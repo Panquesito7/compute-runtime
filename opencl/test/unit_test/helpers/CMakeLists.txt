@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2023 Intel Corporation
+# Copyright (C) 2018-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -27,6 +27,7 @@ set(IGDRCL_SRCS_tests_helpers
     ${CMAKE_CURRENT_SOURCE_DIR}/timestamp_packet_tests.h
     ${CMAKE_CURRENT_SOURCE_DIR}/transfer_properties_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/validator_tests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/image_helper_ocl_tests.cpp
 )
 
 if(TESTS_XEHP_AND_LATER)
@@ -39,6 +40,11 @@ endif()
 if(TESTS_DG2_AND_LATER)
   list(APPEND IGDRCL_SRCS_tests_helpers
        ${CMAKE_CURRENT_SOURCE_DIR}/test_preamble_dg2_and_later.cpp
+  )
+endif()
+if(TESTS_XE3_AND_LATER)
+  list(APPEND IGDRCL_SRCS_tests_helpers
+       ${CMAKE_CURRENT_SOURCE_DIR}/test_preamble_xe3_and_later.cpp
   )
 endif()
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,15 +7,35 @@
 
 #include "shared/source/gmm_helper/client_context/gmm_client_context.h"
 #include "shared/source/gmm_helper/client_context/map_gpu_va_gmm.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/os_interface/windows/gdi_interface.h"
 
 namespace NEO {
 uint64_t GmmClientContext::mapGpuVirtualAddress(MapGpuVirtualAddressGmm *pMapGpuVa) {
-    GMM_MAPGPUVIRTUALADDRESS gmmMapAddress = {pMapGpuVa->mapGpuVirtualAddressParams, 1, pMapGpuVa->resourceInfoHandle, pMapGpuVa->outVirtualAddress};
-    return clientContext->MapGpuVirtualAddress(&gmmMapAddress);
+    auto resourceInfo = pMapGpuVa->resourceInfoHandle;
+    auto gmmResource = resourceInfo->peekGmmResourceInfo();
+    if (gmmResource->IsResourceMappedCompressible()) {
+        GMM_MAPGPUVIRTUALADDRESS gmmMapAddress = {pMapGpuVa->mapGpuVirtualAddressParams, 1, &gmmResource, pMapGpuVa->outVirtualAddress};
+        return clientContext->MapGpuVirtualAddress(&gmmMapAddress);
+    } else {
+        return pMapGpuVa->gdi->mapGpuVirtualAddress(pMapGpuVa->mapGpuVirtualAddressParams);
+    }
 }
 uint64_t GmmClientContext::freeGpuVirtualAddress(FreeGpuVirtualAddressGmm *pFreeGpuVa) {
-    GMM_FREEGPUVIRTUALADDRESS gmmFreeAddress = {pFreeGpuVa->hAdapter, pFreeGpuVa->baseAddress, pFreeGpuVa->size, 1, pFreeGpuVa->resourceInfoHandle};
-    return clientContext->FreeGpuVirtualAddress(&gmmFreeAddress);
+    auto resourceInfo = pFreeGpuVa->resourceInfoHandle;
+    auto gmmResource = resourceInfo->peekGmmResourceInfo();
+    if (gmmResource->IsResourceMappedCompressible()) {
+        GMM_FREEGPUVIRTUALADDRESS gmmFreeAddress = {pFreeGpuVa->hAdapter, pFreeGpuVa->baseAddress, pFreeGpuVa->size, 1, &gmmResource};
+        return clientContext->FreeGpuVirtualAddress(&gmmFreeAddress);
+    } else {
+        return 0;
+    }
+}
+long GmmClientContext::deallocate2(DeallocateGmm *deallocateGmm) {
+    GMM_DESTROYALLOCATION2 gmmDestroyAllocation2{};
+    memcpy_s(&gmmDestroyAllocation2.KmtObj, sizeof(D3DKMT_DESTROYALLOCATION2), deallocateGmm->destroyAllocation2, sizeof(D3DKMT_DESTROYALLOCATION2));
+
+    return clientContext->DeAllocate2(&gmmDestroyAllocation2);
 }
 
 } // namespace NEO

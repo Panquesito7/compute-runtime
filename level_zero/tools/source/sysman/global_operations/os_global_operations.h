@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,13 +7,14 @@
 
 #pragma once
 
-#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/sysman/os_sysman.h"
 #include <level_zero/zes_api.h>
 
 #include <vector>
 
 namespace L0 {
+
+struct Device;
 
 class OsGlobalOperations {
   public:
@@ -29,6 +30,7 @@ class OsGlobalOperations {
     virtual ze_result_t reset(ze_bool_t force) = 0;
     virtual ze_result_t scanProcessesState(std::vector<zes_process_state_t> &pProcessList) = 0;
     virtual ze_result_t deviceGetState(zes_device_state_t *pState) = 0;
+    virtual ze_result_t resetExt(zes_reset_properties_t *pProperties) = 0;
     static OsGlobalOperations *create(OsSysman *pOsSysman);
     virtual ~OsGlobalOperations() {}
 };

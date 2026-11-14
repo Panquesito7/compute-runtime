@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,9 @@
 
 #pragma once
 
-#include "shared/offline_compiler/source/ocloc_igc_facade.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/utilities/arrayref.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "ocl_igc_interface/code_type.h"
 
@@ -24,13 +24,14 @@ class OclocArgHelper;
 namespace NEO {
 
 class OsLibrary;
+class OclocIgcFacade;
 
 class OfflineLinker {
   protected:
     enum class OperationMode {
-        SKIP_EXECUTION = 0,
-        SHOW_HELP = 1,
-        LINK_FILES = 2,
+        skipExecution = 0,
+        showHelp = 1,
+        linkFiles = 2,
     };
 
     struct InputFileContent {
@@ -43,6 +44,7 @@ class OfflineLinker {
     };
 
   public:
+    explicit OfflineLinker(OclocArgHelper *argHelper, std::unique_ptr<OclocIgcFacade> igcFacade);
     static std::unique_ptr<OfflineLinker> create(size_t argsCount, const std::vector<std::string> &args, int &errorCode, OclocArgHelper *argHelper);
     MOCKABLE_VIRTUAL ~OfflineLinker();
 
@@ -50,7 +52,6 @@ class OfflineLinker {
     std::string getBuildLog() const;
 
   protected:
-    explicit OfflineLinker(OclocArgHelper *argHelper, std::unique_ptr<OclocIgcFacade> igcFacade);
     int initialize(size_t argsCount, const std::vector<std::string> &args);
     int parseCommand(size_t argsCount, const std::vector<std::string> &args);
     IGC::CodeType::CodeType_t parseOutputFormat(const std::string &outputFormatName);
@@ -76,7 +77,7 @@ class OfflineLinker {
     std::string options{};
     std::string internalOptions{};
 
-    std::unique_ptr<OclocIgcFacade> igcFacade{};
+    std::unique_ptr<OclocIgcFacade> igcFacade;
     HardwareInfo hwInfo{};
     std::string buildLog{};
 };

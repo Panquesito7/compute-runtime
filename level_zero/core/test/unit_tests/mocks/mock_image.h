@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -25,8 +25,21 @@ struct WhiteBox<::L0::ImageCoreFamily<gfxCoreFamily>>
 
     ~WhiteBox() override {}
 
-    using BaseClass::redescribedSurfaceState;
-    using BaseClass::surfaceState;
+    using BaseClass::getImplicitArgsSurfaceState;
+    using BaseClass::getPackedSurfaceState;
+    using BaseClass::getRedescribedSurfaceState;
+    using BaseClass::getSurfaceState;
+
+    using BaseClass::ImageImp::imageFromBuffer;
+    using BaseClass::ImageImp::imgInfo;
+    using BaseClass::ImageImp::implicitArgsTag;
+    using BaseClass::ImageImp::isUnifiedMcsSurface;
+    using BaseClass::ImageImp::mcsAllocation;
+    using BaseClass::ImageImp::mcsMultisampleCount;
+    using BaseClass::ImageImp::numSamples;
+    using BaseClass::ImageImp::sampledImage;
+    using BaseClass::ImageImp::samplerDesc;
+    using BaseClass::ImageImp::srgbImage;
 };
 
 } // namespace ult

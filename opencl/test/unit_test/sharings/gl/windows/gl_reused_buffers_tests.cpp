@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,7 +8,7 @@
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/resource_info.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/mem_obj/buffer.h"
@@ -40,7 +40,7 @@ struct GlReusedBufferTests : public ::testing::Test {
 
 class FailingMemoryManager : public MockMemoryManager {
   public:
-    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
         return nullptr;
     }
 };
@@ -87,7 +87,10 @@ TEST_F(GlReusedBufferTests, givenMultipleBuffersWithReusedAllocationWhenReleasin
 
 TEST_F(GlReusedBufferTests, givenMultipleBuffersWithReusedAllocationWhenCreatingThenReuseGmmResourceToo) {
     std::unique_ptr<Buffer> glBuffer1(GlBuffer::createSharedGlBuffer(&context, CL_MEM_READ_WRITE, bufferId1, &retVal));
-    glBuffer1->getGraphicsAllocation(rootDeviceIndex)->setDefaultGmm(new Gmm(context.getDevice(0)->getGmmHelper(), (void *)0x100, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    glBuffer1->getGraphicsAllocation(rootDeviceIndex)->setDefaultGmm(new Gmm(context.getDevice(0)->getGmmHelper(), (void *)0x100, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, {}, gmmRequirements));
 
     std::unique_ptr<Buffer> glBuffer2(GlBuffer::createSharedGlBuffer(&context, CL_MEM_READ_WRITE, bufferId1, &retVal));
 
@@ -104,7 +107,7 @@ TEST_F(GlReusedBufferTests, givenGlobalShareHandleChangedWhenAcquiringSharedBuff
     auto glBuffer = clBuffer->peekSharingHandler();
     auto oldGraphicsAllocation = clBuffer->getGraphicsAllocation(rootDeviceIndex);
 
-    ASSERT_EQ(40, oldGraphicsAllocation->peekSharedHandle());
+    ASSERT_EQ(40u, oldGraphicsAllocation->peekSharedHandle());
 
     bufferInfoOutput.globalShareHandle = 41;
     dllParam.loadBuffer(bufferInfoOutput);
@@ -112,7 +115,7 @@ TEST_F(GlReusedBufferTests, givenGlobalShareHandleChangedWhenAcquiringSharedBuff
     auto newGraphicsAllocation = clBuffer->getGraphicsAllocation(rootDeviceIndex);
 
     EXPECT_NE(oldGraphicsAllocation, newGraphicsAllocation);
-    EXPECT_EQ(41, newGraphicsAllocation->peekSharedHandle());
+    EXPECT_EQ(41u, newGraphicsAllocation->peekSharedHandle());
 
     glBuffer->release(clBuffer.get(), rootDeviceIndex);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,11 +11,14 @@
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
-#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/sharings/unified/unified_sharing_types.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include "gtest/gtest.h"
+
+#include <limits>
 
 namespace NEO {
 
@@ -42,7 +45,7 @@ struct UnifiedSharingContextFixture : ::testing::Test {
 
     std::unique_ptr<MockContext> createValidContext() {
         const cl_context_properties contextProperties[] = {
-            static_cast<cl_context_properties>(UnifiedSharingContextType::DeviceHandle), 0,
+            static_cast<cl_context_properties>(UnifiedSharingContextType::deviceHandle), 0,
             CL_CONTEXT_INTEROP_USER_SYNC, 1,
             0};
         return createContext(contextProperties);
@@ -60,19 +63,24 @@ struct UnifiedSharingContextFixture : ::testing::Test {
 template <bool validMemoryManager>
 struct UnifiedSharingMockMemoryManager : MockMemoryManager {
     using MockMemoryManager::MockMemoryManager;
-    GraphicsAllocation *createGraphicsAllocationFromNTHandle(void *handle, uint32_t rootDeviceIndex, AllocationType allocType) override {
-        if (!validMemoryManager) {
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+        ++createFromSharedHandleCalled;
+        capturedSharedHandle = osHandleData.handle;
+        if (!validMemoryManager || createFromSharedHandleCalled > maxSuccessfulImports) {
             return nullptr;
         }
 
-        auto graphicsAllocation = createMemoryAllocation(AllocationType::INTERNAL_HOST_MEMORY, nullptr, reinterpret_cast<void *>(1), 1,
-                                                         4096u, reinterpret_cast<uint64_t>(handle), MemoryPool::SystemCpuInaccessible,
-                                                         rootDeviceIndex, false, false, false);
-        graphicsAllocation->setSharedHandle(static_cast<osHandle>(reinterpret_cast<uint64_t>(handle)));
+        auto graphicsAllocation = createMemoryAllocation(AllocationType::internalHostMemory, nullptr, reinterpret_cast<void *>(1), 1,
+                                                         4096u, osHandleData.handle, MemoryPool::systemCpuInaccessible,
+                                                         properties.rootDeviceIndex, false, false, false);
+        graphicsAllocation->setSharedHandle(osHandleData.handle);
         graphicsAllocation->set32BitAllocation(false);
-        graphicsAllocation->setDefaultGmm(new MockGmm(executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->getGmmHelper()));
+        graphicsAllocation->setDefaultGmm(new MockGmm(executionEnvironment.rootDeviceEnvironments[properties.rootDeviceIndex]->getGmmHelper()));
         return graphicsAllocation;
     }
+
+    uint32_t createFromSharedHandleCalled = 0u;
+    uint32_t maxSuccessfulImports = std::numeric_limits<uint32_t>::max();
 };
 
 template <bool validContext, bool validMemoryManager>

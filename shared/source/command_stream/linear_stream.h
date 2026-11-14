@@ -1,21 +1,23 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/command_container/cmdcontainer.h"
+#include "shared/source/command_container/cmdcontainer_types.h"
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/ptr_math.h"
 
 #include <cstdint>
 
 namespace NEO {
+class CommandContainer;
 class GraphicsAllocation;
 
-class LinearStream {
+class LinearStream : NEO::NonCopyableAndNonMovableClass {
   public:
     virtual ~LinearStream() = default;
     LinearStream() = default;
@@ -24,14 +26,13 @@ class LinearStream {
     LinearStream(GraphicsAllocation *gfxAllocation, void *buffer, size_t bufferSize);
     LinearStream(void *buffer, size_t bufferSize, CommandContainer *cmdContainer, size_t batchBufferEndSize);
 
-    LinearStream(const LinearStream &) = delete;
-    LinearStream &operator=(const LinearStream &) = delete;
-
     void *getCpuBase() const;
     void *getSpace(size_t size);
     size_t getMaxAvailableSpace() const;
     size_t getAvailableSpace() const;
     size_t getUsed() const;
+    void *getCmdContainer() const { return cmdContainer; }
+    void setCmdContainer(CommandContainer *newCmdContainer) { cmdContainer = newCmdContainer; }
 
     uint64_t getGpuBase() const;
     void setGpuBase(uint64_t gpuAddress);
@@ -49,6 +50,9 @@ class LinearStream {
         return reinterpret_cast<Cmd *>(ptr);
     }
 
+    void ensureContinuousSpace(size_t size);
+    void reclaimSpace(size_t space);
+
   protected:
     size_t sizeUsed = 0;
     size_t maxAvailableSpace{0};
@@ -57,6 +61,9 @@ class LinearStream {
     CommandContainer *cmdContainer{nullptr};
     size_t batchBufferEndSize{0};
     uint64_t gpuBase{0};
+
+  private:
+    void allocateNextCommandBuffer();
 };
 
 inline void *LinearStream::getCpuBase() const {
@@ -67,15 +74,23 @@ inline void LinearStream::setGpuBase(uint64_t gpuAddress) {
     gpuBase = gpuAddress;
 }
 
+inline void LinearStream::ensureContinuousSpace(size_t size) {
+    if (cmdContainer && (getAvailableSpace() < (batchBufferEndSize + size))) {
+        allocateNextCommandBuffer();
+    }
+}
+
+inline void LinearStream::reclaimSpace(size_t space) {
+    DEBUG_BREAK_IF(space > sizeUsed);
+    sizeUsed -= space;
+}
+
 inline void *LinearStream::getSpace(size_t size) {
     if (size == 0u) {
         return ptrOffset(buffer, sizeUsed);
     }
 
-    if (cmdContainer != nullptr && getAvailableSpace() < batchBufferEndSize + size) {
-        UNRECOVERABLE_IF(sizeUsed + batchBufferEndSize > maxAvailableSpace);
-        cmdContainer->closeAndAllocateNextCommandBuffer();
-    }
+    ensureContinuousSpace(size);
     UNRECOVERABLE_IF(sizeUsed + size > maxAvailableSpace);
     UNRECOVERABLE_IF(reinterpret_cast<int64_t>(buffer) == 0);
     auto memory = ptrOffset(buffer, sizeUsed);
@@ -117,5 +132,7 @@ inline void LinearStream::replaceGraphicsAllocation(GraphicsAllocation *gfxAlloc
 inline uint64_t LinearStream::getCurrentGpuAddressPosition() const {
     return (getGpuBase() + getUsed());
 }
+
+static_assert(NEO::NonCopyableAndNonMovable<LinearStream>);
 
 } // namespace NEO

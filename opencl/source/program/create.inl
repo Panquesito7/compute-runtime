@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/ail/ail_configuration.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/string_helpers.h"
 
@@ -35,7 +36,7 @@ T *Program::create(
             break;
         }
     }
-    program->createdFrom = CreatedFrom::BINARY;
+    program->createdFrom = CreatedFrom::binary;
 
     if (binaryStatus) {
         DEBUG_BREAK_IF(retVal != CL_SUCCESS);
@@ -71,20 +72,14 @@ T *Program::create(
 
     if (CL_SUCCESS == retVal) {
 
-        auto &hwInfo = pContext->getDevice(0)->getHardwareInfo();
-        auto ail = AILConfiguration::get(hwInfo.platform.eProductFamily);
+        auto ail = pContext->getDevice(0)->getRootDeviceEnvironment().getAILConfigurationHelper();
         if (ail) {
             ail->modifyKernelIfRequired(combinedString);
         }
 
         program = new T(pContext, false, pContext->getDevices());
-        if (ail) {
-            if (ail->isFallbackToPatchtokensRequired(combinedString)) {
-                pContext->setContextAsNonZebin();
-            }
-        }
         program->sourceCode.swap(combinedString);
-        program->createdFrom = CreatedFrom::SOURCE;
+        program->createdFrom = CreatedFrom::source;
     }
 
     errcodeRet = retVal;
@@ -107,7 +102,7 @@ T *Program::createBuiltInFromSource(
     if (retVal == CL_SUCCESS) {
         program = new T(context, true, deviceVector);
         program->sourceCode = nullTerminatedString;
-        program->createdFrom = CreatedFrom::SOURCE;
+        program->createdFrom = CreatedFrom::source;
     }
 
     if (errcodeRet) {
@@ -141,7 +136,7 @@ T *Program::createBuiltInFromGenBinary(
         }
         program->setBuildStatusSuccess(deviceVector, CL_PROGRAM_BINARY_TYPE_EXECUTABLE);
         program->isCreatedFromBinary = true;
-        program->createdFrom = CreatedFrom::BINARY;
+        program->createdFrom = CreatedFrom::binary;
     }
 
     if (errcodeRet) {
@@ -171,7 +166,7 @@ T *Program::createFromIL(Context *context,
             break;
         }
     }
-    program->createdFrom = CreatedFrom::IL;
+    program->createdFrom = CreatedFrom::il;
 
     if (errcodeRet != CL_SUCCESS) {
         delete program;

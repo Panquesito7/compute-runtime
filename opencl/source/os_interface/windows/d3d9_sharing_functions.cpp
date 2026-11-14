@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,13 +11,17 @@
 
 using namespace NEO;
 
-template class D3DSharingFunctions<D3DTypesHelper::D3D9>;
+template <>
 const uint32_t D3DSharingFunctions<D3DTypesHelper::D3D9>::sharingId = SharingType::D3D9_SHARING;
 
 template <>
 void D3DSharingFunctions<D3DTypesHelper::D3D9>::createQuery(D3DQuery **query) {
     D3DQUERYTYPE queryType = D3DQUERYTYPE_EVENT;
     d3dDevice->CreateQuery(queryType, query);
+}
+
+template <>
+void D3DSharingFunctions<D3DTypesHelper::D3D9>::createFence(D3DFence **fence) {
 }
 
 template <>
@@ -31,7 +35,7 @@ void D3DSharingFunctions<D3DTypesHelper::D3D9>::fillCreateBufferDesc(D3DBufferDe
 
 template <>
 std::vector<DXGI_FORMAT> &D3DSharingFunctions<D3DTypesHelper::D3D9>::retrieveTextureFormats(cl_mem_object_type imageType, cl_uint plane) {
-    return DXGINoFormats;
+    return dxgiNoFormats;
 }
 
 template <>
@@ -60,6 +64,7 @@ bool D3DSharingFunctions<D3DTypesHelper::D3D9>::checkFormatSupport(DXGI_FORMAT f
     return false;
 }
 
+template <>
 cl_int D3DSharingFunctions<D3DTypesHelper::D3D9>::validateFormatSupport(DXGI_FORMAT format, cl_mem_object_type type) {
     return CL_SUCCESS;
 }
@@ -130,8 +135,13 @@ void D3DSharingFunctions<D3DTypesHelper::D3D9>::updateSurface(D3DTexture2d *src,
 template <>
 void D3DSharingFunctions<D3DTypesHelper::D3D9>::flushAndWait(D3DQuery *query) {
     query->Issue(D3DISSUE_END);
-    while (query->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK)
+    while (query->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK) {
         ;
+    }
+}
+
+template <>
+void D3DSharingFunctions<D3DTypesHelper::D3D9>::signalAndWait(D3DFence *fence) {
 }
 
 template <>
@@ -146,7 +156,7 @@ template <>
 void D3DSharingFunctions<D3DTypesHelper::D3D9>::getDxgiDesc(DXGI_ADAPTER_DESC *dxgiDesc, IDXGIAdapter *adapter, D3DDevice *device) {
     if (!adapter) {
         IDXGIDevice *dxgiDevice = nullptr;
-        device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgiDevice);
+        device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgiDevice));
         dxgiDevice->GetAdapter(&adapter);
         dxgiDevice->Release();
     } else {
@@ -157,3 +167,4 @@ void D3DSharingFunctions<D3DTypesHelper::D3D9>::getDxgiDesc(DXGI_ADAPTER_DESC *d
 }
 
 template D3DSharingFunctions<D3DTypesHelper::D3D9> *Context::getSharing<D3DSharingFunctions<D3DTypesHelper::D3D9>>();
+template class NEO::D3DSharingFunctions<D3DTypesHelper::D3D9>;

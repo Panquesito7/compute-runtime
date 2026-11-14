@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,17 +14,14 @@
 
 using namespace NEO;
 
-template class D3DSharing<D3DTypesHelper::D3D9>;
-template class D3DSharing<D3DTypesHelper::D3D10>;
-template class D3DSharing<D3DTypesHelper::D3D11>;
-
 template <typename D3D>
 D3DSharing<D3D>::D3DSharing(Context *context, D3DResource *resource, D3DResource *resourceStaging, unsigned int subresource, bool sharedResource)
-    : sharedResource(sharedResource), subresource(subresource), resource(resource), resourceStaging(resourceStaging), context(context) {
+    : context(context), resource(resource), resourceStaging(resourceStaging), sharedResource(sharedResource), subresource(subresource) {
     sharingFunctions = context->getSharing<D3DSharingFunctions<D3D>>();
     if (sharingFunctions) {
         sharingFunctions->addRef(resource);
         sharingFunctions->createQuery(&this->d3dQuery);
+        sharingFunctions->createFence(&this->d3dFence);
         sharingFunctions->track(resource, subresource);
     }
 };
@@ -38,6 +35,7 @@ D3DSharing<D3D>::~D3DSharing() {
         }
         sharingFunctions->release(resource);
         sharingFunctions->release(d3dQuery);
+        sharingFunctions->release(d3dFence);
     }
 };
 
@@ -51,6 +49,32 @@ void D3DSharing<D3D>::synchronizeObject(UpdateData &updateData) {
     } else if (!context->getInteropUserSyncEnabled()) {
         sharingFunctions->flushAndWait(d3dQuery);
     }
+    sharingFunctions->releaseDeviceContext(d3dQuery);
+
+    updateData.synchronizationStatus = SynchronizeStatus::ACQUIRE_SUCCESFUL;
+}
+
+template <>
+void D3DSharing<NEO::D3DTypesHelper::D3D11>::synchronizeObject(UpdateData &updateData) {
+    std::unique_lock<std::mutex> lock(this->mtx);
+    sharingFunctions->getDeviceContext(d3dQuery);
+
+    if (d3dFence) {
+        if (!sharedResource) {
+            sharingFunctions->copySubresourceRegion(resourceStaging, 0, resource, subresource);
+            sharingFunctions->signalAndWait(d3dFence);
+        } else if (!context->getInteropUserSyncEnabled()) {
+            sharingFunctions->signalAndWait(d3dFence);
+        }
+    } else {
+        if (!sharedResource) {
+            sharingFunctions->copySubresourceRegion(resourceStaging, 0, resource, subresource);
+            sharingFunctions->flushAndWait(d3dQuery);
+        } else if (!context->getInteropUserSyncEnabled()) {
+            sharingFunctions->flushAndWait(d3dQuery);
+        }
+    }
+
     sharingFunctions->releaseDeviceContext(d3dQuery);
 
     updateData.synchronizationStatus = SynchronizeStatus::ACQUIRE_SUCCESFUL;
@@ -71,32 +95,21 @@ void D3DSharing<D3D>::releaseResource(MemObj *memObject, uint32_t rootDeviceInde
 
 template <typename D3D>
 void D3DSharing<D3D>::updateImgInfoAndDesc(Gmm *gmm, ImageInfo &imgInfo, ImagePlane imagePlane, cl_uint arrayIndex) {
-
-    gmm->updateImgInfoAndDesc(imgInfo, arrayIndex);
-
-    if (imagePlane == ImagePlane::PLANE_U || imagePlane == ImagePlane::PLANE_V || imagePlane == ImagePlane::PLANE_UV) {
-        imgInfo.imgDesc.imageWidth /= 2;
-        imgInfo.imgDesc.imageHeight /= 2;
-        if (imagePlane != ImagePlane::PLANE_UV) {
-            imgInfo.imgDesc.imageRowPitch /= 2;
-        }
-    }
+    gmm->updateImgInfoAndDesc(imgInfo, arrayIndex, imagePlane);
 }
 
 template <typename D3D>
-const ClSurfaceFormatInfo *D3DSharing<D3D>::findSurfaceFormatInfo(GMM_RESOURCE_FORMAT_ENUM gmmFormat, cl_mem_flags flags, bool supportsOcl20Features, bool packedSupported) {
-    ArrayRef<const ClSurfaceFormatInfo> formats = SurfaceFormats::surfaceFormats(flags, supportsOcl20Features);
+const ClSurfaceFormatInfo *D3DSharing<D3D>::findSurfaceFormatInfo(int gmmFormat, cl_mem_flags flags) {
+    ArrayRef<const ClSurfaceFormatInfo> formats = SurfaceFormats::surfaceFormats(flags);
     for (auto &format : formats) {
         if (gmmFormat == format.surfaceFormat.gmmSurfaceFormat) {
             return &format;
         }
     }
-    if (packedSupported) {
-        formats = SurfaceFormats::packed();
-        for (auto &format : formats) {
-            if (gmmFormat == format.surfaceFormat.gmmSurfaceFormat) {
-                return &format;
-            }
+    formats = SurfaceFormats::packed();
+    for (auto &format : formats) {
+        if (gmmFormat == format.surfaceFormat.gmmSurfaceFormat) {
+            return &format;
         }
     }
 
@@ -113,6 +126,11 @@ bool D3DSharing<D3D>::isFormatWithPlane1(DXGI_FORMAT format) {
     case DXGI_FORMAT_NV11:
     case DXGI_FORMAT_P208:
         return true;
+    default:
+        return false;
     }
-    return false;
 }
+
+template class NEO::D3DSharing<D3DTypesHelper::D3D9>;
+template class NEO::D3DSharing<D3DTypesHelper::D3D10>;
+template class NEO::D3DSharing<D3DTypesHelper::D3D11>;

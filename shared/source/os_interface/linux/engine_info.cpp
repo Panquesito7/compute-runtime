@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,14 +15,13 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/drm_wrappers.h"
-
-#include <array>
+#include "shared/source/os_interface/product_helper.h"
 
 namespace NEO {
 namespace DrmEngineMappingHelper {
-constexpr std::array<aub_stream::EngineType, 9> engineMapping = {{aub_stream::ENGINE_BCS, aub_stream::ENGINE_BCS1, aub_stream::ENGINE_BCS2,
-                                                                  aub_stream::ENGINE_BCS3, aub_stream::ENGINE_BCS4, aub_stream::ENGINE_BCS5,
-                                                                  aub_stream::ENGINE_BCS6, aub_stream::ENGINE_BCS7, aub_stream::ENGINE_BCS8}};
+constexpr aub_stream::EngineType engineMapping[] = {aub_stream::ENGINE_BCS, aub_stream::ENGINE_BCS1, aub_stream::ENGINE_BCS2,
+                                                    aub_stream::ENGINE_BCS3, aub_stream::ENGINE_BCS4, aub_stream::ENGINE_BCS5,
+                                                    aub_stream::ENGINE_BCS6, aub_stream::ENGINE_BCS7, aub_stream::ENGINE_BCS8};
 
 // 3 types of copy engines:
 // - Main - BCS (legacy, aka. BCS0)
@@ -47,90 +46,89 @@ void assignLinkCopyEngine(std::vector<EngineInfo::EngineToInstanceMap> &tileToEn
     UNRECOVERABLE_IF(bcsInfoMask.test(engineMaskIndex));
     bcsInfoMask.set(engineMaskIndex, true);
 }
-} // namespace
 
-EngineInfo::EngineInfo(Drm *drm, const std::vector<EngineCapabilities> &engineInfos) : engines(engineInfos), tileToEngineToInstanceMap(1) {
-    auto computeEngines = 0u;
-    BcsInfoMask bcsInfoMask = 0;
-    uint32_t numHostLinkCopyEngines = 0;
-    uint32_t numScaleUpLinkCopyEngines = 0;
-
-    auto ioctlHelper = drm->getIoctlHelper();
-
-    auto &rootDeviceEnvironment = drm->getRootDeviceEnvironment();
-    for (const auto &engineInfo : engineInfos) {
-        auto &engine = engineInfo.engine;
-        tileToEngineMap.emplace(0, engine);
-        if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassRender)) {
-            tileToEngineToInstanceMap[0][EngineHelpers::remapEngineTypeToHwSpecific(aub_stream::EngineType::ENGINE_RCS, rootDeviceEnvironment)] = engine;
-        } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassCopy)) {
-            const auto &hwInfo = rootDeviceEnvironment.getHardwareInfo();
-            assignCopyEngine(EngineInfo::getBaseCopyEngineType(ioctlHelper, engineInfo.capabilities, hwInfo->capabilityTable.isIntegratedDevice), 0, engine,
-                             bcsInfoMask, numHostLinkCopyEngines, numScaleUpLinkCopyEngines);
-        } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassCompute)) {
-            tileToEngineToInstanceMap[0][static_cast<aub_stream::EngineType>(aub_stream::ENGINE_CCS + computeEngines)] = engine;
-            computeEngines++;
-        }
-    }
-    setSupportedEnginesInfo(rootDeviceEnvironment, computeEngines, bcsInfoMask);
+auto getCopyEnginesMappingIterator(const NEO::RootDeviceEnvironment &rootDeviceEnvironment) {
+    auto mappingCopyEngineIt = DrmEngineMappingHelper::engineMapping;
+    if (const auto defaultCopyEngine = rootDeviceEnvironment.getProductHelper().getDefaultCopyEngine(); defaultCopyEngine != *mappingCopyEngineIt) {
+        mappingCopyEngineIt++;
+    } // Note that BCS0 may not be enabled
+    return mappingCopyEngineIt;
 }
 
-EngineInfo::EngineInfo(Drm *drm, const StackVec<std::vector<EngineClassInstance>, 2> &engineClassInstancePerTile) : tileToEngineToInstanceMap(engineClassInstancePerTile.size()) {
+uint32_t getBcsEngineMaskIndex(const aub_stream::EngineType *mappingCopyEngineIt) {
+    if (*mappingCopyEngineIt == aub_stream::EngineType::ENGINE_BCS) {
+        return 0u;
+    } else {
+        return *mappingCopyEngineIt - aub_stream::EngineType::ENGINE_BCS1 + 1;
+    }
+}
+} // namespace
+
+void EngineInfo::mapEngine(const NEO::IoctlHelper *ioctlHelper, const EngineCapabilities &engineInfo, const NEO::RootDeviceEnvironment &rootDeviceEnvironment,
+                           const aub_stream::EngineType *&mappingCopyEngineIt, EngineCounters &engineCounters, uint32_t tileId) {
+
+    aub_stream::EngineType engineType = aub_stream::EngineType::NUM_ENGINES;
+    auto &engine = engineInfo.engine;
+    tileToEngineMap.emplace(tileId, engine);
+    if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::engineClassRender)) {
+        engineType = EngineHelpers::remapEngineTypeToHwSpecific(aub_stream::EngineType::ENGINE_RCS, rootDeviceEnvironment);
+    } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::engineClassCopy)) {
+
+        auto isIntegrated = rootDeviceEnvironment.getHardwareInfo()->capabilityTable.isIntegratedDevice;
+        auto &bcsInfoMask = rootDeviceEnvironment.getMutableHardwareInfo()->featureTable.ftrBcsInfo;
+        assignCopyEngine(EngineInfo::getBaseCopyEngineType(ioctlHelper, engineInfo.capabilities, isIntegrated), tileId, engine,
+                         bcsInfoMask, engineCounters, mappingCopyEngineIt);
+
+    } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::engineClassCompute)) {
+
+        engineType = static_cast<aub_stream::EngineType>(aub_stream::ENGINE_CCS + engineCounters.numComputeEngines);
+        engineCounters.numComputeEngines++;
+    }
+    if (engineType != aub_stream::EngineType::NUM_ENGINES) {
+        tileToEngineToInstanceMap[tileId][engineType] = engine;
+    }
+}
+
+EngineInfo::EngineInfo(Drm *drm, const StackVec<std::vector<EngineCapabilities>, 2> &engineInfosPerTile) : tileToEngineToInstanceMap(engineInfosPerTile.size()) {
     auto ioctlHelper = drm->getIoctlHelper();
     auto &rootDeviceEnvironment = drm->getRootDeviceEnvironment();
-    auto computeEnginesPerTile = 0u;
-    auto copyEnginesPerTile = 0u;
-    for (auto tile = 0u; tile < engineClassInstancePerTile.size(); tile++) {
-        copyEnginesPerTile = 0u;
-        computeEnginesPerTile = 0u;
-        for (const auto &engine : engineClassInstancePerTile[tile]) {
-            tileToEngineMap.emplace(tile, engine);
-            if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassRender)) {
-                tileToEngineToInstanceMap[tile][EngineHelpers::remapEngineTypeToHwSpecific(aub_stream::EngineType::ENGINE_RCS, rootDeviceEnvironment)] = engine;
-            } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassCopy)) {
-                tileToEngineToInstanceMap[tile][DrmEngineMappingHelper::engineMapping[copyEnginesPerTile]] = engine;
-                copyEnginesPerTile++;
-            } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassCompute)) {
-                tileToEngineToInstanceMap[tile][static_cast<aub_stream::EngineType>(aub_stream::ENGINE_CCS + computeEnginesPerTile)] = engine;
-                computeEnginesPerTile++;
-            }
+    EngineCounters engineCounters{};
+    rootDeviceEnvironment.getMutableHardwareInfo()->featureTable.ftrBcsInfo = 0;
+
+    for (auto tile = 0u; tile < engineInfosPerTile.size(); tile++) {
+        engineCounters.numComputeEngines = 0u;
+        auto copyEnginesMappingIt = getCopyEnginesMappingIterator(rootDeviceEnvironment);
+
+        for (const auto &engineCapabilities : engineInfosPerTile[tile]) {
+            engines.push_back(engineCapabilities);
+            mapEngine(ioctlHelper, engineCapabilities, rootDeviceEnvironment, copyEnginesMappingIt, engineCounters, tile);
         }
     }
-    BcsInfoMask bcsInfoMask = maxNBitValue(copyEnginesPerTile);
-    setSupportedEnginesInfo(rootDeviceEnvironment, computeEnginesPerTile, bcsInfoMask);
+    setSupportedEnginesInfo(rootDeviceEnvironment, engineCounters.numComputeEngines);
 }
 
 EngineInfo::EngineInfo(Drm *drm, uint32_t tileCount, const std::vector<DistanceInfo> &distanceInfos, const std::vector<QueryItem> &queryItems, const std::vector<EngineCapabilities> &engineInfos)
     : engines(engineInfos), tileToEngineToInstanceMap(tileCount) {
     auto tile = 0u;
-    auto computeEnginesPerTile = 0u;
-    auto copyEnginesPerTile = 0u;
+    EngineCounters engineCounters{};
     auto ioctlHelper = drm->getIoctlHelper();
     auto &rootDeviceEnvironment = drm->getRootDeviceEnvironment();
+    rootDeviceEnvironment.getMutableHardwareInfo()->featureTable.ftrBcsInfo = 0;
+
+    auto copyEnginesMappingIt = getCopyEnginesMappingIterator(rootDeviceEnvironment);
     for (auto i = 0u; i < distanceInfos.size(); i++) {
         if (i > 0u && distanceInfos[i].region.memoryInstance != distanceInfos[i - 1u].region.memoryInstance) {
             tile++;
-            computeEnginesPerTile = 0u;
-            copyEnginesPerTile = 0u;
+            engineCounters.numComputeEngines = 0u;
+            copyEnginesMappingIt = getCopyEnginesMappingIterator(rootDeviceEnvironment);
         }
-        if (queryItems[i].length < 0 || distanceInfos[i].distance != 0)
+        if (queryItems[i].length < 0 || distanceInfos[i].distance != 0) {
             continue;
-
-        auto engine = distanceInfos[i].engine;
-        tileToEngineMap.emplace(tile, engine);
-        if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassRender)) {
-            tileToEngineToInstanceMap[tile][EngineHelpers::remapEngineTypeToHwSpecific(aub_stream::EngineType::ENGINE_RCS, rootDeviceEnvironment)] = engine;
-        } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassCopy)) {
-            tileToEngineToInstanceMap[tile][DrmEngineMappingHelper::engineMapping[copyEnginesPerTile]] = engine;
-            copyEnginesPerTile++;
-        } else if (engine.engineClass == ioctlHelper->getDrmParamValue(DrmParam::EngineClassCompute)) {
-            tileToEngineToInstanceMap[tile][static_cast<aub_stream::EngineType>(aub_stream::ENGINE_CCS + computeEnginesPerTile)] = engine;
-            computeEnginesPerTile++;
         }
+        EngineCapabilities engineInfo = {distanceInfos[i].engine, {}};
+        mapEngine(ioctlHelper, engineInfo, rootDeviceEnvironment, copyEnginesMappingIt, engineCounters, tile);
     }
-
-    BcsInfoMask bcsInfoMask = maxNBitValue(copyEnginesPerTile);
-    setSupportedEnginesInfo(rootDeviceEnvironment, computeEnginesPerTile, bcsInfoMask);
+    setSupportedEnginesInfo(rootDeviceEnvironment, engineCounters.numComputeEngines);
 }
 
 const EngineClassInstance *EngineInfo::getEngineInstance(uint32_t tile, aub_stream::EngineType engineType) const {
@@ -145,7 +143,7 @@ const EngineClassInstance *EngineInfo::getEngineInstance(uint32_t tile, aub_stre
     return &iter->second;
 }
 
-void EngineInfo::setSupportedEnginesInfo(const RootDeviceEnvironment &rootDeviceEnvironment, uint32_t numComputeEngines, const BcsInfoMask &bcsInfoMask) {
+void EngineInfo::setSupportedEnginesInfo(const RootDeviceEnvironment &rootDeviceEnvironment, uint32_t numComputeEngines) {
     auto hwInfo = rootDeviceEnvironment.getMutableHardwareInfo();
     auto &ccsInfo = hwInfo->gtSystemInfo.CCSInfo;
 
@@ -156,14 +154,12 @@ void EngineInfo::setSupportedEnginesInfo(const RootDeviceEnvironment &rootDevice
         ccsInfo.NumberOfCCSEnabled = numComputeEngines;
         ccsInfo.Instances.CCSEnableMask = static_cast<uint32_t>(maxNBitValue(numComputeEngines));
     } else {
-        hwInfo->capabilityTable.defaultEngineType = EngineHelpers::remapEngineTypeToHwSpecific(aub_stream::EngineType::ENGINE_RCS, rootDeviceEnvironment);
         hwInfo->featureTable.flags.ftrCCSNode = false;
 
         ccsInfo.IsValid = false;
         ccsInfo.NumberOfCCSEnabled = 0;
         ccsInfo.Instances.CCSEnableMask = 0;
     }
-    hwInfo->featureTable.ftrBcsInfo = bcsInfoMask;
 }
 
 uint32_t EngineInfo::getEngineTileIndex(const EngineClassInstance &engine) {
@@ -188,38 +184,50 @@ void EngineInfo::getListOfEnginesOnATile(uint32_t tile, std::vector<EngineClassI
     }
 }
 
+const std::multimap<uint32_t, EngineClassInstance> &EngineInfo::getEngineTileInfo() const {
+    return tileToEngineMap;
+}
+
 void EngineInfo::assignCopyEngine(aub_stream::EngineType baseEngineType, uint32_t tileId, const EngineClassInstance &engine,
-                                  BcsInfoMask &bcsInfoMask, uint32_t &numHostLinkCopyEngines, uint32_t &numScaleUpLinkCopyEngines) {
+                                  BcsInfoMask &bcsInfoMask, EngineCounters &engineCounters, const aub_stream::EngineType *&mappingCopyEngineIt) {
     // Link copy engines:
     if (baseEngineType == DrmEngineMappingHelper::baseForHostLinkCopyEngine) {
-        assignLinkCopyEngine(tileToEngineToInstanceMap, baseEngineType, tileId, engine, bcsInfoMask, numHostLinkCopyEngines);
+        assignLinkCopyEngine(tileToEngineToInstanceMap, baseEngineType, tileId, engine, bcsInfoMask, engineCounters.numHostLinkCopyEngines);
         return;
     }
 
     if (baseEngineType == DrmEngineMappingHelper::baseForScaleUpLinkCopyEngine) {
-        assignLinkCopyEngine(tileToEngineToInstanceMap, baseEngineType, tileId, engine, bcsInfoMask, numScaleUpLinkCopyEngines);
+        assignLinkCopyEngine(tileToEngineToInstanceMap, baseEngineType, tileId, engine, bcsInfoMask, engineCounters.numScaleUpLinkCopyEngines);
         return;
     }
 
     // Main copy engine:
     UNRECOVERABLE_IF(baseEngineType != DrmEngineMappingHelper::baseForMainCopyEngine);
-    UNRECOVERABLE_IF(bcsInfoMask.test(0));
-    tileToEngineToInstanceMap[tileId][aub_stream::ENGINE_BCS] = engine;
-    bcsInfoMask.set(0, true);
+    auto engineType = *(mappingCopyEngineIt++);
+    tileToEngineToInstanceMap[tileId][engineType] = engine;
+    bcsInfoMask.set(getBcsEngineMaskIndex(&engineType), true);
+}
+
+bool EngineInfo::hasEngines() {
+    return (tileToEngineMap.size() > 0LU);
+}
+
+const std::vector<EngineCapabilities> &EngineInfo::getEngineInfos() const {
+    return engines;
 }
 
 // EngineIndex = (Base + EngineCounter - 1)
-aub_stream::EngineType EngineInfo::getBaseCopyEngineType(IoctlHelper *ioctlHelper, uint64_t capabilities, bool isIntegratedDevice) {
+aub_stream::EngineType EngineInfo::getBaseCopyEngineType(const IoctlHelper *ioctlHelper, EngineCapabilities::Flags capabilities, bool isIntegratedDevice) {
     if (!isIntegratedDevice) {
-        if (const auto capa = ioctlHelper->getCopyClassSaturatePCIECapability(); capa && isValueSet(capabilities, *capa)) {
+        if (capabilities.copyClassSaturatePCIE) {
             return DrmEngineMappingHelper::baseForHostLinkCopyEngine;
         }
 
-        if (const auto capa = ioctlHelper->getCopyClassSaturateLinkCapability(); capa && isValueSet(capabilities, *capa)) {
+        if (capabilities.copyClassSaturateLink) {
             return DrmEngineMappingHelper::baseForScaleUpLinkCopyEngine;
         }
     }
-    // no capabilites check for BCS0, to be backward compatible
+    // no capabilities check for BCS0, to be backward compatible
     return DrmEngineMappingHelper::baseForMainCopyEngine;
 }
 

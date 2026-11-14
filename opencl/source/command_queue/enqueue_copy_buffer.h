@@ -1,12 +1,15 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/addressing_mode_helper.h"
+
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
 #include "opencl/source/command_queue/enqueue_common.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
@@ -23,17 +26,16 @@ cl_int CommandQueueHw<GfxFamily>::enqueueCopyBuffer(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
-    auto eBuiltInOpsType = EBuiltInOps::CopyBufferToBuffer;
+
     constexpr cl_command_type cmdType = CL_COMMAND_COPY_BUFFER;
 
     CsrSelectionArgs csrSelectionArgs{cmdType, srcBuffer, dstBuffer, device->getRootDeviceIndex(), &size};
     CommandStreamReceiver &csr = selectCsrForBuiltinOperation(csrSelectionArgs);
 
-    if (forceStateless(std::max(srcBuffer->getSize(), dstBuffer->getSize()))) {
-        eBuiltInOpsType = EBuiltInOps::CopyBufferToBufferStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(std::max(srcBuffer->getSize(), dstBuffer->getSize()));
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcBuffer;
     dc.dstMemObj = dstBuffer;
     dc.srcOffset = {srcOffset, 0, 0};
@@ -48,7 +50,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueCopyBuffer(
     MemObjSurface s2(dstBuffer);
     Surface *surfaces[] = {&s1, &s2};
 
-    return dispatchBcsOrGpgpuEnqueue<CL_COMMAND_COPY_BUFFER>(dispatchInfo, surfaces, eBuiltInOpsType, numEventsInWaitList, eventWaitList, event, false, csr);
+    return dispatchBcsOrGpgpuEnqueue<CL_COMMAND_COPY_BUFFER>(dispatchInfo, surfaces, {BuiltIn::BaseKernel::copyBufferToBuffer, builtInMode}, numEventsInWaitList, eventWaitList, event, false, csr);
 }
 
 } // namespace NEO

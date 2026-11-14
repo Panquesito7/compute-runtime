@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
+#include "shared/source/os_interface/windows/os_context_win.h"
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
 
@@ -22,19 +23,19 @@ namespace NEO {
 
 bool DeviceTimeWddm::runEscape(Wddm *wddm, TimeStampDataHeader &escapeInfo) {
     if (wddm) {
-        D3DKMT_ESCAPE escapeCommand = {0};
+        D3DKMT_ESCAPE escapeCommand = {};
 
-        GTDIGetGpuCpuTimestampsIn in = {GTDI_FNC_GET_GPU_CPU_TIMESTAMPS};
-        uint32_t outSize = sizeof(GTDIGetGpuCpuTimestampsOut);
+        GetGpuCpuTimestampsIn in{};
+        uint32_t outSize = sizeof(GetGpuCpuTimestampsOut);
 
         escapeInfo.header.EscapeCode = static_cast<decltype(escapeInfo.header.EscapeCode)>(GFX_ESCAPE_IGPA_INSTRUMENTATION_CONTROL);
         escapeInfo.header.Size = outSize;
         escapeInfo.data.in = in;
 
         escapeCommand.Flags.Value = 0;
-        escapeCommand.hAdapter = (D3DKMT_HANDLE)0;
-        escapeCommand.hContext = (D3DKMT_HANDLE)0;
-        escapeCommand.hDevice = (D3DKMT_HANDLE)wddm->getDeviceHandle();
+        escapeCommand.hAdapter = 0;
+        escapeCommand.hContext = 0;
+        escapeCommand.hDevice = static_cast<D3DKMT_HANDLE>(wddm->getDeviceHandle());
         escapeCommand.pPrivateDriverData = &escapeInfo;
         escapeCommand.PrivateDriverDataSize = sizeof(escapeInfo);
         escapeCommand.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
@@ -53,7 +54,16 @@ DeviceTimeWddm::DeviceTimeWddm(Wddm *wddm) {
     this->wddm = wddm;
 }
 
-double DeviceTimeWddm::getDynamicDeviceTimerResolution(HardwareInfo const &hwInfo) const {
+MmioTimestampPtrHelper DeviceTimeWddm::getMmioTimestampPtrHelper(OsContext &osContext) {
+    if (!wddm) {
+        return {};
+    }
+
+    const auto contextHandle = static_cast<OsContextWin &>(osContext).getWddmContextHandle();
+    return wddm->createMmioTimestampPtrHelper(contextHandle);
+}
+
+double DeviceTimeWddm::getDynamicDeviceTimerResolution() const {
     double retVal = 0u;
     if (wddm) {
         retVal = 1000000000.0 / static_cast<double>(wddm->getTimestampFrequency());
@@ -62,7 +72,7 @@ double DeviceTimeWddm::getDynamicDeviceTimerResolution(HardwareInfo const &hwInf
     return retVal;
 }
 
-uint64_t DeviceTimeWddm::getDynamicDeviceTimerClock(HardwareInfo const &hwInfo) const {
+uint64_t DeviceTimeWddm::getDynamicDeviceTimerClock() const {
     uint64_t retVal = 0u;
     if (wddm) {
         retVal = static_cast<uint64_t>(wddm->getTimestampFrequency());

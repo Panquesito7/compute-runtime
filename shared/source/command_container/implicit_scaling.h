@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "shared/source/helpers/definitions/command_encoder_args.h"
 #include "shared/source/helpers/device_bitfield.h"
 #include "shared/source/helpers/vec.h"
 
@@ -16,6 +17,7 @@ struct WalkerPartitionArgs;
 
 namespace NEO {
 struct HardwareInfo;
+class Device;
 class LinearStream;
 struct PipeControlArgs;
 struct RootDeviceEnvironment;
@@ -36,27 +38,40 @@ struct ImplicitScalingHelper {
     static bool pipeControlBeforeCleanupAtomicSyncRequired();
 };
 
+struct ImplicitScalingDispatchCommandArgs {
+    uint64_t workPartitionAllocationGpuVa = 0;
+    const NEO::Device *device = nullptr;
+    void **outWalkerPtr = nullptr;
+
+    RequiredPartitionDim requiredPartitionDim = RequiredPartitionDim::none;
+    uint32_t partitionCount = 0;
+    uint32_t workgroupSize = 0;
+    uint32_t threadGroupCount = 0;
+
+    bool useSecondaryBatchBuffer = false;
+    bool apiSelfCleanup = false;
+    bool dcFlush = false;
+    bool forceExecutionOnSingleTile = false;
+    bool blockDispatchToCommandBuffer = false;
+    bool isRequiredDispatchWorkGroupOrder = false;
+};
+
 template <typename GfxFamily>
 struct ImplicitScalingDispatch {
-    using WALKER_TYPE = typename GfxFamily::WALKER_TYPE;
+    using DefaultWalkerType = typename GfxFamily::DefaultWalkerType;
 
+    template <typename WalkerType>
     static size_t getSize(bool apiSelfCleanup,
                           bool preferStaticPartitioning,
                           const DeviceBitfield &devices,
                           const Vec3<size_t> &groupStart,
                           const Vec3<size_t> &groupCount);
 
+    template <typename WalkerType>
     static void dispatchCommands(LinearStream &commandStream,
-                                 WALKER_TYPE &walkerCmd,
+                                 WalkerType &walkerCmd,
                                  const DeviceBitfield &devices,
-                                 uint32_t &partitionCount,
-                                 bool useSecondaryBatchBuffer,
-                                 bool apiSelfCleanup,
-                                 bool usesImages,
-                                 bool dcFlush,
-                                 bool forceExecutionOnSingleTile,
-                                 uint64_t workPartitionAllocationGpuVa,
-                                 const HardwareInfo &hwInfo);
+                                 ImplicitScalingDispatchCommandArgs &dispatchCommandArgs);
 
     static bool &getPipeControlStallRequired();
 
@@ -67,21 +82,33 @@ struct ImplicitScalingDispatch {
                                         const DeviceBitfield &devices,
                                         PipeControlArgs &flushArgs,
                                         const RootDeviceEnvironment &rootDeviceEnvironment,
-                                        uint64_t gpuAddress,
-                                        uint64_t immediateData,
+                                        uint64_t postSyncGpuAddress,
+                                        uint64_t postSyncImmediateData,
+                                        bool apiSelfCleanup,
+                                        bool useSecondaryBatchBuffer);
+
+    static void dispatchBarrierCommands(void *&commandBuffer,
+                                        const DeviceBitfield &devices,
+                                        PipeControlArgs &flushArgs,
+                                        const RootDeviceEnvironment &rootDeviceEnvironment,
+                                        uint64_t postSyncGpuAddress,
+                                        uint64_t postSyncImmediateData,
+                                        uint64_t cmdBufferGpuAddress,
                                         bool apiSelfCleanup,
                                         bool useSecondaryBatchBuffer);
 
     static size_t getRegisterConfigurationSize();
     static void dispatchRegisterConfiguration(LinearStream &commandStream,
                                               uint64_t workPartitionSurfaceAddress,
-                                              uint32_t addressOffset);
+                                              uint32_t addressOffset,
+                                              bool isBcs);
 
     static size_t getOffsetRegisterSize();
     static void dispatchOffsetRegister(LinearStream &commandStream,
-                                       uint32_t addressOffset);
+                                       uint32_t addressOffset, bool isBcs);
 
-    static uint32_t getPostSyncOffset();
+    static uint32_t getImmediateWritePostSyncOffset();
+    static uint32_t getTimeStampPostSyncOffset();
 
     static bool platformSupportsImplicitScaling(const RootDeviceEnvironment &rootDeviceEnvironment);
 

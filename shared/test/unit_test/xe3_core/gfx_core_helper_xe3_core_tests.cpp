@@ -1,0 +1,714 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_container/command_encoder.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/engine_node_helper.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/pipe_control_args.h"
+#include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/sku_info/sku_info_base.h"
+#include "shared/source/xe3_core/hw_cmds_base.h"
+#include "shared/source/xe3_core/hw_info_xe3_core.h"
+#include "shared/test/common/cmd_parse/hw_parse.h"
+#include "shared/test/common/fixtures/device_fixture.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/gfx_core_helper_tests.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/test_macros/header/per_product_test_definitions.h"
+#include "shared/test/common/test_macros/test.h"
+
+#include "aubstream/engine_node.h"
+#include "gtest/gtest.h"
+#include "metrics_library_api_1_0.h"
+
+#include <array>
+#include <bitset>
+#include <list>
+#include <memory>
+#include <vector>
+
+using GfxCoreHelperTestsXe3Core = GfxCoreHelperTest;
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, whenAskedForMidThreadPreemptionAllocationOnDemandSupportThenTrueIsReturned) {
+    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+    EXPECT_TRUE(gfxCoreHelper.isMidThreadPreemptionAllocationOnDemandSupported());
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, whenGettingMetricsLibraryGenIdThenXe3IsReturned) {
+    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+    EXPECT_EQ(static_cast<uint32_t>(MetricsLibraryApi::ClientGen::Xe3), gfxCoreHelper.getMetricsLibraryGenId());
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenCommandBufferAllocationTypeWhenGetAllocationDataIsCalledThenSystemMemoryIsRequested) {
+    AllocationData allocData;
+    AllocationProperties properties(mockRootDeviceIndex, true, 10, AllocationType::commandBuffer, false, mockDeviceBitfield);
+
+    MockMemoryManager mockMemoryManager;
+    mockMemoryManager.getAllocationData(allocData, properties, nullptr, mockMemoryManager.createStorageInfoFromProperties(properties));
+
+    EXPECT_TRUE(allocData.flags.useSystemMemory);
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, WhenAskingForDcFlushThenReturnTrue) {
+    EXPECT_TRUE(MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pDevice->getRootDeviceEnvironment()));
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, whenGetGpgpuEnginesThenReturnTwoCccsEnginesAndFourCcsEnginesAndEightLinkCopyEnginesAndTwoRegularCopyEngines) {
+    const size_t numEngines = 18;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.caps.rcsExposureDisabled = false;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.featureTable.ftrBcsInfo = maxNBitValue(9);
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS1, true, false},
+        {aub_stream::ENGINE_CCS2, true, false},
+        {aub_stream::ENGINE_CCS3, true, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS1, false, true},
+        {aub_stream::ENGINE_BCS2, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS4, false, true},
+        {aub_stream::ENGINE_BCS5, false, true},
+        {aub_stream::ENGINE_BCS6, false, true},
+        {aub_stream::ENGINE_BCS7, false, true},
+        {aub_stream::ENGINE_BCS8, false, true},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenOneCcsEnabledWhenGetEnginesCalledThenCreateOnlyOneCcs) {
+    const size_t numEngines = 15;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.caps.rcsExposureDisabled = false;
+    hwInfo.featureTable.ftrBcsInfo = maxNBitValue(9);
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS1, false, true},
+        {aub_stream::ENGINE_BCS2, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS4, false, true},
+        {aub_stream::ENGINE_BCS5, false, true},
+        {aub_stream::ENGINE_BCS6, false, true},
+        {aub_stream::ENGINE_BCS7, false, true},
+        {aub_stream::ENGINE_BCS8, false, true},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenRcsExposureDisabledWhenGettingGpgpuEnginesThenCCCSIsNotAdded) {
+    const size_t numEngines = 14;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.caps.rcsExposureDisabled = true;
+    hwInfo.featureTable.ftrBcsInfo = maxNBitValue(9);
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS1, false, true},
+        {aub_stream::ENGINE_BCS2, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS4, false, true},
+        {aub_stream::ENGINE_BCS5, false, true},
+        {aub_stream::ENGINE_BCS6, false, true},
+        {aub_stream::ENGINE_BCS7, false, true},
+        {aub_stream::ENGINE_BCS8, false, true},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenNodeOrdinalSetoToCCCSWhenGettingGpgpuEnginesThenCCCSIsAdded) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.NodeOrdinal.set(aub_stream::ENGINE_CCCS);
+    const size_t numEngines = 15;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.caps.rcsExposureDisabled = true;
+    hwInfo.featureTable.ftrBcsInfo = maxNBitValue(9);
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS1, false, true},
+        {aub_stream::ENGINE_BCS2, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS3, false, true},
+        {aub_stream::ENGINE_BCS4, false, true},
+        {aub_stream::ENGINE_BCS5, false, true},
+        {aub_stream::ENGINE_BCS6, false, true},
+        {aub_stream::ENGINE_BCS7, false, true},
+        {aub_stream::ENGINE_BCS8, false, true},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenNotAllCopyEnginesWhenSettingEngineTableThenDontAddUnsuportted) {
+    const size_t numEngines = 10;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.caps.rcsExposureDisabled = false;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.featureTable.ftrBcsInfo = maxNBitValue(9);
+    hwInfo.featureTable.ftrBcsInfo.set(0, false);
+    hwInfo.featureTable.ftrBcsInfo.set(2, false);
+    hwInfo.featureTable.ftrBcsInfo.set(7, false);
+    hwInfo.featureTable.ftrBcsInfo.set(8, false);
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_BCS1, false, true},
+        {aub_stream::ENGINE_BCS3, false, true}, // regular
+        {aub_stream::ENGINE_BCS3, false, true}, // internal
+        {aub_stream::ENGINE_BCS4, false, true},
+        {aub_stream::ENGINE_BCS5, false, true},
+        {aub_stream::ENGINE_BCS6, false, true},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenOneBcsEnabledWhenGetEnginesCalledThenCreateOnlyOneBcs) {
+    const size_t numEngines = 9;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.caps.rcsExposureDisabled = false;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.featureTable.ftrBcsInfo = 1;
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS1, true, false},
+        {aub_stream::ENGINE_CCS2, true, false},
+        {aub_stream::ENGINE_CCS3, true, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_BCS, false, true},
+        {aub_stream::ENGINE_BCS, false, true},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenBcsDisabledWhenGetEnginesCalledThenDontCreateAnyBcs) {
+    const size_t numEngines = 7;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.caps.rcsExposureDisabled = false;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.featureTable.ftrBcsInfo = 0;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(numEngines, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(numEngines, engines.size());
+
+    struct EnginePropertiesMap {
+        aub_stream::EngineType engineType;
+        bool isCcs;
+        bool isBcs;
+    };
+
+    const std::array<EnginePropertiesMap, numEngines> enginePropertiesMap = {{
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS1, true, false},
+        {aub_stream::ENGINE_CCS2, true, false},
+        {aub_stream::ENGINE_CCS3, true, false},
+        {aub_stream::ENGINE_CCCS, false, false},
+        {aub_stream::ENGINE_CCS, true, false},
+        {aub_stream::ENGINE_CCS, true, false},
+    }};
+
+    for (size_t i = 0; i < numEngines; i++) {
+        EXPECT_EQ(enginePropertiesMap[i].engineType, engines[i].first);
+        EXPECT_EQ(enginePropertiesMap[i].isCcs, EngineHelpers::isCcs(enginePropertiesMap[i].engineType));
+        EXPECT_EQ(enginePropertiesMap[i].isBcs, EngineHelpers::isBcs(enginePropertiesMap[i].engineType));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenDefaultMemorySynchronizationCommandsWhenAddingAdditionalSynchronizationThenMemoryFenceIsReleased) {
+    using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
+
+    auto &rootDeviceEnvironment = this->pDevice->getRootDeviceEnvironment();
+    auto &hardwareInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
+    hardwareInfo.featureTable.flags.ftrLocalMemory = true;
+    uint8_t buffer[128] = {};
+    LinearStream commandStream(buffer, 128);
+
+    MemorySynchronizationCommands<FamilyType>::addAdditionalSynchronization(commandStream, 0x0, NEO::FenceType::release, rootDeviceEnvironment);
+
+    if (MemorySynchronizationCommands<FamilyType>::getSizeForAdditionalSynchronization(NEO::FenceType::release, rootDeviceEnvironment) > 0) {
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(commandStream);
+        EXPECT_EQ(1u, hwParser.cmdList.size());
+        auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*hwParser.cmdList.begin());
+        ASSERT_NE(nullptr, fenceCmd);
+        EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenDontProgramGlobalFenceAsMiMemFenceCommandInCommandStreamWhenAddingAdditionalSynchronizationThenSemaphoreWaitIsCalled) {
+    DebugManagerStateRestore debugRestorer;
+    debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    auto &rootDeviceEnvironment = this->pDevice->getRootDeviceEnvironment();
+    auto &hardwareInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
+    hardwareInfo.featureTable.flags.ftrLocalMemory = true;
+    uint8_t buffer[128] = {};
+    LinearStream commandStream(buffer, 128);
+    uint64_t gpuAddress = 0x12345678;
+
+    MemorySynchronizationCommands<FamilyType>::addAdditionalSynchronization(commandStream, gpuAddress, NEO::FenceType::release, rootDeviceEnvironment);
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(commandStream);
+    EXPECT_EQ(1u, hwParser.cmdList.size());
+    auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*hwParser.cmdList.begin());
+    ASSERT_NE(nullptr, semaphoreCmd);
+    EXPECT_EQ(static_cast<uint32_t>(-2), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
+    EXPECT_EQ(gpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
+    EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD, semaphoreCmd->getCompareOperation());
+}
+
+using ProductHelperTestXe3Core = Test<DeviceFixture>;
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenCheckTimestampWaitForQueuesSupportThenReturnTrue) {
+    auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_TRUE(productHelper.isTimestampWaitSupportedForQueues());
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenCheckTimestampWaitSupportThenReturnTrue) {
+    auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_TRUE(productHelper.isTimestampWaitSupportedForEvents());
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenMultitileConfigWhenConfiguringHwInfoThenBlitterIsEnabled) {
+    auto &productHelper = getHelper<ProductHelper>();
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrBlitterRing = true;
+
+    for (uint32_t tileCount = 0; tileCount <= 4; tileCount++) {
+        hwInfo.gtSystemInfo.MultiTileArchInfo.TileCount = tileCount;
+        hwInfo.capabilityTable.blitterOperationsSupported = false;
+
+        productHelper.configureHardwareCustom(&hwInfo, nullptr);
+
+        EXPECT_TRUE(hwInfo.capabilityTable.blitterOperationsSupported);
+    }
+
+    hwInfo.featureTable.flags.ftrBlitterRing = false;
+
+    for (uint32_t tileCount = 0; tileCount <= 4; tileCount++) {
+        hwInfo.gtSystemInfo.MultiTileArchInfo.TileCount = tileCount;
+        hwInfo.capabilityTable.blitterOperationsSupported = false;
+
+        productHelper.configureHardwareCustom(&hwInfo, nullptr);
+
+        EXPECT_FALSE(hwInfo.capabilityTable.blitterOperationsSupported);
+    }
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenRevisionEnumThenProperMaxThreadsForWorkgroupIsReturned) {
+    auto hardwareInfo = *defaultHwInfo;
+    auto &productHelper = getHelper<ProductHelper>();
+    uint32_t numThreadsPerEU = hardwareInfo.gtSystemInfo.ThreadCount / hardwareInfo.gtSystemInfo.EUCount;
+    EXPECT_EQ(64u * numThreadsPerEU, productHelper.getMaxThreadsForWorkgroupInDSSOrSS(hardwareInfo, 64u, 64u));
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenIsBlitterForImagesSupportedIsCalledThenTrueIsReturned) {
+    auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_TRUE(productHelper.isBlitterForImagesSupported());
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenAskingForGlobalFenceSupportThenReturnTrue) {
+    auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_EQ(productHelper.isReleaseGlobalFenceInCommandStreamRequired(*defaultHwInfo), !defaultHwInfo->capabilityTable.isIntegratedDevice);
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenCallDeferMOCSToPatThenTrueIsReturned) {
+    const auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_TRUE(productHelper.deferMOCSToPatIndex(false));
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenCallDeferMOCSToPatOnWSLThenTrueIsReturned) {
+    const auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_TRUE(productHelper.deferMOCSToPatIndex(true));
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenAskingForCooperativeEngineSupportThenReturnFalse) {
+    auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_FALSE(productHelper.isCooperativeEngineSupported(*defaultHwInfo));
+}
+
+XE3_CORETEST_F(ProductHelperTestXe3Core, givenProductHelperWhenAskingForIsIpSamplingSupportedThenReturnTrue) {
+    const auto &productHelper = getHelper<ProductHelper>();
+    EXPECT_TRUE(productHelper.isIpSamplingSupported(*defaultHwInfo));
+}
+
+using LriHelperTestsXe3Core = ::testing::Test;
+
+XE3_CORETEST_F(LriHelperTestsXe3Core, whenProgrammingLriCommandThenExpectMmioRemapEnableCorrectlySet) {
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+    auto buffer = std::make_unique<uint8_t[]>(128);
+
+    LinearStream stream(buffer.get(), 128);
+    uint32_t address = 0x8888;
+    uint32_t data = 0x1234;
+
+    auto expectedLri = FamilyType::cmdInitLoadRegisterImm;
+    EXPECT_FALSE(expectedLri.getMmioRemapEnable());
+    expectedLri.setRegisterOffset(address);
+    expectedLri.setDataDword(data);
+    expectedLri.setMmioRemapEnable(true);
+
+    LriHelper<FamilyType>::program(&stream, address, data, true, false);
+    MI_LOAD_REGISTER_IMM *lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(buffer.get());
+    ASSERT_NE(nullptr, lri);
+
+    EXPECT_EQ(sizeof(MI_LOAD_REGISTER_IMM), stream.getUsed());
+    EXPECT_EQ(lri, stream.getCpuBase());
+    EXPECT_TRUE(memcmp(lri, &expectedLri, sizeof(MI_LOAD_REGISTER_IMM)) == 0);
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenNumGrfAndSimdSizeWhenAdjustingMaxWorkGroupSizeThenCorrectWorkGroupSizeIsReturned) {
+    auto defaultMaxWorkGroupSize = 2048u;
+    const auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+    const auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
+    std::array<std::array<uint32_t, 3>, 15> values = {{
+        {128u, 16u, 1024u}, // Grf Size, SIMT Size, Max Num of threads
+        {128u, 32u, 1024u},
+        {160u, 16u, 768u},
+        {160u, 32u, 1024u},
+        {192u, 16u, 640u},
+        {192u, 32u, 1024u},
+        {256u, 16u, 512u},
+        {256u, 32u, 1024u},
+        {512u, 16u, 256u},
+        {512u, 32u, 512u},
+        {128u, 1u, 64u},
+        {160u, 1u, 48u},
+        {192u, 1u, 40u},
+        {256u, 1u, 32u},
+        {512u, 1u, 16u},
+    }};
+
+    for (auto &[grfSize, simtSize, expectedNumThreadsPerThreadGroup] : values) {
+        EXPECT_EQ(expectedNumThreadsPerThreadGroup, gfxCoreHelper.adjustMaxWorkGroupSize(grfSize, simtSize, defaultMaxWorkGroupSize, rootDeviceEnvironment));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenParamsWhenCalculateNumThreadsPerThreadGroupThenMethodReturnProperValue) {
+    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+    const auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
+    auto totalWgSize = 2048u;
+    std::array<std::array<uint32_t, 3>, 15> values = {{
+        {128u, 16u, 64u}, // Grf Size, SIMT Size, Max Num of threads
+        {128u, 32u, 32u},
+        {128u, 1u, 64u},
+        {160u, 16u, 48u},
+        {160u, 32u, 32u},
+        {160u, 1u, 48u},
+        {192u, 16u, 40u},
+        {192u, 32u, 32u},
+        {192u, 1u, 40u},
+        {256u, 16u, 32u},
+        {256u, 32u, 32u},
+        {256u, 1u, 32u},
+        {512u, 16u, 16u},
+        {512u, 32u, 16u},
+        {512u, 1u, 16u},
+    }};
+
+    for (auto &[grfSize, simtSize, expectedNumThreadsPerThreadGroup] : values) {
+        EXPECT_EQ(expectedNumThreadsPerThreadGroup, gfxCoreHelper.calculateNumThreadsPerThreadGroup(simtSize, totalWgSize, grfSize, rootDeviceEnvironment));
+    }
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenGfxCoreHelperWhenFlagSetAndCallGetAmountOfAllocationsToFillThenReturnCorrectValue) {
+    DebugManagerStateRestore restorer;
+    MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &gfxCoreHelper = mockExecutionEnvironment.rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
+    EXPECT_EQ(gfxCoreHelper.getAmountOfAllocationsToFill(), 2u);
+
+    debugManager.flags.SetAmountOfReusableAllocations.set(0);
+    EXPECT_EQ(gfxCoreHelper.getAmountOfAllocationsToFill(), 0u);
+
+    debugManager.flags.SetAmountOfReusableAllocations.set(1);
+    EXPECT_EQ(gfxCoreHelper.getAmountOfAllocationsToFill(), 1u);
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenGfxCoreHelperWhenUsmCompressionSupportedCalledThenReturnTrue) {
+    VariableBackup<HardwareInfo> backupHwInfo(defaultHwInfo.get());
+    DebugManagerStateRestore restorer;
+    MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &gfxCoreHelper = mockExecutionEnvironment.rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
+
+    defaultHwInfo->capabilityTable.ftrRenderCompressedBuffers = false;
+    EXPECT_FALSE(gfxCoreHelper.usmCompressionSupported(*defaultHwInfo));
+
+    defaultHwInfo->capabilityTable.ftrRenderCompressedBuffers = true;
+    EXPECT_TRUE(gfxCoreHelper.usmCompressionSupported(*defaultHwInfo));
+
+    debugManager.flags.RenderCompressedBuffersEnabled.set(0);
+    EXPECT_FALSE(gfxCoreHelper.usmCompressionSupported(*defaultHwInfo));
+
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+    defaultHwInfo->capabilityTable.ftrRenderCompressedBuffers = false;
+    EXPECT_TRUE(gfxCoreHelper.usmCompressionSupported(*defaultHwInfo));
+}
+
+using ProductHelperTestXe3 = ::testing::Test;
+
+XE3_CORETEST_F(ProductHelperTestXe3, when64bAddressingIsEnabledForRTThenResourcesAreNot48b) {
+    DebugManagerStateRestore restore;
+    MockExecutionEnvironment executionEnvironment{};
+    auto productHelper = &executionEnvironment.rootDeviceEnvironments[0]->getHelper<ProductHelper>();
+    EXPECT_FALSE(productHelper->is48bResourceNeededForRayTracing());
+
+    debugManager.flags.Enable64bAddressingForRayTracing.set(true);
+    EXPECT_FALSE(productHelper->is48bResourceNeededForRayTracing());
+
+    debugManager.flags.Enable64bAddressingForRayTracing.set(false);
+    EXPECT_TRUE(productHelper->is48bResourceNeededForRayTracing());
+}
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, givenXe3WhenSetStallOnlyBarrierThenResourceBarrierProgrammed) {
+    using RESOURCE_BARRIER = typename FamilyType::RESOURCE_BARRIER;
+    constexpr static auto bufferSize = sizeof(RESOURCE_BARRIER);
+
+    char streamBuffer[bufferSize];
+    LinearStream stream(streamBuffer, bufferSize);
+    PipeControlArgs args;
+    args.csStallOnly = true;
+    MemorySynchronizationCommands<FamilyType>::addSingleBarrier(stream, PostSyncMode::noWrite, 0u, 0u, args);
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(stream, 0);
+    GenCmdList resourceBarrierList = hwParser.getCommandsList<RESOURCE_BARRIER>();
+    EXPECT_EQ(1u, resourceBarrierList.size());
+    GenCmdList::iterator itor = resourceBarrierList.begin();
+    EXPECT_TRUE(hwParser.isStallingBarrier<FamilyType>(itor));
+    auto resourceBarrier = genCmdCast<RESOURCE_BARRIER *>(*itor);
+    EXPECT_NE(nullptr, resourceBarrier);
+    EXPECT_EQ(RESOURCE_BARRIER::SIGNAL_STAGE::SIGNAL_STAGE_GPGPU, resourceBarrier->getSignalStage());
+    EXPECT_FALSE(resourceBarrier->getL1DataportCacheInvalidate());
+    EXPECT_FALSE(resourceBarrier->getL1DataportUavFlush());
+}
+
+struct GfxCoreHelperTestsXe3CoreResourceBarrier : public GfxCoreHelperTestsXe3Core,
+                                                  public ::testing::WithParamInterface<uint32_t> {
+};
+
+XE3_CORETEST_P(GfxCoreHelperTestsXe3CoreResourceBarrier, givenXe3WhenSetStallOnlyBarrierWithDebugFlagThenSetL1CacheFlush) {
+    using RESOURCE_BARRIER = typename FamilyType::RESOURCE_BARRIER;
+    constexpr static auto bufferSize = sizeof(RESOURCE_BARRIER);
+
+    DebugManagerStateRestore restorer;
+    auto mode = GetParam();
+    debugManager.flags.ResourceBarrierL1FlushMode.set(mode);
+
+    PipeControlArgs args;
+    args.csStallOnly = true;
+    char streamBuffer[bufferSize];
+    LinearStream stream(streamBuffer, bufferSize);
+
+    MemorySynchronizationCommands<FamilyType>::addSingleBarrier(stream, PostSyncMode::noWrite, 0u, 0u, args);
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(stream, 0);
+    GenCmdList resourceBarrierList = hwParser.getCommandsList<RESOURCE_BARRIER>();
+    EXPECT_EQ(1u, resourceBarrierList.size());
+    GenCmdList::iterator itor = resourceBarrierList.begin();
+    auto resourceBarrier = genCmdCast<RESOURCE_BARRIER *>(*itor);
+    EXPECT_NE(nullptr, resourceBarrier);
+    if (mode == 1) {
+        EXPECT_TRUE(resourceBarrier->getL1DataportCacheInvalidate());
+        EXPECT_FALSE(resourceBarrier->getL1DataportUavFlush());
+    } else if (mode == 2) {
+        EXPECT_FALSE(resourceBarrier->getL1DataportCacheInvalidate());
+        EXPECT_TRUE(resourceBarrier->getL1DataportUavFlush());
+    } else if (mode == 3) {
+        EXPECT_TRUE(resourceBarrier->getL1DataportCacheInvalidate());
+        EXPECT_TRUE(resourceBarrier->getL1DataportUavFlush());
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(GfxCoreHelperTestsXe3CoreResourceBarrierValues,
+                         GfxCoreHelperTestsXe3CoreResourceBarrier,
+                         ::testing::Values(1, 2, 3));
+
+XE3_CORETEST_F(GfxCoreHelperTestsXe3Core, whenIsWalkerPostSyncSkipEnabledCalledThenReturnTrue) {
+    DebugManagerStateRestore restorer{};
+    MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &gfxCoreHelper = mockExecutionEnvironment.rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
+    EXPECT_FALSE(gfxCoreHelper.isWalkerPostSyncSkipEnabled(false));
+    EXPECT_TRUE(gfxCoreHelper.isWalkerPostSyncSkipEnabled(true));
+
+    debugManager.flags.EnableWalkerPostSyncSkip.set(1);
+    EXPECT_TRUE(gfxCoreHelper.isWalkerPostSyncSkipEnabled(false));
+
+    debugManager.flags.EnableWalkerPostSyncSkip.set(0);
+    EXPECT_FALSE(gfxCoreHelper.isWalkerPostSyncSkipEnabled(false));
+}

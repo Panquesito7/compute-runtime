@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,7 +9,7 @@
 
 namespace NEO {
 
-MEMORY_OBJECT_CONTROL_STATE MockGmmClientContextBase::cachePolicyGetMemoryObject(GMM_RESOURCE_INFO *pResInfo, GMM_RESOURCE_USAGE_TYPE usage) {
+MEMORY_OBJECT_CONTROL_STATE MockGmmClientContextBase::cachePolicyGetMemoryObject(GMM_RESOURCE_INFO *pResInfo, GmmResourceUsageType usage) {
     MEMORY_OBJECT_CONTROL_STATE retVal = {};
     memset(&retVal, 0, sizeof(MEMORY_OBJECT_CONTROL_STATE));
     switch (usage) {
@@ -35,16 +35,25 @@ MEMORY_OBJECT_CONTROL_STATE MockGmmClientContextBase::cachePolicyGetMemoryObject
     return retVal;
 }
 
-uint32_t MockGmmClientContextBase::cachePolicyGetPATIndex(GMM_RESOURCE_INFO *gmmResourceInfo, GMM_RESOURCE_USAGE_TYPE usage, bool compressed, bool cachable) {
+uint32_t MockGmmClientContextBase::cachePolicyGetPATIndex(GMM_RESOURCE_INFO *gmmResourceInfo, GmmResourceUsageType usage, bool compressed, bool cpuCacheable) {
+    getPatIndexQueryCalled++;
+    passedResourceInfoForGetPatIndexQuery = gmmResourceInfo;
     passedCompressedSettingForGetPatIndexQuery = compressed;
-    passedCachableSettingForGetPatIndexQuery = cachable;
+    passedCpuCacheableSettingForGetPatIndexQuery = cpuCacheable;
+    passedUsageTypeForGetPatIndexQuery = usage;
 
     if (returnErrorOnPatIndexQuery) {
         return MockPatIndex::error;
     }
 
-    if (usage == GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED) {
+    if (usage == GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED ||
+        usage == GMM_RESOURCE_USAGE_SURFACE_UNCACHED) {
         return MockPatIndex::uncached;
+    }
+
+    if (usage == GMM_RESOURCE_USAGE_HW_CONTEXT ||
+        usage == GMM_RESOURCE_USAGE_FINE_GRAINED_COHERENT) {
+        return MockPatIndex::twoWayCoherent;
     }
 
     return MockPatIndex::cached;

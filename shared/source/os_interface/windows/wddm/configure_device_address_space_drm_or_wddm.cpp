@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,22 +9,21 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/client_context/gmm_client_context.h"
 #include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_callbacks.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/gmm_helper/page_table_mngr.h"
 #include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/gmm_helper/windows/gmm_memory.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/source/helpers/windows/gmm_callbacks.h"
 #include "shared/source/memory_manager/gfx_partition.h"
 #include "shared/source/os_interface/linux/allocator_helper.h"
-#include "shared/source/os_interface/product_helper.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
 #include "shared/source/os_interface/windows/gfx_escape_wrapper.h"
+#include "shared/source/os_interface/windows/hw_device_id.h"
 #include "shared/source/os_interface/windows/wddm/um_km_data_temp_storage.h"
 #include "shared/source/os_interface/windows/wddm/um_km_data_translator.h"
 #include "shared/source/os_interface/windows/wddm/wddm.h"
-
-#include "gmm_memory.h"
 
 namespace NEO {
 
@@ -87,10 +86,10 @@ bool tryWritePartitionLayoutWithinProcess(Wddm &wddm, GMM_GFX_PARTITIONING &part
     return synchronizePartitionLayoutWithinProcess(wddm, partitionLayout, GfxSynchPartitionInfoEscapeHeader::actionSet);
 }
 
-bool adjustGfxPartitionLayout(GMM_GFX_PARTITIONING &partitionLayout, uint64_t gpuAddressSpace, uintptr_t minAllowedAddress, Wddm &wddm, PRODUCT_FAMILY productFamily) {
+bool adjustGfxPartitionLayout(GMM_GFX_PARTITIONING &partitionLayout, uint64_t gpuAddressSpace, uintptr_t minAllowedAddress, Wddm &wddm) {
     bool requiresRepartitioning = (gpuAddressSpace == maxNBitValue(47)) && wddm.getFeatureTable().flags.ftrCCSRing;
-    auto &productHelper = wddm.getRootDeviceEnvironment().getHelper<ProductHelper>();
-    requiresRepartitioning |= productHelper.overrideGfxPartitionLayoutForWsl();
+    const auto &hwInfo = *wddm.getRootDeviceEnvironment().getHardwareInfo();
+    requiresRepartitioning |= hwInfo.caps.overrideGfxPartitionLayoutForWsl;
     if (false == requiresRepartitioning) {
         return true;
     }
@@ -99,11 +98,9 @@ bool adjustGfxPartitionLayout(GMM_GFX_PARTITIONING &partitionLayout, uint64_t gp
 
     if (false == readPartitionLayoutWithinProcess(wddm, partitionLayout)) {
         return false;
-    } else {
-        if (partitionLayout.Standard64KB.Limit != 0) {
-            // already partitioned
-            return true;
-        }
+    } else if (partitionLayout.Standard64KB.Limit != 0) {
+        // already partitioned
+        return true;
     }
 
     partitionLayout.SVM.Base = minAllowedAddress;
@@ -183,12 +180,7 @@ bool Wddm::configureDeviceAddressSpace() {
         return false;
     }
 
-    auto productFamily = gfxPlatform->eProductFamily;
-    if (!hardwareInfoTable[productFamily]) {
-        DEBUG_BREAK_IF(true);
-        return false;
-    }
-
+    auto productFamily = rootDeviceEnvironment.getHardwareInfo()->platform.eProductFamily;
     auto gpuAddressSpace = hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace;
     maximumApplicationAddress = MemoryConstants::max64BitAppAddress;
 
@@ -201,7 +193,7 @@ bool Wddm::configureDeviceAddressSpace() {
     }
 
     if (maxUsmSize > 0) {
-        if (false == adjustGfxPartitionLayout(this->gfxPartition, gpuAddressSpace, usmBase, *this, gfxPlatform->eProductFamily)) {
+        if (false == adjustGfxPartitionLayout(this->gfxPartition, gpuAddressSpace, usmBase, *this)) {
             return false;
         }
         if (gfxPartition.Standard64KB.Limit <= maxUsmSize) {
@@ -233,8 +225,7 @@ bool Wddm::configureDeviceAddressSpace() {
         }
     }
 
-    uintptr_t addr = 0;
-    auto ret = gmmMemory->configureDevice(getAdapter(), device, getGdi()->escape, maxUsmSize, featureTable->flags.ftrL3IACoherency, addr, false);
+    auto ret = gmmMemory->configureDevice(getAdapter(), device, getGdi()->escape, maxUsmSize, featureTable->flags.ftrL3IACoherency);
     return ret;
 }
 

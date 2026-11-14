@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,16 @@
 
 #pragma once
 
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/test_macros/test_checks_shared.h"
+
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/helpers/dispatch_info.h"
+#include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include "gtest/gtest.h"
 
 namespace NEO {
 
@@ -44,7 +51,7 @@ struct OneMipLevelImageFixture {
     Image *createImage() {
         cl_image_desc imageDesc = Image3dDefaults::imageDesc;
         imageDesc.num_mip_levels = 1;
-        return ImageHelper<Image3dDefaults>::create(&context, &imageDesc);
+        return ImageHelperUlt<Image3dDefaults>::create(&context, &imageDesc);
     }
 
     Buffer *createBuffer() {
@@ -62,7 +69,7 @@ struct OneMipLevelImageFixture {
     size_t region[4] = {0, 0, 0, 0};
     void *cpuPtr = Image3dDefaults::hostPtr;
 
-    BuiltinOpParams usedBuiltinOpsParams;
+    BuiltIn::OpParams usedBuiltinOpsParams;
     bool builtinOpsParamsCaptured;
 };
 

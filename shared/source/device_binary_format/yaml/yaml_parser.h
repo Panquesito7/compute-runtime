@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,7 +12,6 @@
 #include "shared/source/utilities/stackvec.h"
 
 #include <array>
-#include <iterator>
 #include <string>
 
 namespace NEO {
@@ -53,6 +52,14 @@ constexpr bool isAlphaNumeric(char c) {
     return isLetter(c) || isNumber(c);
 }
 
+constexpr bool isHexDigit(char c) {
+    return isNumber(c) || ((c >= 'a') & (c <= 'f')) || ((c >= 'A') & (c <= 'F'));
+}
+
+constexpr bool isHexPrefix(const char *parsePos, const char *parseEnd) {
+    return (parseEnd - parsePos >= 2) && (parsePos[0] == '0') && (parsePos[1] == 'x' || parsePos[1] == 'X');
+}
+
 constexpr bool isNameIdentifierCharacter(char c) {
     return isAlphaNumeric(c) || ('_' == c) || ('-' == c) || ('.' == c);
 }
@@ -84,11 +91,21 @@ constexpr const char *consumeNumberOrSign(ConstStringRef wholeText, const char *
     UNRECOVERABLE_IF(parsePos < wholeText.begin());
     UNRECOVERABLE_IF(parsePos == wholeText.end());
     auto parseEnd = wholeText.end();
-    if (isNumber(*parsePos)) {
-        auto it = parsePos + 1;
+    const auto isHex = isHexPrefix(parsePos, parseEnd);
+    if (isNumber(*parsePos) || isHex) {
+        auto it = parsePos;
+        if (isHex) {
+            it += 2;
+        }
         while (it < parseEnd) {
-            if (false == (isNumber(*it) || ('.' == *it))) {
-                break;
+            if (isHex) {
+                if (!isHexDigit(*it)) {
+                    break;
+                }
+            } else {
+                if (!isNumber(*it) && (*it != '.')) {
+                    break;
+                }
             }
             ++it;
         }
@@ -155,15 +172,15 @@ using TokenId = uint32_t;
 constexpr TokenId invalidTokenId = std::numeric_limits<TokenId>::max();
 
 struct Token {
-    enum Type : uint8_t { Identifier,
-                          LiteralString,
-                          LiteralNumber,
-                          SingleCharacter,
-                          Comment,
-                          FileSectionBeg,
-                          FileSectionEnd,
-                          CollectionBeg,
-                          CollectionEnd };
+    enum Type : uint8_t { identifier,
+                          literalString,
+                          literalNumber,
+                          singleCharacter,
+                          comment,
+                          fileSectionBeg,
+                          fileSectionEnd,
+                          collectionBeg,
+                          collectionEnd };
 
     constexpr Token(ConstStringRef tokData, Type tokType) {
         pos = tokData.begin();
@@ -175,7 +192,7 @@ struct Token {
     const char *pos = nullptr;
     uint32_t len = 0U;
     struct {
-        Type type = Token::Type::Identifier;
+        Type type = Token::Type::identifier;
         char character0 = 0U;
     } traits;
 
@@ -236,17 +253,25 @@ constexpr bool isVectorDataType(const Token &token) {
     return false;
 }
 
+constexpr bool allowEmptyVectorDataType(const Token &token) {
+    auto tokenString = ConstStringRef(token.pos, token.len);
+    if (equals(tokenString, "kernels")) {
+        return true;
+    }
+    return false;
+}
+
 struct Line {
-    enum class LineType : uint8_t { Empty,
-                                    Comment,
-                                    FileSection,
-                                    DictionaryEntry,
-                                    ListEntry };
+    enum class LineType : uint8_t { empty,
+                                    comment,
+                                    fileSection,
+                                    dictionaryEntry,
+                                    listEntry };
     TokenId first = 0U;
     TokenId last = 0U; // note : NOT past last (aka end)
 
     uint16_t indent = 0U;
-    LineType lineType = LineType::Empty;
+    LineType lineType = LineType::empty;
     struct LineTraits {
         union {
             struct {
@@ -270,15 +295,27 @@ struct Line {
 static_assert(sizeof(Line) == 12, "");
 
 template <typename T, typename It>
-inline bool reserveBasedOnEstimates(T &container, It beg, It end, It pos) {
-    if ((container.size() < container.capacity()) || (pos == beg)) {
+inline bool reserveBasedOnEstimates(T &container, It beg, It end, It pos, size_t minFreeSlots) {
+    if ((container.size() + minFreeSlots <= container.capacity()) || (pos == beg)) {
         return false;
     }
     DEBUG_BREAK_IF((beg > end) || (pos < beg));
     auto normalizedPosInv = float(end - beg) / float(pos - beg);
     auto estimatedTotalElements = static_cast<size_t>(container.size() * normalizedPosInv);
+    if (estimatedTotalElements < container.size() + minFreeSlots) {
+        // Extrapolation may round down below the requested headroom.
+        estimatedTotalElements = container.capacity() * 2U;
+        if (estimatedTotalElements < container.size() + minFreeSlots) {
+            estimatedTotalElements = container.size() + minFreeSlots;
+        }
+    }
     container.reserve(estimatedTotalElements);
     return true;
+}
+
+template <typename T, typename It>
+inline bool reserveBasedOnEstimates(T &container, It beg, It end, It pos) {
+    return reserveBasedOnEstimates(container, beg, end, pos, 1U);
 }
 
 using TokensCache = StackVec<Token, 2048>;
@@ -287,7 +324,7 @@ using LinesCache = StackVec<Line, 512>;
 std::string constructYamlError(size_t lineNumber, const char *lineBeg, const char *parsePos, const char *reason = nullptr);
 
 bool isValidInlineCollectionFormat(const char *context, const char *contextEnd);
-constexpr ConstStringRef inlineCollectionYamlErrorMsg = "NEO::Yaml : Inline collection is not in valid regex format - ^\\[(\\s*(\\d|\\w)+,?)+\\s*\\]\\s*\\n";
+constexpr ConstStringRef inlineCollectionYamlErrorMsg = "NEO::Yaml : Inline collection is not in valid regex format - ^\\[(\\s*(\\d|\\w)+,?)*\\s*\\]\\s*\\n";
 
 bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens, std::string &outErrReason, std::string &outWarning);
 
@@ -317,11 +354,11 @@ constexpr bool isUnused(Line::LineType lineType) {
     switch (lineType) {
     default:
         return false;
-    case Line::LineType::Empty:
+    case Line::LineType::empty:
         return true;
-    case Line::LineType::Comment:
+    case Line::LineType::comment:
         return true;
-    case Line::LineType::FileSection:
+    case Line::LineType::fileSection:
         return true;
     }
 }
@@ -492,18 +529,55 @@ struct YamlParser {
     template <typename T>
     bool readValueChecked(const Node &node, T &outValue) const;
 
+    template <typename T>
+    bool readValueChecked(const Node &node, T &outValue, std::string_view messageOnError, std::string &outErrorLog) const {
+        auto success = readValueChecked(node, outValue);
+        if (false == success) {
+            outErrorLog += messageOnError;
+        }
+        return success;
+    }
+
+    template <typename T>
+    bool readValueChecked(const Node *node, T &outValue, std::string_view messageOnError, std::string &outErrorLog) const {
+        if (nullptr == node) {
+            outErrorLog += messageOnError;
+            return false;
+        }
+        auto success = readValueChecked(*node, outValue);
+        if (false == success) {
+            outErrorLog += messageOnError;
+        }
+        return success;
+    }
+
     ConstStringRef readValueNoQuotes(const Node &node) const {
         if (invalidTokenId == node.value) {
             return "";
         }
         auto &tok = tokens[node.value];
-        if (Token::Type::LiteralString != tok.traits.type) {
+        if (Token::Type::literalString != tok.traits.type) {
             return tok.cstrref();
         }
         if ((tok.traits.character0 != '\'') && (tok.traits.character0 != '\"')) {
             return tok.cstrref();
         }
         return ConstStringRef(tok.pos + 1, tok.len - 2);
+    }
+
+    bool readValueNoQuotes(const Node *node, std::string &outValue, bool allowEmpty, std::string_view messageOnError, std::string &outErrorLog) const {
+        if (nullptr == node) {
+            outErrorLog += messageOnError;
+            return false;
+        }
+
+        outValue = readValueNoQuotes(*node).str();
+
+        if (outValue.empty() && (false == allowEmpty)) {
+            outErrorLog += messageOnError;
+            return false;
+        }
+        return true;
     }
 
     ConstChildrenRange createChildrenRange(const Node &parent) const {
@@ -541,13 +615,20 @@ inline bool YamlParser::readValueChecked<int64_t>(const Node &node, int64_t &out
         return false;
     }
     const auto &token = tokens[node.value];
-    if (Token::Type::LiteralNumber != token.traits.type) {
+    if (Token::Type::literalNumber != token.traits.type) {
         return false;
     }
     StackVec<char, 96> nullTerminated{token.pos, token.pos + token.len};
     nullTerminated.push_back('\0');
-    outValue = atoll(nullTerminated.begin());
-    return true;
+
+    char *endPtr;
+    if (token.len > 2 && nullTerminated[0] == '0' && (nullTerminated[1] == 'x' || nullTerminated[1] == 'X')) {
+        outValue = std::strtoll(nullTerminated.begin(), &endPtr, 16);
+    } else {
+        outValue = std::strtoll(nullTerminated.begin(), &endPtr, 10);
+    }
+
+    return (*endPtr == '\0');
 }
 
 template <>
@@ -622,11 +703,11 @@ inline bool YamlParser::readValueChecked<bool>(const Node &node, bool &outValue)
         return false;
     }
     const auto &token = tokens[node.value];
-    if (Token::Type::LiteralString != token.traits.type) {
+    if (Token::Type::literalString != token.traits.type) {
         return false;
     }
 
-    // valid values : y/n yes/no true/false on/off (case insesitive)
+    // valid values : y/n yes/no true/false on/off (case insensitive)
     if (token.len > 5) {
         return false;
     }
@@ -698,7 +779,7 @@ inline bool YamlParser::readValueChecked<bool>(const Node &node, bool &outValue)
 template <>
 inline bool YamlParser::readValueChecked<std::string>(const Node &node, std::string &outValue) const {
     const auto &token = tokens[node.value];
-    if (Token::Type::LiteralString != token.traits.type) {
+    if (Token::Type::literalString != token.traits.type) {
         return false;
     }
     outValue.assign(token.pos, token.len);

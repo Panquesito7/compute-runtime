@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,9 @@
 
 #include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
 
+#include "shared/source/command_stream/aub_command_stream_receiver.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/command_stream/tbx_command_stream_receiver.h"
 #include "shared/source/device/device.h"
 #include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/gfx_core_helper.h"
@@ -21,30 +23,24 @@
 
 namespace NEO {
 
-void AUBCommandStreamFixture::setUp(CommandQueue *pCmdQ) {
-    ASSERT_NE(pCmdQ, nullptr);
-    auto &device = reinterpret_cast<MockDevice &>(pCmdQ->getDevice());
-    auto &gfxCoreHelper = device.getGfxCoreHelper();
-
-    const ::testing::TestInfo *const testInfo = ::testing::UnitTest::GetInstance()->current_test_info();
-    std::stringstream strfilename;
-    auto engineType = pCmdQ->getGpgpuCommandStreamReceiver().getOsContext().getEngineType();
-
-    strfilename << ApiSpecificConfig::getAubPrefixForSpecificApi();
-    strfilename << testInfo->test_case_name() << "_" << testInfo->name() << "_" << gfxCoreHelper.getCsTraits(engineType).name;
-
-    pCommandStreamReceiver = AUBFixture::prepareComputeEngine(device, strfilename.str());
-    ASSERT_NE(nullptr, pCommandStreamReceiver);
-
-    AUBFixture::prepareCopyEngines(device, strfilename.str());
+void AUBCommandStreamFixture::setUp(const HardwareInfo *hardwareInfo) {
+    AUBFixture::setUp(hardwareInfo);
 
     CommandStreamFixture::setUp(pCmdQ);
 
+    pClDevice = device;
+    pDevice = &pClDevice->device;
+    pCommandStreamReceiver = csr;
     pTagMemory = pCommandStreamReceiver->getTagAddress();
     this->commandQueue = pCmdQ;
 }
 
+void AUBCommandStreamFixture::setUp() {
+    setUp(nullptr);
+}
+
 void AUBCommandStreamFixture::tearDown() {
     CommandStreamFixture::tearDown();
+    AUBFixture::tearDown();
 }
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,25 +7,30 @@
 
 #include "level_zero/tools/source/metrics/metric_oa_source.h"
 
-#include "shared/source/os_interface/os_library.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 
 #include "level_zero/core/source/cmdlist/cmdlist.h"
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
 #include "level_zero/tools/source/metrics/metric.h"
+#include "level_zero/tools/source/metrics/metric.inl"
+#include "level_zero/tools/source/metrics/metric_multidevice_programmable.h"
+#include "level_zero/tools/source/metrics/metric_multidevice_programmable.inl"
 #include "level_zero/tools/source/metrics/metric_oa_enumeration_imp.h"
+#include "level_zero/tools/source/metrics/metric_oa_programmable_imp.h"
 #include "level_zero/tools/source/metrics/metric_oa_query_imp.h"
+#include "level_zero/zet_intel_gpu_metric.h"
 
 namespace L0 {
-
-OaMetricSourceImp::OsLibraryLoadPtr OaMetricSourceImp::osLibraryLoadFunction(NEO::OsLibrary::load);
-
 std::unique_ptr<OaMetricSourceImp> OaMetricSourceImp::create(const MetricDeviceContext &metricDeviceContext) {
     return std::unique_ptr<OaMetricSourceImp>(new (std::nothrow) OaMetricSourceImp(metricDeviceContext));
 }
 
 OaMetricSourceImp::OaMetricSourceImp(const MetricDeviceContext &metricDeviceContext) : metricDeviceContext(metricDeviceContext),
-                                                                                       metricEnumeration(std::unique_ptr<MetricEnumeration>(new(std::nothrow) MetricEnumeration(*this))),
-                                                                                       metricsLibrary(std::unique_ptr<MetricsLibrary>(new(std::nothrow) MetricsLibrary(*this))) {
+                                                                                       metricEnumeration(std::unique_ptr<MetricEnumeration>(new (std::nothrow) MetricEnumeration(*this))),
+                                                                                       metricsLibrary(std::unique_ptr<MetricsLibrary>(new (std::nothrow) MetricsLibrary(*this))) {
+    activationTracker = std::make_unique<MultiDomainDeferredActivationTracker>(metricDeviceContext.getSubDeviceIndex());
+    type = MetricSource::metricSourceTypeOa;
 }
 
 OaMetricSourceImp::~OaMetricSourceImp() = default;
@@ -34,19 +39,34 @@ void OaMetricSourceImp::enable() {
     loadDependencies();
 }
 
+ze_result_t OaMetricSourceImp::getTimerResolution(uint64_t &resolution) {
+    if (!metricEnumeration->readGlobalSymbol(globalSymbolOaGpuTimestampFrequency.data(), resolution)) {
+        resolution = 0;
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+void OaMetricSourceImp::getTimestampValidBits(uint64_t &validBits) {
+    Device *device = &getDevice();
+    auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
+    validBits = l0GfxCoreHelper.getOaTimestampValidBits();
+}
+
 bool OaMetricSourceImp::isAvailable() {
     return isInitialized();
 }
 
 ze_result_t OaMetricSourceImp::appendMetricMemoryBarrier(CommandList &commandList) {
-    DeviceImp *pDeviceImp = static_cast<DeviceImp *>(commandList.getDevice());
+    Device *pDevice = commandList.getDevice();
 
-    if (pDeviceImp->metricContext->isImplicitScalingCapable()) {
+    if (pDevice->metricContext->isImplicitScalingCapable()) {
         // Use one of the sub-device contexts to append to command list.
-        pDeviceImp = static_cast<DeviceImp *>(pDeviceImp->subDevices[0]);
+        pDevice = pDevice->subDevices[0];
     }
 
-    auto &metricContext = pDeviceImp->getMetricDeviceContext();
+    auto &metricContext = pDevice->getMetricDeviceContext();
     auto &metricsLibrary = metricContext.getMetricSource<OaMetricSourceImp>().getMetricsLibrary();
 
     // Obtain gpu commands.
@@ -71,7 +91,6 @@ bool OaMetricSourceImp::loadDependencies() {
         result = false;
         DEBUG_BREAK_IF(!result);
     }
-
     // Set metric context initialization state.
     setInitializationState(result
                                ? ZE_RESULT_SUCCESS
@@ -91,6 +110,15 @@ Device &OaMetricSourceImp::getDevice() {
     return metricDeviceContext.getDevice();
 }
 
+bool OaMetricSourceImp::canDisable() {
+    return !activationTracker->isAnyMetricGroupActivated();
+}
+
+ze_result_t OaMetricSourceImp::initMetricScopes(MetricDeviceContext &metricDeviceContext) {
+    initComputeMetricScopes(metricDeviceContext);
+    return ZE_RESULT_SUCCESS;
+}
+
 MetricsLibrary &OaMetricSourceImp::getMetricsLibrary() {
     return *metricsLibrary;
 }
@@ -103,16 +131,6 @@ MetricStreamer *OaMetricSourceImp::getMetricStreamer() {
 
 void OaMetricSourceImp::setMetricStreamer(MetricStreamer *pMetricStreamer) {
     this->pMetricStreamer = pMetricStreamer;
-}
-
-void OaMetricSourceImp::setMetricsLibrary(MetricsLibrary &metricsLibrary) {
-    this->metricsLibrary.release();
-    this->metricsLibrary.reset(&metricsLibrary);
-}
-
-void OaMetricSourceImp::setMetricEnumeration(MetricEnumeration &metricEnumeration) {
-    this->metricEnumeration.release();
-    this->metricEnumeration.reset(&metricEnumeration);
 }
 
 void OaMetricSourceImp::setUseCompute(const bool useCompute) {
@@ -132,20 +150,294 @@ uint32_t OaMetricSourceImp::getSubDeviceIndex() {
 }
 
 bool OaMetricSourceImp::isMetricGroupActivated(const zet_metric_group_handle_t hMetricGroup) const {
-    return metricDeviceContext.isMetricGroupActivated(hMetricGroup);
+    return activationTracker->isMetricGroupActivated(hMetricGroup);
 }
 
-bool OaMetricSourceImp::isMetricGroupActivated() const {
-    return metricDeviceContext.isMetricGroupActivated();
+bool OaMetricSourceImp::isMetricGroupActivatedInHw() const {
+    return activationTracker->isMetricGroupActivatedInHw();
 }
 
 bool OaMetricSourceImp::isImplicitScalingCapable() const {
     return metricDeviceContext.isImplicitScalingCapable();
 }
 
+ze_result_t OaMetricSourceImp::activateMetricGroupsPreferDeferred(uint32_t count,
+                                                                  zet_metric_group_handle_t *phMetricGroups) {
+    Device &device = metricDeviceContext.getDevice();
+    if (metricDeviceContext.isImplicitScalingCapable()) {
+        return MetricSource::activatePreferDeferredHierarchical<OaMetricSourceImp>(&device, count, phMetricGroups);
+    }
+
+    activationTracker->activateMetricGroupsDeferred(count, phMetricGroups);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t OaMetricSourceImp::activateMetricGroupsAlreadyDeferred() {
+    return activationTracker->activateMetricGroupsAlreadyDeferred();
+}
+
+ze_result_t OaMetricSourceImp::getConcurrentMetricGroups(std::vector<zet_metric_group_handle_t> &hMetricGroups,
+                                                         uint32_t *pConcurrentGroupCount,
+                                                         uint32_t *pCountPerConcurrentGroup) {
+
+    if (*pConcurrentGroupCount == 0) {
+        *pConcurrentGroupCount = static_cast<uint32_t>(hMetricGroups.size());
+        return ZE_RESULT_SUCCESS;
+    }
+
+    *pConcurrentGroupCount = std::min(*pConcurrentGroupCount, static_cast<uint32_t>(hMetricGroups.size()));
+    // Each metric group is in unique container
+    for (uint32_t index = 0; index < *pConcurrentGroupCount; index++) {
+        pCountPerConcurrentGroup[index] = 1;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t OaMetricSourceImp::handleMetricGroupExtendedProperties(zet_metric_group_handle_t hMetricGroup,
+                                                                   zet_metric_group_properties_t *pBaseProperties,
+                                                                   void *pNext) {
+    ze_result_t retVal = ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    while (pNext) {
+        auto extendedProperties = reinterpret_cast<zet_base_properties_t *>(pNext);
+
+        if (extendedProperties->stype == ZET_STRUCTURE_TYPE_METRIC_SOURCE_ID_EXP) {
+
+            getMetricGroupSourceIdProperty(extendedProperties);
+            retVal = ZE_RESULT_SUCCESS;
+        } else if (extendedProperties->stype == ZET_STRUCTURE_TYPE_METRIC_GLOBAL_TIMESTAMPS_RESOLUTION_EXP) {
+
+            zet_metric_global_timestamps_resolution_exp_t *metricsTimestampProperties =
+                reinterpret_cast<zet_metric_global_timestamps_resolution_exp_t *>(extendedProperties);
+
+            retVal = getTimerResolution(metricsTimestampProperties->timerResolution);
+            if (retVal != ZE_RESULT_SUCCESS) {
+                metricsTimestampProperties->timerResolution = 0;
+                metricsTimestampProperties->timestampValidBits = 0;
+                return retVal;
+            }
+
+            getTimestampValidBits(metricsTimestampProperties->timestampValidBits);
+
+        } else if (extendedProperties->stype == ZET_STRUCTURE_TYPE_METRIC_GROUP_TYPE_EXP) {
+
+            auto oaMetricGroupImp = static_cast<OaMetricGroupImp *>(MetricGroup::fromHandle(hMetricGroup));
+            zet_metric_group_type_exp_t *groupType = reinterpret_cast<zet_metric_group_type_exp_t *>(extendedProperties);
+            groupType->type = oaMetricGroupImp->getMetricGroupType();
+            retVal = ZE_RESULT_SUCCESS;
+        } else if (extendedProperties->stype == ZET_INTEL_STRUCTURE_TYPE_METRIC_GROUP_CALCULATION_EXP_PROPERTIES) {
+            auto calcProperties = reinterpret_cast<zet_intel_metric_group_calculation_properties_exp_t *>(extendedProperties);
+            if (pBaseProperties->samplingType == ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED) {
+                calcProperties->isTimeFilterSupported = true;
+            } else {
+                calcProperties->isTimeFilterSupported = false;
+            }
+            retVal = ZE_RESULT_SUCCESS;
+        }
+        pNext = extendedProperties->pNext;
+    }
+
+    return retVal;
+}
+
+void OaMetricSourceImp::metricGroupCreate(MetricGroupDescription *metricGroupDesc,
+                                          zet_metric_group_sampling_type_flag_t samplingType,
+                                          const uint32_t domain,
+                                          zet_metric_group_handle_t *pMetricGroupHandle) {
+
+    zet_metric_group_properties_t properties{};
+    memcpy_s(properties.description, ZET_MAX_METRIC_GROUP_DESCRIPTION, metricGroupDesc->description, ZET_MAX_METRIC_GROUP_DESCRIPTION);
+    memcpy_s(properties.name, ZET_MAX_METRIC_GROUP_NAME, metricGroupDesc->namePrefix, ZET_MAX_METRIC_GROUP_NAME);
+    properties.samplingType = samplingType;
+    properties.domain = UINT32_MAX;
+
+    auto concurrentGrp = getMetricEnumeration().getConcurrentGroup(domain);
+    DEBUG_BREAK_IF(concurrentGrp == nullptr);
+    MetricsDiscovery::IMetricSet_1_13 *metricSet = concurrentGrp->AddMetricSet(metricGroupDesc->namePrefix, metricGroupDesc->description);
+    auto metricGroup = OaMetricGroupUserDefined::create(properties, *metricSet, *concurrentGrp, domain, *this);
+    *pMetricGroupHandle = metricGroup->toHandle();
+}
+
+ze_result_t OaMetricSourceImp::metricGroupCreateFromMetric(MetricGroupDescription *metricGroupDesc,
+                                                           zet_metric_group_sampling_type_flags_t samplingType, const uint32_t domain,
+                                                           zet_metric_handle_t hMetric, zet_metric_group_handle_t *phMetricGroup) {
+
+    zet_metric_group_handle_t hMetricGroup{};
+    metricGroupCreate(metricGroupDesc, static_cast<zet_metric_group_sampling_type_flag_t>(samplingType), domain, &hMetricGroup);
+
+    auto oaMetricGroupImp = static_cast<OaMetricGroupUserDefined *>(MetricGroup::fromHandle(hMetricGroup));
+    size_t errorStringSize = 0;
+    auto status = oaMetricGroupImp->addMetric(hMetric, &errorStringSize, nullptr);
+    if (status != ZE_RESULT_SUCCESS) {
+        oaMetricGroupImp->destroy();
+        return status;
+    }
+
+    *phMetricGroup = hMetricGroup;
+    return status;
+}
+
+ze_result_t OaMetricSourceImp::createMetricGroupsFromMetrics(std::vector<zet_metric_handle_t> &metricList,
+                                                             MetricGroupDescription *metricGroupDesc,
+                                                             uint32_t *maxMetricGroupCount,
+                                                             std::vector<zet_metric_group_handle_t> &metricGroupList) {
+
+    if (isImplicitScalingCapable()) {
+        return MultiDeviceCreatedMetricGroupManager::createMultipleMetricGroupsFromMetrics<OaMultiDeviceMetricGroupUserDefined>(
+            metricDeviceContext, *this, metricList,
+            metricGroupDesc,
+            maxMetricGroupCount, metricGroupList);
+    }
+
+    const auto isCountCalculationPath = *maxMetricGroupCount == 0;
+
+    auto cleanupCreatedGroups = [](std::vector<zet_metric_group_handle_t> &createdMetricGroupList) {
+        for (auto &metricGroup : createdMetricGroupList) {
+            zetMetricGroupDestroyExp(metricGroup);
+        }
+        createdMetricGroupList.clear();
+    };
+
+    // Arrange the metrics based on their sampling types and domains, since a metric group
+    // holds metrics of a single sampling type from a single concurrent group.
+    using SamplingTypeAndDomain = std::pair<zet_metric_group_sampling_type_flags_t, uint32_t>;
+    std::map<SamplingTypeAndDomain, std::vector<zet_metric_handle_t>> samplingTypeAndDomainToMetricMap{};
+    for (auto &metric : metricList) {
+        auto metricImp = static_cast<OaMetricImp *>(Metric::fromHandle(metric));
+        auto metricFromProgrammable = static_cast<OaMetricFromProgrammable *>(metricImp);
+        auto samplingType = metricFromProgrammable->getSupportedSamplingType();
+        auto domain = metricFromProgrammable->getDomain();
+        // Different metric groups based on sampling type
+        if (samplingType == METRICS_SAMPLING_TYPE_TIME_EVENT_BASED) {
+            samplingTypeAndDomainToMetricMap[{ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED, domain}].push_back(metric);
+            samplingTypeAndDomainToMetricMap[{ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED, domain}].push_back(metric);
+        } else {
+            samplingTypeAndDomainToMetricMap[{samplingType, domain}].push_back(metric);
+        }
+    }
+
+    if (isCountCalculationPath) {
+        uint32_t maxCount = 0;
+        for (auto &entry : samplingTypeAndDomainToMetricMap) {
+            maxCount += static_cast<uint32_t>(entry.second.size());
+        }
+        *maxMetricGroupCount = maxCount;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    metricGroupList.clear();
+    uint32_t numMetricGroupsCreated = 0;
+
+    auto createMetricGroupAndAddMetric = [&](zet_metric_handle_t metricHandle,
+                                             zet_metric_group_sampling_type_flags_t samplingType,
+                                             const uint32_t domain,
+                                             zet_metric_group_handle_t &metricGroup) {
+        char metricGroupName[ZET_MAX_METRIC_GROUP_NAME] = {};
+        snprintf(metricGroupName, ZET_MAX_METRIC_GROUP_NAME - 1, "%s%d", metricGroupDesc->namePrefix, numMetricGroupsCreated);
+        MetricGroupDescription newDescription(metricGroupName, metricGroupDesc->description);
+        newDescription.extendedInfo = metricGroupDesc->extendedInfo;
+        auto status = metricGroupCreateFromMetric(&newDescription, samplingType, domain, metricHandle, &metricGroup);
+        if (status != ZE_RESULT_SUCCESS) {
+            return status;
+        }
+        numMetricGroupsCreated++;
+        return ZE_RESULT_SUCCESS;
+    };
+
+    bool isMaxMetricGroupCountReached = numMetricGroupsCreated >= *maxMetricGroupCount;
+    // Process the metrics in each sampling type and domain separately
+    for (auto &entry : samplingTypeAndDomainToMetricMap) {
+        if (isMaxMetricGroupCountReached) {
+            break;
+        }
+        std::vector<zet_metric_group_handle_t> perSamplingTypeMetricGroupList{};
+        zet_metric_group_handle_t currentMetricGroup{};
+        auto samplingType = entry.first.first;
+        auto domain = entry.first.second;
+
+        // Create and add the metrics to group
+        for (uint32_t index = 0; index < static_cast<uint32_t>(entry.second.size()); index++) {
+
+            auto &metricToAdd = entry.second[index];
+            bool isAddedToExistingMetricGroup = false;
+            for (auto &perSamplingTypeMetricGroup : perSamplingTypeMetricGroupList) {
+                auto oaMetricGroup = static_cast<OaMetricGroupUserDefined *>(MetricGroup::fromHandle(perSamplingTypeMetricGroup));
+                size_t errorStringSize = 0;
+                auto status = oaMetricGroup->addMetric(metricToAdd, &errorStringSize, nullptr);
+                if (status == ZE_RESULT_SUCCESS) {
+                    isAddedToExistingMetricGroup = true;
+                    break;
+                }
+            }
+
+            if (!isAddedToExistingMetricGroup) {
+                if (isMaxMetricGroupCountReached) {
+                    break;
+                }
+                currentMetricGroup = nullptr;
+                auto status = createMetricGroupAndAddMetric(metricToAdd, samplingType, domain, currentMetricGroup);
+                if (status != ZE_RESULT_SUCCESS) {
+                    cleanupCreatedGroups(metricGroupList);
+                    cleanupCreatedGroups(perSamplingTypeMetricGroupList);
+                    *maxMetricGroupCount = 0;
+                    return status;
+                }
+                perSamplingTypeMetricGroupList.push_back(currentMetricGroup);
+                isMaxMetricGroupCountReached = numMetricGroupsCreated >= *maxMetricGroupCount;
+            }
+        }
+        metricGroupList.insert(metricGroupList.end(), perSamplingTypeMetricGroupList.begin(), perSamplingTypeMetricGroupList.end());
+    }
+
+    // close all the metric groups
+    for (auto &metricGroup : metricGroupList) {
+        auto oaMetricGroup = static_cast<OaMetricGroupUserDefined *>(MetricGroup::fromHandle(metricGroup));
+        auto status = oaMetricGroup->close();
+        if (status != ZE_RESULT_SUCCESS) {
+            cleanupCreatedGroups(metricGroupList);
+            *maxMetricGroupCount = 0;
+            return status;
+        }
+    }
+
+    *maxMetricGroupCount = static_cast<uint32_t>(metricGroupList.size());
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t OaMetricSourceImp::metricProgrammableGet(uint32_t *pCount, zet_metric_programmable_exp_handle_t *phMetricProgrammables) {
+    return getMetricEnumeration().metricProgrammableGet(pCount, phMetricProgrammables);
+}
+
+ze_result_t OaMetricSourceImp::appendMarker(zet_command_list_handle_t hCommandList, zet_metric_group_handle_t hMetricGroup, uint32_t value) {
+    if (nullptr == hCommandList) {
+        return ZE_RESULT_ERROR_INVALID_NULL_HANDLE;
+    }
+    auto commandList = CommandList::fromHandle(hCommandList);
+    Device *pDevice = commandList->getDevice();
+
+    if (pDevice->metricContext->isImplicitScalingCapable()) {
+        // Use one of the sub-device contexts to append to command list.
+        pDevice = pDevice->subDevices[0];
+    }
+
+    OaMetricSourceImp &metricSource = pDevice->metricContext->getMetricSource<OaMetricSourceImp>();
+    auto &metricsLibrary = metricSource.getMetricsLibrary();
+
+    // Obtain gpu commands.
+    CommandBufferData_1_0 commandBuffer = {};
+    commandBuffer.CommandsType = MetricsLibraryApi::ObjectType::MarkerStreamUser;
+    commandBuffer.MarkerStreamUser.Value = value;
+    commandBuffer.Type = metricSource.isComputeUsed()
+                             ? MetricsLibraryApi::GpuCommandBufferType::Compute
+                             : MetricsLibraryApi::GpuCommandBufferType::Render;
+
+    return metricsLibrary.getGpuCommands(*commandList, commandBuffer) ? ZE_RESULT_SUCCESS
+                                                                      : ZE_RESULT_ERROR_UNKNOWN;
+}
+
 template <>
 OaMetricSourceImp &MetricDeviceContext::getMetricSource<OaMetricSourceImp>() const {
-    return static_cast<OaMetricSourceImp &>(*metricSources.at(MetricSource::SourceType::Oa));
+    return static_cast<OaMetricSourceImp &>(*metricSources.at(MetricSource::metricSourceTypeOa));
 }
 
 } // namespace L0

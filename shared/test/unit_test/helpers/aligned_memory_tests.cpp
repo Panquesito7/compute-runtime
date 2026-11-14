@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -54,7 +54,7 @@ TEST(AlignedMallocTests, GivenSizeZeroAndAlign4096WhenAllocatingAlignedThenAlign
     alignedFree(ptr);
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     AlignedMallocParameterized,
     AlignedMalloc,
     testing::Values(
@@ -107,7 +107,7 @@ TEST_P(AlignUp, WhenAligningUpThen64BitIsPreserved) {
     EXPECT_EQ(aligned, result);
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     AlignUpParameterized,
     AlignUp,
     testing::Values(
@@ -118,6 +118,24 @@ INSTANTIATE_TEST_CASE_P(
         64,
         256,
         4096));
+
+struct AlignUpNonZero : public ::testing::TestWithParam<std::tuple<size_t, size_t>> {
+};
+
+TEST_P(AlignUpNonZero, GivenSizeAndAlignmentThenAlignedResultIsNonZero) {
+    size_t size = std::get<0>(GetParam());
+    size_t alignment = std::get<1>(GetParam());
+    const size_t result = alignUpNonZero(size, alignment);
+    EXPECT_TRUE(0 < result);
+    EXPECT_TRUE(0 == result % alignment);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AlignUpNonZeroParameterized,
+    AlignUpNonZero,
+    testing::Combine(
+        testing::Values(0, 1),
+        testing::Values(1, 4, 8, 32, 64, 256, 4096)));
 
 TEST(AlignWholeSize, GivenSizeLessThanPageSizeWhenAligningWholeSizeToPageThenAlignedSizeIsPageSize) {
     int size = 1;
@@ -242,14 +260,15 @@ class IsAlignedTests : public ::testing::Test {
 
 typedef ::testing::Types<int8_t, uint8_t, int16_t, uint16_t, int32_t, uint32_t, int64_t, uint64_t, float, double> IsAlignedTypes;
 
-TYPED_TEST_CASE(IsAlignedTests, IsAlignedTypes);
+TYPED_TEST_SUITE(IsAlignedTests, IsAlignedTypes);
 TYPED_TEST(IsAlignedTests, WhenCheckingForAlignmentThenReturnCorrectValue) {
     TypeParam *ptr = reinterpret_cast<TypeParam *>(static_cast<uintptr_t>(0xdeadbeefu));
     // one byte alignment should always return true
-    if (alignof(TypeParam) == 1)
+    if (alignof(TypeParam) == 1) {
         EXPECT_TRUE(isAligned(ptr));
-    else
+    } else {
         EXPECT_FALSE(isAligned(ptr));
+    }
 
     auto ptr1 = reinterpret_cast<TypeParam *>(reinterpret_cast<uintptr_t>(ptr) & ~(alignof(TypeParam) - 1));
     EXPECT_TRUE(isAligned(ptr1));
@@ -258,8 +277,9 @@ TYPED_TEST(IsAlignedTests, WhenCheckingForAlignmentThenReturnCorrectValue) {
     EXPECT_TRUE(isAligned(ptr2));
 
     // this is hard to align in the middle of byte aligned types
-    if (alignof(TypeParam) == 1)
+    if (alignof(TypeParam) == 1) {
         return;
+    }
 
     auto ptr3 = reinterpret_cast<TypeParam *>(reinterpret_cast<uintptr_t>(ptr) & ~((alignof(TypeParam) >> 1) - 1));
     EXPECT_FALSE(isAligned(ptr3));

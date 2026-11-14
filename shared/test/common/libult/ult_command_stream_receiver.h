@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,38 +10,119 @@
 #include "shared/source/command_stream/command_stream_receiver_hw.h"
 #include "shared/source/command_stream/submissions_aggregator.h"
 #include "shared/source/command_stream/wait_status.h"
-#include "shared/source/direct_submission/direct_submission_hw.h"
 #include "shared/source/helpers/blit_properties.h"
+#include "shared/source/helpers/flush_stamp.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/surface.h"
+#include "shared/source/os_interface/external_semaphore.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
 #include "shared/test/common/helpers/ult_hw_config.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
 
+#include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
+#include <vector>
 
 namespace NEO {
 class GmmPageTableMngr;
 
+struct WaitUserFenceParams {
+    uint64_t latestWaitedAddress = 0;
+    uint64_t latestWaitedValue = 0;
+    int64_t latestWaitedTimeout = 0;
+    uint32_t callCount = 0;
+    uint32_t callCountWithOperation = 0;
+    uint32_t externalInterruptId = NEO::InterruptId::notUsed;
+    GraphicsAllocation *latestAllocForInterruptWait = nullptr;
+    UserFenceWaitOperation latestWaitOperation = UserFenceWaitOperation::greaterOrEqual;
+    UserFenceValueWidth latestWaitValueWidth = UserFenceValueWidth::u64;
+    bool userInterrupt = false;
+    bool forceRetStatusEnabled = false;
+    bool forceRetStatusValue = true;
+    std::function<void()> onWait;
+};
+
+struct KmdWaiterParams {
+    uint32_t createCount = 0;
+    uint32_t waitCount = 0;
+    FlushStamp latestFlushStamp = 0;
+    TaskCountType latestTaskCount = 0;
+    uint64_t latestWaitTimeout = 0;
+    bool createWaiter = true;
+    std::optional<WaitStatus> waitStatus = WaitStatus::notReady;
+    std::function<void()> onWait;
+};
+
+struct UltKmdWaiter : KmdWaiter {
+    UltKmdWaiter(KmdWaiterParams &params) : params(params) {}
+    std::optional<WaitStatus> wait(uint64_t timeoutNanoseconds) override {
+        params.waitCount++;
+        params.latestWaitTimeout = timeoutNanoseconds;
+        if (params.onWait) {
+            params.onWait();
+        }
+        return params.waitStatus;
+    }
+    KmdWaiterParams &params;
+};
+
+struct WrittenMemoryChunk {
+    GraphicsAllocation *gfxAllocation = nullptr;
+    uint64_t gpuVaChunkOffset = 0;
+    size_t chunkSize = 0;
+    bool operator==(const WrittenMemoryChunk &) const = default;
+};
+
+struct WriteMemoryParams {
+    std::vector<WrittenMemoryChunk> chunkWrites;
+    GraphicsAllocation *latestGfxAllocation = nullptr;
+    uint64_t latestGpuVaChunkOffset = 0;
+    size_t latestChunkSize = 0;
+    uint32_t totalCallCount = 0;
+    uint32_t chunkWriteCallCount = 0;
+    bool latestChunkedMode = false;
+};
+
+struct MonitoredFence;
+struct MockSyncFence : SyncFence {
+    volatile uint64_t *getCpuAddress() override { return 0u; }
+    uint64_t getGpuAddress() override { return 0u; }
+    void setFenceValue(uint64_t value) override { fenceValue = value; }
+    MonitoredFence *getFence() override { return nullptr; }
+    uint64_t fenceValue;
+};
+
 template <typename GfxFamily>
-class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, public NonCopyableOrMovableClass {
+class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily> {
     using BaseClass = CommandStreamReceiverHw<GfxFamily>;
 
   public:
-    using BaseClass::addPipeControlBefore3dState;
     using BaseClass::bcsRelaxedOrderingAllowed;
     using BaseClass::blitterDirectSubmission;
     using BaseClass::checkPlatformSupportsGpuIdleImplicitFlush;
     using BaseClass::checkPlatformSupportsNewResourceImplicitFlush;
-    using BaseClass::createKernelArgsBufferAllocation;
+    using BaseClass::createScratchSpaceController;
     using BaseClass::csrSizeRequestFlags;
+    using BaseClass::dcFlushSupport;
     using BaseClass::directSubmission;
     using BaseClass::dshState;
+    using BaseClass::externalSemaphoreGpuWaitAllowed;
+    using BaseClass::flushTaskHeapful;
+    using BaseClass::flushTaskHeapless;
+    using BaseClass::getCmdSizeForExceptions;
+    using BaseClass::getCmdSizeForHeaplessPrologue;
+    using BaseClass::getCmdSizeForPageTableManagerRegisters;
     using BaseClass::getCmdSizeForPrologue;
+    using BaseClass::getFrontEndPrologueSize;
+    using BaseClass::getHostFunctionStreamer;
     using BaseClass::getScratchPatchAddress;
     using BaseClass::getScratchSpaceController;
+    using BaseClass::handleAllocationsResidencyForHeaplessProlog;
     using BaseClass::handleFrontEndStateTransition;
+    using BaseClass::handleImmediateFlushStatelessAllocationsResidency;
     using BaseClass::handlePipelineSelectStateTransition;
     using BaseClass::handleStateBaseAddressStateTransition;
     using BaseClass::heapStorageRequiresRecyclingTag;
@@ -49,15 +130,20 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     using BaseClass::iohState;
     using BaseClass::isBlitterDirectSubmissionEnabled;
     using BaseClass::isDirectSubmissionEnabled;
+    using BaseClass::isHeaplessStatePrologRequiredForContext;
     using BaseClass::isPerDssBackedBufferSent;
-    using BaseClass::kernelArgsBufferAllocation;
-    using BaseClass::logicalStateHelper;
+    using BaseClass::isPerQueuePrologueEnabled;
+    using BaseClass::isWalkerWithProfilingEnqueued;
+    using BaseClass::lateMidThreadPreemptionStartSubmissionPending;
     using BaseClass::makeResident;
-    using BaseClass::perDssBackedBuffer;
+    using BaseClass::pageTableManagerInitialized;
+    using BaseClass::pollForCompletion;
     using BaseClass::postInitFlagsSetup;
+    using BaseClass::primaryCsr;
     using BaseClass::programActivePartitionConfig;
     using BaseClass::programEnginePrologue;
-    using BaseClass::programPerDssBackedBuffer;
+    using BaseClass::programExceptions;
+    using BaseClass::programFrontEndPrologue;
     using BaseClass::programPreamble;
     using BaseClass::programStallingCommandsForBarrier;
     using BaseClass::programStallingNoPostSyncCommandsForBarrier;
@@ -65,16 +151,21 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     using BaseClass::programStateSip;
     using BaseClass::programVFEState;
     using BaseClass::requiresInstructionCacheFlush;
+    using BaseClass::residencyContainerDuplicateRemovalRequired;
     using BaseClass::rootDeviceIndex;
+    using BaseClass::shouldProgramExceptions;
+    using BaseClass::skipPreemptionAllocation;
     using BaseClass::sshState;
     using BaseClass::staticWorkPartitioningEnabled;
     using BaseClass::streamProperties;
+    using BaseClass::submitLateMidThreadPreemptionStart;
+    using BaseClass::ucResourceRequiresTagUpdate;
     using BaseClass::wasSubmittedToSingleSubdevice;
     using BaseClass::CommandStreamReceiver::activePartitions;
     using BaseClass::CommandStreamReceiver::activePartitionsConfig;
+    using BaseClass::CommandStreamReceiver::areExceptionsSent;
     using BaseClass::CommandStreamReceiver::baseWaitFunction;
     using BaseClass::CommandStreamReceiver::bindingTableBaseAddressRequired;
-    using BaseClass::CommandStreamReceiver::canUse4GbHeaps;
     using BaseClass::CommandStreamReceiver::checkForNewResources;
     using BaseClass::CommandStreamReceiver::checkImplicitFlushForGpuIdle;
     using BaseClass::CommandStreamReceiver::cleanupResources;
@@ -82,18 +173,25 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     using BaseClass::CommandStreamReceiver::commandStream;
     using BaseClass::CommandStreamReceiver::debugConfirmationFunction;
     using BaseClass::CommandStreamReceiver::debugPauseStateAddress;
+    using BaseClass::CommandStreamReceiver::debugSurface;
+    using BaseClass::CommandStreamReceiver::device;
     using BaseClass::CommandStreamReceiver::deviceBitfield;
     using BaseClass::CommandStreamReceiver::dispatchMode;
     using BaseClass::CommandStreamReceiver::doubleSbaWa;
     using BaseClass::CommandStreamReceiver::downloadAllocationImpl;
     using BaseClass::CommandStreamReceiver::executionEnvironment;
-    using BaseClass::CommandStreamReceiver::experimentalCmdBuffer;
     using BaseClass::CommandStreamReceiver::feSupportFlags;
+    using BaseClass::CommandStreamReceiver::flushBcsTask;
     using BaseClass::CommandStreamReceiver::flushStamp;
     using BaseClass::CommandStreamReceiver::globalFenceAllocation;
-    using BaseClass::CommandStreamReceiver::gpuHangCheckPeriod;
+    using BaseClass::CommandStreamReceiver::globalStatelessHeapAllocation;
+    using BaseClass::CommandStreamReceiver::gpuHangCheckPeriodUs;
     using BaseClass::CommandStreamReceiver::gsbaFor32BitProgrammed;
+    using BaseClass::CommandStreamReceiver::heaplessModeEnabled;
+    using BaseClass::CommandStreamReceiver::heaplessPrologProgrammed;
+    using BaseClass::CommandStreamReceiver::immWritePostSyncWriteOffset;
     using BaseClass::CommandStreamReceiver::initDirectSubmission;
+    using BaseClass::CommandStreamReceiver::initializeTagAllocation;
     using BaseClass::CommandStreamReceiver::internalAllocationStorage;
     using BaseClass::CommandStreamReceiver::isBlitterDirectSubmissionEnabled;
     using BaseClass::CommandStreamReceiver::isDirectSubmissionEnabled;
@@ -102,26 +200,27 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     using BaseClass::CommandStreamReceiver::isStateSipSent;
     using BaseClass::CommandStreamReceiver::lastAdditionalKernelExecInfo;
     using BaseClass::CommandStreamReceiver::lastKernelExecutionType;
-    using BaseClass::CommandStreamReceiver::lastMediaSamplerConfig;
     using BaseClass::CommandStreamReceiver::lastMemoryCompressionState;
     using BaseClass::CommandStreamReceiver::lastPreemptionMode;
-    using BaseClass::CommandStreamReceiver::lastSentL3Config;
-    using BaseClass::CommandStreamReceiver::lastSentUseGlobalAtomics;
     using BaseClass::CommandStreamReceiver::lastSystolicPipelineSelectMode;
     using BaseClass::CommandStreamReceiver::lastVmeSubslicesConfig;
     using BaseClass::CommandStreamReceiver::latestFlushedTaskCount;
     using BaseClass::CommandStreamReceiver::latestSentStatelessMocsConfig;
     using BaseClass::CommandStreamReceiver::latestSentTaskCount;
+    using BaseClass::CommandStreamReceiver::latestTaskCountUpdateOnlyFlushTaskCount;
     using BaseClass::CommandStreamReceiver::mediaVfeStateDirty;
+    using BaseClass::CommandStreamReceiver::midThreadPreemptionAllocationOnDemand;
     using BaseClass::CommandStreamReceiver::newResources;
     using BaseClass::CommandStreamReceiver::osContext;
     using BaseClass::CommandStreamReceiver::ownershipMutex;
     using BaseClass::CommandStreamReceiver::perfCounterAllocator;
     using BaseClass::CommandStreamReceiver::pipelineSupportFlags;
-    using BaseClass::CommandStreamReceiver::postSyncWriteOffset;
+    using BaseClass::CommandStreamReceiver::preemptionAllocation;
     using BaseClass::CommandStreamReceiver::profilingTimeStampAllocator;
-    using BaseClass::CommandStreamReceiver::requiredPrivateScratchSize;
-    using BaseClass::CommandStreamReceiver::requiredScratchSize;
+    using BaseClass::CommandStreamReceiver::releaseGlobalStatelessHeap;
+    using BaseClass::CommandStreamReceiver::requestedPreallocationsAmount;
+    using BaseClass::CommandStreamReceiver::requiredScratchSlot0Size;
+    using BaseClass::CommandStreamReceiver::requiredScratchSlot1Size;
     using BaseClass::CommandStreamReceiver::resourcesInitialized;
     using BaseClass::CommandStreamReceiver::samplerCacheFlushRequired;
     using BaseClass::CommandStreamReceiver::sbaSupportFlags;
@@ -129,10 +228,14 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     using BaseClass::CommandStreamReceiver::stateComputeModeDirty;
     using BaseClass::CommandStreamReceiver::submissionAggregator;
     using BaseClass::CommandStreamReceiver::tagAddress;
+    using BaseClass::CommandStreamReceiver::tagAllocation;
     using BaseClass::CommandStreamReceiver::taskCount;
     using BaseClass::CommandStreamReceiver::taskLevel;
     using BaseClass::CommandStreamReceiver::timestampPacketAllocator;
     using BaseClass::CommandStreamReceiver::timestampPacketWriteEnabled;
+    using BaseClass::CommandStreamReceiver::timeStampPostSyncWriteOffset;
+    using BaseClass::CommandStreamReceiver::ucTagAddress;
+    using BaseClass::CommandStreamReceiver::use4GbHeaps;
     using BaseClass::CommandStreamReceiver::useGpuIdleImplicitFlush;
     using BaseClass::CommandStreamReceiver::useNewResourceImplicitFlush;
     using BaseClass::CommandStreamReceiver::useNotifyEnableForPostSync;
@@ -144,13 +247,18 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
                              uint32_t rootDeviceIndex,
                              const DeviceBitfield deviceBitfield)
         : BaseClass(executionEnvironment, rootDeviceIndex, deviceBitfield), recursiveLockCounter(0),
-          recordedDispatchFlags(DispatchFlagsHelper::createDefaultDispatchFlags()) {
-        this->downloadAllocationImpl = [this](GraphicsAllocation &graphicsAllocation) {
+          recordedDispatchFlags(DispatchFlagsHelper::createDefaultDispatchFlags()),
+          recordedBcsDispatchFlags(DispatchFlagsHelper::createDefaultBcsDispatchFlags()) {
+        this->downloadAllocationImpl = [this](GraphicsAllocation &graphicsAllocation, uint64_t, size_t) {
             this->downloadAllocationUlt(graphicsAllocation);
         };
+        gpuHangCheckPeriodUs = 0;
     }
     ~UltCommandStreamReceiver() override {
         this->downloadAllocationImpl = nullptr;
+        if (initialOsContext) {
+            BaseClass::setupContext(*initialOsContext);
+        }
     }
     static CommandStreamReceiver *create(bool withAubDump,
                                          ExecutionEnvironment &executionEnvironment,
@@ -164,16 +272,23 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
         return nullptr;
     }
 
+    uint64_t peekTotalMemoryUsed() {
+        return this->totalMemoryUsed;
+    }
+
     void makeSurfacePackNonResident(ResidencyContainer &allocationsForResidency, bool clearAllocations) override {
         makeSurfacePackNonResidentCalled++;
         BaseClass::makeSurfacePackNonResident(allocationsForResidency, clearAllocations);
     }
 
     NEO::SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override {
+        if (incrementFlushStampOnFlush) {
+            this->flushStamp->setStamp(this->obtainCurrentFlushStamp() + 1);
+        }
         if (flushReturnValue) {
             return *flushReturnValue;
         }
-        if (recordFlusheBatchBuffer) {
+        if (recordFlushedBatchBuffer) {
             latestFlushedBatchBuffer = batchBuffer;
         }
         latestSentTaskCountValueDuringFlush = latestSentTaskCount;
@@ -184,19 +299,92 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
                               const IndirectHeap *dsh, const IndirectHeap *ioh, const IndirectHeap *ssh,
                               TaskCountType taskLevel, DispatchFlags &dispatchFlags, Device &device) override {
         recordedDispatchFlags = dispatchFlags;
+        recordedSsh = ssh;
         this->lastFlushedCommandStream = &commandStream;
         return BaseClass::flushTask(commandStream, commandStreamStart, dsh, ioh, ssh, taskLevel, dispatchFlags, device);
     }
 
-    size_t getPreferredTagPoolSize() const override {
-        return BaseClass::getPreferredTagPoolSize() + 1;
+    CompletionStamp flushImmediateTask(LinearStream &immediateCommandStream,
+                                       size_t immediateCommandStreamStart,
+                                       ImmediateDispatchFlags &dispatchFlags,
+                                       Device &device) override {
+        recordedImmediateDispatchFlags = dispatchFlags;
+        this->lastFlushedCommandStream = &commandStream;
+        this->lastFlushedImmediateCommandStream = &immediateCommandStream;
+        auto completionStamp = BaseClass::flushImmediateTask(immediateCommandStream, immediateCommandStreamStart, dispatchFlags, device);
+        if (onFlushImmediateTask) {
+            onFlushImmediateTask();
+        }
+        return completionStamp;
+    }
+
+    CompletionStamp flushImmediateTaskHeapless(LinearStream &immediateCommandStream,
+                                               size_t immediateCommandStreamStart,
+                                               ImmediateDispatchFlags &dispatchFlags,
+                                               Device &device) override {
+        recordedImmediateDispatchFlags = dispatchFlags;
+        this->lastFlushedCommandStream = &commandStream;
+        this->lastFlushedImmediateCommandStream = &immediateCommandStream;
+        auto completionStamp = BaseClass::flushImmediateTaskHeapless(immediateCommandStream, immediateCommandStreamStart, dispatchFlags, device);
+        if (onFlushImmediateTask) {
+            onFlushImmediateTask();
+        }
+        return completionStamp;
+    }
+
+    CompletionStamp flushBcsTask(LinearStream &commandStreamTask, size_t commandStreamTaskStart,
+                                 const DispatchBcsFlags &dispatchBcsFlags, const HardwareInfo &hwInfo) override {
+        this->recordedBcsDispatchFlags = dispatchBcsFlags;
+        this->lastFlushedBcsCommandStream = &commandStreamTask;
+        return BaseClass::flushBcsTask(commandStreamTask, commandStreamTaskStart, dispatchBcsFlags, hwInfo);
+    }
+
+    SubmissionStatus initializeDeviceWithFirstSubmission(Device &device) override {
+        initializeDeviceWithFirstSubmissionCalled++;
+        return BaseClass::initializeDeviceWithFirstSubmission(device);
+    }
+
+    void programHeaplessStateProlog(Device &device, LinearStream &commandStream) override {
+        this->commandStreamHeaplessProlog = &commandStream;
+        return BaseClass::programHeaplessStateProlog(device, commandStream);
+    }
+
+    bool writeMemory(GraphicsAllocation &gfxAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) override {
+        writeMemoryParams.totalCallCount++;
+        if (isChunkCopy) {
+            writeMemoryParams.chunkWriteCallCount++;
+            writeMemoryParams.chunkWrites.push_back({&gfxAllocation, gpuVaChunkOffset, chunkSize});
+        }
+
+        writeMemoryParams.latestGfxAllocation = &gfxAllocation;
+        writeMemoryParams.latestChunkedMode = isChunkCopy;
+        writeMemoryParams.latestGpuVaChunkOffset = gpuVaChunkOffset;
+        writeMemoryParams.latestChunkSize = chunkSize;
+
+        return BaseClass::writeMemory(gfxAllocation, isChunkCopy, gpuVaChunkOffset, chunkSize);
+    }
+
+    void writePooledMemory(SharedPoolAllocation &sharedPoolAllocation, bool initFullPageTables) override {
+        writePooledMemoryCalledCount++;
+        latestWritePooledMemoryInitFullPageTables = initFullPageTables;
+        latestWritePooledMemoryAllocation = &sharedPoolAllocation;
+        BaseClass::writePooledMemory(sharedPoolAllocation, initFullPageTables);
+    }
+
+    bool isChunkCopySupportedForSimulation() const override { return chunkCopySupported; }
+
+    uint32_t getPreferredTagPoolSize() const override {
+        return std::min(BaseClass::getPreferredTagPoolSize(), 128u);
     }
     void setPreemptionAllocation(GraphicsAllocation *allocation) { this->preemptionAllocation = allocation; }
 
-    void downloadAllocations() override {
-        downloadAllocationCalled = true;
-        downloadAllocationsCalled = true;
+    void downloadAllocations(bool blockingWait, TaskCountType taskCount) override {
         downloadAllocationsCalledCount++;
+        latestDownloadAllocationsBlocking = blockingWait;
+        latestDownloadAllocationsTaskCount = taskCount;
+        if (onDownloadAllocations) {
+            onDownloadAllocations();
+        }
     }
 
     void downloadAllocationUlt(GraphicsAllocation &gfxAllocation) {
@@ -204,8 +392,15 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     }
 
     WaitStatus waitForCompletionWithTimeout(const WaitParams &params, TaskCountType taskCountToWait) override {
-        latestWaitForCompletionWithTimeoutTaskCount.store(taskCountToWait);
-        waitForCompletionWithTimeoutTaskCountCalled++;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            latestWaitForCompletionWithTimeoutTaskCount.store(taskCountToWait);
+            latestWaitForCompletionWithTimeoutWaitParams = params;
+            waitForCompletionWithTimeoutTaskCountCalled++;
+        }
+        if (onWaitForCompletionWithTimeout) {
+            onWaitForCompletionWithTimeout();
+        }
         if (callBaseWaitForCompletionWithTimeout) {
             return BaseClass::waitForCompletionWithTimeout(params, taskCountToWait);
         }
@@ -220,10 +415,18 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     }
 
     WaitStatus waitForCompletionWithTimeout(bool enableTimeout, int64_t timeoutMicroseconds, TaskCountType taskCountToWait) {
-        return waitForCompletionWithTimeout(WaitParams{false, enableTimeout, timeoutMicroseconds}, taskCountToWait);
+        return waitForCompletionWithTimeout(WaitParams{false, enableTimeout, false, timeoutMicroseconds}, taskCountToWait);
+    }
+
+    void captureWaitForTaskCountWithKmdNotifyFallbackInputParams(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle) {
+        if (this->captureWaitForTaskCountWithKmdNotifyInputParams) {
+            std::lock_guard<std::mutex> guard(this->mutex);
+            this->waitForTaskCountWithKmdNotifyInputParams.push_back({taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle});
+        }
     }
 
     WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle) override {
+        this->captureWaitForTaskCountWithKmdNotifyFallbackInputParams(taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle);
         if (waitForTaskCountWithKmdNotifyFallbackReturnValue.has_value()) {
             return *waitForTaskCountWithKmdNotifyFallbackReturnValue;
         }
@@ -231,10 +434,39 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
         return BaseClass::waitForTaskCountWithKmdNotifyFallback(taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle);
     }
 
+    WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle, uint64_t timeoutNanoseconds) override {
+        this->captureWaitForTaskCountWithKmdNotifyFallbackInputParams(taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle);
+        if (waitForTaskCountWithKmdNotifyFallbackReturnValue.has_value()) {
+            return *waitForTaskCountWithKmdNotifyFallbackReturnValue;
+        }
+
+        return BaseClass::waitForTaskCountWithKmdNotifyFallback(taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle, timeoutNanoseconds);
+    }
+
+    std::unique_ptr<KmdWaiter> createKmdWaiter(FlushStamp flushStamp, TaskCountType taskCount) override {
+        kmdWaiterParams.createCount++;
+        kmdWaiterParams.latestFlushStamp = flushStamp;
+        kmdWaiterParams.latestTaskCount = taskCount;
+        if (!kmdWaiterParams.createWaiter) {
+            return nullptr;
+        }
+        return std::make_unique<UltKmdWaiter>(kmdWaiterParams);
+    }
+
+    WaitStatus waitForTaskCount(TaskCountType requiredTaskCount) override {
+        this->waitForTaskCountCalled = true;
+        this->latestWaitForTaskCountValue = requiredTaskCount;
+        if (waitForTaskCountReturnValue.has_value()) {
+            return *waitForTaskCountReturnValue;
+        }
+        return BaseClass::waitForTaskCount(requiredTaskCount);
+    }
+
     void overrideCsrSizeReqFlags(CsrSizeRequestFlags &flags) { this->csrSizeRequestFlags = flags; }
     GraphicsAllocation *getPreemptionAllocation() const { return this->preemptionAllocation; }
 
     void makeResident(GraphicsAllocation &gfxAllocation) override {
+        makeResidentCalledTimes++;
         if (storeMakeResidentAllocations) {
             std::map<GraphicsAllocation *, uint32_t>::iterator it = makeResidentAllocations.find(&gfxAllocation);
             if (it == makeResidentAllocations.end()) {
@@ -249,7 +481,7 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     }
 
     bool isMadeResident(GraphicsAllocation *graphicsAllocation) const {
-        return makeResidentAllocations.find(graphicsAllocation) != makeResidentAllocations.end();
+        return makeResidentAllocations.contains(graphicsAllocation);
     }
 
     bool isMadeResident(GraphicsAllocation *graphicsAllocation, TaskCountType taskCount) const {
@@ -282,6 +514,7 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
         addAubCommentCalled = true;
     }
     bool flushBatchedSubmissions() override {
+        auto commandStreamReceiverOwnership = this->obtainUniqueOwnership();
         flushBatchedSubmissionsCalled = true;
 
         if (shouldFailFlushBatchedSubmissions) {
@@ -296,7 +529,11 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     }
     SubmissionStatus flushTagUpdate() override {
         flushTagUpdateCalled = true;
-        return CommandStreamReceiverHw<GfxFamily>::flushTagUpdate();
+        auto ret = SubmissionStatus::success;
+        if (this->callFlushTagUpdate) {
+            ret = CommandStreamReceiverHw<GfxFamily>::flushTagUpdate();
+        }
+        return ret;
     }
 
     void initProgrammingFlags() override {
@@ -309,20 +546,22 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
         return CommandStreamReceiverHw<GfxFamily>::obtainUniqueOwnership();
     }
 
-    TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, bool profilingEnabled, Device &device) override {
+    TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, Device &device) override {
         blitBufferCalled++;
         receivedBlitProperties = blitPropertiesContainer;
 
         if (callBaseFlushBcsTask) {
-            return CommandStreamReceiverHw<GfxFamily>::flushBcsTask(blitPropertiesContainer, blocking, profilingEnabled, device);
+            return CommandStreamReceiverHw<GfxFamily>::flushBcsTask(blitPropertiesContainer, blocking, device);
         } else {
             return flushBcsTaskReturnValue;
         }
     }
 
-    bool createPerDssBackedBuffer(Device &device) override {
-        createPerDssBackedBufferCalled++;
-        return BaseClass::createPerDssBackedBuffer(device);
+    bool getAndClearIsWalkerWithProfilingEnqueued() override {
+        if (this->isWalkerWithProfilingEnqueued) {
+            ++this->walkerWithProfilingEnqueuedTimes;
+        }
+        return CommandStreamReceiverHw<GfxFamily>::getAndClearIsWalkerWithProfilingEnqueued();
     }
 
     bool isMultiOsContextCapable() const override {
@@ -360,6 +599,13 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
         return blitterDirectSubmissionAvailable;
     }
 
+    bool isKmdWaitOnTaskCountAllowed() const override {
+        if (callBaseIsKmdWaitOnTaskCountAllowed) {
+            return BaseClass::isKmdWaitOnTaskCountAllowed();
+        }
+        return isKmdWaitOnTaskCountAllowedValue;
+    }
+
     bool createAllocationForHostSurface(HostPtrSurface &surface, bool requiresL3Flush) override {
         createAllocationForHostSurfaceCalled++;
         cpuCopyForHostPtrSurfaceAllowed = surface.peekIsPtrCopyAllowed();
@@ -375,8 +621,16 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
         return commandStreamReceiverType;
     }
 
-    void pollForCompletion() override {
+    void setType(CommandStreamReceiverType commandStreamReceiverType) {
+        this->commandStreamReceiverType = commandStreamReceiverType;
+    }
+
+    void pollForCompletion(bool skipTaskCountCheck) override {
         pollForCompletionCalled++;
+    }
+
+    void pollForAubCompletion() override {
+        pollForAubCompletionCalled++;
     }
 
     bool checkGpuHangDetected(CommandStreamReceiver::TimeType currentTime, CommandStreamReceiver::TimeType &lastHangCheckTime) const override {
@@ -389,10 +643,151 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     }
 
     SubmissionStatus sendRenderStateCacheFlush() override {
+        this->renderStateCacheFlushed = true;
         if (callBaseSendRenderStateCacheFlush) {
             return BaseClass::sendRenderStateCacheFlush();
         }
         return *flushReturnValue;
+    }
+
+    void stopDirectSubmission(bool blocking, bool needsLock) override {
+        stopDirectSubmissionCalled = true;
+        stopDirectSubmissionCalledBlocking = blocking;
+        if (initialOsContext) {
+            BaseClass::setupContext(*initialOsContext);
+        }
+        if (this->callBaseStopDirectSubmission) {
+            BaseClass::stopDirectSubmission(blocking, needsLock);
+        }
+    }
+
+    bool submitExternalSemaphoreWaits(std::span<const ExternalSemaphoreOperation> waits) override {
+        submitExternalSemaphoreWaitsCalled++;
+        submittedExternalSemaphoreWaits.assign(waits.begin(), waits.end());
+        taskCountAtExternalSemaphoreWaitsSubmission = this->peekTaskCount();
+        return submitExternalSemaphoreWaitsReturnValue;
+    }
+
+    void setupContext(OsContext &osContext) override {
+        if (!initialOsContext) {
+            initialOsContext = this->osContext;
+        }
+        BaseClass::setupContext(osContext);
+    }
+
+    void signalHostFunctionWorker(uint32_t nHostFunctions) override {
+        signalHostFunctionWorkerCounter += nHostFunctions;
+    }
+
+    void createHostFunctionWorker() override {
+        createHostFunctionWorkerCounter++;
+    }
+
+    bool waitUserFence(TaskCountType waitValue, uint64_t hostAddress, int64_t timeout, bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait, SyncFence *fence) override {
+        waitUserFenceParams.callCount++;
+        waitUserFenceParams.latestWaitedAddress = hostAddress;
+        waitUserFenceParams.latestWaitedValue = waitValue;
+        waitUserFenceParams.latestWaitedTimeout = timeout;
+        waitUserFenceParams.userInterrupt = userInterrupt;
+        waitUserFenceParams.externalInterruptId = externalInterruptId;
+        waitUserFenceParams.latestAllocForInterruptWait = allocForInterruptWait;
+        if (waitUserFenceParams.onWait) {
+            waitUserFenceParams.onWait();
+        }
+
+        if (waitUserFenceParams.forceRetStatusEnabled) {
+            return waitUserFenceParams.forceRetStatusValue;
+        }
+
+        return BaseClass::waitUserFence(waitValue, hostAddress, timeout, userInterrupt, externalInterruptId, allocForInterruptWait, nullptr);
+    }
+
+    bool waitUserFence(UserFenceWaitOperation operation, uint64_t waitValue, uint64_t hostAddress, UserFenceValueWidth dataWidth, int64_t timeout, bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait, SyncFence *fence) override {
+        waitUserFenceParams.callCountWithOperation++;
+        waitUserFenceParams.latestWaitOperation = operation;
+        waitUserFenceParams.latestWaitValueWidth = dataWidth;
+        waitUserFenceParams.latestWaitedAddress = hostAddress;
+        waitUserFenceParams.latestWaitedValue = waitValue;
+        waitUserFenceParams.latestWaitedTimeout = timeout;
+        waitUserFenceParams.userInterrupt = userInterrupt;
+        waitUserFenceParams.externalInterruptId = externalInterruptId;
+        waitUserFenceParams.latestAllocForInterruptWait = allocForInterruptWait;
+        if (waitUserFenceParams.onWait) {
+            waitUserFenceParams.onWait();
+        }
+
+        if (waitUserFenceParams.forceRetStatusEnabled) {
+            return waitUserFenceParams.forceRetStatusValue;
+        }
+
+        return BaseClass::waitUserFence(operation, waitValue, hostAddress, dataWidth, timeout, userInterrupt, externalInterruptId, allocForInterruptWait, nullptr);
+    }
+
+    bool waitUserFenceSupported(SyncFence *syncFence) override { return isUserFenceWaitSupported; }
+
+    bool isWaitUserFenceNotEqualSupported() override { return isWaitUserFenceNotEqualSupportedValue; }
+
+    bool getAcLineConnected(bool updateStatus) const override {
+        getAcLineConnectedCalled++;
+        getAcLineConnectedLastUpdateStatus = updateStatus;
+        if (getAcLineConnectedCallBase) {
+            return BaseClass::getAcLineConnected(updateStatus);
+        }
+        return getAcLineConnectedReturnValue;
+    }
+
+    void unblockPagingFenceSemaphore(uint64_t pagingFenceValue) override {
+        this->pagingFenceValueToUnblock = pagingFenceValue;
+        BaseClass::unblockPagingFenceSemaphore(pagingFenceValue);
+    }
+
+    void drainPagingFenceQueue() override {
+        drainPagingFenceQueueCalled++;
+        BaseClass::drainPagingFenceQueue();
+    }
+    SubmissionStatus flushHandler(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override {
+        flushHandlerCalled++;
+        return BaseClass::flushHandler(batchBuffer, allocationsForResidency);
+    }
+    bool isAnyDirectSubmissionEnabled() const override {
+        if (isAnyDirectSubmissionEnabledCallBase) {
+            return BaseClass::isAnyDirectSubmissionEnabled();
+        }
+        return isAnyDirectSubmissionEnabledResult;
+    }
+
+    using BaseClass::testTaskCountReady;
+    bool testTaskCountReady(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait, bool blockOnMiss) override {
+        if (testTaskCountReadyReturnValue.has_value()) {
+            return *testTaskCountReadyReturnValue;
+        }
+        return BaseClass::testTaskCountReady(pollAddress, taskCountToWait, blockOnMiss);
+    }
+    using BaseClass::isTagReached;
+    bool isTagReached(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait, bool blockOnMiss) override {
+        if (isTagReachedReturnValue.has_value()) {
+            return *isTagReachedReturnValue;
+        }
+        return BaseClass::isTagReached(pollAddress, taskCountToWait, blockOnMiss);
+    }
+
+    bool isGpuHangDetected() const override {
+        if (isGpuHangDetectedReturnValue.has_value()) {
+            return *isGpuHangDetectedReturnValue;
+        } else {
+            return CommandStreamReceiver::isGpuHangDetected();
+        }
+    }
+
+    void allocateUserFence(std::unique_ptr<SyncFence> &mf) override {
+        userFenceAllocationAttemptCount++;
+
+        if (shouldAllocateUserFenceReturnSuccess) {
+            mf = std::make_unique<MockSyncFence>();
+            return;
+        }
+
+        return CommandStreamReceiver::allocateUserFence(mf);
     }
 
     std::vector<std::string> aubCommentMessages;
@@ -401,38 +796,87 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
 
     std::atomic<TaskCountType> latestWaitForCompletionWithTimeoutTaskCount{0};
     TaskCountType latestSentTaskCountValueDuringFlush = 0;
+    WaitParams latestWaitForCompletionWithTimeoutWaitParams{};
+    WaitUserFenceParams waitUserFenceParams;
+    KmdWaiterParams kmdWaiterParams;
+    WriteMemoryParams writeMemoryParams;
+    uint32_t writePooledMemoryCalledCount = 0;
+    bool latestWritePooledMemoryInitFullPageTables = false;
+    SharedPoolAllocation *latestWritePooledMemoryAllocation = nullptr;
     TaskCountType flushBcsTaskReturnValue{};
 
     LinearStream *lastFlushedCommandStream = nullptr;
+    LinearStream *lastFlushedImmediateCommandStream = nullptr;
+    LinearStream *lastFlushedBcsCommandStream = nullptr;
+    LinearStream *commandStreamHeaplessProlog = nullptr;
 
+    const IndirectHeap *recordedSsh = nullptr;
+
+    struct WaitForTaskCountWithKmdNotifyParams {
+        TaskCountType taskCountToWait;
+        FlushStamp flushStampToWait;
+        bool useQuickKmdSleep;
+        QueueThrottle throttle;
+    };
+
+    std::vector<WaitForTaskCountWithKmdNotifyParams> waitForTaskCountWithKmdNotifyInputParams;
+
+    std::mutex mutex;
     std::atomic<uint32_t> recursiveLockCounter;
     std::atomic<uint32_t> waitForCompletionWithTimeoutTaskCountCalled{0};
+    std::atomic<uint64_t> pagingFenceValueToUnblock{0u};
+    uint32_t makeResidentCalledTimes = 0;
     uint32_t makeSurfacePackNonResidentCalled = false;
     uint32_t blitBufferCalled = 0;
-    uint32_t createPerDssBackedBufferCalled = 0;
     uint32_t initDirectSubmissionCalled = 0;
     uint32_t fillReusableAllocationsListCalled = 0;
     uint32_t pollForCompletionCalled = 0;
+    uint32_t pollForAubCompletionCalled = 0;
+    uint32_t initializeDeviceWithFirstSubmissionCalled = 0;
+    uint32_t drainPagingFenceQueueCalled = 0;
+    uint32_t flushHandlerCalled = 0;
+    uint32_t obtainUniqueOwnershipCalledTimes = 0;
+    uint32_t walkerWithProfilingEnqueuedTimes = 0;
+    uint32_t createHostFunctionWorkerCounter = 0;
+    uint32_t signalHostFunctionWorkerCounter = 0;
+    uint32_t userFenceAllocationAttemptCount = 0;
     mutable uint32_t checkGpuHangDetectedCalled = 0;
     int ensureCommandBufferAllocationCalled = 0;
     DispatchFlags recordedDispatchFlags;
+    DispatchBcsFlags recordedBcsDispatchFlags;
+    ImmediateDispatchFlags recordedImmediateDispatchFlags = {};
     BlitPropertiesContainer receivedBlitProperties = {};
-    uint32_t createAllocationForHostSurfaceCalled = 0;
-    WaitStatus returnWaitForCompletionWithTimeout = WaitStatus::Ready;
+    std::atomic<uint32_t> createAllocationForHostSurfaceCalled = 0;
+    WaitStatus returnWaitForCompletionWithTimeout = WaitStatus::ready;
     std::optional<WaitStatus> waitForTaskCountWithKmdNotifyFallbackReturnValue{};
+    std::optional<WaitStatus> waitForTaskCountReturnValue{};
     std::optional<SubmissionStatus> flushReturnValue{};
-    CommandStreamReceiverType commandStreamReceiverType = CommandStreamReceiverType::CSR_HW;
-    uint32_t downloadAllocationsCalledCount = 0;
+    std::optional<bool> isGpuHangDetectedReturnValue{};
+    std::optional<bool> testTaskCountReadyReturnValue{};
+    std::optional<bool> isTagReachedReturnValue{};
+    CommandStreamReceiverType commandStreamReceiverType = CommandStreamReceiverType::hardware;
+    std::atomic<uint32_t> downloadAllocationsCalledCount = 0;
+    std::atomic<bool> latestDownloadAllocationsBlocking = false;
+    std::atomic<TaskCountType> latestDownloadAllocationsTaskCount = 0;
+    std::function<void()> onDownloadAllocations;
+    std::function<void()> onWaitForCompletionWithTimeout;
+    std::function<void()> onFlushImmediateTask;
+    OsContext *initialOsContext = nullptr;
 
-    bool cpuCopyForHostPtrSurfaceAllowed = false;
+    bool renderStateCacheFlushed = false;
+    std::atomic_bool cpuCopyForHostPtrSurfaceAllowed = false;
     bool createPageTableManagerCalled = false;
-    bool recordFlusheBatchBuffer = false;
+    bool recordFlushedBatchBuffer = false;
     bool checkAndActivateAubSubCaptureCalled = false;
     bool addAubCommentCalled = false;
+    bool waitForTaskCountCalled = false;
+    TaskCountType latestWaitForTaskCountValue = 0;
     std::atomic_bool downloadAllocationCalled = false;
     std::atomic_bool downloadAllocationsCalled = false;
-    bool flushBatchedSubmissionsCalled = false;
-    bool flushTagUpdateCalled = false;
+    std::atomic_bool flushBatchedSubmissionsCalled = false;
+    std::atomic_bool flushTagUpdateCalled = false;
+    bool callFlushTagUpdate = true;
+    bool callBaseStopDirectSubmission = true;
     bool initProgrammingFlagsCalled = false;
     bool multiOsContextCapable = false;
     bool memoryCompressionEnabled = false;
@@ -442,10 +886,30 @@ class UltCommandStreamReceiver : public CommandStreamReceiverHw<GfxFamily>, publ
     bool callBaseWaitForCompletionWithTimeout = true;
     bool shouldFailFlushBatchedSubmissions = false;
     bool shouldFlushBatchedSubmissionsReturnSuccess = false;
+    bool shouldAllocateUserFenceReturnSuccess = false;
     bool callBaseFillReusableAllocationsList = false;
     bool callBaseFlushBcsTask{true};
     bool callBaseSendRenderStateCacheFlush = true;
     bool forceReturnGpuHang = false;
+    bool callBaseIsKmdWaitOnTaskCountAllowed = false;
+    bool isKmdWaitOnTaskCountAllowedValue = false;
+    bool stopDirectSubmissionCalled = false;
+    bool stopDirectSubmissionCalledBlocking = false;
+    bool submitExternalSemaphoreWaitsReturnValue = true;
+    uint32_t submitExternalSemaphoreWaitsCalled = 0;
+    std::vector<ExternalSemaphoreOperation> submittedExternalSemaphoreWaits;
+    TaskCountType taskCountAtExternalSemaphoreWaitsSubmission = 0;
+    bool isUserFenceWaitSupported = false;
+    bool isWaitUserFenceNotEqualSupportedValue = false;
+    bool getAcLineConnectedCallBase = true;
+    mutable uint32_t getAcLineConnectedCalled = 0u;
+    mutable bool getAcLineConnectedLastUpdateStatus = false;
+    bool getAcLineConnectedReturnValue = false;
+    bool isAnyDirectSubmissionEnabledCallBase = true;
+    bool isAnyDirectSubmissionEnabledResult = true;
+    std::atomic_bool captureWaitForTaskCountWithKmdNotifyInputParams = false;
+    bool incrementFlushStampOnFlush = false;
+    bool chunkCopySupported = false;
 };
 
 } // namespace NEO

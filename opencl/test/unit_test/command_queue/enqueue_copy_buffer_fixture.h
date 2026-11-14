@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
@@ -46,7 +47,7 @@ struct EnqueueCopyBufferTest : public CommandEnqueueFixture,
     void SetUp(void) override {
         CommandEnqueueFixture::setUp();
 
-        BufferDefaults::context = new MockContext;
+        BufferDefaults::context = new MockContext(pClDevice);
 
         srcBuffer = BufferHelper<>::create();
         dstBuffer = BufferHelper<>::create();
@@ -65,9 +66,9 @@ struct EnqueueCopyBufferTest : public CommandEnqueueFixture,
             pCmdQ,
             srcBuffer,
             dstBuffer,
-            0,
-            0,
-            sizeof(float),
+            srcOffset,
+            dstOffset,
+            copySize,
             0,
             nullptr,
             nullptr);
@@ -80,8 +81,10 @@ struct EnqueueCopyBufferTest : public CommandEnqueueFixture,
         parseCommands<FamilyType>(*pCmdQ);
     }
 
-    MockContext context;
     Buffer *srcBuffer = nullptr;
     Buffer *dstBuffer = nullptr;
+    size_t copySize = sizeof(float);
+    size_t srcOffset = 0;
+    size_t dstOffset = 0;
 };
 } // namespace NEO

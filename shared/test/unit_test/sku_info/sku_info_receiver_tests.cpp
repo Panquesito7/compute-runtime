@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -89,4 +89,31 @@ TEST(SkuInfoReceiverTest, givenAdapterInfoWhenReceivingThenUpdateWaTable) {
     SkuInfoBaseReference::fillReferenceWaToReceive(refWaTable);
 
     EXPECT_TRUE(memcmp(&requestedWaTable, &refWaTable, sizeof(WorkaroundTable)) == 0);
+}
+
+TEST(SkuInfoReceiverTest, givenFtrHwSchedulingFlagWhenReceivingThenSetFtrWddmHwQueues) {
+    FeatureTable requestedFeatureTable = {};
+    ADAPTER_INFO adapterInfo = {};
+    adapterInfo.SkuTable.FtrHwScheduling = 1;
+    SkuInfoReceiver::receiveFtrTableFromAdapterInfo(&requestedFeatureTable, &adapterInfo);
+
+    EXPECT_TRUE(requestedFeatureTable.flags.ftrWddmHwQueues);
+}
+
+TEST(SkuInfoReceiverTest, givenFtrEfficient64BitAddressingFlagWhenReceivingThenSetFtrHeaplessMode) {
+    FeatureTable requestedFeatureTable = {};
+    ADAPTER_INFO adapterInfo = {};
+    adapterInfo.SkuTable.FtrEfficient64BitAddressing = 1;
+    SkuInfoReceiver::receiveFtrTableFromAdapterInfo(&requestedFeatureTable, &adapterInfo);
+
+    EXPECT_TRUE(requestedFeatureTable.flags.ftrHeaplessMode);
+}
+
+TEST(SkuInfoReceiverTest, givenFtrHwSemaphore64FlagWhenReceivingThenSetFtrHwSemaphore64) {
+    FeatureTable requestedFeatureTable = {};
+    ADAPTER_INFO adapterInfo = {};
+    adapterInfo.SkuTable.FtrHwSemaphore64 = 1;
+    SkuInfoReceiver::receiveFtrTableFromAdapterInfo(&requestedFeatureTable, &adapterInfo);
+
+    EXPECT_TRUE(requestedFeatureTable.flags.ftrHwSemaphore64);
 }

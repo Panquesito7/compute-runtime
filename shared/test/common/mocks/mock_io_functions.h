@@ -1,14 +1,16 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/string.h"
 #include "shared/source/utilities/io_functions.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
@@ -21,6 +23,8 @@ extern uint32_t mockVfptrinfCalled;
 extern uint32_t mockFcloseCalled;
 extern uint32_t mockGetenvCalled;
 extern uint32_t mockFseekCalled;
+extern int mockFseekReturn;
+extern uint32_t failAfterNFseekCount;
 extern uint32_t mockFtellCalled;
 extern long int mockFtellReturn;
 extern uint32_t mockRewindCalled;
@@ -28,7 +32,10 @@ extern uint32_t mockFreadCalled;
 extern size_t mockFreadReturn;
 extern uint32_t mockFwriteCalled;
 extern size_t mockFwriteReturn;
+extern char *mockFwriteBuffer;
+extern char *mockFreadBuffer;
 extern bool mockVfptrinfUseStdioFunction;
+extern uint32_t mockVsnprintfCalled;
 
 extern std::unordered_map<std::string, std::string> *mockableEnvValues;
 
@@ -48,22 +55,36 @@ inline int mockVfptrinf(FILE *stream, const char *format, va_list arg) {
     return 0x10;
 }
 
+inline int mockVsnprintf(char *buff, size_t buffLen, char const *const formatStr, va_list arg) {
+    ++mockVsnprintfCalled;
+    return ::vsnprintf(buff, buffLen, formatStr, arg);
+}
+
 inline int mockFclose(FILE *stream) {
     mockFcloseCalled++;
     return 0;
 }
+extern const char *openCLDriverName;
 
 inline char *mockGetenv(const char *name) noexcept {
     mockGetenvCalled++;
-    if (mockableEnvValues != nullptr && mockableEnvValues->find(name) != mockableEnvValues->end()) {
-        return const_cast<char *>(mockableEnvValues->find(name)->second.c_str());
+    if (strcmp(name, "OpenCLDriverName") == 0) {
+        return const_cast<char *>(openCLDriverName);
+    }
+    if (mockableEnvValues != nullptr) {
+        if (auto it = mockableEnvValues->find(name); it != mockableEnvValues->end()) {
+            return const_cast<char *>(it->second.c_str());
+        }
     }
     return nullptr;
 }
 
 inline int mockFseek(FILE *stream, long int offset, int origin) {
     mockFseekCalled++;
-    return 0;
+    if (failAfterNFseekCount > 0 && failAfterNFseekCount < mockFseekCalled) {
+        return -1;
+    }
+    return mockFseekReturn;
 }
 
 inline long int mockFtell(FILE *stream) {
@@ -77,18 +98,31 @@ inline void mockRewind(FILE *stream) {
 
 inline size_t mockFread(void *ptr, size_t size, size_t count, FILE *stream) {
     mockFreadCalled++;
+    if (mockFreadBuffer) {
+        memcpy_s(ptr, mockFreadReturn, mockFreadBuffer, size * count);
+    }
     return mockFreadReturn;
 }
 
 inline size_t mockFwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     mockFwriteCalled++;
+
+    if (mockFwriteBuffer) {
+        memcpy_s(mockFwriteBuffer, mockFwriteReturn, ptr, size * nmemb);
+    }
+
     return mockFwriteReturn;
 }
 
 inline int mockFflush(FILE *stream) {
-    if (stream == stdout || stream == stderr)
+    if (stream == stdout || stream == stderr) {
         return fflush(stream);
+    }
 
+    return 0;
+}
+
+inline int mockMkdir(const char *filename) {
     return 0;
 }
 

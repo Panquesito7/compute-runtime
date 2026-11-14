@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,13 +11,13 @@
 #include "shared/source/os_interface/windows/wddm/um_km_data_temp_storage.h"
 #include "shared/source/os_interface/windows/wddm/um_km_data_translator.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/os_interface/windows/adapter_info_tests.h"
 #include "shared/wsl_compute_helper/source/gmm_resource_info_accessor.h"
 #include "shared/wsl_compute_helper/source/wsl_compute_helper.h"
 #include "shared/wsl_compute_helper/source/wsl_compute_helper_types_tokens_structs.h"
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #define EXPORT __declspec(dllexport)
 #else
 #define EXPORT __attribute__((__visibility__("default")))
@@ -37,6 +37,9 @@ constexpr uint16_t mockStrToTokDriverBuildNumber = 0xbadc;
 constexpr uint32_t mockStrToTokProcessID = 0xcdbaebfc;
 constexpr uint64_t mockStrToTokHeapBase = 0xabcdefbc;
 
+constexpr QUEUE_PRIORITY mockTokToStrQueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_HIGH;
+constexpr QUEUE_PRIORITY mockStrToTokQueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_LOW;
+
 extern "C" {
 EXPORT size_t CCONV getSizeRequiredForStruct(TOK structId) {
     switch (structId) {
@@ -52,6 +55,8 @@ EXPORT size_t CCONV getSizeRequiredForStruct(TOK structId) {
         return sizeof(GmmResourceInfoWinStruct);
     case TOK_S_GMM_GFX_PARTITIONING:
         return sizeof(GMM_GFX_PARTITIONING) + 4;
+    case TOK_S_CREATEHWQUEUE_PVTDATA:
+        return sizeof(CREATEHWQUEUE_PVTDATA) + 4;
     }
     return 0;
 }
@@ -87,6 +92,11 @@ EXPORT bool CCONV tokensToStruct(TOK structId, void *dst, size_t dstSizeInBytes,
         gfxPartitioning->Heap32->Base = mockTokToStrHeapBase;
         return true;
     } break;
+    case TOK_S_CREATEHWQUEUE_PVTDATA: {
+        auto hwQueuePrivateData = new (dst) CREATEHWQUEUE_PVTDATA{};
+        hwQueuePrivateData->QueuePriority = mockTokToStrQueuePriority;
+        return true;
+    } break;
     }
     return true;
 }
@@ -105,6 +115,8 @@ EXPORT size_t CCONV getSizeRequiredForTokens(TOK structId) {
         return sizeof(TOKSTR_GmmResourceInfoWinStruct);
     case TOK_S_GMM_GFX_PARTITIONING:
         return sizeof(TOKSTR___GMM_GFX_PARTITIONING);
+    case TOK_S_CREATEHWQUEUE_PVTDATA:
+        return sizeof(TOKSTR__CREATEHWQUEUE_PVTDATA);
     }
 
     return 0;
@@ -146,6 +158,11 @@ EXPORT bool CCONV structToTokens(TOK structId, TokenHeader *dst, size_t dstSizeI
         gfxPartitioning->Heap32->Base.setValue(mockStrToTokHeapBase);
         return true;
     } break;
+    case TOK_S_CREATEHWQUEUE_PVTDATA: {
+        auto hwQueuePrivateData = new (dst) TOKSTR__CREATEHWQUEUE_PVTDATA{};
+        hwQueuePrivateData->QueuePriority.setValue(mockStrToTokQueuePriority);
+        return true;
+    } break;
     }
     return false;
 }
@@ -183,6 +200,7 @@ TEST(UmKmDataTranslator, whenUsingDefaultTranslatorThenTranslationIsDisabled) {
     EXPECT_EQ(sizeof(ADAPTER_INFO), translator.getSizeForAdapterInfoInternalRepresentation());
     EXPECT_EQ(sizeof(COMMAND_BUFFER_HEADER), translator.getSizeForCommandBufferHeaderDataInternalRepresentation());
     EXPECT_EQ(sizeof(CREATECONTEXT_PVTDATA), translator.getSizeForCreateContextDataInternalRepresentation());
+    EXPECT_EQ(sizeof(CREATEHWQUEUE_PVTDATA), translator.getSizeForCreateHwQueueDataInternalRepresentation());
 
     ADAPTER_INFO srcAdapterInfo, dstAdapterInfo;
     memset(&srcAdapterInfo, 7, sizeof(srcAdapterInfo));
@@ -201,12 +219,18 @@ TEST(UmKmDataTranslator, whenUsingDefaultTranslatorThenTranslationIsDisabled) {
     ret = translator.translateCreateContextDataToInternalRepresentation(&dstCreateContextPvtData, sizeof(CREATECONTEXT_PVTDATA), srcCreateContextPvtData);
     EXPECT_TRUE(ret);
     EXPECT_EQ(0, memcmp(&dstCreateContextPvtData, &srcCreateContextPvtData, sizeof(CREATECONTEXT_PVTDATA)));
+
+    CREATEHWQUEUE_PVTDATA srcCreateHwQueuePvtData, dstCreateHwQueuePvtData;
+    memset(&srcCreateHwQueuePvtData, 7, sizeof(srcCreateHwQueuePvtData));
+    ret = translator.translateCreateHwQueueDataToInternalRepresentation(&dstCreateHwQueuePvtData, sizeof(CREATEHWQUEUE_PVTDATA), srcCreateHwQueuePvtData);
+    EXPECT_TRUE(ret);
+    EXPECT_EQ(0, memcmp(&dstCreateHwQueuePvtData, &srcCreateHwQueuePvtData, sizeof(CREATEHWQUEUE_PVTDATA)));
 }
 
 TEST(UmKmDataTranslator, givenToggledDebugKeyWhenCreatingDefaultTranslatorThenTranslationIsEnabled) {
     DebugManagerStateRestore debugSettingsRestore;
 
-    NEO::DebugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
     NEO::wslComputeHelperLibNameToLoad = "";
     NEO::Gdi gdi;
     auto handle = validHandle;
@@ -216,10 +240,37 @@ TEST(UmKmDataTranslator, givenToggledDebugKeyWhenCreatingDefaultTranslatorThenTr
     EXPECT_TRUE(translator->enabled());
 }
 
+TEST(UmKmDataTranslator, givenToggledDebugKeyAndNotExistingLibWhenCreatingDefaultTranslatorThenTranslationIsDisabled) {
+    DebugManagerStateRestore debugSettingsRestore;
+
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::wslComputeHelperLibNameToLoad = "dummyLib";
+    NEO::Gdi gdi;
+    auto handle = validHandle;
+    gdi.queryAdapterInfo.mFunc = QueryAdapterInfoMock::queryadapterinfo;
+
+    auto translator = NEO::createUmKmDataTranslator(gdi, handle);
+    EXPECT_FALSE(translator->enabled());
+}
+
+static NTSTATUS APIENTRY failingQueryAdapterInfo(const D3DKMT_QUERYADAPTERINFO *queryAdapterInfo) {
+    return STATUS_UNSUCCESSFUL;
+}
+
+TEST(UmKmDataTranslator, givenToggledDebugKeyAndFailingDriverStorePathQueryWhenCreatingDefaultTranslatorThenUnrecoverableIsHit) {
+    DebugManagerStateRestore debugSettingsRestore;
+
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::Gdi gdi;
+    gdi.queryAdapterInfo.mFunc = failingQueryAdapterInfo;
+
+    EXPECT_THROW(NEO::createUmKmDataTranslator(gdi, validHandle), std::exception);
+}
+
 TEST(WslUmKmDataTranslator, whenQueryingForTranslationThenQueryIsForwardedToWslComputeHelper) {
     DebugManagerStateRestore debugSettingsRestore;
 
-    NEO::DebugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
     NEO::wslComputeHelperLibNameToLoad = "";
     NEO::Gdi gdi;
     auto handle = validHandle;
@@ -252,7 +303,7 @@ TEST(WslUmKmDataTranslator, whenQueryingForTranslationThenQueryIsForwardedToWslC
     auto gmmHandleAllocator = translator->createGmmHandleAllocator();
     ASSERT_NE(nullptr, gmmHandleAllocator);
     gmmHandleAllocator->getHandleSize();
-    UmKmDataTempStorage<GMM_RESOURCE_INFO> gmmResInfo;
+    UmKmDataTempStorage<GMM_RESOURCE_INFO> gmmResInfo{};
     EXPECT_EQ(sizeof(GmmResourceInfoWinStruct), gmmHandleAllocator->getHandleSize());
     auto gmmResourceInfoHandle = gmmHandleAllocator->createHandle(reinterpret_cast<GMM_RESOURCE_INFO *>(gmmResInfo.data()));
     ASSERT_NE(nullptr, gmmResourceInfoHandle);
@@ -263,7 +314,7 @@ TEST(WslUmKmDataTranslator, whenQueryingForTranslationThenQueryIsForwardedToWslC
 TEST(WslUmKmDataTranslator, whenOpeningExistingHandleThenResourceInfoIsCopiedBasedOnTranslationResult) {
     DebugManagerStateRestore debugSettingsRestore;
 
-    NEO::DebugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
     NEO::wslComputeHelperLibNameToLoad = "";
     NEO::Gdi gdi;
     auto handle = validHandle;
@@ -291,7 +342,7 @@ TEST(WslUmKmDataTranslator, whenOpeningExistingHandleThenResourceInfoIsCopiedBas
 TEST(WslUmKmDataTranslator, whenTranslatingGraphicsPartitionThenResultIsBasedOnWslComputeHelperVersion) {
     DebugManagerStateRestore debugSettingsRestore;
 
-    NEO::DebugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
     NEO::wslComputeHelperLibNameToLoad = "";
     NEO::Gdi gdi;
     auto handle = validHandle;
@@ -342,4 +393,43 @@ TEST(WslUmKmDataTranslator, whenTranslatingGraphicsPartitionThenResultIsBasedOnW
     ret = translatorV1->translateGmmGfxPartitioningFromInternalRepresentation(dst, &src, sizeof(GMM_GFX_PARTITIONING) + 4);
     EXPECT_TRUE(ret);
     EXPECT_EQ(mockStrToTokHeapBase, dst.Heap32->Base);
+}
+
+TEST(WslUmKmDataTranslator, whenTranslatingCreateHwQueueDataThenResultIsBasedOnWslComputeHelperVersion) {
+    DebugManagerStateRestore debugSettingsRestore;
+
+    NEO::debugManager.flags.UseUmKmDataTranslator.set(true);
+    NEO::wslComputeHelperLibNameToLoad = "";
+    NEO::Gdi gdi;
+    auto handle = validHandle;
+    gdi.queryAdapterInfo.mFunc = QueryAdapterInfoMock::queryadapterinfo;
+
+    ASSERT_EQ(translatorVersion, 0U);
+    translatorVersion = 2;
+    auto translatorV2 = NEO::createUmKmDataTranslator(gdi, handle);
+    translatorVersion = 3;
+    auto translatorV3 = NEO::createUmKmDataTranslator(gdi, handle);
+    translatorVersion = 0;
+
+    EXPECT_EQ(sizeof(CREATEHWQUEUE_PVTDATA), translatorV2->getSizeForCreateHwQueueDataInternalRepresentation());
+    EXPECT_EQ(sizeof(CREATEHWQUEUE_PVTDATA) + 4, translatorV3->getSizeForCreateHwQueueDataInternalRepresentation());
+
+    CREATEHWQUEUE_PVTDATA src = {}, dst = {};
+    src.QueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_NORMAL;
+    dst.QueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_LOW;
+    auto ret = translatorV2->translateCreateHwQueueDataToInternalRepresentation(&dst, sizeof(CREATEHWQUEUE_PVTDATA), src);
+    EXPECT_TRUE(ret);
+    EXPECT_EQ(QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_NORMAL, dst.QueuePriority);
+
+    src.QueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_NORMAL;
+    dst.QueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_LOW;
+    ret = translatorV3->translateCreateHwQueueDataToInternalRepresentation(&dst, sizeof(CREATEHWQUEUE_PVTDATA), src);
+    EXPECT_FALSE(ret);
+    EXPECT_EQ(QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_LOW, dst.QueuePriority);
+
+    src.QueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_NORMAL;
+    dst.QueuePriority = QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_LOW;
+    ret = translatorV3->translateCreateHwQueueDataToInternalRepresentation(&dst, sizeof(CREATEHWQUEUE_PVTDATA) + 4, src);
+    EXPECT_TRUE(ret);
+    EXPECT_EQ(mockTokToStrQueuePriority, dst.QueuePriority);
 }

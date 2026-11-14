@@ -1,16 +1,19 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/built_ins/built_in_ops_base.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/ptr_math.h"
 
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 
 namespace NEO {
 
@@ -23,7 +26,7 @@ struct EnqueueWriteBufferTypeTest : public CommandEnqueueFixture,
 
     void SetUp() override {
         CommandEnqueueFixture::setUp();
-        BufferDefaults::context = new MockContext;
+        BufferDefaults::context = new MockContext(pClDevice);
 
         zeroCopyBuffer.reset(BufferHelper<>::create());
         srcBuffer.reset(BufferHelper<BufferUseHostPtr<>>::create());
@@ -34,6 +37,11 @@ struct EnqueueWriteBufferTypeTest : public CommandEnqueueFixture,
         zeroCopyBuffer.reset(nullptr);
         delete BufferDefaults::context;
         CommandEnqueueFixture::tearDown();
+    }
+
+    BuiltIn::AddressingMode getBuiltinMode(bool isStateless) {
+        bool bindless = ApiSpecificConfig::getBindlessMode(pCmdQ->getDevice());
+        return BuiltIn::AddressingMode::getDefaultMode(bindless, isStateless);
     }
 
   protected:

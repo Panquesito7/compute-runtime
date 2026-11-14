@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "level_zero/tools/source/sysman/performance/performance.h"
 #include "level_zero/tools/source/sysman/performance/windows/os_performance_imp.h"
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/performance/windows/mock_performance.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/windows/mock_sysman_fixture.h"
 

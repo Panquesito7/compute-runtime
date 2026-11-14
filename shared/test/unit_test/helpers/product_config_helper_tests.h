@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#pragma once
 #include "shared/source/helpers/product_config_helper.h"
 #include "shared/test/common/test_macros/test.h"
 

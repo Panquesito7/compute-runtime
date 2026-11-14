@@ -1,10 +1,12 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
+#include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/timestamp_packet_container.h"
 #include "shared/source/os_interface/product_helper.h"
@@ -31,8 +33,8 @@ struct BlitXeHpgCoreTests : public ::testing::Test {
             GTEST_SKIP();
         }
 
-        DebugManager.flags.RenderCompressedBuffersEnabled.set(true);
-        DebugManager.flags.EnableLocalMemory.set(true);
+        debugManager.flags.RenderCompressedBuffersEnabled.set(true);
+        debugManager.flags.EnableLocalMemory.set(true);
         HardwareInfo hwInfo = *defaultHwInfo;
         hwInfo.capabilityTable.blitterOperationsSupported = true;
 
@@ -43,7 +45,7 @@ struct BlitXeHpgCoreTests : public ::testing::Test {
         BlitPropertiesContainer blitPropertiesContainer;
         blitPropertiesContainer.push_back(blitProperties);
 
-        return csr->flushBcsTask(blitPropertiesContainer, blocking, false, device);
+        return csr->flushBcsTask(blitPropertiesContainer, blocking, device);
     }
 
     std::unique_ptr<MockClDevice> clDevice;
@@ -55,16 +57,17 @@ struct BlitXeHpgCoreTests : public ::testing::Test {
 XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSetMocs) {
     using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
 
-    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular);
+    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular);
     auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
     MockContext context(clDevice.get());
     MockGraphicsAllocation clearColorAlloc;
 
     cl_int retVal = CL_SUCCESS;
     auto buffer = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE, 1, nullptr, retVal));
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                     buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                     0, 0, {1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+        buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+        0, 0, {1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
     flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -74,7 +77,7 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
     auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
     EXPECT_NE(nullptr, bltCmd);
 
-    auto mocs = clDevice->getRootDeviceEnvironment().getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
+    auto mocs = clDevice->getRootDeviceEnvironment().getGmmHelper()->getUncachedMOCS();
 
     EXPECT_EQ(mocs, bltCmd->getDestinationMOCS());
     EXPECT_EQ(mocs, bltCmd->getSourceMOCS());
@@ -82,19 +85,21 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
 
 XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSetMocsToValueOfDebugKey) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideBlitterMocs.set(0u);
+    uint32_t expectedMocs = 0;
+    debugManager.flags.OverrideBlitterMocs.set(expectedMocs);
     using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
 
-    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular);
+    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular);
     auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
     MockContext context(clDevice.get());
     MockGraphicsAllocation clearColorAlloc;
 
     cl_int retVal = CL_SUCCESS;
     auto buffer = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE, 1, nullptr, retVal));
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                     buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                     0, 0, {1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+        buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+        0, 0, {1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
     flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -103,8 +108,6 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
 
     auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
     EXPECT_NE(nullptr, bltCmd);
-
-    auto expectedMocs = clDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
 
     EXPECT_EQ(expectedMocs, bltCmd->getDestinationMOCS());
     EXPECT_EQ(expectedMocs, bltCmd->getSourceMOCS());
@@ -113,7 +116,7 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
 XE_HPG_CORETEST_F(BlitXeHpgCoreTests, given2dBlitCommandWhenDispatchingThenSetValidSurfaceType) {
     using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
 
-    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular);
+    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular);
     auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
     MockContext context(clDevice.get());
 
@@ -125,8 +128,10 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, given2dBlitCommandWhenDispatchingThenSetVa
     size_t offset = 0;
     {
         // 1D
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(allocation, allocation,
-                                                                         0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            allocation, 0,
+            allocation, 0,
+            0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
         flushBcsTask(csr, blitProperties, false, clDevice->getDevice());
 
         HardwareParse hwParser;
@@ -149,8 +154,10 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, given2dBlitCommandWhenDispatchingThenSetVa
 
     {
         // 2D
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(allocation, allocation,
-                                                                         0, 0, {(2 * BlitterConstants::maxBlitWidth) + 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            allocation, 0,
+            allocation, 0,
+            0, 0, {(2 * BlitterConstants::maxBlitWidth) + 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
         flushBcsTask(csr, blitProperties, false, clDevice->getDevice());
 
         HardwareParse hwParser;
@@ -173,7 +180,7 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, given2dBlitCommandWhenDispatchingThenSetVa
 XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSetTargetMemory) {
     using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
 
-    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular).commandStreamReceiver);
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular).commandStreamReceiver);
     MockContext context(clDevice.get());
     MockGraphicsAllocation clearColorAlloc;
 
@@ -184,9 +191,10 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
     EXPECT_FALSE(MemoryPoolHelper::isSystemMemoryPool(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getMemoryPool()));
 
     {
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -202,9 +210,10 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
 
     {
         auto offset = csr->commandStream.getUsed();
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -224,7 +233,7 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
 
     using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
 
-    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular).commandStreamReceiver);
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular).commandStreamReceiver);
     MockContext context(clDevice.get());
     MockGraphicsAllocation clearColorAlloc;
 
@@ -234,11 +243,12 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
     auto bufferInLocalPool = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE, 2048, nullptr, retVal));
     EXPECT_FALSE(MemoryPoolHelper::isSystemMemoryPool(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getMemoryPool()));
 
-    DebugManager.flags.OverrideBlitterTargetMemory.set(0u);
+    debugManager.flags.OverrideBlitterTargetMemory.set(0u);
     {
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -251,12 +261,13 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
         EXPECT_EQ(bltCmd->getDestinationTargetMemory(), XY_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_SYSTEM_MEM);
         EXPECT_EQ(bltCmd->getSourceTargetMemory(), XY_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_SYSTEM_MEM);
     }
-    DebugManager.flags.OverrideBlitterTargetMemory.set(1u);
+    debugManager.flags.OverrideBlitterTargetMemory.set(1u);
     {
         auto offset = csr->commandStream.getUsed();
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -270,12 +281,13 @@ XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandThenSe
         EXPECT_EQ(bltCmd->getSourceTargetMemory(), XY_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
     }
 
-    DebugManager.flags.OverrideBlitterTargetMemory.set(2u);
+    debugManager.flags.OverrideBlitterTargetMemory.set(2u);
     {
         auto offset = csr->commandStream.getUsed();
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -296,7 +308,7 @@ HWTEST2_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandAndRevisionB0T
     const auto &productHelper = clDevice->getProductHelper();
     hwInfo->platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, *hwInfo);
 
-    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular).commandStreamReceiver);
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular).commandStreamReceiver);
     MockContext context(clDevice.get());
     MockGraphicsAllocation clearColorAlloc;
 
@@ -307,9 +319,10 @@ HWTEST2_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandAndRevisionB0T
     EXPECT_FALSE(MemoryPoolHelper::isSystemMemoryPool(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getMemoryPool()));
 
     {
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -325,9 +338,10 @@ HWTEST2_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandAndRevisionB0T
 
     {
         auto offset = csr->commandStream.getUsed();
-        auto blitProperties = BlitProperties::constructPropertiesForCopy(bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
-                                                                         0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferInLocalPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferInSystemPool->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
 
         flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
 
@@ -339,5 +353,183 @@ HWTEST2_F(BlitXeHpgCoreTests, givenBufferWhenProgrammingBltCommandAndRevisionB0T
 
         EXPECT_EQ(bltCmd->getDestinationTargetMemory(), XY_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
         EXPECT_EQ(bltCmd->getSourceTargetMemory(), XY_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
+    }
+}
+
+XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenCompressedBufferWhenResolveBlitIsCalledThenProgramSpecialOperationMode) {
+    using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
+
+    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular);
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
+    MockContext context(clDevice.get());
+    MockGraphicsAllocation clearColorAlloc;
+
+    cl_int retVal = CL_SUCCESS;
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE | CL_MEM_COMPRESSED_HINT_INTEL, 2048, nullptr, retVal));
+    auto blitProperties = BlitProperties::constructPropertiesForAuxTranslation(AuxTranslationDirection::auxToNonAux,
+                                                                               buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
+                                                                               &clearColorAlloc);
+
+    flushBcsTask(csr, blitProperties, false, clDevice->getDevice());
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(csr->commandStream);
+
+    auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
+    EXPECT_NE(nullptr, bltCmd);
+
+    EXPECT_EQ(XY_COPY_BLT::SPECIAL_MODE_OF_OPERATION::SPECIAL_MODE_OF_OPERATION_FULL_RESOLVE, bltCmd->getSpecialModeOfOperation());
+}
+
+XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenCompressedBufferWhenNonAuxToAuxBlitIsCalledThenDontProgramSourceCompression) {
+    using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
+
+    auto &bcsEngine = clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular);
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
+    MockContext context(clDevice.get());
+    MockGraphicsAllocation clearColorAlloc;
+
+    cl_int retVal = CL_SUCCESS;
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE | CL_MEM_COMPRESSED_HINT_INTEL, 2048, nullptr, retVal));
+    auto blitProperties = BlitProperties::constructPropertiesForAuxTranslation(AuxTranslationDirection::nonAuxToAux,
+                                                                               buffer->getGraphicsAllocation(clDevice->getRootDeviceIndex()),
+                                                                               &clearColorAlloc);
+
+    flushBcsTask(csr, blitProperties, false, clDevice->getDevice());
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(csr->commandStream);
+
+    auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
+    EXPECT_NE(nullptr, bltCmd);
+
+    EXPECT_FALSE(bltCmd->getSourceCompressionEnable());
+}
+
+XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenCompressedBufferWhenProgrammingBltCommandThenSetCompressionFields) {
+    using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
+
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular).commandStreamReceiver);
+    MockContext context(clDevice.get());
+
+    cl_int retVal = CL_SUCCESS;
+    auto bufferCompressed = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE | CL_MEM_COMPRESSED_HINT_INTEL, 2048, nullptr, retVal));
+    bufferCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getDefaultGmm()->setCompressionEnabled(true);
+    auto bufferNotCompressed = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE | CL_MEM_UNCOMPRESSED_HINT_INTEL, 2048, nullptr, retVal));
+
+    auto notCompressedGmm = bufferNotCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getDefaultGmm();
+    if (notCompressedGmm) {
+        notCompressedGmm->setCompressionEnabled(false);
+    }
+
+    auto gmmHelper = clDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getGmmHelper();
+    uint32_t compressionFormat = gmmHelper->getClientContext()->getSurfaceStateCompressionFormat(GMM_RESOURCE_FORMAT::GMM_FORMAT_GENERIC_8BIT);
+
+    {
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferNotCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, csr->getClearColorAllocation(), false);
+
+        flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(csr->commandStream);
+
+        auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
+        EXPECT_NE(nullptr, bltCmd);
+
+        EXPECT_FALSE(bltCmd->getDestinationCompressionEnable());
+        EXPECT_EQ(bltCmd->getDestinationAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_NONE);
+        EXPECT_EQ(bltCmd->getDestinationCompressionFormat(), 0u);
+        EXPECT_TRUE(bltCmd->getSourceCompressionEnable());
+        EXPECT_EQ(bltCmd->getSourceAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_CCS_E);
+        EXPECT_EQ(bltCmd->getSourceCompressionFormat(), compressionFormat);
+    }
+
+    {
+        auto offset = csr->commandStream.getUsed();
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferNotCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, csr->getClearColorAllocation(), false);
+        flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(csr->commandStream, offset);
+
+        auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
+        EXPECT_NE(nullptr, bltCmd);
+
+        EXPECT_TRUE(bltCmd->getDestinationCompressionEnable());
+        EXPECT_EQ(bltCmd->getDestinationAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_CCS_E);
+        EXPECT_EQ(bltCmd->getDestinationCompressionFormat(), compressionFormat);
+        EXPECT_FALSE(bltCmd->getSourceCompressionEnable());
+        EXPECT_EQ(bltCmd->getSourceAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_NONE);
+        EXPECT_EQ(bltCmd->getSourceCompressionFormat(), 0u);
+    }
+}
+
+XE_HPG_CORETEST_F(BlitXeHpgCoreTests, givenDebugFlagSetWhenCompressionEnabledThenForceCompressionFormat) {
+    using XY_COPY_BLT = typename FamilyType::XY_COPY_BLT;
+
+    uint32_t compressionFormat = 3;
+    debugManager.flags.ForceBufferCompressionFormat.set(compressionFormat);
+
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(clDevice->getEngine(aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular).commandStreamReceiver);
+    MockContext context(clDevice.get());
+
+    cl_int retVal = CL_SUCCESS;
+    auto bufferCompressed = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE | CL_MEM_COMPRESSED_HINT_INTEL, 2048, nullptr, retVal));
+    bufferCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getDefaultGmm()->setCompressionEnabled(true);
+    auto bufferNotCompressed = clUniquePtr<Buffer>(Buffer::create(&context, CL_MEM_READ_WRITE | CL_MEM_UNCOMPRESSED_HINT_INTEL, 2048, nullptr, retVal));
+
+    auto uncompressedGmm = bufferNotCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex())->getDefaultGmm();
+    if (uncompressedGmm) {
+        uncompressedGmm->setCompressionEnabled(false);
+    }
+
+    {
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferNotCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, csr->getClearColorAllocation(), false);
+
+        flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(csr->commandStream);
+
+        auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
+        EXPECT_NE(nullptr, bltCmd);
+
+        EXPECT_FALSE(bltCmd->getDestinationCompressionEnable());
+        EXPECT_EQ(bltCmd->getDestinationAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_NONE);
+        EXPECT_EQ(bltCmd->getDestinationCompressionFormat(), 0u);
+        EXPECT_TRUE(bltCmd->getSourceCompressionEnable());
+        EXPECT_EQ(bltCmd->getSourceAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_CCS_E);
+        EXPECT_EQ(bltCmd->getSourceCompressionFormat(), compressionFormat);
+    }
+
+    {
+        auto offset = csr->commandStream.getUsed();
+        auto blitProperties = BlitProperties::constructPropertiesForCopy(
+            bufferCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            bufferNotCompressed->getGraphicsAllocation(clDevice->getRootDeviceIndex()), 0,
+            0, 0, {2048, 1, 1}, 0, 0, 0, 0, csr->getClearColorAllocation(), false);
+        flushBcsTask(csr, blitProperties, true, clDevice->getDevice());
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(csr->commandStream, offset);
+
+        auto bltCmd = genCmdCast<XY_COPY_BLT *>(*(hwParser.cmdList.begin()));
+        EXPECT_NE(nullptr, bltCmd);
+
+        EXPECT_TRUE(bltCmd->getDestinationCompressionEnable());
+        EXPECT_EQ(bltCmd->getDestinationAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_CCS_E);
+        EXPECT_EQ(bltCmd->getDestinationCompressionFormat(), compressionFormat);
+        EXPECT_FALSE(bltCmd->getSourceCompressionEnable());
+        EXPECT_EQ(bltCmd->getSourceAuxiliarysurfacemode(), XY_COPY_BLT::AUXILIARY_SURFACE_MODE_AUX_NONE);
+        EXPECT_EQ(bltCmd->getSourceCompressionFormat(), 0u);
     }
 }

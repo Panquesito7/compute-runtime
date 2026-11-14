@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,17 +7,22 @@
 
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/event/user_event.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
-#include "opencl/test/unit_test/mocks/mock_event.h"
+
+#include "gtest/gtest.h"
+
+namespace NEO {
+class ClDevice;
+class Context;
+class GraphicsAllocation;
+} // namespace NEO
 
 using namespace NEO;
 
@@ -25,7 +30,7 @@ template <typename Family>
 class MyMockCommandQueue : public CommandQueueHw<Family> {
 
   public:
-    MyMockCommandQueue(Context *context, ClDevice *device) : CommandQueueHw<Family>(context, device, nullptr, false){};
+    MyMockCommandQueue(Context *context, ClDevice *device) : CommandQueueHw<Family>(context, device, nullptr, false) {};
 
     cl_int enqueueWriteImage(Image *dstImage, cl_bool blockingWrite,
                              const size_t *origin, const size_t *region,
@@ -39,7 +44,7 @@ class MyMockCommandQueue : public CommandQueueHw<Family> {
         enqueueWriteImageCalled++;
         return CL_SUCCESS;
     }
-    cl_int finish() override {
+    cl_int finish(bool resolvePendingL3Flushes) override {
         finishCalled++;
         return CL_SUCCESS;
     }
@@ -52,9 +57,9 @@ class MyMockCommandQueue : public CommandQueueHw<Family> {
 class ImageUnmapTest : public ::testing::Test {
   public:
     void SetUp() override {
-        device = std::make_unique<MockClDevice>(MockClDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+        device = std::make_unique<MockClDevice>(MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
         context = std::make_unique<MockContext>(device.get());
-        image.reset(ImageHelper<ImageReadOnly<Image3dDefaults>>::create(context.get()));
+        image.reset(ImageHelperUlt<ImageReadOnly<Image3dDefaults>>::create(context.get()));
     }
     std::unique_ptr<MockClDevice> device;
     std::unique_ptr<MockContext> context;
@@ -70,7 +75,7 @@ HWTEST_F(ImageUnmapTest, givenImageWhenUnmapMemObjIsCalledThenEnqueueNonBlocking
     cl_map_flags mapFlags = CL_MAP_WRITE;
     image->addMappedPtr(ptr, 1, mapFlags, region, origin, 0, nullptr);
 
-    AllocationProperties properties{0, false, MemoryConstants::cacheLineSize, AllocationType::MAP_ALLOCATION, false, device->getDeviceBitfield()};
+    AllocationProperties properties{0, false, MemoryConstants::cacheLineSize, AllocationType::mapAllocation, false, device->getDeviceBitfield()};
     auto allocation = device->getMemoryManager()->allocateGraphicsMemoryWithProperties(properties, ptr);
     image->setMapAllocation(allocation);
 

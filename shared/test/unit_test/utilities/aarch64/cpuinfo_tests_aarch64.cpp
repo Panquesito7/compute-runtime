@@ -1,14 +1,15 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/file_io.h"
 #include "shared/source/os_interface/linux/os_inc.h"
 #include "shared/source/utilities/cpu_info.h"
+#include "shared/test/common/helpers/mock_file_io.h"
 #include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/unit_test/mocks/mock_cpuid_functions.h"
 
 #include "gtest/gtest.h"
 
@@ -17,22 +18,47 @@
 
 using namespace NEO;
 
-TEST(CpuInfoAarch64, givenProcCpuinfoFileExistsWhenIsCpuFlagPresentIsCalledThenValidValueIsReturned) {
+void mockGetCpuFlags(std::string &cpuFlags) {
+    size_t fileSize = 0;
+    std::string cpuinfoFile = "cpuinfo";
+    auto fileData = loadDataFromVirtualFile(cpuinfoFile.c_str(), fileSize);
+
+    std::string data(fileData.get(), fileSize);
+    std::istringstream cpuinfo(data);
+    std::string line;
+    while (std::getline(cpuinfo, line)) {
+        if (line.starts_with("Features")) {
+            cpuFlags = line;
+            break;
+        }
+    }
+}
+
+TEST(CpuInfo, givenProcCpuinfoFileExistsWhenIsCpuFlagPresentIsCalledThenValidValueIsReturned) {
     VariableBackup<const char *> pathPrefixBackup(&Os::sysFsProcPathPrefix, ".");
     std::string cpuinfoFile = "cpuinfo";
-    EXPECT_FALSE(fileExists(cpuinfoFile));
+    EXPECT_FALSE(virtualFileExists(cpuinfoFile));
+    constexpr std::string_view cpuinfoData = "processor\t\t: 0\nFeatures\t\t: flag1 flag2 flag3\n";
+    NEO::writeDataToFile(cpuinfoFile.c_str(), cpuinfoData, false);
 
-    {
-        std::ofstream cpuinfo(cpuinfoFile);
-        cpuinfo << "processor\t\t: 0\nFeatures\t\t: flag1 flag2 flag3\n";
-    }
+    EXPECT_TRUE(virtualFileExists(cpuinfoFile));
 
-    EXPECT_TRUE(fileExists(cpuinfoFile));
-
+    VariableBackup<decltype(CpuInfo::getCpuFlagsFunc)> funcBackup(&CpuInfo::getCpuFlagsFunc, mockGetCpuFlags);
     CpuInfo testCpuInfo;
     EXPECT_TRUE(testCpuInfo.isCpuFlagPresent("flag1"));
     EXPECT_TRUE(testCpuInfo.isCpuFlagPresent("flag2"));
     EXPECT_FALSE(testCpuInfo.isCpuFlagPresent("nonExistingCpuFlag"));
 
-    std::remove(cpuinfoFile.c_str());
+    removeVirtualFile(cpuinfoFile.c_str());
+}
+
+TEST(CpuInfoMaxCpuVirtualAddressTest, givenReportedVirtualAddressSizeThenWholeLowRangeBelongsToUserSpace) {
+    MockCpuInfo cpuInfo;
+    cpuInfo.featuresDetected = true;
+
+    cpuInfo.virtualAddressSize = 48u;
+    EXPECT_EQ(maxNBitValue(48), cpuInfo.getMaxCpuVirtualAddress());
+
+    cpuInfo.virtualAddressSize = 39u;
+    EXPECT_EQ(maxNBitValue(39), cpuInfo.getMaxCpuVirtualAddress());
 }

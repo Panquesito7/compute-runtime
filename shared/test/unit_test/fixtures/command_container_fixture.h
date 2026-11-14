@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/command_container/cmdcontainer.h"
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/helpers/cache_policy.h"
 #include "shared/source/kernel/kernel_descriptor.h"
@@ -19,7 +20,9 @@ class CommandEncodeStatesFixture : public DeviceFixture {
   public:
     class MyMockCommandContainer : public CommandContainer {
       public:
+        using CommandContainer::allocationIndirectHeaps;
         using CommandContainer::dirtyHeaps;
+        using CommandContainer::indirectHeaps;
 
         IndirectHeap *getHeapWithRequiredSizeAndAlignment(HeapType heapType, size_t sizeRequired, size_t alignment) override {
             getHeapWithRequiredSizeAndAlignmentCalled++;
@@ -31,10 +34,63 @@ class CommandEncodeStatesFixture : public DeviceFixture {
     void setUp();
     void tearDown();
 
-    EncodeDispatchKernelArgs createDefaultDispatchKernelArgs(Device *device,
-                                                             DispatchKernelEncoderI *dispatchInterface,
-                                                             const void *threadGroupDimensions,
-                                                             bool requiresUncachedMocs);
+    static EncodeDispatchKernelArgs createDefaultDispatchKernelArgs(Device *device, DispatchKernelEncoderI *dispatchInterface, const void *threadGroupDimensions, bool requiresUncachedMocs) {
+        EncodeDispatchKernelArgs args{
+            .device = device,
+            .dispatchInterface = dispatchInterface,
+            .surfaceStateHeap = nullptr,
+            .dynamicStateHeap = nullptr,
+            .threadGroupDimensions = threadGroupDimensions,
+            .outWalkerPtr = nullptr,
+            .outWalkerGpuVa = 0,
+            .cpuWalkerBuffer = nullptr,
+            .cpuPayloadBuffer = nullptr,
+            .outImplicitArgsPtr = nullptr,
+            .outImplicitArgsGpuVa = 0,
+            .additionalCommands = nullptr,
+            .extendedArgs = nullptr,
+            .postSyncArgs = {
+                .eventPacketSize = 32,
+                .eventPacketsCount = 1,
+                .eventAddress = 0,
+                .postSyncImmValue = 0,
+                .inOrderCounterValue = 0,
+                .inOrderIncrementGpuAddress = 0,
+                .inOrderIncrementValue = 0,
+                .device = device,
+                .inOrderExecInfo = nullptr,
+                .tsNode = nullptr,
+                .dcFlushEnable = false,
+                .interruptEvent = false,
+                .isCounterBasedEvent = false,
+                .isFlushL3ForExternalAllocationRequired = false,
+                .isFlushL3ForHostUsmRequired = false,
+                .isHostScopeSignalEvent = false,
+                .isTimestampEvent = false,
+                .isUsingSystemAllocation = false,
+            },
+            .preemptionMode = PreemptionMode::Disabled,
+            .requiredPartitionDim = NEO::RequiredPartitionDim::none,
+            .requiredDispatchWalkOrder = NEO::RequiredDispatchWalkOrder::none,
+            .partitionCount = 1,
+            .reserveExtraPayloadSpace = 0,
+            .defaultPipelinedThreadArbitrationPolicy = NEO::ThreadArbitrationPolicy::NotPresent,
+            .isIndirect = false,
+            .isPredicate = false,
+            .requiresUncachedMocs = requiresUncachedMocs,
+            .isInternal = false,
+            .isCooperative = false,
+            .isKernelDispatchedFromImmediateCmdList = false,
+            .isRcs = false,
+            .isHeaplessModeEnabled = false,
+            .immediateScratchAddressPatching = false,
+            .makeCommandView = false,
+        };
+
+        return args;
+    }
+
+    static EncodeWalkerArgs createDefaultEncodeWalkerArgs(const KernelDescriptor &kernelDescriptor);
 
     template <typename FamilyType>
     EncodeStateBaseAddressArgs<FamilyType> createDefaultEncodeStateBaseAddressArgs(
@@ -49,10 +105,11 @@ class CommandEncodeStatesFixture : public DeviceFixture {
             statelessMocs,                            // statelessMocsIndex
             l1CachePolicyData.getL1CacheValue(false), // l1CachePolicy
             l1CachePolicyData.getL1CacheValue(true),  // l1CachePolicyDebuggerActive
-            false,                                    // useGlobalAtomics
             false,                                    // multiOsContextCapable
             false,                                    // isRcs
-            container->doubleSbaWaRef()};             // doubleSbaWa
+            container->doubleSbaWaRef(),              // doubleSbaWa
+            false                                     // heaplessModeEnabled
+        };
         return args;
     }
 
@@ -60,6 +117,14 @@ class CommandEncodeStatesFixture : public DeviceFixture {
     KernelInfo kernelInfo;
     std::unique_ptr<MyMockCommandContainer> cmdContainer;
     NEO::L1CachePolicy l1CachePolicyData;
+};
+
+struct ScratchProgrammingFixture : public NEO::DeviceFixture {
+    void setUp();
+    void tearDown();
+
+    IndirectHeap *ssh = nullptr;
+    void *sshBuffer = nullptr;
 };
 
 } // namespace NEO

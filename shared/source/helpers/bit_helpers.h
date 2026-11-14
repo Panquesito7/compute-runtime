@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2020 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,6 +14,9 @@ namespace NEO {
 
 constexpr bool isBitSet(uint64_t field, uint64_t bitPosition) {
     assert(bitPosition < std::numeric_limits<uint64_t>::digits); // undefined behavior
+    if (bitPosition >= std::numeric_limits<uint64_t>::digits) {
+        return false;
+    }
     return (field & (1ull << bitPosition));
 }
 
@@ -38,7 +41,24 @@ constexpr uint64_t setBits(uint64_t field, bool newValue, uint64_t bitsToModify)
 }
 
 constexpr uint64_t shiftLeftBy(uint64_t bitPosition) {
+    assert(bitPosition < std::numeric_limits<uint64_t>::digits);
+    if (bitPosition >= std::numeric_limits<uint64_t>::digits) {
+        return 0;
+    }
     return (1ull << bitPosition);
+}
+
+constexpr uint32_t getMostSignificantSetBitIndex(uint64_t field) {
+    uint32_t index = 0;
+    while (field >>= 1) {
+        index++;
+    }
+    return index;
+}
+
+template <unsigned... bits>
+constexpr uint64_t makeBitMask() {
+    return ((1ull << bits) | ...);
 }
 
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,24 +9,29 @@
 
 namespace NEO {
 enum class TransferDirection {
-    HostToHost,
-    HostToLocal,
-    LocalToHost,
-    LocalToLocal,
+    hostToHost = 0,
+    hostToLocal,
+    localToHost,
+    localToLocal,
+    remote,
 };
 
-inline TransferDirection createTransferDirection(bool srcLocal, bool dstLocal) {
+inline TransferDirection createTransferDirection(bool srcLocal, bool dstLocal, bool remoteCopy) {
+    if (remoteCopy) {
+        return TransferDirection::remote;
+    }
+
     if (srcLocal) {
         if (dstLocal) {
-            return TransferDirection::LocalToLocal;
+            return TransferDirection::localToLocal;
         } else {
-            return TransferDirection::LocalToHost;
+            return TransferDirection::localToHost;
         }
     } else {
         if (dstLocal) {
-            return TransferDirection::HostToLocal;
+            return TransferDirection::hostToLocal;
         } else {
-            return TransferDirection::HostToHost;
+            return TransferDirection::hostToHost;
         }
     }
 }

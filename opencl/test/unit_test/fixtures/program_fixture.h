@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,6 @@
 
 #pragma once
 #include <memory>
-#include <string>
 
 namespace NEO {
 class Context;
@@ -16,6 +15,7 @@ class MockContext;
 class MockProgram;
 class ClDevice;
 class MockNeoProgram;
+
 using cl_int = int;
 
 class NEOProgramFixture {
@@ -34,17 +34,10 @@ class ProgramFixture {
   public:
     void createProgramFromBinary(Context *pContext,
                                  const ClDeviceVector &deviceVector,
-                                 const std::string &binaryFileName,
-                                 cl_int &retVal,
-                                 const std::string &options = "");
+                                 const unsigned char **binary,
+                                 const size_t *binarySize);
 
-    void createProgramFromBinary(Context *pContext,
-                                 const ClDeviceVector &deviceVector,
-                                 const std::string &binaryFileName,
-                                 const std::string &options = "");
-
-    void createProgramWithSource(Context *pContext,
-                                 const std::string &sourceFileName);
+    void createProgramWithSource(Context *pContext);
 
   protected:
     void setUp() {

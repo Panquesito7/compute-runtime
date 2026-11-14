@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include "level_zero/core/source/fence/fence.h"
+#include "level_zero/core/test/unit_tests/mock.h"
 #include "level_zero/core/test/unit_tests/white_box.h"
 
 namespace L0 {
@@ -19,7 +20,6 @@ struct WhiteBox<::L0::Fence> : public ::L0::Fence {
     WhiteBox() : Fence(nullptr) {}
     ~WhiteBox() override = default;
 
-    using ::L0::Fence::gpuHangCheckPeriod;
     using ::L0::Fence::taskCount;
 };
 
@@ -31,7 +31,8 @@ struct Mock<Fence> : public Fence {
 
     ADDMETHOD_NOBASE(destroy, ze_result_t, ZE_RESULT_SUCCESS, ());
     ADDMETHOD_NOBASE(hostSynchronize, ze_result_t, ZE_RESULT_SUCCESS, (uint64_t timeout));
-    ADDMETHOD_NOBASE(queryStatus, ze_result_t, ZE_RESULT_SUCCESS, ());
+    using Fence::queryStatus;
+    ADDMETHOD_NOBASE(queryStatus, ze_result_t, ZE_RESULT_SUCCESS, (bool blockOnMiss));
     ADDMETHOD_NOBASE(assignTaskCountFromCsr, ze_result_t, ZE_RESULT_SUCCESS, ());
     ADDMETHOD_NOBASE(reset, ze_result_t, ZE_RESULT_SUCCESS, (bool signaled));
 };

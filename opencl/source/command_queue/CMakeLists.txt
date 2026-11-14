@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2023 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -9,10 +9,10 @@ set(RUNTIME_SRCS_COMMAND_QUEUE
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_local_work_size.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_local_work_size.h
     ${CMAKE_CURRENT_SOURCE_DIR}/command_queue.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_staging.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/command_queue.h
     ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_hw.h
     ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_hw_base.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_hw_bdw_and_later.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_engine_state.h
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu_data_transfer_handler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csr_selection_args.cpp
@@ -41,10 +41,10 @@ set(RUNTIME_SRCS_COMMAND_QUEUE
     ${CMAKE_CURRENT_SOURCE_DIR}/flush.h
     ${CMAKE_CURRENT_SOURCE_DIR}/gpgpu_walker.h
     ${CMAKE_CURRENT_SOURCE_DIR}/gpgpu_walker_base.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpgpu_walker_bdw_and_later.inl
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpgpu_walker_from_xe_hpg_to_xe_hpc.inl
+    ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR_SUFFIX}hardware_interface.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hardware_interface.h
     ${CMAKE_CURRENT_SOURCE_DIR}/hardware_interface_base.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/hardware_interface_bdw_and_later.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/resource_barrier.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/resource_barrier.h
 )
@@ -54,6 +54,14 @@ if(SUPPORT_XEHP_AND_LATER)
        ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_hw_xehp_and_later.inl
        ${CMAKE_CURRENT_SOURCE_DIR}/gpgpu_walker_xehp_and_later.inl
        ${CMAKE_CURRENT_SOURCE_DIR}/hardware_interface_xehp_and_later.inl
+  )
+endif()
+
+if(SUPPORT_XE3P_AND_LATER)
+  list(APPEND RUNTIME_SRCS_COMMAND_QUEUE
+       ${CMAKE_CURRENT_SOURCE_DIR}/finish_xe3p_and_later.inl
+       ${CMAKE_CURRENT_SOURCE_DIR}/gpgpu_walker_xe3p_and_later.inl
+       ${CMAKE_CURRENT_SOURCE_DIR}/hardware_interface_xe3p_and_later.inl
   )
 endif()
 

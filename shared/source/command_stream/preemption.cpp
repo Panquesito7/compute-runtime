@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,6 +15,7 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/kernel/kernel_descriptor.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 
 namespace NEO {
 
@@ -27,21 +28,17 @@ bool PreemptionHelper::allowThreadGroupPreemption(const PreemptionFlags &flags) 
         flags.flags.disableLSQCROPERFforOCL) {
         return false;
     }
-    if (flags.flags.vmeKernel) {
-        return false;
-    }
 
     return true;
 }
 
 bool PreemptionHelper::allowMidThreadPreemption(const PreemptionFlags &flags) {
-    return (flags.flags.disabledMidThreadPreemptionKernel == 0) &&
-           !(flags.flags.vmeKernel && !flags.flags.deviceSupportsVmePreemption);
+    return flags.flags.disabledMidThreadPreemptionKernel == 0;
 }
 
 PreemptionMode PreemptionHelper::taskPreemptionMode(PreemptionMode devicePreemptionMode, const PreemptionFlags &flags) {
-    if (DebugManager.flags.ForceKernelPreemptionMode.get() != -1) {
-        return static_cast<PreemptionMode>(DebugManager.flags.ForceKernelPreemptionMode.get());
+    if (debugManager.flags.ForceKernelPreemptionMode.get() != -1) {
+        return static_cast<PreemptionMode>(debugManager.flags.ForceKernelPreemptionMode.get());
     }
     if (devicePreemptionMode == PreemptionMode::Disabled) {
         return PreemptionMode::Disabled;
@@ -76,22 +73,17 @@ void PreemptionHelper::adjustDefaultPreemptionMode(RuntimeCapabilityTable &devic
 }
 
 PreemptionMode PreemptionHelper::getDefaultPreemptionMode(const HardwareInfo &hwInfo) {
-    return DebugManager.flags.ForcePreemptionMode.get() == -1
+    return debugManager.flags.ForcePreemptionMode.get() == -1
                ? hwInfo.capabilityTable.defaultPreemptionMode
-               : static_cast<PreemptionMode>(DebugManager.flags.ForcePreemptionMode.get());
+               : static_cast<PreemptionMode>(debugManager.flags.ForcePreemptionMode.get());
 }
 
 PreemptionFlags PreemptionHelper::createPreemptionLevelFlags(Device &device, const KernelDescriptor *kernelDescriptor) {
     PreemptionFlags flags = {};
-    auto &productHelper = device.getRootDeviceEnvironment().getHelper<ProductHelper>();
     if (kernelDescriptor) {
         flags.flags.disabledMidThreadPreemptionKernel = kernelDescriptor->kernelAttributes.flags.requiresDisabledMidThreadPreemption;
-        flags.flags.vmeKernel = kernelDescriptor->kernelAttributes.flags.usesVme;
         flags.flags.usesFencesForReadWriteImages = kernelDescriptor->kernelAttributes.flags.usesFencesForReadWriteImages;
-
-        flags.flags.disabledMidThreadPreemptionKernel |= kernelDescriptor->kernelAttributes.flags.hasRTCalls && productHelper.isMidThreadPreemptionDisallowedForRayTracingKernels();
     }
-    flags.flags.deviceSupportsVmePreemption = device.getDeviceInfo().vmeAvcSupportsPreemption;
     flags.flags.disablePerCtxtPreemptionGranularityControl = device.getHardwareInfo().workaroundTable.flags.waDisablePerCtxtPreemptionGranularityControl;
     flags.flags.disableLSQCROPERFforOCL = device.getHardwareInfo().workaroundTable.flags.waDisableLSQCROPERFforOCL;
     return flags;

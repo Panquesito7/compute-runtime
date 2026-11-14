@@ -1,0 +1,8 @@
+components:
+  i915_kmd:
+    version: dev-5963
+  xe_kmd:
+    version: dev-1900
+  ipldt:
+    revision: 34456f8e46e4bd064e55ef11ef7ecea133846c08
+version: '1'

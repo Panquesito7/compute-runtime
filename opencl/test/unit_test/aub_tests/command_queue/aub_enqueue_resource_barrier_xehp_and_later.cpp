@@ -1,22 +1,20 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/test/common/helpers/cmd_buffer_validator.h"
-#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/helpers/test_traits.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/command_queue/resource_barrier.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
-#include "opencl/test/unit_test/aub_tests/fixtures/hello_world_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
-
-#include "test_traits_common.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_kernel_fixture.h"
 
 using namespace NEO;
 
@@ -89,9 +87,9 @@ HWTEST2_F(ResourceBarrierAubTest, givenAllocationsWhenEnqueueResourceBarrierCall
     std::string err;
     auto cmdBuffOk = expectCmdBuff<FamilyType>(l3FlushCmdStream, sizeUsed,
                                                std::vector<MatchCmd *>{
-                                                   new MatchAnyCmd(AnyNumber),
+                                                   new MatchAnyCmd(anyNumber),
                                                    new MatchHwCmd<FamilyType, L3_CONTROL>(1),
-                                                   new MatchAnyCmd(AnyNumber),
+                                                   new MatchAnyCmd(anyNumber),
                                                },
                                                &err);
     EXPECT_TRUE(cmdBuffOk) << err;
@@ -105,8 +103,8 @@ HWTEST2_F(ResourceBarrierAubTest, givenAllocationsWhenEnqueueResourceBarrierCall
 
     pCmdQ->flush();
 
-    expectMemory<FamilyType>(reinterpret_cast<void *>(dstBuffer1->getGraphicsAllocation(device->getRootDeviceIndex())->getGpuAddress()),
+    expectMemory<FamilyType>(addrToPtr(ptrOffset(dstBuffer1->getGraphicsAllocation(device->getRootDeviceIndex())->getGpuAddress(), dstBuffer1->getOffset())),
                              bufferAMemory, bufferSize);
-    expectMemory<FamilyType>(reinterpret_cast<void *>(dstBuffer2->getGraphicsAllocation(device->getRootDeviceIndex())->getGpuAddress()),
+    expectMemory<FamilyType>(addrToPtr(ptrOffset(dstBuffer2->getGraphicsAllocation(device->getRootDeviceIndex())->getGpuAddress(), dstBuffer2->getOffset())),
                              bufferAMemory, bufferSize);
 }

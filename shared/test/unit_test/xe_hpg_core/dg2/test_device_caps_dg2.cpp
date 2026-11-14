@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/os_interface/product_helper.h"
 #include "shared/source/xe_hpg_core/hw_cmds_dg2.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/mocks/mock_device.h"
@@ -14,10 +15,6 @@
 using namespace NEO;
 
 using Dg2UsDeviceIdTest = Test<DeviceFixture>;
-
-DG2TEST_F(Dg2UsDeviceIdTest, givenDg2ThenDebuggerIsNotSupported) {
-    EXPECT_FALSE(pDevice->getHardwareInfo().capabilityTable.debuggerSupported);
-}
 
 DG2TEST_F(Dg2UsDeviceIdTest, givenDg2ProductWhenCheckBlitterOperationsSupportThenReturnFalse) {
     EXPECT_FALSE(pDevice->getHardwareInfo().capabilityTable.blitterOperationsSupported);

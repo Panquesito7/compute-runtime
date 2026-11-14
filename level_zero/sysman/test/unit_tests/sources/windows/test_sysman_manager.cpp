@@ -1,16 +1,17 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/sysman/source/windows/zes_os_sysman_imp.h"
+#include "level_zero/sysman/source/shared/windows/zes_os_sysman_imp.h"
 #include "level_zero/sysman/test/unit_tests/sources/windows/mock_kmd_sys_manager.h"
 
 #include "gtest/gtest.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 class SysmanKmdManagerFixture : public ::testing::Test {
@@ -193,7 +194,7 @@ TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsTrueAndCorruptedDataWhenReques
     EXPECT_NE(ZE_RESULT_SUCCESS, result);
 }
 
-TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsFalseAndTDROccuredWhenRequestSingleIsCalledThenErrorDeviceLostIsReturned) {
+TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsFalseAndTDROccurredWhenRequestSingleIsCalledThenErrorDeviceLostIsReturned) {
     pKmdSysManager->allowSetCalls = false;
     pKmdSysManager->mockEscapeResult = STATUS_DEVICE_REMOVED;
 
@@ -213,7 +214,7 @@ TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsFalseAndTDROccuredWhenRequestS
     EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
 }
 
-TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsFalseAndTDROccuredWhenRequestMultipleIsCalledThenErrorDeviceLostIsReturned) {
+TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsFalseAndTDROccurredWhenRequestMultipleIsCalledThenErrorDeviceLostIsReturned) {
     pKmdSysManager->allowSetCalls = false;
     pKmdSysManager->mockEscapeResult = STATUS_DEVICE_REMOVED;
 
@@ -239,4 +240,5 @@ TEST_F(SysmanKmdManagerFixture, GivenAllowSetCallsFalseAndTDROccuredWhenRequestM
 }
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

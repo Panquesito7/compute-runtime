@@ -1,34 +1,37 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/linear_stream.h"
-#include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_timestamp_container.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "opencl/source/command_queue/gpgpu_walker.h"
 #include "opencl/source/command_queue/hardware_interface.h"
 #include "opencl/source/event/event.h"
 #include "opencl/test/unit_test/command_queue/hardware_interface_helper.h"
 #include "opencl/test/unit_test/fixtures/ult_command_stream_receiver_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_mdi.h"
+
+#include <list>
+#include <vector>
 
 using namespace NEO;
 
 struct MemorySynchronizationViaMiSemaphoreWaitTest : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+        debugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.set(0);
         UltCommandStreamReceiverTest::SetUp();
     }
     DebugManagerStateRestore restore;
@@ -55,9 +58,10 @@ XE_HPC_CORETEST_F(MemorySynchronizationViaMiSemaphoreWaitTest, givenMemorySynchr
 
 struct SystemMemoryFenceInDisabledConfigurationTest : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+        debugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.set(0);
         UltCommandStreamReceiverTest::SetUp();
     }
     DebugManagerStateRestore restore;
@@ -68,8 +72,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDisabledConfigurationTest, givenNoSystemMem
     using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
     using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
 
-    MockKernelWithInternals kernel(*pClDevice);
     MockContext context(pClDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, pClDevice, nullptr);
 
     size_t globalWorkSize[3] = {1, 1, 1};
@@ -93,8 +97,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDisabledConfigurationTest, givenNoSystemMem
 
 struct SystemMemoryFenceViaMiMemFenceTest : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(1);
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(1);
         UltCommandStreamReceiverTest::SetUp();
     }
     DebugManagerStateRestore restore;
@@ -137,7 +141,7 @@ XE_HPC_CORETEST_F(SystemMemoryFenceViaMiMemFenceTest, givenSystemMemoryFenceGene
     EXPECT_FALSE(commandStreamReceiver.isEnginePrologueSent);
 
     BlitPropertiesContainer blitPropertiesContainer;
-    commandStreamReceiver.flushBcsTask(blitPropertiesContainer, false, false, *pDevice);
+    commandStreamReceiver.flushBcsTask(blitPropertiesContainer, false, *pDevice);
     EXPECT_TRUE(commandStreamReceiver.isEnginePrologueSent);
 
     HardwareParse hwParser;
@@ -151,10 +155,10 @@ XE_HPC_CORETEST_F(SystemMemoryFenceViaMiMemFenceTest, givenSystemMemoryFenceGene
 
 struct SystemMemoryFenceViaComputeWalkerTest : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(1);
-        DebugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(1);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
         UltCommandStreamReceiverTest::SetUp();
     }
     DebugManagerStateRestore restore;
@@ -186,16 +190,16 @@ XE_HPC_CORETEST_F(SystemMemoryFenceViaComputeWalkerTest, givenSystemMemoryFenceG
 XE_HPC_CORETEST_F(SystemMemoryFenceViaComputeWalkerTest, givenSystemMemoryFenceGeneratedAsPostSyncOperationInComputeWalkerWhenDispatchWalkerIsCalledThenSystemMemoryFenceRequestInPostSyncDataIsProgrammed) {
     using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
 
-    MockKernelWithInternals kernel(*pClDevice);
-    MockMultiDispatchInfo multiDispatchInfo(pClDevice, kernel.mockKernel);
     MockContext context(pClDevice);
+    MockKernelWithInternals kernel(context);
+    MockMultiDispatchInfo multiDispatchInfo(pClDevice, kernel.mockKernel);
     MockCommandQueue commandQueue(&context, pClDevice, nullptr, false);
     auto &cmdStream = commandQueue.getCS(0);
     MockTimestampPacketContainer timestampPacket(*pClDevice->getGpgpuCommandStreamReceiver().getTimestampPacketAllocator(), 1);
 
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgs.currentTimestampPacketNodes = &timestampPacket;
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<COMPUTE_WALKER>(
         commandQueue,
         multiDispatchInfo,
         CsrDependencies(),
@@ -213,10 +217,10 @@ XE_HPC_CORETEST_F(SystemMemoryFenceViaComputeWalkerTest, givenSystemMemoryFenceG
 
 struct SystemMemoryFenceViaKernelInstructionTest : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
-        DebugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(1);
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(1);
         UltCommandStreamReceiverTest::SetUp();
     }
     DebugManagerStateRestore restore;
@@ -247,10 +251,10 @@ XE_HPC_CORETEST_F(SystemMemoryFenceViaKernelInstructionTest, givenSystemMemoryFe
 
 struct SystemMemoryFenceInDefaultConfigurationTest : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(-1);
-        DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
-        DebugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(-1);
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(-1);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(-1);
         UltCommandStreamReceiverTest::SetUp();
     }
     DebugManagerStateRestore restore;
@@ -268,8 +272,8 @@ HWTEST2_F(SystemMemoryFenceInDefaultConfigurationTest, givenSpecificDeviceSteppi
     UltClDeviceFactory ultClDeviceFactory{1, 0};
     auto &clDevice = *ultClDeviceFactory.rootDevices[0];
 
-    MockKernelWithInternals kernel(clDevice);
     MockContext context(&clDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, &clDevice, nullptr);
     auto &commandStreamReceiver = clDevice.getUltCommandStreamReceiver<FamilyType>();
 
@@ -307,8 +311,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     UltClDeviceFactory ultClDeviceFactory{1, 0};
     auto &clDevice = *ultClDeviceFactory.rootDevices[0];
 
-    MockKernelWithInternals kernel(clDevice);
     MockContext context(&clDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, &clDevice, nullptr);
     auto &commandStreamReceiver = clDevice.getUltCommandStreamReceiver<FamilyType>();
 
@@ -333,7 +337,7 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     ASSERT_NE(hwParser.cmdList.end(), itorMiMemFence);
     auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*itorMiMemFence);
     ASSERT_NE(nullptr, fenceCmd);
-    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE, fenceCmd->getFenceType());
+    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
 }
 
 XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
@@ -349,8 +353,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     UltClDeviceFactory ultClDeviceFactory{1, 0};
     auto &clDevice = *ultClDeviceFactory.rootDevices[0];
 
-    MockKernelWithInternals kernel(clDevice);
     MockContext context(&clDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, &clDevice, nullptr);
     auto &commandStreamReceiver = clDevice.getUltCommandStreamReceiver<FamilyType>();
 
@@ -376,7 +380,7 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     ASSERT_NE(hwParser.cmdList.end(), itorMiMemFence);
     auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*itorMiMemFence);
     ASSERT_NE(nullptr, fenceCmd);
-    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE, fenceCmd->getFenceType());
+    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
 }
 
 XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
@@ -392,8 +396,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     UltClDeviceFactory ultClDeviceFactory{1, 0};
     auto &clDevice = *ultClDeviceFactory.rootDevices[0];
 
-    MockKernelWithInternals kernel(clDevice);
     MockContext context(&clDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, &clDevice, nullptr);
     auto &commandStreamReceiver = clDevice.getUltCommandStreamReceiver<FamilyType>();
 
@@ -419,7 +423,7 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     ASSERT_NE(hwParser.cmdList.end(), itorMiMemFence);
     auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*itorMiMemFence);
     ASSERT_NE(nullptr, fenceCmd);
-    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE, fenceCmd->getFenceType());
+    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
 
     auto event = castToObject<Event>(kernelEvent);
     event->release();
@@ -438,8 +442,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     UltClDeviceFactory ultClDeviceFactory{1, 0};
     auto &clDevice = *ultClDeviceFactory.rootDevices[0];
 
-    MockKernelWithInternals kernel(clDevice);
     MockContext context(&clDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, &clDevice, nullptr);
     auto &commandStreamReceiver = clDevice.getUltCommandStreamReceiver<FamilyType>();
 
@@ -466,7 +470,7 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     ASSERT_NE(hwParser.cmdList.end(), itorMiMemFence);
     auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*itorMiMemFence);
     ASSERT_NE(nullptr, fenceCmd);
-    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE, fenceCmd->getFenceType());
+    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
 
     auto event = castToObject<Event>(kernelEvent);
     event->release();
@@ -485,8 +489,8 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     UltClDeviceFactory ultClDeviceFactory{1, 0};
     auto &clDevice = *ultClDeviceFactory.rootDevices[0];
 
-    MockKernelWithInternals kernel(clDevice);
     MockContext context(&clDevice);
+    MockKernelWithInternals kernel(context);
     MockCommandQueueHw<FamilyType> commandQueue(&context, &clDevice, nullptr);
     auto &commandStreamReceiver = clDevice.getUltCommandStreamReceiver<FamilyType>();
 
@@ -514,7 +518,7 @@ XE_HPC_CORETEST_F(SystemMemoryFenceInDefaultConfigurationTest,
     ASSERT_NE(hwParser.cmdList.end(), itorMiMemFence);
     auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*itorMiMemFence);
     ASSERT_NE(nullptr, fenceCmd);
-    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE, fenceCmd->getFenceType());
+    EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
 
     auto event = castToObject<Event>(kernelEvent);
     event->release();

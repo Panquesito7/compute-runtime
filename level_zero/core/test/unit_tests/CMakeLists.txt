@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -25,11 +25,16 @@ add_executable(${TARGET_NAME}
 
 target_sources(${TARGET_NAME} PRIVATE
                ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-               ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/mock.h
                ${CMAKE_CURRENT_SOURCE_DIR}/white_box.h
+               ${NEO_SHARED_TEST_DIRECTORY}/common/common_main.cpp
+               ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/mock_sip_listener.cpp
+               ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/virtual_file_system_listener.cpp
                ${NEO_SHARED_TEST_DIRECTORY}/common/tests_configuration.h
-               ${NEO_SOURCE_DIR}/level_zero/core/test/common/gen_kernel.cmake
+               ${NEO_SOURCE_DIR}/level_zero/core/test/common/test_modules/gen_kernel.cmake
+               ${NEO_SOURCE_DIR}/level_zero/core/test/common/ult_specific_config_l0.cpp
+               ${NEO_SOURCE_DIR}/level_zero/core/test/common/ult_config_listener_l0.cpp
+               ${NEO_SOURCE_DIR}/level_zero/core/test/common/ult_config_listener_l0.h
 )
 
 target_sources(${TARGET_NAME} PRIVATE
@@ -43,6 +48,7 @@ target_sources(${TARGET_NAME} PRIVATE
 
 set_property(TARGET ${TARGET_NAME} APPEND_STRING PROPERTY COMPILE_FLAGS ${ASAN_FLAGS})
 set_target_properties(${TARGET_NAME} PROPERTIES FOLDER ${TARGET_NAME_L0})
+set_property(TARGET ${TARGET_NAME} PROPERTY ENABLE_EXPORTS TRUE)
 
 add_subdirectoriesL0(${CMAKE_CURRENT_SOURCE_DIR} "*")
 
@@ -54,6 +60,7 @@ target_include_directories(${TARGET_NAME}
                            ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/header${BRANCH_DIR_SUFFIX}
                            ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/includes${BRANCH_DIR_SUFFIX}
                            ${NEO_SHARED_TEST_DIRECTORY}/common/test_configuration/unit_tests
+                           ${NEO_SOURCE_DIR}/level_zero/include
 )
 
 if(WIN32)
@@ -63,17 +70,16 @@ endif()
 target_link_libraries(${TARGET_NAME}
                       ${NEO_SHARED_MOCKABLE_LIB_NAME}
                       ${HW_LIBS_ULT}
-                      gmock-gtest
+                      neo_gtest
                       ${NEO_EXTRA_LIBS}
 )
 
 target_sources(${TARGET_NAME} PRIVATE
+               $<TARGET_OBJECTS:mock_aubstream>
                $<TARGET_OBJECTS:mock_gmm>
                $<TARGET_OBJECTS:${TARGET_NAME_L0}_fixtures>
                $<TARGET_OBJECTS:${TARGET_NAME_L0}_mocks>
-               $<TARGET_OBJECTS:${BUILTINS_BINARIES_STATELESS_LIB_NAME}>
-               $<TARGET_OBJECTS:${BUILTINS_BINARIES_BINDFUL_LIB_NAME}>
-               $<TARGET_OBJECTS:${BUILTINS_BINARIES_BINDLESS_LIB_NAME}>
+               $<TARGET_OBJECTS:${BUILTINS_BINARIES_LIB_NAME}>
 )
 if(TARGET ${BUILTINS_SPIRV_LIB_NAME})
   target_sources(${TARGET_NAME} PRIVATE
@@ -102,6 +108,16 @@ if(MSVC)
   )
 endif()
 
-add_dependencies(unit_tests ${TARGET_NAME} prepare_test_kernels_for_l0 test_l0_loader_lib)
+add_dependencies(unit_tests ${TARGET_NAME} test_l0_loader_lib)
 
 create_source_tree(${TARGET_NAME} ${L0_ROOT_DIR}/..)
+
+if(MSVC AND NOT DISABLE_ULT_PCH_WIN)
+  target_sources(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_NAME}_pch.h)
+  target_precompile_headers(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_NAME}_pch.h)
+
+  if(NOT DONT_CARE_OF_VIRTUALS)
+    target_sources(${L0_MOCKABLE_LIB_NAME} PRIVATE ${NEO_SOURCE_DIR}/level_zero/ze_intel_gpu_lib_pch.h)
+    target_precompile_headers(${L0_MOCKABLE_LIB_NAME} PRIVATE ${NEO_SOURCE_DIR}/level_zero/ze_intel_gpu_lib_pch.h)
+  endif()
+endif()

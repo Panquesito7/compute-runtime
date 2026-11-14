@@ -1,0 +1,156 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include <level_zero/ze_api.h>
+#include <level_zero/zes_api.h>
+#include <level_zero/zes_intel_gpu_sysman.h>
+
+#include "neo_igfxfmid.h"
+
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace NEO {
+class Drm;
+}
+
+namespace L0 {
+namespace Sysman {
+
+struct SysmanDeviceImp;
+class SysmanProductHelper;
+class LinuxSysmanImp;
+class PlatformMonitoringTech;
+class SysmanKmdInterface;
+class FirmwareUtil;
+class SysFsAccessInterface;
+
+enum class RasInterfaceType;
+enum class SysfsValueUnit;
+struct MemPageInfo;
+
+using SysmanProductHelperCreateFunctionType = std::unique_ptr<SysmanProductHelper> (*)();
+extern SysmanProductHelperCreateFunctionType sysmanProductHelperFactory[NEO::maxProductEnumValue];
+
+class SysmanProductHelper {
+  public:
+    static std::unique_ptr<SysmanProductHelper> create(PRODUCT_FAMILY product) {
+        auto productHelperCreateFunction = sysmanProductHelperFactory[product];
+        if (productHelperCreateFunction == nullptr) {
+            return nullptr;
+        }
+        auto productHelper = productHelperCreateFunction();
+        return productHelper;
+    }
+
+    // Frequency
+    virtual void getFrequencyStepSize(double *pStepSize) = 0;
+    virtual bool isFrequencySetRangeSupported() = 0;
+    virtual bool isMediaDomainSupported(LinuxSysmanImp *pLinuxSysmanImp) = 0;
+    virtual bool isMemoryDomainSupported() = 0;
+    virtual ze_result_t getActualFrequency(LinuxSysmanImp *pLinuxSysmanImp, zes_freq_domain_t frequencyDomain, uint32_t subdeviceId, double *pActual) = 0;
+    virtual ze_result_t getCurrentVoltage(LinuxSysmanImp *pLinuxSysmanImp, zes_freq_domain_t frequencyDomain, uint32_t subdeviceId, double *pVoltage) = 0;
+    virtual zes_freq_throttle_reason_flags_t getThrottleReasons(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subdeviceId, void *pNext) = 0;
+
+    // Memory
+    virtual ze_result_t getMemoryProperties(zes_mem_properties_t *pProperties, LinuxSysmanImp *pLinuxSysmanImp, NEO::Drm *pDrm, SysmanKmdInterface *pSysmanKmdInterface, uint32_t subDeviceId, bool isSubdevice) = 0;
+    virtual ze_result_t getMemoryBandwidth(zes_mem_bandwidth_t *pBandwidth, LinuxSysmanImp *pLinuxSysmanImp, uint32_t subdeviceId) = 0;
+    virtual void getMemoryHealthIndicator(LinuxSysmanImp *pLinuxSysmanImp, zes_mem_health_t *health) = 0;
+    virtual ze_result_t getNumberOfMemoryChannels(LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pNumChannels) = 0;
+    virtual ze_result_t getMemoryVendorId(LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pVendorId) = 0;
+
+    // Performance
+    virtual void getMediaPerformanceFactorMultiplier(const double performanceFactor, double *pMultiplier) = 0;
+    virtual bool isPerfFactorSupported() = 0;
+
+    // temperature
+    virtual ze_result_t getGlobalMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) = 0;
+    virtual ze_result_t getGpuMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) = 0;
+    virtual ze_result_t getMemoryMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) = 0;
+    virtual ze_result_t getVoltageRegulatorTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId, uint32_t sensorIndex) = 0;
+    virtual ze_result_t getGpuBoardTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId, uint32_t sensorIndex) = 0;
+    virtual ze_result_t getVoltageRegulatorMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) = 0;
+    virtual ze_result_t getGpuBoardMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) = 0;
+    virtual ze_result_t getCompositeTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) = 0;
+    virtual bool isMemoryMaxTemperatureSupported() = 0;
+    virtual bool isTemperatureReadFromSysfsSupported() = 0;
+    virtual void getSupportedSensors(std::map<zes_temp_sensors_t, uint32_t> &supportedSensorTypeMap) = 0;
+
+    // Ras
+    virtual RasInterfaceType getGtRasUtilInterface() = 0;
+    virtual RasInterfaceType getHbmRasUtilInterface() = 0;
+
+    // Global Operations
+    virtual bool isRepairStatusSupported() = 0;
+    virtual ze_result_t memoryGetPageOfflineStateExp(SysFsAccessInterface *pSysFsAccess, zes_intel_mem_page_status_exp_t pageStatus, uint32_t *pCount, std::vector<MemPageInfo> &memPageInfoList, zes_intel_mem_page_info_exp_t *pPageOfflineInfo) = 0;
+    virtual ze_result_t getMaxMemoryOfflinePages(SysFsAccessInterface *pSysFsAccess, uint32_t *pMaxOfflinePages) = 0;
+    virtual ze_result_t getSocUid(SysFsAccessInterface *pSysFsAccess, zes_uuid_t *pSocUid) = 0;
+    virtual std::string getGpuGeneration() = 0;
+    virtual std::string getProductCodeName() = 0;
+
+    // power
+    virtual int32_t getPowerLimitValue(uint64_t value) = 0;
+    virtual int32_t getPowerMinLimit(const int32_t &defaultLimit) = 0;
+    virtual uint64_t setPowerLimitValue(int32_t value) = 0;
+    virtual zes_limit_unit_t getPowerLimitUnit() = 0;
+    virtual std::string getPackageCriticalPowerLimitFile() = 0;
+    virtual SysfsValueUnit getPackageCriticalPowerLimitNativeUnit() = 0;
+    virtual ze_result_t getPowerEnergyCounter(zes_power_energy_counter_t *pEnergy, LinuxSysmanImp *pLinuxSysmanImp, zes_power_domain_t powerDomain, uint32_t subDeviceId) = 0;
+    virtual ze_result_t getLimitsExt2(SysmanKmdInterface *pSysmanKmdInterface, const std::map<std::string, std::pair<std::string, bool>> &powerLimitFiles, uint32_t *pLimit) = 0;
+    virtual ze_result_t setLimitsExt2(SysmanKmdInterface *pSysmanKmdInterface, const std::map<std::string, std::pair<std::string, bool>> &powerLimitFiles, zes_power_domain_t powerDomain, const uint32_t limit) = 0;
+    virtual ze_result_t getPowerUsage(LinuxSysmanImp *pLinuxSysmanImp, zes_power_domain_t powerDomain, uint32_t *pInstantPower, uint32_t *pAveragePower) = 0;
+
+    // standby
+    virtual bool isStandbySupported(SysmanKmdInterface *pSysmanKmdInterface) = 0;
+    virtual bool isSetStandbyModeSupported() = 0;
+    virtual std::string getStandbyModeFile(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subDeviceId) = 0;
+    virtual ze_result_t getStandbyMode(SysFsAccessInterface *pSysfsAccess, const std::string &standbyModeFile, zes_standby_promo_mode_t &mode) = 0;
+    virtual ze_result_t setStandbyMode(SysFsAccessInterface *pSysfsAccess, const std::string &standbyModeFile, zes_standby_promo_mode_t mode) = 0;
+
+    // Firmware
+    virtual void getDeviceSupportedFwTypes(FirmwareUtil *pFwInterface, std::vector<std::string> &fwTypes) = 0;
+    virtual bool isFlashOverrideSupported() = 0;
+
+    // Ecc
+    virtual bool isEccConfigurationSupported() = 0;
+    virtual ze_result_t getEccAvailable(LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t *pAvailable) = 0;
+    virtual ze_result_t getEccConfigurable(LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t *pConfigurable) = 0;
+    virtual ze_result_t getEccState(LinuxSysmanImp *pLinuxSysmanImp, zes_device_ecc_properties_t *pState) = 0;
+
+    // Device
+    virtual bool isUpstreamPortConnected() = 0;
+    virtual bool isZesInitSupported() = 0;
+
+    // Pci
+    virtual ze_result_t getPciProperties(zes_pci_properties_t *pProperties) = 0;
+    virtual ze_result_t getPciStats(zes_pci_stats_t *pStats, LinuxSysmanImp *pLinuxSysmanImp) = 0;
+    virtual ze_result_t getPciConfigState(zes_intel_pci_config_exp_state_t *pState, LinuxSysmanImp *pLinuxSysmanImp) = 0;
+    virtual bool isPcieDowngradeSupported() = 0;
+    virtual int32_t maxPcieGenSupported() = 0;
+
+    // Vf Management
+    virtual bool isVfMemoryUtilizationSupported() = 0;
+
+    // Netlink
+    virtual bool isNetlinkEventSupported() = 0;
+
+    // Pmt
+    virtual bool isPmtBasedPowerSupported(zes_power_domain_t powerDomain) = 0;
+
+    virtual ~SysmanProductHelper() = default;
+    virtual const std::map<std::string, std::map<std::string, uint64_t>> *getGuidToKeyOffsetMap() = 0;
+
+  protected:
+    SysmanProductHelper() = default;
+};
+
+} // namespace Sysman
+} // namespace L0

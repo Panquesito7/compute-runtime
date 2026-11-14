@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,8 @@
 
 #include "shared/source/helpers/flush_stamp.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
+
+#include <algorithm>
 
 void NEO::SubmissionAggregator::recordCommandBuffer(CommandBuffer *commandBuffer) {
     this->cmdBuffers.pushTailOne(*commandBuffer);
@@ -26,8 +28,38 @@ void NEO::SubmissionAggregator::aggregateCommandBuffers(ResourcePackage &resourc
     this->inspectionId++;
     primaryCommandBuffer->inspectionId = currentInspection;
 
-    // primary command buffers must fix to budget
+    ResourcePackage newResources;
+
+    auto isTrackedByPointer = [&](GraphicsAllocation *graphicsAllocation) {
+        if (graphicsAllocation == nullptr) {
+            return false;
+        }
+
+        if (std::find(resourcePackage.begin(), resourcePackage.end(), graphicsAllocation) != resourcePackage.end()) {
+            return true;
+        }
+
+        return std::find(newResources.begin(), newResources.end(), graphicsAllocation) != newResources.end();
+    };
+
+    // primary command buffers must fit to budget
     for (auto &graphicsAllocation : primaryCommandBuffer->surfaces) {
+        if (graphicsAllocation == nullptr) {
+            continue;
+        }
+
+        if (graphicsAllocation->isView()) {
+            // Different views of one parent share inspectionId.
+            // Track views by pointer so we don't drop distinct subranges.
+            if (isTrackedByPointer(graphicsAllocation)) {
+                continue;
+            }
+
+            resourcePackage.push_back(graphicsAllocation);
+            totalUsedSize += graphicsAllocation->getUnderlyingBufferSize();
+            continue;
+        }
+
         if (graphicsAllocation->getInspectionId(osContextId) < currentInspection) {
             graphicsAllocation->setInspectionId(currentInspection, osContextId);
             resourcePackage.push_back(graphicsAllocation);
@@ -37,11 +69,6 @@ void NEO::SubmissionAggregator::aggregateCommandBuffers(ResourcePackage &resourc
 
     // check if we have anything for merge
     if (!primaryCommandBuffer->next) {
-        return;
-    }
-
-    // check if next cmd buffer is compatible
-    if (primaryCommandBuffer->next->batchBuffer.requiresCoherency != primaryCommandBuffer->batchBuffer.requiresCoherency) {
         return;
     }
 
@@ -58,7 +85,29 @@ void NEO::SubmissionAggregator::aggregateCommandBuffers(ResourcePackage &resourc
     }
 
     auto nextCommandBuffer = primaryCommandBuffer->next;
-    ResourcePackage newResources;
+    auto addMergedResource = [&](GraphicsAllocation *graphicsAllocation, size_t &newResourcesSize) {
+        if (graphicsAllocation == nullptr) {
+            return;
+        }
+
+        if (graphicsAllocation->isView()) {
+            // Different views of one parent share inspectionId.
+            // Track views by pointer so we don't drop distinct subranges.
+            if (isTrackedByPointer(graphicsAllocation)) {
+                return;
+            }
+
+            newResources.push_back(graphicsAllocation);
+            newResourcesSize += graphicsAllocation->getUnderlyingBufferSize();
+            return;
+        }
+
+        if (graphicsAllocation->getInspectionId(osContextId) < currentInspection) {
+            graphicsAllocation->setInspectionId(currentInspection, osContextId);
+            newResources.push_back(graphicsAllocation);
+            newResourcesSize += graphicsAllocation->getUnderlyingBufferSize();
+        }
+    };
 
     while (nextCommandBuffer) {
         size_t nextCommandBufferNewResourcesSize = 0;
@@ -67,19 +116,11 @@ void NEO::SubmissionAggregator::aggregateCommandBuffers(ResourcePackage &resourc
             if (graphicsAllocation == primaryBatchGraphicsAllocation) {
                 continue;
             }
-            if (graphicsAllocation->getInspectionId(osContextId) < currentInspection) {
-                graphicsAllocation->setInspectionId(currentInspection, osContextId);
-                newResources.push_back(graphicsAllocation);
-                nextCommandBufferNewResourcesSize += graphicsAllocation->getUnderlyingBufferSize();
-            }
+            addMergedResource(graphicsAllocation, nextCommandBufferNewResourcesSize);
         }
 
         if (nextCommandBuffer->batchBuffer.commandBufferAllocation && (nextCommandBuffer->batchBuffer.commandBufferAllocation != primaryBatchGraphicsAllocation)) {
-            if (nextCommandBuffer->batchBuffer.commandBufferAllocation->getInspectionId(osContextId) < currentInspection) {
-                nextCommandBuffer->batchBuffer.commandBufferAllocation->setInspectionId(currentInspection, osContextId);
-                newResources.push_back(nextCommandBuffer->batchBuffer.commandBufferAllocation);
-                nextCommandBufferNewResourcesSize += nextCommandBuffer->batchBuffer.commandBufferAllocation->getUnderlyingBufferSize();
-            }
+            addMergedResource(nextCommandBuffer->batchBuffer.commandBufferAllocation, nextCommandBufferNewResourcesSize);
         }
 
         if (nextCommandBufferNewResourcesSize + totalUsedSize <= totalMemoryBudget) {
@@ -100,16 +141,19 @@ void NEO::SubmissionAggregator::aggregateCommandBuffers(ResourcePackage &resourc
 
 NEO::BatchBuffer::BatchBuffer(GraphicsAllocation *commandBufferAllocation, size_t startOffset,
                               size_t chainedBatchBufferStartOffset, uint64_t taskStartAddress, GraphicsAllocation *chainedBatchBuffer,
-                              bool requiresCoherency, bool lowPriority, QueueThrottle throttle, uint64_t sliceCount,
+                              bool lowPriority, QueueThrottle throttle, uint64_t sliceCount,
                               size_t usedSize, LinearStream *stream, void *endCmdPtr, uint32_t numCsrClients, bool hasStallingCmds,
-                              bool hasRelaxedOrderingDependencies)
-    : commandBufferAllocation(commandBufferAllocation), startOffset(startOffset),
-      chainedBatchBufferStartOffset(chainedBatchBufferStartOffset), taskStartAddress(taskStartAddress), chainedBatchBuffer(chainedBatchBuffer),
-      requiresCoherency(requiresCoherency), lowPriority(lowPriority),
-      throttle(throttle), sliceCount(sliceCount),
-      usedSize(usedSize), stream(stream), endCmdPtr(endCmdPtr), numCsrClients(numCsrClients), hasStallingCmds(hasStallingCmds),
-      hasRelaxedOrderingDependencies(hasRelaxedOrderingDependencies) {}
+                              bool hasRelaxedOrderingDependencies, bool dispatchMonitorFence, bool taskCountUpdateOnly)
+    : commandBufferAllocation(commandBufferAllocation), chainedBatchBuffer(chainedBatchBuffer),
+      stream(stream), endCmdPtr(endCmdPtr),
+      startOffset(startOffset), chainedBatchBufferStartOffset(chainedBatchBufferStartOffset), usedSize(usedSize),
+      taskStartAddress(taskStartAddress), sliceCount(sliceCount),
+      throttle(throttle), numCsrClients(numCsrClients),
+      lowPriority(lowPriority), hasStallingCmds(hasStallingCmds), hasRelaxedOrderingDependencies(hasRelaxedOrderingDependencies),
+      dispatchMonitorFence(dispatchMonitorFence), taskCountUpdateOnly(taskCountUpdateOnly) {}
 
 NEO::CommandBuffer::CommandBuffer(Device &device) : device(device) {
     flushStamp.reset(new FlushStampTracker(false));
 }
+
+NEO::CommandBuffer::~CommandBuffer() = default;

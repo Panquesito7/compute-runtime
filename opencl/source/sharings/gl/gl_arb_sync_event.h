@@ -1,20 +1,20 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "opencl/source/event/event.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
-struct _tagCLGLSyncInfo;
-typedef _tagCLGLSyncInfo CL_GL_SYNC_INFO;
+#include "opencl/source/event/event.h"
+#include "opencl/source/sharings/gl/cl_gl_api_intel.h"
 
 namespace NEO {
 class Context;
 class GLSharingFunctions;
-class OsInterface;
+class OSInterface;
 class OsContext;
 
 char *createArbSyncEventName();
@@ -22,7 +22,7 @@ void destroyArbSyncEventName(char *name);
 
 void cleanupArbSyncObject(OSInterface &osInterface, CL_GL_SYNC_INFO *glSyncInfo);
 bool setupArbSyncObject(GLSharingFunctions &sharing, OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo);
-void signalArbSyncObject(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo);
+void signalArbSyncObject(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo, bool signalAtSubmission);
 void serverWaitForArbSyncObject(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo);
 
 class GlArbSyncEvent : public Event {
@@ -47,18 +47,3 @@ class GlArbSyncEvent : public Event {
     std::unique_ptr<CL_GL_SYNC_INFO> glSyncInfo;
 };
 } // namespace NEO
-
-extern "C" CL_API_ENTRY cl_int CL_API_CALL
-clEnqueueMarkerWithSyncObjectINTEL(cl_command_queue commandQueue,
-                                   cl_event *event,
-                                   cl_context *context);
-
-extern "C" CL_API_ENTRY cl_int CL_API_CALL
-clGetCLObjectInfoINTEL(cl_mem memObj,
-                       void *pResourceInfo);
-
-extern "C" CL_API_ENTRY cl_int CL_API_CALL
-clGetCLEventInfoINTEL(cl_event event, CL_GL_SYNC_INFO **pSyncInfoHandleRet, cl_context *pClContextRet);
-
-extern "C" CL_API_ENTRY cl_int CL_API_CALL
-clReleaseGlSharedEventINTEL(cl_event event);

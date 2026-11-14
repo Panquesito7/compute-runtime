@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,25 +8,40 @@
 #pragma once
 
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/string.h"
 #include "shared/source/kernel/kernel_arg_metadata.h"
 #include "shared/source/utilities/arrayref.h"
+
+#include <type_traits>
 
 namespace NEO {
 
 using CrossThreadDataOffset = uint16_t;
 using DynamicStateHeapOffset = uint16_t;
 using SurfaceStateHeapOffset = uint16_t;
+using InlineDataOffset = uint8_t;
 
 template <typename T>
 static constexpr T undefined = std::numeric_limits<T>::max();
 
 template <typename T>
-bool isUndefinedOffset(T offset) {
+constexpr bool isUndefined(T value) {
+    return value == undefined<T>;
+}
+
+template <typename T>
+constexpr bool isDefined(T value) {
+    return value != undefined<T>;
+}
+
+template <typename T>
+    requires(!std::is_pointer_v<T>)
+constexpr bool isUndefinedOffset(T offset) {
     return undefined<T> == offset;
 }
 
 template <typename T>
-bool isValidOffset(T offset) {
+constexpr bool isValidOffset(T offset) {
     return false == isUndefinedOffset<T>(offset);
 }
 
@@ -35,6 +50,7 @@ struct ArgDescPointer final {
     CrossThreadDataOffset stateless = undefined<CrossThreadDataOffset>;
     CrossThreadDataOffset bindless = undefined<CrossThreadDataOffset>;
     CrossThreadDataOffset bufferOffset = undefined<CrossThreadDataOffset>;
+    CrossThreadDataOffset bufferSize = undefined<CrossThreadDataOffset>;
     CrossThreadDataOffset slmOffset = undefined<CrossThreadDataOffset>;
     uint8_t requiredSlmAlignment = 0;
     uint8_t pointerSize = 0;
@@ -45,24 +61,34 @@ struct ArgDescPointer final {
     }
 };
 
+struct ArgDescInlineDataPointer {
+    InlineDataOffset offset = undefined<InlineDataOffset>;
+    uint8_t pointerSize = undefined<uint8_t>;
+};
+
+struct ArgDescScratchPointer {
+    CrossThreadDataOffset offset = undefined<CrossThreadDataOffset>;
+    uint8_t pointerSize = undefined<uint8_t>;
+};
+
 enum class NEOImageType : uint8_t {
-    ImageTypeUnknown,
-    ImageTypeBuffer,
-    ImageType1D,
-    ImageType1DArray,
-    ImageType2D,
-    ImageType2DArray,
-    ImageType3D,
-    ImageTypeCube,
-    ImageTypeCubeArray,
-    ImageType2DDepth,
-    ImageType2DArrayDepth,
-    ImageType2DMSAA,
-    ImageType2DMSAADepth,
-    ImageType2DArrayMSAA,
-    ImageType2DArrayMSAADepth,
-    ImageType2DMedia,
-    ImageType2DMediaBlock,
+    imageTypeUnknown,
+    imageTypeBuffer,
+    imageType1D,
+    imageType1DArray,
+    imageType2D,
+    imageType2DArray,
+    imageType3D,
+    imageTypeCube,
+    imageTypeCubeArray,
+    imageType2DDepth,
+    imageType2DArrayDepth,
+    imageType2DMSAA,
+    imageType2DMSAADepth,
+    imageType2DArrayMSAA,
+    imageType2DArrayMSAADepth,
+    imageType2DMedia,
+    imageType2DMediaBlock,
 };
 
 struct ArgDescImage final {
@@ -78,14 +104,24 @@ struct ArgDescImage final {
         CrossThreadDataOffset arraySize = undefined<CrossThreadDataOffset>;
         CrossThreadDataOffset numSamples = undefined<CrossThreadDataOffset>;
         CrossThreadDataOffset numMipLevels = undefined<CrossThreadDataOffset>;
-
-        CrossThreadDataOffset flatBaseOffset = undefined<CrossThreadDataOffset>;
-        CrossThreadDataOffset flatWidth = undefined<CrossThreadDataOffset>;
-        CrossThreadDataOffset flatHeight = undefined<CrossThreadDataOffset>;
-        CrossThreadDataOffset flatPitch = undefined<CrossThreadDataOffset>;
     } metadataPayload;
     NEOImageType imageType;
+    uint8_t size = undefined<uint8_t>;
+
+    bool isMsaa() const {
+        switch (this->imageType) {
+        case NEOImageType::imageType2DMSAA:
+        case NEOImageType::imageType2DMSAADepth:
+        case NEOImageType::imageType2DArrayMSAA:
+        case NEOImageType::imageType2DArrayMSAADepth:
+            return true;
+        default:
+            return false;
+        }
+    }
 };
+
+inline constexpr uint32_t samplerSnapWaValue = std::numeric_limits<uint32_t>::max();
 
 struct ArgDescSampler final {
     uint32_t samplerType = 0;
@@ -96,6 +132,9 @@ struct ArgDescSampler final {
         CrossThreadDataOffset samplerAddressingMode = undefined<CrossThreadDataOffset>;
         CrossThreadDataOffset samplerNormalizedCoords = undefined<CrossThreadDataOffset>;
     } metadataPayload;
+    uint8_t index = undefined<uint8_t>;
+    uint8_t size = undefined<uint8_t>;
+    uint8_t bindlessSlot = undefined<uint8_t>;
 };
 
 struct ArgDescValue final {
@@ -110,11 +149,11 @@ struct ArgDescValue final {
 
 struct ArgDescriptor final {
     enum ArgType : uint8_t {
-        ArgTUnknown,
-        ArgTPointer,
-        ArgTImage,
-        ArgTSampler,
-        ArgTValue
+        argTUnknown,
+        argTPointer,
+        argTImage,
+        argTSampler,
+        argTValue
     };
 
     struct ExtendedTypeInfo {
@@ -123,13 +162,9 @@ struct ArgDescriptor final {
         }
         union {
             struct {
-                bool isAccelerator : 1;
-                bool isDeviceQueue : 1;
-                bool isMediaImage : 1;
                 bool isMediaBlockImage : 1;
                 bool isTransformable : 1;
                 bool needsPatch : 1;
-                bool hasVmeExtendedDescriptor : 1;
             };
             uint32_t packed;
         };
@@ -138,7 +173,7 @@ struct ArgDescriptor final {
     ArgDescriptor(ArgType type);
 
     ArgDescriptor()
-        : ArgDescriptor(ArgTUnknown) {
+        : ArgDescriptor(argTUnknown) {
     }
 
     ArgDescriptor &operator=(const ArgDescriptor &rhs);
@@ -152,9 +187,9 @@ struct ArgDescriptor final {
     template <typename T>
     T &as(bool initIfUnknown = false);
 
-    template <ArgType Type>
+    template <ArgType type>
     bool is() const {
-        return Type == this->type;
+        return type == this->type;
     }
 
     ArgTypeTraits &getTraits() {
@@ -177,9 +212,9 @@ struct ArgDescriptor final {
         switch (type) {
         default:
             return true;
-        case ArgTImage:
+        case argTImage:
             return (KernelArgMetadata::AccessReadOnly == traits.accessQualifier);
-        case ArgTPointer:
+        case argTPointer:
             return (KernelArgMetadata::AddrConstant == traits.addressQualifier) ||
                    (KernelArgMetadata::AccessReadOnly == traits.accessQualifier) ||
                    traits.typeQualifiers.constQual;
@@ -202,77 +237,77 @@ struct ArgDescriptor final {
 };
 
 namespace {
-constexpr auto ArgSize = sizeof(ArgDescriptor);
-static_assert(ArgSize <= 72, "Keep it small");
+constexpr auto argSize = sizeof(ArgDescriptor);
+static_assert(argSize <= 72, "Keep it small");
 } // namespace
 
 template <>
 inline const ArgDescPointer &ArgDescriptor::as<ArgDescPointer>() const {
-    UNRECOVERABLE_IF(type != ArgTPointer);
+    UNRECOVERABLE_IF(type != argTPointer);
     return this->asPointer;
 }
 
 template <>
 inline const ArgDescImage &ArgDescriptor::as<ArgDescImage>() const {
-    UNRECOVERABLE_IF(type != ArgTImage);
+    UNRECOVERABLE_IF(type != argTImage);
     return this->asImage;
 }
 
 template <>
 inline const ArgDescSampler &ArgDescriptor::as<ArgDescSampler>() const {
-    UNRECOVERABLE_IF(type != ArgTSampler);
+    UNRECOVERABLE_IF(type != argTSampler);
     return this->asSampler;
 }
 
 template <>
 inline const ArgDescValue &ArgDescriptor::as<ArgDescValue>() const {
-    UNRECOVERABLE_IF(type != ArgTValue);
+    UNRECOVERABLE_IF(type != argTValue);
     return this->asByValue;
 }
 
 template <>
 inline ArgDescPointer &ArgDescriptor::as<ArgDescPointer>(bool initIfUnknown) {
-    if ((ArgTUnknown == type) && initIfUnknown) {
-        this->type = ArgTPointer;
+    if ((argTUnknown == type) && initIfUnknown) {
+        this->type = argTPointer;
         this->asPointer = {};
     }
-    UNRECOVERABLE_IF(type != ArgTPointer);
+    UNRECOVERABLE_IF(type != argTPointer);
     return this->asPointer;
 }
 
 template <>
 inline ArgDescImage &ArgDescriptor::as<ArgDescImage>(bool initIfUnknown) {
-    if ((ArgTUnknown == type) && initIfUnknown) {
-        this->type = ArgTImage;
+    if ((argTUnknown == type) && initIfUnknown) {
+        this->type = argTImage;
         this->asImage = {};
     }
-    UNRECOVERABLE_IF(type != ArgTImage);
+    UNRECOVERABLE_IF(type != argTImage);
     return this->asImage;
 }
 
 template <>
 inline ArgDescSampler &ArgDescriptor::as<ArgDescSampler>(bool initIfUnknown) {
-    if ((ArgTUnknown == type) && initIfUnknown) {
-        this->type = ArgTSampler;
+    if ((argTUnknown == type) && initIfUnknown) {
+        this->type = argTSampler;
         this->asSampler = {};
     }
-    UNRECOVERABLE_IF(type != ArgTSampler);
+    UNRECOVERABLE_IF(type != argTSampler);
     return this->asSampler;
 }
 
 template <>
 inline ArgDescValue &ArgDescriptor::as<ArgDescValue>(bool initIfUnknown) {
-    if ((ArgTUnknown == type) && initIfUnknown) {
-        this->type = ArgTValue;
-        this->asByValue = {};
+    if ((argTUnknown == type) && initIfUnknown) {
+        this->type = argTValue;
+        this->asByValue.elements.clear();
     }
-    UNRECOVERABLE_IF(type != ArgTValue);
+    UNRECOVERABLE_IF(type != argTValue);
     return this->asByValue;
 }
 
-template <uint32_t VecSize, typename T>
-inline void setOffsetsVec(CrossThreadDataOffset (&dst)[VecSize], const T (&src)[VecSize]) {
-    for (uint32_t i = 0; i < VecSize; ++i) {
+template <uint32_t vecSize, typename T>
+inline void setOffsetsVec(CrossThreadDataOffset (&dst)[vecSize], const T (&src)[vecSize]) {
+    for (uint32_t i = 0; i < vecSize; ++i) {
         dst[i] = src[i];
     }
 }
@@ -283,13 +318,14 @@ inline bool patchNonPointer(ArrayRef<uint8_t> buffer, CrossThreadDataOffset loca
         return false;
     }
     DEBUG_BREAK_IF(location + sizeof(DstT) > buffer.size());
-    *reinterpret_cast<DstT *>(buffer.begin() + location) = static_cast<DstT>(value);
+    const auto valueToPatch = static_cast<DstT>(value);
+    memcpy_s(buffer.begin() + location, sizeof(DstT), &valueToPatch, sizeof(DstT));
     return true;
 }
 
-template <uint32_t VecSize, typename T>
-inline void patchVecNonPointer(ArrayRef<uint8_t> buffer, const CrossThreadDataOffset (&location)[VecSize], const T (&value)[VecSize]) {
-    for (uint32_t i = 0; i < VecSize; ++i) {
+template <uint32_t vecSize, typename T>
+inline void patchVecNonPointer(ArrayRef<uint8_t> buffer, const CrossThreadDataOffset (&location)[vecSize], const T (&value)[vecSize]) {
+    for (uint32_t i = 0; i < vecSize; ++i) {
         patchNonPointer<T, T>(buffer, location[i], value[i]);
     }
     return;
@@ -305,20 +341,23 @@ inline bool patchPointer(ArrayRef<uint8_t> buffer, const ArgDescPointer &arg, ui
 }
 
 inline ArgDescriptor &ArgDescriptor::operator=(const ArgDescriptor &rhs) {
-    this->type = ArgTUnknown;
+    if (this == &rhs) {
+        return *this;
+    }
+    this->type = argTUnknown;
     switch (rhs.type) {
     default:
         break;
-    case ArgTPointer:
+    case argTPointer:
         this->as<ArgDescPointer>(true) = rhs.as<ArgDescPointer>();
         break;
-    case ArgTImage:
+    case argTImage:
         this->as<ArgDescImage>(true) = rhs.as<ArgDescImage>();
         break;
-    case ArgTSampler:
+    case argTSampler:
         this->as<ArgDescSampler>(true) = rhs.as<ArgDescSampler>();
         break;
-    case ArgTValue:
+    case argTValue:
         this->as<ArgDescValue>(true) = rhs.as<ArgDescValue>();
         break;
     }
@@ -332,23 +371,19 @@ inline ArgDescriptor::ArgDescriptor(ArgType type) : type(type) {
     switch (type) {
     default:
         break;
-    case ArgTPointer:
+    case argTPointer:
         this->as<ArgDescPointer>(true);
         break;
-    case ArgTImage:
+    case argTImage:
         this->as<ArgDescImage>(true);
         break;
-    case ArgTSampler:
+    case argTSampler:
         this->as<ArgDescSampler>(true);
         break;
-    case ArgTValue:
+    case argTValue:
         this->as<ArgDescValue>(true);
         break;
     }
 }
-
-struct ArgDescriptorExtended {
-    virtual ~ArgDescriptorExtended() = default;
-};
 
 } // namespace NEO

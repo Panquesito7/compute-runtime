@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,9 +8,12 @@
 #pragma once
 
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/preamble.h"
 #include "shared/source/indirect_heap/indirect_heap.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
+
+#include "gtest/gtest.h"
 
 #include <cstdint>
 
@@ -58,13 +61,13 @@ void validateStateBaseAddress(uint64_t indirectObjectHeapBase,
     EXPECT_EQ(MemoryConstants::sizeOf4GBinPageEntities, cmd->getInstructionBufferSize());
 
     // Generically validate this command
-    FamilyType::PARSE::template validateCommand<STATE_BASE_ADDRESS *>(cmdList.begin(), itorCmd);
+    FamilyType::Parse::template validateCommand<STATE_BASE_ADDRESS *>(cmdList.begin(), itorCmd);
 }
 
 template <typename FamilyType>
 void validateL3Programming(GenCmdList &cmdList, GenCmdList::iterator &itorWalker) {
-    typedef typename FamilyType::PARSE PARSE;
-    typedef typename PARSE::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
+    typedef typename FamilyType::Parse Parse;
+    typedef typename Parse::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
 
     auto itorCmd = findMmio<FamilyType>(cmdList.begin(), itorWalker, L3CNTLRegisterOffset<FamilyType>::registerOffset);
     if (UnitTestHelper<FamilyType>::isL3ConfigProgrammable()) {
@@ -104,6 +107,6 @@ void validateMediaVFEState(const HardwareInfo *hwInfo, void *cmdMediaVfeState, G
     EXPECT_EQ(0u, cmd->getStackSize());
 
     // Generically validate this command
-    FamilyType::PARSE::template validateCommand<MEDIA_VFE_STATE *>(cmdList.begin(), itorMediaVfeState);
+    FamilyType::Parse::template validateCommand<MEDIA_VFE_STATE *>(cmdList.begin(), itorMediaVfeState);
 }
 } // namespace NEO

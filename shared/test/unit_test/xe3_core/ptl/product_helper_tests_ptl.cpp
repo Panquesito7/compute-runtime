@@ -1,0 +1,72 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/xe3_core/hw_info_xe3_core.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/test_macros/header/per_product_test_definitions.h"
+#include "shared/test/unit_test/os_interface/product_helper_tests.h"
+
+#include "platforms.h"
+
+namespace NEO {
+extern ApiSpecificConfig::ApiType apiTypeForUlts;
+}
+
+using namespace NEO;
+
+using PtlProductHelper = ProductHelperTest;
+
+PTLTEST_F(PtlProductHelper, whenGettingPreferredAllocationMethodThenAllocateByKmdIsReturned) {
+    for (auto i = 0; i < static_cast<int>(AllocationType::count); i++) {
+        auto allocationType = static_cast<AllocationType>(i);
+        auto preferredAllocationMethod = productHelper->getPreferredAllocationMethod(allocationType);
+        EXPECT_TRUE(preferredAllocationMethod.has_value());
+        EXPECT_EQ(GfxMemoryAllocationMethod::allocateByKmd, preferredAllocationMethod.value());
+    }
+}
+
+PTLTEST_F(PtlProductHelper, givenCompilerProductHelperWhenGetDefaultHwIpVersionThenCorrectValueIsSet) {
+    EXPECT_EQ(compilerProductHelper->getDefaultHwIpVersion(), AOT::PTL_H_B0);
+}
+
+PTLTEST_F(PtlProductHelper, givenProductHelperWhenCheckoverrideAllocationCpuCacheableThenTrueIsReturnedForCommandBuffer) {
+    AllocationData allocationData{};
+    allocationData.type = AllocationType::commandBuffer;
+    EXPECT_TRUE(productHelper->overrideAllocationCpuCacheable(allocationData));
+
+    allocationData.type = AllocationType::buffer;
+    EXPECT_FALSE(productHelper->overrideAllocationCpuCacheable(allocationData));
+}
+
+PTLTEST_F(PtlProductHelper, givenProductHelperWhenCallIsStagingBuffersEnabledThenReturnTrue) {
+    EXPECT_TRUE(productHelper->isStagingBuffersEnabled());
+}
+
+PTLTEST_F(PtlProductHelper, givenProductHelperWhenCheckingInitializeInternalEngineImmediatelyThenCorrectValueIsReturned) {
+    EXPECT_FALSE(productHelper->initializeInternalEngineImmediately());
+}
+
+PTLTEST_F(PtlProductHelper, givenProductHelperWhenCheckingIsHostDeviceUsmPoolAllocatorSupportedThenCorrectValueIsReturned) {
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_TRUE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmPoolAllocatorSupported());
+    }
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        EXPECT_TRUE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmPoolAllocatorSupported());
+    }
+}

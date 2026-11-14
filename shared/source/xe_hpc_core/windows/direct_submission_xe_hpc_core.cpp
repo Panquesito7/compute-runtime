@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,13 @@
 
 #include "shared/source/direct_submission/direct_submission_hw.inl"
 #include "shared/source/direct_submission/direct_submission_prefetch_mitigation_xe_hp_core_and_later.inl"
-#include "shared/source/direct_submission/direct_submission_prefetcher_pvc_and_later.inl"
+#include "shared/source/direct_submission/direct_submission_prefetcher_xe_hp_core_and_later.inl"
+#include "shared/source/direct_submission/direct_submission_relaxed_ordering.inl"
 #include "shared/source/direct_submission/direct_submission_xe_hp_core_and_later.inl"
 #include "shared/source/direct_submission/dispatchers/blitter_dispatcher.inl"
 #include "shared/source/direct_submission/dispatchers/dispatcher.inl"
 #include "shared/source/direct_submission/dispatchers/render_dispatcher.inl"
+#include "shared/source/direct_submission/os_agnostic_direct_submission.inl"
 #include "shared/source/direct_submission/windows/wddm_direct_submission.inl"
 #include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
 
@@ -27,4 +29,7 @@ template class DirectSubmissionHw<GfxFamily, RenderDispatcher<GfxFamily>>;
 
 template class WddmDirectSubmission<GfxFamily, BlitterDispatcher<GfxFamily>>;
 template class WddmDirectSubmission<GfxFamily, RenderDispatcher<GfxFamily>>;
+
+template class OsAgnosticDirectSubmission<GfxFamily, BlitterDispatcher<GfxFamily>>;
+template class OsAgnosticDirectSubmission<GfxFamily, RenderDispatcher<GfxFamily>>;
 } // namespace NEO

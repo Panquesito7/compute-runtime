@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,24 +8,34 @@
 #pragma once
 
 #include "shared/source/command_stream/thread_arbitration_policy.h"
-#include "shared/source/device_binary_format/device_binary_formats.h"
-#include "shared/source/kernel/debug_data.h"
+#include "shared/source/device_binary_format/device_binary_format.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/kernel/grf_config.h"
 #include "shared/source/kernel/kernel_arg_descriptor.h"
 #include "shared/source/kernel/kernel_arg_metadata.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 namespace NEO {
 
-using StringMap = std::unordered_map<uint32_t, std::string>;
+using BindlessToSurfaceStateMap = std::unordered_map<CrossThreadDataOffset, uint32_t>;
 using InstructionsSegmentOffset = uint16_t;
 
-struct KernelDescriptor {
+struct KernelDescriptorExt;
+KernelDescriptorExt *allocateKernelDescriptorExt();
+void freeKernelDescriptorExt(KernelDescriptorExt *);
+
+struct KernelDescriptor : NEO::NonCopyableAndNonMovableClass {
+    static bool isBindlessAddressingKernel(const KernelDescriptor &desc);
+    static bool hasMsaaImageArg(const KernelDescriptor &desc);
+
     enum AddressingMode : uint8_t {
         AddrNone,
         Stateless,
@@ -35,101 +45,140 @@ struct KernelDescriptor {
         BindlessAndStateless
     };
 
-    KernelDescriptor() = default;
-    virtual ~KernelDescriptor() = default;
+    KernelDescriptor() {
+        kernelDescriptorExt = allocateKernelDescriptorExt();
+    }
 
-    void updateCrossThreadDataSize();
+    virtual ~KernelDescriptor() {
+        freeKernelDescriptorExt(kernelDescriptorExt);
+    }
+
+    KernelDescriptorExt *kernelDescriptorExt = nullptr;
+
+    void initBindlessOffsetToSurfaceState();
+    void initBindlessSamplerSlots();
+    const BindlessToSurfaceStateMap &getBindlessOffsetToSurfaceState() const {
+        return bindlessArgsMap;
+    }
+    uint16_t getPerThreadDataOffset() const {
+        return kernelAttributes.crossThreadDataSize - std::min(kernelAttributes.crossThreadDataSize, kernelAttributes.inlineDataPayloadSize);
+    }
+
+    enum class SlmAllocationMode : int8_t {
+        compilerResolved = 0, // Compiler resolves the offsets during codegen
+        runtimeAdjusted = 1   // Runtime adjusts the offsets (by slm_size) before kernel launch
+    };
+
+    void patchOffsetInSlmIfRequired(ArrayRef<uint8_t> crossThreadData) const {
+        if (kernelAttributes.slmAllocationMode != KernelDescriptor::SlmAllocationMode::runtimeAdjusted) {
+            return;
+        }
+
+        for (auto &arg : payloadMappings.explicitArgs) {
+            if (arg.getTraits().getAddressQualifier() == KernelArgMetadata::AddrLocal) {
+                const auto &ptrArg = arg.as<ArgDescPointer>();
+                DEBUG_BREAK_IF((0 != ptrArg.requiredSlmAlignment) &&
+                               (0 != (kernelAttributes.slmInlineSize % ptrArg.requiredSlmAlignment)));
+                patchNonPointer<uint32_t>(crossThreadData, ptrArg.slmOffset, kernelAttributes.slmInlineSize);
+            }
+        }
+    }
+
+    static uint32_t getTotalSlmSizePerThreadGroup(uint32_t totalSlmSizePerThreadGroup, uint32_t slmInlineSize, SlmAllocationMode slmAllocationMode) {
+        if (slmAllocationMode == KernelDescriptor::SlmAllocationMode::compilerResolved) {
+            return totalSlmSizePerThreadGroup + slmInlineSize;
+        }
+        const bool noDynamicSlm = (0 == totalSlmSizePerThreadGroup);
+        if (noDynamicSlm) {
+            return slmInlineSize;
+        }
+        return totalSlmSizePerThreadGroup;
+    }
+
+    uint32_t getTotalSlmSizePerThreadGroup(uint32_t totalSlmSizePerThreadGroup) const {
+        return getTotalSlmSizePerThreadGroup(totalSlmSizePerThreadGroup, kernelAttributes.slmInlineSize, kernelAttributes.slmAllocationMode);
+    }
 
     struct KernelAttributes {
         uint32_t slmInlineSize = 0U;
         uint32_t perThreadScratchSize[2] = {0U, 0U};
         uint32_t perHwThreadPrivateMemorySize = 0U;
-        uint32_t perThreadSystemThreadSurfaceSize = 0U;
         uint32_t numThreadsRequired = 0u;
+        uint32_t spillFillScratchMemorySize = 0u;
+        uint32_t privateScratchMemorySize = 0u;
         ThreadArbitrationPolicy threadArbitrationPolicy = NotPresent;
         uint16_t requiredWorkgroupSize[3] = {0U, 0U, 0U};
         uint16_t crossThreadDataSize = 0U;
         uint16_t inlineDataPayloadSize = 0U;
         uint16_t perThreadDataSize = 0U;
         uint16_t numArgsToPatch = 0U;
-        uint16_t numGrfRequired = GrfConfig::DefaultGrfNumber;
+        uint16_t numGrfRequired = GrfConfig::defaultGrfNumber;
+        uint16_t numArgsStateful = 0U;
+        uint16_t numBindlessImages = 0U;
         uint8_t barrierCount = 0u;
+        SlmAllocationMode slmAllocationMode = SlmAllocationMode::compilerResolved;
         bool hasNonKernelArgLoad = false;
         bool hasNonKernelArgStore = false;
         bool hasNonKernelArgAtomic = false;
         bool hasIndirectStatelessAccess = false;
+        bool hasIndirectAccessInImplicitArg = false;
+        bool hasImageWriteArg = false;
+        bool hasImageReadArg = false;
 
         AddressingMode bufferAddressingMode = BindfulAndStateless;
         AddressingMode imageAddressingMode = Bindful;
-        AddressingMode samplerAddressingMode = Bindful;
 
-        DeviceBinaryFormat binaryFormat = DeviceBinaryFormat::Unknown;
+        DeviceBinaryFormat binaryFormat = DeviceBinaryFormat::unknown;
 
         uint8_t workgroupWalkOrder[3] = {0, 1, 2};
         uint8_t workgroupDimensionsOrder[3] = {0, 1, 2};
 
-        uint8_t gpuPointerSize = 0;
         uint8_t simdSize = 8;
         uint8_t numLocalIdChannels = 0;
         uint8_t localId[3] = {0U, 0U, 0U};
-
-        bool supportsBuffersBiggerThan4Gb() const {
-            return Stateless == bufferAddressingMode;
-        }
 
         bool usesBarriers() const {
             return 0 != barrierCount;
         }
 
+        bool usesImageOrSamplerState() const;
+
         union {
             struct {
                 // 0
                 bool usesSystolicPipelineSelectMode : 1;
-                bool usesStringMapForPrintf : 1;
                 bool usesPrintf : 1;
                 bool usesFencesForReadWriteImages : 1;
-                bool usesFlattenedLocalIds : 1;
-                bool usesPrivateMemory : 1;
-                bool usesVme : 1;
                 bool usesImages : 1;
-                // 1
                 bool usesSamplers : 1;
                 bool usesSyncBuffer : 1;
-                bool useGlobalAtomics : 1;
+                bool hasIndirectCalls : 1;
                 bool usesStatelessWrites : 1;
+                // 1
                 bool passInlineData : 1;
-                bool perThreadDataHeaderIsPresent : 1;
-                bool perThreadDataUnusedGrfIsPresent : 1;
                 bool requiresDisabledEUFusion : 1;
-                // 2
                 bool requiresDisabledMidThreadPreemption : 1;
                 bool requiresSubgroupIndependentForwardProgress : 1;
                 bool requiresWorkgroupWalkOrder : 1;
                 bool requiresImplicitArgs : 1;
                 bool useStackCalls : 1;
                 bool hasRTCalls : 1;
+                // 2
                 bool isInvalid : 1;
                 bool hasSample : 1;
-                // 3
                 bool usesAssert : 1;
-                bool reserved : 7;
+                bool hasBindlessImageRead : 1;
+                bool reserved : 4;
             };
-            std::array<bool, 4> packed;
+            std::array<bool, 3> packed;
         } flags = {};
         static_assert(sizeof(KernelAttributes::flags) == sizeof(KernelAttributes::flags.packed), "");
 
-        bool usesStringMap() const {
-            if (binaryFormat == DeviceBinaryFormat::Patchtokens) {
-                return flags.usesStringMapForPrintf || flags.requiresImplicitArgs;
-            }
-            return false;
-        }
     } kernelAttributes;
 
     struct {
         InstructionsSegmentOffset skipPerThreadDataLoad = 0U;
         InstructionsSegmentOffset skipSetFFIDGP = 0U;
-        InstructionsSegmentOffset systemKernel = 0U;
     } entryPoints;
 
     struct PayloadMappings {
@@ -137,11 +186,12 @@ struct KernelDescriptor {
             CrossThreadDataOffset globalWorkOffset[3] = {undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>};
             CrossThreadDataOffset globalWorkSize[3] = {undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>};
             CrossThreadDataOffset localWorkSize[3] = {undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>};
-            CrossThreadDataOffset localWorkSize2[3] = {undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>};
 
             CrossThreadDataOffset enqueuedLocalWorkSize[3] = {undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>};
             CrossThreadDataOffset numWorkGroups[3] = {undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>, undefined<CrossThreadDataOffset>};
             CrossThreadDataOffset workDim = undefined<CrossThreadDataOffset>;
+
+            CrossThreadDataOffset regionGroupDimension = undefined<CrossThreadDataOffset>;
         } dispatchTraits;
 
         struct {
@@ -162,46 +212,53 @@ struct KernelDescriptor {
             ArgDescPointer globalVariablesSurfaceAddress;
             ArgDescPointer globalConstantsSurfaceAddress;
             ArgDescPointer privateMemoryAddress;
-            ArgDescPointer deviceSideEnqueueEventPoolSurfaceAddress;
-            ArgDescPointer deviceSideEnqueueDefaultQueueSurfaceAddress;
             ArgDescPointer systemThreadSurfaceAddress;
             ArgDescPointer syncBufferAddress;
             ArgDescPointer rtDispatchGlobals;
             ArgDescPointer assertBufferAddress;
-            CrossThreadDataOffset privateMemorySize = undefined<CrossThreadDataOffset>;
-            CrossThreadDataOffset maxWorkGroupSize = undefined<CrossThreadDataOffset>;
-            CrossThreadDataOffset simdSize = undefined<CrossThreadDataOffset>;
-            CrossThreadDataOffset deviceSideEnqueueParentEvent = undefined<CrossThreadDataOffset>;
-            CrossThreadDataOffset preferredWkgMultiple = undefined<CrossThreadDataOffset>;
-            CrossThreadDataOffset localMemoryStatelessWindowSize = undefined<CrossThreadDataOffset>;
-            CrossThreadDataOffset localMemoryStatelessWindowStartAddres = undefined<CrossThreadDataOffset>;
             CrossThreadDataOffset implicitArgsBuffer = undefined<CrossThreadDataOffset>;
+            ArgDescInlineDataPointer indirectDataPointerAddress;
+            ArgDescScratchPointer scratchPointerAddress;
         } implicitArgs;
-
-        std::vector<std::unique_ptr<ArgDescriptorExtended>> explicitArgsExtendedDescriptors;
     } payloadMappings;
+
+    StackVec<const ArgDescPointer *, 8> getImplicitArgBindlessCandidatesVec() const {
+        StackVec<const ArgDescPointer *, 8> implicitArgsVec({&payloadMappings.implicitArgs.printfSurfaceAddress,
+                                                             &payloadMappings.implicitArgs.globalVariablesSurfaceAddress,
+                                                             &payloadMappings.implicitArgs.globalConstantsSurfaceAddress,
+                                                             &payloadMappings.implicitArgs.privateMemoryAddress,
+                                                             &payloadMappings.implicitArgs.systemThreadSurfaceAddress,
+                                                             &payloadMappings.implicitArgs.syncBufferAddress,
+                                                             &payloadMappings.implicitArgs.rtDispatchGlobals,
+                                                             &payloadMappings.implicitArgs.assertBufferAddress});
+        return implicitArgsVec;
+    }
 
     std::vector<ArgTypeMetadataExtended> explicitArgsExtendedMetadata;
 
     struct InlineSampler {
         enum class AddrMode : uint8_t {
-            None,
-            Repeat,
-            ClampEdge,
-            ClampBorder,
-            Mirror
+            none,
+            repeat,
+            clampEdge,
+            clampBorder,
+            mirror
         };
         enum class FilterMode : uint8_t {
-            Nearest,
-            Linear
+            nearest,
+            linear
         };
-        static constexpr size_t borderColorStateSize = 64U;
+        static constexpr size_t borderColorStateSize = SamplerConstants::borderColorStateSize;
         static constexpr size_t samplerStateSize = 16U;
 
         uint32_t samplerIndex;
         bool isNormalized;
         AddrMode addrMode;
         FilterMode filterMode;
+        CrossThreadDataOffset bindless = undefined<CrossThreadDataOffset>;
+        uint8_t size = undefined<uint8_t>;
+        uint8_t bindlessSlot = undefined<uint8_t>;
+
         constexpr uint32_t getSamplerBindfulOffset() const {
             return borderColorStateSize + samplerStateSize * samplerIndex;
         }
@@ -211,20 +268,21 @@ struct KernelDescriptor {
     struct {
         std::string kernelName;
         std::string kernelLanguageAttributes;
-        StringMap printfStringsMap;
 
-        uint16_t compiledSubGroupsNumber = 0U;
         uint8_t requiredSubGroupSize = 0U;
+        uint8_t requiredThreadGroupDispatchSize = 0U;
+        uint8_t indirectAccessBuffer = 0u;
+        bool isGeneratedByIgc = true;
     } kernelMetadata;
-
-    struct {
-        std::unique_ptr<DebugData> debugData;
-        std::unique_ptr<uint8_t[]> relocatedDebugData;
-        const void *igcInfoForGtpin = nullptr;
-    } external;
 
     std::vector<uint8_t> generatedSsh;
     std::vector<uint8_t> generatedDsh;
+
+    BindlessToSurfaceStateMap bindlessArgsMap;
+    std::once_flag initBindlessArgsMapOnce;
+    std::once_flag initBindlessSamplerSlotsOnce;
 };
+
+static_assert(NonCopyableAndNonMovable<KernelDescriptor>);
 
 } // namespace NEO

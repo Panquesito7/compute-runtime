@@ -1,18 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <cstdint>
+#include <memory>
+#include <new>
 
 using namespace NEO;
 
@@ -66,19 +70,19 @@ HWTEST_P(AUBFillBuffer, WhenFillingThenExpectationsMet) {
 
     pCmdQ->flush();
 
-    pDestMemory = reinterpret_cast<decltype(pDestMemory)>((destBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress()));
+    pDestMemory = reinterpret_cast<decltype(pDestMemory)>(ptrOffset(destBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), destBuffer->getOffset()));
 
     // The memory under offset should be untouched
     if (offset) {
         cl_float *destMemoryRef = ptrOffset(&destMemory[0], offset);
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, destMemoryRef, offset);
+        expectMemory<FamilyType>(pDestMemory, destMemoryRef, offset);
         pDestMemory = ptrOffset(pDestMemory, offset);
     }
 
-    // Compute our memory expecations based on kernel execution
+    // Compute our memory expectations based on kernel execution
     auto pEndMemory = ptrOffset(pDestMemory, size);
     while (pDestMemory < pEndMemory) {
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, pattern, patternSize);
+        expectMemory<FamilyType>(pDestMemory, pattern, patternSize);
         pDestMemory = ptrOffset(pDestMemory, patternSize);
     }
 
@@ -87,7 +91,7 @@ HWTEST_P(AUBFillBuffer, WhenFillingThenExpectationsMet) {
     if (offset + size < sizeUserMemory) {
         size_t sizeRemaining = sizeUserMemory - size - offset;
         cl_float *destMemoryRef = ptrOffset(&destMemory[0], offset + size);
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, destMemoryRef, sizeRemaining);
+        expectMemory<FamilyType>(pDestMemory, destMemoryRef, sizeRemaining);
     }
     delete destBuffer;
 }
@@ -132,20 +136,20 @@ HWTEST_F(AUBFillBuffer, givenFillBufferWhenSeveralSubmissionsWithoutPollForCompl
         pCmdQ->flush();
     }
 
-    AUBCommandStreamFixture::pollForCompletion<FamilyType>();
+    pollForCompletion<FamilyType>();
 
-    pDestMemory = reinterpret_cast<decltype(pDestMemory)>((destBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress()));
+    pDestMemory = reinterpret_cast<decltype(pDestMemory)>(ptrOffset(destBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), destBuffer->getOffset()));
     auto pEndMemory = ptrOffset(pDestMemory, numWrites * size);
     while (pDestMemory < pEndMemory) {
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, pattern, patternSize);
+        expectMemory<FamilyType>(pDestMemory, pattern, patternSize);
         pDestMemory = ptrOffset(pDestMemory, patternSize);
     }
 }
 
-INSTANTIATE_TEST_CASE_P(AUBFillBuffer_simple,
-                        AUBFillBuffer,
-                        ::testing::Values(
-                            0 * sizeof(cl_float),
-                            1 * sizeof(cl_float),
-                            2 * sizeof(cl_float),
-                            3 * sizeof(cl_float)));
+INSTANTIATE_TEST_SUITE_P(AUBFillBuffer_simple,
+                         AUBFillBuffer,
+                         ::testing::Values(
+                             0 * sizeof(cl_float),
+                             1 * sizeof(cl_float),
+                             2 * sizeof(cl_float),
+                             3 * sizeof(cl_float)));

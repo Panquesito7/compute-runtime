@@ -1,12 +1,15 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/kernel/grf_config.h"
+#include "shared/test/common/mocks/mock_device.h"
 
+#include "opencl/source/api/api.h"
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
@@ -52,6 +55,10 @@ TEST_F(clGetKernelMaxConcurrentWorkGroupCountTests, GivenInvalidInputWhenCalling
     retVal = clGetKernelMaxConcurrentWorkGroupCountINTEL(pCommandQueue, pMultiDeviceKernel, workDim,
                                                          globalWorkOffset, nullptr, &suggestedWorkGroupCount);
     EXPECT_EQ(CL_INVALID_WORK_GROUP_SIZE, retVal);
+
+    retVal = clGetKernelMaxConcurrentWorkGroupCountINTEL(pCommandQueue, pMultiDeviceKernel, workDim,
+                                                         globalWorkOffset, localWorkSize, &suggestedWorkGroupCount);
+    EXPECT_EQ(CL_INVALID_WORK_GROUP_SIZE, retVal);
 }
 
 TEST_F(clGetKernelMaxConcurrentWorkGroupCountTests, GivenVariousInputWhenGettingMaxConcurrentWorkGroupCountThenCorrectValuesAreReturned) {
@@ -59,12 +66,12 @@ TEST_F(clGetKernelMaxConcurrentWorkGroupCountTests, GivenVariousInputWhenGetting
     size_t globalWorkOffset[] = {0, 0, 0};
     size_t localWorkSize[] = {8, 8, 8};
     size_t maxConcurrentWorkGroupCount = 0;
-    const_cast<KernelInfo &>(pKernel->getKernelInfo()).kernelDescriptor.kernelAttributes.numGrfRequired = GrfConfig::DefaultGrfNumber;
+    const_cast<KernelInfo &>(pKernel->getKernelInfo()).kernelDescriptor.kernelAttributes.numGrfRequired = GrfConfig::defaultGrfNumber;
 
     retVal = clGetKernelMaxConcurrentWorkGroupCountINTEL(pCommandQueue, pMultiDeviceKernel, workDim, globalWorkOffset, localWorkSize,
                                                          &maxConcurrentWorkGroupCount);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    size_t expectedMaxConcurrentWorkGroupCount = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue);
+    size_t expectedMaxConcurrentWorkGroupCount = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue, false);
     EXPECT_EQ(expectedMaxConcurrentWorkGroupCount, maxConcurrentWorkGroupCount);
 
     retVal = clGetKernelMaxConcurrentWorkGroupCountINTEL(pCommandQueue, pMultiDeviceKernel, workDim, nullptr, localWorkSize,
@@ -79,8 +86,35 @@ TEST_F(clGetKernelMaxConcurrentWorkGroupCountTests, GivenVariousInputWhenGetting
                                                          globalWorkOffset, localWorkSize,
                                                          &maxConcurrentWorkGroupCount);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    expectedMaxConcurrentWorkGroupCount = pKernelWithExecutionEnvironmentPatch->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue);
+    expectedMaxConcurrentWorkGroupCount = pKernelWithExecutionEnvironmentPatch->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue, false);
     EXPECT_EQ(expectedMaxConcurrentWorkGroupCount, maxConcurrentWorkGroupCount);
+}
+
+TEST_F(clGetKernelMaxConcurrentWorkGroupCountTests, GivenMultiTileWhenGettingMaxConcurrentWorkGroupCountThenCorrectValuesAreReturned) {
+    DebugManagerStateRestore restore;
+    auto &mockDevice = static_cast<MockDevice &>(pDevice->getDevice());
+
+    cl_uint workDim = 3;
+    size_t localWorkSize[] = {8, 8, 8};
+
+    const_cast<KernelInfo &>(pKernel->getKernelInfo()).kernelDescriptor.kernelAttributes.numGrfRequired = GrfConfig::defaultGrfNumber;
+
+    mockDevice.deviceBitfield = 0b1;
+
+    auto baseCount = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue, false);
+
+    debugManager.flags.EnableImplicitScaling.set(1);
+    mockDevice.deviceBitfield = 0b11;
+
+    auto countWithSubDevices = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue, false);
+
+    auto &helper = pDevice->getGfxCoreHelper();
+
+    if (helper.singleTileExecImplicitScalingRequired(true)) {
+        EXPECT_EQ(baseCount, countWithSubDevices);
+    } else {
+        EXPECT_EQ(baseCount * 2, countWithSubDevices);
+    }
 }
 
 } // namespace ULT

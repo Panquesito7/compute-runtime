@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2022 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -9,8 +9,10 @@ set(CLOC_SEGFAULT_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/segfault_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${NEO_SHARED_DIRECTORY}/helpers/abort.cpp
+    ${NEO_SHARED_DIRECTORY}/os_interface/os_library.cpp
     ${NEO_SHARED_DIRECTORY}/os_interface/os_library.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/signal_utils.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/signal_utils_common.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_helpers.cpp
     ${NEO_SOURCE_DIR}/opencl/test/unit_test/offline_compiler/ocloc_tests_configuration.cpp
 )
@@ -21,6 +23,7 @@ if(WIN32)
        ${NEO_SHARED_DIRECTORY}/os_interface/windows/os_library_win.cpp
        ${NEO_SHARED_DIRECTORY}/os_interface/windows/os_library_win.h
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/signal_utils.cpp
+       ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/sys_calls.cpp
        ${OCLOC_DIRECTORY}/source/utilities/windows/safety_guard_windows.h
        ${OCLOC_DIRECTORY}/source/utilities/windows/seh_exception.cpp
        ${OCLOC_DIRECTORY}/source/utilities/windows/seh_exception.h
@@ -37,10 +40,12 @@ else()
 endif()
 
 add_executable(ocloc_segfault_test ${CLOC_SEGFAULT_TEST_SOURCES})
-target_link_libraries(ocloc_segfault_test gmock-gtest)
-if(MSVC)
-  target_compile_options(ocloc_segfault_test PRIVATE /Zi)
-  set_property(TARGET ocloc_segfault_test APPEND PROPERTY LINK_FLAGS /DEBUG)
+target_link_libraries(ocloc_segfault_test neo_gtest)
+if(WIN32)
+  if(MSVC)
+    target_compile_options(ocloc_segfault_test PRIVATE /Zi)
+    set_property(TARGET ocloc_segfault_test APPEND PROPERTY LINK_FLAGS /DEBUG)
+  endif()
   target_link_libraries(ocloc_segfault_test dbghelp)
 endif()
 if(UNIX)
@@ -49,15 +54,15 @@ endif()
 
 set(CLOC_SEGFAULT_TEST_INCLUDES
     ${NEO_SOURCE_DIR}
-    ${THIRD_PARTY_DIR}
 )
 
-if(CMAKE_COMPILER_IS_GNUCC)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR(WIN32 AND NOT MSVC AND ${CMAKE_BUILD_TYPE} STREQUAL "Release"))
   target_compile_definitions(ocloc_segfault_test PRIVATE SKIP_SEGFAULT_TEST=1)
 endif()
 
 get_property(CLOC_FOLDER TARGET ocloc PROPERTY FOLDER)
 set_property(TARGET ocloc_segfault_test PROPERTY FOLDER ${CLOC_FOLDER})
+set_property(TARGET ocloc_segfault_test PROPERTY ENABLE_EXPORTS TRUE)
 
 target_include_directories(ocloc_segfault_test BEFORE PRIVATE ${CLOC_SEGFAULT_TEST_INCLUDES})
 create_project_source_tree(ocloc_segfault_test)

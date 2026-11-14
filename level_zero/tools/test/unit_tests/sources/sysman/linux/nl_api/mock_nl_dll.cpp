@@ -1,11 +1,14 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "mock_nl_dll.h"
+
+#include "gtest/gtest.h"
+#include "iaf_netlink.h"
 
 namespace L0 {
 namespace ult {
@@ -205,6 +208,18 @@ struct nlmsghdr *mockNlmsgHdr(struct nl_msg *msg) {
     EXPECT_EQ(&MockNlDll::mockNlMsg, msg);
     return &MockNlDll::mockNlmsghdr;
 }
+
+struct nlattr *mockNlaNestStart(struct nl_msg *msg, int id) {
+    EXPECT_EQ(&MockNlDll::mockNlMsg, msg);
+    EXPECT_EQ(IAF_ATTR_FABRIC_PORT, id);
+    return &MockNlDll::mockNlattr;
+}
+
+int mockNlaNestEnd(struct nl_msg *msg, struct nlattr *attr) {
+    EXPECT_EQ(&MockNlDll::mockNlMsg, msg);
+    EXPECT_EQ(&MockNlDll::mockNlattr, attr);
+    return 0;
+}
 }
 
 MockNlDll::MockNlDll() {
@@ -239,6 +254,8 @@ MockNlDll::MockNlDll() {
     funcMap["nlmsg_attrlen"] = reinterpret_cast<void *>(&mockNlmsgAttrlen);
     funcMap["nlmsg_free"] = reinterpret_cast<void *>(&mockNlmsgFree);
     funcMap["nlmsg_hdr"] = reinterpret_cast<void *>(&mockNlmsgHdr);
+    funcMap["nla_nest_start"] = reinterpret_cast<void *>(&mockNlaNestStart);
+    funcMap["nla_nest_end"] = reinterpret_cast<void *>(&mockNlaNestEnd);
 }
 
 void *MockNlDll::getProcAddress(const std::string &procName) {

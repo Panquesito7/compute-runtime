@@ -1,119 +1,67 @@
 #
-# Copyright (C) 2018-2022 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
 
-add_library(${BUILTINS_BINARIES_STATELESS_LIB_NAME} OBJECT EXCLUDE_FROM_ALL builtins_binary.cmake)
-add_library(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} OBJECT EXCLUDE_FROM_ALL builtins_binary.cmake)
-add_library(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} OBJECT EXCLUDE_FROM_ALL builtins_binary.cmake)
-target_compile_definitions(${BUILTINS_BINARIES_STATELESS_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
-target_compile_definitions(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
-target_compile_definitions(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
-
-# Add builtins sources
-add_subdirectory(registry)
-
-list(APPEND ADDRESSING_MODES
-     "stateless"
-     "bindful"
-     "bindless"
-)
-
-set(GENERATED_BUILTINS
+set(BUILTINS_BUFFER
     "copy_buffer_rect"
     "copy_buffer_to_buffer"
     "copy_kernel_timestamps"
     "fill_buffer"
 )
 
-set(GENERATED_BUILTINS_AUX_TRANSLATION
+set(BUILTINS_AUX_TRANSLATION
     "aux_translation"
 )
 
-set(GENERATED_BUILTINS_IMAGES
+set(BUILTINS_IMAGE_BUFFER
     "copy_buffer_to_image3d"
     "copy_image3d_to_buffer"
+)
+
+set(BUILTINS_IMAGE
     "copy_image_to_image1d"
     "copy_image_to_image2d"
     "copy_image_to_image3d"
     "fill_image1d"
     "fill_image2d"
     "fill_image3d"
+    "fill_image1d_buffer"
 )
 
-set(GENERATED_BUILTINS_IMAGES_STATELESS
-    "copy_buffer_to_image3d_stateless"
-    "copy_image3d_to_buffer_stateless"
-)
+# Heapless platforms always compile with -heapless_mode enable
+set(HEAPLESS_CORE_TYPES "XE3P_CORE")
+set(HEAPLESS_ONLY_CORE_TYPES "XE3P_CORE")
 
-set(GENERATED_BUILTINS_STATELESS
-    "copy_buffer_to_buffer_stateless"
-    "copy_buffer_rect_stateless"
-    "fill_buffer_stateless"
-)
+add_library(${BUILTINS_BINARIES_LIB_NAME} OBJECT EXCLUDE_FROM_ALL builtins_binary.cmake)
+if(TARGET prepare_kernels)
+  add_dependencies(prepare_kernels ${BUILTINS_BINARIES_LIB_NAME})
+endif()
+
+# Add builtins sources
+add_subdirectory(registry)
 
 # Generate builtins cpps
 if(COMPILE_BUILT_INS)
   add_subdirectory(kernels)
 endif()
 
-foreach(MODE ${ADDRESSING_MODES})
-  get_property(GENERATED_BUILTINS_CPPS_${MODE} GLOBAL PROPERTY GENERATED_BUILTINS_CPPS_${MODE})
-  source_group("generated files\\${CORE_TYPE_LOWER}" FILES GENERATED_BUILTINS_CPPS_${MODE})
-endforeach()
+get_property(GENERATED_BUILTINS_CPPS GLOBAL PROPERTY GENERATED_BUILTINS_CPPS)
 
 if(COMPILE_BUILT_INS)
-  target_sources(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} PUBLIC ${GENERATED_BUILTINS_CPPS_bindful})
-  set_source_files_properties(${GENERATED_BUILTINS_CPPS_bindful} PROPERTIES GENERATED TRUE)
+  target_sources(${BUILTINS_BINARIES_LIB_NAME} PUBLIC ${GENERATED_BUILTINS_CPPS})
+  set_source_files_properties(${GENERATED_BUILTINS_CPPS} PROPERTIES GENERATED TRUE)
 endif()
 
-set_target_properties(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
-set_target_properties(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} PROPERTIES FOLDER "${SHARED_SOURCE_PROJECTS_FOLDER}/${SHARED_BUILTINS_PROJECTS_FOLDER}")
+set_target_properties(${BUILTINS_BINARIES_LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+set_target_properties(${BUILTINS_BINARIES_LIB_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(${BUILTINS_BINARIES_LIB_NAME} PROPERTIES FOLDER "${SHARED_SOURCE_PROJECTS_FOLDER}/${SHARED_BUILTINS_PROJECTS_FOLDER}")
 
-target_include_directories(${BUILTINS_BINARIES_BINDFUL_LIB_NAME} PRIVATE
+target_include_directories(${BUILTINS_BINARIES_LIB_NAME} PRIVATE
                            ${ENGINE_NODE_DIR}
                            ${KHRONOS_HEADERS_DIR}
                            ${KHRONOS_GL_HEADERS_DIR}
                            ${NEO__GMM_INCLUDE_DIR}
                            ${NEO__IGC_INCLUDE_DIR}
-                           ${THIRD_PARTY_DIR}
 )
-
-if(COMPILE_BUILT_INS)
-  target_sources(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} PUBLIC ${GENERATED_BUILTINS_CPPS_bindless})
-  set_source_files_properties(${GENERATED_BUILTINS_CPPS_bindless} PROPERTIES GENERATED TRUE)
-endif()
-
-set_target_properties(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
-set_target_properties(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} PROPERTIES FOLDER "${SHARED_SOURCE_PROJECTS_FOLDER}/${SHARED_BUILTINS_PROJECTS_FOLDER}")
-
-target_include_directories(${BUILTINS_BINARIES_BINDLESS_LIB_NAME} PRIVATE
-                           ${ENGINE_NODE_DIR}
-                           ${KHRONOS_HEADERS_DIR}
-                           ${KHRONOS_GL_HEADERS_DIR}
-                           ${NEO__GMM_INCLUDE_DIR}
-                           ${NEO__IGC_INCLUDE_DIR}
-                           ${THIRD_PARTY_DIR}
-)
-
-if(COMPILE_BUILT_INS)
-  target_sources(${BUILTINS_BINARIES_STATELESS_LIB_NAME} PUBLIC ${GENERATED_BUILTINS_CPPS_stateless})
-  set_source_files_properties(${GENERATED_BUILTINS_CPPS_stateless} PROPERTIES GENERATED TRUE)
-endif()
-
-set_target_properties(${BUILTINS_BINARIES_STATELESS_LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
-set_target_properties(${BUILTINS_BINARIES_STATELESS_LIB_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(${BUILTINS_BINARIES_STATELESS_LIB_NAME} PROPERTIES FOLDER "${SHARED_SOURCE_PROJECTS_FOLDER}/${SHARED_BUILTINS_PROJECTS_FOLDER}")
-
-target_include_directories(${BUILTINS_BINARIES_STATELESS_LIB_NAME} PRIVATE
-                           ${ENGINE_NODE_DIR}
-                           ${KHRONOS_HEADERS_DIR}
-                           ${KHRONOS_GL_HEADERS_DIR}
-                           ${NEO__GMM_INCLUDE_DIR}
-                           ${NEO__IGC_INCLUDE_DIR}
-                           ${THIRD_PARTY_DIR}
-)
-

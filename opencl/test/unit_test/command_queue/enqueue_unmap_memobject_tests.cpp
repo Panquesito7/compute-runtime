@@ -1,13 +1,16 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/local_memory_access_modes.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/event/event.h"
@@ -15,6 +18,7 @@
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 
 #include <algorithm>
@@ -32,7 +36,7 @@ struct EnqueueUnmapMemObjTest : public ClDeviceFixture,
     void SetUp() override {
         ClDeviceFixture::setUp();
         CommandQueueFixture::setUp(pClDevice, 0);
-        BufferDefaults::context = new MockContext;
+        BufferDefaults::context = new MockContext(pClDevice);
         buffer = BufferHelper<BufferUseHostPtr<>>::create();
         mappedPtr = pCmdQ->enqueueMapBuffer(buffer, CL_TRUE, CL_MAP_READ, 0, 8, 0, nullptr, nullptr, retVal);
     }
@@ -135,7 +139,7 @@ HWTEST_F(EnqueueUnmapMemObjTest, WhenUnmappingMemoryObjectThenEventIsUpdated) {
     EXPECT_NE(nullptr, eventReturned);
 
     auto eventObject = castToObject<Event>(eventReturned);
-    EXPECT_EQ(0u, eventObject->peekTaskCount());
+    EXPECT_EQ(pCmdQ->taskCount, eventObject->peekTaskCount());
     EXPECT_TRUE(eventObject->updateStatusAndCheckCompletion());
 
     clReleaseEvent(eventReturned);
@@ -169,6 +173,9 @@ TEST_F(EnqueueUnmapMemObjTest, WhenUnmappingMemoryObjectThenWaitEventIsUpdated) 
     EXPECT_NE(nullptr, ptrResult);
     EXPECT_NE(nullptr, waitEvent);
 
+    Event *wEvent = castToObject<Event>(waitEvent);
+    EXPECT_EQ(CL_QUEUED, wEvent->peekExecutionStatus());
+
     retVal = clEnqueueUnmapMemObject(
         pCmdQ,
         buffer,
@@ -179,14 +186,15 @@ TEST_F(EnqueueUnmapMemObjTest, WhenUnmappingMemoryObjectThenWaitEventIsUpdated) 
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_NE(nullptr, retEvent);
 
-    Event *wEvent = castToObject<Event>(waitEvent);
     EXPECT_EQ(CL_COMPLETE, wEvent->peekExecutionStatus());
 
     Event *rEvent = castToObject<Event>(retEvent);
-    EXPECT_EQ(CL_COMPLETE, rEvent->peekExecutionStatus());
+    EXPECT_EQ(CL_QUEUED, rEvent->peekExecutionStatus());
 
     retVal = clWaitForEvents(1, &retEvent);
     EXPECT_EQ(CL_SUCCESS, retVal);
+
+    EXPECT_EQ(CL_COMPLETE, rEvent->peekExecutionStatus());
 
     retVal = clReleaseMemObject(buffer);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -219,8 +227,8 @@ HWTEST_F(EnqueueUnmapMemObjTest, givenEnqueueUnmapMemObjectWhenNonAubWritableBuf
 
 HWTEST_F(EnqueueUnmapMemObjTest, givenWriteBufferIsServicedOnCPUWhenBufferIsNonAubTbxWriteableThenFlagsChange) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::Default));
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::defaultMode));
     auto buffer = std::unique_ptr<Buffer>(BufferHelper<>::create());
     ASSERT_NE(nullptr, buffer);
     auto graphicsAllocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
@@ -243,9 +251,9 @@ HWTEST_F(EnqueueUnmapMemObjTest, givenWriteBufferIsServicedOnCPUWhenBufferIsNonA
 
 HWTEST_F(EnqueueUnmapMemObjTest, givenMemObjWhenUnmappingThenSetAubWritableBeforeEnqueueWrite) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.DisableZeroCopyForBuffers.set(true);
+    debugManager.flags.DisableZeroCopyForBuffers.set(true);
     auto buffer = std::unique_ptr<Buffer>(BufferHelper<>::create());
-    auto image = std::unique_ptr<Image>(Image2dHelper<>::create(BufferDefaults::context));
+    auto image = std::unique_ptr<Image>(Image2dHelperUlt<>::create(BufferDefaults::context));
 
     class MyMockCommandQueue : public MockCommandQueue {
       public:

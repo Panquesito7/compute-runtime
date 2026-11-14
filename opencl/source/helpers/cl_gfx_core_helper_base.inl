@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,7 +26,7 @@ inline bool ClGfxCoreHelperHw<GfxFamily>::requiresAuxResolves(const KernelInfo &
 template <typename GfxFamily>
 inline bool ClGfxCoreHelperHw<GfxFamily>::hasStatelessAccessToBuffer(const KernelInfo &kernelInfo) const {
     for (const auto &arg : kernelInfo.kernelDescriptor.payloadMappings.explicitArgs) {
-        if (arg.is<ArgDescriptor::ArgTPointer>() && !arg.as<ArgDescPointer>().isPureStateful()) {
+        if (arg.is<ArgDescriptor::argTPointer>() && !arg.as<ArgDescPointer>().isPureStateful()) {
             return true;
         }
     }
@@ -34,19 +34,10 @@ inline bool ClGfxCoreHelperHw<GfxFamily>::hasStatelessAccessToBuffer(const Kerne
 }
 
 template <typename GfxFamily>
-inline bool ClGfxCoreHelperHw<GfxFamily>::allowCompressionForContext(const ClDevice &clDevice, const Context &context) const {
-    return true;
-}
-
-template <typename GfxFamily>
 inline bool ClGfxCoreHelperHw<GfxFamily>::getQueueFamilyName(std::string &name, EngineGroupType type) const {
     return false;
 }
 
-template <typename GfxFamily>
-inline bool ClGfxCoreHelperHw<GfxFamily>::preferBlitterForLocalToLocalTransfers() const {
-    return false;
-}
 template <typename GfxFamily>
 bool ClGfxCoreHelperHw<GfxFamily>::isSupportedKernelThreadArbitrationPolicy() const { return true; }
 
@@ -58,6 +49,11 @@ std::vector<uint32_t> ClGfxCoreHelperHw<GfxFamily>::getSupportedThreadArbitratio
 template <typename GfxFamily>
 bool ClGfxCoreHelperHw<GfxFamily>::allowImageCompression(cl_image_format format) const {
     return true;
+}
+
+template <typename GfxFamily>
+bool ClGfxCoreHelperHw<GfxFamily>::isLimitationForPreemptionNeeded() const {
+    return false;
 }
 
 } // namespace NEO

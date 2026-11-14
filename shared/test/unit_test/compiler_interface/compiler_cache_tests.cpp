@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,19 +7,29 @@
 
 #include "shared/source/compiler_interface/compiler_cache.h"
 #include "shared/source/compiler_interface/compiler_interface.h"
+#include "shared/source/compiler_interface/default_cache_config.h"
+#include "shared/source/compiler_interface/intermediate_representations.h"
+#include "shared/source/device_binary_format/device_binary_formats.h"
+#include "shared/source/device_binary_format/elf/elf_encoder.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/array_count.h"
+#include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/hash.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/string.h"
+#include "shared/source/os_interface/sys_calls_common.h"
 #include "shared/source/utilities/io_functions.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
-#include "shared/test/common/libult/global_environment.h"
 #include "shared/test/common/mocks/mock_compiler_cache.h"
+#include "shared/test/common/mocks/mock_compiler_interface.h"
+#include "shared/test/common/mocks/mock_compilers.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_io_functions.h"
+#include "shared/test/common/mocks/mock_modules_zebin.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include "elements_struct.h"
 #include "os_inc.h"
 
 #include <array>
@@ -42,7 +52,7 @@ TEST(HashGeneration, givenMisalignedBufferWhenPassedToUpdateFunctionThenProperPt
     misalignedPtr[2] = 3;
     misalignedPtr[3] = 4;
     misalignedPtr[4] = 5;
-    // values not used should be ommitted
+    // values not used should be omitted
     misalignedPtr[5] = 6;
     misalignedPtr[6] = 7;
 
@@ -84,7 +94,7 @@ TEST(HashGeneration, givenMisalignedBufferWithSizeOneWhenPassedToUpdateFunctionT
 
     // values really used
     misalignedPtr[0] = 1;
-    // values not used should be ommitted
+    // values not used should be omitted
     misalignedPtr[1] = 2;
     misalignedPtr[2] = 3;
     misalignedPtr[3] = 4;
@@ -130,6 +140,21 @@ TEST(CompilerCacheHashTests, GivenCompilingOptionsWhenGettingCacheThenCorrectCac
 
     std::set<std::string> hashes;
 
+    std::array<std::string, 4> igcRevisions = {{std::string(""),
+                                                std::string("0000000000000000000000000000000000000000"),
+                                                std::string("0000000000000000000000000000000000000001"),
+                                                std::string("abcdef1234567890abcdef123456789000000000")}};
+
+    std::array<std::string, 4> igcRegKeysArray = {{std::string(""),
+                                                   std::string("IGC_ShaderDumpEnable=1"),
+                                                   std::string("IGC_ShaderDumpEnable=0"),
+                                                   std::string("IGC_ShaderDumpEnable=1,IGC_EnableZEBinary=1")}};
+
+    const size_t igcLibSize = 304297;
+    const time_t igcLibMTime = 167594873;
+    const size_t igcLibSizes[] = {0, 1, 1024, igcLibSize};
+    const time_t igcLibMTimes[] = {0, 102, igcLibMTime};
+
     PLATFORM p1 = {(PRODUCT_FAMILY)1};
     PLATFORM p2 = {(PRODUCT_FAMILY)2};
     const PLATFORM *platforms[] = {&p1, &p2};
@@ -143,6 +168,7 @@ TEST(CompilerCacheHashTests, GivenCompilingOptionsWhenGettingCacheThenCorrectCac
     w1.flags.wa4kAlignUVOffsetNV12LinearSurface = true;
     w2.flags.wa4kAlignUVOffsetNV12LinearSurface = false;
     const WorkaroundTable *was[] = {&w1, &w2};
+    const uint32_t ipVersionValues[] = {1, 2};
 
     std::array<std::string, 4> inputArray = {{std::string(""),
                                               std::string("12345678901234567890123456789012"),
@@ -157,10 +183,14 @@ TEST(CompilerCacheHashTests, GivenCompilingOptionsWhenGettingCacheThenCorrectCac
                                                         std::string("--some --options"),
                                                         std::string("--some --different --options")}};
 
+    std::unique_ptr<char[]> buf0(new char[bufSize]);
     std::unique_ptr<char[]> buf1(new char[bufSize]);
     std::unique_ptr<char[]> buf2(new char[bufSize]);
     std::unique_ptr<char[]> buf3(new char[bufSize]);
     std::unique_ptr<char[]> buf4(new char[bufSize]);
+
+    ArrayRef<char> igcRevision;
+    ArrayRef<char> igcRegKeys;
 
     ArrayRef<char> src;
     ArrayRef<char> apiOptions;
@@ -168,51 +198,106 @@ TEST(CompilerCacheHashTests, GivenCompilingOptionsWhenGettingCacheThenCorrectCac
 
     CompilerCache cache(CompilerCacheConfig{});
 
-    for (auto platform : platforms) {
-        hwInfo.platform = *platform;
+    strcpy_s(buf0.get(), bufSize, igcRevisions[0].c_str());
+    igcRevision = ArrayRef<char>(buf0.get(), strlen(buf0.get()));
+    strcpy_s(buf4.get(), bufSize, igcRegKeysArray[0].c_str());
+    igcRegKeys = ArrayRef<char>(buf4.get(), strlen(buf4.get()));
+    strcpy_s(buf1.get(), bufSize, inputArray[0].c_str());
+    src = ArrayRef<char>(buf1.get(), strlen(buf1.get()));
+    strcpy_s(buf2.get(), bufSize, optionsArray[0].c_str());
+    apiOptions = ArrayRef<char>(buf2.get(), strlen(buf2.get()));
+    strcpy_s(buf3.get(), bufSize, internalOptionsArray[0].c_str());
+    internalOptions = ArrayRef<char>(buf3.get(), strlen(buf3.get()));
+    auto libSize = igcLibSizes[0];
+    auto libMTime = igcLibMTimes[0];
+    hwInfo.platform = *platforms[0];
+    hwInfo.featureTable = *skus[0];
+    hwInfo.workaroundTable = *was[0];
+    hwInfo.ipVersion.architecture = ipVersionValues[0];
+    hwInfo.ipVersion.release = ipVersionValues[0];
+    hwInfo.ipVersion.revision = ipVersionValues[0];
 
-        for (auto sku : skus) {
-            hwInfo.featureTable = *sku;
+    auto verifyHash = [&]() -> void {
+        std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions, ArrayRef<const char>(), ArrayRef<const char>(), igcRevision, igcRegKeys, libSize, libMTime);
 
-            for (auto wa : was) {
-                hwInfo.workaroundTable = *wa;
+        ASSERT_FALSE(hashes.contains(hash));
+        hashes.emplace(hash);
+    };
+    verifyHash();
 
-                for (size_t i1 = 0; i1 < inputArray.size(); i1++) {
-                    strcpy_s(buf1.get(), bufSize, inputArray[i1].c_str());
-                    src = ArrayRef<char>(buf1.get(), strlen(buf1.get()));
-                    for (size_t i2 = 0; i2 < optionsArray.size(); i2++) {
-                        strcpy_s(buf2.get(), bufSize, optionsArray[i2].c_str());
-                        apiOptions = ArrayRef<char>(buf2.get(), strlen(buf2.get()));
-                        for (size_t i3 = 0; i3 < internalOptionsArray.size(); i3++) {
-                            strcpy_s(buf3.get(), bufSize, internalOptionsArray[i3].c_str());
-                            internalOptions = ArrayRef<char>(buf3.get(), strlen(buf3.get()));
-
-                            std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions);
-
-                            if (hashes.find(hash) != hashes.end()) {
-                                FAIL() << "failed: " << i1 << ":" << i2 << ":" << i3;
-                            }
-                            hashes.emplace(hash);
-                        }
-                    }
-                }
-            }
-        }
+    for (size_t i = 1; i < igcRevisions.size(); i++) {
+        strcpy_s(buf0.get(), bufSize, igcRevisions[i].c_str());
+        igcRevision = ArrayRef<char>(buf0.get(), strlen(buf0.get()));
+        verifyHash();
+    }
+    for (size_t i = 1; i < igcRegKeysArray.size(); i++) {
+        strcpy_s(buf4.get(), bufSize, igcRegKeysArray[i].c_str());
+        igcRegKeys = ArrayRef<char>(buf4.get(), strlen(buf4.get()));
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(igcLibSizes); i++) {
+        libSize = igcLibSizes[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(igcLibMTimes); i++) {
+        libMTime = igcLibMTimes[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(platforms); i++) {
+        hwInfo.platform = *platforms[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(skus); i++) {
+        hwInfo.featureTable = *skus[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(was); i++) {
+        hwInfo.workaroundTable = *was[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(ipVersionValues); i++) {
+        hwInfo.ipVersion.architecture = ipVersionValues[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(ipVersionValues); i++) {
+        hwInfo.ipVersion.release = ipVersionValues[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < arrayCount(ipVersionValues); i++) {
+        hwInfo.ipVersion.revision = ipVersionValues[i];
+        verifyHash();
+    }
+    for (size_t i = 1; i < inputArray.size(); i++) {
+        strcpy_s(buf1.get(), bufSize, inputArray[i].c_str());
+        src = ArrayRef<char>(buf1.get(), strlen(buf1.get()));
+        verifyHash();
+    }
+    for (size_t i = 1; i < optionsArray.size(); i++) {
+        strcpy_s(buf2.get(), bufSize, optionsArray[i].c_str());
+        apiOptions = ArrayRef<char>(buf2.get(), strlen(buf2.get()));
+        verifyHash();
+    }
+    for (size_t i = 1; i < internalOptionsArray.size(); i++) {
+        strcpy_s(buf3.get(), bufSize, internalOptionsArray[i].c_str());
+        internalOptions = ArrayRef<char>(buf3.get(), strlen(buf3.get()));
+        verifyHash();
     }
 
-    std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions);
-    std::string hash2 = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions);
+    std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions, ArrayRef<const char>(), ArrayRef<const char>(), igcRevision, igcRegKeys, igcLibSize, igcLibMTime);
+    std::string hash2 = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions, ArrayRef<const char>(), ArrayRef<const char>(), igcRevision, igcRegKeys, igcLibSize, igcLibMTime);
     EXPECT_STREQ(hash.c_str(), hash2.c_str());
 }
 
 TEST(CompilerCacheTests, GivenBinaryCacheWhenDebugFlagIsSetThenTraceFilesAreCreated) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.BinaryCacheTrace.set(true);
+    debugManager.flags.BinaryCacheTrace.set(true);
 
     static struct VerifyData {
         bool matched;
         const char *pattern;
     } verifyData[] = {
+        {false, "---- igcRevision ----"},
+        {false, "---- igcRegKeys ----"},
         {false, "---- input ----"},
         {false, "---- options ----"},
         {false, "---- internal options ----"},
@@ -249,8 +334,11 @@ TEST(CompilerCacheTests, GivenBinaryCacheWhenDebugFlagIsSetThenTraceFilesAreCrea
     ArrayRef<char> src;
     ArrayRef<char> apiOptions;
     ArrayRef<char> internalOptions;
+    ArrayRef<char> revision;
+    size_t libSize = 0;
+    time_t libMTime = 0;
     CompilerCache cache(CompilerCacheConfig{});
-    std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions);
+    std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions, ArrayRef<const char>(), ArrayRef<const char>(), revision, ArrayRef<const char>(), libSize, libMTime);
 
     for (size_t idx = 0; idx < sizeof(verifyData) / sizeof(verifyData[0]); idx++) {
         EXPECT_TRUE(verifyData[idx].matched);
@@ -266,7 +354,7 @@ TEST(CompilerCacheTests, GivenBinaryCacheWhenDebugFlagIsSetThenTraceFilesAreCrea
 
 TEST(CompilerCacheTests, GivenBinaryCacheWhenDebugFlagIsSetAndOpenFailesThenNoCloseOccurs) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.BinaryCacheTrace.set(true);
+    debugManager.flags.BinaryCacheTrace.set(true);
 
     VariableBackup<decltype(IoFunctions::mockFopenReturned)> retValBkp(&IoFunctions::mockFopenReturned, reinterpret_cast<FILE *>(0x0));
 
@@ -280,8 +368,11 @@ TEST(CompilerCacheTests, GivenBinaryCacheWhenDebugFlagIsSetAndOpenFailesThenNoCl
     ArrayRef<char> src;
     ArrayRef<char> apiOptions;
     ArrayRef<char> internalOptions;
+    ArrayRef<char> revision;
+    size_t libSize = 0;
+    time_t libMTime = 0;
     CompilerCache cache(CompilerCacheConfig{});
-    std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions);
+    std::string hash = cache.getCachedFileName(hwInfo, src, apiOptions, internalOptions, ArrayRef<const char>(), ArrayRef<const char>(), revision, ArrayRef<const char>(), libSize, libMTime);
 
     EXPECT_EQ(IoFunctions::mockFopenCalled, 2u);
     EXPECT_EQ(IoFunctions::mockFcloseCalled, 0u);
@@ -300,9 +391,18 @@ TEST(CompilerCacheTests, GivenEmptyBinaryWhenCachingThenBinaryIsNotCached) {
 }
 
 TEST(CompilerCacheTests, GivenNonExistantConfigWhenLoadingFromCacheThenNullIsReturned) {
+    VariableBackup<decltype(NEO::IoFunctions::fopenPtr)> mockFopen(&NEO::IoFunctions::fopenPtr, [](const char *filename, const char *mode) -> FILE * { return NULL; });
     CompilerCache cache(CompilerCacheConfig{});
     size_t size;
     auto ret = cache.loadCachedBinary("----do-not-exists----", size);
+    EXPECT_EQ(nullptr, ret);
+    EXPECT_EQ(0U, size);
+}
+
+TEST(CompilerCacheTests, GivenTooShortKernelFileHashWhenGetCachedBinaryIsCalledThenNullIsReturned) {
+    CompilerCache cache(CompilerCacheConfig{});
+    size_t size;
+    auto ret = cache.loadCachedBinary("a", size);
     EXPECT_EQ(nullptr, ret);
     EXPECT_EQ(0U, size);
 }
@@ -314,14 +414,9 @@ TEST(CompilerInterfaceCachedTests, GivenNoCachedBinaryWhenBuildingThenErrorIsRet
 
     inputArgs.src = ArrayRef<const char>(src, strlen(src));
 
-    MockCompilerDebugVars fclDebugVars;
-    fclDebugVars.fileName = gEnvironment->fclGetMockFile();
-    gEnvironment->fclPushDebugVars(fclDebugVars);
-
     MockCompilerDebugVars igcDebugVars;
-    igcDebugVars.fileName = gEnvironment->igcGetMockFile();
     igcDebugVars.forceBuildFailure = true;
-    gEnvironment->igcPushDebugVars(igcDebugVars);
+    NEO::igcPushDebugVars(igcDebugVars);
 
     std::unique_ptr<CompilerCacheMock> cache(new CompilerCacheMock());
     auto compilerInterface = std::unique_ptr<CompilerInterface>(CompilerInterface::createInstance(std::move(cache), true));
@@ -330,10 +425,9 @@ TEST(CompilerInterfaceCachedTests, GivenNoCachedBinaryWhenBuildingThenErrorIsRet
     inputArgs.allowCaching = true;
     MockDevice device;
     auto err = compilerInterface->build(device, inputArgs, translationOutput);
-    EXPECT_EQ(TranslationOutput::ErrorCode::BuildFailure, err);
+    EXPECT_EQ(TranslationErrorCode::buildFailure, err);
 
-    gEnvironment->fclPopDebugVars();
-    gEnvironment->igcPopDebugVars();
+    NEO::igcPopDebugVars();
 }
 
 TEST(CompilerInterfaceCachedTests, GivenCachedBinaryWhenBuildingThenSuccessIsReturned) {
@@ -342,14 +436,13 @@ TEST(CompilerInterfaceCachedTests, GivenCachedBinaryWhenBuildingThenSuccessIsRet
     auto src = "#include \"header.h\"\n__kernel k() {}";
     inputArgs.src = ArrayRef<const char>(src, strlen(src));
 
-    MockCompilerDebugVars fclDebugVars;
-    fclDebugVars.fileName = gEnvironment->fclGetMockFile();
-    gEnvironment->fclPushDebugVars(fclDebugVars);
-
+    char binaryToReturn[1]{};
     MockCompilerDebugVars igcDebugVars;
-    igcDebugVars.fileName = gEnvironment->igcGetMockFile();
+    igcDebugVars.binaryToReturn = binaryToReturn;
+    igcDebugVars.binaryToReturnSize = sizeof(binaryToReturn);
     igcDebugVars.forceBuildFailure = true;
-    gEnvironment->igcPushDebugVars(igcDebugVars);
+    igcDebugVars.forceBuildFailureBackendOnly = true;
+    NEO::igcPushDebugVars(igcDebugVars);
 
     std::unique_ptr<CompilerCacheMock> cache(new CompilerCacheMock());
     cache->loadResult = true;
@@ -359,10 +452,9 @@ TEST(CompilerInterfaceCachedTests, GivenCachedBinaryWhenBuildingThenSuccessIsRet
     TranslationOutput translationOutput;
     MockDevice device;
     auto err = compilerInterface->build(device, inputArgs, translationOutput);
-    EXPECT_EQ(TranslationOutput::ErrorCode::Success, err);
+    EXPECT_EQ(TranslationErrorCode::success, err);
 
-    gEnvironment->fclPopDebugVars();
-    gEnvironment->igcPopDebugVars();
+    NEO::igcPopDebugVars();
 }
 
 TEST(CompilerInterfaceCachedTests, givenKernelWithoutIncludesAndBinaryInCacheWhenCompilationRequestedThenFCLIsNotCalled) {
@@ -375,25 +467,24 @@ TEST(CompilerInterfaceCachedTests, givenKernelWithoutIncludesAndBinaryInCacheWhe
     // we force both compilers to fail compilation request
     // at the end we expect CL_SUCCESS which means compilation ends in cache
     MockCompilerDebugVars fclDebugVars;
-    fclDebugVars.fileName = gEnvironment->fclGetMockFile();
     fclDebugVars.forceBuildFailure = true;
-    gEnvironment->fclPushDebugVars(fclDebugVars);
+    NEO::fclPushDebugVars(fclDebugVars);
 
     MockCompilerDebugVars igcDebugVars;
-    igcDebugVars.fileName = gEnvironment->igcGetMockFile();
     igcDebugVars.forceBuildFailure = true;
-    gEnvironment->igcPushDebugVars(igcDebugVars);
+    NEO::igcPushDebugVars(igcDebugVars);
 
     std::unique_ptr<CompilerCacheMock> cache(new CompilerCacheMock());
     cache->loadResult = true;
+    cache->config.enabled = true;
     auto compilerInterface = std::unique_ptr<CompilerInterface>(CompilerInterface::createInstance(std::move(cache), true));
     TranslationOutput translationOutput;
     inputArgs.allowCaching = true;
     auto retVal = compilerInterface->build(device, inputArgs, translationOutput);
-    EXPECT_EQ(TranslationOutput::ErrorCode::Success, retVal);
+    EXPECT_EQ(TranslationErrorCode::success, retVal);
 
-    gEnvironment->fclPopDebugVars();
-    gEnvironment->igcPopDebugVars();
+    NEO::fclPopDebugVars();
+    NEO::igcPopDebugVars();
 }
 
 TEST(CompilerInterfaceCachedTests, givenKernelWithIncludesAndBinaryInCacheWhenCompilationRequestedThenFCLIsCalled) {
@@ -404,9 +495,8 @@ TEST(CompilerInterfaceCachedTests, givenKernelWithIncludesAndBinaryInCacheWhenCo
     inputArgs.src = ArrayRef<const char>(src, strlen(src));
 
     MockCompilerDebugVars fclDebugVars;
-    fclDebugVars.fileName = gEnvironment->fclGetMockFile();
     fclDebugVars.forceBuildFailure = true;
-    gEnvironment->fclPushDebugVars(fclDebugVars);
+    NEO::fclPushDebugVars(fclDebugVars);
 
     std::unique_ptr<CompilerCacheMock> cache(new CompilerCacheMock());
     cache->loadResult = true;
@@ -414,7 +504,601 @@ TEST(CompilerInterfaceCachedTests, givenKernelWithIncludesAndBinaryInCacheWhenCo
     TranslationOutput translationOutput;
     inputArgs.allowCaching = true;
     auto retVal = compilerInterface->build(device, inputArgs, translationOutput);
-    EXPECT_EQ(TranslationOutput::ErrorCode::BuildFailure, retVal);
+    EXPECT_EQ(TranslationErrorCode::buildFailure, retVal);
 
-    gEnvironment->fclPopDebugVars();
+    NEO::fclPopDebugVars();
+}
+
+class CompilerInterfaceOclElfCacheTest : public ::testing::Test, public CompilerCacheHelper {
+  public:
+    void SetUp() override {
+        ZebinTestData::ValidEmptyProgram<> zebin;
+        deviceBinaryData = zebin.storage;
+
+        std::unique_ptr<CompilerCacheMock> cache(new CompilerCacheMock());
+        cache->config.enabled = true;
+        compilerInterface = std::make_unique<MockCompilerInterface>();
+        bool initRet = compilerInterface->initialize(std::move(cache), true);
+        ASSERT_TRUE(initRet);
+
+        mockCompilerCache = static_cast<CompilerCacheMock *>(compilerInterface->cache.get());
+
+        igcFclDebugVarsForceBuildFailure.forceBuildFailure = true;
+        igcFclDebugVarsForceBuildFailure.forceBuildFailureBackendOnly = true;
+        // When used for the front-end (FCL-role) IGC call (products where
+        // useIgcAsFcl() is true), forceBuildFailureBackendOnly means this call
+        // must actually succeed, so it needs valid output data - reuse the
+        // same content as igcDebugVarsDeviceBinary so the resulting
+        // intermediate representation - and thus its cache hash - matches the
+        // first (successful, non-cached) build() call exactly.
+        igcFclDebugVarsForceBuildFailure.binaryToReturn = deviceBinaryData.data();
+        igcFclDebugVarsForceBuildFailure.binaryToReturnSize = deviceBinaryData.size();
+
+        igcDebugVarsDeviceBinary.forceBuildFailure = false;
+        igcDebugVarsDeviceBinary.binaryToReturn = deviceBinaryData.data();
+        igcDebugVarsDeviceBinary.binaryToReturnSize = deviceBinaryData.size();
+    }
+
+    MockCompilerDebugVars igcFclDebugVarsForceBuildFailure;
+    MockCompilerDebugVars igcDebugVarsDeviceBinary;
+    std::vector<uint8_t> deviceBinaryData;
+
+    std::unique_ptr<MockCompilerInterface> compilerInterface;
+    CompilerCacheMock *mockCompilerCache;
+};
+
+TEST_F(CompilerInterfaceOclElfCacheTest, givenIncorrectBinaryCausingPackDeviceBinaryToReturnEmptyVectorWhenPackAndCacheBinaryThenBinaryIsNotStoredInCache) {
+    TranslationOutput outputFromCompilation;
+
+    const uint8_t deviceBinary[] = {0x01, 0x02, 0x03, 0x04};
+    outputFromCompilation.deviceBinary.mem = makeCopy<char>(reinterpret_cast<const char *>(deviceBinary), sizeof(deviceBinary));
+    outputFromCompilation.deviceBinary.size = sizeof(deviceBinary);
+
+    std::string incorrectIr = "intermediateRepresentation";
+    outputFromCompilation.intermediateRepresentation.mem = makeCopy(incorrectIr.c_str(), incorrectIr.length());
+    outputFromCompilation.intermediateRepresentation.size = incorrectIr.length();
+
+    auto incorrectIrBinary = ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(outputFromCompilation.intermediateRepresentation.mem.get()), outputFromCompilation.intermediateRepresentation.size);
+    ASSERT_FALSE(NEO::isSpirVBitcode(incorrectIrBinary));
+    ASSERT_FALSE(NEO::isLlvmBitcode(incorrectIrBinary));
+
+    MockDevice device;
+    CompilerCacheHelper::packAndCacheBinary(*mockCompilerCache, "some_hash", NEO::getTargetDevice(device.getRootDeviceEnvironment()), outputFromCompilation);
+
+    EXPECT_EQ(0u, mockCompilerCache->hashToBinaryMap.size());
+}
+
+TEST_F(CompilerInterfaceOclElfCacheTest, GivenKernelWithIncludesWhenBuildingThenPackBinaryOnCacheSaveAndUnpackBinaryOnLoadFromCache) {
+    NEO::igcPushDebugVars(igcDebugVarsDeviceBinary);
+
+    TranslationInput inputArgs{IGC::CodeType::oclC, IGC::CodeType::oclGenBin};
+
+    auto src = "#include \"header.h\"\n__kernel k() {}";
+    inputArgs.src = ArrayRef<const char>(src, strlen(src));
+
+    TranslationOutput outputFromCompilation;
+    MockDevice device;
+    auto err = compilerInterface->build(device, inputArgs, outputFromCompilation);
+    EXPECT_EQ(TranslationErrorCode::success, err);
+    EXPECT_EQ(0, memcmp(deviceBinaryData.data(), outputFromCompilation.deviceBinary.mem.get(), outputFromCompilation.deviceBinary.size));
+    EXPECT_EQ(nullptr, outputFromCompilation.debugData.mem.get());
+
+    EXPECT_EQ(1u, mockCompilerCache->hashToBinaryMap.size());
+
+    NEO::igcPopDebugVars();
+
+    // we force igc to fail compilation request
+    // at the end we expect CL_SUCCESS which means compilation ends in cache
+    NEO::igcPushDebugVars(igcFclDebugVarsForceBuildFailure);
+
+    TranslationOutput outputFromCache;
+    err = compilerInterface->build(device, inputArgs, outputFromCache);
+    EXPECT_EQ(TranslationErrorCode::success, err);
+
+    EXPECT_EQ(0, memcmp(deviceBinaryData.data(), outputFromCache.deviceBinary.mem.get(), outputFromCache.deviceBinary.size));
+    EXPECT_EQ(nullptr, outputFromCache.debugData.mem.get());
+
+    NEO::igcPopDebugVars();
+}
+
+TEST_F(CompilerInterfaceOclElfCacheTest, GivenBinaryWhenBuildingThenPackBinaryOnCacheSaveAndUnpackBinaryOnLoadFromCache) {
+    NEO::igcPushDebugVars(igcDebugVarsDeviceBinary);
+
+    TranslationInput inputArgs{IGC::CodeType::oclC, IGC::CodeType::oclGenBin};
+
+    auto src = "__kernel k() {}";
+    inputArgs.src = ArrayRef<const char>(src, strlen(src));
+
+    TranslationOutput outputFromCompilation;
+    MockDevice device;
+    auto err = compilerInterface->build(device, inputArgs, outputFromCompilation);
+    EXPECT_EQ(TranslationErrorCode::success, err);
+    EXPECT_EQ(0, memcmp(deviceBinaryData.data(), outputFromCompilation.deviceBinary.mem.get(), outputFromCompilation.deviceBinary.size));
+    EXPECT_EQ(nullptr, outputFromCompilation.debugData.mem.get());
+
+    EXPECT_EQ(1u, mockCompilerCache->hashToBinaryMap.size());
+
+    NEO::igcPopDebugVars();
+
+    // we force fcl to fail compilation request
+    // at the end we expect CL_SUCCESS which means compilation ends in cache
+    NEO::fclPushDebugVars(igcFclDebugVarsForceBuildFailure);
+
+    TranslationOutput outputFromCache;
+    err = compilerInterface->build(device, inputArgs, outputFromCache);
+    EXPECT_EQ(TranslationErrorCode::success, err);
+
+    EXPECT_EQ(0, memcmp(deviceBinaryData.data(), outputFromCache.deviceBinary.mem.get(), outputFromCache.deviceBinary.size));
+    EXPECT_EQ(nullptr, outputFromCache.debugData.mem.get());
+
+    NEO::fclPopDebugVars();
+}
+
+class CompilerCacheHelperWhitelistedTest : public ::testing::Test, public CompilerCacheHelper {
+  public:
+    using CompilerCacheHelper::whitelistedIncludes;
+
+    bool isValidIncludeFormat(std::string_view entry) {
+        size_t spacePos = entry.find(' ');
+        if (spacePos == std::string_view::npos) {
+            return false;
+        }
+
+        std::string_view firstWord = entry.substr(0, spacePos);
+        if (firstWord != "#include") {
+            return false;
+        }
+
+        std::string_view secondPart = entry.substr(spacePos + 1);
+        if (secondPart.empty()) {
+            return false;
+        }
+
+        return true;
+    }
+};
+
+TEST_F(CompilerCacheHelperWhitelistedTest, GivenWhitelistedIncludesWhenCheckingFormatThenExpectValidIncludeFormat) {
+    for (const auto &entry : whitelistedIncludes) {
+        EXPECT_TRUE(isValidIncludeFormat(entry))
+            << "Invalid format in whitelisted include: " << entry;
+    }
+}
+
+TEST_F(CompilerCacheHelperWhitelistedTest, GivenWhitelistedIncludesWhenCheckingContentsThenExpectCorrectEntries) {
+    std::vector<std::string_view> expectedEntries{
+        "#include <cm/cm.h>",
+        "#include <cm/cmtl.h>"};
+
+    for (const auto &expectedEntry : expectedEntries) {
+        auto it = std::find(whitelistedIncludes.begin(), whitelistedIncludes.end(), expectedEntry);
+        EXPECT_NE(it, whitelistedIncludes.end())
+            << "Expected entry '" << expectedEntry << "' not found in whitelistedIncludes.";
+    }
+
+    EXPECT_EQ(whitelistedIncludes.size(), expectedEntries.size())
+        << "whitelistedIncludes contains unexpected entries.";
+}
+
+class CompilerCacheHelperMockedWhitelistedIncludesTests : public ::testing::Test, public CompilerCacheHelper {
+  public:
+    using CompilerCacheHelper::whitelistedIncludes;
+
+    CompilerCacheHelperMockedWhitelistedIncludesTests() : backup(&whitelistedIncludes, {"#include <whitelisted>"}) {}
+
+    void SetUp() override {}
+    void TearDown() override {}
+
+    VariableBackup<decltype(whitelistedIncludes)> backup;
+};
+
+TEST_F(CompilerCacheHelperMockedWhitelistedIncludesTests, GivenSourceWithWhitelistedIncludeWhenCheckingWhitelistedIncludesThenReturnsTrue) {
+    const StackVec<const char *, 6> sources = {
+        "__kernel void k() {}",                                                 // no includes
+        "#include <whitelisted>\n__kernel void k() {}",                         // whitelisted include
+        "",                                                                     // empty source
+        "    #include <whitelisted>\n__kernel void k() {}",                     // leading spaces
+        "\t#include <whitelisted>\n__kernel void k() {}",                       // leading tabs
+        "#include <whitelisted>\n#include <whitelisted>\n__kernel void k() {}", // multiple whitelisted
+        "\n#include <whitelisted>\n__kernel void k() {}",                       // leading newline
+        "\r\n#include <whitelisted>\n__kernel void k() {}"                      // leading carriage return + newline
+    };
+
+    for (const auto &source : sources) {
+        ArrayRef<const char> sourceRef(source, strlen(source));
+        EXPECT_TRUE(CompilerCacheHelper::validateIncludes(sourceRef, CompilerCacheHelper::whitelistedIncludes))
+            << "Failed for source: " << source;
+    }
+}
+
+TEST_F(CompilerCacheHelperMockedWhitelistedIncludesTests, GivenSourceWithNonWhitelistedIncludeWhenCheckingWhitelistedIncludesThenReturnsFalse) {
+    const StackVec<const char *, 3> sources = {
+        "#include <unknown/unknown.h>\n__kernel void k() {}",                         // non-whitelisted include
+        "#include <whitelisted>\n#include <unknown/unknown.h>\n__kernel void k() {}", // mixed includes - first whitelisted, second non-whitelisted
+        "#include <unknown/unknown.h>\n#include <whitelisted>\n__kernel void k() {}"  // mixed includes - first non-whitelisted, second whitelisted
+    };
+
+    for (const auto &source : sources) {
+        ArrayRef<const char> sourceRef(source, strlen(source));
+        EXPECT_FALSE(CompilerCacheHelper::validateIncludes(sourceRef, CompilerCacheHelper::whitelistedIncludes))
+            << "Failed for source: " << source;
+    }
+}
+
+TEST_F(CompilerCacheHelperMockedWhitelistedIncludesTests, GivenDisabledOrNullCacheWhenGettingCachingModeThenReturnsCachingModeNone) {
+    CompilerCache cache(CompilerCacheConfig{false, false, "", "", 0});
+    const StackVec<std::pair<const char *, IGC::CodeType::CodeType_t>, 3> testCases = {
+        {"#include <whitelisted>\n__kernel void k() {}", IGC::CodeType::oclC},      // disabled cache
+        {"__kernel void k() {}", IGC::CodeType::oclC},                              // disabled cache, no includes
+        {"#include <unknown/unknown.h>\n__kernel void k() {}", IGC::CodeType::oclC} // disabled cache, non-whitelisted include
+    };
+
+    for (const auto &testCase : testCases) {
+        ArrayRef<const char> sourceRef(testCase.first, strlen(testCase.first));
+        EXPECT_EQ(CachingMode::none, CompilerCacheHelper::getCachingMode(&cache, testCase.second, sourceRef))
+            << "Failed for source: " << testCase.first;
+    }
+
+    EXPECT_EQ(CachingMode::none, CompilerCacheHelper::getCachingMode(nullptr, IGC::CodeType::oclC, ArrayRef<const char>()))
+        << "Failed for nullptr CompilerCache";
+}
+
+TEST_F(CompilerCacheHelperMockedWhitelistedIncludesTests, GivenEnabledCacheAndOclCWithWhitelistedIncludesWhenGettingCachingModeThenReturnsCachingModeDirect) {
+    CompilerCache cache(CompilerCacheConfig{true, true, "", "", 0});
+    const StackVec<std::pair<const char *, IGC::CodeType::CodeType_t>, 2> testCases = {
+        {"__kernel void k() {}", IGC::CodeType::oclC},                        // no includes
+        {"#include <whitelisted>\n__kernel void k() {}", IGC::CodeType::oclC} // only whitelisted include
+    };
+
+    for (const auto &testCase : testCases) {
+        ArrayRef<const char> sourceRef(testCase.first, strlen(testCase.first));
+        EXPECT_EQ(CachingMode::direct, CompilerCacheHelper::getCachingMode(&cache, testCase.second, sourceRef))
+            << "Failed for source: " << testCase.first;
+    }
+}
+
+TEST_F(CompilerCacheHelperMockedWhitelistedIncludesTests, GivenEnabledCacheAndNonWhitelistedIncludesOrNonOclCWhenGettingCachingModeThenReturnsCachingModePreProcess) {
+    CompilerCache cache(CompilerCacheConfig{true, true, "", "", 0});
+    const StackVec<std::pair<const char *, IGC::CodeType::CodeType_t>, 6> testCases = {
+        {"#include <unknown/unknown.h>\n__kernel void k() {}", IGC::CodeType::oclC},                         // non-whitelisted include
+        {"#include <whitelisted>\n#include <unknown/unknown.h>\n__kernel void k() {}", IGC::CodeType::oclC}, // mixed includes
+        {"#include <unknown/unknown.h>\n#include <whitelisted>\n__kernel void k() {}", IGC::CodeType::oclC}, // mixed includes different order
+        {"__kernel void k() {}", IGC::CodeType::spirV},                                                      // non-oclC type
+        {"#include <whitelisted>\n__kernel void k() {}", IGC::CodeType::spirV},                              // non-oclC type with whitelisted include
+        {"#include <unknown/unknown.h>\n__kernel void k() {}", IGC::CodeType::spirV}                         // non-oclC type with non-whitelisted include
+    };
+
+    for (const auto &testCase : testCases) {
+        ArrayRef<const char> sourceRef(testCase.first, strlen(testCase.first));
+        EXPECT_EQ(CachingMode::preProcess, CompilerCacheHelper::getCachingMode(&cache, testCase.second, sourceRef))
+            << "Failed for source: " << testCase.first;
+    }
+}
+
+class CompilerCacheIsStatsFile : public CompilerCache {
+  public:
+    using CompilerCache::isStatsFile;
+    CompilerCacheIsStatsFile(const CompilerCacheConfig &config) : CompilerCache(config) {}
+};
+
+TEST(CompilerCacheIsStatsFileTests, GivenPathEndingWithStatsThenReturnsTrue) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string path = sep + "home" + sep + "cl_cache" + sep + "stats";
+    EXPECT_TRUE(CompilerCacheIsStatsFile::isStatsFile(path));
+}
+
+TEST(CompilerCacheIsStatsFileTests, GivenBareStatsFilenameThenReturnsTrue) {
+    EXPECT_TRUE(CompilerCacheIsStatsFile::isStatsFile("stats"));
+}
+
+TEST(CompilerCacheIsStatsFileTests, GivenPathNotEndingWithStatsThenReturnsFalse) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string path = sep + "home" + sep + "cl_cache" + sep + "binary.cl_cache";
+    EXPECT_FALSE(CompilerCacheIsStatsFile::isStatsFile(path));
+}
+
+TEST(CompilerCacheIsStatsFileTests, GivenPathWithStatsInMiddleThenReturnsFalse) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string path = sep + "stats" + sep + "somefile";
+    EXPECT_FALSE(CompilerCacheIsStatsFile::isStatsFile(path));
+}
+
+TEST(CompilerCacheIsStatsFileTests, GivenEmptyPathThenReturnsFalse) {
+    EXPECT_FALSE(CompilerCacheIsStatsFile::isStatsFile(""));
+}
+
+class CompilerCacheMockShowStats : public CompilerCache {
+  public:
+    CompilerCacheMockShowStats(const CompilerCacheConfig &config) : CompilerCache(config) {}
+
+    StatsResult readStatsFromFile(const std::string &statsPath, CacheStats &cacheStats) override {
+        readStatsFromFileCalled++;
+        lastStatsPath = statsPath;
+        if (readStatsResult == StatsResult::success) {
+            cacheStats = injectedStats;
+        }
+        return readStatsResult;
+    }
+
+    bool getFiles(const std::string &startPath, const std::function<bool(const std::string_view &)> &filter, std::vector<ElementsStruct> &foundFiles) override {
+        getFilesCalled++;
+        foundFiles.clear();
+        if (!getFilesResult) {
+            return false;
+        }
+        for (const auto &e : injectedStatsFiles) {
+            if (filter(e.path)) {
+                foundFiles.push_back(e);
+            }
+        }
+        return true;
+    }
+
+    StatsResult readStatsResult = StatsResult::success;
+    CacheStats injectedStats{};
+    std::vector<ElementsStruct> injectedStatsFiles;
+    bool getFilesResult = true;
+    size_t readStatsFromFileCalled = 0;
+    size_t getFilesCalled = 0;
+    std::string lastStatsPath;
+};
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsNonVerboseThenPrintsCacheStats) {
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", "/home/cl_cache/", MemoryConstants::megaByte});
+    cache.injectedStats.version = CompilerCache::cacheVersion;
+    cache.injectedStats.hits = 10;
+    cache.injectedStats.misses = 5;
+
+    std::string output;
+    auto result = cache.showStats(false, output);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(1u, cache.readStatsFromFileCalled);
+    EXPECT_NE(std::string::npos, output.find("Compiler cache stats:"));
+    EXPECT_NE(std::string::npos, output.find("Cache directory: /home/cl_cache/"));
+    EXPECT_NE(std::string::npos, output.find("Version    Hits    Misses    Hit Rate"));
+    EXPECT_NE(std::string::npos, output.find("66.67%"));
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsNonVerboseAndNotFoundThenPrintsNoStatsFound) {
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", "/home/cl_cache/", MemoryConstants::megaByte});
+    cache.readStatsResult = CompilerCache::StatsResult::notFound;
+
+    std::string output;
+    auto result = cache.showStats(false, output);
+
+    EXPECT_TRUE(result);
+    EXPECT_NE(std::string::npos, output.find("No stats found in cache directory."));
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsNonVerboseAndErrorThenReturnsFalse) {
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", "/home/cl_cache/", MemoryConstants::megaByte});
+    cache.readStatsResult = CompilerCache::StatsResult::error;
+
+    std::string output;
+    auto result = cache.showStats(false, output);
+
+    EXPECT_FALSE(result);
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsWithZeroHitsAndMissesThenHitRateIsZero) {
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", "/home/cl_cache/", MemoryConstants::megaByte});
+    cache.injectedStats.version = CompilerCache::cacheVersion;
+    cache.injectedStats.hits = 0;
+    cache.injectedStats.misses = 0;
+
+    std::string output;
+    auto result = cache.showStats(false, output);
+
+    EXPECT_TRUE(result);
+    EXPECT_NE(std::string::npos, output.find("0.00%"));
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsVerboseAndFilesFoundThenPrintsCacheStats) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string cacheDir = sep + "home" + sep + "cl_cache";
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", cacheDir, MemoryConstants::megaByte});
+    cache.injectedStats.version = CompilerCache::cacheVersion;
+    cache.injectedStats.hits = 7;
+    cache.injectedStats.misses = 3;
+
+    ElementsStruct statsFile{};
+    statsFile.path = cacheDir + sep + "0" + sep + "0" + sep + "stats";
+    cache.injectedStatsFiles = {statsFile};
+
+    std::string output;
+    auto result = cache.showStats(true, output);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(1u, cache.getFilesCalled);
+    EXPECT_EQ(1u, cache.readStatsFromFileCalled);
+    EXPECT_NE(std::string::npos, output.find("Compiler cache stats:"));
+    EXPECT_NE(std::string::npos, output.find("Version    Hits    Misses    Hit Rate"));
+    EXPECT_NE(std::string::npos, output.find("70.00%"));
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsVerboseAndReadStatsFailsThenReturnsFalse) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string cacheDir = sep + "home" + sep + "cl_cache";
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", cacheDir, MemoryConstants::megaByte});
+    cache.readStatsResult = CompilerCache::StatsResult::error;
+
+    ElementsStruct statsFile{};
+    statsFile.path = cacheDir + sep + "0" + sep + "0" + sep + "stats";
+    cache.injectedStatsFiles = {statsFile};
+
+    std::string output;
+    auto result = cache.showStats(true, output);
+
+    EXPECT_FALSE(result);
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsVerboseAndNoFilesFoundThenPrintsNoStatsFound) {
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", "/home/cl_cache", MemoryConstants::megaByte});
+
+    std::string output;
+    auto result = cache.showStats(true, output);
+
+    EXPECT_TRUE(result);
+    EXPECT_NE(std::string::npos, output.find("No stats found in cache directories."));
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsVerboseAndGetFilesFailsThenReturnsFalse) {
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", "/home/cl_cache", MemoryConstants::megaByte});
+    cache.getFilesResult = false;
+
+    std::string output;
+    auto result = cache.showStats(true, output);
+
+    EXPECT_FALSE(result);
+}
+
+TEST(CompilerCacheShowStatsTests, GivenCompilerCacheWhenShowStatsVerboseThenOnlyFilesWithBasenameStatsAreUsed) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string cacheDir = sep + "home" + sep + "stats-cache";
+    CompilerCacheMockShowStats cache({true, true, ".cl_cache", cacheDir, MemoryConstants::megaByte});
+    cache.injectedStats.version = CompilerCache::cacheVersion;
+    cache.injectedStats.hits = 5;
+    cache.injectedStats.misses = 5;
+
+    ElementsStruct validStatsFile{};
+    validStatsFile.path = cacheDir + sep + "0" + sep + "0" + sep + "stats";
+
+    ElementsStruct invalidFile{};
+    invalidFile.path = cacheDir + sep + "0" + sep + "0" + sep + "notstats";
+
+    ElementsStruct anotherInvalidFile{};
+    anotherInvalidFile.path = cacheDir + sep + "0" + sep + "0" + sep + "stats.bak";
+
+    cache.injectedStatsFiles = {validStatsFile, invalidFile, anotherInvalidFile};
+
+    std::string output;
+    auto result = cache.showStats(true, output);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(1u, cache.readStatsFromFileCalled);
+    EXPECT_NE(std::string::npos, output.find("50.00%"));
+}
+
+class CompilerCacheMockZeroStats : public CompilerCache {
+  public:
+    CompilerCacheMockZeroStats(const CompilerCacheConfig &config) : CompilerCache(config) {}
+
+    StatsResult readStatsFromFile(const std::string &statsPath, CacheStats &cacheStats) override {
+        readStatsFromFileCalled++;
+        cacheStats = currentStats;
+        return StatsResult::success;
+    }
+
+    bool writeStatsToFile(const std::string &statsPath, const CacheStats &cacheStats) override {
+        writeStatsToFileCalled++;
+        lastWrittenStats = cacheStats;
+        lastWrittenPath = statsPath;
+        currentStats = cacheStats;
+        return writeStatsToFileResult;
+    }
+
+    bool getFiles(const std::string &startPath, const std::function<bool(const std::string_view &)> &filter, std::vector<ElementsStruct> &foundFiles) override {
+        getFilesCalled++;
+        foundFiles.clear();
+        if (!getFilesResult) {
+            return false;
+        }
+        for (const auto &e : injectedStatsFiles) {
+            if (filter(e.path)) {
+                foundFiles.push_back(e);
+            }
+        }
+        return true;
+    }
+
+    CacheStats currentStats{};
+    bool writeStatsToFileResult = true;
+    bool getFilesResult = true;
+    std::vector<ElementsStruct> injectedStatsFiles;
+    size_t readStatsFromFileCalled = 0;
+    size_t writeStatsToFileCalled = 0;
+    size_t getFilesCalled = 0;
+    CacheStats lastWrittenStats{};
+    std::string lastWrittenPath;
+};
+
+TEST(CompilerCacheZeroStatsTests, GivenCompilerCacheWhenZeroStatsAndFilesFoundThenWritesZeroedStats) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string cacheDir = sep + "home" + sep + "cl_cache";
+    CompilerCacheMockZeroStats cache({true, true, ".cl_cache", cacheDir, MemoryConstants::megaByte});
+
+    ElementsStruct statsFile{};
+    statsFile.path = cacheDir + sep + "0" + sep + "0" + sep + "stats";
+    cache.injectedStatsFiles = {statsFile};
+
+    auto result = cache.zeroStats();
+
+    EXPECT_EQ(CompilerCache::StatsResult::success, result);
+    EXPECT_EQ(1u, cache.getFilesCalled);
+    EXPECT_EQ(1u, cache.writeStatsToFileCalled);
+    EXPECT_EQ(CompilerCache::cacheVersion, cache.lastWrittenStats.version);
+    EXPECT_EQ(0u, cache.lastWrittenStats.hits);
+    EXPECT_EQ(0u, cache.lastWrittenStats.misses);
+}
+
+TEST(CompilerCacheZeroStatsTests, GivenCompilerCacheWhenZeroStatsAndMultipleFilesFoundThenWritesAllZeroed) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string cacheDir = sep + "home" + sep + "cl_cache";
+    CompilerCacheMockZeroStats cache({true, true, ".cl_cache", cacheDir, MemoryConstants::megaByte});
+
+    ElementsStruct statsFile1{};
+    statsFile1.path = cacheDir + sep + "0" + sep + "0" + sep + "stats";
+    ElementsStruct statsFile2{};
+    statsFile2.path = cacheDir + sep + "1" + sep + "1" + sep + "stats";
+    cache.injectedStatsFiles = {statsFile1, statsFile2};
+
+    auto result = cache.zeroStats();
+
+    EXPECT_EQ(CompilerCache::StatsResult::success, result);
+    EXPECT_EQ(2u, cache.writeStatsToFileCalled);
+}
+
+TEST(CompilerCacheZeroStatsTests, GivenCompilerCacheWhenZeroStatsAndGetFilesFailsThenReturnsError) {
+    CompilerCacheMockZeroStats cache({true, true, ".cl_cache", "/home/cl_cache", MemoryConstants::megaByte});
+    cache.getFilesResult = false;
+
+    auto result = cache.zeroStats();
+
+    EXPECT_EQ(CompilerCache::StatsResult::error, result);
+    EXPECT_EQ(0u, cache.writeStatsToFileCalled);
+}
+
+TEST(CompilerCacheZeroStatsTests, GivenCompilerCacheWhenZeroStatsAndWriteFailsThenReturnsError) {
+    std::string sep(1, PATH_SEPARATOR);
+    std::string cacheDir = sep + "home" + sep + "cl_cache";
+    CompilerCacheMockZeroStats cache({true, true, ".cl_cache", cacheDir, MemoryConstants::megaByte});
+    cache.writeStatsToFileResult = false;
+
+    ElementsStruct statsFile{};
+    statsFile.path = cacheDir + sep + "0" + sep + "0" + sep + "stats";
+    cache.injectedStatsFiles = {statsFile};
+
+    auto result = cache.zeroStats();
+
+    EXPECT_EQ(CompilerCache::StatsResult::error, result);
+}
+
+TEST(CompilerCacheZeroStatsTests, GivenCompilerCacheWhenZeroStatsAndNoFilesFoundThenReturnsNotFound) {
+    CompilerCacheMockZeroStats cache({true, true, ".cl_cache", "/home/cl_cache", MemoryConstants::megaByte});
+
+    auto result = cache.zeroStats();
+
+    EXPECT_EQ(CompilerCache::StatsResult::notFound, result);
+    EXPECT_EQ(0u, cache.writeStatsToFileCalled);
+}
+
+TEST(CompilerCacheZeroStatsTests, GivenCompilerCacheWhenZeroStatsCalledAndCacheDirIsEmptyThenReturnsNotFound) {
+    CompilerCacheMockZeroStats cache({true, true, ".cl_cache", "", MemoryConstants::megaByte});
+
+    auto result = cache.zeroStats();
+
+    EXPECT_EQ(CompilerCache::StatsResult::notFound, result);
+    EXPECT_EQ(0u, cache.getFilesCalled);
+    EXPECT_EQ(0u, cache.writeStatsToFileCalled);
 }

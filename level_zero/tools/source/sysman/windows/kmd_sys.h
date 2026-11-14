@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <stdint.h>
+#include <memory>
 
 namespace L0 {
 
@@ -146,6 +146,13 @@ enum Activity {
     // current runtime values
     CurrentActivityCounter,
 
+    NumberOfVfsEnabled,
+    EngineInstancesPerGroup,
+    // activity per engine
+    CurrentCounterV2,
+    // array of per-engine activities for all pf and vf
+    CurrentCounterV2Ext,
+
     MaxActivityRequests,
 };
 
@@ -216,6 +223,7 @@ enum Frequency {
     CurrentThrottleReasons,
     CurrentThrottleTime,
     CurrentFrequencyRange,
+    SupportedFreqDomains = 38,
 
     MaxFrequencyRequests,
 };
@@ -340,6 +348,7 @@ enum FlipType {
 enum GeneralDomainsType {
     GeneralDomainDGPU = 0,
     GeneralDomainHBM,
+    GeneralDomainMedia,
 
     GeneralDomainMaxTypes,
 };
@@ -356,6 +365,13 @@ enum ActivityDomainsType {
     ActitvityDomainGT = 0,
     ActivityDomainRenderCompute,
     ActivityDomainMedia,
+
+    ActivityDomainCopy,
+    ActivityDomainComputeSingle,
+    ActivityDomainRenderSingle,
+    ActivityDomainMediaCodecSingle,
+    ActivityDomainMediaEnhancementSingle,
+    ActivityDomainCopySingle,
 
     ActivityDomainMaxTypes,
 };
@@ -496,7 +512,7 @@ struct RequestProperty {
         componentId = other.componentId;
         paramInfo = other.paramInfo;
         dataSize = other.dataSize;
-        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize && other.dataBuffer) {
+        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize) {
             memcpy_s(dataBuffer, other.dataSize, other.dataBuffer, other.dataSize);
         }
     }
@@ -516,12 +532,15 @@ struct RequestProperty {
         }
     }
     RequestProperty &operator=(const RequestProperty &other) {
+        if (this == &other) {
+            return *this;
+        }
         requestId = other.requestId;
         commandId = other.commandId;
         componentId = other.componentId;
         paramInfo = other.paramInfo;
         dataSize = other.dataSize;
-        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize && other.dataBuffer) {
+        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize) {
             memcpy_s(dataBuffer, other.dataSize, other.dataBuffer, other.dataSize);
         }
         return *this;
@@ -541,7 +560,7 @@ struct ResponseProperty {
         returnCode = other.returnCode;
         componentId = other.componentId;
         dataSize = other.dataSize;
-        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize && other.dataBuffer) {
+        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize) {
             memcpy_s(dataBuffer, other.dataSize, other.dataBuffer, other.dataSize);
         }
     }
@@ -559,11 +578,14 @@ struct ResponseProperty {
         }
     }
     ResponseProperty &operator=(const ResponseProperty &other) {
+        if (this == &other) {
+            return *this;
+        }
         this->requestId = other.requestId;
         this->returnCode = other.returnCode;
         this->componentId = other.componentId;
         this->dataSize = other.dataSize;
-        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize && other.dataBuffer) {
+        if (other.dataSize > 0 && other.dataSize < MaxPropertyBufferSize) {
             memcpy_s(this->dataBuffer, other.dataSize, other.dataBuffer, other.dataSize);
         }
         return *this;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,6 +13,8 @@
 #include <functional>
 
 namespace NEO {
+class CompilerProductHelper;
+struct HardwareInfo;
 namespace CompilerOptions {
 inline constexpr ConstStringRef greaterThan4gbBuffersRequired = "-cl-intel-greater-than-4GB-buffer-required";
 inline constexpr ConstStringRef hasBufferOffsetArg = "-cl-intel-has-buffer-offset-arg";
@@ -25,7 +27,6 @@ inline constexpr ConstStringRef argInfo = "-cl-kernel-arg-info";
 inline constexpr ConstStringRef gtpinRera = "-cl-intel-gtpin-rera";
 inline constexpr ConstStringRef finiteMathOnly = "-cl-finite-math-only";
 inline constexpr ConstStringRef fastRelaxedMath = "-cl-fast-relaxed-math";
-inline constexpr ConstStringRef preserveVec3Type = "-fpreserve-vec3-type";
 inline constexpr ConstStringRef createLibrary = "-create-library";
 inline constexpr ConstStringRef generateDebugInfo = "-g";
 inline constexpr ConstStringRef generateSourcePath = "-s";
@@ -33,9 +34,6 @@ inline constexpr ConstStringRef bindlessMode = "-cl-intel-use-bindless-mode -cl-
 inline constexpr ConstStringRef uniformWorkgroupSize = "-cl-uniform-work-group-size";
 inline constexpr ConstStringRef forceEmuInt32DivRem = "-cl-intel-force-emu-int32divrem";
 inline constexpr ConstStringRef forceEmuInt32DivRemSP = "-cl-intel-force-emu-sp-int32divrem";
-inline constexpr ConstStringRef allowZebin = "-cl-intel-allow-zebin";
-inline constexpr ConstStringRef enableZebin = "-cl-intel-enable-zebin";
-inline constexpr ConstStringRef disableZebin = "-cl-intel-disable-zebin";
 inline constexpr ConstStringRef enableImageSupport = "-D__IMAGE_SUPPORT__=1";
 inline constexpr ConstStringRef optLevel = "-ze-opt-level=O";
 inline constexpr ConstStringRef excludeIrFromZebin = "-exclude-ir-from-zebin";
@@ -46,13 +44,22 @@ inline constexpr ConstStringRef autoGrf = "-cl-intel-enable-auto-large-GRF-mode"
 inline constexpr ConstStringRef numThreadsPerEu = "-cl-intel-reqd-eu-thread-count";
 inline constexpr ConstStringRef useCMCompiler = "-cmc";
 inline constexpr ConstStringRef enableFP64GenEmu = "-cl-fp64-gen-emu";
-
+inline constexpr ConstStringRef enableDivergentBarriers = "-cl-intel-enable-divergent-barrier-handling";
+inline constexpr ConstStringRef optDisableSendWarWa = "-ze-opt-disable-sendwarwa";
+inline constexpr ConstStringRef kernelTypes = "-Didx_t=uint -Dcoord2_t=uint2 -Dcoord4_t=uint4 -Doffset_t=uint";
+inline constexpr ConstStringRef wideStatelessTypes = "-Didx_t=ulong -Dcoord2_t=ulong2 -Dcoord4_t=ulong4 -Doffset_t=ulong";
+inline constexpr ConstStringRef enable64bitAddressing = "-ze-intel-64bit-addressing";
+inline const std::string kernelOptions = kernelTypes.str();
+inline const std::string kernelStatelessOptions =
+    greaterThan4gbBuffersRequired.str() + " " + kernelTypes.str();
+inline const std::string kernelWideStatelessOptions =
+    greaterThan4gbBuffersRequired.str() + " " + wideStatelessTypes.str();
 inline constexpr size_t nullterminateSize = 1U;
 inline constexpr size_t spaceSeparatorSize = 1U;
 
-template <size_t Length>
-constexpr size_t length(const char (&array)[Length]) {
-    return Length;
+template <size_t lengthValue>
+constexpr size_t length(const char (&array)[lengthValue]) {
+    return lengthValue;
 }
 
 constexpr size_t length(ConstStringRef string) {
@@ -111,10 +118,10 @@ inline std::string concatenate(T &&arg, RestT &&...rest) {
     return ret;
 }
 
-template <size_t NumOptions>
-constexpr size_t concatenationLength(const ConstStringRef (&options)[NumOptions]) {
+template <size_t numOptions>
+constexpr size_t concatenationLength(const ConstStringRef (&options)[numOptions]) {
     size_t ret = 0U;
-    for (auto opt : options) {
+    for (auto &opt : options) {
         ret += spaceSeparatorSize + opt.length();
     }
     return (ret != 0U) ? ret - nullterminateSize : 0U;
@@ -135,13 +142,13 @@ inline bool extract(const ConstStringRef &toBeExtracted, ContainerT &options) {
     return true;
 }
 
-template <size_t MaxLength = 256>
+template <size_t maxLength = 256>
 class ConstConcatenation {
   public:
-    template <size_t NumOptions>
-    constexpr ConstConcatenation(const ConstStringRef (&options)[NumOptions]) {
+    template <size_t numOptions>
+    constexpr ConstConcatenation(const ConstStringRef (&options)[numOptions]) {
         size_t i = 0U;
-        for (auto opt : options) {
+        for (auto &opt : options) {
             for (size_t j = 0U, e = opt.length(); j < e; ++j, ++i) {
                 storage[i] = opt[j];
             }
@@ -163,17 +170,17 @@ class ConstConcatenation {
     }
 
   protected:
-    char storage[MaxLength + nullterminateSize] = {};
+    char storage[maxLength + nullterminateSize] = {};
     size_t length = 0U;
 };
 
-template <size_t MaxLength>
-bool operator==(const ConstStringRef &lhs, const ConstConcatenation<MaxLength> &rhs) {
+template <size_t maxLength>
+bool operator==(const ConstStringRef &lhs, const ConstConcatenation<maxLength> &rhs) {
     return lhs == rhs.operator ConstStringRef();
 }
 
-template <size_t MaxLength>
-bool operator==(const ConstConcatenation<MaxLength> &lhs, const ConstStringRef &rhs) {
+template <size_t maxLength>
+bool operator==(const ConstConcatenation<maxLength> &lhs, const ConstStringRef &rhs) {
     return rhs == lhs;
 }
 
@@ -185,5 +192,13 @@ std::string wrapInQuotes(const std::string &stringToWrap);
 
 void applyAdditionalInternalOptions(std::string &internalOptions);
 void applyAdditionalApiOptions(std::string &apiOptions);
+
+enum class HeaplessMode {
+    enabled,
+    disabled,
+    defaultMode,
+};
+void applyExtraInternalOptions(std::string &internalOptions, const HardwareInfo &hwInfo, const CompilerProductHelper &compilerProductHelper, HeaplessMode heaplessMode);
+
 } // namespace CompilerOptions
 } // namespace NEO

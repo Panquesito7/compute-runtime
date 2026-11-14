@@ -1,20 +1,24 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/submissions_aggregator.h"
+#include "shared/source/device/device.h"
 #include "shared/source/helpers/flush_stamp.h"
-#include "shared/test/common/mocks/mock_csr.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue_hw.h"
 #include "opencl/source/event/event.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
@@ -26,7 +30,7 @@ struct MockSubmissionAggregator : public SubmissionAggregator {
     }
 };
 
-TEST(SubmissionsAggregator, givenDefaultSubmissionsAggregatorWhenItIsCreatedThenCreationIsSuccesful) {
+TEST(SubmissionsAggregator, givenDefaultSubmissionsAggregatorWhenItIsCreatedThenCreationIsSuccessful) {
     MockSubmissionAggregator submissionsAggregator;
     EXPECT_TRUE(submissionsAggregator.peekCommandBuffersList().peekIsEmpty());
 }
@@ -211,7 +215,7 @@ TEST(SubmissionsAggregator, givenMultipleCommandBuffersWhenTheyAreAggreagateWith
 
     submissionsAggregator.aggregateCommandBuffers(resourcePackage, totalUsedSize, totalMemoryBudget, 0u);
 
-    // command buffer 2 is aggregated to command buffer 1, comand buffer 3 becomes command buffer 2
+    // command buffer 2 is aggregated to command buffer 1, command buffer 3 becomes command buffer 2
     EXPECT_EQ(submissionsAggregator.peekCommandBuffersList().peekHead(), cmdBuffer);
     EXPECT_EQ(submissionsAggregator.peekCommandBuffersList().peekTail(), cmdBuffer3);
     EXPECT_EQ(cmdBuffer->next, cmdBuffer2);
@@ -351,7 +355,7 @@ TEST(SubmissionsAggregator, givenTwoCommandBufferWhereSecondContainsFirstOnResou
 
     submissionsAggregator.aggregateCommandBuffers(resourcePackage, totalUsedSize, totalMemoryBudget, 0u);
 
-    // resource pack shuold have 3 surfaces
+    // resource pack should have 3 surfaces
     EXPECT_EQ(3u, resourcePackage.size());
     EXPECT_EQ(14u, totalUsedSize);
 }
@@ -383,38 +387,9 @@ TEST(SubmissionsAggregator, givenTwoCommandBufferWhereSecondContainsTheFirstComm
 
     submissionsAggregator.aggregateCommandBuffers(resourcePackage, totalUsedSize, totalMemoryBudget, 0u);
 
-    // resource pack shuold have 3 surfaces
+    // resource pack should have 3 surfaces
     EXPECT_EQ(2u, resourcePackage.size());
     EXPECT_EQ(12u, totalUsedSize);
-}
-
-TEST(SubmissionsAggregator, givenCommandBuffersRequiringDifferentCoherencySettingWhenAggregateIsCalledThenTheyAreNotAgggregated) {
-    MockSubmissionAggregator submissionsAggregator;
-
-    std::unique_ptr<Device> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    CommandBuffer *cmdBuffer = new CommandBuffer(*device);
-    CommandBuffer *cmdBuffer2 = new CommandBuffer(*device);
-
-    MockGraphicsAllocation alloc1(nullptr, 1);
-    MockGraphicsAllocation alloc7(nullptr, 7);
-
-    cmdBuffer->batchBuffer.requiresCoherency = true;
-    cmdBuffer2->batchBuffer.requiresCoherency = false;
-
-    cmdBuffer->surfaces.push_back(&alloc1);
-    cmdBuffer2->surfaces.push_back(&alloc7);
-
-    submissionsAggregator.recordCommandBuffer(cmdBuffer);
-    submissionsAggregator.recordCommandBuffer(cmdBuffer2);
-
-    ResourcePackage resourcePackage;
-    size_t totalUsedSize = 0;
-    size_t totalMemoryBudget = 200;
-    submissionsAggregator.aggregateCommandBuffers(resourcePackage, totalUsedSize, totalMemoryBudget, 0u);
-    EXPECT_EQ(1u, totalUsedSize);
-    EXPECT_EQ(1u, resourcePackage.size());
-    EXPECT_NE(cmdBuffer->inspectionId, cmdBuffer2->inspectionId);
-    EXPECT_EQ(1u, cmdBuffer->inspectionId);
 }
 
 TEST(SubmissionsAggregator, givenCommandBuffersRequiringDifferentThrottleSettingWhenAggregateIsCalledThenTheyAreNotAgggregated) {
@@ -575,30 +550,40 @@ TEST(SubmissionsAggregator, givenCommandBuffersRequiringDifferentSliceCountSetti
 }
 
 struct SubmissionsAggregatorTests : public ::testing::Test {
-    void SetUp() override {
+    void SetUp() override {}
+    void TearDown() override {}
+
+    template <typename FamilyType>
+    void setUpT() {
+        debugManager.flags.EnableDirectSubmission.set(0);
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MockCsrHw2<FamilyType>>();
+
         device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+        device->device.disableSecondaryEngines = true;
         context.reset(new MockContext(device.get()));
+        auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
+        mockCsr->overrideDispatchPolicy(DispatchMode::batchedDispatch);
     }
 
-    void overrideCsr(CommandStreamReceiver *newCsr) {
-        device->resetCommandStreamReceiver(newCsr);
-        newCsr->overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    template <typename FamilyType>
+    void tearDownT() {
+        ::testing::Test::TearDown();
     }
 
     std::unique_ptr<MockClDevice> device;
     std::unique_ptr<MockContext> context;
+    DebugManagerStateRestore stateRestore;
 };
 
-HWTEST_F(SubmissionsAggregatorTests, givenMultipleQueuesWhenCmdBuffersAreRecordedThenAssignFlushStampObjFromCmdQueue) {
-    MockKernelWithInternals kernel(*device.get());
+HWTEST_TEMPLATED_F(SubmissionsAggregatorTests, givenMultipleQueuesWhenCmdBuffersAreRecordedThenAssignFlushStampObjFromCmdQueue) {
+    MockKernelWithInternals kernel(*context);
     CommandQueueHw<FamilyType> cmdQ1(context.get(), device.get(), 0, false);
     CommandQueueHw<FamilyType> cmdQ2(context.get(), device.get(), 0, false);
-    auto mockCsr = new MockCsrHw2<FamilyType>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
     mockCsr->useNewResourceImplicitFlush = false;
     mockCsr->useGpuIdleImplicitFlush = false;
     size_t gws = 1;
-
-    overrideCsr(mockCsr);
 
     auto expectRefCounts = [&](int32_t cmdQRef1, int32_t cmdQRef2) {
         EXPECT_EQ(cmdQRef1, cmdQ1.flushStamp->getStampReference()->getRefInternalCount());
@@ -624,15 +609,13 @@ HWTEST_F(SubmissionsAggregatorTests, givenMultipleQueuesWhenCmdBuffersAreRecorde
     expectRefCounts(1, 1);
 }
 
-HWTEST_F(SubmissionsAggregatorTests, givenCmdQueueWhenCmdBufferWithEventIsRecordedThenAssignFlushStampObjForEveryone) {
-    MockKernelWithInternals kernel(*device.get());
+HWTEST_TEMPLATED_F(SubmissionsAggregatorTests, givenCmdQueueWhenCmdBufferWithEventIsRecordedThenAssignFlushStampObjForEveryone) {
+    MockKernelWithInternals kernel(*context);
     CommandQueueHw<FamilyType> cmdQ1(context.get(), device.get(), 0, false);
-    auto mockCsr = new MockCsrHw2<FamilyType>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
     mockCsr->useNewResourceImplicitFlush = false;
     mockCsr->useGpuIdleImplicitFlush = false;
     size_t gws = 1;
-
-    overrideCsr(mockCsr);
 
     cl_event event1;
     EXPECT_EQ(1, cmdQ1.flushStamp->getStampReference()->getRefInternalCount());
@@ -651,16 +634,15 @@ HWTEST_F(SubmissionsAggregatorTests, givenCmdQueueWhenCmdBufferWithEventIsRecord
     EXPECT_EQ(1, cmdQ1.flushStamp->getStampReference()->getRefInternalCount());
 }
 
-HWTEST_F(SubmissionsAggregatorTests, givenMultipleCmdBuffersWhenFlushThenUpdateAllRelatedFlushStamps) {
-    MockKernelWithInternals kernel(*device.get());
+HWTEST_TEMPLATED_F(SubmissionsAggregatorTests, givenMultipleCmdBuffersWhenFlushThenUpdateAllRelatedFlushStamps) {
+    MockKernelWithInternals kernel(*context);
     CommandQueueHw<FamilyType> cmdQ1(context.get(), device.get(), 0, false);
     CommandQueueHw<FamilyType> cmdQ2(context.get(), device.get(), 0, false);
-    auto mockCsr = new MockCsrHw2<FamilyType>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
     mockCsr->useNewResourceImplicitFlush = false;
     mockCsr->useGpuIdleImplicitFlush = false;
     size_t gws = 1;
 
-    overrideCsr(mockCsr);
     mockCsr->taskCount = 5;
     mockCsr->flushStamp->setStamp(5);
 
@@ -680,14 +662,13 @@ HWTEST_F(SubmissionsAggregatorTests, givenMultipleCmdBuffersWhenFlushThenUpdateA
     castToObject<Event>(event2)->release();
 }
 
-HWTEST_F(SubmissionsAggregatorTests, givenMultipleCmdBuffersWhenNotAggregatedDuringFlushThenUpdateAllRelatedFlushStamps) {
-    MockKernelWithInternals kernel(*device.get());
+HWTEST_TEMPLATED_F(SubmissionsAggregatorTests, givenMultipleCmdBuffersWhenNotAggregatedDuringFlushThenUpdateAllRelatedFlushStamps) {
+    MockKernelWithInternals kernel(*context);
     CommandQueueHw<FamilyType> cmdQ1(context.get(), device.get(), 0, false);
     CommandQueueHw<FamilyType> cmdQ2(context.get(), device.get(), 0, false);
-    auto mockCsr = new MockCsrHw2<FamilyType>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
     size_t gws = 1;
 
-    overrideCsr(mockCsr);
     mockCsr->taskCount = 5;
     mockCsr->flushStamp->setStamp(5);
 
@@ -701,10 +682,13 @@ HWTEST_F(SubmissionsAggregatorTests, givenMultipleCmdBuffersWhenNotAggregatedDur
 
     mockCsr->flushBatchedSubmissions();
 
-    EXPECT_EQ(6u, cmdQ1.flushStamp->peekStamp());
-    EXPECT_EQ(6u, castToObject<Event>(event1)->flushStamp->peekStamp());
-    EXPECT_EQ(7u, cmdQ2.flushStamp->peekStamp());
-    EXPECT_EQ(7u, castToObject<Event>(event2)->flushStamp->peekStamp());
+    auto expectedCmdQ1Stamp = 6u;
+    auto expectedCmdQ2Stamp = 7u;
+
+    EXPECT_EQ(expectedCmdQ1Stamp, cmdQ1.flushStamp->peekStamp());
+    EXPECT_EQ(expectedCmdQ1Stamp, castToObject<Event>(event1)->flushStamp->peekStamp());
+    EXPECT_EQ(expectedCmdQ2Stamp, cmdQ2.flushStamp->peekStamp());
+    EXPECT_EQ(expectedCmdQ2Stamp, castToObject<Event>(event2)->flushStamp->peekStamp());
 
     castToObject<Event>(event1)->release();
     castToObject<Event>(event2)->release();

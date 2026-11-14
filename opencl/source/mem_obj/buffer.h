@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,12 @@
 
 #pragma once
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/memory_properties_flags.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
 #include "opencl/source/mem_obj/mem_obj.h"
 
-#include "igfxfmid.h"
-#include "memory_properties_flags.h"
+#include "neo_igfxfmid.h"
 
 #include <functional>
 
@@ -23,8 +23,10 @@ class ClDevice;
 class Device;
 class MemoryManager;
 struct EncodeSurfaceStateArgs;
+class GraphicsAllocation;
+class SharingHandler;
 
-using BufferCreateFunc = Buffer *(*)(Context *context,
+using BufferCreateFunc = Buffer *(*)(Context * context,
                                      const MemoryProperties &memoryProperties,
                                      cl_mem_flags flags,
                                      cl_mem_flags_intel flagsIntel,
@@ -40,7 +42,7 @@ struct BufferFactoryFuncs {
     BufferCreateFunc createBufferFunction;
 };
 
-extern BufferFactoryFuncs bufferFactory[IGFX_MAX_CORE];
+extern BufferFactoryFuncs bufferFactory[NEO::maxCoreEnumValue];
 
 namespace BufferFunctions {
 using ValidateInputAndCreateBufferFunc = std::function<cl_mem(cl_context context,
@@ -56,13 +58,14 @@ extern ValidateInputAndCreateBufferFunc validateInputAndCreateBuffer;
 class Buffer : public MemObj {
   public:
     struct AdditionalBufferCreateArgs {
-        bool doNotProvidePerformanceHints;
+        bool isAllocationForPool;
         bool makeAllocationLockable;
     };
-    constexpr static size_t maxBufferSizeForReadWriteOnCpu = 10 * MB;
-    constexpr static size_t maxBufferSizeForCopyOnCpu = 64 * KB;
+    constexpr static size_t maxBufferSizeForReadWriteOnCpu = 10 * MemoryConstants::megaByte;
+    constexpr static size_t maxBufferSizeForCopyOnCpu = 64 * MemoryConstants::kiloByte;
     constexpr static cl_ulong maskMagic = 0xFFFFFFFFFFFFFFFFLL;
     constexpr static cl_ulong objectMagic = MemObj::objectMagic | 0x02;
+    constexpr static uint8_t bufferTailFillPattern = 0xba;
     bool forceDisallowCPUCopy = false;
 
     ~Buffer() override;
@@ -149,17 +152,20 @@ class Buffer : public MemObj {
                                 GraphicsAllocation *gfxAlloc,
                                 cl_mem_flags flags,
                                 cl_mem_flags_intel flagsIntel,
-                                bool useGlobalAtomics,
                                 bool areMultipleSubDevicesInContext);
 
     static void provideCompressionHint(bool compressionEnabled, Context *context, Buffer *buffer);
+
+    static bool getExtendedTailRegion(size_t totalSize, size_t &origSize, size_t &extSize);
+
+    bool isTailPatternValid();
 
     BufferCreateFunc createFunction = nullptr;
     bool isSubBuffer();
     bool isValidSubBufferOffset(size_t offset);
     uint64_t setArgStateless(void *memory, uint32_t patchSize, uint32_t rootDeviceIndex, bool set32BitAddressing);
     virtual void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation,
-                                bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) = 0;
+                                bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) = 0;
     bool bufferRectPitchSet(const size_t *bufferOrigin,
                             const size_t *region,
                             size_t &bufferRowPitch,
@@ -208,7 +214,7 @@ class Buffer : public MemObj {
                             MemoryManager *memMngr,
                             uint32_t rootDeviceIndex,
                             bool forceCopyHostPtr);
-    static AllocationType getGraphicsAllocationTypeAndCompressionPreference(const MemoryProperties &properties, Context &context,
+    static AllocationType getGraphicsAllocationTypeAndCompressionPreference(const MemoryProperties &properties,
                                                                             bool &compressionEnabled, bool localMemoryEnabled);
     static bool isReadOnlyMemoryPermittedByFlags(const MemoryProperties &properties);
 
@@ -235,7 +241,7 @@ class BufferHw : public Buffer {
                  zeroCopy, isHostPtrSVM, isObjectRedescribed) {}
 
     void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation,
-                        bool isReadOnlyArgument, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) override;
+                        bool isReadOnlyArgument, const Device &device, bool areMultipleSubDevicesInContext) override;
 
     static Buffer *create(Context *context,
                           const MemoryProperties &memoryProperties,

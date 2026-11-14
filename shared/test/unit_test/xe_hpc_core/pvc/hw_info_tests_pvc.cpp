@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/source/unified_memory/usm_memory_support.h"
 #include "shared/source/xe_hpc_core/hw_cmds_pvc.h"
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
@@ -27,6 +28,7 @@ PVCTEST_F(PvcConfigHwInfoTests, givenPvcDeviceIdsAndRevisionsWhenCheckingConfigs
         hwInfo.platform.usDeviceID = deviceId;
         EXPECT_TRUE(PVC::isXl(hwInfo));
         EXPECT_FALSE(PVC::isXt(hwInfo));
+        EXPECT_FALSE(PVC::isXtVg(hwInfo));
 
         hwInfo.platform.usRevId = 0x0;
         EXPECT_TRUE(PVC::isXlA0(hwInfo));
@@ -45,6 +47,26 @@ PVCTEST_F(PvcConfigHwInfoTests, givenPvcDeviceIdsAndRevisionsWhenCheckingConfigs
         hwInfo.platform.usDeviceID = deviceId;
         EXPECT_FALSE(PVC::isXl(hwInfo));
         EXPECT_TRUE(PVC::isXt(hwInfo));
+        EXPECT_FALSE(PVC::isXtVg(hwInfo));
+
+        hwInfo.platform.usRevId = 0x0;
+        EXPECT_TRUE(PVC::isAtMostXtA0(hwInfo));
+
+        hwInfo.platform.usRevId = 0x1;
+        EXPECT_TRUE(PVC::isAtMostXtA0(hwInfo));
+
+        hwInfo.platform.usRevId = 0x3;
+        EXPECT_TRUE(PVC::isAtMostXtA0(hwInfo));
+
+        hwInfo.platform.usRevId = 0x5;
+        EXPECT_FALSE(PVC::isAtMostXtA0(hwInfo));
+    }
+
+    for (auto &deviceId : pvcXtVgDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        EXPECT_FALSE(PVC::isXl(hwInfo));
+        EXPECT_FALSE(PVC::isXt(hwInfo));
+        EXPECT_TRUE(PVC::isXtVg(hwInfo));
 
         hwInfo.platform.usRevId = 0x0;
         EXPECT_TRUE(PVC::isAtMostXtA0(hwInfo));
@@ -63,17 +85,10 @@ PVCTEST_F(PvcConfigHwInfoTests, givenPvcConfigWhenSetupHardwareInfoBaseThenGtSys
     HardwareInfo hwInfo = *defaultHwInfo;
     auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
-    PVC::setupHardwareInfoBase(&hwInfo, false, *compilerProductHelper);
+    PVC::setupHardwareInfoBase(&hwInfo, false);
 
-    EXPECT_EQ(128u, gtSystemInfo.MaxFillRate);
-    EXPECT_EQ(336u, gtSystemInfo.TotalVsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalHsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalDsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalGsThreads);
-    EXPECT_EQ(64u, gtSystemInfo.TotalPsThreadsWindowerRange);
-    EXPECT_EQ(8u, gtSystemInfo.CsrSizeInMb);
-    EXPECT_FALSE(gtSystemInfo.IsL3HashModeEnabled);
-    EXPECT_FALSE(gtSystemInfo.IsDynamicallyPopulated);
+    EXPECT_EQ(0u, gtSystemInfo.CsrSizeInMb);
+    EXPECT_TRUE(gtSystemInfo.IsDynamicallyPopulated);
 }
 
 PVCTEST_F(PvcConfigHwInfoTests, givenPvcConfigWhenSetupMultiTileInfoBaseThenGtSystemInfoIsCorrect) {
@@ -86,7 +101,7 @@ PVCTEST_F(PvcConfigHwInfoTests, givenPvcConfigWhenSetupMultiTileInfoBaseThenGtSy
     EXPECT_EQ(1u, gtSystemInfo.MultiTileArchInfo.TileCount);
     EXPECT_EQ(static_cast<uint8_t>(maxNBitValue(1u)), gtSystemInfo.MultiTileArchInfo.TileMask);
 
-    DebugManager.flags.CreateMultipleSubDevices.set(2);
+    debugManager.flags.CreateMultipleSubDevices.set(2);
     PVC::setupHardwareInfoMultiTileBase(&hwInfo, true);
     EXPECT_TRUE(gtSystemInfo.MultiTileArchInfo.IsValid);
     EXPECT_EQ(2u, gtSystemInfo.MultiTileArchInfo.TileCount);
@@ -97,7 +112,7 @@ PVCTEST_F(PvcConfigHwInfoTests, givenPvcHwConfigWhenSetupHardwareInfoThenSharedS
     HardwareInfo hwInfo = *defaultHwInfo;
     auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     auto &capabilityTable = hwInfo.capabilityTable;
-    PvcHwConfig::setupHardwareInfo(&hwInfo, false, *compilerProductHelper);
-    uint64_t expectedSharedSystemMemCapabilities = (UNIFIED_SHARED_MEMORY_ACCESS | UNIFIED_SHARED_MEMORY_CONCURRENT_ACCESS | UNIFIED_SHARED_MEMORY_CONCURRENT_ATOMIC_ACCESS);
+    PVC::setupHardwareInfoImpl(&hwInfo, false);
+    uint64_t expectedSharedSystemMemCapabilities = (UnifiedSharedMemoryFlags::access | UnifiedSharedMemoryFlags::atomicAccess | UnifiedSharedMemoryFlags::concurrentAccess | UnifiedSharedMemoryFlags::concurrentAtomicAccess);
     EXPECT_EQ(expectedSharedSystemMemCapabilities, capabilityTable.sharedSystemMemCapabilities);
 }

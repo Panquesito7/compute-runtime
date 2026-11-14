@@ -1,16 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/image_aub_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <tuple>
 
 using namespace NEO;
 
@@ -20,6 +26,7 @@ struct AUBCopyImage
       public ::testing::WithParamInterface<std::tuple<uint32_t, uint32_t>>,
       public ::testing::Test {
     void SetUp() override {
+        debugManager.flags.EnableFreeMemory.set(false);
         ImageAubFixture::setUp(enableBlitter);
     }
 
@@ -64,7 +71,7 @@ struct AUBCopyImage
         imageDesc.num_samples       = 0;
         imageDesc.mem_object = NULL;
         // clang-format on
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, pClDevice->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         auto retVal = CL_INVALID_VALUE;
         srcImage.reset(Image::create(
             context,
@@ -117,7 +124,7 @@ struct AUBCopyImage
         retVal = pCmdQ->enqueueReadImage(dstImage.get(), CL_FALSE, imgOrigin, imgRegion, 0, 0, dstOutMemory, nullptr, 0, nullptr, nullptr);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
-        retVal = pCmdQ->finish();
+        retVal = pCmdQ->finish(false);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
         // Offset the source memory
@@ -160,36 +167,36 @@ struct AUBCopyImage
 
         delete[] dstOutMemory;
     }
-
+    DebugManagerStateRestore restorer;
     std::unique_ptr<Image> srcImage;
     std::unique_ptr<Image> dstImage;
 };
 
 using AUBCopyImageCCS = AUBCopyImage<false>;
 
-HWTEST2_P(AUBCopyImageCCS, WhenCopyingThenExpectationsMet, ImagesSupportedMatcher) {
+HWTEST2_P(AUBCopyImageCCS, WhenCopyingThenExpectationsMet, ImageSupport) {
     runAubTest<FamilyType>();
 }
 
-INSTANTIATE_TEST_CASE_P(AUBCopyImage_simple,
-                        AUBCopyImageCCS,
-                        ::testing::Combine(
-                            ::testing::Values( // srcOffset
-                                0u, 1u, 2u),
-                            ::testing::Values( // dstOffset
-                                0u, 1u, 2u)));
+INSTANTIATE_TEST_SUITE_P(AUBCopyImage_simple,
+                         AUBCopyImageCCS,
+                         ::testing::Combine(
+                             ::testing::Values( // srcOffset
+                                 0u, 1u, 2u),
+                             ::testing::Values( // dstOffset
+                                 0u, 1u, 2u)));
 
 using AUBCopyImageBCS = AUBCopyImage<true>;
 
-HWTEST2_P(AUBCopyImageBCS, WhenCopyingWithBlitterEnabledThenExpectationsMet, ImagesSupportedMatcher) {
+HWTEST2_P(AUBCopyImageBCS, WhenCopyingWithBlitterEnabledThenExpectationsMet, ImageSupport) {
     runAubTest<FamilyType>();
-    ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::Blit);
+    ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::blit);
 }
 
-INSTANTIATE_TEST_CASE_P(AUBCopyImage_simple,
-                        AUBCopyImageBCS,
-                        ::testing::Combine(
-                            ::testing::Values( // srcOffset
-                                0u, 1u, 2u),
-                            ::testing::Values( // dstOffset
-                                0u, 1u, 2u)));
+INSTANTIATE_TEST_SUITE_P(AUBCopyImage_simple,
+                         AUBCopyImageBCS,
+                         ::testing::Combine(
+                             ::testing::Values( // srcOffset
+                                 0u, 1u, 2u),
+                             ::testing::Values( // dstOffset
+                                 0u, 1u, 2u)));

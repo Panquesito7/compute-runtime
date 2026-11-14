@@ -1,0 +1,106 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/unit_test/release_helpers/release_helper/release_helper_tests_base.h"
+
+#include "gtest/gtest.h"
+
+struct ReleaseHelperPtlHTests : public ReleaseHelperTests<30, 0> {
+
+    std::vector<uint32_t> getRevisions() override {
+        return {0, 4};
+    }
+};
+
+TEST_F(ReleaseHelperPtlHTests, whenGettingCapabilitiesThenCorrectPropertiesAreReturned) {
+    for (auto &revision : getRevisions()) {
+        ipVersion.revision = revision;
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+
+        EXPECT_FALSE(releaseHelper->isPipeControlPriorToNonPipelinedStateCommandsExtendedWARequired(*defaultHwInfo, false));
+        EXPECT_TRUE(releaseHelper->isResolvingSubDeviceIDNeeded());
+    }
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenGettingSupportedNumGrfsThenCorrectValuesAreReturned) {
+    whenGettingSupportedNumGrfsThenValuesUpTo256Returned();
+}
+
+TEST_F(ReleaseHelperPtlHTests, givenAppTransientPatOverrideWhenCheckingRequirementThenAlwaysReturnFalse) {
+    DebugManagerStateRestore restore;
+
+    for (const auto revision : getRevisions()) {
+        ipVersion.revision = revision;
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+
+        for (const auto overrideValue : {-1, 0, 1}) {
+            debugManager.flags.EnableOverrideToPat19ForSystemMemory.set(overrideValue);
+            EXPECT_FALSE(releaseHelper->isAppTransientCoherentPatRequired());
+        }
+    }
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenGettingThreadsPerEuConfigsThenCorrectValueIsReturnedBasedOnNumThreadPerEu) {
+    whenGettingThreadsPerEuConfigsThenCorrectValueIsReturnedBasedOnNumThreadPerEu();
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenGettingTotalMemBankSizeThenReturn32GB) {
+    whenGettingTotalMemBankSizeThenReturn32GB();
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenGettingPreferredSlmSizeThenAllEntriesHaveCorrectValues) {
+    for (auto &revision : getRevisions()) {
+        ipVersion.revision = revision;
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+
+        auto &preferredSlmValueArray = releaseHelper->getSizeToPreferredSlmValue();
+        EXPECT_EQ(0u, preferredSlmValueArray[0].upperLimit);
+        EXPECT_EQ(0u, preferredSlmValueArray[0].valueToProgram);
+
+        EXPECT_EQ(16 * MemoryConstants::kiloByte, preferredSlmValueArray[1].upperLimit);
+        EXPECT_EQ(1u, preferredSlmValueArray[1].valueToProgram);
+
+        EXPECT_EQ(32 * MemoryConstants::kiloByte, preferredSlmValueArray[2].upperLimit);
+        EXPECT_EQ(2u, preferredSlmValueArray[2].valueToProgram);
+
+        EXPECT_EQ(64 * MemoryConstants::kiloByte, preferredSlmValueArray[3].upperLimit);
+        EXPECT_EQ(3u, preferredSlmValueArray[3].valueToProgram);
+
+        EXPECT_EQ(96 * MemoryConstants::kiloByte, preferredSlmValueArray[4].upperLimit);
+        EXPECT_EQ(4u, preferredSlmValueArray[4].valueToProgram);
+
+        EXPECT_EQ(128 * MemoryConstants::kiloByte, preferredSlmValueArray[5].upperLimit);
+        EXPECT_EQ(5u, preferredSlmValueArray[5].valueToProgram);
+
+        EXPECT_EQ(160 * MemoryConstants::kiloByte, preferredSlmValueArray[6].upperLimit);
+        EXPECT_EQ(6u, preferredSlmValueArray[6].valueToProgram);
+
+        EXPECT_EQ(std::numeric_limits<uint32_t>::max(), preferredSlmValueArray[7].upperLimit);
+        EXPECT_EQ(7u, preferredSlmValueArray[7].valueToProgram);
+    }
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenCallingAdjustMaxThreadsPerEuCountThenCorrectValueIsReturned) {
+    whenCallingAdjustMaxThreadsPerEuCountThenCorrectValueIsReturned();
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenIsStateCacheInvalidationWaRequiredCalledThenTrueReturned) {
+    whenIsStateCacheInvalidationWaRequiredCalledThenTrueReturned();
+}
+
+TEST_F(ReleaseHelperPtlHTests, whenIsStateCacheInvalidationWaRequiredCalledWithDebugFlagSetThenCorrectValueReturned) {
+    whenIsStateCacheInvalidationWaRequiredCalledWithDebugFlagSetThenCorrectValueReturned();
+}

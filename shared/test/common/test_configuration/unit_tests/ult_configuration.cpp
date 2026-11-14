@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,23 @@
 
 #include "test_mode.h"
 
+bool threadsAllowed = false;
+
 namespace NEO {
-unsigned int ultIterationMaxTime = 45;
+#if defined(_WIN32)
+#if defined(_DEBUG)
+unsigned int ultIterationMaxTimeInS = 240;
+#else
+unsigned int ultIterationMaxTimeInS = 120;
+#endif
+#else
+#if defined(_DEBUG)
+unsigned int ultIterationMaxTimeInS = 90;
+#else
+unsigned int ultIterationMaxTimeInS = 45;
+#endif
+#endif
+unsigned int testCaseMaxTimeInMs = 16000;
 bool useMockGmm = true;
 const char *executionDirectorySuffix = "";
 const char *executionName = "ULT";

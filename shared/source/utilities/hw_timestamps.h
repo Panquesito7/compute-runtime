@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,25 +14,32 @@ namespace NEO {
 
 class HwTimeStamps : public TagTypeBase {
   public:
-    void initialize() {
-        globalStartTS = 0;
-        contextStartTS = 0;
-        globalEndTS = 0;
-        contextEndTS = 0;
-        globalCompleteTS = 0;
-        contextCompleteTS = 0;
+    using ValueT = uint64_t;
+
+    void initialize(uint64_t initValue) {
+        globalStartTS = initValue;
+        contextStartTS = initValue;
+        globalEndTS = initValue;
+        contextEndTS = initValue;
+        globalCompleteTS = initValue;
+        contextCompleteTS = initValue;
     }
 
     static constexpr AllocationType getAllocationType() {
-        return AllocationType::PROFILING_TAG_BUFFER;
+        return AllocationType::profilingTagBuffer;
     }
 
-    static constexpr TagNodeType getTagNodeType() { return TagNodeType::HwTimeStamps; }
+    static constexpr TagNodeType getTagNodeType() { return TagNodeType::hwTimeStamps; }
 
     uint64_t getContextStartValue(uint32_t) const { return contextStartTS; }
     uint64_t getGlobalStartValue(uint32_t) const { return globalStartTS; }
     uint64_t getContextEndValue(uint32_t) const { return contextEndTS; }
     uint64_t getGlobalEndValue(uint32_t) const { return globalEndTS; }
+
+    void getGlobalTimestampValues(uint32_t, uint64_t &globalStart, uint64_t &globalEnd) const {
+        globalStart = globalStartTS;
+        globalEnd = globalEndTS;
+    }
 
     uint64_t globalStartTS;
     uint64_t contextStartTS;

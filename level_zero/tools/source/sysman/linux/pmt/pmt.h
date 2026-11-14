@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,17 +9,20 @@
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
 
-#include "level_zero/core/source/device/device.h"
-#include "level_zero/tools/source/sysman/linux/fs_access.h"
+#include <level_zero/zes_api.h>
+
+#include "neo_igfxfmid.h"
 
 #include <fcntl.h>
 #include <map>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <vector>
 
 namespace L0 {
+class FsAccess;
 
-class PlatformMonitoringTech : NEO::NonCopyableOrMovableClass {
+class PlatformMonitoringTech : NEO::NonCopyableAndNonMovableClass {
   public:
     PlatformMonitoringTech() = delete;
     PlatformMonitoringTech(FsAccess *pFsAccess, ze_bool_t onSubdevice, uint32_t subdeviceId);
@@ -27,6 +30,7 @@ class PlatformMonitoringTech : NEO::NonCopyableOrMovableClass {
 
     virtual ze_result_t readValue(const std::string key, uint32_t &value);
     virtual ze_result_t readValue(const std::string key, uint64_t &value);
+    std::string getGuid();
     static ze_result_t enumerateRootTelemIndex(FsAccess *pFsAccess, std::string &gpuUpstreamPortPath);
     static void create(const std::vector<ze_device_handle_t> &deviceHandles,
                        FsAccess *pFsAccess, std::string &gpuUpstreamPortPath,
@@ -37,11 +41,10 @@ class PlatformMonitoringTech : NEO::NonCopyableOrMovableClass {
     static uint32_t rootDeviceTelemNodeIndex;
     std::string telemetryDeviceEntry{};
     std::map<std::string, uint64_t> keyOffsetMap;
+    std::string guid;
     ze_result_t init(FsAccess *pFsAccess, const std::string &gpuUpstreamPortPath, PRODUCT_FAMILY productFamily);
     static void doInitPmtObject(FsAccess *pFsAccess, uint32_t subdeviceId, PlatformMonitoringTech *pPmt, const std::string &gpuUpstreamPortPath,
                                 std::map<uint32_t, L0::PlatformMonitoringTech *> &mapOfSubDeviceIdToPmtObject, PRODUCT_FAMILY productFamily);
-    decltype(&NEO::SysCalls::open) openFunction = NEO::SysCalls::open;
-    decltype(&NEO::SysCalls::close) closeFunction = NEO::SysCalls::close;
     decltype(&NEO::SysCalls::pread) preadFunction = NEO::SysCalls::pread;
 
   private:

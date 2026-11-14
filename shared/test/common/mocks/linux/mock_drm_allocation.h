@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -29,12 +29,20 @@ class MockBufferObject : public BufferObject {
     using BufferObject::bindExtHandles;
     using BufferObject::bindInfo;
     using BufferObject::BufferObject;
+    using BufferObject::gpuAddress;
     using BufferObject::handle;
+    using BufferObject::isaDebugDataHandle;
+    using BufferObject::resourceClass;
+    using BufferObject::size;
 
     struct ExecParams {
         uint64_t completionGpuAddress = 0;
         TaskCountType completionValue = 0;
     };
+
+    void setSize(size_t mockSize) {
+        size = mockSize;
+    }
 
     std::optional<int> execReturnValue;
     std::vector<ExecParams> passedExecParams{};
@@ -49,22 +57,34 @@ class MockBufferObject : public BufferObject {
         return BufferObject::exec(used, startOffset, flags, requiresCoherency, osContext, vmHandleId, drmContextId,
                                   residency, residencyCount, execObjectsStorage, completionGpuAddress, completionValue);
     }
+
+    int unbind(OsContext *osContext, uint32_t vmHandleId) override {
+        errno = 0;
+        if (unbindErrno != 0) {
+            errno = unbindErrno;
+            return -1;
+        }
+        return BufferObject::unbind(osContext, vmHandleId);
+    }
+
+    int unbindErrno = 0;
 };
 
 class MockDrmAllocation : public DrmAllocation {
   public:
     using DrmAllocation::bufferObjects;
-    using DrmAllocation::enabledMemAdviseFlags;
     using DrmAllocation::memoryPool;
+    using DrmAllocation::memoryToUnmap;
     using DrmAllocation::registeredBoBindHandles;
 
     MockDrmAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, MemoryPool pool)
-        : DrmAllocation(rootDeviceIndex, allocationType, nullptr, nullptr, 0, static_cast<size_t>(0), pool) {
+        : DrmAllocation(rootDeviceIndex, 1u /*num gmms*/, allocationType, nullptr, nullptr, 0, static_cast<size_t>(0), pool) {
     }
 
     MockDrmAllocation(AllocationType allocationType, MemoryPool pool, BufferObjects &bos)
         : DrmAllocation(0, 0, allocationType, bos, nullptr, 0, static_cast<size_t>(0), pool) {
     }
+    ~MockDrmAllocation() override;
 
     void registerBOBindExtHandle(Drm *drm) override {
         registerBOBindExtHandleCalled = true;
@@ -76,9 +96,9 @@ class MockDrmAllocation : public DrmAllocation {
         DrmAllocation::markForCapture();
     }
 
-    int bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind) override {
+    int bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence) override {
         bindBOsCalled = true;
-        DrmAllocation::bindBOs(osContext, vmHandleId, bufferObjects, bind);
+        DrmAllocation::bindBOs(osContext, vmHandleId, bufferObjects, bind, forcePagingFence);
         return bindBOsRetValue;
     }
 
@@ -89,7 +109,7 @@ class MockDrmAllocation : public DrmAllocation {
         return DrmAllocation::prefetchBO(bo, vmHandleId, subDeviceId);
     }
 
-    ADDMETHOD_NOBASE(makeBOsResident, int, 0, (OsContext * osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind));
+    ADDMETHOD_NOBASE(makeBOsResident, int, 0, (OsContext * osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence));
 
     bool registerBOBindExtHandleCalled = false;
     bool markedForCapture = false;

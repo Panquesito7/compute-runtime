@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,31 +15,23 @@ inline bool GfxCoreHelperHw<GfxFamily>::isFusedEuDispatchEnabled(const HardwareI
     auto fusedEuDispatchEnabled = !hwInfo.workaroundTable.flags.waDisableFusedThreadScheduling;
     fusedEuDispatchEnabled &= hwInfo.capabilityTable.fusedEuEnabled;
 
-    if (DebugManager.flags.CFEFusedEUDispatch.get() != -1) {
-        fusedEuDispatchEnabled = (DebugManager.flags.CFEFusedEUDispatch.get() == 0);
+    if (debugManager.flags.CFEFusedEUDispatch.get() != -1) {
+        fusedEuDispatchEnabled = (debugManager.flags.CFEFusedEUDispatch.get() == 0);
     }
     return fusedEuDispatchEnabled;
 }
 
 template <typename GfxFamily>
-void LriHelper<GfxFamily>::program(LinearStream *cmdStream, uint32_t address, uint32_t value, bool remap) {
+void *LriHelper<GfxFamily>::program(MI_LOAD_REGISTER_IMM *lriCmd, uint32_t address, uint32_t value, bool remap, bool isBcs) {
     MI_LOAD_REGISTER_IMM cmd = Family::cmdInitLoadRegisterImm;
+    address += (isBcs && remap) ? RegisterOffsets::bcs0Base : 0x0;
     cmd.setRegisterOffset(address);
     cmd.setDataDword(value);
     cmd.setMmioRemapEnable(remap);
 
-    auto lri = cmdStream->getSpaceForCmd<MI_LOAD_REGISTER_IMM>();
-    *lri = cmd;
-}
+    *lriCmd = cmd;
 
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::packedFormatsSupported() const {
-    return true;
-}
-
-template <typename GfxFamily>
-size_t GfxCoreHelperHw<GfxFamily>::getMaxFillPaternSizeForCopyEngine() const {
-    return 4 * sizeof(uint32_t);
+    return lriCmd;
 }
 
 } // namespace NEO

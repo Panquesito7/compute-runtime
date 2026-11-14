@@ -1,14 +1,14 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/constants.h"
-#include "shared/source/os_interface/os_library.h"
 #include "shared/source/xe_hpc_core/hw_cmds_pvc.h"
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/xe_hpc_core/pvc/product_configs_pvc.h"
 
@@ -16,14 +16,14 @@
 #include "opencl/test/unit_test/offline_compiler/ocloc_product_config_tests.h"
 
 namespace NEO {
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     OclocProductConfigPvcTestsValues,
     OclocProductConfigTests,
     ::testing::Combine(
         ::testing::ValuesIn(AOT_PVC::productConfigs),
         ::testing::Values(IGFX_PVC)));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     OclocFatbinaryPvcTests,
     OclocFatbinaryPerProductTests,
     ::testing::Combine(
@@ -50,9 +50,10 @@ PVCTEST_F(PvcOfflineCompilerTests, givenPvcDeviceAndRevisionIdValueWhenInitHwInf
         deviceIDStr << "0x" << std::hex << deviceID;
         deviceStr = mockOfflineCompiler.argHelper->productConfigHelper->getAcronymForProductConfig(config.value);
 
-        testing::internal::CaptureStdout();
+        StreamCapture capture;
+        capture.captureStdout();
         mockOfflineCompiler.initHardwareInfo(deviceIDStr.str());
-        std::string output = testing::internal::GetCapturedStdout();
+        std::string output = capture.getCapturedStdout();
         expectedOutput << "Auto-detected target based on " << deviceIDStr.str() << " device id: " << deviceStr << "\n";
 
         EXPECT_STREQ(output.c_str(), expectedOutput.str().c_str());
@@ -60,6 +61,33 @@ PVCTEST_F(PvcOfflineCompilerTests, givenPvcDeviceAndRevisionIdValueWhenInitHwInf
         EXPECT_EQ(mockOfflineCompiler.hwInfo.platform.usRevId, revisionID);
         EXPECT_EQ(mockOfflineCompiler.deviceConfig, config.value);
     }
+}
+
+PVCTEST_F(PvcOfflineCompilerTests, givenPvcXtVgDeviceAndRevisionIdValueWhenInitHwInfoThenCorrectValuesAreSet) {
+    MockOfflineCompiler mockOfflineCompiler;
+
+    std::string deviceStr;
+    auto deviceID = pvcXtVgDeviceIds.front();
+
+    HardwareIpVersion config = AOT::PVC_XT_C0_VG;
+    int revisionID = 0x2f;
+
+    std::stringstream deviceIDStr, expectedOutput;
+    mockOfflineCompiler.revisionId = revisionID;
+
+    deviceIDStr << "0x" << std::hex << deviceID;
+    deviceStr = mockOfflineCompiler.argHelper->productConfigHelper->getAcronymForProductConfig(config.value);
+
+    StreamCapture capture;
+    capture.captureStdout();
+    mockOfflineCompiler.initHardwareInfo(deviceIDStr.str());
+    std::string output = capture.getCapturedStdout();
+    expectedOutput << "Auto-detected target based on " << deviceIDStr.str() << " device id: " << deviceStr << "\n";
+
+    EXPECT_STREQ(output.c_str(), expectedOutput.str().c_str());
+    EXPECT_EQ(mockOfflineCompiler.hwInfo.platform.usDeviceID, deviceID);
+    EXPECT_EQ(mockOfflineCompiler.hwInfo.platform.usRevId, revisionID);
+    EXPECT_EQ(mockOfflineCompiler.deviceConfig, config.value);
 }
 
 PVCTEST_F(PvcOfflineCompilerTests, givenPvcXtDeviceAndUnknownRevisionIdValueWhenInitHwInfoThenDefaultConfigIsSet) {

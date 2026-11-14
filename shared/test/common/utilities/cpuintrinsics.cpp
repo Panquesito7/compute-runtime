@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,19 +13,38 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <thread>
 
 namespace CpuIntrinsicsTests {
 // std::atomic is used for sake of sanitation in MT tests
 std::atomic<uintptr_t> lastClFlushedPtr(0u);
 std::atomic<uint32_t> clFlushCounter(0u);
 std::atomic<uint32_t> pauseCounter(0u);
+std::atomic<uint32_t> yieldCounter(0u);
 std::atomic<uint32_t> sfenceCounter(0u);
+std::atomic<uint32_t> mfenceCounter(0u);
+
+std::atomic<uint64_t> lastUmwaitCounter(0u);
+std::atomic<unsigned int> lastUmwaitControl(0u);
+std::atomic<uint32_t> umwaitCounter(0u);
+
+std::atomic<uintptr_t> lastUmonitorPtr(0u);
+std::atomic<uint32_t> umonitorCounter(0u);
+
+std::atomic<uint32_t> rdtscCounter(0u);
+
+std::atomic_uint32_t tpauseCounter{};
+std::atomic<uint64_t> lastTpauseCounter(0u);
 
 volatile TagAddressType *pauseAddress = nullptr;
 TaskCountType pauseValue = 0u;
 uint32_t pauseOffset = 0u;
+uint64_t rdtscRetValue = 0;
+unsigned char umwaitRetValue = 0;
 
 std::function<void()> setupPauseAddress;
+std::function<void()> controlUmwait;
+std::function<void()> controlTpause;
 } // namespace CpuIntrinsicsTests
 
 namespace NEO {
@@ -36,8 +55,16 @@ void clFlush(void const *ptr) {
     CpuIntrinsicsTests::lastClFlushedPtr = reinterpret_cast<uintptr_t>(ptr);
 }
 
+void clFlushOpt(void *ptr) {
+    clFlush(ptr);
+}
+
 void sfence() {
     CpuIntrinsicsTests::sfenceCounter++;
+}
+
+void mfence() {
+    CpuIntrinsicsTests::mfenceCounter++;
 }
 
 void pause() {
@@ -50,6 +77,44 @@ void pause() {
             CpuIntrinsicsTests::pauseAddress = ptrOffset(CpuIntrinsicsTests::pauseAddress, CpuIntrinsicsTests::pauseOffset);
         }
     }
+}
+
+void yield() {
+    CpuIntrinsicsTests::yieldCounter++;
+    // Counted AND performed: a ULT wait loop polls a tag that another thread writes, so dropping
+    // the real sched_yield() here would leave it spinning hot against the thread it waits for.
+    std::this_thread::yield();
+}
+
+uint8_t tpause(uint32_t control, uint64_t counter) {
+    CpuIntrinsicsTests::tpauseCounter++;
+    CpuIntrinsicsTests::lastTpauseCounter = counter;
+    if (CpuIntrinsicsTests::controlTpause) {
+        CpuIntrinsicsTests::controlTpause();
+    }
+    return 0;
+}
+
+unsigned char umwait(unsigned int ctrl, uint64_t counter) {
+    CpuIntrinsicsTests::lastUmwaitControl = ctrl;
+    CpuIntrinsicsTests::lastUmwaitCounter = counter;
+    CpuIntrinsicsTests::umwaitCounter++;
+    if (CpuIntrinsicsTests::controlUmwait) {
+        CpuIntrinsicsTests::controlUmwait();
+        return CpuIntrinsicsTests::umwaitRetValue;
+    } else {
+        return CpuIntrinsicsTests::umwaitRetValue;
+    }
+}
+
+void umonitor(void *a) {
+    CpuIntrinsicsTests::lastUmonitorPtr = reinterpret_cast<uintptr_t>(a);
+    CpuIntrinsicsTests::umonitorCounter++;
+}
+
+uint64_t rdtsc() {
+    CpuIntrinsicsTests::rdtscCounter++;
+    return CpuIntrinsicsTests::rdtscRetValue;
 }
 
 } // namespace CpuIntrinsics

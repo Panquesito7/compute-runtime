@@ -1,13 +1,17 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/os_interface/os_library.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
 #include "shared/test/common/mock_gdi/mock_gdi.h"
+
+#include <memory>
+#include <string>
 
 namespace NEO {
 
@@ -16,7 +20,7 @@ class MockGdi : public Gdi {
     MockGdi() {
         initialized = MockGdi::getAllProcAddresses();
     }
-    ~MockGdi() override{};
+    ~MockGdi() override {};
 
     static const D3DKMT_HANDLE adapterHandleForHdc = 0x1233;
     static UINT64 pagingFenceReturnValue;
@@ -63,7 +67,7 @@ class MockGdi : public Gdi {
 
     static NTSTATUS __stdcall destroyAllocation2Mock(IN CONST D3DKMT_DESTROYALLOCATION2 *arg) {
         getDestroyArg() = *arg;
-        return 0;
+        return mockD3DKMTDestroyAllocation2(arg);
     }
 
     static NTSTATUS __stdcall waitFromCpuMock(IN CONST D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU *arg) {
@@ -108,6 +112,10 @@ class MockGdi : public Gdi {
         queryResourceInfo = reinterpret_cast<PFND3DKMT_QUERYRESOURCEINFO>(queryResourceInfoMock);
         openResource = reinterpret_cast<PFND3DKMT_OPENRESOURCE>(openResourceMock);
         return true;
+    }
+
+    void hideProcAddress(const std::string &procName) {
+        gdiDll = std::make_unique<OsLibraryWithHiddenProc>(std::move(gdiDll), procName);
     }
 
     static D3DDDI_MAKERESIDENT &getMakeResidentArg() {
@@ -164,6 +172,23 @@ class MockGdi : public Gdi {
         static D3DKMT_OPENRESOURCE openResource;
         return openResource;
     }
+
+  protected:
+    class OsLibraryWithHiddenProc : public OsLibrary {
+      public:
+        OsLibraryWithHiddenProc(std::unique_ptr<OsLibrary> library, const std::string &hiddenProcName)
+            : library(std::move(library)), hiddenProcName(hiddenProcName) {}
+
+        void *getProcAddress(const std::string &procName) override {
+            return procName == hiddenProcName ? nullptr : library->getProcAddress(procName);
+        }
+        bool isLoaded() override { return library->isLoaded(); }
+        std::string getFullPath() override { return library->getFullPath(); }
+
+      protected:
+        std::unique_ptr<OsLibrary> library;
+        std::string hiddenProcName;
+    };
 };
 
 } // namespace NEO

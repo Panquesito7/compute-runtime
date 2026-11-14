@@ -1,20 +1,25 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/linear_stream.h"
 #include "shared/source/helpers/cache_flush_xehp_and_later.inl"
 #include "shared/source/helpers/l3_range.h"
 #include "shared/source/xe_hpg_core/hw_cmds.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "level_zero/core/source/xe_hpg_core/cmdlist_xe_hpg_core.h"
+#include "level_zero/core/source/cmdlist/cmdlist_hw.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+
+using namespace NEO;
 
 namespace L0 {
 namespace ult {
@@ -22,11 +27,10 @@ namespace ult {
 using CacheFlushDG2Tests = Test<DeviceFixture>;
 
 HWTEST2_F(CacheFlushDG2Tests, givenCommandStreamWithSingleL3RangeAndNonZeroPostSyncAddressWhenFlushGpuCacheIsCalledThenPostSyncOperationIsSetForL3ControlAndUnTypedDataPortCacheFlushIsSet, IsDG2) {
-    using GfxFamily = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using L3_CONTROL = typename GfxFamily::L3_CONTROL;
+    using L3_CONTROL = typename FamilyType::L3_CONTROL;
     auto &hardwareInfo = this->neoDevice->getHardwareInfo();
-    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    commandList->initialize(device, NEO::EngineGroupType::Copy, 0u);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    commandList->initialize(device, NEO::EngineGroupType::copy, 0u);
     LinearStream *cmdStream = commandList->commandContainer.getCommandStream();
     uint64_t gpuAddress = 0x1200;
     void *buffer = reinterpret_cast<void *>(gpuAddress);
@@ -42,13 +46,13 @@ HWTEST2_F(CacheFlushDG2Tests, givenCommandStreamWithSingleL3RangeAndNonZeroPostS
     L3RangesVec ranges;
     ranges.push_back(L3Range::fromAddressSizeWithPolicy(
         gpuAddress, size,
-        GfxFamily::L3_FLUSH_ADDRESS_RANGE::
+        FamilyType::L3_FLUSH_ADDRESS_RANGE::
             L3_FLUSH_EVICTION_POLICY_FLUSH_L3_WITH_EVICTION));
-    NEO::flushGpuCache<GfxFamily>(cmdStream, ranges, postSyncAddress,
-                                  hardwareInfo);
+    NEO::flushGpuCache<FamilyType>(cmdStream, ranges, postSyncAddress,
+                                   hardwareInfo);
 
     GenCmdList cmdList;
-    EXPECT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    EXPECT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(cmdStream->getCpuBase(), 0), cmdStream->getUsed()));
     auto itor = find<L3_CONTROL *>(cmdList.begin(), cmdList.end());
     ASSERT_NE(cmdList.end(), itor);

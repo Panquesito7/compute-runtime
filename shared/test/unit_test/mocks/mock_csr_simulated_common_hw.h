@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -21,15 +21,18 @@ class MockSimulatedCsrHw : public CommandStreamReceiverSimulatedHw<GfxFamily> {
     using CommandStreamReceiverSimulatedHw<GfxFamily>::writeMemory;
     void writeMemory(uint64_t gpuAddress, void *cpuAddress, size_t size, uint32_t memoryBank, uint64_t entryBits) override {
     }
-    void pollForCompletion() override {
+    void pollForCompletion(bool skipTaskCountCheck) override {
     }
     void initializeEngine() override {
+        if (aubManager) {
+            hardwareContextController->createHardwareContexts(*aubManager);
+        }
     }
     bool writeMemory(GraphicsAllocation &gfxAllocation) override {
         return true;
     }
-    void writeMemoryWithAubManager(GraphicsAllocation &graphicsAllocation) override {
-        CommandStreamReceiverSimulatedHw<GfxFamily>::writeMemoryWithAubManager(graphicsAllocation);
+    void writeMemoryWithAubManager(GraphicsAllocation &graphicsAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) const override {
+        CommandStreamReceiverSimulatedHw<GfxFamily>::writeMemoryWithAubManager(graphicsAllocation, isChunkCopy, gpuVaChunkOffset, chunkSize);
     }
     void writeMMIO(uint32_t offset, uint32_t value) override {}
     bool isMultiOsContextCapable() const override {

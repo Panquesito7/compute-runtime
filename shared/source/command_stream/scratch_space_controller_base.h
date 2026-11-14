@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,37 +14,39 @@ class ScratchSpaceControllerBase : public ScratchSpaceController {
   public:
     ScratchSpaceControllerBase(uint32_t rootDeviceIndex, ExecutionEnvironment &environment, InternalAllocationStorage &allocationStorage);
 
-    void setRequiredScratchSpace(void *sshBaseAddress,
+    bool setRequiredScratchSpace(void *sshBaseAddress,
                                  uint32_t scratchSlot,
-                                 uint32_t requiredPerThreadScratchSize,
-                                 uint32_t requiredPerThreadPrivateScratchSize,
-                                 TaskCountType currentTaskCount,
+                                 uint32_t requiredPerThreadScratchSizeSlot0,
+                                 uint32_t requiredPerThreadScratchSizeSlot1,
                                  OsContext &osContext,
                                  bool &stateBaseAddressDirty,
                                  bool &vfeStateDirty) override;
 
+    bool reserveScratchSpace(uint32_t requiredPerThreadScratchSizeSlot0,
+                             uint32_t requiredPerThreadScratchSizeSlot1,
+                             OsContext &osContext) override;
+
     uint64_t calculateNewGSH() override;
     uint64_t getScratchPatchAddress() override;
 
+    size_t getReservedSshSize() const override;
     void reserveHeap(IndirectHeap::Type heapType, IndirectHeap *&indirectHeap) override;
-    void programHeaps(HeapContainer &heapContainer,
+    bool programHeaps(HeapContainer &heapContainer,
                       uint32_t scratchSlot,
-                      uint32_t requiredPerThreadScratchSize,
-                      uint32_t requiredPerThreadPrivateScratchSize,
-                      TaskCountType currentTaskCount,
+                      uint32_t requiredPerThreadScratchSizeSlot0,
+                      uint32_t requiredPerThreadScratchSizeSlot1,
                       OsContext &osContext,
                       bool &stateBaseAddressDirty,
                       bool &vfeStateDirty) override;
     void programBindlessSurfaceStateForScratch(BindlessHeapsHelper *heapsHelper,
-                                               uint32_t requiredPerThreadScratchSize,
-                                               uint32_t requiredPerThreadPrivateScratchSize,
-                                               TaskCountType currentTaskCount,
+                                               uint32_t requiredPerThreadScratchSizeSlot0,
+                                               uint32_t requiredPerThreadScratchSizeSlot1,
                                                OsContext &osContext,
                                                bool &stateBaseAddressDirty,
                                                bool &vfeStateDirty,
                                                NEO::CommandStreamReceiver *csr) override;
 
   protected:
-    void createScratchSpaceAllocation();
+    GraphicsAllocation *createScratchSpaceAllocation(size_t scratchSizeInBytes);
 };
 } // namespace NEO

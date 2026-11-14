@@ -53,6 +53,9 @@ class Timer::TimerImpl {
     }
 
     TimerImpl &operator=(const TimerImpl &t) {
+        if (this == &t) {
+            return *this;
+        }
         startTime = t.startTime;
         return *this;
     }
@@ -70,7 +73,7 @@ class Timer::TimerImpl {
 };
 
 LARGE_INTEGER Timer::TimerImpl::mFrequency = {
-    {{0}},
+    {},
 };
 
 Timer::Timer() {

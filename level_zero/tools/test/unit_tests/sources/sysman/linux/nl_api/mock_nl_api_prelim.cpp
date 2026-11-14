@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,8 @@
 #include "mock_nl_api_prelim.h"
 
 #include "level_zero/tools/source/sysman/linux/nl_api/iaf_nl_api.h"
+
+#include "gtest/gtest.h"
 
 namespace L0 {
 namespace ult {
@@ -104,8 +106,8 @@ int MockNlApi::genlHandleMsg(struct nl_msg *msg, void *arg) {
     MyNlattr *head = new MyNlattr;
     MyNlattr *next = head;
 
-    info.attrs = new struct nlattr *[pOps->o_cmds[cmdIndex].c_maxattr];
-    for (auto i = 0; i < pOps->o_cmds[cmdIndex].c_maxattr; i++) {
+    info.attrs = new struct nlattr *[_IAF_ATTR_COUNT];
+    for (auto i = 0; i < _IAF_ATTR_COUNT; i++) {
         info.attrs[i] = nullptr;
     }
     next = addDefaultAttribs(info, next);
@@ -183,6 +185,22 @@ int MockNlApi::genlHandleMsg(struct nl_msg *msg, void *arg) {
         if (true == addRxTxCounters) {
             next = addAttrib(info, next, IAF_ATTR_FPORT_TX_BYTES, txCounter);
             addAttrib(info, next, IAF_ATTR_FPORT_RX_BYTES, rxCounter);
+        }
+        break;
+    case IAF_CMD_OP_FPORT_THROUGHPUT:
+        validateId(false, false, false);
+
+        if (true == addRxTxCounters) {
+            for (auto i = 0U; i < testMultiPortThroughputCount; i++) {
+                MyNlattr *nested = new MyNlattr;
+                MyNlattr *nextNested = nested;
+                nextNested = addAttrib(info, nextNested, IAF_ATTR_FPORT_TX_BYTES, txCounter);
+                nextNested = addAttrib(info, nextNested, IAF_ATTR_FPORT_RX_BYTES, rxCounter);
+                nextNested = addAttrib(info, nextNested, IAF_ATTR_FABRIC_ID, testPortId.fabricId);
+                nextNested = addAttrib(info, nextNested, IAF_ATTR_SD_INDEX, testPortId.attachId);
+                addAttrib(info, nextNested, IAF_ATTR_FABRIC_PORT_NUMBER, testPortId.portNumber + i);
+                next = addNested(info, next, IAF_ATTR_FABRIC_PORT_THROUGHPUT, nested);
+            }
         }
         break;
     case IAF_CMD_OP_PORT_STATE_QUERY:
@@ -334,8 +352,9 @@ int MockNlApi::nlaIsNested(const struct nlattr *attr) {
 }
 
 int MockNlApi::nlaLen(const struct nlattr *attr) {
-    if (nullptr == attr)
+    if (nullptr == attr) {
         return 0;
+    }
     const MyNlattr *pAttr = reinterpret_cast<const MyNlattr *>(attr);
     return sizeof(MyNlattr) + nlaLen(reinterpret_cast<const struct nlattr *>(pAttr->next)) + nlaLen(reinterpret_cast<const struct nlattr *>(pAttr->nested));
 }
@@ -351,30 +370,38 @@ int MockNlApi::nlaOk(const struct nlattr *attr, int remaining) {
 }
 
 int MockNlApi::nlaPutU16(struct nl_msg *msg, int id, uint16_t data) {
-    EXPECT_EQ(attribs.end(), attribs.find(id));
+    if (!isNestedAttr) {
+        EXPECT_FALSE(attribs.contains(id));
+        attribs[id] = data;
+    }
     EXPECT_EQ(NLA_U16, pOps->o_cmds[cmdIndex].c_attr_policy[id].type);
-    attribs[id] = data;
     return 0;
 }
 
 int MockNlApi::nlaPutU32(struct nl_msg *msg, int id, uint32_t data) {
-    EXPECT_EQ(attribs.end(), attribs.find(id));
+    if (!isNestedAttr) {
+        EXPECT_FALSE(attribs.contains(id));
+        attribs[id] = data;
+    }
     EXPECT_EQ(NLA_U32, pOps->o_cmds[cmdIndex].c_attr_policy[id].type);
-    attribs[id] = data;
     return 0;
 }
 
 int MockNlApi::nlaPutU64(struct nl_msg *msg, int id, uint64_t data) {
-    EXPECT_EQ(attribs.end(), attribs.find(id));
+    if (!isNestedAttr) {
+        EXPECT_FALSE(attribs.contains(id));
+        attribs[id] = data;
+    }
     EXPECT_EQ(NLA_U64, pOps->o_cmds[cmdIndex].c_attr_policy[id].type);
-    attribs[id] = data;
     return 0;
 }
 
 int MockNlApi::nlaPutU8(struct nl_msg *msg, int id, uint8_t data) {
-    EXPECT_EQ(attribs.end(), attribs.find(id));
+    if (!isNestedAttr) {
+        EXPECT_FALSE(attribs.contains(id));
+        attribs[id] = data;
+    }
     EXPECT_EQ(NLA_U8, pOps->o_cmds[cmdIndex].c_attr_policy[id].type);
-    attribs[id] = data;
     return 0;
 }
 
@@ -399,6 +426,16 @@ struct nl_msg *MockNlApi::nlmsgAlloc() {
 
 struct nlattr *MockNlApi::nlmsgAttrdata(const struct nlmsghdr *hdr, int attr) {
     return reinterpret_cast<nlattr *>(const_cast<struct nlmsghdr *>(hdr));
+}
+
+struct nlattr *MockNlApi::nlaNestStart(struct nl_msg *msg, int id) {
+    isNestedAttr = true;
+    return reinterpret_cast<nlattr *>(msg);
+}
+
+int MockNlApi::nlaNestEnd(struct nl_msg *msg, struct nlattr *attr) {
+    isNestedAttr = false;
+    return 0;
 }
 
 int MockNlApi::nlmsgAttrlen(const struct nlmsghdr *hdr, int attr) {

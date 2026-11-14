@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,12 +19,12 @@
 using DeviceTest = Test<DeviceFixture>;
 
 TEST_F(DeviceTest, GivenDeviceWhenGetAdapterLuidThenLuidIsSet) {
-    std::array<uint8_t, ProductHelper::luidSize> luid, expectedLuid;
+    std::array<uint8_t, CommonConstants::luidSize> luid, expectedLuid;
     pDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new NEO::OSInterface);
     auto mockWddm = new WddmMock(*pDevice->executionEnvironment->rootDeviceEnvironments[0]);
     pDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mockWddm));
 
-    memcpy_s(expectedLuid.data(), ProductHelper::luidSize, &mockWddm->mockAdaperLuid, sizeof(LUID));
+    memcpy_s(expectedLuid.data(), CommonConstants::luidSize, &mockWddm->mockAdaperLuid, sizeof(LUID));
     pDevice->getAdapterLuid(luid);
 
     EXPECT_EQ(expectedLuid, luid);
@@ -75,7 +75,7 @@ TEST_F(MockOSTimeWinTest, whenCreatingTimerThenResolutionIsSetCorrectly) {
     std::unique_ptr<MockOSTimeWin> timeWin(new MockOSTimeWin(wddmMock));
 
     double res = 0.0;
-    res = timeWin->getDynamicDeviceTimerResolution(device->getHardwareInfo());
+    res = timeWin->getDynamicDeviceTimerResolution();
     EXPECT_EQ(res, 1e+06);
 }
 

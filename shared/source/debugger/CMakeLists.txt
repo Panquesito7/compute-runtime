@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2022 Intel Corporation
+# Copyright (C) 2020-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -11,8 +11,8 @@ set(NEO_CORE_DEBUGGER
     ${CMAKE_CURRENT_SOURCE_DIR}/debugger_l0.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/debugger_l0.h
     ${CMAKE_CURRENT_SOURCE_DIR}/debugger_l0.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/debugger_l0_base.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/debugger_l0_tgllp_and_later.inl
+    ${CMAKE_CURRENT_SOURCE_DIR}/state_save_area_header_v3.h
 )
 
 set_property(GLOBAL PROPERTY NEO_CORE_DEBUGGER ${NEO_CORE_DEBUGGER})

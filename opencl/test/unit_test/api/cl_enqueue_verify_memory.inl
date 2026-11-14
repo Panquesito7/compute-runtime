@@ -1,26 +1,26 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/mocks/mock_csr.h"
+#include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_os_context.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
+#include "opencl/source/api/api.h"
 #include "opencl/test/unit_test/api/cl_api_tests.h"
+
+#include "aubstream/hardware_context.h"
 
 using namespace NEO;
 
-namespace AubMemDump {
-#include "aub_services.h"
-}
-
 TEST(CheckVerifyMemoryRelatedApiConstants, givenVerifyMemoryRelatedApiConstantsWhenVerifyingTheirValueThenCorrectValuesAreReturned) {
-    EXPECT_EQ(AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareEqual, CL_MEM_COMPARE_EQUAL);
-    EXPECT_EQ(AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareNotEqual, CL_MEM_COMPARE_NOT_EQUAL);
+    EXPECT_EQ(aub_stream::CompareOperationValues::CompareEqual, CL_MEM_COMPARE_EQUAL);
+    EXPECT_EQ(aub_stream::CompareOperationValues::CompareNotEqual, CL_MEM_COMPARE_NOT_EQUAL);
 }
 
 struct ClEnqueueVerifyMemoryINTELSettings {
@@ -70,8 +70,8 @@ HWTEST_F(ClEnqueueVerifyMemoryIntelTests, givenActiveBcsEngineWhenCallingExpectM
     UltCommandStreamReceiver<FamilyType> ultCsrBcs0(*pDevice->getExecutionEnvironment(), pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     UltCommandStreamReceiver<FamilyType> ultCsrBcs1(*pDevice->getExecutionEnvironment(), pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
 
-    MockOsContext osContext0(0, {{aub_stream::ENGINE_BCS, EngineUsage::Regular}, 0, PreemptionMode::Disabled, false, false});
-    MockOsContext osContext1(1, {{aub_stream::ENGINE_BCS1, EngineUsage::Regular}, 0, PreemptionMode::Disabled, false, false});
+    MockOsContext osContext0(0, {{aub_stream::ENGINE_BCS, EngineUsage::regular}, 0, PreemptionMode::Disabled, false});
+    MockOsContext osContext1(1, {{aub_stream::ENGINE_BCS1, EngineUsage::regular}, 0, PreemptionMode::Disabled, false});
 
     EngineControl engineControl[2] = {{&ultCsrBcs0, &osContext0}, {&ultCsrBcs1, &osContext1}};
 

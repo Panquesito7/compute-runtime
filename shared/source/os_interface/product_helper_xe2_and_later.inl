@@ -1,0 +1,88 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/os_interface/product_helper_hw.h"
+
+namespace NEO {
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::useGemCreateExtInAllocateMemoryByKMD() const {
+    return true;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::deferMOCSToPatIndex(bool isWddmOnLinux) const {
+    return true;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::isCopyBufferRectSplitSupported() const {
+    return true;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+void ProductHelperHw<gfxProduct>::setRenderCompressedFlags(HardwareInfo &hwInfo) const {
+    hwInfo.capabilityTable.ftrRenderCompressedImages = hwInfo.featureTable.flags.ftrXe2Compression;
+    hwInfo.capabilityTable.ftrRenderCompressedBuffers = hwInfo.featureTable.flags.ftrXe2Compression;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::isCompressionForbidden(const HardwareInfo &hwInfo) const {
+    return isCompressionForbiddenCommon(false);
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::isVmBindDecompressionProbeAllowed(const HardwareInfo &hwInfo) const {
+    return hwInfo.featureTable.flags.ftrLocalMemory &&
+           hwInfo.featureTable.flags.ftrFlatPhysCCS;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::isResourceUncachedForCS(AllocationType allocationType) const {
+    return GraphicsAllocation::isAccessedFromCommandStreamer(allocationType);
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::isNonCoherentTimestampsModeEnabled() const {
+    if (debugManager.flags.ForceNonCoherentModeForTimestamps.get() != -1) {
+        return debugManager.flags.ForceNonCoherentModeForTimestamps.get();
+    }
+    return !this->isDcFlushAllowed();
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool ProductHelperHw<gfxProduct>::isDisableScratchPagesSupported() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDirectSubmissionSupported() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isResolveDependenciesByPipeControlsSupported() const {
+    if (debugManager.flags.ResolveDependenciesViaPipeControls.get() != -1) {
+        return debugManager.flags.ResolveDependenciesViaPipeControls.get() == 1;
+    }
+    return this->isDcFlushAllowed();
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isIpSamplingSupported(const HardwareInfo &hwInfo) const {
+    return true;
+}
+
+template <>
+uint32_t ProductHelperHw<gfxProduct>::getInternalHeapsPreallocated() const {
+    if (debugManager.flags.SetAmountOfInternalHeapsToPreallocate.get() != -1) {
+        return debugManager.flags.SetAmountOfInternalHeapsToPreallocate.get();
+    }
+    return 2u;
+}
+
+} // namespace NEO

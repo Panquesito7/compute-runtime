@@ -1,0 +1,29 @@
+#
+# Copyright (C) 2026 Intel Corporation
+#
+# SPDX-License-Identifier: MIT
+#
+
+set_property(GLOBAL APPEND PROPERTY LEO_TEST_SOURCES
+             ${CMAKE_CURRENT_SOURCE_DIR}/captured_api.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/capturing_command_list.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/capturing_command_list_args.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/capturing_context.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/command_list_create_hook.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/command_list_create_immediate_hook.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/fill_image_builtin_kernel_lib.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/leo_capture_fixture.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/leo_capture_fixture.cpp
+             ${CMAKE_CURRENT_SOURCE_DIR}/leo_event_callbacks_fixture.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/ocl_fixture.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/ocl_fixture.cpp
+)
+
+set_property(GLOBAL APPEND PROPERTY LEO_MT_TEST_SOURCES
+             ${CMAKE_CURRENT_SOURCE_DIR}/capturing_command_list.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/capturing_command_list_args.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/command_list_create_immediate_hook.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/leo_event_callbacks_fixture.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/ocl_fixture.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/ocl_fixture.cpp
+)

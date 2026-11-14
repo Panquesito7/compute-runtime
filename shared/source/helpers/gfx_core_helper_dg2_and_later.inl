@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,21 +12,19 @@
 namespace NEO {
 
 template <typename GfxFamily>
-inline void MemorySynchronizationCommands<GfxFamily>::setBarrierExtraProperties(void *barrierCmd, PipeControlArgs &args) {
-    auto &pipeControl = *reinterpret_cast<typename GfxFamily::PIPE_CONTROL *>(barrierCmd);
-
+inline void MemorySynchronizationCommands<GfxFamily>::setPipeControlExtraProperties(GfxFamily::PIPE_CONTROL &pipeControl, PipeControlArgs &args) {
     pipeControl.setHdcPipelineFlush(args.hdcPipelineFlush);
     pipeControl.setUnTypedDataPortCacheFlush(args.unTypedDataPortCacheFlush);
     pipeControl.setCompressionControlSurfaceCcsFlush(args.compressionControlSurfaceCcsFlush);
     pipeControl.setWorkloadPartitionIdOffsetEnable(args.workloadPartitionOffset);
     pipeControl.setAmfsFlushEnable(args.amfsFlushEnable);
 
-    if (DebugManager.flags.FlushAllCaches.get()) {
+    if (debugManager.flags.FlushAllCaches.get()) {
         pipeControl.setHdcPipelineFlush(true);
         pipeControl.setUnTypedDataPortCacheFlush(true);
         pipeControl.setCompressionControlSurfaceCcsFlush(true);
     }
-    if (DebugManager.flags.DoNotFlushCaches.get()) {
+    if (debugManager.flags.DoNotFlushCaches.get()) {
         pipeControl.setHdcPipelineFlush(false);
         pipeControl.setUnTypedDataPortCacheFlush(false);
         pipeControl.setCompressionControlSurfaceCcsFlush(false);
@@ -34,11 +32,9 @@ inline void MemorySynchronizationCommands<GfxFamily>::setBarrierExtraProperties(
 }
 
 template <typename GfxFamily>
-inline void MemorySynchronizationCommands<GfxFamily>::setPostSyncExtraProperties(PipeControlArgs &args, const HardwareInfo &hwInfo) {
-    if (hwInfo.featureTable.flags.ftrLocalMemory) {
-        args.hdcPipelineFlush = true;
-        args.unTypedDataPortCacheFlush = true;
-    }
+inline void MemorySynchronizationCommands<GfxFamily>::setPostSyncExtraProperties(PipeControlArgs &args) {
+    args.hdcPipelineFlush = true;
+    args.unTypedDataPortCacheFlush = true;
 }
 
 template <typename GfxFamily>
@@ -61,8 +57,4 @@ bool GfxCoreHelperHw<Family>::isUpdateTaskCountFromWaitSupported() const {
     return true;
 }
 
-template <>
-bool GfxCoreHelperHw<Family>::unTypedDataPortCacheFlushRequired() const {
-    return true;
-}
 } // namespace NEO

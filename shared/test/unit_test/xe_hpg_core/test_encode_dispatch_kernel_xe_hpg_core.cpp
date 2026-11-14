@@ -1,20 +1,20 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_container/command_encoder.h"
+#include "shared/source/helpers/hw_walk_order.h"
 #include "shared/source/os_interface/product_helper.h"
-#include "shared/source/os_interface/product_helper_hw.h"
-#include "shared/test//common/helpers/raii_product_helper.h"
+#include "shared/source/xe_hpg_core/hw_cmds_xe_hpg_core_base.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/hw_test.h"
-
-#include "hw_cmds_xe_hpg_core_base.h"
+#include "shared/test/unit_test/fixtures/command_container_fixture.h"
 
 using namespace NEO;
 
@@ -26,37 +26,102 @@ HWTEST2_F(CommandEncodeStatesTestXeHpgCore, givenVariousValuesWhenCallingSetBarr
 
     uint32_t barrierCounts[] = {0, 1};
 
+    KernelDescriptor kd = {};
     for (auto barrierCount : barrierCounts) {
-        EncodeDispatchKernel<FamilyType>::programBarrierEnable(idd, barrierCount, *defaultHwInfo);
+        kd.kernelAttributes.barrierCount = barrierCount;
+        EncodeDispatchKernel<FamilyType>::programBarrierEnable(idd, kd);
 
         EXPECT_EQ(barrierCount, idd.getNumberOfBarriers());
     }
 }
-template <PRODUCT_FAMILY productFamily>
-struct MockProductHelper : NEO::ProductHelperHw<productFamily> {
-    bool isAdjustWalkOrderAvailable(const ReleaseHelper *releaseHelper) const override { return true; }
-};
-
-HWTEST2_F(CommandEncodeStatesTestXeHpgCore, givenRequiredWorkGroupOrderAndIsAdjustWalkOrderAvailableReturnTrueWhenCallAdjustWalkOrderThenWalkerIsProgrammedCorrectly, IsXeHpgCore) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+HWTEST2_F(CommandEncodeStatesTestXeHpgCore, givenRequiredWorkGroupOrderWhenCallAdjustWalkOrderThenWalkerIsProgrammedCorrectly, IsXeHpgCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
 
     MockExecutionEnvironment executionEnvironment{};
-    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
+    auto &hwInfo = *executionEnvironment.rootDeviceEnvironments[0]->getMutableHardwareInfo();
+    hwInfo.caps.adjustWalkOrderAvailable = true;
 
-    RAIIProductHelperFactory<MockProductHelper<productFamily>> raii(rootDeviceEnvironment);
-
-    WALKER_TYPE walkerCmd{};
-    WALKER_TYPE walkerOnStart{};
+    DefaultWalkerType walkerCmd{};
+    DefaultWalkerType walkerOnStart{};
 
     uint32_t fakeOrder = 5u;
-    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, fakeOrder, rootDeviceEnvironment);
-    EXPECT_EQ(0, memcmp(&walkerOnStart, &walkerCmd, sizeof(WALKER_TYPE))); // no change
+    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, fakeOrder, hwInfo);
+    EXPECT_EQ(0, memcmp(&walkerOnStart, &walkerCmd, sizeof(DefaultWalkerType))); // no change
 
     uint32_t yOrder = 2u;
-    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, yOrder, rootDeviceEnvironment);
-    EXPECT_EQ(WALKER_TYPE::DISPATCH_WALK_ORDER::Y_ORDER_WALKER, walkerCmd.getDispatchWalkOrder());
+    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, yOrder, hwInfo);
+    EXPECT_EQ(DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK, walkerCmd.getDispatchWalkOrder());
 
     uint32_t linearOrder = 0u;
-    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, linearOrder, rootDeviceEnvironment);
-    EXPECT_EQ(WALKER_TYPE::DISPATCH_WALK_ORDER::LINERAR_WALKER, walkerCmd.getDispatchWalkOrder());
+    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, linearOrder, hwInfo);
+    EXPECT_EQ(DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK, walkerCmd.getDispatchWalkOrder());
+}
+
+using EncodeKernelXeHpgCoreTest = Test<CommandEncodeStatesFixture>;
+
+XE_HPG_CORETEST_F(EncodeKernelXeHpgCoreTest, givenRequiredWorkGroupOrderWhenCallAdjustWalkOrderThenDispatchWalkOrderIsProgrammedCorrectly) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+
+    DefaultWalkerType walkerCmd{};
+    uint32_t yOrder = 2u;
+
+    const auto &hwInfo = this->pDevice->getHardwareInfo();
+    auto isExpectedNewWalkOrderApplied = hwInfo.caps.adjustWalkOrderAvailable;
+
+    EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[yOrder], HwWalkOrderHelper::yOrderWalk);
+
+    auto dispatchWalkOrderBeforeAdjust = walkerCmd.getDispatchWalkOrder();
+
+    uint32_t fakeOrder = 5u;
+    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, fakeOrder, hwInfo);
+    EXPECT_EQ(dispatchWalkOrderBeforeAdjust, walkerCmd.getDispatchWalkOrder()); // no change
+
+    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, yOrder, hwInfo);
+    auto expectedWalkOrder = isExpectedNewWalkOrderApplied ? DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK : dispatchWalkOrderBeforeAdjust;
+    EXPECT_EQ(expectedWalkOrder, walkerCmd.getDispatchWalkOrder());
+
+    uint32_t linearOrder = 0u;
+    EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[linearOrder], HwWalkOrderHelper::linearWalk);
+
+    EncodeDispatchKernel<FamilyType>::adjustWalkOrder(walkerCmd, linearOrder, hwInfo);
+    expectedWalkOrder = isExpectedNewWalkOrderApplied ? DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK : dispatchWalkOrderBeforeAdjust;
+    EXPECT_EQ(expectedWalkOrder, walkerCmd.getDispatchWalkOrder());
+}
+
+XE_HPG_CORETEST_F(EncodeKernelXeHpgCoreTest, givenRequiredWorkGroupOrderWhenCallEncodeThreadDataThenDispatchWalkOrderIsProgrammedCorrectly) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    DefaultWalkerType walkerCmd = FamilyType::cmdInitGpgpuWalker;
+
+    uint32_t startWorkGroup[3] = {1, 1, 1};
+    uint32_t numWorkGroups[3] = {1, 1, 1};
+    uint32_t workGroupSizes[3] = {1, 1, 1};
+
+    auto dispatchWalkOrderBeforeAdjust = walkerCmd.getDispatchWalkOrder();
+    auto &rootDeviceEnvironment = this->pDevice->getRootDeviceEnvironment();
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    auto isExpectedNewWalkOrderApplied = hwInfo.caps.adjustWalkOrderAvailable;
+
+    uint32_t yOrder = 2u;
+    EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[yOrder], HwWalkOrderHelper::yOrderWalk);
+
+    auto expectedWalkOrder = isExpectedNewWalkOrderApplied ? DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK : dispatchWalkOrderBeforeAdjust;
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, false, false, true, yOrder, rootDeviceEnvironment);
+    EXPECT_EQ(expectedWalkOrder, walkerCmd.getDispatchWalkOrder());
+
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, true, false, true, yOrder, rootDeviceEnvironment);
+    EXPECT_EQ(expectedWalkOrder, walkerCmd.getDispatchWalkOrder());
+
+    uint32_t linearOrder = 0u;
+    EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[linearOrder], HwWalkOrderHelper::linearWalk);
+
+    expectedWalkOrder = isExpectedNewWalkOrderApplied ? DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK : dispatchWalkOrderBeforeAdjust;
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, false, false, true, linearOrder, rootDeviceEnvironment);
+    EXPECT_EQ(expectedWalkOrder, walkerCmd.getDispatchWalkOrder());
+
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, true, false, true, linearOrder, rootDeviceEnvironment);
+    EXPECT_EQ(expectedWalkOrder, walkerCmd.getDispatchWalkOrder());
 }

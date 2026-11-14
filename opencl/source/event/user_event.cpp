@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,17 +9,13 @@
 
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/wait_status.h"
-#include "shared/source/device/device.h"
 
 #include "opencl/source/command_queue/command_queue.h"
-#include "opencl/source/context/context.h"
 
 namespace NEO {
 
 UserEvent::UserEvent(Context *ctx)
-    : Event(ctx, nullptr, CL_COMMAND_USER, CompletionStamp::notReady, CompletionStamp::notReady) {
-    transitionExecutionStatus(CL_QUEUED);
-}
+    : Event(ctx, nullptr, CL_COMMAND_USER, CompletionStamp::notReady, CompletionStamp::notReady) {}
 
 void UserEvent::updateExecutionStatus() {
     return;
@@ -28,10 +24,10 @@ void UserEvent::updateExecutionStatus() {
 WaitStatus UserEvent::wait(bool blocking, bool useQuickKmdSleep) {
     while (updateStatusAndCheckCompletion() == false) {
         if (blocking == false) {
-            return WaitStatus::NotReady;
+            return WaitStatus::notReady;
         }
     }
-    return WaitStatus::Ready;
+    return WaitStatus::ready;
 }
 
 TaskCountType UserEvent::getTaskLevel() {
@@ -59,10 +55,10 @@ void VirtualEvent::updateExecutionStatus() {
 WaitStatus VirtualEvent::wait(bool blocking, bool useQuickKmdSleep) {
     while (updateStatusAndCheckCompletion() == false) {
         if (blocking == false) {
-            return WaitStatus::NotReady;
+            return WaitStatus::notReady;
         }
     }
-    return WaitStatus::Ready;
+    return WaitStatus::ready;
 }
 
 TaskCountType VirtualEvent::getTaskLevel() {

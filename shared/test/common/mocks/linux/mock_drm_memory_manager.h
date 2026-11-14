@@ -1,32 +1,28 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/memory_manager/gfx_partition.h"
+#include "shared/source/os_interface/linux/drm_allocation.h"
+#include "shared/source/os_interface/linux/drm_buffer_object.h"
 #include "shared/source/os_interface/linux/drm_gem_close_worker.h"
 #include "shared/source/os_interface/linux/drm_memory_manager.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
+#include "shared/test/common/mocks/linux/mock_drm_allocation.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
-#include "shared/test/common/os_interface/linux/device_command_stream_fixture.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include <atomic>
+#include <vector>
 
 namespace NEO {
-extern off_t lseekReturn;
-extern std::atomic<int> lseekCalledCount;
 extern std::atomic<int> closeInputFd;
 extern std::atomic<int> closeCalledCount;
 
-inline off_t lseekMock(int fd, off_t offset, int whence) noexcept {
-    lseekCalledCount++;
-    if ((fd == closeInputFd) && (closeCalledCount > 0)) {
-        return 0;
-    }
-    return lseekReturn;
-}
 inline int closeMock(int fd) {
     closeInputFd = fd;
     closeCalledCount++;
@@ -39,6 +35,7 @@ class DrmGemCloseWorker;
 
 class TestedDrmMemoryManager : public MemoryManagerCreate<DrmMemoryManager> {
   public:
+    using BaseClass = MemoryManagerCreate<DrmMemoryManager>;
     using DrmMemoryManager::acquireGpuRange;
     using DrmMemoryManager::alignmentSelector;
     using DrmMemoryManager::allocateGraphicsMemory;
@@ -46,28 +43,41 @@ class TestedDrmMemoryManager : public MemoryManagerCreate<DrmMemoryManager> {
     using DrmMemoryManager::allocateGraphicsMemoryForImage;
     using DrmMemoryManager::allocateGraphicsMemoryForNonSvmHostPtr;
     using DrmMemoryManager::allocateGraphicsMemoryWithAlignment;
+    using DrmMemoryManager::allocateGraphicsMemoryWithAlignmentImpl;
     using DrmMemoryManager::allocateGraphicsMemoryWithHostPtr;
+    using DrmMemoryManager::allocateKmdMappedIsaIn32BitHeap;
     using DrmMemoryManager::allocateMemoryByKMD;
     using DrmMemoryManager::allocatePhysicalDeviceMemory;
+    using DrmMemoryManager::allocatePhysicalHostMemory;
     using DrmMemoryManager::allocatePhysicalLocalDeviceMemory;
     using DrmMemoryManager::allocationTypeForCompletionFence;
     using DrmMemoryManager::allocUserptr;
-    using DrmMemoryManager::createAllocWithAlignment;
+    using DrmMemoryManager::cachedMaxLocalMemory;
+    using DrmMemoryManager::checkUnexpectedGpuPageFault;
     using DrmMemoryManager::createAllocWithAlignmentFromUserptr;
+    using DrmMemoryManager::createBufferObjectInMemoryRegion;
     using DrmMemoryManager::createGraphicsAllocation;
-    using DrmMemoryManager::createMultiHostAllocation;
+    using DrmMemoryManager::createMultiHostDebugSurfaceAllocation;
     using DrmMemoryManager::createSharedUnifiedMemoryAllocation;
+    using DrmMemoryManager::createStorageInfoFromProperties;
+    using DrmMemoryManager::deferBackedLocalMemAllocsSize;
     using DrmMemoryManager::eraseSharedBoHandleWrapper;
     using DrmMemoryManager::eraseSharedBufferObject;
+    using DrmMemoryManager::getBOTypeFromPatIndex;
     using DrmMemoryManager::getDefaultDrmContextId;
+    using DrmMemoryManager::getDefaultOsContext;
     using DrmMemoryManager::getDrm;
+    using DrmMemoryManager::getImportHandleFromReservedHandleData;
+    using DrmMemoryManager::getLocalOnlyRequired;
     using DrmMemoryManager::getRootDeviceIndex;
     using DrmMemoryManager::getUserptrAlignment;
     using DrmMemoryManager::gfxPartitions;
     using DrmMemoryManager::handleFenceCompletion;
+    using DrmMemoryManager::localMemBanksCount;
     using DrmMemoryManager::lockBufferObject;
     using DrmMemoryManager::lockResourceImpl;
-    using DrmMemoryManager::mapPhysicalToVirtualMemory;
+    using DrmMemoryManager::mapPhysicalDeviceMemoryToVirtualMemory;
+    using DrmMemoryManager::mapPhysicalHostMemoryToVirtualMemory;
     using DrmMemoryManager::memoryForPinBBs;
     using DrmMemoryManager::mmapFunction;
     using DrmMemoryManager::munmapFunction;
@@ -77,18 +87,30 @@ class TestedDrmMemoryManager : public MemoryManagerCreate<DrmMemoryManager> {
     using DrmMemoryManager::registerAllocationInOs;
     using DrmMemoryManager::registerSharedBoHandleAllocation;
     using DrmMemoryManager::releaseGpuRange;
-    using DrmMemoryManager::retrieveMmapOffsetForBufferObject;
+    using DrmMemoryManager::releaseLocalMemoryReservation;
+    using DrmMemoryManager::reserveLocalMemory;
+    using DrmMemoryManager::rootDevicesOnMultipleNumaNodes;
+    using DrmMemoryManager::secondaryEngines;
+    using DrmMemoryManager::selectAlignmentAndHeap;
     using DrmMemoryManager::setDomainCpu;
     using DrmMemoryManager::sharedBoHandles;
     using DrmMemoryManager::sharingBufferObjects;
     using DrmMemoryManager::supportsMultiStorageResources;
+    using DrmMemoryManager::supportsPhysicalDeviceMemoryMultiMapping;
     using DrmMemoryManager::tryToGetBoHandleWrapperWithSharedOwnership;
     using DrmMemoryManager::unlockBufferObject;
-    using DrmMemoryManager::unMapPhysicalToVirtualMemory;
+    using DrmMemoryManager::unMapPhysicalDeviceMemoryFromVirtualMemory;
+    using DrmMemoryManager::unMapPhysicalHostMemoryFromVirtualMemory;
     using DrmMemoryManager::waitOnCompletionFence;
     using MemoryManager::allocateGraphicsMemoryInDevicePool;
     using MemoryManager::allRegisteredEngines;
-    using MemoryManager::heapAssigner;
+    using MemoryManager::heapAssigners;
+    using MemoryManager::localMemAllocsSize;
+    using MemoryManager::localMemorySupported;
+
+    StorageInfo createStorageInfoFromPropertiesGeneric(const AllocationProperties &properties) {
+        return MemoryManager::createStorageInfoFromProperties(properties);
+    }
 
     TestedDrmMemoryManager(ExecutionEnvironment &executionEnvironment);
     TestedDrmMemoryManager(bool enableLocalMemory,
@@ -96,6 +118,15 @@ class TestedDrmMemoryManager : public MemoryManagerCreate<DrmMemoryManager> {
                            bool validateHostPtrMemory,
                            ExecutionEnvironment &executionEnvironment);
     void injectPinBB(BufferObject *newPinBB, uint32_t rootDeviceIndex);
+    SubmissionStatus emitPinningRequestForBoContainer(BufferObject **bo, uint32_t boCount, uint32_t rootDeviceIndex) const override {
+        emitPinningRequestForBoContainerCalled++;
+        if (emitPinningRequestForBoContainerCallBase) {
+            return BaseClass::emitPinningRequestForBoContainer(bo, boCount, rootDeviceIndex);
+        }
+        return SubmissionStatus::success;
+    }
+    bool emitPinningRequestForBoContainerCallBase = true;
+    mutable uint32_t emitPinningRequestForBoContainerCalled = 0u;
 
     DrmGemCloseWorker *getgemCloseWorker();
     void forceLimitedRangeAllocator(uint64_t range);
@@ -155,7 +186,104 @@ class TestedDrmMemoryManager : public MemoryManagerCreate<DrmMemoryManager> {
         return DrmMemoryManager::obtainFdFromHandle(boHandle, rootDeviceIndex);
     }
 
+    bool mockObtainReservedHandleData = false;
+    int mockObtainReservedHandleDataResult = 0;
+
+    int obtainReservedHandleData(int fd, uint32_t rootDeviceIndex, void *reservedHandleData) override {
+        if (mockObtainReservedHandleData) {
+            return mockObtainReservedHandleDataResult;
+        }
+        return DrmMemoryManager::obtainReservedHandleData(fd, rootDeviceIndex, reservedHandleData);
+    }
+    uint64_t acquireGpuRange(size_t &size, uint32_t rootDeviceIndex, HeapIndex heapIndex) override {
+        acquireGpuRangeCalledTimes++;
+        acquireGpuRangeLastHeapIndex = heapIndex;
+        return DrmMemoryManager::acquireGpuRange(size, rootDeviceIndex, heapIndex);
+    }
+
+    uint64_t acquireGpuRangeWithCustomAlignment(size_t &size, uint32_t rootDeviceIndex, HeapIndex heapIndex, size_t alignment) override {
+        acquireGpuRangeWithCustomAlignmenCalledTimes++;
+        acquireGpuRangeWithCustomAlignmenPassedAlignment = alignment;
+        acquireGpuRangeLastHeapIndex = heapIndex;
+        return DrmMemoryManager::acquireGpuRangeWithCustomAlignment(size, rootDeviceIndex, heapIndex, alignment);
+    }
+    ADDMETHOD(isLimitedRange, bool, true, false, (uint32_t rootDeviceIndex), (rootDeviceIndex));
+    ADDMETHOD(isKmdMigrationAvailable, bool, true, false, (uint32_t rootDeviceIndex), (rootDeviceIndex));
+
+    DeviceBitfield computeStorageInfoMemoryBanks(const AllocationProperties &properties, DeviceBitfield preferredBank, DeviceBitfield allBanks) override {
+        ++computeStorageInfoMemoryBanksCalled;
+        return MemoryManager::computeStorageInfoMemoryBanks(properties, preferredBank, allBanks);
+    }
+
+    AllocationStatus registerSysMemAlloc(GraphicsAllocation *allocation) override {
+        ++registerSysMemAllocCalled;
+        if (failRegisterSysMemAlloc) {
+            return AllocationStatus::Error;
+        }
+        return DrmMemoryManager::registerSysMemAlloc(allocation);
+    }
+
+    AllocationStatus registerLocalMemAlloc(GraphicsAllocation *allocation, uint32_t rootDeviceIndex) override {
+        ++registerLocalMemAllocCalled;
+        return DrmMemoryManager::registerLocalMemAlloc(allocation, rootDeviceIndex);
+    }
+
+    void unregisterAllocation(GraphicsAllocation *allocation) override {
+        ++unregisterAllocationCalled;
+        DrmMemoryManager::unregisterAllocation(allocation);
+    }
+
+    uint32_t acquireGpuRangeCalledTimes = 0u;
+    uint32_t acquireGpuRangeWithCustomAlignmenCalledTimes = 0u;
+    size_t acquireGpuRangeWithCustomAlignmenPassedAlignment = 0u;
+    size_t computeStorageInfoMemoryBanksCalled = 0u;
+    size_t registerSysMemAllocCalled = 0u;
+    bool failRegisterSysMemAlloc = false;
+    size_t registerLocalMemAllocCalled = 0u;
+    size_t unregisterAllocationCalled = 0u;
     ExecutionEnvironment *executionEnvironment = nullptr;
+    HeapIndex acquireGpuRangeLastHeapIndex = HeapIndex::totalHeaps;
+
+    BufferObject *createBufferObjectInMemoryRegion(uint32_t rootDeviceIndex, Gmm *gmm, AllocationType allocationType, uint64_t gpuAddress, size_t size,
+                                                   DeviceBitfield memoryBanks, size_t maxOsContextCount, int32_t pairHandle, bool isSystemMemoryPool, bool isUsmHostAllocation, bool deferBacking) override {
+        if (createBufferObjectInMemoryRegionCallBase) {
+            return DrmMemoryManager::createBufferObjectInMemoryRegion(rootDeviceIndex, gmm, allocationType, gpuAddress, size, memoryBanks, maxOsContextCount, pairHandle, isSystemMemoryPool, isUsmHostAllocation, deferBacking);
+        }
+        // Create a mock BufferObject for testing
+        auto &drm = this->getDrm(rootDeviceIndex);
+        auto bo = new (std::nothrow) MockBufferObject(rootDeviceIndex, &drm);
+        if (bo) {
+            bo->setSize(size);
+            bo->setAddress(gpuAddress);
+        }
+        createBufferObjectInMemoryRegionCallCount++;
+        return bo;
+    }
+    bool createBufferObjectInMemoryRegionCallBase = true; // Default to calling the base class
+    uint32_t createBufferObjectInMemoryRegionCallCount = 0u;
+
+    DrmAllocation *createAllocWithAlignment(const AllocationData &allocationData, size_t size, size_t alignment, size_t alignedSize, uint64_t gpuAddress) override {
+        passedAlignment = alignment;
+        return DrmMemoryManager::createAllocWithAlignment(allocationData, size, alignment, alignedSize, gpuAddress);
+    }
+    size_t passedAlignment = 0;
+
+    BufferObjects createBufferObjectsForNonSvmHostPtr(size_t realAllocationSize, const void *alignedPtr, uint64_t gpuVirtualAddress, const AllocationData &allocationData, uint32_t rootDeviceIndex, uint8_t patIndex, size_t alignedSize) override {
+        createBufferObjectsForNonSvmHostPtrCallCount++;
+        if (createBufferObjectsForNonSvmHostPtrCallBase) {
+            return DrmMemoryManager::createBufferObjectsForNonSvmHostPtr(realAllocationSize, alignedPtr, gpuVirtualAddress, allocationData, rootDeviceIndex, patIndex, alignedSize);
+        }
+        BufferObjects bos;
+        auto bo = new (std::nothrow) MockBufferObject(rootDeviceIndex, &this->getDrm(rootDeviceIndex));
+        if (bo) {
+            bo->setSize(alignedSize);
+            bo->setAddress(gpuVirtualAddress);
+            bos.push_back(bo);
+        }
+        return bos;
+    }
+    bool createBufferObjectsForNonSvmHostPtrCallBase = true;
+    uint32_t createBufferObjectsForNonSvmHostPtrCallCount = 0u;
 
   protected:
     std::mutex unreferenceMtx;
@@ -175,8 +303,52 @@ struct MockDrmGemCloseWorker : DrmGemCloseWorker {
 };
 
 struct MockDrmMemoryManager : DrmMemoryManager {
+    using BaseClass = DrmMemoryManager;
     using DrmMemoryManager::DrmMemoryManager;
     using DrmMemoryManager::gemCloseWorker;
+    using DrmMemoryManager::mmapFunction;
+    using DrmMemoryManager::munmapFunction;
+    SubmissionStatus emitPinningRequestForBoContainer(BufferObject **bo, uint32_t boCount, uint32_t rootDeviceIndex) const override {
+        this->emitPinningRequestForBoContainerCalled++;
+        this->emitPinningRequestForBoContainerBos.assign(bo, bo + boCount);
+        if (this->emitPinningRequestForBoContainerCallBase) {
+            return BaseClass::emitPinningRequestForBoContainer(bo, boCount, rootDeviceIndex);
+        }
+        return this->emitPinningRequestForBoContainerResult;
+    }
+    SubmissionStatus emitPinningRequestForBoContainerResult = SubmissionStatus::success;
+    bool emitPinningRequestForBoContainerCallBase = true;
+    mutable uint32_t emitPinningRequestForBoContainerCalled = 0u;
+    mutable std::vector<BufferObject *> emitPinningRequestForBoContainerBos;
+
+    int getImportHandleFromReservedHandleData(void *reservedHandleData, uint32_t rootDeviceIndex) override {
+        if (getImportHandleFromReservedHandleDataCallBase) {
+            return DrmMemoryManager::getImportHandleFromReservedHandleData(reservedHandleData, rootDeviceIndex);
+        }
+        getImportHandleFromReservedHandleDataCallCount++;
+        return getImportHandleFromReservedHandleDataReturnValue;
+    }
+    bool getImportHandleFromReservedHandleDataCallBase = true; // Default to calling the base class
+    uint32_t getImportHandleFromReservedHandleDataCallCount = 0u;
+    int getImportHandleFromReservedHandleDataReturnValue = -1;
+
+    BufferObject *createBufferObjectInMemoryRegion(uint32_t rootDeviceIndex, Gmm *gmm, AllocationType allocationType, uint64_t gpuAddress, size_t size,
+                                                   DeviceBitfield memoryBanks, size_t maxOsContextCount, int32_t pairHandle, bool isSystemMemoryPool, bool isUsmHostAllocation, bool deferBacking) override {
+        if (createBufferObjectInMemoryRegionCallBase) {
+            return DrmMemoryManager::createBufferObjectInMemoryRegion(rootDeviceIndex, gmm, allocationType, gpuAddress, size, memoryBanks, maxOsContextCount, pairHandle, isSystemMemoryPool, isUsmHostAllocation, deferBacking);
+        }
+        // Create a mock BufferObject for testing
+        auto &drm = this->getDrm(rootDeviceIndex);
+        auto bo = new (std::nothrow) MockBufferObject(rootDeviceIndex, &drm);
+        if (bo) {
+            bo->setSize(size);
+            bo->setAddress(gpuAddress);
+        }
+        createBufferObjectInMemoryRegionCallCount++;
+        return bo;
+    }
+    bool createBufferObjectInMemoryRegionCallBase = true; // Default to calling the base class
+    uint32_t createBufferObjectInMemoryRegionCallCount = 0u;
 };
 
 } // namespace NEO

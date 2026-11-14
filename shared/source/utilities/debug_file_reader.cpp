@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,22 +7,21 @@
 
 #include "shared/source/utilities/debug_file_reader.h"
 
-#include <fstream>
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/file_io.h"
+
 #include <sstream>
 
 namespace NEO {
 
 SettingsFileReader::SettingsFileReader(const char *filePath) {
-    std::ifstream settingsFile;
-
-    if (filePath == nullptr)
-        settingsFile.open(settingsFileName);
-    else
-        settingsFile.open(filePath);
-
-    if (settingsFile.is_open()) {
+    UNRECOVERABLE_IF(!filePath);
+    size_t fileSize = 0;
+    auto fileData = loadDataFromFile(filePath, fileSize);
+    if (fileData) {
+        std::istringstream settingsFile(std::string(fileData.get(), fileSize));
         parseStream(settingsFile);
-        settingsFile.close();
     }
 }
 
@@ -30,8 +29,42 @@ SettingsFileReader::~SettingsFileReader() {
     settingStringMap.clear();
 }
 
+int32_t SettingsFileReader::getSetting(const char *settingName, int32_t defaultValue, DebugVarPrefix &type) {
+    return static_cast<int32_t>(getSetting(settingName, static_cast<int64_t>(defaultValue), type));
+}
+
 int32_t SettingsFileReader::getSetting(const char *settingName, int32_t defaultValue) {
     return static_cast<int32_t>(getSetting(settingName, static_cast<int64_t>(defaultValue)));
+}
+
+const std::string *SettingsFileReader::findSetting(const char *settingName, DebugVarPrefix &type) const {
+    auto prefixString = ApiSpecificConfig::getPrefixStrings();
+    auto prefixType = ApiSpecificConfig::getPrefixTypes();
+
+    uint32_t i = 0;
+    for (const auto &prefix : prefixString) {
+        std::string neoKey = prefix;
+        neoKey += settingName;
+        auto it = settingStringMap.find(neoKey);
+        if (it != settingStringMap.end()) {
+            type = prefixType[i];
+            return &it->second;
+        }
+        i++;
+    }
+    type = DebugVarPrefix::none;
+    return nullptr;
+}
+
+bool SettingsFileReader::hasSetting(const char *settingName, DebugVarPrefix &type) {
+    return nullptr != findSetting(settingName, type);
+}
+
+int64_t SettingsFileReader::getSetting(const char *settingName, int64_t defaultValue, DebugVarPrefix &type) {
+    if (auto setting = findSetting(settingName, type)) {
+        return strtoll(setting->c_str(), nullptr, 0);
+    }
+    return defaultValue;
 }
 
 int64_t SettingsFileReader::getSetting(const char *settingName, int64_t defaultValue) {
@@ -45,15 +78,27 @@ int64_t SettingsFileReader::getSetting(const char *settingName, int64_t defaultV
     return value;
 }
 
+bool SettingsFileReader::getSetting(const char *settingName, bool defaultValue, DebugVarPrefix &type) {
+    return getSetting(settingName, static_cast<int64_t>(defaultValue), type) ? true : false;
+}
+
 bool SettingsFileReader::getSetting(const char *settingName, bool defaultValue) {
     return getSetting(settingName, static_cast<int64_t>(defaultValue)) ? true : false;
+}
+
+std::string SettingsFileReader::getSetting(const char *settingName, const std::string &value, DebugVarPrefix &type) {
+    if (auto setting = findSetting(settingName, type)) {
+        return *setting;
+    }
+    return value;
 }
 
 std::string SettingsFileReader::getSetting(const char *settingName, const std::string &value) {
     std::string returnValue = value;
     std::map<std::string, std::string>::iterator it = settingStringMap.find(std::string(settingName));
-    if (it != settingStringMap.end())
+    if (it != settingStringMap.end()) {
         returnValue = it->second;
+    }
 
     return returnValue;
 }
@@ -95,7 +140,7 @@ void SettingsFileReader::parseStream(std::istream &inputStream) {
             }
         }
 
-        settingStringMap.insert(std::pair<std::string, std::string>(key, value));
+        settingStringMap.emplace(key, value);
     }
 }
 }; // namespace NEO

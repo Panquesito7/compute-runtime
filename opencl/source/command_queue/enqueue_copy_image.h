@@ -1,23 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
-#include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/helpers/basic_math.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/vec.h"
+
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/helpers/hardware_commands_helper.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/helpers/mipmap.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
-
-#include <algorithm>
-#include <new>
 
 namespace NEO {
 
@@ -40,7 +39,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueCopyImage(
     MemObjSurface dstImgSurf(dstImage);
     Surface *surfaces[] = {&srcImgSurf, &dstImgSurf};
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcImage;
     dc.dstMemObj = dstImage;
     dc.srcOffset = srcOrigin;
@@ -57,7 +56,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueCopyImage(
 
     MultiDispatchInfo dispatchInfo(dc);
 
-    return dispatchBcsOrGpgpuEnqueue<CL_COMMAND_COPY_IMAGE>(dispatchInfo, surfaces, EBuiltInOps::CopyImageToImage3d, numEventsInWaitList, eventWaitList, event, false, csr);
+    return dispatchBcsOrGpgpuEnqueue<CL_COMMAND_COPY_IMAGE>(dispatchInfo, surfaces, {BuiltIn::BaseKernel::copyImageToImage3d, this->defaultBuiltInMode}, numEventsInWaitList, eventWaitList, event, false, csr);
 }
 
 } // namespace NEO

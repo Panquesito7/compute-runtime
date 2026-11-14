@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/local_work_size.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/hw_test.h"
@@ -34,7 +35,7 @@ TEST_F(LocalWorkSizeTest, givenDisableEUFusionWhenCreatingWorkSizeInfoThenCorrec
     WorkSizeInfo wsInfo(256,                   // maxWorkGroupSize
                         1u,                    // hasBariers
                         simdSize,              // simdSize
-                        0u,                    // slmTotalSize
+                        0u,                    // slmTotalSizePerThreadGroup
                         rootDeviceEnvironment, // rootDeviceEnvironment
                         numThreadsPerSubS,     // numThreadsPerSubS
                         0u,                    // localMemorySize
@@ -46,20 +47,21 @@ TEST_F(LocalWorkSizeTest, givenDisableEUFusionWhenCreatingWorkSizeInfoThenCorrec
     bool fusedDispatchEnabled = gfxCoreHelper.isFusedEuDispatchEnabled(*defaultHwInfo, true);
     auto wgsMultiple = fusedDispatchEnabled ? 2 : 1;
 
-    uint32_t maxBarriersPerHSlice = (defaultHwInfo->platform.eRenderCoreFamily >= IGFX_GEN9_CORE) ? 32 : 16;
+    uint32_t maxBarriersPerHSlice = 32;
     uint32_t expectedMinWGS = wgsMultiple * simdSize * numThreadsPerSubS / maxBarriersPerHSlice;
     EXPECT_EQ(expectedMinWGS, wsInfo.minWorkGroupSize);
 }
 
 TEST_F(LocalWorkSizeTest, GivenSlmLargerThanLocalThenWarningIsReturned) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.PrintDebugMessages.set(true);
-    ::testing::internal::CaptureStderr();
+    debugManager.flags.PrintDebugMessages.set(true);
+    StreamCapture capture;
+    capture.captureStderr();
 
     EXPECT_THROW(WorkSizeInfo wsInfo(256,                   // maxWorkGroupSize
                                      1u,                    // hasBariers
                                      8,                     // simdSize
-                                     128u,                  // slmTotalSize
+                                     128u,                  // slmTotalSizePerThreadGroup
                                      rootDeviceEnvironment, // rootDeviceEnvironment
                                      32u,                   // numThreadsPerSubSlice
                                      64u,                   // localMemorySize
@@ -69,19 +71,20 @@ TEST_F(LocalWorkSizeTest, GivenSlmLargerThanLocalThenWarningIsReturned) {
                                      ),
                  std::exception);
 
-    std::string output = testing::internal::GetCapturedStderr();
+    std::string output = capture.getCapturedStderr();
     EXPECT_EQ(std::string("Size of SLM (128) larger than available (64)\n"), output);
 }
 
 TEST_F(LocalWorkSizeTest, GivenSlmSmallerThanLocalThenWarningIsNotReturned) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.PrintDebugMessages.set(true);
-    ::testing::internal::CaptureStderr();
+    debugManager.flags.PrintDebugMessages.set(true);
+    StreamCapture capture;
+    capture.captureStderr();
 
     WorkSizeInfo wsInfo(256,                   // maxWorkGroupSize
                         1u,                    // hasBariers
                         8,                     // simdSize
-                        64u,                   // slmTotalSize
+                        64u,                   // slmTotalSizePerThreadGroup
                         rootDeviceEnvironment, // rootDeviceEnvironment
                         32u,                   // numThreadsPerSubSlice
                         128u,                  // localMemorySize
@@ -90,18 +93,18 @@ TEST_F(LocalWorkSizeTest, GivenSlmSmallerThanLocalThenWarningIsNotReturned) {
                         false                  // disableEUFusion
     );
 
-    std::string output = testing::internal::GetCapturedStderr();
+    std::string output = capture.getCapturedStderr();
     EXPECT_EQ(std::string(""), output);
 }
 
 TEST_F(LocalWorkSizeTest, whenSettingHasBarriersWithNoFusedDispatchThenMinWorkGroupSizeIsSetCorrectly) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.CFEFusedEUDispatch.set(0);
+    debugManager.flags.CFEFusedEUDispatch.set(0);
 
     WorkSizeInfo wsInfo0(256,                   // maxWorkGroupSize
                          0u,                    // hasBariers
                          8,                     // simdSize
-                         0u,                    // slmTotalSize
+                         0u,                    // slmTotalSizePerThreadGroup
                          rootDeviceEnvironment, // rootDeviceEnvironment
                          32u,                   // numThreadsPerSubSlice
                          128u,                  // localMemorySize
@@ -114,7 +117,7 @@ TEST_F(LocalWorkSizeTest, whenSettingHasBarriersWithNoFusedDispatchThenMinWorkGr
     WorkSizeInfo wsInfo1(256,                   // maxWorkGroupSize
                          1u,                    // hasBariers
                          8,                     // simdSize
-                         0u,                    // slmTotalSize
+                         0u,                    // slmTotalSizePerThreadGroup
                          rootDeviceEnvironment, // rootDeviceEnvironment
                          32u,                   // numThreadsPerSubSlice
                          128u,                  // localMemorySize
@@ -129,7 +132,7 @@ TEST_F(LocalWorkSizeTest, given3DimWorkGroupAndSimdEqual8AndBarriersWhenComputeC
     WorkSizeInfo wsInfo(256,                   // maxWorkGroupSize
                         1u,                    // hasBariers
                         8,                     // simdSize
-                        0u,                    // slmTotalSize
+                        0u,                    // slmTotalSizePerThreadGroup
                         rootDeviceEnvironment, // rootDeviceEnvironment
                         32u,                   // numThreadsPerSubSlice
                         0u,                    // localMemorySize
@@ -160,7 +163,7 @@ TEST_F(LocalWorkSizeTest, givenSmallerLocalMemSizeThanSlmTotalSizeThenExceptionI
     EXPECT_THROW(WorkSizeInfo wsInfo(256,                   // maxWorkGroupSize
                                      1u,                    // hasBariers
                                      8,                     // simdSize
-                                     128u,                  // slmTotalSize
+                                     128u,                  // slmTotalSizePerThreadGroup
                                      rootDeviceEnvironment, // rootDeviceEnvironment
                                      32u,                   // numThreadsPerSubSlice
                                      64u,                   // localMemorySize
@@ -173,9 +176,9 @@ TEST_F(LocalWorkSizeTest, givenSmallerLocalMemSizeThanSlmTotalSizeThenExceptionI
 
 TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSimdEqual8AndNoBarriersWhenComputeCalledThenLocalGroupComputedCorrectly) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(true);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(true);
 
-    // wsInfo maxWorkGroupSize, hasBariers, simdSize, slmTotalSize, rootDeviceEnvironment, numThreadsPerSubSlice, localMemorySize, imgUsed, yTiledSurface, disableEUFusion
+    // wsInfo maxWorkGroupSize, hasBariers, simdSize, slmTotalSizePerThreadGroup, rootDeviceEnvironment, numThreadsPerSubSlice, localMemorySize, imgUsed, yTiledSurface, disableEUFusion
     WorkSizeInfo wsInfo(256, 0u, 8, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
     uint32_t workDim = 2;
     size_t workGroup[3] = {10003, 10003, 1};
@@ -195,7 +198,7 @@ TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSimdEqual8AndNoBarriersWhenComput
 }
 
 TEST_F(LocalWorkSizeTest, given1DimWorkGroupAndSimdEqual8WhenComputeCalledThenLocalGroupComputed) {
-    // wsInfo maxWorkGroupSize, hasBariers, simdSize, slmTotalSize, hardwareInfo, numThreadsPerSubSlice, localMemorySize, imgUsed, yTiledSurface, disableEUFusion
+    // wsInfo maxWorkGroupSize, hasBariers, simdSize, slmTotalSizePerThreadGroup, hardwareInfo, numThreadsPerSubSlice, localMemorySize, imgUsed, yTiledSurface, disableEUFusion
     WorkSizeInfo wsInfo(256, 0u, 8, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
     uint32_t workDim = 1;
     size_t workGroup[3] = {6144, 1, 1};
@@ -276,7 +279,7 @@ TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSimdEqual8WhenComputeCalledThenLo
 
 TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSimdEqual32WhenComputeCalledThenLocalGroupComputed) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
     WorkSizeInfo wsInfo(256, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
 
     uint32_t workDim = 2;
@@ -307,6 +310,257 @@ TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSimdEqual32WhenComputeCalledThenL
     EXPECT_EQ(workGroupSize[0], 1u);
     EXPECT_EQ(workGroupSize[1], 128u);
     EXPECT_EQ(workGroupSize[2], 1u);
+}
+
+TEST_F(LocalWorkSizeTest, givenSimdEqual32AndPreferredWgCountPerSubslice2WhenComputeCalledThenLocalGroupSizeIsLimited) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    WorkSizeInfo wsInfo(1024, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
+    wsInfo.setPreferredWgCountPerSubslice(2);
+
+    constexpr uint32_t maxLws = 32 * 32 / 2; // simd size * num threadsPerSubslice / preferredWgCountPerSubslice
+
+    uint32_t workDim = 2;
+    size_t workGroup[3] = {384, 96, 1};
+    size_t workGroupSize[3];
+
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 128u);
+    EXPECT_EQ(workGroupSize[1], 2u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] < maxLws);
+
+    workGroup[0] = 1024 * 256;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 256u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 48;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 16u);
+    EXPECT_EQ(workGroupSize[1], 32u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 512;
+    workGroup[1] = 1;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 512u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 12;
+    workGroup[1] = 512;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 4u);
+    EXPECT_EQ(workGroupSize[1], 64u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 1;
+    workGroup[1] = 384;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 1u);
+    EXPECT_EQ(workGroupSize[1], 128u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 128;
+    workGroup[1] = 4;
+    wsInfo.imgUsed = true;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 128u);
+    EXPECT_EQ(workGroupSize[1], 4u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 64;
+    workGroup[1] = 8;
+    wsInfo.imgUsed = false;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 64u);
+    EXPECT_EQ(workGroupSize[1], 8u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 1024;
+    workGroup[1] = 9;
+    wsInfo.imgUsed = true;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 512u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+}
+
+TEST_F(LocalWorkSizeTest, givenSimdEqual32AndPreferredWgCountPerSubslice4WhenComputeCalledThenLocalGroupSizeIsLimited) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    WorkSizeInfo wsInfo(1024, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
+    wsInfo.setPreferredWgCountPerSubslice(4);
+
+    constexpr uint32_t maxLws = 32 * 32 / 4; // simd size * num threadsPerSubslice / preferredWgCountPerSubslice
+
+    uint32_t workDim = 2;
+    size_t workGroup[3] = {384, 96, 1};
+    size_t workGroupSize[3];
+
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 128u);
+    EXPECT_EQ(workGroupSize[1], 2u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 1024 * 256;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 256u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 48;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 16u);
+    EXPECT_EQ(workGroupSize[1], 16u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 512;
+    workGroup[1] = 1;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 256u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 12;
+    workGroup[1] = 512;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 4u);
+    EXPECT_EQ(workGroupSize[1], 64u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 1;
+    workGroup[1] = 384;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 1u);
+    EXPECT_EQ(workGroupSize[1], 128u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 128;
+    workGroup[1] = 4;
+    wsInfo.imgUsed = true;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 64u);
+    EXPECT_EQ(workGroupSize[1], 4u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 64;
+    workGroup[1] = 8;
+    wsInfo.imgUsed = false;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 64u);
+    EXPECT_EQ(workGroupSize[1], 4u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 1024;
+    workGroup[1] = 9;
+    wsInfo.imgUsed = true;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 256u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+
+    workGroup[0] = 2048;
+    workGroup[1] = 1;
+    wsInfo.imgUsed = false;
+    NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+    EXPECT_EQ(workGroupSize[0], 256u);
+    EXPECT_EQ(workGroupSize[1], 1u);
+    EXPECT_EQ(workGroupSize[2], 1u);
+    EXPECT_TRUE(workGroupSize[0] * workGroupSize[1] <= maxLws);
+}
+
+TEST_F(LocalWorkSizeTest, givenSimdEqual32AndPreferredWgCountPerSubslice4WhenBarriersOrSlmUsedThenLocalGroupSizeIsNotLimited) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    WorkSizeInfo wsInfo(1024, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
+    wsInfo.setPreferredWgCountPerSubslice(4);
+
+    for (uint32_t i = 0; i < 2; i++) {
+        if (i == 0) {
+            wsInfo.hasBarriers = true;
+        } else if (i == 1) {
+            wsInfo.hasBarriers = false;
+            wsInfo.slmTotalSizePerThreadGroup = 256;
+        }
+
+        uint32_t workDim = 2;
+        size_t workGroup[3] = {384, 96, 1};
+        size_t workGroupSize[3];
+
+        NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+        if (wsInfo.slmTotalSizePerThreadGroup == 0) {
+            EXPECT_EQ(workGroupSize[0], 384u);
+            EXPECT_EQ(workGroupSize[1], 2u);
+            EXPECT_EQ(workGroupSize[2], 1u);
+        } else {
+            // use ratio in algorithm
+            EXPECT_EQ(workGroupSize[0], 64u);
+            EXPECT_EQ(workGroupSize[1], 16u);
+            EXPECT_EQ(workGroupSize[2], 1u);
+        }
+
+        workGroup[0] = 1024 * 256;
+        NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+        EXPECT_EQ(workGroupSize[0], 512u);
+        EXPECT_EQ(workGroupSize[1], 2u);
+        EXPECT_EQ(workGroupSize[2], 1u);
+
+        workGroup[0] = 48;
+        NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+        EXPECT_EQ(workGroupSize[0], 48u);
+        EXPECT_EQ(workGroupSize[1], 16u);
+        EXPECT_EQ(workGroupSize[2], 1u);
+
+        workGroup[0] = 128;
+        workGroup[1] = 4;
+        wsInfo.imgUsed = true;
+        NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+        EXPECT_EQ(workGroupSize[0], 128u);
+        EXPECT_EQ(workGroupSize[1], 4u);
+        EXPECT_EQ(workGroupSize[2], 1u);
+
+        workGroup[0] = 1024;
+        workGroup[1] = 9;
+        wsInfo.imgUsed = false;
+        NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+        if (wsInfo.slmTotalSizePerThreadGroup == 0) {
+            EXPECT_EQ(workGroupSize[0], 512u);
+            EXPECT_EQ(workGroupSize[1], 1u);
+            EXPECT_EQ(workGroupSize[2], 1u);
+        } else {
+            EXPECT_EQ(workGroupSize[0], 256u);
+            EXPECT_EQ(workGroupSize[1], 3u);
+            EXPECT_EQ(workGroupSize[2], 1u);
+        }
+
+        workGroup[0] = 2048;
+        workGroup[1] = 2;
+        wsInfo.imgUsed = false;
+        NEO::computeWorkgroupSizeND(wsInfo, workGroupSize, workGroup, workDim);
+        EXPECT_EQ(workGroupSize[0], 512u);
+        EXPECT_EQ(workGroupSize[1], 2u);
+        EXPECT_EQ(workGroupSize[2], 1u);
+    }
 }
 
 TEST_F(LocalWorkSizeTest, given3DimWorkGroupAndSimdEqual8WhenComputeCalledThenLocalGroupComputed) {
@@ -390,7 +644,7 @@ TEST_F(LocalWorkSizeTest, given3DimWorkGroupAndSimdEqual32WhenComputeCalledThenL
 
 TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSquaredAlgorithmWhenComputeCalledThenLocalGroupComputed) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(true);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(true);
 
     WorkSizeInfo wsInfo(256, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
     uint32_t workDim = 2;
@@ -405,7 +659,7 @@ TEST_F(LocalWorkSizeTest, given2DimWorkGroupAndSquaredAlgorithmWhenComputeCalled
 
 TEST_F(LocalWorkSizeTest, given1DimWorkGroupAndSquaredAlgorithmOnWhenComputeCalledThenSquaredAlgorithmIsNotExecuted) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(true);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(true);
 
     WorkSizeInfo wsInfo(256, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, false, false, false);
     uint32_t workDim = 1;
@@ -420,7 +674,7 @@ TEST_F(LocalWorkSizeTest, given1DimWorkGroupAndSquaredAlgorithmOnWhenComputeCall
 
 TEST_F(LocalWorkSizeTest, given2DdispatchWithImagesAndSquaredAlgorithmOnWhenLwsIsComputedThenSquaredAlgorithmIsNotExecuted) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(true);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(true);
 
     WorkSizeInfo wsInfo(256, 0u, 32, 0u, rootDeviceEnvironment, 32u, 0u, true, false, false);
     uint32_t workDim = 2;
@@ -768,7 +1022,7 @@ TEST_F(LocalWorkSizeTest, given2DimWorkWhenComputeSquaredCalledThenLocalGroupCom
 
 TEST_F(LocalWorkSizeTest, givenDeviceSupportingLws1024AndKernelCompiledInSimd8WhenGwsIs1024ThenLwsIsComputedAsMaxOptimalMultipliedBySimd) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
     WorkSizeInfo wsInfo(1024, 0u, 8, 0u, rootDeviceEnvironment, 56u, 0u, false, false, false);
 
     uint32_t workDim = 2;
@@ -783,7 +1037,7 @@ TEST_F(LocalWorkSizeTest, givenDeviceSupportingLws1024AndKernelCompiledInSimd8Wh
 
 TEST_F(LocalWorkSizeTest, givenDeviceWith36ThreadsPerSubsliceWhenSimd16KernelIsBeingSubmittedThenWorkgroupContainsOf8HwThreads) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
     WorkSizeInfo wsInfo(256, 0u, 16, 0u, rootDeviceEnvironment, 36u, 0u, false, false, false);
 
     uint32_t workDim = 2;
@@ -798,7 +1052,7 @@ TEST_F(LocalWorkSizeTest, givenDeviceWith36ThreadsPerSubsliceWhenSimd16KernelIsB
 
 TEST_F(LocalWorkSizeTest, givenDeviceWith56ThreadsPerSubsliceWhenSimd16KernelIsBeingSubmittedThenWorkgroupContainsOf16HwThreads) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
     WorkSizeInfo wsInfo(256, 0u, 16, 0u, rootDeviceEnvironment, 56u, 0u, false, false, false);
 
     uint32_t workDim = 2;
@@ -813,7 +1067,8 @@ TEST_F(LocalWorkSizeTest, givenDeviceWith56ThreadsPerSubsliceWhenSimd16KernelIsB
 
 TEST_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenItHasCorrectNumberOfThreads) {
     MockClDevice device{new MockDevice};
-    MockKernelWithInternals kernel(device);
+    MockContext mockCtx(&device);
+    MockKernelWithInternals kernel(mockCtx);
     DispatchInfo dispatchInfo;
     dispatchInfo.setClDevice(&device);
     dispatchInfo.setKernel(kernel.mockKernel);
@@ -829,35 +1084,18 @@ TEST_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenItHasCor
     EXPECT_EQ(workSizeInfo.numThreadsPerSubSlice, threadsPerEu * euPerSubSlice);
 }
 
-HWTEST2_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenWorkgroupSizeIsCorrect, IsAtMostGen11) {
-    MockClDevice device{new MockDevice};
-    MockKernelWithInternals kernel(device);
-    kernel.kernelInfo.kernelDescriptor.kernelAttributes.barrierCount = 1;
-    DispatchInfo dispatchInfo;
-    dispatchInfo.setClDevice(&device);
-    dispatchInfo.setKernel(kernel.mockKernel);
-
-    const uint32_t maxBarriersPerHSlice = (defaultHwInfo->platform.eRenderCoreFamily >= IGFX_GEN9_CORE) ? 32 : 16;
-    const uint32_t nonFusedMinWorkGroupSize = static_cast<uint32_t>(device.getSharedDeviceInfo().maxNumEUsPerSubSlice) *
-                                              device.getSharedDeviceInfo().numThreadsPerEU *
-                                              static_cast<uint32_t>(kernel.mockKernel->getKernelInfo().getMaxSimdSize()) /
-                                              maxBarriersPerHSlice;
-    WorkSizeInfo workSizeInfo = createWorkSizeInfoFromDispatchInfo(dispatchInfo);
-
-    EXPECT_EQ(nonFusedMinWorkGroupSize, workSizeInfo.minWorkGroupSize);
-}
-
 using IsCoreWithFusedEu = IsWithinGfxCore<IGFX_GEN12LP_CORE, IGFX_XE_HP_CORE>;
 
 HWTEST2_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenTestEuFusionFtr, IsCoreWithFusedEu) {
     MockClDevice device{new MockDevice};
-    MockKernelWithInternals kernel(device);
+    MockContext mockCtx(&device);
+    MockKernelWithInternals kernel(mockCtx);
     kernel.kernelInfo.kernelDescriptor.kernelAttributes.barrierCount = 1;
     DispatchInfo dispatchInfo;
     dispatchInfo.setClDevice(&device);
     dispatchInfo.setKernel(kernel.mockKernel);
 
-    const uint32_t maxBarriersPerHSlice = (defaultHwInfo->platform.eRenderCoreFamily >= IGFX_GEN9_CORE) ? 32 : 16;
+    const uint32_t maxBarriersPerHSlice = 32;
     const uint32_t nonFusedMinWorkGroupSize = static_cast<uint32_t>(device.getSharedDeviceInfo().maxNumEUsPerSubSlice) *
                                               device.getSharedDeviceInfo().numThreadsPerEU *
                                               static_cast<uint32_t>(kernel.mockKernel->getKernelInfo().getMaxSimdSize()) /
@@ -869,10 +1107,11 @@ HWTEST2_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenTestE
     EXPECT_EQ(fusedMinWorkGroupSize, workSizeInfo.minWorkGroupSize);
 }
 
-HWTEST2_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenTestEuFusionFtrForcedByDebugManager, IsAtLeastGen12lp) {
+HWTEST_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenTestEuFusionFtrForcedByDebugManager) {
     DebugManagerStateRestore dbgRestore;
     MockClDevice device{new MockDevice};
-    MockKernelWithInternals kernel(device);
+    MockContext mockCtx(&device);
+    MockKernelWithInternals kernel(mockCtx);
     kernel.kernelInfo.kernelDescriptor.kernelAttributes.barrierCount = 1;
     DispatchInfo dispatchInfo;
     dispatchInfo.setClDevice(&device);
@@ -887,20 +1126,20 @@ HWTEST2_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenTestE
 
     {
         const bool fusedEuDispatchDisabled = true;
-        DebugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
+        debugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
         WorkSizeInfo workSizeInfo = createWorkSizeInfoFromDispatchInfo(dispatchInfo);
         EXPECT_EQ(nonFusedMinWorkGroupSize, workSizeInfo.minWorkGroupSize);
     }
 
     {
         const bool fusedEuDispatchDisabled = false;
-        DebugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
+        debugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
         WorkSizeInfo workSizeInfo = createWorkSizeInfoFromDispatchInfo(dispatchInfo);
         EXPECT_EQ(fusedMinWorkGroupSize, workSizeInfo.minWorkGroupSize);
     }
 }
 
-HWTEST2_F(LocalWorkSizeTest, givenWorkSizeInfoIsCreatedWithHwInfoThenTestEuFusionFtrForcedByDebugManager, IsAtLeastGen12lp) {
+HWTEST_F(LocalWorkSizeTest, givenWorkSizeInfoIsCreatedWithHwInfoThenTestEuFusionFtrForcedByDebugManager) {
     DebugManagerStateRestore dbgRestore;
 
     const uint32_t nonFusedMinWorkGroupSize = 36 * 16 / 32;
@@ -909,14 +1148,14 @@ HWTEST2_F(LocalWorkSizeTest, givenWorkSizeInfoIsCreatedWithHwInfoThenTestEuFusio
 
     {
         const bool fusedEuDispatchDisabled = true;
-        DebugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
+        debugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
         WorkSizeInfo workSizeInfo(512, 1u, 16, 0u, rootDeviceEnvironment, 36u, 0u, false, false, false);
         EXPECT_EQ(nonFusedMinWorkGroupSize, workSizeInfo.minWorkGroupSize);
     }
 
     {
         const bool fusedEuDispatchDisabled = false;
-        DebugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
+        debugManager.flags.CFEFusedEUDispatch.set(fusedEuDispatchDisabled);
         WorkSizeInfo workSizeInfo(512, 1u, 16, 0u, rootDeviceEnvironment, 36u, 0u, false, false, false);
         EXPECT_EQ(fusedMinWorkGroupSize, workSizeInfo.minWorkGroupSize);
     }
@@ -924,7 +1163,8 @@ HWTEST2_F(LocalWorkSizeTest, givenWorkSizeInfoIsCreatedWithHwInfoThenTestEuFusio
 
 TEST_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenHasBarriersIsCorrectlySet) {
     MockClDevice device{new MockDevice};
-    MockKernelWithInternals kernel(device);
+    MockContext mockCtx(&device);
+    MockKernelWithInternals kernel(mockCtx);
     DispatchInfo dispatchInfo;
     dispatchInfo.setClDevice(&device);
     dispatchInfo.setKernel(kernel.mockKernel);
@@ -934,6 +1174,23 @@ TEST_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenHasBarri
 
     kernel.kernelInfo.kernelDescriptor.kernelAttributes.barrierCount = 1;
     EXPECT_TRUE(createWorkSizeInfoFromDispatchInfo(dispatchInfo).hasBarriers);
+}
+
+TEST_F(LocalWorkSizeTest, givenDispatchInfoWhenWorkSizeInfoIsCreatedThenHasCorrectWgCountPerSubslice) {
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.OverridePreferredWorkgroupCountPerSubslice.set(0);
+
+    MockClDevice device{new MockDevice};
+    MockContext mockCtx(&device);
+    MockKernelWithInternals kernel(mockCtx);
+    DispatchInfo dispatchInfo;
+    dispatchInfo.setClDevice(&device);
+    dispatchInfo.setKernel(kernel.mockKernel);
+
+    EXPECT_EQ(0U, createWorkSizeInfoFromDispatchInfo(dispatchInfo).preferredWgCountPerSubSlice);
+
+    debugManager.flags.OverridePreferredWorkgroupCountPerSubslice.set(4);
+    EXPECT_EQ(4U, createWorkSizeInfoFromDispatchInfo(dispatchInfo).preferredWgCountPerSubSlice);
 }
 
 TEST_F(LocalWorkSizeTest, givenMaxWorkgroupSizeEqualToSimdSizeWhenLwsIsCalculatedThenItIsDownsizedToMaxWorkgroupSize) {
@@ -969,7 +1226,7 @@ TEST_F(LocalWorkSizeTest, givenGwsWithSmallXAndBigYWhenLwsIsCalculatedThenDescen
 
     // Enforce ratio requirement
     wsInfo.yTiledSurfaces = false;
-    wsInfo.slmTotalSize = 128U;
+    wsInfo.slmTotalSizePerThreadGroup = 128U;
     NEO::choosePrefferedWorkgroupSize(wsInfo, workGroupSize, workGroup, workDim);
     EXPECT_EQ(workGroupSize[0], 2u);
     EXPECT_EQ(workGroupSize[1], 128u);

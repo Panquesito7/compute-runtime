@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,7 +16,7 @@
 
 namespace NEO {
 
-extern CommandStreamReceiverCreateFunc commandStreamReceiverFactory[2 * IGFX_MAX_CORE];
+extern CommandStreamReceiverCreateFunc commandStreamReceiverFactory[2 * NEO::maxCoreEnumValue];
 
 template <typename BaseCSR>
 CommandStreamReceiverWithAUBDump<BaseCSR>::CommandStreamReceiverWithAUBDump(const std::string &baseName,
@@ -25,10 +25,11 @@ CommandStreamReceiverWithAUBDump<BaseCSR>::CommandStreamReceiverWithAUBDump(cons
                                                                             const DeviceBitfield deviceBitfield)
     : BaseCSR(executionEnvironment, rootDeviceIndex, deviceBitfield) {
     bool isAubManager = executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->aubCenter && executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->aubCenter->getAubManager();
-    bool isTbxMode = CommandStreamReceiverType::CSR_TBX == BaseCSR::getType();
+    bool isTbxMode = CommandStreamReceiverType::tbx == BaseCSR::getType();
     bool createAubCsr = (isAubManager && isTbxMode) ? false : true;
     if (createAubCsr) {
         aubCSR.reset(AUBCommandStreamReceiver::create(baseName, false, executionEnvironment, rootDeviceIndex, deviceBitfield));
+        UNRECOVERABLE_IF(!aubCSR);
         UNRECOVERABLE_IF(!aubCSR->initializeTagAllocation());
 
         uint32_t subDevices = static_cast<uint32_t>(this->deviceBitfield.count());
@@ -36,7 +37,7 @@ CommandStreamReceiverWithAUBDump<BaseCSR>::CommandStreamReceiverWithAUBDump(cons
 
         for (uint32_t i = 0; i < subDevices; i++) {
             *tagAddressToInitialize = std::numeric_limits<uint32_t>::max();
-            tagAddressToInitialize = ptrOffset(tagAddressToInitialize, this->postSyncWriteOffset);
+            tagAddressToInitialize = ptrOffset(tagAddressToInitialize, this->immWritePostSyncWriteOffset);
         }
     }
 }
@@ -99,11 +100,19 @@ void CommandStreamReceiverWithAUBDump<BaseCSR>::addAubComment(const char *commen
 }
 
 template <typename BaseCSR>
-void CommandStreamReceiverWithAUBDump<BaseCSR>::pollForCompletion() {
+void CommandStreamReceiverWithAUBDump<BaseCSR>::pollForCompletion(bool skipTaskCountCheck) {
     if (aubCSR) {
-        aubCSR->pollForCompletion();
+        aubCSR->pollForCompletion(skipTaskCountCheck);
     }
-    BaseCSR::pollForCompletion();
+    BaseCSR::pollForCompletion(skipTaskCountCheck);
+}
+
+template <typename BaseCSR>
+void CommandStreamReceiverWithAUBDump<BaseCSR>::pollForAubCompletion() {
+    if (aubCSR) {
+        aubCSR->pollForCompletion(true);
+    }
+    BaseCSR::pollForAubCompletion();
 }
 
 template <typename BaseCSR>
@@ -115,4 +124,69 @@ bool CommandStreamReceiverWithAUBDump<BaseCSR>::expectMemory(const void *gfxAddr
     }
     return BaseCSR::expectMemory(gfxAddress, srcAddress, length, compareOperation);
 }
+
+template <typename BaseCSR>
+bool CommandStreamReceiverWithAUBDump<BaseCSR>::writeMemory(GraphicsAllocation &gfxAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) {
+    const bool chunkWriteForAub = isChunkCopy && ((aubCSR == nullptr) || aubCSR->isChunkCopySupportedForSimulation());
+    const uint64_t aubChunkOffset = chunkWriteForAub ? gpuVaChunkOffset : 0;
+    const size_t aubChunkSize = chunkWriteForAub ? chunkSize : 0;
+    bool aubWriteStatus = true;
+    if (aubCSR && !aubCSR->isAubSubCaptureInactive()) {
+        aubWriteStatus = aubCSR->writeMemory(gfxAllocation,
+                                             chunkWriteForAub,
+                                             aubChunkOffset,
+                                             aubChunkSize);
+        DEBUG_BREAK_IF(!aubWriteStatus);
+    }
+
+    const bool chunkWriteForBase = isChunkCopy && BaseCSR::isChunkCopySupportedForSimulation();
+    const uint64_t baseChunkOffset = chunkWriteForBase ? gpuVaChunkOffset : 0;
+    const size_t baseChunkSize = chunkWriteForBase ? chunkSize : 0;
+    const bool baseWriteStatus = BaseCSR::writeMemory(gfxAllocation,
+                                                      chunkWriteForBase,
+                                                      baseChunkOffset,
+                                                      baseChunkSize);
+
+    if (BaseCSR::getType() == CommandStreamReceiverType::hardware) {
+        return aubCSR ? aubWriteStatus : baseWriteStatus;
+    }
+
+    if (aubCSR) {
+        return aubWriteStatus && baseWriteStatus;
+    }
+
+    return baseWriteStatus;
+}
+
+template <typename BaseCSR>
+bool CommandStreamReceiverWithAUBDump<BaseCSR>::isChunkCopySupportedForSimulation() const {
+    const bool aubChunkCopySupported = (aubCSR == nullptr) || aubCSR->isChunkCopySupportedForSimulation();
+    if (BaseCSR::getType() == CommandStreamReceiverType::hardware) {
+        return aubChunkCopySupported;
+    }
+
+    return BaseCSR::isChunkCopySupportedForSimulation() || aubChunkCopySupported;
+}
+
+template <typename BaseCSR>
+void CommandStreamReceiverWithAUBDump<BaseCSR>::setWritableForSimulation(bool writable, GraphicsAllocation &gfxAllocation) {
+    BaseCSR::setWritableForSimulation(writable, gfxAllocation);
+    if (aubCSR && !aubCSR->isAubSubCaptureInactive()) {
+        aubCSR->setWritableForSimulation(writable, gfxAllocation);
+    }
+}
+
+template <typename BaseCSR>
+bool CommandStreamReceiverWithAUBDump<BaseCSR>::isAubSubCaptureInactive() const {
+    return aubCSR != nullptr && aubCSR->isAubSubCaptureInactive();
+}
+
+template <typename BaseCSR>
+void CommandStreamReceiverWithAUBDump<BaseCSR>::writePooledMemory(SharedPoolAllocation &sharedPoolAllocation, bool initFullPageTables) {
+    if (aubCSR) {
+        aubCSR->writePooledMemory(sharedPoolAllocation, initFullPageTables);
+    }
+    BaseCSR::writePooledMemory(sharedPoolAllocation, initFullPageTables);
+}
+
 } // namespace NEO

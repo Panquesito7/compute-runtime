@@ -1,30 +1,32 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/windows/gmm_memory.h"
+#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/surface_format_info.h"
 #include "shared/source/memory_manager/gfx_partition.h"
 #include "shared/source/os_interface/linux/os_time_linux.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/os_time.h"
-#include "shared/source/os_interface/product_helper.h"
 #include "shared/source/os_interface/windows/device_time_wddm.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
+#include "shared/source/os_interface/windows/hw_device_id.h"
 #include "shared/source/os_interface/windows/os_environment_win.h"
 #include "shared/source/os_interface/windows/wddm/um_km_data_translator.h"
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 #include "shared/source/os_interface/windows/wddm_memory_manager.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/mocks/mock_gmm_client_context.h"
 #include "shared/test/common/test_macros/hw_test.h"
-
-#include "gmm_memory.h"
 
 struct MockWddmLinux : NEO::Wddm {
     MockWddmLinux(std::unique_ptr<NEO::HwDeviceIdWddm> hwDeviceId, NEO::RootDeviceEnvironment &rootDeviceEnvironment)
@@ -62,9 +64,11 @@ struct MockWddmLinux : NEO::Wddm {
     std::vector<void *> validAddressRangeReleases;
 
     using Wddm::featureTable;
+    using Wddm::getReadOnlyFlagValue;
     using Wddm::gfxPartition;
     using Wddm::gfxPlatform;
     using Wddm::gmmMemory;
+    using Wddm::isReadOnlyFlagFallbackSupported;
 };
 
 struct MockGmmMemoryWddmLinux : NEO::GmmMemory {
@@ -82,8 +86,8 @@ struct MockWddmLinuxMemoryManager : NEO::WddmMemoryManager {
     using WddmMemoryManager::allocatePhysicalLocalDeviceMemory;
     using WddmMemoryManager::createPhysicalAllocation;
     using WddmMemoryManager::localMemorySupported;
-    using WddmMemoryManager::mapPhysicalToVirtualMemory;
-    using WddmMemoryManager::unMapPhysicalToVirtualMemory;
+    using WddmMemoryManager::mapPhysicalDeviceMemoryToVirtualMemory;
+    using WddmMemoryManager::unMapPhysicalDeviceMemoryFromVirtualMemory;
     using WddmMemoryManager::WddmMemoryManager;
     NTSTATUS createInternalNTHandle(D3DKMT_HANDLE *resourceHandle, HANDLE *ntHandle, uint32_t rootDeviceIndex) override {
         if (failCreateInternalNTHandle) {
@@ -227,7 +231,7 @@ struct WddmLinuxTest : public ::testing::Test {
         auto gmmHelper = rootDeviceEnvironment.getGmmHelper();
 
         wddm->gmmMemory = std::make_unique<MockGmmMemoryWddmLinux>(gmmHelper->getClientContext());
-        *wddm->gfxPlatform = NEO::defaultHwInfo->platform;
+        static_cast<PLATFORM &>(*wddm->gfxPlatform) = NEO::defaultHwInfo->platform;
 
         rootDeviceEnvironment.osInterface.reset(new NEO::OSInterface);
         rootDeviceEnvironment.osInterface->setDriverModel(std::move(wddm));
@@ -256,7 +260,7 @@ HWTEST2_F(GmmTestsDG2, givenGmmForImageWithForceLocalMemThenNonLocalIsSetToFalse
     const_cast<NEO::HardwareInfo *>(mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo())->featureTable.flags.ftrLocalMemory = 1u;
 
     NEO::ImageDescriptor imgDesc = {};
-    imgDesc.imageType = NEO::ImageType::Image2DArray;
+    imgDesc.imageType = NEO::ImageType::image2DArray;
     imgDesc.imageWidth = 60;
     imgDesc.imageHeight = 1;
     imgDesc.imageDepth = 1;
@@ -271,16 +275,17 @@ HWTEST2_F(GmmTestsDG2, givenGmmForImageWithForceLocalMemThenNonLocalIsSetToFalse
     storageInfo.systemMemoryPlacement = false;
 
     std::unique_ptr<NEO::Gmm> gmm(new NEO::Gmm(mockExecEnv.rootDeviceEnvironments[0]->getGmmHelper(), imgInfo, storageInfo, false));
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm->resourceParamsData.data());
 
-    EXPECT_EQ(gmm->resourceParams.Flags.Info.NonLocalOnly, 0u);
-    EXPECT_EQ(gmm->resourceParams.Flags.Info.LocalOnly, 1u);
+    EXPECT_EQ(gmmResourceParams->Flags.Info.NonLocalOnly, 0u);
+    EXPECT_EQ(gmmResourceParams->Flags.Info.LocalOnly, 1u);
 }
 
 using WddmLinuxConfigureDeviceAddressSpaceTest = WddmLinuxTest;
 
 TEST_F(WddmLinuxConfigureDeviceAddressSpaceTest, givenSvmAddressSpaceThenReserveGpuVAForUSM) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace < MemoryConstants::max64BitAppAddress || productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace < MemoryConstants::max64BitAppAddress || hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -297,8 +302,8 @@ TEST_F(WddmLinuxConfigureDeviceAddressSpaceTest, givenSvmAddressSpaceThenReserve
 }
 
 TEST_F(WddmLinuxConfigureDeviceAddressSpaceTest, givenPreReservedSvmAddressSpaceThenMakeSureWholeGpuVAForUSMIsReservedAndProperlyAligned) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace < MemoryConstants::max64BitAppAddress || productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace < MemoryConstants::max64BitAppAddress || hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -342,8 +347,8 @@ TEST_F(WddmLinuxConfigureDeviceAddressSpaceTest, givenNonSvmAddressSpaceThenRese
 using WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest = WddmLinuxConfigureDeviceAddressSpaceTest;
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, whenFailedToReadProceesPartitionLayoutThenFail) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -369,8 +374,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, whenFailedToTransla
         }
     };
 
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -388,8 +393,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, whenFailedToTransla
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenPreconfiguredAddressSpaceFromKmdThenUseIt) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -409,8 +414,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenPreconfiguredA
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfiguredAddressSpaceFromKmdThenConfigureOneAndUpdateKmdItInKmd) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -427,8 +432,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfigure
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfiguredAddressSpaceFromKmdWhenFailedToReserveValidCpuAddressRangeThenFail) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -448,8 +453,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfigure
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfiguredAddressSpaceFromKmdWhenUpdatingItInKmdAndFailedToTranslateThenFail) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -478,8 +483,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfigure
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfiguredAddressSpaceFromKmdWhenKmdGotJustUpdatedByDifferentClientThenUseItsAddressSpaceConfiguration) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -501,8 +506,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfigure
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfiguredAddressSpaceFromKmdThenConfigureOneBasedOnAligmentAndSizeRequirements) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -541,8 +546,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenNoPreconfigure
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenTwoSvmAddressSpacesThenReserveGpuVAForBoth) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -584,8 +589,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenTwoSvmAddressS
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenTwoSvmAddressSpacesWhenReservGpuVAForFirstOneFailsThenFail) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -606,8 +611,8 @@ TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenTwoSvmAddressS
 }
 
 TEST_F(WddmLinuxConfigureReduced48bitDeviceAddressSpaceTest, givenTwoSvmAddressSpacesWhenReservGpuVAForSecondOneFailsThenFail) {
-    auto &productHelper = mockExecEnv.rootDeviceEnvironments[0]->getHelper<NEO::ProductHelper>();
-    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !productHelper.overrideGfxPartitionLayoutForWsl()) {
+    const auto &hwInfo = *mockExecEnv.rootDeviceEnvironments[0]->getHardwareInfo();
+    if (NEO::hardwareInfoTable[productFamily]->capabilityTable.gpuAddressSpace != MemoryConstants::max64BitAppAddress && !hwInfo.caps.overrideGfxPartitionLayoutForWsl) {
         GTEST_SKIP();
     }
 
@@ -638,7 +643,7 @@ TEST_F(WddmLinuxTest, givenRequestFor32bitAllocationWithoutPreexistingHostPtrWhe
     NEO::AllocationData allocData = {};
     allocData.size = 64U;
 
-    auto alloc = memoryManager.allocate32BitGraphicsMemoryImpl(allocData, false);
+    auto alloc = memoryManager.allocate32BitGraphicsMemoryImpl(allocData);
     EXPECT_NE(nullptr, alloc);
     memoryManager.freeGraphicsMemoryImpl(alloc);
 
@@ -660,7 +665,7 @@ TEST_F(WddmLinuxTest, givenRequestFor32bitAllocationWithoutPreexistingHostPtrWhe
     NEO::AllocationData allocData = {};
     allocData.size = 3U;
 
-    auto alloc = memoryManager.allocate32BitGraphicsMemoryImpl(allocData, false);
+    auto alloc = memoryManager.allocate32BitGraphicsMemoryImpl(allocData);
     ASSERT_NE(nullptr, alloc);
     EXPECT_TRUE(isAligned<MemoryConstants::allocationAlignment>(alloc->getUnderlyingBufferSize()));
     memoryManager.freeGraphicsMemoryImpl(alloc);
@@ -700,16 +705,16 @@ TEST_F(WddmLinuxTest, givenAllocatedMemoryAndCloseInternalHandleThenSharedHandle
     auto alloc = memoryManager.allocatePhysicalDeviceMemory(allocData, status);
     ASSERT_NE(nullptr, alloc);
     uint64_t handle = 0;
-    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle));
+    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle, nullptr));
 
     memoryManager.closeInternalHandle(handle, 0u, alloc);
 
-    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle));
+    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle, nullptr));
 
     memoryManager.freeGraphicsMemoryImpl(alloc);
 }
 
-TEST_F(WddmLinuxTest, givenAllocatedMemoryAndCloseInternalHandleWihtoutAllocationThenSharedHandleStillClosed) {
+TEST_F(WddmLinuxTest, givenAllocatedMemoryAndCloseInternalHandleWithoutAllocationThenSharedHandleStillClosed) {
     osEnvironment->gdi->reserveGpuVirtualAddress = reserveDeviceAddressSpaceMock;
     osEnvironment->gdi->createAllocation2 = createAllocation2Mock;
     osEnvironment->gdi->mapGpuVirtualAddress = mapGpuVirtualAddressMock;
@@ -725,7 +730,7 @@ TEST_F(WddmLinuxTest, givenAllocatedMemoryAndCloseInternalHandleWihtoutAllocatio
     auto alloc = memoryManager.allocatePhysicalDeviceMemory(allocData, status);
     ASSERT_NE(nullptr, alloc);
     uint64_t handle = 0;
-    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle));
+    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle, nullptr));
 
     memoryManager.closeInternalHandle(handle, 0u, nullptr);
 
@@ -749,12 +754,12 @@ TEST_F(WddmLinuxTest, givenAllocatedMemoryAndCreateInternalHandleFailedThenEmpyH
     ASSERT_NE(nullptr, alloc);
 
     uint64_t handle = 0;
-    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle));
+    EXPECT_EQ(0, alloc->createInternalHandle(&memoryManager, 0u, handle, nullptr));
 
     memoryManager.closeInternalHandle(handle, 0u, alloc);
 
     memoryManager.failCreateInternalNTHandle = true;
-    EXPECT_EQ(1, alloc->createInternalHandle(&memoryManager, 0u, handle));
+    EXPECT_EQ(1, alloc->createInternalHandle(&memoryManager, 0u, handle, nullptr));
 
     memoryManager.freeGraphicsMemoryImpl(alloc);
 }
@@ -795,9 +800,33 @@ TEST_F(WddmLinuxTest, whenCheckedIfResourcesCleanupCanBeSkippedAndDeviceIsLostTh
     EXPECT_EQ(1, gdiMockConfig.getDeviceStateClb.callCount);
 }
 
+TEST_F(WddmLinuxTest, whenGettingReadOnlyFlagThenAlwaysReturnFalse) {
+    void *ptr = reinterpret_cast<void *>(0x1000);
+    EXPECT_FALSE(wddm->getReadOnlyFlagValue(ptr));
+
+    EXPECT_FALSE(wddm->getReadOnlyFlagValue(nullptr));
+}
+
+TEST_F(WddmLinuxTest, whenGettingReadOnlyFlagFallbackSupportThenFalseIsReturned) {
+    EXPECT_FALSE(wddm->isReadOnlyFlagFallbackSupported());
+}
+
+TEST_F(WddmLinuxTest, GivenWddmDriverModelWhenLatePreemptionStartSupportIsCheckedThenCorrectValueIsReturned) {
+    DebugManagerStateRestore restorer;
+
+    debugManager.flags.OverrideLatePreemptionStart.set(-1);
+    EXPECT_FALSE(wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+
+    debugManager.flags.OverrideLatePreemptionStart.set(0);
+    EXPECT_FALSE(wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+
+    debugManager.flags.OverrideLatePreemptionStart.set(1);
+    EXPECT_TRUE(wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+}
+
 class MockOsTimeLinux : public NEO::OSTimeLinux {
   public:
-    MockOsTimeLinux(NEO::OSInterface *osInterface, std::unique_ptr<NEO::DeviceTime> deviceTime) : NEO::OSTimeLinux(osInterface, std::move(deviceTime)) {}
+    MockOsTimeLinux(NEO::OSInterface &osInterface, std::unique_ptr<NEO::DeviceTime> deviceTime) : NEO::OSTimeLinux(osInterface, std::move(deviceTime)) {}
     bool getCpuTime(uint64_t *timeStamp) override {
         osTimeGetCpuTimeWasCalled = true;
         *timeStamp = 0x1234;
@@ -814,27 +843,27 @@ class MockDeviceTimeWddm : public NEO::DeviceTimeWddm {
     }
 };
 
-TEST(OSTimeWinLinuxTests, givenOSInterfaceWhenGetCpuGpuTimeThenGetCpuTimeFromOsTimeWasCalled) {
+TEST(OSTimeWinLinuxTests, givenOSInterfaceWhenGetGpuCpuTimeThenGetCpuTimeFromOsTimeWasCalled) {
 
-    NEO::TimeStampData cpuGpuTime01 = {0};
+    NEO::TimeStampData gpuCpuTime01 = {0};
 
     std::unique_ptr<NEO::HwDeviceIdWddm> hwDeviceIdIn;
     auto osEnvironment = std::make_unique<NEO::OsEnvironmentWin>();
     osEnvironment->gdi->closeAdapter = closeAdapterMock;
     osEnvironment->gdi->reserveGpuVirtualAddress = reserveDeviceAddressSpaceMock;
     NEO::MockExecutionEnvironment mockExecEnv;
-    NEO::MockRootDeviceEnvironment mockRootDeviceEnvironment{mockExecEnv};
+    auto &rootDeviceEnvironment = *mockExecEnv.rootDeviceEnvironments[0];
     hwDeviceIdIn.reset(new NEO::HwDeviceIdWddm(NULL_HANDLE, LUID{}, 1u, osEnvironment.get(), std::make_unique<NEO::UmKmDataTranslator>()));
 
-    std::unique_ptr<NEO::OSInterface> osInterface(new NEO::OSInterface());
+    rootDeviceEnvironment.osInterface = std::make_unique<NEO::OSInterface>();
 
-    std::unique_ptr<MockWddmLinux> wddm = std::make_unique<MockWddmLinux>(std::move(hwDeviceIdIn), mockRootDeviceEnvironment);
-    *wddm->gfxPlatform = NEO::defaultHwInfo->platform;
-    mockRootDeviceEnvironment.setHwInfoAndInitHelpers(NEO::defaultHwInfo.get());
+    std::unique_ptr<MockWddmLinux> wddm = std::make_unique<MockWddmLinux>(std::move(hwDeviceIdIn), rootDeviceEnvironment);
+    static_cast<PLATFORM &>(*wddm->gfxPlatform) = NEO::defaultHwInfo->platform;
+    rootDeviceEnvironment.setHwInfoAndInitHelpers(NEO::defaultHwInfo.get());
     auto mockDeviceTimeWddm = std::make_unique<MockDeviceTimeWddm>(wddm.get());
-    osInterface->setDriverModel(std::move(wddm));
+    rootDeviceEnvironment.osInterface->setDriverModel(std::move(wddm));
     std::unique_ptr<NEO::DeviceTime> deviceTime = std::unique_ptr<NEO::DeviceTime>(mockDeviceTimeWddm.release());
-    auto osTime = std::unique_ptr<MockOsTimeLinux>(new MockOsTimeLinux(osInterface.get(), std::move(deviceTime)));
-    osTime->getCpuGpuTime(&cpuGpuTime01);
+    auto osTime = std::unique_ptr<MockOsTimeLinux>(new MockOsTimeLinux(*rootDeviceEnvironment.osInterface, std::move(deviceTime)));
+    osTime->getGpuCpuTime(&gpuCpuTime01);
     EXPECT_TRUE(osTime->osTimeGetCpuTimeWasCalled);
 }

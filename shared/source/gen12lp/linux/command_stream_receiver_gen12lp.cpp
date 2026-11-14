@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,11 +9,11 @@
 #include "shared/source/gen12lp/hw_cmds.h"
 #include "shared/source/os_interface/linux/device_command_stream.inl"
 #include "shared/source/os_interface/linux/drm_command_stream.inl"
-#include "shared/source/os_interface/linux/drm_command_stream_bdw_and_later.inl"
 
 namespace NEO {
 
 template class DeviceCommandStreamReceiver<Gen12LpFamily>;
 template class DrmCommandStreamReceiver<Gen12LpFamily>;
 template class CommandStreamReceiverWithAUBDump<DrmCommandStreamReceiver<Gen12LpFamily>>;
+static_assert(NEO::NonCopyableAndNonMovable<CommandStreamReceiverWithAUBDump<DrmCommandStreamReceiver<Gen12LpFamily>>>);
 } // namespace NEO

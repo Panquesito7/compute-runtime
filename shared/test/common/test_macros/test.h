@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -29,7 +29,7 @@ struct Test
 
 #define TEST_MAX_LENGTH 140
 #define CHECK_TEST_NAME_LENGTH_WITH_MAX(test_fixture, test_name, max_length) \
-    static_assert((NEO::defaultTestMode != NEO::TestMode::AubTests && NEO::defaultTestMode != NEO::TestMode::AubTestsWithTbx) || (sizeof(#test_fixture) + sizeof(#test_name) <= max_length), "Test and fixture names length exceeds max allowed size: " TO_STR(max_length));
+    static_assert((NEO::defaultTestMode != NEO::TestMode::aubTests && NEO::defaultTestMode != NEO::TestMode::aubTestsWithTbx) || (sizeof(#test_fixture) + sizeof(#test_name) <= max_length), "Test and fixture names length exceeds max allowed size: " TO_STR(max_length));
 #define CHECK_TEST_NAME_LENGTH(test_fixture, test_name) \
     CHECK_TEST_NAME_LENGTH_WITH_MAX(test_fixture, test_name, TEST_MAX_LENGTH)
 
@@ -55,6 +55,12 @@ struct Test
       public:                                                                                                                                             \
         GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)                                                                                                \
         () {}                                                                                                                                             \
+        GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)                                                                                                \
+        (const GTEST_TEST_CLASS_NAME_(test_suite_name, test_name) &) = delete;                                                                            \
+        GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)                                                                                                \
+        (GTEST_TEST_CLASS_NAME_(test_suite_name, test_name) &&) = delete;                                                                                 \
+        GTEST_TEST_CLASS_NAME_(test_suite_name, test_name) &operator=(const GTEST_TEST_CLASS_NAME_(test_suite_name, test_name) &) = delete;               \
+        GTEST_TEST_CLASS_NAME_(test_suite_name, test_name) &operator=(GTEST_TEST_CLASS_NAME_(test_suite_name, test_name) &&) = delete;                    \
         void TestBody() override;                                                                                                                         \
                                                                                                                                                           \
       private:                                                                                                                                            \
@@ -65,12 +71,11 @@ struct Test
                     #test_suite_name,                                                                                                                     \
                     #test_name,                                                                                                                           \
                     new ::testing::internal::TestMetaFactory<                                                                                             \
-                        GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)>());                                                                           \
+                        GTEST_TEST_CLASS_NAME_(test_suite_name, test_name)>(),                                                                            \
+                    ::testing::internal::CodeLocation(__FILE__, __LINE__));                                                                               \
             return 0;                                                                                                                                     \
         }                                                                                                                                                 \
         static int gtest_registering_dummy_;                                                                                                              \
-        GTEST_DISALLOW_COPY_AND_ASSIGN_(                                                                                                                  \
-            GTEST_TEST_CLASS_NAME_(test_suite_name, test_name));                                                                                          \
     };                                                                                                                                                    \
     int GTEST_TEST_CLASS_NAME_(test_suite_name,                                                                                                           \
                                test_name)::gtest_registering_dummy_ =                                                                                     \

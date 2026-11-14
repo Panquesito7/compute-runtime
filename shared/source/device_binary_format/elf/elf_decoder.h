@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "shared/source/device_binary_format/elf/elf.h"
 #include "shared/source/utilities/arrayref.h"
 #include "shared/source/utilities/const_stringref.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/stackvec.h"
 
 #include <cstdint>
@@ -17,23 +18,20 @@ namespace NEO {
 
 namespace Elf {
 
-enum class RELOCATION_X8664_TYPE : uint32_t {
-    R_X8664_64 = 0x1,
-    R_X8664_32 = 0xa
+template <ElfIdentifierClass numBits = EI_CLASS_64>
+struct ProgramHeaderAndData {
+    const ElfProgramHeader<numBits> *header = nullptr;
+    ArrayRef<const uint8_t> data;
 };
 
-template <ELF_IDENTIFIER_CLASS NumBits = EI_CLASS_64>
+template <ElfIdentifierClass numBits = EI_CLASS_64>
+struct SectionHeaderAndData {
+    const ElfSectionHeader<numBits> *header;
+    ArrayRef<const uint8_t> data;
+};
+
+template <ElfIdentifierClass numBits = EI_CLASS_64>
 struct Elf {
-    struct ProgramHeaderAndData {
-        const ElfProgramHeader<NumBits> *header = nullptr;
-        ArrayRef<const uint8_t> data;
-    };
-
-    struct SectionHeaderAndData {
-        const ElfSectionHeader<NumBits> *header;
-        ArrayRef<const uint8_t> data;
-    };
-
     struct RelocationInfo {
         int symbolSectionIndex;
         int symbolTableIndex;
@@ -44,7 +42,7 @@ struct Elf {
         std::string symbolName;
     };
     using Relocations = std::vector<RelocationInfo>;
-    using SymbolsTable = std::vector<ElfSymbolEntry<NumBits>>;
+    using SymbolsTable = std::vector<ElfSymbolEntry<numBits>>;
 
     bool decodeSections(std::string &outError);
 
@@ -64,20 +62,28 @@ struct Elf {
     }
 
     MOCKABLE_VIRTUAL std::string getSectionName(uint32_t id) const {
-        auto sectionHeaderNamesData = sectionHeaders[elfFileHeader->shStrNdx].data;
-        return std::string(reinterpret_cast<const char *>(sectionHeaderNamesData.begin()) + sectionHeaders[id].header->name);
+        if (sectionHeaders.size() > id && sectionHeaders.size() > elfFileHeader->shStrNdx) {
+            auto sectionHeaderNamesData = sectionHeaders[elfFileHeader->shStrNdx].data;
+            return std::string(reinterpret_cast<const char *>(sectionHeaderNamesData.begin()) + sectionHeaders[id].header->name);
+        } else {
+            return std::string("");
+        }
     }
 
-    MOCKABLE_VIRTUAL std::string getSymbolName(uint32_t nameOffset) const {
+    std::string getName(uint32_t nameOffset) const {
         auto sectionHeaderNamesData = sectionHeaders[elfFileHeader->shStrNdx].data;
         return std::string(reinterpret_cast<const char *>(sectionHeaderNamesData.begin()) + nameOffset);
     }
 
-    decltype(ElfSymbolEntry<NumBits>::value) getSymbolValue(uint32_t idx) const {
+    MOCKABLE_VIRTUAL std::string getSymbolName(uint32_t nameOffset) const {
+        return getName(nameOffset);
+    }
+
+    decltype(ElfSymbolEntry<numBits>::value) getSymbolValue(uint32_t idx) const {
         return symbolTable[idx].value;
     }
 
-    decltype(ElfSectionHeader<NumBits>::offset) getSectionOffset(uint32_t idx) const {
+    decltype(ElfSectionHeader<numBits>::offset) getSectionOffset(uint32_t idx) const {
         return sectionHeaders[idx].header->offset;
     }
 
@@ -93,13 +99,13 @@ struct Elf {
         return symbolTable;
     }
 
-    const ElfFileHeader<NumBits> *elfFileHeader = nullptr;
-    StackVec<ProgramHeaderAndData, 32> programHeaders;
-    StackVec<SectionHeaderAndData, 32> sectionHeaders;
+    const ElfFileHeader<numBits> *elfFileHeader = nullptr;
+    StackVec<ProgramHeaderAndData<numBits>, 32> programHeaders;
+    StackVec<SectionHeaderAndData<numBits>, 32> sectionHeaders;
 
   protected:
-    bool decodeSymTab(SectionHeaderAndData &sectionHeaderData, std::string &outError);
-    bool decodeRelocations(SectionHeaderAndData &sectionHeaderData, std::string &outError);
+    bool decodeSymTab(SectionHeaderAndData<numBits> &sectionHeaderData, std::string &outError);
+    bool decodeRelocations(SectionHeaderAndData<numBits> &sectionHeaderData, std::string &outError);
     bool isDebugDataRelocation(ConstStringRef sectionName);
 
     SymbolsTable symbolTable;
@@ -107,26 +113,37 @@ struct Elf {
     Relocations debugInfoRelocations;
 };
 
-template <ELF_IDENTIFIER_CLASS NumBits = EI_CLASS_64>
-const ElfFileHeader<NumBits> *decodeElfFileHeader(const ArrayRef<const uint8_t> binary);
+struct DecodedNote {
+    ConstStringRef name;
+    ConstStringRef desc;
+    uint32_t type;
+};
+
+template <ElfIdentifierClass numBits = EI_CLASS_64>
+bool decodeNoteSection(ArrayRef<const uint8_t> sectionData, std::vector<DecodedNote> &out, std::string &outErrReason, std::string &outWarning);
+extern template bool decodeNoteSection<EI_CLASS_32>(ArrayRef<const uint8_t> sectionData, std::vector<DecodedNote> &out, std::string &outErrReason, std::string &outWarning);
+extern template bool decodeNoteSection<EI_CLASS_64>(ArrayRef<const uint8_t> sectionData, std::vector<DecodedNote> &out, std::string &outErrReason, std::string &outWarning);
+
+template <ElfIdentifierClass numBits = EI_CLASS_64>
+const ElfFileHeader<numBits> *decodeElfFileHeader(const ArrayRef<const uint8_t> binary);
 extern template const ElfFileHeader<EI_CLASS_32> *decodeElfFileHeader<EI_CLASS_32>(const ArrayRef<const uint8_t>);
 extern template const ElfFileHeader<EI_CLASS_64> *decodeElfFileHeader<EI_CLASS_64>(const ArrayRef<const uint8_t>);
 
-template <ELF_IDENTIFIER_CLASS NumBits = EI_CLASS_64>
-Elf<NumBits> decodeElf(const ArrayRef<const uint8_t> binary, std::string &outErrReason, std::string &outWarning);
+template <ElfIdentifierClass numBits = EI_CLASS_64>
+Elf<numBits> decodeElf(const ArrayRef<const uint8_t> binary, std::string &outErrReason, std::string &outWarning);
 extern template Elf<EI_CLASS_32> decodeElf<EI_CLASS_32>(const ArrayRef<const uint8_t>, std::string &, std::string &);
 extern template Elf<EI_CLASS_64> decodeElf<EI_CLASS_64>(const ArrayRef<const uint8_t>, std::string &, std::string &);
 
-template <ELF_IDENTIFIER_CLASS NumBits>
+template <ElfIdentifierClass numBits>
 inline bool isElf(const ArrayRef<const uint8_t> binary) {
-    return (nullptr != decodeElfFileHeader<NumBits>(binary));
+    return (nullptr != decodeElfFileHeader<numBits>(binary));
 }
 
 inline bool isElf(const ArrayRef<const uint8_t> binary) {
     return isElf<EI_CLASS_32>(binary) || isElf<EI_CLASS_64>(binary);
 }
 
-inline ELF_IDENTIFIER_CLASS getElfNumBits(const ArrayRef<const uint8_t> binary) {
+inline ElfIdentifierClass getElfNumBits(const ArrayRef<const uint8_t> binary) {
     if (isElf<EI_CLASS_32>(binary)) {
         return EI_CLASS_32;
     } else if (isElf<EI_CLASS_64>(binary)) {

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2023 Intel Corporation
+# Copyright (C) 2018-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -13,7 +13,6 @@ set(RUNTIME_SRCS_HELPERS_BASE
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_gfx_core_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_gfx_core_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_gfx_core_helper_base.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/cl_gfx_core_helper_bdw_and_later.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_gfx_core_helper_factory_init.inl
     ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR_SUFFIX}cl_memory_properties_helpers.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_memory_properties_helpers.h
@@ -27,6 +26,7 @@ set(RUNTIME_SRCS_HELPERS_BASE
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_info.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_info.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_info_builder.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/enable_family_full_ocl.h
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_properties.h
     ${CMAKE_CURRENT_SOURCE_DIR}/error_mappers.h
     ${CMAKE_CURRENT_SOURCE_DIR}/get_info_status_mapper.h
@@ -35,7 +35,6 @@ set(RUNTIME_SRCS_HELPERS_BASE
     ${CMAKE_CURRENT_SOURCE_DIR}/gmm_types_converter.h
     ${CMAKE_CURRENT_SOURCE_DIR}/hardware_commands_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/hardware_commands_helper_base.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/hardware_commands_helper_bdw_and_later.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/helper_options.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/implicit_scaling_ocl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/mipmap.cpp
@@ -57,9 +56,14 @@ if(SUPPORT_XEHP_AND_LATER)
        ${CMAKE_CURRENT_SOURCE_DIR}/hardware_commands_helper_xehp_and_later.inl
   )
 endif()
-
 if(SUPPORT_PVC_AND_LATER)
   list(APPEND RUNTIME_SRCS_HELPERS_BASE ${CMAKE_CURRENT_SOURCE_DIR}/cl_gfx_core_helper_pvc_and_later.inl)
+endif()
+
+if(SUPPORT_XE3P_AND_LATER)
+  list(APPEND RUNTIME_SRCS_HELPERS_BASE
+       ${CMAKE_CURRENT_SOURCE_DIR}/hardware_commands_helper_xe3p_and_later.inl
+  )
 endif()
 
 target_sources(${NEO_STATIC_LIB_NAME} PRIVATE ${RUNTIME_SRCS_HELPERS_BASE})

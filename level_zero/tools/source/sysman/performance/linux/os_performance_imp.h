@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,13 +8,12 @@
 #pragma once
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
-#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
 #include "level_zero/tools/source/sysman/performance/os_performance.h"
 #include "level_zero/tools/source/sysman/performance/performance_imp.h"
 
 namespace L0 {
 
-class LinuxPerformanceImp : public OsPerformance, NEO::NonCopyableOrMovableClass {
+class LinuxPerformanceImp : public OsPerformance, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t osPerformanceGetProperties(zes_perf_properties_t &pProperties) override;
     ze_result_t osPerformanceGetConfig(double *pFactor) override;

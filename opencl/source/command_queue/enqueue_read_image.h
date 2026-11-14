@@ -1,21 +1,24 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/addressing_mode_helper.h"
 #include "shared/source/helpers/cache_policy.h"
 #include "shared/source/helpers/engine_node_helper.h"
+#include "shared/source/helpers/vec.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/os_interface/os_context.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
 #include "opencl/source/context/context.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/helpers/mipmap.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
@@ -39,6 +42,25 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadImage(
 
     CsrSelectionArgs csrSelectionArgs{cmdType, srcImage, {}, device->getRootDeviceIndex(), region, origin, nullptr};
     CommandStreamReceiver &csr = selectCsrForBuiltinOperation(csrSelectionArgs);
+    return enqueueReadImageImpl(srcImage, blockingRead, origin, region, inputRowPitch, inputSlicePitch, ptr, mapAllocation, numEventsInWaitList, eventWaitList, event, csr);
+}
+
+template <typename GfxFamily>
+cl_int CommandQueueHw<GfxFamily>::enqueueReadImageImpl(
+    Image *srcImage,
+    cl_bool blockingRead,
+    const size_t *origin,
+    const size_t *region,
+    size_t inputRowPitch,
+    size_t inputSlicePitch,
+    void *ptr,
+    GraphicsAllocation *mapAllocation,
+    cl_uint numEventsInWaitList,
+    const cl_event *eventWaitList,
+    cl_event *event, CommandStreamReceiver &csr) {
+    constexpr cl_command_type cmdType = CL_COMMAND_READ_IMAGE;
+
+    CsrSelectionArgs csrSelectionArgs{cmdType, srcImage, {}, device->getRootDeviceIndex(), region, origin, nullptr};
 
     if (nullptr == mapAllocation) {
         notifyEnqueueReadImage(srcImage, static_cast<bool>(blockingRead), EngineHelpers::isBcs(csr.getOsContext().getEngineType()));
@@ -66,6 +88,16 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadImage(
     auto bcsSplit = this->isSplitEnqueueBlitNeeded(csrSelectionArgs.direction, getTotalSizeFromRectRegion(region), csr);
 
     bool tempAllocFallback = false;
+
+    if (!mapAllocation) {
+        InternalMemoryType memoryType = InternalMemoryType::notSpecified;
+        bool isCpuCopyAllowed = false;
+        cl_int retVal = getContext().tryGetExistingHostPtrAllocation(ptr, hostPtrSize, device->getRootDeviceIndex(), mapAllocation, memoryType, isCpuCopyAllowed);
+        if (retVal != CL_SUCCESS) {
+            return retVal;
+        }
+    }
+
     if (mapAllocation) {
         surfaces[1] = &mapSurface;
         mapSurface.setGraphicsAllocation(mapAllocation);
@@ -95,10 +127,12 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadImage(
         }
     }
 
-    void *alignedDstPtr = alignDown(dstPtr, 4);
+    // blitter takes host ptr as is - offset.x is used as a pixel coordinate, so it can't carry byte alignment remainder
+    const bool isBcs = EngineHelpers::isBcs(csr.getOsContext().getEngineType());
+    void *alignedDstPtr = isBcs ? dstPtr : alignDown(dstPtr, 4);
     size_t dstPtrOffset = ptrDiff(dstPtr, alignedDstPtr);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcImage;
     dc.dstPtr = alignedDstPtr;
     dc.dstOffset.x = dstPtrOffset;
@@ -116,10 +150,15 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadImage(
     dc.bcsSplit = bcsSplit;
     dc.direction = csrSelectionArgs.direction;
 
-    auto eBuiltInOps = EBuiltInOps::CopyImage3dToBuffer;
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(std::max(srcImage->getSize(), hostPtrSize));
+    BuiltIn::BuiltInId builtIn{BuiltIn::BaseKernel::copyImage3dToBuffer, builtInMode};
+    if (!isBcs && srcImage->isImage1dBufferFromBuffer()) {
+        overrideBuiltinForImage1dBufferWithParentBuffer(dc, builtIn, true);
+    }
     MultiDispatchInfo dispatchInfo(dc);
 
-    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_READ_IMAGE>(dispatchInfo, surfaces, eBuiltInOps, numEventsInWaitList, eventWaitList, event, blockingRead == CL_TRUE, csr);
+    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_READ_IMAGE>(dispatchInfo, surfaces, builtIn, numEventsInWaitList, eventWaitList, event, blockingRead == CL_TRUE, csr);
     if (dispatchResult != CL_SUCCESS) {
         return dispatchResult;
     }

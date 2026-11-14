@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,9 +11,11 @@
 #include "shared/source/gen_common/reg_configs_common.h"
 #include "shared/source/helpers/flat_batch_buffer_helper_hw.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/pipeline_select_args.h"
 #include "shared/source/helpers/preamble.h"
 #include "shared/source/utilities/stackvec.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
+#include "shared/test/common/fixtures/preamble_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
@@ -21,7 +23,6 @@
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "reg_configs_common.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -39,7 +40,7 @@ HWTEST_F(PreambleTest, givenDisabledPreemptioWhenPreambleAdditionalCommandsSizeI
     EXPECT_EQ(0u, cmdSize);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, givenMidthreadPreemptionWhenPreambleAdditionalCommandsSizeIsQueriedThenSizeForPreemptionPreambleIsReturned) {
+HWCMDTEST_F(IGFX_GEN12LP_CORE, PreambleTest, givenMidthreadPreemptionWhenPreambleAdditionalCommandsSizeIsQueriedThenSizeForPreemptionPreambleIsReturned) {
     using GPGPU_CSR_BASE_ADDRESS = typename FamilyType::GPGPU_CSR_BASE_ADDRESS;
     auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
 
@@ -52,7 +53,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, givenMidthreadPreemptionWhenPreambleAd
     }
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, givenMidThreadPreemptionWhenPreambleIsProgrammedThenStateSipAndCsrBaseAddressCmdsAreAdded) {
+HWCMDTEST_F(IGFX_GEN12LP_CORE, PreambleTest, givenMidThreadPreemptionWhenPreambleIsProgrammedThenStateSipAndCsrBaseAddressCmdsAreAdded) {
     using STATE_SIP = typename FamilyType::STATE_SIP;
     using GPGPU_CSR_BASE_ADDRESS = typename FamilyType::GPGPU_CSR_BASE_ADDRESS;
 
@@ -77,9 +78,9 @@ HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, givenMidThreadPreemptionWhenPreambleIs
         uintptr_t minCsrAlignment = 2 * 256 * MemoryConstants::kiloByte;
         MockGraphicsAllocation csrSurface(reinterpret_cast<void *>(minCsrAlignment), 1024);
 
-        PreambleHelper<FamilyType>::programPreamble(&preambleStream, *mockDevice, 0U, &csrSurface, nullptr);
+        PreambleHelper<FamilyType>::programPreamble(&preambleStream, *mockDevice, 0U, &csrSurface, false);
 
-        PreemptionHelper::programStateSip<FamilyType>(preemptionStream, *mockDevice, nullptr, nullptr);
+        PreemptionHelper::programStateSip<FamilyType>(preemptionStream, *mockDevice, nullptr);
 
         HardwareParse hwParserPreamble;
         hwParserPreamble.parseCommands<FamilyType>(preambleStream, 0);
@@ -110,88 +111,24 @@ HWTEST_F(PreambleTest, givenInactiveKernelDebuggingWhenPreambleKernelDebuggingCo
     EXPECT_EQ(0u, size);
 }
 
-HWTEST_F(PreambleTest, whenKernelDebuggingCommandsAreProgrammedThenCorrectCommandsArePlacedIntoStream) {
-    typedef typename FamilyType::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
-
-    auto bufferSize = PreambleHelper<FamilyType>::getKernelDebuggingCommandsSize(true);
-    auto buffer = std::unique_ptr<char[]>(new char[bufferSize]);
-
-    LinearStream stream(buffer.get(), bufferSize);
-    PreambleHelper<FamilyType>::programKernelDebugging(&stream);
-
-    HardwareParse hwParser;
-    hwParser.parseCommands<FamilyType>(stream);
-    auto cmdList = hwParser.getCommandsList<MI_LOAD_REGISTER_IMM>();
-
-    auto expectedProgrammedCmdsCount = UnitTestHelper<FamilyType>::getMiLoadRegisterImmProgrammedCmdsCount(true);
-    ASSERT_EQ(expectedProgrammedCmdsCount, cmdList.size());
-
-    auto it = cmdList.begin();
-
-    MI_LOAD_REGISTER_IMM *pCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(*it);
-    EXPECT_EQ(UnitTestHelper<FamilyType>::getDebugModeRegisterOffset(), pCmd->getRegisterOffset());
-    EXPECT_EQ(UnitTestHelper<FamilyType>::getDebugModeRegisterValue(), pCmd->getDataDword());
-    it++;
-
-    pCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(*it);
-    EXPECT_EQ(UnitTestHelper<FamilyType>::getTdCtlRegisterOffset(), pCmd->getRegisterOffset());
-    EXPECT_EQ(UnitTestHelper<FamilyType>::getTdCtlRegisterValue(), pCmd->getDataDword());
-}
-
-HWTEST_F(PreambleTest, givenKernelDebuggingActiveWhenPreambleIsProgrammedThenProgramKernelDebuggingIsCalled) {
-    typedef typename FamilyType::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
-
-    auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-
-    mockDevice->setPreemptionMode(PreemptionMode::Disabled);
-    mockDevice->setDebuggerActive(false);
-
-    StackVec<char, 8192> preambleBuffer(8192);
-    LinearStream preambleStream(&*preambleBuffer.begin(), preambleBuffer.size());
-
-    PreambleHelper<FamilyType>::programPreamble(&preambleStream, *mockDevice, 0U, nullptr, nullptr);
-
-    HardwareParse hwParser;
-    hwParser.parseCommands<FamilyType>(preambleStream);
-    auto cmdList = hwParser.getCommandsList<MI_LOAD_REGISTER_IMM>();
-
-    auto miLoadRegImmCountWithoutDebugging = cmdList.size();
-
-    mockDevice->setDebuggerActive(true);
-    auto preemptionAllocation = mockDevice->getGpgpuCommandStreamReceiver().getPreemptionAllocation();
-
-    StackVec<char, 8192> preambleBuffer2(8192);
-    preambleStream.replaceBuffer(&*preambleBuffer2.begin(), preambleBuffer2.size());
-    PreambleHelper<FamilyType>::programPreamble(&preambleStream, *mockDevice, 0U, preemptionAllocation, nullptr);
-    HardwareParse hwParser2;
-    hwParser2.parseCommands<FamilyType>(preambleStream);
-    cmdList = hwParser2.getCommandsList<MI_LOAD_REGISTER_IMM>();
-
-    auto miLoadRegImmCountWithDebugging = cmdList.size();
-    auto expectedProgrammedCmdsCount = UnitTestHelper<FamilyType>::getMiLoadRegisterImmProgrammedCmdsCount(true);
-    ASSERT_LT(miLoadRegImmCountWithoutDebugging, miLoadRegImmCountWithDebugging);
-    EXPECT_EQ(expectedProgrammedCmdsCount, miLoadRegImmCountWithDebugging - miLoadRegImmCountWithoutDebugging);
-}
-
-HWTEST_F(PreambleTest, givenKernelDebuggingActiveAndMidThreadPreemptionWhenGetAdditionalCommandsSizeIsCalledThen2MiLoadRegisterImmCmdsAreAdded) {
+HWTEST_F(PreambleTest, givenDebuggerInitializedAndMidThreadPreemptionWhenGetAdditionalCommandsSizeIsCalledThen2MiLoadRegisterImmCmdsAreAddedInsteadOfBasePreambleProgramming) {
     auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
     mockDevice->setPreemptionMode(PreemptionMode::MidThread);
 
-    mockDevice->setDebuggerActive(false);
     size_t withoutDebugging = PreambleHelper<FamilyType>::getAdditionalCommandsSize(*mockDevice);
-    mockDevice->setDebuggerActive(true);
+
+    mockDevice->executionEnvironment->rootDeviceEnvironments[0]->initDebuggerL0(mockDevice.get());
     size_t withDebugging = PreambleHelper<FamilyType>::getAdditionalCommandsSize(*mockDevice);
     EXPECT_LT(withoutDebugging, withDebugging);
 
-    size_t diff = withDebugging - withoutDebugging;
     auto expectedProgrammedCmdsCount = UnitTestHelper<FamilyType>::getMiLoadRegisterImmProgrammedCmdsCount(true);
     size_t sizeExpected = expectedProgrammedCmdsCount * sizeof(typename FamilyType::MI_LOAD_REGISTER_IMM);
-    EXPECT_EQ(sizeExpected, diff);
+    EXPECT_EQ(sizeExpected, withDebugging);
 }
 
 HWTEST_F(PreambleTest, givenDefaultPreambleWhenGetThreadsMaxNumberIsCalledThenMaximumNumberOfThreadsIsReturned) {
     const HardwareInfo &hwInfo = *defaultHwInfo;
-    uint32_t threadsPerEU = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount) + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
+    uint32_t threadsPerEU = hwInfo.gtSystemInfo.NumThreadsPerEu + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
     uint32_t value = GfxCoreHelper::getMaxThreadsForVfe(hwInfo);
 
     uint32_t expected = hwInfo.gtSystemInfo.EUCount * threadsPerEU;
@@ -200,9 +137,9 @@ HWTEST_F(PreambleTest, givenDefaultPreambleWhenGetThreadsMaxNumberIsCalledThenMa
 
 HWTEST_F(PreambleTest, givenMaxHwThreadsPercentDebugVariableWhenGetThreadsMaxNumberIsCalledThenMaximumNumberOfThreadsIsCappedToRequestedNumber) {
     const HardwareInfo &hwInfo = *defaultHwInfo;
-    uint32_t threadsPerEU = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount) + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
+    uint32_t threadsPerEU = hwInfo.gtSystemInfo.NumThreadsPerEu + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
     DebugManagerStateRestore debugManagerStateRestore;
-    DebugManager.flags.MaxHwThreadsPercent.set(80);
+    debugManager.flags.MaxHwThreadsPercent.set(80);
     uint32_t value = GfxCoreHelper::getMaxThreadsForVfe(hwInfo);
 
     uint32_t expected = int(hwInfo.gtSystemInfo.EUCount * threadsPerEU * 80 / 100.0f);
@@ -211,17 +148,18 @@ HWTEST_F(PreambleTest, givenMaxHwThreadsPercentDebugVariableWhenGetThreadsMaxNum
 
 HWTEST_F(PreambleTest, givenMinHwThreadsUnoccupiedDebugVariableWhenGetThreadsMaxNumberIsCalledThenMaximumNumberOfThreadsIsCappedToMatchRequestedNumber) {
     const HardwareInfo &hwInfo = *defaultHwInfo;
-    uint32_t threadsPerEU = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount) + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
+    uint32_t threadsPerEU = hwInfo.gtSystemInfo.NumThreadsPerEu + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
     DebugManagerStateRestore debugManagerStateRestore;
-    DebugManager.flags.MinHwThreadsUnoccupied.set(2);
+    debugManager.flags.MinHwThreadsUnoccupied.set(2);
     uint32_t value = GfxCoreHelper::getMaxThreadsForVfe(hwInfo);
 
     uint32_t expected = hwInfo.gtSystemInfo.EUCount * threadsPerEU - 2;
     EXPECT_EQ(expected, value);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenProgramVFEStateIsCalledThenCorrectVfeStateAddressIsReturned) {
+HWCMDTEST_F(IGFX_GEN12LP_CORE, PreambleTest, WhenProgramVFEStateIsCalledThenCorrectVfeStateAddressIsReturned) {
     using MEDIA_VFE_STATE = typename FamilyType::MEDIA_VFE_STATE;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
     char buffer[64];
     MockGraphicsAllocation graphicsAllocation(buffer, sizeof(buffer));
@@ -229,10 +167,13 @@ HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenProgramVFEStateIsCalledThenCorrect
     uint64_t addressToPatch = 0xC0DEC0DE;
     uint64_t expectedAddress = 0xC0DEC000;
 
-    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&preambleStream, *defaultHwInfo, EngineGroupType::RenderCompute);
+    uint64_t expectedGpuAddress = preambleStream.getCurrentGpuAddressPosition() + sizeof(PIPE_CONTROL);
+    uint64_t cmdBufferGpuAddress = 0;
+    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&preambleStream, *defaultHwInfo, EngineGroupType::renderCompute, &cmdBufferGpuAddress);
+    EXPECT_EQ(expectedGpuAddress, cmdBufferGpuAddress);
     StreamProperties emptyProperties{};
     MockExecutionEnvironment executionEnvironment{};
-    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, *executionEnvironment.rootDeviceEnvironments[0], 1024u, addressToPatch, 10u, emptyProperties, nullptr);
+    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, *executionEnvironment.rootDeviceEnvironments[0], 1024u, addressToPatch, 10u, emptyProperties);
     EXPECT_GE(reinterpret_cast<uintptr_t>(pVfeCmd), reinterpret_cast<uintptr_t>(preambleStream.getCpuBase()));
     EXPECT_LT(reinterpret_cast<uintptr_t>(pVfeCmd), reinterpret_cast<uintptr_t>(preambleStream.getCpuBase()) + preambleStream.getUsed());
 
@@ -243,7 +184,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenProgramVFEStateIsCalledThenCorrect
     EXPECT_EQ(0u, vfeCmd.getScratchSpaceBasePointerHigh());
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenGetScratchSpaceAddressOffsetForVfeStateIsCalledThenCorrectOffsetIsReturned) {
+HWCMDTEST_F(IGFX_GEN12LP_CORE, PreambleTest, WhenGetScratchSpaceAddressOffsetForVfeStateIsCalledThenCorrectOffsetIsReturned) {
     using MEDIA_VFE_STATE = typename FamilyType::MEDIA_VFE_STATE;
 
     char buffer[64];
@@ -253,9 +194,9 @@ HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenGetScratchSpaceAddressOffsetForVfe
     FlatBatchBufferHelperHw<FamilyType> helper(*mockDevice->getExecutionEnvironment());
     uint64_t addressToPatch = 0xC0DEC0DE;
 
-    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&preambleStream, mockDevice->getHardwareInfo(), EngineGroupType::RenderCompute);
+    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&preambleStream, mockDevice->getHardwareInfo(), EngineGroupType::renderCompute, nullptr);
     StreamProperties emptyProperties{};
-    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, mockDevice->getRootDeviceEnvironment(), 1024u, addressToPatch, 10u, emptyProperties, nullptr);
+    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, mockDevice->getRootDeviceEnvironment(), 1024u, addressToPatch, 10u, emptyProperties);
 
     auto offset = PreambleHelper<FamilyType>::getScratchSpaceAddressOffsetForVfeState(&preambleStream, pVfeCmd);
     EXPECT_NE(0u, offset);
@@ -263,7 +204,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenGetScratchSpaceAddressOffsetForVfe
               offset + reinterpret_cast<uintptr_t>(preambleStream.getCpuBase()));
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, PreambleTest, WhenIsSystolicModeConfigurableThenReturnFalse) {
+HWCMDTEST_F(IGFX_GEN12LP_CORE, PreambleTest, WhenIsSystolicModeConfigurableThenReturnFalse) {
     MockExecutionEnvironment mockExecutionEnvironment{};
     auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
     auto result = PreambleHelper<FamilyType>::isSystolicModeConfigurable(rootDeviceEnvironment);
@@ -274,14 +215,14 @@ HWTEST_F(PreambleTest, givenSetForceSemaphoreDelayBetweenWaitsWhenProgramSemapho
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
     DebugManagerStateRestore debugManagerStateRestore;
     uint32_t newDelay = 10u;
-    DebugManager.flags.ForceSemaphoreDelayBetweenWaits.set(newDelay);
+    debugManager.flags.ForceSemaphoreDelayBetweenWaits.set(newDelay);
 
     auto bufferSize = PreambleHelper<FamilyType>::getSemaphoreDelayCommandSize();
     EXPECT_EQ(sizeof(MI_LOAD_REGISTER_IMM), bufferSize);
     auto buffer = std::unique_ptr<char[]>(new char[bufferSize]);
 
     LinearStream stream(buffer.get(), bufferSize);
-    PreambleHelper<FamilyType>::programSemaphoreDelay(&stream);
+    PreambleHelper<FamilyType>::programSemaphoreDelay(&stream, false);
 
     HardwareParse hwParser;
     hwParser.parseCommands<FamilyType>(stream);
@@ -298,17 +239,75 @@ HWTEST_F(PreambleTest, givenSetForceSemaphoreDelayBetweenWaitsWhenProgramSemapho
 HWTEST_F(PreambleTest, givenNotSetForceSemaphoreDelayBetweenWaitsWhenProgramSemaphoreDelayThenSemaWaitPollRegisterIsNotProgrammed) {
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
     DebugManagerStateRestore debugManagerStateRestore;
-    DebugManager.flags.ForceSemaphoreDelayBetweenWaits.set(-1);
+    debugManager.flags.ForceSemaphoreDelayBetweenWaits.set(-1);
 
     auto bufferSize = PreambleHelper<FamilyType>::getSemaphoreDelayCommandSize();
     EXPECT_EQ(sizeof(MI_LOAD_REGISTER_IMM), bufferSize);
     auto buffer = std::unique_ptr<char[]>(new char[bufferSize]);
 
     LinearStream stream(buffer.get(), bufferSize);
-    PreambleHelper<FamilyType>::programSemaphoreDelay(&stream);
+    PreambleHelper<FamilyType>::programSemaphoreDelay(&stream, false);
 
     HardwareParse hwParser;
     hwParser.parseCommands<FamilyType>(stream);
     auto cmdList = hwParser.getCommandsList<MI_LOAD_REGISTER_IMM>();
     ASSERT_EQ(0u, cmdList.size());
+}
+
+HWTEST2_F(PreambleTest, whenCleanStateInPreambleIsSetAndProgramPipelineSelectIsCalledThenExtraPipelineSelectAndTwoExtraPipeControlsAdded, IsXeCore) {
+    using PIPELINE_SELECT = typename FamilyType::PIPELINE_SELECT;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+    DebugManagerStateRestore stateRestore;
+    debugManager.flags.CleanStateInPreamble.set(true);
+
+    auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
+
+    constexpr size_t bufferSize = 256;
+    uint8_t buffer[bufferSize];
+    LinearStream stream(buffer, bufferSize);
+
+    PipelineSelectArgs pipelineArgs;
+
+    PreambleHelper<FamilyType>::programPipelineSelect(&stream, pipelineArgs, mockDevice->getRootDeviceEnvironment());
+    size_t usedSpace = stream.getUsed();
+
+    EXPECT_EQ(usedSpace, PreambleHelper<FamilyType>::getCmdSizeForPipelineSelect(mockDevice->getRootDeviceEnvironment()));
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(stream);
+
+    auto numPipeControl = hwParser.getCommandsList<PIPE_CONTROL>().size();
+    auto expectedNumPipeControl = 2u;
+    if (MemorySynchronizationCommands<FamilyType>::isBarrierPriorToPipelineSelectWaRequired(mockDevice->getRootDeviceEnvironment())) {
+        expectedNumPipeControl++;
+    }
+    EXPECT_EQ(expectedNumPipeControl, numPipeControl);
+    auto numPipelineSelect = hwParser.getCommandsList<PIPELINE_SELECT>().size();
+    EXPECT_EQ(2u, numPipelineSelect);
+}
+
+HWTEST2_F(PreambleTest, GivenAtLeastXeHpCoreWhenPreambleRetrievesUrbEntryAllocationSizeThenValueIsCorrect, IsAtLeastXeCore) {
+    uint32_t actualVal = PreambleHelper<FamilyType>::getUrbEntryAllocationSize();
+    EXPECT_EQ(0u, actualVal);
+}
+
+using PreambleHwTest = PreambleFixture;
+
+HWTEST2_F(PreambleHwTest, GivenAtLeastXeHpCoreWhenPreambleAddsPipeControlBeforeCommandThenExpectNothingToAdd, IsAtLeastXeCore) {
+    constexpr size_t bufferSize = 64;
+    uint8_t buffer[bufferSize];
+    LinearStream stream(buffer, bufferSize);
+
+    auto &hwInfo = pDevice->getHardwareInfo();
+
+    PreambleHelper<FamilyType>::addPipeControlBeforeVfeCmd(&stream, &hwInfo, EngineGroupType::compute);
+    EXPECT_EQ(0u, stream.getUsed());
+}
+
+HWTEST2_F(PreambleHwTest, givenHwWithForcedHeaplessModeWhenCallingSetSingleSliceDispatchModeThenDoNothing, IsAtLeastXeCore) {
+    if (FamilyType::isHeaplessRequired() == false) {
+        GTEST_SKIP();
+    }
+    PreambleHelper<FamilyType>::setSingleSliceDispatchMode(nullptr, true);
 }

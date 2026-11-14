@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,15 +8,14 @@
 #include "shared/source/compiler_interface/compiler_cache.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/casts.h"
 #include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/hash.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/source/utilities/debug_settings_reader.h"
+#include "shared/source/helpers/path.h"
 #include "shared/source/utilities/io_functions.h"
 
-#include "config.h"
+#include "elements_struct.h"
 #include "os_inc.h"
 
 #include <cstring>
@@ -26,11 +25,21 @@
 #include <string>
 
 namespace NEO {
+
 std::mutex CompilerCache::cacheAccessMtx;
 
 const std::string CompilerCache::getCachedFileName(const HardwareInfo &hwInfo, const ArrayRef<const char> input,
-                                                   const ArrayRef<const char> options, const ArrayRef<const char> internalOptions) {
+                                                   const ArrayRef<const char> options, const ArrayRef<const char> internalOptions,
+                                                   const ArrayRef<const char> specIds, const ArrayRef<const char> specValues,
+                                                   const ArrayRef<const char> igcRevision, const ArrayRef<const char> igcRegKeys, size_t igcLibSize, time_t igcLibMTime) {
     Hash hash;
+
+    hash.update("----", 4);
+    hash.update(&*igcRevision.begin(), igcRevision.size());
+    hash.update(safePodCast<const char *>(&igcLibSize), sizeof(igcLibSize));
+    hash.update(safePodCast<const char *>(&igcLibMTime), sizeof(igcLibMTime));
+    hash.update("----", 4);
+    hash.update(&*igcRegKeys.begin(), igcRegKeys.size());
 
     hash.update("----", 4);
     hash.update(&*input.begin(), input.size());
@@ -38,6 +47,9 @@ const std::string CompilerCache::getCachedFileName(const HardwareInfo &hwInfo, c
     hash.update(&*options.begin(), options.size());
     hash.update("----", 4);
     hash.update(&*internalOptions.begin(), internalOptions.size());
+    hash.update("----", 4);
+    hash.update(&*specIds.begin(), specIds.size());
+    hash.update(&*specValues.begin(), specValues.size());
     hash.update("----", 4);
     hash.update(safePodCast<const char *>(&hwInfo.platform), sizeof(hwInfo.platform));
     hash.update("----", 4);
@@ -48,6 +60,9 @@ const std::string CompilerCache::getCachedFileName(const HardwareInfo &hwInfo, c
 
     const auto workaroundTableHashStr = std::to_string(hwInfo.workaroundTable.asHash());
     hash.update(workaroundTableHashStr.c_str(), workaroundTableHashStr.length());
+    hash.update("----", 4);
+
+    hash.update(reinterpret_cast<const char *>(&hwInfo.ipVersion), sizeof(uint32_t));
 
     auto res = hash.finish();
     std::stringstream stream;
@@ -56,18 +71,35 @@ const std::string CompilerCache::getCachedFileName(const HardwareInfo &hwInfo, c
            << std::hex
            << res;
 
-    if (DebugManager.flags.BinaryCacheTrace.get()) {
+    if (debugManager.flags.BinaryCacheTrace.get()) {
         std::string traceFilePath = config.cacheDir + PATH_SEPARATOR + stream.str() + ".trace";
         std::string inputFilePath = config.cacheDir + PATH_SEPARATOR + stream.str() + ".input";
         std::lock_guard<std::mutex> lock(cacheAccessMtx);
         auto fp = NEO::IoFunctions::fopenPtr(traceFilePath.c_str(), "w");
         if (fp) {
+            NEO::IoFunctions::fprintf(fp, "---- igcRevision ----\n");
+            NEO::IoFunctions::fprintf(fp, "%s\n", &*igcRevision.begin());
+            NEO::IoFunctions::fprintf(fp, "  libSize=%llu\n", igcLibSize);
+            NEO::IoFunctions::fprintf(fp, "  libMTime=%llu\n", igcLibMTime);
+            NEO::IoFunctions::fprintf(fp, "---- igcRegKeys ----\n");
+            NEO::IoFunctions::fprintf(fp, "%s\n", igcRegKeys.size() > 0 ? &*igcRegKeys.begin() : "");
             NEO::IoFunctions::fprintf(fp, "---- input ----\n");
             NEO::IoFunctions::fprintf(fp, "<%s>\n", inputFilePath.c_str());
             NEO::IoFunctions::fprintf(fp, "---- options ----\n");
             NEO::IoFunctions::fprintf(fp, "%s\n", &*options.begin());
             NEO::IoFunctions::fprintf(fp, "---- internal options ----\n");
             NEO::IoFunctions::fprintf(fp, "%s\n", &*internalOptions.begin());
+            NEO::IoFunctions::fprintf(fp, "---- specialization constants ----\n");
+            NEO::IoFunctions::fprintf(fp, "specIds=");
+            for (size_t idx = 0; idx < specIds.size(); idx++) {
+                NEO::IoFunctions::fprintf(fp, "%02x", specIds[idx]);
+            }
+            NEO::IoFunctions::fprintf(fp, "\n");
+            NEO::IoFunctions::fprintf(fp, "specValues=");
+            for (size_t idx = 0; idx < specValues.size(); idx++) {
+                NEO::IoFunctions::fprintf(fp, "%02x", specValues[idx]);
+            }
+            NEO::IoFunctions::fprintf(fp, "\n");
 
             NEO::IoFunctions::fprintf(fp, "---- platform ----\n");
             NEO::IoFunctions::fprintf(fp, "  eProductFamily=%d\n", hwInfo.platform.eProductFamily);
@@ -108,6 +140,166 @@ const std::string CompilerCache::getCachedFileName(const HardwareInfo &hwInfo, c
 }
 
 CompilerCache::CompilerCache(const CompilerCacheConfig &cacheConfig)
-    : config(cacheConfig){};
+    : config(cacheConfig) {};
+
+std::string CompilerCache::getCachedFilePath(const std::string &cacheFile) {
+    std::string path = config.cacheDir;
+    for (int i = 0; i < maxCacheDepth; i++) {
+        path = joinPath(path, std::string(1, cacheFile[i]));
+    }
+    path = joinPath(path, cacheFile);
+
+    return path;
+}
+
+std::unique_ptr<char[]> CompilerCache::loadCachedBinary(const std::string &kernelFileHash, size_t &cachedBinarySize) {
+    auto cacheFilename = kernelFileHash + config.cacheFileExtension;
+    if (cacheFilename.length() < maxCacheDepth + config.cacheFileExtension.length()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "[Cache failure]: Load cached binary failed - cache file name is too short!\n");
+        cachedBinarySize = 0;
+        return nullptr;
+    }
+
+    std::string filePath = getCachedFilePath(cacheFilename);
+    auto data = NEO::loadDataFromFile(filePath.c_str(), cachedBinarySize);
+
+    if (cachedBinarySize == 0) {
+        if (config.statsEnabled) {
+            updateAllStats(cacheFilename, false);
+        }
+        return nullptr;
+    }
+
+    if (config.statsEnabled) {
+        updateAllStats(cacheFilename, true);
+    }
+
+    return data;
+}
+
+bool CompilerCache::getCachedFiles(std::vector<ElementsStruct> &cacheFiles) {
+    cacheFiles.clear();
+
+    auto filterFunction = [](const std::string_view &path) {
+        return path.find(".cl_cache") != path.npos || path.find(".ocloc_cache") != path.npos || path.find(".l0_cache") != path.npos;
+    };
+
+    if (!getFiles(config.cacheDir, filterFunction, cacheFiles)) {
+        return false;
+    }
+
+    std::sort(cacheFiles.begin(), cacheFiles.end(), [this](const ElementsStruct &a, const ElementsStruct &b) {
+        return this->compareByLastAccessTime(a, b);
+    });
+
+    return true;
+}
+
+bool CompilerCache::updateAllStats(const std::string &fileName, bool hit) {
+    std::string path = config.cacheDir;
+    for (int i = 0; i <= maxCacheDepth; i++) {
+        if (!updateStats(joinPath(path, "stats"), hit)) {
+            return false;
+        }
+        path = joinPath(path, std::string(1, fileName[i]));
+    }
+
+    return true;
+}
+
+bool CompilerCache::showStats(bool verbose, std::string &output) {
+    std::stringstream ss;
+    ss << "Compiler cache stats:\n\n";
+
+    auto appendStats = [](std::stringstream &ss, const std::string &statsPath, const CacheStats &cacheStats) {
+        auto lastSep = statsPath.rfind(PATH_SEPARATOR);
+        ss << "Cache directory: " << (lastSep != std::string::npos ? statsPath.substr(0, lastSep + 1) : statsPath) << "\n";
+        ss << "Version    Hits    Misses    Hit Rate\n";
+        ss << std::left << std::setw(9) << cacheStats.version << " "
+           << std::setw(7) << cacheStats.hits << " "
+           << std::setw(9) << cacheStats.misses << " "
+           << std::fixed << std::setprecision(2)
+           << (cacheStats.hits + cacheStats.misses > 0
+                   ? static_cast<double>(cacheStats.hits) / (cacheStats.hits + cacheStats.misses) * 100.0
+                   : 0.0)
+           << "%\n\n";
+    };
+
+    if (!verbose) {
+        std::string statsPath = joinPath(config.cacheDir, "stats");
+
+        CacheStats cacheStats{};
+        auto result = readStatsFromFile(statsPath, cacheStats);
+        if (result != StatsResult::success) {
+            if (result == StatsResult::notFound) {
+                ss << "No stats found in cache directory.\n";
+                output = ss.str();
+                return true;
+            }
+            return false;
+        }
+
+        appendStats(ss, statsPath, cacheStats);
+        output = ss.str();
+        return true;
+    }
+
+    std::vector<ElementsStruct> statsFiles;
+    if (!getFiles(config.cacheDir, isStatsFile, statsFiles)) {
+        return false;
+    }
+
+    if (statsFiles.empty()) {
+        ss << "No stats found in cache directories.\n";
+        output = ss.str();
+        return true;
+    }
+
+    for (const auto &statsFile : statsFiles) {
+        CacheStats cacheStats{};
+        if (readStatsFromFile(statsFile.path, cacheStats) != StatsResult::success) {
+            return false;
+        }
+
+        appendStats(ss, statsFile.path, cacheStats);
+    }
+
+    output = ss.str();
+    return true;
+}
+
+bool CompilerCache::isStatsFile(const std::string_view &path) {
+    auto lastSep = path.rfind(PATH_SEPARATOR);
+    auto basename = (lastSep != std::string_view::npos) ? path.substr(lastSep + 1) : path;
+    return basename == "stats";
+}
+
+CompilerCache::StatsResult CompilerCache::zeroStats() {
+    if (config.cacheDir.empty()) {
+        return StatsResult::notFound;
+    }
+
+    std::vector<ElementsStruct> statsFiles;
+    if (!getFiles(config.cacheDir, isStatsFile, statsFiles)) {
+        return StatsResult::error;
+    }
+
+    if (statsFiles.empty()) {
+        return StatsResult::notFound;
+    }
+
+    CacheStats cacheStats{0, 0, CompilerCache::cacheVersion};
+    for (const auto &statsFile : statsFiles) {
+        if (!writeStatsToFile(statsFile.path, cacheStats)) {
+            return StatsResult::error;
+        }
+    }
+
+    return StatsResult::success;
+}
+
+bool CompilerCache::clear() {
+    return clearDirectoryContents(config.cacheDir);
+}
 
 } // namespace NEO

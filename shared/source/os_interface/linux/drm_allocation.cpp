@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,20 +9,61 @@
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/residency.h"
 #include "shared/source/os_interface/linux/cache_info.h"
 #include "shared/source/os_interface/linux/drm_buffer_object.h"
 #include "shared/source/os_interface/linux/drm_memory_manager.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/i915_prelim.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
+#include "shared/source/os_interface/linux/memory_info.h"
 #include "shared/source/os_interface/linux/os_context_linux.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/source/os_interface/product_helper.h"
 
+#include <algorithm>
 #include <sstream>
 
 namespace NEO {
+
+DrmAllocation::DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObject *bo, void *ptrIn, size_t sizeIn, osHandle sharedHandle, MemoryPool pool, uint64_t canonizedGpuAddress)
+    : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, ptrIn, sizeIn, sharedHandle, pool, MemoryManager::maxOsContextCount, canonizedGpuAddress) {
+    bufferObjects.push_back(bo);
+    this->numHandles = (bo != nullptr) ? 1u : 0u;
+    resizeBufferObjects(EngineLimits::maxHandleCount);
+    handles.resize(EngineLimits::maxHandleCount, std::numeric_limits<uint64_t>::max());
+}
+
+DrmAllocation::DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObject *bo, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool)
+    : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, ptrIn, canonizedGpuAddress, 0, sizeIn, pool, MemoryManager::maxOsContextCount) {
+    bufferObjects.push_back(bo);
+    this->numHandles = (bo != nullptr) ? 1u : 0u;
+    resizeBufferObjects(EngineLimits::maxHandleCount);
+    handles.resize(EngineLimits::maxHandleCount, std::numeric_limits<uint64_t>::max());
+}
+
+DrmAllocation::DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObjects &bos, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool)
+    : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, ptrIn, canonizedGpuAddress, 0, sizeIn, pool, MemoryManager::maxOsContextCount),
+      bufferObjects(bos) {
+    this->numHandles = static_cast<uint32_t>(bufferObjects.size());
+    handles.resize(EngineLimits::maxHandleCount, std::numeric_limits<uint64_t>::max());
+}
+
+DrmAllocation::DrmAllocation(DrmAllocation *parent, size_t offsetInParentAllocation, size_t viewSize)
+    : GraphicsAllocation(parent, offsetInParentAllocation, viewSize),
+      bufferObjects(parent->bufferObjects),
+      numHandles(parent->numHandles),
+      usmHostAllocation(parent->usmHostAllocation) {
+    this->osContext = parent->osContext;
+}
+
+GraphicsAllocation *DrmAllocation::createView(size_t offsetInParentAllocation, size_t viewSize) {
+    return new DrmAllocation(this, offsetInParentAllocation, viewSize);
+}
 
 DrmAllocation::~DrmAllocation() {
     [[maybe_unused]] int retCode;
@@ -42,27 +83,69 @@ std::string DrmAllocation::getAllocationInfoString() const {
     return ss.str();
 }
 
+std::string DrmAllocation::getPatIndexInfoString() const {
+    std::stringstream ss;
+
+    auto bo = getBO();
+    if (bo) {
+        ss << " PATIndex: " << bo->peekPatIndex() << ",";
+    }
+    auto gmm = getDefaultGmm();
+    if (gmm) {
+        ss << " Gmm resource usage: "
+           << "[ " << gmm->getUsageTypeString() << " ],";
+        auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm->resourceParamsData.data());
+        ss << " Cacheable: " << gmmResourceParams->Flags.Info.Cacheable;
+        ss << " NotLockable: " << gmmResourceParams->Flags.Info.NotLockable;
+    }
+    return ss.str();
+}
+
 void DrmAllocation::clearInternalHandle(uint32_t handleId) {
+    if (parentAllocation) {
+        static_cast<DrmAllocation *>(parentAllocation)->clearInternalHandle(handleId);
+        return;
+    }
     handles[handleId] = std::numeric_limits<uint64_t>::max();
 }
 
-int DrmAllocation::createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) {
-    return peekInternalHandle(memoryManager, handleId, handle);
+int DrmAllocation::createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) {
+    return peekInternalHandle(memoryManager, handleId, handle, reservedHandleData);
 }
 
-int DrmAllocation::peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle) {
-    return peekInternalHandle(memoryManager, 0u, handle);
+int DrmAllocation::peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle, void *reservedHandleData) {
+    return peekInternalHandle(memoryManager, 0u, handle, reservedHandleData);
 }
 
-int DrmAllocation::peekInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) {
+int DrmAllocation::peekInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) {
+    if (parentAllocation) {
+        return static_cast<DrmAllocation *>(parentAllocation)->peekInternalHandle(memoryManager, handleId, handle, reservedHandleData);
+    }
+
     if (handles[handleId] != std::numeric_limits<uint64_t>::max()) {
         handle = handles[handleId];
+        if (reservedHandleData) {
+            int reservedHandleRet = static_cast<DrmMemoryManager *>(memoryManager)->obtainReservedHandleData(static_cast<int>(handle), this->getRootDeviceIndex(), reservedHandleData);
+            if (reservedHandleRet != 0) {
+                return -1;
+            }
+        }
         return 0;
     }
 
-    int64_t ret = static_cast<int64_t>((static_cast<DrmMemoryManager *>(memoryManager))->obtainFdFromHandle(getBufferObjectToModify(handleId)->peekHandle(), this->rootDeviceIndex));
+    auto bufferObject = getBufferObjectToModify(handleId);
+    if (bufferObject == nullptr) {
+        return -1;
+    }
+    int64_t ret = static_cast<int64_t>((static_cast<DrmMemoryManager *>(memoryManager))->obtainFdFromHandle(bufferObject->peekHandle(), this->rootDeviceIndex));
     if (ret < 0) {
         return -1;
+    }
+    if (reservedHandleData) {
+        int reservedHandleRet = static_cast<DrmMemoryManager *>(memoryManager)->obtainReservedHandleData(static_cast<int>(ret), this->getRootDeviceIndex(), reservedHandleData);
+        if (reservedHandleRet != 0) {
+            return -1;
+        }
     }
 
     handle = handles[handleId] = ret;
@@ -82,6 +165,44 @@ bool DrmAllocation::setPreferredLocation(Drm *drm, PreferredLocation memoryLocat
     auto ioctlHelper = drm->getIoctlHelper();
     auto remainingMemoryBanks = storageInfo.memoryBanks;
     bool success = true;
+    auto pHwInfo = drm->getRootDeviceEnvironment().getHardwareInfo();
+
+    if (this->storageInfo.isChunked && debugManager.flags.EnableBOChunkingPreferredLocationHint.get() == 1) {
+        prelim_drm_i915_gem_memory_class_instance region{};
+        region.memory_class = NEO::PrelimI915::PRELIM_I915_MEMORY_CLASS_DEVICE;
+        auto banks = std::bitset<4>(remainingMemoryBanks);
+        MemRegionsVec memRegions{};
+        size_t currentBank = 0;
+        size_t i = 0;
+        while (i < banks.count()) {
+            if (banks.test(currentBank)) {
+                auto regionClassAndInstance = drm->getMemoryInfo()->getMemoryRegionClassAndInstance(1u << currentBank, *pHwInfo);
+                memRegions.push_back(regionClassAndInstance);
+                i++;
+            }
+            currentBank++;
+        }
+
+        for (uint32_t i = 0; i < this->storageInfo.numOfChunks; i++) {
+            // Depth-first
+            region.memory_instance = memRegions[i / (this->storageInfo.numOfChunks / memRegions.size())].memoryInstance;
+            uint64_t chunkLength = (bufferObjects[0]->peekSize() / this->storageInfo.numOfChunks);
+            uint64_t chunkStart = i * chunkLength;
+            PRINT_STRING(debugManager.flags.PrintBOChunkingLogs.get(), stdout,
+                         "Setting PRELIM_DRM_I915_GEM_VM_ADVISE for BO-%d chunk 0x%lx chunkLength %ld memory_class %d, memory_region %d\n",
+                         bufferObjects[0]->peekHandle(),
+                         chunkStart,
+                         chunkLength,
+                         region.memory_class,
+                         region.memory_instance);
+            success &= ioctlHelper->setVmBoAdviseForChunking(bufferObjects[0]->peekHandle(),
+                                                             chunkStart,
+                                                             chunkLength,
+                                                             ioctlHelper->getPreferredLocationAdvise(),
+                                                             &region);
+        }
+        return success;
+    }
 
     for (uint8_t handleId = 0u; handleId < numHandles; handleId++) {
         auto memoryInstance = Math::getMinLsbSet(static_cast<uint32_t>(remainingMemoryBanks.to_ulong()));
@@ -99,7 +220,7 @@ bool DrmAllocation::setPreferredLocation(Drm *drm, PreferredLocation memoryLocat
 }
 
 bool DrmAllocation::setCacheRegion(Drm *drm, CacheRegion regionIndex) {
-    if (regionIndex == CacheRegion::Default) {
+    if (regionIndex == CacheRegion::defaultRegion) {
         return true;
     }
 
@@ -108,20 +229,23 @@ bool DrmAllocation::setCacheRegion(Drm *drm, CacheRegion regionIndex) {
         return false;
     }
 
-    auto regionSize = (cacheInfo->getMaxReservationNumCacheRegions() > 0) ? cacheInfo->getMaxReservationCacheSize() / cacheInfo->getMaxReservationNumCacheRegions() : 0;
+    const auto cacheLevel{cacheInfo->getLevelForRegion(regionIndex)};
+    const auto maxCacheRegions{cacheInfo->getMaxReservationNumCacheRegions(cacheLevel)};
+    const auto maxReservationCacheSize{cacheInfo->getMaxReservationCacheSize(cacheLevel)};
+    const auto regionSize{(maxCacheRegions > 0) ? maxReservationCacheSize / maxCacheRegions : 0};
     if (regionSize == 0) {
         return false;
     }
 
-    return setCacheAdvice(drm, regionSize, regionIndex);
+    return setCacheAdvice(drm, regionSize, regionIndex, !isAllocatedInLocalMemoryPool());
 }
 
-bool DrmAllocation::setCacheAdvice(Drm *drm, size_t regionSize, CacheRegion regionIndex) {
+bool DrmAllocation::setCacheAdvice(Drm *drm, size_t regionSize, CacheRegion regionIndex, bool isSystemMemoryPool) {
     if (!drm->getCacheInfo()->getCacheRegion(regionSize, regionIndex)) {
         return false;
     }
 
-    auto patIndex = drm->getPatIndex(getDefaultGmm(), allocationType, regionIndex, CachePolicy::WriteBack, true);
+    auto patIndex = drm->getPatIndex(getDefaultGmm(), allocationType, regionIndex, CachePolicy::writeBack, true, isSystemMemoryPool, false);
 
     if (fragmentsStorage.fragmentCount > 0) {
         for (uint32_t i = 0; i < fragmentsStorage.fragmentCount; i++) {
@@ -141,11 +265,76 @@ bool DrmAllocation::setCacheAdvice(Drm *drm, size_t regionSize, CacheRegion regi
     return true;
 }
 
-int DrmAllocation::makeBOsResident(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind) {
+bool DrmAllocation::prefetchBOWithChunking(Drm *drm) {
+    auto getSubDeviceIds = [](const DeviceBitfield &subDeviceBitfield) {
+        SubDeviceIdsVec subDeviceIds;
+        for (auto subDeviceId = 0u; subDeviceId < subDeviceBitfield.size(); subDeviceId++) {
+            if (subDeviceBitfield.test(subDeviceId)) {
+                subDeviceIds.push_back(subDeviceId);
+            }
+        }
+        return subDeviceIds;
+    };
+
+    auto bo = this->getBO();
+
+    auto ioctlHelper = drm->getIoctlHelper();
+    auto memoryClassDevice = ioctlHelper->getDrmParamValue(DrmParam::memoryClassDevice);
+    auto subDeviceIds = getSubDeviceIds(storageInfo.subDeviceBitfield);
+
+    uint32_t chunksPerSubDevice = this->storageInfo.numOfChunks / subDeviceIds.size();
+    uint64_t chunkLength = (bo->peekSize() / this->storageInfo.numOfChunks);
+    bool success = true;
+    for (uint32_t i = 0; i < this->storageInfo.numOfChunks; i++) {
+        uint64_t chunkStart = bo->peekAddress() + i * chunkLength;
+        auto subDeviceId = subDeviceIds[i / chunksPerSubDevice];
+        for (auto vmHandleId : subDeviceIds) {
+            auto region = static_cast<uint32_t>((memoryClassDevice << 16u) | subDeviceId);
+            auto vmId = drm->getVirtualMemoryAddressSpace(vmHandleId);
+
+            PRINT_STRING(debugManager.flags.PrintBOPrefetchingResult.get(), stdout,
+                         "prefetching BO=%d to VM %u, drmVmId=%u, range: %llx - %llx, size: %lld, region: %x\n",
+                         bo->peekHandle(), vmId, vmHandleId, chunkStart, ptrOffset(chunkStart, chunkLength), chunkLength, region);
+
+            success &= ioctlHelper->setVmPrefetch(chunkStart, chunkLength, region, vmId);
+
+            PRINT_STRING(debugManager.flags.PrintBOPrefetchingResult.get(), stdout,
+                         "prefetched BO=%d to VM %u, drmVmId=%u, range: %llx - %llx, size: %lld, region: %x, result: %d\n",
+                         bo->peekHandle(), vmId, vmHandleId, chunkStart, ptrOffset(chunkStart, chunkLength), chunkLength, region, success);
+        }
+    }
+
+    return success;
+}
+
+StackVec<BufferObject *, maxFragmentsCount> DrmAllocation::getFragmentBOsForResidency(uint32_t vmHandleId) const {
+    StackVec<BufferObject *, maxFragmentsCount> residencyBufferObjects;
+    if (debugManager.flags.EnableUsmHostPtrFragments.get() == 1) {
+        for (auto fragmentId = 0u; fragmentId < fragmentsStorage.fragmentCount; fragmentId++) {
+            residencyBufferObjects.push_back(static_cast<OsHandleLinux *>(fragmentsStorage.fragmentStorageData[fragmentId].osHandleStorage)->bo);
+        }
+    } else {
+        residencyBufferObjects.push_back(getBOForVmHandle(vmHandleId));
+    }
+    return residencyBufferObjects;
+}
+
+int DrmAllocation::makeBOsResident(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence) {
     if (this->fragmentsStorage.fragmentCount) {
+        const bool usmHostPtrFragmentsEnabled = debugManager.flags.EnableUsmHostPtrFragments.get() == 1;
+        const bool fragmentsBoundInEveryVm = bufferObjects == nullptr && usmHostPtrFragmentsEnabled;
+        const bool fragmentsCollectedPerSubmission = bufferObjects != nullptr && usmHostPtrFragmentsEnabled;
         for (unsigned int f = 0; f < this->fragmentsStorage.fragmentCount; f++) {
-            if (!this->fragmentsStorage.fragmentStorageData[f].residency->resident[osContext->getContextId()]) {
-                int retVal = bindBO(static_cast<OsHandleLinux *>(this->fragmentsStorage.fragmentStorageData[f].osHandleStorage)->bo, osContext, vmHandleId, bufferObjects, bind);
+            if (fragmentsBoundInEveryVm && !bind) {
+                continue;
+            }
+            auto bo = static_cast<OsHandleLinux *>(this->fragmentsStorage.fragmentStorageData[f].osHandleStorage)->bo;
+            bool fragmentNeedsBinding = fragmentsBoundInEveryVm || !this->fragmentsStorage.fragmentStorageData[f].residency->resident[osContext->getContextId()];
+            if (fragmentsCollectedPerSubmission) {
+                fragmentNeedsBinding = std::find(bufferObjects->begin(), bufferObjects->end(), bo) == bufferObjects->end();
+            }
+            if (fragmentNeedsBinding) {
+                int retVal = bindBO(bo, osContext, vmHandleId, bufferObjects, bind, forcePagingFence);
                 if (retVal) {
                     return retVal;
                 }
@@ -153,7 +342,7 @@ int DrmAllocation::makeBOsResident(OsContext *osContext, uint32_t vmHandleId, st
             }
         }
     } else {
-        int retVal = bindBOs(osContext, vmHandleId, bufferObjects, bind);
+        int retVal = bindBOs(osContext, vmHandleId, bufferObjects, bind, forcePagingFence);
         if (retVal) {
             return retVal;
         }
@@ -162,7 +351,7 @@ int DrmAllocation::makeBOsResident(OsContext *osContext, uint32_t vmHandleId, st
     return 0;
 }
 
-int DrmAllocation::bindBO(BufferObject *bo, OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind) {
+int DrmAllocation::bindBO(BufferObject *bo, OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence) {
     auto retVal = 0;
     if (bo) {
         bo->requireExplicitResidency(bo->peekDrm()->hasPageFaultSupport() && !shouldAllocationPageFault(bo->peekDrm()));
@@ -179,7 +368,9 @@ int DrmAllocation::bindBO(BufferObject *bo, OsContext *osContext, uint32_t vmHan
 
         } else {
             if (bind) {
-                retVal = bo->bind(osContext, vmHandleId);
+                retVal = bo->bind(osContext, vmHandleId, forcePagingFence);
+            } else if (sharedBoUnbindDeferred && bo->peekIsReusableAllocation() && bo->getRefCount() > 1) {
+                retVal = 0;
             } else {
                 retVal = bo->unbind(osContext, vmHandleId);
             }
@@ -188,29 +379,21 @@ int DrmAllocation::bindBO(BufferObject *bo, OsContext *osContext, uint32_t vmHan
     return retVal;
 }
 
-int DrmAllocation::bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind) {
+int DrmAllocation::bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence) {
     int retVal = 0;
-    if (this->storageInfo.getNumBanks() > 1) {
-        auto &bos = this->getBOs();
-        if (this->storageInfo.tileInstanced) {
-            auto bo = bos[vmHandleId];
-            retVal = bindBO(bo, osContext, vmHandleId, bufferObjects, bind);
+    auto &bos = this->getBOs();
+    if (this->storageInfo.getNumBanks() > 1 && this->storageInfo.tileInstanced) {
+        auto bo = bos[vmHandleId];
+        retVal = bindBO(bo, osContext, vmHandleId, bufferObjects, bind, forcePagingFence);
+        if (retVal) {
+            return retVal;
+        }
+    } else {
+        for (auto bo : bos) {
+            retVal = bindBO(bo, osContext, vmHandleId, bufferObjects, bind, forcePagingFence);
             if (retVal) {
                 return retVal;
             }
-        } else {
-            for (auto bo : bos) {
-                retVal = bindBO(bo, osContext, vmHandleId, bufferObjects, bind);
-                if (retVal) {
-                    return retVal;
-                }
-            }
-        }
-    } else {
-        auto bo = this->getBO();
-        retVal = bindBO(bo, osContext, vmHandleId, bufferObjects, bind);
-        if (retVal) {
-            return retVal;
         }
     }
     return 0;
@@ -219,86 +402,53 @@ int DrmAllocation::bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vecto
 bool DrmAllocation::prefetchBO(BufferObject *bo, uint32_t vmHandleId, uint32_t subDeviceId) {
     auto drm = bo->peekDrm();
     auto ioctlHelper = drm->getIoctlHelper();
-    auto memoryClassDevice = ioctlHelper->getDrmParamValue(DrmParam::MemoryClassDevice);
+    auto memoryClassDevice = ioctlHelper->getDrmParamValue(DrmParam::memoryClassDevice);
     auto region = static_cast<uint32_t>((memoryClassDevice << 16u) | subDeviceId);
     auto vmId = drm->getVirtualMemoryAddressSpace(vmHandleId);
 
     auto result = ioctlHelper->setVmPrefetch(bo->peekAddress(), bo->peekSize(), region, vmId);
 
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintBOPrefetchingResult.get(), stdout,
-                       "prefetch BO=%d to VM %u, drmVmId=%u, range: %llx - %llx, size: %lld, region: %x, result: %d\n",
-                       bo->peekHandle(), vmId, vmHandleId, bo->peekAddress(), ptrOffset(bo->peekAddress(), bo->peekSize()), bo->peekSize(), region, result);
+    PRINT_STRING(debugManager.flags.PrintBOPrefetchingResult.get(), stdout,
+                 "prefetch BO=%d to VM %u, drmVmId=%u, range: %llx - %llx, size: %lld, region: %x, result: %d\n",
+                 bo->peekHandle(), vmId, vmHandleId, bo->peekAddress(), ptrOffset(bo->peekAddress(), bo->peekSize()), bo->peekSize(), region, result);
     return result;
 }
 
 void DrmAllocation::registerBOBindExtHandle(Drm *drm) {
-    if (!drm->resourceRegistrationEnabled()) {
+    if (!drm->getIoctlHelper()->resourceRegistrationEnabled()) {
         return;
     }
 
-    DrmResourceClass resourceClass = DrmResourceClass::MaxSize;
-
-    switch (this->allocationType) {
-    case AllocationType::DEBUG_CONTEXT_SAVE_AREA:
-        resourceClass = DrmResourceClass::ContextSaveArea;
-        break;
-    case AllocationType::DEBUG_SBA_TRACKING_BUFFER:
-        resourceClass = DrmResourceClass::SbaTrackingBuffer;
-        break;
-    case AllocationType::KERNEL_ISA:
-        resourceClass = DrmResourceClass::Isa;
-        break;
-    case AllocationType::DEBUG_MODULE_AREA:
-        resourceClass = DrmResourceClass::ModuleHeapDebugArea;
-        break;
-    default:
-        break;
+    if (!registeredBoBindHandles.empty()) {
+        return;
     }
 
-    if (resourceClass != DrmResourceClass::MaxSize) {
-        auto handle = 0;
-        if (resourceClass == DrmResourceClass::Isa) {
-            auto deviceBitfiled = static_cast<uint32_t>(this->storageInfo.subDeviceBitfield.to_ulong());
-            handle = drm->registerResource(resourceClass, &deviceBitfiled, sizeof(deviceBitfiled));
-        } else {
-            uint64_t gpuAddress = getGpuAddress();
-            handle = drm->registerResource(resourceClass, &gpuAddress, sizeof(gpuAddress));
+    drm->getIoctlHelper()->registerBOBindHandle(drm, this);
+}
+
+void DrmAllocation::setAsReadOnly() {
+    auto &bos = getBOs();
+    for (auto &bo : bos) {
+        if (bo) {
+            bo->setAsReadOnly(true);
         }
+    }
+}
 
-        registeredBoBindHandles.push_back(handle);
+void DrmAllocation::setIsaDebugDataHandle(uint32_t handle) {
+    auto &bos = getBOs();
+    for (auto bo : bos) {
+        if (bo) {
+            bo->setIsaDebugDataHandle(handle);
+        }
+    }
+}
 
-        auto &bos = getBOs();
-        uint32_t boIndex = 0u;
-
-        for (auto bo : bos) {
-            if (bo) {
-                bo->addBindExtHandle(handle);
-                bo->markForCapture();
-                if (resourceClass == DrmResourceClass::Isa && storageInfo.tileInstanced == true) {
-                    auto cookieHandle = drm->registerIsaCookie(handle);
-                    bo->addBindExtHandle(cookieHandle);
-                    registeredBoBindHandles.push_back(cookieHandle);
-                }
-
-                if (resourceClass == DrmResourceClass::SbaTrackingBuffer && getOsContext()) {
-                    auto deviceIndex = [=]() -> uint32_t {
-                        if (storageInfo.tileInstanced == true) {
-                            return boIndex;
-                        }
-                        auto deviceBitfield = this->storageInfo.subDeviceBitfield;
-                        return deviceBitfield.any() ? static_cast<uint32_t>(Math::log2(static_cast<uint32_t>(deviceBitfield.to_ulong()))) : 0u;
-                    }();
-
-                    auto contextId = getOsContext()->getOfflineDumpContextId(deviceIndex);
-                    auto externalHandle = drm->registerResource(resourceClass, &contextId, sizeof(uint64_t));
-
-                    bo->addBindExtHandle(externalHandle);
-                    registeredBoBindHandles.push_back(externalHandle);
-                }
-
-                bo->requireImmediateBinding(true);
-            }
-            boIndex++;
+void DrmAllocation::setDrmResourceClass(DrmResourceClass resourceClassToSet) {
+    auto &bos = getBOs();
+    for (auto bo : bos) {
+        if (bo) {
+            bo->setDrmResourceClass(resourceClassToSet);
         }
     }
 }
@@ -308,6 +458,7 @@ void DrmAllocation::linkWithRegisteredHandle(uint32_t handle) {
     for (auto bo : bos) {
         if (bo) {
             bo->addBindExtHandle(handle);
+            bo->requireImmediateBinding(true);
         }
     }
 }
@@ -332,15 +483,15 @@ bool DrmAllocation::shouldAllocationPageFault(const Drm *drm) {
         return false;
     }
 
-    if (DebugManager.flags.EnableImplicitMigrationOnFaultableHardware.get() != -1) {
-        return DebugManager.flags.EnableImplicitMigrationOnFaultableHardware.get();
+    if (debugManager.flags.EnableImplicitMigrationOnFaultableHardware.get() != -1) {
+        return debugManager.flags.EnableImplicitMigrationOnFaultableHardware.get();
     }
 
     switch (this->allocationType) {
-    case AllocationType::UNIFIED_SHARED_MEMORY:
+    case AllocationType::unifiedSharedMemory:
         return drm->hasKmdMigrationSupport();
-    case AllocationType::BUFFER:
-        return DebugManager.flags.UseKmdMigrationForBuffers.get() > 0;
+    case AllocationType::buffer:
+        return debugManager.flags.UseKmdMigrationForBuffers.get() > 0;
     default:
         return false;
     }
@@ -348,14 +499,15 @@ bool DrmAllocation::shouldAllocationPageFault(const Drm *drm) {
 
 bool DrmAllocation::setMemAdvise(Drm *drm, MemAdviseFlags flags) {
     bool success = true;
+    auto currentFlags = this->getMemAdviseFlags();
 
-    if (flags.cachedMemory != enabledMemAdviseFlags.cachedMemory) {
-        CachePolicy memType = flags.cachedMemory ? CachePolicy::WriteBack : CachePolicy::Uncached;
+    if (flags.cachedMemory != currentFlags.cachedMemory) {
+        CachePolicy memType = flags.cachedMemory ? CachePolicy::writeBack : CachePolicy::uncached;
         setCachePolicy(memType);
     }
 
     auto ioctlHelper = drm->getIoctlHelper();
-    if (flags.nonAtomic != enabledMemAdviseFlags.nonAtomic) {
+    if (flags.nonAtomic != currentFlags.nonAtomic) {
         for (auto bo : bufferObjects) {
             if (bo != nullptr) {
                 success &= ioctlHelper->setVmBoAdvise(bo->peekHandle(), ioctlHelper->getAtomicAdvise(flags.nonAtomic), nullptr);
@@ -363,14 +515,36 @@ bool DrmAllocation::setMemAdvise(Drm *drm, MemAdviseFlags flags) {
         }
     }
 
-    if (flags.devicePreferredLocation != enabledMemAdviseFlags.devicePreferredLocation) {
-        success &= setPreferredLocation(drm, flags.devicePreferredLocation ? PreferredLocation::Device : PreferredLocation::Clear);
+    if (flags.devicePreferredLocation != currentFlags.devicePreferredLocation) {
+        success &= setPreferredLocation(drm, flags.devicePreferredLocation ? PreferredLocation::device : PreferredLocation::clear);
+    }
+
+    if (flags.systemPreferredLocation != currentFlags.systemPreferredLocation) {
+        success &= setPreferredLocation(drm, flags.systemPreferredLocation ? PreferredLocation::system : PreferredLocation::defaultLocation);
     }
 
     if (success) {
-        enabledMemAdviseFlags = flags;
+        this->setMemAdviseFlags(flags);
     }
 
+    return success;
+}
+
+bool DrmAllocation::setAtomicAccess(Drm *drm, size_t size, AtomicAccessMode mode) {
+    bool success = true;
+
+    if (mode == AtomicAccessMode::host) {
+        // Host mode not currently supported by KMD
+        return success;
+    }
+
+    auto ioctlHelper = drm->getIoctlHelper();
+
+    for (auto bo : bufferObjects) {
+        if (bo != nullptr) {
+            success &= ioctlHelper->setVmBoAdvise(bo->peekHandle(), ioctlHelper->getAtomicAccess(mode), nullptr);
+        }
+    }
     return success;
 }
 
@@ -383,7 +557,7 @@ bool DrmAllocation::setMemPrefetch(Drm *drm, SubDeviceIdsVec &subDeviceIds) {
         for (uint8_t handleId = 0u; handleId < numHandles; handleId++) {
             auto bo = this->getBOs()[handleId];
             auto subDeviceId = handleId;
-            if (DebugManager.flags.KMDSupportForCrossTileMigrationPolicy.get() > 0) {
+            if (debugManager.flags.KMDSupportForCrossTileMigrationPolicy.get() > 0) {
                 subDeviceId = subDeviceIds[handleId % subDeviceIds.size()];
             }
             for (auto vmHandleId : subDeviceIds) {
@@ -392,13 +566,18 @@ bool DrmAllocation::setMemPrefetch(Drm *drm, SubDeviceIdsVec &subDeviceIds) {
         }
     } else {
         auto bo = this->getBO();
-        success = prefetchBO(bo, subDeviceIds[0], subDeviceIds[0]);
+        if (bo->isChunked()) {
+            auto drm = bo->peekDrm();
+            success = prefetchBOWithChunking(const_cast<Drm *>(drm));
+        } else {
+            success = prefetchBO(bo, subDeviceIds[0], subDeviceIds[0]);
+        }
     }
 
     return success;
 }
 
-void DrmAllocation::registerMemoryToUnmap(void *pointer, size_t size, DrmAllocation::MemoryUnmapFunction unmapFunction) {
+void DrmAllocation::registerMemoryToUnmap(void *pointer, size_t size, MemoryUnmapFunction unmapFunction) {
     this->memoryToUnmap.push_back({pointer, size, unmapFunction});
 }
 
@@ -408,6 +587,15 @@ uint64_t DrmAllocation::getHandleAddressBase(uint32_t handleIndex) {
 
 size_t DrmAllocation::getHandleSize(uint32_t handleIndex) {
     return bufferObjects[handleIndex]->peekSize();
+}
+
+bool DrmAllocation::isPartialObjectMapping() const {
+    auto bo = this->getBO();
+    if (bo == nullptr) {
+        return false;
+    }
+    const auto mappedSize = bo->getVirtualMappingSize();
+    return bo->getPhysicalMemoryOffset() != 0u || (mappedSize != 0u && mappedSize != bo->peekSize());
 }
 
 } // namespace NEO

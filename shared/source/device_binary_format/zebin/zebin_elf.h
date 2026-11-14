@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,21 +12,22 @@
 
 namespace NEO::Zebin::Elf {
 using namespace NEO::Elf;
-enum ELF_TYPE_ZEBIN : uint16_t {
+enum ElfTypeZebin : uint16_t {
     ET_ZEBIN_REL = 0xff11, // A relocatable ZE binary file
     ET_ZEBIN_EXE = 0xff12, // An executable ZE binary file
     ET_ZEBIN_DYN = 0xff13, // A shared object ZE binary file
 };
 
-enum SHT_ZEBIN : uint32_t {
+enum SectionHeaderTypeZebin : uint32_t {
     SHT_ZEBIN_SPIRV = 0xff000009,      // .spv.kernel section, value the same as SHT_OPENCL_SPIRV
     SHT_ZEBIN_ZEINFO = 0xff000011,     // .ze_info section
     SHT_ZEBIN_GTPIN_INFO = 0xff000012, // .gtpin_info section
     SHT_ZEBIN_VISA_ASM = 0xff000013,   // .visaasm sections
-    SHT_ZEBIN_MISC = 0xff000014        // .misc section
+    SHT_ZEBIN_MISC = 0xff000014,       // .misc section
+    SHT_ZEBIN_PISA = 0xff000015        // .pisa section
 };
 
-enum RELOC_TYPE_ZEBIN : uint32_t {
+enum RelocTypeZebin : uint32_t {
     R_ZE_NONE,
     R_ZE_SYM_ADDR,
     R_ZE_SYM_ADDR_32,
@@ -35,6 +36,7 @@ enum RELOC_TYPE_ZEBIN : uint32_t {
 };
 
 namespace SectionNames {
+inline constexpr ConstStringRef text = ".text";
 inline constexpr ConstStringRef textPrefix = ".text.";
 inline constexpr ConstStringRef functions = ".text.Intel_Symbol_Table_Void_Program";
 inline constexpr ConstStringRef dataConst = ".data.const";
@@ -47,6 +49,7 @@ inline constexpr ConstStringRef symtab = ".symtab";
 inline constexpr ConstStringRef relTablePrefix = ".rel.";
 inline constexpr ConstStringRef relaTablePrefix = ".rela.";
 inline constexpr ConstStringRef spv = ".spv";
+inline constexpr ConstStringRef pisa = ".pisa";
 inline constexpr ConstStringRef debugPrefix = ".debug_";
 inline constexpr ConstStringRef debugInfo = ".debug_info";
 inline constexpr ConstStringRef debugAbbrev = ".debug_abbrev";
@@ -54,18 +57,23 @@ inline constexpr ConstStringRef zeInfo = ".ze_info";
 inline constexpr ConstStringRef gtpinInfo = ".gtpin_info.";
 inline constexpr ConstStringRef noteIntelGT = ".note.intelgt.compat";
 inline constexpr ConstStringRef buildOptions = ".misc.buildOptions";
+inline constexpr ConstStringRef specConstantsIds = ".misc.specConstantsIds";
+inline constexpr ConstStringRef specConstantsValues = ".misc.specConstantsValues";
 inline constexpr ConstStringRef vIsaAsmPrefix = ".visaasm.";
 inline constexpr ConstStringRef externalFunctions = "Intel_Symbol_Table_Void_Program";
 } // namespace SectionNames
 
-inline constexpr ConstStringRef IntelGTNoteOwnerName = "IntelGT";
+inline constexpr ConstStringRef intelGTNoteOwnerName = "IntelGT";
 enum IntelGTSectionType : uint32_t {
-    ProductFamily = 1,
-    GfxCore = 2,
-    TargetMetadata = 3,
-    ZebinVersion = 4,
-    ProductConfig = 5,
-    LastSupported = ProductConfig
+    productFamily = 1,
+    gfxCore = 2,
+    targetMetadata = 3,
+    zebinVersion = 4,
+    vISAAbiVersion = 5, // for debugger only
+    productConfig = 6,
+    indirectAccessDetectionVersion = 7,
+    indirectAccessBufferMajorVersion = 8,
+    lastSupported = indirectAccessBufferMajorVersion
 };
 struct IntelGTNote {
     IntelGTSectionType type;
@@ -77,7 +85,7 @@ struct ZebinTargetFlags {
             // bit[7:0]: dedicated for specific generator (meaning based on generatorId)
             uint8_t generatorSpecificFlags : 8;
 
-            // bit[12:8]: values [0-31], min compatbile device revision Id (stepping)
+            // bit[12:8]: values [0-31], min compatible device revision Id (stepping)
             uint8_t minHwRevisionId : 5;
 
             // bit[13:13]:
@@ -95,7 +103,7 @@ struct ZebinTargetFlags {
             // 1 - elfFileHeader::machine is GFXCORE_FAMILY
             bool machineEntryUsesGfxCoreInsteadOfProductFamily : 1;
 
-            // bit[20:16]:  max compatbile device revision Id (stepping)
+            // bit[20:16]:  max compatible device revision Id (stepping)
             uint8_t maxHwRevisionId : 5;
 
             // bit[23:21]: generator of this device binary

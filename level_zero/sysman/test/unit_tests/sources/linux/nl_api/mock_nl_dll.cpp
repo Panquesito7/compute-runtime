@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,11 @@
 
 #include "level_zero/sysman/test/unit_tests/sources/linux/nl_api/mock_nl_dll.h"
 
-#include <level_zero/zes_api.h>
+#include "gtest/gtest.h"
+#include "iaf_netlink.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 extern "C" {
@@ -25,6 +27,7 @@ struct nlattr MockNlDll::mockNlattr;
 struct nlattr MockNlDll::mockNextNlattr;
 struct genl_ops MockNlDll::mockGenlOps;
 nl_recvmsg_msg_cb_t MockNlDll::mockCb = mockCallback;
+const std::string MockNlDll::mockStr = "mockString";
 
 extern "C" {
 int mockGenlConnect(struct nl_sock *sock) {
@@ -114,6 +117,11 @@ void *mockNlaData(const struct nlattr *attr) {
 uint32_t mockNlaGetU32(const struct nlattr *attr) {
     EXPECT_EQ(&MockNlDll::mockNlattr, attr);
     return MockNlDll::mockU32Val;
+}
+
+char *mockNlaGetString(const struct nlattr *attr) {
+    EXPECT_EQ(&MockNlDll::mockNlattr, attr);
+    return const_cast<char *>(MockNlDll::mockStr.c_str());
 }
 
 uint64_t mockNlaGetU64(const struct nlattr *attr) {
@@ -207,6 +215,47 @@ struct nlmsghdr *mockNlmsgHdr(struct nl_msg *msg) {
     EXPECT_EQ(&MockNlDll::mockNlMsg, msg);
     return &MockNlDll::mockNlmsghdr;
 }
+
+struct nlattr *mockNlaNestStart(struct nl_msg *msg, int id) {
+    EXPECT_EQ(&MockNlDll::mockNlMsg, msg);
+    EXPECT_EQ(IAF_ATTR_FABRIC_PORT, id);
+    return &MockNlDll::mockNlattr;
+}
+
+int mockNlaNestEnd(struct nl_msg *msg, struct nlattr *attr) {
+    EXPECT_EQ(&MockNlDll::mockNlMsg, msg);
+    EXPECT_EQ(&MockNlDll::mockNlattr, attr);
+    return 0;
+}
+
+int mockGenlCtrlResolveGrp(struct nl_sock *sock, const char *family, const char *group) {
+    EXPECT_EQ(&MockNlDll::mockNlSock, sock);
+    EXPECT_FALSE(strcmp(MockNlDll::mockFamilyName, family));
+    EXPECT_FALSE(strcmp(MockNlDll::mockGroupName, group));
+    return MockNlDll::mockGroupId;
+}
+
+int mockNlSocketAddMembership(struct nl_sock *sock, int group) {
+    EXPECT_EQ(&MockNlDll::mockNlSock, sock);
+    EXPECT_EQ(MockNlDll::mockGroupId, group);
+    return 0;
+}
+
+int mockNlSocketDropMembership(struct nl_sock *sock, int group) {
+    EXPECT_EQ(&MockNlDll::mockNlSock, sock);
+    EXPECT_EQ(MockNlDll::mockGroupId, group);
+    return 0;
+}
+
+int mockNlSocketSetNonblocking(struct nl_sock *sock) {
+    EXPECT_EQ(&MockNlDll::mockNlSock, sock);
+    return 0;
+}
+
+int mockNlSocketGetFd(const struct nl_sock *sock) {
+    EXPECT_EQ(&MockNlDll::mockNlSock, sock);
+    return MockNlDll::mockFd;
+}
 }
 
 MockNlDll::MockNlDll() {
@@ -225,6 +274,7 @@ MockNlDll::MockNlDll() {
     funcMap["nl_socket_modify_cb"] = reinterpret_cast<void *>(&mockNlSocketModifyCb);
     funcMap["nla_data"] = reinterpret_cast<void *>(&mockNlaData);
     funcMap["nla_get_u32"] = reinterpret_cast<void *>(&mockNlaGetU32);
+    funcMap["nla_get_string"] = reinterpret_cast<void *>(&mockNlaGetString);
     funcMap["nla_get_u64"] = reinterpret_cast<void *>(&mockNlaGetU64);
     funcMap["nla_get_u8"] = reinterpret_cast<void *>(&mockNlaGetU8);
     funcMap["nla_is_nested"] = reinterpret_cast<void *>(&mockNlaIsNested);
@@ -241,6 +291,13 @@ MockNlDll::MockNlDll() {
     funcMap["nlmsg_attrlen"] = reinterpret_cast<void *>(&mockNlmsgAttrlen);
     funcMap["nlmsg_free"] = reinterpret_cast<void *>(&mockNlmsgFree);
     funcMap["nlmsg_hdr"] = reinterpret_cast<void *>(&mockNlmsgHdr);
+    funcMap["nla_nest_start"] = reinterpret_cast<void *>(&mockNlaNestStart);
+    funcMap["nla_nest_end"] = reinterpret_cast<void *>(&mockNlaNestEnd);
+    funcMap["genl_ctrl_resolve_grp"] = reinterpret_cast<void *>(&mockGenlCtrlResolveGrp);
+    funcMap["nl_socket_add_membership"] = reinterpret_cast<void *>(&mockNlSocketAddMembership);
+    funcMap["nl_socket_drop_membership"] = reinterpret_cast<void *>(&mockNlSocketDropMembership);
+    funcMap["nl_socket_set_nonblocking"] = reinterpret_cast<void *>(&mockNlSocketSetNonblocking);
+    funcMap["nl_socket_get_fd"] = reinterpret_cast<void *>(&mockNlSocketGetFd);
 }
 
 void *MockNlDll::getProcAddress(const std::string &procName) {
@@ -260,4 +317,5 @@ void MockNlDll::deleteEntryPoint(const std::string &procName) {
 }
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

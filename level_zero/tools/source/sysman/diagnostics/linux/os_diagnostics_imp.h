@@ -1,21 +1,24 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
-#include "level_zero/tools/source/sysman/diagnostics/diagnostics_imp.h"
 #include "level_zero/tools/source/sysman/diagnostics/os_diagnostics.h"
-#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
 
 namespace L0 {
 class FirmwareUtil;
+class FsAccess;
+class LinuxSysmanImp;
+class SysfsAccess;
+struct OsSysman;
 
-class LinuxDiagnosticsImp : public OsDiagnostics, NEO::NonCopyableOrMovableClass {
+class LinuxDiagnosticsImp : public OsDiagnostics, NEO::NonCopyableAndNonMovableClass {
   public:
     void osGetDiagProperties(zes_diag_properties_t *pProperties) override;
     ze_result_t osGetDiagTests(uint32_t *pCount, zes_diag_test_t *pTests) override;
@@ -31,7 +34,6 @@ class LinuxDiagnosticsImp : public OsDiagnostics, NEO::NonCopyableOrMovableClass
     FirmwareUtil *pFwInterface = nullptr;
     SysfsAccess *pSysfsAccess = nullptr;
     FsAccess *pFsAccess = nullptr;
-    ze_result_t gpuProcessCleanup();
     ze_result_t waitForQuiescentCompletion();
 
   private:

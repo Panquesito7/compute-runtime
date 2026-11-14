@@ -1,21 +1,19 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/aub_mem_dump/definitions/aub_services.h"
 #include "shared/source/command_stream/preemption_mode.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/release_helpers/caps/caps_setup.h"
 #include "shared/source/unified_memory/usm_memory_support.h"
 #include "shared/source/xe_hpc_core/hw_cmds_pvc.h"
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
 
 #include "aubstream/engine_node.h"
-#include "platforms.h"
 
 namespace NEO {
 
@@ -28,193 +26,114 @@ const PLATFORM PVC::platform = {
     IGFX_XE_HPC_CORE,
     PLATFORM_NONE,     // default init
     pvcXtDeviceIds[0], // usDeviceID
-    7,                 // usRevId
+    47,                // usRevId
     0,                 // usDeviceID_PCH
     0,                 // usRevId_PCH
     GTTYPE_UNDEFINED};
 
 const RuntimeCapabilityTable PVC::capabilityTable{
-    EngineDirectSubmissionInitVec{
-        {aub_stream::ENGINE_CCS, {true, false, false, true}},
-        {aub_stream::ENGINE_CCS1, {true, false, true, true}},
-        {aub_stream::ENGINE_CCS2, {true, false, true, true}},
-        {aub_stream::ENGINE_CCS3, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS1, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS2, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS3, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS4, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS5, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS6, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS7, {true, false, true, true}},
-        {aub_stream::ENGINE_BCS8, {true, false, true, true}}}, // directSubmissionEngines
-    {0, 0, 0, 0, false, false, false, false},                  // kmdNotifyProperties
-    maxNBitValue(57),                                          // gpuAddressSpace
-    0,                                                         // sharedSystemMemCapabilities
-    83.333,                                                    // defaultProfilingTimerResolution
-    MemoryConstants::pageSize,                                 // requiredPreemptionSurfaceSize
-    "",                                                        // deviceName
-    PreemptionMode::ThreadGroup,                               // defaultPreemptionMode
-    aub_stream::ENGINE_CCS,                                    // defaultEngineType
-    0,                                                         // maxRenderFrequency
-    30,                                                        // clVersionSupport
-    CmdServicesMemTraceVersion::DeviceValues::Pvc,             // aubDeviceId
-    0,                                                         // extraQuantityThreadsPerEU
-    128,                                                       // slmSize
-    sizeof(PVC::GRF),                                          // grfSize
-    36u,                                                       // timestampValidBits
-    32u,                                                       // kernelTimestampValidBits
-    false,                                                     // blitterOperationsSupported
-    true,                                                      // ftrSupportsInteger64BitAtomics
-    true,                                                      // ftrSupportsFP64
-    false,                                                     // ftrSupportsFP64Emulation
-    true,                                                      // ftrSupports64BitMath
-    true,                                                      // ftrSvm
-    false,                                                     // ftrSupportsCoherency
-    false,                                                     // ftrSupportsVmeAvcTextureSampler
-    false,                                                     // ftrSupportsVmeAvcPreemption
-    false,                                                     // ftrRenderCompressedBuffers
-    false,                                                     // ftrRenderCompressedImages
-    true,                                                      // ftr64KBpages
-    true,                                                      // instrumentationEnabled
-    false,                                                     // sourceLevelDebuggerSupported
-    false,                                                     // supportsVme
-    false,                                                     // supportCacheFlushAfterWalker
-    false,                                                     // supportsImages
-    false,                                                     // supportsDeviceEnqueue
-    false,                                                     // supportsPipes
-    true,                                                      // supportsOcl21Features
-    true,                                                      // supportsOnDemandPageFaults
-    true,                                                      // supportsIndependentForwardProgress
-    false,                                                     // hostPtrTrackingEnabled
-    true,                                                      // levelZeroSupported
-    false,                                                     // isIntegratedDevice
-    false,                                                     // supportsMediaBlock
-    true,                                                      // p2pAccessSupported
-    true,                                                      // p2pAtomicAccessSupported
-    false,                                                     // fusedEuEnabled
-    true,                                                      // l0DebuggerSupported;
-    true                                                       // supportsFloatAtomics
+    .directSubmissionEngines = makeDirectSubmissionPropertiesPerEngine({
+        {aub_stream::ENGINE_CCS, {.engineSupported = true, .submitOnInit = false, .useNonDefault = false}},
+        {aub_stream::ENGINE_CCS1, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_CCS2, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_CCS3, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS1, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS2, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS3, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS4, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS5, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS6, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS7, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_BCS8, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+    }),
+    .kmdNotifyProperties = {0, 0, 0, 0, false, false, false, false},
+    .gpuAddressSpace = maxNBitValue(57),
+    .sharedSystemMemCapabilities = 0,
+    .requiredPreemptionSurfaceSize = MemoryConstants::pageSize,
+    .deviceName = "",
+    .preferredPlatformName = nullptr,
+    .defaultPreemptionMode = PreemptionMode::ThreadGroup,
+    .defaultEngineType = aub_stream::ENGINE_CCS,
+    .maxRenderFrequency = 0,
+    .extraQuantityThreadsPerEU = 0,
+    .maxProgrammableSlmSize = 128,
+    .grfSize = sizeof(PVC::GRF),
+    .timestampValidBits = 36u,
+    .kernelTimestampValidBits = 32u,
+    .blitterOperationsSupported = false,
+    .ftrSupportsFP64 = true,
+    .ftrSupportsFP64Emulation = false,
+    .ftrSupports64BitMath = true,
+    .ftrSupportsCoherency = false,
+    .ftrRenderCompressedBuffers = false,
+    .ftrRenderCompressedImages = false,
+    .supportCacheFlushAfterWalker = false,
+    .supportsImages = false,
+    .supportsOnDemandPageFaults = false,
+    .supportsIndependentForwardProgress = true,
+    .isIntegratedDevice = false,
+    .supportsMediaBlock = false,
+    .fusedEuEnabled = false,
+    .l0DebuggerSupported = true,
 };
 
 void PVC::setupFeatureAndWorkaroundTable(HardwareInfo *hwInfo) {
+    setupDefaultFeatureTableAndWorkaroundTable(hwInfo);
     FeatureTable *featureTable = &hwInfo->featureTable;
-    WorkaroundTable *workaroundTable = &hwInfo->workaroundTable;
 
-    featureTable->flags.ftrL3IACoherency = true;
     featureTable->flags.ftrLocalMemory = true;
-    featureTable->flags.ftrLinearCCS = true;
     featureTable->flags.ftrFlatPhysCCS = true;
-    featureTable->flags.ftrE2ECompression = false;
-    featureTable->flags.ftrCCSNode = true;
-    featureTable->flags.ftrCCSRing = true;
     featureTable->flags.ftrMultiTileArch = true;
 
-    featureTable->flags.ftrPPGTT = true;
-    featureTable->flags.ftrSVM = true;
-    featureTable->flags.ftrL3IACoherency = true;
-    featureTable->flags.ftrIA32eGfxPTEs = true;
-    featureTable->flags.ftrStandardMipTailFormat = true;
-    featureTable->flags.ftrTranslationTable = true;
-    featureTable->flags.ftrUserModeTranslationTable = true;
-    featureTable->flags.ftrTileMappedResource = true;
-    featureTable->flags.ftrFbc = true;
-    featureTable->flags.ftrAstcHdr2D = true;
-    featureTable->flags.ftrAstcLdr2D = true;
-
-    featureTable->flags.ftrGpGpuMidBatchPreempt = true;
-    featureTable->flags.ftrGpGpuThreadGroupLevelPreempt = true;
-
-    featureTable->flags.ftrTileY = false;
     featureTable->ftrBcsInfo = maxNBitValue(9);
-    workaroundTable->flags.wa4kAlignUVOffsetNV12LinearSurface = true;
 }
 
 void PVC::adjustHardwareInfo(HardwareInfo *hwInfo) {
-    hwInfo->capabilityTable.sharedSystemMemCapabilities = (UNIFIED_SHARED_MEMORY_ACCESS | UNIFIED_SHARED_MEMORY_CONCURRENT_ACCESS | UNIFIED_SHARED_MEMORY_CONCURRENT_ATOMIC_ACCESS);
+    hwInfo->capabilityTable.sharedSystemMemCapabilities = (UnifiedSharedMemoryFlags::access | UnifiedSharedMemoryFlags::atomicAccess | UnifiedSharedMemoryFlags::concurrentAccess | UnifiedSharedMemoryFlags::concurrentAtomicAccess);
 }
 
-void PVC::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->ThreadCount = gtSysInfo->EUCount * compilerProductHelper.getNumThreadsPerEu();
-    gtSysInfo->MaxFillRate = 128;
-    gtSysInfo->TotalVsThreads = 336;
-    gtSysInfo->TotalHsThreads = 336;
-    gtSysInfo->TotalDsThreads = 336;
-    gtSysInfo->TotalGsThreads = 336;
-    gtSysInfo->TotalPsThreadsWindowerRange = 64;
-    gtSysInfo->CsrSizeInMb = 8;
-    gtSysInfo->MaxEuPerSubSlice = PVC::maxEuPerSubslice;
-    gtSysInfo->MaxSlicesSupported = PVC::maxSlicesSupported;
-    gtSysInfo->MaxSubSlicesSupported = PVC::maxSubslicesSupported;
-    gtSysInfo->MaxDualSubSlicesSupported = PVC::maxDualSubslicesSupported;
-    gtSysInfo->IsL3HashModeEnabled = false;
-    gtSysInfo->IsDynamicallyPopulated = false;
+void PVC::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
+    setupDefaultGtSysInfo(hwInfo);
+    setupHardwareInfoMultiTileBase(hwInfo, true);
+
+    hwInfo->gtSystemInfo.NumThreadsPerEu = 8u;
+    hwInfo->gtSystemInfo.ThreadCount = hwInfo->gtSystemInfo.EUCount * hwInfo->gtSystemInfo.NumThreadsPerEu;
 
     PVC::adjustHardwareInfo(hwInfo);
 
+    setupCaps(*hwInfo);
     if (setupFeatureTableAndWorkaroundTable) {
         setupFeatureAndWorkaroundTable(hwInfo);
     }
+
+    applyDebugOverrides(*hwInfo);
 }
 
 void PVC::setupHardwareInfoMultiTileBase(HardwareInfo *hwInfo, bool setupMultiTile) {
     GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
     gtSysInfo->MultiTileArchInfo.IsValid = setupMultiTile;
     gtSysInfo->MultiTileArchInfo.TileCount = 1;
-    if (DebugManager.flags.CreateMultipleSubDevices.get() > 0) {
-        gtSysInfo->MultiTileArchInfo.TileCount = DebugManager.flags.CreateMultipleSubDevices.get();
+    if (debugManager.flags.CreateMultipleSubDevices.get() > 0) {
+        gtSysInfo->MultiTileArchInfo.TileCount = debugManager.flags.CreateMultipleSubDevices.get();
     }
     gtSysInfo->MultiTileArchInfo.TileMask = static_cast<uint8_t>(maxNBitValue(gtSysInfo->MultiTileArchInfo.TileCount));
 }
 
-FeatureTable PVC::featureTable;
-WorkaroundTable PVC::workaroundTable;
+FeatureTable PVC::featureTable{};
+WorkaroundTable PVC::workaroundTable{};
 
-const HardwareInfo PvcHwConfig::hwInfo = {
+const HardwareInfo PVC::hwInfo = {
     &PVC::platform,
     &PVC::featureTable,
     &PVC::workaroundTable,
-    &PvcHwConfig::gtSystemInfo,
-    PVC::capabilityTable,
-    AOT::PVC_XT_C0};
+    &PVC::gtSystemInfo,
+    PVC::capabilityTable};
 
-GT_SYSTEM_INFO PvcHwConfig::gtSystemInfo = {0};
-void PvcHwConfig::setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    PVC::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
-    GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->CsrSizeInMb = 8;
-    gtSysInfo->IsL3HashModeEnabled = false;
-    gtSysInfo->IsDynamicallyPopulated = false;
-
-    // non-zero values for unit tests
-    if (gtSysInfo->SliceCount == 0) {
-        gtSysInfo->SliceCount = 2;
-        gtSysInfo->SubSliceCount = 8;
-        gtSysInfo->DualSubSliceCount = gtSysInfo->SubSliceCount;
-        gtSysInfo->EUCount = 40;
-        gtSysInfo->MaxEuPerSubSlice = gtSysInfo->EUCount / gtSysInfo->SubSliceCount;
-        gtSysInfo->MaxSlicesSupported = gtSysInfo->SliceCount;
-        gtSysInfo->MaxSubSlicesSupported = gtSysInfo->SubSliceCount;
-
-        gtSysInfo->L3CacheSizeInKb = 1;
-        gtSysInfo->L3BankCount = 1;
-
-        gtSysInfo->CCSInfo.IsValid = true;
-        gtSysInfo->CCSInfo.NumberOfCCSEnabled = 2;
-        gtSysInfo->CCSInfo.Instances.CCSEnableMask = 0b11;
-
-        hwInfo->featureTable.ftrBcsInfo = 1;
-        gtSysInfo->IsDynamicallyPopulated = true;
-        for (uint32_t slice = 0; slice < gtSysInfo->SliceCount; slice++) {
-            gtSysInfo->SliceInfo[slice].Enabled = true;
-        }
-    }
-
-    if (setupFeatureTableAndWorkaroundTable) {
-        PVC::setupFeatureAndWorkaroundTable(hwInfo);
-    }
+GT_SYSTEM_INFO PVC::gtSystemInfo = {0};
+void PVC::setupHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
+    PVC::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable);
 };
 
-#include "hw_info_setup_pvc.inl"
+void (*PVC::setupHardwareInfo)(HardwareInfo *, bool) = PVC::setupHardwareInfoImpl;
 } // namespace NEO

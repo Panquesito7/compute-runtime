@@ -1,0 +1,358 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/os_interface/linux/engine_info.h"
+#include "shared/source/os_interface/linux/ioctl_helper.h"
+#include "shared/source/os_interface/linux/memory_info.h"
+#include "shared/source/utilities/stackvec.h"
+#include "shared/test/common/libult/linux/drm_mock.h"
+
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace NEO {
+
+class MockIoctlHelperWithCapture : public IoctlHelperUpstream {
+  public:
+    using IoctlHelperUpstream::ioctl;
+    using IoctlHelperUpstream::IoctlHelperUpstream;
+    using IoctlHelperUpstream::waitUserFence;
+
+    bool isDmaBufMmapPreferredForImportedHostMemory() const override {
+        return isDmaBufMmapPreferredForImportedHostMemoryResult.value_or(IoctlHelperUpstream::isDmaBufMmapPreferredForImportedHostMemory());
+    }
+    std::optional<bool> isDmaBufMmapPreferredForImportedHostMemoryResult;
+
+    struct QueryResult {
+        int ret = 0;
+        int32_t length = 0;
+    };
+
+    int ioctl(DrmIoctl request, void *arg) override {
+        if (request != DrmIoctl::query || queryCalled >= queryResults.size()) {
+            return IoctlHelperUpstream::ioctl(request, arg);
+        }
+        auto &result = queryResults[queryCalled++];
+        auto query = static_cast<Query *>(arg);
+        reinterpret_cast<QueryItem *>(query->itemsPtr)->length = result.length;
+        return result.ret;
+    }
+
+    static constexpr uint64_t vmBindFlagCapture = 1u << 0;
+    static constexpr uint64_t vmBindFlagImmediate = 1u << 1;
+    static constexpr uint64_t vmBindFlagMakeResident = 1u << 2;
+    static constexpr uint64_t vmBindFlagLockedMemory = 1u << 3;
+    static constexpr uint64_t vmBindFlagReadOnly = 1u << 4;
+    static constexpr uint64_t vmBindFlagResolve = 1u << 5;
+
+    struct UserFence {
+        uint64_t address = 0;
+        uint64_t value = 0;
+    };
+
+    struct VmCreateFlags {
+        bool disableScratch = false;
+        bool enablePageFault = false;
+        bool useVmBind = false;
+    };
+
+    struct VmPrefetchCall {
+        uint64_t start = 0;
+        uint64_t length = 0;
+        uint32_t region = 0;
+        uint32_t vmId = 0;
+    };
+
+    struct VmSharedSystemMemAdviseCall {
+        uint64_t handle = 0;
+        size_t size = 0;
+        uint32_t attribute = 0;
+        uint64_t param = 0;
+        std::vector<uint32_t> vmIds;
+    };
+
+    struct CreateGemExtCall {
+        MemRegionsVec memClassInstances;
+        std::optional<std::vector<unsigned long>> memPolicyNodemask;
+        size_t allocSize = 0;
+        uint64_t patIndex = 0;
+        std::optional<uint32_t> vmId;
+        std::optional<uint32_t> memPolicyMode;
+        int32_t pairHandle = -1;
+        uint32_t numOfChunks = 0;
+        bool isChunked = false;
+    };
+
+    int createGemExt(const MemRegionsVec &memClassInstances, size_t allocSize, uint32_t &handle, uint64_t patIndex, std::optional<uint32_t> vmId, int32_t pairHandle, bool isChunked, uint32_t numOfChunks, std::optional<uint32_t> memPolicyMode, std::optional<std::vector<unsigned long>> memPolicyNodemask, std::optional<bool> isCoherent, GemCreateExtHint hint, std::optional<bool> deferBacking) override {
+        createGemExtCalls.push_back({memClassInstances, memPolicyNodemask, allocSize, patIndex, vmId, memPolicyMode, pairHandle, numOfChunks, isChunked});
+        handle = createGemExtHandle;
+        return createGemExtResult;
+    }
+
+    bool hasEnoughDeviceMemory(size_t size, uint32_t memoryBanks) override {
+        hasEnoughDeviceMemoryCalled++;
+        return hasEnoughDeviceMemoryResult;
+    }
+
+    bool retrieveMmapOffsetForBufferObject(BufferObject &bo, uint64_t flags, uint64_t &offset) override {
+        retrieveMmapOffsetCalled++;
+        offset = mmapOffsetToReturn;
+        return retrieveMmapOffsetResult;
+    }
+
+    std::unique_ptr<MemoryInfo> createMemoryInfo() override {
+        if (!memoryRegionsToReturn) {
+            return nullptr;
+        }
+        return std::make_unique<MemoryInfo>(*memoryRegionsToReturn, drm);
+    }
+
+    bool setVmBoAdvise(int32_t handle, uint32_t attribute, void *region) override {
+        vmBoAdviseCalled++;
+        return vmBoAdviseResult;
+    }
+
+    bool setVmBoAdviseForChunking(int32_t handle, uint64_t start, uint64_t length, uint32_t attribute, void *region) override {
+        vmBoAdviseForChunkingCalled++;
+        return vmBoAdviseResult;
+    }
+
+    bool setVmSharedSystemMemAdvise(uint64_t handle, const size_t size, const uint32_t attribute, const uint64_t param, const StackVec<uint32_t, 2> &vmIds, uint32_t numSubDevices) override {
+        VmSharedSystemMemAdviseCall call{handle, size, attribute, param, {}};
+        for (uint32_t i = 0; i < numSubDevices; i++) {
+            call.vmIds.push_back(vmIds[i]);
+        }
+        vmSharedSystemMemAdviseCalls.push_back(call);
+        return vmSharedSystemMemAdviseResult;
+    }
+
+    bool setVmPrefetch(uint64_t start, uint64_t length, uint32_t region, uint32_t vmId) override {
+        vmPrefetchCalls.push_back({start, length, region, vmId});
+        return vmPrefetchResult;
+    }
+
+    std::optional<MemoryClassInstance> getPreferredLocationRegion(PreferredLocation memoryLocation, uint32_t memoryInstance) override {
+        if (!preferredLocationRegionAvailable) {
+            return std::nullopt;
+        }
+        return MemoryClassInstance{static_cast<uint16_t>(getDrmParamValue(DrmParam::memoryClassDevice)), static_cast<uint16_t>(memoryInstance)};
+    }
+
+    std::optional<uint32_t> getVmAdviseAtomicAttribute() override {
+        return vmAdviseAtomicAttribute;
+    }
+
+    CacheRegion closAlloc(CacheLevel cacheLevel) override {
+        if (!closSupported || ++closIndex == 0) {
+            return CacheRegion::none;
+        }
+        return static_cast<CacheRegion>(closIndex);
+    }
+
+    uint16_t closAllocWays(CacheRegion closIndex, uint16_t cacheLevel, uint16_t numWays) override {
+        if (!closSupported || toUnderlying(closIndex) > this->closIndex || numWays > closMaxNumWays - closAllocatedNumWays) {
+            return 0;
+        }
+        closAllocatedNumWays += numWays;
+        return numWays;
+    }
+
+    CacheRegion closFree(CacheRegion closIndex) override {
+        if (!closSupported || toUnderlying(closIndex) > this->closIndex) {
+            return CacheRegion::none;
+        }
+        this->closIndex--;
+        return closIndex;
+    }
+
+    bool isVmBindPatIndexExtSupported() override {
+        return true;
+    }
+
+    void fillVmBindExtSetPat(VmBindExtSetPatT &vmBindExtSetPat, uint64_t patIndex, uint64_t nextExtension) override {
+        filledVmBindExtPatIndex = patIndex;
+    }
+
+    uint32_t getDirectSubmissionFlag() override {
+        return directSubmissionFlag;
+    }
+
+    uint32_t createContextWithAccessCounters(GemContextCreateExt &gcc) override {
+        createContextWithAccessCountersCalled++;
+        return IoctlHelperUpstream::createContextWithAccessCounters(gcc);
+    }
+
+    uint32_t createCooperativeContext(GemContextCreateExt &gcc) override {
+        createCooperativeContextCalled++;
+        return IoctlHelperUpstream::createCooperativeContext(gcc);
+    }
+
+    uint32_t getFlagsForVmCreate(bool disableScratch, bool enablePageFault, bool useVmBind) override {
+        receivedVmCreateFlags = VmCreateFlags{disableScratch, enablePageFault, useVmBind};
+        return IoctlHelperUpstream::getFlagsForVmCreate(disableScratch, enablePageFault, useVmBind);
+    }
+
+    std::unique_ptr<uint8_t[]> createVmControlExtRegion(const std::optional<MemoryClassInstance> &regionInstanceClass) override {
+        createVmControlExtRegionCalled++;
+        receivedVmControlRegion = regionInstanceClass;
+        return IoctlHelperUpstream::createVmControlExtRegion(regionInstanceClass);
+    }
+
+    std::unique_ptr<uint8_t[]> prepareVmBindExt(const StackVec<uint32_t, 2> &bindExtHandles, uint64_t cookie) override {
+        prepareVmBindExtCalls.emplace_back(bindExtHandles.begin(), bindExtHandles.end());
+        return std::make_unique<uint8_t[]>(1);
+    }
+
+    uint64_t getFlagsForVmBind(bool bindCapture, bool bindImmediate, bool bindMakeResident, bool bindLockedMemory, bool readOnlyResource, bool resolveResource) override {
+        return (bindCapture ? vmBindFlagCapture : 0) | (bindImmediate ? vmBindFlagImmediate : 0) | (bindMakeResident ? vmBindFlagMakeResident : 0) |
+               (bindLockedMemory ? vmBindFlagLockedMemory : 0) | (readOnlyResource ? vmBindFlagReadOnly : 0) | (resolveResource ? vmBindFlagResolve : 0);
+    }
+
+    void fillVmBindExtUserFence(VmBindExtUserFenceT &vmBindExtUserFence, uint64_t fenceAddress, uint64_t fenceValue, uint64_t nextExtension) override {
+        filledVmBindExtUserFence = UserFence{fenceAddress, fenceValue};
+    }
+
+    int vmBind(const VmBindParams &vmBindParams) override {
+        vmBindCalled++;
+        receivedVmBind = vmBindParams;
+        receivedVmBindPatIndex = std::exchange(filledVmBindExtPatIndex, std::nullopt);
+        if (filledVmBindExtUserFence) {
+            receivedVmBindUserFence = std::exchange(filledVmBindExtUserFence, std::nullopt);
+        }
+        return vmBindResult;
+    }
+
+    bool isDeferBackingEnabledForAllocation(size_t allocationSize, AllocationType allocationType) const override {
+        return deferBackingEnabledForAllocation;
+    }
+
+    int vmUnbind(const VmBindParams &vmBindParams) override {
+        vmUnbindCalled++;
+        receivedVmUnbind = vmBindParams;
+        receivedVmUnbindPatIndex = std::exchange(filledVmBindExtPatIndex, std::nullopt);
+        if (filledVmBindExtUserFence) {
+            receivedVmBindUserFence = std::exchange(filledVmBindExtUserFence, std::nullopt);
+        }
+        return vmUnbindResult;
+    }
+
+    int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, uint32_t dataWidth, int64_t timeout, uint16_t flags,
+                      bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+        waitUserFenceCalled++;
+        return waitUserFenceResult;
+    }
+
+    bool requiresUserFenceSetup(bool bind) const override {
+        return userFenceSetupRequired;
+    }
+
+    bool isVmBindAvailable() override {
+        isVmBindAvailableCalled++;
+        return vmBindAvailable;
+    }
+
+    bool isSetPairAvailable() override {
+        isSetPairAvailableCalled++;
+        return setPairAvailable;
+    }
+
+    bool isChunkingAvailable() override {
+        isChunkingAvailableCalled++;
+        return chunkingAvailable;
+    }
+
+    std::unique_ptr<EngineInfo> createEngineInfo(bool isSysmanEnabled) override {
+        createEngineInfoCalled++;
+        if (!enginesToReturn) {
+            return nullptr;
+        }
+        StackVec<std::vector<EngineCapabilities>, 2> engineInfosPerTile{*enginesToReturn};
+        return std::make_unique<EngineInfo>(&drm, engineInfosPerTile);
+    }
+
+    bool closSupported = false;
+    uint16_t closIndex = 0u;
+    uint16_t closMaxNumWays = 32u;
+    uint16_t closAllocatedNumWays = 0u;
+
+    std::vector<QueryResult> queryResults;
+    size_t queryCalled = 0u;
+
+    std::vector<CreateGemExtCall> createGemExtCalls;
+    uint32_t createGemExtHandle = 1u;
+    int createGemExtResult = 0;
+
+    std::optional<std::vector<MemoryRegion>> memoryRegionsToReturn;
+
+    std::vector<VmPrefetchCall> vmPrefetchCalls;
+    std::vector<VmSharedSystemMemAdviseCall> vmSharedSystemMemAdviseCalls;
+    bool vmSharedSystemMemAdviseResult = true;
+    bool deferBackingEnabledForAllocation = false;
+    std::optional<uint32_t> vmAdviseAtomicAttribute = 0u;
+    uint32_t vmBoAdviseCalled = 0u;
+    uint32_t vmBoAdviseForChunkingCalled = 0u;
+    bool vmBoAdviseResult = true;
+    bool vmPrefetchResult = true;
+    bool preferredLocationRegionAvailable = false;
+
+    bool retrieveMmapOffsetResult = true;
+    uint32_t hasEnoughDeviceMemoryCalled = 0u;
+    bool hasEnoughDeviceMemoryResult = true;
+    uint32_t retrieveMmapOffsetCalled = 0u;
+    uint64_t mmapOffsetToReturn = 0u;
+
+    uint32_t createVmControlExtRegionCalled = 0u;
+    std::optional<MemoryClassInstance> receivedVmControlRegion;
+    std::optional<VmCreateFlags> receivedVmCreateFlags;
+
+    std::vector<std::vector<uint32_t>> prepareVmBindExtCalls;
+
+    std::optional<uint64_t> filledVmBindExtPatIndex;
+    std::optional<UserFence> filledVmBindExtUserFence;
+    std::optional<UserFence> receivedVmBindUserFence;
+    std::optional<VmBindParams> receivedVmBind;
+    std::optional<uint64_t> receivedVmBindPatIndex;
+    std::optional<VmBindParams> receivedVmUnbind;
+    std::optional<uint64_t> receivedVmUnbindPatIndex;
+    uint32_t vmBindCalled = 0u;
+    int vmBindResult = 0;
+    uint32_t vmUnbindCalled = 0u;
+    int vmUnbindResult = 0;
+    uint32_t waitUserFenceCalled = 0u;
+    int waitUserFenceResult = 0;
+    bool userFenceSetupRequired = false;
+
+    bool vmBindAvailable = false;
+    bool setPairAvailable = false;
+    bool chunkingAvailable = false;
+    uint32_t isVmBindAvailableCalled = 0u;
+    uint32_t isSetPairAvailableCalled = 0u;
+    uint32_t isChunkingAvailableCalled = 0u;
+
+    uint32_t directSubmissionFlag = 0u;
+    uint32_t createContextWithAccessCountersCalled = 0u;
+    uint32_t createCooperativeContextCalled = 0u;
+
+    uint32_t createEngineInfoCalled = 0u;
+    std::optional<std::vector<EngineCapabilities>> enginesToReturn;
+};
+
+class DrmMockWithCaptureHelper : public DrmMock {
+  public:
+    DrmMockWithCaptureHelper(RootDeviceEnvironment &rootDeviceEnvironment) : DrmMock(rootDeviceEnvironment) {
+        ioctlHelper = std::make_unique<MockIoctlHelperWithCapture>(*this);
+    }
+
+    MockIoctlHelperWithCapture *getMockIoctlHelper() {
+        return static_cast<MockIoctlHelperWithCapture *>(ioctlHelper.get());
+    }
+};
+
+} // namespace NEO

@@ -1,0 +1,4232 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "zello_common.h"
+#include "zello_compile.h"
+#include "zello_test_duration.h"
+
+#include <algorithm>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <sstream>
+
+using TestKernelsContainer = std::map<std::string, ze_kernel_handle_t>;
+
+struct GraphDumpSettings {
+    bool dump = false;
+    ze_record_replay_graph_ext_dump_mode_t mode = ZE_RECORD_REPLAY_GRAPH_EXT_DUMP_MODE_DETAILED;
+};
+
+void dumpGraphToDotIfEnabled(ze_graph_handle_t virtualGraph, const std::string &testName, const GraphDumpSettings &dumpSettings) {
+    if (!dumpSettings.dump) {
+        return;
+    }
+    ze_record_replay_graph_ext_dump_desc_t dumpDesc = {};
+    dumpDesc.stype = ZE_STRUCTURE_TYPE_RECORD_REPLAY_GRAPH_EXT_DUMP_DESC;
+    dumpDesc.mode = dumpSettings.mode;
+    dumpDesc.pNext = nullptr;
+
+    std::string filename = testName + "_graph.gv";
+    ze_result_t dumpResult = zeGraphDumpContentsExt(virtualGraph, filename.c_str(), &dumpDesc);
+
+    if (dumpResult == ZE_RESULT_SUCCESS) {
+        std::cout << "Graph dumped to " << filename << std::endl;
+    } else {
+        std::cerr << "Failed to dump graph for test " << testName << " (result: " << std::hex << dumpResult << ")" << std::endl;
+    }
+}
+
+bool testAppendMemoryCopy(ze_context_handle_t &context, ze_device_handle_t &device, bool aubMode, const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+    ze_graph_handle_t virtualGraph = nullptr;
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+
+    const size_t allocSize = 4096;
+
+    void *heapBuffer = nullptr;
+    void *stackBuffer = nullptr;
+    void *zeBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &heapBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stackBuffer));
+
+    for (size_t i = 0; i < allocSize; ++i) {
+        static_cast<char *>(heapBuffer)[i] = static_cast<char>(i + 1);
+    }
+    memset(stackBuffer, 0, allocSize);
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    deviceDesc.ordinal = 0;
+    deviceDesc.flags = 0;
+    deviceDesc.pNext = nullptr;
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdList);
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, zeBuffer, heapBuffer, allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, stackBuffer, zeBuffer, allocSize, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        // Validate stack and ze buffers have the original data from heapBuffer
+        validRet &= LevelZeroBlackBoxTests::validate(heapBuffer, stackBuffer, allocSize);
+
+        if (!validRet) {
+            std::cerr << "Data mismatches found!\n";
+            std::cerr << "heapBuffer == " << heapBuffer << "\n";
+            std::cerr << "stackBuffer == " << stackBuffer << std::endl;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, heapBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stackBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+
+    return validRet;
+}
+
+bool testMultiGraph(ze_context_handle_t &context, ze_device_handle_t &device, bool aubMode, const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+    ze_graph_handle_t virtualGraph = nullptr;
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+
+    const size_t allocSize = 4096;
+    void *heapBuffer = nullptr;
+    void *stackBuffer = nullptr;
+    void *zeBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &heapBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stackBuffer));
+
+    for (size_t i = 0; i < allocSize; ++i) {
+        static_cast<char *>(heapBuffer)[i] = static_cast<char>(i + 1);
+    }
+    memset(stackBuffer, 0, allocSize);
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    deviceDesc.ordinal = 0;
+    deviceDesc.flags = 0;
+    deviceDesc.pNext = nullptr;
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    ze_command_list_handle_t cmdListMain;
+    ze_command_list_handle_t cmdListSub;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 2;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    ze_event_handle_t eventFork = nullptr;
+    ze_event_handle_t eventJoin = nullptr;
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventFork));
+
+    eventDesc.index = 1;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventJoin));
+
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListMain);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListSub);
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListMain, virtualGraph, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListMain, zeBuffer, heapBuffer, allocSize, eventFork, 0, nullptr));
+    // fork :
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListSub, stackBuffer, zeBuffer, allocSize, eventJoin, 1, &eventFork));
+    // join :
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListMain, 1, &eventJoin));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListMain, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListMain, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListMain, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        // Validate stack and ze buffers have the original data from heapBuffer
+        validRet &= LevelZeroBlackBoxTests::validate(heapBuffer, stackBuffer, allocSize);
+
+        if (!validRet) {
+            std::cerr << "Data mismatches found!\n";
+            std::cerr << "heapBuffer == " << heapBuffer << "\n";
+            std::cerr << "stackBuffer == " << stackBuffer << std::endl;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, heapBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stackBuffer));
+
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListSub));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListMain));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventJoin));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventFork));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    return validRet;
+}
+
+bool testMultiGraphPostJoinTrailingSync(ze_context_handle_t &context, ze_device_handle_t &device, bool aubMode, const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+    ze_graph_handle_t virtualGraph = nullptr;
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+
+    constexpr size_t allocSize = 4096;
+    uint8_t *sharedBuffer = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocShared(context, &deviceDesc, &hostDesc, allocSize, 4096, device, reinterpret_cast<void **>(&sharedBuffer)));
+    std::memset(sharedBuffer, 0, allocSize);
+
+    ze_command_list_handle_t cmdListMain;
+    ze_command_list_handle_t cmdListSub;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 3;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    ze_event_handle_t eventFork = nullptr;
+    ze_event_handle_t eventJoin = nullptr;
+    ze_event_handle_t eventPostJoinSignal = nullptr;
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventFork));
+
+    eventDesc.index = 1;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventJoin));
+
+    eventDesc.index = 2;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventPostJoinSignal));
+
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListMain);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListSub);
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListMain, virtualGraph, nullptr));
+
+    // parent: signal fork
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListMain, eventFork, 0, nullptr));
+    uint8_t pattern = 0x5A;
+    // child: wait fork
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListSub, sharedBuffer, &pattern, sizeof(pattern), allocSize, nullptr, 1, &eventFork));
+    // child: signal join
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListSub, eventJoin, 0, nullptr));
+    // child: post-join command
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(cmdListSub, eventPostJoinSignal));
+    // parent: wait join
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListMain, 1, &eventJoin));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListMain, nullptr, nullptr));
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListMain, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListMain, std::numeric_limits<uint64_t>::max()));
+
+    // Checks post-join signal, should be signaled at this point
+    SUCCESS_OR_TERMINATE(zeEventQueryStatus(eventPostJoinSignal));
+
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(pattern, sharedBuffer, allocSize);
+        if (!validRet) {
+            std::cerr << "Data mismatches found after multi-graph post-join trailing sync graph execution!" << std::endl;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListSub));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListMain));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventPostJoinSignal));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventJoin));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventFork));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, sharedBuffer));
+    return validRet;
+}
+
+// Positive transitive-join scenario:
+//
+//      qcap (primary)          q1                    q2
+//        |                     |                     |
+//   begin_capture(qcap)        |                     |
+//   copy src->ze1, sig e1 ---->| wait e1             |
+//   barrier      sig e2 -------------------------->  | wait e2
+//        |                copy ze1->shared           |
+//        |                barrier sig e3 ----------> | wait e3  (offending edge: neither end is qcap)
+//        |                     |                copy shared->dst
+//        |                     |                barrier sig e4
+//   wait e4  <-------------------------------------- +
+//
+// q2 is joined directly to qcap while q1 is joined transitively, through its sibling q2.
+bool testTransitiveForkJoinsGraph(ze_context_handle_t &context, ze_device_handle_t &device, bool aubMode, const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+    ze_graph_handle_t virtualGraph = nullptr;
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+
+    const size_t allocSize = 4096;
+    void *srcBuffer = nullptr;
+    void *dstBuffer = nullptr;
+    void *ze1Buffer = nullptr;
+    void *sharedBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &dstBuffer));
+
+    for (size_t i = 0; i < allocSize; ++i) {
+        static_cast<char *>(srcBuffer)[i] = static_cast<char>(i + 1);
+    }
+    memset(dstBuffer, 0, allocSize);
+
+    ze_device_mem_alloc_desc_t deviceDesc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &ze1Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &sharedBuffer));
+
+    ze_command_list_handle_t cmdListMain;
+    ze_command_list_handle_t cmdListQ1;
+    ze_command_list_handle_t cmdListQ2;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListMain);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListQ1);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListQ2);
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 4;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
+    ze_event_handle_t e1 = nullptr; // fork qcap -> q1
+    ze_event_handle_t e2 = nullptr; // fork qcap -> q2
+    ze_event_handle_t e3 = nullptr; // join q1 -> q2 (transitive edge)
+    ze_event_handle_t e4 = nullptr; // join q2 -> qcap
+    eventDesc.index = 0;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e1));
+    eventDesc.index = 1;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e2));
+    eventDesc.index = 2;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e3));
+    eventDesc.index = 3;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e4));
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListMain, virtualGraph, nullptr));
+
+    // qcap forks q1 and q2
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListMain, ze1Buffer, srcBuffer, allocSize, e1, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListMain, e2, 0, nullptr));
+
+    // q1 does its work then signals its join event (as its last work command)
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListQ1, sharedBuffer, ze1Buffer, allocSize, nullptr, 1, &e1));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ1, e3, 0, nullptr));
+
+    // q2 is forked, then q1 is joined onto q2 (sibling), then q2 does dependent work and signals its own join event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ2, nullptr, 1, &e2));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListQ2, dstBuffer, sharedBuffer, allocSize, nullptr, 1, &e3));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ2, e4, 0, nullptr));
+
+    // q2 joins back to the primary command list
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListMain, 1, &e4));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListMain, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListMain, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListMain, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validate(srcBuffer, dstBuffer, allocSize);
+        if (!validRet) {
+            std::cerr << "Data mismatches found after transitive fork/join graph execution!" << std::endl;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListQ2));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListQ1));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListMain));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e4));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e3));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e2));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e1));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, sharedBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, ze1Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+    return validRet;
+}
+
+// Negative transitive-join scenario: a fork (q1) is joined onto another forked command list (q2),
+// but q2 is never joined back to the primary command list. Because there is no chain of joins from
+// q1/q2 to the primary command list, the recorded graph is invalid and capture must report it.
+bool testTransitiveForkJoinsGraphNegative(ze_context_handle_t &context, ze_device_handle_t &device, bool aubMode, const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+
+    ze_command_list_handle_t cmdListMain;
+    ze_command_list_handle_t cmdListQ1;
+    ze_command_list_handle_t cmdListQ2;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListMain);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListQ1);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListQ2);
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 3;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
+    ze_event_handle_t e1 = nullptr; // fork qcap -> q1
+    ze_event_handle_t e2 = nullptr; // fork qcap -> q2
+    ze_event_handle_t e3 = nullptr; // join q1 -> q2 (but q2 itself is never joined)
+    eventDesc.index = 0;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e1));
+    eventDesc.index = 1;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e2));
+    eventDesc.index = 2;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &e3));
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListMain, virtualGraph, nullptr));
+
+    // qcap forks q1 and q2
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListMain, e1, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListMain, e2, 0, nullptr));
+
+    // q1 is forked and signals its join event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ1, nullptr, 1, &e1));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ1, e3, 0, nullptr));
+
+    // q2 is forked and joins q1 onto itself, but q2 is never joined back to qcap
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ2, nullptr, 1, &e2));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListQ2, nullptr, 1, &e3));
+
+    ze_graph_handle_t retGraph = nullptr;
+    ze_result_t endResult = zeCommandListEndGraphCaptureExt(cmdListMain, nullptr, &retGraph);
+    if (endResult != ZE_RESULT_ERROR_GRAPH_UNJOINED_FORKS) {
+        std::cerr << "Expected ZE_RESULT_ERROR_GRAPH_UNJOINED_FORKS for a graph whose join chain never "
+                     "reaches the primary command list, got 0x"
+                  << std::hex << static_cast<uint32_t>(endResult) << std::dec << std::endl;
+        validRet &= false;
+    }
+
+    // an invalid graph must not be instantiable either
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    ze_result_t instantiateResult = zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph);
+    if (instantiateResult != ZE_RESULT_ERROR_INVALID_GRAPH) {
+        std::cerr << "Expected ZE_RESULT_ERROR_INVALID_GRAPH when instantiating an invalid graph, got 0x"
+                  << std::hex << static_cast<uint32_t>(instantiateResult) << std::dec << std::endl;
+        validRet &= false;
+    }
+    if (nullptr != physicalGraph) {
+        SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListQ2));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListQ1));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListMain));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e3));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e2));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(e1));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    return validRet;
+}
+
+inline auto allocateDispatchTraits(ze_context_handle_t context, bool indirect) {
+
+    auto dispatchTraitsDeleter = [context, indirect](ze_group_count_t *ptr) noexcept {
+        if (indirect) {
+            zeMemFree(context, ptr);
+        } else {
+            delete ptr;
+        }
+    };
+    using RetUniquePtr = std::unique_ptr<ze_group_count_t, decltype(dispatchTraitsDeleter)>;
+
+    ze_group_count_t *rawPtr = nullptr;
+    if (indirect) {
+        ze_host_mem_alloc_desc_t hostAllocDesc{
+            .stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC,
+            .pNext = nullptr,
+            .flags = 0U,
+        };
+        SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostAllocDesc, sizeof(ze_group_count_t), 4096, reinterpret_cast<void **>(&rawPtr)));
+    } else {
+        rawPtr = new ze_group_count_t;
+    }
+    return RetUniquePtr(rawPtr, dispatchTraitsDeleter);
+}
+
+bool testAppendLaunchKernel(ze_context_handle_t &context,
+                            ze_device_handle_t &device,
+                            TestKernelsContainer &testKernels,
+                            bool areDispatchTraitsIndirect,
+                            bool aubMode,
+                            const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    auto kernel = testKernels["memcpy_bytes"];
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCopied = nullptr;
+
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+                                                     false, nullptr,
+                                                     1, &eventCopied, ZE_EVENT_SCOPE_FLAG_HOST, ZE_EVENT_SCOPE_FLAG_HOST);
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdList);
+
+    // Buffers
+    constexpr size_t allocSize = 4096;
+    void *srcBuffer = nullptr;
+    void *interimBuffer = nullptr;
+    void *dstBuffer = nullptr;
+    ze_device_mem_alloc_desc_t devAllocDesc = {
+        .stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC,
+        .pNext = nullptr,
+        .flags = 0,
+        .ordinal = 0,
+    };
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &devAllocDesc, allocSize, allocSize, device, &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &devAllocDesc, allocSize, allocSize, device, &interimBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &devAllocDesc, allocSize, allocSize, device, &dstBuffer));
+
+    // Kernel groups size
+    constexpr size_t bytesPerThread = sizeof(std::byte);
+    constexpr size_t numThreads = allocSize / bytesPerThread;
+    uint32_t groupSizeX = 32u;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSuggestGroupSize(kernel, static_cast<uint32_t>(numThreads), 1U, 1U, &groupSizeX, &groupSizeY, &groupSizeZ));
+    SUCCESS_OR_TERMINATE_BOOL(numThreads % groupSizeX == 0);
+    if (LevelZeroBlackBoxTests::verbose) {
+        std::cout << "Group size : (" << groupSizeX << ", " << groupSizeY << ", " << groupSizeZ << ")" << std::endl;
+    }
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernel, groupSizeX, groupSizeY, groupSizeZ));
+
+    // Start capturing commands
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    // Encode buffers initialization
+    uint8_t srcInitValue = 0xa;
+    uint8_t dstInitValue = 0x5;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdList, srcBuffer, &srcInitValue, sizeof(srcInitValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdList, dstBuffer, &dstInitValue, sizeof(dstInitValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+
+    auto dispatchTraits = allocateDispatchTraits(context, areDispatchTraitsIndirect);
+    dispatchTraits->groupCountX = static_cast<uint32_t>(numThreads) / groupSizeX,
+    dispatchTraits->groupCountY = 1u,
+    dispatchTraits->groupCountZ = 1u,
+    LevelZeroBlackBoxTests::printGroupCount(*dispatchTraits);
+    SUCCESS_OR_TERMINATE_BOOL(dispatchTraits->groupCountX * groupSizeX == allocSize);
+
+    // Launch first copy
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernel, 0, sizeof(interimBuffer), &interimBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernel, 1, sizeof(srcBuffer), &srcBuffer));
+    if (areDispatchTraitsIndirect) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernelIndirect(cmdList, kernel, dispatchTraits.get(), eventCopied, 0, nullptr));
+    } else {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernel, dispatchTraits.get(), eventCopied, 0, nullptr));
+    }
+
+    // Launch second copy
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernel, 0, sizeof(dstBuffer), &dstBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernel, 1, sizeof(interimBuffer), &interimBuffer));
+    if (areDispatchTraitsIndirect) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernelIndirect(cmdList, kernel, dispatchTraits.get(), nullptr, 1, &eventCopied));
+    } else {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernel, dispatchTraits.get(), nullptr, 1, &eventCopied));
+    }
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+
+    // Encode reading data back
+    auto outputData = std::make_unique<std::byte[]>(allocSize);
+    std::memset(outputData.get(), 0x9, allocSize);
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, outputData.get(), dstBuffer, allocSize, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    // Validate
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(srcInitValue, outputData.get(), numThreads);
+        if (!validRet) {
+            std::cerr << "Data mismatches found!\n";
+            std::cerr << "srcInitValue == " << std::dec << srcInitValue << "\n";
+            std::cerr << "outputData == " << static_cast<void *>(outputData.get()) << std::endl;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    // Cleanup
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, interimBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCopied));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    return validRet;
+}
+
+bool testAppendLaunchMultipleKernelsIndirect(ze_context_handle_t &context,
+                                             ze_device_handle_t &device,
+                                             TestKernelsContainer &testKernels,
+                                             bool aubMode,
+                                             const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    auto kernelMemcpySrcToDst = testKernels["memcpy_bytes"];
+    auto kernelAddConstant = testKernels["add_constant"];
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCopied = nullptr;
+
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+                                                     false, nullptr,
+                                                     1, &eventCopied, ZE_EVENT_SCOPE_FLAG_HOST, ZE_EVENT_SCOPE_FLAG_HOST);
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdList);
+
+    // Buffers
+    constexpr size_t allocSize = 4096;
+    void *srcBuffer = nullptr;
+    void *incrementedBuffer = nullptr;
+    void *dstBuffer = nullptr;
+    ze_device_mem_alloc_desc_t devAllocDesc = {
+        .stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC,
+        .pNext = nullptr,
+        .flags = 0,
+        .ordinal = 0,
+    };
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &devAllocDesc, allocSize, allocSize, device, &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &devAllocDesc, allocSize, allocSize, device, &dstBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &devAllocDesc, allocSize, allocSize, device, &incrementedBuffer));
+
+    constexpr uint32_t kernelsNum = 2U;
+    uint32_t *kernelsNumBuff = nullptr;
+    ze_group_count_t *dispatchTraits = nullptr;
+    ze_host_mem_alloc_desc_t hostAllocDesc{
+        .stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC,
+        .pNext = nullptr,
+        .flags = 0U,
+    };
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostAllocDesc, sizeof(uint32_t), 4096, reinterpret_cast<void **>(&kernelsNumBuff)));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostAllocDesc, sizeof(ze_group_count_t) * kernelsNum, 4096, reinterpret_cast<void **>(&dispatchTraits)));
+
+    // Kernel groups size
+    constexpr size_t bytesPerThread = sizeof(std::byte);
+    constexpr size_t numThreads = allocSize / bytesPerThread;
+    uint32_t groupSizeX = 32u;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE_BOOL(numThreads % groupSizeX == 0);
+    SUCCESS_OR_TERMINATE(zeKernelSuggestGroupSize(kernelAddConstant, static_cast<uint32_t>(numThreads), 1U, 1U, &groupSizeX, &groupSizeY, &groupSizeZ));
+    if (LevelZeroBlackBoxTests::verbose) {
+        std::cout << "Group size : (" << groupSizeX << ", " << groupSizeY << ", " << groupSizeZ << ")" << std::endl;
+    }
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelMemcpySrcToDst, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+
+    // Start capturing commands
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    // Encode buffers initialization
+    const std::byte srcInitialValue{0xA};
+    const std::byte dstInitialValue{0x5};
+    const int valueToIncrement{-3};
+    constexpr int deltaValue = 2;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdList, srcBuffer, &srcInitialValue, sizeof(srcInitialValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdList, dstBuffer, &dstInitialValue, sizeof(dstInitialValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdList, incrementedBuffer, &valueToIncrement, sizeof(valueToIncrement), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+
+    // Prepare contiguous dispatch traits
+    for (uint32_t i{0U}; i < kernelsNum; ++i) {
+        dispatchTraits[i] = {
+            .groupCountX = static_cast<uint32_t>(numThreads) / groupSizeX,
+            .groupCountY = 1u,
+            .groupCountZ = 1u,
+        };
+    }
+
+    LevelZeroBlackBoxTests::printGroupCount(dispatchTraits[0]);
+    SUCCESS_OR_TERMINATE_BOOL(dispatchTraits[0].groupCountX * groupSizeX == allocSize);
+
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMemcpySrcToDst, 0, sizeof(dstBuffer), &dstBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMemcpySrcToDst, 1, sizeof(srcBuffer), &srcBuffer));
+
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(incrementedBuffer), &incrementedBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(int), &deltaValue));
+
+    ze_kernel_handle_t pKernelHandles[] = {kernelMemcpySrcToDst, kernelAddConstant};
+    *kernelsNumBuff = kernelsNum;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchMultipleKernelsIndirect(cmdList,
+                                                                          kernelsNum,
+                                                                          pKernelHandles,
+                                                                          kernelsNumBuff,
+                                                                          dispatchTraits,
+                                                                          eventCopied,
+                                                                          0U,
+                                                                          nullptr));
+
+    // Encode reading data back
+    auto dstOut = std::vector<std::byte>(allocSize);
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, dstOut.data(), dstBuffer, allocSize, nullptr, 1, &eventCopied));
+
+    auto incrementedOut = std::vector<std::byte>(allocSize);
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, incrementedOut.data(), incrementedBuffer, allocSize, nullptr, 1, &eventCopied));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    // Validate
+    if (aubMode == false) {
+        auto expectedDst = std::vector<std::byte>(allocSize, srcInitialValue);
+        validRet = LevelZeroBlackBoxTests::validate(dstOut.data(), expectedDst.data(), allocSize);
+        if (!validRet) {
+            std::cerr << "Data mismatches found!\n";
+            std::cerr << "copiedOutData == " << static_cast<void *>(dstOut.data()) << "\n";
+            std::cerr << "expectedData == " << static_cast<void *>(expectedDst.data()) << std::endl;
+        }
+
+        constexpr std::byte incrementedValue{0xFF};
+        auto expectedIncremented = std::vector<std::byte>(allocSize, incrementedValue);
+        bool validRet2 = LevelZeroBlackBoxTests::validate(incrementedOut.data(), expectedIncremented.data(), allocSize);
+        if (!validRet2) {
+            std::cerr << "Data mismatches found!\n";
+            std::cerr << "incrementedData == " << static_cast<void *>(incrementedOut.data()) << "\n";
+            std::cerr << "expectedData == " << static_cast<void *>(expectedIncremented.data()) << std::endl;
+        }
+        validRet &= validRet2; // Combine results
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    // Cleanup
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dispatchTraits));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, kernelsNumBuff));
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, incrementedBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCopied));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    return validRet;
+}
+
+bool testMultipleGraphExecution(ze_context_handle_t &context,
+                                ze_device_handle_t &device,
+                                TestKernelsContainer &testKernels,
+                                bool aubMode,
+                                const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t loopCount = 3;
+    uint32_t addValue = 5;
+
+    uint32_t expectedValue = initialValue + loopCount * addValue;
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdList);
+    void *buffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &buffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(buffer)[i] = initialValue;
+    }
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(buffer), &buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernelAddConstant, &groupCount, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait
+    for (uint32_t i = 0; i < loopCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    }
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, buffer, elemCount);
+        if (!validRet) {
+            std::cerr << "Data mismatches found after multiple graph executions!" << std::endl;
+        }
+    }
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, buffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    return validRet;
+}
+
+bool testExternalGraphCbEvents(ze_context_handle_t &context,
+                               ze_device_handle_t &device,
+                               TestKernelsContainer &testKernels,
+                               bool aubMode,
+                               const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t addValue = 5;
+
+    uint32_t expectedValueForFirstExecution = initialValue + addValue;
+    uint32_t expectedValueForSecondExecution = expectedValueForFirstExecution + addValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCb = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL;
+    counterBasedDesc.flags |= ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventCb, ZE_EVENT_SCOPE_FLAG_HOST, 0u);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdList);
+
+    void *buffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &buffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(buffer)[i] = initialValue;
+    }
+
+    auto buf2 = reinterpret_cast<volatile uint32_t *>(buffer);
+    std::cout << "\nBuffer before graph execution: " << buf2[0] << ", " << buf2[1] << ", " << buf2[2] << std::endl;
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(buffer), &buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external event to append operation
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernelAddConstant, &groupCount, eventCb, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+
+    // create two physical graphs from the same virtual graph
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    ze_executable_graph_handle_t physicalGraph2 = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph2));
+
+    // Dispatch and wait physicalGraph 1
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    // synchronize using event
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventCb, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValueForFirstExecution, buffer, elemCount);
+        std::cerr << "Validation after first execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // Dispatch and wait physicalGraph 2
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph2, nullptr, nullptr, 0, nullptr));
+    // synchronize using the same event, but different executable graph
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventCb, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        auto validRet2 = LevelZeroBlackBoxTests::validateToValue(expectedValueForSecondExecution, buffer, elemCount);
+        std::cerr << "Validation after second execution: " << (validRet2 ? "success" : "failure") << std::endl;
+        validRet &= validRet2;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph2));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, buffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCb));
+    return validRet;
+}
+
+bool testExternalWaitCbEventsImmediate(ze_context_handle_t &context,
+                                       ze_device_handle_t &device,
+                                       TestKernelsContainer &testKernels,
+                                       bool aubMode,
+                                       const GraphDumpSettings &dumpSettings,
+                                       bool useCopyEngineForMemoryTransfers) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t addValue = 5;
+
+    uint32_t expectedValue = initialValue + addValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventInput = nullptr, eventOutput = nullptr, eventSynchronization = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventSynchronization, counterBasedDesc.signal, 0u);
+
+    counterBasedDesc.signal = 0;
+    counterBasedDesc.flags = (ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventInput, counterBasedDesc.signal, 0u);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventOutput, counterBasedDesc.signal, 0u);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t replayCmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+
+    ze_command_list_handle_t inputOutputCmdList;
+    if (useCopyEngineForMemoryTransfers) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputOutputCmdList);
+    } else {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                               false, false, inputOutputCmdList);
+    }
+
+    void *zeBuffer = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    deviceDesc.ordinal = 0;
+    deviceDesc.flags = 0;
+    deviceDesc.pNext = nullptr;
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    memset(outputBuffer, 0, allocSize);
+
+    ze_graph_handle_t virtualGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(zeBuffer), &zeBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external event to append operation - wait for eventInput and signal eventOutput
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(replayCmdList, kernelAddConstant, &groupCount, eventOutput, 1, &eventInput));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+
+    // perform input copy and signal eventInput - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, zeBuffer, inputBuffer, allocSize, eventInput, 0, nullptr));
+
+    // create physical graph from the same virtual graph
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    // Dispatch physicalGraph
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+    // wait for event output and perform output copy and wait on eventSynchronization - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, outputBuffer, zeBuffer, allocSize, eventSynchronization, 1, &eventOutput));
+
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after first execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // reset zeBuffer and outputBuffer for second execution
+    uint8_t resetValue = 0;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, zeBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+
+    // now perform input copy and signal eventInput - so it is attached as an wait event with new counter value
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, zeBuffer, inputBuffer, allocSize, eventInput, 0, nullptr));
+
+    // graphs kernel wait for input event and signal output event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, outputBuffer, zeBuffer, allocSize, eventSynchronization, 1, &eventOutput));
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        auto validRet2 = LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after second execution: " << (validRet2 ? "success" : "failure") << std::endl;
+        validRet &= validRet2;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__) + "_compute";
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputOutputCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventInput));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventOutput));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventSynchronization));
+    return validRet;
+}
+
+bool testExternalWaitCbEventsGraphs(ze_context_handle_t &context,
+                                    ze_device_handle_t &device,
+                                    TestKernelsContainer &testKernels,
+                                    bool aubMode,
+                                    const GraphDumpSettings &dumpSettings,
+                                    bool useCopyEngineForMemoryTransfers,
+                                    uint32_t executionCount,
+                                    bool primedTimestampWait) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 3;
+    uint32_t mulValue = 5;
+
+    uint32_t expectedValue = initialValue * mulValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventInput = nullptr, eventOutput = nullptr, eventSynchronization = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    ze_event_counter_based_flags_t commonFlags = (ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL);
+    counterBasedDesc.flags = commonFlags | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventSynchronization, counterBasedDesc.signal, 0u);
+
+    counterBasedDesc.signal = 0;
+    counterBasedDesc.flags = commonFlags | (primedTimestampWait ? ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP : 0);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventInput, counterBasedDesc.signal, 0u);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventOutput, counterBasedDesc.signal, 0u);
+
+    ze_kernel_handle_t kernelMulConstant = testKernels["mul_constant_output"];
+
+    ze_command_list_handle_t replayCmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+
+    ze_command_list_handle_t inputOutputCmdList;
+    if (useCopyEngineForMemoryTransfers) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputOutputCmdList);
+    } else {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                               false, false, inputOutputCmdList);
+    }
+
+    void *zeBufferIn = nullptr;
+    void *zeBufferOut = nullptr;
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBufferIn));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBufferOut));
+    memset(outputBuffer, 0, allocSize);
+    memset(zeBufferIn, 0, allocSize);
+    memset(zeBufferOut, 0, allocSize);
+
+    void *primeBuffer = nullptr;
+    if (primedTimestampWait) {
+        SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, sizeof(uint32_t), sizeof(uint32_t), &primeBuffer));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, primeBuffer, inputBuffer, sizeof(uint32_t), eventInput, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, primeBuffer, inputBuffer, sizeof(uint32_t), eventOutput, 0, nullptr));
+    }
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    ze_graph_handle_t virtualInputGraph = nullptr;
+    ze_graph_handle_t virtualOutputGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualInputGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(inputOutputCmdList, virtualInputGraph, nullptr));
+
+    // perform input copy and signal eventInput - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, zeBufferIn, inputBuffer, allocSize, eventInput, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(inputOutputCmdList, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelMulConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulConstant, 0, sizeof(zeBufferIn), &zeBufferIn));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulConstant, 1, sizeof(zeBufferOut), &zeBufferOut));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulConstant, 2, sizeof(mulValue), &mulValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external event to append operation - wait for eventInput and signal eventOutput
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(replayCmdList, kernelMulConstant, &groupCount, eventOutput, 1, &eventInput));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualOutputGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(inputOutputCmdList, virtualOutputGraph, nullptr));
+
+    // wait for event output and perform output copy and wait on eventSynchronization - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, outputBuffer, zeBufferOut, allocSize, eventSynchronization, 1, &eventOutput));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(inputOutputCmdList, nullptr, nullptr));
+
+    // create physical graphs
+    ze_executable_graph_handle_t physicalInputGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualInputGraph, nullptr, &physicalInputGraph));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    ze_executable_graph_handle_t physicalOutputGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualOutputGraph, nullptr, &physicalOutputGraph));
+
+    for (uint32_t i = 0; i < executionCount; ++i) {
+        // Dispatch executable graphs
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(inputOutputCmdList, physicalInputGraph, nullptr, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(inputOutputCmdList, physicalOutputGraph, nullptr, nullptr, 0, nullptr));
+
+        SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+        // verify data
+        if (aubMode == false) {
+            bool executionValid = LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+            std::cerr << "Validation result after #" << i + 1 << " execution: " << (executionValid ? "success" : "failure") << std::endl;
+            validRet &= executionValid;
+        }
+
+        uint8_t resetValue = 0;
+        if (!primedTimestampWait && i < executionCount - 1) {
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, zeBufferIn, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, zeBufferOut, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+        }
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__) + "_compute";
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    graphName = std::string(__func__) + "_copy_input";
+    dumpGraphToDotIfEnabled(virtualInputGraph, graphName, dumpSettings);
+
+    graphName = std::string(__func__) + "_copy_output";
+    dumpGraphToDotIfEnabled(virtualOutputGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalInputGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalOutputGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualInputGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualOutputGraph));
+    if (primeBuffer) {
+        SUCCESS_OR_TERMINATE(zeMemFree(context, primeBuffer));
+    }
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBufferIn));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBufferOut));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputOutputCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventInput));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventOutput));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventSynchronization));
+    return validRet;
+}
+
+bool testExternalWaitCbEventsImmediate(ze_context_handle_t &context,
+                                       ze_device_handle_t &device,
+                                       TestKernelsContainer &testKernels,
+                                       bool aubMode,
+                                       const GraphDumpSettings &dumpSettings,
+                                       bool useCopyEngineForMemoryTransfers,
+                                       uint32_t executionCount,
+                                       bool useTimestampWait,
+                                       bool primeWaitEvent) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 33;
+    uint32_t addValue = 25;
+
+    uint32_t expectedValue = initialValue + addValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventInput = nullptr, eventOutput = nullptr;
+
+    constexpr ze_event_counter_based_flags_t commonFlags = (ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL);
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = commonFlags | (useTimestampWait ? ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP : 0);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventInput, counterBasedDesc.signal, 0u);
+
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    counterBasedDesc.flags = commonFlags | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventOutput, counterBasedDesc.signal, 0u);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t replayCmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+
+    ze_command_list_handle_t inputCmdList;
+    if (useCopyEngineForMemoryTransfers) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputCmdList);
+    } else {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                               false, false, inputCmdList);
+    }
+
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    memset(outputBuffer, 0, allocSize);
+
+    uint8_t resetValue = 0;
+    if (primeWaitEvent) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, eventInput, 0, nullptr));
+    }
+
+    ze_graph_handle_t virtualGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(outputBuffer), &outputBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external event to append operation - wait for eventInput and signal eventOutput
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(replayCmdList, kernelAddConstant, &groupCount, eventOutput, 1, &eventInput));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+    // create physical graph from the same virtual graph before attaching eventInput to the append operation, which happen AFTER instantiation
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    for (uint32_t i = 0; i < executionCount; ++i) {
+        // perform input copy and signal eventInput - so it is attached as an wait event
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputCmdList, outputBuffer, inputBuffer, allocSize, eventInput, 0, nullptr));
+        // Dispatch physicalGraph
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+        SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventOutput, std::numeric_limits<uint64_t>::max()));
+
+        // verify data
+        if (aubMode == false) {
+            auto validRetIter = LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+            std::cerr << "Validation result after #" << i + 1 << " execution: " << (validRetIter ? "success" : "failure") << std::endl;
+            validRet &= validRetIter;
+        }
+
+        // reset outputBuffer for next execution
+        if (i < executionCount - 1) {
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+        }
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputCmdList, std::numeric_limits<uint64_t>::max()));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__) + "_compute";
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventInput));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventOutput));
+    return validRet;
+}
+
+bool testExternalGraphCbEventsMultiExecution(ze_context_handle_t &context,
+                                             ze_device_handle_t &device,
+                                             TestKernelsContainer &testKernels,
+                                             uint32_t executionCount,
+                                             bool aubMode,
+                                             const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    constexpr size_t elemCount = 4096;
+    constexpr size_t allocSize = 4096 * sizeof(uint32_t);
+
+    constexpr uint32_t initialValue = 4;
+    constexpr uint32_t addValue = 5;
+
+    std::vector<uint32_t> expectedValues(executionCount);
+    uint32_t sum = initialValue;
+
+    for (uint32_t i = 0; i < executionCount; ++i) {
+        sum += addValue;
+        expectedValues[i] = sum;
+    }
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCb = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL;
+    counterBasedDesc.flags |= ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventCb, ZE_EVENT_SCOPE_FLAG_HOST, 0u);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdList);
+
+    void *buffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &buffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(buffer)[i] = initialValue;
+    }
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 32;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(buffer), &buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external event to append operation
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernelAddConstant, &groupCount, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(cmdList, eventCb));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+
+    // create physical graph
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    std::vector<int64_t> eventSyncTimings(executionCount);
+    std::vector<int64_t> commandListSyncTimings(executionCount);
+
+    // Dispatch physicalGraph and wait on cb event
+    for (uint32_t i = 0; i < executionCount; ++i) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+        // synchronize using event
+        auto startTime = std::chrono::high_resolution_clock::now();
+        SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventCb, std::numeric_limits<uint64_t>::max()));
+        auto endTime = std::chrono::high_resolution_clock::now();
+        eventSyncTimings[i] = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+        auto cmdListEndTime = std::chrono::high_resolution_clock::now();
+        commandListSyncTimings[i] = std::chrono::duration_cast<std::chrono::microseconds>(cmdListEndTime - startTime).count();
+
+        // verify data
+        if (aubMode == false) {
+            auto validRetIter = LevelZeroBlackBoxTests::validateToValue(expectedValues[i], buffer, elemCount);
+            std::cerr << "Validation result after #" << i + 1 << " execution: " << (validRetIter ? "success" : "failure") << std::endl;
+            validRet &= validRetIter;
+        }
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+    // Display event sync timings
+    std::cout << "Event and command list host synchronize timings (us):" << std::endl;
+    for (uint32_t i = 0; i < executionCount; ++i) {
+        std::cout << "  Iteration " << i << ": event: " << eventSyncTimings[i] << " command list: " << commandListSyncTimings[i] << " us" << std::endl;
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, buffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCb));
+    return validRet;
+}
+
+bool testDestroyNonExternalCbEventsBeforeCaptureEnd(ze_context_handle_t &context,
+                                                    ze_device_handle_t &device,
+                                                    bool aubMode,
+                                                    const GraphDumpSettings &dumpSettings) {
+    constexpr size_t allocSize = 4096;
+    const uint8_t pattern = 0xab;
+    void *srcBuffer = nullptr;
+    void *dstBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &dstBuffer));
+    memset(srcBuffer, 0, allocSize);
+    memset(dstBuffer, 0, allocSize);
+
+    ze_command_list_handle_t cmdListRoot = nullptr;
+    ze_command_list_handle_t cmdListFork = nullptr;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListRoot);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListFork);
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE;
+    ze_event_handle_t eventFork = nullptr;
+    ze_event_handle_t eventJoin = nullptr;
+    SUCCESS_OR_TERMINATE(zeEventCounterBasedCreate(context, device, &counterBasedDesc, &eventFork));
+    SUCCESS_OR_TERMINATE(zeEventCounterBasedCreate(context, device, &counterBasedDesc, &eventJoin));
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListRoot, virtualGraph, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListRoot, srcBuffer, &pattern, sizeof(pattern), allocSize, eventFork, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListFork, dstBuffer, srcBuffer, allocSize, eventJoin, 1, &eventFork));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListRoot, 1, &eventJoin));
+
+    // Non-external CB events used only for captured dependencies are destroyed before capture ends.
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventFork));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventJoin));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListRoot, nullptr, nullptr));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListRoot, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListRoot, std::numeric_limits<uint64_t>::max()));
+
+    bool validRet = true;
+    if (aubMode == false) {
+        validRet = LevelZeroBlackBoxTests::validateToValue(pattern, dstBuffer, allocSize);
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListRoot));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListFork));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    return validRet;
+}
+
+bool testEventTransitionBetweenGraphAndEager(ze_context_handle_t &context,
+                                             ze_device_handle_t &device,
+                                             TestKernelsContainer &testKernels,
+                                             bool aubMode,
+                                             const GraphDumpSettings &dumpSettings,
+                                             uint32_t transitionCycles,
+                                             uint32_t executionCount) {
+    using ElemType = int32_t;
+    constexpr size_t elemCount = 1024;
+    constexpr size_t bufferSize = elemCount * sizeof(ElemType);
+    constexpr ElemType addValue = 3;
+    constexpr uint32_t groupSizeX = 64;
+    const uint8_t zeroPattern = 0;
+    const uint8_t poisonPattern = 0xff;
+    bool validRet = true;
+
+    void *accumulator = nullptr;
+    void *eagerSrc = nullptr;
+    void *eagerDst = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, bufferSize, bufferSize, &accumulator));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, bufferSize * transitionCycles, bufferSize, &eagerSrc));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, bufferSize * transitionCycles, bufferSize, &eagerDst));
+    auto eagerSlot = [](void *base, uint32_t cycle) { return static_cast<uint8_t *>(base) + cycle * bufferSize; };
+    auto eagerPattern = [](uint32_t cycle) { return static_cast<uint8_t>(cycle + 1); };
+
+    ze_command_list_handle_t inputOutputCmdList = nullptr;
+    LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputOutputCmdList);
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, accumulator, &poisonPattern, sizeof(poisonPattern), bufferSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, eagerSrc, &zeroPattern, sizeof(zeroPattern), bufferSize * transitionCycles, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, eagerDst, &zeroPattern, sizeof(zeroPattern), bufferSize * transitionCycles, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+
+    ze_command_list_handle_t cmdListMain = nullptr;
+    ze_command_list_handle_t cmdListEagerSignal = nullptr;
+    ze_command_list_handle_t cmdListEagerWait = nullptr;
+    std::vector<ze_command_list_handle_t> cmdListsForked(transitionCycles);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdListMain);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdListEagerSignal);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdListEagerWait);
+    for (auto &cmdList : cmdListsForked) {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdList);
+    }
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE;
+    ze_event_handle_t event = nullptr;
+    SUCCESS_OR_TERMINATE(zeEventCounterBasedCreate(context, device, &counterBasedDesc, &event));
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, 1, 1));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(accumulator), &accumulator));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+
+    auto checkEventState = [&validRet, &event](bool expectGraphInternal, const char *stage, uint32_t cycle) {
+        const bool isGraphInternal = (ZE_RESULT_ERROR_GRAPH_INTERNAL_EVENT == zeEventQueryStatus(event));
+        if (isGraphInternal != expectGraphInternal) {
+            std::cerr << "Cycle " << cycle << ": event is " << (isGraphInternal ? "graph internal" : "eager") << " after " << stage << std::endl;
+            validRet = false;
+        }
+    };
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListMain, virtualGraph, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListMain, accumulator, &zeroPattern, sizeof(zeroPattern), bufferSize, nullptr, 0, nullptr));
+
+    for (uint32_t cycle = 0; cycle < transitionCycles; ++cycle) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListMain, event, 0, nullptr));
+        checkEventState(true, "fork signal", cycle);
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListsForked[cycle], kernelAddConstant, &groupCount, nullptr, 1, &event));
+
+        const auto pattern = eagerPattern(cycle);
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListEagerSignal, eagerSlot(eagerSrc, cycle), &pattern, sizeof(pattern), bufferSize, event, 0, nullptr));
+        checkEventState(false, "eager signal", cycle);
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListEagerWait, eagerSlot(eagerDst, cycle), eagerSlot(eagerSrc, cycle), bufferSize, nullptr, 1, &event));
+
+        SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdListsForked[cycle], event, 0, nullptr));
+        checkEventState(true, "join signal", cycle);
+        SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListMain, 1, &event));
+    }
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListMain, nullptr, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListEagerWait, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        for (uint32_t cycle = 0; cycle < transitionCycles; ++cycle) {
+            if (false == LevelZeroBlackBoxTests::validateToValue(eagerPattern(cycle), eagerSlot(eagerDst, cycle), bufferSize)) {
+                std::cerr << "Eager copy of cycle " << cycle << " does not match the eager fill" << std::endl;
+                validRet = false;
+            }
+        }
+    }
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    const ElemType expectedValue = static_cast<ElemType>(transitionCycles) * addValue;
+    for (uint32_t execution = 0; execution < executionCount; ++execution) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, accumulator, &poisonPattern, sizeof(poisonPattern), bufferSize, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, eagerDst, &zeroPattern, sizeof(zeroPattern), bufferSize, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListMain, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+        const auto pattern = eagerPattern(execution);
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListEagerSignal, eagerSrc, &pattern, sizeof(pattern), bufferSize, event, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListEagerWait, eagerDst, eagerSrc, bufferSize, nullptr, 1, &event));
+
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListMain, std::numeric_limits<uint64_t>::max()));
+        SUCCESS_OR_TERMINATE(zeEventHostSynchronize(event, std::numeric_limits<uint64_t>::max()));
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListEagerWait, std::numeric_limits<uint64_t>::max()));
+
+        if (aubMode == false) {
+            const bool graphValid = LevelZeroBlackBoxTests::validateToValue(expectedValue, accumulator, elemCount);
+            const bool eagerValid = LevelZeroBlackBoxTests::validateToValue(pattern, eagerDst, bufferSize);
+            std::cerr << "Validation result after execution #" << execution + 1 << ": graph " << (graphValid ? "success" : "failure")
+                      << ", eager " << (eagerValid ? "success" : "failure") << std::endl;
+            validRet &= graphValid && eagerValid;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(event));
+    for (auto &cmdList : cmdListsForked) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    }
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListEagerWait));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListEagerSignal));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListMain));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputOutputCmdList));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, eagerDst));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, eagerSrc));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, accumulator));
+    return validRet;
+}
+
+bool testEventTransitionBetweenCaptures(ze_context_handle_t &context,
+                                        ze_device_handle_t &device,
+                                        bool aubMode,
+                                        const GraphDumpSettings &dumpSettings,
+                                        uint32_t executionCount) {
+    constexpr size_t allocSize = 4096;
+    const uint8_t patternFirst = 0x11;
+    const uint8_t patternSecond = 0x22;
+    const uint8_t zeroPattern = 0;
+    bool validRet = true;
+
+    void *bufferFirst = nullptr;
+    void *bufferSecond = nullptr;
+    void *bufferForked = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &bufferFirst));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &bufferSecond));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &bufferForked));
+
+    ze_command_list_handle_t inputOutputCmdList = nullptr;
+    ze_command_list_handle_t cmdListFirst = nullptr;
+    ze_command_list_handle_t cmdListSecond = nullptr;
+    ze_command_list_handle_t cmdListForked = nullptr;
+    LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputOutputCmdList);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdListFirst);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdListSecond);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, false, false, cmdListForked);
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE;
+    ze_event_handle_t event = nullptr;
+    SUCCESS_OR_TERMINATE(zeEventCounterBasedCreate(context, device, &counterBasedDesc, &event));
+
+    ze_graph_handle_t virtualGraphFirst = nullptr;
+    ze_graph_handle_t virtualGraphSecond = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraphFirst));
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraphSecond));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListFirst, virtualGraphFirst, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListSecond, virtualGraphSecond, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListFirst, bufferFirst, &patternFirst, sizeof(patternFirst), allocSize, event, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdListSecond, bufferSecond, &patternSecond, sizeof(patternSecond), allocSize, event, 0, nullptr));
+
+    const auto mergeResult = zeCommandListAppendBarrier(cmdListFirst, nullptr, 1, &event);
+    if (ZE_RESULT_ERROR_GRAPH_CAPTURE_MERGE_ATTEMPT != mergeResult) {
+        std::cerr << "Waiting in the first capture on the event moved to the second capture returned " << mergeResult << std::endl;
+        validRet = false;
+    }
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListForked, bufferForked, bufferSecond, allocSize, event, 1, &event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListSecond, 1, &event));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListFirst, nullptr, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListSecond, nullptr, nullptr));
+
+    ze_executable_graph_handle_t physicalGraphFirst = nullptr;
+    ze_executable_graph_handle_t physicalGraphSecond = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraphFirst, nullptr, &physicalGraphFirst));
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraphSecond, nullptr, &physicalGraphSecond));
+
+    for (uint32_t execution = 0; execution < executionCount; ++execution) {
+        for (auto *buffer : {bufferFirst, bufferSecond, bufferForked}) {
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, buffer, &zeroPattern, sizeof(zeroPattern), allocSize, nullptr, 0, nullptr));
+        }
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListFirst, physicalGraphFirst, nullptr, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListSecond, physicalGraphSecond, nullptr, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListFirst, std::numeric_limits<uint64_t>::max()));
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListSecond, std::numeric_limits<uint64_t>::max()));
+
+        if (aubMode == false) {
+            const bool executionValid = LevelZeroBlackBoxTests::validateToValue(patternFirst, bufferFirst, allocSize) &&
+                                        LevelZeroBlackBoxTests::validateToValue(patternSecond, bufferSecond, allocSize) &&
+                                        LevelZeroBlackBoxTests::validateToValue(patternSecond, bufferForked, allocSize);
+            std::cerr << "Validation result after execution #" << execution + 1 << ": " << (executionValid ? "success" : "failure") << std::endl;
+            validRet &= executionValid;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraphSecond, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraphSecond));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraphFirst));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraphSecond));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraphFirst));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(event));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListForked));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListSecond));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListFirst));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputOutputCmdList));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, bufferForked));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, bufferSecond));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, bufferFirst));
+    return validRet;
+}
+
+bool testMultipleLevelGraph(LevelZeroBlackBoxTests::VisitExtension::VisitApi *visitApi,
+                            ze_context_handle_t &context,
+                            ze_device_handle_t &device,
+                            TestKernelsContainer &testKernels,
+                            bool aubMode,
+                            const GraphDumpSettings &dumpSettings,
+                            bool immediate,
+                            bool executeUsingVisitor) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 512;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t addValue1 = 5;
+    uint32_t mulValue1 = 2;
+    uint32_t mulValue2 = 1;
+    uint32_t addValue2 = 3;
+    uint32_t mulValue3 = 4;
+
+    uint32_t expectedValue = (((((initialValue + addValue1) * mulValue1) * mulValue2) + addValue2) * mulValue3);
+
+    // order of kernels: add (init + add1) => mul (result * mul1) => mul (result * mul2) => add (result + add2) => mul(result * mul3)
+    // graph sequence root(add1) => fork1(mul1) => fork2(mul2) => return fork1 => return root => root(add2) => fork1(mul3) => return root
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCb = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventCb, 0u, 0u);
+
+    ze_kernel_handle_t kernelAddDst = testKernels["add_constant_output"];
+    ze_kernel_handle_t kernelMulDst = testKernels["mul_constant_output"];
+
+    ze_command_list_handle_t cmdListRoot, cmdListFork1, cmdListFork2;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListRoot);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListFork1);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListFork2);
+
+    void *srcBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(srcBuffer)[i] = initialValue;
+    }
+    void *stage1Buffer = nullptr; // results for add1
+    void *stage2Buffer = nullptr; // results for mul1
+    void *stage3Buffer = nullptr; // results for mul2
+    void *stage4Buffer = nullptr; // results for add2
+    void *finalBuffer = nullptr;  // results for mul3
+
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &finalBuffer));
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    if (immediate == false) {
+        SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+        SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListRoot, virtualGraph, nullptr));
+    }
+
+    uint32_t groupSizeX = std::min(64u, static_cast<uint32_t>(elemCount));
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddDst, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelMulDst, groupSizeX, groupSizeY, groupSizeZ));
+
+    // set add kernel for root
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddDst, 0, sizeof(srcBuffer), &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddDst, 1, sizeof(stage1Buffer), &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddDst, 2, sizeof(addValue1), &addValue1));
+
+    // attach event to append operation to signal to fork 1
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddDst, &groupCount, eventCb, 0, nullptr));
+
+    // set mul kernel for fork 1
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 0, sizeof(stage1Buffer), &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 1, sizeof(stage2Buffer), &stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 2, sizeof(mulValue1), &mulValue1));
+
+    // wait for signal from root and reuse event to carry signal into fork 2
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListFork1, kernelMulDst, &groupCount, eventCb, 1, &eventCb));
+
+    // set mul kernel for fork 2
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 0, sizeof(stage2Buffer), &stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 1, sizeof(stage3Buffer), &stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 2, sizeof(mulValue2), &mulValue2));
+
+    // wait for signal from fork 1 and reuse event to carry signal into fork 2
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListFork2, kernelMulDst, &groupCount, eventCb, 1, &eventCb));
+
+    // join to fork1
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListFork1, 1, &eventCb));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(cmdListFork1, eventCb));
+
+    // set add kernel for root
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddDst, 0, sizeof(stage3Buffer), &stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddDst, 1, sizeof(stage4Buffer), &stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddDst, 2, sizeof(addValue2), &addValue2));
+
+    // join to root and attach event to append operation to signal to fork 1
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddDst, &groupCount, eventCb, 1, &eventCb));
+
+    // set mul kernel for fork 1
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 0, sizeof(stage4Buffer), &stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 1, sizeof(finalBuffer), &finalBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulDst, 2, sizeof(mulValue3), &mulValue3));
+
+    // wait for signal from root and reuse event to carry signal into root again
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListFork1, kernelMulDst, &groupCount, eventCb, 1, &eventCb));
+
+    // join to root
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListRoot, 1, &eventCb));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    if (immediate == false) {
+        // create physical graphs from the same virtual graph
+        SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListRoot, nullptr, nullptr));
+        SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    }
+
+    if (immediate == false) {
+        // Dispatch and wait physicalGraph
+        if (executeUsingVisitor == false) {
+            SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListRoot, physicalGraph, nullptr, nullptr, 0, nullptr));
+        } else {
+            ze_command_visit_ext_desc_t visitDesc{ZE_STRUCTURE_TYPE_COMMAND_VISIT_EXT_DESC};
+            visitDesc.defaultOp = ZE_COMMAND_VISIT_EXT_DEFAULT_OP_REAPPEND;
+            SUCCESS_OR_TERMINATE(visitApi->graphVisit(virtualGraph, &visitDesc));
+        }
+    }
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListRoot, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, finalBuffer, elemCount);
+        std::cerr << "Validation result after execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    if (immediate == false) {
+        dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+        SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+        SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    }
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, finalBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListRoot));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListFork1));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListFork2));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCb));
+    return validRet;
+}
+
+bool testMultipleForkJoinsGraph(ze_context_handle_t &context,
+                                ze_device_handle_t &device,
+                                TestKernelsContainer &testKernels,
+                                bool aubMode,
+                                const GraphDumpSettings &dumpSettings,
+                                bool reuse) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 1024;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    // srcBuffer = initialValue
+    // root: addVal(srcBuffer, addValue1, stageBuffer1, fork) -> fork && addVal(stageBuffer1, addValue2, stageBuffer2) -> join1 from fork -> addBuff(stageBuffer2, stageBuffer3, stageBuffer4) -> join 2 from fork -> addBuff(stageBuffer4, stageBuffer5, dstBuffer)
+    // fork: mulVal(stageBuffer1, mulValue1, stageBuffer3, join1) -> inc1(stageBuffer3, stageBuffer5, join2)
+
+    // order of kernels: add(init+add1 = st1) => mul(st1*mul1 = st3)/parallel/add(st1+add2 = st2) => inc(st3+1 = st5)/parallel/add(st2+st3 = st4) => add(st4+st5 = dst)
+
+    const uint32_t initialValue = 4;
+    const uint32_t addValue1 = 5;
+    const uint32_t addValue2 = 6;
+    const uint32_t mulValue1 = 2;
+
+    const uint32_t stage1 = initialValue + addValue1; // stageBuffer1
+    const uint32_t stage2 = stage1 + addValue2;       // stageBuffer2
+    const uint32_t stage3 = stage1 * mulValue1;       // stageBuffer3
+    const uint32_t stage4 = stage2 + stage3;          // stageBuffer4
+    const uint32_t stage5 = stage3 + 1;               // stageBuffer5
+    const uint32_t dstValue = stage4 + stage5;        // dstBuffer
+
+    uint32_t expectedValue = dstValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCbArray[2] = {nullptr, nullptr};
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     2, eventCbArray, 0u, 0u);
+
+    ze_event_handle_t eventCb = eventCbArray[0];
+    ze_event_handle_t eventCb2 = eventCbArray[1];
+
+    ze_event_handle_t forkJoin1Event = eventCb;
+    ze_event_handle_t join2Event = reuse ? eventCb : eventCb2;
+
+    ze_kernel_handle_t kernelAddValDst = testKernels["add_constant_output"];
+    ze_kernel_handle_t kernelMulValDst = testKernels["mul_constant_output"];
+    ze_kernel_handle_t kernelIncDwordByOne = testKernels["increment_dword_by_one"];
+    ze_kernel_handle_t kernelAddTwoSrcBuffer = testKernels["add_two_src_buffer"];
+
+    ze_command_list_handle_t cmdListRoot, cmdListFork;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListRoot);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListFork);
+
+    void *srcBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(srcBuffer)[i] = initialValue;
+    }
+    void *stage1Buffer = nullptr; // results for addVal1
+    void *stage2Buffer = nullptr; // results for addVal2
+    void *stage3Buffer = nullptr; // results for mulVal1
+    void *stage4Buffer = nullptr; // results for addTwoSrcBuffer 2,3
+    void *stage5Buffer = nullptr; // results for incDwordByOne
+    void *finalBuffer = nullptr;  // results for addTwoSrcBuffer 4,5
+
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stage5Buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &finalBuffer));
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListRoot, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = std::min(64u, static_cast<uint32_t>(elemCount));
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddValDst, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelMulValDst, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelIncDwordByOne, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddTwoSrcBuffer, groupSizeX, groupSizeY, groupSizeZ));
+
+    // set add kernel for add1 on root
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 0, sizeof(srcBuffer), &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 1, sizeof(stage1Buffer), &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 2, sizeof(addValue1), &addValue1));
+
+    // attach event to append operation to signal to fork
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddValDst, &groupCount, forkJoin1Event, 0, nullptr));
+
+    // set add kernel for add2 on root
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 0, sizeof(stage1Buffer), &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 1, sizeof(stage2Buffer), &stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 2, sizeof(addValue2), &addValue2));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddValDst, &groupCount, nullptr, 0, nullptr));
+
+    // set mul kernel for fork
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulValDst, 0, sizeof(stage1Buffer), &stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulValDst, 1, sizeof(stage3Buffer), &stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulValDst, 2, sizeof(mulValue1), &mulValue1));
+
+    // wait for signal from root and reuse event to carry signal into join 1
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListFork, kernelMulValDst, &groupCount, forkJoin1Event, 1, &forkJoin1Event));
+
+    if (reuse == true) {
+        // set addbuffers kernel for addBuffer2,3 from fork into stage4Buffer
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 0, sizeof(stage4Buffer), &stage4Buffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 1, sizeof(stage2Buffer), &stage2Buffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 2, sizeof(stage3Buffer), &stage3Buffer));
+
+        // wait for signal from join1
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddTwoSrcBuffer, &groupCount, nullptr, 1, &forkJoin1Event));
+
+        // set inc1 kernel for fork stage3+1=stage5
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelIncDwordByOne, 0, sizeof(stage5Buffer), &stage5Buffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelIncDwordByOne, 1, sizeof(stage3Buffer), &stage3Buffer));
+
+        // reuse cb event to signal join2 completion
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListFork, kernelIncDwordByOne, &groupCount, join2Event, 0, nullptr));
+    } else {
+        // set inc1 kernel for fork stage3+1=stage5
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelIncDwordByOne, 0, sizeof(stage5Buffer), &stage5Buffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelIncDwordByOne, 1, sizeof(stage3Buffer), &stage3Buffer));
+
+        // reuse cb event to signal join2 completion
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListFork, kernelIncDwordByOne, &groupCount, join2Event, 0, nullptr));
+
+        // set addbuffers kernel for addBuffer2,3 from fork into stage4Buffer
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 0, sizeof(stage4Buffer), &stage4Buffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 1, sizeof(stage2Buffer), &stage2Buffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 2, sizeof(stage3Buffer), &stage3Buffer));
+
+        // wait for signal from join1
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddTwoSrcBuffer, &groupCount, nullptr, 1, &forkJoin1Event));
+    }
+
+    // set addbuffers kernel for addBuffer4,5 from fork into dstBuffer
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 0, sizeof(finalBuffer), &finalBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 1, sizeof(stage4Buffer), &stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddTwoSrcBuffer, 2, sizeof(stage5Buffer), &stage5Buffer));
+
+    // join to root for join2
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddTwoSrcBuffer, &groupCount, nullptr, 1, &join2Event));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    // create physical graphs from the same virtual graph
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListRoot, nullptr, nullptr));
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait physicalGraph
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListRoot, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListRoot, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, finalBuffer, elemCount);
+        std::cerr << "Validation result after execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    std::stringstream ss;
+    ss << __func__ << (reuse ? "_reuse_join2" : "_new_join2");
+
+    dumpGraphToDotIfEnabled(virtualGraph, ss.str(), dumpSettings);
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage1Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage2Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage3Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage4Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stage5Buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, finalBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListRoot));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListFork));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCb));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCb2));
+    return validRet;
+}
+
+bool testSingleForkMultipleJoinsGraph(ze_context_handle_t &context,
+                                      ze_device_handle_t &device,
+                                      TestKernelsContainer &testKernels,
+                                      bool aubMode,
+                                      const GraphDumpSettings &dumpSettings,
+                                      uint32_t forkCount,
+                                      uint32_t executionCount,
+                                      bool validateBetweenExecutions) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 1024;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    // root: addVal(srcBuffer, addValue, stageBuffer, fork) -> wait join[0] -> ... -> wait join[forkCount - 1]
+    // fork[i]: wait fork -> mulVal(stageBuffer, i + 2, dstBuffer[i], join[i])
+    // a single fork event is awaited by all forked command lists, graph is executed multiple times
+
+    const uint32_t initialValue = 4;
+    const uint32_t addValue = 5;
+    const uint32_t stageValue = initialValue + addValue;
+
+    std::vector<ze_event_handle_t> events(forkCount + 1, nullptr);
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     forkCount + 1, events.data(), 0u, 0u);
+    ze_event_handle_t forkEvent = events[0];
+    ze_event_handle_t *joinEvents = &events[1];
+
+    ze_kernel_handle_t kernelAddValDst = testKernels["add_constant_output"];
+    ze_kernel_handle_t kernelMulValDst = testKernels["mul_constant_output"];
+
+    ze_command_list_handle_t cmdListRoot;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, cmdListRoot);
+    std::vector<ze_command_list_handle_t> cmdListsFork(forkCount, nullptr);
+    for (auto &cmdListFork : cmdListsFork) {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                               false, false, cmdListFork);
+    }
+
+    // add copy engine command list to zero dst buffers between executions
+    ze_command_list_handle_t memoryCmdList = nullptr;
+    if (validateBetweenExecutions) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, memoryCmdList);
+    }
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    void *srcBuffer = nullptr;
+    void *stageBuffer = nullptr;
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &stageBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(srcBuffer)[i] = initialValue;
+    }
+    memset(stageBuffer, 0, allocSize);
+    std::vector<void *> dstBuffers(forkCount, nullptr);
+    for (auto &dstBuffer : dstBuffers) {
+        SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &dstBuffer));
+        memset(dstBuffer, 0, allocSize);
+    }
+
+    uint32_t groupSizeX = std::min(64u, static_cast<uint32_t>(elemCount));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddValDst, groupSizeX, 1u, 1u));
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelMulValDst, groupSizeX, 1u, 1u));
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListRoot, virtualGraph, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 0, sizeof(srcBuffer), &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 1, sizeof(stageBuffer), &stageBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddValDst, 2, sizeof(addValue), &addValue));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListRoot, kernelAddValDst, &groupCount, forkEvent, 0, nullptr));
+
+    for (uint32_t i = 0; i < forkCount; i++) {
+        uint32_t mulValue = i + 2;
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulValDst, 0, sizeof(stageBuffer), &stageBuffer));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulValDst, 1, sizeof(dstBuffers[i]), &dstBuffers[i]));
+        SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulValDst, 2, sizeof(mulValue), &mulValue));
+        // all forked command lists wait for the same fork event
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListsFork[i], kernelMulValDst, &groupCount, joinEvents[i], 1, &forkEvent));
+    }
+    for (uint32_t i = 0; i < forkCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(cmdListRoot, 1, &joinEvents[i]));
+    }
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListRoot, nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    constexpr uint64_t syncTimeout = std::numeric_limits<uint64_t>::max();
+    for (uint32_t execution = 0; execution < executionCount; execution++) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListRoot, physicalGraph, nullptr, nullptr, 0, nullptr));
+        std::cout << "Execution " << execution + 1 << " of " << executionCount << " submitted" << std::endl;
+
+        if (aubMode == false && validateBetweenExecutions) {
+            SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListRoot, syncTimeout));
+
+            for (uint32_t i = 0; i < forkCount; i++) {
+                uint32_t expectedValue = stageValue * (i + 2);
+                bool validFork = LevelZeroBlackBoxTests::validateToValue(expectedValue, dstBuffers[i], elemCount);
+                std::cout << "Validation result after execution " << execution + 1 << " for fork " << i + 1 << ": " << (validFork ? "success" : "failure") << std::endl;
+                validRet &= validFork;
+            }
+            if (execution < executionCount - 1) {
+                // reset dst buffers to zero for next execution
+                uint8_t zeroValue = 0;
+                SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(memoryCmdList, stageBuffer, &zeroValue, sizeof(zeroValue), allocSize, nullptr, 0, nullptr));
+                for (auto dstBuffer : dstBuffers) {
+                    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(memoryCmdList, dstBuffer, &zeroValue, sizeof(zeroValue), allocSize, nullptr, 0, nullptr));
+                }
+                SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(memoryCmdList, syncTimeout));
+            }
+        }
+    }
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListRoot, syncTimeout));
+    if (aubMode == false && validateBetweenExecutions == false) {
+        for (uint32_t i = 0; i < forkCount; i++) {
+            uint32_t expectedValue = stageValue * (i + 2);
+            bool validFork = LevelZeroBlackBoxTests::validateToValue(expectedValue, dstBuffers[i], elemCount);
+            std::cout << "Validation result after all executions " << executionCount << " for fork " << i + 1 << ": " << (validFork ? "success" : "failure") << std::endl;
+            validRet &= validFork;
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, stageBuffer));
+    for (auto dstBuffer : dstBuffers) {
+        SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    }
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListRoot));
+    for (auto cmdListFork : cmdListsFork) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListFork));
+    }
+    if (memoryCmdList != nullptr) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(memoryCmdList));
+    }
+    for (auto event : events) {
+        SUCCESS_OR_TERMINATE(zeEventDestroy(event));
+    }
+    return validRet;
+}
+
+bool testForkedGraphMultipleExecutionEventSync(ze_context_handle_t &context,
+                                               ze_device_handle_t &device,
+                                               TestKernelsContainer &testKernels,
+                                               bool aubMode,
+                                               const GraphDumpSettings &dumpSettings,
+                                               uint32_t executionCount) {
+    using ElemType = uint32_t;
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(ElemType);
+
+    ElemType initialValue = 1;
+    ElemType addValue = 5;
+
+    ElemType expectedValue = initialValue + addValue;
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t cmdListCopy, cmdListExecute;
+    std::vector<ze_command_list_handle_t> cmdListReplay(executionCount);
+
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListCopy);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListExecute);
+
+    for (uint32_t i = 0; i < executionCount; i++) {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdListReplay[i]);
+    }
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 2;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    ze_event_handle_t eventFork = nullptr;
+    ze_event_handle_t eventJoin = nullptr;
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    eventDesc.index = 0;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventFork));
+
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.index = 1;
+    SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &eventJoin));
+
+    ze_event_pool_handle_t eventPoolReplay = nullptr;
+    eventPoolDesc.count = executionCount;
+
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPoolReplay));
+    std::vector<ze_event_handle_t> eventReplay(executionCount);
+    for (uint32_t i = 0; i < executionCount; i++) {
+        ze_event_desc_t eventDescReplay = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+        eventDescReplay.index = i;
+        SUCCESS_OR_TERMINATE(zeEventCreate(eventPoolReplay, &eventDescReplay, &eventReplay[i]));
+    }
+
+    std::vector<ElemType> inputData(elemCount);
+    std::vector<ElemType> outputData(elemCount);
+
+    for (size_t i = 0; i < elemCount; ++i) {
+        inputData[i] = initialValue;
+        outputData[i] = 0;
+    }
+
+    void *zeBuffer = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    deviceDesc.ordinal = 0;
+    deviceDesc.flags = 0;
+    deviceDesc.pNext = nullptr;
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListCopy, virtualGraph, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListCopy, zeBuffer, inputData.data(), allocSize, eventFork, 0, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(zeBuffer), &zeBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListExecute, kernelAddConstant, &groupCount, eventJoin, 1, &eventFork));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdListCopy, outputData.data(), zeBuffer, allocSize, nullptr, 1, &eventJoin));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListCopy, nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    auto eventStatus = [](ze_result_t evStatus, std::string evType, bool before) -> std::string {
+        std::ostringstream caseName;
+        caseName << "event " << evType << " status ";
+        caseName << (before ? "before execution " : "after execution ");
+        caseName << (evStatus == ZE_RESULT_NOT_READY ? "NOT_READY" : "SUCCESS") << std::endl;
+        return caseName.str();
+    };
+
+    // Dispatch and wait
+    for (uint32_t i = 0; i < executionCount; i++) {
+        std::cout << "execution iteration " << i << std::endl;
+        ze_result_t evStatus;
+        evStatus = zeEventQueryStatus(eventFork);
+        std::cout << eventStatus(evStatus, "fork", true);
+        evStatus = zeEventQueryStatus(eventJoin);
+        std::cout << eventStatus(evStatus, "join", true);
+
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListReplay[i], physicalGraph, nullptr, eventReplay[i], 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventReplay[i], std::numeric_limits<uint64_t>::max()));
+
+        if (aubMode == false) {
+            evStatus = zeEventQueryStatus(eventFork);
+            std::cout << eventStatus(evStatus, "fork", false);
+            evStatus = zeEventQueryStatus(eventJoin);
+            std::cout << eventStatus(evStatus, "join", false);
+
+            auto validIter = LevelZeroBlackBoxTests::validateToValue(expectedValue, outputData.data(), elemCount);
+            std::cerr << "Validation result after execution iteration #" << i + 1 << ": " << (validIter ? "success" : "failure") << std::endl;
+            validRet &= validIter;
+        }
+        SUCCESS_OR_TERMINATE(zeEventHostReset(eventFork));
+        SUCCESS_OR_TERMINATE(zeEventHostReset(eventJoin));
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    for (uint32_t i = 0; i < executionCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListReplay[i], std::numeric_limits<uint64_t>::max()));
+    }
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListCopy));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListExecute));
+    for (uint32_t i = 0; i < executionCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListReplay[i]));
+    }
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventJoin));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventFork));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    for (uint32_t i = 0; i < executionCount; i++) {
+        SUCCESS_OR_TERMINATE(zeEventDestroy(eventReplay[i]));
+    }
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPoolReplay));
+    return validRet;
+}
+
+enum TestWrappedMultipleEnginesForkPolicy {
+    pairEnginesFirst,
+    sequence,
+    max
+};
+
+bool testWrappedMultipleEngines(ze_context_handle_t &context,
+                                ze_device_handle_t &device,
+                                TestKernelsContainer &testKernels,
+                                bool aubMode,
+                                const GraphDumpSettings &dumpSettings,
+                                uint32_t enginesCount,
+                                uint32_t pairCount,
+                                TestWrappedMultipleEnginesForkPolicy forkPolicy,
+                                bool useInOrder) {
+    using ElemType = uint32_t;
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(ElemType);
+
+    const uint32_t kernelsPerPair = 4;
+
+    ElemType initialValue = 1;
+    ElemType addValue = 5;
+
+    ElemType expectedValue = initialValue + (kernelsPerPair * addValue) * pairCount;
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    uint32_t sequenceCount = kernelsPerPair * pairCount;
+    uint32_t queueCount = enginesCount + pairCount;
+
+    std::vector<ze_command_list_handle_t> cmdListCreated(queueCount);
+    std::vector<ze_command_list_handle_t> cmdListSequence(sequenceCount);
+
+    ze_command_queue_flags_t immFlags = 0;
+    if (useInOrder) {
+        immFlags |= ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
+    }
+    for (uint32_t i = 0; i < queueCount; i++) {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, immFlags, false, false, cmdListCreated[i]);
+    }
+
+    std::string forkPolicyString;
+    if (forkPolicy == TestWrappedMultipleEnginesForkPolicy::pairEnginesFirst) {
+        forkPolicyString = "_pairEngines";
+        // this sequence goes engine 0 -> fork engine 0 + wrapped -> fork engine 1 -> fork engine 1 + wrapped
+        // join from engine pair MAX + wrappped -> join engine pair MAX -> join engine pair MAX-1 + wrapped -> join engine pair MAX-1
+
+        for (uint32_t i = 0; i < pairCount; i++) {
+            cmdListSequence[2 * i] = cmdListCreated[i];
+            cmdListSequence[2 * i + 1] = cmdListCreated[i + enginesCount];
+
+            cmdListSequence[sequenceCount - 1 - 2 * i] = cmdListCreated[i];
+            cmdListSequence[sequenceCount - 2 - 2 * i] = cmdListCreated[i + enginesCount];
+        }
+    } else {
+        forkPolicyString = "_sequence";
+        // sequence engine 0 -> fork engine 1 -> ... -> fork engine 0 + wrapped -> fork engine 1 + wrapped
+        // join engine pair MAX + wrapped -> join engine MAX-1 + wrapped -> ... -> join engine pair MAX
+
+        for (uint32_t i = 0; i < pairCount; i++) {
+            cmdListSequence[i] = cmdListCreated[i];
+            cmdListSequence[i + pairCount] = cmdListCreated[i + enginesCount];
+
+            cmdListSequence[sequenceCount - 1 - i] = cmdListCreated[i];
+            cmdListSequence[sequenceCount - sequenceCount / kernelsPerPair - 1 - i] = cmdListCreated[i + enginesCount];
+        }
+    }
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_handle_t eventPoolInitEvents = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = sequenceCount;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    eventPoolDesc.count = queueCount;
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPoolInitEvents));
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    std::vector<ze_event_handle_t> events(sequenceCount);
+    std::vector<ze_event_handle_t> initEvents(queueCount);
+
+    for (uint32_t i = 0; i < sequenceCount; i++) {
+        eventDesc.index = i;
+        SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &events[i]));
+    }
+
+    for (uint32_t i = 0; i < queueCount; i++) {
+        eventDesc.index = i;
+        SUCCESS_OR_TERMINATE(zeEventCreate(eventPoolInitEvents, &eventDesc, &initEvents[i]));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendEventReset(cmdListCreated[i], initEvents[i]));
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListCreated[i], std::numeric_limits<uint64_t>::max()));
+    }
+
+    if (useInOrder) {
+        for (uint32_t i = 0; i < sequenceCount; i++) {
+            SUCCESS_OR_TERMINATE(zeCommandListAppendEventReset(cmdListSequence[i], events[i]));
+        }
+    }
+
+    void *zeBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<ElemType *>(zeBuffer)[i] = initialValue;
+    }
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(zeBuffer), &zeBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListSequence[0], virtualGraph, nullptr));
+
+    ze_event_handle_t signalEvent = nullptr, waitEvent = nullptr;
+    uint32_t numWaitEvents = 0;
+    for (uint32_t i = 0; i < sequenceCount; i++) {
+        signalEvent = events[i];
+        numWaitEvents = waitEvent != nullptr ? 1 : 0;
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListSequence[i], kernelAddConstant, &groupCount, signalEvent, numWaitEvents, &waitEvent));
+        waitEvent = signalEvent;
+    }
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListSequence[0], nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListSequence[0], physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListSequence[0], std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, zeBuffer, elemCount);
+        std::cerr << "Validation result after execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    std::stringstream ss;
+    ss << __func__ << forkPolicyString;
+    dumpGraphToDotIfEnabled(virtualGraph, ss.str(), dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    for (uint32_t i = 0; i < queueCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListCreated[i]));
+        SUCCESS_OR_TERMINATE(zeEventDestroy(initEvents[i]));
+    }
+    for (uint32_t i = 0; i < sequenceCount; i++) {
+        SUCCESS_OR_TERMINATE(zeEventDestroy(events[i]));
+    }
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPoolInitEvents));
+    return validRet;
+}
+
+bool testSingleWrappedEngineDeepFork(ze_context_handle_t &context,
+                                     ze_device_handle_t &device,
+                                     TestKernelsContainer &testKernels,
+                                     bool aubMode,
+                                     const GraphDumpSettings &dumpSettings,
+                                     uint32_t enginesCount,
+                                     bool useInOrder) {
+    using ElemType = uint32_t;
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(ElemType);
+
+    ElemType initialValue = 1;
+    ElemType addValue = 5;
+
+    // sequence: root -> fork1 -> fork2 -> fork2+engineCount -> join2 -> join1 -> fork2 -> fork3-> join2 -> join1 -> join root
+    // kernels #: root:1 + fork*3 + join*2 + fork*2 + join*3 = 1 + 3 + 2 + 1 + 2 = 11 kernels
+
+    const uint32_t kernelsAppendCount = 11;
+    const uint32_t wrappedCount = 3; // fork 2, so must go beyond root and fork1
+
+    ElemType expectedValue = initialValue + (kernelsAppendCount * addValue);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    uint32_t queueCount = enginesCount + wrappedCount;
+
+    std::vector<ze_command_list_handle_t> cmdListCreated(queueCount);
+    std::vector<ze_command_list_handle_t> cmdListSequence(kernelsAppendCount);
+
+    ze_command_queue_flags_t immFlags = 0;
+    if (useInOrder) {
+        immFlags |= ZE_COMMAND_QUEUE_FLAG_IN_ORDER;
+    }
+    for (uint32_t i = 0; i < queueCount; i++) {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, immFlags, false, false, cmdListCreated[i]);
+    }
+
+    cmdListSequence[0] = cmdListCreated[0];                // root
+    cmdListSequence[1] = cmdListCreated[1];                // fork 1
+    cmdListSequence[2] = cmdListCreated[2];                // fork 2
+    cmdListSequence[3] = cmdListCreated[2 + enginesCount]; // fork2+engineCount
+    cmdListSequence[4] = cmdListCreated[2];                // join 2
+    cmdListSequence[5] = cmdListCreated[1];                // join 1
+    cmdListSequence[6] = cmdListCreated[2];                // fork 2
+    cmdListSequence[7] = cmdListCreated[3];                // fork 3
+    cmdListSequence[8] = cmdListCreated[2];                // join 2
+    cmdListSequence[9] = cmdListCreated[1];                // join 1
+    cmdListSequence[10] = cmdListCreated[0];               // join root
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_pool_handle_t eventPoolInitEvents = nullptr;
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = kernelsAppendCount;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPool));
+
+    eventPoolDesc.count = queueCount;
+    SUCCESS_OR_TERMINATE(zeEventPoolCreate(context, &eventPoolDesc, 1, &device, &eventPoolInitEvents));
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    std::vector<ze_event_handle_t> events(kernelsAppendCount);
+    std::vector<ze_event_handle_t> initEvents(queueCount);
+
+    for (uint32_t i = 0; i < kernelsAppendCount; i++) {
+        eventDesc.index = i;
+        SUCCESS_OR_TERMINATE(zeEventCreate(eventPool, &eventDesc, &events[i]));
+    }
+
+    for (uint32_t i = 0; i < queueCount; i++) {
+        eventDesc.index = i;
+        SUCCESS_OR_TERMINATE(zeEventCreate(eventPoolInitEvents, &eventDesc, &initEvents[i]));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendEventReset(cmdListCreated[i], initEvents[i]));
+    }
+
+    if (useInOrder) {
+        for (uint32_t i = 0; i < kernelsAppendCount; i++) {
+            SUCCESS_OR_TERMINATE(zeCommandListAppendEventReset(cmdListSequence[i], events[i]));
+        }
+    }
+
+    void *zeBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<ElemType *>(zeBuffer)[i] = initialValue;
+    }
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(zeBuffer), &zeBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdListSequence[0], virtualGraph, nullptr));
+
+    ze_event_handle_t signalEvent = nullptr, waitEvent = nullptr;
+    uint32_t numWaitEvents = 0;
+    for (uint32_t i = 0; i < kernelsAppendCount; i++) {
+        signalEvent = events[i];
+        numWaitEvents = waitEvent != nullptr ? 1 : 0;
+        SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdListSequence[i], kernelAddConstant, &groupCount, signalEvent, numWaitEvents, &waitEvent));
+        waitEvent = signalEvent;
+    }
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdListSequence[0], nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdListSequence[0], physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdListSequence[0], std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, zeBuffer, elemCount);
+        std::cerr << "Validation result after execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    std::stringstream ss;
+    ss << __func__;
+    dumpGraphToDotIfEnabled(virtualGraph, ss.str(), dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    for (uint32_t i = 0; i < queueCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdListCreated[i]));
+        SUCCESS_OR_TERMINATE(zeEventDestroy(initEvents[i]));
+    }
+    for (uint32_t i = 0; i < kernelsAppendCount; i++) {
+        SUCCESS_OR_TERMINATE(zeEventDestroy(events[i]));
+    }
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPoolInitEvents));
+    SUCCESS_OR_TERMINATE(zeEventPoolDestroy(eventPool));
+    return validRet;
+}
+
+bool testCopyEngineSimpleGraph(ze_context_handle_t &context,
+                               ze_device_handle_t &device,
+                               bool aubMode,
+                               const GraphDumpSettings &dumpSettings) {
+    using ElemType = uint32_t;
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(ElemType);
+
+    ElemType initialValue = 10;
+
+    if (LevelZeroBlackBoxTests::getCopyOnlyCommandQueueOrdinal(device) == LevelZeroBlackBoxTests::undefinedQueueOrdinal) {
+        std::cout << "Device does not support copy only engine, skipping test." << std::endl;
+        return validRet;
+    }
+
+    void *srcBuffer = nullptr;
+    void *dstBuffer = nullptr;
+    void *zeBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &dstBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<ElemType *>(srcBuffer)[i] = initialValue;
+    }
+    memset(dstBuffer, 0x0, allocSize);
+
+    ze_device_mem_alloc_desc_t deviceDesc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    ze_command_list_handle_t copyIcl = nullptr;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, false, true, copyIcl);
+
+    // begin recording graph
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(copyIcl, virtualGraph, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(copyIcl, zeBuffer, srcBuffer, allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(copyIcl, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(copyIcl, dstBuffer, zeBuffer, allocSize, nullptr, 0, nullptr));
+
+    // instantiate graph
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(copyIcl, nullptr, nullptr));
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // Dispatch and wait
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(copyIcl, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(copyIcl, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(initialValue, dstBuffer, elemCount);
+        std::cerr << "Validation result after execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    std::stringstream ss;
+    ss << __func__;
+    dumpGraphToDotIfEnabled(virtualGraph, ss.str(), dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(copyIcl));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    return validRet;
+}
+
+// Scenario:
+// 1) Start graph capture and copy patternA to device buffer
+// 2) Pause capture, copy patternB to the same device buffer and validate
+// 3) Resume capture, copy from device buffer to host and validate patternA is copied (patternB copy should not be captured)
+bool testPauseResumeCapture(ze_context_handle_t &context, ze_device_handle_t &device, bool aubMode, const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr uint8_t patternA = 0xAA;
+    constexpr uint8_t patternB = 0xBB;
+
+    void *srcBufferA = nullptr;
+    void *srcBufferB = nullptr;
+    void *zeBuffer = nullptr;
+    void *dstBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBufferA));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &srcBufferB));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &dstBuffer));
+
+    ze_device_mem_alloc_desc_t deviceDesc = {.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    memset(srcBufferA, patternA, allocSize);
+    memset(srcBufferB, patternB, allocSize);
+    memset(dstBuffer, 0x00, allocSize);
+
+    ze_command_list_handle_t cmdList{};
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, cmdList);
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginGraphCaptureExt(cmdList, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, zeBuffer, srcBufferA, allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+
+    ze_graph_handle_t virtualGraph{};
+    SUCCESS_OR_TERMINATE(zeCommandListGetGraphExt(cmdList, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeGraphPauseCaptureExt(virtualGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, zeBuffer, srcBufferB, allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, dstBuffer, zeBuffer, allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        const bool pausePhaseValid = LevelZeroBlackBoxTests::validateToValue(patternB, static_cast<uint8_t *>(dstBuffer), allocSize);
+        validRet &= pausePhaseValid;
+        if (!pausePhaseValid) {
+            std::cerr << "Pause/resume capture test failed: dstBuffer should contain patternB (0xBB) during the pause phase\n";
+        }
+    }
+
+    SUCCESS_OR_TERMINATE(zeGraphResumeCaptureExt(virtualGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, dstBuffer, zeBuffer, allocSize, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, &virtualGraph));
+
+    ze_executable_graph_handle_t physicalGraph{};
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    if (aubMode == false) {
+        const bool replayPhaseValid = LevelZeroBlackBoxTests::validateToValue(patternA, static_cast<uint8_t *>(dstBuffer), allocSize);
+        validRet &= replayPhaseValid;
+        if (!replayPhaseValid) {
+            std::cerr << "Pause/resume capture test failed: dstBuffer should contain patternA (0xAA) "
+                         "but pause-phase patternB (0xBB) write was incorrectly captured\n";
+        }
+    }
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBufferA));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, srcBufferB));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, dstBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    return validRet;
+}
+
+bool testExternalFlagCbEventsImmediate(ze_context_handle_t &context,
+                                       ze_device_handle_t &device,
+                                       TestKernelsContainer &testKernels,
+                                       bool aubMode,
+                                       const GraphDumpSettings &dumpSettings,
+                                       bool useCopyEngineForMemoryTransfers) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t addValue = 5;
+
+    uint32_t expectedValue = initialValue + addValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventInputUseFlags = nullptr, eventOutputUseFlags = nullptr, eventSynchronization = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventSynchronization, counterBasedDesc.signal, 0u);
+
+    counterBasedDesc.signal = 0;
+    counterBasedDesc.flags = (ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventInputUseFlags, counterBasedDesc.signal, 0u);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventOutputUseFlags, counterBasedDesc.signal, 0u);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t replayCmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+
+    ze_command_list_handle_t inputOutputCmdList;
+    if (useCopyEngineForMemoryTransfers) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputOutputCmdList);
+    } else {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                               false, false, inputOutputCmdList);
+    }
+
+    void *zeBuffer = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+    deviceDesc.ordinal = 0;
+    deviceDesc.flags = 0;
+    deviceDesc.pNext = nullptr;
+    SUCCESS_OR_TERMINATE(zeMemAllocDevice(context, &deviceDesc, allocSize, allocSize, device, &zeBuffer));
+
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    memset(outputBuffer, 0, allocSize);
+
+    ze_graph_handle_t virtualGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(zeBuffer), &zeBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external flag event to append operation - wait for eventInput and signal eventOutput
+
+    ze_event_ext_flags_desc_t eventExternalFlagDesc = {ZE_STRUCTURE_TYPE_EVENT_EXT_FLAGS_DESC, nullptr, ZE_EVENT_EXT_FLAG_APPEND_GRAPH_EXTERNAL};
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEventsWithParameters(replayCmdList, &eventExternalFlagDesc, 1, &eventInputUseFlags));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(replayCmdList, kernelAddConstant, &groupCount, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEventWithParameters(replayCmdList, &eventExternalFlagDesc, eventOutputUseFlags));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+
+    // perform input copy and signal eventInput - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, zeBuffer, inputBuffer, allocSize, eventInputUseFlags, 0, nullptr));
+
+    // create physical graph from the same virtual graph
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    // Dispatch physicalGraph
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+    // wait for event output and perform output copy and wait on eventSynchronization - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, outputBuffer, zeBuffer, allocSize, eventSynchronization, 1, &eventOutputUseFlags));
+
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after first execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // reset zeBuffer and outputBuffer for second execution
+    uint8_t resetValue = 0;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, zeBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+
+    // now perform input copy and signal eventInput - so it is attached as an wait event with new counter value
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, zeBuffer, inputBuffer, allocSize, eventInputUseFlags, 0, nullptr));
+
+    // graphs kernel wait for input event and signal output event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, outputBuffer, zeBuffer, allocSize, eventSynchronization, 1, &eventOutputUseFlags));
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        auto validRet2 = LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after second execution: " << (validRet2 ? "success" : "failure") << std::endl;
+        validRet &= validRet2;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__) + "_compute";
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputOutputCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventInputUseFlags));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventOutputUseFlags));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventSynchronization));
+    return validRet;
+}
+
+bool testForkJoinExternalFlagSignalHostSynchronize(ze_context_handle_t &context,
+                                                   ze_device_handle_t &device,
+                                                   bool aubMode,
+                                                   bool validateBetweenExecutions,
+                                                   const GraphDumpSettings &dumpSettings,
+                                                   uint32_t executionCount) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t expectedValue = initialValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t event = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &event, counterBasedDesc.signal, 0u);
+
+    ze_command_list_handle_t replayCmdList = nullptr, forkCmdList = nullptr, memoryCmdList = nullptr;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, forkCmdList);
+
+    if (aubMode == false && validateBetweenExecutions == true) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, memoryCmdList);
+    }
+
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    memset(outputBuffer, 0, allocSize);
+
+    ze_graph_handle_t virtualGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(replayCmdList, event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(forkCmdList, 1, &event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(forkCmdList, event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(replayCmdList, 1, &event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(replayCmdList, outputBuffer, inputBuffer, allocSize, nullptr, 0, nullptr));
+
+    ze_event_ext_flags_desc_t eventExternalFlagDesc = {ZE_STRUCTURE_TYPE_EVENT_EXT_FLAGS_DESC, nullptr, ZE_EVENT_EXT_FLAG_APPEND_GRAPH_EXTERNAL};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEventWithParameters(replayCmdList, &eventExternalFlagDesc, event));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+
+    // create physical graphs
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    for (uint32_t i = 0; i < executionCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+        // event synchronization when cb event is marked only with external flags
+        SUCCESS_OR_TERMINATE(zeEventHostSynchronize(event, std::numeric_limits<uint64_t>::max()));
+
+        // verify data
+        if (aubMode == false && validateBetweenExecutions == true) {
+            validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+            std::cerr << "Validation result after #" << i + 1 << " execution: " << (validRet ? "success" : "failure") << std::endl;
+
+            uint8_t resetValue = 0;
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(memoryCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+            SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(memoryCmdList, std::numeric_limits<uint64_t>::max()));
+        }
+    }
+
+    if (aubMode == false && validateBetweenExecutions == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after all executions " << executionCount << ": " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__);
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(forkCmdList));
+    if (memoryCmdList) {
+        SUCCESS_OR_TERMINATE(zeCommandListDestroy(memoryCmdList));
+    }
+    SUCCESS_OR_TERMINATE(zeEventDestroy(event));
+    return validRet;
+}
+
+bool testForkJoinExternalFlagWaitBeforeMemoryCopy(ze_context_handle_t &context,
+                                                  ze_device_handle_t &device,
+                                                  bool aubMode,
+                                                  bool validateBetweenExecutions,
+                                                  const GraphDumpSettings &dumpSettings,
+                                                  uint32_t executionCount) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t expectedValue = initialValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t event = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &event, counterBasedDesc.signal, 0u);
+
+    ze_command_list_handle_t replayCmdList = nullptr, forkCmdList = nullptr, memoryCmdList = nullptr;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, forkCmdList);
+
+    LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, memoryCmdList);
+
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    memset(outputBuffer, 0, allocSize);
+
+    ze_graph_handle_t virtualGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+    ze_event_ext_flags_desc_t eventExternalFlagDesc = {ZE_STRUCTURE_TYPE_EVENT_EXT_FLAGS_DESC, nullptr, ZE_EVENT_EXT_FLAG_APPEND_GRAPH_EXTERNAL};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEventsWithParameters(replayCmdList, &eventExternalFlagDesc, 1, &event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(replayCmdList, event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(forkCmdList, 1, &event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(forkCmdList, event));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEvents(replayCmdList, 1, &event));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+
+    // create physical graphs
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    for (uint32_t i = 0; i < executionCount; i++) {
+        SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(memoryCmdList, outputBuffer, inputBuffer, allocSize, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEvent(memoryCmdList, event));
+
+        SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+        SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+        // verify data
+        if (aubMode == false && validateBetweenExecutions == true) {
+            validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+            std::cerr << "Validation result after #" << i + 1 << " execution: " << (validRet ? "success" : "failure") << std::endl;
+
+            uint8_t resetValue = 0;
+            SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(memoryCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+            SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(memoryCmdList, std::numeric_limits<uint64_t>::max()));
+        }
+    }
+
+    if (aubMode == false && validateBetweenExecutions == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after all executions " << executionCount << ": " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(memoryCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__);
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(forkCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(memoryCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(event));
+    return validRet;
+}
+
+bool testExternalFlagCbEventsGraphs(ze_context_handle_t &context,
+                                    ze_device_handle_t &device,
+                                    TestKernelsContainer &testKernels,
+                                    bool aubMode,
+                                    const GraphDumpSettings &dumpSettings,
+                                    bool useCopyEngineForMemoryTransfers) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 3;
+    uint32_t mulValue = 5;
+
+    uint32_t expectedValue = initialValue * mulValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventInputUseFlags = nullptr, eventOutputUseFlags = nullptr, eventSynchronization = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    ze_event_counter_based_flags_t commonFlags = (ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE);
+    counterBasedDesc.flags = commonFlags | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+    counterBasedDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventSynchronization, counterBasedDesc.signal, 0u);
+
+    counterBasedDesc.signal = 0;
+    counterBasedDesc.flags = commonFlags;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventInputUseFlags, counterBasedDesc.signal, 0u);
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventOutputUseFlags, counterBasedDesc.signal, 0u);
+    ze_kernel_handle_t kernelMulConstant = testKernels["mul_constant_output"];
+
+    ze_command_list_handle_t replayCmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                           false, false, replayCmdList);
+
+    ze_command_list_handle_t inputOutputCmdList;
+    if (useCopyEngineForMemoryTransfers) {
+        LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, inputOutputCmdList);
+    } else {
+        LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+                                                               false, false, inputOutputCmdList);
+    }
+
+    void *zeBufferIn = nullptr;
+    void *zeBufferOut = nullptr;
+    void *inputBuffer = nullptr;
+    void *outputBuffer = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &inputBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(inputBuffer)[i] = initialValue;
+    }
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBufferIn));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBufferOut));
+    memset(outputBuffer, 0, allocSize);
+    memset(zeBufferIn, 0, allocSize);
+    memset(zeBufferOut, 0, allocSize);
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    ze_graph_handle_t virtualInputGraph = nullptr;
+    ze_graph_handle_t virtualOutputGraph = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualInputGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(inputOutputCmdList, virtualInputGraph, nullptr));
+
+    // perform input copy and signal eventInputUseFlags - so it is attached as an wait event
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, zeBufferIn, inputBuffer, allocSize, nullptr, 0, nullptr));
+
+    ze_event_ext_flags_desc_t eventExternalFlagDesc = {ZE_STRUCTURE_TYPE_EVENT_EXT_FLAGS_DESC, nullptr, ZE_EVENT_EXT_FLAG_APPEND_GRAPH_EXTERNAL};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEventWithParameters(inputOutputCmdList, &eventExternalFlagDesc, eventInputUseFlags));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(inputOutputCmdList, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(replayCmdList, virtualGraph, nullptr));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelMulConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulConstant, 0, sizeof(zeBufferIn), &zeBufferIn));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulConstant, 1, sizeof(zeBufferOut), &zeBufferOut));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelMulConstant, 2, sizeof(mulValue), &mulValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    // attach external event to append operation - wait for eventInputUseFlags and signal eventOutputUseFlags
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEventsWithParameters(replayCmdList, &eventExternalFlagDesc, 1, &eventInputUseFlags));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(replayCmdList, kernelMulConstant, &groupCount, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEventWithParameters(replayCmdList, &eventExternalFlagDesc, eventOutputUseFlags));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(replayCmdList, nullptr, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualOutputGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(inputOutputCmdList, virtualOutputGraph, nullptr));
+
+    // wait for event output and perform output copy and wait on eventSynchronization - so it is attached as an signal event and host synchronization can manage the wait
+    SUCCESS_OR_TERMINATE(zeCommandListAppendWaitOnEventsWithParameters(inputOutputCmdList, &eventExternalFlagDesc, 1, &eventOutputUseFlags));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(inputOutputCmdList, outputBuffer, zeBufferOut, allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendSignalEventWithParameters(inputOutputCmdList, &eventExternalFlagDesc, eventSynchronization));
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(inputOutputCmdList, nullptr, nullptr));
+
+    // create physical graphs
+    ze_executable_graph_handle_t physicalInputGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualInputGraph, nullptr, &physicalInputGraph));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    ze_executable_graph_handle_t physicalOutputGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualOutputGraph, nullptr, &physicalOutputGraph));
+
+    // Dispatch executable graphs
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(inputOutputCmdList, physicalInputGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(inputOutputCmdList, physicalOutputGraph, nullptr, nullptr, 0, nullptr));
+
+    // event synchronization when cb event is marked only with external flags
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after first execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // reset zeBuffer and outputBuffer for second execution
+    uint8_t resetValue = 0;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, zeBufferIn, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, zeBufferOut, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(inputOutputCmdList, outputBuffer, &resetValue, sizeof(resetValue), allocSize, nullptr, 0, nullptr));
+
+    // Dispatch executable graphs
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(inputOutputCmdList, physicalInputGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(replayCmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(inputOutputCmdList, physicalOutputGraph, nullptr, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeEventHostSynchronize(eventSynchronization, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        auto validRet2 = LevelZeroBlackBoxTests::validateToValue(expectedValue, outputBuffer, elemCount);
+        std::cerr << "Validation result after second execution: " << (validRet2 ? "success" : "failure") << std::endl;
+        validRet &= validRet2;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(inputOutputCmdList, std::numeric_limits<uint64_t>::max()));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(replayCmdList, std::numeric_limits<uint64_t>::max()));
+
+    std::string graphName = std::string(__func__) + "_compute";
+    dumpGraphToDotIfEnabled(virtualGraph, graphName, dumpSettings);
+
+    graphName = std::string(__func__) + "_copy_input";
+    dumpGraphToDotIfEnabled(virtualInputGraph, graphName, dumpSettings);
+
+    graphName = std::string(__func__) + "_copy_output";
+    dumpGraphToDotIfEnabled(virtualOutputGraph, graphName, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalInputGraph));
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalOutputGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualInputGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualOutputGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBufferIn));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBufferOut));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, outputBuffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, inputBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(replayCmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(inputOutputCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventInputUseFlags));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventOutputUseFlags));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventSynchronization));
+    return validRet;
+}
+
+bool testExternalGraphCbEventsAsWaitCopyOffload(ze_context_handle_t &context,
+                                                ze_device_handle_t &device,
+                                                TestKernelsContainer &testKernels,
+                                                bool aubMode,
+                                                const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t addValue = 5;
+
+    uint32_t expectedValue = initialValue + addValue;
+
+    ze_event_pool_handle_t eventPool = nullptr;
+    ze_event_handle_t eventCb = nullptr;
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL;
+    LevelZeroBlackBoxTests::createEventPoolAndEvents(context, device,
+                                                     eventPool, 0u,
+                                                     true, &counterBasedDesc,
+                                                     1, &eventCb, 0u, 0u);
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER | ZE_COMMAND_QUEUE_FLAG_COPY_OFFLOAD_HINT,
+                                                           false, false, cmdList);
+
+    ze_command_list_handle_t fillCmdList;
+    LevelZeroBlackBoxTests::createPreferredCopyEngineCmdList(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER, fillCmdList);
+
+    void *buffer = nullptr;
+    void *workingBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &workingBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(buffer)[i] = initialValue;
+    }
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+    // wait on an event that is external on a memory copy (that should be offloaded to copy engine)
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, workingBuffer, buffer, allocSize, nullptr, 1, &eventCb));
+
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(workingBuffer), &workingBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernelAddConstant, &groupCount, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+
+    // signal the eventCb to allow the memory copy to proceed
+    uint8_t zeroValue = 0;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(fillCmdList, workingBuffer, &zeroValue, sizeof(zeroValue), allocSize, eventCb, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, workingBuffer, elemCount);
+        std::cerr << "Validation after first execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    // reset the working buffer for second execution and signal cb event again
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(fillCmdList, workingBuffer, &zeroValue, sizeof(zeroValue), allocSize, eventCb, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        auto validRet2 = LevelZeroBlackBoxTests::validateToValue(expectedValue, workingBuffer, elemCount);
+        std::cerr << "Validation after second execution: " << (validRet2 ? "success" : "failure") << std::endl;
+        validRet &= validRet2;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, workingBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(fillCmdList));
+    SUCCESS_OR_TERMINATE(zeEventDestroy(eventCb));
+    return validRet;
+}
+
+bool testSimpleCopyOffload(ze_context_handle_t &context,
+                           ze_device_handle_t &device,
+                           TestKernelsContainer &testKernels,
+                           bool aubMode,
+                           const GraphDumpSettings &dumpSettings) {
+    bool validRet = true;
+
+    constexpr size_t allocSize = 4096;
+    constexpr size_t elemCount = allocSize / sizeof(uint32_t);
+
+    uint32_t initialValue = 1;
+    uint32_t addValue = 5;
+
+    uint32_t expectedValue = initialValue + addValue;
+
+    ze_kernel_handle_t kernelAddConstant = testKernels["add_constant"];
+
+    ze_command_list_handle_t cmdList;
+    LevelZeroBlackBoxTests::createImmediateCmdlistWithMode(context, device, ZE_COMMAND_QUEUE_FLAG_IN_ORDER | ZE_COMMAND_QUEUE_FLAG_COPY_OFFLOAD_HINT,
+                                                           false, false, cmdList);
+
+    void *buffer = nullptr;
+    void *workingBuffer = nullptr;
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &buffer));
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &workingBuffer));
+    for (size_t i = 0; i < elemCount; i++) {
+        reinterpret_cast<uint32_t *>(buffer)[i] = initialValue;
+    }
+
+    ze_graph_handle_t virtualGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphCreateExt(context, nullptr, &virtualGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListBeginCaptureIntoGraphExt(cmdList, virtualGraph, nullptr));
+
+    uint8_t zeroValue = 0;
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryFill(cmdList, workingBuffer, &zeroValue, sizeof(zeroValue), allocSize, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, workingBuffer, buffer, allocSize, nullptr, 0, nullptr));
+    uint32_t groupSizeX = 64;
+    uint32_t groupSizeY = 1u;
+    uint32_t groupSizeZ = 1u;
+    SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernelAddConstant, groupSizeX, groupSizeY, groupSizeZ));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 0, sizeof(workingBuffer), &workingBuffer));
+    SUCCESS_OR_TERMINATE(zeKernelSetArgumentValue(kernelAddConstant, 1, sizeof(addValue), &addValue));
+    ze_group_count_t groupCount = {static_cast<uint32_t>(elemCount / groupSizeX), 1, 1};
+    SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernelAddConstant, &groupCount, nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListEndGraphCaptureExt(cmdList, nullptr, nullptr));
+
+    ze_executable_graph_handle_t physicalGraph = nullptr;
+    SUCCESS_OR_TERMINATE(zeGraphInstantiateExt(virtualGraph, nullptr, &physicalGraph));
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        validRet &= LevelZeroBlackBoxTests::validateToValue(expectedValue, workingBuffer, elemCount);
+        std::cerr << "Validation after first execution: " << (validRet ? "success" : "failure") << std::endl;
+    }
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendGraphExt(cmdList, physicalGraph, nullptr, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    // verify data
+    if (aubMode == false) {
+        auto validRet2 = LevelZeroBlackBoxTests::validateToValue(expectedValue, workingBuffer, elemCount);
+        std::cerr << "Validation after second execution: " << (validRet2 ? "success" : "failure") << std::endl;
+        validRet &= validRet2;
+    }
+
+    // Final sync to ensure all operations are done
+    SUCCESS_OR_TERMINATE(zeCommandListHostSynchronize(cmdList, std::numeric_limits<uint64_t>::max()));
+
+    dumpGraphToDotIfEnabled(virtualGraph, __func__, dumpSettings);
+
+    SUCCESS_OR_TERMINATE(zeExecutableGraphDestroyExt(physicalGraph));
+    SUCCESS_OR_TERMINATE(zeGraphDestroyExt(virtualGraph));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, buffer));
+    SUCCESS_OR_TERMINATE(zeMemFree(context, workingBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    return validRet;
+}
+
+int main(int argc, char *argv[]) {
+    constexpr uint32_t bitNumberTestStandardMemoryCopy = 0u;
+    constexpr uint32_t bitNumberTestStandardMemoryCopyMultigraph = 1u;
+    constexpr uint32_t bitNumberTestAppendLaunchKernel = 2u;
+    constexpr uint32_t bitNumberTestAppendLaunchKernelIndirect = 3u;
+    constexpr uint32_t bitNumberTestAppendLaunchMultipleKernelsIndirect = 4u;
+    constexpr uint32_t bitNumberTestMultipleExecution = 5u;
+    constexpr uint32_t bitNumberTestExternalCbEvents = 6u;
+    constexpr uint32_t bitNumberTestMultiLevelGraph = 7u;
+    constexpr uint32_t bitNumberTestMultiJoinGraph = 8u;
+    constexpr uint32_t bitNumberTestMultiExecForkedGraph = 9u;
+    constexpr uint32_t bitNumberTestWrappedMultipleEngines = 10u;
+    constexpr uint32_t bitNumberTestCopyEngineSimpleGraph = 11u;
+    constexpr uint32_t bitNumberTestVisitGraph = 12u;
+    constexpr uint32_t bitNumberTestPauseResume = 13u;
+    constexpr uint32_t bitNumberTestTransitiveForkJoins = 14u;
+    constexpr uint32_t bitNumberTestExternalFlagEvents = 15u;
+    constexpr uint32_t bitNumberTestDestroyNonExternalCbEventsBeforeCaptureEnd = 16u;
+    constexpr uint32_t bitNumberTestExternalCbEventsOnCopyOffload = 17u;
+    constexpr uint32_t bitNumberTestEventTransition = 18u;
+
+    LevelZeroBlackBoxTests::TestDuration testDuration = LevelZeroBlackBoxTests::TestDuration(argc, argv);
+
+    constexpr uint32_t defaultTestMask = std::numeric_limits<uint32_t>::max();
+    LevelZeroBlackBoxTests::TestBitMask testMask = LevelZeroBlackBoxTests::getTestMask(argc, argv, defaultTestMask);
+    LevelZeroBlackBoxTests::TestBitMask testSubMask = LevelZeroBlackBoxTests::getTestSubmask(argc, argv, std::numeric_limits<uint32_t>::max());
+
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
+    bool dumpGraph = LevelZeroBlackBoxTests::isParamEnabled(argc, argv, "-d", "--dump_graph");
+    auto graphMode = static_cast<ze_record_replay_graph_ext_dump_mode_t>(LevelZeroBlackBoxTests::getParamValue(argc, argv, "-sm", "--dump_graph_mode", 0U));
+    GraphDumpSettings graphDumpSettings = {.dump = dumpGraph, .mode = graphMode};
+
+    constexpr uint32_t defaultUseCopyEngineForMemoryTransfers = 1;
+    bool useCopyEngineForMemoryTransfers = LevelZeroBlackBoxTests::getParamValue(argc, argv, "", "--use_copy_engine", defaultUseCopyEngineForMemoryTransfers) != 0;
+    auto getCaseNameExternalWaitEvents = [](std::string &testTitle, bool useCopyEngine) -> std::string {
+        std::ostringstream caseName;
+        caseName << testTitle << std::endl;
+        caseName << "Copy engine selected for memory transfers: " << (useCopyEngine ? "yes" : "no") << std::endl;
+        return caseName.str();
+    };
+
+    uint32_t executionCount = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-ec", "--execution_count", 3u);
+    bool validateBetweenExecutions = !!(LevelZeroBlackBoxTests::getParamValue(argc, argv, "-val", "--validate_between_executions", 1u));
+
+    const std::string blackBoxName("Zello Graph");
+
+    ze_context_handle_t context = nullptr;
+    ze_driver_handle_t driverHandle = nullptr;
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context, driverHandle);
+
+    auto device0 = devices[0];
+    ze_record_replay_graph_ext_properties_t graphProperties = {ZE_STRUCTURE_TYPE_RECORD_REPLAY_GRAPH_EXT_PROPERTIES};
+    ze_device_properties_t device0Properties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+    device0Properties.pNext = &graphProperties;
+    SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device0, &device0Properties));
+    LevelZeroBlackBoxTests::printDeviceProperties(device0Properties);
+
+    std::vector<ze_driver_extension_properties_t> extensionVector;
+    ze_driver_extension_properties_t graphExtension{};
+    std::string graphExtensionString = ZE_RECORD_REPLAY_GRAPH_EXT_NAME;
+    std::snprintf(graphExtension.name, sizeof(graphExtension.name), "%s", graphExtensionString.c_str());
+    graphExtension.version = ZE_RECORD_REPLAY_GRAPH_EXT_VERSION_1_0;
+    extensionVector.push_back(graphExtension);
+    bool graphExtensionPresent = LevelZeroBlackBoxTests::checkExtensionIsPresent(driverHandle, extensionVector);
+    if (!graphExtensionPresent) {
+        std::cerr << "Graph extension not present" << std::endl;
+        return 1;
+    }
+    if (false == !!(graphProperties.graphFlags & ZE_RECORD_REPLAY_GRAPH_EXT_FLAG_IMMUTABLE_GRAPH)) {
+        std::cerr << "Device not supporting graph" << std::endl;
+        return 1;
+    }
+
+    TestKernelsContainer kernelsMap;
+
+    ze_module_handle_t moduleTestKernels;
+    LevelZeroBlackBoxTests::createModuleFromSpirV(context, device0, LevelZeroBlackBoxTests::openCLKernelsSource, moduleTestKernels);
+    LevelZeroBlackBoxTests::createKernelWithName(moduleTestKernels, "add_constant", kernelsMap["add_constant"]);
+    LevelZeroBlackBoxTests::createKernelWithName(moduleTestKernels, "memcpy_bytes", kernelsMap["memcpy_bytes"]);
+    LevelZeroBlackBoxTests::createKernelWithName(moduleTestKernels, "add_constant_output", kernelsMap["add_constant_output"]);
+    LevelZeroBlackBoxTests::createKernelWithName(moduleTestKernels, "mul_constant_output", kernelsMap["mul_constant_output"]);
+    LevelZeroBlackBoxTests::createKernelWithName(moduleTestKernels, "increment_dword_by_one", kernelsMap["increment_dword_by_one"]);
+    LevelZeroBlackBoxTests::createKernelWithName(moduleTestKernels, "add_two_src_buffer", kernelsMap["add_two_src_buffer"]);
+
+    bool boxPass = true;
+    bool casePass = true;
+    std::string currentTest;
+    if (testMask.test(bitNumberTestStandardMemoryCopy)) {
+        currentTest = "Standard Memory Copy";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testAppendMemoryCopy(context, device0, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestStandardMemoryCopy, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestStandardMemoryCopyMultigraph)) {
+        if (testSubMask.test(0)) {
+            currentTest = "Standard Memory Copy - multigraph";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testMultiGraph(context, device0, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestStandardMemoryCopyMultigraph, 0);
+        }
+
+        if (testSubMask.test(1)) {
+            currentTest = "Standard Memory Copy - multigraph post-join trailing synchronization";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testMultiGraphPostJoinTrailingSync(context, device0, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestStandardMemoryCopyMultigraph, 1);
+        }
+    }
+
+    if (testMask.test(bitNumberTestAppendLaunchKernel)) {
+        currentTest = "AppendLaunchKernel";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testAppendLaunchKernel(context, device0, kernelsMap, false, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestAppendLaunchKernel, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestAppendLaunchKernelIndirect)) {
+        currentTest = "AppendLaunchKernelIndirect";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testAppendLaunchKernel(context, device0, kernelsMap, true, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestAppendLaunchKernelIndirect, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestAppendLaunchMultipleKernelsIndirect)) {
+        currentTest = "AppendLaunchMultipleKernelsIndirect";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testAppendLaunchMultipleKernelsIndirect(context, device0, kernelsMap, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestAppendLaunchMultipleKernelsIndirect, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestMultipleExecution)) {
+        currentTest = "Multiple Graph Execution";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testMultipleGraphExecution(context, device0, kernelsMap, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestMultipleExecution, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestExternalCbEvents)) {
+        if (testSubMask.test(0)) {
+            currentTest = "External Graph CB Events";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalGraphCbEvents(context, device0, kernelsMap, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 0);
+        }
+        if (testSubMask.test(1)) {
+            std::string testTitle = "External Graph CB Events multiple execution";
+            auto getCaseName = [&testTitle](uint32_t executionCount) -> std::string {
+                std::ostringstream caseName;
+                caseName << testTitle;
+                caseName << " count: " << executionCount;
+                return caseName.str();
+            };
+
+            currentTest = getCaseName(executionCount);
+
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalGraphCbEventsMultiExecution(context, device0, kernelsMap, executionCount, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 1);
+        }
+        if (testSubMask.test(2)) {
+            std::string testTitle = "External Wait CB Events using immediate for input/output";
+            currentTest = getCaseNameExternalWaitEvents(testTitle, useCopyEngineForMemoryTransfers);
+
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsImmediate(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 2);
+        }
+        if (testSubMask.test(3)) {
+            std::string testTitle = "External Wait CB Events using graphs for input/output";
+            currentTest = getCaseNameExternalWaitEvents(testTitle, useCopyEngineForMemoryTransfers);
+
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsGraphs(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers, executionCount, false);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 3);
+        }
+        if (testSubMask.test(4)) {
+            std::string testTitle = "External Wait CB Events with device timestamp signaled before graph capture using graphs for input/output";
+            std::ostringstream caseName;
+            caseName << testTitle << std::endl;
+            caseName << "Execution count: " << executionCount << std::endl;
+            caseName << "Copy engine selected for memory transfers: " << (useCopyEngineForMemoryTransfers ? "yes" : "no");
+            currentTest = caseName.str();
+
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsGraphs(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers, executionCount, true);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 4);
+        }
+
+        std::string testTitleExternalWaitEventsImmediate = "Appended External Wait CB Events on Immediate signaled after graph creation";
+        auto getCaseNameExternalWaitEventsImmediate = [&testTitleExternalWaitEventsImmediate](bool useCopyEngine, uint32_t executionCount, bool useTsEvents, bool primeWaitEvent) -> std::string {
+            std::ostringstream caseName;
+            caseName << testTitleExternalWaitEventsImmediate << std::endl;
+            caseName << "Execution count: " << executionCount << std::endl;
+            caseName << "Copy engine selected for memory transfers: " << (useCopyEngine ? "yes" : "no") << std::endl;
+            caseName << "Use device timestamp events: " << (useTsEvents ? "yes" : "no") << std::endl;
+            caseName << "Prime wait event: " << (primeWaitEvent ? "yes" : "no");
+            return caseName.str();
+        };
+
+        constexpr bool usePrimeFalse = false;
+        constexpr bool usePrimeTrue = true;
+        constexpr bool useDeviceTimestampFalse = false;
+        constexpr bool useDeviceTimestampTrue = true;
+        if (testSubMask.test(5)) {
+            currentTest = getCaseNameExternalWaitEventsImmediate(useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampFalse, usePrimeFalse);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsImmediate(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampFalse, usePrimeFalse);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 5);
+        }
+        if (testSubMask.test(6)) {
+            currentTest = getCaseNameExternalWaitEventsImmediate(useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampFalse, usePrimeTrue);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsImmediate(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampFalse, usePrimeTrue);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 6);
+        }
+        if (testSubMask.test(7)) {
+            currentTest = getCaseNameExternalWaitEventsImmediate(useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampTrue, usePrimeFalse);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsImmediate(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampTrue, usePrimeFalse);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 7);
+        }
+        if (testSubMask.test(8)) {
+            currentTest = getCaseNameExternalWaitEventsImmediate(useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampTrue, usePrimeTrue);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalWaitCbEventsImmediate(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers, executionCount, useDeviceTimestampTrue, usePrimeTrue);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEvents, 8);
+        }
+    }
+
+    if (testMask.test(bitNumberTestMultiLevelGraph)) {
+        auto testTitle = "Multiple Level Graph";
+        auto getCaseName = [&testTitle](bool immediate) -> std::string {
+            std::ostringstream caseName;
+            caseName << testTitle;
+            caseName << " immediate execution: " << std::boolalpha << immediate;
+            caseName << ".";
+            return caseName.str();
+        };
+        bool immediate = LevelZeroBlackBoxTests::isParamEnabled(argc, argv, "-i", "--immediate");
+        currentTest = getCaseName(immediate);
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testMultipleLevelGraph(nullptr, context, device0, kernelsMap, aubMode, graphDumpSettings, immediate, false);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestMultiLevelGraph, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestMultiJoinGraph)) {
+        auto testTitle = "Multiple Fork Joins Graph";
+        auto getCaseName = [&testTitle](bool reuse) -> std::string {
+            std::ostringstream caseName;
+            caseName << testTitle;
+            caseName << " reuse single cb event: " << std::boolalpha << reuse;
+            caseName << ".";
+            return caseName.str();
+        };
+
+        std::vector<bool> reuseValues = {true, false};
+        size_t reuseValuesSize = reuseValues.size();
+
+        constexpr uint32_t defaultReuseSetting = 2u;
+        uint32_t reuseSetting = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-r", "--reuse", defaultReuseSetting);
+        if (reuseSetting < 2) {
+            reuseValues[0] = !!reuseSetting;
+            reuseValuesSize = 1;
+        }
+
+        if (testSubMask.test(0)) {
+            for (size_t i = 0; i < reuseValuesSize; i++) {
+                bool reuse = reuseValues[i];
+                currentTest = getCaseName(reuse);
+                LevelZeroBlackBoxTests::printTestHeader(currentTest);
+                casePass = testMultipleForkJoinsGraph(context, device0, kernelsMap, aubMode, graphDumpSettings, reuse);
+                LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+                boxPass &= casePass;
+                LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestMultiJoinGraph, 0);
+            }
+        }
+        if (testSubMask.test(1)) {
+            uint32_t forkCount = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-fc", "--fork_count", 3u);
+            std::ostringstream caseName;
+            caseName << "Single Fork Multiple Joins Graph fork count: " << forkCount << " execution count: " << executionCount << ".";
+            currentTest = caseName.str();
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testSingleForkMultipleJoinsGraph(context, device0, kernelsMap, aubMode, graphDumpSettings, forkCount, executionCount, validateBetweenExecutions);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestMultiJoinGraph, 1);
+        }
+    }
+
+    if (testMask.test(bitNumberTestMultiExecForkedGraph)) {
+        auto testTitle = "Forked Graph Multiple Execution";
+        auto getCaseName = [&testTitle](uint32_t executionCount) -> std::string {
+            std::ostringstream caseName;
+            caseName << testTitle;
+            caseName << " count: " << executionCount;
+            caseName << " Event Synchronization.";
+            return caseName.str();
+        };
+
+        currentTest = getCaseName(executionCount);
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testForkedGraphMultipleExecutionEventSync(context, device0, kernelsMap, aubMode, graphDumpSettings, executionCount);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestMultiExecForkedGraph, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestWrappedMultipleEngines)) {
+        uint32_t engineCount = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-engc", "--engine_count", 60u);
+        bool useInOrder = !!(LevelZeroBlackBoxTests::getParamValue(argc, argv, "-o", "--in_order", 0u));
+
+        if (testSubMask.test(0)) {
+            uint32_t pairCount = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-p", "--pair_count", 3u);
+            auto forkPolicy = static_cast<TestWrappedMultipleEnginesForkPolicy>(
+                LevelZeroBlackBoxTests::getParamValue(argc, argv, "-f", "--fork_policy", TestWrappedMultipleEnginesForkPolicy::max));
+
+            auto testTitle = "Wrapped Multiple Engines";
+            auto getCaseName = [&testTitle](uint32_t engineCount, uint32_t pairCount, TestWrappedMultipleEnginesForkPolicy forkPolicy, bool useInOrder) -> std::string {
+                std::ostringstream caseName;
+                caseName << testTitle << std::endl;
+                caseName << "engine count: " << engineCount << " pair count: " << pairCount;
+                caseName << " forkPolicy: " << forkPolicy;
+                caseName << " useInOrder: " << useInOrder;
+                return caseName.str();
+            };
+
+            std::vector<TestWrappedMultipleEnginesForkPolicy> forkPolicyValues = {TestWrappedMultipleEnginesForkPolicy::pairEnginesFirst, TestWrappedMultipleEnginesForkPolicy::sequence};
+            size_t forkPolicyValuesSize = forkPolicyValues.size();
+
+            if (forkPolicy < TestWrappedMultipleEnginesForkPolicy::max) {
+                forkPolicyValues[0] = forkPolicy;
+                forkPolicyValuesSize = 1;
+            }
+
+            for (size_t i = 0; i < forkPolicyValuesSize; i++) {
+                auto currentForkPolicy = forkPolicyValues[i];
+                currentTest = getCaseName(engineCount, pairCount, currentForkPolicy, useInOrder);
+                LevelZeroBlackBoxTests::printTestHeader(currentTest);
+                casePass = testWrappedMultipleEngines(context, device0, kernelsMap, aubMode, graphDumpSettings, engineCount, pairCount, currentForkPolicy, useInOrder);
+                LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+                boxPass &= casePass;
+                LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestWrappedMultipleEngines, 0);
+            }
+        }
+        if (testSubMask.test(1)) {
+            auto testTitle = "Single Wrapped Engine Deep Fork";
+            auto getCaseName = [&testTitle](uint32_t engineCount, bool useInOrder) -> std::string {
+                std::ostringstream caseName;
+                caseName << testTitle;
+                caseName << " engine count: " << engineCount;
+                caseName << " useInOrder: " << useInOrder;
+                return caseName.str();
+            };
+
+            currentTest = getCaseName(engineCount, useInOrder);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testSingleWrappedEngineDeepFork(context, device0, kernelsMap, aubMode, graphDumpSettings, engineCount, useInOrder);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestWrappedMultipleEngines, 1);
+        }
+    }
+
+    if (testMask.test(bitNumberTestCopyEngineSimpleGraph)) {
+        currentTest = "Copy Engine Simple Graph";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testCopyEngineSimpleGraph(context, device0, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestCopyEngineSimpleGraph, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestVisitGraph)) {
+        currentTest = "Visit Graph";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        auto &visitApi = LevelZeroBlackBoxTests::VisitExtension::loadVisitApi(driverHandle);
+        if (!visitApi.valid()) {
+            std::cout << "Visit extension API is not available, skipping test" << std::endl;
+        } else {
+            casePass = testMultipleLevelGraph(&visitApi, context, device0, kernelsMap, aubMode, graphDumpSettings, false, true);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestVisitGraph, LevelZeroBlackBoxTests::undefinedTestNumber);
+        }
+    }
+
+    if (testMask.test(bitNumberTestPauseResume)) {
+        currentTest = "Pause Resume Graph Capture";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testPauseResumeCapture(context, device0, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestPauseResume, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestTransitiveForkJoins)) {
+        if (testSubMask.test(0)) {
+            currentTest = "Transitive Fork Joins Graph";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testTransitiveForkJoinsGraph(context, device0, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestTransitiveForkJoins, 0);
+        }
+
+        if (testSubMask.test(1)) {
+            currentTest = "Transitive Fork Joins Graph - unjoined chain (negative)";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testTransitiveForkJoinsGraphNegative(context, device0, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestTransitiveForkJoins, 1);
+        }
+    }
+
+    if (testMask.test(bitNumberTestExternalFlagEvents)) {
+        if (testSubMask.test(0)) {
+            std::string testTitle = "External Flag CB Events using immediate for input/output";
+            currentTest = getCaseNameExternalWaitEvents(testTitle, useCopyEngineForMemoryTransfers);
+
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalFlagCbEventsImmediate(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalFlagEvents, 0);
+        }
+        if (testSubMask.test(1)) {
+            std::string testTitle = "External Flag CB Events using graphs for input/output";
+            currentTest = getCaseNameExternalWaitEvents(testTitle, useCopyEngineForMemoryTransfers);
+
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalFlagCbEventsGraphs(context, device0, kernelsMap, aubMode, graphDumpSettings, useCopyEngineForMemoryTransfers);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalFlagEvents, 1);
+        }
+        auto getCaseNameForkJoinExternalFlag = [](std::string &testTitle, uint32_t executionCount, bool validateBetweenExecutions) -> std::string {
+            std::ostringstream caseName;
+            caseName << testTitle << std::endl;
+            caseName << "Execution count: " << executionCount << " validate between executions: " << (validateBetweenExecutions ? "yes" : "no") << std::endl;
+            return caseName.str();
+        };
+        if (testSubMask.test(2)) {
+            std::string testTitle = "Fork/Join External Flag Signal - Host Synchronize";
+            currentTest = getCaseNameForkJoinExternalFlag(testTitle, executionCount, validateBetweenExecutions);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testForkJoinExternalFlagSignalHostSynchronize(context, device0, aubMode, validateBetweenExecutions, graphDumpSettings, executionCount);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalFlagEvents, 2);
+        }
+        if (testSubMask.test(3)) {
+            std::string testTitle = "Fork/Join External Flag Wait - Before Memory Copy";
+            currentTest = getCaseNameForkJoinExternalFlag(testTitle, executionCount, validateBetweenExecutions);
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testForkJoinExternalFlagWaitBeforeMemoryCopy(context, device0, aubMode, validateBetweenExecutions, graphDumpSettings, executionCount);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalFlagEvents, 3);
+        }
+    }
+
+    if (testMask.test(bitNumberTestDestroyNonExternalCbEventsBeforeCaptureEnd)) {
+        currentTest = "Destroy Non-External CB Events Before Capture End";
+        LevelZeroBlackBoxTests::printTestHeader(currentTest);
+        casePass = testDestroyNonExternalCbEventsBeforeCaptureEnd(context, device0, aubMode, graphDumpSettings);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+        boxPass &= casePass;
+        LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestDestroyNonExternalCbEventsBeforeCaptureEnd, LevelZeroBlackBoxTests::undefinedTestNumber);
+    }
+
+    if (testMask.test(bitNumberTestExternalCbEventsOnCopyOffload)) {
+        if (testSubMask.test(0)) {
+            currentTest = "External CB Event as a Wait Event On Copy Offload";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testExternalGraphCbEventsAsWaitCopyOffload(context, device0, kernelsMap, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEventsOnCopyOffload, 0);
+        }
+        if (testSubMask.test(1)) {
+            currentTest = "Simple Copy Offload";
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testSimpleCopyOffload(context, device0, kernelsMap, aubMode, graphDumpSettings);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestExternalCbEventsOnCopyOffload, 1);
+        }
+    }
+
+    if (testMask.test(bitNumberTestEventTransition)) {
+        uint32_t transitionCycles = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-tc", "--transition_cycles", 16u);
+        if (testSubMask.test(0)) {
+            std::ostringstream caseName;
+            caseName << "Event Transition Graph/Eager - fork, eager signal, join cycles: " << transitionCycles << " execution count: " << executionCount;
+            currentTest = caseName.str();
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testEventTransitionBetweenGraphAndEager(context, device0, kernelsMap, aubMode, graphDumpSettings, transitionCycles, executionCount);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestEventTransition, 0);
+        }
+        if (testSubMask.test(1)) {
+            std::ostringstream caseName;
+            caseName << "Event Transition Graph/Eager - between active captures, execution count: " << executionCount;
+            currentTest = caseName.str();
+            LevelZeroBlackBoxTests::printTestHeader(currentTest);
+            casePass = testEventTransitionBetweenCaptures(context, device0, aubMode, graphDumpSettings, executionCount);
+            LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, currentTest);
+            boxPass &= casePass;
+            LevelZeroBlackBoxTests::addFailedCase(casePass, currentTest, bitNumberTestEventTransition, 1);
+        }
+    }
+
+    for (auto kernel : kernelsMap) {
+        SUCCESS_OR_TERMINATE(zeKernelDestroy(kernel.second));
+    }
+    SUCCESS_OR_TERMINATE(zeModuleDestroy(moduleTestKernels));
+
+    int mainRetCode = LevelZeroBlackBoxTests::printTestResult(boxPass, aubMode, blackBoxName);
+    LevelZeroBlackBoxTests::printFailedCases();
+    return mainRetCode;
+}

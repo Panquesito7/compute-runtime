@@ -1,0 +1,195 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/release_helpers/caps/caps_xe_hpc.h"
+
+#include "gtest/gtest.h"
+
+#include <cstdint>
+#include <optional>
+
+using namespace NEO;
+
+namespace {
+HardwareIpVersion withUnsupportedRevision(uint32_t ipVersionValue) {
+    HardwareIpVersion ipVersion{ipVersionValue};
+    ipVersion.revision = 0x3f;
+    return ipVersion;
+}
+} // namespace
+
+TEST(CapsXeHpcTest, givenPvcIpVersionWhenResolvingCapsThenReleaseCapsAreReturned) {
+    EXPECT_EQ(materializeCaps<CapsPvc>(), resolveCapsPvc(AOT::PVC_XL_A0));
+    EXPECT_EQ(materializeCaps<CapsPvc>(), resolveCapsPvc(AOT::PVC_XL_A0P));
+    EXPECT_EQ(materializeCaps<CapsPvc>(), resolveCapsPvc(AOT::PVC_XT_A0));
+    EXPECT_EQ(materializeCaps<CapsPvc>(), resolveCapsPvc(AOT::PVC_XT_B0));
+    EXPECT_EQ(materializeCaps<CapsPvc>(), resolveCapsPvc(AOT::PVC_XT_B1));
+    EXPECT_EQ(materializeCaps<CapsPvc>(), resolveCapsPvc(AOT::PVC_XT_C0));
+    EXPECT_EQ(std::nullopt, resolveCapsPvc(withUnsupportedRevision(AOT::PVC_XL_A0)));
+}
+
+TEST(CapsXeHpcTest, givenPvcVgIpVersionWhenResolvingCapsThenReleaseCapsAreReturned) {
+    EXPECT_EQ(materializeCaps<CapsPvcVg>(), resolveCapsPvcVg(AOT::PVC_XT_C0_VG));
+    EXPECT_EQ(std::nullopt, resolveCapsPvcVg(withUnsupportedRevision(AOT::PVC_XT_C0_VG)));
+}
+
+TEST(CapsXeHpcTest, givenPvcReleaseWhenMaterializingCapsThenCapabilitiesAreCorrect) {
+    constexpr auto capsPvc = materializeCaps<CapsPvc>();
+
+    EXPECT_EQ(0u, capsPvc.blockScaledSystolicDotProductInputTypes);
+    EXPECT_EQ(0u, capsPvc.blockScaledSystolicDotProductOutputTypes);
+    EXPECT_EQ(64u, capsPvc.cacheLineSize);
+    EXPECT_EQ(2u, capsPvc.commandBuffersPreallocatedPerCommandQueue);
+    EXPECT_EQ(0u, capsPvc.defaultMidthreadPreemptionDelayTimer);
+    EXPECT_EQ(ThreadArbitrationPolicy::RoundRobinAfterDependency, capsPvc.defaultThreadArbitrationPolicy);
+    EXPECT_EQ(0u, capsPvc.implicitArgsVersion);
+    EXPECT_EQ(0u, capsPvc.kernelBFloat16AtomicCapabilities);
+    EXPECT_EQ(FpAtomicExtFlags::minMaxAtomicCaps | FpAtomicExtFlags::loadStoreAtomicCaps, capsPvc.kernelFp16AtomicCapabilities);
+    EXPECT_EQ(0u, capsPvc.maxNumSamplers);
+    EXPECT_EQ(16u, capsPvc.minimalSimdSize);
+    EXPECT_EQ(toUnderlying(CacheRegion::region3), capsPvc.numCacheRegions);
+    EXPECT_EQ(16128u, capsPvc.planarYuvMaxHeight);
+    EXPECT_EQ(0u, capsPvc.preferredSlmThreadGroupHeadroom);
+    EXPECT_EQ(0u, capsPvc.preferredWorkgroupCountPerSubslice);
+    EXPECT_EQ(1u, capsPvc.rtasFormat);
+    EXPECT_EQ(1u, capsPvc.shareMemoryWithoutNTHandle);
+    EXPECT_EQ(0u, capsPvc.stackSizePerRay);
+    EXPECT_EQ(DotProductInputTypeFlags::int8Pack4 | DotProductInputTypeFlags::int4Pack8 | DotProductInputTypeFlags::int2Pack8 | DotProductInputTypeFlags::fp16Pack2 | DotProductInputTypeFlags::bf16Pack2, capsPvc.systolicDotProductInputTypes);
+    EXPECT_EQ(DotProductOutputTypeFlags::int32 | DotProductOutputTypeFlags::fp32 | DotProductOutputTypeFlags::fp16 | DotProductOutputTypeFlags::bf16, capsPvc.systolicDotProductOutputTypes);
+    EXPECT_EQ(16u, capsPvc.systolicDotProductSimdLaneCount);
+    EXPECT_EQ(16384u, capsPvc.max3dImageWidthOrHeight);
+    EXPECT_EQ(MemoryConstants::pageSize64k, capsPvc.svmCpuAlignment);
+    EXPECT_FALSE(capsPvc.adjustWalkOrderAvailable);
+    EXPECT_FALSE(capsPvc.auxSurfaceModeOverrideRequired);
+    EXPECT_FALSE(capsPvc.availableSemaphore64);
+    EXPECT_TRUE(capsPvc.bFloat16ConversionSupported);
+    EXPECT_TRUE(capsPvc.bindlessAddressingDisabled);
+    EXPECT_FALSE(capsPvc.blitImageAllowedForDepthFormat);
+    EXPECT_TRUE(capsPvc.block2DLoadSupported);
+    EXPECT_TRUE(capsPvc.block2DStoreSupported);
+    EXPECT_FALSE(capsPvc.bufferPoolAllocatorSupported);
+    EXPECT_FALSE(capsPvc.cacheFlushPriorToImageReadRequired);
+    EXPECT_FALSE(capsPvc.deviceConfigStringTileCountIncluded);
+    EXPECT_FALSE(capsPvc.deviceConfigStringXeCuSegmentIncluded);
+    EXPECT_FALSE(capsPvc.directSubmissionLightSupported);
+    EXPECT_TRUE(capsPvc.dotProductAccumulateSystolicSupported);
+    EXPECT_TRUE(capsPvc.dummyBlitWaRequired);
+    EXPECT_TRUE(capsPvc.exposingSubdevicesAllowed);
+    EXPECT_FALSE(capsPvc.forceEmuInt32DivRemSPRequired);
+    EXPECT_FALSE(capsPvc.ftrXe2Compression);
+    EXPECT_FALSE(capsPvc.globalBindlessAllocatorEnabled);
+    EXPECT_FALSE(capsPvc.grfLimitedPreferredSlmSizeEnabled);
+    EXPECT_FALSE(capsPvc.hvAlign4Required);
+    EXPECT_TRUE(capsPvc.initBuiltinAsyncSupported);
+    EXPECT_TRUE(capsPvc.initDeviceWithFirstSubmissionRequired);
+    EXPECT_FALSE(capsPvc.latePreemptionStartSupported);
+    EXPECT_TRUE(capsPvc.localOnlyAllowed);
+    EXPECT_FALSE(capsPvc.memSetExtendedPayloadSupported);
+    EXPECT_FALSE(capsPvc.misalignedUserPtr2WayCoherent);
+    EXPECT_FALSE(capsPvc.newCoherencyModelSupported);
+    EXPECT_TRUE(capsPvc.newResidencyModelSupported);
+    EXPECT_TRUE(capsPvc.numRtStacksPerDssFixedValue);
+    EXPECT_FALSE(capsPvc.overrideGfxPartitionLayoutForWsl);
+    EXPECT_FALSE(capsPvc.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired);
+    EXPECT_FALSE(capsPvc.pipeControlPriorToPipelineSelectWaRequired);
+    EXPECT_FALSE(capsPvc.postImageWriteFlushRequired);
+    EXPECT_FALSE(capsPvc.preImageReadFlushRequired);
+    EXPECT_FALSE(capsPvc.programAdditionalStallPriorToBarrierWithTimestamp);
+    EXPECT_FALSE(capsPvc.programAllStateComputeCommandFieldsWARequired);
+    EXPECT_FALSE(capsPvc.queryPeerAccess);
+    EXPECT_TRUE(capsPvc.rayTracingSupported);
+    EXPECT_FALSE(capsPvc.rayTracingWalkerAdjustmentRequired);
+    EXPECT_TRUE(capsPvc.rcsExposureDisabled);
+    EXPECT_TRUE(capsPvc.readOnlyAllocationsSupported);
+    EXPECT_FALSE(capsPvc.reducedSurfaceStateSupported);
+    EXPECT_TRUE(capsPvc.scratchSpaceBasePointerInGrf);
+    EXPECT_FALSE(capsPvc.sharedUsmAllocationReuseSupported);
+    EXPECT_FALSE(capsPvc.sharingWith3dOrMediaAllowed);
+    EXPECT_FALSE(capsPvc.singleDispatchRequiredForMultiCCS);
+    EXPECT_FALSE(capsPvc.splitMatrixMultiplyAccumulateSupported);
+    EXPECT_FALSE(capsPvc.storageInfoAdjustmentRequired);
+    EXPECT_FALSE(capsPvc.useLocalPreferredForCacheableBuffers);
+}
+
+TEST(CapsXeHpcTest, givenPvcVgReleaseWhenMaterializingCapsThenCapabilitiesAreCorrect) {
+    constexpr auto capsPvcVg = materializeCaps<CapsPvcVg>();
+
+    EXPECT_EQ(0u, capsPvcVg.blockScaledSystolicDotProductInputTypes);
+    EXPECT_EQ(0u, capsPvcVg.blockScaledSystolicDotProductOutputTypes);
+    EXPECT_EQ(64u, capsPvcVg.cacheLineSize);
+    EXPECT_EQ(2u, capsPvcVg.commandBuffersPreallocatedPerCommandQueue);
+    EXPECT_EQ(0u, capsPvcVg.defaultMidthreadPreemptionDelayTimer);
+    EXPECT_EQ(ThreadArbitrationPolicy::RoundRobinAfterDependency, capsPvcVg.defaultThreadArbitrationPolicy);
+    EXPECT_EQ(0u, capsPvcVg.implicitArgsVersion);
+    EXPECT_EQ(0u, capsPvcVg.kernelBFloat16AtomicCapabilities);
+    EXPECT_EQ(FpAtomicExtFlags::minMaxAtomicCaps | FpAtomicExtFlags::loadStoreAtomicCaps, capsPvcVg.kernelFp16AtomicCapabilities);
+    EXPECT_EQ(0u, capsPvcVg.maxNumSamplers);
+    EXPECT_EQ(16u, capsPvcVg.minimalSimdSize);
+    EXPECT_EQ(toUnderlying(CacheRegion::region3), capsPvcVg.numCacheRegions);
+    EXPECT_EQ(16128u, capsPvcVg.planarYuvMaxHeight);
+    EXPECT_EQ(0u, capsPvcVg.preferredSlmThreadGroupHeadroom);
+    EXPECT_EQ(0u, capsPvcVg.preferredWorkgroupCountPerSubslice);
+    EXPECT_EQ(1u, capsPvcVg.rtasFormat);
+    EXPECT_EQ(1u, capsPvcVg.shareMemoryWithoutNTHandle);
+    EXPECT_EQ(0u, capsPvcVg.stackSizePerRay);
+    EXPECT_EQ(0u, capsPvcVg.systolicDotProductInputTypes);
+    EXPECT_EQ(0u, capsPvcVg.systolicDotProductOutputTypes);
+    EXPECT_EQ(0u, capsPvcVg.systolicDotProductSimdLaneCount);
+    EXPECT_EQ(16384u, capsPvcVg.max3dImageWidthOrHeight);
+    EXPECT_EQ(MemoryConstants::pageSize64k, capsPvcVg.svmCpuAlignment);
+    EXPECT_FALSE(capsPvcVg.adjustWalkOrderAvailable);
+    EXPECT_FALSE(capsPvcVg.auxSurfaceModeOverrideRequired);
+    EXPECT_FALSE(capsPvcVg.availableSemaphore64);
+    EXPECT_TRUE(capsPvcVg.bFloat16ConversionSupported);
+    EXPECT_TRUE(capsPvcVg.bindlessAddressingDisabled);
+    EXPECT_FALSE(capsPvcVg.blitImageAllowedForDepthFormat);
+    EXPECT_TRUE(capsPvcVg.block2DLoadSupported);
+    EXPECT_TRUE(capsPvcVg.block2DStoreSupported);
+    EXPECT_FALSE(capsPvcVg.bufferPoolAllocatorSupported);
+    EXPECT_FALSE(capsPvcVg.cacheFlushPriorToImageReadRequired);
+    EXPECT_FALSE(capsPvcVg.deviceConfigStringTileCountIncluded);
+    EXPECT_FALSE(capsPvcVg.deviceConfigStringXeCuSegmentIncluded);
+    EXPECT_FALSE(capsPvcVg.directSubmissionLightSupported);
+    EXPECT_FALSE(capsPvcVg.dotProductAccumulateSystolicSupported);
+    EXPECT_TRUE(capsPvcVg.dummyBlitWaRequired);
+    EXPECT_TRUE(capsPvcVg.exposingSubdevicesAllowed);
+    EXPECT_FALSE(capsPvcVg.forceEmuInt32DivRemSPRequired);
+    EXPECT_FALSE(capsPvcVg.ftrXe2Compression);
+    EXPECT_FALSE(capsPvcVg.globalBindlessAllocatorEnabled);
+    EXPECT_FALSE(capsPvcVg.grfLimitedPreferredSlmSizeEnabled);
+    EXPECT_FALSE(capsPvcVg.hvAlign4Required);
+    EXPECT_TRUE(capsPvcVg.initBuiltinAsyncSupported);
+    EXPECT_TRUE(capsPvcVg.initDeviceWithFirstSubmissionRequired);
+    EXPECT_FALSE(capsPvcVg.latePreemptionStartSupported);
+    EXPECT_TRUE(capsPvcVg.localOnlyAllowed);
+    EXPECT_FALSE(capsPvcVg.memSetExtendedPayloadSupported);
+    EXPECT_FALSE(capsPvcVg.misalignedUserPtr2WayCoherent);
+    EXPECT_FALSE(capsPvcVg.newCoherencyModelSupported);
+    EXPECT_TRUE(capsPvcVg.newResidencyModelSupported);
+    EXPECT_TRUE(capsPvcVg.numRtStacksPerDssFixedValue);
+    EXPECT_FALSE(capsPvcVg.overrideGfxPartitionLayoutForWsl);
+    EXPECT_FALSE(capsPvcVg.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired);
+    EXPECT_FALSE(capsPvcVg.pipeControlPriorToPipelineSelectWaRequired);
+    EXPECT_FALSE(capsPvcVg.postImageWriteFlushRequired);
+    EXPECT_FALSE(capsPvcVg.preImageReadFlushRequired);
+    EXPECT_FALSE(capsPvcVg.programAdditionalStallPriorToBarrierWithTimestamp);
+    EXPECT_FALSE(capsPvcVg.programAllStateComputeCommandFieldsWARequired);
+    EXPECT_FALSE(capsPvcVg.queryPeerAccess);
+    EXPECT_TRUE(capsPvcVg.rayTracingSupported);
+    EXPECT_FALSE(capsPvcVg.rayTracingWalkerAdjustmentRequired);
+    EXPECT_TRUE(capsPvcVg.rcsExposureDisabled);
+    EXPECT_TRUE(capsPvcVg.readOnlyAllocationsSupported);
+    EXPECT_FALSE(capsPvcVg.reducedSurfaceStateSupported);
+    EXPECT_TRUE(capsPvcVg.scratchSpaceBasePointerInGrf);
+    EXPECT_FALSE(capsPvcVg.sharedUsmAllocationReuseSupported);
+    EXPECT_FALSE(capsPvcVg.sharingWith3dOrMediaAllowed);
+    EXPECT_FALSE(capsPvcVg.singleDispatchRequiredForMultiCCS);
+    EXPECT_FALSE(capsPvcVg.splitMatrixMultiplyAccumulateSupported);
+    EXPECT_FALSE(capsPvcVg.storageInfoAdjustmentRequired);
+    EXPECT_FALSE(capsPvcVg.useLocalPreferredForCacheableBuffers);
+}

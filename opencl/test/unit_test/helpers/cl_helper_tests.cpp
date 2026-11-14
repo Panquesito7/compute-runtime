@@ -1,18 +1,16 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/kernel/kernel_arg_descriptor.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/program/kernel_info.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/gfx_core_helper_tests.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/helpers/cl_gfx_core_helper.h"
@@ -23,6 +21,7 @@
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 #include <array>
+
 using namespace NEO;
 
 TEST(ClHelper, whenCallGetStringWithCmdTypeFunctionThenGetProperCmdTypeAsString) {
@@ -90,22 +89,20 @@ HWTEST_F(GfxCoreHelperTest, givenGfxCoreHelperWhenIsLinearStoragePreferredThenRe
         bool allowedType = imgTypes[i] == (CL_MEM_OBJECT_IMAGE2D) || (imgTypes[i] == CL_MEM_OBJECT_IMAGE3D) ||
                            (imgTypes[i] == CL_MEM_OBJECT_IMAGE2D_ARRAY);
 
-        // non shared context, dont force linear storage
-        EXPECT_EQ((tilingSupported & allowedType), !productHelper.isLinearStoragePreferred(false, Image::isImage1d(imgDesc), false));
+        // dont force linear storage
+        EXPECT_EQ((tilingSupported & allowedType), !productHelper.isLinearStoragePreferred(Image::isImage1d(imgDesc), false));
         {
             DebugManagerStateRestore restore;
-            DebugManager.flags.ForceLinearImages.set(true);
-            // non shared context, dont force linear storage + debug flag
-            EXPECT_TRUE(productHelper.isLinearStoragePreferred(false, Image::isImage1d(imgDesc), false));
+            debugManager.flags.ForceLinearImages.set(true);
+            // dont force linear storage + debug flag
+            EXPECT_TRUE(productHelper.isLinearStoragePreferred(Image::isImage1d(imgDesc), false));
         }
-        // shared context, dont force linear storage
-        EXPECT_TRUE(productHelper.isLinearStoragePreferred(true, Image::isImage1d(imgDesc), false));
-        // non shared context,  force linear storage
-        EXPECT_TRUE(productHelper.isLinearStoragePreferred(false, Image::isImage1d(imgDesc), true));
+        // force linear storage
+        EXPECT_TRUE(productHelper.isLinearStoragePreferred(Image::isImage1d(imgDesc), true));
 
-        // non shared context, dont force linear storage + create from buffer
+        // dont force linear storage + create from buffer
         imgDesc.buffer = buffer.get();
-        EXPECT_TRUE(productHelper.isLinearStoragePreferred(false, Image::isImage1d(imgDesc), false));
+        EXPECT_TRUE(productHelper.isLinearStoragePreferred(Image::isImage1d(imgDesc), false));
     }
 }
 
@@ -118,11 +115,11 @@ HWTEST_F(ClGfxCoreHelperTest, givenKernelInfoWhenCheckingRequiresAuxResolvesThen
     auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
     KernelInfo kernelInfo{};
 
-    ArgDescriptor argDescriptorValue(ArgDescriptor::ArgType::ArgTValue);
+    ArgDescriptor argDescriptorValue(ArgDescriptor::ArgType::argTValue);
     kernelInfo.kernelDescriptor.payloadMappings.explicitArgs.push_back(argDescriptorValue);
     EXPECT_FALSE(clGfxCoreHelper.requiresAuxResolves(kernelInfo));
 
-    ArgDescriptor argDescriptorPointer(ArgDescriptor::ArgType::ArgTPointer);
+    ArgDescriptor argDescriptorPointer(ArgDescriptor::ArgType::argTPointer);
     argDescriptorPointer.as<ArgDescPointer>().accessedUsingStatelessAddressingMode = true;
     kernelInfo.kernelDescriptor.payloadMappings.explicitArgs.push_back(argDescriptorPointer);
     EXPECT_TRUE(clGfxCoreHelper.requiresAuxResolves(kernelInfo));
@@ -139,7 +136,13 @@ TEST_F(ClGfxCoreHelperTest, givenGenHelperWhenKernelArgumentIsNotPureStatefulThe
     }
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, ClGfxCoreHelperTest, givenCLImageFormatsWhenCallingIsFormatRedescribableThenCorrectValueReturned) {
+HWTEST_F(ClGfxCoreHelperTest, WhenCheckingIsLimitationForPreemptionNeededThenReturnFalse) {
+    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
+
+    EXPECT_FALSE(clGfxCoreHelper.isLimitationForPreemptionNeeded());
+}
+
+HWTEST2_F(ClGfxCoreHelperTest, givenCLImageFormatsWhenCallingIsFormatRedescribableThenCorrectValueReturned, IsGen12LP) {
     static const cl_image_format redescribeFormats[] = {
         {CL_R, CL_UNSIGNED_INT8},
         {CL_R, CL_UNSIGNED_INT16},

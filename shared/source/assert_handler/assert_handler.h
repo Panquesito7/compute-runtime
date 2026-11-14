@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,8 @@
 
 #pragma once
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <cstdint>
 #include <mutex>
@@ -26,7 +28,7 @@ static_assert(sizeof(AssertBufferHeader) == 3u * sizeof(uint32_t));
 
 #pragma pack()
 
-class AssertHandler {
+class AssertHandler : NonCopyableAndNonMovableClass {
   public:
     AssertHandler(Device *device);
     MOCKABLE_VIRTUAL ~AssertHandler();
@@ -41,9 +43,10 @@ class AssertHandler {
   protected:
     static constexpr size_t assertBufferSize = MemoryConstants::pageSize64k;
     void printMessage() const;
+    void resetAssertBuffer();
 
     std::mutex mtx;
-    const Device *device = nullptr;
+    Device *device = nullptr;
     GraphicsAllocation *assertBuffer = nullptr;
 };
 } // namespace NEO

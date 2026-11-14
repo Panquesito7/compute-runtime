@@ -1,0 +1,17 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/test/common/test_macros/test_excludes.h"
+using namespace NEO;
+
+HWTEST_EXCLUDE_PRODUCT(Xe3pBcsTests, givenCompressibleSrcBuffersWhenAppendBlitCommandsForBufferCalledThenSetCompressionFormat, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(Xe3pBcsTests, givenCompressibleDstBuffersWhenAppendBlitCommandsForBufferCalledThenSetCompressionFormat, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(BcsTestsXe3pAndLater, givenCompressibleSrcBuffersWhenAppendBlitCommandsBlockCopyIsCalledThenSetCompressionFormat_IsAtLeastXe3pCore, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(Xe3pBcsTests, givenCompressibleDstBuffersWhenAppendBlitCommandsBlockCopyIsCalledThenSetCompressionFormat, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(BuiltInTests, givenBigOffsetAndSizeWhenBuilderCopyImageToLocalBufferStatelessIsUsedThenParamsAreCorrect, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(BuiltInTests, givenBigOffsetAndSizeWhenBuilderCopyImageToSystemBufferStatelessIsUsedThenParamsAreCorrect, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(CommandQueuePvcAndLaterTests, givenSplitBcsMaskWhenConstructBcsEnginesForSplitThenContainsGivenBcsEngines_IsAtLeastXeHpcCore, IGFX_NVL);

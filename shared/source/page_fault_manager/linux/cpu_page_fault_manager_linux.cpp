@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,48 +10,91 @@
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/root_device_environment.h"
-#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/memory_manager/memory_operations_handler.h"
+#include "shared/source/page_fault_manager/linux/tbx_page_fault_manager_linux.h"
 
+#include <algorithm>
 #include <sys/mman.h>
 
 namespace NEO {
-std::unique_ptr<PageFaultManager> PageFaultManager::create() {
-    auto pageFaultManager = std::make_unique<PageFaultManagerLinux>();
+std::unique_ptr<CpuPageFaultManager> CpuPageFaultManager::create() {
+    auto pageFaultManager = [&]() -> std::unique_ptr<CpuPageFaultManager> {
+        if (debugManager.isTbxPageFaultManagerEnabled()) {
+            return TbxPageFaultManager::create();
+        }
+        return std::make_unique<PageFaultManagerLinux>();
+    }();
 
     pageFaultManager->selectGpuDomainHandler();
     return pageFaultManager;
 }
 
-std::function<void(int signal, siginfo_t *info, void *context)> PageFaultManagerLinux::pageFaultHandler;
+constinit std::atomic<PageFaultManagerLinux *> PageFaultManagerLinux::activePageFaultManager{nullptr};
 
 PageFaultManagerLinux::PageFaultManagerLinux() {
-    pageFaultHandler = [&](int signal, siginfo_t *info, void *context) {
-        if (!this->verifyPageFault(info->si_addr)) {
-            callPreviousHandler(signal, info, context);
-        }
+    PageFaultManagerLinux::registerFaultHandler();
+}
+
+PageFaultManagerLinux::~PageFaultManagerLinux() {
+    auto expectedPageFaultManager = this;
+    auto wasActivePageFaultManager = activePageFaultManager.compare_exchange_strong(expectedPageFaultManager, nullptr);
+
+    if (wasActivePageFaultManager && !previousHandlerRestored) {
+        auto &previousPageFaultHandler = previousPageFaultHandlers[0];
+
+        auto previousHandlerIsWrapper = (previousPageFaultHandler.sa_flags & SA_SIGINFO) &&
+                                        previousPageFaultHandler.sa_sigaction == pageFaultHandlerWrapper;
+
+        struct sigaction defaultPageFaultHandler = {};
+        defaultPageFaultHandler.sa_handler = SIG_DFL;
+
+        auto retVal = sigaction(SIGSEGV, previousHandlerIsWrapper ? &defaultPageFaultHandler : &previousPageFaultHandler, nullptr);
+        UNRECOVERABLE_IF(retVal != 0);
+        previousPageFaultHandlers.clear();
+    }
+}
+
+bool PageFaultManagerLinux::checkFaultHandlerFromPageFaultManager() {
+    struct sigaction currentPageFaultHandler = {};
+    sigaction(SIGSEGV, NULL, &currentPageFaultHandler);
+    return (currentPageFaultHandler.sa_sigaction == pageFaultHandlerWrapper);
+}
+
+void PageFaultManagerLinux::registerFaultHandler() {
+    struct sigaction previousPageFaultHandler = {};
+    auto retVal = sigaction(SIGSEGV, nullptr, &previousPageFaultHandler);
+    UNRECOVERABLE_IF(retVal != 0);
+
+    auto compareHandler = [&ph = previousPageFaultHandler](const struct sigaction &h) -> bool {
+        return (h.sa_flags & SA_SIGINFO) ? (h.sa_sigaction == ph.sa_sigaction) : (h.sa_handler == ph.sa_handler);
     };
+    if (std::find_if(previousPageFaultHandlers.begin(),
+                     previousPageFaultHandlers.end(),
+                     compareHandler) == previousPageFaultHandlers.end()) {
+        previousPageFaultHandlers.push_back(previousPageFaultHandler);
+    }
+
+    activePageFaultManager.store(this);
 
     struct sigaction pageFaultManagerHandler = {};
     pageFaultManagerHandler.sa_flags = SA_SIGINFO;
     pageFaultManagerHandler.sa_sigaction = pageFaultHandlerWrapper;
 
-    auto retVal = sigaction(SIGSEGV, &pageFaultManagerHandler, &previousPageFaultHandler);
+    retVal = sigaction(SIGSEGV, &pageFaultManagerHandler, &previousPageFaultHandler);
     UNRECOVERABLE_IF(retVal != 0);
 
-    this->evictMemoryAfterCopy = DebugManager.flags.EnableDirectSubmission.get() &&
-                                 DebugManager.flags.USMEvictAfterMigration.get();
-}
-
-PageFaultManagerLinux::~PageFaultManagerLinux() {
-    if (!previousHandlerRestored) {
-        auto retVal = sigaction(SIGSEGV, &previousPageFaultHandler, nullptr);
-        UNRECOVERABLE_IF(retVal != 0);
-    }
+    previousHandlerRestored = false;
 }
 
 void PageFaultManagerLinux::pageFaultHandlerWrapper(int signal, siginfo_t *info, void *context) {
-    pageFaultHandler(signal, info, context);
+    auto pageFaultManager = activePageFaultManager.load();
+    if (pageFaultManager == nullptr) {
+        return;
+    }
+
+    if (!pageFaultManager->verifyAndHandlePageFault(info->si_addr, pageFaultManager->handlerIndex == 0)) {
+        pageFaultManager->callPreviousHandler(signal, info, context);
+    }
 }
 
 void PageFaultManagerLinux::allowCPUMemoryAccess(void *ptr, size_t size) {
@@ -64,7 +107,15 @@ void PageFaultManagerLinux::protectCPUMemoryAccess(void *ptr, size_t size) {
     UNRECOVERABLE_IF(retVal != 0);
 }
 
+void PageFaultManagerLinux::protectCpuMemoryFromWrites(void *ptr, size_t size) {
+    auto retVal = mprotect(ptr, size, PROT_READ);
+    UNRECOVERABLE_IF(retVal != 0);
+}
+
 void PageFaultManagerLinux::callPreviousHandler(int signal, siginfo_t *info, void *context) {
+    handlerIndex++;
+    UNRECOVERABLE_IF(handlerIndex <= 0 || handlerIndex > static_cast<int>(previousPageFaultHandlers.size()));
+    auto previousPageFaultHandler = previousPageFaultHandlers[previousPageFaultHandlers.size() - handlerIndex];
     if (previousPageFaultHandler.sa_flags & SA_SIGINFO) {
         previousPageFaultHandler.sa_sigaction(signal, info, context);
     } else {
@@ -72,18 +123,14 @@ void PageFaultManagerLinux::callPreviousHandler(int signal, siginfo_t *info, voi
             auto retVal = sigaction(SIGSEGV, &previousPageFaultHandler, nullptr);
             UNRECOVERABLE_IF(retVal != 0);
             previousHandlerRestored = true;
-        } else if (previousPageFaultHandler.sa_handler == SIG_IGN) {
-            return;
-        } else {
+            previousPageFaultHandlers.clear();
+        } else if (previousPageFaultHandler.sa_handler != SIG_IGN) {
             previousPageFaultHandler.sa_handler(signal);
         }
     }
+    handlerIndex--;
 }
 
-void PageFaultManagerLinux::evictMemoryAfterImplCopy(GraphicsAllocation *allocation, Device *device) {
-    if (evictMemoryAfterCopy) {
-        device->getRootDeviceEnvironment().memoryOperationsInterface->evict(device, *allocation);
-    }
-};
+void PageFaultManagerLinux::allowCPUMemoryEvictionImpl(bool evict, void *ptr, CommandStreamReceiver &csr, OSInterface *osInterface) {}
 
 } // namespace NEO

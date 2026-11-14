@@ -1,0 +1,40 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/helpers/constants.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
+namespace NEO {
+class MockReleaseHelper : public ReleaseHelper {
+  public:
+    MockReleaseHelper() : ReleaseHelper(0) {}
+    ADDMETHOD_CONST_NOBASE(isPipeControlPriorToNonPipelinedStateCommandsExtendedWARequired, bool, false, (const HardwareInfo &hwInfo, bool isRcs));
+    ADDMETHOD_CONST_NOBASE(isResolvingSubDeviceIDNeeded, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(getSupportedNumGrfs, const SupportedNumGrfs, {128u}, ());
+    ADDMETHOD_CONST_NOBASE(getTotalMemBankSize, uint64_t, 32ull * MemoryConstants::gigaByte, ());
+    ADDMETHOD_CONST_NOBASE(getThreadsPerEUConfigs, const ThreadsPerEUConfigs, {}, (uint32_t numThreadsPerEu));
+    ADDMETHOD_CONST_NOBASE(computeSlmValues, uint32_t, {}, (uint32_t slmSize));
+    ADDMETHOD_CONST_NOBASE(alignSlmSizePerThreadGroup, uint32_t, {}, (uint32_t slmSize));
+    ADDMETHOD_CONST_NOBASE(adjustMaxThreadsPerEuCount, uint32_t, 8u, (uint32_t maxThreadsPerEuCount, uint32_t grfCount));
+    ADDMETHOD_CONST_NOBASE(isStateCacheInvalidationWaRequired, bool, false, (bool isImmediateCmdList, bool kernelUsesImageOrSampler));
+    ADDMETHOD_CONST_NOBASE(getIpVersionForGmm, uint32_t, 0, ());
+    ADDMETHOD_CONST_NOBASE(is2WayCoherentPatSupported, bool, true, ());
+    ADDMETHOD_CONST_NOBASE(isAppTransientCoherentPatRequired, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(getAubFilePrefix, const char *, nullptr, ());
+
+    uint64_t overrideSystemMemoryPatIndexBase(uint64_t patIndex) const override {
+        return patIndex;
+    }
+
+    const SizeToPreferredSlmValueArray &getSizeToPreferredSlmValue() const override {
+        static SizeToPreferredSlmValueArray sizeToPreferredSlmValue = {};
+        return sizeToPreferredSlmValue;
+    }
+};
+} // namespace NEO

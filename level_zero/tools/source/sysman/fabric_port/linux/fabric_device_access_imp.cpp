@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,10 +8,13 @@
 #include "fabric_device_access_imp.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
 
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 
-#include <limits>
+#include <algorithm>
 
 namespace L0 {
 
@@ -58,7 +61,7 @@ ze_result_t FabricDeviceAccessNl::getState(const zes_fabric_port_id_t portId, ze
     const IafPortId iafPortId(portId.fabricId, portId.attachId, portId.portNumber);
     ze_result_t result = pIafNlApi->fPortStatusQuery(iafPortId, iafPortState);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): IafNlApi->fPortStatusQuery() failed for portnumber : %d and returning error:0x%x \n", __FUNCTION__, iafPortId.portNumber, result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): IafNlApi->fPortStatusQuery() failed for portnumber : %d and returning error:0x%x \n", NEO_FUNCTION_NAME, iafPortId.portNumber, result);
         return result;
     }
     readIafPortStatus(state, iafPortState);
@@ -72,7 +75,7 @@ ze_result_t FabricDeviceAccessNl::getState(const zes_fabric_port_id_t portId, ze
 
     result = pIafNlApi->fportProperties(iafPortId, guid, portNumber, maxRxSpeed, maxTxSpeed, rxSpeed, txSpeed);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): IafNlApi->fportProperties() failed for portnumber : %d and returning error:0x%x \n", __FUNCTION__, iafPortId.portNumber, result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): IafNlApi->fportProperties() failed for portnumber : %d and returning error:0x%x \n", NEO_FUNCTION_NAME, iafPortId.portNumber, result);
         return result;
     }
     readIafPortSpeed(state.rxSpeed, rxSpeed);
@@ -99,11 +102,40 @@ ze_result_t FabricDeviceAccessNl::getState(const zes_fabric_port_id_t portId, ze
     return result;
 }
 
-ze_result_t FabricDeviceAccessNl::getThroughput(const zes_fabric_port_id_t portId, zes_fabric_port_throughput_t &througput) {
+ze_result_t FabricDeviceAccessNl::getThroughput(const zes_fabric_port_id_t portId, zes_fabric_port_throughput_t &throughput) {
     const IafPortId iafPortId(portId.fabricId, portId.attachId, portId.portNumber);
     IafPortThroughPut iafThroughPut = {};
     ze_result_t result = pIafNlApi->getThroughput(iafPortId, iafThroughPut);
-    readIafPortThroughPut(througput, iafThroughPut);
+    readIafPortThroughPut(throughput, iafThroughPut);
+    return result;
+}
+
+ze_result_t FabricDeviceAccessNl::getMultiPortThroughput(std::vector<zes_fabric_port_id_t> &portIdList, zes_fabric_port_throughput_t **pThroughput) {
+    std::vector<IafPortId> iafPortIdList = {};
+    std::vector<IafThroughPutInfo> iafThroughPutList = {};
+    for (const auto &portId : portIdList) {
+        IafPortId iafPortId(portId.fabricId, portId.attachId, portId.portNumber);
+        iafPortIdList.push_back(iafPortId);
+    }
+
+    ze_result_t result = pIafNlApi->getMultiPortThroughPut(iafPortIdList, iafThroughPutList);
+    if (ZE_RESULT_SUCCESS != result) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to retrieve throughput, Returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    zes_fabric_port_throughput_t *throughputArray = *pThroughput;
+    memset(throughputArray, 0, sizeof(zes_fabric_port_throughput_t) * portIdList.size());
+    for (uint32_t i = 0; i < portIdList.size(); i++) {
+        auto it = std::find_if(iafThroughPutList.begin(), iafThroughPutList.end(), [&](auto &info) {
+            return (info.iafPortId.portNumber == iafPortIdList[i].portNumber) && (info.iafPortId.fabricId == iafPortIdList[i].fabricId) && (info.iafPortId.attachId == iafPortIdList[i].attachId);
+        });
+        if (it != iafThroughPutList.end()) {
+            readIafPortThroughPut(throughputArray[i], it->iafThroughput);
+            throughputArray[i].timestamp = SysmanDevice::getSysmanTimestamp();
+            iafThroughPutList.erase(it);
+        }
+    }
     return result;
 }
 
@@ -162,7 +194,7 @@ ze_result_t FabricDeviceAccessNl::getPorts(std::vector<zes_fabric_port_id_t> &po
     pLinuxSysmanImp->getSysfsAccess().getRealPath(iafPath, iafRealPath);
     ze_result_t result = pIafNlApi->getPorts(iafRealPath, iafPorts);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): IafNlApi->getPorts() failed to retrieve prots from %s and returning error:0x%x \n", __FUNCTION__, iafRealPath.c_str(), result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): IafNlApi->getPorts() failed to retrieve prots from %s and returning error:0x%x \n", NEO_FUNCTION_NAME, iafRealPath.c_str(), result);
         return result;
     }
 
@@ -174,7 +206,7 @@ ze_result_t FabricDeviceAccessNl::getPorts(std::vector<zes_fabric_port_id_t> &po
     }
 
     ports.clear();
-    for (auto port : fabricPorts) {
+    for (auto &port : fabricPorts) {
         ports.push_back(port.portId);
     }
     return ZE_RESULT_SUCCESS;
@@ -182,7 +214,7 @@ ze_result_t FabricDeviceAccessNl::getPorts(std::vector<zes_fabric_port_id_t> &po
 
 void FabricDeviceAccessNl::getProperties(const zes_fabric_port_id_t portId, std::string &model, bool &onSubdevice,
                                          uint32_t &subdeviceId, zes_fabric_port_speed_t &maxRxSpeed, zes_fabric_port_speed_t &maxTxSpeed) {
-    for (auto port : fabricPorts) {
+    for (auto &port : fabricPorts) {
         UNRECOVERABLE_IF(portId.fabricId != port.portId.fabricId);
         if (portId.attachId == port.portId.attachId && portId.portNumber == port.portId.portNumber) {
             model = port.model;
@@ -213,7 +245,7 @@ void FabricDeviceAccessNl::populateGuidMap() {
     if (ZE_RESULT_SUCCESS != getAllFabricIds(fabricIds)) {
         return;
     }
-    for (auto fabricId : fabricIds) {
+    for (auto &fabricId : fabricIds) {
         uint32_t numSubdevices = 0;
 
         if (ZE_RESULT_SUCCESS != getNumSubdevices(fabricId, numSubdevices)) {

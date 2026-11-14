@@ -1,67 +1,118 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/helpers/string.h"
 
-#include "level_zero/sysman/source/linux/pmt/sysman_pmt.h"
-#include "level_zero/sysman/source/power/linux/sysman_os_power_imp.h"
-#include "level_zero/sysman/source/power/sysman_power_imp.h"
+#include "level_zero/sysman/source/api/power/linux/sysman_os_power_imp.h"
+#include "level_zero/sysman/source/api/power/sysman_power_imp.h"
+#include "level_zero/sysman/source/device/sysman_device_imp.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
 #include "level_zero/sysman/source/sysman_const.h"
-#include "level_zero/sysman/source/sysman_device_imp.h"
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_fixture.h"
+#include "level_zero/sysman/test/unit_tests/sources/shared/linux/kmd_interface/mock_sysman_kmd_interface_i915.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
-constexpr uint64_t setEnergyCounter = (83456u * 1048576u);
-constexpr uint64_t offset = 0x400;
-const std::string deviceName("device");
-const std::string baseTelemSysFS("/sys/class/intel_pmt");
-const std::string hwmonDir("device/hwmon");
-const std::string i915HwmonDir("device/hwmon/hwmon2");
-const std::string nonI915HwmonDir("device/hwmon/hwmon1");
+
+constexpr uint64_t mockKeyOffset = 0x420;
+constexpr uint32_t mockLimitCount = 2u;
+const std::string mockPowerDevicePciBdf("0000:3a:00.0");
+const std::string mockPowerDeviceRealPath("/sys/devices/pci0000:37/0000:37:01.0/0000:38:00.0/0000:39:01.0/" + mockPowerDevicePciBdf);
+const std::string mockPowerHwmonBaseDir("/sys/bus/pci/devices/" + mockPowerDevicePciBdf + "/hwmon");
+const std::string hwmonDir(mockPowerHwmonBaseDir);
+const std::string i915HwmonDir(mockPowerHwmonBaseDir + "/hwmon2");
+const std::string nonI915HwmonDir(mockPowerHwmonBaseDir + "/hwmon1");
+const std::string i915HwmonDirTile0(mockPowerHwmonBaseDir + "/hwmon3");
+const std::string i915HwmonDirTile1(mockPowerHwmonBaseDir + "/hwmon4");
 const std::vector<std::string> listOfMockedHwmonDirs = {"hwmon0", "hwmon1", "hwmon2", "hwmon3", "hwmon4"};
-const std::string sustainedPowerLimitEnabled("power1_max_enable");
 const std::string sustainedPowerLimit("power1_max");
 const std::string sustainedPowerLimitInterval("power1_max_interval");
-const std::string burstPowerLimitEnabled("power1_cap_enable");
-const std::string burstPowerLimit("power1_cap");
-const std::string energyCounterNode("energy1_input");
-const std::string defaultPowerLimit("power_default_limit");
-const std::string minPowerLimit("power_min_limit");
-const std::string maxPowerLimit("power_max_limit");
+const std::string criticalPowerLimit1("curr1_crit");
+const std::string criticalPowerLimit2("power1_crit");
+const std::string packageEnergyCounterNode("energy1_input");
+const std::string defaultPowerLimit("power1_rated_max");
 constexpr uint64_t expectedEnergyCounter = 123456785u;
-constexpr uint32_t mockDefaultPowerLimitVal = 300000000;
-constexpr uint32_t mockMaxPowerLimitVal = 490000000;
-constexpr uint32_t mockMinPowerLimitVal = 10;
+constexpr uint64_t expectedEnergyCounterTile0 = 123456785u;
+constexpr uint64_t expectedEnergyCounterTile1 = 128955785u;
+constexpr uint32_t mockDefaultPowerLimitVal = 600000000;
+constexpr uint64_t mockMinPowerLimitVal = 300000000;
+constexpr uint64_t mockMaxPowerLimitVal = 600000000;
 
-const std::map<std::string, uint64_t> deviceKeyOffsetMapPower = {
-    {"PACKAGE_ENERGY", 0x400},
-    {"COMPUTE_TEMPERATURES", 0x68},
-    {"SOC_TEMPERATURES", 0x60},
-    {"CORE_TEMPERATURES", 0x6c}};
+const std::string realPathTelem1 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem1";
+const std::string realPathTelem2 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem2";
+const std::string realPathTelem3 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem3";
+const std::string sysfsPathTelem1 = "/sys/class/intel_pmt/telem1";
+const std::string sysfsPathTelem2 = "/sys/class/intel_pmt/telem2";
+const std::string sysfsPathTelem3 = "/sys/class/intel_pmt/telem3";
+const std::string telem1OffsetFileName("/sys/class/intel_pmt/telem1/offset");
+const std::string telem1GuidFileName("/sys/class/intel_pmt/telem1/guid");
+const std::string telem1TelemFileName("/sys/class/intel_pmt/telem1/telem");
+const std::string telem2OffsetFileName("/sys/class/intel_pmt/telem2/offset");
+const std::string telem2GuidFileName("/sys/class/intel_pmt/telem2/guid");
+const std::string telem2TelemFileName("/sys/class/intel_pmt/telem2/telem");
+const std::string telem3OffsetFileName("/sys/class/intel_pmt/telem3/offset");
+const std::string telem3GuidFileName("/sys/class/intel_pmt/telem3/guid");
+const std::string telem3TelemFileName("/sys/class/intel_pmt/telem3/telem");
 
-struct MockPowerSysfsAccess : public L0::Sysman::SysfsAccess {
+struct MockPowerSysfsAccessInterface : public L0::Sysman::SysFsAccessInterface {
 
-    std::vector<ze_result_t> mockReadReturnStatus{};
-    std::vector<ze_result_t> mockWriteReturnStatus{};
-    std::vector<ze_result_t> mockScanDirEntriesReturnStatus{};
-    std::vector<uint64_t> mockReadUnsignedLongValue{};
-    std::vector<uint32_t> mockReadUnsignedIntValue{};
-    bool isRepeated = false;
+    ze_result_t realPathResult = ZE_RESULT_SUCCESS;
+    std::string mockRealPathValue = mockPowerDeviceRealPath;
 
-    ze_result_t read(const std::string file, std::string &val) override {
+    ze_result_t getRealPath(const std::string &path, std::string &val) override {
+        if (realPathResult != ZE_RESULT_SUCCESS) {
+            return realPathResult;
+        }
+        if (path == "device" || path == "device/") {
+            val = mockRealPathValue;
+            return ZE_RESULT_SUCCESS;
+        }
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
 
+    MockPowerSysfsAccessInterface() = default;
+};
+
+struct MockPowerFsAccessInterface : public L0::Sysman::FsAccessInterface {
+
+    ze_result_t mockReadResult = ZE_RESULT_SUCCESS;
+    ze_result_t mockReadPeakResult = ZE_RESULT_SUCCESS;
+    ze_result_t mockWriteResult = ZE_RESULT_SUCCESS;
+    ze_result_t mockReadIntResult = ZE_RESULT_SUCCESS;
+    ze_result_t mockWritePeakLimitResult = ZE_RESULT_SUCCESS;
+    std::vector<ze_result_t> mockscanDirEntriesResult{};
+    std::vector<ze_result_t> mockReadValUnsignedLongResult{};
+    std::vector<ze_result_t> mockWriteUnsignedResult{};
+    std::string listDirectoryPathRequested;
+
+    uint64_t sustainedPowerLimitVal = 0;
+    uint64_t criticalPowerLimitVal = 0;
+    int32_t sustainedPowerLimitIntervalVal = 0;
+    bool isEnergyCounterFilePresent = true;
+    bool isSustainedPowerLimitFilePresent = true;
+    bool isCriticalPowerLimitFilePresent = true;
+    bool isTelemetryDataFilePresent = false;
+
+    ze_result_t getValString(const std::string file, std::string &val) {
         ze_result_t result = ZE_RESULT_ERROR_UNKNOWN;
         if (file.compare(i915HwmonDir + "/" + "name") == 0) {
             val = "i915";
             result = ZE_RESULT_SUCCESS;
         } else if (file.compare(nonI915HwmonDir + "/" + "name") == 0) {
             result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+        } else if (file.compare(i915HwmonDirTile1 + "/" + "name") == 0) {
+            val = "i915_gt1";
+            result = ZE_RESULT_SUCCESS;
+        } else if (file.compare(i915HwmonDirTile0 + "/" + "name") == 0) {
+            val = "i915_gt0";
+            result = ZE_RESULT_SUCCESS;
         } else {
             val = "garbageI915";
             result = ZE_RESULT_SUCCESS;
@@ -69,327 +120,196 @@ struct MockPowerSysfsAccess : public L0::Sysman::SysfsAccess {
         return result;
     }
 
-    uint64_t sustainedPowerLimitEnabledVal = 1u;
-    uint64_t sustainedPowerLimitVal = 0;
-    uint64_t sustainedPowerLimitIntervalVal = 0;
-    uint64_t burstPowerLimitEnabledVal = 0;
-    uint64_t burstPowerLimitVal = 0;
-    uint64_t energyCounterNodeVal = expectedEnergyCounter;
-
-    ze_result_t getValUnsignedLongReturnErrorForBurstPowerLimit(const std::string file, uint64_t &val) {
-        if (file.compare(i915HwmonDir + "/" + burstPowerLimitEnabled) == 0) {
-            val = burstPowerLimitEnabledVal;
-        }
-        if (file.compare(i915HwmonDir + "/" + burstPowerLimit) == 0) {
-
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t getValUnsignedLongReturnErrorForBurstPowerLimitEnabled(const std::string file, uint64_t &val) {
-        if (file.compare(i915HwmonDir + "/" + burstPowerLimitEnabled) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE; // mocking the condition when user passes nullptr for sustained and peak power in zesPowerGetLimit and burst power file is absent
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t getValUnsignedLongReturnErrorForSustainedPowerLimitEnabled(const std::string file, uint64_t &val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE; // mocking the condition when user passes nullptr for burst and peak power in zesPowerGetLimit and sustained power file is absent
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t getValUnsignedLongReturnsPowerLimitEnabledAsDisabled(const std::string file, uint64_t &val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            val = 0;
-            return ZE_RESULT_SUCCESS;
-        } else if (file.compare(i915HwmonDir + "/" + burstPowerLimitEnabled) == 0) {
-            val = 0;
-            return ZE_RESULT_SUCCESS;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t getValUnsignedLongReturnErrorForSustainedPower(const std::string file, uint64_t &val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            val = 1;
-        } else if (file.compare(i915HwmonDir + "/" + sustainedPowerLimit) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t getValUnsignedLongReturnErrorForSustainedPowerInterval(const std::string file, uint64_t &val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            val = 1;
-        } else if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitInterval) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t setValUnsignedLongReturnErrorForBurstPowerLimit(const std::string file, const int val) {
-        if (file.compare(i915HwmonDir + "/" + burstPowerLimit) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t setValUnsignedLongReturnErrorForBurstPowerLimitEnabled(const std::string file, const int val) {
-        if (file.compare(i915HwmonDir + "/" + burstPowerLimitEnabled) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t setValUnsignedLongReturnErrorForSustainedPowerLimitEnabled(const std::string file, const int val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t setValUnsignedLongReturnInsufficientForSustainedPowerLimitEnabled(const std::string file, const int val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t setValReturnErrorForSustainedPower(const std::string file, const int val) {
+    ze_result_t getValUnsignedLongHelper(const std::string file, uint64_t &val);
+    ze_result_t getValUnsignedLong(const std::string file, uint64_t &val) {
+        ze_result_t result = ZE_RESULT_SUCCESS;
         if (file.compare(i915HwmonDir + "/" + sustainedPowerLimit) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
+            val = sustainedPowerLimitVal;
+        } else if ((file.compare(i915HwmonDir + "/" + criticalPowerLimit1) == 0) || (file.compare(i915HwmonDir + "/" + criticalPowerLimit2) == 0)) {
+            if (mockReadPeakResult != ZE_RESULT_SUCCESS) {
+                return mockReadPeakResult;
+            }
+            val = criticalPowerLimitVal;
+        } else if (file.compare(i915HwmonDirTile0 + "/" + packageEnergyCounterNode) == 0) {
+            val = expectedEnergyCounterTile0;
+        } else if (file.compare(i915HwmonDirTile1 + "/" + packageEnergyCounterNode) == 0) {
+            val = expectedEnergyCounterTile1;
+        } else if (file.compare(i915HwmonDir + "/" + packageEnergyCounterNode) == 0) {
+            val = expectedEnergyCounter;
+        } else if (file.compare(i915HwmonDir + "/" + defaultPowerLimit) == 0) {
+            val = mockDefaultPowerLimitVal;
+        } else {
+            result = ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
-        return ZE_RESULT_SUCCESS;
+
+        return result;
     }
 
-    ze_result_t setValReturnErrorForSustainedPowerInterval(const std::string file, const int val) {
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitInterval) == 0) {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    ze_result_t getValUnsignedInt(const std::string file, uint32_t &val) {
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        if (file.compare(i915HwmonDir + "/" + defaultPowerLimit) == 0) {
+            val = mockDefaultPowerLimitVal;
+        } else {
+            result = ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
-        return ZE_RESULT_SUCCESS;
+        return result;
+    }
+
+    ze_result_t setVal(const std::string file, const int val) {
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        if ((file.compare(i915HwmonDir + "/" + sustainedPowerLimitInterval) == 0)) {
+            sustainedPowerLimitIntervalVal = val;
+        } else {
+            result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+        }
+
+        return result;
+    }
+
+    ze_result_t getListDirectory(const std::string file, std::vector<std::string> &listOfEntries) {
+        if (file.compare(hwmonDir) == 0) {
+            listOfEntries = listOfMockedHwmonDirs;
+            return ZE_RESULT_SUCCESS;
+        }
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
     ze_result_t read(const std::string file, uint64_t &val) override {
         ze_result_t result = ZE_RESULT_SUCCESS;
-        if (!mockReadReturnStatus.empty()) {
-            result = mockReadReturnStatus.front();
-            if (!mockReadUnsignedLongValue.empty()) {
-                val = mockReadUnsignedLongValue.front();
+        if (!mockReadValUnsignedLongResult.empty()) {
+            result = mockReadValUnsignedLongResult.front();
+            mockReadValUnsignedLongResult.erase(mockReadValUnsignedLongResult.begin());
+            if (result != ZE_RESULT_SUCCESS) {
+                return result;
             }
-            if (isRepeated != true) {
-                if (mockReadUnsignedLongValue.size() != 0) {
-                    mockReadUnsignedLongValue.erase(mockReadUnsignedLongValue.begin());
-                }
-                mockReadReturnStatus.erase(mockReadReturnStatus.begin());
-            }
-            return result;
         }
 
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            val = sustainedPowerLimitEnabledVal;
-        } else if (file.compare(i915HwmonDir + "/" + sustainedPowerLimit) == 0) {
-            val = sustainedPowerLimitVal;
-        } else if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitInterval) == 0) {
-            val = sustainedPowerLimitIntervalVal;
-        } else if (file.compare(i915HwmonDir + "/" + burstPowerLimitEnabled) == 0) {
-            val = burstPowerLimitEnabledVal;
-        } else if (file.compare(i915HwmonDir + "/" + burstPowerLimit) == 0) {
-            val = burstPowerLimitVal;
-        } else if (file.compare(i915HwmonDir + "/" + energyCounterNode) == 0) {
-            val = energyCounterNodeVal;
-        } else {
-            result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+        return getValUnsignedLong(file, val);
+    }
+
+    ze_result_t read(const std::string file, int32_t &val) override {
+        if (mockReadIntResult != ZE_RESULT_SUCCESS) {
+            return mockReadIntResult;
         }
-        return result;
+
+        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitInterval) == 0) {
+            val = sustainedPowerLimitIntervalVal;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    ze_result_t read(const std::string file, std::string &val) override {
+        if (mockReadResult != ZE_RESULT_SUCCESS) {
+            return mockReadResult;
+        }
+
+        return getValString(file, val);
     }
 
     ze_result_t read(const std::string file, uint32_t &val) override {
-        ze_result_t result = ZE_RESULT_SUCCESS;
-        if (!mockReadReturnStatus.empty()) {
-            result = mockReadReturnStatus.front();
-            if (!mockReadUnsignedIntValue.empty()) {
-                val = mockReadUnsignedIntValue.front();
-            }
-            if (isRepeated != true) {
-                if (mockReadUnsignedIntValue.size() != 0) {
-                    mockReadUnsignedIntValue.erase(mockReadUnsignedIntValue.begin());
-                }
-                mockReadReturnStatus.erase(mockReadReturnStatus.begin());
-            }
-            return result;
+        if (mockReadResult != ZE_RESULT_SUCCESS) {
+            return mockReadResult;
+        }
+        return getValUnsignedInt(file, val);
+    }
+
+    ze_result_t write(const std::string &file, const int val) override {
+        if (mockWriteResult != ZE_RESULT_SUCCESS) {
+            return mockWriteResult;
         }
 
-        if (file.compare(i915HwmonDir + "/" + defaultPowerLimit) == 0) {
-            val = mockDefaultPowerLimitVal;
-        } else if (file.compare(i915HwmonDir + "/" + maxPowerLimit) == 0) {
-            val = mockMaxPowerLimitVal;
-        } else if (file.compare(i915HwmonDir + "/" + minPowerLimit) == 0) {
-            val = mockMinPowerLimitVal;
+        return setVal(file, val);
+    }
+
+    ze_result_t write(const std::string &file, const uint64_t val) override {
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        if (!mockWriteUnsignedResult.empty()) {
+            result = mockWriteUnsignedResult.front();
+            mockWriteUnsignedResult.erase(mockWriteUnsignedResult.begin());
+            if (result != ZE_RESULT_SUCCESS) {
+                return result;
+            }
+        }
+
+        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimit) == 0) {
+            if (val < mockMinPowerLimitVal) {
+                sustainedPowerLimitVal = mockMinPowerLimitVal;
+            } else if (val > mockMaxPowerLimitVal) {
+                sustainedPowerLimitVal = mockMaxPowerLimitVal;
+            } else {
+                sustainedPowerLimitVal = val;
+            }
+        } else if ((file.compare(i915HwmonDir + "/" + criticalPowerLimit1) == 0) || (file.compare(i915HwmonDir + "/" + criticalPowerLimit2) == 0)) {
+            if (mockWritePeakLimitResult != ZE_RESULT_SUCCESS) {
+                return mockWritePeakLimitResult;
+            }
+            criticalPowerLimitVal = val;
         } else {
             result = ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
+
         return result;
     }
 
-    ze_result_t write(const std::string file, const int val) override {
-        ze_result_t result = ZE_RESULT_SUCCESS;
-        if (!mockWriteReturnStatus.empty()) {
-            ze_result_t result = mockWriteReturnStatus.front();
-            if (isRepeated != true) {
-                mockWriteReturnStatus.erase(mockWriteReturnStatus.begin());
+    ze_result_t listDirectory(const std::string file, std::vector<std::string> &listOfEntries) override {
+        listDirectoryPathRequested = file;
+        if (!mockscanDirEntriesResult.empty()) {
+            ze_result_t result = mockscanDirEntriesResult.front();
+            mockscanDirEntriesResult.erase(mockscanDirEntriesResult.begin());
+            if (result != ZE_RESULT_SUCCESS) {
+                return result;
             }
-            return result;
         }
+        return getListDirectory(file, listOfEntries);
+    }
 
-        if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitEnabled) == 0) {
-            sustainedPowerLimitEnabledVal = static_cast<uint64_t>(val);
-        } else if (file.compare(i915HwmonDir + "/" + sustainedPowerLimit) == 0) {
-            sustainedPowerLimitVal = static_cast<uint64_t>(val);
-        } else if (file.compare(i915HwmonDir + "/" + sustainedPowerLimitInterval) == 0) {
-            sustainedPowerLimitIntervalVal = static_cast<uint64_t>(val);
-        } else if (file.compare(i915HwmonDir + "/" + burstPowerLimitEnabled) == 0) {
-            burstPowerLimitEnabledVal = static_cast<uint64_t>(val);
-        } else if (file.compare(i915HwmonDir + "/" + burstPowerLimit) == 0) {
-            burstPowerLimitVal = static_cast<uint64_t>(val);
-        } else {
-            result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    bool fileExists(const std::string file) override {
+        if (file.find(packageEnergyCounterNode) != std::string::npos) {
+            return isEnergyCounterFilePresent;
+        } else if (file.find(sustainedPowerLimit) != std::string::npos) {
+            return isSustainedPowerLimitFilePresent;
+        } else if (file.find(criticalPowerLimit1) != std::string::npos) {
+            return isCriticalPowerLimitFilePresent;
+        } else if (file.find(criticalPowerLimit2) != std::string::npos) {
+            return isCriticalPowerLimitFilePresent;
+        } else if (file == telem1TelemFileName || file == telem2TelemFileName || file == telem3TelemFileName) {
+            return isTelemetryDataFilePresent;
         }
-        return result;
+        return false;
     }
 
-    ze_result_t scanDirEntries(const std::string file, std::vector<std::string> &listOfEntries) override {
-        ze_result_t result = ZE_RESULT_ERROR_NOT_AVAILABLE;
-        if (!mockScanDirEntriesReturnStatus.empty()) {
-            ze_result_t result = mockScanDirEntriesReturnStatus.front();
-            if (isRepeated != true) {
-                mockScanDirEntriesReturnStatus.erase(mockScanDirEntriesReturnStatus.begin());
-            }
-            return result;
-        }
-
-        if (file.compare(hwmonDir) == 0) {
-            listOfEntries = listOfMockedHwmonDirs;
-            result = ZE_RESULT_SUCCESS;
-        }
-        return result;
-    }
-
-    MockPowerSysfsAccess() = default;
-};
-
-struct MockPowerPmt : public L0::Sysman::PlatformMonitoringTech {
-    using L0::Sysman::PlatformMonitoringTech::closeFunction;
-    using L0::Sysman::PlatformMonitoringTech::keyOffsetMap;
-    using L0::Sysman::PlatformMonitoringTech::openFunction;
-    using L0::Sysman::PlatformMonitoringTech::preadFunction;
-    using L0::Sysman::PlatformMonitoringTech::telemetryDeviceEntry;
-
-    MockPowerPmt(L0::Sysman::FsAccess *pFsAccess, ze_bool_t onSubdevice, uint32_t subdeviceId) : L0::Sysman::PlatformMonitoringTech(pFsAccess, onSubdevice, subdeviceId) {}
-    ~MockPowerPmt() override {
-        rootDeviceTelemNodeIndex = 0;
-    }
-
-    void mockedInit(L0::Sysman::FsAccess *pFsAccess) {
-        std::string gpuUpstreamPortPath = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0";
-        if (ZE_RESULT_SUCCESS != L0::Sysman::PlatformMonitoringTech::enumerateRootTelemIndex(pFsAccess, gpuUpstreamPortPath)) {
-            return;
-        }
-        telemetryDeviceEntry = "/sys/class/intel_pmt/telem2/telem";
-    }
-};
-
-struct MockPowerFsAccess : public L0::Sysman::FsAccess {
-
-    ze_result_t listDirectory(const std::string directory, std::vector<std::string> &listOfTelemNodes) override {
-        if (directory.compare(baseTelemSysFS) == 0) {
-            listOfTelemNodes.push_back("telem1");
-            listOfTelemNodes.push_back("telem2");
-            listOfTelemNodes.push_back("telem3");
-            listOfTelemNodes.push_back("telem4");
-            listOfTelemNodes.push_back("telem5");
-            return ZE_RESULT_SUCCESS;
-        }
-        return ZE_RESULT_ERROR_NOT_AVAILABLE;
-    }
-
-    ze_result_t listDirectoryFailure(const std::string directory, std::vector<std::string> &events) {
-        return ZE_RESULT_ERROR_NOT_AVAILABLE;
-    }
-
-    ze_result_t getRealPath(const std::string path, std::string &buf) override {
-        if (path.compare("/sys/class/intel_pmt/telem1") == 0) {
-            buf = "/sys/devices/pci0000:89/0000:89:02.0/0000:86:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem1";
-        } else if (path.compare("/sys/class/intel_pmt/telem2") == 0) {
-            buf = "/sys/devices/pci0000:89/0000:89:02.0/0000:86:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem2";
-        } else if (path.compare("/sys/class/intel_pmt/telem3") == 0) {
-            buf = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem3";
-        } else if (path.compare("/sys/class/intel_pmt/telem4") == 0) {
-            buf = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem4";
-        } else if (path.compare("/sys/class/intel_pmt/telem5") == 0) {
-            buf = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem5";
-        } else {
-            return ZE_RESULT_ERROR_NOT_AVAILABLE;
-        }
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t getRealPathFailure(const std::string path, std::string &buf) {
-        return ZE_RESULT_ERROR_NOT_AVAILABLE;
-    }
-
-    MockPowerFsAccess() = default;
+    MockPowerFsAccessInterface() = default;
 };
 
 class PublicLinuxPowerImp : public L0::Sysman::LinuxPowerImp {
   public:
-    PublicLinuxPowerImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId) : LinuxPowerImp(pOsSysman, onSubdevice, subdeviceId) {}
-    using L0::Sysman::LinuxPowerImp::pPmt;
+    PublicLinuxPowerImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId, zes_power_domain_t powerDomain) : L0::Sysman::LinuxPowerImp(pOsSysman, onSubdevice, subdeviceId, powerDomain) {}
+    using L0::Sysman::LinuxPowerImp::isPmtBasedPowerSupported;
+    using L0::Sysman::LinuxPowerImp::pFsAccess;
 };
 
-class SysmanDevicePowerFixture : public SysmanDeviceFixture {
+class SysmanDevicePowerFixtureI915 : public SysmanDeviceFixture {
   protected:
     L0::Sysman::SysmanDevice *device = nullptr;
-    std::unique_ptr<PublicLinuxPowerImp> pPublicLinuxPowerImp;
-    std::unique_ptr<MockPowerPmt> pPmt;
-    std::unique_ptr<MockPowerFsAccess> pFsAccess;
-    std::unique_ptr<MockPowerSysfsAccess> pSysfsAccess;
-    L0::Sysman::SysfsAccess *pSysfsAccessOld = nullptr;
-    L0::Sysman::FsAccess *pFsAccessOriginal = nullptr;
-    L0::Sysman::OsPower *pOsPowerOriginal = nullptr;
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> pmtMapOriginal;
+    MockSysmanKmdInterfacePrelim *pSysmanKmdInterface = nullptr;
+    MockPowerSysfsAccessInterface *pSysfsAccess = nullptr;
+    MockPowerFsAccessInterface *pFsAccess = nullptr;
+
     void SetUp() override {
         SysmanDeviceFixture::SetUp();
         device = pSysmanDevice;
-        pFsAccess = std::make_unique<MockPowerFsAccess>();
-        pFsAccessOriginal = pLinuxSysmanImp->pFsAccess;
-        pLinuxSysmanImp->pFsAccess = pFsAccess.get();
-        pSysfsAccessOld = pLinuxSysmanImp->pSysfsAccess;
-        pSysfsAccess = std::make_unique<MockPowerSysfsAccess>();
-        pLinuxSysmanImp->pSysfsAccess = pSysfsAccess.get();
-
-        pmtMapOriginal = pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject;
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.clear();
-
-        auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
-        uint32_t subdeviceId = 0;
-        do {
-            ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
-            auto pPmt = new MockPowerPmt(pFsAccess.get(), onSubdevice, subdeviceId);
-            pPmt->mockedInit(pFsAccess.get());
-            pPmt->keyOffsetMap = deviceKeyOffsetMapPower;
-            pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.emplace(subdeviceId, pPmt);
-        } while (++subdeviceId < subDeviceCount);
-
-        getPowerHandles(0);
+        pSysmanKmdInterface = new MockSysmanKmdInterfacePrelim(pLinuxSysmanImp->getSysmanProductHelper());
+        pFsAccess = new MockPowerFsAccessInterface();
+        pSysfsAccess = new MockPowerSysfsAccessInterface();
+        pSysmanKmdInterface->pFsAccess.reset(pFsAccess);
+        pSysmanKmdInterface->pSysfsAccess.reset(pSysfsAccess);
+        pLinuxSysmanImp->pSysmanKmdInterface.reset(pSysmanKmdInterface);
+        pFsAccess->mockscanDirEntriesResult.push_back(ZE_RESULT_SUCCESS);
+        pLinuxSysmanImp->pFsAccess = pFsAccess;
     }
     void TearDown() override {
-        pLinuxSysmanImp->releasePmtObject();
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject = pmtMapOriginal;
-        pLinuxSysmanImp->pFsAccess = pFsAccessOriginal;
-        pLinuxSysmanImp->pSysfsAccess = pSysfsAccessOld;
         SysmanDeviceFixture::TearDown();
     }
 
@@ -404,43 +324,22 @@ class SysmanDevicePowerMultiDeviceFixture : public SysmanMultiDeviceFixture {
   protected:
     L0::Sysman::SysmanDevice *device = nullptr;
     std::unique_ptr<PublicLinuxPowerImp> pPublicLinuxPowerImp;
-    std::unique_ptr<MockPowerPmt> pPmt;
-    std::unique_ptr<MockPowerFsAccess> pFsAccess;
-    std::unique_ptr<MockPowerSysfsAccess> pSysfsAccess;
-    L0::Sysman::SysfsAccess *pSysfsAccessOld = nullptr;
-    L0::Sysman::FsAccess *pFsAccessOriginal = nullptr;
-    L0::Sysman::OsPower *pOsPowerOriginal = nullptr;
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> mapOriginal;
+    MockSysmanKmdInterfacePrelim *pSysmanKmdInterface = nullptr;
+    MockPowerSysfsAccessInterface *pSysfsAccess = nullptr;
+    MockPowerFsAccessInterface *pFsAccess = nullptr;
+
     void SetUp() override {
         SysmanMultiDeviceFixture::SetUp();
         device = pSysmanDevice;
-        pFsAccess = std::make_unique<MockPowerFsAccess>();
-        pFsAccessOriginal = pLinuxSysmanImp->pFsAccess;
-        pLinuxSysmanImp->pFsAccess = pFsAccess.get();
-        pSysfsAccessOld = pLinuxSysmanImp->pSysfsAccess;
-        pSysfsAccess = std::make_unique<MockPowerSysfsAccess>();
-        pLinuxSysmanImp->pSysfsAccess = pSysfsAccess.get();
-
-        mapOriginal = pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject;
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.clear();
-
-        auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
-        uint32_t subdeviceId = 0;
-        do {
-            ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
-            auto pPmt = new MockPowerPmt(pFsAccess.get(), onSubdevice, subdeviceId);
-            pPmt->mockedInit(pFsAccess.get());
-            pPmt->keyOffsetMap = deviceKeyOffsetMapPower;
-            pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.emplace(subdeviceId, pPmt);
-        } while (++subdeviceId < subDeviceCount);
+        pSysmanKmdInterface = new MockSysmanKmdInterfacePrelim(pLinuxSysmanImp->getSysmanProductHelper());
+        pSysfsAccess = new MockPowerSysfsAccessInterface();
+        pFsAccess = new MockPowerFsAccessInterface();
+        pSysmanKmdInterface->pSysfsAccess.reset(pSysfsAccess);
+        pSysmanKmdInterface->pFsAccess.reset(pFsAccess);
+        pLinuxSysmanImp->pSysmanKmdInterface.reset(pSysmanKmdInterface);
+        pLinuxSysmanImp->pFsAccess = pFsAccess;
     }
     void TearDown() override {
-        for (const auto &pmtMapElement : pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject) {
-            delete pmtMapElement.second;
-        }
-        pLinuxSysmanImp->pFsAccess = pFsAccessOriginal;
-        pLinuxSysmanImp->pSysfsAccess = pSysfsAccessOld;
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject = mapOriginal;
         SysmanMultiDeviceFixture::TearDown();
     }
 
@@ -452,4 +351,5 @@ class SysmanDevicePowerMultiDeviceFixture : public SysmanMultiDeviceFixture {
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

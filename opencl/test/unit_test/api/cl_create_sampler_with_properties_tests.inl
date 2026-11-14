@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,7 +15,7 @@ using namespace NEO;
 
 namespace ULT {
 
-struct SamplerWithPropertiesTest : public ApiFixture<>,
+struct SamplerWithPropertiesTest : public ApiFixture,
                                    public ::testing::WithParamInterface<std::tuple<uint64_t /*cl_sampler_properties*/, uint64_t /*cl_sampler_properties*/, uint64_t /*cl_sampler_properties*/>>,
                                    public ::testing::Test {
     SamplerWithPropertiesTest() {
@@ -233,12 +233,12 @@ static cl_sampler_properties filterProperties[] =
         CL_FILTER_LINEAR,
 };
 
-INSTANTIATE_TEST_CASE_P(api,
-                        ClCreateSamplerWithPropertiesTests2,
-                        ::testing::Combine(
-                            ::testing::ValuesIn(normalizdProperties),
-                            ::testing::ValuesIn(addressingProperties),
-                            ::testing::ValuesIn(filterProperties)));
+INSTANTIATE_TEST_SUITE_P(api,
+                         ClCreateSamplerWithPropertiesTests2,
+                         ::testing::Combine(
+                             ::testing::ValuesIn(normalizdProperties),
+                             ::testing::ValuesIn(addressingProperties),
+                             ::testing::ValuesIn(filterProperties)));
 
 TEST_F(ClCreateSamplerWithPropertiesTests, GivenMipMapDataWhenCreatingSamplerWithPropertiesThenSamplerIsCreatedAndCorrectlyPopulated) {
     SamplerLodProperty minLodProperty;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,26 +8,62 @@
 #include "level_zero/tools/source/debug/debug_session_imp.h"
 
 #include "shared/source/built_ins/sip.h"
+#include "shared/source/debugger/state_save_area_header_v3.h"
+#include "shared/source/device/device.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/preprocessor.h"
 #include "shared/source/helpers/sleep.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/sip_external_lib/sip_external_lib.h"
 
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
-#include "level_zero/include/zet_intel_gpu_debug.h"
+#include "level_zero/zet_intel_gpu_debug.h"
+
+#include <algorithm>
+#include <cinttypes>
 
 namespace L0 {
+
+using SipTransferAddr = DebugSessionImp::SipTransferAddr;
+using SipRegisterPacker = DebugSessionImp::SipRegisterPacker;
+
+static NEO::SipLibThreadId euThreadIdToSip(EuThread::ThreadId threadId) {
+    return NEO::SipLibThreadId{
+        .slice = static_cast<uint32_t>(threadId.slice),
+        .subslice = static_cast<uint32_t>(threadId.subslice),
+        .eu = static_cast<uint32_t>(threadId.eu),
+        .thread = static_cast<uint32_t>(threadId.thread),
+    };
+}
+
+static NEO::RegsetDescExt sipToNeoRegsetDescExt(const SIP::regset_desc &regdesc) {
+    return {
+        .num = regdesc.num,
+        .bytes = regdesc.bytes,
+    };
+}
+
+static SIP::regset_desc regsetDescExtToSip(const NEO::RegsetDescExt &regdesc) {
+    return {
+        .num = regdesc.num,
+        .bits = static_cast<uint16_t>(regdesc.bytes * 8),
+        .bytes = regdesc.bytes,
+    };
+}
 
 DebugSession::DebugSession(const zet_debug_config_t &config, Device *device) : connectedDevice(device), config(config) {
 }
 
 const NEO::TopologyMap &DebugSession::getTopologyMap() {
-    return connectedDevice->getOsInterface().getDriverModel()->getTopologyMap();
+    return connectedDevice->getOsInterface()->getDriverModel()->getTopologyMap();
 };
 
 void DebugSession::createEuThreads() {
@@ -38,7 +74,7 @@ void DebugSession::createEuThreads() {
         auto &hwInfo = connectedDevice->getHwInfo();
         const uint32_t numSubslicesPerSlice = std::max(hwInfo.gtSystemInfo.MaxSubSlicesSupported, hwInfo.gtSystemInfo.MaxDualSubSlicesSupported) / hwInfo.gtSystemInfo.MaxSlicesSupported;
         const uint32_t numEuPerSubslice = hwInfo.gtSystemInfo.MaxEuPerSubSlice;
-        const uint32_t numThreadsPerEu = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount);
+        const uint32_t numThreadsPerEu = hwInfo.gtSystemInfo.NumThreadsPerEu;
         uint32_t subDeviceCount = std::max(1u, connectedDevice->getNEODevice()->getNumSubDevices());
         UNRECOVERABLE_IF(isSubDevice && subDeviceCount > 1);
 
@@ -100,7 +136,6 @@ uint32_t DebugSession::getDeviceIndexFromApiThread(ze_device_thread_t thread) {
 }
 
 ze_device_thread_t DebugSession::convertToPhysicalWithinDevice(ze_device_thread_t thread, uint32_t deviceIndex) {
-    auto deviceImp = static_cast<DeviceImp *>(connectedDevice);
     const auto &topologyMap = getTopologyMap();
 
     // set slice for single slice config to allow subslice remapping
@@ -111,10 +146,10 @@ ze_device_thread_t DebugSession::convertToPhysicalWithinDevice(ze_device_thread_
 
     if (thread.slice != UINT32_MAX) {
         if (thread.subslice != UINT32_MAX) {
-            deviceImp->toPhysicalSliceId(topologyMap, thread.slice, thread.subslice, deviceIndex);
+            connectedDevice->toPhysicalSliceId(topologyMap, thread.slice, thread.subslice, deviceIndex);
         } else {
             uint32_t dummy = 0;
-            deviceImp->toPhysicalSliceId(topologyMap, thread.slice, dummy, deviceIndex);
+            connectedDevice->toPhysicalSliceId(topologyMap, thread.slice, dummy, deviceIndex);
         }
     }
 
@@ -122,21 +157,18 @@ ze_device_thread_t DebugSession::convertToPhysicalWithinDevice(ze_device_thread_
 }
 
 EuThread::ThreadId DebugSession::convertToThreadId(ze_device_thread_t thread) {
-    auto deviceImp = static_cast<DeviceImp *>(connectedDevice);
     UNRECOVERABLE_IF(!DebugSession::isSingleThread(thread));
 
     uint32_t deviceIndex = 0;
-    deviceImp->toPhysicalSliceId(getTopologyMap(), thread.slice, thread.subslice, deviceIndex);
+    connectedDevice->toPhysicalSliceId(getTopologyMap(), thread.slice, thread.subslice, deviceIndex);
 
     EuThread::ThreadId threadId(deviceIndex, thread.slice, thread.subslice, thread.eu, thread.thread);
     return threadId;
 }
 
 ze_device_thread_t DebugSession::convertToApi(EuThread::ThreadId threadId) {
-    auto deviceImp = static_cast<DeviceImp *>(connectedDevice);
-
     ze_device_thread_t thread = {static_cast<uint32_t>(threadId.slice), static_cast<uint32_t>(threadId.subslice), static_cast<uint32_t>(threadId.eu), static_cast<uint32_t>(threadId.thread)};
-    deviceImp->toApiSliceId(getTopologyMap(), thread.slice, thread.subslice, threadId.tileIndex);
+    connectedDevice->toApiSliceId(getTopologyMap(), thread.slice, thread.subslice, threadId.tileIndex);
 
     return thread;
 }
@@ -145,7 +177,7 @@ std::vector<EuThread::ThreadId> DebugSession::getSingleThreadsForDevice(uint32_t
 
     const uint32_t numSubslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
     const uint32_t numEuPerSubslice = hwInfo.gtSystemInfo.MaxEuPerSubSlice;
-    const uint32_t numThreadsPerEu = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount);
+    const uint32_t numThreadsPerEu = hwInfo.gtSystemInfo.NumThreadsPerEu;
 
     UNRECOVERABLE_IF(numThreadsPerEu > 16);
 
@@ -179,7 +211,7 @@ std::vector<EuThread::ThreadId> DebugSession::getSingleThreadsForDevice(uint32_t
                     if (thread != UINT32_MAX) {
                         threadID = thread;
                     }
-                    threads.push_back({deviceIndex, sliceID, subsliceID, euID, threadID});
+                    threads.emplace_back(deviceIndex, sliceID, subsliceID, euID, threadID);
 
                     if (thread != UINT32_MAX) {
                         break;
@@ -282,7 +314,7 @@ size_t DebugSession::getPerThreadScratchOffset(size_t ptss, EuThread::ThreadId t
     auto &hwInfo = connectedDevice->getHwInfo();
     const uint32_t numSubslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
     const uint32_t numEuPerSubslice = hwInfo.gtSystemInfo.MaxEuPerSubSlice;
-    const uint32_t numThreadsPerEu = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount);
+    const uint32_t numThreadsPerEu = hwInfo.gtSystemInfo.NumThreadsPerEu;
 
     const auto &productHelper = connectedDevice->getProductHelper();
     uint32_t threadEuRatio = productHelper.getThreadEuRatioForScratch(hwInfo);
@@ -296,7 +328,7 @@ size_t DebugSession::getPerThreadScratchOffset(size_t ptss, EuThread::ThreadId t
 }
 
 void DebugSession::printBitmask(uint8_t *bitmask, size_t bitmaskSize) {
-    if (NEO::DebugManager.flags.DebuggerLogBitmask.get() & NEO::DebugVariables::DEBUGGER_LOG_BITMASK::LOG_INFO) {
+    if (NEO::debugManager.flags.DebuggerLogBitmask.get() & NEO::DebugVariables::DEBUGGER_LOG_BITMASK::LOG_INFO) {
 
         DEBUG_BREAK_IF(bitmaskSize % sizeof(uint64_t) != 0);
 
@@ -367,12 +399,28 @@ ze_result_t DebugSessionImp::interrupt(ze_device_thread_t thread) {
     return ZE_RESULT_SUCCESS;
 }
 
+uint32_t DebugSessionImp::readSipMemory(void *userArg, uint32_t offset, uint32_t size, void *destination) {
+    struct SipMemoryAccessArgs *args = reinterpret_cast<struct SipMemoryAccessArgs *>(userArg);
+    if (args->debugSession->readGpuMemory(args->contextHandle, static_cast<char *>(destination), size, offset + args->gpuVa) != ZE_RESULT_SUCCESS) {
+        return 0;
+    }
+    return size;
+}
+
+uint32_t DebugSessionImp::writeSipMemory(void *userArg, uint32_t offset, uint32_t size, void *source) {
+    struct SipMemoryAccessArgs *args = reinterpret_cast<struct SipMemoryAccessArgs *>(userArg);
+    if (args->debugSession->writeGpuMemory(args->contextHandle, static_cast<const char *>(source), size, offset + args->gpuVa) != ZE_RESULT_SUCCESS) {
+        return 0;
+    }
+    return size;
+}
+
 DebugSessionImp::Error DebugSessionImp::resumeThreadsWithinDevice(uint32_t deviceIndex, ze_device_thread_t apiThread) {
     auto &hwInfo = connectedDevice->getHwInfo();
     bool allThreadsRunning = true;
     auto physicalThread = convertToPhysicalWithinDevice(apiThread, deviceIndex);
     auto singleThreads = getSingleThreadsForDevice(deviceIndex, physicalThread, hwInfo);
-    Error retVal = Error::Unknown;
+    Error retVal = Error::unknown;
     uint64_t memoryHandle = EuThread::invalidHandle;
 
     std::vector<ze_device_thread_t> resumeThreads;
@@ -390,7 +438,7 @@ DebugSessionImp::Error DebugSessionImp::resumeThreadsWithinDevice(uint32_t devic
     }
 
     if (allThreadsRunning) {
-        return Error::ThreadsRunning;
+        return Error::threadsRunning;
     }
 
     std::unique_lock<std::mutex> lock(threadStateMutex);
@@ -412,7 +460,7 @@ DebugSessionImp::Error DebugSessionImp::resumeThreadsWithinDevice(uint32_t devic
         auto stateSaveReadResult = ZE_RESULT_ERROR_UNKNOWN;
 
         if (gpuVa != 0 && stateSaveAreaSize != 0) {
-            stateSaveArea = std::make_unique<char[]>(stateSaveAreaSize);
+            stateSaveArea = std::make_unique_for_overwrite<char[]>(stateSaveAreaSize);
             stateSaveReadResult = readGpuMemory(memoryHandle, stateSaveArea.get(), stateSaveAreaSize, gpuVa);
         } else {
             DEBUG_BREAK_IF(true);
@@ -431,8 +479,9 @@ DebugSessionImp::Error DebugSessionImp::resumeThreadsWithinDevice(uint32_t devic
     } else {
 
         for (auto &threadID : resumeThreadIds) {
-            while (checkThreadIsResumed(threadID) == false)
+            while (checkThreadIsResumed(threadID) == false) {
                 ;
+            }
 
             allThreads[threadID]->resumeThread();
         }
@@ -440,7 +489,7 @@ DebugSessionImp::Error DebugSessionImp::resumeThreadsWithinDevice(uint32_t devic
     checkStoppedThreadsAndGenerateEvents(resumeThreadIds, memoryHandle, deviceIndex);
 
     if (sipCommandResult && result == ZE_RESULT_SUCCESS) {
-        retVal = Error::Success;
+        retVal = Error::success;
     }
 
     return retVal;
@@ -484,7 +533,7 @@ bool DebugSessionImp::writeResumeCommand(const std::vector<EuThread::ThreadId> &
             }
 
             const auto regSize = std::max(getRegisterSize(registerType), hwInfo.capabilityTable.grfSize);
-            auto reg = std::make_unique<uint32_t[]>(regSize / sizeof(uint32_t));
+            auto reg = std::make_unique_for_overwrite<uint32_t[]>(regSize / sizeof(uint32_t));
 
             for (auto &threadID : threadIds) {
                 memset(reg.get(), 0, regSize);
@@ -501,8 +550,8 @@ bool DebugSessionImp::writeResumeCommand(const std::vector<EuThread::ThreadId> &
         }
     } else // >= 2u
     {
-        SIP::sip_command resumeCommand = {0};
-        resumeCommand.command = static_cast<uint32_t>(NEO::SipKernel::COMMAND::RESUME);
+        NEO::SipCommandRegisterValues resumeCommand = {{0}};
+        resumeCommand.sip_commandValues.command = static_cast<uint32_t>(NEO::SipKernel::Command::resume);
 
         for (auto &threadID : threadIds) {
             ze_result_t result = cmdRegisterAccessHelper(threadID, resumeCommand, true);
@@ -517,10 +566,9 @@ bool DebugSessionImp::writeResumeCommand(const std::vector<EuThread::ThreadId> &
 bool DebugSessionImp::checkThreadIsResumed(const EuThread::ThreadId &threadID) {
     auto stateSaveAreaHeader = getStateSaveAreaHeader();
     bool resumed = true;
-
-    if (stateSaveAreaHeader->versionHeader.version.major >= 2u) {
+    const auto thread = allThreads[threadID].get();
+    if (stateSaveAreaHeader->versionHeader.version.major > 1 && stateSaveAreaHeader->versionHeader.version.major < 5) {
         SIP::sr_ident srMagic = {{0}};
-        const auto thread = allThreads[threadID].get();
 
         if (!readSystemRoutineIdent(thread, thread->getMemoryHandle(), srMagic)) {
             return resumed;
@@ -532,6 +580,15 @@ bool DebugSessionImp::checkThreadIsResumed(const EuThread::ThreadId &threadID) {
         if (srMagic.count == thread->getLastCounter()) {
             resumed = false;
         }
+    } else if (stateSaveAreaHeader->versionHeader.version.major >= 5) {
+        uint64_t sipCounter = 0;
+        if (!getThreadSipCounter(nullptr, thread, stateSaveAreaHeader, &sipCounter)) {
+            return resumed;
+        }
+        // Counter greater than last one means thread was resumed
+        if (sipCounter == thread->getLastCounter()) {
+            resumed = false;
+        }
     }
     return resumed;
 }
@@ -539,10 +596,10 @@ bool DebugSessionImp::checkThreadIsResumed(const EuThread::ThreadId &threadID) {
 bool DebugSessionImp::checkThreadIsResumed(const EuThread::ThreadId &threadID, const void *stateSaveArea) {
     auto stateSaveAreaHeader = getStateSaveAreaHeader();
     bool resumed = true;
+    const auto thread = allThreads[threadID].get();
 
-    if (stateSaveAreaHeader->versionHeader.version.major >= 2u) {
+    if (stateSaveAreaHeader->versionHeader.version.major > 1 && stateSaveAreaHeader->versionHeader.version.major < 5) {
         SIP::sr_ident srMagic = {{0}};
-        const auto thread = allThreads[threadID].get();
 
         if (!readSystemRoutineIdentFromMemory(thread, stateSaveArea, srMagic)) {
             return resumed;
@@ -552,6 +609,16 @@ bool DebugSessionImp::checkThreadIsResumed(const EuThread::ThreadId &threadID, c
 
         // Counter greater than last one means thread was resumed
         if (srMagic.count == thread->getLastCounter()) {
+            resumed = false;
+        }
+    } else if (stateSaveAreaHeader->versionHeader.version.major >= 5) {
+        uint64_t sipCounter = 0;
+        if (!getThreadSipCounter(stateSaveArea, thread, stateSaveAreaHeader, &sipCounter)) {
+            return resumed;
+        }
+        PRINT_DEBUGGER_THREAD_LOG("checkThreadIsResumed - Read counter for thread %s, counter == %d\n", EuThread::toString(threadID).c_str(), (int)sipCounter);
+        // Counter greater than last one means thread was resumed
+        if (sipCounter == thread->getLastCounter()) {
             resumed = false;
         }
     }
@@ -569,17 +636,15 @@ ze_result_t DebugSessionImp::resume(ze_device_thread_t thread) {
 
         if (connectedDevice->getNEODevice()->isSubDevice()) {
             deviceIndex = Math::log2(static_cast<uint32_t>(connectedDevice->getNEODevice()->getDeviceBitfield().to_ulong()));
-        } else {
-            if (thread.slice != UINT32_MAX) {
-                deviceIndex = getDeviceIndexFromApiThread(thread);
-            }
+        } else if (thread.slice != UINT32_MAX) {
+            deviceIndex = getDeviceIndexFromApiThread(thread);
         }
 
         auto result = resumeThreadsWithinDevice(deviceIndex, thread);
 
-        if (result == Error::ThreadsRunning) {
+        if (result == Error::threadsRunning) {
             retVal = ZE_RESULT_ERROR_NOT_AVAILABLE;
-        } else if (result != Error::Success) {
+        } else if (result != Error::success) {
             return ZE_RESULT_ERROR_UNKNOWN;
         }
     } else {
@@ -588,9 +653,9 @@ ze_result_t DebugSessionImp::resume(ze_device_thread_t thread) {
         for (uint32_t deviceId = 0; deviceId < deviceCount; deviceId++) {
             auto result = resumeThreadsWithinDevice(deviceId, thread);
 
-            if (result == Error::ThreadsRunning) {
+            if (result == Error::threadsRunning) {
                 continue;
-            } else if (result != Error::Success) {
+            } else if (result != Error::success) {
                 retVal = ZE_RESULT_ERROR_UNKNOWN;
             }
             allThreadsRunning = false;
@@ -702,6 +767,20 @@ void DebugSessionImp::sendInterrupts() {
     }
 }
 
+size_t DebugSessionImp::calculateSrMagicOffset(const NEO::StateSaveAreaHeader *stateSaveAreaHeader, EuThread *thread) {
+    auto threadSlotOffset = calculateThreadSlotOffset(thread->getThreadId());
+    size_t srMagicOffset = 0;
+    if (stateSaveAreaHeader->versionHeader.version.major == 3) {
+        srMagicOffset = threadSlotOffset + NEO::getStateSaveAreaV3SrMagicOffset(*stateSaveAreaHeader);
+    } else if (stateSaveAreaHeader->versionHeader.version.major < 3) {
+        srMagicOffset = threadSlotOffset + stateSaveAreaHeader->regHeader.sr_magic_offset;
+    } else {
+        PRINT_DEBUGGER_ERROR_LOG("%s: Unsupported version of State Save Area Header\n", NEO_FUNCTION_NAME);
+        DEBUG_BREAK_IF(true);
+    }
+    return srMagicOffset;
+}
+
 bool DebugSessionImp::readSystemRoutineIdent(EuThread *thread, uint64_t memoryHandle, SIP::sr_ident &srIdent) {
     auto stateSaveAreaHeader = getStateSaveAreaHeader();
     if (!stateSaveAreaHeader) {
@@ -713,8 +792,7 @@ bool DebugSessionImp::readSystemRoutineIdent(EuThread *thread, uint64_t memoryHa
         return false;
     }
 
-    auto threadSlotOffset = calculateThreadSlotOffset(thread->getThreadId());
-    auto srMagicOffset = threadSlotOffset + stateSaveAreaHeader->regHeader.sr_magic_offset;
+    auto srMagicOffset = calculateSrMagicOffset(stateSaveAreaHeader, thread);
 
     if (ZE_RESULT_SUCCESS != readGpuMemory(memoryHandle, reinterpret_cast<char *>(&srIdent), sizeof(srIdent), gpuVa + srMagicOffset)) {
         return false;
@@ -729,11 +807,12 @@ bool DebugSessionImp::readSystemRoutineIdent(EuThread *thread, uint64_t memoryHa
 }
 bool DebugSessionImp::readSystemRoutineIdentFromMemory(EuThread *thread, const void *stateSaveArea, SIP::sr_ident &srIdent) {
     auto stateSaveAreaHeader = getStateSaveAreaHeader();
-    auto threadSlotOffset = calculateThreadSlotOffset(thread->getThreadId());
-    auto srMagicOffset = threadSlotOffset + stateSaveAreaHeader->regHeader.sr_magic_offset;
+
+    auto srMagicOffset = calculateSrMagicOffset(stateSaveAreaHeader, thread);
     auto threadSlot = ptrOffset(stateSaveArea, srMagicOffset);
     memcpy_s(&srIdent, sizeof(SIP::sr_ident), threadSlot, sizeof(SIP::sr_ident));
 
+    PRINT_DEBUGGER_INFO_LOG("readSystemRoutineIdentFromMemory - srMagicOffset %lu for thread %s\n", srMagicOffset, EuThread::toString(thread->getThreadId()).c_str());
     if (0 != strcmp(srIdent.magic, "srmagic")) {
         PRINT_DEBUGGER_ERROR_LOG("readSystemRoutineIdentFromMemory - Failed to read srMagic for thread %s\n", EuThread::toString(thread->getThreadId()).c_str());
         return false;
@@ -746,6 +825,7 @@ void DebugSessionImp::addThreadToNewlyStoppedFromRaisedAttention(EuThread::Threa
 
     SIP::sr_ident srMagic = {{0}};
     srMagic.count = 0;
+    auto stateSaveAreaHeader = getStateSaveAreaHeader();
 
     DEBUG_BREAK_IF(stateSaveArea == nullptr);
 
@@ -754,12 +834,20 @@ void DebugSessionImp::addThreadToNewlyStoppedFromRaisedAttention(EuThread::Threa
         wasStopped = allThreads[threadId]->isStopped();
 
         if (!wasStopped) {
-
-            if (!readSystemRoutineIdentFromMemory(allThreads[threadId].get(), stateSaveArea, srMagic)) {
-                PRINT_DEBUGGER_ERROR_LOG("Failed to read SR IDENT\n", "");
-                return;
+            uint64_t counter = 0;
+            if (stateSaveAreaHeader->versionHeader.version.major < 5) {
+                if (!readSystemRoutineIdentFromMemory(allThreads[threadId].get(), stateSaveArea, srMagic)) {
+                    PRINT_DEBUGGER_ERROR_LOG("Failed to read SR IDENT\n", "");
+                    return;
+                } else {
+                    PRINT_DEBUGGER_INFO_LOG("SIP version == %d.%d.%d\n", (int)srMagic.version.major, (int)srMagic.version.minor, (int)srMagic.version.patch);
+                }
             } else {
-                PRINT_DEBUGGER_INFO_LOG("SIP version == %d.%d.%d\n", (int)srMagic.version.major, (int)srMagic.version.minor, (int)srMagic.version.patch);
+                if (!getThreadSipCounterWithMemHandle(stateSaveArea, allThreads[threadId].get(), stateSaveAreaHeader, &counter, memoryHandle)) {
+                    PRINT_DEBUGGER_ERROR_LOG("Failed to read SIP counter\n", "");
+                    return;
+                }
+                srMagic.count = static_cast<uint8_t>(counter);
             }
 
             if (!allThreads[threadId]->verifyStopped(srMagic.count)) {
@@ -802,26 +890,58 @@ void DebugSessionImp::generateEventsAndResumeStoppedThreads() {
 }
 
 bool DebugSessionImp::isForceExceptionOrForceExternalHaltOnlyExceptionReason(uint32_t *cr0) {
-    const uint32_t cr0ExceptionBitmask = 0xFC000000;
-    const uint32_t cr0ForcedExcpetionBitmask = 0x44000000;
+    const uint32_t cr0ExceptionBitmask = 0xFCE10000;
+    const uint32_t cr0ForcedExceptionBitmask = 0x44000000;
 
-    return (((cr0[1] & cr0ExceptionBitmask) & (~cr0ForcedExcpetionBitmask)) == 0);
+    return (((cr0[1] & cr0ExceptionBitmask) & (~cr0ForcedExceptionBitmask)) == 0);
+}
+
+bool DebugSessionImp::isAIPequalToThreadStartIP(uint32_t *cr0, uint32_t *dbg0) {
+    if (cr0[2] == dbg0[0]) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+bool DebugSessionImp::doesSr5ContainExceptionReason(const EuThread::ThreadId &threadId) {
+    const auto &ssah = getStateSaveAreaHeader();
+    if (ssah && ssah->versionHeader.version.major >= 5) {
+        const auto size = getRegisterSize(ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU);
+        std::vector<uint32_t> sr5(std::max<size_t>(1u, size / sizeof(sr5[0])));
+        readRegistersImp(threadId, ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU, 3, 1, sr5.data());
+        return (sr5[0] >> 3) & 1;
+    }
+    return false;
 }
 
 void DebugSessionImp::fillResumeAndStoppedThreadsFromNewlyStopped(std::vector<EuThread::ThreadId> &resumeThreads, std::vector<EuThread::ThreadId> &stoppedThreadsToReport, std::vector<EuThread::ThreadId> &interruptedThreads) {
 
     if (newlyStoppedThreads.empty()) {
+        PRINT_DEBUGGER_INFO_LOG("%s", "No newly stopped threads found. Returning");
         return;
     }
     const auto regSize = std::max(getRegisterSize(ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU), 64u);
-    auto reg = std::make_unique<uint32_t[]>(regSize / sizeof(uint32_t));
+    auto reg = std::make_unique_for_overwrite<uint32_t[]>(regSize / sizeof(uint32_t));
 
     for (auto &newlyStopped : newlyStoppedThreads) {
         if (allThreads[newlyStopped]->isStopped()) {
             memset(reg.get(), 0, regSize);
             readRegistersImp(newlyStopped, ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, 0, 1, reg.get());
 
-            if (isForceExceptionOrForceExternalHaltOnlyExceptionReason(reg.get())) {
+            if (allThreads[newlyStopped]->getPageFault()) {
+                uint32_t dbgreg[64u] = {0};
+                readRegistersImp(newlyStopped, ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU, 0, 1, dbgreg);
+                if (isAIPequalToThreadStartIP(reg.get(), dbgreg)) {
+                    PRINT_DEBUGGER_THREAD_LOG("Thread %s with PF AIP is equal to StartIP. Filtering out\n", allThreads[newlyStopped]->toString().c_str());
+                } else {
+                    const uint32_t cr0PFBit16 = 0x10000;
+                    reg[1] = reg[1] | cr0PFBit16;
+                    writeRegistersImp(newlyStopped, ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, 0, 1, reg.get());
+                }
+            }
+
+            if (isForceExceptionOrForceExternalHaltOnlyExceptionReason(reg.get()) && !doesSr5ContainExceptionReason(newlyStopped)) {
                 bool threadWasInterrupted = false;
 
                 for (auto &request : pendingInterrupts) {
@@ -841,10 +961,14 @@ void DebugSessionImp::fillResumeAndStoppedThreadsFromNewlyStopped(std::vector<Eu
                     interruptedThreads.push_back(newlyStopped);
                 } else {
                     PRINT_DEBUGGER_THREAD_LOG("RESUME accidentally stopped thread = %s\n", allThreads[newlyStopped]->toString().c_str());
+                    const uint32_t cr0ForcedExceptionBitmask = 0x44000000;
+                    reg[1] = reg[1] & (~cr0ForcedExceptionBitmask);
+                    writeRegistersImp(newlyStopped, ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, 0, 1, reg.get());
                     resumeThreads.push_back(newlyStopped);
                 }
             } else {
                 PRINT_DEBUGGER_THREAD_LOG("Newly stopped thread = %s, exception bits = %#010" PRIx32 "\n", allThreads[newlyStopped]->toString().c_str(), reg[1]);
+                allThreads[newlyStopped]->setPageFault(false);
                 stoppedThreadsToReport.push_back(newlyStopped);
             }
         }
@@ -875,17 +999,14 @@ void DebugSessionImp::generateEventsForPendingInterrupts() {
 }
 
 void DebugSessionImp::resumeAccidentallyStoppedThreads(const std::vector<EuThread::ThreadId> &threadIds) {
-    std::vector<ze_device_thread_t> threads[4];
     std::vector<EuThread::ThreadId> threadIdsPerDevice[4];
 
     for (auto &threadID : threadIds) {
-        ze_device_thread_t thread = {static_cast<uint32_t>(threadID.slice), static_cast<uint32_t>(threadID.subslice), static_cast<uint32_t>(threadID.eu), static_cast<uint32_t>(threadID.thread)};
         uint32_t deviceIndex = static_cast<uint32_t>(threadID.tileIndex);
 
         UNRECOVERABLE_IF((connectedDevice->getNEODevice()->getNumSubDevices() > 0) &&
                          (deviceIndex >= connectedDevice->getNEODevice()->getNumSubDevices()));
 
-        threads[deviceIndex].push_back(thread);
         threadIdsPerDevice[deviceIndex].push_back(threadID);
     }
 
@@ -899,8 +1020,9 @@ void DebugSessionImp::resumeAccidentallyStoppedThreads(const std::vector<EuThrea
         }
 
         for (auto &threadID : threadIdsPerDevice[i]) {
-            while (checkThreadIsResumed(threadID) == false)
+            while (checkThreadIsResumed(threadID) == false) {
                 ;
+            }
 
             allThreads[threadID]->resumeThread();
         }
@@ -953,20 +1075,46 @@ ze_result_t DebugSessionImp::readEvent(uint64_t timeout, zet_debug_event_t *outp
     return ZE_RESULT_NOT_READY;
 }
 
+void DebugSessionImp::dumpDebugSurfaceToFile(uint64_t vmHandle, uint64_t gpuVa, const std::string &path) {
+    auto stateSaveAreaSize = getContextStateSaveAreaSize(vmHandle);
+    std::vector<char> data(stateSaveAreaSize);
+    auto retVal = readGpuMemory(vmHandle, data.data(), data.size(), gpuVa);
+    if (retVal != ZE_RESULT_SUCCESS) {
+        PRINT_DEBUGGER_ERROR_LOG("Reading context state save area failed, error = %d\n", retVal);
+        return;
+    }
+    NEO::writeDataToFile(path.c_str(), std::string_view(data.data(), data.size()), false);
+}
+
 void DebugSessionImp::validateAndSetStateSaveAreaHeader(uint64_t vmHandle, uint64_t gpuVa) {
-    auto headerSize = sizeof(SIP::StateSaveAreaHeader);
+    const std::string dumpDebugSurfacePath = NEO::debugManager.flags.DumpDebugSurfaceFile.get();
+    if (dumpDebugSurfacePath != "unk") {
+        dumpDebugSurfaceToFile(vmHandle, gpuVa, dumpDebugSurfacePath);
+    }
+
+    auto headerSize = sizeof(NEO::StateSaveAreaHeader);
     std::vector<char> data(headerSize);
-    auto retVal = readGpuMemory(vmHandle, data.data(), headerSize, gpuVa);
+    auto retVal = readGpuMemory(vmHandle, data.data(), sizeof(SIP::StateSaveArea), gpuVa);
 
     if (retVal != ZE_RESULT_SUCCESS) {
-        PRINT_DEBUGGER_ERROR_LOG("Reading Context State Save Area failed, error = %d\n", retVal);
+        PRINT_DEBUGGER_ERROR_LOG("Reading Context State Save Area Version Header failed, error = %d\n", retVal);
         return;
     }
 
-    auto pStateSaveArea = reinterpret_cast<const SIP::StateSaveAreaHeader *>(data.data());
+    auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(data.data());
     if (0 == strcmp(pStateSaveArea->versionHeader.magic, "tssarea")) {
         size_t size = pStateSaveArea->versionHeader.size * 8u;
-        DEBUG_BREAK_IF(size != sizeof(SIP::StateSaveAreaHeader));
+        size_t regHeaderSize = 0;
+        if (!getRegHeaderSize(pStateSaveArea, size, regHeaderSize)) {
+            PRINT_DEBUGGER_ERROR_LOG("Setting Context State Save Area: unsupported version == %d.%d.%d\n", (int)pStateSaveArea->versionHeader.version.major, (int)pStateSaveArea->versionHeader.version.minor, (int)pStateSaveArea->versionHeader.version.patch);
+            DEBUG_BREAK_IF(true);
+            return;
+        }
+        auto retVal = readGpuMemory(vmHandle, data.data() + sizeof(SIP::StateSaveArea), regHeaderSize, gpuVa + sizeof(SIP::StateSaveArea));
+        if (retVal != ZE_RESULT_SUCCESS) {
+            PRINT_DEBUGGER_ERROR_LOG("Reading Context State Save Area Reg Header failed, error = %d\n", retVal);
+            return;
+        }
         stateSaveAreaHeader.assign(data.begin(), data.begin() + size);
         PRINT_DEBUGGER_INFO_LOG("Context State Save Area : version == %d.%d.%d\n", (int)pStateSaveArea->versionHeader.version.major, (int)pStateSaveArea->versionHeader.version.minor, (int)pStateSaveArea->versionHeader.version.patch);
         slmSipVersionCheck();
@@ -988,68 +1136,267 @@ void DebugSessionImp::slmSipVersionCheck() {
     }
 }
 
-const SIP::StateSaveAreaHeader *DebugSessionImp::getStateSaveAreaHeader() {
+const NEO::StateSaveAreaHeader *DebugSessionImp::getStateSaveAreaHeader() {
     if (stateSaveAreaHeader.empty()) {
         readStateSaveAreaHeader();
     }
-    return reinterpret_cast<SIP::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+    return reinterpret_cast<NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
 }
 
-const SIP::regset_desc *DebugSessionImp::getSbaRegsetDesc() {
-    // SBA virtual register set is always present
+uint32_t DebugSessionImp::getStateSaveAreaMajorVersion() {
+    const auto &ssah = getStateSaveAreaHeader();
+    return ssah ? ssah->versionHeader.version.major : 0;
+}
+
+const SIP::regset_desc *DebugSessionImp::getModeFlagsRegsetDesc() {
+    static const SIP::regset_desc mode = {0, 1, 32, 4};
+    return &mode;
+}
+
+const SIP::regset_desc *DebugSessionImp::getDebugScratchRegsetDesc() {
+    static const SIP::regset_desc debugScratch = {0, 2, 64, 8};
+    return &debugScratch;
+}
+
+const SIP::regset_desc *DebugSessionImp::getThreadScratchRegsetDesc() {
+    static const SIP::regset_desc threadScratch = {0, 2, 64, 8};
+    return &threadScratch;
+}
+
+bool DebugSessionImp::isHeaplessMode(L0::Device *device, const NEO::StateSaveAreaHeader &stateSaveAreaHeader) {
+    if (device->getNEODevice()->getSipExternalLibInterface()) {
+        return true;
+    }
+    return (NEO::getStateSaveAreaV3SipFlags(stateSaveAreaHeader) & SIP::SIP_FLAG_HEAPLESS);
+}
+
+const SIP::regset_desc *DebugSessionImp::getSbaRegsetDesc(L0::Device *device, const NEO::StateSaveAreaHeader &ssah) {
+
+    static const SIP::regset_desc sbaHeapless = {0, 0, 0, 0};
     static const SIP::regset_desc sba = {0, ZET_DEBUG_SBA_COUNT_INTEL_GPU, 64, 8};
-    return &sba;
+    if (ssah.versionHeader.version.major > 5) {
+        DEBUG_BREAK_IF(true);
+        PRINT_DEBUGGER_ERROR_LOG("Unsupported version of State Save Area Header\n", "");
+        return nullptr;
+    } else if (ssah.versionHeader.version.major == 3 && isHeaplessMode(device, ssah)) {
+        return &sbaHeapless;
+    } else if (ssah.versionHeader.version.major == 5) {
+        return &sbaHeapless;
+    } else {
+        return &sba;
+    }
 }
 
-const SIP::regset_desc *DebugSessionImp::typeToRegsetDesc(uint32_t type) {
-    auto pStateSaveAreaHeader = getStateSaveAreaHeader();
-
+const SIP::regset_desc *DebugSessionImp::typeToRegsetDesc(const NEO::StateSaveAreaHeader *pStateSaveAreaHeader, zet_debug_regset_type_intel_gpu_t type, L0::Device *device) {
     if (pStateSaveAreaHeader == nullptr) {
         DEBUG_BREAK_IF(pStateSaveAreaHeader == nullptr);
         return nullptr;
     }
 
-    switch (type) {
-    case ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.grf;
-    case ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.addr;
-    case ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.flag;
-    case ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.emask;
-    case ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.sr;
-    case ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.cr;
-    case ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.tdr;
-    case ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.acc;
-    case ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.mme;
-    case ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.sp;
-    case ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.dbg;
-    case ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU:
-        return &pStateSaveAreaHeader->regHeader.fc;
-    case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU:
-        return DebugSessionImp::getSbaRegsetDesc();
-    default:
+    if (pStateSaveAreaHeader->versionHeader.version.major >= 5) {
+        PRINT_DEBUGGER_ERROR_LOG("%s: Unsupported version of State Save Area Header\n", NEO_FUNCTION_NAME);
+        DEBUG_BREAK_IF(true);
+        return nullptr;
+    }
+
+    auto sipLibInterface = device->getNEODevice()->getSipExternalLibInterface();
+    if (sipLibInterface) {
+        switch (type) {
+        case ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU:
+            return DebugSessionImp::getModeFlagsRegsetDesc();
+        case ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU:
+            return DebugSessionImp::getDebugScratchRegsetDesc();
+        case ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU:
+            return DebugSessionImp::getThreadScratchRegsetDesc();
+        case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU: {
+            auto &stateSaveAreaHeader = NEO::SipKernel::getDebugSipKernel(*device->getNEODevice()).getStateSaveAreaHeader();
+            auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+            return DebugSessionImp::getSbaRegsetDesc(device, *pStateSaveArea);
+        }
+        default:
+            return sipLibInterface->getRegsetDescFromMap(getSipRegisterType(type));
+        }
+    }
+
+    if (pStateSaveAreaHeader->versionHeader.version.major == 3) {
+        switch (type) {
+        case ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.grf;
+        case ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.addr;
+        case ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.flag;
+        case ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.emask;
+        case ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.sr;
+        case ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.cr;
+        case ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.tdr;
+        case ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.acc;
+        case ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.mme;
+        case ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.sp;
+        case ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.dbg_reg;
+        case ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.fc;
+        case ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU:
+            return DebugSessionImp::getModeFlagsRegsetDesc();
+        case ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU:
+            return DebugSessionImp::getDebugScratchRegsetDesc();
+        case ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU:
+            return DebugSessionImp::getThreadScratchRegsetDesc();
+        case ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.scalar;
+        case ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeaderV3.msg;
+        case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU: {
+            auto &stateSaveAreaHeader = NEO::SipKernel::getDebugSipKernel(*device->getNEODevice()).getStateSaveAreaHeader();
+            auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+            return DebugSessionImp::getSbaRegsetDesc(device, *pStateSaveArea);
+        }
+        default:
+            return nullptr;
+        }
+    } else if (pStateSaveAreaHeader->versionHeader.version.major < 3) {
+        switch (type) {
+        case ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.grf;
+        case ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.addr;
+        case ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.flag;
+        case ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.emask;
+        case ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.sr;
+        case ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.cr;
+        case ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.tdr;
+        case ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.acc;
+        case ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.mme;
+        case ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.sp;
+        case ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.dbg_reg;
+        case ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU:
+            return &pStateSaveAreaHeader->regHeader.fc;
+        case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU: {
+            auto &stateSaveAreaHeader = NEO::SipKernel::getDebugSipKernel(*device->getNEODevice()).getStateSaveAreaHeader();
+            auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+            return DebugSessionImp::getSbaRegsetDesc(device, *pStateSaveArea);
+        }
+        default:
+            return nullptr;
+        }
+    } else {
+        PRINT_DEBUGGER_ERROR_LOG("Unsupported version of State Save Area Header\n", "");
+        DEBUG_BREAK_IF(true);
         return nullptr;
     }
 }
 
-uint32_t DebugSessionImp::getRegisterSize(uint32_t type) {
-    auto regset = typeToRegsetDesc(type);
-    if (regset) {
-        return regset->bytes;
+NEO::SipRegisterType DebugSessionImp::getSipRegisterType(zet_debug_regset_type_intel_gpu_t type) {
+    using SipRegisterType = NEO::SipRegisterType;
+    switch (type) {
+    case ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU:
+        return SipRegisterType::eGRF;
+    case ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU:
+        return SipRegisterType::eAccumulator;
+    case ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU:
+        return SipRegisterType::eFlags;
+    case ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU:
+        return SipRegisterType::eState;
+    case ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU:
+        return SipRegisterType::eControl;
+    case ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU:
+        return SipRegisterType::eAddress;
+    case ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU:
+        return SipRegisterType::eChannelEnable;
+    case ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU:
+        return SipRegisterType::eStackPointer;
+    case ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU:
+        return SipRegisterType::eTDR;
+    case ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU:
+        return SipRegisterType::eFlowControl;
+    case ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU:
+        return SipRegisterType::eDebug;
+    case ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU:
+        return SipRegisterType::eMME;
+    case ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU:
+        return SipRegisterType::eScalar;
+    case ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU:
+        return SipRegisterType::eMessageControl;
+    case ZET_DEBUG_REGSET_TYPE_STATUS_INTEL_GPU:
+        return SipRegisterType::eStatus;
+    case ZET_DEBUG_REGSET_TYPE_RANDOM_INTEL_GPU:
+        return SipRegisterType::eRandom;
+    case ZET_DEBUG_REGSET_TYPE_DIRECT_INTEL_GPU:
+        return SipRegisterType::eDirect;
+    case ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_FORCE_UINT32:
+    case ZET_DEBUG_REGSET_TYPE_INVALID_INTEL_GPU:
+        return SipRegisterType::eInvalid;
+    }
+    PRINT_DEBUGGER_ERROR_LOG("Unhandled zet_debug_regset_type_intel_gpu_t: %d", type);
+    DEBUG_BREAK_IF(true);
+    return SipRegisterType::eInvalid;
+}
+
+std::optional<NEO::RegsetDescExt> DebugSessionImp::typeToRegsetDescExt(zet_debug_regset_type_intel_gpu_t type, L0::Device *device) {
+    auto sipLibInterface = device->getNEODevice()->getSipExternalLibInterface();
+    switch (type) {
+    case ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU:
+        return sipToNeoRegsetDescExt(*getModeFlagsRegsetDesc());
+    case ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU:
+        return sipToNeoRegsetDescExt(*getDebugScratchRegsetDesc());
+    case ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU:
+        return sipToNeoRegsetDescExt(*getThreadScratchRegsetDesc());
+    case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU: {
+        const auto &stateSaveAreaHeader = NEO::SipKernel::getDebugSipKernel(*device->getNEODevice()).getStateSaveAreaHeader();
+        const auto &ssah = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+        const auto &regdesc = getSbaRegsetDesc(device, *ssah);
+        if (regdesc) {
+            return sipToNeoRegsetDescExt(*regdesc);
+        }
+        return std::nullopt;
+    }
+    default:
+        if (!sipLibInterface) {
+            PRINT_DEBUGGER_ERROR_LOG("%s: SipExternalLibInterface not available", NEO_FUNCTION_NAME);
+            DEBUG_BREAK_IF(true);
+            return std::nullopt;
+        }
+        return sipLibInterface->getRegsetDescExt(getSipRegisterType(type));
+    }
+}
+
+uint32_t DebugSessionImp::getRegisterSize(zet_debug_regset_type_intel_gpu_t type) {
+    if (getStateSaveAreaMajorVersion() >= 5) {
+        const auto &regset = typeToRegsetDescExt(type, connectedDevice);
+        if (regset) {
+            return regset->bytes;
+        }
+    } else {
+        const auto &regset = typeToRegsetDesc(getStateSaveAreaHeader(), type, connectedDevice);
+        if (regset) {
+            return regset->bytes;
+        }
     }
     return 0;
 }
 
-uint32_t DebugSessionImp::typeToRegsetFlags(uint32_t type) {
+uint32_t DebugSessionImp::typeToRegsetFlags(zet_debug_regset_type_intel_gpu_t type) {
     switch (type) {
     case ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU:
@@ -1057,14 +1404,23 @@ uint32_t DebugSessionImp::typeToRegsetFlags(uint32_t type) {
     case ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_STATUS_INTEL_GPU:
         return ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE;
 
     case ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU:
     case ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_RANDOM_INTEL_GPU:
+    case ZET_DEBUG_REGSET_TYPE_DIRECT_INTEL_GPU:
         return ZET_DEBUG_REGSET_FLAG_READABLE;
 
     default:
@@ -1074,15 +1430,67 @@ uint32_t DebugSessionImp::typeToRegsetFlags(uint32_t type) {
 
 size_t DebugSessionImp::calculateThreadSlotOffset(EuThread::ThreadId threadId) {
     auto pStateSaveAreaHeader = getStateSaveAreaHeader();
-    return pStateSaveAreaHeader->versionHeader.size * 8 + pStateSaveAreaHeader->regHeader.state_area_offset + ((((threadId.slice * pStateSaveAreaHeader->regHeader.num_subslices_per_slice + threadId.subslice) * pStateSaveAreaHeader->regHeader.num_eus_per_subslice + threadId.eu) * pStateSaveAreaHeader->regHeader.num_threads_per_eu + threadId.thread) * pStateSaveAreaHeader->regHeader.state_save_size);
+    if (pStateSaveAreaHeader->versionHeader.version.major > 3) {
+        DEBUG_BREAK_IF(true);
+        PRINT_DEBUGGER_ERROR_LOG("Unsupported version of State Save Area Header\n", "");
+        return 0;
+    } else if (pStateSaveAreaHeader->versionHeader.version.major == 3) {
+        return pStateSaveAreaHeader->versionHeader.size * 8 + pStateSaveAreaHeader->regHeaderV3.state_area_offset + ((((threadId.slice * pStateSaveAreaHeader->regHeaderV3.num_subslices_per_slice + threadId.subslice) * pStateSaveAreaHeader->regHeaderV3.num_eus_per_subslice + threadId.eu) * pStateSaveAreaHeader->regHeaderV3.num_threads_per_eu + threadId.thread) * pStateSaveAreaHeader->regHeaderV3.state_save_size);
+    } else {
+        return pStateSaveAreaHeader->versionHeader.size * 8 + pStateSaveAreaHeader->regHeader.state_area_offset + ((((threadId.slice * pStateSaveAreaHeader->regHeader.num_subslices_per_slice + threadId.subslice) * pStateSaveAreaHeader->regHeader.num_eus_per_subslice + threadId.eu) * pStateSaveAreaHeader->regHeader.num_threads_per_eu + threadId.thread) * pStateSaveAreaHeader->regHeader.state_save_size);
+    }
 }
 
 size_t DebugSessionImp::calculateRegisterOffsetInThreadSlot(const SIP::regset_desc *regdesc, uint32_t start) {
     return regdesc->offset + regdesc->bytes * start;
 }
 
+ze_result_t DebugSessionImp::readModeFlags(uint32_t start, uint32_t count, void *pRegisterValues) {
+    if (start != 0 || count != 1) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    auto &stateSaveAreaHeader = NEO::SipKernel::getDebugSipKernel(*connectedDevice->getNEODevice()).getStateSaveAreaHeader();
+    auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+    if (pStateSaveArea->versionHeader.version.major >= 5) {
+        uint32_t data = ZET_DEBUG_MODE_FLAG_HEAPLESS;
+        memcpy_s(pRegisterValues, sizeof(data), &data, sizeof(data));
+        return ZE_RESULT_SUCCESS;
+    }
+
+    const uint32_t sipFlags = NEO::getStateSaveAreaV3SipFlags(*pStateSaveArea);
+    memcpy_s(pRegisterValues, sizeof(sipFlags), &sipFlags, sizeof(sipFlags));
+    return ZE_RESULT_SUCCESS;
+}
+ze_result_t DebugSessionImp::readDebugScratchRegisters(uint32_t start, uint32_t count, void *pRegisterValues) {
+
+    auto debugScratchRegDesc = DebugSessionImp::getDebugScratchRegsetDesc();
+
+    if (start >= debugScratchRegDesc->num) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (start + count > debugScratchRegDesc->num) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    auto info = getModuleDebugAreaInfo();
+
+    std::vector<uint64_t> packed;
+    auto gmmHelper = connectedDevice->getNEODevice()->getGmmHelper();
+    packed.push_back(gmmHelper->canonize(info.gpuVa));
+    packed.push_back(info.size);
+
+    size_t size = count * debugScratchRegDesc->bytes;
+    memcpy_s(pRegisterValues, size, &packed[start], size);
+
+    return ZE_RESULT_SUCCESS;
+}
+
 ze_result_t DebugSessionImp::readSbaRegisters(EuThread::ThreadId threadId, uint32_t start, uint32_t count, void *pRegisterValues) {
-    auto sbaRegDesc = DebugSessionImp::getSbaRegsetDesc();
+
+    auto &stateSaveAreaHeader = NEO::SipKernel::getDebugSipKernel(*connectedDevice->getNEODevice()).getStateSaveAreaHeader();
+    auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+    auto sbaRegDesc = DebugSessionImp::getSbaRegsetDesc(connectedDevice, *pStateSaveArea);
 
     if (start >= sbaRegDesc->num) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
@@ -1094,7 +1502,7 @@ ze_result_t DebugSessionImp::readSbaRegisters(EuThread::ThreadId threadId, uint3
 
     ze_result_t ret = ZE_RESULT_SUCCESS;
 
-    NEO::SbaTrackedAddresses sbaBuffer;
+    alignas(64) NEO::SbaTrackedAddresses sbaBuffer{};
     ret = readSbaBuffer(threadId, sbaBuffer);
     if (ret != ZE_RESULT_SUCCESS) {
         return ret;
@@ -1102,7 +1510,7 @@ ze_result_t DebugSessionImp::readSbaRegisters(EuThread::ThreadId threadId, uint3
 
     const auto &hwInfo = connectedDevice->getHwInfo();
     const auto regSize = std::max(getRegisterSize(ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU), hwInfo.capabilityTable.grfSize);
-    auto r0 = std::make_unique<uint32_t[]>(regSize / sizeof(uint32_t));
+    auto r0 = std::make_unique_for_overwrite<uint32_t[]>(regSize / sizeof(uint32_t));
 
     ret = readRegistersImp(threadId, ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU, 0, 1, r0.get());
     if (ret != ZE_RESULT_SUCCESS) {
@@ -1113,12 +1521,13 @@ ze_result_t DebugSessionImp::readSbaRegisters(EuThread::ThreadId threadId, uint3
     uint64_t scratchSpaceBaseAddress = 0;
 
     auto &gfxCoreHelper = connectedDevice->getGfxCoreHelper();
+    const auto &rootDeviceEnvironment = connectedDevice->getNEODevice()->getRootDeviceEnvironment();
     if (gfxCoreHelper.isScratchSpaceSurfaceStateAccessible()) {
         auto surfaceStateForScratch = ((r0[5] >> 10) << 6);
 
         if (surfaceStateForScratch > 0) {
             uint64_t renderSurfaceStateGpuVa = surfaceStateForScratch + sbaBuffer.surfaceStateBaseAddress;
-            constexpr size_t renderSurfaceStateSize = 64;
+            const size_t renderSurfaceStateSize = gfxCoreHelper.getRenderSurfaceStateSize(rootDeviceEnvironment);
             std::vector<char> renderSurfaceState(renderSurfaceStateSize, 0);
 
             ret = readGpuMemory(allThreads[threadId]->getMemoryHandle(), renderSurfaceState.data(), renderSurfaceStateSize, renderSurfaceStateGpuVa);
@@ -1127,10 +1536,10 @@ ze_result_t DebugSessionImp::readSbaRegisters(EuThread::ThreadId threadId, uint3
                 return ret;
             }
 
-            auto scratchSpacePTSize = gfxCoreHelper.getRenderSurfaceStatePitch(renderSurfaceState.data());
+            auto scratchSpacePTSize = gfxCoreHelper.getRenderSurfaceStatePitch(renderSurfaceState.data(), rootDeviceEnvironment);
             auto threadOffset = getPerThreadScratchOffset(scratchSpacePTSize, threadId);
             auto gmmHelper = connectedDevice->getNEODevice()->getGmmHelper();
-            auto scratchAllocationBase = gmmHelper->decanonize(gfxCoreHelper.getRenderSurfaceStateBaseAddress(renderSurfaceState.data()));
+            auto scratchAllocationBase = gmmHelper->decanonize(gfxCoreHelper.getRenderSurfaceStateBaseAddress(renderSurfaceState.data(), rootDeviceEnvironment));
             if (scratchAllocationBase != 0) {
                 scratchSpaceBaseAddress = threadOffset + scratchAllocationBase;
             }
@@ -1153,10 +1562,35 @@ ze_result_t DebugSessionImp::readSbaRegisters(EuThread::ThreadId threadId, uint3
     packed.push_back(bindingTableBaseAddress);
     packed.push_back(scratchSpaceBaseAddress);
 
+    PRINT_DEBUGGER_INFO_LOG("Debug session : SBA ssh = %" SCNx64
+                            " gsba = %" SCNx64
+                            " dsba =  %" SCNx64
+                            " ioba =  %" SCNx64
+                            " iba =  %" SCNx64
+                            " bsurfsba =  %" SCNx64
+                            " btba =  %" SCNx64
+                            " scrsba =  %" SCNx64 "\n",
+                            sbaBuffer.surfaceStateBaseAddress, sbaBuffer.generalStateBaseAddress, sbaBuffer.dynamicStateBaseAddress,
+                            sbaBuffer.indirectObjectBaseAddress, sbaBuffer.instructionBaseAddress, sbaBuffer.bindlessSurfaceStateBaseAddress, bindingTableBaseAddress, scratchSpaceBaseAddress);
+
     size_t size = count * sbaRegDesc->bytes;
     memcpy_s(pRegisterValues, size, &packed[start], size);
 
     return ZE_RESULT_SUCCESS;
+}
+
+void DebugSession::updateGrfRegisterSetProperties(EuThread::ThreadId thread, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties) {
+    // The only caller returns early when there are no properties to update.
+    auto &l0GfxCoreHelper = connectedDevice->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
+    auto regsetType = l0GfxCoreHelper.getRegsetTypeForLargeGrfDetection();
+    const auto regSize = std::max(getRegisterSize(regsetType), 64u);
+    auto reg = std::make_unique<uint32_t[]>(regSize / sizeof(uint32_t));
+    readRegistersImp(thread, regsetType, 0, 1, reg.get());
+    for (uint32_t i = 0; i < *pCount; i++) {
+        if (pRegisterSetProperties[i].type == ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU) {
+            pRegisterSetProperties[i].count = l0GfxCoreHelper.getGrfRegisterCount(reg.get());
+        }
+    }
 }
 
 ze_result_t DebugSession::getThreadRegisterSetProperties(ze_device_thread_t thread, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties) {
@@ -1169,7 +1603,26 @@ ze_result_t DebugSession::getThreadRegisterSetProperties(ze_device_thread_t thre
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
-    return getRegisterSetProperties(this->connectedDevice, pCount, pRegisterSetProperties);
+    auto ret = getRegisterSetProperties(this->connectedDevice, pCount, pRegisterSetProperties);
+    if (ret != ZE_RESULT_SUCCESS) {
+        return ret;
+    }
+
+    if (pRegisterSetProperties == nullptr) {
+        return ret;
+    }
+
+    auto sipExternalLib = this->connectedDevice->getNEODevice()->getSipExternalLibInterface();
+    if (sipExternalLib) {
+        if (!getRegisterAccessProperties(&threadId, pCount, pRegisterSetProperties)) {
+            // Reporting a partially updated set would silently mix device level and thread level counts.
+            PRINT_DEBUGGER_ERROR_LOG("%s: Failed to get thread register access properties\n", NEO_FUNCTION_NAME);
+            return ZE_RESULT_ERROR_UNKNOWN;
+        }
+    } else {
+        updateGrfRegisterSetProperties(threadId, pCount, pRegisterSetProperties);
+    }
+    return ret;
 }
 
 ze_result_t DebugSession::getRegisterSetProperties(Device *device, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties) {
@@ -1181,7 +1634,12 @@ ze_result_t DebugSession::getRegisterSetProperties(Device *device, uint32_t *pCo
         return ZE_RESULT_ERROR_INVALID_NULL_POINTER;
     }
 
-    auto &stateSaveAreaHeader = NEO::SipKernel::getBindlessDebugSipKernel(*device->getNEODevice()).getStateSaveAreaHeader();
+    const NEO::SipKernel *sipKernel = NEO::SipKernel::getDebugSipKernelPtr(*device->getNEODevice());
+    if (!sipKernel) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    auto &stateSaveAreaHeader = sipKernel->getStateSaveAreaHeader();
 
     if (stateSaveAreaHeader.size() == 0) {
         *pCount = 0;
@@ -1192,6 +1650,7 @@ ze_result_t DebugSession::getRegisterSetProperties(Device *device, uint32_t *pCo
     auto parseRegsetDesc = [&](const SIP::regset_desc &regsetDesc, zet_debug_regset_type_intel_gpu_t regsetType) {
         if (regsetDesc.num) {
             if (totalRegsetNum < *pCount) {
+                uint16_t num = (regsetType == ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU) ? 128 : regsetDesc.num;
                 zet_debug_regset_properties_t regsetProps = {
                     ZET_STRUCTURE_TYPE_DEBUG_REGSET_PROPERTIES,
                     nullptr,
@@ -1199,7 +1658,7 @@ ze_result_t DebugSession::getRegisterSetProperties(Device *device, uint32_t *pCo
                     0,
                     DebugSessionImp::typeToRegsetFlags(regsetType),
                     0,
-                    regsetDesc.num,
+                    num,
                     regsetDesc.bits,
                     regsetDesc.bytes,
                 };
@@ -1209,23 +1668,66 @@ ze_result_t DebugSession::getRegisterSetProperties(Device *device, uint32_t *pCo
         }
     };
 
-    auto pStateSaveArea = reinterpret_cast<const SIP::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
+    auto pStateSaveArea = reinterpret_cast<const NEO::StateSaveAreaHeader *>(stateSaveAreaHeader.data());
 
-    parseRegsetDesc(pStateSaveArea->regHeader.grf, ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.addr, ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.flag, ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.emask, ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.sr, ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.cr, ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.tdr, ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.acc, ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.mme, ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.sp, ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU);
+    // Define register types to process
+    std::vector<zet_debug_regset_type_intel_gpu_t> regsetTypes = {
+        ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU,
+        ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU};
 
-    parseRegsetDesc(*DebugSessionImp::getSbaRegsetDesc(), ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU);
+    // Add V3/V5-specific register types
+    if (pStateSaveArea->versionHeader.version.major >= 3) {
+        regsetTypes.insert(regsetTypes.end(), {ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU,
+                                               ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU,
+                                               ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU});
 
-    parseRegsetDesc(pStateSaveArea->regHeader.dbg, ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU);
-    parseRegsetDesc(pStateSaveArea->regHeader.fc, ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU);
+        // Conditionally add thread scratch for heapless mode
+        if (DebugSessionImp::isHeaplessMode(device, *pStateSaveArea) || pStateSaveArea->versionHeader.version.major == 5) {
+            regsetTypes.push_back(ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU);
+        }
+
+        regsetTypes.push_back(ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU);
+    }
+
+    if (pStateSaveArea->versionHeader.version.major >= 5) {
+        regsetTypes.insert(regsetTypes.end(), {ZET_DEBUG_REGSET_TYPE_STATUS_INTEL_GPU,
+                                               ZET_DEBUG_REGSET_TYPE_RANDOM_INTEL_GPU,
+                                               ZET_DEBUG_REGSET_TYPE_DIRECT_INTEL_GPU});
+    }
+
+    // Process each register type using the conditional helper
+    for (auto regsetType : regsetTypes) {
+        if (pStateSaveArea->versionHeader.version.major >= 5) {
+            const auto regdesc = DebugSessionImp::typeToRegsetDescExt(regsetType, device);
+            if (regdesc) {
+                const SIP::regset_desc sipRegdesc = regsetDescExtToSip(*regdesc);
+                parseRegsetDesc(sipRegdesc, regsetType);
+            }
+        } else {
+            const SIP::regset_desc *regsetDesc = DebugSessionImp::typeToRegsetDesc(pStateSaveArea, regsetType, device);
+            if (regsetDesc != nullptr) {
+                parseRegsetDesc(*regsetDesc, regsetType);
+            }
+        }
+    }
+
+    // Handle unsupported version case
+    if (pStateSaveArea->versionHeader.version.major > 5) {
+        PRINT_DEBUGGER_ERROR_LOG("Unsupported version of State Save Area Header\n", "");
+        DEBUG_BREAK_IF(true);
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
 
     if (!*pCount || (*pCount > totalRegsetNum)) {
         *pCount = totalRegsetNum;
@@ -1235,7 +1737,16 @@ ze_result_t DebugSession::getRegisterSetProperties(Device *device, uint32_t *pCo
 }
 
 ze_result_t DebugSessionImp::registersAccessHelper(const EuThread *thread, const SIP::regset_desc *regdesc,
-                                                   uint32_t start, uint32_t count, void *pRegisterValues, bool write) {
+                                                   uint32_t start, uint32_t count, zet_debug_regset_type_intel_gpu_t type, void *pRegisterValues, bool write) {
+    return registersAccessHelper(thread, regdesc, start, count, getSipRegisterType(type), pRegisterValues, write);
+}
+
+ze_result_t DebugSessionImp::registersAccessHelper(const EuThread *thread, const SIP::regset_desc *regdesc,
+                                                   uint32_t start, uint32_t count, NEO::SipRegisterType type, void *pRegisterValues, bool write) {
+    if (!regdesc) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
     if (start >= regdesc->num) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
     }
@@ -1249,26 +1760,199 @@ ze_result_t DebugSessionImp::registersAccessHelper(const EuThread *thread, const
         return ZE_RESULT_ERROR_UNKNOWN;
     }
 
-    auto threadSlotOffset = calculateThreadSlotOffset(thread->getThreadId());
-    auto startRegOffset = threadSlotOffset + calculateRegisterOffsetInThreadSlot(regdesc, start);
+    size_t startRegOffset = 0;
+    auto sipLibInterface = connectedDevice->getNEODevice()->getSipExternalLibInterface();
+    if (sipLibInterface) {
+        uint32_t registerCount = 0;
+        uint32_t registerStartOffset = 0;
+        auto threadId = thread->getThreadId();
+        struct NEO::SipLibThreadId threadIdStruct = {};
+        threadIdStruct.slice = threadId.slice;
+        threadIdStruct.subslice = threadId.subslice;
+        threadIdStruct.eu = threadId.eu;
+        threadIdStruct.thread = threadId.thread;
+        sipLibInterface->getSipLibRegisterAccess(this->getSipHandle(thread->getMemoryHandle()), threadIdStruct, type, &registerCount, &registerStartOffset);
+        if (start + count > registerCount) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        startRegOffset = static_cast<size_t>(registerStartOffset) + (static_cast<size_t>(start) * regdesc->bytes);
+    } else {
+        auto threadSlotOffset = calculateThreadSlotOffset(thread->getThreadId());
+        startRegOffset = threadSlotOffset + calculateRegisterOffsetInThreadSlot(regdesc, start);
+    }
 
     int ret = 0;
     if (write) {
         ret = writeGpuMemory(thread->getMemoryHandle(), static_cast<const char *>(pRegisterValues), count * regdesc->bytes, gpuVa + startRegOffset);
-    } else {
+    } else if (type == NEO::SipRegisterType::eCommand) {
+        // SIP writes the command register while parked, so this read must never skip the flush.
         ret = readGpuMemory(thread->getMemoryHandle(), static_cast<char *>(pRegisterValues), count * regdesc->bytes, gpuVa + startRegOffset);
+    } else {
+        ret = readRegsetForStoppedThread(thread, static_cast<char *>(pRegisterValues), count * regdesc->bytes, gpuVa + startRegOffset);
     }
 
     return ret == 0 ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_UNKNOWN;
 }
 
-ze_result_t DebugSessionImp::cmdRegisterAccessHelper(const EuThread::ThreadId &threadId, SIP::sip_command &command, bool write) {
+std::optional<SipRegisterPacker> SipRegisterPacker::create(const NEO::RegsetDescExt &regdesc, uint32_t start, uint32_t count) {
+    const int unpackedOffset = start * regdesc.stride;
+    std::vector<uint32_t> unpackedIndices;
+    uint32_t packed = 0;
+    uint32_t unpacked = 0;
+    std::optional<uint32_t> packedOffset;
+
+    for (const uint8_t maskByte : regdesc.validMask) {
+        for (int bitNum = 0; bitNum < 8; bitNum++) {
+            if ((maskByte >> bitNum) & 1) {
+                const uint32_t majorReg = unpacked / regdesc.stride;
+                if (majorReg >= start && majorReg < start + count) {
+                    if (!packedOffset.has_value()) {
+                        packedOffset = packed;
+                    }
+                    unpackedIndices.push_back(unpacked - unpackedOffset);
+                }
+                packed++;
+            }
+            unpacked++;
+        }
+    }
+
+    if (!packedOffset.has_value()) {
+        PRINT_DEBUGGER_ERROR_LOG("Invalid SipRegisterPacker, start=%u, count=%u", start, count);
+        return std::nullopt;
+    }
+
+    return SipRegisterPacker{
+        .stride = regdesc.stride,
+        .majorStart = start,
+        .majorCount = count,
+        .packedOffset = packedOffset.value(),
+        .unpackedIndices = std::move(unpackedIndices),
+    };
+}
+
+std::vector<uint32_t> SipRegisterPacker::packRegisters(const std::vector<uint32_t> &unpacked) const {
+    std::vector<uint32_t> packed;
+    for (const int i : unpackedIndices) {
+        try {
+            packed.push_back(unpacked.at(i));
+        } catch (const std::out_of_range &) {
+            PRINT_DEBUGGER_ERROR_LOG("%s: Invalid register indices", NEO_FUNCTION_NAME);
+            return {};
+        }
+    }
+
+    return packed;
+}
+
+std::vector<uint32_t> SipRegisterPacker::unpackRegisters(const std::vector<uint32_t> &packed) const {
+    std::vector<uint32_t> unpacked(majorCount * stride);
+    for (size_t i = 0; i < unpackedIndices.size(); i++) {
+        try {
+            unpacked.at(unpackedIndices.at(i)) = packed.at(i);
+        } catch (const std::out_of_range &) {
+            PRINT_DEBUGGER_ERROR_LOG("%s: Invalid register indices", NEO_FUNCTION_NAME);
+            return {};
+        }
+    }
+    return unpacked;
+}
+
+ze_result_t DebugSessionImp::registersAccessHelperPacked(const EuThread &thread, const NEO::RegsetDescExt &regdesc,
+                                                         uint32_t start, uint32_t count, zet_debug_regset_type_intel_gpu_t type, void *pRegisterValues, bool write) {
+    const uint64_t memHandle = thread.getMemoryHandle();
+    if (start >= regdesc.num) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (start + count > regdesc.num) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    const uint64_t gpuVaBase = getContextStateSaveAreaGpuVa(memHandle);
+    if (!gpuVaBase) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    auto sipLibInterface = getSipExternalLibInterface();
+    UNRECOVERABLE_IF(!sipLibInterface);
+
+    uint32_t registerCount = 0;
+    uint32_t startRegOffset = 0;
+    const NEO::SipLibThreadId threadId = euThreadIdToSip(thread.getThreadId());
+    sipLibInterface->getSipLibRegisterAccess(getSipHandle(memHandle), threadId, getSipRegisterType(type), &registerCount, &startRegOffset);
+    if (start + count > registerCount) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    const uint64_t regStartGpuVa = gpuVaBase + startRegOffset;
+    const auto &maybePacker = SipRegisterPacker::create(regdesc, start, count);
+    if (!maybePacker.has_value()) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+    const SipRegisterPacker &packer = maybePacker.value();
+
+    if (write) {
+        return writePackedRegisters(memHandle, regStartGpuVa, packer, pRegisterValues);
+    } else {
+        return readPackedRegisters(thread, regStartGpuVa, packer, pRegisterValues);
+    }
+}
+
+ze_result_t DebugSessionImp::writePackedRegisters(uint64_t memHandle, uint64_t regStartGpuVa, const SipRegisterPacker &packer, const void *src) {
+    const uint32_t *regValues = static_cast<const uint32_t *>(src);
+    const uint32_t unpackedMinorRegCount = packer.majorCount * packer.stride;
+    const std::vector<uint32_t> unpacked(regValues, regValues + unpackedMinorRegCount);
+    const std::vector<uint32_t> packed = packer.packRegisters(unpacked);
+
+    const char *data = reinterpret_cast<const char *>(packed.data());
+    const size_t size = sizeof(packed[0]) * packed.size();
+    const uint64_t gpuVa = (packer.packedOffset * sizeof(packed[0])) + regStartGpuVa;
+    return writeGpuMemory(memHandle, data, size, gpuVa);
+}
+
+ze_result_t DebugSessionImp::readPackedRegisters(const EuThread &thread, uint64_t regStartGpuVa, const SipRegisterPacker &packer, void *dest) {
+    std::vector<uint32_t> packed(packer.unpackedIndices.size());
+
+    char *data = reinterpret_cast<char *>(packed.data());
+    const size_t packedDataSize = sizeof(packed[0]) * packed.size();
+    const uint64_t gpuVa = (packer.packedOffset * sizeof(packed[0])) + regStartGpuVa;
+    ze_result_t status = readRegsetForStoppedThread(&thread, data, packedDataSize, gpuVa);
+    if (status != ZE_RESULT_SUCCESS) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    const std::vector<uint32_t> unpacked = packer.unpackRegisters(packed);
+    const size_t unpackedDataSize = sizeof(unpacked[0]) * unpacked.size();
+    memcpy(dest, unpacked.data(), unpackedDataSize);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t DebugSessionImp::getCommandRegisterDescriptor(const NEO::StateSaveAreaHeader *stateSaveAreaHeader, SIP::regset_desc *regdesc) {
+    if (stateSaveAreaHeader->versionHeader.version.major == 3) {
+        *regdesc = stateSaveAreaHeader->regHeaderV3.cmd;
+    } else if (stateSaveAreaHeader->versionHeader.version.major < 3) {
+        *regdesc = stateSaveAreaHeader->regHeader.cmd;
+    } else {
+        PRINT_DEBUGGER_ERROR_LOG("%s: Unsupported State Save Area Header version %u\n", NEO_FUNCTION_NAME, stateSaveAreaHeader->versionHeader.version.major);
+        DEBUG_BREAK_IF(true);
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t DebugSessionImp::cmdRegisterAccessHelper(const EuThread::ThreadId &threadId, NEO::SipCommandRegisterValues &command, bool write) {
     auto stateSaveAreaHeader = getStateSaveAreaHeader();
-    auto *regdesc = &stateSaveAreaHeader->regHeader.cmd;
+    if (stateSaveAreaHeader->versionHeader.version.major >= 5) {
+        return cmdRegisterAccessHelperV5(threadId, command, write);
+    }
+    SIP::regset_desc regdesc;
+    if (getCommandRegisterDescriptor(stateSaveAreaHeader, &regdesc) != ZE_RESULT_SUCCESS) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
 
-    PRINT_DEBUGGER_INFO_LOG("Access CMD %d for thread %s\n", command.command, EuThread::toString(threadId).c_str());
-
-    ze_result_t result = registersAccessHelper(allThreads[threadId].get(), regdesc, 0, 1, &command, write);
+    PRINT_DEBUGGER_INFO_LOG("Access CMD %d for thread %s\n", command.sip_commandValues.command, EuThread::toString(threadId).c_str());
+    ze_result_t result = registersAccessHelper(allThreads[threadId].get(), &regdesc, 0, 1, NEO::SipRegisterType::eCommand, &command, write);
     if (result != ZE_RESULT_SUCCESS) {
         PRINT_DEBUGGER_ERROR_LOG("Failed to access CMD for thread %s\n", EuThread::toString(threadId).c_str());
     }
@@ -1276,7 +1960,33 @@ ze_result_t DebugSessionImp::cmdRegisterAccessHelper(const EuThread::ThreadId &t
     return result;
 }
 
-ze_result_t DebugSessionImp::readRegisters(ze_device_thread_t thread, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
+ze_result_t DebugSessionImp::cmdRegisterAccessHelperV5(const EuThread::ThreadId &euThreadId, NEO::SipCommandRegisterValues &command, bool write) {
+    PRINT_DEBUGGER_INFO_LOG("Access CMD %d for thread %s\n", command.sip_commandValues.command, EuThread::toString(euThreadId).c_str());
+    const EuThread &thread = *allThreads.at(euThreadId);
+    const uint64_t memoryHandle = thread.getMemoryHandle();
+    const uint64_t gpuVa = getContextStateSaveAreaGpuVa(memoryHandle);
+    if (gpuVa == 0) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    auto sipLibInterface = connectedDevice->getNEODevice()->getSipExternalLibInterface();
+    UNRECOVERABLE_IF(!sipLibInterface);
+    uint32_t registerStartOffset = 0;
+    bool ok = sipLibInterface->getSipLibRegisterAccess(this->getSipHandle(memoryHandle), euThreadIdToSip(thread.getThreadId()), NEO::SipRegisterType::eCommand, nullptr, &registerStartOffset);
+    if (!ok) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    const size_t size = getSipCommandRegisterValues(command, write, sizeof(command));
+
+    if (write) {
+        return writeGpuMemory(memoryHandle, reinterpret_cast<const char *>(&command), size, gpuVa + registerStartOffset);
+    } else {
+        return readGpuMemory(memoryHandle, reinterpret_cast<char *>(&command), size, gpuVa + registerStartOffset);
+    }
+}
+
+ze_result_t DebugSessionImp::readRegisters(ze_device_thread_t thread, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
     if (!isSingleThread(thread)) {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
@@ -1293,21 +2003,37 @@ ze_result_t DebugSessionImp::readRegisters(ze_device_thread_t thread, uint32_t t
 
     if (type == ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU) {
         return readSbaRegisters(threadId, start, count, pRegisterValues);
+    } else if (type == ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU) {
+        return readModeFlags(start, count, pRegisterValues);
+    } else if (type == ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU) {
+        return readDebugScratchRegisters(start, count, pRegisterValues);
+    } else if (type == ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU) {
+        return readThreadScratchRegisters(threadId, start, count, pRegisterValues);
     }
 
     return readRegistersImp(threadId, type, start, count, pRegisterValues);
 }
 
-ze_result_t DebugSessionImp::readRegistersImp(EuThread::ThreadId threadId, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
-    auto regdesc = typeToRegsetDesc(type);
-    if (nullptr == regdesc) {
-        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+ze_result_t DebugSessionImp::readRegistersImp(EuThread::ThreadId threadId, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
+    const NEO::SipRegisterType sipType = getSipRegisterType(type);
+    if (getStateSaveAreaMajorVersion() >= 5) {
+        auto regdesc = typeToRegsetDescExt(type, connectedDevice);
+        if (!regdesc) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        const auto &thread = allThreads.at(threadId);
+        if (regdesc->stride != 0) {
+            return registersAccessHelperPacked(*thread, *regdesc, start, count, type, pRegisterValues, false);
+        }
+        const SIP::regset_desc sipRegdesc = regsetDescExtToSip(*regdesc);
+        return registersAccessHelper(thread.get(), &sipRegdesc, start, count, sipType, pRegisterValues, false);
     }
 
-    return registersAccessHelper(allThreads[threadId].get(), regdesc, start, count, pRegisterValues, false);
+    const SIP::regset_desc *regdesc = typeToRegsetDesc(getStateSaveAreaHeader(), type, connectedDevice);
+    return registersAccessHelper(allThreads[threadId].get(), regdesc, start, count, sipType, pRegisterValues, false);
 }
 
-ze_result_t DebugSessionImp::writeRegisters(ze_device_thread_t thread, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
+ze_result_t DebugSessionImp::writeRegisters(ze_device_thread_t thread, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
     if (!isSingleThread(thread)) {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
@@ -1325,17 +2051,27 @@ ze_result_t DebugSessionImp::writeRegisters(ze_device_thread_t thread, uint32_t 
     return writeRegistersImp(threadId, type, start, count, pRegisterValues);
 }
 
-ze_result_t DebugSessionImp::writeRegistersImp(EuThread::ThreadId threadId, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
-    auto regdesc = typeToRegsetDesc(type);
-    if (nullptr == regdesc) {
-        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    }
-
+ze_result_t DebugSessionImp::writeRegistersImp(EuThread::ThreadId threadId, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
     if (ZET_DEBUG_REGSET_FLAG_WRITEABLE != ((DebugSessionImp::typeToRegsetFlags(type) & ZET_DEBUG_REGSET_FLAG_WRITEABLE))) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
     }
 
-    return registersAccessHelper(allThreads[threadId].get(), regdesc, start, count, pRegisterValues, true);
+    const NEO::SipRegisterType sipType = getSipRegisterType(type);
+    if (getStateSaveAreaMajorVersion() >= 5) {
+        auto regdesc = typeToRegsetDescExt(type, connectedDevice);
+        if (!regdesc) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        const auto &thread = allThreads.at(threadId);
+        if (regdesc->stride != 0) {
+            return registersAccessHelperPacked(*thread, *regdesc, start, count, type, pRegisterValues, true);
+        }
+        const SIP::regset_desc sipRegdesc = regsetDescExtToSip(*regdesc);
+        return registersAccessHelper(thread.get(), &sipRegdesc, start, count, sipType, pRegisterValues, true);
+    }
+
+    auto regdesc = typeToRegsetDesc(getStateSaveAreaHeader(), type, connectedDevice);
+    return registersAccessHelper(allThreads[threadId].get(), regdesc, start, count, sipType, pRegisterValues, true);
 }
 
 bool DebugSessionImp::isValidGpuAddress(const zet_debug_memory_space_desc_t *desc) const {
@@ -1352,6 +2088,8 @@ bool DebugSessionImp::isValidGpuAddress(const zet_debug_memory_space_desc_t *des
         if (desc->address & (1 << slmAddressSpaceTag)) { // IGC sets bit 28 to identify SLM address
             return true;
         }
+    } else if (desc->type == ZET_DEBUG_MEMORY_SPACE_TYPE_BARRIER) {
+        return true;
     }
 
     return false;
@@ -1371,7 +2109,7 @@ ze_result_t DebugSessionImp::validateThreadAndDescForMemoryAccess(ze_device_thre
 
 ze_result_t DebugSessionImp::waitForCmdReady(EuThread::ThreadId threadId, uint16_t retryCount) {
     ze_result_t status;
-    SIP::sip_command sipCommand = {0};
+    NEO::SipCommandRegisterValues sipCommand = {{0}};
 
     for (uint16_t attempts = 0; attempts < retryCount; attempts++) {
         status = cmdRegisterAccessHelper(threadId, sipCommand, false);
@@ -1379,17 +2117,406 @@ ze_result_t DebugSessionImp::waitForCmdReady(EuThread::ThreadId threadId, uint16
             return status;
         }
 
-        if (sipCommand.command == static_cast<uint32_t>(NEO::SipKernel::COMMAND::READY)) {
+        if (sipCommand.sip_commandValues.command == static_cast<uint32_t>(NEO::SipKernel::Command::ready)) {
             break;
         }
         NEO::sleep(std::chrono::microseconds(100));
     }
 
-    if (sipCommand.command != static_cast<uint32_t>(NEO::SipKernel::COMMAND::READY)) {
+    if (sipCommand.sip_commandValues.command != static_cast<uint32_t>(NEO::SipKernel::Command::ready)) {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
+    // SIP writes READY only after fencing whatever the command produced, and the poll above always
+    // flushes, so the whole slot is back in memory. Does not rely on a fifo entry being published
+    // on command completion.
+    allThreads.at(threadId)->setStateSaveAreaCoherent(true);
+
     return ZE_RESULT_SUCCESS;
+}
+
+void DebugSessionImp::getNotStoppedThreads(const std::vector<EuThread::ThreadId> &threadsWithAtt, std::vector<EuThread::ThreadId> &notStoppedThreads) {
+    for (const auto &threadId : threadsWithAtt) {
+
+        bool wasStopped = false;
+
+        if (tileSessionsEnabled) {
+            wasStopped = tileSessions[threadId.tileIndex].first->allThreads[threadId]->isStopped();
+        } else {
+            wasStopped = allThreads[threadId]->isStopped();
+        }
+
+        if (!wasStopped) {
+            notStoppedThreads.push_back(threadId);
+        }
+    }
+}
+
+ze_result_t DebugSessionImp::isValidNode(uint64_t vmHandle, uint64_t gpuVa, SIP::fifo_node &node) {
+    constexpr uint32_t failsafeTimeoutWait = 50;
+    uint32_t failsafeTimeoutMax = 100;
+    if (NEO::debugManager.flags.sipFifoValidNodeMaxTimeoutMs.get() != -1) {
+        failsafeTimeoutMax = static_cast<uint32_t>(NEO::debugManager.flags.sipFifoValidNodeMaxTimeoutMs.get());
+    }
+    uint32_t timeCount = 0;
+    while (!node.valid && (timeCount < failsafeTimeoutMax)) {
+        auto retVal = readGpuMemory(vmHandle, reinterpret_cast<char *>(&node), sizeof(SIP::fifo_node), gpuVa);
+        if (retVal != ZE_RESULT_SUCCESS) {
+            PRINT_DEBUGGER_ERROR_LOG("Reading FIFO failed, error = %d\n", retVal);
+            return retVal;
+        }
+        NEO::sleep(std::chrono::milliseconds(failsafeTimeoutWait));
+        timeCount += failsafeTimeoutWait;
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t DebugSessionImp::writeFifoTail(uint64_t vmHandle, uint64_t tailGpuVa, uint32_t fifoTailIndex) {
+    for (uint32_t attempt = 1; attempt <= maxTailWriteAttempts; attempt++) {
+        auto retVal = writeGpuMemory(vmHandle, reinterpret_cast<char *>(&fifoTailIndex), sizeof(uint32_t), tailGpuVa);
+        if (retVal != ZE_RESULT_SUCCESS) {
+            PRINT_DEBUGGER_ERROR_LOG("Writing FIFO tail failed, error = %d\n", retVal);
+            return retVal;
+        }
+        uint32_t readBackTailIndex = 0;
+        retVal = readGpuMemory(vmHandle, reinterpret_cast<char *>(&readBackTailIndex), sizeof(uint32_t), tailGpuVa);
+        if (retVal != ZE_RESULT_SUCCESS) {
+            PRINT_DEBUGGER_ERROR_LOG("Reading FIFO tail failed, error = %d\n", retVal);
+            return retVal;
+        }
+        if (readBackTailIndex == fifoTailIndex) {
+            return ZE_RESULT_SUCCESS;
+        }
+        PRINT_DEBUGGER_ERROR_LOG("FIFO tail write did not persist: written = %u read back = %u attempt = %u\n",
+                                 fifoTailIndex, readBackTailIndex, attempt);
+    }
+    // A later readFifo() detects the reverted tail and restores it.
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t DebugSessionImp::readFifo(uint64_t vmHandle, std::vector<EuThread::ThreadId> &threadsWithAttention) {
+    auto stateSaveAreaHeader = getStateSaveAreaHeader();
+    if (!stateSaveAreaHeader) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    } else if (stateSaveAreaHeader->versionHeader.version.major < 3) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    auto gpuVa = getContextStateSaveAreaGpuVa(vmHandle);
+
+    // Drain the fifo
+    uint32_t drainRetries = 2, lastHead = ~0u;
+
+    uint64_t offsetTail;
+    uint64_t offsetHead;
+    uint64_t offsetFifoSize;
+    uint64_t offsetFifo;
+    getFifoOffsets(stateSaveAreaHeader, offsetTail, offsetHead, offsetFifoSize, offsetFifo, gpuVa);
+
+    const uint64_t offsetFifoIndicesBegin = std::min({offsetFifoSize, offsetHead, offsetTail});
+    const uint64_t offsetFifoIndicesEnd = std::max({offsetFifoSize, offsetHead, offsetTail}) + sizeof(uint32_t);
+    std::vector<char> fifoIndices(static_cast<size_t>(offsetFifoIndicesEnd - offsetFifoIndicesBegin));
+
+    const bool tailRevertWorkaroundEnabled = NEO::debugManager.flags.DebugUmdFifoTailRevertWorkaround.get() != 0;
+
+    while (drainRetries--) {
+        constexpr uint32_t failsafeTimeoutWait = 50;
+        uint32_t fifoHeadIndex = 0, fifoTailIndex = 0, fifoSize = 0;
+
+        auto retVal = readGpuMemory(vmHandle, fifoIndices.data(), fifoIndices.size(), gpuVa + offsetFifoIndicesBegin);
+        if (retVal != ZE_RESULT_SUCCESS) {
+            PRINT_DEBUGGER_ERROR_LOG("Reading FIFO indices failed, error = %d\n", retVal);
+            return retVal;
+        }
+        memcpy_s(&fifoSize, sizeof(fifoSize), fifoIndices.data() + (offsetFifoSize - offsetFifoIndicesBegin), sizeof(fifoSize));
+        memcpy_s(&fifoHeadIndex, sizeof(fifoHeadIndex), fifoIndices.data() + (offsetHead - offsetFifoIndicesBegin), sizeof(fifoHeadIndex));
+        memcpy_s(&fifoTailIndex, sizeof(fifoTailIndex), fifoIndices.data() + (offsetTail - offsetFifoIndicesBegin), sizeof(fifoTailIndex));
+
+        // Only the debugger writes the tail, so reading back the value it replaced means the write was reverted.
+        auto tailState = fifoTailStates.find(vmHandle);
+        if (tailRevertWorkaroundEnabled && tailState != fifoTailStates.end() &&
+            fifoTailIndex != tailState->second.writtenTail &&
+            fifoTailIndex == tailState->second.previousTail) {
+            PRINT_DEBUGGER_ERROR_LOG("FIFO tail reverted from %u to %u, restoring\n", tailState->second.writtenTail, fifoTailIndex);
+            fifoTailIndex = tailState->second.writtenTail;
+            retVal = writeFifoTail(vmHandle, gpuVa + offsetTail, fifoTailIndex);
+            if (retVal != ZE_RESULT_SUCCESS) {
+                return retVal;
+            }
+        }
+        const uint32_t initialTailIndex = fifoTailIndex;
+
+        if (lastHead != fifoHeadIndex) {
+            drainRetries++;
+        }
+        PRINT_DEBUGGER_FIFO_LOG("fifoHeadIndex: %u fifoTailIndex: %u fifoSize: %u lastHead: %u drainRetries: %u\n",
+                                fifoHeadIndex, fifoTailIndex, fifoSize, lastHead, drainRetries);
+
+        lastHead = fifoHeadIndex;
+        bool updateTailIndex = false;
+        while (fifoTailIndex != fifoHeadIndex) {
+            uint32_t readSize = fifoTailIndex < fifoHeadIndex ? fifoHeadIndex - fifoTailIndex : fifoSize - fifoTailIndex;
+            std::vector<SIP::fifo_node> nodes(readSize);
+            uint64_t currentFifoOffset = offsetFifo + (sizeof(SIP::fifo_node) * fifoTailIndex);
+
+            retVal = readGpuMemory(vmHandle, reinterpret_cast<char *>(nodes.data()), readSize * sizeof(SIP::fifo_node), currentFifoOffset);
+            if (retVal != ZE_RESULT_SUCCESS) {
+                PRINT_DEBUGGER_ERROR_LOG("Reading FIFO failed, error = %d\n", retVal);
+                return retVal;
+            }
+            for (uint32_t i = 0; i < readSize; i++) {
+                const uint64_t gpuVa = currentFifoOffset + (i * sizeof(SIP::fifo_node));
+                PRINT_DEBUGGER_FIFO_LOG("Validate entry at index %u in SW Fifo:: vmHandle: %" SCNx64
+                                        " gpuVa = %" SCNx64
+                                        " valid = %" SCNx8
+                                        " slice = %" SCNx8
+                                        " subslice = %" SCNx8
+                                        " eu = %" SCNx8
+                                        " thread = %" SCNx8
+                                        "\n",
+                                        (i + fifoTailIndex), vmHandle, gpuVa, nodes[i].valid, nodes[i].slice_id, nodes[i].subslice_id, nodes[i].eu_id, nodes[i].thread_id);
+                retVal = isValidNode(vmHandle, gpuVa, nodes[i]);
+                if (retVal != ZE_RESULT_SUCCESS) {
+                    return retVal;
+                }
+                UNRECOVERABLE_IF(!nodes[i].valid);
+                const EuThread::ThreadId threadId(0, nodes[i].slice_id, nodes[i].subslice_id, nodes[i].eu_id, nodes[i].thread_id);
+
+                // SIP publishes this node only after fencing its state save, and the read above
+                // flushed, so the whole slot for this thread is now in memory.
+                auto thread = allThreads.find(threadId);
+                if (thread != allThreads.end()) {
+                    thread->second->setStateSaveAreaCoherent(true);
+                }
+
+                threadsWithAttention.push_back(threadId);
+                nodes[i].valid = 0;
+            }
+            retVal = writeGpuMemory(vmHandle, reinterpret_cast<char *>(nodes.data()), readSize * sizeof(SIP::fifo_node), currentFifoOffset);
+            if (retVal != ZE_RESULT_SUCCESS) {
+                PRINT_DEBUGGER_ERROR_LOG("Writing FIFO failed, error = %d\n", retVal);
+                return retVal;
+            }
+
+            if (fifoTailIndex < fifoHeadIndex) {
+                // then we read to the head and are done
+                fifoTailIndex = fifoHeadIndex;
+            } else {
+                // wrap around
+                fifoTailIndex = 0;
+            }
+            updateTailIndex = true;
+        }
+
+        if (updateTailIndex) {
+            if (tailRevertWorkaroundEnabled) {
+                retVal = writeFifoTail(vmHandle, gpuVa + offsetTail, fifoTailIndex);
+                if (retVal != ZE_RESULT_SUCCESS) {
+                    return retVal;
+                }
+                fifoTailStates[vmHandle] = {initialTailIndex, fifoTailIndex};
+            } else {
+                retVal = writeGpuMemory(vmHandle, reinterpret_cast<char *>(&fifoTailIndex), sizeof(uint32_t), gpuVa + offsetTail);
+                if (retVal != ZE_RESULT_SUCCESS) {
+                    PRINT_DEBUGGER_ERROR_LOG("Writing FIFO failed, error = %d\n", retVal);
+                    return retVal;
+                }
+            }
+            NEO::sleep(std::chrono::milliseconds(failsafeTimeoutWait));
+        } else {
+            break;
+        }
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+void DebugSessionImp::pollFifo() {
+    if (attentionEventContext.empty()) {
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    auto currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+
+    auto timeSinceLastFifoRead = currentTime - lastFifoReadTime;
+    if (timeSinceLastFifoRead.count() > fifoPollInterval) {
+        PRINT_DEBUGGER_FIFO_LOG("%s", "Polling FIFO start\n");
+        handleStoppedThreads();
+        PRINT_DEBUGGER_FIFO_LOG("%s", "Polling FIFO ends\n");
+    }
+}
+
+void DebugSessionImp::handleStoppedThreads() {
+    for (const auto &entry : attentionEventContext) {
+        auto vmHandle = entry.first;
+        std::vector<EuThread::ThreadId> threadsWithAttention;
+        auto result = readFifo(vmHandle, threadsWithAttention);
+        if (result != ZE_RESULT_SUCCESS) {
+            return;
+        }
+        auto now = std::chrono::steady_clock::now();
+        lastFifoReadTime = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+
+        if (threadsWithAttention.empty()) {
+            return;
+        }
+        updateStoppedThreadsAndCheckTriggerEvents(entry.second, 0, threadsWithAttention);
+    }
+}
+
+const NEO::ProductHelper &DebugSessionImp::getProductHelper() const {
+    return connectedDevice->getProductHelper();
+}
+
+NEO::SipExternalLib *DebugSessionImp::getSipExternalLibInterface() const {
+    return this->connectedDevice->getNEODevice()->getSipExternalLibInterface();
+}
+
+DebugSessionImp::SlmAccessProtocol DebugSessionImp::getSlmAccessProtocol() const {
+    if (getProductHelper().sipUsesSubslicePools()) {
+        return SlmAccessProtocol::v2;
+    }
+    return SlmAccessProtocol::v1;
+}
+
+bool DebugSessionImp::getSlmStartOffset(uint64_t memoryHandle, EuThread::ThreadId threadId, uint32_t *slmStartOffset) {
+    auto sipExternalLib = getSipExternalLibInterface();
+    UNRECOVERABLE_IF(!sipExternalLib);
+    return sipExternalLib->getSlmStartOffset(getSipHandle(memoryHandle), euThreadIdToSip(threadId), slmStartOffset);
+}
+
+bool DebugSessionImp::getBarrierStartOffset(uint64_t memoryHandle, EuThread::ThreadId threadId, uint32_t *slmStartOffset) {
+    auto sipExternalLib = getSipExternalLibInterface();
+    UNRECOVERABLE_IF(!sipExternalLib);
+    return sipExternalLib->getBarrierStartOffset(getSipHandle(memoryHandle), euThreadIdToSip(threadId), slmStartOffset);
+}
+
+static NEO::SipCommandRegisterValues sipTransferAddrToSipCommand(const SipTransferAddr &addr, NEO::SipKernel::Command commandId) {
+    return {
+        .sip_commandValues = {
+            .command = static_cast<uint32_t>(commandId),
+            .size = addr.sipSize,
+            .offset = addr.sipOffset,
+        },
+    };
+}
+
+std::optional<SipTransferAddr> DebugSessionImp::getSlmAddresses(EuThread::ThreadId threadId, size_t size, const zet_debug_memory_space_desc_t *desc) {
+    static constexpr uint64_t sipAlignMask = ~maxNBitValue(4);
+    static constexpr uint64_t addressableMemMask = maxNBitValue(24);
+
+    const uint64_t memoryHandle = allThreads.at(threadId)->getMemoryHandle();
+
+    uint32_t slmStartOffset = 0;
+    if (!getSlmStartOffset(memoryHandle, threadId, &slmStartOffset)) {
+        PRINT_DEBUGGER_ERROR_LOG("%s: Getting SLM start offset failed\n", NEO_FUNCTION_NAME);
+        return std::nullopt;
+    }
+
+    const uint64_t gpuVaBase = getContextStateSaveAreaGpuVa(memoryHandle);
+    const uint64_t alignedAddress = desc->address & sipAlignMask;
+
+    return SipTransferAddr{
+        .sipOffset = alignedAddress,
+        .sipSize = static_cast<uint32_t>(size + (desc->address - alignedAddress)),
+        .gpuMemOffset = gpuVaBase + slmStartOffset + (desc->address & addressableMemMask),
+    };
+}
+
+std::optional<SipTransferAddr> DebugSessionImp::getBarrierAddresses(EuThread::ThreadId threadId, size_t size, const zet_debug_memory_space_desc_t *desc) {
+    static constexpr uint64_t barrierSize = sizeof(uint64_t);
+    const uint64_t barrierIndex = (desc->address >> 3) & maxNBitValue(7);
+    const uint64_t memoryHandle = allThreads.at(threadId)->getMemoryHandle();
+
+    uint32_t barrierStartOffset = 0;
+    if (!getBarrierStartOffset(memoryHandle, threadId, &barrierStartOffset)) {
+        PRINT_DEBUGGER_ERROR_LOG("%s: Getting barrier start offset failed\n", NEO_FUNCTION_NAME);
+        return std::nullopt;
+    }
+
+    const uint64_t gpuVaBase = getContextStateSaveAreaGpuVa(memoryHandle);
+
+    return SipTransferAddr{
+        .sipOffset = desc->address,
+        .sipSize = static_cast<uint32_t>(size / barrierSize),
+        .gpuMemOffset = gpuVaBase + barrierStartOffset + barrierIndex * barrierSize,
+    };
+}
+
+ze_result_t DebugSessionImp::readMemViaSipTransaction(NEO::SipKernel::Command commandId, EuThread::ThreadId threadId, const SipTransferAddr &addrs, size_t size, void *buffer) {
+    ze_result_t status = waitForCmdReady(threadId, sipRetryCount);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    NEO::SipCommandRegisterValues sipCmd = sipTransferAddrToSipCommand(addrs, commandId);
+    status = cmdRegisterAccessHelper(threadId, sipCmd, true);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    status = resumeImp(std::vector<EuThread::ThreadId>{threadId}, threadId.tileIndex);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    status = waitForCmdReady(threadId, sipRetryCount);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    const uint64_t memoryHandle = allThreads.at(threadId)->getMemoryHandle();
+    return readGpuMemory(memoryHandle, static_cast<char *>(buffer), size, addrs.gpuMemOffset);
+}
+
+ze_result_t DebugSessionImp::slmMemoryReadV2(EuThread::ThreadId threadId, const zet_debug_memory_space_desc_t *desc, size_t size, void *buffer) {
+    const auto addrs = getSlmAddresses(threadId, size, desc);
+    if (!addrs.has_value()) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+    return readMemViaSipTransaction(NEO::SipKernel::Command::slmRead, threadId, addrs.value(), size, buffer);
+}
+
+ze_result_t DebugSessionImp::readBarrierMemory(EuThread::ThreadId threadId, const zet_debug_memory_space_desc_t *desc, size_t size, void *buffer) {
+    const auto addrs = getBarrierAddresses(threadId, size, desc);
+    if (!addrs.has_value()) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+    return readMemViaSipTransaction(NEO::SipKernel::Command::barrierRead, threadId, addrs.value(), size, buffer);
+}
+
+ze_result_t DebugSessionImp::writeMemViaSipTransaction(NEO::SipKernel::Command commandId, EuThread::ThreadId threadId, const SipTransferAddr &addrs, size_t size, const void *buffer) {
+    ze_result_t status = waitForCmdReady(threadId, sipRetryCount);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    const uint64_t memoryHandle = allThreads.at(threadId)->getMemoryHandle();
+    status = writeGpuMemory(memoryHandle, static_cast<const char *>(buffer), size, addrs.gpuMemOffset);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    NEO::SipCommandRegisterValues sipCmd = sipTransferAddrToSipCommand(addrs, commandId);
+    status = cmdRegisterAccessHelper(threadId, sipCmd, true);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    status = resumeImp(std::vector<EuThread::ThreadId>{threadId}, threadId.tileIndex);
+    if (status != ZE_RESULT_SUCCESS) {
+        return status;
+    }
+
+    return waitForCmdReady(threadId, sipRetryCount);
+}
+
+ze_result_t DebugSessionImp::slmMemoryWriteV2(EuThread::ThreadId threadId, const zet_debug_memory_space_desc_t *desc, size_t size, const void *buffer) {
+    const auto addrs = getSlmAddresses(threadId, size, desc);
+    if (!addrs.has_value()) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    return writeMemViaSipTransaction(NEO::SipKernel::Command::slmWrite, threadId, addrs.value(), size, buffer);
 }
 
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,6 +16,7 @@
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/libult/create_command_stream.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "gtest/gtest.h"
@@ -56,7 +57,7 @@ struct PrepareDeviceEnvironmentsTest : ::testing::Test {
 
 TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathWhenCsrIsSetToVariousTypesThenExpectedValuesOfHardwareInfoAreSet) {
     uint32_t expectedDevices = 1;
-    DebugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
+    debugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
 
     if (!deviceAot.deviceAcronyms.empty()) {
         product = deviceAot.deviceAcronyms.front().str();
@@ -68,17 +69,17 @@ TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathW
         GTEST_SKIP();
     }
 
-    for (int csrTypes = -1; csrTypes <= CSR_TYPES_NUM; csrTypes++) {
+    for (int csrTypes = -1; csrTypes <= static_cast<int>(CommandStreamReceiverType::typesNum); csrTypes++) {
         CommandStreamReceiverType csrType;
         if (csrTypes != -1) {
             csrType = static_cast<CommandStreamReceiverType>(csrTypes);
-            DebugManager.flags.SetCommandStreamReceiver.set(csrType);
+            debugManager.flags.SetCommandStreamReceiver.set(csrTypes);
         } else {
-            csrType = CSR_HW;
-            DebugManager.flags.SetCommandStreamReceiver.set(-1);
+            csrType = CommandStreamReceiverType::hardware;
+            debugManager.flags.SetCommandStreamReceiver.set(-1);
         }
 
-        DebugManager.flags.ProductFamilyOverride.set(product);
+        debugManager.flags.ProductFamilyOverride.set(product);
         MockExecutionEnvironment exeEnv;
         exeEnv.prepareRootDeviceEnvironments(expectedDevices);
 
@@ -90,9 +91,9 @@ TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathW
             hwInfo = exeEnv.rootDeviceEnvironments[i]->getHardwareInfo();
 
             switch (csrType) {
-            case CSR_HW:
-            case CSR_HW_WITH_AUB:
-            case CSR_TYPES_NUM:
+            case CommandStreamReceiverType::hardware:
+            case CommandStreamReceiverType::hardwareWithAub:
+            case CommandStreamReceiverType::typesNum:
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
                 break;
@@ -106,23 +107,23 @@ TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathW
 
 TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathForDeprecatedNamesWhenCsrIsSetToVariousTypesThenExpectedValuesOfHardwareInfoAreSet) {
     uint32_t expectedDevices = 1;
-    DebugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
+    debugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
 
     if (deprecatedAcronym.empty()) {
         GTEST_SKIP();
     }
 
-    for (int csrTypes = -1; csrTypes <= CSR_TYPES_NUM; csrTypes++) {
+    for (int csrTypes = -1; csrTypes <= static_cast<int>(CommandStreamReceiverType::typesNum); csrTypes++) {
         CommandStreamReceiverType csrType;
         if (csrTypes != -1) {
             csrType = static_cast<CommandStreamReceiverType>(csrTypes);
-            DebugManager.flags.SetCommandStreamReceiver.set(csrType);
+            debugManager.flags.SetCommandStreamReceiver.set(csrTypes);
         } else {
-            csrType = CSR_HW;
-            DebugManager.flags.SetCommandStreamReceiver.set(-1);
+            csrType = CommandStreamReceiverType::hardware;
+            debugManager.flags.SetCommandStreamReceiver.set(-1);
         }
 
-        DebugManager.flags.ProductFamilyOverride.set(deprecatedAcronym);
+        debugManager.flags.ProductFamilyOverride.set(deprecatedAcronym);
         MockExecutionEnvironment exeEnv;
         exeEnv.prepareRootDeviceEnvironments(expectedDevices);
 
@@ -134,9 +135,9 @@ TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathF
             hwInfo = exeEnv.rootDeviceEnvironments[i]->getHardwareInfo();
 
             switch (csrType) {
-            case CSR_HW:
-            case CSR_HW_WITH_AUB:
-            case CSR_TYPES_NUM:
+            case CommandStreamReceiverType::hardware:
+            case CommandStreamReceiverType::hardwareWithAub:
+            case CommandStreamReceiverType::typesNum:
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
                 break;
@@ -150,60 +151,70 @@ TEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWithPciPathF
 
 HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsForDeprecatedNamesWhenCsrIsSetToVariousTypesThenExpectedValuesOfHardwareInfoAreSet) {
     uint32_t expectedDevices = 1;
-    DebugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
+    debugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
 
     if (deprecatedAcronym.empty()) {
         GTEST_SKIP();
     }
 
-    for (int csrTypes = -1; csrTypes <= CSR_TYPES_NUM; csrTypes++) {
+    for (int csrTypes = -1; csrTypes <= static_cast<int>(CommandStreamReceiverType::typesNum); csrTypes++) {
         CommandStreamReceiverType csrType;
         if (csrTypes != -1) {
             csrType = static_cast<CommandStreamReceiverType>(csrTypes);
-            DebugManager.flags.SetCommandStreamReceiver.set(csrType);
+            debugManager.flags.SetCommandStreamReceiver.set(csrTypes);
         } else {
-            csrType = CSR_HW;
-            DebugManager.flags.SetCommandStreamReceiver.set(-1);
+            csrType = CommandStreamReceiverType::hardware;
+            debugManager.flags.SetCommandStreamReceiver.set(-1);
         }
 
-        DebugManager.flags.ProductFamilyOverride.set(deprecatedAcronym);
+        debugManager.flags.ProductFamilyOverride.set(deprecatedAcronym);
         MockExecutionEnvironment exeEnv;
         exeEnv.prepareRootDeviceEnvironments(expectedDevices);
+
+        if (csrType == CommandStreamReceiverType::tbx || csrType == CommandStreamReceiverType::tbxWithAub) {
+            for (auto &rootDeviceEnvironment : exeEnv.rootDeviceEnvironments) {
+                auto mockProductHelper = std::make_unique<MockProductHelper>();
+                rootDeviceEnvironment->productHelper = std::move(mockProductHelper);
+            }
+        }
 
         const auto ret = prepareDeviceEnvironments(exeEnv);
         EXPECT_EQ(expectedDevices, exeEnv.rootDeviceEnvironments.size());
         for (auto i = 0u; i < expectedDevices; i++) {
             hwInfo = exeEnv.rootDeviceEnvironments[i]->getHardwareInfo();
             auto &productHelper = exeEnv.rootDeviceEnvironments[i]->getProductHelper();
-            auto &compilerProductHelper = exeEnv.rootDeviceEnvironments[i]->getHelper<CompilerProductHelper>();
             switch (csrType) {
-            case CSR_HW:
-            case CSR_HW_WITH_AUB:
+            case CommandStreamReceiverType::hardware:
+            case CommandStreamReceiverType::hardwareWithAub:
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
                 break;
-            case CSR_AUB:
-            case CSR_TBX:
-            case CSR_TBX_WITH_AUB: {
+            case CommandStreamReceiverType::aub:
+            case CommandStreamReceiverType::tbx:
+            case CommandStreamReceiverType::nullAub:
+            case CommandStreamReceiverType::tbxWithAub: {
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
 
-                for (i = 0; i < IGFX_MAX_PRODUCT; i++) {
+                for (i = 0; i < NEO::maxProductEnumValue; i++) {
                     auto hardwareInfo = hardwareInfoTable[i];
-                    if (hardwareInfo == nullptr)
+                    if (hardwareInfo == nullptr) {
                         continue;
-                    if (hardwareInfoTable[i]->platform.eProductFamily == hwInfo->platform.eProductFamily)
+                    }
+                    if (hardwareInfoTable[i]->platform.eProductFamily == hwInfo->platform.eProductFamily) {
                         break;
+                    }
                 }
 
-                EXPECT_TRUE(i < IGFX_MAX_PRODUCT);
+                EXPECT_TRUE(i < NEO::maxProductEnumValue);
                 ASSERT_NE(nullptr, hardwarePrefix[i]);
 
                 HardwareInfo hwInfoFromTable = *hardwareInfoTable[i];
                 hwInfoFromTable.featureTable = {};
                 hwInfoFromTable.workaroundTable = {};
                 hwInfoFromTable.gtSystemInfo = {};
-                hardwareInfoSetup[hwInfoFromTable.platform.eProductFamily](&hwInfoFromTable, true, 0x0, compilerProductHelper);
+                hwInfoFromTable.ipVersion = hwInfo->ipVersion;
+                hardwareInfoSetup[hwInfoFromTable.platform.eProductFamily](&hwInfoFromTable, true);
 
                 productHelper.configureHardwareCustom(&hwInfoFromTable, nullptr);
                 EXPECT_EQ(0, memcmp(&hwInfoFromTable.platform, &hwInfo->platform, sizeof(PLATFORM)));
@@ -220,7 +231,7 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsForDepreca
 
 HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWhenCsrIsSetToVariousTypesThenExpectedValuesOfHardwareInfoAreSet) {
     uint32_t expectedDevices = 1;
-    DebugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
+    debugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
 
     if (!deviceAot.deviceAcronyms.empty()) {
         product = deviceAot.deviceAcronyms.front().str();
@@ -232,19 +243,26 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWhenCsrIsS
         GTEST_SKIP();
     }
 
-    for (int csrTypes = -1; csrTypes <= CSR_TYPES_NUM; csrTypes++) {
+    for (int csrTypes = -1; csrTypes <= static_cast<int>(CommandStreamReceiverType::typesNum); csrTypes++) {
         CommandStreamReceiverType csrType;
         if (csrTypes != -1) {
             csrType = static_cast<CommandStreamReceiverType>(csrTypes);
-            DebugManager.flags.SetCommandStreamReceiver.set(csrType);
+            debugManager.flags.SetCommandStreamReceiver.set(csrTypes);
         } else {
-            csrType = CSR_HW;
-            DebugManager.flags.SetCommandStreamReceiver.set(-1);
+            csrType = CommandStreamReceiverType::hardware;
+            debugManager.flags.SetCommandStreamReceiver.set(-1);
         }
 
-        DebugManager.flags.ProductFamilyOverride.set(product);
-        MockExecutionEnvironment exeEnv;
+        debugManager.flags.ProductFamilyOverride.set(product);
+        ExecutionEnvironment exeEnv{};
         exeEnv.prepareRootDeviceEnvironments(expectedDevices);
+
+        if (csrType == CommandStreamReceiverType::tbx || csrType == CommandStreamReceiverType::tbxWithAub) {
+            for (auto &rootDeviceEnvironment : exeEnv.rootDeviceEnvironments) {
+                auto mockProductHelper = std::make_unique<MockProductHelper>();
+                rootDeviceEnvironment->productHelper = std::move(mockProductHelper);
+            }
+        }
 
         const auto ret = prepareDeviceEnvironments(exeEnv);
         EXPECT_EQ(expectedDevices, exeEnv.rootDeviceEnvironments.size());
@@ -254,14 +272,15 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWhenCsrIsS
             auto &compilerProductHelper = exeEnv.rootDeviceEnvironments[i]->getHelper<CompilerProductHelper>();
 
             switch (csrType) {
-            case CSR_HW:
-            case CSR_HW_WITH_AUB:
+            case CommandStreamReceiverType::hardware:
+            case CommandStreamReceiverType::hardwareWithAub:
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
                 break;
-            case CSR_AUB:
-            case CSR_TBX:
-            case CSR_TBX_WITH_AUB: {
+            case CommandStreamReceiverType::aub:
+            case CommandStreamReceiverType::nullAub:
+            case CommandStreamReceiverType::tbx:
+            case CommandStreamReceiverType::tbxWithAub: {
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
 
@@ -269,7 +288,8 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsWhenCsrIsS
                 expectedHwInfo.featureTable = {};
                 expectedHwInfo.workaroundTable = {};
                 expectedHwInfo.gtSystemInfo = {};
-                hardwareInfoSetup[expectedHwInfo.platform.eProductFamily](&expectedHwInfo, true, 0x0, compilerProductHelper);
+                expectedHwInfo.ipVersion = deviceAot.aotConfig;
+                hardwareInfoSetup[expectedHwInfo.platform.eProductFamily](&expectedHwInfo, true);
                 productHelper.configureHardwareCustom(&expectedHwInfo, nullptr);
 
                 compilerProductHelper.setProductConfigForHwInfo(expectedHwInfo, deviceAot.aotConfig);
@@ -291,8 +311,8 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenUpperCaseDeprecatedAcronymsToProduc
     }
 
     std::transform(deprecatedAcronym.begin(), deprecatedAcronym.end(), deprecatedAcronym.begin(), ::toupper);
-    DebugManager.flags.ProductFamilyOverride.set(deprecatedAcronym);
-    DebugManager.flags.SetCommandStreamReceiver.set(CommandStreamReceiverType::CSR_AUB);
+    debugManager.flags.ProductFamilyOverride.set(deprecatedAcronym);
+    debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::aub));
     MockExecutionEnvironment exeEnv;
     bool ret = prepareDeviceEnvironments(exeEnv);
 
@@ -312,8 +332,8 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenUpperCaseProductFamilyOverrideFlagS
     }
     std::transform(product.begin(), product.end(), product.begin(), ::toupper);
 
-    DebugManager.flags.ProductFamilyOverride.set(product);
-    DebugManager.flags.SetCommandStreamReceiver.set(CommandStreamReceiverType::CSR_AUB);
+    debugManager.flags.ProductFamilyOverride.set(product);
+    debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::aub));
 
     MockExecutionEnvironment exeEnv;
     bool ret = prepareDeviceEnvironments(exeEnv);
@@ -324,47 +344,56 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenUpperCaseProductFamilyOverrideFlagS
 
 HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsAndUnknownProductFamilyWhenCsrIsSetToValidTypeThenTheFunctionReturnsTheExpectedValueOfHardwareInfo) {
     uint32_t expectedDevices = 1;
-    DebugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
-    for (int csrTypes = 0; csrTypes <= CSR_TYPES_NUM; csrTypes++) {
+    debugManager.flags.CreateMultipleRootDevices.set(expectedDevices);
+    for (int csrTypes = 0; csrTypes <= static_cast<int>(CommandStreamReceiverType::typesNum); csrTypes++) {
         CommandStreamReceiverType csrType = static_cast<CommandStreamReceiverType>(csrTypes);
         std::string productFamily("unk");
 
-        DebugManager.flags.SetCommandStreamReceiver.set(csrType);
-        DebugManager.flags.ProductFamilyOverride.set(productFamily);
+        debugManager.flags.SetCommandStreamReceiver.set(csrTypes);
+        debugManager.flags.ProductFamilyOverride.set(productFamily);
         MockExecutionEnvironment exeEnv;
         exeEnv.prepareRootDeviceEnvironments(expectedDevices);
+
+        if (csrType == CommandStreamReceiverType::tbx || csrType == CommandStreamReceiverType::tbxWithAub) {
+            for (auto &rootDeviceEnvironment : exeEnv.rootDeviceEnvironments) {
+                auto mockProductHelper = std::make_unique<MockProductHelper>();
+                rootDeviceEnvironment->productHelper = std::move(mockProductHelper);
+            }
+        }
 
         auto ret = prepareDeviceEnvironments(exeEnv);
         EXPECT_EQ(expectedDevices, exeEnv.rootDeviceEnvironments.size());
         for (auto i = 0u; i < expectedDevices; i++) {
             hwInfo = exeEnv.rootDeviceEnvironments[i]->getHardwareInfo();
             auto &productHelper = exeEnv.rootDeviceEnvironments[i]->getProductHelper();
-            auto &compilerProductHelper = exeEnv.rootDeviceEnvironments[i]->getHelper<CompilerProductHelper>();
 
             switch (csrType) {
-            case CSR_HW:
-            case CSR_HW_WITH_AUB:
+            case CommandStreamReceiverType::hardware:
+            case CommandStreamReceiverType::hardwareWithAub:
                 EXPECT_TRUE(ret);
                 break;
-            case CSR_AUB:
-            case CSR_TBX:
-            case CSR_TBX_WITH_AUB: {
+            case CommandStreamReceiverType::aub:
+            case CommandStreamReceiverType::nullAub:
+            case CommandStreamReceiverType::tbx:
+            case CommandStreamReceiverType::tbxWithAub: {
                 EXPECT_TRUE(ret);
                 EXPECT_NE(nullptr, hwInfo);
-                for (i = 0; i < IGFX_MAX_PRODUCT; i++) {
+                for (i = 0; i < NEO::maxProductEnumValue; i++) {
                     auto hardwareInfo = hardwareInfoTable[i];
-                    if (hardwareInfo == nullptr)
+                    if (hardwareInfo == nullptr) {
                         continue;
-                    if (hardwareInfoTable[i]->platform.eProductFamily == hwInfo->platform.eProductFamily)
+                    }
+                    if (hardwareInfoTable[i]->platform.eProductFamily == hwInfo->platform.eProductFamily) {
                         break;
+                    }
                 }
-                EXPECT_TRUE(i < IGFX_MAX_PRODUCT);
+                EXPECT_TRUE(i < NEO::maxProductEnumValue);
                 ASSERT_NE(nullptr, hardwarePrefix[i]);
                 HardwareInfo baseHwInfo = *defaultHwInfo;
                 baseHwInfo.featureTable = {};
                 baseHwInfo.workaroundTable = {};
                 baseHwInfo.gtSystemInfo = {};
-                hardwareInfoSetup[baseHwInfo.platform.eProductFamily](&baseHwInfo, true, 0x0, compilerProductHelper);
+                hardwareInfoSetup[baseHwInfo.platform.eProductFamily](&baseHwInfo, true);
 
                 productHelper.configureHardwareCustom(&baseHwInfo, nullptr);
                 EXPECT_EQ(0, memcmp(&baseHwInfo.platform, &hwInfo->platform, sizeof(PLATFORM)));
@@ -376,5 +405,4 @@ HWTEST_F(PrepareDeviceEnvironmentsTest, givenPrepareDeviceEnvironmentsAndUnknown
         }
     }
 }
-
 } // namespace NEO

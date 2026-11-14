@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,9 +12,8 @@
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/test_macros/test.h"
-#include "shared/test/common/xe_hpg_core/dg2/product_configs_dg2.h"
 
-#include "device_ids_configs_dg2.h"
+#include "platforms.h"
 
 using namespace NEO;
 
@@ -25,11 +24,11 @@ DG2TEST_F(Dg2DeviceFactoryTest, givenOverrideHwIpVersionWhenPrepareDeviceEnviron
     MockExecutionEnvironment executionEnvironment{};
 
     std::vector<std::pair<uint32_t, int>> dg2G10Configs = {
-        {AOT::DG2_G10_A0, REV_ID_A0},
-        {AOT::DG2_G10_A1, REV_ID_A1}};
+        {AOT::DG2_G10_A0, revIdA0},
+        {AOT::DG2_G10_A1, revIdA1}};
 
     for (const auto &[config, revisionID] : dg2G10Configs) {
-        DebugManager.flags.OverrideHwIpVersion.set(config);
+        debugManager.flags.OverrideHwIpVersion.set(config);
 
         bool success = DeviceFactory::prepareDeviceEnvironmentsForProductFamilyOverride(executionEnvironment);
         EXPECT_TRUE(success);
@@ -44,12 +43,12 @@ DG2TEST_F(Dg2DeviceFactoryTest, givenOverrideHwIpVersionAndDeviceIdWhenPrepareDe
     MockExecutionEnvironment executionEnvironment{};
 
     std::vector<std::pair<uint32_t, int>> dg2G10Configs = {
-        {AOT::DG2_G10_A0, REV_ID_A0},
-        {AOT::DG2_G10_A1, REV_ID_A1}};
+        {AOT::DG2_G10_A0, revIdA0},
+        {AOT::DG2_G10_A1, revIdA1}};
 
-    DebugManager.flags.ForceDeviceId.set("0x1234");
+    debugManager.flags.ForceDeviceId.set("0x1234");
     for (const auto &[config, revisionID] : dg2G10Configs) {
-        DebugManager.flags.OverrideHwIpVersion.set(config);
+        debugManager.flags.OverrideHwIpVersion.set(config);
 
         bool success = DeviceFactory::prepareDeviceEnvironmentsForProductFamilyOverride(executionEnvironment);
         EXPECT_TRUE(success);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,26 +11,22 @@
 #include "zello_compile.h"
 
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <memory>
 
 int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello Copy With Printf";
-    verbose = isVerbose(argc, argv);
-    bool aubMode = isAubMode(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
 
     // X. Prepare spirV
     std::string buildLog;
-    auto moduleBinary = compileToSpirV(memcpyBytesWithPrintfTestKernelSrc, "-g", buildLog);
-    if (!buildLog.empty()) {
-        std::cout << "Build log " << buildLog;
-    }
+    auto moduleBinary = LevelZeroBlackBoxTests::compileToSpirV(LevelZeroBlackBoxTests::memcpyBytesWithPrintfTestKernelSrc, "-g", buildLog);
+    LevelZeroBlackBoxTests::printBuildLog(buildLog);
     SUCCESS_OR_TERMINATE((0 == moduleBinary.size()));
 
     // 1. Set-up
     size_t allocSize = 4096;
-    if (verbose) {
+    if (LevelZeroBlackBoxTests::verbose) {
         allocSize = 32;
     }
     constexpr size_t bytesPerThread = sizeof(char);
@@ -43,12 +39,12 @@ int main(int argc, char *argv[]) {
     void *dstBuffer = nullptr;
 
     ze_context_handle_t context = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context);
     auto device = devices[0];
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
     ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
     moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
@@ -66,14 +62,14 @@ int main(int argc, char *argv[]) {
     SUCCESS_OR_TERMINATE(zeKernelSuggestGroupSize(kernel, static_cast<uint32_t>(numThreads), 1U, 1U, &groupSizeX,
                                                   &groupSizeY, &groupSizeZ));
     SUCCESS_OR_TERMINATE_BOOL(numThreads % groupSizeX == 0);
-    if (verbose) {
+    if (LevelZeroBlackBoxTests::verbose) {
         std::cout << "Group size : (" << groupSizeX << ", " << groupSizeY << ", " << groupSizeZ
                   << ")" << std::endl;
     }
     SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernel, groupSizeX, groupSizeY, groupSizeZ));
 
-    cmdQueue = createCommandQueue(context, device, nullptr, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     ze_device_mem_alloc_desc_t deviceDesc = {};
     deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
@@ -118,11 +114,8 @@ int main(int argc, char *argv[]) {
     dispatchTraits.groupCountX = static_cast<uint32_t>(numThreads) / groupSizeX;
     dispatchTraits.groupCountY = 1u;
     dispatchTraits.groupCountZ = 1u;
-    if (verbose) {
-        std::cerr << "Number of groups : (" << dispatchTraits.groupCountX << ", "
-                  << dispatchTraits.groupCountY << ", " << dispatchTraits.groupCountZ << ")"
-                  << std::endl;
-    }
+    LevelZeroBlackBoxTests::printGroupCount(dispatchTraits);
+
     SUCCESS_OR_TERMINATE_BOOL(dispatchTraits.groupCountX * groupSizeX == allocSize);
     SUCCESS_OR_TERMINATE(zeCommandListAppendLaunchKernel(cmdList, kernel, &dispatchTraits,
                                                          nullptr, 0, nullptr));
@@ -148,7 +141,7 @@ int main(int argc, char *argv[]) {
     for (size_t i = 0; i < allocSize; ++i) {
         uint8_t expectedData = static_cast<uint8_t>(initDataSrc[i] + i);
         outputValidationSuccessful &= (expectedData == readBackData[i]);
-        if ((verbose || (outputValidationSuccessful == false)) && (aubMode == false)) {
+        if ((LevelZeroBlackBoxTests::verbose || (outputValidationSuccessful == false)) && (aubMode == false)) {
             std::cout << "readBackData[" << i << "] = "
                       << static_cast<uint32_t>(readBackData[i])
                       << ", expected " << static_cast<uint32_t>(expectedData) << "\n";
@@ -168,13 +161,12 @@ int main(int argc, char *argv[]) {
 
     SUCCESS_OR_TERMINATE(zeKernelDestroy(kernel));
     SUCCESS_OR_TERMINATE(zeModuleDestroy(module));
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
 
     delete[] initDataSrc;
     delete[] initDataDst;
     delete[] readBackData;
 
-    printResult(aubMode, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(aubMode, outputValidationSuccessful, blackBoxName);
     int resultOnFailure = aubMode ? 0 : 1;
     return outputValidationSuccessful ? 0 : resultOnFailure;
 }

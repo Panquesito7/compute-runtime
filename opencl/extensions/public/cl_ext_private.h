@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,9 +22,15 @@
  * Internal only kernel exec info properties *
  *********************************************/
 
+// Legacy aliases of the CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_*_INTEL tokens, still accepted for backward compatibility
 #define CL_KERNEL_EXEC_INFO_KERNEL_TYPE_INTEL 0x1000C
 #define CL_KERNEL_EXEC_INFO_DEFAULT_TYPE_INTEL 0x1000D
 #define CL_KERNEL_EXEC_INFO_CONCURRENT_TYPE_INTEL 0x1000E
+
+using cl_kernel_exec_info_dispatch_type_intel = cl_uint;
+#define CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_INTEL 0x4257
+#define CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_DEFAULT_INTEL 0
+#define CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_CONCURRENT_INTEL 1
 
 /*********************************
  * cl_intel_debug_info extension *
@@ -72,7 +78,7 @@ using cl_unified_shared_memory_type_intel = cl_uint;
 #define CL_MEM_LOCALLY_UNCACHED_SURFACE_STATE_RESOURCE (1 << 25)
 #define CL_MEM_48BIT_RESOURCE_INTEL (1 << 26)
 
-#define CL_MEM_DEVICE_ID_INTEL 0x10011
+#define CL_MEM_DEVICE_ID_INTEL_DEPRECATED 0x10011
 
 // Used with clEnqueueVerifyMemory
 #define CL_MEM_COMPARE_EQUAL 0u
@@ -343,6 +349,22 @@ typedef cl_bitfield cl_command_queue_mdapi_properties_intel;
 #define CL_DEVICE_EU_THREAD_COUNTS_INTEL 0x1000A // placeholder
 #define CL_KERNEL_EU_THREAD_COUNT_INTEL 0x1000B  // placeholder
 
+#if !defined(cl_intel_maximum_registers)
+#define CL_KERNEL_REGISTER_COUNT_INTEL 0x425B
+#endif
+
+/*************************************************
+ *   cl_khr_spirv_queries extension              *
+ *************************************************/
+
+#ifndef cl_khr_spirv_queries
+#define cl_khr_spirv_queries 1
+#define CL_KHR_SPIRV_QUERIES_EXTENSION_NAME "cl_khr_spirv_queries"
+#define CL_DEVICE_SPIRV_EXTENDED_INSTRUCTION_SETS_KHR 0x12B9
+#define CL_DEVICE_SPIRV_EXTENSIONS_KHR 0x12BA
+#define CL_DEVICE_SPIRV_CAPABILITIES_KHR 0x12BB
+#endif
+
 /*************************************************
  *   cl_ext_float_atomics extension              *
  *************************************************/
@@ -369,4 +391,40 @@ typedef cl_bitfield cl_device_fp_atomic_capabilities_ext;
 
 /* bits 19 and beyond are currently unused */
 
+#endif
+
+/*************************************************
+ *   CL_PLATFORM_UNLOADABLE_KHR                  *
+ *************************************************/
+
+#if !defined(CL_PLATFORM_UNLOADABLE_KHR)
+#define CL_PLATFORM_UNLOADABLE_KHR 0x0921
+#endif
+
+/***************************************************************
+ * cl_intel_kernel_allocations_info
+ ***************************************************************/
+#if !defined(cl_intel_kernel_allocations_info)
+#define cl_intel_kernel_allocations_info 1
+#define CL_INTEL_KERNEL_ALLOCATIONS_INFO_EXTENSION_NAME \
+    "cl_intel_kernel_allocations_info"
+
+#define CL_INTEL_KERNEL_ALLOCATIONS_INFO_EXTENSION_VERSION CL_MAKE_VERSION(1, 0, 0)
+
+/* type cl_unified_shared_memory_type_intel */
+
+typedef struct _cl_kernel_allocation_info_intel {
+    void *base;
+    size_t size;
+    cl_unified_shared_memory_type_intel type;
+    cl_int arg_index;
+} cl_kernel_allocation_info_intel;
+
+/* cl_kernel_workgroup_info */
+#define CL_KERNEL_ALLOCATIONS_INFO_INTEL 0x425A
+#endif
+
+// cl_device bfloat16 atomic capabilities
+#if !defined(CL_DEVICE_BFLOAT16_FP_ATOMIC_CAPABILITIES_EXT)
+#define CL_DEVICE_BFLOAT16_FP_ATOMIC_CAPABILITIES_EXT 0x10012
 #endif

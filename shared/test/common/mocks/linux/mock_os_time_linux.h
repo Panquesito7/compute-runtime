@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,15 +14,39 @@
 namespace NEO {
 class MockDeviceTimeDrm : public DeviceTimeDrm {
   public:
+    using DeviceTimeDrm::DeviceTimeDrm;
     using DeviceTimeDrm::pDrm;
-    MockDeviceTimeDrm() : DeviceTimeDrm(nullptr) {
+
+    TimeQueryStatus getGpuCpuTimeImpl(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
+        getGpuCpuTimeImplCalled++;
+        if (callBaseGetGpuCpuTimeImpl) {
+            return DeviceTimeDrm::getGpuCpuTimeImpl(pGpuCpuTime, osTime);
+        }
+        *pGpuCpuTime = gpuCpuTimeValue;
+        return getGpuCpuTimeImplResult;
     }
+
+    double getDynamicDeviceTimerResolution() const override {
+        if (callGetDynamicDeviceTimerResolution) {
+            return DeviceTimeDrm::getDynamicDeviceTimerResolution();
+        }
+        return dynamicDeviceTimerResolutionValue;
+    }
+
+    bool callBaseGetGpuCpuTimeImpl = true;
+    TimeQueryStatus getGpuCpuTimeImplResult = TimeQueryStatus::success;
+    TimeStampData gpuCpuTimeValue{};
+    uint32_t getGpuCpuTimeImplCalled = 0;
+
+    bool callGetDynamicDeviceTimerResolution = false;
+    double dynamicDeviceTimerResolutionValue = 1.0;
 };
 
 class MockOSTimeLinux : public OSTimeLinux {
   public:
-    MockOSTimeLinux(OSInterface *osInterface)
-        : OSTimeLinux(osInterface, std::make_unique<MockDeviceTimeDrm>()) {
+    using OSTimeLinux::maxGpuTimeStamp;
+    MockOSTimeLinux(OSInterface &osInterface)
+        : OSTimeLinux(osInterface, std::make_unique<MockDeviceTimeDrm>(osInterface)) {
     }
     void setResolutionFunc(resolutionFunc_t func) {
         this->resolutionFunc = func;
@@ -33,9 +57,8 @@ class MockOSTimeLinux : public OSTimeLinux {
     void updateDrm(Drm *drm) {
         osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
         static_cast<MockDeviceTimeDrm *>(this->deviceTime.get())->pDrm = drm;
-        static_cast<MockDeviceTimeDrm *>(this->deviceTime.get())->timestampTypeDetect();
     }
-    static std::unique_ptr<MockOSTimeLinux> create(OSInterface *osInterface) {
+    static std::unique_ptr<MockOSTimeLinux> create(OSInterface &osInterface) {
         return std::unique_ptr<MockOSTimeLinux>(new MockOSTimeLinux(osInterface));
     }
 

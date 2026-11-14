@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,16 +15,21 @@
 #include <string>
 #include <vector>
 
-extern std::string lastTest;
 namespace NEO {
 extern const char *executionName;
-}
+extern const char *apiName;
+} // namespace NEO
 
 class CCustomEventListener : public ::testing::TestEventListener {
   public:
     CCustomEventListener(::testing::TestEventListener *listener) : listener(listener), hardwarePrefix("---") {}
 
     CCustomEventListener(::testing::TestEventListener *listener, const char *hardwarePrefix) : listener(listener), hardwarePrefix(hardwarePrefix) {
+        setHwPrefix(hardwarePrefix);
+    }
+
+    void setHwPrefix(const char *hardwarePrefix) {
+        this->hardwarePrefix = hardwarePrefix;
         std::transform(this->hardwarePrefix.begin(), this->hardwarePrefix.end(), this->hardwarePrefix.begin(),
                        [](unsigned char c) { return std::toupper(c); });
     }
@@ -60,20 +65,19 @@ class CCustomEventListener : public ::testing::TestEventListener {
     void OnEnvironmentsSetUpEnd(const ::testing::UnitTest &unitTest) override {
     }
 
-    void OnTestCaseStart(const ::testing::TestCase &testCase) override {
+    void OnTestSuiteStart(const ::testing::TestSuite &testSuite) override {
     }
 
     void OnTestStart(const ::testing::TestInfo &testCase) override {
-        std::stringstream ss;
-        ss << testCase.test_case_name() << "." << testCase.name();
-        lastTest = ss.str();
     }
 
     void OnTestPartResult(const ::testing::TestPartResult &testPartResult) override {
         if (testPartResult.failed()) {
             printf("\n");
         }
-        listener->OnTestPartResult(testPartResult);
+        if (!testPartResult.skipped()) {
+            listener->OnTestPartResult(testPartResult);
+        }
     }
 
     void OnTestEnd(const ::testing::TestInfo &testCase) override {
@@ -85,7 +89,7 @@ class CCustomEventListener : public ::testing::TestEventListener {
         }
     }
 
-    void OnTestCaseEnd(const ::testing::TestCase &testCase) override {
+    void OnTestSuiteEnd(const ::testing::TestSuite &testSuite) override {
     }
 
     void OnEnvironmentsTearDownStart(const ::testing::UnitTest &testCase) override {
@@ -107,55 +111,64 @@ class CCustomEventListener : public ::testing::TestEventListener {
         if (unitTest.Failed()) {
             ultStatus = "FAILED";
         }
-        auto executionNameLen = strlen(NEO::executionName);
+        auto targetNameLen = strlen(NEO::apiName) + 1 + strlen(NEO::executionName);
 
         if (hardwarePrefix != "---") {
-            paddingS = std::string(hardwarePrefix.length() + executionNameLen, ' ');
-            paddingE = std::string(hardwarePrefix.length() + executionNameLen, '=');
+            paddingS = std::string(hardwarePrefix.length() + targetNameLen, ' ');
+            paddingE = std::string(hardwarePrefix.length() + targetNameLen, '=');
 
             fprintf(
                 stdout,
                 "\n"
                 "%s==================\n"
-                "==  %s %ss %s   ==\n"
+                "==  %s %s %ss %s   ==\n"
                 "%s==================\n",
-                paddingE.c_str(), hardwarePrefix.c_str(), NEO::executionName, ultStatus.c_str(), paddingE.c_str());
+                paddingE.c_str(), hardwarePrefix.c_str(), NEO::apiName, NEO::executionName, ultStatus.c_str(), paddingE.c_str());
         } else {
-            paddingE = std::string(executionNameLen, '=');
+            paddingE = std::string(targetNameLen, '=');
             fprintf(
                 stdout,
                 "\n"
                 "%s==================\n"
-                "==   %ss %s   ==\n"
+                "==   %s %ss %s   ==\n"
                 "%s==================\n",
-                paddingE.c_str(), NEO::executionName, ultStatus.c_str(), paddingE.c_str());
+                paddingE.c_str(), NEO::apiName, NEO::executionName, ultStatus.c_str(), paddingE.c_str());
         }
 
         fprintf(
             stdout,
             "Tests run:      %d\n"
             "Tests passed:   %d\n"
-            "Tests skipped:  %d\n"
-            "Tests failed:   %d\n"
+            "Tests skipped:  %d\n",
+            testsRun,
+            testsPassed,
+            testsSkipped);
+        if (testsFailed > 0) {
+            fprintf(
+                stdout,
+                "Tests failed:   %d\n",
+                testsFailed);
+        }
+
+        fprintf(
+            stdout,
             "Tests disabled: %d\n"
             " Time elapsed:  %d ms\n"
             "%s==================\n",
-            testsRun,
-            testsPassed,
-            testsSkipped,
-            testsFailed,
             testsDisabled,
             timeElapsed,
             paddingE.c_str());
 
-        for (auto failure : testFailures)
+        for (auto failure : testFailures) {
             fprintf(
                 stdout,
                 "[  FAILED  ][ %s ][ %u ] %s\n", hardwarePrefix.c_str(), failure.second, failure.first.c_str());
-        if (unitTest.Failed())
+        }
+        if (unitTest.Failed()) {
             fprintf(
                 stdout,
                 "\n");
+        }
 
         fflush(stdout);
     }

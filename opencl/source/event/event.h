@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,10 @@
 
 #pragma once
 #include "shared/source/helpers/completion_stamp.h"
-#include "shared/source/os_interface/os_time.h"
+#include "shared/source/helpers/profiling_info.h"
 #include "shared/source/utilities/idlist.h"
 #include "shared/source/utilities/iflist.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "opencl/source/api/cl_types.h"
 #include "opencl/source/command_queue/copy_engine_state.h"
@@ -39,12 +40,12 @@ struct OpenCLObjectMapper<_cl_event> {
 class Event : public BaseObject<_cl_event>, public IDNode<Event> {
   public:
     enum class ECallbackTarget : uint32_t {
-        Queued = 0,
-        Submitted,
-        Running,
-        Completed,
-        MAX,
-        Invalid
+        queued = 0,
+        submitted,
+        running,
+        completed,
+        max,
+        invalid
     };
 
     struct Callback : public IFNode<Callback> {
@@ -75,18 +76,18 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
       private:
         cl_event event;
         ClbFuncT callbackFunction;
-        int32_t callbackExecutionStatusTarget; // minimum event execution status that will triger this callback
+        int32_t callbackExecutionStatusTarget; // minimum event execution status that will trigger this callback
         void *userData;
     };
+    static_assert(NEO::NonCopyableAndNonMovable<IFList<Callback, true, true>>);
+
+    using ProfilingInfo = NEO::ProfilingInfo;
 
     static const cl_ulong objectMagic = 0x80134213A43C981ALL;
     static constexpr cl_int executionAbortedDueToGpuHang = -777;
 
     Event(CommandQueue *cmdQueue, cl_command_type cmdType,
           TaskCountType taskLevel, TaskCountType taskCount);
-
-    Event(const Event &) = delete;
-    Event &operator=(const Event &) = delete;
 
     ~Event() override;
 
@@ -160,16 +161,16 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
     }
 
     bool peekHasCallbacks(ECallbackTarget target) {
-        if (target >= ECallbackTarget::MAX) {
+        if (target >= ECallbackTarget::max) {
             DEBUG_BREAK_IF(true);
             return false;
         }
-        return (callbacks[(uint32_t)target].peekHead() != nullptr);
+        return (callbacks[static_cast<uint32_t>(target)].peekHead() != nullptr);
     }
 
     bool peekHasCallbacks() {
-        for (uint32_t i = 0; i < (uint32_t)ECallbackTarget::MAX; ++i) {
-            if (peekHasCallbacks((ECallbackTarget)i)) {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(ECallbackTarget::max); ++i) {
+            if (peekHasCallbacks(static_cast<ECallbackTarget>(i))) {
                 return true;
             }
         }
@@ -208,13 +209,13 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
         return submittedCmd != nullptr;
     }
 
-    // commands blocked by user event depencies
+    // commands blocked by user event dependencies
     bool isReadyForSubmission();
 
     // adds a callback (execution state change listener) to this event's list of callbacks
     void addCallback(Callback::ClbFuncT fn, cl_int type, void *data);
 
-    // if(blocking==false), will return with WaitStatus::NotReady instead of blocking while waiting for completion
+    // if(blocking==false), will return with WaitStatus::notReady instead of blocking while waiting for completion
     virtual WaitStatus wait(bool blocking, bool useQuickKmdSleep);
 
     bool isUserEvent() const {
@@ -237,7 +238,7 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
         return cmdQueue;
     }
 
-    cl_command_type getCommandType() {
+    cl_command_type getCommandType() const {
         return cmdType;
     }
 
@@ -287,13 +288,8 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
         return this->taskCount;
     }
 
-    void setQueueTimeStamp(TimeStampData *queueTimeStamp) {
-        this->queueTimeStamp = *queueTimeStamp;
-    };
-
     void setQueueTimeStamp();
     void setSubmitTimeStamp();
-
     void setStartTimeStamp();
     void setEndTimeStamp();
 
@@ -311,6 +307,16 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
 
     static void getBoundaryTimestampValues(TimestampPacketContainer *timestampContainer, uint64_t &globalStartTS, uint64_t &globalEndTS);
 
+    void copyTimestamps(Event &srcEvent);
+
+    void setWaitForTaskCountRequired(bool newValue) {
+        waitForTaskCountRequired = newValue;
+    }
+
+    bool getWaitForTaskCountRequired() const {
+        return waitForTaskCountRequired;
+    }
+
   protected:
     Event(Context *ctx, CommandQueue *cmdQueue, cl_command_type cmdType,
           TaskCountType taskLevel, TaskCountType taskCount);
@@ -319,27 +325,28 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
         switch (execStatus) {
         default: {
             DEBUG_BREAK_IF(true);
-            return ECallbackTarget::Invalid;
+            return ECallbackTarget::invalid;
         }
 
         case CL_QUEUED:
-            return ECallbackTarget::Queued;
+            return ECallbackTarget::queued;
         case CL_SUBMITTED:
-            return ECallbackTarget::Submitted;
+            return ECallbackTarget::submitted;
         case CL_RUNNING:
-            return ECallbackTarget::Running;
+            return ECallbackTarget::running;
         case CL_COMPLETE:
-            return ECallbackTarget::Completed;
+            return ECallbackTarget::completed;
         }
     }
 
-    void calculateSubmitTimestampData();
-    uint64_t getTimeInNSFromTimestampData(const TimeStampData &timestamp) const;
+    uint64_t getProfilingInfoData(const ProfilingInfo &profilingInfo) const;
+    void setupRelativeProfilingInfo(ProfilingInfo &profilingInfo);
     bool calcProfilingData();
     MOCKABLE_VIRTUAL void calculateProfilingDataInternal(uint64_t contextStartTS, uint64_t contextEndTS, uint64_t *contextCompleteTS, uint64_t globalStartTS);
     MOCKABLE_VIRTUAL void synchronizeTaskCount() {
-        while (this->taskCount == CompletionStamp::notReady)
+        while (this->taskCount == CompletionStamp::notReady) {
             ;
+        }
     };
 
     // executes all callbacks associated with this event
@@ -359,45 +366,51 @@ class Event : public BaseObject<_cl_event>, public IDNode<Event> {
     bool isWaitForTimestampsEnabled() const;
     bool areTimestampsCompleted();
 
-    bool currentCmdQVirtualEvent;
-    std::atomic<Command *> cmdToSubmit;
-    std::atomic<Command *> submittedCmd;
+    bool currentCmdQVirtualEvent = false;
+    std::atomic<Command *> cmdToSubmit{nullptr};
+    std::atomic<Command *> submittedCmd{nullptr};
     bool eventWithoutCommand = true;
+    bool waitForTaskCountRequired = false;
 
-    Context *ctx;
-    CommandQueue *cmdQueue;
-    cl_command_type cmdType;
+    Context *ctx = nullptr;
+    CommandQueue *cmdQueue = nullptr;
+    cl_command_type cmdType{};
 
     // callbacks to be executed when this event changes its execution state
-    IFList<Callback, true, true> callbacks[(uint32_t)ECallbackTarget::MAX];
+    IFList<Callback, true, true> callbacks[static_cast<uint32_t>(ECallbackTarget::max)];
 
     // can be accessed only with transitionExecutionState
-    // this is to ensure state consitency event when doning lock-free multithreading
-    // e.g. CL_COMPLETE -> CL_SUBMITTED or CL_SUBMITTED -> CL_QUEUED becomes forbiden
-    mutable std::atomic<int32_t> executionStatus;
+    // this is to ensure state consistency event when doning lock-free multithreading
+    // e.g. CL_COMPLETE -> CL_SUBMITTED or CL_SUBMITTED -> CL_QUEUED becomes forbidden
+    mutable std::atomic<int32_t> executionStatus{CL_QUEUED};
     // Timestamps
-    bool profilingEnabled;
-    bool profilingCpuPath;
-    bool dataCalculated;
-    TimeStampData queueTimeStamp;
-    TimeStampData submitTimeStamp;
-    uint64_t startTimeStamp;
-    uint64_t endTimeStamp;
-    uint64_t completeTimeStamp;
+    bool profilingEnabled = false;
+    bool profilingCpuPath = false;
+    bool dataCalculated = false;
+
+    ProfilingInfo queueTimeStamp{};
+    ProfilingInfo submitTimeStamp{};
+    ProfilingInfo startTimeStamp{};
+    ProfilingInfo endTimeStamp{};
+    ProfilingInfo completeTimeStamp{};
+
     CopyEngineState bcsState{};
-    bool perfCountersEnabled;
+    bool perfCountersEnabled = false;
     TagNodeBase *timeStampNode = nullptr;
     TagNodeBase *perfCounterNode = nullptr;
     TagNodeBase *multiRootTimeStampSyncNode = nullptr;
     std::unique_ptr<TimestampPacketContainer> timestampPacketContainer;
     // number of events this event depends on
     std::unique_ptr<TimestampPacketContainer> multiRootDeviceTimestampPacketContainer;
-    std::atomic<int> parentCount;
+    std::atomic<int> parentCount{0u};
+    std::atomic<bool> gpuStateWaited{false};
     // event parents
     std::vector<Event *> parentEvents;
 
   private:
     // can be accessed only with updateTaskCount
-    std::atomic<TaskCountType> taskCount;
+    std::atomic<TaskCountType> taskCount{0};
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<Event>);
 } // namespace NEO

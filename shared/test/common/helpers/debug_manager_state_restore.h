@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,32 +8,25 @@
 #pragma once
 #include "shared/source/debug_settings/debug_settings_manager.h"
 
+#include <cstddef>
+
 using namespace NEO;
+
+// Records the previous value of every set() on the DebugVariables passed to startRecording().
+// DebugManagerStateRestore reverts the changes made during its lifetime, stopRecording() reverts the rest.
+namespace DebugVariablesChangeTracker {
+void startRecording(DebugVariables &flags);
+void stopRecording(void (*reportChangedVariable)(const void *variable));
+} // namespace DebugVariablesChangeTracker
 
 class DebugManagerStateRestore {
   public:
-    DebugManagerStateRestore() {
-        debugVarSnapshot = DebugManager.flags;
-        injectFcnSnapshot = DebugManager.injectFcn;
-    }
-    ~DebugManagerStateRestore() {
-        DebugManager.flags = debugVarSnapshot;
-        DebugManager.injectFcn = injectFcnSnapshot;
-#undef DECLARE_DEBUG_VARIABLE
-#define DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description) shrink(DebugManager.flags.variableName.getRef());
-#include "shared/source/debug_settings/release_variables.inl"
-
-#include "debug_variables.inl"
-#undef DECLARE_DEBUG_VARIABLE
-    }
-    DebugVariables debugVarSnapshot;
-    void *injectFcnSnapshot = nullptr;
+    DebugManagerStateRestore();
+    ~DebugManagerStateRestore();
+    DebugManagerStateRestore(const DebugManagerStateRestore &) = delete;
+    DebugManagerStateRestore &operator=(const DebugManagerStateRestore &) = delete;
 
   protected:
-    void shrink(std::string &flag) {
-        flag.shrink_to_fit();
-    }
-    void shrink(int64_t &flag) {}
-    void shrink(int32_t &flag) {}
-    void shrink(bool &flag) {}
+    size_t firstChangeIndex;
+    void *injectFcnSnapshot;
 };

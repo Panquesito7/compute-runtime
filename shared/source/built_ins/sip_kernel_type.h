@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,18 +12,19 @@
 namespace NEO {
 
 enum class SipKernelType : std::uint32_t {
-    Csr = 0,
-    DbgCsr,
-    DbgCsrLocal,
-    DbgBindless,
-    COUNT
+    csr = 0,
+    dbgCsr,
+    dbgCsrLocal,
+    dbgBindless,
+    dbgHeapless,
+    count
 };
 
 enum class SipClassType : std::uint32_t {
-    Init = 0,
-    Builtins,
-    RawBinaryFromFile,
-    HexadecimalHeaderFile
+    init = 0,
+    builtins,
+    rawBinaryFromFile,
+    externalLib
 };
 
 } // namespace NEO

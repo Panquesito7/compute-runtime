@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -32,7 +32,7 @@ void SyncBufferHandler::makeResident(CommandStreamReceiver &csr) {
 
 void SyncBufferHandler::allocateNewBuffer() {
     AllocationProperties allocationProperties{device.getRootDeviceIndex(), true, bufferSize,
-                                              AllocationType::LINEAR_STREAM,
+                                              AllocationType::syncBuffer,
                                               (device.getNumGenericSubDevices() > 1u), /* multiOsContextCapable */
                                               false, device.getDeviceBitfield()};
     graphicsAllocation = memoryManager.allocateGraphicsMemoryWithProperties(allocationProperties);
@@ -40,6 +40,23 @@ void SyncBufferHandler::allocateNewBuffer() {
 
     auto cpuPointer = graphicsAllocation->getUnderlyingBuffer();
     std::memset(cpuPointer, 0, bufferSize);
+}
+
+std::pair<GraphicsAllocation *, size_t> SyncBufferHandler::obtainAllocationAndOffset(size_t requiredSize) {
+    std::lock_guard<std::mutex> guard(this->mutex);
+
+    bool isCurrentBufferFull = (usedBufferSize + requiredSize > bufferSize);
+    if (isCurrentBufferFull) {
+        memoryManager.checkGpuUsageAndDestroyGraphicsAllocations(graphicsAllocation);
+        allocateNewBuffer();
+        usedBufferSize = 0;
+    }
+
+    std::pair<GraphicsAllocation *, size_t> allocationAndOffset = {graphicsAllocation, usedBufferSize};
+
+    usedBufferSize += requiredSize;
+
+    return allocationAndOffset;
 }
 
 } // namespace NEO

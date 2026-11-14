@@ -1,19 +1,20 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/compiler_product_helper.h"
-#include "shared/source/xe_hpg_core/hw_cmds.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/platform/platform_info.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
+#include "opencl/test/unit_test/fixtures/platform_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-
-#include "hw_cmds_xe_hpg_core_base.h"
 
 using namespace NEO;
 
@@ -26,20 +27,16 @@ XE_HPG_CORETEST_F(XeHpgCoreClDeviceCaps, givenXeHpgCoreWhenCheckExtensionsThenDe
 }
 
 XE_HPG_CORETEST_F(XeHpgCoreClDeviceCaps, giveDeviceExtensionsWhenDeviceCapsInitializedThenAddProperExtensions) {
-    const auto &compilerProductHelper = getHelper<CompilerProductHelper>();
     const auto &caps = pClDevice->getDeviceInfo();
-    auto releaseHelper = pClDevice->getDevice().getReleaseHelper();
+    const auto &hwInfoCaps = pClDevice->getDevice().getHardwareInfo().caps;
 
     EXPECT_TRUE(hasSubstr(caps.deviceExtensions, std::string("cl_intel_create_buffer_with_properties")));
-    EXPECT_TRUE(hasSubstr(caps.deviceExtensions, std::string("cl_intel_dot_accumulate")));
     EXPECT_TRUE(hasSubstr(caps.deviceExtensions, std::string("cl_intel_subgroup_local_block_io")));
 
-    bool expectMatrixMultiplyAccumulateExtensions = compilerProductHelper.isMatrixMultiplyAccumulateSupported(releaseHelper);
-    EXPECT_EQ(expectMatrixMultiplyAccumulateExtensions, hasSubstr(caps.deviceExtensions, std::string("cl_intel_subgroup_matrix_multiply_accumulate")));
-    EXPECT_EQ(expectMatrixMultiplyAccumulateExtensions, hasSubstr(caps.deviceExtensions, std::string("cl_intel_subgroup_split_matrix_multiply_accumulate")));
+    EXPECT_EQ(hwInfoCaps.dotProductAccumulateSystolicSupported, hasSubstr(caps.deviceExtensions, std::string("cl_intel_subgroup_matrix_multiply_accumulate")));
+    EXPECT_EQ(hwInfoCaps.splitMatrixMultiplyAccumulateSupported, hasSubstr(caps.deviceExtensions, std::string("cl_intel_subgroup_split_matrix_multiply_accumulate")));
 
-    bool expectBFloat16ConversionsExtension = compilerProductHelper.isBFloat16ConversionSupported(pClDevice->getHardwareInfo());
-    EXPECT_EQ(expectBFloat16ConversionsExtension, hasSubstr(caps.deviceExtensions, std::string("cl_intel_bfloat16_conversions")));
+    EXPECT_EQ(hwInfoCaps.bFloat16ConversionSupported, hasSubstr(caps.deviceExtensions, std::string("cl_intel_bfloat16_conversions")));
 }
 
 XE_HPG_CORETEST_F(XeHpgCoreClDeviceCaps, givenXeHpgCoreWhenCheckingCapsThenDeviceDoesNotSupportIndependentForwardProgress) {
@@ -62,4 +59,12 @@ XE_HPG_CORETEST_F(XeHpgCoreClDeviceCaps, givenDeviceThatHasHighNumberOfExecution
 
     EXPECT_EQ(1024u, device->sharedDeviceInfo.maxWorkGroupSize);
     EXPECT_EQ(device->sharedDeviceInfo.maxWorkGroupSize / 8, device->getDeviceInfo().maxNumOfSubGroups);
+}
+
+using XeLpgClDeviceCaps = Test<PlatformFixture>;
+
+HWTEST2_F(XeLpgClDeviceCaps, givenSkuWhenCheckingExtensionThenFp64IsReported, IsXeLpg) {
+    const auto &caps = pPlatform->getPlatformInfo();
+
+    EXPECT_NE(std::string::npos, caps.extensions.find(std::string("cl_khr_fp64")));
 }

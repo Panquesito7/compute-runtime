@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,47 +10,49 @@
 #include "shared/source/helpers/string.h"
 
 #include <iostream>
+#include <string_view>
 
 namespace NEO {
 
-PrintFormatter::PrintFormatter(const uint8_t *printfOutputBuffer, uint32_t printfOutputBufferMaxSize,
-                               bool using32BitPointers, const StringMap *stringLiteralMap)
+PrintFormatter::PrintFormatter(const uint8_t *printfOutputBuffer, uint32_t printfOutputBufferMaxSize)
     : printfOutputBuffer(printfOutputBuffer),
-      printfOutputBufferSize(printfOutputBufferMaxSize),
-      using32BitPointers(using32BitPointers),
-      usesStringMap(stringLiteralMap != nullptr),
-      stringLiteralMap(stringLiteralMap) {
+      printfOutputBufferSize(printfOutputBufferMaxSize) {
 
     output.reset(new char[maxSinglePrintStringLength]);
 }
 
 void PrintFormatter::printKernelOutput(const std::function<void(char *)> &print) {
-    currentOffset = 0;
+    currentOffset = initialOffset;
 
     // first 4 bytes of the buffer store the actual size of data that was written by printf from within EUs
     uint32_t printfOutputBufferSizeRead = 0;
     read(&printfOutputBufferSizeRead);
     printfOutputBufferSize = std::min(printfOutputBufferSizeRead, printfOutputBufferSize);
 
-    if (usesStringMap) {
-        uint32_t stringIndex = 0;
-        while (currentOffset + 4 <= printfOutputBufferSize) {
-            read(&stringIndex);
-            const char *formatString = queryPrintfString(stringIndex);
-            if (formatString != nullptr) {
-                printString(formatString, print);
+    if (startParsingOffset > currentOffset) {
+        currentOffset = startParsingOffset;
+    }
+
+    while (currentOffset + sizeof(char *) <= printfOutputBufferSize) {
+        char *formatString = nullptr;
+        read(&formatString);
+        if (formatString == reinterpret_cast<char *>(static_cast<uintptr_t>(endOfDataMarker))) {
+            break;
+        }
+        const char *stringToPrint = formatString;
+        if constexpr (sizeof(uintptr_t) == sizeof(uint64_t)) {
+            if (reinterpret_cast<uintptr_t>(formatString) & inlineStringFormatFlag) {
+                uint32_t byteLength = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(formatString) & ~inlineStringFormatFlag);
+                uint32_t alignedLength = static_cast<uint32_t>(alignUp(byteLength, sizeof(uint32_t)));
+                if (byteLength == 0 || currentOffset + alignedLength > printfOutputBufferSize) {
+                    break;
+                }
+                stringToPrint = reinterpret_cast<const char *>(printfOutputBuffer + currentOffset);
+                currentOffset += alignedLength;
             }
         }
-    } else {
-        while (currentOffset + sizeof(char *) <= printfOutputBufferSize) {
-            char *formatString = nullptr;
-            read(&formatString);
-            if (formatString == reinterpret_cast<char *>(static_cast<uintptr_t>(0xffffffff))) {
-                break;
-            }
-            if (formatString != nullptr) {
-                printString(formatString, print);
-            }
+        if (stringToPrint != nullptr) {
+            printString(stringToPrint, print);
         }
     }
 }
@@ -59,12 +61,10 @@ void PrintFormatter::printString(const char *formatString, const std::function<v
     size_t length = strnlen_s(formatString, maxSinglePrintStringLength - 1);
 
     size_t cursor = 0;
-    std::unique_ptr<char[]> dataFormat(new char[length + 1]);
+    auto dataFormat = std::make_unique<char[]>(length + 1);
 
     for (size_t i = 0; i <= length; i++) {
-        if (formatString[i] == '\\')
-            output[cursor++] = escapeChar(formatString[++i]);
-        else if (formatString[i] == '%') {
+        if (formatString[i] == '%') {
             size_t end = i;
             if (end + 1 <= length && formatString[end + 1] == '%') {
                 output[cursor++] = '%';
@@ -72,16 +72,23 @@ void PrintFormatter::printString(const char *formatString, const std::function<v
                 continue;
             }
 
-            while (isConversionSpecifier(formatString[end++]) == false && end < length)
+            while (isConversionSpecifier(formatString[end++]) == false && end < length && formatString[end] != '%') {
                 ;
+            }
 
             memcpy_s(dataFormat.get(), length, formatString + i, end - i);
             dataFormat[end - i] = '\0';
 
-            if (formatString[end - 1] == 's')
+            if (isConversionSpecifier(formatString[end - 1]) == false) {
+                PrintfDataType type = PrintfDataType::invalidType;
+                read(&type);
+                skipToken(type);
+            } else if (formatString[end - 1] == 's') {
+                stripStringLengthModifiers(dataFormat.get());
                 cursor += printStringToken(output.get() + cursor, maxSinglePrintStringLength - cursor, dataFormat.get());
-            else
+            } else {
                 cursor += printToken(output.get() + cursor, maxSinglePrintStringLength - cursor, dataFormat.get());
+            }
 
             i = end - 1;
         } else {
@@ -93,7 +100,7 @@ void PrintFormatter::printString(const char *formatString, const std::function<v
 }
 
 void PrintFormatter::stripVectorFormat(const char *format, char *stripped) {
-    while (*format != '\0') {
+    while (*format != '\0') { // //NOLINT(clang-analyzer-core.UndefinedBinaryOperatorResult)
         if (*format != 'v') {
             *stripped = *format;
         } else if (*(format + 1) != '1') {
@@ -118,8 +125,20 @@ void PrintFormatter::stripVectorTypeConversion(char *format) {
     }
 }
 
+void PrintFormatter::stripStringLengthModifiers(char *format) {
+    std::string_view token(format);
+    auto conversionPosition = token.find_last_not_of("lLw", token.size() - 2) + 1;
+    format[conversionPosition] = 's';
+    format[conversionPosition + 1] = '\0';
+}
+
 template <>
 void PrintFormatter::adjustFormatString<int64_t>(std::string &formatString) {
+    auto sizeTOrPtrdiffTModifierPosition = formatString.find_first_of("zt");
+    if (sizeTOrPtrdiffTModifierPosition != std::string::npos) {
+        formatString[sizeTOrPtrdiffTModifierPosition] = 'l';
+    }
+
     auto longPosition = formatString.find('l');
 
     if (longPosition == std::string::npos) {
@@ -128,40 +147,47 @@ void PrintFormatter::adjustFormatString<int64_t>(std::string &formatString) {
     UNRECOVERABLE_IF(formatString.size() - 1 == longPosition);
 
     if (formatString.at(longPosition + 1) != 'l') {
-        formatString.insert(longPosition, "l");
+        formatString.append(1, '\0');
+        std::move_backward(formatString.begin() + longPosition, formatString.end() - 1, formatString.end());
+        formatString[longPosition] = 'l';
     }
 }
 
 size_t PrintFormatter::printToken(char *output, size_t size, const char *formatString) {
-    PRINTF_DATA_TYPE type(PRINTF_DATA_TYPE::INVALID);
+    PrintfDataType type(PrintfDataType::invalidType);
     read(&type);
 
     switch (type) {
-    case PRINTF_DATA_TYPE::BYTE:
+    case PrintfDataType::byteType:
         return typedPrintToken<int8_t>(output, size, formatString);
-    case PRINTF_DATA_TYPE::SHORT:
+    case PrintfDataType::shortType:
         return typedPrintToken<int16_t>(output, size, formatString);
-    case PRINTF_DATA_TYPE::INT:
+    case PrintfDataType::intType:
         return typedPrintToken<int>(output, size, formatString);
-    case PRINTF_DATA_TYPE::FLOAT:
+    case PrintfDataType::floatType:
         return typedPrintToken<float>(output, size, formatString);
-    case PRINTF_DATA_TYPE::LONG:
+    case PrintfDataType::longType:
         return typedPrintToken<int64_t>(output, size, formatString);
-    case PRINTF_DATA_TYPE::POINTER:
-        return printPointerToken(output, size, formatString);
-    case PRINTF_DATA_TYPE::DOUBLE:
+    case PrintfDataType::stringType: {
+        const char *string = nullptr;
+        read(&string);
+        return 0;
+    }
+    case PrintfDataType::pointerType:
+        return typedPrintToken<uint64_t>(output, size, formatString);
+    case PrintfDataType::doubleType:
         return typedPrintToken<double>(output, size, formatString);
-    case PRINTF_DATA_TYPE::VECTOR_BYTE:
+    case PrintfDataType::vectorByteType:
         return typedPrintVectorToken<int8_t>(output, size, formatString);
-    case PRINTF_DATA_TYPE::VECTOR_SHORT:
+    case PrintfDataType::vectorShortType:
         return typedPrintVectorToken<int16_t>(output, size, formatString);
-    case PRINTF_DATA_TYPE::VECTOR_INT:
+    case PrintfDataType::vectorIntType:
         return typedPrintVectorToken<int>(output, size, formatString);
-    case PRINTF_DATA_TYPE::VECTOR_LONG:
+    case PrintfDataType::vectorLongType:
         return typedPrintVectorToken<int64_t>(output, size, formatString);
-    case PRINTF_DATA_TYPE::VECTOR_FLOAT:
+    case PrintfDataType::vectorFloatType:
         return typedPrintVectorToken<float>(output, size, formatString);
-    case PRINTF_DATA_TYPE::VECTOR_DOUBLE:
+    case PrintfDataType::vectorDoubleType:
         return typedPrintVectorToken<double>(output, size, formatString);
     default:
         return 0;
@@ -169,41 +195,55 @@ size_t PrintFormatter::printToken(char *output, size_t size, const char *formatS
 }
 
 size_t PrintFormatter::printStringToken(char *output, size_t size, const char *formatString) {
-    PRINTF_DATA_TYPE type = PRINTF_DATA_TYPE::INVALID;
+    PrintfDataType type = PrintfDataType::invalidType;
     read(&type);
-
-    const char *string = nullptr;
-    if (usesStringMap) {
-        int index = 0;
-        read(&index);
-        string = queryPrintfString(index);
-    } else {
-        read(&string);
-    }
 
     switch (type) {
     default:
+        skipToken(type);
         return simpleSprintf(output, size, formatString, 0);
-    case PRINTF_DATA_TYPE::STRING:
-    case PRINTF_DATA_TYPE::POINTER:
+    case PrintfDataType::stringType:
+    case PrintfDataType::pointerType: {
+        const char *string = nullptr;
+        read(&string);
         return simpleSprintf(output, size, formatString, string);
     }
-}
-
-size_t PrintFormatter::printPointerToken(char *output, size_t size, const char *formatString) {
-    uint64_t value = {0};
-    read(&value);
-
-    if (using32BitPointers) {
-        value &= 0x00000000FFFFFFFF;
     }
-
-    return simpleSprintf(output, size, formatString, value);
 }
 
-const char *PrintFormatter::queryPrintfString(uint32_t index) const {
-    auto stringEntry = stringLiteralMap->find(index);
-    return stringEntry == stringLiteralMap->end() ? nullptr : stringEntry->second.c_str();
+void PrintFormatter::skipToken(PrintfDataType type) {
+    switch (type) {
+    case PrintfDataType::byteType:
+        return skipTypedToken<int8_t>();
+    case PrintfDataType::shortType:
+        return skipTypedToken<int16_t>();
+    case PrintfDataType::intType:
+        return skipTypedToken<int>();
+    case PrintfDataType::floatType:
+        return skipTypedToken<float>();
+    case PrintfDataType::longType:
+        return skipTypedToken<int64_t>();
+    case PrintfDataType::stringType:
+        return skipTypedToken<const char *>();
+    case PrintfDataType::pointerType:
+        return skipTypedToken<uint64_t>();
+    case PrintfDataType::doubleType:
+        return skipTypedToken<double>();
+    case PrintfDataType::vectorByteType:
+        return skipTypedVectorToken<int8_t>();
+    case PrintfDataType::vectorShortType:
+        return skipTypedVectorToken<int16_t>();
+    case PrintfDataType::vectorIntType:
+        return skipTypedVectorToken<int>();
+    case PrintfDataType::vectorLongType:
+        return skipTypedVectorToken<int64_t>();
+    case PrintfDataType::vectorFloatType:
+        return skipTypedVectorToken<float>();
+    case PrintfDataType::vectorDoubleType:
+        return skipTypedVectorToken<double>();
+    default:
+        return;
+    }
 }
 
 char PrintFormatter::escapeChar(char escape) {

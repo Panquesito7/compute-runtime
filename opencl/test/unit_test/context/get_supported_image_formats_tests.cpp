@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -23,7 +23,7 @@ using namespace NEO;
 
 struct GetSupportedImageFormatsTest : public PlatformFixture,
                                       public ContextFixture,
-                                      public ::testing::TestWithParam<std::tuple<uint64_t, uint32_t>> {
+                                      public ::testing::Test {
 
     using ContextFixture::setUp;
     using PlatformFixture::setUp;
@@ -44,121 +44,137 @@ struct GetSupportedImageFormatsTest : public PlatformFixture,
     cl_int retVal = CL_SUCCESS;
 };
 
-TEST_P(GetSupportedImageFormatsTest, WhenGettingNumImageFormatsThenGreaterThanZeroIsReturned) {
-    cl_uint numImageFormats = 0;
-    uint64_t imageFormatsFlags;
-    uint32_t imageFormats;
-    std::tie(imageFormatsFlags, imageFormats) = GetParam();
-    retVal = pContext->getSupportedImageFormats(
-        &castToObject<ClDevice>(devices[0])->getDevice(),
-        imageFormatsFlags,
-        imageFormats,
-        0,
-        nullptr,
-        &numImageFormats);
+cl_mem_flags imageFormatsFlags[] = {
+    CL_MEM_READ_WRITE,
+    CL_MEM_WRITE_ONLY,
+    CL_MEM_READ_ONLY};
 
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_GT(numImageFormats, 0u);
-}
+cl_mem_object_type imageFormats[] = {
+    CL_MEM_OBJECT_IMAGE1D,
+    CL_MEM_OBJECT_IMAGE1D_BUFFER,
+    CL_MEM_OBJECT_IMAGE1D_ARRAY,
+    CL_MEM_OBJECT_IMAGE2D,
+    CL_MEM_OBJECT_IMAGE2D_ARRAY,
+    CL_MEM_OBJECT_IMAGE3D};
 
-TEST_P(GetSupportedImageFormatsTest, WhenRetrievingImageFormatsThenListIsNonEmpty) {
-    cl_uint numImageFormats = 0;
-    uint64_t imageFormatsFlags;
-    uint32_t imageFormats;
-    std::tie(imageFormatsFlags, imageFormats) = GetParam();
-    retVal = pContext->getSupportedImageFormats(
-        &castToObject<ClDevice>(devices[0])->getDevice(),
-        imageFormatsFlags,
-        imageFormats,
-        0,
-        nullptr,
-        &numImageFormats);
-    EXPECT_GT(numImageFormats, 0u);
+TEST_F(GetSupportedImageFormatsTest, WhenGettingNumImageFormatsThenGreaterThanZeroIsReturned) {
+    for (auto flags : imageFormatsFlags) {
+        for (auto imageType : imageFormats) {
+            cl_uint numImageFormats = 0;
+            retVal = pContext->getSupportedImageFormats(
+                &castToObject<ClDevice>(devices[0])->getDevice(),
+                flags,
+                imageType,
+                0,
+                nullptr,
+                &numImageFormats);
 
-    auto imageFormatList = new cl_image_format[numImageFormats];
-    memset(imageFormatList, 0, numImageFormats * sizeof(cl_image_format));
-
-    retVal = pContext->getSupportedImageFormats(
-        &castToObject<ClDevice>(devices[0])->getDevice(),
-        imageFormatsFlags,
-        imageFormats,
-        numImageFormats,
-        imageFormatList,
-        nullptr);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    for (cl_uint entry = 0; entry < numImageFormats; ++entry) {
-        EXPECT_NE(0u, imageFormatList[entry].image_channel_order);
-        EXPECT_NE(0u, imageFormatList[entry].image_channel_data_type);
-    }
-
-    retVal = pContext->getSupportedImageFormats(
-        &castToObject<ClDevice>(devices[0])->getDevice(),
-        CL_MEM_KERNEL_READ_AND_WRITE,
-        imageFormats,
-        numImageFormats,
-        imageFormatList,
-        nullptr);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    delete[] imageFormatList;
-}
-
-TEST_P(GetSupportedImageFormatsTest, WhenRetrievingImageFormatsSRGBThenListIsNonEmpty) {
-    cl_uint numImageFormats = 0;
-    uint64_t imageFormatsFlags;
-    uint32_t imageFormats;
-    bool sRGBAFormatFound = false;
-    bool sBGRAFormatFound = false;
-    bool isReadOnly = false;
-    std::tie(imageFormatsFlags, imageFormats) = GetParam();
-    retVal = pContext->getSupportedImageFormats(
-        &castToObject<ClDevice>(devices[0])->getDevice(),
-        imageFormatsFlags,
-        imageFormats,
-        0,
-        nullptr,
-        &numImageFormats);
-    EXPECT_GT(numImageFormats, 0u);
-
-    auto imageFormatList = new cl_image_format[numImageFormats];
-    memset(imageFormatList, 0, numImageFormats * sizeof(cl_image_format));
-
-    retVal = pContext->getSupportedImageFormats(
-        &castToObject<ClDevice>(devices[0])->getDevice(),
-        imageFormatsFlags,
-        imageFormats,
-        numImageFormats,
-        imageFormatList,
-        nullptr);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    isReadOnly |= (imageFormatsFlags == CL_MEM_READ_ONLY);
-
-    for (cl_uint entry = 0; entry < numImageFormats; ++entry) {
-        EXPECT_NE(0u, imageFormatList[entry].image_channel_order);
-        EXPECT_NE(0u, imageFormatList[entry].image_channel_data_type);
-
-        if (imageFormatList[entry].image_channel_order == CL_sRGBA) {
-            sRGBAFormatFound = true;
-        }
-
-        if (imageFormatList[entry].image_channel_order == CL_sBGRA) {
-            sBGRAFormatFound = true;
+            EXPECT_EQ(CL_SUCCESS, retVal);
+            EXPECT_GT(numImageFormats, 0u);
         }
     }
+}
 
-    if (isReadOnly && ((&castToObject<ClDevice>(devices[0])->getDevice())->getHardwareInfo().capabilityTable.supportsOcl21Features)) {
-        EXPECT_TRUE(sRGBAFormatFound & sBGRAFormatFound);
-    } else {
-        EXPECT_FALSE(sRGBAFormatFound | sBGRAFormatFound);
+TEST_F(GetSupportedImageFormatsTest, WhenRetrievingImageFormatsThenListIsNonEmpty) {
+    for (auto flags : imageFormatsFlags) {
+        for (auto imageType : imageFormats) {
+            cl_uint numImageFormats = 0;
+            retVal = pContext->getSupportedImageFormats(
+                &castToObject<ClDevice>(devices[0])->getDevice(),
+                flags,
+                imageType,
+                0,
+                nullptr,
+                &numImageFormats);
+            EXPECT_GT(numImageFormats, 0u);
+
+            auto imageFormatList = new cl_image_format[numImageFormats];
+            memset(imageFormatList, 0, numImageFormats * sizeof(cl_image_format));
+
+            retVal = pContext->getSupportedImageFormats(
+                &castToObject<ClDevice>(devices[0])->getDevice(),
+                flags,
+                imageType,
+                numImageFormats,
+                imageFormatList,
+                nullptr);
+            EXPECT_EQ(CL_SUCCESS, retVal);
+
+            for (cl_uint entry = 0; entry < numImageFormats; ++entry) {
+                EXPECT_NE(0u, imageFormatList[entry].image_channel_order);
+                EXPECT_NE(0u, imageFormatList[entry].image_channel_data_type);
+            }
+
+            retVal = pContext->getSupportedImageFormats(
+                &castToObject<ClDevice>(devices[0])->getDevice(),
+                CL_MEM_KERNEL_READ_AND_WRITE,
+                imageType,
+                numImageFormats,
+                imageFormatList,
+                nullptr);
+            EXPECT_EQ(CL_SUCCESS, retVal);
+
+            delete[] imageFormatList;
+        }
     }
+}
 
-    delete[] imageFormatList;
+TEST_F(GetSupportedImageFormatsTest, WhenRetrievingImageFormatsSRGBThenListIsNonEmpty) {
+    for (auto flags : imageFormatsFlags) {
+        for (auto imageType : imageFormats) {
+            cl_uint numImageFormats = 0;
+            bool sRGBAFormatFound = false;
+            bool sBGRAFormatFound = false;
+            bool isReadOnly = false;
+            retVal = pContext->getSupportedImageFormats(
+                &castToObject<ClDevice>(devices[0])->getDevice(),
+                flags,
+                imageType,
+                0,
+                nullptr,
+                &numImageFormats);
+            EXPECT_GT(numImageFormats, 0u);
+
+            auto imageFormatList = new cl_image_format[numImageFormats];
+            memset(imageFormatList, 0, numImageFormats * sizeof(cl_image_format));
+
+            retVal = pContext->getSupportedImageFormats(
+                &castToObject<ClDevice>(devices[0])->getDevice(),
+                flags,
+                imageType,
+                numImageFormats,
+                imageFormatList,
+                nullptr);
+            EXPECT_EQ(CL_SUCCESS, retVal);
+
+            isReadOnly |= (flags == CL_MEM_READ_ONLY);
+
+            for (cl_uint entry = 0; entry < numImageFormats; ++entry) {
+                EXPECT_NE(0u, imageFormatList[entry].image_channel_order);
+                EXPECT_NE(0u, imageFormatList[entry].image_channel_data_type);
+
+                if (imageFormatList[entry].image_channel_order == CL_sRGBA) {
+                    sRGBAFormatFound = true;
+                }
+
+                if (imageFormatList[entry].image_channel_order == CL_sBGRA) {
+                    sBGRAFormatFound = true;
+                }
+            }
+
+            if (isReadOnly) {
+                EXPECT_TRUE(sRGBAFormatFound & sBGRAFormatFound);
+            } else {
+                EXPECT_FALSE(sRGBAFormatFound | sBGRAFormatFound);
+            }
+
+            delete[] imageFormatList;
+        }
+    }
 }
 
 TEST(ImageFormats, WhenCheckingIsDepthFormatThenCorrectValueReturned) {
-    for (auto &format : SurfaceFormats::readOnly20()) {
+    for (auto &format : SurfaceFormats::readOnly()) {
         EXPECT_FALSE(Image::isDepthFormat(format.oclImageFormat));
     }
 
@@ -288,8 +304,7 @@ TEST_P(NV12ExtensionSupportedImageFormatsTest, givenNV12ExtensionWhenQueriedForI
         nullptr,
         &numImageFormats);
 
-    auto supportsOcl20Features = device->getHardwareInfo().capabilityTable.supportsOcl21Features;
-    size_t expectedNumReadOnlyFormats = (supportsOcl20Features) ? SurfaceFormats::readOnly20().size() : SurfaceFormats::readOnly12().size();
+    size_t expectedNumReadOnlyFormats = SurfaceFormats::readOnly().size();
 
     if (Image::isImage2dOr2dArray(imageFormats) && imageFormatsFlags == CL_MEM_READ_ONLY) {
         expectedNumReadOnlyFormats += SurfaceFormats::readOnlyDepth().size();
@@ -419,8 +434,9 @@ TEST_P(NV12ExtensionSupportedImageFormatsTest, WhenRetrievingLessImageFormatsTha
         &numImageFormats);
     EXPECT_GT(numImageFormats, 0u);
 
-    if (numImageFormats > 1)
+    if (numImageFormats > 1) {
         numImageFormats--;
+    }
 
     auto imageFormatList = new cl_image_format[numImageFormats];
     memset(imageFormatList, 0, numImageFormats * sizeof(cl_image_format));
@@ -442,55 +458,35 @@ TEST_P(NV12ExtensionSupportedImageFormatsTest, WhenRetrievingLessImageFormatsTha
     delete[] imageFormatList;
 }
 
-cl_mem_flags GetSupportedImageFormatsFlags[] = {
-    CL_MEM_READ_WRITE,
-    CL_MEM_WRITE_ONLY,
-    CL_MEM_READ_ONLY};
-
-cl_mem_object_type GetSupportedImageFormats[] = {
-    CL_MEM_OBJECT_IMAGE1D,
-    CL_MEM_OBJECT_IMAGE1D_BUFFER,
-    CL_MEM_OBJECT_IMAGE1D_ARRAY,
-    CL_MEM_OBJECT_IMAGE2D,
-    CL_MEM_OBJECT_IMAGE2D_ARRAY,
-    CL_MEM_OBJECT_IMAGE3D};
-
-INSTANTIATE_TEST_CASE_P(
-    Context,
-    GetSupportedImageFormatsTest,
-    ::testing::Combine(
-        ::testing::ValuesIn(GetSupportedImageFormatsFlags),
-        ::testing::ValuesIn(GetSupportedImageFormats)));
-
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     Context,
     PackedYuvExtensionSupportedImageFormatsTest,
     ::testing::Combine(
-        ::testing::ValuesIn(GetSupportedImageFormatsFlags),
-        ::testing::ValuesIn(GetSupportedImageFormats)));
+        ::testing::ValuesIn(imageFormatsFlags),
+        ::testing::ValuesIn(imageFormats)));
 
-cl_mem_flags NV12ExtensionSupportedImageFormatsFlags[] = {
+cl_mem_flags nv12ExtensionSupportedImageFormatsFlags[] = {
     CL_MEM_NO_ACCESS_INTEL,
     CL_MEM_READ_ONLY};
 
-cl_mem_flags NV12ExtensionUnsupportedImageFormatsFlags[] = {
+cl_mem_flags nv12ExtensionUnsupportedImageFormatsFlags[] = {
     CL_MEM_READ_WRITE,
     CL_MEM_WRITE_ONLY};
 
-cl_mem_object_type NV12ExtensionSupportedImageFormats[] = {
+cl_mem_object_type nv12ExtensionSupportedImageFormats[] = {
     CL_MEM_OBJECT_IMAGE1D,
     CL_MEM_OBJECT_IMAGE2D};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     Context,
     NV12ExtensionSupportedImageFormatsTest,
     ::testing::Combine(
-        ::testing::ValuesIn(NV12ExtensionSupportedImageFormatsFlags),
-        ::testing::ValuesIn(NV12ExtensionSupportedImageFormats)));
+        ::testing::ValuesIn(nv12ExtensionSupportedImageFormatsFlags),
+        ::testing::ValuesIn(nv12ExtensionSupportedImageFormats)));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     Context,
     NV12ExtensionUnsupportedImageFormatsTest,
     ::testing::Combine(
-        ::testing::ValuesIn(NV12ExtensionUnsupportedImageFormatsFlags),
-        ::testing::ValuesIn(NV12ExtensionSupportedImageFormats)));
+        ::testing::ValuesIn(nv12ExtensionUnsupportedImageFormatsFlags),
+        ::testing::ValuesIn(nv12ExtensionSupportedImageFormats)));

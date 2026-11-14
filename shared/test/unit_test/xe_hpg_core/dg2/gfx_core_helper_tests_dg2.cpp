@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,6 +14,7 @@
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/gfx_core_helper_tests.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/mocks/mock_ail_configuration.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
@@ -29,8 +30,7 @@ DG2TEST_F(GfxCoreHelperTestDg2, whenGetExtensionsIsCalledThenMatrixMultiplyAccum
     auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
     auto &compilerProductHelper = rootDeviceEnvironment.getHelper<CompilerProductHelper>();
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
-    auto *releaseHelper = rootDeviceEnvironment.getReleaseHelper();
-    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
+    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
 
     EXPECT_TRUE(hasSubstr(extensions, std::string("cl_intel_subgroup_matrix_multiply_accumulate")));
     EXPECT_TRUE(hasSubstr(extensions, std::string("cl_intel_subgroup_split_matrix_multiply_accumulate")));
@@ -40,14 +40,12 @@ DG2TEST_F(GfxCoreHelperTestDg2, givenRcsDisabledWhenGetGpgpuEnginesCalledThenDon
     HardwareInfo hwInfo = *defaultHwInfo;
     MockExecutionEnvironment mockExecutionEnvironment{};
 
-    auto &productHelper = mockExecutionEnvironment.rootDeviceEnvironments[0]->getHelper<ProductHelper>();
     hwInfo.featureTable.flags.ftrCCSNode = true;
     hwInfo.featureTable.ftrBcsInfo = 1;
-    hwInfo.featureTable.flags.ftrRcsNode = true;
+    hwInfo.caps.rcsExposureDisabled = true;
     hwInfo.capabilityTable.blitterOperationsSupported = true;
     hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
     hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
-    productHelper.configureHardwareCustom(&hwInfo, nullptr);
 
     auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
     auto &gfxCoreHelper = device->getGfxCoreHelper();
@@ -65,17 +63,47 @@ DG2TEST_F(GfxCoreHelperTestDg2, givenRcsDisabledWhenGetGpgpuEnginesCalledThenDon
     EXPECT_EQ(aub_stream::ENGINE_BCS, engines[7].first);
 }
 
+DG2TEST_F(GfxCoreHelperTestDg2, givenRcsDisabledWhenAilForceToUseRcsThenRcsIsSetAndCssIsNot) {
+    HardwareInfo hwInfo = *defaultHwInfo;
+    MockExecutionEnvironment mockExecutionEnvironment{};
+
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+    hwInfo.featureTable.ftrBcsInfo = 1;
+    hwInfo.caps.rcsExposureDisabled = true;
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto ailConfiguration = std::make_unique<MockAILConfiguration>();
+    ailConfiguration->forceRcsValue = true;
+    auto &rootDeviceEnvironment = *device->getExecutionEnvironment()->rootDeviceEnvironments[0];
+    rootDeviceEnvironment.ailConfiguration.reset(ailConfiguration.release());
+    EngineHelpers::setupDefaultEngineType(rootDeviceEnvironment);
+    EXPECT_EQ(aub_stream::ENGINE_RCS, rootDeviceEnvironment.getHardwareInfo()->capabilityTable.defaultEngineType);
+
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(5u, engines.size());
+
+    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[0].first);
+    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[1].first);
+    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[2].first);
+    EXPECT_EQ(aub_stream::ENGINE_BCS, engines[3].first);
+    EXPECT_EQ(aub_stream::ENGINE_BCS, engines[4].first);
+}
+
 DG2TEST_F(GfxCoreHelperTestDg2, givenRcsDisabledButDebugVariableSetWhenGetGpgpuEnginesCalledThenSetRcs) {
     HardwareInfo hwInfo = *defaultHwInfo;
     hwInfo.featureTable.flags.ftrCCSNode = true;
     hwInfo.featureTable.ftrBcsInfo = 1;
-    hwInfo.featureTable.flags.ftrRcsNode = false;
+    hwInfo.caps.rcsExposureDisabled = true;
     hwInfo.capabilityTable.blitterOperationsSupported = true;
     hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
     hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.NodeOrdinal.set(static_cast<int32_t>(aub_stream::EngineType::ENGINE_RCS));
+    debugManager.flags.NodeOrdinal.set(static_cast<int32_t>(aub_stream::EngineType::ENGINE_RCS));
 
     auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
     auto &gfxCoreHelper = device->getGfxCoreHelper();
@@ -96,14 +124,15 @@ DG2TEST_F(GfxCoreHelperTestDg2, givenRcsDisabledButDebugVariableSetWhenGetGpgpuE
 
 using GfxCoreHelperTests = Test<DeviceFixture>;
 DG2TEST_F(GfxCoreHelperTests, givenAllocationTypeInternalHeapWhenSetExtraAllocationDataThenUseSystemMemory) {
-    HardwareInfo hwInfo = *defaultHwInfo;
+    HardwareInfo &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
 
     hwInfo.platform.usDeviceID = dg2G10DeviceIds[0];
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+    hwInfo.platform.usRevId = 0;
 
+    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
     constexpr DeviceBitfield singleTileBitfield = 0b0100;
 
-    const AllocationProperties singleTileAllocProperties(0, 1, AllocationType::INTERNAL_HEAP, singleTileBitfield);
+    const AllocationProperties singleTileAllocProperties(0, 1, AllocationType::internalHeap, singleTileBitfield);
 
     AllocationData allocData;
     allocData.flags.useSystemMemory = false;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,7 +13,7 @@ using namespace NEO;
 class TestMacrosIfNotMatchTearDownCall : public ::testing::Test {
   public:
     void expectCorrectPlatform() {
-        EXPECT_EQ(IGFX_SKYLAKE, defaultHwInfo->platform.eProductFamily);
+        EXPECT_EQ(IGFX_BMG, defaultHwInfo->platform.eProductFamily);
     }
     void SetUp() override {
         expectCorrectPlatform();
@@ -23,13 +23,13 @@ class TestMacrosIfNotMatchTearDownCall : public ::testing::Test {
     }
 };
 
-HWTEST2_F(TestMacrosIfNotMatchTearDownCall, givenNotMatchPlatformWhenUseHwTest2FThenSetUpAndTearDownAreNotCalled, IsSKL) {
+HWTEST2_F(TestMacrosIfNotMatchTearDownCall, givenNotMatchPlatformWhenUseHwTest2FThenSetUpAndTearDownAreNotCalled, IsBMG) {
     expectCorrectPlatform();
 }
 class TestMacrosWithParamIfNotMatchTearDownCall : public TestMacrosIfNotMatchTearDownCall, public ::testing::WithParamInterface<int> {};
-HWTEST2_P(TestMacrosWithParamIfNotMatchTearDownCall, givenNotMatchPlatformWhenUseHwTest2PThenSetUpAndTearDownAreNotCalled, IsSKL) {
+HWTEST2_P(TestMacrosWithParamIfNotMatchTearDownCall, givenNotMatchPlatformWhenUseHwTest2PThenSetUpAndTearDownAreNotCalled, IsBMG) {
     expectCorrectPlatform();
 }
-INSTANTIATE_TEST_CASE_P(givenNotMatchPlatformWhenUseHwTest2PThenSetUpAndTearDownAreNotCalled,
-                        TestMacrosWithParamIfNotMatchTearDownCall,
-                        ::testing::Values(0));
+INSTANTIATE_TEST_SUITE_P(givenNotMatchPlatformWhenUseHwTest2PThenSetUpAndTearDownAreNotCalled,
+                         TestMacrosWithParamIfNotMatchTearDownCall,
+                         ::testing::Values(0));

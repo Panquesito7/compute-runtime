@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,14 +26,22 @@ inline void initializeProcess(ze_context_handle_t &context,
                               ze_command_queue_handle_t &cmdQueueCopy,
                               ze_command_list_handle_t &cmdListCopy,
                               bool isServer) {
-    SUCCESS_OR_TERMINATE(zeInit(ZE_INIT_FLAG_GPU_ONLY));
-
     // Retrieve driver
+    ze_init_driver_type_desc_t desc = {ZE_STRUCTURE_TYPE_INIT_DRIVER_TYPE_DESC};
+    desc.pNext = nullptr;
+    desc.flags = ZE_INIT_FLAG_GPU_ONLY;
     uint32_t driverCount = 0;
-    SUCCESS_OR_TERMINATE(zeDriverGet(&driverCount, nullptr));
 
-    ze_driver_handle_t driverHandle;
-    SUCCESS_OR_TERMINATE(zeDriverGet(&driverCount, &driverHandle));
+    SUCCESS_OR_TERMINATE(zeInitDrivers(&driverCount, nullptr, &desc));
+
+    if (driverCount == 0) {
+        std::cerr << "No driver handle found!\n";
+        std::terminate();
+    }
+
+    ze_driver_handle_t driverHandle = nullptr;
+    driverCount = 1;
+    SUCCESS_OR_TERMINATE(zeInitDrivers(&driverCount, &driverHandle, &desc));
 
     ze_context_desc_t contextDesc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC};
     SUCCESS_OR_TERMINATE(zeContextCreate(driverHandle, &contextDesc, &context));
@@ -273,10 +281,10 @@ void runServer(int commSocket, bool &validRet) {
 
 int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello IPC P2P";
-    verbose = isVerbose(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
     bool outputValidationSuccessful;
 
-    useCopyEngine = isParamEnabled(argc, argv, "-c", "--copyengine");
+    useCopyEngine = LevelZeroBlackBoxTests::isParamEnabled(argc, argv, "-c", "--copyengine");
 
     int sv[2];
     if (socketpair(PF_UNIX, SOCK_STREAM, 0, sv) < 0) {
@@ -299,6 +307,6 @@ int main(int argc, char *argv[]) {
         close(sv[0]);
     }
 
-    printResult(false, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(false, outputValidationSuccessful, blackBoxName);
     return outputValidationSuccessful ? 0 : 1;
 }

@@ -5,6 +5,7 @@
  *
  */
 
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 #include "level_zero/tools/source/sysman/temperature/windows/os_temperature_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/temperature/windows/mock_temperature.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/windows/mock_sysman_fixture.h"
@@ -65,6 +66,14 @@ TEST_F(SysmanDeviceTemperatureFixture, GivenComponentCountZeroWhenEnumeratingTem
     EXPECT_EQ(count, temperatureHandleComponentCount);
 }
 
+TEST_F(SysmanDeviceTemperatureFixture, GivenTempDomainsAreEnumeratedWhenCallingIsTempInitCompletedThenVerifyTempInitializationIsCompleted) {
+    uint32_t count = 0;
+    EXPECT_EQ(zesDeviceEnumTemperatureSensors(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(count, temperatureHandleComponentCount);
+
+    EXPECT_EQ(true, pSysmanDeviceImp->pTempHandleContext->isTempInitDone());
+}
+
 TEST_F(SysmanDeviceTemperatureFixture, GivenInvalidComponentCountWhenEnumeratingTemperatureSensorsThenValidCountIsReturnedAndVerifySysmanPowerGetCallSucceeds) {
     uint32_t count = 0;
     EXPECT_EQ(zesDeviceEnumTemperatureSensors(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
@@ -87,6 +96,13 @@ TEST_F(SysmanDeviceTemperatureFixture, GivenComponentCountZeroWhenEnumeratingTem
     }
 }
 
+TEST_F(SysmanDeviceTemperatureFixture, GivenValidDeviceHandleWhenEnumeratingTemperatureSensorsOnIntegratedDeviceThenZeroCountIsReturned) {
+    uint32_t count = 0;
+    pKmdSysManager->isIntegrated = true;
+    EXPECT_EQ(zesDeviceEnumTemperatureSensors(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(count, 0u);
+}
+
 TEST_F(SysmanDeviceTemperatureFixture, GivenValidPowerHandleWhenGettingTemperaturePropertiesAllowSetToTrueThenCallSucceeds) {
     auto handles = getTempHandles(temperatureHandleComponentCount);
     uint32_t sensorTypeIndex = 0;
@@ -97,7 +113,7 @@ TEST_F(SysmanDeviceTemperatureFixture, GivenValidPowerHandleWhenGettingTemperatu
 
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
         EXPECT_FALSE(properties.onSubdevice);
-        EXPECT_EQ(properties.subdeviceId, 0);
+        EXPECT_EQ(properties.subdeviceId, 0u);
         EXPECT_FALSE(properties.isCriticalTempSupported);
         EXPECT_FALSE(properties.isThreshold1Supported);
         EXPECT_FALSE(properties.isThreshold2Supported);

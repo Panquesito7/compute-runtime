@@ -1,0 +1,266 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_container/encode_surface_state.h"
+#include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/gmm_lib.h"
+#include "shared/source/helpers/hw_walk_order.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/os_interface/product_helper_hw.h"
+#include "shared/source/xe2_hpg_core/hw_cmds.h"
+#include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
+#include "shared/test/unit_test/encoders/test_encode_dispatch_kernel_dg2_and_later.h"
+#include "shared/test/unit_test/fixtures/command_container_fixture.h"
+#include "shared/test/unit_test/fixtures/implicit_scaling_fixture.h"
+#include "shared/test/unit_test/mocks/mock_dispatch_kernel_encoder_interface.h"
+
+#include <array>
+
+using namespace NEO;
+
+using CommandEncodeStatesTestXe2AndLater = Test<CommandEncodeStatesFixture>;
+
+using CommandEncoderTestXe2AndLater = ::testing::Test;
+
+HWTEST2_F(CommandEncoderTestXe2AndLater, whenAdjustCompressionFormatForPlanarImageThenNothingHappens, IsAtLeastXe2HpgCore) {
+    for (auto plane : {GMM_NO_PLANE, GMM_PLANE_Y, GMM_PLANE_U, GMM_PLANE_V}) {
+        uint32_t compressionFormat = 0u;
+        EncodeWA<FamilyType>::adjustCompressionFormatForPlanarImage(compressionFormat, plane);
+        EXPECT_EQ(0u, compressionFormat);
+
+        compressionFormat = 0xFFu;
+        EncodeWA<FamilyType>::adjustCompressionFormatForPlanarImage(compressionFormat, plane);
+        EXPECT_EQ(0xFFu, compressionFormat);
+    }
+}
+
+HWTEST2_F(CommandEncodeStatesTestXe2AndLater, whenDebugFlagIsEnabledForAdjustPipelineSelectThenCommandIsAdded, IsAtLeastXe2HpgCore) {
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.PipelinedPipelineSelect.set(true);
+
+    const auto usedSpaceBefore = cmdContainer->getCommandStream()->getUsed();
+    NEO::EncodeComputeMode<FamilyType>::adjustPipelineSelect(*cmdContainer, descriptor);
+    const auto usedSpaceAfter = cmdContainer->getCommandStream()->getUsed();
+
+    EXPECT_GT(usedSpaceAfter, usedSpaceBefore);
+}
+
+HWTEST2_F(CommandEncodeStatesTestXe2AndLater, whenDebugFlagIsDisabledForAdjustPipelineSelectThenNoCommandIsAdded, IsAtLeastXe2HpgCore) {
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.PipelinedPipelineSelect.set(false);
+
+    const auto usedSpaceBefore = cmdContainer->getCommandStream()->getUsed();
+    NEO::EncodeComputeMode<FamilyType>::adjustPipelineSelect(*cmdContainer, descriptor);
+    const auto usedSpaceAfter = cmdContainer->getCommandStream()->getUsed();
+
+    EXPECT_EQ(usedSpaceAfter, usedSpaceBefore);
+}
+
+HWTEST2_F(ImplicitScalingTests, GivenXeAtLeastHpg2WhenCheckingPipeControlStallRequiredThenExpectTrue, IsAtLeastXe2HpgCore) {
+    EXPECT_FALSE(ImplicitScalingDispatch<FamilyType>::getPipeControlStallRequired());
+}
+
+HWTEST2_F(CommandEncodeStatesTestXe2AndLater, givenDebugFlagWhenProgrammingStateComputeModeThenEnableL1FlushUavCoherencyMode, IsAtLeastXe2HpgCore) {
+    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
+
+    DebugManagerStateRestore restore;
+
+    uint8_t buffer[sizeof(STATE_COMPUTE_MODE)]{};
+    const auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
+    {
+        // default
+        LinearStream linearStream(buffer, sizeof(buffer));
+
+        StreamProperties streamProperties{};
+        streamProperties.initSupport(rootDeviceEnvironment);
+        streamProperties.stateComputeMode.setPropertiesAll(0, 0, false);
+        EncodeComputeMode<FamilyType>::programComputeModeCommand(linearStream, streamProperties.stateComputeMode, rootDeviceEnvironment);
+
+        auto &stateComputeModeCmd = *reinterpret_cast<STATE_COMPUTE_MODE *>(linearStream.getCpuBase());
+        EXPECT_EQ(STATE_COMPUTE_MODE::UAV_COHERENCY_MODE::UAV_COHERENCY_MODE_FLUSH_DATAPORT_L1, stateComputeModeCmd.getUavCoherencyMode());
+    }
+
+    {
+        // enabled
+        debugManager.flags.EnableL1FlushUavCoherencyMode.set(1);
+
+        LinearStream linearStream(buffer, sizeof(buffer));
+
+        StreamProperties streamProperties{};
+        streamProperties.initSupport(rootDeviceEnvironment);
+        streamProperties.stateComputeMode.setPropertiesAll(0, 0, false);
+        EncodeComputeMode<FamilyType>::programComputeModeCommand(linearStream, streamProperties.stateComputeMode, rootDeviceEnvironment);
+
+        auto &stateComputeModeCmd = *reinterpret_cast<STATE_COMPUTE_MODE *>(linearStream.getCpuBase());
+        EXPECT_EQ(STATE_COMPUTE_MODE::UAV_COHERENCY_MODE::UAV_COHERENCY_MODE_FLUSH_DATAPORT_L1, stateComputeModeCmd.getUavCoherencyMode());
+    }
+
+    {
+        // disabled
+        debugManager.flags.EnableL1FlushUavCoherencyMode.set(0);
+
+        LinearStream linearStream(buffer, sizeof(buffer));
+
+        StreamProperties streamProperties{};
+        streamProperties.initSupport(rootDeviceEnvironment);
+        streamProperties.stateComputeMode.setPropertiesAll(0, 0, false);
+        EncodeComputeMode<FamilyType>::programComputeModeCommand(linearStream, streamProperties.stateComputeMode, rootDeviceEnvironment);
+
+        auto &stateComputeModeCmd = *reinterpret_cast<STATE_COMPUTE_MODE *>(linearStream.getCpuBase());
+        EXPECT_EQ(STATE_COMPUTE_MODE::UAV_COHERENCY_MODE::UAV_COHERENCY_MODE_DRAIN_DATAPORT_MODE, stateComputeModeCmd.getUavCoherencyMode());
+    }
+}
+
+HWTEST2_F(CommandEncodeStatesTestXe2AndLater, givenDebugFlagWhenProgrammingStateComputeModeThenMidthreadPreemptionDelayTimerIsOverridden, IsAtLeastXe2HpgCore) {
+    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
+    using MIDTHREAD_PREEMPTION_DELAY_TIMER = typename STATE_COMPUTE_MODE::MIDTHREAD_PREEMPTION_DELAY_TIMER;
+
+    constexpr uint32_t midthreadPreemptionDelayTimerMask = FamilyType::stateComputeModeMidthreadPreemptionDelayTimerMask;
+
+    DebugManagerStateRestore restore;
+
+    alignas(STATE_COMPUTE_MODE) uint8_t buffer[sizeof(STATE_COMPUTE_MODE)]{};
+    const auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
+
+    auto programStateComputeMode = [&]() -> STATE_COMPUTE_MODE & {
+        LinearStream linearStream(buffer, sizeof(buffer));
+
+        StreamProperties streamProperties{};
+        streamProperties.initSupport(rootDeviceEnvironment);
+        streamProperties.stateComputeMode.setPropertiesAll(0, 0, false);
+        EncodeComputeMode<FamilyType>::programComputeModeCommand(linearStream, streamProperties.stateComputeMode, rootDeviceEnvironment);
+
+        return *reinterpret_cast<STATE_COMPUTE_MODE *>(linearStream.getCpuBase());
+    };
+
+    debugManager.flags.ScmMidthreadPreemptionDelayTimerOverride.set(-1);
+    auto &unsetFlagCmd = programStateComputeMode();
+    const auto productDefaultTimer = unsetFlagCmd.getMidthreadPreemptionDelayTimer();
+    const auto productDefaultMaskBits = unsetFlagCmd.getMask2() & midthreadPreemptionDelayTimerMask;
+
+    for (auto outsideField : {-2, 8}) {
+        // not representable in the field - the product default is left in place
+        debugManager.flags.ScmMidthreadPreemptionDelayTimerOverride.set(outsideField);
+
+        auto &stateComputeModeCmd = programStateComputeMode();
+        EXPECT_EQ(productDefaultTimer, stateComputeModeCmd.getMidthreadPreemptionDelayTimer());
+        EXPECT_EQ(productDefaultMaskBits, stateComputeModeCmd.getMask2() & midthreadPreemptionDelayTimerMask);
+    }
+
+    const std::array<MIDTHREAD_PREEMPTION_DELAY_TIMER, 4> expectedTimers = {
+        MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_0,
+        MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_50,
+        MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_100,
+        MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_150};
+
+    for (uint32_t flagValue = 0; flagValue < expectedTimers.size(); flagValue++) {
+        debugManager.flags.ScmMidthreadPreemptionDelayTimerOverride.set(static_cast<int32_t>(flagValue));
+
+        // the immediate encoding is the hardware default, so it is selected by leaving the field alone
+        const uint32_t expectedMaskBits = (flagValue == 0) ? 0u : midthreadPreemptionDelayTimerMask;
+
+        auto &stateComputeModeCmd = programStateComputeMode();
+        EXPECT_EQ(expectedTimers[flagValue], stateComputeModeCmd.getMidthreadPreemptionDelayTimer());
+        EXPECT_EQ(expectedMaskBits, stateComputeModeCmd.getMask2() & midthreadPreemptionDelayTimerMask);
+    }
+}
+
+HWTEST2_F(CommandEncodeStatesTestXe2AndLater, givenCapsDefaultWhenProgrammingStateComputeModeThenMidthreadPreemptionDelayTimerIsProgrammed, IsAtLeastXe2HpgCore) {
+    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
+    using MIDTHREAD_PREEMPTION_DELAY_TIMER = typename STATE_COMPUTE_MODE::MIDTHREAD_PREEMPTION_DELAY_TIMER;
+
+    constexpr uint32_t midthreadPreemptionDelayTimerMask = FamilyType::stateComputeModeMidthreadPreemptionDelayTimerMask;
+
+    DebugManagerStateRestore restore;
+
+    alignas(STATE_COMPUTE_MODE) uint8_t buffer[sizeof(STATE_COMPUTE_MODE)]{};
+    auto &rootDeviceEnvironment = *pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0];
+    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
+
+    auto programStateComputeMode = [&]() -> STATE_COMPUTE_MODE & {
+        LinearStream linearStream(buffer, sizeof(buffer));
+
+        StreamProperties streamProperties{};
+        streamProperties.initSupport(rootDeviceEnvironment);
+        streamProperties.stateComputeMode.setPropertiesAll(0, 0, false);
+        EncodeComputeMode<FamilyType>::programComputeModeCommand(linearStream, streamProperties.stateComputeMode, rootDeviceEnvironment);
+
+        return *reinterpret_cast<STATE_COMPUTE_MODE *>(linearStream.getCpuBase());
+    };
+
+    {
+        // no product default - neither the field nor its mask bits are touched
+        hwInfo.caps.defaultMidthreadPreemptionDelayTimer = 0u;
+
+        auto &stateComputeModeCmd = programStateComputeMode();
+        EXPECT_EQ(MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_0, stateComputeModeCmd.getMidthreadPreemptionDelayTimer());
+        EXPECT_EQ(0u, stateComputeModeCmd.getMask2() & midthreadPreemptionDelayTimerMask);
+    }
+
+    {
+        hwInfo.caps.defaultMidthreadPreemptionDelayTimer = MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_150;
+
+        auto &stateComputeModeCmd = programStateComputeMode();
+        EXPECT_EQ(MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_150, stateComputeModeCmd.getMidthreadPreemptionDelayTimer());
+        EXPECT_EQ(midthreadPreemptionDelayTimerMask, stateComputeModeCmd.getMask2() & midthreadPreemptionDelayTimerMask);
+    }
+
+    {
+        // the debug key overrides the product default, down to disabling the timer again
+        debugManager.flags.ScmMidthreadPreemptionDelayTimerOverride.set(0);
+
+        auto &stateComputeModeCmd = programStateComputeMode();
+        EXPECT_EQ(MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_0, stateComputeModeCmd.getMidthreadPreemptionDelayTimer());
+        EXPECT_EQ(0u, stateComputeModeCmd.getMask2() & midthreadPreemptionDelayTimerMask);
+    }
+
+    {
+        // ... and up, over a product default that leaves it disabled
+        hwInfo.caps.defaultMidthreadPreemptionDelayTimer = 0u;
+        debugManager.flags.ScmMidthreadPreemptionDelayTimerOverride.set(MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_100);
+
+        auto &stateComputeModeCmd = programStateComputeMode();
+        EXPECT_EQ(MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_100, stateComputeModeCmd.getMidthreadPreemptionDelayTimer());
+        EXPECT_EQ(midthreadPreemptionDelayTimerMask, stateComputeModeCmd.getMask2() & midthreadPreemptionDelayTimerMask);
+    }
+}
+
+HWTEST2_F(CommandEncodeStatesTestXe2AndLater, givenRequiredWorkGroupOrderWhenCallEncodeThreadDataThenDispatchWalkOrderIsProgrammedCorrectly, IsAtLeastXe2HpgCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    DefaultWalkerType walkerCmd = FamilyType::template getInitGpuWalker<DefaultWalkerType>();
+
+    uint32_t startWorkGroup[3] = {1, 1, 1};
+    uint32_t numWorkGroups[3] = {1, 1, 1};
+    uint32_t workGroupSizes[3] = {1, 1, 1};
+
+    uint32_t yOrder = 2u;
+    EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[yOrder], HwWalkOrderHelper::yOrderWalk);
+
+    auto &rootDeviceEnvironment = this->pDevice->getRootDeviceEnvironment();
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, false, false, true, yOrder, rootDeviceEnvironment);
+    EXPECT_EQ(DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK, walkerCmd.getDispatchWalkOrder());
+
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, true, false, true, yOrder, rootDeviceEnvironment);
+    EXPECT_EQ(DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK, walkerCmd.getDispatchWalkOrder());
+
+    uint32_t linearOrder = 0u;
+    EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[linearOrder], HwWalkOrderHelper::linearWalk);
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, false, false, true, linearOrder, rootDeviceEnvironment);
+    EXPECT_EQ(DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK, walkerCmd.getDispatchWalkOrder());
+
+    EncodeDispatchKernel<FamilyType>::encodeThreadData(walkerCmd, startWorkGroup, numWorkGroups, workGroupSizes, 0, 3,
+                                                       0, 1, true, false, true, linearOrder, rootDeviceEnvironment);
+    EXPECT_EQ(DefaultWalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK, walkerCmd.getDispatchWalkOrder());
+}

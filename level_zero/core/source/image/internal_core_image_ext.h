@@ -1,0 +1,114 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/surface_format_info.h"
+#include "shared/source/memory_manager/allocation_type.h"
+
+#include <level_zero/ze_api.h>
+
+namespace L0 {
+
+// NOLINTBEGIN(readability-identifier-naming)
+
+constexpr ze_structure_type_t ZE_STRUCTURE_TYPE_IMAGE_ALLOCATION_TYPE_EXT_DESC = static_cast<ze_structure_type_t>(0x00050000);
+
+struct ze_image_allocation_type_ext_desc_t {
+    ze_structure_type_t stype = ZE_STRUCTURE_TYPE_IMAGE_ALLOCATION_TYPE_EXT_DESC;
+    const void *pNext = nullptr;
+    NEO::AllocationType allocationType = NEO::AllocationType::unknown;
+};
+
+constexpr ze_structure_type_t ZE_STRUCTURE_TYPE_EXTERNAL_GL_TEXTURE_EXT_DESC = static_cast<ze_structure_type_t>(0x00050001);
+
+struct ze_external_gl_texture_ext_desc_t {
+    ze_structure_type_t stype = ZE_STRUCTURE_TYPE_EXTERNAL_GL_TEXTURE_EXT_DESC;
+    const void *pNext = nullptr;
+    void *pGmmResInfo = nullptr;      // GMM_RESOURCE_INFO* obtained from the GL driver
+    uint64_t textureBufferOffset = 0; // byte offset of the texture data within the shared allocation
+    uint32_t glHWFormat = 0;          // genx surface-state format override (0 means no override)
+    uint32_t cubeFaceIndex = 0;       // GMM cube face index (__GMM_NO_CUBE_MAP for non-cube targets)
+    bool isAuxEnabled = false;        // request aux/compression mapping
+
+    // Multisample / MCS sharing (cl_khr_gl_msaa_sharing)
+    uint32_t numberOfSamples = 0;      // GL texture sample count (>1 for MSAA)
+    void *mcsNtHandle = nullptr;       // NT handle of the MCS / auxiliary surface (nullptr if unified)
+    void *pGmmResInfoMcs = nullptr;    // GMM_RESOURCE_INFO* of the MCS surface
+    bool hasUnifiedMcsSurface = false; // MCS lives inside the main allocation (unified aux)
+};
+
+constexpr ze_structure_type_t ZE_STRUCTURE_TYPE_EXTERNAL_D3D_TEXTURE_EXT_DESC = static_cast<ze_structure_type_t>(0x00050007);
+
+// Carries the D3D subresource / array-slice index of an externally imported
+// D3D11/D3D10 texture.  A D3D texture array (or a planar NV12/P010/P016 texture,
+// whose planes are exposed as consecutive array slices) is shared through a single
+// NT handle that backs several allocations; this index selects which one to open
+// and drives the GMM render-offset calculation.
+struct ze_external_d3d_texture_ext_desc_t {
+    ze_structure_type_t stype = ZE_STRUCTURE_TYPE_EXTERNAL_D3D_TEXTURE_EXT_DESC;
+    const void *pNext = nullptr;
+    uint32_t arrayIndex = 0; // D3D subresource array-slice index within the shared resource
+};
+
+// Extended image region that carries a mip-level index.  Inherits from
+// ze_image_region_t so a pointer to this struct is implicitly convertible to
+// const ze_image_region_t* and can be passed directly to any L0 image-copy
+// entrypoint.  The L0 implementation recovers the mip level by casting back
+// when the image is mipmapped (numMipLevels > 1).
+struct ze_image_region_mip_level_exp_desc_t : ze_image_region_t {
+    uint32_t mipLevel = 0;
+};
+
+inline uint32_t getRegionMipLevel(const ze_image_region_t *pRegion, uint32_t numMipLevels) {
+    if (pRegion == nullptr || numMipLevels <= 1u) {
+        return 0u;
+    }
+    return static_cast<const ze_image_region_mip_level_exp_desc_t *>(pRegion)->mipLevel;
+}
+
+constexpr ze_structure_type_t ZE_STRUCTURE_TYPE_SAMPLER_LOD_EXT_DESC = static_cast<ze_structure_type_t>(0x00050003);
+
+struct ze_sampler_lod_ext_desc_t {
+    ze_structure_type_t stype = ZE_STRUCTURE_TYPE_SAMPLER_LOD_EXT_DESC;
+    const void *pNext = nullptr;
+    float lodMin = 0.0f;
+    float lodMax = 0.0f;
+    bool mipFilterLinear = false;
+};
+
+constexpr ze_structure_type_t ZE_STRUCTURE_TYPE_DEPTH_STENCIL_FORMAT_EXT_DESC = static_cast<ze_structure_type_t>(0x00050005);
+
+enum ze_depth_stencil_format_t : uint32_t {
+    ZE_DEPTH_STENCIL_FORMAT_D24_UNORM_S8_UINT = 0,
+    ZE_DEPTH_STENCIL_FORMAT_D32_FLOAT_S8X24_UINT = 1,
+};
+
+struct ze_depth_stencil_format_ext_desc_t {
+    ze_structure_type_t stype = ZE_STRUCTURE_TYPE_DEPTH_STENCIL_FORMAT_EXT_DESC;
+    const void *pNext = nullptr;
+    ze_depth_stencil_format_t format = ZE_DEPTH_STENCIL_FORMAT_D24_UNORM_S8_UINT;
+};
+
+constexpr ze_structure_type_t ZE_STRUCTURE_TYPE_IMAGE_TILING_EXT_DESC = static_cast<ze_structure_type_t>(0x00050006);
+
+// Communicates the tiling/layout of an externally imported image (e.g. a dma-buf
+// shared from another driver) so the implementation can build a matching GMM.
+// Required on Linux: a dma-buf's layout is described by a DRM format modifier that
+// cannot be queried back from the kernel on the Xe KMD, so the importer must supply
+// it explicitly. Only consulted on the shared-handle (FD) image-create path.
+struct ze_image_tiling_ext_desc_t {
+    ze_structure_type_t stype = ZE_STRUCTURE_TYPE_IMAGE_TILING_EXT_DESC;
+    const void *pNext = nullptr;
+    bool linearStorage = false;                                        // image memory is linear (e.g. DRM_FORMAT_MOD_LINEAR)
+    NEO::ImageTilingMode forceTiling = NEO::ImageTilingMode::notTiled; // explicit tiling, used when linearStorage is false
+    uint64_t rowPitch = 0;                                             // row pitch in bytes as reported by the exporter (0 = derive from GMM)
+};
+
+// NOLINTEND(readability-identifier-naming)
+
+} // namespace L0

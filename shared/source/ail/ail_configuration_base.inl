@@ -1,43 +1,110 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/ail/ail_configuration.h"
+#include "shared/source/ail/ail_ov_comp_wa.h"
 
 #include <string>
 
 namespace NEO {
 
-template <PRODUCT_FAMILY Product>
-inline void AILConfigurationHw<Product>::modifyKernelIfRequired(std::string &kernel) {
+template <PRODUCT_FAMILY product>
+inline void AILConfigurationHw<product>::modifyKernelIfRequired(std::string &kernel) {
 }
 
-//  To avoid a known oneDNN issue in ZEBin handling,
-//  fall back to legacy (patchtoken) format when dummy kernel used by nGen is detected.
-//  Only this specific kernel with that exact source code will be affected.
+template <PRODUCT_FAMILY product>
+inline void AILConfigurationHw<product>::applyExt(HardwareInfo &hwInfo) {
+}
 
-template <PRODUCT_FAMILY Product>
-inline bool AILConfigurationHw<Product>::isFallbackToPatchtokensRequired(const std::string &kernelSources) {
-    std::string_view dummyKernelSource{"kernel void _(){}"};
-    if (sourcesContain(kernelSources, dummyKernelSource)) {
-        return true;
-    }
-
-    for (const auto &name : {"Resolve",
-                             "ArcControlAssist",
-                             "ArcControl"}) {
-        if (processName == name) {
-            return true;
-        }
-    }
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::isContextSyncFlagRequired() {
     return false;
 }
 
-template <PRODUCT_FAMILY Product>
-inline void AILConfigurationHw<Product>::applyExt(RuntimeCapabilityTable &runtimeCapabilityTable) {
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::isRunAloneContextRequired() {
+    return false;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::is256BPrefetchDisableRequired() {
+    return false;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::drainHostptrs() {
+    return true;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::isBufferPoolEnabled() {
+    return true;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::useLegacyValidationLogic() {
+    return false;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::forceRcs() {
+    return shouldForceRcs;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::handleDivergentBarriers() {
+    return shouldHandleDivergentBarriers;
+}
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::disableBindlessAddressing() {
+    return shouldDisableBindlessAddressing;
+}
+template <PRODUCT_FAMILY product>
+inline void AILConfigurationHw<product>::setHandleDivergentBarriers(bool val) {
+    shouldHandleDivergentBarriers = val;
+}
+template <PRODUCT_FAMILY product>
+inline void AILConfigurationHw<product>::setDisableBindlessAddressing(bool val) {
+    shouldDisableBindlessAddressing = val;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::limitAmountOfDeviceMemoryForRecycling() {
+    return false;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::isAdjustMicrosecondResolutionRequired() {
+    return shouldAdjustMicrosecondResolution;
+}
+
+template <PRODUCT_FAMILY product>
+inline uint32_t AILConfigurationHw<product>::getMicrosecondResolution() {
+    return microsecondAdjustment;
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::getOpenVinoDetected() {
+    return this->openVinoDetected;
+}
+
+template <PRODUCT_FAMILY product>
+inline void AILConfigurationHw<product>::checkIfOpenVinoDetected() {
+    this->openVinoDetected = isOpenVinoDetected();
+}
+
+template <PRODUCT_FAMILY product>
+inline bool AILConfigurationHw<product>::getOldOpenVinoVersionDetected() {
+    return this->oldOpenVinoVersionDetected;
+}
+
+template <PRODUCT_FAMILY product>
+inline void AILConfigurationHw<product>::checkIfOldOpenVinoVersionDetected() {
+    this->oldOpenVinoVersionDetected = isOldOpenVinoVersionDetected();
 }
 
 } // namespace NEO

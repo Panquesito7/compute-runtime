@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,6 +14,7 @@
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/blit_commands_helper.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/definitions/command_encoder_args.h"
 #include "shared/source/helpers/flush_stamp.h"
 #include "shared/source/helpers/gfx_core_helper.h"
@@ -24,6 +25,7 @@
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
 #include "shared/test/common/helpers/relaxed_ordering_commands_helper.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/helpers/ult_hw_config.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/helpers/variable_backup.h"
@@ -32,10 +34,12 @@
 #include "shared/test/common/mocks/mock_io_functions.h"
 #include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/unit_test/fixtures/direct_submission_fixture.h"
-#include "shared/test/unit_test/mocks/mock_direct_submission_diagnostic_collector.h"
+
+#include <chrono>
 
 namespace CpuIntrinsicsTests {
 extern std::atomic<uint32_t> sfenceCounter;
+extern std::atomic<uint32_t> mfenceCounter;
 } // namespace CpuIntrinsicsTests
 
 using DirectSubmissionTest = Test<DirectSubmissionFixture>;
@@ -47,7 +51,10 @@ struct DirectSubmissionDispatchMiMemFenceTest : public DirectSubmissionDispatchB
         DirectSubmissionDispatchBufferTest::SetUp();
 
         auto &productHelper = pDevice->getProductHelper();
-        miMemFenceSupported = productHelper.isGlobalFenceInDirectSubmissionRequired(pDevice->getHardwareInfo());
+        miMemFenceSupported = pDevice->getHardwareInfo().capabilityTable.isIntegratedDevice ? false : productHelper.isAcquireGlobalFenceInDirectSubmissionRequired(pDevice->getHardwareInfo());
+
+        auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+        heaplessModeEnabled = compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo);
     }
 
     template <typename FamilyType>
@@ -73,7 +80,7 @@ struct DirectSubmissionDispatchMiMemFenceTest : public DirectSubmissionDispatchB
 
                     EXPECT_NE(0u, sysFenceAddress->getSystemMemoryFenceAddress());
                 } else if (auto miMemFence = genCmdCast<MI_MEM_FENCE *>(it)) {
-                    if (miMemFence->getFenceType() == MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_ACQUIRE) {
+                    if (miMemFence->getFenceType() == MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_ACQUIRE_FENCE) {
                         EXPECT_TRUE(id > systemMemoryFenceId);
 
                         fenceCount++;
@@ -111,37 +118,42 @@ struct DirectSubmissionDispatchMiMemFenceTest : public DirectSubmissionDispatchB
     }
 
     bool miMemFenceSupported = false;
+    bool heaplessModeEnabled = false;
 };
 
 HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenMiMemFenceSupportedWhenInitializingDirectSubmissionThenEnableMiMemFenceProgramming) {
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
+    uint32_t expectedSysMemFenceAddress = heaplessModeEnabled ? 0 : 1;
+
     EXPECT_EQ(miMemFenceSupported, directSubmission.miMemFenceRequired);
-    EXPECT_FALSE(directSubmission.systemMemoryFenceAddressSet);
+    EXPECT_EQ(heaplessModeEnabled && miMemFenceSupported, directSubmission.systemMemoryFenceAddressSet);
 
-    EXPECT_TRUE(directSubmission.initialize(true, false));
+    EXPECT_TRUE(directSubmission.initialize(true));
 
-    EXPECT_EQ(miMemFenceSupported, directSubmission.systemMemoryFenceAddressSet);
+    EXPECT_EQ(directSubmission.globalFenceAllocation != nullptr, directSubmission.systemMemoryFenceAddressSet);
 
-    validateFenceProgramming<FamilyType>(directSubmission, 1, 1);
+    validateFenceProgramming<FamilyType>(directSubmission, 1, expectedSysMemFenceAddress);
 }
 
 HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenMiMemFenceSupportedWhenDispatchingWithoutInitThenEnableMiMemFenceProgramming) {
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     FlushStampTracker flushStamp(true);
 
+    uint32_t expectedSysMemFenceAddress = heaplessModeEnabled ? 0 : 1;
+
     EXPECT_EQ(miMemFenceSupported, directSubmission.miMemFenceRequired);
-    EXPECT_FALSE(directSubmission.systemMemoryFenceAddressSet);
+    EXPECT_EQ(heaplessModeEnabled && miMemFenceSupported, directSubmission.systemMemoryFenceAddressSet);
 
-    EXPECT_TRUE(directSubmission.initialize(false, false));
+    EXPECT_TRUE(directSubmission.initialize(false));
 
-    EXPECT_FALSE(directSubmission.systemMemoryFenceAddressSet);
+    EXPECT_EQ(heaplessModeEnabled && miMemFenceSupported, directSubmission.systemMemoryFenceAddressSet);
 
     EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
 
-    validateFenceProgramming<FamilyType>(directSubmission, 2, 1);
+    validateFenceProgramming<FamilyType>(directSubmission, 1, expectedSysMemFenceAddress);
 
-    EXPECT_EQ(miMemFenceSupported, directSubmission.systemMemoryFenceAddressSet);
+    EXPECT_EQ(directSubmission.globalFenceAllocation != nullptr, directSubmission.systemMemoryFenceAddressSet);
 }
 
 HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenMiMemFenceSupportedWhenSysMemFenceIsAlreadySentThenDontReprogram) {
@@ -151,46 +163,244 @@ HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenMiMemFenceSupportedWhenSys
     EXPECT_EQ(miMemFenceSupported, directSubmission.miMemFenceRequired);
     directSubmission.systemMemoryFenceAddressSet = true;
 
-    EXPECT_TRUE(directSubmission.initialize(false, false));
+    EXPECT_TRUE(directSubmission.initialize(false));
 
     EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
 
-    validateFenceProgramming<FamilyType>(directSubmission, 2, 0);
+    validateFenceProgramming<FamilyType>(directSubmission, 1, 0);
 
     EXPECT_TRUE(directSubmission.systemMemoryFenceAddressSet);
 }
 
 HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenPciBarrierPtrSetWhenUnblockGpuThenWriteZero) {
-    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     uint32_t pciBarrierMock = 1;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     directSubmission.pciBarrierPtr = &pciBarrierMock;
-    EXPECT_TRUE(directSubmission.initialize(false, false));
+    EXPECT_TRUE(directSubmission.initialize(false));
 
     directSubmission.unblockGpu();
 
     EXPECT_EQ(*directSubmission.pciBarrierPtr, 0u);
 }
 
-HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenDebugFlagSetWhenCreatingDirectSubmissionThenDontEnableMiMemFenceProgramming) {
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenMemoryFenceOverPciBarrierActiveWhenUnblockGpuThenPciBarrierIsNotWritten) {
+    uint32_t pciBarrierMock = 0x1234u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    EXPECT_TRUE(directSubmission.initialize(false));
+
+    std::promise<GraphicsAllocation *> blockingPromise;
+    directSubmission.asyncNewRingBufferAllocation = blockingPromise.get_future();
+
+    // First submission still emits PCI barrier, memory fence was not programmed
+    directSubmission.updateMemoryFenceOverPciBarrier();
+    directSubmission.unblockGpu();
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+    EXPECT_EQ(*directSubmission.pciBarrierPtr, 0x0u);
+    *directSubmission.pciBarrierPtr = 0x1234u;
+
+    directSubmission.updateMemoryFenceOverPciBarrier();
+    directSubmission.unblockGpu();
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+    EXPECT_EQ(*directSubmission.pciBarrierPtr, 0x1234u);
+
+    blockingPromise.set_value(directSubmission.ringBuffers[0].ringBuffer);
+    directSubmission.asyncNewRingBufferAllocation.get();
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenMemoryFenceOverPciBarrierActiveWhenDispatchingSemaphoreSectionThenAdditionalSynchronizationIsEmitted) {
+    if (!miMemFenceSupported) {
+        GTEST_SKIP();
+    }
+    uint32_t pciBarrierMock = 0u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    EXPECT_TRUE(directSubmission.initialize(false));
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.miMemFenceRequired = true;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+
+    directSubmission.memoryFenceOverPciBarrier = false;
+    size_t sizeWithout = directSubmission.getSizeSemaphoreSection(false);
+
+    directSubmission.memoryFenceOverPciBarrier = true;
+    size_t sizeWith = directSubmission.getSizeSemaphoreSection(false);
+    EXPECT_GT(sizeWith, sizeWithout);
+
+    size_t usedBefore = directSubmission.ringCommandStream.getUsed();
+    directSubmission.dispatchSemaphoreSection(1u);
+    size_t emittedSize = directSubmission.ringCommandStream.getUsed() - usedBefore;
+    EXPECT_EQ(sizeWith, emittedSize);
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenPciBarrierPtrAndAsyncRingBufferInFlightWhenDispatchCommandBufferThenMemoryFenceOverPciBarrierIsSelected) {
+    uint32_t pciBarrierMock = 0u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    FlushStampTracker flushStamp(true);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
+
+    std::promise<GraphicsAllocation *> blockingPromise;
+    directSubmission.asyncNewRingBufferAllocation = blockingPromise.get_future();
+    ASSERT_TRUE(directSubmission.asyncNewRingBufferAllocation.valid());
+    ASSERT_EQ(std::future_status::timeout, directSubmission.asyncNewRingBufferAllocation.wait_for(std::chrono::microseconds(0)));
+
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+
+    blockingPromise.set_value(directSubmission.ringBuffers[0].ringBuffer);
+    auto fetched = directSubmission.asyncNewRingBufferAllocation.get();
+    EXPECT_EQ(fetched, directSubmission.ringBuffers[0].ringBuffer);
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenPciBarrierPtrAndAsyncRingBufferReadyWhenDispatchCommandBufferThenMemoryFenceOverPciBarrierIsDisabled) {
+    uint32_t pciBarrierMock = 0u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    FlushStampTracker flushStamp(true);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
+
+    std::promise<GraphicsAllocation *> readyPromise;
+    readyPromise.set_value(directSubmission.ringBuffers[0].ringBuffer);
+    directSubmission.asyncNewRingBufferAllocation = readyPromise.get_future();
+    ASSERT_NE(std::future_status::timeout, directSubmission.asyncNewRingBufferAllocation.wait_for(std::chrono::microseconds(0)));
+
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_FALSE(directSubmission.memoryFenceOverPciBarrier);
+    directSubmission.asyncNewRingBufferAllocation.get();
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenDebugFlagForcingMemoryFenceOverPciBarrierWhenNoPciBarrierThenStillForcedTrue) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.set(0);
+    debugManager.flags.DirectSubmissionMemoryFenceOverPciBarrier.set(1);
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    FlushStampTracker flushStamp(true);
+    ASSERT_EQ(nullptr, directSubmission.pciBarrierPtr);
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
 
-    EXPECT_FALSE(directSubmission.miMemFenceRequired);
-    EXPECT_FALSE(directSubmission.systemMemoryFenceAddressSet);
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+}
 
-    EXPECT_TRUE(directSubmission.initialize(true, false));
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenStaleMemoryFenceOverPciBarrierAndAsyncInFlightWhenStopRingBufferThenPciBarrierSkipped) {
+    uint32_t pciBarrierMock = 0x1234u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
+    directSubmission.ringStart = true;
+    directSubmission.memoryFenceOverPciBarrier = false;
+
+    std::promise<GraphicsAllocation *> blockingPromise;
+    directSubmission.asyncNewRingBufferAllocation = blockingPromise.get_future();
+
+    EXPECT_TRUE(directSubmission.stopRingBuffer(false));
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+    EXPECT_EQ(*directSubmission.pciBarrierPtr, pciBarrierMock);
+
+    blockingPromise.set_value(directSubmission.ringBuffers[0].ringBuffer);
+    directSubmission.asyncNewRingBufferAllocation.get();
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenStaleMemoryFenceOverPciBarrierAndAsyncReadyWhenStopRingBufferThenPciBarrierNotWritten) {
+    uint32_t pciBarrierMock = 0x1234u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
+    directSubmission.ringStart = true;
+
+    directSubmission.memoryFenceOverPciBarrier = true;
+    ASSERT_FALSE(directSubmission.asyncNewRingBufferAllocation.valid());
+    EXPECT_TRUE(directSubmission.stopRingBuffer(false));
+    EXPECT_FALSE(directSubmission.memoryFenceOverPciBarrier);
+    EXPECT_EQ(*directSubmission.pciBarrierPtr, 0x1234u);
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenOverflowingQueueWorkCountAndAsyncInFlightWhenDispatchCommandBufferThenMemoryFenceOverPciBarrierIsAppliedDuringOverflowHandling) {
+    uint32_t pciBarrierMock = 0x1234u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    FlushStampTracker flushStamp(true);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
+    ASSERT_FALSE(directSubmission.memoryFenceOverPciBarrier);
+
+    std::promise<GraphicsAllocation *> blockingPromise;
+    directSubmission.asyncNewRingBufferAllocation = blockingPromise.get_future();
+
+    directSubmission.currentQueueWorkCount = std::numeric_limits<uint32_t>::max() - 3u;
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+    EXPECT_EQ(*directSubmission.pciBarrierPtr, pciBarrierMock);
+
+    blockingPromise.set_value(directSubmission.ringBuffers[0].ringBuffer);
+    directSubmission.asyncNewRingBufferAllocation.get();
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenAsyncRingBufferBecomesInFlightBetweenSubmissionsWhenUnblockingThenReleasedSectionIsProtected) {
+    if (!miMemFenceSupported) {
+        GTEST_SKIP();
+    }
+    uint32_t pciBarrierMock = 0u;
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    FlushStampTracker flushStamp(true);
+    directSubmission.pciBarrierPtr = &pciBarrierMock;
+    directSubmission.gpuVaForAdditionalSynchronizationWA = 0xDEADBEE0u;
+    EXPECT_TRUE(directSubmission.initialize(false));
+    ASSERT_TRUE(directSubmission.miMemFenceRequired);
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_FALSE(directSubmission.memoryFenceOverPciBarrier);
+
+    std::promise<GraphicsAllocation *> blockingPromise;
+    directSubmission.asyncNewRingBufferAllocation = blockingPromise.get_future();
+    pciBarrierMock = 0x1234u;
+
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_TRUE(directSubmission.memoryFenceOverPciBarrier);
+    EXPECT_EQ(0u, *directSubmission.pciBarrierPtr);
+
+    blockingPromise.set_value(directSubmission.ringBuffers[0].ringBuffer);
+    directSubmission.asyncNewRingBufferAllocation.get();
+}
+
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenNoGlobalFenceAllocationWhenInitializeThenDoNotProgramGlobalFence) {
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    directSubmission.globalFenceAllocation = nullptr;
+    directSubmission.systemMemoryFenceAddressSet = false;
+
+    EXPECT_TRUE(directSubmission.initialize(true));
 
     EXPECT_FALSE(directSubmission.systemMemoryFenceAddressSet);
 }
 
+HWTEST_F(DirectSubmissionDispatchMiMemFenceTest, givenDebugFlagSetToTrueWhenCreatingDirectSubmissionThenEnableMiMemFenceProgramming) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.set(1);
+
+    if (heaplessModeEnabled || pDevice->getHardwareInfo().capabilityTable.isIntegratedDevice) {
+        GTEST_SKIP();
+    }
+
+    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+
+    EXPECT_TRUE(directSubmission.miMemFenceRequired);
+    EXPECT_FALSE(directSubmission.systemMemoryFenceAddressSet);
+
+    EXPECT_TRUE(directSubmission.initialize(true));
+
+    EXPECT_EQ(directSubmission.systemMemoryFenceAddressSet, directSubmission.globalFenceAllocation != nullptr);
+    EXPECT_TRUE(directSubmission.miMemFenceRequired);
+}
+
 HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
             givenDirectSubmissionInPartitionModeWhenDispatchingCommandBufferThenExpectDispatchPartitionedPipeControlInCommandBuffer) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using POST_SYNC_OPERATION = typename FamilyType::PIPE_CONTROL::POST_SYNC_OPERATION;
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
     using MI_LOAD_REGISTER_MEM = typename FamilyType::MI_LOAD_REGISTER_MEM;
+    pDevice->getRootDeviceEnvironmentRef().memoryOperationsInterface.reset(new MockMemoryOperations{});
 
     FlushStampTracker flushStamp(true);
 
@@ -204,11 +414,10 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     EXPECT_TRUE(directSubmission.partitionConfigSet);
     directSubmission.partitionConfigSet = false;
-    directSubmission.disableMonitorFence = false;
     directSubmission.partitionedMode = true;
     directSubmission.workPartitionAllocation = ultCsr->getWorkPartitionAllocation();
 
-    bool ret = directSubmission.initialize(true, false);
+    bool ret = directSubmission.initialize(true);
     EXPECT_TRUE(ret);
     EXPECT_TRUE(directSubmission.partitionConfigSet);
     EXPECT_NE(0x0u, directSubmission.ringCommandStream.getUsed());
@@ -221,7 +430,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
                         directSubmission.getSizeSemaphoreSection(false) +
                         sizeof(MI_LOAD_REGISTER_IMM) +
                         sizeof(MI_LOAD_REGISTER_MEM);
-    if (directSubmission.miMemFenceRequired) {
+    if (directSubmission.miMemFenceRequired && !heaplessModeEnabled) {
         submitSize += directSubmission.getSizeSystemMemoryFenceAddress();
     }
     if (directSubmission.isRelaxedOrderingEnabled()) {
@@ -244,27 +453,8 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(1u, directSubmission.submitCount);
     EXPECT_EQ(2u, directSubmission.handleResidencyCount);
 
-    EXPECT_EQ(directSubmission.getSizeDispatch(false, false), directSubmission.ringCommandStream.getUsed());
+    EXPECT_EQ(directSubmission.getSizeDispatch(false, false, directSubmission.dispatchMonitorFenceRequired(false)) - directSubmission.getSizeNewResourceHandler(), directSubmission.ringCommandStream.getUsed());
     EXPECT_TRUE(directSubmission.ringStart);
-
-    HardwareParse hwParse;
-    hwParse.parsePipeControl = true;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
-    hwParse.findHardwareCommands<FamilyType>();
-
-    bool foundFenceUpdate = false;
-    for (auto &it : hwParse.pipeControlList) {
-        PIPE_CONTROL *pipeControl = reinterpret_cast<PIPE_CONTROL *>(it);
-        if (pipeControl->getPostSyncOperation() == POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA) {
-            foundFenceUpdate = true;
-            EXPECT_EQ(directSubmission.tagAddressSetValue, NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl));
-            uint64_t data = pipeControl->getImmediateData();
-            EXPECT_EQ(directSubmission.tagValueSetValue, data);
-            EXPECT_TRUE(pipeControl->getWorkloadPartitionIdOffsetEnable());
-            break;
-        }
-    }
-    EXPECT_TRUE(foundFenceUpdate);
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest, givenCopyCommandBufferIntoRingWhenDispatchCommandBufferThenCopyTaskStream) {
@@ -273,13 +463,13 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenCopyCommandBufferIntoRingWhenD
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
     FlushStampTracker flushStamp(true);
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     EXPECT_TRUE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
 
-    bool ret = directSubmission.initialize(true, false);
+    bool ret = directSubmission.initialize(true);
     EXPECT_TRUE(ret);
 
     size_t sizeUsed = directSubmission.ringCommandStream.getUsed();
@@ -295,34 +485,43 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenCopyCommandBufferIntoRingWhenD
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRingBufferAndSingleTileDirectSubmissionWhenSubmitSystemMemNotChainedBatchBufferWithoutRelaxingDependenciesThenCopyIntoRing) {
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     EXPECT_TRUE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest, givenMetricsDefaultDirectSubmissionFlatRingBufferAndSingleTileDirectSubmissionWhenSubmitSystemMemNotChainedBatchBufferWithoutRelaxingDependenciesThenNotCopyIntoRing) {
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
     pDevice->getExecutionEnvironment()->setMetricsEnabled(true);
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     EXPECT_FALSE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
 }
 
-HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRingBufferAndSingleTileDirectSubmissionWhenSubmitSystemMemNotChainedBatchBufferWithoutCommandBufferRelaxingDependenciesThenNotCopyIntoRing) {
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRingBufferAndSingleTileDirectSubmissionWhenSubmitSystemMemBatchBufferWithoutCommandBufferRelaxingAndForcedFlatRingDisabledDependenciesThenNotCopyIntoRing) {
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+
+    batchBuffer.disableFlatRingBuffer = true;
+
+    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    EXPECT_FALSE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
+}
+
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRingBufferAndSingleTileDirectSubmissionWhenSubmitSystemMemNotChainedBatchBufferWithoutCommandBufferRelaxingDependenciesThenNotCopyIntoRing) {
+    using Dispatcher = RenderDispatcher<FamilyType>;
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
     batchBuffer.commandBufferAllocation = nullptr;
 
@@ -334,7 +533,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenDisabledDirectSubmissionFlatRi
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(0);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(0);
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     EXPECT_FALSE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
@@ -344,7 +543,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRin
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
     batchBuffer.hasRelaxedOrderingDependencies = true;
 
@@ -356,7 +555,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRin
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
     batchBuffer.chainedBatchBuffer = reinterpret_cast<GraphicsAllocation *>(0x1234);
 
@@ -368,9 +567,9 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRin
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
-    static_cast<MemoryAllocation *>(batchBuffer.commandBufferAllocation)->overrideMemoryPool(MemoryPool::LocalMemory);
+    static_cast<MemoryAllocation *>(batchBuffer.commandBufferAllocation)->overrideMemoryPool(MemoryPool::localMemory);
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     EXPECT_FALSE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
@@ -380,198 +579,16 @@ HWTEST_F(DirectSubmissionDispatchBufferTest, givenDefaultDirectSubmissionFlatRin
     using Dispatcher = RenderDispatcher<FamilyType>;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
 
     std::unique_ptr<OsContext> osContext(OsContext::create(pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), pDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, 0b11)));
     pDevice->getDefaultEngine().commandStreamReceiver->setupContext(*osContext.get());
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
     EXPECT_FALSE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest,
-         givenDirectSubmissionDisableMonitorFenceWhenDispatchWorkloadCalledThenExpectStartWithoutMonitorFence) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using Dispatcher = RenderDispatcher<FamilyType>;
-
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionDisableCacheFlush.set(0);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> regularDirectSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    size_t regularSizeDispatch = regularDirectSubmission.getSizeDispatch(false, false);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.disableMonitorFence = true;
-
-    bool ret = directSubmission.allocateResources();
-    EXPECT_TRUE(ret);
-
-    size_t tagUpdateSize = Dispatcher::getSizeMonitorFence(directSubmission.rootDeviceEnvironment);
-
-    size_t disabledSizeDispatch = directSubmission.getSizeDispatch(false, false);
-    EXPECT_EQ(disabledSizeDispatch, (regularSizeDispatch - tagUpdateSize));
-
-    directSubmission.tagValueSetValue = 0x4343123ull;
-    directSubmission.tagAddressSetValue = 0xBEEF00000ull;
-    directSubmission.dispatchWorkloadSection(batchBuffer);
-    size_t expectedDispatchSize = disabledSizeDispatch;
-    EXPECT_EQ(expectedDispatchSize, directSubmission.ringCommandStream.getUsed());
-
-    HardwareParse hwParse;
-    hwParse.parsePipeControl = true;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
-    hwParse.findHardwareCommands<FamilyType>();
-    MI_BATCH_BUFFER_START *bbStart = hwParse.getCommand<MI_BATCH_BUFFER_START>();
-    ASSERT_NE(nullptr, bbStart);
-
-    bool foundFenceUpdate = false;
-    for (auto it = hwParse.pipeControlList.begin(); it != hwParse.pipeControlList.end(); it++) {
-        auto pipeControl = genCmdCast<PIPE_CONTROL *>(*it);
-        uint64_t data = pipeControl->getImmediateData();
-        if ((directSubmission.tagAddressSetValue == NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl)) &&
-            (directSubmission.tagValueSetValue == data)) {
-            foundFenceUpdate = true;
-            break;
-        }
-    }
-    EXPECT_FALSE(foundFenceUpdate);
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest,
-         givenDirectSubmissionDisableCacheFlushWhenDispatchWorkloadCalledThenExpectStartWithoutCacheFlush) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using Dispatcher = RenderDispatcher<FamilyType>;
-
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionDisableCacheFlush.set(0);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> regularDirectSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    size_t regularSizeDispatch = regularDirectSubmission.getSizeDispatch(false, false);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-
-    directSubmission.disableCacheFlush = true;
-    bool ret = directSubmission.allocateResources();
-    EXPECT_TRUE(ret);
-
-    size_t flushSize = Dispatcher::getSizeCacheFlush(directSubmission.rootDeviceEnvironment);
-
-    size_t disabledSizeDispatch = directSubmission.getSizeDispatch(false, false);
-    EXPECT_EQ(disabledSizeDispatch, (regularSizeDispatch - flushSize));
-
-    directSubmission.dispatchWorkloadSection(batchBuffer);
-    size_t expectedDispatchSize = disabledSizeDispatch;
-    EXPECT_EQ(expectedDispatchSize, directSubmission.ringCommandStream.getUsed());
-
-    HardwareParse hwParse;
-    hwParse.parsePipeControl = true;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
-    hwParse.findHardwareCommands<FamilyType>();
-    MI_BATCH_BUFFER_START *bbStart = hwParse.getCommand<MI_BATCH_BUFFER_START>();
-    ASSERT_NE(nullptr, bbStart);
-
-    bool foundFlush = false;
-    LinearStream parseDispatch;
-    uint8_t buffer[256];
-    parseDispatch.replaceBuffer(buffer, 256);
-    RenderDispatcher<FamilyType>::dispatchCacheFlush(parseDispatch, pDevice->getRootDeviceEnvironment(), 0ull);
-    auto expectedPipeControl = static_cast<PIPE_CONTROL *>(parseDispatch.getCpuBase());
-    for (auto it = hwParse.pipeControlList.begin(); it != hwParse.pipeControlList.end(); it++) {
-        auto pipeControl = genCmdCast<PIPE_CONTROL *>(*it);
-        if (memcmp(expectedPipeControl, pipeControl, sizeof(PIPE_CONTROL)) == 0) {
-            foundFlush = true;
-            break;
-        }
-    }
-    EXPECT_FALSE(foundFlush);
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest,
-         givenDirectSubmissionDebugBufferModeOneWhenDispatchWorkloadCalledThenExpectNoStartAndLoadDataImm) {
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
-    using Dispatcher = RenderDispatcher<FamilyType>;
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> regularDirectSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-
-    size_t regularSizeDispatch = regularDirectSubmission.getSizeDispatch(false, false);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-
-    directSubmission.workloadMode = 1;
-    bool ret = directSubmission.allocateResources();
-    EXPECT_TRUE(ret);
-
-    size_t startSize = directSubmission.getSizeStartSection();
-    size_t storeDataSize = Dispatcher::getSizeStoreDwordCommand();
-
-    size_t debugSizeDispatch = directSubmission.getSizeDispatch(false, false);
-    EXPECT_EQ(debugSizeDispatch, (regularSizeDispatch - startSize + storeDataSize));
-
-    directSubmission.workloadModeOneExpectedValue = 0x40u;
-    directSubmission.semaphoreGpuVa = 0xAFF0000;
-    directSubmission.dispatchWorkloadSection(batchBuffer);
-    size_t expectedDispatchSize = debugSizeDispatch;
-    EXPECT_EQ(expectedDispatchSize, directSubmission.ringCommandStream.getUsed());
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
-
-    if (directSubmission.getSizePrefetchMitigation() == sizeof(MI_BATCH_BUFFER_START)) {
-        EXPECT_EQ(1u, hwParse.getCommandCount<MI_BATCH_BUFFER_START>());
-    } else {
-        EXPECT_EQ(0u, hwParse.getCommandCount<MI_BATCH_BUFFER_START>());
-    }
-
-    MI_STORE_DATA_IMM *storeData = hwParse.getCommand<MI_STORE_DATA_IMM>();
-    ASSERT_NE(nullptr, storeData);
-    EXPECT_EQ(0x40u + 1u, storeData->getDataDword0());
-    uint64_t expectedGpuVa = directSubmission.semaphoreGpuVa;
-    auto semaphore = static_cast<RingSemaphoreData *>(directSubmission.semaphorePtr);
-    expectedGpuVa += ptrDiff(&semaphore->diagnosticModeCounter, directSubmission.semaphorePtr);
-    EXPECT_EQ(expectedGpuVa, storeData->getAddress());
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest,
-         givenDirectSubmissionDebugBufferModeTwoWhenDispatchWorkloadCalledThenExpectNoStartAndNoLoadDataImm) {
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
-
-    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> regularDirectSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    size_t regularSizeDispatch = regularDirectSubmission.getSizeDispatch(false, false);
-
-    MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-
-    directSubmission.workloadMode = 2;
-    bool ret = directSubmission.allocateResources();
-    EXPECT_TRUE(ret);
-
-    size_t startSize = directSubmission.getSizeStartSection();
-
-    size_t debugSizeDispatch = directSubmission.getSizeDispatch(false, false);
-    EXPECT_EQ(debugSizeDispatch, (regularSizeDispatch - startSize));
-
-    directSubmission.currentQueueWorkCount = 0x40u;
-    directSubmission.dispatchWorkloadSection(batchBuffer);
-    size_t expectedDispatchSize = debugSizeDispatch;
-    EXPECT_EQ(expectedDispatchSize, directSubmission.ringCommandStream.getUsed());
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
-
-    if (directSubmission.getSizePrefetchMitigation() == sizeof(MI_BATCH_BUFFER_START)) {
-        EXPECT_EQ(1u, hwParse.getCommandCount<MI_BATCH_BUFFER_START>());
-    } else {
-        EXPECT_EQ(0u, hwParse.getCommandCount<MI_BATCH_BUFFER_START>());
-    }
-
-    MI_STORE_DATA_IMM *storeData = hwParse.getCommand<MI_STORE_DATA_IMM>();
-    EXPECT_EQ(nullptr, storeData);
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest,
@@ -582,7 +599,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    bool ret = directSubmission.initialize(true, false);
+    bool ret = directSubmission.initialize(true);
     EXPECT_TRUE(ret);
     EXPECT_NE(0x0u, directSubmission.ringCommandStream.getUsed());
     GraphicsAllocation *oldRingAllocation = directSubmission.ringCommandStream.getGraphicsAllocation();
@@ -592,7 +609,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(1u, directSubmission.submitCount);
     size_t submitSize = RenderDispatcher<FamilyType>::getSizePreemption() +
                         directSubmission.getSizeSemaphoreSection(false);
-    if (directSubmission.miMemFenceRequired) {
+    if (directSubmission.miMemFenceRequired && !heaplessModeEnabled) {
         submitSize += directSubmission.getSizeSystemMemoryFenceAddress();
     }
     if (directSubmission.isRelaxedOrderingEnabled()) {
@@ -611,7 +628,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(1u, directSubmission.submitCount);
     EXPECT_EQ(2u, directSubmission.handleResidencyCount);
 
-    EXPECT_EQ(sizeUsed + directSubmission.getSizeDispatch(false, false), directSubmission.ringCommandStream.getUsed());
+    EXPECT_EQ(sizeUsed + directSubmission.getSizeDispatch(false, false, directSubmission.dispatchMonitorFenceRequired(false)) - directSubmission.getSizeNewResourceHandler(), directSubmission.ringCommandStream.getUsed());
     EXPECT_TRUE(directSubmission.ringStart);
 
     HardwareParse hwParse;
@@ -626,7 +643,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    bool ret = directSubmission.initialize(false, false);
+    bool ret = directSubmission.initialize(false);
     EXPECT_TRUE(ret);
     EXPECT_EQ(0x0u, directSubmission.ringCommandStream.getUsed());
     GraphicsAllocation *oldRingAllocation = directSubmission.ringCommandStream.getGraphicsAllocation();
@@ -639,33 +656,31 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
     ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
     EXPECT_TRUE(ret);
     EXPECT_EQ(oldRingAllocation, directSubmission.ringCommandStream.getGraphicsAllocation());
-    EXPECT_EQ(2u, directSubmission.semaphoreData->queueWorkCount);
-    EXPECT_EQ(3u, directSubmission.currentQueueWorkCount);
+    EXPECT_EQ(0u, directSubmission.semaphoreData->queueWorkCount);
+    EXPECT_EQ(2u, directSubmission.currentQueueWorkCount);
     EXPECT_EQ(1u, directSubmission.submitCount);
-    size_t submitSize = directSubmission.getSizeSemaphoreSection(false);
-    if (directSubmission.miMemFenceRequired) {
+    EXPECT_EQ(oldRingAllocation->getGpuAddress(), directSubmission.submitGpuAddress);
+    EXPECT_EQ(1u, directSubmission.handleResidencyCount);
+
+    size_t submitSize = directSubmission.getSizeDispatch(false, false, directSubmission.dispatchMonitorFenceRequired(false)) - directSubmission.getSizeNewResourceHandler();
+    if (directSubmission.miMemFenceRequired && !heaplessModeEnabled) {
         submitSize += directSubmission.getSizeSystemMemoryFenceAddress();
     }
     if (directSubmission.isRelaxedOrderingEnabled()) {
         submitSize += RelaxedOrderingHelper::getSizeRegistersInit<FamilyType>();
     }
-    EXPECT_EQ(submitSize, directSubmission.submitSize);
-    EXPECT_EQ(oldRingAllocation->getGpuAddress(), directSubmission.submitGpuAddress);
-    EXPECT_EQ(2u, directSubmission.handleResidencyCount);
-
-    size_t dispatchSize = submitSize + directSubmission.getSizeDispatch(false, false);
-
-    EXPECT_EQ(dispatchSize, directSubmission.ringCommandStream.getUsed());
+    EXPECT_EQ(submitSize, directSubmission.ringCommandStream.getUsed());
     EXPECT_TRUE(directSubmission.ringStart);
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest,
          givenDirectSubmissionRingStartWhenDispatchingCommandBufferThenExpectDispatchInCommandBufferAndQueueCountIncrease) {
+    pDevice->getRootDeviceEnvironmentRef().memoryOperationsInterface.reset(new MockMemoryOperations{});
     FlushStampTracker flushStamp(true);
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    bool ret = directSubmission.initialize(true, false);
+    bool ret = directSubmission.initialize(true);
     EXPECT_TRUE(ret);
     EXPECT_NE(0x0u, directSubmission.ringCommandStream.getUsed());
     GraphicsAllocation *oldRingAllocation = directSubmission.ringCommandStream.getGraphicsAllocation();
@@ -675,7 +690,7 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(1u, directSubmission.submitCount);
     size_t submitSize = RenderDispatcher<FamilyType>::getSizePreemption() +
                         directSubmission.getSizeSemaphoreSection(false);
-    if (directSubmission.miMemFenceRequired) {
+    if (directSubmission.miMemFenceRequired && !heaplessModeEnabled) {
         submitSize += directSubmission.getSizeSystemMemoryFenceAddress();
     }
     if (directSubmission.isRelaxedOrderingEnabled()) {
@@ -696,17 +711,18 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(1u, directSubmission.submitCount);
     EXPECT_EQ(2u, directSubmission.handleResidencyCount);
 
-    EXPECT_EQ(directSubmission.getSizeDispatch(false, false), directSubmission.ringCommandStream.getUsed());
+    EXPECT_EQ(directSubmission.getSizeDispatch(false, false, directSubmission.dispatchMonitorFenceRequired(false)) - directSubmission.getSizeNewResourceHandler(), directSubmission.ringCommandStream.getUsed());
     EXPECT_TRUE(directSubmission.ringStart);
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest,
          givenDirectSubmissionRingNotStartWhenDispatchingCommandBufferThenExpectDispatchInCommandBufferQueueCountIncreaseAndSubmitToGpu) {
+    pDevice->getRootDeviceEnvironmentRef().memoryOperationsInterface.reset(new MockMemoryOperations{});
     FlushStampTracker flushStamp(true);
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    bool ret = directSubmission.initialize(false, false);
+    bool ret = directSubmission.initialize(false);
     EXPECT_TRUE(ret);
     EXPECT_EQ(0u, directSubmission.semaphoreData->queueWorkCount);
     EXPECT_EQ(1u, directSubmission.currentQueueWorkCount);
@@ -720,46 +736,74 @@ HWTEST_F(DirectSubmissionDispatchBufferTest,
     ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
     EXPECT_TRUE(ret);
     EXPECT_NE(oldRingAllocation, directSubmission.ringCommandStream.getGraphicsAllocation());
-    EXPECT_EQ(2u, directSubmission.semaphoreData->queueWorkCount);
-    EXPECT_EQ(3u, directSubmission.currentQueueWorkCount);
+    EXPECT_EQ(0u, directSubmission.semaphoreData->queueWorkCount);
+    EXPECT_EQ(2u, directSubmission.currentQueueWorkCount);
     EXPECT_EQ(1u, directSubmission.submitCount);
-    size_t submitSize = directSubmission.getSizeSemaphoreSection(false);
-    if (directSubmission.miMemFenceRequired) {
+    EXPECT_EQ(1u, directSubmission.handleResidencyCount);
+
+    size_t submitSize = directSubmission.getSizeDispatch(false, false, directSubmission.dispatchMonitorFenceRequired(false)) - directSubmission.getSizeNewResourceHandler();
+    if (directSubmission.miMemFenceRequired && !heaplessModeEnabled) {
         submitSize += directSubmission.getSizeSystemMemoryFenceAddress();
     }
     if (directSubmission.isRelaxedOrderingEnabled()) {
         submitSize += RelaxedOrderingHelper::getSizeRegistersInit<FamilyType>();
     }
-    EXPECT_EQ(submitSize, directSubmission.submitSize);
-    EXPECT_EQ(2u, directSubmission.handleResidencyCount);
-
-    size_t dispatchSize = submitSize + directSubmission.getSizeDispatch(false, false);
-
-    EXPECT_EQ(dispatchSize, directSubmission.ringCommandStream.getUsed());
+    EXPECT_EQ(submitSize, directSubmission.ringCommandStream.getUsed());
     EXPECT_TRUE(directSubmission.ringStart);
 }
 
 HWTEST_F(DirectSubmissionDispatchBufferTest, givenDirectSubmissionPrintBuffersWhenInitializeAndDispatchBufferThenCommandBufferArePrinted) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionPrintBuffers.set(true);
+    debugManager.flags.DirectSubmissionPrintBuffers.set(true);
 
     FlushStampTracker flushStamp(true);
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
 
-    bool ret = directSubmission.initialize(false, false);
+    bool ret = directSubmission.initialize(false);
     EXPECT_TRUE(ret);
     ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
     EXPECT_TRUE(ret);
 
-    std::string output = testing::internal::GetCapturedStdout();
+    std::string output = capture.getCapturedStdout();
 
     auto pos = output.find("Ring buffer 0");
     EXPECT_TRUE(pos != std::string::npos);
     pos = output.find("Ring buffer 1");
     EXPECT_TRUE(pos != std::string::npos);
     pos = output.find("Client buffer");
+    EXPECT_TRUE(pos != std::string::npos);
+    pos = output.find("Ring buffer for submission");
+    EXPECT_TRUE(pos != std::string::npos);
+}
+
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenDirectSubmissionPrintSemaphoreWhenDispatchingThenPrintAllData) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.DirectSubmissionPrintSemaphoreUsage.set(1);
+    StreamCapture capture;
+
+    {
+        FlushStampTracker flushStamp(true);
+        MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+
+        capture.captureStdout();
+
+        bool ret = directSubmission.initialize(false);
+        EXPECT_TRUE(ret);
+        ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
+        EXPECT_TRUE(ret);
+        directSubmission.unblockGpu();
+    }
+
+    std::string output = capture.getCapturedStdout();
+
+    auto pos = output.find("DirectSubmission semaphore");
+    EXPECT_TRUE(pos != std::string::npos);
+    pos = output.find("unlocked with value:");
+    EXPECT_TRUE(pos != std::string::npos);
+    pos = output.find("programmed with value:");
     EXPECT_TRUE(pos != std::string::npos);
 }
 
@@ -784,7 +828,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
     directSubmission.partitionConfigSet = false;
     directSubmission.workPartitionAllocation = ultCsr->getWorkPartitionAllocation();
 
-    bool ret = directSubmission.initialize(true, false);
+    bool ret = directSubmission.initialize(true);
     EXPECT_TRUE(ret);
     EXPECT_TRUE(directSubmission.partitionConfigSet);
     EXPECT_NE(0x0u, directSubmission.ringCommandStream.getUsed());
@@ -793,11 +837,11 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
                         directSubmission.getSizeSemaphoreSection(false) +
                         sizeof(MI_LOAD_REGISTER_IMM) +
                         sizeof(MI_LOAD_REGISTER_MEM);
-    if (directSubmission.miMemFenceRequired) {
+    if (directSubmission.miMemFenceRequired && !heaplessModeEnabled) {
         submitSize += directSubmission.getSizeSystemMemoryFenceAddress();
     }
 
-    size_t expectedAllocationsCount = 4;
+    size_t expectedAllocationsCount = 5;
 
     if (directSubmission.isRelaxedOrderingEnabled()) {
         expectedAllocationsCount += 2;
@@ -808,8 +852,8 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(1u, directSubmission.handleResidencyCount);
     EXPECT_EQ(expectedAllocationsCount, directSubmission.makeResourcesResidentVectorSize);
 
-    uint32_t expectedOffset = NEO::ImplicitScalingDispatch<FamilyType>::getPostSyncOffset();
-    EXPECT_EQ(expectedOffset, directSubmission.postSyncOffset);
+    uint32_t expectedOffset = NEO::ImplicitScalingDispatch<FamilyType>::getImmediateWritePostSyncOffset();
+    EXPECT_EQ(expectedOffset, directSubmission.immWritePostSyncOffset);
 
     HardwareParse hwParse;
     hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
@@ -855,22 +899,20 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
     directSubmission.partitionConfigSet = false;
     directSubmission.workPartitionAllocation = ultCsr->getWorkPartitionAllocation();
 
-    bool ret = directSubmission.initialize(false, false);
+    bool ret = directSubmission.initialize(false);
     EXPECT_TRUE(ret);
     EXPECT_FALSE(directSubmission.partitionConfigSet);
     EXPECT_FALSE(directSubmission.ringStart);
     EXPECT_EQ(0x0u, directSubmission.ringCommandStream.getUsed());
 
-    ret = directSubmission.startRingBuffer();
-    EXPECT_TRUE(ret);
+    directSubmission.dispatchUllsState();
     EXPECT_TRUE(directSubmission.partitionConfigSet);
-    EXPECT_TRUE(directSubmission.ringStart);
 
     HardwareParse hwParse;
     hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, 0);
     hwParse.findHardwareCommands<FamilyType>();
 
-    uint32_t expectedOffset = NEO::ImplicitScalingDispatch<FamilyType>::getPostSyncOffset();
+    uint32_t expectedOffset = NEO::ImplicitScalingDispatch<FamilyType>::getImmediateWritePostSyncOffset();
 
     ASSERT_NE(hwParse.lriList.end(), hwParse.lriList.begin());
     bool partitionRegisterFound = false;
@@ -891,143 +933,21 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DirectSubmissionDispatchBufferTest,
     EXPECT_EQ(gpuAddress, loadRegisterMem->getMemoryAddress());
 }
 
-HWTEST_F(DirectSubmissionDispatchBufferTest,
-         givenRenderDirectSubmissionUsingNotifyEnabledWhenDispatchWorkloadCalledWithMonitorFenceThenExpectPostSyncOperationWithNotifyFlag) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using POST_SYNC_OPERATION = typename PIPE_CONTROL::POST_SYNC_OPERATION;
-    using Dispatcher = RenderDispatcher<FamilyType>;
-
-    FlushStampTracker flushStamp(true);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.disableMonitorFence = false;
-
-    bool ret = directSubmission.initialize(true, true);
-    EXPECT_TRUE(ret);
-    EXPECT_TRUE(directSubmission.useNotifyForPostSync);
-
-    size_t sizeUsedBefore = directSubmission.ringCommandStream.getUsed();
-    ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
-    EXPECT_TRUE(ret);
-
-    HardwareParse hwParse;
-    hwParse.parsePipeControl = true;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, sizeUsedBefore);
-    hwParse.findHardwareCommands<FamilyType>();
-
-    bool foundFenceUpdate = false;
-    for (auto it = hwParse.pipeControlList.begin(); it != hwParse.pipeControlList.end(); it++) {
-        auto pipeControl = genCmdCast<PIPE_CONTROL *>(*it);
-        if (pipeControl->getPostSyncOperation() == POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA) {
-            foundFenceUpdate = true;
-            EXPECT_TRUE(pipeControl->getNotifyEnable());
-            break;
-        }
-    }
-    EXPECT_TRUE(foundFenceUpdate);
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest,
-         givenBlitterDirectSubmissionUsingNotifyEnabledWhenDispatchWorkloadCalledWithMonitorFenceThenExpectPostSyncOperationWithNotifyFlag) {
-    using MI_FLUSH_DW = typename FamilyType::MI_FLUSH_DW;
-    using Dispatcher = BlitterDispatcher<FamilyType>;
-
-    FlushStampTracker flushStamp(true);
-
-    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.disableMonitorFence = false;
-
-    bool ret = directSubmission.initialize(true, true);
-    EXPECT_TRUE(ret);
-    EXPECT_TRUE(directSubmission.useNotifyForPostSync);
-
-    size_t sizeUsedBefore = directSubmission.ringCommandStream.getUsed();
-    ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
-    EXPECT_TRUE(ret);
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, sizeUsedBefore);
-    hwParse.findHardwareCommands<FamilyType>();
-    auto miFlushList = hwParse.getCommandsList<MI_FLUSH_DW>();
-
-    bool foundFenceUpdate = false;
-    for (auto it = miFlushList.begin(); it != miFlushList.end(); it++) {
-        auto miFlush = genCmdCast<MI_FLUSH_DW *>(*it);
-        if (miFlush->getPostSyncOperation() == MI_FLUSH_DW::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA_QWORD) {
-            foundFenceUpdate = true;
-            EXPECT_TRUE(miFlush->getNotifyEnable());
-            break;
-        }
-    }
-    EXPECT_TRUE(foundFenceUpdate);
-}
-
 HWTEST_F(DirectSubmissionDispatchBufferTest, givenRingBufferRestartRequestWhenDispatchCommandBuffer) {
     FlushStampTracker flushStamp(true);
     MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    bool ret = directSubmission.initialize(true, true);
+    bool ret = directSubmission.initialize(true);
     EXPECT_TRUE(ret);
     EXPECT_EQ(directSubmission.submitCount, 1u);
 
     ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
     EXPECT_TRUE(ret);
     EXPECT_EQ(directSubmission.submitCount, 1u);
-
-    batchBuffer.ringBufferRestartRequest = true;
-    ret = directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
-    EXPECT_TRUE(ret);
-    EXPECT_EQ(directSubmission.submitCount, 2u);
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest, givenDebugFlagSetWhenDispatchingWorkloadThenProgramSfenceInstruction) {
-    DebugManagerStateRestore restorer{};
-
-    using Dispatcher = BlitterDispatcher<FamilyType>;
-
-    FlushStampTracker flushStamp(true);
-
-    for (int32_t debugFlag : {-1, 0, 1, 2}) {
-        DebugManager.flags.DirectSubmissionInsertSfenceInstructionPriorToSubmission.set(debugFlag);
-
-        MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        EXPECT_TRUE(directSubmission.initialize(true, true));
-
-        auto initialCounterValue = CpuIntrinsicsTests::sfenceCounter.load();
-
-        EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
-
-        uint32_t expectedCount = (debugFlag == -1) ? 2 : static_cast<uint32_t>(debugFlag);
-
-        EXPECT_EQ(initialCounterValue + expectedCount, CpuIntrinsicsTests::sfenceCounter);
-    }
-}
-
-HWTEST_F(DirectSubmissionDispatchBufferTest, givenDebugFlagSetWhenStoppingRingbufferThenProgramSfenceInstruction) {
-    DebugManagerStateRestore restorer{};
-
-    using Dispatcher = BlitterDispatcher<FamilyType>;
-
-    FlushStampTracker flushStamp(true);
-
-    for (int32_t debugFlag : {-1, 0, 1, 2}) {
-        DebugManager.flags.DirectSubmissionInsertSfenceInstructionPriorToSubmission.set(debugFlag);
-
-        MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        EXPECT_TRUE(directSubmission.initialize(true, true));
-
-        auto initialCounterValue = CpuIntrinsicsTests::sfenceCounter.load();
-
-        EXPECT_TRUE(directSubmission.stopRingBuffer());
-
-        uint32_t expectedCount = (debugFlag == -1) ? 2 : static_cast<uint32_t>(debugFlag);
-
-        EXPECT_EQ(initialCounterValue + expectedCount, CpuIntrinsicsTests::sfenceCounter);
-    }
 }
 
 struct DirectSubmissionRelaxedOrderingTests : public DirectSubmissionDispatchBufferTest {
     void SetUp() override {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
         DirectSubmissionDispatchBufferTest::SetUp();
     }
 
@@ -1061,7 +981,6 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
     using MI_MATH_ALU_INST_INLINE = typename FamilyType::MI_MATH_ALU_INST_INLINE;
     using MI_ARB_CHECK = typename FamilyType::MI_ARB_CHECK;
     using MI_MATH = typename FamilyType::MI_MATH;
-    using XY_COLOR_BLT = typename FamilyType::XY_COLOR_BLT;
 
     uint64_t schedulerStartGpuAddress = schedulerAllocation.getGpuAddress();
     void *schedulerCmds = schedulerAllocation.getUnderlyingBuffer();
@@ -1071,74 +990,74 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
     // 1. Init section
     auto miPredicate = reinterpret_cast<MI_SET_PREDICATE *>(schedulerCmds);
 
-    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::Disable)) {
+    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::disable)) {
         return false;
     }
 
     auto lrrCmd = reinterpret_cast<MI_LOAD_REGISTER_REG *>(++miPredicate);
 
-    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(lrrCmd, CS_GPR_R0, CS_GPR_R9)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(lrrCmd, RegisterOffsets::csGprR0, RegisterOffsets::csGprR9)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(++lrrCmd, CS_GPR_R0 + 4, CS_GPR_R9 + 4)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(++lrrCmd, RegisterOffsets::csGprR0 + 4, RegisterOffsets::csGprR9 + 4)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(++lrrCmd, 0, CS_GPR_R1, 0, CompareOperation::Equal, true)) {
+    if (!RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(++lrrCmd, 0, RegisterOffsets::csGprR1, 0, CompareOperation::equal, true)) {
         return false;
     }
 
-    auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(lrrCmd, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart()));
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R2, 0)) {
+    auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(lrrCmd, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false)));
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR2, 0)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R2 + 4, 0)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR2 + 4, 0)) {
         return false;
     }
 
     uint64_t removeTaskVa = schedulerStartGpuAddress + RelaxedOrderingHelper::StaticSchedulerSizeAndOffsetSection<FamilyType>::removeTaskSectionStart;
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R3, static_cast<uint32_t>(removeTaskVa & 0xFFFF'FFFFULL))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR3, static_cast<uint32_t>(removeTaskVa & 0xFFFF'FFFFULL))) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R3 + 4, static_cast<uint32_t>(removeTaskVa >> 32))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR3 + 4, static_cast<uint32_t>(removeTaskVa >> 32))) {
         return false;
     }
 
     uint64_t walkersLoopConditionCheckVa = schedulerStartGpuAddress + RelaxedOrderingHelper::StaticSchedulerSizeAndOffsetSection<FamilyType>::tasksListLoopCheckSectionStart;
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R4, static_cast<uint32_t>(walkersLoopConditionCheckVa & 0xFFFF'FFFFULL))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR4, static_cast<uint32_t>(walkersLoopConditionCheckVa & 0xFFFF'FFFFULL))) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R4 + 4, static_cast<uint32_t>(walkersLoopConditionCheckVa >> 32))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR4 + 4, static_cast<uint32_t>(walkersLoopConditionCheckVa >> 32))) {
         return false;
     }
 
     // 2. Dispatch task section (loop start)
     miPredicate = reinterpret_cast<MI_SET_PREDICATE *>(++lriCmd);
 
-    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::Disable)) {
+    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::disable)) {
         return false;
     }
 
     lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(++miPredicate);
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R6, 8)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR6, 8)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R6 + 4, 0)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR6 + 4, 0)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R8, static_cast<uint32_t>(deferredTaskListVa & 0xFFFF'FFFFULL))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR8, static_cast<uint32_t>(deferredTaskListVa & 0xFFFF'FFFFULL))) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R8 + 4, static_cast<uint32_t>(deferredTaskListVa >> 32))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR8 + 4, static_cast<uint32_t>(deferredTaskListVa >> 32))) {
         return false;
     }
 
@@ -1154,43 +1073,43 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
     }
 
     auto miAluCmd = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(++miMathCmd);
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_2)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr2)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_6)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr6)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_SHL, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeShl, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STORE, AluRegisters::R_7, AluRegisters::R_ACCU)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStore, AluRegisters::gpr7, AluRegisters::accu)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_7)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr7)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_8)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr8)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_ADD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeAdd, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STORE, AluRegisters::R_6, AluRegisters::R_ACCU)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStore, AluRegisters::gpr6, AluRegisters::accu)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOADIND, AluRegisters::R_0, AluRegisters::R_ACCU)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoadind, AluRegisters::gpr0, AluRegisters::accu)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_FENCE_RD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeFenceRd, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
@@ -1201,49 +1120,49 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
 
     // 3. Remove task section
     miPredicate = reinterpret_cast<MI_SET_PREDICATE *>(++bbStart);
-    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::Disable)) {
+    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::disable)) {
         return false;
     }
 
     miPredicate++;
-    if (!RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(miPredicate, AluRegisters::R_1, false)) {
+    if (!RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(miPredicate, AluRegisters::gpr1, false)) {
         return false;
     }
 
     auto cmds = ptrOffset(miPredicate, EncodeMathMMIO<FamilyType>::getCmdSizeForIncrementOrDecrement());
 
-    if (!RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(cmds, AluRegisters::R_2, false)) {
+    if (!RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(cmds, AluRegisters::gpr2, false)) {
         return false;
     }
 
     lrrCmd = reinterpret_cast<MI_LOAD_REGISTER_REG *>(ptrOffset(cmds, EncodeMathMMIO<FamilyType>::getCmdSizeForIncrementOrDecrement()));
 
-    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(lrrCmd, CS_GPR_R0, CS_GPR_R9)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(lrrCmd, RegisterOffsets::csGprR0, RegisterOffsets::csGprR9)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(++lrrCmd, CS_GPR_R0 + 4, CS_GPR_R9 + 4)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLrr<FamilyType>(++lrrCmd, RegisterOffsets::csGprR0 + 4, RegisterOffsets::csGprR9 + 4)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(++lrrCmd, 0, CS_GPR_R1, 0, CompareOperation::Equal, true)) {
+    if (!RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(++lrrCmd, 0, RegisterOffsets::csGprR1, 0, CompareOperation::equal, true)) {
         return false;
     }
 
-    lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(lrrCmd, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart()));
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R7, 8)) {
+    lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(lrrCmd, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false)));
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR7, 8)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R7 + 4, 0)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR7 + 4, 0)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R8, static_cast<uint32_t>(deferredTaskListVa & 0xFFFF'FFFFULL))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR8, static_cast<uint32_t>(deferredTaskListVa & 0xFFFF'FFFFULL))) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R8 + 4, static_cast<uint32_t>(deferredTaskListVa >> 32))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR8 + 4, static_cast<uint32_t>(deferredTaskListVa >> 32))) {
         return false;
     }
 
@@ -1259,88 +1178,88 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
     }
 
     miAluCmd = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(++miMathCmd);
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_1)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr1)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_7)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr7)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_SHL, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeShl, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STORE, AluRegisters::R_7, AluRegisters::R_ACCU)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStore, AluRegisters::gpr7, AluRegisters::accu)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_7)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr7)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_8)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr8)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_ADD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeAdd, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOADIND, AluRegisters::R_7, AluRegisters::R_ACCU)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoadind, AluRegisters::gpr7, AluRegisters::accu)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_FENCE_RD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeFenceRd, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_6)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr6)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD0, AluRegisters::R_SRCB, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad0, AluRegisters::srcb, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_ADD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeAdd, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STOREIND, AluRegisters::R_ACCU, AluRegisters::R_7)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStoreind, AluRegisters::accu, AluRegisters::gpr7)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_FENCE_WR, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeFenceWr, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
     // 4. List loop check section
 
     miPredicate = reinterpret_cast<MI_SET_PREDICATE *>(++miAluCmd);
-    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::Disable)) {
+    if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::disable)) {
         return false;
     }
 
     miPredicate++;
-    if (!RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(miPredicate, AluRegisters::R_2, true)) {
+    if (!RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(miPredicate, AluRegisters::gpr2, true)) {
         return false;
     }
 
     cmds = ptrOffset(miPredicate, EncodeMathMMIO<FamilyType>::getCmdSizeForIncrementOrDecrement());
 
     if (!RelaxedOrderingCommandsHelper::verifyConditionalRegRegBbStart<FamilyType>(cmds, schedulerStartGpuAddress + RelaxedOrderingHelper::StaticSchedulerSizeAndOffsetSection<FamilyType>::loopStartSectionStart,
-                                                                                   AluRegisters::R_1, AluRegisters::R_2, CompareOperation::NotEqual, false)) {
+                                                                                   AluRegisters::gpr1, AluRegisters::gpr2, CompareOperation::notEqual, false)) {
         return false;
     }
 
     lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(cmds, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalRegRegBatchBufferStart()));
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R2, 0)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR2, 0)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R2 + 4, 0)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR2 + 4, 0)) {
         return false;
     }
 
@@ -1352,25 +1271,25 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
     }
 
     if (!RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(++arbCheck, schedulerStartGpuAddress + RelaxedOrderingHelper::StaticSchedulerSizeAndOffsetSection<FamilyType>::loopStartSectionStart,
-                                                                                    CS_GPR_R1, expectedQueueSizeLimit, CompareOperation::GreaterOrEqual, false)) {
+                                                                                    RegisterOffsets::csGprR1, expectedQueueSizeLimit, CompareOperation::greaterOrEqual, false)) {
         return false;
     }
 
-    auto conditionalBbStartcmds = ptrOffset(arbCheck, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart());
+    auto conditionalBbStartcmds = ptrOffset(arbCheck, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false));
 
     if (!RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(conditionalBbStartcmds, schedulerStartGpuAddress + RelaxedOrderingHelper::StaticSchedulerSizeAndOffsetSection<FamilyType>::loopStartSectionStart,
-                                                                                    CS_GPR_R5, 1, CompareOperation::Equal, false)) {
+                                                                                    RegisterOffsets::csGprR5, 1, CompareOperation::equal, false)) {
         return false;
     }
 
     // 6. Scheduler loop check section
-    lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(conditionalBbStartcmds, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart()));
+    lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(conditionalBbStartcmds, EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false)));
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R10, static_cast<uint32_t>(RelaxedOrderingHelper::DynamicSchedulerSizeAndOffsetSection<FamilyType>::semaphoreSectionSize))) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR10, static_cast<uint32_t>(RelaxedOrderingHelper::DynamicSchedulerSizeAndOffsetSection<FamilyType>::getSemaphoreSectionSize()))) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R10 + 4, 0)) {
+    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR10 + 4, 0)) {
         return false;
     }
 
@@ -1386,23 +1305,23 @@ bool DirectSubmissionRelaxedOrderingTests::verifyStaticSchedulerProgramming(Grap
     }
 
     miAluCmd = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(++miMathCmd);
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_9)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr9)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_10)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr10)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_ADD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeAdd, AluRegisters::opcodeNone, AluRegisters::opcodeNone)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STORE, AluRegisters::R_0, AluRegisters::R_ACCU)) {
+    if (!RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStore, AluRegisters::gpr0, AluRegisters::accu)) {
         return false;
     }
 
-    if (!RelaxedOrderingCommandsHelper::verifyConditionalRegMemBbStart<FamilyType>(++miAluCmd, 0, semaphoreGpuVa, CS_GPR_R11, CompareOperation::GreaterOrEqual, true)) {
+    if (!RelaxedOrderingCommandsHelper::verifyConditionalRegMemBbStart<FamilyType>(++miAluCmd, 0, semaphoreGpuVa, RegisterOffsets::csGprR11, CompareOperation::greaterOrEqual, true)) {
         return false;
     }
 
@@ -1424,8 +1343,6 @@ bool DirectSubmissionRelaxedOrderingTests::verifyDynamicSchedulerProgramming(Lin
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     using MI_SET_PREDICATE = typename FamilyType::MI_SET_PREDICATE;
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-    using MI_MATH_ALU_INST_INLINE = typename FamilyType::MI_MATH_ALU_INST_INLINE;
-    using MI_MATH = typename FamilyType::MI_MATH;
 
     HardwareParse hwParse;
     hwParse.parseCommands<FamilyType>(cs, offset);
@@ -1441,15 +1358,15 @@ bool DirectSubmissionRelaxedOrderingTests::verifyDynamicSchedulerProgramming(Lin
 
             uint64_t semaphoreSectionVa = schedulerStartAddress + RelaxedOrderingHelper::DynamicSchedulerSizeAndOffsetSection<FamilyType>::semaphoreSectionStart;
 
-            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R11, semaphoreValue)) {
+            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR11, semaphoreValue)) {
                 continue;
             }
 
-            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R9, static_cast<uint32_t>(semaphoreSectionVa & 0xFFFF'FFFFULL))) {
+            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR9, static_cast<uint32_t>(semaphoreSectionVa & 0xFFFF'FFFFULL))) {
                 continue;
             }
 
-            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R9 + 4, static_cast<uint32_t>(semaphoreSectionVa >> 32))) {
+            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR9 + 4, static_cast<uint32_t>(semaphoreSectionVa >> 32))) {
                 continue;
             }
 
@@ -1460,13 +1377,13 @@ bool DirectSubmissionRelaxedOrderingTests::verifyDynamicSchedulerProgramming(Lin
 
             // 2. Semaphore section
             auto miPredicate = reinterpret_cast<MI_SET_PREDICATE *>(++bbStart);
-            if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::Disable)) {
+            if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::disable)) {
                 continue;
             }
 
             auto semaphore = reinterpret_cast<MI_SEMAPHORE_WAIT *>(++miPredicate);
-            if ((semaphore->getSemaphoreGraphicsAddress() != semaphoreGpuVa) ||
-                (semaphore->getSemaphoreDataDword() != semaphoreValue) ||
+            if ((NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphore) != semaphoreGpuVa) ||
+                (NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphore) != semaphoreValue) ||
                 (semaphore->getCompareOperation() != MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_GREATER_THAN_OR_EQUAL_SDD)) {
                 continue;
             }
@@ -1474,12 +1391,12 @@ bool DirectSubmissionRelaxedOrderingTests::verifyDynamicSchedulerProgramming(Lin
             // 3. End section
 
             miPredicate = reinterpret_cast<MI_SET_PREDICATE *>(++semaphore);
-            if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::Disable)) {
+            if (!RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(miPredicate, MiPredicateType::disable)) {
                 continue;
             }
 
             lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(++miPredicate);
-            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R5, 0)) {
+            if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR5, 0)) {
                 continue;
             }
             lriCmd++;
@@ -1504,17 +1421,17 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenAllocatingResourcesThenCreate
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
     directSubmission.callBaseResident = true;
 
-    directSubmission.initialize(false, false);
+    directSubmission.initialize(false);
 
     auto allocsIter = mockMemoryOperations->gfxAllocationsForMakeResident.rbegin();
 
-    EXPECT_EQ(AllocationType::COMMAND_BUFFER, directSubmission.relaxedOrderingSchedulerAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::commandBuffer, directSubmission.relaxedOrderingSchedulerAllocation->getAllocationType());
     EXPECT_NE(nullptr, directSubmission.relaxedOrderingSchedulerAllocation);
     EXPECT_EQ(directSubmission.relaxedOrderingSchedulerAllocation, *allocsIter);
 
     allocsIter++;
 
-    EXPECT_EQ(AllocationType::DEFERRED_TASKS_LIST, directSubmission.deferredTasksListAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::deferredTasksList, directSubmission.deferredTasksListAllocation->getAllocationType());
     EXPECT_NE(nullptr, directSubmission.deferredTasksListAllocation);
     EXPECT_EQ(directSubmission.deferredTasksListAllocation, *allocsIter);
 }
@@ -1522,15 +1439,15 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenAllocatingResourcesThenCreate
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenDispatchingStaticSchedulerThenOverrideQueueSizeLimit, IsAtLeastXeHpcCore) {
     using Dispatcher = RenderDispatcher<FamilyType>;
 
-    DebugManager.flags.DirectSubmissionRelaxedOrderingQueueSizeLimit.set(123);
+    debugManager.flags.DirectSubmissionRelaxedOrderingQueueSizeLimit.set(123);
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
 
     EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
     EXPECT_TRUE(verifyStaticSchedulerProgramming<FamilyType>(*directSubmission.relaxedOrderingSchedulerAllocation,
                                                              directSubmission.deferredTasksListAllocation->getGpuAddress(), directSubmission.semaphoreGpuVa, 123,
-                                                             pDevice->getRootDeviceEnvironment().getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER)));
+                                                             pDevice->getRootDeviceEnvironment().getGmmHelper()->getL3EnabledMOCS()));
 }
 
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenNewNumberOfClientsWhenDispatchingWorkThenIncraseQueueSize, IsAtLeastXeHpcCore) {
@@ -1538,17 +1455,17 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenNewNumberOfClientsWhenDispa
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
 
     EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
     EXPECT_EQ(RelaxedOrderingHelper::queueSizeMultiplier, directSubmission.currentRelaxedOrderingQueueSize);
     EXPECT_TRUE(verifyStaticSchedulerProgramming<FamilyType>(*directSubmission.relaxedOrderingSchedulerAllocation,
                                                              directSubmission.deferredTasksListAllocation->getGpuAddress(), directSubmission.semaphoreGpuVa, RelaxedOrderingHelper::queueSizeMultiplier,
-                                                             pDevice->getRootDeviceEnvironment().getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER)));
+                                                             pDevice->getRootDeviceEnvironment().getGmmHelper()->getL3EnabledMOCS()));
 
     const uint64_t expectedQueueSizeValueVa = directSubmission.relaxedOrderingSchedulerAllocation->getGpuAddress() +
                                               RelaxedOrderingHelper::StaticSchedulerSizeAndOffsetSection<FamilyType>::drainRequestSectionStart +
-                                              EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{}) +
+                                              EncodeMiArbCheck<FamilyType>::getCommandSize() +
                                               RelaxedOrderingHelper::getQueueSizeLimitValueOffset<FamilyType>();
 
     auto findStaticSchedulerUpdate = [&](LinearStream &cs, size_t offset, uint32_t expectedQueueSize) {
@@ -1596,6 +1513,15 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenNewNumberOfClientsWhenDispa
     EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
     EXPECT_EQ(RelaxedOrderingHelper::queueSizeMultiplier * batchBuffer.numCsrClients, directSubmission.currentRelaxedOrderingQueueSize);
     EXPECT_TRUE(findStaticSchedulerUpdate(directSubmission.ringCommandStream, offset, RelaxedOrderingHelper::queueSizeMultiplier * batchBuffer.numCsrClients));
+
+    offset = directSubmission.ringCommandStream.getUsed();
+    batchBuffer.numCsrClients = 5;
+    directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
+
+    EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
+    EXPECT_TRUE((RelaxedOrderingHelper::queueSizeMultiplier * batchBuffer.numCsrClients) > RelaxedOrderingHelper::maxQueueSize);
+    EXPECT_EQ(RelaxedOrderingHelper::maxQueueSize, directSubmission.currentRelaxedOrderingQueueSize);
+    EXPECT_FALSE(findStaticSchedulerUpdate(directSubmission.ringCommandStream, offset, RelaxedOrderingHelper::queueSizeMultiplier * batchBuffer.numCsrClients));
 }
 
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenDispatchStaticScheduler, IsAtLeastXeHpcCore) {
@@ -1603,31 +1529,28 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenDispatchStat
 
     {
         MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(false, false);
+        directSubmission.initialize(false);
 
         EXPECT_EQ(0u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
     }
 
     {
         MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
         EXPECT_TRUE(verifyStaticSchedulerProgramming<FamilyType>(*directSubmission.relaxedOrderingSchedulerAllocation,
                                                                  directSubmission.deferredTasksListAllocation->getGpuAddress(), directSubmission.semaphoreGpuVa, RelaxedOrderingHelper::queueSizeMultiplier,
-                                                                 pDevice->getRootDeviceEnvironment().getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER)));
+                                                                 pDevice->getRootDeviceEnvironment().getGmmHelper()->getL3EnabledMOCS()));
     }
 
     {
         MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(false, false);
+        directSubmission.initialize(false);
         EXPECT_EQ(0u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
 
-        directSubmission.startRingBuffer();
+        directSubmission.dispatchUllsState();
 
-        EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
-
-        directSubmission.startRingBuffer();
         EXPECT_EQ(1u, directSubmission.dispatchStaticRelaxedOrderingSchedulerCalled);
 
         directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
@@ -1648,21 +1571,21 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenPreinitialize
 
         for (auto &it : hwParse.cmdList) {
             if (auto lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(it)) {
-                if (CS_GPR_R1 == lriCmd->getRegisterOffset()) {
+                if (RegisterOffsets::csGprR1 == lriCmd->getRegisterOffset()) {
                     EXPECT_EQ(0u, lriCmd->getDataDword());
 
                     lriCmd++;
-                    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R1 + 4, 0)) {
+                    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR1 + 4, 0)) {
                         continue;
                     }
 
                     lriCmd++;
-                    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R5, 0)) {
+                    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR5, 0)) {
                         continue;
                     }
 
                     lriCmd++;
-                    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R5 + 4, 0)) {
+                    if (!RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR5 + 4, 0)) {
                         continue;
                     }
 
@@ -1677,7 +1600,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenPreinitialize
 
     {
         MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(false, false);
+        directSubmission.initialize(false);
         EXPECT_FALSE(verifyInitRegisters(directSubmission.ringCommandStream, 0));
 
         EXPECT_EQ(0u, directSubmission.preinitializeRelaxedOrderingSectionsCalled);
@@ -1688,7 +1611,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenPreinitialize
 
     {
         MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
         EXPECT_TRUE(verifyInitRegisters(directSubmission.ringCommandStream, 0));
 
         EXPECT_EQ(1u, directSubmission.preinitializeRelaxedOrderingSectionsCalled);
@@ -1698,7 +1621,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenPreinitialize
 
         size_t offset = directSubmission.ringCommandStream.getUsed();
 
-        directSubmission.startRingBuffer();
+        directSubmission.dispatchUllsState();
         EXPECT_FALSE(verifyInitRegisters(directSubmission.ringCommandStream, offset));
 
         EXPECT_EQ(1u, directSubmission.preinitializeRelaxedOrderingSectionsCalled);
@@ -1706,10 +1629,10 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenPreinitialize
 
     {
         MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(false, false);
+        directSubmission.initialize(false);
         EXPECT_EQ(0u, directSubmission.preinitializeRelaxedOrderingSectionsCalled);
 
-        directSubmission.startRingBuffer();
+        directSubmission.dispatchUllsState();
 
         EXPECT_EQ(1u, directSubmission.preinitializeRelaxedOrderingSectionsCalled);
         EXPECT_TRUE(directSubmission.relaxedOrderingInitialized);
@@ -1717,7 +1640,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenInitializingThenPreinitialize
         EXPECT_NE(nullptr, directSubmission.preinitializedRelaxedOrderingScheduler.get());
 
         size_t offset = directSubmission.ringCommandStream.getUsed();
-        directSubmission.startRingBuffer();
+        directSubmission.dispatchUllsState();
         EXPECT_FALSE(verifyInitRegisters(directSubmission.ringCommandStream, offset));
         EXPECT_EQ(1u, directSubmission.preinitializeRelaxedOrderingSectionsCalled);
     }
@@ -1731,7 +1654,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenDispatchingWorkThenDispatchTa
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     auto offset = directSubmission.ringCommandStream.getUsed() + directSubmission.getSizeStartSection() + RelaxedOrderingHelper::getSizeReturnPtrRegs<FamilyType>();
 
     batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -1740,7 +1663,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenDispatchingWorkThenDispatchTa
     auto taskStoreSection = ptrOffset(directSubmission.ringCommandStream.getCpuBase(), offset);
 
     if constexpr (FamilyType::isUsingMiSetPredicate) {
-        EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(taskStoreSection, MiPredicateType::Disable));
+        EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyMiPredicate<FamilyType>(taskStoreSection, MiPredicateType::disable));
 
         taskStoreSection = ptrOffset(taskStoreSection, sizeof(typename FamilyType::MI_SET_PREDICATE));
     }
@@ -1749,63 +1672,63 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, whenDispatchingWorkThenDispatchTa
 
     auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(taskStoreSection);
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R6, static_cast<uint32_t>(deferredTasksVa & 0xFFFF'FFFFULL)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR6, static_cast<uint32_t>(deferredTasksVa & 0xFFFF'FFFFULL)));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R6 + 4, static_cast<uint32_t>(deferredTasksVa >> 32)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR6 + 4, static_cast<uint32_t>(deferredTasksVa >> 32)));
 
     EXPECT_NE(0u, batchBuffer.taskStartAddress);
 
     uint32_t taskStartAddressLow = static_cast<uint32_t>(batchBuffer.taskStartAddress & 0xFFFF'FFFFULL);
     EXPECT_NE(0u, taskStartAddressLow);
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R7, taskStartAddressLow));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR7, taskStartAddressLow));
 
     uint32_t taskStartHigh = static_cast<uint32_t>(batchBuffer.taskStartAddress >> 32);
     EXPECT_NE(0u, taskStartHigh);
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R7 + 4, taskStartHigh));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR7 + 4, taskStartHigh));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R8, 8));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR8, 8));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R8 + 4, 0));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR8 + 4, 0));
 
     auto miMathCmd = reinterpret_cast<MI_MATH *>(++lriCmd);
     EXPECT_EQ(8u, miMathCmd->DW0.BitField.DwordLength);
 
     if constexpr (FamilyType::isUsingMiMathMocs) {
-        EXPECT_EQ(miMathCmd->DW0.BitField.MemoryObjectControlState, pDevice->getRootDeviceEnvironment().getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER));
+        EXPECT_EQ(miMathCmd->DW0.BitField.MemoryObjectControlState, pDevice->getRootDeviceEnvironment().getGmmHelper()->getL3EnabledMOCS());
     }
 
     auto miAluCmd = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(++miMathCmd);
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_1));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr1));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_8));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr8));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_SHL, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeShl, AluRegisters::opcodeNone, AluRegisters::opcodeNone));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STORE, AluRegisters::R_8, AluRegisters::R_ACCU));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStore, AluRegisters::gpr8, AluRegisters::accu));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCA, AluRegisters::R_8));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srca, AluRegisters::gpr8));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_LOAD, AluRegisters::R_SRCB, AluRegisters::R_6));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeLoad, AluRegisters::srcb, AluRegisters::gpr6));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_ADD, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeAdd, AluRegisters::opcodeNone, AluRegisters::opcodeNone));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_STOREIND, AluRegisters::R_ACCU, AluRegisters::R_7));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeStoreind, AluRegisters::accu, AluRegisters::gpr7));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::OPCODE_FENCE_WR, AluRegisters::OPCODE_NONE, AluRegisters::OPCODE_NONE));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyAlu<FamilyType>(++miAluCmd, AluRegisters::opcodeFenceWr, AluRegisters::opcodeNone, AluRegisters::opcodeNone));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(++miAluCmd, AluRegisters::R_1, true));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyIncrementOrDecrement<FamilyType>(++miAluCmd, AluRegisters::gpr1, true));
 }
 
 HWTEST_F(DirectSubmissionRelaxedOrderingTests, givenNotEnoughSpaceForTaskStoreSectionWhenDispatchingThenSwitchRingBuffers) {
     using Dispatcher = RenderDispatcher<FamilyType>;
-
+    pDevice->getRootDeviceEnvironmentRef().memoryOperationsInterface.reset(new MockMemoryOperations{});
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     directSubmission.ringCommandStream.getUsed();
 
     auto sizeToConsume = directSubmission.ringCommandStream.getAvailableSpace() -
-                         (directSubmission.getSizeDispatch(false, false) + directSubmission.getSizeEnd(false) + directSubmission.getSizeSwitchRingBufferSection());
+                         (directSubmission.getSizeDispatch(false, false, directSubmission.dispatchMonitorFenceRequired(false)) + directSubmission.getSizeEnd(false) + directSubmission.getSizeSwitchRingBufferSection());
 
     directSubmission.ringCommandStream.getSpace(sizeToConsume);
 
@@ -1821,7 +1744,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenDispatchingWorkThenDispatchS
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     auto offset = directSubmission.ringCommandStream.getUsed();
 
     uint64_t staticSchedulerGpuAddress = directSubmission.relaxedOrderingSchedulerAllocation->getGpuAddress();
@@ -1850,7 +1773,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsWhenDispa
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     size_t offset = directSubmission.ringCommandStream.getUsed();
 
     uint64_t staticSchedulerGpuAddress = directSubmission.relaxedOrderingSchedulerAllocation->getGpuAddress();
@@ -1874,13 +1797,13 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsWhenDispa
 
     auto startAddress = ptrOffset(directSubmission.ringCommandStream.getCpuBase(), offset);
     auto jumpOffset = directSubmission.getSizeSemaphoreSection(true) + sizeof(typename FamilyType::MI_LOAD_REGISTER_IMM) +
-                      EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart();
+                      EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false);
     uint64_t expectedJumpAddress = directSubmission.ringCommandStream.getGpuBase() + offset + jumpOffset;
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(startAddress, expectedJumpAddress, CS_GPR_R1, 0, CompareOperation::Equal, false));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(startAddress, expectedJumpAddress, RegisterOffsets::csGprR1, 0, CompareOperation::equal, false));
 
     HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, offset + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart());
+    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, offset + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false));
     hwParse.findHardwareCommands<FamilyType>();
 
     bool success = false;
@@ -1889,7 +1812,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsWhenDispa
     for (auto &it : hwParse.cmdList) {
         lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(it);
         if (lriCmd) {
-            if (CS_GPR_R5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
+            if (RegisterOffsets::csGprR5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
                 success = true;
                 break;
             }
@@ -1912,7 +1835,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenFirstBbWithStallingCmdsWhen
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     size_t offset = directSubmission.ringCommandStream.getUsed();
 
     uint64_t staticSchedulerGpuAddress = directSubmission.relaxedOrderingSchedulerAllocation->getGpuAddress();
@@ -1935,7 +1858,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenFirstBbWithStallingCmdsWhen
     for (auto &it : hwParse.cmdList) {
         lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(it);
         if (lriCmd) {
-            if (CS_GPR_R5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
+            if (RegisterOffsets::csGprR5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
                 success = true;
                 break;
             }
@@ -1952,7 +1875,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenStoppingRingThenProgramSched
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     size_t offset = directSubmission.ringCommandStream.getUsed();
 
     uint64_t staticSchedulerGpuAddress = directSubmission.relaxedOrderingSchedulerAllocation->getGpuAddress();
@@ -1971,17 +1894,17 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenStoppingRingThenProgramSched
 
     offset = directSubmission.ringCommandStream.getUsed();
 
-    directSubmission.stopRingBuffer();
+    directSubmission.stopRingBuffer(false);
 
     auto startAddress = ptrOffset(directSubmission.ringCommandStream.getCpuBase(), offset);
     auto jumpOffset = directSubmission.getSizeSemaphoreSection(true) + sizeof(typename FamilyType::MI_LOAD_REGISTER_IMM) +
-                      EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart();
+                      EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false);
     uint64_t expectedJumpAddress = directSubmission.ringCommandStream.getGpuBase() + offset + jumpOffset;
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(startAddress, expectedJumpAddress, CS_GPR_R1, 0, CompareOperation::Equal, false));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyConditionalDataRegBbStart<FamilyType>(startAddress, expectedJumpAddress, RegisterOffsets::csGprR1, 0, CompareOperation::equal, false));
 
     HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, offset + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart());
+    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, offset + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataRegBatchBufferStart(false));
     hwParse.findHardwareCommands<FamilyType>();
 
     bool success = false;
@@ -1990,7 +1913,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenStoppingRingThenProgramSched
     for (auto &it : hwParse.cmdList) {
         lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(it);
         if (lriCmd) {
-            if (CS_GPR_R5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
+            if (RegisterOffsets::csGprR5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
                 success = true;
                 break;
             }
@@ -2013,7 +1936,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, WhenStoppingRingWithoutSubmissio
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
     size_t offset = directSubmission.ringCommandStream.getUsed();
 
     uint64_t staticSchedulerGpuAddress = directSubmission.relaxedOrderingSchedulerAllocation->getGpuAddress();
@@ -2023,7 +1946,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, WhenStoppingRingWithoutSubmissio
 
     EXPECT_FALSE(verifyDynamicSchedulerProgramming<FamilyType>(directSubmission.ringCommandStream, staticSchedulerGpuAddress, semaphoreGpuVa, directSubmission.currentQueueWorkCount, 0, endOffset));
 
-    directSubmission.stopRingBuffer();
+    directSubmission.stopRingBuffer(false);
 
     HardwareParse hwParse;
     hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, offset);
@@ -2035,7 +1958,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, WhenStoppingRingWithoutSubmissio
     for (auto &it : hwParse.cmdList) {
         lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(it);
         if (lriCmd) {
-            if (CS_GPR_R5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
+            if (RegisterOffsets::csGprR5 == lriCmd->getRegisterOffset() && lriCmd->getDataDword() == 1) {
                 success = true;
                 break;
             }
@@ -2051,14 +1974,14 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenAskingForRel
     auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(-1);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(-1);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
         EXPECT_EQ(gfxCoreHelper.isRelaxedOrderingSupported(), directSubmission.isRelaxedOrderingEnabled());
     }
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(0);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(0);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
 
@@ -2066,7 +1989,7 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenAskingForRel
     }
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
 
@@ -2074,17 +1997,51 @@ HWTEST_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenAskingForRel
     }
 }
 
+HWTEST_F(DirectSubmissionRelaxedOrderingTests, givenSimulationCsrWhenAskingForRelaxedOrderingSupportThenDisabledByDefaultAndDebugFlagIsRespected) {
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
+    ultCsr->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+
+    {
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(-1);
+
+        MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*ultCsr);
+        EXPECT_FALSE(directSubmission.isRelaxedOrderingEnabled());
+    }
+
+    {
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+
+        MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*ultCsr);
+        EXPECT_TRUE(directSubmission.isRelaxedOrderingEnabled());
+    }
+
+    ultCsr->commandStreamReceiverType = CommandStreamReceiverType::hardware;
+}
+
+HWTEST_F(DirectSubmissionRelaxedOrderingTests, givenSoftwareTagCountersEnabledWhenAskingForRelaxedOrderingSupportThenDisable) {
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
+
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+    debugManager.flags.EnableSWTags.set(true);
+    debugManager.flags.EnableExtendedSoftwareTags.set(true);
+
+    // Counters are written to CS_GPR R10/R11, which the relaxed ordering scheduler owns.
+    MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
+
+    EXPECT_FALSE(directSubmission.isRelaxedOrderingEnabled());
+}
+
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenCreatingBcsDispatcherThenEnableRelaxedOrdering, IsAtLeastXeHpcCore) {
     std::unique_ptr<OsContext> osContext(OsContext::create(pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), pDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, pDevice->getDeviceBitfield())));
 
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
     ultCsr->setupContext(*osContext);
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(0);
-        DebugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(0);
+        debugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(1);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
 
@@ -2092,8 +2049,8 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenCreatingBcs
     }
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
-        DebugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(-1);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(-1);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
 
@@ -2101,8 +2058,8 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenCreatingBcs
     }
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
-        DebugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(0);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(0);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
 
@@ -2110,8 +2067,8 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenDebugFlagSetWhenCreatingBcs
     }
 
     {
-        DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
-        DebugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+        debugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(1);
 
         MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>> directSubmission(*ultCsr);
 
@@ -2123,15 +2080,15 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBcsRelaxedOrderingEnabledWh
     using MI_LOAD_REGISTER_REG = typename FamilyType::MI_LOAD_REGISTER_REG;
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
 
-    DebugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(1);
+    debugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(1);
 
     std::unique_ptr<OsContext> osContext(OsContext::create(pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), pDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, pDevice->getDeviceBitfield())));
 
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
     ultCsr->setupContext(*osContext);
-    ultCsr->blitterDirectSubmissionAvailable = true;
+    VariableBackup<bool> blitterDirectSubmissionAvailable{&ultCsr->blitterDirectSubmissionAvailable, true};
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>>(*ultCsr);
     ultCsr->blitterDirectSubmission.reset(directSubmission);
@@ -2140,15 +2097,20 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBcsRelaxedOrderingEnabledWh
 
     auto endingPtr = commandStream.getSpace(0);
 
-    ultCsr->programEndingCmd(commandStream, &endingPtr, true, true, false);
+    ultCsr->programEndingCmd(commandStream, &endingPtr, true, true, true);
 
-    auto lrrCmd = reinterpret_cast<MI_LOAD_REGISTER_REG *>(commandStream.getCpuBase());
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R3);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_GPR_R0);
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(commandStream, 0);
+    hwParser.findHardwareCommands<FamilyType>();
+    auto lrrCmdIt = find<MI_LOAD_REGISTER_REG *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+    auto lrrCmd = genCmdCast<MI_LOAD_REGISTER_REG *>(*lrrCmdIt);
+
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR3);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR0);
 
     lrrCmd++;
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R3 + 4);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_GPR_R0 + 4);
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR3 + 4);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR0 + 4);
 
     auto bbStartCmd = reinterpret_cast<MI_BATCH_BUFFER_START *>(++lrrCmd);
     EXPECT_EQ(1u, bbStartCmd->getIndirectAddressEnable());
@@ -2157,10 +2119,10 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBcsRelaxedOrderingEnabledWh
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBcsRelaxedOrderingDisabledWhenProgrammingEndingCommandsThenDontSetReturnPtrs, IsAtLeastXeHpcCore) {
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
 
-    DebugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(0);
+    debugManager.flags.DirectSubmissionRelaxedOrderingForBcs.set(0);
 
     std::unique_ptr<OsContext> osContext(OsContext::create(pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), pDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, pDevice->getDeviceBitfield())));
 
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
@@ -2170,12 +2132,16 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBcsRelaxedOrderingDisabledW
     ultCsr->blitterDirectSubmission.reset(directSubmission);
 
     auto &commandStream = ultCsr->getCS(0x100);
-
     auto endingPtr = commandStream.getSpace(0);
 
-    ultCsr->programEndingCmd(commandStream, &endingPtr, true, false, false);
+    ultCsr->programEndingCmd(commandStream, &endingPtr, true, false, true);
 
-    auto bbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(commandStream.getCpuBase());
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(commandStream, 0);
+    hwParser.findHardwareCommands<FamilyType>();
+    auto bbStartCmdIt = find<MI_BATCH_BUFFER_START *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+    auto bbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(*bbStartCmdIt);
+
     ASSERT_NE(nullptr, bbStartCmd);
     EXPECT_EQ(0u, bbStartCmd->getIndirectAddressEnable());
 }
@@ -2188,7 +2154,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenProgrammingEndingCmdsThenSet
     ultCsr->directSubmissionAvailable = true;
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
-    directSubmission->initialize(true, false);
+    directSubmission->initialize(true);
 
     ultCsr->directSubmission.reset(directSubmission);
 
@@ -2196,28 +2162,32 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenProgrammingEndingCmdsThenSet
 
     auto endingPtr = commandStream.getSpace(0);
 
-    ultCsr->programEndingCmd(commandStream, &endingPtr, true, true, false);
+    ultCsr->programEndingCmd(commandStream, &endingPtr, true, true, true);
 
-    auto lrrCmd = reinterpret_cast<MI_LOAD_REGISTER_REG *>(commandStream.getCpuBase());
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R3);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_GPR_R0);
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(commandStream, 0);
+    hwParser.findHardwareCommands<FamilyType>();
+    auto lrrCmdIt = find<MI_LOAD_REGISTER_REG *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+    auto lrrCmd = genCmdCast<MI_LOAD_REGISTER_REG *>(*lrrCmdIt);
+
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR3);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR0);
 
     lrrCmd++;
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R3 + 4);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_GPR_R0 + 4);
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR3 + 4);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::bcs0Base + RegisterOffsets::csGprR0 + 4);
 
     auto bbStartCmd = reinterpret_cast<MI_BATCH_BUFFER_START *>(++lrrCmd);
     EXPECT_EQ(1u, bbStartCmd->getIndirectAddressEnable());
 }
 
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithoutRelaxedOrderingDependencieswhenProgrammingEndingCmdsThenDontSetReturnRegisters, IsAtLeastXeHpcCore) {
-    using MI_LOAD_REGISTER_REG = typename FamilyType::MI_LOAD_REGISTER_REG;
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
 
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
-    directSubmission->initialize(true, false);
+    directSubmission->initialize(true);
 
     ultCsr->directSubmission.reset(directSubmission);
 
@@ -2227,7 +2197,12 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithoutRelaxedOrderingDep
 
     ultCsr->programEndingCmd(commandStream, &endingPtr, true, false, false);
 
-    auto bbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(commandStream.getCpuBase());
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(commandStream, 0);
+    hwParser.findHardwareCommands<FamilyType>();
+    auto bbStartCmdIt = find<MI_BATCH_BUFFER_START *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+    auto bbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(*bbStartCmdIt);
+
     ASSERT_NE(nullptr, bbStartCmd);
     EXPECT_EQ(0u, bbStartCmd->getIndirectAddressEnable());
 }
@@ -2237,24 +2212,24 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, whenDispatchingWorkloadSectionTh
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
 
     auto offset = directSubmission.ringCommandStream.getUsed();
 
     auto originalBbStart = *reinterpret_cast<MI_BATCH_BUFFER_START *>(batchBuffer.endCmdPtr);
 
     batchBuffer.hasRelaxedOrderingDependencies = true;
-    directSubmission.dispatchWorkloadSection(batchBuffer);
+    directSubmission.dispatchWorkloadSection(batchBuffer, directSubmission.dispatchMonitorFenceRequired(batchBuffer.dispatchMonitorFence));
 
     uint64_t returnPtr = directSubmission.ringCommandStream.getGpuBase() + offset + (4 * sizeof(MI_LOAD_REGISTER_IMM)) + directSubmission.getSizeStartSection();
 
     auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(directSubmission.ringCommandStream.getCpuBase(), offset));
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R4, static_cast<uint32_t>(returnPtr & 0xFFFF'FFFFULL)));
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R4 + 4, static_cast<uint32_t>(returnPtr >> 32)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR4, static_cast<uint32_t>(returnPtr & 0xFFFF'FFFFULL)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR4 + 4, static_cast<uint32_t>(returnPtr >> 32)));
 
     uint64_t returnPtr2 = returnPtr + RelaxedOrderingHelper::getSizeTaskStoreSection<FamilyType>();
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R3, static_cast<uint32_t>(returnPtr2 & 0xFFFF'FFFFULL)));
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R3 + 4, static_cast<uint32_t>(returnPtr2 >> 32)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR3, static_cast<uint32_t>(returnPtr2 & 0xFFFF'FFFFULL)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR3 + 4, static_cast<uint32_t>(returnPtr2 >> 32)));
 
     EXPECT_EQ(0, memcmp(&originalBbStart, batchBuffer.endCmdPtr, sizeof(MI_BATCH_BUFFER_START)));
 }
@@ -2263,12 +2238,12 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithoutRelaxedOrderingDep
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
 
     auto offset = directSubmission.ringCommandStream.getUsed();
 
     batchBuffer.hasRelaxedOrderingDependencies = false;
-    directSubmission.dispatchWorkloadSection(batchBuffer);
+    directSubmission.dispatchWorkloadSection(batchBuffer, directSubmission.dispatchMonitorFenceRequired(batchBuffer.dispatchMonitorFence));
 
     auto lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(ptrOffset(directSubmission.ringCommandStream.getCpuBase(), offset));
     EXPECT_EQ(nullptr, lriCmd);
@@ -2277,7 +2252,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithoutRelaxedOrderingDep
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndDependenciesWhenDispatchingNextCmdBufferThenProgramSchedulerIfNeeded, IsAtLeastXeHpcCore) {
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
@@ -2300,7 +2275,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndDepend
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -2316,7 +2291,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndDepend
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -2332,7 +2307,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndDepend
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -2348,13 +2323,13 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndDepend
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = true;
         directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
 
-        directSubmission.stopRingBuffer();
+        directSubmission.stopRingBuffer(false);
         EXPECT_EQ(2u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(1u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
         EXPECT_EQ(1u, directSubmission.dispatchTaskStoreSectionCalled);
@@ -2364,7 +2339,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndDepend
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndDependenciesWhenDispatchingNextCmdBufferThenProgramSchedulerIfNeeded, IsAtLeastXeHpcCore) {
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
@@ -2387,7 +2362,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndDep
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -2403,7 +2378,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndDep
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -2419,7 +2394,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndDep
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = true;
@@ -2435,13 +2410,13 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndDep
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = true;
         directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
 
-        directSubmission.stopRingBuffer();
+        directSubmission.stopRingBuffer(false);
         EXPECT_EQ(2u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(1u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
         EXPECT_EQ(1u, directSubmission.dispatchTaskStoreSectionCalled);
@@ -2451,7 +2426,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndDep
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndWithoutDependenciesWhenDispatchingNextCmdBufferThenProgramSchedulerIfNeeded, IsAtLeastXeHpcCore) {
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
@@ -2474,7 +2449,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndWithou
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = false;
@@ -2490,7 +2465,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndWithou
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = false;
@@ -2506,7 +2481,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndWithou
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = false;
@@ -2522,13 +2497,13 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndWithou
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = true;
         batchBuffer.hasRelaxedOrderingDependencies = false;
         directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
 
-        directSubmission.stopRingBuffer();
+        directSubmission.stopRingBuffer(false);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
         EXPECT_EQ(0u, directSubmission.dispatchTaskStoreSectionCalled);
@@ -2538,7 +2513,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithStallingCmdsAndWithou
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndWithoutDependenciesWhenDispatchingNextCmdBufferThenProgramSchedulerIfNeeded, IsAtLeastXeHpcCore) {
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
@@ -2561,7 +2536,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndWit
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = false;
@@ -2577,7 +2552,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndWit
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = false;
@@ -2593,7 +2568,7 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndWit
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = false;
@@ -2609,52 +2584,24 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenBbWithNonStallingCmdsAndWit
 
     {
         MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-        directSubmission.initialize(true, false);
+        directSubmission.initialize(true);
 
         batchBuffer.hasStallingCmds = false;
         batchBuffer.hasRelaxedOrderingDependencies = false;
         directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp);
 
-        directSubmission.stopRingBuffer();
+        directSubmission.stopRingBuffer(false);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingSchedulerSectionCalled);
         EXPECT_EQ(0u, directSubmission.dispatchRelaxedOrderingQueueStallCalled);
         EXPECT_EQ(0u, directSubmission.dispatchTaskStoreSectionCalled);
     }
-}
-
-HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenRelaxedOrderingSchedulerRequiredWhenAskingForCmdsSizeThenReturnCorrectValue, IsAtLeastXeHpcCore) {
-    using Dispatcher = RenderDispatcher<FamilyType>;
-    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-
-    size_t expectedBaseSemaphoreSectionSize = directSubmission.getSizePrefetchMitigation();
-    if (directSubmission.isDisablePrefetcherRequired) {
-        expectedBaseSemaphoreSectionSize += 2 * directSubmission.getSizeDisablePrefetcher();
-    }
-
-    if (directSubmission.miMemFenceRequired) {
-        expectedBaseSemaphoreSectionSize += MemorySynchronizationCommands<FamilyType>::getSizeForSingleAdditionalSynchronizationForDirectSubmission(pDevice->getRootDeviceEnvironment());
-    }
-
-    EXPECT_EQ(expectedBaseSemaphoreSectionSize + RelaxedOrderingHelper::DynamicSchedulerSizeAndOffsetSection<FamilyType>::totalSize, directSubmission.getSizeSemaphoreSection(true));
-    EXPECT_EQ(expectedBaseSemaphoreSectionSize + EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait(), directSubmission.getSizeSemaphoreSection(false));
-
-    size_t expectedBaseEndSize = Dispatcher::getSizeStopCommandBuffer() +
-                                 Dispatcher::getSizeCacheFlush(directSubmission.rootDeviceEnvironment) +
-                                 (Dispatcher::getSizeStartCommandBuffer() - Dispatcher::getSizeStopCommandBuffer()) +
-                                 MemoryConstants::cacheLineSize;
-    if (directSubmission.disableMonitorFence) {
-        expectedBaseEndSize += Dispatcher::getSizeMonitorFence(pDevice->getRootDeviceEnvironment());
-    }
-
-    EXPECT_EQ(expectedBaseEndSize + directSubmission.getSizeDispatchRelaxedOrderingQueueStall(), directSubmission.getSizeEnd(true));
-    EXPECT_EQ(expectedBaseEndSize, directSubmission.getSizeEnd(false));
 }
 
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenSchedulerRequiredWhenDispatchingReturnPtrsThenAddOffset, IsAtLeastXeHpcCore) {
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
 
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
-    directSubmission.initialize(true, false);
+    directSubmission.initialize(true);
 
     uint64_t returnPtr = 0x800100123000;
     uint64_t returnPtr2 = returnPtr + RelaxedOrderingHelper::getSizeTaskStoreSection<FamilyType>();
@@ -2664,18 +2611,18 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenSchedulerRequiredWhenDispat
     directSubmission.dispatchRelaxedOrderingReturnPtrRegs(directSubmission.ringCommandStream, returnPtr);
 
     auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(ptrOffset(directSubmission.ringCommandStream.getCpuBase(), offset));
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, CS_GPR_R4, static_cast<uint32_t>(returnPtr & 0xFFFF'FFFFULL)));
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R4 + 4, static_cast<uint32_t>(returnPtr >> 32)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(lriCmd, RegisterOffsets::csGprR4, static_cast<uint32_t>(returnPtr & 0xFFFF'FFFFULL)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR4 + 4, static_cast<uint32_t>(returnPtr >> 32)));
 
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R3, static_cast<uint32_t>(returnPtr2 & 0xFFFF'FFFFULL)));
-    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, CS_GPR_R3 + 4, static_cast<uint32_t>(returnPtr2 >> 32)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR3, static_cast<uint32_t>(returnPtr2 & 0xFFFF'FFFFULL)));
+    EXPECT_TRUE(RelaxedOrderingCommandsHelper::verifyLri<FamilyType>(++lriCmd, RegisterOffsets::csGprR3 + 4, static_cast<uint32_t>(returnPtr2 >> 32)));
 }
 
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenReturnPtrsRequiredWhenAskingForDispatchSizeTheAddMmioSizes, IsAtLeastXeHpcCore) {
     MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    size_t baseSize = directSubmission.getSizeDispatch(true, false);
-    size_t sizeWitfRetPtr = directSubmission.getSizeDispatch(true, true);
+    size_t baseSize = directSubmission.getSizeDispatch(true, false, directSubmission.dispatchMonitorFenceRequired(false));
+    size_t sizeWitfRetPtr = directSubmission.getSizeDispatch(true, true, directSubmission.dispatchMonitorFenceRequired(false));
 
     EXPECT_EQ(baseSize + RelaxedOrderingHelper::getSizeReturnPtrRegs<FamilyType>(), sizeWitfRetPtr);
 }
@@ -2683,7 +2630,8 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenReturnPtrsRequiredWhenAskin
 HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenNumClientsWhenAskingIfRelaxedOrderingEnabledThenReturnCorrectValue, IsAtLeastXeHpcCore) {
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
 
-    ultCsr->registerClient();
+    int client1, client2, client3, client4;
+    ultCsr->registerClient(&client1);
 
     auto directSubmission = new NEO::MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
     ultCsr->directSubmission.reset(directSubmission);
@@ -2691,21 +2639,122 @@ HWTEST2_F(DirectSubmissionRelaxedOrderingTests, givenNumClientsWhenAskingIfRelax
     EXPECT_EQ(1u, ultCsr->getNumClients());
     EXPECT_FALSE(NEO::RelaxedOrderingHelper::isRelaxedOrderingDispatchAllowed(*ultCsr, 1));
 
-    ultCsr->registerClient();
+    ultCsr->registerClient(&client2);
 
     EXPECT_EQ(2u, ultCsr->getNumClients());
     EXPECT_TRUE(NEO::RelaxedOrderingHelper::isRelaxedOrderingDispatchAllowed(*ultCsr, 1));
 
-    DebugManager.flags.DirectSubmissionRelaxedOrderingMinNumberOfClients.set(4);
+    debugManager.flags.DirectSubmissionRelaxedOrderingMinNumberOfClients.set(4);
 
     EXPECT_EQ(2u, ultCsr->getNumClients());
     EXPECT_FALSE(NEO::RelaxedOrderingHelper::isRelaxedOrderingDispatchAllowed(*ultCsr, 1));
 
-    ultCsr->registerClient();
+    ultCsr->registerClient(&client3);
     EXPECT_EQ(3u, ultCsr->getNumClients());
     EXPECT_FALSE(NEO::RelaxedOrderingHelper::isRelaxedOrderingDispatchAllowed(*ultCsr, 1));
 
-    ultCsr->registerClient();
+    ultCsr->registerClient(&client4);
     EXPECT_EQ(4u, ultCsr->getNumClients());
     EXPECT_TRUE(NEO::RelaxedOrderingHelper::isRelaxedOrderingDispatchAllowed(*ultCsr, 1));
+}
+
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenNotStartedDirectSubmissionWhenStartingFailsDuringDispatchCommandBufferThenExpectReturnFalse) {
+    using Dispatcher = RenderDispatcher<FamilyType>;
+
+    FlushStampTracker flushStamp(true);
+
+    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    EXPECT_TRUE(directSubmission.initialize(false));
+    directSubmission.submitReturn = false;
+
+    EXPECT_FALSE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_FALSE(directSubmission.ringStart);
+}
+
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenNotStartedDirectSubmissionWhenUpdateMonitorFenceTagFailsDuringDispatchCommandBufferThenExpectReturnFalse) {
+    using Dispatcher = RenderDispatcher<FamilyType>;
+
+    FlushStampTracker flushStamp(true);
+
+    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    EXPECT_TRUE(directSubmission.initialize(false));
+    directSubmission.updateTagValueReturn = std::numeric_limits<uint64_t>::max();
+
+    EXPECT_FALSE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+}
+
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenDispatchBufferNotRequiresBlockingResidencyHandlingThenDontWaitForResidencyAndProgramSemaphore) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using Dispatcher = RenderDispatcher<FamilyType>;
+    FlushStampTracker flushStamp(true);
+    HardwareParse hwParse;
+
+    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    EXPECT_TRUE(directSubmission.initialize(false));
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    size_t sizeUsedBefore = directSubmission.ringCommandStream.getUsed();
+    directSubmission.handleResidencyCount = 0u;
+    batchBuffer.pagingFenceSemInfo.pagingFenceValue = 10u;
+    batchBuffer.pagingFenceSemInfo.requiresBlockingResidencyHandling = false;
+    EXPECT_TRUE(directSubmission.dispatchCommandBuffer(batchBuffer, flushStamp));
+    EXPECT_EQ(0u, directSubmission.handleResidencyCount);
+
+    hwParse.parseCommands<FamilyType>(directSubmission.ringCommandStream, sizeUsedBefore);
+    hwParse.findHardwareCommands<FamilyType>();
+    auto semaphoreIt = find<MI_SEMAPHORE_WAIT *>(hwParse.cmdList.begin(), hwParse.cmdList.end());
+    auto semaphore = reinterpret_cast<MI_SEMAPHORE_WAIT *>(*semaphoreIt);
+    EXPECT_EQ(10u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphore));
+
+    auto expectedGpuVa = directSubmission.semaphoreGpuVa + offsetof(RingSemaphoreData, pagingFenceCounter);
+    EXPECT_EQ(expectedGpuVa, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphore));
+}
+
+HWTEST_F(DirectSubmissionTest, givenCsrWhenUnblockPagingFenceSemaphoreCalledThenSemaphoreUnblocked) {
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(pDevice->getDefaultEngine().commandStreamReceiver);
+    auto directSubmission = new NEO::MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
+    auto blitterDirectSubmission = new NEO::MockDirectSubmissionHw<FamilyType, BlitterDispatcher<FamilyType>>(*ultCsr);
+
+    ultCsr->directSubmission.reset(directSubmission);
+    ultCsr->blitterDirectSubmission.reset(blitterDirectSubmission);
+
+    ultCsr->unblockPagingFenceSemaphore(20u);
+    EXPECT_EQ(0ull, directSubmission->pagingFenceValueToWait);
+    EXPECT_EQ(0ull, blitterDirectSubmission->pagingFenceValueToWait);
+
+    ultCsr->directSubmissionAvailable = true;
+    ultCsr->blitterDirectSubmissionAvailable = true;
+
+    ultCsr->unblockPagingFenceSemaphore(20u);
+    EXPECT_EQ(20u, directSubmission->pagingFenceValueToWait);
+    EXPECT_EQ(0ull, blitterDirectSubmission->pagingFenceValueToWait);
+
+    directSubmission->pagingFenceValueToWait = 0u;
+
+    std::unique_ptr<OsContext> osContext(OsContext::create(pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), pDevice->getRootDeviceIndex(), 0,
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular},
+                                                                                                        PreemptionMode::ThreadGroup, pDevice->getDeviceBitfield())));
+    ultCsr->setupContext(*osContext);
+    ultCsr->unblockPagingFenceSemaphore(20u);
+    EXPECT_EQ(0ull, directSubmission->pagingFenceValueToWait);
+    EXPECT_EQ(20u, blitterDirectSubmission->pagingFenceValueToWait);
+}
+
+HWTEST_F(DirectSubmissionDispatchBufferTest, givenCopyCommandBufferIntoRingWhenDispatchWorkloadSectionThenBatchBufferStreamSpaceIsReclaimed) {
+    using Dispatcher = RenderDispatcher<FamilyType>;
+
+    debugManager.flags.DirectSubmissionFlatRingBuffer.set(-1);
+
+    MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
+    ASSERT_TRUE(directSubmission.copyCommandBufferIntoRing(batchBuffer));
+
+    directSubmission.initialize(true);
+
+    batchBuffer.startOffset = 0x20;
+    batchBuffer.endCmdPtr = ptrOffset(batchBuffer.stream->getCpuBase(), batchBuffer.startOffset);
+
+    EXPECT_EQ(0x40u, batchBuffer.stream->getUsed());
+
+    directSubmission.dispatchWorkloadSection(batchBuffer, false);
+
+    EXPECT_EQ(batchBuffer.startOffset, batchBuffer.stream->getUsed());
 }

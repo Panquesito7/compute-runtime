@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,10 +8,16 @@
 #pragma once
 #include "shared/source/debugger/debugger.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
-#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/memory_manager/address_range.h"
+#include "shared/source/utilities/arrayref.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+#include "shared/source/utilities/stackvec.h"
+
+#include "StateSaveAreaHeaderWrapper.h"
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 
@@ -55,22 +61,9 @@ struct DebugAreaHeader {
 };
 static_assert(sizeof(DebugAreaHeader) == 32u * sizeof(uint8_t));
 
-struct alignas(4) DebuggerVersion {
-    uint8_t major;
-    uint8_t minor;
-    uint16_t patch;
-};
-struct alignas(8) StateSaveAreaHeader {
-    char magic[8] = "tssarea";
-    uint64_t reserved1;
-    struct DebuggerVersion version;
-    uint8_t size;
-    uint8_t reserved2[3];
-};
-
 #pragma pack()
 
-class DebuggerL0 : public NEO::Debugger, NEO::NonCopyableOrMovableClass {
+class DebuggerL0 : public NEO::Debugger, NEO::NonCopyableAndNonMovableClass {
   public:
     static std::unique_ptr<Debugger> create(NEO::Device *device);
 
@@ -90,27 +83,28 @@ class DebuggerL0 : public NEO::Debugger, NEO::NonCopyableOrMovableClass {
     }
 
     void printTrackedAddresses(uint32_t contextId);
-    MOCKABLE_VIRTUAL void registerElfAndLinkWithAllocation(NEO::DebugData *debugData, NEO::GraphicsAllocation *isaAllocation);
-    MOCKABLE_VIRTUAL uint32_t registerElf(NEO::DebugData *debugData);
+    MOCKABLE_VIRTUAL uint32_t registerElf(ArrayRef<const char> debugZebin);
     MOCKABLE_VIRTUAL void notifyCommandQueueCreated(NEO::Device *device);
     MOCKABLE_VIRTUAL void notifyCommandQueueDestroyed(NEO::Device *device);
     MOCKABLE_VIRTUAL void notifyModuleLoadAllocations(Device *device, const StackVec<NEO::GraphicsAllocation *, 32> &allocs);
-    MOCKABLE_VIRTUAL void notifyModuleCreate(void *module, uint32_t moduleSize, uint64_t moduleLoadAddress);
+    MOCKABLE_VIRTUAL void notifyModuleCreate(ArrayRef<const char> debugZebin, uint64_t moduleLoadAddress);
     MOCKABLE_VIRTUAL void notifyModuleDestroy(uint64_t moduleLoadAddress);
     MOCKABLE_VIRTUAL void registerAllocationType(GraphicsAllocation *allocation);
     void initSbaTrackingMode();
 
     virtual size_t getSbaAddressLoadCommandsSize() = 0;
-    virtual void programSbaAddressLoad(NEO::LinearStream &cmdStream, uint64_t sbaGpuVa) = 0;
+    virtual void programSbaAddressLoad(NEO::LinearStream &cmdStream, uint64_t sbaGpuVa, bool isBcs) = 0;
 
     MOCKABLE_VIRTUAL bool attachZebinModuleToSegmentAllocations(const StackVec<NEO::GraphicsAllocation *, 32> &kernelAlloc, uint32_t &moduleHandle, uint32_t elfHandle);
     MOCKABLE_VIRTUAL bool removeZebinModule(uint32_t moduleHandle);
+    void initialize();
+    void removeTempFiles();
 
     void setSingleAddressSpaceSbaTracking(bool value) {
         singleAddressSpaceSbaTracking = value;
     }
-    bool getSingleAddressSpaceSbaTracking() { return singleAddressSpaceSbaTracking; }
-
+    bool getSingleAddressSpaceSbaTracking() const override { return singleAddressSpaceSbaTracking; }
+    bool isSbaTrackingEnabled() const { return debuggerRequiresSBATracking; }
     struct CommandQueueNotification {
         uint32_t subDeviceIndex = 0;
         uint32_t subDeviceCount = 0;
@@ -118,8 +112,9 @@ class DebuggerL0 : public NEO::Debugger, NEO::NonCopyableOrMovableClass {
 
   protected:
     static bool initDebuggingInOs(NEO::OSInterface *osInterface);
-
-    void initialize();
+    static constexpr std::string_view debugTmpDirPrefix = "/tmp/intel-gpu-debugger";
+    static char debugProcDir[];
+    static bool createDebugDirectory();
 
     NEO::Device *device = nullptr;
     NEO::GraphicsAllocation *sbaAllocation = nullptr;
@@ -130,11 +125,12 @@ class DebuggerL0 : public NEO::Debugger, NEO::NonCopyableOrMovableClass {
     std::vector<uint32_t> uuidL0CommandQueueHandle;
     bool singleAddressSpaceSbaTracking = false;
     std::mutex debuggerL0Mutex;
+    bool debuggerRequiresSBATracking = true;
 };
 
 static_assert(std::is_standard_layout<DebuggerL0::CommandQueueNotification>::value, "DebuggerL0::CommandQueueNotification issue");
 
-using DebugerL0CreateFn = DebuggerL0 *(*)(NEO::Device *device);
+using DebugerL0CreateFn = DebuggerL0 *(*)(NEO::Device * device);
 extern DebugerL0CreateFn debuggerL0Factory[];
 
 template <typename GfxFamily>
@@ -145,12 +141,12 @@ class DebuggerL0Hw : public DebuggerL0 {
     void captureStateBaseAddress(NEO::LinearStream &cmdStream, SbaAddresses sba, bool useFirstLevelBB) override;
     size_t getSbaTrackingCommandsSize(size_t trackedAddressCount) override;
     size_t getSbaAddressLoadCommandsSize() override;
-    void programSbaAddressLoad(NEO::LinearStream &cmdStream, uint64_t sbaGpuVa) override;
+    void programSbaAddressLoad(NEO::LinearStream &cmdStream, uint64_t sbaGpuVa, bool isBcs) override;
 
     void programSbaTrackingCommandsSingleAddressSpace(NEO::LinearStream &cmdStream, const SbaAddresses &sba, bool useFirstLevelBB);
 
   protected:
-    DebuggerL0Hw(NEO::Device *device) : DebuggerL0(device){};
+    DebuggerL0Hw(NEO::Device *device) : DebuggerL0(device) {};
 };
 
 template <uint32_t coreFamily, typename GfxFamily>

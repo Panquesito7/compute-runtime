@@ -1,0 +1,143 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+#if defined(_WIN32)
+#if !defined(NEO_HOST_FUNCTION_CALLBACK)
+#define NEO_HOST_FUNCTION_CALLBACK __stdcall
+#endif
+#else
+#if !defined(NEO_HOST_FUNCTION_CALLBACK)
+#define NEO_HOST_FUNCTION_CALLBACK
+#endif
+#endif
+
+namespace NEO {
+
+class LinearStream;
+class CommandStreamReceiver;
+class IHostFunction;
+class GraphicsAllocation;
+struct RootDeviceEnvironment;
+
+struct HostFunction {
+    uint64_t hostFunctionAddress = 0;
+    uint64_t userDataAddress = 0;
+
+    void invoke() const {
+
+        using CallbackT = void(NEO_HOST_FUNCTION_CALLBACK *)(void *);
+        CallbackT callback = reinterpret_cast<CallbackT>(hostFunctionAddress);
+        void *callbackData = reinterpret_cast<void *>(userDataAddress);
+
+        callback(callbackData);
+    }
+};
+
+namespace HostFunctionStatus {
+inline constexpr uint64_t completed = 0;
+inline constexpr uint64_t notReady = completed;
+} // namespace HostFunctionStatus
+
+namespace HostFunctionThreadPoolHelper {
+inline constexpr int32_t unlimitedThreads = -1; // each CSR that uses host function creates worker thread in thread pool
+}
+
+class HostFunctionStreamer {
+  public:
+    HostFunctionStreamer(CommandStreamReceiver *csr,
+                         GraphicsAllocation *allocation,
+                         void *hostFunctionIdAddress,
+                         const std::function<void(GraphicsAllocation &, uint64_t, size_t)> &downloadAllocationImpl,
+                         const std::function<void(GraphicsAllocation &, uint64_t, size_t)> &uploadAllocationChunkImpl,
+                         uint32_t activePartition,
+                         uint32_t partitionOffset,
+                         bool isTbx,
+                         bool dcFlushRequired,
+                         bool useSemaphore64bCmd,
+                         std::mutex &tbxWriteMutex);
+    ~HostFunctionStreamer() = default;
+
+    std::optional<uint64_t> getHostFunctionReadyToExecute() const;
+    std::optional<uint64_t> tryReserveHostFunctionReadyToExecute();
+    GraphicsAllocation *getHostFunctionIdAllocation() const;
+    HostFunction getHostFunction(uint64_t hostFunctionId);
+    uint64_t getHostFunctionId(uint32_t partitionId) const;
+    uint64_t getHostFunctionIdGpuAddress(uint32_t partitionId) const;
+    uint64_t *getHostFunctionIdPtr(uint32_t partitionId) const;
+    uint64_t getNextHostFunctionIdAndIncrement();
+    bool isUsingSemaphore64bCmd() const;
+
+    void addHostFunction(uint64_t hostFunctionId, HostFunction &&hostFunction);
+    void downloadHostFunctionAllocation() const;
+    void signalHostFunctionCompletion(const HostFunction &hostFunction);
+    void prepareForExecution(const HostFunction &hostFunction);
+    uint32_t getActivePartitions() const;
+    bool getDcFlushRequired() const;
+    std::mutex &getTbxWriteMutex() const { return tbxWriteMutex; }
+
+  private:
+    void updateTbxData();
+    void setHostFunctionIdAsCompleted();
+    void startInOrderExecution();
+    void endInOrderExecution();
+    bool isInOrderExecutionInProgress() const;
+
+    std::mutex hostFunctionsMutex;
+    std::vector<std::pair<uint64_t, HostFunction>> hostFunctions;
+    uint64_t *hostFunctionIdAddress = nullptr; // 0 bit - used to signal that host function is pending or completed
+    CommandStreamReceiver *csr = nullptr;
+    GraphicsAllocation *allocation = nullptr;
+    std::function<void(GraphicsAllocation &, uint64_t, size_t)> downloadAllocationImpl;
+    std::function<void(GraphicsAllocation &, uint64_t, size_t)> uploadAllocationChunkImpl;
+    std::atomic<uint64_t> nextHostFunctionId{1};
+    std::atomic<uint32_t> pendingHostFunctions{0};
+    uint32_t activePartitions{1};
+    uint32_t partitionOffset{0};
+    std::atomic<bool> inOrderExecutionInProgress{false};
+    const bool isTbx = false;
+    bool dcFlushRequired = false;
+    const bool useSemaphore64bCmd = false;
+    std::mutex &tbxWriteMutex;
+};
+
+enum class HostFunctionWorkerMode : int32_t {
+    defaultMode = -1,
+    countingSemaphore = 0,
+    schedulerWithThreadPool = 1,
+};
+
+template <typename GfxFamily>
+struct HostFunctionHelper {
+    static void programHostFunction(LinearStream &commandStream, HostFunctionStreamer &streamer, HostFunction &&hostFunction, bool memorySynchronizationRequired);
+    static void programHostFunctionId(LinearStream *commandStream, void *cmdBuffer, HostFunctionStreamer &streamer, HostFunction &&hostFunction, bool memorySynchronizationRequired);
+    static void programHostFunctionWaitForCompletion(LinearStream *commandStream, void *cmdBuffer, const HostFunctionStreamer &streamer, uint32_t partionId);
+    static bool isMemorySynchronizationRequired(bool memorySynchronizationRequired);
+    static bool usePipeControlForHostFunction(bool memorySynchronizationRequired, bool dcFlushPlatform);
+    static bool useMemoryFenceForHostFunction(bool memorySynchronizationRequired, bool dcFlushPlatform);
+    static size_t getSizeForHostFunctionIdProgramming(bool memorySynchronizationRequired, bool dcFlushPlatform);
+};
+
+namespace HostFunctionFactory {
+
+void createAndSetHostFunctionWorker(HostFunctionWorkerMode hostFunctionWorkerMode,
+                                    CommandStreamReceiver *csr,
+                                    RootDeviceEnvironment *rootDeviceEnvironment);
+
+} // namespace HostFunctionFactory
+
+} // namespace NEO

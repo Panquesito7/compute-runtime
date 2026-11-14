@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,7 +9,6 @@
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/debug_helpers.h"
-#include "shared/source/utilities/directory.h"
 
 namespace L0 {
 const std::string fwDeviceInitByDevice = "igsc_device_init_by_device_info";
@@ -57,13 +56,13 @@ bool FirmwareUtilImp::loadEntryPoints() {
 }
 
 static void progressFunc(uint32_t done, uint32_t total, void *ctx) {
-    uint32_t percent = (done * 100) / total;
-    PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get(), stdout, "Progess: %d/%d:%d/%\n", done, total, percent);
+    if (NEO::debugManager.flags.PrintDebugMessages.get()) {
+        uint32_t percent = (done * 100) / total;
+        PRINT_STRING(true, stdout, "Progress: %d/%d:%d/%\n", done, total, percent);
+    }
 }
 
-FirmwareUtilImp::OsLibraryLoadPtr FirmwareUtilImp::osLibraryLoadFunction(NEO::OsLibrary::load);
-
-ze_result_t FirmwareUtilImp::getFirstDevice(igsc_device_info *info) {
+ze_result_t FirmwareUtilImp::getFirstDevice(IgscDeviceInfo *info) {
     igsc_device_iterator *iter;
     int ret = deviceIteratorCreate(&iter);
     if (ret != IGSC_SUCCESS) {
@@ -92,7 +91,7 @@ ze_result_t FirmwareUtilImp::getFirstDevice(igsc_device_info *info) {
 
 ze_result_t FirmwareUtilImp::fwDeviceInit() {
     int ret;
-    igsc_device_info info;
+    IgscDeviceInfo info;
     ze_result_t result = getFirstDevice(&info);
     if (result != ZE_RESULT_SUCCESS) {
         return result;
@@ -158,7 +157,7 @@ ze_result_t FirmwareUtilImp::fwFlashOprom(void *pImage, uint32_t size) {
     const std::lock_guard<std::mutex> lock(this->fwLock);
     struct igsc_oprom_image *opromImg = nullptr;
     uint32_t opromImgType = 0;
-    int retData = 0, retCode = 0;
+    int retData = IGSC_SUCCESS, retCode = IGSC_SUCCESS;
     int ret = imageOpromInit(&opromImg, static_cast<const uint8_t *>(pImage), size);
     if (ret != IGSC_SUCCESS) {
         return ZE_RESULT_ERROR_UNINITIALIZED;
@@ -173,7 +172,7 @@ ze_result_t FirmwareUtilImp::fwFlashOprom(void *pImage, uint32_t size) {
     if (opromImgType & IGSC_OPROM_CODE) {
         retCode = deviceOpromUpdate(&fwDeviceHandle, IGSC_OPROM_CODE, opromImg, progressFunc, nullptr);
     }
-    if ((retData != IGSC_SUCCESS) && (retCode != IGSC_SUCCESS)) {
+    if ((retData != IGSC_SUCCESS) || (retCode != IGSC_SUCCESS)) {
         return ZE_RESULT_ERROR_UNINITIALIZED;
     }
     return ZE_RESULT_SUCCESS;
@@ -192,17 +191,29 @@ FirmwareUtilImp::~FirmwareUtilImp() {
 };
 
 FirmwareUtil *FirmwareUtil::create(uint16_t domain, uint8_t bus, uint8_t device, uint8_t function) {
-    FirmwareUtilImp *pFwUtilImp = new FirmwareUtilImp(domain, bus, device, function);
-    UNRECOVERABLE_IF(nullptr == pFwUtilImp);
-    pFwUtilImp->libraryHandle = FirmwareUtilImp::osLibraryLoadFunction(FirmwareUtilImp::fwUtilLibraryName);
-    if (pFwUtilImp->libraryHandle == nullptr || pFwUtilImp->loadEntryPoints() == false || pFwUtilImp->fwDeviceInit() != ZE_RESULT_SUCCESS) {
-        if (nullptr != pFwUtilImp->libraryHandle) {
+    for (const auto &libName : FirmwareUtilImp::fwUtilLibraryNames) {
+        FirmwareUtilImp *pFwUtilImp = new FirmwareUtilImp(domain, bus, device, function);
+        UNRECOVERABLE_IF(nullptr == pFwUtilImp);
+
+        NEO::OsLibraryCreateProperties properties(libName);
+        properties.customLoadFlags = &FirmwareUtilImp::fwUtilLoadFlags;
+        pFwUtilImp->libraryHandle = NEO::OsLibrary::loadFunc(properties);
+
+        if (pFwUtilImp->libraryHandle == nullptr) {
+            delete pFwUtilImp;
+            continue;
+        }
+
+        if (pFwUtilImp->loadEntryPoints() == true &&
+            pFwUtilImp->fwDeviceInit() == ZE_RESULT_SUCCESS) {
+            return static_cast<FirmwareUtil *>(pFwUtilImp);
+        } else {
             delete pFwUtilImp->libraryHandle;
             pFwUtilImp->libraryHandle = nullptr;
+            delete pFwUtilImp;
+            return nullptr;
         }
-        delete pFwUtilImp;
-        return nullptr;
     }
-    return static_cast<FirmwareUtil *>(pFwUtilImp);
+    return nullptr;
 }
 } // namespace L0

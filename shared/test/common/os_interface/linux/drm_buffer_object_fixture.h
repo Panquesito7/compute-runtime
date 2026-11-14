@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -53,10 +53,10 @@ class TestedBufferObject : public BufferObject {
         }
 
         if (!waitForCompletion) {
-            return MemoryOperationsStatus::SUCCESS;
+            return MemoryOperationsStatus::success;
         }
 
-        return MemoryOperationsStatus::GPU_HANG_DETECTED_DURING_OPERATION;
+        return MemoryOperationsStatus::gpuHangDetectedDuringOperation;
     }
 
     uint64_t receivedCompletionGpuAddress = 0;
@@ -76,13 +76,12 @@ class DrmBufferObjectFixture {
     const uint32_t rootDeviceIndex = 0u;
 
     void setUp() {
-        this->mock = std::make_unique<DrmClass>(*executionEnvironment.rootDeviceEnvironments[0]);
+        this->mock = DrmClass::create(*executionEnvironment.rootDeviceEnvironments[0]);
         ASSERT_NE(nullptr, this->mock);
-        executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock.get(), 0u);
+        executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock.get(), 0u, false);
         osContext.reset(new OsContextLinux(*this->mock, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor()));
         this->mock->reset();
         bo = new TestedBufferObject(0, this->mock.get());
-        ASSERT_NE(nullptr, bo);
     }
 
     void tearDown() {

@@ -1,0 +1,107 @@
+/*
+ * Copyright (C) 2020-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/file_io.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/test/common/helpers/test_files.h"
+#include "shared/test/common/tests_configuration.h"
+
+#include "level_zero/core/source/driver/kernel_dispatch_stats_reporter.h"
+#include "level_zero/core/test/common/ult_config_listener_l0.h"
+
+#include <map>
+#include <sstream>
+#include <string>
+
+namespace NEO {
+extern std::map<std::string, std::stringstream> virtualFileListTestKernelsOnly;
+}
+
+struct _ze_driver_handle_t;
+
+namespace L0 {
+extern std::vector<_ze_driver_handle_t *> *globalDriverHandles;
+}
+namespace NEO {
+const char *apiName = "L0";
+}
+
+using namespace NEO;
+void cleanTestHelpers() {
+    delete L0::globalDriverHandles;
+    L0::globalDriverHandles = nullptr;
+}
+
+bool sysmanUltsEnable = false;
+
+void applyWorkarounds() {
+    auto sysmanUltsEnableEnv = getenv("NEO_L0_SYSMAN_ULTS_ENABLE");
+    if (sysmanUltsEnableEnv != nullptr) {
+        sysmanUltsEnable = (strcmp(sysmanUltsEnableEnv, "1") == 0);
+    }
+    L0::globalDriverHandles = new std::vector<_ze_driver_handle_t *>;
+    L0::globalDriverHandles->reserve(1);
+    L0::kernelDispatchStatsReporter();
+    debugManager.flags.EnableUsmPoolLazyInit.set(1);
+}
+
+void setupTestFiles(std::string testBinaryFiles, int32_t revId) {
+    std::string testBinaryFilesApiSpecific = testBinaryFiles;
+    testBinaryFilesApiSpecific.append("/level_zero/");
+    testBinaryFiles.append("/" + binaryNameSuffix + "/");
+    testBinaryFilesApiSpecific.append(binaryNameSuffix + "/");
+
+    testBinaryFiles.append(std::to_string(revId));
+    testBinaryFiles.append("/");
+    testBinaryFiles.append(testFiles);
+    testBinaryFilesApiSpecific.append(std::to_string(revId));
+    testBinaryFilesApiSpecific.append("/");
+    testBinaryFilesApiSpecific.append(testFilesApiSpecific);
+    testFiles = testBinaryFiles;
+    testFilesApiSpecific = testBinaryFilesApiSpecific;
+}
+
+std::string getBaseExecutionDir() {
+    if (!isAubTestMode(testMode)) {
+        return "level_zero/";
+    }
+    return "";
+}
+
+bool isChangeDirectoryRequired() {
+    return true;
+}
+
+void addUltListener(::testing::TestEventListeners &listeners) {
+    listeners.Append(new L0::UltConfigListenerL0);
+}
+
+void populateApiSpecificVirtualFileList(const NEO::HardwareInfo &hwInfo) {
+    auto loadApiSpecificKernel = [](const std::string &name) {
+        std::string testFilename;
+        retrieveBinaryKernelFilenameApiSpecific(testFilename, name + "_", ".bin");
+        size_t retFileNsize = 0;
+        auto retFiledata = NEO::loadDataFromFile(testFilename.c_str(), retFileNsize);
+        if (retFiledata && retFileNsize > 0) {
+            NEO::virtualFileListTestKernelsOnly[testFilename].write(reinterpret_cast<const char *>(retFiledata.get()), retFileNsize);
+        }
+    };
+
+    for (const std::string name : {"test_kernel", "bindless_stateful_copy_buffer", "simple_spill_fill_kernel"}) {
+        loadApiSpecificKernel(name);
+    }
+
+    auto productHelper = NEO::ProductHelper::create(hwInfo.platform.eProductFamily);
+    auto releaseHelper = NEO::ReleaseHelper::create(hwInfo.ipVersion);
+    const auto supportedGrfSizes = productHelper->getSupportedNumGrfs(*releaseHelper);
+    for (const auto grfSize : supportedGrfSizes) {
+        loadApiSpecificKernel("grf_" + std::to_string(grfSize) + "_kernel_variable_register_per_thread");
+    }
+}

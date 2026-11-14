@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -7,18 +7,34 @@
 target_sources(${L0_STATIC_LIB_NAME}
                PRIVATE
                ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+               ${CMAKE_CURRENT_SOURCE_DIR}/base_driver.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/definitions${BRANCH_DIR_SUFFIX}additional_extension_function_address.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/definitions${BRANCH_DIR_SUFFIX}additional_extensions_support.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/definitions${BRANCH_DIR_SUFFIX}additional_extensions_support.inl
+               ${CMAKE_CURRENT_SOURCE_DIR}/definitions${BRANCH_DIR_SUFFIX}extension_injector.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/driver_handle.h
-               ${CMAKE_CURRENT_SOURCE_DIR}/driver_handle_imp.cpp
-               ${CMAKE_CURRENT_SOURCE_DIR}/driver_handle_imp.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/driver_handle.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/driver_handle_helper.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR_SUFFIX}driver_handle_p2p_helper.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/driver.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/driver.h
-               ${CMAKE_CURRENT_SOURCE_DIR}/driver_imp.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/extension_function_address.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/extension_function_address.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/extension_injector.h
                ${CMAKE_CURRENT_SOURCE_DIR}/host_pointer_manager.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/host_pointer_manager.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/kernel_dispatch_stats_reporter.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/kernel_dispatch_stats_reporter.h
 )
 
-if(NOT DEFINED L0_DRIVER_VERSION)
-  set(L0_DRIVER_VERSION 1)
+if(UNIX)
+  target_sources(${L0_STATIC_LIB_NAME}
+                 PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/linux/driver_handle_linux.cpp
+  )
+else()
+  target_sources(${L0_STATIC_LIB_NAME}
+                 PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/windows/driver_handle_windows.cpp
+  )
 endif()
-
-configure_file(driver_version.h.in ${CMAKE_BINARY_DIR}/driver_version_l0.h) # Put Driver version into define

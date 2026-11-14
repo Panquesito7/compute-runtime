@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,8 +14,10 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/utilities/const_stringref.h"
 
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -27,19 +29,28 @@ inline std::string versionToString(NEO::Zebin::ZeInfo::Types::Version version) {
 
 namespace ZebinTestData {
 
-enum class appendElfAdditionalSection {
-    NONE,
-    SPIRV,
-    GLOBAL,
-    CONSTANT,
-    CONSTANT_STRING
+enum class AppendElfAdditionalSection {
+    none,
+    spirv,
+    pisa,
+    global,
+    constant,
+    constantString
 };
 
-template <NEO::Elf::ELF_IDENTIFIER_CLASS numBits = NEO::Elf::EI_CLASS_64>
+template <NEO::Elf::ElfIdentifierClass numBits = NEO::Elf::EI_CLASS_64>
 struct ValidEmptyProgram {
     static constexpr char kernelName[19] = "valid_empty_kernel";
+    static constexpr auto defaultZeInfo = R"===(
+kernels :
+  - name :    valid_empty_kernel
+    execution_env :
+      simd_size  : 32
+      grf_count : 128
+  )===";
 
     ValidEmptyProgram();
+    ValidEmptyProgram(const std::string &zeInfo);
     void recalcPtr();
     NEO::Elf::ElfSectionHeader<numBits> &appendSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel, const ArrayRef<const uint8_t> sectionData);
     void removeSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel);
@@ -69,6 +80,7 @@ kernels:
     - name: Intel_Symbol_Table_Void_Program
       execution_env:
         simd_size: 8
+        indirect_stateless_count: 1
 functions:
     - name: fun0
       execution_env:
@@ -84,8 +96,8 @@ functions:
 };
 
 struct ZebinWithL0TestCommonModule {
-    ZebinWithL0TestCommonModule(const NEO::HardwareInfo &hwInfo) : ZebinWithL0TestCommonModule(hwInfo, std::initializer_list<appendElfAdditionalSection>{}) {}
-    ZebinWithL0TestCommonModule(const NEO::HardwareInfo &hwInfo, std::initializer_list<appendElfAdditionalSection> additionalSections, bool forceRecompilation = false);
+    ZebinWithL0TestCommonModule(const NEO::HardwareInfo &hwInfo) : ZebinWithL0TestCommonModule(hwInfo, std::initializer_list<AppendElfAdditionalSection>{}) {}
+    ZebinWithL0TestCommonModule(const NEO::HardwareInfo &hwInfo, std::initializer_list<AppendElfAdditionalSection> additionalSections, bool forceRecompilation = false);
 
     void recalcPtr();
 
@@ -176,7 +188,7 @@ kernels:
         sampler_index:   0
       - arg_type:        arg_bypointer
         offset:          0
-        size:            0
+        size:            4
         arg_index:       3
         addrmode:        stateful
         addrspace:       image
@@ -188,6 +200,20 @@ kernels:
         addrmode:        stateful
         addrspace:       image
         access_type:     writeonly
+      - arg_type:        arg_bypointer
+        offset:          0
+        size:            0
+        arg_index:       6
+        addrmode:        stateful
+        addrspace:       global
+        access_type:     readonly
+      - arg_type:        arg_bypointer
+        offset:          32
+        size:            8
+        arg_index:       6
+        addrmode:        stateless
+        addrspace:       global
+        access_type:     readonly
     per_thread_payload_arguments:
       - arg_type:        local_id
         offset:          0
@@ -260,12 +286,56 @@ kernels:
         arg_index:       0
       - bti_value:       1
         arg_index:       1
--)===";
+)===";
 };
 
-template <NEO::Elf::ELF_IDENTIFIER_CLASS numBits>
-struct ZebinCopyBufferSimdModule {
-    ZebinCopyBufferSimdModule(const NEO::HardwareInfo &hwInfo, uint8_t simdSize);
+template <NEO::Elf::ElfIdentifierClass numBits>
+struct ZebinCopyBufferModule {
+    struct KernelTags {
+        KernelTags(const char *section) : section(section) {}
+
+        KernelTags(const char *section, std::map<std::string, std::string> vars) : section(section), vars(vars) {}
+
+        std::string &operator[](NEO::ConstStringRef strRef) {
+            return vars[strRef.str()];
+        }
+
+        std::string &operator[](const char *str) {
+            return vars[str];
+        }
+
+        std::string toZeInfoYaml() const {
+            std::stringstream os;
+            if (vars.empty()) {
+                return "";
+            }
+            os << "\n    " << section << ":";
+            for (const auto &[var, value] : vars) {
+                if (!value.empty()) {
+                    os << "\n      " << var << ": " << value;
+                }
+            }
+            return os.str();
+        }
+
+        const char *section;
+        std::map<std::string, std::string> vars;
+    };
+
+    struct BindingTableIndex {
+        uint8_t btiValue;
+        uint8_t argIndex;
+    };
+
+    struct Descriptor {
+        KernelTags execEnv{"execution_env", {{"simd_size", "32"}, {"grf_count", "128"}, {"inline_data_payload_size", "32"}, {"offset_to_skip_per_thread_data_load", "192"}}};
+        KernelTags userAttributes{"user_attributes"};
+        std::vector<BindingTableIndex> bindingTableIndices{{0, 0}, {1, 1}};
+        bool isStateless = false;
+    };
+
+    ZebinCopyBufferModule(const NEO::HardwareInfo &hwInfo, Descriptor copyBufferDesc);
+    ZebinCopyBufferModule(const NEO::HardwareInfo &hwInfo) : ZebinCopyBufferModule(hwInfo, Descriptor{}) {}
     inline size_t getLocalIdSize(const NEO::HardwareInfo &hwInfo, uint8_t simdSize) {
         return alignUp(simdSize * sizeof(uint16_t), hwInfo.capabilityTable.grfSize) * 3;
     }
@@ -275,62 +345,261 @@ struct ZebinCopyBufferSimdModule {
     size_t zeInfoSize;
     std::string zeInfoCopyBufferSimdPlaceholder = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
 kernels:
-  - name:            CopyBuffer
-    execution_env:
-      disable_mid_thread_preemption: true
-      grf_count:       128
-      has_no_stateless_write: true
-      inline_data_payload_size: 32
-      offset_to_skip_per_thread_data_load: 192
-      required_sub_group_size: %d
-      simd_size:       %d
-      subgroup_independent_forward_progress: true
+  - name:            CopyBuffer%s%s
     payload_arguments:
-      - arg_type:        global_id_offset
+      - arg_type:        indirect_data_pointer
         offset:          0
-        size:            12
-      - arg_type:        local_size
-        offset:          12
-        size:            12
+        size:            8
+      - arg_type:        scratch_pointer
+        offset:          8
+        size:            8
       - arg_type:        arg_bypointer
-        offset:          0
-        size:            0
+        offset:          16
+        size:            8
         arg_index:       0
-        addrmode:        stateful
+        addrmode:        %s
         addrspace:       global
         access_type:     readwrite
       - arg_type:        buffer_address
-        offset:          32
+        offset:          24
         size:            8
         arg_index:       0
       - arg_type:        arg_bypointer
-        offset:          0
-        size:            0
+        offset:          32
+        size:            8
         arg_index:       1
-        addrmode:        stateful
+        addrmode:        %s
         addrspace:       global
         access_type:     readwrite
       - arg_type:        buffer_address
         offset:          40
         size:            8
-        arg_index:       1
-      - arg_type:        buffer_offset
-        offset:          48
-        size:            4
         arg_index:       0
-      - arg_type:        buffer_offset
-        offset:          52
-        size:            4
+)===";
+};
+
+template <NEO::Elf::ElfIdentifierClass numBits>
+struct ZebinCopyImageModule {
+    ZebinCopyImageModule(const NEO::HardwareInfo &hwInfo);
+    NEO::Elf::ElfFileHeader<numBits> *elfHeader;
+    std::vector<uint8_t> storage;
+    size_t zeInfoSize;
+    std::string zeInfoCopyImage = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
+kernels:
+  - name:            CopyImage3dToImage3d
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       32
+      has_4gb_buffers: true
+      has_no_stateless_write: true
+      inline_data_payload_size: 64
+      offset_to_skip_per_thread_data_load: 128
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 10
+    payload_arguments:
+      - arg_type:        indirect_data_pointer
+        offset:          0
+        size:            8
+      - arg_type:        scratch_pointer
+        offset:          8
+        size:            8
+      - arg_type:        global_id_offset
+        offset:          16
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          28
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            16
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            16
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            8
+        arg_index:       0
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     readonly
+        image_type:      image_3d
+        image_transformable: true
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            8
         arg_index:       1
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     writeonly
+        image_type:      image_3d
     per_thread_payload_arguments:
       - arg_type:        local_id
         offset:          0
-        size:            %d
-    binding_table_indices:
-      - bti_value:       0
+        size:            192
+  - name:            CopyImage1dBufferToImage3d
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       32
+      has_4gb_buffers: true
+      has_no_stateless_write: true
+      inline_data_payload_size: 64
+      offset_to_skip_per_thread_data_load: 128
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 10
+    payload_arguments:
+      - arg_type:        indirect_data_pointer
+        offset:          0
+        size:            8
+      - arg_type:        scratch_pointer
+        offset:          8
+        size:            8
+      - arg_type:        global_id_offset
+        offset:          16
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          28
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            16
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            16
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            8
         arg_index:       0
-      - bti_value:       1
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     readonly
+        image_type:      image_buffer
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            8
         arg_index:       1
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     writeonly
+        image_type:      image_3d
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            CopyImage3dToImage1dBuffer
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       32
+      has_4gb_buffers: true
+      has_no_stateless_write: true
+      inline_data_payload_size: 64
+      offset_to_skip_per_thread_data_load: 128
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 10
+    payload_arguments:
+      - arg_type:        indirect_data_pointer
+        offset:          0
+        size:            8
+      - arg_type:        scratch_pointer
+        offset:          8
+        size:            8
+      - arg_type:        global_id_offset
+        offset:          16
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          28
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            16
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            16
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            8
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     writeonly
+        image_type:      image_buffer
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            8
+        arg_index:       0
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     readonly
+        image_type:      image_3d
+        image_transformable: true
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
+  - name:            CopyImage1dBufferToImage1dBuffer
+    user_attributes:
+      intel_reqd_workgroup_walk_order: [ 0, 1, 2 ]
+    execution_env:
+      grf_count:       32
+      has_4gb_buffers: true
+      has_no_stateless_write: true
+      inline_data_payload_size: 64
+      offset_to_skip_per_thread_data_load: 128
+      simd_size:       32
+      subgroup_independent_forward_progress: true
+      eu_thread_count: 10
+    payload_arguments:
+      - arg_type:        indirect_data_pointer
+        offset:          0
+        size:            8
+      - arg_type:        scratch_pointer
+        offset:          8
+        size:            8
+      - arg_type:        global_id_offset
+        offset:          16
+        size:            12
+      - arg_type:        enqueued_local_size
+        offset:          28
+        size:            12
+      - arg_type:        arg_byvalue
+        offset:          48
+        size:            16
+        arg_index:       2
+      - arg_type:        arg_byvalue
+        offset:          64
+        size:            16
+        arg_index:       3
+      - arg_type:        arg_bypointer
+        offset:          80
+        size:            8
+        arg_index:       0
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     readonly
+        image_type:      image_buffer
+      - arg_type:        arg_bypointer
+        offset:          88
+        size:            8
+        arg_index:       1
+        addrmode:        bindless
+        addrspace:       image
+        access_type:     writeonly
+        image_type:      image_buffer
+    per_thread_payload_arguments:
+      - arg_type:        local_id
+        offset:          0
+        size:            192
 )===";
 };
 

@@ -1,18 +1,35 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/sysman/source/linux/pmt/sysman_pmt.h"
-#include "level_zero/sysman/source/linux/sysman_fs_access.h"
-#include "level_zero/sysman/source/temperature/linux/sysman_os_temperature_imp.h"
-#include "level_zero/sysman/source/temperature/sysman_temperature_imp.h"
+
+#include "level_zero/sysman/source/api/temperature/linux/sysman_os_temperature_imp.h"
+#include "level_zero/sysman/source/api/temperature/sysman_temperature_imp.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+#include "level_zero/sysman/source/sysman_const.h"
+#include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_fixture.h"
+#include "level_zero/sysman/test/unit_tests/sources/shared/linux/kmd_interface/mock_sysman_kmd_interface_i915.h"
+#include "level_zero/sysman/test/unit_tests/sources/shared/linux/kmd_interface/mock_sysman_kmd_interface_xe.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
+
+constexpr uint32_t offsetComputeTemperatures = 104;
+constexpr uint32_t offsetCoreTemperatures = 108;
+constexpr uint32_t offsetSocTemperatures1 = 96;
+constexpr uint32_t offsetSocTemperatures2 = 56;
+
+constexpr uint32_t offsetTileMaxTemperature = 44;
+constexpr uint32_t offsetGtMaxTemperature = 52;
+constexpr uint32_t offsetHbm0MaxDeviceTemperature = 28;
+constexpr uint32_t offsetHbm1MaxDeviceTemperature = 36;
+constexpr uint32_t offsetHbm2MaxDeviceTemperature = 300;
+constexpr uint32_t offsetHbm3MaxDeviceTemperature = 308;
 
 constexpr uint8_t memory0MaxTemperature = 0x12;
 constexpr uint8_t memory1MaxTemperature = 0x45;
@@ -24,151 +41,169 @@ constexpr uint32_t tileMaxTemperature = 0x34;
 constexpr uint8_t computeTempIndex = 8;
 constexpr uint8_t coreTempIndex = 12;
 constexpr uint8_t socTempIndex = 0;
-constexpr uint8_t tempArrForNoSubDevices[19] = {0x12, 0x23, 0x43, 0xde, 0xa3, 0xce, 0x23, 0x11, 0x45, 0x32, 0x67, 0x47, 0xac, 0x21, 0x03, 0x90, 0, 0, 0};
+constexpr uint8_t tempArrForNoSubDevices[19] = {0x09, 0x23, 0x43, 0xde, 0xa3, 0xce, 0x23, 0x11, 0x45, 0x32, 0x67, 0x47, 0xac, 0x21, 0x03, 0x90, 0, 0, 0};
 constexpr uint8_t computeIndexForNoSubDevices = 9;
 constexpr uint8_t gtTempIndexForNoSubDevices = 0;
 const std::string baseTelemSysFS("/sys/class/intel_pmt");
-std::string gpuUpstreamPortPathInTemperature = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0";
 const std::string realPathTelem1 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem1";
 const std::string realPathTelem2 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem2";
 const std::string realPathTelem3 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem3";
 const std::string realPathTelem4 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem4";
 const std::string realPathTelem5 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem5";
-const std::string sysfsPahTelem1 = "/sys/class/intel_pmt/telem1";
-const std::string sysfsPahTelem2 = "/sys/class/intel_pmt/telem2";
-const std::string sysfsPahTelem3 = "/sys/class/intel_pmt/telem3";
-const std::string sysfsPahTelem4 = "/sys/class/intel_pmt/telem4";
-const std::string sysfsPahTelem5 = "/sys/class/intel_pmt/telem5";
+const std::string realPathTelem6 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem6";
+const std::string sysfsPathTelem1 = "/sys/class/intel_pmt/telem1";
+const std::string sysfsPathTelem2 = "/sys/class/intel_pmt/telem2";
+const std::string sysfsPathTelem3 = "/sys/class/intel_pmt/telem3";
+const std::string sysfsPathTelem4 = "/sys/class/intel_pmt/telem4";
+const std::string sysfsPathTelem5 = "/sys/class/intel_pmt/telem5";
+const std::string sysfsPathTelem6 = "/sys/class/intel_pmt/telem6";
+const std::string telem1OffsetFileName("/sys/class/intel_pmt/telem1/offset");
+const std::string telem1GuidFileName("/sys/class/intel_pmt/telem1/guid");
+const std::string telem1TelemFileName("/sys/class/intel_pmt/telem1/telem");
+const std::string telem2OffsetFileName("/sys/class/intel_pmt/telem2/offset");
+const std::string telem2GuidFileName("/sys/class/intel_pmt/telem2/guid");
+const std::string telem2TelemFileName("/sys/class/intel_pmt/telem2/telem");
+const std::string telem3OffsetFileName("/sys/class/intel_pmt/telem3/offset");
+const std::string telem3GuidFileName("/sys/class/intel_pmt/telem3/guid");
+const std::string telem3TelemFileName("/sys/class/intel_pmt/telem3/telem");
+const std::string telem4OffsetFileName("/sys/class/intel_pmt/telem4/offset");
+const std::string telem4GuidFileName("/sys/class/intel_pmt/telem4/guid");
+const std::string telem4TelemFileName("/sys/class/intel_pmt/telem4/telem");
+const std::string telem5OffsetFileName("/sys/class/intel_pmt/telem5/offset");
+const std::string telem5GuidFileName("/sys/class/intel_pmt/telem5/guid");
+const std::string telem5TelemFileName("/sys/class/intel_pmt/telem5/telem");
+const std::string telem6OffsetFileName("/sys/class/intel_pmt/telem6/offset");
+const std::string telem6GuidFileName("/sys/class/intel_pmt/telem6/guid");
+const std::string telem6TelemFileName("/sys/class/intel_pmt/telem6/telem");
+const std::string mockTemperatureDevicePciBdf("0000:3a:00.0");
+const std::string mockTemperatureDeviceRealPath("/sys/devices/pci0000:37/0000:37:01.0/0000:38:00.0/0000:39:01.0/" + mockTemperatureDevicePciBdf);
+const std::string mockTemperatureHwmonDir("/sys/bus/pci/devices/" + mockTemperatureDevicePciBdf + "/hwmon");
+const std::string mockTemperatureHwmonNameFile0(mockTemperatureHwmonDir + "/hwmon0/name");
+const std::string mockTemperatureHwmonNameFile1(mockTemperatureHwmonDir + "/hwmon1/name");
+const std::string mockTemperatureHwmonTempFile0(mockTemperatureHwmonDir + "/hwmon0/temp2_emergency");
+const std::string mockMemoryTemperatureHwmonFile0(mockTemperatureHwmonDir + "/hwmon0/temp3_input");
+const std::string mockGpuTemperatureHwmonFile0(mockTemperatureHwmonDir + "/hwmon0/temp2_input");
+const std::string mockTemperatureHwmonSubDir0(mockTemperatureHwmonDir + "/hwmon0/");
 
-struct MockTemperaturePmt : public L0::Sysman::PlatformMonitoringTech {
-    MockTemperaturePmt(L0::Sysman::FsAccess *pFsAccess, ze_bool_t onSubdevice, uint32_t subdeviceId) : L0::Sysman::PlatformMonitoringTech(pFsAccess, onSubdevice, subdeviceId) {}
-    using L0::Sysman::PlatformMonitoringTech::closeFunction;
-    using L0::Sysman::PlatformMonitoringTech::keyOffsetMap;
-    using L0::Sysman::PlatformMonitoringTech::openFunction;
-    using L0::Sysman::PlatformMonitoringTech::preadFunction;
-    using L0::Sysman::PlatformMonitoringTech::telemetryDeviceEntry;
+class MockTemperatureSysfsAccess : public L0::Sysman::SysFsAccessInterface {
+  public:
+    ze_result_t realPathResult = ZE_RESULT_SUCCESS;
+    std::string mockRealPathValue = mockTemperatureDeviceRealPath;
 
-    ze_result_t mockReadValueResult = ZE_RESULT_SUCCESS;
-    ze_result_t mockReadCoreTempResult = ZE_RESULT_SUCCESS;
-    ze_result_t mockReadComputeTempResult = ZE_RESULT_SUCCESS;
-
-    ~MockTemperaturePmt() override {
-        rootDeviceTelemNodeIndex = 0;
-    }
-
-    void mockedInit(L0::Sysman::FsAccess *pFsAccess) {
-        if (ZE_RESULT_SUCCESS != PlatformMonitoringTech::enumerateRootTelemIndex(pFsAccess, gpuUpstreamPortPathInTemperature)) {
-            return;
+    ze_result_t getRealPath(const std::string &path, std::string &val) override {
+        if (realPathResult != ZE_RESULT_SUCCESS) {
+            return realPathResult;
         }
-        telemetryDeviceEntry = "/sys/class/intel_pmt/telem2/telem";
-    }
-
-    ze_result_t readValue(const std::string key, uint32_t &val) override {
-
-        if (mockReadValueResult != ZE_RESULT_SUCCESS) {
-            return mockReadValueResult;
-        }
-
-        ze_result_t result = ZE_RESULT_SUCCESS;
-        if (key.compare("HBM0MaxDeviceTemperature") == 0) {
-            val = memory0MaxTemperature;
-        } else if (key.compare("HBM1MaxDeviceTemperature") == 0) {
-            val = memory1MaxTemperature;
-        } else if (key.compare("HBM2MaxDeviceTemperature") == 0) {
-            val = memory2MaxTemperature;
-        } else if (key.compare("HBM3MaxDeviceTemperature") == 0) {
-            val = memory3MaxTemperature;
-        } else if (key.compare("GTMaxTemperature") == 0) {
-            val = gtMaxTemperature;
-        } else if (key.compare("TileMaxTemperature") == 0) {
-            val = tileMaxTemperature;
-        } else if (key.compare("COMPUTE_TEMPERATURES") == 0) {
-            if (mockReadComputeTempResult != ZE_RESULT_SUCCESS) {
-                return mockReadComputeTempResult;
-            }
-            val = 0;
-            for (uint8_t i = 0; i < sizeof(uint32_t); i++) {
-                val |= (uint32_t)tempArrForNoSubDevices[(computeTempIndex) + i] << (i * 8);
-            }
-        } else if (key.compare("CORE_TEMPERATURES") == 0) {
-            if (mockReadCoreTempResult != ZE_RESULT_SUCCESS) {
-                return mockReadCoreTempResult;
-            }
-            val = 0;
-            for (uint8_t i = 0; i < sizeof(uint32_t); i++) {
-                val |= (uint32_t)tempArrForNoSubDevices[(coreTempIndex) + i] << (i * 8);
-            }
-        } else {
-            result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-        }
-
-        return result;
-    }
-
-    ze_result_t readValue(const std::string key, uint64_t &val) override {
-
-        if (mockReadValueResult != ZE_RESULT_SUCCESS) {
-            return mockReadValueResult;
-        }
-
-        if (key.compare("SOC_TEMPERATURES") == 0) {
-            val = 0;
-            for (uint8_t i = 0; i < sizeof(uint64_t); i++) {
-                val |= (uint64_t)tempArrForNoSubDevices[(socTempIndex) + i] << (i * 8);
-            }
-            return ZE_RESULT_SUCCESS;
-        } else {
-            return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-        }
-    }
-};
-
-struct MockTemperatureFsAccess : public L0::Sysman::FsAccess {
-    ze_result_t mockErrorListDirectory = ZE_RESULT_SUCCESS;
-    ze_result_t mockErrorGetRealPath = ZE_RESULT_SUCCESS;
-    ze_result_t listDirectory(const std::string directory, std::vector<std::string> &listOfTelemNodes) override {
-        if (mockErrorListDirectory != ZE_RESULT_SUCCESS) {
-            return mockErrorListDirectory;
-        }
-        if (directory.compare(baseTelemSysFS) == 0) {
-            listOfTelemNodes.push_back("telem1");
-            listOfTelemNodes.push_back("telem2");
-            listOfTelemNodes.push_back("telem3");
-            listOfTelemNodes.push_back("telem4");
-            listOfTelemNodes.push_back("telem5");
+        if (path == "device" || path == "device/") {
+            val = mockRealPathValue;
             return ZE_RESULT_SUCCESS;
         }
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
+};
 
-    ze_result_t getRealPath(const std::string path, std::string &buf) override {
-        if (mockErrorGetRealPath != ZE_RESULT_SUCCESS) {
-            return mockErrorGetRealPath;
+struct MockTemperatureFsAccess : public L0::Sysman::FsAccessInterface {
+    MockTemperatureFsAccess() = default;
+
+    ze_result_t scanResult = ZE_RESULT_SUCCESS;
+    std::vector<std::string> directoryEntries = {"hwmon0"};
+    ze_result_t hwmonNameReadResult0 = ZE_RESULT_SUCCESS;
+    ze_result_t hwmonNameReadResult1 = ZE_RESULT_SUCCESS;
+    ze_result_t temp2EmergencyReadResult = ZE_RESULT_SUCCESS;
+    ze_result_t memoryTemperatureReadResult = ZE_RESULT_SUCCESS;
+    ze_result_t gpuTemperatureReadResult = ZE_RESULT_SUCCESS;
+    std::string hwmonName0 = "xe";
+    std::string hwmonName1 = "dummy";
+    int32_t temp2EmergencyValue = 125000;
+    int32_t memoryTemperatureValue = 39000;
+    int32_t gpuTemperatureValue = 45000;
+    bool temp2EmergencyExists = true;
+    bool memoryTemperatureExists = false;
+    bool gpuTemperatureExists = false;
+    bool isRootUserResult = true;
+    std::string listDirectoryPathRequested;
+
+    ze_result_t read(const std::string file, std::string &val) override {
+        if (file == mockTemperatureHwmonNameFile0) {
+            if (hwmonNameReadResult0 == ZE_RESULT_SUCCESS) {
+                val = hwmonName0;
+            }
+            return hwmonNameReadResult0;
         }
-        if (path.compare(sysfsPahTelem1) == 0) {
-            buf = realPathTelem1;
-        } else if (path.compare(sysfsPahTelem2) == 0) {
-            buf = realPathTelem2;
-        } else if (path.compare(sysfsPahTelem3) == 0) {
-            buf = realPathTelem3;
-        } else if (path.compare(sysfsPahTelem4) == 0) {
-            buf = realPathTelem4;
-        } else if (path.compare(sysfsPahTelem5) == 0) {
-            buf = realPathTelem5;
-        } else {
+        if (file == mockTemperatureHwmonNameFile1) {
+            if (hwmonNameReadResult1 == ZE_RESULT_SUCCESS) {
+                val = hwmonName1;
+            }
+            return hwmonNameReadResult1;
+        }
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    ze_result_t read(const std::string file, int32_t &val) override {
+        if (file == mockTemperatureHwmonTempFile0) {
+            if (temp2EmergencyReadResult == ZE_RESULT_SUCCESS) {
+                val = temp2EmergencyValue;
+            }
+            return temp2EmergencyReadResult;
+        }
+        if (file == mockMemoryTemperatureHwmonFile0) {
+            if (memoryTemperatureReadResult == ZE_RESULT_SUCCESS) {
+                val = memoryTemperatureValue;
+            }
+            return memoryTemperatureReadResult;
+        }
+        if (file == mockGpuTemperatureHwmonFile0) {
+            if (gpuTemperatureReadResult == ZE_RESULT_SUCCESS) {
+                val = gpuTemperatureValue;
+            }
+            return gpuTemperatureReadResult;
+        }
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    ze_result_t listDirectory(const std::string path, std::vector<std::string> &listOfEntries) override {
+        listDirectoryPathRequested = path;
+        if (scanResult != ZE_RESULT_SUCCESS) {
+            return scanResult;
+        }
+        if (path != mockTemperatureHwmonDir) {
             return ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
+        listOfEntries = directoryEntries;
         return ZE_RESULT_SUCCESS;
     }
 
-    MockTemperatureFsAccess() = default;
+    bool fileExists(const std::string file) override {
+        if (file == mockTemperatureHwmonTempFile0) {
+            return temp2EmergencyExists;
+        }
+        if (file == mockMemoryTemperatureHwmonFile0) {
+            return memoryTemperatureExists;
+        }
+        if (file == mockGpuTemperatureHwmonFile0) {
+            return gpuTemperatureExists;
+        }
+        if (file == mockTemperatureHwmonSubDir0) {
+            return true;
+        }
+        return false;
+    }
+
+    bool isRootUser() override {
+        return isRootUserResult;
+    }
+};
+
+struct MockTemperatureProcfsAccess : public L0::Sysman::ProcFsAccessInterface {
+    MockTemperatureProcfsAccess() = default;
+    ~MockTemperatureProcfsAccess() override = default;
 };
 
 class PublicLinuxTemperatureImp : public L0::Sysman::LinuxTemperatureImp {
   public:
-    PublicLinuxTemperatureImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId) : LinuxTemperatureImp(pOsSysman, onSubdevice, subdeviceId) {}
-    using L0::Sysman::LinuxTemperatureImp::pPmt;
-    using L0::Sysman::LinuxTemperatureImp::type;
+    PublicLinuxTemperatureImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId, uint32_t sensorIndex) : LinuxTemperatureImp(pOsSysman, onSubdevice, subdeviceId, sensorIndex) {}
 };
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

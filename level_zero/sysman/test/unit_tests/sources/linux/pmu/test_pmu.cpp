@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,26 +11,22 @@
 #include <cmath>
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
+
 struct SysmanPmuFixture : public SysmanDeviceFixture {
   protected:
     std::unique_ptr<MockPmuInterface> pPmuInterface;
     L0::Sysman::PmuInterface *pOriginalPmuInterface = nullptr;
-    std::unique_ptr<MockPmuFsAccess> pFsAccess;
-    L0::Sysman::FsAccess *pFsAccessOriginal = nullptr;
 
     void SetUp() override {
         SysmanDeviceFixture::SetUp();
-        pFsAccessOriginal = pLinuxSysmanImp->pFsAccess;
-        pFsAccess = std::make_unique<MockPmuFsAccess>();
-        pLinuxSysmanImp->pFsAccess = pFsAccess.get();
         pOriginalPmuInterface = pLinuxSysmanImp->pPmuInterface;
         pPmuInterface = std::make_unique<MockPmuInterface>(pLinuxSysmanImp);
         pLinuxSysmanImp->pPmuInterface = pPmuInterface.get();
     }
     void TearDown() override {
         pLinuxSysmanImp->pPmuInterface = pOriginalPmuInterface;
-        pLinuxSysmanImp->pFsAccess = pFsAccessOriginal;
         SysmanDeviceFixture::TearDown();
     }
 };
@@ -45,50 +41,90 @@ inline static ssize_t openReadReturnFailure(int fd, void *data, size_t sizeOfdat
     return -1;
 }
 
+inline static ssize_t openReadReturnShort(int fd, void *data, size_t sizeOfdata) {
+    return sizeOfdata - sizeof(uint64_t);
+}
+
 inline static long int syscallReturnSuccess(long int sysNo, ...) noexcept {
     return mockPmuFd;
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenCallingPmuReadThenSuccessIsReturned) {
-    MockPmuInterfaceImpForSysman *pmuInterface = new MockPmuInterfaceImpForSysman(pLinuxSysmanImp);
+    auto pmuInterface = std::make_unique<MockPmuInterfaceImpForSysman>(pLinuxSysmanImp);
     pmuInterface->readFunction = openReadReturnSuccess;
     uint64_t data[2];
     int validFd = 10;
     EXPECT_EQ(0, pmuInterface->pmuRead(validFd, data, sizeof(data)));
     EXPECT_EQ(mockEventVal, data[0]);
     EXPECT_EQ(mockTimeStamp, data[1]);
-    delete pmuInterface;
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenCallingPerEventOpenThenSuccessIsReturned) {
-    MockPmuInterfaceImpForSysman *pmuInterface = new MockPmuInterfaceImpForSysman(pLinuxSysmanImp);
+    auto pmuInterface = std::make_unique<MockPmuInterfaceImpForSysman>(pLinuxSysmanImp);
     pmuInterface->syscallFunction = syscallReturnSuccess;
     struct perf_event_attr attr = {};
     int cpu = 0;
     attr.read_format = static_cast<uint64_t>(PERF_FORMAT_TOTAL_TIME_ENABLED);
     attr.config = 11;
     EXPECT_EQ(mockPmuFd, pmuInterface->perfEventOpen(&attr, -1, cpu, -1, 0));
-    delete pmuInterface;
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenCallingThenFailureIsReturned) {
-    MockPmuInterfaceImpForSysman *pmuInterface = new MockPmuInterfaceImpForSysman(pLinuxSysmanImp);
+    auto pmuInterface = std::make_unique<MockPmuInterfaceImpForSysman>(pLinuxSysmanImp);
     pmuInterface->readFunction = openReadReturnFailure;
     int validFd = 10;
     uint64_t data[2];
+
+    errno = EACCES; // errno as set by the failing read()
     EXPECT_EQ(-1, pmuInterface->pmuRead(validFd, data, sizeof(data)));
-    delete pmuInterface;
+    EXPECT_EQ(EACCES, errno); // pmuRead must not overwrite it, only a short read sets EIO
+}
+
+TEST_F(SysmanPmuFixture, GivenShortReadWhenCallingPmuReadThenErrnoIsSetToIoError) {
+    auto pmuInterface = std::make_unique<MockPmuInterfaceImpForSysman>(pLinuxSysmanImp);
+    pmuInterface->readFunction = openReadReturnShort;
+    int validFd = 10;
+    uint64_t data[2];
+
+    errno = 0;
+    EXPECT_EQ(-1, pmuInterface->pmuRead(validFd, data, sizeof(data)));
+    EXPECT_EQ(EIO, errno);
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenCallingPmuInterfaceOpenAndPerfEventOpenSucceedsThenVaildFdIsReturned) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::ostringstream oStream;
+        oStream << 18;
+        std::string value = oStream.str();
+        memcpy(buf, value.data(), count);
+        return count;
+    });
+
     uint64_t config = 10;
-    auto &rootDeviceEnvironment = pLinuxSysmanImp->getSysmanDeviceImp()->getRootDeviceEnvironment();
-    auto mutableHwInfo = rootDeviceEnvironment.getMutableHardwareInfo();
-    mutableHwInfo->capabilityTable.isIntegratedDevice = true;
+    bool isIntegratedDevice = true;
+    pLinuxSysmanImp->pSysmanKmdInterface->setSysmanDeviceDirName(isIntegratedDevice);
     EXPECT_EQ(mockPmuFd, pLinuxSysmanImp->pPmuInterface->pmuInterfaceOpen(config, -1, PERF_FORMAT_TOTAL_TIME_ENABLED));
 }
 
+TEST_F(SysmanPmuFixture, GivenUnavailablePmuEventTypeWhenCallingPmuInterfaceOpenThenErrnoIsSetToNotAvailable) {
+    uint64_t config = 10;
+
+    errno = 0;
+    EXPECT_EQ(-ENOENT, pLinuxSysmanImp->pPmuInterface->pmuInterfaceOpen(config, -1, PERF_FORMAT_TOTAL_TIME_ENABLED));
+    EXPECT_EQ(ENOENT, errno);
+}
+
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenReadingGroupOfEventsUsingGroupFdThenSuccessIsReturned) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::ostringstream oStream;
+        oStream << 18;
+        std::string value = oStream.str();
+        memcpy(buf, value.data(), count);
+        return count;
+    });
+
     uint64_t configForEvent1 = 10;
     int64_t groupFd = pLinuxSysmanImp->pPmuInterface->pmuInterfaceOpen(configForEvent1, -1, PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_GROUP); // To get group leader
     uint64_t configForEvent2 = 15;
@@ -102,30 +138,46 @@ TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenReadingGroupOfEventsUsingGroupFd
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenCallingPmuInterfaceOpenAndPerfEventOpenFailsThenFailureIsReturned) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::ostringstream oStream;
+        oStream << 18;
+        std::string value = oStream.str();
+        memcpy(buf, value.data(), count);
+        return count;
+    });
+
     pPmuInterface->perfEventOpenResult = -1;
     uint64_t config = 10;
-    auto &rootDeviceEnvironment = pLinuxSysmanImp->getSysmanDeviceImp()->getRootDeviceEnvironment();
-    auto mutableHwInfo = rootDeviceEnvironment.getMutableHardwareInfo();
-    mutableHwInfo->capabilityTable.isIntegratedDevice = true;
+    bool isIntegratedDevice = true;
+    pLinuxSysmanImp->pSysmanKmdInterface->setSysmanDeviceDirName(isIntegratedDevice);
     EXPECT_EQ(-1, pLinuxSysmanImp->pPmuInterface->pmuInterfaceOpen(config, -1, PERF_FORMAT_TOTAL_TIME_ENABLED));
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenCallingPmuInterfaceOpenAndPerfEventOpenFailsAndErrNoSetBySyscallIsNotInvalidArgumentThenFailureIsReturned) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::ostringstream oStream;
+        oStream << 18;
+        std::string value = oStream.str();
+        memcpy(buf, value.data(), count);
+        return count;
+    });
+
     pPmuInterface->perfEventOpenResult = -1;
     pPmuInterface->getErrorNoResult = EBADF;
     uint64_t config = 10;
-    auto &rootDeviceEnvironment = pLinuxSysmanImp->getSysmanDeviceImp()->getRootDeviceEnvironment();
-    auto mutableHwInfo = rootDeviceEnvironment.getMutableHardwareInfo();
-    mutableHwInfo->capabilityTable.isIntegratedDevice = true;
+    bool isIntegratedDevice = true;
+    pLinuxSysmanImp->pSysmanKmdInterface->setSysmanDeviceDirName(isIntegratedDevice);
     EXPECT_EQ(-1, pLinuxSysmanImp->pPmuInterface->pmuInterfaceOpen(config, -1, PERF_FORMAT_TOTAL_TIME_ENABLED));
 }
 
 TEST_F(SysmanPmuFixture, GivenValidPmuHandleWhenAndDomainErrorOccursThenDomainErrorIsReturnedBygetErrorNoFunction) {
-    MockPmuInterfaceImpForSysman *pmuInterface = new MockPmuInterfaceImpForSysman(pLinuxSysmanImp);
+    auto pmuInterface = std::make_unique<MockPmuInterfaceImpForSysman>(pLinuxSysmanImp);
     log(-1.0); // Domain error injected
     EXPECT_EQ(EDOM, pmuInterface->getErrorNo());
-    delete pmuInterface;
 }
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,19 +7,17 @@
 
 #include "level_zero/core/source/driver/host_pointer_manager.h"
 
-#include "shared/source/helpers/aligned_memory.h"
-#include "shared/source/helpers/constants.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/memory_manager/multi_graphics_allocation.h"
 
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
 
 namespace L0 {
 
-void HostPointerManager::MapBasedAllocationTracker::insert(HostPointerData allocationsData) {
-    allocations.insert(std::make_pair(reinterpret_cast<void *>(allocationsData.basePtr), allocationsData));
+void HostPointerManager::MapBasedAllocationTracker::insert(const HostPointerData &allocationsData) {
+    allocations.emplace(reinterpret_cast<void *>(allocationsData.basePtr), allocationsData);
 }
 
 void HostPointerManager::MapBasedAllocationTracker::remove(const void *ptr) {
@@ -84,7 +82,11 @@ ze_result_t HostPointerManager::createHostPointerMultiAllocation(std::vector<Dev
         return ZE_RESULT_ERROR_INVALID_SIZE;
     }
 
-    HostPointerData hostData(static_cast<uint32_t>(devices.size() - 1));
+    uint32_t maxRootDeviceIndex = 0;
+    for (auto device : devices) {
+        maxRootDeviceIndex = std::max(maxRootDeviceIndex, device->getRootDeviceIndex());
+    }
+    HostPointerData hostData(maxRootDeviceIndex);
     hostData.basePtr = ptr;
     hostData.size = size;
     for (auto device : devices) {
@@ -110,7 +112,7 @@ NEO::GraphicsAllocation *HostPointerManager::createHostPointerAllocation(uint32_
                                                                          size_t size,
                                                                          const NEO::DeviceBitfield &deviceBitfield) {
     NEO::AllocationProperties properties = {rootDeviceIndex, false, size,
-                                            NEO::AllocationType::EXTERNAL_HOST_PTR,
+                                            NEO::AllocationType::externalHostPtr,
                                             false, deviceBitfield};
     properties.flags.flushL3RequiredForRead = properties.flags.flushL3RequiredForWrite = true;
     auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(properties,

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,13 +9,16 @@
 
 #include "shared/source/helpers/constants.h"
 #include "shared/source/os_interface/windows/dxgi_wrapper.h"
+#include "shared/test/common/os_interface/windows/ult_adapter_luid.h"
 
 #include <cwchar>
 
 namespace NEO {
 class UltIDXGIAdapter1 : public IDXGIAdapter1 {
   public:
+    virtual ~UltIDXGIAdapter1() = default;
     const static wchar_t *description;
+    uint32_t adapterIndex = 0u;
     // IDXGIAdapter1
     HRESULT STDMETHODCALLTYPE GetDesc1(
         _Out_ DXGI_ADAPTER_DESC1 *pDesc) {
@@ -24,7 +27,7 @@ class UltIDXGIAdapter1 : public IDXGIAdapter1 {
             return S_FALSE;
         }
         swprintf(pDesc->Description, 128, description);
-        pDesc->AdapterLuid.HighPart = 0x1234;
+        pDesc->AdapterLuid = UltAdapterLuid::create(UltAdapterLuid::dxgiFactoryId, adapterIndex);
         pDesc->DeviceId = 0x1234;
         return S_OK;
     }
@@ -77,7 +80,7 @@ class UltIDXGIAdapter1 : public IDXGIAdapter1 {
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(
         REFIID riid,
-        void __RPC_FAR *__RPC_FAR *ppvObject) {
+        void __RPC_FAR * __RPC_FAR * ppvObject) {
 
         return S_OK;
     }
@@ -96,6 +99,7 @@ class UltIDXGIAdapter1 : public IDXGIAdapter1 {
 extern uint32_t numRootDevicesToEnum;
 class UltIDXGIFactory1 : public IDXGIFactory1 {
   public:
+    virtual ~UltIDXGIFactory1() = default;
     HRESULT STDMETHODCALLTYPE EnumAdapters1(
         UINT Adapter,
         IDXGIAdapter1 **ppAdapter) {
@@ -103,7 +107,9 @@ class UltIDXGIFactory1 : public IDXGIFactory1 {
             *(IDXGIAdapter1 **)ppAdapter = nullptr;
             return DXGI_ERROR_NOT_FOUND;
         }
-        *(IDXGIAdapter1 **)ppAdapter = new UltIDXGIAdapter1;
+        auto adapter = new UltIDXGIAdapter1;
+        adapter->adapterIndex = Adapter;
+        *reinterpret_cast<IDXGIAdapter1 **>(ppAdapter) = adapter;
         return S_OK;
     }
 
@@ -171,7 +177,7 @@ class UltIDXGIFactory1 : public IDXGIFactory1 {
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(
         REFIID riid,
-        void __RPC_FAR *__RPC_FAR *ppvObject) {
+        void __RPC_FAR * __RPC_FAR * ppvObject) {
 
         return S_OK;
     }

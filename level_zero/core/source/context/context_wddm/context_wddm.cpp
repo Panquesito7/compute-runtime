@@ -1,0 +1,73 @@
+/*
+ * Copyright (C) 2022-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/memory_manager/external_memory_type.h"
+
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+
+namespace L0 {
+
+uint8_t Context::isOpaqueHandleSupported(IpcHandleType *handleType) {
+    return isWddmOpaqueHandleSupported(handleType);
+}
+
+bool Context::isIPCHandleSharingSupportedByDefault() {
+    if (NEO::debugManager.flags.EnableipcSupportedAllocationByDefault.get()) {
+        return true;
+    }
+    return false;
+}
+
+bool Context::isShareableMemory(const void *exportDesc, bool exportableMemory, NEO::Device *neoDevice, bool ipcSupportedAllocationByDefault) {
+    if (exportableMemory) {
+        return true;
+    }
+
+    if (ipcSupportedAllocationByDefault) {
+        return true;
+    }
+
+    return false;
+}
+
+void Context::closeExternalHandle(uint64_t) {
+}
+
+std::pair<NEO::GraphicsAllocation *, void *> Context::getMemHandlePtr(ze_device_handle_t hDevice, uint64_t handle, NEO::AllocationType allocationType, bool isHostIpcAllocation, unsigned int processId, ze_ipc_memory_flags_t flags, void *reservedHandleData, bool compressedMemory, bool isOpaqueHandle, uint64_t physicalOffset) {
+    return this->driverHandle->importNTHandle(hDevice, reinterpret_cast<void *>(handle), nullptr, NEO::ExternalMemoryType::opaqueWin32, 0u, allocationType, isHostIpcAllocation, processId, compressedMemory, physicalOffset);
+}
+
+void Context::getDataFromIpcHandle(ze_device_handle_t hDevice, const ze_ipc_mem_handle_t &ipcHandle, uint64_t &handle, uint8_t &type, unsigned int &processId, uint64_t &poolOffset, void *&reservedHandleData, bool &compressedMemory, bool &isOpaqueHandle) {
+    const IpcOpaqueMemoryData *ipcData = reinterpret_cast<const IpcOpaqueMemoryData *>(ipcHandle.data);
+    handle = static_cast<uint64_t>(ipcData->handle.reserved);
+    type = ipcData->memoryType;
+    processId = ipcData->processId;
+    poolOffset = ipcData->poolOffset;
+    compressedMemory = ipcData->compressedMemory;
+    reservedHandleData = nullptr;
+    isOpaqueHandle = true;
+}
+
+ze_result_t Context::systemBarrier(ze_device_handle_t hDevice) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+Context::OpaqueHandleImportResult Context::importOpaqueHandleWithFallback(uint64_t handle,
+                                                                          unsigned int processId,
+                                                                          std::optional<uint64_t> cacheID,
+                                                                          void *reservedHandleData,
+                                                                          NEO::Device *neoDevice) {
+    return {handle, true};
+}
+
+void Context::releaseImportedRangeChunkHandles(const std::vector<std::pair<uint64_t, uint64_t>> &importedChunks) {
+    UNRECOVERABLE_IF(!importedChunks.empty());
+}
+} // namespace L0

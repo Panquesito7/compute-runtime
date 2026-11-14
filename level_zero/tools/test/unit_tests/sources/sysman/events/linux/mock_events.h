@@ -1,23 +1,28 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/ptr_math.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/hw_device_id.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
 #include "shared/source/os_interface/linux/system_info.h"
-#include "shared/source/os_interface/os_interface.h"
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include "level_zero/tools/source/sysman/events/events_imp.h"
 #include "level_zero/tools/source/sysman/events/linux/os_events_imp.h"
 #include "level_zero/tools/source/sysman/firmware_util/firmware_util.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_driver_imp.h"
+#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+#include "level_zero/tools/source/sysman/linux/pmu/pmu_imp.h"
+#include "level_zero/tools/test/unit_tests/sources/sysman/linux/pmu/mock_pmu.h"
 
-#include "drm/intel_hwconfig_types.h"
+#include <cstring>
 
 using namespace NEO;
 namespace L0 {
@@ -30,13 +35,10 @@ const std::string ueventFabricFile("/var/lib/libze_intel_gpu/fabric-pci-0000_03_
 const std::string deviceDir("device");
 const std::string deviceMemoryHealth("device_memory_health");
 const std::string eventsDir("/sys/devices/i915_0000_03_00.0/events");
-constexpr int64_t mockPmuFd = 10;
 constexpr uint64_t errorCount = 10u;
-constexpr uint64_t mockTimeStamp = 1100u;
 
-struct MockPmuInterfaceImpForEvents : public PmuInterfaceImp {
-    using PmuInterfaceImp::perfEventOpen;
-    MockPmuInterfaceImpForEvents(LinuxSysmanImp *pLinuxSysmanImp) : PmuInterfaceImp(pLinuxSysmanImp) {}
+struct MockPmuInterfaceImpForEvents : public MockPmuInterfaceImpForSysman {
+    MockPmuInterfaceImpForEvents(LinuxSysmanImp *pLinuxSysmanImp) : MockPmuInterfaceImpForSysman(pLinuxSysmanImp) {}
 
     bool mockPmuReadFail = false;
 
@@ -196,6 +198,10 @@ struct MockEventsSysfsAccess : public SysfsAccess {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
+    ze_result_t read(const std::string file, std::string &val) override {
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
     MockEventsSysfsAccess() = default;
 };
 
@@ -240,13 +246,13 @@ struct MockEventsFwInterface : public FirmwareUtil {
     MockEventsFwInterface() = default;
 
     ADDMETHOD_NOBASE(fwDeviceInit, ze_result_t, ZE_RESULT_SUCCESS, (void));
-    ADDMETHOD_NOBASE(getFirstDevice, ze_result_t, ZE_RESULT_SUCCESS, (igsc_device_info * info));
+    ADDMETHOD_NOBASE(getFirstDevice, ze_result_t, ZE_RESULT_SUCCESS, (IgscDeviceInfo * info));
     ADDMETHOD_NOBASE(getFwVersion, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, std::string &firmwareVersion));
     ADDMETHOD_NOBASE(flashFirmware, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, void *pImage, uint32_t size));
     ADDMETHOD_NOBASE(fwSupportedDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::vector<std::string> & supportedDiagTests));
     ADDMETHOD_NOBASE(fwRunDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::string & osDiagType, zes_diag_result_t *pResult));
     ADDMETHOD_NOBASE(fwGetMemoryErrorCount, ze_result_t, ZE_RESULT_SUCCESS, (zes_ras_error_type_t category, uint32_t subDeviceCount, uint32_t subDeviceId, uint64_t &count));
-    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t * currentState, uint8_t *pendingState));
+    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t *currentState, uint8_t *pendingState));
     ADDMETHOD_NOBASE(fwSetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t newState, uint8_t *currentState, uint8_t *pendingState));
     ADDMETHOD_NOBASE_VOIDRETURN(getDeviceSupportedFwTypes, (std::vector<std::string> & fwTypes));
     ADDMETHOD_NOBASE_VOIDRETURN(fwGetMemoryHealthIndicator, (zes_mem_health_t * health));
@@ -254,8 +260,8 @@ struct MockEventsFwInterface : public FirmwareUtil {
 
 struct MockEventNeoDrm : public Drm {
     using Drm::ioctlHelper;
-    uint32_t mockMemoryType = INTEL_HWCONFIG_MEMORY_TYPE_HBM2e;
-    const int mockFd = 33;
+    uint32_t mockMemoryType = NEO::DeviceBlobConstants::MemoryType::hbm2e;
+    static constexpr int mockFd = 33;
     std::vector<bool> mockQuerySystemInfoReturnValue{};
     bool isRepeated = false;
     bool mockReturnEmptyRegions = false;
@@ -265,7 +271,7 @@ struct MockEventNeoDrm : public Drm {
         mockMemoryType = memory;
     }
 
-    std::vector<uint8_t> getMemoryRegionsReturnsEmpty() {
+    std::vector<uint64_t> getMemoryRegionsReturnsEmpty() {
         return {};
     }
 
@@ -279,8 +285,8 @@ struct MockEventNeoDrm : public Drm {
             return returnValue;
         }
 
-        uint32_t hwBlob[] = {INTEL_HWCONFIG_MAX_MEMORY_CHANNELS, 1, 8, INTEL_HWCONFIG_MEMORY_TYPE, 0, mockMemoryType};
-        std::vector<uint8_t> inputBlobData(reinterpret_cast<uint8_t *>(hwBlob), reinterpret_cast<uint8_t *>(hwBlob) + sizeof(hwBlob));
+        uint32_t hwBlob[] = {NEO::DeviceBlobConstants::maxMemoryChannels, 1, 8, NEO::DeviceBlobConstants::memoryType, 0, mockMemoryType};
+        std::vector<uint32_t> inputBlobData(reinterpret_cast<uint32_t *>(hwBlob), reinterpret_cast<uint32_t *>(ptrOffset(hwBlob, sizeof(hwBlob))));
         this->systemInfo.reset(new SystemInfo(inputBlobData));
         return returnValue;
     }

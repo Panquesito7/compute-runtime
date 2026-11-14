@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -27,7 +27,7 @@ struct MiAtomicAubFixture : public AUBFixture {
         AllocationProperties commandBufferProperties = {device->getRootDeviceIndex(),
                                                         true,
                                                         MemoryConstants::pageSize,
-                                                        AllocationType::COMMAND_BUFFER,
+                                                        AllocationType::commandBuffer,
                                                         false,
                                                         device->getDeviceBitfield()};
         streamAllocation = memoryManager->allocateGraphicsMemoryWithProperties(commandBufferProperties);
@@ -36,7 +36,7 @@ struct MiAtomicAubFixture : public AUBFixture {
         AllocationProperties deviceBufferProperties = {device->getRootDeviceIndex(),
                                                        true,
                                                        MemoryConstants::pageSize,
-                                                       AllocationType::BUFFER,
+                                                       AllocationType::buffer,
                                                        false,
                                                        device->getDeviceBitfield()};
         deviceSurface = memoryManager->allocateGraphicsMemoryWithProperties(deviceBufferProperties);
@@ -45,7 +45,7 @@ struct MiAtomicAubFixture : public AUBFixture {
         AllocationProperties systemBufferProperties = {device->getRootDeviceIndex(),
                                                        true,
                                                        MemoryConstants::pageSize,
-                                                       AllocationType::SVM_CPU,
+                                                       AllocationType::svmCpu,
                                                        false,
                                                        device->getDeviceBitfield()};
         systemSurface = memoryManager->allocateGraphicsMemoryWithProperties(systemBufferProperties);
@@ -72,9 +72,9 @@ struct MiAtomicAubFixture : public AUBFixture {
         csr->makeResident(*deviceSurface);
         csr->makeResident(*systemSurface);
         csr->flushTask(taskStream, 0,
-                       &csr->getIndirectHeap(IndirectHeapType::DYNAMIC_STATE, 0u),
-                       &csr->getIndirectHeap(IndirectHeapType::INDIRECT_OBJECT, 0u),
-                       &csr->getIndirectHeap(IndirectHeapType::SURFACE_STATE, 0u),
+                       &csr->getIndirectHeap(IndirectHeapType::dynamicState, 0u),
+                       &csr->getIndirectHeap(IndirectHeapType::indirectObject, 0u),
+                       &csr->getIndirectHeap(IndirectHeapType::surfaceState, 0u),
                        0u, dispatchFlags, device->getDevice());
 
         csr->flushBatchedSubmissions();
@@ -110,11 +110,12 @@ HWTEST_F(MiAtomicAubTest, WhenDispatchingAtomicMoveOperationThenExpectCorrectEnd
 
     uint32_t operation3dword0 = 0xF0;
     uint32_t operation3dword1 = 0x1F;
+    uint64_t operation3qword = (static_cast<uint64_t>(operation3dword1) << 32) | operation3dword0;
+
     EncodeAtomic<FamilyType>::programMiAtomic(taskStream, expectedGpuAddressQwordOp3,
                                               MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_8B_MOVE,
                                               MI_ATOMIC::DATA_SIZE::DATA_SIZE_QWORD,
-                                              0, 0, operation3dword0, operation3dword1);
-    uint64_t operation3qword = (static_cast<uint64_t>(operation3dword1) << 32) | operation3dword0;
+                                              0, 0, operation3qword, 0);
 
     flushStream();
 

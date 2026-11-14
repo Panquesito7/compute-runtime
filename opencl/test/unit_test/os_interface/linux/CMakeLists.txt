@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2023 Intel Corporation
+# Copyright (C) 2018-2024 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -12,9 +12,10 @@ set(IGDRCL_SRCS_tests_os_interface_linux
     ${CMAKE_CURRENT_SOURCE_DIR}/mock_performance_counters_linux.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/mock_performance_counters_linux.h
     ${CMAKE_CURRENT_SOURCE_DIR}/performance_counters_linux_tests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform_tests_lin.cpp
 )
 
-if(NEO_ENABLE_i915_PRELIM_DETECTION)
+if(NEO_ENABLE_I915_PRELIM_DETECTION)
   if(TESTS_XE_HPC_CORE)
     list(APPEND IGDRCL_SRCS_tests_os_interface_linux
          ${CMAKE_CURRENT_SOURCE_DIR}/cl_mem_cache_clos_tests_xe_hpc.cpp

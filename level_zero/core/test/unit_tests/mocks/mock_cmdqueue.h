@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,44 +7,66 @@
 
 #pragma once
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_context.h"
 #include "level_zero/core/source/cmdqueue/cmdqueue_hw.h"
-#include "level_zero/core/source/cmdqueue/cmdqueue_imp.h"
 #include "level_zero/core/test/unit_tests/mock.h"
 #include "level_zero/core/test/unit_tests/white_box.h"
 
 #include <cstddef>
 #include <optional>
 
+namespace NEO {
+class GraphicsAllocation;
+class LinearStream;
+class ScratchSpaceController;
+enum class SubmissionStatus : uint32_t;
+enum class WaitStatus;
+} // namespace NEO
+
 namespace L0 {
+struct Device;
+
 namespace ult {
+template <typename Type>
+struct Mock;
+template <typename Type>
+struct WhiteBox;
 
 template <>
-struct WhiteBox<::L0::CommandQueue> : public ::L0::CommandQueueImp {
-    using BaseClass = ::L0::CommandQueueImp;
+struct WhiteBox<::L0::CommandQueue> : public ::L0::CommandQueue {
+    using BaseClass = ::L0::CommandQueue;
+    using BaseClass::activeSubDevices;
     using BaseClass::buffers;
+    using BaseClass::cachedSipAllocation;
+    using BaseClass::cmdListHeapAddressModel;
     using BaseClass::cmdListWithAssertExecuted;
     using BaseClass::commandStream;
     using BaseClass::csr;
+    using BaseClass::desc;
     using BaseClass::device;
+    using BaseClass::dispatchCmdListBatchBufferAsPrimary;
+    using BaseClass::doubleSbaWa;
+    using BaseClass::firstCmdListStream;
+    using BaseClass::forceBbStartJump;
+    using BaseClass::frontEndStateTracking;
+    using BaseClass::heaplessModeEnabled;
+    using BaseClass::internalUsage;
+    using BaseClass::partitionCount;
+    using BaseClass::patchingPreamble;
+    using BaseClass::patchPreambleCounter;
+    using BaseClass::pipelineSelectStateTracking;
     using BaseClass::preemptionCmdSyncProgramming;
     using BaseClass::printfKernelContainer;
+    using BaseClass::saveWaitForPreamble;
     using BaseClass::startingCmdBuffer;
+    using BaseClass::stateBaseAddressTracking;
+    using BaseClass::stateComputeModeTracking;
     using BaseClass::submitBatchBuffer;
     using BaseClass::synchronizeByPollingForTaskCount;
     using BaseClass::taskCount;
-    using CommandQueue::activeSubDevices;
-    using CommandQueue::cmdListHeapAddressModel;
-    using CommandQueue::dispatchCmdListBatchBufferAsPrimary;
-    using CommandQueue::doubleSbaWa;
-    using CommandQueue::frontEndStateTracking;
-    using CommandQueue::internalQueueForImmediateCommandList;
-    using CommandQueue::internalUsage;
-    using CommandQueue::partitionCount;
-    using CommandQueue::pipelineSelectStateTracking;
-    using CommandQueue::stateBaseAddressTracking;
-    using CommandQueue::stateComputeModeTracking;
 
     WhiteBox(Device *device, NEO::CommandStreamReceiver *csr,
              const ze_command_queue_desc_t *desc);
@@ -52,17 +74,19 @@ struct WhiteBox<::L0::CommandQueue> : public ::L0::CommandQueueImp {
 };
 using CommandQueue = WhiteBox<::L0::CommandQueue>;
 
-static ze_command_queue_desc_t default_cmd_queue_desc = {};
+static ze_command_queue_desc_t defaultCmdqueueDesc = {};
 template <>
 struct Mock<CommandQueue> : public CommandQueue {
-    Mock(L0::Device *device = nullptr, NEO::CommandStreamReceiver *csr = nullptr, const ze_command_queue_desc_t *desc = &default_cmd_queue_desc);
+    Mock(L0::Device *device = nullptr, NEO::CommandStreamReceiver *csr = nullptr, const ze_command_queue_desc_t *desc = &defaultCmdqueueDesc);
     ~Mock() override;
+
+    using CommandQueue::isCopyOnlyCommandQueue;
 
     ADDMETHOD_NOBASE(createFence, ze_result_t, ZE_RESULT_SUCCESS, (const ze_fence_desc_t *desc, ze_fence_handle_t *phFence));
     ADDMETHOD_NOBASE(destroy, ze_result_t, ZE_RESULT_SUCCESS, ());
-    ADDMETHOD_NOBASE(executeCommandLists, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t numCommandLists, ze_command_list_handle_t *phCommandLists, ze_fence_handle_t hFence, bool performMigration));
-    ADDMETHOD_NOBASE(executeCommands, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t numCommands, void *phCommands, ze_fence_handle_t hFence));
-    ADDMETHOD_NOBASE(synchronize, ze_result_t, ZE_RESULT_SUCCESS, (uint64_t timeout));
+    ADDMETHOD_NOBASE(executeCommandLists, ze_result_t, ZE_RESULT_SUCCESS,
+                     (uint32_t numCommandLists, ze_command_list_handle_t *phCommandLists, ze_fence_handle_t hFence,
+                      CommandListExecutionInternalOptions &internalOptions));
     ADDMETHOD_NOBASE(getPreemptionCmdProgramming, bool, false, ());
 };
 
@@ -70,23 +94,33 @@ template <GFXCORE_FAMILY gfxCoreFamily>
 struct MockCommandQueueHw : public L0::CommandQueueHw<gfxCoreFamily> {
     using BaseClass = ::L0::CommandQueueHw<gfxCoreFamily>;
     using BaseClass::commandStream;
+    using BaseClass::estimateCommandListPatchPreambleWaitSyncSize;
+    using BaseClass::estimateFrontEndCmdSizeForMultipleCommandLists;
+    using BaseClass::executeCommandListsRegularHeapless;
+    using BaseClass::forceBbStartJump;
+    using BaseClass::heapContainer;
     using BaseClass::prepareAndSubmitBatchBuffer;
     using BaseClass::printfKernelContainer;
     using BaseClass::startingCmdBuffer;
+    using BaseClass::waitForCommandQueueCompletion;
     using L0::CommandQueue::activeSubDevices;
     using L0::CommandQueue::cmdListHeapAddressModel;
+    using L0::CommandQueue::copyOffloadQueue;
+    using L0::CommandQueue::csr;
     using L0::CommandQueue::dispatchCmdListBatchBufferAsPrimary;
     using L0::CommandQueue::doubleSbaWa;
     using L0::CommandQueue::frontEndStateTracking;
-    using L0::CommandQueue::internalQueueForImmediateCommandList;
+    using L0::CommandQueue::heaplessModeEnabled;
     using L0::CommandQueue::internalUsage;
     using L0::CommandQueue::partitionCount;
+    using L0::CommandQueue::patchingPreamble;
+    using L0::CommandQueue::patchPreambleCounter;
     using L0::CommandQueue::pipelineSelectStateTracking;
     using L0::CommandQueue::preemptionCmdSyncProgramming;
+    using L0::CommandQueue::saveWaitForPreamble;
     using L0::CommandQueue::stateBaseAddressTracking;
     using L0::CommandQueue::stateComputeModeTracking;
-    using L0::CommandQueueImp::csr;
-    using typename BaseClass::CommandListExecutionContext;
+    using L0::CommandQueue::useKmdWaitFunction;
 
     MockCommandQueueHw(L0::Device *device, NEO::CommandStreamReceiver *csr, const ze_command_queue_desc_t *desc) : L0::CommandQueueHw<gfxCoreFamily>(device, csr, desc) {
     }
@@ -103,26 +137,64 @@ struct MockCommandQueueHw : public L0::CommandQueueHw<gfxCoreFamily> {
         return BaseClass::reserveLinearStreamSize(size);
     }
 
-    NEO::SubmissionStatus submitBatchBuffer(size_t offset, NEO::ResidencyContainer &residencyContainer, void *endingCmdPtr, bool isCooperative) override {
-        residencyContainerSnapshot = residencyContainer;
+    NEO::SubmissionStatus submitBatchBuffer(size_t offset, void *endingCmdPtr, bool isCooperative) override {
+        residencyContainerSnapshot = this->csr->getResidencyAllocations();
         if (submitBatchBufferReturnValue.has_value()) {
             return *submitBatchBufferReturnValue;
         }
         if (this->startingCmdBuffer == nullptr) {
             this->startingCmdBuffer = &this->commandStream;
         }
-        return BaseClass::submitBatchBuffer(offset, residencyContainer, endingCmdPtr, isCooperative);
+        return BaseClass::submitBatchBuffer(offset, endingCmdPtr, isCooperative);
     }
 
+    ze_result_t executeCommandListsRegular(CommandListExecutionContext &ctx,
+                                           uint32_t numCommandLists,
+                                           ze_command_list_handle_t *commandListHandles,
+                                           ze_fence_handle_t hFence) override {
+        recordedGlobalStatelessAllocation = ctx.globalStatelessAllocation;
+        recordedScratchController = ctx.scratchSpaceController;
+        recordedLockScratchController = ctx.lockScratchController;
+        return BaseClass::executeCommandListsRegular(ctx, numCommandLists, commandListHandles, hFence);
+    }
+
+    ze_result_t executeCommandListsRegularHeapless(CommandListExecutionContext &ctx,
+                                                   uint32_t numCommandLists,
+                                                   ze_command_list_handle_t *commandListHandles,
+                                                   ze_fence_handle_t hFence) override {
+        recordedGlobalStatelessAllocation = ctx.globalStatelessAllocation;
+        recordedScratchController = ctx.scratchSpaceController;
+        recordedLockScratchController = ctx.lockScratchController;
+        return BaseClass::executeCommandListsRegularHeapless(ctx, numCommandLists, commandListHandles, hFence);
+    }
+
+    ze_result_t initialize(bool copyOnly, bool isInternal, bool immediateCmdListQueue) override {
+        auto returnCode = BaseClass::initialize(copyOnly, isInternal, immediateCmdListQueue);
+
+        if (this->cmdListHeapAddressModel == NEO::HeapAddressModel::globalStateless) {
+            this->csr->createGlobalStatelessHeap();
+        }
+        return returnCode;
+    }
+
+    void handleIndirectAllocationResidency(UnifiedMemoryControls unifiedMemoryControls, std::unique_lock<std::mutex> &lockForIndirect, bool performMigration) override {
+        handleIndirectAllocationResidencyCalledTimes++;
+        BaseClass::handleIndirectAllocationResidency(unifiedMemoryControls, lockForIndirect, performMigration);
+    }
+
+    NEO::GraphicsAllocation *recordedGlobalStatelessAllocation = nullptr;
+    NEO::ScratchSpaceController *recordedScratchController = nullptr;
     uint32_t synchronizedCalled = 0;
     NEO::ResidencyContainer residencyContainerSnapshot;
     ze_result_t synchronizeReturnValue{ZE_RESULT_SUCCESS};
     std::optional<NEO::WaitStatus> reserveLinearStreamSizeReturnValue{};
     std::optional<NEO::SubmissionStatus> submitBatchBufferReturnValue{};
+    uint32_t handleIndirectAllocationResidencyCalledTimes = 0;
+    bool recordedLockScratchController = false;
 };
 
 struct Deleter {
-    void operator()(CommandQueueImp *cmdQ) {
+    void operator()(::L0::CommandQueue *cmdQ) {
         cmdQ->destroy();
     }
 };

@@ -1,27 +1,24 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/xe_hpg_core/hw_cmds_xe_hpg_core_base.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/helpers/state_base_address_tests.h"
 
-#include "hw_cmds_xe_hpg_core_base.h"
-
 using namespace NEO;
 
 using XeHpgCoreHwCmdTest = ::testing::Test;
 
-XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenMediaSurfaceStateWhenProgrammingMocsThenMocsIndexIsSetProperly) {
-    auto mediaSurfaceState = FamilyType::cmdInitMediaSurfaceState;
-    uint32_t mocs = 4u;
-    uint32_t expectedMocsIndex = (mocs >> 1);
-    mediaSurfaceState.setSurfaceMemoryObjectControlState(mocs);
-    EXPECT_EQ(expectedMocsIndex, mediaSurfaceState.TheStructure.Common.SurfaceMemoryObjectControlState_IndexToMocsTables);
+XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenComputeWalkerThenPostSyncTypeIsPostSyncData) {
+    auto postSyncType = FamilyType::template getPostSyncType<typename FamilyType::DefaultWalkerType>();
+    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
+    EXPECT_TRUE((std::is_same<POSTSYNC_DATA, decltype(postSyncType)>::value));
 }
 
 XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenRenderSurfaceStateWhenProgrammingMocsThenMocsIndexIsSetProperly) {
@@ -69,31 +66,22 @@ XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenPostSyncDataWhenProgrammingMocsThenMo
     uint32_t mocs = 4u;
     uint32_t expectedMocsIndex = (mocs >> 1);
     postSyncData.setMocs(mocs);
-    EXPECT_EQ(expectedMocsIndex, postSyncData.TheStructure.Common.MocsIndexToMocsTables);
+    EXPECT_EQ(expectedMocsIndex, postSyncData.TheStructure.Common.IndexToMocsTables);
 }
 
-XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenLoadRegisterMemWhenProgrammingMocsThenMocsIndexIsSetProperly) {
-    auto loadRegisterMem = FamilyType::cmdInitLoadRegisterMem;
-    uint32_t mocs = 4u;
-    uint32_t expectedMocsIndex = (mocs >> 1);
-    loadRegisterMem.setMemoryObjectControlState(mocs);
-    EXPECT_EQ(expectedMocsIndex, loadRegisterMem.TheStructure.Common.MemoryObjectControlStateIndexToMocsTables);
-}
-
-XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenStoreRegisterMemWhenProgrammingMocsThenMocsIndexIsSetProperly) {
-    auto storeRegisterMem = FamilyType::cmdInitStoreRegisterMem;
-    uint32_t mocs = 4u;
-    uint32_t expectedMocsIndex = (mocs >> 1);
-    storeRegisterMem.setMemoryObjectControlState(mocs);
-    EXPECT_EQ(expectedMocsIndex, storeRegisterMem.TheStructure.Common.MemoryObjectControlStateIndexToMocsTables);
-}
-
-XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenStoreDataImmWhenProgrammingMocsThenMocsIndexIsSetProperly) {
-    auto storeDataImm = FamilyType::cmdInitStoreDataImm;
-    uint32_t mocs = 4u;
-    uint32_t expectedMocsIndex = (mocs >> 1);
-    storeDataImm.setMemoryObjectControlState(mocs);
-    EXPECT_EQ(expectedMocsIndex, storeDataImm.TheStructure.Common.MemoryObjectControlStateIndexToMocsTables);
+XE_HPG_CORETEST_F(XeHpgCoreHwCmdTest, givenArbCheckWhenProgrammingPreParserDisableThenMaskBitIsSet) {
+    {
+        auto arbCheck = FamilyType::cmdInitArbCheck;
+        EXPECT_EQ(0u, arbCheck.TheStructure.Common.MaskBits);
+        arbCheck.setPreParserDisable(true);
+        EXPECT_EQ(1u, arbCheck.TheStructure.Common.MaskBits);
+    }
+    {
+        auto arbCheck = FamilyType::cmdInitArbCheck;
+        EXPECT_EQ(0u, arbCheck.TheStructure.Common.MaskBits);
+        arbCheck.setPreParserDisable(false);
+        EXPECT_EQ(1u, arbCheck.TheStructure.Common.MaskBits);
+    }
 }
 
 using XeHpgSbaTest = SbaTest;
@@ -105,12 +93,12 @@ XE_HPG_CORETEST_F(XeHpgSbaTest, givenSpecificProductFamilyWhenAppendingSbaThenPr
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_POLICY_WBP, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_CONTROL_WBP, sbaCmd.getL1CacheControlCachePolicy());
 }
 
 XE_HPG_CORETEST_F(XeHpgSbaTest, givenL1CachingOverrideWhenStateBaseAddressIsProgrammedThenItMatchesTheOverrideValue) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceStatelessL1CachingPolicy.set(0u);
+    debugManager.flags.ForceStatelessL1CachingPolicy.set(0u);
     auto sbaCmd = FamilyType::cmdInitStateBaseAddress;
     StateBaseAddressHelperArgs<FamilyType> args = createSbaHelperArgs<FamilyType>(&sbaCmd, pDevice->getRootDeviceEnvironment().getGmmHelper(), &ssh, nullptr, nullptr);
     args.setGeneralStateBaseAddress = true;
@@ -120,19 +108,19 @@ XE_HPG_CORETEST_F(XeHpgSbaTest, givenL1CachingOverrideWhenStateBaseAddressIsProg
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(0u, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(0u, sbaCmd.getL1CacheControlCachePolicy());
 
-    DebugManager.flags.ForceStatelessL1CachingPolicy.set(2u);
+    debugManager.flags.ForceStatelessL1CachingPolicy.set(2u);
     updateSbaHelperArgsL1CachePolicy<FamilyType>(args, productHelper);
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(2u, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(2u, sbaCmd.getL1CacheControlCachePolicy());
 
-    DebugManager.flags.ForceAllResourcesUncached.set(true);
+    debugManager.flags.ForceAllResourcesUncached.set(true);
     updateSbaHelperArgsL1CachePolicy<FamilyType>(args, productHelper);
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(1u, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(1u, sbaCmd.getL1CacheControlCachePolicy());
 }

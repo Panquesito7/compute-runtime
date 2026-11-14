@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/source/command_stream/queue_throttle.h"
 #include "shared/source/command_stream/task_count_helper.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/kmd_notify_helper.h"
 
 #include <chrono>
 #include <cstdint>
@@ -24,7 +25,7 @@ WaitParams KmdNotifyHelper::obtainTimeoutParams(bool quickKmdSleepRequest,
                                                 bool kmdWaitModeActive,
                                                 bool directSubmissionEnabled) {
     if (throttle == QueueThrottle::HIGH) {
-        return WaitParams{true};
+        return WaitParams{true, false, false, 0};
     }
 
     if (flushStampToWait == 0) {
@@ -35,12 +36,12 @@ WaitParams KmdNotifyHelper::obtainTimeoutParams(bool quickKmdSleepRequest,
         return WaitParams{};
     }
 
-    if (DebugManager.flags.PowerSavingMode.get() || throttle == QueueThrottle::LOW) {
-        return WaitParams{false, true, 1};
+    if (debugManager.flags.PowerSavingMode.get() || throttle == QueueThrottle::LOW) {
+        return WaitParams{false, true, false, 1};
     }
 
-    int64_t multiplier = (currentHwTag < taskCountToWait) ? static_cast<int64_t>(taskCountToWait - currentHwTag) : 1;
-    if (!properties->enableKmdNotify && multiplier > KmdNotifyConstants::minimumTaskCountDiffToCheckAcLine) {
+    const int64_t taskCountDiff = (currentHwTag < taskCountToWait) ? static_cast<int64_t>(taskCountToWait - currentHwTag) : 1;
+    if (!properties->enableKmdNotify && taskCountDiff > KmdNotifyConstants::minimumTaskCountDiffToCheckAcLine) {
         updateAcLineStatus();
     }
 
@@ -54,7 +55,7 @@ WaitParams KmdNotifyHelper::obtainTimeoutParams(bool quickKmdSleepRequest,
     } else if (directSubmissionEnabled && properties->enableQuickKmdSleepForDirectSubmission) {
         params.waitTimeout = properties->delayQuickKmdSleepForDirectSubmissionMicroseconds;
     } else {
-        params.waitTimeout = getBaseTimeout(multiplier);
+        params.waitTimeout = properties->delayKmdNotifyMicroseconds;
     }
 
     params.enableTimeout = (properties->enableKmdNotify || !acLineConnected);

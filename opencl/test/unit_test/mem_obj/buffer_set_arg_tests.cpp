@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,11 +8,13 @@
 #include "shared/source/command_container/encode_surface_state.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/gmm_resource_usage_ocl_buffer.h"
 #include "shared/source/helpers/address_patch.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/memory_manager/surface.h"
 #include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/kernel/kernel.h"
@@ -22,7 +24,6 @@
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_program.h"
-#include "opencl/test/unit_test/test_macros/test_checks_ocl.h"
 
 #include "gtest/gtest.h"
 
@@ -85,7 +86,6 @@ class BufferSetArgTest : public ContextFixture,
     MultiDeviceKernel *pMultiDeviceKernel = nullptr;
     MockKernel *pKernel = nullptr;
     std::unique_ptr<MockKernelInfo> pKernelInfo;
-    SKernelBinaryHeaderCommon kernelHeader;
     char surfaceStateHeap[0x80];
     char pCrossThreadData[64];
     Buffer *buffer = nullptr;
@@ -107,7 +107,7 @@ TEST_F(BufferSetArgTest, givenInvalidSizeWhenSettingKernelArgBufferThenReturnClI
 }
 
 HWTEST_F(BufferSetArgTest, givenSetArgBufferWhenNullArgStatefulThenProgramNullSurfaceState) {
-    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
     using SURFACE_FORMAT = typename RENDER_SURFACE_STATE::SURFACE_FORMAT;
 
     pKernelInfo->argAsPtr(0).bindful = 0;
@@ -116,11 +116,13 @@ HWTEST_F(BufferSetArgTest, givenSetArgBufferWhenNullArgStatefulThenProgramNullSu
     EXPECT_EQ(CL_SUCCESS, ret);
 
     auto surfaceState = reinterpret_cast<const RENDER_SURFACE_STATE *>(ptrOffset(pKernel->getSurfaceStateHeap(), pKernelInfo->argAsPtr(0).bindful));
-    auto surfaceFormat = surfaceState->getSurfaceType();
     auto surfacetype = surfaceState->getSurfaceFormat();
-
-    EXPECT_EQ(surfaceFormat, RENDER_SURFACE_STATE::SURFACE_TYPE_SURFTYPE_NULL);
     EXPECT_EQ(surfacetype, SURFACE_FORMAT::SURFACE_FORMAT_RAW);
+
+    if constexpr (supportsLegacyRenderSurfaceState<FamilyType>()) {
+        auto surfaceFormat = surfaceState->getSurfaceType();
+        EXPECT_EQ(surfaceFormat, RENDER_SURFACE_STATE::SURFACE_TYPE_SURFTYPE_NULL);
+    }
 }
 
 HWTEST_F(BufferSetArgTest, givenSetKernelArgOnReadOnlyBufferThatIsMisalingedWhenSurfaceStateIsSetThenCachingIsOn) {
@@ -141,15 +143,12 @@ HWTEST_F(BufferSetArgTest, givenSetKernelArgOnReadOnlyBufferThatIsMisalingedWhen
     auto surfaceState = reinterpret_cast<const RENDER_SURFACE_STATE *>(ptrOffset(pKernel->getSurfaceStateHeap(), pKernelInfo->argAsPtr(0).bindful));
     auto mocs = surfaceState->getMemoryObjectControlState();
     auto gmmHelper = pDevice->getGmmHelper();
-    auto expectedMocs = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER);
-    auto expectedMocs2 = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CONST);
+    auto expectedMocs = gmmHelper->getL3EnabledMOCS();
+    auto expectedMocs2 = gmmHelper->getL1EnabledMOCS();
     EXPECT_TRUE(expectedMocs == mocs || expectedMocs2 == mocs);
 }
 
 HWTEST_F(BufferSetArgTest, givenSetArgBufferWithNullArgStatelessThenDontProgramNullSurfaceState) {
-    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
-    using SURFACE_FORMAT = typename RENDER_SURFACE_STATE::SURFACE_FORMAT;
-
     char sshOriginal[sizeof(surfaceStateHeap)];
     memcpy(sshOriginal, surfaceStateHeap, sizeof(surfaceStateHeap));
 
@@ -168,8 +167,11 @@ HWTEST_F(BufferSetArgTest, givenNonPureStatefulArgWhenCompressedBufferIsSetThenS
     pKernelInfo->argAsPtr(0).bindful = 0;
 
     auto graphicsAllocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
-    graphicsAllocation->setDefaultGmm(new Gmm(pDevice->getGmmHelper(), graphicsAllocation->getUnderlyingBuffer(), buffer->getSize(), 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
-    graphicsAllocation->getDefaultGmm()->isCompressionEnabled = true;
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    graphicsAllocation->setDefaultGmm(new Gmm(pDevice->getGmmHelper(), graphicsAllocation->getUnderlyingBuffer(), buffer->getSize(), 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
+    graphicsAllocation->getDefaultGmm()->setCompressionEnabled(true);
     cl_mem clMem = buffer;
 
     cl_int ret = pKernel->setArgBuffer(0, sizeof(cl_mem), &clMem);
@@ -195,7 +197,7 @@ TEST_F(BufferSetArgTest, Given32BitAddressingWhenSettingArgStatelessThenGpuAddre
     EXPECT_EQ(reinterpret_cast<void *>(buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress() - gpuBase), *pKernelArg);
 }
 
-TEST_F(BufferSetArgTest, givenBufferWhenOffsetedSubbufferIsPassedToSetKernelArgThenCorrectGpuVAIsPatched) {
+TEST_F(BufferSetArgTest, givenBufferWhenOffsetSubbufferIsPassedToSetKernelArgThenCorrectGpuVAIsPatched) {
     cl_buffer_region region;
     region.origin = 0xc0;
     region.size = 32;
@@ -222,7 +224,7 @@ TEST_F(BufferSetArgTest, givenCurbeTokenThatSizeIs4BytesWhenStatelessArgIsPatche
     // fill 8 bytes with 0xffffffffffffffff;
     uint64_t fillValue = -1;
     uint64_t *pointer64bytes = (uint64_t *)pKernelArg;
-    *pointer64bytes = fillValue;
+    std::memcpy(pointer64bytes, &fillValue, sizeof(fillValue));
 
     constexpr uint32_t sizeOf4Bytes = sizeof(uint32_t);
     pKernelInfo->argAsPtr(0).pointerSize = sizeOf4Bytes;
@@ -232,7 +234,8 @@ TEST_F(BufferSetArgTest, givenCurbeTokenThatSizeIs4BytesWhenStatelessArgIsPatche
     // make sure only 4 bytes are patched
     auto bufferAddress = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress();
     uint32_t address32bits = static_cast<uint32_t>(bufferAddress);
-    uint64_t curbeValue = *pointer64bytes;
+    uint64_t curbeValue;
+    std::memcpy(&curbeValue, pointer64bytes, sizeof(curbeValue));
     uint32_t higherPart = curbeValue >> 32;
     uint32_t lowerPart = (curbeValue & 0xffffffff);
     EXPECT_EQ(0xffffffff, higherPart);
@@ -264,7 +267,6 @@ TEST_F(BufferSetArgTest, WhenSettingKernelArgThenAddressToPatchIsSetCorrectlyAnd
 }
 
 TEST_F(BufferSetArgTest, GivenSvmPointerWhenSettingKernelArgThenAddressToPatchIsSetCorrectlyAndSurfacesSet) {
-    REQUIRE_SVM_OR_SKIP(pDevice);
     void *ptrSVM = pContext->getSVMAllocsManager()->createSVMAlloc(256, {}, pContext->getRootDeviceIndices(), pContext->getDeviceBitfields());
     EXPECT_NE(nullptr, ptrSVM);
 
@@ -309,7 +311,7 @@ TEST_F(BufferSetArgTest, WhenGettingKernelArgThenBufferIsReturned) {
 
 TEST_F(BufferSetArgTest, givenKernelArgBufferWhenAddPathInfoDataIsSetThenPatchInfoDataIsCollected) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AddPatchInfoCommentsForAUBDump.set(true);
+    debugManager.flags.AddPatchInfoCommentsForAUBDump.set(true);
     cl_mem memObj = buffer;
 
     retVal = pKernel->setArg(
@@ -320,8 +322,8 @@ TEST_F(BufferSetArgTest, givenKernelArgBufferWhenAddPathInfoDataIsSetThenPatchIn
     ASSERT_EQ(CL_SUCCESS, retVal);
     ASSERT_EQ(1u, pKernel->getPatchInfoDataList().size());
 
-    EXPECT_EQ(PatchInfoAllocationType::KernelArg, pKernel->getPatchInfoDataList()[0].sourceType);
-    EXPECT_EQ(PatchInfoAllocationType::IndirectObjectHeap, pKernel->getPatchInfoDataList()[0].targetType);
+    EXPECT_EQ(PatchInfoAllocationType::kernelArg, pKernel->getPatchInfoDataList()[0].sourceType);
+    EXPECT_EQ(PatchInfoAllocationType::indirectObjectHeap, pKernel->getPatchInfoDataList()[0].targetType);
     EXPECT_EQ(buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddressToPatch(), pKernel->getPatchInfoDataList()[0].sourceAllocation);
     EXPECT_EQ(reinterpret_cast<uint64_t>(pKernel->getCrossThreadData()), pKernel->getPatchInfoDataList()[0].targetAllocation);
     EXPECT_EQ(0u, pKernel->getPatchInfoDataList()[0].sourceAllocationOffset);

@@ -1,16 +1,19 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/memory_manager/unified_memory_manager.h"
+#include "shared/source/helpers/addressing_mode_helper.h"
+#include "shared/source/unified_memory/unified_memory.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
 
@@ -31,17 +34,39 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBuffer(
 
     CsrSelectionArgs csrSelectionArgs{cmdType, {}, buffer, device->getRootDeviceIndex(), &size};
     CommandStreamReceiver &csr = selectCsrForBuiltinOperation(csrSelectionArgs);
+    return enqueueWriteBufferImpl(buffer, blockingWrite, offset, size, ptr, mapAllocation, numEventsInWaitList, eventWaitList, event, csr);
+}
+
+template <typename GfxFamily>
+cl_int CommandQueueHw<GfxFamily>::enqueueWriteBufferImpl(
+    Buffer *buffer,
+    cl_bool blockingWrite,
+    size_t offset,
+    size_t size,
+    const void *ptr,
+    GraphicsAllocation *mapAllocation,
+    cl_uint numEventsInWaitList,
+    const cl_event *eventWaitList,
+    cl_event *event,
+    CommandStreamReceiver &csr) {
+    const cl_command_type cmdType = CL_COMMAND_WRITE_BUFFER;
+
+    CsrSelectionArgs csrSelectionArgs{cmdType, {}, buffer, device->getRootDeviceIndex(), &size};
 
     auto rootDeviceIndex = getDevice().getRootDeviceIndex();
     auto isMemTransferNeeded = buffer->isMemObjZeroCopy() ? buffer->checkIfMemoryTransferIsRequired(offset, 0, ptr, cmdType) : true;
     bool isCpuCopyAllowed = bufferCpuCopyAllowed(buffer, cmdType, blockingWrite, size, const_cast<void *>(ptr),
                                                  numEventsInWaitList, eventWaitList);
-    InternalMemoryType memoryType = InternalMemoryType::NOT_SPECIFIED;
+    InternalMemoryType memoryType = InternalMemoryType::notSpecified;
 
     if (!mapAllocation) {
         cl_int retVal = getContext().tryGetExistingHostPtrAllocation(ptr, size, rootDeviceIndex, mapAllocation, memoryType, isCpuCopyAllowed);
         if (retVal != CL_SUCCESS) {
             return retVal;
+        }
+        if (mapAllocation) {
+            mapAllocation->setAubWritable(true, GraphicsAllocation::defaultBank);
+            mapAllocation->setTbxWritable(true, GraphicsAllocation::defaultBank);
         }
     }
 
@@ -58,10 +83,8 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBuffer(
                                                   numEventsInWaitList, eventWaitList, event);
     }
 
-    auto eBuiltInOps = EBuiltInOps::CopyBufferToBuffer;
-    if (forceStateless(buffer->getSize())) {
-        eBuiltInOps = EBuiltInOps::CopyBufferToBufferStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(buffer->getSize());
 
     void *srcPtr = const_cast<void *>(ptr);
 
@@ -91,7 +114,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBuffer(
     void *alignedSrcPtr = alignDown(srcPtr, 4);
     size_t srcPtrOffset = ptrDiff(srcPtr, alignedSrcPtr);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = alignedSrcPtr;
     dc.srcOffset = {srcPtrOffset, 0, 0};
     dc.dstMemObj = buffer;
@@ -102,7 +125,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBuffer(
     dc.direction = csrSelectionArgs.direction;
 
     MultiDispatchInfo dispatchInfo(dc);
-    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_WRITE_BUFFER>(dispatchInfo, surfaces, eBuiltInOps, numEventsInWaitList, eventWaitList, event, blockingWrite, csr);
+    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_WRITE_BUFFER>(dispatchInfo, surfaces, {BuiltIn::BaseKernel::copyBufferToBuffer, builtInMode}, numEventsInWaitList, eventWaitList, event, blockingWrite, csr);
     if (dispatchResult != CL_SUCCESS) {
         return dispatchResult;
     }

@@ -1,12 +1,15 @@
 #
-# Copyright (C) 2021 Intel Corporation
+# Copyright (C) 2021-2024 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
 
 if(UNIX)
-  target_sources(${TARGET_NAME} PRIVATE
-                 ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-                 ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR_SUFFIX}test_cache_reservation_impl.cpp
-  )
+  if(NEO_ENABLE_I915_PRELIM_DETECTION)
+    target_sources(${TARGET_NAME} PRIVATE
+                   ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+                   ${CMAKE_CURRENT_SOURCE_DIR}/test_cache_reservation_impl_prelim.cpp
+    )
+  endif()
+  add_subdirectories()
 endif()

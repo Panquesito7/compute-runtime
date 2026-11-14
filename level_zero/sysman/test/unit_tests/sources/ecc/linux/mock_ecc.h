@@ -1,35 +1,51 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
-#include "level_zero/sysman/source/ecc/sysman_ecc_imp.h"
-#include "level_zero/sysman/source/firmware_util/sysman_firmware_util.h"
+#include "level_zero/sysman/source/api/ecc/sysman_ecc_imp.h"
+#include "level_zero/sysman/source/shared/firmware_util/sysman_firmware_util.h"
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_fixture.h"
 
+#include <string_view>
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
+
+inline constexpr std::string_view eccSysfsPathTelem1 = "/sys/class/intel_pmt/telem1";
+inline constexpr std::string_view eccRealPathTelem1 = "/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:02.0/0000:8e:00.1/pmt_telemetry.1.auto/intel_pmt/telem1";
+inline constexpr std::string_view eccTelem1OffsetFileName = "/sys/class/intel_pmt/telem1/offset";
+inline constexpr std::string_view eccTelem1GuidFileName = "/sys/class/intel_pmt/telem1/guid";
+inline constexpr std::string_view eccTelem1TelemFileName = "/sys/class/intel_pmt/telem1/telem";
 
 struct MockEccFwInterface : public L0::Sysman::FirmwareUtil {
     ze_result_t mockFwGetEccConfigResult = ZE_RESULT_SUCCESS;
     ze_result_t mockFwSetEccConfigResult = ZE_RESULT_SUCCESS;
+    ze_result_t mockFwGetEccAvailableResult = ZE_RESULT_SUCCESS;
+    ze_result_t mockFwGetEccConfigurableResult = ZE_RESULT_SUCCESS;
 
     ze_bool_t mockSetConfig = true;
+    ze_bool_t mockEccAvailable = true;
+    ze_bool_t mockEccConfigurable = true;
     uint8_t mockCurrentState = 0;
     uint8_t mockPendingState = 0;
+    uint8_t mockDefaultState = 0xff;
 
-    ze_result_t fwGetEccConfig(uint8_t *currentState, uint8_t *pendingState) override {
+    ze_result_t fwGetEccConfig(uint8_t *currentState, uint8_t *pendingState, uint8_t *defaultState) override {
         if (mockFwGetEccConfigResult != ZE_RESULT_SUCCESS) {
             return mockFwGetEccConfigResult;
         }
 
         *currentState = mockCurrentState;
         *pendingState = mockPendingState;
+        *defaultState = mockDefaultState;
 
         return ZE_RESULT_SUCCESS;
     }
@@ -48,8 +64,26 @@ struct MockEccFwInterface : public L0::Sysman::FirmwareUtil {
         return ZE_RESULT_SUCCESS;
     }
 
-    ADDMETHOD_NOBASE(getFirstDevice, ze_result_t, ZE_RESULT_SUCCESS, (igsc_device_info * info));
+    ze_result_t fwGetEccAvailable(ze_bool_t *pAvailable) override {
+        if (mockFwGetEccAvailableResult != ZE_RESULT_SUCCESS) {
+            return mockFwGetEccAvailableResult;
+        }
+
+        *pAvailable = mockEccAvailable;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    ze_result_t fwGetEccConfigurable(ze_bool_t *pAvailable) override {
+        if (mockFwGetEccConfigurableResult != ZE_RESULT_SUCCESS) {
+            return mockFwGetEccConfigurableResult;
+        }
+
+        *pAvailable = mockEccConfigurable;
+        return ZE_RESULT_SUCCESS;
+    }
+
     ADDMETHOD_NOBASE(getFwVersion, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, std::string &firmwareVersion));
+    ADDMETHOD_NOBASE(getFlashFirmwareProgress, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t *pCompletionPercent));
     ADDMETHOD_NOBASE(flashFirmware, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, void *pImage, uint32_t size));
     ADDMETHOD_NOBASE(fwIfrApplied, ze_result_t, ZE_RESULT_SUCCESS, (bool &ifrStatus));
     ADDMETHOD_NOBASE(fwSupportedDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::vector<std::string> & supportedDiagTests));
@@ -58,10 +92,15 @@ struct MockEccFwInterface : public L0::Sysman::FirmwareUtil {
     ADDMETHOD_NOBASE(fwGetMemoryErrorCount, ze_result_t, ZE_RESULT_SUCCESS, (zes_ras_error_type_t category, uint32_t subDeviceCount, uint32_t subDeviceId, uint64_t &count));
     ADDMETHOD_NOBASE_VOIDRETURN(getDeviceSupportedFwTypes, (std::vector<std::string> & fwTypes));
     ADDMETHOD_NOBASE_VOIDRETURN(fwGetMemoryHealthIndicator, (zes_mem_health_t * health));
+    ADDMETHOD_NOBASE_VOIDRETURN(getLateBindingSupportedFwTypes, (std::vector<std::string> & fwTypes));
+    ADDMETHOD_NOBASE(fwSetGfspConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t gfspHeciCmdCode, std::vector<uint8_t> inBuf, std::vector<uint8_t> &outBuf));
+    ADDMETHOD_NOBASE(fwGetGfspConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t gfspHeciCmdCode, std::vector<uint8_t> &outBuf));
+    ADDMETHOD_NOBASE(fwGetSerialNumber, ze_result_t, ZE_RESULT_SUCCESS, (std::array<uint8_t, IGSC_MAX_OEM_SN_LENGTH> & serialNumber, uint16_t &serialNumberLen));
 
     MockEccFwInterface() = default;
     ~MockEccFwInterface() override = default;
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

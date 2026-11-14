@@ -1,12 +1,15 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/device_bitfield.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
+
+#include <vector>
 
 namespace NEO {
 class OsContext;
@@ -20,15 +23,17 @@ struct AllocationProperties {
             uint32_t forcePin : 1;
             uint32_t uncacheable : 1;
             uint32_t multiOsContextCapable : 1;
-            uint32_t readOnlyMultiStorage : 1;
             uint32_t shareable : 1;
             uint32_t resource48Bit : 1;
             uint32_t isUSMHostAllocation : 1;
-            uint32_t isUSMDeviceAllocation : 1;
+            uint32_t isHostInaccessibleAllocation : 1;
             uint32_t use32BitFrontWindow : 1;
             uint32_t forceSystemMemory : 1;
             uint32_t preferCompressed : 1;
-            uint32_t reserved : 18;
+            uint32_t cantBeReadOnly : 1;
+            uint32_t readOnly : 1;
+            uint32_t ipcSupportedAllocationByDefault : 1;
+            uint32_t reserved : 16;
         } flags;
         uint32_t allFlags = 0;
     };
@@ -36,11 +41,11 @@ struct AllocationProperties {
     uint32_t rootDeviceIndex = std::numeric_limits<uint32_t>::max();
     size_t size = 0;
     size_t alignment = 0;
-    AllocationType allocationType = AllocationType::UNKNOWN;
+    AllocationType allocationType = AllocationType::unknown;
     GraphicsAllocation::UsmInitialPlacement usmInitialPlacement = GraphicsAllocation::UsmInitialPlacement::DEFAULT;
     ImageInfo *imgInfo = nullptr;
     bool multiStorageResource = false;
-    ColouringPolicy colouringPolicy = ColouringPolicy::DeviceCountBased;
+    ColouringPolicy colouringPolicy = ColouringPolicy::deviceCountBased;
     size_t colouringGranularity = MemoryConstants::pageSize64k;
     DeviceBitfield subDevicesBitfield{};
     uint64_t gpuAddress = 0;
@@ -50,17 +55,21 @@ struct AllocationProperties {
     bool makeGPUVaDifferentThanCPUPtr = false;
     uint32_t cacheRegion = 0;
     bool makeDeviceBufferLockable = false;
+    bool isaPaddingIncluded = false;
+    uint32_t ipcHandleTypeFlags = 0;
+    // Per-handle physical offsets for range IPC import (createGraphicsAllocationFromMultipleSharedHandles).
+    std::vector<uint64_t> physicalOffsets;
 
     AllocationProperties(uint32_t rootDeviceIndex, size_t size,
                          AllocationType allocationType, DeviceBitfield subDevicesBitfieldParam)
         : AllocationProperties(rootDeviceIndex, true, size, allocationType, false, subDevicesBitfieldParam) {}
 
     AllocationProperties(uint32_t rootDeviceIndex, bool allocateMemory,
-                         ImageInfo &imgInfo,
+                         ImageInfo *imgInfo,
                          AllocationType allocationType,
                          DeviceBitfield subDevicesBitfieldParam)
         : AllocationProperties(rootDeviceIndex, allocateMemory, 0u, allocationType, false, subDevicesBitfieldParam) {
-        this->imgInfo = &imgInfo;
+        this->imgInfo = imgInfo;
     }
 
     AllocationProperties(uint32_t rootDeviceIndex,
@@ -108,15 +117,18 @@ struct AllocationData {
             uint32_t resource48Bit : 1;
             uint32_t isUSMHostAllocation : 1;
             uint32_t use32BitFrontWindow : 1;
-            uint32_t isUSMDeviceMemory : 1;
+            uint32_t isHostInaccessibleAllocation : 1;
             uint32_t zeroMemory : 1;
-            uint32_t reserved : 16;
+            uint32_t cantBeReadOnly : 1;
+            uint32_t ipcSupportedAllocationByDefault : 1;
+            uint32_t reserved : 14;
         } flags;
         uint32_t allFlags = 0;
     };
     static_assert(sizeof(AllocationData::flags) == sizeof(AllocationData::allFlags), "");
-    AllocationType type = AllocationType::UNKNOWN;
+    AllocationType type = AllocationType::unknown;
     GraphicsAllocation::UsmInitialPlacement usmInitialPlacement = GraphicsAllocation::UsmInitialPlacement::DEFAULT;
+    GfxMemoryAllocationMethod allocationMethod = GfxMemoryAllocationMethod::notDefined;
     const void *hostPtr = nullptr;
     uint64_t gpuAddress = 0;
     size_t size = 0;

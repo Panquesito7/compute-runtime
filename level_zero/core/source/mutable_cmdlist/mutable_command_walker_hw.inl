@@ -1,0 +1,117 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_container/command_encoder.h"
+#include "shared/source/command_container/implicit_scaling.h"
+#include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/device/device.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/ptr_math.h"
+
+#include "level_zero/core/source/mutable_cmdlist/mutable_command_walker_hw.h"
+
+namespace L0::MCL {
+
+template <typename GfxFamily>
+template <typename WalkerType>
+void MutableComputeWalkerHw<GfxFamily>::updateImplicitScalingData(const NEO::Device &device,
+                                                                  uint32_t partitionCount,
+                                                                  uint32_t workgroupSize,
+                                                                  uint32_t threadGroupCount,
+                                                                  NEO::RequiredPartitionDim requiredPartitionDim,
+                                                                  bool isRequiredDispatchWorkGroupOrder,
+                                                                  bool cooperativeKernel) {
+
+    constexpr uint64_t viewOnlyStaticPartitionGpuVa = 64u;
+    constexpr bool dcFlushEnable = false;
+    constexpr bool onlyRegularCmdList = true;
+    constexpr bool useSecondaryBatchBuffer = false;
+    constexpr bool makeCommandView = true;
+
+    bool forceExecutionOnSingleTile = NEO::EncodeDispatchKernel<GfxFamily>::singleTileExecImplicitScalingRequired(cooperativeKernel);
+
+    NEO::ImplicitScalingDispatchCommandArgs implicitScalingArgs{
+        viewOnlyStaticPartitionGpuVa,      // workPartitionAllocationGpuVa
+        &device,                           // device
+        nullptr,                           // outWalkerPtr
+        requiredPartitionDim,              // requiredPartitionDim
+        partitionCount,                    // partitionCount
+        workgroupSize,                     // workgroupSize
+        threadGroupCount,                  // threadGroupCount
+        useSecondaryBatchBuffer,           // useSecondaryBatchBuffer
+        onlyRegularCmdList,                // apiSelfCleanup
+        dcFlushEnable,                     // dcFlush
+        forceExecutionOnSingleTile,        // forceExecutionOnSingleTile
+        makeCommandView,                   // blockDispatchToCommandBuffer
+        isRequiredDispatchWorkGroupOrder}; // isRequiredDispatchWorkGroupOrder
+
+    NEO::LinearStream viewOnlyStream;
+
+    auto walkerCpuCmd = reinterpret_cast<WalkerType *>(this->cpuBuffer);
+
+    NEO::ImplicitScalingDispatch<GfxFamily>::dispatchCommands(viewOnlyStream,
+                                                              *walkerCpuCmd,
+                                                              device.getDeviceBitfield(),
+                                                              implicitScalingArgs);
+}
+
+template <typename GfxFamily>
+void MutableComputeWalkerHw<GfxFamily>::updateSlmSize(const NEO::Device &device, uint32_t slmTotalSizePerThreadGroup) {
+    auto &hwInfo = device.getHardwareInfo();
+
+    uint32_t availableSlmSizePerSubslice = device.getProductHelper().getAvailableSlmSizePerSubslice(device.getRootDeviceEnvironment());
+    auto maxProgrammableSlmSizeKb = std::min(hwInfo.capabilityTable.maxProgrammableSlmSize, availableSlmSizePerSubslice);
+    slmTotalSizePerThreadGroup = std::min(slmTotalSizePerThreadGroup, static_cast<uint32_t>(maxProgrammableSlmSizeKb * MemoryConstants::kiloByte));
+
+    auto programmableIDSLMSize = NEO::EncodeDispatchKernel<GfxFamily>::computeSlmValues(device.getHardwareInfo(), slmTotalSizePerThreadGroup, device.getReleaseHelper());
+
+    if (NEO::debugManager.flags.OverrideSlmAllocationSize.get() != -1) {
+        programmableIDSLMSize = static_cast<uint32_t>(NEO::debugManager.flags.OverrideSlmAllocationSize.get());
+    }
+
+    this->setSlmSize(programmableIDSLMSize);
+}
+
+template <typename GfxFamily>
+void MutableComputeWalkerHw<GfxFamily>::saveCpuBufferIntoGpuBuffer(bool useDispatchPart, bool useInlinePostSyncPart) {
+    using WalkerType = typename GfxFamily::DefaultWalkerType;
+    constexpr size_t dispatchPartSize = offsetof(WalkerType, TheStructure.Common.PostSync);
+    constexpr size_t walkerSize = sizeof(WalkerType);
+    constexpr size_t inlinePostSyncSize = walkerSize - dispatchPartSize;
+
+    if (useDispatchPart && useInlinePostSyncPart) {
+        memcpy_s(this->walker, walkerSize, this->cpuBuffer, walkerSize);
+    } else {
+        if (useDispatchPart) {
+            memcpy_s(this->walker, dispatchPartSize, this->cpuBuffer, dispatchPartSize);
+        } else if (useInlinePostSyncPart) {
+            auto cmdBufferInlinePostSync = ptrOffset(this->walker, dispatchPartSize);
+            auto hostViewInlinePostSync = ptrOffset(this->cpuBuffer, dispatchPartSize);
+            memcpy_s(cmdBufferInlinePostSync, inlinePostSyncSize, hostViewInlinePostSync, inlinePostSyncSize);
+        }
+    }
+}
+
+template <typename GfxFamily>
+void MutableComputeWalkerHw<GfxFamily>::setWorkGroupSize(MaxChannelsArray workgroupSize, uint32_t localIdDimensions) {
+    using WalkerType = typename GfxFamily::DefaultWalkerType;
+
+    constexpr uint32_t workGroupSizeIndex = 6;
+
+    auto cpuBufferWalker = reinterpret_cast<WalkerType *>(this->cpuBuffer);
+    cpuBufferWalker->setLocalXMaximum(workgroupSize[0] - 1);
+    cpuBufferWalker->setLocalYMaximum(workgroupSize[1] - 1);
+    cpuBufferWalker->setLocalZMaximum(workgroupSize[2] - 1);
+
+    if (!this->stageCommitMode) {
+        auto walkerCmd = reinterpret_cast<WalkerType *>(this->walker);
+        walkerCmd->getRawData(workGroupSizeIndex) = cpuBufferWalker->getRawData(workGroupSizeIndex);
+    }
+}
+
+} // namespace L0::MCL

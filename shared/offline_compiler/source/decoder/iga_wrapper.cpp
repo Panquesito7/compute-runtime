@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,7 +12,7 @@
 #include "shared/source/os_interface/os_library.h"
 
 #include "helper.h"
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 #include "translate_platform_base.h"
 
 #include <memory>
@@ -43,7 +43,7 @@ struct IgaWrapper::Impl {
         iga.optsContext.cb = sizeof(igaLib.optsContext);
         iga.optsContext.gen = igaGen;
 
-        iga.library.reset(NEO::OsLibrary::load(Os::igaDllName));
+        iga.library.reset(NEO::OsLibrary::loadFunc({Os::igaDllName}));
         if (iga.library == nullptr) {
             return;
         }

@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/helpers/common_types.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/kernel/kernel_descriptor.h"
 #include "shared/source/os_interface/product_helper.h"
@@ -13,13 +14,11 @@
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
-#include "shared/test/common/helpers/gtest_helpers.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
-#include "shared/test/common/test_macros/test.h"
-#include "shared/test/common/xe_hpc_core/pvc/product_configs_pvc.h"
 #include "shared/test/unit_test/os_interface/product_helper_tests.h"
 
 #include "aubstream/product_family.h"
+#include "gtest/gtest.h"
 
 using namespace NEO;
 
@@ -35,7 +34,7 @@ PVCTEST_F(PvcProductHelper, whenCheckIsTlbFlushRequiredThenReturnProperValue) {
 
 PVCTEST_F(PvcProductHelper, whenForceTlbFlushSetAndCheckIsTlbFlushRequiredThenReturnProperValue) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.ForceTlbFlush.set(1);
+    debugManager.flags.ForceTlbFlush.set(1);
     EXPECT_TRUE(productHelper->isTlbFlushRequired());
 }
 
@@ -80,23 +79,19 @@ PVCTEST_F(PvcProductHelper, givenPvcHwInfoWhenIsIpSamplingSupportedThenCorrectRe
         hwInfo.platform.usDeviceID = deviceId;
         EXPECT_TRUE(productHelper->isIpSamplingSupported(hwInfo));
     }
-}
 
-PVCTEST_F(PvcProductHelper, givenProductHelperWhenGettingEvictIfNecessaryFlagSupportedThenExpectTrue) {
-
-    EXPECT_TRUE(productHelper->isEvictionIfNecessaryFlagSupported());
+    for (const auto &deviceId : pvcXtVgDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        EXPECT_TRUE(productHelper->isIpSamplingSupported(hwInfo));
+    }
 }
 
 PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenIsPrefetcherDisablingInDirectSubmissionRequiredThenFalseIsReturned) {
     EXPECT_FALSE(productHelper->isPrefetcherDisablingInDirectSubmissionRequired());
 }
 
-PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenIsStatefulAddressingModeSupportedThenReturnFalse) {
-    EXPECT_FALSE(productHelper->isStatefulAddressingModeSupported());
-}
-
-PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenIsInitBuiltinAsyncSupportedThenReturnTrue) {
-    EXPECT_TRUE(productHelper->isInitBuiltinAsyncSupported(*defaultHwInfo));
+PVCTEST_F(PvcProductHelper, givenProductHelperWhenCheckIsCopyBufferRectSplitSupportedThenReturnsFalse) {
+    EXPECT_FALSE(productHelper->isCopyBufferRectSplitSupported());
 }
 
 PVCTEST_F(PvcProductHelper, givenPvcSteppingWhenQueryIsComputeDispatchAllWalkerEnableInCfeStateRequiredThenAppropriateValueIsReturned) {
@@ -112,39 +107,25 @@ PVCTEST_F(PvcProductHelper, givenPvcSteppingWhenQueryIsComputeDispatchAllWalkerE
 PVCTEST_F(PvcProductHelper, givenProductHelperWhenGetCommandsStreamPropertiesSupportThenExpectCorrectValues) {
 
     EXPECT_TRUE(productHelper->getScmPropertyThreadArbitrationPolicySupport());
-    EXPECT_TRUE(productHelper->getScmPropertyCoherencyRequiredSupport());
     EXPECT_FALSE(productHelper->getScmPropertyZPassAsyncComputeThreadLimitSupport());
     EXPECT_FALSE(productHelper->getScmPropertyPixelAsyncComputeThreadLimitSupport());
     EXPECT_TRUE(productHelper->getScmPropertyLargeGrfModeSupport());
-    EXPECT_FALSE(productHelper->getScmPropertyDevicePreemptionModeSupport());
 
-    EXPECT_FALSE(productHelper->getStateBaseAddressPropertyGlobalAtomicsSupport());
     EXPECT_TRUE(productHelper->getStateBaseAddressPropertyBindingTablePoolBaseAddressSupport());
-
-    EXPECT_TRUE(productHelper->getFrontEndPropertyScratchSizeSupport());
-    EXPECT_TRUE(productHelper->getFrontEndPropertyPrivateScratchSizeSupport());
-
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyPreemptionModeSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyStateSipSupport());
-    EXPECT_FALSE(productHelper->getPreemptionDbgPropertyCsrSurfaceSupport());
 
     EXPECT_TRUE(productHelper->getFrontEndPropertyComputeDispatchAllWalkerSupport());
     EXPECT_FALSE(productHelper->getFrontEndPropertyDisableEuFusionSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertyDisableOverDispatchSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertySingleSliceDispatchCcsModeSupport());
 
-    EXPECT_FALSE(productHelper->getPipelineSelectPropertyMediaSamplerDopClockGateSupport());
     EXPECT_TRUE(productHelper->getPipelineSelectPropertySystolicModeSupport());
-}
-
-PVCTEST_F(PvcProductHelper, givenPvcWhenCallingGetDeviceMemoryNameThenHbmIsReturned) {
-
-    auto deviceMemoryName = productHelper->getDeviceMemoryName();
-    EXPECT_TRUE(hasSubstr(deviceMemoryName, std::string("HBM")));
 }
 
 PVCTEST_F(PvcProductHelper, givenProductHelperWhenAdditionalKernelExecInfoSupportCheckedThenCorrectValueIsReturned) {
     auto hwInfo = *defaultHwInfo;
+
+    hwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(REVISION_A0, hwInfo);
+
     EXPECT_FALSE(productHelper->isDisableOverdispatchAvailable(hwInfo));
 
     FrontEndPropertiesSupport fePropertiesSupport{};
@@ -158,19 +139,13 @@ PVCTEST_F(PvcProductHelper, givenProductHelperWhenAdditionalKernelExecInfoSuppor
     EXPECT_TRUE(fePropertiesSupport.disableOverdispatch);
 }
 
-PVCTEST_F(PvcProductHelper, givenProductHelperWhenAskedIfPipeControlPriorToNonPipelinedStateCommandsWARequiredThenTrueIsReturned) {
-    auto hwInfo = *defaultHwInfo;
-    auto isRcs = false;
-
-    const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-    EXPECT_FALSE(isBasicWARequired);
-    EXPECT_FALSE(isExtendedWARequired);
+PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenCheckDirectSubmissionSupportedThenTrueIsReturned) {
+    EXPECT_TRUE(productHelper->isDirectSubmissionSupported());
 }
 
-PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenCheckDirectSubmissionSupportedThenTrueIsReturned) {
+PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenCheckDirectSubmissionConstantCacheInvalidationNeededThenFalseIsReturned) {
     auto hwInfo = *defaultHwInfo;
-    EXPECT_TRUE(productHelper->isDirectSubmissionSupported(hwInfo));
+    EXPECT_FALSE(productHelper->isDirectSubmissionConstantCacheInvalidationNeeded(hwInfo));
 }
 
 PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenCheckCopyEngineSelectorEnabledThenFalseIsReturned) {
@@ -178,32 +153,14 @@ PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenCheckCopyEngineSelectorEnab
     EXPECT_FALSE(productHelper->isCopyEngineSelectorEnabled(hwInfo));
 }
 
-PVCTEST_F(PvcProductHelper, givenProductHelperAndProgramExtendedPipeControlPriorToNonPipelinedStateCommandDisabledWhenAskedIfPipeControlPriorToNonPipelinedStateCommandsWARequiredThenFalseIsReturned) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(0);
+PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenIsSkippingStatefulInformationRequiredThenCorrectResultIsReturned) {
 
-    auto hwInfo = *defaultHwInfo;
-    auto isRcs = false;
+    KernelDescriptor kernelDescriptor{};
+    kernelDescriptor.kernelMetadata.isGeneratedByIgc = true;
+    EXPECT_FALSE(productHelper->isSkippingStatefulInformationRequired(kernelDescriptor));
 
-    const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-    EXPECT_FALSE(isExtendedWARequired);
-    EXPECT_FALSE(isBasicWARequired);
-}
-
-PVCTEST_F(PvcProductHelper, givenPvcWhenConfiguringThenDisableCccs) {
-    productHelper->configureHardwareCustom(&pInHwInfo, nullptr);
-    EXPECT_FALSE(pInHwInfo.featureTable.flags.ftrRcsNode);
-}
-
-PVCTEST_F(PvcProductHelper, givenDebugVariableSetWhenConfiguringThenEnableCccs) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.NodeOrdinal.set(static_cast<int32_t>(aub_stream::EngineType::ENGINE_CCCS));
-
-    HardwareInfo hwInfo = *defaultHwInfo;
-
-    productHelper->configureHardwareCustom(&hwInfo, nullptr);
-    EXPECT_TRUE(hwInfo.featureTable.flags.ftrRcsNode);
+    kernelDescriptor.kernelMetadata.isGeneratedByIgc = false;
+    EXPECT_TRUE(productHelper->isSkippingStatefulInformationRequired(kernelDescriptor));
 }
 
 PVCTEST_F(PvcProductHelper, givenDeviceIdThenProperMaxThreadsForWorkgroupIsReturned) {
@@ -216,7 +173,13 @@ PVCTEST_F(PvcProductHelper, givenDeviceIdThenProperMaxThreadsForWorkgroupIsRetur
 
     for (const auto &deviceId : pvcXtDeviceIds) {
         hwInfo.platform.usDeviceID = deviceId;
-        uint32_t numThreadsPerEU = hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount;
+        uint32_t numThreadsPerEU = hwInfo.gtSystemInfo.NumThreadsPerEu;
+        EXPECT_EQ(64u * numThreadsPerEU, productHelper->getMaxThreadsForWorkgroupInDSSOrSS(hwInfo, 64u, 64u));
+    }
+
+    for (const auto &deviceId : pvcXtVgDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        uint32_t numThreadsPerEU = hwInfo.gtSystemInfo.NumThreadsPerEu;
         EXPECT_EQ(64u * numThreadsPerEU, productHelper->getMaxThreadsForWorkgroupInDSSOrSS(hwInfo, 64u, 64u));
     }
 }
@@ -225,7 +188,7 @@ PVCTEST_F(PvcProductHelper, givenVariousValuesWhenConvertingHwRevIdAndSteppingTh
     auto hwInfo = *defaultHwInfo;
 
     for (uint32_t testValue = 0; testValue < 0xFF; testValue++) {
-        for (const auto *pvc : {&pvcXlDeviceIds, &pvcXtDeviceIds}) {
+        for (const auto *pvc : {&pvcXlDeviceIds, &pvcXtDeviceIds, &pvcXtVgDeviceIds}) {
             for (const auto &deviceId : *pvc) {
                 hwInfo.platform.usDeviceID = deviceId;
                 auto hwRevIdFromStepping = productHelper->getHwRevIdFromStepping(testValue, hwInfo);
@@ -239,7 +202,7 @@ PVCTEST_F(PvcProductHelper, givenVariousValuesWhenConvertingHwRevIdAndSteppingTh
         auto steppingFromHwRevId = productHelper->getSteppingFromHwRevId(hwInfo);
         if (steppingFromHwRevId != CommonConstants::invalidStepping) {
             bool anyMatchAfterConversionFromStepping = false;
-            for (const auto *pvc : {&pvcXlDeviceIds, &pvcXtDeviceIds}) {
+            for (const auto *pvc : {&pvcXlDeviceIds, &pvcXtDeviceIds, &pvcXtVgDeviceIds}) {
                 for (const auto &deviceId : *pvc) {
                     hwInfo.platform.usDeviceID = deviceId;
                     auto hwRevId = productHelper->getHwRevIdFromStepping(steppingFromHwRevId, hwInfo);
@@ -268,33 +231,47 @@ PVCTEST_F(PvcProductHelper, givenPvcProductHelperWhenIsIpSamplingSupportedThenCo
         hwInfo.platform.usDeviceID = deviceId;
         EXPECT_TRUE(productHelper->isIpSamplingSupported(hwInfo));
     }
-}
 
-PVCTEST_F(PvcProductHelper, givenPvcProductHelperAndKernelBinaryFormatsWhenCheckingIsDetectIndirectAccessInKernelSupportedThenCorrectValueIsReturned) {
-    KernelDescriptor kernelDescriptor;
-
-    {
-        kernelDescriptor.kernelAttributes.binaryFormat = DeviceBinaryFormat::Patchtokens;
-        kernelDescriptor.kernelAttributes.simdSize = 8u;
-        EXPECT_FALSE(productHelper->isDetectIndirectAccessInKernelSupported(kernelDescriptor));
-    }
-    {
-        kernelDescriptor.kernelAttributes.binaryFormat = DeviceBinaryFormat::Patchtokens;
-        kernelDescriptor.kernelAttributes.simdSize = 1u;
-        EXPECT_FALSE(productHelper->isDetectIndirectAccessInKernelSupported(kernelDescriptor));
-    }
-    {
-        kernelDescriptor.kernelAttributes.binaryFormat = DeviceBinaryFormat::Zebin;
-        kernelDescriptor.kernelAttributes.simdSize = 1u;
-        EXPECT_FALSE(productHelper->isDetectIndirectAccessInKernelSupported(kernelDescriptor));
-    }
-    {
-        kernelDescriptor.kernelAttributes.binaryFormat = DeviceBinaryFormat::Zebin;
-        kernelDescriptor.kernelAttributes.simdSize = 8u;
-        EXPECT_TRUE(productHelper->isDetectIndirectAccessInKernelSupported(kernelDescriptor));
+    for (const auto &deviceId : pvcXtVgDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        EXPECT_TRUE(productHelper->isIpSamplingSupported(hwInfo));
     }
 }
 
-PVCTEST_F(PvcProductHelper, whenQueryingMaxNumSamplersThenReturnZero) {
-    EXPECT_EQ(0u, productHelper->getMaxNumSamplers());
+PVCTEST_F(PvcProductHelper, givenProductHelperWhenGetRequiredDetectIndirectVersionCalledThenReturnCorrectVersion) {
+    EXPECT_EQ(3u, productHelper->getRequiredDetectIndirectVersion());
+    EXPECT_EQ(9u, productHelper->getRequiredDetectIndirectVersionVC());
+}
+
+PVCTEST_F(ProductHelperTest, givenProductHelperThenCompressionIsForbidden) {
+    auto hwInfo = *defaultHwInfo;
+    EXPECT_TRUE(productHelper->isCompressionForbidden(hwInfo));
+}
+
+PVCTEST_F(PvcProductHelper, whenGettingPatIndexThenValueCorrespondingToCacheRegionAndPolicyIsReturned) {
+    EXPECT_EQ(0u, productHelper->getPatIndex(CacheRegion::defaultRegion, CachePolicy::uncached));
+    EXPECT_EQ(1u, productHelper->getPatIndex(CacheRegion::defaultRegion, CachePolicy::writeCombined));
+    EXPECT_EQ(2u, productHelper->getPatIndex(CacheRegion::defaultRegion, CachePolicy::writeThrough));
+    EXPECT_EQ(3u, productHelper->getPatIndex(CacheRegion::defaultRegion, CachePolicy::writeBack));
+
+    EXPECT_ANY_THROW(productHelper->getPatIndex(CacheRegion::region1, CachePolicy::uncached));
+    EXPECT_ANY_THROW(productHelper->getPatIndex(CacheRegion::region1, CachePolicy::writeCombined));
+    EXPECT_EQ(4u, productHelper->getPatIndex(CacheRegion::region1, CachePolicy::writeThrough));
+    EXPECT_EQ(5u, productHelper->getPatIndex(CacheRegion::region1, CachePolicy::writeBack));
+
+    EXPECT_ANY_THROW(productHelper->getPatIndex(CacheRegion::region2, CachePolicy::uncached));
+    EXPECT_ANY_THROW(productHelper->getPatIndex(CacheRegion::region2, CachePolicy::writeCombined));
+    EXPECT_EQ(6u, productHelper->getPatIndex(CacheRegion::region2, CachePolicy::writeThrough));
+    EXPECT_EQ(7u, productHelper->getPatIndex(CacheRegion::region2, CachePolicy::writeBack));
+}
+
+PVCTEST_F(PvcProductHelper, givenForceAllResourcesUncachedWhenGettingPatIndexThenUncachedDefaultRegionPatIndexIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ForceAllResourcesUncached.set(1);
+
+    for (auto cacheRegion : {CacheRegion::defaultRegion, CacheRegion::region1, CacheRegion::region2}) {
+        for (auto cachePolicy : {CachePolicy::uncached, CachePolicy::writeCombined, CachePolicy::writeThrough, CachePolicy::writeBack}) {
+            EXPECT_EQ(0u, productHelper->getPatIndex(cacheRegion, cachePolicy));
+        }
+    }
 }

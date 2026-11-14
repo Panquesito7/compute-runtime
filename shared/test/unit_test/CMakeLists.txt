@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2019-2023 Intel Corporation
+# Copyright (C) 2019-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -13,13 +13,18 @@ endfunction()
 ADD_SUPPORTED_TEST_PRODUCT_FAMILIES_DEFINITION()
 link_libraries(${ASAN_LIBS} ${TSAN_LIBS})
 
+include(${NEO_SOURCE_DIR}/cmake/setup_ult_global_flags.cmake)
+
 add_executable(neo_shared_tests
                ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
-               ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/api_specific_config_ult.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/ult_specific_config.cpp
                ${NEO_SHARED_DIRECTORY}/helpers/allow_deferred_deleter.cpp
+               ${NEO_SHARED_TEST_DIRECTORY}/common/common_main.cpp
+               ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/mock_sip_listener.cpp
+               ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/virtual_file_system_listener.cpp
                ${NEO_SHARED_TEST_DIRECTORY}/common/tests_configuration.h
-               ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_checks_shared.cpp
+               $<TARGET_OBJECTS:mock_aubstream>
                $<TARGET_OBJECTS:mock_gmm>
                $<TARGET_OBJECTS:neo_libult_common>
                $<TARGET_OBJECTS:neo_libult_cs>
@@ -31,6 +36,7 @@ add_dependencies(neo_shared_tests test_dynamic_lib)
 
 set_property(TARGET neo_shared_tests APPEND_STRING PROPERTY COMPILE_FLAGS ${ASAN_FLAGS})
 set_target_properties(neo_shared_tests PROPERTIES FOLDER "${SHARED_TEST_PROJECTS_FOLDER}")
+set_property(TARGET neo_shared_tests PROPERTY ENABLE_EXPORTS TRUE)
 
 target_include_directories(neo_shared_tests PRIVATE
                            ${NEO_SHARED_TEST_DIRECTORY}/common/test_configuration/unit_tests
@@ -48,7 +54,7 @@ if(WIN32)
 endif()
 
 target_link_libraries(neo_shared_tests
-                      gmock-gtest
+                      neo_gtest
                       ${NEO_SHARED_MOCKABLE_LIB_NAME}
                       ${NEO_EXTRA_LIBS}
 )
@@ -69,11 +75,19 @@ add_subdirectories()
 
 target_sources(neo_shared_tests PRIVATE
                $<TARGET_OBJECTS:neo_unit_tests_config>
-               $<TARGET_OBJECTS:${BUILTINS_BINARIES_STATELESS_LIB_NAME}>
-               $<TARGET_OBJECTS:${BUILTINS_BINARIES_BINDFUL_LIB_NAME}>
-               $<TARGET_OBJECTS:${BUILTINS_BINARIES_BINDLESS_LIB_NAME}>
+               $<TARGET_OBJECTS:${BUILTINS_BINARIES_LIB_NAME}>
 )
-add_dependencies(unit_tests prepare_test_kernels_for_shared)
 add_dependencies(unit_tests neo_shared_tests)
 
 create_project_source_tree(neo_shared_tests)
+
+if(MSVC AND NOT DISABLE_ULT_PCH_WIN)
+  target_sources(neo_shared_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/neo_shared_tests_pch.h)
+  target_precompile_headers(neo_shared_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/neo_shared_tests_pch.h)
+
+  if(NOT DONT_CARE_OF_VIRTUALS)
+    target_link_libraries(${NEO_SHARED_MOCKABLE_LIB_NAME} PRIVATE dxguid)
+    target_sources(${NEO_SHARED_MOCKABLE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${NEO_SHARED_MOCKABLE_LIB_NAME}_pch.h)
+    target_precompile_headers(${NEO_SHARED_MOCKABLE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${NEO_SHARED_MOCKABLE_LIB_NAME}_pch.h)
+  endif()
+endif()

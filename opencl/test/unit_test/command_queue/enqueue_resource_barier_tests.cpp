@@ -1,16 +1,19 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/command_queue/resource_barrier.h"
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
 
@@ -53,7 +56,8 @@ HWTEST_F(ResourceBarrierTest, whenEnqueueResourceBarrierCalledThenUpdateQueueCom
 
     BarrierCommand barrierCommand(pCmdQ, &descriptor, 1);
 
-    auto previousTaskCount = pCmdQ->taskCount;
+    auto &csr = pCmdQ->getGpgpuCommandStreamReceiver();
+    auto previousTaskCount = std::max(pCmdQ->taskCount, csr.peekTaskCount());
     auto previousTaskLevel = pCmdQ->taskLevel;
 
     const auto enqueueResult = pCmdQ->enqueueResourceBarrier(&barrierCommand, 0, nullptr, nullptr);
@@ -71,13 +75,13 @@ HWTEST_F(ResourceBarrierTest, whenEnqueueResourceBarrierCalledThenUpdateQueueCom
 
 HWTEST_F(ResourceBarrierTest, GivenGpuHangAndBlockingCallsWhenEnqueueResourceBarrierIsCalledThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context, device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     auto retVal = CL_INVALID_VALUE;
     size_t bufferSize = MemoryConstants::pageSize;

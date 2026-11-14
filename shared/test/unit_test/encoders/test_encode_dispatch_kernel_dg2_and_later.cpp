@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,6 +14,7 @@
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/fixtures/command_container_fixture.h"
@@ -25,122 +26,230 @@ using namespace NEO;
 
 using CommandEncodeStatesTestDg2AndLater = Test<CommandEncodeStatesFixture>;
 
-HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenEventAddressWhenEncodeAndPVCAndDG2ThenSetDataportSubsliceCacheFlushIstSet, IsAtLeastXeHpgCore) {
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenEventAddressWhenEncodeAndPVCAndDG2ThenSetDataportSubsliceCacheFlushIstSet, IsAtLeastXeCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     uint32_t dims[] = {2, 1, 1};
     std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
     uint64_t eventAddress = MemoryConstants::cacheLineSize * 123;
 
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
-    dispatchArgs.eventAddress = eventAddress;
-    dispatchArgs.isTimestampEvent = true;
+    dispatchArgs.postSyncArgs.eventAddress = eventAddress;
+    dispatchArgs.postSyncArgs.isTimestampEvent = true;
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
 
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
-    auto cmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto cmd = genCmdCast<DefaultWalkerType *>(*itor);
     EXPECT_EQ(true, cmd->getPostSync().getDataportSubsliceCacheFlush());
 }
 
-HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenEventAddressWhenEncodeAndDG2ThenMocsIndex2IsSet, IsDG2) {
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenDebugVariableToForceL1FlushWhenWalkerIsProgramedThenCacheFlushIsDisabled, IsAtLeastXeCore) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.ForcePostSyncL1Flush.set(0);
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     uint32_t dims[] = {2, 1, 1};
     std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
     uint64_t eventAddress = MemoryConstants::cacheLineSize * 123;
 
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
-    dispatchArgs.eventAddress = eventAddress;
-    dispatchArgs.isTimestampEvent = true;
-    dispatchArgs.dcFlushEnable = MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pDevice->getRootDeviceEnvironment());
+    dispatchArgs.postSyncArgs.eventAddress = eventAddress;
+    dispatchArgs.postSyncArgs.isTimestampEvent = true;
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
 
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
-    auto cmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto cmd = genCmdCast<DefaultWalkerType *>(*itor);
+    EXPECT_EQ(false, cmd->getPostSync().getDataportPipelineFlush());
+    EXPECT_EQ(false, cmd->getPostSync().getDataportSubsliceCacheFlush());
+}
+
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenEventAddressWhenEncodeThenMocsIndex2IsSet, IsXeHpgCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    uint32_t dims[] = {2, 1, 1};
+    std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
+    uint64_t eventAddress = MemoryConstants::cacheLineSize * 123;
+
+    bool requiresUncachedMocs = false;
+    EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
+    dispatchArgs.postSyncArgs.eventAddress = eventAddress;
+    dispatchArgs.postSyncArgs.isTimestampEvent = true;
+    dispatchArgs.postSyncArgs.dcFlushEnable = MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pDevice->getRootDeviceEnvironment());
+
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
+
+    GenCmdList commands;
+    CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
+
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
+    ASSERT_NE(itor, commands.end());
+    auto cmd = genCmdCast<DefaultWalkerType *>(*itor);
 
     auto gmmHelper = pDevice->getGmmHelper();
 
-    EXPECT_EQ(gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED), cmd->getPostSync().getMocs());
+    EXPECT_EQ(gmmHelper->getUncachedMOCS(), cmd->getPostSync().getMocs());
 }
 
-HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenVariousSlmTotalSizesAndSettingRevIDToDifferentValuesWhenSetAdditionalInfoIsCalledThenCorrectValuesAreSet, IsXeHpgCore) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename FamilyType::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenVariousSlmTotalSizesWhenSetPreferredSlmIsCalledThenCorrectValuesAreSet, IsXeHpgCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
 
-    const std::vector<PreferredSlmTestValues<FamilyType>> valuesToTest = {
-        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K},
-        {16 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16K},
-        {32 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K},
+    using PREFERRED_SLM_ALLOCATION_SIZE = typename INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
+
+    const std::vector<PreferredSlmTestValuesPreXe2<FamilyType>> valuesToTest = {
+        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0KB},
+        {16 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+        {32 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB},
         // since we can't set 48KB as SLM size for workgroup, we need to ask for 64KB here.
-        {64 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64K},
+        {64 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64KB},
     };
 
-    const std::array<REVID, 5> revs{REVISION_A0, REVISION_B, REVISION_C, REVISION_D, REVISION_K};
-    auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
-    auto &productHelper = pDevice->getRootDeviceEnvironment().getProductHelper();
-    for (auto rev : revs) {
-        hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(rev, hwInfo);
-        verifyPreferredSlmValues<FamilyType>(valuesToTest, pDevice->getRootDeviceEnvironment());
-    }
+    verifyPreferredSlmValuesPreXe2<FamilyType>(valuesToTest, pDevice->getRootDeviceEnvironment());
 }
 
-HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenDebugOverrideWhenSetAdditionalInfoIsCalledThenDebugValuesAreSet, IsAtLeastXeHpgCore) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename FamilyType::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenDebugOverrideWhenSetAdditionalInfoIsCalledThenDebugValuesAreSet, IsXeCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
+
+    using PREFERRED_SLM_ALLOCATION_SIZE = typename INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
 
     DebugManagerStateRestore stateRestore;
-    PREFERRED_SLM_ALLOCATION_SIZE debugOverrideValues[] = {PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K,
-                                                           PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K,
-                                                           PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K};
+    PREFERRED_SLM_ALLOCATION_SIZE debugOverrideValues[] = {PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0KB,
+                                                           PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB,
+                                                           PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128KB};
 
     for (auto debugOverrideValue : debugOverrideValues) {
-        DebugManager.flags.OverridePreferredSlmAllocationSizePerDss.set(debugOverrideValue);
-        const std::vector<PreferredSlmTestValues<FamilyType>> valuesToTest = {
+        debugManager.flags.OverridePreferredSlmAllocationSizePerDss.set(debugOverrideValue);
+        const std::vector<PreferredSlmTestValuesPreXe2<FamilyType>> valuesToTest = {
             {0, debugOverrideValue},
-            {32 * KB, debugOverrideValue},
-            {64 * KB, debugOverrideValue},
+            {32 * MemoryConstants::kiloByte, debugOverrideValue},
+            {64 * MemoryConstants::kiloByte, debugOverrideValue},
         };
-        verifyPreferredSlmValues<FamilyType>(valuesToTest, pDevice->getRootDeviceEnvironment());
+        verifyPreferredSlmValuesPreXe2<FamilyType>(valuesToTest, pDevice->getRootDeviceEnvironment());
     }
 }
 
-HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenOverridePreferredSlmAllocationSizePerDssWhenDispatchingKernelThenCorrectValueIsSet, IsAtLeastXeHpgCore) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenDebugOverrideWhenSetAdditionalInfoIsCalledThenDebugValuesAreSet, IsAtLeastXe2HpgCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
     using PREFERRED_SLM_ALLOCATION_SIZE = typename INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
+
+    DebugManagerStateRestore stateRestore;
+    PREFERRED_SLM_ALLOCATION_SIZE debugOverrideValues[] = {PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_SLM_ENCODES_0K,
+                                                           PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_SLM_ENCODES_32K,
+                                                           PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_SLM_ENCODES_128K};
+
+    for (auto debugOverrideValue : debugOverrideValues) {
+        debugManager.flags.OverridePreferredSlmAllocationSizePerDss.set(debugOverrideValue);
+        const std::vector<PreferredSlmTestValuesPreXe2<FamilyType>> valuesToTest = {
+            {0, debugOverrideValue},
+            {32 * MemoryConstants::kiloByte, debugOverrideValue},
+            {64 * MemoryConstants::kiloByte, debugOverrideValue},
+        };
+        verifyPreferredSlmValuesPreXe2<FamilyType>(valuesToTest, pDevice->getRootDeviceEnvironment());
+    }
+}
+
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, givenOverridePreferredSlmAllocationSizePerDssWhenDispatchingKernelThenCorrectValueIsSet, IsAtLeastXeCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverridePreferredSlmAllocationSizePerDss.set(5);
+    debugManager.flags.OverridePreferredSlmAllocationSizePerDss.set(5);
     uint32_t dims[] = {2, 1, 1};
     std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
-    uint32_t slmTotalSize = 1;
+    uint32_t slmTotalSizePerThreadGroup = 1;
 
-    dispatchInterface->getSlmTotalSizeResult = slmTotalSize;
+    dispatchInterface->getSlmTotalSizePerThreadGroupResult = slmTotalSizePerThreadGroup;
 
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
 
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
 
-    auto cmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto cmd = genCmdCast<DefaultWalkerType *>(*itor);
     auto &idd = cmd->getInterfaceDescriptor();
 
     EXPECT_EQ(5u, static_cast<uint32_t>(idd.getPreferredSlmAllocationSize()));
+}
+
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenSlmTotalSizeExceedsHardwareLimitWhenSetPreferredSlmIsCalledThenSlmSizeIsClampedToHardwareLimit, IsXeCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
+
+    using PREFERRED_SLM_ALLOCATION_SIZE = typename INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
+
+    auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
+    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
+
+    hwInfo.gtSystemInfo.DualSubSliceCount = 2;
+    hwInfo.gtSystemInfo.SubSliceCount = 2;
+    hwInfo.gtSystemInfo.SLMSizeInKb = 32;
+
+    uint32_t availableSlmSizePerSubslice = rootDeviceEnvironment.getProductHelper().getAvailableSlmSizePerSubslice(rootDeviceEnvironment);
+    bool usesWddmPreXe2Method = (availableSlmSizePerSubslice == hwInfo.gtSystemInfo.SLMSizeInKb / hwInfo.gtSystemInfo.DualSubSliceCount);
+
+    std::vector<PreferredSlmTestValuesPreXe2<FamilyType>> valuesToTest;
+    if (usesWddmPreXe2Method) {
+        // On WDDM pre-XE2: SLM size exceeds hardware limit (32KB / 2 DSS = 16KB)
+        // Values beyond 16KB should be clamped to the available hardware limit
+        valuesToTest = {
+            {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0KB},
+            {16 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+            {32 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+            {64 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+        };
+    } else {
+        // On Linux DRM pre-XE2: SLMSizeInKb holds per-subslice value (32KB total)
+        // Values beyond 32KB should be clamped to the available hardware limit
+        valuesToTest = {
+            {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0KB},
+            {16 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+            {32 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB},
+            {64 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB},
+        };
+    }
+
+    verifyPreferredSlmValuesPreXe2<FamilyType>(valuesToTest, rootDeviceEnvironment);
+}
+
+HWTEST2_F(CommandEncodeStatesTestDg2AndLater, GivenWddmOnLinuxAndSlmTotalSizeExceedsHardwareLimitWhenSetPreferredSlmIsCalledThenSlmSizeIsClampedToHardwareLimit, IsXeCore) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
+    using PREFERRED_SLM_ALLOCATION_SIZE = typename INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
+
+    auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
+    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
+
+    reinterpret_cast<MockRootDeviceEnvironment *>(&pDevice->getRootDeviceEnvironmentRef())->isWddmOnLinuxEnable = true;
+    hwInfo.gtSystemInfo.DualSubSliceCount = 2;
+    hwInfo.gtSystemInfo.SLMSizeInKb = 32;
+
+    std::vector<PreferredSlmTestValuesPreXe2<FamilyType>> valuesToTest;
+    // WDDM on Linux pre-XE2: SLM size exceeds hardware limit (32KB / 2 DSS = 16KB)
+    // Values beyond 16KB should be clamped to the available hardware limit
+    valuesToTest = {
+        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0KB},
+        {16 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+        {32 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+        {64 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+    };
+
+    verifyPreferredSlmValuesPreXe2<FamilyType>(valuesToTest, rootDeviceEnvironment);
 }

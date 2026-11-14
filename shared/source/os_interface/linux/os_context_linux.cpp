@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,15 +15,19 @@
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
+#include "shared/source/os_interface/linux/os_library_linux.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/os_interface/sys_calls_common.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+
+#include <sstream>
 
 namespace NEO {
 
 OsContext *OsContextLinux::create(OSInterface *osInterface, uint32_t rootDeviceIndex, uint32_t contextId, const EngineDescriptor &engineDescriptor) {
-    if (osInterface) {
+    if (osInterface && osInterface->getDriverModel()->getDriverModelType() == DriverModelType::drm) {
         return new OsContextLinux(*osInterface->getDriverModel()->as<Drm>(), rootDeviceIndex, contextId, engineDescriptor);
     }
     return new OsContext(rootDeviceIndex, contextId, engineDescriptor);
@@ -34,13 +38,15 @@ OsContextLinux::OsContextLinux(Drm &drm, uint32_t rootDeviceIndex, uint32_t cont
       drm(drm) {
     pagingFence.fill(0u);
     fenceVal.fill(0u);
+    this->isOpenVinoLoaded();
+    initializeOfflineDumpContextIds();
 }
 
 bool OsContextLinux::initializeContext() {
     auto hwInfo = drm.getRootDeviceEnvironment().getHardwareInfo();
     auto defaultEngineType = getChosenEngineType(*hwInfo);
 
-    if (engineType == defaultEngineType && !isLowPriority() && !isInternalEngine()) {
+    if (engineType == defaultEngineType && !isLowPriority() && !isInternalEngine() && !isPowerHint()) {
         this->setDefaultContext(true);
     }
 
@@ -60,10 +66,10 @@ bool OsContextLinux::initializeContext() {
                 [[maybe_unused]] auto ret = drm.createDrmVirtualMemory(drmVmId);
                 DEBUG_BREAK_IF(drmVmId == 0);
                 DEBUG_BREAK_IF(ret != 0);
-                if (ret != 0) {
-                    return false;
-                }
 
+                if (ret != 0) {
+                    drmVmId = 0;
+                }
                 UNRECOVERABLE_IF(this->drmVmIds.size() <= deviceIndex);
                 this->drmVmIds[deviceIndex] = drmVmId;
             }
@@ -73,20 +79,64 @@ bool OsContextLinux::initializeContext() {
                 return false;
             }
 
+            if (drm.isPerContextVMRequired() && this->drmVmIds[deviceIndex] == 0) {
+                drmVmId = 0;
+                [[maybe_unused]] auto ret = drm.queryVmId(drmContextId, drmVmId);
+                DEBUG_BREAK_IF(drmVmId == 0);
+                DEBUG_BREAK_IF(ret != 0);
+
+                this->drmVmIds[deviceIndex] = drmVmId;
+            }
+
             this->drmContextIds.push_back(drmContextId);
         }
     }
     return true;
 }
 
-bool OsContextLinux::isDirectSubmissionSupported(const HardwareInfo &hwInfo) const {
-    auto &productHelper = this->getDrm().getRootDeviceEnvironment().getHelper<ProductHelper>();
+void OsContextLinux::onFirstSubmission() {
+    drm.getIoctlHelper()->onFirstSubmission(*this);
+}
 
-    return this->getDrm().isVmBindAvailable() && productHelper.isDirectSubmissionSupported(hwInfo);
+void OsContextLinux::isOpenVinoLoaded() {
+    std::call_once(this->ovLoadedFlag, [this]() {
+        this->ovLoaded = NEO::Linux::isLibraryLoaded("libopenvino_intel_gpu_plugin.so");
+    });
+}
+
+bool OsContextLinux::isDirectSubmissionSupported() const {
+    auto &rootDeviceEnvironment = this->getDrm().getRootDeviceEnvironment();
+    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+
+    return (this->getDrm().isVmBindAvailable() || (this->ovLoaded && hwInfo.caps.directSubmissionLightSupported)) && productHelper.isDirectSubmissionSupported();
 }
 
 Drm &OsContextLinux::getDrm() const {
     return this->drm;
+}
+bool OsContextLinux::isDirectSubmissionLightActive() const {
+    return this->isDirectSubmissionActive() && !this->getDrm().isVmBindAvailable();
+}
+
+void OsContextLinux::overridePriority(uint32_t newPriority) {
+    if (!priorityLevel.has_value()) {
+        defaultPriorityLevel = newPriority;
+        priorityLevel = newPriority;
+    }
+    // change of priority level of an already initialized context
+    else if (this->isPartOfContextGroup() && priorityLevel.value() != newPriority && this->drmContextIds.size() > 0) {
+        if (debugManager.flags.PrintSecondaryContextEngineInfo.get()) {
+            std::stringstream contextEngineInfo;
+            contextEngineInfo << "Overriding priority osContextId: " << this->getContextId() << " previous priorityLevel: " << std::to_string(this->getPriorityLevel()) << " new priority: " << newPriority << "\n";
+            PRINT_STRING(debugManager.flags.PrintSecondaryContextEngineInfo.get(), stdout, "%s", contextEngineInfo.str().c_str());
+        }
+
+        for (auto drmContextId : this->drmContextIds) {
+            drm.getIoctlHelper()->setContextGroupPriority(drmContextId, newPriority);
+        }
+        priorityLevel = newPriority;
+    }
 }
 
 void OsContextLinux::waitForPagingFence() {
@@ -98,32 +148,55 @@ void OsContextLinux::waitForPagingFence() {
 }
 
 void OsContextLinux::waitForBind(uint32_t drmIterator) {
+
+    auto fenceAddressAndValToWait = getFenceAddressAndValToWait(drmIterator, false);
+
+    if (fenceAddressAndValToWait.has_value()) {
+        const auto fenceAddressToWait = fenceAddressAndValToWait->first;
+        const auto fenceValToWait = fenceAddressAndValToWait->second;
+        drm.waitUserFence(0u, fenceAddressToWait, fenceValToWait, Drm::ValueWidth::u64, -1, drm.getIoctlHelper()->getWaitUserFenceSoftFlag(), false, NEO::InterruptId::notUsed, nullptr);
+    }
+}
+
+[[nodiscard]] std::optional<std::pair<uint64_t, uint64_t>> OsContextLinux::getFenceAddressAndValToWait(uint32_t vmHandleId, bool isLocked) {
     if (drm.isPerContextVMRequired()) {
-        if (pagingFence[drmIterator] >= fenceVal[drmIterator]) {
-            return;
+        std::unique_lock<std::mutex> lock;
+
+        if (!isLocked) {
+            lock = drm.lockBindFenceMutex();
         }
-        auto lock = drm.lockBindFenceMutex();
-        auto fenceAddress = castToUint64(&this->pagingFence[drmIterator]);
-        auto fenceValue = this->fenceVal[drmIterator];
-        lock.unlock();
 
-        drm.waitUserFence(0u, fenceAddress, fenceValue, Drm::ValueWidth::U64, -1, drm.getIoctlHelper()->getWaitUserFenceSoftFlag());
+        if (!(pagingFence[vmHandleId] >= fenceVal[vmHandleId])) {
+            auto fenceAddress = castToUint64(&this->pagingFence[vmHandleId]);
+            auto fenceValue = this->fenceVal[vmHandleId];
+            return std::make_pair(fenceAddress, fenceValue);
+        }
 
+        return std::nullopt;
     } else {
-        drm.waitForBind(drmIterator);
+        return drm.getFenceAddressAndValToWait(vmHandleId, isLocked);
     }
 }
 
 void OsContextLinux::reInitializeContext() {}
 
 uint64_t OsContextLinux::getOfflineDumpContextId(uint32_t deviceIndex) const {
-    if (deviceIndex < drmContextIds.size()) {
-        const auto processId = SysCalls::getProcessId();
-        const auto drmContextId = drmContextIds[deviceIndex];
-        return static_cast<uint64_t>(processId) << 32 |
-               static_cast<uint64_t>(drmContextId);
+    if (deviceIndex >= offlineDumpCtxIds.size()) {
+        return 0;
     }
-    return 0;
+    return offlineDumpCtxIds[deviceIndex];
+}
+
+std::atomic<uint32_t> OsContextLinux::contextIdForOfflineDump{0};
+
+void OsContextLinux::initializeOfflineDumpContextIds() {
+    const auto processId = SysCalls::getProcessId();
+    for (auto index = 0u; index < deviceBitfield.size(); index++) {
+        offlineDumpCtxIds[index] = 0;
+        if (deviceBitfield.test(index)) {
+            offlineDumpCtxIds[index] = static_cast<uint64_t>(processId) << 32 | static_cast<uint64_t>(OsContextLinux::contextIdForOfflineDump++);
+        }
+    }
 }
 
 OsContextLinux::~OsContextLinux() {

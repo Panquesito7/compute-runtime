@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,19 +8,21 @@
 #include "level_zero/core/test/unit_tests/fixtures/multi_tile_fixture.h"
 
 #include "shared/source/command_container/implicit_scaling.h"
-#include "shared/source/os_interface/os_interface.h"
 
-#include "level_zero/core/source/context/context_imp.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 
 #include "gtest/gtest.h"
 
 namespace L0 {
 namespace ult {
 MultiTileCommandListAppendLaunchKernelFixture::MultiTileCommandListAppendLaunchKernelFixture() : backup({&NEO::ImplicitScaling::apiSupport, true}) {}
-MultiTileImmediateCommandListAppendLaunchKernelFixture::MultiTileImmediateCommandListAppendLaunchKernelFixture() : backupApiSupport({&NEO::ImplicitScaling::apiSupport, true}), backupLocalMemory({&NEO::OSInterface::osEnableLocalMemory, true}) {}
+MultiTileImmediateCommandListAppendLaunchKernelFixture::MultiTileImmediateCommandListAppendLaunchKernelFixture() : backupApiSupport({&NEO::ImplicitScaling::apiSupport, true}) {}
 
 void MultiTileCommandListAppendLaunchKernelFixture::setUp() {
-    DebugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.SelectCmdListHeapAddressModel.set(0);
 
     MultiDeviceFixture::numRootDevices = 1u;
     MultiDeviceFixture::numSubDevices = 4u;
@@ -35,10 +37,10 @@ void MultiTileCommandListAppendLaunchKernelFixture::setUp() {
     ze_context_desc_t desc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
     ze_result_t res = device->getDriverHandle()->createContext(&desc, 0u, nullptr, &hContext);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
-    contextImp = static_cast<ContextImp *>(Context::fromHandle(hContext));
+    contextImp = Context::fromHandle(hContext);
 
     ze_result_t returnValue;
-    commandList = whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    commandList = CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
 }
 
@@ -50,7 +52,8 @@ void MultiTileCommandListAppendLaunchKernelFixture::tearDown() {
 }
 
 void MultiTileImmediateCommandListAppendLaunchKernelFixture::setUp() {
-    DebugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.SelectCmdListHeapAddressModel.set(0);
 
     MultiDeviceFixture::numRootDevices = 1u;
     MultiDeviceFixture::numSubDevices = 2u;
@@ -65,7 +68,7 @@ void MultiTileImmediateCommandListAppendLaunchKernelFixture::setUp() {
     ze_context_desc_t desc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
     ze_result_t res = device->getDriverHandle()->createContext(&desc, 0u, nullptr, &hContext);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
-    contextImp = static_cast<ContextImp *>(Context::fromHandle(hContext));
+    contextImp = Context::fromHandle(hContext);
 }
 
 void MultiTileImmediateCommandListAppendLaunchKernelFixture::tearDown() {

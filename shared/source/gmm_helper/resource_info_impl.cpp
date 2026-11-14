@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "shared/source/gmm_helper/client_context/gmm_handle_allocator.h"
 #include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/surface_format_info.h"
 
 namespace NEO {
 
@@ -64,6 +65,114 @@ void GmmResourceInfo::refreshHandle() {
         this->clientContext->getHandleAllocator()->openHandle(this->handle, this->resourceInfo.get(), this->clientContext->getHandleAllocator()->getHandleSize());
     }
 }
+
+size_t GmmResourceInfo::getSizeAllocation() { return static_cast<size_t>(resourceInfo->GetSize(GMM_TOTAL_SURF)); }
+
+size_t GmmResourceInfo::getBaseWidth() { return static_cast<size_t>(resourceInfo->GetBaseWidth()); }
+
+size_t GmmResourceInfo::getBaseHeight() { return static_cast<size_t>(resourceInfo->GetBaseHeight()); }
+
+size_t GmmResourceInfo::getBaseDepth() { return static_cast<size_t>(resourceInfo->GetBaseDepth()); }
+
+size_t GmmResourceInfo::getArraySize() { return static_cast<size_t>(resourceInfo->GetArraySize()); }
+
+size_t GmmResourceInfo::getRenderPitch() { return static_cast<size_t>(resourceInfo->GetRenderPitch()); }
+
+uint32_t GmmResourceInfo::getNumSamples() { return resourceInfo->GetNumSamples(); }
+
+uint32_t GmmResourceInfo::getQPitch() { return resourceInfo->GetQPitch(); }
+
+uint32_t GmmResourceInfo::getBitsPerPixel() { return resourceInfo->GetBitsPerPixel(); }
+
+uint32_t GmmResourceInfo::getHAlign() { return resourceInfo->GetHAlign(); }
+
+uint32_t GmmResourceInfo::getHAlignSurfaceState() { return resourceInfo->GetHAlignSurfaceState(); }
+
+uint32_t GmmResourceInfo::getVAlignSurfaceState() { return resourceInfo->GetVAlignSurfaceState(); }
+
+uint32_t GmmResourceInfo::getMaxLod() { return resourceInfo->GetMaxLod(); }
+
+uint32_t GmmResourceInfo::getTileModeSurfaceState() { return resourceInfo->GetTileModeSurfaceState(); }
+
+uint32_t GmmResourceInfo::getRenderAuxPitchTiles() { return resourceInfo->GetRenderAuxPitchTiles(); }
+
+uint32_t GmmResourceInfo::getAuxQPitch() { return resourceInfo->GetAuxQPitch(); }
+
+uint32_t GmmResourceInfo::getMipTailStartLODSurfaceState() { return resourceInfo->GetMipTailStartLodSurfaceState(); }
+
+GMM_RESOURCE_FORMAT GmmResourceInfo::getResourceFormat() { return resourceInfo->GetResourceFormat(); }
+
+GMM_SURFACESTATE_FORMAT GmmResourceInfo::getResourceFormatSurfaceState() { return resourceInfo->GetResourceFormatSurfaceState(); }
+
+GMM_RESOURCE_TYPE GmmResourceInfo::getResourceType() { return resourceInfo->GetResourceType(); }
+
+ImageTilingMode GmmResourceInfo::getTilingMode() {
+    auto flags = getResourceFlags();
+    if (flags->Info.TiledW) {
+        return ImageTilingMode::tiledW;
+    }
+    if (flags->Info.TiledX) {
+        return ImageTilingMode::tiledX;
+    }
+    if (flags->Info.TiledY) {
+        return ImageTilingMode::tiledY;
+    }
+    if (flags->Info.Tile4) {
+        return ImageTilingMode::tiled4;
+    }
+    if (flags->Info.Tile64) {
+        return ImageTilingMode::tiled64;
+    }
+    return ImageTilingMode::notTiled;
+}
+
+GmmCompressionType GmmResourceInfo::getCompressionType() {
+    auto flags = getResourceFlags();
+    if (flags->Info.NotCompressed) {
+        return GmmCompressionType::none;
+    }
+    UNRECOVERABLE_IF(flags->Info.RenderCompressed && flags->Info.MediaCompressed);
+    if (flags->Info.MediaCompressed) {
+        return GmmCompressionType::media;
+    }
+    return flags->Info.RenderCompressed ? GmmCompressionType::render : GmmCompressionType::none;
+}
+
+bool GmmResourceInfo::isCacheable() { return getResourceFlags()->Info.Cacheable; }
+
+bool GmmResourceInfo::isDepthResource() { return getResourceFlags()->Gpu.Depth; }
+
+bool GmmResourceInfo::isMCS() { return getResourceFlags()->Gpu.MCS; }
+
+bool GmmResourceInfo::isIndirectClearColor() { return getResourceFlags()->Gpu.IndirectClearColor; }
+
+bool GmmResourceInfo::isCCS() { return getResourceFlags()->Gpu.CCS; }
+
+GMM_STATUS GmmResourceInfo::getOffset(GMM_REQ_OFFSET_INFO &reqOffsetInfo) { return resourceInfo->GetOffset(reqOffsetInfo); }
+
+GMM_RESOURCE_USAGE_TYPE GmmResourceInfo::getCachePolicyUsage() const { return resourceInfo->GetCachePolicyUsage(); }
+
+uint8_t GmmResourceInfo::cpuBlt(const GmmCpuBltParams &params) {
+    GMM_RES_COPY_BLT resCopyBlt = {};
+    resCopyBlt.Gpu.pData = params.gpuData;
+    resCopyBlt.Sys.pData = params.sysData;
+    resCopyBlt.Sys.RowPitch = params.sysRowPitch;
+    resCopyBlt.Sys.BufferSize = params.sysBufferSize;
+    resCopyBlt.Blt.Upload = params.upload;
+    return resourceInfo->CpuBlt(&resCopyBlt);
+}
+
+uint64_t GmmResourceInfo::getUnifiedAuxSurfaceOffset(GMM_UNIFIED_AUX_TYPE auxType) { return resourceInfo->GetUnifiedAuxSurfaceOffset(auxType); }
+
+void *GmmResourceInfo::getSystemMemPointer() { return resourceInfo->GetSystemMemPointer(true); }
+
+bool GmmResourceInfo::is64KBPageSuitable() const { return resourceInfo->Is64KBPageSuitable(); }
+
+bool GmmResourceInfo::isDisplayable() const { return resourceInfo->IsDisplayable(); }
+
+uint64_t GmmResourceInfo::getDriverProtectionBits() { return static_cast<uint64_t>(resourceInfo->GetDriverProtectionBits({})); }
+
+GMM_RESOURCE_INFO *GmmResourceInfo::peekGmmResourceInfo() const { return resourceInfo.get(); }
 
 GmmResourceInfo::~GmmResourceInfo() {
     if (this->clientContext && this->clientContext->getHandleAllocator()) {

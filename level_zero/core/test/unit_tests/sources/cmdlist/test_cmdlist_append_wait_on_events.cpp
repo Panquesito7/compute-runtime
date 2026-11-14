@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,36 +11,48 @@
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_direct_submission_hw.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "level_zero/core/source/builtin/builtin_functions_lib.h"
 #include "level_zero/core/source/cmdlist/cmdlist_hw_immediate.h"
-#include "level_zero/core/source/image/image_hw.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/image/image.h"
 #include "level_zero/core/test/unit_tests/fixtures/cmdlist_fixture.inl"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_event.h"
 
 namespace L0 {
 namespace ult {
 
 using CommandListAppendWaitOnEvent = Test<CommandListFixture>;
-using CommandListAppendWaitOnUsedPacketSignalEvent = Test<CommandListEventUsedPacketSignalFixture>;
+using CommandListAppendWaitOnUsedPacketSignalEvent = Test<CommandListSecondaryBatchBufferFixture>;
 using CommandListAppendWaitOnSecondaryBatchBufferEvent = Test<CommandListSecondaryBatchBufferFixture>;
 
 HWTEST_F(CommandListAppendWaitOnEvent, WhenAppendingWaitOnEventThenSemaphoreWaitCmdIsGenerated) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
     ze_event_handle_t hEventHandle = event->toHandle();
-    auto result = commandList->appendWaitOnEvents(1, &hEventHandle, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    auto result = commandList->appendWaitOnEvents(1, &hEventHandle, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
                                                       usedSpaceAfter));
 
@@ -51,13 +63,13 @@ HWTEST_F(CommandListAppendWaitOnEvent, WhenAppendingWaitOnEventThenSemaphoreWait
         auto cmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*itor);
         EXPECT_EQ(cmd->getCompareOperation(),
                   MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD);
-        EXPECT_EQ(static_cast<uint32_t>(-1), cmd->getSemaphoreDataDword());
+        EXPECT_EQ(static_cast<uint32_t>(-1), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(cmd));
 
         auto addressSpace = device->getHwInfo().capabilityTable.gpuAddressSpace;
 
         uint64_t gpuAddress = event->getCompletionFieldGpuAddress(device);
 
-        EXPECT_EQ(gpuAddress & addressSpace, cmd->getSemaphoreGraphicsAddress() & addressSpace);
+        EXPECT_EQ(gpuAddress & addressSpace, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(cmd) & addressSpace);
         EXPECT_EQ(cmd->getWaitMode(),
                   MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE);
     }
@@ -73,28 +85,36 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     using MI_MATH = typename FamilyType::MI_MATH;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
 
     ze_command_queue_desc_t desc = {};
     desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(productFamily, device, &desc, false, NEO::EngineGroupType::RenderCompute, returnValue));
+    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(device, &desc, false, NEO::EngineGroupType::renderCompute, returnValue));
     ASSERT_NE(nullptr, immCommandList);
-    auto whiteBoxCmdList = static_cast<CommandList *>(immCommandList.get());
+    auto whiteBoxCmdList = CommandList::whiteboxCast(immCommandList.get());
 
-    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->csr);
+    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->getCsr(false));
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
     ultCsr->directSubmission.reset(directSubmission);
 
     ze_event_handle_t hEventHandle = event->toHandle();
-    auto result = static_cast<CommandListCoreFamilyImmediate<gfxCoreFamily> *>(immCommandList.get())->addEventsToCmdList(1, &hEventHandle, true, true);
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = true,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    auto result = static_cast<CommandListCoreFamilyImmediate<FamilyType::gfxCoreFamily> *>(immCommandList.get())->addEventsToCmdList(1, &hEventHandle, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = immCommandList->getCmdContainer().getCommandStream()->getUsed();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       immCommandList->getCmdContainer().getCommandStream()->getCpuBase(),
                                                       usedSpaceAfter));
 
@@ -102,83 +122,83 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     ASSERT_NE(cmdList.end(), itor);
 
     auto lrrCmd = genCmdCast<MI_LOAD_REGISTER_REG *>(*itor);
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R4);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_GPR_R0);
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::csGprR4);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::csGprR0);
     lrrCmd++;
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R4 + 4);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_GPR_R0 + 4);
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::csGprR4 + 4);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::csGprR0 + 4);
 
     auto eventGpuAddr = event->getCompletionFieldGpuAddress(this->device);
 
     // conditional bb_start
     auto lrmCmd = reinterpret_cast<MI_LOAD_REGISTER_MEM *>(++lrrCmd);
-    EXPECT_EQ(lrmCmd->getRegisterAddress(), CS_GPR_R7);
+    EXPECT_EQ(lrmCmd->getRegisterAddress(), RegisterOffsets::csGprR7);
     EXPECT_EQ(lrmCmd->getMemoryAddress(), eventGpuAddr);
 
     auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(++lrmCmd);
-    EXPECT_EQ(lriCmd->getRegisterOffset(), CS_GPR_R7 + 4);
+    EXPECT_EQ(lriCmd->getRegisterOffset(), RegisterOffsets::csGprR7 + 4);
     EXPECT_EQ(lriCmd->getDataDword(), 0u);
 
     lriCmd++;
-    EXPECT_EQ(lriCmd->getRegisterOffset(), CS_GPR_R8);
+    EXPECT_EQ(lriCmd->getRegisterOffset(), RegisterOffsets::csGprR8);
     EXPECT_EQ(lriCmd->getDataDword(), static_cast<uint32_t>(Event::State::STATE_CLEARED));
 
     lriCmd++;
-    EXPECT_EQ(lriCmd->getRegisterOffset(), CS_GPR_R8 + 4);
+    EXPECT_EQ(lriCmd->getRegisterOffset(), RegisterOffsets::csGprR8 + 4);
     EXPECT_EQ(lriCmd->getDataDword(), 0u);
 
     auto miMathCmd = reinterpret_cast<MI_MATH *>(++lriCmd);
     EXPECT_EQ(miMathCmd->DW0.BitField.DwordLength, 3u);
 
     auto miAluCmd = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(++miMathCmd);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::OPCODE_LOAD), miAluCmd->DW0.BitField.ALUOpcode);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::R_SRCA), miAluCmd->DW0.BitField.Operand1);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::R_7), miAluCmd->DW0.BitField.Operand2);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::opcodeLoad), miAluCmd->DW0.BitField.ALUOpcode);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::srca), miAluCmd->DW0.BitField.Operand1);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::gpr7), miAluCmd->DW0.BitField.Operand2);
 
     miAluCmd++;
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::OPCODE_LOAD), miAluCmd->DW0.BitField.ALUOpcode);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::R_SRCB), miAluCmd->DW0.BitField.Operand1);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::R_8), miAluCmd->DW0.BitField.Operand2);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::opcodeLoad), miAluCmd->DW0.BitField.ALUOpcode);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::srcb), miAluCmd->DW0.BitField.Operand1);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::gpr8), miAluCmd->DW0.BitField.Operand2);
 
     miAluCmd++;
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::OPCODE_SUB), miAluCmd->DW0.BitField.ALUOpcode);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::OPCODE_NONE), miAluCmd->DW0.BitField.Operand1);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::OPCODE_NONE), miAluCmd->DW0.BitField.Operand2);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::opcodeSub), miAluCmd->DW0.BitField.ALUOpcode);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::opcodeNone), miAluCmd->DW0.BitField.Operand1);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::opcodeNone), miAluCmd->DW0.BitField.Operand2);
 
     miAluCmd++;
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::OPCODE_STORE), miAluCmd->DW0.BitField.ALUOpcode);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::R_7), miAluCmd->DW0.BitField.Operand1);
-    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::R_ZF), miAluCmd->DW0.BitField.Operand2);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::opcodeStore), miAluCmd->DW0.BitField.ALUOpcode);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::gpr7), miAluCmd->DW0.BitField.Operand1);
+    EXPECT_EQ(static_cast<uint32_t>(AluRegisters::zf), miAluCmd->DW0.BitField.Operand2);
 
     lrrCmd = reinterpret_cast<MI_LOAD_REGISTER_REG *>(++miAluCmd);
-    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), CS_GPR_R7);
-    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), CS_PREDICATE_RESULT_2);
+    EXPECT_EQ(lrrCmd->getSourceRegisterAddress(), RegisterOffsets::csGprR7);
+    EXPECT_EQ(lrrCmd->getDestinationRegisterAddress(), RegisterOffsets::csPredicateResult2);
 
     auto predicateCmd = reinterpret_cast<MI_SET_PREDICATE *>(++lrrCmd);
-    EXPECT_EQ(static_cast<typename MI_SET_PREDICATE::PREDICATE_ENABLE>(MiPredicateType::NoopOnResult2Clear), predicateCmd->getPredicateEnable());
+    EXPECT_EQ(static_cast<typename MI_SET_PREDICATE::PREDICATE_ENABLE>(MiPredicateType::noopOnResult2Clear), predicateCmd->getPredicateEnable());
 
     auto bbStartCmd = reinterpret_cast<MI_BATCH_BUFFER_START *>(++predicateCmd);
     EXPECT_EQ(1u, bbStartCmd->getPredicationEnable());
     EXPECT_EQ(1u, bbStartCmd->getIndirectAddressEnable());
 
     predicateCmd = reinterpret_cast<MI_SET_PREDICATE *>(++bbStartCmd);
-    EXPECT_EQ(static_cast<typename MI_SET_PREDICATE::PREDICATE_ENABLE>(MiPredicateType::Disable), predicateCmd->getPredicateEnable());
+    EXPECT_EQ(static_cast<typename MI_SET_PREDICATE::PREDICATE_ENABLE>(MiPredicateType::disable), predicateCmd->getPredicateEnable());
 }
 
 HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissionAndRelaxedOrderingWhenAppendingApiWaitOnEventsThenUseSemaphore, IsAtLeastXeHpcCore) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
 
     ze_command_queue_desc_t desc = {};
     desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(productFamily, device, &desc, false, NEO::EngineGroupType::RenderCompute, returnValue));
+    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(device, &desc, false, NEO::EngineGroupType::renderCompute, returnValue));
     ASSERT_NE(nullptr, immCommandList);
-    auto whiteBoxCmdList = static_cast<CommandList *>(immCommandList.get());
+    auto whiteBoxCmdList = CommandList::whiteboxCast(immCommandList.get());
 
-    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->csr);
+    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->getCsr(false));
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
     ultCsr->directSubmission.reset(directSubmission);
@@ -191,7 +211,7 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     auto usedSpaceAfter = immCommandList->getCmdContainer().getCommandStream()->getUsed();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       immCommandList->getCmdContainer().getCommandStream()->getCpuBase(),
                                                       usedSpaceAfter));
 
@@ -199,20 +219,240 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     ASSERT_NE(cmdList.end(), itor);
 }
 
-HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissionAndRelaxedOrderingWhenAppendingBarrierThenUseSemaphore, IsAtLeastXeHpcCore) {
+HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListAndAppendingRegularCommandlistWithWaitOnEventsThenUseSemaphore, IsAtLeastXeHpcCore) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
 
     ze_command_queue_desc_t desc = {};
     desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(productFamily, device, &desc, false, NEO::EngineGroupType::RenderCompute, returnValue));
+    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(device, &desc, false, NEO::EngineGroupType::renderCompute, returnValue));
     ASSERT_NE(nullptr, immCommandList);
-    auto whiteBoxCmdList = static_cast<CommandList *>(immCommandList.get());
 
-    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->csr);
+    ze_event_handle_t hEventHandle = event->toHandle();
+    std::unique_ptr<L0::CommandList> commandListRegular(CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false));
+    commandListRegular->close();
+    auto commandListHandle = commandListRegular->toHandle();
+
+    // 1st append can carry preamble
+    CommandListExecutionInternalOptions internalOptions = {};
+    auto result = immCommandList->appendCommandLists(1u, &commandListHandle, nullptr, 1u, &hEventHandle, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // 2nd append should carry only wait events and bb_start to regular command list
+    auto usedSpaceBefore = immCommandList->getCmdContainer().getCommandStream()->getUsed();
+
+    result = immCommandList->appendCommandLists(1u, &commandListHandle, nullptr, 1u, &hEventHandle, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    auto usedSpaceAfter = immCommandList->getCmdContainer().getCommandStream()->getUsed();
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
+                                                      ptrOffset(immCommandList->getCmdContainer().getCommandStream()->getCpuBase(), usedSpaceBefore),
+                                                      usedSpaceAfter - usedSpaceBefore));
+
+    auto itor = find<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(cmdList.end(), itor);
+
+    auto itorBBStart = find<MI_BATCH_BUFFER_START *>(itor, cmdList.end());
+    ASSERT_NE(cmdList.end(), itorBBStart);
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+class MockCommandListImmediateHwWithWaitEventFail : public WhiteBox<::L0::CommandListCoreFamilyImmediate<gfxCoreFamily>> {
+  public:
+    using BaseClass = WhiteBox<::L0::CommandListCoreFamilyImmediate<gfxCoreFamily>>;
+    MockCommandListImmediateHwWithWaitEventFail() : BaseClass() {
+        this->cmdListType = CommandList::CommandListType::typeImmediate;
+    }
+    using BaseClass::appendSignalEventPostWalker;
+    using BaseClass::applyMemoryRangesBarrier;
+    using BaseClass::cmdListType;
+    using BaseClass::cmdQImmediate;
+    using BaseClass::copyThroughLockedPtrEnabled;
+    using BaseClass::dcFlushSupport;
+    using BaseClass::dependenciesPresent;
+    using BaseClass::dummyBlitWa;
+    using BaseClass::isSyncModeQueue;
+    using BaseClass::isTbxMode;
+    using BaseClass::setupFillKernelArguments;
+
+    ze_result_t appendWaitOnEvents(uint32_t numEvents, ze_event_handle_t *phEvent, CmdListWaitEventParameters &waitEventsParameters) override {
+        if (forceWaitEventError) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        appendWaitEventCalled++;
+        return BaseClass::appendWaitOnEvents(numEvents, phEvent, waitEventsParameters);
+    };
+
+    ze_result_t appendSignalEvent(ze_event_handle_t hEvent, CmdListSignalEventParameters &signalEventParameters) override {
+        if (forceSignalEventError) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        appendSignalEventCalled++;
+        return BaseClass::appendSignalEvent(hEvent, signalEventParameters);
+    }
+
+    ze_result_t executeCommandListImmediateWithFlushTask(bool performMigration, bool hasStallingCmds, bool hasRelaxedOrderingDependencies, NEO::AppendOperations appendOperation,
+                                                         bool copyOffloadSubmission, bool requireTaskCountUpdate,
+                                                         MutexLock *outerLock,
+                                                         std::unique_lock<std::mutex> *outerLockForIndirect) override {
+        ++executeCommandListImmediateWithFlushTaskCalledCount;
+        if (callBaseExecute) {
+            return BaseClass::executeCommandListImmediateWithFlushTask(performMigration, hasStallingCmds, hasRelaxedOrderingDependencies, appendOperation, copyOffloadSubmission, requireTaskCountUpdate,
+                                                                       outerLock, outerLockForIndirect);
+        }
+        return executeCommandListImmediateWithFlushTaskReturnValue;
+    }
+
+    bool callBaseExecute = false;
+    bool forceSignalEventError = false;
+    bool forceWaitEventError = false;
+
+    ze_result_t executeCommandListImmediateWithFlushTaskReturnValue = ZE_RESULT_SUCCESS;
+    uint32_t executeCommandListImmediateWithFlushTaskCalledCount = 0;
+
+    uint32_t appendSignalEventCalled = 0u;
+    uint32_t appendWaitEventCalled = 0u;
+};
+
+class MockCommandQueueExecute : public Mock<CommandQueue> {
+  public:
+    MockCommandQueueExecute(L0::Device *device, NEO::CommandStreamReceiver *csr, const ze_command_queue_desc_t *desc) : Mock(device, csr, desc) {}
+    ze_result_t executeCommandLists(
+        uint32_t numCommandLists,
+        ze_command_list_handle_t *phCommandLists,
+        ze_fence_handle_t hFence,
+        CommandListExecutionInternalOptions &internalOptions) override {
+        if (forceQueueExecuteError) {
+            return ZE_RESULT_ERROR_DEVICE_LOST;
+        }
+        executeCalledCount++;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    ze_result_t destroy() override {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    uint32_t executeCalledCount = 0;
+    bool forceQueueExecuteError = false;
+};
+
+using CommandListImmediateAppendRegularTest = Test<CommandListFixture>;
+HWTEST2_F(CommandListImmediateAppendRegularTest, givenImmediateCommandListAndAppendRegularCommandlistWhenWaitFailsThenExecuteNotCalled, IsAtLeastXeHpcCore) {
+    ze_command_queue_desc_t queueDesc = {};
+    MockCommandStreamReceiver mockCommandStreamReceiver(*neoDevice->executionEnvironment, neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield());
+    mockCommandStreamReceiver.osContext = neoDevice->getDefaultEngine().osContext;
+    MockCommandQueueExecute queue(device, &mockCommandStreamReceiver, &queueDesc);
+
+    auto cmdList = new MockCommandListImmediateHwWithWaitEventFail<FamilyType::gfxCoreFamily>;
+    cmdList->cmdListType = CommandList::CommandListType::typeImmediate;
+    cmdList->forceWaitEventError = true;
+    cmdList->cmdQImmediate = &queue;
+    cmdList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    auto result = cmdList->appendCommandLists(0u, nullptr, nullptr, 1u, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+    EXPECT_EQ(queue.executeCalledCount, 0u);
+
+    cmdList->destroy();
+}
+
+HWTEST2_F(CommandListImmediateAppendRegularTest, givenImmediateCommandListAndAppendRegularCommandlistWhenWaitSucceedsAndQueueExecFailsThenSignalEventNotCalled, IsAtLeastXeHpcCore) {
+    ze_command_queue_desc_t queueDesc = {};
+    MockCommandStreamReceiver mockCommandStreamReceiver(*neoDevice->executionEnvironment, neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield());
+    mockCommandStreamReceiver.osContext = neoDevice->getDefaultEngine().osContext;
+    MockCommandQueueExecute queue(device, &mockCommandStreamReceiver, &queueDesc);
+    queue.forceQueueExecuteError = true;
+
+    ze_event_handle_t hEventHandle = event->toHandle();
+    auto cmdList = new MockCommandListImmediateHwWithWaitEventFail<FamilyType::gfxCoreFamily>;
+    cmdList->cmdListType = CommandList::CommandListType::typeImmediate;
+    cmdList->cmdQImmediate = &queue;
+    cmdList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    auto result = cmdList->appendCommandLists(0u, nullptr, nullptr, 1u, &hEventHandle, internalOptions);
+    EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
+    EXPECT_EQ(queue.executeCalledCount, 0u);
+
+    cmdList->destroy();
+}
+
+HWTEST2_F(CommandListImmediateAppendRegularTest, givenImmediateCommandListAndAppendRegularCommandlistWhenSubOperationsSucceedThenFinalCallSucceeds, IsAtLeastXeHpcCore) {
+    ze_command_queue_desc_t queueDesc = {};
+    auto tagMemory = std::make_unique<TagAddressType[]>(MemoryConstants::pageSize / sizeof(TagAddressType));
+    memset(tagMemory.get(), 0xFF, MemoryConstants::pageSize);
+    MockGraphicsAllocation mockGraphicsAllocation(tagMemory.get(), MemoryConstants::pageSize);
+    MockCommandStreamReceiver mockCommandStreamReceiver(*neoDevice->executionEnvironment, neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield());
+    mockCommandStreamReceiver.setTagAllocation(&mockGraphicsAllocation);
+    mockCommandStreamReceiver.osContext = neoDevice->getDefaultEngine().osContext;
+    MockCommandQueueExecute queue(device, &mockCommandStreamReceiver, &queueDesc);
+
+    ze_event_handle_t hEventHandle = event->toHandle();
+    const ze_event_desc_t eventDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_DESC,
+        nullptr,
+        0,
+        0,
+        ZE_EVENT_SCOPE_FLAG_DEVICE};
+    ze_result_t result;
+    auto signalEvent = std::unique_ptr<L0::Event>(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+    ze_event_handle_t hSignalEventHandle = signalEvent->toHandle();
+
+    auto cmdList = new MockCommandListImmediateHwWithWaitEventFail<FamilyType::gfxCoreFamily>;
+    cmdList->cmdListType = CommandList::CommandListType::typeImmediate;
+    cmdList->cmdQImmediate = &queue;
+    cmdList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+
+    std::unique_ptr<L0::CommandList> commandListRegular(CommandList::create(device, NEO::EngineGroupType::compute, 0u, result, false));
+    commandListRegular->close();
+    auto commandListHandle = commandListRegular->toHandle();
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    result = cmdList->appendCommandLists(1, &commandListHandle, hSignalEventHandle, 1u, &hEventHandle, internalOptions);
+    EXPECT_EQ(queue.executeCalledCount, 1u);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    cmdList->destroy();
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+class MockAppendRegularCommandlistWithWaitOnEvents : public MockCommandListForAppendLaunchKernel<gfxCoreFamily> {
+  public:
+    MockAppendRegularCommandlistWithWaitOnEvents() : MockCommandListForAppendLaunchKernel<gfxCoreFamily>() {}
+    ze_result_t appendWaitOnEvents(uint32_t numEvents, ze_event_handle_t *phEvent, CmdListWaitEventParameters &waitEventsParameters) override {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    };
+};
+
+HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListAndAppendingRegularCommandlistWithWaitOnEventsAndForceInvalidReturnThenCheckReturnStatus, IsAtLeastXeHpcCore) {
+    MockAppendRegularCommandlistWithWaitOnEvents<FamilyType::gfxCoreFamily> cmdList;
+
+    cmdList.initialize(device, NEO::EngineGroupType::compute, 0u);
+    ze_event_handle_t hEventHandle = event->toHandle();
+    CommandListExecutionInternalOptions internalOptions = {};
+    auto result = cmdList.appendCommandLists(0u, nullptr, nullptr, 1u, &hEventHandle, internalOptions);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+}
+
+HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissionAndRelaxedOrderingWhenAppendingBarrierThenUseSemaphore, IsAtLeastXeHpcCore) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+
+    ze_command_queue_desc_t desc = {};
+    desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(device, &desc, false, NEO::EngineGroupType::renderCompute, returnValue));
+    ASSERT_NE(nullptr, immCommandList);
+    auto whiteBoxCmdList = CommandList::whiteboxCast(immCommandList.get());
+
+    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->getCsr(false));
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
     ultCsr->directSubmission.reset(directSubmission);
@@ -225,7 +465,7 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     auto usedSpaceAfter = immCommandList->getCmdContainer().getCommandStream()->getUsed();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       immCommandList->getCmdContainer().getCommandStream()->getCpuBase(),
                                                       usedSpaceAfter));
 
@@ -237,7 +477,7 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
 
     const size_t rangeSizes = 1;
     const void *ranges = nullptr;
@@ -245,11 +485,11 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     ze_command_queue_desc_t desc = {};
     desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(productFamily, device, &desc, false, NEO::EngineGroupType::RenderCompute, returnValue));
+    std::unique_ptr<L0::CommandList> immCommandList(CommandList::createImmediate(device, &desc, false, NEO::EngineGroupType::renderCompute, returnValue));
     ASSERT_NE(nullptr, immCommandList);
-    auto whiteBoxCmdList = static_cast<CommandList *>(immCommandList.get());
+    auto whiteBoxCmdList = CommandList::whiteboxCast(immCommandList.get());
 
-    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->csr);
+    auto ultCsr = static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(whiteBoxCmdList->getCsr(false));
 
     auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(*ultCsr);
     ultCsr->directSubmission.reset(directSubmission);
@@ -262,7 +502,7 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCmdListWithDirectSubmissio
     auto usedSpaceAfter = immCommandList->getCmdContainer().getCommandStream()->getUsed();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       immCommandList->getCmdContainer().getCommandStream()->getCpuBase(),
                                                       usedSpaceAfter));
 
@@ -275,15 +515,22 @@ HWTEST_F(CommandListAppendWaitOnEvent, givenTwoEventsWhenWaitOnEventsAppendedThe
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
     ze_event_handle_t handles[2] = {event->toHandle(), event->toHandle()};
-
-    auto result = commandList->appendWaitOnEvents(2, handles, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    auto result = commandList->appendWaitOnEvents(2, handles, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
                                                       usedSpaceAfter));
 
@@ -298,8 +545,8 @@ HWTEST_F(CommandListAppendWaitOnEvent, givenTwoEventsWhenWaitOnEventsAppendedThe
         auto cmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*itor[i]);
         EXPECT_EQ(cmd->getCompareOperation(),
                   MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD);
-        EXPECT_EQ(static_cast<uint32_t>(-1), cmd->getSemaphoreDataDword());
-        EXPECT_EQ(gpuAddress & addressSpace, cmd->getSemaphoreGraphicsAddress() & addressSpace);
+        EXPECT_EQ(static_cast<uint32_t>(-1), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(cmd));
+        EXPECT_EQ(gpuAddress & addressSpace, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(cmd) & addressSpace);
         EXPECT_EQ(cmd->getWaitMode(),
                   MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE);
     }
@@ -307,7 +554,15 @@ HWTEST_F(CommandListAppendWaitOnEvent, givenTwoEventsWhenWaitOnEventsAppendedThe
 
 HWTEST_F(CommandListAppendWaitOnEvent, WhenAppendingWaitOnEventsThenEventGraphicsAllocationIsAddedToResidencyContainer) {
     ze_event_handle_t hEventHandle = event->toHandle();
-    auto result = commandList->appendWaitOnEvents(1, &hEventHandle, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    auto result = commandList->appendWaitOnEvents(1, &hEventHandle, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto &residencyContainer = commandList->getCmdContainer().getResidencyContainer();
@@ -316,49 +571,6 @@ HWTEST_F(CommandListAppendWaitOnEvent, WhenAppendingWaitOnEventsThenEventGraphic
         auto itor =
             std::find(std::begin(residencyContainer), std::end(residencyContainer), alloc);
         EXPECT_NE(itor, std::end(residencyContainer));
-    }
-}
-
-HWTEST_F(CommandListAppendWaitOnEvent, givenEventWithWaitScopeFlagDeviceWhenAppendingWaitOnEventThenPCWithDcFlushIsGenerated) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-
-    const ze_event_desc_t eventDesc = {
-        ZE_STRUCTURE_TYPE_EVENT_DESC,
-        nullptr,
-        0,
-        0,
-        ZE_EVENT_SCOPE_FLAG_DEVICE};
-
-    auto event = std::unique_ptr<L0::Event>(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device));
-    ze_event_handle_t hEventHandle = event->toHandle();
-
-    auto result = commandList->appendWaitOnEvents(1, &hEventHandle, false, true, false);
-    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
-
-    auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
-    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
-                                                      ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-                                                      usedSpaceAfter));
-
-    auto itor = find<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
-    EXPECT_NE(cmdList.end(), itor);
-
-    if (NEO::MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, device->getNEODevice()->getRootDeviceEnvironment())) {
-        itor--;
-        auto cmd = genCmdCast<PIPE_CONTROL *>(*itor);
-
-        ASSERT_NE(nullptr, cmd);
-        EXPECT_TRUE(cmd->getCommandStreamerStallEnable());
-        EXPECT_TRUE(cmd->getDcFlushEnable());
-    } else {
-        if (cmdList.begin() != itor) {
-            itor--;
-            EXPECT_EQ(nullptr, genCmdCast<PIPE_CONTROL *>(*itor));
-        }
     }
 }
 
@@ -375,11 +587,21 @@ HWTEST_F(CommandListAppendWaitOnUsedPacketSignalEvent, WhenAppendingWaitOnTimest
     ze_result_t result = ZE_RESULT_SUCCESS;
     std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
 
-    event->setPacketsInUse(3u);
+    constexpr uint32_t packets = 3u;
+    whiteboxCast(event.get())->maxPacketCount = packets;
+    event->setPacketsInUse(packets);
     ze_event_handle_t hEventHandle = event->toHandle();
-    result = commandList->appendWaitOnEvents(1, &hEventHandle, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    result = commandList->appendWaitOnEvents(1, &hEventHandle, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
@@ -387,7 +609,7 @@ HWTEST_F(CommandListAppendWaitOnUsedPacketSignalEvent, WhenAppendingWaitOnTimest
     auto gpuAddress = event->getGpuAddress(device) + event->getContextEndOffset();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
                                                       usedSpaceAfter));
 
@@ -401,8 +623,8 @@ HWTEST_F(CommandListAppendWaitOnUsedPacketSignalEvent, WhenAppendingWaitOnTimest
 
         EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD,
                   cmd->getCompareOperation());
-        EXPECT_EQ(cmd->getSemaphoreDataDword(), static_cast<uint32_t>(-1));
-        EXPECT_EQ(gpuAddress & addressSpace, cmd->getSemaphoreGraphicsAddress() & addressSpace);
+        EXPECT_EQ(NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(cmd), static_cast<uint32_t>(-1));
+        EXPECT_EQ(gpuAddress & addressSpace, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(cmd) & addressSpace);
         EXPECT_EQ(MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE, cmd->getWaitMode());
 
         semaphoreWaitsFound++;
@@ -411,84 +633,39 @@ HWTEST_F(CommandListAppendWaitOnUsedPacketSignalEvent, WhenAppendingWaitOnTimest
     ASSERT_EQ(3u, semaphoreWaitsFound);
 }
 
-HWTEST_F(CommandListAppendWaitOnUsedPacketSignalEvent, WhenAppendingWaitOnTimestampEventWithThreeKernelsThenSemaphoreWaitCmdIsGeneratedCorrectly) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-
-    DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.UseDynamicEventPacketsCount.set(0);
-
-    ze_result_t result = ZE_RESULT_SUCCESS;
-    commandList.reset(whiteboxCast(CommandList::create(device->getHwInfo().platform.eProductFamily, device, NEO::EngineGroupType::RenderCompute, 0u, result)));
-
-    auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-
-    ze_event_pool_desc_t eventPoolDesc = {};
-    eventPoolDesc.count = 1;
-    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    ze_event_desc_t eventDesc = {};
-    eventDesc.index = 0;
-    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device));
-
-    event->setMaxKernelCount(3u);
-
-    event->setPacketsInUse(3u);
-    event->increaseKernelCount();
-    event->setPacketsInUse(3u);
-    event->increaseKernelCount();
-    event->setPacketsInUse(3u);
-    ASSERT_EQ(9u, event->getPacketsInUse());
-
-    ze_event_handle_t hEventHandle = event->toHandle();
-    result = commandList->appendWaitOnEvents(1, &hEventHandle, false, true, false);
-    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
-    auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
-    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
-
-    auto gpuAddress = event->getGpuAddress(device) + event->getContextEndOffset();
-
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
-                                                      ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-                                                      usedSpaceAfter));
-
-    auto itorSW = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
-    ASSERT_NE(0u, itorSW.size());
-    uint32_t semaphoreWaitsFound = 0;
-
-    for (auto it : itorSW) {
-        auto cmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*it);
-        auto addressSpace = device->getHwInfo().capabilityTable.gpuAddressSpace;
-
-        EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD,
-                  cmd->getCompareOperation());
-        EXPECT_EQ(cmd->getSemaphoreDataDword(), static_cast<uint32_t>(-1));
-        EXPECT_EQ(gpuAddress & addressSpace, cmd->getSemaphoreGraphicsAddress() & addressSpace);
-        EXPECT_EQ(MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE, cmd->getWaitMode());
-
-        semaphoreWaitsFound++;
-        gpuAddress += event->getSinglePacketSize();
-    }
-    ASSERT_EQ(9u, semaphoreWaitsFound);
-}
-
-HWTEST2_F(CommandListAppendWaitOnEvent, givenCommandListWhenAppendWriteGlobalTimestampCalledWithWaitOnEventsThenSemaphoreWaitAndPipeControlForTimestampEncoded, IsAtLeastSkl) {
+HWTEST_F(CommandListAppendWaitOnEvent, givenCommandListWhenAppendWriteGlobalTimestampCalledWithWaitOnEventsThenSemaphoreWaitAndPipeControlForTimestampEncoded) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using POST_SYNC_OPERATION = typename PIPE_CONTROL::POST_SYNC_OPERATION;
 
-    uint64_t timestampAddress = 0x12345678555500;
-    uint64_t *dstptr = reinterpret_cast<uint64_t *>(timestampAddress);
-    ze_event_handle_t hEventHandle = event->toHandle();
+    auto memoryManager = static_cast<MockMemoryManager *>(neoDevice->getMemoryManager());
+    memoryManager->returnFakeAllocation = true;
 
-    commandList->appendWriteGlobalTimestamp(dstptr, nullptr, 1, &hEventHandle);
+    uint64_t dstAddress = 0x123456785500;
+    uint64_t *dstptr = reinterpret_cast<uint64_t *>(dstAddress);
+    auto &commandContainer = commandList->getCmdContainer();
+    commandContainer.clearResidencyContainer();
+
+    ze_event_handle_t hEventHandle = event->toHandle();
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    commandList->appendWriteGlobalTimestamp(dstptr, nullptr, 1, &hEventHandle, waitEventsParameters);
+
+    auto residencyContainer = commandContainer.getResidencyContainer();
+    auto timestampAlloc = residencyContainer[1];
+    EXPECT_EQ(dstAddress, reinterpret_cast<uint64_t>(timestampAlloc->getUnderlyingBuffer()));
+    auto timestampAddress = timestampAlloc->getGpuAddress();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-        commandList->getCmdContainer().getCommandStream()->getUsed()));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandContainer.getCommandStream()->getCpuBase(), 0),
+        commandContainer.getCommandStream()->getUsed()));
 
     auto itor = find<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
     ASSERT_NE(cmdList.end(), itor);
@@ -496,13 +673,13 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenCommandListWhenAppendWriteGlobalTim
     auto cmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*itor);
     EXPECT_EQ(cmd->getCompareOperation(),
               MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD);
-    EXPECT_EQ(static_cast<uint32_t>(-1), cmd->getSemaphoreDataDword());
+    EXPECT_EQ(static_cast<uint32_t>(-1), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(cmd));
 
     auto addressSpace = device->getHwInfo().capabilityTable.gpuAddressSpace;
 
     uint64_t gpuAddress = event->getCompletionFieldGpuAddress(device);
 
-    EXPECT_EQ(gpuAddress & addressSpace, cmd->getSemaphoreGraphicsAddress() & addressSpace);
+    EXPECT_EQ(gpuAddress & addressSpace, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(cmd) & addressSpace);
     EXPECT_EQ(cmd->getWaitMode(),
               MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE);
 
@@ -524,7 +701,6 @@ HWTEST2_F(CommandListAppendWaitOnEvent, givenCommandListWhenAppendWriteGlobalTim
 }
 
 HWTEST_F(CommandListAppendWaitOnSecondaryBatchBufferEvent, givenCommandBufferIsEmptyWhenAppendingWaitOnEventThenAllocateNewCommandBuffer) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     using MI_BATCH_BUFFER_END = typename FamilyType::MI_BATCH_BUFFER_END;
 
@@ -533,9 +709,6 @@ HWTEST_F(CommandListAppendWaitOnSecondaryBatchBufferEvent, givenCommandBufferIsE
     commandList->getCmdContainer().getCommandStream()->getSpace(consumeSpace);
 
     size_t expectedConsumedSpace = NEO::EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait();
-    if (MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, device->getNEODevice()->getRootDeviceEnvironment())) {
-        expectedConsumedSpace += sizeof(PIPE_CONTROL);
-    }
 
     const ze_event_desc_t eventDesc = {
         ZE_STRUCTURE_TYPE_EVENT_DESC,
@@ -543,12 +716,20 @@ HWTEST_F(CommandListAppendWaitOnSecondaryBatchBufferEvent, givenCommandBufferIsE
         0,
         0,
         ZE_EVENT_SCOPE_FLAG_DEVICE};
-
-    auto event = std::unique_ptr<L0::Event>(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device));
+    ze_result_t result;
+    auto event = std::unique_ptr<L0::Event>(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
     ze_event_handle_t hEventHandle = event->toHandle();
 
     auto oldCommandBuffer = commandList->getCmdContainer().getCommandStream()->getGraphicsAllocation();
-    auto result = commandList->appendWaitOnEvents(1, &hEventHandle, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    result = commandList->appendWaitOnEvents(1, &hEventHandle, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
@@ -560,23 +741,9 @@ HWTEST_F(CommandListAppendWaitOnSecondaryBatchBufferEvent, givenCommandBufferIsE
     auto gpuAddress = event->getCompletionFieldGpuAddress(device);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       commandList->getCmdContainer().getCommandStream()->getCpuBase(),
                                                       usedSpaceAfter));
-
-    auto itorPC = find<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
-    if (MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, device->getNEODevice()->getRootDeviceEnvironment())) {
-        ASSERT_NE(cmdList.end(), itorPC);
-        {
-            auto cmd = genCmdCast<PIPE_CONTROL *>(*itorPC);
-            ASSERT_NE(cmd, nullptr);
-
-            EXPECT_TRUE(cmd->getCommandStreamerStallEnable());
-            EXPECT_EQ(MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, device->getNEODevice()->getRootDeviceEnvironment()), cmd->getDcFlushEnable());
-        }
-    } else {
-        EXPECT_EQ(cmdList.end(), itorPC);
-    }
 
     auto itorSW = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
     ASSERT_NE(0u, itorSW.size());
@@ -587,8 +754,8 @@ HWTEST_F(CommandListAppendWaitOnSecondaryBatchBufferEvent, givenCommandBufferIsE
 
         EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD,
                   cmd->getCompareOperation());
-        EXPECT_EQ(cmd->getSemaphoreDataDword(), std::numeric_limits<uint32_t>::max());
-        EXPECT_EQ(gpuAddress & addressSpace, cmd->getSemaphoreGraphicsAddress() & addressSpace);
+        EXPECT_EQ(NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(cmd), std::numeric_limits<uint32_t>::max());
+        EXPECT_EQ(gpuAddress & addressSpace, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(cmd) & addressSpace);
         EXPECT_EQ(MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE, cmd->getWaitMode());
 
         semaphoreWaitsFound++;
@@ -599,27 +766,34 @@ HWTEST_F(CommandListAppendWaitOnSecondaryBatchBufferEvent, givenCommandBufferIsE
 
 using MultTileCommandListAppendWaitOnEvent = Test<MultiTileCommandListFixture<false, false, false, -1>>;
 HWTEST2_F(MultTileCommandListAppendWaitOnEvent,
-          GivenMultiTileCmdListWhenPartitionedEventUsedToWaitThenExpectProperGpuAddressAndSemaphoreCount, IsAtLeastXeHpCore) {
+          GivenMultiTileCmdListWhenPartitionedEventUsedToWaitThenExpectProperGpuAddressAndSemaphoreCount, IsAtLeastXeCore) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     size_t expectedSize = commandList->partitionCount * NEO::EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait();
 
     event->setPacketsInUse(commandList->partitionCount);
-    event->setUsingContextEndOffset(true);
 
     ze_event_handle_t eventHandle = event->toHandle();
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-    auto result = commandList->appendWaitOnEvents(1, &eventHandle, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    auto result = commandList->appendWaitOnEvents(1, &eventHandle, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     EXPECT_EQ(expectedSize, (usedSpaceAfter - usedSpaceBefore));
 
-    auto gpuAddress = event->getGpuAddress(device) + event->getContextEndOffset();
+    auto gpuAddress = event->getGpuAddress(device);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), usedSpaceBefore),
                                                       expectedSize));
 
@@ -631,8 +805,8 @@ HWTEST2_F(MultTileCommandListAppendWaitOnEvent,
 
         EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD,
                   cmd->getCompareOperation());
-        EXPECT_EQ(cmd->getSemaphoreDataDword(), std::numeric_limits<uint32_t>::max());
-        EXPECT_EQ(gpuAddress, cmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(cmd), std::numeric_limits<uint32_t>::max());
+        EXPECT_EQ(gpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(cmd));
         EXPECT_EQ(MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE, cmd->getWaitMode());
 
         semaphoreWaitsFound++;
@@ -641,77 +815,111 @@ HWTEST2_F(MultTileCommandListAppendWaitOnEvent,
     EXPECT_EQ(2u, semaphoreWaitsFound);
 }
 
-HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCommandListWhenAppendWaitOnNotSignaledEventThenWait, IsAtLeastSkl) {
-    MockCommandListImmediateHw<gfxCoreFamily> cmdList;
-    cmdList.initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
-    cmdList.csr = device->getNEODevice()->getInternalEngine().commandStreamReceiver;
+HWTEST_F(CommandListAppendWaitOnEvent, givenImmediateCommandListWhenAppendWaitOnNotSignaledEventThenWait) {
+    ze_command_queue_desc_t queueDesc = {};
+    auto queue = std::make_unique<Mock<CommandQueue>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    MockCommandListImmediateHw<FamilyType::gfxCoreFamily> cmdList;
+    cmdList.cmdQImmediate = queue.get();
+
+    cmdList.initialize(device, NEO::EngineGroupType::renderCompute, 0u);
 
     ze_event_handle_t eventHandle = event->toHandle();
 
     EXPECT_FALSE(cmdList.dependenciesPresent);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, cmdList.appendWaitOnEvents(1, &eventHandle, false, true, false));
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, cmdList.appendWaitOnEvents(1, &eventHandle, waitEventsParameters));
     EXPECT_TRUE(cmdList.dependenciesPresent);
 }
 
-HWTEST2_F(CommandListAppendWaitOnEvent, givenImmediateCommandListWhenAppendWaitOnAlreadySignaledEventThenDontWait, IsAtLeastSkl) {
-    MockCommandListImmediateHw<gfxCoreFamily> cmdList;
-    cmdList.initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
-    cmdList.csr = device->getNEODevice()->getInternalEngine().commandStreamReceiver;
+HWTEST_F(CommandListAppendWaitOnEvent, givenImmediateCommandListWhenAppendWaitOnAlreadySignaledEventThenDontWait) {
+    ze_command_queue_desc_t queueDesc = {};
+    auto queue = std::make_unique<Mock<CommandQueue>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    MockCommandListImmediateHw<FamilyType::gfxCoreFamily> cmdList;
+    cmdList.cmdQImmediate = queue.get();
+
+    cmdList.initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     cmdList.dcFlushSupport = false;
-    event->hostSignal();
-    EXPECT_EQ(ZE_RESULT_SUCCESS, event->queryStatus());
+    event->hostSignal(false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->queryStatus(0));
     ze_event_handle_t eventHandle = event->toHandle();
 
     EXPECT_FALSE(cmdList.dependenciesPresent);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, cmdList.appendWaitOnEvents(1, &eventHandle, false, true, false));
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, cmdList.appendWaitOnEvents(1, &eventHandle, waitEventsParameters));
     EXPECT_FALSE(cmdList.dependenciesPresent);
 }
 
 using TbxImmediateCommandListTest = Test<TbxImmediateCommandListFixture>;
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendLaunchKernelThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendLaunchKernelThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
     ze_group_count_t group = {1, 1, 1};
     CmdListKernelLaunchParams launchParams = {};
-    commandListImmediate->appendLaunchKernel(kernel->toHandle(), &group, nullptr, 1, &eventHandle, launchParams, false);
+    commandListImmediate->appendLaunchKernel(kernel->toHandle(), group, nullptr, 1, &eventHandle, launchParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendLaunchKernelIndirectThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendLaunchKernelIndirectThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
     ze_group_count_t group = {1, 1, 1};
-    commandListImmediate->appendLaunchKernelIndirect(kernel->toHandle(), &group, nullptr, 1, &eventHandle, false);
+    commandListImmediate->appendLaunchKernelIndirect(kernel->toHandle(), group, nullptr, 1, &eventHandle, false);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendBarrierThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendBarrierThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendBarrier(nullptr, 1, &eventHandle);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    CmdListSignalEventParameters signalEventParameters = {
+        .relaxedOrderingDispatch = false,
+    };
+    commandListImmediate->appendBarrier(nullptr, 1, &eventHandle, waitEventsParameters, signalEventParameters);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryCopyThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryCopyThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
     void *srcPtr = reinterpret_cast<void *>(0x1234);
     void *dstPtr = reinterpret_cast<void *>(0x2345);
-    commandListImmediate->appendMemoryCopy(dstPtr, srcPtr, 8, nullptr, 1, &eventHandle, false);
+    CmdListMemoryCopyParams copyParams = {};
+    commandListImmediate->appendMemoryCopy(dstPtr, srcPtr, 8, nullptr, 1, &eventHandle, copyParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
     ultCsr.getInternalAllocationStorage()->getTemporaryAllocations().freeAllGraphicsAllocations(neoDevice);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryCopyRegionThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryCopyRegionThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
@@ -719,13 +927,14 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
     void *dstPtr = reinterpret_cast<void *>(0x2345);
     ze_copy_region_t dstRegion = {};
     ze_copy_region_t srcRegion = {};
-    commandListImmediate->appendMemoryCopyRegion(dstPtr, &dstRegion, 0, 0, srcPtr, &srcRegion, 0, 0, nullptr, 1, &eventHandle, false);
+    CmdListMemoryCopyParams copyParams = {};
+    commandListImmediate->appendMemoryCopyRegion(dstPtr, &dstRegion, 0, 0, srcPtr, &srcRegion, 0, 0, nullptr, 1, &eventHandle, copyParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
     ultCsr.getInternalAllocationStorage()->getTemporaryAllocations().freeAllGraphicsAllocations(neoDevice);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryFillThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryFillThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
@@ -733,40 +942,57 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
     ze_host_mem_alloc_desc_t hostDesc = {};
     context->allocHostMem(&hostDesc, 4096, 4096u, &dstBuffer);
 
+    CmdListMemoryCopyParams copyParams = {};
     int one = 1;
     commandListImmediate->appendMemoryFill(dstBuffer, reinterpret_cast<void *>(&one), sizeof(one), 4096,
-                                           nullptr, 1, &eventHandle, false);
+                                           nullptr, 1, &eventHandle, copyParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 
     context->freeMem(dstBuffer);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendWaitOnEventsThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendWaitOnEventsThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendWaitOnEvents(1, &eventHandle, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    commandListImmediate->appendWaitOnEvents(1, &eventHandle, waitEventsParameters);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendWriteGlobalTimestampThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendWriteGlobalTimestampThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     auto eventHandle = event->toHandle();
     uint64_t *dstptr = reinterpret_cast<uint64_t *>(0x12345678555500);
-    commandListImmediate->appendWriteGlobalTimestamp(dstptr, nullptr, 1, &eventHandle);
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    commandListImmediate->appendWriteGlobalTimestamp(dstptr, nullptr, 1, &eventHandle, waitEventsParameters);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendImageCopyRegionThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendImageCopyRegionThenDoNotDownloadAllocations) {
     if (!neoDevice->getDeviceInfo().imageSupport) {
         GTEST_SKIP();
     }
-    auto kernel = device->getBuiltinFunctionsLib()->getImageFunction(ImageBuiltin::CopyImageRegion);
-    auto mockBuiltinKernel = static_cast<Mock<::L0::Kernel> *>(kernel);
+    auto kernel = device->getBuiltinFunctionsLib()->getImageFunction(ImageBuiltIn::copyImageRegion, getDefaultBuiltInMode());
+    auto mockBuiltinKernel = static_cast<Mock<::L0::KernelImp> *>(kernel);
     mockBuiltinKernel->setArgRedescribedImageCallBase = false;
 
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
@@ -774,11 +1000,11 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
     ze_image_desc_t desc = {ZE_STRUCTURE_TYPE_IMAGE_DESC};
     L0::Image *imagePtr;
 
-    auto result = Image::create(neoDevice->getHardwareInfo().platform.eProductFamily, device, &desc, &imagePtr);
+    auto result = Image::create(device, &desc, &imagePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     std::unique_ptr<L0::Image> imageDst(imagePtr);
 
-    result = Image::create(neoDevice->getHardwareInfo().platform.eProductFamily, device, &desc, &imagePtr);
+    result = Image::create(device, &desc, &imagePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     std::unique_ptr<L0::Image> imageSrc(imagePtr);
 
@@ -786,18 +1012,19 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
     ze_image_region_t dstRegion = {4, 4, 4, 2, 2, 2};
 
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendImageCopyRegion(imageDst->toHandle(), imageSrc->toHandle(), &dstRegion, &srcRegion, nullptr, 1, &eventHandle, false);
+    CmdListMemoryCopyParams copyParams = {};
+    commandListImmediate->appendImageCopyRegion(imageDst->toHandle(), imageSrc->toHandle(), &dstRegion, &srcRegion, nullptr, 1, &eventHandle, copyParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendImageCopyFromMemoryThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendImageCopyFromMemoryThenDoNotDownloadAllocations) {
     if (!neoDevice->getDeviceInfo().imageSupport) {
         GTEST_SKIP();
     }
 
-    auto kernel = device->getBuiltinFunctionsLib()->getImageFunction(ImageBuiltin::CopyBufferToImage3dBytes);
-    auto mockBuiltinKernel = static_cast<Mock<::L0::Kernel> *>(kernel);
+    auto kernel = device->getBuiltinFunctionsLib()->getImageFunction(ImageBuiltIn::copyBufferToImage3dBytes, getDefaultBuiltInMode());
+    auto mockBuiltinKernel = static_cast<Mock<::L0::KernelImp> *>(kernel);
     mockBuiltinKernel->setArgRedescribedImageCallBase = false;
 
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
@@ -806,24 +1033,24 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
 
     ze_image_desc_t desc = {ZE_STRUCTURE_TYPE_IMAGE_DESC};
     L0::Image *imagePtr;
-    auto result = Image::create(neoDevice->getHardwareInfo().platform.eProductFamily, device, &desc, &imagePtr);
+    auto result = Image::create(device, &desc, &imagePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     std::unique_ptr<L0::Image> image(imagePtr);
-
+    CmdListMemoryCopyParams copyParams = {};
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendImageCopyFromMemory(imagePtr->toHandle(), ptr, nullptr, nullptr, 1, &eventHandle, false);
+    commandListImmediate->appendImageCopyFromMemory(imagePtr->toHandle(), ptr, nullptr, nullptr, 1, &eventHandle, copyParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
     ultCsr.getInternalAllocationStorage()->getTemporaryAllocations().freeAllGraphicsAllocations(neoDevice);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendImageCopyToMemoryThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendImageCopyToMemoryThenDoNotDownloadAllocations) {
     if (!neoDevice->getDeviceInfo().imageSupport) {
         GTEST_SKIP();
     }
 
-    auto kernel = device->getBuiltinFunctionsLib()->getImageFunction(ImageBuiltin::CopyImage3dToBufferBytes);
-    auto mockBuiltinKernel = static_cast<Mock<::L0::Kernel> *>(kernel);
+    auto kernel = device->getBuiltinFunctionsLib()->getImageFunction(ImageBuiltIn::copyImage3dToBufferBytes, getDefaultBuiltInMode());
+    auto mockBuiltinKernel = static_cast<Mock<::L0::KernelImp> *>(kernel);
     mockBuiltinKernel->setArgRedescribedImageCallBase = false;
 
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
@@ -832,18 +1059,19 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
 
     ze_image_desc_t desc = {ZE_STRUCTURE_TYPE_IMAGE_DESC};
     L0::Image *imagePtr;
-    auto result = Image::create(neoDevice->getHardwareInfo().platform.eProductFamily, device, &desc, &imagePtr);
+    auto result = Image::create(device, &desc, &imagePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     std::unique_ptr<L0::Image> image(imagePtr);
+    CmdListMemoryCopyParams copyParams = {};
 
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendImageCopyToMemory(ptr, imagePtr->toHandle(), nullptr, nullptr, 1, &eventHandle, false);
+    commandListImmediate->appendImageCopyToMemory(ptr, imagePtr->toHandle(), nullptr, nullptr, 1, &eventHandle, copyParams);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
     ultCsr.getInternalAllocationStorage()->getTemporaryAllocations().freeAllGraphicsAllocations(neoDevice);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryRangesBarrierThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendMemoryRangesBarrierThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     uint32_t numRanges = 1;
@@ -852,19 +1080,116 @@ HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediate
     const void **rangesMemory = reinterpret_cast<const void **>(&ranges[0]);
 
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendMemoryRangesBarrier(numRanges, &rangeSizes, rangesMemory, nullptr, 1, &eventHandle);
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    commandListImmediate->appendMemoryRangesBarrier(numRanges, &rangeSizes, rangesMemory, nullptr, 1, &eventHandle, waitEventsParameters);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 }
 
-HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendLaunchCooperativeKernelThenExpectDownloadAllocations) {
+HWTEST_TEMPLATED_F(TbxImmediateCommandListTest, givenTbxModeOnFlushTaskImmediateAsyncCommandListWhenAppendLaunchCooperativeKernelThenDoNotDownloadAllocations) {
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
 
     ze_group_count_t groupCount{1, 1, 1};
     auto eventHandle = event->toHandle();
-    commandListImmediate->appendLaunchCooperativeKernel(kernel->toHandle(), &groupCount, nullptr, 1, &eventHandle, false);
 
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
+    CmdListKernelLaunchParams cooperativeParams = {};
+    cooperativeParams.isCooperative = true;
+
+    commandListImmediate->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 1, &eventHandle, cooperativeParams);
+
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
+}
+
+HWTEST_F(CommandListAppendWaitOnEvent, GivenOutCmdListProvidedAndSkipResidencyFlagTrueWhenAppendingEventToCmdListThenSemaphoreWaitStoredAndEventAllocationNotAdded) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    uint32_t eventCount = 4;
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = eventCount;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    auto eventPoolAllocation = eventPool->getAllocation().getDefaultGraphicsAllocation();
+
+    std::vector<std::unique_ptr<L0::Event>> events;
+    std::vector<ze_event_handle_t> eventHandles;
+    events.reserve(eventCount);
+    eventHandles.reserve(eventCount);
+    ze_event_desc_t eventDesc = {};
+    for (uint32_t i = 0; i < eventCount; i++) {
+        eventDesc.index = i;
+        auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+        eventHandles.emplace_back(event->toHandle());
+        events.emplace_back(std::move(event));
+    }
+
+    CommandToPatchContainer outSemaphoreWaitCmds;
+
+    auto &cmdListResidency = commandList->getCmdContainer().getResidencyContainer();
+    auto cmdListStream = commandList->getCmdContainer().getCommandStream();
+    auto usedSpaceBefore = cmdListStream->getUsed();
+
+    bool skipResidency = true;
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = &outSemaphoreWaitCmds,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = false,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = skipResidency,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    result = commandList->appendWaitOnEvents(eventCount, eventHandles.data(), waitEventsParameters);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    auto usedSpaceAfter = cmdListStream->getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
+                                                      ptrOffset(cmdListStream->getCpuBase(), usedSpaceBefore),
+                                                      usedSpaceAfter - usedSpaceBefore));
+
+    auto semWaitList = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+
+    auto addressSpace = device->getHwInfo().capabilityTable.gpuAddressSpace;
+
+    ASSERT_EQ(eventCount, semWaitList.size());
+    ASSERT_EQ(eventCount, outSemaphoreWaitCmds.size());
+
+    for (uint32_t i = 0; i < eventCount; i++) {
+        auto *patch = std::get_if<PatchWaitEventSemaphoreWait>(&outSemaphoreWaitCmds[i]);
+        ASSERT_NE(nullptr, patch);
+
+        auto parsedCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*semWaitList[i]);
+        auto outCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(patch->pDestination);
+
+        ASSERT_EQ(parsedCmd, outCmd);
+
+        auto eventGpuAddress = events[i]->getGpuAddress(device) + patch->offset;
+        EXPECT_EQ(eventGpuAddress & addressSpace, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(outCmd) & eventGpuAddress);
+    }
+
+    auto eventResidencyIt = std::find(cmdListResidency.begin(), cmdListResidency.end(), eventPoolAllocation);
+    EXPECT_EQ(cmdListResidency.end(), eventResidencyIt);
+
+    skipResidency = false;
+    waitEventsParameters.skipAddingWaitEventsToResidency = skipResidency;
+    result = commandList->appendWaitOnEvents(eventCount, eventHandles.data(), waitEventsParameters);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    eventResidencyIt = std::find(cmdListResidency.begin(), cmdListResidency.end(), eventPoolAllocation);
+    EXPECT_NE(cmdListResidency.end(), eventResidencyIt);
 }
 
 } // namespace ult

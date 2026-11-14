@@ -1,17 +1,20 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <new>
+#include <tuple>
 
 using namespace NEO;
 
@@ -62,7 +65,7 @@ HWTEST_P(AUBCopyBuffer, WhenCopyingThenExpectationsMet) {
     cl_event *eventWaitList = nullptr;
     cl_event *event = nullptr;
 
-    auto pDstMemory = reinterpret_cast<cl_float *>(dstBuffer->getGraphicsAllocation(pDevice->getRootDeviceIndex())->getGpuAddress());
+    auto pDstMemory = reinterpret_cast<cl_float *>(ptrOffset(dstBuffer->getGraphicsAllocation(pDevice->getRootDeviceIndex())->getGpuAddress(), dstBuffer->getOffset()));
 
     retVal = pCmdQ->enqueueCopyBuffer(
         srcBuffer,
@@ -81,9 +84,9 @@ HWTEST_P(AUBCopyBuffer, WhenCopyingThenExpectationsMet) {
     pSrcMemory = ptrOffset(pSrcMemory, srcOffset);
     pDstMemory = ptrOffset(pDstMemory, dstOffset);
 
-    // Compute our memory expecations based on kernel execution
+    // Compute our memory expectations based on kernel execution
     size_t sizeUserMemory = sizeof(dstMemory);
-    AUBCommandStreamFixture::expectMemory<FamilyType>(pDstMemory, pSrcMemory, sizeCopied);
+    expectMemory<FamilyType>(pDstMemory, pSrcMemory, sizeCopied);
 
     // If the copykernel wasn't max sized, ensure we didn't overwrite existing memory
     if (dstOffset + sizeCopied < sizeUserMemory) {
@@ -91,23 +94,23 @@ HWTEST_P(AUBCopyBuffer, WhenCopyingThenExpectationsMet) {
         float *dstMemoryRef = ptrOffset(dstMemory, sizeCopied);
 
         size_t sizeRemaining = sizeUserMemory - sizeCopied - dstOffset;
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDstMemory, dstMemoryRef, sizeRemaining);
+        expectMemory<FamilyType>(pDstMemory, dstMemoryRef, sizeRemaining);
     }
 
     delete srcBuffer;
     delete dstBuffer;
 }
 
-INSTANTIATE_TEST_CASE_P(AUBCopyBuffer_simple,
-                        AUBCopyBuffer,
-                        ::testing::Combine(
-                            ::testing::Values( // srcOffset
-                                0 * sizeof(cl_float),
-                                1 * sizeof(cl_float),
-                                2 * sizeof(cl_float),
-                                3 * sizeof(cl_float)),
-                            ::testing::Values( // dstOffset
-                                0 * sizeof(cl_float),
-                                1 * sizeof(cl_float),
-                                2 * sizeof(cl_float),
-                                3 * sizeof(cl_float))));
+INSTANTIATE_TEST_SUITE_P(AUBCopyBuffer_simple,
+                         AUBCopyBuffer,
+                         ::testing::Combine(
+                             ::testing::Values( // srcOffset
+                                 0 * sizeof(cl_float),
+                                 1 * sizeof(cl_float),
+                                 2 * sizeof(cl_float),
+                                 3 * sizeof(cl_float)),
+                             ::testing::Values( // dstOffset
+                                 0 * sizeof(cl_float),
+                                 1 * sizeof(cl_float),
+                                 2 * sizeof(cl_float),
+                                 3 * sizeof(cl_float))));

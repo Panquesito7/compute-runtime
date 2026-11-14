@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,14 +12,17 @@
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
+#include "shared/source/os_interface/windows/hw_device_id.h"
 #include "shared/source/os_interface/windows/os_context_win.h"
+#include "shared/source/os_interface/windows/wddm/um_km_data_translator.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_wddm.h"
 #include "shared/test/common/mocks/mock_wddm_interface23.h"
 #include "shared/test/common/os_interface/windows/gdi_dll_fixture.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 using namespace NEO;
 
@@ -108,55 +111,69 @@ TEST_F(Wddm23Tests, whenObjectIsDestructedThenDestroyHwQueue) {
     EXPECT_EQ(hwQueue, getDestroyHwQueueDataFcn()->hHwQueue);
 }
 
+TEST_F(Wddm23Tests, whencreateMonitoredFenceForDirectSubmissionThenObtainHwQueueFenceAndReplaceResidencyControllerWithNewFence) {
+    EXPECT_EQ(osContext->getMonitoredFence().fenceHandle, osContext->getHwQueue().progressFenceHandle);
+    osContext->getMonitoredFence().currentFenceValue = 2u;
+    osContext->getMonitoredFence().lastSubmittedFence = 1u;
+    MonitoredFence fence{};
+    wddm->getWddmInterface()->createFenceForDirectSubmission(fence, *osContext);
+    EXPECT_EQ(osContext->getHwQueue().progressFenceHandle, fence.fenceHandle);
+    EXPECT_NE(osContext->getMonitoredFence().fenceHandle, osContext->getHwQueue().progressFenceHandle);
+    EXPECT_EQ(osContext->getMonitoredFence().currentFenceValue, 2u);
+    EXPECT_EQ(osContext->getMonitoredFence().lastSubmittedFence, 1u);
+    EXPECT_EQ(fence.currentFenceValue, 2u);
+    EXPECT_EQ(fence.lastSubmittedFence, 1u);
+}
+
 TEST_F(Wddm23Tests, givenCmdBufferWhenSubmitCalledThenSetAllRequiredFiledsAndUpdateMonitoredFence) {
     uint64_t cmdBufferAddress = 123;
     size_t cmdSize = 456;
     auto hwQueue = osContext->getHwQueue();
     COMMAND_BUFFER_HEADER cmdBufferHeader = {};
 
-    EXPECT_EQ(1u, osContext->getResidencyController().getMonitoredFence().currentFenceValue);
-    EXPECT_EQ(0u, osContext->getResidencyController().getMonitoredFence().lastSubmittedFence);
+    EXPECT_EQ(1u, osContext->getMonitoredFence().currentFenceValue);
+    EXPECT_EQ(0u, osContext->getMonitoredFence().lastSubmittedFence);
 
     WddmSubmitArguments submitArgs = {};
     submitArgs.contextHandle = osContext->getWddmContextHandle();
     submitArgs.hwQueueHandle = hwQueue.handle;
-    submitArgs.monitorFence = &osContext->getResidencyController().getMonitoredFence();
+    submitArgs.monitorFence = &osContext->getMonitoredFence();
     wddm->submit(cmdBufferAddress, cmdSize, &cmdBufferHeader, submitArgs);
 
     EXPECT_EQ(cmdBufferAddress, getSubmitCommandToHwQueueDataFcn()->CommandBuffer);
     EXPECT_EQ(static_cast<UINT>(cmdSize), getSubmitCommandToHwQueueDataFcn()->CommandLength);
     EXPECT_EQ(hwQueue.handle, getSubmitCommandToHwQueueDataFcn()->hHwQueue);
-    EXPECT_EQ(osContext->getResidencyController().getMonitoredFence().lastSubmittedFence, getSubmitCommandToHwQueueDataFcn()->HwQueueProgressFenceId);
+    EXPECT_EQ(osContext->getMonitoredFence().lastSubmittedFence, getSubmitCommandToHwQueueDataFcn()->HwQueueProgressFenceId);
     EXPECT_EQ(&cmdBufferHeader, getSubmitCommandToHwQueueDataFcn()->pPrivateDriverData);
     EXPECT_EQ(static_cast<UINT>(sizeof(COMMAND_BUFFER_HEADER)), getSubmitCommandToHwQueueDataFcn()->PrivateDriverDataSize);
 
     EXPECT_EQ(0u, cmdBufferHeader.MonitorFenceVA);
     EXPECT_EQ(0u, cmdBufferHeader.MonitorFenceValue);
-    EXPECT_EQ(2u, osContext->getResidencyController().getMonitoredFence().currentFenceValue);
-    EXPECT_EQ(1u, osContext->getResidencyController().getMonitoredFence().lastSubmittedFence);
+    EXPECT_EQ(2u, osContext->getMonitoredFence().currentFenceValue);
+    EXPECT_EQ(1u, osContext->getMonitoredFence().lastSubmittedFence);
 }
 
 TEST_F(Wddm23Tests, givenDebugVariableSetWhenSubmitCalledThenUseCmdBufferHeaderSizeForPrivateDriverDataSize) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.UseCommandBufferHeaderSizeForWddmQueueSubmission.set(true);
+    debugManager.flags.UseCommandBufferHeaderSizeForWddmQueueSubmission.set(true);
 
     COMMAND_BUFFER_HEADER cmdBufferHeader = {};
 
     WddmSubmitArguments submitArgs = {};
     submitArgs.contextHandle = osContext->getWddmContextHandle();
     submitArgs.hwQueueHandle = osContext->getHwQueue().handle;
-    submitArgs.monitorFence = &osContext->getResidencyController().getMonitoredFence();
+    submitArgs.monitorFence = &osContext->getMonitoredFence();
     wddm->submit(123, 456, &cmdBufferHeader, submitArgs);
 
     EXPECT_EQ(static_cast<UINT>(sizeof(COMMAND_BUFFER_HEADER)), getSubmitCommandToHwQueueDataFcn()->PrivateDriverDataSize);
 
-    DebugManager.flags.UseCommandBufferHeaderSizeForWddmQueueSubmission.set(false);
+    debugManager.flags.UseCommandBufferHeaderSizeForWddmQueueSubmission.set(false);
 
     cmdBufferHeader = {};
     submitArgs = {};
     submitArgs.contextHandle = osContext->getWddmContextHandle();
     submitArgs.hwQueueHandle = osContext->getHwQueue().handle;
-    submitArgs.monitorFence = &osContext->getResidencyController().getMonitoredFence();
+    submitArgs.monitorFence = &osContext->getMonitoredFence();
     wddm->submit(123, 456, &cmdBufferHeader, submitArgs);
 
     EXPECT_EQ(static_cast<UINT>(MemoryConstants::pageSize), getSubmitCommandToHwQueueDataFcn()->PrivateDriverDataSize);
@@ -166,11 +183,11 @@ TEST_F(Wddm23Tests, whenMonitoredFenceIsCreatedThenSetupAllRequiredFields) {
     wddm->wddmInterface->createMonitoredFence(*osContext);
     auto hwQueue = osContext->getHwQueue();
 
-    EXPECT_EQ(hwQueue.progressFenceCpuVA, osContext->getResidencyController().getMonitoredFence().cpuAddress);
-    EXPECT_EQ(1u, osContext->getResidencyController().getMonitoredFence().currentFenceValue);
-    EXPECT_EQ(hwQueue.progressFenceHandle, osContext->getResidencyController().getMonitoredFence().fenceHandle);
-    EXPECT_EQ(hwQueue.progressFenceGpuVA, osContext->getResidencyController().getMonitoredFence().gpuAddress);
-    EXPECT_EQ(0u, osContext->getResidencyController().getMonitoredFence().lastSubmittedFence);
+    EXPECT_EQ(hwQueue.progressFenceCpuVA, osContext->getMonitoredFence().cpuAddress);
+    EXPECT_EQ(1u, osContext->getMonitoredFence().currentFenceValue);
+    EXPECT_EQ(hwQueue.progressFenceHandle, osContext->getMonitoredFence().fenceHandle);
+    EXPECT_EQ(hwQueue.progressFenceGpuVA, osContext->getMonitoredFence().gpuAddress);
+    EXPECT_EQ(0u, osContext->getMonitoredFence().lastSubmittedFence);
 }
 
 TEST_F(Wddm23Tests, givenCurrentPendingFenceValueGreaterThanPendingFenceValueWhenSubmitCalledThenCallWaitOnGpu) {
@@ -181,8 +198,9 @@ TEST_F(Wddm23Tests, givenCurrentPendingFenceValueGreaterThanPendingFenceValueWhe
     WddmSubmitArguments submitArgs = {};
     submitArgs.contextHandle = osContext->getWddmContextHandle();
     submitArgs.hwQueueHandle = osContext->getHwQueue().handle;
-    submitArgs.monitorFence = &osContext->getResidencyController().getMonitoredFence();
+    submitArgs.monitorFence = &osContext->getMonitoredFence();
 
+    VariableBackup<volatile uint64_t> pagingFenceBackup(wddm->pagingFenceAddress);
     *wddm->pagingFenceAddress = 1;
     wddm->currentPagingFenceValue = 1;
 
@@ -194,9 +212,9 @@ TEST_F(Wddm23Tests, givenCurrentPendingFenceValueGreaterThanPendingFenceValueWhe
     EXPECT_EQ(1u, wddm->waitOnGPUResult.called);
 }
 
-TEST_F(Wddm23Tests, givenDestructionOsContextWinWhenCallingDestroyMonitorFenceThenDoNotCallGdiDestroy) {
+TEST_F(Wddm23Tests, givenDestructionOsContextWinWhenCallingDestroyMonitorFenceThenDoNotCallDestroy) {
     osContext.reset(nullptr);
-    EXPECT_EQ(1u, wddmMockInterface->destroyMonitorFenceCalled);
+    EXPECT_EQ(0u, wddmMockInterface->destroyMonitorFenceCalled);
     EXPECT_EQ(0u, getDestroySynchronizationObjectDataFcn()->hSyncObject);
 }
 
@@ -229,4 +247,118 @@ TEST_F(Wddm23TestsWithoutWddmInit, givenFailureOnGdiInitializationWhenCreatingHw
     EXPECT_ANY_THROW(init());
     EXPECT_EQ(1u, wddmMockInterface->createHwQueueCalled);
     EXPECT_FALSE(wddmMockInterface->createHwQueueResult);
+}
+
+TEST_F(Wddm23TestsWithoutWddmInit, givenContextGroupWhenContextFromContextGroupCreatedThenItHasPrimaryContextHandle) {
+    if (defaultHwInfo->capabilityTable.defaultEngineType != aub_stream::EngineType::ENGINE_CCS) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore retore;
+    debugManager.flags.ContextGroupSize.set(4);
+
+    wddmMockInterface = static_cast<WddmMockInterface23 *>(wddm->wddmInterface.release());
+    wddm->init();
+    wddm->wddmInterface.reset(wddmMockInterface);
+
+    EngineTypeUsage engineUsage = {};
+    engineUsage.first = aub_stream::EngineType::ENGINE_CCS;
+    engineUsage.second = EngineUsage::regular;
+
+    osContext = std::make_unique<OsContextWin>(*wddm, 0, 0u,
+                                               EngineDescriptorHelper::getDefaultDescriptor(engineUsage));
+    EXPECT_TRUE(osContext->ensureContextInitialized());
+    EXPECT_EQ(1u, wddmMockInterface->createHwQueueCalled);
+
+    auto osContext2 = std::make_unique<OsContextWin>(*wddm, 0, 1u,
+                                                     EngineDescriptorHelper::getDefaultDescriptor(engineUsage));
+    osContext2->setPrimaryContext(osContext.get());
+
+    EXPECT_TRUE(osContext2->ensureContextInitialized());
+    EXPECT_EQ(osContext->getWddmContextHandle(), osContext2->getWddmContextHandle());
+    EXPECT_EQ(getCreateHwQueueData()->hHwContext, osContext->getWddmContextHandle());
+}
+
+TEST_F(Wddm23TestsWithoutWddmInit, givenUmKmDataTranslatorEnabledWhenCreateHwQueueCalledForContextGroupThenPrivateDataIsTranslated) {
+    wddmMockInterface = static_cast<WddmMockInterface23 *>(wddm->wddmInterface.release());
+    wddm->init();
+    wddm->wddmInterface.reset(wddmMockInterface);
+
+    struct MockUmKmDataTranslator : UmKmDataTranslator {
+        using UmKmDataTranslator::isEnabled;
+    };
+    auto translator = std::make_unique<MockUmKmDataTranslator>();
+    translator->isEnabled = true;
+    auto hwDeviceId = std::make_unique<HwDeviceIdWddm>(wddm->hwDeviceId->getAdapter(),
+                                                       wddm->hwDeviceId->getAdapterLuid(),
+                                                       1u,
+                                                       executionEnvironment.osEnvironment.get(),
+                                                       std::move(translator));
+    wddm->hwDeviceId.reset(hwDeviceId.release());
+
+    EngineTypeUsage engineUsage = {};
+    engineUsage.first = defaultHwInfo->capabilityTable.defaultEngineType;
+    engineUsage.second = EngineUsage::regular;
+    auto preemptionMode = PreemptionHelper::getDefaultPreemptionMode(*defaultHwInfo);
+
+    OsContextWin contextGroupContext(*wddm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor(engineUsage, preemptionMode));
+    contextGroupContext.setContextGroupCount(4);
+
+    EXPECT_TRUE(wddm->wddmInterface->createHwQueue(contextGroupContext));
+    EXPECT_EQ(static_cast<UINT>(sizeof(CREATEHWQUEUE_PVTDATA)), getCreateHwQueueData()->PrivateDriverDataSize);
+    ASSERT_NE(nullptr, getCreateHwQueueData()->pPrivateDriverData);
+    auto privateData = reinterpret_cast<CREATEHWQUEUE_PVTDATA *>(getCreateHwQueueData()->pPrivateDriverData);
+    EXPECT_EQ(QUEUE_PRIORITY::XE3P_QUEUE_PRIORITY_NORMAL, privateData->QueuePriority);
+}
+
+TEST_F(Wddm23TestsWithoutWddmInit, givenContextGroupWhenContextFromContextGroupDestroyedThenPrimaryContextHandleIsDestroyedOnce) {
+    if (defaultHwInfo->capabilityTable.defaultEngineType != aub_stream::EngineType::ENGINE_CCS) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore retore;
+    debugManager.flags.ContextGroupSize.set(4);
+
+    wddmMockInterface = static_cast<WddmMockInterface23 *>(wddm->wddmInterface.release());
+    wddm->init();
+    wddm->wddmInterface.reset(wddmMockInterface);
+
+    {
+        EngineTypeUsage engineUsage = {};
+        engineUsage.first = aub_stream::EngineType::ENGINE_CCS;
+        engineUsage.second = EngineUsage::regular;
+
+        osContext = std::make_unique<OsContextWin>(*wddm, 0, 0u,
+                                                   EngineDescriptorHelper::getDefaultDescriptor(engineUsage));
+        EXPECT_TRUE(osContext->ensureContextInitialized());
+
+        auto osContext2 = std::make_unique<OsContextWin>(*wddm, 0, 1u,
+                                                         EngineDescriptorHelper::getDefaultDescriptor(engineUsage));
+        osContext2->setPrimaryContext(osContext.get());
+        EXPECT_TRUE(osContext2->ensureContextInitialized());
+    }
+
+    EXPECT_EQ(1u, wddm->destroyContextResult.called);
+}
+
+TEST_F(Wddm23Tests, whenWaitingForSyncObjectsFromGpuThenWaitIsSubmittedToHwQueue) {
+    D3DKMT_HANDLE handles[] = {0x10, 0x20};
+    uint64_t fenceValues[] = {3u, 4u};
+    EXPECT_TRUE(wddm->getWddmInterface()->waitForSyncObjectsFromGpu(*osContext, 2u, handles, fenceValues));
+
+    auto waitData = getSubmitWaitForSyncObjectsToHwQueueDataFcn();
+    EXPECT_EQ(osContext->getHwQueue().handle, waitData->hHwQueue);
+    EXPECT_EQ(2u, waitData->ObjectCount);
+    EXPECT_EQ(handles, waitData->ObjectHandleArray);
+    EXPECT_EQ(fenceValues, waitData->FenceValueArray);
+
+    EXPECT_EQ(nullptr, getWaitForSynchronizationObjectFromGpuDataFcn()->ObjectHandleArray);
+}
+
+TEST_F(Wddm23Tests, givenKmdWaitFailureWhenWaitingForSyncObjectsFromGpuThenFalseIsReturned) {
+    *getSubmitWaitForSyncObjectsToHwQueueFailCallFcn() = true;
+
+    D3DKMT_HANDLE handle = 0x10;
+    uint64_t fenceValue = 3u;
+    EXPECT_FALSE(wddm->getWddmInterface()->waitForSyncObjectsFromGpu(*osContext, 1u, &handle, &fenceValue));
 }

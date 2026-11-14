@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,30 +7,17 @@
 
 #include "level_zero/tools/source/metrics/metric_ip_sampling_streamer.h"
 
+#include "shared/source/device/sub_device.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+
 #include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
 #include "level_zero/tools/source/metrics/metric.h"
 #include "level_zero/tools/source/metrics/metric_ip_sampling_source.h"
-#include "level_zero/tools/source/metrics/os_metric_ip_sampling.h"
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 #include <level_zero/zet_api.h>
 
-#include <string.h>
-
 namespace L0 {
-
-void IpSamplingMetricStreamerBase::attachEvent(ze_event_handle_t hNotificationEvent) {
-    // Associate notification event with metric streamer.
-    pNotificationEvent = Event::fromHandle(hNotificationEvent);
-    if (pNotificationEvent != nullptr) {
-        pNotificationEvent->setMetricStreamer(this);
-    }
-}
-
-void IpSamplingMetricStreamerBase::detachEvent() {
-    // Release notification event.
-    if (pNotificationEvent != nullptr) {
-        pNotificationEvent->setMetricStreamer(nullptr);
-    }
-}
 
 ze_result_t IpSamplingMetricGroupImp::streamerOpen(
     zet_context_handle_t hContext,
@@ -42,21 +29,22 @@ ze_result_t IpSamplingMetricGroupImp::streamerOpen(
     auto device = Device::fromHandle(hDevice);
 
     // Check whether metric group is activated.
-    if (!device->getMetricDeviceContext().isMetricGroupActivated(this->toHandle())) {
+    IpSamplingMetricSourceImp &source = device->getMetricDeviceContext().getMetricSource<IpSamplingMetricSourceImp>();
+    if (!source.isMetricGroupActivated(this->toHandle())) {
         return ZE_RESULT_NOT_READY;
     }
 
     // Check whether metric streamer is already open.
-    if (metricSource.pActiveStreamer != nullptr) {
+    if (source.pActiveStreamer != nullptr) {
         return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
     }
 
-    auto pStreamerImp = new IpSamplingMetricStreamerImp(metricSource);
+    auto pStreamerImp = new IpSamplingMetricStreamerImp(source);
     UNRECOVERABLE_IF(pStreamerImp == nullptr);
 
-    const ze_result_t result = metricSource.getMetricOsInterface()->startMeasurement(desc->notifyEveryNReports, desc->samplingPeriod);
+    const ze_result_t result = source.getMetricOsInterface()->startMeasurement(desc->notifyEveryNReports, desc->samplingPeriod);
     if (result == ZE_RESULT_SUCCESS) {
-        metricSource.pActiveStreamer = pStreamerImp;
+        source.pActiveStreamer = pStreamerImp;
         pStreamerImp->attachEvent(hNotificationEvent);
     } else {
         delete pStreamerImp;
@@ -65,6 +53,12 @@ ze_result_t IpSamplingMetricGroupImp::streamerOpen(
     }
 
     *phMetricStreamer = pStreamerImp->toHandle();
+
+    auto hwBufferSizeDesc = MetricSource::getHwBufferSizeDesc(static_cast<zet_base_desc_t *>(const_cast<void *>(desc->pNext)));
+    if (hwBufferSizeDesc.has_value()) {
+        // EUSS uses fixed max hw buffer size
+        hwBufferSizeDesc.value()->sizeInBytes = source.getMetricOsInterface()->getRequiredBufferSize(UINT32_MAX);
+    }
     return ZE_RESULT_SUCCESS;
 }
 
@@ -104,7 +98,402 @@ Event::State IpSamplingMetricStreamerImp::getNotificationState() {
 
 uint32_t IpSamplingMetricStreamerImp::getMaxSupportedReportCount() {
     const auto unitReportSize = ipSamplingSource.getMetricOsInterface()->getUnitReportSize();
+    UNRECOVERABLE_IF(unitReportSize == 0);
     return ipSamplingSource.getMetricOsInterface()->getRequiredBufferSize(UINT32_MAX) / unitReportSize;
+}
+
+IpSamplingMetricCalcOpImp::IpSamplingMetricCalcOpImp(bool multidevice,
+                                                     const std::vector<MetricScopeImp *> &metricScopesInCalcOp,
+                                                     std::vector<MetricImp *> &metricsInReport,
+                                                     const std::vector<MetricScopeImp *> &metricScopesInReport,
+                                                     IpSamplingMetricSourceImp &metricSource,
+                                                     std::map<uint32_t, std::vector<uint32_t>> &perScopeIncludedMetricIndexes,
+                                                     std::vector<MetricImp *> &excludedMetrics)
+    : MetricCalcOpImp(multidevice, metricScopesInReport, metricsInReport, excludedMetrics),
+      metricSource(metricSource), perScopeIncludedMetricIndexes(perScopeIncludedMetricIndexes), metricScopesInCalcOp(metricScopesInCalcOp) {
+
+    // Create an IP data cache for each scope in the calcOp
+    for (auto &scope : metricScopesInCalcOp) {
+        auto scopeId = scope->getId();
+        perScopeIpDataCaches[scopeId] = new std::map<uint64_t, void *>{};
+    }
+
+    const auto device = &(metricSource.getMetricDeviceContext().getDevice());
+    l0GfxCoreHelper = &(device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>());
+}
+
+void IpSamplingMetricCalcOpImp::clearScopesCaches() {
+    for (auto &entry : perScopeIpDataCaches) {
+        l0GfxCoreHelper->stallIpDataMapDeleteSumData(*entry.second);
+        entry.second->clear();
+    }
+}
+
+ze_result_t IpSamplingMetricCalcOpImp::destroy() {
+    clearScopesCaches();
+    for (auto &it : perScopeIpDataCaches) {
+        delete it.second;
+        it.second = nullptr;
+    }
+
+    perScopeIpDataCaches.clear();
+    delete this;
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t IpSamplingMetricCalcOpImp::create(bool isMultiDevice,
+                                              IpSamplingMetricSourceImp &metricSource,
+                                              zet_intel_metric_calculation_exp_desc_t *pCalculationDesc,
+                                              zet_intel_metric_calculation_operation_exp_handle_t *phCalculationOperation) {
+
+    // There is only one valid metric group in IP sampling and time filtering is not supported
+    // So only metrics handles are used to filter the metrics
+
+    // The order of metrics in the report should be the same as the one in the HW report to optimize calculation
+    uint32_t metricGroupCount = 1;
+    zet_metric_group_handle_t hMetricGroup = {};
+    if (auto ret = metricSource.metricGroupGet(&metricGroupCount, &hMetricGroup); ret != ZE_RESULT_SUCCESS) {
+        return ret;
+    }
+
+    uint32_t metricCount = 0;
+    MetricGroup::fromHandle(hMetricGroup)->metricGet(&metricCount, nullptr);
+    std::vector<zet_metric_handle_t> hMetrics(metricCount);
+    MetricGroup::fromHandle(hMetricGroup)->metricGet(&metricCount, hMetrics.data());
+    std::vector<MetricImp *> includedMetrics = {};
+    std::vector<uint32_t> includedMetricIndexes = {};
+
+    for (uint32_t i = 0; i < metricCount; i++) {
+        auto metric = static_cast<MetricImp *>(Metric::fromHandle(hMetrics[i]));
+        if (pCalculationDesc->metricGroupCount > 0) {
+            includedMetrics.push_back(metric);
+            includedMetricIndexes.push_back(i);
+        } else {
+            auto metricsBegin = pCalculationDesc->phMetrics;
+            auto metricsEnd = pCalculationDesc->phMetrics + pCalculationDesc->metricCount;
+            if (std::find(metricsBegin, metricsEnd, hMetrics[i]) != metricsEnd) {
+                includedMetrics.push_back(metric);
+                includedMetricIndexes.push_back(i);
+            }
+        }
+    }
+
+    std::vector<MetricScopeImp *> metricScopes;
+    for (uint32_t i = 0; i < pCalculationDesc->metricScopesCount; i++) {
+        metricScopes.push_back(static_cast<MetricScopeImp *>(MetricScope::fromHandle(pCalculationDesc->phMetricScopes[i])));
+    }
+
+    std::vector<MetricImp *> excludedMetrics;
+    MetricSource::checkMetricsScopesAndGetExcludedMetrics(includedMetrics, pCalculationDesc->metricScopesCount,
+                                                          pCalculationDesc->phMetricScopes,
+                                                          excludedMetrics);
+    if (!excludedMetrics.empty()) {
+        // Remove excluded metrics from includedMetrics and includedMetricIndexes
+        std::vector<MetricImp *> allMetrics = includedMetrics;
+        std::vector<uint32_t> allMetricIndexes = includedMetricIndexes;
+
+        includedMetrics.clear();
+        includedMetricIndexes.clear();
+
+        std::unordered_set<MetricImp *> excludedMetricsSet(excludedMetrics.begin(), excludedMetrics.end());
+
+        for (size_t i = 0; i < allMetrics.size(); i++) {
+            if (!excludedMetricsSet.contains(allMetrics[i])) {
+                includedMetrics.push_back(allMetrics[i]);
+                includedMetricIndexes.push_back(allMetricIndexes[i]);
+            }
+        }
+    }
+
+    std::vector<std::vector<zet_intel_metric_scope_exp_handle_t>> includedMetricsSupportedScopes(includedMetrics.size());
+    for (size_t i = 0; i < includedMetrics.size(); i++) {
+        uint32_t supportedScopeCount = 0;
+        includedMetrics[i]->getScopes(&supportedScopeCount, nullptr);
+        includedMetricsSupportedScopes[i].resize(supportedScopeCount);
+        includedMetrics[i]->getScopes(&supportedScopeCount, includedMetricsSupportedScopes[i].data());
+    }
+
+    // Each scope reports only the metrics supporting it.
+    // The indexes of the metrics in the HW report are tracked per scope as well, so the results of
+    // each scope can be picked from its data following the report format.
+    std::vector<MetricImp *> metricsInReport = {};
+    std::vector<MetricScopeImp *> metricScopesInReport = {};
+    std::map<uint32_t, std::vector<uint32_t>> perScopeIncludedMetricIndexes = {};
+    std::vector<MetricScopeImp *> metricScopesInCalcOp = {};
+
+    for (auto &metricScope : metricScopes) {
+        auto metricScopeHandle = metricScope->toHandle();
+        std::vector<uint32_t> scopeIncludedMetricIndexes = {};
+
+        for (size_t metricIndex = 0; metricIndex < includedMetrics.size(); metricIndex++) {
+            const auto &supportedScopes = includedMetricsSupportedScopes[metricIndex];
+            if (std::find(supportedScopes.begin(), supportedScopes.end(), metricScopeHandle) == supportedScopes.end()) {
+                continue;
+            }
+
+            metricsInReport.push_back(includedMetrics[metricIndex]);
+            metricScopesInReport.push_back(metricScope);
+            scopeIncludedMetricIndexes.push_back(includedMetricIndexes[metricIndex]);
+        }
+
+        if (scopeIncludedMetricIndexes.empty()) {
+            METRICS_LOG_INFO("None of the metrics of the calculation operation supports the metric scope with ID %u, so the scope is excluded from the calculation operation",
+                             metricScope->getId());
+            continue;
+        }
+
+        perScopeIncludedMetricIndexes[metricScope->getId()] = std::move(scopeIncludedMetricIndexes);
+        metricScopesInCalcOp.push_back(metricScope);
+    }
+
+    if (metricScopesInCalcOp.empty()) {
+        METRICS_LOG_ERR("%s", "None of the metrics requested for the calculation operation supports any of the requested metric scopes");
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    auto calcOp = new IpSamplingMetricCalcOpImp(isMultiDevice, metricScopesInCalcOp, metricsInReport,
+                                                metricScopesInReport, metricSource, perScopeIncludedMetricIndexes,
+                                                excludedMetrics);
+    *phCalculationOperation = calcOp->toHandle();
+
+    ze_result_t status = ZE_RESULT_SUCCESS;
+    if ((pCalculationDesc->timeWindowsCount > 0) || (pCalculationDesc->timeAggregationWindow != 0)) {
+        // Time filtering is not supported in IP sampling, update pCalculationDesc accordingly
+        pCalculationDesc->timeWindowsCount = 0;
+        pCalculationDesc->timeAggregationWindow = 0;
+        status = ZE_INTEL_RESULT_WARNING_TIME_PARAMS_IGNORED_EXP;
+        METRICS_LOG_INFO("%s", "Time filtering is not supported in IP sampling, ignoring time windows and aggregation window");
+    }
+
+    return status;
+}
+
+ze_result_t IpSamplingMetricCalcOpImp::updateCacheForSingleScope(const size_t rawDataSize, const uint8_t *pRawData,
+                                                                 bool newData, std::map<uint64_t, void *> &reportDataMap, bool &dataOverflow) {
+    if (newData) {
+        ze_result_t status = ZE_RESULT_ERROR_UNKNOWN;
+        auto ipSamplingCalculation = metricSource.ipSamplingCalculation.get();
+
+        status = ipSamplingCalculation->updateStallDataMapFromData(rawDataSize, pRawData,
+                                                                   reportDataMap, &dataOverflow);
+        if (status != ZE_RESULT_SUCCESS) {
+            METRICS_LOG_ERR("%s", "Failed to update stall data map");
+            return status;
+        }
+    }
+
+    DEBUG_BREAK_IF(reportDataMap.empty());
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t IpSamplingMetricCalcOpImp::updateCachesForMultiScopes(const size_t rawDataSize, const uint8_t *pRawData,
+                                                                  bool newData, bool &dataOverflow) {
+
+    // Process new data only once per sub-device.
+    // Aggregated scope update needs metrics only from new data. So:
+    //      a) Save sub-devices data in temporary caches for each compute scope
+    //      b) Update aggregated scope temporary caches data.
+    // For compute scopes use the temporary caches to update each compute scope cache accordingly
+
+    if (newData) {
+        MetricScopeImp *aggregatedScope = nullptr;
+        std::map<uint32_t, std::map<uint64_t, void *> *> computeNewIpsCaches{};
+        std::vector<uint32_t> subDevIndexesForComputeScopes{};
+        ze_result_t status = ZE_RESULT_ERROR_UNKNOWN;
+
+        auto traverseDataAndUpdateCache = [this, rawDataSize, pRawData, newData, &dataOverflow](uint32_t subDeviceIndex, std::map<uint64_t, void *> &reportDataMap) -> ze_result_t {
+            auto processedSize = 0u;
+            ze_result_t result = ZE_RESULT_ERROR_UNKNOWN;
+            while (processedSize < rawDataSize) {
+                auto processMetricData = pRawData + processedSize;
+                auto header = reinterpret_cast<const IpSamplingMultiDevDataHeader *>(processMetricData);
+                processedSize += sizeof(IpSamplingMultiDevDataHeader) + header->rawDataSize;
+                if (header->setIndex != subDeviceIndex) {
+                    continue;
+                }
+
+                result = updateCacheForSingleScope(header->rawDataSize,
+                                                   (processMetricData + sizeof(IpSamplingMultiDevDataHeader)),
+                                                   newData, reportDataMap, dataOverflow);
+                if (result != ZE_RESULT_SUCCESS) {
+                    return result;
+                }
+            }
+            return ZE_RESULT_SUCCESS;
+        };
+
+        auto clearTempCaches = [&computeNewIpsCaches, this]() {
+            for (auto &it : computeNewIpsCaches) {
+                l0GfxCoreHelper->stallIpDataMapDeleteSumData(*it.second);
+                it.second->clear();
+                delete it.second;
+            }
+            computeNewIpsCaches.clear();
+        };
+
+        for (auto &scope : metricScopesInCalcOp) {
+            if (!scope->isAggregated()) {
+                uint32_t subDeviceIndex = scope->getComputeSubDeviceIndex();
+                subDevIndexesForComputeScopes.push_back(subDeviceIndex);
+                // Temporary cache for new data per compute scope to allow updating aggregated and compute cached independently
+                computeNewIpsCaches[scope->getId()] = new std::map<uint64_t, void *>{};
+                status = traverseDataAndUpdateCache(subDeviceIndex, *computeNewIpsCaches[scope->getId()]);
+                if (status != ZE_RESULT_SUCCESS) {
+                    clearTempCaches();
+                    return status;
+                }
+            } else {
+                aggregatedScope = scope;
+            }
+        }
+
+        if (aggregatedScope) {
+            // Process data for the sub-devices not already processed above.
+            std::map<uint64_t, void *> *aggregatedScopeCache = perScopeIpDataCaches[aggregatedScope->getId()];
+            Device *device = &metricSource.getMetricDeviceContext().getDevice();
+            uint32_t subDeviceCount = device->numSubDevices;
+            std::vector<ze_device_handle_t> subDevices(subDeviceCount);
+            device->getSubDevices(&subDeviceCount, subDevices.data());
+
+            std::vector<uint32_t> pendingSubDeviceIndexes{};
+            for (auto &subDeviceHandle : subDevices) {
+                auto neoSubDevice = static_cast<NEO::SubDevice *>(Device::fromHandle(subDeviceHandle)->getNEODevice());
+                uint32_t subdevIndex = neoSubDevice->getSubDeviceIndex();
+                if (std::find(subDevIndexesForComputeScopes.begin(), subDevIndexesForComputeScopes.end(), subdevIndex) == subDevIndexesForComputeScopes.end()) {
+                    pendingSubDeviceIndexes.push_back(subdevIndex);
+                }
+            }
+
+            for (auto &subDeviceIndex : pendingSubDeviceIndexes) {
+                status = traverseDataAndUpdateCache(subDeviceIndex, *aggregatedScopeCache);
+                if (status != ZE_RESULT_SUCCESS) {
+                    clearTempCaches();
+                    return status;
+                }
+            }
+
+            // Update aggregated scope cache with Ips from new data in sub-devices caches.
+            for (auto &it : computeNewIpsCaches) {
+                l0GfxCoreHelper->stallIpDataMapUpdateFromMap(*it.second, *aggregatedScopeCache);
+            }
+        }
+
+        // Update each compute scope cache with its data and free the temporary caches
+        for (auto &it : computeNewIpsCaches) {
+            l0GfxCoreHelper->stallIpDataMapUpdateFromMap(*it.second, *perScopeIpDataCaches[it.first]);
+        }
+
+        clearTempCaches();
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t IpSamplingMetricCalcOpImp::metricCalculateValues(const size_t rawDataSize, const uint8_t *pRawData,
+                                                             bool lastCall, size_t *usedSize,
+                                                             uint32_t *pTotalMetricReportCount,
+                                                             zet_intel_metric_result_exp_t *pMetricResults) {
+    *usedSize = 0;
+    uint32_t metricReportCount = 0;
+    bool dataOverflow = false;
+    auto ipSamplingCalculation = metricSource.ipSamplingCalculation.get();
+    bool newData = false; // Track if there is fresh new raw data that requires updating caches
+    uint64_t dataSize = rawDataSize;
+    const uint8_t *rawDataStart = pRawData;
+
+    ze_result_t status = ZE_RESULT_SUCCESS;
+
+    // Querying the number of reports available in the raw data is not supported, so the caller must
+    // always request a number of reports to calculate and provide a buffer big enough to hold them.
+    if (*pTotalMetricReportCount == 0) {
+        METRICS_LOG_ERR("%s", "Number of metric reports to calculate must be greater than zero");
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    // An empty buffer holds no raw report to process, whatever the scope of the raw data it would carry,
+    // so it is only meaningful on a last call, which calculates whatever is still cached from the raw
+    // data of the previous calls without consuming any more of it.
+    if ((rawDataSize == 0) && !lastCall) {
+        METRICS_LOG_ERR("%s", "Raw data is empty on a call that is not the last one of the calculation");
+        *pTotalMetricReportCount = 0;
+        return ZE_RESULT_ERROR_INVALID_SIZE;
+    }
+
+    if (areAllCachesEmpty()) {
+        if (rawDataSize == 0) {
+            *pTotalMetricReportCount = 0;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        // All data is new: user asked to calculate all results available in the raw data. So, all caches are empty
+        newData = true;
+    } else if (rawDataSize > processedSize) {
+        // Previous call user requested fewer results than available. So, algo cached pending results and
+        // processed size = input size - rawReportSize because returned used size = rawReportSize.
+        // Then user is expected to move pRawData by rawReportSize. If data gets appended user must update
+        // new size accordingly.
+        newData = true;
+        rawDataStart += processedSize;
+        dataSize = rawDataSize - processedSize;
+    }
+
+    if (newData) { // only check on new data. Otherwise, cached values are guaranteed to be valid
+        isMultiDeviceData = IpSamplingCalculation::isMultiDeviceCaptureData(dataSize, rawDataStart);
+    }
+
+    if (!isMultiDevice) {
+        if (isMultiDeviceData) {
+            METRICS_LOG_ERR("%s", "Cannot use root device raw data in a sub-device calculation operation handle");
+            *pTotalMetricReportCount = 0;
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+
+        uint32_t scopeId = metricScopesInCalcOp[0]->getId(); // Sub-devices calcOp can only have single scope
+        DEBUG_BREAK_IF(metricScopesInCalcOp[0]->isAggregated());
+        DEBUG_BREAK_IF(scopeId != 0);
+
+        status = updateCacheForSingleScope(dataSize, rawDataStart, newData, *perScopeIpDataCaches[scopeId], dataOverflow);
+        if (status != ZE_RESULT_SUCCESS) {
+            clearScopesCaches();
+            METRICS_LOG_ERR("%s", "Failed to update stall data");
+            *pTotalMetricReportCount = 0;
+            return status;
+        }
+
+        metricReportCount = std::min<uint32_t>(*pTotalMetricReportCount, getLargestCacheSize());
+        ipSamplingCalculation->stallDataMapToMetricResults(*getScopeCache(scopeId), metricReportCount,
+                                                           perScopeIncludedMetricIndexes[scopeId], pMetricResults);
+    } else {
+        if (!isMultiDeviceData) {
+            METRICS_LOG_ERR("%s", "Cannot use sub-device raw data in a root device calculation operation handle");
+            *pTotalMetricReportCount = 0;
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+
+        status = updateCachesForMultiScopes(dataSize, rawDataStart, newData, dataOverflow);
+        if (status != ZE_RESULT_SUCCESS) {
+            clearScopesCaches();
+            METRICS_LOG_ERR("%s", "Failed to update stall data map");
+            *pTotalMetricReportCount = 0;
+            return status;
+        }
+
+        metricReportCount = std::min<uint32_t>(*pTotalMetricReportCount, getLargestCacheSize());
+        ipSamplingCalculation->multiDataMapToMetricResults(perScopeIpDataCaches, metricReportCount,
+                                                           perScopeIncludedMetricIndexes, pMetricResults);
+    }
+    // Update with the actual number of reports calculated
+    *pTotalMetricReportCount = metricReportCount;
+
+    if (lastCall || areAllCachesEmpty()) {
+        clearScopesCaches();
+        *usedSize = rawDataSize;
+        processedSize = 0;
+    } else {
+        *usedSize = IpSamplingCalculation::rawReportSize;
+        processedSize = rawDataSize - IpSamplingCalculation::rawReportSize;
+    }
+
+    return dataOverflow ? ZE_RESULT_WARNING_DROPPED_DATA : ZE_RESULT_SUCCESS;
 }
 
 ze_result_t MultiDeviceIpSamplingMetricGroupImp::streamerOpen(
@@ -117,7 +506,8 @@ ze_result_t MultiDeviceIpSamplingMetricGroupImp::streamerOpen(
     ze_result_t result = ZE_RESULT_SUCCESS;
 
     std::vector<IpSamplingMetricStreamerImp *> subDeviceStreamers = {};
-    subDeviceStreamers.reserve(subDeviceMetricGroup.size());
+    const auto numSubDevices = subDeviceMetricGroup.size();
+    subDeviceStreamers.reserve(numSubDevices);
 
     // Open SubDevice Streamers
     for (auto &metricGroup : subDeviceMetricGroup) {
@@ -136,12 +526,20 @@ ze_result_t MultiDeviceIpSamplingMetricGroupImp::streamerOpen(
 
     pStreamerImp->attachEvent(hNotificationEvent);
     *phMetricStreamer = pStreamerImp->toHandle();
+
+    auto hwBufferSizeDesc = MetricSource::getHwBufferSizeDesc(static_cast<zet_base_desc_t *>(const_cast<void *>(desc->pNext)));
+    if (hwBufferSizeDesc.has_value()) {
+        auto device = Device::fromHandle(hDevice);
+        IpSamplingMetricSourceImp &source = device->getMetricDeviceContext().getMetricSource<IpSamplingMetricSourceImp>();
+        // EUSS uses fixed max hw buffer size
+        hwBufferSizeDesc.value()->sizeInBytes = source.getMetricOsInterface()->getRequiredBufferSize(UINT32_MAX) * numSubDevices;
+    }
     return result;
 }
 
 ze_result_t MultiDeviceIpSamplingMetricStreamerImp::readData(uint32_t maxReportCount, size_t *pRawDataSize, uint8_t *pRawData) {
 
-    const int32_t totalHeaderSize = static_cast<int32_t>(sizeof(IpSamplingMetricDataHeader) * subDeviceStreamers.size());
+    const int32_t totalHeaderSize = static_cast<int32_t>(sizeof(IpSamplingMultiDevDataHeader) * subDeviceStreamers.size());
     // Find single report size
     size_t singleReportSize = 0;
     subDeviceStreamers[0]->readData(1, &singleReportSize, nullptr);
@@ -172,8 +570,8 @@ ze_result_t MultiDeviceIpSamplingMetricStreamerImp::readData(uint32_t maxReportC
         auto &streamer = subDeviceStreamers[index];
 
         // Get header address
-        auto header = reinterpret_cast<IpSamplingMetricDataHeader *>(pCurrRawData);
-        pCurrRawData += sizeof(IpSamplingMetricDataHeader);
+        auto header = reinterpret_cast<IpSamplingMultiDevDataHeader *>(pCurrRawData);
+        pCurrRawData += sizeof(IpSamplingMultiDevDataHeader);
 
         result = streamer->readData(maxReportCount, &currRawDataSize, pCurrRawData);
         if (result != ZE_RESULT_SUCCESS) {
@@ -182,8 +580,8 @@ ze_result_t MultiDeviceIpSamplingMetricStreamerImp::readData(uint32_t maxReportC
         }
 
         // Update to header
-        memset(header, 0, sizeof(IpSamplingMetricDataHeader));
-        header->magic = IpSamplingMetricDataHeader::magicValue;
+        memset(header, 0, sizeof(IpSamplingMultiDevDataHeader));
+        header->magic = IpSamplingMultiDevDataHeader::magicValue;
         header->rawDataSize = static_cast<uint32_t>(currRawDataSize);
         header->setIndex = index;
 

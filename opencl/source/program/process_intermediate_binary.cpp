@@ -1,14 +1,13 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/compiler_interface/external_functions.h"
-#include "shared/source/compiler_interface/linker.h"
 #include "shared/source/helpers/string.h"
 
+#include "CL/cl_ext.h"
 #include "program.h"
 
 namespace NEO {

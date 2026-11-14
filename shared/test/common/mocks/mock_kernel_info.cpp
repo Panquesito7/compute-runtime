@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,34 +7,43 @@
 
 #include "shared/test/common/mocks/mock_kernel_info.h"
 
-#include "shared/source/kernel/kernel_descriptor_from_patchtokens.h"
+#include "shared/source/kernel/kernel_descriptor.h"
 
 using namespace NEO;
-namespace NEO {
-void populatePointerKernelArg(ArgDescPointer &dst,
-                              CrossThreadDataOffset stateless, uint8_t pointerSize, SurfaceStateHeapOffset bindful, CrossThreadDataOffset bindless,
-                              KernelDescriptor::AddressingMode addressingMode);
-}
 
-void MockKernelInfo::addArgAccelerator(uint32_t index, SurfaceStateHeapOffset bindful,
-                                       CrossThreadDataOffset mbBlockType, CrossThreadDataOffset sadAdjustMode,
-                                       CrossThreadDataOffset searchPathType, CrossThreadDataOffset subpixelMode) {
-    addArgSampler(index, bindful);
-    argAsSmp(index).samplerType = iOpenCL::SAMPLER_OBJECT_VME;
-    argAt(index).getExtendedTypeInfo().isAccelerator = true;
-    addExtendedVmeDescriptor(index, mbBlockType, sadAdjustMode, searchPathType, subpixelMode);
-    kernelDescriptor.kernelAttributes.flags.usesVme = true;
+static void populatePointerKernelArg(KernelDescriptor &kernelDesc, ArgDescPointer &dst,
+                                     CrossThreadDataOffset stateless, uint8_t pointerSize,
+                                     SurfaceStateHeapOffset bindful, CrossThreadDataOffset bindless,
+                                     KernelDescriptor::AddressingMode addressingMode) {
+    switch (addressingMode) {
+    default:
+        UNRECOVERABLE_IF(KernelDescriptor::Stateless != addressingMode);
+        dst.bindful = undefined<SurfaceStateHeapOffset>;
+        dst.stateless = stateless;
+        dst.bindless = undefined<CrossThreadDataOffset>;
+        dst.pointerSize = pointerSize;
+        break;
+    case KernelDescriptor::BindfulAndStateless:
+        dst.bindful = bindful;
+        dst.stateless = stateless;
+        dst.bindless = undefined<CrossThreadDataOffset>;
+        dst.pointerSize = pointerSize;
+        kernelDesc.kernelAttributes.numArgsStateful++;
+        break;
+    case KernelDescriptor::BindlessAndStateless:
+        dst.bindful = undefined<SurfaceStateHeapOffset>;
+        dst.stateless = stateless;
+        dst.bindless = bindless;
+        dst.pointerSize = pointerSize;
+        kernelDesc.kernelAttributes.numArgsStateful++;
+        break;
+    }
 }
 
 void MockKernelInfo::addArgBuffer(uint32_t index, CrossThreadDataOffset stateless, uint8_t pointerSize, SurfaceStateHeapOffset bindful, CrossThreadDataOffset bindless) {
     resizeArgsIfIndexTooBig(index);
 
-    populatePointerKernelArg(argAt(index).as<ArgDescPointer>(true), stateless, pointerSize, bindful, bindless, kernelDescriptor.kernelAttributes.bufferAddressingMode);
-}
-
-void MockKernelInfo::addArgDevQueue(uint32_t index, CrossThreadDataOffset stateless, uint8_t pointerSize, SurfaceStateHeapOffset bindful) {
-    addArgBuffer(index, stateless, pointerSize, bindful);
-    argAt(index).getExtendedTypeInfo().isDeviceQueue = true;
+    populatePointerKernelArg(kernelDescriptor, argAt(index).as<ArgDescPointer>(true), stateless, pointerSize, bindful, bindless, kernelDescriptor.kernelAttributes.bufferAddressingMode);
 }
 
 void MockKernelInfo::addArgImage(uint32_t index, SurfaceStateHeapOffset offset, uint32_t type, bool isTransformable) {
@@ -47,9 +56,7 @@ void MockKernelInfo::addArgImage(uint32_t index, SurfaceStateHeapOffset offset, 
         arg.bindless = offset;
     }
 
-    if (type == iOpenCL::IMAGE_MEMORY_OBJECT_2D_MEDIA) {
-        argAt(index).getExtendedTypeInfo().isMediaImage = true;
-    } else if (type == iOpenCL::IMAGE_MEMORY_OBJECT_2D_MEDIA_BLOCK) {
+    if (type == static_cast<uint32_t>(NEOImageType::imageType2DMediaBlock)) {
         argAt(index).getExtendedTypeInfo().isMediaBlockImage = true;
     }
 
@@ -63,6 +70,15 @@ void MockKernelInfo::addArgImmediate(uint32_t index, uint16_t size, CrossThreadD
 
     ArgDescValue::Element element{offset, size, sourceOffset};
     argAt(index).as<ArgDescValue>(true).elements.push_back(element);
+
+    auto &extendedMetadata = kernelDescriptor.explicitArgsExtendedMetadata;
+    if (index >= extendedMetadata.size()) {
+        extendedMetadata.resize(index + 1);
+    }
+    auto requiredSize = static_cast<size_t>(sourceOffset) + static_cast<size_t>(size);
+    if (requiredSize > extendedMetadata[index].typeSize) {
+        extendedMetadata[index].typeSize = requiredSize;
+    }
 }
 
 void MockKernelInfo::addArgLocal(uint32_t index, CrossThreadDataOffset slmOffset, uint8_t requiredSlmAlignment) {
@@ -86,7 +102,7 @@ void MockKernelInfo::addArgSampler(uint32_t index, SurfaceStateHeapOffset bindfu
 
     auto &arg = argAt(index).as<ArgDescSampler>(true);
     arg.bindful = bindful;
-    arg.samplerType = iOpenCL::SAMPLER_OBJECT_TEXTURE;
+    arg.samplerType = 1u;
 
     arg.metadataPayload.samplerAddressingMode = addressingMode;
     arg.metadataPayload.samplerNormalizedCoords = normalizedCoords;
@@ -100,33 +116,17 @@ void MockKernelInfo::resizeArgsIfIndexTooBig(uint32_t index) {
     }
 }
 
-void MockKernelInfo::addExtendedMetadata(uint32_t index, const std::string &argName, const std::string &type, const std::string &accessQualifier, const std::string &addressQualifier, const std::string &typeQualifiers) {
+void MockKernelInfo::addExtendedMetadata(uint32_t index, const std::string &argName, const std::string &type, const std::string &accessQualifier, const std::string &addressQualifier, const std::string &typeQualifiers, size_t typeSize) {
     auto &extendedMetadata = kernelDescriptor.explicitArgsExtendedMetadata;
     if (index >= extendedMetadata.size()) {
         extendedMetadata.resize(index + 1);
     }
 
-    extendedMetadata[index] = {argName, type, accessQualifier, addressQualifier, typeQualifiers};
-}
-
-void MockKernelInfo::addExtendedVmeDescriptor(uint32_t index, CrossThreadDataOffset mbBlockType, CrossThreadDataOffset sadAdjustMode, CrossThreadDataOffset searchPathType, CrossThreadDataOffset subpixelMode) {
-    auto &explicitArgsExtendedDescriptors = kernelDescriptor.payloadMappings.explicitArgsExtendedDescriptors;
-    if (index >= explicitArgsExtendedDescriptors.size()) {
-        explicitArgsExtendedDescriptors.resize(index + 1);
-    }
-
-    auto vmeDescriptor = std::make_unique<ArgDescVme>();
-    vmeDescriptor->mbBlockType = mbBlockType;
-    vmeDescriptor->sadAdjustMode = sadAdjustMode;
-    vmeDescriptor->searchPathType = searchPathType;
-    vmeDescriptor->subpixelMode = subpixelMode;
-    explicitArgsExtendedDescriptors[index] = std::move(vmeDescriptor);
-
-    argAt(index).getExtendedTypeInfo().hasVmeExtendedDescriptor = true;
+    extendedMetadata[index] = {argName, type, accessQualifier, addressQualifier, typeQualifiers, typeSize};
 }
 
 void MockKernelInfo::populatePointerArg(ArgDescPointer &arg, uint8_t pointerSize, CrossThreadDataOffset stateless, SurfaceStateHeapOffset bindful) {
-    populatePointerKernelArg(arg, stateless, pointerSize, bindful, bindful, kernelDescriptor.kernelAttributes.bufferAddressingMode);
+    populatePointerKernelArg(kernelDescriptor, arg, stateless, pointerSize, bindful, bindful, kernelDescriptor.kernelAttributes.bufferAddressingMode);
 }
 
 void MockKernelInfo::setPrintfSurface(uint8_t dataParamSize, CrossThreadDataOffset crossThreadDataOffset, SurfaceStateHeapOffset sshOffset) {
@@ -144,14 +144,6 @@ void MockKernelInfo::setGlobalVariablesSurface(uint8_t pointerSize, CrossThreadD
     populatePointerArg(kernelDescriptor.payloadMappings.implicitArgs.globalVariablesSurfaceAddress, pointerSize, stateless, bindful);
 }
 
-void MockKernelInfo::setDeviceSideEnqueueEventPoolSurface(uint8_t pointerSize, CrossThreadDataOffset stateless, SurfaceStateHeapOffset bindful) {
-    populatePointerArg(kernelDescriptor.payloadMappings.implicitArgs.deviceSideEnqueueEventPoolSurfaceAddress, pointerSize, stateless, bindful);
-}
-
-void MockKernelInfo::setDeviceSideEnqueueDefaultQueueSurface(uint8_t pointerSize, CrossThreadDataOffset stateless, SurfaceStateHeapOffset bindful) {
-    populatePointerArg(kernelDescriptor.payloadMappings.implicitArgs.deviceSideEnqueueDefaultQueueSurfaceAddress, pointerSize, stateless, bindful);
-}
-
 void MockKernelInfo::setGlobalConstantsSurface(uint8_t pointerSize, CrossThreadDataOffset stateless, SurfaceStateHeapOffset bindful) {
     populatePointerArg(kernelDescriptor.payloadMappings.implicitArgs.globalConstantsSurfaceAddress, pointerSize, stateless, bindful);
 }
@@ -162,7 +154,6 @@ void MockKernelInfo::setSyncBuffer(uint8_t pointerSize, CrossThreadDataOffset st
 }
 
 void MockKernelInfo::setPrivateMemory(uint32_t perThreadPrivateMemorySize, bool isSimtThread, uint8_t pointerSize, CrossThreadDataOffset stateless, SurfaceStateHeapOffset bindful) {
-    kernelDescriptor.kernelAttributes.flags.usesPrivateMemory = true;
     auto multiplier = static_cast<uint32_t>(isSimtThread ? kernelDescriptor.kernelAttributes.simdSize : 1U);
     kernelDescriptor.kernelAttributes.perHwThreadPrivateMemorySize = multiplier * perThreadPrivateMemorySize;
     populatePointerArg(kernelDescriptor.payloadMappings.implicitArgs.privateMemoryAddress, pointerSize, stateless, bindful);
@@ -175,9 +166,6 @@ void MockKernelInfo::setSamplerTable(DynamicStateHeapOffset borderColor, uint8_t
     samplerTable.tableOffset = tableOffset;
 }
 
-void MockKernelInfo::setPerThreadScratchSize(uint32_t perThreadScratchSize, uint32_t slot) {
-    kernelDescriptor.kernelAttributes.perThreadScratchSize[slot] = perThreadScratchSize;
-}
 void MockKernelInfo::setLocalIds(const std::array<uint8_t, 3> &localIds) {
     kernelDescriptor.kernelAttributes.numLocalIdChannels = localIds[0] + localIds[1] + localIds[2];
     kernelDescriptor.kernelAttributes.localId[0] = localIds[0];

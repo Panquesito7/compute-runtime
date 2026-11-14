@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,12 @@
 
 #include "shared/source/gen12lp/hw_info_rkl.h"
 
-#include "shared/source/aub_mem_dump/definitions/aub_services.h"
 #include "shared/source/command_stream/preemption_mode.h"
 #include "shared/source/gen12lp/hw_cmds_rkl.h"
-#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/release_helpers/caps/caps_setup.h"
 
 #include "aubstream/engine_node.h"
-#include "platforms.h"
 
 namespace NEO {
 
@@ -26,63 +24,46 @@ const PLATFORM RKL::platform = {
     IGFX_GEN12LP_CORE,
     IGFX_GEN12LP_CORE,
     PLATFORM_NONE, // default init
-    0,             // usDeviceID
+    0x4C80,        // usDeviceID
     0,             // usRevId. 0 sets the stepping to A0
     0,             // usDeviceID_PCH
     0,             // usRevId_PCH
     GTTYPE_UNDEFINED};
 
 const RuntimeCapabilityTable RKL::capabilityTable{
-    EngineDirectSubmissionInitVec{
-        {aub_stream::ENGINE_RCS, {true, true}},
-        {aub_stream::ENGINE_CCS, {true, true}}},     // directSubmissionEngines
-    {0, 0, 0, 0, false, false, false, false},        // kmdNotifyProperties
-    MemoryConstants::max48BitAddress,                // gpuAddressSpace
-    0,                                               // sharedSystemMemCapabilities
-    83.333,                                          // defaultProfilingTimerResolution
-    MemoryConstants::pageSize,                       // requiredPreemptionSurfaceSize
-    "",                                              // deviceName
-    PreemptionMode::MidThread,                       // defaultPreemptionMode
-    aub_stream::ENGINE_RCS,                          // defaultEngineType
-    0,                                               // maxRenderFrequency
-    30,                                              // clVersionSupport
-    CmdServicesMemTraceVersion::DeviceValues::Tgllp, // aubDeviceId
-    1,                                               // extraQuantityThreadsPerEU
-    64,                                              // slmSize
-    sizeof(RKL::GRF),                                // grfSize
-    36u,                                             // timestampValidBits
-    32u,                                             // kernelTimestampValidBits
-    false,                                           // blitterOperationsSupported
-    true,                                            // ftrSupportsInteger64BitAtomics
-    false,                                           // ftrSupportsFP64
-    false,                                           // ftrSupportsFP64Emulation
-    false,                                           // ftrSupports64BitMath
-    true,                                            // ftrSvm
-    false,                                           // ftrSupportsCoherency
-    false,                                           // ftrSupportsVmeAvcTextureSampler
-    false,                                           // ftrSupportsVmeAvcPreemption
-    false,                                           // ftrRenderCompressedBuffers
-    false,                                           // ftrRenderCompressedImages
-    true,                                            // ftr64KBpages
-    true,                                            // instrumentationEnabled
-    false,                                           // sourceLevelDebuggerSupported
-    false,                                           // supportsVme
-    false,                                           // supportCacheFlushAfterWalker
-    true,                                            // supportsImages
-    false,                                           // supportsDeviceEnqueue
-    false,                                           // supportsPipes
-    true,                                            // supportsOcl21Features
-    false,                                           // supportsOnDemandPageFaults
-    false,                                           // supportsIndependentForwardProgress
-    false,                                           // hostPtrTrackingEnabled
-    true,                                            // levelZeroSupported
-    true,                                            // isIntegratedDevice
-    true,                                            // supportsMediaBlock
-    false,                                           // p2pAccessSupported
-    false,                                           // p2pAtomicAccessSupported
-    true,                                            // fusedEuEnabled
-    false,                                           // l0DebuggerSupported;
-    true                                             // supportsFloatAtomics
+    .directSubmissionEngines = makeDirectSubmissionPropertiesPerEngine({
+        {aub_stream::ENGINE_RCS, {.engineSupported = true, .submitOnInit = true, .useNonDefault = false}},
+        {aub_stream::ENGINE_CCS, {.engineSupported = true, .submitOnInit = true, .useNonDefault = false}},
+    }),
+    .kmdNotifyProperties = {0, 0, 0, 0, false, false, false, false},
+    .gpuAddressSpace = MemoryConstants::max48BitAddress,
+    .sharedSystemMemCapabilities = 0,
+    .requiredPreemptionSurfaceSize = MemoryConstants::pageSize,
+    .deviceName = "",
+    .preferredPlatformName = nullptr,
+    .defaultPreemptionMode = PreemptionMode::ThreadGroup,
+    .defaultEngineType = aub_stream::ENGINE_RCS,
+    .maxRenderFrequency = 0,
+    .extraQuantityThreadsPerEU = 1,
+    .maxProgrammableSlmSize = 64,
+    .grfSize = sizeof(RKL::GRF),
+    .timestampValidBits = 36u,
+    .kernelTimestampValidBits = 32u,
+    .blitterOperationsSupported = false,
+    .ftrSupportsFP64 = false,
+    .ftrSupportsFP64Emulation = false,
+    .ftrSupports64BitMath = false,
+    .ftrSupportsCoherency = false,
+    .ftrRenderCompressedBuffers = false,
+    .ftrRenderCompressedImages = false,
+    .supportCacheFlushAfterWalker = false,
+    .supportsImages = true,
+    .supportsOnDemandPageFaults = false,
+    .supportsIndependentForwardProgress = false,
+    .isIntegratedDevice = true,
+    .supportsMediaBlock = true,
+    .fusedEuEnabled = true,
+    .l0DebuggerSupported = false,
 };
 
 WorkaroundTable RKL::workaroundTable = {};
@@ -114,55 +95,45 @@ void RKL::setupFeatureAndWorkaroundTable(HardwareInfo *hwInfo) {
     workaroundTable->flags.wa4kAlignUVOffsetNV12LinearSurface = true;
 };
 
-void RKL::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
+void RKL::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
     GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->ThreadCount = gtSysInfo->EUCount * compilerProductHelper.getNumThreadsPerEu();
-    gtSysInfo->TotalVsThreads = 0;
-    gtSysInfo->TotalHsThreads = 0;
-    gtSysInfo->TotalDsThreads = 0;
-    gtSysInfo->TotalGsThreads = 0;
-    gtSysInfo->TotalPsThreadsWindowerRange = 64;
+    gtSysInfo->NumThreadsPerEu = 7u;
+    gtSysInfo->ThreadCount = gtSysInfo->EUCount * gtSysInfo->NumThreadsPerEu;
     gtSysInfo->CsrSizeInMb = 8;
     gtSysInfo->MaxEuPerSubSlice = RKL::maxEuPerSubslice;
     gtSysInfo->MaxSlicesSupported = RKL::maxSlicesSupported;
     gtSysInfo->MaxSubSlicesSupported = 2;
     gtSysInfo->MaxDualSubSlicesSupported = 2;
-    gtSysInfo->IsL3HashModeEnabled = false;
     gtSysInfo->IsDynamicallyPopulated = false;
 
+    setupCaps(*hwInfo);
     if (setupFeatureTableAndWorkaroundTable) {
         setupFeatureAndWorkaroundTable(hwInfo);
     }
+
+    applyDebugOverrides(*hwInfo);
 }
 
-const HardwareInfo RklHwConfig::hwInfo = {
+const HardwareInfo RKL::hwInfo = {
     &RKL::platform,
     &RKL::featureTable,
     &RKL::workaroundTable,
-    &RklHwConfig::gtSystemInfo,
-    RKL::capabilityTable,
-    AOT::RKL};
+    &RKL::gtSystemInfo,
+    RKL::capabilityTable};
 
-GT_SYSTEM_INFO RklHwConfig::gtSystemInfo = {0};
-void RklHwConfig::setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    RKL::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
+GT_SYSTEM_INFO RKL::gtSystemInfo = {0};
+void RKL::setupHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
+    RKL::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable);
 
     GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
     gtSysInfo->DualSubSliceCount = gtSysInfo->SubSliceCount;
     gtSysInfo->L3CacheSizeInKb = 1920;
     gtSysInfo->L3BankCount = 4;
-    gtSysInfo->MaxFillRate = 8;
 
     gtSysInfo->CCSInfo.IsValid = true;
     gtSysInfo->CCSInfo.NumberOfCCSEnabled = 1;
     gtSysInfo->CCSInfo.Instances.CCSEnableMask = 0b1;
 };
 
-const HardwareInfo RKL::hwInfo = RklHwConfig::hwInfo;
-
-void setupRKLHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, uint64_t hwInfoConfig, const CompilerProductHelper &compilerProductHelper) {
-    RklHwConfig::setupHardwareInfo(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
-}
-
-void (*RKL::setupHardwareInfo)(HardwareInfo *, bool, uint64_t, const CompilerProductHelper &) = setupRKLHardwareInfoImpl;
+void (*RKL::setupHardwareInfo)(HardwareInfo *, bool) = RKL::setupHardwareInfoImpl;
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,20 +8,15 @@
 #include "shared/source/os_interface/windows/debug_registry_reader.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/os_interface/debug_env_reader.h"
 #include "shared/source/os_interface/windows/sys_calls.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
 #include "shared/source/utilities/debug_settings_reader.h"
-
-#include <stdint.h>
 
 namespace NEO {
 
 SettingsReader *SettingsReader::createOsReader(bool userScope, const std::string &regKey) {
     return new RegistryReader(userScope, regKey);
-}
-
-char *SettingsReader::getenv(const char *settingName) {
-    return SysCalls::getenv(settingName);
 }
 
 RegistryReader::RegistryReader(bool userScope, const std::string &regKey) : registryReadRootKey(regKey) {
@@ -38,36 +33,77 @@ void RegistryReader::setUpProcessName() {
     processName.assign(buff);
 }
 const char *RegistryReader::appSpecificLocation(const std::string &name) {
-    if (processName.length() > 0)
+    if (processName.length() > 0) {
         return processName.c_str();
+    }
     return name.c_str();
+}
+
+bool RegistryReader::getSetting(const char *settingName, bool defaultValue, DebugVarPrefix &type) {
+    return getSetting(settingName, static_cast<int32_t>(defaultValue), type) ? true : false;
 }
 
 bool RegistryReader::getSetting(const char *settingName, bool defaultValue) {
     return getSetting(settingName, static_cast<int32_t>(defaultValue)) ? true : false;
 }
 
+int32_t RegistryReader::getSetting(const char *settingName, int32_t defaultValue, DebugVarPrefix &type) {
+    return static_cast<int32_t>(getSetting(settingName, static_cast<int64_t>(defaultValue), type));
+}
+
 int32_t RegistryReader::getSetting(const char *settingName, int32_t defaultValue) {
     return static_cast<int32_t>(getSetting(settingName, static_cast<int64_t>(defaultValue)));
 }
 
-int64_t RegistryReader::getSetting(const char *settingName, int64_t defaultValue) {
-    HKEY Key{};
-    int64_t value = defaultValue;
+bool RegistryReader::hasRegistryValue(const char *settingName) {
+    HKEY key{};
+    bool retVal = false;
+
+    if (ERROR_SUCCESS == SysCalls::regOpenKeyExA(hkeyType,
+                                                 registryReadRootKey.c_str(),
+                                                 0,
+                                                 KEY_READ,
+                                                 &key)) {
+        DWORD regType = REG_NONE;
+        DWORD regSize = 0;
+
+        retVal = (ERROR_SUCCESS == SysCalls::regQueryValueExA(key,
+                                                              settingName,
+                                                              NULL,
+                                                              &regType,
+                                                              NULL,
+                                                              &regSize));
+        RegCloseKey(key);
+    }
+    return retVal;
+}
+
+bool RegistryReader::hasSetting(const char *settingName, DebugVarPrefix &type) {
+    if (hasRegistryValue(settingName)) {
+        type = DebugVarPrefix::none;
+        return true;
+    }
+
+    EnvironmentVariableReader envReader;
+    return envReader.hasSetting(settingName, type);
+}
+
+bool RegistryReader::getSettingIntCommon(const char *settingName, int64_t &value) {
+    HKEY key{};
     DWORD success = ERROR_SUCCESS;
-    bool readSettingFromEnv = true;
+    bool retVal = false;
 
     success = SysCalls::regOpenKeyExA(hkeyType,
                                       registryReadRootKey.c_str(),
                                       0,
                                       KEY_READ,
-                                      &Key);
+                                      &key);
 
     if (ERROR_SUCCESS == success) {
         DWORD size = sizeof(int64_t);
         int64_t regData;
 
-        success = SysCalls::regQueryValueExA(Key,
+        success = SysCalls::regQueryValueExA(key,
                                              settingName,
                                              NULL,
                                              NULL,
@@ -75,12 +111,30 @@ int64_t RegistryReader::getSetting(const char *settingName, int64_t defaultValue
                                              &size);
         if (ERROR_SUCCESS == success) {
             value = regData;
-            readSettingFromEnv = false;
+            retVal = true;
         }
-        RegCloseKey(Key);
+        RegCloseKey(key);
     }
-    if (readSettingFromEnv) {
-        const char *envValue = getenv(settingName);
+    return retVal;
+}
+
+int64_t RegistryReader::getSetting(const char *settingName, int64_t defaultValue, DebugVarPrefix &type) {
+    int64_t value = defaultValue;
+
+    if (!(getSettingIntCommon(settingName, value))) {
+        if (auto envValue = EnvironmentVariableReader::findEnvironmentVariable(settingName, type)) {
+            return atoll(envValue);
+        }
+    }
+    type = DebugVarPrefix::none;
+    return value;
+}
+
+int64_t RegistryReader::getSetting(const char *settingName, int64_t defaultValue) {
+    int64_t value = defaultValue;
+
+    if (!(getSettingIntCommon(settingName, value))) {
+        const char *envValue = EnvironmentVariableReader::getEnvironmentVariable(settingName);
         if (envValue) {
             value = atoll(envValue);
         }
@@ -89,22 +143,21 @@ int64_t RegistryReader::getSetting(const char *settingName, int64_t defaultValue
     return value;
 }
 
-std::string RegistryReader::getSetting(const char *settingName, const std::string &value) {
-    HKEY Key{};
+bool RegistryReader::getSettingStringCommon(const char *settingName, std::string &keyValue) {
+    HKEY key{};
     DWORD success = ERROR_SUCCESS;
-    std::string keyValue = value;
-    bool readSettingFromEnv = true;
+    bool retVal = false;
 
     success = SysCalls::regOpenKeyExA(hkeyType,
                                       registryReadRootKey.c_str(),
                                       0,
                                       KEY_READ,
-                                      &Key);
+                                      &key);
     if (ERROR_SUCCESS == success) {
         DWORD regType = REG_NONE;
         DWORD regSize = 0;
 
-        success = SysCalls::regQueryValueExA(Key,
+        success = SysCalls::regQueryValueExA(key,
                                              settingName,
                                              NULL,
                                              &regType,
@@ -112,8 +165,8 @@ std::string RegistryReader::getSetting(const char *settingName, const std::strin
                                              &regSize);
         if (ERROR_SUCCESS == success) {
             if (regType == REG_SZ || regType == REG_MULTI_SZ) {
-                auto regData = std::make_unique<char[]>(regSize);
-                success = SysCalls::regQueryValueExA(Key,
+                auto regData = std::make_unique_for_overwrite<char[]>(regSize);
+                success = SysCalls::regQueryValueExA(key,
                                                      settingName,
                                                      NULL,
                                                      &regType,
@@ -121,12 +174,12 @@ std::string RegistryReader::getSetting(const char *settingName, const std::strin
                                                      &regSize);
                 if (success == ERROR_SUCCESS) {
                     keyValue.assign(regData.get());
-                    readSettingFromEnv = false;
+                    retVal = true;
                 }
             } else if (regType == REG_BINARY) {
                 size_t charCount = regSize / sizeof(wchar_t);
-                auto regData = std::make_unique<wchar_t[]>(charCount);
-                success = SysCalls::regQueryValueExA(Key,
+                auto regData = std::make_unique_for_overwrite<wchar_t[]>(charCount);
+                success = SysCalls::regQueryValueExA(key,
                                                      settingName,
                                                      NULL,
                                                      &regType,
@@ -135,20 +188,38 @@ std::string RegistryReader::getSetting(const char *settingName, const std::strin
 
                 if (ERROR_SUCCESS == success) {
 
-                    std::unique_ptr<char[]> convertedData(new char[charCount + 1]);
+                    auto convertedData = std::make_unique<char[]>(charCount + 1);
                     std::wcstombs(convertedData.get(), regData.get(), charCount);
                     convertedData.get()[charCount] = 0;
 
                     keyValue.assign(convertedData.get());
-                    readSettingFromEnv = false;
+                    retVal = true;
                 }
             }
         }
-        RegCloseKey(Key);
+        RegCloseKey(key);
     }
+    return retVal;
+}
 
-    if (readSettingFromEnv) {
-        const char *envValue = strcmp(processName.c_str(), settingName) ? getenv(settingName) : getenv("cl_cache_dir");
+std::string RegistryReader::getSetting(const char *settingName, const std::string &value, DebugVarPrefix &type) {
+    std::string keyValue = value;
+
+    if (!(getSettingStringCommon(settingName, keyValue))) {
+        if (auto envValue = EnvironmentVariableReader::findEnvironmentVariable(settingName, type)) {
+            return std::string(envValue);
+        }
+    }
+    type = DebugVarPrefix::none;
+    return keyValue;
+}
+
+std::string RegistryReader::getSetting(const char *settingName, const std::string &value) {
+    std::string keyValue = value;
+
+    if (!(getSettingStringCommon(settingName, keyValue))) {
+        const char *envValue = EnvironmentVariableReader::getEnvironmentVariable(settingName);
+
         if (envValue) {
             keyValue.assign(envValue);
         }

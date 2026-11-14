@@ -1,18 +1,29 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/cl_device/cl_device.h"
+#include "opencl/source/context/context.h"
+#include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
+#include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
+#include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include "cstring"
+
+#include <cstdint>
+#include <memory>
+#include <tuple>
 
 using namespace NEO;
 
@@ -29,8 +40,7 @@ struct MapImageParams {
 };
 
 struct AUBMapImage
-    : public CommandDeviceFixture,
-      public AUBCommandStreamFixture,
+    : public AUBCommandStreamFixture,
       public ::testing::WithParamInterface<std::tuple<uint32_t /*cl_channel_type*/, uint32_t /*cl_channel_order*/, MapImageParams>>,
       public ::testing::Test {
     typedef AUBCommandStreamFixture CommandStreamFixture;
@@ -41,20 +51,15 @@ struct AUBMapImage
         if (!(defaultHwInfo->capabilityTable.supportsImages)) {
             GTEST_SKIP();
         }
-        CommandDeviceFixture::setUp(cl_command_queue_properties(0));
-        CommandStreamFixture::setUp(pCmdQ);
-
-        context = std::make_unique<MockContext>(pClDevice);
+        CommandStreamFixture::setUp();
     }
 
     void TearDown() override {
         srcImage.reset();
-        context.reset();
+
         CommandStreamFixture::tearDown();
-        CommandDeviceFixture::tearDown();
     }
 
-    std::unique_ptr<MockContext> context;
     std::unique_ptr<Image> srcImage;
 };
 
@@ -113,25 +118,23 @@ HWTEST_P(AUBMapImage, WhenMappingAndUnmappingThenExpectationsAreMet) {
 
     size_t elementSize = perChannelDataSize * numChannels;
     auto sizeMemory = testWidth * alignUp(testHeight, 4) * testDepth * elementSize;
-    auto srcMemory = new (std::nothrow) uint8_t[sizeMemory];
-    ASSERT_NE(nullptr, srcMemory); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+    std::vector<uint8_t> srcMemory(sizeMemory);
 
     for (unsigned i = 0; i < sizeMemory; ++i) {
-        uint8_t origValue = i;
-        memcpy(srcMemory + i, &origValue, sizeof(origValue));
+        srcMemory[i] = static_cast<uint8_t>(i);
     }
 
     auto retVal = CL_INVALID_VALUE;
     cl_mem_flags flags = CL_MEM_COPY_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, pClDevice->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     srcImage.reset(Image::create(
-        context.get(),
+        context,
         ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context->getDevice(0)->getDevice()),
         flags,
         0,
         surfaceFormat,
         &imageDesc,
-        srcMemory,
+        srcMemory.data(),
         retVal));
     ASSERT_NE(nullptr, srcImage.get());
 
@@ -158,7 +161,7 @@ HWTEST_P(AUBMapImage, WhenMappingAndUnmappingThenExpectationsAreMet) {
                                                           srcImage->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex())->getMemoryPool());
     if (isGpuCopy) {
         mappedPtrStart = static_cast<uint8_t *>(mappedPtr);
-        srcMemoryStart = srcMemory;
+        srcMemoryStart = srcMemory.data();
 
         // validate mapped region
         srcMemoryStart = ptrOffset(srcMemoryStart, inputSlicePitch * origin[2]);
@@ -187,19 +190,20 @@ HWTEST_P(AUBMapImage, WhenMappingAndUnmappingThenExpectationsAreMet) {
     pCmdQ->enqueueUnmapMemObject(srcImage.get(), mappedPtr, 0, nullptr, nullptr);
 
     // verify unmap
-    uint8_t *readMemory = new uint8_t[srcImage->getSize()];
+    std::vector<uint8_t> readMemory(srcImage->getSize());
     size_t imgOrigin[] = {0, 0, 0};
     size_t imgRegion[] = {testWidth, testHeight, testDepth};
-    retVal = pCmdQ->enqueueReadImage(srcImage.get(), CL_FALSE, imgOrigin, imgRegion, inputRowPitch, inputSlicePitch, readMemory, nullptr, 0, nullptr, nullptr);
+    retVal = pCmdQ->enqueueReadImage(srcImage.get(), CL_FALSE, imgOrigin, imgRegion, inputRowPitch, inputSlicePitch, readMemory.data(), nullptr, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     retVal = pCmdQ->flush();
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    srcMemoryStart = srcMemory;
-    auto readMemoryStart = readMemory;
-    uint8_t *expected = new uint8_t[elementSize];
-    memset(expected, 0xFF, elementSize);
+    srcMemoryStart = srcMemory.data();
+    auto readMemoryStart = readMemory.data();
+    std::vector<uint8_t> expected(elementSize, 0xFF);
+
+    std::vector<uint8_t> expectedRow(testWidth * elementSize);
 
     for (size_t z = 0; z < testDepth; ++z) {
         for (size_t y = 0; y < testHeight; ++y) {
@@ -207,25 +211,21 @@ HWTEST_P(AUBMapImage, WhenMappingAndUnmappingThenExpectationsAreMet) {
                 if (z >= origin[2] && z < (origin[2] + region[2]) &&
                     y >= origin[1] && y < (origin[1] + region[1]) &&
                     x >= origin[0] && x < (origin[0] + region[0])) {
-                    // this texel should be updated
-                    AUBCommandStreamFixture::expectMemory<FamilyType>(&readMemoryStart[x * elementSize], expected, elementSize);
+                    memcpy_s(&expectedRow[x * elementSize], elementSize, expected.data(), elementSize);
                 } else {
-                    AUBCommandStreamFixture::expectMemory<FamilyType>(&readMemoryStart[x * elementSize], &srcMemoryStart[x * elementSize], elementSize);
+                    memcpy_s(&expectedRow[x * elementSize], elementSize, &srcMemoryStart[x * elementSize], elementSize);
                 }
             }
+            AUBCommandStreamFixture::expectMemory<FamilyType>(readMemoryStart, expectedRow.data(), testWidth * elementSize);
             readMemoryStart = ptrOffset(readMemoryStart, inputRowPitch);
             srcMemoryStart = ptrOffset(srcMemoryStart, inputRowPitch);
         }
         readMemoryStart = ptrOffset(readMemoryStart, inputSlicePitch - (inputRowPitch * (testHeight > 0 ? testHeight : 1)));
         srcMemoryStart = ptrOffset(srcMemoryStart, inputSlicePitch - (inputRowPitch * (testHeight > 0 ? testHeight : 1)));
     }
-
-    delete[] readMemory;
-    delete[] srcMemory;
-    delete[] expected;
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     AUBMapImage_simple, AUBMapImage,
     ::testing::Combine(::testing::Values( // formats
                            CL_UNORM_INT8, CL_SIGNED_INT16, CL_UNSIGNED_INT32,

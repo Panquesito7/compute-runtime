@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,13 +7,13 @@
 
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
-#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fill_buffer_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 
 #include "gtest/gtest.h"
-#include "hw_cmds.h"
 
 using namespace NEO;
 
@@ -105,13 +105,13 @@ TEST_F(EnqueueFillBuffer, GivenEventListAndNumEventsZeroWhenFillingBufferThenInv
 
 HWTEST_F(EnqueueFillBuffer, GivenGpuHangAndBlockingCallWhenFillingBufferThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
-    MockCommandQueueHw<FamilyType> mockCommandQueueHw(&context, device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    MockCommandQueueHw<FamilyType> mockCommandQueueHw(context, device.get(), &props);
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     cl_uint numEventsInWaitList = 0;
     const cl_event *eventWaitList = nullptr;
@@ -122,48 +122,22 @@ HWTEST_F(EnqueueFillBuffer, GivenGpuHangAndBlockingCallWhenFillingBufferThenOutO
     EXPECT_EQ(1, mockCommandQueueHw.waitForAllEnginesCalledCount);
 }
 
-} // namespace ULT
-
-namespace ULT {
-
-struct InvalidPatternSize : public EnqueueFillBufferFixture,
-                            public ::testing::TestWithParam<size_t> {
-    typedef EnqueueFillBufferFixture BaseClass;
-
-    InvalidPatternSize() {
+TEST_F(EnqueueFillBuffer, GivenInvalidPatternSizeWhenFillingBufferThenInvalidValueErrorIsReturned) {
+    const size_t invalidSizes[] = {0, 3, 5, 256, 512, 1024};
+    for (auto patternSize : invalidSizes) {
+        char patternData[1] = {};
+        auto retVal = clEnqueueFillBuffer(
+            BaseClass::pCmdQ,
+            buffer,
+            patternData,
+            patternSize,
+            0,
+            patternSize,
+            0,
+            nullptr,
+            nullptr);
+        EXPECT_EQ(CL_INVALID_VALUE, retVal);
     }
-
-    void SetUp() override {
-        BaseClass::setUp();
-        patternSize = GetParam();
-        pattern = new char[patternSize];
-    }
-
-    void TearDown() override {
-        delete[] pattern;
-        BaseClass::tearDown();
-    }
-
-    size_t patternSize = 0;
-    char *pattern = nullptr;
-};
-
-TEST_P(InvalidPatternSize, GivenInvalidPatternSizeWhenFillingBufferThenInvalidValueErrorIsReturned) {
-    auto retVal = clEnqueueFillBuffer(
-        BaseClass::pCmdQ,
-        buffer,
-        &pattern,
-        patternSize,
-        0,
-        patternSize,
-        0,
-        nullptr,
-        nullptr);
-
-    EXPECT_EQ(CL_INVALID_VALUE, retVal);
 }
 
-INSTANTIATE_TEST_CASE_P(EnqueueFillBuffer,
-                        InvalidPatternSize,
-                        ::testing::Values(0, 3, 5, 256, 512, 1024));
 } // namespace ULT

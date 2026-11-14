@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -126,7 +126,7 @@ class SysmanGlobalOperationsFixture : public SysmanDeviceFixture {
         auto pDrm = std::make_unique<DrmGlobalOpsMock>(*executionEnvironment->rootDeviceEnvironments[0]);
         VariableBackup<NEO::Drm *> backup(&pLinuxSysmanImp->pDrm);
         pLinuxSysmanImp->pDrm = pDrm.get();
-        zes_device_state_t deviceState;
+        zes_device_state_t deviceState = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceGetState(device, &deviceState));
     }
 };
@@ -148,6 +148,66 @@ class SysmanGlobalOperationsIntegratedFixture : public SysmanGlobalOperationsFix
         SysmanGlobalOperationsFixture::TearDown();
     }
 };
+
+TEST_F(SysmanGlobalOperationsFixture, GivenDeviceInUseWhenCallingzesDeviceResetExtThenResetExtCallReturnSuccess) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.VfBarResourceAllocationWa.set(false);
+    initGlobalOps();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp = pMockGlobalOpsLinuxSysmanImp.get();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp->pDevice = pLinuxSysmanImp->getDeviceHandle();
+    zes_reset_properties_t pProperties = {.stype = ZES_STRUCTURE_TYPE_RESET_PROPERTIES, .pNext = nullptr, .force = true, .resetType = ZES_RESET_TYPE_WARM};
+    ze_result_t result = zesDeviceResetExt(device, &pProperties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    pProperties.resetType = ZES_RESET_TYPE_COLD;
+    result = zesDeviceResetExt(device, &pProperties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    pProperties.resetType = ZES_RESET_TYPE_FLR;
+    result = zesDeviceResetExt(device, &pProperties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(SysmanGlobalOperationsFixture, GivenDeviceInUseWhenCallingZesDeviceResetExtForColdResetThenErrorIsReturned) {
+    initGlobalOps();
+    pProcfsAccess->ourDevicePid = pProcfsAccess->pidList[0];
+    pProcfsAccess->ourDeviceFd = pProcfsAccess->extraFd;
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp = pMockGlobalOpsLinuxSysmanImp.get();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp->pDevice = pLinuxSysmanImp->getDeviceHandle();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->resetTimeout = 0; // timeout immediate
+    pMockGlobalOpsLinuxSysmanImp->ourDevicePid = pProcfsAccess->ourDevicePid;
+    pMockGlobalOpsLinuxSysmanImp->ourDeviceFd = pProcfsAccess->ourDevicePid;
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_UNUSED);
+    pProcfsAccess->isRepeated.push_back(false);
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_IN_USE);
+    pProcfsAccess->isRepeated.push_back(true);
+    pProcfsAccess->mockNoKill = true;
+    pSysfsAccess->mockBindDeviceError = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    zes_reset_properties_t pProperties = {.stype = ZES_STRUCTURE_TYPE_RESET_PROPERTIES, .pNext = nullptr, .force = true, .resetType = ZES_RESET_TYPE_COLD};
+    ze_result_t result = zesDeviceResetExt(device, &pProperties);
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+}
+
+TEST_F(SysmanGlobalOperationsFixture, GivenDeviceInUseWhenCallingResetExtWithInvalidTypeThenFailureIsReturned) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.VfBarResourceAllocationWa.set(false);
+    initGlobalOps();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp = pMockGlobalOpsLinuxSysmanImp.get();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp->pDevice = pLinuxSysmanImp->getDeviceHandle();
+    zes_reset_properties_t pProperties = {.stype = ZES_STRUCTURE_TYPE_RESET_PROPERTIES, .pNext = nullptr, .force = true, .resetType = ZES_RESET_TYPE_FORCE_UINT32};
+    ze_result_t result = zesDeviceResetExt(device, &pProperties);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+}
+
+TEST_F(SysmanGlobalOperationsFixture, GivenGettingSysfsPathFailsWhenCallingResetExtThenFailureIsReturned) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.VfBarResourceAllocationWa.set(false);
+    initGlobalOps();
+    pSysfsAccess->mockDeviceUnbound = true;
+    zes_reset_properties_t pProperties = {.stype = ZES_STRUCTURE_TYPE_RESET_PROPERTIES, .pNext = nullptr, .force = true, .resetType = ZES_RESET_TYPE_FORCE_UINT32};
+    ze_result_t result = zesDeviceResetExt(device, &pProperties);
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+}
 
 TEST_F(SysmanGlobalOperationsFixture, GivenValidDeviceHandleWhenCallingzesGlobalOperationsGetPropertiesThenVerifyValidPropertiesAreReturned) {
 
@@ -214,7 +274,7 @@ TEST_F(SysmanGlobalOperationsFixture, GivenValidDeviceHandleWhenCallingzesGlobal
 
     zes_device_properties_t properties;
     const std::string expectedSerialNumber("0x3e8c9dfe1c2e4d5c");
-    const std::string expectedBoardNumber("0821VPTW910091000821VPTW91009100");
+    const std::string expectedBoardNumber("1280WTPV001900191280WTPV00190019");
     ze_result_t result = zesDeviceGetProperties(device, &properties);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -502,7 +562,8 @@ TEST_F(SysmanGlobalOperationsFixture, GivenValidDeviceHandleAndOpenSysCallFailsW
     auto pOriginalDrm = pLinuxSysmanImp->pDrm;
     pLinuxSysmanImp->pDrm = pDrmMock.get();
 
-    zes_device_properties_t properties;
+    zes_device_properties_t properties = {ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+    properties.pNext = nullptr;
     ze_result_t result = zesDeviceGetProperties(device, &properties);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -727,7 +788,7 @@ TEST_F(SysmanGlobalOperationsFixture, GivenDeviceIsWedgedWhenCallingGetDeviceSta
     pDrm->ioctlErrno = EIO;
     VariableBackup<NEO::Drm *> backup(&pLinuxSysmanImp->pDrm);
     pLinuxSysmanImp->pDrm = pDrm.get();
-    zes_device_state_t deviceState;
+    zes_device_state_t deviceState = {};
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceGetState(device, &deviceState));
     EXPECT_EQ(ZES_RESET_REASON_FLAG_WEDGED, deviceState.reset);
 }
@@ -737,7 +798,7 @@ TEST_F(SysmanGlobalOperationsFixture, GivenDeviceIsNotWedgedWhenCallingGetDevice
     auto pDrm = std::make_unique<DrmGlobalOpsMock>(*executionEnvironment->rootDeviceEnvironments[0]);
     VariableBackup<NEO::Drm *> backup(&pLinuxSysmanImp->pDrm);
     pLinuxSysmanImp->pDrm = pDrm.get();
-    zes_device_state_t deviceState;
+    zes_device_state_t deviceState = {};
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceGetState(device, &deviceState));
     EXPECT_EQ(0u, deviceState.reset);
 }
@@ -749,17 +810,35 @@ TEST_F(SysmanGlobalOperationsFixture, GivenGemCreateIoctlFailsWithEINVALWhenCall
     pDrm->ioctlErrno = EINVAL;
     VariableBackup<NEO::Drm *> backup(&pLinuxSysmanImp->pDrm);
     pLinuxSysmanImp->pDrm = pDrm.get();
-    zes_device_state_t deviceState;
+    zes_device_state_t deviceState = {};
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceGetState(device, &deviceState));
     EXPECT_EQ(0u, deviceState.reset);
 }
 
 TEST_F(SysmanGlobalOperationsFixture, GivenForceTrueWhenCallingResetThenSuccessIsReturned) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.VfBarResourceAllocationWa.set(false);
     initGlobalOps();
     static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp = pMockGlobalOpsLinuxSysmanImp.get();
     static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp->pDevice = pLinuxSysmanImp->getDeviceHandle();
     ze_result_t result = zesDeviceReset(device, true);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(SysmanGlobalOperationsFixture, GivenPermissionDeniedWhenCallingGetDeviceStateThenZeResultErrorInsufficientPermissionsIsReturned) {
+    pSysfsAccess->isRootSet = false;
+    ze_result_t result = zesDeviceReset(device, true);
+    EXPECT_EQ(ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS, result);
+}
+
+TEST_F(SysmanGlobalOperationsFixture, GivenDeviceInUseWhenCallingResetThenZeResultErrorHandleObjectInUseIsReturned) {
+
+    pProcfsAccess->ourDevicePid = pProcfsAccess->extraPid;
+    pProcfsAccess->ourDeviceFd = pProcfsAccess->extraFd;
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_IN_USE);
+    pProcfsAccess->isRepeated.push_back(true);
+    ze_result_t result = zesDeviceReset(device, false);
+    EXPECT_EQ(ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE, result);
 }
 
 TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenPermissionDeniedWhenCallingGetDeviceStateThenZeResultErrorInsufficientPermissionsIsReturned) {
@@ -778,11 +857,66 @@ TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenDeviceInUseWhenCallingReset
     EXPECT_EQ(ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE, result);
 }
 
+TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenDeviceInUseAndBindingFailsDuringResetWhenCallingResetThenErrorIsReturned) {
+
+    initGlobalOps();
+    pProcfsAccess->ourDevicePid = pProcfsAccess->pidList[0]; // make sure it isn't our process id
+    pProcfsAccess->ourDeviceFd = pProcfsAccess->extraFd;
+
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp = pMockGlobalOpsLinuxSysmanImp.get();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp->pDevice = pLinuxSysmanImp->getDeviceHandle();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->resetTimeout = 0; // timeout immediate
+
+    pMockGlobalOpsLinuxSysmanImp->ourDevicePid = pProcfsAccess->ourDevicePid;
+    pMockGlobalOpsLinuxSysmanImp->ourDeviceFd = pProcfsAccess->ourDevicePid;
+
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_UNUSED);
+    pProcfsAccess->isRepeated.push_back(false);
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_IN_USE);
+    pProcfsAccess->isRepeated.push_back(true);
+    pProcfsAccess->mockNoKill = true;
+    pSysfsAccess->mockBindDeviceError = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    ze_result_t result = zesDeviceReset(device, true);
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+}
+
+TEST_F(SysmanGlobalOperationsFixture, GivenDeviceInUseAndReInitFailsDuringResetWhenCallingResetThenErrorIsReturned) {
+
+    initGlobalOps();
+    pProcfsAccess->ourDevicePid = pProcfsAccess->pidList[0]; // make sure it isn't our process id
+    pProcfsAccess->ourDeviceFd = pProcfsAccess->extraFd;
+
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp = pMockGlobalOpsLinuxSysmanImp.get();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->pLinuxSysmanImp->pDevice = pLinuxSysmanImp->getDeviceHandle();
+    static_cast<PublicLinuxGlobalOperationsImp *>(pGlobalOperationsImp->pOsGlobalOperations)->resetTimeout = 0; // timeout immediate
+
+    pMockGlobalOpsLinuxSysmanImp->ourDevicePid = pProcfsAccess->ourDevicePid;
+    pMockGlobalOpsLinuxSysmanImp->ourDeviceFd = pProcfsAccess->ourDevicePid;
+    pMockGlobalOpsLinuxSysmanImp->setMockInitDeviceError(ZE_RESULT_ERROR_UNKNOWN);
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_UNUSED);
+    pProcfsAccess->isRepeated.push_back(false);
+    pProcfsAccess->mockListProcessCall.push_back(DEVICE_IN_USE);
+    pProcfsAccess->isRepeated.push_back(true);
+    pProcfsAccess->mockNoKill = true;
+    ze_result_t result = zesDeviceReset(device, true);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, result);
+}
+
 TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenDeviceNotInUseWhenCallingResetThenSuccessIsReturned) {
 
     // Pretend we have the device open
     pProcfsAccess->ourDevicePid = getpid();
-    pProcfsAccess->ourDeviceFd = ::open("/dev/null", 0);
+
+    constexpr auto deviceFd = 0xF00;
+    pProcfsAccess->ourDeviceFd = deviceFd;
+
+    static bool deviceFdWasClosed;
+    deviceFdWasClosed = false;
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fd) -> int {
+                                                                          if (fd == deviceFd) {
+                                                                              deviceFdWasClosed = true;
+                                                                          }
+                                                                          return 0; });
 
     // The first time we get the process list, include our own process, that has the file open
     // Reset should close the file (we verify after reset). On subsequent calls, return
@@ -794,9 +928,7 @@ TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenDeviceNotInUseWhenCallingRe
     ze_result_t result = zesDeviceReset(device, false);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     // Check that reset closed the device
-    // If the device is already closed, then close will fail with errno of EBADF
-    EXPECT_NE(0, ::close(pProcfsAccess->ourDevicePid));
-    EXPECT_EQ(errno, EBADF);
+    EXPECT_TRUE(deviceFdWasClosed);
 }
 
 TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenForceTrueAndDeviceInUseWhenCallingResetThenSuccessIsReturned) {
@@ -962,21 +1094,21 @@ TEST_F(SysmanGlobalOperationsIntegratedFixture, GivenProcessStartsMidResetWhenCa
 }
 
 TEST(SysmanGlobalOperationsTest, GivenValidDevicePciPathWhenPreparingDeviceEnvironmentThenPrepareDeviceEnvironmentReturnsTrue) {
-    auto device1 = std::unique_ptr<MockDevice>{MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get())};
+    MockExecutionEnvironment executionEnvironment;
     std::string pciPath1 = "0000:00:02.0";
-    EXPECT_TRUE(DeviceFactory::prepareDeviceEnvironment(*device1->getExecutionEnvironment(), pciPath1, 0u));
+    EXPECT_TRUE(DeviceFactory::prepareDeviceEnvironment(executionEnvironment, pciPath1, 0u));
 }
 
 TEST(SysmanGlobalOperationsTest, GivenValidDevicePciPathWhoseFileDescriptorOpenFailedThenPrepareDeviceEnvironmentReturnsFalse) {
-    auto device2 = std::unique_ptr<MockDevice>{MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get())};
+    MockExecutionEnvironment executionEnvironment;
     std::string pciPath2 = "0000:00:03.0";
-    EXPECT_FALSE(DeviceFactory::prepareDeviceEnvironment(*device2->getExecutionEnvironment(), pciPath2, 0u));
+    EXPECT_FALSE(DeviceFactory::prepareDeviceEnvironment(executionEnvironment, pciPath2, 0u));
 }
 
 TEST(SysmanGlobalOperationsTest, GivenNotExisitingPciPathWhenPrepareDeviceEnvironmentIsCalledThenFalseIsReturned) {
-    auto device3 = std::unique_ptr<MockDevice>{MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get())};
+    MockExecutionEnvironment executionEnvironment;
     std::string pciPath3 = "0000:00:04.0";
-    EXPECT_FALSE(DeviceFactory::prepareDeviceEnvironment(*device3->getExecutionEnvironment(), pciPath3, 0u));
+    EXPECT_FALSE(DeviceFactory::prepareDeviceEnvironment(executionEnvironment, pciPath3, 0u));
 }
 
 TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleWhenCallingDeviceGetStateThenSuccessResultIsReturned) {
@@ -984,7 +1116,7 @@ TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleWhenCallingDeviceGetStateThenS
     auto pDrm = std::make_unique<DrmGlobalOpsMock>(*executionEnvironment->rootDeviceEnvironments[0]);
     VariableBackup<NEO::Drm *> backup(&pLinuxSysmanImp->pDrm);
     pLinuxSysmanImp->pDrm = pDrm.get();
-    zes_device_state_t deviceState;
+    zes_device_state_t deviceState = {};
     ze_result_t result = zesDeviceGetState(device, &deviceState);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }

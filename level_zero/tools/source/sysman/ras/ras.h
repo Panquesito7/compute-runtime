@@ -1,13 +1,14 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
 #include "level_zero/api/sysman/zes_handles_struct.h"
-#include "level_zero/core/source/device/device.h"
 #include <level_zero/zes_api.h>
 
 #include <mutex>
@@ -19,10 +20,17 @@ struct OsSysman;
 
 class Ras : _zes_ras_handle_t {
   public:
+    virtual ~Ras() = default;
     virtual ze_result_t rasGetProperties(zes_ras_properties_t *pProperties) = 0;
     virtual ze_result_t rasGetConfig(zes_ras_config_t *pConfig) = 0;
     virtual ze_result_t rasSetConfig(const zes_ras_config_t *pConfig) = 0;
     virtual ze_result_t rasGetState(zes_ras_state_t *pState, ze_bool_t clear) = 0;
+    virtual ze_result_t rasGetStateExp(uint32_t *pCount, zes_ras_state_exp_t *pState) = 0;
+    virtual ze_result_t rasGetStateExp2(const uint32_t categoryCount, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) = 0;
+    virtual ze_result_t rasClearStateExp(zes_ras_error_category_exp_t category) = 0;
+    virtual ze_result_t rasGetSupportedCategoriesExp(uint32_t *pCount, zes_ras_error_category_exp_t *pCategories) = 0;
+    virtual ze_result_t rasGetConfigExp(const uint32_t count, zes_ras_config_exp_t *pConfig) = 0;
+    virtual ze_result_t rasSetConfigExp(const uint32_t count, const zes_ras_config_exp_t *pConfig) = 0;
 
     static Ras *fromHandle(zes_ras_handle_t handle) {
         return static_cast<Ras *>(handle);
@@ -33,7 +41,7 @@ class Ras : _zes_ras_handle_t {
 };
 
 struct RasHandleContext {
-    RasHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    RasHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     MOCKABLE_VIRTUAL ~RasHandleContext();
 
     MOCKABLE_VIRTUAL void init(std::vector<ze_device_handle_t> &deviceHandles);

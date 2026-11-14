@@ -1,0 +1,132 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/helpers/definitions/command_encoder_args.h"
+#include "shared/source/helpers/definitions/engine_group_types.h"
+
+#include "level_zero/core/source/mutable_cmdlist/mcl_types.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_indirect_data.h"
+
+#include <functional>
+#include <memory>
+
+namespace NEO {
+class Device;
+struct KernelDescriptor;
+struct RootDeviceEnvironment;
+} // namespace NEO
+namespace L0::MCL {
+struct KernelDispatch;
+struct MutableComputeWalker;
+struct MutableKernelDispatchParameters;
+struct Variable;
+
+struct VariableDispatch {
+    VariableDispatch(KernelDispatch *kernelDispatch,
+                     std::unique_ptr<MutableIndirectData> mutableIndirectData, MutableComputeWalker *mutableCommandWalker,
+                     Variable *groupSizeVariable, Variable *groupCountVariable, Variable *globalOffsetVariable, Variable *lastSlmArgumentVariable, const std::vector<Variable *> *buffersVariables,
+                     uint32_t grfSize, const MutableKernelDispatchParameters &dispatchParams, uint32_t partitionCount,
+                     NEO::EngineGroupType cmdListEngineType);
+
+    void setGroupSize(const MaxChannelsCArray groupSize, NEO::Device &device, bool stageData);
+    void setGroupCount(const MaxChannelsCArray, const NEO::Device &device, bool stageData);
+    void setGlobalOffset(const MaxChannelsCArray);
+    void setSlmSize(const uint32_t slmArgTotalSize, NEO::Device &device, bool stageData);
+    bool updateAllocationsCount(int32_t systemMemoryAllocationsDelta, int32_t importedAllocationsDelta);
+
+    void commitChanges(const NEO::Device &device);
+
+    Variable *getGroupSizeVar() const;
+    Variable *getGroupCountVar() const;
+    Variable *getGlobalOffsetVar() const;
+    Variable *getLastSlmArgumentVariable() const;
+    const MutableIndirectData::Offsets &getIndirectDataOffsets() const;
+
+    MutableIndirectData *getIndirectData() const {
+        return indirectData.get();
+    }
+
+    bool isCooperativeDispatch() const {
+        return isCooperative;
+    }
+
+    uint32_t getTotalGroupCount() const {
+        return threadGroupCount;
+    }
+
+    uint32_t getMaxCooperativeGroupCount() const {
+        return maxCooperativeGroupCount;
+    }
+
+  protected:
+    void setGws();
+    void setWorkDim();
+
+    bool requiresLocalIdGeneration(size_t localWorkSize, uint32_t &outWalkOrder, const NEO::RootDeviceEnvironment &rootDeviceEnvironment);
+    void generateLocalIds(size_t localWorkSize, const NEO::RootDeviceEnvironment &rootDeviceEnvironment);
+
+    bool doCommitVariableDispatch() {
+        return commitGroupCount || commitGroupSize || commitSlmSize || commitL3FlushAfterWalker;
+    }
+
+    void cleanCommitVariableDispatch() {
+        commitGroupCount = false;
+        commitGroupSize = false;
+        commitSlmSize = false;
+        commitL3FlushAfterWalker = false;
+    }
+
+    MaxChannelsArray groupSize = {1, 1, 1};
+    MaxChannelsArray groupCount = {1, 1, 1};
+    MaxChannelsArray globalOffset = {0, 0, 0};
+
+    std::unique_ptr<uint8_t, std::function<void(void *)>> perThreadData;
+
+    KernelDispatch *kernelDispatch;
+    std::unique_ptr<MutableIndirectData> indirectData;
+    MutableComputeWalker *mutableCommandWalker;
+    Variable *groupSizeVar = nullptr;
+    Variable *groupCountVar = nullptr;
+    Variable *globalOffsetVar = nullptr;
+    Variable *lastSlmArgumentVar = nullptr;
+
+    size_t perThreadDataAllocSize = 0U;
+    size_t perThreadDataSize = 0U;
+    size_t totalLwsSize = 1u;
+    size_t syncBufferOffset = undefined<size_t>;
+
+    const uint32_t grfSize;
+    const uint32_t numChannels;
+    uint32_t walkOrder = 0U;
+    uint32_t numThreadsPerThreadGroup;
+    uint32_t threadExecutionMask;
+    uint32_t threadGroupCount = 1;
+    uint32_t maxCooperativeGroupCount = 0;
+    uint32_t slmTotalSizePerThreadGroup = 0;
+    uint32_t alignedSlmSize = 0;
+    uint32_t systemMemoryAllocsCount = 0u;
+    uint32_t importedAllocationsCount = 0u;
+    uint32_t commitedSystemMemoryAllocsCount = 0u;
+    uint32_t commitedImportedAllocationsCount = 0u;
+
+    NEO::RequiredPartitionDim requiredPartitionDim = NEO::RequiredPartitionDim::none;
+    NEO::RequiredDispatchWalkOrder requiredDispatchWalkOrder = NEO::RequiredDispatchWalkOrder::none;
+
+    const uint32_t partitionCount = 1;
+    const NEO::EngineGroupType cmdListEngineType;
+
+    bool commitGroupCount = false;
+    bool commitGroupSize = false;
+    bool commitSlmSize = false;
+    bool commitL3FlushAfterWalker = false;
+    bool localIdGenerationByRuntime = false;
+    bool isCooperative = false;
+    bool isSlmKernel = false;
+};
+
+} // namespace L0::MCL

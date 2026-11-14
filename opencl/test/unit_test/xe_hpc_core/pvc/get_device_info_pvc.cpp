@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,9 +13,6 @@
 #include "opencl/test/unit_test/fixtures/device_info_fixture.h"
 
 using namespace NEO;
-
-HWTEST_EXCLUDE_PRODUCT(GetDeviceInfoMemCapabilitiesTest, GivenValidParametersWhenGetDeviceInfoIsCalledForXE_HP_COREThenClSuccessIsReturned, IGFX_XE_HPC_CORE);
-HWTEST_EXCLUDE_PRODUCT(GetDeviceInfoMemCapabilitiesTest, GivenEnableUsmConcurrentAccessSupportWhenGetDeviceInfoIsCalledForXE_HP_COREThenClSuccessIsReturned, IGFX_XE_HPC_CORE);
 
 PVCTEST_F(GetDeviceInfoMemCapabilitiesTest, GivenValidParametersWhenGetDeviceInfoIsCalledForPVCThenClSuccessIsReturned) {
     std::vector<TestParams> params = {
@@ -34,7 +31,8 @@ PVCTEST_F(GetDeviceInfoMemCapabilitiesTest, GivenValidParametersWhenGetDeviceInf
 
 PVCTEST_F(GetDeviceInfoMemCapabilitiesTest, GivenEnableUsmConcurrentAccessSupportWhenGetDeviceInfoIsCalledForPVCThenClSuccessIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableUsmConcurrentAccessSupport.set(0b1110);
+    debugManager.flags.EnableUsmConcurrentAccessSupport.set(0b1110);
+    debugManager.flags.UseKmdMigration.set(true);
 
     std::vector<TestParams> params = {
         {CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL, CL_UNIFIED_SHARED_MEMORY_ACCESS_INTEL},

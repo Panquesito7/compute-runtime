@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 #include "opencl/source/event/event.h"
 #include "opencl/test/unit_test/command_queue/buffer_operations_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 
 #include "gtest/gtest.h"
 
@@ -103,8 +104,8 @@ TEST_F(EnqueueWriteBufferTypeTest, WhenWritingBufferThenReturnedEventShouldBeMax
 
 TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndForcedCpuCopyOnWriteBufferAndDstPtrEqualSrcPtrWithEventsNotBlockedWhenWriteBufferIsExecutedThenTaskLevelShouldNotBeIncreased) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::Default));
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::defaultMode));
     cl_int retVal = CL_SUCCESS;
     uint32_t taskLevelCmdQ = 17;
     pCmdQ->taskLevel = taskLevelCmdQ;
@@ -146,7 +147,7 @@ TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndForcedCpuCopyOnWriteBuffe
 
 TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndForcedCpuCopyOnWriteBufferAndEventNotReadyWhenWriteBufferIsExecutedThenTaskLevelShouldBeIncreased) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
     cl_int retVal = CL_SUCCESS;
     uint32_t taskLevelCmdQ = 17;
     pCmdQ->taskLevel = taskLevelCmdQ;
@@ -186,7 +187,7 @@ TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndForcedCpuCopyOnWriteBuffe
 
 TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndForcedCpuCopyOnWriteBufferAndDstPtrEqualSrcPtrWhenWriteBufferIsExecutedThenTaskLevelShouldNotBeIncreased) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
     cl_int retVal = CL_SUCCESS;
     uint32_t taskLevelCmdQ = 17;
     pCmdQ->taskLevel = taskLevelCmdQ;
@@ -218,8 +219,8 @@ TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndForcedCpuCopyOnWriteBuffe
 
 TEST_F(EnqueueWriteBufferTypeTest, givenOutOfOrderQueueAndForcedCpuCopyOnWriteBufferAndDstPtrEqualSrcPtrWithEventsWhenWriteBufferIsExecutedThenTaskLevelShouldNotBeIncreased) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::Default));
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(1);
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::defaultMode));
     std::unique_ptr<CommandQueue> pCmdOOQ(createCommandQueue(pClDevice, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE));
     cl_int retVal = CL_SUCCESS;
     uint32_t taskLevelCmdQ = 17;
@@ -261,7 +262,7 @@ TEST_F(EnqueueWriteBufferTypeTest, givenOutOfOrderQueueAndForcedCpuCopyOnWriteBu
 }
 TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndDisabledSupportCpuCopiesAndDstPtrEqualSrcPtrWithEventsWhenWriteBufferIsExecutedThenTaskLevelShouldNotBeIncreased) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(0);
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(0);
     cl_int retVal = CL_SUCCESS;
     uint32_t taskLevelCmdQ = 17;
     pCmdQ->taskLevel = taskLevelCmdQ;
@@ -302,7 +303,7 @@ TEST_F(EnqueueWriteBufferTypeTest, givenInOrderQueueAndDisabledSupportCpuCopiesA
 }
 TEST_F(EnqueueWriteBufferTypeTest, givenOutOfOrderQueueAndDisabledSupportCpuCopiesAndDstPtrEqualSrcPtrWithEventsWhenWriteBufferIsExecutedThenTaskLevelShouldNotBeIncreased) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.DoCpuCopyOnWriteBuffer.set(0);
+    debugManager.flags.DoCpuCopyOnWriteBuffer.set(0);
     std::unique_ptr<CommandQueue> pCmdOOQ(createCommandQueue(pClDevice, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE));
     cl_int retVal = CL_SUCCESS;
     uint32_t taskLevelCmdQ = 17;
@@ -338,9 +339,15 @@ TEST_F(EnqueueWriteBufferTypeTest, givenOutOfOrderQueueAndDisabledSupportCpuCopi
     ASSERT_NE(nullptr, event);
 
     auto pEvent = castToObject<Event>(event);
-    if (pCmdOOQ->getGpgpuCommandStreamReceiver().peekTimestampPacketWriteEnabled()) {
-        EXPECT_EQ(taskLevelEvent2 + 1, pCmdOOQ->taskLevel);
-        EXPECT_EQ(taskLevelEvent2 + 1, pEvent->taskLevel);
+    auto &csr = pCmdOOQ->getGpgpuCommandStreamReceiver();
+
+    if (csr.peekTimestampPacketWriteEnabled()) {
+
+        if (!csr.isUpdateTagFromWaitEnabled()) {
+            taskLevelEvent2++;
+        }
+        EXPECT_EQ(taskLevelEvent2, pCmdOOQ->taskLevel);
+        EXPECT_EQ(taskLevelEvent2, pEvent->taskLevel);
     } else {
         EXPECT_EQ(19u, pCmdOOQ->taskLevel);
         EXPECT_EQ(19u, pEvent->taskLevel);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 
 #include "shared/source/compiler_interface/tokenized_string.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 
 #include <cstring>
 
@@ -38,16 +39,16 @@ std::string wrapInQuotes(const std::string &stringToWrap) {
     return std::string{quoteEscape + stringToWrap + quoteEscape};
 }
 
-TokenizedString tokenize(ConstStringRef src, char sperator) {
+TokenizedString tokenize(ConstStringRef src, char separator) {
     TokenizedString ret;
     const char *it = src.begin();
     while (it < src.end()) {
         const char *beg = it;
-        while ((beg < src.end()) && (*beg == sperator)) {
+        while ((beg < src.end()) && (*beg == separator)) {
             ++beg;
         }
         const char *end = beg;
-        while ((end < src.end()) && (*end != sperator)) {
+        while ((end < src.end()) && (*end != separator)) {
             ++end;
         }
         it = end;
@@ -60,12 +61,12 @@ TokenizedString tokenize(ConstStringRef src, char sperator) {
 
 void applyAdditionalInternalOptions(std::string &internalOptions) {
     size_t pos;
-    if (DebugManager.flags.ForceLargeGrfCompilationMode.get()) {
+    if (debugManager.flags.ForceLargeGrfCompilationMode.get()) {
         pos = internalOptions.find(CompilerOptions::largeGrf.data());
         if (pos == std::string::npos) {
             CompilerOptions::concatenateAppend(internalOptions, CompilerOptions::largeGrf);
         }
-    } else if (DebugManager.flags.ForceDefaultGrfCompilationMode.get()) {
+    } else if (debugManager.flags.ForceDefaultGrfCompilationMode.get()) {
         pos = internalOptions.find(CompilerOptions::defaultGrf.data());
         if (pos == std::string::npos) {
             CompilerOptions::concatenateAppend(internalOptions, CompilerOptions::defaultGrf.data());
@@ -79,7 +80,7 @@ void applyAdditionalInternalOptions(std::string &internalOptions) {
 
 void applyAdditionalApiOptions(std::string &apiOptions) {
     size_t pos;
-    if (DebugManager.flags.ForceAutoGrfCompilationMode.get() == 1) {
+    if (debugManager.flags.ForceAutoGrfCompilationMode.get() == 1) {
         pos = apiOptions.find(CompilerOptions::autoGrf.data());
         if (pos == std::string::npos) {
             CompilerOptions::concatenateAppend(apiOptions, CompilerOptions::autoGrf);
@@ -88,6 +89,16 @@ void applyAdditionalApiOptions(std::string &apiOptions) {
         if (pos != std::string::npos) {
             apiOptions.erase(pos, CompilerOptions::largeGrf.size());
         }
+    }
+}
+
+void applyExtraInternalOptions(std::string &internalOptions, const HardwareInfo &hwInfo, const CompilerProductHelper &compilerProductHelper, HeaplessMode heaplessMode) {
+
+    bool enableE64 = heaplessMode == HeaplessMode::enabled;
+    enableE64 |= (heaplessMode == HeaplessMode::defaultMode) && compilerProductHelper.isHeaplessModeEnabled(hwInfo);
+
+    if (enableE64) {
+        CompilerOptions::concatenateAppend(internalOptions, enable64bitAddressing);
     }
 }
 

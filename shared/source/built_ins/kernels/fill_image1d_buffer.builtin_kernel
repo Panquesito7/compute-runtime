@@ -1,0 +1,16 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+__kernel void FillImage1dBuffer(
+    __write_only image1d_buffer_t output,
+    uint4 color,
+    int4 dstOffset) {
+    const int x = get_global_id(0);
+
+    const int dstCoord = x + dstOffset.x;
+    write_imageui(output, dstCoord, color);
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,17 +7,20 @@
 
 #include "level_zero/tools/source/sysman/power/power.h"
 
-#include "shared/source/helpers/basic_math.h"
-
 #include "level_zero/tools/source/sysman/os_sysman.h"
 #include "level_zero/tools/source/sysman/power/power_imp.h"
 
 namespace L0 {
 
-PowerHandleContext::~PowerHandleContext() {
+void PowerHandleContext::releasePowerHandles() {
     for (Power *pPower : handleList) {
         delete pPower;
     }
+    handleList.clear();
+}
+
+PowerHandleContext::~PowerHandleContext() {
+    releasePowerHandles();
 }
 
 void PowerHandleContext::createHandle(ze_device_handle_t deviceHandle) {
@@ -43,6 +46,7 @@ ze_result_t PowerHandleContext::init(std::vector<ze_device_handle_t> &deviceHand
 void PowerHandleContext::initPower() {
     std::call_once(initPowerOnce, [this]() {
         this->init(pOsSysman->getDeviceHandles(), pOsSysman->getCoreDeviceHandle());
+        this->powerInitDone = true;
     });
 }
 

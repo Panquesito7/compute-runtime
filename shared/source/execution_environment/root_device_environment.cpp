@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 #include "shared/source/aub/aub_center.h"
 #include "shared/source/built_ins/built_ins.h"
 #include "shared/source/built_ins/sip.h"
+#include "shared/source/command_stream/front_end_controller.h"
 #include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/source/compiler_interface/default_cache_config.h"
 #include "shared/source/debugger/debugger.h"
@@ -26,6 +27,7 @@
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/host_function/host_function_scheduler.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/memory_manager.h"
@@ -33,44 +35,52 @@
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/os_time.h"
 #include "shared/source/os_interface/product_helper.h"
-#include "shared/source/release_helper/release_helper.h"
+#include "shared/source/program/print_formatter.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/source/sip_external_lib/sip_external_lib.h"
 #include "shared/source/utilities/software_tags_manager.h"
+#include "shared/source/utilities/wait_util.h"
 
 namespace NEO {
 
-RootDeviceEnvironment::RootDeviceEnvironment(ExecutionEnvironment &executionEnvironment) : executionEnvironment(executionEnvironment) {
+RootDeviceEnvironment::RootDeviceEnvironment(ExecutionEnvironment &executionEnvironment, uint32_t index) : executionEnvironment(executionEnvironment), index(index) {
     hwInfo = std::make_unique<HardwareInfo>();
 
-    if (DebugManager.flags.EnableSWTags.get()) {
+    if (debugManager.flags.EnableSWTags.get()) {
         tagsManager = std::make_unique<SWTagsManager>();
     }
 }
 
 RootDeviceEnvironment::~RootDeviceEnvironment() = default;
 
+uint32_t RootDeviceEnvironment::getRootDeviceIndex() const {
+    return this->index;
+}
+
 void RootDeviceEnvironment::initAubCenter(bool localMemoryEnabled, const std::string &aubFileName, CommandStreamReceiverType csrType) {
     if (!aubCenter) {
         UNRECOVERABLE_IF(!getGmmHelper());
         aubCenter.reset(new AubCenter(*this, localMemoryEnabled, aubFileName, csrType));
     }
-}
-
-void RootDeviceEnvironment::initDebugger() {
-    debugger = Debugger::create(*this);
+    if (debugManager.flags.UseAubStream.get() && aubCenter->getAubManager() == nullptr) {
+        printToStderr("ERROR: Simulation mode detected but Aubstream is not available.\n");
+        UNRECOVERABLE_IF(true);
+    }
 }
 
 void RootDeviceEnvironment::initDebuggerL0(Device *neoDevice) {
-    if (this->debugger.get() != nullptr) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "%s", "Source Level Debugger cannot be used with Environment Variable enabling program debugging.\n");
-        UNRECOVERABLE_IF(this->debugger.get() != nullptr);
-    }
+
+    DEBUG_BREAK_IF(this->debugger.get() != nullptr);
 
     this->getMutableHardwareInfo()->capabilityTable.fusedEuEnabled = false;
     this->getMutableHardwareInfo()->capabilityTable.ftrRenderCompressedBuffers = false;
     this->getMutableHardwareInfo()->capabilityTable.ftrRenderCompressedImages = false;
 
     this->debugger = DebuggerL0::create(neoDevice);
+}
+
+void RootDeviceEnvironment::initWaitUtils() {
+    WaitUtils::init(WaitUtils::WaitpkgUse::tpause, *hwInfo);
 }
 
 const HardwareInfo *RootDeviceEnvironment::getHardwareInfo() const {
@@ -82,8 +92,15 @@ HardwareInfo *RootDeviceEnvironment::getMutableHardwareInfo() const {
 }
 
 void RootDeviceEnvironment::setHwInfoAndInitHelpers(const HardwareInfo *hwInfo) {
-    *this->hwInfo = *hwInfo;
+    setHwInfo(hwInfo);
     initHelpers();
+}
+
+void RootDeviceEnvironment::setHwInfo(const HardwareInfo *hwInfo) {
+    *this->hwInfo = *hwInfo;
+    if (debugManager.flags.DisableSupportForL0Debugger.get() == 1) {
+        this->hwInfo->capabilityTable.l0DebuggerSupported = false;
+    }
 }
 
 bool RootDeviceEnvironment::isFullRangeSvm() const {
@@ -104,10 +121,8 @@ void RootDeviceEnvironment::prepareForCleanup() const {
 }
 
 bool RootDeviceEnvironment::initAilConfiguration() {
-    auto ailConfiguration = AILConfiguration::get(hwInfo->platform.eProductFamily);
-
     if (ailConfiguration == nullptr) {
-        return true;
+        return (false == debugManager.flags.EnableAIL.get());
     }
 
     auto result = ailConfiguration->initProcessExecutableName();
@@ -115,7 +130,7 @@ bool RootDeviceEnvironment::initAilConfiguration() {
         return false;
     }
 
-    ailConfiguration->apply(hwInfo->capabilityTable);
+    ailConfiguration->apply(*hwInfo);
 
     return true;
 }
@@ -129,6 +144,7 @@ void RootDeviceEnvironment::initGmm() {
 void RootDeviceEnvironment::initOsTime() {
     if (!osTime) {
         osTime = OSTime::create(osInterface.get());
+        osTime->setDeviceTimerResolution();
     }
 }
 
@@ -140,8 +156,19 @@ const ProductHelper &RootDeviceEnvironment::getProductHelper() const {
     return *productHelper;
 }
 
-void RootDeviceEnvironment::createBindlessHeapsHelper(MemoryManager *memoryManager, bool availableDevices, uint32_t rootDeviceIndex, DeviceBitfield deviceBitfield) {
-    bindlessHeapsHelper = std::make_unique<BindlessHeapsHelper>(memoryManager, availableDevices, rootDeviceIndex, deviceBitfield);
+void RootDeviceEnvironment::createBindlessHeapsHelper(Device *rootDevice, bool availableDevices) {
+    bindlessHeapsHelper = std::make_unique<BindlessHeapsHelper>(rootDevice, availableDevices);
+}
+
+FrontEndController *RootDeviceEnvironment::getFrontEndController() const {
+    return frontEndController.get();
+}
+
+void RootDeviceEnvironment::createFrontEndController(Device *rootDevice) {
+    frontEndController = std::make_unique<FrontEndController>(rootDevice);
+    if (!frontEndController->initialize()) {
+        frontEndController.reset();
+    }
 }
 
 CompilerInterface *RootDeviceEnvironment::getCompilerInterface() {
@@ -149,18 +176,44 @@ CompilerInterface *RootDeviceEnvironment::getCompilerInterface() {
         std::lock_guard<std::mutex> autolock(this->mtx);
         if (this->compilerInterface.get() == nullptr) {
             auto cache = std::make_unique<CompilerCache>(getDefaultCompilerCacheConfig());
-            this->compilerInterface.reset(CompilerInterface::createInstance(std::move(cache), ApiSpecificConfig::getApiType() == ApiSpecificConfig::ApiType::OCL));
+            this->compilerInterface.reset(CompilerInterface::createInstance(std::move(cache), true));
         }
     }
     return this->compilerInterface.get();
 }
 
+SipExternalLib *RootDeviceEnvironment::getSipExternalLibInterface() {
+    if (sipExternalLib.get() == nullptr) {
+        if (SipKernel::isExternalLibRequired(*gfxCoreHelper)) {
+            std::lock_guard<std::mutex> autolock(this->mtx);
+            sipExternalLib.reset(SipExternalLib::getSipExternalLibInstance());
+        }
+    }
+    return sipExternalLib.get();
+}
+
 void RootDeviceEnvironment::initHelpers() {
     initProductHelper();
     initGfxCoreHelper();
+    initializeGfxCoreHelperFromProductHelper(true);
+    initializeGfxCoreHelperFromHwInfo();
     initApiGfxCoreHelper();
     initCompilerProductHelper();
     initReleaseHelper();
+    initAilConfigurationHelper();
+    initWaitUtils();
+}
+
+void RootDeviceEnvironment::initializeGfxCoreHelperFromHwInfo() {
+    if (gfxCoreHelper != nullptr) {
+        gfxCoreHelper->initializeDefaultHpCopyEngine(*this->getHardwareInfo());
+    }
+}
+
+void RootDeviceEnvironment::initializeGfxCoreHelperFromProductHelper(bool hwQueuesSupported) {
+    if (this->productHelper) {
+        gfxCoreHelper->initializeFromProductHelper(*this->productHelper.get(), hwQueuesSupported);
+    }
 }
 
 void RootDeviceEnvironment::initGfxCoreHelper() {
@@ -186,8 +239,19 @@ void RootDeviceEnvironment::initReleaseHelper() {
     }
 }
 
-ReleaseHelper *RootDeviceEnvironment::getReleaseHelper() const {
-    return releaseHelper.get();
+void RootDeviceEnvironment::initAilConfigurationHelper() {
+    if (ailConfiguration == nullptr && debugManager.flags.EnableAIL.get()) {
+        ailConfiguration = AILConfiguration::create(this->getHardwareInfo()->platform.eProductFamily);
+    }
+}
+
+const ReleaseHelper &RootDeviceEnvironment::getReleaseHelper() const {
+    UNRECOVERABLE_IF(releaseHelper == nullptr);
+    return *releaseHelper;
+}
+
+AILConfiguration *RootDeviceEnvironment::getAILConfigurationHelper() const {
+    return ailConfiguration.get();
 }
 
 BuiltIns *RootDeviceEnvironment::getBuiltIns() {
@@ -200,10 +264,23 @@ BuiltIns *RootDeviceEnvironment::getBuiltIns() {
     return this->builtins.get();
 }
 
-void RootDeviceEnvironment::limitNumberOfCcs(uint32_t numberOfCcs) {
+bool RootDeviceEnvironment::setNumberOfCcs(uint32_t numberOfCcs) {
+    if (numberOfCcs == 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error: Invalid number of CCS - %u\n", numberOfCcs);
+        return false;
+    }
 
     hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled = std::min(hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled, numberOfCcs);
     limitedNumberOfCcs = true;
+    if (aubCenter) {
+        aubCenter->getAubManager()->setCCSMode(hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled);
+    }
+
+    return true;
+}
+
+uint32_t RootDeviceEnvironment::getNumberOfCcs() const {
+    return hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled;
 }
 
 bool RootDeviceEnvironment::isNumberOfCcsLimited() const {
@@ -222,19 +299,24 @@ void RootDeviceEnvironment::initDummyAllocation() {
 }
 
 void RootDeviceEnvironment::setDummyBlitProperties(uint32_t rootDeviceIndex) {
-    size_t size = 4 * 4096u;
-    this->dummyBlitProperties = std::make_unique<AllocationProperties>(
-        rootDeviceIndex,
-        true,
-        size,
-        NEO::AllocationType::BUFFER,
-        false,
-        false,
-        systemMemoryBitfield);
+    size_t size = 32 * MemoryConstants::kiloByte;
+    this->dummyBlitProperties = std::make_unique<AllocationProperties>(rootDeviceIndex, size, NEO::AllocationType::buffer, systemMemoryBitfield);
 }
 
 GraphicsAllocation *RootDeviceEnvironment::getDummyAllocation() const {
     return dummyAllocation.get();
+}
+
+void RootDeviceEnvironment::releaseDummyAllocation() {
+    dummyAllocation.reset();
+}
+
+HostFunctionWorker *RootDeviceEnvironment::getOrCreateHostFunctionScheduler(int32_t threadsInThreadPoolLimit) {
+    std::lock_guard<std::mutex> autolock(this->mtx);
+    if (this->hostFunctionScheduler == nullptr) {
+        this->hostFunctionScheduler = std::make_unique<HostFunctionScheduler>(threadsInThreadPoolLimit);
+    }
+    return this->hostFunctionScheduler.get();
 }
 
 AssertHandler *RootDeviceEnvironment::getAssertHandler(Device *neoDevice) {

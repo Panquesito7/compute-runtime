@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/gen_common/reg_configs_common.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/libult/gen12lp/special_ult_helper_gen12lp.h"
 #include "shared/test/common/mocks/mock_csr.h"
@@ -21,7 +22,6 @@
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
 #include "gtest/gtest.h"
-#include "reg_configs_common.h"
 
 using namespace NEO;
 
@@ -29,17 +29,16 @@ using namespace NEO;
 
 using CommandStreamReceiverHwTestGen12lp = CommandStreamReceiverHwTest<Gen12LpFamily>;
 
-GEN12LPTEST_F(CommandStreamReceiverHwTestGen12lp, givenPreambleSentWhenL3ConfigRequestChangedThenDontProgramL3Register) {
+GEN12LPTEST_F(CommandStreamReceiverHwTestGen12lp, givenPreambleSentWhenEnqueueingKernelThenDontProgramL3Register) {
     size_t gws = 1;
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     CommandQueueHw<FamilyType> commandQueue(&ctx, pClDevice, 0, false);
     auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     pDevice->resetCommandStreamReceiver(commandStreamReceiver);
     auto &commandStreamCSR = commandStreamReceiver->getCS();
 
     commandStreamReceiver->isPreambleSent = true;
-    commandStreamReceiver->lastSentL3Config = 0;
 
     commandQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
 
@@ -78,7 +77,7 @@ using UltCommandStreamReceiverTestGen12Lp = UltCommandStreamReceiverTest;
 GEN12LPTEST_F(UltCommandStreamReceiverTestGen12Lp, givenDebugEnablingCacheFlushWhenAddingPipeControlWithoutCacheFlushThenOverrideRequestAndEnableCacheFlushFlags) {
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.FlushAllCaches.set(true);
+    debugManager.flags.FlushAllCaches.set(true);
 
     char buff[sizeof(PIPE_CONTROL) * 3];
     LinearStream stream(buff, sizeof(PIPE_CONTROL) * 3);
@@ -103,7 +102,7 @@ GEN12LPTEST_F(UltCommandStreamReceiverTestGen12Lp, givenDebugEnablingCacheFlushW
 GEN12LPTEST_F(UltCommandStreamReceiverTestGen12Lp, givenDebugDisablingCacheFlushWhenAddingPipeControlWithCacheFlushThenOverrideRequestAndDisableCacheFlushFlags) {
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.DoNotFlushCaches.set(true);
+    debugManager.flags.DoNotFlushCaches.set(true);
 
     char buff[sizeof(PIPE_CONTROL) * 3];
     LinearStream stream(buff, sizeof(PIPE_CONTROL) * 3);

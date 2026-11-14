@@ -1,0 +1,15 @@
+#
+# Copyright (C) 2025-2026 Intel Corporation
+#
+# SPDX-License-Identifier: MIT
+#
+
+if(SUPPORT_XE3P_CORE)
+  set(NEO_CORE_HELPERS
+      ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+      ${CMAKE_CURRENT_SOURCE_DIR}/compiler_product_helper_xe3p.inl
+  )
+
+  set_property(GLOBAL APPEND PROPERTY NEO_CORE_HELPERS ${NEO_CORE_HELPERS})
+  add_subdirectories()
+endif()

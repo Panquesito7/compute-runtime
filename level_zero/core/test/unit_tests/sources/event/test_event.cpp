@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,46 +8,73 @@
 #include "shared/source/built_ins/sip.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/memory_manager/gfx_partition.h"
+#include "shared/source/memory_manager/internal_allocation_storage.h"
+#include "shared/source/os_interface/os_interface.h"
+#include "shared/source/utilities/buffer_pool_allocator.inl"
+#include "shared/source/utilities/wait_util.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/engine_descriptor_helper.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/helpers/variable_backup.h"
-#include "shared/test/common/mocks/mock_compilers.h"
+#include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/mocks/mock_csr.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_driver_model.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
 #include "shared/test/common/mocks/mock_memory_operations_handler.h"
+#include "shared/test/common/mocks/mock_os_context.h"
 #include "shared/test/common/mocks/mock_ostime.h"
+#include "shared/test/common/mocks/mock_timestamp_container.h"
 #include "shared/test/common/mocks/mock_timestamp_packet.h"
+#include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "level_zero/core/source/context/context_imp.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/api/internal/l0_event.h"
+#include "level_zero/core/source/cmdlist/cmdlist_memory_copy_params.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/source/event/event.h"
+#include "level_zero/core/source/event/event_host_synchronize_wait.h"
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/core/test/unit_tests/fixtures/event_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_built_ins.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_device.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_driver_handle.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_event.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_module.h"
 #include "level_zero/core/test/unit_tests/sources/helper/ze_object_utils.h"
+#include "level_zero/driver_experimental/zex_api.h"
+#include "level_zero/tools/source/metrics/metric.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <thread>
 
 using namespace std::chrono_literals;
 
 namespace CpuIntrinsicsTests {
 extern std::atomic<uint32_t> pauseCounter;
+extern std::atomic<uint32_t> yieldCounter;
 extern volatile TagAddressType *pauseAddress;
 extern TaskCountType pauseValue;
 extern uint32_t pauseOffset;
 extern std::function<void()> setupPauseAddress;
+extern std::atomic_uint32_t tpauseCounter;
+extern std::atomic<uint64_t> lastTpauseCounter;
+extern uint64_t rdtscRetValue;
+extern std::function<void()> controlTpause;
 } // namespace CpuIntrinsicsTests
 
 namespace L0 {
@@ -62,38 +89,65 @@ class MemoryManagerEventPoolFailMock : public NEO::MemoryManager {
         return nullptr;
     };
     GraphicsAllocation *createGraphicsAllocationFromMultipleSharedHandles(const std::vector<osHandle> &handles, AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override { return nullptr; }
-    NEO::GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override { return nullptr; }
-    void addAllocationToHostPtrManager(NEO::GraphicsAllocation *memory) override{};
-    void removeAllocationFromHostPtrManager(NEO::GraphicsAllocation *memory) override{};
-    NEO::GraphicsAllocation *createGraphicsAllocationFromNTHandle(void *handle, uint32_t rootDeviceIndex, AllocationType allocType) override { return nullptr; };
+    NEO::GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override { return nullptr; }
+    void addAllocationToHostPtrManager(NEO::GraphicsAllocation *memory) override {};
+    void removeAllocationFromHostPtrManager(NEO::GraphicsAllocation *memory) override {};
     AllocationStatus populateOsHandles(NEO::OsHandleStorage &handleStorage, uint32_t rootDeviceIndex) override { return AllocationStatus::Success; };
-    void cleanOsHandles(NEO::OsHandleStorage &handleStorage, uint32_t rootDeviceIndex) override{};
-    void freeGraphicsMemoryImpl(NEO::GraphicsAllocation *gfxAllocation) override{};
-    void freeGraphicsMemoryImpl(GraphicsAllocation *gfxAllocation, bool isImportedAllocation) override{};
+    void cleanOsHandles(NEO::OsHandleStorage &handleStorage, uint32_t rootDeviceIndex) override {};
+    void freeGraphicsMemoryImpl(NEO::GraphicsAllocation *gfxAllocation) override {};
+    void freeGraphicsMemoryImpl(GraphicsAllocation *gfxAllocation, bool isImportedAllocation) override {};
     uint64_t getSystemSharedMemory(uint32_t rootDeviceIndex) override { return 0; };
     uint64_t getLocalMemorySize(uint32_t rootDeviceIndex, uint32_t deviceBitfield) override { return 0; };
+    uint64_t getCurrentUsedLocalMemorySize(uint32_t rootDeviceIndex, uint32_t deviceBitfield) override { return 0; };
+    uint64_t getCurrentUsedSystemSharedMemorySize(uint32_t rootDeviceIndex) override { return 0; };
     double getPercentOfGlobalMemoryAvailable(uint32_t rootDeviceIndex) override { return 0; }
-    AddressRange reserveGpuAddress(const uint64_t requiredStartAddress, size_t size, RootDeviceIndicesContainer rootDeviceIndices, uint32_t *reservedOnRootDeviceIndex) override {
+    AddressRange reserveGpuAddress(const uint64_t requiredStartAddress, size_t size, const RootDeviceIndicesContainer &rootDeviceIndices, uint32_t *reservedOnRootDeviceIndex) override {
         return {};
     }
-    void freeGpuAddress(AddressRange addressRange, uint32_t rootDeviceIndex) override{};
+    AddressRange reserveGpuAddressOnHeap(const uint64_t requiredStartAddress, size_t size, const RootDeviceIndicesContainer &rootDeviceIndices, uint32_t *reservedOnRootDeviceIndex, HeapIndex heap, size_t alignment) override {
+        return {};
+    }
+    size_t selectAlignmentAndHeap(size_t size, HeapIndex *heap) override {
+        return selectAlignmentAndHeap(0ull, size, heap);
+    }
+    size_t selectAlignmentAndHeap(const uint64_t requiredStartAddress, size_t size, HeapIndex *heap) override {
+        // Always default to HEAP STANDARD and page size 64KB
+        *heap = HeapIndex::heapStandard;
+        size_t pageSizeAlignment = MemoryConstants::pageSize64k;
+
+        // If the user provides a start address, we try to find the heap and page size alignment based on that address.
+        if (requiredStartAddress != 0ull) {
+            auto rootDeviceIndex = 0u;
+            auto gfxPartition = getGfxPartition(rootDeviceIndex);
+            if (gfxPartition->getHeapIndexAndPageSizeBasedOnAddress(requiredStartAddress, *heap, pageSizeAlignment)) {
+                return pageSizeAlignment;
+            }
+        }
+        return pageSizeAlignment;
+    }
+    void freeGpuAddress(AddressRange addressRange, uint32_t rootDeviceIndex) override {};
+    AddressRange reserveCpuAddress(const uint64_t requiredStartAddress, size_t size) override { return {}; }
+    void freeCpuAddress(AddressRange addressRange) override {};
     NEO::GraphicsAllocation *createGraphicsAllocation(OsHandleStorage &handleStorage, const NEO::AllocationData &allocationData) override { return nullptr; };
     NEO::GraphicsAllocation *allocateGraphicsMemoryForNonSvmHostPtr(const NEO::AllocationData &allocationData) override { return nullptr; };
     NEO::GraphicsAllocation *allocateGraphicsMemoryWithAlignment(const NEO::AllocationData &allocationData) override { return nullptr; };
     NEO::GraphicsAllocation *allocateUSMHostGraphicsMemory(const NEO::AllocationData &allocationData) override { return nullptr; };
     NEO::GraphicsAllocation *allocateGraphicsMemory64kb(const NEO::AllocationData &allocationData) override { return nullptr; };
-    NEO::GraphicsAllocation *allocate32BitGraphicsMemoryImpl(const NEO::AllocationData &allocationData, bool useLocalMemory) override { return nullptr; };
+    NEO::GraphicsAllocation *allocate32BitGraphicsMemoryImpl(const NEO::AllocationData &allocationData) override { return nullptr; };
     NEO::GraphicsAllocation *allocateGraphicsMemoryInDevicePool(const NEO::AllocationData &allocationData, AllocationStatus &status) override { return nullptr; };
     NEO::GraphicsAllocation *allocateGraphicsMemoryWithGpuVa(const NEO::AllocationData &allocationData) override { return nullptr; };
     GraphicsAllocation *allocatePhysicalDeviceMemory(const AllocationData &allocationData, AllocationStatus &status) override { return nullptr; };
     GraphicsAllocation *allocatePhysicalLocalDeviceMemory(const AllocationData &allocationData, AllocationStatus &status) override { return nullptr; };
-    void unMapPhysicalToVirtualMemory(GraphicsAllocation *physicalAllocation, uint64_t gpuRange, size_t bufferSize, OsContext *osContext, uint32_t rootDeviceIndex) override { return; };
-    bool mapPhysicalToVirtualMemory(GraphicsAllocation *physicalAllocation, uint64_t gpuRange, size_t bufferSize) override { return false; };
+    GraphicsAllocation *allocatePhysicalHostMemory(const AllocationData &allocationData, AllocationStatus &status) override { return nullptr; };
+    bool unMapPhysicalDeviceMemoryFromVirtualMemory(MultiGraphicsAllocation &multiGraphicsAllocation, GraphicsAllocation *physicalAllocation, uint64_t gpuRange, size_t bufferSize, OsContext *osContext, uint32_t rootDeviceIndex) override { return false; };
+    bool unMapPhysicalHostMemoryFromVirtualMemory(MultiGraphicsAllocation &multiGraphicsAllocation, GraphicsAllocation *physicalAllocation, uint64_t gpuRange, size_t bufferSize, bool keepReservationPlaceholder) override { return false; };
+    bool mapPhysicalDeviceMemoryToVirtualMemory(MultiGraphicsAllocation &multiGraphicsAllocation, GraphicsAllocation *physicalAllocation, uint64_t gpuRange, size_t bufferSize, const MemoryFlags *memoryflags, size_t offset) override { return false; };
+    bool mapPhysicalHostMemoryToVirtualMemory(RootDeviceIndicesContainer &rootDeviceIndices, MultiGraphicsAllocation &multiGraphicsAllocation, GraphicsAllocation *physicalAllocation, uint64_t gpuRange, size_t bufferSize, size_t offset, bool keepReservationPlaceholder) override { return false; };
 
     NEO::GraphicsAllocation *allocateGraphicsMemoryForImageImpl(const NEO::AllocationData &allocationData, std::unique_ptr<Gmm> gmm) override { return nullptr; };
     NEO::GraphicsAllocation *allocateMemoryByKMD(const NEO::AllocationData &allocationData) override { return nullptr; };
     void *lockResourceImpl(NEO::GraphicsAllocation &graphicsAllocation) override { return nullptr; };
-    void unlockResourceImpl(NEO::GraphicsAllocation &graphicsAllocation) override{};
+    void unlockResourceImpl(NEO::GraphicsAllocation &graphicsAllocation) override {};
 };
 
 struct EventPoolFailTests : public ::testing::Test {
@@ -102,34 +156,48 @@ struct EventPoolFailTests : public ::testing::Test {
         neoDevice =
             NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get());
         auto mockBuiltIns = new MockBuiltins();
-        neoDevice->executionEnvironment->rootDeviceEnvironments[0]->builtins.reset(mockBuiltIns);
+        MockRootDeviceEnvironment::resetBuiltins(neoDevice->executionEnvironment->rootDeviceEnvironments[0].get(), mockBuiltIns);
         NEO::DeviceVector devices;
         devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-        driverHandle = std::make_unique<DriverHandleImp>();
+        driverHandle = std::make_unique<DriverHandle>();
         driverHandle->initialize(std::move(devices));
-        prevMemoryManager = driverHandle->getMemoryManager();
+
+        prevMemoryManagerDriver = driverHandle->getMemoryManager();
+        prevMemoryManagerExecEnv = neoDevice->executionEnvironment->memoryManager.release();
+
         currMemoryManager = new MemoryManagerEventPoolFailMock(*neoDevice->executionEnvironment);
+
         driverHandle->setMemoryManager(currMemoryManager);
+        neoDevice->executionEnvironment->memoryManager.reset(currMemoryManager);
+
         device = driverHandle->devices[0];
 
-        context = std::make_unique<ContextImp>(driverHandle.get());
+        context = std::make_unique<Context>(driverHandle.get());
         EXPECT_NE(context, nullptr);
         context->getDevices().insert(std::make_pair(device->getRootDeviceIndex(), device->toHandle()));
         auto neoDevice = device->getNEODevice();
-        context->rootDeviceIndices.push_back(neoDevice->getRootDeviceIndex());
+        context->rootDeviceIndices.pushUnique(neoDevice->getRootDeviceIndex());
         context->deviceBitfields.insert({neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield()});
     }
 
     void TearDown() override {
-        driverHandle->setMemoryManager(prevMemoryManager);
+        driverHandle->setMemoryManager(prevMemoryManagerDriver);
+
+        neoDevice->executionEnvironment->memoryManager.release();
+        neoDevice->executionEnvironment->memoryManager.reset(prevMemoryManagerExecEnv);
+
         delete currMemoryManager;
     }
-    NEO::MemoryManager *prevMemoryManager = nullptr;
+
+    NEO::MemoryManager *prevMemoryManagerDriver = nullptr;
+    NEO::MemoryManager *prevMemoryManagerExecEnv = nullptr;
+
     NEO::MemoryManager *currMemoryManager = nullptr;
-    std::unique_ptr<DriverHandleImp> driverHandle;
+
+    std::unique_ptr<DriverHandle> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
-    std::unique_ptr<ContextImp> context;
+    std::unique_ptr<Context> context;
 };
 
 TEST_F(EventPoolFailTests, whenCreatingEventPoolAndAllocationFailsThenOutOfDeviceMemoryIsReturned) {
@@ -142,6 +210,34 @@ TEST_F(EventPoolFailTests, whenCreatingEventPoolAndAllocationFailsThenOutOfDevic
     ze_event_pool_handle_t eventPool = {};
     ze_result_t res = context->createEventPool(&eventPoolDesc, 0, nullptr, &eventPool);
     EXPECT_EQ(res, ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+TEST_F(EventPoolFailTests, givenEnabledTimestampPoolAllocatorWhenCreatingEventPoolAndAllocationFailsThenOutOfDeviceMemoryIsReturned) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableTimestampPoolAllocator.set(1);
+
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        1};
+
+    ze_event_pool_handle_t eventPool = {};
+    ze_result_t res = context->createEventPool(&eventPoolDesc, 0, nullptr, &eventPool);
+    EXPECT_EQ(res, ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+TEST_F(EventPoolCreate, givenZeroEventCountWhenCreatingEventPoolThenInvalidSizeIsReturned) {
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        0,
+        0};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, result);
+    EXPECT_EQ(nullptr, eventPool);
 }
 
 TEST_F(EventPoolCreate, GivenEventPoolThenAllocationContainsAtLeast16Bytes) {
@@ -164,6 +260,59 @@ TEST_F(EventPoolCreate, GivenEventPoolThenAllocationContainsAtLeast16Bytes) {
               minAllocationSize);
 }
 
+TEST_F(EventPoolCreate, givenInvalidPNextWhenCreatingPoolThenIgnore) {
+    ze_base_desc_t baseDesc = {ZE_STRUCTURE_TYPE_FORCE_UINT32};
+
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        &baseDesc,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+        1};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+}
+
+TEST_F(EventPoolCreate, givenValidEventPoolWithFlagsWhenCallingGetFlagsThenCorrectFlagsAreReturned) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    std::vector<ze_event_pool_flags_t> testingFlags = {
+        0,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+        ZE_EVENT_POOL_FLAG_IPC,
+        ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        ZE_EVENT_POOL_FLAG_KERNEL_MAPPED_TIMESTAMP};
+
+    for (auto &flags : testingFlags) {
+        ze_event_pool_flags_t eventPoolFlags = ZE_EVENT_POOL_FLAG_FORCE_UINT32;
+        eventPoolDesc.flags = flags;
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+        ASSERT_NE(nullptr, eventPool);
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getFlags(&eventPoolFlags));
+        ASSERT_EQ(eventPoolDesc.flags, eventPoolFlags);
+    }
+}
+
+TEST_F(EventPoolCreate, givenValidEventPoolWhenCallingGetContextThenCorrectContextIsReturned) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = 0;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    ze_context_handle_t hContext;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getContextHandle(&hContext));
+    ASSERT_EQ(hContext, context->toHandle());
+}
+
 HWTEST_F(EventPoolCreate, givenTimestampEventsThenEventSizeSufficientForAllKernelTimestamps) {
     ze_event_pool_desc_t eventPoolDesc = {};
     eventPoolDesc.count = 1;
@@ -174,16 +323,13 @@ HWTEST_F(EventPoolCreate, givenTimestampEventsThenEventSizeSufficientForAllKerne
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
 
-    auto &hwInfo = device->getHwInfo();
     auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
     auto &gfxCoreHelper = device->getGfxCoreHelper();
 
-    uint32_t maxPacketCount = EventPacketsCount::maxKernelSplit * NEO::TimestampPacketConstants::preferredPacketCount;
-    if (l0GfxCoreHelper.useDynamicEventPacketsCount(hwInfo)) {
-        maxPacketCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
-    }
+    uint32_t maxPacketCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
+
     uint32_t packetsSize = maxPacketCount *
-                           static_cast<uint32_t>(NEO::TimestampPackets<typename FamilyType::TimestampPacketType>::getSinglePacketSize());
+                           static_cast<uint32_t>(NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize());
     uint32_t kernelTimestampsSize = static_cast<uint32_t>(alignUp(packetsSize, gfxCoreHelper.getTimestampPacketAllocatorAlignment()));
     EXPECT_EQ(kernelTimestampsSize, eventPool->getEventSize());
 }
@@ -213,7 +359,7 @@ TEST_F(EventPoolCreate, givenEventPoolCreatedWithNoTimestampFlagThenHasTimestamp
 
 TEST_F(EventPoolCreate, givenEventPoolCreatedWithTimestampFlagAndOverrideTimestampEventsFlagThenHasTimestampEventsReturnsFalse) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.OverrideTimestampEvents.set(0);
+    NEO::debugManager.flags.OverrideTimestampEvents.set(0);
 
     ze_event_pool_desc_t eventPoolDesc = {};
     eventPoolDesc.count = 1;
@@ -228,7 +374,7 @@ TEST_F(EventPoolCreate, givenEventPoolCreatedWithTimestampFlagAndOverrideTimesta
 
 TEST_F(EventPoolCreate, givenEventPoolCreatedWithoutTimestampFlagAndOverrideTimestampEventsFlagThenHasTimestampEventsReturnsTrue) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.OverrideTimestampEvents.set(1);
+    NEO::debugManager.flags.OverrideTimestampEvents.set(1);
 
     ze_event_pool_desc_t eventPoolDesc = {};
     eventPoolDesc.count = 1;
@@ -295,38 +441,70 @@ TEST_F(EventPoolCreate, GivenDeviceThenEventPoolIsCreated) {
     auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
 
     if (l0GfxCoreHelper.alwaysAllocateEventInLocalMem()) {
-        EXPECT_EQ(NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER, eventPool->getAllocation().getAllocationType());
+        EXPECT_EQ(NEO::AllocationType::gpuTimestampDeviceBuffer, eventPool->getAllocation().getAllocationType());
     } else {
-        EXPECT_EQ(NEO::AllocationType::BUFFER_HOST_MEMORY, eventPool->getAllocation().getAllocationType());
+        EXPECT_EQ(NEO::AllocationType::timestampPacketTagBuffer, eventPool->getAllocation().getAllocationType());
     }
     eventPool->destroy();
 }
+
+TEST_F(EventPoolCreate, GivenEnabledTimestampPoolAllocatorWhenCreatingEventPoolWithIpcFlagThenTimestampPoolAllocatorIsNotUsed) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableTimestampPoolAllocator.set(1);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+
+    {
+        eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_IPC;
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+        ASSERT_NE(nullptr, eventPool);
+
+        EXPECT_FALSE(driverHandle->devices[0]->getNEODevice()->getDeviceTimestampPoolAllocator().isPoolBuffer(eventPool->getAllocation().getDefaultGraphicsAllocation()));
+    }
+    {
+        eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+        ASSERT_NE(nullptr, eventPool);
+
+        EXPECT_TRUE(driverHandle->devices[0]->getNEODevice()->getDeviceTimestampPoolAllocator().isPoolBuffer(eventPool->getAllocation().getDefaultGraphicsAllocation()));
+    }
+}
+
 struct EventPoolIpcMockGraphicsAllocation : public NEO::MockGraphicsAllocation {
     using NEO::MockGraphicsAllocation::MockGraphicsAllocation;
 
-    int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle) override {
+    int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle, void *reservedHandleData) override {
         handle = peekInternalHandleValue;
+        if (reservedHandleData != nullptr) {
+            memset(reservedHandleData, 0xab, reservedHandleDataSize);
+        }
         return peekInternalHandleRetCode;
     }
 
     int peekInternalHandleRetCode = 0;
     uint64_t peekInternalHandleValue = 0;
+    size_t reservedHandleDataSize = 32;
 };
 class MemoryManagerEventPoolIpcMock : public NEO::MockMemoryManager {
   public:
     MemoryManagerEventPoolIpcMock(NEO::ExecutionEnvironment &executionEnvironment) : NEO::MockMemoryManager(executionEnvironment) {}
     void *createMultiGraphicsAllocationInSystemMemoryPool(RootDeviceIndicesContainer &rootDeviceIndices, AllocationProperties &properties, NEO::MultiGraphicsAllocation &multiGraphicsAllocation) override {
         alloc = new EventPoolIpcMockGraphicsAllocation(&buffer, sizeof(buffer));
-        alloc->isShareableHostMemory = true;
+        alloc->setShareableHostMemory(true);
         multiGraphicsAllocation.addAllocation(alloc);
         return reinterpret_cast<void *>(alloc->getUnderlyingBuffer());
     }
-    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
         if (callParentCreateGraphicsAllocationFromSharedHandle) {
-            return NEO::MockMemoryManager::createGraphicsAllocationFromSharedHandle(handle, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
+            return NEO::MockMemoryManager::createGraphicsAllocationFromSharedHandle(osHandleData, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
         }
         alloc = new EventPoolIpcMockGraphicsAllocation(&buffer, sizeof(buffer));
-        alloc->isShareableHostMemory = true;
+        alloc->setShareableHostMemory(true);
         return alloc;
     }
     GraphicsAllocation *allocateGraphicsMemoryWithProperties(const AllocationProperties &properties) override {
@@ -334,13 +512,65 @@ class MemoryManagerEventPoolIpcMock : public NEO::MockMemoryManager {
             return NEO::MockMemoryManager::allocateGraphicsMemoryWithProperties(properties);
         }
         alloc = new EventPoolIpcMockGraphicsAllocation(&buffer, sizeof(buffer));
-        alloc->isShareableHostMemory = true;
+        alloc->setShareableHostMemory(true);
         return alloc;
     }
     char buffer[256];
     EventPoolIpcMockGraphicsAllocation *alloc = nullptr;
     bool callParentCreateGraphicsAllocationFromSharedHandle = true;
     bool callParentAllocateGraphicsMemoryWithProperties = true;
+};
+
+class MemoryManagerEventPoolIpcReleaseMock : public MemoryManagerEventPoolIpcMock {
+  public:
+    using MemoryManagerEventPoolIpcMock::MemoryManagerEventPoolIpcMock;
+
+    void closeInternalHandle(uint64_t &handle, uint32_t handleId, GraphicsAllocation *graphicsAllocation) override {
+        closeInternalHandleCalled++;
+        lastClosedHandle = handle;
+        lastHandleId = handleId;
+        lastGraphicsAllocation = graphicsAllocation;
+    }
+
+    uint32_t closeInternalHandleCalled = 0;
+    uint64_t lastClosedHandle = 0;
+    uint32_t lastHandleId = 0;
+    GraphicsAllocation *lastGraphicsAllocation = nullptr;
+};
+
+class MemoryManagerEventPoolIpcReservedHandleMock : public MemoryManagerEventPoolIpcMock {
+  public:
+    using MemoryManagerEventPoolIpcMock::MemoryManagerEventPoolIpcMock;
+
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+        createFromSharedHandleCalled++;
+        if (failPrimaryImport && createFromSharedHandleCalled == 1) {
+            return nullptr;
+        }
+        return MemoryManagerEventPoolIpcMock::createGraphicsAllocationFromSharedHandle(osHandleData, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
+    }
+
+    int getImportHandleFromReservedHandleData(void *reservedHandleData, uint32_t rootDeviceIndex) override {
+        getImportHandleFromReservedHandleDataCalled++;
+        lastReservedHandleData = reservedHandleData;
+        lastRootDeviceIndex = rootDeviceIndex;
+        return importHandleFromReservedHandleDataResult;
+    }
+
+    bool failPrimaryImport = false;
+    uint32_t createFromSharedHandleCalled = 0;
+    uint32_t getImportHandleFromReservedHandleDataCalled = 0;
+    void *lastReservedHandleData = nullptr;
+    uint32_t lastRootDeviceIndex = 0;
+    int importHandleFromReservedHandleDataResult = -1;
+};
+
+class ContextWhiteboxForEventPoolIpcTesting : public ::L0::Context {
+  public:
+    ContextWhiteboxForEventPoolIpcTesting(L0::DriverHandle *driverHandle) : ::L0::Context(driverHandle) {}
+
+    using ::L0::Context::releaseIpcEventPoolHandle;
+    using ::L0::Context::trackIpcEventPoolHandle;
 };
 
 using EventPoolIPCHandleTests = Test<DeviceFixture>;
@@ -366,15 +596,372 @@ TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolThenHandleAndNum
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     constexpr uint64_t expectedHandle = static_cast<uint64_t>(-1);
-    EXPECT_NE(expectedHandle, ipcHandleData.handle);
+    EXPECT_NE(expectedHandle, ipcHandleData.handle.val);
     EXPECT_EQ(numEvents, ipcHandleData.numEvents);
 
     res = eventPool->destroy();
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
     delete mockMemoryManager;
     driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenTrackedIpcEventPoolHandleWhenTrackingSameHandleTwiceThenRefCountIsIncremented) {
+    ContextWhiteboxForEventPoolIpcTesting contextWhitebox(driverHandle.get());
+    NEO::MockGraphicsAllocation mockAllocation;
+    constexpr uint64_t handle = 0x12345;
+
+    EXPECT_TRUE(driverHandle->getIPCHandleMap().empty());
+
+    contextWhitebox.trackIpcEventPoolHandle(handle, &mockAllocation);
+
+    auto &ipcHandleMap = driverHandle->getIPCHandleMap();
+    ASSERT_EQ(1u, ipcHandleMap.size());
+    auto handleIterator = ipcHandleMap.find(handle);
+    ASSERT_NE(handleIterator, ipcHandleMap.end());
+    EXPECT_EQ(1u, handleIterator->second->refcnt);
+    EXPECT_EQ(&mockAllocation, handleIterator->second->alloc);
+
+    contextWhitebox.trackIpcEventPoolHandle(handle, &mockAllocation);
+
+    EXPECT_EQ(1u, ipcHandleMap.size());
+    handleIterator = ipcHandleMap.find(handle);
+    ASSERT_NE(handleIterator, ipcHandleMap.end());
+    EXPECT_EQ(2u, handleIterator->second->refcnt);
+    EXPECT_EQ(&mockAllocation, handleIterator->second->alloc);
+
+    delete handleIterator->second;
+    ipcHandleMap.clear();
+}
+
+TEST_F(EventPoolIPCHandleTests, givenTrackedIpcEventPoolHandleWhenReleasedToZeroThenHandleIsClosedRemovedAndMissingReleaseIsNoOp) {
+    MemoryManagerEventPoolIpcReleaseMock mockMemoryManager(*neoDevice->executionEnvironment);
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
+
+    ContextWhiteboxForEventPoolIpcTesting contextWhitebox(driverHandle.get());
+    NEO::MockGraphicsAllocation mockAllocation;
+    constexpr uint64_t handle = 0xABCDE;
+
+    contextWhitebox.trackIpcEventPoolHandle(handle, &mockAllocation);
+    contextWhitebox.trackIpcEventPoolHandle(handle, &mockAllocation);
+
+    EXPECT_EQ(0u, mockMemoryManager.closeInternalHandleCalled);
+
+    contextWhitebox.releaseIpcEventPoolHandle(handle);
+
+    auto &ipcHandleMap = driverHandle->getIPCHandleMap();
+    ASSERT_EQ(1u, ipcHandleMap.size());
+    auto handleIterator = ipcHandleMap.find(handle);
+    ASSERT_NE(handleIterator, ipcHandleMap.end());
+    EXPECT_EQ(1u, handleIterator->second->refcnt);
+    EXPECT_EQ(0u, mockMemoryManager.closeInternalHandleCalled);
+
+    contextWhitebox.releaseIpcEventPoolHandle(handle);
+
+    EXPECT_TRUE(ipcHandleMap.empty());
+    EXPECT_EQ(1u, mockMemoryManager.closeInternalHandleCalled);
+    EXPECT_EQ(handle, mockMemoryManager.lastClosedHandle);
+    EXPECT_EQ(0u, mockMemoryManager.lastHandleId);
+    EXPECT_EQ(&mockAllocation, mockMemoryManager.lastGraphicsAllocation);
+
+    contextWhitebox.releaseIpcEventPoolHandle(handle);
+    EXPECT_TRUE(ipcHandleMap.empty());
+    EXPECT_EQ(1u, mockMemoryManager.closeInternalHandleCalled);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenGetIpcHandleInNonOpaqueModeWhenPuttingIpcHandleThenHandleIsReleasedFromMap) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::none;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    res = context->putIpcEventPoolHandle(ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+
+    res = eventPool->destroy();
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenGetIpcHandleInOpaqueFdModeWhenPuttingIpcHandleThenHandleIsReleasedFromMap) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    IpcHandleType handleType = context->settings.handleType;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::sockets;
+    context->settings.handleType = IpcHandleType::fdHandle;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    res = context->putIpcEventPoolHandle(ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+    context->settings.handleType = handleType;
+
+    res = eventPool->destroy();
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenGetIpcHandleInOpaqueSocketsModeWithoutFdWhenPuttingIpcHandleThenHandleIsReleasedFromMap) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    IpcHandleType handleType = context->settings.handleType;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::sockets;
+    context->settings.handleType = IpcHandleType::ntHandle;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    res = context->putIpcEventPoolHandle(ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+    context->settings.handleType = handleType;
+
+    res = eventPool->destroy();
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenMultipleGetIpcHandleCallsWhenPuttingIpcHandleThenHandleIsReleasedOnLastPut) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::none;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getIpcHandle(&ipcHandle));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getIpcHandle(&ipcHandle));
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, context->putIpcEventPoolHandle(ipcHandle));
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, context->putIpcEventPoolHandle(ipcHandle));
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->destroy());
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenUnknownIpcHandleWhenPuttingIpcHandleThenSuccessIsReturned) {
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::none;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    ipcHandleData.handle.val = 0xdeadbeef;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, context->putIpcEventPoolHandle(ipcHandle));
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+}
+
+TEST_F(EventPoolIPCHandleTests, givenGetIpcHandleWhenDestroyingEventPoolWithoutPutThenHandleIsReleasedFromMap) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getIpcHandle(&ipcHandle));
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->destroy());
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenOpaqueSocketsFdModeWhenReleasingIpcEventPoolHandleThenHandleIsReleasedFromMap) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    IpcHandleType handleType = context->settings.handleType;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::sockets;
+    context->settings.handleType = IpcHandleType::fdHandle;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getIpcHandle(&ipcHandle));
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    context->releaseIpcEventPoolHandle(ipcHandleData.handle.val);
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+    context->settings.handleType = handleType;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->destroy());
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenOpaqueSocketsModeWithoutFdWhenReleasingIpcEventPoolHandleThenHandleIsReleasedFromMap) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemoryManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(mockMemoryManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    uint8_t useOpaque = context->settings.useOpaqueHandle;
+    IpcHandleType handleType = context->settings.handleType;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::sockets;
+    context->settings.handleType = IpcHandleType::ntHandle;
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->getIpcHandle(&ipcHandle));
+    EXPECT_EQ(1u, driverHandle->getIPCHandleMap().size());
+
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    context->releaseIpcEventPoolHandle(ipcHandleData.handle.val);
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    context->settings.useOpaqueHandle = useOpaque;
+    context->settings.handleType = handleType;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->destroy());
+    delete mockMemoryManager;
+    driverHandle->setMemoryManager(curMemoryManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, givenExportedIpcHandleAndNullContextWhenDestroyingEventPoolThenNoReleaseIsAttempted) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+        numEvents};
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = whiteboxCast(EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    eventPool->hasExportedIpcHandle = true;
+    eventPool->exportedIpcHandle = 0x1234;
+    eventPool->context = nullptr;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->destroy());
 }
 
 TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolThenHandleAndIsHostVisibleAreReturnedInHandle) {
@@ -398,9 +985,9 @@ TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolThenHandleAndIsH
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     constexpr uint64_t expectedHandle = static_cast<uint64_t>(-1);
-    EXPECT_NE(expectedHandle, ipcHandleData.handle);
+    EXPECT_NE(expectedHandle, ipcHandleData.handle.val);
 
     EXPECT_TRUE(ipcHandleData.isHostVisibleEventPoolAllocation);
 
@@ -431,9 +1018,9 @@ TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolThenIsImplicitSc
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     constexpr uint64_t expectedHandle = static_cast<uint64_t>(-1);
-    EXPECT_NE(expectedHandle, ipcHandleData.handle);
+    EXPECT_NE(expectedHandle, ipcHandleData.handle.val);
 
     EXPECT_EQ(ipcHandleData.numEvents, 2u);
     EXPECT_EQ(ipcHandleData.numDevices, 1u);
@@ -467,9 +1054,9 @@ TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolThenHandleAndNum
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     constexpr uint64_t expectedHandle = static_cast<uint64_t>(-1);
-    EXPECT_NE(expectedHandle, ipcHandleData.handle);
+    EXPECT_NE(expectedHandle, ipcHandleData.handle.val);
 
     EXPECT_EQ(ipcHandleData.numDevices, 1u);
 
@@ -500,19 +1087,17 @@ TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolWithDeviceAllocT
 
     auto allocation = &eventPool->getAllocation();
 
-    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER);
+    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::gpuTimestampDeviceBuffer);
 
     ze_ipc_event_pool_handle_t ipcHandle = {};
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     constexpr uint64_t expectedHandle = static_cast<uint64_t>(-1);
-    EXPECT_NE(expectedHandle, ipcHandleData.handle);
+    EXPECT_NE(expectedHandle, ipcHandleData.handle.val);
 
     EXPECT_EQ(numEvents, ipcHandleData.numEvents);
-
-    EXPECT_EQ(0u, ipcHandleData.rootDeviceIndex);
 
     EXPECT_TRUE(ipcHandleData.isDeviceEventPoolAllocation);
 
@@ -522,9 +1107,421 @@ TEST_F(EventPoolIPCHandleTests, whenGettingIpcHandleForEventPoolWithDeviceAllocT
     driverHandle->setMemoryManager(curMemoryManager);
 }
 
+TEST_F(EventPoolIPCHandleTests, whenGettingOpaqueEventPoolIpcHandleWithDeviceAllocThenReturnsHandleAndProcessID) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    // Enable opaque IPC handles
+    context->settings.useOpaqueHandle = OpaqueHandlingType::pidfd;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *memManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(memManager);
+    auto eventPool = whiteboxCast(EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    EXPECT_TRUE(eventPool->isDeviceEventPoolAllocation);
+
+    auto allocation = &eventPool->getAllocation();
+
+    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::gpuTimestampDeviceBuffer);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    constexpr uint64_t badHandle = static_cast<uint64_t>(-1);
+    EXPECT_NE(badHandle, ipcData.handle.val);
+    EXPECT_EQ(numEvents, ipcData.numEvents);
+    EXPECT_EQ(NEO::SysCalls::getCurrentProcessId(), ipcData.processId);
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+    delete memManager;
+    driverHandle->setMemoryManager(curMemManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, whenGettingNonOpaqueIpcEventPoolHandleWithDeviceAllocThenReturnsHandleButNotProcessID) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_IPC,
+        numEvents};
+
+    // Set to non-opaque IPC handles.
+    bool useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::none;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *memManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(memManager);
+    auto eventPool = whiteboxCast(EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &poolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    EXPECT_TRUE(eventPool->isDeviceEventPoolAllocation);
+
+    auto allocation = &eventPool->getAllocation();
+
+    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::gpuTimestampDeviceBuffer);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    // Reset opaque IPC handle setting.
+    context->settings.useOpaqueHandle = useOpaque;
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    constexpr uint64_t badHandle = static_cast<uint64_t>(-1);
+    EXPECT_NE(ipcData.handle.val, badHandle);
+    EXPECT_EQ(ipcData.numEvents, numEvents);
+    EXPECT_NE(ipcData.processId, NEO::SysCalls::getCurrentProcessId());
+    EXPECT_EQ(ipcData.processId, 0u);
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+    delete memManager;
+    driverHandle->setMemoryManager(curMemManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, whenOpeningOpaqueIpcEventPoolHandleThenEventPoolIsCreatedAndProcessIDsAreTheSame) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        numEvents};
+
+    // Enable opaque IPC handles
+    bool useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::pidfd;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *memManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(memManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &poolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    constexpr uint64_t badHandle = static_cast<uint64_t>(-1);
+    EXPECT_NE(ipcData.handle.val, badHandle);
+    EXPECT_EQ(ipcData.numEvents, numEvents);
+    EXPECT_EQ(ipcData.processId, NEO::SysCalls::getCurrentProcessId());
+
+    ze_event_pool_handle_t ipcPoolHandle = {};
+    res = context->openEventPoolIpcHandle(ipcHandle, &ipcPoolHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    // Reset opaque IPC handle setting.
+    context->settings.useOpaqueHandle = useOpaque;
+
+    auto ipcPool = L0::EventPool::fromHandle(ipcPoolHandle);
+
+    EXPECT_EQ(ipcPool->getEventSize(), eventPool->getEventSize());
+    EXPECT_EQ(static_cast<uint32_t>(ipcPool->getNumEvents()), numEvents);
+    EXPECT_TRUE(ipcPool->isEventPoolTimestampFlagSet());
+
+    EXPECT_EQ(ipcPool->closeIpcHandle(), ZE_RESULT_SUCCESS);
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+    delete memManager;
+    driverHandle->setMemoryManager(curMemManager);
+}
+
+struct FabricAccessEventPoolIpcFixture {
+    void setUp() {
+        deviceFactory = std::make_unique<NEO::UltDeviceFactory>(1, 0);
+        NEO::DeviceVector inputDevices;
+        inputDevices.push_back(std::unique_ptr<NEO::Device>(deviceFactory->rootDevices[0]));
+
+        for (auto *devicePtr : driverHandle.devices) {
+            delete devicePtr;
+        }
+        driverHandle.devices.clear();
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, driverHandle.initialize(std::move(inputDevices)));
+
+        ze_context_handle_t hContext = nullptr;
+        ze_context_desc_t desc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
+        EXPECT_EQ(ZE_RESULT_SUCCESS, driverHandle.createContext(&desc, 0u, nullptr, &hContext));
+        context = Context::fromHandle(hContext);
+
+        device = driverHandle.devices[0];
+        neoDevice = device->getNEODevice();
+    }
+
+    void tearDown() {
+        context->destroy();
+    }
+
+    std::unique_ptr<NEO::UltDeviceFactory> deviceFactory;
+    Mock<DriverHandle> driverHandle;
+    Context *context = nullptr;
+    L0::Device *device = nullptr;
+    NEO::Device *neoDevice = nullptr;
+};
+
+using EventPoolIpcFabricAccessTests = Test<FabricAccessEventPoolIpcFixture>;
+
+TEST_F(EventPoolIpcFabricAccessTests, whenGettingOpaqueEventPoolIpcHandleAndFabricAccessIsSupportedThenReservedHandleDataIsCaptured) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        numEvents};
+
+    context->settings.useOpaqueHandle = OpaqueHandlingType::pidfd;
+    driverHandle.isFabricAccessSupportedResult = true;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    MemoryManagerEventPoolIpcMock memManager(*neoDevice->getExecutionEnvironment());
+    memManager.callParentAllocateGraphicsMemoryWithProperties = false;
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle.memoryManager, &memManager);
+    auto eventPool = EventPool::create(&driverHandle, context, 1, &deviceHandle, &poolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    static const uint8_t emptyReservedHandleData[sizeof(ipcData.reservedHandleData)] = {0};
+    EXPECT_NE(0, std::memcmp(ipcData.reservedHandleData, emptyReservedHandleData, sizeof(emptyReservedHandleData)));
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+}
+
+TEST_F(EventPoolIpcFabricAccessTests, whenGettingOpaqueEventPoolIpcHandleAndFabricAccessIsNotSupportedThenReservedHandleDataIsNotCaptured) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        numEvents};
+
+    context->settings.useOpaqueHandle = OpaqueHandlingType::pidfd;
+    driverHandle.isFabricAccessSupportedResult = false;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    MemoryManagerEventPoolIpcMock memManager(*neoDevice->getExecutionEnvironment());
+    memManager.callParentAllocateGraphicsMemoryWithProperties = false;
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle.memoryManager, &memManager);
+    auto eventPool = EventPool::create(&driverHandle, context, 1, &deviceHandle, &poolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    static const uint8_t emptyReservedHandleData[sizeof(ipcData.reservedHandleData)] = {0};
+    EXPECT_EQ(0, std::memcmp(ipcData.reservedHandleData, emptyReservedHandleData, sizeof(emptyReservedHandleData)));
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+}
+
+TEST_F(EventPoolIpcFabricAccessTests, whenOpeningOpaqueIpcEventPoolHandleAndPrimaryImportFailsThenReservedHandleDataFallbackIsUsed) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        numEvents};
+
+    context->settings.useOpaqueHandle = OpaqueHandlingType::pidfd;
+    driverHandle.isFabricAccessSupportedResult = true;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    MemoryManagerEventPoolIpcReservedHandleMock memManager(*neoDevice->getExecutionEnvironment());
+    memManager.callParentAllocateGraphicsMemoryWithProperties = false;
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle.memoryManager, &memManager);
+    auto eventPool = EventPool::create(&driverHandle, context, 1, &deviceHandle, &poolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    memManager.failPrimaryImport = true;
+    memManager.importHandleFromReservedHandleDataResult = 123;
+
+    ze_event_pool_handle_t ipcPoolHandle = {};
+    res = context->openEventPoolIpcHandle(ipcHandle, &ipcPoolHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    EXPECT_EQ(2u, memManager.createFromSharedHandleCalled);
+    EXPECT_EQ(1u, memManager.getImportHandleFromReservedHandleDataCalled);
+    EXPECT_NE(nullptr, memManager.lastReservedHandleData);
+
+    auto ipcPool = L0::EventPool::fromHandle(ipcPoolHandle);
+    EXPECT_EQ(ipcPool->closeIpcHandle(), ZE_RESULT_SUCCESS);
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+}
+
+TEST_F(EventPoolIpcFabricAccessTests, whenDestroyingImportedOpaqueEventPoolThenOpaqueHandleImportCacheRefIsReleased) {
+    constexpr uint64_t cacheId = 0x1234;
+    auto &cacheEntry = driverHandle.opaqueHandleImportCache[cacheId];
+    cacheEntry.fd = -1;
+    cacheEntry.refCount = 5;
+
+    auto pool = new WhiteBox<::L0::EventPool>();
+    pool->importedIpcCacheId = cacheId;
+    pool->importedIpcDriverHandle = &driverHandle;
+
+    delete pool;
+
+    EXPECT_EQ(4u, driverHandle.opaqueHandleImportCache[cacheId].refCount);
+}
+
+TEST_F(EventPoolIpcFabricAccessTests, whenDestroyingImportedOpaqueEventPoolWithoutDriverHandleThenOpaqueHandleImportCacheRefIsNotReleased) {
+    constexpr uint64_t cacheId = 0x1234;
+    auto &cacheEntry = driverHandle.opaqueHandleImportCache[cacheId];
+    cacheEntry.fd = -1;
+    cacheEntry.refCount = 5;
+
+    auto pool = new WhiteBox<::L0::EventPool>();
+    pool->importedIpcCacheId = cacheId;
+    pool->importedIpcDriverHandle = nullptr;
+
+    delete pool;
+
+    EXPECT_EQ(5u, driverHandle.opaqueHandleImportCache[cacheId].refCount);
+}
+
+TEST_F(EventPoolIPCHandleTests, whenOpeningOpaqueIpcEventPoolHandleWithipcSupportedAllocationByDefaultEnabledThenEventPoolIsCreatedAndProcessIDsAreTheSame) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableipcSupportedAllocationByDefault.set(true);
+
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        numEvents};
+
+    // Enable opaque IPC handles
+    bool useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::pidfd;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *memManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(memManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &poolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    constexpr uint64_t badHandle = static_cast<uint64_t>(-1);
+    EXPECT_NE(ipcData.handle.val, badHandle);
+    EXPECT_EQ(ipcData.numEvents, numEvents);
+    EXPECT_EQ(ipcData.processId, NEO::SysCalls::getCurrentProcessId());
+
+    ze_event_pool_handle_t ipcPoolHandle = {};
+    res = context->openEventPoolIpcHandle(ipcHandle, &ipcPoolHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    // Reset opaque IPC handle setting.
+    context->settings.useOpaqueHandle = useOpaque;
+
+    auto ipcPool = L0::EventPool::fromHandle(ipcPoolHandle);
+
+    EXPECT_EQ(ipcPool->getEventSize(), eventPool->getEventSize());
+    EXPECT_EQ(static_cast<uint32_t>(ipcPool->getNumEvents()), numEvents);
+    EXPECT_TRUE(ipcPool->isEventPoolTimestampFlagSet());
+
+    EXPECT_EQ(ipcPool->closeIpcHandle(), ZE_RESULT_SUCCESS);
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+    delete memManager;
+    driverHandle->setMemoryManager(curMemManager);
+}
+
+TEST_F(EventPoolIPCHandleTests, whenOpeningNonOpaqueIpcEventPoolHandleThenEventPoolIsCreatedButProcessIDsNotSet) {
+    uint32_t numEvents = 4;
+    ze_event_pool_desc_t poolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
+        numEvents};
+
+    // Set to non-opaque IPC handles.
+    bool useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::none;
+
+    auto deviceHandle = device->toHandle();
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto curMemManager = driverHandle->getMemoryManager();
+    MemoryManagerEventPoolIpcMock *memManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(memManager);
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &poolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto &ipcData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
+    constexpr uint64_t badHandle = static_cast<uint64_t>(-1);
+    EXPECT_NE(ipcData.handle.val, badHandle);
+    EXPECT_EQ(ipcData.numEvents, numEvents);
+    EXPECT_NE(ipcData.processId, NEO::SysCalls::getCurrentProcessId());
+    EXPECT_EQ(ipcData.processId, 0u);
+
+    ze_event_pool_handle_t ipcPoolHandle = {};
+    res = context->openEventPoolIpcHandle(ipcHandle, &ipcPoolHandle);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    // Reset opaque IPC handle setting.
+    context->settings.useOpaqueHandle = useOpaque;
+
+    auto ipcPool = L0::EventPool::fromHandle(ipcPoolHandle);
+
+    EXPECT_EQ(ipcPool->getEventSize(), eventPool->getEventSize());
+    EXPECT_EQ(static_cast<uint32_t>(ipcPool->getNumEvents()), numEvents);
+    EXPECT_TRUE(ipcPool->isEventPoolTimestampFlagSet());
+
+    EXPECT_EQ(ipcPool->closeIpcHandle(), ZE_RESULT_SUCCESS);
+
+    EXPECT_EQ(eventPool->destroy(), ZE_RESULT_SUCCESS);
+    delete memManager;
+    driverHandle->setMemoryManager(curMemManager);
+}
+
 using EventPoolCreateMultiDevice = Test<MultiDeviceFixture>;
 
-TEST_F(EventPoolCreateMultiDevice, whenGettingIpcHandleForEventPoolWhenHostShareableMemoryIsFalseThenUnsuportedIsReturned) {
+TEST_F(EventPoolCreateMultiDevice, whenGettingIpcHandleForEventPoolWhenHostShareableMemoryIsFalseThenUnsupportedIsReturned) {
     uint32_t numEvents = 4;
     ze_event_pool_desc_t eventPoolDesc = {
         ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
@@ -559,7 +1556,7 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolThenEventPoolIsC
     ze_event_pool_desc_t eventPoolDesc = {
         ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
         nullptr,
-        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP,
         numEvents};
 
     auto deviceHandle = device->toHandle();
@@ -583,6 +1580,7 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolThenEventPoolIsC
 
     EXPECT_EQ(ipcEventPool->getEventSize(), eventPool->getEventSize());
     EXPECT_EQ(numEvents, static_cast<uint32_t>(ipcEventPool->getNumEvents()));
+    EXPECT_TRUE(ipcEventPool->isEventPoolTimestampFlagSet());
 
     res = ipcEventPool->closeIpcHandle();
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
@@ -598,7 +1596,7 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolWithHostVisibleT
     ze_event_pool_desc_t eventPoolDesc = {
         ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
         nullptr,
-        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC | ZE_EVENT_POOL_FLAG_KERNEL_MAPPED_TIMESTAMP,
         numEvents};
 
     auto deviceHandle = device->toHandle();
@@ -622,6 +1620,7 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolWithHostVisibleT
 
     EXPECT_EQ(ipcEventPool->isHostVisibleEventPoolAllocation, eventPool->isHostVisibleEventPoolAllocation);
     EXPECT_TRUE(ipcEventPool->isHostVisibleEventPoolAllocation);
+    EXPECT_TRUE(ipcEventPool->isEventPoolKernelMappedTsFlagSet());
 
     res = ipcEventPool->closeIpcHandle();
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
@@ -633,9 +1632,9 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolWithHostVisibleT
 }
 
 TEST_F(EventPoolIPCHandleTests,
-       GivenRemoteEventPoolHasTwoEventPacketsWhenContextWithSinglePacketOpensIpcEventPoolFromIpcHandleThenDiffrentMaxEventPacketsCauseInvalidArgumentError) {
+       GivenRemoteEventPoolHasTwoEventPacketsWhenContextWithSinglePacketOpensIpcEventPoolFromIpcHandleThenDifferentMaxEventPacketsCauseInvalidArgumentError) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.PrintDebugMessages.set(1);
+    NEO::debugManager.flags.PrintDebugMessages.set(1);
 
     uint32_t numEvents = 1;
     ze_event_pool_desc_t eventPoolDesc = {
@@ -659,13 +1658,14 @@ TEST_F(EventPoolIPCHandleTests,
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    ::testing::internal::CaptureStderr();
+    StreamCapture capture;
+    capture.captureStderr();
 
     ze_event_pool_handle_t ipcEventPoolHandle = {};
     res = context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
     EXPECT_EQ(res, ZE_RESULT_ERROR_INVALID_ARGUMENT);
 
-    std::string output = testing::internal::GetCapturedStderr();
+    std::string output = capture.getCapturedStderr();
     std::string expectedOutput("IPC handle max event packets 2 does not match context devices max event packet 1\n");
     EXPECT_EQ(expectedOutput, output);
 
@@ -700,7 +1700,7 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolWithDeviceAllocT
     res = context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     EXPECT_TRUE(ipcHandleData.isDeviceEventPoolAllocation);
 
     auto ipcEventPool = whiteboxCast(L0::EventPool::fromHandle(ipcEventPoolHandle));
@@ -709,7 +1709,7 @@ TEST_F(EventPoolIPCHandleTests, whenOpeningIpcHandleForEventPoolWithDeviceAllocT
 
     auto allocation = &ipcEventPool->getAllocation();
 
-    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER);
+    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::gpuTimestampDeviceBuffer);
 
     EXPECT_EQ(ipcEventPool->getEventSize(), eventPool->getEventSize());
     EXPECT_EQ(numEvents, static_cast<uint32_t>(ipcEventPool->getNumEvents()));
@@ -756,7 +1756,7 @@ TEST_F(EventPoolIPCHandleTests, GivenEventPoolWithIPCEventFlagAndHostMemoryThenS
     uint32_t minAllocationSize = eventPool->getEventSize();
     EXPECT_GE(allocation->getGraphicsAllocation(device->getNEODevice()->getRootDeviceIndex())->getUnderlyingBufferSize(),
               minAllocationSize);
-    EXPECT_FALSE(allocation->getGraphicsAllocation(device->getNEODevice()->getRootDeviceIndex())->isShareableHostMemory);
+    EXPECT_FALSE(allocation->getGraphicsAllocation(device->getNEODevice()->getRootDeviceIndex())->isShareableHostMemory());
 }
 
 TEST_F(EventPoolIPCHandleTests, GivenIpcEventPoolWhenCreatingEventFromIpcPoolThenExpectIpcFlag) {
@@ -769,10 +1769,9 @@ TEST_F(EventPoolIPCHandleTests, GivenIpcEventPoolWhenCreatingEventFromIpcPoolThe
 
     auto deviceHandle = device->toHandle();
     ze_result_t result = ZE_RESULT_SUCCESS;
-    auto curMemoryManager = driverHandle->getMemoryManager();
-    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
-    mockMemoryManager->callParentCreateGraphicsAllocationFromSharedHandle = false;
-    driverHandle->setMemoryManager(mockMemoryManager);
+    MemoryManagerEventPoolIpcMock mockMemoryManager(*neoDevice->executionEnvironment);
+    mockMemoryManager.callParentCreateGraphicsAllocationFromSharedHandle = false;
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
     auto eventPool = EventPool::create(driverHandle.get(), context, 1, &deviceHandle, &eventPoolDesc, result);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
@@ -794,7 +1793,7 @@ TEST_F(EventPoolIPCHandleTests, GivenIpcEventPoolWhenCreatingEventFromIpcPoolThe
         0,
         0};
 
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(ipcEventPool, &eventDesc, device));
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(ipcEventPool, &eventDesc, device, result));
     ASSERT_NE(nullptr, event);
     EXPECT_TRUE(event->isFromIpcPool);
 
@@ -807,14 +1806,12 @@ TEST_F(EventPoolIPCHandleTests, GivenIpcEventPoolWhenCreatingEventFromIpcPoolThe
         data = ptrOffset(data, event->getSinglePacketSize());
     }
     event->setIsCompleted();
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
     event->destroy();
 
     res = eventPool->destroy();
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
-    delete mockMemoryManager;
-    driverHandle->setMemoryManager(curMemoryManager);
 }
 
 TEST_F(EventPoolIPCHandleTests, givenIpcEventPoolWhenGettingIpcHandleAndFailingToGetThenCorrectErrorIsReturned) {
@@ -898,7 +1895,7 @@ class MultiDeviceEventPoolOpenIpcHandleMemoryManager : public FailMemoryManager 
   public:
     MultiDeviceEventPoolOpenIpcHandleMemoryManager(NEO::ExecutionEnvironment &executionEnvironment) : FailMemoryManager(executionEnvironment) {}
 
-    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
         return &mockAllocation0;
     }
 
@@ -998,9 +1995,8 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOp
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto deviceHandle = driverHandle->devices[0]->toHandle();
     NEO::MockDevice *neoDevice = static_cast<NEO::MockDevice *>(driverHandle->devices[0]->getNEODevice());
-    auto originalMemoryManager = driverHandle->getMemoryManager();
-    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(mockMemoryManager);
+    MemoryManagerEventPoolIpcMock mockMemoryManager(*neoDevice->executionEnvironment);
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
 
     auto eventPool = EventPool::create(driverHandle.get(), context, 0, &deviceHandle, &eventPoolDesc, result);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -1010,16 +2006,15 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOp
     result = eventPool->getIpcHandle(&ipcHandle);
     ASSERT_EQ(result, ZE_RESULT_SUCCESS);
 
-    auto prevMemoryManager = driverHandle->getMemoryManager();
-    auto currMemoryManager = new MultiDeviceEventPoolOpenIpcHandleMemoryManager(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(currMemoryManager);
-    currMemoryManager->maxCalls = 4;
+    MultiDeviceEventPoolOpenIpcHandleMemoryManager currMemoryManager(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(&currMemoryManager);
+    currMemoryManager.maxCalls = 4;
 
     ze_event_pool_handle_t ipcEventPoolHandle = {};
     result = context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, ipcEventPoolHandle);
-    EXPECT_EQ(3u, currMemoryManager->calls);
+    EXPECT_EQ(3u, currMemoryManager.calls);
 
     auto ipcEventPool = whiteboxCast(EventPool::fromHandle(ipcEventPoolHandle));
     ASSERT_EQ(driverHandle->devices.size(), ipcEventPool->devices.size());
@@ -1028,17 +2023,13 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOp
     }
 
     ipcEventPool->closeIpcHandle();
-    EXPECT_EQ(1u, currMemoryManager->alloc0FreeCall);
-    EXPECT_EQ(3u, currMemoryManager->alloc1FreeCall);
+    EXPECT_EQ(1u, currMemoryManager.alloc0FreeCall);
+    EXPECT_EQ(3u, currMemoryManager.alloc1FreeCall);
 
-    driverHandle->setMemoryManager(prevMemoryManager);
-    delete currMemoryManager;
+    driverHandle->setMemoryManager(&mockMemoryManager);
 
     result = eventPool->destroy();
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-
-    delete mockMemoryManager;
-    driverHandle->setMemoryManager(originalMemoryManager);
 }
 
 TEST_F(EventPoolCreateMultiDevice, GivenIPCEventPoolCreatedWithMultiDeviceThenHostVisibleIsSetInEventPoolDuringOpenIPCEventHandle) {
@@ -1054,9 +2045,8 @@ TEST_F(EventPoolCreateMultiDevice, GivenIPCEventPoolCreatedWithMultiDeviceThenHo
     devices.push_back(driverHandle->devices[0]->toHandle());
     devices.push_back(driverHandle->devices[1]->toHandle());
     NEO::MockDevice *neoDevice = static_cast<NEO::MockDevice *>(driverHandle->devices[0]->getNEODevice());
-    auto originalMemoryManager = driverHandle->getMemoryManager();
-    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(mockMemoryManager);
+    MemoryManagerEventPoolIpcMock mockMemoryManager(*neoDevice->executionEnvironment);
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
 
     auto eventPool = whiteboxCast(EventPool::create(driverHandle.get(), context, 2, devices.data(), &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -1065,13 +2055,12 @@ TEST_F(EventPoolCreateMultiDevice, GivenIPCEventPoolCreatedWithMultiDeviceThenHo
     ze_ipc_event_pool_handle_t ipcHandle = {};
     result = eventPool->getIpcHandle(&ipcHandle);
     ASSERT_EQ(result, ZE_RESULT_SUCCESS);
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     EXPECT_TRUE(ipcHandleData.isHostVisibleEventPoolAllocation);
 
-    auto prevMemoryManager = driverHandle->getMemoryManager();
-    auto currMemoryManager = new MultiDeviceEventPoolOpenIpcHandleMemoryManager(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(currMemoryManager);
-    currMemoryManager->maxCalls = 4;
+    MultiDeviceEventPoolOpenIpcHandleMemoryManager currMemoryManager(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(&currMemoryManager);
+    currMemoryManager.maxCalls = 4;
 
     ze_event_pool_handle_t ipcEventPoolHandle = {};
     result = context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
@@ -1084,14 +2073,10 @@ TEST_F(EventPoolCreateMultiDevice, GivenIPCEventPoolCreatedWithMultiDeviceThenHo
 
     ipcEventPool->closeIpcHandle();
 
-    driverHandle->setMemoryManager(prevMemoryManager);
-    delete currMemoryManager;
+    driverHandle->setMemoryManager(&mockMemoryManager);
 
     result = eventPool->destroy();
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-
-    delete mockMemoryManager;
-    driverHandle->setMemoryManager(originalMemoryManager);
 }
 
 TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOpeningIpcEventPoolUsingContextThenExpectNumDevicesSameForEventPoolOpenedAsCreate) {
@@ -1109,9 +2094,8 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOp
     deviceHandles.push_back(driverHandle->devices[2]->toHandle());
     deviceHandles.push_back(driverHandle->devices[3]->toHandle());
     NEO::MockDevice *neoDevice = static_cast<NEO::MockDevice *>(driverHandle->devices[0]->getNEODevice());
-    auto originalMemoryManager = driverHandle->getMemoryManager();
-    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(mockMemoryManager);
+    MemoryManagerEventPoolIpcMock mockMemoryManager(*neoDevice->executionEnvironment);
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
 
     auto eventPool = EventPool::create(driverHandle.get(), context, 4, deviceHandles.data(), &eventPoolDesc, result);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -1121,19 +2105,18 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOp
     result = eventPool->getIpcHandle(&ipcHandle);
     ASSERT_EQ(result, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     EXPECT_EQ(ipcHandleData.numDevices, 4u);
 
-    auto prevMemoryManager = driverHandle->getMemoryManager();
-    auto currMemoryManager = new MultiDeviceEventPoolOpenIpcHandleMemoryManager(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(currMemoryManager);
-    currMemoryManager->maxCalls = 4;
+    MultiDeviceEventPoolOpenIpcHandleMemoryManager currMemoryManager(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(&currMemoryManager);
+    currMemoryManager.maxCalls = 4;
 
     ze_event_pool_handle_t ipcEventPoolHandle = {};
     result = context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, ipcEventPoolHandle);
-    EXPECT_EQ(3u, currMemoryManager->calls);
+    EXPECT_EQ(3u, currMemoryManager.calls);
 
     auto ipcEventPool = whiteboxCast(EventPool::fromHandle(ipcEventPoolHandle));
     for (uint32_t i = 0; i < 4u; i++) {
@@ -1142,20 +2125,16 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithAllDriverDevicesWhenOp
     EXPECT_EQ(ipcHandleData.numDevices, ipcEventPool->devices.size());
 
     ipcEventPool->closeIpcHandle();
-    EXPECT_EQ(1u, currMemoryManager->alloc0FreeCall);
-    EXPECT_EQ(3u, currMemoryManager->alloc1FreeCall);
+    EXPECT_EQ(1u, currMemoryManager.alloc0FreeCall);
+    EXPECT_EQ(3u, currMemoryManager.alloc1FreeCall);
 
-    driverHandle->setMemoryManager(prevMemoryManager);
-    delete currMemoryManager;
+    driverHandle->setMemoryManager(&mockMemoryManager);
 
     result = eventPool->destroy();
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-
-    delete mockMemoryManager;
-    driverHandle->setMemoryManager(originalMemoryManager);
 }
 
-TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithSingleDeviceWhenOpeningIpcEventPoolUsingContextThenExpectOnlyThatDeviceHandleToBeUsed) {
+TEST_F(EventPoolCreateMultiDevice, GivenHostEventPoolCreatedWithSingleDeviceWhenOpeningIpcEventPoolUsingMultiDeviceContextThenFirstContextDeviceIsUsedAndHostStorageIsSharedWithOtherRootDevices) {
     uint32_t numEvents = 1;
     ze_event_pool_desc_t eventPoolDesc = {
         ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
@@ -1167,9 +2146,8 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithSingleDeviceWhenOpenin
     std::vector<ze_device_handle_t> deviceHandles;
     deviceHandles.push_back(driverHandle->devices[2]->toHandle());
     NEO::MockDevice *neoDevice = static_cast<NEO::MockDevice *>(driverHandle->devices[0]->getNEODevice());
-    auto originalMemoryManager = driverHandle->getMemoryManager();
-    MemoryManagerEventPoolIpcMock *mockMemoryManager = new MemoryManagerEventPoolIpcMock(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(mockMemoryManager);
+    MemoryManagerEventPoolIpcMock mockMemoryManager(*neoDevice->executionEnvironment);
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
 
     auto eventPool = EventPool::create(driverHandle.get(), context, 1, deviceHandles.data(), &eventPoolDesc, result);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -1179,36 +2157,231 @@ TEST_F(EventPoolCreateMultiDevice, GivenContextCreatedWithSingleDeviceWhenOpenin
     result = eventPool->getIpcHandle(&ipcHandle);
     ASSERT_EQ(result, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     EXPECT_EQ(ipcHandleData.numDevices, 1u);
+    ipcHandleData.isDeviceEventPoolAllocation = false;
 
-    auto prevMemoryManager = driverHandle->getMemoryManager();
-    auto currMemoryManager = new MultiDeviceEventPoolOpenIpcHandleMemoryManager(*neoDevice->executionEnvironment);
-    driverHandle->setMemoryManager(currMemoryManager);
-    currMemoryManager->maxCalls = 0u;
+    MultiDeviceEventPoolOpenIpcHandleMemoryManager currMemoryManager(*neoDevice->executionEnvironment);
+    driverHandle->setMemoryManager(&currMemoryManager);
+    currMemoryManager.maxCalls = 4u;
 
     ze_event_pool_handle_t ipcEventPoolHandle = {};
     result = context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, ipcEventPoolHandle);
-    EXPECT_EQ(0u, currMemoryManager->calls);
+    EXPECT_EQ(3u, currMemoryManager.calls);
 
     auto ipcEventPool = whiteboxCast(EventPool::fromHandle(ipcEventPoolHandle));
     EXPECT_EQ(ipcHandleData.numDevices, ipcEventPool->devices.size());
-    EXPECT_EQ(deviceHandles[0], ipcEventPool->devices[0]->toHandle());
+    EXPECT_EQ(driverHandle->devices[0], ipcEventPool->devices[0]);
 
     ipcEventPool->closeIpcHandle();
-    EXPECT_EQ(1u, currMemoryManager->alloc0FreeCall);
-    EXPECT_EQ(0u, currMemoryManager->alloc1FreeCall);
+    EXPECT_EQ(1u, currMemoryManager.alloc0FreeCall);
+    EXPECT_EQ(3u, currMemoryManager.alloc1FreeCall);
 
-    driverHandle->setMemoryManager(prevMemoryManager);
-    delete currMemoryManager;
+    driverHandle->setMemoryManager(&mockMemoryManager);
 
     result = eventPool->destroy();
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+}
 
-    delete mockMemoryManager;
-    driverHandle->setMemoryManager(originalMemoryManager);
+TEST_F(EventPoolCreateMultiDevice, GivenContextWithOnlyHighestRootDeviceWhenOpeningIpcEventPoolThenAllocationIsStoredForThatRootDevice) {
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_IPC,
+        1};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto highestDevice = driverHandle->devices[numRootDevices - 1];
+    auto highestDeviceHandle = highestDevice->toHandle();
+    NEO::MockDevice *neoDevice = static_cast<NEO::MockDevice *>(driverHandle->devices[0]->getNEODevice());
+    MemoryManagerEventPoolIpcMock mockMemoryManager(*neoDevice->executionEnvironment);
+    VariableBackup<NEO::MemoryManager *> memoryManagerBackup(&driverHandle->memoryManager, &mockMemoryManager);
+
+    auto eventPool = EventPool::create(driverHandle.get(), context, 1, &highestDeviceHandle, &eventPoolDesc, result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, eventPool->getIpcHandle(&ipcHandle));
+
+    ze_context_handle_t hImporterContext = nullptr;
+    ze_context_desc_t contextDesc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, driverHandle->createContext(&contextDesc, 1u, &highestDeviceHandle, &hImporterContext));
+    auto importerContext = Context::fromHandle(hImporterContext);
+
+    ze_event_pool_handle_t ipcEventPoolHandle = {};
+    result = importerContext->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, ipcEventPoolHandle);
+
+    auto ipcEventPool = whiteboxCast(EventPool::fromHandle(ipcEventPoolHandle));
+    EXPECT_EQ(highestDevice, ipcEventPool->devices[0]);
+    auto importedAllocation = ipcEventPool->getAllocation().getGraphicsAllocation(highestDevice->getRootDeviceIndex());
+    ASSERT_NE(nullptr, importedAllocation);
+    EXPECT_EQ(highestDevice->getRootDeviceIndex(), importedAllocation->getRootDeviceIndex());
+
+    ipcEventPool->closeIpcHandle();
+    importerContext->destroy();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventPool->destroy());
+}
+
+class EventPoolPeerImportMemoryManager : public FailMemoryManager {
+  public:
+    using FailMemoryManager::FailMemoryManager;
+
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+        importedRootDeviceIndices.push_back(properties.rootDeviceIndex);
+        importedHandles.push_back(static_cast<uint64_t>(osHandleData.handle));
+        importedAsHostIpc.push_back(isHostIpcAllocation);
+        if (properties.rootDeviceIndex == failingRootDeviceIndex) {
+            return nullptr;
+        }
+        auto allocation = new NEO::MockGraphicsAllocation(properties.rootDeviceIndex, buffer, sizeof(buffer));
+        allocation->internalHandle = exportedHandle;
+        allocation->peekInternalHandleResult = peekInternalHandleResult;
+        return allocation;
+    }
+
+    void closeInternalHandle(uint64_t &handle, uint32_t handleId, GraphicsAllocation *graphicsAllocation) override {
+        closedHandles.push_back(handle);
+    }
+
+    GraphicsAllocation *createGraphicsAllocationFromExistingStorage(AllocationProperties &properties, void *ptr, MultiGraphicsAllocation &multiGraphicsAllocation) override {
+        existingStorageCalls++;
+        return nullptr;
+    }
+
+    void freeGraphicsMemory(GraphicsAllocation *gfxAllocation) override {
+        freeCalls++;
+        delete gfxAllocation;
+    }
+
+    char buffer[256] = {};
+    std::vector<uint32_t> importedRootDeviceIndices;
+    std::vector<uint64_t> importedHandles;
+    std::vector<bool> importedAsHostIpc;
+    std::vector<uint64_t> closedHandles;
+    uint64_t exportedHandle = 0x55;
+    int peekInternalHandleResult = 0;
+    uint32_t failingRootDeviceIndex = std::numeric_limits<uint32_t>::max();
+    uint32_t existingStorageCalls = 0;
+    uint32_t freeCalls = 0;
+};
+
+struct EventPoolOpenIpcPeerAccessTest : public EventPoolCreateMultiDevice {
+    void SetUp() override {
+        EventPoolCreateMultiDevice::SetUp();
+
+        neoDevice = static_cast<NEO::MockDevice *>(driverHandle->devices[0]->getNEODevice());
+        originalMemoryManager = driverHandle->getMemoryManager();
+        exporterMemoryManager = std::make_unique<MemoryManagerEventPoolIpcMock>(*neoDevice->executionEnvironment);
+        exporterMemoryManager->callParentAllocateGraphicsMemoryWithProperties = false;
+        driverHandle->setMemoryManager(exporterMemoryManager.get());
+
+        ze_event_pool_desc_t eventPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr, ZE_EVENT_POOL_FLAG_IPC, 1};
+        auto exporterDeviceHandle = driverHandle->devices[2]->toHandle();
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        exporterEventPool = EventPool::create(driverHandle.get(), context, 1, &exporterDeviceHandle, &eventPoolDesc, result);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+        ASSERT_NE(nullptr, exporterEventPool);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, exporterEventPool->getIpcHandle(&ipcHandle));
+        ASSERT_TRUE(reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data)->isDeviceEventPoolAllocation);
+
+        importerMemoryManager = std::make_unique<EventPoolPeerImportMemoryManager>(*neoDevice->executionEnvironment);
+        driverHandle->setMemoryManager(importerMemoryManager.get());
+    }
+
+    void TearDown() override {
+        driverHandle->setMemoryManager(exporterMemoryManager.get());
+        exporterEventPool->destroy();
+        driverHandle->setMemoryManager(originalMemoryManager);
+        EventPoolCreateMultiDevice::TearDown();
+    }
+
+    NEO::MockDevice *neoDevice = nullptr;
+    NEO::MemoryManager *originalMemoryManager = nullptr;
+    std::unique_ptr<MemoryManagerEventPoolIpcMock> exporterMemoryManager;
+    std::unique_ptr<EventPoolPeerImportMemoryManager> importerMemoryManager;
+    L0::EventPool *exporterEventPool = nullptr;
+    ze_ipc_event_pool_handle_t ipcHandle = {};
+};
+
+TEST_F(EventPoolOpenIpcPeerAccessTest, GivenSingleDeviceDeviceEventPoolAndPeerAccessSupportedWhenOpeningIpcHandleInMultiDeviceContextThenPeerAllocationIsImportedForEachContextRootDevice) {
+    NEO::debugManager.flags.ForceZeDeviceCanAccessPerReturnValue.set(1);
+
+    ze_event_pool_handle_t ipcEventPoolHandle = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle));
+    ASSERT_NE(nullptr, ipcEventPoolHandle);
+
+    auto ipcEventPool = whiteboxCast(EventPool::fromHandle(ipcEventPoolHandle));
+    ASSERT_EQ(numRootDevices, importerMemoryManager->importedRootDeviceIndices.size());
+    EXPECT_EQ(0u, importerMemoryManager->existingStorageCalls);
+    for (uint32_t i = 1; i < numRootDevices; i++) {
+        EXPECT_EQ(importerMemoryManager->exportedHandle, importerMemoryManager->importedHandles[i]);
+        EXPECT_FALSE(importerMemoryManager->importedAsHostIpc[i]);
+    }
+    EXPECT_EQ(std::vector<uint64_t>(numRootDevices - 1, importerMemoryManager->exportedHandle), importerMemoryManager->closedHandles);
+    auto firstRootDeviceIndex = driverHandle->devices[0]->getRootDeviceIndex();
+    for (auto &device : driverHandle->devices) {
+        auto rootDeviceIndex = device->getRootDeviceIndex();
+        auto allocation = ipcEventPool->getAllocation().getGraphicsAllocation(rootDeviceIndex);
+        ASSERT_NE(nullptr, allocation);
+        EXPECT_EQ(rootDeviceIndex, allocation->getRootDeviceIndex());
+        if (rootDeviceIndex != firstRootDeviceIndex) {
+            EXPECT_EQ(std::numeric_limits<osHandle>::max(), allocation->peekSharedHandle());
+        }
+    }
+
+    ipcEventPool->closeIpcHandle();
+    EXPECT_EQ(numRootDevices, importerMemoryManager->freeCalls);
+}
+
+TEST_F(EventPoolOpenIpcPeerAccessTest, GivenSingleDeviceDeviceEventPoolAndPeerAccessNotSupportedWhenOpeningIpcHandleInMultiDeviceContextThenOnlyFirstContextDeviceGetsAllocation) {
+    NEO::debugManager.flags.ForceZeDeviceCanAccessPerReturnValue.set(0);
+
+    ze_event_pool_handle_t ipcEventPoolHandle = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle));
+    ASSERT_NE(nullptr, ipcEventPoolHandle);
+
+    auto ipcEventPool = whiteboxCast(EventPool::fromHandle(ipcEventPoolHandle));
+    auto firstRootDeviceIndex = driverHandle->devices[0]->getRootDeviceIndex();
+    ASSERT_EQ(1u, importerMemoryManager->importedRootDeviceIndices.size());
+    EXPECT_EQ(firstRootDeviceIndex, importerMemoryManager->importedRootDeviceIndices[0]);
+    EXPECT_EQ(0u, importerMemoryManager->existingStorageCalls);
+    for (auto &device : driverHandle->devices) {
+        auto rootDeviceIndex = device->getRootDeviceIndex();
+        EXPECT_EQ(rootDeviceIndex == firstRootDeviceIndex, ipcEventPool->getAllocation().getGraphicsAllocation(rootDeviceIndex) != nullptr);
+    }
+
+    ipcEventPool->closeIpcHandle();
+    EXPECT_EQ(1u, importerMemoryManager->freeCalls);
+}
+
+TEST_F(EventPoolOpenIpcPeerAccessTest, GivenSingleDeviceDeviceEventPoolAndPeerImportFailureWhenOpeningIpcHandleInMultiDeviceContextThenErrorIsReturnedAndImportedAllocationsAreFreed) {
+    NEO::debugManager.flags.ForceZeDeviceCanAccessPerReturnValue.set(1);
+    importerMemoryManager->failingRootDeviceIndex = driverHandle->devices[2]->getRootDeviceIndex();
+
+    ze_event_pool_handle_t ipcEventPoolHandle = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle));
+    EXPECT_EQ(nullptr, ipcEventPoolHandle);
+    EXPECT_EQ(3u, importerMemoryManager->importedRootDeviceIndices.size());
+    EXPECT_EQ(2u, importerMemoryManager->closedHandles.size());
+    EXPECT_EQ(2u, importerMemoryManager->freeCalls);
+}
+
+TEST_F(EventPoolOpenIpcPeerAccessTest, GivenSingleDeviceDeviceEventPoolAndExportFromImportedAllocationFailsWhenOpeningIpcHandleInMultiDeviceContextThenErrorIsReturnedAndImportedAllocationIsFreed) {
+    NEO::debugManager.flags.ForceZeDeviceCanAccessPerReturnValue.set(1);
+    importerMemoryManager->peekInternalHandleResult = -1;
+
+    ze_event_pool_handle_t ipcEventPoolHandle = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, context->openEventPoolIpcHandle(ipcHandle, &ipcEventPoolHandle));
+    EXPECT_EQ(nullptr, ipcEventPoolHandle);
+    EXPECT_EQ(1u, importerMemoryManager->importedRootDeviceIndices.size());
+    EXPECT_EQ(0u, importerMemoryManager->closedHandles.size());
+    EXPECT_EQ(1u, importerMemoryManager->freeCalls);
 }
 
 TEST_F(EventPoolCreate, GivenNullptrDeviceAndNumberOfDevicesWhenCreatingEventPoolThenReturnError) {
@@ -1256,7 +2429,7 @@ TEST_F(EventPoolCreate, whenHostVisibleFlagNotSetThenEventAllocationIsOnDevice) 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
 
-    EXPECT_EQ(NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER, eventPool->getAllocation().getAllocationType());
+    EXPECT_EQ(NEO::AllocationType::gpuTimestampDeviceBuffer, eventPool->getAllocation().getAllocationType());
     EXPECT_NE(systemMemoryBitfield, memoryManager->recentlyPassedDeviceBitfield);
     EXPECT_EQ(neoDevice->getDeviceBitfield(), memoryManager->recentlyPassedDeviceBitfield);
 }
@@ -1298,7 +2471,7 @@ TEST_F(EventCreate, givenAnEventCreatedThenTheEventHasTheDeviceCommandStreamRece
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
 
-    std::unique_ptr<Event> event(static_cast<Event *>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device)));
+    std::unique_ptr<Event> event(static_cast<Event *>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
     ASSERT_NE(nullptr, event);
     ASSERT_NE(nullptr, event->csrs[0]);
     ASSERT_EQ(device->getNEODevice()->getDefaultEngine().commandStreamReceiver, event->csrs[0]);
@@ -1318,41 +2491,37 @@ TEST_F(EventCreate, givenEventWhenSignaledAndResetFromTheHostThenCorrectDataAndO
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
 
-    auto &hwInfo = device->getHwInfo();
     auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
-    auto event = std::unique_ptr<L0::Event>(l0GfxCoreHelper.createEvent(eventPool.get(), &eventDesc, device));
+    auto event = std::unique_ptr<L0::Event>(l0GfxCoreHelper.createEvent(eventPool.get(), &eventDesc, device, result));
     ASSERT_NE(nullptr, event);
 
     if (eventPool->isImplicitScalingCapableFlagSet()) {
-        EXPECT_TRUE(event->isUsingContextEndOffset());
+        EXPECT_TRUE(event->isEventTimestampFlagSet());
     } else {
-        EXPECT_FALSE(event->isUsingContextEndOffset());
+        EXPECT_FALSE(event->isEventTimestampFlagSet());
     }
 
     uint32_t *eventCompletionMemory = reinterpret_cast<uint32_t *>(event->getCompletionFieldHostAddress());
-    uint32_t maxPacketsCount = EventPacketsCount::maxKernelSplit * NEO::TimestampPacketConstants::preferredPacketCount;
-    if (l0GfxCoreHelper.useDynamicEventPacketsCount(hwInfo)) {
-        maxPacketsCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
-    }
+    uint32_t maxPacketsCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
 
     for (uint32_t i = 0; i < maxPacketsCount; i++) {
         EXPECT_EQ(Event::STATE_INITIAL, *eventCompletionMemory);
         eventCompletionMemory = ptrOffset(eventCompletionMemory, event->getSinglePacketSize());
     }
 
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 
     uint64_t gpuAddr = event->getGpuAddress(device);
     EXPECT_EQ(gpuAddr, event->getPacketAddress(device));
 
-    event->hostSignal();
-    result = event->queryStatus();
+    event->hostSignal(false);
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(gpuAddr, event->getPacketAddress(device));
 
     event->reset();
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(gpuAddr, event->getPacketAddress(device));
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 }
@@ -1383,87 +2552,271 @@ TEST_F(EventCreate, givenAnEventCreateWithInvalidIndexUsingThisEventPoolThenErro
     ASSERT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, value);
 }
 
-HWTEST2_F(EventCreate, givenPlatformSupportMultTileWhenDebugKeyIsSetToNotUseContextEndThenDoNotUseContextEndOffset, IsXeHpOrXeHpcCore) {
-    DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.UseContextEndOffsetForEventCompletion.set(0);
-    auto &l0GfxCoreHelper = getHelper<L0GfxCoreHelper>();
-    EXPECT_TRUE(l0GfxCoreHelper.multiTileCapablePlatform());
+TEST_F(EventCreate, givenEventWhenCallingGetEventPoolThenCorrectEventPoolIsReturned) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
 
-    ze_event_pool_desc_t eventPoolDesc = {
-        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
-        nullptr,
-        0,
-        1};
-    const ze_event_desc_t eventDesc = {
-        ZE_STRUCTURE_TYPE_EVENT_DESC,
-        nullptr,
-        0,
-        0,
-        0};
-
-    ze_event_handle_t eventHandle = nullptr;
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
 
     ze_result_t result = ZE_RESULT_SUCCESS;
-    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
 
-    ze_result_t value = eventPool->createEvent(&eventDesc, &eventHandle);
-    ASSERT_NE(nullptr, eventHandle);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, value);
+    ze_event_handle_t hEvent = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, eventPool->createEvent(&eventDesc, &hEvent));
+    ASSERT_NE(nullptr, hEvent);
 
-    auto event = Event::fromHandle(eventHandle);
-    EXPECT_FALSE(event->isEventTimestampFlagSet());
-    EXPECT_FALSE(event->isUsingContextEndOffset());
+    ze_event_pool_handle_t hEventPool;
+    auto event = Event::fromHandle(hEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->getEventPool(&hEventPool));
+    EXPECT_EQ(eventPool->toHandle(), hEventPool);
 
     event->destroy();
 }
 
-HWTEST2_F(EventCreate, givenPlatformNotSupportsMultTileWhenDebugKeyIsSetToUseContextEndThenUseContextEndOffset, IsNotXeHpOrXeHpcCore) {
+TEST_F(EventCreate, givenEventWhenCallingGetSignalScopelThenCorrectScopeIsReturned) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    std::vector<ze_event_scope_flags_t> testingFlags = {
+        0,
+        ZE_EVENT_SCOPE_FLAG_SUBDEVICE,
+        ZE_EVENT_SCOPE_FLAG_DEVICE,
+        ZE_EVENT_SCOPE_FLAG_HOST};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    for (auto &flags : testingFlags) {
+        eventDesc.signal = flags;
+
+        ze_event_handle_t hEvent = nullptr;
+        ASSERT_EQ(ZE_RESULT_SUCCESS, eventPool->createEvent(&eventDesc, &hEvent));
+        ASSERT_NE(nullptr, hEvent);
+
+        ze_event_scope_flags_t signalScopeFlags = ZE_EVENT_SCOPE_FLAG_FORCE_UINT32;
+        auto event = Event::fromHandle(hEvent);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, event->getSignalScope(&signalScopeFlags));
+        EXPECT_EQ(eventDesc.signal, signalScopeFlags);
+
+        event->destroy();
+    }
+}
+
+TEST_F(EventCreate, givenEventWhenCallingGetWaitScopelThenCorrectScopeIsReturned) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    std::vector<ze_event_scope_flags_t> testingFlags = {
+        0,
+        ZE_EVENT_SCOPE_FLAG_SUBDEVICE,
+        ZE_EVENT_SCOPE_FLAG_DEVICE,
+        ZE_EVENT_SCOPE_FLAG_HOST};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    for (auto &flags : testingFlags) {
+        eventDesc.wait = flags;
+
+        ze_event_handle_t hEvent = nullptr;
+        ASSERT_EQ(ZE_RESULT_SUCCESS, eventPool->createEvent(&eventDesc, &hEvent));
+        ASSERT_NE(nullptr, hEvent);
+
+        ze_event_scope_flags_t waitScopeFlags = ZE_EVENT_SCOPE_FLAG_FORCE_UINT32;
+        auto event = Event::fromHandle(hEvent);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, event->getWaitScope(&waitScopeFlags));
+        EXPECT_EQ(eventDesc.wait, waitScopeFlags);
+
+        event->destroy();
+    }
+}
+
+template <typename GfxFamily>
+struct MockL0GfxCoreHelperAlwaysAllocateEventInLocalMemHw : L0::L0GfxCoreHelperHw<GfxFamily> {
+    bool alwaysAllocateEventInLocalMem() const override { return true; }
+};
+
+HWTEST_F(EventCreate, GivenEnabledTimestampPoolAllocatorAndForcedEventAllocateInLocalMemoryWhenCreatingMultipleEventPoolsForSingleDeviceThenEventsUseSharedAllocationAndHaveUniqueAddresses) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.UseContextEndOffsetForEventCompletion.set(1);
-    auto &l0GfxCoreHelper = getHelper<L0GfxCoreHelper>();
-    EXPECT_FALSE(l0GfxCoreHelper.multiTileCapablePlatform());
+    NEO::debugManager.flags.EnableTimestampPoolAllocator.set(1);
+
+    MockL0GfxCoreHelperAlwaysAllocateEventInLocalMemHw<FamilyType> mockL0GfxCoreHelper{};
+    std::unique_ptr<ApiGfxCoreHelper> l0GfxCoreHelperBackup(static_cast<ApiGfxCoreHelper *>(&mockL0GfxCoreHelper));
+    device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[0]->apiGfxCoreHelper.swap(l0GfxCoreHelperBackup);
+
+    ze_device_handle_t devices[] = {device->toHandle()};
+
+    std::vector<std::unique_ptr<L0::EventPool>> eventPools;
+    std::vector<std::unique_ptr<Event>> events;
+    std::set<uint64_t> gpuAddresses;
+
+    constexpr size_t numEventPools = 5;
+    constexpr size_t numEventsInPool = 2;
+    constexpr size_t numEvents = numEventPools * numEventsInPool;
 
     ze_event_pool_desc_t eventPoolDesc = {
         ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
         nullptr,
-        0,
-        1};
-    const ze_event_desc_t eventDesc = {
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+        numEventsInPool};
+
+    ze_event_desc_t eventDesc = {
         ZE_STRUCTURE_TYPE_EVENT_DESC,
         nullptr,
         0,
-        0,
-        0};
-
-    ze_event_handle_t eventHandle = nullptr;
+        ZE_EVENT_SCOPE_FLAG_DEVICE,
+        ZE_EVENT_SCOPE_FLAG_DEVICE};
 
     ze_result_t result = ZE_RESULT_SUCCESS;
-    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    ASSERT_NE(nullptr, eventPool);
 
-    ze_result_t value = eventPool->createEvent(&eventDesc, &eventHandle);
-    ASSERT_NE(nullptr, eventHandle);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, value);
+    for (size_t i = 0; i < numEventPools; i++) {
+        eventPools.emplace_back(EventPool::create(driverHandle.get(), context, 1, devices, &eventPoolDesc, result));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+        EXPECT_NE(nullptr, eventPools[i]);
 
-    auto event = Event::fromHandle(eventHandle);
-    EXPECT_FALSE(event->isEventTimestampFlagSet());
-    EXPECT_TRUE(event->isUsingContextEndOffset());
+        for (size_t j = 0; j < numEventsInPool; j++) {
+            eventDesc.index = static_cast<uint32_t>(j);
+            events.emplace_back(static_cast<Event *>(getHelper<L0GfxCoreHelper>().createEvent(eventPools[i].get(), &eventDesc, device, result)));
+            EXPECT_NE(nullptr, events.back());
+        }
+    }
 
-    event->destroy();
+    const auto expectedSharedAllocation = events[0]->getAllocation(device);
+    EXPECT_TRUE(device->getNEODevice()->getDeviceTimestampPoolAllocator().isPoolBuffer(expectedSharedAllocation));
+
+    for (auto &event : events) {
+        EXPECT_EQ(expectedSharedAllocation, event->getAllocation(device));
+
+        uint64_t gpuAddress = event->getGpuAddress(device);
+        auto [iterator, wasInserted] = gpuAddresses.insert(gpuAddress);
+        EXPECT_TRUE(wasInserted) << "Duplicate GPU address found: " << std::hex << "0x" << gpuAddress;
+    }
+
+    EXPECT_EQ(numEvents, gpuAddresses.size());
+
+    device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[0]->apiGfxCoreHelper.swap(l0GfxCoreHelperBackup);
+    l0GfxCoreHelperBackup.release();
+}
+
+HWTEST_F(EventPoolCreateMultiDevice, GivenEnabledTimestampPoolAllocatorAndForcedLocalMemoryWhenCreatingEventPoolsForTwoDevicesThenEventsShareAllocationWithinDeviceButNotBetweenDevices) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableTimestampPoolAllocator.set(1);
+
+    ASSERT_GE(driverHandle->devices.size(), 2u);
+
+    auto device0 = driverHandle->devices[0];
+    auto device1 = driverHandle->devices[1];
+    auto neoDevice0 = device0->getNEODevice();
+    auto neoDevice1 = device1->getNEODevice();
+
+    VariableBackup<std::unique_ptr<ApiGfxCoreHelper>> backupApiGfxCoreHelper0(&neoDevice0->getExecutionEnvironment()->rootDeviceEnvironments[0]->apiGfxCoreHelper, std::make_unique<MockL0GfxCoreHelperAlwaysAllocateEventInLocalMemHw<FamilyType>>());
+    VariableBackup<std::unique_ptr<ApiGfxCoreHelper>> backupApiGfxCoreHelper1(&neoDevice1->getExecutionEnvironment()->rootDeviceEnvironments[1]->apiGfxCoreHelper, std::make_unique<MockL0GfxCoreHelperAlwaysAllocateEventInLocalMemHw<FamilyType>>());
+
+    std::vector<std::unique_ptr<L0::EventPool>> eventPoolsDevice0;
+    std::vector<std::unique_ptr<L0::EventPool>> eventPoolsDevice1;
+    std::vector<std::unique_ptr<Event>> eventsDevice0;
+    std::vector<std::unique_ptr<Event>> eventsDevice1;
+    std::set<uint64_t> gpuAddressesDevice0;
+    std::set<uint64_t> gpuAddressesDevice1;
+
+    constexpr size_t numEventPools = 3;
+    constexpr size_t numEventsInPool = 2;
+    constexpr size_t numEvents = numEventPools * numEventsInPool;
+
+    ze_event_pool_desc_t eventPoolDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
+        nullptr,
+        ZE_EVENT_POOL_FLAG_HOST_VISIBLE,
+        numEventsInPool};
+
+    ze_event_desc_t eventDesc = {
+        ZE_STRUCTURE_TYPE_EVENT_DESC,
+        nullptr,
+        0,
+        ZE_EVENT_SCOPE_FLAG_DEVICE,
+        ZE_EVENT_SCOPE_FLAG_DEVICE};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    auto &l0GfxCoreHelper = neoDevice0->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
+
+    // Create events for device0
+    ze_device_handle_t devices0[] = {device0->toHandle()};
+    for (size_t i = 0; i < numEventPools; i++) {
+        eventPoolsDevice0.emplace_back(EventPool::create(driverHandle.get(), context, 1, devices0, &eventPoolDesc, result));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+        EXPECT_NE(nullptr, eventPoolsDevice0[i]);
+
+        for (size_t j = 0; j < numEventsInPool; j++) {
+            eventDesc.index = static_cast<uint32_t>(j);
+            eventsDevice0.emplace_back(static_cast<Event *>(l0GfxCoreHelper.createEvent(eventPoolsDevice0[i].get(), &eventDesc, device0, result)));
+            EXPECT_NE(nullptr, eventsDevice0.back());
+        }
+    }
+
+    // Create events for device1
+    ze_device_handle_t devices1[] = {device1->toHandle()};
+    for (size_t i = 0; i < numEventPools; i++) {
+        eventPoolsDevice1.emplace_back(EventPool::create(driverHandle.get(), context, 1, devices1, &eventPoolDesc, result));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+        EXPECT_NE(nullptr, eventPoolsDevice1[i]);
+
+        for (size_t j = 0; j < numEventsInPool; j++) {
+            eventDesc.index = static_cast<uint32_t>(j);
+            eventsDevice1.emplace_back(static_cast<Event *>(l0GfxCoreHelper.createEvent(eventPoolsDevice1[i].get(), &eventDesc, device1, result)));
+            EXPECT_NE(nullptr, eventsDevice1.back());
+        }
+    }
+
+    // Verify allocations and GPU addresses for device0
+    const auto expectedSharedAllocationDevice0 = eventsDevice0[0]->getAllocation(device0);
+    EXPECT_TRUE(neoDevice0->getDeviceTimestampPoolAllocator().isPoolBuffer(expectedSharedAllocationDevice0));
+    EXPECT_FALSE(neoDevice1->getDeviceTimestampPoolAllocator().isPoolBuffer(expectedSharedAllocationDevice0));
+
+    for (auto &event : eventsDevice0) {
+        EXPECT_EQ(expectedSharedAllocationDevice0, event->getAllocation(device0));
+
+        uint64_t gpuAddress = event->getGpuAddress(device0);
+        auto [iterator, wasInserted] = gpuAddressesDevice0.insert(gpuAddress);
+        EXPECT_TRUE(wasInserted) << "Duplicate GPU address found for device0: " << std::hex << "0x" << gpuAddress;
+    }
+
+    // Verify allocations and GPU addresses for device1
+    const auto expectedSharedAllocationDevice1 = eventsDevice1[0]->getAllocation(device1);
+    EXPECT_TRUE(neoDevice1->getDeviceTimestampPoolAllocator().isPoolBuffer(expectedSharedAllocationDevice1));
+    EXPECT_FALSE(neoDevice0->getDeviceTimestampPoolAllocator().isPoolBuffer(expectedSharedAllocationDevice1));
+
+    for (auto &event : eventsDevice1) {
+        EXPECT_EQ(expectedSharedAllocationDevice1, event->getAllocation(device1));
+
+        uint64_t gpuAddress = event->getGpuAddress(device1);
+        auto [iterator, wasInserted] = gpuAddressesDevice1.insert(gpuAddress);
+        EXPECT_TRUE(wasInserted) << "Duplicate GPU address found for device1: " << std::hex << "0x" << gpuAddress;
+    }
+
+    EXPECT_NE(expectedSharedAllocationDevice0, expectedSharedAllocationDevice1);
+    EXPECT_EQ(numEvents, gpuAddressesDevice0.size());
+    EXPECT_EQ(numEvents, gpuAddressesDevice1.size());
 }
 
 using EventSynchronizeTest = Test<EventFixture<1, 0>>;
-using EventUsedPacketSignalSynchronizeTest = Test<EventUsedPacketSignalFixture<1, 0, 0, -1>>;
+using EventSynchronizeTimestampTest = Test<EventFixture<1, 1>>;
+using EventUsedPacketSignalSynchronizeTest = Test<EventCompactL3FlushFixture<1, 0, -1>>;
 
-TEST_F(EventSynchronizeTest, GivenGpuHangWhenHostSynchronizeIsCalledThenDeviceLostIsReturned) {
-    const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
-    csr->isGpuHangDetectedReturnValue = true;
-
-    event->csrs[0] = csr.get();
-    event->gpuHangCheckPeriod = 0ms;
+HWTEST_F(EventSynchronizeTest, GivenGpuHangWhenHostSynchronizeIsCalledThenDeviceLostIsReturned) {
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = true;
 
     constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
     auto result = event->hostSynchronize(timeout);
@@ -1471,12 +2824,38 @@ TEST_F(EventSynchronizeTest, GivenGpuHangWhenHostSynchronizeIsCalledThenDeviceLo
     EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
 }
 
+HWTEST_F(EventSynchronizeTest, GivenHangHappenedBeforePeriodicHangCheckAndForceGpuStatusCheckDuringHostSynchronizeThenHangIsDetected) {
+    NEO::debugManager.flags.ForceGpuStatusCheckOnSuccessfulEventHostSynchronize.set(1);
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = true;
+    uint32_t *hostAddr = static_cast<uint32_t *>(event->getHostAddress());
+    *hostAddr = Event::STATE_SIGNALED;
+
+    auto result = event->hostSynchronize(0);
+
+    EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
+}
+
+TEST_F(EventSynchronizeTest, GivenEventCompletedAndForceGpuStatusCheckThenHostSynchronizeReturnsSuccess) {
+    NEO::debugManager.flags.ForceGpuStatusCheckOnSuccessfulEventHostSynchronize.set(1);
+
+    const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+
+    event->csrs[0] = csr.get();
+    uint32_t *hostAddr = static_cast<uint32_t *>(event->getHostAddress());
+    *hostAddr = Event::STATE_SIGNALED;
+
+    auto result = event->hostSynchronize(0);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
 TEST_F(EventSynchronizeTest, GivenNoGpuHangAndOneNanosecondTimeoutWhenHostSynchronizeIsCalledThenResultNotReadyIsReturnedDueToTimeout) {
     const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
     csr->isGpuHangDetectedReturnValue = false;
 
     event->csrs[0] = csr.get();
-    event->gpuHangCheckPeriod = 0ms;
 
     constexpr uint64_t timeoutNanoseconds = 1;
     auto result = event->hostSynchronize(timeoutNanoseconds);
@@ -1484,15 +2863,134 @@ TEST_F(EventSynchronizeTest, GivenNoGpuHangAndOneNanosecondTimeoutWhenHostSynchr
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 }
 
-TEST_F(EventSynchronizeTest, GivenLongPeriodOfGpuCheckAndOneNanosecondTimeoutWhenHostSynchronizeIsCalledThenResultNotReadyIsReturnedDueToTimeout) {
+TEST_F(EventSynchronizeTest, GivenShortTimeoutAndNotReadyEventWhenHostSynchronizeIsCalledThenTPauseIsNotCalled) {
+    int64_t eventHostSyncThreshold = WaitUtils::defaultWaitPkgThresholdForEventHostSyncInMicroSeconds;
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::tpause);
+    VariableBackup<int64_t> backupWaitpkgThresholdForEventHostSync(
+        &WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds,
+        eventHostSyncThreshold);
+
     const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr->isGpuHangDetectedReturnValue = false;
+
     event->csrs[0] = csr.get();
-    event->gpuHangCheckPeriod = 50000000ms;
+
+    constexpr uint64_t timeoutNanoseconds = 1;
+    EXPECT_EQ(CpuIntrinsicsTests::tpauseCounter, 0u);
+    auto result = event->hostSynchronize(timeoutNanoseconds);
+    EXPECT_EQ(CpuIntrinsicsTests::tpauseCounter, 0u);
+    CpuIntrinsicsTests::tpauseCounter = 0;
+
+    EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+}
+
+TEST_F(EventSynchronizeTest, GivenUllsLightThresholdAndShortTimeoutWhenHostSynchronizeIsCalledThenTPauseIsNotCalled) {
+    int64_t ullsLightThreshold = WaitUtils::defaultWaitPkgThresholdForUllsLightInMicroSeconds;
+    int64_t eventHostSyncThreshold = WaitUtils::defaultWaitPkgThresholdForEventHostSyncInMicroSeconds;
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::tpause);
+    VariableBackup<int64_t> backupWaitpkgThreshold(&WaitUtils::waitPkgThresholdInMicroSeconds, ullsLightThreshold);
+    VariableBackup<int64_t> backupWaitpkgThresholdForEventHostSync(
+        &WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds,
+        eventHostSyncThreshold);
+
+    const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr->isGpuHangDetectedReturnValue = false;
+
+    event->csrs[0] = csr.get();
+
+    constexpr uint64_t timeoutNanoseconds = 1;
+    EXPECT_EQ(CpuIntrinsicsTests::tpauseCounter, 0u);
+    auto result = event->hostSynchronize(timeoutNanoseconds);
+    EXPECT_EQ(CpuIntrinsicsTests::tpauseCounter, 0u);
+    CpuIntrinsicsTests::tpauseCounter = 0;
+
+    EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenNotReadyEventAndInfiniteTimeoutWhenHostSynchronizeIsCalledThenTPauseIsCalled) {
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::tpause);
+    VariableBackup<int64_t> backupWaitpkgThresholdForEventHostSync(&WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds, 0);
+    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
+    VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_CLEARED);
+    VariableBackup<uint32_t> backupPauseOffset(&CpuIntrinsicsTests::pauseOffset);
+    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
+    VariableBackup<std::function<void()>> backupControlTpause(&CpuIntrinsicsTests::controlTpause);
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = false;
+
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+
+    auto *hostAddr = static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), event->getContextStartOffset()));
+    *hostAddr = Event::STATE_CLEARED;
+
+    const auto testStartTime = std::chrono::high_resolution_clock::now();
+    CpuIntrinsicsTests::pauseCounter = 0u;
+    CpuIntrinsicsTests::pauseAddress = hostAddr;
+    CpuIntrinsicsTests::setupPauseAddress = [hostAddr, testStartTime]() {
+        if (std::chrono::high_resolution_clock::now() - testStartTime > 10ms) {
+            *hostAddr = Event::STATE_SIGNALED;
+        }
+    };
+    CpuIntrinsicsTests::controlTpause = [hostAddr]() {
+        *hostAddr = Event::STATE_SIGNALED;
+    };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(0u, CpuIntrinsicsTests::tpauseCounter.load());
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+}
+
+HWTEST_F(EventSynchronizeTest, GivenNotReadyEventAndInfiniteTimeoutWhenHostSynchronizeIsCalledThenTPauseUsesEventHostSyncCounterValue) {
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::tpause);
+    VariableBackup<int64_t> backupWaitpkgThresholdForEventHostSync(&WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds, 0);
+    uint64_t ullsLightCounterValue = WaitUtils::defaultCounterValueForUllsLight;
+    VariableBackup<uint64_t> backupWaitpkgCounterValue(&WaitUtils::waitpkgCounterValue, ullsLightCounterValue);
+    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
+    VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_CLEARED);
+    VariableBackup<uint32_t> backupPauseOffset(&CpuIntrinsicsTests::pauseOffset);
+    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
+    VariableBackup<std::function<void()>> backupControlTpause(&CpuIntrinsicsTests::controlTpause);
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = false;
+
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+    CpuIntrinsicsTests::lastTpauseCounter = 0u;
+
+    auto *hostAddr = static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), event->getContextStartOffset()));
+    *hostAddr = Event::STATE_CLEARED;
+
+    CpuIntrinsicsTests::pauseCounter = 0u;
+    CpuIntrinsicsTests::pauseAddress = hostAddr;
+    CpuIntrinsicsTests::setupPauseAddress = []() {};
+    CpuIntrinsicsTests::controlTpause = [hostAddr]() {
+        *hostAddr = Event::STATE_SIGNALED;
+    };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(0u, CpuIntrinsicsTests::tpauseCounter.load());
+    EXPECT_EQ(CpuIntrinsicsTests::rdtscRetValue + WaitUtils::defaultCounterValueForEventHostSync, CpuIntrinsicsTests::lastTpauseCounter.load());
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+    CpuIntrinsicsTests::lastTpauseCounter = 0u;
+}
+
+HWTEST_F(EventSynchronizeTest, GivenGpuHangAndOneNanosecondTimeoutWhenHostSynchronizeIsCalledThenCsrHangCheckPeriodIsRespected) {
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = true;
+    csr.gpuHangCheckPeriodUs = std::numeric_limits<int64_t>::max();
 
     constexpr uint64_t timeoutNanoseconds = 1;
     auto result = event->hostSynchronize(timeoutNanoseconds);
 
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+
+    csr.gpuHangCheckPeriodUs = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, event->hostSynchronize(timeoutNanoseconds));
 }
 
 TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithTimeoutZeroAndStateInitialHostSynchronizeReturnsNotReady) {
@@ -1500,14 +2998,994 @@ TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithTimeoutZeroAndSt
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 }
 
+TEST_F(EventSynchronizeTest, GivenNotReadyEventWhenHostSynchronizeWithZeroTimeoutThenCoreIsNotYielded) {
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(0));
+    EXPECT_EQ(yieldCountBefore, CpuIntrinsicsTests::yieldCounter);
+}
+
+TEST_F(EventSynchronizeTest, GivenNotReadyEventWhenHostSynchronizeWithTimeoutThenCoreIsYieldedBetweenPolls) {
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(10));
+    EXPECT_GT(CpuIntrinsicsTests::yieldCounter.load(), yieldCountBefore);
+}
+
+TEST_F(EventSynchronizeTest, GivenNotReadyCounterBasedEventWhenHostSynchronizeWithTimeoutThenCoreIsYieldedBetweenPolls) {
+    event->enableCounterBasedMode(true, 0u);
+    uint64_t counterValue = 0;
+    event->inOrderExecHelper.initializeLocalTempStorage();
+    event->inOrderExecHelper.assignData(1, 0, 1, 1, event->getAllocation(device), event->getAllocation(device), 0, 0, &counterValue, 0, 0, false, false);
+
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(10));
+    EXPECT_GT(CpuIntrinsicsTests::yieldCounter.load(), yieldCountBefore);
+}
+
+TEST_F(EventSynchronizeTest, GivenNotReadyCounterBasedEventWhenHostSynchronizeWithZeroTimeoutThenCoreIsNotYielded) {
+    event->enableCounterBasedMode(true, 0u);
+    uint64_t counterValue = 0;
+    event->inOrderExecHelper.initializeLocalTempStorage();
+    event->inOrderExecHelper.assignData(1, 0, 1, 1, event->getAllocation(device), event->getAllocation(device), 0, 0, &counterValue, 0, 0, false, false);
+
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(0));
+    EXPECT_EQ(yieldCountBefore, CpuIntrinsicsTests::yieldCounter);
+}
+
 TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithNonZeroTimeoutAndStateInitialHostSynchronizeReturnsNotReady) {
     ze_result_t result = event->hostSynchronize(10);
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 }
 
+TEST_F(EventSynchronizeTest, GivenEventHostSynchronizeWaitStrategyDebugFlagsWhenDefaultsAreUsedThenKmdWaitStrategyAndDefaultTimingsAreSet) {
+    EXPECT_EQ(3, NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.get());
+    EXPECT_FALSE(NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.get());
+    EXPECT_TRUE(NEO::debugManager.flags.EventHostSynchronizeWindowsDiscreteKmdWait.get());
+    EXPECT_EQ(-1, NEO::debugManager.flags.EventHostSynchronizeWindowsDiscreteKmdWaitUlls.get());
+    EXPECT_EQ(5000, NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.get());
+    EXPECT_EQ(750, NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.get());
+    EXPECT_EQ(50, NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.get());
+    EXPECT_EQ(20000, NEO::debugManager.flags.EventHostSynchronizeWaitStrategyMinTimeoutMicroseconds.get());
+    EXPECT_EQ(12000, NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.get());
+    EXPECT_EQ(750000, NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWaitTimeoutNanoseconds.get());
+}
+
+TEST(EventHostSynchronizeWaitTest, givenFiniteTimeoutWhenCalculatingKmdWaitTimeoutThenFinalPollingWindowIsReserved) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategyMinTimeoutMicroseconds.set(20000);
+
+    EXPECT_EQ(70000000u, EventHostSynchronize::getKmdWaitTimeout(100000000u, 10000000u));
+    EXPECT_EQ(0u, EventHostSynchronize::getKmdWaitTimeout(32999999u, 12000000u));
+    EXPECT_EQ(0u, EventHostSynchronize::getKmdWaitTimeout(30000000u, 10000000u));
+    EXPECT_EQ(0u, EventHostSynchronize::getKmdWaitTimeout(10000000u, 10000000u));
+    EXPECT_EQ(std::numeric_limits<uint64_t>::max(), EventHostSynchronize::getKmdWaitTimeout(std::numeric_limits<uint64_t>::max(), 10000000u));
+}
+
+TEST(EventHostSynchronizeWaitTest, givenDisabledFinalPollingWindowWhenCalculatingKmdWaitTimeoutThenAllRemainingTimeIsReturned) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategyMinTimeoutMicroseconds.set(0);
+
+    EXPECT_EQ(90000000u, EventHostSynchronize::getKmdWaitTimeout(100000000u, 10000000u));
+}
+
+HWTEST_F(EventSynchronizeTest, GivenWaitControllerWhenStrategiesAndInputsAreChangedThenExpectedWaitActionsAreReturned) {
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    auto &rootDeviceEnvironment = *neoDevice->executionEnvironment->rootDeviceEnvironments[0];
+
+    auto setWaitStrategy = [](int32_t strategy, int64_t initialPollUs, int64_t pollUs, int64_t sleepUs) {
+        NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(strategy);
+        NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(initialPollUs);
+        NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(pollUs);
+        NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(sleepUs);
+        NEO::debugManager.flags.EventHostSynchronizeWaitStrategyMinTimeoutMicroseconds.set(20);
+    };
+
+    auto resetAcLineStatus = [&csr]() {
+        csr.getAcLineConnectedCallBase = false;
+        csr.getAcLineConnectedCalled = 0u;
+        csr.getAcLineConnectedLastUpdateStatus = false;
+        csr.getAcLineConnectedReturnValue = false;
+    };
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        rootDeviceEnvironment.osInterface.reset();
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+
+        EXPECT_EQ(0, waitAction.sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        rootDeviceEnvironment.osInterface = std::make_unique<NEO::OSInterface>();
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+
+        EXPECT_EQ(0, waitAction.sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        rootDeviceEnvironment.osInterface = std::make_unique<NEO::OSInterface>();
+        rootDeviceEnvironment.osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+
+        EXPECT_EQ(0, waitAction.sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+
+    rootDeviceEnvironment.osInterface = std::make_unique<NEO::OSInterface>();
+    rootDeviceEnvironment.osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    {
+        setWaitStrategy(1, 10, 5, 3);
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(15, std::numeric_limits<uint64_t>::max(), 15000);
+
+        EXPECT_EQ(3, waitAction.sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+
+    {
+        setWaitStrategy(1, 10, 5, 3);
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(14, std::numeric_limits<uint64_t>::max(), 14000);
+
+        EXPECT_EQ(0, waitAction.sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        resetAcLineStatus();
+        csr.getAcLineConnectedReturnValue = false;
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto firstWaitAction = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+        csr.getAcLineConnectedReturnValue = true;
+        auto secondWaitAction = waitController.getAction(10, std::numeric_limits<uint64_t>::max(), 10000);
+
+        EXPECT_EQ(10, firstWaitAction.sleepUs);
+        EXPECT_EQ(10, secondWaitAction.sleepUs);
+        EXPECT_EQ(1u, csr.getAcLineConnectedCalled);
+        EXPECT_TRUE(csr.getAcLineConnectedLastUpdateStatus);
+    }
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        resetAcLineStatus();
+        csr.getAcLineConnectedReturnValue = true;
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+
+        EXPECT_EQ(0, waitAction.sleepUs);
+        EXPECT_EQ(1u, csr.getAcLineConnectedCalled);
+    }
+
+    {
+        setWaitStrategy(3, 0, 0, 10);
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto waitAction = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+
+        EXPECT_EQ(0, waitAction.sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto infiniteTimeout = waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0);
+        auto shortFiniteTimeout = waitController.getAction(10, 20000, 10000);
+        auto longFiniteTimeout = waitController.getAction(10, 40000, 10000);
+        auto nearDeadline = waitController.getAction(10, 100000, 80000);
+        auto deadlineReached = waitController.getAction(10, 100000, 100000);
+
+        EXPECT_EQ(10, infiniteTimeout.sleepUs);
+        EXPECT_EQ(0, shortFiniteTimeout.sleepUs);
+        EXPECT_EQ(10, longFiniteTimeout.sleepUs);
+        EXPECT_EQ(0, nearDeadline.sleepUs);
+        EXPECT_EQ(0, deadlineReached.sleepUs);
+    }
+
+    {
+        setWaitStrategy(2, 0, 0, 10);
+        NEO::debugManager.flags.EventHostSynchronizeWaitStrategyMinTimeoutMicroseconds.set(0);
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        auto finiteTimeout = waitController.getAction(0, 1, 0);
+        auto deadlineReached = waitController.getAction(10, 100000, 100000);
+
+        EXPECT_EQ(10, finiteTimeout.sleepUs);
+        EXPECT_EQ(0, deadlineReached.sleepUs);
+    }
+
+    {
+        setWaitStrategy(2, 0, -1, 10);
+        resetAcLineStatus();
+        L0::EventHostSynchronize::WaitController waitController(csr);
+
+        EXPECT_EQ(0, waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0).sleepUs);
+
+        NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(0);
+        NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(0);
+        EXPECT_EQ(0, waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0).sleepUs);
+
+        NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(std::numeric_limits<int64_t>::max());
+        NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+        EXPECT_EQ(0, waitController.getAction(0, std::numeric_limits<uint64_t>::max(), 0).sleepUs);
+        EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    }
+}
+
+HWTEST_F(EventSynchronizeTest, GivenZeroTimeoutWhenEventHostSynchronizeWaitStrategyIsEnabledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+
+    event->hostSynchronize(0);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenDisabledEventHostSynchronizeWaitStrategyWhenHostSynchronizeIsCalledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(1);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenFiniteTimeoutAndBatteryOnlyEventHostSynchronizeWaitStrategyAndWddmWhenHostSynchronizeIsCalledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+    csr.getAcLineConnectedReturnValue = false;
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenBatteryOnlyEventHostSynchronizeWaitStrategyAndDrmWhenHostSynchronizeIsCalledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenDrmAndKmdWaitStrategyWhenSynchronizingRegularEventThenUserFenceWaitsOnEventPacketWithNotEqual) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+    constexpr int64_t expectedTimeout = 123456789;
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWaitTimeoutNanoseconds.set(expectedTimeout);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = true;
+
+    auto eventAddress = static_cast<uint32_t *>(event->getCompletionFieldHostAddress());
+    *eventAddress = Event::STATE_CLEARED;
+    csr.waitUserFenceParams.onWait = [&]() { *eventAddress = Event::STATE_SIGNALED; };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(NEO::UserFenceWaitOperation::notEqual, csr.waitUserFenceParams.latestWaitOperation);
+    EXPECT_EQ(NEO::UserFenceValueWidth::u32, csr.waitUserFenceParams.latestWaitValueWidth);
+    EXPECT_EQ(castToUint64(eventAddress), csr.waitUserFenceParams.latestWaitedAddress);
+    EXPECT_EQ(static_cast<uint64_t>(Event::STATE_CLEARED), csr.waitUserFenceParams.latestWaitedValue);
+    EXPECT_EQ(expectedTimeout, csr.waitUserFenceParams.latestWaitedTimeout);
+    EXPECT_FALSE(csr.waitUserFenceParams.userInterrupt);
+    EXPECT_EQ(event->getAllocation(device), csr.waitUserFenceParams.latestAllocForInterruptWait);
+}
+
+namespace {
+struct EventCompletingAfterPolling : L0::EventImp<uint32_t> {
+    EventCompletingAfterPolling(L0::Device *device, NEO::CommandStreamReceiver *csr) : L0::EventImp<uint32_t>(0, device, false) {
+        this->setCsr(csr, true);
+        this->setWindowsDiscreteKmdWaitEnabled(true);
+    }
+
+    using L0::EventImp<uint32_t>::queryStatus;
+    ze_result_t queryStatus(int64_t timeSinceWait, bool blockOnMiss) override {
+        return ++this->queryCount == 3 ? ZE_RESULT_SUCCESS : ZE_RESULT_NOT_READY;
+    }
+
+    uint32_t queryCount = 0;
+};
+
+void setUpWindowsDiscreteKmdWait(int64_t kmdWaitTimeoutNanoseconds) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeWindowsDiscreteKmdWaitTimeoutNanoseconds.set(kmdWaitTimeoutNanoseconds);
+}
+} // namespace
+
+HWTEST_F(EventSynchronizeTest, GivenWorkFlushedAfterEventWhenSynchronizingThenKmdWaiterForEventSubmissionIsCreatedOnceAndWaitedOnWithTimeout) {
+    DebugManagerStateRestore restore;
+    setUpWindowsDiscreteKmdWait(2000000);
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->setWindowsDiscreteKmdWaitEnabled(true);
+    const auto signalTaskCount = csr.peekTaskCount();
+    event->setCleanupTaskCount(&csr, signalTaskCount);
+    event->setSignalFlushStamp(5);
+    csr.taskCount++;
+
+    auto eventAddress = static_cast<uint32_t *>(event->getCompletionFieldHostAddress());
+    *eventAddress = Event::STATE_CLEARED;
+    csr.kmdWaiterParams.onWait = [&]() {
+        if (csr.kmdWaiterParams.waitCount == 2u) {
+            *eventAddress = Event::STATE_SIGNALED;
+        }
+    };
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(1u, csr.kmdWaiterParams.createCount);
+    EXPECT_EQ(5u, csr.kmdWaiterParams.latestFlushStamp);
+    EXPECT_EQ(signalTaskCount, csr.kmdWaiterParams.latestTaskCount);
+    EXPECT_EQ(2u, csr.kmdWaiterParams.waitCount);
+    EXPECT_EQ(2000000u, csr.kmdWaiterParams.latestWaitTimeout);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenMissingSignalFlushStampNoKmdWaitBudgetOrNoWaiterWhenSynchronizingEventThenEventIsPolled) {
+    DebugManagerStateRestore restore;
+    setUpWindowsDiscreteKmdWait(2000000);
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    EventCompletingAfterPolling eventNotSignaledByItsCsr(device, &csr);
+    eventNotSignaledByItsCsr.setSignalFlushStamp(5);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventNotSignaledByItsCsr.hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(3u, eventNotSignaledByItsCsr.queryCount);
+
+    EventCompletingAfterPolling eventWithoutFlushStamp(device, &csr);
+    eventWithoutFlushStamp.setCleanupTaskCount(&csr, csr.peekTaskCount());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventWithoutFlushStamp.hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(3u, eventWithoutFlushStamp.queryCount);
+
+    event->setWindowsDiscreteKmdWaitEnabled(true);
+    event->setCleanupTaskCount(&csr, csr.peekTaskCount());
+    event->setSignalFlushStamp(5);
+    *static_cast<uint32_t *>(event->getCompletionFieldHostAddress()) = Event::STATE_CLEARED;
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(1));
+    EXPECT_EQ(0u, csr.kmdWaiterParams.createCount);
+
+    csr.kmdWaiterParams.createWaiter = false;
+    EventCompletingAfterPolling eventWithoutWaiter(device, &csr);
+    eventWithoutWaiter.setCleanupTaskCount(&csr, csr.peekTaskCount());
+    eventWithoutWaiter.setSignalFlushStamp(5);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventWithoutWaiter.hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(3u, eventWithoutWaiter.queryCount);
+    EXPECT_EQ(1u, csr.kmdWaiterParams.createCount);
+    EXPECT_EQ(0u, csr.kmdWaiterParams.waitCount);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenMonitoredFenceReachedBeforeEventOrFailedKmdWaitWhenSynchronizingThenRemainingWaitIsPolled) {
+    DebugManagerStateRestore restore;
+    setUpWindowsDiscreteKmdWait(2000000);
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    for (const auto waitStatus : {std::optional<NEO::WaitStatus>(NEO::WaitStatus::ready), std::optional<NEO::WaitStatus>()}) {
+        csr.kmdWaiterParams.waitStatus = waitStatus;
+        csr.kmdWaiterParams.waitCount = 0;
+        EventCompletingAfterPolling pollingEvent(device, &csr);
+        pollingEvent.setCleanupTaskCount(&csr, csr.peekTaskCount());
+        pollingEvent.setSignalFlushStamp(5);
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, pollingEvent.hostSynchronize(std::numeric_limits<uint64_t>::max()));
+        EXPECT_EQ(3u, pollingEvent.queryCount);
+        EXPECT_EQ(1u, csr.kmdWaiterParams.waitCount);
+    }
+}
+
+HWTEST_F(EventSynchronizeTest, GivenGpuHangReportedByKmdWaitWhenSynchronizingEventThenDeviceLostIsReturned) {
+    DebugManagerStateRestore restore;
+    setUpWindowsDiscreteKmdWait(2000000);
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.kmdWaiterParams.waitStatus = NEO::WaitStatus::gpuHang;
+    event->setWindowsDiscreteKmdWaitEnabled(true);
+    event->setCleanupTaskCount(&csr, csr.peekTaskCount());
+    event->setSignalFlushStamp(5);
+    *static_cast<uint32_t *>(event->getCompletionFieldHostAddress()) = Event::STATE_CLEARED;
+
+    EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, event->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(1u, csr.kmdWaiterParams.waitCount);
+}
+
+namespace {
+struct MockMetricNotification : public MetricCollectorEventNotify {
+    Event::State state = Event::STATE_INITIAL;
+    uint32_t getNotificationStateCalled = 0u;
+    uint32_t signalAtCall = 0u;
+    Event::State getNotificationState() override {
+        getNotificationStateCalled++;
+        if (signalAtCall != 0u && getNotificationStateCalled >= signalAtCall) {
+            state = Event::STATE_SIGNALED;
+        }
+        return state;
+    }
+};
+} // namespace
+
+HWTEST_F(EventSynchronizeTest, GivenDrmAndKmdWaitStrategyWhenSynchronizingMetricNotificationEventThenUserFenceWaitIsNotUsedAndPollingIsUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = true;
+
+    // Metric notification events are signaled by the host driver polling the OA/perf FD, not by a GPU write.
+    // A blocking KMD user-fence wait would deadlock (nothing wakes it), so such events must fall back to polling.
+    MockMetricNotification metricNotification;
+    metricNotification.signalAtCall = 2u;
+    event->setMetricNotification(&metricNotification);
+
+    auto eventAddress = static_cast<uint32_t *>(event->getCompletionFieldHostAddress());
+    *eventAddress = Event::STATE_CLEARED;
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    event->setMetricNotification(nullptr);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_NE(0u, metricNotification.getNotificationStateCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenDrmAndKmdWaitStrategyAndSignalAllPacketsWhenRemainingPacketWaitReturnsNotReadyThenHostSynchronizeFallsBackToPolling) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    std::vector<uint64_t> packetStorage;
+    auto maxPackets = event->getMaxPacketsCount();
+    if (maxPackets <= 1u) {
+        maxPackets = 2u;
+        event->maxPacketCount = maxPackets;
+        packetStorage.resize(alignUp(maxPackets * event->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+        event->hostAddressFromPool = packetStorage.data();
+    }
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = false;
+
+    for (uint32_t packetId = 0; packetId < maxPackets; packetId++) {
+        auto packetAddress = static_cast<uint32_t *>(ptrOffset(event->getHostAddress(), packetId * event->getSinglePacketSize() + event->getCompletionFieldOffset()));
+        *packetAddress = Event::STATE_CLEARED;
+    }
+
+    auto firstPacketAddress = static_cast<uint32_t *>(event->getCompletionFieldHostAddress());
+    *firstPacketAddress = Event::STATE_SIGNALED;
+    csr.waitUserFenceParams.onWait = [&]() {
+        for (uint32_t packetId = 0; packetId < maxPackets; packetId++) {
+            auto packetAddress = static_cast<uint32_t *>(ptrOffset(event->getHostAddress(), packetId * event->getSinglePacketSize() + event->getCompletionFieldOffset()));
+            *packetAddress = Event::STATE_SIGNALED;
+        }
+    };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(NEO::UserFenceWaitOperation::notEqual, csr.waitUserFenceParams.latestWaitOperation);
+    EXPECT_NE(castToUint64(firstPacketAddress), csr.waitUserFenceParams.latestWaitedAddress);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenDrmAndKmdWaitStrategyWhenUserFenceWaitReturnsNotReadyThenHostSynchronizeFallsBackToPolling) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = false;
+
+    auto eventAddress = static_cast<uint32_t *>(event->getCompletionFieldHostAddress());
+    *eventAddress = Event::STATE_CLEARED;
+    csr.waitUserFenceParams.onWait = [&]() { *eventAddress = Event::STATE_SIGNALED; };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(NEO::UserFenceWaitOperation::notEqual, csr.waitUserFenceParams.latestWaitOperation);
+}
+
+HWTEST_F(EventSynchronizeTimestampTest, GivenDrmAndKmdWaitStrategyWhenSynchronizingHeapfullProfilingEventThenUserFenceWaitsOnTimestampNode) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = true;
+
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+
+    event->resetInOrderTimestampNode(timestampNode, 1);
+    event->setCbEventWithProfiling(true);
+
+    uint64_t counterStorage = 1;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+
+    auto timestampCompletionAddress = static_cast<uint32_t *>(ptrOffset(timestampNode->getCpuBase(), event->getCompletionFieldOffset()));
+    *timestampCompletionAddress = Event::STATE_CLEARED;
+    csr.waitUserFenceParams.onWait = [&]() { *timestampCompletionAddress = Event::STATE_SIGNALED; };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(NEO::UserFenceWaitOperation::notEqual, csr.waitUserFenceParams.latestWaitOperation);
+    EXPECT_EQ(NEO::UserFenceValueWidth::u32, csr.waitUserFenceParams.latestWaitValueWidth);
+    EXPECT_EQ(castToUint64(timestampCompletionAddress), csr.waitUserFenceParams.latestWaitedAddress);
+    EXPECT_EQ(timestampNode->getBaseGraphicsAllocation()->getGraphicsAllocation(device->getRootDeviceIndex()), csr.waitUserFenceParams.latestAllocForInterruptWait);
+}
+
+HWTEST_F(EventSynchronizeTimestampTest, GivenDrmAndKmdWaitStrategyWhenTimestampNodeUserFenceWaitReturnsNotReadyThenHostSynchronizeFallsBackToPolling) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = false;
+
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+
+    event->resetInOrderTimestampNode(timestampNode, 1);
+    event->setCbEventWithProfiling(true);
+
+    uint64_t counterStorage = 1;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+
+    auto timestampCompletionAddress = static_cast<uint32_t *>(ptrOffset(timestampNode->getCpuBase(), event->getCompletionFieldOffset()));
+    *timestampCompletionAddress = Event::STATE_CLEARED;
+    csr.waitUserFenceParams.onWait = [&]() { *timestampCompletionAddress = Event::STATE_SIGNALED; };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(NEO::UserFenceWaitOperation::notEqual, csr.waitUserFenceParams.latestWaitOperation);
+    EXPECT_EQ(castToUint64(timestampCompletionAddress), csr.waitUserFenceParams.latestWaitedAddress);
+}
+
+TEST_F(EventSynchronizeTimestampTest, GivenCbEventWithProfilingAndPatchPreambleCounterNotReachedWhenHostSynchronizeThenNotReadyUntilPatchPreambleCounterIsReached) {
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+
+    event->resetInOrderTimestampNode(timestampNode, 1);
+    event->setCbEventWithProfiling(true);
+
+    uint64_t counterStorage = 1;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+
+    constexpr uint64_t patchPreambleCounter = 2;
+    uint64_t patchPreambleStorage = 0;
+    NEO::MockGraphicsAllocation patchPreambleAllocation(&patchPreambleStorage, sizeof(patchPreambleStorage));
+    event->getInOrderExecEventHelper().assignPatchPreambleData(patchPreambleCounter, &patchPreambleStorage, patchPreambleAllocation.getGpuAddress(), &patchPreambleAllocation,
+                                                               patchPreambleAllocation.getGpuAddress(), &patchPreambleAllocation);
+    ASSERT_TRUE(event->isActiveExternalCbEvent());
+
+    auto timestampCompletionAddress = static_cast<uint32_t *>(ptrOffset(timestampNode->getCpuBase(), event->getCompletionFieldOffset()));
+    *timestampCompletionAddress = Event::STATE_SIGNALED;
+
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(0));
+
+    patchPreambleStorage = patchPreambleCounter;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSynchronize(0));
+}
+
+HWTEST_F(EventSynchronizeTimestampTest, GivenTbxModeAndCbEventWithProfilingWhenHostSynchronizeThenPatchPreambleCounterIsReadAfterDownload) {
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    eventDesc.index = 1;
+    auto tbxEvent = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(nullptr, tbxEvent);
+
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+
+    tbxEvent->resetInOrderTimestampNode(timestampNode, 1);
+    tbxEvent->setCbEventWithProfiling(true);
+
+    uint64_t counterStorage = 1;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    tbxEvent->getInOrderExecEventHelper().initializeLocalTempStorage();
+    tbxEvent->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+
+    constexpr uint64_t patchPreambleCounter = 2;
+    uint64_t patchPreambleStorage = 0;
+    NEO::MockGraphicsAllocation patchPreambleAllocation(&patchPreambleStorage, sizeof(patchPreambleStorage));
+    patchPreambleAllocation.updateTaskCount(1u, ultCsr.getOsContext().getContextId());
+    tbxEvent->getInOrderExecEventHelper().assignPatchPreambleData(patchPreambleCounter, &patchPreambleStorage, patchPreambleAllocation.getGpuAddress(), &patchPreambleAllocation,
+                                                                  patchPreambleAllocation.getGpuAddress(), &patchPreambleAllocation);
+    ASSERT_TRUE(tbxEvent->isActiveExternalCbEvent());
+
+    auto timestampCompletionAddress = static_cast<uint32_t *>(ptrOffset(timestampNode->getCpuBase(), tbxEvent->getCompletionFieldOffset()));
+    *timestampCompletionAddress = Event::STATE_SIGNALED;
+
+    ultCsr.initializeResources(device->getDevicePreemptionMode());
+    uint32_t patchPreambleDownloads = 0;
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr.downloadAllocationImpl);
+    ultCsr.downloadAllocationImpl = [&](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        if (&gfxAllocation == &patchPreambleAllocation) {
+            patchPreambleStorage = patchPreambleCounter;
+            patchPreambleDownloads++;
+        }
+    };
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tbxEvent->hostSynchronize(0));
+    EXPECT_EQ(1u, patchPreambleDownloads);
+}
+
+HWTEST_F(EventSynchronizeTimestampTest, GivenTbxModeAndStandaloneCbTimestampEventWithProfilingWhenHostSynchronizeThenTimestampNodeIsDownloaded) {
+    using TimestampPacketType = typename FamilyType::TimestampPacketType;
+    using TimestampPackets = NEO::TimestampPackets<TimestampPacketType, NEO::TimestampPacketConstants::preferredPacketCount>;
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP;
+    ze_event_handle_t handle = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &counterBasedDesc, &handle));
+    auto standaloneEvent = Event::fromHandle(handle);
+
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+    standaloneEvent->resetInOrderTimestampNode(timestampNode, 1);
+    standaloneEvent->setCbEventWithProfiling(true);
+
+    uint64_t counterStorage = 1;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    standaloneEvent->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+
+    auto nodeAllocation = standaloneEvent->getAllocation(device);
+    ASSERT_NE(nullptr, nodeAllocation);
+    nodeAllocation->updateTaskCount(1u, ultCsr.getOsContext().getContextId());
+    auto timestampCompletionAddress = static_cast<TimestampPacketType *>(ptrOffset(timestampNode->getCpuBase(), standaloneEvent->getCompletionFieldOffset()));
+
+    ultCsr.initializeResources(device->getDevicePreemptionMode());
+    uint32_t nodeDownloads = 0;
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr.downloadAllocationImpl);
+    ultCsr.downloadAllocationImpl = [&](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        if (&gfxAllocation == nodeAllocation) {
+            *timestampCompletionAddress = static_cast<TimestampPacketType>(Event::STATE_SIGNALED);
+            nodeDownloads++;
+        }
+    };
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, standaloneEvent->hostSynchronize(0));
+    EXPECT_EQ(1u, nodeDownloads);
+
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventSynchronizeTimestampTest, GivenCompletedCbEventWithProfilingWhenHostSynchronizeThenSuccessIsReturnedWithoutReadingTimestamp) {
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+
+    event->resetInOrderTimestampNode(timestampNode, 1);
+    event->setCbEventWithProfiling(true);
+    event->setIsCompleted();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSynchronize(0));
+}
+
+TEST_F(EventSynchronizeTimestampTest, GivenCounterBasedTimestampEventBackedByNodeWithZeroTotalEventSizeWhenHostSignalThenProfilingCanBeRetrieved) {
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+    MockTagAllocator<TimestampPackets> timestampAllocator(0, neoDevice->getMemoryManager());
+    auto timestampNode = timestampAllocator.getTag();
+    timestampNode->initialize();
+
+    event->totalEventSize = 0;
+    event->maxPacketCount = 1;
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->resetInOrderTimestampNode(timestampNode, 1);
+    event->resetPacketsUsedCount();
+
+    ASSERT_TRUE(event->isCounterBased());
+    ASSERT_TRUE(event->isEventTimestampFlagSet());
+    ASSERT_NE(nullptr, event->getAllocation(device));
+
+    event->setGpuStartTimestamp();
+    event->setGpuEndTimestamp();
+
+    ASSERT_NE(0u, event->gpuStartTimestamp);
+    ASSERT_NE(0u, event->gpuEndTimestamp);
+
+    const auto expectedStart = static_cast<uint32_t>(event->gpuStartTimestamp);
+    const auto expectedEnd = static_cast<uint32_t>(event->gpuEndTimestamp);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSignal(true));
+
+    ze_kernel_timestamp_result_t result = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, event->queryKernelTimestamp(&result));
+
+    EXPECT_EQ(expectedStart, result.context.kernelStart);
+    EXPECT_EQ(expectedEnd, result.context.kernelEnd);
+    EXPECT_EQ(expectedStart, result.global.kernelStart);
+    EXPECT_EQ(expectedEnd, result.global.kernelEnd);
+}
+
+TEST_F(EventSynchronizeTimestampTest, GivenCounterBasedTimestampEventWithoutTimestampNodeAndWithEventPoolAllocationWhenHostSignalThenTimestampsAreWrittenToEventPoolMemory) {
+    using TimestampPackets = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+
+    event->enableCounterBasedMode(false, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+
+    ASSERT_TRUE(event->isCounterBased());
+    ASSERT_FALSE(event->hasInOrderTimestampNode());
+    ASSERT_NE(nullptr, event->getAllocation(device));
+
+    event->setGpuStartTimestamp();
+    event->setGpuEndTimestamp();
+    ASSERT_NE(0u, event->gpuStartTimestamp);
+    ASSERT_NE(0u, event->gpuEndTimestamp);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSignal(true));
+
+    auto timestampData = static_cast<TimestampPackets *>(event->getHostAddress());
+    EXPECT_EQ(static_cast<uint32_t>(event->gpuStartTimestamp), timestampData->getGlobalStartValue(0));
+    EXPECT_EQ(static_cast<uint32_t>(event->gpuEndTimestamp), timestampData->getGlobalEndValue(0));
+}
+
+HWTEST_F(EventSynchronizeTest, GivenDrmAndKmdWaitStrategyWhenSynchronizingCounterBasedEventThenBoundedUserFenceWaitIsUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+    constexpr int64_t expectedTimeout = 123456789;
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWaitTimeoutNanoseconds.set(expectedTimeout);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = true;
+
+    uint64_t counterStorage = 0;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+    csr.waitUserFenceParams.onWait = [&]() { counterStorage = 1; };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(castToUint64(&counterStorage), csr.waitUserFenceParams.latestWaitedAddress);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.latestWaitedValue);
+    EXPECT_EQ(expectedTimeout, csr.waitUserFenceParams.latestWaitedTimeout);
+    EXPECT_FALSE(csr.waitUserFenceParams.userInterrupt);
+    EXPECT_EQ(&counterAllocation, csr.waitUserFenceParams.latestAllocForInterruptWait);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenDrmAndKmdWaitStrategyWhenFenceWaitIsActiveThenAdditionalUserFenceWaitIsNotUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    event->setLinuxUserFenceKmdWaitEnabled(true);
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = true;
+
+    uint64_t counterStorage = 0;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->enableKmdWaitMode();
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+    csr.waitUserFenceParams.onWait = [&]() { counterStorage = 1; };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenEventHostSynchronizeWaitStrategyAndWddmOnLinuxWhenHostSynchronizeIsCalledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    reinterpret_cast<NEO::MockRootDeviceEnvironment *>(neoDevice->executionEnvironment->rootDeviceEnvironments[0].get())->isWddmOnLinuxEnable = true;
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenInitialPollNotElapsedWhenHostSynchronizeIsCalledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(1000000);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(1);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenEventHostSynchronizeWaitStrategyAndOverflowingCycleThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(std::numeric_limits<int64_t>::max());
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+}
+
+HWTEST_F(EventSynchronizeTest, GivenFenceWaitWhenEventHostSynchronizeWaitStrategyIsEnabledThenAcLineStatusIsNotQueried) {
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(2);
+    NEO::debugManager.flags.EventHostSynchronizeInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizePollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeSleepMicroseconds.set(1);
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.getAcLineConnectedCallBase = false;
+    csr.isUserFenceWaitSupported = true;
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+    csr.waitUserFenceParams.forceRetStatusValue = false;
+    event->enableCounterBasedMode(true, 0u);
+    event->enableKmdWaitMode();
+    uint64_t counterValue = 0;
+    event->inOrderExecHelper.initializeLocalTempStorage();
+    event->inOrderExecHelper.assignData(1, 0, 1, 1, event->getAllocation(device), event->getAllocation(device), 0, 0, &counterValue, 0, 0, false, false);
+
+    event->hostSynchronize(10);
+    EXPECT_EQ(0u, csr.getAcLineConnectedCalled);
+    EXPECT_NE(0u, csr.waitUserFenceParams.callCount);
+}
+
 TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithTimeoutNonZeroAndOverrideTimeoutSetAndStateInitialThenHostSynchronizeReturnsNotReady) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.OverrideEventSynchronizeTimeout.set(100);
+    NEO::debugManager.flags.OverrideEventSynchronizeTimeout.set(100);
     std::chrono::high_resolution_clock::time_point waitStartTime, currentTime;
     waitStartTime = std::chrono::high_resolution_clock::now();
     ze_result_t result = event->hostSynchronize(0);
@@ -1523,7 +4001,6 @@ TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithTimeoutZeroWhenS
     uint32_t *hostAddr = static_cast<uint32_t *>(event->getHostAddress());
     *hostAddr = Event::STATE_SIGNALED;
 
-    event->setUsingContextEndOffset(false);
     ze_result_t result = event->hostSynchronize(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
@@ -1532,25 +4009,13 @@ TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithTimeoutNonZeroWh
     uint32_t *hostAddr = static_cast<uint32_t *>(event->getHostAddress());
     *hostAddr = Event::STATE_SIGNALED;
 
-    event->setUsingContextEndOffset(false);
     ze_result_t result = event->hostSynchronize(10);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-}
-
-TEST_F(EventSynchronizeTest, givenCallToEventHostSynchronizeWithTimeoutZeroWhenOffsetEventStateSignaledThenHostSynchronizeReturnsSuccess) {
-    uint32_t *hostAddr = static_cast<uint32_t *>(event->getHostAddress());
-    hostAddr = ptrOffset(hostAddr, event->getContextEndOffset());
-    *hostAddr = Event::STATE_SIGNALED;
-
-    event->setUsingContextEndOffset(true);
-    ze_result_t result = event->hostSynchronize(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
 
 TEST_F(EventUsedPacketSignalSynchronizeTest, givenInfiniteTimeoutWhenWaitingForNonTimestampEventCompletionThenReturnOnlyAfterAllEventPacketsAreCompleted) {
     constexpr uint32_t packetsInUse = 2;
     event->setPacketsInUse(packetsInUse);
-    event->setUsingContextEndOffset(false);
 
     const size_t eventPacketSize = event->getSinglePacketSize();
     const size_t eventCompletionOffset = event->getContextStartOffset();
@@ -1569,43 +4034,7 @@ TEST_F(EventUsedPacketSignalSynchronizeTest, givenInfiniteTimeoutWhenWaitingForN
     }
 
     CpuIntrinsicsTests::setupPauseAddress = [&]() {
-        if (CpuIntrinsicsTests::pauseCounter > 10) {
-            volatile TagAddressType *nextPacket = CpuIntrinsicsTests::pauseAddress;
-            for (uint32_t i = 0; i < packetsInUse; i++) {
-                *nextPacket = Event::STATE_SIGNALED;
-                nextPacket = ptrOffset(nextPacket, eventPacketSize);
-            }
-        }
-    };
-
-    constexpr uint64_t infiniteTimeout = std::numeric_limits<std::uint64_t>::max();
-    ze_result_t result = event->hostSynchronize(infiniteTimeout);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-}
-
-TEST_F(EventUsedPacketSignalSynchronizeTest, givenInfiniteTimeoutWhenWaitingForOffsetedNonTimestampEventCompletionThenReturnOnlyAfterAllEventPacketsAreCompleted) {
-    constexpr uint32_t packetsInUse = 2;
-    event->setPacketsInUse(packetsInUse);
-    event->setUsingContextEndOffset(true);
-
-    const size_t eventPacketSize = event->getSinglePacketSize();
-    const size_t eventCompletionOffset = event->getContextEndOffset();
-
-    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
-    VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_CLEARED);
-    VariableBackup<uint32_t> backupPauseOffset(&CpuIntrinsicsTests::pauseOffset);
-    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
-    CpuIntrinsicsTests::pauseCounter = 0u;
-    CpuIntrinsicsTests::pauseAddress = static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), eventCompletionOffset));
-
-    uint64_t *hostAddr = static_cast<uint64_t *>(ptrOffset(event->getHostAddress(), eventCompletionOffset));
-    for (uint32_t i = 0; i < packetsInUse; i++) {
-        *hostAddr = Event::STATE_CLEARED;
-        hostAddr = ptrOffset(hostAddr, eventPacketSize);
-    }
-
-    CpuIntrinsicsTests::setupPauseAddress = [&]() {
-        if (CpuIntrinsicsTests::pauseCounter > 10) {
+        if (CpuIntrinsicsTests::pauseCounter > 1) {
             volatile TagAddressType *nextPacket = CpuIntrinsicsTests::pauseAddress;
             for (uint32_t i = 0; i < packetsInUse; i++) {
                 *nextPacket = Event::STATE_SIGNALED;
@@ -1641,7 +4070,7 @@ TEST_F(EventUsedPacketSignalSynchronizeTest, givenInfiniteTimeoutWhenWaitingForT
     }
 
     CpuIntrinsicsTests::setupPauseAddress = [&]() {
-        if (CpuIntrinsicsTests::pauseCounter > 10) {
+        if (CpuIntrinsicsTests::pauseCounter > 1) {
             volatile TagAddressType *nextPacket = CpuIntrinsicsTests::pauseAddress;
             for (uint32_t i = 0; i < packetsInUse; i++) {
                 *nextPacket = Event::STATE_SIGNALED;
@@ -1678,14 +4107,14 @@ TEST_F(EventPoolIPCEventResetTests, whenOpeningIpcHandleForEventPoolCreateWithIp
     eventDesc.wait = 0;
     event0 = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(),
                                                                                  &eventDesc,
-                                                                                 device));
+                                                                                 device, result));
     EXPECT_NE(nullptr, event0);
 
     uint32_t *hostAddr = static_cast<uint32_t *>(event0->getCompletionFieldHostAddress());
     EXPECT_EQ(*hostAddr, Event::STATE_INITIAL);
 
     // change state
-    event0->hostSignal();
+    event0->hostSignal(false);
     EXPECT_EQ(*hostAddr, Event::STATE_SIGNALED);
 
     // create an event from the pool with the same index as event0, but this time, since isImportedIpcPool is true, no reset should happen
@@ -1693,7 +4122,7 @@ TEST_F(EventPoolIPCEventResetTests, whenOpeningIpcHandleForEventPoolCreateWithIp
     std::unique_ptr<L0::Event> event1;
     event1 = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(),
                                                                                  &eventDesc,
-                                                                                 device));
+                                                                                 device, result));
     EXPECT_NE(nullptr, event1);
 
     uint32_t *hostAddr1 = static_cast<uint32_t *>(event1->getCompletionFieldHostAddress());
@@ -1704,7 +4133,7 @@ TEST_F(EventPoolIPCEventResetTests, whenOpeningIpcHandleForEventPoolCreateWithIp
     std::unique_ptr<L0::Event> event2;
     event2 = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(),
                                                                                  &eventDesc,
-                                                                                 device));
+                                                                                 device, result));
     EXPECT_NE(nullptr, event2);
 
     uint32_t *hostAddr2 = static_cast<uint32_t *>(event2->getCompletionFieldHostAddress());
@@ -1714,21 +4143,21 @@ TEST_F(EventPoolIPCEventResetTests, whenOpeningIpcHandleForEventPoolCreateWithIp
 using EventAubCsrTest = Test<DeviceFixture>;
 
 HWTEST_F(EventAubCsrTest, givenCallToEventHostSynchronizeWithAubModeCsrReturnsSuccess) {
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
 
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCsrAub<FamilyType>>();
+
     neoDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get());
     auto mockBuiltIns = new MockBuiltins();
-    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->builtins.reset(mockBuiltIns);
+    MockRootDeviceEnvironment::resetBuiltins(neoDevice->executionEnvironment->rootDeviceEnvironments[0].get(), mockBuiltIns);
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
     device = driverHandle->devices[0];
-    int32_t tag;
-    auto aubCsr = new MockCsrAub<FamilyType>(tag, *neoDevice->executionEnvironment, neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield());
-    neoDevice->resetCommandStreamReceiver(aubCsr);
 
     std::unique_ptr<L0::EventPool> eventPool = nullptr;
     std::unique_ptr<L0::Event> event;
@@ -1746,7 +4175,7 @@ HWTEST_F(EventAubCsrTest, givenCallToEventHostSynchronizeWithAubModeCsrReturnsSu
     eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
-    event = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    event = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
     ASSERT_NE(nullptr, event);
 
     result = event->hostSynchronize(10);
@@ -1761,7 +4190,7 @@ struct EventCreateAllocationResidencyTest : public ::testing::Test {
             mockMemoryOperationsHandler);
         NEO::DeviceVector devices;
         devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-        driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+        driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
         driverHandle->initialize(std::move(devices));
         device = driverHandle->devices[0];
     }
@@ -1770,50 +4199,27 @@ struct EventCreateAllocationResidencyTest : public ::testing::Test {
     }
 
     NEO::MockMemoryOperationsHandlerTests *mockMemoryOperationsHandler;
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
 };
 
-struct TimestampEventCreateMultiKernelFixture : public EventFixture<1, 1> {
-    void setUp() {
-        DebugManager.flags.UsePipeControlMultiKernelEventSync.set(0);
-        DebugManager.flags.SignalAllEventPackets.set(0);
-        EventFixture<1, 1>::setUp();
-    }
-
-    DebugManagerStateRestore restorer;
-};
-
 using TimestampEventCreate = Test<EventFixture<1, 1>>;
-using TimestampEventCreateMultiKernel = Test<TimestampEventCreateMultiKernelFixture>;
-using TimestampEventUsedPacketSignalCreate = Test<EventUsedPacketSignalFixture<1, 1, 0, -1>>;
+using TimestampEventUsedPacketSignalCreate = Test<EventCompactL3FlushFixture<1, 1, -1>>;
 
 TEST_F(TimestampEventCreate, givenEventCreatedWithTimestampThenIsTimestampEventFlagSet) {
     EXPECT_TRUE(event->isEventTimestampFlagSet());
 }
 
 TEST_F(TimestampEventCreate, givenEventTimestampsCreatedWhenResetIsInvokeThenCorrectDataAreSet) {
-    auto &hwInfo = device->getHwInfo();
-    auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
-
-    uint32_t maxKernelCount = EventPacketsCount::maxKernelSplit;
-    if (l0GfxCoreHelper.useDynamicEventPacketsCount(hwInfo)) {
-        maxKernelCount = l0GfxCoreHelper.getEventMaxKernelCount(hwInfo);
+    for (auto i = 0u; i < NEO::TimestampPacketConstants::preferredPacketCount; i++) {
+        EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData.getContextStartValue(i));
+        EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData.getGlobalStartValue(i));
+        EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData.getContextEndValue(i));
+        EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData.getGlobalEndValue(i));
     }
 
-    EXPECT_NE(nullptr, event->kernelEventCompletionData);
-    for (auto j = 0u; j < maxKernelCount; j++) {
-        for (auto i = 0u; i < NEO::TimestampPacketConstants::preferredPacketCount; i++) {
-            EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData[j].getContextStartValue(i));
-            EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData[j].getGlobalStartValue(i));
-            EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData[j].getContextEndValue(i));
-            EXPECT_EQ(static_cast<uint64_t>(Event::State::STATE_INITIAL), event->kernelEventCompletionData[j].getGlobalEndValue(i));
-        }
-        EXPECT_EQ(1u, event->kernelEventCompletionData[j].getPacketsUsed());
-    }
-
-    EXPECT_EQ(1u, event->getKernelCount());
+    EXPECT_EQ(1u, event->kernelEventCompletionData.getPacketsUsed());
 }
 
 TEST_F(TimestampEventCreate, givenSingleTimestampEventThenAllocationSizeCreatedForAllTimestamps) {
@@ -1832,52 +4238,48 @@ TEST_F(TimestampEventCreate, givenTimestampEventThenAllocationsIsDependentIfAllo
     auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
 
     if (l0GfxCoreHelper.alwaysAllocateEventInLocalMem()) {
-        EXPECT_EQ(NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER, allocation->getAllocationType());
+        EXPECT_EQ(NEO::AllocationType::gpuTimestampDeviceBuffer, allocation->getAllocationType());
     } else {
-        EXPECT_EQ(NEO::AllocationType::TIMESTAMP_PACKET_TAG_BUFFER, allocation->getAllocationType());
+        EXPECT_EQ(NEO::AllocationType::timestampPacketTagBuffer, allocation->getAllocationType());
     }
-}
-
-HWTEST2_F(TimestampEventCreateMultiKernel, givenEventTimestampWhenPacketCountIsSetThenCorrectOffsetIsReturned, IsAtLeastXeHpCore) {
-    EXPECT_EQ(1u, event->getPacketsInUse());
-    auto gpuAddr = event->getGpuAddress(device);
-    EXPECT_EQ(gpuAddr, event->getPacketAddress(device));
-
-    event->setPacketsInUse(4u);
-    EXPECT_EQ(4u, event->getPacketsInUse());
-
-    gpuAddr += (4u * event->getSinglePacketSize());
-
-    event->increaseKernelCount();
-    event->setPacketsInUse(2u);
-    EXPECT_EQ(6u, event->getPacketsInUse());
-    EXPECT_EQ(gpuAddr, event->getPacketAddress(device));
-
-    gpuAddr += (2u * event->getSinglePacketSize());
-    event->increaseKernelCount();
-    EXPECT_EQ(gpuAddr, event->getPacketAddress(device));
-    EXPECT_EQ(7u, event->getPacketsInUse());
 }
 
 TEST_F(TimestampEventCreate, givenEventWhenSignaledAndResetFromTheHostThenCorrectDataAreSet) {
-    EXPECT_NE(nullptr, event->kernelEventCompletionData);
-    event->hostSignal();
-    ze_result_t result = event->queryStatus();
+    event->hostSignal(false);
+    ze_result_t result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     event->reset();
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
-    for (auto j = 0u; j < event->getKernelCount(); j++) {
-        for (auto i = 0u; i < NEO::TimestampPacketConstants::preferredPacketCount; i++) {
-            EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData[j].getContextStartValue(i));
-            EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData[j].getGlobalStartValue(i));
-            EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData[j].getContextEndValue(i));
-            EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData[j].getGlobalEndValue(i));
-        }
-        EXPECT_EQ(1u, event->kernelEventCompletionData[j].getPacketsUsed());
+    for (auto i = 0u; i < NEO::TimestampPacketConstants::preferredPacketCount; i++) {
+        EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData.getContextStartValue(i));
+        EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData.getGlobalStartValue(i));
+        EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData.getContextEndValue(i));
+        EXPECT_EQ(Event::State::STATE_INITIAL, event->kernelEventCompletionData.getGlobalEndValue(i));
     }
-    EXPECT_EQ(1u, event->getKernelCount());
+    EXPECT_EQ(1u, event->kernelEventCompletionData.getPacketsUsed());
+}
+
+TEST_F(TimestampEventCreate, givenPacketsInUseExceedingCompletionDataCapacityWhenHostSignalThenInvariantIsCaught) {
+    // hostEventSetValueTimestamps() feeds assignKernelEventCompletionData() a stack buffer sized for exactly
+    // preferredPacketCount packets, so a larger packet count must abort rather than walk off the end of it.
+    event->setPacketsInUse(NEO::TimestampPacketConstants::preferredPacketCount + 1);
+
+    EXPECT_THROW(event->hostSignal(false), std::exception);
+}
+
+TEST_F(TimestampEventCreate, givenPacketsInUseAtCompletionDataCapacityWhenHostSignalThenAllPacketsAreSignaled) {
+    event->setPacketsInUse(NEO::TimestampPacketConstants::preferredPacketCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSignal(false));
+
+    for (auto i = 0u; i < NEO::TimestampPacketConstants::preferredPacketCount; i++) {
+        EXPECT_EQ(Event::State::STATE_SIGNALED, event->kernelEventCompletionData.getContextStartValue(i));
+        EXPECT_EQ(Event::State::STATE_SIGNALED, event->kernelEventCompletionData.getGlobalStartValue(i));
+        EXPECT_EQ(Event::State::STATE_SIGNALED, event->kernelEventCompletionData.getContextEndValue(i));
+        EXPECT_EQ(Event::State::STATE_SIGNALED, event->kernelEventCompletionData.getGlobalEndValue(i));
+    }
 }
 
 TEST_F(TimestampEventCreate, givenpCountZeroCallingQueryTimestampExpThenpCountSetProperly) {
@@ -1899,7 +4301,7 @@ TEST_F(TimestampEventUsedPacketSignalCreate, givenpCountLargerThanSupportedWhenC
 
 TEST_F(TimestampEventCreate, givenEventWithStaticPartitionOffThenQueryTimestampExpReturnsUnsupported) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.EnableStaticPartitioning.set(0);
+    NEO::debugManager.flags.EnableStaticPartitioning.set(0);
 
     uint32_t pCount = 0;
     auto result = event->queryTimestampsExp(device, &pCount, nullptr);
@@ -1913,14 +4315,13 @@ TEST_F(TimestampDeviceEventCreate, givenTimestampDeviceEventThenAllocationsIsOfG
     auto allocation = &eventPool->getAllocation();
     ASSERT_NE(nullptr, allocation);
 
-    EXPECT_EQ(NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER, allocation->getAllocationType());
+    EXPECT_EQ(NEO::AllocationType::gpuTimestampDeviceBuffer, allocation->getAllocationType());
 }
 
 using EventQueryTimestampExpWithRootDeviceAndSubDevices = Test<MultiDeviceFixture>;
 
 TEST_F(EventQueryTimestampExpWithRootDeviceAndSubDevices, givenEventWhenQuerytimestampExpWithRootDeviceAndSubDevicesThenReturnsCorrectValuesReturned) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.SignalAllEventPackets.set(0);
 
     std::unique_ptr<L0::EventPool> eventPool;
     std::unique_ptr<EventImp<uint32_t>> eventRoot;
@@ -1953,7 +4354,7 @@ TEST_F(EventQueryTimestampExpWithRootDeviceAndSubDevices, givenEventWhenQuerytim
     eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 1, &rootDeviceHandle, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, eventPool);
-    eventRoot = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, L0::Device::fromHandle(rootDeviceHandle))));
+    eventRoot = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, L0::Device::fromHandle(rootDeviceHandle), result)));
     ASSERT_NE(nullptr, eventRoot);
 
     typename MockTimestampPackets32::Packet packetData[2];
@@ -1969,14 +4370,14 @@ TEST_F(EventQueryTimestampExpWithRootDeviceAndSubDevices, givenEventWhenQuerytim
     packetData[1].globalStart = 7u;
     packetData[1].globalEnd = 8u;
 
-    eventRoot->hostAddress = packetData;
+    eventRoot->hostAddressFromPool = packetData;
 
     ze_kernel_timestamp_result_t results[2];
     uint32_t numPackets = 2;
 
     for (uint32_t packetId = 0; packetId < numPackets; packetId++) {
-        eventRoot->kernelEventCompletionData[0].assignDataToAllTimestamps(packetId, eventRoot->hostAddress);
-        eventRoot->hostAddress = ptrOffset(eventRoot->hostAddress, NEO::TimestampPackets<uint32_t>::getSinglePacketSize());
+        eventRoot->kernelEventCompletionData.assignDataToAllTimestamps(packetId, eventRoot->hostAddressFromPool);
+        eventRoot->hostAddressFromPool = ptrOffset(eventRoot->hostAddressFromPool, NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
     }
 
     uint32_t pCount = 0;
@@ -1993,16 +4394,16 @@ TEST_F(EventQueryTimestampExpWithRootDeviceAndSubDevices, givenEventWhenQuerytim
     }
 
     auto subdevice = L0::Device::fromHandle(subDeviceHandle[0]);
-    eventSub0 = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, subdevice)));
+    eventSub0 = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, subdevice, result)));
     ASSERT_NE(nullptr, eventSub0);
 
     numPackets = 1;
     eventSub0->setPacketsInUse(1u);
-    eventSub0->hostAddress = packetData;
+    eventSub0->hostAddressFromPool = packetData;
 
     for (uint32_t packetId = 0; packetId < numPackets; packetId++) {
-        eventSub0->kernelEventCompletionData[0].assignDataToAllTimestamps(packetId, eventSub0->hostAddress);
-        eventSub0->hostAddress = ptrOffset(eventSub0->hostAddress, NEO::TimestampPackets<uint32_t>::getSinglePacketSize());
+        eventSub0->kernelEventCompletionData.assignDataToAllTimestamps(packetId, eventSub0->hostAddressFromPool);
+        eventSub0->hostAddressFromPool = ptrOffset(eventSub0->hostAddressFromPool, NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
     }
 
     pCount = 0;
@@ -2020,16 +4421,16 @@ TEST_F(EventQueryTimestampExpWithRootDeviceAndSubDevices, givenEventWhenQuerytim
     }
 
     subdevice = L0::Device::fromHandle(subDeviceHandle[1]);
-    eventSub1 = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, subdevice)));
+    eventSub1 = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, subdevice, result)));
     ASSERT_NE(nullptr, eventSub1);
 
     numPackets = 1;
     eventSub1->setPacketsInUse(1u);
-    eventSub1->hostAddress = packetData;
+    eventSub1->hostAddressFromPool = packetData;
 
     for (uint32_t packetId = 0; packetId < numPackets; packetId++) {
-        eventSub1->kernelEventCompletionData[0].assignDataToAllTimestamps(packetId, eventSub1->hostAddress);
-        eventSub1->hostAddress = ptrOffset(eventSub1->hostAddress, NEO::TimestampPackets<uint32_t>::getSinglePacketSize());
+        eventSub1->kernelEventCompletionData.assignDataToAllTimestamps(packetId, eventSub1->hostAddressFromPool);
+        eventSub1->hostAddressFromPool = ptrOffset(eventSub1->hostAddressFromPool, NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
     }
 
     pCount = 0;
@@ -2047,14 +4448,337 @@ TEST_F(EventQueryTimestampExpWithRootDeviceAndSubDevices, givenEventWhenQuerytim
     }
 }
 
-HWCMDTEST_F(IGFX_GEN9_CORE, TimestampEventCreate, givenEventTimestampsWhenQueryKernelTimestampThenCorrectDataAreSet) {
+using EventMultiRootDeviceTimestampTest = Test<MultiDeviceFixture>;
+
+HWTEST_F(EventMultiRootDeviceTimestampTest, givenCounterBasedTimestampEventWithTimestampNodeFromOtherRootDeviceWhenHostSignalThenKernelTimestampIsReady) {
+    using TagSizeT = typename FamilyType::TimestampPacketType;
+
+    uint32_t deviceCount = 0;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeDeviceGet(driverHandle.get(), &deviceCount, nullptr));
+    ASSERT_LE(2u, deviceCount);
+    std::vector<ze_device_handle_t> devices(deviceCount);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeDeviceGet(driverHandle.get(), &deviceCount, devices.data()));
+    auto eventDevice = Device::fromHandle(devices[0]);
+    auto cmdListDevice = Device::fromHandle(devices[1]);
+    eventDevice->getNEODevice()->getRootDeviceEnvironmentRef().osTime.reset(new NEO::MockOSTimeWithConstTimestamp());
+
+    ze_event_pool_desc_t eventPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    std::unique_ptr<EventImp<TagSizeT>> event(static_cast<EventImp<TagSizeT> *>(L0::Event::create<TagSizeT>(eventPool.get(), &eventDesc, eventDevice, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    event->enableCounterBasedMode(false, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->resetInOrderTimestampNode(cmdListDevice->getInOrderTimestampAllocator()->getTag(), 1);
+
+    ASSERT_TRUE(event->isCounterBased());
+    ASSERT_EQ(nullptr, event->getAllocation(eventDevice));
+
+    event->setGpuStartTimestamp();
+    event->setGpuEndTimestamp();
+    ASSERT_NE(0u, event->gpuStartTimestamp);
+    ASSERT_NE(0u, event->gpuEndTimestamp);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSignal(true));
+
+    ze_kernel_timestamp_result_t timestamp = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, event->queryKernelTimestamp(&timestamp));
+    EXPECT_EQ(static_cast<TagSizeT>(event->gpuStartTimestamp), timestamp.global.kernelStart);
+    EXPECT_EQ(static_cast<TagSizeT>(event->gpuEndTimestamp), timestamp.global.kernelEnd);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event.release()->destroy());
+}
+
+using EventqueryKernelTimestampsExt = Test<EventCompactL3FlushFixture<1, 1, -1>>;
+
+TEST_F(EventqueryKernelTimestampsExt, givenpCountLargerThanSupportedWhenCallingQueryKernelTimestampsExtThenpCountSetProperly) {
+    uint32_t pCount = 10;
+    event->setPacketsInUse(2u);
+
+    std::vector<ze_kernel_timestamp_result_t> kernelTsBuffer(2);
+    ze_event_query_kernel_timestamps_results_ext_properties_t results{};
+    results.pKernelTimestampsBuffer = kernelTsBuffer.data();
+    results.pSynchronizedTimestampsBuffer = nullptr;
+    event->hostSignal(false);
+
+    auto result = event->queryKernelTimestampsExt(device, &pCount, &results);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(2u, pCount);
+}
+
+TEST_F(EventqueryKernelTimestampsExt, givenEventWithStaticPartitionOffThenQueryKernelTimestampsExtReturnsUnsupported) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EnableStaticPartitioning.set(0);
+
+    event->hasKernelMappedTsCapability = true;
+
+    std::vector<ze_kernel_timestamp_result_t> kernelTsBuffer(2);
+    ze_event_query_kernel_timestamps_results_ext_properties_t results{};
+    results.pKernelTimestampsBuffer = kernelTsBuffer.data();
+    results.pSynchronizedTimestampsBuffer = nullptr;
+    event->hostSignal(false);
+
+    uint32_t pCount = 10;
+    auto result = event->queryKernelTimestampsExt(device, &pCount, &results);
+
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
+}
+
+TEST_F(EventqueryKernelTimestampsExt, givenEventStatusNotReadyThenQueryKernelTimestampsExtReturnsNotReady) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EnableStaticPartitioning.set(0);
+
+    event->hasKernelMappedTsCapability = true;
+
+    std::vector<ze_kernel_timestamp_result_t> kernelTsBuffer(2);
+    ze_event_query_kernel_timestamps_results_ext_properties_t results{};
+    results.pKernelTimestampsBuffer = kernelTsBuffer.data();
+    results.pSynchronizedTimestampsBuffer = nullptr;
+
+    uint32_t pCount = 10;
+    auto result = event->queryKernelTimestampsExt(device, &pCount, &results);
+
+    EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+}
+
+TEST_F(EventqueryKernelTimestampsExt, givenEventWithMappedTimestampCapabilityWhenQueryKernelTimestampsExtIsCalledCorrectValuesAreReturned) {
+
+    struct MappedTimeStampData {
+        typename MockTimestampPackets32::Packet packetData[3];
+        NEO::TimeStampData referenceTs{};
+    } mappedTimeStampData;
+
+    auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    device->getNEODevice()->getRootDeviceEnvironment().getMutableHardwareInfo()->capabilityTable.kernelTimestampValidBits = 32;
+    event->setPacketsInUse(3u);
+    event->hasKernelMappedTsCapability = true;
+    const auto deviceTsFrequency = device->getNEODevice()->getDeviceInfo().profilingTimerResolution;
+    const int64_t gpuReferenceTimeInNs = 2000;
+    const int64_t cpuReferenceTimeInNs = 3000;
+    const auto maxKernelTsValue = maxNBitValue(hwInfo.capabilityTable.kernelTimestampValidBits);
+
+    auto timeToTimeStamp = [&](uint32_t timeInNs) {
+        return static_cast<uint32_t>(timeInNs / deviceTsFrequency);
+    };
+
+    mappedTimeStampData.packetData[0].contextStart = 50u;
+    mappedTimeStampData.packetData[0].contextEnd = 100u;
+    mappedTimeStampData.packetData[0].globalStart = timeToTimeStamp(4000u);
+    mappedTimeStampData.packetData[0].globalEnd = timeToTimeStamp(5000u);
+
+    // Device Ts overflow case
+    mappedTimeStampData.packetData[1].contextStart = 20u;
+    mappedTimeStampData.packetData[1].contextEnd = 30u;
+    mappedTimeStampData.packetData[1].globalStart = timeToTimeStamp(500u);
+    mappedTimeStampData.packetData[1].globalEnd = timeToTimeStamp(1500u);
+
+    mappedTimeStampData.packetData[2].contextStart = 20u;
+    mappedTimeStampData.packetData[2].contextEnd = 30u;
+    mappedTimeStampData.packetData[2].globalStart = timeToTimeStamp(5000u);
+    mappedTimeStampData.packetData[2].globalEnd = timeToTimeStamp(500u);
+
+    event->hostAddressFromPool = &mappedTimeStampData;
+    event->maxPacketCount = 3;
+    uint32_t count = 0;
+
+    NEO::TimeStampData *referenceTs = event->peekReferenceTs();
+    referenceTs->cpuTimeinNS = cpuReferenceTimeInNs;
+    referenceTs->gpuTimeStamp = static_cast<uint64_t>(gpuReferenceTimeInNs / deviceTsFrequency);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->queryKernelTimestampsExt(device, &count, nullptr));
+    EXPECT_EQ(count, 3u);
+
+    std::vector<ze_kernel_timestamp_result_t> kernelTsBuffer(count);
+    std::vector<ze_synchronized_timestamp_result_ext_t> synchronizedTsBuffer(count);
+
+    ze_event_query_kernel_timestamps_results_ext_properties_t results{};
+    results.pKernelTimestampsBuffer = kernelTsBuffer.data();
+    results.pSynchronizedTimestampsBuffer = synchronizedTsBuffer.data();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->queryKernelTimestampsExt(device, &count, &results));
+    uint64_t errorOffset = 5;
+    // Packet 1
+    auto expectedGlobalStart = (cpuReferenceTimeInNs - gpuReferenceTimeInNs) + 4000u;
+    auto expectedGlobalEnd = (cpuReferenceTimeInNs - gpuReferenceTimeInNs) + 5000u;
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[0].global.kernelStart, expectedGlobalStart - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[0].global.kernelStart, expectedGlobalStart + errorOffset);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[0].global.kernelEnd, expectedGlobalEnd - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[0].global.kernelEnd, expectedGlobalEnd + errorOffset);
+
+    auto expectedContextStart = expectedGlobalStart;
+    auto expectedContextEnd = expectedContextStart + (mappedTimeStampData.packetData[0].contextEnd - mappedTimeStampData.packetData[0].contextStart) * deviceTsFrequency;
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[0].context.kernelStart, expectedContextStart - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[0].context.kernelStart, expectedContextStart + errorOffset);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[0].context.kernelEnd, expectedContextEnd - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[0].context.kernelEnd, expectedContextEnd + errorOffset);
+
+    // Packet 2
+    expectedGlobalStart = (cpuReferenceTimeInNs - gpuReferenceTimeInNs) + 500u +
+                          static_cast<uint64_t>(maxNBitValue(hwInfo.capabilityTable.kernelTimestampValidBits) * deviceTsFrequency);
+    expectedGlobalEnd = expectedGlobalStart + (1500 - 500);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[1].global.kernelStart, expectedGlobalStart - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[1].global.kernelStart, expectedGlobalStart + errorOffset);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[1].global.kernelEnd, expectedGlobalEnd - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[1].global.kernelEnd, expectedGlobalEnd + errorOffset);
+
+    expectedContextStart = expectedGlobalStart;
+    expectedContextEnd = expectedContextStart + (mappedTimeStampData.packetData[1].contextEnd - mappedTimeStampData.packetData[1].contextStart) * deviceTsFrequency;
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[1].context.kernelStart, expectedContextStart - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[1].context.kernelStart, expectedContextStart + errorOffset);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[1].context.kernelEnd, expectedContextEnd - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[1].context.kernelEnd, expectedContextEnd + errorOffset);
+
+    // Packet 3
+    expectedGlobalStart = (cpuReferenceTimeInNs - gpuReferenceTimeInNs) + 5000u;
+    expectedGlobalEnd = expectedGlobalStart + (static_cast<uint64_t>(maxKernelTsValue * deviceTsFrequency) - 5000u + 500u);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[2].global.kernelStart, expectedGlobalStart - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[2].global.kernelStart, expectedGlobalStart + errorOffset);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[2].global.kernelEnd, expectedGlobalEnd - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[2].global.kernelEnd, expectedGlobalEnd + errorOffset);
+
+    expectedContextStart = expectedGlobalStart;
+    expectedContextEnd = expectedContextStart + (mappedTimeStampData.packetData[2].contextEnd - mappedTimeStampData.packetData[1].contextStart) * deviceTsFrequency;
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[2].context.kernelStart, expectedContextStart - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[2].context.kernelStart, expectedContextStart + errorOffset);
+    EXPECT_GE(results.pSynchronizedTimestampsBuffer[2].context.kernelEnd, expectedContextEnd - errorOffset);
+    EXPECT_LE(results.pSynchronizedTimestampsBuffer[2].context.kernelEnd, expectedContextEnd + errorOffset);
+}
+
+using HostMappedEventTests = Test<DeviceFixture>;
+HWTEST_F(HostMappedEventTests, givenMappedEventsWhenSettingRefereshTimestampThenCorrectRefreshIntervalIsCalculated) {
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    const auto deviceTsFrequency = device->getNEODevice()->getDeviceInfo().profilingTimerResolution;
+    const auto kernelTsValidBits = device->getNEODevice()->getRootDeviceEnvironment().getMutableHardwareInfo()->capabilityTable.kernelTimestampValidBits;
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_MAPPED_TIMESTAMP;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    uint64_t expectedTsRefreshIntervalInNanoSec = 0u;
+    if (kernelTsValidBits >= 64) {
+        expectedTsRefreshIntervalInNanoSec = maxNBitValue(kernelTsValidBits) / 2;
+    } else {
+        expectedTsRefreshIntervalInNanoSec = static_cast<uint64_t>((maxNBitValue(kernelTsValidBits) * deviceTsFrequency) / 2);
+    }
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    auto event = std::unique_ptr<EventImp<uint64_t>>(static_cast<EventImp<uint64_t> *>(L0::Event::create<uint64_t>(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(nullptr, event);
+
+    // Reset before setting
+    NEO::TimeStampData *resetReferenceTs = event->peekReferenceTs();
+    resetReferenceTs->cpuTimeinNS = std::numeric_limits<uint64_t>::max();
+    resetReferenceTs->gpuTimeStamp = std::numeric_limits<uint64_t>::max();
+
+    event->setReferenceTs(expectedTsRefreshIntervalInNanoSec + 1);
+    EXPECT_NE(resetReferenceTs->cpuTimeinNS, std::numeric_limits<uint64_t>::max());
+    EXPECT_NE(resetReferenceTs->gpuTimeStamp, std::numeric_limits<uint64_t>::max());
+}
+
+HWTEST_F(HostMappedEventTests, givenEventTimestampRefreshIntervalInMilliSecIsSetThenCorrectRefreshIntervalIsCalculated) {
+
+    const uint32_t refereshIntervalMillisec = 10;
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EventTimestampRefreshIntervalInMilliSec.set(refereshIntervalMillisec);
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_MAPPED_TIMESTAMP;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    uint64_t expectedTsRefreshIntervalInNanoSec = refereshIntervalMillisec * 1000000;
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    auto event = std::unique_ptr<EventImp<uint64_t>>(static_cast<EventImp<uint64_t> *>(L0::Event::create<uint64_t>(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(nullptr, event);
+
+    // Reset before setting
+    NEO::TimeStampData *resetReferenceTs = event->peekReferenceTs();
+    resetReferenceTs->cpuTimeinNS = 0;
+    resetReferenceTs->gpuTimeStamp = 0;
+
+    event->setReferenceTs(expectedTsRefreshIntervalInNanoSec + 1);
+    EXPECT_NE(resetReferenceTs->cpuTimeinNS, 0u);
+    EXPECT_NE(resetReferenceTs->gpuTimeStamp, 0u);
+}
+
+HWTEST_F(HostMappedEventTests, givenEventTimestampRefreshIntervalInMilliSecIsSetThenRefreshIntervalIsNotCalculatedIfCpuTimeLessThanInterval) {
+
+    const uint32_t refereshIntervalMillisec = 10;
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EventTimestampRefreshIntervalInMilliSec.set(refereshIntervalMillisec);
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_MAPPED_TIMESTAMP;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    uint64_t expectedTsRefreshIntervalInNanoSec = refereshIntervalMillisec * 1000000;
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    auto event = std::unique_ptr<EventImp<uint64_t>>(static_cast<EventImp<uint64_t> *>(L0::Event::create<uint64_t>(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(nullptr, event);
+
+    // Reset before setting
+    NEO::TimeStampData *resetReferenceTs = event->peekReferenceTs();
+    resetReferenceTs->cpuTimeinNS = 1;
+    resetReferenceTs->gpuTimeStamp = 1;
+
+    event->setReferenceTs(expectedTsRefreshIntervalInNanoSec - 2);
+    EXPECT_EQ(resetReferenceTs->cpuTimeinNS, 1u);
+    EXPECT_EQ(resetReferenceTs->gpuTimeStamp, 1u);
+}
+
+HWTEST_F(HostMappedEventTests, givenMappedTimestampEventWhenResettingAllPacketsThenReferenceTimestampIsNotOverwritten) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 2;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_MAPPED_TIMESTAMP;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, eventPool);
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    auto event = std::unique_ptr<EventImp<uint64_t>>(static_cast<EventImp<uint64_t> *>(L0::Event::create<uint64_t>(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(nullptr, event);
+    ASSERT_LT(event->getMaxPacketsCount(), NEO::TimestampPacketConstants::preferredPacketCount);
+
+    NEO::TimeStampData *referenceTs = event->peekReferenceTs();
+    referenceTs->cpuTimeinNS = 0;
+    referenceTs->gpuTimeStamp = 0;
+
+    event->resetDeviceCompletionData(true);
+
+    EXPECT_EQ(0u, referenceTs->cpuTimeinNS);
+    EXPECT_EQ(0u, referenceTs->gpuTimeStamp);
+}
+
+HWCMDTEST_F(IGFX_GEN12LP_CORE, TimestampEventCreate, givenEventTimestampsWhenQueryKernelTimestampThenCorrectDataAreSet) {
     typename MockTimestampPackets32::Packet data = {};
     data.contextStart = 1u;
     data.contextEnd = 2u;
     data.globalStart = 3u;
     data.globalEnd = 4u;
 
-    event->hostAddress = &data;
+    event->hostAddressFromPool = &data;
     ze_kernel_timestamp_result_t result = {};
 
     event->queryKernelTimestamp(&result);
@@ -2062,6 +4786,156 @@ HWCMDTEST_F(IGFX_GEN9_CORE, TimestampEventCreate, givenEventTimestampsWhenQueryK
     EXPECT_EQ(data.contextEnd, result.context.kernelEnd);
     EXPECT_EQ(data.globalStart, result.global.kernelStart);
     EXPECT_EQ(data.globalEnd, result.global.kernelEnd);
+}
+
+HWTEST_F(TimestampEventCreate, givenOverflowingTimeStampDataOnMultiplePacketsWhenQueryKernelTimestampIsCalledOverflowIsObserved) {
+    typename MockTimestampPackets32::Packet packetData[3] = {};
+    event->hostAddressFromPool = packetData;
+
+    // 1st packet - both timestamps overflowing, starts the overflow tracking
+    packetData[0].contextStart = 100u;
+    packetData[0].contextEnd = 50u;
+    packetData[0].globalStart = 1000u;
+    packetData[0].globalEnd = 500u;
+
+    // 2nd packet - both timestamps overflowing again, tracked while already overflowed
+    packetData[1].contextStart = 200u;
+    packetData[1].contextEnd = 60u;
+    packetData[1].globalStart = 2000u;
+    packetData[1].globalEnd = 600u;
+
+    // 3rd packet - not overflowing, must not extend the end timestamps
+    packetData[2].contextStart = 10u;
+    packetData[2].contextEnd = 300u;
+    packetData[2].globalStart = 20u;
+    packetData[2].globalEnd = 3000u;
+
+    event->setPacketsInUse(3u);
+
+    ze_kernel_timestamp_result_t results = {};
+    event->queryKernelTimestamp(&results);
+
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    if (gfxCoreHelper.useOnlyGlobalTimestamps() == false) {
+        EXPECT_EQ(10u, results.context.kernelStart);
+        EXPECT_EQ(60u, results.context.kernelEnd);
+    }
+
+    EXPECT_EQ(20u, results.global.kernelStart);
+    EXPECT_EQ(600u, results.global.kernelEnd);
+}
+
+HWTEST_F(TimestampEventCreate, givenFlagPrintCalculatedTimestampsWhenCallQueryKernelTimestampThenProperLogIsPrinted) {
+    debugManager.flags.PrintCalculatedTimestamps.set(1);
+    typename MockTimestampPackets32::Packet data = {};
+    data.contextStart = 1u;
+    data.contextEnd = 2u;
+    data.globalStart = 3u;
+    data.globalEnd = 4u;
+
+    event->hostAddressFromPool = &data;
+    ze_kernel_timestamp_result_t result = {};
+    StreamCapture capture;
+    capture.captureStdout();
+    event->queryKernelTimestamp(&result);
+    std::string output = capture.getCapturedStdout();
+    std::stringstream expected;
+    expected << "globalStartTS: " << result.global.kernelStart << ", "
+             << "globalEndTS: " << result.global.kernelEnd << ", "
+             << "contextStartTS: " << result.context.kernelStart << ", "
+             << "contextEndTS: " << result.context.kernelEnd << std::endl;
+
+    EXPECT_EQ(0, output.compare(expected.str().c_str()));
+}
+
+TEST_F(TimestampEventUsedPacketSignalCreate, givenFlagPrintTimestampPacketContentsWhenMultiPacketAndCallQueryKernelTimestampThenProperLogIsPrinted) {
+    debugManager.flags.PrintTimestampPacketContents.set(1);
+    typename MockTimestampPackets32::Packet packetData[2];
+
+    packetData[0].contextStart = 1u;
+    packetData[0].contextEnd = 2u;
+    packetData[0].globalStart = 3u;
+    packetData[0].globalEnd = 4u;
+
+    packetData[1].contextStart = 5u;
+    packetData[1].contextEnd = 6u;
+    packetData[1].globalStart = 7u;
+    packetData[1].globalEnd = 8u;
+
+    event->hostAddressFromPool = packetData;
+
+    ze_kernel_timestamp_result_t results;
+    auto packedCount = 2u;
+    event->setPacketsInUse(packedCount);
+
+    StreamCapture capture;
+    capture.captureStdout();
+    event->queryKernelTimestamp(&results);
+    std::string output = capture.getCapturedStdout();
+    std::stringstream expected;
+
+    for (uint32_t i = 0; i < packedCount; i++) {
+        expected << "packet: " << i << ", "
+                 << "globalStartTS: " << packetData[i].globalStart << ", "
+                 << "globalEndTS: " << packetData[i].globalEnd << ", "
+                 << "contextStartTS: " << packetData[i].contextStart << ", "
+                 << "contextEndTS: " << packetData[i].contextEnd << std::endl;
+    }
+    EXPECT_EQ(0, output.compare(expected.str().c_str()));
+}
+
+TEST_F(TimestampEventUsedPacketSignalCreate, givenEventWithBlitAdditionalPropertiesWhenCallingCalulateProfilingDataThenCorrectDataSet) {
+    typename MockTimestampPackets32::Packet packetData[3];
+    uint32_t deviceCount = 1;
+    ze_device_handle_t rootDeviceHandle;
+
+    ze_result_t result = zeDeviceGet(driverHandle.get(), &deviceCount, &rootDeviceHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    MockTagAllocator<DeviceAllocNodeType<true>> deviceTagAllocator(0, neoDevice->getMemoryManager());
+    MockTagAllocator<NEO::TimestampPackets<uint32_t, 2>> blitTagAllocator(0, neoDevice->getMemoryManager());
+    auto event = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, L0::Device::fromHandle(rootDeviceHandle), result)));
+    ASSERT_NE(nullptr, event);
+
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(deviceTagAllocator.getTag(), nullptr, *neoDevice, 1, false);
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+
+    event->resetAdditionalTimestampNode(blitTagAllocator.getTag(), 1, false);
+
+    event->setPacketsInUse(2u);
+
+    packetData[0].contextStart = 1u;
+    packetData[0].contextEnd = 2u;
+    packetData[0].globalStart = 3u;
+    packetData[0].globalEnd = 4u;
+
+    packetData[1].contextStart = 5u;
+    packetData[1].contextEnd = 6u;
+    packetData[1].globalStart = 7u;
+    packetData[1].globalEnd = 8u;
+
+    packetData[2].contextStart = 9u;
+    packetData[2].contextEnd = 10u;
+    packetData[2].globalStart = 11u;
+    packetData[2].globalEnd = 12u;
+
+    event->hostAddressFromPool = packetData;
+    uint32_t pCount = 3;
+
+    for (uint32_t packetId = 0; packetId < pCount; packetId++) {
+        event->kernelEventCompletionData.assignDataToAllTimestamps(packetId, event->hostAddressFromPool);
+        event->hostAddressFromPool = ptrOffset(event->hostAddressFromPool, NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
+    }
+    result = event->calculateProfilingData();
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(packetData[0].contextStart, event->contextStartTS);
+    EXPECT_EQ(packetData[2].contextEnd, event->contextEndTS);
+    EXPECT_EQ(packetData[0].globalStart, event->globalStartTS);
+    EXPECT_EQ(packetData[2].globalEnd, event->globalEndTS);
 }
 
 TEST_F(TimestampEventUsedPacketSignalCreate, givenEventWhenQueryingTimestampExpThenCorrectDataSet) {
@@ -2078,14 +4952,14 @@ TEST_F(TimestampEventUsedPacketSignalCreate, givenEventWhenQueryingTimestampExpT
     packetData[1].globalStart = 7u;
     packetData[1].globalEnd = 8u;
 
-    event->hostAddress = packetData;
+    event->hostAddressFromPool = packetData;
 
     ze_kernel_timestamp_result_t results[2];
     uint32_t pCount = 2;
 
     for (uint32_t packetId = 0; packetId < pCount; packetId++) {
-        event->kernelEventCompletionData[0].assignDataToAllTimestamps(packetId, event->hostAddress);
-        event->hostAddress = ptrOffset(event->hostAddress, NEO::TimestampPackets<uint32_t>::getSinglePacketSize());
+        event->kernelEventCompletionData.assignDataToAllTimestamps(packetId, event->hostAddressFromPool);
+        event->hostAddressFromPool = ptrOffset(event->hostAddressFromPool, NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
     }
 
     auto result = event->queryTimestampsExp(device, &pCount, results);
@@ -2099,147 +4973,58 @@ TEST_F(TimestampEventUsedPacketSignalCreate, givenEventWhenQueryingTimestampExpT
     }
 }
 
-HWTEST2_F(TimestampEventCreateMultiKernel, givenTimeStampEventUsedOnTwoKernelsWhenL3FlushSetOnFirstKernelThenDoNotUseSecondPacketOfFirstKernel, IsAtLeastXeHpCore) {
-    typename MockTimestampPackets32::Packet packetData[4];
+TEST_F(TimestampEventUsedPacketSignalCreate, givenNonAggregatedStorageEventWhenCallingQueryTimestampsExpThenAllPacketsAreReported) {
+    ASSERT_FALSE(Event::isAggregatedEvent(event.get()));
 
-    event->hostAddress = packetData;
-
-    constexpr uint32_t kernelStartValue = 5u;
-    constexpr uint32_t kernelEndValue = 10u;
-
-    constexpr uint32_t waStartValue = 2u;
-    constexpr uint32_t waEndValue = 15u;
-
-    // 1st kernel 1st packet
-    packetData[0].contextStart = kernelStartValue;
-    packetData[0].contextEnd = kernelEndValue;
-    packetData[0].globalStart = kernelStartValue;
-    packetData[0].globalEnd = kernelEndValue;
-
-    // 1st kernel 2nd packet for L3 Flush
-    packetData[1].contextStart = waStartValue;
-    packetData[1].contextEnd = waEndValue;
-    packetData[1].globalStart = waStartValue;
-    packetData[1].globalEnd = waEndValue;
-
-    // 2nd kernel 1st packet
-    packetData[2].contextStart = kernelStartValue;
-    packetData[2].contextEnd = kernelEndValue;
-    packetData[2].globalStart = kernelStartValue;
-    packetData[2].globalEnd = kernelEndValue;
-
-    event->setPacketsInUse(2u);
-    event->setL3FlushForCurrentKernel();
-
-    event->increaseKernelCount();
-    EXPECT_EQ(1u, event->getPacketsUsedInLastKernel());
-
-    ze_kernel_timestamp_result_t results;
-    event->queryKernelTimestamp(&results);
-
-    EXPECT_EQ(static_cast<uint64_t>(kernelStartValue), results.context.kernelStart);
-    EXPECT_EQ(static_cast<uint64_t>(kernelStartValue), results.global.kernelStart);
-    EXPECT_EQ(static_cast<uint64_t>(kernelEndValue), results.context.kernelEnd);
-    EXPECT_EQ(static_cast<uint64_t>(kernelEndValue), results.global.kernelEnd);
-}
-
-HWTEST2_F(TimestampEventCreateMultiKernel, givenTimeStampEventUsedOnTwoKernelsWhenL3FlushSetOnSecondKernelThenDoNotUseSecondPacketOfSecondKernel, IsAtLeastXeHpCore) {
-    typename MockTimestampPackets32::Packet packetData[4];
-
-    event->hostAddress = packetData;
-
-    constexpr uint32_t kernelStartValue = 5u;
-    constexpr uint32_t kernelEndValue = 10u;
-
-    constexpr uint32_t waStartValue = 2u;
-    constexpr uint32_t waEndValue = 15u;
-
-    // 1st kernel 1st packet
-    packetData[0].contextStart = kernelStartValue;
-    packetData[0].contextEnd = kernelEndValue;
-    packetData[0].globalStart = kernelStartValue;
-    packetData[0].globalEnd = kernelEndValue;
-
-    // 2nd kernel 1st packet
-    packetData[1].contextStart = kernelStartValue;
-    packetData[1].contextEnd = kernelEndValue;
-    packetData[1].globalStart = kernelStartValue;
-    packetData[1].globalEnd = kernelEndValue;
-
-    // 2nd kernel 2nd packet for L3 Flush
-    packetData[2].contextStart = waStartValue;
-    packetData[2].contextEnd = waEndValue;
-    packetData[2].globalStart = waStartValue;
-    packetData[2].globalEnd = waEndValue;
-
-    EXPECT_EQ(1u, event->getPacketsUsedInLastKernel());
-
-    event->increaseKernelCount();
-    event->setPacketsInUse(2u);
-    event->setL3FlushForCurrentKernel();
-
-    ze_kernel_timestamp_result_t results;
-    event->queryKernelTimestamp(&results);
-
-    EXPECT_EQ(static_cast<uint64_t>(kernelStartValue), results.context.kernelStart);
-    EXPECT_EQ(static_cast<uint64_t>(kernelStartValue), results.global.kernelStart);
-    EXPECT_EQ(static_cast<uint64_t>(kernelEndValue), results.context.kernelEnd);
-    EXPECT_EQ(static_cast<uint64_t>(kernelEndValue), results.global.kernelEnd);
-}
-
-HWTEST2_F(TimestampEventCreateMultiKernel, givenOverflowingTimeStampDataOnTwoKernelsWhenQueryKernelTimestampIsCalledOverflowIsObserved, IsAtLeastXeHpCore) {
-    typename MockTimestampPackets32::Packet packetData[4] = {};
-    event->hostAddress = packetData;
-
-    uint32_t maxTimeStampValue = std::numeric_limits<uint32_t>::max();
-
-    // 1st kernel 1st packet (overflowing context timestamp)
-    packetData[0].contextStart = maxTimeStampValue - 1;
-    packetData[0].contextEnd = maxTimeStampValue + 1;
-    packetData[0].globalStart = maxTimeStampValue - 2;
-    packetData[0].globalEnd = maxTimeStampValue - 1;
-
-    // 2nd kernel 1st packet (overflowing global timestamp)
-    packetData[1].contextStart = maxTimeStampValue - 2;
-    packetData[1].contextEnd = maxTimeStampValue - 1;
-    packetData[1].globalStart = maxTimeStampValue - 1;
-    packetData[1].globalEnd = maxTimeStampValue + 1;
-
-    // 2nd kernel 2nd packet (overflowing context timestamp)
-    memcpy(&packetData[2], &packetData[0], sizeof(MockTimestampPackets32::Packet));
-    packetData[2].contextStart = maxTimeStampValue;
-    packetData[2].contextEnd = maxTimeStampValue + 2;
-
-    EXPECT_EQ(1u, event->getPacketsUsedInLastKernel());
-
-    event->increaseKernelCount();
+    typename MockTimestampPackets32::Packet packetData[2];
     event->setPacketsInUse(2u);
 
-    ze_kernel_timestamp_result_t results;
-    event->queryKernelTimestamp(&results);
+    packetData[0].contextStart = 1u;
+    packetData[0].contextEnd = 2u;
+    packetData[0].globalStart = 3u;
+    packetData[0].globalEnd = 4u;
 
-    auto &gfxCoreHelper = device->getGfxCoreHelper();
-    if (gfxCoreHelper.useOnlyGlobalTimestamps() == false) {
-        EXPECT_EQ(static_cast<uint64_t>(maxTimeStampValue - 2), results.context.kernelStart);
-        EXPECT_EQ(static_cast<uint64_t>(maxTimeStampValue + 2), results.context.kernelEnd);
+    packetData[1].contextStart = 5u;
+    packetData[1].contextEnd = 6u;
+    packetData[1].globalStart = 7u;
+    packetData[1].globalEnd = 8u;
+
+    event->hostAddressFromPool = packetData;
+    for (uint32_t packetId = 0; packetId < 2u; packetId++) {
+        event->kernelEventCompletionData.assignDataToAllTimestamps(packetId, event->hostAddressFromPool);
+        event->hostAddressFromPool = ptrOffset(event->hostAddressFromPool, NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
     }
 
-    EXPECT_EQ(static_cast<uint64_t>(maxTimeStampValue - 2), results.global.kernelStart);
-    EXPECT_EQ(static_cast<uint64_t>(maxTimeStampValue + 1), results.global.kernelEnd);
+    // Size query reports the full packet count (not 1 like it would for aggregated storage event).
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->queryTimestampsExp(device, &count, nullptr));
+    EXPECT_EQ(2u, count);
+
+    ze_kernel_timestamp_result_t results[2] = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->queryTimestampsExp(device, &count, results));
+    EXPECT_EQ(2u, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        EXPECT_EQ(packetData[i].contextStart, results[i].context.kernelStart);
+        EXPECT_EQ(packetData[i].contextEnd, results[i].context.kernelEnd);
+        EXPECT_EQ(packetData[i].globalStart, results[i].global.kernelStart);
+        EXPECT_EQ(packetData[i].globalEnd, results[i].global.kernelEnd);
+    }
 }
 
 HWTEST_EXCLUDE_PRODUCT(TimestampEventCreate, givenEventTimestampsWhenQueryKernelTimestampThenCorrectDataAreSet, IGFX_GEN12LP_CORE);
 
 TEST_F(TimestampEventCreate, givenEventWhenQueryKernelTimestampThenNotReadyReturned) {
     struct MockEventQuery : public L0::EventImp<uint32_t> {
-        MockEventQuery(L0::EventPool *eventPool, int index, L0::Device *device) : EventImp(eventPool, index, device, false) {}
+        MockEventQuery(int index, L0::Device *device) : EventImp(index, device, false) {}
 
-        ze_result_t queryStatus() override {
+        using EventImp<uint32_t>::queryStatus;
+        ze_result_t queryStatus(int64_t timeSinceWait, bool blockOnMiss) override {
             return ZE_RESULT_NOT_READY;
         }
     };
 
-    auto mockEvent = std::make_unique<MockEventQuery>(eventPool.get(), 1u, device);
+    auto mockEvent = std::make_unique<MockEventQuery>(1u, device);
 
     ze_kernel_timestamp_result_t resultTimestamp = {};
 
@@ -2252,10 +5037,9 @@ TEST_F(TimestampEventCreate, givenEventWhenQueryKernelTimestampThenNotReadyRetur
     EXPECT_EQ(0u, resultTimestamp.global.kernelEnd);
 }
 
-TEST_F(EventPoolCreateMultiDevice, givenReturnSubDevicesAsApiDevicesWhenCallZeGetDevicesThenSubDevicesAreReturnedAsSeparateDevices) {
-    DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.ReturnSubDevicesAsApiDevices.set(1);
+using EventPoolCreateMultiDeviceFlatHierarchy = Test<MultiDeviceFixtureFlatHierarchy>;
 
+TEST_F(EventPoolCreateMultiDeviceFlatHierarchy, givenFlatHierarchyWhenCallZeGetDevicesThenSubDevicesAreReturnedAsSeparateDevices) {
     uint32_t deviceCount = 0;
     ze_result_t result = zeDeviceGet(driverHandle.get(), &deviceCount, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -2267,14 +5051,15 @@ TEST_F(EventPoolCreateMultiDevice, givenReturnSubDevicesAsApiDevicesWhenCallZeGe
 
     uint32_t i = 0u;
     for (const auto device : driverHandle->devices) {
-        auto deviceImpl = static_cast<DeviceImp *>(device);
+        auto deviceImpl = static_cast<Device *>(device);
         for (const auto subdevice : deviceImpl->subDevices) {
             EXPECT_EQ(devices[i], subdevice);
             i++;
         }
     }
 
-    static_cast<DeviceImp *>(driverHandle->devices[1])->numSubDevices = 0;
+    static_cast<Device *>(driverHandle->devices[1])->numSubDevices = 0;
+    driverHandle->setupDevicesToExpose();
     uint32_t deviceCount2 = 0;
     result = zeDeviceGet(driverHandle.get(), &deviceCount2, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -2286,7 +5071,7 @@ TEST_F(EventPoolCreateMultiDevice, givenReturnSubDevicesAsApiDevicesWhenCallZeGe
 
     i = 0u;
     for (const auto device : driverHandle->devices) {
-        auto deviceImpl = static_cast<DeviceImp *>(device);
+        auto deviceImpl = static_cast<Device *>(device);
         if (deviceImpl->numSubDevices > 0) {
             for (const auto subdevice : deviceImpl->subDevices) {
                 EXPECT_EQ(devices2[i], subdevice);
@@ -2298,7 +5083,7 @@ TEST_F(EventPoolCreateMultiDevice, givenReturnSubDevicesAsApiDevicesWhenCallZeGe
         }
     }
 
-    static_cast<DeviceImp *>(driverHandle->devices[1])->numSubDevices = numSubDevices;
+    static_cast<Device *>(driverHandle->devices[1])->numSubDevices = numSubDevices;
     delete[] devices2;
     delete[] devices;
 }
@@ -2414,6 +5199,26 @@ TEST_F(EventPoolCreateSingleDevice, whenCreatingEventPoolWithNoDevicesThenEventP
     EXPECT_EQ(allocation->getGraphicsAllocations().size(), 1u);
 }
 
+TEST_F(EventPoolCreateSingleDevice, whenCreatingEventPoolAndPlatformHasDcFlushThenEventPoolIsUncacheable) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+    eventPoolDesc.count = 1;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(),
+                                                               context,
+                                                               0,
+                                                               nullptr,
+                                                               &eventPoolDesc,
+                                                               result));
+    EXPECT_NE(nullptr, eventPool);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    auto allocation = &eventPool->getAllocation();
+    EXPECT_NE(nullptr, allocation);
+    auto mockAllocation = static_cast<MemoryAllocation *>(allocation->getGraphicsAllocations()[0]);
+    EXPECT_EQ(mockAllocation->uncacheable, device->getProductHelper().isDcFlushAllowed());
+}
+
 struct EventPoolCreateNegativeTest : public ::testing::Test {
     void SetUp() override {
 
@@ -2423,6 +5228,7 @@ struct EventPoolCreateNegativeTest : public ::testing::Test {
             executionEnvironment->rootDeviceEnvironments[i]->setHwInfoAndInitHelpers(NEO::defaultHwInfo.get());
             executionEnvironment->rootDeviceEnvironments[i]->initGmm();
         }
+        executionEnvironment->calculateMaxOsContextCount();
 
         std::vector<std::unique_ptr<NEO::Device>> devices;
         for (uint32_t i = 0; i < numRootDevices; i++) {
@@ -2430,7 +5236,7 @@ struct EventPoolCreateNegativeTest : public ::testing::Test {
             devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
         }
 
-        driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+        driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
         driverHandle->initialize(std::move(devices));
         static_cast<MockMemoryManager *>(driverHandle->getMemoryManager())->isMockEventPoolCreateMemoryManager = true;
 
@@ -2440,18 +5246,18 @@ struct EventPoolCreateNegativeTest : public ::testing::Test {
         ze_context_desc_t desc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
         ze_result_t res = driverHandle->createContext(&desc, 0u, nullptr, &hContext);
         EXPECT_EQ(ZE_RESULT_SUCCESS, res);
-        context = static_cast<ContextImp *>(Context::fromHandle(hContext));
+        context = Context::fromHandle(hContext);
     }
     void TearDown() override {
         context->destroy();
     }
 
     NEO::ExecutionEnvironment *executionEnvironment = nullptr;
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
     const uint32_t numRootDevices = 2u;
-    L0::ContextImp *context = nullptr;
+    L0::Context *context = nullptr;
 };
 
 TEST_F(EventPoolCreateNegativeTest, whenCreatingEventPoolButMemoryManagerFailsThenErrorIsReturned) {
@@ -2506,42 +5312,82 @@ TEST_F(EventPoolCreateNegativeTest, whenInitializingEventPoolButMemoryManagerFai
 }
 
 using EventTests = Test<EventFixture<1, 0>>;
-using EventUsedPacketSignalTests = Test<EventUsedPacketSignalFixture<1, 0, 0, -1>>;
+using EventUsedPacketSignalTests = Test<EventCompactL3FlushFixture<1, 0, -1>>;
 
 TEST_F(EventTests, WhenQueryingStatusThenSuccessIsReturned) {
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    ze_result_t returnValue;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, returnValue));
     ASSERT_NE(event, nullptr);
 
-    auto result = event->hostSignal();
+    auto result = event->hostSignal(false);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
+
+    event->destroy();
+}
+
+TEST_F(EventTests, givenForceHostSignalScopeSetToOneWhenCreateEventWithoutScopeThenHostScopeSet) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.ForceHostSignalScope.set(1);
+
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
+    ASSERT_NE(event, nullptr);
+
+    EXPECT_TRUE(event->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+
+    event->destroy();
+}
+
+TEST_F(EventTests, givenForceHostSignalScopeSetToZeroWhenCreateEventWithHostScopeThenHostScopeUnset) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.ForceHostSignalScope.set(0);
+
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
+    ASSERT_NE(event, nullptr);
+
+    EXPECT_FALSE(event->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+
+    event->destroy();
+}
+
+TEST_F(EventTests, givenAbortHostSyncOnNonHostVisibleEventWhenWaitForNonHostVisibleEventThenAbort) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.AbortHostSyncOnNonHostVisibleEvent.set(true);
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
+    ASSERT_NE(event, nullptr);
+
+    EXPECT_ANY_THROW(event->hostSynchronize(std::numeric_limits<uint64_t>::max()));
 
     event->destroy();
 }
 
 TEST_F(EventTests, GivenResetWhenQueryingStatusThenNotReadyIsReturned) {
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    ze_result_t returnValue;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, returnValue));
     ASSERT_NE(event, nullptr);
 
-    auto result = event->hostSignal();
+    auto result = event->hostSignal(false);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
-
-    event->setUsingContextEndOffset(true);
 
     result = event->reset();
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_NOT_READY);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_NOT_READY);
 
     event->destroy();
 }
 
 TEST_F(EventTests, WhenDestroyingAnEventThenSuccessIsReturned) {
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
     ASSERT_NE(event, nullptr);
 
-    auto result = event->destroy();
+    result = event->destroy();
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
 
@@ -2553,14 +5399,14 @@ TEST_F(EventTests, givenTwoEventsCreatedThenTheyHaveDifferentAddresses) {
     ze_event_desc_t eventDesc1 = {};
     eventDesc1.index = 1;
     eventDesc.index = 1;
-
-    auto event0 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc0, device));
+    ze_result_t result;
+    auto event0 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc0, device, result));
     ASSERT_NE(event0, nullptr);
 
-    auto event1 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc1, device));
+    auto event1 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc1, device, result));
     ASSERT_NE(event1, nullptr);
 
-    EXPECT_NE(event0->hostAddress, event1->hostAddress);
+    EXPECT_NE(event0->hostAddressFromPool, event1->hostAddressFromPool);
     EXPECT_NE(event0->getGpuAddress(device), event1->getGpuAddress(device));
 
     event0->destroy();
@@ -2571,19 +5417,23 @@ TEST_F(EventTests, givenRegularEventUseMultiplePacketsWhenHostSignalThenExpectAl
     eventDesc.index = 0;
     eventDesc.signal = 0;
     eventDesc.wait = 0;
+
+    uint32_t packetsUsed = std::min(4u, eventPool->getEventMaxPackets());
+
+    eventPool->setEventSize(static_cast<uint32_t>(alignUp(packetsUsed * device->getGfxCoreHelper().getSingleTimestampPacketSize(), 64)));
+    ze_result_t result;
     auto event = std::unique_ptr<L0::EventImp<uint32_t>>(static_cast<L0::EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(),
                                                                                                                            &eventDesc,
-                                                                                                                           device)));
+                                                                                                                           device, result)));
     ASSERT_NE(event, nullptr);
 
     uint32_t *hostAddr = static_cast<uint32_t *>(event->getCompletionFieldHostAddress());
     EXPECT_EQ(*hostAddr, Event::STATE_INITIAL);
     EXPECT_EQ(1u, event->getPacketsInUse());
 
-    constexpr uint32_t packetsUsed = 4u;
     event->setPacketsInUse(packetsUsed);
     event->setEventTimestampFlag(false);
-    event->hostSignal();
+    event->hostSignal(false);
     for (uint32_t i = 0; i < packetsUsed; i++) {
         EXPECT_EQ(Event::STATE_SIGNALED, *hostAddr);
         hostAddr = ptrOffset(hostAddr, event->getSinglePacketSize());
@@ -2594,9 +5444,14 @@ TEST_F(EventUsedPacketSignalTests, givenEventUseMultiplePacketsWhenHostSignalThe
     eventDesc.index = 0;
     eventDesc.signal = 0;
     eventDesc.wait = 0;
+
+    uint32_t packetsUsed = std::min(4u, eventPool->getEventMaxPackets());
+
+    eventPool->setEventSize(static_cast<uint32_t>(alignUp(packetsUsed * device->getGfxCoreHelper().getSingleTimestampPacketSize(), 64)));
+    ze_result_t result;
     auto event = std::unique_ptr<L0::EventImp<uint32_t>>(static_cast<L0::EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(),
                                                                                                                            &eventDesc,
-                                                                                                                           device)));
+                                                                                                                           device, result)));
     ASSERT_NE(event, nullptr);
 
     size_t eventOffset = event->getCompletionFieldOffset();
@@ -2606,41 +5461,14 @@ TEST_F(EventUsedPacketSignalTests, givenEventUseMultiplePacketsWhenHostSignalThe
     EXPECT_EQ(Event::STATE_INITIAL, *hostAddr);
     EXPECT_EQ(1u, event->getPacketsInUse());
 
-    constexpr uint32_t packetsUsed = 4u;
     event->setPacketsInUse(packetsUsed);
     event->setEventTimestampFlag(false);
 
-    event->hostSignal();
+    event->hostSignal(false);
     for (uint32_t i = 0; i < packetsUsed; i++) {
         EXPECT_EQ(Event::STATE_SIGNALED, *hostAddr);
         hostAddr = ptrOffset(hostAddr, event->getSinglePacketSize());
     }
-}
-
-using EventUsedPacketSignalNoCompactionTests = Test<EventUsedPacketSignalFixture<1, 0, 0, 0>>;
-HWTEST2_F(EventUsedPacketSignalNoCompactionTests, WhenSettingL3FlushOnEventThenSetOnParticularKernel, IsAtLeastXeHpCore) {
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
-    ASSERT_NE(event, nullptr);
-    EXPECT_FALSE(event->getL3FlushForCurrenKernel());
-
-    event->setL3FlushForCurrentKernel();
-    EXPECT_TRUE(event->getL3FlushForCurrenKernel());
-
-    event->increaseKernelCount();
-    EXPECT_EQ(2u, event->getKernelCount());
-
-    EXPECT_FALSE(event->getL3FlushForCurrenKernel());
-
-    event->setL3FlushForCurrentKernel();
-    EXPECT_TRUE(event->getL3FlushForCurrenKernel());
-
-    event->reset();
-    EXPECT_FALSE(event->getL3FlushForCurrenKernel());
-
-    constexpr size_t expectedL3FlushOnKernelCount = 0;
-    EXPECT_EQ(expectedL3FlushOnKernelCount, event->l3FlushAppliedOnKernel.count());
-
-    event->destroy();
 }
 
 struct EventSizeFixture : public DeviceFixture {
@@ -2695,17 +5523,13 @@ HWTEST_F(EventSizeTests, whenCreatingEventPoolThenUseCorrectSizeAndAlignment) {
     eventPool.reset(EventPool::create(device->getDriverHandle(), context, 1, &hDevice, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     auto &gfxCoreHelper = device->getGfxCoreHelper();
-    auto &hwInfo = device->getHwInfo();
 
     auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
 
-    uint32_t packetCount = EventPacketsCount::eventPackets;
-    if (l0GfxCoreHelper.useDynamicEventPacketsCount(hwInfo)) {
-        packetCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
-    }
+    uint32_t packetCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
 
     auto expectedAlignment = static_cast<uint32_t>(gfxCoreHelper.getTimestampPacketAllocatorAlignment());
-    auto singlePacketSize = TimestampPackets<typename FamilyType::TimestampPacketType>::getSinglePacketSize();
+    auto singlePacketSize = TimestampPackets<typename FamilyType::TimestampPacketType, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize();
     auto expectedSize = static_cast<uint32_t>(alignUp(packetCount * singlePacketSize, expectedAlignment));
 
     EXPECT_EQ(expectedSize, eventPool->getEventSize());
@@ -2722,7 +5546,7 @@ HWTEST_F(EventSizeTests, whenCreatingEventPoolThenUseCorrectSizeAndAlignment) {
     EXPECT_EQ(timestampPacketTypeSize * 2, eventObj0->getContextEndOffset());
     EXPECT_EQ(timestampPacketTypeSize * 3, eventObj0->getGlobalEndOffset());
 
-    EXPECT_EQ(timestampPacketTypeSize * 4, eventObj0->getSinglePacketSize());
+    EXPECT_EQ(l0GfxCoreHelper.getImmediateWritePostSyncOffset(), eventObj0->getSinglePacketSize());
 
     auto hostPtrDiff = ptrDiff(eventObj1->getHostAddress(), eventObj0->getHostAddress());
     EXPECT_EQ(expectedSize, hostPtrDiff);
@@ -2730,23 +5554,19 @@ HWTEST_F(EventSizeTests, whenCreatingEventPoolThenUseCorrectSizeAndAlignment) {
 
 HWTEST_F(EventSizeTests, givenDebugFlagwhenCreatingEventPoolThenUseCorrectSizeAndAlignment) {
     auto &gfxCoreHelper = device->getGfxCoreHelper();
-    auto &hwInfo = device->getHwInfo();
     auto expectedAlignment = static_cast<uint32_t>(gfxCoreHelper.getTimestampPacketAllocatorAlignment());
 
     auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
 
-    uint32_t packetCount = EventPacketsCount::eventPackets;
-    if (l0GfxCoreHelper.useDynamicEventPacketsCount(hwInfo)) {
-        packetCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
-    }
+    uint32_t packetCount = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
 
     {
-        DebugManager.flags.OverrideTimestampPacketSize.set(4);
+        debugManager.flags.OverrideTimestampPacketSize.set(4);
 
         ze_result_t result = ZE_RESULT_SUCCESS;
         eventPool.reset(EventPool::create(device->getDriverHandle(), context, 1, &hDevice, &eventPoolDesc, result));
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-        auto singlePacketSize = TimestampPackets<uint32_t>::getSinglePacketSize();
+        auto singlePacketSize = TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize();
 
         auto expectedSize = static_cast<uint32_t>(alignUp(packetCount * singlePacketSize, expectedAlignment));
 
@@ -2762,12 +5582,12 @@ HWTEST_F(EventSizeTests, givenDebugFlagwhenCreatingEventPoolThenUseCorrectSizeAn
     }
 
     {
-        DebugManager.flags.OverrideTimestampPacketSize.set(8);
+        debugManager.flags.OverrideTimestampPacketSize.set(8);
 
         ze_result_t result = ZE_RESULT_SUCCESS;
         eventPool.reset(EventPool::create(device->getDriverHandle(), context, 1, &hDevice, &eventPoolDesc, result));
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-        auto singlePacketSize = TimestampPackets<uint64_t>::getSinglePacketSize();
+        auto singlePacketSize = TimestampPackets<uint64_t, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize();
 
         auto expectedSize = static_cast<uint32_t>(alignUp(packetCount * singlePacketSize, expectedAlignment));
 
@@ -2783,35 +5603,67 @@ HWTEST_F(EventSizeTests, givenDebugFlagwhenCreatingEventPoolThenUseCorrectSizeAn
     }
 
     {
-        DebugManager.flags.OverrideTimestampPacketSize.set(12);
+        debugManager.flags.OverrideTimestampPacketSize.set(12);
         ze_result_t result = ZE_RESULT_SUCCESS;
         EXPECT_ANY_THROW(EventPool::create(device->getDriverHandle(), context, 1, &hDevice, &eventPoolDesc, result));
         EXPECT_ANY_THROW(createEvents());
     }
 }
 
-HWTEST_F(EventTests,
-         WhenHostEventSyncThenExpectDownloadEventAllocationWithEachQuery) {
+HWTEST_F(EventTests, whenCreatingNonTimestampEventsThenPacketsSizeIsQword) {
+    DebugManagerStateRestore restore;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+
+    const ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, 0, 0, 0};
+
+    std::unique_ptr<L0::EventPool> timestampPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+
+    eventPoolDesc.flags = 0;
+    std::unique_ptr<L0::EventPool> regularPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+
+    ze_event_handle_t timestampEventHandle = nullptr;
+    ze_event_handle_t regularEventHandle = nullptr;
+
+    timestampPool->createEvent(&eventDesc, &timestampEventHandle);
+    regularPool->createEvent(&eventDesc, &regularEventHandle);
+
+    auto timestampEvent = Event::fromHandle(timestampEventHandle);
+    auto regularEvent = Event::fromHandle(regularEventHandle);
+
+    auto timestampSinglePacketSize = NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
+    EXPECT_EQ(timestampSinglePacketSize, timestampEvent->getSinglePacketSize());
+    EXPECT_EQ(device->getL0GfxCoreHelper().getImmediateWritePostSyncOffset(), regularEvent->getSinglePacketSize());
+
+    timestampEvent->destroy();
+    regularEvent->destroy();
+}
+
+HWTEST_F(EventTests, GivenEventWhenHostSynchronizeCalledThenExpectDownloadEventAllocationOnlyWhenEventWasUsedOnGpu) {
     std::map<GraphicsAllocation *, uint32_t> downloadAllocationTrack;
 
-    constexpr uint32_t iterations = 5;
+    constexpr uint32_t iterations = 2;
 
     VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
     VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_CLEARED);
     VariableBackup<uint32_t> backupPauseOffset(&CpuIntrinsicsTests::pauseOffset);
     VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
-    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::CSR_TBX;
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::tbx;
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
         std::make_unique<NEO::MockMemoryOperations>();
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
 
     ASSERT_NE(event, nullptr);
     ASSERT_NE(nullptr, event->csrs[0]);
     ASSERT_EQ(device->getNEODevice()->getDefaultEngine().commandStreamReceiver, event->csrs[0]);
-    event->setUsingContextEndOffset(false);
 
     size_t eventCompletionOffset = event->getContextStartOffset();
-    if (event->isUsingContextEndOffset()) {
+    if (event->isEventTimestampFlagSet()) {
         eventCompletionOffset = event->getContextEndOffset();
     }
     TagAddressType *eventAddress = static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), eventCompletionOffset));
@@ -2828,30 +5680,528 @@ HWTEST_F(EventTests,
     };
 
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0]);
-    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
-    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation) {
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
+    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
         downloadAllocationTrack[&gfxAllocation]++;
     };
 
+    auto eventAllocation = event->getAllocation(device);
     constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
-    auto result = event->hostSynchronize(timeout);
+    result = event->hostSynchronize(timeout);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    auto eventAllocation = &event->getAllocation(device);
     uint32_t downloadedAllocations = downloadAllocationTrack[eventAllocation];
-    EXPECT_EQ(iterations + 1, downloadedAllocations);
+    EXPECT_EQ(0u, downloadedAllocations);
     EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+
+    event->reset();
+    CpuIntrinsicsTests::pauseCounter = 0u;
+    CpuIntrinsicsTests::pauseAddress = eventAddress;
+    *eventAddress = Event::STATE_INITIAL;
+    ultCsr->downloadAllocationsCalledCount = 0;
+
+    eventAllocation->updateTaskCount(0u, ultCsr->getOsContext().getContextId());
+
+    result = event->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    downloadedAllocations = downloadAllocationTrack[eventAllocation];
+    EXPECT_EQ(iterations + 1u, downloadedAllocations);
+    EXPECT_EQ(2u, ultCsr->downloadAllocationsCalledCount);
 
     event->destroy();
 }
 
-HWTEST_F(EventTests, givenInOrderEventWhenHostEventSyncThenExpectDownloadEventAllocationWithEachQuery) {
+struct EventContextGroupFixture : public EventFixture<1, 0> {
+    using BaseClass = EventFixture<1, 0>;
+    void setUp() {
+        HardwareInfo hwInfo = *defaultHwInfo;
+        if (hwInfo.capabilityTable.defaultEngineType != aub_stream::EngineType::ENGINE_CCS) {
+            skipped = true;
+            GTEST_SKIP();
+        }
+
+        debugManager.flags.ContextGroupSize.set(2);
+        BaseClass::setUp();
+    }
+
+    void tearDown() {
+        if (!skipped) {
+            BaseClass::tearDown();
+        }
+    }
+
+    DebugManagerStateRestore restore;
+    bool skipped = false;
+};
+
+using EventContextGroupTests = Test<EventContextGroupFixture>;
+
+HWTEST_F(EventContextGroupTests, givenSecondaryCsrWhenDownloadingAllocationThenUseCorrectCsr) {
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
+
+    size_t eventCompletionOffset = event->getContextStartOffset();
+    if (event->isEventTimestampFlagSet()) {
+        eventCompletionOffset = event->getContextEndOffset();
+    }
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), eventCompletionOffset));
+    *eventAddress = Event::STATE_INITIAL;
+
+    auto ultCsr = new UltCommandStreamReceiver<FamilyType>(*neoDevice->getExecutionEnvironment(), 0, 1);
+    neoDevice->secondaryCsrs.clear();
+    neoDevice->secondaryCsrs.push_back(std::unique_ptr<UltCommandStreamReceiver<FamilyType>>(ultCsr));
+
+    OsContext osContext(0, static_cast<uint32_t>(neoDevice->getAllEngines().size()), EngineDescriptorHelper::getDefaultDescriptor());
+
+    ultCsr->setupContext(osContext);
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+
+    uint32_t downloadCounter = 0;
+    ultCsr->downloadAllocationImpl = [&downloadCounter](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadCounter++;
+    };
+
+    auto eventAllocation = event->getAllocation(device);
+    ultCsr->makeResident(*eventAllocation);
+
+    event->hostSynchronize(1);
+
+    EXPECT_EQ(1u, downloadCounter);
+
+    event->destroy();
+}
+
+template <typename GfxFamily>
+struct CacheFlushTrackingCsr : public UltCommandStreamReceiver<GfxFamily> {
+    using BaseClass = UltCommandStreamReceiver<GfxFamily>;
+
+    CacheFlushTrackingCsr(NEO::ExecutionEnvironment &executionEnvironment,
+                          uint32_t rootDeviceIndex,
+                          const NEO::DeviceBitfield deviceBitfield)
+        : BaseClass(executionEnvironment, rootDeviceIndex, deviceBitfield) {}
+
+    NEO::SubmissionStatus flushTagUpdate() override {
+        this->flushTagUpdateCalled = true;
+        this->latestFlushedTaskCount = this->taskCount.load();
+        return NEO::SubmissionStatus::success;
+    }
+};
+
+template <typename GfxFamily>
+struct KmdWaitTrackingCsr : public CacheFlushTrackingCsr<GfxFamily> {
+    using BaseClass = CacheFlushTrackingCsr<GfxFamily>;
+
+    KmdWaitTrackingCsr(NEO::ExecutionEnvironment &executionEnvironment,
+                       uint32_t rootDeviceIndex,
+                       const NEO::DeviceBitfield deviceBitfield)
+        : BaseClass(executionEnvironment, rootDeviceIndex, deviceBitfield) {}
+
+    NEO::WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, NEO::QueueThrottle throttle) override {
+        this->waitForTaskCountWithKmdNotifyInputParams.push_back({taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle});
+        if (onKmdWait) {
+            onKmdWait();
+        }
+        if (this->waitForTaskCountWithKmdNotifyFallbackReturnValue.has_value()) {
+            return *this->waitForTaskCountWithKmdNotifyFallbackReturnValue;
+        }
+        return NEO::WaitStatus::ready;
+    }
+
+    NEO::WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, NEO::QueueThrottle throttle, uint64_t timeoutNanoseconds) override {
+        this->waitForTaskCountWithKmdNotifyInputParams.push_back({taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle});
+        boundedKmdWaitTimeouts.push_back(timeoutNanoseconds);
+        if (onKmdWait) {
+            onKmdWait();
+        }
+        if (this->waitForTaskCountWithKmdNotifyFallbackReturnValue.has_value()) {
+            return *this->waitForTaskCountWithKmdNotifyFallbackReturnValue;
+        }
+        return NEO::WaitStatus::ready;
+    }
+
+    std::function<void()> onKmdWait;
+    std::vector<uint64_t> boundedKmdWaitTimeouts;
+};
+
+HWTEST_F(EventContextGroupTests, givenPendingSelectedSecondaryCsrTaskWhenHostSynchronizeRequiresCacheFlushThenFlushAndWaitAreCalledOnSelectedCsrOnly) {
+    if (!device->getGfxCoreHelper().areSecondaryContextsSupported()) {
+        GTEST_SKIP();
+    }
+
+    if (!event->isDcFlushAllowed) {
+        GTEST_SKIP();
+    }
+
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+
+    auto defaultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
+    ASSERT_NE(nullptr, defaultCsr);
+
+    defaultCsr->taskCount = 0;
+    defaultCsr->latestFlushedTaskCount = 0;
+    defaultCsr->flushTagUpdateCalled = false;
+    defaultCsr->waitForTaskCountCalled = false;
+    defaultCsr->waitForTaskCountReturnValue = NEO::WaitStatus::ready;
+
+    auto secondaryCsr = std::make_unique<CacheFlushTrackingCsr<FamilyType>>(*neoDevice->getExecutionEnvironment(), 0, 1);
+
+    OsContext osContext(0, static_cast<uint32_t>(neoDevice->getAllEngines().size()), EngineDescriptorHelper::getDefaultDescriptor());
+    secondaryCsr->setupContext(osContext);
+    secondaryCsr->initializeResources(device->getDevicePreemptionMode());
+    secondaryCsr->setPrimaryCsr(defaultCsr);
+
+    secondaryCsr->taskCount = 1;
+    secondaryCsr->latestFlushedTaskCount = 0;
+    secondaryCsr->flushTagUpdateCalled = false;
+    secondaryCsr->waitForTaskCountCalled = false;
+    secondaryCsr->waitForTaskCountReturnValue = NEO::WaitStatus::ready;
+
+    auto secondaryCsrPtr = secondaryCsr.get();
+
+    event->setCsrForCacheFlush(secondaryCsrPtr);
+    event->setDualCopyOffload(true);
+    *static_cast<uint32_t *>(event->getHostAddress()) = Event::STATE_SIGNALED;
+
+    auto result = event->hostSynchronize(0);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_FALSE(defaultCsr->flushTagUpdateCalled);
+    EXPECT_FALSE(defaultCsr->waitForTaskCountCalled);
+
+    EXPECT_TRUE(secondaryCsrPtr->flushTagUpdateCalled);
+    EXPECT_TRUE(secondaryCsrPtr->waitForTaskCountCalled);
+    EXPECT_EQ(1u, secondaryCsrPtr->peekLatestFlushedTaskCount());
+}
+
+HWTEST_F(EventContextGroupTests, givenKmdWaitStrategyAndInfiniteTimeoutWhenHostSynchronizeRequiresCacheFlushThenKmdWaitUsesSelectedCsrAndEventIsQueriedAgain) {
+    if (!device->getGfxCoreHelper().areSecondaryContextsSupported()) {
+        GTEST_SKIP();
+    }
+
+    if (!event->isDcFlushAllowed) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = true;
+
+    auto defaultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
+    ASSERT_NE(nullptr, defaultCsr);
+
+    defaultCsr->taskCount = 0;
+    defaultCsr->latestFlushedTaskCount = 0;
+    defaultCsr->flushTagUpdateCalled = false;
+    defaultCsr->waitForTaskCountCalled = false;
+    defaultCsr->captureWaitForTaskCountWithKmdNotifyInputParams = true;
+    defaultCsr->waitForTaskCountWithKmdNotifyInputParams.clear();
+
+    auto secondaryCsr = std::make_unique<KmdWaitTrackingCsr<FamilyType>>(*neoDevice->getExecutionEnvironment(), 0, 1);
+
+    OsContext osContext(0, static_cast<uint32_t>(neoDevice->getAllEngines().size()), EngineDescriptorHelper::getDefaultDescriptor());
+    secondaryCsr->setupContext(osContext);
+    secondaryCsr->initializeResources(device->getDevicePreemptionMode());
+    secondaryCsr->setPrimaryCsr(defaultCsr);
+
+    secondaryCsr->taskCount = 1;
+    secondaryCsr->latestFlushedTaskCount = 0;
+    secondaryCsr->flushTagUpdateCalled = false;
+    secondaryCsr->waitForTaskCountCalled = false;
+    secondaryCsr->captureWaitForTaskCountWithKmdNotifyInputParams = true;
+    secondaryCsr->waitForTaskCountWithKmdNotifyFallbackReturnValue = NEO::WaitStatus::ready;
+    secondaryCsr->flushStamp->setStamp(0);
+
+    auto secondaryCsrPtr = secondaryCsr.get();
+
+    event->setCsrForCacheFlush(secondaryCsrPtr);
+    event->setDualCopyOffload(true);
+    auto eventAddress = static_cast<uint32_t *>(event->getHostAddress());
+    *eventAddress = Event::STATE_INITIAL;
+    uint32_t kmdWaitCallbacks = 0;
+    secondaryCsr->onKmdWait = [&]() {
+        kmdWaitCallbacks++;
+        *eventAddress = Event::STATE_SIGNALED;
+    };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, kmdWaitCallbacks);
+
+    EXPECT_FALSE(defaultCsr->flushTagUpdateCalled);
+    EXPECT_FALSE(defaultCsr->waitForTaskCountCalled);
+    EXPECT_TRUE(defaultCsr->waitForTaskCountWithKmdNotifyInputParams.empty());
+
+    EXPECT_TRUE(secondaryCsrPtr->flushTagUpdateCalled);
+    EXPECT_FALSE(secondaryCsrPtr->waitForTaskCountCalled);
+    ASSERT_EQ(1u, secondaryCsrPtr->waitForTaskCountWithKmdNotifyInputParams.size());
+    EXPECT_EQ(1u, secondaryCsrPtr->waitForTaskCountWithKmdNotifyInputParams[0].taskCountToWait);
+    EXPECT_EQ(1u, secondaryCsrPtr->waitForTaskCountWithKmdNotifyInputParams[0].flushStampToWait);
+    EXPECT_FALSE(secondaryCsrPtr->waitForTaskCountWithKmdNotifyInputParams[0].useQuickKmdSleep);
+    EXPECT_EQ(NEO::QueueThrottle::LOW, secondaryCsrPtr->waitForTaskCountWithKmdNotifyInputParams[0].throttle);
+}
+
+HWTEST_F(EventContextGroupTests, givenKmdWaitStrategyAndShortFiniteTimeoutWhenHostSynchronizeRequiresCacheFlushThenKmdWaitIsNotUsed) {
+    if (!device->getGfxCoreHelper().areSecondaryContextsSupported()) {
+        GTEST_SKIP();
+    }
+
+    if (!event->isDcFlushAllowed) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = true;
+
+    auto secondaryCsr = std::make_unique<KmdWaitTrackingCsr<FamilyType>>(*neoDevice->getExecutionEnvironment(), 0, 1);
+
+    OsContext osContext(0, static_cast<uint32_t>(neoDevice->getAllEngines().size()), EngineDescriptorHelper::getDefaultDescriptor());
+    secondaryCsr->setupContext(osContext);
+    secondaryCsr->initializeResources(device->getDevicePreemptionMode());
+    secondaryCsr->taskCount = 1;
+    secondaryCsr->latestFlushedTaskCount = 0;
+    secondaryCsr->flushTagUpdateCalled = false;
+    secondaryCsr->captureWaitForTaskCountWithKmdNotifyInputParams = true;
+
+    auto secondaryCsrPtr = secondaryCsr.get();
+
+    event->setCsrForCacheFlush(secondaryCsrPtr);
+    event->setDualCopyOffload(true);
+    *static_cast<uint32_t *>(event->getHostAddress()) = Event::STATE_INITIAL;
+
+    auto result = event->hostSynchronize(1);
+
+    EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+    EXPECT_FALSE(secondaryCsrPtr->flushTagUpdateCalled);
+    EXPECT_TRUE(secondaryCsrPtr->waitForTaskCountWithKmdNotifyInputParams.empty());
+}
+
+HWTEST_F(EventContextGroupTests, givenKmdWaitStrategyAndLongFiniteTimeoutWhenHostSynchronizeRequiresCacheFlushThenBoundedKmdWaitIsUsed) {
+    if (!device->getGfxCoreHelper().areSecondaryContextsSupported()) {
+        GTEST_SKIP();
+    }
+
+    if (!event->isDcFlushAllowed) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategyMinTimeoutMicroseconds.set(20000);
+
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = true;
+
+    auto secondaryCsr = std::make_unique<KmdWaitTrackingCsr<FamilyType>>(*neoDevice->getExecutionEnvironment(), 0, 1);
+    OsContext osContext(0, static_cast<uint32_t>(neoDevice->getAllEngines().size()), EngineDescriptorHelper::getDefaultDescriptor());
+    secondaryCsr->setupContext(osContext);
+    secondaryCsr->initializeResources(device->getDevicePreemptionMode());
+    secondaryCsr->taskCount = 1;
+    secondaryCsr->latestFlushedTaskCount = 0;
+    secondaryCsr->flushStamp->setStamp(0);
+
+    auto eventAddress = static_cast<uint32_t *>(event->getHostAddress());
+    *eventAddress = Event::STATE_INITIAL;
+    secondaryCsr->onKmdWait = [&]() {
+        *eventAddress = Event::STATE_SIGNALED;
+    };
+    event->setCsrForCacheFlush(secondaryCsr.get());
+    event->setDualCopyOffload(true);
+
+    constexpr uint64_t timeoutNanoseconds = 1000000000u;
+    auto result = event->hostSynchronize(timeoutNanoseconds);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_EQ(1u, secondaryCsr->boundedKmdWaitTimeouts.size());
+    EXPECT_GT(secondaryCsr->boundedKmdWaitTimeouts[0], 0u);
+    EXPECT_LE(secondaryCsr->boundedKmdWaitTimeouts[0], timeoutNanoseconds - 20000000u);
+    EXPECT_EQ(1u, secondaryCsr->waitForTaskCountWithKmdNotifyInputParams.size());
+}
+
+HWTEST_F(EventContextGroupTests, givenKmdWaitStrategyAndCounterBasedEventWithoutCacheFlushWhenHostSynchronizeThenKmdWaitIsNotUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.AllowDcFlush.set(0);
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    event.reset();
+    ze_result_t createResult = ZE_RESULT_SUCCESS;
+    event = std::unique_ptr<EventImp<uint32_t>>(static_cast<EventImp<uint32_t> *>(L0::Event::create<uint32_t>(eventPool.get(), &eventDesc, device, createResult)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, createResult);
+    ASSERT_NE(nullptr, event);
+    ASSERT_FALSE(event->isDcFlushAllowed);
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = true;
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    ASSERT_TRUE(event->isCounterBased());
+
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
+    ASSERT_NE(nullptr, csr);
+    csr->taskCount = 1;
+    csr->latestFlushedTaskCount = 0;
+    csr->captureWaitForTaskCountWithKmdNotifyInputParams = true;
+    csr->waitForTaskCountWithKmdNotifyInputParams.clear();
+
+    uint64_t counterStorage = Event::STATE_INITIAL;
+    NEO::MockGraphicsAllocation counterAllocation(&counterStorage, sizeof(counterStorage));
+    counterAllocation.updateTaskCount(1u, csr->getOsContext().getContextId());
+    event->getInOrderExecEventHelper().assignData(1u, 0u, 1u, 1u, &counterAllocation, &counterAllocation, counterAllocation.getGpuAddress(), counterAllocation.getGpuAddress(), &counterStorage, 0u, 0u, false, false);
+
+    auto counterAddress = static_cast<uint64_t *>(event->getInOrderExecEventHelper().getBaseHostCpuAddress());
+    *counterAddress = Event::STATE_INITIAL;
+
+    uint32_t pauseCounter = 0;
+    VariableBackup<std::function<void()>> setupPauseAddressBackup(&CpuIntrinsicsTests::setupPauseAddress);
+    CpuIntrinsicsTests::setupPauseAddress = [&]() {
+        if (++pauseCounter == 2) {
+            *counterAddress = event->getInOrderExecBaseSignalValue();
+        }
+    };
+
+    auto result = event->hostSynchronize(std::numeric_limits<uint64_t>::max());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(csr->waitForTaskCountWithKmdNotifyInputParams.empty());
+}
+
+HWTEST_F(EventContextGroupTests, givenNoPendingTaskOnSelectedSecondaryCsrWhenHostSynchronizeRequiresCacheFlushThenFlushAndWaitAreNotCalled) {
+    if (!device->getGfxCoreHelper().areSecondaryContextsSupported()) {
+        GTEST_SKIP();
+    }
+
+    if (!event->isDcFlushAllowed) {
+        GTEST_SKIP();
+    }
+
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+
+    auto defaultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
+    ASSERT_NE(nullptr, defaultCsr);
+
+    defaultCsr->taskCount = 0;
+    defaultCsr->latestFlushedTaskCount = 0;
+    defaultCsr->flushTagUpdateCalled = false;
+    defaultCsr->waitForTaskCountCalled = false;
+    defaultCsr->waitForTaskCountReturnValue = NEO::WaitStatus::ready;
+
+    auto secondaryCsr = std::make_unique<CacheFlushTrackingCsr<FamilyType>>(*neoDevice->getExecutionEnvironment(), 0, 1);
+
+    OsContext osContext(0, static_cast<uint32_t>(neoDevice->getAllEngines().size()), EngineDescriptorHelper::getDefaultDescriptor());
+    secondaryCsr->setupContext(osContext);
+    secondaryCsr->initializeResources(device->getDevicePreemptionMode());
+    secondaryCsr->setPrimaryCsr(defaultCsr);
+
+    secondaryCsr->taskCount = 0;
+    secondaryCsr->latestFlushedTaskCount = 0;
+    secondaryCsr->flushTagUpdateCalled = false;
+    secondaryCsr->waitForTaskCountCalled = false;
+    secondaryCsr->waitForTaskCountReturnValue = NEO::WaitStatus::ready;
+
+    auto secondaryCsrPtr = secondaryCsr.get();
+
+    event->setCsrForCacheFlush(secondaryCsrPtr);
+    event->setDualCopyOffload(true);
+    *static_cast<uint32_t *>(event->getHostAddress()) = Event::STATE_SIGNALED;
+
+    auto result = event->hostSynchronize(0);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_FALSE(defaultCsr->flushTagUpdateCalled);
+    EXPECT_FALSE(defaultCsr->waitForTaskCountCalled);
+
+    EXPECT_FALSE(secondaryCsrPtr->flushTagUpdateCalled);
+    EXPECT_FALSE(secondaryCsrPtr->waitForTaskCountCalled);
+}
+
+HWTEST_F(EventContextGroupTests, givenNullCsrForCacheFlushWhenHostSynchronizeRequiresCacheFlushThenDefaultCsrIsUsed) {
+    if (!event->isDcFlushAllowed) {
+        GTEST_SKIP();
+    }
+
+    auto defaultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
+    ASSERT_NE(nullptr, defaultCsr);
+
+    defaultCsr->taskCount = 1;
+    defaultCsr->latestFlushedTaskCount = 0;
+    defaultCsr->flushTagUpdateCalled = false;
+    defaultCsr->waitForTaskCountCalled = false;
+    defaultCsr->waitForTaskCountReturnValue = NEO::WaitStatus::ready;
+    defaultCsr->callFlushTagUpdate = false;
+
+    event->setCsrForCacheFlush(nullptr);
+    event->setDualCopyOffload(true);
+    *static_cast<uint32_t *>(event->getHostAddress()) = Event::STATE_SIGNALED;
+
+    auto result = event->hostSynchronize(0);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_TRUE(defaultCsr->flushTagUpdateCalled);
+    EXPECT_FALSE(defaultCsr->waitForTaskCountCalled);
+}
+
+HWTEST_F(EventTests, givenRegularEventWhenCallingResetAdditionalTimestampNodeMultipleTimesWithTagAllocatorThenTagAddedToAdditionalTimestampNodeVectorOnce) {
+
+    MockTagAllocator<DeviceAllocNodeType<true>> eventTagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(event, nullptr);
+
+    event->resetAdditionalTimestampNode(eventTagAllocator.getTag(), 1, false);
+
+    event->resetAdditionalTimestampNode(eventTagAllocator.getTag(), 1, false);
+    EXPECT_EQ(1u, event->inOrderExecHelper.getAdditionalTimestampNodesCount());
+}
+
+HWTEST_F(EventTests, givenRegularEventWhenCallingResetAdditionalTimestampNodeWithNullptrThenVectorCleared) {
+
+    MockTagAllocator<DeviceAllocNodeType<true>> eventTagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(event, nullptr);
+
+    event->resetAdditionalTimestampNode(eventTagAllocator.getTag(), 1, false);
+    EXPECT_EQ(1u, event->inOrderExecHelper.getAdditionalTimestampNodesCount());
+
+    event->resetAdditionalTimestampNode(nullptr, 0, false);
+    EXPECT_EQ(0u, event->inOrderExecHelper.getAdditionalTimestampNodesCount());
+}
+
+HWTEST_F(EventTests, givenInOrderEventWhenHostSynchronizeIsCalledThenAllocationIsDonwloadedOnlyAfterEventWasUsedOnGpu) {
     std::map<GraphicsAllocation *, uint32_t> downloadAllocationTrack;
 
-    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::CSR_TBX;
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::tbx;
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
         std::make_unique<NEO::MockMemoryOperations>();
-    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device)));
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
 
     ASSERT_NE(event, nullptr);
 
@@ -2859,38 +6209,753 @@ HWTEST_F(EventTests, givenInOrderEventWhenHostEventSyncThenExpectDownloadEventAl
     *eventAddress = Event::STATE_SIGNALED;
 
     auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0]);
-    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
-    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation) {
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
+    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
         downloadAllocationTrack[&gfxAllocation]++;
     };
 
-    auto node = ultCsr->getTimestampPacketAllocator()->getTag();
-    NEO::TimestampPacketContainer container;
-    container.add(node);
+    auto mockNode = tagAllocator.getTag();
+    auto syncAllocation = mockNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation();
 
-    typename FamilyType::TimestampPacketType data[] = {0, 0, 0, 0};
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(mockNode, nullptr, *neoDevice, 1, false);
+    *inOrderExecInfo->getBaseHostAddress() = 1;
 
-    node->assignDataToAllTimestamps(0, data);
-
-    event->enableInOrderExecMode(container);
-
-    auto allocation = node->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation();
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
 
     constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
-    auto result = event->hostSynchronize(timeout);
+    result = event->hostSynchronize(timeout);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_NE(0u, downloadAllocationTrack[allocation]);
+    EXPECT_EQ(0u, downloadAllocationTrack[syncAllocation]);
+    EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+
+    auto event2 = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+
+    event2->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event2->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event2->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    syncAllocation->updateTaskCount(0u, ultCsr->getOsContext().getContextId());
+    ultCsr->downloadAllocationsCalledCount = 0;
+    eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    result = event2->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_NE(0u, downloadAllocationTrack[syncAllocation]);
     EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
 }
 
-HWTEST_F(EventTests, GivenEventIsReadyToDownloadAllAlocationsWhenDownloadAllocationNotRequiredThenDontDownloadAllocations) {
-    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::CSR_HW;
+struct EventSignalerPreviousContextsTests : public EventTests {
+    template <typename FamilyType>
+    NEO::UltCommandStreamReceiver<FamilyType> *findPreviousContextCsr() {
+        auto defaultCsr = this->neoDevice->getDefaultEngine().commandStreamReceiver;
+        for (auto &engine : this->neoDevice->getAllEngines()) {
+            if (engine.commandStreamReceiver != defaultCsr) {
+                return static_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(engine.commandStreamReceiver);
+            }
+        }
+        return nullptr;
+    }
 
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    static constexpr TaskCountType previousContextTaskCount = 7u;
+};
+
+HWTEST_F(EventSignalerPreviousContextsTests, givenRegularEventWithSignalerPreviousContextsWhenHostSynchronizeSucceedsThenAllocationsOfPreviousContextsAreDownloadedOnlyInTbxMode) {
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+    auto previousContextCsr = findPreviousContextCsr<FamilyType>();
+    ASSERT_NE(nullptr, previousContextCsr);
+
+    for (const auto csrType : {CommandStreamReceiverType::hardware, CommandStreamReceiverType::tbx}) {
+        neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = csrType;
+        ze_result_t result;
+        auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+        ASSERT_NE(nullptr, event);
+
+        size_t completionOffset = event->isEventTimestampFlagSet() ? event->getContextEndOffset() : event->getContextStartOffset();
+        *static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), completionOffset)) = Event::STATE_SIGNALED;
+
+        event->setSignalerPreviousContexts({{previousContextCsr, previousContextTaskCount}});
+        previousContextCsr->downloadAllocationsCalledCount = 0;
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+
+        if (csrType == CommandStreamReceiverType::tbx) {
+            EXPECT_EQ(1u, previousContextCsr->downloadAllocationsCalledCount);
+            EXPECT_TRUE(previousContextCsr->latestDownloadAllocationsBlocking);
+            EXPECT_EQ(previousContextTaskCount, previousContextCsr->latestDownloadAllocationsTaskCount);
+        } else {
+            EXPECT_EQ(0u, previousContextCsr->downloadAllocationsCalledCount);
+        }
+    }
+}
+
+HWTEST_F(EventSignalerPreviousContextsTests, givenCounterBasedEventWithSignalerPreviousContextsWhenHostSynchronizeSucceedsThenAllocationsOfPreviousContextsAreDownloadedOnlyInTbxMode) {
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    auto previousContextCsr = findPreviousContextCsr<FamilyType>();
+    ASSERT_NE(nullptr, previousContextCsr);
+
+    for (const auto csrType : {CommandStreamReceiverType::hardware, CommandStreamReceiverType::tbx}) {
+        neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = csrType;
+        ze_result_t result;
+        auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+        ASSERT_NE(nullptr, event);
+
+        auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(tagAllocator.getTag(), nullptr, *neoDevice, 1, false);
+        *inOrderExecInfo->getBaseHostAddress() = 1;
+        event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+        event->getInOrderExecEventHelper().initializeLocalTempStorage();
+        event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+
+        event->setSignalerPreviousContexts({{previousContextCsr, previousContextTaskCount}});
+        previousContextCsr->downloadAllocationsCalledCount = 0;
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, event->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+
+        if (csrType == CommandStreamReceiverType::tbx) {
+            EXPECT_EQ(1u, previousContextCsr->downloadAllocationsCalledCount);
+            EXPECT_TRUE(previousContextCsr->latestDownloadAllocationsBlocking);
+            EXPECT_EQ(previousContextTaskCount, previousContextCsr->latestDownloadAllocationsTaskCount);
+        } else {
+            EXPECT_EQ(0u, previousContextCsr->downloadAllocationsCalledCount);
+        }
+    }
+}
+
+HWTEST_F(EventSignalerPreviousContextsTests, givenEventWithSignalerPreviousContextsWhenEventIsResetThenPreviousContextsAreCleared) {
+    auto previousContextCsr = findPreviousContextCsr<FamilyType>();
+    ASSERT_NE(nullptr, previousContextCsr);
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(nullptr, event);
+
+    event->setSignalerPreviousContexts({{previousContextCsr, previousContextTaskCount}});
+    ASSERT_EQ(1u, event->signalerPreviousContexts.size());
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->reset());
+    EXPECT_TRUE(event->signalerPreviousContexts.empty());
+}
+
+HWTEST_F(EventSignalerPreviousContextsTests, givenNotSignaledRegularEventWhenHostSynchronizeChecksForGpuHangThenDeviceLostIsReturnedOnlyWhenSignalerPreviousContextIsHung) {
+    auto previousContextCsr = findPreviousContextCsr<FamilyType>();
+    ASSERT_NE(nullptr, previousContextCsr);
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isGpuHangDetectedReturnValue = false;
+
+    for (const bool previousContextAttached : {false, true}) {
+        for (const bool previousContextHung : {false, true}) {
+            ze_result_t result;
+            auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+            ASSERT_NE(nullptr, event);
+            if (previousContextAttached) {
+                event->setSignalerPreviousContexts({{previousContextCsr, previousContextTaskCount}});
+            }
+            previousContextCsr->isGpuHangDetectedReturnValue = previousContextHung;
+
+            const auto expectedResult = (previousContextAttached && previousContextHung) ? ZE_RESULT_ERROR_DEVICE_LOST : ZE_RESULT_NOT_READY;
+            EXPECT_EQ(expectedResult, event->hostSynchronize(0));
+        }
+    }
+}
+
+HWTEST_F(EventSignalerPreviousContextsTests, givenNotCompletedCounterBasedEventWhenHostSynchronizeChecksForGpuHangThenDeviceLostIsReturnedOnlyWhenSignalerPreviousContextIsHung) {
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    auto previousContextCsr = findPreviousContextCsr<FamilyType>();
+    ASSERT_NE(nullptr, previousContextCsr);
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isGpuHangDetectedReturnValue = false;
+
+    for (const bool previousContextAttached : {false, true}) {
+        for (const bool previousContextHung : {false, true}) {
+            ze_result_t result;
+            auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+            ASSERT_NE(nullptr, event);
+
+            auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(tagAllocator.getTag(), nullptr, *neoDevice, 1, false);
+            *inOrderExecInfo->getBaseHostAddress() = 0;
+            event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+            event->getInOrderExecEventHelper().initializeLocalTempStorage();
+            event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+
+            if (previousContextAttached) {
+                event->setSignalerPreviousContexts({{previousContextCsr, previousContextTaskCount}});
+            }
+            previousContextCsr->isGpuHangDetectedReturnValue = previousContextHung;
+
+            const auto expectedResult = (previousContextAttached && previousContextHung) ? ZE_RESULT_ERROR_DEVICE_LOST : ZE_RESULT_NOT_READY;
+            EXPECT_EQ(expectedResult, event->hostSynchronize(0));
+        }
+    }
+}
+
+HWTEST_F(EventSignalerPreviousContextsTests, givenSignaledEventAndForcedGpuStatusCheckWhenHostSynchronizingThenDeviceLostIsReturnedOnlyWhenSignalerPreviousContextIsHung) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.ForceGpuStatusCheckOnSuccessfulEventHostSynchronize.set(1);
+    auto previousContextCsr = findPreviousContextCsr<FamilyType>();
+    ASSERT_NE(nullptr, previousContextCsr);
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isGpuHangDetectedReturnValue = false;
+
+    for (const bool previousContextHung : {false, true}) {
+        ze_result_t result;
+        auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+        ASSERT_NE(nullptr, event);
+        size_t completionOffset = event->isEventTimestampFlagSet() ? event->getContextEndOffset() : event->getContextStartOffset();
+        *static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), completionOffset)) = Event::STATE_SIGNALED;
+
+        event->setSignalerPreviousContexts({{previousContextCsr, previousContextTaskCount}});
+        previousContextCsr->isGpuHangDetectedReturnValue = previousContextHung;
+
+        const auto expectedResult = previousContextHung ? ZE_RESULT_ERROR_DEVICE_LOST : ZE_RESULT_SUCCESS;
+        EXPECT_EQ(expectedResult, event->hostSynchronize(0));
+    }
+}
+
+HWTEST_F(EventTests, givenExternalCbEventWhenHostSynchronizeIsCalledThenPreambleAllocationIsDonwloadedAndCounterIsSignaled) {
+    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
+    VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_SIGNALED);
+    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
+    VariableBackup<std::function<void()>> backupControlTpause(&CpuIntrinsicsTests::controlTpause);
+
+    std::map<GraphicsAllocation *, uint32_t> downloadAllocationTrack;
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+
+    ASSERT_NE(event, nullptr);
+
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0]);
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
+    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadAllocationTrack[&gfxAllocation]++;
+    };
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = false;
+
+    auto mockNode = tagAllocator.getTag();
+    auto syncAllocation = mockNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation();
+
+    uint64_t counterValue = 1;
+    uint64_t patchPreambleData = 0;
+    uint64_t *patchPreambleHostAddress = &patchPreambleData;
+    MockGraphicsAllocation preambleAllocation(patchPreambleHostAddress, reinterpret_cast<uint64_t>(patchPreambleHostAddress), sizeof(patchPreambleData));
+    uint64_t preambleDevAddress = 0x1000;
+    MockGraphicsAllocation preambleDevAllocation(nullptr, preambleDevAddress, sizeof(patchPreambleData));
+
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+
+    CpuIntrinsicsTests::controlTpause = [patchPreambleHostAddress, counterValue]() {
+        if (CpuIntrinsicsTests::tpauseCounter > 1) {
+            *patchPreambleHostAddress = counterValue;
+        }
+    };
+
+    CpuIntrinsicsTests::pauseCounter = 0u;
+    CpuIntrinsicsTests::pauseAddress = eventAddress;
+    CpuIntrinsicsTests::setupPauseAddress = [patchPreambleHostAddress, counterValue]() {
+        if (CpuIntrinsicsTests::pauseCounter > 1) {
+            *patchPreambleHostAddress = counterValue;
+        }
+    };
+
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(mockNode, nullptr, *neoDevice, 1, false);
+    *inOrderExecInfo->getBaseHostAddress() = 1;
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    event->externalEvent = true;
+
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, patchPreambleHostAddress, preambleAllocation.getGpuAddress(), &preambleAllocation, preambleDevAddress, &preambleDevAllocation);
+
+    constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
+    result = event->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(0u, downloadAllocationTrack[syncAllocation]);
+    EXPECT_EQ(0u, downloadAllocationTrack[&preambleAllocation]);
+    EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+
+    auto event2 = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+
+    event2->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event2->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event2->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    event2->externalEvent = true;
+    event2->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, patchPreambleHostAddress, preambleAllocation.getGpuAddress(), &preambleAllocation, preambleDevAddress, &preambleDevAllocation);
+
+    syncAllocation->updateTaskCount(0u, ultCsr->getOsContext().getContextId());
+    preambleAllocation.updateTaskCount(0u, ultCsr->getOsContext().getContextId());
+    ultCsr->downloadAllocationsCalledCount = 0;
+    eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    result = event2->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_NE(0u, downloadAllocationTrack[syncAllocation]);
+    EXPECT_NE(0u, downloadAllocationTrack[&preambleAllocation]);
+    EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+}
+
+HWTEST_F(EventTests, givenNotExternalCbEventWithPatchPreambleAssignedWhenHostSynchronizeIsCalledThenPreambleAllocationIsDonwloadedAndCounterIsSignaled) {
+    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
+    VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_SIGNALED);
+    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
+    VariableBackup<std::function<void()>> backupControlTpause(&CpuIntrinsicsTests::controlTpause);
+
+    std::map<GraphicsAllocation *, uint32_t> downloadAllocationTrack;
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(event, nullptr);
+
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0]);
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
+    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadAllocationTrack[&gfxAllocation]++;
+    };
+
+    auto &csr = this->neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isGpuHangDetectedReturnValue = false;
+
+    auto mockNode = tagAllocator.getTag();
+    auto syncAllocation = mockNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation();
+
+    uint64_t counterValue = 1;
+    uint64_t patchPreambleData = 0;
+    uint64_t *patchPreambleHostAddress = &patchPreambleData;
+    MockGraphicsAllocation preambleAllocation(patchPreambleHostAddress, reinterpret_cast<uint64_t>(patchPreambleHostAddress), sizeof(patchPreambleData));
+    uint64_t preambleDevAddress = 0x1000;
+    MockGraphicsAllocation preambleDevAllocation(nullptr, preambleDevAddress, sizeof(patchPreambleData));
+
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+
+    CpuIntrinsicsTests::controlTpause = [patchPreambleHostAddress, counterValue]() {
+        if (CpuIntrinsicsTests::tpauseCounter > 1) {
+            *patchPreambleHostAddress = counterValue;
+        }
+    };
+
+    CpuIntrinsicsTests::pauseCounter = 0u;
+    CpuIntrinsicsTests::pauseAddress = eventAddress;
+    CpuIntrinsicsTests::setupPauseAddress = [patchPreambleHostAddress, counterValue]() {
+        if (CpuIntrinsicsTests::pauseCounter > 1) {
+            *patchPreambleHostAddress = counterValue;
+        }
+    };
+
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(mockNode, nullptr, *neoDevice, 1, false);
+    *inOrderExecInfo->getBaseHostAddress() = 1;
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    event->externalEvent = false;
+
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, patchPreambleHostAddress, preambleAllocation.getGpuAddress(), &preambleAllocation, preambleDevAddress, &preambleDevAllocation);
+
+    constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
+    result = event->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(0u, downloadAllocationTrack[syncAllocation]);
+    EXPECT_EQ(0u, downloadAllocationTrack[&preambleAllocation]);
+    EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+}
+
+HWTEST_F(EventTests, GivenLinuxUserFenceKmdWaitFlagWhenCreatingHostVisibleEventThenKmdWaitIsEnabledWithoutUserInterrupt) {
+    DebugManagerStateRestore restore;
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isWaitUserFenceNotEqualSupportedValue = true;
+
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(false);
+    auto eventWithoutFlag = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(eventWithoutFlag->isLinuxUserFenceKmdWaitEnabled());
+    EXPECT_FALSE(eventWithoutFlag->isSignalWithUserInterrupt());
+    // The dedicated flag should not enable the generic interrupt mode (post-sync interrupt bit) behavior.
+    EXPECT_FALSE(eventWithoutFlag->isInterruptModeEnabled());
+
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    auto eventWithFlag = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(eventWithFlag->isLinuxUserFenceKmdWaitEnabled());
+    EXPECT_FALSE(eventWithFlag->isSignalWithUserInterrupt());
+    EXPECT_FALSE(eventWithFlag->isInterruptModeEnabled());
+}
+
+HWTEST_F(EventTests, GivenLinuxUserFenceKmdWaitFlagWhenNotEqualUserFenceUnsupportedThenKmdWaitIsNotEnabled) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isWaitUserFenceNotEqualSupportedValue = false;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(event->isLinuxUserFenceKmdWaitEnabled());
+    EXPECT_FALSE(event->isSignalWithUserInterrupt());
+}
+
+HWTEST_F(EventTests, GivenLinuxUserFenceKmdWaitFlagWhenCreatingDeviceOnlyEventThenKmdWaitIsNotEnabled) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isWaitUserFenceNotEqualSupportedValue = true;
+
+    ze_event_pool_desc_t deviceOnlyPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    deviceOnlyPoolDesc.count = 1;
+    deviceOnlyPoolDesc.flags = 0;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto deviceOnlyPool = std::unique_ptr<L0::EventPool>(whiteboxCast(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &deviceOnlyPoolDesc, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, deviceOnlyPool);
+
+    auto deviceOnlyEvent = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(deviceOnlyPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(deviceOnlyEvent->isLinuxUserFenceKmdWaitEnabled());
+    EXPECT_FALSE(deviceOnlyEvent->isSignalWithUserInterrupt());
+}
+
+HWTEST_F(EventTests, GivenLinuxUserFenceKmdWaitFlagWhenCreatingHostVisibleStandaloneCounterBasedEventThenKmdWaitIsEnabledWithoutUserInterrupt) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isWaitUserFenceNotEqualSupportedValue = true;
+
+    ze_event_handle_t handle = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &defaultIntelCounterBasedEventDesc, &handle));
+
+    auto event = zeUniquePtr(whiteboxCast(Event::fromHandle(handle)));
+    ASSERT_NE(nullptr, event);
+    EXPECT_TRUE(event->isCounterBasedExplicitlyEnabled());
+    EXPECT_TRUE(event->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+    EXPECT_TRUE(event->isLinuxUserFenceKmdWaitEnabled());
+    EXPECT_FALSE(event->isSignalWithUserInterrupt());
+    EXPECT_FALSE(event->isInterruptModeEnabled());
+}
+
+HWTEST_F(EventTests, GivenLinuxUserFenceKmdWaitFlagWhenCreatingDeviceScopeStandaloneCounterBasedEventThenKmdWaitIsNotEnabled) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().isWaitUserFenceNotEqualSupportedValue = true;
+
+    ze_event_counter_based_desc_t deviceScopeDesc = defaultIntelCounterBasedEventDesc;
+    deviceScopeDesc.signal = 0;
+
+    ze_event_handle_t handle = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &deviceScopeDesc, &handle));
+
+    auto event = zeUniquePtr(whiteboxCast(Event::fromHandle(handle)));
+    ASSERT_NE(nullptr, event);
+    EXPECT_TRUE(event->isCounterBasedExplicitlyEnabled());
+    EXPECT_FALSE(event->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+    EXPECT_FALSE(event->isLinuxUserFenceKmdWaitEnabled());
+    EXPECT_FALSE(event->isSignalWithUserInterrupt());
+}
+
+HWTEST_F(EventTests, GivenWindowsDiscreteKmdWaitFlagWhenCreatingEventThenKmdWaitIsEnabledOnlyForHostVisibleEventOnDiscreteWddmDevice) {
+    DebugManagerStateRestore restore;
+    auto rootDeviceEnvironment = neoDevice->executionEnvironment->rootDeviceEnvironments[0].get();
+    rootDeviceEnvironment->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = false;
+    rootDeviceEnvironment->osInterface = std::make_unique<NEO::OSInterface>();
+    rootDeviceEnvironment->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    NEO::debugManager.flags.EventHostSynchronizeWindowsDiscreteKmdWait.set(false);
+    auto eventWithoutFlag = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(eventWithoutFlag->isWindowsDiscreteKmdWaitEnabled());
+
+    NEO::debugManager.flags.EventHostSynchronizeWindowsDiscreteKmdWait.set(true);
+    auto eventWithFlag = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(eventWithFlag->isWindowsDiscreteKmdWaitEnabled());
+
+    ze_event_pool_desc_t deviceOnlyPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    deviceOnlyPoolDesc.count = 1;
+    auto deviceOnlyPool = std::unique_ptr<L0::EventPool>(whiteboxCast(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &deviceOnlyPoolDesc, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    auto deviceOnlyEvent = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(deviceOnlyPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(deviceOnlyEvent->isWindowsDiscreteKmdWaitEnabled());
+
+    rootDeviceEnvironment->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+    auto drmEvent = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(drmEvent->isWindowsDiscreteKmdWaitEnabled());
+
+    rootDeviceEnvironment->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = true;
+    rootDeviceEnvironment->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelWDDM>());
+    auto integratedEvent = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(integratedEvent->isWindowsDiscreteKmdWaitEnabled());
+}
+
+HWTEST_F(EventTests, givenExternalCbEventWhenHostSynchronizeUsesWaitFenceThenPreambleCounterIsSynchronized) {
+    NEO::debugManager.flags.WaitForUserFenceOnEventHostSynchronize.set(1);
+
+    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
+    VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue, Event::STATE_SIGNALED);
+    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
+    VariableBackup<std::function<void()>> backupControlTpause(&CpuIntrinsicsTests::controlTpause);
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    ASSERT_NE(event, nullptr);
+    EXPECT_TRUE(event->isKmdWaitModeEnabled());
+    EXPECT_TRUE(event->isInterruptModeEnabled());
+
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(device->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+    event->csrs[0] = ultCsr;
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+    ultCsr->isGpuHangDetectedReturnValue = false;
+
+    ultCsr->isUserFenceWaitSupported = true;
+    ultCsr->waitUserFenceParams.forceRetStatusEnabled = true;
+    ultCsr->waitUserFenceParams.forceRetStatusValue = true;
+
+    auto mockNode = tagAllocator.getTag();
+
+    uint64_t counterValue = 1;
+    uint64_t patchPreambleData = 0;
+    uint64_t *patchPreambleHostAddress = &patchPreambleData;
+    MockGraphicsAllocation preambleAllocation(patchPreambleHostAddress, reinterpret_cast<uint64_t>(patchPreambleHostAddress), sizeof(patchPreambleData));
+    uint64_t preambleDevAddress = 0x1000;
+    MockGraphicsAllocation preambleDevAllocation(nullptr, preambleDevAddress, sizeof(patchPreambleData));
+
+    CpuIntrinsicsTests::tpauseCounter = 0u;
+
+    CpuIntrinsicsTests::controlTpause = [patchPreambleHostAddress, counterValue]() {
+        if (CpuIntrinsicsTests::tpauseCounter > 1) {
+            *patchPreambleHostAddress = counterValue;
+        }
+    };
+
+    CpuIntrinsicsTests::pauseCounter = 0u;
+    CpuIntrinsicsTests::pauseAddress = eventAddress;
+    CpuIntrinsicsTests::setupPauseAddress = [patchPreambleHostAddress, counterValue]() {
+        if (CpuIntrinsicsTests::pauseCounter > 1) {
+            *patchPreambleHostAddress = counterValue;
+        }
+    };
+
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(mockNode, nullptr, *neoDevice, 1, false);
+    *inOrderExecInfo->getBaseHostAddress() = 1;
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    event->externalEvent = true;
+
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, patchPreambleHostAddress, preambleAllocation.getGpuAddress(), &preambleAllocation, preambleDevAddress, &preambleDevAllocation);
+
+    constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
+    result = event->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+HWTEST_F(EventTests, givenExternalCbEventWithIncompletePreambleWhenHostSynchronizeUsesWaitFenceThenCoreIsYieldedOnlyWhenWaiting) {
+    NEO::debugManager.flags.WaitForUserFenceOnEventHostSynchronize.set(1);
+
+    VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress, nullptr);
+    VariableBackup<std::function<void()>> backupSetupPauseAddress(&CpuIntrinsicsTests::setupPauseAddress);
+    VariableBackup<std::function<void()>> backupControlTpause(&CpuIntrinsicsTests::controlTpause);
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+    ASSERT_NE(event, nullptr);
+
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    EXPECT_TRUE(event->isKmdWaitModeEnabled());
+
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(device->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+    event->csrs[0] = ultCsr;
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+    ultCsr->isGpuHangDetectedReturnValue = false;
+    ultCsr->isUserFenceWaitSupported = true;
+    ultCsr->waitUserFenceParams.forceRetStatusEnabled = true;
+    ultCsr->waitUserFenceParams.forceRetStatusValue = true;
+
+    auto mockNode = tagAllocator.getTag();
+
+    uint64_t counterValue = 1;
+    uint64_t patchPreambleData = 0;
+    uint64_t *patchPreambleHostAddress = &patchPreambleData;
+    MockGraphicsAllocation preambleAllocation(patchPreambleHostAddress, reinterpret_cast<uint64_t>(patchPreambleHostAddress), sizeof(patchPreambleData));
+    uint64_t preambleDevAddress = 0x1000;
+    MockGraphicsAllocation preambleDevAllocation(nullptr, preambleDevAddress, sizeof(patchPreambleData));
+
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(mockNode, nullptr, *neoDevice, 1, false);
+    *inOrderExecInfo->getBaseHostAddress() = 1;
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    event->externalEvent = true;
+
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, patchPreambleHostAddress, preambleAllocation.getGpuAddress(), &preambleAllocation, preambleDevAddress, &preambleDevAllocation);
+
+    auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(0));
+    EXPECT_EQ(yieldCountBefore, CpuIntrinsicsTests::yieldCounter);
+
+    yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, event->hostSynchronize(1));
+    EXPECT_GT(CpuIntrinsicsTests::yieldCounter.load(), yieldCountBefore);
+}
+
+HWTEST_F(EventTests, givenStandaloneCbEventAndTbxModeWhenSynchronizingThenHandleCorrectly) {
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
+
+    uint64_t counterValue = 2;
+
+    ze_host_mem_alloc_desc_t desc = {};
+    void *ptr = nullptr;
+    context->allocHostMem(&desc, sizeof(uint64_t), 1, &ptr);
+
+    uint64_t *hostAddress = static_cast<uint64_t *>(ptr);
+
+    *hostAddress = counterValue;
+    uint64_t *gpuAddress = ptrOffset(&counterValue, 64);
+
+    ze_event_handle_t handle = nullptr;
+
+    ze_event_counter_based_external_sync_allocation_desc_t externalSync = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_EXTERNAL_SYNC_ALLOCATION_DESC};
+    externalSync.deviceAddress = gpuAddress;
+    externalSync.hostAddress = hostAddress;
+    externalSync.completionValue = counterValue;
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE;
+    counterBasedDesc.pNext = &externalSync;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &counterBasedDesc, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+
+    ASSERT_NE(event, nullptr);
+    auto result = eventObj->hostSynchronize(1);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    zeEventDestroy(handle);
+    context->freeMem(hostAddress);
+}
+
+HWTEST_F(EventTests, givenInOrderEventWithHostAllocWhenHostSynchronizeIsCalledThenAllocationIsDonwloadedOnlyAfterEventWasUsedOnGpu) {
+    debugManager.flags.InOrderDuplicatedCounterStorageEnabled.set(1);
+
+    std::map<GraphicsAllocation *, uint32_t> downloadAllocationTrack;
+
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
+        std::make_unique<NEO::MockMemoryOperations>();
+
+    MockTagAllocator<DeviceAllocNodeType<true>> deviceTagAllocator(0, neoDevice->getMemoryManager());
+    MockTagAllocator<DeviceAllocNodeType<true>> hostTagAllocator(0, neoDevice->getMemoryManager());
+    ze_result_t result;
+    auto event = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+
+    ASSERT_NE(event, nullptr);
+
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0]);
+    ultCsr->initializeResources(device->getDevicePreemptionMode());
+    VariableBackup<std::function<void(GraphicsAllocation & gfxAllocation, uint64_t, size_t)>> backupCsrDownloadImpl(&ultCsr->downloadAllocationImpl);
+    ultCsr->downloadAllocationImpl = [&downloadAllocationTrack](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadAllocationTrack[&gfxAllocation]++;
+    };
+
+    auto deviceMockNode = deviceTagAllocator.getTag();
+    auto hostMockNode = hostTagAllocator.getTag();
+    auto deviceSyncAllocation = deviceMockNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation();
+    auto hostSyncAllocation = hostMockNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation();
+
+    auto inOrderExecInfo = std::make_shared<NEO::InOrderExecInfo>(deviceMockNode, hostMockNode, *neoDevice, 1, false);
+    *inOrderExecInfo->getBaseHostAddress() = 1;
+
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event->updateInOrderExecState(inOrderExecInfo, 1, 0);
+
+    constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
+    result = event->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(0u, downloadAllocationTrack[deviceSyncAllocation]);
+    EXPECT_EQ(0u, downloadAllocationTrack[hostSyncAllocation]);
+    EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+
+    auto event2 = zeUniquePtr(whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result)));
+
+    event2->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    event2->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event2->updateInOrderExecState(inOrderExecInfo, 1, 0);
+    hostSyncAllocation->updateTaskCount(0u, ultCsr->getOsContext().getContextId());
+    ultCsr->downloadAllocationsCalledCount = 0;
+    eventAddress = static_cast<TagAddressType *>(event->getHostAddress());
+    *eventAddress = Event::STATE_SIGNALED;
+
+    result = event2->hostSynchronize(timeout);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(0u, downloadAllocationTrack[deviceSyncAllocation]);
+    EXPECT_NE(0u, downloadAllocationTrack[hostSyncAllocation]);
+    EXPECT_NE(0u, downloadAllocationTrack[hostSyncAllocation]);
+    EXPECT_EQ(1u, ultCsr->downloadAllocationsCalledCount);
+}
+
+HWTEST_F(EventTests, GivenEventIsReadyToDownloadAllAllocationsWhenDownloadAllocationNotRequiredThenDontDownloadAllocations) {
+    neoDevice->getUltCommandStreamReceiver<FamilyType>().commandStreamReceiverType = CommandStreamReceiverType::hardware;
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
 
     size_t offset = event->getCompletionFieldOffset();
-    void *completionAddress = ptrOffset(event->hostAddress, offset);
+    void *completionAddress = ptrOffset(event->hostAddressFromPool, offset);
     size_t packets = event->getPacketsInUse();
     uint64_t signaledValue = Event::STATE_SIGNALED;
     for (size_t i = 0; i < packets; i++) {
@@ -2898,9 +6963,9 @@ HWTEST_F(EventTests, GivenEventIsReadyToDownloadAllAlocationsWhenDownloadAllocat
         completionAddress = ptrOffset(completionAddress, event->getSinglePacketSize());
     }
 
-    auto status = event->queryStatus();
+    auto status = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, status);
-    EXPECT_FALSE(static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0])->downloadAllocationsCalled);
+    EXPECT_EQ(0u, static_cast<UltCommandStreamReceiver<FamilyType> *>(event->csrs[0])->downloadAllocationsCalledCount);
     event->destroy();
 }
 
@@ -2908,20 +6973,19 @@ HWTEST_F(EventTests, GivenNotReadyEventBecomesReadyWhenDownloadAllocationRequire
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface =
         std::make_unique<NEO::MockMemoryOperations>();
 
-    CommandStreamReceiverType tbxCsrTypes[] = {CommandStreamReceiverType::CSR_TBX, CommandStreamReceiverType::CSR_TBX_WITH_AUB};
-
+    CommandStreamReceiverType tbxCsrTypes[] = {CommandStreamReceiverType::tbx, CommandStreamReceiverType::tbxWithAub};
+    ze_result_t result;
     auto &ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> &>(neoDevice->getUltCommandStreamReceiver<FamilyType>());
     for (auto csrType : tbxCsrTypes) {
         ultCsr.commandStreamReceiverType = csrType;
-        auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+        auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
 
-        auto status = event->queryStatus();
+        auto status = event->queryStatus(0);
         EXPECT_EQ(ZE_RESULT_NOT_READY, status);
-        EXPECT_FALSE(ultCsr.downloadAllocationsCalled);
         EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
 
         size_t offset = event->getCompletionFieldOffset();
-        void *completionAddress = ptrOffset(event->hostAddress, offset);
+        void *completionAddress = ptrOffset(event->hostAddressFromPool, offset);
         size_t packets = event->getPacketsInUse();
         uint64_t signaledValue = Event::STATE_SIGNALED;
         for (size_t i = 0; i < packets; i++) {
@@ -2929,35 +6993,38 @@ HWTEST_F(EventTests, GivenNotReadyEventBecomesReadyWhenDownloadAllocationRequire
             completionAddress = ptrOffset(completionAddress, event->getSinglePacketSize());
         }
 
-        status = event->queryStatus();
+        status = event->queryStatus(0);
         EXPECT_EQ(ZE_RESULT_SUCCESS, status);
-        EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
         EXPECT_EQ(1u, ultCsr.downloadAllocationsCalledCount);
 
-        status = event->queryStatus();
+        status = event->queryStatus(0);
         EXPECT_EQ(ZE_RESULT_SUCCESS, status);
-        EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
         EXPECT_EQ(1u, ultCsr.downloadAllocationsCalledCount);
 
         event->destroy();
         ultCsr.downloadAllocationsCalledCount = 0;
-        ultCsr.downloadAllocationsCalled = false;
     }
 }
-HWTEST_F(EventTests, GivenCsrTbxModeWhenEventCreatedAndSignaledThenEventAllocationIsResidentOnce) {
+HWTEST_F(EventTests, GivenCsrTbxModeWhenEventCreatedAndSignaledThenEventAllocationIsWritten) {
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
     auto mockMemIface = static_cast<NEO::MockMemoryOperations *>(neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface.get());
+
+    constexpr uint32_t expectedBanks = std::numeric_limits<uint32_t>::max();
 
     mockMemIface->captureGfxAllocationsForMakeResident = true;
 
     auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
-    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::CSR_TBX;
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
 
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
-    auto eventAllocation = &event->getAllocation(device);
+    EXPECT_EQ(0u, ultCsr.writeMemoryParams.totalCallCount);
+    EXPECT_EQ(0u, ultCsr.writeMemoryParams.chunkWriteCallCount);
+
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
+    auto eventAllocation = event->getAllocation(device);
+    auto offsetInSharedAlloc = event->getOffsetInSharedAlloc();
 
     EXPECT_TRUE(eventAllocation->getAubInfo().writeMemoryOnly);
 
@@ -2965,29 +7032,51 @@ HWTEST_F(EventTests, GivenCsrTbxModeWhenEventCreatedAndSignaledThenEventAllocati
                                     mockMemIface->gfxAllocationsForMakeResident.end(),
                                     eventAllocation);
     EXPECT_EQ(mockMemIface->gfxAllocationsForMakeResident.end(), eventAllocItor);
-    EXPECT_EQ(1, mockMemIface->makeResidentCalledCount);
 
-    constexpr uint32_t expectedBanks = std::numeric_limits<uint32_t>::max();
-    eventAllocation->setTbxWritable(false, expectedBanks);
-    auto status = event->hostSignal();
+    uint32_t expectedCallCount = std::min(static_cast<uint32_t>(eventPool->getEventSize() / sizeof(uint64_t)), uint32_t(16));
+
+    EXPECT_EQ(2u, ultCsr.writeMemoryParams.totalCallCount);
+    EXPECT_EQ(1u, ultCsr.writeMemoryParams.chunkWriteCallCount);
+    EXPECT_EQ(eventAllocation, ultCsr.writeMemoryParams.latestGfxAllocation);
+    EXPECT_TRUE(ultCsr.writeMemoryParams.latestChunkedMode);
+    EXPECT_EQ(sizeof(uint64_t) * expectedCallCount, ultCsr.writeMemoryParams.latestChunkSize);
+    EXPECT_EQ(0u + offsetInSharedAlloc, ultCsr.writeMemoryParams.latestGpuVaChunkOffset);
+    EXPECT_FALSE(eventAllocation->isTbxWritable(expectedBanks));
+
+    auto status = event->hostSignal(false);
     EXPECT_EQ(ZE_RESULT_SUCCESS, status);
-    EXPECT_EQ(2, mockMemIface->makeResidentCalledCount);
 
-    EXPECT_TRUE(eventAllocation->isTbxWritable(expectedBanks));
+    EXPECT_EQ(3u, ultCsr.writeMemoryParams.totalCallCount);
+    EXPECT_EQ(2u, ultCsr.writeMemoryParams.chunkWriteCallCount);
+    EXPECT_EQ(eventAllocation, ultCsr.writeMemoryParams.latestGfxAllocation);
+    EXPECT_TRUE(ultCsr.writeMemoryParams.latestChunkedMode);
+    EXPECT_EQ(event->getSinglePacketSize(), ultCsr.writeMemoryParams.latestChunkSize);
+    EXPECT_EQ(0u + offsetInSharedAlloc, ultCsr.writeMemoryParams.latestGpuVaChunkOffset);
+
+    EXPECT_FALSE(eventAllocation->isTbxWritable(expectedBanks));
 
     std::bitset<32> singleBitMask;
     for (uint32_t i = 0; i < 32; i++) {
         singleBitMask.reset();
         singleBitMask.set(i, true);
         uint32_t bit = static_cast<uint32_t>(singleBitMask.to_ulong());
-        EXPECT_TRUE(eventAllocation->isTbxWritable(bit));
+        EXPECT_FALSE(eventAllocation->isTbxWritable(bit));
     }
 
     event->reset();
-    EXPECT_EQ(3, mockMemIface->makeResidentCalledCount);
+    EXPECT_EQ(0, mockMemIface->makeResidentCalledCount);
+
+    EXPECT_EQ(4u, ultCsr.writeMemoryParams.totalCallCount);
+    EXPECT_EQ(3u, ultCsr.writeMemoryParams.chunkWriteCallCount);
+    EXPECT_EQ(eventAllocation, ultCsr.writeMemoryParams.latestGfxAllocation);
+    EXPECT_TRUE(ultCsr.writeMemoryParams.latestChunkedMode);
+    EXPECT_EQ(event->getSinglePacketSize(), ultCsr.writeMemoryParams.latestChunkSize);
+    EXPECT_EQ(0u + offsetInSharedAlloc, ultCsr.writeMemoryParams.latestGpuVaChunkOffset);
+
+    EXPECT_FALSE(eventAllocation->isTbxWritable(expectedBanks));
 
     size_t offset = event->getCompletionFieldOffset();
-    void *completionAddress = ptrOffset(event->hostAddress, offset);
+    void *completionAddress = ptrOffset(event->hostAddressFromPool, offset);
     size_t packets = event->getPacketsInUse();
     uint64_t signaledValue = Event::STATE_SIGNALED;
     for (size_t i = 0; i < packets; i++) {
@@ -2995,104 +7084,300 @@ HWTEST_F(EventTests, GivenCsrTbxModeWhenEventCreatedAndSignaledThenEventAllocati
         completionAddress = ptrOffset(completionAddress, event->getSinglePacketSize());
     }
 
-    status = event->queryStatus();
+    status = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, status);
-    EXPECT_TRUE(ultCsr.downloadAllocationsCalled);
     EXPECT_EQ(1u, ultCsr.downloadAllocationsCalledCount);
 
     event->destroy();
 }
 
-struct MockEventCompletion : public L0::EventImp<uint32_t> {
-    using EventImp<uint32_t>::gpuStartTimestamp;
-    using EventImp<uint32_t>::gpuEndTimestamp;
+template <typename TagSizeT>
+struct MockEventCompletion : public L0::EventImp<TagSizeT> {
+    using BaseClass = L0::EventImp<TagSizeT>;
+    using BaseClass::clearTimestampTagData;
+    using BaseClass::csrs;
+    using BaseClass::gpuEndTimestamp;
+    using BaseClass::gpuStartTimestamp;
+    using BaseClass::hostAddressFromPool;
+    using BaseClass::maxPacketCount;
+    using BaseClass::statusQueryAssignedCompletionData;
 
-    MockEventCompletion(L0::EventPool *eventPool, int index, L0::Device *device) : EventImp(eventPool, index, device, false) {
+    MockEventCompletion(MultiGraphicsAllocation *alloc, uint32_t eventSize, uint32_t maxPacketsCount, int index, L0::Device *device) : BaseClass::EventImp(index, device, false) {
         auto neoDevice = device->getNEODevice();
-        auto &hwInfo = neoDevice->getHardwareInfo();
-        signalAllEventPackets = L0GfxCoreHelper::useSignalAllEventPackets(hwInfo);
 
-        auto alloc = eventPool->getAllocation().getGraphicsAllocation(neoDevice->getRootDeviceIndex());
+        this->eventPoolAllocation = alloc;
 
-        uint64_t baseHostAddr = reinterpret_cast<uint64_t>(alloc->getUnderlyingBuffer());
-        totalEventSize = eventPool->getEventSize();
-        eventPoolOffset = index * totalEventSize;
-        hostAddress = reinterpret_cast<void *>(baseHostAddr + eventPoolOffset);
-        csrs[0] = neoDevice->getDefaultEngine().commandStreamReceiver;
+        uint64_t baseHostAddr = reinterpret_cast<uint64_t>(alloc->getGraphicsAllocation(device->getNEODevice()->getRootDeviceIndex())->getUnderlyingBuffer());
+        this->totalEventSize = eventSize;
+        this->eventPoolOffset = index * this->totalEventSize;
+        hostAddressFromPool = reinterpret_cast<void *>(baseHostAddr + this->eventPoolOffset);
+        if (this->csrs.empty()) {
+            this->csrs.push_back(neoDevice->getDefaultEngine().commandStreamReceiver);
+        } else {
+            this->csrs[0] = neoDevice->getDefaultEngine().commandStreamReceiver;
+        }
 
-        maxKernelCount = eventPool->getMaxKernelCount();
-        maxPacketCount = eventPool->getEventMaxPackets();
-
-        kernelEventCompletionData = std::make_unique<KernelEventCompletionData<uint32_t>[]>(maxKernelCount);
+        this->maxPacketCount = maxPacketsCount;
     }
 
     void assignKernelEventCompletionData(void *address) override {
         assignKernelEventCompletionDataCounter++;
     }
 
-    ze_result_t hostEventSetValue(uint32_t eventValue) override {
+    ze_result_t hostEventSetValue(Event::State eventState) override {
         if (shouldHostEventSetValueFail) {
             return ZE_RESULT_ERROR_UNKNOWN;
         }
-        return EventImp<uint32_t>::hostEventSetValue(eventValue);
+        return BaseClass::hostEventSetValue(eventState);
+    }
+
+    ze_result_t hostSynchronize(uint64_t timeout) override {
+        hostSynchronizeCalled++;
+        return BaseClass::hostSynchronize(timeout);
+    }
+
+    using BaseClass::queryStatus;
+    ze_result_t queryStatus(int64_t timeSinceWait, bool blockOnMiss) override {
+        if (failOnNextQueryStatus) {
+            failOnNextQueryStatus = false;
+            return ZE_RESULT_NOT_READY;
+        }
+
+        return BaseClass::queryStatus(timeSinceWait, blockOnMiss);
     }
 
     bool shouldHostEventSetValueFail = false;
+    bool failOnNextQueryStatus = false;
     uint32_t assignKernelEventCompletionDataCounter = 0u;
+    uint32_t hostSynchronizeCalled = 0;
+};
+
+using SimulationUploadTagType = NEO::TimestampPackets<uint32_t, NEO::TimestampPacketConstants::preferredPacketCount>;
+
+struct MockTagNodeForSimulationUpload : public NEO::TagNode<SimulationUploadTagType> {
+    MockTagNodeForSimulationUpload(NEO::MultiGraphicsAllocation *allocation, uint64_t gpuAddress, void *cpuBase) {
+        this->gfxAllocation = allocation;
+        this->gpuAddress = gpuAddress;
+        this->tagForCpuAccess = reinterpret_cast<SimulationUploadTagType *>(cpuBase);
+    }
 };
 
 TEST_F(EventTests, WhenQueryingStatusAfterHostSignalThenDontAccessMemoryAndReturnSuccess) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
-    auto result = event->hostSignal();
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto result = event->hostSignal(false);
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
     EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 0u);
 }
 
-TEST_F(EventTests, whenAppendAdditionalCsrThenStoreUniqueCsr) {
-    auto csr1 = reinterpret_cast<NEO::CommandStreamReceiver *>(0x1234);
-    auto csr2 = reinterpret_cast<NEO::CommandStreamReceiver *>(0x5678);
+TEST_F(EventTests, givenDebugFlagSetWhenCallingResetThenSynchronizeBeforeReset) {
+    debugManager.flags.SynchronizeEventBeforeReset.set(1);
 
-    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    event->failOnNextQueryStatus = true;
+
+    *reinterpret_cast<uint32_t *>(event->hostAddressFromPool) = Event::STATE_SIGNALED;
+
+    StreamCapture capture;
+    capture.captureStdout();
+
+    EXPECT_EQ(0u, event->hostSynchronizeCalled);
+
+    event->reset();
+
+    EXPECT_EQ(1u, event->hostSynchronizeCalled);
+
+    std::string output = capture.getCapturedStdout();
+    std::string expectedOutput("");
+    EXPECT_EQ(expectedOutput, output);
+}
+
+TEST_F(EventTests, givenDebugFlagSetWhenCallingResetThenPrintLogAndSynchronizeBeforeReset) {
+    debugManager.flags.SynchronizeEventBeforeReset.set(2);
+
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    *reinterpret_cast<uint32_t *>(event->hostAddressFromPool) = Event::STATE_SIGNALED;
+
+    {
+        event->failOnNextQueryStatus = false;
+
+        StreamCapture capture;
+        capture.captureStdout();
+
+        EXPECT_EQ(0u, event->hostSynchronizeCalled);
+
+        event->reset();
+
+        EXPECT_EQ(1u, event->hostSynchronizeCalled);
+
+        std::string output = capture.getCapturedStdout();
+        std::string expectedOutput("");
+        EXPECT_EQ(expectedOutput, output);
+    }
+
+    {
+        event->failOnNextQueryStatus = true;
+
+        StreamCapture capture;
+        capture.captureStdout();
+
+        EXPECT_EQ(1u, event->hostSynchronizeCalled);
+
+        event->reset();
+
+        EXPECT_EQ(2u, event->hostSynchronizeCalled);
+
+        std::string output = capture.getCapturedStdout();
+        char expectedStr[128] = {};
+        snprintf(expectedStr, 128, "\nzeEventHostReset: Event %p not ready. Calling zeEventHostSynchronize.", event.get());
+
+        EXPECT_EQ(std::string(expectedStr), output);
+    }
+}
+
+TEST_F(EventTests, whenAppendAdditionalCsrThenStoreUniqueCsr) {
+    auto csr1 = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    auto csr2 = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+
+    ze_result_t result;
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
     EXPECT_EQ(event->csrs.size(), 1u);
 
-    event->appendAdditionalCsr(csr1);
+    event->appendAdditionalCsr(csr1.get());
     EXPECT_EQ(event->csrs.size(), 2u);
 
-    event->appendAdditionalCsr(csr2);
+    event->appendAdditionalCsr(csr2.get());
     EXPECT_EQ(event->csrs.size(), 3u);
 
-    event->appendAdditionalCsr(csr1);
+    event->appendAdditionalCsr(csr1.get());
     EXPECT_EQ(event->csrs.size(), 3u);
 
     event->destroy();
 }
 
 TEST_F(EventTests, WhenQueryingStatusAfterHostSignalThatFailedThenAccessMemoryAndReturnSuccess) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     event->shouldHostEventSetValueFail = true;
-    event->hostSignal();
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
+    event->hostSignal(false);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
     EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 1u);
 }
 
+HWTEST_F(EventTests, givenQwordPacketSizeWhenSignalingThenCopyQword) {
+    using TimestampPacketType = typename FamilyType::TimestampPacketType;
+
+    auto event = std::make_unique<MockEventCompletion<TimestampPacketType>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+
+    auto completionAddress = static_cast<uint64_t *>(event->getCompletionFieldHostAddress());
+
+    {
+        event->setSinglePacketSize(sizeof(uint64_t));
+        *completionAddress = std::numeric_limits<uint64_t>::max();
+
+        event->hostSignal(false);
+
+        EXPECT_EQ(static_cast<uint64_t>(Event::STATE_SIGNALED), *completionAddress);
+
+        EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
+    }
+
+    {
+        event->setSinglePacketSize(NEO::TimestampPackets<TimestampPacketType, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
+
+        *completionAddress = std::numeric_limits<uint64_t>::max();
+
+        event->hostSignal(false);
+
+        if (sizeof(TimestampPacketType) == sizeof(uint32_t)) {
+            uint64_t expectedValue = static_cast<uint64_t>(Event::STATE_SIGNALED);
+
+            EXPECT_EQ(expectedValue, *completionAddress);
+            EXPECT_EQ(static_cast<uint32_t>(Event::STATE_SIGNALED), *static_cast<uint32_t *>(event->getCompletionFieldHostAddress()));
+        } else if (sizeof(TimestampPacketType) == sizeof(uint64_t)) {
+            EXPECT_EQ(static_cast<uint64_t>(Event::STATE_SIGNALED), *completionAddress);
+        } else {
+            ASSERT_TRUE(false);
+        }
+
+        EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
+    }
+}
+
 TEST_F(EventTests, WhenQueryingStatusThenAccessMemoryOnce) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 1u);
+}
+
+TEST_F(EventTests, WhenQueryingStatusThenStatusQueryRecordsCompletionDataAssigned) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    EXPECT_FALSE(event->statusQueryAssignedCompletionData);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(event->statusQueryAssignedCompletionData);
+}
+
+TEST_F(EventTests, GivenStatusQueryAssignedCompletionDataWhenQueryingKernelTimestampThenCompletionDataNotAssignedAgain) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    ze_kernel_timestamp_result_t result = {};
+    EXPECT_EQ(event->queryKernelTimestamp(&result), ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(event->statusQueryAssignedCompletionData);
+    EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 1u);
+}
+
+TEST_F(EventTests, GivenHostSignaledWhenQueryingKernelTimestampThenStatusQueryRecordsCompletionDataNotAssigned) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    EXPECT_EQ(event->hostSignal(false), ZE_RESULT_SUCCESS);
+    ze_kernel_timestamp_result_t result = {};
+    EXPECT_EQ(event->queryKernelTimestamp(&result), ZE_RESULT_SUCCESS);
+    EXPECT_FALSE(event->statusQueryAssignedCompletionData);
+    EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 1u);
+}
+
+TEST_F(EventTests, GivenNotReadyPacketsWhenQueryingStatusThenNotReadyReturnedAndCompletionDataAssignmentNotRecorded) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    const uint32_t clearedPacket[4] = {static_cast<uint32_t>(Event::STATE_CLEARED), static_cast<uint32_t>(Event::STATE_CLEARED),
+                                       static_cast<uint32_t>(Event::STATE_CLEARED), static_cast<uint32_t>(Event::STATE_CLEARED)};
+    event->kernelEventCompletionData.assignDataToAllTimestamps(0u, clearedPacket);
+
+    EXPECT_FALSE(event->statusQueryAssignedCompletionData);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_NOT_READY);
+    EXPECT_FALSE(event->statusQueryAssignedCompletionData);
+}
+
+TEST_F(EventTests, GivenNotReadyPacketsWhenQueryingStatusThenCoreIsNotYielded) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    const uint32_t clearedPacket[4] = {static_cast<uint32_t>(Event::STATE_CLEARED), static_cast<uint32_t>(Event::STATE_CLEARED),
+                                       static_cast<uint32_t>(Event::STATE_CLEARED), static_cast<uint32_t>(Event::STATE_CLEARED)};
+    event->kernelEventCompletionData.assignDataToAllTimestamps(0u, clearedPacket);
+
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_NOT_READY);
+    EXPECT_EQ(yieldCountBefore, CpuIntrinsicsTests::yieldCounter);
+}
+
+TEST_F(EventTests, GivenNotReadyPacketsWhenQueryingKernelTimestampThenNotReadyReturnedAndCompletionDataAssignmentNotRecorded) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    const uint32_t clearedPacket[4] = {static_cast<uint32_t>(Event::STATE_CLEARED), static_cast<uint32_t>(Event::STATE_CLEARED),
+                                       static_cast<uint32_t>(Event::STATE_CLEARED), static_cast<uint32_t>(Event::STATE_CLEARED)};
+    event->kernelEventCompletionData.assignDataToAllTimestamps(0u, clearedPacket);
+
+    ze_kernel_timestamp_result_t result = {};
+    EXPECT_EQ(event->queryKernelTimestamp(&result), ZE_RESULT_NOT_READY);
+    EXPECT_FALSE(event->statusQueryAssignedCompletionData);
     EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 1u);
 }
 
 TEST_F(EventTests, WhenQueryingStatusAfterResetThenAccessMemory) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
     EXPECT_EQ(event->reset(), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(event->queryStatus(), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(event->queryStatus(0), ZE_RESULT_SUCCESS);
     EXPECT_EQ(event->assignKernelEventCompletionDataCounter, 2u);
 }
 
 TEST_F(EventTests, WhenResetEventThenZeroCpuTimestamps) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     event->gpuStartTimestamp = 10u;
     event->gpuEndTimestamp = 20u;
     EXPECT_EQ(event->reset(), ZE_RESULT_SUCCESS);
@@ -3100,76 +7385,336 @@ TEST_F(EventTests, WhenResetEventThenZeroCpuTimestamps) {
     EXPECT_EQ(event->gpuEndTimestamp, 0u);
 }
 
-TEST_F(EventTests, WhenEventResetIsCalledThenKernelCountAndPacketsUsedHaveNotBeenReset) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+HWTEST_F(EventTests, givenZeroPartitionCountWhenClearingTimestampTagDataThenSkipSimulationUpload) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->csrs.clear();
+    event->csrs.push_back(&ultCsr);
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr.writeMemoryParams = {};
+
+    uint8_t storage[4096] = {};
+    NEO::MockGraphicsAllocation tagAllocation(storage, 0x1234000, sizeof(storage));
+    NEO::MultiGraphicsAllocation multiAllocation(1);
+    multiAllocation.addAllocation(&tagAllocation);
+    MockTagNodeForSimulationUpload timestampNode(&multiAllocation, tagAllocation.getGpuAddress(), storage);
+
+    event->clearTimestampTagData(0u, &timestampNode);
+
+    EXPECT_EQ(0u, ultCsr.writeMemoryParams.totalCallCount);
+}
+
+HWTEST_F(EventTests, givenEmptyCsrListWhenClearingTimestampTagDataThenSkipSimulationUpload) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->csrs.clear();
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr.writeMemoryParams = {};
+
+    uint8_t storage[4096] = {};
+    NEO::MockGraphicsAllocation tagAllocation(storage, 0x1834000, sizeof(storage));
+    NEO::MultiGraphicsAllocation multiAllocation(1);
+    multiAllocation.addAllocation(&tagAllocation);
+    MockTagNodeForSimulationUpload timestampNode(&multiAllocation, tagAllocation.getGpuAddress(), storage);
+
+    event->clearTimestampTagData(2u, &timestampNode);
+
+    EXPECT_EQ(0u, ultCsr.writeMemoryParams.totalCallCount);
+}
+
+HWTEST_F(EventTests, givenNonSimulationCsrWhenClearingTimestampTagDataThenSkipSimulationUpload) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->csrs.clear();
+    event->csrs.push_back(&ultCsr);
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::hardware;
+    ultCsr.writeMemoryParams = {};
+
+    uint8_t storage[4096] = {};
+    NEO::MockGraphicsAllocation tagAllocation(storage, 0x2234000, sizeof(storage));
+    NEO::MultiGraphicsAllocation multiAllocation(1);
+    multiAllocation.addAllocation(&tagAllocation);
+    MockTagNodeForSimulationUpload timestampNode(&multiAllocation, tagAllocation.getGpuAddress(), storage);
+
+    event->clearTimestampTagData(2u, &timestampNode);
+
+    EXPECT_EQ(0u, ultCsr.writeMemoryParams.totalCallCount);
+}
+
+HWTEST_F(EventTests, givenAubCsrWhenClearingTimestampTagDataThenUploadEachPartitionChunk) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->csrs.clear();
+    event->csrs.push_back(&ultCsr);
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::aub;
+    ultCsr.writeMemoryParams = {};
+
+    uint8_t storage[4096] = {};
+    NEO::MockGraphicsAllocation tagAllocation(storage, 0x2834000, sizeof(storage));
+    NEO::MultiGraphicsAllocation multiAllocation(1);
+    multiAllocation.addAllocation(&tagAllocation);
+    MockTagNodeForSimulationUpload timestampNode(&multiAllocation, tagAllocation.getGpuAddress(), storage);
+
+    constexpr uint32_t partitionCount = 2u;
+    event->clearTimestampTagData(partitionCount, &timestampNode);
+
+    EXPECT_EQ(partitionCount, ultCsr.writeMemoryParams.totalCallCount);
+}
+
+HWTEST_F(EventTests, givenAubCsrAnd64BitTagWhenClearingTimestampTagDataThenUploadEachPartitionChunk) {
+    auto event = std::make_unique<MockEventCompletion<uint64_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->csrs.clear();
+    event->csrs.push_back(&ultCsr);
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::aub;
+    ultCsr.writeMemoryParams = {};
+
+    uint8_t storage[4096] = {};
+    NEO::MockGraphicsAllocation tagAllocation(storage, 0x2c34000, sizeof(storage));
+    NEO::MultiGraphicsAllocation multiAllocation(1);
+    multiAllocation.addAllocation(&tagAllocation);
+    MockTagNodeForSimulationUpload timestampNode(&multiAllocation, tagAllocation.getGpuAddress(), storage);
+
+    constexpr uint32_t partitionCount = 2u;
+    event->clearTimestampTagData(partitionCount, &timestampNode);
+
+    EXPECT_EQ(partitionCount, ultCsr.writeMemoryParams.totalCallCount);
+}
+
+HWTEST_F(EventTests, Given64BitEventAndDrmKmdWaitStrategyWhenSignalAllPacketsUsesRemainingPacketThenHostSynchronizeFallsBackToPolling) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.isWaitUserFenceNotEqualSupportedValue = true;
+    csr.waitUserFenceParams.forceRetStatusEnabled = true;
+
+    auto prepareEvent = [&]() {
+        auto testedEvent = std::make_unique<MockEventCompletion<uint64_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+        testedEvent->maxPacketCount = 2u;
+        testedEvent->setLinuxUserFenceKmdWaitEnabled(true);
+        return testedEvent;
+    };
+
+    auto eventWithFirstPacketPending = prepareEvent();
+    std::vector<uint64_t> firstPacketPendingStorage(alignUp(eventWithFirstPacketPending->getMaxPacketsCount() * eventWithFirstPacketPending->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+    eventWithFirstPacketPending->hostAddressFromPool = firstPacketPendingStorage.data();
+    auto pendingFirstPacketAddress = static_cast<uint64_t *>(eventWithFirstPacketPending->getCompletionFieldHostAddress());
+    *pendingFirstPacketAddress = Event::STATE_CLEARED;
+    csr.waitUserFenceParams.forceRetStatusValue = true;
+    csr.waitUserFenceParams.onWait = [&]() { *pendingFirstPacketAddress = Event::STATE_SIGNALED; };
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventWithFirstPacketPending->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(NEO::UserFenceValueWidth::u64, csr.waitUserFenceParams.latestWaitValueWidth);
+
+    auto eventWithRemainingPacketPending = prepareEvent();
+    std::vector<uint64_t> remainingPacketPendingStorage(alignUp(eventWithRemainingPacketPending->getMaxPacketsCount() * eventWithRemainingPacketPending->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+    eventWithRemainingPacketPending->hostAddressFromPool = remainingPacketPendingStorage.data();
+    auto firstPacketAddress = static_cast<uint64_t *>(eventWithRemainingPacketPending->getCompletionFieldHostAddress());
+    auto remainingPacketAddress = static_cast<uint64_t *>(ptrOffset(eventWithRemainingPacketPending->getHostAddress(), eventWithRemainingPacketPending->getSinglePacketSize() + eventWithRemainingPacketPending->getCompletionFieldOffset()));
+    *firstPacketAddress = Event::STATE_SIGNALED;
+    *remainingPacketAddress = Event::STATE_CLEARED;
+    csr.waitUserFenceParams.callCountWithOperation = 0;
+    csr.waitUserFenceParams.forceRetStatusValue = false;
+    csr.waitUserFenceParams.onWait = [&]() { *remainingPacketAddress = Event::STATE_SIGNALED; };
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, eventWithRemainingPacketPending->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(1u, csr.waitUserFenceParams.callCountWithOperation);
+    EXPECT_EQ(NEO::UserFenceValueWidth::u64, csr.waitUserFenceParams.latestWaitValueWidth);
+    EXPECT_EQ(castToUint64(remainingPacketAddress), csr.waitUserFenceParams.latestWaitedAddress);
+}
+
+HWTEST_F(EventTests, GivenDrmAndKmdWaitStrategyWhenLinuxUserFenceKmdWaitIsDisabledThenUserFenceWaitIsNotUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+
+    auto testedEvent = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    std::vector<uint64_t> eventStorage(alignUp(testedEvent->getMaxPacketsCount() * testedEvent->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+    testedEvent->hostAddressFromPool = eventStorage.data();
+    testedEvent->setLinuxUserFenceKmdWaitEnabled(false);
+    testedEvent->failOnNextQueryStatus = true;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, testedEvent->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+}
+
+HWTEST_F(EventTests, GivenDrmAndKmdWaitStrategyWhenEventUsesBcsThenUserFenceWaitIsNotUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    auto &osContext = reinterpret_cast<NEO::MockOsContext &>(csr.getOsContext());
+    osContext.engineType = aub_stream::ENGINE_BCS;
+
+    auto testedEvent = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    std::vector<uint64_t> eventStorage(alignUp(testedEvent->getMaxPacketsCount() * testedEvent->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+    testedEvent->hostAddressFromPool = eventStorage.data();
+    testedEvent->setLinuxUserFenceKmdWaitEnabled(true);
+    testedEvent->failOnNextQueryStatus = true;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, testedEvent->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+}
+
+HWTEST_F(EventTests, GivenDrmAndKmdWaitStrategyWhenLinuxUserFenceKmdWaitFlagIsDisabledThenUserFenceWaitIsNotUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(false);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+
+    auto testedEvent = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    std::vector<uint64_t> eventStorage(alignUp(testedEvent->getMaxPacketsCount() * testedEvent->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+    testedEvent->hostAddressFromPool = eventStorage.data();
+    testedEvent->setLinuxUserFenceKmdWaitEnabled(true);
+    testedEvent->failOnNextQueryStatus = true;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, testedEvent->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+}
+
+HWTEST_F(EventTests, GivenDrmAndKmdWaitStrategyWhenPacketEventUsesMultiplePartitionsThenUserFenceWaitIsNotUsed) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.set(3);
+    NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.set(true);
+    NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.set(0);
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<NEO::OSInterface>();
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::make_unique<NEO::MockDriverModelDRM>());
+
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    csr.isUserFenceWaitSupported = true;
+    csr.setActivePartitions(2);
+
+    auto testedEvent = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    std::vector<uint64_t> eventStorage(alignUp(testedEvent->getMaxPacketsCount() * testedEvent->getSinglePacketSize() + sizeof(NEO::TimeStampData), sizeof(uint64_t)) / sizeof(uint64_t));
+    testedEvent->hostAddressFromPool = eventStorage.data();
+    testedEvent->setLinuxUserFenceKmdWaitEnabled(true);
+    testedEvent->failOnNextQueryStatus = true;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, testedEvent->hostSynchronize(std::numeric_limits<uint64_t>::max()));
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCount);
+    EXPECT_EQ(0u, csr.waitUserFenceParams.callCountWithOperation);
+}
+
+HWTEST_F(EventTests, givenSimulationCsrWhenClearingTimestampTagDataThenUploadEachPartitionChunk) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    event->csrs.clear();
+    event->csrs.push_back(&ultCsr);
+    ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr.writeMemoryParams = {};
+
+    uint8_t storage[4096] = {};
+    NEO::MockGraphicsAllocation tagAllocation(storage, 0x3234000, sizeof(storage));
+    NEO::MultiGraphicsAllocation multiAllocation(1);
+    multiAllocation.addAllocation(&tagAllocation);
+    MockTagNodeForSimulationUpload timestampNode(&multiAllocation, tagAllocation.getGpuAddress(), storage);
+
+    constexpr uint32_t partitionCount = 2u;
+    event->clearTimestampTagData(partitionCount, &timestampNode);
+
+    EXPECT_EQ(partitionCount, ultCsr.writeMemoryParams.totalCallCount);
+}
+
+TEST_F(EventTests, WhenEventResetIsCalledThenPacketsUsedHaveNotBeenReset) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     event->gpuStartTimestamp = 10u;
     event->gpuEndTimestamp = 20u;
-    event->zeroKernelCount();
+    event->setPacketsInUse(3u);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, event->reset());
 
-    EXPECT_EQ(0u, event->getKernelCount());
-    EXPECT_EQ(0u, event->getPacketsInUse());
+    EXPECT_EQ(3u, event->getPacketsInUse());
     EXPECT_EQ(event->gpuStartTimestamp, 0u);
     EXPECT_EQ(event->gpuEndTimestamp, 0u);
 }
 
-TEST_F(EventTests, GivenResetAllPacketsWhenResetPacketsThenOneKernelCountAndOnePacketUsed) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+TEST_F(EventTests, GivenResetAllPacketsWhenResetPacketsThenOnePacketUsed) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     event->gpuStartTimestamp = 10u;
     event->gpuEndTimestamp = 20u;
-    event->zeroKernelCount();
+    event->setPacketsInUse(3u);
     auto resetAllPackets = true;
     event->resetPackets(resetAllPackets);
 
-    EXPECT_EQ(1u, event->getKernelCount());
     EXPECT_EQ(1u, event->getPacketsInUse());
     EXPECT_EQ(event->gpuStartTimestamp, 0u);
     EXPECT_EQ(event->gpuEndTimestamp, 0u);
 }
 
-TEST_F(EventTests, GivenResetAllPacketsFalseWhenResetPacketsThenKernelCountAndPacketsUsedHaveNotBeenReset) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+TEST_F(EventTests, GivenResetAllPacketsFalseWhenResetPacketsThenPacketsUsedHaveNotBeenReset) {
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     event->gpuStartTimestamp = 10u;
     event->gpuEndTimestamp = 20u;
-    event->zeroKernelCount();
+    event->setPacketsInUse(3u);
     auto resetAllPackets = false;
     event->resetPackets(resetAllPackets);
 
-    EXPECT_EQ(0u, event->getKernelCount());
-    EXPECT_EQ(0u, event->getPacketsInUse());
+    EXPECT_EQ(3u, event->getPacketsInUse());
     EXPECT_EQ(event->gpuStartTimestamp, 0u);
     EXPECT_EQ(event->gpuEndTimestamp, 0u);
 }
 
 TEST_F(EventTests, givenCallToEventQueryStatusWithKernelPointerReturnsCounter) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     Mock<Module> mockModule(this->device, nullptr);
-    Mock<Kernel> mockKernel;
-    mockKernel.descriptor.kernelAttributes.flags.usesPrintf = true;
-    mockKernel.module = &mockModule;
+    std::shared_ptr<Mock<KernelImp>> mockKernel{new Mock<KernelImp>{}};
+    mockKernel->descriptor.kernelAttributes.flags.usesPrintf = true;
+    mockKernel->module = &mockModule;
 
-    event->setKernelForPrintf(&mockKernel);
-    EXPECT_NE(nullptr, event->getKernelForPrintf());
+    event->setKernelForPrintf(std::weak_ptr<Kernel>{mockKernel});
+    event->setKernelWithPrintfDeviceMutex(&static_cast<Device *>(this->device)->printfKernelMutex);
+    EXPECT_FALSE(event->getKernelForPrintf().expired());
+    EXPECT_NE(nullptr, event->getKernelWithPrintfDeviceMutex());
 
     constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
     event->hostSynchronize(timeout);
-    EXPECT_EQ(1u, mockKernel.printPrintfOutputCalledTimes);
+    EXPECT_EQ(1u, mockKernel->printPrintfOutputCalledTimes);
 }
 
 TEST_F(EventTests, givenCallToEventQueryStatusWithNullKernelPointerReturnsCounter) {
-    auto event = std::make_unique<MockEventCompletion>(eventPool.get(), 1u, device);
+    auto event = std::make_unique<MockEventCompletion<uint32_t>>(&eventPool->getAllocation(), eventPool->getEventSize(), eventPool->getEventMaxPackets(), 1u, device);
     Mock<Module> mockModule(this->device, nullptr);
-    Mock<Kernel> mockKernel;
-    mockKernel.descriptor.kernelAttributes.flags.usesPrintf = true;
-    mockKernel.module = &mockModule;
+    std::shared_ptr<Mock<KernelImp>> mockKernel{new Mock<KernelImp>{}};
+    mockKernel->descriptor.kernelAttributes.flags.usesPrintf = true;
+    mockKernel->module = &mockModule;
 
-    event->setKernelForPrintf(nullptr);
-    EXPECT_EQ(nullptr, event->getKernelForPrintf());
+    event->resetKernelForPrintf();
+    EXPECT_TRUE(event->getKernelForPrintf().expired());
 
     constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
     event->hostSynchronize(timeout);
-    EXPECT_EQ(0u, mockKernel.printPrintfOutputCalledTimes);
+    EXPECT_EQ(0u, mockKernel->printPrintfOutputCalledTimes);
+    EXPECT_EQ(nullptr, event->getKernelWithPrintfDeviceMutex());
 }
 
 TEST_F(EventSynchronizeTest, whenEventSetCsrThenCorrectCsrSet) {
@@ -3177,31 +7722,24 @@ TEST_F(EventSynchronizeTest, whenEventSetCsrThenCorrectCsrSet) {
     const auto mockCsr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
 
     EXPECT_EQ(event->csrs[0], defaultCsr);
-    event->setCsr(mockCsr.get());
+    event->setCsr(mockCsr.get(), false);
     EXPECT_EQ(event->csrs[0], mockCsr.get());
 
     event->reset();
     EXPECT_EQ(event->csrs[0], defaultCsr);
 }
 
-template <int32_t multiTile, int32_t signalRemainingPackets>
+template <int32_t multiTile>
 struct EventDynamicPacketUseFixture : public DeviceFixture {
     void setUp() {
-        NEO::DebugManager.flags.UseDynamicEventPacketsCount.set(1);
         if constexpr (multiTile == 1) {
-            DebugManager.flags.CreateMultipleSubDevices.set(2);
-            DebugManager.flags.EnableImplicitScaling.set(1);
-        }
-        NEO::DebugManager.flags.SignalAllEventPackets.set(signalRemainingPackets);
-        if constexpr (signalRemainingPackets == 1) {
-            NEO::DebugManager.flags.UsePipeControlMultiKernelEventSync.set(0);
-            NEO::DebugManager.flags.CompactL3FlushEventPacket.set(0);
+            debugManager.flags.CreateMultipleSubDevices.set(2);
+            debugManager.flags.EnableImplicitScaling.set(1);
         }
         DeviceFixture::setUp();
     }
 
     void testAllDevices() {
-        auto &hwInfo = device->getHwInfo();
         auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
         auto &gfxCoreHelper = device->getGfxCoreHelper();
 
@@ -3215,9 +7753,6 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
         std::unique_ptr<L0::EventPool> eventPool(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
         ASSERT_NE(nullptr, eventPool);
-
-        auto expectedMaxKernelCount = driverHandle->getEventMaxKernelCount(0, nullptr);
-        EXPECT_EQ(expectedMaxKernelCount, eventPool->getMaxKernelCount());
 
         auto eventPoolMaxPackets = eventPool->getEventMaxPackets();
         auto expectedPoolMaxPackets = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
@@ -3237,19 +7772,16 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             ZE_EVENT_SCOPE_FLAG_DEVICE,
             ZE_EVENT_SCOPE_FLAG_DEVICE};
 
-        std::unique_ptr<L0::Event> event(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+        std::unique_ptr<L0::Event> event(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
 
         EXPECT_EQ(expectedPoolMaxPackets, event->getMaxPacketsCount());
-
-        uint32_t maxKernels = l0GfxCoreHelper.getEventMaxKernelCount(hwInfo);
-        EXPECT_EQ(expectedMaxKernelCount, maxKernels);
-        EXPECT_EQ(maxKernels, event->getMaxKernelCount());
     }
 
     void testSingleDevice() {
         ze_result_t result = ZE_RESULT_SUCCESS;
 
-        auto &hwInfo = device->getHwInfo();
+        device->getNEODevice()->getExecutionEnvironment()->setDeviceHierarchyMode(DeviceHierarchyMode::composite);
+
         auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
         auto &gfxCoreHelper = device->getGfxCoreHelper();
 
@@ -3277,9 +7809,6 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
         ASSERT_NE(nullptr, eventPool);
 
-        auto expectedMaxKernelCount = driverHandle->getEventMaxKernelCount(1, deviceHandles.data());
-        EXPECT_EQ(expectedMaxKernelCount, eventPool->getMaxKernelCount());
-
         auto eventPoolMaxPackets = eventPool->getEventMaxPackets();
         auto expectedPoolMaxPackets = l0GfxCoreHelper.getEventBaseMaxPacketCount(device->getNEODevice()->getRootDeviceEnvironment());
 
@@ -3296,16 +7825,12 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             ZE_EVENT_SCOPE_FLAG_DEVICE,
             ZE_EVENT_SCOPE_FLAG_DEVICE};
 
-        std::unique_ptr<L0::Event> event(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, eventDevice));
+        std::unique_ptr<L0::Event> event(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, eventDevice, result));
 
         EXPECT_EQ(expectedPoolMaxPackets, event->getMaxPacketsCount());
-
-        uint32_t maxKernels = l0GfxCoreHelper.getEventMaxKernelCount(hwInfo);
-        EXPECT_EQ(expectedMaxKernelCount, maxKernels);
-        EXPECT_EQ(maxKernels, event->getMaxKernelCount());
     }
 
-    void testSignalAllPackets(uint32_t eventValueAfterSignal, uint32_t queryRetAfterPartialReset, ze_event_pool_flags_t flags, bool signalAll) {
+    void testSignalAllPackets(uint32_t eventValueAfterSignal, uint32_t queryRetAfterPartialReset, ze_event_pool_flags_t flags) {
         ze_result_t result = ZE_RESULT_SUCCESS;
         auto &l0GfxCoreHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<L0GfxCoreHelper>();
 
@@ -3331,7 +7856,7 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             ZE_EVENT_SCOPE_FLAG_DEVICE,
             ZE_EVENT_SCOPE_FLAG_DEVICE};
 
-        std::unique_ptr<L0::Event> event(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+        std::unique_ptr<L0::Event> event(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, result));
         EXPECT_EQ(expectedPoolMaxPackets, event->getMaxPacketsCount());
 
         // natively one packet is in use
@@ -3342,7 +7867,7 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
         void *eventHostAddress = event->getHostAddress();
         uint32_t remainingPackets = maxPackets - usedPackets;
         void *remainingPacketsAddress = ptrOffset(eventHostAddress, (usedPackets * packetSize));
-        if (event->isUsingContextEndOffset()) {
+        if (event->isEventTimestampFlagSet()) {
             remainingPacketsAddress = ptrOffset(remainingPacketsAddress, event->getContextEndOffset());
         }
 
@@ -3352,14 +7877,14 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             remainingPacketsAddress = ptrOffset(remainingPacketsAddress, packetSize);
         }
 
-        result = event->queryStatus();
+        result = event->queryStatus(0);
         EXPECT_EQ(ZE_RESULT_NOT_READY, result);
         event->resetCompletionStatus();
 
-        event->hostSignal();
+        event->hostSignal(false);
 
         remainingPacketsAddress = ptrOffset(eventHostAddress, (usedPackets * packetSize));
-        if (event->isUsingContextEndOffset()) {
+        if (event->isEventTimestampFlagSet()) {
             remainingPacketsAddress = ptrOffset(remainingPacketsAddress, event->getContextEndOffset());
         }
 
@@ -3369,12 +7894,12 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             remainingPacketsAddress = ptrOffset(remainingPacketsAddress, packetSize);
         }
 
-        result = event->queryStatus();
+        result = event->queryStatus(0);
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
         event->resetCompletionStatus();
 
         remainingPacketsAddress = ptrOffset(eventHostAddress, (usedPackets * packetSize));
-        if (event->isUsingContextEndOffset()) {
+        if (event->isEventTimestampFlagSet()) {
             remainingPacketsAddress = ptrOffset(remainingPacketsAddress, event->getContextEndOffset());
         }
 
@@ -3382,13 +7907,13 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             uint32_t *completionField = reinterpret_cast<uint32_t *>(remainingPacketsAddress);
             *completionField = Event::STATE_CLEARED;
 
-            result = event->queryStatus();
+            result = event->queryStatus(0);
             EXPECT_EQ(queryRetAfterPartialReset, result);
             event->resetCompletionStatus();
 
             *completionField = Event::STATE_SIGNALED;
 
-            result = event->queryStatus();
+            result = event->queryStatus(0);
             EXPECT_EQ(ZE_RESULT_SUCCESS, result);
             event->resetCompletionStatus();
         }
@@ -3400,60 +7925,222 @@ struct EventDynamicPacketUseFixture : public DeviceFixture {
             uint32_t *completionField = reinterpret_cast<uint32_t *>(remainingPacketsAddress);
 
             // manually signaled free packet will not be cleared when signal all is not active
-            if (!signalAll && i == 0) {
-                eventValueAfterReset = Event::STATE_SIGNALED;
-            } else {
-                eventValueAfterReset = Event::STATE_CLEARED;
-            }
+            eventValueAfterReset = (i == 0) ? Event::STATE_SIGNALED : Event::STATE_CLEARED;
             EXPECT_EQ(eventValueAfterReset, *completionField);
             remainingPacketsAddress = ptrOffset(remainingPacketsAddress, packetSize);
         }
 
-        result = event->queryStatus();
+        result = event->queryStatus(0);
         EXPECT_EQ(ZE_RESULT_NOT_READY, result);
     }
 
     DebugManagerStateRestore restorer;
 };
 
-using EventDynamicPacketUseTest = Test<EventDynamicPacketUseFixture<0, 0>>;
-HWTEST2_F(EventDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromAllDevicesThenMaxPossibleSelected, IsAtLeastSkl) {
+using EventDynamicPacketUseTest = Test<EventDynamicPacketUseFixture<0>>;
+HWTEST_F(EventDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromAllDevicesThenMaxPossibleSelected) {
     testAllDevices();
 }
 
-HWTEST2_F(EventDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromSingleDeviceThenMaxFromThisDeviceSelected, IsAtLeastSkl) {
+HWTEST_F(EventDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromSingleDeviceThenMaxFromThisDeviceSelected) {
     testSingleDevice();
 }
 
-using EventMultiTileDynamicPacketUseTest = Test<EventDynamicPacketUseFixture<1, 0>>;
-HWTEST2_F(EventMultiTileDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromAllDevicesThenMaxPossibleSelected, IsAtLeastXeHpCore) {
+using EventMultiTileDynamicPacketUseTest = Test<EventDynamicPacketUseFixture<1>>;
+HWTEST2_F(EventMultiTileDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromAllDevicesThenMaxPossibleSelected, IsAtLeastXeCore) {
     testAllDevices();
 }
 
-HWTEST2_F(EventMultiTileDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromSingleOneTileDeviceThenMaxFromThisDeviceSelected, IsAtLeastXeHpCore) {
+HWTEST2_F(EventMultiTileDynamicPacketUseTest, givenEventUsedCreatedOnSubDeviceButUsedOnDifferentSubdeviceWhenQueryingThenDownload, IsAtLeastXeCore) {
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
+
+    auto rootDevice = static_cast<MockDeviceImp *>(device);
+
+    ASSERT_TRUE(rootDevice->subDevices.size() > 1);
+
+    auto subDevice0 = rootDevice->subDevices[0];
+    auto subDevice1 = rootDevice->subDevices[1];
+
+    auto rootCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(rootDevice->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+    auto ultCsr0 = static_cast<UltCommandStreamReceiver<FamilyType> *>(subDevice0->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+    auto ultCsr1 = static_cast<UltCommandStreamReceiver<FamilyType> *>(subDevice1->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+    auto ultCsr2 = static_cast<UltCommandStreamReceiver<FamilyType> *>(subDevice1->getNEODevice()->getInternalEngine().commandStreamReceiver);
+
+    rootCsr->initializeResources(device->getDevicePreemptionMode());
+    ultCsr0->initializeResources(device->getDevicePreemptionMode());
+    ultCsr1->initializeResources(device->getDevicePreemptionMode());
+
+    rootCsr->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr0->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr1->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr2->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+
+    ultCsr2->resourcesInitialized = false;
+
+    ze_event_pool_desc_t eventPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 1;
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+
+    auto event = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, subDevice1, result));
+
+    size_t eventCompletionOffset = event->getContextStartOffset();
+    if (event->isEventTimestampFlagSet()) {
+        eventCompletionOffset = event->getContextEndOffset();
+    }
+    TagAddressType *eventAddress = static_cast<TagAddressType *>(ptrOffset(event->getHostAddress(), eventCompletionOffset));
+    *eventAddress = Event::STATE_INITIAL;
+
+    uint32_t rootDownloadCounter = 0;
+    uint32_t downloadCounter0 = 0;
+    uint32_t downloadCounter1 = 0;
+    uint32_t downloadCounter2 = 0;
+
+    rootCsr->downloadAllocationImpl = [&rootDownloadCounter](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        rootDownloadCounter++;
+    };
+    ultCsr0->downloadAllocationImpl = [&downloadCounter0](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadCounter0++;
+    };
+    ultCsr1->downloadAllocationImpl = [&downloadCounter1](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadCounter1++;
+    };
+    ultCsr2->downloadAllocationImpl = [&downloadCounter2](GraphicsAllocation &gfxAllocation, uint64_t, size_t) {
+        downloadCounter2++;
+    };
+
+    auto eventAllocation = event->getAllocation(device);
+    ultCsr0->makeResident(*eventAllocation);
+    ultCsr2->makeResident(*eventAllocation);
+    rootCsr->makeResident(*eventAllocation);
+
+    // all packets are signaled and waited on, so the whole event must be completed for
+    // hostSynchronize to succeed and reach the download path under test
+    for (uint32_t packetId = 0; packetId < event->getMaxPacketsCount(); packetId++) {
+        auto packetAddress = static_cast<uint64_t *>(ptrOffset(event->getHostAddress(), packetId * event->getSinglePacketSize() + event->getCompletionFieldOffset()));
+        *packetAddress = Event::STATE_SIGNALED;
+    }
+
+    event->hostSynchronize(1);
+
+    EXPECT_EQ(1u, rootCsr->downloadAllocationsCalledCount);
+    EXPECT_FALSE(rootCsr->latestDownloadAllocationsBlocking);
+    EXPECT_EQ(0u, rootDownloadCounter);
+
+    EXPECT_EQ(1u, ultCsr0->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr0->latestDownloadAllocationsBlocking);
+    EXPECT_EQ(1u, downloadCounter0);
+
+    EXPECT_EQ(1u, ultCsr1->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr1->latestDownloadAllocationsBlocking);
+    EXPECT_EQ(0u, downloadCounter1);
+
+    EXPECT_EQ(0u, ultCsr2->downloadAllocationsCalledCount);
+    EXPECT_EQ(0u, downloadCounter2);
+
+    event->destroy();
+}
+
+HWTEST2_F(EventMultiTileDynamicPacketUseTest, givenEventCounterBasedUsedCreatedOnSubDeviceButUsedOnDifferentSubdeviceWhenQueryingThenDownload, IsAtLeastXeCore) {
+    neoDevice->getExecutionEnvironment()->calculateMaxOsContextCount();
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<NEO::MockMemoryOperations>();
+
+    auto rootDevice = static_cast<MockDeviceImp *>(device);
+
+    ASSERT_TRUE(rootDevice->subDevices.size() > 1);
+
+    auto subDevice0 = rootDevice->subDevices[0];
+    auto subDevice1 = rootDevice->subDevices[1];
+
+    auto ultCsr0 = static_cast<UltCommandStreamReceiver<FamilyType> *>(subDevice0->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+    auto ultCsr1 = static_cast<UltCommandStreamReceiver<FamilyType> *>(subDevice1->getNEODevice()->getDefaultEngine().commandStreamReceiver);
+
+    ultCsr0->initializeResources(device->getDevicePreemptionMode());
+    ultCsr1->initializeResources(device->getDevicePreemptionMode());
+
+    ultCsr0->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+    ultCsr1->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+
+    ze_event_pool_desc_t eventPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 3;
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+
+    auto event0 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, subDevice1, result));
+    auto event1 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, subDevice1, result));
+    auto event2 = whiteboxCast(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, subDevice1, result));
+    event0->eventPoolAllocation = nullptr;
+    event1->eventPoolAllocation = nullptr;
+    event2->eventPoolAllocation = nullptr;
+
+    auto inOrderExecInfo0 = NEO::InOrderExecInfo::create(device->getDeviceInOrderCounterAllocator()->getTag(), nullptr, *device->getNEODevice(), 1);
+    inOrderExecInfo0->setLastWaitedCounterValue(1, 0);
+    event0->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event0->updateInOrderExecState(inOrderExecInfo0, 1, 0);
+
+    uint64_t counter = 2;
+
+    event1->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event1->getInOrderExecEventHelper().assignData(1, 0, 1, 1, nullptr, nullptr, 1, 0, &counter, 0, 0, false, true);
+
+    MockGraphicsAllocation mockAlloc(rootDeviceIndex, nullptr, 1);
+
+    event2->getInOrderExecEventHelper().initializeLocalTempStorage();
+    event2->getInOrderExecEventHelper().assignData(1, 0, 1, 1, &mockAlloc, &mockAlloc, 1, 0, &counter, 0, 0, false, true);
+
+    ultCsr0->makeResident(*inOrderExecInfo0->getDeviceCounterAllocation());
+
+    event0->hostSynchronize(1);
+
+    EXPECT_EQ(1u, ultCsr0->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr0->latestDownloadAllocationsBlocking);
+
+    EXPECT_EQ(1u, ultCsr1->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr1->latestDownloadAllocationsBlocking);
+
+    event1->hostSynchronize(1);
+
+    EXPECT_EQ(2u, ultCsr0->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr0->latestDownloadAllocationsBlocking);
+
+    EXPECT_EQ(3u, ultCsr1->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr1->latestDownloadAllocationsBlocking);
+
+    event2->hostSynchronize(1);
+
+    EXPECT_EQ(2u, ultCsr0->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr0->latestDownloadAllocationsBlocking);
+
+    EXPECT_EQ(4u, ultCsr1->downloadAllocationsCalledCount);
+    EXPECT_FALSE(ultCsr1->latestDownloadAllocationsBlocking);
+
+    event0->destroy();
+    event1->destroy();
+    event2->destroy();
+}
+
+HWTEST2_F(EventMultiTileDynamicPacketUseTest, givenDynamicPacketEstimationWhenGettingMaxPacketFromSingleOneTileDeviceThenMaxFromThisDeviceSelected, IsAtLeastXeCore) {
     testSingleDevice();
 }
 
-using EventSignalAllPacketsTest = Test<EventDynamicPacketUseFixture<0, 1>>;
-HWTEST2_F(EventSignalAllPacketsTest, givenDynamicPacketEstimationWhenImmediateEventSignalMaxPacketThenAllPacketCompletionSignaled, IsAtLeastXeHpCore) {
-    testSignalAllPackets(Event::STATE_SIGNALED, ZE_RESULT_NOT_READY, 0, true);
+using EventSignalUsedPacketsTest = Test<EventDynamicPacketUseFixture<0>>;
+HWTEST2_F(EventSignalUsedPacketsTest, givenDynamicPacketEstimationWhenImmediateSignalUsedPacketThenUsedPacketCompletionSignaled, IsAtLeastXeCore) {
+    testSignalAllPackets(Event::STATE_CLEARED, ZE_RESULT_SUCCESS, 0);
 }
 
-HWTEST2_F(EventSignalAllPacketsTest, givenDynamicPacketEstimationWhenTimestampEventSignalMaxPacketThenAllPacketCompletionSignaled, IsAtLeastXeHpCore) {
-    testSignalAllPackets(Event::STATE_SIGNALED, ZE_RESULT_NOT_READY, ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP, true);
+HWTEST2_F(EventSignalUsedPacketsTest, givenDynamicPacketEstimationWhenTimestampSignalUsedPacketThenUsedPacketCompletionSignaled, IsAtLeastXeCore) {
+    testSignalAllPackets(Event::STATE_CLEARED, ZE_RESULT_SUCCESS, ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP);
 }
 
-using EventSignalUsedPacketsTest = Test<EventDynamicPacketUseFixture<0, 0>>;
-HWTEST2_F(EventSignalUsedPacketsTest, givenDynamicPacketEstimationWhenImmediateSignalUsedPacketThenUsedPacketCompletionSignaled, IsAtLeastXeHpCore) {
-    testSignalAllPackets(Event::STATE_CLEARED, ZE_RESULT_SUCCESS, 0, false);
-}
-
-HWTEST2_F(EventSignalUsedPacketsTest, givenDynamicPacketEstimationWhenTimestampSignalUsedPacketThenUsedPacketCompletionSignaled, IsAtLeastXeHpCore) {
-    testSignalAllPackets(Event::STATE_CLEARED, ZE_RESULT_SUCCESS, ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP, false);
-}
-
-void testQueryAllPackets(L0::Event *event, bool singlePacket) {
-    auto result = event->queryStatus();
+void testQueryAllPackets(L0::Event *event) {
+    auto result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 
     uint32_t usedPackets = event->getPacketsInUse();
@@ -3469,24 +8156,9 @@ void testQueryAllPackets(L0::Event *event, bool singlePacket) {
         eventHostAddress = ptrOffset(eventHostAddress, packetSize);
     }
 
-    if (singlePacket) {
-        EXPECT_EQ(maxPackets, usedPackets);
-    } else {
-        result = event->queryStatus();
-        EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+    EXPECT_EQ(maxPackets, usedPackets);
 
-        ASSERT_LT(usedPackets, maxPackets);
-
-        uint32_t remainingPackets = maxPackets - usedPackets;
-        for (uint32_t i = 0; i < remainingPackets; i++) {
-            uint32_t *completionField = reinterpret_cast<uint32_t *>(eventHostAddress);
-            EXPECT_EQ(Event::STATE_INITIAL, *completionField);
-            *completionField = Event::STATE_SIGNALED;
-            eventHostAddress = ptrOffset(eventHostAddress, packetSize);
-        }
-    }
-
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = event->reset();
@@ -3499,10 +8171,10 @@ void testQueryAllPackets(L0::Event *event, bool singlePacket) {
         eventHostAddress = ptrOffset(eventHostAddress, packetSize);
     }
 
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 
-    result = event->hostSignal();
+    result = event->hostSignal(false);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     eventHostAddress = firstPacketAddress;
@@ -3512,37 +8184,23 @@ void testQueryAllPackets(L0::Event *event, bool singlePacket) {
         eventHostAddress = ptrOffset(eventHostAddress, packetSize);
     }
 
-    result = event->queryStatus();
+    result = event->queryStatus(0);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
 
-using TimestampEventAllPacketSignalMultiPacketUseTest = Test<EventUsedPacketSignalFixture<1, 1, 1, 0>>;
-HWTEST2_F(TimestampEventAllPacketSignalMultiPacketUseTest,
-          givenSignalAllEventPacketWhenQueryingAndSignalingTimestampEventThenUseEventMaxPackets,
-          IsAtLeastXeHpCore) {
-    testQueryAllPackets(event.get(), false);
-}
-
-using ImmediateEventAllPacketSignalMultiPacketUseTest = Test<EventUsedPacketSignalFixture<1, 0, 1, 0>>;
-HWTEST2_F(ImmediateEventAllPacketSignalMultiPacketUseTest,
-          givenSignalAllEventPacketWhenQueryingAndSignalingImmediateEventThenUseEventMaxPackets,
-          IsAtLeastXeHpCore) {
-    testQueryAllPackets(event.get(), false);
-}
-
-using TimestampEventAllPacketSignalSinglePacketUseTest = Test<EventUsedPacketSignalFixture<1, 1, 1, 1>>;
+using TimestampEventAllPacketSignalSinglePacketUseTest = Test<EventCompactL3FlushFixture<1, 1, 1>>;
 TEST_F(TimestampEventAllPacketSignalSinglePacketUseTest, givenSignalAllEventPacketWhenQueryingAndSignalingTimestampEventThenUseEventMaxPackets) {
-    testQueryAllPackets(event.get(), true);
+    testQueryAllPackets(event.get());
 }
 
-using ImmediateEventAllPacketSignalSinglePacketUseTest = Test<EventUsedPacketSignalFixture<1, 0, 1, 1>>;
+using ImmediateEventAllPacketSignalSinglePacketUseTest = Test<EventCompactL3FlushFixture<1, 0, 1>>;
 TEST_F(ImmediateEventAllPacketSignalSinglePacketUseTest, givenSignalAllEventPacketWhenQueryingAndSignalingImmediateEventThenUseEventMaxPackets) {
-    testQueryAllPackets(event.get(), true);
+    testQueryAllPackets(event.get());
 }
 
 struct LocalMemoryEnabledDeviceFixture : public DeviceFixture {
     void setUp() {
-        DebugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.EnableLocalMemory.set(1);
         DeviceFixture::setUp();
     }
     void tearDown() {
@@ -3553,10 +8211,15 @@ struct LocalMemoryEnabledDeviceFixture : public DeviceFixture {
 
 using EventTimestampTest = Test<LocalMemoryEnabledDeviceFixture>;
 HWTEST2_F(EventTimestampTest, givenAppendMemoryCopyIsCalledWhenCpuCopyIsUsedAndCopyTimeIsLessThanDeviceTimestampResolutionThenReturnTimstampDifferenceAsOne, IsXeHpcCore) {
-    MockCommandListImmediateHw<gfxCoreFamily> cmdList;
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.ExperimentalForceCopyThroughLock.set(1);
+    ze_command_queue_desc_t queueDesc = {};
+    auto queue = std::make_unique<Mock<CommandQueue>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    queue->isCopyOnlyCommandQueue = true;
+    MockCommandListImmediateHw<FamilyType::gfxCoreFamily> cmdList;
     cmdList.copyThroughLockedPtrEnabled = true;
-    cmdList.initialize(device, NEO::EngineGroupType::Copy, 0u);
-    cmdList.csr = device->getNEODevice()->getInternalEngine().commandStreamReceiver;
+    cmdList.cmdQImmediate = queue.get();
+    cmdList.initialize(device, NEO::EngineGroupType::copy, 0u);
     neoDevice->setOSTime(new NEO::MockOSTimeWithConstTimestamp());
 
     ze_event_pool_desc_t eventPoolDesc = {};
@@ -3567,13 +8230,14 @@ HWTEST2_F(EventTimestampTest, givenAppendMemoryCopyIsCalledWhenCpuCopyIsUsedAndC
     ze_result_t returnValue = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, returnValue));
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
-    auto event = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device));
+    auto event = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, device, returnValue));
     constexpr uint32_t copySize = 1024;
     auto hostPtr = new char[copySize];
     ze_device_mem_alloc_desc_t deviceDesc = {};
     void *devicePtr;
     context->allocDeviceMem(device->toHandle(), &deviceDesc, copySize, 1u, &devicePtr);
-    cmdList.appendMemoryCopy(devicePtr, hostPtr, copySize, event->toHandle(), 0, nullptr, false);
+    CmdListMemoryCopyParams copyParams = {};
+    cmdList.appendMemoryCopy(devicePtr, hostPtr, copySize, event->toHandle(), 0, nullptr, copyParams);
 
     ze_kernel_timestamp_result_t result = {};
     event->queryKernelTimestamp(&result);
@@ -3581,6 +8245,354 @@ HWTEST2_F(EventTimestampTest, givenAppendMemoryCopyIsCalledWhenCpuCopyIsUsedAndC
 
     delete[] hostPtr;
     context->freeMem(devicePtr);
+}
+
+TEST_F(EventTests, givenDefaultDescriptorWhenCreatingCounterBasedEventThenEventWithNoProfilingAndSignalScopeHostAndDeviceScopeWaitIsCreated) {
+    ze_event_handle_t handle = nullptr;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &defaultIntelCounterBasedEventDesc, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+    EXPECT_TRUE(eventObj->isCounterBasedExplicitlyEnabled());
+    EXPECT_FALSE(eventObj->isIpcImported());
+    EXPECT_FALSE(eventObj->isEventTimestampFlagSet());
+    EXPECT_TRUE(eventObj->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+    EXPECT_TRUE(eventObj->isWaitScope(ZE_EVENT_SCOPE_FLAG_DEVICE));
+    EXPECT_EQ(static_cast<uint32_t>(ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE), eventObj->getCounterBasedFlags());
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenNullDescriptorWhenCreatingDeprecatedCbEvent2ThenEventWithNoProfilingAndSignalScopeHostAndDeviceScopeWaitIsCreated) {
+    ze_event_handle_t handle = nullptr;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zexCounterBasedEventCreate2(context, device, nullptr, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+    EXPECT_TRUE(eventObj->isCounterBasedExplicitlyEnabled());
+    EXPECT_FALSE(eventObj->isIpcImported());
+    EXPECT_FALSE(eventObj->isEventTimestampFlagSet());
+    EXPECT_TRUE(eventObj->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+    EXPECT_TRUE(eventObj->isWaitScope(ZE_EVENT_SCOPE_FLAG_DEVICE));
+    EXPECT_EQ(static_cast<uint32_t>(ZEX_COUNTER_BASED_EVENT_FLAG_IMMEDIATE | ZEX_COUNTER_BASED_EVENT_FLAG_NON_IMMEDIATE | ZEX_COUNTER_BASED_EVENT_FLAG_HOST_VISIBLE), eventObj->getCounterBasedFlags());
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenDescriptorWithExternalFlagWhenCreatingCounterBasedEventThenEventWithExternalFlagIsCreated) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+    EXPECT_TRUE(eventObj->isCounterBasedExplicitlyEnabled());
+    EXPECT_TRUE(eventObj->isExternalEvent());
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenHostTimestampFlagWhenCreatingCounterBasedEventThenTimestampStorageIsAllocated) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_TIMESTAMP;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+    EXPECT_TRUE(eventObj->isEventTimestampFlagSet());
+    EXPECT_TRUE(eventObj->hasKernelMappedTsCapability);
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenDeviceTimestampFlagWhenCreatingCounterBasedEventThenTimestampStorageIsAllocatedWithoutMappedCapability) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+    EXPECT_TRUE(eventObj->isEventTimestampFlagSet());
+    EXPECT_FALSE(eventObj->hasKernelMappedTsCapability);
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenNoTimestampFlagsWhenCreatingCounterBasedEventThenTimestampStorageIsNotAllocated) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    auto eventObj = Event::fromHandle(handle);
+    EXPECT_FALSE(eventObj->isEventTimestampFlagSet());
+    EXPECT_FALSE(eventObj->hasKernelMappedTsCapability);
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenCounterBasedEventCreatedWithAdditionalFlagsWhenQueryingCounterBasedFlagsThenAllCreationFlagsAreReturned) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_TIMESTAMP;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    ze_event_counter_based_flags_t flags = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, Event::fromHandle(handle)->getCounterBasedFlags(&flags));
+    EXPECT_EQ(static_cast<uint32_t>(desc.flags), flags);
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenCounterBasedEventCreatedWithTimestampAndExternalFlagsWhenQueryingCounterBasedFlagsThenAllCreationFlagsAreReturned) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP | ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    ze_event_counter_based_flags_t flags = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, Event::fromHandle(handle)->getCounterBasedFlags(&flags));
+    EXPECT_EQ(static_cast<uint32_t>(desc.flags), flags);
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenNoImmediateFlagsWhenCreatingCounterBasedEventThenImmediateIsAddedToReportedFlags) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+
+    ze_event_counter_based_flags_t flags = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, Event::fromHandle(handle)->getCounterBasedFlags(&flags));
+    EXPECT_EQ(static_cast<uint32_t>(ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_HOST_VISIBLE), flags);
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenUndefinedFlagWhenCreatingCounterBasedEventThenReturnInvalidEnumeration) {
+    constexpr uint32_t firstUndefinedFlag = ZE_EVENT_COUNTER_BASED_FLAG_GRAPH_EXTERNAL << 1;
+
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | firstUndefinedFlag;
+
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ENUMERATION, zeEventCounterBasedCreate(context, device, &desc, &handle));
+    EXPECT_EQ(nullptr, handle);
+
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &desc, &handle));
+    zeEventDestroy(handle);
+}
+
+TEST_F(EventTests, givenBothTimestampFlagsWhenCreatingCounterBasedEventThenReturnError) {
+    ze_event_handle_t handle = nullptr;
+    ze_event_counter_based_desc_t desc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    desc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP | ZE_EVENT_COUNTER_BASED_FLAG_HOST_TIMESTAMP;
+
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zeEventCounterBasedCreate(context, device, &desc, &handle));
+    EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(EventTests, givenInvalidExtensionArgumentWhenCreatingEventThenDoNotAbortAndReturnErrorCode) {
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+    eventPoolDesc.count = 2;
+    ze_result_t returnValue;
+    auto eventPool = std::unique_ptr<L0::EventPool>(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, returnValue));
+
+    ze_event_counter_based_external_sync_allocation_desc_t externalSyncAllocProperties = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_EXTERNAL_SYNC_ALLOCATION_DESC};
+    ze_event_desc_t eventDesc = {};
+    eventDesc.pNext = &externalSyncAllocProperties;
+
+    auto event0 = Event::create<uint32_t>(eventPool.get(), &eventDesc, device, returnValue);
+    EXPECT_EQ(event0, nullptr);
+    EXPECT_EQ(returnValue, ZE_RESULT_ERROR_INVALID_ARGUMENT);
+
+    ze_event_counter_based_external_aggregate_storage_desc_t externalStorageAllocProperties = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_EXTERNAL_AGGREGATE_STORAGE_DESC};
+    eventDesc.pNext = &externalStorageAllocProperties;
+
+    auto event1 = Event::create<uint32_t>(eventPool.get(), &eventDesc, device, returnValue);
+    EXPECT_EQ(event1, nullptr);
+    EXPECT_EQ(returnValue, ZE_RESULT_ERROR_INVALID_ARGUMENT);
+}
+
+HWTEST_F(EventTests, givenCounterBasedEventMaxValueQueryWhenCallingApiThenReturnLimitMatchingInOrderCounterWidth) {
+    uint64_t maxValue = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeDeviceGetCounterBasedEventMaxValue(device->toHandle(), &maxValue));
+
+    auto &l0GfxCoreHelper = device->getL0GfxCoreHelper();
+
+    if constexpr (FamilyType::isQwordInOrderCounter) {
+        EXPECT_EQ(std::numeric_limits<uint64_t>::max(), maxValue);
+    } else {
+        EXPECT_EQ(static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()), maxValue);
+    }
+
+    EXPECT_EQ(l0GfxCoreHelper.getCounterBasedEventMaxValue(), maxValue);
+    EXPECT_EQ(sizeof(uint64_t) == l0GfxCoreHelper.getCmdListWaitOnMemoryDataSize(), maxValue == std::numeric_limits<uint64_t>::max());
+}
+
+TEST_F(EventTests, givenNullArgumentsWhenQueryingCounterBasedEventMaxValueThenReturnError) {
+    uint64_t maxValue = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NULL_HANDLE, zeDeviceGetCounterBasedEventMaxValue(nullptr, &maxValue));
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NULL_POINTER, zeDeviceGetCounterBasedEventMaxValue(device->toHandle(), nullptr));
+}
+
+TEST_F(EventTests, givenCompletionValueExceedingMaxValueWhenCreatingCbEventWithExternalSyncAllocThenReturnError) {
+    const uint64_t maxValue = device->getL0GfxCoreHelper().getCounterBasedEventMaxValue();
+    if (maxValue == std::numeric_limits<uint64_t>::max()) {
+        GTEST_SKIP();
+    }
+
+    uint64_t counter = 0;
+
+    ze_event_counter_based_external_sync_allocation_desc_t externalSyncAllocProperties = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_EXTERNAL_SYNC_ALLOCATION_DESC};
+    externalSyncAllocProperties.deviceAddress = &counter;
+    externalSyncAllocProperties.hostAddress = &counter;
+    externalSyncAllocProperties.completionValue = maxValue + 1;
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE;
+    counterBasedDesc.pNext = &externalSyncAllocProperties;
+
+    ze_event_handle_t handle = nullptr;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zeEventCounterBasedCreate(context, device, &counterBasedDesc, &handle));
+    EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(EventTests, givenCompletionValueExceedingMaxValueWhenCreatingCbEventWithExternalStorageThenReturnErrorAndAcceptValueAtLimit) {
+    const uint64_t maxValue = device->getL0GfxCoreHelper().getCounterBasedEventMaxValue();
+    if (maxValue == std::numeric_limits<uint64_t>::max()) {
+        GTEST_SKIP();
+    }
+
+    void *deviceAlloc = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, context->allocDeviceMem(device->toHandle(), &deviceDesc, sizeof(uint64_t), 4096u, &deviceAlloc));
+
+    ze_event_counter_based_external_aggregate_storage_desc_t externalStorageAllocProperties = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_EXTERNAL_AGGREGATE_STORAGE_DESC};
+    externalStorageAllocProperties.deviceAddress = reinterpret_cast<uint64_t *>(deviceAlloc);
+    externalStorageAllocProperties.incrementValue = 1;
+    externalStorageAllocProperties.completionValue = maxValue + 1;
+
+    ze_event_counter_based_desc_t counterBasedDesc = {ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC};
+    counterBasedDesc.flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE | ZE_EVENT_COUNTER_BASED_FLAG_NON_IMMEDIATE;
+    counterBasedDesc.pNext = &externalStorageAllocProperties;
+
+    ze_event_handle_t handle = nullptr;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zeEventCounterBasedCreate(context, device, &counterBasedDesc, &handle));
+    EXPECT_EQ(nullptr, handle);
+
+    externalStorageAllocProperties.completionValue = maxValue;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context, device, &counterBasedDesc, &handle));
+    ASSERT_NE(nullptr, handle);
+    zeEventDestroy(handle);
+
+    context->freeMem(deviceAlloc);
+}
+
+TEST_F(EventTests, givenNotCounterBasedEventWhenCallingGetCounterBasedFlagsThenReturnSuccessAndFlagsAreZero) {
+    ze_event_counter_based_flags_t flags{};
+    auto result = event->getCounterBasedFlags(&flags);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(0u, flags);
+    EXPECT_FALSE(event->isCounterBased());
+}
+
+TEST_F(EventTests, givenCounterBasedEventWhenCallingGetCounterBasedFlagsThenReturnSuccessAndCorrectFlags) {
+    event->enableCounterBasedMode(true, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    ze_event_counter_based_flags_t flags{};
+    auto result = event->getCounterBasedFlags(&flags);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE, flags);
+    EXPECT_TRUE(event->isCounterBased());
+}
+
+TEST_F(EventTests, givenImplicitlyEnabledCounterBasedEventWhenResetThenModeReturnsToInitialAndCanBeEnabledAgain) {
+    ze_event_counter_based_flags_t flags{};
+
+    event->enableCounterBasedMode(false, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    EXPECT_TRUE(event->isCounterBased());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->getCounterBasedFlags(&flags));
+    EXPECT_EQ(ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE, flags);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->reset());
+    EXPECT_FALSE(event->isCounterBased());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->getCounterBasedFlags(&flags));
+    EXPECT_EQ(0u, flags);
+
+    event->enableCounterBasedMode(false, ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE);
+    EXPECT_TRUE(event->isCounterBased());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, event->getCounterBasedFlags(&flags));
+    EXPECT_EQ(ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE, flags);
+}
+
+using CounterBasedEventTests = Test<CounterBasedEventFixture>;
+TEST_F(CounterBasedEventTests, givenEventCreatedWithCounterBasedEventPoolAndCallingGetCounterBasedEventFlagsThenEventIsCounterBasedAndCorrectFlagsReturned) {
+    EXPECT_TRUE(event->isCounterBased());
+    ze_event_counter_based_flags_t counterBasedEventFlags{};
+    auto result = event->getCounterBasedFlags(&counterBasedEventFlags);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    constexpr uint32_t counterBasedEventPoolFlag = ZE_EVENT_POOL_COUNTER_BASED_EXP_FLAG_IMMEDIATE;
+    EXPECT_EQ(counterBasedEventPoolFlag, counterBasedEventFlags);
+}
+
+TEST_F(CounterBasedEventTests, givenCbEventWithApiRequiredExternalFlagSetWhenSettingGraphInternalThenEventIsNotSetAsInternal) {
+    EXPECT_TRUE(event->isCounterBased());
+    event->setApiRequiredGraphExternalEvent(true);
+    EXPECT_TRUE(event->getApiRequiredGraphExternalEvent());
+    event->setIsSignalledAsGraphInternalEvent(true);
+    EXPECT_FALSE(event->getIsSignalledAsGraphInternalEvent());
+}
+
+using EventTemporaryAllocationCleanupTest = Test<DeviceFixture>;
+
+HWTEST_F(EventTemporaryAllocationCleanupTest,
+         givenRecordedCleanupTaskCountWhenHandleSuccessfulHostSynchronizationThenTemporaryAllocationsUpToEventCompletionAreFreedAndLaterOnesAreKept) {
+    struct MockCleanupEvent : public L0::EventImp<uint32_t> {
+        MockCleanupEvent(int index, L0::Device *device) : EventImp(index, device, false) {}
+        using L0::EventImp<uint32_t>::handleSuccessfulHostSynchronization;
+    };
+
+    auto csr = neoDevice->getDefaultEngine().commandStreamReceiver;
+    const auto contextId = csr->getOsContext().getContextId();
+    auto memoryManager = neoDevice->getMemoryManager();
+
+    constexpr TaskCountType eventTaskCount = 10u;
+
+    auto mockEvent = std::make_unique<MockCleanupEvent>(0, device);
+    mockEvent->setCsr(csr, true);
+    mockEvent->setCleanupTaskCount(csr, eventTaskCount);
+
+    // Simulate a CSR tag that lags the event's real completion. The fix must clean based on the
+    // recorded event completion, not this stale live value, so a stale tag must not affect the result.
+    *csr->getTagAddress() = eventTaskCount - 1u;
+
+    auto &temporaryAllocations = memoryManager->getTemporaryAllocationsList();
+
+    // Pin whose work is covered by the synchronized event (task count == event's) -> must be freed.
+    auto completedAllocation = memoryManager->allocateGraphicsMemoryWithProperties(
+        NEO::MockAllocationProperties{neoDevice->getRootDeviceIndex(), MemoryConstants::pageSize});
+    completedAllocation->setHostPtrTaskCountAssignment(0);
+    completedAllocation->updateTaskCount(eventTaskCount, contextId);
+    csr->getInternalAllocationStorage()->storeAllocationWithTaskCount(
+        std::unique_ptr<NEO::GraphicsAllocation>(completedAllocation), NEO::AllocationUsage::TEMPORARY_ALLOCATION, eventTaskCount);
+
+    // Later, still in-flight pin (task count beyond the event's completion) -> must be kept.
+    auto laterAllocation = memoryManager->allocateGraphicsMemoryWithProperties(
+        NEO::MockAllocationProperties{neoDevice->getRootDeviceIndex(), MemoryConstants::pageSize});
+    laterAllocation->setHostPtrTaskCountAssignment(0);
+    laterAllocation->updateTaskCount(eventTaskCount + 2u, contextId);
+    csr->getInternalAllocationStorage()->storeAllocationWithTaskCount(
+        std::unique_ptr<NEO::GraphicsAllocation>(laterAllocation), NEO::AllocationUsage::TEMPORARY_ALLOCATION, eventTaskCount + 2u);
+
+    ASSERT_EQ(2u, temporaryAllocations.peekHead()->countThisAndAllConnected());
+
+    mockEvent->handleSuccessfulHostSynchronization();
+
+    ASSERT_EQ(1u, temporaryAllocations.peekHead()->countThisAndAllConnected());
+    EXPECT_EQ(laterAllocation, temporaryAllocations.peekHead());
+
+    csr->getInternalAllocationStorage()->getTemporaryAllocations().freeAllGraphicsAllocations(neoDevice);
 }
 
 } // namespace ult

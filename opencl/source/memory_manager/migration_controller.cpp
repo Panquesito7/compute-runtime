@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -59,7 +59,7 @@ void MigrationController::migrateMemory(Context &context, MemoryManager &memoryM
     } else {
 
         auto srcCmdQ = context.getSpecialQueue(sourceRootDeviceIndex);
-        if (srcMemory->getAllocationType() == AllocationType::IMAGE) {
+        if (srcMemory->getAllocationType() == AllocationType::image) {
             auto pImage = static_cast<Image *>(memObj);
             size_t origin[3] = {};
             size_t region[3] = {};
@@ -70,7 +70,7 @@ void MigrationController::migrateMemory(Context &context, MemoryManager &memoryM
             auto pBuffer = static_cast<Buffer *>(memObj);
             srcCmdQ->enqueueReadBuffer(pBuffer, CL_TRUE, 0u, pBuffer->getSize(), hostPtr, nullptr, 0, nullptr, nullptr);
         }
-        srcCmdQ->finish();
+        srcCmdQ->finish(false);
     }
 
     if (dstMemory->isAllocationLockable()) {
@@ -80,7 +80,7 @@ void MigrationController::migrateMemory(Context &context, MemoryManager &memoryM
     } else {
 
         auto dstCmdQ = context.getSpecialQueue(targetRootDeviceIndex);
-        if (dstMemory->getAllocationType() == AllocationType::IMAGE) {
+        if (dstMemory->getAllocationType() == AllocationType::image) {
             auto pImage = static_cast<Image *>(memObj);
             size_t origin[3] = {};
             size_t region[3] = {};
@@ -91,7 +91,7 @@ void MigrationController::migrateMemory(Context &context, MemoryManager &memoryM
             auto pBuffer = static_cast<Buffer *>(memObj);
             dstCmdQ->enqueueWriteBuffer(pBuffer, CL_TRUE, 0u, pBuffer->getSize(), hostPtr, nullptr, 0, nullptr, nullptr);
         }
-        dstCmdQ->finish();
+        dstCmdQ->finish(false);
     }
     migrationSyncData->setCurrentLocation(targetRootDeviceIndex);
 }

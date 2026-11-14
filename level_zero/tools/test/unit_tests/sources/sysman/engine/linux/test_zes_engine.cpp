@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -56,6 +56,7 @@ class ZesEngineFixture : public SysmanDeviceFixture {
         pOriginalPmuInterface = pLinuxSysmanImp->pPmuInterface;
         pLinuxSysmanImp->pDrm = pDrm.get();
         pLinuxSysmanImp->pPmuInterface = pPmuInterface.get();
+        pLinuxSysmanImp->isUsingPrelimEnabledKmd = false;
         pFsAccess->mockReadVal = 23;
 
         pSysmanDeviceImp->pEngineHandleContext->handleList.clear();
@@ -199,6 +200,44 @@ TEST_F(ZesEngineFixture, GivenValidEngineHandleWhenCallingZesEngineGetActivityAn
     }
 }
 
+TEST_F(ZesEngineFixture, GivenPerfEventOpenFailsWhenEnumeratingHandlesThenFailureIsObserved) {
+    pPmuInterface->mockPerfEventFailureReturnValue = -1;
+    std::unique_ptr<LinuxEngineImp> engineImp = std::make_unique<LinuxEngineImp>(pOsSysman, ZES_ENGINE_GROUP_RENDER_SINGLE, 1, 0, false);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, engineImp->isEngineModuleSupported());
+}
+
+TEST_F(ZesEngineFixture, GivenPerfEventOpenFailsWhenEnumeratingHandlesUnsupportedEngineClassIsPassedThenFailureIsObserved) {
+    pPmuInterface->mockPerfEventFailureReturnValue = -1;
+    std::unique_ptr<LinuxEngineImp> engineImp = std::make_unique<LinuxEngineImp>(pOsSysman, ZES_ENGINE_GROUP_RENDER_ALL, 1, 0, false);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, engineImp->isEngineModuleSupported());
+}
+
+TEST_F(ZesEngineFixture, GivenPerfEventOpenFailsBecauseOfHandlesUnavailableThenFailureIsObserved) {
+    pPmuInterface->mockPerfEventFailureReturnValue = -1;
+    {
+        pPmuInterface->mockErrorNumber = EMFILE;
+        std::unique_ptr<LinuxEngineImp> engineImp = std::make_unique<LinuxEngineImp>(pOsSysman, ZES_ENGINE_GROUP_RENDER_SINGLE, 1, 0, false);
+        EXPECT_EQ(ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE, engineImp->isEngineModuleSupported());
+    }
+
+    {
+        pPmuInterface->mockErrorNumber = ENFILE;
+        std::unique_ptr<LinuxEngineImp> engineImp = std::make_unique<LinuxEngineImp>(pOsSysman, ZES_ENGINE_GROUP_RENDER_SINGLE, 1, 0, false);
+        EXPECT_EQ(ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE, engineImp->isEngineModuleSupported());
+    }
+}
+
+TEST_F(ZesEngineFixture, GivenValidEngineHandleWhenCallingZesEngineGetActivityExtThenVerifyFailureIsReturned) {
+    auto handles = getEngineHandles(handleComponentCount);
+    EXPECT_EQ(handleComponentCount, handles.size());
+
+    for (auto handle : handles) {
+        uint32_t count = 0;
+        zes_engine_stats_t stats = {};
+        EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesEngineGetActivityExt(handle, &count, &stats));
+    }
+}
+
 TEST_F(ZesEngineFixture, GivenValidEngineHandleWhenCallingZesEngineGetActivityAndperfEventOpenFailsThenVerifyEngineGetActivityReturnsFailure) {
     pPmuInterface->mockPerfEventFailureReturnValue = -1;
     MockEnginePmuInterfaceImp pPmuInterfaceImp(pLinuxSysmanImp);
@@ -220,7 +259,7 @@ TEST_F(ZesEngineFixture, givenEngineInfoQuerySupportedWhenQueryingEngineInfoThen
     drm->sysmanQueryEngineInfo();
     auto engineInfo = drm->getEngineInfo();
     ASSERT_NE(nullptr, engineInfo);
-    EXPECT_EQ(2u, engineInfo->engines.size());
+    EXPECT_EQ(2u, engineInfo->getEngineInfos().size());
 }
 
 TEST_F(ZesEngineFixture, GivenEngineInfoWithVideoQuerySupportedWhenQueryingEngineInfoWithVideoThenEngineInfoIsCreatedWithEngines) {
@@ -232,7 +271,7 @@ TEST_F(ZesEngineFixture, GivenEngineInfoWithVideoQuerySupportedWhenQueryingEngin
     drm->sysmanQueryEngineInfo();
     auto engineInfo = drm->getEngineInfo();
     ASSERT_NE(nullptr, engineInfo);
-    EXPECT_EQ(2u, engineInfo->engines.size());
+    EXPECT_EQ(2u, engineInfo->getEngineInfos().size());
 }
 
 TEST_F(ZesEngineFixture, GivenEngineInfoWithVideoQueryFailsThenFailureIsReturned) {

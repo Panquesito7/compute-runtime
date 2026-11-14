@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,7 +17,7 @@ namespace L0 {
 
 class OsPci;
 struct OsSysman;
-class PciImp : public Pci, NEO::NonCopyableOrMovableClass {
+class PciImp : public Pci, NEO::NonCopyableAndNonMovableClass {
   public:
     void init() override;
     ze_result_t pciStaticProperties(zes_pci_properties_t *pProperties) override;
@@ -25,7 +25,7 @@ class PciImp : public Pci, NEO::NonCopyableOrMovableClass {
     ze_result_t pciGetState(zes_pci_state_t *pState) override;
     void pciGetStaticFields();
 
-    PciImp(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    PciImp(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     ~PciImp() override;
     OsPci *pOsPci = nullptr;
 

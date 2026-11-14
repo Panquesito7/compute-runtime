@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,33 +7,31 @@
 
 #include "shared/source/os_interface/windows/os_context_win.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
-#include "shared/source/os_interface/debug_env_reader.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/os_interface/windows/hw_device_id.h"
+#include "shared/source/os_interface/windows/sys_calls_wrapper.h"
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 #include "shared/source/os_interface/windows/wddm/wddm_interface.h"
 
 namespace NEO {
 
 OsContext *OsContextWin::create(OSInterface *osInterface, uint32_t rootDeviceIndex, uint32_t contextId, const EngineDescriptor &engineDescriptor) {
-    if (osInterface) {
+    if (osInterface && osInterface->getDriverModel()->getDriverModelType() == DriverModelType::wddm) {
         return new OsContextWin(*osInterface->getDriverModel()->as<Wddm>(), rootDeviceIndex, contextId, engineDescriptor);
     }
     return new OsContext(rootDeviceIndex, contextId, engineDescriptor);
 }
 
-OsContextWin::OsContextWin(Wddm &wddm, uint32_t rootDeviceIndex, uint32_t contextId, const EngineDescriptor &engineDescriptor)
-    : OsContext(rootDeviceIndex, contextId, engineDescriptor),
-      residencyController(wddm, contextId),
-      wddm(wddm) {
-}
+OsContextWin::OsContextWin(Wddm &wddm, uint32_t rootDeviceIndex, uint32_t contextId, const EngineDescriptor &engineDescriptor) : OsContext(rootDeviceIndex, contextId, engineDescriptor), wddm(wddm) {}
 
 bool OsContextWin::initializeContext() {
 
-    NEO::EnvironmentVariableReader envReader;
-    bool disableContextCreationFlag = envReader.getSetting("NEO_L0_SYSMAN_NO_CONTEXT_MODE", false);
-    if (!disableContextCreationFlag) {
+    if (!NEO::debugManager.flags.NEO_L0_SYSMAN_NO_CONTEXT_MODE.get()) {
         if (wddm.getRootDeviceEnvironment().executionEnvironment.isDebuggingEnabled()) {
             debuggableContext = wddm.getRootDeviceEnvironment().osInterface->isDebugAttachAvailable() && !isInternalEngine();
         }
@@ -44,24 +42,35 @@ bool OsContextWin::initializeContext() {
             UNRECOVERABLE_IF(!wddmInterface->createHwQueue(*this));
         }
         UNRECOVERABLE_IF(!wddmInterface->createMonitoredFence(*this));
-
-        residencyController.registerCallback();
-        UNRECOVERABLE_IF(!residencyController.isInitialized());
     }
 
     return true;
-};
+}
 
 void OsContextWin::reInitializeContext() {
-    NEO::EnvironmentVariableReader envReader;
-    bool disableContextCreationFlag = envReader.getSetting("NEO_L0_SYSMAN_NO_CONTEXT_MODE", false);
-    if (!disableContextCreationFlag) {
+    if (!NEO::debugManager.flags.NEO_L0_SYSMAN_NO_CONTEXT_MODE.get() && !isPartOfContextGroup()) {
         if (contextInitialized && (false == this->wddm.skipResourceCleanup())) {
+            stopLatePreemptionStartWait();
+            wddm.getWddmInterface()->destroyHwQueue(hardwareQueue.handle);
             wddm.destroyContext(wddmContextHandle);
         }
+        releaseMonitoredFenceKmdWaitEvent();
         UNRECOVERABLE_IF(!wddm.createContext(*this));
+        auto wddmInterface = wddm.getWddmInterface();
+        if (wddmInterface->hwQueuesSupported()) {
+            UNRECOVERABLE_IF(!wddmInterface->createHwQueue(*this));
+            UNRECOVERABLE_IF(!wddmInterface->createMonitoredFence(*this));
+        }
     }
-};
+}
+
+void OsContextWin::resetMonitoredFenceParams(D3DKMT_HANDLE &handle, uint64_t *cpuAddress, D3DGPU_VIRTUAL_ADDRESS &gpuAddress) {
+    monitoredFence.lastSubmittedFence = 0;
+    monitoredFence.currentFenceValue = 1;
+    monitoredFence.fenceHandle = handle;
+    monitoredFence.cpuAddress = cpuAddress;
+    monitoredFence.gpuAddress = gpuAddress;
+}
 
 void OsContextWin::getDeviceLuidArray(std::vector<uint8_t> &luidData, size_t arraySize) {
     auto *wddm = this->getWddm();
@@ -78,7 +87,7 @@ void OsContextWin::getDeviceLuidArray(std::vector<uint8_t> &luidData, size_t arr
             luidData.emplace(luidData.end(), luidArray[i - 4]);
         }
     }
-};
+}
 
 uint32_t OsContextWin::getDeviceNodeMask() {
     auto *wddm = this->getWddm();
@@ -86,15 +95,48 @@ uint32_t OsContextWin::getDeviceNodeMask() {
     return hwDeviceID->getAdapterNodeMask();
 }
 
+WddmResidencyController &OsContextWin::getResidencyController() { return wddm.getResidencyController(); }
+
 uint64_t OsContextWin::getOfflineDumpContextId(uint32_t deviceIndex) const {
     return 0;
 }
 
+bool OsContextWin::isDirectSubmissionSupported() const {
+    auto &rootDeviceEnvironment = wddm.getRootDeviceEnvironment();
+    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
+    auto isWSL = rootDeviceEnvironment.isWddmOnLinux();
+
+    return !isWSL && productHelper.isDirectSubmissionSupported();
+}
+
+bool OsContextWin::checkLatePreemptionStartSupport() {
+    auto &hwInfo = *wddm.getRootDeviceEnvironment().getHardwareInfo();
+    return wddm.isLatePreemptionStartSupported(hwInfo) && isLatePreemptionStartTarget();
+}
+
 OsContextWin::~OsContextWin() {
     if (contextInitialized && (false == this->wddm.skipResourceCleanup())) {
+        stopLatePreemptionStartWait();
         wddm.getWddmInterface()->destroyHwQueue(hardwareQueue.handle);
-        wddm.getWddmInterface()->destroyMonitorFence(residencyController.getMonitoredFence());
-        wddm.destroyContext(wddmContextHandle);
+        if (getMonitoredFence().fenceHandle != hardwareQueue.progressFenceHandle) {
+            wddm.getWddmInterface()->destroyMonitorFence(getMonitoredFence().fenceHandle);
+        }
+
+        if (!isPartOfContextGroup() ||
+            (isPartOfContextGroup() && getPrimaryContext() == nullptr)) {
+            wddm.destroyContext(wddmContextHandle);
+        }
+    }
+    releaseMonitoredFenceKmdWaitEvent();
+}
+
+void OsContextWin::releaseMonitoredFenceKmdWaitEvent() {
+    std::lock_guard lock(monitoredFenceKmdWaitData.mutex);
+    auto eventHandle = monitoredFenceKmdWaitData.eventHandle;
+    monitoredFenceKmdWaitData.eventHandle = nullptr;
+    monitoredFenceKmdWaitData.pendingFenceValue = 0;
+    if (eventHandle != nullptr) {
+        SysCalls::closeHandle(eventHandle);
     }
 }
 

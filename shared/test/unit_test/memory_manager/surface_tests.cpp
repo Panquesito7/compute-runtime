@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -27,7 +27,7 @@ using namespace NEO;
 typedef ::testing::Types<NullSurface, HostPtrSurface, GeneralSurface> SurfaceTypes;
 
 namespace createSurface {
-template <typename surfType>
+template <typename SurfType>
 Surface *create(char *data, GraphicsAllocation *gfxAllocation);
 
 template <>
@@ -52,7 +52,7 @@ class SurfaceTest : public ::testing::Test {
     MockGraphicsAllocation gfxAllocation;
 };
 
-TYPED_TEST_CASE(SurfaceTest, SurfaceTypes);
+TYPED_TEST_SUITE(SurfaceTest, SurfaceTypes);
 
 HWTEST_TYPED_TEST(SurfaceTest, GivenSurfaceWhenInterfaceIsUsedThenSurfaceBehavesCorrectly) {
     int32_t execStamp;
@@ -150,4 +150,35 @@ HWTEST_F(GeneralSurfaceTest, givenGeneralSurfaceWhenMigrationNotNeededThenMoveTo
 
     surface->makeResident(*csr);
     EXPECT_EQ(pageFaultManagerPtr->moveAllocationToGpuDomainCalled, 0);
+}
+
+using SystemMemorySurfaceTest = ::testing::Test;
+
+HWTEST_F(SystemMemorySurfaceTest, givenSystemMemorySurfaceWhenMakeResidentCalledThenNoAction) {
+    int32_t execStamp;
+    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+    auto memoryManager = std::make_unique<MockMemoryManager>();
+    executionEnvironment->memoryManager.reset(memoryManager.release());
+    DeviceBitfield deviceBitfield(1);
+    auto csr = std::make_unique<MockCsr<FamilyType>>(execStamp, *executionEnvironment, 0, deviceBitfield);
+    auto hwInfo = *defaultHwInfo;
+    auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
+    auto engine = gfxCoreHelper.getGpgpuEngineInstances(*executionEnvironment->rootDeviceEnvironments[0])[0];
+    auto osContext = executionEnvironment->memoryManager->createAndRegisterOsContext(csr.get(), EngineDescriptorHelper::getDefaultDescriptor(engine, PreemptionHelper::getDefaultPreemptionMode(hwInfo)));
+    csr->setupContext(*osContext);
+
+    SystemMemorySurface surface;
+    EXPECT_NE(nullptr, &surface);
+    surface.makeResident(*csr);
+
+    EXPECT_EQ(0u, csr->madeResidentGfxAllocations.size());
+}
+
+HWTEST_F(SystemMemorySurfaceTest, givenSystemMemorySurfaceWhenDuplicateCalledThenNewInstanceReturned) {
+    SystemMemorySurface surface;
+    EXPECT_NE(nullptr, &surface);
+    auto duplicatedSurface = std::unique_ptr<Surface>(surface.duplicate());
+
+    ASSERT_NE(nullptr, duplicatedSurface);
+    EXPECT_NE(static_cast<Surface *>(&surface), duplicatedSurface.get());
 }

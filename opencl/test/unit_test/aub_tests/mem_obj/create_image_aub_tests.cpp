@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,10 +9,11 @@
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/context/context.h"
+#include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/source/platform/platform.h"
 #include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
-#include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 #include <memory>
 
@@ -24,8 +25,7 @@ static const unsigned int testImageDimensions = 17;
 auto const elementSize = 4; // sizeof CL_RGBA * CL_UNORM_INT8
 
 struct AUBCreateImage
-    : public CommandDeviceFixture,
-      public AUBCommandStreamFixture,
+    : public AUBCommandStreamFixture,
       public ::testing::Test {
     typedef AUBCommandStreamFixture CommandStreamFixture;
 
@@ -35,8 +35,7 @@ struct AUBCreateImage
         if (!(defaultHwInfo->capabilityTable.supportsImages)) {
             GTEST_SKIP();
         }
-        CommandDeviceFixture::setUp(cl_command_queue_properties(0));
-        CommandStreamFixture::setUp(pCmdQ);
+        CommandStreamFixture::setUp();
 
         imageFormat.image_channel_data_type = CL_UNORM_INT8;
         imageFormat.image_channel_order = CL_RGBA;
@@ -56,7 +55,6 @@ struct AUBCreateImage
     void TearDown() override {
         image.reset();
         CommandStreamFixture::tearDown();
-        CommandDeviceFixture::tearDown();
     }
 
     std::unique_ptr<Image> image;
@@ -84,10 +82,11 @@ HWTEST_F(AUBCreateImageArray, Given1DImageArrayThenExpectationsMet) {
     imageDesc.image_type = CL_MEM_OBJECT_IMAGE1D_ARRAY;
     imageDesc.image_height = 1;
     cl_mem_flags flags = CL_MEM_COPY_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     auto imageDescriptor = Image::convertDescriptor(imageDesc);
     auto imgInfo = MockGmm::initImgInfo(imageDescriptor, 0, &surfaceFormat->surfaceFormat);
-    imgInfo.linearStorage = productHelper.isLinearStoragePreferred(false, Image::isImage1d(imageDesc), false);
+    imgInfo.linearStorage = productHelper.isLinearStoragePreferred(Image::isImage1d(imageDesc), false);
+    imgInfo.useLocalMemory = device->getMemoryManager()->isLocalMemorySupported(device->getRootDeviceIndex());
     auto queryGmm = MockGmm::queryImgParams(pDevice->getGmmHelper(), imgInfo, false);
 
     // allocate host_ptr
@@ -118,7 +117,7 @@ HWTEST_F(AUBCreateImageArray, Given1DImageArrayThenExpectationsMet) {
     EXPECT_EQ(image->getImageDesc().image_row_pitch, imgInfo.rowPitch);
     EXPECT_GE(image->getImageDesc().image_slice_pitch, image->getImageDesc().image_row_pitch);
     EXPECT_EQ(image->getQPitch(), imgInfo.qPitch);
-    EXPECT_EQ(image->getCubeFaceIndex(), static_cast<uint32_t>(__GMM_NO_CUBE_MAP));
+    EXPECT_EQ(image->getCubeFaceIndex(), gmmNoCubeMap);
 
     auto imageHeight = imageDesc.image_height;
     std::unique_ptr<uint32_t[]> readMemory(new uint32_t[image->getSize() / sizeof(uint32_t)]);
@@ -143,16 +142,18 @@ HWTEST_F(AUBCreateImageArray, Given1DImageArrayThenExpectationsMet) {
 
     auto address = (int *)image->getCpuAddress();
     auto currentCounter = 0;
+    bool isLocalMem = !MemoryPoolHelper::isSystemMemoryPool(image->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex())->getMemoryPool());
     for (auto array = 0u; array < imageDesc.image_array_size; array++) {
         for (auto height = 0u; height < imageHeight; height++) {
-            for (auto element = 0u; element < imageDesc.image_width; element++) {
-                auto offset = (array * imgInfo.slicePitch + element * pixelSize + height * imgInfo.rowPitch) / 4;
-                if (MemoryPoolHelper::isSystemMemoryPool(image->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex())->getMemoryPool()) == false) {
-                    AUBCommandStreamFixture::expectMemory<FamilyType>(&destGpuAddress[offset], &currentCounter, pixelSize);
-                } else {
-                    EXPECT_EQ(currentCounter, address[offset]);
+            auto rowBaseOffset = (array * imgInfo.slicePitch + height * imgInfo.rowPitch) / 4;
+            if (isLocalMem) {
+                AUBCommandStreamFixture::expectMemory<FamilyType>(&destGpuAddress[rowBaseOffset], &hostPtr[currentCounter], imageDesc.image_width * pixelSize);
+                currentCounter += static_cast<int>(imageDesc.image_width);
+            } else {
+                for (auto element = 0u; element < imageDesc.image_width; element++) {
+                    EXPECT_EQ(currentCounter, address[rowBaseOffset + element]);
+                    currentCounter++;
                 }
-                currentCounter++;
             }
         }
     }
@@ -163,10 +164,11 @@ HWTEST_F(AUBCreateImageArray, Given2DImageArrayThenExpectationsMet) {
     imageDesc.image_type = CL_MEM_OBJECT_IMAGE2D_ARRAY;
 
     cl_mem_flags flags = CL_MEM_COPY_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     auto imageDescriptor = Image::convertDescriptor(imageDesc);
     auto imgInfo = MockGmm::initImgInfo(imageDescriptor, 0, &surfaceFormat->surfaceFormat);
-    imgInfo.linearStorage = productHelper.isLinearStoragePreferred(false, Image::isImage1d(imageDesc), false);
+    imgInfo.linearStorage = productHelper.isLinearStoragePreferred(Image::isImage1d(imageDesc), false);
+    imgInfo.useLocalMemory = device->getMemoryManager()->isLocalMemorySupported(device->getRootDeviceIndex());
     auto queryGmm = MockGmm::queryImgParams(pDevice->getGmmHelper(), imgInfo, false);
 
     // allocate host_ptr
@@ -197,7 +199,7 @@ HWTEST_F(AUBCreateImageArray, Given2DImageArrayThenExpectationsMet) {
     EXPECT_EQ(image->getImageDesc().image_row_pitch, imgInfo.rowPitch);
     EXPECT_GE(image->getImageDesc().image_slice_pitch, image->getImageDesc().image_row_pitch);
     EXPECT_EQ(image->getQPitch(), imgInfo.qPitch);
-    EXPECT_EQ(image->getCubeFaceIndex(), static_cast<uint32_t>(__GMM_NO_CUBE_MAP));
+    EXPECT_EQ(image->getCubeFaceIndex(), gmmNoCubeMap);
 
     auto imageHeight = imageDesc.image_height;
     std::unique_ptr<uint32_t[]> readMemory(new uint32_t[image->getSize() / sizeof(uint32_t)]);
@@ -223,16 +225,18 @@ HWTEST_F(AUBCreateImageArray, Given2DImageArrayThenExpectationsMet) {
 
     auto address = (int *)image->getCpuAddress();
     auto currentCounter = 0;
+    bool isLocalMem = !MemoryPoolHelper::isSystemMemoryPool(image->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex())->getMemoryPool());
     for (auto array = 0u; array < imageDesc.image_array_size; array++) {
         for (auto height = 0u; height < imageHeight; height++) {
-            for (auto element = 0u; element < imageDesc.image_width; element++) {
-                auto offset = (array * imgInfo.slicePitch + element * pixelSize + height * imgInfo.rowPitch) / 4;
-                if (MemoryPoolHelper::isSystemMemoryPool(image->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex())->getMemoryPool()) == false) {
-                    AUBCommandStreamFixture::expectMemory<FamilyType>(&destGpuAddress[offset], &currentCounter, pixelSize);
-                } else {
-                    EXPECT_EQ(currentCounter, address[offset]);
+            auto rowBaseOffset = (array * imgInfo.slicePitch + height * imgInfo.rowPitch) / 4;
+            if (isLocalMem) {
+                AUBCommandStreamFixture::expectMemory<FamilyType>(&destGpuAddress[rowBaseOffset], &hostPtr[currentCounter], imageDesc.image_width * pixelSize);
+                currentCounter += static_cast<int>(imageDesc.image_width);
+            } else {
+                for (auto element = 0u; element < imageDesc.image_width; element++) {
+                    EXPECT_EQ(currentCounter, address[rowBaseOffset + element]);
+                    currentCounter++;
                 }
-                currentCounter++;
             }
         }
     }
@@ -274,20 +278,21 @@ static cl_mem_flags copyHostPtrFlags[] = {
 using UseHostPtrTest = AUBCreateImageHostPtr;
 using CopyHostPtrTest = AUBCreateImageHostPtr;
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     CreateImgTest_UseHostPtr,
     UseHostPtrTest,
     testing::ValuesIn(useHostPtrFlags));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     CreateImgTest_CopyHostPtr,
     CopyHostPtrTest,
     testing::ValuesIn(copyHostPtrFlags));
 
 HWTEST_P(CopyHostPtrTest, GivenImageWithDoubledRowPitchWhenCreatedWithCopyHostPtrFlagThenHasProperRowPitchSet) {
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     auto imageDescriptor = Image::convertDescriptor(imageDesc);
     auto imgInfo = MockGmm::initImgInfo(imageDescriptor, 0, &surfaceFormat->surfaceFormat);
+    imgInfo.useLocalMemory = device->getMemoryManager()->isLocalMemorySupported(device->getRootDeviceIndex());
 
     MockGmm::queryImgParams(pDevice->getGmmHelper(), imgInfo, false);
     auto lineWidth = imageDesc.image_width * elementSize;
@@ -316,7 +321,7 @@ HWTEST_P(CopyHostPtrTest, GivenImageWithDoubledRowPitchWhenCreatedWithCopyHostPt
     EXPECT_EQ(image->getImageDesc().image_slice_pitch, imgInfo.slicePitch);
     EXPECT_GE(image->getImageDesc().image_slice_pitch, image->getImageDesc().image_row_pitch);
     EXPECT_EQ(image->getQPitch(), imgInfo.qPitch);
-    EXPECT_EQ(image->getCubeFaceIndex(), static_cast<uint32_t>(__GMM_NO_CUBE_MAP));
+    EXPECT_EQ(image->getCubeFaceIndex(), gmmNoCubeMap);
 
     // now check if data is properly propagated to image
 
@@ -337,11 +342,12 @@ HWTEST_P(CopyHostPtrTest, GivenImageWithDoubledRowPitchWhenCreatedWithCopyHostPt
         imageStorage = readMemory;
     }
 
+    auto rowSize = imageDesc.image_width * elementSize;
     while (heightToCopy--) {
-        for (unsigned int i = 0; i < imageDesc.image_width * elementSize; i++) {
-            if (isGpuCopy) {
-                AUBCommandStreamFixture::expectMemory<FamilyType>(&imageStorage[i], &data[i], 1);
-            } else {
+        if (isGpuCopy) {
+            AUBCommandStreamFixture::expectMemory<FamilyType>(imageStorage, data, rowSize);
+        } else {
+            for (unsigned int i = 0; i < rowSize; i++) {
                 EXPECT_EQ(imageStorage[i], data[i]);
             }
         }
@@ -349,14 +355,15 @@ HWTEST_P(CopyHostPtrTest, GivenImageWithDoubledRowPitchWhenCreatedWithCopyHostPt
         imageStorage += lineWidth;
     }
 
-    if (readMemory)
+    if (readMemory) {
         delete[] readMemory;
+    }
 }
 
 HWTEST_P(UseHostPtrTest, GivenImageWithRowPitchWhenCreatedWithUseHostPtrFlagThenExpectationsMet) {
     imageDesc.image_width = 546;
     imageDesc.image_height = 1;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     auto imageDescriptor = Image::convertDescriptor(imageDesc);
     auto imgInfo = MockGmm::initImgInfo(imageDescriptor, 0, &surfaceFormat->surfaceFormat);
     MockGmm::queryImgParams(pDevice->getGmmHelper(), imgInfo, false);
@@ -432,11 +439,12 @@ HWTEST_P(UseHostPtrTest, GivenImageWithRowPitchWhenCreatedWithUseHostPtrFlagThen
     bool isGpuCopy = image->isTiledAllocation() || !MemoryPoolHelper::isSystemMemoryPool(
                                                        image->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex())->getMemoryPool());
 
+    auto rowSize = imageDesc.image_width * elementSize;
     while (heightToCopy--) {
-        for (unsigned int i = 0; i < imageDesc.image_width * elementSize; i++) {
-            if (isGpuCopy) {
-                AUBCommandStreamFixture::expectMemory<FamilyType>(&imageStorage[i], &data[i], 1);
-            } else {
+        if (isGpuCopy) {
+            AUBCommandStreamFixture::expectMemory<FamilyType>(imageStorage, data, rowSize);
+        } else {
+            for (unsigned int i = 0; i < rowSize; i++) {
                 EXPECT_EQ(imageStorage[i], data[i]);
             }
         }
@@ -474,7 +482,7 @@ HWTEST_F(AUBCreateImage, GivenImage3DCreatedWithDoubledSlicePitchWhenQueriedForD
         data += inputSlicePitch;
     }
     cl_mem_flags flags = CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     image.reset(Image::create(context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context->getDevice(0)->getDevice()),
                               flags, 0, surfaceFormat, &imageDesc, hostPtr, retVal));
 
@@ -496,11 +504,12 @@ HWTEST_F(AUBCreateImage, GivenImage3DCreatedWithDoubledSlicePitchWhenQueriedForD
         imageStorage = readMemory;
     }
 
+    auto sliceDataSize = imageDesc.image_width * 4 * imageDesc.image_height;
     while (depthToCopy--) {
-        for (unsigned int i = 0; i < imageDesc.image_width * 4 * imageDesc.image_height; i++) {
-            if (isGpuCopy) {
-                AUBCommandStreamFixture::expectMemory<FamilyType>(&imageStorage[i], &data[i], 1);
-            } else {
+        if (isGpuCopy) {
+            AUBCommandStreamFixture::expectMemory<FamilyType>(imageStorage, data, sliceDataSize);
+        } else {
+            for (unsigned int i = 0; i < sliceDataSize; i++) {
                 EXPECT_EQ(imageStorage[i], data[i]);
             }
         }

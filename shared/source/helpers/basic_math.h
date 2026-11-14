@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,7 +9,6 @@
 #include "shared/source/helpers/vec.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -88,56 +87,6 @@ constexpr uint32_t log2(uint64_t value) {
     return exponent;
 }
 
-union FloatConversion {
-    uint32_t u;
-    float f;
-};
-
-// clang-format off
-static const FloatConversion PosInfinity = {0x7f800000};
-static const FloatConversion NegInfinity = {0xff800000};
-static const FloatConversion Nan         = {0x7fc00000};
-// clang-format on
-
-inline uint16_t float2Half(float f) {
-    FloatConversion u;
-    u.f = f;
-
-    uint32_t fsign = (u.u >> 16) & 0x8000;
-    float x = std::fabs(f);
-
-    // Nan
-    if (x != x) {
-        u.u >>= (24 - 11);
-        u.u &= 0x7fff;
-        u.u |= 0x0200; // silence the NaN
-        return u.u | fsign;
-    }
-
-    // overflow
-    if (x >= std::ldexp(1.0f, 16)) {
-        if (x == PosInfinity.f)
-            return 0x7c00 | fsign;
-
-        return 0x7bff | fsign;
-    }
-
-    // underflow
-    if (x < std::ldexp(1.0f, -24))
-        return fsign; // The halfway case can return 0x0001 or 0. 0 is even.
-
-    // half denormal
-    if (x < std::ldexp(1.0f, -14)) {
-        x *= std::ldexp(1.0f, 24);
-        return (uint16_t)((int)x | fsign);
-    }
-
-    u.u &= 0xFFFFE000U;
-    u.u -= 0x38000000U;
-
-    return (u.u >> (24 - 11)) | fsign;
-}
-
 constexpr bool isDivisibleByPowerOfTwoDivisor(uint32_t number, uint32_t divisor) {
     return (number & (divisor - 1)) == 0;
 }
@@ -172,6 +121,10 @@ constexpr T ffs(T v) {
 
 constexpr size_t divideAndRoundUp(size_t dividend, size_t divisor) {
     return (dividend + divisor - 1) / divisor;
+}
+
+constexpr size_t roundUp(size_t value, size_t divisor) {
+    return ((value + divisor - 1) / divisor) * divisor;
 }
 
 } // namespace Math

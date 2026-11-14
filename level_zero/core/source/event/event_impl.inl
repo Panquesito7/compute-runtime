@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,56 +7,105 @@
 
 #include "shared/source/assert_handler/assert_handler.h"
 #include "shared/source/command_container/implicit_scaling.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/command_stream/queue_throttle.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/sub_device.h"
+#include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/in_order_cmd_helpers.h"
+#include "shared/source/helpers/sleep.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
 #include "shared/source/memory_manager/memory_operations_handler.h"
+#include "shared/source/os_interface/os_context.h"
 #include "shared/source/os_interface/os_time.h"
+#include "shared/source/utilities/shared_pool_allocation.h"
+#include "shared/source/utilities/staging_buffer_manager.h"
+#include "shared/source/utilities/wait_util.h"
 
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/event/event_host_synchronize_wait.h"
 #include "level_zero/core/source/event/event_imp.h"
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
 #include "level_zero/core/source/kernel/kernel.h"
+#include "level_zero/driver_experimental/zex_common.h"
 #include "level_zero/tools/source/metrics/metric.h"
+
+#include <chrono>
 
 namespace L0 {
 template <typename TagSizeT>
-Event *Event::create(EventPool *eventPool, const ze_event_desc_t *desc, Device *device) {
+Event *Event::create(const EventDescriptor &eventDescriptor, Device *device, ze_result_t &result) {
     auto neoDevice = device->getNEODevice();
     auto csr = neoDevice->getDefaultEngine().commandStreamReceiver;
-    bool downloadAllocationRequired = csr->isTbxMode();
-
-    auto event = new EventImp<TagSizeT>(eventPool, desc->index, device, downloadAllocationRequired);
-    UNRECOVERABLE_IF(event == nullptr);
-
-    if (eventPool->isEventPoolTimestampFlagSet()) {
-        event->setEventTimestampFlag(true);
-    }
     auto &hwInfo = neoDevice->getHardwareInfo();
 
-    event->signalAllEventPackets = L0GfxCoreHelper::useSignalAllEventPackets(hwInfo);
+    auto event = std::make_unique<EventImp<TagSizeT>>(eventDescriptor.index, device, csr->isTbxMode());
+    UNRECOVERABLE_IF(!event.get());
 
-    auto alloc = eventPool->getAllocation().getGraphicsAllocation(neoDevice->getRootDeviceIndex());
+    event->eventPoolAllocation = eventDescriptor.eventPoolAllocation;
 
-    uint64_t baseHostAddr = reinterpret_cast<uint64_t>(alloc->getUnderlyingBuffer());
-    event->totalEventSize = eventPool->getEventSize();
-    event->eventPoolOffset = desc->index * event->totalEventSize;
-    event->hostAddress = reinterpret_cast<void *>(baseHostAddr + event->eventPoolOffset);
-    event->signalScope = desc->signal;
-    event->waitScope = desc->wait;
-    event->csrs.push_back(csr);
-    event->maxKernelCount = eventPool->getMaxKernelCount();
-    event->maxPacketCount = eventPool->getEventMaxPackets();
-    event->isFromIpcPool = eventPool->getImportedIpcPool();
-
-    event->kernelEventCompletionData =
-        std::make_unique<KernelEventCompletionData<TagSizeT>[]>(event->maxKernelCount);
-
-    bool useContextEndOffset = eventPool->isImplicitScalingCapableFlagSet();
-    int32_t overrideUseContextEndOffset = NEO::DebugManager.flags.UseContextEndOffsetForEventCompletion.get();
-    if (overrideUseContextEndOffset != -1) {
-        useContextEndOffset = !!overrideUseContextEndOffset;
+    if (eventDescriptor.timestampPool) {
+        event->setEventTimestampFlag(true);
+        event->setSinglePacketSize(NEO::TimestampPackets<TagSizeT, NEO::TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize());
     }
-    event->setUsingContextEndOffset(useContextEndOffset);
+    event->hasKernelMappedTsCapability = eventDescriptor.kernelMappedTsPoolFlag;
+
+    void *baseHostAddress = 0;
+    if (event->eventPoolAllocation) {
+        baseHostAddress = event->eventPoolAllocation->getGraphicsAllocation(neoDevice->getRootDeviceIndex())->getUnderlyingBuffer();
+    }
+
+    event->totalEventSize = eventDescriptor.totalEventSize;
+    event->eventPoolOffset = eventDescriptor.index * event->totalEventSize;
+    event->offsetInSharedAlloc = eventDescriptor.offsetInSharedAlloc;
+    event->hostAddressFromPool = ptrOffset(baseHostAddress, event->eventPoolOffset + event->offsetInSharedAlloc);
+    event->signalScope = eventDescriptor.signalScope;
+
+    if (NEO::debugManager.flags.ForceHostSignalScope.get() == 1) {
+        event->signalScope |= ZE_EVENT_SCOPE_FLAG_HOST;
+    }
+    if (NEO::debugManager.flags.ForceHostSignalScope.get() == 0) {
+        event->signalScope &= ~ZE_EVENT_SCOPE_FLAG_HOST;
+    }
+
+    event->waitScope = eventDescriptor.waitScope;
+    event->csrs.push_back(csr);
+    event->maxPacketCount = eventDescriptor.maxPacketsCount;
+    event->isFromIpcPool = eventDescriptor.importedIpcPool;
+    if ((event->isFromIpcPool || eventDescriptor.ipcPool) && (eventDescriptor.counterBasedFlags == 0)) {
+        event->disableImplicitCounterBasedMode();
+    }
+
+    const auto frequency = device->getNEODevice()->getDeviceInfo().profilingTimerResolution;
+    const auto maxKernelTsValue = maxNBitValue(hwInfo.capabilityTable.kernelTimestampValidBits);
+    if (hwInfo.capabilityTable.kernelTimestampValidBits < 64u) {
+        event->timestampRefreshIntervalInNanoSec = static_cast<uint64_t>(maxKernelTsValue * frequency) / 2;
+    } else {
+        event->timestampRefreshIntervalInNanoSec = maxKernelTsValue / 2;
+    }
+    if (NEO::debugManager.flags.EventTimestampRefreshIntervalInMilliSec.get() != -1) {
+        constexpr uint32_t milliSecondsToNanoSeconds = 1000000u;
+        const uint32_t refreshTime = NEO::debugManager.flags.EventTimestampRefreshIntervalInMilliSec.get();
+        event->timestampRefreshIntervalInNanoSec = refreshTime * milliSecondsToNanoSeconds;
+    }
+
+    if (eventDescriptor.counterBasedFlags != 0 || NEO::debugManager.flags.ForceInOrderEvents.get() == 1) {
+        event->enableCounterBasedMode(true, eventDescriptor.counterBasedFlags);
+        if (!event->isFromIpcPool) {
+            if (eventDescriptor.ipcPool) {
+                auto node = device->getInOrderSharableEventDataAllocator()->getTag();
+                node->initialize();
+                event->getInOrderExecEventHelper().initializeFromTagNode(*node, device->getRootDeviceIndex());
+            } else {
+                event->getInOrderExecEventHelper().initializeLocalTempStorage();
+            }
+        }
+        if (eventDescriptor.ipcPool) {
+            event->isSharableCounterBased = true;
+        }
+    }
 
     // do not reset even if it has been imported, since event pool
     // might have been imported after events being already signaled
@@ -64,214 +113,712 @@ Event *Event::create(EventPool *eventPool, const ze_event_desc_t *desc, Device *
         event->resetDeviceCompletionData(true);
     }
 
+    result = event->enableExtensions(eventDescriptor);
+
+    if (result != ZE_RESULT_SUCCESS) {
+        return nullptr;
+    }
+    event->externalEvent = eventDescriptor.externalEvent;
+
+    return event.release();
+}
+
+template <typename TagSizeT>
+Event *Event::create(EventPool *eventPool, const ze_event_desc_t *desc, Device *device, ze_result_t &result) {
+    EventDescriptor eventDescriptor = {
+        .eventPoolAllocation = &eventPool->getAllocation(),
+        .extensions = desc->pNext,
+        .totalEventSize = eventPool->getEventSize(),
+        .maxPacketsCount = eventPool->getEventMaxPackets(),
+        .counterBasedFlags = eventPool->getCounterBasedFlags(),
+        .index = desc->index,
+        .signalScope = desc->signal,
+        .waitScope = desc->wait,
+        .timestampPool = eventPool->isEventPoolTimestampFlagSet(),
+        .kernelMappedTsPoolFlag = eventPool->isEventPoolKernelMappedTsFlagSet(),
+        .importedIpcPool = eventPool->getImportedIpcPool(),
+        .ipcPool = eventPool->isIpcPoolFlagSet(),
+        .externalEvent = false,
+        .hostVisibleEventPoolAllocation = !eventPool->isEventPoolDeviceAllocationFlagSet(),
+    };
+
+    if (eventPool->getCounterBasedFlags() != 0) {
+        eventDescriptor.eventPoolAllocation = nullptr;
+    }
+
+    if (eventPool->getSharedTimestampAllocation()) {
+        eventDescriptor.offsetInSharedAlloc = eventPool->getSharedTimestampAllocation()->getOffset();
+    }
+
+    result = ZE_RESULT_SUCCESS;
+
+    Event *event = Event::create<TagSizeT>(eventDescriptor, device, result);
+
+    if (event) {
+        event->setEventPool(eventPool);
+    }
+
     return event;
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::calculateProfilingData() {
-    constexpr uint32_t skipL3EventPacketIndex = 2u;
-    globalStartTS = kernelEventCompletionData[0].getGlobalStartValue(0);
-    globalEndTS = kernelEventCompletionData[0].getGlobalEndValue(0);
-    contextStartTS = kernelEventCompletionData[0].getContextStartValue(0);
-    contextEndTS = kernelEventCompletionData[0].getContextEndValue(0);
+EventImp<TagSizeT>::EventImp(int index, Device *device, bool tbxMode)
+    : Event(index, device), tbxMode(tbxMode),
+      isHeaplessModeEnabled(device->getCompilerProductHelper().isHeaplessModeEnabled(device->getHwInfo())),
+      isDcFlushAllowed(device->getProductHelper().isDcFlushAllowed()),
+      isNonCoherentTimestampsModeEnabled(device->getProductHelper().isNonCoherentTimestampsModeEnabled()) {
+    contextStartOffset = NEO::TimestampPackets<TagSizeT, NEO::TimestampPacketConstants::preferredPacketCount>::getContextStartOffset();
+    contextEndOffset = NEO::TimestampPackets<TagSizeT, NEO::TimestampPacketConstants::preferredPacketCount>::getContextEndOffset();
+    globalStartOffset = NEO::TimestampPackets<TagSizeT, NEO::TimestampPacketConstants::preferredPacketCount>::getGlobalStartOffset();
+    globalEndOffset = NEO::TimestampPackets<TagSizeT, NEO::TimestampPacketConstants::preferredPacketCount>::getGlobalEndOffset();
+    timestampSizeInDw = (sizeof(TagSizeT) / sizeof(uint32_t));
+    singlePacketSize = device->getL0GfxCoreHelper().getImmediateWritePostSyncOffset();
+}
 
-    auto getEndTS = [](bool &isOverflowed, const std::pair<uint64_t, uint64_t> &currTs, const uint64_t &end) {
-        auto &[currStartTs, currEndTs] = currTs;
+inline uint64_t getEndTimestamp(bool &isOverflowed, const std::pair<uint64_t, uint64_t> &currTs, uint64_t end) {
+    const auto &[currStartTs, currEndTs] = currTs;
 
-        if (isOverflowed == false) {
-            if (currEndTs < currStartTs) {
-                isOverflowed = true;
-                return currEndTs;
-            } else {
-                return std::max(end, currEndTs);
-            }
+    if (isOverflowed == false) {
+        if (currEndTs < currStartTs) {
+            isOverflowed = true;
+            return currEndTs;
         } else {
-            // if already overflowed, then track the endTs of new overflowing ones
-            if (currEndTs < currStartTs) {
-                return std::max(end, currEndTs);
-            }
+            return std::max(end, currEndTs);
         }
-        return end;
-    };
+    } else {
+        // if already overflowed, then track the endTs of new overflowing ones
+        if (currEndTs < currStartTs) {
+            return std::max(end, currEndTs);
+        }
+    }
+    return end;
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::calculateProfilingData() {
+    globalStartTS = kernelEventCompletionData.getGlobalStartValue(0);
+    globalEndTS = kernelEventCompletionData.getGlobalEndValue(0);
+    contextStartTS = kernelEventCompletionData.getContextStartValue(0);
+    contextEndTS = kernelEventCompletionData.getContextEndValue(0);
 
     bool isGlobalTsOverflowed = false;
     bool isContextTsOverflowed = false;
 
-    for (uint32_t kernelId = 0; kernelId < kernelCount; kernelId++) {
-        const auto &eventCompletion = kernelEventCompletionData[kernelId];
-        for (auto packetId = 0u; packetId < eventCompletion.getPacketsUsed(); packetId++) {
-            if (this->l3FlushAppliedOnKernel.test(kernelId) && ((packetId % skipL3EventPacketIndex) != 0)) {
-                continue;
-            }
-            const std::pair<uint64_t, uint64_t> currentGlobal(eventCompletion.getGlobalStartValue(packetId),
-                                                              eventCompletion.getGlobalEndValue(packetId));
-            const std::pair<uint64_t, uint64_t> currentContext(eventCompletion.getContextStartValue(packetId),
-                                                               eventCompletion.getContextEndValue(packetId));
+    // Aggregated storage folds every node and packet into a single packet (slot 0).
+    // Otherwise the additional timestamp nodes are kept as separate packets.
+    uint32_t numPackets = 1;
+    if (!isAggregatedEvent(this)) {
+        numPackets = kernelEventCompletionData.getPacketsUsed() +
+                     static_cast<uint32_t>(inOrderExecHelper.getAdditionalTimestampNodesCount());
+    }
 
-            globalStartTS = std::min(globalStartTS, currentGlobal.first);
-            contextStartTS = std::min(contextStartTS, currentContext.first);
-            globalEndTS = getEndTS(isGlobalTsOverflowed, currentGlobal, globalEndTS);
-            contextEndTS = getEndTS(isContextTsOverflowed, currentContext, contextEndTS);
-        }
+    for (auto packetId = 0u; packetId < numPackets; packetId++) {
+        const std::pair<uint64_t, uint64_t> currentGlobal(kernelEventCompletionData.getGlobalStartValue(packetId),
+                                                          kernelEventCompletionData.getGlobalEndValue(packetId));
+        const std::pair<uint64_t, uint64_t> currentContext(kernelEventCompletionData.getContextStartValue(packetId),
+                                                           kernelEventCompletionData.getContextEndValue(packetId));
+
+        auto calculatedGlobalEndTs = getEndTimestamp(isGlobalTsOverflowed, currentGlobal, globalEndTS);
+        auto calculatedContextEndTs = getEndTimestamp(isContextTsOverflowed, currentContext, contextEndTS);
+        PRINT_STRING(NEO::debugManager.flags.PrintTimestampPacketContents.get(), stdout, "packet: %d, globalStartTS: %llu, globalEndTS: %llu, contextStartTS: %llu, contextEndTS: %llu\n",
+                     packetId, currentGlobal.first, calculatedGlobalEndTs, currentContext.first, calculatedContextEndTs);
+
+        globalStartTS = std::min(globalStartTS, currentGlobal.first);
+        contextStartTS = std::min(contextStartTS, currentContext.first);
+        globalEndTS = calculatedGlobalEndTs;
+        contextEndTS = calculatedContextEndTs;
     }
     return ZE_RESULT_SUCCESS;
+}
+
+template <typename TagSizeT>
+void EventImp<TagSizeT>::clearTimestampTagData(uint32_t partitionCount, NEO::TagNodeBase *newNode) {
+    auto node = newNode;
+    auto hostAddress = node->getCpuBase();
+
+    const std::array<TagSizeT, 4> data = {Event::STATE_INITIAL, Event::STATE_INITIAL, Event::STATE_INITIAL, Event::STATE_INITIAL};
+    constexpr size_t copySize = data.size() * sizeof(TagSizeT);
+
+    for (uint32_t i = 0; i < partitionCount; i++) {
+        memcpy_s(hostAddress, copySize, data.data(), copySize);
+
+        hostAddress = ptrOffset(hostAddress, singlePacketSize);
+    }
+
+    const bool uploadToSimulation = (partitionCount > 0) && !csrs.empty() && (csrs[0]->isTbxMode() || csrs[0]->isAubMode());
+    if (!uploadToSimulation) {
+        return;
+    }
+
+    uint64_t tagOffset = 0;
+    for (uint32_t i = 0; i < partitionCount; i++) {
+        csrs[0]->writeTagAllocationChunkToSimulation(*node, tagOffset, copySize);
+        tagOffset += singlePacketSize;
+    }
 }
 
 template <typename TagSizeT>
 void EventImp<TagSizeT>::assignKernelEventCompletionData(void *address) {
-    for (uint32_t i = 0; i < kernelCount; i++) {
-        uint32_t packetsToCopy = 0;
-        packetsToCopy = kernelEventCompletionData[i].getPacketsUsed();
-        for (uint32_t packetId = 0; packetId < packetsToCopy; packetId++) {
-            kernelEventCompletionData[i].assignDataToAllTimestamps(packetId, address);
-            address = ptrOffset(address, singlePacketSize);
+    if (isAggregatedEvent(this)) {
+        assignAggregatedEventCompletionData();
+        return;
+    }
+
+    const uint32_t packetsUsed = kernelEventCompletionData.getPacketsUsed();
+
+    for (uint32_t packetId = 0; packetId < packetsUsed; packetId++) {
+        kernelEventCompletionData.assignDataToAllTimestamps(packetId, address);
+        address = ptrOffset(address, singlePacketSize);
+    }
+
+    // Account for additional timestamp nodes
+    const uint32_t remainingPackets = packetsUsed * static_cast<uint32_t>(inOrderExecHelper.getAdditionalTimestampNodesCount());
+    if (remainingPackets == 0) {
+        return;
+    }
+
+    uint32_t nodeId = 0;
+    uint32_t normalizedPacketId = 0;
+    for (uint32_t packetId = packetsUsed; packetId < packetsUsed + remainingPackets; packetId++) {
+        if (normalizedPacketId % packetsUsed == 0) {
+            address = inOrderExecHelper.getAdditionalTimestampNode(nodeId++)->getCpuBase();
         }
+
+        kernelEventCompletionData.assignDataToAllTimestamps(packetId, address);
+        address = ptrOffset(address, singlePacketSize);
+        normalizedPacketId++;
     }
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::queryInOrderEventStatus() {
-    auto node = this->inOrderTimestampPacket->peekNodes()[0];
+void EventImp<TagSizeT>::assignAggregatedEventCompletionData() {
+    const uint32_t packetsPerNode = kernelEventCompletionData.getPacketsUsed();
+    uint64_t globalStart = 0;
+    uint64_t contextStart = 0;
+    uint64_t globalEnd = 0;
+    uint64_t contextEnd = 0;
+    bool isGlobalTsOverflowed = false;
+    bool isContextTsOverflowed = false;
+    bool initialized = false;
 
-    bool signaled = true;
+    auto foldNode = [&](NEO::TagNodeBase *node) {
+        for (uint32_t packetId = 0; packetId < packetsPerNode; packetId++) {
+            const void *packetAddress = ptrOffset(node->getCpuBase(), packetId * this->singlePacketSize);
+            const uint64_t currentGlobalStart = *static_cast<const TagSizeT *>(ptrOffset(packetAddress, this->getGlobalStartOffset()));
+            const uint64_t currentContextStart = *static_cast<const TagSizeT *>(ptrOffset(packetAddress, this->getContextStartOffset()));
+            const uint64_t currentGlobalEnd = *static_cast<const TagSizeT *>(ptrOffset(packetAddress, this->getGlobalEndOffset()));
+            const uint64_t currentContextEnd = *static_cast<const TagSizeT *>(ptrOffset(packetAddress, this->getContextEndOffset()));
 
-    for (uint32_t i = 0; i < this->getPacketsInUse(); i++) {
-        auto hostAddress = static_cast<TagSizeT const *>(node->getContextEndAddress(i));
-
-        if (!NEO::WaitUtils::waitFunctionWithPredicate<const TagSizeT>(hostAddress, NEO::TimestampPacketConstants::initValue, std::not_equal_to<TagSizeT>())) {
-            signaled = false;
-            break;
+            if (!initialized) {
+                globalStart = currentGlobalStart;
+                contextStart = currentContextStart;
+                globalEnd = currentGlobalEnd;
+                contextEnd = currentContextEnd;
+                initialized = true;
+            }
+            globalEnd = getEndTimestamp(isGlobalTsOverflowed, {currentGlobalStart, currentGlobalEnd}, globalEnd);
+            contextEnd = getEndTimestamp(isContextTsOverflowed, {currentContextStart, currentContextEnd}, contextEnd);
+            globalStart = std::min<uint64_t>(globalStart, currentGlobalStart);
+            contextStart = std::min<uint64_t>(contextStart, currentContextStart);
         }
+    };
+
+    const uint32_t timestampNodesCount = static_cast<uint32_t>(inOrderExecHelper.getTimestampNodesCount());
+    for (uint32_t nodeId = 0; nodeId < timestampNodesCount; nodeId++) {
+        foldNode(inOrderExecHelper.getTimestampNode(nodeId));
     }
 
-    if (!signaled) {
-        return ZE_RESULT_NOT_READY;
+    const uint32_t additionalNodesCount = static_cast<uint32_t>(inOrderExecHelper.getAdditionalTimestampNodesCount());
+    for (uint32_t nodeId = 0; nodeId < additionalNodesCount; nodeId++) {
+        foldNode(inOrderExecHelper.getAdditionalTimestampNode(nodeId));
+    }
+
+    const std::array<TagSizeT, 4> folded = {static_cast<TagSizeT>(contextStart), static_cast<TagSizeT>(globalStart),
+                                            static_cast<TagSizeT>(contextEnd), static_cast<TagSizeT>(globalEnd)};
+    kernelEventCompletionData.assignDataToAllTimestamps(0, folded.data());
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::queryCounterBasedEventStatus(int64_t timeSinceWait, bool blockOnMiss) {
+    if (!inOrderExecHelper.isDataAssigned()) {
+        return reportEmptyCbEventAsReady ? ZE_RESULT_SUCCESS : ZE_RESULT_NOT_READY;
+    }
+
+    if (!inOrderExecHelper.getBaseHostCpuAddress()) {
+        return ZE_RESULT_ERROR_INVALID_SYNCHRONIZATION_OBJECT;
+    }
+
+    const auto waitValue = getInOrderExecBaseSignalValue();
+    const auto partitionOffset = device->getL0GfxCoreHelper().getImmediateWritePostSyncOffset();
+
+    if (!inOrderExecHelper.isCounterAlreadyDone(waitValue, this->getInOrderAllocationOffset())) {
+        bool signaled = true;
+
+        if (this->cbEventWithProfiling) {
+            this->refreshTimestampCompletionData();
+            signaled = this->isTimestampPopulated();
+        } else {
+            const uint64_t *hostAddress = ptrOffset(inOrderExecHelper.getBaseHostCpuAddress(), inOrderExecHelper.getEventData()->counterOffset);
+            for (uint32_t i = 0; i < inOrderExecHelper.getEventData()->hostPartitions; i++) {
+                if (!NEO::WaitUtils::pollFunctionWithPredicate<const uint64_t>(hostAddress, waitValue, std::greater_equal<uint64_t>(), timeSinceWait,
+                                                                               NEO::WaitUtils::counterValueForEventHostSync,
+                                                                               NEO::WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds, blockOnMiss)) {
+                    signaled = false;
+                    break;
+                }
+
+                hostAddress = ptrOffset(hostAddress, partitionOffset);
+            }
+        }
+
+        if (!signaled) {
+            return ZE_RESULT_NOT_READY;
+        }
+        inOrderExecHelper.setLastWaitedCounterValue(waitValue, this->getInOrderAllocationOffset());
     }
 
     handleSuccessfulHostSynchronization();
 
     return ZE_RESULT_SUCCESS;
+}
+
+template <typename TagSizeT>
+TaskCountType EventImp<TagSizeT>::getTaskCount(const NEO::CommandStreamReceiver &csr) const {
+    auto contextId = csr.getOsContext().getContextId();
+
+    TaskCountType taskCount = getAllocation(this->device) ? getAllocation(this->device)->getTaskCount(contextId) : 0;
+
+    if (inOrderExecHelper.isDataAssigned()) {
+        if (inOrderExecHelper.getDeviceCounterAllocation()) {
+            taskCount = std::max(taskCount, inOrderExecHelper.getDeviceCounterAllocation()->getTaskCount(contextId));
+        } else {
+            DEBUG_BREAK_IF(true); // external allocation - not able to download
+        }
+    }
+
+    return taskCount;
+}
+
+template <typename TagSizeT>
+NEO::WaitStatus EventImp<TagSizeT>::tryKmdWaitForHostSynchronize(NEO::CommandStreamReceiver &csrForCacheFlush,
+                                                                 bool cacheFlushRequiredForHostSync,
+                                                                 TaskCountType &taskCountToWaitForCacheFlush,
+                                                                 bool &taskCountWaitedForCacheFlush,
+                                                                 uint64_t timeoutNanoseconds) {
+    auto isUsableTaskCount = [](TaskCountType taskCount) {
+        return taskCount && (taskCount != NEO::GraphicsAllocation::objectNotUsed);
+    };
+
+    NEO::CommandStreamReceiver *csrForTaskCountWait = nullptr;
+    TaskCountType taskCountToWait = 0;
+    bool cacheFlushTaskCount = false;
+
+    if (cacheFlushRequiredForHostSync) {
+        if (!isUsableTaskCount(taskCountToWaitForCacheFlush)) {
+            taskCountToWaitForCacheFlush = flushTagUpdateForHostSync(csrForCacheFlush);
+        }
+        if (isUsableTaskCount(taskCountToWaitForCacheFlush)) {
+            csrForTaskCountWait = &csrForCacheFlush;
+            taskCountToWait = taskCountToWaitForCacheFlush;
+            cacheFlushTaskCount = true;
+        }
+    }
+
+    if ((csrForTaskCountWait == nullptr) || !isUsableTaskCount(taskCountToWait)) {
+        return NEO::WaitStatus::notReady;
+    }
+
+    auto flushStampToWait = csrForTaskCountWait->obtainCurrentFlushStamp();
+    if (flushStampToWait == 0) {
+        flushStampToWait = taskCountToWait;
+    }
+
+    const auto waitStatus = timeoutNanoseconds == std::numeric_limits<uint64_t>::max()
+                                ? csrForTaskCountWait->waitForTaskCountWithKmdNotifyFallback(taskCountToWait,
+                                                                                             flushStampToWait,
+                                                                                             false,
+                                                                                             NEO::QueueThrottle::LOW)
+                                : csrForTaskCountWait->waitForTaskCountWithKmdNotifyFallback(taskCountToWait,
+                                                                                             flushStampToWait,
+                                                                                             false,
+                                                                                             NEO::QueueThrottle::LOW,
+                                                                                             timeoutNanoseconds);
+    if ((waitStatus == NEO::WaitStatus::ready) && cacheFlushTaskCount) {
+        taskCountWaitedForCacheFlush = true;
+        taskCountToWaitForCacheFlush = 0;
+    }
+    return waitStatus;
+}
+
+template <typename TagSizeT>
+NEO::WaitStatus EventImp<TagSizeT>::tryUserFenceWaitForHostSynchronize(int64_t timeSinceWait) {
+    auto *csr = csrs[0];
+    if (!csr->waitUserFenceSupported(nullptr)) {
+        return NEO::WaitStatus::notReady;
+    }
+
+    if (handlePreQueryStatusOperationsAndCheckCompletion()) {
+        return NEO::WaitStatus::ready;
+    }
+
+    if (isActiveExternalCbEvent() && !isPatchPreambleCounterCompleted(timeSinceWait, true)) {
+        return NEO::WaitStatus::notReady;
+    }
+
+    constexpr auto eventPacketWidth = sizeof(TagSizeT) == sizeof(uint64_t) ? NEO::UserFenceValueWidth::u64 : NEO::UserFenceValueWidth::u32;
+    const bool packetUserFenceWaitSupported = (csr->getActivePartitions() == 1u);
+
+    const int64_t packetWaitTimeout = NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWaitTimeoutNanoseconds.get();
+
+    auto waitForPacket = [&](const void *queryAddress) -> bool {
+        auto typedAddress = static_cast<const TagSizeT *>(queryAddress);
+        const auto clearedValue = static_cast<TagSizeT>(Event::STATE_CLEARED);
+        if (*typedAddress != clearedValue) {
+            return true;
+        }
+
+        return csr->waitUserFence(NEO::UserFenceWaitOperation::notEqual, static_cast<uint64_t>(clearedValue), castToUint64(typedAddress), eventPacketWidth,
+                                  packetWaitTimeout, false, this->externalInterruptId, getAllocation(this->device), nullptr);
+    };
+
+    if (this->cbEventWithProfiling && inOrderExecHelper.hasTimestampNodes()) {
+        if (!packetUserFenceWaitSupported) {
+            return NEO::WaitStatus::notReady;
+        }
+
+        auto waitForTimestampNode = [&](NEO::TagNodeBase *node) -> bool {
+            uint32_t packetsToCheck = kernelEventCompletionData.getPacketsUsed();
+            for (uint32_t packetId = 0; packetId < packetsToCheck; packetId++) {
+                auto queryAddress = ptrOffset(node->getCpuBase(), packetId * this->singlePacketSize + this->getCompletionFieldOffset());
+                if (!waitForPacket(queryAddress)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        for (size_t nodeId = 0; nodeId < inOrderExecHelper.getTimestampNodesCount(); nodeId++) {
+            if (!waitForTimestampNode(inOrderExecHelper.getTimestampNode(nodeId))) {
+                return NEO::WaitStatus::notReady;
+            }
+        }
+        for (size_t nodeId = 0; nodeId < inOrderExecHelper.getAdditionalTimestampNodesCount(); nodeId++) {
+            if (!waitForTimestampNode(inOrderExecHelper.getAdditionalTimestampNode(nodeId))) {
+                return NEO::WaitStatus::notReady;
+            }
+        }
+        return NEO::WaitStatus::ready;
+    }
+
+    if (isCounterBased() || inOrderExecHelper.isDataAssigned()) {
+        if (!inOrderExecHelper.isDataAssigned() || !inOrderExecHelper.getBaseHostCpuAddress()) {
+            return NEO::WaitStatus::notReady;
+        }
+
+        auto waitAddress = castToUint64(ptrOffset(inOrderExecHelper.getBaseHostCpuAddress(), inOrderExecHelper.getEventData()->counterOffset));
+        auto *hostAlloc = inOrderExecHelper.isHostStorageDuplicated() ? inOrderExecHelper.getHostCounterAllocation() : inOrderExecHelper.getDeviceCounterAllocation();
+        if (!csr->waitUserFence(static_cast<TaskCountType>(getInOrderExecBaseSignalValue()), waitAddress, packetWaitTimeout, false, this->externalInterruptId, hostAlloc, nullptr)) {
+            return NEO::WaitStatus::notReady;
+        }
+
+        return NEO::WaitStatus::ready;
+    }
+
+    if (!packetUserFenceWaitSupported) {
+        return NEO::WaitStatus::notReady;
+    }
+
+    if (!getAllocation(this->device)) {
+        return NEO::WaitStatus::notReady;
+    }
+
+    uint32_t packets = kernelEventCompletionData.getPacketsUsed();
+    for (uint32_t packetId = 0; packetId < packets; packetId++) {
+        auto queryAddress = ptrOffset(getHostAddress(), packetId * this->singlePacketSize + this->getCompletionFieldOffset());
+        if (!waitForPacket(queryAddress)) {
+            return NEO::WaitStatus::notReady;
+        }
+    }
+
+    if (packets < getMaxPacketsCount()) {
+        for (uint32_t packetId = packets; packetId < getMaxPacketsCount(); packetId++) {
+            auto queryAddress = ptrOffset(getHostAddress(), packetId * this->singlePacketSize + this->getCompletionFieldOffset());
+            if (!waitForPacket(queryAddress)) {
+                return NEO::WaitStatus::notReady;
+            }
+        }
+    }
+    return NEO::WaitStatus::ready;
+}
+
+template <typename TagSizeT>
+void EventImp<TagSizeT>::downloadAllTbxAllocations() {
+    for (auto &csr : csrs) {
+        auto taskCount = getTaskCount(*csr);
+        if (taskCount == NEO::GraphicsAllocation::objectNotUsed) {
+            taskCount = csr->peekLatestFlushedTaskCount();
+        }
+        csr->downloadAllocations(false, taskCount);
+    }
+
+    for (const auto &[previousContextCsr, previousContextTaskCount] : this->signalerPreviousContexts) {
+        previousContextCsr->downloadAllocations(true, previousContextTaskCount);
+    }
+
+    for (auto &engine : this->device->getNEODevice()->getMemoryManager()->getRegisteredEngines()[this->device->getRootDeviceIndex()]) {
+        if (!engine.commandStreamReceiver->isInitialized()) {
+            continue;
+        }
+        auto taskCount = getTaskCount(*engine.commandStreamReceiver);
+
+        if (taskCount != NEO::GraphicsAllocation::objectNotUsed) {
+            engine.commandStreamReceiver->downloadAllocations(false, taskCount);
+        }
+    }
 }
 
 template <typename TagSizeT>
 void EventImp<TagSizeT>::handleSuccessfulHostSynchronization() {
-    if (this->downloadAllocationRequired) {
-        for (auto &csr : csrs) {
-            csr->downloadAllocations();
-        }
+    csrs[0]->pollForAubCompletion();
+
+    if (this->tbxMode) {
+        downloadAllTbxAllocations();
     }
     this->setIsCompleted();
-    for (auto &csr : csrs) {
-        csr->getInternalAllocationStorage()->cleanAllocationList(csr->peekTaskCount(), NEO::AllocationUsage::TEMPORARY_ALLOCATION);
+    unsetCmdQueue();
+
+    if (!isCounterBased()) {
+        // Temporary assignment. If in-order CmdList required to use Event allocation for HW commands chaining, we need to wait for the counter.
+        // After successful host synchronization, we can unset CL counter.
+        unsetInOrderExecInfo();
     }
+    for (auto &csr : csrs) {
+        // Prefer this event's own completed task count, captured on the signaling CSR at signal
+        // time. Reading *csr->getTagAddress() directly can sample the tag before the GPU's write
+        // is visible, under-reporting completion and leaving still-referenced temporary
+        // allocations on the reuse list. Fall back to the tag for events with no recorded signal
+        // on this CSR (e.g. host-signaled events).
+        TaskCountType cleanupTaskCount = 0;
+        if (!this->getCleanupTaskCount(csr, cleanupTaskCount)) {
+            cleanupTaskCount = csr->getTagAddress() ? *csr->getTagAddress() : 0;
+        }
+        csr->getInternalAllocationStorage()->cleanAllocationList(cleanupTaskCount, NEO::AllocationUsage::TEMPORARY_ALLOCATION);
+    }
+
+    inOrderExecHelper.releaseNotUsedTempTimestampNodes();
+    device->getDriverHandle()->getStagingBufferManager()->resetDetectedPtrs();
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::queryStatusEventPackets() {
-    assignKernelEventCompletionData(this->hostAddress);
+ze_result_t EventImp<TagSizeT>::queryStatusEventPackets(int64_t timeSinceWait, bool blockOnMiss) {
+    assignKernelEventCompletionData(getHostAddress());
     uint32_t queryVal = Event::STATE_CLEARED;
-    uint32_t packets = 0;
-    for (uint32_t i = 0; i < this->kernelCount; i++) {
-        uint32_t packetsToCheck = kernelEventCompletionData[i].getPacketsUsed();
-        for (uint32_t packetId = 0; packetId < packetsToCheck; packetId++, packets++) {
-            void const *queryAddress = isUsingContextEndOffset()
-                                           ? kernelEventCompletionData[i].getContextEndAddress(packetId)
-                                           : kernelEventCompletionData[i].getContextStartAddress(packetId);
-            bool ready = NEO::WaitUtils::waitFunctionWithPredicate<const TagSizeT>(
+    uint32_t packets = kernelEventCompletionData.getPacketsUsed();
+
+    for (uint32_t packetId = 0; packetId < packets; packetId++) {
+        void const *queryAddress = isEventTimestampFlagSet()
+                                       ? kernelEventCompletionData.getContextEndAddress(packetId)
+                                       : kernelEventCompletionData.getContextStartAddress(packetId);
+        bool ready = NEO::WaitUtils::pollFunctionWithPredicate<const TagSizeT>(
+            static_cast<TagSizeT const *>(queryAddress),
+            queryVal,
+            std::not_equal_to<TagSizeT>(),
+            timeSinceWait,
+            NEO::WaitUtils::counterValueForEventHostSync,
+            NEO::WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds,
+            blockOnMiss);
+        if (!ready) {
+            return ZE_RESULT_NOT_READY;
+        }
+    }
+    if (packets < getMaxPacketsCount()) {
+        uint32_t remainingPackets = getMaxPacketsCount() - packets;
+        auto remainingPacketSyncAddress = ptrOffset(getHostAddress(), packets * this->singlePacketSize);
+        remainingPacketSyncAddress = ptrOffset(remainingPacketSyncAddress, this->getCompletionFieldOffset());
+        for (uint32_t i = 0; i < remainingPackets; i++) {
+            void const *queryAddress = remainingPacketSyncAddress;
+            bool ready = NEO::WaitUtils::pollFunctionWithPredicate<const TagSizeT>(
                 static_cast<TagSizeT const *>(queryAddress),
                 queryVal,
-                std::not_equal_to<TagSizeT>());
+                std::not_equal_to<TagSizeT>(),
+                timeSinceWait,
+                NEO::WaitUtils::counterValueForEventHostSync,
+                NEO::WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds,
+                blockOnMiss);
             if (!ready) {
                 return ZE_RESULT_NOT_READY;
             }
-        }
-    }
-    if (this->signalAllEventPackets) {
-        if (packets < getMaxPacketsCount()) {
-            uint32_t remainingPackets = getMaxPacketsCount() - packets;
-            auto remainingPacketSyncAddress = ptrOffset(this->hostAddress, packets * this->singlePacketSize);
-            remainingPacketSyncAddress = ptrOffset(remainingPacketSyncAddress, this->getCompletionFieldOffset());
-            for (uint32_t i = 0; i < remainingPackets; i++) {
-                void const *queryAddress = remainingPacketSyncAddress;
-                bool ready = NEO::WaitUtils::waitFunctionWithPredicate<const TagSizeT>(
-                    static_cast<TagSizeT const *>(queryAddress),
-                    queryVal,
-                    std::not_equal_to<TagSizeT>());
-                if (!ready) {
-                    return ZE_RESULT_NOT_READY;
-                }
-                remainingPacketSyncAddress = ptrOffset(remainingPacketSyncAddress, this->singlePacketSize);
-            }
+            remainingPacketSyncAddress = ptrOffset(remainingPacketSyncAddress, this->singlePacketSize);
         }
     }
 
     handleSuccessfulHostSynchronization();
+    this->statusQueryAssignedCompletionData = true;
 
     return ZE_RESULT_SUCCESS;
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::queryStatus() {
-    if (metricStreamer != nullptr) {
-        hostEventSetValue(metricStreamer->getNotificationState());
-    }
-    if (this->downloadAllocationRequired) {
-        for (auto &csr : csrs) {
-            csr->downloadAllocation(this->getAllocation(this->device));
-            if (inOrderExecEvent) {
-                auto node = this->inOrderTimestampPacket->peekNodes()[0];
-                auto nodeAlloc = node->getBaseGraphicsAllocation()->getGraphicsAllocation(this->device->getRootDeviceIndex());
-
-                csr->downloadAllocation(*nodeAlloc);
-            }
+bool EventImp<TagSizeT>::tbxDownload(NEO::CommandStreamReceiver &csr, bool &downloadedAllocation, bool &downloadedInOrdedAllocation, bool &downloadedPatchPreambleAllocation) {
+    if (!downloadedAllocation) {
+        if (auto &alloc = *this->getAllocation(this->device); alloc.isUsedByOsContext(csr.getOsContext().getContextId())) {
+            csr.downloadAllocation(alloc);
+            downloadedAllocation = true;
         }
     }
 
-    if (!this->isFromIpcPool && isAlreadyCompleted()) {
-        return ZE_RESULT_SUCCESS;
-    } else if (this->inOrderExecEvent) {
-        return queryInOrderEventStatus();
-    } else {
-        return queryStatusEventPackets();
+    if (!downloadedInOrdedAllocation) {
+        auto alloc = inOrderExecHelper.isHostStorageDuplicated() ? inOrderExecHelper.getHostCounterAllocation() : inOrderExecHelper.getDeviceCounterAllocation();
+
+        if (alloc->isUsedByOsContext(csr.getOsContext().getContextId())) {
+            csr.downloadAllocation(*alloc);
+            downloadedInOrdedAllocation = true;
+        }
+    }
+
+    if (!downloadedPatchPreambleAllocation) {
+        auto alloc = inOrderExecHelper.getPatchPreambleHostAllocation();
+        if (alloc && alloc->isUsedByOsContext(csr.getOsContext().getContextId())) {
+            csr.downloadAllocation(*alloc);
+            downloadedPatchPreambleAllocation = true;
+        }
+    }
+
+    if (downloadedAllocation && downloadedInOrdedAllocation && downloadedPatchPreambleAllocation) {
+        return false;
+    }
+
+    return true;
+}
+
+template <typename TagSizeT>
+void EventImp<TagSizeT>::tbxDownload(NEO::Device &device, bool &downloadedAllocation, bool &downloadedInOrdedAllocation, bool &downloadedPatchPreambleAllocation) {
+    for (auto const &engine : device.getAllEngines()) {
+        if (!engine.commandStreamReceiver->isInitialized()) {
+            continue;
+        }
+        if (!tbxDownload(*engine.commandStreamReceiver, downloadedAllocation, downloadedInOrdedAllocation, downloadedPatchPreambleAllocation)) {
+            break;
+        }
+    }
+
+    for (auto &csr : device.getSecondaryCsrs()) {
+        if (!csr->isInitialized()) {
+            continue;
+        }
+        if (!tbxDownload(*csr, downloadedAllocation, downloadedInOrdedAllocation, downloadedPatchPreambleAllocation)) {
+            break;
+        }
     }
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::hostEventSetValueTimestamps(TagSizeT eventVal) {
+void EventImp<TagSizeT>::downloadTbxAllocationsForQuery() {
+    bool downloadedAllocation = (this->getAllocation(this->device) == nullptr);
+    bool downloadedInOrdedAllocation = (inOrderExecHelper.getDeviceCounterAllocation() == nullptr);
+    bool downloadedPatchPreambleAllocation = (inOrderExecHelper.getPatchPreambleHostAllocation() == nullptr);
 
-    auto baseAddr = castToUint64(this->hostAddress);
-    auto eventTsSetFunc = [](auto tsAddr, TagSizeT value) {
-        auto tsptr = reinterpret_cast<void *>(tsAddr);
-        memcpy_s(tsptr, sizeof(TagSizeT), static_cast<void *>(&value), sizeof(TagSizeT));
-    };
+    DEBUG_BREAK_IF(inOrderExecHelper.isDataAssigned() && (inOrderExecHelper.getDeviceCounterAllocation() == nullptr)); //  external allocation - not able to download
 
-    TagSizeT timestampStart = eventVal;
-    TagSizeT timestampEnd = eventVal;
-    if (eventVal == Event::STATE_SIGNALED) {
-        timestampStart = static_cast<TagSizeT>(this->gpuStartTimestamp);
-        timestampEnd = static_cast<TagSizeT>(this->gpuEndTimestamp);
-    }
-
-    uint32_t packets = 0;
-    for (uint32_t i = 0; i < this->kernelCount; i++) {
-        uint32_t packetsToSet = kernelEventCompletionData[i].getPacketsUsed();
-        for (uint32_t j = 0; j < packetsToSet; j++, packets++) {
-            if (baseAddr >= castToUint64(ptrOffset(this->hostAddress, totalEventSize))) {
-                break;
-            }
-            eventTsSetFunc(baseAddr + contextStartOffset, timestampStart);
-            eventTsSetFunc(baseAddr + globalStartOffset, timestampStart);
-            eventTsSetFunc(baseAddr + contextEndOffset, timestampEnd);
-            eventTsSetFunc(baseAddr + globalEndOffset, timestampEnd);
-            baseAddr += singlePacketSize;
+    tbxDownload(*this->device->getNEODevice(), downloadedAllocation, downloadedInOrdedAllocation, downloadedPatchPreambleAllocation);
+    if (!downloadedAllocation || !downloadedInOrdedAllocation || !downloadedPatchPreambleAllocation) {
+        for (auto &subDevice : this->device->getNEODevice()->getRootDevice()->getSubDevices()) {
+            tbxDownload(*subDevice, downloadedAllocation, downloadedInOrdedAllocation, downloadedPatchPreambleAllocation);
         }
     }
-    if (this->signalAllEventPackets) {
-        baseAddr = ptrOffset(baseAddr, this->contextEndOffset);
-        setRemainingPackets(eventVal, reinterpret_cast<void *>(baseAddr), packets);
+}
+
+template <typename TagSizeT>
+bool EventImp<TagSizeT>::handlePreQueryStatusOperationsAndCheckCompletion() {
+    if (inOrderExecHelper.is2WayIpcSharingEnabled()) {
+        refreshImported2WayIpcCbData();
     }
 
-    const auto dataSize = 4u * EventPacketsCount::maxKernelSplit * NEO::TimestampPacketConstants::preferredPacketCount;
+    if (metricNotification != nullptr && eventPoolAllocation) {
+        hostEventSetValue(metricNotification->getNotificationState());
+    }
+
+    if (this->tbxMode) {
+        downloadTbxAllocationsForQuery();
+    }
+
+    if (!this->isFromIpcPool && isAlreadyCompleted()) {
+        return true;
+    }
+
+    return false;
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::queryStatus(int64_t timeSinceWait, bool blockOnMiss) {
+    if (handlePreQueryStatusOperationsAndCheckCompletion()) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    if (isActiveExternalCbEvent()) {
+        if (!isPatchPreambleCounterCompleted(timeSinceWait, blockOnMiss)) {
+            return ZE_RESULT_NOT_READY;
+        }
+    }
+
+    if (isCounterBased() || this->inOrderExecHelper.isDataAssigned()) {
+        return queryCounterBasedEventStatus(timeSinceWait, blockOnMiss);
+    } else {
+        return queryStatusEventPackets(timeSinceWait, blockOnMiss);
+    }
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::hostEventSetValueTimestamps(Event::State eventState) {
+    if (isCounterBased() && !inOrderExecHelper.hasTimestampNodes() && !getAllocation(this->device)) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    if (isAggregatedEvent(this)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    auto baseHostAddr = getHostAddress();
+    auto baseGpuAddr = getGpuAddress(device);
+
+    auto eventVal = static_cast<TagSizeT>(eventState);
+    auto timestampStart = static_cast<TagSizeT>(eventState);
+    auto timestampEnd = static_cast<TagSizeT>(eventState);
+    if (eventState == Event::STATE_SIGNALED) {
+        if (this->gpuStartTimestamp != 0u) {
+            timestampStart = static_cast<TagSizeT>(this->gpuStartTimestamp);
+        }
+        if (this->gpuEndTimestamp != 0u) {
+            timestampEnd = static_cast<TagSizeT>(this->gpuEndTimestamp);
+        }
+    }
+
+    auto hostAddress = getHostAddress();
+
+    const size_t writeRegionSize = static_cast<size_t>(maxPacketCount) * singlePacketSize;
+
+    const std::array<TagSizeT, 4> copyData = {{timestampStart, timestampStart, timestampEnd, timestampEnd}};
+    constexpr size_t copySize = copyData.size() * sizeof(TagSizeT);
+
+    const uint32_t packetsToSet = kernelEventCompletionData.getPacketsUsed();
+    uint32_t packets = 0;
+    for (; packets < packetsToSet; packets++) {
+        if (castToUint64(baseHostAddr) >= castToUint64(ptrOffset(hostAddress, writeRegionSize))) {
+            break;
+        }
+
+        copyDataToEventAlloc(baseHostAddr, baseGpuAddr, copySize, copyData.data());
+
+        baseHostAddr = ptrOffset(baseHostAddr, singlePacketSize);
+        baseGpuAddr += singlePacketSize;
+    }
+    baseHostAddr = ptrOffset(baseHostAddr, this->contextEndOffset);
+    baseGpuAddr += this->contextEndOffset;
+    setRemainingPackets(eventVal, baseGpuAddr, baseHostAddr, packets);
+
+    UNRECOVERABLE_IF(packetsToSet > NEO::TimestampPacketConstants::preferredPacketCount);
+    constexpr uint32_t timestampsPerPacket = 4u;
+    constexpr uint32_t dataSize = timestampsPerPacket * NEO::TimestampPacketConstants::preferredPacketCount;
     TagSizeT tagValues[dataSize];
 
     for (uint32_t index = 0u; index < dataSize; index++) {
@@ -284,46 +831,104 @@ ze_result_t EventImp<TagSizeT>::hostEventSetValueTimestamps(TagSizeT eventVal) {
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::hostEventSetValue(TagSizeT eventVal) {
-    UNRECOVERABLE_IF(hostAddress == nullptr);
+void EventImp<TagSizeT>::copyTbxData(uint64_t dstGpuVa, size_t copySize) {
+    auto alloc = getAllocation(device);
+    if (!alloc) {
+        DEBUG_BREAK_IF(true);
+        return;
+    }
+
+    constexpr uint32_t allBanks = std::numeric_limits<uint32_t>::max();
+
+    if (alloc->isTbxWritable(allBanks)) {
+        // initialize full page tables for the first time
+        csrs[0]->writeMemory(*alloc, false, 0, 0);
+    }
+
+    alloc->setTbxWritable(true, allBanks);
+
+    auto offset = ptrDiff(dstGpuVa, alloc->getGpuAddress());
+
+    csrs[0]->writeMemory(*alloc, true, offset, copySize);
+
+    alloc->setTbxWritable(false, allBanks);
+}
+
+template <typename TagSizeT>
+void EventImp<TagSizeT>::copyDataToEventAlloc(void *dstHostAddr, uint64_t dstGpuVa, size_t copySize, const void *copyData) {
+    memcpy_s(dstHostAddr, copySize, copyData, copySize);
+
+    if (this->tbxMode) {
+        copyTbxData(dstGpuVa, copySize);
+    }
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::hostEventSetValue(Event::State eventState) {
+    if (!hostAddressFromPool && !inOrderExecHelper.hasTimestampNodes()) {
+        return ZE_RESULT_ERROR_INVALID_NULL_POINTER;
+    }
 
     if (isEventTimestampFlagSet()) {
-        return hostEventSetValueTimestamps(eventVal);
+        return hostEventSetValueTimestamps(eventState);
     }
 
-    auto packetHostAddr = getCompletionFieldHostAddress();
+    if (isCounterBased()) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    auto eventVal = static_cast<TagSizeT>(eventState);
+
+    auto basePacketHostAddr = getCompletionFieldHostAddress();
+    auto basePacketGpuAddr = getCompletionFieldGpuAddress(device);
+
+    UNRECOVERABLE_IF(sizeof(TagSizeT) > sizeof(uint64_t));
 
     uint32_t packets = 0;
-    for (uint32_t i = 0; i < kernelCount; i++) {
-        uint32_t packetsToSet = kernelEventCompletionData[i].getPacketsUsed();
-        for (uint32_t j = 0; j < packetsToSet; j++, packets++) {
-            if (castToUint64(packetHostAddr) >= castToUint64(ptrOffset(this->hostAddress, totalEventSize))) {
-                break;
-            }
-            memcpy_s(packetHostAddr, sizeof(TagSizeT), static_cast<void *>(&eventVal), sizeof(TagSizeT));
-            packetHostAddr = ptrOffset(packetHostAddr, this->singlePacketSize);
+
+    auto packetHostAddr = basePacketHostAddr;
+    auto packetGpuAddr = basePacketGpuAddr;
+
+    size_t totalSizeToCopy = 0;
+
+    auto hostAddress = getHostAddress();
+
+    const uint32_t packetsToSet = kernelEventCompletionData.getPacketsUsed();
+    for (; packets < packetsToSet; packets++) {
+        if (castToUint64(packetHostAddr) >= castToUint64(ptrOffset(hostAddress, totalEventSize))) {
+            break;
         }
-    }
-    if (this->signalAllEventPackets) {
-        setRemainingPackets(eventVal, packetHostAddr, packets);
+
+        packetHostAddr = ptrOffset(packetHostAddr, this->singlePacketSize);
+        packetGpuAddr = ptrOffset(packetGpuAddr, this->singlePacketSize);
+
+        totalSizeToCopy += this->singlePacketSize;
     }
 
-    if (this->downloadAllocationRequired) {
-        auto memoryIface = this->device->getNEODevice()->getRootDeviceEnvironment().memoryOperationsInterface.get();
-
-        auto eventAllocation = &this->getAllocation(device);
-        ArrayRef<NEO::GraphicsAllocation *> allocationArray(&eventAllocation, 1);
-        memoryIface->makeResident(nullptr, allocationArray);
-
-        constexpr uint32_t allBanks = std::numeric_limits<uint32_t>::max();
-        eventAllocation->setTbxWritable(true, allBanks);
+    if (packets > 0) {
+        const size_t numElements = totalSizeToCopy / sizeof(uint64_t);
+        StackVec<uint64_t, 16 * 4> tempCopyData; // 16 packets, 4 timestamps
+        tempCopyData.reserve(numElements);
+        std::fill_n(tempCopyData.begin(), numElements, static_cast<uint64_t>(eventVal));
+        copyDataToEventAlloc(basePacketHostAddr, basePacketGpuAddr, totalSizeToCopy, &tempCopyData[0]);
     }
+    setRemainingPackets(eventVal, packetGpuAddr, packetHostAddr, packets);
+
     return ZE_RESULT_SUCCESS;
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::hostSignal() {
-    auto status = hostEventSetValue(Event::STATE_SIGNALED);
+ze_result_t EventImp<TagSizeT>::hostSignal(bool allowCounterBased) {
+    if (!allowCounterBased && this->isCounterBased()) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    ze_result_t status = ZE_RESULT_SUCCESS;
+
+    if (!isCounterBased() || isEventTimestampFlagSet()) {
+        status = hostEventSetValue(Event::STATE_SIGNALED);
+    }
+
     if (status == ZE_RESULT_SUCCESS) {
         this->setIsCompleted();
     }
@@ -331,46 +936,234 @@ ze_result_t EventImp<TagSizeT>::hostSignal() {
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::hostSynchronize(uint64_t timeout) {
-    std::chrono::microseconds elapsedTimeSinceGpuHangCheck{0};
-    std::chrono::high_resolution_clock::time_point waitStartTime, lastHangCheckTime, currentTime;
-    uint64_t timeDiff = 0;
-
-    ze_result_t ret = ZE_RESULT_NOT_READY;
-
-    if (this->csrs[0]->getType() == NEO::CommandStreamReceiverType::CSR_AUB) {
+ze_result_t EventImp<TagSizeT>::waitForUserFence(uint64_t timeout, int64_t timeSinceWait) {
+    if (handlePreQueryStatusOperationsAndCheckCompletion()) {
         return ZE_RESULT_SUCCESS;
     }
 
-    if (NEO::DebugManager.flags.OverrideEventSynchronizeTimeout.get() != -1) {
-        timeout = NEO::DebugManager.flags.OverrideEventSynchronizeTimeout.get();
+    if (isActiveExternalCbEvent()) {
+        if (!isPatchPreambleCounterCompleted(timeSinceWait, timeout != 0)) {
+            return ZE_RESULT_NOT_READY;
+        }
+    }
+
+    if (!inOrderExecHelper.isDataAssigned()) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    uint64_t waitAddress = castToUint64(ptrOffset(inOrderExecHelper.getBaseHostCpuAddress(), inOrderExecHelper.getEventData()->counterOffset));
+    NEO::GraphicsAllocation *hostAlloc = inOrderExecHelper.isHostStorageDuplicated() ? inOrderExecHelper.getHostCounterAllocation() : inOrderExecHelper.getDeviceCounterAllocation();
+
+    if (!csrs[0]->waitUserFence(getInOrderExecBaseSignalValue(), waitAddress, timeout, true, this->externalInterruptId, hostAlloc, inOrderExecHelper.getInterruptFence())) {
+        return ZE_RESULT_NOT_READY;
+    }
+
+    handleSuccessfulHostSynchronization();
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::hostSynchronize(uint64_t timeout) {
+    if (Event::isBeingUsedInActiveGraphRecording(this)) {
+        return ZE_RESULT_ERROR_GRAPH_CAPTURE_UNSUPPORTED;
+    }
+
+    if (getIsSignalledAsGraphInternalEvent()) {
+        return ZE_RESULT_ERROR_GRAPH_INTERNAL_EVENT;
+    }
+
+    std::chrono::microseconds elapsedTimeSinceGpuHangCheck{0};
+    std::chrono::high_resolution_clock::time_point waitStartTime, lastHangCheckTime, currentTime;
+    int64_t elapsedTimeSinceWaitStartUs = 0;
+    uint64_t elapsedTimeSinceWaitStartNs = 0;
+
+    ze_result_t ret = ZE_RESULT_NOT_READY;
+
+    if (NEO::debugManager.flags.AbortHostSyncOnNonHostVisibleEvent.get()) {
+        UNRECOVERABLE_IF(!this->isSignalScope(ZE_EVENT_SCOPE_FLAG_HOST));
+    }
+
+    if (this->csrs[0]->getType() == NEO::CommandStreamReceiverType::aub) {
+        this->csrs[0]->pollForAubCompletion();
+        return ZE_RESULT_SUCCESS;
+    }
+
+    if (NEO::debugManager.flags.OverrideEventSynchronizeTimeout.get() != -1) {
+        timeout = NEO::debugManager.flags.OverrideEventSynchronizeTimeout.get();
+    }
+    auto neoDevice = this->device->getNEODevice();
+    auto csrForCacheFlush = neoDevice->getDefaultEngine().commandStreamReceiver;
+    auto *selectedCsrForCacheFlush = this->getCsrForCacheFlush();
+    if (selectedCsrForCacheFlush != nullptr) {
+        csrForCacheFlush = selectedCsrForCacheFlush;
+    }
+    const bool cacheFlushRequiredForHostSync = this->isCacheFlushRequiredForHostSync();
+    const bool secondaryContextsSupported = this->device->getGfxCoreHelper().areSecondaryContextsSupported();
+    const bool waitForTaskCountUsingKmd = (NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.get() == 3) &&
+                                          cacheFlushRequiredForHostSync &&
+                                          EventHostSynchronize::isNativeWddm(*csrForCacheFlush) &&
+                                          neoDevice->getHardwareInfo().capabilityTable.isIntegratedDevice;
+    const bool waitForUserFenceUsingKmd = (NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.get() == 3) &&
+                                          NEO::debugManager.flags.EventHostSynchronizeLinuxUserFenceKmdWait.get() &&
+                                          (timeout == std::numeric_limits<uint64_t>::max()) &&
+                                          EventHostSynchronize::isDrm(*csrs[0]) &&
+                                          !NEO::EngineHelpers::isBcs(csrs[0]->getOsContext().getEngineType()) &&
+                                          csrs[0]->waitUserFenceSupported(nullptr) &&
+                                          this->isLinuxUserFenceKmdWaitEnabled() &&
+                                          (this->metricNotification == nullptr);
+    const auto monitoredFenceKmdWaitTimeoutNs = static_cast<uint64_t>(std::max<int64_t>(NEO::debugManager.flags.EventHostSynchronizeWindowsDiscreteKmdWaitTimeoutNanoseconds.get(), 0));
+    NEO::FlushStamp signalFlushStamp = 0;
+    bool waitForMonitoredFenceUsingKmd = (NEO::debugManager.flags.EventHostSynchronizeWaitStrategy.get() == 3) &&
+                                         this->isWindowsDiscreteKmdWaitEnabled() &&
+                                         !cacheFlushRequiredForHostSync &&
+                                         (this->csrs.size() == 1u) &&
+                                         (this->metricNotification == nullptr) &&
+                                         !Event::isAggregatedEvent(this) &&
+                                         this->getSignalFlushStamp(this->csrs[0], signalFlushStamp);
+    const auto kmdWaitInitialPollUs = std::max<int64_t>(NEO::debugManager.flags.EventHostSynchronizeKmdWaitInitialPollMicroseconds.get(), 0);
+    TaskCountType taskCountToWaitForCacheFlush = 0;
+    bool taskCountWaitedForCacheFlush = false;
+
+    auto isUsableTaskCount = [](TaskCountType taskCount) {
+        return taskCount && (taskCount != NEO::GraphicsAllocation::objectNotUsed);
+    };
+
+    if (cacheFlushRequiredForHostSync && !secondaryContextsSupported) {
+        taskCountToWaitForCacheFlush = flushTagUpdateForHostSync(*csrForCacheFlush);
     }
 
     waitStartTime = std::chrono::high_resolution_clock::now();
     lastHangCheckTime = waitStartTime;
+
+    const bool fenceWait = isKmdWaitModeEnabled() && isCounterBased() && !this->cbEventWithProfiling && csrs[0]->waitUserFenceSupported(inOrderExecHelper.getInterruptFence());
+    EventHostSynchronize::WaitController waitController(*csrs[0]);
+    std::unique_ptr<NEO::KmdWaiter> kmdWaiter;
+
+    auto *assertHndlr = neoDevice->getRootDeviceEnvironment().assertHandler.get();
+
     do {
-        ret = queryStatus();
-        if (ret == ZE_RESULT_SUCCESS) {
-            if (this->getKernelForPrintf() != nullptr) {
-                static_cast<Kernel *>(this->getKernelForPrintf())->printPrintfOutput(true);
-                this->setKernelForPrintf(nullptr);
+        if (this->cbEventWithProfiling && !isAlreadyCompleted()) {
+            ret = ZE_RESULT_NOT_READY;
+            if (handlePreQueryStatusOperationsAndCheckCompletion()) {
+                ret = ZE_RESULT_SUCCESS;
+            } else if (!isActiveExternalCbEvent() || isPatchPreambleCounterCompleted(elapsedTimeSinceWaitStartUs, timeout != 0)) {
+                assignKernelEventCompletionData(getHostAddress());
+                calculateProfilingData();
+                if (this->isTimestampPopulated()) {
+                    inOrderExecHelper.setLastWaitedCounterValue(getInOrderExecBaseSignalValue(), this->getInOrderAllocationOffset());
+                    handleSuccessfulHostSynchronization();
+                    ret = ZE_RESULT_SUCCESS;
+                }
             }
-            if (device->getNEODevice()->getRootDeviceEnvironment().assertHandler.get()) {
-                device->getNEODevice()->getRootDeviceEnvironment().assertHandler->printAssertAndAbort();
+        } else {
+            if (fenceWait) {
+                ret = waitForUserFence(timeout, elapsedTimeSinceWaitStartUs);
+            } else {
+                ret = queryStatus(elapsedTimeSinceWaitStartUs, timeout != 0);
+            }
+        }
+        if (ret == ZE_RESULT_SUCCESS) {
+            if (cacheFlushRequiredForHostSync && !taskCountWaitedForCacheFlush) {
+                if (secondaryContextsSupported || !isUsableTaskCount(taskCountToWaitForCacheFlush)) {
+                    taskCountToWaitForCacheFlush = flushTagUpdateForHostSync(*csrForCacheFlush);
+                }
+            }
+            if (this->getKernelWithPrintfDeviceMutex() != nullptr) {
+                std::lock_guard<std::mutex> lock(*this->getKernelWithPrintfDeviceMutex());
+                if (!this->getKernelForPrintf().expired()) {
+                    this->getKernelForPrintf().lock()->printPrintfOutput(true);
+                }
+                this->resetKernelForPrintf();
+                this->resetKernelWithPrintfDeviceMutex();
+            }
+            if (assertHndlr) {
+                assertHndlr->printAssertAndAbort();
+            }
+            if (NEO::debugManager.flags.ForceGpuStatusCheckOnSuccessfulEventHostSynchronize.get() == 1) {
+                const bool hangDetected = this->isGpuHangDetectedOnSignalingContexts(*csrForCacheFlush);
+                if (hangDetected) {
+                    return ZE_RESULT_ERROR_DEVICE_LOST;
+                }
+            }
+            if (isUsableTaskCount(taskCountToWaitForCacheFlush)) {
+                csrForCacheFlush->waitForTaskCount(taskCountToWaitForCacheFlush);
             }
             return ret;
         }
 
         currentTime = std::chrono::high_resolution_clock::now();
+        auto elapsedTimeSinceWaitStart = currentTime - waitStartTime;
+        elapsedTimeSinceWaitStartUs = std::chrono::duration_cast<std::chrono::microseconds>(elapsedTimeSinceWaitStart).count();
+        elapsedTimeSinceWaitStartNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsedTimeSinceWaitStart).count());
+
         elapsedTimeSinceGpuHangCheck = std::chrono::duration_cast<std::chrono::microseconds>(currentTime - lastHangCheckTime);
 
-        if (elapsedTimeSinceGpuHangCheck.count() >= this->gpuHangCheckPeriod.count()) {
+        if (csrForCacheFlush->isGpuHangCheckPeriodElapsed(elapsedTimeSinceGpuHangCheck.count())) {
             lastHangCheckTime = currentTime;
-            if (this->csrs[0]->isGpuHangDetected()) {
-                if (device->getNEODevice()->getRootDeviceEnvironment().assertHandler.get()) {
-                    device->getNEODevice()->getRootDeviceEnvironment().assertHandler->printAssertAndAbort();
+            if (this->isGpuHangDetectedOnSignalingContexts(*csrForCacheFlush)) {
+                if (assertHndlr) {
+                    assertHndlr->printAssertAndAbort();
                 }
                 return ZE_RESULT_ERROR_DEVICE_LOST;
+            }
+        }
+
+        if (waitForTaskCountUsingKmd && (elapsedTimeSinceWaitStartUs >= kmdWaitInitialPollUs)) {
+            const auto kmdWaitTimeoutNanoseconds = EventHostSynchronize::getKmdWaitTimeout(timeout, elapsedTimeSinceWaitStartNs);
+            const auto waitStatus = kmdWaitTimeoutNanoseconds == 0
+                                        ? NEO::WaitStatus::notReady
+                                        : tryKmdWaitForHostSynchronize(*csrForCacheFlush,
+                                                                       cacheFlushRequiredForHostSync,
+                                                                       taskCountToWaitForCacheFlush,
+                                                                       taskCountWaitedForCacheFlush,
+                                                                       kmdWaitTimeoutNanoseconds);
+            if (waitStatus == NEO::WaitStatus::gpuHang) {
+                if (assertHndlr) {
+                    assertHndlr->printAssertAndAbort();
+                }
+                return ZE_RESULT_ERROR_DEVICE_LOST;
+            }
+            if (waitStatus == NEO::WaitStatus::ready) {
+                continue;
+            }
+        }
+
+        if (!fenceWait && waitForUserFenceUsingKmd && (elapsedTimeSinceWaitStartUs >= kmdWaitInitialPollUs)) {
+            const auto waitStatus = tryUserFenceWaitForHostSynchronize(elapsedTimeSinceWaitStartUs);
+            if (waitStatus == NEO::WaitStatus::ready) {
+                continue;
+            }
+        }
+
+        if (!fenceWait && waitForMonitoredFenceUsingKmd && (elapsedTimeSinceWaitStartUs >= kmdWaitInitialPollUs)) {
+            const auto kmdWaitTimeoutNs = std::min(EventHostSynchronize::getKmdWaitTimeout(timeout, elapsedTimeSinceWaitStartNs), monitoredFenceKmdWaitTimeoutNs);
+            if (!kmdWaiter && (kmdWaitTimeoutNs > 0)) {
+                kmdWaiter = csrs[0]->createKmdWaiter(signalFlushStamp, this->cleanupTaskCount);
+                waitForMonitoredFenceUsingKmd = (kmdWaiter != nullptr);
+            }
+            if (kmdWaiter && (kmdWaitTimeoutNs > 0)) {
+                const auto waitStatus = kmdWaiter->wait(kmdWaitTimeoutNs);
+                if (waitStatus == NEO::WaitStatus::gpuHang) {
+                    if (assertHndlr) {
+                        assertHndlr->printAssertAndAbort();
+                    }
+                    return ZE_RESULT_ERROR_DEVICE_LOST;
+                }
+                waitForMonitoredFenceUsingKmd = (waitStatus == NEO::WaitStatus::notReady);
+                continue;
+            }
+        }
+
+        if (!fenceWait) {
+            auto waitAction = waitController.getAction(elapsedTimeSinceWaitStartUs, timeout, elapsedTimeSinceWaitStartNs);
+            if (waitAction.sleepUs > 0) {
+                NEO::sleep(std::chrono::microseconds(waitAction.sleepUs));
+
+                currentTime = std::chrono::high_resolution_clock::now();
+                elapsedTimeSinceWaitStart = currentTime - waitStartTime;
+                elapsedTimeSinceWaitStartUs = std::chrono::duration_cast<std::chrono::microseconds>(elapsedTimeSinceWaitStart).count();
+                elapsedTimeSinceWaitStartNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsedTimeSinceWaitStart).count());
             }
         }
 
@@ -380,25 +1173,38 @@ ze_result_t EventImp<TagSizeT>::hostSynchronize(uint64_t timeout) {
             break;
         }
 
-        timeDiff = std::chrono::duration_cast<std::chrono::nanoseconds>(currentTime - waitStartTime).count();
+    } while (elapsedTimeSinceWaitStartNs < timeout);
 
-    } while (timeDiff < timeout);
-
-    if (device->getNEODevice()->getRootDeviceEnvironment().assertHandler.get()) {
-        device->getNEODevice()->getRootDeviceEnvironment().assertHandler->printAssertAndAbort();
+    if (assertHndlr) {
+        assertHndlr->printAssertAndAbort();
     }
     return ret;
 }
 
 template <typename TagSizeT>
 ze_result_t EventImp<TagSizeT>::reset() {
-    if (inOrderExecEvent) {
-        inOrderExecEvent = false;
-        inOrderTimestampPacket->releaseNodes();
+    if (this->counterBasedMode == CounterBasedMode::explicitlyEnabled) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
+
+    if (const auto flag = NEO::debugManager.flags.SynchronizeEventBeforeReset.get(); flag != -1) {
+        PRINT_STRING((flag == 2 && queryStatus(0) != ZE_RESULT_SUCCESS), stdout,
+                     "\nzeEventHostReset: Event %p not ready. Calling zeEventHostSynchronize.", this);
+
+        hostSynchronize(std::numeric_limits<uint64_t>::max());
+    }
+
+    unsetInOrderExecInfo();
+    unsetCmdQueue();
+    this->cbEventWithProfiling = false;
+    if (this->counterBasedMode != CounterBasedMode::implicitlyDisabled) {
+        this->counterBasedMode = CounterBasedMode::initiallyDisabled;
+        this->counterBasedFlags = 0;
+    }
+    this->clearCleanupTaskCounts();
     this->resetCompletionStatus();
     this->resetDeviceCompletionData(false);
-    this->l3FlushAppliedOnKernel.reset();
+    this->resetAdditionalTimestampNode(nullptr, 0, true);
     return ZE_RESULT_SUCCESS;
 }
 
@@ -406,10 +1212,7 @@ template <typename TagSizeT>
 void EventImp<TagSizeT>::resetDeviceCompletionData(bool resetAllPackets) {
 
     if (resetAllPackets) {
-        this->kernelCount = this->maxKernelCount;
-        for (uint32_t i = 0; i < kernelCount; i++) {
-            this->kernelEventCompletionData[i].setPacketsUsed(NEO::TimestampPacketConstants::preferredPacketCount);
-        }
+        this->kernelEventCompletionData.setPacketsUsed(NEO::TimestampPacketConstants::preferredPacketCount);
     }
 
     this->hostEventSetValue(Event::STATE_INITIAL);
@@ -417,16 +1220,59 @@ void EventImp<TagSizeT>::resetDeviceCompletionData(bool resetAllPackets) {
 }
 
 template <typename TagSizeT>
-ze_result_t EventImp<TagSizeT>::queryKernelTimestamp(ze_kernel_timestamp_result_t *dstptr) {
+void EventImp<TagSizeT>::refreshTimestampCompletionData() {
+    if (this->tbxMode) {
+        this->downloadTbxAllocationsForQuery();
+    }
+    this->assignKernelEventCompletionData(this->getHostAddress());
+    this->calculateProfilingData();
 
+    this->statusQueryAssignedCompletionData = true;
+}
+
+template <typename TagSizeT>
+void EventImp<TagSizeT>::synchronizeTimestampCompletionWithTimeout() {
+    std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
+    uint64_t timeDiff = 0;
+
+    do {
+        this->refreshTimestampCompletionData();
+
+        timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+    } while (!isTimestampPopulated() && (timeDiff < getCompletionTimeout()));
+    DEBUG_BREAK_IF(!isTimestampPopulated());
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::queryKernelTimestamp(ze_kernel_timestamp_result_t *dstptr) {
     ze_kernel_timestamp_result_t &result = *dstptr;
 
-    if (queryStatus() != ZE_RESULT_SUCCESS) {
-        return ZE_RESULT_NOT_READY;
+    this->statusQueryAssignedCompletionData = false;
+    const bool completionCheckedByQueryStatus = !this->isCounterBased() || !this->inOrderExecHelper.hasTimestampNodes();
+    if (completionCheckedByQueryStatus) {
+        if (queryStatus(0) != ZE_RESULT_SUCCESS) {
+            return ZE_RESULT_NOT_READY;
+        }
     }
 
-    assignKernelEventCompletionData(hostAddress);
+    if (!this->statusQueryAssignedCompletionData) {
+        assignKernelEventCompletionData(getHostAddress());
+    }
     calculateProfilingData();
+
+    if (!isTimestampPopulated()) {
+        const bool completionConfirmed = completionCheckedByQueryStatus || this->inOrderExecHelper.isCounterAlreadyDone(this->getInOrderExecBaseSignalValue(), this->getInOrderAllocationOffset());
+        if (completionConfirmed) {
+            this->synchronizeTimestampCompletionWithTimeout();
+        } else {
+            this->refreshTimestampCompletionData();
+        }
+        if (inOrderExecHelper.hasTimestampNodes()) {
+            if (!isTimestampPopulated()) {
+                return ZE_RESULT_NOT_READY;
+            }
+        }
+    }
 
     auto eventTsSetFunc = [&](uint64_t &timestampFieldToCopy, uint64_t &timestampFieldForWriting) {
         memcpy_s(&(timestampFieldForWriting), sizeof(uint64_t), static_cast<void *>(&timestampFieldToCopy), sizeof(uint64_t));
@@ -444,17 +1290,19 @@ ze_result_t EventImp<TagSizeT>::queryKernelTimestamp(ze_kernel_timestamp_result_
         eventTsSetFunc(globalEndTS, result.context.kernelEnd);
         eventTsSetFunc(globalEndTS, result.global.kernelEnd);
     }
+    PRINT_STRING(NEO::debugManager.flags.PrintCalculatedTimestamps.get(), stdout, "globalStartTS: %llu, globalEndTS: %llu, contextStartTS: %llu, contextEndTS: %llu\n",
+                 result.global.kernelStart, result.global.kernelEnd, result.context.kernelStart, result.context.kernelEnd);
+
     return ZE_RESULT_SUCCESS;
 }
 
 template <typename TagSizeT>
 ze_result_t EventImp<TagSizeT>::queryTimestampsExp(Device *device, uint32_t *count, ze_kernel_timestamp_result_t *timestamps) {
-    uint32_t timestampPacket = 0;
     uint64_t globalStartTs, globalEndTs, contextStartTs, contextEndTs;
     globalStartTs = globalEndTs = contextStartTs = contextEndTs = Event::STATE_INITIAL;
     bool isStaticPartitioning = true;
 
-    if (NEO::DebugManager.flags.EnableStaticPartitioning.get() == 0) {
+    if (NEO::debugManager.flags.EnableStaticPartitioning.get() == 0) {
         isStaticPartitioning = false;
     }
 
@@ -462,12 +1310,21 @@ ze_result_t EventImp<TagSizeT>::queryTimestampsExp(Device *device, uint32_t *cou
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
 
-    uint32_t numPacketsUsed = this->getPacketsInUse();
+    uint32_t numPacketsUsed = 0u;
+    if (isAggregatedEvent(this)) {
+        numPacketsUsed = 1u;
+    } else {
+        numPacketsUsed = this->getPacketsInUse();
+    }
 
     if ((*count == 0) ||
         (*count > numPacketsUsed)) {
         *count = numPacketsUsed;
         return ZE_RESULT_SUCCESS;
+    }
+
+    if (isAggregatedEvent(this)) {
+        assignAggregatedEventCompletionData();
     }
 
     for (auto i = 0u; i < *count; i++) {
@@ -479,10 +1336,10 @@ ze_result_t EventImp<TagSizeT>::queryTimestampsExp(Device *device, uint32_t *cou
 
         auto packetId = i;
 
-        globalStartTs = kernelEventCompletionData[timestampPacket].getGlobalStartValue(packetId);
-        contextStartTs = kernelEventCompletionData[timestampPacket].getContextStartValue(packetId);
-        contextEndTs = kernelEventCompletionData[timestampPacket].getContextEndValue(packetId);
-        globalEndTs = kernelEventCompletionData[timestampPacket].getGlobalEndValue(packetId);
+        globalStartTs = kernelEventCompletionData.getGlobalStartValue(packetId);
+        contextStartTs = kernelEventCompletionData.getContextStartValue(packetId);
+        contextEndTs = kernelEventCompletionData.getContextEndValue(packetId);
+        globalEndTs = kernelEventCompletionData.getGlobalEndValue(packetId);
 
         queryTsEventAssignFunc(result.global.kernelStart, globalStartTs);
         queryTsEventAssignFunc(result.context.kernelStart, contextStartTs);
@@ -494,51 +1351,200 @@ ze_result_t EventImp<TagSizeT>::queryTimestampsExp(Device *device, uint32_t *cou
 }
 
 template <typename TagSizeT>
-uint32_t EventImp<TagSizeT>::getPacketsInUse() const {
-    uint32_t packetsInUse = 0;
-    for (uint32_t i = 0; i < kernelCount; i++) {
-        packetsInUse += kernelEventCompletionData[i].getPacketsUsed();
+void EventImp<TagSizeT>::getSynchronizedKernelTimestamps(ze_synchronized_timestamp_result_ext_t *pSynchronizedTimestampsBuffer,
+                                                         const uint32_t count, const ze_kernel_timestamp_result_t *pKernelTimestampsBuffer) {
+
+    auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    const auto resolution = device->getNEODevice()->getDeviceInfo().profilingTimerResolution;
+    const auto maxKernelTsValue = maxNBitValue(hwInfo.capabilityTable.kernelTimestampValidBits);
+
+    const auto numBitsForResolution = Math::log2(static_cast<uint64_t>(resolution)) + 1u;
+    UNRECOVERABLE_IF(numBitsForResolution > 64U);
+    const auto clampedBitsCount = std::min(hwInfo.capabilityTable.kernelTimestampValidBits, 64u - numBitsForResolution);
+    const auto maxClampedTsValue = maxNBitValue(clampedBitsCount);
+
+    auto convertDeviceTsToNanoseconds = [&resolution, &maxClampedTsValue](uint64_t deviceTs) {
+        // Use clamped maximum to avoid overflows
+        return static_cast<uint64_t>((deviceTs & maxClampedTsValue) * resolution);
+    };
+
+    NEO::TimeStampData *referenceTs = static_cast<NEO::TimeStampData *>(ptrOffset(getHostAddress(), maxPacketCount * singlePacketSize));
+    auto deviceTsInNs = convertDeviceTsToNanoseconds(referenceTs->gpuTimeStamp);
+
+    auto getDuration = [&](uint64_t startTs, uint64_t endTs) {
+        const uint64_t maxValue = maxKernelTsValue;
+        startTs &= maxValue;
+        endTs &= maxValue;
+
+        if (startTs > endTs) {
+            // Resolve overflows
+            return endTs + (maxValue - startTs);
+        } else {
+            return endTs - startTs;
+        }
+    };
+
+    const auto &referenceHostTsInNs = referenceTs->cpuTimeinNS;
+
+    // High Level Approach:
+    // startTimeStamp = (referenceHostTsInNs - submitDeviceTs) + kernelDeviceTsStart
+    // deviceDuration = kernelDeviceTsEnd - kernelDeviceTsStart
+    // endTimeStamp = startTimeStamp + deviceDuration
+
+    // Get offset between Device and Host timestamps
+    const int64_t tsOffsetInNs = referenceHostTsInNs - deviceTsInNs;
+
+    auto calculateSynchronizedTs = [&](ze_synchronized_timestamp_data_ext_t *synchronizedTs, const ze_kernel_timestamp_data_t *deviceTs) {
+        // Add the offset to the kernel timestamp to find the start timestamp on the CPU timescale
+        int64_t offset = tsOffsetInNs;
+        uint64_t startTimeStampInNs = static_cast<uint64_t>(deviceTs->kernelStart * resolution) + offset;
+        if (startTimeStampInNs < referenceHostTsInNs) {
+            offset += static_cast<uint64_t>(convertDeviceTsToNanoseconds(maxKernelTsValue));
+            startTimeStampInNs = static_cast<uint64_t>(convertDeviceTsToNanoseconds(deviceTs->kernelStart) + offset);
+        }
+
+        // Get the kernel timestamp duration
+        uint64_t deviceDuration = getDuration(deviceTs->kernelStart, deviceTs->kernelEnd);
+        uint64_t deviceDurationNs = static_cast<uint64_t>(deviceDuration * resolution);
+        // Add the duration to the startTimeStamp to get the endTimeStamp
+        uint64_t endTimeStampInNs = startTimeStampInNs + deviceDurationNs;
+
+        synchronizedTs->kernelStart = startTimeStampInNs;
+        synchronizedTs->kernelEnd = endTimeStampInNs;
+    };
+
+    for (uint32_t index = 0; index < count; index++) {
+        calculateSynchronizedTs(&pSynchronizedTimestampsBuffer[index].global, &pKernelTimestampsBuffer[index].global);
+
+        pSynchronizedTimestampsBuffer[index].context.kernelStart = pSynchronizedTimestampsBuffer[index].global.kernelStart;
+        uint64_t deviceDuration = getDuration(pKernelTimestampsBuffer[index].context.kernelStart,
+                                              pKernelTimestampsBuffer[index].context.kernelEnd);
+        uint64_t deviceDurationNs = static_cast<uint64_t>(deviceDuration * resolution);
+        pSynchronizedTimestampsBuffer[index].context.kernelEnd = pSynchronizedTimestampsBuffer[index].context.kernelStart +
+                                                                 deviceDurationNs;
     }
-    return packetsInUse;
 }
 
 template <typename TagSizeT>
-uint32_t EventImp<TagSizeT>::getPacketsUsedInLastKernel() {
-    return kernelEventCompletionData[getCurrKernelDataIndex()].getPacketsUsed();
+ze_result_t EventImp<TagSizeT>::queryKernelTimestampsExt(Device *device, uint32_t *pCount, ze_event_query_kernel_timestamps_results_ext_properties_t *pResults) {
+
+    if (*pCount == 0) {
+        return queryTimestampsExp(device, pCount, nullptr);
+    }
+
+    if (queryStatus(0) != ZE_RESULT_SUCCESS) {
+        return ZE_RESULT_NOT_READY;
+    }
+
+    ze_result_t status = queryTimestampsExp(device, pCount, pResults->pKernelTimestampsBuffer);
+
+    if (status == ZE_RESULT_SUCCESS && hasKernelMappedTsCapability) {
+        getSynchronizedKernelTimestamps(pResults->pSynchronizedTimestampsBuffer, *pCount, pResults->pKernelTimestampsBuffer);
+    }
+    return status;
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::getEventPool(ze_event_pool_handle_t *phEventPool) {
+    *phEventPool = eventPool;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::getSignalScope(ze_event_scope_flags_t *pSignalScope) {
+    *pSignalScope = signalScope;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <typename TagSizeT>
+ze_result_t EventImp<TagSizeT>::getWaitScope(ze_event_scope_flags_t *pWaitScope) {
+    *pWaitScope = waitScope;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <typename TagSizeT>
+uint32_t EventImp<TagSizeT>::getPacketsInUse() const {
+    return kernelEventCompletionData.getPacketsUsed();
 }
 
 template <typename TagSizeT>
 void EventImp<TagSizeT>::setPacketsInUse(uint32_t value) {
-    kernelEventCompletionData[getCurrKernelDataIndex()].setPacketsUsed(value);
+    kernelEventCompletionData.setPacketsUsed(value);
 }
 
 template <typename TagSizeT>
-void EventImp<TagSizeT>::resetKernelCountAndPacketUsedCount() {
-    for (auto i = 0u; i < this->kernelCount; i++) {
-        this->kernelEventCompletionData[i].setPacketsUsed(1);
-    }
-    this->kernelCount = 1;
+void EventImp<TagSizeT>::resetPacketsUsedCount() {
+    this->kernelEventCompletionData.setPacketsUsed(1);
 }
 
 template <typename TagSizeT>
 uint64_t EventImp<TagSizeT>::getPacketAddress(Device *device) {
-    uint64_t address = getGpuAddress(device);
-    for (uint32_t i = 0; i < kernelCount - 1; i++) {
-        address += kernelEventCompletionData[i].getPacketsUsed() *
-                   singlePacketSize;
-    }
-    return address;
+    return getGpuAddress(device);
 }
 
 template <typename TagSizeT>
-void EventImp<TagSizeT>::setRemainingPackets(TagSizeT eventVal, void *nextPacketAddress, uint32_t packetsAlreadySet) {
+void EventImp<TagSizeT>::setRemainingPackets(TagSizeT eventVal, uint64_t nextPacketGpuVa, void *nextPacketAddress, uint32_t packetsAlreadySet) {
+    const uint64_t copyData = eventVal;
+
     if (getMaxPacketsCount() > packetsAlreadySet) {
         uint32_t remainingPackets = getMaxPacketsCount() - packetsAlreadySet;
         for (uint32_t i = 0; i < remainingPackets; i++) {
-            memcpy_s(nextPacketAddress, sizeof(TagSizeT), static_cast<void *>(&eventVal), sizeof(TagSizeT));
+            copyDataToEventAlloc(nextPacketAddress, nextPacketGpuVa, sizeof(TagSizeT), &copyData);
             nextPacketAddress = ptrOffset(nextPacketAddress, this->singlePacketSize);
+            nextPacketGpuVa = ptrOffset(nextPacketGpuVa, this->singlePacketSize);
         }
     }
 }
 
+template <typename TagSizeT>
+TaskCountType EventImp<TagSizeT>::flushTagUpdateForHostSync(NEO::CommandStreamReceiver &csrForCacheFlush) const {
+    TaskCountType signalTaskCount = 0;
+    if (!this->getCleanupTaskCount(&csrForCacheFlush, signalTaskCount)) {
+        return csrForCacheFlush.flushTagUpdateIfRequired();
+    }
+
+    // Tag is written only by submissions with a cache flushing tag update, so once it reaches
+    // the signal task count the signal submission is flushed, without waiting for later work.
+    csrForCacheFlush.flushTagUpdateIfRequired(signalTaskCount);
+    return signalTaskCount;
+}
+
+template <typename TagSizeT>
+bool EventImp<TagSizeT>::isGpuHangDetectedOnSignalingContexts(const NEO::CommandStreamReceiver &csrForCacheFlush) const {
+    if (csrForCacheFlush.isGpuHangDetected()) {
+        return true;
+    }
+    return std::any_of(this->signalerPreviousContexts.begin(), this->signalerPreviousContexts.end(),
+                       [](const auto &previousContext) { return previousContext.first->isGpuHangDetected(); });
+}
+
+template <typename TagSizeT>
+bool EventImp<TagSizeT>::isCacheFlushRequiredForHostSync() const {
+    if (!isDcFlushAllowed) {
+        return false;
+    }
+    if (isDualCopyOffloadEvent) {
+        return true;
+    }
+
+    return !isHeaplessModeEnabled && (isCounterBased() || (inOrderExecHelper.isDataAssigned() && isNonCoherentTimestampsModeEnabled));
+}
+
+template <typename TagSizeT>
+bool EventImp<TagSizeT>::isPatchPreambleCounterCompleted(int64_t timeSinceWait, bool blockOnMiss) {
+    const auto counterValue = inOrderExecHelper.getPatchPreambleCounter();
+    auto hostAddress = inOrderExecHelper.getPatchPreambleHostAddress();
+    const auto hostPartitions = inOrderExecHelper.getEventData()->hostPartitions;
+    const auto partitionOffset = device->getL0GfxCoreHelper().getImmediateWritePostSyncOffset();
+
+    for (uint32_t partition = 0; partition < hostPartitions; partition++) {
+        if (!NEO::WaitUtils::pollFunctionWithPredicate<const uint64_t>(hostAddress, counterValue, std::greater_equal<uint64_t>(), timeSinceWait,
+                                                                       NEO::WaitUtils::counterValueForEventHostSync,
+                                                                       NEO::WaitUtils::waitPkgThresholdForEventHostSyncInMicroSeconds, blockOnMiss)) {
+            return false;
+        }
+        hostAddress = ptrOffset(hostAddress, partitionOffset);
+    }
+    return true;
+}
 } // namespace L0

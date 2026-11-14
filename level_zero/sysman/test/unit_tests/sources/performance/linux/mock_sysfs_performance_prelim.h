@@ -1,17 +1,21 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/sysman/source/linux/sysman_fs_access.h"
-#include "level_zero/sysman/source/performance/linux/sysman_os_performance_imp_prelim.h"
-#include "level_zero/sysman/source/performance/sysman_performance.h"
-#include "level_zero/sysman/source/performance/sysman_performance_imp.h"
+
+#include "level_zero/sysman/source/api/performance/linux/sysman_os_performance_imp.h"
+#include "level_zero/sysman/source/api/performance/sysman_performance.h"
+#include "level_zero/sysman/source/api/performance/sysman_performance_imp.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+
+#include <list>
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 const std::string mediaFreqFactorSubDevice0("gt/gt0/media_freq_factor");
@@ -24,7 +28,7 @@ const std::string baseFreqFactorSubDevice1("gt/gt1/base_freq_factor");
 const std::string baseScaleSubDevice1("gt/gt1/base_freq_factor.scale");
 const std::string pwrBalance("sys_pwr_balance");
 
-struct MockPerformanceSysfsAccess : public L0::Sysman::SysfsAccess {
+struct MockPerformanceSysfsAccess : public L0::Sysman::SysFsAccessInterface {
     ze_result_t mockReadResult = ZE_RESULT_SUCCESS;
     ze_result_t mockCanReadResult = ZE_RESULT_SUCCESS;
     ze_bool_t isComputeInvalid = false;
@@ -112,7 +116,7 @@ struct MockPerformanceSysfsAccess : public L0::Sysman::SysfsAccess {
         return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
     }
 
-    ze_result_t write(const std::string file, const double val) override {
+    ze_result_t write(const std::string &file, const double val) override {
         if ((file.compare(baseFreqFactorSubDevice0) == 0) || (file.compare(baseFreqFactorSubDevice1) == 0)) {
             mockBaseVal1 = val;
         } else if ((file.compare(mediaFreqFactorSubDevice0) == 0) || (file.compare(mediaFreqFactorSubDevice1) == 0)) {
@@ -156,8 +160,9 @@ class PublicLinuxPerformanceImp : public L0::Sysman::LinuxPerformanceImp {
   public:
     PublicLinuxPerformanceImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId, zes_engine_type_flag_t domain) : L0::Sysman::LinuxPerformanceImp(pOsSysman, onSubdevice, subdeviceId, domain) {}
     using L0::Sysman::LinuxPerformanceImp::domain;
-    using L0::Sysman::LinuxPerformanceImp::pSysfsAccess;
+    using L0::Sysman::LinuxPerformanceImp::pSysmanKmdInterface;
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

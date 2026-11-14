@@ -1,12 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "opencl/source/accelerators/intel_accelerator.h"
-#include "opencl/source/helpers/base_object.h"
+#include "opencl/source/api/dispatch.h"
 #include "opencl/source/sharings/sharing_factory.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
@@ -26,11 +25,10 @@ struct VABaseObjectTests : public ::testing::Test {
 
 typedef ::testing::Types<
     MockPlatform,
-    IntelAccelerator,
     MockCommandQueue>
     BaseObjectTypes;
 
-TYPED_TEST_CASE(VABaseObjectTests, BaseObjectTypes);
+TYPED_TEST_SUITE(VABaseObjectTests, BaseObjectTypes);
 
 TYPED_TEST(VABaseObjectTests, GivenCommonRuntimeThenDispatchTableAtFirstPointerInObject) {
     TypeParam objectDrv;

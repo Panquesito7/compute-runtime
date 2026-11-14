@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,11 @@
 
 #include "level_zero/sysman/test/unit_tests/sources/linux/nl_api/mock_nl_dll.h"
 
+#include "gtest/gtest.h"
+#include "iaf_netlink.h"
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 class PublicNlApi : public L0::Sysman::NlApi {
@@ -57,6 +61,7 @@ TEST_F(SysmanNlApiFixture, GivenNlApiWhenMissingDllEntryPointThenVerifyLoadEntry
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nl_socket_modify_cb"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_data"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_get_u32"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_get_string"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_get_u64"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_get_u8"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_is_nested"));
@@ -73,6 +78,13 @@ TEST_F(SysmanNlApiFixture, GivenNlApiWhenMissingDllEntryPointThenVerifyLoadEntry
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nlmsg_attrlen"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nlmsg_free"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nlmsg_hdr"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_nest_start"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_nest_end"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("genl_ctrl_resolve_grp"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nl_socket_add_membership"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nl_socket_drop_membership"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nl_socket_set_nonblocking"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nl_socket_get_fd"));
 }
 
 TEST_F(SysmanNlApiFixture, GivenNlApiWhenMissingDllHandleThenVerifyLoadEntryPointsFails) {
@@ -134,6 +146,10 @@ TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlSendAutoRe
 
 TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaDataReturnsValidPointer) {
     EXPECT_NE(nullptr, testNlApi.nlaData(&MockNlDll::mockNlattr));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaGetStringReturnsValue) {
+    EXPECT_STREQ(const_cast<char *>(MockNlDll::mockStr.c_str()), testNlApi.nlaGetString(&MockNlDll::mockNlattr));
 }
 
 TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaGetU32ReturnsValue) {
@@ -206,5 +222,35 @@ TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlmsgAttrlen
 TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlmsgHdrReturnsNlmsghdr) {
     EXPECT_EQ(&MockNlDll::mockNlmsghdr, testNlApi.nlmsgHdr(&MockNlDll::mockNlMsg));
 }
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaNestStartReturnsZero) {
+    EXPECT_EQ(&MockNlDll::mockNlattr, testNlApi.nlaNestStart(&MockNlDll::mockNlMsg, IAF_ATTR_FABRIC_PORT));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaNestEndReturnsZero) {
+    EXPECT_EQ(0, testNlApi.nlaNestEnd(&MockNlDll::mockNlMsg, &MockNlDll::mockNlattr));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyGenlCtrlResolveGrpReturnsGroupId) {
+    EXPECT_EQ(MockNlDll::mockGroupId, testNlApi.genlCtrlResolveGrp(&MockNlDll::mockNlSock, MockNlDll::mockFamilyName, MockNlDll::mockGroupName));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlSocketAddMembershipReturnsZero) {
+    EXPECT_EQ(0, testNlApi.nlSocketAddMembership(&MockNlDll::mockNlSock, MockNlDll::mockGroupId));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlSocketDropMembershipReturnsZero) {
+    EXPECT_EQ(0, testNlApi.nlSocketDropMembership(&MockNlDll::mockNlSock, MockNlDll::mockGroupId));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlSocketSetNonblockingReturnsZero) {
+    EXPECT_EQ(0, testNlApi.nlSocketSetNonblocking(&MockNlDll::mockNlSock));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlSocketGetFdReturnsFd) {
+    EXPECT_EQ(MockNlDll::mockFd, testNlApi.nlSocketGetFd(&MockNlDll::mockNlSock));
+}
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,6 +16,10 @@
 #include "shared/test/common/mocks/mock_gmm_resource_info.h"
 
 #include "gtest/gtest.h"
+
+#include <algorithm>
+#include <utility>
+#include <vector>
 
 using namespace NEO;
 
@@ -45,7 +49,8 @@ struct MockGmmHandleAllocator : NEO::GmmHandleAllocator {
 TEST(GmmResourceInfo, WhenGmmHandleAllocatorIsPresentThenItsBeingUsedForCreatingGmmResourceInfoHandles) {
     auto hwInfo = *defaultHwInfo;
     MockExecutionEnvironment executionEnvironment{&hwInfo};
-    NEO::MockGmmClientContext gmmClientCtx{*executionEnvironment.rootDeviceEnvironments[0]};
+    NEO::MockGmmClientContext gmmClientCtx{};
+    gmmClientCtx.initialize(*executionEnvironment.rootDeviceEnvironments[0]);
     gmmClientCtx.setHandleAllocator(std::make_unique<MockGmmHandleAllocator>());
     auto handleAllocator = static_cast<MockGmmHandleAllocator *>(gmmClientCtx.getHandleAllocator());
 
@@ -78,7 +83,8 @@ TEST(GmmResourceInfo, WhenGmmHandleAllocatorIsPresentThenItsBeingUsedForCreating
 TEST(GmmResourceInfo, GivenGmmResourceInfoAndHandleAllocatorInClientContextWhenDecodingResourceInfoThenExistingHandleIsOpened) {
     auto hwInfo = *defaultHwInfo;
     MockExecutionEnvironment executionEnvironment{&hwInfo};
-    NEO::MockGmmClientContext gmmClientCtx{*executionEnvironment.rootDeviceEnvironments[0]};
+    NEO::MockGmmClientContext gmmClientCtx{};
+    gmmClientCtx.initialize(*executionEnvironment.rootDeviceEnvironments[0]);
     gmmClientCtx.setHandleAllocator(std::make_unique<MockGmmHandleAllocator>());
     auto handleAllocator = static_cast<MockGmmHandleAllocator *>(gmmClientCtx.getHandleAllocator());
 
@@ -136,7 +142,8 @@ TEST(GmmResourceInfo, GivenGmmResourceInfoAndHandleAllocatorInClientContextWhenD
 TEST(GmmResourceInfo, GivenResourceInfoWhenRefreshIsCalledTiwceThenOpenHandleIsCalledTwice) {
     auto hwInfo = *defaultHwInfo;
     MockExecutionEnvironment executionEnvironment{&hwInfo};
-    NEO::MockGmmClientContext gmmClientCtx{*executionEnvironment.rootDeviceEnvironments[0]};
+    NEO::MockGmmClientContext gmmClientCtx{};
+    gmmClientCtx.initialize(*executionEnvironment.rootDeviceEnvironments[0]);
     gmmClientCtx.setHandleAllocator(std::make_unique<MockGmmHandleAllocator>());
     auto handleAllocator = static_cast<MockGmmHandleAllocator *>(gmmClientCtx.getHandleAllocator());
 
@@ -208,29 +215,63 @@ TEST(GmmResourceInfo, GivenEmptyHandleWhenUsingBaseHandleAllocatorThenOpenHandle
     defaultAllocator.destroyHandle(handle);
 }
 
-TEST(GmmHelperTests, WhenInitializingGmmHelperThenCorrectAddressWidthIsSet) {
-    auto hwInfo = *defaultHwInfo;
-    {
-        hwInfo.capabilityTable.gpuAddressSpace = maxNBitValue(48);
-        MockExecutionEnvironment executionEnvironment{&hwInfo};
-        auto gmmHelper = executionEnvironment.rootDeviceEnvironments[0]->getGmmHelper();
+TEST(GmmResourceInfoFlagsTest, givenTilingFlagsWhenGettingTilingModeThenTilingModeIsReturned) {
+    for (const auto &[setFlag, expectedTilingMode] : std::vector<std::pair<void (*)(GMM_RESOURCE_FLAG &), ImageTilingMode>>{
+             {[](GMM_RESOURCE_FLAG &) {}, ImageTilingMode::notTiled},
+             {[](GMM_RESOURCE_FLAG &flags) { flags.Info.Linear = 1; }, ImageTilingMode::notTiled},
+             {[](GMM_RESOURCE_FLAG &flags) { flags.Info.TiledW = 1; }, ImageTilingMode::tiledW},
+             {[](GMM_RESOURCE_FLAG &flags) { flags.Info.TiledX = 1; }, ImageTilingMode::tiledX},
+             {[](GMM_RESOURCE_FLAG &flags) { flags.Info.TiledY = 1; }, ImageTilingMode::tiledY},
+             {[](GMM_RESOURCE_FLAG &flags) { flags.Info.Tile4 = 1; }, ImageTilingMode::tiled4},
+             {[](GMM_RESOURCE_FLAG &flags) { flags.Info.Tile64 = 1; }, ImageTilingMode::tiled64}}) {
+        MockGmmResourceInfoWithFlags resourceInfo;
+        setFlag(resourceInfo.resourceFlags);
+        EXPECT_EQ(expectedTilingMode, resourceInfo.getTilingMode());
+    }
+}
 
-        auto addressWidth = gmmHelper->getAddressWidth();
-        EXPECT_EQ(48u, addressWidth);
-    }
-    {
-        hwInfo.capabilityTable.gpuAddressSpace = maxNBitValue(36);
-        MockExecutionEnvironment executionEnvironment{&hwInfo};
-        auto gmmHelper = executionEnvironment.rootDeviceEnvironments[0]->getGmmHelper();
+TEST(GmmResourceInfoFlagsTest, givenCompressionFlagsWhenGettingCompressionTypeThenCompressionTypeIsReturned) {
+    MockGmmResourceInfoWithFlags resourceInfo;
+    EXPECT_EQ(GmmCompressionType::none, resourceInfo.getCompressionType());
 
-        auto addressWidth = gmmHelper->getAddressWidth();
-        EXPECT_EQ(48u, addressWidth);
+    resourceInfo.resourceFlags.Info.RenderCompressed = 1;
+    EXPECT_EQ(GmmCompressionType::render, resourceInfo.getCompressionType());
+
+    resourceInfo.resourceFlags.Info.RenderCompressed = 0;
+    resourceInfo.resourceFlags.Info.MediaCompressed = 1;
+    EXPECT_EQ(GmmCompressionType::media, resourceInfo.getCompressionType());
+
+    resourceInfo.resourceFlags.Info.RenderCompressed = 1;
+    EXPECT_THROW(resourceInfo.getCompressionType(), std::exception);
+}
+
+TEST(GmmResourceInfoFlagsTest, givenCompressedResourceWithNotCompressedFlagWhenGettingCompressionTypeThenNoneIsReturned) {
+    for (const auto mediaCompressed : {0u, 1u}) {
+        MockGmmResourceInfoWithFlags resourceInfo;
+        resourceInfo.resourceFlags.Info.MediaCompressed = mediaCompressed;
+        resourceInfo.resourceFlags.Info.RenderCompressed = 1u - mediaCompressed;
+
+        resourceInfo.resourceFlags.Info.NotCompressed = 1;
+        EXPECT_EQ(GmmCompressionType::none, resourceInfo.getCompressionType());
     }
-    {
-        hwInfo.capabilityTable.gpuAddressSpace = maxNBitValue(57);
-        MockExecutionEnvironment executionEnvironment{&hwInfo};
-        auto gmmHelper = executionEnvironment.rootDeviceEnvironments[0]->getGmmHelper();
-        auto addressWidth = gmmHelper->getAddressWidth();
-        EXPECT_EQ(57u, addressWidth);
-    }
+}
+
+TEST(GmmResourceInfoFlagsTest, givenSurfaceFlagsWhenQueryingSurfacePropertiesThenFlagValuesAreReturned) {
+    MockGmmResourceInfoWithFlags resourceInfo;
+    EXPECT_FALSE(resourceInfo.isCacheable());
+    EXPECT_FALSE(resourceInfo.isDepthResource());
+    EXPECT_FALSE(resourceInfo.isMCS());
+    EXPECT_FALSE(resourceInfo.isIndirectClearColor());
+    EXPECT_FALSE(resourceInfo.isCCS());
+
+    resourceInfo.resourceFlags.Info.Cacheable = 1;
+    resourceInfo.resourceFlags.Gpu.Depth = 1;
+    resourceInfo.resourceFlags.Gpu.MCS = 1;
+    resourceInfo.resourceFlags.Gpu.IndirectClearColor = 1;
+    resourceInfo.resourceFlags.Gpu.CCS = 1;
+    EXPECT_TRUE(resourceInfo.isCacheable());
+    EXPECT_TRUE(resourceInfo.isDepthResource());
+    EXPECT_TRUE(resourceInfo.isMCS());
+    EXPECT_TRUE(resourceInfo.isIndirectClearColor());
+    EXPECT_TRUE(resourceInfo.isCCS());
 }

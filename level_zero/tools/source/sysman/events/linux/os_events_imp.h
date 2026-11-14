@@ -1,18 +1,27 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+
 #include "level_zero/tools/source/sysman/events/os_events.h"
-#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
 #include "level_zero/tools/source/sysman/linux/udev/udev_lib.h"
 
-namespace L0 {
+#include <map>
+#include <mutex>
 
-class LinuxEventsImp : public OsEvents, NEO::NonCopyableOrMovableClass {
+namespace L0 {
+class LinuxSysmanImp;
+class Ras;
+class UdevLib;
+struct OsSysman;
+struct SysmanDeviceImp;
+
+class LinuxEventsImp : public OsEvents, NEO::NonCopyableAndNonMovableClass {
   public:
     bool eventListen(zes_event_type_flags_t &pEvent, uint64_t timeout) override;
     ze_result_t eventRegister(zes_event_type_flags_t events) override;

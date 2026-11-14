@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,18 +7,19 @@
 
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
-#include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/windows/wddm_device_command_stream.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/os_interface/windows/mock_wddm_memory_manager.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "opencl/test/unit_test/fixtures/buffer_fixture.h"
+#include "opencl/source/kernel/kernel.h"
+#include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/helpers/cl_execution_environment_helper.h"
 #include "opencl/test/unit_test/helpers/cl_hw_parse.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
 
@@ -29,7 +30,7 @@ struct EnqueueBufferWindowsTest : public ClHardwareParse,
     }
 
     void SetUp() override {
-        DebugManager.flags.EnableBlitterForEnqueueOperations.set(0);
+        debugManager.flags.EnableBlitterForEnqueueOperations.set(0);
         executionEnvironment = getClExecutionEnvironmentImpl(hwInfo, 1);
     }
 
@@ -106,13 +107,13 @@ HWTEST_F(EnqueueBufferWindowsTest, givenMisalignedHostPtrWhenEnqueueReadBufferCa
     ASSERT_NE(nullptr, hostPtrAllocation);
 
     uint64_t gpuVa = hostPtrAllocation->getGpuAddress();
-    cmdQ->finish();
+    cmdQ->finish(false);
 
     parseCommands<FamilyType>(*cmdQ);
     auto &kernelInfo = kernel->getKernelInfo();
 
     if (hwInfo->capabilityTable.gpuAddressSpace == MemoryConstants::max48BitAddress) {
-        const auto &surfaceStateDst = getSurfaceState<FamilyType>(&cmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), 1);
+        const auto &surfaceStateDst = getSurfaceState<FamilyType>(&cmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0), 1);
 
         const auto &arg1AsPtr = kernelInfo.getArgDescriptorAt(1).as<ArgDescPointer>();
         if (arg1AsPtr.pointerSize == sizeof(uint64_t)) {

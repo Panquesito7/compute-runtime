@@ -1,0 +1,130 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper.h"
+
+namespace L0 {
+namespace Sysman {
+
+template <PRODUCT_FAMILY gfxProduct>
+class SysmanProductHelperHw : public SysmanProductHelper {
+  public:
+    static std::unique_ptr<SysmanProductHelper> create() {
+        return std::make_unique<SysmanProductHelperHw<gfxProduct>>();
+    }
+
+    // Frequency
+    void getFrequencyStepSize(double *pStepSize) override;
+    bool isFrequencySetRangeSupported() override;
+    bool isMediaDomainSupported(LinuxSysmanImp *pLinuxSysmanImp) override;
+    bool isMemoryDomainSupported() override;
+    ze_result_t getActualFrequency(LinuxSysmanImp *pLinuxSysmanImp, zes_freq_domain_t frequencyDomain, uint32_t subdeviceId, double *pActual) override;
+    ze_result_t getCurrentVoltage(LinuxSysmanImp *pLinuxSysmanImp, zes_freq_domain_t frequencyDomain, uint32_t subdeviceId, double *pVoltage) override;
+    zes_freq_throttle_reason_flags_t getThrottleReasons(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subdeviceId, void *pNext) override;
+
+    // Memory
+    ze_result_t getMemoryProperties(zes_mem_properties_t *pProperties, LinuxSysmanImp *pLinuxSysmanImp, NEO::Drm *pDrm, SysmanKmdInterface *pSysmanKmdInterface, uint32_t subDeviceId, bool isSubdevice) override;
+    ze_result_t getMemoryBandwidth(zes_mem_bandwidth_t *pBandwidth, LinuxSysmanImp *pLinuxSysmanImp, uint32_t subdeviceId) override;
+    void getMemoryHealthIndicator(LinuxSysmanImp *pLinuxSysmanImp, zes_mem_health_t *health) override;
+    ze_result_t getNumberOfMemoryChannels(LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pNumChannels) override;
+    ze_result_t getMemoryVendorId(LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pVendorId) override;
+
+    // Performance
+    void getMediaPerformanceFactorMultiplier(const double performanceFactor, double *pMultiplier) override;
+    bool isPerfFactorSupported() override;
+
+    // temperature
+    ze_result_t getGlobalMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) override;
+    ze_result_t getGpuMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) override;
+    ze_result_t getMemoryMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) override;
+    ze_result_t getVoltageRegulatorTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId, uint32_t sensorIndex) override;
+    ze_result_t getGpuBoardTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId, uint32_t sensorIndex) override;
+    ze_result_t getVoltageRegulatorMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) override;
+    ze_result_t getGpuBoardMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) override;
+    ze_result_t getCompositeTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) override;
+    bool isMemoryMaxTemperatureSupported() override;
+    bool isTemperatureReadFromSysfsSupported() override;
+    void getSupportedSensors(std::map<zes_temp_sensors_t, uint32_t> &supportedSensorTypeMap) override;
+
+    // Ras
+    RasInterfaceType getGtRasUtilInterface() override;
+    RasInterfaceType getHbmRasUtilInterface() override;
+
+    // global ops
+    bool isRepairStatusSupported() override;
+    ze_result_t memoryGetPageOfflineStateExp(SysFsAccessInterface *pSysFsAccess, zes_intel_mem_page_status_exp_t pageStatus, uint32_t *pCount, std::vector<MemPageInfo> &memPageInfoList, zes_intel_mem_page_info_exp_t *pPageOfflineInfo) override;
+    ze_result_t getMaxMemoryOfflinePages(SysFsAccessInterface *pSysFsAccess, uint32_t *pMaxOfflinePages) override;
+    ze_result_t getSocUid(SysFsAccessInterface *pSysFsAccess, zes_uuid_t *pSocUid) override;
+    std::string getGpuGeneration() override;
+    std::string getProductCodeName() override;
+
+    // power
+    int32_t getPowerLimitValue(uint64_t value) override;
+    int32_t getPowerMinLimit(const int32_t &defaultLimit) override;
+    uint64_t setPowerLimitValue(int32_t value) override;
+    zes_limit_unit_t getPowerLimitUnit() override;
+    std::string getPackageCriticalPowerLimitFile() override;
+    SysfsValueUnit getPackageCriticalPowerLimitNativeUnit() override;
+    ze_result_t getPowerEnergyCounter(zes_power_energy_counter_t *pEnergy, LinuxSysmanImp *pLinuxSysmanImp, zes_power_domain_t powerDomain, uint32_t subDeviceId) override;
+    ze_result_t getLimitsExt2(SysmanKmdInterface *pSysmanKmdInterface, const std::map<std::string, std::pair<std::string, bool>> &powerLimitFiles, uint32_t *pLimit) override;
+    ze_result_t setLimitsExt2(SysmanKmdInterface *pSysmanKmdInterface, const std::map<std::string, std::pair<std::string, bool>> &powerLimitFiles, zes_power_domain_t powerDomain, const uint32_t limit) override;
+    ze_result_t getPowerUsage(LinuxSysmanImp *pLinuxSysmanImp, zes_power_domain_t powerDomain, uint32_t *pInstantPower, uint32_t *pAveragePower) override;
+
+    // standby
+    bool isStandbySupported(SysmanKmdInterface *pSysmanKmdInterface) override;
+    bool isSetStandbyModeSupported() override;
+    std::string getStandbyModeFile(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subDeviceId) override;
+    ze_result_t getStandbyMode(SysFsAccessInterface *pSysfsAccess, const std::string &standbyModeFile, zes_standby_promo_mode_t &mode) override;
+    ze_result_t setStandbyMode(SysFsAccessInterface *pSysfsAccess, const std::string &standbyModeFile, zes_standby_promo_mode_t mode) override;
+
+    // Firmware
+    void getDeviceSupportedFwTypes(FirmwareUtil *pFwInterface, std::vector<std::string> &fwTypes) override;
+    bool isFlashOverrideSupported() override;
+
+    // Ecc
+    bool isEccConfigurationSupported() override;
+    ze_result_t getEccAvailable(LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t *pAvailable) override;
+    ze_result_t getEccConfigurable(LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t *pConfigurable) override;
+    ze_result_t getEccState(LinuxSysmanImp *pLinuxSysmanImp, zes_device_ecc_properties_t *pState) override;
+
+    // Device
+    bool isUpstreamPortConnected() override;
+    bool isZesInitSupported() override;
+
+    // Pci
+    ze_result_t getPciProperties(zes_pci_properties_t *pProperties) override;
+    ze_result_t getPciStats(zes_pci_stats_t *pStats, LinuxSysmanImp *pLinuxSysmanImp) override;
+    ze_result_t getPciConfigState(zes_intel_pci_config_exp_state_t *pState, LinuxSysmanImp *pLinuxSysmanImp) override;
+    bool isPcieDowngradeSupported() override;
+    int32_t maxPcieGenSupported() override;
+
+    // Vf Management
+    bool isVfMemoryUtilizationSupported() override;
+
+    // Netlink
+    bool isNetlinkEventSupported() override;
+
+    // Pmt
+    bool isPmtBasedPowerSupported(zes_power_domain_t powerDomain) override;
+
+    ~SysmanProductHelperHw() override = default;
+
+    const std::map<std::string, std::map<std::string, uint64_t>> *getGuidToKeyOffsetMap() override;
+};
+
+template <PRODUCT_FAMILY gfxProduct>
+struct EnableSysmanProductHelper {
+    EnableSysmanProductHelper() {
+        auto sysmanProductHelperCreateFunction = SysmanProductHelperHw<gfxProduct>::create;
+        sysmanProductHelperFactory[gfxProduct] = sysmanProductHelperCreateFunction;
+    }
+};
+
+} // namespace Sysman
+} // namespace L0

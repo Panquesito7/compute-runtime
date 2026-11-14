@@ -1,17 +1,25 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/image_aub_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <tuple>
+#include <vector>
 
 using namespace NEO;
 
@@ -33,6 +41,7 @@ struct AUBWriteImage
       public ::testing::WithParamInterface<std::tuple<uint32_t /*cl_channel_type*/, uint32_t /*cl_channel_order*/, WriteImageParams>>,
       public ::testing::Test {
     void SetUp() override {
+        debugManager.flags.EnableFreeMemory.set(false);
         ImageAubFixture::setUp(enableBlitter);
     }
 
@@ -108,7 +117,7 @@ struct AUBWriteImage
 
         auto retVal = CL_INVALID_VALUE;
         cl_mem_flags flags = 0;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         dstImage.reset(Image::create(
             context,
             ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context->getDevice(0)->getDevice()),
@@ -148,7 +157,7 @@ struct AUBWriteImage
         retVal = pCmdQ->enqueueReadImage(dstImage.get(), CL_TRUE, imgOrigin, imgRegion, 0, 0, readMemory, nullptr, 0, nullptr, nullptr);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
-        retVal = pCmdQ->finish();
+        retVal = pCmdQ->finish(false);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
         auto pDstMemory = readMemory;
@@ -158,6 +167,8 @@ struct AUBWriteImage
         auto rowPitch = dstImage->getHostPtrRowPitch();
         auto slicePitch = dstImage->getHostPtrSlicePitch();
 
+        std::vector<uint8_t> expectedRow(testWidth * elementSize);
+
         for (size_t z = 0; z < testDepth; ++z) {
             for (size_t y = 0; y < testHeight; ++y) {
                 for (size_t x = 0; x < testWidth; ++x) {
@@ -166,12 +177,13 @@ struct AUBWriteImage
                         y >= origin[1] && y < (origin[1] + region[1]) &&
                         x >= origin[0] && x < (origin[0] + region[0])) {
                         // this texel should be updated
-                        AUBCommandStreamFixture::expectMemory<FamilyType>(&pDstMemory[pos], pSrcMemory, elementSize);
+                        memcpy_s(&expectedRow[pos], elementSize, pSrcMemory, elementSize);
                         pSrcMemory = ptrOffset(pSrcMemory, elementSize);
                     } else {
-                        AUBCommandStreamFixture::expectMemory<FamilyType>(&pDstMemory[pos], referenceMemory.data(), elementSize);
+                        memcpy_s(&expectedRow[pos], elementSize, referenceMemory.data(), elementSize);
                     }
                 }
+                AUBCommandStreamFixture::expectMemory<FamilyType>(pDstMemory, expectedRow.data(), testWidth * elementSize);
                 pDstMemory = ptrOffset(pDstMemory, rowPitch);
                 if (y >= origin[1] && y < origin[1] + region[1] &&
                     z >= origin[2] && z < origin[2] + region[2]) {
@@ -190,7 +202,7 @@ struct AUBWriteImage
 
     template <typename FamilyType>
     void testWriteImageMisaligned(size_t offset, size_t size, size_t pixelSize) {
-        DebugManager.flags.ForceLinearImages.set(true);
+        debugManager.flags.ForceLinearImages.set(true);
 
         const size_t testWidth = 14 / pixelSize;
         const size_t testHeight = 4;
@@ -230,7 +242,7 @@ struct AUBWriteImage
         auto srcMemoryUnaligned = ptrOffset(reinterpret_cast<uint8_t *>(srcMemoryAligned), 4); // ensure non cacheline-aligned (but aligned to 4) hostPtr to create non-zerocopy image
 
         cl_mem_flags flags = CL_MEM_USE_HOST_PTR | CL_MEM_READ_WRITE;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, pClDevice->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         auto retVal = CL_INVALID_VALUE;
         auto image = std::unique_ptr<Image>(Image::create(
             context,
@@ -268,7 +280,7 @@ struct AUBWriteImage
             nullptr);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
-        pCmdQ->finish();
+        pCmdQ->finish(false);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
         auto imageRowPitch = image->getImageDesc().image_row_pitch;
@@ -283,13 +295,13 @@ struct AUBWriteImage
 
         alignedFree(srcMemoryAligned);
     }
-
+    DebugManagerStateRestore restorer;
     std::unique_ptr<Image> dstImage;
 };
 
 using AUBWriteImageCCS = AUBWriteImage<false>;
 
-HWTEST2_F(AUBWriteImageCCS, GivenMisalignedHostPtrWhenWritingImageThenExpectationsAreMet, ImagesSupportedMatcher) {
+HWTEST2_F(AUBWriteImageCCS, GivenMisalignedHostPtrWhenWritingImageThenExpectationsAreMet, ImageSupport) {
     const std::vector<size_t> pixelSizes = {1, 2, 4};
     const std::vector<size_t> offsets = {0, 4, 8, 12};
     const std::vector<size_t> sizes = {3, 2, 1};
@@ -303,22 +315,29 @@ HWTEST2_F(AUBWriteImageCCS, GivenMisalignedHostPtrWhenWritingImageThenExpectatio
     }
 }
 
-HWTEST2_P(AUBWriteImageCCS, GivenUnalignedMemoryWhenWritingImageThenExpectationsAreMet, ImagesSupportedMatcher) {
+HWTEST2_P(AUBWriteImageCCS, GivenUnalignedMemoryWhenWritingImageThenExpectationsAreMet, ImageSupport) {
     testWriteImageUnaligned<FamilyType>();
 }
 
-INSTANTIATE_TEST_CASE_P(AUBWriteImage_simple, AUBWriteImageCCS,
-                        ::testing::Combine(::testing::Values( // formats
-                                               CL_UNORM_INT8, CL_SIGNED_INT16,
-                                               CL_UNSIGNED_INT32, CL_HALF_FLOAT,
-                                               CL_FLOAT),
-                                           ::testing::Values( // channels
-                                               CL_R, CL_RG, CL_RGBA),
-                                           ::testing::ValuesIn(writeImageParams)));
+INSTANTIATE_TEST_SUITE_P(AUBWriteImage_simple, AUBWriteImageCCS,
+                         ::testing::Combine(::testing::Values( // formats
+                                                CL_UNORM_INT8, CL_SIGNED_INT16,
+                                                CL_UNSIGNED_INT32, CL_HALF_FLOAT,
+                                                CL_FLOAT),
+                                            ::testing::Values( // channels
+                                                CL_R, CL_RG, CL_RGBA),
+                                            ::testing::ValuesIn(writeImageParams)));
 
 using AUBWriteImageBCS = AUBWriteImage<true>;
 
-HWTEST2_F(AUBWriteImageBCS, GivenMisalignedHostPtrWhenWritingImageWithBlitterEnabledThenExpectationsAreMet, ImagesSupportedMatcher) {
+struct AUBWriteImageBCSParam : AUBWriteImage<true> {
+    void SetUp() override {
+        debugManager.flags.EnableFreeMemory.set(false);
+        ImageAubFixture::setUp(true, std::get<2>(GetParam()).imageType);
+    }
+};
+
+HWTEST2_F(AUBWriteImageBCS, GivenMisalignedHostPtrWhenWritingImageWithBlitterEnabledThenExpectationsAreMet, ImageSupport) {
     const std::vector<size_t> pixelSizes = {1, 2, 4};
     const std::vector<size_t> offsets = {0, 4, 8, 12};
     const std::vector<size_t> sizes = {3, 2, 1};
@@ -327,28 +346,22 @@ HWTEST2_F(AUBWriteImageBCS, GivenMisalignedHostPtrWhenWritingImageWithBlitterEna
         for (auto offset : offsets) {
             for (auto size : sizes) {
                 testWriteImageMisaligned<FamilyType>(offset, size, pixelSize);
-                ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::Blit);
+                ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::blit);
             }
         }
     }
 }
 
-HWTEST2_P(AUBWriteImageBCS, GivenUnalignedMemoryWhenWritingImageWithBlitterEnabledThenExpectationsAreMet, ImagesSupportedMatcher) {
-    auto &productHelper = pCmdQ->getDevice().getProductHelper();
-    if (std::get<2>(GetParam()).imageType == CL_MEM_OBJECT_IMAGE3D &&
-        !(productHelper.isTile64With3DSurfaceOnBCSSupported(*defaultHwInfo))) {
-        GTEST_SKIP();
-    }
-
+HWTEST2_P(AUBWriteImageBCSParam, GivenUnalignedMemoryWhenWritingImageWithBlitterEnabledThenExpectationsAreMet, ImageSupport) {
     testWriteImageUnaligned<FamilyType>();
-    ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::Blit);
+    ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::blit);
 }
 
-INSTANTIATE_TEST_CASE_P(AUBWriteImage_simple, AUBWriteImageBCS,
-                        ::testing::Combine(::testing::Values( // formats
-                                               CL_UNORM_INT8, CL_SIGNED_INT16,
-                                               CL_UNSIGNED_INT32, CL_HALF_FLOAT,
-                                               CL_FLOAT),
-                                           ::testing::Values( // channels
-                                               CL_R, CL_RG, CL_RGBA),
-                                           ::testing::ValuesIn(writeImageParams)));
+INSTANTIATE_TEST_SUITE_P(AUBWriteImage_simple, AUBWriteImageBCSParam,
+                         ::testing::Combine(::testing::Values( // formats
+                                                CL_UNORM_INT8, CL_SIGNED_INT16,
+                                                CL_UNSIGNED_INT32, CL_HALF_FLOAT,
+                                                CL_FLOAT),
+                                            ::testing::Values( // channels
+                                                CL_R, CL_RG, CL_RGBA),
+                                            ::testing::ValuesIn(writeImageParams)));

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,25 +11,26 @@
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
-#include "opencl/test/unit_test/aub_tests/fixtures/multicontext_aub_fixture.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/multicontext_ocl_aub_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
-#include <array>
+#include "multitile_matchers.h"
 
-struct MultiTileBuffersXeHPAndLater : public MulticontextAubFixture, public ::testing::Test {
+struct MultiTileBuffersXeHPAndLater : public MulticontextOclAubFixture, public ::testing::Test {
     static constexpr uint32_t numTiles = 2;
 
     void SetUp() override {
-        MulticontextAubFixture::setUp(numTiles, EnabledCommandStreamers::Single, false);
+        MulticontextOclAubFixture::setUp(numTiles, EnabledCommandStreamers::single, false);
     }
     void TearDown() override {
-        MulticontextAubFixture::tearDown();
+        MulticontextOclAubFixture::tearDown();
     }
 };
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, MultiTileBuffersXeHPAndLater, givenTwoBuffersAllocatedOnDifferentTilesWhenCopiedThenDataValidates) {
+HWTEST2_F(MultiTileBuffersXeHPAndLater, givenTwoBuffersAllocatedOnDifferentTilesWhenCopiedThenDataValidates, SupportsMultiTile) {
     if constexpr (is64bit) {
 
-        constexpr size_t bufferSize = 64 * 1024u;
+        constexpr size_t bufferSize = 64 * MemoryConstants::kiloByte;
 
         char bufferTile0Memory[bufferSize] = {};
         char bufferTile1Memory[bufferSize] = {};

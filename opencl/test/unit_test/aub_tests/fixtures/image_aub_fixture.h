@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,69 +7,55 @@
 
 #pragma once
 
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 
-#include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
+#include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
+#include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 
-#include "test_traits_common.h"
-
-struct ImagesSupportedMatcher {
-    template <PRODUCT_FAMILY productFamily>
-    static constexpr bool isMatched() {
-        return TestTraits<NEO::ToGfxCoreFamily<productFamily>::get()>::imagesSupported;
-    }
-};
+#include "aub_fixture.h"
 
 namespace NEO {
-struct ImageAubFixture : public ClDeviceFixture, public AUBCommandStreamFixture {
+struct ImageAubFixture : public AUBCommandStreamFixture {
     typedef AUBCommandStreamFixture CommandStreamFixture;
 
     using AUBCommandStreamFixture::setUp;
 
-    void setUp(bool enableBlitter) {
+    void setUp(bool enableBlitter, uint32_t imageType = 0) {
         if (enableBlitter) {
 
             MockExecutionEnvironment mockExecutionEnvironment{};
             auto &productHelper = mockExecutionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->getHelper<ProductHelper>();
 
-            if (!productHelper.isBlitterForImagesSupported()) {
+            if (!productHelper.isBlitterForImagesSupported() || !productHelper.blitEnqueuePreferred(false)) {
                 GTEST_SKIP();
             }
 
-            hardwareInfo = *defaultHwInfo;
+            if (imageType == CL_MEM_OBJECT_IMAGE3D && !productHelper.isTile64With3DSurfaceOnBCSSupported(*defaultHwInfo)) {
+                GTEST_SKIP();
+            }
+
+            auto hardwareInfo = *defaultHwInfo;
             hardwareInfo.capabilityTable.blitterOperationsSupported = true;
-            ClDeviceFixture::setUpImpl(&hardwareInfo);
+            CommandStreamFixture::setUp(&hardwareInfo);
         } else {
-            ClDeviceFixture::setUp();
+            CommandStreamFixture::setUp(nullptr);
         }
-
-        context = new MockContext(pClDevice);
-
-        cl_int retVal = CL_SUCCESS;
-        auto clQueue = clCreateCommandQueueWithProperties(context, pClDevice, nullptr, &retVal);
-        EXPECT_EQ(CL_SUCCESS, retVal);
-        pCmdQ = castToObject<CommandQueue>(clQueue);
-
-        CommandStreamFixture::setUp(pCmdQ);
     }
 
     void tearDown() {
         if (pCmdQ) {
             auto blocked = pCmdQ->isQueueBlocked();
             UNRECOVERABLE_IF(blocked);
-            pCmdQ->release();
-        }
-        if (context) {
-            context->release();
         }
 
         CommandStreamFixture::tearDown();
-        ClDeviceFixture::tearDown();
     }
 
     DebugManagerStateRestore restorer;
-    CommandQueue *pCmdQ = nullptr;
-    MockContext *context = nullptr;
 };
 } // namespace NEO

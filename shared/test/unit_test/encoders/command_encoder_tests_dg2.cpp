@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,9 +16,9 @@
 using namespace NEO;
 
 using DG2CommandEncoderTest = Test<DeviceFixture>;
-HWTEST_EXCLUDE_PRODUCT(XeHPAndLaterCommandEncoderTest, whenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned_IsAtLeastXeHpCore, IGFX_DG2);
+HWTEST_EXCLUDE_PRODUCT(XeHPAndLaterCommandEncoderTest, whenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned_IsAtLeastXeCore, IGFX_DG2);
 HWTEST_EXCLUDE_PRODUCT(CommandEncoderTest, whenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned_Platforms, IGFX_DG2);
-HWTEST_EXCLUDE_PRODUCT(XeHPAndLaterCommandEncoderTest, givenCommandContainerWithDirtyHeapWhenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned_IsAtLeastXeHpCore, IGFX_DG2);
+HWTEST_EXCLUDE_PRODUCT(XeHPAndLaterCommandEncoderTest, givenCommandContainerWithDirtyHeapWhenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned_IsHeapfulRequiredAndAtLeastXeCore, IGFX_DG2);
 
 HWTEST2_F(DG2CommandEncoderTest, givenDG2WhenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned, IsDG2) {
     class MockCommandContainer : public CommandContainer {
@@ -49,7 +49,7 @@ HWTEST2_F(DG2CommandEncoderTest, givenDG2WhenGettingRequiredSizeForStateBaseAddr
 
 HWTEST2_F(DG2CommandEncoderTest, givenDG2AndCommandContainerWithDirtyHeapWhenGettingRequiredSizeForStateBaseAddressCommandThenCorrectSizeIsReturned, IsDG2) {
     auto container = CommandContainer();
-    container.setHeapDirty(HeapType::SURFACE_STATE);
+    container.setHeapDirty(HeapType::surfaceState);
 
     auto &hwInfo = *pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getMutableHardwareInfo();
 
@@ -67,16 +67,17 @@ HWTEST2_F(DG2CommandEncoderTest, givenDG2AndCommandContainerWithDirtyHeapWhenGet
 
 HWTEST2_F(DG2CommandEncoderTest, givenInterfaceDescriptorDataWhenForceThreadGroupDispatchSizeVariableIsDefaultThenThreadGroupDispatchSizeIsNotChanged, IsDG2) {
     using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     INTERFACE_DESCRIPTOR_DATA iddArg;
-    WALKER_TYPE walkerCmd{};
+    DefaultWalkerType walkerCmd{};
+    uint32_t threadGroups[] = {walkerCmd.getThreadGroupIdXDimension(), walkerCmd.getThreadGroupIdYDimension(), walkerCmd.getThreadGroupIdZDimension()};
     iddArg = FamilyType::cmdInitInterfaceDescriptorData;
     const uint32_t forceThreadGroupDispatchSize = -1;
     auto hwInfo = pDevice->getHardwareInfo();
     const auto &productHelper = pDevice->getProductHelper();
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceThreadGroupDispatchSize.set(forceThreadGroupDispatchSize);
+    debugManager.flags.ForceThreadGroupDispatchSize.set(forceThreadGroupDispatchSize);
 
     uint32_t revisions[] = {REVISION_A0, REVISION_B};
     for (auto revision : revisions) {
@@ -84,7 +85,7 @@ HWTEST2_F(DG2CommandEncoderTest, givenInterfaceDescriptorDataWhenForceThreadGrou
 
         for (auto numberOfThreadsInGroup : {1u, 4u, 16u}) {
             iddArg.setNumberOfThreadsInGpgpuThreadGroup(numberOfThreadsInGroup);
-            EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, 0, 0, walkerCmd);
+            EncodeDispatchKernel<FamilyType>::encodeThreadGroupDispatch(iddArg, *pDevice, hwInfo, threadGroups, 0, 0, 0, numberOfThreadsInGroup, walkerCmd);
 
             if (productHelper.isDisableOverdispatchAvailable(hwInfo)) {
                 if (numberOfThreadsInGroup == 1) {

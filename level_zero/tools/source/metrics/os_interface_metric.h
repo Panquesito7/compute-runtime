@@ -1,0 +1,55 @@
+/*
+ * Copyright (C) 2022-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/constants.h"
+
+#include <level_zero/zet_api.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <sys/types.h>
+
+namespace L0 {
+
+struct Device;
+class MetricOsInterface {
+  public:
+    virtual ~MetricOsInterface() = default;
+    virtual ze_result_t getMetricsTimerResolution(uint64_t &timerResolution) = 0;
+    static std::unique_ptr<MetricOsInterface> create(Device &device);
+};
+
+class MetricIpSamplingOsInterface : public MetricOsInterface {
+  public:
+    ~MetricIpSamplingOsInterface() override = default;
+    virtual ze_result_t startMeasurement(uint32_t &notifyEveryNReports, uint32_t &samplingPeriodNs) = 0;
+    virtual ze_result_t stopMeasurement() = 0;
+    virtual ze_result_t readData(uint8_t *pRawData, size_t *pRawDataSize) = 0;
+    virtual uint32_t getRequiredBufferSize(const uint32_t maxReportCount) = 0;
+    virtual uint32_t getUnitReportSize() = 0;
+    virtual bool isNReportsAvailable() = 0;
+    virtual bool isOsSupportAvailable() = 0;
+    static std::unique_ptr<MetricIpSamplingOsInterface> create(Device &device);
+
+    uint32_t maxDssBufferSize = 512 * MemoryConstants::kiloByte;
+    uint32_t defaultPollPeriodNs = 10000000u;
+    uint32_t unitReportSize = 64u;
+
+  protected:
+    // Clamp a report count to the static buffer-report capacity reported by getRequiredBufferSize
+    // (the long-standing per-platform estimate). Used where no authoritative KMD capacity query is
+    // available (i915/PVC, older xe, and Windows).
+    uint32_t clampToMaxSupportedReports(uint32_t notifyEveryNReports) {
+        return std::min(notifyEveryNReports, getRequiredBufferSize(std::numeric_limits<uint32_t>::max()) / getUnitReportSize());
+    }
+};
+
+} // namespace L0

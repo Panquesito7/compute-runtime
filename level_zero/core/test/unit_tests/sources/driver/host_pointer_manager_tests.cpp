@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,19 @@
 
 #include "shared/source/built_ins/sip.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/mocks/mock_memory_operations_handler.h"
 #include "shared/test/common/test_macros/test.h"
 
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/core/test/unit_tests/fixtures/host_pointer_manager_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_device.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_driver_handle.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_host_pointer_manager.h"
 
 namespace L0 {
@@ -80,7 +88,7 @@ TEST_F(HostPointerManagerTest, givenPointerRegisteredWhenSvmAllocationExistsThen
     size_t usmSize = MemoryConstants::pageSize;
     void *usmBuffer = hostDriverHandle->getMemoryManager()->allocateSystemMemory(usmSize, usmSize);
     NEO::GraphicsAllocation *usmAllocation = hostDriverHandle->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), false, usmSize, NEO::AllocationType::BUFFER_HOST_MEMORY, false, neoDevice->getDeviceBitfield()},
+        {device->getRootDeviceIndex(), false, usmSize, NEO::AllocationType::bufferHostMemory, false, neoDevice->getDeviceBitfield()},
         usmBuffer);
     ASSERT_NE(nullptr, usmAllocation);
 
@@ -88,7 +96,7 @@ TEST_F(HostPointerManagerTest, givenPointerRegisteredWhenSvmAllocationExistsThen
     allocData.gpuAllocations.addAllocation(usmAllocation);
     allocData.cpuAllocation = nullptr;
     allocData.size = usmSize;
-    allocData.memoryType = InternalMemoryType::NOT_SPECIFIED;
+    allocData.memoryType = InternalMemoryType::notSpecified;
     allocData.device = nullptr;
     hostDriverHandle->getSvmAllocsManager()->insertSVMAlloc(allocData);
 
@@ -110,7 +118,7 @@ TEST_F(HostPointerManagerTest, givenSvmAllocationExistsWhenGettingExistingAlloca
     size_t usmSize = MemoryConstants::pageSize;
     void *usmBuffer = hostDriverHandle->getMemoryManager()->allocateSystemMemory(usmSize, usmSize);
     NEO::GraphicsAllocation *usmAllocation = hostDriverHandle->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), false, usmSize, NEO::AllocationType::BUFFER_HOST_MEMORY, false, neoDevice->getDeviceBitfield()},
+        {device->getRootDeviceIndex(), false, usmSize, NEO::AllocationType::bufferHostMemory, false, neoDevice->getDeviceBitfield()},
         usmBuffer);
     ASSERT_NE(nullptr, usmAllocation);
 
@@ -118,7 +126,7 @@ TEST_F(HostPointerManagerTest, givenSvmAllocationExistsWhenGettingExistingAlloca
     allocData.gpuAllocations.addAllocation(usmAllocation);
     allocData.cpuAllocation = nullptr;
     allocData.size = usmSize;
-    allocData.memoryType = InternalMemoryType::NOT_SPECIFIED;
+    allocData.memoryType = InternalMemoryType::notSpecified;
     allocData.device = nullptr;
     hostDriverHandle->getSvmAllocsManager()->insertSVMAlloc(allocData);
 
@@ -389,8 +397,8 @@ TEST_F(HostPointerManagerTest, givenNoPointerRegisteredWhenAllocationCreationFai
 TEST_F(HostPointerManagerTest, givenHostAllocationImportedWhenMakingResidentAddressThenAllocationMadeResident) {
     void *testPtr = heapPointer;
 
-    mockMemoryInterface->makeResidentResult = NEO::MemoryOperationsStatus::SUCCESS;
-    mockMemoryInterface->evictResult = NEO::MemoryOperationsStatus::SUCCESS;
+    mockMemoryInterface->makeResidentResult = NEO::MemoryOperationsStatus::success;
+    mockMemoryInterface->evictResult = NEO::MemoryOperationsStatus::success;
 
     auto result = context->makeMemoryResident(device, testPtr, MemoryConstants::pageSize);
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
@@ -480,6 +488,33 @@ TEST_F(ForceEnabledHostPointerManagerTest, givenHostPointerManagerForceEnabledTh
 
     result = hostDriverHandle->releaseImportedPointer(testPtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+using MultiDeviceHostPointerManagerTests = Test<MultiDeviceFixture>;
+
+TEST_F(MultiDeviceHostPointerManagerTests, createHostPointerMultiAllocationHandlesNonZeroRootDeviceIndex) {
+    // Create a NEO device with rootDeviceIndex == 1
+    const uint32_t rootDeviceIndex = 1;
+    NEO::Device *neoDevice(NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get(), rootDeviceIndex));
+    MockDeviceImp l0Device(neoDevice);
+
+    NEO::DeviceVector neoDevices;
+    neoDevices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
+
+    auto hostDriverHandle = std::make_unique<L0::ult::DriverHandle>();
+    hostDriverHandle->initialize(std::move(neoDevices));
+
+    std::vector<L0::Device *> devices;
+    devices.push_back(&l0Device);
+
+    uint8_t data{};
+
+    // Should not abort, should succeed
+    auto openHostPointerManager = static_cast<L0::ult::HostPointerManager *>(hostDriverHandle->hostPointerManager.get());
+    auto result = openHostPointerManager->createHostPointerMultiAllocation(devices, &data, sizeof(data));
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+
+    openHostPointerManager->freeHostPointerAllocation(&data);
 }
 
 } // namespace ult

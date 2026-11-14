@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,9 +11,13 @@
 
 #include <cstdint>
 
+template <typename T>
+struct Vec3;
+
 namespace NEO {
 
 class CommandQueue;
+class CsrDependencies;
 class DispatchInfo;
 class Event;
 class IndirectHeap;
@@ -21,12 +25,17 @@ class Kernel;
 class LinearStream;
 class HwPerfCounter;
 class HwTimeStamps;
+class TagNodeBase;
+class TimestampPacketContainer;
 struct KernelOperation;
 struct MultiDispatchInfo;
 struct TimestampPacketDependencies;
-
+struct KernelInfo;
+struct EncodeWalkerArgs;
+struct HardwareInfo;
 template <class T>
 class TagNode;
+enum class DebugPauseState : uint32_t;
 
 struct HardwareInterfaceWalkerArgs {
     size_t globalWorkSizes[3] = {};
@@ -47,15 +56,29 @@ struct HardwareInterfaceWalkerArgs {
     uint32_t interfaceDescriptorIndex = 0;
     bool isMainKernel = false;
     bool relaxedOrderingEnabled = false;
+    bool blocking = false;
+};
+
+struct HardwareInterfaceHelper {
+    static void setEncodeWalkerArgsExt(
+        EncodeWalkerArgs &encodeWalkerArgs,
+        const KernelInfo &kernelInfo);
 };
 
 template <typename GfxFamily>
 class HardwareInterface {
   public:
-    using INTERFACE_DESCRIPTOR_DATA = typename GfxFamily::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename GfxFamily::WALKER_TYPE;
+    using DefaultWalkerType = typename GfxFamily::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
 
+    template <typename WalkerType>
     static void dispatchWalker(
+        CommandQueue &commandQueue,
+        const MultiDispatchInfo &multiDispatchInfo,
+        const CsrDependencies &csrDependencies,
+        HardwareInterfaceWalkerArgs &walkerArgs);
+
+    static void dispatchWalkerCommon(
         CommandQueue &commandQueue,
         const MultiDispatchInfo &multiDispatchInfo,
         const CsrDependencies &csrDependencies,
@@ -94,6 +117,7 @@ class HardwareInterface {
         DebugPauseState waitCondition,
         const HardwareInfo &hwInfo);
 
+    template <typename WalkerType>
     static void programWalker(
         LinearStream &commandStream,
         Kernel &kernel,
@@ -104,12 +128,14 @@ class HardwareInterface {
         const DispatchInfo &dispatchInfo,
         HardwareInterfaceWalkerArgs &walkerArgs);
 
-    static WALKER_TYPE *allocateWalkerSpace(LinearStream &commandStream,
-                                            const Kernel &kernel);
+    template <typename WalkerType>
+    static WalkerType *allocateWalkerSpace(LinearStream &commandStream,
+                                           const Kernel &kernel);
 
     static void obtainIndirectHeaps(CommandQueue &commandQueue, const MultiDispatchInfo &multiDispatchInfo,
                                     bool blockedQueue, IndirectHeap *&dsh, IndirectHeap *&ioh, IndirectHeap *&ssh);
 
+    template <typename WalkerType>
     static void dispatchKernelCommands(CommandQueue &commandQueue, const DispatchInfo &dispatchInfo, LinearStream &commandStream,
                                        IndirectHeap &dsh, IndirectHeap &ioh, IndirectHeap &ssh,
                                        HardwareInterfaceWalkerArgs &walkerArgs);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,33 +7,35 @@
 
 #include "level_zero/core/test/aub_tests/fixtures/aub_fixture.h"
 
+#include "shared/source/aub/aub_center.h"
 #include "shared/source/command_stream/aub_command_stream_receiver.h"
 #include "shared/source/command_stream/tbx_command_stream_receiver_hw.h"
+#include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/file_io.h"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/os_interface/aub_memory_operations_handler.h"
+#include "shared/test/common/helpers/mock_file_io.h"
+#include "shared/test/common/helpers/test_files.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/tests_configuration.h"
 
 #include "level_zero/core/source/cmdqueue/cmdqueue.h"
-#include "level_zero/core/source/context/context_imp.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/module/module_imp.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_driver_handle.h"
 
 #include "gtest/gtest.h"
 #include "test_mode.h"
 
+#include <limits>
+
 namespace L0 {
 AUBFixtureL0::AUBFixtureL0() = default;
 AUBFixtureL0::~AUBFixtureL0() = default;
-void AUBFixtureL0::prepareCopyEngines(NEO::MockDevice &device, const std::string &filename) {
-    for (auto i = 0u; i < device.allEngines.size(); i++) {
-        if (NEO::EngineHelpers::isBcs(device.allEngines[i].getEngineType())) {
-            NEO::CommandStreamReceiver *pBcsCommandStreamReceiver = nullptr;
-            pBcsCommandStreamReceiver = NEO::AUBCommandStreamReceiver::create(filename, true, *device.executionEnvironment, device.getRootDeviceIndex(), device.getDeviceBitfield());
-            device.resetCommandStreamReceiver(pBcsCommandStreamReceiver, i);
-        }
-    }
-}
 
 void AUBFixtureL0::setUp() {
     setUp(NEO::defaultHwInfo.get(), false);
@@ -41,40 +43,52 @@ void AUBFixtureL0::setUp() {
 void AUBFixtureL0::setUp(const NEO::HardwareInfo *hardwareInfo, bool debuggingEnabled) {
     ASSERT_NE(nullptr, hardwareInfo);
     const auto &hwInfo = *hardwareInfo;
+    backupUltConfig = std::make_unique<VariableBackup<NEO::UltHwConfig>>(&NEO::ultHwConfig);
 
     executionEnvironment = new NEO::ExecutionEnvironment();
     executionEnvironment->prepareRootDeviceEnvironments(1u);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hwInfo);
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
 
-    if (debuggingEnabled) {
-        executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    if (auto &rootDeviceEnvironment = *executionEnvironment->rootDeviceEnvironments[0]; !rootDeviceEnvironment.aubCenter) {
+        auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<NEO::GfxCoreHelper>();
+        auto hardwareInfo = rootDeviceEnvironment.getMutableHardwareInfo();
+        auto localMemoryEnabled = gfxCoreHelper.getEnableLocalMemory(*hardwareInfo);
+        rootDeviceEnvironment.initAubCenter(localMemoryEnabled, "", NEO::CommandStreamReceiverType::aub);
     }
-    neoDevice = NEO::MockDevice::createWithExecutionEnvironment<NEO::MockDevice>(&hwInfo, executionEnvironment, 0u);
 
-    auto &gfxCoreHelper = neoDevice->getGfxCoreHelper();
+    const auto aubCenter = executionEnvironment->rootDeviceEnvironments[0]->aubCenter.get();
+    auto memoryOperationsInterface = std::make_unique<NEO::AubMemoryOperationsHandler>(*aubCenter);
+    memoryOperationsInterface->setAddressWidth(executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->getGmmHelper()->getAddressWidth());
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = std::move(memoryOperationsInterface);
+
+    if (debuggingEnabled) {
+        executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    }
+
     auto engineType = getChosenEngineType(hwInfo);
 
     const ::testing::TestInfo *const testInfo = ::testing::UnitTest::GetInstance()->current_test_info();
     std::stringstream strfilename;
 
     strfilename << NEO::ApiSpecificConfig::getAubPrefixForSpecificApi();
-    strfilename << testInfo->test_case_name() << "_" << testInfo->name() << "_" << gfxCoreHelper.getCsTraits(engineType).name;
+    strfilename << testInfo->test_case_name() << "_" << testInfo->name() << "_" << NEO::EngineHelpers::engineTypeToString(engineType);
 
-    if (NEO::testMode == NEO::TestMode::AubTestsWithTbx) {
-        this->csr = NEO::TbxCommandStreamReceiver::create(strfilename.str(), true, *executionEnvironment, 0, neoDevice->getDeviceBitfield());
-    } else {
-        this->csr = NEO::AUBCommandStreamReceiver::create(strfilename.str(), true, *executionEnvironment, 0, neoDevice->getDeviceBitfield());
+    aubFileName = strfilename.str();
+    NEO::ultHwConfig.aubTestName = aubFileName.c_str();
+
+    neoDevice = NEO::MockDevice::createWithExecutionEnvironment<NEO::MockDevice>(&hwInfo, executionEnvironment, 0u);
+
+    this->csr = neoDevice->getDefaultEngine().commandStreamReceiver;
+    if (!this->csr->getPreemptionAllocation()) {
+        ASSERT_TRUE(this->csr->createPreemptionAllocation());
     }
-
-    neoDevice->resetCommandStreamReceiver(this->csr);
-    prepareCopyEngines(*neoDevice, strfilename.str());
 
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    driverHandle = std::make_unique<ult::Mock<DriverHandleImp>>();
+    driverHandle = std::make_unique<ult::Mock<DriverHandle>>();
 
-    driverHandle->enableProgramDebugging = debuggingEnabled ? NEO::DebuggingMode::Online : NEO::DebuggingMode::Disabled;
+    driverHandle->enableProgramDebugging = debuggingEnabled ? NEO::DebuggingMode::online : NEO::DebuggingMode::disabled;
 
     driverHandle->initialize(std::move(devices));
 
@@ -84,19 +98,109 @@ void AUBFixtureL0::setUp(const NEO::HardwareInfo *hardwareInfo, bool debuggingEn
     ze_context_desc_t desc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
     ze_result_t res = driverHandle->createContext(&desc, 0u, nullptr, &hContext);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
-    context = static_cast<ContextImp *>(Context::fromHandle(hContext));
+    context = Context::fromHandle(hContext);
 
     ze_result_t returnValue;
-    commandList.reset(ult::whiteboxCast(CommandList::create(hwInfo.platform.eProductFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)));
+    commandList.reset(ult::CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)));
 
     returnValue = ZE_RESULT_ERROR_UNINITIALIZED;
     ze_command_queue_desc_t queueDesc = {};
-    pCmdq = CommandQueue::create(hwInfo.platform.eProductFamily, device, csr, &queueDesc, false, false, false, returnValue);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    pCmdq = CommandQueue::create(device, csr, &queueDesc, false, false, false, returnValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
 }
 void AUBFixtureL0::tearDown() {
-    context->destroy();
-    pCmdq->destroy();
+    for (auto kernel : this->kernels) {
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelDestroy(kernel));
+    }
+    for (auto &module : this->modules) {
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeModuleDestroy(module.second));
+    }
+    for (auto ptr : this->usmAllocations) {
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeMemFree(this->context->toHandle(), ptr));
+    }
+    if (this->context) {
+        this->context->destroy();
+    }
+    if (this->pCmdq) {
+        this->pCmdq->destroy();
+    }
+}
+
+void *AUBFixtureL0::allocateHostMemory(size_t size, size_t alignment) {
+    ze_host_mem_alloc_desc_t hostDesc = {ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    void *ptr = nullptr;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeMemAllocHost(this->context->toHandle(), &hostDesc, size, alignment, &ptr));
+    if (ptr) {
+        this->usmAllocations.push_back(ptr);
+    }
+    return ptr;
+}
+
+void *AUBFixtureL0::allocateDeviceMemory(size_t size, size_t alignment) {
+    ze_device_mem_alloc_desc_t deviceDesc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
+    void *ptr = nullptr;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeMemAllocDevice(this->context->toHandle(), &deviceDesc, size, alignment, this->device->toHandle(), &ptr));
+    if (ptr) {
+        this->usmAllocations.push_back(ptr);
+    }
+    return ptr;
+}
+
+void AUBFixtureL0::executeAndSynchronize() {
+    auto commandListHandle = this->commandList->toHandle();
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListClose(commandListHandle));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandQueueExecuteCommandLists(this->pCmdq->toHandle(), 1, &commandListHandle, nullptr));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandQueueSynchronize(this->pCmdq->toHandle(), std::numeric_limits<uint64_t>::max()));
+}
+
+ze_kernel_handle_t AUBFixtureL0::createKernel(const std::string &moduleFileName, const std::string &kernelName, bool useSharedFile) {
+    const auto moduleKey = std::make_pair(moduleFileName, useSharedFile);
+    auto moduleIt = this->modules.find(moduleKey);
+    if (moduleIt == this->modules.end()) {
+        auto module = createModuleFromFile(moduleFileName, this->context->toHandle(), this->device->toHandle(), "", useSharedFile);
+        if (module == nullptr) {
+            return nullptr;
+        }
+        moduleIt = this->modules.emplace(moduleKey, module).first;
+    }
+
+    ze_kernel_desc_t kernelDesc = {ZE_STRUCTURE_TYPE_KERNEL_DESC};
+    kernelDesc.pKernelName = kernelName.c_str();
+    ze_kernel_handle_t kernel = nullptr;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelCreate(moduleIt->second, &kernelDesc, &kernel));
+    if (kernel) {
+        this->kernels.push_back(kernel);
+    }
+    return kernel;
+}
+
+ze_module_handle_t AUBFixtureL0::createModuleFromFile(const std::string &fileName, ze_context_handle_t context, ze_device_handle_t device, const std::string &buildFlags, bool useSharedFile) {
+    ze_module_handle_t moduleHandle = nullptr;
+    std::string testFile;
+    if (useSharedFile) {
+        retrieveBinaryKernelFilename(testFile, fileName + "_", ".bin");
+    } else {
+        retrieveBinaryKernelFilenameApiSpecific(testFile, fileName + "_", ".bin");
+    }
+
+    size_t size = 0;
+    auto src = loadDataFromVirtualFileTestKernelsOnly(testFile.c_str(), size);
+
+    EXPECT_NE(0u, size);
+    EXPECT_NE(nullptr, src);
+
+    if (!src || size == 0) {
+        return nullptr;
+    }
+
+    ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.get());
+    moduleDesc.inputSize = size;
+    moduleDesc.pBuildFlags = buildFlags.data();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeModuleCreate(context, device, &moduleDesc, &moduleHandle, nullptr));
+    return moduleHandle;
 }
 
 } // namespace L0

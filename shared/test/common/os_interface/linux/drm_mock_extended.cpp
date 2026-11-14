@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,8 @@
 
 #include "shared/test/common/libult/linux/drm_mock_helper.h"
 
+#include <cmath>
+
 DrmMockExtended::DrmMockExtended(RootDeviceEnvironment &rootDeviceEnvironmentIn, const HardwareInfo *inputHwInfo) : DrmMock(rootDeviceEnvironmentIn) {
     rootDeviceEnvironment.setHwInfoAndInitHelpers(inputHwInfo);
     EXPECT_TRUE(queryMemoryInfo());
@@ -17,7 +19,7 @@ DrmMockExtended::DrmMockExtended(RootDeviceEnvironment &rootDeviceEnvironmentIn,
 }
 
 int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
-    if ((request == DrmIoctl::Query) && (arg != nullptr)) {
+    if ((request == DrmIoctl::query) && (arg != nullptr)) {
         if (i915QuerySuccessCount == 0) {
             return EINVAL;
         }
@@ -33,7 +35,7 @@ int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
             }
         }
         return 0;
-    } else if (request == DrmIoctl::GemContextSetparam && arg != nullptr && receivedContextParamRequest.param == I915_CONTEXT_PARAM_ENGINES) {
+    } else if (request == DrmIoctl::gemContextSetparam && arg != nullptr && receivedContextParamRequest.param == I915_CONTEXT_PARAM_ENGINES) {
         EXPECT_LE(receivedContextParamRequest.size, sizeof(receivedContextParamEngines));
         memcpy(&receivedContextParamEngines, reinterpret_cast<const void *>(receivedContextParamRequest.value), receivedContextParamRequest.size);
         auto srcBalancer = reinterpret_cast<const i915_context_engines_load_balance *>(receivedContextParamEngines.extensions);
@@ -44,13 +46,13 @@ int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
             memcpy(&receivedContextEnginesLoadBalance, srcBalancer, balancerSize);
         }
         return this->storedRetValForSetParamEngines;
-    } else if (request == DrmIoctl::GemContextSetparam && arg != nullptr && receivedContextParamRequest.param == PRELIM_I915_CONTEXT_PARAM_DEBUG_FLAGS) {
+    } else if (request == DrmIoctl::gemContextSetparam && arg != nullptr && receivedContextParamRequest.param == PRELIM_I915_CONTEXT_PARAM_DEBUG_FLAGS) {
         if (!this->contextDebugSupported) {
             return EINVAL;
         } else {
             return 0;
         }
-    } else if (request == DrmIoctl::GemContextGetparam && arg != nullptr) {
+    } else if (request == DrmIoctl::gemContextGetparam && arg != nullptr) {
         auto argIn = static_cast<GemContextParam *>(arg);
         if (argIn->param == PRELIM_I915_CONTEXT_PARAM_DEBUG_FLAGS) {
             if (this->contextDebugSupported) {
@@ -60,7 +62,7 @@ int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
             }
             return 0;
         }
-    } else if (request == DrmIoctl::GemCreateExt) {
+    } else if (request == DrmIoctl::gemCreateExt) {
         auto createExtParams = static_cast<prelim_drm_i915_gem_create_ext *>(arg);
         if (createExtParams->size == 0) {
             return EINVAL;
@@ -100,11 +102,11 @@ int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
             return EINVAL;
         }
         return gemCreateExtRetVal;
-    } else if (request == DrmIoctl::GemMmapOffset) {
+    } else if (request == DrmIoctl::gemMmapOffset) {
         auto mmapArg = static_cast<GemMmapOffset *>(arg);
         mmapArg->offset = 0;
         return mmapOffsetRetVal;
-    } else if (request == DrmIoctl::GemClosReserve && (arg != nullptr)) {
+    } else if (request == DrmIoctl::gemClosReserve && (arg != nullptr)) {
         auto closReserveArg = static_cast<prelim_drm_i915_gem_clos_reserve *>(arg);
         this->closIndex++;
         if (closIndex == 0) {
@@ -112,20 +114,21 @@ int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
         }
         closReserveArg->clos_index = closIndex;
         return 0;
-    } else if (request == DrmIoctl::GemClosFree && (arg != nullptr)) {
+    } else if (request == DrmIoctl::gemClosFree && (arg != nullptr)) {
         auto closFreeArg = static_cast<prelim_drm_i915_gem_clos_free *>(arg);
         if (closFreeArg->clos_index > closIndex) {
             return EINVAL;
         }
         this->closIndex--;
         return 0;
-    } else if (request == DrmIoctl::GemCacheReserve && (arg != nullptr)) {
+    } else if (request == DrmIoctl::gemCacheReserve && (arg != nullptr)) {
         auto cacheReserveArg = static_cast<prelim_drm_i915_gem_cache_reserve *>(arg);
         if (cacheReserveArg->clos_index > closIndex) {
             return EINVAL;
         }
+        const auto cacheLevel{toCacheLevel(cacheReserveArg->cache_level)};
         auto cacheInfo = this->getCacheInfo();
-        auto maxReservationNumWays = cacheInfo ? cacheInfo->getMaxReservationNumWays() : maxNumWays;
+        auto maxReservationNumWays = cacheInfo ? cacheInfo->getMaxReservationNumWays(cacheLevel) : maxNumWays;
         if (cacheReserveArg->num_ways > maxReservationNumWays) {
             return EINVAL;
         }
@@ -135,16 +138,17 @@ int DrmMockExtended::handleRemainingRequests(DrmIoctl request, void *arg) {
         }
         this->allocNumWays += cacheReserveArg->num_ways;
         return 0;
-    } else if ((request == DrmIoctl::DebuggerOpen) && (arg != nullptr)) {
+    } else if ((request == DrmIoctl::debuggerOpen) && (arg != nullptr)) {
         auto debuggerOpen = reinterpret_cast<prelim_drm_i915_debugger_open_param *>(arg);
         inputDebuggerOpen = *debuggerOpen;
         return debuggerOpenRetval;
-    } else if ((request == DrmIoctl::GemVmAdvise) && (arg != nullptr)) {
+    } else if ((request == DrmIoctl::gemVmAdvise) && (arg != nullptr)) {
         auto vmAdvise = reinterpret_cast<prelim_drm_i915_gem_vm_advise *>(arg);
         vmAdviseCalled = true;
         vmAdviseFlags = vmAdvise->attribute;
         vmAdviseHandle = vmAdvise->handle;
-        vmAdviseRegion = *reinterpret_cast<MemoryClassInstance *>(&vmAdvise->region);
+        vmAdviseRegion.memoryClass = vmAdvise->region.memory_class;
+        vmAdviseRegion.memoryInstance = vmAdvise->region.memory_instance;
         return vmAdviseRetValue;
     }
 

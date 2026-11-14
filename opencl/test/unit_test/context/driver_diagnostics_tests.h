@@ -1,22 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_device.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
 
 #include "opencl/source/context/context.h"
 #include "opencl/source/kernel/kernel.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
+#include "opencl/test/unit_test/fixtures/mock_kernel_fixture.h"
 #include "opencl/test/unit_test/fixtures/platform_fixture.h"
-#include "opencl/test/unit_test/fixtures/program_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
@@ -45,8 +45,7 @@ struct DriverDiagnosticsTest : public PlatformFixture,
     char expectedHint[DriverDiagnostics::maxHintStringSize]{};
 };
 
-struct VerboseLevelTest : public DriverDiagnosticsTest,
-                          public ::testing::WithParamInterface<unsigned int> {
+struct VerboseLevelTest : public DriverDiagnosticsTest {
 
     void SetUp() override {
         DriverDiagnosticsTest::SetUp();
@@ -57,7 +56,7 @@ struct VerboseLevelTest : public DriverDiagnosticsTest,
     void TearDown() override {
         DriverDiagnosticsTest::TearDown();
     }
-    std::vector<unsigned int> validLevels{
+    std::vector<uint64_t> validLevels{
         CL_CONTEXT_DIAGNOSTICS_LEVEL_ALL_INTEL,
         CL_CONTEXT_DIAGNOSTICS_LEVEL_BAD_INTEL,
         CL_CONTEXT_DIAGNOSTICS_LEVEL_GOOD_INTEL,
@@ -81,12 +80,10 @@ struct PerformanceHintTest : public DriverDiagnosticsTest,
     }
 };
 
-struct PerformanceHintBufferTest : public PerformanceHintTest,
-                                   public ::testing::WithParamInterface<std::tuple<bool /*address aligned*/, bool /*size aligned*/, bool /*provide performance hint*/>> {
+struct PerformanceHintBufferTest : public PerformanceHintTest {
 
     void SetUp() override {
         PerformanceHintTest::SetUp();
-        std::tie(alignedAddress, alignedSize, providePerformanceHint) = GetParam();
         address = alignedMalloc(2 * MemoryConstants::cacheLineSize, MemoryConstants::cacheLineSize);
     }
 
@@ -102,17 +99,16 @@ struct PerformanceHintBufferTest : public PerformanceHintTest,
     Buffer *buffer = nullptr;
 };
 
-struct PerformanceHintCommandQueueTest : public PerformanceHintTest,
-                                         public ::testing::WithParamInterface<std::tuple<bool /*profiling enabled*/, bool /*preemption supported*/>> {
+struct PerformanceHintCommandQueueTest : public PerformanceHintTest {
 
     void SetUp() override {
         PerformanceHintTest::SetUp();
-        std::tie(profilingEnabled, preemptionSupported) = GetParam();
-        static_cast<MockClDevice *>(context->getDevice(0))->deviceInfo.preemptionSupported = preemptionSupported;
     }
 
     void TearDown() override {
-        clReleaseCommandQueue(cmdQ);
+        if (cmdQ) {
+            clReleaseCommandQueue(cmdQ);
+        }
         PerformanceHintTest::TearDown();
     }
     cl_command_queue cmdQ = nullptr;
@@ -152,12 +148,10 @@ struct PerformanceHintEnqueueBufferTest : public PerformanceHintEnqueueTest {
     Buffer *buffer = nullptr;
 };
 
-struct PerformanceHintEnqueueReadBufferTest : public PerformanceHintEnqueueBufferTest,
-                                              public ::testing::WithParamInterface<std::tuple<bool /*address aligned*/, bool /*size aligned*/>> {
+struct PerformanceHintEnqueueReadBufferTest : public PerformanceHintEnqueueBufferTest {
 
     void SetUp() override {
         PerformanceHintEnqueueBufferTest::SetUp();
-        std::tie(alignedAddress, alignedSize) = GetParam();
     }
 
     void TearDown() override {
@@ -174,12 +168,13 @@ struct PerformanceHintEnqueueImageTest : public PerformanceHintEnqueueTest {
 
         PerformanceHintEnqueueTest::SetUp();
         address = alignedMalloc(2 * MemoryConstants::cacheLineSize, MemoryConstants::cacheLineSize);
-        image = ImageHelper<ImageUseHostPtr<Image1dDefaults>>::create(context);
-        zeroCopyImage.reset(ImageHelper<Image1dDefaults>::create(context));
+        image = ImageHelperUlt<ImageUseHostPtr<Image1dDefaults>>::create(context);
+        zeroCopyImage.reset(ImageHelperUlt<Image1dDefaults>::create(context));
+        initialized = true;
     }
 
     void TearDown() override {
-        if (IsSkipped()) {
+        if (!initialized) {
             return;
         }
         delete image;
@@ -190,14 +185,13 @@ struct PerformanceHintEnqueueImageTest : public PerformanceHintEnqueueTest {
     void *address = nullptr;
     Image *image = nullptr;
     std::unique_ptr<Image> zeroCopyImage;
+    bool initialized = false;
 };
 
-struct PerformanceHintEnqueueReadImageTest : public PerformanceHintEnqueueImageTest,
-                                             public ::testing::WithParamInterface<std::tuple<bool /*address aligned*/, bool /*size aligned*/>> {
+struct PerformanceHintEnqueueReadImageTest : public PerformanceHintEnqueueImageTest {
 
     void SetUp() override {
         PerformanceHintEnqueueImageTest::SetUp();
-        std::tie(alignedAddress, alignedSize) = GetParam();
     }
 
     void TearDown() override {
@@ -207,8 +201,7 @@ struct PerformanceHintEnqueueReadImageTest : public PerformanceHintEnqueueImageT
     bool alignedAddress = false;
 };
 
-struct PerformanceHintEnqueueMapTest : public PerformanceHintEnqueueTest,
-                                       public ::testing::WithParamInterface<bool /*zero-copy obj*/> {
+struct PerformanceHintEnqueueMapTest : public PerformanceHintEnqueueTest {
 
     void SetUp() override {
         PerformanceHintEnqueueTest::SetUp();
@@ -219,32 +212,28 @@ struct PerformanceHintEnqueueMapTest : public PerformanceHintEnqueueTest,
     }
 };
 
-struct PerformanceHintEnqueueKernelTest : public PerformanceHintEnqueueTest,
-                                          public ProgramFixture {
+struct PerformanceHintEnqueueKernelTest : public PerformanceHintEnqueueTest {
 
     void SetUp() override {
         PerformanceHintEnqueueTest::SetUp();
-        createProgramFromBinary(context, context->getDevices(), "CopyBuffer_simd32");
-        retVal = pProgram->build(pProgram->getDevices(), nullptr);
-        ASSERT_EQ(CL_SUCCESS, retVal);
-        kernel = Kernel::create<MockKernel>(pProgram, pProgram->getKernelInfoForKernel("CopyBuffer"), *context->getDevice(0), retVal);
+        mockKernelWithInternals = createBufferArgsKernel(*context);
+        kernel = mockKernelWithInternals->mockKernel;
 
         globalWorkGroupSize[0] = globalWorkGroupSize[1] = globalWorkGroupSize[2] = 1;
         rootDeviceIndex = context->getDevice(0)->getRootDeviceIndex();
     }
 
     void TearDown() override {
-        delete kernel;
-        ProgramFixture::tearDown();
+        mockKernelWithInternals.reset();
         PerformanceHintEnqueueTest::TearDown();
     }
+    std::unique_ptr<MockKernelWithInternals> mockKernelWithInternals;
     MockKernel *kernel = nullptr;
     uint32_t rootDeviceIndex = std::numeric_limits<uint32_t>::max();
     size_t globalWorkGroupSize[3]{};
 };
 
-struct PerformanceHintEnqueueKernelBadSizeTest : public PerformanceHintEnqueueKernelTest,
-                                                 public ::testing::WithParamInterface<int /*bad size dimension*/> {
+struct PerformanceHintEnqueueKernelBadSizeTest : public PerformanceHintEnqueueKernelTest {
 
     void SetUp() override {
         PerformanceHintEnqueueKernelTest::SetUp();
@@ -256,41 +245,35 @@ struct PerformanceHintEnqueueKernelBadSizeTest : public PerformanceHintEnqueueKe
     }
 };
 
-struct PerformanceHintEnqueueKernelPrintfTest : public PerformanceHintEnqueueTest,
-                                                public ProgramFixture {
-    class KernelWhitebox : public Kernel {
-      public:
-        using Kernel::initializeLocalIdsCache;
-    };
+struct PerformanceHintEnqueueKernelPrintfTest : public PerformanceHintEnqueueTest {
 
     void SetUp() override {
         PerformanceHintEnqueueTest::SetUp();
-        createProgramFromBinary(context, context->getDevices(), "printf");
-        retVal = pProgram->build(pProgram->getDevices(), nullptr);
-        ASSERT_EQ(CL_SUCCESS, retVal);
-        kernel = static_cast<KernelWhitebox *>(Kernel::create(pProgram, pProgram->getKernelInfoForKernel("test"), *context->getDevice(0), retVal));
-        kernel->initializeLocalIdsCache();
+        mockKernelWithInternals = createBufferArgsKernel(*context);
+        kernel = mockKernelWithInternals->mockKernel;
+
+        auto &kernelInfo = mockKernelWithInternals->kernelInfo;
+        kernelInfo.kernelDescriptor.kernelAttributes.flags.usesPrintf = true;
+        kernelInfo.setPrintfSurface(sizeof(uintptr_t), 64);
 
         globalWorkGroupSize[0] = globalWorkGroupSize[1] = globalWorkGroupSize[2] = 1;
     }
 
     void TearDown() override {
-        delete kernel;
-        ProgramFixture::tearDown();
+        mockKernelWithInternals.reset();
         PerformanceHintEnqueueTest::TearDown();
     }
-    KernelWhitebox *kernel = nullptr;
+    std::unique_ptr<MockKernelWithInternals> mockKernelWithInternals;
+    MockKernel *kernel = nullptr;
     size_t globalWorkGroupSize[3]{};
 };
 
-struct PerformanceHintKernelTest : public PerformanceHintTest,
-                                   public ::testing::WithParamInterface<bool /*zero-sized*/> {
+struct PerformanceHintKernelTest : public PerformanceHintTest {
 
     void SetUp() override {
-        DebugManager.flags.CreateMultipleRootDevices.set(2);
-        DebugManager.flags.EnableMultiRootDeviceContexts.set(true);
+        debugManager.flags.CreateMultipleRootDevices.set(2);
+        debugManager.flags.EnableMultiRootDeviceContexts.set(true);
         PerformanceHintTest::SetUp();
-        zeroSized = GetParam();
     }
 
     void TearDown() override {

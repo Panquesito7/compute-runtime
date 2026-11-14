@@ -1,16 +1,20 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/mocks/mock_device.h"
+
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/mocks/mock_sysman_device_info.h"
 
 namespace L0 {
 namespace ult {
 
-TEST_F(SysmanMultiDeviceInfoFixture, GivenDeviceWithMultipleTilesWhenOnlyTileOneIsEnabledThenGetSysmanDeviceInfoReturnsExpectedValues) {
+TEST_F(SysmanMultiDeviceInfoFixture, givenDeviceWithMultipleTilesWhenOnlyTileOneIsEnabledThenGetSysmanDeviceInfoReturnsExpectedValues) {
     neoDevice->deviceBitfield.reset();
     neoDevice->deviceBitfield.set(1);
     uint32_t subdeviceId = 0;
@@ -20,7 +24,7 @@ TEST_F(SysmanMultiDeviceInfoFixture, GivenDeviceWithMultipleTilesWhenOnlyTileOne
     EXPECT_TRUE(onSubdevice);
 }
 
-TEST_F(SysmanMultiDeviceInfoFixture, GivenDeviceWithMultipleTilesWhenOnlyTileOneIsEnabledAndMultiArchIsDisabledThenGetSysmanDeviceInfoReturnsExpectedValues) {
+TEST_F(SysmanMultiDeviceInfoFixture, givenDeviceWithMultipleTilesWhenOnlyTileOneIsEnabledAndMultiArchIsDisabledThenGetSysmanDeviceInfoReturnsExpectedValues) {
     neoDevice->deviceBitfield.reset();
     neoDevice->deviceBitfield.set(1);
     uint32_t subdeviceId = 0;
@@ -30,7 +34,8 @@ TEST_F(SysmanMultiDeviceInfoFixture, GivenDeviceWithMultipleTilesWhenOnlyTileOne
     EXPECT_FALSE(onSubdevice);
 }
 
-TEST_F(SysmanMultiDeviceInfoFixture, GivenDeviceWithMultipleTilesEnabledThenGetSysmanDeviceInfoReturnsExpectedValues) {
+TEST_F(SysmanMultiDeviceInfoFixture, givenDeviceWithMultipleTilesEnabledAndCompositeHierarchyThenGetSysmanDeviceInfoReturnsExpectedValues) {
+    neoDevice->getExecutionEnvironment()->setDeviceHierarchyMode(NEO::DeviceHierarchyMode::composite);
     uint32_t subDeviceCount = 0;
     std::vector<ze_device_handle_t> deviceHandles;
     Device::fromHandle(device->toHandle())->getSubDevices(&subDeviceCount, nullptr);

@@ -1,26 +1,17 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/test_macros/test.h"
-
-#include "hw_cmds_xe_hpc_core_base.h"
 
 using namespace NEO;
 
 using XeHpcCoreHwCmdTest = ::testing::Test;
-
-XE_HPC_CORETEST_F(XeHpcCoreHwCmdTest, givenMediaSurfaceStateWhenProgrammingMocsThenMocsIndexIsSetProperly) {
-    auto mediaSurfaceState = FamilyType::cmdInitMediaSurfaceState;
-    uint32_t mocs = 4u;
-    uint32_t expectedMocsIndex = (mocs >> 1);
-    mediaSurfaceState.setSurfaceMemoryObjectControlState(mocs);
-    EXPECT_EQ(expectedMocsIndex, mediaSurfaceState.TheStructure.Common.SurfaceMemoryObjectControlStateIndexToMocsTables);
-}
 
 XE_HPC_CORETEST_F(XeHpcCoreHwCmdTest, givenRenderSurfaceStateWhenProgrammingMocsThenMocsIndexIsSetProperly) {
     auto renderSurfaceState = FamilyType::cmdInitRenderSurfaceState;
@@ -67,5 +58,5 @@ XE_HPC_CORETEST_F(XeHpcCoreHwCmdTest, givenPostSyncDataWhenProgrammingMocsThenMo
     uint32_t mocs = 4u;
     uint32_t expectedMocsIndex = (mocs >> 1);
     postSyncData.setMocs(mocs);
-    EXPECT_EQ(expectedMocsIndex, postSyncData.TheStructure.Common.MocsIndexToMocsTables);
+    EXPECT_EQ(expectedMocsIndex, postSyncData.TheStructure.Common.IndexToMocsTables);
 }

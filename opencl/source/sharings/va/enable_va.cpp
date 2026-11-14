@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,9 +9,11 @@
 
 #include "opencl/source/sharings/va/enable_va.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/os_interface/driver_info.h"
 
 #include "opencl/source/api/api.h"
+#include "opencl/source/api/dispatch.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/context/context.inl"
 #include "opencl/source/sharings/sharing_factory.h"
@@ -30,15 +32,16 @@ bool VaSharingContextBuilder::processProperties(cl_context_properties &propertyT
 
     switch (propertyType) {
     case CL_CONTEXT_VA_API_DISPLAY_INTEL:
-        contextData->vaDisplay = (VADisplay)propertyValue;
+        contextData->vaDisplay = reinterpret_cast<VADisplay>(propertyValue);
         return true;
     }
     return false;
 }
 
 bool VaSharingContextBuilder::finalizeProperties(Context &context, int32_t &errcodeRet) {
-    if (contextData.get() == nullptr)
+    if (contextData.get() == nullptr) {
         return true;
+    }
 
     if (contextData->vaDisplay) {
         context.registerSharing(new VASharingFunctions(contextData->vaDisplay));
@@ -71,18 +74,18 @@ void VaSharingBuilderFactory::fillGlobalDispatchTable() {
     crtGlobalDispatchTable.clEnqueueAcquireVA_APIMediaSurfacesINTEL = clEnqueueAcquireVA_APIMediaSurfacesINTEL;
 }
 
-#define RETURN_FUNC_PTR_IF_EXIST(name) \
-    {                                  \
-        if (functionName == #name) {   \
-            return ((void *)(name));   \
-        }                              \
+#define RETURN_FUNC_PTR_IF_EXIST(name)             \
+    {                                              \
+        if (functionName == #name) {               \
+            return reinterpret_cast<void *>(name); \
+        }                                          \
     }
 void *VaSharingBuilderFactory::getExtensionFunctionAddress(const std::string &functionName) {
     RETURN_FUNC_PTR_IF_EXIST(clCreateFromVA_APIMediaSurfaceINTEL);
     RETURN_FUNC_PTR_IF_EXIST(clGetDeviceIDsFromVA_APIMediaAdapterINTEL);
     RETURN_FUNC_PTR_IF_EXIST(clEnqueueAcquireVA_APIMediaSurfacesINTEL);
     RETURN_FUNC_PTR_IF_EXIST(clEnqueueReleaseVA_APIMediaSurfacesINTEL);
-    if (DebugManager.flags.EnableFormatQuery.get()) {
+    if (debugManager.flags.EnableFormatQuery.get()) {
         RETURN_FUNC_PTR_IF_EXIST(clGetSupportedVA_APIMediaSurfaceFormatsINTEL);
     }
     auto extraFunction = getExtensionFunctionAddressExtra(functionName);

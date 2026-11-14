@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,10 +8,9 @@
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
 #include "shared/source/helpers/bit_helpers.h"
+#include "shared/source/helpers/memory_properties_flags.h"
 #include "shared/source/helpers/memory_properties_helpers.h"
 #include "shared/source/memory_manager/allocation_properties.h"
-
-#include "memory_properties_flags.h"
 
 namespace NEO {
 
@@ -54,7 +53,7 @@ GraphicsAllocation::UsmInitialPlacement MemoryPropertiesHelper::getUSMInitialPla
     if (memoryProperties.allocFlags.usmInitialPlacementCpu) {
         initialPlacement = GraphicsAllocation::UsmInitialPlacement::CPU;
     }
-    if (const int32_t debugFlag = DebugManager.flags.UsmInitialPlacement.get(); debugFlag != -1) {
+    if (const int32_t debugFlag = debugManager.flags.UsmInitialPlacement.get(); debugFlag != -1) {
         initialPlacement = debugFlag != 1 ? GraphicsAllocation::UsmInitialPlacement::CPU : GraphicsAllocation::UsmInitialPlacement::GPU;
     }
     return initialPlacement;

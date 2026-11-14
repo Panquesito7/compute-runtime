@@ -1,41 +1,36 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/os_interface/windows/windows_wrapper.h"
+
+#include "level_zero/core/source/driver/driver.h"
 #include "level_zero/core/source/global_teardown.h"
 #include "level_zero/tools/source/sysman/os_sysman_driver.h"
 #include "level_zero/tools/source/sysman/sysman.h"
 
-#include <windows.h>
-
-namespace L0 {
-
-ze_result_t setDriverTeardownHandleInLoader(std::string loaderLibraryName) {
-    HMODULE handle = nullptr;
-    ze_result_t result = ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
-    handle = GetModuleHandleA(loaderLibraryName.c_str());
-    if (handle) {
-        zelSetDriverTeardown_fn setDriverTeardown = reinterpret_cast<zelSetDriverTeardown_fn>(GetProcAddress(handle, "zelSetDriverTeardown"));
-        if (setDriverTeardown) {
-            result = setDriverTeardown();
-        }
+/*
+ * DllMain is called by the OS when the DLL is loaded or unloaded.
+ * When modifying the code here, be aware of the restrictions on what can be done
+ * inside DllMain. See https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices
+ * for more information.
+ */
+BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) { // NOLINT(readability-identifier-naming)
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        L0::globalDriverSetup();
     }
-    return result;
-}
-
-} // namespace L0
-
-BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_DETACH) {
-        std::string loaderLibraryName = L0::loaderLibraryFilename + ".dll";
-        L0::setDriverTeardownHandleInLoader(loaderLibraryName);
+        if (lpvReserved != nullptr) {
+            L0::removePageFaultManagerAtTermination();
+            return TRUE;
+        }
         L0::globalDriverTeardown();
-        if (L0::GlobalOsSysmanDriver != nullptr) {
-            delete L0::GlobalOsSysmanDriver;
-            L0::GlobalOsSysmanDriver = nullptr;
+        if (L0::globalOsSysmanDriver != nullptr) {
+            delete L0::globalOsSysmanDriver;
+            L0::globalOsSysmanDriver = nullptr;
         }
     }
     return TRUE;

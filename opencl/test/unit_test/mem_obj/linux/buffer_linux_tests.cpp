@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -37,7 +37,7 @@
 
 using namespace NEO;
 
-static const unsigned int g_scTestBufferSizeInBytes = 16;
+static const unsigned int testBufferSizeInBytes = 16;
 
 TEST(Buffer, GivenInvalidHandleTypeWhenValidateHandleTypeThenReturnFalse) {
     MemoryProperties memoryProperties;
@@ -49,7 +49,7 @@ TEST(Buffer, GivenInvalidHandleTypeWhenValidateHandleTypeThenReturnFalse) {
 
 TEST(Buffer, GivenLinuxFdHandleTypeWhenValidateHandleTypeThenReturnTrue) {
     MemoryProperties memoryProperties;
-    memoryProperties.handleType = static_cast<uint64_t>(UnifiedSharingHandleType::LinuxFd);
+    memoryProperties.handleType = static_cast<uint64_t>(UnifiedSharingHandleType::linuxFd);
     UnifiedSharingMemoryDescription extMem;
     bool isValid = Buffer::validateHandleType(memoryProperties, extMem);
     EXPECT_TRUE(isValid);
@@ -77,7 +77,7 @@ class ExportBufferTests : public ClDeviceFixture,
     std::unique_ptr<MockContext> context;
     MemoryManager *contextMemoryManager;
     cl_mem_flags flags = CL_MEM_READ_WRITE;
-    unsigned char pHostPtr[g_scTestBufferSizeInBytes];
+    unsigned char pHostPtr[testBufferSizeInBytes];
 };
 
 struct ValidExportHostPtr
@@ -112,7 +112,7 @@ TEST_F(ValidExportHostPtr, givenInvalidPropertiesWithDmaBufWhenValidateInputAndC
 
     osHandle invalidHandle = static_cast<MockMemoryManager *>(pClExecutionEnvironment->memoryManager.get())->invalidSharedHandle;
     cl_mem_properties properties[] = {CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, invalidHandle, 0};
-    cl_mem buffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, flags, 0, g_scTestBufferSizeInBytes, nullptr, retVal);
+    cl_mem buffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, flags, 0, testBufferSizeInBytes, nullptr, retVal);
 
     EXPECT_EQ(retVal, CL_INVALID_MEM_OBJECT);
     EXPECT_EQ(static_cast<MockMemoryManager *>(pClExecutionEnvironment->memoryManager.get())->capturedSharedHandle, properties[1]);
@@ -123,7 +123,7 @@ TEST_F(ValidExportHostPtr, givenInvalidPropertiesWithDmaBufWhenValidateInputAndC
 
 TEST_F(ValidExportHostPtr, givenInvalidPropertiesWithOpaqueWin32WhenValidateInputAndCreateBufferThenNullptrIsReturned) {
     cl_mem_properties properties[] = {CL_EXTERNAL_MEMORY_HANDLE_OPAQUE_WIN32_KHR, 0x1234, 0};
-    cl_mem buffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, flags, 0, g_scTestBufferSizeInBytes, nullptr, retVal);
+    cl_mem buffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, flags, 0, testBufferSizeInBytes, nullptr, retVal);
 
     EXPECT_EQ(retVal, CL_INVALID_PROPERTY);
     EXPECT_EQ(buffer, nullptr);
@@ -134,7 +134,7 @@ TEST_F(ValidExportHostPtr, givenInvalidPropertiesWithOpaqueWin32WhenValidateInpu
 TEST_F(ValidExportHostPtr, givenPropertiesWithDmaBufWhenValidateInputAndCreateBufferThenCorrectBufferIsSet) {
 
     cl_mem_properties properties[] = {CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, 0x1234, 0};
-    cl_mem buffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, flags, 0, g_scTestBufferSizeInBytes, nullptr, retVal);
+    cl_mem buffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, flags, 0, testBufferSizeInBytes, nullptr, retVal);
 
     EXPECT_EQ(retVal, CL_SUCCESS);
     EXPECT_EQ(static_cast<MockMemoryManager *>(pClExecutionEnvironment->memoryManager.get())->capturedSharedHandle, properties[1]);
@@ -147,7 +147,7 @@ using BufferCreateLinuxTests = ::testing::Test;
 
 HWTEST_F(BufferCreateLinuxTests, givenClMemCopyHostPointerPassedToBufferCreateWhenCpuCopyAllowedThenLockResourceAndWriteBufferCorrectlyCalled) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::CpuAccessAllowed));
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::cpuAccessAllowed));
 
     auto executionEnvironment = new MockExecutionEnvironment(defaultHwInfo.get());
     auto memoryManager = new MockMemoryManager(true, *executionEnvironment);
@@ -161,7 +161,7 @@ HWTEST_F(BufferCreateLinuxTests, givenClMemCopyHostPointerPassedToBufferCreateWh
     context.setSpecialQueue(commandQueue, mockRootDeviceIndex);
     constexpr size_t smallBufferSize = Buffer::maxBufferSizeForCopyOnCpu;
     char memory[smallBufferSize];
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHwWithSetIsLockable<FamilyType>> overrideGfxCoreHelperHw{*executionEnvironment->rootDeviceEnvironments[0]};
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> overrideGfxCoreHelperHw{*executionEnvironment->rootDeviceEnvironments[0]};
 
     {
         // cpu copy allowed
@@ -188,7 +188,7 @@ HWTEST_F(BufferCreateLinuxTests, givenClMemCopyHostPointerPassedToBufferCreateWh
 
 HWTEST_F(BufferCreateLinuxTests, givenClMemCopyHostPointerPassedToBufferCreateWhenCpuCopyDisAllowedThenLockResourceAndWriteBufferCorrectlyCalled) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::CpuAccessAllowed));
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::cpuAccessAllowed));
 
     auto executionEnvironment = new MockExecutionEnvironment(defaultHwInfo.get());
     auto memoryManager = new MockMemoryManager(true, *executionEnvironment);
@@ -202,7 +202,7 @@ HWTEST_F(BufferCreateLinuxTests, givenClMemCopyHostPointerPassedToBufferCreateWh
     context.setSpecialQueue(commandQueue, mockRootDeviceIndex);
     constexpr size_t bigBufferSize = Buffer::maxBufferSizeForCopyOnCpu + 1;
     char bigMemory[bigBufferSize];
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHwWithSetIsLockable<FamilyType>> overrideGfxCoreHelperHw{*executionEnvironment->rootDeviceEnvironments[0]};
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> overrideGfxCoreHelperHw{*executionEnvironment->rootDeviceEnvironments[0]};
 
     {
         // buffer size over threshold -> cpu copy disallowed
@@ -225,4 +225,26 @@ HWTEST_F(BufferCreateLinuxTests, givenClMemCopyHostPointerPassedToBufferCreateWh
         EXPECT_EQ(commandQueue->writeBufferCounter, writeBufferCounter + 1);
         EXPECT_EQ(memoryManager->lockResourceCalled, lockResourceCalled);
     }
+}
+
+using ExportBufferMultiRootDeviceTests = MultiRootDeviceFixture;
+
+TEST_F(ExportBufferMultiRootDeviceTests, givenDeviceHandleListWhenValidatingInputAndCreatingBufferThenHandleIsImportedOnlyForListedDevices) {
+    cl_mem_properties properties[] = {
+        CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, 0x1234,
+        CL_MEM_DEVICE_HANDLE_LIST_KHR, reinterpret_cast<cl_mem_properties>(static_cast<cl_device_id>(device2)),
+        CL_MEM_DEVICE_HANDLE_LIST_END_KHR,
+        0};
+    cl_int retVal = CL_INVALID_VALUE;
+
+    auto clBuffer = BufferFunctions::validateInputAndCreateBuffer(context.get(), properties, CL_MEM_READ_WRITE, 0,
+                                                                  MemoryConstants::pageSize, nullptr, retVal);
+    ASSERT_EQ(CL_SUCCESS, retVal);
+    auto buffer = castToObject<Buffer>(clBuffer);
+    ASSERT_NE(nullptr, buffer);
+
+    EXPECT_EQ(nullptr, buffer->getGraphicsAllocation(device1->getRootDeviceIndex()));
+    EXPECT_NE(nullptr, buffer->getGraphicsAllocation(device2->getRootDeviceIndex()));
+
+    clReleaseMemObject(clBuffer);
 }

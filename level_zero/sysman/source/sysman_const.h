@@ -1,54 +1,46 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include <chrono>
-#include <string>
-const std::string vendorIntel("Intel(R) Corporation");
-const std::string unknown("unknown");
-const std::string intelPciId("0x8086");
-constexpr uint32_t MbpsToBytesPerSecond = 125000;
-constexpr double milliVoltsFactor = 1000.0;
-constexpr uint32_t maxRasErrorCategoryCount = 7;
+#include <level_zero/zes_api.h>
 
-constexpr double maxPerformanceFactor = 100;
-constexpr double halfOfMaxPerformanceFactor = 50;
-constexpr double minPerformanceFactor = 0;
+#include <string_view>
 
 namespace L0 {
 namespace Sysman {
-struct SteadyClock {
-    typedef std::chrono::duration<uint64_t, std::milli> duration;
-    typedef duration::rep rep;
-    typedef duration::period period;
-    typedef std::chrono::time_point<SteadyClock> time_point;
-    static time_point now() noexcept {
-        static auto epoch = std::chrono::steady_clock::now();
-        return time_point(std::chrono::duration_cast<duration>(std::chrono::steady_clock::now() - epoch));
-    }
-};
 
-typedef struct _zes_fabric_port_error_counters_t {
-    void *pNext;
-    uint64_t linkFailureCount;
-    uint64_t fwCommErrorCount;
-    uint64_t fwErrorCount;
-    uint64_t linkDegradeCount;
+inline constexpr std::string_view vendorIntel("Intel(R) Corporation");
+inline constexpr std::string_view unknown("unknown");
+inline constexpr std::string_view intelPciId("0x8086");
+inline constexpr std::string_view guid64BitMemoryCounters("0xb15a0ede");
+inline constexpr double milliVoltsFactor = 1000.0;
+inline constexpr uint32_t maxRasErrorCategoryCount = 7;
+inline constexpr uint32_t maxRasErrorCategoryExpCount = 10;
 
-} zes_fabric_port_error_counters_t;
-} // namespace Sysman
-} // namespace L0
+inline constexpr uint32_t criticalLimitMultiplyFactor = 2;
+inline constexpr double maxPerformanceFactor = 100;
+inline constexpr double halfOfMaxPerformanceFactor = 50;
+inline constexpr double minPerformanceFactor = 0;
+inline constexpr double minPowerLimitFactor = 0.5;
+
+inline constexpr uint32_t numSocTemperatureEntries = 7;     // entries would be PCH or GT_TEMP, DRAM, SA, PSF, DE, PCIE, TYPEC
+inline constexpr uint32_t numCoreTemperatureEntries = 4;    // entries would be CORE0, CORE1, CORE2, CORE3
+inline constexpr uint32_t numComputeTemperatureEntries = 3; // entries would be IA, GT and LLC
+inline constexpr uint32_t invalidMaxTemperature = 125;
+inline constexpr uint32_t invalidMinTemperature = 10;
+inline constexpr uint32_t vendorIdIntel = 0x8086;
+inline constexpr double defaultMaxTemperature = -1;
 
 namespace PciLinkSpeeds {
-constexpr double Pci2_5GigatransfersPerSecond = 2.5;
-constexpr double Pci5_0GigatransfersPerSecond = 5.0;
-constexpr double Pci8_0GigatransfersPerSecond = 8.0;
-constexpr double Pci16_0GigatransfersPerSecond = 16.0;
-constexpr double Pci32_0GigatransfersPerSecond = 32.0;
+inline constexpr double pci2Dot5GigaTransfersPerSecond = 2.5;
+inline constexpr double pci5GigaTransfersPerSecond = 5.0;
+inline constexpr double pci8GigaTransfersPerSecond = 8.0;
+inline constexpr double pci16GigaTransfersPerSecond = 16.0;
+inline constexpr double pci32GigaTransfersPerSecond = 32.0;
 
 } // namespace PciLinkSpeeds
 enum PciGenerations {
@@ -59,21 +51,62 @@ enum PciGenerations {
     PciGen5,
 };
 
-constexpr uint8_t maxPciBars = 6;
+inline constexpr uint8_t maxPciBars = 6;
 // Linux kernel would report 255 link width, as an indication of unknown.
-constexpr uint32_t unknownPcieLinkWidth = 255u;
+inline constexpr uint32_t unknownPcieLinkWidth = 255u;
 
-constexpr uint32_t microSecondsToNanoSeconds = 1000u;
+inline constexpr uint32_t microSecondsToNanoSeconds = 1000u;
 
-constexpr uint64_t convertJouleToMicroJoule = 1000000u;
-constexpr uint64_t minTimeoutModeHeartbeat = 5000u;
-constexpr uint64_t minTimeoutInMicroSeconds = 1000u;
-constexpr uint16_t milliSecsToMicroSecs = 1000;
-constexpr uint32_t milliFactor = 1000u;
-constexpr uint32_t microFacor = milliFactor * milliFactor;
-constexpr uint64_t gigaUnitTransferToUnitTransfer = 1000 * 1000 * 1000;
+inline constexpr uint64_t convertJouleToMicroJoule = 1000000u;
+inline constexpr uint64_t minTimeoutModeHeartbeat = 5000u;
+inline constexpr uint64_t minTimeoutInMicroSeconds = 1000u;
+inline constexpr uint16_t milliSecsToMicroSecs = 1000;
+inline constexpr uint32_t milliFactor = 1000u;
+inline constexpr uint32_t microFactor = milliFactor * milliFactor;
+inline constexpr uint64_t gigaUnitTransferToUnitTransfer = 1000 * 1000 * 1000;
+inline constexpr uint64_t megaBytesToBytes = 1000 * 1000;
+inline constexpr uint64_t gigaBytesToBytes = megaBytesToBytes * 1000;
+inline constexpr uint64_t mbpsToBytesPerSec = megaBytesToBytes / 8;
 
-constexpr int32_t memoryBusWidth = 128; // bus width in bytes
-constexpr int32_t numMemoryChannels = 8;
-constexpr uint32_t unknownMemoryType = UINT32_MAX;
-#define BITS(x, at, width) (((x) >> (at)) & ((1 << (width)) - 1))
+inline constexpr int32_t memoryBusWidth = 128; // bus width in bytes
+inline constexpr int32_t numMemoryChannels = 8;
+inline constexpr uint32_t unknownMemoryType = UINT32_MAX;
+
+inline constexpr uint32_t bits(uint32_t x, uint32_t at, uint32_t width) {
+    return (((x) >> (at)) & ((1 << (width)) - 1));
+}
+
+inline constexpr uint64_t packInto64Bit(uint32_t msb, uint32_t lsb) {
+    return ((static_cast<uint64_t>(msb) << 32) | static_cast<uint64_t>(lsb));
+}
+
+inline constexpr double convertU13p3(uint16_t rawValue) {
+    // Convert U13.3 fixed-point format (13 integer bits + 3 fractional bits) to a floating-point value
+    const uint32_t integerPart = rawValue >> 3;
+    const uint32_t fractionalBits = rawValue & 0x7; // 3 bits
+    const double fractionalPart = static_cast<double>(fractionalBits) / (1 << 3);
+    return (static_cast<double>(integerPart) + fractionalPart);
+}
+
+inline constexpr double convertU1p8(uint16_t rawValue) {
+    // Convert U1.8 fixed-point format (1 integer bit + 8 fractional bits) to a floating-point value
+    const uint32_t integerPart = rawValue >> 8;
+    const uint32_t fractionalBits = rawValue & 0xFF; // 8 bits
+    const double fractionalPart = static_cast<double>(fractionalBits) / (1 << 8);
+    return (static_cast<double>(integerPart) + fractionalPart);
+}
+
+inline constexpr double convertU18p14(uint32_t rawValue) {
+    // Convert U18.14 fixed-point format (18 integer bits + 14 fractional bits) to a floating-point value
+    const uint32_t integerPart = rawValue >> 14;
+    const uint32_t fractionalBits = rawValue & 0x3FFF; // 14 bits
+    const double fractionalPart = static_cast<double>(fractionalBits) / (1 << 14);
+    return static_cast<double>(integerPart) + fractionalPart;
+}
+
+inline constexpr bool isGroupEngineHandle(zes_engine_group_t engineGroup) {
+    return (engineGroup == ZES_ENGINE_GROUP_ALL || engineGroup == ZES_ENGINE_GROUP_MEDIA_ALL || engineGroup == ZES_ENGINE_GROUP_COMPUTE_ALL || engineGroup == ZES_ENGINE_GROUP_RENDER_ALL || engineGroup == ZES_ENGINE_GROUP_COPY_ALL);
+}
+
+} // namespace Sysman
+} // namespace L0

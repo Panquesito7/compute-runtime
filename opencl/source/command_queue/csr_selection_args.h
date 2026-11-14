@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -33,7 +33,7 @@ struct CsrSelectionArgs {
     CsrSelectionArgs(cl_command_type cmdType, const size_t *size)
         : cmdType(cmdType),
           size(size),
-          direction(TransferDirection::HostToHost) {}
+          direction(TransferDirection::hostToHost) {}
 
     template <typename ResourceType>
     CsrSelectionArgs(cl_command_type cmdType, ResourceType *src, ResourceType *dst, uint32_t rootDeviceIndex, const size_t *size)
@@ -45,7 +45,7 @@ struct CsrSelectionArgs {
         if (dst) {
             processResource(*dst, rootDeviceIndex, this->dstResource);
         }
-        this->direction = createTransferDirection(srcResource.isLocal, dstResource.isLocal);
+        this->direction = createTransferDirection(srcResource.isLocal, dstResource.isLocal, false);
     }
 
     CsrSelectionArgs(cl_command_type cmdType, Image *src, Image *dst, uint32_t rootDeviceIndex, const size_t *size, const size_t *srcOrigin, const size_t *dstOrigin)

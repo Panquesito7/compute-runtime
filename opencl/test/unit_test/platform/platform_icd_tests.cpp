@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/source/helpers/string.h"
 
+#include "opencl/source/api/dispatch.h"
 #include "opencl/source/sharings/sharing_factory.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
 
@@ -42,7 +43,7 @@ class IcdRestore : public SharingFactory {
     std::vector<std::unique_ptr<SharingBuilderFactory>> sharings;
 };
 
-void fakeGlF() {
+void CL_API_CALL fakeGlF() {
 }
 
 class PlatformTestedSharingBuilderFactory : public SharingBuilderFactory {

@@ -1,0 +1,440 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_lib.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/memory_allocation.h"
+#include "shared/source/memory_manager/os_agnostic_memory_manager.h"
+#include "shared/test/common/mocks/mock_gmm.h"
+#include "shared/test/common/test_macros/hw_test.h"
+
+#include "level_zero/core/source/image/internal_core_image_ext.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_image.h"
+
+namespace L0 {
+namespace ult {
+
+class MemoryManagerGlExtNTHandleMock : public NEO::OsAgnosticMemoryManager {
+  public:
+    MemoryManagerGlExtNTHandleMock(NEO::ExecutionEnvironment &executionEnvironment) : NEO::OsAgnosticMemoryManager(executionEnvironment) {}
+
+    NEO::GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+        auto graphicsAllocation = createMemoryAllocation(AllocationType::internalHostMemory, nullptr, reinterpret_cast<void *>(1), 1,
+                                                         4096u, osHandleData.handle, MemoryPool::systemCpuInaccessible,
+                                                         properties.rootDeviceIndex, false, false, false);
+        graphicsAllocation->setSharedHandle(osHandleData.handle);
+        graphicsAllocation->set32BitAllocation(false);
+        GmmRequirements gmmRequirements{};
+        gmmRequirements.allowLargePages = true;
+        gmmRequirements.preferCompressed = false;
+        constexpr size_t importedGmmSize = 1u;
+        constexpr size_t importedGmmAlignment = 0u;
+        auto importedGmm = std::make_unique<Gmm>(executionEnvironment.rootDeviceEnvironments[0]->getGmmHelper(), nullptr, importedGmmSize, importedGmmAlignment, GMM_RESOURCE_USAGE_OCL_BUFFER, StorageInfo{}, gmmRequirements);
+        this->importedGmms.push_back(importedGmm.get());
+        graphicsAllocation->setDefaultGmm(std::move(importedGmm));
+        return graphicsAllocation;
+    }
+
+    std::vector<Gmm *> importedGmms;
+};
+
+class ImageCreateGlTextureExtFixture : public DeviceFixtureWithCustomMemoryManager<MemoryManagerGlExtNTHandleMock> {
+  public:
+    void setUp() {
+        DeviceFixtureWithCustomMemoryManager<MemoryManagerGlExtNTHandleMock>::setUp();
+
+        desc.stype = ZE_STRUCTURE_TYPE_IMAGE_DESC;
+        desc.type = ZE_IMAGE_TYPE_3D;
+        desc.format.layout = ZE_IMAGE_FORMAT_LAYOUT_8_8_8_8;
+        desc.format.type = ZE_IMAGE_FORMAT_TYPE_UINT;
+        desc.width = 11;
+        desc.height = 13;
+        desc.depth = 17;
+
+        desc.format.x = ZE_IMAGE_FORMAT_SWIZZLE_A;
+        desc.format.y = ZE_IMAGE_FORMAT_SWIZZLE_0;
+        desc.format.z = ZE_IMAGE_FORMAT_SWIZZLE_1;
+        desc.format.w = ZE_IMAGE_FORMAT_SWIZZLE_X;
+
+        delete driverHandle->svmAllocsManager;
+        driverHandle->setMemoryManager(execEnv->memoryManager.get());
+        driverHandle->svmAllocsManager = new NEO::SVMAllocsManager(execEnv->memoryManager.get());
+    }
+
+    void tearDown() {
+        DeviceFixtureWithCustomMemoryManager<MemoryManagerGlExtNTHandleMock>::tearDown();
+    }
+
+    ze_image_desc_t desc = {};
+    uint64_t imageHandle = 0x1;
+};
+
+using ImageCreateGlTextureExtTest = Test<ImageCreateGlTextureExtFixture>;
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWhenCreatingImageThenSuccessIsReturnedAndSharedHandleIsSet) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.pGmmResInfo = nullptr;
+    glTextureExtDesc.textureBufferOffset = 0u;
+    glTextureExtDesc.glHWFormat = 0u;
+    glTextureExtDesc.isAuxEnabled = false;
+
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+    ASSERT_NE(nullptr, imageHW->getAllocation());
+    ASSERT_EQ(imageHW->getAllocation()->peekSharedHandle(), NEO::toOsHandle(importNTHandle.handle));
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST2_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWhenCreatingImageThenImgInfoOffsetsAreResetToZero, SupportsLegacyRenderSurfaceState) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    // For GL shared-handle imports, imgInfo offsets must be reset to zero so that the
+    // surface state is programmed against the imported allocation's base address with
+    // no intra-resource shift.
+    EXPECT_EQ(0u, imageHW->imgInfo.offset);
+    EXPECT_EQ(0u, imageHW->imgInfo.xOffset);
+    EXPECT_EQ(0u, imageHW->imgInfo.yOffset);
+    EXPECT_EQ(0u, imageHW->imgInfo.yOffsetForUVPlane);
+
+    EXPECT_EQ(imageHW->getAllocation()->getGpuAddress(), imageHW->getSurfaceState().getSurfaceBaseAddress());
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWithNonZeroTextureBufferOffsetWhenCreatingImageThenSuccessIsReturned) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.textureBufferOffset = 0u;
+
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+    ASSERT_EQ(imageHW->getAllocation()->peekSharedHandle(), NEO::toOsHandle(importNTHandle.handle));
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST2_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWithCubeFaceIndexWhenCreatingImageThenMinimumArrayElementMatchesCubeFace, SupportsLegacyRenderSurfaceState) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.cubeFaceIndex = static_cast<uint32_t>(__GMM_CUBE_FACE_POS_Y);
+
+    desc.type = ZE_IMAGE_TYPE_2D;
+    desc.depth = 1;
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(static_cast<uint32_t>(__GMM_CUBE_FACE_POS_Y), imageHW->getSurfaceState().getMinimumArrayElement());
+    EXPECT_TRUE(imageHW->getSurfaceState().getSurfaceArray());
+    EXPECT_EQ(static_cast<uint32_t>(__GMM_CUBE_FACE_POS_Y), imageHW->getRedescribedSurfaceState().getMinimumArrayElement());
+    EXPECT_TRUE(imageHW->getRedescribedSurfaceState().getSurfaceArray());
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWithNoCubeMapWhenCreatingImageThenCubeBranchIsNotEntered) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.cubeFaceIndex = static_cast<uint32_t>(__GMM_NO_CUBE_MAP);
+
+    desc.type = ZE_IMAGE_TYPE_2DARRAY;
+    desc.depth = 1;
+    desc.arraylevels = 12;
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, imageHW->getSurfaceState().getMinimumArrayElement());
+    EXPECT_EQ(0u, imageHW->getRedescribedSurfaceState().getMinimumArrayElement());
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWithMsaaSamplesWhenCreatingImageThenMultisampleFieldsAreSet) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.numberOfSamples = 4;
+
+    desc.type = ZE_IMAGE_TYPE_2DARRAY;
+    desc.depth = 1;
+    desc.arraylevels = 6;
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(4u, imageHW->numSamples);
+    EXPECT_EQ(2u, imageHW->mcsMultisampleCount);
+    EXPECT_EQ(nullptr, imageHW->mcsAllocation);
+    EXPECT_FALSE(imageHW->isUnifiedMcsSurface);
+
+    auto expectedMultisamples = static_cast<typename RENDER_SURFACE_STATE::NUMBER_OF_MULTISAMPLES>(2u);
+    EXPECT_EQ(expectedMultisamples, imageHW->getSurfaceState().getNumberOfMultisamples());
+    EXPECT_EQ(expectedMultisamples, imageHW->getRedescribedSurfaceState().getNumberOfMultisamples());
+
+    EXPECT_EQ(RENDER_SURFACE_STATE::MULTISAMPLED_SURFACE_STORAGE_FORMAT::MULTISAMPLED_SURFACE_STORAGE_FORMAT_MSS,
+              imageHW->getSurfaceState().getMultisampledSurfaceStorageFormat());
+    EXPECT_EQ(RENDER_SURFACE_STATE::MULTISAMPLED_SURFACE_STORAGE_FORMAT::MULTISAMPLED_SURFACE_STORAGE_FORMAT_MSS,
+              imageHW->getRedescribedSurfaceState().getMultisampledSurfaceStorageFormat());
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST2_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWith16xMsaaSamplesWhenCreatingImageThenMultisampleCountIsCorrect, SupportsLegacyRenderSurfaceState) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.numberOfSamples = 16;
+
+    desc.type = ZE_IMAGE_TYPE_2DARRAY;
+    desc.depth = 1;
+    desc.arraylevels = 12;
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(16u, imageHW->numSamples);
+    EXPECT_EQ(4u, imageHW->mcsMultisampleCount);
+
+    auto expectedMultisamples = static_cast<typename RENDER_SURFACE_STATE::NUMBER_OF_MULTISAMPLES>(4u);
+    EXPECT_EQ(expectedMultisamples, imageHW->getSurfaceState().getNumberOfMultisamples());
+    EXPECT_EQ(expectedMultisamples, imageHW->getRedescribedSurfaceState().getNumberOfMultisamples());
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST2_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWithMsaaAndMcsHandleWhenCreatingImageThenMcsAllocationIsCreated, SupportsLegacyRenderSurfaceState) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    uint64_t mcsHandle = 0x2;
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.numberOfSamples = 4;
+    glTextureExtDesc.mcsNtHandle = &mcsHandle;
+
+    desc.type = ZE_IMAGE_TYPE_2DARRAY;
+    desc.depth = 1;
+    desc.arraylevels = 6;
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(4u, imageHW->numSamples);
+    EXPECT_NE(nullptr, imageHW->mcsAllocation);
+    EXPECT_FALSE(imageHW->isUnifiedMcsSurface);
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST2_F(ImageCreateGlTextureExtTest, givenGmmResourceInfosOfTextureAndMcsWhenCreatingImageThenGmmsOfImportedAllocationsAreReplaced, SupportsLegacyRenderSurfaceState) {
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    auto gmmHelper = neoDevice->getRootDeviceEnvironment().getGmmHelper();
+    auto textureGmm = std::make_unique<MockGmm>(gmmHelper);
+    auto mcsGmm = std::make_unique<MockGmm>(gmmHelper);
+
+    constexpr uint32_t numberOfSamples = 4u;
+    uint64_t mcsHandle = 0u;
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.pGmmResInfo = textureGmm->gmmResourceInfo->peekGmmResourceInfo();
+    glTextureExtDesc.numberOfSamples = numberOfSamples;
+    glTextureExtDesc.mcsNtHandle = &mcsHandle;
+    glTextureExtDesc.pGmmResInfoMcs = mcsGmm->gmmResourceInfo->peekGmmResourceInfo();
+
+    desc.type = ZE_IMAGE_TYPE_2D;
+    desc.pNext = &glTextureExtDesc;
+
+    auto memoryManager = static_cast<MemoryManagerGlExtNTHandleMock *>(execEnv->memoryManager.get());
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    ASSERT_EQ(2u, memoryManager->importedGmms.size());
+    ASSERT_NE(nullptr, imageHW->getAllocation()->getDefaultGmm());
+    EXPECT_NE(memoryManager->importedGmms[0], imageHW->getAllocation()->getDefaultGmm());
+    ASSERT_NE(nullptr, imageHW->mcsAllocation);
+    ASSERT_NE(nullptr, imageHW->mcsAllocation->getDefaultGmm());
+    EXPECT_NE(memoryManager->importedGmms[1], imageHW->mcsAllocation->getDefaultGmm());
+}
+
+HWTEST2_F(ImageCreateGlTextureExtTest, givenGlTextureExtDescWithNoMsaaWhenCreatingImageThenMultisampleFieldsAreDefault, SupportsLegacyRenderSurfaceState) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+
+    ze_external_memory_import_win32_handle_t importNTHandle = {};
+    importNTHandle.handle = &imageHandle;
+    importNTHandle.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    importNTHandle.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32;
+
+    ze_external_gl_texture_ext_desc_t glTextureExtDesc = {};
+    glTextureExtDesc.pNext = &importNTHandle;
+    glTextureExtDesc.numberOfSamples = 0;
+
+    desc.pNext = &glTextureExtDesc;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, imageHW->numSamples);
+    EXPECT_EQ(0u, imageHW->mcsMultisampleCount);
+    EXPECT_EQ(nullptr, imageHW->mcsAllocation);
+    EXPECT_FALSE(imageHW->isUnifiedMcsSurface);
+
+    EXPECT_EQ(RENDER_SURFACE_STATE::NUMBER_OF_MULTISAMPLES::NUMBER_OF_MULTISAMPLES_MULTISAMPLECOUNT_1,
+              imageHW->getSurfaceState().getNumberOfMultisamples());
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenDmaBufFdAndImageTilingExtDescWithForcedTilingWhenCreatingImageThenForceTilingAndRowPitchAreApplied) {
+    ze_external_memory_import_fd_t importFd = {};
+    importFd.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
+    importFd.fd = 1;
+    importFd.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+
+    ze_image_tiling_ext_desc_t tilingDesc = {};
+    tilingDesc.linearStorage = false;
+    tilingDesc.forceTiling = NEO::ImageTilingMode::tiled4;
+    tilingDesc.rowPitch = 256u;
+    importFd.pNext = &tilingDesc;
+
+    desc.type = ZE_IMAGE_TYPE_2D;
+    desc.depth = 1;
+    desc.pNext = &importFd;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(imageHW->imgInfo.linearStorage);
+    EXPECT_EQ(NEO::ImageTilingMode::tiled4, imageHW->imgInfo.forceTiling);
+    EXPECT_EQ(256u, imageHW->imgInfo.imgDesc.imageRowPitch);
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenDmaBufFdAndImageTilingExtDescWithLinearStorageWhenCreatingImageThenLinearStorageAndRowPitchAreApplied) {
+    ze_external_memory_import_fd_t importFd = {};
+    importFd.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
+    importFd.fd = 1;
+    importFd.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+
+    ze_image_tiling_ext_desc_t tilingDesc = {};
+    tilingDesc.linearStorage = true;
+    tilingDesc.rowPitch = 64u;
+    importFd.pNext = &tilingDesc;
+
+    desc.type = ZE_IMAGE_TYPE_2D;
+    desc.depth = 1;
+    desc.pNext = &importFd;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_TRUE(imageHW->imgInfo.linearStorage);
+    EXPECT_EQ(64u, imageHW->imgInfo.imgDesc.imageRowPitch);
+
+    imageHW.reset(nullptr);
+}
+
+HWTEST_F(ImageCreateGlTextureExtTest, givenDmaBufFdWithoutImageTilingExtDescWhenCreatingImageThenRowPitchIsDerivedFromGmm) {
+    ze_external_memory_import_fd_t importFd = {};
+    importFd.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
+    importFd.fd = 1;
+    importFd.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+
+    desc.type = ZE_IMAGE_TYPE_2D;
+    desc.depth = 1;
+    desc.pNext = &importFd;
+
+    auto imageHW = std::make_unique<WhiteBox<::L0::ImageCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto ret = imageHW->initialize(device, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_NE(256u, imageHW->imgInfo.imgDesc.imageRowPitch);
+
+    imageHW.reset(nullptr);
+}
+
+} // namespace ult
+} // namespace L0

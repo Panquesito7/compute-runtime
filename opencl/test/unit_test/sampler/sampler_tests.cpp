@@ -1,123 +1,66 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/test_macros/hw_test.h"
+
 #include "opencl/source/sampler/sampler.h"
+#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_sampler.h"
 
 #include "gtest/gtest.h"
-#include "patch_list.h"
-
-#include <tuple>
 
 using namespace NEO;
 
-struct CreateSampler : public ::testing::TestWithParam<
-                           std::tuple<uint32_t /*cl_bool*/, uint32_t /*cl_addressing_mode*/, uint32_t /*cl_filter_mode*/>> {
-    CreateSampler() {
-    }
-
-    void SetUp() override {
-        std::tie(normalizedCoords, addressingMode, filterMode) = GetParam();
-        context = new MockContext();
-    }
-
-    void TearDown() override {
-        delete context;
-    }
-
-    MockContext *context;
+struct CreateSampler : public ::testing::Test {
+    MockContext context;
     cl_int retVal = CL_INVALID_VALUE;
-    cl_bool normalizedCoords;
-    cl_addressing_mode addressingMode;
-    cl_filter_mode filterMode;
 };
 
-TEST_P(CreateSampler, WhenSamplerIsCreatedThenSuccessIsReturned) {
-    auto sampler = Sampler::create(
-        context,
-        normalizedCoords,
-        addressingMode,
-        filterMode,
-        retVal);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, sampler);
-    delete sampler;
+TEST_F(CreateSampler, WhenSamplerIsCreatedThenSuccessIsReturned) {
+    const cl_bool normalizedCoordModes[] = {CL_FALSE, CL_TRUE};
+    const cl_addressing_mode addressingModes[] = {CL_ADDRESS_MIRRORED_REPEAT, CL_ADDRESS_REPEAT,
+                                                  CL_ADDRESS_CLAMP_TO_EDGE, CL_ADDRESS_CLAMP, CL_ADDRESS_NONE};
+    const cl_filter_mode filterModes[] = {CL_FILTER_NEAREST, CL_FILTER_LINEAR};
+    for (auto normalizedCoords : normalizedCoordModes) {
+        for (auto addressingMode : addressingModes) {
+            for (auto filterMode : filterModes) {
+                retVal = CL_INVALID_VALUE;
+                std::unique_ptr<Sampler> sampler(Sampler::create(&context, normalizedCoords, addressingMode, filterMode, retVal));
+                EXPECT_EQ(CL_SUCCESS, retVal);
+                EXPECT_NE(nullptr, sampler);
+            }
+        }
+    }
 }
 
-TEST_P(CreateSampler, GivenModeWhenSamplerIsCreatedThenParamsAreSetCorrectly) {
-    auto sampler = new MockSampler(
-        context,
-        normalizedCoords,
-        addressingMode,
-        filterMode);
-    ASSERT_NE(nullptr, sampler); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+TEST_F(CreateSampler, GivenModeWhenSamplerIsCreatedThenParamsAreSetCorrectly) {
+    const cl_bool normalizedCoordModes[] = {CL_FALSE, CL_TRUE};
+    const cl_addressing_mode addressingModes[] = {CL_ADDRESS_MIRRORED_REPEAT, CL_ADDRESS_REPEAT,
+                                                  CL_ADDRESS_CLAMP_TO_EDGE, CL_ADDRESS_CLAMP, CL_ADDRESS_NONE};
+    const cl_filter_mode filterModes[] = {CL_FILTER_NEAREST, CL_FILTER_LINEAR};
+    for (auto normalizedCoords : normalizedCoordModes) {
+        for (auto addressingMode : addressingModes) {
+            for (auto filterMode : filterModes) {
+                std::unique_ptr<MockSampler> sampler(new MockSampler(&context, normalizedCoords, addressingMode, filterMode));
+                ASSERT_NE(nullptr, sampler);
 
-    EXPECT_EQ(context, sampler->getContext());
-    EXPECT_EQ(normalizedCoords, sampler->getNormalizedCoordinates());
-    EXPECT_EQ(addressingMode, sampler->getAddressingMode());
-    EXPECT_EQ(filterMode, sampler->getFilterMode());
+                EXPECT_EQ(&context, sampler->getContext());
+                EXPECT_EQ(normalizedCoords, sampler->getNormalizedCoordinates());
+                EXPECT_EQ(addressingMode, sampler->getAddressingMode());
+                EXPECT_EQ(filterMode, sampler->getFilterMode());
 
-    // check for SnapWA
-    bool snapWaNeeded = addressingMode == CL_ADDRESS_CLAMP && filterMode == CL_FILTER_NEAREST;
-    auto snapWaValue = snapWaNeeded ? iOpenCL::CONSTANT_REGISTER_BOOLEAN_TRUE : iOpenCL::CONSTANT_REGISTER_BOOLEAN_FALSE;
-    EXPECT_EQ(snapWaValue, sampler->getSnapWaValue());
-
-    delete sampler;
+                bool snapWaNeeded = addressingMode == CL_ADDRESS_CLAMP && filterMode == CL_FILTER_NEAREST;
+                EXPECT_EQ(snapWaNeeded, sampler->getSnapWaValue() != 0u);
+            }
+        }
+    }
 }
-
-static cl_bool normalizedCoordModes[] = {
-    CL_FALSE,
-    CL_TRUE};
-
-static cl_addressing_mode addressingModes[] = {
-    CL_ADDRESS_MIRRORED_REPEAT,
-    CL_ADDRESS_REPEAT,
-    CL_ADDRESS_CLAMP_TO_EDGE,
-    CL_ADDRESS_CLAMP,
-    CL_ADDRESS_NONE};
-
-static cl_filter_mode filterModes[] = {
-    CL_FILTER_NEAREST,
-    CL_FILTER_LINEAR};
-
-INSTANTIATE_TEST_CASE_P(Sampler,
-                        CreateSampler,
-                        ::testing::Combine(
-                            ::testing::ValuesIn(normalizedCoordModes),
-                            ::testing::ValuesIn(addressingModes),
-                            ::testing::ValuesIn(filterModes)));
-
-typedef ::testing::TestWithParam<std::tuple<uint32_t /*normalizedCoords*/, uint32_t /*addressingMode*/, uint32_t /*filterMode*/>> TransformableSamplerTest;
-
-TEST_P(TransformableSamplerTest, givenSamplerWhenHasProperParametersThenIsTransformable) {
-    bool expectedRetVal;
-    bool retVal;
-    cl_bool normalizedCoords;
-    cl_addressing_mode addressingMode;
-    cl_filter_mode filterMode;
-    std::tie(normalizedCoords, addressingMode, filterMode) = GetParam();
-
-    expectedRetVal = addressingMode == CL_ADDRESS_CLAMP_TO_EDGE &&
-                     filterMode == CL_FILTER_NEAREST &&
-                     normalizedCoords == CL_FALSE;
-
-    MockSampler sampler(nullptr, normalizedCoords, addressingMode, filterMode);
-
-    retVal = sampler.isTransformable();
-    EXPECT_EQ(expectedRetVal, retVal);
-}
-INSTANTIATE_TEST_CASE_P(Sampler,
-                        TransformableSamplerTest,
-                        ::testing::Combine(
-                            ::testing::ValuesIn(normalizedCoordModes),
-                            ::testing::ValuesIn(addressingModes),
-                            ::testing::ValuesIn(filterModes)));
 
 TEST(castToSamplerTest, GivenGenericPointerWhichHoldsSamplerObjectWhenCastToSamplerIsCalledThenCastWithSuccess) {
     cl_int retVal;
@@ -138,9 +81,17 @@ TEST(castToSamplerTest, GivenGenericPointerWhichHoldsSamplerObjectWhenCastToSamp
 
 TEST(castToSamplerTest, GivenGenericPointerWhichDoestNotHoldSamplerObjectWhenCastToSamplerIsCalledThenCastWithAFailure) {
     auto context = std::make_unique<MockContext>();
-    auto notSamplerObj = std::unique_ptr<Image>(ImageHelper<Image2dDefaults>::create(context.get()));
+    auto notSamplerObj = std::unique_ptr<Image>(ImageHelperUlt<Image2dDefaults>::create(context.get()));
     void *ptr = notSamplerObj.get();
     auto notSampler = castToObject<Sampler>(ptr);
 
     EXPECT_EQ(nullptr, notSampler);
+}
+
+using SamplerHwTest = Test<ClDeviceFixture>;
+
+HWTEST2_F(SamplerHwTest, GivenDefaultThenLowQualityFilterIsDisabled, IsAtMostXe3pCore) {
+    using SAMPLER_STATE = typename FamilyType::SAMPLER_STATE;
+    auto state = FamilyType::cmdInitSamplerState;
+    EXPECT_EQ(SAMPLER_STATE::LOW_QUALITY_FILTER_DISABLE, state.getLowQualityFilter());
 }

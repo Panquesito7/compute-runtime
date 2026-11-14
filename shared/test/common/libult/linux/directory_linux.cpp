@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,23 +7,29 @@
 
 #include "shared/source/utilities/directory.h"
 
-#include "test_files_setup.h"
-
 #include <cstdio>
 #include <dirent.h>
 #include <map>
 
 namespace NEO {
+extern bool returnEmptyFilesVector;
 
-std::string byPathPattern(std::string(NEO_SHARED_TEST_FILES_DIR) + "/linux/by-path");
-std::string deviceDrmPath(std::string(NEO_SHARED_TEST_FILES_DIR) + "/linux/devices/device/drm");
+std::string byPathPattern("/linux/by-path");
+std::string deviceDrmPath("/linux/devices/device/drm");
 std::map<std::string, std::vector<std::string>> directoryFilesMap = {};
+int setErrno = 0;
 
 std::vector<std::string> Directory::getFiles(const std::string &path) {
     std::vector<std::string> files;
 
-    if (Directory::ReturnEmptyFilesVector) {
+    if (returnEmptyFilesVector) {
+        errno = setErrno;
         return files;
+    }
+
+    auto it = directoryFilesMap.find(path);
+    if (it != directoryFilesMap.end()) {
+        return directoryFilesMap[path];
     }
 
     if (path == byPathPattern) {
@@ -56,11 +62,6 @@ std::vector<std::string> Directory::getFiles(const std::string &path) {
             "/sys/class/intel_pmt/telem7",
             "/sys/class/intel_pmt/telem9",
         };
-    }
-
-    auto it = directoryFilesMap.find(path);
-    if (it != directoryFilesMap.end()) {
-        return directoryFilesMap[path];
     }
 
     return files;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/test/unit_test/fixtures/implicit_scaling_fixture.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/os_interface/os_interface.h"
@@ -16,7 +17,6 @@
 void ImplicitScalingFixture::setUp() {
     CommandEncodeStatesFixture::setUp();
     apiSupportBackup = std::make_unique<VariableBackup<bool>>(&ImplicitScaling::apiSupport, true);
-    osLocalMemoryBackup = std::make_unique<VariableBackup<bool>>(&OSInterface::osEnableLocalMemory, true);
 
     singleTile = DeviceBitfield(static_cast<uint32_t>(maxNBitValue(1)));
     twoTile = DeviceBitfield(static_cast<uint32_t>(maxNBitValue(2)));
@@ -38,4 +38,23 @@ void ImplicitScalingFixture::setUp() {
 void ImplicitScalingFixture::tearDown() {
     alignedFree(alignedMemory);
     CommandEncodeStatesFixture::tearDown();
+}
+
+ImplicitScalingDispatchCommandArgs ImplicitScalingFixture::createDispatchCommandArgs(uint64_t workPartitionAllocationAddress, uint32_t partitionCount) {
+    ImplicitScalingDispatchCommandArgs args{
+        workPartitionAllocationAddress,  // workPartitionAllocationGpuVa
+        this->pDevice,                   // device
+        nullptr,                         // outWalkerPtr
+        NEO::RequiredPartitionDim::none, // requiredPartitionDim
+        partitionCount,                  // partitionCount
+        1,                               // workgroupSize
+        1,                               // threadGroupCount
+        true,                            // useSecondaryBatchBuffer
+        false,                           // apiSelfCleanup
+        dcFlushFlag,                     // dcFlush
+        forceExecutionOnSingleTileFlag,  // forceExecutionOnSingleTile
+        false,                           // blockDispatchToCommandBuffer
+        false};                          // isRequiredDispatchWorkGroupOrder
+
+    return args;
 }

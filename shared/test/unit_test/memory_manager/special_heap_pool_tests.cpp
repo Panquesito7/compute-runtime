@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -21,17 +21,17 @@ TEST_F(FrontWindowAllocatorTests, givenAllocateInFrontWindowPoolFlagWhenAllocate
     AllocationData allocData = {};
     allocData.flags.use32BitFrontWindow = true;
     allocData.size = MemoryConstants::kiloByte;
-    auto allocation(memManager->allocate32BitGraphicsMemoryImpl(allocData, false));
+    auto allocation(memManager->allocate32BitGraphicsMemoryImpl(allocData));
     EXPECT_EQ(allocation->getGpuBaseAddress(), allocation->getGpuAddress());
     memManager->freeGraphicsMemory(allocation);
 }
 
-TEST_F(FrontWindowAllocatorTests, givenAllocateInFrontWindowPoolFlagWhenAllocate32BitGraphicsMemoryThenAlocationInFrontWindowPoolRange) {
+TEST_F(FrontWindowAllocatorTests, givenAllocateInFrontWindowPoolFlagWhenAllocate32BitGraphicsMemoryThenAllocationInFrontWindowPoolRange) {
     AllocationData allocData = {};
     allocData.flags.use32BitFrontWindow = true;
     allocData.size = MemoryConstants::kiloByte;
-    auto allocation(memManager->allocate32BitGraphicsMemoryImpl(allocData, false));
-    auto heap = memManager->heapAssigner.get32BitHeapIndex(allocData.type, false, *defaultHwInfo, true);
+    auto allocation(memManager->allocate32BitGraphicsMemoryImpl(allocData));
+    auto heap = memManager->heapAssigners[allocData.rootDeviceIndex]->get32BitHeapIndex(allocData.type, false, *defaultHwInfo, true);
     auto gmmHelper = memManager->getGmmHelper(allocData.rootDeviceIndex);
 
     EXPECT_EQ(gmmHelper->canonize(memManager->getGfxPartition(0)->getHeapMinimalAddress(heap)), allocation->getGpuAddress());
@@ -41,43 +41,43 @@ TEST_F(FrontWindowAllocatorTests, givenAllocateInFrontWindowPoolFlagWhenAllocate
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshEnabledThenExternalHeapHaveFrontWindowPool) {
-    EXPECT_NE(memManager->getGfxPartition(0)->getHeapLimit(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW), 0u);
+    EXPECT_NE(memManager->getGfxPartition(0)->getHeapLimit(HeapIndex::heapExternalFrontWindow), 0u);
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshEnabledThenFrontWindowPoolIsAtBeginingOfExternalHeap) {
-    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW));
-    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW));
+    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternalFrontWindow), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternalFrontWindow));
+    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::heapExternalFrontWindow), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternalFrontWindow));
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshEnabledThenMinimalAddressIsNotAtBeginingOfExternalHeap) {
-    EXPECT_GT(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::HEAP_EXTERNAL), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL));
+    EXPECT_GT(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::heapExternal), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternal));
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshEnabledThenMinimalAddressIsAtBeginingOfExternalFrontWindowHeap) {
-    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW));
+    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::heapExternalFrontWindow), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternalFrontWindow));
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshEnabledThenMinimalAddressIsAtBeginingOfExternalDeviceFrontWindowHeap) {
-    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::HEAP_EXTERNAL_DEVICE_FRONT_WINDOW), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL_DEVICE_FRONT_WINDOW));
+    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::heapExternalDeviceFrontWindow), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternalDeviceFrontWindow));
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshDisabledThenMinimalAddressEqualBeginingOfExternalHeap) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(false);
+    debugManager.flags.UseExternalAllocatorForSshAndDsh.set(false);
     memManager.reset(new FrontWindowMemManagerMock(*pDevice->getExecutionEnvironment()));
-    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::HEAP_EXTERNAL), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::HEAP_EXTERNAL) + GfxPartition::heapGranularity);
+    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapMinimalAddress(HeapIndex::heapExternal), memManager->getGfxPartition(0)->getHeapBase(HeapIndex::heapExternal) + GfxPartition::heapGranularity);
 }
 
 TEST_F(FrontWindowAllocatorTests, givenInitializedHeapsWhenUseExternalAllocatorForSshAndDshDisabledThenExternalHeapDoesntHaveFrontWindowPool) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(false);
+    debugManager.flags.UseExternalAllocatorForSshAndDsh.set(false);
     memManager.reset(new FrontWindowMemManagerMock(*pDevice->getExecutionEnvironment()));
-    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapLimit(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW), 0u);
+    EXPECT_EQ(memManager->getGfxPartition(0)->getHeapLimit(HeapIndex::heapExternalFrontWindow), 0u);
 }
 
 TEST_F(FrontWindowAllocatorTests, givenLinearStreamAllocWhenSelectingHeapWithFrontWindowThenCorrectIndexReturned) {
-    GraphicsAllocation allocation{0, AllocationType::LINEAR_STREAM, nullptr, 0, 0, 0, MemoryPool::MemoryNull, MemoryManager::maxOsContextCount};
-    EXPECT_EQ(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW, memManager->selectHeap(&allocation, true, true, true));
+    GraphicsAllocation allocation{0, 1u /*num gmms*/, AllocationType::linearStream, nullptr, 0, 0, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount};
+    EXPECT_EQ(HeapIndex::heapExternalFrontWindow, memManager->selectHeap(&allocation, true, true, true));
 }
 
 } // namespace NEO

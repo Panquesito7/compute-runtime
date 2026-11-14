@@ -1,0 +1,742 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/device/device_info.h"
+#include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/ptr_math.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/test_macros/test.h"
+
+#include "level_zero/api/opencl/extensions/public/cl_ext_private.h"
+#include "level_zero/api/opencl/source/cl_device/leo_cl_device.h"
+#include "level_zero/api/opencl/source/command_queue/leo_command_queue.h"
+#include "level_zero/api/opencl/source/context/leo_context.h"
+#include "level_zero/api/opencl/test/common/fixtures/capturing_command_list.h"
+#include "level_zero/api/opencl/test/common/fixtures/leo_event_callbacks_fixture.h"
+#include "level_zero/api/opencl/test/common/fixtures/ocl_fixture.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+
+#include "CL/cl.h"
+#include "CL/cl_ext.h"
+
+#include <memory>
+#include <vector>
+
+namespace NEO {
+namespace LEO {
+namespace ult {
+
+struct ClSvmAllocTest : public Test<OclFixture> {
+    void SetUp() override {
+        Test<OclFixture>::SetUp();
+        clDevice = platform->getDevices()[0].get();
+
+        cl_int errcode = CL_SUCCESS;
+        cl_device_id clDeviceId = clDevice;
+        clContext = clCreateContext(nullptr, 1, &clDeviceId, nullptr, nullptr, &errcode);
+        ASSERT_EQ(CL_SUCCESS, errcode);
+        ASSERT_NE(nullptr, clContext);
+
+        svmManager = castToObject<Context>(clContext)->getL0Object()->getDriverHandle()->getSvmAllocsManager();
+    }
+
+    void TearDown() override {
+        clReleaseContext(clContext);
+        Test<OclFixture>::TearDown();
+    }
+
+    cl_context getContext() { return clContext; }
+
+    ClDevice *clDevice = nullptr;
+    cl_context clContext = nullptr;
+    NEO::SVMAllocsManager *svmManager = nullptr;
+
+    static constexpr size_t validSize = 4096u * sizeof(cl_long);
+};
+
+TEST_F(ClSvmAllocTest, givenDeviceHandleListWithNonDeviceObjectWhenHostMemAllocThenInvalidValueIsReturned) {
+    cl_mem_properties_intel properties[] = {CL_MEM_DEVICE_HANDLE_LIST_KHR, reinterpret_cast<cl_mem_properties_intel>(clContext),
+                                            CL_MEM_DEVICE_HANDLE_LIST_END_KHR, 0};
+    cl_int errcode = CL_SUCCESS;
+
+    auto ptr = clHostMemAllocINTEL(clContext, properties, validSize, 0, &errcode);
+
+    EXPECT_EQ(nullptr, ptr);
+    EXPECT_EQ(CL_INVALID_VALUE, errcode);
+}
+
+TEST_F(ClSvmAllocTest, givenExternalMemoryHandleWhenHostMemAllocThenInvalidValueIsReturned) {
+    cl_mem_properties_intel properties[] = {CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR, 0x10, 0};
+    cl_int errcode = CL_SUCCESS;
+
+    auto ptr = clHostMemAllocINTEL(clContext, properties, validSize, 0, &errcode);
+
+    EXPECT_EQ(nullptr, ptr);
+    EXPECT_EQ(CL_INVALID_VALUE, errcode);
+}
+
+TEST_F(ClSvmAllocTest, givenAtomicsWithoutFineGrainBufferFlagWhenClSvmAllocThenReturnsNull) {
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_SVM_ATOMICS, validSize, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenUseHostPtrFlagWhenClSvmAllocThenReturnsNull) {
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_USE_HOST_PTR, validSize, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenCopyHostPtrFlagWhenClSvmAllocThenReturnsNull) {
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_COPY_HOST_PTR, validSize, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenInvalidFlagsWhenClSvmAllocThenReturnsNull) {
+    auto ptr = clSVMAlloc(getContext(), 12345, validSize, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenZeroSizeWhenClSvmAllocThenReturnsNull) {
+    auto ptr = clSVMAlloc(getContext(), 0, 0, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenNonPowerOfTwoAlignmentWhenClSvmAllocThenReturnsNull) {
+    for (cl_uint alignment : {3u, 5u, 6u, 7u}) {
+        auto ptr = clSVMAlloc(getContext(), 0, validSize, alignment);
+        EXPECT_EQ(nullptr, ptr) << "alignment: " << alignment;
+    }
+}
+
+TEST_F(ClSvmAllocTest, givenSizeExceedingMaxMemAllocSizeWhenClSvmAllocThenReturnsNull) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.AllowUnrestrictedSize.set(0);
+
+    auto maxMemAllocSize = clDevice->getSharedDeviceInfo().maxMemAllocSize;
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_READ_WRITE, static_cast<size_t>(maxMemAllocSize) + 1u, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenFineGrainBufferFlagWhenFineGrainedSvmIsUnsupportedThenClSvmAllocReturnsNull) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.ForceFineGrainedSVMSupport.set(0);
+
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_SVM_FINE_GRAIN_BUFFER, validSize, 0);
+    EXPECT_EQ(nullptr, ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenValidArgumentsWhenClSvmAllocThenAllocationIsRegisteredAndFreedThroughSvmManager) {
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_READ_WRITE, validSize, 8);
+    ASSERT_NE(nullptr, ptr);
+
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_EQ(validSize, svmData->size);
+
+    clSVMFree(getContext(), ptr);
+    EXPECT_EQ(nullptr, svmManager->getSVMAlloc(ptr));
+}
+
+TEST_F(ClSvmAllocTest, givenReadOnlyFlagWhenClSvmAllocThenAllocationIsRegistered) {
+    auto ptr = clSVMAlloc(getContext(), CL_MEM_READ_ONLY, validSize, 0);
+    ASSERT_NE(nullptr, ptr);
+    EXPECT_NE(nullptr, svmManager->getSVMAlloc(ptr));
+    clSVMFree(getContext(), ptr);
+}
+
+TEST_F(ClSvmAllocTest, givenSupportedAlignmentsWhenClSvmAllocThenAllocationSucceeds) {
+    for (cl_uint alignment : {0u, 1u, 2u, 4u, 8u, 16u, 128u}) {
+        auto ptr = clSVMAlloc(getContext(), CL_MEM_READ_WRITE, validSize, alignment);
+        EXPECT_NE(nullptr, ptr) << "alignment: " << alignment;
+        clSVMFree(getContext(), ptr);
+    }
+}
+
+TEST_F(ClSvmAllocTest, givenUseHostPtrPropertyWhenClHostMemAllocIntelThenGivenHostPtrIsUsed) {
+    auto hostStorage = alignedMalloc(validSize, MemoryConstants::pageSize64k);
+    cl_mem_properties_intel properties[] = {CL_MEM_ALLOC_USE_HOST_PTR_INTEL, reinterpret_cast<cl_mem_properties_intel>(hostStorage), 0};
+    cl_int retVal = CL_INVALID_VALUE;
+
+    auto ptr = clHostMemAllocINTEL(getContext(), properties, validSize, 0, &retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(hostStorage, ptr);
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(hostStorage), svmData->allocationFlagsProperty.hostptr);
+
+    EXPECT_EQ(CL_SUCCESS, clMemBlockingFreeINTEL(getContext(), ptr));
+    alignedFree(hostStorage);
+}
+
+TEST_F(ClSvmAllocTest, givenNoUseHostPtrPropertyWhenClHostMemAllocIntelThenNoExternalHostPtrIsUsed) {
+    cl_int retVal = CL_INVALID_VALUE;
+
+    auto ptr = clHostMemAllocINTEL(getContext(), nullptr, validSize, 0, &retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_EQ(0u, svmData->allocationFlagsProperty.hostptr);
+
+    EXPECT_EQ(CL_SUCCESS, clMemBlockingFreeINTEL(getContext(), ptr));
+}
+
+TEST_F(ClSvmAllocTest, givenUseHostPtrPropertyWhenClSharedMemAllocIntelThenGivenHostPtrIsUsed) {
+    auto hostStorage = alignedMalloc(validSize, MemoryConstants::pageSize64k);
+    cl_mem_properties_intel properties[] = {CL_MEM_ALLOC_USE_HOST_PTR_INTEL, reinterpret_cast<cl_mem_properties_intel>(hostStorage), 0};
+    cl_int retVal = CL_INVALID_VALUE;
+
+    auto ptr = clSharedMemAllocINTEL(getContext(), clDevice, properties, validSize, 0, &retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(hostStorage, ptr);
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(hostStorage), svmData->allocationFlagsProperty.hostptr);
+
+    EXPECT_EQ(CL_SUCCESS, clMemBlockingFreeINTEL(getContext(), ptr));
+    alignedFree(hostStorage);
+}
+
+TEST_F(ClSvmAllocTest, givenNoUseHostPtrPropertyWhenClSharedMemAllocIntelThenNoExternalHostPtrIsUsed) {
+    cl_int retVal = CL_INVALID_VALUE;
+
+    auto ptr = clSharedMemAllocINTEL(getContext(), clDevice, nullptr, validSize, 0, &retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_EQ(0u, svmData->allocationFlagsProperty.hostptr);
+
+    EXPECT_EQ(CL_SUCCESS, clMemBlockingFreeINTEL(getContext(), ptr));
+}
+
+TEST_F(ClSvmAllocTest, givenUseHostPtrPropertyWhenClHostMemAllocIntelFailsThenNullIsReturned) {
+    auto memoryManager = static_cast<MockMemoryManager *>(driverHandle->getMemoryManager());
+    memoryManager->isMockHostMemoryManager = true;
+    memoryManager->forceFailureInAllocationWithHostPointer = true;
+    auto hostStorage = alignedMalloc(validSize, MemoryConstants::pageSize64k);
+    cl_mem_properties_intel properties[] = {CL_MEM_ALLOC_USE_HOST_PTR_INTEL, reinterpret_cast<cl_mem_properties_intel>(hostStorage), 0};
+    cl_int retVal = CL_SUCCESS;
+
+    auto ptr = clHostMemAllocINTEL(getContext(), properties, validSize, 0, &retVal);
+    EXPECT_NE(CL_SUCCESS, retVal);
+    EXPECT_EQ(nullptr, ptr);
+
+    alignedFree(hostStorage);
+}
+
+TEST_F(ClSvmAllocTest, givenUseHostPtrPropertyWhenClSharedMemAllocIntelFailsThenNullIsReturned) {
+    auto memoryManager = static_cast<MockMemoryManager *>(driverHandle->getMemoryManager());
+    memoryManager->isMockHostMemoryManager = true;
+    memoryManager->forceFailureInPrimaryAllocation = true;
+    memoryManager->forceFailureInAllocationWithHostPointer = true;
+    auto hostStorage = alignedMalloc(validSize, MemoryConstants::pageSize64k);
+    cl_mem_properties_intel properties[] = {CL_MEM_ALLOC_USE_HOST_PTR_INTEL, reinterpret_cast<cl_mem_properties_intel>(hostStorage), 0};
+    cl_int retVal = CL_SUCCESS;
+
+    auto ptr = clSharedMemAllocINTEL(getContext(), clDevice, properties, validSize, 0, &retVal);
+    EXPECT_NE(CL_SUCCESS, retVal);
+    EXPECT_EQ(nullptr, ptr);
+
+    alignedFree(hostStorage);
+}
+
+struct RecordingCommandList : public L0::ult::Mock<L0::ult::CommandList> {
+    ze_result_t appendMemoryCopy(void *dstptr, const void *srcptr, size_t size,
+                                 ze_event_handle_t hSignalEvent, uint32_t numWaitEvents,
+                                 ze_event_handle_t *phWaitEvents, L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        ++migrationCalled;
+        migrationDstPtr = dstptr;
+        migrationSrcPtr = srcptr;
+        migrationSize = size;
+        migrationDstAlloc = memoryCopyParams.dstAllocInfo.explicitAlloc;
+        migrationSrcAlloc = memoryCopyParams.srcAllocInfo.explicitAlloc;
+        migrationNumWaitEvents = numWaitEvents;
+        return migrationResult;
+    }
+
+    void *migrationDstPtr = nullptr;
+    const void *migrationSrcPtr = nullptr;
+    NEO::GraphicsAllocation *migrationDstAlloc = nullptr;
+    NEO::GraphicsAllocation *migrationSrcAlloc = nullptr;
+    size_t migrationSize = 0u;
+    uint32_t migrationCalled = 0u;
+    uint32_t migrationNumWaitEvents = 0u;
+    ze_result_t migrationResult = ZE_RESULT_SUCCESS;
+};
+
+struct ClEnqueueSvmMapTest : public Test<OclFixture> {
+    void SetUp() override {
+        Test<OclFixture>::SetUp();
+
+        auto &clDevices = platform->getDevices();
+        ASSERT_FALSE(clDevices.empty());
+        clDevice = clDevices[0].get();
+
+        cl_int errcode = CL_SUCCESS;
+        cl_device_id clDeviceId = clDevice;
+        clContext = clCreateContext(nullptr, 1, &clDeviceId, nullptr, nullptr, &errcode);
+        ASSERT_EQ(CL_SUCCESS, errcode);
+        ASSERT_NE(nullptr, clContext);
+
+        context = castToObject<Context>(clContext);
+        ASSERT_NE(nullptr, context);
+
+        svmManager = context->getL0Object()->getDriverHandle()->getSvmAllocsManager();
+
+        // Inject a mock immediate command list so queue synchronization is observable.
+        commandQueue = new CommandQueue(context, clDevice, nullptr, mockCmdList.toHandle());
+    }
+
+    void TearDown() override {
+        if (deviceStorageData) {
+            svmManager->removeSVMAlloc(*deviceStorageData);
+        }
+        commandQueue->decRefApi();
+        clReleaseContext(clContext);
+        Test<OclFixture>::TearDown();
+    }
+
+    void registerDeviceStorageAlloc(NEO::AllocationType allocationType = NEO::AllocationType::svmGpu) {
+        cpuAllocation = std::make_unique<MockGraphicsAllocation>(&svmStorage, sizeof(svmStorage));
+        gpuAllocation = std::make_unique<MockGraphicsAllocation>(&svmStorage, sizeof(svmStorage));
+        gpuAllocation->allocationType = allocationType;
+
+        deviceStorageData = std::make_unique<SvmAllocationData>(0u);
+        deviceStorageData->gpuAllocations.addAllocation(gpuAllocation.get());
+        deviceStorageData->cpuAllocation = cpuAllocation.get();
+        deviceStorageData->size = sizeof(svmStorage);
+
+        svmManager->insertSVMAlloc(*deviceStorageData);
+    }
+
+    ClDevice *clDevice = nullptr;
+    cl_context clContext = nullptr;
+    Context *context = nullptr;
+    NEO::SVMAllocsManager *svmManager = nullptr;
+    CommandQueue *commandQueue = nullptr;
+    RecordingCommandList mockCmdList{};
+
+    std::unique_ptr<MockGraphicsAllocation> cpuAllocation;
+    std::unique_ptr<MockGraphicsAllocation> gpuAllocation;
+    std::unique_ptr<SvmAllocationData> deviceStorageData;
+    uint64_t svmStorage = 0u;
+};
+
+TEST_F(ClEnqueueSvmMapTest, givenBlockingMapWhenClEnqueueSVMMapThenQueueIsSynchronized) {
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_TRUE, CL_MAP_READ, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCmdList.appendBarrierCalled);
+    EXPECT_EQ(1u, mockCmdList.hostSynchronizeCalled);
+    EXPECT_EQ(0u, mockCmdList.migrationCalled);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenNonBlockingMapWhenClEnqueueSVMMapThenQueueIsNotSynchronized) {
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_READ, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCmdList.appendBarrierCalled);
+    EXPECT_EQ(0u, mockCmdList.hostSynchronizeCalled);
+    EXPECT_EQ(0u, mockCmdList.migrationCalled);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenBlockingMapWhenHostSynchronizeFailsThenErrorIsReturned) {
+    mockCmdList.hostSynchronizeResult = ZE_RESULT_ERROR_DEVICE_LOST;
+
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_TRUE, CL_MAP_READ, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_DEVICE_NOT_AVAILABLE, retVal);
+    EXPECT_EQ(1u, mockCmdList.hostSynchronizeCalled);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenClEnqueueSVMUnmapThenQueueIsNotSynchronized) {
+    auto retVal = clEnqueueSVMUnmap(commandQueue, &svmStorage, 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCmdList.appendBarrierCalled);
+    EXPECT_EQ(0u, mockCmdList.hostSynchronizeCalled);
+    EXPECT_EQ(0u, mockCmdList.migrationCalled);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenDeviceStorageAllocationWhenClEnqueueSVMMapThenMigratesDeviceToHostAndRecordsOperation) {
+    registerDeviceStorageAlloc();
+
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(cpuAllocation.get(), mockCmdList.migrationDstAlloc);
+    EXPECT_EQ(nullptr, mockCmdList.migrationSrcAlloc);
+    EXPECT_EQ(static_cast<const void *>(&svmStorage), mockCmdList.migrationSrcPtr);
+    EXPECT_EQ(sizeof(svmStorage), mockCmdList.migrationSize);
+
+    auto mapOperation = svmManager->getSvmMapOperation(&svmStorage);
+    ASSERT_NE(nullptr, mapOperation);
+    EXPECT_FALSE(mapOperation->readOnlyMap);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenAlreadyMappedDeviceStorageWhenClEnqueueSVMMapAgainThenMigrationIsSkipped) {
+    registerDeviceStorageAlloc();
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr));
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr));
+
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenReadOnlyMapWhenClEnqueueSVMUnmapThenMigrationIsSkippedAndOperationIsRemoved) {
+    registerDeviceStorageAlloc();
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_READ, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr));
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMUnmap(commandQueue, &svmStorage, 0, nullptr, nullptr));
+
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenWriteMapWhenClEnqueueSVMUnmapThenMigratesHostToDeviceAndRemovesOperation) {
+    registerDeviceStorageAlloc();
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr));
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMUnmap(commandQueue, &svmStorage, 0, nullptr, nullptr));
+
+    EXPECT_EQ(2u, mockCmdList.migrationCalled);
+    EXPECT_EQ(cpuAllocation.get(), mockCmdList.migrationSrcAlloc);
+    EXPECT_EQ(nullptr, mockCmdList.migrationDstAlloc);
+    EXPECT_EQ(static_cast<void *>(&svmStorage), mockCmdList.migrationDstPtr);
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenWriteMapWhenClEnqueueSVMUnmapThenCpuAllocationIsMarkedAubAndTbxWritable) {
+    registerDeviceStorageAlloc();
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr));
+
+    cpuAllocation->setAubWritable(false, GraphicsAllocation::defaultBank);
+    cpuAllocation->setTbxWritable(false, GraphicsAllocation::defaultBank);
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMUnmap(commandQueue, &svmStorage, 0, nullptr, nullptr));
+
+    EXPECT_TRUE(cpuAllocation->isAubWritable(GraphicsAllocation::defaultBank));
+    EXPECT_TRUE(cpuAllocation->isTbxWritable(GraphicsAllocation::defaultBank));
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenBlockingDeviceStorageMapThenQueueIsSynchronizedAfterMigration) {
+    registerDeviceStorageAlloc();
+
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_TRUE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(1u, mockCmdList.hostSynchronizeCalled);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenWaitListWhenDeviceStorageMapThenWaitEventsArePassedToMigration) {
+    registerDeviceStorageAlloc();
+
+    cl_int errcode = CL_SUCCESS;
+    cl_event userEvent = clCreateUserEvent(clContext, &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    ASSERT_NE(nullptr, userEvent);
+
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 1, &userEvent, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(1u, mockCmdList.migrationNumWaitEvents);
+    EXPECT_EQ(0u, mockCmdList.appendWaitOnEventsCalled);
+
+    clSetUserEventStatus(userEvent, CL_COMPLETE);
+    clReleaseEvent(userEvent);
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenZeroCopyAllocationWhenClEnqueueSVMMapThenMigrationIsSkipped) {
+    registerDeviceStorageAlloc(NEO::AllocationType::svmZeroCopy);
+
+    auto retVal = clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, &svmStorage, sizeof(svmStorage), 0, nullptr, nullptr);
+
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(0u, mockCmdList.migrationCalled);
+    EXPECT_EQ(1u, mockCmdList.appendBarrierCalled);
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenSubRegionMapAndUnmapWhenDeviceStorageThenOnlyThatRegionIsMigrated) {
+    registerDeviceStorageAlloc();
+
+    constexpr size_t regionOffset = sizeof(uint32_t);
+    constexpr size_t regionSize = sizeof(uint32_t);
+    auto regionPtr = ptrOffset(&svmStorage, regionOffset);
+    auto expectedCpuSidePtr = reinterpret_cast<void *>(cpuAllocation->getGpuAddress() + regionOffset);
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMMap(commandQueue, CL_FALSE, CL_MAP_WRITE, regionPtr, regionSize, 0, nullptr, nullptr));
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(cpuAllocation.get(), mockCmdList.migrationDstAlloc);
+    EXPECT_EQ(expectedCpuSidePtr, mockCmdList.migrationDstPtr);
+    EXPECT_EQ(static_cast<const void *>(regionPtr), mockCmdList.migrationSrcPtr);
+    EXPECT_EQ(regionSize, mockCmdList.migrationSize);
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMUnmap(commandQueue, regionPtr, 0, nullptr, nullptr));
+    EXPECT_EQ(2u, mockCmdList.migrationCalled);
+    EXPECT_EQ(cpuAllocation.get(), mockCmdList.migrationSrcAlloc);
+    EXPECT_EQ(static_cast<const void *>(expectedCpuSidePtr), mockCmdList.migrationSrcPtr);
+    EXPECT_EQ(static_cast<void *>(regionPtr), mockCmdList.migrationDstPtr);
+    EXPECT_EQ(regionSize, mockCmdList.migrationSize);
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(regionPtr));
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenReadOnlyMappedSvmBufferWhenClEnqueueUnmapMemObjectThenMapOperationIsReleasedAndNextMapMigratesAgain) {
+    registerDeviceStorageAlloc();
+
+    cl_int errcode = CL_SUCCESS;
+    cl_mem buffer = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, sizeof(svmStorage), &svmStorage, &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    ASSERT_NE(nullptr, buffer);
+
+    auto mappedPtr = clEnqueueMapBuffer(commandQueue, buffer, CL_TRUE, CL_MAP_READ, 0, sizeof(svmStorage), 0, nullptr, nullptr, &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    EXPECT_EQ(static_cast<void *>(&svmStorage), mappedPtr);
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    ASSERT_NE(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueUnmapMemObject(commandQueue, buffer, mappedPtr, 0, nullptr, nullptr));
+    EXPECT_EQ(1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+
+    mappedPtr = clEnqueueMapBuffer(commandQueue, buffer, CL_TRUE, CL_MAP_READ, 0, sizeof(svmStorage), 0, nullptr, nullptr, &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    EXPECT_EQ(2u, mockCmdList.migrationCalled);
+
+    EXPECT_EQ(CL_SUCCESS, clEnqueueUnmapMemObject(commandQueue, buffer, mappedPtr, 0, nullptr, nullptr));
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+    EXPECT_EQ(CL_SUCCESS, clReleaseMemObject(buffer));
+}
+
+TEST_F(ClEnqueueSvmMapTest, givenWriteInvalidateMappedSvmBufferWhenUnmappedThenHostToDeviceMigrationIsPerformed) {
+    registerDeviceStorageAlloc();
+
+    cl_int errcode = CL_SUCCESS;
+    cl_mem buffer = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, sizeof(svmStorage), &svmStorage, &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    ASSERT_NE(nullptr, buffer);
+
+    auto mappedPtr = clEnqueueMapBuffer(commandQueue, buffer, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, 0, sizeof(svmStorage), 0, nullptr, nullptr, &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    EXPECT_EQ(static_cast<void *>(&svmStorage), mappedPtr);
+
+    auto mapOperation = svmManager->getSvmMapOperation(&svmStorage);
+    ASSERT_NE(nullptr, mapOperation);
+    EXPECT_FALSE(mapOperation->readOnlyMap);
+
+    auto migrationsAfterMap = mockCmdList.migrationCalled;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueUnmapMemObject(commandQueue, buffer, mappedPtr, 0, nullptr, nullptr));
+    EXPECT_EQ(migrationsAfterMap + 1u, mockCmdList.migrationCalled);
+    EXPECT_EQ(cpuAllocation.get(), mockCmdList.migrationSrcAlloc);
+    EXPECT_EQ(nullptr, mockCmdList.migrationDstAlloc);
+    EXPECT_EQ(nullptr, svmManager->getSvmMapOperation(&svmStorage));
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseMemObject(buffer));
+}
+
+struct SvmFreeCallbackRecord {
+    cl_command_queue commandQueue = nullptr;
+    cl_uint numSvmPointers = 0u;
+    std::vector<void *> svmPointers{};
+    uint32_t callCount = 0u;
+};
+
+struct ClEnqueueSvmFreeTest : public Test<OclFixture> {
+    void SetUp() override {
+        Test<OclFixture>::SetUp();
+
+        auto &clDevices = platform->getDevices();
+        ASSERT_FALSE(clDevices.empty());
+        clDevice = clDevices[0].get();
+        cl_device_id clDeviceId = clDevice;
+
+        mockHandler = installMockHandler();
+
+        leoContext = std::make_unique<Context>(nullptr, this->L0::ult::DeviceFixture::context->toHandle(),
+                                               1, &clDeviceId, true);
+
+        commandQueue = new CommandQueue(leoContext.get(), clDevice, nullptr, capturingQueueCmdList.toHandle());
+    }
+
+    void TearDown() override {
+        installMockHandler();
+
+        commandQueue->decRefApi();
+        otherContext.reset();
+        leoContext.reset();
+        Test<OclFixture>::TearDown();
+    }
+
+    MockAsyncEventsHandler *installMockHandler() {
+        auto handler = new MockAsyncEventsHandler(false);
+        static_cast<WhiteBoxPlatform *>(platform)->asyncEventsHandler.reset(handler);
+        return handler;
+    }
+
+    void completeEvent(cl_event event) {
+        auto pEvent = castToObject<Event>(event);
+        ASSERT_NE(nullptr, pEvent);
+        L0::Event::fromHandle(pEvent->getL0Handle())->hostSignal(false);
+        pEvent->updateExecutionStatus();
+    }
+
+    cl_command_type queryCommandType(cl_event event) {
+        cl_command_type commandType = 0u;
+        EXPECT_EQ(CL_SUCCESS, clGetEventInfo(event, CL_EVENT_COMMAND_TYPE, sizeof(commandType), &commandType, nullptr));
+        return commandType;
+    }
+
+    static void CL_CALLBACK svmFreeCallback(cl_command_queue commandQueue, cl_uint numSvmPointers,
+                                            void *svmPointers[], void *userData) {
+        auto record = static_cast<SvmFreeCallbackRecord *>(userData);
+        record->commandQueue = commandQueue;
+        record->numSvmPointers = numSvmPointers;
+        record->svmPointers.assign(svmPointers, svmPointers + numSvmPointers);
+        ++record->callCount;
+    }
+
+    ClDevice *clDevice = nullptr;
+    std::unique_ptr<Context> leoContext;
+    std::unique_ptr<Context> otherContext;
+    CommandQueue *commandQueue = nullptr;
+    CapturingCommandList capturingQueueCmdList{};
+    MockAsyncEventsHandler *mockHandler = nullptr;
+    SvmFreeCallbackRecord freeRecord{};
+    uint32_t firstStorage = 0u;
+    uint32_t secondStorage = 0u;
+    void *svmPointers[2] = {&firstStorage, &secondStorage};
+};
+
+TEST_F(ClEnqueueSvmFreeTest, givenUserProvidedEventWhenClEnqueueSVMFreeThenCommandTypeIsSvmFreeBeforeCallbackRuns) {
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMFree(commandQueue, 2, svmPointers, svmFreeCallback, &freeRecord, 0, nullptr, &event));
+    ASSERT_NE(nullptr, event);
+
+    EXPECT_TRUE(castToObject<Event>(event)->peekHasCallbacks());
+    EXPECT_FALSE(mockHandler->peekIsRegisterListEmpty());
+    EXPECT_EQ(0u, freeRecord.callCount);
+    EXPECT_EQ(static_cast<cl_command_type>(CL_COMMAND_SVM_FREE), queryCommandType(event));
+
+    completeEvent(event);
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(event));
+}
+
+TEST_F(ClEnqueueSvmFreeTest, givenDeferredCallbackWhenEventCompletesThenUserFreeCallbackIsInvoked) {
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMFree(commandQueue, 2, svmPointers, svmFreeCallback, &freeRecord, 0, nullptr, &event));
+    ASSERT_NE(nullptr, event);
+
+    completeEvent(event);
+
+    EXPECT_EQ(1u, freeRecord.callCount);
+    EXPECT_EQ(static_cast<cl_command_queue>(commandQueue), freeRecord.commandQueue);
+    EXPECT_EQ(2u, freeRecord.numSvmPointers);
+    ASSERT_EQ(2u, freeRecord.svmPointers.size());
+    EXPECT_EQ(static_cast<void *>(&firstStorage), freeRecord.svmPointers[0]);
+    EXPECT_EQ(static_cast<void *>(&secondStorage), freeRecord.svmPointers[1]);
+    EXPECT_EQ(static_cast<cl_command_type>(CL_COMMAND_SVM_FREE), queryCommandType(event));
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(event));
+}
+
+TEST_F(ClEnqueueSvmFreeTest, givenCallerArrayOverwrittenAfterEnqueueWhenDeferredCallbackRunsThenOriginalPointersAreReported) {
+    void *callerSvmPointers[2] = {&firstStorage, &secondStorage};
+
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMFree(commandQueue, 2, callerSvmPointers, svmFreeCallback, &freeRecord, 0, nullptr, &event));
+    ASSERT_NE(nullptr, event);
+
+    // The caller owns its array and may reuse it as soon as the call returns.
+    callerSvmPointers[0] = nullptr;
+    callerSvmPointers[1] = nullptr;
+
+    completeEvent(event);
+
+    EXPECT_EQ(1u, freeRecord.callCount);
+    EXPECT_EQ(2u, freeRecord.numSvmPointers);
+    ASSERT_EQ(2u, freeRecord.svmPointers.size());
+    EXPECT_EQ(static_cast<void *>(&firstStorage), freeRecord.svmPointers[0]);
+    EXPECT_EQ(static_cast<void *>(&secondStorage), freeRecord.svmPointers[1]);
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(event));
+}
+
+TEST_F(ClEnqueueSvmFreeTest, givenEventThatNeverCompletesWhenTheHandlerShutsDownThenTheFreeCallbackStillRuns) {
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMFree(commandQueue, 2, svmPointers, svmFreeCallback, &freeRecord, 0, nullptr, &event));
+    ASSERT_NE(nullptr, event);
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(event));
+    ASSERT_EQ(0u, freeRecord.callCount);
+
+    // Handler teardown drops the last reference to the never-completed event. Its destructor has to
+    // drain the pending callback, otherwise the wrapper's user data and the SVM pointers are leaked.
+    mockHandler = installMockHandler();
+
+    EXPECT_EQ(1u, freeRecord.callCount);
+    EXPECT_EQ(2u, freeRecord.numSvmPointers);
+}
+
+TEST_F(ClEnqueueSvmFreeTest, givenIdleCmdListWhenClEnqueueSVMFreeThenFreeCallbackRunsImmediately) {
+    capturingQueueCmdList.completeSignalEventOnAppendBarrier = true;
+
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueSVMFree(commandQueue, 2, svmPointers, svmFreeCallback, &freeRecord, 0, nullptr, &event));
+    ASSERT_NE(nullptr, event);
+
+    EXPECT_EQ(1u, freeRecord.callCount);
+    EXPECT_EQ(2u, freeRecord.numSvmPointers);
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(event));
+}
+
+TEST_F(ClEnqueueSvmFreeTest, givenMarkerEnqueuedWhenQueryingCommandTypeThenMarkerIsReported) {
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_SUCCESS, clEnqueueMarkerWithWaitList(commandQueue, 0, nullptr, &event));
+    ASSERT_NE(nullptr, event);
+
+    EXPECT_EQ(static_cast<cl_command_type>(CL_COMMAND_MARKER), queryCommandType(event));
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(event));
+}
+
+TEST_F(ClEnqueueSvmFreeTest, givenWaitListEventFromOtherContextWhenClEnqueueSVMFreeThenInvalidContextIsReturned) {
+    cl_device_id clDeviceId = clDevice;
+    otherContext = std::make_unique<Context>(nullptr, this->L0::ult::DeviceFixture::context->toHandle(),
+                                             1, &clDeviceId, true);
+
+    cl_int errcode = CL_SUCCESS;
+    auto userEvent = clCreateUserEvent(otherContext.get(), &errcode);
+    ASSERT_EQ(CL_SUCCESS, errcode);
+    ASSERT_NE(nullptr, userEvent);
+
+    cl_event event = nullptr;
+    EXPECT_EQ(CL_INVALID_CONTEXT, clEnqueueSVMFree(commandQueue, 1, svmPointers, svmFreeCallback, &freeRecord, 1, &userEvent, &event));
+
+    EXPECT_EQ(nullptr, event);
+    EXPECT_TRUE(mockHandler->peekIsRegisterListEmpty());
+    EXPECT_EQ(0u, freeRecord.callCount);
+
+    EXPECT_EQ(CL_SUCCESS, clReleaseEvent(userEvent));
+}
+
+} // namespace ult
+} // namespace LEO
+} // namespace NEO

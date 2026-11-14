@@ -1,16 +1,17 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/test/common/test_macros/test_checks_shared.h"
 
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
 
@@ -19,11 +20,12 @@ struct EnqueueFillImageTestFixture : public CommandEnqueueFixture {
         REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
         CommandEnqueueFixture::setUp();
         context = new MockContext(pClDevice);
-        image = Image2dHelper<>::create(context);
+        image = Image2dHelperUlt<>::create(context);
+        initialized = true;
     }
 
     void tearDown() {
-        if (testing::Test::IsSkipped()) {
+        if (!initialized) {
             return;
         }
         delete image;
@@ -42,5 +44,6 @@ struct EnqueueFillImageTestFixture : public CommandEnqueueFixture {
 
     MockContext *context = nullptr;
     Image *image = nullptr;
+    bool initialized = false;
 };
 } // namespace NEO

@@ -1,13 +1,12 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "opencl/source/api/api.h"
 #include "opencl/source/tracing/tracing_api.h"
-
-#include "cl_api_tests.h"
 
 using namespace NEO;
 
@@ -88,6 +87,11 @@ TEST_F(clGetExtensionFunctionAddressForPlatformTests, GivenClGetKernelSuggestedL
 TEST_F(clGetExtensionFunctionAddressForPlatformTests, GivenClGetKernelSuggestedLocalWorkSizeKHRWhenGettingExtensionFunctionThenCorrectAddressIsReturned) {
     auto retVal = clGetExtensionFunctionAddressForPlatform(pPlatform, "clGetKernelSuggestedLocalWorkSizeKHR");
     EXPECT_EQ(retVal, reinterpret_cast<void *>(clGetKernelSuggestedLocalWorkSizeKHR));
+}
+
+TEST_F(clGetExtensionFunctionAddressForPlatformTests, GivenClGetKernelSuggestedLocalWorkSizeWhenGettingExtensionFunctionThenCorrectAddressIsReturned) {
+    auto retVal = clGetExtensionFunctionAddressForPlatform(pPlatform, "clGetKernelSuggestedLocalWorkSize");
+    EXPECT_EQ(retVal, reinterpret_cast<void *>(clGetKernelSuggestedLocalWorkSize));
 }
 
 TEST_F(clGetExtensionFunctionAddressForPlatformTests, GivenClGetKernelMaxConcurrentWorkGroupCountINTELWhenGettingExtensionFunctionThenCorrectAddressIsReturned) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,7 +13,19 @@
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
+#include "gtest/gtest.h"
+
 using namespace NEO;
+namespace NEO {
+class UserEvent;
+}
+
+struct CallbackData {
+    cl_kernel kernel;
+    cl_command_queue queue;
+    bool callbackCalled = false;
+    UserEvent *signalCallbackDoneEvent = nullptr;
+};
 
 class ScenarioTest : public ::testing::Test,
                      public PlatformFixture {
@@ -21,7 +33,7 @@ class ScenarioTest : public ::testing::Test,
 
   protected:
     void SetUp() override {
-        DebugManager.flags.EnableTimestampPacket.set(false);
+        debugManager.flags.EnableTimestampPacket.set(false);
         PlatformFixture::setUp();
 
         auto pDevice = pPlatform->getClDevice(0);
@@ -32,7 +44,7 @@ class ScenarioTest : public ::testing::Test,
         commandQueue = new MockCommandQueue(context, pDevice, 0, false);
         program = new MockProgram(context, false, toClDeviceVector(*pDevice));
 
-        kernelInternals = new MockKernelWithInternals(*pDevice, context);
+        kernelInternals = new MockKernelWithInternals(*context);
         kernel = kernelInternals->mockKernel;
 
         ASSERT_NE(nullptr, kernel);

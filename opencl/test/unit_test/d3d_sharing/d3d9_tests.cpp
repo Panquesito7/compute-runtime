@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -32,17 +32,18 @@ IDXGIAdapter *MockD3DSharingFunctions<D3DTypesHelper::D3D9>::getDxgiDescAdapterR
 
 class MockMM : public OsAgnosticMemoryManager {
   public:
-    MockMM(const ExecutionEnvironment &executionEnvironment) : OsAgnosticMemoryManager(const_cast<ExecutionEnvironment &>(executionEnvironment)){};
-    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
-        auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(handle, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
+    MockMM(const ExecutionEnvironment &executionEnvironment) : OsAgnosticMemoryManager(const_cast<ExecutionEnvironment &>(executionEnvironment)) {};
+    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+        auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(osHandleData, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
         alloc->setDefaultGmm(forceGmm);
         gmmOwnershipPassed = true;
         return alloc;
     }
     GraphicsAllocation *allocateGraphicsMemoryForImage(const AllocationData &allocationData) override {
         auto gmm = std::make_unique<Gmm>(executionEnvironment.rootDeviceEnvironments[allocationData.rootDeviceIndex]->getGmmHelper(), *allocationData.imgInfo, StorageInfo{}, false);
-        AllocationProperties properties(allocationData.rootDeviceIndex, nullptr, false, AllocationType::SHARED_IMAGE, false, {});
-        auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(1, properties, false, false, true, nullptr);
+        AllocationProperties properties(allocationData.rootDeviceIndex, false, nullptr, AllocationType::sharedImage, DeviceBitfield{});
+        OsAgnosticMemoryManager::OsHandleData osHandleData{1u};
+        auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
         alloc->setDefaultGmm(forceGmm);
         gmmOwnershipPassed = true;
         return alloc;
@@ -81,7 +82,7 @@ class D3D9Tests : public PlatformFixture, public ::testing::Test {
         imgDesc.imageHeight = 10;
         imgDesc.imageWidth = 10;
         imgDesc.imageDepth = 1;
-        imgDesc.imageType = ImageType::Image2D;
+        imgDesc.imageType = ImageType::image2D;
         auto imgInfo = MockGmm::initImgInfo(imgDesc, 0, nullptr);
         gmm = MockGmm::queryImgParams(pPlatform->getClDevice(0)->getGmmHelper(), imgInfo, false).release();
         mockGmmResInfo = static_cast<MockGmmResourceInfo *>(gmm->gmmResourceInfo.get());
@@ -99,7 +100,7 @@ class D3D9Tests : public PlatformFixture, public ::testing::Test {
         mockSharingFcns = new MockD3DSharingFunctions<D3D9>();
         context->setSharingFunctions(mockSharingFcns);
         cmdQ = new MockCommandQueue(context, context->getDevice(0), 0, false);
-        DebugManager.injectFcn = &mockSharingFcns->mockGetDxgiDesc;
+        debugManager.injectFcn = reinterpret_cast<void *>(&mockSharingFcns->mockGetDxgiDesc);
 
         surfaceInfo.resource = reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurface);
 
@@ -123,8 +124,8 @@ class D3D9Tests : public PlatformFixture, public ::testing::Test {
     MockContext *context;
     MockCommandQueue *cmdQ;
     DebugManagerStateRestore dbgRestore;
-    char dummyD3DSurface;
-    char dummyD3DSurfaceStaging;
+    uint64_t dummyD3DSurface{};
+    uint64_t dummyD3DSurfaceStaging{};
     cl_dx9_surface_info_khr surfaceInfo = {};
 
     Gmm *gmm = nullptr;
@@ -176,7 +177,7 @@ TEST_F(D3D9Tests, WhenGetDeviceIdThenOneCorrectDeviceIsReturned) {
 TEST_F(D3D9Tests, WhenCreatingSurfaceThenImagePropertiesAreSetCorrectly) {
     cl_int retVal;
     cl_image_format expectedImgFormat = {};
-    ImagePlane imagePlane = ImagePlane::NO_PLANE;
+    ImagePlane imagePlane = ImagePlane::noPlane;
     D3DSurface::findImgFormat(mockSharingFcns->mockTexture2dDesc.Format, expectedImgFormat, 0, imagePlane);
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -208,7 +209,7 @@ TEST_F(D3D9Tests, WhenCreatingSurfaceThenImagePropertiesAreSetCorrectly) {
 
 TEST(D3D9SimpleTests, givenWrongFormatWhenFindIsCalledThenErrorIsReturned) {
     cl_image_format expectedImgFormat = {};
-    ImagePlane imagePlane = ImagePlane::NO_PLANE;
+    ImagePlane imagePlane = ImagePlane::noPlane;
     auto status = D3DSurface::findImgFormat(D3DFMT_FORCE_DWORD, expectedImgFormat, 0, imagePlane);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, status);
 }
@@ -216,7 +217,7 @@ TEST(D3D9SimpleTests, givenWrongFormatWhenFindIsCalledThenErrorIsReturned) {
 TEST_F(D3D9Tests, WhenCreatingSurfaceIntelThenImagePropertiesAreSetCorrectly) {
     cl_int retVal;
     cl_image_format expectedImgFormat = {};
-    ImagePlane imagePlane = ImagePlane::NO_PLANE;
+    ImagePlane imagePlane = ImagePlane::noPlane;
     D3DSurface::findImgFormat(mockSharingFcns->mockTexture2dDesc.Format, expectedImgFormat, 0, imagePlane);
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -246,7 +247,7 @@ TEST_F(D3D9Tests, WhenCreatingSurfaceIntelThenImagePropertiesAreSetCorrectly) {
 }
 
 TEST_F(D3D9Tests, givenD3DHandleWhenCreatingSharedSurfaceThenAllocationTypeImageIsSet) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = reinterpret_cast<HANDLE>(1);
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -256,13 +257,13 @@ TEST_F(D3D9Tests, givenD3DHandleWhenCreatingSharedSurfaceThenAllocationTypeImage
     ASSERT_NE(nullptr, sharedImg.get());
     auto graphicsAllocation = sharedImg->getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex());
     ASSERT_NE(nullptr, graphicsAllocation);
-    EXPECT_EQ(AllocationType::SHARED_IMAGE, graphicsAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::sharedImage, graphicsAllocation->getAllocationType());
 
     EXPECT_EQ(1u, mockSharingFcns->getTexture2dDescCalled);
 }
 
 TEST_F(D3D9Tests, givenUPlaneWhenCreateSurfaceThenChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)1;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -279,7 +280,7 @@ TEST_F(D3D9Tests, givenUPlaneWhenCreateSurfaceThenChangeWidthHeightAndPitch) {
 }
 
 TEST_F(D3D9Tests, givenVPlaneWhenCreateSurfaceThenChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)1;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -296,7 +297,7 @@ TEST_F(D3D9Tests, givenVPlaneWhenCreateSurfaceThenChangeWidthHeightAndPitch) {
 }
 
 TEST_F(D3D9Tests, givenUVPlaneWhenCreateSurfaceThenChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)1;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -313,7 +314,7 @@ TEST_F(D3D9Tests, givenUVPlaneWhenCreateSurfaceThenChangeWidthHeightAndPitch) {
 }
 
 TEST_F(D3D9Tests, givenYPlaneWhenCreateSurfaceThenDontChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)1;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -330,7 +331,7 @@ TEST_F(D3D9Tests, givenYPlaneWhenCreateSurfaceThenDontChangeWidthHeightAndPitch)
 }
 
 TEST_F(D3D9Tests, givenUPlaneWhenCreateNonSharedSurfaceThenChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -347,7 +348,7 @@ TEST_F(D3D9Tests, givenUPlaneWhenCreateNonSharedSurfaceThenChangeWidthHeightAndP
 }
 
 TEST_F(D3D9Tests, givenVPlaneWhenCreateNonSharedSurfaceThenChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -364,7 +365,7 @@ TEST_F(D3D9Tests, givenVPlaneWhenCreateNonSharedSurfaceThenChangeWidthHeightAndP
 }
 
 TEST_F(D3D9Tests, givenUVPlaneWhenCreateNonSharedSurfaceThenChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -381,7 +382,7 @@ TEST_F(D3D9Tests, givenUVPlaneWhenCreateNonSharedSurfaceThenChangeWidthHeightAnd
 }
 
 TEST_F(D3D9Tests, givenYPlaneWhenCreateNonSharedSurfaceThenDontChangeWidthHeightAndPitch) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -399,7 +400,7 @@ TEST_F(D3D9Tests, givenYPlaneWhenCreateNonSharedSurfaceThenDontChangeWidthHeight
 
 TEST_F(D3D9Tests, givenNV12FormatAndInvalidPlaneWhenSurfaceIsCreatedThenReturnError) {
     cl_int retVal = CL_SUCCESS;
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('N', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -412,7 +413,7 @@ TEST_F(D3D9Tests, givenNV12FormatAndInvalidPlaneWhenSurfaceIsCreatedThenReturnEr
 
 TEST_F(D3D9Tests, givenYV12FormatAndInvalidPlaneWhenSurfaceIsCreatedThenReturnError) {
     cl_int retVal = CL_SUCCESS;
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -457,7 +458,7 @@ TEST_F(D3D9Tests, givenNonDefaultPoolWhenSurfaceIsCreatedThenReturnError) {
 
 TEST_F(D3D9Tests, givenAlreadyUsedSurfaceWhenSurfaceIsCreatedThenReturnError) {
     cl_int retVal = CL_SUCCESS;
-    surfaceInfo.resource = reinterpret_cast<IDirect3DSurface9 *>(1);
+    surfaceInfo.resource = reinterpret_cast<IDirect3DSurface9 *>(0x8);
 
     mockSharingFcns->getTexture2dDescSetParams = true;
     mockSharingFcns->getTexture2dDescParamsSet.textureDesc = mockSharingFcns->mockTexture2dDesc;
@@ -472,7 +473,7 @@ TEST_F(D3D9Tests, givenAlreadyUsedSurfaceWhenSurfaceIsCreatedThenReturnError) {
 
 TEST_F(D3D9Tests, givenNotSupportedFormatWhenSurfaceIsCreatedThenReturnError) {
     cl_int retVal = CL_SUCCESS;
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('I', '4', '2', '0');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('I', '4', '2', '0'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)0;
 
     mockSharingFcns->getTexture2dDescSetParams = true;
@@ -484,7 +485,7 @@ TEST_F(D3D9Tests, givenNotSupportedFormatWhenSurfaceIsCreatedThenReturnError) {
 }
 
 TEST_F(D3D9Tests, GivenMediaSurfaceInfoKhrWhenGetMemObjInfoThenCorrectInfoIsReturned) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     cl_dx9_media_adapter_type_khr expectedAdapterType = 5;
     cl_uint expectedPlane = 2;
     cl_dx9_surface_info_khr getSurfaceInfo = {};
@@ -507,7 +508,7 @@ TEST_F(D3D9Tests, GivenMediaSurfaceInfoKhrWhenGetMemObjInfoThenCorrectInfoIsRetu
 }
 
 TEST_F(D3D9Tests, GivenResourceIntelWhenGetMemObjInfoThenCorrectInfoIsReturned) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     cl_dx9_media_adapter_type_khr expectedAdapterType = 5;
     cl_uint expectedPlane = 2;
     cl_dx9_surface_info_khr getSurfaceInfo = {};
@@ -530,7 +531,7 @@ TEST_F(D3D9Tests, GivenResourceIntelWhenGetMemObjInfoThenCorrectInfoIsReturned) 
 }
 
 TEST_F(D3D9Tests, GivenSharedHandleIntelWhenGetMemObjInfoThenCorrectInfoIsReturned) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     cl_dx9_media_adapter_type_khr expectedAdapterType = 5;
     cl_uint expectedPlane = 2;
     cl_dx9_surface_info_khr getSurfaceInfo = {};
@@ -552,7 +553,7 @@ TEST_F(D3D9Tests, GivenSharedHandleIntelWhenGetMemObjInfoThenCorrectInfoIsReturn
 }
 
 TEST_F(D3D9Tests, GivenMediaAdapterTypeKhrWhenGetMemObjInfoThenCorrectInfoIsReturned) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     cl_dx9_media_adapter_type_khr adapterType = 0;
     cl_dx9_media_adapter_type_khr expectedAdapterType = 5;
     cl_uint expectedPlane = 2;
@@ -574,7 +575,7 @@ TEST_F(D3D9Tests, GivenMediaAdapterTypeKhrWhenGetMemObjInfoThenCorrectInfoIsRetu
 }
 
 TEST_F(D3D9Tests, GivenMediaPlaneKhrWhenGetMemObjInfoThenCorrectInfoIsReturned) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     cl_dx9_media_adapter_type_khr expectedAdapterType = 5;
     cl_uint plane = 0;
     cl_uint expectedPlane = 2;
@@ -596,7 +597,7 @@ TEST_F(D3D9Tests, GivenMediaPlaneKhrWhenGetMemObjInfoThenCorrectInfoIsReturned) 
 }
 
 TEST_F(D3D9Tests, GivenPlaneIntelWhenGetMemObjInfoThenCorrectInfoIsReturned) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     cl_dx9_media_adapter_type_khr expectedAdapterType = 5;
     cl_uint plane = 0;
     cl_uint expectedPlane = 2;
@@ -802,33 +803,33 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndLockableWhenReleasingThenResou
     memoryManager->lockResourceReturnValue = returnedLockedRes;
     memoryManager->expectedLockingAllocation = graphicsAllocation;
 
-    GMM_RES_COPY_BLT &requestedResCopyBlt = mockGmmResInfo->requestedResCopyBlt;
-    GMM_RES_COPY_BLT expectedResCopyBlt = {};
+    GmmCpuBltParams &requestedResCopyBlt = mockGmmResInfo->requestedCpuBltParams;
+    GmmCpuBltParams expectedResCopyBlt = {};
     mockGmmResInfo->cpuBltCalled = 0u;
-    expectedResCopyBlt.Sys.pData = lockedRect.pBits;
-    expectedResCopyBlt.Gpu.pData = returnedLockedRes;
-    expectedResCopyBlt.Sys.RowPitch = lockedRect.Pitch;
-    expectedResCopyBlt.Blt.Upload = 1;
-    expectedResCopyBlt.Sys.BufferSize = lockedRect.Pitch * imgHeight;
+    expectedResCopyBlt.sysData = lockedRect.pBits;
+    expectedResCopyBlt.gpuData = returnedLockedRes;
+    expectedResCopyBlt.sysRowPitch = lockedRect.Pitch;
+    expectedResCopyBlt.upload = true;
+    expectedResCopyBlt.sysBufferSize = lockedRect.Pitch * imgHeight;
 
     auto retVal = clEnqueueAcquireDX9MediaSurfacesKHR(cmdQ, 1, &clMem, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(1, memoryManager->lockResourceCalled);
     EXPECT_EQ(1, memoryManager->unlockResourceCalled);
-    EXPECT_TRUE(memcmp(&requestedResCopyBlt, &expectedResCopyBlt, sizeof(GMM_RES_COPY_BLT)) == 0);
+    EXPECT_EQ(requestedResCopyBlt, expectedResCopyBlt);
     EXPECT_EQ(1u, mockGmmResInfo->cpuBltCalled);
     EXPECT_EQ(1u, mockSharingFcns->lockRectCalled);
 
     mockSharingFcns->lockRectParamsSet.lockedRect = lockedRect;
 
     requestedResCopyBlt = {};
-    expectedResCopyBlt.Blt.Upload = 0;
+    expectedResCopyBlt.upload = false;
 
     EXPECT_EQ(1u, mockSharingFcns->unlockRectCalled);
 
     retVal = clEnqueueReleaseDX9MediaSurfacesKHR(cmdQ, 1, &clMem, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_TRUE(memcmp(&requestedResCopyBlt, &expectedResCopyBlt, sizeof(GMM_RES_COPY_BLT)) == 0);
+    EXPECT_EQ(requestedResCopyBlt, expectedResCopyBlt);
     EXPECT_EQ(2, memoryManager->lockResourceCalled);
     EXPECT_EQ(2, memoryManager->unlockResourceCalled);
     EXPECT_EQ(2u, mockGmmResInfo->cpuBltCalled);
@@ -841,7 +842,7 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndLockableWhenReleasingThenResou
     EXPECT_EQ(1u, mockSharingFcns->updateDeviceCalled);
 
     EXPECT_EQ(reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurface), mockSharingFcns->lockRectParamsPassed[0].d3dResource);
-    EXPECT_EQ(D3DLOCK_READONLY, mockSharingFcns->lockRectParamsPassed[0].flags);
+    EXPECT_EQ(static_cast<uint32_t>(D3DLOCK_READONLY), mockSharingFcns->lockRectParamsPassed[0].flags);
     EXPECT_EQ(reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurface), mockSharingFcns->lockRectParamsPassed[1].d3dResource);
     EXPECT_EQ(0u, mockSharingFcns->lockRectParamsPassed[1].flags);
 
@@ -872,18 +873,18 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndLockableIntelWhenReleasingThen
     memoryManager->lockResourceReturnValue = returnedLockedRes;
     memoryManager->expectedLockingAllocation = graphicsAllocation;
 
-    GMM_RES_COPY_BLT &requestedResCopyBlt = mockGmmResInfo->requestedResCopyBlt;
-    GMM_RES_COPY_BLT expectedResCopyBlt = {};
+    GmmCpuBltParams &requestedResCopyBlt = mockGmmResInfo->requestedCpuBltParams;
+    GmmCpuBltParams expectedResCopyBlt = {};
     mockGmmResInfo->cpuBltCalled = 0u;
-    expectedResCopyBlt.Sys.pData = lockedRect.pBits;
-    expectedResCopyBlt.Gpu.pData = returnedLockedRes;
-    expectedResCopyBlt.Sys.RowPitch = lockedRect.Pitch;
-    expectedResCopyBlt.Blt.Upload = 1;
-    expectedResCopyBlt.Sys.BufferSize = lockedRect.Pitch * imgHeight;
+    expectedResCopyBlt.sysData = lockedRect.pBits;
+    expectedResCopyBlt.gpuData = returnedLockedRes;
+    expectedResCopyBlt.sysRowPitch = lockedRect.Pitch;
+    expectedResCopyBlt.upload = true;
+    expectedResCopyBlt.sysBufferSize = lockedRect.Pitch * imgHeight;
 
     auto retVal = clEnqueueAcquireDX9ObjectsINTEL(cmdQ, 1, &clMem, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_TRUE(memcmp(&requestedResCopyBlt, &expectedResCopyBlt, sizeof(GMM_RES_COPY_BLT)) == 0);
+    EXPECT_EQ(requestedResCopyBlt, expectedResCopyBlt);
     EXPECT_EQ(1, memoryManager->lockResourceCalled);
     EXPECT_EQ(1, memoryManager->unlockResourceCalled);
     EXPECT_EQ(1u, mockGmmResInfo->cpuBltCalled);
@@ -892,13 +893,13 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndLockableIntelWhenReleasingThen
     mockSharingFcns->lockRectParamsSet.lockedRect = lockedRect;
 
     requestedResCopyBlt = {};
-    expectedResCopyBlt.Blt.Upload = 0;
+    expectedResCopyBlt.upload = false;
 
     EXPECT_EQ(1u, mockSharingFcns->unlockRectCalled);
 
     retVal = clEnqueueReleaseDX9ObjectsINTEL(cmdQ, 1, &clMem, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_TRUE(memcmp(&requestedResCopyBlt, &expectedResCopyBlt, sizeof(GMM_RES_COPY_BLT)) == 0);
+    EXPECT_EQ(requestedResCopyBlt, expectedResCopyBlt);
     EXPECT_EQ(2, memoryManager->lockResourceCalled);
     EXPECT_EQ(2, memoryManager->unlockResourceCalled);
     EXPECT_EQ(2u, mockGmmResInfo->cpuBltCalled);
@@ -911,7 +912,7 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndLockableIntelWhenReleasingThen
     EXPECT_EQ(1u, mockSharingFcns->updateDeviceCalled);
 
     EXPECT_EQ(reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurface), mockSharingFcns->lockRectParamsPassed[0].d3dResource);
-    EXPECT_EQ(D3DLOCK_READONLY, mockSharingFcns->lockRectParamsPassed[0].flags);
+    EXPECT_EQ(static_cast<uint32_t>(D3DLOCK_READONLY), mockSharingFcns->lockRectParamsPassed[0].flags);
     EXPECT_EQ(reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurface), mockSharingFcns->lockRectParamsPassed[1].d3dResource);
     EXPECT_EQ(0u, mockSharingFcns->lockRectParamsPassed[1].flags);
 
@@ -946,18 +947,18 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndNonLockableWhenReleasingThenRe
     memoryManager->lockResourceReturnValue = returnedLockedRes;
     memoryManager->expectedLockingAllocation = graphicsAllocation;
 
-    GMM_RES_COPY_BLT &requestedResCopyBlt = mockGmmResInfo->requestedResCopyBlt;
+    GmmCpuBltParams &requestedResCopyBlt = mockGmmResInfo->requestedCpuBltParams;
     mockGmmResInfo->cpuBltCalled = 0u;
-    GMM_RES_COPY_BLT expectedResCopyBlt = {};
-    expectedResCopyBlt.Sys.pData = lockedRect.pBits;
-    expectedResCopyBlt.Gpu.pData = returnedLockedRes;
-    expectedResCopyBlt.Sys.RowPitch = lockedRect.Pitch;
-    expectedResCopyBlt.Blt.Upload = 1;
-    expectedResCopyBlt.Sys.BufferSize = lockedRect.Pitch * imgHeight;
+    GmmCpuBltParams expectedResCopyBlt = {};
+    expectedResCopyBlt.sysData = lockedRect.pBits;
+    expectedResCopyBlt.gpuData = returnedLockedRes;
+    expectedResCopyBlt.sysRowPitch = lockedRect.Pitch;
+    expectedResCopyBlt.upload = true;
+    expectedResCopyBlt.sysBufferSize = lockedRect.Pitch * imgHeight;
 
     auto retVal = clEnqueueAcquireDX9MediaSurfacesKHR(cmdQ, 1, &clMem, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_TRUE(memcmp(&requestedResCopyBlt, &expectedResCopyBlt, sizeof(GMM_RES_COPY_BLT)) == 0);
+    EXPECT_EQ(requestedResCopyBlt, expectedResCopyBlt);
     EXPECT_EQ(1, memoryManager->lockResourceCalled);
     EXPECT_EQ(1, memoryManager->unlockResourceCalled);
     EXPECT_EQ(1u, mockGmmResInfo->cpuBltCalled);
@@ -965,13 +966,13 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndNonLockableWhenReleasingThenRe
 
     mockSharingFcns->lockRectParamsSet.lockedRect = lockedRect;
 
-    expectedResCopyBlt.Blt.Upload = 0;
+    expectedResCopyBlt.upload = false;
 
     EXPECT_EQ(1u, mockSharingFcns->unlockRectCalled);
 
     retVal = clEnqueueReleaseDX9MediaSurfacesKHR(cmdQ, 1, &clMem, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_TRUE(memcmp(&requestedResCopyBlt, &expectedResCopyBlt, sizeof(GMM_RES_COPY_BLT)) == 0);
+    EXPECT_EQ(requestedResCopyBlt, expectedResCopyBlt);
     EXPECT_EQ(2, memoryManager->lockResourceCalled);
     EXPECT_EQ(2, memoryManager->unlockResourceCalled);
     EXPECT_EQ(2u, mockGmmResInfo->cpuBltCalled);
@@ -985,7 +986,7 @@ TEST_F(D3D9Tests, GivenNonSharedResourceSurfaceAndNonLockableWhenReleasingThenRe
     EXPECT_EQ(1u, mockSharingFcns->updateDeviceCalled);
 
     EXPECT_EQ(reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurfaceStaging), mockSharingFcns->lockRectParamsPassed[0].d3dResource);
-    EXPECT_EQ(D3DLOCK_READONLY, mockSharingFcns->lockRectParamsPassed[0].flags);
+    EXPECT_EQ(static_cast<uint32_t>(D3DLOCK_READONLY), mockSharingFcns->lockRectParamsPassed[0].flags);
     EXPECT_EQ(reinterpret_cast<IDirect3DSurface9 *>(&dummyD3DSurfaceStaging), mockSharingFcns->lockRectParamsPassed[1].d3dResource);
     EXPECT_EQ(0u, mockSharingFcns->lockRectParamsPassed[1].flags);
 
@@ -1088,7 +1089,7 @@ TEST_F(D3D9Tests, givenInvalidContextWhenImageIsCreatedThenErrorIsReturned) {
 }
 
 TEST_F(D3D9Tests, givenTheSameResourceAndPlaneWhenSurfaceIsCreatedThenReturnError) {
-    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2');
+    mockSharingFcns->mockTexture2dDesc.Format = (D3DFORMAT)MAKEFOURCC('Y', 'V', '1', '2'); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange), code supplied by vendor
     surfaceInfo.shared_handle = (HANDLE)1;
     cl_int retVal = CL_SUCCESS;
     cl_uint plane = 0;
@@ -1109,6 +1110,8 @@ TEST_F(D3D9Tests, givenTheSameResourceAndPlaneWhenSurfaceIsCreatedThenReturnErro
 TEST_F(D3D9Tests, WhenFillingBufferDescThenBufferContentsAreCorrect) {
     D3D9::D3DBufferDesc requestedDesc = {};
     D3D9::D3DBufferDesc expectedDesc = {};
+    memset(&requestedDesc, 0, sizeof(requestedDesc));
+    memset(&expectedDesc, 0, sizeof(expectedDesc));
 
     mockSharingFcns->fillCreateBufferDesc(requestedDesc, 10);
     EXPECT_TRUE(memcmp(&requestedDesc, &expectedDesc, sizeof(D3D9::D3DBufferDesc)) == 0);
@@ -1119,6 +1122,8 @@ TEST_F(D3D9Tests, WhenFillingTexture2dDescThenTextureContentsAreCorrect) {
     D3D9::D3DTexture2dDesc expectedDesc = {};
     D3D9::D3DTexture2dDesc srcDesc = {};
     cl_uint subresource = 4;
+    memset(&requestedDesc, 0, sizeof(requestedDesc));
+    memset(&expectedDesc, 0, sizeof(expectedDesc));
     mockSharingFcns->fillCreateTexture2dDesc(requestedDesc, &srcDesc, subresource);
     EXPECT_TRUE(memcmp(&requestedDesc, &expectedDesc, sizeof(D3D9::D3DTexture2dDesc)) == 0);
 }
@@ -1128,6 +1133,8 @@ TEST_F(D3D9Tests, WhenFillingTexture3dDescThenTextureContentsAreCorrect) {
     D3D9::D3DTexture3dDesc expectedDesc = {};
     D3D9::D3DTexture3dDesc srcDesc = {};
     cl_uint subresource = 4;
+    memset(&requestedDesc, 0, sizeof(requestedDesc));
+    memset(&expectedDesc, 0, sizeof(expectedDesc));
     mockSharingFcns->fillCreateTexture3dDesc(requestedDesc, &srcDesc, subresource);
     EXPECT_TRUE(memcmp(&requestedDesc, &expectedDesc, sizeof(D3D9::D3DTexture3dDesc)) == 0);
 }
@@ -1243,34 +1250,34 @@ TEST_F(D3D9Tests, givenImproperCommandQueueWhenD3D11ObjectsAreReleasedThenReturn
 namespace D3D9Formats {
 static const std::tuple<uint32_t /*d3dFormat*/, uint32_t /*plane*/, uint32_t /*cl_channel_type*/, uint32_t /*cl_channel_order*/, ImagePlane> allImageFormats[] = {
     // input, input, output, output
-    std::make_tuple(D3DFMT_R32F, 0, CL_R, CL_FLOAT, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_R16F, 0, CL_R, CL_HALF_FLOAT, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_L16, 0, CL_R, CL_UNORM_INT16, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A8, 0, CL_A, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_L8, 0, CL_R, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_G32R32F, 0, CL_RG, CL_FLOAT, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_G16R16F, 0, CL_RG, CL_HALF_FLOAT, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_G16R16, 0, CL_RG, CL_UNORM_INT16, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A8L8, 0, CL_RG, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A32B32G32R32F, 0, CL_RGBA, CL_FLOAT, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A16B16G16R16F, 0, CL_RGBA, CL_HALF_FLOAT, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A16B16G16R16, 0, CL_RGBA, CL_UNORM_INT16, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A8B8G8R8, 0, CL_RGBA, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_X8B8G8R8, 0, CL_RGBA, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_A8R8G8B8, 0, CL_BGRA, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_X8R8G8B8, 0, CL_BGRA, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(MAKEFOURCC('N', 'V', '1', '2'), 0, CL_R, CL_UNORM_INT8, ImagePlane::PLANE_Y),
-    std::make_tuple(MAKEFOURCC('N', 'V', '1', '2'), 1, CL_RG, CL_UNORM_INT8, ImagePlane::PLANE_UV),
-    std::make_tuple(MAKEFOURCC('N', 'V', '1', '2'), 2, 0, 0, ImagePlane::NO_PLANE),
-    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 0, CL_R, CL_UNORM_INT8, ImagePlane::PLANE_Y),
-    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 1, CL_R, CL_UNORM_INT8, ImagePlane::PLANE_V),
-    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 2, CL_R, CL_UNORM_INT8, ImagePlane::PLANE_U),
-    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 3, 0, 0, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_YUY2, 0, CL_YUYV_INTEL, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(D3DFMT_UYVY, 0, CL_UYVY_INTEL, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(MAKEFOURCC('Y', 'V', 'Y', 'U'), 0, CL_YVYU_INTEL, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(MAKEFOURCC('V', 'Y', 'U', 'Y'), 0, CL_VYUY_INTEL, CL_UNORM_INT8, ImagePlane::NO_PLANE),
-    std::make_tuple(CL_INVALID_VALUE, 0, 0, 0, ImagePlane::NO_PLANE)};
+    std::make_tuple(D3DFMT_R32F, 0, CL_R, CL_FLOAT, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_R16F, 0, CL_R, CL_HALF_FLOAT, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_L16, 0, CL_R, CL_UNORM_INT16, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A8, 0, CL_A, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_L8, 0, CL_R, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_G32R32F, 0, CL_RG, CL_FLOAT, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_G16R16F, 0, CL_RG, CL_HALF_FLOAT, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_G16R16, 0, CL_RG, CL_UNORM_INT16, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A8L8, 0, CL_RG, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A32B32G32R32F, 0, CL_RGBA, CL_FLOAT, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A16B16G16R16F, 0, CL_RGBA, CL_HALF_FLOAT, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A16B16G16R16, 0, CL_RGBA, CL_UNORM_INT16, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A8B8G8R8, 0, CL_RGBA, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_X8B8G8R8, 0, CL_RGBA, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_A8R8G8B8, 0, CL_BGRA, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_X8R8G8B8, 0, CL_BGRA, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(MAKEFOURCC('N', 'V', '1', '2'), 0, CL_R, CL_UNORM_INT8, ImagePlane::planeY),
+    std::make_tuple(MAKEFOURCC('N', 'V', '1', '2'), 1, CL_RG, CL_UNORM_INT8, ImagePlane::planeUV),
+    std::make_tuple(MAKEFOURCC('N', 'V', '1', '2'), 2, 0, 0, ImagePlane::noPlane),
+    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 0, CL_R, CL_UNORM_INT8, ImagePlane::planeY),
+    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 1, CL_R, CL_UNORM_INT8, ImagePlane::planeV),
+    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 2, CL_R, CL_UNORM_INT8, ImagePlane::planeU),
+    std::make_tuple(MAKEFOURCC('Y', 'V', '1', '2'), 3, 0, 0, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_YUY2, 0, CL_YUYV_INTEL, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_UYVY, 0, CL_UYVY_INTEL, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(MAKEFOURCC('Y', 'V', 'Y', 'U'), 0, CL_YVYU_INTEL, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(MAKEFOURCC('V', 'Y', 'U', 'Y'), 0, CL_VYUY_INTEL, CL_UNORM_INT8, ImagePlane::noPlane),
+    std::make_tuple(D3DFMT_UNKNOWN, 0, 0, 0, ImagePlane::noPlane)};
 }
 
 struct D3D9ImageFormatTests
@@ -1278,7 +1285,7 @@ struct D3D9ImageFormatTests
       public ::testing::Test {
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     D3D9ImageFormatTests,
     D3D9ImageFormatTests,
     testing::ValuesIn(D3D9Formats::allImageFormats));
@@ -1287,7 +1294,7 @@ TEST_P(D3D9ImageFormatTests, WhenGettingImageFormatThenValidFormatDetailsAreRetu
     cl_image_format imgFormat = {};
     auto format = std::get<0>(GetParam());
     auto plane = std::get<1>(GetParam());
-    ImagePlane imagePlane = ImagePlane::NO_PLANE;
+    ImagePlane imagePlane = ImagePlane::noPlane;
     auto expectedImagePlane = std::get<4>(GetParam());
     auto expectedClChannelType = static_cast<cl_channel_type>(std::get<3>(GetParam()));
     auto expectedClChannelOrder = static_cast<cl_channel_order>(std::get<2>(GetParam()));
@@ -1306,7 +1313,7 @@ TEST_F(D3D9MultiRootDeviceTest, givenD3DHandleIsNullWhenCreatingSharedSurfaceAnd
     imgDesc.imageHeight = 10;
     imgDesc.imageWidth = 10;
     imgDesc.imageDepth = 1;
-    imgDesc.imageType = ImageType::Image2D;
+    imgDesc.imageType = ImageType::image2D;
     auto imgInfo = MockGmm::initImgInfo(imgDesc, 0, nullptr);
     auto gmm = MockGmm::queryImgParams(device1->getGmmHelper(), imgInfo, false).release();
 
@@ -1340,7 +1347,7 @@ TEST_F(D3D9MultiRootDeviceTest, givenD3DHandleIsNotNullWhenCreatingSharedSurface
     imgDesc.imageHeight = 10;
     imgDesc.imageWidth = 10;
     imgDesc.imageDepth = 1;
-    imgDesc.imageType = ImageType::Image2D;
+    imgDesc.imageType = ImageType::image2D;
     auto imgInfo = MockGmm::initImgInfo(imgDesc, 0, nullptr);
     auto gmm = MockGmm::queryImgParams(device1->getGmmHelper(), imgInfo, false).release();
 

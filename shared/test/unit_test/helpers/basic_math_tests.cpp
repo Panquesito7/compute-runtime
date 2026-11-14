@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/basic_math_float.h"
 #include "shared/source/helpers/vec.h"
 
 #include "gtest/gtest.h"
@@ -95,21 +96,31 @@ TEST(getExponentWithLog2, GivenNonZeroWhenGettingLog2ThenLog2IsReturned) {
     // clang-format on
 }
 
+TEST(RoundUp, GivenNonZeroValueWhenRoundUpCalledThencorrectValueIsReturned) {
+    // clang-format off
+    EXPECT_EQ(5u, Math::roundUp(3u, 5));
+    EXPECT_EQ(6u, Math::roundUp(5u, 3));
+    EXPECT_EQ(9u, Math::roundUp(7u, 9));
+    EXPECT_EQ(8u, Math::roundUp(5u, 4));
+    EXPECT_EQ(28u, Math::roundUp(27u, 7));
+    // clang-format on
+}
+
 struct Float2HalfParams {
     float floatInput;
     uint16_t uintOutput;
 };
 
-// clang-format off
+static const FloatConversion nanFloat = {0x7fc00000};
+
 Float2HalfParams float2HalfParams[] = {
-    {0.0f,                  0x0000},
-    {1.0f,                  0x3c00},
-    {PosInfinity.f,         0x7c00},
-    {Nan.f,                 0x7e00},
-    {std::ldexp(1.0f, 16),  0x7bff},
+    {0.0f, 0x0000},
+    {1.0f, 0x3c00},
+    {posInfinity.f, 0x7c00},
+    {nanFloat.f, 0x7e00},
+    {std::ldexp(1.0f, 16), 0x7bff},
     {std::ldexp(1.0f, -25), 0x0000},
     {std::ldexp(1.0f, -15), 0x0200}};
-// clang-format on
 
 typedef ::testing::TestWithParam<Float2HalfParams> Float2HalfTest;
 
@@ -120,9 +131,9 @@ TEST_P(Float2HalfTest, WhenConvertingFloatToHalfThenValueIsPreserved) {
     EXPECT_EQ(uintOutput, uint16ofHalf);
 }
 
-INSTANTIATE_TEST_CASE_P(Float2Half,
-                        Float2HalfTest,
-                        ::testing::ValuesIn(float2HalfParams));
+INSTANTIATE_TEST_SUITE_P(Float2Half,
+                         Float2HalfTest,
+                         ::testing::ValuesIn(float2HalfParams));
 
 struct L3Config {
     union {
@@ -180,6 +191,9 @@ TEST_P(ComputeTotalElementsCount, givenVariousInputVectorsWhenComputeTotalElemen
     Vec3<size_t> inputData(GetParam().x, GetParam().y, GetParam().z);
     EXPECT_EQ(GetParam().result, computeTotalElementsCount(inputData));
 }
+INSTANTIATE_TEST_SUITE_P(,
+                         ComputeTotalElementsCount,
+                         ::testing::ValuesIn(elementCountInputData));
 
 TEST(isPow2Test, WhenArgZeroThenReturnFalse) {
     EXPECT_FALSE(isPow2(0u));

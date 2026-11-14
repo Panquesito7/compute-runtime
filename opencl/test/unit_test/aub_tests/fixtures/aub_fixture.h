@@ -1,18 +1,17 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
-#include "shared/source/command_stream/aub_command_stream_receiver.h"
 #include "shared/source/command_stream/aub_command_stream_receiver_hw.h"
 #include "shared/source/command_stream/command_stream_receiver_with_aub_dump.h"
 #include "shared/source/command_stream/tbx_command_stream_receiver_hw.h"
 #include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/test/common/helpers/ult_hw_config.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_memory_operations_handler.h"
 #include "shared/test/common/tests_configuration.h"
@@ -28,61 +27,43 @@ namespace NEO {
 
 class AUBFixture : public CommandQueueHwFixture {
   public:
-    static CommandStreamReceiver *prepareComputeEngine(MockDevice &device, const std::string &filename) {
-        CommandStreamReceiver *pCommandStreamReceiver = nullptr;
-        if (testMode == TestMode::AubTestsWithTbx) {
-            pCommandStreamReceiver = TbxCommandStreamReceiver::create(filename, true, *device.executionEnvironment, device.getRootDeviceIndex(), device.getDeviceBitfield());
-        } else {
-            pCommandStreamReceiver = AUBCommandStreamReceiver::create(filename, true, *device.executionEnvironment, device.getRootDeviceIndex(), device.getDeviceBitfield());
-        }
-        device.resetCommandStreamReceiver(pCommandStreamReceiver);
-        return pCommandStreamReceiver;
-    }
-    static void prepareCopyEngines(MockDevice &device, const std::string &filename) {
-        for (auto i = 0u; i < device.allEngines.size(); i++) {
-            if (EngineHelpers::isBcs(device.allEngines[i].getEngineType())) {
-                CommandStreamReceiver *pBcsCommandStreamReceiver = nullptr;
-                if (testMode == TestMode::AubTestsWithTbx) {
-                    pBcsCommandStreamReceiver = TbxCommandStreamReceiver::create(filename, true, *device.executionEnvironment, device.getRootDeviceIndex(), device.getDeviceBitfield());
-                } else {
-                    pBcsCommandStreamReceiver = AUBCommandStreamReceiver::create(filename, true, *device.executionEnvironment, device.getRootDeviceIndex(), device.getDeviceBitfield());
-                }
-                device.resetCommandStreamReceiver(pBcsCommandStreamReceiver, i);
-            }
-        }
-    }
-
     void setUp(const HardwareInfo *hardwareInfo) {
         const HardwareInfo &hwInfo = hardwareInfo ? *hardwareInfo : *defaultHwInfo;
+
+        backupUltConfig = std::make_unique<VariableBackup<UltHwConfig>>(&ultHwConfig);
 
         executionEnvironment = platform()->peekExecutionEnvironment();
         executionEnvironment->prepareRootDeviceEnvironments(1u);
         executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hwInfo);
         executionEnvironment->rootDeviceEnvironments[0]->initGmm();
         executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<MockMemoryOperationsHandler>();
+        executionEnvironment->calculateMaxOsContextCount();
 
-        auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
         auto engineType = getChosenEngineType(hwInfo);
 
         const ::testing::TestInfo *const testInfo = ::testing::UnitTest::GetInstance()->current_test_info();
         std::stringstream strfilename;
         strfilename << ApiSpecificConfig::getAubPrefixForSpecificApi();
-        strfilename << testInfo->test_case_name() << "_" << testInfo->name() << "_" << gfxCoreHelper.getCsTraits(engineType).name;
+        strfilename << testInfo->test_case_name() << "_" << testInfo->name() << "_" << EngineHelpers::engineTypeToString(engineType);
+
+        aubFileName = strfilename.str();
+        ultHwConfig.aubTestName = aubFileName.c_str();
 
         auto pDevice = MockDevice::create<MockDevice>(executionEnvironment, rootDeviceIndex);
-        device = std::make_unique<MockClDevice>(pDevice);
+        pDevice->disableSecondaryEngines = true;
+        initPlatform({pDevice});
+        device = static_cast<MockClDevice *>(platform(pDevice->getExecutionEnvironment())->getClDevice(0));
 
-        this->csr = prepareComputeEngine(*pDevice, strfilename.str());
+        this->csr = pDevice->getDefaultEngine().commandStreamReceiver;
 
-        prepareCopyEngines(*pDevice, strfilename.str());
-
-        CommandQueueHwFixture::setUp(AUBFixture::device.get(), cl_command_queue_properties(0));
+        CommandQueueHwFixture::setUp(AUBFixture::device, cl_command_queue_properties(0));
     }
     void tearDown() {
         CommandQueueHwFixture::tearDown();
     }
 
     GraphicsAllocation *createHostPtrAllocationFromSvmPtr(void *svmPtr, size_t size);
+    GraphicsAllocation *createResidentAllocationAndStoreItInCsr(const void *address, size_t size);
 
     template <typename FamilyType>
     CommandStreamReceiverSimulatedCommonHw<FamilyType> *getSimulatedCsr() const {
@@ -93,7 +74,7 @@ class AUBFixture : public CommandQueueHwFixture {
     void expectMemory(void *gfxAddress, const void *srcAddress, size_t length) {
         CommandStreamReceiverSimulatedCommonHw<FamilyType> *csrSimulated = getSimulatedCsr<FamilyType>();
 
-        if (testMode == TestMode::AubTestsWithTbx) {
+        if (testMode == TestMode::aubTestsWithTbx) {
             auto tbxCsr = csrSimulated;
             EXPECT_TRUE(tbxCsr->expectMemoryEqual(gfxAddress, srcAddress, length));
             csrSimulated = static_cast<CommandStreamReceiverSimulatedCommonHw<FamilyType> *>(
@@ -116,7 +97,7 @@ class AUBFixture : public CommandQueueHwFixture {
     template <typename FamilyType>
     void expectMMIO(uint32_t mmioRegister, uint32_t expectedValue) {
         CommandStreamReceiver *csrtemp = csr;
-        if (testMode == TestMode::AubTestsWithTbx) {
+        if (testMode == TestMode::aubTestsWithTbx) {
             csrtemp = static_cast<CommandStreamReceiverWithAUBDump<TbxCommandStreamReceiverHw<FamilyType>> *>(csr)->aubCSR.get();
         }
 
@@ -131,7 +112,7 @@ class AUBFixture : public CommandQueueHwFixture {
     void expectNotEqualMemory(void *gfxAddress, const void *srcAddress, size_t length) {
         CommandStreamReceiverSimulatedCommonHw<FamilyType> *csrSimulated = getSimulatedCsr<FamilyType>();
 
-        if (testMode == TestMode::AubTestsWithTbx) {
+        if (testMode == TestMode::aubTestsWithTbx) {
             auto tbxCsr = csrSimulated;
             EXPECT_TRUE(tbxCsr->expectMemoryNotEqual(gfxAddress, srcAddress, length));
             csrSimulated = static_cast<CommandStreamReceiverSimulatedCommonHw<FamilyType> *>(
@@ -147,7 +128,7 @@ class AUBFixture : public CommandQueueHwFixture {
     void expectCompressedMemory(void *gfxAddress, const void *srcAddress, size_t length) {
         CommandStreamReceiverSimulatedCommonHw<FamilyType> *csrSimulated = getSimulatedCsr<FamilyType>();
 
-        if (testMode == TestMode::AubTestsWithTbx) {
+        if (testMode == TestMode::aubTestsWithTbx) {
             auto tbxCsr = csrSimulated;
             EXPECT_TRUE(tbxCsr->expectMemoryCompressed(gfxAddress, srcAddress, length));
             csrSimulated = static_cast<CommandStreamReceiverSimulatedCommonHw<FamilyType> *>(
@@ -157,6 +138,11 @@ class AUBFixture : public CommandQueueHwFixture {
         if (csrSimulated) {
             csrSimulated->expectMemoryCompressed(gfxAddress, srcAddress, length);
         }
+    }
+
+    template <typename FamilyType>
+    void pollForCompletion() {
+        getSimulatedCsr<FamilyType>()->pollForCompletion();
     }
 
     static void *getGpuPointer(GraphicsAllocation *allocation) {
@@ -170,12 +156,15 @@ class AUBFixture : public CommandQueueHwFixture {
     const uint32_t rootDeviceIndex = 0;
     CommandStreamReceiver *csr = nullptr;
     volatile uint32_t *pTagMemory = nullptr;
-    std::unique_ptr<MockClDevice> device;
+    MockClDevice *device;
 
     ExecutionEnvironment *executionEnvironment;
 
   private:
     using CommandQueueHwFixture::setUp;
+    std::string aubFileName;
+    std::unique_ptr<VariableBackup<UltHwConfig>> backupUltConfig;
+
 }; // namespace NEO
 
 template <typename KernelFixture>
@@ -183,7 +172,7 @@ struct KernelAUBFixture : public AUBFixture,
                           public KernelFixture {
     void setUp() {
         AUBFixture::setUp(nullptr);
-        KernelFixture::setUp(device.get(), context);
+        KernelFixture::setUp(device, context);
     }
 
     void tearDown() {

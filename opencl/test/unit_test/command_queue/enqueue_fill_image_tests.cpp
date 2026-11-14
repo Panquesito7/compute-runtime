@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,22 +7,19 @@
 
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_gmm_resource_info.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/helpers/convert_color.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fill_image_fixture.h"
 #include "opencl/test/unit_test/gen_common/gen_commands_common_validation.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
-
-#include "reg_configs_common.h"
-
-#include <algorithm>
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 
 using namespace NEO;
 
 class EnqueueFillImageTest : public EnqueueFillImageTestFixture,
+                             public SurfaceStateAccessor,
                              public ::testing::Test {
   public:
     void SetUp(void) override {
@@ -42,10 +39,16 @@ HWTEST_F(EnqueueFillImageTest, WhenFillingImageThenTaskCountIsAlignedWithCsr) {
 
     EnqueueFillImageHelper<>::enqueueFillImage(pCmdQ, image);
     EXPECT_EQ(csr.peekTaskCount(), pCmdQ->taskCount);
-    EXPECT_EQ(csr.peekTaskLevel(), pCmdQ->taskLevel + 1);
+
+    auto cmdQTaskLevel = pCmdQ->taskLevel;
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        cmdQTaskLevel++;
+    }
+
+    EXPECT_EQ(csr.peekTaskLevel(), cmdQTaskLevel);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenGpgpuWalkerIsCorrect) {
+HWTEST2_F(EnqueueFillImageTest, WhenFillingImageThenGpgpuWalkerIsCorrect, IsGen12LP) {
     typedef typename FamilyType::GPGPU_WALKER GPGPU_WALKER;
     enqueueFillImage<FamilyType>();
 
@@ -93,13 +96,13 @@ HWTEST_F(EnqueueFillImageTest, WhenFillingImageThenCommandsAreAdded) {
 
 HWTEST_F(EnqueueFillImageTest, GivenGpuHangAndBlockingCallWhenFillingImageThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context, device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     const auto enqueueResult = EnqueueFillImageHelper<>::enqueueFillImage(&mockCommandQueueHw, image);
 
@@ -125,7 +128,7 @@ HWTEST_F(EnqueueFillImageTest, WhenFillingImageThenL3ProgrammingIsCorrect) {
     validateL3Programming<FamilyType>(cmdList, itorWalker);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed) {
+HWTEST2_F(EnqueueFillImageTest, WhenEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed, IsGen12LP) {
     enqueueFillImage<FamilyType>();
     auto &ultCsr = this->pDevice->getUltCommandStreamReceiver<FamilyType>();
 
@@ -136,7 +139,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenEnqueueIsDoneThenStateBase
                                          pDSH, pIOH, pSSH, itorPipelineSelect, itorWalker, cmdList, 0llu);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenMediaInterfaceDescriptorLoadIsCorrect) {
+HWTEST2_F(EnqueueFillImageTest, WhenFillingImageThenMediaInterfaceDescriptorLoadIsCorrect, IsGen12LP) {
     typedef typename FamilyType::MEDIA_INTERFACE_DESCRIPTOR_LOAD MEDIA_INTERFACE_DESCRIPTOR_LOAD;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -159,10 +162,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenMediaInter
     EXPECT_EQ(0u, cmd->getInterfaceDescriptorTotalLength() % alignmentTotalLength);
 
     // Generically validate this command
-    FamilyType::PARSE::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorMediaInterfaceDescriptorLoad);
+    FamilyType::Parse::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorMediaInterfaceDescriptorLoad);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenInterfaceDescriptorDataIsCorrect) {
+HWTEST2_F(EnqueueFillImageTest, WhenFillingImageThenInterfaceDescriptorDataIsCorrect, IsGen12LP) {
     typedef typename FamilyType::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -173,7 +176,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenInterfaceD
     auto &interfaceDescriptorData = *(INTERFACE_DESCRIPTOR_DATA *)cmdInterfaceDescriptorData;
 
     // Validate the kernel start pointer.  Technically, a kernel can start at address 0 but let's force a value.
-    auto kernelStartPointer = ((uint64_t)interfaceDescriptorData.getKernelStartPointerHigh() << 32) + interfaceDescriptorData.getKernelStartPointer();
+    auto kernelStartPointer = interfaceDescriptorData.getKernelStartPointer();
     EXPECT_LE(kernelStartPointer, cmdSBA->getInstructionBufferSize() * MemoryConstants::pageSize);
 
     size_t maxLocalSize = 256u;
@@ -190,34 +193,65 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenInterfaceD
 }
 
 HWTEST_F(EnqueueFillImageTest, WhenFillingImageThenSurfaceStateIsCorrect) {
-    typedef typename FamilyType::RENDER_SURFACE_STATE RENDER_SURFACE_STATE;
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
 
     auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
     VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
     mockCmdQ->storeMultiDispatchInfo = true;
+
     enqueueFillImage<FamilyType>();
 
-    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
-    uint32_t index = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(0).template as<ArgDescImage>().bindful) / sizeof(RENDER_SURFACE_STATE);
+    const auto surfaceState = SurfaceStateAccessor::getSurfaceState<FamilyType, RENDER_SURFACE_STATE>(mockCmdQ, 0);
 
-    const auto surfaceState = getSurfaceState<FamilyType>(&pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), index);
     const auto &imageDesc = image->getImageDesc();
     EXPECT_EQ(imageDesc.image_width, surfaceState->getWidth());
     EXPECT_EQ(imageDesc.image_height, surfaceState->getHeight());
     EXPECT_NE(0u, surfaceState->getSurfacePitch());
     EXPECT_NE(0u, surfaceState->getSurfaceType());
     EXPECT_EQ(MockGmmResourceInfo::getHAlignSurfaceStateResult, surfaceState->getSurfaceHorizontalAlignment());
-    EXPECT_EQ(RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4, surfaceState->getSurfaceVerticalAlignment());
+    EXPECT_EQ(static_cast<uint32_t>(FamilyType::RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4), static_cast<uint32_t>(surfaceState->getSurfaceVerticalAlignment()));
     EXPECT_EQ(image->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), surfaceState->getSurfaceBaseAddress());
 }
 
-HWTEST2_F(EnqueueFillImageTest, WhenFillingImageThenNumberOfPipelineSelectsIsOne, IsAtMostXeHpcCore) {
+HWTEST_F(EnqueueFillImageTest, WhenFillingImage1dBufferThenCorrectBuiltInIsSelected) {
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
+
+    std::unique_ptr<Image> image1dBuffer;
+    image1dBuffer.reset(Image1dBufferHelperUlt<>::create(context));
+    VariableBackup<Image *> imageBackup(&image, image1dBuffer.get());
+
+    mockCmdQ->storeMultiDispatchInfo = true;
+    enqueueFillImage<FamilyType>();
+
+    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
+    EXPECT_TRUE(kernelInfo.kernelDescriptor.kernelMetadata.kernelName == "FillImage1dBuffer");
+}
+
+HWTEST2_F(EnqueueFillImageTest, givenHeaplessWhenFillingImage1dBufferThenCorrectBuiltInIsSelected, HeaplessSupport) {
+
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
+
+    std::unique_ptr<Image> image1dBuffer;
+    image1dBuffer.reset(Image1dBufferHelperUlt<>::create(context));
+    VariableBackup<Image *> imageBackup(&image, image1dBuffer.get());
+
+    mockCmdQ->storeMultiDispatchInfo = true;
+    mockCmdQ->heaplessModeEnabled = true;
+    enqueueFillImage<FamilyType>();
+
+    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
+    EXPECT_TRUE(kernelInfo.kernelDescriptor.kernelMetadata.kernelName == "FillImage1dBuffer");
+}
+
+HWTEST2_F(EnqueueFillImageTest, WhenFillingImageThenNumberOfPipelineSelectsIsOne, IsAtMostXeCore) {
     enqueueFillImage<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueFillImageTest, WhenFillingImageThenMediaVfeStateIsSetCorrectly) {
+HWTEST2_F(EnqueueFillImageTest, WhenFillingImageThenMediaVfeStateIsSetCorrectly, IsGen12LP) {
     enqueueFillImage<FamilyType>();
     validateMediaVFEState<FamilyType>(&pDevice->getHardwareInfo(), cmdMediaVfeState, cmdList, itorMediaVfeState);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,13 +10,18 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/hw_device_id.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/test/common/mocks/mock_device.h"
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/driver/driver.h"
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_driver_imp.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+#include "level_zero/tools/source/sysman/linux/udev/udev_lib.h"
 #include "level_zero/tools/source/sysman/sysman.h"
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/firmware_util/mock_fw_util_fixture.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_procfs_access_fixture.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysfs_access_fixture.h"
@@ -45,7 +50,6 @@ class PublicLinuxSysmanImp : public L0::LinuxSysmanImp {
     using LinuxSysmanImp::pPmuInterface;
     using LinuxSysmanImp::pProcfsAccess;
     using LinuxSysmanImp::pSysfsAccess;
-    using LinuxSysmanImp::pUdevLib;
 };
 
 class SysmanDeviceFixture : public DeviceFixture, public ::testing::Test {
@@ -57,11 +61,13 @@ class SysmanDeviceFixture : public DeviceFixture, public ::testing::Test {
         if (!sysmanUltsEnable) {
             GTEST_SKIP();
         }
+        debugManager.flags.EnableHostUsmAllocationPool.set(0);
+        debugManager.flags.EnableDeviceUsmAllocationPool.set(0);
         DeviceFixture::setUp();
         neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-        auto &osInterface = device->getOsInterface();
+        auto &osInterface = *device->getOsInterface();
         osInterface.setDriverModel(std::make_unique<SysmanMockDrm>(const_cast<NEO::RootDeviceEnvironment &>(neoDevice->getRootDeviceEnvironment())));
-        setenv("ZES_ENABLE_SYSMAN", "1", 1);
+        debugManager.flags.ZES_ENABLE_SYSMAN.set(true);
         device->setSysmanHandle(new SysmanDeviceImp(device->toHandle()));
         pSysmanDevice = device->getSysmanHandle();
         pSysmanDeviceImp = static_cast<SysmanDeviceImp *>(pSysmanDevice);
@@ -75,8 +81,8 @@ class SysmanDeviceFixture : public DeviceFixture, public ::testing::Test {
         pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
         pLinuxSysmanImp->pProcfsAccess = pProcfsAccess;
 
-        if (GlobalOsSysmanDriver == nullptr) {
-            GlobalOsSysmanDriver = L0::OsSysmanDriver::create();
+        if (globalOsSysmanDriver == nullptr) {
+            globalOsSysmanDriver = L0::OsSysmanDriver::create();
         }
 
         pSysmanDeviceImp->init();
@@ -87,15 +93,14 @@ class SysmanDeviceFixture : public DeviceFixture, public ::testing::Test {
             GTEST_SKIP();
         }
 
-        if (GlobalOsSysmanDriver != nullptr) {
-            delete GlobalOsSysmanDriver;
-            GlobalOsSysmanDriver = nullptr;
+        if (globalOsSysmanDriver != nullptr) {
+            delete globalOsSysmanDriver;
+            globalOsSysmanDriver = nullptr;
         }
 
         DeviceFixture::tearDown();
-        unsetenv("ZES_ENABLE_SYSMAN");
     }
-
+    DebugManagerStateRestore restorer;
     SysmanDevice *pSysmanDevice = nullptr;
     SysmanDeviceImp *pSysmanDeviceImp = nullptr;
     OsSysman *pOsSysman = nullptr;
@@ -115,13 +120,13 @@ class SysmanMultiDeviceFixture : public MultiDeviceFixture, public ::testing::Te
         device = driverHandle->devices[0];
         neoDevice = device->getNEODevice();
         neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-        auto &osInterface = device->getOsInterface();
+        auto &osInterface = *device->getOsInterface();
         osInterface.setDriverModel(std::make_unique<SysmanMockDrm>(const_cast<NEO::RootDeviceEnvironment &>(neoDevice->getRootDeviceEnvironment())));
-        setenv("ZES_ENABLE_SYSMAN", "1", 1);
+        debugManager.flags.ZES_ENABLE_SYSMAN.set(true);
         device->setSysmanHandle(new SysmanDeviceImp(device->toHandle()));
         pSysmanDevice = device->getSysmanHandle();
-        for (auto &subDevice : static_cast<DeviceImp *>(device)->subDevices) {
-            static_cast<DeviceImp *>(subDevice)->setSysmanHandle(pSysmanDevice);
+        for (auto &subDevice : device->subDevices) {
+            static_cast<Device *>(subDevice)->setSysmanHandle(pSysmanDevice);
         }
 
         pSysmanDeviceImp = static_cast<SysmanDeviceImp *>(pSysmanDevice);
@@ -135,8 +140,8 @@ class SysmanMultiDeviceFixture : public MultiDeviceFixture, public ::testing::Te
         pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
         pLinuxSysmanImp->pProcfsAccess = pProcfsAccess;
 
-        if (GlobalOsSysmanDriver == nullptr) {
-            GlobalOsSysmanDriver = L0::OsSysmanDriver::create();
+        if (globalOsSysmanDriver == nullptr) {
+            globalOsSysmanDriver = L0::OsSysmanDriver::create();
         }
 
         pSysmanDeviceImp->init();
@@ -147,14 +152,14 @@ class SysmanMultiDeviceFixture : public MultiDeviceFixture, public ::testing::Te
         if (!sysmanUltsEnable) {
             GTEST_SKIP();
         }
-        if (GlobalOsSysmanDriver != nullptr) {
-            delete GlobalOsSysmanDriver;
-            GlobalOsSysmanDriver = nullptr;
+        if (globalOsSysmanDriver != nullptr) {
+            delete globalOsSysmanDriver;
+            globalOsSysmanDriver = nullptr;
         }
-        unsetenv("ZES_ENABLE_SYSMAN");
         MultiDeviceFixture::tearDown();
     }
 
+    DebugManagerStateRestore restorer;
     SysmanDevice *pSysmanDevice = nullptr;
     SysmanDeviceImp *pSysmanDeviceImp = nullptr;
     OsSysman *pOsSysman = nullptr;

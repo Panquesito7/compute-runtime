@@ -1,20 +1,62 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "shared/source/command_stream/command_stream_receiver.h"
 
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/hello_world_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
 
-#include <future>
+#include <thread>
 
 using namespace NEO;
 
-typedef HelloWorldTest<HelloWorldFixtureFactory> IOQTaskTestsMt;
+struct IOQTaskTestsMt : public HelloWorldTest<HelloWorldFixtureFactory> {
+    void SetUp() override {
+        ClDeviceFixture::setUp();
+        ASSERT_NE(nullptr, pClDevice);
+        pDevice->disableSecondaryEngines = true;
+
+        CommandQueueFixture::setUp(pClDevice, 0);
+        ASSERT_NE(nullptr, pCmdQ);
+        CommandStreamFixture::setUp(pCmdQ);
+        ASSERT_NE(nullptr, pCS);
+        IndirectHeapFixture::setUp(pCmdQ);
+        KernelFixture::setUp(pClDevice);
+        ASSERT_NE(nullptr, pKernel);
+
+        auto retVal = CL_INVALID_VALUE;
+        BufferDefaults::context = new MockContext(pClDevice);
+
+        destBuffer = Buffer::create(
+            BufferDefaults::context,
+            CL_MEM_READ_WRITE,
+            sizeUserMemory,
+            nullptr,
+            retVal);
+
+        srcBuffer = Buffer::create(
+            BufferDefaults::context,
+            CL_MEM_READ_WRITE,
+            sizeUserMemory,
+            nullptr,
+            retVal);
+
+        pDestMemory = destBuffer->getCpuAddressForMapping();
+        pSrcMemory = srcBuffer->getCpuAddressForMapping();
+
+        memset(pDestMemory, destPattern, sizeUserMemory);
+        memset(pSrcMemory, srcPattern, sizeUserMemory);
+
+        pKernel->setArg(0, srcBuffer);
+        pKernel->setArg(1, destBuffer);
+    }
+};
 
 TEST_F(IOQTaskTestsMt, GivenBlockingAndBlockedOnUserEventWhenReadingBufferThenTaskCountAndTaskLevelAreIncremented) {
     auto buffer = std::unique_ptr<Buffer>(BufferHelper<>::create());
@@ -22,7 +64,7 @@ TEST_F(IOQTaskTestsMt, GivenBlockingAndBlockedOnUserEventWhenReadingBufferThenTa
     auto alignedReadPtr = alignedMalloc(BufferDefaults::sizeInBytes, MemoryConstants::cacheLineSize);
     ASSERT_NE(nullptr, alignedReadPtr);
 
-    auto userEvent = clCreateUserEvent(pContext, &retVal);
+    auto userEvent = clCreateUserEvent(pContext.get(), &retVal);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     auto previousTaskLevel = pCmdQ->taskLevel;
@@ -37,7 +79,7 @@ TEST_F(IOQTaskTestsMt, GivenBlockingAndBlockedOnUserEventWhenReadingBufferThenTa
         ASSERT_EQ(CL_SUCCESS, ret);
     });
 
-    buffer->forceDisallowCPUCopy = true; // no task level incrasing when cpu copy
+    buffer->forceDisallowCPUCopy = true; // no task level increasing when cpu copy
     retVal = EnqueueReadBufferHelper<>::enqueueReadBuffer(pCmdQ,
                                                           buffer.get(),
                                                           CL_TRUE,
@@ -63,7 +105,7 @@ TEST_F(IOQTaskTestsMt, GivenBlockingAndBlockedOnUserEventWhenReadingBufferThenTa
 
 TEST_F(IOQTaskTestsMt, GivenBlockedOnUserEventWhenEnqueingMarkerThenSuccessIsReturned) {
 
-    auto userEvent = clCreateUserEvent(pContext, &retVal);
+    auto userEvent = clCreateUserEvent(pContext.get(), &retVal);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     std::thread t([=]() {
@@ -89,9 +131,9 @@ TEST_F(IOQTaskTestsMt, GivenBlockedOnUserEventWhenEnqueingMarkerThenSuccessIsRet
 
 TEST_F(IOQTaskTestsMt, GivenMultipleThreadsWhenMappingBufferThenEventsAreCompleted) {
     MockGraphicsAllocation alignedBufferAlloc{nullptr, MemoryConstants::pageSize};
-    AlignedBuffer alignedBuffer{pContext, &alignedBufferAlloc};
+    AlignedBuffer alignedBuffer{pContext.get(), &alignedBufferAlloc};
 
-    auto userEvent = clCreateUserEvent(pContext, &retVal);
+    auto userEvent = clCreateUserEvent(pContext.get(), &retVal);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     cl_event outputEvent = nullptr;
@@ -99,7 +141,7 @@ TEST_F(IOQTaskTestsMt, GivenMultipleThreadsWhenMappingBufferThenEventsAreComplet
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    const int32_t numThreads = 20;
+    const int32_t numThreads = 8;
 
     std::thread threads[numThreads];
     std::thread threadUnblocking;
@@ -157,9 +199,9 @@ TEST_F(IOQTaskTestsMt, GivenMultipleThreadsWhenMappingBufferThenEventsAreComplet
 }
 
 TEST_F(IOQTaskTestsMt, GivenMultipleThreadsWhenMappingImageThenEventsAreCompleted) {
-    auto image = std::unique_ptr<Image>(ImageHelper<Image1dDefaults>::create(context));
+    auto image = std::unique_ptr<Image>(ImageHelperUlt<Image1dDefaults>::create(context));
 
-    auto userEvent = clCreateUserEvent(pContext, &retVal);
+    auto userEvent = clCreateUserEvent(pContext.get(), &retVal);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     cl_event outputEvent = nullptr;
@@ -170,7 +212,7 @@ TEST_F(IOQTaskTestsMt, GivenMultipleThreadsWhenMappingImageThenEventsAreComplete
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    const int32_t numThreads = 20;
+    const int32_t numThreads = 8;
 
     std::thread threads[numThreads];
     std::thread threadUnblocking;
@@ -228,28 +270,29 @@ TEST_F(IOQTaskTestsMt, GivenMultipleThreadsWhenMappingImageThenEventsAreComplete
 }
 
 TEST_F(IOQTaskTestsMt, givenBlitterWhenCopyUsingMultipleThreadsThenSuccessReturned) {
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.capabilityTable.blitterOperationsSupported = true;
-
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableBlitterForEnqueueOperations.set(1);
-    DebugManager.flags.DoCpuCopyOnReadBuffer.set(0);
+    debugManager.flags.EnableBlitterForEnqueueOperations.set(1);
+    debugManager.flags.DoCpuCopyOnReadBuffer.set(0);
+    debugManager.flags.UpdateTaskCountFromWait.set(0);
+    debugManager.flags.EnableTimestampWaitForQueues.set(0);
 
-    constexpr uint32_t numThreads = 32;
+    REQUIRE_FULL_BLITTER_OR_SKIP(pClDevice->getRootDeviceEnvironment());
+
+    constexpr uint32_t numThreads = 4;
     std::atomic_uint32_t barrier = numThreads;
-    std::array<std::future<void>, numThreads> threads;
+    std::array<std::thread, numThreads> threads;
 
-    auto device = MockClDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, rootDeviceIndex);
-    REQUIRE_FULL_BLITTER_OR_SKIP(device->getRootDeviceEnvironment());
-    MockClDevice clDevice(device);
-    auto cmdQ = createCommandQueue(&clDevice);
+    auto cmdQ = createCommandQueue(pClDevice);
+    auto initialCsrTaskCount = cmdQ->getGpgpuCommandStreamReceiver().peekTaskCount();
+    auto bcsCsr = cmdQ->getBcsCommandStreamReceiver(aub_stream::EngineType::ENGINE_BCS);
+    ASSERT_NE(nullptr, bcsCsr);
+    auto initialBcsCsrTaskCount = bcsCsr->peekTaskCount();
     EXPECT_EQ(cmdQ->taskCount, 0u);
-    EXPECT_EQ(cmdQ->getGpgpuCommandStreamReceiver().peekTaskCount(), 0u);
     EXPECT_EQ(cmdQ->peekBcsTaskCount(aub_stream::EngineType::ENGINE_BCS), 0u);
     auto buffer = std::unique_ptr<Buffer>(BufferHelper<>::create());
 
     for (auto &thread : threads) {
-        thread = std::async(std::launch::async, [&]() {
+        thread = std::thread([&]() {
             auto alignedReadPtr = alignedMalloc(BufferDefaults::sizeInBytes, MemoryConstants::cacheLineSize);
             barrier.fetch_sub(1u);
             while (barrier.load() != 0u) {
@@ -270,12 +313,12 @@ TEST_F(IOQTaskTestsMt, givenBlitterWhenCopyUsingMultipleThreadsThenSuccessReturn
         });
     }
     for (auto &thread : threads) {
-        thread.get();
+        thread.join();
     }
 
     EXPECT_EQ(cmdQ->taskCount, 0u);
-    EXPECT_EQ(cmdQ->getGpgpuCommandStreamReceiver().peekTaskCount(), 0u);
-    EXPECT_EQ(cmdQ->peekBcsTaskCount(aub_stream::EngineType::ENGINE_BCS), numThreads);
+    EXPECT_EQ(cmdQ->getGpgpuCommandStreamReceiver().peekTaskCount(), initialCsrTaskCount);
+    EXPECT_EQ(cmdQ->peekBcsTaskCount(aub_stream::EngineType::ENGINE_BCS), initialBcsCsrTaskCount + numThreads);
 
     clReleaseCommandQueue(cmdQ);
 }

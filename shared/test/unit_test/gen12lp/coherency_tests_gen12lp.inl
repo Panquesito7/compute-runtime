@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/command_stream_receiver_hw.h"
+#include "shared/source/gen12lp/hw_cmds_base.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
@@ -24,7 +25,11 @@ struct Gen12LpCoherencyRequirements : public ::testing::Test {
     struct MyCsr : public CommandStreamReceiverHw<Gen12LpFamily> {
         using CommandStreamReceiver::commandStream;
         using CommandStreamReceiver::streamProperties;
-        MyCsr(ExecutionEnvironment &executionEnvironment) : CommandStreamReceiverHw<Gen12LpFamily>(executionEnvironment, 0, 1){};
+        MyCsr(ExecutionEnvironment &executionEnvironment) : CommandStreamReceiverHw<Gen12LpFamily>(executionEnvironment, 0, 1) {};
+        MyCsr(ExecutionEnvironment &executionEnvironment,
+              int32_t rootDeviceIndex,
+              const DeviceBitfield deviceBitfield)
+            : CommandStreamReceiverHw<Gen12LpFamily>(executionEnvironment, rootDeviceIndex, deviceBitfield) {};
         CsrSizeRequestFlags *getCsrRequestFlags() { return &csrSizeRequestFlags; }
     };
 
@@ -34,7 +39,6 @@ struct Gen12LpCoherencyRequirements : public ::testing::Test {
 
     void overrideCoherencyRequest(bool reqestChanged, bool requireCoherency, bool hasSharedHandles) {
         csr->getCsrRequestFlags()->hasSharedHandles = hasSharedHandles;
-        flags.requiresCoherency = requireCoherency;
         csr->streamProperties.stateComputeMode.isCoherencyRequired.value = requireCoherency;
         csr->streamProperties.stateComputeMode.isCoherencyRequired.isDirty = reqestChanged;
         if (hasSharedHandles) {
@@ -43,12 +47,15 @@ struct Gen12LpCoherencyRequirements : public ::testing::Test {
     }
 
     void SetUp() override {
-        device.reset(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
-        csr = new MyCsr(*device->executionEnvironment);
-        device->resetCommandStreamReceiver(csr);
-        AllocationProperties properties(device->getRootDeviceIndex(), false, MemoryConstants::pageSize, AllocationType::SHARED_BUFFER, false, {});
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MyCsr>();
 
-        alloc = device->getMemoryManager()->createGraphicsAllocationFromSharedHandle(static_cast<osHandle>(123), properties, false, false, true, nullptr);
+        device.reset(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+        csr = static_cast<MyCsr *>(&device->getGpgpuCommandStreamReceiver());
+        AllocationProperties properties(device->getRootDeviceIndex(), false, MemoryConstants::pageSize, AllocationType::sharedBuffer, false, {});
+
+        MemoryManager::OsHandleData osHandleData{123u};
+        alloc = device->getMemoryManager()->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
     }
 
     void TearDown() override {
@@ -142,17 +149,6 @@ GEN12LPTEST_F(Gen12LpCoherencyRequirements, GivenNoSharedHandlesThenCoherencyCmd
 
     auto scmCmd = reinterpret_cast<char *>(stream.getCpuBase());
     EXPECT_TRUE(memcmp(&expectedScmCmd, scmCmd + cmdsSizeWABeginOffset, sizeof(STATE_COMPUTE_MODE)) == 0);
-
-    auto startOffset = stream.getUsed();
-
-    overrideCoherencyRequest(true, true, false);
-    csr->programComputeMode(stream, flags, *defaultHwInfo);
-    EXPECT_EQ(cmdsSize * 2, stream.getUsed());
-
-    expectedScmCmd.setForceNonCoherent(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_DISABLED);
-    expectedScmCmd.setMaskBits(FamilyType::stateComputeModeForceNonCoherentMask);
-    scmCmd = reinterpret_cast<char *>(ptrOffset(stream.getCpuBase(), startOffset));
-    EXPECT_TRUE(memcmp(&expectedScmCmd, scmCmd + cmdsSizeWABeginOffset, sizeof(STATE_COMPUTE_MODE)) == 0);
 }
 
 GEN12LPTEST_F(Gen12LpCoherencyRequirements, GivenSharedHandlesThenCoherencyCmdValuesAreCorrect) {
@@ -187,20 +183,6 @@ GEN12LPTEST_F(Gen12LpCoherencyRequirements, GivenSharedHandlesThenCoherencyCmdVa
 
     auto pcCmd = reinterpret_cast<char *>(ptrOffset(stream.getCpuBase(), sizeof(STATE_COMPUTE_MODE)));
     EXPECT_TRUE(memcmp(&expectedPcCmd, pcCmd + cmdsSizeWABeginOffset, sizeof(PIPE_CONTROL)) == 0);
-
-    auto startOffset = stream.getUsed();
-
-    overrideCoherencyRequest(true, true, true);
-    csr->programComputeMode(stream, flags, *defaultHwInfo);
-    EXPECT_EQ(cmdsSize * 2, stream.getUsed());
-
-    expectedScmCmd.setForceNonCoherent(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_DISABLED);
-    expectedScmCmd.setMaskBits(FamilyType::stateComputeModeForceNonCoherentMask);
-    scmCmd = reinterpret_cast<char *>(ptrOffset(stream.getCpuBase(), startOffset));
-    EXPECT_TRUE(memcmp(&expectedScmCmd, scmCmd + cmdsSizeWABeginOffset, sizeof(STATE_COMPUTE_MODE)) == 0);
-
-    pcCmd = reinterpret_cast<char *>(ptrOffset(stream.getCpuBase(), startOffset + sizeof(STATE_COMPUTE_MODE)));
-    EXPECT_TRUE(memcmp(&expectedPcCmd, pcCmd + cmdsSizeWABeginOffset, sizeof(PIPE_CONTROL)) == 0);
 }
 
 GEN12LPTEST_F(Gen12LpCoherencyRequirements, givenCoherencyRequirementWithoutSharedHandlesWhenFlushTaskCalledThenProgramCmdOnlyIfChanged) {
@@ -210,7 +192,6 @@ GEN12LPTEST_F(Gen12LpCoherencyRequirements, givenCoherencyRequirementWithoutShar
     IndirectHeap stream(graphicAlloc);
 
     auto flushTask = [&](bool coherencyRequired) {
-        flags.requiresCoherency = coherencyRequired;
         startOffset = csr->commandStream.getUsed();
         csr->flushTask(stream, 0, &stream, &stream, &stream, 0, flags, *device);
     };
@@ -254,7 +235,6 @@ GEN12LPTEST_F(Gen12LpCoherencyRequirements, givenSharedHandlesWhenFlushTaskCalle
     IndirectHeap stream(graphicsAlloc);
 
     auto flushTask = [&](bool coherencyRequired) {
-        flags.requiresCoherency = coherencyRequired;
         makeResidentSharedAlloc();
 
         startOffset = csr->commandStream.getUsed();

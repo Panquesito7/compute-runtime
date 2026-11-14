@@ -1,0 +1,322 @@
+/*
+ * Copyright (C) 2019-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/compiler_interface/default_cache_config.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/os_interface/sys_calls_common.h"
+#include "shared/source/os_interface/windows/sys_calls.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/stream_capture.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/test_macros/test.h"
+
+namespace NEO {
+
+namespace SysCalls {
+extern const size_t getLastErrorResultCount;
+extern size_t getLastErrorCalled;
+extern DWORD getLastErrorResults[];
+extern BOOL getLastErrorOneResult;
+
+extern size_t createDirectoryACalled;
+extern BOOL createDirectoryAResult;
+
+extern HRESULT shGetKnownFolderPathResult;
+extern const size_t shGetKnownFolderSetPathSize;
+extern wchar_t shGetKnownFolderSetPath[];
+
+extern DWORD getFileAttributesResult;
+extern std::unordered_map<std::string, DWORD> pathAttributes;
+} // namespace SysCalls
+
+struct ClCacheDefaultConfigWindowsTest : public ::testing::Test {
+    ClCacheDefaultConfigWindowsTest()
+        : getLastErrorCalledBackup(&SysCalls::getLastErrorCalled),
+          shGetKnownFolderPathResultBackup(&SysCalls::shGetKnownFolderPathResult),
+          createDirectoryACalledBackup(&SysCalls::createDirectoryACalled),
+          createDirectoryAResultBackup(&SysCalls::createDirectoryAResult) {}
+
+    void SetUp() override {
+        SysCalls::createDirectoryACalled = 0u;
+        SysCalls::getLastErrorCalled = 0u;
+    }
+
+    void TearDown() override {
+        for (size_t i = 0; i < SysCalls::getLastErrorResultCount; i++) {
+            SysCalls::getLastErrorResults[i] = 0;
+        }
+        std::wmemset(SysCalls::shGetKnownFolderSetPath, 0, SysCalls::shGetKnownFolderSetPathSize);
+        SysCalls::pathAttributes.clear();
+    }
+
+  protected:
+    DebugManagerStateRestore restorer;
+
+    VariableBackup<size_t> getLastErrorCalledBackup;
+    VariableBackup<HRESULT> shGetKnownFolderPathResultBackup;
+    VariableBackup<size_t> createDirectoryACalledBackup;
+    VariableBackup<BOOL> createDirectoryAResultBackup;
+};
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenAllEnvVarWhenProperlySetThenCorrectConfigIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+    debugManager.flags.EnvCacheDir.set("ult\\directory\\");
+
+    DWORD getFileAttributesResultMock = FILE_ATTRIBUTE_DIRECTORY;
+    VariableBackup<DWORD> pathExistsMockBackup(&NEO::SysCalls::getFileAttributesResult, getFileAttributesResultMock);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, 22u);
+    EXPECT_EQ(cacheConfig.cacheDir, "ult\\directory\\");
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenNonExistingPathWhenGetCompilerCacheConfigThenConfigWithDisabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+    debugManager.flags.EnvCacheDir.set("ult\\directory\\");
+
+    DWORD getFileAttributesResultMock = INVALID_FILE_ATTRIBUTES;
+    VariableBackup<DWORD> pathExistsMockBackup(&NEO::SysCalls::getFileAttributesResult, getFileAttributesResultMock);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    EXPECT_FALSE(cacheConfig.enabled);
+    EXPECT_TRUE(cacheConfig.cacheDir.empty());
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenLocalAppDataCachePathSetWhenGetCompilerCacheConfigThenConfigWithEnabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO"] = FILE_ATTRIBUTE_DIRECTORY;
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache"] = FILE_ATTRIBUTE_DIRECTORY;
+
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    const std::string expectedCacheDirPath = "C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache";
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, 22u);
+    EXPECT_EQ(cacheConfig.cacheDir, expectedCacheDirPath);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenNeoCacheDirNotSetAndLocalAppDataCachePathNotSetWhenGetCompilerCacheConfigThenConfigWithDisabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::shGetKnownFolderPathResult = S_FALSE;
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    EXPECT_FALSE(cacheConfig.enabled);
+    EXPECT_TRUE(cacheConfig.cacheDir.empty());
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenLocalAppDataSetAndNonExistingNeoDirectoryWhenGetCompilerCacheConfigThenNeoDirectoryIsCreatedAndConfigWithEnabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache"] = FILE_ATTRIBUTE_DIRECTORY;
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    const std::string expectedCacheDirPath = "C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache";
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, 22u);
+    EXPECT_EQ(cacheConfig.cacheDir, expectedCacheDirPath);
+    EXPECT_EQ(1u, SysCalls::createDirectoryACalled);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenLocalAppDataSetAndNonExistingNeoDirectoryWhenGetCompilerCacheConfigAndNeoDirCreationFailsThenConfigWithDisabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache"] = FILE_ATTRIBUTE_DIRECTORY;
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+    SysCalls::createDirectoryAResult = FALSE;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    EXPECT_FALSE(cacheConfig.enabled);
+    EXPECT_TRUE(cacheConfig.cacheDir.empty());
+    EXPECT_EQ(1u, SysCalls::createDirectoryACalled);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenLocalAppDataSetAndNonExistingNeoCompilerCacheDirectoryWhenGetCompilerCacheConfigThenNeoCompilerCacheDirectoryIsCreatedAndConfigWithEnabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO"] = FILE_ATTRIBUTE_DIRECTORY;
+
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    const std::string expectedCacheDirPath = "C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache";
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, 22u);
+    EXPECT_EQ(cacheConfig.cacheDir, expectedCacheDirPath);
+    EXPECT_EQ(1u, SysCalls::createDirectoryACalled);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenLocalAppDataSetAndNonExistingNeoCompilerCacheDirectoryWhenGetCompilerCacheConfigAndDirectoryCreationFailsThenConfigWithDisabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO"] = FILE_ATTRIBUTE_DIRECTORY;
+
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+    SysCalls::createDirectoryAResult = FALSE;
+    SysCalls::getLastErrorResults[0] = ERROR_ALREADY_EXISTS + 1;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    EXPECT_FALSE(cacheConfig.enabled);
+    EXPECT_TRUE(cacheConfig.cacheDir.empty());
+    EXPECT_EQ(1u, SysCalls::createDirectoryACalled);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenLocalAppDataSetWhenGetCompilerCacheConfigAndNeoCompilerCacheDirectoryAlreadyExistsThenConfigWithEnabledCacheIsReturned) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+
+    SysCalls::pathAttributes["C:\\Users\\user1\\AppData\\Local\\NEO"] = FILE_ATTRIBUTE_DIRECTORY;
+
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+    SysCalls::createDirectoryAResult = FALSE;
+    SysCalls::getLastErrorResults[0] = ERROR_ALREADY_EXISTS;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    const std::string expectedCacheDirPath = "C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache";
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, 22u);
+    EXPECT_EQ(cacheConfig.cacheDir, expectedCacheDirPath);
+    EXPECT_EQ(1u, SysCalls::createDirectoryACalled);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenCacheMaxSizeSetTo0WhenGetDefaultConfigThenCacheSizeIsSetToMaxSize) {
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(0);
+    debugManager.flags.EnvCacheDir.set("ult\\directory\\");
+
+    SysCalls::pathAttributes["ult\\directory\\"] = FILE_ATTRIBUTE_DIRECTORY;
+
+    auto cacheConfig = getDefaultCompilerCacheConfig();
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, std::numeric_limits<size_t>::max());
+    EXPECT_EQ(cacheConfig.cacheDir, "ult\\directory\\");
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenCachePathExistsAndNoEnvVarsSetWhenGetDefaultCompilerCacheConfigThenCacheIsEnabled) {
+    DWORD getFileAttributesResultMock = FILE_ATTRIBUTE_DIRECTORY;
+    VariableBackup<DWORD> pathExistsMockBackup(&NEO::SysCalls::getFileAttributesResult, getFileAttributesResultMock);
+
+    SysCalls::shGetKnownFolderPathResult = S_OK;
+
+    const wchar_t *localAppDataPath = L"C:\\Users\\user1\\AppData\\Local";
+    wcscpy(SysCalls::shGetKnownFolderSetPath, localAppDataPath);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    const std::string expectedCacheDirPath = "C:\\Users\\user1\\AppData\\Local\\NEO\\neo_compiler_cache";
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheFileExtension, ApiSpecificConfig::compilerCacheFileExtension().c_str());
+    EXPECT_EQ(cacheConfig.cacheSize, static_cast<size_t>(MemoryConstants::gigaByte));
+    EXPECT_EQ(cacheConfig.cacheDir, expectedCacheDirPath);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenNeoCachePersistentSetToZeroWhenGetDefaultCompilerCacheConfigThenCacheIsDisabled) {
+    debugManager.flags.EnvCachePersistent.set(0);
+
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+
+    EXPECT_FALSE(cacheConfig.enabled);
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenPrintDebugMessagesWhenCacheIsEnabledThenMessageWithPathIsPrintedToStdout) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.PrintDebugMessages.set(true);
+
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+    debugManager.flags.EnvCacheDir.set("ult\\directory\\");
+
+    DWORD getFileAttributesResultMock = FILE_ATTRIBUTE_DIRECTORY;
+    VariableBackup<DWORD> pathExistsMockBackup(&NEO::SysCalls::getFileAttributesResult, getFileAttributesResultMock);
+
+    StreamCapture capture;
+    capture.captureStdout();
+    auto cacheConfig = NEO::getDefaultCompilerCacheConfig();
+    std::string output = capture.getCapturedStdout();
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_STREQ(output.c_str(), "NEO_CACHE_PERSISTENT is enabled. Cache is located in: ult\\directory\\\n\n");
+}
+
+TEST_F(ClCacheDefaultConfigWindowsTest, GivenIgcEnvVarSetThenCacheConfigRemainsEnabled) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.PrintDebugMessages.set(false);
+
+    debugManager.flags.EnvCachePersistent.set(1);
+    debugManager.flags.EnvCacheMaxSize.set(22);
+    debugManager.flags.EnvCacheDir.set("ult\\directory\\");
+    DWORD getFileAttributesResultMock = FILE_ATTRIBUTE_DIRECTORY;
+    VariableBackup<DWORD> pathExistsMockBackup(&SysCalls::getFileAttributesResult, getFileAttributesResultMock);
+    wchar_t envBlockNoIgc[] = L"NEO_CACHE_PERSISTENT=1\0NEO_CACHE_MAX_SIZE=22\0NEO_CACHE_DIR=ult\\directory\\\0\0";
+    VariableBackup<LPWCH> mockEnvStringsWBackup(&SysCalls::mockEnvStringsW, envBlockNoIgc);
+
+    auto cacheConfig = getDefaultCompilerCacheConfig();
+
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheDir, "ult\\directory\\");
+
+    wchar_t envBlockWithIgc[] = L"IGC_DEBUG=1\0NEO_CACHE_PERSISTENT=1\0NEO_CACHE_MAX_SIZE=22\0NEO_CACHE_DIR=ult\\directory\\\0\0";
+    SysCalls::mockEnvStringsW = envBlockWithIgc;
+
+    cacheConfig = getDefaultCompilerCacheConfig();
+    EXPECT_TRUE(cacheConfig.enabled);
+    EXPECT_EQ(cacheConfig.cacheDir, "ult\\directory\\");
+}
+
+} // namespace NEO

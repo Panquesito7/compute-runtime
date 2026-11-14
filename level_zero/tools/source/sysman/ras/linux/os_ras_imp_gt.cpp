@@ -1,55 +1,78 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
 
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
-#include "level_zero/tools/source/sysman/ras/linux/os_ras_imp_prelim.h"
+#include "level_zero/tools/source/sysman/linux/pmu/pmu.h"
+#include "level_zero/tools/source/sysman/ras/linux/os_ras_imp.h"
 #include "level_zero/tools/source/sysman/sysman_imp.h"
 
+#include <algorithm>
+#include <linux/perf_event.h>
+#include <sstream>
+
 namespace L0 {
-static const std::map<zes_ras_error_cat_t, std::vector<std::string>> categoryToListOfEventsUncorrectable = {
-    {ZES_RAS_ERROR_CAT_CACHE_ERRORS,
+
+static const std::map<zes_ras_error_category_exp_t, std::vector<std::string>> categoryToListOfEventsUncorrectable = {
+    {ZES_RAS_ERROR_CATEGORY_EXP_CACHE_ERRORS,
      {"fatal-array-bist", "fatal-idi-parity", "fatal-l3-double",
       "fatal-l3-ecc-checker",
       "fatal-sqidi", "fatal-tlb", "fatal-l3bank"}},
-    {ZES_RAS_ERROR_CAT_RESET,
+    {ZES_RAS_ERROR_CATEGORY_EXP_RESET,
      {"engine-reset"}},
-    {ZES_RAS_ERROR_CAT_PROGRAMMING_ERRORS,
+    {ZES_RAS_ERROR_CATEGORY_EXP_PROGRAMMING_ERRORS,
      {"eu-attention"}},
-    {ZES_RAS_ERROR_CAT_NON_COMPUTE_ERRORS,
+    {ZES_RAS_ERROR_CATEGORY_EXP_NON_COMPUTE_ERRORS,
      {"soc-fatal-psf-0", "soc-fatal-psf-1", "soc-fatal-psf-2", "soc-fatal-psf-csc-0",
       "soc-fatal-psf-csc-1", "soc-fatal-psf-csc-2", "soc-fatal-punit",
       "sgunit-fatal", "soc-nonfatal-punit", "sgunit-fatal", "sgunit-nonfatal", "gsc-nonfatal-mia-shutdown",
       "gsc-nonfatal-aon-parity", "gsc-nonfatal-rom-parity", "gsc-nonfatal-fuse-crc-check",
       "gsc-nonfatal-selfmbist", "gsc-nonfatal-fuse-pull", "gsc-nonfatal-sram-ecc", "gsc-nonfatal-glitch-det",
-      "gsc-nonfatal-ucode-parity", "gsc-nonfatal-mia-int", "gsc-nonfatal-wdg-timeout"}},
-    {ZES_RAS_ERROR_CAT_COMPUTE_ERRORS,
+      "gsc-nonfatal-ucode-parity", "gsc-nonfatal-mia-int", "gsc-nonfatal-wdg-timeout",
+      "soc-nonfatal-mdfi-east", "soc-nonfatal-mdfi-south",
+      "soc-nonfatal-cd0-mdfi", "soc-fatal-iosf-pciaer", "soc-fatal-iosf-pcierr", "soc-fatal-pciaer",
+      "soc-fatal-pcierr", "soc-fatal-serr-spi", "soc-fatal-serr-srcs", "soc-fatal-ur-response", "soc-fatal-ur",
+      "soc-fatal-hbm-mca", "soc-fatal-hbm-punit-mca"}},
+    {ZES_RAS_ERROR_CATEGORY_EXP_COMPUTE_ERRORS,
      {"fatal-fpu", "fatal-eu-grf", "fatal-sampler", "fatal-slm",
       "fatal-guc", "fatal-eu-ic", "fatal-subslice"}},
-    {ZES_RAS_ERROR_CAT_DRIVER_ERRORS,
+    {ZES_RAS_ERROR_CATEGORY_EXP_DRIVER_ERRORS,
      {"driver-object-migration", "driver-engine-other", "driver-ggtt",
       "driver-gt-interrupt", "driver-gt-other", "driver-guc-communication",
-      "driver-rps"}}};
+      "driver-rps"}},
+    {ZES_RAS_ERROR_CATEGORY_EXP_L3FABRIC_ERRORS,
+     {"soc-fatal-mdfi-east", "soc-fatal-mdfi-south", "soc-fatal-mdfi-west", "fatal-l3-fabric", "soc-fatal-cd0-mdfi"}}};
 
-static const std::map<zes_ras_error_cat_t, std::vector<std::string>> categoryToListOfEventsCorrectable = {
-    {ZES_RAS_ERROR_CAT_CACHE_ERRORS,
+static const std::map<zes_ras_error_category_exp_t, std::vector<std::string>> categoryToListOfEventsCorrectable = {
+    {ZES_RAS_ERROR_CATEGORY_EXP_CACHE_ERRORS,
      {"correctable-l3-sng", "correctable-l3bank"}},
-    {ZES_RAS_ERROR_CAT_NON_COMPUTE_ERRORS,
+    {ZES_RAS_ERROR_CATEGORY_EXP_NON_COMPUTE_ERRORS,
      {"sgunit-correctable", "gsc-correctable-sram-ecc"}},
-    {ZES_RAS_ERROR_CAT_COMPUTE_ERRORS,
+    {ZES_RAS_ERROR_CATEGORY_EXP_COMPUTE_ERRORS,
      {"correctable-eu-grf", "correctable-eu-ic", "correctable-guc", "correctable-sampler", "correctable-slm", "correctable-subslice"}}};
 
 static void closeFd(int64_t &fd) {
     if (fd != -1) {
-        close(static_cast<int>(fd));
+        NEO::SysCalls::close(static_cast<int>(fd));
         fd = -1;
     }
 }
+
+static const std::map<zes_ras_error_category_exp_t, zes_ras_error_cat_t> rasErrorCatExpToErrorCat = {
+    {ZES_RAS_ERROR_CATEGORY_EXP_CACHE_ERRORS, ZES_RAS_ERROR_CAT_CACHE_ERRORS},
+    {ZES_RAS_ERROR_CATEGORY_EXP_RESET, ZES_RAS_ERROR_CAT_RESET},
+    {ZES_RAS_ERROR_CATEGORY_EXP_PROGRAMMING_ERRORS, ZES_RAS_ERROR_CAT_PROGRAMMING_ERRORS},
+    {ZES_RAS_ERROR_CATEGORY_EXP_NON_COMPUTE_ERRORS, ZES_RAS_ERROR_CAT_NON_COMPUTE_ERRORS},
+    {ZES_RAS_ERROR_CATEGORY_EXP_COMPUTE_ERRORS, ZES_RAS_ERROR_CAT_COMPUTE_ERRORS},
+    {ZES_RAS_ERROR_CATEGORY_EXP_DRIVER_ERRORS, ZES_RAS_ERROR_CAT_DRIVER_ERRORS},
+    {ZES_RAS_ERROR_CATEGORY_EXP_DISPLAY_ERRORS, ZES_RAS_ERROR_CAT_DISPLAY_ERRORS}};
 
 static ze_result_t readI915EventsDirectory(LinuxSysmanImp *pLinuxSysmanImp, std::vector<std::string> &listOfEvents, std::string *eventDirectory) {
     // To know how many errors are supported on a platform scan
@@ -62,7 +85,7 @@ static ze_result_t readI915EventsDirectory(LinuxSysmanImp *pLinuxSysmanImp, std:
     std::string bdfDir;
     ze_result_t result = pSysfsAccess->readSymLink(deviceDir, bdfDir);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Symlink from %s and returning error:0x%x \n", __FUNCTION__, deviceDir.c_str(), ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Symlink from %s and returning error:0x%x \n", NEO_FUNCTION_NAME, deviceDir.c_str(), ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
     const auto loc = bdfDir.find_last_of('/');
@@ -76,7 +99,7 @@ static ze_result_t readI915EventsDirectory(LinuxSysmanImp *pLinuxSysmanImp, std:
     FsAccess *pFsAccess = &pLinuxSysmanImp->getFsAccess();
     result = pFsAccess->listDirectory(sysfsNode, listOfEvents);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to list directories from %s and returning error:0x%x \n", __FUNCTION__, sysfsNode.c_str(), ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to list directories from %s and returning error:0x%x \n", NEO_FUNCTION_NAME, sysfsNode.c_str(), ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
     return ZE_RESULT_SUCCESS;
@@ -91,7 +114,7 @@ static uint64_t convertHexToUint64(std::string strVal) {
     return config;
 }
 
-static bool getErrorType(std::map<zes_ras_error_cat_t, std::vector<std::string>> categoryToListOfEvents, std::vector<std::string> &eventList, ze_device_handle_t deviceHandle) {
+static bool getErrorType(std::map<zes_ras_error_category_exp_t, std::vector<std::string>> categoryToListOfEvents, std::vector<std::string> &eventList, ze_device_handle_t deviceHandle) {
     ze_bool_t onSubDevice = false;
     uint32_t subDeviceId = 0;
     SysmanDeviceImp::getSysmanDeviceInfo(deviceHandle, subDeviceId, onSubDevice, true);
@@ -147,9 +170,8 @@ void LinuxRasSourceGt::getSupportedRasErrorTypes(std::set<zes_ras_error_type_t> 
 ze_result_t LinuxRasSourceGt::osRasGetState(zes_ras_state_t &state, ze_bool_t clear) {
     if (clear == true) {
         closeFds();
-        totalEventCount = 0;
         memset(state.category, 0, maxRasErrorCategoryCount * sizeof(uint64_t));
-        memset(initialErrorCount, 0, maxRasErrorCategoryCount * sizeof(uint64_t));
+        memset(initialErrorCount, 0, maxRasErrorCategoryExpCount * sizeof(uint64_t));
     }
     initRasErrors(clear);
     // Iterate over all the file descriptor values present in vector which is mapped to given ras error category
@@ -158,20 +180,19 @@ ze_result_t LinuxRasSourceGt::osRasGetState(zes_ras_state_t &state, ze_bool_t cl
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
 
-    std::map<zes_ras_error_cat_t, std::vector<std::string>> categoryToEvent;
-    if (osRasErrorType == ZES_RAS_ERROR_TYPE_CORRECTABLE) {
-        categoryToEvent = categoryToListOfEventsCorrectable;
-    }
-    if (osRasErrorType == ZES_RAS_ERROR_TYPE_UNCORRECTABLE) {
-        categoryToEvent = categoryToListOfEventsUncorrectable;
-    }
-    std::vector<std::uint64_t> data(2 + totalEventCount, 0); // In data[], event count starts from second index, first value gives number of events and second value is for timestamp
+    auto numEvents = memberFds.size() + 1;             // Add 1 for group Fd
+    std::vector<std::uint64_t> data(2 + numEvents, 0); // In data[], event count starts from second index, first value gives number of events and second value is for timestamp
     if (pPmuInterface->pmuRead(static_cast<int>(groupFd), data.data(), sizeof(uint64_t) * data.size()) < 0) {
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
     /* The data buffer retrieved after reading pmu counters is parsed to get the error count for each suberror category */
     uint64_t initialIndex = 2; // Initial index in the buffer from which the data be parsed begins
     for (auto errorCat = errorCategoryToEventCount.begin(); errorCat != errorCategoryToEventCount.end(); errorCat++) {
+        auto errorCategory = rasErrorCatExpToErrorCat.find(errorCat->first);
+        if (errorCategory == rasErrorCatExpToErrorCat.end()) {
+            initialIndex += errorCat->second;
+            continue;
+        }
         uint64_t errorCount = 0;
         uint64_t j = 0;
         for (; j < errorCat->second; j++) {
@@ -184,6 +205,99 @@ ze_result_t LinuxRasSourceGt::osRasGetState(zes_ras_state_t &state, ze_bool_t cl
     return ZE_RESULT_SUCCESS;
 }
 
+ze_result_t LinuxRasSourceGt::osRasGetStateExp(uint32_t numCategoriesRequested, zes_ras_state_exp_t *pState) {
+    initRasErrors(false);
+    // Iterate over all the file descriptor values present in vector which is mapped to given ras error category
+    // Use the file descriptors to read pmu counters and add all the errors corresponding to the ras error category
+    if (groupFd < 0) {
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    auto numEvents = memberFds.size() + 1;             // Add 1 for group Fd
+    std::vector<std::uint64_t> data(2 + numEvents, 0); // In data[], event count starts from second index, first value gives number of events and second value is for timestamp
+    if (pPmuInterface->pmuRead(static_cast<int>(groupFd), data.data(), sizeof(uint64_t) * data.size()) < 0) {
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    /* The data buffer retrieved after reading pmu counters is parsed to get the error count for each suberror category */
+    uint64_t initialIndex = 2; // Initial index in the buffer from which the data be parsed begins
+    uint32_t categoryIdx = 0u;
+    for (auto errorCat = errorCategoryToEventCount.begin(); (errorCat != errorCategoryToEventCount.end()) && (categoryIdx < numCategoriesRequested); errorCat++) {
+        uint64_t errorCount = 0;
+        uint64_t j = 0;
+        for (; j < errorCat->second; j++) {
+            errorCount += data[initialIndex + j];
+        }
+        pState[categoryIdx].category = errorCat->first;
+        pState[categoryIdx].errorCounter = errorCount + initialErrorCount[errorCat->first];
+        initialIndex += j;
+        categoryIdx++;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t LinuxRasSourceGt::osRasGetStateExp2(const uint32_t categoryCount, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) {
+    initRasErrors(false);
+    if (groupFd < 0) {
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    auto numEvents = memberFds.size() + 1;
+    std::vector<std::uint64_t> data(2 + numEvents, 0);
+    if (pPmuInterface->pmuRead(static_cast<int>(groupFd), data.data(), sizeof(uint64_t) * data.size()) < 0) {
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    // Build category->errorCounter lookup from ordered errorCategoryToEventCount
+    std::map<zes_ras_error_category_exp_t, uint64_t> categoryToCounter;
+    uint64_t initialIndex = 2;
+    for (auto const &catEventCount : errorCategoryToEventCount) {
+        uint64_t errorCount = 0;
+        for (uint64_t j = 0; j < catEventCount.second; j++) {
+            errorCount += data[initialIndex + j];
+        }
+        categoryToCounter[catEventCount.first] = errorCount + initialErrorCount[catEventCount.first];
+        initialIndex += catEventCount.second;
+    }
+
+    for (uint32_t i = 0; i < categoryCount; i++) {
+        auto it = categoryToCounter.find(pCategories[i]);
+        pStates[i].errorCounter = (it != categoryToCounter.end()) ? it->second : 0u;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t LinuxRasSourceGt::osRasClearStateExp(zes_ras_error_category_exp_t category) {
+    ze_result_t result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    // check requested category is already initialized
+    if (errorCategoryToEventCount.contains(category)) {
+        closeFds();
+        clearStatus |= (1 << category);
+        initialErrorCount[category] = 0;
+        result = ZE_RESULT_SUCCESS;
+    }
+    return result;
+}
+
+uint32_t LinuxRasSourceGt::osRasGetCategoryCount() {
+    if (osRasErrorType == ZES_RAS_ERROR_TYPE_UNCORRECTABLE) {
+        return static_cast<uint32_t>(categoryToListOfEventsUncorrectable.size());
+    }
+    return static_cast<uint32_t>(categoryToListOfEventsCorrectable.size());
+}
+
+std::vector<zes_ras_error_category_exp_t> LinuxRasSourceGt::getSupportedErrorCategories(zes_ras_error_type_t errorType) {
+    std::vector<zes_ras_error_category_exp_t> categories;
+    const auto &categoryMap = errorType == ZES_RAS_ERROR_TYPE_UNCORRECTABLE ? categoryToListOfEventsUncorrectable : categoryToListOfEventsCorrectable;
+
+    for (const auto &entry : categoryMap) {
+        categories.push_back(entry.first);
+    }
+    return categories;
+}
+
 ze_result_t LinuxRasSourceGt::getPmuConfig(
     const std::string &eventDirectory,
     const std::vector<std::string> &listOfEvents,
@@ -191,7 +305,7 @@ ze_result_t LinuxRasSourceGt::getPmuConfig(
     std::string &pmuConfig) {
     auto findErrorInList = std::find(listOfEvents.begin(), listOfEvents.end(), errorFileToGetConfig);
     if (findErrorInList == listOfEvents.end()) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to find %s from list of events and returning error:0x%x \n", __FUNCTION__, errorFileToGetConfig.c_str(), ZE_RESULT_ERROR_UNKNOWN);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to find %s from list of events and returning error:0x%x \n", NEO_FUNCTION_NAME, errorFileToGetConfig.c_str(), ZE_RESULT_ERROR_UNKNOWN);
         return ZE_RESULT_ERROR_UNKNOWN;
     }
     return pFsAccess->read(eventDirectory + "/" + errorFileToGetConfig, pmuConfig);
@@ -218,7 +332,7 @@ void LinuxRasSourceGt::initRasErrors(ze_bool_t clear) {
     if (result != ZE_RESULT_SUCCESS) {
         return;
     }
-    std::map<zes_ras_error_cat_t, std::vector<std::string>> categoryToListOfEvents;
+    std::map<zes_ras_error_category_exp_t, std::vector<std::string>> categoryToListOfEvents;
     if (osRasErrorType == ZES_RAS_ERROR_TYPE_CORRECTABLE) {
         categoryToListOfEvents = categoryToListOfEventsCorrectable;
     }
@@ -249,7 +363,7 @@ void LinuxRasSourceGt::initRasErrors(ze_bool_t clear) {
                 errorPrefixLocal = "error--";
             }
             uint64_t initialErrorVal = 0;
-            if (clear == false) {
+            if ((clear == false) && (getAbsoluteCount(rasErrorCatToListOfEvents.first) == true)) {
                 result = getBootUpErrorCountFromSysfs(nameOfError, errorCounterDirLocal, initialErrorVal);
                 if (result != ZE_RESULT_SUCCESS) {
                     continue;
@@ -260,7 +374,7 @@ void LinuxRasSourceGt::initRasErrors(ze_bool_t clear) {
             if (result != ZE_RESULT_SUCCESS) {
                 continue;
             }
-            uint64_t config = convertHexToUint64(pmuConfig);
+            uint64_t config = convertHexToUint64(std::move(pmuConfig));
             if (groupFd == -1) {
                 groupFd = pPmuInterface->pmuInterfaceOpen(config, -1, PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_GROUP); // To get file descriptor of the group leader
                 if (groupFd < 0) {
@@ -273,9 +387,9 @@ void LinuxRasSourceGt::initRasErrors(ze_bool_t clear) {
             eventCount++;
             errorCount += initialErrorVal;
         }
+        clearStatus &= ~(1 << rasErrorCatToListOfEvents.first);
         initialErrorCount[rasErrorCatToListOfEvents.first] = errorCount;
         errorCategoryToEventCount[rasErrorCatToListOfEvents.first] = eventCount;
-        totalEventCount += eventCount;
     }
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,13 +9,15 @@
 #include "shared/source/aub/aub_helper.h"
 #include "shared/source/aub_mem_dump/aub_alloc_dump.h"
 #include "shared/source/aub_mem_dump/aub_alloc_dump.inl"
-#include "shared/source/aub_mem_dump/page_table_entry_bits.h"
 #include "shared/source/command_stream/aub_command_stream_receiver.h"
 #include "shared/source/command_stream/command_stream_receiver_with_aub_dump.h"
 #include "shared/source/command_stream/submission_status.h"
 #include "shared/source/command_stream/submissions_aggregator.h"
+#include "shared/source/command_stream/task_count_helper.h"
 #include "shared/source/command_stream/tbx_command_stream_receiver_hw.h"
+#include "shared/source/command_stream/wait_status.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/direct_submission/direct_submission_hw.h"
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/aligned_memory.h"
@@ -24,14 +26,28 @@
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/kmd_notify_properties.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/source/memory_manager/allocation_type.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
-#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/memory_manager/memory_operations_handler.h"
+#include "shared/source/page_fault_manager/cpu_page_fault_manager.h"
+#include "shared/source/utilities/shared_pool_allocation.h"
 
+#include <chrono>
+#include <cstdarg>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <type_traits>
 
 namespace NEO {
+
+template <typename GfxFamily>
+CpuPageFaultManager *TbxCommandStreamReceiverHw<GfxFamily>::getTbxPageFaultManager() {
+    return this->getMemoryManager()->getPageFaultManager();
+}
 
 template <typename GfxFamily>
 TbxCommandStreamReceiverHw<GfxFamily>::TbxCommandStreamReceiverHw(ExecutionEnvironment &executionEnvironment,
@@ -41,123 +57,164 @@ TbxCommandStreamReceiverHw<GfxFamily>::TbxCommandStreamReceiverHw(ExecutionEnvir
 
     forceSkipResourceCleanupRequired = true;
 
-    physicalAddressAllocator.reset(this->createPhysicalAddressAllocator(&this->peekHwInfo()));
+    const auto &releaseHelper = executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->getReleaseHelper();
+    physicalAddressAllocator.reset(this->createPhysicalAddressAllocator(&this->peekHwInfo(), releaseHelper));
     executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->initAubCenter(this->localMemoryEnabled, "", this->getType());
-    auto aubCenter = executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->aubCenter.get();
-    UNRECOVERABLE_IF(nullptr == aubCenter);
+    simulationAubCenter = executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->aubCenter.get();
+    UNRECOVERABLE_IF(nullptr == simulationAubCenter);
 
-    aubManager = aubCenter->getAubManager();
+    aubManager = simulationAubCenter->getAubManager();
+    allocationMemorySharedWithSimulator = simulationAubCenter->isAllocationMemorySharedWithSimulator();
 
     ppgtt = std::make_unique<std::conditional<is64bit, PML4, PDPE>::type>(physicalAddressAllocator.get());
     ggtt = std::make_unique<PDPE>(physicalAddressAllocator.get());
 
-    auto debugDeviceId = DebugManager.flags.OverrideAubDeviceId.get();
-    this->aubDeviceId = debugDeviceId == -1
-                            ? this->peekHwInfo().capabilityTable.aubDeviceId
-                            : static_cast<uint32_t>(debugDeviceId);
-    this->stream = &tbxStream;
-    this->downloadAllocationImpl = [this](GraphicsAllocation &graphicsAllocation) {
-        this->downloadAllocationTbx(graphicsAllocation);
+    this->downloadAllocationImpl = [this](GraphicsAllocation &graphicsAllocation, uint64_t chunkOffset, size_t chunkSize) {
+        this->downloadAllocationChunkTbx(graphicsAllocation, chunkOffset, chunkSize);
+    };
+
+    this->uploadAllocationChunkImpl = [this](GraphicsAllocation &graphicsAllocation, uint64_t chunkOffset, size_t chunkSize) {
+        this->writeAllocationWithAubManager(graphicsAllocation, true, chunkOffset, chunkSize);
     };
 }
 
 template <typename GfxFamily>
 TbxCommandStreamReceiverHw<GfxFamily>::~TbxCommandStreamReceiverHw() {
     this->downloadAllocationImpl = nullptr;
+}
 
-    if (streamInitialized) {
-        tbxStream.close();
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::writeAllocationWithAubManager(GraphicsAllocation &gfxAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) {
+    if (shareAllocationMemoryWithSimulator(gfxAllocation)) {
+        return;
+    }
+    this->writeMemoryWithAubManager(gfxAllocation, isChunkCopy, gpuVaChunkOffset, chunkSize);
+}
+
+template <typename GfxFamily>
+bool TbxCommandStreamReceiverHw<GfxFamily>::shareAllocationMemoryWithSimulator(GraphicsAllocation &gfxAllocation) {
+    if (!allocationMemorySharedWithSimulator) {
+        return false;
+    }
+    auto pageTablesLock = simulationAubCenter->obtainPageTablesLock();
+    if (gfxAllocation.isSimulationMemoryShared()) {
+        return true;
+    }
+    const bool isLocalMemory = gfxAllocation.isAllocatedInLocalMemoryPool();
+    if (gfxAllocation.isSimulationMemorySharingAttempted() || gfxAllocation.getDriverAllocatedCpuPtr() == nullptr || gfxAllocation.isCompressionEnabled() ||
+        (isLocalMemory && !this->isWrittenWithAubManager(gfxAllocation)) || isAllocTbxFaultable(&gfxAllocation)) {
+        return false;
     }
 
-    this->freeEngineInfo(gttRemap);
+    uint64_t gpuAddress = 0;
+    void *cpuAddress = nullptr;
+    size_t size = 0;
+    if (!this->getParametersForMemory(gfxAllocation, gpuAddress, cpuAddress, size)) {
+        return false;
+    }
+
+    const size_t gpuPageSize = gfxAllocation.getUsedPageSize();
+    const auto physicalPageSize = std::max(gpuPageSize, MemoryConstants::pageSize64k);
+    if (!isAligned(gpuAddress, physicalPageSize) || !isAligned(size, physicalPageSize) || !isAligned<MemoryConstants::pageSize>(cpuAddress)) {
+        return false;
+    }
+
+    auto allocationParams = this->createAllocationParams(gfxAllocation, gpuAddress, nullptr, size);
+    if (isLocalMemory && DeviceBitfield(allocationParams.memoryBanks).count() != 1) {
+        return false;
+    }
+    allocationParams.pageSize = physicalPageSize;
+    aub_stream::PhysicalAllocationInfo physicalAllocationInfo{};
+    gfxAllocation.setSimulationMemorySharingAttempted(true);
+    if (!aubManager->reserveOnlyPhysicalSpace(allocationParams, physicalAllocationInfo)) {
+        return false;
+    }
+
+    if (!aubManager->mapSystemMemoryToPhysicalAddress(physicalAllocationInfo.physicalAddress, size, MemoryConstants::pageSize, isLocalMemory, cpuAddress)) {
+        return false;
+    }
+
+    allocationParams.pageSize = std::min(gpuPageSize, physicalAllocationInfo.pageSize);
+    if (!aubManager->mapGpuVa2(physicalAllocationInfo.physicalAddress, allocationParams)) {
+        return false;
+    }
+    gfxAllocation.setSimulationMemoryShared(true);
+    this->getMemoryManager()->setNewResourceBoundOnRegisteredEngines(this->rootDeviceIndex);
+    return true;
+}
+
+template <typename GfxFamily>
+bool TbxCommandStreamReceiverHw<GfxFamily>::isAllocTbxFaultable(GraphicsAllocation *gfxAlloc) {
+    // indicates host memory not managed by the driver
+    if ((gfxAlloc->getDriverAllocatedCpuPtr() == nullptr) ||
+        (debugManager.isTbxPageFaultManagerEnabled() == false) ||
+        (this->getTbxPageFaultManager() == nullptr)) {
+        return false;
+    }
+    auto allocType = gfxAlloc->getAllocationType();
+
+    if (allocType == AllocationType::bufferHostMemory) {
+        return true;
+    }
+    return false;
+}
+
+template <typename GfxFamily>
+bool TbxCommandStreamReceiverHw<GfxFamily>::isAllocationModifiedByHost(GraphicsAllocation &gfxAllocation) {
+    return isAllocTbxFaultable(&gfxAllocation) && this->isTbxWritable(gfxAllocation);
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::registerAllocationWithTbxFaultMngrIfTbxFaultable(GraphicsAllocation *gfxAlloc, void *cpuAddress, size_t size) {
+    if (!isAllocTbxFaultable(gfxAlloc)) {
+        return;
+    }
+    auto bank = this->getMemoryBank(gfxAlloc);
+    if (bank == 0u || gfxAlloc->storageInfo.cloningOfPageTables) {
+        bank = GraphicsAllocation::defaultBank;
+    }
+    auto faultManager = getTbxPageFaultManager();
+    faultManager->insertAllocation(this, gfxAlloc, bank, cpuAddress, size);
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::allowCPUMemoryAccessIfTbxFaultable(GraphicsAllocation *gfxAlloc, void *cpuAddress, size_t size) {
+    if (!isAllocTbxFaultable(gfxAlloc)) {
+        return;
+    }
+    auto faultManager = getTbxPageFaultManager();
+    faultManager->allowCPUMemoryAccess(cpuAddress, size);
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::protectCPUMemoryAccessIfTbxFaultable(GraphicsAllocation *gfxAlloc, void *cpuAddress, size_t size) {
+    if (!isAllocTbxFaultable(gfxAlloc)) {
+        return;
+    }
+    auto faultManager = getTbxPageFaultManager();
+    faultManager->protectCPUMemoryAccess(cpuAddress, size);
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::protectCPUMemoryFromWritesIfTbxFaultable(GraphicsAllocation *gfxAlloc, void *cpuAddress, size_t size) {
+    if (!isAllocTbxFaultable(gfxAlloc)) {
+        return;
+    }
+    auto faultManager = getTbxPageFaultManager();
+    faultManager->protectCpuMemoryFromWrites(cpuAddress, size);
 }
 
 template <typename GfxFamily>
 void TbxCommandStreamReceiverHw<GfxFamily>::initializeEngine() {
-    isEngineInitialized = true;
+    if (!isEngineInitialized) {
+        isEngineInitialized = true;
 
-    if (hardwareContextController) {
-        hardwareContextController->initialize();
-        return;
+        if (hardwareContextController) {
+            hardwareContextController->createHardwareContexts(*aubManager);
+            hardwareContextController->initialize();
+            return;
+        }
     }
-
-    auto csTraits = this->getCsTraits(osContext->getEngineType());
-
-    if (engineInfo.pLRCA) {
-        return;
-    }
-
-    this->initGlobalMMIO();
-    this->initEngineMMIO();
-    this->initAdditionalMMIO();
-
-    // Global HW Status Page
-    {
-        const size_t sizeHWSP = 0x1000;
-        const size_t alignHWSP = 0x1000;
-        engineInfo.pGlobalHWStatusPage = alignedMalloc(sizeHWSP, alignHWSP);
-        engineInfo.ggttHWSP = gttRemap.map(engineInfo.pGlobalHWStatusPage, sizeHWSP);
-        auto physHWSP = ggtt->map(engineInfo.ggttHWSP, sizeHWSP, this->getGTTBits(), this->getMemoryBankForGtt());
-
-        // Write our GHWSP
-        AubGTTData data = {0};
-        this->getGTTData(reinterpret_cast<void *>(physHWSP), data);
-        AUB::reserveAddressGGTT(tbxStream, engineInfo.ggttHWSP, sizeHWSP, physHWSP, data);
-        tbxStream.writeMMIO(AubMemDump::computeRegisterOffset(csTraits.mmioBase, 0x2080), engineInfo.ggttHWSP);
-    }
-
-    // Allocate the LRCA
-    const size_t sizeLRCA = csTraits.sizeLRCA;
-    const size_t alignLRCA = csTraits.alignLRCA;
-    auto pLRCABase = alignedMalloc(sizeLRCA, alignLRCA);
-    engineInfo.pLRCA = pLRCABase;
-
-    // Initialize the LRCA to a known state
-    csTraits.initialize(pLRCABase);
-
-    // Reserve the RCS ring buffer
-    engineInfo.sizeRingBuffer = 0x4 * 0x1000;
-    {
-        const size_t alignRCS = 0x1000;
-        engineInfo.pRingBuffer = alignedMalloc(engineInfo.sizeRingBuffer, alignRCS);
-        engineInfo.ggttRingBuffer = gttRemap.map(engineInfo.pRingBuffer, engineInfo.sizeRingBuffer);
-        auto physRCS = ggtt->map(engineInfo.ggttRingBuffer, engineInfo.sizeRingBuffer, this->getGTTBits(), this->getMemoryBankForGtt());
-
-        AubGTTData data = {0};
-        this->getGTTData(reinterpret_cast<void *>(physRCS), data);
-        AUB::reserveAddressGGTT(tbxStream, engineInfo.ggttRingBuffer, engineInfo.sizeRingBuffer, physRCS, data);
-    }
-
-    // Initialize the ring MMIO registers
-    {
-        uint32_t ringHead = 0x000;
-        uint32_t ringTail = 0x000;
-        auto ringBase = engineInfo.ggttRingBuffer;
-        auto ringCtrl = (uint32_t)((engineInfo.sizeRingBuffer - 0x1000) | 1);
-        csTraits.setRingHead(pLRCABase, ringHead);
-        csTraits.setRingTail(pLRCABase, ringTail);
-        csTraits.setRingBase(pLRCABase, ringBase);
-        csTraits.setRingCtrl(pLRCABase, ringCtrl);
-    }
-
-    // Write our LRCA
-    {
-        engineInfo.ggttLRCA = gttRemap.map(engineInfo.pLRCA, sizeLRCA);
-        auto lrcAddressPhys = ggtt->map(engineInfo.ggttLRCA, sizeLRCA, this->getGTTBits(), this->getMemoryBankForGtt());
-
-        AubGTTData data = {0};
-        this->getGTTData(reinterpret_cast<void *>(lrcAddressPhys), data);
-        AUB::reserveAddressGGTT(tbxStream, engineInfo.ggttLRCA, sizeLRCA, lrcAddressPhys, data);
-        AUB::addMemoryWrite(
-            tbxStream,
-            lrcAddressPhys,
-            pLRCABase,
-            sizeLRCA,
-            this->getAddressSpace(csTraits.aubHintLRCA),
-            csTraits.aubHintLRCA);
-    }
-
-    DEBUG_BREAK_IF(!engineInfo.pLRCA);
 }
 
 template <typename GfxFamily>
@@ -170,14 +227,13 @@ CommandStreamReceiver *TbxCommandStreamReceiverHw<GfxFamily>::create(const std::
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[rootDeviceIndex];
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
     auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
-    const auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
     if (withAubDump) {
         auto localMemoryEnabled = gfxCoreHelper.getEnableLocalMemory(hwInfo);
-        auto fullName = AUBCommandStreamReceiver::createFullFilePath(hwInfo, baseName, rootDeviceIndex);
-        if (DebugManager.flags.AUBDumpCaptureFileName.get() != "unk") {
-            fullName.assign(DebugManager.flags.AUBDumpCaptureFileName.get());
+        auto fullName = AUBCommandStreamReceiver::createFullFilePath(hwInfo, rootDeviceEnvironment.getReleaseHelper(), baseName, rootDeviceIndex);
+        if (debugManager.flags.AUBDumpCaptureFileName.get() != "unk") {
+            fullName.assign(debugManager.flags.AUBDumpCaptureFileName.get());
         }
-        rootDeviceEnvironment.initAubCenter(localMemoryEnabled, fullName, CommandStreamReceiverType::CSR_TBX_WITH_AUB);
+        rootDeviceEnvironment.initAubCenter(localMemoryEnabled, fullName, CommandStreamReceiverType::tbxWithAub);
 
         csr = new CommandStreamReceiverWithAUBDump<TbxCommandStreamReceiverHw<GfxFamily>>(baseName, executionEnvironment, rootDeviceIndex, deviceBitfield);
 
@@ -187,27 +243,20 @@ CommandStreamReceiver *TbxCommandStreamReceiverHw<GfxFamily>::create(const std::
         auto subCaptureCommon = aubCenter->getSubCaptureCommon();
         UNRECOVERABLE_IF(nullptr == subCaptureCommon);
 
-        if (subCaptureCommon->subCaptureMode > AubSubCaptureManager::SubCaptureMode::Off) {
+        if (subCaptureCommon->subCaptureMode > AubSubCaptureManager::SubCaptureMode::off) {
             csr->subCaptureManager = std::make_unique<AubSubCaptureManager>(fullName, *subCaptureCommon, ApiSpecificConfig::getRegistryPath());
         }
 
         if (csr->aubManager) {
             if (!csr->aubManager->isOpen()) {
-                csr->aubManager->open(csr->subCaptureManager ? csr->subCaptureManager->getSubCaptureFileName("") : fullName);
+                const auto aubFilePath = csr->subCaptureManager ? csr->subCaptureManager->getSubCaptureFileName("") : fullName;
+                AUBCommandStreamReceiver::createDirectoriesForFilePath(aubFilePath);
+                csr->aubManager->open(aubFilePath);
                 UNRECOVERABLE_IF(!csr->aubManager->isOpen());
             }
         }
     } else {
         csr = new TbxCommandStreamReceiverHw<GfxFamily>(executionEnvironment, rootDeviceIndex, deviceBitfield);
-    }
-
-    if (!csr->aubManager) {
-        // Open our stream
-        csr->stream->open(nullptr);
-
-        // Add the file header.
-        bool streamInitialized = csr->stream->init(productHelper.getAubStreamSteppingFromHwRevId(hwInfo), csr->aubDeviceId);
-        csr->streamInitialized = streamInitialized;
     }
     return csr;
 }
@@ -235,6 +284,9 @@ SubmissionStatus TbxCommandStreamReceiverHw<GfxFamily>::flush(BatchBuffer &batch
     batchBuffer.commandBufferAllocation->updateResidencyTaskCount(submissionTaskCount, this->osContext->getContextId());
     batchBuffer.commandBufferAllocation->updateTaskCount(submissionTaskCount, osContext->getContextId());
 
+    // Write only the new command buffer chunk to avoid overwriting data being executed by TBX
+    this->writeBatchBufferToSimulation(batchBuffer);
+
     // Write allocations for residency
     processResidency(allocationsForResidency, 0u);
 
@@ -250,6 +302,14 @@ SubmissionStatus TbxCommandStreamReceiverHw<GfxFamily>::flush(BatchBuffer &batch
         }
     }
 
+    batchBuffer.allocationsForResidency = &allocationsForResidency;
+
+    if (this->directSubmission.get() || this->blitterDirectSubmission.get()) {
+        bool dispatched = this->directSubmission.get() ? this->directSubmission->dispatchCommandBuffer(batchBuffer, *this->flushStamp.get())
+                                                       : this->blitterDirectSubmission->dispatchCommandBuffer(batchBuffer, *this->flushStamp.get());
+        return dispatched ? SubmissionStatus::success : SubmissionStatus::failed;
+    }
+
     submitBatchBufferTbx(
         batchBufferGpuAddress, pBatchBuffer, sizeBatchBuffer,
         this->getMemoryBank(batchBuffer.commandBufferAllocation),
@@ -261,195 +321,64 @@ SubmissionStatus TbxCommandStreamReceiverHw<GfxFamily>::flush(BatchBuffer &batch
         subCaptureManager->disableSubCapture();
     }
 
-    return SubmissionStatus::SUCCESS;
+    return SubmissionStatus::success;
 }
 
 template <typename GfxFamily>
 void TbxCommandStreamReceiverHw<GfxFamily>::submitBatchBufferTbx(uint64_t batchBufferGpuAddress, const void *batchBuffer, size_t batchBufferSize, uint32_t memoryBank, uint64_t entryBits, bool overrideRingHead) {
-    if (hardwareContextController) {
-        if (batchBufferSize) {
-            hardwareContextController->submit(batchBufferGpuAddress, batchBuffer, batchBufferSize, memoryBank, MemoryConstants::pageSize64k, overrideRingHead);
-        }
-        return;
-    }
-
-    auto csTraits = this->getCsTraits(osContext->getEngineType());
-
-    {
-        auto physBatchBuffer = ppgtt->map(static_cast<uintptr_t>(batchBufferGpuAddress), batchBufferSize, entryBits, memoryBank);
-
-        AubHelperHw<GfxFamily> aubHelperHw(this->localMemoryEnabled);
-        AUB::reserveAddressPPGTT(tbxStream, static_cast<uintptr_t>(batchBufferGpuAddress), batchBufferSize, physBatchBuffer,
-                                 entryBits, aubHelperHw);
-
-        AUB::addMemoryWrite(
-            tbxStream,
-            physBatchBuffer,
-            batchBuffer,
-            batchBufferSize,
-            this->getAddressSpace(AubMemDump::DataTypeHintValues::TraceBatchBufferPrimary),
-            AubMemDump::DataTypeHintValues::TraceBatchBufferPrimary);
-    }
-
-    // Add a batch buffer start to the RCS
-    auto previousTail = engineInfo.tailRingBuffer;
-    {
-        typedef typename GfxFamily::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
-        typedef typename GfxFamily::MI_BATCH_BUFFER_START MI_BATCH_BUFFER_START;
-        typedef typename GfxFamily::MI_NOOP MI_NOOP;
-
-        auto pTail = ptrOffset(engineInfo.pRingBuffer, engineInfo.tailRingBuffer);
-        auto ggttTail = ptrOffset(engineInfo.ggttRingBuffer, engineInfo.tailRingBuffer);
-
-        auto sizeNeeded =
-            sizeof(MI_BATCH_BUFFER_START) +
-            sizeof(MI_NOOP) +
-            sizeof(MI_LOAD_REGISTER_IMM);
-        if (engineInfo.tailRingBuffer + sizeNeeded >= engineInfo.sizeRingBuffer) {
-            // Pad the remaining ring with NOOPs
-            auto sizeToWrap = engineInfo.sizeRingBuffer - engineInfo.tailRingBuffer;
-            memset(pTail, 0, sizeToWrap);
-            // write remaining ring
-            auto physDumpStart = ggtt->map(ggttTail, sizeToWrap, this->getGTTBits(), this->getMemoryBankForGtt());
-            AUB::addMemoryWrite(
-                tbxStream,
-                physDumpStart,
-                pTail,
-                sizeToWrap,
-                this->getAddressSpace(AubMemDump::DataTypeHintValues::TraceCommandBuffer),
-                AubMemDump::DataTypeHintValues::TraceCommandBuffer);
-            previousTail = 0;
-            engineInfo.tailRingBuffer = 0;
-            pTail = engineInfo.pRingBuffer;
-        } else if (engineInfo.tailRingBuffer == 0) {
-            // Add a LRI if this is our first submission
-            auto lri = GfxFamily::cmdInitLoadRegisterImm;
-            lri.setRegisterOffset(AubMemDump::computeRegisterOffset(csTraits.mmioBase, 0x2244));
-            lri.setDataDword(0x00010000);
-            *(MI_LOAD_REGISTER_IMM *)pTail = lri;
-            pTail = ((MI_LOAD_REGISTER_IMM *)pTail) + 1;
-        }
-
-        // Add our BBS
-        auto bbs = GfxFamily::cmdInitBatchBufferStart;
-        bbs.setBatchBufferStartAddress(static_cast<uint64_t>(batchBufferGpuAddress));
-        bbs.setAddressSpaceIndicator(MI_BATCH_BUFFER_START::ADDRESS_SPACE_INDICATOR_PPGTT);
-        *(MI_BATCH_BUFFER_START *)pTail = bbs;
-        pTail = ((MI_BATCH_BUFFER_START *)pTail) + 1;
-
-        // Add a NOOP as our tail needs to be aligned to a QWORD
-        *(MI_NOOP *)pTail = GfxFamily::cmdInitNoop;
-        pTail = ((MI_NOOP *)pTail) + 1;
-
-        // Compute our new ring tail.
-        engineInfo.tailRingBuffer = (uint32_t)ptrDiff(pTail, engineInfo.pRingBuffer);
-
-        // Only dump the new commands
-        auto ggttDumpStart = ptrOffset(engineInfo.ggttRingBuffer, previousTail);
-        auto dumpStart = ptrOffset(engineInfo.pRingBuffer, previousTail);
-        auto dumpLength = engineInfo.tailRingBuffer - previousTail;
-
-        // write RCS
-        auto physDumpStart = ggtt->map(ggttDumpStart, dumpLength, this->getGTTBits(), this->getMemoryBankForGtt());
-        AUB::addMemoryWrite(
-            tbxStream,
-            physDumpStart,
-            dumpStart,
-            dumpLength,
-            this->getAddressSpace(AubMemDump::DataTypeHintValues::TraceCommandBuffer),
-            AubMemDump::DataTypeHintValues::TraceCommandBuffer);
-
-        // update the RCS mmio tail in the LRCA
-        auto physLRCA = ggtt->map(engineInfo.ggttLRCA, sizeof(engineInfo.tailRingBuffer), this->getGTTBits(), this->getMemoryBankForGtt());
-        AUB::addMemoryWrite(
-            tbxStream,
-            physLRCA + 0x101c,
-            &engineInfo.tailRingBuffer,
-            sizeof(engineInfo.tailRingBuffer),
-            this->getAddressSpace(AubMemDump::DataTypeHintValues::TraceNotype));
-
-        DEBUG_BREAK_IF(engineInfo.tailRingBuffer >= engineInfo.sizeRingBuffer);
-    }
-
-    // Submit our execlist by submitting to the execlist submit ports
-    {
-        typename AUB::MiContextDescriptorReg contextDescriptor = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
-
-        contextDescriptor.sData.valid = true;
-        contextDescriptor.sData.forcePageDirRestore = false;
-        contextDescriptor.sData.forceRestore = false;
-        contextDescriptor.sData.legacy = true;
-        contextDescriptor.sData.faultSupport = 0;
-        contextDescriptor.sData.privilegeAccessOrPPGTT = true;
-        contextDescriptor.sData.aDor64bitSupport = AUB::Traits::addressingBits > 32;
-
-        auto ggttLRCA = engineInfo.ggttLRCA;
-        contextDescriptor.sData.logicalRingCtxAddress = ggttLRCA / 4096;
-        contextDescriptor.sData.contextID = 0;
-
-        this->submitLRCA(contextDescriptor);
+    if (hardwareContextController && batchBufferSize) {
+        hardwareContextController->submit(batchBufferGpuAddress, batchBuffer, batchBufferSize, memoryBank, MemoryConstants::pageSize64k, overrideRingHead);
     }
 }
 
 template <typename GfxFamily>
-void TbxCommandStreamReceiverHw<GfxFamily>::pollForCompletion() {
-    if (hardwareContextController) {
+void TbxCommandStreamReceiverHw<GfxFamily>::pollForCompletion(bool skipTaskCountCheck) {
+    if (hardwareContextController && this->pollForCompletionEnabled) {
         hardwareContextController->pollForCompletion();
-        return;
     }
-
-    typedef typename AubMemDump::CmdServicesMemTraceRegisterPoll CmdServicesMemTraceRegisterPoll;
-
-    auto mmioBase = this->getCsTraits(osContext->getEngineType()).mmioBase;
-    bool pollNotEqual = getpollNotEqualValueForPollForCompletion();
-    uint32_t mask = getMaskAndValueForPollForCompletion();
-    uint32_t value = mask;
-    tbxStream.registerPoll(
-        AubMemDump::computeRegisterOffset(mmioBase, 0x2234), // EXECLIST_STATUS
-        mask,
-        value,
-        pollNotEqual,
-        CmdServicesMemTraceRegisterPoll::TimeoutActionValues::Abort);
 }
 
 template <typename GfxFamily>
 void TbxCommandStreamReceiverHw<GfxFamily>::writeMemory(uint64_t gpuAddress, void *cpuAddress, size_t size, uint32_t memoryBank, uint64_t entryBits) {
     UNRECOVERABLE_IF(!isEngineInitialized);
-
-    AubHelperHw<GfxFamily> aubHelperHw(this->localMemoryEnabled);
-
-    PageWalker walker = [&](uint64_t physAddress, size_t size, size_t offset, uint64_t entryBits) {
-        AUB::reserveAddressGGTTAndWriteMmeory(tbxStream, static_cast<uintptr_t>(gpuAddress), cpuAddress, physAddress, size, offset, entryBits,
-                                              aubHelperHw);
-    };
-
-    ppgtt->pageWalk(static_cast<uintptr_t>(gpuAddress), size, 0, entryBits, walker, memoryBank);
 }
 
 template <typename GfxFamily>
-bool TbxCommandStreamReceiverHw<GfxFamily>::writeMemory(GraphicsAllocation &gfxAllocation) {
-    UNRECOVERABLE_IF(!isEngineInitialized);
+bool TbxCommandStreamReceiverHw<GfxFamily>::writeMemory(GraphicsAllocation &gfxAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) {
+    uint64_t gpuAddress;
+    void *cpuAddress;
+    size_t size;
+
+    if (!this->getParametersForMemory(gfxAllocation, gpuAddress, cpuAddress, size)) {
+        return false;
+    }
+
+    auto allocType = gfxAllocation.getAllocationType();
+    this->registerAllocationWithTbxFaultMngrIfTbxFaultable(&gfxAllocation, cpuAddress, size);
 
     if (!this->isTbxWritable(gfxAllocation)) {
         return false;
     }
 
-    uint64_t gpuAddress;
-    void *cpuAddress;
-    size_t size;
-    if (!this->getParametersForWriteMemory(gfxAllocation, gpuAddress, cpuAddress, size)) {
-        return false;
-    }
+    this->protectCPUMemoryFromWritesIfTbxFaultable(&gfxAllocation, cpuAddress, size);
+
+    initializeEngine();
 
     if (aubManager) {
-        this->writeMemoryWithAubManager(gfxAllocation);
+        this->writeAllocationWithAubManager(gfxAllocation, isChunkCopy, gpuVaChunkOffset, chunkSize);
     } else {
+        if (isChunkCopy) {
+            gpuAddress += gpuVaChunkOffset;
+            cpuAddress = ptrOffset(cpuAddress, static_cast<uintptr_t>(gpuVaChunkOffset));
+            size = chunkSize;
+        }
         writeMemory(gpuAddress, cpuAddress, size, this->getMemoryBank(&gfxAllocation), this->getPPGTTAdditionalBits(&gfxAllocation));
     }
 
-    if (AubHelper::isOneTimeAubWritableAllocationType(gfxAllocation.getAllocationType())) {
+    if (AubHelper::isOneTimeAubWritableAllocationType(allocType)) {
         this->setTbxWritable(false, gfxAllocation);
     }
+    this->protectCPUMemoryAccessIfTbxFaultable(&gfxAllocation, cpuAddress, size);
 
     return true;
 }
@@ -465,11 +394,12 @@ template <typename GfxFamily>
 bool TbxCommandStreamReceiverHw<GfxFamily>::expectMemory(const void *gfxAddress, const void *srcAddress,
                                                          size_t length, uint32_t compareOperation) {
     if (hardwareContextController) {
-        auto readMemory = std::make_unique<char[]>(length);
+        auto readMemory = std::make_unique_for_overwrite<char[]>(length);
         // note: memory bank should not matter assuming that we call expect on the memory that was previously allocated
         hardwareContextController->readMemory((uint64_t)gfxAddress, readMemory.get(), length, this->getMemoryBankForGtt(), MemoryConstants::pageSize64k);
         auto isMemoryEqual = (memcmp(readMemory.get(), srcAddress, length) == 0);
-        auto isEqualMemoryExpected = (compareOperation == AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareEqual);
+        auto isEqualMemoryExpected = (compareOperation == aub_stream::CompareOperationValues::CompareEqual);
+        hardwareContextController->expectMemory(reinterpret_cast<uint64_t>(gfxAddress), srcAddress, length, compareOperation);
         return (isMemoryEqual == isEqualMemoryExpected);
     }
 
@@ -477,7 +407,129 @@ bool TbxCommandStreamReceiverHw<GfxFamily>::expectMemory(const void *gfxAddress,
 }
 
 template <typename GfxFamily>
-void TbxCommandStreamReceiverHw<GfxFamily>::flushSubmissionsAndDownloadAllocations(TaskCountType taskCountToWait) {
+void TbxCommandStreamReceiverHw<GfxFamily>::writePooledMemory(SharedPoolAllocation &sharedPoolAllocation, bool initFullPageTables) {
+    auto &gfxAllocation = *sharedPoolAllocation.getGraphicsAllocation();
+
+    auto writeMemoryOperation = [&]() {
+        constexpr uint32_t allBanks = std::numeric_limits<uint32_t>::max();
+        if (initFullPageTables && gfxAllocation.isTbxWritable(allBanks)) {
+            writeMemory(gfxAllocation, false, 0, 0);
+        }
+
+        gfxAllocation.setTbxWritable(true, allBanks);
+        [[maybe_unused]] const auto writeMemoryStatus = writeMemory(gfxAllocation, true, sharedPoolAllocation.getOffset(), sharedPoolAllocation.getSize());
+        DEBUG_BREAK_IF(!writeMemoryStatus);
+        gfxAllocation.setTbxWritable(false, allBanks);
+    };
+
+    if (auto mutex = sharedPoolAllocation.getMutex(); mutex) {
+        std::lock_guard<std::mutex> lock(*mutex);
+        writeMemoryOperation();
+    } else {
+        writeMemoryOperation();
+    }
+}
+
+template <typename GfxFamily>
+TaskCountType TbxCommandStreamReceiverHw<GfxFamily>::peekCompletedTaskCount() const {
+    if (this->getTagAllocation() == nullptr) {
+        return 0u;
+    }
+
+    auto completedTaskCount = std::numeric_limits<TaskCountType>::max();
+    volatile TagAddressType *pollAddress = this->getTagAddress();
+    for (uint32_t i = 0; i < this->activePartitions; i++) {
+        completedTaskCount = std::min(completedTaskCount, static_cast<TaskCountType>(*pollAddress));
+        pollAddress = ptrOffset(pollAddress, this->immWritePostSyncWriteOffset);
+    }
+    return completedTaskCount;
+}
+
+template <typename GfxFamily>
+TaskCountType TbxCommandStreamReceiverHw<GfxFamily>::waitForCompletionOfTaskCount(TaskCountType taskCountToWait) {
+    this->flushTagUpdateIfRequired(taskCountToWait);
+
+    volatile TagAddressType *pollAddress = this->getTagAddress();
+    auto startTime = std::chrono::high_resolution_clock::now();
+    for (uint32_t i = 0; i < this->activePartitions; i++) {
+        while (*pollAddress < taskCountToWait) {
+            this->downloadAllocation(*this->getTagAllocation());
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+            if (static_cast<uint64_t>(elapsedMs) > this->getNonBlockingDownloadTimeoutMs()) {
+                break;
+            }
+        }
+        pollAddress = ptrOffset(pollAddress, this->immWritePostSyncWriteOffset);
+    }
+    return this->peekCompletedTaskCount();
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::executeDownloadAllocations(TaskCountType taskCountToWait) {
+    const uint32_t contextId = this->osContext->getContextId();
+    TaskCountType highestPendingAllocationTaskCount = 0u;
+
+    // download allocations that are completed, and remove them from the list
+    for (auto it = this->allocationsForDownload.begin(); it != this->allocationsForDownload.end();) {
+        auto graphicsAllocation = *it;
+        const auto allocationTaskCount = graphicsAllocation->getTaskCount(contextId);
+        const bool isAllocationTaskCompleted = !graphicsAllocation->isUsedByOsContext(contextId) ||
+                                               (allocationTaskCount <= taskCountToWait);
+
+        if (isAllocationModifiedByHost(*graphicsAllocation)) {
+            it = this->allocationsForDownload.erase(it);
+        } else if (isAllocationTaskCompleted) {
+            this->downloadAllocation(*graphicsAllocation);
+            it = this->allocationsForDownload.erase(it);
+        } else {
+            // not completed yet, move to the next allocation
+            ++it;
+            if (allocationTaskCount > highestPendingAllocationTaskCount) {
+                highestPendingAllocationTaskCount = allocationTaskCount;
+            }
+        }
+    }
+
+    if (!this->allocationsForDownload.empty()) {
+        const auto completedTaskCount = this->waitForCompletionOfTaskCount(highestPendingAllocationTaskCount);
+
+        for (auto it = this->allocationsForDownload.begin(); it != this->allocationsForDownload.end();) {
+            auto graphicsAllocation = *it;
+            const auto allocationTaskCount = graphicsAllocation->getTaskCount(contextId);
+            const bool isAllocationTaskCompleted = !graphicsAllocation->isUsedByOsContext(contextId) ||
+                                                   (allocationTaskCount <= completedTaskCount);
+
+            if (isAllocationTaskCompleted) {
+                this->downloadAllocation(*graphicsAllocation);
+                it = this->allocationsForDownload.erase(it);
+            } else {
+                PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stdout, "Allocation %p is not completed yet and in effect not downloaded, taskCount: %llu, completedTaskCount: %llu\n",
+                             graphicsAllocation, allocationTaskCount, completedTaskCount);
+                DEBUG_BREAK_IF(true);
+                ++it;
+            }
+        }
+    }
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::downloadSubmittedAllocationsWithoutRetiring(TaskCountType taskCount) {
+    const uint32_t contextId = this->osContext->getContextId();
+    for (auto it = this->allocationsForDownload.begin(); it != this->allocationsForDownload.end();) {
+        auto graphicsAllocation = *it;
+        if (isAllocationModifiedByHost(*graphicsAllocation)) {
+            it = this->allocationsForDownload.erase(it);
+            continue;
+        }
+        if (!graphicsAllocation->isUsedByOsContext(contextId) || graphicsAllocation->getTaskCount(contextId) <= taskCount) {
+            this->downloadAllocation(*graphicsAllocation);
+        }
+        ++it;
+    }
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::flushSubmissionsAndDownloadAllocations(TaskCountType taskCountToWait, bool skipAllocationsDownload) {
     this->flushBatchedSubmissions();
 
     if (this->latestFlushedTaskCount < taskCountToWait) {
@@ -489,36 +541,48 @@ void TbxCommandStreamReceiverHw<GfxFamily>::flushSubmissionsAndDownloadAllocatio
         while (*pollAddress < this->latestFlushedTaskCount) {
             this->downloadAllocation(*this->getTagAllocation());
         }
-        pollAddress = ptrOffset(pollAddress, this->postSyncWriteOffset);
+        pollAddress = ptrOffset(pollAddress, this->immWritePostSyncWriteOffset);
+    }
+
+    if (skipAllocationsDownload) {
+        return;
     }
 
     auto lockCSR = this->obtainUniqueOwnership();
-    for (GraphicsAllocation *graphicsAllocation : this->allocationsForDownload) {
-        this->downloadAllocation(*graphicsAllocation);
-    }
-    this->allocationsForDownload.clear();
+    this->executeDownloadAllocations(taskCountToWait);
 }
 
 template <typename GfxFamily>
 WaitStatus TbxCommandStreamReceiverHw<GfxFamily>::waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle) {
-    flushSubmissionsAndDownloadAllocations(taskCountToWait);
+    flushSubmissionsAndDownloadAllocations(taskCountToWait, false);
     return BaseClass::waitForTaskCountWithKmdNotifyFallback(taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle);
 }
 
 template <typename GfxFamily>
 WaitStatus TbxCommandStreamReceiverHw<GfxFamily>::waitForCompletionWithTimeout(const WaitParams &params, TaskCountType taskCountToWait) {
-    flushSubmissionsAndDownloadAllocations(taskCountToWait);
+    flushSubmissionsAndDownloadAllocations(taskCountToWait, params.skipTbxDownload);
     return BaseClass::waitForCompletionWithTimeout(params, taskCountToWait);
 }
 
 template <typename GfxFamily>
 void TbxCommandStreamReceiverHw<GfxFamily>::processEviction() {
-    this->allocationsForDownload.insert(this->getEvictionAllocations().begin(), this->getEvictionAllocations().end());
+    auto lockCSR = this->obtainUniqueOwnership();
     BaseClass::processEviction();
 }
 
 template <typename GfxFamily>
-SubmissionStatus TbxCommandStreamReceiverHw<GfxFamily>::processResidency(const ResidencyContainer &allocationsForResidency, uint32_t handleId) {
+void TbxCommandStreamReceiverHw<GfxFamily>::makeNonResident(GraphicsAllocation &gfxAllocation) {
+    auto lock = this->obtainUniqueOwnership();
+    if (gfxAllocation.isResident(osContext->getContextId()) && !gfxAllocation.isSimulationMemoryShared() &&
+        (GraphicsAllocation::isSuitableForDownload(gfxAllocation.getAllocationType()) || debugManager.flags.TbxDownloadAllAllocations.get())) {
+        this->allocationsForDownload.insert(&gfxAllocation);
+    }
+    BaseClass::makeNonResident(gfxAllocation);
+}
+
+template <typename GfxFamily>
+SubmissionStatus TbxCommandStreamReceiverHw<GfxFamily>::processResidency(ResidencyContainer &allocationsForResidency, uint32_t handleId) {
+
     for (auto &gfxAllocation : allocationsForResidency) {
         if (dumpTbxNonWritable) {
             this->setTbxWritable(true, *gfxAllocation);
@@ -530,45 +594,71 @@ SubmissionStatus TbxCommandStreamReceiverHw<GfxFamily>::processResidency(const R
         gfxAllocation->updateResidencyTaskCount(this->taskCount + 1, this->osContext->getContextId());
     }
 
+    if (this->executionEnvironment.rootDeviceEnvironments[this->rootDeviceIndex]->memoryOperationsInterface) {
+        this->executionEnvironment.rootDeviceEnvironments[this->rootDeviceIndex]->memoryOperationsInterface->processFlushResidency(this);
+    }
+
     dumpTbxNonWritable = false;
-    return SubmissionStatus::SUCCESS;
+    return SubmissionStatus::success;
 }
 
 template <typename GfxFamily>
-void TbxCommandStreamReceiverHw<GfxFamily>::downloadAllocationTbx(GraphicsAllocation &gfxAllocation) {
-    if (hardwareContextController) {
-        hardwareContextController->readMemory(gfxAllocation.getGpuAddress(), gfxAllocation.getUnderlyingBuffer(), gfxAllocation.getUnderlyingBufferSize(),
-                                              this->getMemoryBank(&gfxAllocation), MemoryConstants::pageSize64k);
+void TbxCommandStreamReceiverHw<GfxFamily>::downloadAllocationChunkTbx(GraphicsAllocation &gfxAllocation, uint64_t chunkOffset, size_t chunkSize) {
+    if (gfxAllocation.isSimulationMemoryShared()) {
         return;
     }
 
-    auto cpuAddress = gfxAllocation.getUnderlyingBuffer();
-    auto gpuAddress = gfxAllocation.getGpuAddress();
-    auto length = gfxAllocation.getUnderlyingBufferSize();
+    uint64_t gpuAddress = 0;
+    void *cpuAddress = nullptr;
+    size_t allocSize = 0;
 
-    if (length) {
-        PageWalker walker = [&](uint64_t physAddress, size_t size, size_t offset, uint64_t entryBits) {
-            DEBUG_BREAK_IF(offset > length);
-            tbxStream.readMemory(physAddress, ptrOffset(cpuAddress, offset), size);
-        };
-        ppgtt->pageWalk(static_cast<uintptr_t>(gpuAddress), length, 0, 0, walker, this->getMemoryBank(&gfxAllocation));
+    this->getParametersForMemory(gfxAllocation, gpuAddress, cpuAddress, allocSize);
+
+    DEBUG_BREAK_IF(chunkOffset + chunkSize > allocSize);
+
+    gpuAddress += chunkOffset;
+    cpuAddress = ptrOffset(cpuAddress, static_cast<size_t>(chunkOffset));
+
+    this->allowCPUMemoryAccessIfTbxFaultable(&gfxAllocation, cpuAddress, chunkSize);
+
+    if (hardwareContextController) {
+        hardwareContextController->readMemory(gpuAddress, cpuAddress, chunkSize,
+                                              this->getMemoryBank(&gfxAllocation), gfxAllocation.getUsedPageSize());
+        this->protectCPUMemoryFromWritesIfTbxFaultable(&gfxAllocation, cpuAddress, chunkSize);
     }
 }
 
 template <typename GfxFamily>
-void TbxCommandStreamReceiverHw<GfxFamily>::downloadAllocations() {
+void TbxCommandStreamReceiverHw<GfxFamily>::downloadAllocations(bool blockingWait, TaskCountType taskCount) {
     volatile TagAddressType *pollAddress = this->getTagAddress();
+
+    auto waitTaskCount = std::min(taskCount, this->latestFlushedTaskCount.load());
+
     for (uint32_t i = 0; i < this->activePartitions; i++) {
-        while (*pollAddress < this->latestFlushedTaskCount) {
+        if (*pollAddress < waitTaskCount) {
             this->downloadAllocation(*this->getTagAllocation());
+
+            auto startTime = std::chrono::high_resolution_clock::now();
+            uint64_t timeDiff = 0;
+
+            while (*pollAddress < waitTaskCount) {
+                if (!blockingWait) {
+                    // Additional delay to reach PC in case of Event wait
+                    timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+                    if (timeDiff > getNonBlockingDownloadTimeoutMs()) {
+                        auto lockCSR = this->obtainUniqueOwnership();
+                        this->downloadSubmittedAllocationsWithoutRetiring(waitTaskCount);
+                        return;
+                    }
+                }
+                this->downloadAllocation(*this->getTagAllocation());
+            }
         }
-        pollAddress = ptrOffset(pollAddress, this->postSyncWriteOffset);
+
+        pollAddress = ptrOffset(pollAddress, this->immWritePostSyncWriteOffset);
     }
     auto lockCSR = this->obtainUniqueOwnership();
-    for (GraphicsAllocation *graphicsAllocation : this->allocationsForDownload) {
-        this->downloadAllocation(*graphicsAllocation);
-    }
-    this->allocationsForDownload.clear();
+    this->executeDownloadAllocations(waitTaskCount);
 }
 
 template <typename GfxFamily>
@@ -606,7 +696,7 @@ void TbxCommandStreamReceiverHw<GfxFamily>::dumpAllocation(GraphicsAllocation &g
         return;
     }
 
-    if (DebugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.get() || DebugManager.flags.AUBDumpAllocsOnEnqueueSVMMemcpyOnly.get()) {
+    if (debugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.get() || debugManager.flags.AUBDumpAllocsOnEnqueueSVMMemcpyOnly.get()) {
         if (!gfxAllocation.isAllocDumpable()) {
             return;
         }
@@ -614,10 +704,22 @@ void TbxCommandStreamReceiverHw<GfxFamily>::dumpAllocation(GraphicsAllocation &g
     }
 
     auto dumpFormat = AubAllocDump::getDumpFormat(gfxAllocation);
-    auto surfaceInfo = std::unique_ptr<aub_stream::SurfaceInfo>(AubAllocDump::getDumpSurfaceInfo<GfxFamily>(gfxAllocation, dumpFormat));
+    auto surfaceInfo = std::unique_ptr<aub_stream::SurfaceInfo>(AubAllocDump::getDumpSurfaceInfo<GfxFamily>(gfxAllocation, *this->peekGmmHelper(), dumpFormat));
     if (surfaceInfo) {
         hardwareContextController->pollForCompletion();
         hardwareContextController->dumpSurface(*surfaceInfo.get());
+    }
+}
+
+template <typename GfxFamily>
+void TbxCommandStreamReceiverHw<GfxFamily>::removeDownloadAllocation(GraphicsAllocation *alloc) {
+    auto lockCSR = this->obtainUniqueOwnership();
+
+    this->allocationsForDownload.erase(alloc);
+
+    auto faultManager = getTbxPageFaultManager();
+    if (faultManager != nullptr) {
+        faultManager->removeAllocation(alloc);
     }
 }
 } // namespace NEO

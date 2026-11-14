@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,25 +12,25 @@
 #include "shared/source/device_binary_format/zebin/zebin_elf.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/utilities/shared_pool_allocation.h"
 
 namespace NEO::Zebin::Debug {
 using namespace NEO::Zebin::Elf;
 
 Segments::Segments() {}
 
-Segments::Segments(const GraphicsAllocation *globalVarAlloc, const GraphicsAllocation *globalConstAlloc, ArrayRef<const uint8_t> &globalStrings, std::vector<KernelNameIsaPairT> &kernels) {
+Segments::Segments(const SharedPoolAllocation *globalVarAlloc, const SharedPoolAllocation *globalConstAlloc, ArrayRef<const uint8_t> &globalStrings, std::vector<KernelNameIsaTupleT> &kernels) {
     if (globalVarAlloc) {
-        varData = {static_cast<uintptr_t>(globalVarAlloc->getGpuAddress()), globalVarAlloc->getUnderlyingBufferSize()};
+        varData = {static_cast<uintptr_t>(globalVarAlloc->getGpuAddress()), globalVarAlloc->getSize()};
     }
     if (globalConstAlloc) {
-        constData = {static_cast<uintptr_t>(globalConstAlloc->getGpuAddress()), globalConstAlloc->getUnderlyingBufferSize()};
+        constData = {static_cast<uintptr_t>(globalConstAlloc->getGpuAddress()), globalConstAlloc->getSize()};
     }
     if (false == globalStrings.empty()) {
         stringData = {reinterpret_cast<uintptr_t>(globalStrings.begin()), globalStrings.size()};
     }
-    for (auto &[kernelName, isa] : kernels) {
-        Debug::Segments::Segment kernelSegment = {static_cast<uintptr_t>(isa->getGpuAddress()), isa->getUnderlyingBufferSize()};
-        nameToSegMap.insert(std::pair(kernelName, kernelSegment));
+    for (auto &[kernelName, isaSegment] : kernels) {
+        nameToSegMap.emplace(kernelName, isaSegment);
     }
 }
 
@@ -99,7 +99,7 @@ void patchWithValue(uintptr_t addr, T value) {
     }
 }
 
-void DebugZebinCreator::applyRelocation(uintptr_t addr, uint64_t value, RELOC_TYPE_ZEBIN type) {
+void DebugZebinCreator::applyRelocation(uintptr_t addr, uint64_t value, RelocTypeZebin type) {
     switch (type) {
     default:
         UNRECOVERABLE_IF(type != R_ZE_SYM_ADDR)
@@ -138,7 +138,7 @@ void DebugZebinCreator::applyRelocations() {
 
     for (const auto *relocations : {&elf.getDebugInfoRelocations(), &elf.getRelocations()}) {
         for (const auto &reloc : *relocations) {
-            auto relocType = static_cast<RELOC_TYPE_ZEBIN>(reloc.relocType);
+            auto relocType = static_cast<RelocTypeZebin>(reloc.relocType);
             if (isRelocTypeSupported(relocType) == false) {
                 continue;
             }
@@ -150,10 +150,10 @@ void DebugZebinCreator::applyRelocations() {
     }
 }
 
-bool DebugZebinCreator::isRelocTypeSupported(RELOC_TYPE_ZEBIN type) {
-    return type == RELOC_TYPE_ZEBIN::R_ZE_SYM_ADDR ||
-           type == RELOC_TYPE_ZEBIN::R_ZE_SYM_ADDR_32 ||
-           type == RELOC_TYPE_ZEBIN::R_ZE_SYM_ADDR_32_HI;
+bool DebugZebinCreator::isRelocTypeSupported(RelocTypeZebin type) {
+    return type == RelocTypeZebin::R_ZE_SYM_ADDR ||
+           type == RelocTypeZebin::R_ZE_SYM_ADDR_32 ||
+           type == RelocTypeZebin::R_ZE_SYM_ADDR_32_HI;
 }
 
 const Segments::Segment *DebugZebinCreator::getSegmentByName(ConstStringRef sectionName) {

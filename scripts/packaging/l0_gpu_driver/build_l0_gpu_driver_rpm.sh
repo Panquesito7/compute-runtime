@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #
-# Copyright (C) 2021-2022 Intel Corporation
+# Copyright (C) 2021-2024 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -20,7 +20,7 @@ fi
 BUILD_SRPM="${BUILD_SRPM:-1}"
 BUILD_RPM="${BUILD_RPM:-1}"
 SPEC_FILE="${SPEC_FILE:-${OS_TYPE}}"
-if [[ ${SPEC_FILE} == rhel* ]]; then
+if [[ ${SPEC_FILE} == rhel* || ${SPEC_FILE} == sles* ]]; then
     SPEC_FILE=${SPEC_FILE%.*}
 fi
 
@@ -53,6 +53,10 @@ if [ "${BUILD_SRPM}" == "1" ]; then
     RELEASE="${NEO_L0_VERSION_HOTFIX}${API_VERSION_SRC}${API_RPM_MODEL_LINK}"
 
     RELEASE_WITH_REGKEYS="${RELEASE_WITH_REGKEYS:-FALSE}"
+    NEO_ENABLE_I915_PRELIM_DETECTION="${NEO_ENABLE_I915_PRELIM_DETECTION:-FALSE}"
+    NEO_ENABLE_XE_PRELIM_DETECTION="${NEO_ENABLE_XE_PRELIM_DETECTION:-FALSE}"
+    NEO_ENABLE_XE_EU_DEBUG_SUPPORT="${NEO_ENABLE_XE_EU_DEBUG_SUPPORT:-FALSE}"
+    NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM="${NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM:-FALSE}"
 
     #setup rpm build tree
     rm -rf $BUILD_DIR
@@ -61,9 +65,9 @@ if [ "${BUILD_SRPM}" == "1" ]; then
     cp $COPYRIGHT $BUILD_DIR/SOURCES/
     cp $SPEC_SRC $BUILD_DIR/SPECS/
 
-    if [ -d "$I915_HEADERS_DIR" ]; then
-        tar -c -I 'xz -6 -T0' -f $BUILD_DIR/SOURCES/uapi.tar.xz -C $REPO_DIR --transform "s,${I915_HEADERS_DIR:1},uapi," $I915_HEADERS_DIR
-        perl -pi -e "s;^%global I915_HEADERS_DIR .*;%global I915_HEADERS_DIR %{_builddir}/uapi;" $SPEC
+    if [ -d "$NEO_I915_PRELIM_HEADERS_DIR" ]; then
+        tar -c -I 'xz -6 -T0' -f $BUILD_DIR/SOURCES/uapi.tar.xz -C $REPO_DIR --transform "s,${NEO_I915_PRELIM_HEADERS_DIR:1},uapi," $NEO_I915_PRELIM_HEADERS_DIR
+        perl -pi -e "s;^%global NEO_I915_PRELIM_HEADERS_DIR .*;%global NEO_I915_PRELIM_HEADERS_DIR %{_builddir}/uapi/drm;" $SPEC
     fi
 
     PATCH_SPEC="${REPO_DIR}/scripts/packaging/${BRANCH_SUFFIX}/patch_spec.sh"
@@ -76,6 +80,10 @@ if [ "${BUILD_SRPM}" == "1" ]; then
     perl -pi -e "s/^%global ver .*/%global ver ${VERSION}/" $SPEC
     perl -pi -e "s/^%global rel .*/%global rel ${RELEASE}/" $SPEC
     perl -pi -e "s/^%global NEO_RELEASE_WITH_REGKEYS .*/%global NEO_RELEASE_WITH_REGKEYS ${RELEASE_WITH_REGKEYS}/" $SPEC
+    perl -pi -e "s/^%global NEO_ENABLE_I915_PRELIM_DETECTION .*/%global NEO_ENABLE_I915_PRELIM_DETECTION ${NEO_ENABLE_I915_PRELIM_DETECTION}/" $SPEC
+    perl -pi -e "s/^%global NEO_ENABLE_XE_PRELIM_DETECTION .*/%global NEO_ENABLE_XE_PRELIM_DETECTION ${NEO_ENABLE_XE_PRELIM_DETECTION}/" $SPEC
+    perl -pi -e "s/^%global NEO_ENABLE_XE_EU_DEBUG_SUPPORT .*/%global NEO_ENABLE_XE_EU_DEBUG_SUPPORT ${NEO_ENABLE_XE_EU_DEBUG_SUPPORT}/" $SPEC
+    perl -pi -e "s/^%global NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM .*/%global NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM ${NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM}/" $SPEC
     perl -pi -e "s/^%global build_id .*/%global build_id ${NEO_L0_VERSION_PATCH}/" $SPEC
 
     rpmbuild --define "_topdir $BUILD_DIR" -bs $SPEC --define 'build_type ${CMAKE_BUILD_TYPE}' "${build_args[@]}"

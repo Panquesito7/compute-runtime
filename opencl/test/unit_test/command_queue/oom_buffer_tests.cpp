@@ -1,22 +1,19 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/test/common/fixtures/memory_management_fixture.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/event/event.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
-#include "opencl/test/unit_test/fixtures/hello_world_kernel_fixture.h"
-#include "opencl/test/unit_test/fixtures/simple_arg_kernel_fixture.h"
+#include "opencl/test/unit_test/fixtures/mock_kernel_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 
 using namespace NEO;
@@ -34,13 +31,9 @@ static OOMSetting oomSettings[] = {
 struct OOMCommandQueueBufferTest : public MemoryManagementFixture,
                                    public ClDeviceFixture,
                                    public CommandQueueFixture,
-                                   public SimpleArgKernelFixture,
-                                   public HelloWorldKernelFixture,
                                    public ::testing::TestWithParam<OOMSetting> {
 
     using CommandQueueFixture::setUp;
-    using HelloWorldKernelFixture::setUp;
-    using SimpleArgKernelFixture::setUp;
 
     void SetUp() override {
         MemoryManagement::breakOnAllocationEvent = 77;
@@ -49,8 +42,6 @@ struct OOMCommandQueueBufferTest : public MemoryManagementFixture,
         context = new MockContext(pClDevice);
         BufferDefaults::context = context;
         CommandQueueFixture::setUp(context, pClDevice, 0);
-        SimpleArgKernelFixture::setUp(pClDevice);
-        HelloWorldKernelFixture::setUp(pClDevice, "CopyBuffer_simd", "CopyBuffer");
 
         srcBuffer = BufferHelper<>::create();
         dstBuffer = BufferHelper<>::create();
@@ -60,15 +51,15 @@ struct OOMCommandQueueBufferTest : public MemoryManagementFixture,
         if (oomSetting.oomCS) {
             auto &cs = pCmdQ->getCS(oomSize);
 
-            // CommandStream may be larger than requested so grab what wasnt requested
+            // CommandStream may be larger than requested so grab what was not requested
             cs.getSpace(cs.getAvailableSpace() - oomSize);
             ASSERT_EQ(oomSize, cs.getAvailableSpace());
         }
 
         if (oomSetting.oomISH) {
-            auto &ish = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, oomSize);
+            auto &ish = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, oomSize);
 
-            // IndirectHeap may be larger than requested so grab what wasnt requested
+            // IndirectHeap may be larger than requested so grab what was not requested
             ish.getSpace(ish.getAvailableSpace() - oomSize);
             ASSERT_EQ(oomSize, ish.getAvailableSpace());
         }
@@ -78,8 +69,6 @@ struct OOMCommandQueueBufferTest : public MemoryManagementFixture,
         delete dstBuffer;
         delete srcBuffer;
         context->release();
-        HelloWorldKernelFixture::tearDown();
-        SimpleArgKernelFixture::tearDown();
         CommandQueueFixture::tearDown();
         ClDeviceFixture::tearDown();
         MemoryManagementFixture::tearDown();
@@ -94,7 +83,7 @@ HWTEST_P(OOMCommandQueueBufferTest, WhenCopyingBufferThenMaxAvailableSpaceIsNotE
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
@@ -118,7 +107,7 @@ HWTEST_P(OOMCommandQueueBufferTest, WhenFillingBufferThenMaxAvailableSpaceIsNotE
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
@@ -142,7 +131,7 @@ HWTEST_P(OOMCommandQueueBufferTest, WhenReadingBufferThenMaxAvailableSpaceIsNotE
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
@@ -166,7 +155,7 @@ HWTEST_P(OOMCommandQueueBufferTest, WhenWritingBufferThenMaxAvailableSpaceIsNotE
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
@@ -190,7 +179,7 @@ HWTEST_P(OOMCommandQueueBufferTest, WhenWritingBufferRectThenMaxAvailableSpaceIs
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
@@ -210,22 +199,22 @@ HWTEST_P(OOMCommandQueueBufferTest, WhenWritingBufferRectThenMaxAvailableSpaceIs
     }
 }
 
-HWTEST_P(OOMCommandQueueBufferTest, GivenHelloWorldWhenEnqueingKernelThenMaxAvailableSpaceIsNotExceeded) {
-    typedef HelloWorldKernelFixture KernelFixture;
+HWTEST_P(OOMCommandQueueBufferTest, GivenBufferArgsKernelWhenEnqueingKernelThenMaxAvailableSpaceIsNotExceeded) {
+    auto bufferArgsKernelWithInternals = createBufferArgsKernel(*context);
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
     auto retVal1 = EnqueueKernelHelper<>::enqueueKernel(
         pCmdQ,
-        KernelFixture::pKernel);
+        bufferArgsKernelWithInternals->mockKernel);
 
     auto retVal2 = EnqueueKernelHelper<>::enqueueKernel(
         &cmdQ,
-        KernelFixture::pKernel);
+        bufferArgsKernelWithInternals->mockKernel);
 
     auto usedAfterCS = commandStream.getUsed();
     auto usedAfterISH = indirectHeap.getUsed();
@@ -241,21 +230,21 @@ HWTEST_P(OOMCommandQueueBufferTest, GivenHelloWorldWhenEnqueingKernelThenMaxAvai
 }
 
 HWTEST_P(OOMCommandQueueBufferTest, GivenSimpleArgWhenEnqueingKernelThenMaxAvailableSpaceIsNotExceeded) {
-    typedef SimpleArgKernelFixture KernelFixture;
+    auto simpleArgKernelWithInternals = createSimpleArgKernel(*context);
     CommandQueueHw<FamilyType> cmdQ(context, pClDevice, 0, false);
 
     auto &commandStream = pCmdQ->getCS(1024);
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 10);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 10);
     auto usedBeforeCS = commandStream.getUsed();
     auto usedBeforeISH = indirectHeap.getUsed();
 
     auto retVal1 = EnqueueKernelHelper<>::enqueueKernel(
         pCmdQ,
-        KernelFixture::pKernel);
+        simpleArgKernelWithInternals->mockKernel);
 
     auto retVal2 = EnqueueKernelHelper<>::enqueueKernel(
         &cmdQ,
-        KernelFixture::pKernel);
+        simpleArgKernelWithInternals->mockKernel);
 
     auto usedAfterCS = commandStream.getUsed();
     auto usedAfterISH = indirectHeap.getUsed();
@@ -270,7 +259,7 @@ HWTEST_P(OOMCommandQueueBufferTest, GivenSimpleArgWhenEnqueingKernelThenMaxAvail
     EXPECT_EQ(CL_SUCCESS, retVal2);
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     OOM,
     OOMCommandQueueBufferTest,
     testing::ValuesIn(oomSettings));

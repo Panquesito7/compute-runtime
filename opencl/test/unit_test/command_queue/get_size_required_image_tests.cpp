@@ -1,29 +1,24 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/built_ins/built_ins.h"
-#include "shared/source/utilities/perf_counter.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/source/compiler_interface/compiler_options.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/file_io.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_zebin_wrapper.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/built_ins/builtins_dispatch_builder.h"
-#include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/command_queue/enqueue_copy_image.h"
-#include "opencl/source/command_queue/enqueue_fill_image.h"
-#include "opencl/source/command_queue/enqueue_read_image.h"
-#include "opencl/source/command_queue/enqueue_write_image.h"
 #include "opencl/source/command_queue/gpgpu_walker.h"
-#include "opencl/source/event/event.h"
 #include "opencl/source/helpers/hardware_commands_helper.h"
 #include "opencl/source/kernel/kernel.h"
+#include "opencl/source/program/create.inl"
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
-#include "opencl/test/unit_test/command_queue/enqueue_write_image_fixture.h"
-#include "opencl/test/unit_test/fixtures/built_in_fixture.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
 using namespace NEO;
@@ -38,14 +33,15 @@ struct GetSizeRequiredImageTest : public CommandEnqueueFixture,
         REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
         CommandEnqueueFixture::setUp();
 
-        srcImage = Image2dHelper<>::create(context);
-        dstImage = Image2dHelper<>::create(context);
+        srcImage = Image2dHelperUlt<>::create(context);
+        dstImage = Image2dHelperUlt<>::create(context);
 
         pDevice->setPreemptionMode(PreemptionMode::Disabled);
+        initialized = true;
     }
 
     void TearDown() override {
-        if (IsSkipped()) {
+        if (!initialized) {
             return;
         }
         delete dstImage;
@@ -56,14 +52,31 @@ struct GetSizeRequiredImageTest : public CommandEnqueueFixture,
 
     Image *srcImage = nullptr;
     Image *dstImage = nullptr;
+
+    bool initialized = false;
 };
 
-HWTEST_F(GetSizeRequiredImageTest, WhenCopyingImageThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
+class GetSizeRequiredImageMockedZebinTest : public GetSizeRequiredImageTest {
+  public:
+    void SetUp() override {
+        GetSizeRequiredImageTest::SetUp();
+        mockZebin.setAsMockCompilerReturnedBinary();
+    }
+
+    void TearDown() override {
+        GetSizeRequiredImageTest::TearDown();
+    }
+
+    typedef MockZebinImageWrapper<> MockZebinImageWrapperDefaultTemplateParamsType;
+    MockZebinImageWrapperDefaultTemplateParamsType mockZebin{*defaultHwInfo};
+};
+
+HWTEST_F(GetSizeRequiredImageMockedZebinTest, WhenCopyingImageThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
     auto &commandStream = pCmdQ->getCS(1024);
     auto usedBeforeCS = commandStream.getUsed();
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u);
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u);
     auto usedBeforeDSH = dsh.getUsed();
     auto usedBeforeIOH = ioh.getUsed();
     auto usedBeforeSSH = ssh.getUsed();
@@ -71,11 +84,11 @@ HWTEST_F(GetSizeRequiredImageTest, WhenCopyingImageThenHeapsAndCommandBufferCons
     auto retVal = EnqueueCopyImageHelper<>::enqueueCopyImage(pCmdQ);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyImageToImage3d,
-                                                                            pCmdQ->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImageToImage3d, BuiltIn::bindfulImageBindfulBuffer,
+                                                                              pCmdQ->getClDevice());
     ASSERT_NE(nullptr, &builder);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcImage;
     dc.dstMemObj = dstImage;
     dc.srcOffset = EnqueueCopyImageTraits::srcOrigin;
@@ -96,7 +109,8 @@ HWTEST_F(GetSizeRequiredImageTest, WhenCopyingImageThenHeapsAndCommandBufferCons
 
     auto expectedSizeCS = EnqueueOperation<FamilyType>::getSizeRequiredCS(CL_COMMAND_COPY_IMAGE, false, false, *pCmdQ, kernel, {});
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(*kernel);
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel);
+    size_t localWorkSizes[] = {256, 1, 1};
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel, localWorkSizes, pDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(*kernel);
 
     // Since each enqueue* may flush, we may see a MI_BATCH_BUFFER_END appended.
@@ -109,20 +123,20 @@ HWTEST_F(GetSizeRequiredImageTest, WhenCopyingImageThenHeapsAndCommandBufferCons
     EXPECT_GE(expectedSizeSSH, usedAfterSSH - usedBeforeSSH);
 }
 
-HWTEST_F(GetSizeRequiredImageTest, WhenCopyingReadWriteImageThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
+HWTEST_F(GetSizeRequiredImageMockedZebinTest, WhenCopyingReadWriteImageThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
     auto &commandStream = pCmdQ->getCS(1024);
     auto usedBeforeCS = commandStream.getUsed();
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u);
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u);
     auto usedBeforeDSH = dsh.getUsed();
     auto usedBeforeIOH = ioh.getUsed();
     auto usedBeforeSSH = ssh.getUsed();
 
-    std::unique_ptr<MockProgram> program(Program::createBuiltInFromSource<MockProgram>("CopyImageToImage3d", context, context->getDevices(), nullptr));
-    program->build(program->getDevices(), nullptr);
+    std::unique_ptr<MockProgram> program(Program::createBuiltInFromSource<MockProgram>("CopyImageTo3dImage3d", context, context->getDevices(), nullptr));
+    program->build(program->getDevices(), CompilerOptions::kernelOptions.c_str());
     cl_int retVal{CL_SUCCESS};
-    std::unique_ptr<Kernel> kernel(Kernel::create<MockKernel>(program.get(), program->getKernelInfoForKernel("CopyImageToImage3d"), *context->getDevice(0), retVal));
+    std::unique_ptr<Kernel> kernel(Kernel::create<MockKernel>(program.get(), program->getKernelInfoForKernel("CopyImage3dToImage3d"), *context->getDevice(0), retVal));
 
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_NE(nullptr, kernel);
@@ -143,7 +157,8 @@ HWTEST_F(GetSizeRequiredImageTest, WhenCopyingReadWriteImageThenHeapsAndCommandB
 
     auto expectedSizeCS = EnqueueOperation<FamilyType>::getSizeRequiredCS(CL_COMMAND_COPY_IMAGE, false, false, *pCmdQ, kernel.get(), {});
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(*kernel.get());
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel.get());
+    size_t localWorkSizes[] = {256, 1, 1};
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel.get(), localWorkSizes, pDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(*kernel.get());
 
     // Since each enqueue* may flush, we may see a MI_BATCH_BUFFER_END appended.
@@ -161,9 +176,9 @@ HWTEST_F(GetSizeRequiredImageTest, WhenCopyingReadWriteImageThenHeapsAndCommandB
 HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageNonBlockingThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
     auto &commandStream = pCmdQ->getCS(1024);
     auto usedBeforeCS = commandStream.getUsed();
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u);
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u);
     auto usedBeforeDSH = dsh.getUsed();
     auto usedBeforeIOH = ioh.getUsed();
     auto usedBeforeSSH = ssh.getUsed();
@@ -174,11 +189,12 @@ HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageNonBlockingThenHeapsAndComman
         CL_FALSE);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyImage3dToBuffer,
-                                                                            pCmdQ->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImage3dToBuffer,
+                                                                              defaultBuiltInMode,
+                                                                              pCmdQ->getClDevice());
     ASSERT_NE(nullptr, &builder);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcImage;
     dc.dstPtr = EnqueueReadImageTraits::hostPtr;
     dc.srcOffset = EnqueueReadImageTraits::origin;
@@ -200,11 +216,13 @@ HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageNonBlockingThenHeapsAndComman
 
     auto expectedSizeCS = EnqueueOperation<FamilyType>::getSizeRequiredCS(CL_COMMAND_READ_IMAGE, false, false, *pCmdQ, kernel, {});
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(*kernel);
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel);
+    size_t localWorkSizes[] = {256, 1, 1};
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel, localWorkSizes, pDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(*kernel);
 
     // Since each enqueue* may flush, we may see a MI_BATCH_BUFFER_END appended.
     expectedSizeCS += sizeof(typename FamilyType::MI_BATCH_BUFFER_END);
+    expectedSizeCS += sizeof(typename FamilyType::PIPE_CONTROL); // tag update
     expectedSizeCS = alignUp(expectedSizeCS, MemoryConstants::cacheLineSize);
 
     EXPECT_GE(expectedSizeCS, usedAfterCS - usedBeforeCS);
@@ -216,9 +234,9 @@ HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageNonBlockingThenHeapsAndComman
 HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageBlockingThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
     auto &commandStream = pCmdQ->getCS(1024);
     auto usedBeforeCS = commandStream.getUsed();
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u);
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u);
     auto usedBeforeDSH = dsh.getUsed();
     auto usedBeforeIOH = ioh.getUsed();
     auto usedBeforeSSH = ssh.getUsed();
@@ -229,11 +247,11 @@ HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageBlockingThenHeapsAndCommandBu
         CL_TRUE);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyImage3dToBuffer,
-                                                                            pCmdQ->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImage3dToBuffer, defaultBuiltInMode,
+                                                                              pCmdQ->getClDevice());
     ASSERT_NE(nullptr, &builder);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcImage;
     dc.dstPtr = EnqueueReadImageTraits::hostPtr;
     dc.srcOffset = EnqueueReadImageTraits::origin;
@@ -255,11 +273,13 @@ HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageBlockingThenHeapsAndCommandBu
 
     auto expectedSizeCS = EnqueueOperation<FamilyType>::getSizeRequiredCS(CL_COMMAND_READ_IMAGE, false, false, *pCmdQ, kernel, {});
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(*kernel);
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel);
+    size_t localWorkSizes[] = {256, 1, 1};
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel, localWorkSizes, pDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(*kernel);
 
     // Since each enqueue* may flush, we may see a MI_BATCH_BUFFER_END appended.
     expectedSizeCS += sizeof(typename FamilyType::MI_BATCH_BUFFER_END);
+    expectedSizeCS += sizeof(typename FamilyType::PIPE_CONTROL); // tag update
     expectedSizeCS = alignUp(expectedSizeCS, MemoryConstants::cacheLineSize);
 
     EXPECT_GE(expectedSizeCS, usedAfterCS - usedBeforeCS);
@@ -271,9 +291,9 @@ HWTEST_F(GetSizeRequiredImageTest, WhenReadingImageBlockingThenHeapsAndCommandBu
 HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageNonBlockingThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
     auto &commandStream = pCmdQ->getCS(1024);
     auto usedBeforeCS = commandStream.getUsed();
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u);
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u);
     auto usedBeforeDSH = dsh.getUsed();
     auto usedBeforeIOH = ioh.getUsed();
     auto usedBeforeSSH = ssh.getUsed();
@@ -284,11 +304,11 @@ HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageNonBlockingThenHeapsAndComman
         CL_FALSE);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyBufferToImage3d,
-                                                                            pCmdQ->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToImage3d, defaultBuiltInMode,
+                                                                              pCmdQ->getClDevice());
     ASSERT_NE(nullptr, &builder);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = EnqueueWriteImageTraits::hostPtr;
     dc.dstMemObj = dstImage;
     dc.dstOffset = EnqueueWriteImageTraits::origin;
@@ -310,7 +330,8 @@ HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageNonBlockingThenHeapsAndComman
 
     auto expectedSizeCS = EnqueueOperation<FamilyType>::getSizeRequiredCS(CL_COMMAND_WRITE_IMAGE, false, false, *pCmdQ, kernel, {});
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(*kernel);
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel);
+    size_t localWorkSizes[] = {256, 1, 1};
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel, localWorkSizes, pDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(*kernel);
 
     // Since each enqueue* may flush, we may see a MI_BATCH_BUFFER_END appended.
@@ -326,9 +347,9 @@ HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageNonBlockingThenHeapsAndComman
 HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageBlockingThenHeapsAndCommandBufferConsumedMinimumRequiredSize) {
     auto &commandStream = pCmdQ->getCS(1024);
     auto usedBeforeCS = commandStream.getUsed();
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u);
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u);
     auto usedBeforeDSH = dsh.getUsed();
     auto usedBeforeIOH = ioh.getUsed();
     auto usedBeforeSSH = ssh.getUsed();
@@ -339,11 +360,11 @@ HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageBlockingThenHeapsAndCommandBu
         CL_TRUE);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyBufferToImage3d,
-                                                                            pCmdQ->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToImage3d, defaultBuiltInMode,
+                                                                              pCmdQ->getClDevice());
     ASSERT_NE(nullptr, &builder);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = EnqueueWriteImageTraits::hostPtr;
     dc.dstMemObj = dstImage;
     dc.dstOffset = EnqueueWriteImageTraits::origin;
@@ -365,11 +386,13 @@ HWTEST_F(GetSizeRequiredImageTest, WhenWritingImageBlockingThenHeapsAndCommandBu
 
     auto expectedSizeCS = EnqueueOperation<FamilyType>::getSizeRequiredCS(CL_COMMAND_WRITE_IMAGE, false, false, *pCmdQ, kernel, {});
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(*kernel);
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel);
+    size_t localWorkSizes[] = {256, 1, 1};
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(*kernel, localWorkSizes, pDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(*kernel);
 
     // Since each enqueue* may flush, we may see a MI_BATCH_BUFFER_END appended.
     expectedSizeCS += sizeof(typename FamilyType::MI_BATCH_BUFFER_END);
+    expectedSizeCS += sizeof(typename FamilyType::PIPE_CONTROL); // tag update
     expectedSizeCS = alignUp(expectedSizeCS, MemoryConstants::cacheLineSize);
 
     EXPECT_GE(expectedSizeCS, usedAfterCS - usedBeforeCS);

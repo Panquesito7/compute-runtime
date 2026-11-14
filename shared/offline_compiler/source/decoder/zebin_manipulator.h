@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/source/device_binary_format/zebin/zebin_elf.h"
 #include "shared/source/utilities/arrayref.h"
 #include "shared/source/utilities/const_stringref.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <memory>
 #include <string>
@@ -23,10 +24,10 @@ namespace NEO {
 namespace Elf {
 struct IntelGTNote;
 
-template <ELF_IDENTIFIER_CLASS numBits>
+template <ElfIdentifierClass numBits>
 struct Elf;
 
-template <ELF_IDENTIFIER_CLASS numBits>
+template <ElfIdentifierClass numBits>
 struct ElfEncoder;
 } // namespace Elf
 
@@ -45,14 +46,13 @@ struct Arguments {
 };
 
 enum BinaryFormats {
-    PatchTokens,
     Zebin32b,
     Zebin64b
 };
 
 using ErrorCode = int;
 
-ErrorCode parseIntelGTNotesSectionForDevice(const std::vector<Zebin::Elf::IntelGTNote> &intelGTNotes, IgaWrapper *iga);
+ErrorCode parseIntelGTNotesSectionForDevice(const std::vector<Zebin::Elf::IntelGTNote> &intelGTNotes, IgaWrapper *iga, OclocArgHelper *argHelper);
 ErrorCode validateInput(const std::vector<std::string> &args, IgaWrapper *iga, OclocArgHelper *argHelper, Arguments &outArguments);
 
 BinaryFormats getBinaryFormatForAssemble(OclocArgHelper *argHelper, const std::vector<std::string> &args);
@@ -61,7 +61,7 @@ bool is64BitZebin(OclocArgHelper *argHelper, const std::string &sectionsInfoFile
 
 constexpr ConstStringRef sectionsInfoFilename = "sections.txt";
 
-template <Elf::ELF_IDENTIFIER_CLASS numBits>
+template <Elf::ElfIdentifierClass numBits>
 class ZebinDecoder {
   public:
     using ElfT = Elf::Elf<numBits>;
@@ -95,7 +95,7 @@ class ZebinDecoder {
     std::unique_ptr<IgaWrapper> iga;
 };
 
-template <Elf::ELF_IDENTIFIER_CLASS numBits>
+template <Elf::ElfIdentifierClass numBits>
 class ZebinEncoder {
   public:
     using ElfEncoderT = Elf::ElfEncoder<numBits>;

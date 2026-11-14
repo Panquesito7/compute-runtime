@@ -1,0 +1,155 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/unified_memory/unified_memory.h"
+
+namespace NEO {
+
+template <>
+const AuxTranslationMode GfxCoreHelperHw<Family>::defaultAuxTranslationMode = AuxTranslationMode::none;
+
+template <>
+void GfxCoreHelperHw<Family>::applyAdditionalCompressionSettings(Gmm &gmm, bool isNotCompressed) const {
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm.resourceParamsData.data());
+    gmmResourceParams->Flags.Info.NotCompressed = isNotCompressed;
+    if (!isNotCompressed) {
+        gmmResourceParams->Flags.Info.Cacheable = 0;
+        gmm.applyExtraAuxInitFlag();
+    }
+
+    PRINT_STRING(debugManager.flags.PrintGmmCompressionParams.get(), stdout,
+                 "\n\tFlags.Info.NotCompressed: %u", gmmResourceParams->Flags.Info.NotCompressed);
+}
+
+template <typename GfxFamily>
+const EngineInstancesContainer GfxCoreHelperHw<GfxFamily>::getGpgpuEngineInstances(const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    auto defaultEngine = getChosenEngineType(hwInfo);
+    EngineInstancesContainer engines;
+
+    uint32_t numCcs = hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled;
+
+    if (hwInfo.featureTable.flags.ftrCCSNode) {
+        for (uint32_t i = 0; i < numCcs; i++) {
+            auto engineType = static_cast<aub_stream::EngineType>(i + aub_stream::ENGINE_CCS);
+
+            engines.push_back({engineType, EngineUsage::regular});
+        }
+    }
+
+    if (EngineHelpers::isRcsExposed(rootDeviceEnvironment)) {
+        engines.push_back({aub_stream::ENGINE_CCCS, EngineUsage::regular});
+    }
+
+    engines.push_back({defaultEngine, EngineUsage::lowPriority});
+    engines.push_back({defaultEngine, EngineUsage::internal});
+
+    const bool isPowerHintEngineSupported = NEO::EngineHelpers::isPowerHintEngineSupported(rootDeviceEnvironment);
+    if (isPowerHintEngineSupported) {
+        engines.push_back({defaultEngine, EngineUsage::powerHint});
+    }
+
+    if (hwInfo.capabilityTable.blitterOperationsSupported) {
+
+        if (hwInfo.featureTable.ftrBcsInfo.test(0)) {
+            engines.push_back({aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular});  // Main copy engine
+            engines.push_back({aub_stream::EngineType::ENGINE_BCS, EngineUsage::internal}); // Internal usage
+        }
+
+        uint32_t internalIndex = getInternalCopyEngineIndex(hwInfo);
+        for (uint32_t i = 1; i < hwInfo.featureTable.ftrBcsInfo.size(); i++) {
+            if (hwInfo.featureTable.ftrBcsInfo.test(i)) {
+                auto engineType = static_cast<aub_stream::EngineType>((i - 1) + aub_stream::ENGINE_BCS1); // Link copy engine
+                engines.push_back({engineType, EngineUsage::regular});
+                if (i == internalIndex) {
+                    engines.push_back({engineType, EngineUsage::internal});
+                }
+            }
+        }
+
+        if (isPowerHintEngineSupported) {
+            const auto &productHelper = rootDeviceEnvironment.getProductHelper();
+            auto defaultCopyEngine = productHelper.getDefaultCopyEngine();
+            auto defaultCopyBcsIndex = NEO::EngineHelpers::getBcsIndex(defaultCopyEngine);
+            if (defaultCopyBcsIndex < hwInfo.featureTable.ftrBcsInfo.size() && hwInfo.featureTable.ftrBcsInfo.test(defaultCopyBcsIndex)) {
+                engines.push_back({defaultCopyEngine, EngineUsage::powerHint});
+            }
+        }
+    }
+
+    return engines;
+};
+
+template <>
+void GfxCoreHelperHw<Family>::applyRenderCompressionFlag(Gmm &gmm, uint32_t isCompressed) const {}
+
+template <>
+bool GfxCoreHelperHw<Family>::isTimestampShiftRequired() const {
+    return false;
+}
+
+template <>
+void MemorySynchronizationCommands<Family>::encodeAdditionalTimestampOffsets(LinearStream &commandStream, uint64_t contextAddress, uint64_t globalAddress, bool isBcs) {
+    EncodeStoreMMIO<Family>::encode(commandStream, ContextTimestampRegister<Family>::getRegisterOffsetHigh(), contextAddress + sizeof(uint32_t), false, nullptr, isBcs);
+    EncodeStoreMMIO<Family>::encode(commandStream, RegisterOffsets::globalTimestampUn, globalAddress + sizeof(uint32_t), false, nullptr, isBcs);
+}
+
+template <>
+bool GfxCoreHelperHw<Family>::usmCompressionSupported(const NEO::HardwareInfo &hwInfo) const {
+    if (NEO::debugManager.flags.RenderCompressedBuffersEnabled.get() != -1) {
+        return !!NEO::debugManager.flags.RenderCompressedBuffersEnabled.get();
+    }
+
+    return hwInfo.capabilityTable.ftrRenderCompressedBuffers;
+}
+
+template <>
+bool GfxCoreHelperHw<Family>::isExtendedUsmPoolSizeEnabled() const {
+    return true;
+}
+
+template <>
+bool GfxCoreHelperHw<Family>::isUsmPoolManagerSupported(InternalMemoryType memoryType) const {
+    return true;
+}
+
+template <>
+bool GfxCoreHelperHw<Family>::crossEngineCacheFlushRequired() const {
+    return false;
+};
+
+template <>
+bool GfxCoreHelperHw<Family>::isWalkerPostSyncSkipEnabled(bool isBarrierUsedForImplicitDependency) const {
+    if (debugManager.flags.EnableWalkerPostSyncSkip.get() != -1) {
+        return debugManager.flags.EnableWalkerPostSyncSkip.get() == 1;
+    }
+    if constexpr (UsesResourceBarrier<Family>) {
+        return isBarrierUsedForImplicitDependency;
+    }
+    return false;
+}
+
+template <>
+uint32_t GfxCoreHelperHw<Family>::getAmountOfAllocationsToFill() const {
+    if (debugManager.flags.SetAmountOfReusableAllocations.get() != -1) {
+        return debugManager.flags.SetAmountOfReusableAllocations.get();
+    }
+    return 2u;
+}
+
+template <>
+bool GfxCoreHelperHw<Family>::copyThroughLockedPtrEnabled(const HardwareInfo &hwInfo, const ProductHelper &productHelper) const {
+    if (debugManager.flags.ExperimentalCopyThroughLock.get() != -1) {
+        return debugManager.flags.ExperimentalCopyThroughLock.get() == 1;
+    }
+    return this->isLocalMemoryEnabled(hwInfo);
+}
+
+} // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,53 +7,56 @@
 
 #pragma once
 
-#include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/string_helpers.h"
+#include "shared/source/utilities/allocation_logger.h"
 #include "shared/source/utilities/directory.h"
 #include "shared/source/utilities/logger.h"
+#include "shared/test/common/helpers/mock_file_io.h"
 
 #include <map>
+#include <utility>
 
-template <DebugFunctionalityLevel DebugLevel>
-class TestFileLogger : public NEO::FileLogger<DebugLevel> {
+namespace NEO {
+extern std::map<std::string, std::stringstream> virtualFileList;
+} // namespace NEO
+
+template <DebugFunctionalityLevel debugLevel>
+class TestFileLogger : public NEO::FileLogger<debugLevel> {
   public:
-    using NEO::FileLogger<DebugLevel>::FileLogger;
+    TestFileLogger(std::string filename) : NEO::FileLogger<debugLevel>(std::move(filename)) {
+        if (NEO::FileLogger<debugLevel>::enabled() && virtualFileExists(this->getLogFileName())) {
+            removeVirtualFile(this->getLogFileName());
+        }
+    }
 
     ~TestFileLogger() override {
-        std::remove(NEO::FileLogger<DebugLevel>::logFileName.c_str());
-    }
-
-    void useRealFiles(bool value) {
-        mockFileSystem = !value;
-    }
-
-    void writeToFile(std::string filename,
-                     const char *str,
-                     size_t length,
-                     std::ios_base::openmode mode) override {
-
-        savedFiles[filename] << std::string(str, str + length);
-        if (mockFileSystem == false) {
-            NEO::FileLogger<DebugLevel>::writeToFile(filename, str, length, mode);
+        if (virtualFileExists(this->getLogFileName())) {
+            removeVirtualFile(this->getLogFileName());
         }
-    };
+    }
 
     int32_t createdFilesCount() {
-        return static_cast<int32_t>(savedFiles.size());
+        return static_cast<int32_t>(NEO::virtualFileList.size());
     }
 
     bool wasFileCreated(std::string filename) {
-        return savedFiles.find(filename) != savedFiles.end();
+        return virtualFileExists(filename);
     }
 
     std::string getFileString(std::string filename) {
-        return savedFiles[filename].str();
+        return NEO::virtualFileList[filename].str();
     }
-
-  protected:
-    bool mockFileSystem = true;
-    std::map<std::string, std::stringstream> savedFiles;
 };
 
-using FullyEnabledFileLogger = TestFileLogger<DebugFunctionalityLevel::Full>;
-using FullyDisabledFileLogger = TestFileLogger<DebugFunctionalityLevel::None>;
+template <DebugFunctionalityLevel debugLevel>
+class TestAllocationLogger : public TestFileLogger<debugLevel>, public NEO::AllocationLogger<debugLevel> {
+  public:
+    TestAllocationLogger(std::string filename, const NEO::DebugVariables &flags)
+        : TestFileLogger<debugLevel>(std::move(filename)), NEO::AllocationLogger<debugLevel>(*this, flags) {}
+};
+
+using FullyEnabledFileLogger = TestFileLogger<DebugFunctionalityLevel::full>;
+using FullyDisabledFileLogger = TestFileLogger<DebugFunctionalityLevel::none>;
+using ReleaseInternalFileLogger = TestFileLogger<DebugFunctionalityLevel::regKeys>;
+
+using FullyEnabledAllocationLogger = TestAllocationLogger<DebugFunctionalityLevel::full>;

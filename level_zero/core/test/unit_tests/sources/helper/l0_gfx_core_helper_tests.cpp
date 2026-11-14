@@ -1,15 +1,18 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/built_ins/built_in_ops_base.h"
+#include "shared/source/command_container/implicit_scaling.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
@@ -18,6 +21,8 @@
 
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
 
+#include "multitile_matchers.h"
+
 namespace L0 {
 namespace ult {
 
@@ -25,13 +30,6 @@ using L0GfxCoreHelperTest = ::testing::Test;
 
 TEST(L0GfxCoreHelperTest, WhenL0GfxCoreHelperIsCalledWithUnknownGfxCoreThenNullptrIsReturned) {
     EXPECT_EQ(nullptr, L0GfxCoreHelper::create(IGFX_UNKNOWN_CORE));
-}
-
-HWTEST2_F(L0GfxCoreHelperTest, givenResumeWANotNeededThenFalseIsReturned, IsAtMostGen11) {
-    MockExecutionEnvironment executionEnvironment;
-    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
-
-    EXPECT_FALSE(l0GfxCoreHelper.isResumeWARequired());
 }
 
 using PlatformsWithWa = IsWithinGfxCore<IGFX_GEN12LP_CORE, IGFX_XE_HP_CORE>;
@@ -51,14 +49,23 @@ HWTEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenAskingForImageCompressionS
 
     EXPECT_FALSE(l0GfxCoreHelper.imageCompressionSupported(*NEO::defaultHwInfo));
 
-    NEO::DebugManager.flags.RenderCompressedImagesEnabled.set(1);
+    NEO::debugManager.flags.RenderCompressedImagesEnabled.set(1);
     EXPECT_TRUE(l0GfxCoreHelper.imageCompressionSupported(*NEO::defaultHwInfo));
 
-    NEO::DebugManager.flags.RenderCompressedImagesEnabled.set(0);
+    NEO::debugManager.flags.RenderCompressedImagesEnabled.set(0);
     EXPECT_FALSE(l0GfxCoreHelper.imageCompressionSupported(*NEO::defaultHwInfo));
 }
 
-HWTEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenAskingForUsmCompressionSupportThenReturnFalse) {
+HWTEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenAskingForCmdListWaitOnMemDataSizeThenReturnCorrectSize) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    uint32_t expectedSize = FamilyType::isQwordInOrderCounter ? sizeof(uint64_t) : sizeof(uint32_t);
+
+    EXPECT_EQ(expectedSize, l0GfxCoreHelper.getCmdListWaitOnMemoryDataSize());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenAskingForUsmCompressionSupportThenReturnFalse, IsAtMostXeCore) {
     DebugManagerStateRestore restore;
 
     MockExecutionEnvironment executionEnvironment;
@@ -74,15 +81,15 @@ HWTEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenAskingForUsmCompressionSup
     hwInfo.capabilityTable.ftrRenderCompressedBuffers = false;
     EXPECT_FALSE(l0GfxCoreHelper.usmCompressionSupported(hwInfo));
 
-    NEO::DebugManager.flags.RenderCompressedBuffersEnabled.set(1);
+    NEO::debugManager.flags.RenderCompressedBuffersEnabled.set(1);
     EXPECT_TRUE(l0GfxCoreHelper.usmCompressionSupported(hwInfo));
 
     hwInfo.capabilityTable.ftrRenderCompressedBuffers = true;
-    NEO::DebugManager.flags.RenderCompressedBuffersEnabled.set(0);
+    NEO::debugManager.flags.RenderCompressedBuffersEnabled.set(0);
     EXPECT_FALSE(l0GfxCoreHelper.usmCompressionSupported(hwInfo));
 }
 
-HWTEST_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmaskThenCorrectBitmaskIsReturned) {
+HWTEST2_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmaskThenCorrectBitmaskIsReturned, IsAtMostXe2HpgCore) {
 
     auto printAttentionBitmask = [](uint8_t *expected, uint8_t *actual, uint32_t maxSlices, uint32_t maxSubSlicesPerSlice, uint32_t maxEuPerSubslice, uint32_t threadsPerEu, bool printBitmask = false) {
         auto bytesPerThread = threadsPerEu > 8 ? 2u : 1u;
@@ -118,7 +125,11 @@ HWTEST_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmask
     };
 
     auto hwInfo = *NEO::defaultHwInfo.get();
-    MockExecutionEnvironment executionEnvironment;
+
+    hwInfo.gtSystemInfo.MaxEuPerSubSlice = 16u;
+    hwInfo.gtSystemInfo.EUCount = hwInfo.gtSystemInfo.MaxEuPerSubSlice * hwInfo.gtSystemInfo.SubSliceCount;
+    hwInfo.gtSystemInfo.ThreadCount = hwInfo.gtSystemInfo.EUCount * hwInfo.gtSystemInfo.NumThreadsPerEu;
+    MockExecutionEnvironment executionEnvironment(&hwInfo);
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
 
     std::unique_ptr<uint8_t[]> bitmask;
@@ -127,10 +138,7 @@ HWTEST_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmask
     uint32_t subslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
     uint32_t subslice = subslicesPerSlice > 1 ? subslicesPerSlice - 1 : 0;
 
-    const auto threadsPerEu = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount);
-
-    auto &compilerProductHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<NEO::CompilerProductHelper>();
-    auto bytesPerEu = Math::divideAndRoundUp(compilerProductHelper.getNumThreadsPerEu(), 8u);
+    auto bytesPerEu = Math::divideAndRoundUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8u);
 
     const auto maxEUsInAtt = hwInfo.gtSystemInfo.MaxEuPerSubSlice > 8 ? 8 : hwInfo.gtSystemInfo.MaxEuPerSubSlice;
     const auto threadsSizePerSubSlice = maxEUsInAtt * bytesPerEu;
@@ -168,7 +176,7 @@ HWTEST_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmask
     data = ptrOffset(data, 3 * bytesPerEu);
     data[0] = 1 << 6;
 
-    printAttentionBitmask(expectedBitmask.get(), bitmask.get(), hwInfo.gtSystemInfo.MaxSlicesSupported, subslicesPerSlice, hwInfo.gtSystemInfo.MaxEuPerSubSlice, threadsPerEu);
+    printAttentionBitmask(expectedBitmask.get(), bitmask.get(), hwInfo.gtSystemInfo.MaxSlicesSupported, subslicesPerSlice, hwInfo.gtSystemInfo.MaxEuPerSubSlice, hwInfo.gtSystemInfo.NumThreadsPerEu);
     EXPECT_EQ(0, memcmp(bitmask.get(), expectedBitmask.get(), size));
 
     threads.clear();
@@ -183,7 +191,7 @@ HWTEST_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmask
     data = ptrOffset(data, 3 * bytesPerEu);
     data[0] = 1 << 6;
 
-    printAttentionBitmask(expectedBitmask.get(), bitmask.get(), hwInfo.gtSystemInfo.MaxSlicesSupported, subslicesPerSlice, hwInfo.gtSystemInfo.MaxEuPerSubSlice, threadsPerEu);
+    printAttentionBitmask(expectedBitmask.get(), bitmask.get(), hwInfo.gtSystemInfo.MaxSlicesSupported, subslicesPerSlice, hwInfo.gtSystemInfo.MaxEuPerSubSlice, hwInfo.gtSystemInfo.NumThreadsPerEu);
     EXPECT_EQ(0, memcmp(bitmask.get(), expectedBitmask.get(), size));
 
     threads.clear();
@@ -203,11 +211,11 @@ HWTEST_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmask
     }
     data[0] = 1;
 
-    printAttentionBitmask(expectedBitmask.get(), bitmask.get(), hwInfo.gtSystemInfo.MaxSlicesSupported, subslicesPerSlice, hwInfo.gtSystemInfo.MaxEuPerSubSlice, threadsPerEu);
+    printAttentionBitmask(expectedBitmask.get(), bitmask.get(), hwInfo.gtSystemInfo.MaxSlicesSupported, subslicesPerSlice, hwInfo.gtSystemInfo.MaxEuPerSubSlice, hwInfo.gtSystemInfo.NumThreadsPerEu);
     EXPECT_EQ(0, memcmp(bitmask.get(), expectedBitmask.get(), size));
 }
 
-HWTEST_F(L0GfxCoreHelperTest, givenSingleThreadsWhenGettingBitmaskThenCorrectBitsAreSet) {
+HWTEST2_F(L0GfxCoreHelperTest, givenSingleThreadsWhenGettingBitmaskThenCorrectBitsAreSet, IsAtMostXe2HpgCore) {
     auto hwInfo = *NEO::defaultHwInfo.get();
     MockExecutionEnvironment executionEnvironment;
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
@@ -221,14 +229,161 @@ HWTEST_F(L0GfxCoreHelperTest, givenSingleThreadsWhenGettingBitmaskThenCorrectBit
 
     l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threads, hwInfo, bitmask, size);
 
-    auto &compilerProductHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<NEO::CompilerProductHelper>();
-    auto numBytesPerThread = Math::divideAndRoundUp(compilerProductHelper.getNumThreadsPerEu(), 8u);
+    auto numBytesPerThread = Math::divideAndRoundUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8u);
 
     auto data = bitmask.get();
     EXPECT_EQ(1u << 3, data[0]);
     EXPECT_EQ(1u, data[numBytesPerThread]);
 
     EXPECT_TRUE(memoryZeroed(&data[numBytesPerThread + 1], size - numBytesPerThread - 1));
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenSingleThreadsWhenGettingBitmaskThenCorrectBitsAreSet, IsXe3Core) {
+    auto hwInfo = *NEO::defaultHwInfo.get();
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    hwInfo.gtSystemInfo.IsDynamicallyPopulated = true;
+    hwInfo.gtSystemInfo.MaxSlicesSupported = 4u;
+    hwInfo.gtSystemInfo.MaxSubSlicesSupported = 16u;
+    for (auto &sliceInfo : hwInfo.gtSystemInfo.SliceInfo) {
+        sliceInfo.Enabled = false;
+    }
+    hwInfo.gtSystemInfo.SliceInfo[2].Enabled = true;
+    hwInfo.gtSystemInfo.SliceInfo[3].Enabled = true;
+
+    hwInfo.gtSystemInfo.NumThreadsPerEu = 10u;
+    hwInfo.gtSystemInfo.ThreadCount = hwInfo.gtSystemInfo.EUCount * hwInfo.gtSystemInfo.NumThreadsPerEu;
+
+    const uint32_t numSubslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
+    const uint32_t numEuPerSubslice = std::min(hwInfo.gtSystemInfo.MaxEuPerSubSlice, 8u);
+    const uint32_t bytesPerEu = alignUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8) / 8;
+    const uint32_t threadsSizePerSlice = numSubslicesPerSlice * numEuPerSubslice * bytesPerEu;
+
+    std::unique_ptr<uint8_t[]> bitmask;
+    size_t size = 0;
+
+    std::vector<EuThread::ThreadId> threads;
+    threads.push_back({0, 0, 0, 0, 8});
+    threads.push_back({0, 0, 0, 1, 9});
+
+    threads.push_back({0, 1, 0, 0, 0});
+    threads.push_back({0, 1, 0, 1, 1});
+    threads.push_back({0, 1, 0, 0, 8});
+    threads.push_back({0, 1, 0, 1, 9});
+
+    threads.push_back({0, 1, 1, 0, 0});
+    threads.push_back({0, 1, 1, 1, 1});
+    threads.push_back({0, 1, 1, 0, 8});
+    threads.push_back({0, 1, 1, 1, 9});
+
+    threads.push_back({0, 2, 1, 0, 0});
+    threads.push_back({0, 2, 1, 1, 1});
+    threads.push_back({0, 2, 1, 0, 8});
+    threads.push_back({0, 2, 1, 1, 9});
+
+    threads.push_back({0, 1, 2, 0, 0});
+    threads.push_back({0, 1, 2, 1, 1});
+    threads.push_back({0, 1, 2, 0, 8});
+    threads.push_back({0, 1, 2, 1, 9});
+
+    auto maxSlice = hwInfo.gtSystemInfo.MaxSlicesSupported - 1;
+    threads.push_back({0, maxSlice, 2, 3, 0});
+    threads.push_back({0, maxSlice, 2, 3, 1});
+    threads.push_back({0, maxSlice, 2, 3, 8});
+    threads.push_back({0, maxSlice, 2, 3, 9});
+
+    auto maxSubSlice = numSubslicesPerSlice - 1;
+    threads.push_back({0, 1, maxSubSlice, 3, 0});
+    threads.push_back({0, 1, maxSubSlice, 3, 1});
+    threads.push_back({0, 1, maxSubSlice, 3, 8});
+    threads.push_back({0, 1, maxSubSlice, 3, 9});
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threads, hwInfo, bitmask, size);
+
+    auto data = bitmask.get();
+    EXPECT_EQ(1u, data[8]);
+    EXPECT_EQ(1u << 1, data[9]);
+
+    auto sliceOffset = threadsSizePerSlice;
+    EXPECT_EQ(1u, data[sliceOffset]);
+    EXPECT_EQ(1u << 1, data[sliceOffset + 1]);
+
+    EXPECT_EQ(1u, data[sliceOffset + 8]);
+    EXPECT_EQ(1u << 1, data[sliceOffset + 9]);
+
+    auto subSliceOffset = sliceOffset + numEuPerSubslice * bytesPerEu;
+    EXPECT_EQ(1u, data[subSliceOffset]);
+    EXPECT_EQ(1u << 1, data[subSliceOffset + 1]);
+
+    EXPECT_EQ(1u, data[subSliceOffset + 8]);
+    EXPECT_EQ(1u << 1, data[subSliceOffset + 9]);
+
+    size_t threadCount = 0;
+    for (size_t i = 0; i < size; i++) {
+        while (data[i]) {
+            if (data[i] & 0x01) {
+                threadCount++;
+            }
+            data[i] = data[i] >> 1;
+        }
+    }
+    EXPECT_EQ(threadCount, threads.size());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenSliceSubsliceEuAndThreadIdsWhenGettingBitmaskThenCorrectBitmaskIsReturned, IsXe3Core) {
+
+    auto hwInfo = *NEO::defaultHwInfo.get();
+
+    hwInfo.gtSystemInfo.MaxEuPerSubSlice = 16u;
+    hwInfo.gtSystemInfo.EUCount = hwInfo.gtSystemInfo.MaxEuPerSubSlice * hwInfo.gtSystemInfo.SubSliceCount;
+    hwInfo.gtSystemInfo.NumThreadsPerEu = 10u;
+    hwInfo.gtSystemInfo.ThreadCount = hwInfo.gtSystemInfo.EUCount * hwInfo.gtSystemInfo.NumThreadsPerEu;
+    MockExecutionEnvironment executionEnvironment(&hwInfo);
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    const uint32_t numSubslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
+    const uint32_t numEuPerSubslice = std::min(hwInfo.gtSystemInfo.MaxEuPerSubSlice, 8u);
+    const uint32_t bytesPerEu = alignUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8) / 8;
+    const uint32_t threadsSizePerSlice = numSubslicesPerSlice * numEuPerSubslice * bytesPerEu;
+    auto sliceOffset = threadsSizePerSlice;
+
+    std::unique_ptr<uint8_t[]> bitmask;
+    size_t size = 0;
+
+    std::vector<EuThread::ThreadId> threads;
+    threads.push_back({0, 0, 0, 0, 6});
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threads, hwInfo, bitmask, size);
+
+    auto expectedBitmask = std::make_unique<uint8_t[]>(size);
+    memset(expectedBitmask.get(), 0, size);
+
+    auto returnedBitmask = bitmask.get();
+    EXPECT_EQ(uint8_t(1u << 6), returnedBitmask[0]);
+
+    threads.clear();
+    threads.push_back({0, 0, 0, 1, 3});
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threads, hwInfo, bitmask, size);
+
+    returnedBitmask = bitmask.get();
+    EXPECT_EQ(uint8_t(1u << 3), returnedBitmask[1]);
+
+    threads.clear();
+    threads.push_back({0, 0, 1, 1, 8});
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threads, hwInfo, bitmask, size);
+
+    returnedBitmask = bitmask.get();
+    EXPECT_EQ(1u, returnedBitmask[25]);
+
+    threads.clear();
+    threads.push_back({0, 1, 0, 0, 8});
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threads, hwInfo, bitmask, size);
+
+    returnedBitmask = bitmask.get();
+    EXPECT_EQ(1u, returnedBitmask[sliceOffset + 8]);
 }
 
 HWTEST_F(L0GfxCoreHelperTest, givenBitmaskWithAttentionBitsForSingleThreadWhenGettingThreadsThenSingleCorrectThreadReturned) {
@@ -267,6 +422,51 @@ HWTEST_F(L0GfxCoreHelperTest, givenBitmaskWithAttentionBitsForSingleThreadWhenGe
     EXPECT_EQ(threadID, threads[0].thread);
 
     EXPECT_EQ(1u, threads[0].tileIndex);
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenBitmaskWithAttentionBitsForSingleThreadWhenGettingThreadsThenSingleCorrectThreadReturned, IsXe3Core) {
+    auto hwInfo = *NEO::defaultHwInfo.get();
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    hwInfo.gtSystemInfo.NumThreadsPerEu = 10u;
+    hwInfo.gtSystemInfo.ThreadCount = hwInfo.gtSystemInfo.EUCount * hwInfo.gtSystemInfo.NumThreadsPerEu;
+
+    std::unique_ptr<uint8_t[]> bitmask;
+    size_t size = 0;
+
+    uint32_t subslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
+    uint32_t subsliceID = subslicesPerSlice > 2 ? subslicesPerSlice - 2 : 0;
+
+    uint32_t threadID = 8;
+    std::vector<EuThread::ThreadId> threadsWithAtt;
+    threadsWithAtt.push_back({0, 0, subsliceID, 0, threadID});
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threadsWithAtt, hwInfo, bitmask, size);
+
+    auto threads = l0GfxCoreHelper.getThreadsFromAttentionBitmask(hwInfo, 0, bitmask.get(), size);
+
+    ASSERT_EQ(1u, threads.size());
+    EXPECT_EQ(0u, threads[0].slice);
+    EXPECT_EQ(subsliceID, threads[0].subslice);
+    EXPECT_EQ(0u, threads[0].eu);
+    EXPECT_EQ(threadID, threads[0].thread);
+
+    EXPECT_EQ(0u, threads[0].tileIndex);
+
+    std::memset(bitmask.get(), 0, size);
+    threadsWithAtt.clear();
+    threadID = 9;
+    threadsWithAtt.push_back({0, 0, 1, 5, threadID});
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threadsWithAtt, hwInfo, bitmask, size);
+    threads = l0GfxCoreHelper.getThreadsFromAttentionBitmask(hwInfo, 0, bitmask.get(), size);
+
+    ASSERT_EQ(1u, threads.size());
+    EXPECT_EQ(0u, threads[0].slice);
+    EXPECT_EQ(1u, threads[0].subslice);
+    EXPECT_EQ(5u, threads[0].eu);
+    EXPECT_EQ(threadID, threads[0].thread);
 }
 
 HWTEST_F(L0GfxCoreHelperTest, givenBitmaskWithAttentionBitsForAllSubslicesWhenGettingThreadsThenCorrectThreadsAreReturned) {
@@ -332,13 +532,12 @@ HWTEST_F(L0GfxCoreHelperTest, givenBitmaskWithAttentionBitsForAllEUsWhenGettingT
     }
 }
 
-HWTEST_F(L0GfxCoreHelperTest, givenEu0To1Threads0To3BitmaskWhenGettingThreadsThenCorrectThreadsAreReturned) {
+HWTEST2_F(L0GfxCoreHelperTest, givenEu0To1Threads0To3BitmaskWhenGettingThreadsThenCorrectThreadsAreReturned, IsWithinXeHpcCoreAndXe2HpgCore) {
     auto hwInfo = *NEO::defaultHwInfo.get();
     MockExecutionEnvironment executionEnvironment;
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
 
-    auto &compilerProductHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<NEO::CompilerProductHelper>();
-    auto numBytesPerEu = Math::divideAndRoundUp(compilerProductHelper.getNumThreadsPerEu(), 8u);
+    auto numBytesPerEu = Math::divideAndRoundUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8u);
 
     uint8_t data[4]{};
     data[0] = 0x0f;
@@ -357,6 +556,123 @@ HWTEST_F(L0GfxCoreHelperTest, givenEu0To1Threads0To3BitmaskWhenGettingThreadsThe
         {0, 0, 1, 3}};
 
     for (uint32_t i = 0; i < 8u; i++) {
+        EXPECT_EQ(expectedThreads[i].slice, threads[i].slice);
+        EXPECT_EQ(expectedThreads[i].subslice, threads[i].subslice);
+        EXPECT_EQ(expectedThreads[i].eu, threads[i].eu);
+        EXPECT_EQ(expectedThreads[i].thread, threads[i].thread);
+
+        EXPECT_EQ(0u, threads[i].tileIndex);
+    }
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenEu0To1Threads6To10BitmaskWhenGettingThreadsThenCorrectThreadsAreReturned, IsXe3Core) {
+    auto hwInfo = *NEO::defaultHwInfo.get();
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    hwInfo.gtSystemInfo.NumThreadsPerEu = 10u;
+    hwInfo.gtSystemInfo.ThreadCount = hwInfo.gtSystemInfo.EUCount * hwInfo.gtSystemInfo.NumThreadsPerEu;
+
+    const uint32_t numSubslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
+    const uint32_t numEuPerSubslice = std::min(hwInfo.gtSystemInfo.MaxEuPerSubSlice, 8u);
+    const uint32_t bytesPerEu = alignUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8) / 8;
+    const uint32_t threadsSizePerSlice = numSubslicesPerSlice * numEuPerSubslice * bytesPerEu;
+
+    auto subsliceOffset = numEuPerSubslice * bytesPerEu;
+    auto sliceOffset = threadsSizePerSlice;
+
+    uint8_t data[1024] = {};
+    data[0] = 0xC0;
+    data[1] = 0xC0;
+    data[8] = 0x03;
+    data[9] = 0x03;
+    data[subsliceOffset + 8] = 0x03;
+    data[subsliceOffset + 9] = 0x03;
+    data[sliceOffset + subsliceOffset + 8] = 0x03;
+    data[sliceOffset + subsliceOffset + 9] = 0x03;
+
+    ze_device_thread_t expectedThreads[] = {
+        {0, 0, 0, 6},
+        {0, 0, 0, 7},
+        {0, 0, 1, 6},
+        {0, 0, 1, 7},
+        {0, 0, 0, 8},
+        {0, 0, 0, 9},
+        {0, 0, 1, 8},
+        {0, 0, 1, 9},
+        // subslice > 0
+        {0, 1, 0, 8},
+        {0, 1, 0, 9},
+        {0, 1, 1, 8},
+        {0, 1, 1, 9},
+        // slice > 0
+        {1, 1, 0, 8},
+        {1, 1, 0, 9},
+        {1, 1, 1, 8},
+        {1, 1, 1, 9}};
+
+    auto threads = l0GfxCoreHelper.getThreadsFromAttentionBitmask(hwInfo, 0, data, sizeof(data));
+    ASSERT_EQ(16u, threads.size());
+
+    for (uint32_t i = 0; i < 16u; i++) {
+        EXPECT_EQ(expectedThreads[i].slice, threads[i].slice);
+        EXPECT_EQ(expectedThreads[i].subslice, threads[i].subslice);
+        EXPECT_EQ(expectedThreads[i].eu, threads[i].eu);
+        EXPECT_EQ(expectedThreads[i].thread, threads[i].thread);
+        EXPECT_EQ(0u, threads[i].tileIndex);
+    }
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenThreadsToBitmaskThenSameThreadsReturnedParsingBitmask, IsXe3Core) {
+    auto hwInfo = *NEO::defaultHwInfo.get();
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    hwInfo.gtSystemInfo.IsDynamicallyPopulated = true;
+    hwInfo.gtSystemInfo.MaxSlicesSupported = 4u;
+    hwInfo.gtSystemInfo.MaxSubSlicesSupported = 16u;
+    for (auto &sliceInfo : hwInfo.gtSystemInfo.SliceInfo) {
+        sliceInfo.Enabled = false;
+    }
+    hwInfo.gtSystemInfo.SliceInfo[2].Enabled = true;
+    hwInfo.gtSystemInfo.SliceInfo[3].Enabled = true;
+
+    hwInfo.gtSystemInfo.NumThreadsPerEu = 10u;
+    hwInfo.gtSystemInfo.ThreadCount = hwInfo.gtSystemInfo.EUCount * hwInfo.gtSystemInfo.NumThreadsPerEu;
+
+    std::unique_ptr<uint8_t[]> bitmask;
+    size_t size = 0;
+
+    // ordering is important, byte0 of every EU is before byte1 of any EU
+    std::vector<EuThread::ThreadId> expectedThreads = {
+        {0, 0, 0, 0, 6},
+        {0, 0, 0, 0, 7},
+        {0, 0, 0, 1, 6},
+        {0, 0, 0, 1, 7},
+        {0, 0, 0, 0, 8},
+        {0, 0, 0, 0, 9},
+        {0, 0, 0, 1, 8},
+        {0, 0, 0, 1, 9},
+        {0, 0, 1, 0, 8},
+        {0, 0, 1, 0, 9},
+        {0, 0, 1, 1, 8},
+        {0, 0, 1, 1, 9},
+        {0, 1, 1, 3, 5},
+        {0, 1, 1, 6, 7},
+        {0, 1, 1, 0, 8},
+        {0, 1, 1, 0, 9},
+        {0, 1, 1, 1, 8},
+        {0, 1, 1, 1, 9},
+        {0, 1, 1, 2, 8},
+        {0, 1, 1, 4, 9},
+        {0, 2, 1, 0, 0},
+        {0, 2, 2, 3, 5}};
+
+    l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(expectedThreads, hwInfo, bitmask, size);
+
+    auto threads = l0GfxCoreHelper.getThreadsFromAttentionBitmask(hwInfo, 0, bitmask.get(), size);
+
+    for (uint32_t i = 0; i < expectedThreads.size(); i++) {
         EXPECT_EQ(expectedThreads[i].slice, threads[i].slice);
         EXPECT_EQ(expectedThreads[i].subslice, threads[i].subslice);
         EXPECT_EQ(expectedThreads[i].eu, threads[i].eu);
@@ -465,8 +781,7 @@ HWTEST2_F(L0GfxCoreHelperFusedEuTest, givenDynamicallyPopulatesSliceInfoGreaterT
     l0GfxCoreHelper.getAttentionBitmaskForSingleThreads(threadsWithAtt, hwInfo, bitmask, size);
     const uint32_t numSubslicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
     const uint32_t numEuPerSubslice = std::min(hwInfo.gtSystemInfo.MaxEuPerSubSlice, 8u);
-    const uint32_t numThreadsPerEu = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount);
-    const uint32_t bytesPerEu = alignUp(numThreadsPerEu, 8) / 8;
+    const uint32_t bytesPerEu = alignUp(hwInfo.gtSystemInfo.NumThreadsPerEu, 8) / 8;
     auto expectedSize = 4 * numSubslicesPerSlice * numEuPerSubslice * bytesPerEu;
     EXPECT_EQ(size, expectedSize);
 
@@ -689,12 +1004,30 @@ HWTEST2_F(L0GfxCoreHelperFusedEuTest, givenBitmaskWithAttentionBitsForHalfOfThre
     }
 }
 
-using NonMultiTilePlatforms = IsWithinGfxCore<IGFX_GEN9_CORE, IGFX_GEN12LP_CORE>;
-
-HWTEST2_F(L0GfxCoreHelperTest, GivenNonMultiTilePlatformsWhenCheckingL0HelperForMultiTileCapablePlatformThenReturnFalse, NonMultiTilePlatforms) {
+HWTEST2_F(L0GfxCoreHelperTest, givenXe2OrXe3PlatformWhenAdjustBuiltInImageModeToBindfulCalledThenImageModeIsBindful, IsWithinXe2HpgCoreAndXe3Core) {
     MockExecutionEnvironment executionEnvironment;
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
-    EXPECT_FALSE(l0GfxCoreHelper.multiTileCapablePlatform());
+
+    NEO::BuiltIn::AddressingMode mode = NEO::BuiltIn::bindlessImageStatelessBuffer;
+    EXPECT_EQ(NEO::BuiltIn::AddressingMode::ImageMode::bindless, mode.imageMode);
+
+    l0GfxCoreHelper.adjustBuiltInImageModeToBindful(mode);
+
+    EXPECT_EQ(NEO::BuiltIn::AddressingMode::ImageMode::bindful, mode.imageMode);
+    EXPECT_EQ(NEO::BuiltIn::AddressingMode::BufferMode::stateless, mode.bufferMode);
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenNonXe2Xe3PlatformWhenAdjustBuiltInImageModeToBindfulCalledThenImageModeIsUnchanged, IsAtLeastXe3pCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    NEO::BuiltIn::AddressingMode mode = NEO::BuiltIn::bindlessImageStatelessBuffer;
+    EXPECT_EQ(NEO::BuiltIn::AddressingMode::ImageMode::bindless, mode.imageMode);
+
+    l0GfxCoreHelper.adjustBuiltInImageModeToBindful(mode);
+
+    EXPECT_EQ(NEO::BuiltIn::AddressingMode::ImageMode::bindless, mode.imageMode);
+    EXPECT_EQ(NEO::BuiltIn::AddressingMode::BufferMode::stateless, mode.bufferMode);
 }
 
 HWTEST2_F(L0GfxCoreHelperTest, whenAlwaysAllocateEventInLocalMemCalledThenReturnFalse, IsNotXeHpcCore) {
@@ -704,37 +1037,31 @@ HWTEST2_F(L0GfxCoreHelperTest, whenAlwaysAllocateEventInLocalMemCalledThenReturn
     EXPECT_FALSE(l0GfxCoreHelper.alwaysAllocateEventInLocalMem());
 }
 
-TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultValueForUsePipeControlMultiKernelEventSyncThenReturnTrue) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
-    bool defaultValue = L0::L0GfxCoreHelper::usePipeControlMultiKernelEventSync(hwInfo);
-    EXPECT_TRUE(defaultValue);
-}
-
 TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultValueForCompactL3FlushEventPacketThenReturnTrue) {
     auto hwInfo = *NEO::defaultHwInfo.get();
-    bool defaultValue = L0::L0GfxCoreHelper::useCompactL3FlushEventPacket(hwInfo);
+    bool useL3FlushAfterPostSync = false;
+    bool defaultValue = L0::L0GfxCoreHelper::useCompactL3FlushEventPacket(hwInfo, useL3FlushAfterPostSync);
     EXPECT_TRUE(defaultValue);
 }
 
-TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultValueForDynamicEventPacketCountThenReturnTrue) {
+TEST_F(L0GfxCoreHelperTest, givenL3FlushAfterPostSyncWhenUseCompactL3FlushEventPacketThenFalseIsReturned) {
     auto hwInfo = *NEO::defaultHwInfo.get();
-    bool defaultValue = L0::L0GfxCoreHelper::useDynamicEventPacketsCount(hwInfo);
-    EXPECT_TRUE(defaultValue);
+    bool useL3FlushAfterPostSync = true;
+    bool compactL3FlushEventEnabled = L0::L0GfxCoreHelper::useCompactL3FlushEventPacket(hwInfo, useL3FlushAfterPostSync);
+    EXPECT_FALSE(compactL3FlushEventEnabled);
 }
 
-HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingMaxKernelAndMaxPacketThenExpectBothReturnOne, NonMultiTilePlatforms) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingMaxPacketThenExpectReturnOne, MultiTileNotSupported) {
     MockExecutionEnvironment executionEnvironment;
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
-    EXPECT_EQ(1u, l0GfxCoreHelper.getEventMaxKernelCount(hwInfo));
     EXPECT_EQ(1u, l0GfxCoreHelper.getEventBaseMaxPacketCount(*executionEnvironment.rootDeviceEnvironments[0]));
 }
 
-template <int32_t usePipeControlMultiPacketEventSync, int32_t compactL3FlushEventPacket>
+template <int32_t compactL3FlushEventPacket>
 struct L0GfxCoreHelperMultiPacketEventFixture {
     void setUp() {
-        DebugManager.flags.UsePipeControlMultiKernelEventSync.set(usePipeControlMultiPacketEventSync);
-        DebugManager.flags.CompactL3FlushEventPacket.set(compactL3FlushEventPacket);
+        debugManager.flags.CompactL3FlushEventPacket.set(compactL3FlushEventPacket);
+        debugManager.flags.EnableL3FlushAfterPostSync.set(0);
     }
 
     void tearDown() {
@@ -744,40 +1071,10 @@ struct L0GfxCoreHelperMultiPacketEventFixture {
     MockExecutionEnvironment executionEnvironment;
 };
 
-using L0GfxCoreHelperEventMultiKernelEnabledL3FlushCompactDisabledTest = Test<L0GfxCoreHelperMultiPacketEventFixture<0, 0>>;
-HWTEST2_F(L0GfxCoreHelperEventMultiKernelEnabledL3FlushCompactDisabledTest,
-          givenL0GfxCoreHelperWhenGettingMaxKernelAndMaxPacketThenExpectKernelThreeAndPacketThreeWithL3PacketWhenApplicable,
-          IsAtLeastXeHpCore) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
-    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
-
-    uint32_t expectedPacket = 3;
-    if (NEO::MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, *executionEnvironment.rootDeviceEnvironments[0])) {
-        expectedPacket++;
-    }
-
-    EXPECT_EQ(3u, l0GfxCoreHelper.getEventMaxKernelCount(hwInfo));
-    EXPECT_EQ(expectedPacket, l0GfxCoreHelper.getEventBaseMaxPacketCount(*executionEnvironment.rootDeviceEnvironments[0]));
-}
-
-using L0GfxCoreHelperEventMultiKernelEnabledL3FlushCompactEnabledTest = Test<L0GfxCoreHelperMultiPacketEventFixture<0, 1>>;
-HWTEST2_F(L0GfxCoreHelperEventMultiKernelEnabledL3FlushCompactEnabledTest,
-          givenL0GfxCoreHelperWhenGettingMaxKernelAndMaxPacketThenExpectKernelThreeAndPacketThree,
-          IsAtLeastXeHpCore) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
-    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
-
-    uint32_t expectedPacket = 3;
-
-    EXPECT_EQ(3u, l0GfxCoreHelper.getEventMaxKernelCount(hwInfo));
-    EXPECT_EQ(expectedPacket, l0GfxCoreHelper.getEventBaseMaxPacketCount(*executionEnvironment.rootDeviceEnvironments[0]));
-}
-
-using L0GfxCoreHelperEventMultiKernelDisabledL3FlushCompactDisabledTest = Test<L0GfxCoreHelperMultiPacketEventFixture<1, 0>>;
-HWTEST2_F(L0GfxCoreHelperEventMultiKernelDisabledL3FlushCompactDisabledTest,
-          givenL0GfxCoreHelperWhenGettingMaxKernelAndMaxPacketThenExpectKernelOneAndPacketOneWithL3PacketWhenApplicable,
-          IsAtLeastXeHpCore) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
+using L0GfxCoreHelperEventL3FlushCompactDisabledTest = Test<L0GfxCoreHelperMultiPacketEventFixture<0>>;
+HWTEST2_F(L0GfxCoreHelperEventL3FlushCompactDisabledTest,
+          givenL0GfxCoreHelperWhenGettingMaxPacketThenExpectPacketOneWithL3PacketWhenApplicable,
+          IsAtLeastXeCore) {
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
 
     uint32_t expectedPacket = 1;
@@ -785,27 +1082,18 @@ HWTEST2_F(L0GfxCoreHelperEventMultiKernelDisabledL3FlushCompactDisabledTest,
         expectedPacket++;
     }
 
-    EXPECT_EQ(1u, l0GfxCoreHelper.getEventMaxKernelCount(hwInfo));
     EXPECT_EQ(expectedPacket, l0GfxCoreHelper.getEventBaseMaxPacketCount(*executionEnvironment.rootDeviceEnvironments[0]));
 }
 
-using L0GfxCoreHelperEventMultiKernelDisabledL3FlushCompactEnabledTest = Test<L0GfxCoreHelperMultiPacketEventFixture<1, 1>>;
-HWTEST2_F(L0GfxCoreHelperEventMultiKernelDisabledL3FlushCompactEnabledTest,
-          givenL0GfxCoreHelperWhenGettingMaxKernelAndMaxPacketThenExpectKernelOneAndPacketOne,
-          IsAtLeastXeHpCore) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
+using L0GfxCoreHelperEventL3FlushCompactEnabledTest = Test<L0GfxCoreHelperMultiPacketEventFixture<1>>;
+HWTEST2_F(L0GfxCoreHelperEventL3FlushCompactEnabledTest,
+          givenL0GfxCoreHelperWhenGettingMaxPacketThenExpectPacketOne,
+          IsAtLeastXeCore) {
     auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
 
     uint32_t expectedPacket = 1;
 
-    EXPECT_EQ(1u, l0GfxCoreHelper.getEventMaxKernelCount(hwInfo));
     EXPECT_EQ(expectedPacket, l0GfxCoreHelper.getEventBaseMaxPacketCount(*executionEnvironment.rootDeviceEnvironments[0]));
-}
-
-TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultValueForSignalAllEventPacketThenReturnTrue) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
-    bool defaultValue = L0::L0GfxCoreHelper::useSignalAllEventPackets(hwInfo);
-    EXPECT_TRUE(defaultValue);
 }
 
 TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultHeapModelThenUsePlatformDefaultHeapModel) {
@@ -813,7 +1101,7 @@ TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultHeapModelThenU
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
     auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
 
-    EXPECT_EQ(l0GfxCoreHelper.getPlatformHeapAddressModel(), L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
+    EXPECT_EQ(l0GfxCoreHelper.getPlatformHeapAddressModel(rootDeviceEnvironment), L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
 }
 
 TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGettingDefaultHeapModelThenUseDebugKeySelectedModel) {
@@ -822,71 +1110,217 @@ TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGetting
     MockExecutionEnvironment executionEnvironment;
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
 
-    DebugManager.flags.SelectCmdListHeapAddressModel.set(0);
+    debugManager.flags.SelectCmdListHeapAddressModel.set(0);
 
-    EXPECT_EQ(NEO::HeapAddressModel::PrivateHeaps, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
+    EXPECT_EQ(NEO::HeapAddressModel::privateHeaps, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
 
-    DebugManager.flags.SelectCmdListHeapAddressModel.set(1);
+    debugManager.flags.SelectCmdListHeapAddressModel.set(1);
 
-    EXPECT_EQ(NEO::HeapAddressModel::GlobalStateless, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
+    EXPECT_EQ(NEO::HeapAddressModel::globalStateless, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
 
-    DebugManager.flags.SelectCmdListHeapAddressModel.set(2);
+    debugManager.flags.SelectCmdListHeapAddressModel.set(2);
 
-    EXPECT_EQ(NEO::HeapAddressModel::GlobalBindless, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
+    EXPECT_EQ(NEO::HeapAddressModel::globalBindless, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
 
-    DebugManager.flags.SelectCmdListHeapAddressModel.set(3);
+    debugManager.flags.SelectCmdListHeapAddressModel.set(3);
 
-    EXPECT_EQ(NEO::HeapAddressModel::GlobalBindful, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
-}
-
-HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingSupportedNumGrfsThenCorrectValueIsReturned, IsBeforeXeHpCore) {
-    MockExecutionEnvironment executionEnvironment;
-    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
-    const auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
-    const std::vector<uint32_t> expectedValues{128u};
-
-    EXPECT_EQ(expectedValues, l0GfxCoreHelper.getSupportedNumGrfs());
-}
-
-HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingSupportedNumGrfsThenCorrectValueIsReturned, IsAtLeastXeHpCore) {
-    MockExecutionEnvironment executionEnvironment;
-    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
-    const auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
-    const std::vector<uint32_t> expectedValues{128u, 256u};
-
-    EXPECT_EQ(expectedValues, l0GfxCoreHelper.getSupportedNumGrfs());
+    EXPECT_EQ(NEO::HeapAddressModel::globalBindful, L0GfxCoreHelper::getHeapAddressModel(rootDeviceEnvironment));
 }
 
 TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGettingDispatchCmdListCmdBufferPrimaryThenUseDbgKeyValue) {
     DebugManagerStateRestore restorer;
-    MockExecutionEnvironment executionEnvironment;
-    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    debugManager.flags.DispatchCmdlistCmdBufferPrimary.set(0);
 
-    DebugManager.flags.DispatchCmdlistCmdBufferPrimary.set(0);
+    EXPECT_FALSE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(true));
 
-    EXPECT_FALSE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(rootDeviceEnvironment, true));
+    debugManager.flags.DispatchCmdlistCmdBufferPrimary.set(1);
 
-    DebugManager.flags.DispatchCmdlistCmdBufferPrimary.set(1);
-
-    EXPECT_TRUE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(rootDeviceEnvironment, true));
+    EXPECT_TRUE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(true));
 }
 
 TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGettingDispatchCmdListCmdBufferPrimaryAndNotAllowPrimaryThenOverrideDbgKeyValueAndDisallow) {
     DebugManagerStateRestore restorer;
-    MockExecutionEnvironment executionEnvironment;
-    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    debugManager.flags.DispatchCmdlistCmdBufferPrimary.set(1);
 
-    DebugManager.flags.DispatchCmdlistCmdBufferPrimary.set(1);
-
-    EXPECT_FALSE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(rootDeviceEnvironment, false));
+    EXPECT_FALSE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(false));
 }
 
 TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultCmdlistPrimaryBatchBufferThenUsePlatformDefaultSetting) {
+    EXPECT_TRUE(L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(true));
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperOnGenPlatformsWhenGettingPlatformUseImmediateFlushTaskThenReturnFalse, IsGen12LP) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    EXPECT_FALSE(l0GfxCoreHelper.platformSupportsImmediateComputeFlushTask());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperOnGenPlatformsWhenGettingCmdlistUpdateCapabilityThenReturnZero, IsGen12LP) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+    EXPECT_EQ(0u, l0GfxCoreHelper.getPlatformCmdListUpdateCapabilities());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperOnGenPlatformsWhenGettingRecordReplayGraphCapabilityThenReturnZero, IsGen12LP) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+    EXPECT_EQ(0u, l0GfxCoreHelper.getPlatformRecordReplayGraphCapabilities());
+}
+
+HWTEST_F(L0GfxCoreHelperTest, whenAskingForUnifiedPostSyncAllocLayoutThenCheckImmWriteOffset) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ((NEO::ImplicitScalingDispatch<FamilyType>::getImmediateWritePostSyncOffset() == NEO::ImplicitScalingDispatch<FamilyType>::getTimeStampPostSyncOffset()),
+              l0GfxCoreHelper.hasUnifiedPostSyncAllocationLayout());
+}
+
+HWTEST_F(L0GfxCoreHelperTest, whenAskingForImmediateWritePostSyncOffsetThenReturnValueFromImplicitScalingHelper) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &l0GfxCoreHelper = executionEnvironment.rootDeviceEnvironments[0]->getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(NEO::ImplicitScalingDispatch<FamilyType>::getImmediateWritePostSyncOffset(), l0GfxCoreHelper.getImmediateWritePostSyncOffset());
+}
+
+TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultUseImmediateFlushTaskThenUsePlatformDefaultSetting) {
     MockExecutionEnvironment executionEnvironment;
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
     auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
 
-    EXPECT_EQ(l0GfxCoreHelper.platformSupportsPrimaryBatchBufferCmdList(), L0GfxCoreHelper::dispatchCmdListBatchBufferAsPrimary(rootDeviceEnvironment, true));
+    EXPECT_EQ(l0GfxCoreHelper.platformSupportsImmediateComputeFlushTask(), L0GfxCoreHelper::useImmediateComputeFlushTask(rootDeviceEnvironment));
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingSyncDispatchSupportThenReturnFalse, IsAtMostXeHpgCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_FALSE(l0GfxCoreHelper.synchronizedDispatchSupported());
+}
+
+HWTEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingImplicitSyncDispatchModeForCooperativeKernelsThenReturnFalse) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_FALSE(l0GfxCoreHelper.implicitSynchronizedDispatchForCooperativeKernelsAllowed());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenCheckingImplicitCounterBasedEventPromotionThenReturnFalse, IsNotXeHpcCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_FALSE(l0GfxCoreHelper.implicitCounterBasedEventPromotionAllowed());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingSyncDispatchSupportThenReturnTrue, IsAtLeastXeHpcCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_TRUE(l0GfxCoreHelper.synchronizedDispatchSupported());
+}
+
+TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGettingUseImmediateFlushTaskThenUseDbgKeyValue) {
+    DebugManagerStateRestore restorer;
+    MockExecutionEnvironment executionEnvironment;
+    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+
+    debugManager.flags.UseImmediateFlushTask.set(0);
+
+    EXPECT_FALSE(L0GfxCoreHelper::useImmediateComputeFlushTask(rootDeviceEnvironment));
+
+    debugManager.flags.UseImmediateFlushTask.set(1);
+
+    EXPECT_TRUE(L0GfxCoreHelper::useImmediateComputeFlushTask(rootDeviceEnvironment));
+}
+
+TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGettingCmdListUpdateCapabilityThenUseDbgKeyValue) {
+    DebugManagerStateRestore restorer;
+    MockExecutionEnvironment executionEnvironment;
+    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+
+    constexpr uint32_t expectedValue = 2359;
+    debugManager.flags.OverrideCmdListUpdateCapability.set(static_cast<int32_t>(expectedValue));
+
+    EXPECT_EQ(expectedValue, L0GfxCoreHelper::getCmdListUpdateCapabilities(rootDeviceEnvironment));
+}
+
+TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultCmdlistUpdateCapabilityThenUsePlatformDefaultSetting) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(l0GfxCoreHelper.getPlatformCmdListUpdateCapabilities(), L0GfxCoreHelper::getCmdListUpdateCapabilities(rootDeviceEnvironment));
+}
+
+TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperUsingOverrideDebugKeyWhenGettingRecordReplayGraphCapabilityThenUseDbgKeyValue) {
+    DebugManagerStateRestore restorer;
+    MockExecutionEnvironment executionEnvironment;
+    const auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+
+    constexpr uint32_t expectedValue = 2359;
+    debugManager.flags.OverrideRecordReplayGraphCapability.set(static_cast<int32_t>(expectedValue));
+
+    EXPECT_EQ(expectedValue, L0GfxCoreHelper::getRecordReplayGraphCapabilities(rootDeviceEnvironment));
+}
+
+TEST_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingDefaultRecordReplayGraphCapabilityThenUsePlatformDefaultSetting) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(l0GfxCoreHelper.getPlatformRecordReplayGraphCapabilities(), L0GfxCoreHelper::getRecordReplayGraphCapabilities(rootDeviceEnvironment));
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingMaxFillPatternSizeForCopyEngineThenReturnCorrectValue, IsAtMostDg2) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(4 * sizeof(uint32_t), l0GfxCoreHelper.getMaxFillPatternSizeForCopyEngine());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperWhenGettingMaxFillPatternSizeForCopyEngineThenReturnCorrectValue, IsWithinXeHpcCoreAndXe3pCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(sizeof(uint8_t), l0GfxCoreHelper.getMaxFillPatternSizeForCopyEngine());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, GivenL0GfxCoreHelperWhenGettingSupportedCustomOperations1ThenReturnCorrectValue, IsAtMostXe3pCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(0u, l0GfxCoreHelper.getSupportedCustomOperations1());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, GivenL0GfxCoreHelperWhenGettingSupportedCustomOperations2ThenReturnCorrectValue, IsAtMostXe3pCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_EQ(0u, l0GfxCoreHelper.getSupportedCustomOperations2());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperBeforeXe3pWhenAskingForOutOfOrderImmediateCopyOffloadSupportThenReturnFalse, IsAtMostXe3Core) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_FALSE(l0GfxCoreHelper.isCopyOffloadForOutOfOrderImmediateCmdListSupported());
+}
+
+HWTEST2_F(L0GfxCoreHelperTest, givenL0GfxCoreHelperFromXe3pWhenAskingForOutOfOrderImmediateCopyOffloadSupportThenReturnTrue, IsAtLeastXe3pCore) {
+    MockExecutionEnvironment executionEnvironment;
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0].get();
+    auto &l0GfxCoreHelper = rootDeviceEnvironment.getHelper<L0GfxCoreHelper>();
+
+    EXPECT_TRUE(l0GfxCoreHelper.isCopyOffloadForOutOfOrderImmediateCmdListSupported());
 }
 
 } // namespace ult

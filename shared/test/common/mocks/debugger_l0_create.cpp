@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,13 +10,20 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/test/common/mocks/mock_l0_debugger.h"
 
-NEO::DebugerL0CreateFn mockDebuggerL0HwFactory[IGFX_MAX_CORE];
+NEO::DebugerL0CreateFn mockDebuggerL0HwFactory[NEO::maxCoreEnumValue];
+bool forceCreateNullptrDebugger = false;
+size_t createDebuggerCallCount = 0;
 
 namespace NEO {
 
 std::unique_ptr<Debugger> DebuggerL0::create(NEO::Device *device) {
+    createDebuggerCallCount++;
+    if (forceCreateNullptrDebugger) {
+        return nullptr;
+    }
     initDebuggingInOs(device->getRootDeviceEnvironment().osInterface.get());
     auto debugger = mockDebuggerL0HwFactory[device->getHardwareInfo().platform.eRenderCoreFamily](device);
+    device->setDebugger(debugger);
     return std::unique_ptr<DebuggerL0>(debugger);
 }
 

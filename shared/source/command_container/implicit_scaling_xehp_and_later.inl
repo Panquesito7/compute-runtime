@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,30 +9,29 @@
 #include "shared/source/command_container/implicit_scaling.h"
 #include "shared/source/command_container/walker_partition_xehp_and_later.h"
 #include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/device/device.h"
+#include "shared/source/device/device_info.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 
 namespace NEO {
 
 template <typename GfxFamily>
-WalkerPartition::WalkerPartitionArgs prepareWalkerPartitionArgs(uint64_t workPartitionAllocationGpuVa,
+WalkerPartition::WalkerPartitionArgs prepareWalkerPartitionArgs(ImplicitScalingDispatchCommandArgs &dispatchCommandArgs,
                                                                 uint32_t tileCount,
-                                                                uint32_t partitionCount,
-                                                                bool emitSelfCleanup,
                                                                 bool preferStaticPartitioning,
-                                                                bool staticPartitioning,
-                                                                bool useSecondaryBatchBuffer,
-                                                                bool dcFlush,
-                                                                bool forceExecutionOnSingleTile) {
+                                                                bool staticPartitioning) {
     WalkerPartition::WalkerPartitionArgs args = {};
 
-    args.workPartitionAllocationGpuVa = workPartitionAllocationGpuVa;
-    args.partitionCount = partitionCount;
+    args.workPartitionAllocationGpuVa = dispatchCommandArgs.workPartitionAllocationGpuVa;
+    args.partitionCount = dispatchCommandArgs.partitionCount;
     args.tileCount = tileCount;
     args.staticPartitioning = staticPartitioning;
     args.preferredStaticPartitioning = preferStaticPartitioning;
-    args.forceExecutionOnSingleTile = forceExecutionOnSingleTile;
+    args.forceExecutionOnSingleTile = dispatchCommandArgs.forceExecutionOnSingleTile;
 
     args.useAtomicsForSelfCleanup = ImplicitScalingHelper::isAtomicsUsedForSelfCleanup();
     args.initializeWparidRegister = ImplicitScalingHelper::isWparidRegisterInitializationRequired();
@@ -42,105 +41,112 @@ WalkerPartition::WalkerPartitionArgs prepareWalkerPartitionArgs(uint64_t workPar
     args.synchronizeBeforeExecution = ImplicitScalingHelper::isSynchronizeBeforeExecutionRequired();
     args.crossTileAtomicSynchronization = ImplicitScalingHelper::isCrossTileAtomicRequired(args.emitPipeControlStall);
     args.semaphoreProgrammingRequired = ImplicitScalingHelper::isSemaphoreProgrammingRequired();
+    args.semaphore64bCmdSupported = dispatchCommandArgs.device != nullptr ? dispatchCommandArgs.device->getDeviceInfo().semaphore64bCmdSupport : false;
 
-    args.emitSelfCleanup = ImplicitScalingHelper::isSelfCleanupRequired(args, emitSelfCleanup);
+    args.emitSelfCleanup = ImplicitScalingHelper::isSelfCleanupRequired(args, dispatchCommandArgs.apiSelfCleanup);
     args.emitBatchBufferEnd = false;
-    args.secondaryBatchBuffer = useSecondaryBatchBuffer;
+    args.secondaryBatchBuffer = dispatchCommandArgs.useSecondaryBatchBuffer;
 
-    args.dcFlushEnable = dcFlush;
+    args.dcFlushEnable = dispatchCommandArgs.dcFlush;
 
     args.pipeControlBeforeCleanupCrossTileSync = ImplicitScalingHelper::pipeControlBeforeCleanupAtomicSyncRequired();
+
+    args.blockDispatchToCommandBuffer = dispatchCommandArgs.blockDispatchToCommandBuffer;
+
+    args.workgroupSize = dispatchCommandArgs.workgroupSize;
+    args.threadGroupCount = dispatchCommandArgs.threadGroupCount;
+    args.isRequiredDispatchWorkGroupOrder = dispatchCommandArgs.isRequiredDispatchWorkGroupOrder;
 
     return args;
 }
 
 template <typename GfxFamily>
+template <typename WalkerType>
 size_t ImplicitScalingDispatch<GfxFamily>::getSize(bool apiSelfCleanup,
                                                    bool preferStaticPartitioning,
                                                    const DeviceBitfield &devices,
                                                    const Vec3<size_t> &groupStart,
                                                    const Vec3<size_t> &groupCount) {
-    typename GfxFamily::COMPUTE_WALKER::PARTITION_TYPE partitionType{};
+    typename WalkerType::PARTITION_TYPE partitionType{};
     bool staticPartitioning = false;
     const uint32_t tileCount = static_cast<uint32_t>(devices.count());
 
-    const uint32_t partitionCount = WalkerPartition::computePartitionCountAndPartitionType<GfxFamily>(tileCount,
-                                                                                                      preferStaticPartitioning,
-                                                                                                      groupStart,
-                                                                                                      groupCount,
-                                                                                                      {},
-                                                                                                      &partitionType,
-                                                                                                      &staticPartitioning);
+    const uint32_t partitionCount = WalkerPartition::computePartitionCountAndPartitionType<GfxFamily, WalkerType>(tileCount,
+                                                                                                                  preferStaticPartitioning,
+                                                                                                                  groupStart,
+                                                                                                                  groupCount,
+                                                                                                                  {},
+                                                                                                                  &partitionType,
+                                                                                                                  &staticPartitioning);
     UNRECOVERABLE_IF(staticPartitioning && (tileCount != partitionCount));
-    WalkerPartition::WalkerPartitionArgs args = prepareWalkerPartitionArgs<GfxFamily>(0u,
-                                                                                      tileCount,
-                                                                                      partitionCount,
-                                                                                      apiSelfCleanup,
-                                                                                      preferStaticPartitioning,
-                                                                                      staticPartitioning,
-                                                                                      false,
-                                                                                      false,
-                                                                                      false);
+    ImplicitScalingDispatchCommandArgs dispatchCommandArgs = {};
+    dispatchCommandArgs.partitionCount = partitionCount;
+    dispatchCommandArgs.apiSelfCleanup = apiSelfCleanup;
 
-    return static_cast<size_t>(WalkerPartition::estimateSpaceRequiredInCommandBuffer<GfxFamily>(args));
+    WalkerPartition::WalkerPartitionArgs args = prepareWalkerPartitionArgs<GfxFamily>(dispatchCommandArgs,
+                                                                                      tileCount,
+                                                                                      preferStaticPartitioning,
+                                                                                      staticPartitioning);
+
+    return static_cast<size_t>(WalkerPartition::estimateSpaceRequiredInCommandBuffer<GfxFamily, WalkerType>(args));
 }
 
 template <typename GfxFamily>
+template <typename WalkerType>
 void ImplicitScalingDispatch<GfxFamily>::dispatchCommands(LinearStream &commandStream,
-                                                          WALKER_TYPE &walkerCmd,
+                                                          WalkerType &walkerCmd,
                                                           const DeviceBitfield &devices,
-                                                          uint32_t &partitionCount,
-                                                          bool useSecondaryBatchBuffer,
-                                                          bool apiSelfCleanup,
-                                                          bool usesImages,
-                                                          bool dcFlush,
-                                                          bool forceExecutionOnSingleTile,
-                                                          uint64_t workPartitionAllocationGpuVa,
-                                                          const HardwareInfo &hwInfo) {
+                                                          ImplicitScalingDispatchCommandArgs &dispatchCommandArgs) {
     uint32_t totalProgrammedSize = 0u;
     const uint32_t tileCount = static_cast<uint32_t>(devices.count());
-    const bool preferStaticPartitioning = workPartitionAllocationGpuVa != 0u;
+    const bool preferStaticPartitioning = dispatchCommandArgs.workPartitionAllocationGpuVa != 0u;
 
     bool staticPartitioning = false;
-    partitionCount = WalkerPartition::computePartitionCountAndSetPartitionType<GfxFamily>(&walkerCmd, tileCount, preferStaticPartitioning, usesImages, &staticPartitioning);
+    dispatchCommandArgs.partitionCount = WalkerPartition::computePartitionCountAndSetPartitionType<GfxFamily, WalkerType>(&walkerCmd, dispatchCommandArgs.requiredPartitionDim, tileCount, preferStaticPartitioning, &staticPartitioning);
 
-    WalkerPartition::WalkerPartitionArgs args = prepareWalkerPartitionArgs<GfxFamily>(workPartitionAllocationGpuVa,
-                                                                                      tileCount,
-                                                                                      partitionCount,
-                                                                                      apiSelfCleanup,
-                                                                                      preferStaticPartitioning,
-                                                                                      staticPartitioning,
-                                                                                      useSecondaryBatchBuffer,
-                                                                                      dcFlush,
-                                                                                      forceExecutionOnSingleTile);
+    WalkerPartition::WalkerPartitionArgs walkerPartitionArgs = prepareWalkerPartitionArgs<GfxFamily>(dispatchCommandArgs,
+                                                                                                     tileCount,
+                                                                                                     preferStaticPartitioning,
+                                                                                                     staticPartitioning);
+    size_t dispatchCommandsSize = 0;
+    void *commandBuffer = nullptr;
+    uint64_t cmdBufferGpuAddress = 0;
 
-    auto dispatchCommandsSize = getSize(apiSelfCleanup, preferStaticPartitioning, devices, {walkerCmd.getThreadGroupIdStartingX(), walkerCmd.getThreadGroupIdStartingY(), walkerCmd.getThreadGroupIdStartingZ()}, {walkerCmd.getThreadGroupIdXDimension(), walkerCmd.getThreadGroupIdYDimension(), walkerCmd.getThreadGroupIdZDimension()});
-    void *commandBuffer = commandStream.getSpace(dispatchCommandsSize);
-    uint64_t cmdBufferGpuAddress = commandStream.getGraphicsAllocation()->getGpuAddress() + commandStream.getUsed() - dispatchCommandsSize;
+    if (!dispatchCommandArgs.blockDispatchToCommandBuffer) {
+        dispatchCommandsSize = getSize<WalkerType>(dispatchCommandArgs.apiSelfCleanup,
+                                                   preferStaticPartitioning,
+                                                   devices,
+                                                   {walkerCmd.getThreadGroupIdStartingX(), walkerCmd.getThreadGroupIdStartingY(), walkerCmd.getThreadGroupIdStartingZ()},
+                                                   {walkerCmd.getThreadGroupIdXDimension(), walkerCmd.getThreadGroupIdYDimension(), walkerCmd.getThreadGroupIdZDimension()});
+        commandBuffer = commandStream.getSpace(dispatchCommandsSize);
+        cmdBufferGpuAddress = commandStream.getGraphicsAllocation()->getGpuAddress() + commandStream.getUsed() - dispatchCommandsSize;
+    }
 
     if (staticPartitioning) {
-        UNRECOVERABLE_IF(tileCount != partitionCount);
-        WalkerPartition::constructStaticallyPartitionedCommandBuffer<GfxFamily>(commandBuffer,
-                                                                                cmdBufferGpuAddress,
-                                                                                &walkerCmd,
-                                                                                totalProgrammedSize,
-                                                                                args,
-                                                                                hwInfo);
+        UNRECOVERABLE_IF(tileCount != dispatchCommandArgs.partitionCount);
+        WalkerPartition::constructStaticallyPartitionedCommandBuffer<GfxFamily, WalkerType>(commandBuffer,
+                                                                                            dispatchCommandArgs.outWalkerPtr,
+                                                                                            cmdBufferGpuAddress,
+                                                                                            &walkerCmd,
+                                                                                            totalProgrammedSize,
+                                                                                            walkerPartitionArgs,
+                                                                                            *dispatchCommandArgs.device);
     } else {
-        if (DebugManager.flags.ExperimentalSetWalkerPartitionCount.get()) {
-            partitionCount = DebugManager.flags.ExperimentalSetWalkerPartitionCount.get();
-            if (partitionCount == 1u) {
-                walkerCmd.setPartitionType(GfxFamily::COMPUTE_WALKER::PARTITION_TYPE::PARTITION_TYPE_DISABLED);
+        if (debugManager.flags.ExperimentalSetWalkerPartitionCount.get()) {
+            dispatchCommandArgs.partitionCount = debugManager.flags.ExperimentalSetWalkerPartitionCount.get();
+            if (dispatchCommandArgs.partitionCount == 1u) {
+                walkerCmd.setPartitionType(WalkerType::PARTITION_TYPE::PARTITION_TYPE_DISABLED);
             }
-            args.partitionCount = partitionCount;
+            walkerPartitionArgs.partitionCount = dispatchCommandArgs.partitionCount;
         }
 
-        WalkerPartition::constructDynamicallyPartitionedCommandBuffer<GfxFamily>(commandBuffer,
-                                                                                 cmdBufferGpuAddress,
-                                                                                 &walkerCmd,
-                                                                                 totalProgrammedSize,
-                                                                                 args,
-                                                                                 hwInfo);
+        WalkerPartition::constructDynamicallyPartitionedCommandBuffer<GfxFamily, WalkerType>(commandBuffer,
+                                                                                             dispatchCommandArgs.outWalkerPtr,
+                                                                                             cmdBufferGpuAddress,
+                                                                                             &walkerCmd,
+                                                                                             totalProgrammedSize,
+                                                                                             walkerPartitionArgs,
+                                                                                             *dispatchCommandArgs.device);
     }
     UNRECOVERABLE_IF(totalProgrammedSize != dispatchCommandsSize);
 }
@@ -152,11 +158,13 @@ bool &ImplicitScalingDispatch<GfxFamily>::getPipeControlStallRequired() {
 
 template <typename GfxFamily>
 WalkerPartition::WalkerPartitionArgs prepareBarrierWalkerPartitionArgs(bool emitSelfCleanup,
-                                                                       bool usePostSync) {
+                                                                       bool usePostSync,
+                                                                       bool semaphore64bCmdSupported) {
     WalkerPartition::WalkerPartitionArgs args = {};
     args.crossTileAtomicSynchronization = true;
     args.useAtomicsForSelfCleanup = ImplicitScalingHelper::isAtomicsUsedForSelfCleanup();
     args.usePostSync = usePostSync;
+    args.semaphore64bCmdSupported = semaphore64bCmdSupported;
 
     args.emitSelfCleanup = ImplicitScalingHelper::isSelfCleanupRequired(args, emitSelfCleanup);
     args.pipeControlBeforeCleanupCrossTileSync = ImplicitScalingHelper::pipeControlBeforeCleanupAtomicSyncRequired();
@@ -168,7 +176,8 @@ template <typename GfxFamily>
 size_t ImplicitScalingDispatch<GfxFamily>::getBarrierSize(const RootDeviceEnvironment &rootDeviceEnvironment,
                                                           bool apiSelfCleanup,
                                                           bool usePostSync) {
-    WalkerPartition::WalkerPartitionArgs args = prepareBarrierWalkerPartitionArgs<GfxFamily>(apiSelfCleanup, usePostSync);
+    bool semaphore64bCmdSupported = rootDeviceEnvironment.getHelper<CompilerProductHelper>().isAvailableSemaphore64(*rootDeviceEnvironment.getHardwareInfo());
+    WalkerPartition::WalkerPartitionArgs args = prepareBarrierWalkerPartitionArgs<GfxFamily>(apiSelfCleanup, usePostSync, semaphore64bCmdSupported);
 
     return static_cast<size_t>(WalkerPartition::estimateBarrierSpaceRequiredInCommandBuffer<GfxFamily>(args, rootDeviceEnvironment));
 }
@@ -178,21 +187,49 @@ void ImplicitScalingDispatch<GfxFamily>::dispatchBarrierCommands(LinearStream &c
                                                                  const DeviceBitfield &devices,
                                                                  PipeControlArgs &flushArgs,
                                                                  const RootDeviceEnvironment &rootDeviceEnvironment,
-                                                                 uint64_t gpuAddress,
-                                                                 uint64_t immediateData,
+                                                                 uint64_t postSyncGpuAddress,
+                                                                 uint64_t postSyncImmediateData,
+                                                                 bool apiSelfCleanup,
+                                                                 bool useSecondaryBatchBuffer) {
+    size_t totalProgrammedSize = 0u;
+
+    auto barrierCommandsSize = getBarrierSize(rootDeviceEnvironment, apiSelfCleanup, postSyncGpuAddress > 0);
+    void *commandBufferBefore = commandStream.getSpace(barrierCommandsSize);
+    void *commandBuffer = commandBufferBefore;
+
+    uint64_t cmdBufferGpuAddress = commandStream.getGraphicsAllocation()->getGpuAddress() + commandStream.getUsed() - barrierCommandsSize;
+
+    ImplicitScalingDispatch<GfxFamily>::dispatchBarrierCommands(commandBuffer,
+                                                                devices,
+                                                                flushArgs,
+                                                                rootDeviceEnvironment,
+                                                                postSyncGpuAddress,
+                                                                postSyncImmediateData,
+                                                                cmdBufferGpuAddress,
+                                                                apiSelfCleanup,
+                                                                useSecondaryBatchBuffer);
+    totalProgrammedSize = ptrDiff(commandBuffer, commandBufferBefore);
+    UNRECOVERABLE_IF(totalProgrammedSize != barrierCommandsSize);
+}
+
+template <typename GfxFamily>
+void ImplicitScalingDispatch<GfxFamily>::dispatchBarrierCommands(void *&commandBuffer,
+                                                                 const DeviceBitfield &devices,
+                                                                 PipeControlArgs &flushArgs,
+                                                                 const RootDeviceEnvironment &rootDeviceEnvironment,
+                                                                 uint64_t postSyncGpuAddress,
+                                                                 uint64_t postSyncImmediateData,
+                                                                 uint64_t cmdBufferGpuAddress,
                                                                  bool apiSelfCleanup,
                                                                  bool useSecondaryBatchBuffer) {
     uint32_t totalProgrammedSize = 0u;
 
-    WalkerPartition::WalkerPartitionArgs args = prepareBarrierWalkerPartitionArgs<GfxFamily>(apiSelfCleanup, gpuAddress > 0);
+    bool semaphore64bCmdSupported = rootDeviceEnvironment.getHelper<CompilerProductHelper>().isAvailableSemaphore64(*rootDeviceEnvironment.getHardwareInfo());
+    WalkerPartition::WalkerPartitionArgs args = prepareBarrierWalkerPartitionArgs<GfxFamily>(apiSelfCleanup, postSyncGpuAddress > 0, semaphore64bCmdSupported);
     args.tileCount = static_cast<uint32_t>(devices.count());
     args.secondaryBatchBuffer = useSecondaryBatchBuffer;
-    args.postSyncGpuAddress = gpuAddress;
-    args.postSyncImmediateValue = immediateData;
-
-    auto barrierCommandsSize = getBarrierSize(rootDeviceEnvironment, args.emitSelfCleanup, args.usePostSync);
-    void *commandBuffer = commandStream.getSpace(barrierCommandsSize);
-    uint64_t cmdBufferGpuAddress = commandStream.getGraphicsAllocation()->getGpuAddress() + commandStream.getUsed() - barrierCommandsSize;
+    args.postSyncGpuAddress = postSyncGpuAddress;
+    args.postSyncImmediateValue = postSyncImmediateData;
 
     WalkerPartition::constructBarrierCommandBuffer<GfxFamily>(commandBuffer,
                                                               cmdBufferGpuAddress,
@@ -200,7 +237,7 @@ void ImplicitScalingDispatch<GfxFamily>::dispatchBarrierCommands(LinearStream &c
                                                               args,
                                                               flushArgs,
                                                               rootDeviceEnvironment);
-    UNRECOVERABLE_IF(totalProgrammedSize != barrierCommandsSize);
+    commandBuffer = ptrOffset(commandBuffer, totalProgrammedSize);
 }
 
 template <typename GfxFamily>
@@ -212,11 +249,12 @@ inline size_t ImplicitScalingDispatch<GfxFamily>::getRegisterConfigurationSize()
 template <typename GfxFamily>
 inline void ImplicitScalingDispatch<GfxFamily>::dispatchRegisterConfiguration(LinearStream &commandStream,
                                                                               uint64_t workPartitionSurfaceAddress,
-                                                                              uint32_t addressOffset) {
+                                                                              uint32_t addressOffset,
+                                                                              bool isBcs) {
     EncodeSetMMIO<GfxFamily>::encodeMEM(commandStream,
                                         PartitionRegisters<GfxFamily>::wparidCCSOffset,
-                                        workPartitionSurfaceAddress);
-    dispatchOffsetRegister(commandStream, addressOffset);
+                                        workPartitionSurfaceAddress, isBcs);
+    dispatchOffsetRegister(commandStream, addressOffset, isBcs);
 }
 
 template <typename GfxFamily>
@@ -226,15 +264,22 @@ inline size_t ImplicitScalingDispatch<GfxFamily>::getOffsetRegisterSize() {
 
 template <typename GfxFamily>
 inline void ImplicitScalingDispatch<GfxFamily>::dispatchOffsetRegister(LinearStream &commandStream,
-                                                                       uint32_t addressOffset) {
+                                                                       uint32_t addressOffset, bool isBcs) {
     EncodeSetMMIO<GfxFamily>::encodeIMM(commandStream,
                                         PartitionRegisters<GfxFamily>::addressOffsetCCSOffset,
                                         addressOffset,
-                                        true);
+                                        true,
+                                        isBcs,
+                                        nullptr);
 }
 
 template <typename GfxFamily>
-inline uint32_t ImplicitScalingDispatch<GfxFamily>::getPostSyncOffset() {
+inline uint32_t ImplicitScalingDispatch<GfxFamily>::getImmediateWritePostSyncOffset() {
+    return static_cast<uint32_t>(sizeof(uint64_t));
+}
+
+template <typename GfxFamily>
+inline uint32_t ImplicitScalingDispatch<GfxFamily>::getTimeStampPostSyncOffset() {
     return static_cast<uint32_t>(GfxCoreHelperHw<GfxFamily>::getSingleTimestampPacketSizeHw());
 }
 

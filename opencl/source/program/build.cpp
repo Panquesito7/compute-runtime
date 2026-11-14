@@ -1,33 +1,25 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/ail/ail_configuration.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/compiler_interface/compiler_warnings/compiler_warnings.h"
-#include "shared/source/compiler_interface/external_functions.h"
 #include "shared/source/device/device.h"
-#include "shared/source/device_binary_format/device_binary_formats.h"
-#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/addressing_mode_helper.h"
 #include "shared/source/helpers/compiler_options_parser.h"
 #include "shared/source/program/kernel_info.h"
-#include "shared/source/source_level_debugger/source_level_debugger.h"
 #include "shared/source/utilities/logger.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/context/context.h"
-#include "opencl/source/gtpin/gtpin_notify.h"
-#include "opencl/source/helpers/cl_validators.h"
-#include "opencl/source/platform/platform.h"
 #include "opencl/source/program/program.h"
-
-#include <cstring>
-#include <iterator>
-#include <sstream>
 
 namespace NEO {
 
@@ -42,7 +34,7 @@ cl_int Program::build(
 
     std::unordered_map<uint32_t, BuildPhase> phaseReached;
     for (const auto &clDevice : deviceVector) {
-        phaseReached[clDevice->getRootDeviceIndex()] = BuildPhase::Init;
+        phaseReached[clDevice->getRootDeviceIndex()] = BuildPhase::init;
     }
     do {
         // check to see if a previous build request is in progress
@@ -59,7 +51,7 @@ cl_int Program::build(
             if (false == requiresRebuild) {
                 if (nullptr != buildOptions) {
                     options = buildOptions;
-                } else if (this->createdFrom != CreatedFrom::BINARY) {
+                } else if (this->createdFrom != CreatedFrom::binary) {
                     options = "";
                 }
             }
@@ -75,11 +67,11 @@ cl_int Program::build(
                 break;
             }
 
-            disableZebinIfVmeEnabled(options, internalOptions, sourceCode);
-
             TranslationInput inputArgs = {IGC::CodeType::oclC, IGC::CodeType::oclGenBin};
-            if (createdFrom != CreatedFrom::SOURCE) {
-                inputArgs.srcType = isSpirV ? IGC::CodeType::spirV : IGC::CodeType::llvmBc;
+            if (createdFrom != CreatedFrom::source) {
+                inputArgs.srcType = (intermediateRepresentation != IGC::CodeType::invalid)
+                                        ? intermediateRepresentation
+                                        : (isSpirV ? IGC::CodeType::spirV : IGC::CodeType::llvmBc);
                 inputArgs.src = ArrayRef<const char>(irBinary.get(), irBinarySize);
             } else {
                 inputArgs.src = ArrayRef<const char>(sourceCode.c_str(), sourceCode.size());
@@ -90,42 +82,28 @@ cl_int Program::build(
                 break;
             }
 
-            if (isKernelDebugEnabled()) {
-                std::string filename;
-                for (const auto &clDevice : deviceVector) {
-                    if (BuildPhase::SourceCodeNotification == phaseReached[clDevice->getRootDeviceIndex()]) {
-                        continue;
-                    }
-                    appendKernelDebugOptions(*clDevice, internalOptions);
-                    notifyDebuggerWithSourceCode(*clDevice, filename);
-                    prependFilePathToOptions(filename);
-
-                    phaseReached[clDevice->getRootDeviceIndex()] = BuildPhase::SourceCodeNotification;
-                }
-            }
-
             std::string extensions = requiresOpenClCFeatures(options) ? defaultClDevice->peekCompilerExtensionsWithFeatures()
                                                                       : defaultClDevice->peekCompilerExtensions();
-            if (requiresAdditionalExtensions(options)) {
-                extensions.erase(extensions.length() - 1);
-                extensions += ",+cl_khr_3d_image_writes ";
-            }
+
+            appendAdditionalExtensions(extensions, options, internalOptions);
+            removeNotSupportedExtensions(extensions, options, internalOptions);
             CompilerOptions::concatenateAppend(internalOptions, extensions);
 
-            if (!this->getIsBuiltIn() && DebugManager.flags.InjectInternalBuildOptions.get() != "unk") {
-                NEO::CompilerOptions::concatenateAppend(internalOptions, NEO::DebugManager.flags.InjectInternalBuildOptions.get());
+            auto ailHelper = defaultDevice.getRootDeviceEnvironment().getAILConfigurationHelper();
+            bool shouldEnableDivergentBarriers = (ailHelper && ailHelper->handleDivergentBarriers());
+            if (!this->getIsBuiltIn() && debugManager.flags.EnableDivergentBarrierHandling.get()) {
+                shouldEnableDivergentBarriers = true;
+            }
+            if (shouldEnableDivergentBarriers) {
+                CompilerOptions::concatenateAppend(internalOptions, CompilerOptions::enableDivergentBarriers);
             }
 
-            if (nullptr != this->getContextPtr()) {
-                if (this->getContext().checkIfContextIsNonZebin()) {
-                    const auto &rootDevice = defaultDevice.getRootDevice();
-                    rootDevice->getCompilerInterface()->addOptionDisableZebin(options, internalOptions);
-                }
+            if (!this->getIsBuiltIn() && debugManager.flags.InjectInternalBuildOptions.get() != "unk") {
+                NEO::CompilerOptions::concatenateAppend(internalOptions, NEO::debugManager.flags.InjectInternalBuildOptions.get());
             }
 
             inputArgs.apiOptions = ArrayRef<const char>(options.c_str(), options.length());
             inputArgs.internalOptions = ArrayRef<const char>(internalOptions.c_str(), internalOptions.length());
-            inputArgs.gtPinInput = gtpinGetIgcInit();
             inputArgs.specializedValues = this->specConstantsValues;
             DBG_LOG(LogApiCalls,
                     "Build Options", inputArgs.apiOptions.begin(),
@@ -150,11 +128,11 @@ cl_int Program::build(
                 }
                 this->buildInfos[clDevice->getRootDeviceIndex()].debugData = std::move(compilerOuput.debugData.mem);
                 this->buildInfos[clDevice->getRootDeviceIndex()].debugDataSize = compilerOuput.debugData.size;
-                if (BuildPhase::BinaryCreation == phaseReached[clDevice->getRootDeviceIndex()]) {
+                if (BuildPhase::binaryCreation == phaseReached[clDevice->getRootDeviceIndex()]) {
                     continue;
                 }
                 this->replaceDeviceBinary(std::move(compilerOuput.deviceBinary.mem), compilerOuput.deviceBinary.size, clDevice->getRootDeviceIndex());
-                phaseReached[clDevice->getRootDeviceIndex()] = BuildPhase::BinaryCreation;
+                phaseReached[clDevice->getRootDeviceIndex()] = BuildPhase::binaryCreation;
             }
             if (retVal != CL_SUCCESS) {
                 break;
@@ -164,13 +142,13 @@ cl_int Program::build(
 
         retVal = processGenBinaries(deviceVector, phaseReached);
 
-        auto skipLastExplicitArg = isGTPinInitialized;
-        auto containsStatefulAccess = AddressingModeHelper::containsStatefulAccess(buildInfos[clDevices[0]->getRootDeviceIndex()].kernelInfoArray, skipLastExplicitArg);
+        auto containsBufferStatefulAccess = AddressingModeHelper::containsBufferStatefulAccess(buildInfos[clDevices[0]->getRootDeviceIndex()].kernelInfoArray);
         auto isUserKernel = !isBuiltIn;
 
-        auto failBuildProgram = (containsStatefulAccess &&
-                                 isUserKernel &&
-                                 AddressingModeHelper::failBuildProgramWithStatefulAccess(clDevices[0]->getRootDeviceEnvironment()));
+        auto failBuildProgram = containsBufferStatefulAccess &&
+                                isUserKernel &&
+                                AddressingModeHelper::failBuildProgramWithBufferStatefulAccess(clDevices[0]->getRootDeviceEnvironment()) &&
+                                isGeneratedByIgc;
 
         if (failBuildProgram) {
             retVal = CL_BUILD_PROGRAM_FAILURE;
@@ -180,10 +158,11 @@ cl_int Program::build(
             break;
         }
 
-        if (isKernelDebugEnabled() || gtpinIsGTPinInitialized()) {
-            debugNotify(deviceVector, phaseReached);
-        }
         notifyModuleCreate();
+        if (!clDevices[0]->getDevice().getDefaultEngine().commandStreamReceiver->isHardwareMode()) [[unlikely]] {
+            dumpKernelInfoToAubComments();
+        }
+
     } while (false);
 
     if (retVal != CL_SUCCESS) {
@@ -198,25 +177,8 @@ cl_int Program::build(
     return retVal;
 }
 
-bool Program::appendKernelDebugOptions(ClDevice &clDevice, std::string &internalOptions) {
-    CompilerOptions::concatenateAppend(internalOptions, CompilerOptions::debugKernelEnable);
-    CompilerOptions::concatenateAppend(options, CompilerOptions::generateDebugInfo);
-
-    auto debugger = clDevice.getSourceLevelDebugger();
-    if (debugger && (NEO::SourceLevelDebugger::shouldAppendOptDisable(*debugger))) {
-        CompilerOptions::concatenateAppend(options, CompilerOptions::optDisable);
-    }
-    return true;
-}
-
-void Program::notifyDebuggerWithSourceCode(ClDevice &clDevice, std::string &filename) {
-    if (clDevice.getSourceLevelDebugger()) {
-        clDevice.getSourceLevelDebugger()->notifySourceCode(sourceCode.c_str(), sourceCode.size(), filename);
-    }
-}
-
 cl_int Program::build(const ClDeviceVector &deviceVector, const char *buildOptions,
-                      std::unordered_map<std::string, BuiltinDispatchInfoBuilder *> &builtinsMap) {
+                      std::unordered_map<std::string, BuiltIn::DispatchInfoBuilder *> &builtinsMap) {
     auto ret = this->build(deviceVector, buildOptions);
     if (ret != CL_SUCCESS) {
         return ret;
@@ -247,17 +209,6 @@ void Program::extractInternalOptions(const std::string &options, std::string &in
             CompilerOptions::concatenateAppend(internalOptions, optionString);
             CompilerOptions::concatenateAppend(internalOptions, *(element + 1));
         }
-    }
-}
-
-void Program::debugNotify(const ClDeviceVector &deviceVector, std::unordered_map<uint32_t, BuildPhase> &phasesReached) {
-    for (auto &clDevice : deviceVector) {
-        auto rootDeviceIndex = clDevice->getRootDeviceIndex();
-        if (BuildPhase::DebugDataNotification == phasesReached[rootDeviceIndex]) {
-            continue;
-        }
-        notifyDebuggerWithDebugData(clDevice);
-        phasesReached[rootDeviceIndex] = BuildPhase::DebugDataNotification;
     }
 }
 

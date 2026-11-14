@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,8 @@
 #include "shared/source/command_stream/wait_status.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_csr.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
 #include "opencl/source/command_queue/command_queue.h"
@@ -33,16 +35,38 @@ struct EventTest
 
     void SetUp() override {
         ClDeviceFixture::setUp();
-        CommandQueueFixture::setUp(&mockContext, pClDevice, 0);
+        mockContext = std::make_unique<MockContext>(pClDevice);
+        CommandQueueFixture::setUp(mockContext.get(), pClDevice, 0);
         CommandStreamFixture::setUp(pCmdQ);
     }
 
     void TearDown() override {
         CommandStreamFixture::tearDown();
         CommandQueueFixture::tearDown();
+        mockContext.reset();
         ClDeviceFixture::tearDown();
     }
-    MockContext mockContext;
+    std::unique_ptr<MockContext> mockContext;
+};
+
+template <typename GfxFamily>
+struct TestEventCsr;
+
+struct EventTestWithTestEventCsr
+    : public EventTest {
+    void SetUp() override {}
+    void TearDown() override {}
+    template <typename FamilyType>
+    void setUpT() {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<TestEventCsr<FamilyType>>();
+        EventTest::SetUp();
+    }
+
+    template <typename FamilyType>
+    void tearDownT() {
+        EventTest::TearDown();
+    }
 };
 
 struct InternalsEventTest
@@ -55,6 +79,8 @@ struct InternalsEventTest
     void SetUp() override {
         ClDeviceFixture::setUp();
         mockContext = new MockContext(pClDevice);
+        debugManager.flags.EnableLinearStreamPoolAllocator.set(0);
+        debugManager.flags.EnableInternalHeapPoolAllocator.set(0);
     }
 
     void TearDown() override {
@@ -63,6 +89,26 @@ struct InternalsEventTest
     }
 
     MockContext *mockContext = nullptr;
+    DebugManagerStateRestore restorer;
+};
+
+struct InternalsEventTestWithMockCsr
+    : public InternalsEventTest {
+
+    void SetUp() override {}
+    void TearDown() override {}
+
+    template <typename FamilyType>
+    void setUpT() {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MockCsr<FamilyType>>();
+        InternalsEventTest::SetUp();
+    }
+
+    template <typename FamilyType>
+    void tearDownT() {
+        InternalsEventTest::TearDown();
+    }
 };
 
 struct MyUserEvent : public VirtualEvent {
@@ -75,27 +121,15 @@ struct MyUserEvent : public VirtualEvent {
 };
 
 struct MyEvent : public Event {
+
+    using Event::completeTimeStamp;
+    using Event::endTimeStamp;
+    using Event::queueTimeStamp;
+    using Event::startTimeStamp;
+    using Event::submitTimeStamp;
+
     MyEvent(CommandQueue *cmdQueue, cl_command_type cmdType, TaskCountType taskLevel, TaskCountType taskCount)
         : Event(cmdQueue, cmdType, taskLevel, taskCount) {
-    }
-    TimeStampData getQueueTimeStamp() {
-        return this->queueTimeStamp;
-    };
-
-    TimeStampData getSubmitTimeStamp() {
-        return this->submitTimeStamp;
-    };
-
-    uint64_t getStartTimeStamp() {
-        return this->startTimeStamp;
-    };
-
-    uint64_t getEndTimeStamp() {
-        return this->endTimeStamp;
-    };
-
-    uint64_t getCompleteTimeStamp() {
-        return this->completeTimeStamp;
     }
 
     uint64_t getGlobalStartTimestamp() const {
@@ -107,7 +141,7 @@ struct MyEvent : public Event {
     }
 
     void calculateProfilingDataInternal(uint64_t contextStartTS, uint64_t contextEndTS, uint64_t *contextCompleteTS, uint64_t globalStartTS) override {
-        if (DebugManager.flags.ReturnRawGpuTimestamps.get()) {
+        if (debugManager.flags.ReturnRawGpuTimestamps.get()) {
             globalStartTimestamp = globalStartTS;
         }
         Event::calculateProfilingDataInternal(contextStartTS, contextEndTS, contextCompleteTS, globalStartTS);

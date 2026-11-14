@@ -1,15 +1,18 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/addressing_mode_helper.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
 
@@ -49,15 +52,13 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBufferRect(
 
     const size_t hostPtrSize = Buffer::calculateHostPtrSize(hostOrigin, region, hostRowPitch, hostSlicePitch);
     const uint32_t rootDeviceIndex = getDevice().getRootDeviceIndex();
-    InternalMemoryType memoryType = InternalMemoryType::NOT_SPECIFIED;
+    InternalMemoryType memoryType = InternalMemoryType::notSpecified;
     GraphicsAllocation *mapAllocation = nullptr;
     bool isCpuCopyAllowed = false;
     getContext().tryGetExistingHostPtrAllocation(ptr, hostPtrSize, rootDeviceIndex, mapAllocation, memoryType, isCpuCopyAllowed);
 
-    auto eBuiltInOps = EBuiltInOps::CopyBufferRect;
-    if (forceStateless(buffer->getSize())) {
-        eBuiltInOps = EBuiltInOps::CopyBufferRectStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(buffer->getSize());
 
     void *dstPtr = ptr;
 
@@ -87,7 +88,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBufferRect(
     void *alignedDstPtr = alignDown(dstPtr, 4);
     size_t dstPtrOffset = ptrDiff(dstPtr, alignedDstPtr);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = buffer;
     dc.dstPtr = alignedDstPtr;
     dc.srcOffset = bufferOrigin;
@@ -103,7 +104,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBufferRect(
     dc.direction = csrSelectionArgs.direction;
 
     MultiDispatchInfo dispatchInfo(dc);
-    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_READ_BUFFER_RECT>(dispatchInfo, surfaces, eBuiltInOps, numEventsInWaitList, eventWaitList, event, blockingRead, csr);
+    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_READ_BUFFER_RECT>(dispatchInfo, surfaces, {BuiltIn::BaseKernel::copyBufferRect, builtInMode}, numEventsInWaitList, eventWaitList, event, blockingRead, csr);
     if (dispatchResult != CL_SUCCESS) {
         return dispatchResult;
     }

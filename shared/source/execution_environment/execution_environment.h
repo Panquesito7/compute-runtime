@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,24 @@
 
 #pragma once
 #include "shared/source/debugger/debugger.h"
+#include "shared/source/device/device_group_sort_key.h"
+#include "shared/source/helpers/device_hierarchy_mode.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/reference_tracked_object.h"
 
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace NEO {
 class DirectSubmissionController;
+class UnifiedMemoryReuseCleaner;
+class UsmReusePerfLogger;
+class GfxCoreHelper;
 class MemoryManager;
+struct HardwareInfo;
 struct OsEnvironment;
 struct RootDeviceEnvironment;
 
@@ -26,45 +36,87 @@ class ExecutionEnvironment : public ReferenceTrackedObject<ExecutionEnvironment>
 
     MOCKABLE_VIRTUAL bool initializeMemoryManager();
     void calculateMaxOsContextCount();
+    int clearErrorDescription();
     virtual void prepareRootDeviceEnvironments(uint32_t numRootDevices);
     void prepareRootDeviceEnvironment(const uint32_t rootDeviceIndexForReInit);
     void parseAffinityMask();
-    void adjustCcsCount();
-    void adjustCcsCount(const uint32_t rootDeviceIndex) const;
+    bool adjustCcsCount();
+    bool adjustCcsCount(const uint32_t rootDeviceIndex) const;
     void sortNeoDevices();
-    void sortNeoDevicesDRM();
-    void sortNeoDevicesWDDM();
+    void setDeviceHierarchyMode(const GfxCoreHelper &gfxCoreHelper);
+    void setDeviceHierarchyMode(const DeviceHierarchyMode deviceHierarchyMode) {
+        this->deviceHierarchyMode = deviceHierarchyMode;
+    }
+    DeviceHierarchyMode getDeviceHierarchyMode() const { return deviceHierarchyMode; }
+    void adjustRootDeviceEnvironments();
     void prepareForCleanup() const;
+    MOCKABLE_VIRTUAL void configureCcsMode();
     void setDebuggingMode(DebuggingMode debuggingMode) {
         debuggingEnabledMode = debuggingMode;
     }
     DebuggingMode getDebuggingMode() const { return debuggingEnabledMode; }
-    bool isDebuggingEnabled() const { return debuggingEnabledMode != DebuggingMode::Disabled; }
+    bool isDebuggingEnabled() const { return debuggingEnabledMode != DebuggingMode::disabled; }
     void setMetricsEnabled(bool value) {
         this->metricsEnabled = value;
     }
+    void getErrorDescription(const char **ppString);
+    bool getSubDeviceHierarchy(uint32_t index, std::tuple<uint32_t, uint32_t, uint32_t> *subDeviceMap);
     bool areMetricsEnabled() { return this->metricsEnabled; }
-    void setFP64EmulationEnabled() {
-        fp64EmulationEnabled = true;
+    int setErrorDescription(const std::string &str);
+    void setDevicePermissionError(bool value) {
+        devicePermissionError = value;
     }
-    bool isFP64EmulationEnabled() const { return fp64EmulationEnabled; }
+    bool isDevicePermissionError() const { return devicePermissionError; }
+    void addLeoPlatformKey(const HardwareInfo &hwInfo);
+    const std::vector<DeviceGroupSortKey> &getLeoPlatformKeys() const { return leoPlatformKeys; }
+    bool isLeoRootDeviceDetected() const { return !leoPlatformKeys.empty(); }
+    bool isResourceDecompressionEnabled() const { return resourceDecompressionEnabled; };
+    void setResourceDecompressionEnabled(bool value) { resourceDecompressionEnabled = value; };
 
     DirectSubmissionController *initializeDirectSubmissionController();
+    void initializeUnifiedMemoryReuseCleaner(bool isAnyDirectSubmissionLightEnabled);
+    UsmReusePerfLogger &getUsmReusePerfLogger() const;
 
+    std::unique_lock<std::mutex> obtainPeerAccessQueryLock() {
+        return std::unique_lock<std::mutex>(peerAccessQueryMutex);
+    }
+
+  private:
+    // Must be declared before the memory manager and reuse cleaner to outlive their teardown
+    mutable std::once_flag usmReusePerfLoggerOnceFlag;
+    mutable std::unique_ptr<UsmReusePerfLogger> usmReusePerfLogger;
+
+  public:
     std::unique_ptr<MemoryManager> memoryManager;
+    std::unique_ptr<UnifiedMemoryReuseCleaner> unifiedMemoryReuseCleaner;
     std::unique_ptr<DirectSubmissionController> directSubmissionController;
     std::unique_ptr<OsEnvironment> osEnvironment;
     std::vector<std::unique_ptr<RootDeviceEnvironment>> rootDeviceEnvironments;
     void releaseRootDeviceEnvironmentResources(RootDeviceEnvironment *rootDeviceEnvironment);
+    // Map of Sub Device Indices set during Affinity Mask in the form of:
+    // <RootDeviceIndex, SubDeviceIndex, SubDeviceCount>
+    // Primarily used by the Metrics Library to communicate the actual Sub Device Index being used in queries.
+    std::unordered_map<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t>> mapOfSubDeviceIndices;
+    std::unordered_map<std::thread::id, std::string> errorDescs;
+    std::mutex errorDescsMutex;
+    std::mutex peerAccessQueryMutex;
 
   protected:
-    void parseCcsCountLimitations();
+    static bool comparePciIdBusNumber(std::unique_ptr<RootDeviceEnvironment> &rootDeviceEnvironment1, std::unique_ptr<RootDeviceEnvironment> &rootDeviceEnvironment2);
+    bool parseCcsCountLimitations();
     void adjustCcsCountImpl(RootDeviceEnvironment *rootDeviceEnvironment) const;
     void configureNeoEnvironment();
+    void restoreCcsMode();
     bool metricsEnabled = false;
-    bool fp64EmulationEnabled = false;
+    bool devicePermissionError = false;
+    bool resourceDecompressionEnabled = false;
 
-    DebuggingMode debuggingEnabledMode = DebuggingMode::Disabled;
+    DeviceHierarchyMode deviceHierarchyMode = DeviceHierarchyMode::composite;
+    DebuggingMode debuggingEnabledMode = DebuggingMode::disabled;
     std::unordered_map<uint32_t, uint32_t> rootDeviceNumCcsMap;
+    std::mutex initializeDirectSubmissionControllerMutex;
+    std::mutex initializeUnifiedMemoryReuseCleanerMutex;
+    std::vector<std::tuple<std::string, uint32_t>> deviceCcsModeVec;
+    std::vector<DeviceGroupSortKey> leoPlatformKeys;
 };
 } // namespace NEO

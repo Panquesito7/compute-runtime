@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,16 +13,94 @@ namespace NEO {
 
 namespace SysCalls {
 
+enum class ProcessPowerThrottlingState {
+    Eco,
+    High
+};
+
+enum class ThreadPriority {
+    Normal,
+    AboveNormal
+};
+
+DWORD getLastError();
 HANDLE createEvent(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCSTR lpName);
+BOOL resetEvent(HANDLE hEvent);
+BOOL setEvent(HANDLE hEvent);
+DWORD waitForMultipleObjects(DWORD nCount, CONST HANDLE *lpHandles, BOOL bWaitAll, DWORD dwMilliseconds);
+DWORD waitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
+HANDLE createWaitableTimerEx(LPSECURITY_ATTRIBUTES lpTimerAttributes, LPCWSTR lpTimerName, DWORD dwFlags, DWORD dwDesiredAccess);
+BOOL setWaitableTimer(HANDLE hTimer, const LARGE_INTEGER *lpDueTime, LONG lPeriod, PTIMERAPCROUTINE pfnCompletionRoutine, LPVOID lpArgToCompletionRoutine, BOOL fResume);
+BOOL registerWaitForSingleObject(PHANDLE phNewWaitObject, HANDLE hObject, WAITORTIMERCALLBACK callback, PVOID context, ULONG dwMilliseconds, ULONG dwFlags);
+BOOL unregisterWait(HANDLE waitHandle);
 BOOL closeHandle(HANDLE hObject);
 BOOL getSystemPowerStatus(LPSYSTEM_POWER_STATUS systemPowerStatusPtr);
+BOOL getLogicalProcessorInformationEx(LOGICAL_PROCESSOR_RELATIONSHIP relationshipType, PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer, PDWORD returnedLength);
 BOOL getModuleHandle(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule);
 DWORD getModuleFileName(HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
-char *getenv(const char *variableName);
+UINT getTempFileNameA(LPCSTR lpPathName, LPCSTR lpPrefixString, UINT uUnique, LPSTR lpTempFileName);
+BOOL moveFileExA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName, DWORD dwFlags);
+BOOL lockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, LPOVERLAPPED lpOverlapped);
+BOOL unlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, LPOVERLAPPED lpOverlapped);
+BOOL getOverlappedResult(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait);
+BOOL createDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
+BOOL removeDirectoryA(LPCSTR lpPathName);
+HANDLE createFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+BOOL deleteFileA(LPCSTR lpFileName);
+HRESULT shGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken, PWSTR *ppszPat);
+BOOL readFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped);
+BOOL writeFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped);
+HANDLE findFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData);
+BOOL findNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData);
+BOOL findClose(HANDLE hFindFile);
+DWORD getFileAttributesA(LPCSTR lpFileName);
+DWORD setFilePointer(HANDLE hFile, LONG lDistanceToMove, PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod);
+BOOL getFileSizeEx(HANDLE hFile, PLARGE_INTEGER lpFileSize);
+HANDLE createFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES lpFileMappingAttributes, DWORD flProtect, DWORD dwMaximumSizeHigh, DWORD dwMaximumSizeLow, LPCSTR lpName);
+LPVOID mapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess, DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap);
+BOOL unmapViewOfFile(LPCVOID lpBaseAddress);
+BOOL duplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions);
+HANDLE openProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+
+void setProcessPowerThrottlingState(ProcessPowerThrottlingState state);
+void setThreadPriority(ThreadPriority priority);
+void coTaskMemFree(LPVOID pv);
 
 LSTATUS regOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult);
 LSTATUS regQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
-
+HANDLE createFile(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+BOOL deviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped);
+CONFIGRET cmGetDeviceInterfaceListSize(PULONG pulLen, LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, ULONG ulFlags);
+CONFIGRET cmGetDeviceInterfaceList(LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, PZZWSTR buffer, ULONG bufferLen, ULONG ulFlags);
+CONFIGRET cmGetDeviceIdSize(PULONG pulLen, DEVINST dnDevInst, ULONG ulFlags);
+CONFIGRET cmGetDeviceId(DEVINST dnDevInst, PWSTR buffer, ULONG bufferLen, ULONG ulFlags);
+CONFIGRET cmGetChild(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags);
+CONFIGRET cmGetSibling(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags);
+BOOL setupDiGetDeviceRegistryProperty(HDEVINFO deviceInfoSet, PSP_DEVINFO_DATA deviceInfoData, DWORD property, PDWORD propertyRegDataType, PBYTE propertyBuffer, DWORD propertyBufferSize, PDWORD requiredSize);
+BOOL setupDiOpenDeviceInfo(HDEVINFO deviceInfoSet, PCWSTR deviceInstanceId, HWND hwndParent, DWORD openFlags, PSP_DEVINFO_DATA deviceInfoData);
+BOOL setupDiEnumDeviceInfo(HDEVINFO deviceInfoSet, DWORD memberIndex, PSP_DEVINFO_DATA deviceInfoData);
+BOOL setupDiDestroyDeviceInfoList(HDEVINFO deviceInfoSet);
+HDEVINFO setupDiGetClassDevs(GUID *classGuid, PCWSTR enumerator, HWND hwndParent, DWORD flags);
+LPVOID heapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes);
+BOOL heapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem);
+SIZE_T virtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength);
+BOOL getModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule);
+DWORD getModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
+BOOL getModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName, HMODULE *phModule);
+DWORD getModuleFileNameA(HMODULE hModule, LPSTR lpFilename, DWORD nSize);
+DWORD getFileVersionInfoSizeW(LPCWSTR lptstrFilename, LPDWORD lpdwHandle);
+BOOL getFileVersionInfoW(LPCWSTR lptstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData);
+BOOL verQueryValueW(LPCVOID pBlock, LPCWSTR lpSubBlock, LPVOID *lplpBuffer, PUINT puLen);
+DWORD getLastError();
+BOOL processIdToSessionId(DWORD dwProcessId, DWORD *pSessionId);
+void rtlInitUnicodeString(PUNICODE_STRING destinationString, PCWSTR sourceString);
+NTSTATUS ntOpenDirectoryObject(PHANDLE directoryHandle, ACCESS_MASK desiredAccess, POBJECT_ATTRIBUTES objectAttributes);
+NTSTATUS ntQueryObject(HANDLE handle, OBJECT_INFORMATION_CLASS objectInformationClass, PVOID objectInformation, ULONG objectInformationLength, PULONG returnLength);
+HANDLE openFileMapping(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName);
+extern LPWCH mockEnvStringsW;
+extern BOOL mockFreeEnvStringsWResult;
+LPWCH getEnvironmentStringsW();
+BOOL freeEnvironmentStringsW(LPWCH);
 } // namespace SysCalls
 
 } // namespace NEO

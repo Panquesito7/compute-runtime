@@ -1,15 +1,10 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#if defined(_WIN32)
-#include "shared/source/os_interface/windows/os_library_win.h"
-#elif defined(__linux__)
-#include "shared/source/os_interface/linux/os_library_linux.h"
-#endif
 #include "shared/source/os_interface/os_library.h"
 #include "shared/test/common/fixtures/memory_management_fixture.h"
 #include "shared/test/common/test_macros/test.h"
@@ -27,45 +22,49 @@ const std::string fnName = "testDynamicLibraryFunc";
 using namespace NEO;
 
 TEST(OSLibraryTest, whenLibraryNameIsEmptyThenCurrentProcesIsUsedAsLibrary) {
-    std::unique_ptr<OsLibrary> library{OsLibrary::load("")};
+    std::unique_ptr<OsLibrary> library{OsLibrary::loadFunc({""})};
     EXPECT_NE(nullptr, library);
     void *ptr = library->getProcAddress("selfDynamicLibraryFunc");
     EXPECT_NE(nullptr, ptr);
 }
 
 TEST(OSLibraryTest, GivenFakeLibNameWhenLoadingLibraryThenNullIsReturned) {
-    OsLibrary *library = OsLibrary::load(fakeLibName);
+    OsLibrary *library = OsLibrary::loadFunc(fakeLibName);
     EXPECT_EQ(nullptr, library);
 }
 
 TEST(OSLibraryTest, GivenFakeLibNameWhenLoadingLibraryThenNullIsReturnedAndErrorString) {
     std::string errorValue;
-    OsLibrary *library = OsLibrary::load(fakeLibName, &errorValue);
+    OsLibraryCreateProperties properties(fakeLibName);
+    properties.errorValue = &errorValue;
+    OsLibrary *library = OsLibrary::loadFunc(properties);
     EXPECT_FALSE(errorValue.empty());
     EXPECT_EQ(nullptr, library);
 }
 
 TEST(OSLibraryTest, GivenValidLibNameWhenLoadingLibraryThenLibraryIsLoaded) {
-    std::unique_ptr<OsLibrary> library(OsLibrary::load(Os::testDllName));
+    std::unique_ptr<OsLibrary> library(OsLibrary::loadFunc({Os::testDllName}));
     EXPECT_NE(nullptr, library);
 }
 
 TEST(OSLibraryTest, GivenValidLibNameWhenLoadingLibraryThenLibraryIsLoadedWithNoErrorString) {
     std::string errorValue;
-    std::unique_ptr<OsLibrary> library(OsLibrary::load(Os::testDllName, &errorValue));
+    OsLibraryCreateProperties properties(Os::testDllName);
+    properties.errorValue = &errorValue;
+    std::unique_ptr<OsLibrary> library(OsLibrary::loadFunc(properties));
     EXPECT_TRUE(errorValue.empty());
     EXPECT_NE(nullptr, library);
 }
 
 TEST(OSLibraryTest, whenSymbolNameIsValidThenGetProcAddressReturnsNonNullPointer) {
-    std::unique_ptr<OsLibrary> library(OsLibrary::load(Os::testDllName));
+    std::unique_ptr<OsLibrary> library(OsLibrary::loadFunc({Os::testDllName}));
     EXPECT_NE(nullptr, library);
     void *ptr = library->getProcAddress(fnName);
     EXPECT_NE(nullptr, ptr);
 }
 
 TEST(OSLibraryTest, whenSymbolNameIsInvalidThenGetProcAddressReturnsNullPointer) {
-    std::unique_ptr<OsLibrary> library(OsLibrary::load(Os::testDllName));
+    std::unique_ptr<OsLibrary> library(OsLibrary::loadFunc({Os::testDllName}));
     EXPECT_NE(nullptr, library);
     void *ptr = library->getProcAddress(fnName + "invalid");
     EXPECT_EQ(nullptr, ptr);
@@ -78,7 +77,7 @@ TEST_F(OsLibraryTestWithFailureInjection, GivenFailureInjectionWhenLibraryIsLoad
         std::string libName(Os::testDllName);
 
         // System under test
-        OsLibrary *library = OsLibrary::load(libName);
+        OsLibrary *library = OsLibrary::loadFunc(libName);
 
         if (MemoryManagement::nonfailingAllocation == failureIndex) {
             EXPECT_NE(nullptr, library);
@@ -99,6 +98,7 @@ TEST(OsLibrary, whenCallingIndexOperatorThenObjectConvertibleToFunctionOrVoidPoi
             return ptrToReturn;
         }
         bool isLoaded() override { return true; }
+        std::string getFullPath() override { return std::string(); }
 
         void *ptrToReturn = nullptr;
         std::string lastRequestedProcName;

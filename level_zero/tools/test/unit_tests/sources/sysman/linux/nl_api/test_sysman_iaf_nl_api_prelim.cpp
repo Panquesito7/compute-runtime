@@ -1,17 +1,19 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
 
 #include "level_zero/tools/source/sysman/linux/nl_api/iaf_nl_api.h"
 
-#include "gmock/gmock.h"
+#include "gtest/gtest.h"
 #include "mock_nl_api_prelim.h"
 
+#include <algorithm>
 #include <limits>
 #include <netlink/handlers.h>
 
@@ -129,7 +131,7 @@ TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGenlRegisterFamilyFailesWithExist
     pMockNlApi->mockLoadEntryPointsReturnValue.push_back(true);
     pMockNlApi->mockGenlRegisterFamilyReturnValue.push_back(-NLE_EXIST);
     pMockNlApi->isMockGenlRegisterFamilyRepeatedCall.push_back(false);
-    EXPECT_EQ(ZE_RESULT_NOT_READY, testIafNlApi.init());
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, testIafNlApi.init());
 }
 
 TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGenlRegisterFamilyFailesWithAnyOtherErrorInitReturnsErrorUnknown) {
@@ -456,6 +458,80 @@ TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGetThroughputCalledAndRxAndTxCoun
     EXPECT_EQ(ZE_RESULT_SUCCESS, testIafNlApi.getThroughput(pMockNlApi->testPortId, throughput));
     EXPECT_EQ(0U, throughput.txCounter);
     EXPECT_EQ(0U, throughput.rxCounter);
+}
+
+TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGetMultiPortThroughputCalledThenRxCounterAndTxCounterReturned) {
+
+    std::vector<IafPortId> iafPortIdList = {};
+    std::vector<IafThroughPutInfo> iafThroughPutList = {};
+    MockNlApi *pMockNlApi = static_cast<MockNlApi *>(testIafNlApi.pNlApi.get());
+    setupExpectInit();
+    setupExpectCleanup();
+    setupExpectCommand(IAF_CMD_OP_FPORT_THROUGHPUT, pMockNlApi->testPortId.fabricId,
+                       pMockNlApi->testPortId.attachId, pMockNlApi->testPortId.portNumber);
+    pMockNlApi->testMultiPortThroughputCount = 3;
+    for (auto i = 0U; i < pMockNlApi->testMultiPortThroughputCount; i++) {
+        IafPortId iafPortId(pMockNlApi->testPortId.fabricId, pMockNlApi->testPortId.attachId, pMockNlApi->testPortId.portNumber + i);
+        iafPortIdList.push_back(iafPortId);
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, testIafNlApi.getMultiPortThroughPut(iafPortIdList, iafThroughPutList));
+    EXPECT_EQ(iafPortIdList.size(), iafThroughPutList.size());
+    for (auto i = 0U; i < iafThroughPutList.size(); i++) {
+        EXPECT_EQ(pMockNlApi->txCounter, iafThroughPutList.at(i).iafThroughput.txCounter);
+        EXPECT_EQ(pMockNlApi->rxCounter, iafThroughPutList.at(i).iafThroughput.rxCounter);
+        EXPECT_EQ(pMockNlApi->testPortId.fabricId, iafThroughPutList.at(i).iafPortId.fabricId);
+        EXPECT_EQ(pMockNlApi->testPortId.attachId, iafThroughPutList.at(i).iafPortId.attachId);
+        EXPECT_EQ(pMockNlApi->testPortId.portNumber + i, iafThroughPutList.at(i).iafPortId.portNumber);
+    }
+}
+
+TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGetMultiPortThroughputCalledAndRxAndTxCountersNotPresentThenThroughputInfoSizeIsZero) {
+
+    std::vector<IafPortId> iafPortIdList = {};
+    std::vector<IafThroughPutInfo> iafThroughPutList = {};
+    MockNlApi *pMockNlApi = static_cast<MockNlApi *>(testIafNlApi.pNlApi.get());
+    setupExpectInit();
+    setupExpectCleanup();
+    setupExpectCommand(IAF_CMD_OP_FPORT_THROUGHPUT, pMockNlApi->testPortId.fabricId,
+                       pMockNlApi->testPortId.attachId, pMockNlApi->testPortId.portNumber);
+    pMockNlApi->testMultiPortThroughputCount = 3;
+    for (auto i = 0U; i < pMockNlApi->testMultiPortThroughputCount; i++) {
+        IafPortId iafPortId(pMockNlApi->testPortId.fabricId, pMockNlApi->testPortId.attachId, pMockNlApi->testPortId.portNumber + i);
+        iafPortIdList.push_back(iafPortId);
+    }
+
+    pMockNlApi->addRxTxCounters = false;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, testIafNlApi.getMultiPortThroughPut(iafPortIdList, iafThroughPutList));
+    EXPECT_EQ(0UL, iafThroughPutList.size());
+}
+
+TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGetMultiPortThroughputCalledAndNlmsgAllocFailsThenUnknownErrorIsReturned) {
+    std::vector<IafPortId> iafPortIdList = {};
+    std::vector<IafThroughPutInfo> iafThroughPutList = {};
+    MockNlApi *pMockNlApi = static_cast<MockNlApi *>(testIafNlApi.pNlApi.get());
+    setupExpectInit();
+    setupExpectCleanup();
+    for (auto i = 0U; i < pMockNlApi->testMultiPortThroughputCount; i++) {
+        IafPortId iafPortId(pMockNlApi->testPortId.fabricId, pMockNlApi->testPortId.attachId, pMockNlApi->testPortId.portNumber + i);
+        iafPortIdList.push_back(iafPortId);
+    }
+
+    pMockNlApi->mockNlmsgAllocReturnValue.push_back(nullptr);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, testIafNlApi.getMultiPortThroughPut(iafPortIdList, iafThroughPutList));
+}
+
+TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenGetMultiPortThroughputCalledAndInitFailsThenErrorIsReturned) {
+    std::vector<IafPortId> iafPortIdList = {};
+    std::vector<IafThroughPutInfo> iafThroughPutList = {};
+    MockNlApi *pMockNlApi = static_cast<MockNlApi *>(testIafNlApi.pNlApi.get());
+    for (auto i = 0U; i < pMockNlApi->testMultiPortThroughputCount; i++) {
+        IafPortId iafPortId(pMockNlApi->testPortId.fabricId, pMockNlApi->testPortId.attachId, pMockNlApi->testPortId.portNumber + i);
+        iafPortIdList.push_back(iafPortId);
+    }
+
+    pMockNlApi->mockLoadEntryPointsReturnValue.push_back(false);
+    EXPECT_EQ(ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE, testIafNlApi.getMultiPortThroughPut(iafPortIdList, iafThroughPutList));
 }
 
 TEST_F(SysmanIafNlApiFixture, GivenIafNlApiWhenDeviceEnumCalledThenFabricIdsReturned) {

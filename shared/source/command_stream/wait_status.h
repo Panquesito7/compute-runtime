@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,14 +12,19 @@
 namespace NEO {
 
 enum class WaitStatus {
-    NotReady = 0,
-    Ready = 1,
-    GpuHang = 2,
+    notReady = 0,
+    ready = 1,
+    gpuHang = 2,
 };
 
 struct WaitParams {
+    WaitParams() = default;
+    WaitParams(bool indefinitelyPoll, bool enableTimeout, bool skipTbxDownload, int64_t waitTimeout)
+        : indefinitelyPoll(indefinitelyPoll), enableTimeout(enableTimeout), skipTbxDownload(skipTbxDownload), waitTimeout(waitTimeout) {};
+
     bool indefinitelyPoll = false;
     bool enableTimeout = false;
+    bool skipTbxDownload = false;
     int64_t waitTimeout = 0;
 };
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,17 +12,37 @@
 #include <cstddef>
 #include <vector>
 
+namespace WalkerPartition {
+
+struct WalkerPartitionArgs;
+
+} // namespace WalkerPartition
+
 namespace NEO {
 
 class CommandStreamReceiver;
 class LinearStream;
+class ProductHelper;
 struct DeviceInfo;
 struct KernelDescriptor;
 struct HardwareInfo;
 struct RootDeviceEnvironment;
 
 template <typename GfxFamily>
-struct UnitTestHelper {
+struct UnitTestHelperWithHeap {
+    static bool getDisableFusionStateFromFrontEndCommand(const typename GfxFamily::FrontEndStateCommand &feCmd);
+    static bool getComputeDispatchAllWalkerFromFrontEndCommand(const typename GfxFamily::FrontEndStateCommand &feCmd);
+};
+
+template <typename GfxFamily>
+struct UnitTestHelperNoHeap {
+};
+
+template <typename GfxFamily>
+using UnitTestHelperBase = std::conditional_t<GfxFamily::isHeaplessRequired(), UnitTestHelperNoHeap<GfxFamily>, UnitTestHelperWithHeap<GfxFamily>>;
+
+template <typename GfxFamily>
+struct UnitTestHelper : public UnitTestHelperBase<GfxFamily> {
     using COHERENCY_TYPE = typename GfxFamily::RENDER_SURFACE_STATE::COHERENCY_TYPE;
 
     static bool isL3ConfigProgrammable();
@@ -35,7 +55,7 @@ struct UnitTestHelper {
 
     static bool isExpectMemoryNotEqualSupported();
 
-    static uint32_t getDefaultSshUsage();
+    static uint32_t getDefaultSshUsage(const ProductHelper &productHelper);
 
     static uint32_t getAppropriateThreadArbitrationPolicy(int32_t policy);
 
@@ -55,8 +75,6 @@ struct UnitTestHelper {
 
     static bool requiresTimestampPacketsInSystemMemory(HardwareInfo &hwInfo);
 
-    static void setExtraMidThreadPreemptionFlag(HardwareInfo &hwInfo, bool value);
-
     static uint32_t getDebugModeRegisterOffset();
     static uint32_t getDebugModeRegisterValue();
     static uint32_t getTdCtlRegisterOffset();
@@ -73,12 +91,18 @@ struct UnitTestHelper {
     static const bool additionalMiFlushDwRequired;
 
     static uint64_t getPipeControlPostSyncAddress(const typename GfxFamily::PIPE_CONTROL &pipeControl);
+
+    static uint64_t getSemaphoreWaitAddress(const void *semWaitCmd);
+    static uint64_t getSemaphoreWaitData(const void *semWaitCmd);
+
     static bool getPipeControlHdcPipelineFlush(const typename GfxFamily::PIPE_CONTROL &pipeControl);
     static void setPipeControlHdcPipelineFlush(typename GfxFamily::PIPE_CONTROL &pipeControl, bool hdcPipelineFlush);
 
     static void adjustKernelDescriptorForImplicitArgs(KernelDescriptor &kernelDescriptor);
 
     static std::vector<bool> getProgrammedLargeGrfValues(CommandStreamReceiver &csr, LinearStream &linearStream);
+
+    static std::vector<bool> getProgrammedLargeGrfValues(LinearStream &linearStream);
 
     static uint32_t getProgrammedGrfValue(CommandStreamReceiver &csr, LinearStream &linearStream);
 
@@ -88,17 +112,25 @@ struct UnitTestHelper {
 
     static void validateSbaMocs(uint32_t expectedMocs, CommandStreamReceiver &csr);
 
-    static GenCmdList::iterator findMidThreadPreemptionAllocationCommand(GenCmdList::iterator begin, GenCmdList::iterator end);
+    static GenCmdList::iterator findCsrBaseAddressCommand(GenCmdList::iterator begin, GenCmdList::iterator end);
 
     static std::vector<GenCmdList::iterator> findAllMidThreadPreemptionAllocationCommand(GenCmdList::iterator begin, GenCmdList::iterator end);
-
-    static bool getDisableFusionStateFromFrontEndCommand(const typename GfxFamily::VFE_STATE_TYPE &feCmd);
-    static bool getComputeDispatchAllWalkerFromFrontEndCommand(const typename GfxFamily::VFE_STATE_TYPE &feCmd);
+    static uint32_t getInlineDataSize(bool isHeaplessEnabled);
     static bool getSystolicFlagValueFromPipelineSelectCommand(const typename GfxFamily::PIPELINE_SELECT &pipelineSelectCmd);
     static size_t getAdditionalDshSize(uint32_t iddCount);
     static bool expectNullDsh(const DeviceInfo &deviceInfo);
 
-    static bool findStateCacheFlushPipeControl(LinearStream &csrStream);
+    static bool findStateCacheFlushPipeControl(CommandStreamReceiver &csr, LinearStream &csrStream);
+    static void verifyDummyBlitWa(const RootDeviceEnvironment *rootDeviceEnvironment, GenCmdList::iterator &cmdIterator);
+    static uint64_t getWalkerPartitionEstimateSpaceRequiredInCommandBuffer(bool isHeaplessEnabled, WalkerPartition::WalkerPartitionArgs &testArgs);
+    static GenCmdList::iterator findWalkerTypeCmd(GenCmdList::iterator begin, GenCmdList::iterator end);
+    static std::vector<GenCmdList::iterator> findAllWalkerTypeCmds(GenCmdList::iterator begin, GenCmdList::iterator end);
+    static void getSpaceAndInitWalkerCmd(LinearStream &stream, bool heapless);
+    static void *getInitWalkerCmd(bool heapless);
+    static size_t getWalkerSize(bool isHeaplessEnabled);
+    template <typename WalkerType>
+    static uint64_t getWalkerActivePostSyncAddress(WalkerType *walkerCmd);
+    static void skipStatePrefetch(GenCmdList::iterator &iter);
 };
 
 } // namespace NEO

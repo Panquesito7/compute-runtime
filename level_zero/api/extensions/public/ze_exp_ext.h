@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <level_zero/ze_api.h>
 #include <level_zero/zet_api.h>
 
 namespace L0 {
@@ -56,6 +57,12 @@ ze_result_t zetMetricGroupCalculateMultipleMetricValuesExp(
     uint32_t *pMetricCounts,
     zet_typed_value_t *pMetricValues);
 
+ze_result_t zetMetricGroupGetGlobalTimestampsExp(
+    zet_metric_group_handle_t hMetricGroup,
+    ze_bool_t synchronizedWithHost,
+    uint64_t *globalTimestamp,
+    uint64_t *metricTimestamp);
+
 ze_result_t zeFabricVertexGetExp(
     ze_driver_handle_t hDriver,
     uint32_t *pCount,
@@ -92,5 +99,131 @@ ze_result_t zeFabricEdgeGetVerticesExp(
 ze_result_t zeFabricEdgeGetPropertiesExp(
     ze_fabric_edge_handle_t hEdge,
     ze_fabric_edge_exp_properties_t *pEdgeProperties);
+
+ze_result_t zeRTASBuilderCreateExp(
+    ze_driver_handle_t hDriver,
+    const ze_rtas_builder_exp_desc_t *pDescriptor,
+    ze_rtas_builder_exp_handle_t *phBuilder);
+
+ze_result_t zeRTASBuilderGetBuildPropertiesExp(
+    ze_rtas_builder_exp_handle_t hBuilder,
+    const ze_rtas_builder_build_op_exp_desc_t *pBuildOpDescriptor,
+    ze_rtas_builder_exp_properties_t *pProperties);
+
+ze_result_t zeDriverRTASFormatCompatibilityCheckExp(
+    ze_driver_handle_t hDriver,
+    ze_rtas_format_exp_t rtasFormatA,
+    ze_rtas_format_exp_t rtasFormatB);
+
+ze_result_t zeRTASBuilderBuildExp(
+    ze_rtas_builder_exp_handle_t hBuilder,
+    const ze_rtas_builder_build_op_exp_desc_t *pBuildOpDescriptor,
+    void *pScratchBuffer,
+    size_t scratchBufferSizeBytes,
+    void *pRtasBuffer,
+    size_t rtasBufferSizeBytes,
+    ze_rtas_parallel_operation_exp_handle_t hParallelOperation,
+    void *pBuildUserPtr,
+    ze_rtas_aabb_exp_t *pBounds,
+    size_t *pRtasBufferSizeBytes);
+
+ze_result_t zeRTASBuilderDestroyExp(
+    ze_rtas_builder_exp_handle_t hBuilder);
+
+ze_result_t zeRTASParallelOperationCreateExp(
+    ze_driver_handle_t hDriver,
+    ze_rtas_parallel_operation_exp_handle_t *phParallelOperation);
+
+ze_result_t zeRTASParallelOperationGetPropertiesExp(
+    ze_rtas_parallel_operation_exp_handle_t hParallelOperation,
+    ze_rtas_parallel_operation_exp_properties_t *pProperties);
+
+ze_result_t zeRTASParallelOperationJoinExp(
+    ze_rtas_parallel_operation_exp_handle_t hParallelOperation);
+
+ze_result_t zeRTASParallelOperationDestroyExp(
+    ze_rtas_parallel_operation_exp_handle_t hParallelOperation);
+
+// RTAs Ext
+
+ze_result_t zeRTASBuilderCreateExt(ze_driver_handle_t hDriver,
+                                   const ze_rtas_builder_ext_desc_t *pDescriptor,
+                                   ze_rtas_builder_ext_handle_t *phBuilder);
+
+ze_result_t zeRTASBuilderGetBuildPropertiesExt(
+    ze_rtas_builder_ext_handle_t hBuilder,
+    const ze_rtas_builder_build_op_ext_desc_t *pBuildOpDescriptor,
+    ze_rtas_builder_ext_properties_t *pProperties);
+
+ze_result_t zeDriverRTASFormatCompatibilityCheckExt(
+    ze_driver_handle_t hDriver,
+    ze_rtas_format_ext_t rtasFormatA,
+    ze_rtas_format_ext_t rtasFormatB);
+
+ze_result_t zeRTASBuilderBuildExt(
+    ze_rtas_builder_ext_handle_t hBuilder,
+    const ze_rtas_builder_build_op_ext_desc_t *pBuildOpDescriptor,
+    void *pScratchBuffer,
+    size_t scratchBufferSizeBytes,
+    void *pRtasBuffer,
+    size_t rtasBufferSizeBytes,
+    ze_rtas_parallel_operation_ext_handle_t hParallelOperation,
+    void *pBuildUserPtr,
+    ze_rtas_aabb_ext_t *pBounds,
+    size_t *pRtasBufferSizeBytes);
+
+ze_result_t zeRTASBuilderDestroyExt(
+    ze_rtas_builder_ext_handle_t hBuilder);
+
+ze_result_t zeRTASBuilderCommandListAppendCopyExt(
+    ze_command_list_handle_t hCommandList,
+    void *dstptr,
+    const void *srcptr,
+    size_t size,
+    ze_event_handle_t hSignalEvent,
+    uint32_t numWaitEvents,
+    ze_event_handle_t *phWaitEvents);
+
+ze_result_t zeRTASParallelOperationCreateExt(
+    ze_driver_handle_t hDriver,
+    ze_rtas_parallel_operation_ext_handle_t *phParallelOperation);
+
+ze_result_t zeRTASParallelOperationGetPropertiesExt(
+    ze_rtas_parallel_operation_ext_handle_t hParallelOperation,
+    ze_rtas_parallel_operation_ext_properties_t *pProperties);
+
+ze_result_t zeRTASParallelOperationJoinExt(
+    ze_rtas_parallel_operation_ext_handle_t hParallelOperation);
+
+ze_result_t zeRTASParallelOperationDestroyExt(
+    ze_rtas_parallel_operation_ext_handle_t hParallelOperation);
+
+// End RTAS Ext
+
+ze_result_t zeMemSetAtomicAccessAttributeExp(
+    ze_context_handle_t hContext,
+    ze_device_handle_t hDevice,
+    const void *ptr,
+    size_t size,
+    ze_memory_atomic_attr_exp_flags_t attr);
+
+ze_result_t zeMemGetAtomicAccessAttributeExp(
+    ze_context_handle_t hContext,
+    ze_device_handle_t hDevice,
+    const void *ptr,
+    size_t size,
+    ze_memory_atomic_attr_exp_flags_t *pAttr);
+
+ze_result_t zeMemGetPitchFor2dImage(
+    ze_context_handle_t hContext,
+    ze_device_handle_t hDevice,
+    size_t imageWidth,
+    size_t imageHeight,
+    unsigned int elementSizeInBytes,
+    size_t *rowPitch);
+
+ze_result_t zeImageGetDeviceOffsetExp(
+    ze_image_handle_t hImage,
+    uint64_t *pDeviceOffset);
 
 } // namespace L0

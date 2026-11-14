@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,33 +7,45 @@
 
 #pragma once
 #include "shared/source/gmm_helper/gmm_lib.h"
+#include "shared/source/gmm_helper/gmm_resource_usage_type.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
+#include <functional>
 #include <memory>
 
 namespace NEO {
 class GmmClientContext;
+class GmmResourceInfo;
 struct RootDeviceEnvironment;
 class GmmHandleAllocator;
 class MapGpuVirtualAddressGmm;
 class FreeGpuVirtualAddressGmm;
+class DeallocateGmm;
 
-class GmmClientContext {
+class GmmClientContext : public NonCopyableClass {
   public:
-    GmmClientContext(const RootDeviceEnvironment &rootDeviceEnvironment);
+    GmmClientContext();
     MOCKABLE_VIRTUAL ~GmmClientContext();
+    MOCKABLE_VIRTUAL void initialize(const RootDeviceEnvironment &rootDeviceEnvironment);
 
-    MOCKABLE_VIRTUAL MEMORY_OBJECT_CONTROL_STATE cachePolicyGetMemoryObject(GMM_RESOURCE_INFO *pResInfo, GMM_RESOURCE_USAGE_TYPE usage);
-    MOCKABLE_VIRTUAL uint32_t cachePolicyGetPATIndex(GMM_RESOURCE_INFO *gmmResourceInfo, GMM_RESOURCE_USAGE_TYPE usage, bool compressed, bool cachable);
+    MOCKABLE_VIRTUAL MEMORY_OBJECT_CONTROL_STATE cachePolicyGetMemoryObject(GMM_RESOURCE_INFO *pResInfo, GmmResourceUsageType usage);
+    MOCKABLE_VIRTUAL uint32_t cachePolicyGetPATIndex(GMM_RESOURCE_INFO *gmmResourceInfo, GmmResourceUsageType usage, bool compressed, bool cpuCacheable);
 
     MOCKABLE_VIRTUAL GMM_RESOURCE_INFO *createResInfoObject(GMM_RESCREATE_PARAMS *pCreateParams);
     MOCKABLE_VIRTUAL GMM_RESOURCE_INFO *copyResInfoObject(GMM_RESOURCE_INFO *pSrcRes);
     MOCKABLE_VIRTUAL void destroyResInfoObject(GMM_RESOURCE_INFO *pResInfo);
+    MOCKABLE_VIRTUAL GMM_RESOURCE_INFO *getGmmResInfoFromExternalResourceHandle(const void *externalResourceHandle);
+    MOCKABLE_VIRTUAL GmmResourceInfo *createResInfoFromWddmPrivateData(const void *pPrivateDriverData, uint32_t privateDriverDataSize);
+    MOCKABLE_VIRTUAL long deallocate2(DeallocateGmm *deallocateGmm);
     MOCKABLE_VIRTUAL uint64_t mapGpuVirtualAddress(MapGpuVirtualAddressGmm *pMapGpuVa);
     MOCKABLE_VIRTUAL uint64_t freeGpuVirtualAddress(FreeGpuVirtualAddressGmm *pFreeGpuVa);
     GMM_CLIENT_CONTEXT *getHandle() const;
     template <typename T>
     static std::unique_ptr<GmmClientContext> create(const RootDeviceEnvironment &rootDeviceEnvironment) {
-        return std::make_unique<T>(rootDeviceEnvironment);
+        auto retVal = std::make_unique<T>();
+        retVal->initialize(rootDeviceEnvironment);
+        return retVal;
     }
 
     MOCKABLE_VIRTUAL uint8_t getSurfaceStateCompressionFormat(GMM_RESOURCE_FORMAT format);
@@ -41,14 +53,18 @@ class GmmClientContext {
 
     void setHandleAllocator(std::unique_ptr<GmmHandleAllocator> allocator);
 
-    MOCKABLE_VIRTUAL void setGmmDeviceInfo(GMM_DEVICE_INFO *deviceInfo);
-
     GmmHandleAllocator *getHandleAllocator() {
         return handleAllocator.get();
     }
+    uint64_t getDeviceHandle() const {
+        return deviceHandle;
+    }
 
   protected:
-    GMM_CLIENT_CONTEXT *clientContext;
+    std::unique_ptr<GMM_CLIENT_CONTEXT, std::function<void(GMM_CLIENT_CONTEXT *)>> clientContext;
     std::unique_ptr<GmmHandleAllocator> handleAllocator;
+    uint64_t deviceHandle = 0;
 };
+static_assert(NEO::NonCopyable<GmmClientContext>);
+
 } // namespace NEO

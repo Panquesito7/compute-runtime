@@ -1,12 +1,15 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
 #include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
@@ -26,6 +29,7 @@ Buffer *GlBuffer::createSharedGlBuffer(Context *context, cl_mem_flags flags, uns
     ErrorCodeHelper errorCode(errcodeRet, CL_SUCCESS);
     CL_GL_BUFFER_INFO bufferInfo = {0};
     bufferInfo.bufferName = bufferId;
+    bufferInfo.createOrDestroy = true;
 
     GLSharingFunctionsWindows *sharingFunctions = context->getSharing<GLSharingFunctionsWindows>();
     if (sharingFunctions->acquireSharedBufferINTEL(&bufferInfo) == GL_FALSE) {
@@ -148,12 +152,13 @@ GraphicsAllocation *GlBuffer::createGraphicsAllocation(Context *context, unsigne
         AllocationProperties properties = {context->getDevice(0)->getRootDeviceIndex(),
                                            false, // allocateMemory
                                            0u,    // size
-                                           AllocationType::SHARED_BUFFER,
+                                           AllocationType::sharedBuffer,
                                            false, // isMultiStorageAllocation
                                            context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex())};
         // couldn't find allocation for reuse - create new
+        MemoryManager::OsHandleData osHandleData{bufferInfo.globalShareHandle};
         graphicsAllocation =
-            context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(bufferInfo.globalShareHandle, properties, true, false, true, nullptr);
+            context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(osHandleData, properties, true, false, true, nullptr);
     }
 
     if (!graphicsAllocation) {
@@ -164,18 +169,24 @@ GraphicsAllocation *GlBuffer::createGraphicsAllocation(Context *context, unsigne
     if (!reusedAllocation) {
         sharingFunctions->graphicsAllocationsForGlBufferReuse.push_back(std::make_pair(bufferId, graphicsAllocation));
         if (bufferInfo.pGmmResInfo) {
-            DEBUG_BREAK_IF(graphicsAllocation->getDefaultGmm() != nullptr);
             auto gmmHelper = context->getDevice(0)->getRootDeviceEnvironment().getGmmHelper();
-            graphicsAllocation->setDefaultGmm(new Gmm(gmmHelper, bufferInfo.pGmmResInfo));
+            auto gmmResInfo = gmmHelper->getClientContext()->getGmmResInfoFromExternalResourceHandle(bufferInfo.pGmmResInfo);
+            auto gmmResourceInfo = std::unique_ptr<GmmResourceInfo>(GmmResourceInfo::create(gmmHelper->getClientContext(), gmmResInfo));
+            graphicsAllocation->setDefaultGmm(std::make_unique<Gmm>(gmmHelper, gmmResourceInfo.get()));
         }
     }
 
     return graphicsAllocation;
 }
 
-void GlBuffer::releaseResource(MemObj *memObject, uint32_t rootDeviceIndex) {
+void GlBuffer::callReleaseResource(bool createOrDestroy) {
     auto sharingFunctions = static_cast<GLSharingFunctionsWindows *>(this->sharingFunctions);
     CL_GL_BUFFER_INFO bufferInfo = {};
     bufferInfo.bufferName = this->clGlObjectId;
+    bufferInfo.createOrDestroy = createOrDestroy;
     sharingFunctions->releaseSharedBufferINTEL(&bufferInfo);
+}
+
+void GlBuffer::releaseResource(MemObj *memObject, uint32_t rootDeviceIndex) {
+    callReleaseResource(false);
 }

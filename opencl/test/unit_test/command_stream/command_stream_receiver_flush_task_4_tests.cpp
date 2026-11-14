@@ -1,18 +1,25 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/wait_status.h"
+#include "shared/source/compiler_interface/compiler_options.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/timestamp_packet.h"
+#include "shared/source/utilities/wait_util.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_timestamp_container.h"
+#include "shared/test/common/mocks/mock_zebin_wrapper.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
 #include "opencl/source/event/user_event.h"
 #include "opencl/test/unit_test/fixtures/multi_root_device_fixture.h"
@@ -29,8 +36,6 @@ using namespace NEO;
 using MultiRootDeviceCommandStreamReceiverBufferTests = MultiRootDeviceFixture;
 
 HWTEST_F(MultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEventInMultiRootDeviceEnvironmentWhenTheyArePassedToEnqueueWithSubmissionThenCsIsWaitingForEventsFromPreviousDevices) {
-    REQUIRE_SVM_OR_SKIP(device1);
-    REQUIRE_SVM_OR_SKIP(device2);
 
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     cl_int retVal = 0;
@@ -40,9 +45,14 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEventInMu
     auto pCmdQ1 = context->getSpecialQueue(1u);
     auto pCmdQ2 = context->getSpecialQueue(2u);
 
-    std::unique_ptr<MockProgram> program(Program::createBuiltInFromSource<MockProgram>("FillBufferBytes", context.get(), context->getDevices(), &retVal));
-    program->build(program->getDevices(), nullptr);
-    std::unique_ptr<MockKernel> kernel(Kernel::create<MockKernel>(program.get(), program->getKernelInfoForKernel("FillBufferBytes"), *context->getDevice(0), retVal));
+    MockZebinWrapper<>::Descriptor desc{};
+    desc.isStateless = NEO::CompilerProductHelper::create(defaultHwInfo->platform.eProductFamily)->isForceToStatelessRequired();
+    MockZebinWrapper mockZebin{*defaultHwInfo, desc};
+    mockZebin.setAsMockCompilerReturnedBinary();
+
+    std::unique_ptr<MockProgram> program(Program::createBuiltInFromSource<MockProgram>(mockZebin.kernelName, context.get(), context->getDevices(), &retVal));
+    program->build(program->getDevices(), CompilerOptions::kernelOptions.c_str());
+    std::unique_ptr<MockKernel> kernel(Kernel::create<MockKernel>(program.get(), program->getKernelInfoForKernel(mockZebin.kernelName), *context->getDevice(0), retVal));
     ASSERT_EQ(CL_SUCCESS, retVal);
 
     size_t svmSize = 4096;
@@ -98,12 +108,12 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEventInMu
         EXPECT_EQ(2u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node4->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node4->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
 
         auto semaphoreCmd1 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[1]));
-        EXPECT_EQ(1u, semaphoreCmd1->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), semaphoreCmd1->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd1));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd1));
     }
 
     {
@@ -126,12 +136,12 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEventInMu
         EXPECT_EQ(2u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
 
         auto semaphoreCmd1 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[1]));
-        EXPECT_EQ(1u, semaphoreCmd1->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node3->getContextEndAddress(0u)), semaphoreCmd1->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd1));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node3->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd1));
     }
     alignedFree(svmPtr);
 }
@@ -142,18 +152,13 @@ using MultiRootDeviceCommandStreamReceiverTests = CommandStreamReceiverFlushTask
 HWTEST_F(MultiRootDeviceCommandStreamReceiverTests, givenMultipleEventInMultiRootDeviceEnvironmentWhenTheyArePassedToEnqueueWithoutSubmissionThenCsIsWaitingForEventsFromPreviousDevices) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCommandStreamReceiver>();
+
     auto deviceFactory = std::make_unique<UltClDeviceFactory>(4, 0);
     auto device1 = deviceFactory->rootDevices[1];
     auto device2 = deviceFactory->rootDevices[2];
     auto device3 = deviceFactory->rootDevices[3];
-
-    auto mockCsr1 = new MockCommandStreamReceiver(*device1->executionEnvironment, device1->getRootDeviceIndex(), device1->getDeviceBitfield());
-    auto mockCsr2 = new MockCommandStreamReceiver(*device2->executionEnvironment, device2->getRootDeviceIndex(), device2->getDeviceBitfield());
-    auto mockCsr3 = new MockCommandStreamReceiver(*device3->executionEnvironment, device3->getRootDeviceIndex(), device3->getDeviceBitfield());
-
-    device1->resetCommandStreamReceiver(mockCsr1);
-    device2->resetCommandStreamReceiver(mockCsr2);
-    device3->resetCommandStreamReceiver(mockCsr3);
 
     cl_device_id devices[] = {device1, device2, device3};
 
@@ -205,19 +210,19 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverTests, givenMultipleEventInMultiRoo
         csHwParser.parseCommands<FamilyType>(pCmdQ1->getCS(0));
         auto semaphores = findAll<MI_SEMAPHORE_WAIT *>(csHwParser.cmdList.begin(), csHwParser.cmdList.end());
 
-        EXPECT_EQ(3u, semaphores.size());
+        ASSERT_EQ(3u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node4->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node4->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
 
         auto semaphoreCmd1 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[1]));
-        EXPECT_EQ(1u, semaphoreCmd1->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), semaphoreCmd1->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd1));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd1));
 
         auto semaphoreCmd2 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[2]));
-        EXPECT_EQ(1u, semaphoreCmd2->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node6->getContextEndAddress(0u)), semaphoreCmd2->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd2));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node6->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd2));
     }
 
     {
@@ -233,16 +238,16 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverTests, givenMultipleEventInMultiRoo
         EXPECT_EQ(3u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
 
         auto semaphoreCmd1 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[1]));
-        EXPECT_EQ(1u, semaphoreCmd1->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node3->getContextEndAddress(0u)), semaphoreCmd1->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd1));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node3->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd1));
 
         auto semaphoreCmd2 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[2]));
-        EXPECT_EQ(1u, semaphoreCmd2->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), semaphoreCmd2->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd2));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd2));
     }
 
     {
@@ -267,14 +272,15 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverTests, givenMultipleEventInMultiRoo
         EXPECT_EQ(1u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
     }
 }
 
 struct CrossDeviceDependenciesTests : public ::testing::Test {
 
     void SetUp() override {
+        debugRestorer.reset(new DebugManagerStateRestore());
         VariableBackup<HardwareInfo> backupHwInfo(defaultHwInfo.get());
         defaultHwInfo->capabilityTable.blitterOperationsSupported = true;
         deviceFactory = std::make_unique<UltClDeviceFactory>(3, 0);
@@ -291,8 +297,10 @@ struct CrossDeviceDependenciesTests : public ::testing::Test {
     }
 
     void TearDown() override {
+        debugRestorer.reset();
     }
 
+    std::unique_ptr<DebugManagerStateRestore> debugRestorer;
     std::unique_ptr<UltClDeviceFactory> deviceFactory;
     std::unique_ptr<MockContext> context;
 
@@ -301,8 +309,6 @@ struct CrossDeviceDependenciesTests : public ::testing::Test {
 };
 
 HWTEST_F(CrossDeviceDependenciesTests, givenMultipleEventInMultiRootDeviceEnvironmentWhenTheyArePassedToMarkerThenMiSemaphoreWaitCommandSizeIsIncluded) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-
     Event event1(pCmdQ1, CL_COMMAND_NDRANGE_KERNEL, 5, 15);
     event1.getMultiRootTimestampSyncNode();
     Event event2(nullptr, CL_COMMAND_NDRANGE_KERNEL, 6, 16);
@@ -429,27 +435,27 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
         EXPECT_EQ(0u, semaphores.size());
     }
     userEvent1.setStatus(CL_COMPLETE);
-    pCmdQ1->finish();
-    pCmdQ2->finish();
+    pCmdQ1->finish(false);
+    pCmdQ2->finish(false);
     {
         HardwareParse csHwParser;
         csHwParser.parseCommands<FamilyType>(pCmdQ1->getGpgpuCommandStreamReceiver().getCS(0));
         auto semaphores = findAll<MI_SEMAPHORE_WAIT *>(csHwParser.cmdList.begin(), csHwParser.cmdList.end());
 
-        EXPECT_EQ(1u, semaphores.size());
+        ASSERT_EQ(1u, semaphores.size());
         auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(event2->getMultiRootDeviceTimestampPacketNodes()->peekNodes().at(0)->getContextEndAddress(0u)), semaphoreCmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(event2->getMultiRootDeviceTimestampPacketNodes()->peekNodes().at(0)->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
     }
     {
         HardwareParse csHwParser;
         csHwParser.parseCommands<FamilyType>(pCmdQ2->getGpgpuCommandStreamReceiver().getCS(0));
         auto semaphores = findAll<MI_SEMAPHORE_WAIT *>(csHwParser.cmdList.begin(), csHwParser.cmdList.end());
 
-        EXPECT_EQ(1u, semaphores.size());
+        ASSERT_EQ(1u, semaphores.size());
         auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(event1->getMultiRootDeviceTimestampPacketNodes()->peekNodes().at(0)->getContextEndAddress(0u)), semaphoreCmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(event1->getMultiRootDeviceTimestampPacketNodes()->peekNodes().at(0)->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
     }
     event1->release();
     event2->release();
@@ -460,7 +466,7 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableBlitterForEnqueueOperations.set(false);
+    debugManager.flags.EnableBlitterForEnqueueOperations.set(false);
 
     UserEvent userEvent1(&pCmdQ1->getContext());
 
@@ -516,7 +522,7 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
     userEvent1.setStatus(CL_COMPLETE);
     event1->release();
     event2->release();
-    pCmdQ1->finish();
+    pCmdQ1->finish(false);
     {
         HardwareParse csHwParser;
         csHwParser.parseCommands<FamilyType>(pCmdQ1->getGpgpuCommandStreamReceiver().getCS(0));
@@ -531,7 +537,7 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableBlitterForEnqueueOperations.set(true);
+    debugManager.flags.EnableBlitterForEnqueueOperations.set(true);
 
     for (auto &rootDeviceEnvironment : deviceFactory->rootDevices[0]->getExecutionEnvironment()->rootDeviceEnvironments) {
         REQUIRE_FULL_BLITTER_OR_SKIP(*rootDeviceEnvironment);
@@ -616,8 +622,8 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
         EXPECT_EQ(0u, semaphores.size());
     }
     userEvent1.setStatus(CL_COMPLETE);
-    pCmdQ1->finish();
-    pCmdQ2->finish();
+    pCmdQ1->finish(false);
+    pCmdQ2->finish(false);
 
     {
         HardwareParse csHwParser;
@@ -626,9 +632,9 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
 
         EXPECT_EQ(1u, semaphores.size());
         auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd->getSemaphoreDataDword());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
         auto node = event2->getMultiRootDeviceTimestampPacketNodes()->peekNodes().at(0);
-        EXPECT_EQ(node->getGpuAddress() + node->getContextEndOffset(), semaphoreCmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(node->getGpuAddress() + node->getContextEndOffset(), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
     }
     {
         HardwareParse csHwParser;
@@ -644,9 +650,9 @@ HWTEST_F(CrossDeviceDependenciesTests, givenWaitListWithEventBlockedByUserEventW
 
         EXPECT_EQ(2u, semaphores.size());
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
         auto node = event1->getMultiRootDeviceTimestampPacketNodes()->peekNodes().at(0);
-        EXPECT_EQ(node->getGpuAddress() + node->getContextEndOffset(), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(node->getGpuAddress() + node->getContextEndOffset(), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
     }
     {
         HardwareParse csHwParser;
@@ -674,7 +680,7 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverTests, givenUnflushedQueueAndEventI
     auto pCmdQ1 = context.get()->getSpecialQueue(1u);
     auto pCmdQ2 = context.get()->getSpecialQueue(2u);
 
-    pCmdQ1->getGpgpuCommandStreamReceiver().overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    pCmdQ1->getGpgpuCommandStreamReceiver().overrideDispatchPolicy(DispatchMode::batchedDispatch);
     cl_event outputEvent{};
     cl_event inputEvent;
 
@@ -696,21 +702,21 @@ HWTEST_F(MultiRootDeviceCommandStreamReceiverTests, givenUnflushedQueueAndEventI
     EXPECT_TRUE(pCmdQ1->getGpgpuCommandStreamReceiver().isLatestTaskCountFlushed());
     castToObject<Event>(inputEvent)->release();
     castToObject<Event>(outputEvent)->release();
-    pCmdQ1->finish();
-    pCmdQ2->finish();
+    pCmdQ1->finish(false);
+    pCmdQ2->finish(false);
 }
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenStaticPartitioningEnabledWhenFlushingTaskThenWorkPartitionAllocationIsMadeResident) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.EnableStaticPartitioning.set(1);
-    DebugManager.flags.EnableImplicitScaling.set(1);
-    DebugManager.flags.ForcePreemptionMode.set(PreemptionMode::Disabled);
+    debugManager.flags.EnableStaticPartitioning.set(1);
+    debugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.ForcePreemptionMode.set(PreemptionMode::Disabled);
     UltDeviceFactory deviceFactory{1, 2};
     MockDevice *device = deviceFactory.rootDevices[0];
     auto &mockCsr = device->getUltCommandStreamReceiver<FamilyType>();
     ASSERT_NE(nullptr, mockCsr.getWorkPartitionAllocation());
 
-    mockCsr.overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    mockCsr.overrideDispatchPolicy(DispatchMode::batchedDispatch);
     mockCsr.storeMakeResidentAllocations = true;
 
     DispatchFlags dispatchFlags = DispatchFlagsHelper::createDefaultDispatchFlags();
@@ -738,9 +744,13 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenStaticPartitioningEnabledWhen
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenEnqueueWithoutArbitrationPolicyWhenPolicyIsAlreadyProgrammedThenReuse) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
+    debugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
 
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    if (commandStreamReceiver.heaplessPrologProgrammed) {
+        GTEST_SKIP();
+    }
+
     commandStreamReceiver.streamProperties.initSupport(pDevice->getRootDeviceEnvironment());
     auto &csrThreadArbitrationPolicy = commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value;
 
@@ -762,7 +772,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenEnqueueWithoutArbitrationPoli
 struct PreambleThreadArbitrationMatcher {
     template <PRODUCT_FAMILY productFamily>
     static constexpr bool isMatched() {
-        if constexpr (HwMapper<productFamily>::GfxProduct::supportsCmdSet(IGFX_GEN8_CORE)) {
+        if constexpr (HwMapper<productFamily>::GfxProduct::supportsCmdSet(IGFX_GEN12LP_CORE)) {
             return TestTraits<NEO::ToGfxCoreFamily<productFamily>::get()>::implementsPreambleThreadArbitration;
         }
         return false;
@@ -771,15 +781,15 @@ struct PreambleThreadArbitrationMatcher {
 
 HWTEST2_F(CommandStreamReceiverFlushTaskTests, givenPolicyValueChangedWhenFlushingTaskThenProgramThreadArbitrationPolicy, PreambleThreadArbitrationMatcher) {
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     commandStreamReceiver.isPreambleSent = true;
 
     flushTask(commandStreamReceiver);
     size_t parsingOffset = commandStreamReceiver.commandStream.getUsed();
+    const auto &hwInfo = pDevice->getHardwareInfo();
     for (auto arbitrationChanged : ::testing::Bool()) {
         commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value =
-            arbitrationChanged ? -1 : gfxCoreHelper.getDefaultThreadArbitrationPolicy();
+            arbitrationChanged ? -1 : hwInfo.caps.defaultThreadArbitrationPolicy;
 
         flushTask(commandStreamReceiver);
         HardwareParse csHwParser;
@@ -799,12 +809,15 @@ extern volatile TagAddressType *pauseAddress;
 extern TaskCountType pauseValue;
 } // namespace CpuIntrinsicsTests
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenTagValueNotMeetingTaskCountToWaitWhenTagValueSwitchesThenWaitFunctionReturnsTrue) {
+using CommandStreamReceiverFlushTaskTestsWithMockCsrHw2 = UltCommandStreamReceiverTestWithCsrT<MockCsrHw2>;
+
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenTagValueNotMeetingTaskCountToWaitWhenTagValueSwitchesThenWaitFunctionReturnsTrue) {
     VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
     VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue);
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::noUse);
+    VariableBackup<uint32_t> backupWaitCount(&WaitUtils::waitCount, 1);
 
-    auto mockCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(mockCsr);
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     TaskCountType taskCountToWait = 2u;
 
@@ -813,16 +826,17 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenTagValueNotMeetingTaskCountTo
     CpuIntrinsicsTests::pauseAddress = mockCsr->tagAddress;
     CpuIntrinsicsTests::pauseValue = taskCountToWait;
 
-    const auto ret = mockCsr->waitForCompletionWithTimeout(WaitParams{false, false, 1}, taskCountToWait);
-    EXPECT_EQ(NEO::WaitStatus::Ready, ret);
+    const auto ret = mockCsr->waitForCompletionWithTimeout(WaitParams{false, false, false, 1}, taskCountToWait);
+    EXPECT_EQ(NEO::WaitStatus::ready, ret);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenTagValueNotMeetingTaskCountToWaitAndIndefinitelyPollWhenWaitForCompletionThenDoNotCallWaitUtils) {
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenTagValueNotMeetingTaskCountToWaitAndIndefinitelyPollWhenWaitForCompletionThenDoNotCallWaitUtils) {
     VariableBackup<volatile TagAddressType *> backupPauseAddress(&CpuIntrinsicsTests::pauseAddress);
     VariableBackup<TaskCountType> backupPauseValue(&CpuIntrinsicsTests::pauseValue);
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::noUse);
+    VariableBackup<uint32_t> backupWaitCount(&WaitUtils::waitCount, 1);
 
-    auto mockCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(mockCsr);
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     TaskCountType taskCountToWait = 2u;
 
@@ -831,14 +845,14 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenTagValueNotMeetingTaskCountTo
     CpuIntrinsicsTests::pauseAddress = mockCsr->tagAddress;
     CpuIntrinsicsTests::pauseValue = taskCountToWait;
 
-    const auto ret = mockCsr->waitForCompletionWithTimeout(WaitParams{true, true, 10}, taskCountToWait);
-    EXPECT_EQ(NEO::WaitStatus::NotReady, ret);
+    const auto ret = mockCsr->waitForCompletionWithTimeout(WaitParams{true, true, false, 10}, taskCountToWait);
+    EXPECT_EQ(NEO::WaitStatus::notReady, ret);
 }
 
 HWTEST_F(UltCommandStreamReceiverTest, WhenFlushingAllCachesThenPipeControlIsAdded) {
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.FlushAllCaches.set(true);
+    debugManager.flags.FlushAllCaches.set(-1);
 
     char buff[sizeof(PIPE_CONTROL) * 3];
     LinearStream stream(buff, sizeof(PIPE_CONTROL) * 3);
@@ -871,7 +885,7 @@ HWTEST_F(UltCommandStreamReceiverTest, WhenFlushingAllCachesThenPipeControlIsAdd
 HWTEST_F(UltCommandStreamReceiverTest, givenDebugDisablingCacheFlushWhenAddingPipeControlWithCacheFlushThenOverrideRequestAndDisableCacheFlushFlags) {
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.DoNotFlushCaches.set(true);
+    debugManager.flags.DoNotFlushCaches.set(true);
 
     char buff[sizeof(PIPE_CONTROL) * 3];
     LinearStream stream(buff, sizeof(PIPE_CONTROL) * 3);
@@ -916,7 +930,7 @@ struct BcsCrossDeviceMigrationTests : public ::testing::Test {
       public:
         MockCmdQToTestMigration(Context *context, ClDevice *device) : CommandQueueHw<FamilyType>(context, device, nullptr, false) {}
 
-        bool migrateMultiGraphicsAllocationsIfRequired(const BuiltinOpParams &operationParams, CommandStreamReceiver &csr) override {
+        bool migrateMultiGraphicsAllocationsIfRequired(const BuiltIn::OpParams &operationParams, CommandStreamReceiver &csr) override {
             migrateMultiGraphicsAllocationsIfRequiredCalled = true;
             migrateMultiGraphicsAllocationsReceivedOperationParams = operationParams;
             migrateMultiGraphicsAllocationsReceivedCsr = &csr;
@@ -924,7 +938,7 @@ struct BcsCrossDeviceMigrationTests : public ::testing::Test {
         }
 
         bool migrateMultiGraphicsAllocationsIfRequiredCalled = false;
-        BuiltinOpParams migrateMultiGraphicsAllocationsReceivedOperationParams{};
+        BuiltIn::OpParams migrateMultiGraphicsAllocationsReceivedOperationParams{};
         CommandStreamReceiver *migrateMultiGraphicsAllocationsReceivedCsr = nullptr;
     };
 
@@ -932,7 +946,7 @@ struct BcsCrossDeviceMigrationTests : public ::testing::Test {
         VariableBackup<HardwareInfo> backupHwInfo(defaultHwInfo.get());
         defaultHwInfo->capabilityTable.blitterOperationsSupported = true;
 
-        DebugManager.flags.EnableBlitterForEnqueueOperations.set(true);
+        debugManager.flags.EnableBlitterForEnqueueOperations.set(true);
 
         deviceFactory = std::make_unique<UltClDeviceFactory>(2, 0);
         auto device1 = deviceFactory->rootDevices[0];
@@ -985,7 +999,7 @@ HWTEST_F(BcsCrossDeviceMigrationTests, givenBufferWithMultiStorageWhenEnqueueRea
     retVal = cmdQueue->enqueueReadBuffer(buffer.get(), CL_FALSE, 0, size, hostPtr, nullptr, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    cmdQueue->finish();
+    cmdQueue->finish(false);
 
     EXPECT_TRUE(cmdQueue->migrateMultiGraphicsAllocationsIfRequiredCalled);
 

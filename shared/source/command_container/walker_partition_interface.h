@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,11 +17,14 @@ struct WalkerPartitionArgs {
     uint64_t postSyncImmediateValue = 0;
     uint32_t partitionCount = 0;
     uint32_t tileCount = 0;
+    uint32_t workgroupSize = 0;
+    uint32_t threadGroupCount = 0;
     bool emitBatchBufferEnd = false;
     bool secondaryBatchBuffer = false;
     bool synchronizeBeforeExecution = false;
     bool crossTileAtomicSynchronization = false;
     bool semaphoreProgrammingRequired = false;
+    bool semaphore64bCmdSupported = false;
     bool staticPartitioning = false;
     bool emitSelfCleanup = false;
     bool useAtomicsForSelfCleanup = false;
@@ -32,6 +35,8 @@ struct WalkerPartitionArgs {
     bool pipeControlBeforeCleanupCrossTileSync = false;
     bool dcFlushEnable = false;
     bool forceExecutionOnSingleTile = false;
+    bool blockDispatchToCommandBuffer = false;
+    bool isRequiredDispatchWorkGroupOrder = false;
 };
 
 inline constexpr uint32_t wparidCCSOffset = 0x221C;

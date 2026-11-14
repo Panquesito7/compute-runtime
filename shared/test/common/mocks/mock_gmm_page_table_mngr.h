@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,18 +13,30 @@
 namespace NEO {
 class MockGmmPageTableMngr : public GmmPageTableMngr {
   public:
+    using GmmPageTableMngr::pageTableManager;
+    using GmmPageTableMngr::updateAuxTable;
     MockGmmPageTableMngr() {
         initContextAuxTableRegisterParamsPassed.clear();
     };
 
-    MockGmmPageTableMngr(unsigned int translationTableFlags, GMM_TRANSLATIONTABLE_CALLBACKS *translationTableCb)
-        : translationTableFlags(translationTableFlags) {
+    MockGmmPageTableMngr(unsigned int translationTableFlags, GMM_TRANSLATIONTABLE_CALLBACKS *translationTableCb, void *aubCsrHandle)
+        : passedAubCsrHandle(aubCsrHandle), translationTableFlags(translationTableFlags) {
+        if (translationTableCb) {
+            this->translationTableCb = *translationTableCb;
+        }
+    };
+    MockGmmPageTableMngr(GmmClientContext *clientContext, unsigned int translationTableFlags, GMM_TRANSLATIONTABLE_CALLBACKS *translationTableCb, void *aubCsrHandle) : GmmPageTableMngr(clientContext, translationTableFlags, translationTableCb, aubCsrHandle) {
+        passedAubCsrHandle = aubCsrHandle;
+        this->translationTableFlags = translationTableFlags;
         if (translationTableCb) {
             this->translationTableCb = *translationTableCb;
         }
     };
 
-    GMM_STATUS initContextAuxTableRegister(HANDLE initialBBHandle, GMM_ENGINE_TYPE engineType) override {
+    bool initContextAuxTableRegister(HANDLE initialBBHandle, GMM_ENGINE_TYPE engineType) override {
+        if (callBaseInitContextAuxTableRegister) {
+            return GmmPageTableMngr::initContextAuxTableRegister(initialBBHandle, engineType);
+        }
         initContextAuxTableRegisterCalled++;
         initContextAuxTableRegisterParamsPassed.push_back({initialBBHandle, engineType});
         return initContextAuxTableRegisterResult;
@@ -37,9 +49,13 @@ class MockGmmPageTableMngr : public GmmPageTableMngr {
 
     StackVec<InitContextAuxTableRegisterParams, 2> initContextAuxTableRegisterParamsPassed{};
     uint32_t initContextAuxTableRegisterCalled = 0u;
-    GMM_STATUS initContextAuxTableRegisterResult = GMM_STATUS::GMM_SUCCESS;
+    bool initContextAuxTableRegisterResult = true;
+    bool callBaseInitContextAuxTableRegister = false;
 
-    GMM_STATUS updateAuxTable(const GMM_DDI_UPDATEAUXTABLE *ddiUpdateAuxTable) override {
+    bool updateAuxTable(const GMM_DDI_UPDATEAUXTABLE *ddiUpdateAuxTable) override {
+        if (callBaseUpdateAuxTable) {
+            return GmmPageTableMngr::updateAuxTable(ddiUpdateAuxTable);
+        }
         updateAuxTableCalled++;
         updateAuxTableParamsPassed.push_back({*ddiUpdateAuxTable});
         return updateAuxTableResult;
@@ -51,12 +67,10 @@ class MockGmmPageTableMngr : public GmmPageTableMngr {
 
     StackVec<UpdateAuxTableParams, 1> updateAuxTableParamsPassed{};
     uint32_t updateAuxTableCalled = 0u;
-    GMM_STATUS updateAuxTableResult = GMM_STATUS::GMM_SUCCESS;
+    bool updateAuxTableResult = true;
+    bool callBaseUpdateAuxTable = false;
 
-    void setCsrHandle(void *csrHandle) override;
-
-    uint32_t setCsrHanleCalled = 0;
-    void *passedCsrHandle = nullptr;
+    void *passedAubCsrHandle = nullptr;
 
     unsigned int translationTableFlags = 0;
     GMM_TRANSLATIONTABLE_CALLBACKS translationTableCb = {};

@@ -1,22 +1,26 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/utilities/arrayref.h"
+#include "shared/source/utilities/bitcontainers.h"
 #include "shared/source/utilities/idlist.h"
 #include "shared/source/utilities/iflist.h"
-#include "shared/source/utilities/range.h"
+#include "shared/source/utilities/lookup_array.h"
 #include "shared/source/utilities/stackvec.h"
 #include "shared/test/unit_test/utilities/containers_tests_helpers.h"
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <memory>
 #include <numeric>
+#include <ranges>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -26,7 +30,7 @@ struct DummyFNode : IFNode<DummyFNode> {
     DummyFNode(uint32_t *destructorsCounter = nullptr)
         : destructorsCounter(destructorsCounter) {
     }
-    ~DummyFNode() {
+    ~DummyFNode() override {
         if (destructorsCounter != nullptr) {
             ++(*destructorsCounter);
         }
@@ -35,7 +39,7 @@ struct DummyFNode : IFNode<DummyFNode> {
     void setPrev(DummyFNode *) {
     }
 
-    uint32_t *destructorsCounter;
+    uint32_t *destructorsCounter = nullptr;
 };
 
 struct DummyDNode : IDNode<DummyDNode> {
@@ -55,8 +59,8 @@ struct DummyDNode : IDNode<DummyDNode> {
     uint32_t *destructorsCounter;
 };
 
-template <typename NodeType = DummyFNode, size_t ArraySize>
-void makeList(NodeType *(&nodes)[ArraySize], uint32_t *destructorsCounter = nullptr) {
+template <typename NodeType = DummyFNode, size_t arraySize>
+void makeList(NodeType *(&nodes)[arraySize], uint32_t *destructorsCounter = nullptr) {
     NodeType *prev = nullptr;
     for (NodeType *&nd : nodes) {
         nd = new NodeType(destructorsCounter);
@@ -178,9 +182,9 @@ TEST(IFNode, WhenVerifingSequenceThenCorrectValueIsReturned) {
     }
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iFListTestPushFrontOne() {
-    IFList<DummyFNode, ThreadSafe, false> list;
+    IFList<DummyFNode, threadSafe, false> list;
     ASSERT_TRUE(list.peekIsEmpty());
 
     DummyFNode node1;
@@ -234,9 +238,9 @@ TEST(IFList, WhenSplicingAndDeletingAllThenListIsEmpty) {
     ASSERT_EQ(2 * sizeof(nodes) / sizeof(nodes[0]), destructorCounter);
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iFListTestDetachNodes() {
-    IFList<DummyFNode, ThreadSafe, false> list;
+    IFList<DummyFNode, threadSafe, false> list;
 
     uint32_t destructorCounter = 0;
     static const uint32_t maxNodes = 17;
@@ -282,29 +286,35 @@ TEST(IFList, WhenExchangingHeadThenResultIsCorrect) {
     EXPECT_EQ(nullptr, nd2.next);
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iFRefListTestPushFrontOne() {
-    auto list = std::unique_ptr<IFRefList<DummyFNode, ThreadSafe, true>>(new IFRefList<DummyFNode, ThreadSafe, true>());
-    ASSERT_TRUE(list->peekIsEmpty());
+    uint32_t destructorCounter = 0;
+    {
+        auto list = std::unique_ptr<IFRefList<DummyFNode, threadSafe, true>>(new IFRefList<DummyFNode, threadSafe, true>());
+        ASSERT_TRUE(list->peekIsEmpty());
 
-    DummyFNode node1;
-    node1.next = nullptr; // garbage
-    list->pushRefFrontOne(node1);
-    ASSERT_FALSE(list->peekIsEmpty());
-    ASSERT_EQ(&node1, list->peekHead()->ref);
-    ASSERT_EQ(nullptr, node1.next);
+        DummyFNode node1(&destructorCounter);
+        node1.next = nullptr; // garbage
+        list->pushRefFrontOne(node1);
+        ASSERT_FALSE(list->peekIsEmpty());
+        ASSERT_EQ(&node1, list->peekHead()->ref);
+        ASSERT_EQ(nullptr, node1.next);
 
-    DummyFNode node2;
-    node2.next = nullptr; // garbage
-    list->pushRefFrontOne(node2);
-    ASSERT_FALSE(list->peekIsEmpty());
-    ASSERT_EQ(&node2, list->peekHead()->ref);
-    ASSERT_EQ(nullptr, node2.next);
+        DummyFNode node2(&destructorCounter);
+        node2.next = nullptr; // garbage
+        list->pushRefFrontOne(node2);
+        ASSERT_FALSE(list->peekIsEmpty());
+        ASSERT_EQ(&node2, list->peekHead()->ref);
+        ASSERT_EQ(nullptr, node2.next);
 
-    ASSERT_EQ(&node2, list->peekHead()->ref);
-    ASSERT_EQ(&node1, list->peekHead()->next->ref);
+        ASSERT_EQ(&node2, list->peekHead()->ref);
+        ASSERT_EQ(&node1, list->peekHead()->next->ref);
 
-    list.reset();
+        EXPECT_EQ(0u, destructorCounter);
+        list.reset();
+        EXPECT_EQ(0u, destructorCounter);
+    }
+    EXPECT_EQ(2u, destructorCounter);
 }
 
 TEST(IFRefList, GivenThreadSafeWhenPushingFrontOneThenResultIsCorrect) {
@@ -496,9 +506,9 @@ TEST(IDNode, WhenVerifyingSequenceThenResultIsCorrect) {
     }
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListTestPushOne() {
-    IDList<DummyDNode, ThreadSafe, false, false> list(nullptr);
+    IDList<DummyDNode, threadSafe, false, false> list(nullptr);
     ASSERT_TRUE(list.peekIsEmpty());
     ASSERT_EQ(nullptr, list.peekHead());
     ASSERT_EQ(nullptr, list.peekTail());
@@ -589,14 +599,14 @@ TEST(IDList, WhenResettingThenListIsEmpty) {
     ASSERT_EQ(sizeof(nodes) / sizeof(nodes[0]), destructorCounter);
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListSpliceAndDeleteAll() {
     DummyDNode *nodes[7];
     DummyDNode *nodes2[sizeof(nodes) / sizeof(nodes[0])];
     uint32_t destructorCounter = 0;
     makeList(nodes, &destructorCounter);
     makeList(nodes2, &destructorCounter);
-    IDList<DummyDNode, ThreadSafe, false, false> list;
+    IDList<DummyDNode, threadSafe, false, false> list;
     list.splice(*nodes[0]);
     EXPECT_FALSE(list.peekIsEmpty());
     EXPECT_EQ(nodes[0], list.peekHead());
@@ -627,9 +637,9 @@ TEST(IDList, GivenNonThreadSafeWhenSplicingAndDeletingAllThenResultIsCorrect) {
     iDListSpliceAndDeleteAll<false>();
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListTestDetachNodes() {
-    IDList<DummyDNode, ThreadSafe, false, false> list;
+    IDList<DummyDNode, threadSafe, false, false> list;
 
     uint32_t destructorCounter = 0;
     static const uint32_t maxNodes = 17;
@@ -653,9 +663,9 @@ TEST(IDList, GivenNonThreadSafeWhenDetachingNodesThenResultIsCorrect) {
     iDListTestDetachNodes<false>();
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListTestRemoveOne() {
-    IDList<DummyDNode, ThreadSafe, false, false> list;
+    IDList<DummyDNode, threadSafe, false, false> list;
 
     DummyDNode nodes[3];
 
@@ -713,9 +723,9 @@ TEST(IDList, GivenNonThreadSafeWhenRemovingOneThenResultIsCorrect) {
     iDListTestRemoveOne<false>();
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListTestRemoveFrontOne() {
-    IDList<DummyDNode, ThreadSafe, false, false> list;
+    IDList<DummyDNode, threadSafe, false, false> list;
 
     DummyDNode nodes[3];
     DummyDNode *head = nullptr;
@@ -774,11 +784,11 @@ TEST(IDList, GivenNonThreadSafeWhenRemovingFrontOneThenResultIsCorrect) {
     iDListTestRemoveFrontOne<false>();
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListTestDetachSequence() {
     DummyDNode *nodes[10];
     makeList(nodes);
-    IDList<DummyDNode, ThreadSafe, false, false> list(nodes[0]);
+    IDList<DummyDNode, threadSafe, false, false> list(nodes[0]);
     DummyDNode *detachedNodes = nullptr;
 
     detachedNodes = list.detachSequence(*nodes[1], *nodes[3]);
@@ -843,9 +853,9 @@ TEST(IDList, GivenNonThreadSafeWhenDetachingSequenceThenResultIsCorrect) {
     iDListTestDetachSequence<false>();
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDListTestPeekContains() {
-    IDList<DummyDNode, ThreadSafe, false, false> list;
+    IDList<DummyDNode, threadSafe, false, false> list;
 
     DummyDNode *node1 = new DummyDNode;
     EXPECT_FALSE(list.peekContains(*node1));
@@ -886,16 +896,16 @@ TEST(IDList, GivenNonThreadSafeWhenPeekingThenResultIsCorrect) {
     iDListTestPeekContains<false>();
 }
 
-template <typename NodeObjectType, bool ThreadSafe, bool OwnsNodes, bool SupportRecursiveLock>
+template <typename NodeObjectType, bool threadSafe, bool ownsNodes, bool supportRecursiveLock>
 void testIDListSpinlock() {
-    struct ListMock : IDList<NodeObjectType, ThreadSafe, OwnsNodes, SupportRecursiveLock> {
+    struct ListMock : IDList<NodeObjectType, threadSafe, ownsNodes, supportRecursiveLock> {
         std::atomic_flag &getLockedRef() { return this->locked; }
         std::atomic<std::thread::id> &getLockOwnerRef() { return this->lockOwner; }
-        using ListenerT = void (*)(IDList<NodeObjectType, ThreadSafe, OwnsNodes, SupportRecursiveLock> &list);
+        using ListenerT = void (*)(IDList<NodeObjectType, threadSafe, ownsNodes, supportRecursiveLock> &list);
         ListenerT &getSpinLockedListenerRef() { return this->spinLockedListener; }
 
         int32_t lockLoopCount = 0;
-        static void listener(IDList<NodeObjectType, ThreadSafe, OwnsNodes, SupportRecursiveLock> &list) {
+        static void listener(IDList<NodeObjectType, threadSafe, ownsNodes, supportRecursiveLock> &list) {
             ListMock &l = reinterpret_cast<ListMock &>(list);
             EXPECT_LT(0, l.lockLoopCount);
             --l.lockLoopCount;
@@ -935,11 +945,11 @@ TEST(IDList, GivenLockedIDListWhenProcessLockedIsUsedThenWaitsInSpinlock) {
     testIDListSpinlock<DummyDNode, true, false, false>();
 }
 
-template <typename NodeObjectType, bool ThreadSafe, bool OwnsNodes, bool SupportRecursiveLock>
+template <typename NodeObjectType, bool threadSafe, bool ownsNodes, bool supportRecursiveLock>
 void testIDListUnlockOnException() {
     using ExType = std::runtime_error;
 
-    struct ListMock : IDList<NodeObjectType, ThreadSafe, OwnsNodes, SupportRecursiveLock> {
+    struct ListMock : IDList<NodeObjectType, threadSafe, ownsNodes, supportRecursiveLock> {
         void throwExFromLock() {
             this->template processLocked<ListMock, &ListMock::throwExFromLockImpl>(nullptr, nullptr);
         }
@@ -963,9 +973,9 @@ TEST(IDList, GivenInsideLockWhenExceptionIsThrownThenUnlocksBeforeRethrowingExce
     testIDListUnlockOnException<DummyDNode, true, false, false>();
 }
 
-template <bool ThreadSafe>
+template <bool threadSafe>
 void iDRefListTestPushFrontOne() {
-    auto list = std::unique_ptr<IDRefList<DummyDNode, ThreadSafe, true>>(new IDRefList<DummyDNode, ThreadSafe, true>());
+    auto list = std::unique_ptr<IDRefList<DummyDNode, threadSafe, true>>(new IDRefList<DummyDNode, threadSafe, true>());
     ASSERT_TRUE(list->peekIsEmpty());
 
     DummyDNode node1;
@@ -1022,7 +1032,7 @@ TEST(IDRefList, GivenRecursiveLockWhenExecutingThenListIsNotEmpty) {
     ASSERT_FALSE(list.peekIsEmpty());
 }
 
-// Checks if a pointer is contained (in terms of continous memory) within given object
+// Checks if a pointer is contained (in terms of continuous memory) within given object
 template <typename ContainerType>
 bool contains(const ContainerType *container, const void *ptr) {
     uintptr_t base = (intptr_t)container;
@@ -1357,6 +1367,62 @@ TEST(StackVecPopBack, GivenNonEmptyStackVecThenRemoveSingleElementFromTheEnd) {
     EXPECT_EQ(0U, v.size());
 }
 
+TEST(StackVecBack, GivenStackStorageWhenGettingBackThenLastElementIsReturned) {
+    using Type = uint32_t;
+    StackVec<Type, 5> v;
+    v.push_back(3);
+    EXPECT_EQ(3U, v.back());
+
+    v.push_back(7);
+    EXPECT_EQ(7U, v.back());
+
+    v.pop_back();
+    EXPECT_EQ(3U, v.back());
+
+    v.back() = 11;
+    EXPECT_EQ(11U, v.back());
+    EXPECT_EQ(11U, v[v.size() - 1]);
+}
+
+TEST(StackVecBack, GivenStackStorageWhenGettingBackOnConstStackVecThenLastElementIsReturned) {
+    using VecType = StackVec<uint32_t, 5>;
+    VecType v;
+    v.push_back(3);
+    v.push_back(7);
+
+    const VecType &constRef = v;
+    EXPECT_EQ(7U, constRef.back());
+    EXPECT_EQ(&v.back(), &constRef.back());
+}
+
+TEST(StackVecBack, GivenDynamicStorageWhenGettingBackThenLastElementIsReturned) {
+    using Type = uint32_t;
+    StackVec<Type, 1> v;
+    v.push_back(3);
+    v.push_back(7);
+    v.push_back(11);
+    EXPECT_EQ(11U, v.back());
+
+    v.pop_back();
+    EXPECT_EQ(7U, v.back());
+
+    v.back() = 13;
+    EXPECT_EQ(13U, v.back());
+    EXPECT_EQ(13U, v[v.size() - 1]);
+}
+
+TEST(StackVecBack, GivenDynamicStorageWhenGettingBackOnConstStackVecThenLastElementIsReturned) {
+    using VecType = StackVec<uint32_t, 1>;
+    VecType v;
+    v.push_back(3);
+    v.push_back(7);
+    v.push_back(11);
+
+    const VecType &constRef = v;
+    EXPECT_EQ(11U, constRef.back());
+    EXPECT_EQ(&v.back(), &constRef.back());
+}
+
 TEST(StackVec, WhenReservingThenCapacityIncreasesAndSizeDoesNot) {
     using Type = uint32_t;
     StackVec<Type, 5> v;
@@ -1400,7 +1466,7 @@ TEST(StackVec, WhenResizingThenElementsAreCorrectlyManaged) {
             this->data = new int[100];
         }
 
-        Element(Element &&rhs) {
+        Element(Element &&rhs) noexcept {
             this->v = rhs.v;
             this->data = rhs.data;
             rhs.data = nullptr;
@@ -1413,7 +1479,7 @@ TEST(StackVec, WhenResizingThenElementsAreCorrectlyManaged) {
             return *this;
         }
 
-        Element &operator=(Element &&rhs) {
+        Element &operator=(Element &&rhs) noexcept {
             this->v = rhs.v;
             delete[] this->data;
             this->data = rhs.data;
@@ -1483,6 +1549,26 @@ TEST(StackVec, WhenResizingThenElementsAreCorrectlyManaged) {
     EXPECT_NE(nullptr, vec[1].data);
     EXPECT_NE(nullptr, vec[2].data);
     EXPECT_FALSE(contains(&vec, &*vec.begin()));
+}
+
+TEST(StackVec, GivenNoDefaultValueWhenResizingThenDontUseCopyAssignment) {
+    struct Element {
+        Element() = default;
+
+        Element(Element &&rhs) = default;
+        Element &operator=(Element &&rhs) = default;
+
+        Element(const Element &rhs) = delete;
+        Element &operator=(const Element &rhs) = delete;
+
+        int v = 9;
+    };
+
+    StackVec<Element, 5> vec;
+    vec.resize(3);
+    EXPECT_EQ(9, vec[0].v);
+    EXPECT_EQ(9, vec[1].v);
+    EXPECT_EQ(9, vec[2].v);
 }
 
 TEST(StackVec, WhenIteratingThenCorrectElementsAreReturned) {
@@ -1647,13 +1733,13 @@ TEST(StackVec, WhenCallingDataThenVectorDataIsReturned) {
     char dataB[] = {5, 4, 3, 2, 1};
 
     StackVec<char, 1> stackVecA{dataA, dataA + sizeof(dataA)};
-    StackVec<char, 5> stackVecB{dataB, dataB + sizeof(dataB)};
+    const StackVec<char, 5> stackVecB{dataB, dataB + sizeof(dataB)};
 
     EXPECT_TRUE(stackVecA.usesDynamicMem());
     EXPECT_FALSE(stackVecB.usesDynamicMem());
 
-    auto stackVecAData = reinterpret_cast<char *>(stackVecA.data());
-    auto stackVecBData = reinterpret_cast<char *>(stackVecB.data());
+    auto stackVecAData = stackVecA.data();
+    auto stackVecBData = stackVecB.data();
     for (size_t i = 0; i < 5; i++) {
         EXPECT_EQ(dataA[i], stackVecAData[i]);
         EXPECT_EQ(dataB[i], stackVecBData[i]);
@@ -1704,34 +1790,59 @@ TEST(StackVec, GivenStackVecWithDynamicMemWhenSelfAssignedThenMemoryIsReused) {
     }
 }
 
-TEST(StackVec, GivenVectorWithDuplicatesWhenRemovingDuplicatesThenVectorIsSortedAndDuplicatesRemoved) {
-    StackVec<uint32_t, 8> stackVec = {6, 5, 4, 3, 2, 1, 5, 4, 5, 4, 2, 4, 3, 1, 6, 1};
-    ASSERT_EQ(stackVec.size(), 16u);
+TEST(StackVec, whenPushingUniqueToRootDeviceIndicesContainerThenOnlyUniqueValuesArePopulated) {
+    StackVec<uint32_t, 8> input = {6, 5, 4, 3, 2, 1, 5, 4, 5, 4, 2, 4, 3, 1, 6, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0};
+    ASSERT_EQ(input.size(), 27u);
 
-    stackVec.remove_duplicates();
-    EXPECT_EQ(stackVec.size(), 6u);
-    const StackVec<uint32_t, 8> expectedStackVec = {1, 2, 3, 4, 5, 6};
-    EXPECT_EQ(stackVec, expectedStackVec);
+    RootDeviceIndicesContainer rootDeviceIndices{};
+
+    for (auto &index : input) {
+        rootDeviceIndices.pushUnique(index);
+    }
+
+    EXPECT_EQ(rootDeviceIndices.size(), 17u);
+    const RootDeviceIndicesContainer expectedContainer = {6, 5, 4, 3, 2, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0};
+    for (auto i = 0u; i < rootDeviceIndices.size(); i++) {
+        EXPECT_EQ(rootDeviceIndices[i], expectedContainer[i]);
+    }
 }
 
-TEST(StackVec, GivenVectorWithoutDuplicatesWhenRemovingDuplicatesThenVectorIsSorted) {
-    StackVec<uint32_t, 8> stackVec = {16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
-    ASSERT_EQ(stackVec.size(), 16u);
+TEST(StackVec, WhenInsertingAtGivenPositionThenOrderIsMaintained) {
+    {
+        StackVec<int, 10> tested;
+        tested.insert(tested.end(), 12);
 
-    stackVec.remove_duplicates();
-    EXPECT_EQ(stackVec.size(), 16u);
-    const StackVec<uint32_t, 8> expectedStackVec = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    EXPECT_EQ(stackVec, expectedStackVec);
-}
+        StackVec<int, 10> expected{12};
+        EXPECT_EQ(expected, tested);
+    }
+    {
+        StackVec<int, 10> tested{3, 5, 7, 11};
+        tested.insert(tested.end(), 12);
+        tested.insert(tested.begin(), 2);
+        tested.insert(tested.begin() + 2, 4);
 
-TEST(StackVec, GivenSortedVectorWithoutDuplicatesWhenRemovingDuplicatesThenVectorIsUnchanged) {
-    StackVec<uint32_t, 8> stackVec = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    ASSERT_EQ(stackVec.size(), 16u);
+        StackVec<int, 10> expected{2, 3, 4, 5, 7, 11, 12};
+        EXPECT_EQ(expected, tested);
+    }
+    {
+        StackVec<int, 1> testedB{3};
+        testedB.insert(testedB.begin(), 2);
+        StackVec<int, 1> testedE{2};
+        testedE.insert(testedE.end(), 3);
 
-    stackVec.remove_duplicates();
-    EXPECT_EQ(stackVec.size(), 16u);
-    const StackVec<uint32_t, 8> expectedStackVec = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    EXPECT_EQ(stackVec, expectedStackVec);
+        StackVec<int, 10> expected{2, 3};
+        EXPECT_EQ(expected, testedB);
+        EXPECT_EQ(expected, testedE);
+    }
+    {
+        StackVec<int, 4> tested{3, 5, 7, 11};
+        tested.insert(tested.end(), 12);
+        tested.insert(tested.begin(), 2);
+        tested.insert(tested.begin() + 2, 4);
+
+        StackVec<int, 10> expected{2, 3, 4, 5, 7, 11, 12};
+        EXPECT_EQ(expected, tested);
+    }
 }
 
 int sum(ArrayRef<int> a) {
@@ -1859,48 +1970,6 @@ TEST(ArrayRef, GivenArraysContainingSameDataWhenComparingThenEqualReturnsTrue) {
     EXPECT_TRUE(arrayA == arrayB);
 }
 
-TEST(Range, GivenRangeThenValidStandardIteratorsAreAvailable) {
-    int tab[10] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29};
-    Range<int> range = tab;
-    const Range<int> &constantRange = range;
-    Range<int> emptyRange{nullptr, 0};
-    EXPECT_EQ(0U, emptyRange.size());
-    EXPECT_TRUE(emptyRange.empty());
-    EXPECT_EQ(10U, constantRange.size());
-    EXPECT_FALSE(constantRange.empty());
-
-    auto rangeFwdIt = range.begin();
-    auto rangeFwdEnd = range.end();
-    auto rangeBackIt = range.rbegin();
-    auto rangeBackEnd = range.rend();
-
-    auto constantRangeFwdIt = constantRange.begin();
-    auto constantRangeFwdEnd = constantRange.end();
-    auto constantRangeBackIt = constantRange.rbegin();
-    auto constantRangeBackEnd = constantRange.rend();
-    for (int i = 0; i < 10; ++i, ++rangeFwdIt, ++rangeBackIt, ++constantRangeFwdIt, ++constantRangeBackIt) {
-        EXPECT_EQ(tab[i], *rangeFwdIt) << " it : " << i;
-        EXPECT_EQ(tab[i], *constantRangeFwdIt) << " it : " << i;
-        EXPECT_NE(rangeFwdEnd, rangeFwdIt) << " it : " << i;
-        EXPECT_NE(constantRangeFwdEnd, constantRangeFwdIt) << " it : " << i;
-
-        EXPECT_EQ(tab[10 - 1 - i], *rangeBackIt) << " it : " << i;
-        EXPECT_EQ(tab[10 - 1 - i], *constantRangeBackIt) << " it : " << i;
-        EXPECT_NE(rangeBackEnd, rangeBackIt) << " it : " << i;
-        EXPECT_NE(constantRangeBackEnd, constantRangeBackIt) << " it : " << i;
-    }
-
-    EXPECT_EQ(rangeFwdEnd, rangeFwdIt);
-    EXPECT_EQ(constantRangeFwdEnd, constantRangeFwdIt);
-    EXPECT_EQ(rangeBackEnd, rangeBackIt);
-    EXPECT_EQ(constantRangeBackEnd, constantRangeBackIt);
-
-    std::vector<int> vec(&tab[0], &tab[10]);
-    Range<int> rangeFromVec = vec;
-    EXPECT_EQ(&*vec.begin(), &*rangeFromVec.begin());
-    EXPECT_EQ(&*vec.rbegin(), &*rangeFromVec.rbegin());
-}
-
 TEST(ArrayRef, WhenFromAnyIsCalledThenPointerIsReinterpretedAndSizeIsAdjusted) {
     uint32_t x[2] = {};
     auto arrayRefU8 = ArrayRef<const uint8_t>::fromAny(x, 2);
@@ -1921,4 +1990,257 @@ TEST(ArrayRef, WhenClearedThenEmpty) {
     auto arrayRefU32 = ArrayRef<const uint32_t>::fromAny(x, 2);
     arrayRefU32.clear();
     EXPECT_TRUE(arrayRefU32.empty());
+}
+
+TEST(LookupArrayFindGreaterEqual, WhenLookingForElementThenReturnFirstThatIsEqualOrGreater) {
+    LookupArray<int, int, 3> arr({{{1, 10}, {4, 40}, {9, 90}}});
+    auto res = arr.findGreaterEqual(0);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(10, res.value());
+
+    res = arr.findGreaterEqual(1);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(10, res.value());
+
+    res = arr.findGreaterEqual(2);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(40, res.value());
+
+    res = arr.findGreaterEqual(3);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(40, res.value());
+
+    res = arr.findGreaterEqual(4);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(40, res.value());
+
+    res = arr.findGreaterEqual(9);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(90, res.value());
+
+    res = arr.findGreaterEqual(10);
+    EXPECT_FALSE(res.has_value());
+}
+
+TEST(LookupArrayLookUpGreaterEqual, WhenLookingForElementThenReturnFirstThatIsEqualOrGreater) {
+    LookupArray<int, int, 3> arr({{{1, 10}, {4, 40}, {9, 90}}});
+    auto res = arr.lookUpGreaterEqual(0);
+    EXPECT_EQ(10, res);
+
+    res = arr.lookUpGreaterEqual(1);
+    EXPECT_EQ(10, res);
+
+    res = arr.lookUpGreaterEqual(2);
+    EXPECT_EQ(40, res);
+
+    res = arr.lookUpGreaterEqual(3);
+    EXPECT_EQ(40, res);
+
+    res = arr.lookUpGreaterEqual(4);
+    EXPECT_EQ(40, res);
+
+    res = arr.lookUpGreaterEqual(9);
+    EXPECT_EQ(90, res);
+
+    EXPECT_THROW(res = arr.lookUpGreaterEqual(10), std::exception);
+}
+
+TEST(BitArray, WhenFfzIsCalledThenReturnsFirstZeroBitOrMinusAllBitAreSet) {
+    {
+        BitArray ba{3};
+        ASSERT_EQ(3U, ba.length());
+        auto pos = ba.ffz();
+        EXPECT_EQ(0, pos);
+        pos = ba.ffz();
+        EXPECT_EQ(0, pos);
+        ba[0] = true;
+        pos = ba.ffz();
+        EXPECT_EQ(1, pos);
+        pos = ba.ffz();
+        EXPECT_EQ(1, pos);
+        ba[1] = true;
+        pos = ba.ffz();
+        EXPECT_EQ(2, pos);
+        ba[2] = true;
+        pos = ba.ffz();
+        EXPECT_EQ(-1, pos);
+    }
+    {
+        BitArray ba{64};
+        ASSERT_EQ(64U, ba.length());
+        for (int i = 0; i < 64; ++i) {
+            ba[i] = true;
+        }
+        auto pos = ba.ffz();
+        EXPECT_EQ(-1, pos);
+    }
+    {
+        BitArray ba{4097};
+        ASSERT_EQ(4097U, ba.length());
+        for (int i = 0; i < 4095; ++i) {
+            ba[i] = true;
+        }
+        auto pos = ba.ffz();
+        EXPECT_EQ(4095, pos);
+        ba[4095] = true;
+        pos = ba.ffz();
+        EXPECT_EQ(4096, pos);
+        ba[4096] = true;
+        pos = ba.ffz();
+        EXPECT_EQ(-1, pos);
+
+        ba[796] = false;
+        pos = ba.ffz();
+        EXPECT_EQ(796, pos);
+    }
+}
+
+TEST(BitAllocator, WhenAllocateIsCalledThenAllocatesAndReturnsFirstFreeBitPositionOrMinusOneIfEmpty) {
+    {
+        BitAllocator ba{3};
+        ASSERT_EQ(3U, ba.sizeInBits());
+        auto pos = ba.allocate();
+        EXPECT_EQ(0, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(1, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(2, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(-1, pos);
+
+        ba.free(1);
+        pos = ba.allocate();
+        EXPECT_EQ(1, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(-1, pos);
+
+        ba.free(0);
+        pos = ba.allocate();
+        EXPECT_EQ(0, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(-1, pos);
+    }
+    {
+        BitAllocator ba{64};
+        ASSERT_EQ(64U, ba.sizeInBits());
+        for (int i = 0; i < 64; ++i) {
+            EXPECT_EQ(i, ba.allocate());
+        }
+        auto pos = ba.allocate();
+        EXPECT_EQ(-1, pos);
+    }
+    {
+        BitAllocator ba{4097};
+        ASSERT_EQ(4097U, ba.sizeInBits());
+        for (int i = 0; i < 4095; ++i) {
+            EXPECT_EQ(i, ba.allocate());
+        }
+        auto pos = ba.allocate();
+        EXPECT_EQ(4095, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(4096, pos);
+        pos = ba.allocate();
+        EXPECT_EQ(-1, pos);
+
+        ba.free(796);
+        pos = ba.allocate();
+        EXPECT_EQ(796, pos);
+    }
+}
+
+TEST(OpaqueArray, WhenAllocateIsCalledThenAllocatesAndReturnsFirstFreeElementOrNullIfEmpty) {
+    struct GraphicsAllocationHandleExample {
+    } handle;
+    double underlyingMemory[5] = {1, 2, 3, 4, 5};
+    const size_t elementStride = 2 * sizeof(double);
+    {
+        OpaqueArrayElementAllocator<GraphicsAllocationHandleExample *> oa{&handle, underlyingMemory, elementStride, sizeof(underlyingMemory) / elementStride};
+        EXPECT_EQ(underlyingMemory, oa.base());
+        EXPECT_EQ(&handle, oa.handle());
+
+        EXPECT_TRUE(oa.contains(underlyingMemory));
+        EXPECT_TRUE(oa.contains(underlyingMemory + 1));
+        EXPECT_TRUE(oa.contains(underlyingMemory + 2));
+        EXPECT_TRUE(oa.contains(underlyingMemory + 3));
+        EXPECT_FALSE(oa.contains(underlyingMemory + 4));
+
+        auto el0 = oa.allocate();
+        EXPECT_EQ(underlyingMemory, el0);
+        EXPECT_EQ(el0, oa.element(0));
+
+        auto el1 = oa.allocate();
+        EXPECT_EQ(underlyingMemory + 2, el1);
+        EXPECT_EQ(el1, oa.element(1));
+
+        auto el2 = oa.allocate();
+        EXPECT_EQ(nullptr, el2);
+
+        oa.free(el0);
+        el2 = oa.allocate();
+        EXPECT_EQ(underlyingMemory, el2);
+    }
+}
+
+TEST(OpaqueElementAllocator, WhenAllocateIsCalledThenAllocatesAndReturnsFirstFreeElementAndGrowsIfNeeded) {
+    struct GraphicsAllocationHandleExample {};
+    using AllocatorT = OpaqueElementAllocator<GraphicsAllocationHandleExample *>;
+    using AllocationT = AllocatorT::AllocationT;
+
+    std::set<GraphicsAllocationHandleExample *> graphicsAllocations;
+    {
+        const size_t chunkSize = 256;
+        const size_t elementSize = 64;
+        AllocatorT allocator(chunkSize, elementSize, AllocatorT::UnderlyingAllocatorT{.allocate = [&](size_t s, size_t a) -> AllocationT {
+                                                                                          auto newGa = new GraphicsAllocationHandleExample;
+                                                                                          graphicsAllocations.insert(newGa);
+                                                                                          return {newGa, alignedMalloc(s, a)};
+                                                                                      },
+                                                                                      .free = [&](AllocationT alloc) {
+                                                        UNRECOVERABLE_IF(1 != graphicsAllocations.count(alloc.first));
+                                                        graphicsAllocations.erase(alloc.first);
+                                                        delete alloc.first; 
+                                                        alignedFree(alloc.second); }});
+
+        auto elsPerChunk = chunkSize / elementSize;
+        std::set<void *> allocated;
+        int toAllocate = static_cast<int>(elsPerChunk * 3 + 1);
+        for (int i = 0; i < toAllocate; ++i) {
+            AllocationT el = allocator.allocate();
+            EXPECT_NE(nullptr, el.first);
+            EXPECT_NE(nullptr, el.second);
+            EXPECT_EQ(1U, graphicsAllocations.count(el.first));
+            EXPECT_EQ(0U, allocated.count(el.second));
+            allocated.insert(el.second);
+
+            EXPECT_TRUE(isAligned(reinterpret_cast<uintptr_t>(el.second), elementSize));
+            EXPECT_EQ(alignUp(i + 1, elsPerChunk) / elsPerChunk, graphicsAllocations.size());
+        }
+
+        EXPECT_EQ(alignUp(toAllocate, elsPerChunk) / elsPerChunk, graphicsAllocations.size());
+        for (auto ptr : allocated) {
+            EXPECT_TRUE(allocator.contains(ptr));
+        }
+        int stackMem = 0;
+        EXPECT_FALSE(allocator.contains(&stackMem));
+        EXPECT_FALSE(allocator.free(&stackMem));
+
+        EXPECT_EQ(alignUp(toAllocate, elsPerChunk) / elsPerChunk, graphicsAllocations.size());
+        for (auto ptr : allocated) {
+            EXPECT_TRUE(allocator.free(ptr));
+        }
+
+        allocated.clear();
+        for (int i = 0; i < toAllocate; ++i) {
+            AllocationT el = allocator.allocate();
+            EXPECT_NE(nullptr, el.first);
+            EXPECT_NE(nullptr, el.second);
+            EXPECT_EQ(1U, graphicsAllocations.count(el.first));
+            EXPECT_EQ(0U, allocated.count(el.second));
+            allocated.insert(el.second);
+
+            EXPECT_TRUE(isAligned(reinterpret_cast<uintptr_t>(el.second), elementSize));
+        }
+        EXPECT_EQ(alignUp(toAllocate, elsPerChunk) / elsPerChunk, graphicsAllocations.size()) << " alloc reuse failed";
+    }
+    EXPECT_EQ(0U, graphicsAllocations.size());
 }

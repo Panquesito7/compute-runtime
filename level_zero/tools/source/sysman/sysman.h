@@ -1,37 +1,23 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/tools/source/sysman/diagnostics/diagnostics.h"
-#include "level_zero/tools/source/sysman/ecc/ecc.h"
-#include "level_zero/tools/source/sysman/engine/engine.h"
-#include "level_zero/tools/source/sysman/events/events.h"
-#include "level_zero/tools/source/sysman/fabric_port/fabric_port.h"
-#include "level_zero/tools/source/sysman/fan/fan.h"
-#include "level_zero/tools/source/sysman/firmware/firmware.h"
-#include "level_zero/tools/source/sysman/frequency/frequency.h"
-#include "level_zero/tools/source/sysman/global_operations/global_operations.h"
-#include "level_zero/tools/source/sysman/memory/memory.h"
-#include "level_zero/tools/source/sysman/pci/pci.h"
-#include "level_zero/tools/source/sysman/performance/performance.h"
-#include "level_zero/tools/source/sysman/power/power.h"
-#include "level_zero/tools/source/sysman/ras/ras.h"
-#include "level_zero/tools/source/sysman/scheduler/scheduler.h"
-#include "level_zero/tools/source/sysman/standby/standby.h"
-#include "level_zero/tools/source/sysman/temperature/temperature.h"
+#include "level_zero/core/source/device/device_handle.h"
 #include <level_zero/zes_api.h>
 
 struct _zet_sysman_handle_t {};
 
 namespace L0 {
 struct Device;
+struct OsSysman;
+
 struct SysmanDevice : _ze_device_handle_t {
 
-    static SysmanDevice *fromHandle(zes_device_handle_t handle) { return Device::fromHandle(handle)->getSysmanHandle(); }
+    static SysmanDevice *fromHandle(zes_device_handle_t handle);
     static ze_result_t performanceGet(zes_device_handle_t hDevice, uint32_t *pCount, zes_perf_handle_t *phPerformance);
     static ze_result_t powerGet(zes_device_handle_t hDevice, uint32_t *pCount, zes_pwr_handle_t *phPower);
     static ze_result_t powerGetCardDomain(zes_device_handle_t hDevice, zes_pwr_handle_t *phPower);
@@ -60,6 +46,10 @@ struct SysmanDevice : _ze_device_handle_t {
     static ze_result_t deviceGetEccState(zes_device_handle_t hDevice, zes_device_ecc_properties_t *pState);
     static ze_result_t deviceSetEccState(zes_device_handle_t hDevice, const zes_device_ecc_desc_t *newState, zes_device_ecc_properties_t *pState);
     static bool deviceEventListen(zes_device_handle_t hDevice, zes_event_type_flags_t &pEvent, uint64_t timeout);
+    static uint64_t getSysmanTimestamp();
+    static ze_result_t deviceResetExt(zes_device_handle_t hDevice, zes_reset_properties_t *pProperties);
+    static ze_result_t fabricPortGetMultiPortThroughput(zes_device_handle_t hDevice, uint32_t numPorts, zes_fabric_port_handle_t *phPort, zes_fabric_port_throughput_t **pThroughput);
+    static ze_result_t deviceEnumEnabledVF(zes_device_handle_t hDevice, uint32_t *pCount, zes_vf_handle_t *phVFhandle);
 
     virtual ze_result_t performanceGet(uint32_t *pCount, zes_perf_handle_t *phPerformance) = 0;
     virtual ze_result_t powerGet(uint32_t *pCount, zes_pwr_handle_t *phPower) = 0;
@@ -88,12 +78,15 @@ struct SysmanDevice : _ze_device_handle_t {
     virtual ze_result_t deviceEccConfigurable(ze_bool_t *pConfigurable) = 0;
     virtual ze_result_t deviceGetEccState(zes_device_ecc_properties_t *pState) = 0;
     virtual ze_result_t deviceSetEccState(const zes_device_ecc_desc_t *newState, zes_device_ecc_properties_t *pState) = 0;
+    virtual ze_result_t fabricPortGetMultiPortThroughput(uint32_t numPorts, zes_fabric_port_handle_t *phPort, zes_fabric_port_throughput_t **pThroughput) = 0;
     virtual bool deviceEventListen(zes_event_type_flags_t &pEvent, uint64_t timeout) = 0;
+    virtual ze_result_t deviceResetExt(zes_reset_properties_t *pProperties) = 0;
+    virtual ze_result_t deviceEnumEnabledVF(uint32_t *pCount, zes_vf_handle_t *phVFhandle) = 0;
     virtual OsSysman *deviceGetOsInterface() = 0;
     virtual ~SysmanDevice() = default;
 };
 
-extern struct OsSysmanDriver *GlobalOsSysmanDriver;
+extern struct OsSysmanDriver *globalOsSysmanDriver;
 
 class SysmanDeviceHandleContext {
   public:

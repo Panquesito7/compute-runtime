@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2023 Intel Corporation
+# Copyright (C) 2023-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -10,21 +10,8 @@ target_sources(${L0_STATIC_LIB_NAME}
                ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_base.inl
                ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_from_xe2_hpg_to_xe3.inl
 )
-
-if(SUPPORT_GEN9 OR SUPPORT_GEN11)
-  target_sources(${L0_STATIC_LIB_NAME}
-                 PRIVATE
-                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_skl_to_icllp.inl
-  )
-endif()
-
-if(SUPPORT_GEN9 OR SUPPORT_GEN11 OR SUPPORT_GEN12LP)
-  target_sources(${L0_STATIC_LIB_NAME}
-                 PRIVATE
-                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_skl_to_tgllp.inl
-  )
-endif()
 
 if(SUPPORT_XEHP_AND_LATER)
   target_sources(${L0_STATIC_LIB_NAME}
@@ -33,10 +20,17 @@ if(SUPPORT_XEHP_AND_LATER)
   )
 endif()
 
-if(SUPPORT_GEN12LP OR SUPPORT_XE_HP_CORE OR SUPPORT_XE_HPG_CORE)
+if(SUPPORT_GEN12LP OR SUPPORT_XE_HPG_CORE)
   target_sources(${L0_STATIC_LIB_NAME}
                  PRIVATE
                  ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_tgllp_to_dg2.inl
+  )
+endif()
+
+if(SUPPORT_XE_HPC_CORE OR SUPPORT_XE_HPG_CORE)
+  target_sources(${L0_STATIC_LIB_NAME}
+                 PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_xe_hpg_and_xe_hpc.inl
   )
 endif()
 
@@ -46,3 +40,43 @@ if(SUPPORT_PVC_AND_LATER)
                  ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_pvc_and_later.inl
   )
 endif()
+
+if(SUPPORT_GEN12LP OR SUPPORT_XE_HPG_CORE OR SUPPORT_XE_HPC_CORE)
+  target_sources(${L0_STATIC_LIB_NAME}
+                 PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_tgllp_to_pvc.inl
+  )
+endif()
+
+if(SUPPORT_XE_HPC_CORE OR SUPPORT_XE2_HPG_CORE)
+  target_sources(${L0_STATIC_LIB_NAME} PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_pvc_to_xe2.inl
+  )
+endif()
+
+if(SUPPORT_XE2_HPG_CORE OR SUPPORT_XE3_CORE)
+  target_sources(${L0_STATIC_LIB_NAME} PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_xe2_hpg_xe3.inl
+  )
+endif()
+
+if(SUPPORT_XE2_AND_LATER)
+  target_sources(${L0_STATIC_LIB_NAME} PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_xe2_hpg_and_later.inl
+  )
+endif()
+
+if(SUPPORT_XE3_AND_LATER)
+  target_sources(${L0_STATIC_LIB_NAME} PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_xe3_and_later.inl
+  )
+endif()
+
+if(SUPPORT_XE3P_AND_LATER)
+  target_sources(${L0_STATIC_LIB_NAME} PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_xe3p_and_later.inl
+                 ${CMAKE_CURRENT_SOURCE_DIR}/l0_gfx_core_helper_xe3p_and_later_specializations.inl
+  )
+endif()
+
+add_subdirectories()

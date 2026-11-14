@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,7 +18,7 @@ namespace L0 {
 namespace ult {
 
 using TimestampEvent = Test<EventFixture<1, 1>>;
-using TimestampUsedPacketSignalEvent = Test<EventUsedPacketSignalFixture<1, 1, 0, -1>>;
+using TimestampUsedPacketSignalEvent = Test<EventCompactL3FlushFixture<1, 1, -1>>;
 
 GEN12LPTEST_F(TimestampEvent, givenEventTimestampsWhenQueryKernelTimestampThenCorrectDataAreSet) {
     typename MockTimestampPackets32::Packet data = {};
@@ -27,7 +27,7 @@ GEN12LPTEST_F(TimestampEvent, givenEventTimestampsWhenQueryKernelTimestampThenCo
     data.globalStart = 3u;
     data.globalEnd = 4u;
 
-    event->hostAddress = &data;
+    event->hostAddressFromPool = &data;
     ze_kernel_timestamp_result_t result = {};
 
     event->queryKernelTimestamp(&result);
@@ -52,7 +52,7 @@ GEN12LPTEST_F(TimestampUsedPacketSignalEvent, givenEventMoreThanOneTimestampsPac
     data[2].globalStart = 6u;
     data[2].globalEnd = 7u;
 
-    event->hostAddress = &data;
+    event->hostAddressFromPool = &data;
     event->setPacketsInUse(3u);
     ze_kernel_timestamp_result_t result = {};
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,14 +9,20 @@
 
 #include "shared/source/command_stream/task_count_helper.h"
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/memory_manager/allocation_type.h"
 #include "shared/source/memory_manager/definitions/engine_limits.h"
 #include "shared/source/memory_manager/definitions/storage_info.h"
 #include "shared/source/memory_manager/host_ptr_defines.h"
+#include "shared/source/memory_manager/memadvise_flags.h"
 #include "shared/source/memory_manager/memory_pool.h"
 #include "shared/source/memory_manager/residency.h"
 #include "shared/source/utilities/idlist.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include <memory>
+#include <vector>
 
 namespace NEO {
 
@@ -35,6 +41,11 @@ constexpr auto nonSharedResource = 0u;
 class Gmm;
 class MemoryManager;
 class CommandStreamReceiver;
+class GraphicsAllocation;
+class ProductHelper;
+
+struct AllocationData;
+struct AllocationProperties;
 
 struct AubInfo {
     uint32_t aubWritable = std::numeric_limits<uint32_t>::max();
@@ -43,9 +54,19 @@ struct AubInfo {
     bool bcsDumpOnly = false;
     bool memObjectsAllocationWithWritableFlags = false;
     bool writeMemoryOnly = false;
+    bool simulationInitialUploadDone = false;
+    bool simulationMemoryShared = false;
+    bool simulationMemorySharingAttempted = false;
 };
 
-class GraphicsAllocation : public IDNode<GraphicsAllocation> {
+struct SurfaceStateInHeapInfo {
+    GraphicsAllocation *heapAllocation;
+    uint64_t surfaceStateOffset;
+    void *ssPtr;
+    size_t ssSize;
+};
+
+class GraphicsAllocation : public IDNode<GraphicsAllocation>, NEO::NonCopyableAndNonMovableClass {
   public:
     enum UsmInitialPlacement {
         DEFAULT,
@@ -53,23 +74,92 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
         GPU
     };
 
+    static constexpr uint32_t defaultBank = 0b1u;
+    static constexpr uint32_t allBanks = 0xffffffff;
+    constexpr static TaskCountType objectNotResident = std::numeric_limits<TaskCountType>::max();
+    constexpr static TaskCountType objectNotUsed = std::numeric_limits<TaskCountType>::max();
+    constexpr static TaskCountType objectAlwaysResident = std::numeric_limits<TaskCountType>::max() - 1;
+
     ~GraphicsAllocation() override;
-    GraphicsAllocation &operator=(const GraphicsAllocation &) = delete;
-    GraphicsAllocation(const GraphicsAllocation &) = delete;
-
-    GraphicsAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, void *cpuPtrIn,
-                       uint64_t gpuAddress, uint64_t baseAddress, size_t sizeIn, MemoryPool pool, size_t maxOsContextCount)
-        : GraphicsAllocation(rootDeviceIndex, 1, allocationType, cpuPtrIn, gpuAddress, baseAddress, sizeIn, pool, maxOsContextCount) {}
-
-    GraphicsAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, void *cpuPtrIn,
-                       size_t sizeIn, osHandle sharedHandleIn, MemoryPool pool, size_t maxOsContextCount, uint64_t canonizedGpuAddress)
-        : GraphicsAllocation(rootDeviceIndex, 1, allocationType, cpuPtrIn, sizeIn, sharedHandleIn, pool, maxOsContextCount, canonizedGpuAddress) {}
 
     GraphicsAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, void *cpuPtrIn,
                        uint64_t canonizedGpuAddress, uint64_t baseAddress, size_t sizeIn, MemoryPool pool, size_t maxOsContextCount);
 
     GraphicsAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, void *cpuPtrIn,
                        size_t sizeIn, osHandle sharedHandleIn, MemoryPool pool, size_t maxOsContextCount, uint64_t canonizedGpuAddress);
+
+  protected:
+    GraphicsAllocation(GraphicsAllocation *parentAllocation, size_t offsetInParentAllocation, size_t viewSize);
+
+    struct UsageInfo {
+        TaskCountType taskCount = objectNotUsed;
+        TaskCountType residencyTaskCount = objectNotResident;
+    };
+
+    struct SharingInfo {
+        uint32_t reuseCount = 0;
+        osHandle sharedHandle = Sharing::nonSharedResource;
+    };
+
+    struct AllocationInfo {
+        union {
+            struct {
+                uint32_t coherent : 1;
+                uint32_t evictable : 1;
+                uint32_t flushL3Required : 1;
+                uint32_t uncacheable : 1;
+                uint32_t is32BitAllocation : 1;
+                uint32_t lockedMemory : 1;
+                uint32_t shareableHostMemory : 1;
+                uint32_t cantBeReadOnly : 1;
+                uint32_t explicitlyMadeResident : 1;
+                uint32_t isImported : 1;
+                uint32_t qualifiedFor2MBPages : 1;
+                uint32_t sharedPhysicalMemoryMapping : 1;
+                uint32_t reserved : 20;
+            } flags;
+            uint32_t allFlags = 0u;
+        };
+        static_assert(sizeof(AllocationInfo::flags) == sizeof(AllocationInfo::allFlags), "");
+        AllocationInfo() {
+            flags.coherent = false;
+            flags.evictable = true;
+            flags.flushL3Required = true;
+            flags.is32BitAllocation = false;
+            flags.lockedMemory = false;
+            flags.shareableHostMemory = false;
+            flags.cantBeReadOnly = false;
+            flags.explicitlyMadeResident = false;
+            flags.isImported = false;
+            flags.qualifiedFor2MBPages = false;
+            flags.sharedPhysicalMemoryMapping = false;
+        }
+    };
+
+    struct ReservedAddressRange {
+        void *addressPtr = nullptr;
+        size_t rangeSize = 0;
+    };
+
+    friend class SubmissionAggregator;
+
+    std::vector<UsageInfo> usageInfos;
+    uint64_t gpuBaseAddress = 0;
+    uint64_t gpuAddress = 0;
+    uint64_t allocationOffset = 0u;
+    size_t size = 0;
+    void *cpuPtr = nullptr;
+    MemoryPool memoryPool = MemoryPool::memoryNull;
+    AllocationType allocationType = AllocationType::unknown;
+    AllocationInfo allocationInfo;
+    const uint32_t rootDeviceIndex;
+    std::atomic<uint32_t> registeredContextsNum{0};
+
+  public:
+    bool isView() const { return parentAllocation != nullptr; }
+    GraphicsAllocation *getParentAllocation() const { return parentAllocation; }
+    size_t getOffsetInParent() const { return offsetInParent; }
+    virtual GraphicsAllocation *createView(size_t offsetInParentAllocation, size_t viewSize);
 
     uint32_t getRootDeviceIndex() const { return rootDeviceIndex; }
     void *getUnderlyingBuffer() const { return cpuPtr; }
@@ -78,6 +168,9 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
 
     void setCpuPtrAndGpuAddress(void *cpuPtr, uint64_t canonizedGpuAddress) {
         this->cpuPtr = cpuPtr;
+        this->gpuAddress = canonizedGpuAddress;
+    }
+    void setGpuPtr(uint64_t canonizedGpuAddress) {
         this->gpuAddress = canonizedGpuAddress;
     }
     size_t getUnderlyingBufferSize() const { return size; }
@@ -96,6 +189,9 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     void setGpuBaseAddress(uint64_t baseAddress) {
         gpuBaseAddress = baseAddress;
     }
+    uint64_t getGpuAddressWithoutOffset() const {
+        return gpuAddress;
+    }
     uint64_t getGpuAddress() const {
         DEBUG_BREAK_IF(gpuAddress < gpuBaseAddress);
         return gpuAddress + allocationOffset;
@@ -105,10 +201,33 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
         return gpuAddress + allocationOffset - gpuBaseAddress;
     }
 
-    void lock(void *ptr) { lockedPtr = ptr; }
-    void unlock() { lockedPtr = nullptr; }
-    bool isLocked() const { return lockedPtr != nullptr; }
-    void *getLockedPtr() const { return lockedPtr; }
+    void lock(void *ptr) {
+        if (parentAllocation) {
+            parentAllocation->lock(ptr);
+            return;
+        }
+        lockedPtr = ptr;
+    }
+    void unlock() {
+        if (parentAllocation) {
+            parentAllocation->unlock();
+            return;
+        }
+        lockedPtr = nullptr;
+    }
+    bool isLocked() const {
+        if (parentAllocation) {
+            return parentAllocation->isLocked();
+        }
+        return lockedPtr != nullptr;
+    }
+    void *getLockedPtr() const {
+        if (parentAllocation) {
+            auto parentLockedPtr = parentAllocation->getLockedPtr();
+            return parentLockedPtr ? ptrOffset(parentLockedPtr, offsetInParent) : nullptr;
+        }
+        return lockedPtr;
+    }
 
     bool isCoherent() const { return allocationInfo.flags.coherent; }
     void setCoherent(bool coherentIn) { allocationInfo.flags.coherent = coherentIn; }
@@ -116,6 +235,8 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     bool peekEvictable() const { return allocationInfo.flags.evictable; }
     bool isFlushL3Required() const { return allocationInfo.flags.flushL3Required; }
     void setFlushL3Required(bool flushL3Required) { allocationInfo.flags.flushL3Required = flushL3Required; }
+    bool isLockedMemory() const { return allocationInfo.flags.lockedMemory; }
+    void setLockedMemory(bool locked) { allocationInfo.flags.lockedMemory = locked; }
 
     bool isUncacheable() const { return allocationInfo.flags.uncacheable; }
     void setUncacheable(bool uncacheable) { allocationInfo.flags.uncacheable = uncacheable; }
@@ -133,6 +254,24 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     void setWriteMemoryOnly(bool writeMemoryOnly) {
         aubInfo.writeMemoryOnly = writeMemoryOnly;
     }
+    void setSimulationInitialUploadDone(bool done) {
+        aubInfo.simulationInitialUploadDone = done;
+    }
+    bool isSimulationInitialUploadDone() const {
+        return aubInfo.simulationInitialUploadDone;
+    }
+    void setSimulationMemoryShared(bool shared) {
+        aubInfo.simulationMemoryShared = shared;
+    }
+    bool isSimulationMemoryShared() const {
+        return aubInfo.simulationMemoryShared;
+    }
+    void setSimulationMemorySharingAttempted(bool attempted) {
+        aubInfo.simulationMemorySharingAttempted = attempted;
+    }
+    bool isSimulationMemorySharingAttempted() const {
+        return aubInfo.simulationMemorySharingAttempted;
+    }
     bool isAllocDumpable() const { return aubInfo.allocDumpable; }
     bool isMemObjectsAllocationWithWritableFlags() const { return aubInfo.memObjectsAllocationWithWritableFlags; }
     void setMemObjectsAllocationWithWritableFlags(bool newValue) { aubInfo.memObjectsAllocationWithWritableFlags = newValue; }
@@ -147,33 +286,90 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     AllocationType getAllocationType() const { return allocationType; }
 
     MemoryPool getMemoryPool() const { return memoryPool; }
+    virtual void setAsReadOnly() {};
 
-    bool isUsed() const { return registeredContextsNum > 0; }
-    bool isUsedByManyOsContexts() const { return registeredContextsNum > 1u; }
+    bool isUsed() const {
+        if (parentAllocation) {
+            return parentAllocation->isUsed();
+        }
+        return registeredContextsNum > 0;
+    }
+    bool isUsedByManyOsContexts() const {
+        if (parentAllocation) {
+            return parentAllocation->isUsedByManyOsContexts();
+        }
+        return registeredContextsNum > 1u;
+    }
     bool isUsedByOsContext(uint32_t contextId) const { return objectNotUsed != getTaskCount(contextId); }
-    MOCKABLE_VIRTUAL void updateTaskCount(TaskCountType newTaskCount, uint32_t contextId);
-    MOCKABLE_VIRTUAL TaskCountType getTaskCount(uint32_t contextId) const { return usageInfos[contextId].taskCount; }
+    uint32_t getNumRegisteredContexts() const {
+        if (parentAllocation) {
+            return parentAllocation->getNumRegisteredContexts();
+        }
+        return registeredContextsNum.load();
+    }
+    MOCKABLE_VIRTUAL void updateTaskCount(TaskCountType newTaskCount, uint32_t contextId) {
+        if (parentAllocation) {
+            parentAllocation->updateTaskCount(newTaskCount, contextId);
+            return;
+        }
+        OPTIONAL_UNRECOVERABLE_IF(contextId >= usageInfos.size());
+        if (usageInfos[contextId].taskCount == objectNotUsed) {
+            registeredContextsNum++;
+        }
+        if (newTaskCount == objectNotUsed) {
+            registeredContextsNum--;
+        }
+        usageInfos[contextId].taskCount = newTaskCount;
+    }
+    MOCKABLE_VIRTUAL TaskCountType getTaskCount(uint32_t contextId) const {
+        if (parentAllocation) {
+            return parentAllocation->getTaskCount(contextId);
+        }
+        if (contextId >= usageInfos.size()) {
+            return objectNotUsed;
+        }
+        return usageInfos[contextId].taskCount;
+    }
+
     void releaseUsageInOsContext(uint32_t contextId) { updateTaskCount(objectNotUsed, contextId); }
-    uint32_t getInspectionId(uint32_t contextId) const { return usageInfos[contextId].inspectionId; }
-    void setInspectionId(uint32_t newInspectionId, uint32_t contextId) { usageInfos[contextId].inspectionId = newInspectionId; }
+    uint32_t getInspectionId(uint32_t contextId) const {
+        if (parentAllocation) {
+            return parentAllocation->getInspectionId(contextId);
+        }
+        return inspectionIds[contextId];
+    }
+    void setInspectionId(uint32_t newInspectionId, uint32_t contextId) {
+        if (parentAllocation) {
+            parentAllocation->setInspectionId(newInspectionId, contextId);
+            return;
+        }
+        inspectionIds[contextId] = newInspectionId;
+    }
 
     MOCKABLE_VIRTUAL bool isResident(uint32_t contextId) const { return GraphicsAllocation::objectNotResident != getResidencyTaskCount(contextId); }
     bool isAlwaysResident(uint32_t contextId) const { return GraphicsAllocation::objectAlwaysResident == getResidencyTaskCount(contextId); }
     void updateResidencyTaskCount(TaskCountType newTaskCount, uint32_t contextId) {
+        if (contextId >= usageInfos.size()) {
+            DEBUG_BREAK_IF(true);
+            return;
+        }
         if (usageInfos[contextId].residencyTaskCount != GraphicsAllocation::objectAlwaysResident || newTaskCount == GraphicsAllocation::objectNotResident) {
             usageInfos[contextId].residencyTaskCount = newTaskCount;
         }
     }
-    TaskCountType getResidencyTaskCount(uint32_t contextId) const { return usageInfos[contextId].residencyTaskCount; }
+    TaskCountType getResidencyTaskCount(uint32_t contextId) const {
+        return usageInfos[contextId].residencyTaskCount;
+    }
     void releaseResidencyInOsContext(uint32_t contextId) { updateResidencyTaskCount(objectNotResident, contextId); }
     bool isResidencyTaskCountBelow(TaskCountType taskCount, uint32_t contextId) const { return !isResident(contextId) || getResidencyTaskCount(contextId) < taskCount; }
 
     virtual std::string getAllocationInfoString() const;
-    virtual int createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) { return 0; }
-    virtual int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle) { return 0; }
+    virtual std::string getPatIndexInfoString() const;
+    virtual int createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) { return 0; }
+    virtual int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle, void *reservedHandleData) { return 0; }
     virtual void clearInternalHandle(uint32_t handleId) { return; }
 
-    virtual int peekInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) {
+    virtual int peekInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) {
         return 0;
     }
 
@@ -191,49 +387,88 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     virtual size_t getHandleSize(uint32_t handleIndex) {
         return 0lu;
     }
+    virtual bool isMapped() { return false; }
+    // True when the GPU address range maps only part of the backing object or starts past its beginning.
+    virtual bool isPartialObjectMapping() const { return false; }
 
     static bool isCpuAccessRequired(AllocationType allocationType) {
-        return allocationType == AllocationType::COMMAND_BUFFER ||
-               allocationType == AllocationType::CONSTANT_SURFACE ||
-               allocationType == AllocationType::GLOBAL_SURFACE ||
-               allocationType == AllocationType::INTERNAL_HEAP ||
-               allocationType == AllocationType::LINEAR_STREAM ||
-               allocationType == AllocationType::PIPE ||
-               allocationType == AllocationType::PRINTF_SURFACE ||
-               allocationType == AllocationType::TIMESTAMP_PACKET_TAG_BUFFER ||
-               allocationType == AllocationType::RING_BUFFER ||
-               allocationType == AllocationType::SEMAPHORE_BUFFER ||
-               allocationType == AllocationType::DEBUG_CONTEXT_SAVE_AREA ||
-               allocationType == AllocationType::DEBUG_SBA_TRACKING_BUFFER ||
-               allocationType == AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER ||
-               allocationType == AllocationType::DEBUG_MODULE_AREA ||
-               allocationType == AllocationType::ASSERT_BUFFER;
+        return allocationType == AllocationType::commandBuffer ||
+               allocationType == AllocationType::constantSurface ||
+               allocationType == AllocationType::globalSurface ||
+               allocationType == AllocationType::internalHeap ||
+               allocationType == AllocationType::linearStream ||
+               allocationType == AllocationType::printfSurface ||
+               allocationType == AllocationType::timestampPacketTagBuffer ||
+               allocationType == AllocationType::ringBuffer ||
+               allocationType == AllocationType::semaphoreBuffer ||
+               allocationType == AllocationType::debugContextSaveArea ||
+               allocationType == AllocationType::debugSbaTrackingBuffer ||
+               allocationType == AllocationType::gpuTimestampDeviceBuffer ||
+               allocationType == AllocationType::debugModuleArea ||
+               allocationType == AllocationType::assertBuffer ||
+               allocationType == AllocationType::syncDispatchToken ||
+               allocationType == AllocationType::syncBuffer;
     }
     static bool isLockable(AllocationType allocationType) {
         return isCpuAccessRequired(allocationType) ||
                isIsaAllocationType(allocationType) ||
-               allocationType == AllocationType::BUFFER_HOST_MEMORY ||
-               allocationType == AllocationType::SHARED_RESOURCE_COPY;
+               allocationType == AllocationType::bufferHostMemory ||
+               allocationType == AllocationType::svmZeroCopy ||
+               allocationType == AllocationType::sharedResourceCopy;
     }
 
     static bool isKernelIsaAllocationType(AllocationType type) {
-        return type == AllocationType::KERNEL_ISA ||
-               type == AllocationType::KERNEL_ISA_INTERNAL;
+        return type == AllocationType::kernelIsa ||
+               type == AllocationType::kernelIsaInternal;
     }
 
     static bool isIsaAllocationType(AllocationType type) {
         return isKernelIsaAllocationType(type) ||
-               type == AllocationType::DEBUG_MODULE_AREA;
+               type == AllocationType::debugModuleArea;
     }
 
     static bool isDebugSurfaceAllocationType(AllocationType type) {
-        return type == AllocationType::DEBUG_CONTEXT_SAVE_AREA ||
-               type == AllocationType::DEBUG_SBA_TRACKING_BUFFER;
+        return type == AllocationType::debugContextSaveArea ||
+               type == AllocationType::debugSbaTrackingBuffer;
     }
 
     static bool isConstantOrGlobalSurfaceAllocationType(AllocationType type) {
-        return type == AllocationType::CONSTANT_SURFACE ||
-               type == AllocationType::GLOBAL_SURFACE;
+        return type == AllocationType::constantSurface ||
+               type == AllocationType::globalSurface;
+    }
+
+    static bool is2MBPageAllocationType(AllocationType type) {
+        return type == AllocationType::timestampPacketTagBuffer ||
+               type == AllocationType::gpuTimestampDeviceBuffer ||
+               type == AllocationType::profilingTagBuffer ||
+               type == AllocationType::printfSurface ||
+               type == AllocationType::scratchSurface;
+    }
+
+    static bool isAccessedFromCommandStreamer(AllocationType allocationType) {
+        return allocationType == AllocationType::commandBuffer ||
+               allocationType == AllocationType::ringBuffer ||
+               allocationType == AllocationType::semaphoreBuffer;
+    }
+    static bool isZeroInitRequired(AllocationType allocationType) {
+        return allocationType == AllocationType::preemption;
+    }
+
+    static bool isSuitableForDownload(AllocationType allocationType) {
+        switch (allocationType) {
+        case AllocationType::commandBuffer:
+        case AllocationType::fillPattern:
+        case AllocationType::globalSurface:
+        case AllocationType::internalHeap:
+        case AllocationType::instructionHeap:
+        case AllocationType::kernelIsa:
+        case AllocationType::kernelIsaInternal:
+        case AllocationType::linearStream:
+        case AllocationType::ringBuffer:
+            return false;
+        default:
+            return true;
+        }
     }
 
     static uint32_t getNumHandlesForKmdSharedAllocation(uint32_t numBanks);
@@ -260,6 +495,7 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     void setDefaultGmm(Gmm *gmm) {
         setGmm(gmm, 0u);
     }
+    void setDefaultGmm(std::unique_ptr<Gmm> gmm);
     void setGmm(Gmm *gmm, uint32_t handleId) {
         gmms[handleId] = gmm;
     }
@@ -273,7 +509,40 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
 
     uint32_t getUsedPageSize() const;
 
-    bool isAllocatedInLocalMemoryPool() const { return (this->memoryPool == MemoryPool::LocalMemory); }
+    bool qualifiesFor2MBPages() const { return allocationInfo.flags.qualifiedFor2MBPages; }
+    void setQualifiesFor2MBPages(bool value) { allocationInfo.flags.qualifiedFor2MBPages = value; }
+
+    // Set on a mapping that aliases another allocation's physical memory. Its bytes and GMMs belong to
+    // that physical allocation, so it is left out of the used-memory totals and memory bank usage and
+    // does not free the GMMs.
+    bool isSharedPhysicalMemoryMapping() const { return allocationInfo.flags.sharedPhysicalMemoryMapping; }
+    void setSharedPhysicalMemoryMapping(bool value) { allocationInfo.flags.sharedPhysicalMemoryMapping = value; }
+
+    struct ParkedPhysicalMemoryMapping {
+        GraphicsAllocation *mappedAllocation = nullptr;
+        uint64_t gpuRange = 0u;
+        size_t size = 0u;
+    };
+    struct PhysicalMappingsInfo {
+        std::atomic<uint32_t> liveMappingsCount{0u};
+        bool releasePending = false;
+        bool handlesSharedWithMappings = false;
+        // Unmapped mappings stay alive, as kernels and command lists keep referencing them, and are
+        // reused when the same range is mapped again.
+        std::vector<ParkedPhysicalMemoryMapping> parkedMappings;
+    };
+    // A mapping borrows the backing storage, GMMs and handles of the physical allocation it maps.
+    GraphicsAllocation *getMappedPhysicalAllocation() const { return mappedPhysicalAllocation; }
+    void setMappedPhysicalAllocation(GraphicsAllocation *physicalAllocation) { this->mappedPhysicalAllocation = physicalAllocation; }
+    PhysicalMappingsInfo &getPhysicalMappingsInfo() {
+        if (!this->physicalMappingsInfo) {
+            this->physicalMappingsInfo = std::make_unique<PhysicalMappingsInfo>();
+        }
+        return *this->physicalMappingsInfo;
+    }
+    PhysicalMappingsInfo *peekPhysicalMappingsInfo() const { return this->physicalMappingsInfo.get(); }
+
+    bool isAllocatedInLocalMemoryPool() const { return (this->memoryPool == MemoryPool::localMemory); }
     bool isAllocationLockable() const;
 
     const AubInfo &getAubInfo() const { return aubInfo; }
@@ -281,79 +550,132 @@ class GraphicsAllocation : public IDNode<GraphicsAllocation> {
     bool isCompressionEnabled() const;
 
     ResidencyData &getResidencyData() {
+        if (parentAllocation) {
+            return parentAllocation->getResidencyData();
+        }
         return residency;
     }
+
+    uint64_t getBindlessOffset() {
+        if (bindlessInfo.heapAllocation == nullptr) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return bindlessInfo.surfaceStateOffset;
+    }
+
+    void setBindlessInfo(const SurfaceStateInHeapInfo &info) {
+        bindlessInfo = info;
+    }
+
+    const SurfaceStateInHeapInfo &getBindlessInfo() const {
+        return bindlessInfo;
+    }
+    bool canBeReadOnly() {
+        return !allocationInfo.flags.cantBeReadOnly;
+    }
+    void setAsCantBeReadOnly(bool cantBeReadOnly) {
+        allocationInfo.flags.cantBeReadOnly = cantBeReadOnly;
+    }
+    MOCKABLE_VIRTUAL void updateCompletionDataForAllocationAndFragments(uint64_t newFenceValue, uint32_t contextId);
+    void setShareableHostMemory(bool shareableHostMemory) { allocationInfo.flags.shareableHostMemory = shareableHostMemory; }
+    bool isShareableHostMemory() const { return allocationInfo.flags.shareableHostMemory; }
+    MOCKABLE_VIRTUAL bool hasAllocationReadOnlyType();
+    MOCKABLE_VIRTUAL void checkAllocationTypeReadOnlyRestrictions(const AllocationData &allocData);
 
     OsHandleStorage fragmentsStorage;
     StorageInfo storageInfo = {};
 
-    static constexpr uint32_t defaultBank = 0b1u;
-    static constexpr uint32_t allBanks = 0xffffffff;
-    constexpr static TaskCountType objectNotResident = std::numeric_limits<TaskCountType>::max();
-    constexpr static TaskCountType objectNotUsed = std::numeric_limits<TaskCountType>::max();
-    constexpr static TaskCountType objectAlwaysResident = std::numeric_limits<TaskCountType>::max() - 1;
-    std::atomic<uint32_t> hostPtrTaskCountAssignment{0};
-    bool isShareableHostMemory = false;
+    uint32_t getHostPtrTaskCountAssignment() const {
+        if (parentAllocation) {
+            return parentAllocation->getHostPtrTaskCountAssignment();
+        }
+        return hostPtrTaskCountAssignment.load();
+    }
+    void incrementHostPtrTaskCountAssignment() {
+        if (parentAllocation) {
+            parentAllocation->incrementHostPtrTaskCountAssignment();
+            return;
+        }
+        hostPtrTaskCountAssignment++;
+    }
+    void decrementHostPtrTaskCountAssignment() {
+        if (parentAllocation) {
+            parentAllocation->decrementHostPtrTaskCountAssignment();
+            return;
+        }
+        hostPtrTaskCountAssignment--;
+    }
+    void setHostPtrTaskCountAssignment(uint32_t value) {
+        if (parentAllocation) {
+            parentAllocation->setHostPtrTaskCountAssignment(value);
+            return;
+        }
+        hostPtrTaskCountAssignment = value;
+    }
+
+    uint64_t getResidencyContainerStamp() const {
+        return residencyContainerStamp.load(std::memory_order_relaxed);
+    }
+    void setResidencyContainerStamp(uint64_t stamp) {
+        residencyContainerStamp.store(stamp, std::memory_order_relaxed);
+    }
+
+    bool isExplicitlyMadeResident() const {
+        if (parentAllocation) {
+            return parentAllocation->isExplicitlyMadeResident();
+        }
+        return allocationInfo.flags.explicitlyMadeResident;
+    }
+    void setExplicitlyMadeResident(bool explicitlyMadeResidentValue) {
+        if (parentAllocation) {
+            parentAllocation->setExplicitlyMadeResident(explicitlyMadeResidentValue);
+            return;
+        }
+        allocationInfo.flags.explicitlyMadeResident = explicitlyMadeResidentValue;
+    }
+
+    void setIsImported() {
+        if (parentAllocation) {
+            parentAllocation->setIsImported();
+            return;
+        }
+        allocationInfo.flags.isImported = true;
+    }
+
+    bool getIsImported() const {
+        if (parentAllocation) {
+            return parentAllocation->getIsImported();
+        }
+        return allocationInfo.flags.isImported;
+    }
+
+    MemAdviseFlags getMemAdviseFlags() const {
+        return enabledMemAdviseFlags.load(std::memory_order_relaxed);
+    }
+    void setMemAdviseFlags(MemAdviseFlags flags) {
+        enabledMemAdviseFlags.store(flags, std::memory_order_relaxed);
+    }
 
   protected:
-    struct UsageInfo {
-        TaskCountType taskCount = objectNotUsed;
-        TaskCountType residencyTaskCount = objectNotResident;
-        uint32_t inspectionId = 0u;
-    };
-
-    struct SharingInfo {
-        uint32_t reuseCount = 0;
-        osHandle sharedHandle = Sharing::nonSharedResource;
-    };
-    struct AllocationInfo {
-        union {
-            struct {
-                uint32_t coherent : 1;
-                uint32_t evictable : 1;
-                uint32_t flushL3Required : 1;
-                uint32_t uncacheable : 1;
-                uint32_t is32BitAllocation : 1;
-                uint32_t reserved : 27;
-            } flags;
-            uint32_t allFlags = 0u;
-        };
-        static_assert(sizeof(AllocationInfo::flags) == sizeof(AllocationInfo::allFlags), "");
-        AllocationInfo() {
-            flags.coherent = false;
-            flags.evictable = true;
-            flags.flushL3Required = true;
-            flags.is32BitAllocation = false;
-        }
-    };
-
-    struct ReservedAddressRange {
-        void *addressPtr = nullptr;
-        size_t rangeSize = 0;
-    };
-
-    friend class SubmissionAggregator;
-
-    const uint32_t rootDeviceIndex;
-    AllocationInfo allocationInfo;
+    std::vector<uint32_t> inspectionIds;
+    std::vector<Gmm *> gmms;
     AubInfo aubInfo;
     SharingInfo sharingInfo;
     ReservedAddressRange reservedAddressRangeInfo;
-
-    uint64_t allocationOffset = 0u;
-    uint64_t gpuBaseAddress = 0;
-    uint64_t gpuAddress = 0;
-    void *driverAllocatedCpuPointer = nullptr;
-    size_t size = 0;
-    void *cpuPtr = nullptr;
+    SurfaceStateInHeapInfo bindlessInfo = {};
     void *lockedPtr = nullptr;
-
-    MemoryPool memoryPool = MemoryPool::MemoryNull;
-    AllocationType allocationType = AllocationType::UNKNOWN;
-
-    StackVec<UsageInfo, 32> usageInfos;
-    std::atomic<uint32_t> registeredContextsNum{0};
-    StackVec<Gmm *, EngineLimits::maxHandleCount> gmms;
+    void *driverAllocatedCpuPointer = nullptr;
     ResidencyData residency;
+    GraphicsAllocation *parentAllocation = nullptr;
+    size_t offsetInParent = 0u;
+    GraphicsAllocation *mappedPhysicalAllocation = nullptr;
+    std::unique_ptr<PhysicalMappingsInfo> physicalMappingsInfo;
+    std::atomic<uint32_t> hostPtrTaskCountAssignment{0};
+    std::atomic<uint64_t> residencyContainerStamp{0};
+    // Not {}: value-initializing the atomic zeroes the byte, but default MemAdviseFlags sets cachedMemory.
+    std::atomic<MemAdviseFlags> enabledMemAdviseFlags{MemAdviseFlags{}};
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<GraphicsAllocation>);
+
 } // namespace NEO

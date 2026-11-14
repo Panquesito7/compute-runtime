@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2021 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -53,16 +53,18 @@ if(UNIX)
   endif()
 
   if(NEO_BUILD_WITH_OCL)
+    set(NEO_OCL_ICD_FILE_NAME "intel${NEO__SO_NAME_SUFFIX}.icd")
+
     get_target_property(OCL_RUNTIME_LIB_NAME igdrcl_dll OUTPUT_NAME)
     install(
-            CODE "file( WRITE ${NEO_BINARY_DIR}/intel.icd \"${CMAKE_INSTALL_FULL_LIBDIR}/intel-opencl/${CMAKE_SHARED_LIBRARY_PREFIX}${OCL_RUNTIME_LIB_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}\n\" )"
+            CODE "file( WRITE ${NEO_BINARY_DIR}/${NEO_OCL_ICD_FILE_NAME} \"${CMAKE_INSTALL_FULL_LIBDIR}/intel-opencl/${CMAKE_SHARED_LIBRARY_PREFIX}${OCL_RUNTIME_LIB_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}\n\" )"
             CODE "file( WRITE ${NEO_BINARY_DIR}/tmp/postinst \"/sbin/ldconfig\n\" )"
             CODE "file( WRITE ${NEO_BINARY_DIR}/tmp/postrm \"/sbin/ldconfig\n\" )"
             CODE "file( COPY ${NEO_BINARY_DIR}/tmp/postinst DESTINATION ${NEO_BINARY_DIR} FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE )"
             CODE "file( COPY ${NEO_BINARY_DIR}/tmp/postrm DESTINATION ${NEO_BINARY_DIR} FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE )"
             COMPONENT opencl
     )
-    install(FILES ${NEO_BINARY_DIR}/intel.icd DESTINATION ${OCL_ICD_VENDORDIR} COMPONENT opencl)
+    install(FILES ${NEO_BINARY_DIR}/${NEO_OCL_ICD_FILE_NAME} DESTINATION ${OCL_ICD_VENDORDIR} COMPONENT opencl)
   endif()
 
   if(NEO_BUILD_DEBUG_SYMBOLS_PACKAGE)
@@ -128,17 +130,17 @@ if(UNIX)
   if(CMAKE_VERSION VERSION_GREATER 3.6 OR CMAKE_VERSION VERSION_EQUAL 3.6)
     set(CPACK_DEBIAN_OPENCL_FILE_NAME "intel-opencl_${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-1~${os_codename}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}.deb")
     set(CPACK_DEBIAN_OCLOC_FILE_NAME "intel-ocloc_${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-1~${os_codename}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}.deb")
-    set(CPACK_DEBIAN_LEVEL-ZERO-GPU_FILE_NAME "intel-level-zero-gpu_${NEO_L0_VERSION_MAJOR}.${NEO_L0_VERSION_MINOR}.${NEO_VERSION_BUILD}-1~${os_codename}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}.deb")
+    set(CPACK_DEBIAN_LEVEL-ZERO-GPU_FILE_NAME "libze-intel-gpu1_${NEO_L0_VERSION_MAJOR}.${NEO_L0_VERSION_MINOR}.${NEO_VERSION_BUILD}-1~${os_codename}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}.deb")
     set(CPACK_DEBIAN_OPENCL-DEBUGINFO_FILE_NAME "intel-opencl-debuginfo_${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-1~${os_codename}_${CPACK_DEBIAN_PACKAGE_ARCHITECTURE}.deb")
 
     set(CPACK_RPM_OPENCL_FILE_NAME "intel-opencl-${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-${CPACK_RPM_PACKAGE_RELEASE}%{?dist}.${CPACK_RPM_PACKAGE_ARCHITECTURE}.rpm")
     set(CPACK_RPM_OCLOC_FILE_NAME "intel-ocloc-${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-${CPACK_RPM_PACKAGE_RELEASE}%{?dist}.${CPACK_RPM_PACKAGE_ARCHITECTURE}.rpm")
-    set(CPACK_RPM_LEVEL-ZERO-GPU_FILE_NAME "intel-level-zero-gpu-${NEO_L0_VERSION_MAJOR}.${NEO_L0_VERSION_MINOR}.${NEO_VERSION_BUILD}-${CPACK_RPM_PACKAGE_RELEASE}%{?dist}.${CPACK_RPM_PACKAGE_ARCHITECTURE}.rpm")
+    set(CPACK_RPM_LEVEL-ZERO-GPU_FILE_NAME "libze-intel-gpu1-${NEO_L0_VERSION_MAJOR}.${NEO_L0_VERSION_MINOR}.${NEO_VERSION_BUILD}-${CPACK_RPM_PACKAGE_RELEASE}%{?dist}.${CPACK_RPM_PACKAGE_ARCHITECTURE}.rpm")
     set(CPACK_RPM_OPENCL-DEBUGINFO_FILE_NAME "intel-opencl-debuginfo-${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-${CPACK_RPM_PACKAGE_RELEASE}%{?dist}.${CPACK_RPM_PACKAGE_ARCHITECTURE}.rpm")
 
     set(CPACK_ARCHIVE_OPENCL_FILE_NAME "intel-opencl-${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-${os_codename}-${CPACK_PACKAGE_ARCHITECTURE}")
     set(CPACK_ARCHIVE_OCLOC_FILE_NAME "intel-ocloc-${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-${os_codename}-${CPACK_PACKAGE_ARCHITECTURE}")
-    set(CPACK_ARCHIVE_LEVEL-ZERO-GPU_FILE_NAME "intel-level-zero-gpu-${NEO_L0_VERSION_MAJOR}.${NEO_L0_VERSION_MINOR}.${NEO_VERSION_BUILD}-${os_codename}_${CPACK_PACKAGE_ARCHITECTURE}")
+    set(CPACK_ARCHIVE_LEVEL-ZERO-GPU_FILE_NAME "libze-intel-gpu1-${NEO_L0_VERSION_MAJOR}.${NEO_L0_VERSION_MINOR}.${NEO_VERSION_BUILD}-${os_codename}_${CPACK_PACKAGE_ARCHITECTURE}")
     set(CPACK_ARCHIVE_OPENCL-DEBUGINFO_FILE_NAME "intel-opencl-debuginfo-${NEO_OCL_VERSION_MAJOR}.${NEO_OCL_VERSION_MINOR}.${NEO_VERSION_BUILD}-${os_codename}-${CPACK_PACKAGE_ARCHITECTURE}")
   else()
     if(CPACK_GENERATOR STREQUAL "DEB")
@@ -159,15 +161,15 @@ if(UNIX)
   endif()
 
   if(NEO__IGC_FOUND)
-    list(APPEND _external_package_dependencies_debian "intel-igc-opencl(=${NEO__IGC_VERSION})")
-    list(APPEND _external_package_dependencies_rpm "intel-igc-opencl = ${NEO__IGC_VERSION}")
-    list(APPEND _igc_package_dependencies_debian "intel-igc-opencl(=${NEO__IGC_VERSION})")
-    list(APPEND _igc_package_dependencies_rpm "intel-igc-opencl = ${NEO__IGC_VERSION}")
+    list(APPEND _external_package_dependencies_debian "intel-igc-opencl-2(=${NEO__IGC_VERSION})")
+    list(APPEND _external_package_dependencies_rpm "intel-igc-opencl-2 = ${NEO__IGC_VERSION}")
+    list(APPEND _igc_package_dependencies_debian "intel-igc-opencl-2(=${NEO__IGC_VERSION})")
+    list(APPEND _igc_package_dependencies_rpm "intel-igc-opencl-2 = ${NEO__IGC_VERSION}")
   else()
-    list(APPEND _external_package_dependencies_debian "intel-igc-opencl")
-    list(APPEND _external_package_dependencies_rpm "intel-igc-opencl")
-    list(APPEND _igc_package_dependencies_debian "intel-igc-opencl")
-    list(APPEND _igc_package_dependencies_rpm "intel-igc-opencl")
+    list(APPEND _external_package_dependencies_debian "intel-igc-opencl-2")
+    list(APPEND _external_package_dependencies_rpm "intel-igc-opencl-2")
+    list(APPEND _igc_package_dependencies_debian "intel-igc-opencl-2")
+    list(APPEND _igc_package_dependencies_rpm "intel-igc-opencl-2")
   endif()
 
   set(_external_package_dependencies_debian_level_zero_gpu "${_external_package_dependencies_debian}")

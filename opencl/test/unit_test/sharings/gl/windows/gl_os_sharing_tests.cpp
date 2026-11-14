@@ -1,29 +1,33 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/preemption.h"
+#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
-#include "shared/source/helpers/timestamp_packet.h"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/windows/gdi_interface.h"
 #include "shared/source/os_interface/windows/os_context_win.h"
 #include "shared/source/os_interface/windows/wddm/wddm.h"
-#include "shared/source/os_interface/windows/wddm_memory_operations_handler.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_wddm.h"
+#include "shared/test/common/mocks/windows/mock_gdi_interface.h"
 #include "shared/test/common/os_interface/windows/mock_sys_calls.h"
-#include "shared/test/common/os_interface/windows/wddm_fixture.h"
+#include "shared/test/common/test_macros/test.h"
 
-#include "opencl/extensions/public/cl_gl_private_intel.h"
 #include "opencl/source/sharings/gl/gl_arb_sync_event.h"
 #include "opencl/source/sharings/gl/windows/gl_sharing_windows.h"
 #include "opencl/test/unit_test/mocks/gl/windows/mock_gl_sharing_windows.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
 
 #include "gtest/gtest.h"
-#include <GL/gl.h>
 
 using namespace NEO;
 
@@ -31,7 +35,7 @@ struct MockOSInterface : OSInterface {
     static HANDLE createEvent(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCSTR lpName, void *data) {
         MockOSInterface *self = reinterpret_cast<MockOSInterface *>(data);
         if (self->eventNum++ == self->failEventNum) {
-            return INVALID_HANDLE;
+            return reinterpret_cast<HANDLE>(INVALID_HANDLE);
         }
         return handleValue;
     }
@@ -46,16 +50,16 @@ struct MockOSInterface : OSInterface {
 };
 
 TEST(glSharingBasicTest, GivenSharingFunctionsWhenItIsConstructedThenBackupContextIsCreated) {
-    GLType GLHDCType = CL_WGL_HDC_KHR;
-    GLContext GLHGLRCHandle = 0;
-    GLDisplay GLHDCHandle = 0;
+    GLType glHDCType = CL_WGL_HDC_KHR;
+    GLContext glHGLRCHandle = 0;
+    GLDisplay glHDCHandle = 0;
     int32_t expectedContextAttrs[3] = {0};
     GlDllHelper dllHelper;
 
-    auto glSharingFunctions = new GlSharingFunctionsMock(GLHDCType, GLHGLRCHandle, GLHGLRCHandle, GLHDCHandle);
+    auto glSharingFunctions = new GlSharingFunctionsMock(glHDCType, glHGLRCHandle, glHGLRCHandle, glHDCHandle);
 
-    EXPECT_EQ(1, dllHelper.getParam("WGLCreateContextCalled"));
-    EXPECT_EQ(1, dllHelper.getParam("WGLShareListsCalled"));
+    EXPECT_EQ(1, dllHelper.getParam("wglCreateContextCalled"));
+    EXPECT_EQ(1, dllHelper.getParam("wglShareListsCalled"));
     EXPECT_EQ(0, EGLChooseConfigCalled);
     EXPECT_EQ(0, EGLCreateContextCalled);
     EXPECT_EQ(0, GlxChooseFBConfigCalled);
@@ -70,15 +74,15 @@ TEST(glSharingBasicTest, GivenSharingFunctionsWhenItIsConstructedThenBackupConte
     EXPECT_EQ(0, glxBkpContextParams.queryAttribute);
     EXPECT_EQ(0, glxBkpContextParams.renderType);
     delete glSharingFunctions;
-    EXPECT_EQ(1, dllHelper.getParam("WGLDeleteContextCalled"));
-    EXPECT_EQ(1, dllHelper.getParam("GLDeleteContextCalled"));
+    EXPECT_EQ(1, dllHelper.getParam("wglDeleteContextCalled"));
+    EXPECT_EQ(1, dllHelper.getParam("glDeleteContextCalled"));
 }
 
 struct GlArbSyncEventOsTest : public ::testing::Test {
     void SetUp() override {
         rootDeviceEnvironment = std::make_unique<RootDeviceEnvironment>(executionEnvironment);
-        sharing.GLContextHandle = 0x2cU;
-        sharing.GLDeviceHandle = 0x3cU;
+        sharing.glContextHandle = 0x2cU;
+        sharing.glDeviceHandle = 0x3cU;
         wddm = new WddmMock(*rootDeviceEnvironment);
         rootDeviceEnvironment->osInterface = std::make_unique<OSInterface>();
         osInterface = rootDeviceEnvironment->osInterface.get();
@@ -111,11 +115,11 @@ TEST_F(GlArbSyncEventOsTest, WhenCreateSynchronizationObjectSucceedsThenAllHAndl
                 return STATUS_INVALID_PARAMETER;
             }
 
-            EXPECT_NE(NULL, pData->hDevice);
+            EXPECT_NE(0u, pData->hDevice);
             EXPECT_EQ(D3DDDI_SEMAPHORE, pData->Info.Type);
 
-            EXPECT_EQ(32, pData->Info.Semaphore.MaxCount);
-            EXPECT_EQ(0, pData->Info.Semaphore.InitialCount);
+            EXPECT_EQ(32u, pData->Info.Semaphore.MaxCount);
+            EXPECT_EQ(0u, pData->Info.Semaphore.InitialCount);
 
             pData->hSyncObject = getHandle()++;
             return STATUS_SUCCESS;
@@ -126,7 +130,7 @@ TEST_F(GlArbSyncEventOsTest, WhenCreateSynchronizationObjectSucceedsThenAllHAndl
                 return STATUS_INVALID_PARAMETER;
             }
 
-            EXPECT_NE(NULL, pData->hDevice);
+            EXPECT_NE(0u, pData->hDevice);
             EXPECT_EQ(D3DDDI_CPU_NOTIFICATION, pData->Info.Type);
             EXPECT_NE(nullptr, pData->Info.CPUNotification.Event);
 
@@ -144,7 +148,7 @@ TEST_F(GlArbSyncEventOsTest, WhenCreateSynchronizationObjectSucceedsThenAllHAndl
     EXPECT_EQ(1U, syncInfo.serverSynchronizationObject);
     EXPECT_EQ(2U, syncInfo.clientSynchronizationObject);
     EXPECT_EQ(3U, syncInfo.submissionSynchronizationObject);
-    EXPECT_EQ(sharing.GLContextHandle, syncInfo.hContextToBlock);
+    EXPECT_EQ(sharing.glContextHandle, syncInfo.hContextToBlock);
     EXPECT_NE(nullptr, syncInfo.event);
     EXPECT_NE(nullptr, syncInfo.eventName);
     EXPECT_NE(nullptr, syncInfo.submissionEvent);
@@ -303,10 +307,10 @@ TEST_F(GlArbSyncEventOsTest, GivenCallToSignalArbSyncObjectWhenSignalSynchroniza
                 return STATUS_INVALID_PARAMETER;
             }
 
-            EXPECT_EQ(2, obj->ObjectCount);
+            EXPECT_EQ(2u, obj->ObjectCount);
             EXPECT_EQ(getExpectedSynchHandle0(), obj->ObjectHandleArray[0]);
             EXPECT_EQ(getExpectedSynchHandle1(), obj->ObjectHandleArray[1]);
-            EXPECT_EQ(0, obj->Flags.SignalAtSubmission);
+            EXPECT_EQ(0u, obj->Flags.SignalAtSubmission);
             EXPECT_EQ(getExpectedContextHandle(), obj->hContext);
             return STATUS_INVALID_PARAMETER;
         }
@@ -348,7 +352,7 @@ TEST_F(GlArbSyncEventOsTest, GivenCallToSignalArbSyncObjectWhenSignalSynchroniza
     FailSignalSyncObjectMock::getExpectedSynchHandle0() = syncInfo.serverSynchronizationObject;
     FailSignalSyncObjectMock::getExpectedSynchHandle1() = syncInfo.clientSynchronizationObject;
 
-    signalArbSyncObject(osContext, syncInfo);
+    signalArbSyncObject(osContext, syncInfo, false);
 }
 
 TEST_F(GlArbSyncEventOsTest, GivenCallToSignalArbSyncObjectWhenSignalSynchronizationObjectForServerClientSyncSucceedsThenSubmissionSyncGetsSignalledAsWell) {
@@ -364,9 +368,9 @@ TEST_F(GlArbSyncEventOsTest, GivenCallToSignalArbSyncObjectWhenSignalSynchroniza
                 return STATUS_SUCCESS;
             }
 
-            EXPECT_EQ(1, obj->ObjectCount);
+            EXPECT_EQ(1u, obj->ObjectCount);
             EXPECT_EQ(getExpectedSynchHandle0(), obj->ObjectHandleArray[0]);
-            EXPECT_EQ(1, obj->Flags.SignalAtSubmission);
+            EXPECT_EQ(1u, obj->Flags.SignalAtSubmission);
             EXPECT_EQ(getExpectedContextHandle(), obj->hContext);
 
             return STATUS_SUCCESS;
@@ -406,7 +410,34 @@ TEST_F(GlArbSyncEventOsTest, GivenCallToSignalArbSyncObjectWhenSignalSynchroniza
     FailSignalSyncObjectMock::getExpectedContextHandle() = osContext.getWddmContextHandle();
     FailSignalSyncObjectMock::getExpectedSynchHandle0() = syncInfo.submissionSynchronizationObject;
 
-    signalArbSyncObject(osContext, syncInfo);
+    signalArbSyncObject(osContext, syncInfo, false);
+}
+
+TEST_F(GlArbSyncEventOsTest, givenSignalAtSubmissionWhenSignalArbSyncObjectIsCalledThenServerClientSyncIsSignalledAtSubmission) {
+    struct SignalSyncObjectMock {
+        static NTSTATUS __stdcall signal(_In_ CONST D3DKMT_SIGNALSYNCHRONIZATIONOBJECT *obj) {
+            if (obj->ObjectCount == 2u) {
+                getServerClientSignalAtSubmission() = obj->Flags.SignalAtSubmission;
+            }
+            return STATUS_SUCCESS;
+        }
+
+        static UINT &getServerClientSignalAtSubmission() {
+            static UINT signalAtSubmission = 0u;
+            return signalAtSubmission;
+        }
+    };
+    SignalSyncObjectMock::getServerClientSignalAtSubmission() = 0u;
+    auto preemptionMode = PreemptionHelper::getDefaultPreemptionMode(*defaultHwInfo);
+    wddm->init();
+    auto &gfxCoreHelper = this->rootDeviceEnvironment->getHelper<GfxCoreHelper>();
+    OsContextWin osContext(*wddm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor(gfxCoreHelper.getGpgpuEngineInstances(*rootDeviceEnvironment)[0], preemptionMode));
+
+    CL_GL_SYNC_INFO syncInfo = {};
+    gdi->signalSynchronizationObject.mFunc = SignalSyncObjectMock::signal;
+
+    signalArbSyncObject(osContext, syncInfo, true);
+    EXPECT_EQ(1u, SignalSyncObjectMock::getServerClientSignalAtSubmission());
 }
 
 TEST_F(GlArbSyncEventOsTest, GivenCallToServerWaitForArbSyncObjectWhenWaitForSynchronizationObjectFailsThenWaitFlagDoesNotGetSet) {
@@ -417,7 +448,7 @@ TEST_F(GlArbSyncEventOsTest, GivenCallToServerWaitForArbSyncObjectWhenWaitForSyn
                 return STATUS_INVALID_PARAMETER;
             }
 
-            EXPECT_EQ(1, waitData->ObjectCount);
+            EXPECT_EQ(1u, waitData->ObjectCount);
             EXPECT_EQ(getExpectedSynchHandle0(), waitData->ObjectHandleArray[0]);
             EXPECT_EQ(getExpectedContextHandle(), waitData->hContext);
             return STATUS_INVALID_PARAMETER;
@@ -451,6 +482,38 @@ TEST_F(GlArbSyncEventOsTest, GivenCallToServerWaitForArbSyncObjectWhenWaitForSyn
     EXPECT_FALSE(syncInfo.waitCalled);
     serverWaitForArbSyncObject(*osInterface, syncInfo);
     EXPECT_FALSE(syncInfo.waitCalled);
+}
+
+TEST_F(GlArbSyncEventOsTest, GivenCallToServerWaitForArbSyncObjectWhenWaitForSingleObjectFailsThenWaitFlagDoesNotGetSet) {
+    CL_GL_SYNC_INFO syncInfo = {};
+    syncInfo.hContextToBlock = 0x4cU;
+
+    VariableBackup<decltype(SysCalls::sysCallsWaitForSingleObject)> mockSysCallsWaitForSingleObject(&SysCalls::sysCallsWaitForSingleObject, [](HANDLE hHandle, DWORD dwMilliseconds) -> DWORD {
+        return WAIT_FAILED;
+    });
+
+    EXPECT_FALSE(syncInfo.waitCalled);
+    serverWaitForArbSyncObject(*osInterface, syncInfo);
+    EXPECT_FALSE(syncInfo.waitCalled);
+}
+
+TEST_F(GlArbSyncEventOsTest, whenWaitOnServerForArbSyncObjectThenUseCpuSubmissionEvent) {
+    CL_GL_SYNC_INFO syncInfo = {};
+    syncInfo.hContextToBlock = 0x4cU;
+    syncInfo.submissionEvent = reinterpret_cast<HANDLE>(1);
+    syncInfo.event = reinterpret_cast<HANDLE>(2);
+    syncInfo.submissionSynchronizationObject = static_cast<D3DKMT_HANDLE>(3u);
+    syncInfo.clientSynchronizationObject = static_cast<D3DKMT_HANDLE>(4u);
+    syncInfo.serverSynchronizationObject = static_cast<D3DKMT_HANDLE>(5u);
+
+    VariableBackup<decltype(SysCalls::sysCallsWaitForSingleObject)> mockSysCallsWaitForSingleObject(&SysCalls::sysCallsWaitForSingleObject, [](HANDLE hHandle, DWORD dwMilliseconds) -> DWORD {
+        EXPECT_EQ(hHandle, reinterpret_cast<HANDLE>(1));
+        return WAIT_OBJECT_0;
+    });
+
+    EXPECT_FALSE(syncInfo.waitCalled);
+    serverWaitForArbSyncObject(*osInterface, syncInfo);
+    EXPECT_TRUE(syncInfo.waitCalled);
 }
 
 TEST_F(GlArbSyncEventOsTest, GivenCallToServerWaitForArbSyncObjectWhenWaitForSynchronizationObjectSucceedsThenWaitFlagGetsSet) {

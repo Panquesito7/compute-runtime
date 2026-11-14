@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,20 +15,17 @@
 #include "shared/source/os_interface/os_interface.h"
 
 #include "level_zero/core/source/device/device.h"
-#include "level_zero/core/source/device/device_imp.h"
 #include "level_zero/core/source/fabric/fabric.h"
 
 namespace L0 {
 
 FabricDeviceIaf::FabricDeviceIaf(Device *device) : device(device) {
 
-    DeviceImp *deviceImp = static_cast<DeviceImp *>(device);
-
-    if (deviceImp->numSubDevices == 0) {
+    if (device->numSubDevices == 0) {
         // Add one sub-device
         subDeviceIafs.push_back(std::make_unique<FabricSubDeviceIaf>(device));
     } else {
-        for (const auto &subDevice : deviceImp->subDevices) {
+        for (const auto &subDevice : device->subDevices) {
             subDeviceIafs.push_back(std::make_unique<FabricSubDeviceIaf>(subDevice));
         }
     }
@@ -105,14 +102,14 @@ ze_result_t FabricSubDeviceIaf::enumerate() {
         return ZE_RESULT_ERROR_UNINITIALIZED;
     }
 
-    if (osInterface->getDriverModel()->getDriverModelType() != NEO::DriverModelType::DRM) {
+    if (osInterface->getDriverModel()->getDriverModelType() != NEO::DriverModelType::drm) {
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
 
     auto pDrm = osInterface->getDriverModel()->as<NEO::Drm>();
     std::optional<std::string> rootPciPath = NEO::getPciLinkPath(pDrm->getFileDescriptor());
     if (!rootPciPath.has_value()) {
-        PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PCI Path not found%s\n", "");
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PCI Path not found%s\n", "");
         return ZE_RESULT_ERROR_UNKNOWN;
     }
 
@@ -122,10 +119,9 @@ ze_result_t FabricSubDeviceIaf::enumerate() {
         return result;
     }
 
-    DeviceImp *deviceImp = static_cast<DeviceImp *>(device);
-    uint32_t physicalSubDeviceId = deviceImp->getPhysicalSubDeviceId();
+    uint32_t physicalSubDeviceId = device->getPhysicalSubDeviceId();
 
-    // Remove ports which donot belong to this device
+    // Remove ports which do not belong to this device
     for (auto iter = iafPorts.begin(); iter != iafPorts.end();) {
         IafPort &port = *iter;
         if (port.portId.attachId != physicalSubDeviceId) {
@@ -136,14 +132,14 @@ ze_result_t FabricSubDeviceIaf::enumerate() {
     }
 
     // Get Connections
-    for (auto iafPort : iafPorts) {
+    for (auto &iafPort : iafPorts) {
         FabricPortConnection connection = {};
         ze_result_t result = getConnection(iafPort, connection);
         if (result != ZE_RESULT_SUCCESS) {
-            NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                                  "failure observed for IafPort{0x%x, 0x%x, 0x%x}: 0x%x\n",
-                                  iafPort.portId.fabricId, iafPort.portId.attachId, iafPort.portId.portNumber,
-                                  result);
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "failure observed for IafPort{0x%x, 0x%x, 0x%x}: 0x%x\n",
+                         iafPort.portId.fabricId, iafPort.portId.attachId, iafPort.portId.portNumber,
+                         result);
             continue;
         }
         connections.push_back(connection);
@@ -154,10 +150,10 @@ ze_result_t FabricSubDeviceIaf::enumerate() {
         std::vector<uint8_t> ports = {};
         if (ZE_RESULT_SUCCESS != pIafNlApi->subdevicePropertiesGet(iafPorts[0].portId.fabricId, physicalSubDeviceId, guid, ports)) {
             connections.clear();
-            NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                                  "failure during fabric port guid reading {0x%x, 0x%x, 0x%x}: result: 0x%x subdeviceId:%d\n",
-                                  iafPorts[0].portId.fabricId, iafPorts[0].portId.attachId, iafPorts[0].portId.portNumber,
-                                  result, physicalSubDeviceId);
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "failure during fabric port guid reading {0x%x, 0x%x, 0x%x}: result: 0x%x subdeviceId:%d\n",
+                         iafPorts[0].portId.fabricId, iafPorts[0].portId.attachId, iafPorts[0].portId.portNumber,
+                         result, physicalSubDeviceId);
             return ZE_RESULT_ERROR_UNKNOWN;
         }
     }
@@ -170,11 +166,11 @@ ze_result_t FabricSubDeviceIaf::getConnection(IafPort &port, FabricPortConnectio
     IafPortState iafPortState = {};
     ze_result_t result = pIafNlApi->fPortStatusQuery(port.portId, iafPortState);
     if (result != ZE_RESULT_SUCCESS) {
-        PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "fPortStatusQuery Unsuccessful: %s\n", result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "fPortStatusQuery Unsuccessful: %s\n", result);
         return result;
     }
     if (iafPortState.healthStatus != IAF_FPORT_HEALTH_HEALTHY) {
-        PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "IAF PORT not Healthy%s\n", "");
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "IAF PORT not Healthy%s\n", "");
         return ZE_RESULT_ERROR_UNKNOWN;
     }
 
@@ -250,14 +246,14 @@ bool FabricSubDeviceIaf::getEdgeProperty(FabricVertex *neighborVertex,
     ze_uuid_t &uuid = edgeProperty.uuid;
     bool isConnected = false;
     uint32_t accumulatedBandwidth = 0;
-    DeviceImp *neighborDeviceImp = static_cast<DeviceImp *>(neighborVertex->device);
+    Device *neighborDevice = neighborVertex->device;
 
     // If the neighbor is a root device
-    if (neighborDeviceImp->isSubdevice == false) {
+    if (neighborDevice->isSubdevice == false) {
 
         std::vector<ze_fabric_edge_exp_properties_t> subEdgeProperties = {};
 
-        FabricDeviceIaf *deviceIaf = static_cast<FabricDeviceIaf *>(neighborVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        FabricDeviceIaf *deviceIaf = static_cast<FabricDeviceIaf *>(neighborVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         // Get the edges to the neighbors subVertices
         for (auto &subDeviceIaf : deviceIaf->subDeviceIafs) {
             ze_fabric_edge_exp_properties_t edgeProperty = {};
@@ -294,7 +290,7 @@ bool FabricSubDeviceIaf::getEdgeProperty(FabricVertex *neighborVertex,
         }
     } else {
         FabricSubDeviceIaf *pNeighbourInterface =
-            static_cast<FabricSubDeviceIaf *>(neighborVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+            static_cast<FabricSubDeviceIaf *>(neighborVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         isConnected = getEdgeProperty(pNeighbourInterface, edgeProperty);
     }
 
@@ -307,9 +303,9 @@ void FabricSubDeviceIaf::setIafNlApi(IafNlApi *iafNlApi) {
 
 std::unique_ptr<FabricDeviceInterface> FabricDeviceInterface::createFabricDeviceInterfaceIaf(const FabricVertex *fabricVertex) {
 
-    DeviceImp *deviceImp = static_cast<DeviceImp *>(fabricVertex->device);
+    Device *device = fabricVertex->device;
 
-    if (deviceImp->isSubdevice) {
+    if (device->isSubdevice) {
         return std::unique_ptr<FabricDeviceInterface>(new (std::nothrow) FabricSubDeviceIaf(fabricVertex->device));
     }
 

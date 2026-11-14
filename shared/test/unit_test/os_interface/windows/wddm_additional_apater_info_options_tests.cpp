@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,6 +18,17 @@ TEST_F(WddmTest, WhenPopulateIpVersionWddmIsCalledThenIpVersionIsSet) {
     auto &compilerProductHelper = wddm->rootDeviceEnvironment.getHelper<CompilerProductHelper>();
     HardwareInfo hwInfo = *defaultHwInfo;
     auto config = compilerProductHelper.getHwIpVersion(hwInfo);
+    wddm->populateIpVersion(hwInfo);
+
+    EXPECT_EQ(config, hwInfo.ipVersion.value);
+}
+
+HWTEST2_F(WddmTest, WhenPopulateIpVersionWddmIsCalledAndIpVersionIsZeroThenDefaultValueIsSet, IsAtLeastMtl) {
+    auto &compilerProductHelper = wddm->rootDeviceEnvironment.getHelper<CompilerProductHelper>();
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.ipVersion = 0;
+    hwInfo.platform.usDeviceID = 0;
+    auto config = compilerProductHelper.getDefaultHwIpVersion();
     wddm->populateIpVersion(hwInfo);
 
     EXPECT_EQ(config, hwInfo.ipVersion.value);

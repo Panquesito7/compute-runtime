@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,8 +13,7 @@
 #include "ocl_igc_interface/fcl_ocl_device_ctx.h"
 #include "ocl_igc_interface/igc_ocl_device_ctx.h"
 
-#include <functional>
-#include <map>
+#include <optional>
 #include <string>
 
 namespace NEO {
@@ -22,17 +21,19 @@ namespace NEO {
 class MockCompilerInterface : public CompilerInterface {
   public:
     using CompilerInterface::cache;
-    using CompilerInterface::checkIcbeVersionOnce;
     using CompilerInterface::fclBaseTranslationCtx;
     using CompilerInterface::fclDeviceContexts;
     using CompilerInterface::initialize;
     using CompilerInterface::isCompilerAvailable;
     using CompilerInterface::isFclAvailable;
     using CompilerInterface::isIgcAvailable;
-    using CompilerInterface::verifyIcbeVersion;
 
-    using CompilerInterface::fclMain;
-    using CompilerInterface::igcMain;
+    using CompilerInterface::defaultIgc;
+    using CompilerInterface::fcl;
+
+    using CompilerInterface::customCompilerLibraries;
+    using CompilerInterface::finalizerDeviceContexts;
+    using CompilerInterface::useIgcAsFcl;
 
     bool loadFcl() override {
         if (failLoadFcl) {
@@ -41,39 +42,48 @@ class MockCompilerInterface : public CompilerInterface {
         return CompilerInterface::loadFcl();
     }
 
-    bool loadIgc() override {
+    bool loadIgcBasedCompiler(CompilerLibraryEntry &entryPoint, const char *libName) override {
         if (failLoadIgc) {
             return false;
         }
-        return CompilerInterface::loadIgc();
+
+        if (igcLibraryNameOverride.has_value()) {
+            libName = *igcLibraryNameOverride;
+        }
+
+        return CompilerInterface::loadIgcBasedCompiler(entryPoint, libName);
     }
 
-    void setFclDeviceCtx(const Device &d, IGC::FclOclDeviceCtxTagOCL *ctx) {
-        this->fclDeviceContexts[&d] = CIF::RAII::RetainAndPack<IGC::FclOclDeviceCtxTagOCL>(ctx);
+    void setFclDeviceCtx(const Device &d, NEO::FclOclDeviceCtxTag *ctx) {
+        this->fclDeviceContexts[&d] = CIF::RAII::RetainAndPack<NEO::FclOclDeviceCtxTag>(ctx);
     }
 
-    std::map<const Device *, fclDevCtxUptr> &getFclDeviceContexts() {
+    std::unordered_map<const Device *, fclDevCtxUptr> &getFclDeviceContexts() {
         return this->fclDeviceContexts;
     }
 
-    void setIgcDeviceCtx(const Device &d, IGC::IgcOclDeviceCtxTagOCL *ctx) {
-        this->igcDeviceContexts[&d] = CIF::RAII::RetainAndPack<IGC::IgcOclDeviceCtxTagOCL>(ctx);
+    void setIgcDeviceCtx(const Device &d, NEO::IgcOclDeviceCtxTag *ctx) {
+        this->igcDeviceContexts[&d] = CIF::RAII::RetainAndPack<NEO::IgcOclDeviceCtxTag>(ctx);
     }
 
-    std::map<const Device *, igcDevCtxUptr> &getIgcDeviceContexts() {
+    void setFinalizerDeviceCtx(const Device &d, NEO::IgcOclDeviceCtxTag *ctx) {
+        this->finalizerDeviceContexts[&d] = CIF::RAII::RetainAndPack<NEO::IgcOclDeviceCtxTag>(ctx);
+    }
+
+    std::unordered_map<const Device *, igcDevCtxUptr> &getIgcDeviceContexts() {
         return this->igcDeviceContexts;
     }
 
-    void setDeviceCtx(const Device &d, IGC::IgcOclDeviceCtxTagOCL *ctx) {
+    void setDeviceCtx(const Device &d, NEO::IgcOclDeviceCtxTag *ctx) {
         setIgcDeviceCtx(d, ctx);
     }
 
-    void setDeviceCtx(const Device &d, IGC::FclOclDeviceCtxTagOCL *ctx) {
+    void setDeviceCtx(const Device &d, NEO::FclOclDeviceCtxTag *ctx) {
         setFclDeviceCtx(d, ctx);
     }
 
     template <typename DeviceCtx>
-    std::map<const Device *, CIF::RAII::UPtr_t<DeviceCtx>> &getDeviceContexts();
+    std::unordered_map<const Device *, CIF::RAII::UPtr_t<DeviceCtx>> &getDeviceContexts();
 
     std::unique_lock<SpinLock> lock() override {
         if (lockListener != nullptr) {
@@ -84,16 +94,16 @@ class MockCompilerInterface : public CompilerInterface {
     }
 
     void setIgcMain(CIF::CIFMain *main) {
-        this->igcMain.release();
-        this->igcMain.reset(main);
+        this->defaultIgc.entryPoint.release();
+        this->defaultIgc.entryPoint.reset(main);
     }
 
     void setFclMain(CIF::CIFMain *main) {
-        this->fclMain.release();
-        this->fclMain.reset(main);
+        this->fcl.entryPoint.release();
+        this->fcl.entryPoint.reset(main);
     }
 
-    IGC::IgcOclDeviceCtxTagOCL *getIgcDeviceCtx(const Device &device) override {
+    NEO::IgcOclDeviceCtxTag *getIgcDeviceCtx(const Device &device) override {
         if (failGetIgcDeviceCtx) {
             return nullptr;
         }
@@ -101,9 +111,9 @@ class MockCompilerInterface : public CompilerInterface {
         return CompilerInterface::getIgcDeviceCtx(device);
     }
 
-    CIF::RAII::UPtr_t<IGC::FclOclTranslationCtxTagOCL> createFclTranslationCtx(const Device &device,
-                                                                               IGC::CodeType::CodeType_t inType,
-                                                                               IGC::CodeType::CodeType_t outType) override {
+    CIF::RAII::UPtr_t<NEO::FclOclTranslationCtxTag> createFclTranslationCtx(const Device &device,
+                                                                            IGC::CodeType::CodeType_t inType,
+                                                                            IGC::CodeType::CodeType_t outType) override {
         requestedTranslationCtxs.emplace_back(inType, outType);
         if (failCreateFclTranslationCtx) {
             return nullptr;
@@ -112,9 +122,9 @@ class MockCompilerInterface : public CompilerInterface {
         return CompilerInterface::createFclTranslationCtx(device, inType, outType);
     }
 
-    CIF::RAII::UPtr_t<IGC::IgcOclTranslationCtxTagOCL> createIgcTranslationCtx(const Device &device,
-                                                                               IGC::CodeType::CodeType_t inType,
-                                                                               IGC::CodeType::CodeType_t outType) override {
+    CIF::RAII::UPtr_t<NEO::IgcOclTranslationCtxTag> createIgcTranslationCtx(const Device &device,
+                                                                            IGC::CodeType::CodeType_t inType,
+                                                                            IGC::CodeType::CodeType_t outType) override {
         requestedTranslationCtxs.emplace_back(inType, outType);
         if (failCreateIgcTranslationCtx) {
             return nullptr;
@@ -123,62 +133,100 @@ class MockCompilerInterface : public CompilerInterface {
         return CompilerInterface::createIgcTranslationCtx(device, inType, outType);
     }
 
-    IGC::FclOclTranslationCtxTagOCL *getFclBaseTranslationCtx() {
+    CIF::RAII::UPtr_t<NEO::IgcOclTranslationCtxTag> createFinalizerTranslationCtx(const Device &device,
+                                                                                  IGC::CodeType::CodeType_t inType,
+                                                                                  IGC::CodeType::CodeType_t outType) override {
+        requestedTranslationCtxs.emplace_back(inType, outType);
+        if (failCreateFinalizerTranslationCtx) {
+            return nullptr;
+        }
+
+        return CompilerInterface::createFinalizerTranslationCtx(device, inType, outType);
+    }
+
+    NEO::FclOclTranslationCtxTag *getFclBaseTranslationCtx() {
         return this->fclBaseTranslationCtx.get();
     }
 
-    TranslationOutput::ErrorCode getSipKernelBinary(NEO::Device &device, SipKernelType type, std::vector<char> &retBinary,
-                                                    std::vector<char> &stateAreaHeader) override {
+    TranslationErrorCode getSipKernelBinary(NEO::Device &device, SipKernelType type, std::vector<char> &retBinary,
+                                            std::vector<char> &stateAreaHeader) override {
         if (this->sipKernelBinaryOverride.size() > 0) {
             retBinary = this->sipKernelBinaryOverride;
+            if (this->sipStateAreaHeaderOverride.size() > 0) {
+                stateAreaHeader = this->sipStateAreaHeaderOverride;
+            }
             this->requestedSipKernel = type;
-            return TranslationOutput::ErrorCode::Success;
+            return TranslationErrorCode::success;
         } else {
             return CompilerInterface::getSipKernelBinary(device, type, retBinary, stateAreaHeader);
         }
     }
 
-    CIF::RAII::UPtr_t<IGC::IgcFeaturesAndWorkaroundsTagOCL> getIgcFeaturesAndWorkarounds(const NEO::Device &device) override {
+    CIF::RAII::UPtr_t<NEO::IgcFeaturesAndWorkaroundsTag> getIgcFeaturesAndWorkarounds(const NEO::Device &device) override {
         if (nullptr != igcFeaturesAndWorkaroundsTagOCL) {
-            return CIF::RAII::RetainAndPack<IGC::IgcFeaturesAndWorkaroundsTagOCL>(igcFeaturesAndWorkaroundsTagOCL);
+            return CIF::RAII::RetainAndPack<NEO::IgcFeaturesAndWorkaroundsTag>(igcFeaturesAndWorkaroundsTagOCL);
         } else {
             return CompilerInterface::getIgcFeaturesAndWorkarounds(device);
         }
     };
+
+    IGC::CodeType::CodeType_t getPreferredIntermediateRepresentation(const Device &device) override {
+        if (preferredIr != IGC::CodeType::undefined) {
+            return preferredIr;
+        }
+        return CompilerInterface::getPreferredIntermediateRepresentation(device);
+    }
+
+    std::string getSpirvExtensionsYAML(const NEO::Device &device) override {
+        getSpirvExtensionsYAMLCalled++;
+        if (spirvExtensionsYAMLOverride.has_value()) {
+            return *spirvExtensionsYAMLOverride;
+        }
+        return CompilerInterface::getSpirvExtensionsYAML(device);
+    }
 
     static std::vector<char> getDummyGenBinary();
     static void releaseDummyGenBinary();
 
     void (*lockListener)(MockCompilerInterface &compInt) = nullptr;
     void *lockListenerData = nullptr;
-    IGC::IgcFeaturesAndWorkaroundsTagOCL *igcFeaturesAndWorkaroundsTagOCL = nullptr;
+    NEO::IgcFeaturesAndWorkaroundsTag *igcFeaturesAndWorkaroundsTagOCL = nullptr;
     bool failCreateFclTranslationCtx = false;
     bool failCreateIgcTranslationCtx = false;
+    bool failCreateFinalizerTranslationCtx = false;
     bool failLoadFcl = false;
     bool failLoadIgc = false;
     bool failGetIgcDeviceCtx = false;
+    std::optional<const char *> igcLibraryNameOverride;
 
     using TranslationOpT = std::pair<IGC::CodeType::CodeType_t, IGC::CodeType::CodeType_t>;
     std::vector<TranslationOpT> requestedTranslationCtxs;
 
     std::vector<char> sipKernelBinaryOverride;
-    SipKernelType requestedSipKernel = SipKernelType::COUNT;
+    std::vector<char> sipStateAreaHeaderOverride;
+    SipKernelType requestedSipKernel = SipKernelType::count;
 
-    IGC::IgcOclDeviceCtxTagOCL *peekIgcDeviceCtx(Device *device) { return igcDeviceContexts[device].get(); }
+    NEO::IgcOclDeviceCtxTag *peekIgcDeviceCtx(Device *device) { return igcDeviceContexts[device].get(); }
+    IGC::CodeType::CodeType_t preferredIr = IGC::CodeType::undefined;
+
+    // When set, getSpirvExtensionsYAML() returns this verbatim (use the IGC
+    // golden fixture for the success path, or "" to exercise legacy fallback).
+    std::optional<std::string> spirvExtensionsYAMLOverride;
+    uint32_t getSpirvExtensionsYAMLCalled = 0;
 };
 
 template <>
-inline std::map<const Device *, MockCompilerInterface::igcDevCtxUptr> &MockCompilerInterface::getDeviceContexts<IGC::IgcOclDeviceCtxTagOCL>() {
+inline std::unordered_map<const Device *, MockCompilerInterface::igcDevCtxUptr> &MockCompilerInterface::getDeviceContexts<NEO::IgcOclDeviceCtxTag>() {
     return getIgcDeviceContexts();
 }
 
 template <>
-inline std::map<const Device *, MockCompilerInterface::fclDevCtxUptr> &MockCompilerInterface::getDeviceContexts<IGC::FclOclDeviceCtxTagOCL>() {
+inline std::unordered_map<const Device *, MockCompilerInterface::fclDevCtxUptr> &MockCompilerInterface::getDeviceContexts<NEO::FclOclDeviceCtxTag>() {
     return getFclDeviceContexts();
 }
 
 struct MockCompilerInterfaceCaptureBuildOptions : CompilerInterface {
-    TranslationOutput::ErrorCode compile(const NEO::Device &device, const TranslationInput &input, TranslationOutput &out) override {
+    TranslationErrorCode compile(const NEO::Device &device, const TranslationInput &input, TranslationOutput &out) override {
         buildOptions.clear();
         if ((input.apiOptions.size() > 0) && (input.apiOptions.begin() != nullptr)) {
             buildOptions.assign(input.apiOptions.begin(), input.apiOptions.end());
@@ -186,6 +234,10 @@ struct MockCompilerInterfaceCaptureBuildOptions : CompilerInterface {
         buildInternalOptions.clear();
         if ((input.internalOptions.size() > 0) && (input.internalOptions.begin() != nullptr)) {
             buildInternalOptions.assign(input.internalOptions.begin(), input.internalOptions.end());
+        }
+        frontendBuildOptions.reset();
+        if (input.frontendApiOptions.has_value()) {
+            frontendBuildOptions = std::string(input.frontendApiOptions->begin(), input.frontendApiOptions->end());
         }
 
         auto copy = [](TranslationOutput::MemAndSize &dst, TranslationOutput::MemAndSize &src) {
@@ -200,21 +252,22 @@ struct MockCompilerInterfaceCaptureBuildOptions : CompilerInterface {
         copy(out.deviceBinary, output.intermediateRepresentation);
         out.intermediateCodeType = output.intermediateCodeType;
 
-        return TranslationOutput::ErrorCode::Success;
+        return TranslationErrorCode::success;
     }
 
-    TranslationOutput::ErrorCode build(const NEO::Device &device, const TranslationInput &input, TranslationOutput &out) override {
+    TranslationErrorCode build(const NEO::Device &device, const TranslationInput &input, TranslationOutput &out) override {
         return this->MockCompilerInterfaceCaptureBuildOptions::compile(device, input, out);
     }
 
-    TranslationOutput::ErrorCode link(const NEO::Device &device,
-                                      const TranslationInput &input,
-                                      TranslationOutput &output) override {
+    TranslationErrorCode link(const NEO::Device &device,
+                              const TranslationInput &input,
+                              TranslationOutput &output) override {
         return this->MockCompilerInterfaceCaptureBuildOptions::compile(device, input, output);
     }
 
     TranslationOutput output;
     std::string buildOptions;
     std::string buildInternalOptions;
+    std::optional<std::string> frontendBuildOptions;
 };
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,8 +12,8 @@
 #include "opencl/source/sharings/sharing.h"
 
 #include "CL/cl.h"
-#include "GL/gl.h"
-#include "GL/glext.h"
+#include "CL/cl_gl.h"
+#include "gl_types.h"
 
 #include <functional>
 #include <mutex>
@@ -62,7 +62,7 @@ class GLSharingFunctions : public SharingFunctions {
 class GlSharing : public SharingHandler {
   public:
     GlSharing(GLSharingFunctions *sharingFunctions, unsigned int glObjectType, unsigned int glObjectId)
-        : sharingFunctions(sharingFunctions), clGlObjectType(glObjectType), clGlObjectId(glObjectId){};
+        : sharingFunctions(sharingFunctions), clGlObjectType(glObjectType), clGlObjectId(glObjectId) {};
     GLSharingFunctions *peekFunctionsHandler() { return sharingFunctions; }
     void getGlObjectInfo(unsigned int *pClGlObjectType, unsigned int *pClGlObjectId) {
         if (pClGlObjectType) {

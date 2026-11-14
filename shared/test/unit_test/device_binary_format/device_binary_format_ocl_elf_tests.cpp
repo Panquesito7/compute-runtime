@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,7 +13,6 @@
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
 #include "shared/source/device_binary_format/elf/ocl_elf.h"
 #include "shared/source/program/program_info.h"
-#include "shared/test/common/device_binary_format/patchtokens_tests.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/test.h"
 
@@ -24,36 +23,36 @@ TEST(IsDeviceBinaryFormatOclElf, GivenElfThenReturnsTrueIfProperElfFileTypeDetec
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
-    EXPECT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_OBJECTS;
-    EXPECT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_LIBRARY;
-    EXPECT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_DEBUG;
-    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_SOURCE;
-    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_NONE;
-    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_EXEC;
-    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode()));
+    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode()));
 
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_32> elfEnc32;
     elfEnc32.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
-    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(elfEnc32.encode()));
+    EXPECT_FALSE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(elfEnc32.encode()));
 }
 
 TEST(UnpackSingleDeviceBinaryOclElf, WhenFailedToDecodeElfThenUnpackingFails) {
     std::string unpackErrors;
     std::string unpackWarnings;
-    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>({}, "", {}, unpackErrors, unpackWarnings);
-    EXPECT_EQ(NEO::DeviceBinaryFormat::Unknown, unpackResult.format);
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>({}, "", {}, unpackErrors, unpackWarnings);
+    EXPECT_EQ(NEO::DeviceBinaryFormat::unknown, unpackResult.format);
     EXPECT_TRUE(unpackResult.deviceBinary.empty());
     EXPECT_TRUE(unpackResult.debugData.empty());
     EXPECT_TRUE(unpackResult.intermediateRepresentation.empty());
@@ -66,8 +65,8 @@ TEST(UnpackSingleDeviceBinaryOclElf, GivenNotOclElfThenUnpackingFails) {
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
     std::string unpackErrors;
     std::string unpackWarnings;
-    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode(), "", {}, unpackErrors, unpackWarnings);
-    EXPECT_EQ(NEO::DeviceBinaryFormat::Unknown, unpackResult.format);
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode(), "", {}, unpackErrors, unpackWarnings);
+    EXPECT_EQ(NEO::DeviceBinaryFormat::unknown, unpackResult.format);
     EXPECT_TRUE(unpackResult.deviceBinary.empty());
     EXPECT_TRUE(unpackResult.debugData.empty());
     EXPECT_TRUE(unpackResult.intermediateRepresentation.empty());
@@ -80,21 +79,11 @@ TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfThenSetsProperOutputFormat) {
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
     std::string unpackErrors;
     std::string unpackWarnings;
-    elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
-    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode(), "", {}, unpackErrors, unpackWarnings);
-    EXPECT_EQ(NEO::DeviceBinaryFormat::Patchtokens, unpackResult.format);
-    EXPECT_TRUE(unpackResult.deviceBinary.empty());
-    EXPECT_TRUE(unpackResult.debugData.empty());
-    EXPECT_TRUE(unpackResult.intermediateRepresentation.empty());
-    EXPECT_TRUE(unpackResult.buildOptions.empty());
-    EXPECT_TRUE(unpackWarnings.empty());
-    EXPECT_TRUE(unpackErrors.empty());
-
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_LIBRARY;
     elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_SPIRV, NEO::Elf::SectionNamesOpenCl::spirvObject, ArrayRef<const uint8_t>::fromAny(NEO::spirvMagic.begin(), NEO::spirvMagic.size()));
     auto elfData = elfEnc64.encode();
-    unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfData, "", {}, unpackErrors, unpackWarnings);
-    EXPECT_EQ(NEO::DeviceBinaryFormat::OclLibrary, unpackResult.format);
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(elfData, "", {}, unpackErrors, unpackWarnings);
+    EXPECT_EQ(NEO::DeviceBinaryFormat::oclLibrary, unpackResult.format);
     EXPECT_TRUE(unpackResult.deviceBinary.empty());
     EXPECT_TRUE(unpackResult.debugData.empty());
     EXPECT_TRUE(unpackResult.buildOptions.empty());
@@ -107,8 +96,8 @@ TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfThenSetsProperOutputFormat) {
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_OBJECTS;
     elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_LLVM_BINARY, NEO::Elf::SectionNamesOpenCl::llvmObject, ArrayRef<const uint8_t>::fromAny(NEO::llvmBcMagic.begin(), NEO::llvmBcMagic.size()));
     elfData = elfEnc64.encode();
-    unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfData, "", {}, unpackErrors, unpackWarnings);
-    EXPECT_EQ(NEO::DeviceBinaryFormat::OclCompiledObject, unpackResult.format);
+    unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(elfData, "", {}, unpackErrors, unpackWarnings);
+    EXPECT_EQ(NEO::DeviceBinaryFormat::oclCompiledObject, unpackResult.format);
     EXPECT_TRUE(unpackResult.deviceBinary.empty());
     EXPECT_TRUE(unpackResult.debugData.empty());
     EXPECT_TRUE(unpackResult.buildOptions.empty());
@@ -119,69 +108,70 @@ TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfThenSetsProperOutputFormat) {
     EXPECT_EQ(NEO::llvmBcMagic.size(), unpackResult.intermediateRepresentation.size());
 }
 
-TEST(UnpackSingleDeviceBinaryOclElf, GivenValidOclElfExecutableThenReadsAllSectionProperly) {
-    PatchTokensTestData::ValidEmptyProgram patchtokensProgram;
-    NEO::TargetDevice targetDevice;
-    targetDevice.coreFamily = static_cast<GFXCORE_FAMILY>(patchtokensProgram.header->Device);
-    targetDevice.stepping = patchtokensProgram.header->SteppingId;
-    targetDevice.maxPointerSizeInBytes = patchtokensProgram.header->GPUPointerSizeInBytes;
-
-    const uint8_t intermediateRepresentation[] = "235711";
-    const uint8_t debugData[] = "313739";
-    std::string buildOptions = "buildOpts";
+TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfExecutableWithDevBinaryAndIrWhenUnpackingThenIrIsExtracted) {
+    const uint8_t ir[] = "235711";
+    const uint8_t devBin[] = "old_dev_binary";
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
+    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_BINARY, NEO::Elf::SectionNamesOpenCl::deviceBinary,
+                           ArrayRef<const uint8_t>(devBin, sizeof(devBin)));
+    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_SPIRV, NEO::Elf::SectionNamesOpenCl::spirvObject,
+                           ArrayRef<const uint8_t>(ir, sizeof(ir)));
+
+    auto encodedElf = elfEnc64.encode();
     std::string unpackErrors;
     std::string unpackWarnings;
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_BINARY, NEO::Elf::SectionNamesOpenCl::deviceBinary, patchtokensProgram.storage);
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_OPTIONS, NEO::Elf::SectionNamesOpenCl::buildOptions, buildOptions);
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_DEBUG, NEO::Elf::SectionNamesOpenCl::buildOptions, debugData);
-    {
-        auto encWithLlvm = elfEnc64;
-        encWithLlvm.appendSection(NEO::Elf::SHT_OPENCL_LLVM_BINARY, NEO::Elf::SectionNamesOpenCl::llvmObject, intermediateRepresentation);
-        auto elfData = encWithLlvm.encode();
-        auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfData, "", targetDevice, unpackErrors, unpackWarnings);
-        EXPECT_TRUE(unpackWarnings.empty());
-        EXPECT_TRUE(unpackErrors.empty());
-        EXPECT_EQ(NEO::DeviceBinaryFormat::Patchtokens, unpackResult.format);
-        ASSERT_EQ(patchtokensProgram.storage.size(), unpackResult.deviceBinary.size());
-        ASSERT_EQ(sizeof(debugData), unpackResult.debugData.size());
-        ASSERT_EQ(buildOptions.size() + 1, unpackResult.buildOptions.size());
-        ASSERT_EQ(sizeof(intermediateRepresentation), unpackResult.intermediateRepresentation.size());
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(encodedElf, "", {}, unpackErrors, unpackWarnings);
 
-        EXPECT_EQ(0, memcmp(patchtokensProgram.storage.data(), unpackResult.deviceBinary.begin(), unpackResult.deviceBinary.size()));
-        EXPECT_STREQ(buildOptions.c_str(), unpackResult.buildOptions.begin());
-        EXPECT_EQ(0, memcmp(debugData, unpackResult.debugData.begin(), unpackResult.debugData.size()));
-        EXPECT_EQ(0, memcmp(intermediateRepresentation, unpackResult.intermediateRepresentation.begin(), unpackResult.intermediateRepresentation.size()));
-    }
-    {
-        auto encWithSpirV = elfEnc64;
-        encWithSpirV.appendSection(NEO::Elf::SHT_OPENCL_SPIRV, NEO::Elf::SectionNamesOpenCl::spirvObject, intermediateRepresentation);
-        auto elfData = encWithSpirV.encode();
-        auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfData, "", targetDevice, unpackErrors, unpackWarnings);
-        EXPECT_TRUE(unpackWarnings.empty());
-        EXPECT_TRUE(unpackErrors.empty());
-        EXPECT_EQ(NEO::DeviceBinaryFormat::Patchtokens, unpackResult.format);
-        ASSERT_EQ(patchtokensProgram.storage.size(), unpackResult.deviceBinary.size());
-        ASSERT_EQ(sizeof(debugData), unpackResult.debugData.size());
-        ASSERT_EQ(buildOptions.size() + 1, unpackResult.buildOptions.size());
-        ASSERT_EQ(sizeof(intermediateRepresentation), unpackResult.intermediateRepresentation.size());
-
-        EXPECT_EQ(0, memcmp(patchtokensProgram.storage.data(), unpackResult.deviceBinary.begin(), unpackResult.deviceBinary.size()));
-        EXPECT_STREQ(buildOptions.c_str(), unpackResult.buildOptions.begin());
-        EXPECT_EQ(0, memcmp(debugData, unpackResult.debugData.begin(), unpackResult.debugData.size()));
-        EXPECT_EQ(0, memcmp(intermediateRepresentation, unpackResult.intermediateRepresentation.begin(), unpackResult.intermediateRepresentation.size()));
-    }
+    EXPECT_TRUE(unpackErrors.empty()) << unpackErrors;
+    EXPECT_TRUE(unpackWarnings.empty()) << unpackWarnings;
+    EXPECT_TRUE(unpackResult.deviceBinary.empty());
+    ASSERT_EQ(sizeof(ir), unpackResult.intermediateRepresentation.size());
+    EXPECT_EQ(0, memcmp(ir, unpackResult.intermediateRepresentation.begin(), sizeof(ir)));
 }
 
-TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfExecutableWithUnhandledSectionThenUnpackingFails) {
+TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfWithBuildOptionsThenBuildOptionsAreExtracted) {
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
     std::string unpackErrors;
     std::string unpackWarnings;
-    elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
+    elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_LIBRARY;
+    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_SPIRV, NEO::Elf::SectionNamesOpenCl::spirvObject, ArrayRef<const uint8_t>::fromAny(NEO::spirvMagic.begin(), NEO::spirvMagic.size()));
+    const std::string buildOptionsStr = "-cl-opt-disable -DFOO=1";
+    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_OPTIONS, NEO::Elf::SectionNamesOpenCl::buildOptions,
+                           ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(buildOptionsStr.c_str()), buildOptionsStr.size()));
+    auto encodedElf = elfEnc64.encode();
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(encodedElf, "", {}, unpackErrors, unpackWarnings);
+    EXPECT_TRUE(unpackErrors.empty()) << unpackErrors;
+    EXPECT_TRUE(unpackWarnings.empty()) << unpackWarnings;
+    EXPECT_FALSE(unpackResult.buildOptions.empty());
+    EXPECT_EQ(0, memcmp(buildOptionsStr.c_str(), unpackResult.buildOptions.begin(), buildOptionsStr.size()));
+}
+
+TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfWithDebugDataThenDebugDataIsExtracted) {
+    NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
+    std::string unpackErrors;
+    std::string unpackWarnings;
+    elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_LIBRARY;
+    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_SPIRV, NEO::Elf::SectionNamesOpenCl::spirvObject, ArrayRef<const uint8_t>::fromAny(NEO::spirvMagic.begin(), NEO::spirvMagic.size()));
+    const uint8_t debugPayload[] = {0x01, 0x02, 0x03, 0x04};
+    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_DEBUG, NEO::Elf::SectionNamesOpenCl::deviceDebug,
+                           ArrayRef<const uint8_t>(debugPayload, sizeof(debugPayload)));
+    auto encodedElf = elfEnc64.encode();
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(encodedElf, "", {}, unpackErrors, unpackWarnings);
+    EXPECT_TRUE(unpackErrors.empty()) << unpackErrors;
+    EXPECT_TRUE(unpackWarnings.empty()) << unpackWarnings;
+    ASSERT_EQ(sizeof(debugPayload), unpackResult.debugData.size());
+    EXPECT_EQ(0, memcmp(debugPayload, unpackResult.debugData.begin(), sizeof(debugPayload)));
+}
+
+TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfWithUnhandledSectionThenUnpackingFails) {
+    NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
+    std::string unpackErrors;
+    std::string unpackWarnings;
+    elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_LIBRARY;
     elfEnc64.appendSection(NEO::Elf::SHT_NOBITS, "my_data", {});
-    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode(), "", {}, unpackErrors, unpackWarnings);
-    EXPECT_EQ(NEO::DeviceBinaryFormat::Unknown, unpackResult.format);
+    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(elfEnc64.encode(), "", {}, unpackErrors, unpackWarnings);
+    EXPECT_EQ(NEO::DeviceBinaryFormat::unknown, unpackResult.format);
     EXPECT_TRUE(unpackResult.deviceBinary.empty());
     EXPECT_TRUE(unpackResult.debugData.empty());
     EXPECT_TRUE(unpackResult.intermediateRepresentation.empty());
@@ -190,55 +180,22 @@ TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfExecutableWithUnhandledSectionTh
     EXPECT_STREQ("Unhandled ELF section", unpackErrors.c_str());
 }
 
-TEST(UnpackSingleDeviceBinaryOclElf, GivenOclElfExecutableWhenPatchtokensBinaryIsBrokenThenReadsAllSectionProperly) {
-    const uint8_t intermediateRepresentation[] = "235711";
-    const uint8_t debugData[] = "313739";
-    const uint8_t deviceBinary[] = "not_patchtokens";
-    std::string buildOptions = "buildOpts";
-    NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
-    elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
-    std::string unpackErrors;
-    std::string unpackWarnings;
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_BINARY, NEO::Elf::SectionNamesOpenCl::deviceBinary, deviceBinary);
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_OPTIONS, NEO::Elf::SectionNamesOpenCl::buildOptions, buildOptions);
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_DEBUG, NEO::Elf::SectionNamesOpenCl::buildOptions, debugData);
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_SPIRV, NEO::Elf::SectionNamesOpenCl::spirvObject, intermediateRepresentation);
-
-    auto unpackResult = NEO::unpackSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(elfEnc64.encode(), "", {}, unpackErrors, unpackWarnings);
-    EXPECT_FALSE(unpackErrors.empty());
-    EXPECT_STREQ("Invalid program header", unpackErrors.c_str());
-    EXPECT_EQ(NEO::DeviceBinaryFormat::Patchtokens, unpackResult.format);
-    EXPECT_TRUE(unpackResult.deviceBinary.empty());
-    EXPECT_TRUE(unpackResult.debugData.empty());
-    EXPECT_FALSE(unpackResult.intermediateRepresentation.empty());
-    EXPECT_FALSE(unpackResult.buildOptions.empty());
-    EXPECT_TRUE(unpackWarnings.empty());
-}
-
 TEST(DecodeSingleDeviceBinaryOclElf, WhenUsedAsSingleDeviceBinaryThenDecodingFails) {
     NEO::MockExecutionEnvironment mockExecutionEnvironment{};
     auto &gfxCoreHelper = mockExecutionEnvironment.rootDeviceEnvironments[0]->getHelper<NEO::GfxCoreHelper>();
-    PatchTokensTestData::ValidEmptyProgram patchtokensProgram;
 
     NEO::Elf::ElfEncoder<NEO::Elf::EI_CLASS_64> elfEnc64;
     elfEnc64.getElfFileHeader().type = NEO::Elf::ET_OPENCL_EXECUTABLE;
-    elfEnc64.appendSection(NEO::Elf::SHT_OPENCL_DEV_BINARY, NEO::Elf::SectionNamesOpenCl::deviceBinary, patchtokensProgram.storage);
     auto elfData = elfEnc64.encode();
 
-    NEO::TargetDevice targetDevice;
-    targetDevice.coreFamily = static_cast<GFXCORE_FAMILY>(patchtokensProgram.header->Device);
-    targetDevice.stepping = patchtokensProgram.header->SteppingId;
-    targetDevice.maxPointerSizeInBytes = patchtokensProgram.header->GPUPointerSizeInBytes;
-
     NEO::SingleDeviceBinary deviceBinary;
-    deviceBinary.targetDevice = targetDevice;
     deviceBinary.deviceBinary = elfData;
 
     std::string unpackErrors;
     std::string unpackWarnings;
     NEO::ProgramInfo programInfo;
-    NEO::DecodeError error = NEO::decodeSingleDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(programInfo, deviceBinary, unpackErrors, unpackWarnings, gfxCoreHelper);
-    EXPECT_EQ(NEO::DecodeError::InvalidBinary, error);
+    NEO::DecodeError error = NEO::decodeSingleDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(programInfo, deviceBinary, unpackErrors, unpackWarnings, gfxCoreHelper);
+    EXPECT_EQ(NEO::DecodeError::invalidBinary, error);
     EXPECT_TRUE(unpackWarnings.empty());
     EXPECT_FALSE(unpackErrors.empty());
     EXPECT_STREQ("Device binary format is packed", unpackErrors.c_str());
@@ -249,11 +206,11 @@ TEST(PackDeviceBinaryOclElf, WhenPackingEmptyDataThenEmptyOclElfIsEmitted) {
 
     std::string packErrors;
     std::string packWarnings;
-    auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(singleBinary, packErrors, packWarnings);
+    auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(singleBinary, packErrors, packWarnings);
     EXPECT_TRUE(packWarnings.empty());
     EXPECT_TRUE(packErrors.empty());
 
-    ASSERT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(packedData));
+    ASSERT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(packedData));
 
     std::string decodeElfErrors;
     std::string decodeElfWarnings;
@@ -273,7 +230,7 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryWithUnknownIntermediateRepresentat
 
     std::string packErrors;
     std::string packWarnings;
-    auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(singleBinary, packErrors, packWarnings);
+    auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(singleBinary, packErrors, packWarnings);
     EXPECT_TRUE(packedData.empty());
     EXPECT_TRUE(packWarnings.empty());
     EXPECT_FALSE(packErrors.empty());
@@ -291,12 +248,12 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryWitIntermediateRepresentationThenC
 
         std::string packErrors;
         std::string packWarnings;
-        auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(singleBinary, packErrors, packWarnings);
+        auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(singleBinary, packErrors, packWarnings);
         EXPECT_FALSE(packedData.empty());
         EXPECT_TRUE(packWarnings.empty());
         EXPECT_TRUE(packErrors.empty());
 
-        ASSERT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(packedData));
+        ASSERT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(packedData));
 
         std::string decodeElfErrors;
         std::string decodeElfWarnings;
@@ -309,7 +266,7 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryWitIntermediateRepresentationThenC
         EXPECT_EQ(3U, elf.elfFileHeader->shNum);
 
         auto spirVSection = std::find_if(elf.sectionHeaders.begin(), elf.sectionHeaders.end(),
-                                         [](const Elf<>::SectionHeaderAndData &section) { return section.header->type == NEO::Elf::SHT_OPENCL_SPIRV; });
+                                         [](const SectionHeaderAndData<> &section) { return section.header->type == NEO::Elf::SHT_OPENCL_SPIRV; });
         ASSERT_NE(nullptr, spirVSection);
         ASSERT_EQ(spirV.size(), spirVSection->data.size());
         EXPECT_EQ(0, memcmp(spirV.begin(), spirVSection->data.begin(), spirV.size()));
@@ -320,12 +277,12 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryWitIntermediateRepresentationThenC
 
         std::string packErrors;
         std::string packWarnings;
-        auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(singleBinary, packErrors, packWarnings);
+        auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(singleBinary, packErrors, packWarnings);
         EXPECT_FALSE(packedData.empty());
         EXPECT_TRUE(packWarnings.empty());
         EXPECT_TRUE(packErrors.empty());
 
-        ASSERT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::OclElf>(packedData));
+        ASSERT_TRUE(NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::oclElf>(packedData));
 
         std::string decodeElfErrors;
         std::string decodeElfWarnings;
@@ -338,7 +295,7 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryWitIntermediateRepresentationThenC
         EXPECT_EQ(3U, elf.elfFileHeader->shNum);
 
         auto llvmSection = std::find_if(elf.sectionHeaders.begin(), elf.sectionHeaders.end(),
-                                        [](const Elf<>::SectionHeaderAndData &section) { return section.header->type == NEO::Elf::SHT_OPENCL_LLVM_BINARY; });
+                                        [](const SectionHeaderAndData<> &section) { return section.header->type == NEO::Elf::SHT_OPENCL_LLVM_BINARY; });
         ASSERT_NE(nullptr, llvmSection);
         ASSERT_EQ(llvmBc.size(), llvmSection->data.size());
         EXPECT_EQ(0, memcmp(llvmBc.begin(), llvmSection->data.begin(), llvmBc.size()));
@@ -360,7 +317,7 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryThenSectionsAreProperlyPopulated) 
 
     std::string packErrors;
     std::string packWarnings;
-    auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::OclElf>(singleBinary, packErrors, packWarnings);
+    auto packedData = NEO::packDeviceBinary<NEO::DeviceBinaryFormat::oclElf>(singleBinary, packErrors, packWarnings);
     EXPECT_TRUE(packErrors.empty());
     EXPECT_TRUE(packWarnings.empty());
 
@@ -372,16 +329,16 @@ TEST(PackDeviceBinaryOclElf, WhenPackingBinaryThenSectionsAreProperlyPopulated) 
     ASSERT_NE(nullptr, elf.elfFileHeader);
 
     auto spirvSection = std::find_if(elf.sectionHeaders.begin(), elf.sectionHeaders.end(),
-                                     [](const Elf<>::SectionHeaderAndData &section) { return section.header->type == NEO::Elf::SHT_OPENCL_SPIRV; });
+                                     [](const SectionHeaderAndData<> &section) { return section.header->type == NEO::Elf::SHT_OPENCL_SPIRV; });
 
     auto deviceBinarySection = std::find_if(elf.sectionHeaders.begin(), elf.sectionHeaders.end(),
-                                            [](const Elf<>::SectionHeaderAndData &section) { return section.header->type == NEO::Elf::SHT_OPENCL_DEV_BINARY; });
+                                            [](const SectionHeaderAndData<> &section) { return section.header->type == NEO::Elf::SHT_OPENCL_DEV_BINARY; });
 
     auto deviceDebugSection = std::find_if(elf.sectionHeaders.begin(), elf.sectionHeaders.end(),
-                                           [](const Elf<>::SectionHeaderAndData &section) { return section.header->type == NEO::Elf::SHT_OPENCL_DEV_DEBUG; });
+                                           [](const SectionHeaderAndData<> &section) { return section.header->type == NEO::Elf::SHT_OPENCL_DEV_DEBUG; });
 
     auto buildOptionsSection = std::find_if(elf.sectionHeaders.begin(), elf.sectionHeaders.end(),
-                                            [](const Elf<>::SectionHeaderAndData &section) { return section.header->type == NEO::Elf::SHT_OPENCL_OPTIONS; });
+                                            [](const SectionHeaderAndData<> &section) { return section.header->type == NEO::Elf::SHT_OPENCL_OPTIONS; });
 
     ASSERT_NE(nullptr, spirvSection);
     ASSERT_EQ(spirV.size(), spirvSection->data.size());

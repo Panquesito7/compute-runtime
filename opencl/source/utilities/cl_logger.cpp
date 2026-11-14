@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,18 +17,76 @@
 
 namespace NEO {
 
-template <DebugFunctionalityLevel DebugLevel>
-ClFileLogger<DebugLevel>::ClFileLogger(FileLogger<DebugLevel> &baseLoggerIn, const DebugVariables &flags) : baseLogger(baseLoggerIn) {
-    dumpKernelArgsEnabled = flags.DumpKernelArgs.get();
+template <DebugFunctionalityLevel debugLevel>
+ClFileLogger<debugLevel>::ClFileLogger(FileLogger<debugLevel> &baseLoggerIn, const DebugVariables &flags) : baseLogger(baseLoggerIn) {
+    this->dumpKernels = flags.DumpKernels.get();
+    this->logApiCalls = flags.LogApiCalls.get();
+    this->dumpKernelArgsEnabled = flags.DumpKernelArgs.get();
+}
+
+template <DebugFunctionalityLevel debugLevel>
+void ClFileLogger<debugLevel>::dumpKernel(const std::string &name, const std::string &src) {
+    if (false == this->baseLogger.enabled()) {
+        return;
+    }
+
+    if (this->dumpKernels) {
+        DBG_LOG(LogApiCalls, "Kernel size", src.size(), src.c_str());
+        this->baseLogger.writeToFile(name + ".txt", src.c_str(), src.size(), std::ios::trunc);
+    }
+}
+
+template <DebugFunctionalityLevel debugLevel>
+void ClFileLogger<debugLevel>::logApiCall(const char *function, bool enter, int32_t errorCode) {
+    if (false == this->baseLogger.enabled()) {
+        return;
+    }
+
+    if (this->logApiCalls) {
+        std::thread::id thisThread = std::this_thread::get_id();
+
+        std::stringstream ss;
+        ss << "ThreadID: " << thisThread << " ";
+        if (enter) {
+            ss << "Function Enter: ";
+        } else {
+            ss << "Function Leave (" << errorCode << "): ";
+        }
+        ss << function << std::endl;
+
+        this->baseLogger.logDebugString(true, ss.str());
+    }
+}
+
+template <DebugFunctionalityLevel debugLevel>
+size_t ClFileLogger<debugLevel>::getInput(const size_t *input, int32_t index) {
+    if (this->baseLogger.enabled() == false) {
+        return 0;
+    }
+    return input != nullptr ? input[index] : 0;
+}
+
+template <DebugFunctionalityLevel debugLevel>
+void ClFileLogger<debugLevel>::dumpBinaryProgram(int32_t numDevices, const size_t *lengths, const unsigned char **binaries) {
+    if (false == this->baseLogger.enabled()) {
+        return;
+    }
+
+    if (this->dumpKernels) {
+        if (lengths != nullptr && binaries != nullptr &&
+            lengths[0] != 0 && binaries[0] != nullptr) {
+            this->baseLogger.writeToFile("programBinary.bin", reinterpret_cast<const char *>(binaries[0]), lengths[0], std::ios::trunc | std::ios::binary);
+        }
+    }
 }
 
 ClFileLogger<globalDebugFunctionalityLevel> &getClFileLogger() {
-    static ClFileLogger<globalDebugFunctionalityLevel> clFileLoggerInstance(fileLoggerInstance(), DebugManager.flags);
+    static ClFileLogger<globalDebugFunctionalityLevel> clFileLoggerInstance(fileLoggerInstance(), debugManager.flags);
     return clFileLoggerInstance;
 }
 
-template <DebugFunctionalityLevel DebugLevel>
-void ClFileLogger<DebugLevel>::dumpKernelArgs(const MultiDispatchInfo *multiDispatchInfo) {
+template <DebugFunctionalityLevel debugLevel>
+void ClFileLogger<debugLevel>::dumpKernelArgs(const MultiDispatchInfo *multiDispatchInfo) {
     if (false == baseLogger.enabled()) {
         return;
     }
@@ -55,7 +113,7 @@ void ClFileLogger<DebugLevel>::dumpKernelArgs(const MultiDispatchInfo *multiDisp
             const auto &arg = explicitArgs[i];
             if (arg.getTraits().getAddressQualifier() == KernelArgMetadata::AddrLocal) {
                 type = "local";
-            } else if (arg.is<ArgDescriptor::ArgTImage>()) {
+            } else if (arg.is<ArgDescriptor::argTImage>()) {
                 type = "image";
                 auto clMem = reinterpret_cast<const _cl_mem *>(kernel->getKernelArg(i));
                 auto memObj = castToObject<MemObj>(clMem);
@@ -64,9 +122,9 @@ void ClFileLogger<DebugLevel>::dumpKernelArgs(const MultiDispatchInfo *multiDisp
                     size = memObj->getSize();
                     flags = memObj->getFlags();
                 }
-            } else if (arg.is<ArgDescriptor::ArgTSampler>()) {
+            } else if (arg.is<ArgDescriptor::argTSampler>()) {
                 type = "sampler";
-            } else if (arg.is<ArgDescriptor::ArgTPointer>()) {
+            } else if (arg.is<ArgDescriptor::argTPointer>()) {
                 type = "buffer";
                 auto clMem = reinterpret_cast<const _cl_mem *>(kernel->getKernelArg(i));
                 auto memObj = castToObject<MemObj>(clMem);
@@ -79,7 +137,7 @@ void ClFileLogger<DebugLevel>::dumpKernelArgs(const MultiDispatchInfo *multiDisp
                 type = "immediate";
                 auto crossThreadData = kernel->getCrossThreadData();
                 auto crossThreadDataSize = kernel->getCrossThreadDataSize();
-                argVal = std::unique_ptr<char[]>(new char[crossThreadDataSize]);
+                argVal = std::make_unique<char[]>(crossThreadDataSize);
 
                 size_t totalArgSize = 0;
                 for (const auto &element : arg.as<ArgDescValue>().elements) {
@@ -100,8 +158,8 @@ void ClFileLogger<DebugLevel>::dumpKernelArgs(const MultiDispatchInfo *multiDisp
     }
 }
 
-template <DebugFunctionalityLevel DebugLevel>
-const std::string ClFileLogger<DebugLevel>::getEvents(const uintptr_t *input, uint32_t numOfEvents) {
+template <DebugFunctionalityLevel debugLevel>
+const std::string ClFileLogger<debugLevel>::getEvents(const uintptr_t *input, uint32_t numOfEvents) {
     if (false == baseLogger.enabled()) {
         return "";
     }
@@ -110,14 +168,14 @@ const std::string ClFileLogger<DebugLevel>::getEvents(const uintptr_t *input, ui
     for (uint32_t i = 0; i < numOfEvents; i++) {
         if (input != nullptr) {
             cl_event event = (reinterpret_cast<const cl_event *>(input))[i];
-            os << "cl_event " << event << ", Event " << (Event *)event << ", ";
+            os << "cl_event " << event << ", Event " << static_cast<Event *>(event) << ", ";
         }
     }
     return os.str();
 }
 
-template <DebugFunctionalityLevel DebugLevel>
-const std::string ClFileLogger<DebugLevel>::getMemObjects(const uintptr_t *input, uint32_t numOfObjects) {
+template <DebugFunctionalityLevel debugLevel>
+const std::string ClFileLogger<debugLevel>::getMemObjects(const uintptr_t *input, uint32_t numOfObjects) {
     if (false == baseLogger.enabled()) {
         return "";
     }
@@ -131,7 +189,7 @@ const std::string ClFileLogger<DebugLevel>::getMemObjects(const uintptr_t *input
     }
     return os.str();
 }
-template class ClFileLogger<DebugFunctionalityLevel::None>;
-template class ClFileLogger<DebugFunctionalityLevel::RegKeys>;
-template class ClFileLogger<DebugFunctionalityLevel::Full>;
+template class ClFileLogger<DebugFunctionalityLevel::none>;
+template class ClFileLogger<DebugFunctionalityLevel::regKeys>;
+template class ClFileLogger<DebugFunctionalityLevel::full>;
 } // namespace NEO

@@ -1,31 +1,34 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/os_interface/os_library.h"
 
-#include "level_zero/sysman/source/linux/nl_api/sysman_nl_api.h"
+#include "level_zero/sysman/source/shared/linux/nl_api/sysman_nl_api.h"
 
-#include "gmock/gmock.h"
+#include <map>
 
 // Define opaque types so variables can be allocated
-struct nl_sock {
-};
+struct nl_sock {};
 
-struct nl_msg {
-};
+struct nl_msg {};
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 class MockNlDll : public NEO::OsLibrary {
   public:
     bool isLoaded() override { return false; }
     void *getProcAddress(const std::string &procName) override;
+    std::string getFullPath() override {
+        return std::string();
+    }
 
     void deleteEntryPoint(const std::string &procName);
 
@@ -38,6 +41,7 @@ class MockNlDll : public NEO::OsLibrary {
     static struct nlattr mockNextNlattr;
     static struct genl_ops mockGenlOps;
     static nl_recvmsg_msg_cb_t mockCb;
+    static const std::string mockStr;
 
     constexpr static int mockFamilyId = 0x2020;
     constexpr static char mockFamilyName[] = "TestName";
@@ -59,10 +63,14 @@ class MockNlDll : public NEO::OsLibrary {
     constexpr static int mockRemainAfter = 16;
     constexpr static enum nl_cb_type mockCbType = NL_CB_VALID;
     constexpr static enum nl_cb_kind mockCbKind = NL_CB_CUSTOM;
+    constexpr static int mockGroupId = 100;
+    constexpr static int mockFd = 42;
+    constexpr static char mockGroupName[] = "error-notify";
 
   private:
     std::map<std::string, void *> funcMap;
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

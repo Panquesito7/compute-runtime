@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
+#include "shared/source/os_interface/windows/hw_device_id.h"
 #include "shared/source/os_interface/windows/os_context_win.h"
 #include "shared/source/os_interface/windows/wddm/um_km_data_temp_storage.h"
 #include "shared/source/os_interface/windows/wddm/um_km_data_translator.h"
@@ -41,14 +42,24 @@ void WddmInterface::destroyMonitorFence(D3DKMT_HANDLE fenceHandle) {
     DEBUG_BREAK_IF(STATUS_SUCCESS != status);
 }
 
+bool WddmInterface::waitForSyncObjectsFromGpu(OsContextWin &osContext, uint32_t objectCount, const D3DKMT_HANDLE *objectHandles, const uint64_t *fenceValues) {
+    D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU waitFromGpu = {};
+    waitFromGpu.hContext = osContext.getWddmContextHandle();
+    waitFromGpu.ObjectCount = objectCount;
+    waitFromGpu.ObjectHandleArray = objectHandles;
+    waitFromGpu.MonitoredFenceValueArray = fenceValues;
+
+    auto status = wddm.getGdi()->waitForSynchronizationObjectFromGpu(&waitFromGpu);
+    return status == STATUS_SUCCESS;
+}
+
 bool WddmInterface20::createHwQueue(OsContextWin &osContext) {
     return false;
 }
 void WddmInterface20::destroyHwQueue(D3DKMT_HANDLE hwQueue) {}
 
 bool WddmInterface20::createMonitoredFence(OsContextWin &osContext) {
-    auto &residencyController = osContext.getResidencyController();
-    MonitoredFence &monitorFence = residencyController.getMonitoredFence();
+    MonitoredFence &monitorFence = osContext.getMonitoredFence();
     bool ret = WddmInterface::createMonitoredFence(monitorFence);
 
     monitorFence.currentFenceValue = 1;
@@ -72,7 +83,7 @@ bool WddmInterface20::submit(uint64_t commandBuffer, size_t size, void *commandH
     submitCommand.CommandLength = static_cast<UINT>(size);
     submitCommand.BroadcastContextCount = 1;
     submitCommand.BroadcastContext[0] = submitArguments.contextHandle;
-    submitCommand.Flags.NullRendering = (UINT)DebugManager.flags.EnableNullHardware.get();
+    submitCommand.Flags.NullRendering = (UINT)debugManager.flags.EnableNullHardware.get();
 
     COMMAND_BUFFER_HEADER *pHeader = reinterpret_cast<COMMAND_BUFFER_HEADER *>(commandHeader);
 
@@ -97,11 +108,33 @@ bool WddmInterface20::submit(uint64_t commandBuffer, size_t size, void *commandH
     return STATUS_SUCCESS == status;
 }
 
+bool NEO::WddmInterface20::createFenceForDirectSubmission(MonitoredFence &monitorFence, OsContextWin &osContext) {
+    auto ret = WddmInterface::createMonitoredFence(monitorFence);
+    monitorFence.currentFenceValue = 1;
+    return ret;
+}
+
 bool WddmInterface23::createHwQueue(OsContextWin &osContext) {
     D3DKMT_CREATEHWQUEUE createHwQueue = {};
+    CREATEHWQUEUE_PVTDATA hwQueuePrivateData = {};
+    UmKmDataTempStorage<CREATEHWQUEUE_PVTDATA> internalRepresentation;
 
     if (!wddm.getGdi()->setupHwQueueProcAddresses()) {
         return false;
+    }
+
+    if (osContext.isPartOfContextGroup()) {
+        hwQueuePrivateData = initHwQueuePrivateData(osContext);
+        auto umKmDataTranslator = wddm.getHwDeviceId()->getUmKmDataTranslator();
+        if (umKmDataTranslator->enabled()) {
+            internalRepresentation.resize(umKmDataTranslator->getSizeForCreateHwQueueDataInternalRepresentation());
+            umKmDataTranslator->translateCreateHwQueueDataToInternalRepresentation(internalRepresentation.data(), internalRepresentation.size(), hwQueuePrivateData);
+            createHwQueue.pPrivateDriverData = internalRepresentation.data();
+            createHwQueue.PrivateDriverDataSize = static_cast<uint32_t>(internalRepresentation.size());
+        } else {
+            createHwQueue.pPrivateDriverData = &hwQueuePrivateData;
+            createHwQueue.PrivateDriverDataSize = sizeof(hwQueuePrivateData);
+        }
     }
 
     createHwQueue.hHwContext = osContext.getWddmContextHandle();
@@ -118,11 +151,10 @@ bool WddmInterface23::createHwQueue(OsContextWin &osContext) {
 }
 
 bool WddmInterface23::createMonitoredFence(OsContextWin &osContext) {
-    auto &residencyController = osContext.getResidencyController();
     auto hwQueue = osContext.getHwQueue();
-    residencyController.resetMonitoredFenceParams(hwQueue.progressFenceHandle,
-                                                  reinterpret_cast<uint64_t *>(hwQueue.progressFenceCpuVA),
-                                                  hwQueue.progressFenceGpuVA);
+    osContext.resetMonitoredFenceParams(hwQueue.progressFenceHandle,
+                                        reinterpret_cast<uint64_t *>(hwQueue.progressFenceCpuVA),
+                                        hwQueue.progressFenceGpuVA);
     return true;
 }
 
@@ -150,14 +182,60 @@ bool WddmInterface23::submit(uint64_t commandBuffer, size_t size, void *commandH
     submitCommand.CommandBuffer = commandBuffer;
     submitCommand.CommandLength = static_cast<UINT>(size);
 
-    submitCommand.pPrivateDriverData = commandHeader;
-    submitCommand.PrivateDriverDataSize = sizeof(COMMAND_BUFFER_HEADER);
+    COMMAND_BUFFER_HEADER *pHeader = reinterpret_cast<COMMAND_BUFFER_HEADER *>(commandHeader);
+    UmKmDataTempStorage<COMMAND_BUFFER_HEADER> internalRepresentation;
+    if (wddm.getHwDeviceId()->getUmKmDataTranslator()->enabled()) {
+        internalRepresentation.resize(wddm.getHwDeviceId()->getUmKmDataTranslator()->getSizeForCommandBufferHeaderDataInternalRepresentation());
+        bool translated = wddm.getHwDeviceId()->getUmKmDataTranslator()->translateCommandBufferHeaderDataToInternalRepresentation(internalRepresentation.data(), internalRepresentation.size(), *pHeader);
+        UNRECOVERABLE_IF(false == translated);
+        submitCommand.pPrivateDriverData = internalRepresentation.data();
+        submitCommand.PrivateDriverDataSize = static_cast<uint32_t>(internalRepresentation.size());
+    } else {
+        submitCommand.pPrivateDriverData = pHeader;
+        submitCommand.PrivateDriverDataSize = sizeof(COMMAND_BUFFER_HEADER);
+    }
 
-    if (!DebugManager.flags.UseCommandBufferHeaderSizeForWddmQueueSubmission.get()) {
+    if (!debugManager.flags.UseCommandBufferHeaderSizeForWddmQueueSubmission.get()) {
         submitCommand.PrivateDriverDataSize = MemoryConstants::pageSize;
     }
 
     auto status = wddm.getGdi()->submitCommandToHwQueue(&submitCommand);
-    UNRECOVERABLE_IF(status != STATUS_SUCCESS);
     return status == STATUS_SUCCESS;
+}
+
+bool WddmInterface23::waitForSyncObjectsFromGpu(OsContextWin &osContext, uint32_t objectCount, const D3DKMT_HANDLE *objectHandles, const uint64_t *fenceValues) {
+    D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE waitForSyncObjects = {};
+    waitForSyncObjects.hHwQueue = osContext.getHwQueue().handle;
+    waitForSyncObjects.ObjectCount = objectCount;
+    waitForSyncObjects.ObjectHandleArray = objectHandles;
+    waitForSyncObjects.FenceValueArray = fenceValues;
+
+    auto status = wddm.getGdi()->submitWaitForSyncObjectsToHwQueue(&waitForSyncObjects);
+    return status == STATUS_SUCCESS;
+}
+
+bool NEO::WddmInterface23::createFenceForDirectSubmission(MonitoredFence &monitorFence, OsContextWin &osContext) {
+    MonitoredFence monitorFenceForResidency{};
+    auto ret = createSyncObject(monitorFenceForResidency);
+    auto lastSubmittedFence = osContext.getMonitoredFence().lastSubmittedFence;
+    auto currentFenceValue = osContext.getMonitoredFence().currentFenceValue;
+    osContext.resetMonitoredFenceParams(monitorFenceForResidency.fenceHandle,
+                                        const_cast<uint64_t *>(monitorFenceForResidency.cpuAddress),
+                                        monitorFenceForResidency.gpuAddress);
+    osContext.getMonitoredFence().currentFenceValue = currentFenceValue;
+    osContext.getMonitoredFence().lastSubmittedFence = lastSubmittedFence;
+
+    auto hwQueue = osContext.getHwQueue();
+    monitorFence.cpuAddress = reinterpret_cast<uint64_t *>(hwQueue.progressFenceCpuVA);
+    monitorFence.currentFenceValue = currentFenceValue;
+    monitorFence.lastSubmittedFence = lastSubmittedFence;
+    monitorFence.gpuAddress = hwQueue.progressFenceGpuVA;
+    monitorFence.fenceHandle = hwQueue.progressFenceHandle;
+
+    return ret;
+}
+
+bool WddmInterface23::createSyncObject(MonitoredFence &monitorFence) {
+    auto ret = WddmInterface::createMonitoredFence(monitorFence);
+    return ret;
 }

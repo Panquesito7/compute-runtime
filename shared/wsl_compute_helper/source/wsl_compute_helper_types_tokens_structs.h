@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -347,39 +347,6 @@ struct TOKSTR_GT_SQIDI_INFO {
 static_assert(std::is_standard_layout_v<TOKSTR_GT_SQIDI_INFO>, "");
 static_assert(sizeof(TOKSTR_GT_SQIDI_INFO) % sizeof(uint32_t) == 0, "");
 
-struct TOKSTR__GT_CACHE_TYPES {
-    TokenVariableLength base;
-
-    TOKSTR__GT_CACHE_TYPES(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR__GT_CACHE_TYPES, CacheTypeMask) + sizeof(CacheTypeMask) - offsetof(TOKSTR__GT_CACHE_TYPES, L3), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-    TOKSTR__GT_CACHE_TYPES()
-        : base(TOK_S_GT_CACHE_TYPES, 0, sizeof(*this) - sizeof(base)) {}
-
-    struct TOKSTR_ANONYMOUS9544 {
-        TokenVariableLength base;
-
-        TOKSTR_ANONYMOUS9544(uint16_t tokenId, uint32_t elementId = 0)
-            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS9544, eDRAM) + sizeof(eDRAM) - offsetof(TOKSTR_ANONYMOUS9544, L3), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-        TOKSTR_ANONYMOUS9544()
-            : base(TOK_S_GT_CACHE_TYPES__ANONYMOUS9544, 0, sizeof(*this) - sizeof(base)) {}
-
-        TokenDword L3 = {TOK_FBD_GT_CACHE_TYPES__ANONYMOUS9544__L3};
-        TokenDword LLC = {TOK_FBD_GT_CACHE_TYPES__ANONYMOUS9544__LLC};
-        TokenDword eDRAM = {TOK_FBD_GT_CACHE_TYPES__ANONYMOUS9544__E_DRAM};
-    };
-    static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS9544>, "");
-    static_assert(sizeof(TOKSTR_ANONYMOUS9544) % sizeof(uint32_t) == 0, "");
-
-    TokenDword L3 = {TOK_FBD_GT_CACHE_TYPES__ANONYMOUS9544__L3};        // Indirect field from anonymous struct
-    TokenDword LLC = {TOK_FBD_GT_CACHE_TYPES__ANONYMOUS9544__LLC};      // Indirect field from anonymous struct
-    TokenDword eDRAM = {TOK_FBD_GT_CACHE_TYPES__ANONYMOUS9544__E_DRAM}; // Indirect field from anonymous struct
-    TokenDword CacheTypeMask = {TOK_FBD_GT_CACHE_TYPES__CACHE_TYPE_MASK};
-};
-static_assert(std::is_standard_layout_v<TOKSTR__GT_CACHE_TYPES>, "");
-static_assert(sizeof(TOKSTR__GT_CACHE_TYPES) % sizeof(uint32_t) == 0, "");
-
 struct TOKSTR_GT_SYSTEM_INFO {
     TokenVariableLength base;
 
@@ -422,7 +389,6 @@ struct TOKSTR_GT_SYSTEM_INFO {
     TOKSTR_GT_VDBOX_INFO VDBoxInfo = {TOK_FS_GT_SYSTEM_INFO__VDBOX_INFO};
     TOKSTR_GT_VEBOX_INFO VEBoxInfo = {TOK_FS_GT_SYSTEM_INFO__VEBOX_INFO};
     TokenDword NumThreadsPerEu = {TOK_FBD_GT_SYSTEM_INFO__NUM_THREADS_PER_EU};
-    TOKSTR__GT_CACHE_TYPES CacheTypes = {TOK_FS_GT_SYSTEM_INFO__CACHE_TYPES};
     TokenDword MaxVECS = {TOK_FBD_GT_SYSTEM_INFO__MAX_VECS};
 };
 static_assert(std::is_standard_layout_v<TOKSTR_GT_SYSTEM_INFO>, "");
@@ -432,7 +398,7 @@ struct TOKSTR__SKU_FEATURE_TABLE {
     TokenVariableLength base;
 
     TOKSTR__SKU_FEATURE_TABLE(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR__SKU_FEATURE_TABLE, FtrAssignedGpuTile) + sizeof(FtrAssignedGpuTile) - offsetof(TOKSTR__SKU_FEATURE_TABLE, FtrULT), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
+        : base(tokenId, elementId, offsetof(TOKSTR__SKU_FEATURE_TABLE, FtrHwSemaphore64) + sizeof(FtrHwSemaphore64) - offsetof(TOKSTR__SKU_FEATURE_TABLE, FtrBlitterRing), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
 
     TOKSTR__SKU_FEATURE_TABLE()
         : base(TOK_S_SKU_FEATURE_TABLE, 0, sizeof(*this) - sizeof(base)) {}
@@ -441,11 +407,12 @@ struct TOKSTR__SKU_FEATURE_TABLE {
         TokenVariableLength base;
 
         TOKSTR_ANONYMOUS3245(uint16_t tokenId, uint32_t elementId = 0)
-            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS3245, FtrCCSMultiInstance) + sizeof(FtrCCSMultiInstance) - offsetof(TOKSTR_ANONYMOUS3245, FtrULT), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
+            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS3245, FtrCCSMultiInstance) + sizeof(FtrCCSMultiInstance) - offsetof(TOKSTR_ANONYMOUS3245, FtrBlitterRing), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
 
         TOKSTR_ANONYMOUS3245()
             : base(TOK_S_SKU_FEATURE_TABLE__ANONYMOUS3245, 0, sizeof(*this) - sizeof(base)) {}
 
+        TokenDword FtrBlitterRing = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_BLITTER_RING};
         TokenDword FtrULT = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_ULT};
         TokenDword FtrLCIA = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_LCIA};
         TokenDword FtrCCSRing = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_CCSRING};
@@ -487,7 +454,7 @@ struct TOKSTR__SKU_FEATURE_TABLE {
         TokenVariableLength base;
 
         TOKSTR_ANONYMOUS21990(uint16_t tokenId, uint32_t elementId = 0)
-            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS21990, FtrDriverFLR) + sizeof(FtrDriverFLR) - offsetof(TOKSTR_ANONYMOUS21990, FtrGpGpuMidBatchPreempt), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
+            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS21990, FtrHwScheduling) + sizeof(FtrHwScheduling) - offsetof(TOKSTR_ANONYMOUS21990, FtrGpGpuMidBatchPreempt), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
 
         TOKSTR_ANONYMOUS21990()
             : base(TOK_S_SKU_FEATURE_TABLE__ANONYMOUS21990, 0, sizeof(*this) - sizeof(base)) {}
@@ -525,6 +492,7 @@ struct TOKSTR__SKU_FEATURE_TABLE {
         TokenDword FtrKmdDaf = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_KMD_DAF};
         TokenDword FtrFrameBufferLLC = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_FRAME_BUFFER_LLC};
         TokenDword FtrDriverFLR = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_DRIVER_FLR};
+        TokenDword FtrHwScheduling = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_HW_SCHEDULING};
     };
     static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS21990>, "");
     static_assert(sizeof(TOKSTR_ANONYMOUS21990) % sizeof(uint32_t) == 0, "");
@@ -603,6 +571,7 @@ struct TOKSTR__SKU_FEATURE_TABLE {
     static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS91822>, "");
     static_assert(sizeof(TOKSTR_ANONYMOUS91822) % sizeof(uint32_t) == 0, "");
 
+    TokenDword FtrBlitterRing = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_BLITTER_RING};                                        // Indirect field from anonymous struct
     TokenDword FtrULT = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_ULT};                                                         // Indirect field from anonymous struct
     TokenDword FtrLCIA = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_LCIA};                                                       // Indirect field from anonymous struct
     TokenDword FtrCCSRing = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS3245__FTR_CCSRING};                                                 // Indirect field from anonymous struct
@@ -643,6 +612,7 @@ struct TOKSTR__SKU_FEATURE_TABLE {
     TokenDword FtrKmdDaf = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_KMD_DAF};                                                 // Indirect field from anonymous struct
     TokenDword FtrFrameBufferLLC = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_FRAME_BUFFER_LLC};                                // Indirect field from anonymous struct
     TokenDword FtrDriverFLR = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_DRIVER_FLR};                                           // Indirect field from anonymous struct
+    TokenDword FtrHwScheduling = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS21990__FTR_HW_SCHEDULING};                                     // Indirect field from anonymous struct
     TokenDword FtrAstcLdr2D = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS37751__FTR_ASTC_LDR2D};                                           // Indirect field from anonymous struct
     TokenDword FtrAstcHdr2D = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS37751__FTR_ASTC_HDR2D};                                           // Indirect field from anonymous struct
     TokenDword FtrAstc3D = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS37751__FTR_ASTC3D};                                                  // Indirect field from anonymous struct
@@ -653,6 +623,8 @@ struct TOKSTR__SKU_FEATURE_TABLE {
     TokenDword FtrDisplayEngineS3d = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS66219__FTR_DISPLAY_ENGINE_S3D};                            // Indirect field from anonymous struct
     TokenDword FtrVgt = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS89755__FTR_VGT};                                                        // Indirect field from anonymous struct
     TokenDword FtrAssignedGpuTile = {TOK_FBD_SKU_FEATURE_TABLE__ANONYMOUS91822__FTR_ASSIGNED_GPU_TILE};                              // Indirect field from anonymous struct
+    TokenDword FtrEfficient64BitAddressing = {TOK_FBD_SKU_FEATURE_TABLE__FTR_EFFICIENT64_BIT_ADDRESSING};
+    TokenDword FtrHwSemaphore64 = {TOK_FBD_SKU_FEATURE_TABLE__FTR_HW_SEMAPHORE64};
 };
 static_assert(std::is_standard_layout_v<TOKSTR__SKU_FEATURE_TABLE>, "");
 static_assert(sizeof(TOKSTR__SKU_FEATURE_TABLE) % sizeof(uint32_t) == 0, "");
@@ -1008,7 +980,7 @@ struct TOKSTR__CREATECONTEXT_PVTDATA {
     TokenVariableLength base;
 
     TOKSTR__CREATECONTEXT_PVTDATA(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR__CREATECONTEXT_PVTDATA, NoRingFlushes) + sizeof(NoRingFlushes) - offsetof(TOKSTR__CREATECONTEXT_PVTDATA, pHwContextId), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
+        : base(tokenId, elementId, offsetof(TOKSTR__CREATECONTEXT_PVTDATA, NumHwQueues) + sizeof(NumHwQueues) - offsetof(TOKSTR__CREATECONTEXT_PVTDATA, pHwContextId), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
 
     TOKSTR__CREATECONTEXT_PVTDATA()
         : base(TOK_S_CREATECONTEXT_PVTDATA, 0, sizeof(*this) - sizeof(base)) {}
@@ -1035,6 +1007,13 @@ struct TOKSTR__CREATECONTEXT_PVTDATA {
     TokenDword IsMediaUsage = {TOK_FBC_CREATECONTEXT_PVTDATA__IS_MEDIA_USAGE};
     TokenDword GpuVAContext = {TOK_FBC_CREATECONTEXT_PVTDATA__GPU_VACONTEXT};
     TokenDword NoRingFlushes = {TOK_FBC_CREATECONTEXT_PVTDATA__NO_RING_FLUSHES};
+    TokenDword UmdContextType = {TOK_FBD_CREATECONTEXT_PVTDATA__UMD_CONTEXT_TYPE};
+    TokenDword UseHw64bToken = {TOK_FBD_CREATECONTEXT_PVTDATA__USE_HW64B_TOKEN};
+    TokenDword DisableWmtp = {TOK_FBC_CREATECONTEXT_PVTDATA__DISABLE_WMTP};
+    TokenDword NotifyPreemptExceedThreshold = {TOK_FBC_CREATECONTEXT_PVTDATA__NOTIFY_PREEMPT_EXCEED_THRESHOLD};
+    TokenQword hPreemptCpuEventObject = {TOK_FBQ_CREATECONTEXT_PVTDATA__H_PREEMPT_CPU_EVENT_OBJECT};
+    TokenDword DebugSIPInstalled = {TOK_FBC_CREATECONTEXT_PVTDATA__DEBUG_SIPINSTALLED};
+    TokenDword NumHwQueues = {TOK_FBC_CREATECONTEXT_PVTDATA__NUM_HW_QUEUES};
 };
 static_assert(std::is_standard_layout_v<TOKSTR__CREATECONTEXT_PVTDATA>, "");
 static_assert(sizeof(TOKSTR__CREATECONTEXT_PVTDATA) % sizeof(uint32_t) == 0, "");
@@ -1210,7 +1189,7 @@ struct TOKSTR_GMM_RESOURCE_FLAG_REC {
         TokenVariableLength base;
 
         TOKSTR_ANONYMOUS6797(uint16_t tokenId, uint32_t elementId = 0)
-            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS6797, __PreWddm2SVM) + sizeof(__PreWddm2SVM) - offsetof(TOKSTR_ANONYMOUS6797, AllowVirtualPadding), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
+            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS6797, NotCompressed) + sizeof(NotCompressed) - offsetof(TOKSTR_ANONYMOUS6797, AllowVirtualPadding), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
 
         TOKSTR_ANONYMOUS6797()
             : base(TOK_S_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797, 0, sizeof(*this) - sizeof(base)) {}
@@ -1228,7 +1207,6 @@ struct TOKSTR_GMM_RESOURCE_FLAG_REC {
         TokenDword KernelModeMapped = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__KERNEL_MODE_MAPPED};
         TokenDword LayoutBelow = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__LAYOUT_BELOW};
         TokenDword LayoutMono = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__LAYOUT_MONO};
-        TokenDword LayoutRight = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__LAYOUT_RIGHT};
         TokenDword LocalOnly = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__LOCAL_ONLY};
         TokenDword Linear = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__LINEAR};
         TokenDword MediaCompressed = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__MEDIA_COMPRESSED};
@@ -1256,6 +1234,7 @@ struct TOKSTR_GMM_RESOURCE_FLAG_REC {
         TokenDword XAdapter = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__XADAPTER};
         TokenDword __PreallocatedResInfo = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797____PREALLOCATED_RES_INFO};
         TokenDword __PreWddm2SVM = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797____PRE_WDDM2SVM};
+        TokenDword NotCompressed = {TOK_FBD_GMM_RESOURCE_FLAG_REC__ANONYMOUS6797__NOT_COMPRESSED};
     };
     static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS6797>, "");
     static_assert(sizeof(TOKSTR_ANONYMOUS6797) % sizeof(uint32_t) == 0, "");
@@ -1607,143 +1586,16 @@ struct TOKSTR_GmmResourceInfoWinStruct {
 static_assert(std::is_standard_layout_v<TOKSTR_GmmResourceInfoWinStruct>, "");
 static_assert(sizeof(TOKSTR_GmmResourceInfoWinStruct) % sizeof(uint32_t) == 0, "");
 
-struct TOKSTR_GFX_ESCAPE_HEADER {
+struct TOKSTR__CREATEHWQUEUE_PVTDATA {
     TokenVariableLength base;
 
-    TOKSTR_GFX_ESCAPE_HEADER(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR_GFX_ESCAPE_HEADER, uiMinorEscapeCode) + sizeof(uiMinorEscapeCode) - offsetof(TOKSTR_GFX_ESCAPE_HEADER, Size), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
+    TOKSTR__CREATEHWQUEUE_PVTDATA(uint16_t tokenId, uint32_t elementId = 0)
+        : base(tokenId, elementId, offsetof(TOKSTR__CREATEHWQUEUE_PVTDATA, QueuePriority) + sizeof(QueuePriority) - offsetof(TOKSTR__CREATEHWQUEUE_PVTDATA, QueuePriority), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
 
-    TOKSTR_GFX_ESCAPE_HEADER()
-        : base(TOK_S_GFX_ESCAPE_HEADER, 0, sizeof(*this) - sizeof(base)) {}
+    TOKSTR__CREATEHWQUEUE_PVTDATA()
+        : base(TOK_S_CREATEHWQUEUE_PVTDATA, 0, sizeof(*this) - sizeof(base)) {}
 
-    struct TOKSTR_ANONYMOUS4410 {
-        TokenVariableLength base;
-
-        TOKSTR_ANONYMOUS4410(uint16_t tokenId, uint32_t elementId = 0)
-            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS4410, uiMinorEscapeCode) + sizeof(uiMinorEscapeCode) - offsetof(TOKSTR_ANONYMOUS4410, Size), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-        TOKSTR_ANONYMOUS4410()
-            : base(TOK_S_GFX_ESCAPE_HEADER__ANONYMOUS4410, 0, sizeof(*this) - sizeof(base)) {}
-
-        struct TOKSTR_ANONYMOUS4430 {
-            TokenVariableLength base;
-
-            TOKSTR_ANONYMOUS4430(uint16_t tokenId, uint32_t elementId = 0)
-                : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS4430, ulReserved) + sizeof(ulReserved) - offsetof(TOKSTR_ANONYMOUS4430, Size), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-            TOKSTR_ANONYMOUS4430()
-                : base(TOK_S_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430, 0, sizeof(*this) - sizeof(base)) {}
-
-            TokenDword Size = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__SIZE};
-            TokenDword CheckSum = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__CHECK_SUM};
-            TokenDword EscapeCode = {TOK_FE_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__ESCAPE_CODE};
-            TokenDword ulReserved = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__UL_RESERVED};
-        };
-        static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS4430>, "");
-        static_assert(sizeof(TOKSTR_ANONYMOUS4430) % sizeof(uint32_t) == 0, "");
-
-        struct TOKSTR_ANONYMOUS4963 {
-            TokenVariableLength base;
-
-            TOKSTR_ANONYMOUS4963(uint16_t tokenId, uint32_t elementId = 0)
-                : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS4963, uiMinorEscapeCode) + sizeof(uiMinorEscapeCode) - offsetof(TOKSTR_ANONYMOUS4963, ulReserved1), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-            TOKSTR_ANONYMOUS4963()
-                : base(TOK_S_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963, 0, sizeof(*this) - sizeof(base)) {}
-
-            TokenDword ulReserved1 = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UL_RESERVED1};
-            TokenDword usEscapeVersion = {TOK_FBW_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__US_ESCAPE_VERSION};
-            TokenDword usFileVersion = {TOK_FBW_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__US_FILE_VERSION};
-            TokenDword ulMajorEscapeCode = {TOK_FE_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UL_MAJOR_ESCAPE_CODE};
-            TokenDword uiMinorEscapeCode = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UI_MINOR_ESCAPE_CODE};
-        };
-        static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS4963>, "");
-        static_assert(sizeof(TOKSTR_ANONYMOUS4963) % sizeof(uint32_t) == 0, "");
-
-        TokenDword Size = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__SIZE};                              // Indirect field from anonymous struct
-        TokenDword CheckSum = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__CHECK_SUM};                     // Indirect field from anonymous struct
-        TokenDword EscapeCode = {TOK_FE_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__ESCAPE_CODE};                  // Indirect field from anonymous struct
-        TokenDword ulReserved = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__UL_RESERVED};                 // Indirect field from anonymous struct
-        TokenDword ulReserved1 = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UL_RESERVED1};               // Indirect field from anonymous struct
-        TokenDword usEscapeVersion = {TOK_FBW_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__US_ESCAPE_VERSION};      // Indirect field from anonymous struct
-        TokenDword usFileVersion = {TOK_FBW_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__US_FILE_VERSION};          // Indirect field from anonymous struct
-        TokenDword ulMajorEscapeCode = {TOK_FE_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UL_MAJOR_ESCAPE_CODE};  // Indirect field from anonymous struct
-        TokenDword uiMinorEscapeCode = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UI_MINOR_ESCAPE_CODE}; // Indirect field from anonymous struct
-    };
-    static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS4410>, "");
-    static_assert(sizeof(TOKSTR_ANONYMOUS4410) % sizeof(uint32_t) == 0, "");
-
-    TokenDword Size = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__SIZE};                              // Indirect field from anonymous struct
-    TokenDword CheckSum = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__CHECK_SUM};                     // Indirect field from anonymous struct
-    TokenDword EscapeCode = {TOK_FE_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__ESCAPE_CODE};                  // Indirect field from anonymous struct
-    TokenDword ulReserved = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4430__UL_RESERVED};                 // Indirect field from anonymous struct
-    TokenDword ulReserved1 = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UL_RESERVED1};               // Indirect field from anonymous struct
-    TokenDword usEscapeVersion = {TOK_FBW_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__US_ESCAPE_VERSION};      // Indirect field from anonymous struct
-    TokenDword usFileVersion = {TOK_FBW_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__US_FILE_VERSION};          // Indirect field from anonymous struct
-    TokenDword ulMajorEscapeCode = {TOK_FE_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UL_MAJOR_ESCAPE_CODE};  // Indirect field from anonymous struct
-    TokenDword uiMinorEscapeCode = {TOK_FBD_GFX_ESCAPE_HEADER__ANONYMOUS4410__ANONYMOUS4963__UI_MINOR_ESCAPE_CODE}; // Indirect field from anonymous struct
+    TokenDword QueuePriority = {TOK_FBD_CREATEHWQUEUE_PVTDATA__QUEUE_PRIORITY};
 };
-static_assert(std::is_standard_layout_v<TOKSTR_GFX_ESCAPE_HEADER>, "");
-static_assert(sizeof(TOKSTR_GFX_ESCAPE_HEADER) % sizeof(uint32_t) == 0, "");
-
-struct TOKSTR_GTDIBaseInStruct {
-    TokenVariableLength base;
-
-    TOKSTR_GTDIBaseInStruct(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR_GTDIBaseInStruct, Function) + sizeof(Function) - offsetof(TOKSTR_GTDIBaseInStruct, Function), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-    TOKSTR_GTDIBaseInStruct()
-        : base(TOK_S_GTDIBASE_IN_STRUCT, 0, sizeof(*this) - sizeof(base)) {}
-
-    TokenDword Function = {TOK_FE_GTDIBASE_IN_STRUCT__FUNCTION};
-};
-static_assert(std::is_standard_layout_v<TOKSTR_GTDIBaseInStruct>, "");
-static_assert(sizeof(TOKSTR_GTDIBaseInStruct) % sizeof(uint32_t) == 0, "");
-
-struct TOKSTR_GTDIGetGpuCpuTimestampsOutStruct {
-    TokenVariableLength base;
-
-    TOKSTR_GTDIGetGpuCpuTimestampsOutStruct(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR_GTDIGetGpuCpuTimestampsOutStruct, cpuPerfFreq) + sizeof(cpuPerfFreq) - offsetof(TOKSTR_GTDIGetGpuCpuTimestampsOutStruct, RetCode), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-    TOKSTR_GTDIGetGpuCpuTimestampsOutStruct()
-        : base(TOK_S_GTDIGET_GPU_CPU_TIMESTAMPS_OUT_STRUCT, 0, sizeof(*this) - sizeof(base)) {}
-
-    TokenDword RetCode = {TOK_FE_GTDIGET_GPU_CPU_TIMESTAMPS_OUT_STRUCT__RET_CODE};
-    TokenQword gpuPerfTicks = {TOK_FBQ_GTDIGET_GPU_CPU_TIMESTAMPS_OUT_STRUCT__GPU_PERF_TICKS};
-    TokenQword cpuPerfTicks = {TOK_FBQ_GTDIGET_GPU_CPU_TIMESTAMPS_OUT_STRUCT__CPU_PERF_TICKS};
-    TokenQword gpuPerfFreq = {TOK_FBQ_GTDIGET_GPU_CPU_TIMESTAMPS_OUT_STRUCT__GPU_PERF_FREQ};
-    TokenQword cpuPerfFreq = {TOK_FBQ_GTDIGET_GPU_CPU_TIMESTAMPS_OUT_STRUCT__CPU_PERF_FREQ};
-};
-static_assert(std::is_standard_layout_v<TOKSTR_GTDIGetGpuCpuTimestampsOutStruct>, "");
-static_assert(sizeof(TOKSTR_GTDIGetGpuCpuTimestampsOutStruct) % sizeof(uint32_t) == 0, "");
-
-struct TOKSTR_TimeStampDataHeader {
-    TokenVariableLength base;
-
-    TOKSTR_TimeStampDataHeader(uint16_t tokenId, uint32_t elementId = 0)
-        : base(tokenId, elementId, offsetof(TOKSTR_TimeStampDataHeader, m_Data) + sizeof(m_Data) - offsetof(TOKSTR_TimeStampDataHeader, m_Header), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-    TOKSTR_TimeStampDataHeader()
-        : base(TOK_S_TIME_STAMP_DATA_HEADER, 0, sizeof(*this) - sizeof(base)) {}
-
-    struct TOKSTR_ANONYMOUS2466 {
-        TokenVariableLength base;
-
-        TOKSTR_ANONYMOUS2466(uint16_t tokenId, uint32_t elementId = 0)
-            : base(tokenId, elementId, offsetof(TOKSTR_ANONYMOUS2466, m_Out) + sizeof(m_Out) - offsetof(TOKSTR_ANONYMOUS2466, m_In), (sizeof(*this) - sizeof(base)) / sizeof(uint32_t)) {}
-
-        TOKSTR_ANONYMOUS2466()
-            : base(TOK_S_TIME_STAMP_DATA_HEADER__ANONYMOUS2466, 0, sizeof(*this) - sizeof(base)) {}
-
-        TOKSTR_GTDIBaseInStruct m_In = {TOK_FXS_TIME_STAMP_DATA_HEADER__ANONYMOUS2466__M_IN};
-        TOKSTR_GTDIGetGpuCpuTimestampsOutStruct m_Out = {TOK_FS_TIME_STAMP_DATA_HEADER__ANONYMOUS2466__M_OUT};
-    };
-    static_assert(std::is_standard_layout_v<TOKSTR_ANONYMOUS2466>, "");
-    static_assert(sizeof(TOKSTR_ANONYMOUS2466) % sizeof(uint32_t) == 0, "");
-
-    TOKSTR_GFX_ESCAPE_HEADER m_Header = {TOK_FS_TIME_STAMP_DATA_HEADER__M_HEADER};
-    TOKSTR_ANONYMOUS2466 m_Data = {TOK_FS_TIME_STAMP_DATA_HEADER__M_DATA};
-};
-static_assert(std::is_standard_layout_v<TOKSTR_TimeStampDataHeader>, "");
-static_assert(sizeof(TOKSTR_TimeStampDataHeader) % sizeof(uint32_t) == 0, "");
+static_assert(std::is_standard_layout_v<TOKSTR__CREATEHWQUEUE_PVTDATA>, "");
+static_assert(sizeof(TOKSTR__CREATEHWQUEUE_PVTDATA) % sizeof(uint32_t) == 0, "");

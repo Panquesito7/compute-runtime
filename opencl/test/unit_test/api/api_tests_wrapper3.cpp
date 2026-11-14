@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,16 +8,15 @@
 #include "opencl/test/unit_test/api/cl_get_kernel_max_concurrent_work_group_count_intel_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_kernel_suggested_local_work_size_intel_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_kernel_suggested_local_work_size_khr_tests.inl"
+#include "opencl/test/unit_test/api/cl_get_kernel_suggested_local_work_size_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_kernel_work_group_info_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_mem_object_info_tests.inl"
-#include "opencl/test/unit_test/api/cl_get_pipe_info_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_platform_ids_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_platform_info_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_program_build_info_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_program_info_tests.inl"
 #include "opencl/test/unit_test/api/cl_get_supported_image_formats_tests.inl"
 #include "opencl/test/unit_test/api/cl_icd_get_platform_ids_khr_tests.inl"
-#include "opencl/test/unit_test/api/cl_intel_accelerator_tests.inl"
 #include "opencl/test/unit_test/api/cl_intel_tracing_tests.inl"
 #include "opencl/test/unit_test/api/cl_link_program_tests.inl"
 #include "opencl/test/unit_test/api/cl_release_command_queue_tests.inl"
@@ -34,6 +33,7 @@
 #include "opencl/test/unit_test/api/cl_set_context_destructor_callback.inl"
 #include "opencl/test/unit_test/api/cl_set_event_callback_tests.inl"
 #include "opencl/test/unit_test/api/cl_set_kernel_arg_svm_pointer_tests.inl"
+#include "opencl/test/unit_test/api/cl_set_kernel_arg_tests.inl"
 #include "opencl/test/unit_test/api/cl_set_kernel_exec_info_tests.inl"
 #include "opencl/test/unit_test/api/cl_set_mem_object_destructor_callback_tests.inl"
 #include "opencl/test/unit_test/api/cl_set_performance_configuration_tests.inl"

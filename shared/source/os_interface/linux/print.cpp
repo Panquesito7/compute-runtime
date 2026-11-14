@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -23,11 +23,13 @@ void printToStderr(const char *str) {
 
 template <class T>
 size_t simpleSprintf(char *output, size_t outputSize, const char *format, T value) {
-    return snprintf(output, outputSize, format, value);
+    auto retVal = snprintf(output, outputSize, format, value);
+    return retVal < 0 ? 0 : static_cast<size_t>(retVal);
 }
 
 size_t simpleSprintf(char *output, size_t outputSize, const char *format, const char *value) {
-    return snprintf(output, outputSize, format, value);
+    auto retVal = snprintf(output, outputSize, format, value);
+    return retVal < 0 ? 0 : static_cast<size_t>(retVal);
 }
 
 template size_t simpleSprintf<float>(char *output, size_t output_size, const char *format, float value);

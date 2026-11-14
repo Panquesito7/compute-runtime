@@ -1,68 +1,70 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/test_macros/hw_test.h"
+
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_fixture.h"
 #include "level_zero/sysman/test/unit_tests/sources/performance/linux/mock_sysfs_performance_prelim.h"
 
+#include "gtest/gtest.h"
+
+#include <cmath>
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 constexpr uint32_t mockHandleCount = 5;
 constexpr double maxPerformanceFactor = 100;
 constexpr double halfOfMaxPerformanceFactor = 50;
 constexpr double minPerformanceFactor = 0;
-class ZesPerformanceFixture : public SysmanMultiDeviceFixture {
+class ZesPerformanceFixtureI915Prelim : public SysmanMultiDeviceFixture {
   protected:
-    std::unique_ptr<MockPerformanceSysfsAccess> ptestSysfsAccess;
-    L0::Sysman::SysfsAccess *pOriginalSysfsAccess = nullptr;
-    L0::Sysman::SysmanDevice *device = nullptr;
+    std::unique_ptr<MockPerformanceSysfsAccess> pSysfsAccess;
     void SetUp() override {
         SysmanMultiDeviceFixture::SetUp();
-        device = pSysmanDevice;
-        ptestSysfsAccess = std::make_unique<MockPerformanceSysfsAccess>();
-        pOriginalSysfsAccess = pLinuxSysmanImp->pSysfsAccess;
-        pLinuxSysmanImp->pSysfsAccess = ptestSysfsAccess.get();
-        for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
-            delete handle;
-        }
         pSysmanDeviceImp->pPerformanceHandleContext->handleList.clear();
-        getPerfHandles(0);
+        std::unique_ptr<SysmanKmdInterface> pSysmanKmdInterface = std::make_unique<SysmanKmdInterfaceI915Prelim>(pLinuxSysmanImp->getSysmanProductHelper());
+        std::swap(pLinuxSysmanImp->pSysmanKmdInterface, pSysmanKmdInterface);
+        pSysfsAccess = std::make_unique<MockPerformanceSysfsAccess>();
     }
     void TearDown() override {
         SysmanMultiDeviceFixture::TearDown();
-        pLinuxSysmanImp->pSysfsAccess = pOriginalSysfsAccess;
     }
 
     std::vector<zes_perf_handle_t> getPerfHandles(uint32_t count) {
         std::vector<zes_perf_handle_t> handles(count, nullptr);
-        EXPECT_EQ(zesDeviceEnumPerformanceFactorDomains(device->toHandle(), &count, handles.data()), ZE_RESULT_SUCCESS);
+
+        EXPECT_EQ(zesDeviceEnumPerformanceFactorDomains(pSysmanDevice->toHandle(), &count, handles.data()), ZE_RESULT_SUCCESS);
         return handles;
     }
 };
 
-TEST_F(ZesPerformanceFixture, GivenValidSysmanHandleWhenRetrievingPerfThenValidHandlesReturned) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidSysmanHandleWhenRetrievingPerfThenValidHandlesReturned, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     uint32_t count = 0;
-    ze_result_t result = zesDeviceEnumPerformanceFactorDomains(device->toHandle(), &count, NULL);
+    ze_result_t result = zesDeviceEnumPerformanceFactorDomains(pSysmanDevice->toHandle(), &count, NULL);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(count, mockHandleCount);
 
     uint32_t testcount = count + 1;
-    result = zesDeviceEnumPerformanceFactorDomains(device->toHandle(), &testcount, NULL);
+    result = zesDeviceEnumPerformanceFactorDomains(pSysmanDevice->toHandle(), &testcount, NULL);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(testcount, mockHandleCount);
 
     count = 0;
     std::vector<zes_perf_handle_t> handles(count, nullptr);
-    EXPECT_EQ(zesDeviceEnumPerformanceFactorDomains(device->toHandle(), &count, handles.data()), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(zesDeviceEnumPerformanceFactorDomains(pSysmanDevice->toHandle(), &count, handles.data()), ZE_RESULT_SUCCESS);
     EXPECT_EQ(count, mockHandleCount);
 }
 
-TEST_F(ZesPerformanceFixture, GivenInAnyDomainTypeIfcanReadFailsWhenGettingPerfHandlesThenZeroHandlesAreRetrieved) {
-    ptestSysfsAccess->mockCanReadResult = ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+TEST_F(ZesPerformanceFixtureI915Prelim, GivenInAnyDomainTypeIfcanReadFailsWhenGettingPerfHandlesThenZeroHandlesAreRetrieved) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
+    pSysfsAccess->mockCanReadResult = ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
     for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
         delete handle;
     }
@@ -83,8 +85,9 @@ TEST_F(ZesPerformanceFixture, GivenInAnyDomainTypeIfcanReadFailsWhenGettingPerfH
     delete pLinuxPerformanceImp;
 }
 
-TEST_F(ZesPerformanceFixture, GivenInAnyDomainTypeIfSysfsReadForMediaAndComputeScaleFailsWhileGettingPerfHandlesThenZeroHandlesAreRetrieved) {
-    ptestSysfsAccess->mockReadResult = ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+TEST_F(ZesPerformanceFixtureI915Prelim, GivenInAnyDomainTypeIfSysfsReadForMediaAndComputeScaleFailsWhileGettingPerfHandlesThenZeroHandlesAreRetrieved) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
+    pSysfsAccess->mockReadResult = ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
     for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
         delete handle;
     }
@@ -101,12 +104,13 @@ TEST_F(ZesPerformanceFixture, GivenInAnyDomainTypeIfSysfsReadForMediaAndComputeS
     delete pLinuxPerformanceImp;
 }
 
-TEST_F(ZesPerformanceFixture, GivenInAnyDomainTypeIfMediaAndBaseFreqFactorSysfsNodesAreAbsentWhenGettingPerfHandlesThenZeroHandlesAreRetrieved) {
+TEST_F(ZesPerformanceFixtureI915Prelim, GivenInAnyDomainTypeIfMediaAndBaseFreqFactorSysfsNodesAreAbsentWhenGettingPerfHandlesThenZeroHandlesAreRetrieved) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
         delete handle;
     }
     pSysmanDeviceImp->pPerformanceHandleContext->handleList.clear();
-    ptestSysfsAccess->mockReadResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    pSysfsAccess->mockReadResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
     PublicLinuxPerformanceImp *pLinuxPerformanceImp = new PublicLinuxPerformanceImp(pOsSysman, 1, 0u, ZES_ENGINE_TYPE_FLAG_MEDIA);
     EXPECT_FALSE(pLinuxPerformanceImp->isPerformanceSupported());
 
@@ -119,7 +123,8 @@ TEST_F(ZesPerformanceFixture, GivenInAnyDomainTypeIfMediaAndBaseFreqFactorSysfsN
     delete pLinuxPerformanceImp;
 }
 
-TEST_F(ZesPerformanceFixture, GivenIncorrectConditionsWhenGettingPerfHandlesThenZeroHandlesAreRetrieved) {
+TEST_F(ZesPerformanceFixtureI915Prelim, GivenIncorrectConditionsWhenGettingPerfHandlesThenZeroHandlesAreRetrieved) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     // Check perf handle with incorrect domain type
     PublicLinuxPerformanceImp *pLinuxPerformanceImp = new PublicLinuxPerformanceImp(pOsSysman, 1, 0u, ZES_ENGINE_TYPE_FLAG_DMA);
     EXPECT_FALSE(pLinuxPerformanceImp->isPerformanceSupported());
@@ -127,13 +132,14 @@ TEST_F(ZesPerformanceFixture, GivenIncorrectConditionsWhenGettingPerfHandlesThen
     pLinuxPerformanceImp = nullptr;
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandleWhenGettingPerformancePropertiesThenValidPropertiesReturned) {
-
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandleWhenGettingPerformancePropertiesThenValidPropertiesReturned, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
     ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
     uint32_t subdeviceId = 0;
 
     auto handle = getPerfHandles(1u);
+    ASSERT_NE(nullptr, handle[0]);
     zes_perf_properties_t properties = {};
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesPerformanceFactorGetProperties(handle[0], &properties));
     EXPECT_TRUE(onSubdevice);
@@ -141,46 +147,54 @@ TEST_F(ZesPerformanceFixture, GivenValidPerfHandleWhenGettingPerformanceProperti
     EXPECT_EQ(properties.subdeviceId, subdeviceId);
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandleWhenGettingConfigThenSuccessIsReturned) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandleWhenGettingConfigThenSuccessIsReturned, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         double factor = 0;
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesPerformanceFactorGetConfig(handle, &factor));
         EXPECT_EQ(factor, 100);
     }
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandlesWhenInvalidMultiplierValuesAreReturnedBySysfsInterfaceThenUnknownErrorIsReturned) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandlesWhenInvalidMultiplierValuesAreReturnedBySysfsInterfaceThenUnknownErrorIsReturned, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
         delete handle;
     }
     pSysmanDeviceImp->pPerformanceHandleContext->handleList.clear();
-    ptestSysfsAccess->isReturnUnknownFailure = true;
+    pSysfsAccess->isReturnUnknownFailure = true;
     pSysmanDeviceImp->pPerformanceHandleContext->init(pLinuxSysmanImp->getSubDeviceCount());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         double factor = 0;
         EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, zesPerformanceFactorGetConfig(handle, &factor));
     }
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandlesWhenBaseAndMediaFreqFactorNodesAreAbsentThenUnsupportedFeatureIsReturned) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandlesWhenBaseAndMediaFreqFactorNodesAreAbsentThenUnsupportedFeatureIsReturned, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
         delete handle;
     }
     pSysmanDeviceImp->pPerformanceHandleContext->handleList.clear();
-    ptestSysfsAccess->isMediaBaseFailure = true;
+    pSysfsAccess->isMediaBaseFailure = true;
     pSysmanDeviceImp->pPerformanceHandleContext->init(pLinuxSysmanImp->getSubDeviceCount());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         double factor = 0;
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesPerformanceFactorGetConfig(handle, &factor));
     }
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandleWhenSettingConfigThenSuccessIsReturned) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandleWhenSettingConfigThenSuccessIsReturned, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         double setFactor = 0;
         double getFactor;
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesPerformanceFactorSetConfig(handle, setFactor));
@@ -194,9 +208,11 @@ TEST_F(ZesPerformanceFixture, GivenValidPerfHandleWhenSettingConfigThenSuccessIs
     }
 }
 
-HWTEST2_F(ZesPerformanceFixture, GivenValidPerfHandleWhenSettingMediaConfigAndGettingMediaConfigForProductOtherThanPVCThenValidConfigIsReturned, IsNotPVC) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandleWhenSettingMediaConfigAndGettingMediaConfigForProductOtherThanPVCThenValidConfigIsReturned, IsAtMostDg2) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_perf_properties_t properties = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesPerformanceFactorGetProperties(handle, &properties));
         if (properties.engines == ZES_ENGINE_TYPE_FLAG_MEDIA) {
@@ -230,9 +246,11 @@ HWTEST2_F(ZesPerformanceFixture, GivenValidPerfHandleWhenSettingMediaConfigAndGe
     }
 }
 
-HWTEST2_F(ZesPerformanceFixture, GivenValidPerfHandleWhenSettingMediaConfigAndGettingMediaConfigWhenProductFamilyIsPVCThenValidConfigIsReturned, IsPVC) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandleWhenSettingMediaConfigAndGettingMediaConfigWhenProductFamilyIsPVCThenValidConfigIsReturned, IsPVC) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_perf_properties_t properties = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesPerformanceFactorGetProperties(handle, &properties));
         if (properties.engines == ZES_ENGINE_TYPE_FLAG_MEDIA) {
@@ -260,11 +278,12 @@ HWTEST2_F(ZesPerformanceFixture, GivenValidPerfHandleWhenSettingMediaConfigAndGe
     }
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandlesButSysfsReadsFailAtDifferentBrancesWhenSettingPerfConfigThenPerfGetConfigFails) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandlesButSysfsReadsFailAtDifferentBrancesWhenSettingPerfConfigThenPerfGetConfigFails, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     double factor = 0;
 
-    ptestSysfsAccess->isComputeInvalid = true;
+    pSysfsAccess->isComputeInvalid = true;
 
     PublicLinuxPerformanceImp *pLinuxPerformanceImp = new PublicLinuxPerformanceImp(pOsSysman, 1, 0u, ZES_ENGINE_TYPE_FLAG_COMPUTE);
     EXPECT_TRUE(pLinuxPerformanceImp->isPerformanceSupported());
@@ -276,20 +295,23 @@ TEST_F(ZesPerformanceFixture, GivenValidPerfHandlesButSysfsReadsFailAtDifferentB
     delete pLinuxPerformanceImp;
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandleWhenGettingPerfConfigForOtherDomainAndSysfsReadReturnsInvalidValueThenPerfGetConfigFails) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandleWhenGettingPerfConfigForOtherDomainAndSysfsReadReturnsInvalidValueThenPerfGetConfigFails, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     double factor = 0;
 
-    ptestSysfsAccess->returnNegativeFactor = true;
+    pSysfsAccess->returnNegativeFactor = true;
     PublicLinuxPerformanceImp *pLinuxPerformanceImp = new PublicLinuxPerformanceImp(pOsSysman, 0, 0u, ZES_ENGINE_TYPE_FLAG_OTHER);
     EXPECT_TRUE(pLinuxPerformanceImp->isPerformanceSupported());
     EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, pLinuxPerformanceImp->osPerformanceGetConfig(&factor));
     delete pLinuxPerformanceImp;
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidPerfHandlesButSysfsReadsFailAtDifferentBrancesWhenSettingPerfConfigThenPerfSetConfigFails) {
+HWTEST2_F(ZesPerformanceFixtureI915Prelim, GivenValidPerfHandlesButSysfsReadsFailAtDifferentBrancesWhenSettingPerfConfigThenPerfSetConfigFails, IsXeCore) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     auto handles = getPerfHandles(mockHandleCount);
     for (const auto &handle : handles) {
+        ASSERT_NE(nullptr, handle);
         double setFactor = 110;
         EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zesPerformanceFactorSetConfig(handle, setFactor));
 
@@ -304,7 +326,8 @@ TEST_F(ZesPerformanceFixture, GivenValidPerfHandlesButSysfsReadsFailAtDifferentB
     delete pLinuxPerformanceImp;
 }
 
-TEST_F(ZesPerformanceFixture, GivenValidOfjectsOfClassPerformanceImpAndPerformanceHandleContextThenDuringObjectReleaseCheckDestructorBranches) {
+TEST_F(ZesPerformanceFixtureI915Prelim, GivenValidOfjectsOfClassPerformanceImpAndPerformanceHandleContextThenDuringObjectReleaseCheckDestructorBranches) {
+    VariableBackup<L0::Sysman::SysFsAccessInterface *> sysfsBackup(&pLinuxSysmanImp->pSysfsAccess, pSysfsAccess.get());
     for (auto &handle : pSysmanDeviceImp->pPerformanceHandleContext->handleList) {
         auto pPerformanceImp = static_cast<L0::Sysman::PerformanceImp *>(handle);
         delete pPerformanceImp->pOsPerformance;
@@ -315,4 +338,5 @@ TEST_F(ZesPerformanceFixture, GivenValidOfjectsOfClassPerformanceImpAndPerforman
 }
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,8 @@
 
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/resource_info.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/mocks/mock_gmm_resource_info.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
@@ -15,13 +16,15 @@
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
+#include "gtest/gtest.h"
+
 using namespace NEO;
 
 struct ImageTestsTgllAndLater : ClDeviceFixture, testing::Test {
     void SetUp() override {
         ClDeviceFixture::setUp();
         context = std::make_unique<MockContext>(pClDevice);
-        srcImage = std::unique_ptr<Image>(Image3dHelper<>::create(context.get()));
+        srcImage = std::unique_ptr<Image>(Image3dHelperUlt<>::create(context.get()));
     }
 
     void TearDown() override {
@@ -34,17 +37,16 @@ struct ImageTestsTgllAndLater : ClDeviceFixture, testing::Test {
     std::unique_ptr<Image> srcImage{};
 };
 
-using TgllpAndLaterMatcher = IsAtLeastProduct<IGFX_TIGERLAKE_LP>;
-HWTEST2_F(ImageTestsTgllAndLater, givenDepthResourceWhenSettingImageArgThenSetDepthStencilResourceField, TgllpAndLaterMatcher) {
+HWTEST2_F(ImageTestsTgllAndLater, givenDepthResourceWhenSettingImageArgThenSetDepthStencilResourceField, SupportsLegacyRenderSurfaceState) {
     using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
     RENDER_SURFACE_STATE surfaceState{};
-    auto &gpuFlags = srcImage->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getDefaultGmm()->gmmResourceInfo->getResourceFlags()->Gpu;
+    auto &gpuFlags = static_cast<MockGmmResourceInfo *>(srcImage->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getDefaultGmm()->gmmResourceInfo.get())->mockResourceCreateParams.Flags.Gpu;
 
     gpuFlags.Depth = 0;
-    srcImage->setImageArg(&surfaceState, false, 0, pClDevice->getRootDeviceIndex(), false);
+    srcImage->setImageArg(&surfaceState, false, 0, pClDevice->getRootDeviceIndex());
     EXPECT_FALSE(surfaceState.getDepthStencilResource());
 
     gpuFlags.Depth = 1;
-    srcImage->setImageArg(&surfaceState, false, 0, pClDevice->getRootDeviceIndex(), false);
+    srcImage->setImageArg(&surfaceState, false, 0, pClDevice->getRootDeviceIndex());
     EXPECT_TRUE(surfaceState.getDepthStencilResource());
 }

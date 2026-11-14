@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,11 +22,13 @@
 using SKU_FEATURE_TABLE_GMM = SKU_FEATURE_TABLE;
 using WA_TABLE_GMM = WA_TABLE;
 using ADAPTER_INFO_GMM = ADAPTER_INFO;
+using PLATFORM_GMM = PLATFORM;
 
 #if defined(UMD_KMD_COMMAND_BUFFER_REV_ID)
 using SKU_FEATURE_TABLE_KMD = SKU_FEATURE_TABLE_GMM;
 using WA_TABLE_KMD = WA_TABLE_GMM;
 using ADAPTER_INFO_KMD = ADAPTER_INFO_GMM;
+using PLATFORM_KMD = PLATFORM_GMM;
 
 inline void propagateData(ADAPTER_INFO_KMD &) {
 }
@@ -68,6 +70,7 @@ struct SKU_FEATURE_TABLE_KMD : SKU_FEATURE_TABLE_GMM { // NOLINT(readability-ide
 
     bool FtrFbc : 1; // NOLINT(readability-identifier-naming)
 
+    bool FtrBlitterRing : 1;        // NOLINT(readability-identifier-naming)
     bool FtrULT : 1;                // NOLINT(readability-identifier-naming)
     bool FtrLCIA : 1;               // NOLINT(readability-identifier-naming)
     bool FtrTileMappedResource : 1; // NOLINT(readability-identifier-naming)
@@ -92,6 +95,11 @@ struct SKU_FEATURE_TABLE_KMD : SKU_FEATURE_TABLE_GMM { // NOLINT(readability-ide
     bool FtrRcsNode : 1;              // NOLINT(readability-identifier-naming)
     bool FtrLocalMemory : 1;          // NOLINT(readability-identifier-naming)
     bool FtrLocalMemoryAllows4KB : 1; // NOLINT(readability-identifier-naming)
+
+    bool FtrHwScheduling : 1;  // NOLINT(readability-identifier-naming)
+    bool FtrWalkerMTP : 1;     // NOLINT(readability-identifier-naming)
+    bool FtrSelectiveWmtp : 1; // NOLINT(readability-identifier-naming)
+    bool FtrHwSemaphore64 : 1; // NOLINT(readability-identifier-naming)
 };
 
 struct WA_TABLE_KMD : WA_TABLE_GMM { // NOLINT(readability-identifier-naming)
@@ -149,16 +157,42 @@ typedef struct __GMM_GFX_PARTITIONING {
         Heap32[4];            // NOLINT(readability-identifier-naming)
 } GMM_GFX_PARTITIONING;
 
+typedef union UMD_POWER_HINT_REC { // NOLINT(readability-identifier-naming)
+    struct {
+        uint8_t Value : 7;   // NOLINT(readability-identifier-naming)
+        uint8_t IsValid : 1; // NOLINT(readability-identifier-naming)
+    };
+    uint8_t Data; // NOLINT(readability-identifier-naming)
+} UMD_POWER_HINT;
+
 struct CREATECONTEXT_PVTDATA { // NOLINT(readability-identifier-naming)
     unsigned long *pHwContextId;
     uint32_t NumberOfHwContextIds; // NOLINT(readability-identifier-naming)
 
-    uint32_t ProcessID;         // NOLINT(readability-identifier-naming)
-    uint8_t IsProtectedProcess; // NOLINT(readability-identifier-naming)
-    uint8_t IsDwm;              // NOLINT(readability-identifier-naming)
-    uint8_t IsMediaUsage;       // NOLINT(readability-identifier-naming)
-    uint8_t GpuVAContext;       // NOLINT(readability-identifier-naming)
-    BOOLEAN NoRingFlushes;      // NOLINT(readability-identifier-naming)
+    uint32_t ProcessID;                   // NOLINT(readability-identifier-naming)
+    uint8_t IsProtectedProcess;           // NOLINT(readability-identifier-naming)
+    uint8_t IsDwm;                        // NOLINT(readability-identifier-naming)
+    uint8_t IsMediaUsage;                 // NOLINT(readability-identifier-naming)
+    uint8_t GpuVAContext;                 // NOLINT(readability-identifier-naming)
+    BOOLEAN NoRingFlushes;                // NOLINT(readability-identifier-naming)
+    BOOLEAN DummyPageBackingEnabled;      // NOLINT(readability-identifier-naming)
+    uint32_t UmdContextType;              // NOLINT(readability-identifier-naming)
+    UMD_POWER_HINT PowerHint;             // NOLINT(readability-identifier-naming)
+    BOOLEAN DebugSIPInstalled;            // NOLINT(readability-identifier-naming)
+    uint8_t NumHwQueues;                  // NOLINT(readability-identifier-naming)
+    BOOLEAN DisableWmtp;                  // NOLINT(readability-identifier-naming)
+    BOOLEAN NotifyPreemptExceedThreshold; // NOLINT(readability-identifier-naming)
+    uint64_t hPreemptCpuEventObject;      // NOLINT(readability-identifier-naming)
+    uint32_t UseHw64bToken : 1;           // NOLINT(readability-identifier-naming)
+};
+
+struct PLATFORM_KMD : PLATFORM_GMM { // NOLINT(readability-identifier-naming)
+
+    struct HwIpVersion {
+        uint32_t Value; // NOLINT(readability-identifier-naming)
+    };
+
+    HwIpVersion sRenderBlockID;
 };
 
 struct ADAPTER_INFO_KMD : ADAPTER_INFO_GMM { // NOLINT(readability-identifier-naming)
@@ -166,6 +200,9 @@ struct ADAPTER_INFO_KMD : ADAPTER_INFO_GMM { // NOLINT(readability-identifier-na
     WA_TABLE_KMD WaTable;                    // NOLINT(readability-identifier-naming)
     GMM_GFX_PARTITIONING GfxPartition;       // NOLINT(readability-identifier-naming)
     ADAPTER_BDF stAdapterBDF;
+    PLATFORM_KMD GfxPlatform; // NOLINT(readability-identifier-naming)
+    uint64_t LMemBarSize;     // NOLINT(readability-identifier-naming)
+    uint8_t SegmentId[3];     // NOLINT(readability-identifier-naming)
 };
 
 static constexpr COMMAND_BUFFER_HEADER initCommandBufferHeader(uint32_t umdContextType, uint32_t umdPatchList, uint32_t usesResourceStreamer, uint32_t perfTag) {
@@ -187,5 +224,19 @@ inline void propagateData(ADAPTER_INFO_KMD &adapterInfo) {
     ADAPTER_INFO &base = static_cast<ADAPTER_INFO &>(adapterInfo);
     base.SkuTable = adapterInfo.SkuTable;
     base.WaTable = adapterInfo.WaTable;
+    base.GfxPlatform = adapterInfo.GfxPlatform;
 }
+
+enum QUEUE_PRIORITY {               // NOLINT(readability-identifier-naming)
+    XE3P_QUEUE_PRIORITY_LOW = 0,    // NOLINT(readability-identifier-naming)
+    XE3P_QUEUE_PRIORITY_NORMAL = 1, // NOLINT(readability-identifier-naming)
+    XE3P_QUEUE_PRIORITY_HIGH = 2,   // NOLINT(readability-identifier-naming)
+    XE3P_QUEUE_PRIORITY_MAX = 3,    // NOLINT(readability-identifier-naming)
+};
+
+struct CREATEHWQUEUE_PVTDATA // NOLINT(readability-identifier-naming)
+{
+    QUEUE_PRIORITY QueuePriority; // NOLINT(readability-identifier-naming)
+    uint8_t reserved[20];
+};
 #endif

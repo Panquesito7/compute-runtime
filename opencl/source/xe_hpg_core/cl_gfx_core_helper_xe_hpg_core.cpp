@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -24,37 +24,12 @@ static auto gfxCore = IGFX_XE_HPG_CORE;
 #include "opencl/source/helpers/cl_gfx_core_helper_factory_init.inl"
 
 template <>
-bool ClGfxCoreHelperHw<Family>::requiresNonAuxMode(const ArgDescPointer &argAsPtr) const {
-
-    if (CompressionSelector::allowStatelessCompression()) {
-        return false;
-    } else {
-        return !argAsPtr.isPureStateful();
-    }
-}
-
-template <>
-bool ClGfxCoreHelperHw<Family>::requiresAuxResolves(const KernelInfo &kernelInfo) const {
-
-    if (CompressionSelector::allowStatelessCompression()) {
-        return false;
-    } else {
-        return hasStatelessAccessToBuffer(kernelInfo);
-    }
-}
-
-template <>
 std::vector<uint32_t> ClGfxCoreHelperHw<Family>::getSupportedThreadArbitrationPolicies() const {
     return {};
 }
 
 template <>
 bool ClGfxCoreHelperHw<Family>::isSupportedKernelThreadArbitrationPolicy() const { return false; }
-
-template <>
-cl_version ClGfxCoreHelperHw<Family>::getDeviceIpVersion(const HardwareInfo &hwInfo) const {
-    return makeDeviceIpVersion(12, 7, makeDeviceRevision(hwInfo));
-}
 
 static const std::vector<cl_image_format> incompressibleFormats = {
     {CL_LUMINANCE, CL_UNORM_INT8},

@@ -1,24 +1,30 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/device_binary_format/patchtokens_tests.h"
+#include "shared/source/compiler_interface/compiler_options.h"
+#include "shared/source/device_binary_format/elf/elf.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/kernel/kernel_descriptor.h"
+#include "shared/source/program/kernel_info.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_compiler_interface.h"
 #include "shared/test/common/mocks/mock_csr.h"
-#include "shared/test/common/mocks/mock_elf.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_l0_debugger.h"
 #include "shared/test/common/mocks/mock_modules_zebin.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/fixtures/context_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_cl_execution_environment.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
 using namespace NEO;
@@ -30,14 +36,14 @@ struct DebuggerClFixture
     void setUp() {
         hardwareInfo = *NEO::defaultHwInfo.get();
         auto executionEnvironment = MockClDevice::prepareExecutionEnvironment(&hardwareInfo, rootDeviceIndex);
-        executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+        executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
         device = MockDevice::createWithExecutionEnvironment<MockDevice>(&hardwareInfo, executionEnvironment, rootDeviceIndex);
         ASSERT_NE(nullptr, device);
         clExecutionEnvironment = static_cast<MockClExecutionEnvironment *>(device->getExecutionEnvironment());
         clDevice = new MockClDevice{device};
-        ASSERT_NE(nullptr, clDevice);
 
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initDebuggerL0(device);
+        device->getL0Debugger()->initialize();
         this->osContext = device->getDefaultEngine().osContext;
 
         cl_device_id deviceId = clDevice;
@@ -63,6 +69,24 @@ struct DebuggerClFixture
 
 using DebuggerCmdQTest = Test<DebuggerClFixture>;
 
+struct DebuggerCmdQTestWithMockCsr : public DebuggerCmdQTest {
+    void SetUp() override {}
+    void TearDown() override {}
+
+    template <typename FamilyType>
+    void setUpT() {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MockCsr<FamilyType>>();
+
+        DebuggerCmdQTest::SetUp();
+    }
+
+    template <typename FamilyType>
+    void tearDownT() {
+        DebuggerCmdQTest::TearDown();
+    }
+};
+
 HWTEST_F(DebuggerCmdQTest, GivenDebuggingEnabledWhenCommandQueueIsCreatedAndReleasedThenDebuggerL0IsNotified) {
     auto debuggerL0Hw = static_cast<MockDebuggerL0Hw<FamilyType> *>(device->getL0Debugger());
     debuggerL0Hw->commandQueueCreatedCount = 0;
@@ -87,13 +111,29 @@ HWTEST_F(DebuggerCmdQTest, GivenDebuggingEnabledWhenInternalCommandQueueIsCreate
     EXPECT_EQ(0u, debuggerL0Hw->commandQueueDestroyedCount);
 }
 
-using Gen12Plus = IsAtLeastGfxCore<IGFX_GEN12_CORE>;
-HWTEST2_F(DebuggerCmdQTest, GivenDebuggingEnabledWhenEnqueueingKernelThenDebugSurfaceIsResident, Gen12Plus) {
-    int32_t executionStamp = 0;
-    auto mockCSR = new MockCsr<FamilyType>(executionStamp, *device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
-    device->resetCommandStreamReceiver(mockCSR);
+HWTEST_F(DebuggerCmdQTest, GivenDebuggingEnabledAndGpgpuEngineFromContextGroupWhenInitializingGpgpuInternalsThenDebugSurfaceIsAllocatedOnPrimaryCsr) {
+    auto &defaultEngine = device->getDefaultEngine();
+    auto primaryCsr = defaultEngine.commandStreamReceiver;
+    ASSERT_EQ(nullptr, primaryCsr->getDebugSurfaceAllocation());
 
-    MockKernelWithInternals mockKernelWithInternals(*clDevice);
+    MockCommandStreamReceiver secondaryCsr(*device->getExecutionEnvironment(), rootDeviceIndex, device->getDeviceBitfield());
+    secondaryCsr.setupContext(*defaultEngine.osContext);
+    secondaryCsr.setPrimaryCsr(primaryCsr);
+    EngineControl secondaryEngine{&secondaryCsr, defaultEngine.osContext};
+
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, clDevice, nullptr);
+    mockCmdQ->gpgpuEngine = &secondaryEngine;
+    mockCmdQ->initializeGpgpuInternals();
+
+    EXPECT_NE(nullptr, primaryCsr->getDebugSurfaceAllocation());
+    EXPECT_EQ(primaryCsr->getDebugSurfaceAllocation(), secondaryCsr.getDebugSurfaceAllocation());
+    mockCmdQ->gpgpuEngine = nullptr;
+}
+
+HWTEST_TEMPLATED_F(DebuggerCmdQTestWithMockCsr, GivenDebuggingEnabledWhenEnqueueingKernelThenDebugSurfaceIsResident) {
+    auto mockCSR = static_cast<MockCsr<FamilyType> *>(&device->getUltCommandStreamReceiver<FamilyType>());
+
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -139,7 +179,7 @@ struct DebuggerZebinProgramTest : public Test<DebuggerClFixture> {
         delete program->getKernelInfoArray(rootDeviceIndex)[0]->kernelAllocation;
         delete program->getKernelInfoArray(rootDeviceIndex)[0];
         program->getKernelInfoArray(rootDeviceIndex).clear();
-        delete program->getGlobalSurface(rootDeviceIndex);
+        delete program->getGlobalSurfaceGA(rootDeviceIndex);
         program->setGlobalSurface(nullptr);
         delete program;
         program = nullptr;
@@ -172,19 +212,14 @@ HWTEST_F(DebuggerZebinProgramTest, GivenDebuggingEnabledWhenProgramNotifiesModul
     releaseProgram(program);
 }
 
-HWTEST_F(DebuggerZebinProgramTest, GivenDebuggingEnabledAndNonZebinWhenProgramNotifiesModuleCreationThenDebuggerL0IsNotNotified) {
+HWTEST_F(DebuggerZebinProgramTest, GivenDebuggingEnabledAndNoDeviceBinaryWhenProgramNotifiesModuleCreationThenDebuggerL0IsNotNotified) {
     auto debuggerL0Hw = static_cast<MockDebuggerL0Hw<FamilyType> *>(device->getL0Debugger());
     debuggerL0Hw->elfHandleToReturn = 5;
     debuggerL0Hw->moduleHandleToReturn = 6;
 
     auto program = createProgram();
-
-    PatchTokensTestData::ValidEmptyProgram programTokens;
-
-    program->buildInfos[rootDeviceIndex].unpackedDeviceBinarySize = programTokens.storage.size();
-    program->buildInfos[rootDeviceIndex].unpackedDeviceBinary.reset(new char[programTokens.storage.size()]);
-    memcpy_s(program->buildInfos[rootDeviceIndex].unpackedDeviceBinary.get(), program->buildInfos[rootDeviceIndex].unpackedDeviceBinarySize,
-             programTokens.storage.data(), programTokens.storage.size());
+    program->buildInfos[rootDeviceIndex].unpackedDeviceBinary.reset();
+    program->buildInfos[rootDeviceIndex].unpackedDeviceBinarySize = 0u;
 
     program->notifyModuleCreate();
 
@@ -221,8 +256,14 @@ HWTEST_F(DebuggerZebinProgramTest, GivenProgramWhenBuildingThenNotifyModuleCreat
     auto mockCompilerInterface = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->compilerInterface.reset(mockCompilerInterface);
 
-    auto zebin = ZebinTestData::ValidEmptyProgram<>();
+    auto zebin = ZebinTestData::ValidEmptyProgram<is32bit ? NEO::Elf::EI_CLASS_32 : NEO::Elf::EI_CLASS_64>();
     auto program = new MockProgram(toClDeviceVector(*clDevice));
+
+    auto copyHwInfo = device->getHardwareInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
+
+    zebin.elfHeader->machine = copyHwInfo.platform.eProductFamily;
 
     mockCompilerInterface->output.intermediateRepresentation.size = zebin.storage.size();
     mockCompilerInterface->output.intermediateRepresentation.mem.reset(new char[zebin.storage.size()]);
@@ -230,11 +271,11 @@ HWTEST_F(DebuggerZebinProgramTest, GivenProgramWhenBuildingThenNotifyModuleCreat
     memcpy_s(mockCompilerInterface->output.intermediateRepresentation.mem.get(), mockCompilerInterface->output.intermediateRepresentation.size,
              zebin.storage.data(), zebin.storage.size());
 
-    program->createdFrom = Program::CreatedFrom::BINARY;
+    program->createdFrom = Program::CreatedFrom::binary;
     program->irBinary = std::make_unique<char[]>(16);
     program->irBinarySize = 16;
 
-    cl_int retVal = program->build(program->getDevices(), nullptr);
+    cl_int retVal = program->build(program->getDevices(), CompilerOptions::kernelOptions.c_str());
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(1u, debuggerL0Hw->notifyModuleCreateCount);
 
@@ -247,8 +288,14 @@ HWTEST_F(DebuggerZebinProgramTest, GivenProgramWhenLinkingThenNotifyModuleCreate
     auto mockCompilerInterface = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->compilerInterface.reset(mockCompilerInterface);
 
-    auto zebin = ZebinTestData::ValidEmptyProgram<>();
+    auto zebin = ZebinTestData::ValidEmptyProgram<is32bit ? NEO::Elf::EI_CLASS_32 : NEO::Elf::EI_CLASS_64>();
     auto program = new MockProgram(toClDeviceVector(*clDevice));
+
+    auto copyHwInfo = device->getHardwareInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
+
+    zebin.elfHeader->machine = copyHwInfo.platform.eProductFamily;
 
     mockCompilerInterface->output.intermediateRepresentation.size = zebin.storage.size();
     mockCompilerInterface->output.intermediateRepresentation.mem.reset(new char[zebin.storage.size()]);
@@ -256,7 +303,7 @@ HWTEST_F(DebuggerZebinProgramTest, GivenProgramWhenLinkingThenNotifyModuleCreate
     memcpy_s(mockCompilerInterface->output.intermediateRepresentation.mem.get(), mockCompilerInterface->output.intermediateRepresentation.size,
              zebin.storage.data(), zebin.storage.size());
 
-    program->createdFrom = Program::CreatedFrom::BINARY;
+    program->createdFrom = Program::CreatedFrom::binary;
     program->irBinary = std::make_unique<char[]>(16);
     program->irBinarySize = 16;
 

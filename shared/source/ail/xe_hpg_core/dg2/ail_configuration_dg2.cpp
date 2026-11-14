@@ -1,15 +1,18 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "ail_configuration_dg2.inl"
 
 #include "shared/source/ail/ail_configuration_base.inl"
 #include "shared/source/helpers/hw_info.h"
 
 #include <algorithm>
 #include <map>
+#include <vector>
 
 namespace NEO {
 
@@ -30,6 +33,9 @@ const std::vector<ApplicationKernelFixDg2> applicationsKernelFixesDG2 =
     {{"FAHBench-gui", "findBlocksWithInteractions", 0xa39732fc26656899, 12651u, "else { SYNC_WARPS; }"},
      {"FAHBench-cmd", "findBlocksWithInteractions", 0xa39732fc26656899, 12651u, "else { SYNC_WARPS; }"}};
 
+constexpr std::array<std::string_view, 3> applicationsLegacyValidationPathDg2 = {
+    "blender", "bforartists", "cycles"};
+
 template <>
 void AILConfigurationHw<IGFX_DG2>::modifyKernelIfRequired(std::string &kernelsSources) {
 
@@ -43,6 +49,28 @@ void AILConfigurationHw<IGFX_DG2>::modifyKernelIfRequired(std::string &kernelsSo
             kernelsSources.insert(it->fixStartPosition, it->fixCode);
         }
     }
+}
+
+template <>
+bool AILConfigurationHw<IGFX_DG2>::useLegacyValidationLogic() {
+    auto it = std::find_if(applicationsLegacyValidationPathDg2.begin(), applicationsLegacyValidationPathDg2.end(), [this](const auto &appName) {
+        return this->processName == appName;
+    });
+    return it != applicationsLegacyValidationPathDg2.end() ? true : false;
+}
+
+template <>
+inline void AILConfigurationHw<IGFX_DG2>::applyExt(HardwareInfo &hwInfo) {
+    auto search = applicationsForceRcsDg2.find(processName);
+    if (search != applicationsForceRcsDg2.end()) {
+        shouldForceRcs = true;
+    }
+}
+
+template <>
+bool AILConfigurationHw<IGFX_DG2>::isBufferPoolEnabled() {
+    auto iterator = applicationsBufferPoolDisabledXe.find(processName);
+    return iterator == applicationsBufferPoolDisabledXe.end();
 }
 
 template class AILConfigurationHw<IGFX_DG2>;

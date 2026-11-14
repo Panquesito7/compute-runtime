@@ -1,19 +1,21 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/memory_manager/allocation_properties.h"
-#include "shared/source/memory_manager/internal_allocation_storage.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/utilities/arrayref.h"
-#include "shared/test/common/mocks/mock_csr.h"
 #include "shared/test/common/mocks/mock_device.h"
 
 #include "opencl/source/event/event_builder.h"
 #include "opencl/source/event/user_event.h"
 #include "opencl/source/helpers/task_information.h"
+#include "opencl/source/program/printf_handler.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
@@ -23,6 +25,8 @@
 #include "gtest/gtest.h"
 
 namespace NEO {
+class CommandQueue;
+class Kernel;
 
 struct SmallEventBuilderEventMock : MockEvent<Event> {
     SmallEventBuilderEventMock(CommandQueue *commandQueue, int param1, float param2)
@@ -86,13 +90,13 @@ TEST(EventBuilder, givenVirtualEventWithCommandThenFinalizeAddChild) {
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
     MockContext context(device.get());
     MockCommandQueue cmdQ(&context, device.get(), nullptr, false);
-    MockKernelWithInternals kernel(*device);
+    MockKernelWithInternals kernel(context);
 
     IndirectHeap *ih1 = nullptr, *ih2 = nullptr, *ih3 = nullptr;
-    cmdQ.allocateHeapMemory(IndirectHeap::Type::DYNAMIC_STATE, 1, ih1);
-    cmdQ.allocateHeapMemory(IndirectHeap::Type::INDIRECT_OBJECT, 1, ih2);
-    cmdQ.allocateHeapMemory(IndirectHeap::Type::SURFACE_STATE, 1, ih3);
-    auto cmdStream = new LinearStream(device->getMemoryManager()->allocateGraphicsMemoryWithProperties({device->getRootDeviceIndex(), 1, AllocationType::COMMAND_BUFFER, device->getDeviceBitfield()}));
+    cmdQ.allocateHeapMemory(IndirectHeap::Type::dynamicState, 1, ih1);
+    cmdQ.allocateHeapMemory(IndirectHeap::Type::indirectObject, 1, ih2);
+    cmdQ.allocateHeapMemory(IndirectHeap::Type::surfaceState, 1, ih3);
+    auto cmdStream = new LinearStream(device->getMemoryManager()->allocateGraphicsMemoryWithProperties({device->getRootDeviceIndex(), 1, AllocationType::commandBuffer, device->getDeviceBitfield()}));
 
     std::vector<Surface *> surfaces;
     auto kernelOperation = std::make_unique<KernelOperation>(cmdStream, *device->getDefaultEngine().commandStreamReceiver->getInternalAllocationStorage());
@@ -136,13 +140,13 @@ TEST(EventBuilder, givenVirtualEventWithSubmittedCommandAsParentThenFinalizeNotA
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
     MockContext context(device.get());
     MockCommandQueue cmdQ(&context, device.get(), nullptr, false);
-    MockKernelWithInternals kernel(*device);
+    MockKernelWithInternals kernel(context);
 
     IndirectHeap *ih1 = nullptr, *ih2 = nullptr, *ih3 = nullptr;
-    cmdQ.allocateHeapMemory(IndirectHeap::Type::DYNAMIC_STATE, 1, ih1);
-    cmdQ.allocateHeapMemory(IndirectHeap::Type::INDIRECT_OBJECT, 1, ih2);
-    cmdQ.allocateHeapMemory(IndirectHeap::Type::SURFACE_STATE, 1, ih3);
-    auto cmdStream = new LinearStream(device->getMemoryManager()->allocateGraphicsMemoryWithProperties({device->getRootDeviceIndex(), 4096, AllocationType::COMMAND_BUFFER, device->getDeviceBitfield()}));
+    cmdQ.allocateHeapMemory(IndirectHeap::Type::dynamicState, 1, ih1);
+    cmdQ.allocateHeapMemory(IndirectHeap::Type::indirectObject, 1, ih2);
+    cmdQ.allocateHeapMemory(IndirectHeap::Type::surfaceState, 1, ih3);
+    auto cmdStream = new LinearStream(device->getMemoryManager()->allocateGraphicsMemoryWithProperties({device->getRootDeviceIndex(), 4096, AllocationType::commandBuffer, device->getDeviceBitfield()}));
 
     std::vector<Surface *> surfaces;
     auto kernelOperation = std::make_unique<KernelOperation>(cmdStream, *device->getDefaultEngine().commandStreamReceiver->getInternalAllocationStorage());
@@ -154,7 +158,7 @@ TEST(EventBuilder, givenVirtualEventWithSubmittedCommandAsParentThenFinalizeNotA
     virtualEvent.eventWithoutCommand = false;
     virtualEvent.submittedCmd.exchange(command.release());
 
-    EventBuilder eventBuilder;
+    EventBuilder eventBuilder; // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks), NEO-14033
     EXPECT_EQ(nullptr, eventBuilder.getEvent());
 
     constexpr int constrParam1 = 7;

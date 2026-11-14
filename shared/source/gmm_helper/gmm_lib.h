@@ -1,12 +1,12 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#ifdef _WIN32
+#if defined(_WIN32)
 #include "shared/source/os_interface/windows/windows_wrapper.h"
 #else // !_WIN32
 #ifdef WDDM_LINUX
@@ -26,7 +26,19 @@
 #endif // !WDDM_LINUX
 #endif // !_WIN32
 
-#include "GmmLib.h"
+#if __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnonportable-include-path"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+#pragma clang diagnostic ignored "-Wparentheses-equality"
+
+#endif
+
+#include "neo_gmmlib.h"
+
+#if __clang__
+#pragma clang diagnostic pop
+#endif
 
 #ifdef RESTORE_WDDM_LINUX
 #ifdef RESTORE_LHDM

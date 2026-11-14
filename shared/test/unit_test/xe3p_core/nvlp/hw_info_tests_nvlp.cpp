@@ -1,0 +1,141 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/source/xe3p_core/hw_cmds_nvlp.h"
+#include "shared/source/xe3p_core/hw_info_xe3p_core.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/test_macros/test.h"
+
+#include "per_product_test_definitions.h"
+
+using namespace NEO;
+
+using NvlHwInfoTest = ::testing::Test;
+
+NVLPTEST_F(NvlHwInfoTest, WhenGettingHardwareInfoThenNvlIsReturned) {
+    EXPECT_EQ(IGFX_NVL, defaultHwInfo->platform.eProductFamily);
+}
+
+NVLPTEST_F(NvlHwInfoTest, givenBoolWhenCallNvlHardwareInfoSetupThenFeatureTableAndWorkaroundTableAreSetCorrect) {
+    bool boolValue[]{true, false};
+    HardwareInfo hwInfo = *defaultHwInfo;
+    GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
+    FeatureTable &featureTable = hwInfo.featureTable;
+    WorkaroundTable &workaroundTable = hwInfo.workaroundTable;
+
+    for (auto setParamBool : boolValue) {
+
+        gtSystemInfo = {0};
+        featureTable = {};
+        workaroundTable = {};
+        hardwareInfoSetup[productFamily](&hwInfo, setParamBool);
+
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrL3IACoherency);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrLinearCCS);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrFlatPhysCCS);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrCCSNode);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrCCSRing);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrPPGTT);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrSVM);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrL3IACoherency);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrStandardMipTailFormat);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrTranslationTable);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrUserModeTranslationTable);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrTileMappedResource);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrFbc);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcHdr2D);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcLdr2D);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuMidBatchPreempt);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuThreadGroupLevelPreempt);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrTile64Optimization);
+        EXPECT_EQ(false, featureTable.flags.ftrTileY);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrWalkerMTP);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrAppTransientCaching);
+        EXPECT_EQ(false, featureTable.flags.ftrSelectiveWmtp);
+        EXPECT_TRUE(featureTable.flags.ftrHeaplessMode);
+
+        EXPECT_EQ(setParamBool, workaroundTable.flags.wa4kAlignUVOffsetNV12LinearSurface);
+    }
+}
+
+NVLPTEST_F(NvlHwInfoTest, WhenSetupHardwareInfoWithSetupFeatureTableFlagTrueOrFalseIsCalledThenFeatureTableHasCorrectValues) {
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable = {};
+    hwInfo.workaroundTable = {};
+    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
+    FeatureTable &featureTable = hwInfo.featureTable;
+    WorkaroundTable &workaroundTable = hwInfo.workaroundTable;
+
+    NVLP::setupHardwareInfoImpl(&hwInfo, false);
+    EXPECT_FALSE(featureTable.flags.ftrLocalMemory);
+    EXPECT_FALSE(featureTable.flags.ftrFlatPhysCCS);
+    EXPECT_FALSE(featureTable.flags.ftrLinearCCS);
+    EXPECT_FALSE(featureTable.flags.ftrE2ECompression);
+    EXPECT_FALSE(featureTable.flags.ftrXe2Compression);
+    EXPECT_FALSE(featureTable.flags.ftrXe2PlusTiling);
+    EXPECT_FALSE(featureTable.flags.ftrPml5Support);
+    EXPECT_FALSE(featureTable.flags.ftrCCSNode);
+    EXPECT_FALSE(featureTable.flags.ftrCCSRing);
+    EXPECT_FALSE(featureTable.flags.ftrMultiTileArch);
+    EXPECT_FALSE(featureTable.flags.ftrHwSemaphore64);
+    EXPECT_FALSE(featureTable.flags.ftrSelectiveWmtp);
+    NVLP::setupHardwareInfoImpl(&hwInfo, true);
+    EXPECT_TRUE(featureTable.flags.ftrFlatPhysCCS);
+    EXPECT_TRUE(featureTable.flags.ftrLinearCCS);
+    EXPECT_TRUE(featureTable.flags.ftrE2ECompression);
+    EXPECT_EQ(featureTable.flags.ftrXe2Compression, hwInfo.caps.ftrXe2Compression);
+    EXPECT_EQ(featureTable.flags.ftrHwSemaphore64, hwInfo.caps.availableSemaphore64);
+    EXPECT_TRUE(featureTable.flags.ftrXe2PlusTiling);
+    EXPECT_TRUE(featureTable.flags.ftrPml5Support);
+    EXPECT_TRUE(featureTable.flags.ftrCCSNode);
+    EXPECT_TRUE(featureTable.flags.ftrCCSRing);
+    EXPECT_TRUE(featureTable.flags.ftrPPGTT);
+    EXPECT_TRUE(featureTable.flags.ftrSVM);
+    EXPECT_TRUE(featureTable.flags.ftrL3IACoherency);
+    EXPECT_TRUE(featureTable.flags.ftrIA32eGfxPTEs);
+    EXPECT_TRUE(featureTable.flags.ftrStandardMipTailFormat);
+    EXPECT_TRUE(featureTable.flags.ftrTranslationTable);
+    EXPECT_TRUE(featureTable.flags.ftrUserModeTranslationTable);
+    EXPECT_TRUE(featureTable.flags.ftrTileMappedResource);
+    EXPECT_TRUE(featureTable.flags.ftrFbc);
+    EXPECT_TRUE(featureTable.flags.ftrAstcHdr2D);
+    EXPECT_TRUE(featureTable.flags.ftrAstcLdr2D);
+    EXPECT_FALSE(featureTable.flags.ftrSelectiveWmtp);
+    EXPECT_FALSE(featureTable.flags.ftrTileY);
+    EXPECT_EQ(1u, featureTable.ftrBcsInfo.to_ulong());
+    EXPECT_TRUE(workaroundTable.flags.wa4kAlignUVOffsetNV12LinearSurface);
+}
+
+NVLPTEST_F(NvlHwInfoTest, whenCheckDirectSubmissionEnginesThenProperValuesAreSetToTrue) {
+    HardwareInfo hwInfo = *defaultHwInfo;
+    const auto &directSubmissionEngines = hwInfo.capabilityTable.directSubmissionEngines;
+
+    for (uint32_t i = 0; i < aub_stream::NUM_ENGINES; i++) {
+        switch (i) {
+        case aub_stream::ENGINE_CCS:
+            EXPECT_TRUE(directSubmissionEngines.data[i].engineSupported);
+            EXPECT_FALSE(directSubmissionEngines.data[i].submitOnInit);
+            EXPECT_FALSE(directSubmissionEngines.data[i].useNonDefault);
+            break;
+        case aub_stream::ENGINE_BCS:
+            EXPECT_TRUE(directSubmissionEngines.data[i].engineSupported);
+            EXPECT_FALSE(directSubmissionEngines.data[i].submitOnInit);
+            EXPECT_TRUE(directSubmissionEngines.data[i].useNonDefault);
+            break;
+        default:
+            EXPECT_FALSE(directSubmissionEngines.data[i].engineSupported);
+            EXPECT_FALSE(directSubmissionEngines.data[i].submitOnInit);
+            EXPECT_FALSE(directSubmissionEngines.data[i].useNonDefault);
+        }
+    }
+}

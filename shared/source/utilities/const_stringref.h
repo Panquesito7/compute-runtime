@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 namespace NEO {
 
@@ -29,7 +30,13 @@ class ConstStringRef {
     constexpr ConstStringRef(const ConstStringRef &rhs) : ptr(rhs.ptr), len(rhs.len) {
     }
 
+    explicit constexpr ConstStringRef(std::string_view rhs) : ptr(rhs.data()), len(rhs.length()) {
+    }
+
     ConstStringRef &operator=(const ConstStringRef &rhs) {
+        if (this == &rhs) {
+            return *this;
+        }
         this->ptr = rhs.ptr;
         this->len = rhs.len;
         return *this;
@@ -47,9 +54,9 @@ class ConstStringRef {
         : ptr(ptr), len(length) {
     }
 
-    template <size_t Length>
-    static constexpr ConstStringRef fromArray(const char (&array)[Length]) noexcept {
-        return ConstStringRef(array, Length);
+    template <size_t length>
+    static constexpr ConstStringRef fromArray(const char (&array)[length]) noexcept {
+        return ConstStringRef(array, length);
     }
 
     ConstStringRef(const std::string &str) noexcept
@@ -88,7 +95,9 @@ class ConstStringRef {
                 break;
             }
             newLen--;
-            end--;
+            if (newLen > 0) {
+                end--;
+            }
         }
         return ConstStringRef(this->ptr, newLen);
     }
@@ -206,11 +215,33 @@ class ConstStringRef {
             if (*i == separator) {
                 continue;
             }
-            if (*i != *rhs)
+            if (*i != *rhs) {
                 return false;
+            }
             ++rhs;
         }
         return ('\0' == *rhs);
+    }
+
+    template <typename ContainerT>
+    std::string join(const ContainerT &container) {
+        std::string ret;
+        if (container.empty()) {
+            return ret;
+        }
+
+        size_t len = container.size() - 1;
+        for (const auto &substr : container) {
+            len += substr.size();
+        }
+        ret.reserve(len);
+
+        ret.append(container.begin()->data(), container.begin()->size());
+        for (auto it = std::next(container.begin()), e = container.end(); it != e; ++it) {
+            ret.append(this->ptr, this->len);
+            ret.append(it->data(), it->size());
+        }
+        return ret;
     }
 
   protected:

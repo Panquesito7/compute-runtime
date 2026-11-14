@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,6 +13,10 @@
 #include "shared/test/common/mocks/mock_device.h"
 
 #include "gtest/gtest.h"
+
+namespace NEO {
+class OSInterface;
+} // namespace NEO
 
 using namespace NEO;
 
@@ -48,7 +52,7 @@ struct DeferredOsContextCreationL0Tests : ::testing::Test {
     }
 
     std::unique_ptr<MockDevice> device;
-    static inline const EngineTypeUsage engineTypeUsageBlitter{aub_stream::ENGINE_BCS, EngineUsage::Regular};
+    static inline const EngineTypeUsage engineTypeUsageBlitter{aub_stream::ENGINE_BCS, EngineUsage::regular};
 };
 
 TEST_F(DeferredOsContextCreationL0Tests, givenBlitterEngineWhenCreatingOsContextThenOsContextInitializationIsDeferred) {
@@ -56,9 +60,9 @@ TEST_F(DeferredOsContextCreationL0Tests, givenBlitterEngineWhenCreatingOsContext
 
     expectDeferredContextCreation(engineTypeUsageBlitter, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.DeferOsContextInitialization.set(1);
     expectDeferredContextCreation(engineTypeUsageBlitter, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(0);
+    debugManager.flags.DeferOsContextInitialization.set(0);
     expectImmediateContextCreation(engineTypeUsageBlitter, false);
 }

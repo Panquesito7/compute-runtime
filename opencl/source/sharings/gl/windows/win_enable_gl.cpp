@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
 
+#include "opencl/source/api/dispatch.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/context/context.inl"
 #include "opencl/source/sharings/gl/cl_gl_api_intel.h"
@@ -27,31 +28,32 @@ bool GlSharingContextBuilder::processProperties(cl_context_properties &propertyT
 
     switch (propertyType) {
     case CL_GL_CONTEXT_KHR:
-        contextData->GLHGLRCHandle = (GLContext)propertyValue;
+        contextData->glHGLRCHandle = (GLContext)propertyValue;
         return true;
     case CL_WGL_HDC_KHR:
-        contextData->GLHDCType = (GLType)CL_WGL_HDC_KHR;
-        contextData->GLHDCHandle = (GLDisplay)propertyValue;
+        contextData->glHDCType = (GLType)CL_WGL_HDC_KHR;
+        contextData->glHDCHandle = (GLDisplay)propertyValue;
         return true;
     case CL_GLX_DISPLAY_KHR:
-        contextData->GLHDCType = (GLType)CL_GLX_DISPLAY_KHR;
-        contextData->GLHDCHandle = (GLDisplay)propertyValue;
+        contextData->glHDCType = (GLType)CL_GLX_DISPLAY_KHR;
+        contextData->glHDCHandle = (GLDisplay)propertyValue;
         return true;
     case CL_EGL_DISPLAY_KHR:
-        contextData->GLHDCType = (GLType)CL_EGL_DISPLAY_KHR;
-        contextData->GLHDCHandle = (GLDisplay)propertyValue;
+        contextData->glHDCType = (GLType)CL_EGL_DISPLAY_KHR;
+        contextData->glHDCHandle = (GLDisplay)propertyValue;
         return true;
     }
     return false;
 }
 
 bool GlSharingContextBuilder::finalizeProperties(Context &context, int32_t &errcodeRet) {
-    if (contextData.get() == nullptr)
+    if (contextData.get() == nullptr) {
         return true;
+    }
 
-    if (contextData->GLHGLRCHandle) {
-        context.registerSharing(new GLSharingFunctionsWindows(contextData->GLHDCType, contextData->GLHGLRCHandle,
-                                                              nullptr, contextData->GLHDCHandle));
+    if (contextData->glHGLRCHandle) {
+        context.registerSharing(new GLSharingFunctionsWindows(contextData->glHDCType, contextData->glHGLRCHandle,
+                                                              nullptr, contextData->glHDCHandle));
     }
 
     contextData.reset(nullptr);
@@ -79,8 +81,8 @@ void GlSharingBuilderFactory::fillGlobalDispatchTable() {
 std::string GlSharingBuilderFactory::getExtensions(DriverInfo *driverInfo) {
     auto isGlSharingEnabled = GLSharingFunctionsWindows::isGlSharingEnabled();
 
-    if (DebugManager.flags.AddClGlSharing.get() != -1) {
-        isGlSharingEnabled = DebugManager.flags.AddClGlSharing.get();
+    if (debugManager.flags.AddClGlSharing.get() != -1) {
+        isGlSharingEnabled = debugManager.flags.AddClGlSharing.get();
     }
 
     if (isGlSharingEnabled) {
@@ -94,7 +96,13 @@ std::string GlSharingBuilderFactory::getExtensions(DriverInfo *driverInfo) {
 }
 
 void *GlSharingBuilderFactory::getExtensionFunctionAddress(const std::string &functionName) {
-    if (DebugManager.flags.EnableFormatQuery.get() &&
+    if (functionName == "clGetCLEventInfoINTEL") {
+        return reinterpret_cast<void *>(clGetCLEventInfoINTEL);
+    }
+    if (functionName == "clReleaseGlSharedEventINTEL") {
+        return reinterpret_cast<void *>(clReleaseGlSharedEventINTEL);
+    }
+    if (debugManager.flags.EnableFormatQuery.get() &&
         functionName == "clGetSupportedGLTextureFormatsINTEL") {
         return ((void *)(clGetSupportedGLTextureFormatsINTEL));
     }

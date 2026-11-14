@@ -1,42 +1,53 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/sysman/source/sysman_device_imp.h"
+#include "shared/test/common/mocks/linux/mock_ioctl_helper.h"
+#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test_checks_shared.h"
+
+#include "level_zero/sysman/source/device/sysman_device_imp.h"
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper.h"
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_hw.h"
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_fixture.h"
 #include "level_zero/sysman/test/unit_tests/sources/memory/linux/mock_memory.h"
+#include "level_zero/sysman/test/unit_tests/sources/shared/linux/kmd_interface/mock_sysman_kmd_interface_i915.h"
+#include "level_zero/zes_intel_gpu_sysman.h"
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
+#include <cstring>
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
-constexpr uint32_t memoryHandleComponentCount = 1u;
+static const uint32_t memoryHandleComponentCount = 1u;
+
+class SysmanMemoryMockIoctlHelper : public NEO::MockIoctlHelper {
+
+  public:
+    using NEO::MockIoctlHelper::MockIoctlHelper;
+    bool returnEmptyMemoryInfo = false;
+    int32_t mockErrorNumber = 0;
+
+    std::unique_ptr<MemoryInfo> createMemoryInfo() override {
+        if (returnEmptyMemoryInfo) {
+            errno = mockErrorNumber;
+            return {};
+        }
+        return NEO::MockIoctlHelper::createMemoryInfo();
+    }
+};
+
 class SysmanDeviceMemoryFixture : public SysmanDeviceFixture {
   protected:
-    void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(1);
-        SysmanDeviceFixture::SetUp();
-
-        pSysmanDeviceImp->pMemoryHandleContext->handleList.clear();
-        device = pSysmanDeviceImp;
-        getMemoryHandles(0);
-    }
-
-    void TearDown() override {
-        SysmanDeviceFixture::TearDown();
-    }
-
-    void setLocalSupportedAndReinit(bool supported) {
-
-        DebugManager.flags.EnableLocalMemory.set(supported == true ? 1 : 0);
-
-        pSysmanDeviceImp->pMemoryHandleContext->handleList.clear();
-        pSysmanDeviceImp->pMemoryHandleContext->init(pOsSysman->getSubDeviceCount());
-    }
+    L0::Sysman::SysmanDevice *device = nullptr;
+    DebugManagerStateRestore restorer;
 
     std::vector<zes_mem_handle_t> getMemoryHandles(uint32_t count) {
         std::vector<zes_mem_handle_t> handles(count, nullptr);
@@ -44,36 +55,77 @@ class SysmanDeviceMemoryFixture : public SysmanDeviceFixture {
         return handles;
     }
 
-    L0::Sysman::SysmanDevice *device = nullptr;
+    void setLocalSupportedAndReinit(bool supported) {
+        debugManager.flags.EnableLocalMemory.set(supported == true ? 1 : 0);
+        pSysmanDeviceImp->pMemoryHandleContext->handleList.clear();
+        pSysmanDeviceImp->pMemoryHandleContext->init(pOsSysman->getSubDeviceCount());
+    }
 };
 
-TEST_F(SysmanDeviceMemoryFixture, GivenComponentCountZeroWhenEnumeratingMemoryModulesWithLocalMemorySupportThenValidCountIsReturned) {
-    setLocalSupportedAndReinit(false);
+class SysmanDeviceMemoryFixtureI915 : public SysmanDeviceMemoryFixture {
+  protected:
+    MockMemoryNeoDrm *pDrm = nullptr;
+
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(1);
+        SysmanDeviceFixture::SetUp();
+        device = pSysmanDeviceImp;
+        auto pSysmanProductHelper = L0::Sysman::SysmanProductHelper::create(defaultHwInfo->platform.eProductFamily);
+        pSysmanDeviceImp->pMemoryHandleContext->handleList.clear();
+        pLinuxSysmanImp->pSysmanProductHelper = std::move(pSysmanProductHelper);
+        pDrm = new MockMemoryNeoDrm(const_cast<NEO::RootDeviceEnvironment &>(pSysmanDeviceImp->getRootDeviceEnvironment()));
+        auto &osInterface = pSysmanDeviceImp->getRootDeviceEnvironment().osInterface;
+        osInterface->setDriverModel(std::unique_ptr<MockMemoryNeoDrm>(pDrm));
+        pDrm->setMemoryType(NEO::DeviceBlobConstants::MemoryType::hbm2e);
+        pDrm->ioctlHelper = static_cast<std::unique_ptr<NEO::IoctlHelper>>(std::make_unique<SysmanMemoryMockIoctlHelper>(*pDrm));
+    }
+
+    void TearDown() override {
+        SysmanDeviceFixture::TearDown();
+    }
+};
+
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenComponentCountZeroWhenEnumeratingMemoryModulesWithNoLocalMemorySupportThenZeroCountIsReturnedForDiscretePlatforms) {
+    if (!defaultHwInfo->capabilityTable.isIntegratedDevice) {
+        setLocalSupportedAndReinit(false);
+    }
     uint32_t count = 0;
     EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(count, 0u);
+    if (defaultHwInfo->capabilityTable.isIntegratedDevice) {
+        EXPECT_EQ(count, 1u);
+    } else {
+        EXPECT_EQ(count, 0u);
+    }
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenInvalidComponentCountWhenEnumeratingMemoryModulesWithLocalMemorySupportThenValidCountIsReturned) {
-    setLocalSupportedAndReinit(false);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenInvalidComponentCountWhenEnumeratingMemoryModulesWithNoLocalMemorySupportThenZeroCountIsReturnedForDiscretePlatforms) {
+    if (!defaultHwInfo->capabilityTable.isIntegratedDevice) {
+        setLocalSupportedAndReinit(false);
+    }
     uint32_t count = 0;
     EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(count, 0u);
+    if (defaultHwInfo->capabilityTable.isIntegratedDevice) {
+        EXPECT_EQ(count, 1u);
+    } else {
+        EXPECT_EQ(count, 0u);
+    }
 
     count = count + 1;
     EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(count, 0u);
+    if (defaultHwInfo->capabilityTable.isIntegratedDevice) {
+        EXPECT_EQ(count, 1u);
+    } else {
+        EXPECT_EQ(count, 0u);
+    }
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenComponentCountZeroWhenEnumeratingMemoryModulesWithNoLocalMemorySupportThenValidCountIsReturned) {
-    setLocalSupportedAndReinit(true);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenComponentCountZeroWhenEnumeratingMemoryModulesThenValidCountIsReturned) {
     uint32_t count = 0;
     EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
     EXPECT_EQ(count, memoryHandleComponentCount);
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenInvalidComponentCountWhenEnumeratingMemoryModulesWithNoLocalMemorySupportThenValidCountIsReturned) {
-    setLocalSupportedAndReinit(true);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenInvalidComponentCountWhenEnumeratingMemoryModulesThenValidCountIsReturned) {
     uint32_t count = 0;
     EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
     EXPECT_EQ(count, memoryHandleComponentCount);
@@ -83,8 +135,7 @@ TEST_F(SysmanDeviceMemoryFixture, GivenInvalidComponentCountWhenEnumeratingMemor
     EXPECT_EQ(count, memoryHandleComponentCount);
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenComponentCountZeroWhenEnumeratingMemoryModulesThenValidHandlesIsReturned) {
-    setLocalSupportedAndReinit(true);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenComponentCountZeroWhenEnumeratingMemoryModulesThenValidHandlesAreReturned) {
     uint32_t count = 0;
     EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, nullptr), ZE_RESULT_SUCCESS);
     EXPECT_EQ(count, memoryHandleComponentCount);
@@ -96,45 +147,242 @@ TEST_F(SysmanDeviceMemoryFixture, GivenComponentCountZeroWhenEnumeratingMemoryMo
     }
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenValidMemoryHandleWhenCallingZetSysmanMemoryGetPropertiesThenVerifySysmanMemoryGetPropertiesCallReturnSuccess) {
-    setLocalSupportedAndReinit(true);
-    auto handles = getMemoryHandles(memoryHandleComponentCount);
-
-    for (auto handle : handles) {
-        zes_mem_properties_t properties;
-        EXPECT_EQ(zesMemoryGetProperties(handle, &properties), ZE_RESULT_SUCCESS);
-    }
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenValidMemoryHandleWhenCallingMemoryGetStateAndFwUtilInterfaceIsAbsentThenMemoryHealthWillBeUnknown) {
+    VariableBackup<L0::Sysman::FirmwareUtil *> backup(&pLinuxSysmanImp->pFwUtilInterface);
+    pLinuxSysmanImp->pFwUtilInterface = nullptr;
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        if (++NEO::SysCalls::readFuncCalled == 1) {
+            constexpr std::string_view content = "MemFree: 1000 kB\nMemAvailable: 2000 kB\n";
+            auto size = std::min(count, content.size());
+            memcpy(buf, content.data(), size);
+            return static_cast<ssize_t>(size);
+        }
+        return 0;
+    });
+    auto pLinuxMemoryImp = std::make_unique<PublicLinuxMemoryImp>(pOsSysman, true, 0);
+    zes_mem_state_t state;
+    ze_result_t result = pLinuxMemoryImp->getState(&state);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(state.health, ZES_MEM_HEALTH_UNKNOWN);
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenValidMemoryHandleWhenCallingZetSysmanMemoryGetStateThenVerifySysmanMemoryGetStateCallReturnUnsupportedFeature) {
-    setLocalSupportedAndReinit(true);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenValidMemoryHandleWhenCallingZesSysmanMemoryGetStateAndIoctlReturnedErrorThenApiReturnsError) {
+    REQUIRE_DISCRETE_DEVICE_OR_SKIP(*defaultHwInfo);
+    auto ioctlHelper = static_cast<SysmanMemoryMockIoctlHelper *>(pDrm->ioctlHelper.get());
+    ioctlHelper->returnEmptyMemoryInfo = true;
+    ioctlHelper->mockErrorNumber = EBUSY;
     auto handles = getMemoryHandles(memoryHandleComponentCount);
-
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_mem_state_t state;
-        EXPECT_EQ(zesMemoryGetState(handle, &state), ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+
+        ze_result_t result = zesMemoryGetState(handle, &state);
+
+        EXPECT_EQ(result, ZE_RESULT_ERROR_UNKNOWN);
+        EXPECT_EQ(state.size, 0u);
+        EXPECT_EQ(state.free, 0u);
     }
 }
 
-TEST_F(SysmanDeviceMemoryFixture, GivenValidMemoryHandleWhenCallingZetSysmanMemoryGetBandwidthThenVerifySysmanMemoryGetBandwidthCallReturnUnsupportedFeature) {
-    setLocalSupportedAndReinit(true);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenValidMemoryHandleWhenCallingZesSysmanMemoryGetStateAndDeviceIsNotAvailableThenDeviceLostErrorIsReturned) {
+    REQUIRE_DISCRETE_DEVICE_OR_SKIP(*defaultHwInfo);
+    auto ioctlHelper = static_cast<SysmanMemoryMockIoctlHelper *>(pDrm->ioctlHelper.get());
+    ioctlHelper->returnEmptyMemoryInfo = true;
+    ioctlHelper->mockErrorNumber = ENODEV;
+    auto handles = getMemoryHandles(memoryHandleComponentCount);
+    for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
+        zes_mem_state_t state;
+
+        ze_result_t result = zesMemoryGetState(handle, &state);
+
+        EXPECT_EQ(result, ZE_RESULT_ERROR_DEVICE_LOST);
+        EXPECT_EQ(state.size, 0u);
+        EXPECT_EQ(state.free, 0u);
+        errno = 0;
+    }
+}
+
+HWTEST2_F(SysmanDeviceMemoryFixtureI915, GivenMemoryVendorIdExtensionWhenCallingZesMemoryGetPropertiesAndVendorIdIsNotSupportedThenZeroVendorIdAndSuccessIsReturned, IsNotCRI) {
+    auto handles = getMemoryHandles(memoryHandleComponentCount);
+    for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
+        zes_mem_properties_t properties = {};
+        zes_memory_vendor_info_ext_properties_t vendorIdProperties = {ZES_STRUCTURE_TYPE_MEMORY_VENDOR_INFO_EXT_PROPERTIES};
+        vendorIdProperties.vendorId = 0xADu;
+        vendorIdProperties.length = 0xBEEFu;
+        std::strncpy(vendorIdProperties.vendorName, "unexpected", ZES_MEMORY_VENDOR_NAME_EXT_SIZE);
+        properties.pNext = &vendorIdProperties;
+
+        EXPECT_EQ(zesMemoryGetProperties(handle, &properties), ZE_RESULT_SUCCESS);
+        EXPECT_EQ(properties.pNext, &vendorIdProperties);
+        EXPECT_EQ(vendorIdProperties.vendorId, 0u);
+        EXPECT_EQ(vendorIdProperties.length, 0u);
+        EXPECT_STREQ(vendorIdProperties.vendorName, "");
+    }
+}
+
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenMemoryVendorIdExtensionAndVendorIdIsKnownWhenCallingZesMemoryGetPropertiesThenVendorNameIsReturned) {
     auto handles = getMemoryHandles(memoryHandleComponentCount);
 
-    for (auto handle : handles) {
-        zes_mem_bandwidth_t bandwidth;
-        EXPECT_EQ(zesMemoryGetBandwidth(handle, &bandwidth), ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+    static uint32_t mockVendorId = 0;
+    struct MockSysmanProductHelperMemoryVendorId : L0::Sysman::SysmanProductHelperHw<IGFX_UNKNOWN> {
+        ze_result_t getMemoryVendorId(L0::Sysman::LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pVendorId) override {
+            *pVendorId = mockVendorId;
+            return ZE_RESULT_SUCCESS;
+        }
+    };
+    std::unique_ptr<SysmanProductHelper> pSysmanProductHelper = std::make_unique<MockSysmanProductHelperMemoryVendorId>();
+    std::swap(pLinuxSysmanImp->pSysmanProductHelper, pSysmanProductHelper);
+
+    const std::vector<std::pair<uint32_t, std::string>> knownVendors = {
+        {mockSamsungMemoryVendorIdValue, "Samsung"},
+        {mockCxmtMemoryVendorIdValue, "CXMT"},
+        {mockMicronMemoryVendorIdValue, "Micron"},
+    };
+
+    for (const auto &[vendorId, vendorName] : knownVendors) {
+        mockVendorId = vendorId;
+        for (auto handle : handles) {
+            ASSERT_NE(nullptr, handle);
+            zes_mem_properties_t properties = {};
+            zes_memory_vendor_info_ext_properties_t vendorIdProperties = {ZES_STRUCTURE_TYPE_MEMORY_VENDOR_INFO_EXT_PROPERTIES};
+            properties.pNext = &vendorIdProperties;
+
+            EXPECT_EQ(zesMemoryGetProperties(handle, &properties), ZE_RESULT_SUCCESS);
+            EXPECT_EQ(properties.pNext, &vendorIdProperties);
+            EXPECT_EQ(vendorIdProperties.vendorId, vendorId);
+            EXPECT_STREQ(vendorIdProperties.vendorName, vendorName.c_str());
+            EXPECT_EQ(vendorIdProperties.length, static_cast<uint16_t>(vendorName.length()));
+        }
     }
 }
 
-TEST_F(SysmanMultiDeviceFixture, GivenValidDevicePointerWhenGettingMemoryPropertiesThenValidMemoryPropertiesRetrieved) {
-    zes_mem_properties_t properties = {};
-    ze_bool_t isSubdevice = pLinuxSysmanImp->getSubDeviceCount() == 0 ? false : true;
-    auto subDeviceId = std::max(0u, pLinuxSysmanImp->getSubDeviceCount() - 1);
-    std::unique_ptr<L0::Sysman::LinuxMemoryImp> pLinuxMemoryImp = std::make_unique<L0::Sysman::LinuxMemoryImp>(pOsSysman, isSubdevice, subDeviceId);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, pLinuxMemoryImp->getProperties(&properties));
-    EXPECT_EQ(properties.subdeviceId, subDeviceId);
-    EXPECT_EQ(properties.onSubdevice, isSubdevice);
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenMemoryVendorIdExtensionAndVendorIdIsUnknownWhenCallingZesMemoryGetPropertiesThenVendorNameIsNotReturned) {
+    auto handles = getMemoryHandles(memoryHandleComponentCount);
+
+    struct MockSysmanProductHelperMemoryVendorId : L0::Sysman::SysmanProductHelperHw<IGFX_UNKNOWN> {
+        ze_result_t getMemoryVendorId(L0::Sysman::LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pVendorId) override {
+            *pVendorId = mockMemoryVendorIdValue;
+            return ZE_RESULT_SUCCESS;
+        }
+    };
+    std::unique_ptr<SysmanProductHelper> pSysmanProductHelper = std::make_unique<MockSysmanProductHelperMemoryVendorId>();
+    std::swap(pLinuxSysmanImp->pSysmanProductHelper, pSysmanProductHelper);
+
+    for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
+        zes_mem_properties_t properties = {};
+        zes_memory_vendor_info_ext_properties_t vendorIdProperties = {ZES_STRUCTURE_TYPE_MEMORY_VENDOR_INFO_EXT_PROPERTIES};
+        vendorIdProperties.length = 0xBEEFu;
+        std::strncpy(vendorIdProperties.vendorName, "unexpected", ZES_MEMORY_VENDOR_NAME_EXT_SIZE);
+        properties.pNext = &vendorIdProperties;
+
+        EXPECT_EQ(zesMemoryGetProperties(handle, &properties), ZE_RESULT_SUCCESS);
+        EXPECT_EQ(vendorIdProperties.vendorId, mockMemoryVendorIdValue);
+        EXPECT_EQ(vendorIdProperties.length, 0u);
+        EXPECT_STREQ(vendorIdProperties.vendorName, "");
+    }
+}
+
+TEST_F(SysmanDeviceMemoryFixtureI915, GivenUnsupportedExtensionStypeWhenCallingZesMemoryGetPropertiesThenExtensionIsIgnoredAndSuccessIsReturned) {
+    auto handles = getMemoryHandles(memoryHandleComponentCount);
+    for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
+        zes_mem_properties_t properties = {};
+        zes_memory_vendor_info_ext_properties_t vendorIdProperties = {ZES_STRUCTURE_TYPE_FORCE_UINT32};
+        vendorIdProperties.vendorId = 0xADu;
+        vendorIdProperties.length = 0xBEEFu;
+        std::strncpy(vendorIdProperties.vendorName, "untouched", ZES_MEMORY_VENDOR_NAME_EXT_SIZE);
+        properties.pNext = &vendorIdProperties;
+
+        EXPECT_EQ(zesMemoryGetProperties(handle, &properties), ZE_RESULT_SUCCESS);
+        EXPECT_EQ(vendorIdProperties.vendorId, 0xADu);
+        EXPECT_EQ(vendorIdProperties.length, 0xBEEFu);
+        EXPECT_STREQ(vendorIdProperties.vendorName, "untouched");
+    }
+}
+
+class SysmanMultiDeviceMemoryFixture : public SysmanMultiDeviceFixture {
+  protected:
+    MockMemoryNeoDrm *pDrm = nullptr;
+    L0::Sysman::SysmanDevice *device = nullptr;
+    MockMemorySysFsAccessInterface *pSysfsAccess = nullptr;
+    MockSysmanKmdInterfacePrelim *pSysmanKmdInterface = nullptr;
+    MockMemoryFsAccessInterface *pFsAccess = nullptr;
+
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(1);
+        SysmanMultiDeviceFixture::SetUp();
+
+        pSysmanKmdInterface = new MockSysmanKmdInterfacePrelim(pLinuxSysmanImp->getSysmanProductHelper());
+        pSysfsAccess = new MockMemorySysFsAccessInterface();
+        pFsAccess = new MockMemoryFsAccessInterface();
+        pSysmanKmdInterface->pSysfsAccess.reset(pSysfsAccess);
+        pSysmanKmdInterface->pFsAccess.reset(pFsAccess);
+        pLinuxSysmanImp->pSysmanKmdInterface.reset(pSysmanKmdInterface);
+        pLinuxSysmanImp->pSysfsAccess = pLinuxSysmanImp->pSysmanKmdInterface->getSysFsAccess();
+        pLinuxSysmanImp->pFsAccess = pLinuxSysmanImp->pSysmanKmdInterface->getFsAccess();
+        pDrm = new MockMemoryNeoDrm(const_cast<NEO::RootDeviceEnvironment &>(pSysmanDeviceImp->getRootDeviceEnvironment()));
+        pDrm->ioctlHelper = static_cast<std::unique_ptr<NEO::IoctlHelper>>(std::make_unique<NEO::MockIoctlHelper>(*pDrm));
+        auto &osInterface = pSysmanDeviceImp->getRootDeviceEnvironment().osInterface;
+        osInterface->setDriverModel(std::unique_ptr<MockMemoryNeoDrm>(pDrm));
+        pSysmanDeviceImp->pMemoryHandleContext->handleList.clear();
+        device = pSysmanDeviceImp;
+    }
+
+    void TearDown() override {
+        SysmanMultiDeviceFixture::TearDown();
+    }
+
+    std::vector<zes_mem_handle_t> getMemoryHandles(uint32_t count) {
+        std::vector<zes_mem_handle_t> handles(count, nullptr);
+        EXPECT_EQ(zesDeviceEnumMemoryModules(device->toHandle(), &count, handles.data()), ZE_RESULT_SUCCESS);
+        return handles;
+    }
+};
+
+TEST_F(SysmanMultiDeviceMemoryFixture, GivenMemFreeAndMemAvailableMissingInMemInfoWhenCallingGetStateThenFreeAndSizeValuesAreZero) {
+    REQUIRE_INTEGRATED_DEVICE_OR_SKIP(*defaultHwInfo);
+    pFsAccess->customMemInfo = {
+        "Buffers: 158772 kB",
+        "Cached: 11744244 kB"};
+    auto handles = getMemoryHandles(pOsSysman->getSubDeviceCount());
+    zes_mem_state_t state = {};
+    ze_result_t result = zesMemoryGetState(handles[0], &state);
+
+    EXPECT_EQ(result, ZE_RESULT_ERROR_UNKNOWN);
+    EXPECT_EQ(state.free, 0u);
+    EXPECT_EQ(state.size, 0u);
+}
+
+TEST_F(SysmanMultiDeviceMemoryFixture, GivenMemInfoWithoutColonSeparatorWhenCallingGetStateThenFreeAndSizeValuesAreZero) {
+    REQUIRE_INTEGRATED_DEVICE_OR_SKIP(*defaultHwInfo);
+    pFsAccess->customMemInfo = {
+        "Buffers 158772 kB",
+        "Cached 11744244 kB"};
+    auto handles = getMemoryHandles(pOsSysman->getSubDeviceCount());
+    zes_mem_state_t state = {};
+    ze_result_t result = zesMemoryGetState(handles[0], &state);
+
+    EXPECT_EQ(result, ZE_RESULT_ERROR_UNKNOWN);
+    EXPECT_EQ(state.free, 0u);
+    EXPECT_EQ(state.size, 0u);
+}
+
+TEST_F(SysmanMultiDeviceMemoryFixture, GivenMemInfoIsEmptyWhenCallingGetStateThenFreeAndSizeValuesAreZero) {
+    REQUIRE_INTEGRATED_DEVICE_OR_SKIP(*defaultHwInfo);
+    pFsAccess->customMemInfo = {""};
+    auto handles = getMemoryHandles(pOsSysman->getSubDeviceCount());
+    zes_mem_state_t state = {};
+    ze_result_t result = zesMemoryGetState(handles[0], &state);
+
+    EXPECT_EQ(result, ZE_RESULT_ERROR_UNKNOWN);
+    EXPECT_EQ(state.free, 0u);
+    EXPECT_EQ(state.size, 0u);
 }
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

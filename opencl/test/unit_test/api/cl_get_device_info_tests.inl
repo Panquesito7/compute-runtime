@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,17 @@
 
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/test/common/compiler_interface/spirv_extensions_yaml_igc_sample.h"
+#include "shared/test/common/mocks/mock_compiler_interface.h"
 
 #include "opencl/source/helpers/cl_gfx_core_helper.h"
 
 #include "cl_api_tests.h"
+#include "spirv/unified1/spirv.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 using namespace NEO;
 
@@ -102,19 +107,17 @@ TEST_F(clGetDeviceInfoTests, givenOpenCLDeviceWhenAskedForSupportedSvmTypeThenCo
     const HardwareInfo &hwInfo = pDevice->getHardwareInfo();
 
     cl_device_svm_capabilities expectedCaps = 0;
-    if (hwInfo.capabilityTable.ftrSvm != 0) {
-        if (hwInfo.capabilityTable.ftrSupportsCoherency != 0) {
-            expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER | CL_DEVICE_SVM_FINE_GRAIN_BUFFER | CL_DEVICE_SVM_ATOMICS;
-        } else {
-            expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER;
-        }
+    if (hwInfo.capabilityTable.ftrSupportsCoherency != 0) {
+        expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER | CL_DEVICE_SVM_FINE_GRAIN_BUFFER | CL_DEVICE_SVM_ATOMICS;
+    } else {
+        expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER;
     }
     EXPECT_EQ(svmCaps, expectedCaps);
 }
 
 TEST(clGetDeviceGlobalMemSizeTests, givenDebugFlagForGlobalMemSizePercentWhenAskedForGlobalMemSizeThenAdjustedGlobalMemSizeIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ClDeviceGlobalMemSizeAvailablePercent.set(100u);
+    debugManager.flags.ClDeviceGlobalMemSizeAvailablePercent.set(100u);
     uint64_t globalMemSize100percent = 0u;
 
     auto hwInfo = *defaultHwInfo;
@@ -130,7 +133,7 @@ TEST(clGetDeviceGlobalMemSizeTests, givenDebugFlagForGlobalMemSizePercentWhenAsk
     EXPECT_EQ(retVal, CL_SUCCESS);
     EXPECT_NE(globalMemSize100percent, 0u);
 
-    DebugManager.flags.ClDeviceGlobalMemSizeAvailablePercent.set(50u);
+    debugManager.flags.ClDeviceGlobalMemSizeAvailablePercent.set(50u);
     uint64_t globalMemSize50percent = 0u;
 
     hwInfo = *defaultHwInfo;
@@ -151,7 +154,7 @@ TEST(clGetDeviceGlobalMemSizeTests, givenDebugFlagForGlobalMemSizePercentWhenAsk
 
 TEST(clGetDeviceFineGrainedTests, givenDebugFlagForFineGrainedOverrideWhenItIsUsedWithZeroThenNoFineGrainSupport) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceFineGrainedSVMSupport.set(0);
+    debugManager.flags.ForceFineGrainedSVMSupport.set(0);
     cl_device_svm_capabilities svmCaps;
 
     auto hwInfo = *defaultHwInfo;
@@ -167,16 +170,13 @@ TEST(clGetDeviceFineGrainedTests, givenDebugFlagForFineGrainedOverrideWhenItIsUs
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    cl_device_svm_capabilities expectedCaps = 0;
-    if (hwInfo.capabilityTable.ftrSvm != 0) {
-        expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER;
-    }
+    cl_device_svm_capabilities expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER;
     EXPECT_EQ(svmCaps, expectedCaps);
 }
 
 TEST(clGetDeviceFineGrainedTests, givenDebugFlagForFineGrainedOverrideWhenItIsUsedWithOneThenThereIsFineGrainSupport) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceFineGrainedSVMSupport.set(1);
+    debugManager.flags.ForceFineGrainedSVMSupport.set(1);
     cl_device_svm_capabilities svmCaps;
 
     auto hwInfo = *defaultHwInfo;
@@ -192,10 +192,7 @@ TEST(clGetDeviceFineGrainedTests, givenDebugFlagForFineGrainedOverrideWhenItIsUs
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    cl_device_svm_capabilities expectedCaps = 0;
-    if (hwInfo.capabilityTable.ftrSvm != 0) {
-        expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER | CL_DEVICE_SVM_FINE_GRAIN_BUFFER | CL_DEVICE_SVM_ATOMICS;
-    }
+    cl_device_svm_capabilities expectedCaps = CL_DEVICE_SVM_COARSE_GRAIN_BUFFER | CL_DEVICE_SVM_FINE_GRAIN_BUFFER | CL_DEVICE_SVM_ATOMICS;
     EXPECT_EQ(svmCaps, expectedCaps);
 }
 
@@ -266,7 +263,6 @@ TEST_F(clGetDeviceInfoTests, GivenClDeviceExtensionsParamWhenGettingDeviceInfoTh
         "cl_intel_subgroups ",
         "cl_intel_required_subgroup_size ",
         "cl_intel_subgroups_short ",
-        "cl_khr_spir ",
         "cl_intel_accelerator ",
         "cl_intel_driver_diagnostics ",
         "cl_khr_priority_hints ",
@@ -282,6 +278,7 @@ TEST_F(clGetDeviceInfoTests, GivenClDeviceExtensionsParamWhenGettingDeviceInfoTh
         "cl_khr_subgroup_shuffle ",
         "cl_khr_subgroup_shuffle_relative ",
         "cl_khr_subgroup_clustered_reduce ",
+        "cl_khr_subgroup_rotate ",
         "cl_intel_device_attribute_query ",
         "cl_khr_suggested_local_work_size ",
         "cl_intel_split_work_group_barrier "};
@@ -292,7 +289,7 @@ TEST_F(clGetDeviceInfoTests, GivenClDeviceExtensionsParamWhenGettingDeviceInfoTh
     }
 }
 
-TEST_F(clGetDeviceInfoTests, GivenClDeviceIlVersionParamWhenGettingDeviceInfoThenSpirv12IsReturned) {
+TEST_F(clGetDeviceInfoTests, GivenClDeviceIlVersionParamWhenGettingDeviceInfoThenSpirv10To15IsReturned) {
     size_t paramRetSize = 0;
 
     cl_int retVal = clGetDeviceInfo(
@@ -314,8 +311,165 @@ TEST_F(clGetDeviceInfoTests, GivenClDeviceIlVersionParamWhenGettingDeviceInfoThe
         nullptr);
 
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_STREQ("SPIR-V_1.2 ", paramValue.get());
+    EXPECT_STREQ("SPIR-V_1.5 SPIR-V_1.4 SPIR-V_1.3 SPIR-V_1.2 SPIR-V_1.1 SPIR-V_1.0 ", paramValue.get());
 }
+
+TEST_F(clGetDeviceInfoTests, SpirvQueryForSpirvExtensionsReturnsSpirvExtensions) {
+    size_t paramRetSize = 0;
+
+    cl_int retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_EXTENSIONS_KHR,
+        0,
+        nullptr,
+        &paramRetSize);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    std::vector<const char *> spirvExtensions(paramRetSize / sizeof(const char *));
+    retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_EXTENSIONS_KHR,
+        paramRetSize,
+        spirvExtensions.data(),
+        nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    for (auto extension : spirvExtensions) {
+        EXPECT_EQ(0, std::strncmp(extension, "SPV_", 4));
+    }
+
+    const auto subgroupRotateIt = std::find_if(spirvExtensions.begin(), spirvExtensions.end(), [](const char *extension) {
+        return std::strcmp(extension, "SPV_KHR_subgroup_rotate") == 0;
+    });
+    EXPECT_NE(spirvExtensions.end(), subgroupRotateIt);
+}
+
+TEST_F(clGetDeviceInfoTests, SpirvQueryForSpirvExtendedInstructionSetsReturnsSpirvExtendedInstructionSets) {
+    size_t paramRetSize = 0;
+
+    cl_int retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_EXTENDED_INSTRUCTION_SETS_KHR,
+        0,
+        nullptr,
+        &paramRetSize);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    std::vector<const char *> spirvExtendedInstructionSets(paramRetSize / sizeof(const char *));
+    retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_EXTENDED_INSTRUCTION_SETS_KHR,
+        paramRetSize,
+        spirvExtendedInstructionSets.data(),
+        nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    bool found = paramRetSize == 0;
+    for (auto extinst : spirvExtendedInstructionSets) {
+        if (std::strcmp(extinst, "OpenCL.std") == 0) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST_F(clGetDeviceInfoTests, SpirvQueryForSpirvCapabilitiesReturnsSpirvCapabilities) {
+    size_t paramRetSize = 0;
+
+    cl_int retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_CAPABILITIES_KHR,
+        0,
+        nullptr,
+        &paramRetSize);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    std::vector<cl_uint> spirvCapabilities(paramRetSize / sizeof(cl_uint));
+    retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_CAPABILITIES_KHR,
+        paramRetSize,
+        spirvCapabilities.data(),
+        nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    constexpr cl_uint spirvCapabilityKernel = 6;
+
+    bool found = paramRetSize == 0;
+    for (auto cap : spirvCapabilities) {
+        if (cap == spirvCapabilityKernel) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found);
+
+    const auto subgroupRotateIt = std::find(spirvCapabilities.begin(), spirvCapabilities.end(),
+                                            static_cast<cl_uint>(spv::CapabilityGroupNonUniformRotateKHR));
+    EXPECT_NE(spirvCapabilities.end(), subgroupRotateIt);
+}
+
+TEST_F(clGetDeviceInfoTests, GivenMockedIgcYamlWhenQueryingSpirvInfoThroughApiThenIgcSourcedExtensionsAndCapabilitiesAreReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableSpirvQueriesFromIgc.set(1);
+    auto *mockCompilerInterface = new MockCompilerInterface();
+    mockCompilerInterface->spirvExtensionsYAMLOverride = std::string(spirvExtensionsYamlIgcSample);
+    executionEnvironment->rootDeviceEnvironments[testedRootDeviceIndex]->compilerInterface.reset(mockCompilerInterface);
+
+    // Extensions through the real clGetDeviceInfo entry point (two-call convention).
+    size_t extRetSize = 0;
+    cl_int retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_EXTENSIONS_KHR,
+        0,
+        nullptr,
+        &extRetSize);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(1u, mockCompilerInterface->getSpirvExtensionsYAMLCalled);
+
+    std::vector<const char *> spirvExtensions(extRetSize / sizeof(const char *));
+    retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_EXTENSIONS_KHR,
+        extRetSize,
+        spirvExtensions.data(),
+        nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_TRUE(std::any_of(spirvExtensions.begin(), spirvExtensions.end(),
+                            [](const char *extension) { return std::strcmp(extension, "SPV_KHR_shader_clock") == 0; }));
+
+    // Capabilities through the real entry point: numeric SPIR-V IDs sourced from IGC YAML.
+    size_t capRetSize = 0;
+    retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_CAPABILITIES_KHR,
+        0,
+        nullptr,
+        &capRetSize);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    std::vector<cl_uint> spirvCapabilities(capRetSize / sizeof(cl_uint));
+    retVal = clGetDeviceInfo(
+        testedClDevice,
+        CL_DEVICE_SPIRV_CAPABILITIES_KHR,
+        capRetSize,
+        spirvCapabilities.data(),
+        nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    auto hasCapability = [&spirvCapabilities](cl_uint cap) {
+        return std::any_of(spirvCapabilities.begin(), spirvCapabilities.end(), [cap](cl_uint c) { return c == cap; });
+    };
+    // IGC-sourced capability from the mocked YAML.
+    constexpr cl_uint spirvCapabilityShaderClockKHR = 5055;
+    EXPECT_TRUE(hasCapability(spirvCapabilityShaderClockKHR));
+    // Mandatory base capabilities are always present, even on the IGC path (Addresses=4,
+    // Linkage=5, Kernel=6, Vector16=7, Float16Buffer=8, Int64=11, Int16=22, Int8=39).
+    for (cl_uint baseCap : {4u, 5u, 6u, 7u, 8u, 11u, 22u, 39u}) {
+        EXPECT_TRUE(hasCapability(baseCap)) << "missing required base capability " << baseCap;
+    }
+}
+
 using matcherAtMostGen12lp = IsAtMostGfxCore<IGFX_GEN12LP_CORE>;
 HWTEST2_F(clGetDeviceInfoTests, givenClDeviceSupportedThreadArbitrationPolicyIntelWhenCallClGetDeviceInfoThenProperArrayIsReturned, matcherAtMostGen12lp) {
     cl_device_info paramName = 0;
@@ -360,100 +514,74 @@ HWTEST_F(clGetDeviceInfoTests, givenClDeviceSupportedThreadArbitrationPolicyInte
     EXPECT_EQ(0u, paramRetSize);
 }
 
-//------------------------------------------------------------------------------
-struct GetDeviceInfoP : public ApiFixture<>,
-                        public ::testing::TestWithParam<uint32_t /*cl_device_info*/> {
-    void SetUp() override {
-        param = GetParam();
-        ApiFixture::setUp();
+static cl_device_info deviceInfoStrParams[] = {
+    CL_DEVICE_BUILT_IN_KERNELS,
+    CL_DEVICE_LATEST_CONFORMANCE_VERSION_PASSED,
+    CL_DEVICE_NAME,
+    CL_DEVICE_OPENCL_C_VERSION,
+    CL_DEVICE_PROFILE,
+    CL_DEVICE_VENDOR,
+    CL_DEVICE_VERSION,
+    CL_DRIVER_VERSION};
+
+TEST_F(clGetDeviceInfoTests, GivenStringTypeParamWhenGettingDeviceInfoThenSuccessIsReturned) {
+    for (auto param : deviceInfoStrParams) {
+        size_t paramRetSize = 0;
+
+        cl_int retVal = clGetDeviceInfo(
+            testedClDevice,
+            param,
+            0,
+            nullptr,
+            &paramRetSize);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        ASSERT_NE(0u, paramRetSize);
+
+        auto paramValue = std::make_unique<char[]>(paramRetSize);
+
+        retVal = clGetDeviceInfo(
+            testedClDevice,
+            param,
+            paramRetSize,
+            paramValue.get(),
+            nullptr);
+
+        EXPECT_EQ(CL_SUCCESS, retVal);
     }
-
-    void TearDown() override {
-        ApiFixture::tearDown();
-    }
-
-    cl_device_info param;
-};
-
-typedef GetDeviceInfoP GetDeviceInfoStr;
-
-TEST_P(GetDeviceInfoStr, GivenStringTypeParamWhenGettingDeviceInfoThenSuccessIsReturned) {
-    size_t paramRetSize = 0;
-
-    cl_int retVal = clGetDeviceInfo(
-        testedClDevice,
-        param,
-        0,
-        nullptr,
-        &paramRetSize);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    ASSERT_NE(0u, paramRetSize);
-
-    auto paramValue = std::make_unique<char[]>(paramRetSize);
-
-    retVal = clGetDeviceInfo(
-        testedClDevice,
-        param,
-        paramRetSize,
-        paramValue.get(),
-        nullptr);
-
-    EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-static cl_device_info deviceInfoStrParams[] =
-    {
-        CL_DEVICE_BUILT_IN_KERNELS,
-        CL_DEVICE_LATEST_CONFORMANCE_VERSION_PASSED,
-        CL_DEVICE_NAME,
-        CL_DEVICE_OPENCL_C_VERSION,
-        CL_DEVICE_PROFILE,
-        CL_DEVICE_VENDOR,
-        CL_DEVICE_VERSION,
-        CL_DRIVER_VERSION};
-
-INSTANTIATE_TEST_CASE_P(
-    api,
-    GetDeviceInfoStr,
-    testing::ValuesIn(deviceInfoStrParams));
-
-typedef GetDeviceInfoP GetDeviceInfoVectorWidth;
-
-TEST_P(GetDeviceInfoVectorWidth, GivenParamTypeVectorWhenGettingDeviceInfoThenSizeIsGreaterThanZeroAndValueIsGreaterThanZero) {
-    cl_uint paramValue = 0;
-    size_t paramRetSize = 0;
-
-    auto retVal = clGetDeviceInfo(
-        testedClDevice,
-        param,
-        0,
-        nullptr,
-        &paramRetSize);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(sizeof(cl_uint), paramRetSize);
-
-    retVal = clGetDeviceInfo(
-        testedClDevice,
-        param,
-        paramRetSize,
-        &paramValue,
-        nullptr);
-
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_GT(paramValue, 0u);
-}
-
-cl_device_info devicePreferredVector[] = {
+static cl_device_info devicePreferredVector[] = {
     CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR,
     CL_DEVICE_PREFERRED_VECTOR_WIDTH_SHORT,
     CL_DEVICE_PREFERRED_VECTOR_WIDTH_INT,
     CL_DEVICE_PREFERRED_VECTOR_WIDTH_LONG,
     CL_DEVICE_PREFERRED_VECTOR_WIDTH_FLOAT};
 
-INSTANTIATE_TEST_CASE_P(
-    api,
-    GetDeviceInfoVectorWidth,
-    testing::ValuesIn(devicePreferredVector));
+TEST_F(clGetDeviceInfoTests, GivenParamTypeVectorWhenGettingDeviceInfoThenSizeIsGreaterThanZeroAndValueIsGreaterThanZero) {
+    for (auto param : devicePreferredVector) {
+        cl_uint paramValue = 0;
+        size_t paramRetSize = 0;
+
+        auto retVal = clGetDeviceInfo(
+            testedClDevice,
+            param,
+            0,
+            nullptr,
+            &paramRetSize);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        EXPECT_EQ(sizeof(cl_uint), paramRetSize);
+
+        retVal = clGetDeviceInfo(
+            testedClDevice,
+            param,
+            paramRetSize,
+            &paramValue,
+            nullptr);
+
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        EXPECT_GT(paramValue, 0u);
+    }
+}
 
 TEST_F(clGetDeviceInfoTests, givenClDeviceWhenGetInfoForIntegerDotCapsThenCorrectValuesAreSet) {
     size_t paramRetSize = 0;
@@ -465,8 +593,7 @@ TEST_F(clGetDeviceInfoTests, givenClDeviceWhenGetInfoForIntegerDotCapsThenCorrec
         sizeof(integerDotCapabilities),
         &integerDotCapabilities,
         &paramRetSize);
-    auto &compilerHelper = pDevice->getDevice().getCompilerProductHelper();
-    EXPECT_EQ(((integerDotCapabilities & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_KHR) && (integerDotCapabilities & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR)), compilerHelper.isDotIntegerProductExtensionSupported());
+    EXPECT_TRUE(((integerDotCapabilities & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_KHR) && (integerDotCapabilities & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR)));
 }
 
 TEST_F(clGetDeviceInfoTests, givenClDeviceWhenGetInfoForIntegerDot8BitPropertiesThenCorrectValuesAreSet) {
@@ -479,13 +606,12 @@ TEST_F(clGetDeviceInfoTests, givenClDeviceWhenGetInfoForIntegerDot8BitProperties
         sizeof(integerDotAccelerationProperties8Bit),
         &integerDotAccelerationProperties8Bit,
         &paramRetSize);
-    auto &compilerHelper = pDevice->getDevice().getCompilerProductHelper();
-    EXPECT_EQ(integerDotAccelerationProperties8Bit.accumulating_saturating_mixed_signedness_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8Bit.accumulating_saturating_signed_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8Bit.accumulating_saturating_unsigned_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8Bit.mixed_signedness_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8Bit.signed_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8Bit.unsigned_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
+    EXPECT_TRUE(integerDotAccelerationProperties8Bit.accumulating_saturating_mixed_signedness_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8Bit.accumulating_saturating_signed_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8Bit.accumulating_saturating_unsigned_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8Bit.mixed_signedness_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8Bit.signed_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8Bit.unsigned_accelerated);
 }
 
 TEST_F(clGetDeviceInfoTests, givenClDeviceWhenGetInfoForIntegerDot8BitPackedPropertiesThenCorrectValuesAreSet) {
@@ -498,12 +624,11 @@ TEST_F(clGetDeviceInfoTests, givenClDeviceWhenGetInfoForIntegerDot8BitPackedProp
         sizeof(integerDotAccelerationProperties8BitPacked),
         &integerDotAccelerationProperties8BitPacked,
         &paramRetSize);
-    auto &compilerHelper = pDevice->getDevice().getCompilerProductHelper();
-    EXPECT_EQ(integerDotAccelerationProperties8BitPacked.accumulating_saturating_mixed_signedness_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8BitPacked.accumulating_saturating_signed_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8BitPacked.accumulating_saturating_unsigned_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8BitPacked.mixed_signedness_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8BitPacked.signed_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
-    EXPECT_EQ(integerDotAccelerationProperties8BitPacked.unsigned_accelerated, compilerHelper.isDotIntegerProductExtensionSupported());
+    EXPECT_TRUE(integerDotAccelerationProperties8BitPacked.accumulating_saturating_mixed_signedness_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8BitPacked.accumulating_saturating_signed_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8BitPacked.accumulating_saturating_unsigned_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8BitPacked.mixed_signedness_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8BitPacked.signed_accelerated);
+    EXPECT_TRUE(integerDotAccelerationProperties8BitPacked.unsigned_accelerated);
 }
 } // namespace ULT

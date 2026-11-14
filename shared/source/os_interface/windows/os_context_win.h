@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,11 @@
 
 #pragma once
 #include "shared/source/os_interface/os_context.h"
+#include "shared/source/os_interface/windows/wddm/wddm.h"
 #include "shared/source/os_interface/windows/wddm_residency_controller.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include <mutex>
 
 namespace NEO {
 
@@ -18,6 +22,14 @@ struct HardwareQueue {
     D3DKMT_HANDLE progressFenceHandle = 0;
     VOID *progressFenceCpuVA = nullptr;
     D3DGPU_VIRTUAL_ADDRESS progressFenceGpuVA = 0;
+};
+
+struct MonitoredFenceKmdWaitData {
+    // An asynchronous KMD wait can outlive the API timeout, so keep its event across calls.
+    // The mutex prevents resetting or closing the event while another thread is waiting.
+    std::mutex mutex;
+    HANDLE eventHandle = nullptr;
+    uint64_t pendingFenceValue = 0;
 };
 
 class OsContextWin : public OsContext {
@@ -31,19 +43,40 @@ class OsContextWin : public OsContext {
     void setWddmContextHandle(D3DKMT_HANDLE wddmContextHandle) { this->wddmContextHandle = wddmContextHandle; }
     HardwareQueue getHwQueue() const { return hardwareQueue; }
     void setHwQueue(HardwareQueue hardwareQueue) { this->hardwareQueue = hardwareQueue; }
+    bool isDirectSubmissionSupported() const override;
+    bool isExternalSemaphoreGpuWaitSupported() const override { return true; }
     Wddm *getWddm() const { return &wddm; }
-    MOCKABLE_VIRTUAL WddmResidencyController &getResidencyController() { return residencyController; }
+    MOCKABLE_VIRTUAL WddmResidencyController &getResidencyController();
     static OsContext *create(OSInterface *osInterface, uint32_t rootDeviceIndex, uint32_t contextId, const EngineDescriptor &engineDescriptor);
+    MonitoredFence &getMonitoredFence() { return monitoredFence; }
+    const MonitoredFence &getMonitoredFence() const { return monitoredFence; }
+    MonitoredFenceKmdWaitData &getMonitoredFenceKmdWaitData() { return monitoredFenceKmdWaitData; }
+    void releaseMonitoredFenceKmdWaitEvent();
+    void resetMonitoredFenceParams(D3DKMT_HANDLE &handle, uint64_t *cpuAddress, D3DGPU_VIRTUAL_ADDRESS &gpuAddress);
+    bool wasAllocationUsedSinceLastTrim(uint64_t fenceValue) { return fenceValue > lastTrimFenceValue; }
+    void updateLastTrimFenceValue() { lastTrimFenceValue = *monitoredFence.cpuAddress; }
+    uint64_t getLastTrimFenceValue() const { return this->lastTrimFenceValue; };
     void reInitializeContext() override;
     void getDeviceLuidArray(std::vector<uint8_t> &luidData, size_t arraySize);
     uint32_t getDeviceNodeMask();
     uint64_t getOfflineDumpContextId(uint32_t deviceIndex) const override;
+    void prepareLatePreemptionStart(CREATECONTEXT_PVTDATA &privateData);
+    void stopLatePreemptionStartWait();
+    bool checkLatePreemptionStartSupport();
+
+    HANDLE latePreemptionStartEventHandle = 0;
+    HANDLE latePreemptionStartWaitObjectHandle = 0;
+    D3DKMT_HANDLE latePreemptionStartSyncObjectHandle = 0;
 
   protected:
     bool initializeContext() override;
 
-    WddmResidencyController residencyController;
     HardwareQueue hardwareQueue;
+
+    MonitoredFence monitoredFence = {};
+    MonitoredFenceKmdWaitData monitoredFenceKmdWaitData;
+    uint64_t lastTrimFenceValue = 0u;
+
     Wddm &wddm;
     D3DKMT_HANDLE wddmContextHandle = 0;
 };

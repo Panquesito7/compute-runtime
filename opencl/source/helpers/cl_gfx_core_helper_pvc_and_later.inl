@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,10 +15,10 @@ std::vector<uint32_t> ClGfxCoreHelperHw<Family>::getSupportedThreadArbitrationPo
 template <>
 inline bool ClGfxCoreHelperHw<Family>::getQueueFamilyName(std::string &name, EngineGroupType type) const {
     switch (type) {
-    case EngineGroupType::RenderCompute:
+    case EngineGroupType::renderCompute:
         name = "cccs";
         return true;
-    case EngineGroupType::LinkedCopy:
+    case EngineGroupType::linkedCopy:
         name = "linked bcs";
         return true;
     default:
@@ -27,6 +27,6 @@ inline bool ClGfxCoreHelperHw<Family>::getQueueFamilyName(std::string &name, Eng
 }
 
 template <>
-bool ClGfxCoreHelperHw<Family>::allowImageCompression(cl_image_format format) const {
-    return true;
+bool ClGfxCoreHelperHw<Family>::requiresAuxResolves(const KernelInfo &kernelInfo) const {
+    return false;
 }

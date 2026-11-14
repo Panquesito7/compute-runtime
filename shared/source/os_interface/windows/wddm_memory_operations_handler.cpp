@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,16 +11,17 @@
 #include "shared/source/memory_manager/host_ptr_defines.h"
 #include "shared/source/os_interface/windows/wddm_allocation.h"
 #include "shared/source/os_interface/windows/wddm_residency_allocations_container.h"
+#include "shared/source/utilities/stackvec.h"
 
 namespace NEO {
 
 WddmMemoryOperationsHandler::WddmMemoryOperationsHandler(Wddm *wddm) : wddm(wddm) {
-    residentAllocations = std::make_unique<WddmResidentAllocationsContainer>(wddm);
+    residentAllocations = std::make_unique<WddmResidentAllocationsContainer>(wddm, false);
 }
 
 WddmMemoryOperationsHandler::~WddmMemoryOperationsHandler() = default;
 
-MemoryOperationsStatus WddmMemoryOperationsHandler::makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) {
+MemoryOperationsStatus WddmMemoryOperationsHandler::makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations, bool isDummyExecNeeded, const bool forcePagingFence) {
     uint32_t totalHandlesCount = 0;
     constexpr uint32_t stackAllocations = 64;
     constexpr uint32_t stackHandlesCount = NEO::maxFragmentsCount * EngineLimits::maxHandleCount * stackAllocations;
@@ -28,6 +29,7 @@ MemoryOperationsStatus WddmMemoryOperationsHandler::makeResident(Device *device,
     size_t totalSize = 0;
 
     for (const auto &allocation : gfxAllocations) {
+        allocation->setExplicitlyMadeResident(true);
         WddmAllocation *wddmAllocation = reinterpret_cast<WddmAllocation *>(allocation);
         totalSize += wddmAllocation->getAlignedSize();
 
@@ -48,6 +50,7 @@ MemoryOperationsStatus WddmMemoryOperationsHandler::makeResident(Device *device,
 }
 
 MemoryOperationsStatus WddmMemoryOperationsHandler::evict(Device *device, GraphicsAllocation &gfxAllocation) {
+    gfxAllocation.setExplicitlyMadeResident(false);
     constexpr uint32_t stackHandlesCount = NEO::maxFragmentsCount * EngineLimits::maxHandleCount;
     StackVec<D3DKMT_HANDLE, stackHandlesCount> handlesForEviction;
     WddmAllocation &wddmAllocation = reinterpret_cast<WddmAllocation &>(gfxAllocation);
@@ -81,4 +84,33 @@ MemoryOperationsStatus WddmMemoryOperationsHandler::isResident(Device *device, G
     return residentAllocations->isAllocationResident(defaultHandle);
 }
 
+MemoryOperationsStatus WddmMemoryOperationsHandler::free(Device *device, GraphicsAllocation &gfxAllocation) {
+    // Mappings of physical memory share its handles, and every mapping made resident adds its own references to
+    // them, so the release of the last owner must drop all of them whether or not it was made resident itself.
+    const auto physicalMappingsInfo = gfxAllocation.peekPhysicalMappingsInfo();
+    const bool handlesSharedWithMappings = physicalMappingsInfo != nullptr && physicalMappingsInfo->handlesSharedWithMappings;
+    const bool ownsPhysicalMemoryHandles = !gfxAllocation.isSharedPhysicalMemoryMapping() &&
+                                           (gfxAllocation.getMappedPhysicalAllocation() != nullptr || handlesSharedWithMappings);
+    if (gfxAllocation.isExplicitlyMadeResident() || ownsPhysicalMemoryHandles) {
+        WddmAllocation &wddmAllocation = reinterpret_cast<WddmAllocation &>(gfxAllocation);
+        if (wddmAllocation.fragmentsStorage.fragmentCount > 0) {
+            OsHandleStorage &fragmentStorage = wddmAllocation.fragmentsStorage;
+
+            for (uint32_t allocId = 0; allocId < fragmentStorage.fragmentCount; allocId++) {
+                residentAllocations->removeResource(static_cast<OsHandleWin *>(fragmentStorage.fragmentStorageData[allocId].osHandleStorage)->handle);
+            }
+        } else {
+            const auto &handles = wddmAllocation.getHandles();
+            size_t handleCount = wddmAllocation.getNumGmms();
+            for (uint32_t i = 0; i < handleCount; i++) {
+                if (gfxAllocation.isSharedPhysicalMemoryMapping()) {
+                    residentAllocations->removeResourceReference(handles[i]);
+                } else {
+                    residentAllocations->removeResource(handles[i]);
+                }
+            }
+        }
+    }
+    return MemoryOperationsStatus::success;
+}
 } // namespace NEO

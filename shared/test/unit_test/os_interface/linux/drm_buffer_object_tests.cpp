@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,15 +9,17 @@
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
 #include "shared/test/common/mocks/linux/mock_drm_allocation.h"
 #include "shared/test/common/mocks/linux/mock_drm_wrappers.h"
 #include "shared/test/common/mocks/linux/mock_ioctl_helper.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_gmm_helper.h"
-#include "shared/test/common/os_interface/linux/device_command_stream_fixture.h"
 #include "shared/test/common/os_interface/linux/drm_buffer_object_fixture.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 using namespace NEO;
@@ -56,16 +58,31 @@ TEST_F(DrmBufferObjectTest, GivenDetectedGpuHangDuringEvictUnusedAllocationsWhen
     EXPECT_EQ(BufferObject::gpuHangDetected, result);
 }
 
+HWTEST2_F(DrmBufferObjectTest, GivenDirectSubmissionLightWhenExecFailsThenDoNotRetryAtBoExecLevelAndReturnError, IsXeLpg) {
+    osContext->setDirectSubmissionActive();
+
+    mock->ioctlExpected.total = 1;
+    mock->ioctlRes = -1;
+    mock->errnoValue = EFAULT;
+
+    bo->callBaseEvictUnusedAllocations = false;
+
+    ExecObject execObjectsStorage = {};
+    const auto result = bo->exec(0, 0, 0, false, osContext.get(), 0, 1, nullptr, 0u, &execObjectsStorage, 0, 0);
+
+    EXPECT_NE(0, result);
+}
+
 TEST_F(DrmBufferObjectTest, WhenSettingTilingThenCallSucceeds) {
     mock->ioctlExpected.total = 1; // set_tiling
-    auto tilingY = mock->getIoctlHelper()->getDrmParamValue(DrmParam::TilingY);
+    auto tilingY = mock->getIoctlHelper()->getDrmParamValue(DrmParam::tilingY);
     auto ret = bo->setTiling(tilingY, 0);
     EXPECT_TRUE(ret);
 }
 
 TEST_F(DrmBufferObjectTest, WhenSettingSameTilingThenCallSucceeds) {
     mock->ioctlExpected.total = 0; // set_tiling
-    auto tilingY = mock->getIoctlHelper()->getDrmParamValue(DrmParam::TilingY);
+    auto tilingY = mock->getIoctlHelper()->getDrmParamValue(DrmParam::tilingY);
     bo->tilingMode = tilingY;
     auto ret = bo->setTiling(tilingY, 0);
     EXPECT_TRUE(ret);
@@ -73,7 +90,7 @@ TEST_F(DrmBufferObjectTest, WhenSettingSameTilingThenCallSucceeds) {
 
 TEST_F(DrmBufferObjectTest, GivenInvalidTilingWhenSettingTilingThenCallFails) {
     mock->ioctlExpected.total = 1; // set_tiling
-    auto tilingY = mock->getIoctlHelper()->getDrmParamValue(DrmParam::TilingY);
+    auto tilingY = mock->getIoctlHelper()->getDrmParamValue(DrmParam::tilingY);
     mock->ioctlRes = -1;
     auto ret = bo->setTiling(tilingY, 0);
     EXPECT_FALSE(ret);
@@ -124,6 +141,31 @@ TEST_F(DrmBufferObjectTest, whenExecFailsThenPinFails) {
     EXPECT_EQ(EINVAL, ret);
 }
 
+HWTEST2_F(DrmBufferObjectTest, givenDirectSubmissionLightWhenValidateHostptrThenStopDirectSubmission, IsXeLpg) {
+    mock->ioctlExpected.total = -1;
+    executionEnvironment.initializeMemoryManager();
+    MockCommandStreamReceiver csr(executionEnvironment, 0, 0b1);
+    OsContextLinux osContextLinux(*mock, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    executionEnvironment.memoryManager->createAndRegisterOsContext(&csr, EngineDescriptorHelper::getDefaultDescriptor());
+    auto &engine = executionEnvironment.memoryManager->getRegisteredEngines(0)[0];
+    auto backupContext = engine.osContext;
+    auto &mutableEngine = const_cast<EngineControl &>(engine);
+    mutableEngine.osContext = &osContextLinux;
+    executionEnvironment.memoryManager->getRegisteredEngines(0)[0].osContext->setDirectSubmissionActive();
+    std::unique_ptr<uint32_t[]> buff(new uint32_t[1024]);
+
+    std::unique_ptr<BufferObject> boToPin(new TestedBufferObject(rootDeviceIndex, this->mock.get()));
+    ASSERT_NE(nullptr, boToPin.get());
+    bo->setAddress(reinterpret_cast<uint64_t>(buff.get()));
+    BufferObject *boArray[1] = {boToPin.get()};
+    EXPECT_EQ(csr.stopDirectSubmissionCalledTimes, 0u);
+
+    bo->validateHostPtr(boArray, 1, osContext.get(), 0, 1);
+
+    EXPECT_EQ(csr.stopDirectSubmissionCalledTimes, 1u);
+    mutableEngine.osContext = backupContext;
+}
+
 TEST_F(DrmBufferObjectTest, whenExecFailsThenValidateHostPtrFails) {
     std::unique_ptr<uint32_t[]> buff(new uint32_t[1024]);
 
@@ -143,7 +185,7 @@ TEST_F(DrmBufferObjectTest, whenExecFailsThenValidateHostPtrFails) {
 TEST_F(DrmBufferObjectTest, givenResidentBOWhenPrintExecutionBufferIsSetToTrueThenDebugInformationAboutBOIsPrinted) {
     mock->ioctlExpected.total = 1;
     DebugManagerStateRestore restore;
-    DebugManager.flags.PrintExecutionBuffer.set(true);
+    debugManager.flags.PrintExecutionBuffer.set(true);
 
     std::unique_ptr<uint32_t[]> buff(new uint32_t[1024]);
     std::unique_ptr<BufferObject> bo(new TestedBufferObject(rootDeviceIndex, this->mock.get()));
@@ -151,11 +193,12 @@ TEST_F(DrmBufferObjectTest, givenResidentBOWhenPrintExecutionBufferIsSetToTrueTh
     bo->setAddress(reinterpret_cast<uint64_t>(buff.get()));
     BufferObject *boArray[1] = {bo.get()};
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     auto ret = bo->pin(boArray, 1, osContext.get(), 0, 1);
     EXPECT_EQ(0, ret);
 
-    std::string output = testing::internal::GetCapturedStdout();
+    std::string output = capture.getCapturedStdout();
     auto idx = output.find("drm_i915_gem_execbuffer2 {");
     size_t expectedValue = 29;
     EXPECT_EQ(expectedValue, idx);
@@ -170,13 +213,14 @@ TEST_F(DrmBufferObjectTest, givenResidentBOWhenPrintExecutionBufferIsSetToTrueTh
 TEST_F(DrmBufferObjectTest, whenPrintBOCreateDestroyResultFlagIsSetAndCloseIsCalledOnBOThenDebugInfromationIsPrinted) {
     mock->ioctlExpected.total = 1;
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.PrintBOCreateDestroyResult.set(true);
+    debugManager.flags.PrintBOCreateDestroyResult.set(true);
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     bool result = bo->close();
     EXPECT_EQ(true, result);
 
-    std::string output = testing::internal::GetCapturedStdout();
+    std::string output = capture.getCapturedStdout();
     size_t idx = output.find("Calling gem close on handle: BO-");
     size_t expectedValue = 0;
     EXPECT_EQ(expectedValue, idx);
@@ -185,27 +229,29 @@ TEST_F(DrmBufferObjectTest, whenPrintBOCreateDestroyResultFlagIsSetAndCloseIsCal
 TEST_F(DrmBufferObjectTest, whenPrintBOCreateDestroyResultFlagIsSetAndCloseIsCalledButHandleIsSharedThenDebugInfromationIsPrintedThatCloseIsSkipped) {
     mock->ioctlExpected.total = 1;
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.PrintBOCreateDestroyResult.set(true);
+    debugManager.flags.PrintBOCreateDestroyResult.set(true);
 
     {
         MockBufferObjectHandleWrapper sharedBoHandleWrapper = bo->acquireSharedOwnershipOfBoHandle();
         EXPECT_TRUE(bo->isBoHandleShared());
 
-        testing::internal::CaptureStdout();
+        StreamCapture capture;
+        capture.captureStdout();
         bool result = bo->close();
         EXPECT_EQ(true, result);
 
-        std::string output = testing::internal::GetCapturedStdout();
+        std::string output = capture.getCapturedStdout();
         size_t idx = output.find("Skipped closing BO-");
         size_t expectedValue = 0u;
         EXPECT_EQ(expectedValue, idx);
     }
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     bool result = bo->close();
     EXPECT_EQ(true, result);
 
-    std::string output = testing::internal::GetCapturedStdout();
+    std::string output = capture.getCapturedStdout();
     size_t idx = output.find("Calling gem close on handle: BO-");
     size_t expectedValue = 0;
     EXPECT_EQ(expectedValue, idx);
@@ -214,24 +260,30 @@ TEST_F(DrmBufferObjectTest, whenPrintBOCreateDestroyResultFlagIsSetAndCloseIsCal
 TEST_F(DrmBufferObjectTest, whenPrintExecutionBufferIsSetToTrueThenMessageFoundInStdStream) {
     mock->ioctlExpected.total = 1;
     DebugManagerStateRestore restore;
-    DebugManager.flags.PrintExecutionBuffer.set(true);
+    debugManager.flags.PrintExecutionBuffer.set(true);
     ExecObject execObjectsStorage = {};
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     auto ret = bo->exec(0, 0, 0, false, osContext.get(), 0, 1, nullptr, 0u, &execObjectsStorage, 0, 0);
     EXPECT_EQ(0, ret);
 
-    std::string output = testing::internal::GetCapturedStdout();
-    auto idx = output.find("drm_i915_gem_execbuffer2 {");
-    size_t expectedValue = 29;
+    std::string output = capture.getCapturedStdout();
+
+    auto idx = output.find("Exec called with drmVmId = " + std::to_string(mock->getVmIdForContext(*osContext.get(), 0)));
+    uint32_t expectedValue = 0;
+    EXPECT_EQ(expectedValue, idx);
+
+    idx = output.find("drm_i915_gem_execbuffer2 {");
+    expectedValue = 29;
     EXPECT_EQ(expectedValue, idx);
 }
 
 TEST(DrmBufferObjectSimpleTest, givenInvalidBoWhenValidateHostptrIsCalledThenErrorIsReturned) {
     std::unique_ptr<uint32_t[]> buff(new uint32_t[256]);
     MockExecutionEnvironment executionEnvironment;
-    std::unique_ptr<DrmMockCustom> mock(new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]));
-    executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock.get(), 0u);
+    auto mock = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]);
+    executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock.get(), 0u, false);
     OsContextLinux osContext(*mock, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
     ASSERT_NE(nullptr, mock.get());
     std::unique_ptr<TestedBufferObject> bo(new TestedBufferObject(0u, mock.get()));
@@ -255,8 +307,8 @@ TEST(DrmBufferObjectSimpleTest, givenInvalidBoWhenValidateHostptrIsCalledThenErr
 TEST(DrmBufferObjectSimpleTest, givenInvalidBoWhenPinIsCalledThenErrorIsReturned) {
     std::unique_ptr<uint32_t[]> buff(new uint32_t[256]);
     MockExecutionEnvironment executionEnvironment;
-    std::unique_ptr<DrmMockCustom> mock(new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]));
-    executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock.get(), 0u);
+    auto mock = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]);
+    executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock.get(), 0u, false);
     OsContextLinux osContext(*mock, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
     ASSERT_NE(nullptr, mock.get());
     std::unique_ptr<TestedBufferObject> bo(new TestedBufferObject(0u, mock.get()));
@@ -279,7 +331,7 @@ TEST(DrmBufferObjectSimpleTest, givenInvalidBoWhenPinIsCalledThenErrorIsReturned
 
 TEST(DrmBufferObjectSimpleTest, givenBufferObjectWhenConstructedWithASizeThenTheSizeIsInitialized) {
     MockExecutionEnvironment executionEnvironment;
-    std::unique_ptr<DrmMockCustom> drmMock(new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]));
+    auto drmMock = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]);
     std::unique_ptr<BufferObject> bo(new BufferObject(0u, drmMock.get(), 3, 1, 0x1000, 1));
 
     EXPECT_EQ(0x1000u, bo->peekSize());
@@ -289,7 +341,7 @@ TEST(DrmBufferObjectSimpleTest, givenArrayOfBosWhenPinnedThenAllBosArePinned) {
     const auto rootDeviceIndex = 0u;
     std::unique_ptr<uint32_t[]> buff(new uint32_t[256]);
     MockExecutionEnvironment executionEnvironment;
-    std::unique_ptr<DrmMockCustom> mock(new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]));
+    auto mock = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]);
     ASSERT_NE(nullptr, mock.get());
     OsContextLinux osContext(*mock, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
 
@@ -324,7 +376,7 @@ TEST(DrmBufferObjectSimpleTest, givenArrayOfBosWhenValidatedThenAllBosArePinned)
     const auto rootDeviceIndex = 0u;
     std::unique_ptr<uint32_t[]> buff(new uint32_t[256]);
     MockExecutionEnvironment executionEnvironment;
-    std::unique_ptr<DrmMockCustom> mock(new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]));
+    auto mock = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]);
     ASSERT_NE(nullptr, mock.get());
     OsContextLinux osContext(*mock, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
 
@@ -370,14 +422,14 @@ TEST_F(DrmBufferObjectTest, givenDeleterWhenBufferObjectIsCreatedAndDeletedThenC
 
 TEST(DrmBufferObject, givenOfflineDebuggingModeWhenQueryingIsPerContextVMRequiredThenPerContextVMIsDisabled) {
     auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    device->getRootDeviceEnvironment().executionEnvironment.setDebuggingMode(NEO::DebuggingMode::Offline);
+    device->getRootDeviceEnvironment().executionEnvironment.setDebuggingMode(NEO::DebuggingMode::offline);
     DrmMock drm(*(device->getExecutionEnvironment()->rootDeviceEnvironments[0].get()));
     EXPECT_FALSE(drm.isPerContextVMRequired());
 }
 
 TEST(DrmBufferObject, givenPerContextVmRequiredWhenBoCreatedThenBindInfoIsInitializedToOsContextCount) {
     auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    device->getRootDeviceEnvironment().executionEnvironment.setDebuggingMode(NEO::DebuggingMode::Online);
+    device->getRootDeviceEnvironment().executionEnvironment.setDebuggingMode(NEO::DebuggingMode::online);
     device->getExecutionEnvironment()->calculateMaxOsContextCount();
     DrmMock drm(*(device->getExecutionEnvironment()->rootDeviceEnvironments[0].get()));
     EXPECT_TRUE(drm.isPerContextVMRequired());
@@ -395,7 +447,7 @@ TEST(DrmBufferObject, givenPerContextVmRequiredWhenBoCreatedThenBindInfoIsInitia
 
 TEST(DrmBufferObject, givenDrmIoctlReturnsErrorNotSupportedThenBufferObjectReturnsError) {
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -407,7 +459,7 @@ TEST(DrmBufferObject, givenDrmIoctlReturnsErrorNotSupportedThenBufferObjectRetur
     drm->errnoRetVal = EOPNOTSUPP;
     drm->baseErrno = false;
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
 
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
 
@@ -425,7 +477,7 @@ TEST(DrmBufferObject, givenDrmIoctlReturnsErrorNotSupportedThenBufferObjectRetur
 
 TEST(DrmBufferObject, givenPerContextVmRequiredWhenBoBoundAndUnboundThenCorrectBindInfoIsUpdated) {
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -436,7 +488,7 @@ TEST(DrmBufferObject, givenPerContextVmRequiredWhenBoBoundAndUnboundThenCorrectB
     EXPECT_TRUE(drm->isPerContextVMRequired());
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
 
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
 
@@ -450,7 +502,7 @@ TEST(DrmBufferObject, givenPerContextVmRequiredWhenBoBoundAndUnboundThenCorrectB
     auto osContext = engines[contextId].osContext;
     osContext->ensureContextInitialized();
 
-    bo.bind(osContext, 0);
+    bo.bind(osContext, 0, false);
     EXPECT_TRUE(bo.bindInfo[contextId][0]);
 
     bo.unbind(osContext, 0);
@@ -461,15 +513,15 @@ TEST(DrmBufferObject, givenPrintBOBindingResultWhenBOBindAndUnbindSucceedsThenPr
     struct DrmMockToSucceedBindBufferObject : public DrmMock {
         DrmMockToSucceedBindBufferObject(RootDeviceEnvironment &rootDeviceEnvironment)
             : DrmMock(rootDeviceEnvironment) {}
-        int bindBufferObject(OsContext *osContext, uint32_t vmHandleId, BufferObject *bo) override { return 0; }
+        int bindBufferObject(OsContext *osContext, uint32_t vmHandleId, BufferObject *bo, const bool forcePagingFence) override { return 0; }
         int unbindBufferObject(OsContext *osContext, uint32_t vmHandleId, BufferObject *bo) override { return 0; }
     };
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.PrintBOBindingResult.set(true);
+    debugManager.flags.PrintBOBindingResult.set(true);
 
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -480,7 +532,7 @@ TEST(DrmBufferObject, givenPrintBOBindingResultWhenBOBindAndUnbindSucceedsThenPr
     drm->latestCreatedVmId = 1;
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
 
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
 
@@ -494,23 +546,27 @@ TEST(DrmBufferObject, givenPrintBOBindingResultWhenBOBindAndUnbindSucceedsThenPr
     auto osContext = engines[contextId].osContext;
     osContext->ensureContextInitialized();
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
 
-    bo.bind(osContext, 0);
+    bo.bind(osContext, 0, false);
     EXPECT_TRUE(bo.bindInfo[contextId][0]);
 
-    std::string bindOutput = testing::internal::GetCapturedStdout();
+    std::string bindOutput = capture.getCapturedStdout();
     std::stringstream expected;
-    expected << "bind BO-0 to VM 0, drmVmId = " << drm->latestCreatedVmId << ", range: 0 - 0, size: 0, result: 0\n";
+    expected << "bind BO-0 to VM " << drm->latestCreatedVmId << ", vmHandleId = 0"
+             << ", range: 0 - 0, size: 0, result: 0\n";
     EXPECT_STREQ(bindOutput.c_str(), expected.str().c_str()) << bindOutput;
     expected.str("");
-    testing::internal::CaptureStdout();
+
+    capture.captureStdout();
 
     bo.unbind(osContext, 0);
     EXPECT_FALSE(bo.bindInfo[contextId][0]);
 
-    std::string unbindOutput = testing::internal::GetCapturedStdout();
-    expected << "unbind BO-0 from VM 0, drmVmId = " << drm->latestCreatedVmId << ", range: 0 - 0, size: 0, result: 0\n";
+    std::string unbindOutput = capture.getCapturedStdout();
+    expected << "unbind BO-0 from VM " << drm->latestCreatedVmId << ", vmHandleId = 0"
+             << ", range: 0 - 0, size: 0, result: 0\n";
     EXPECT_STREQ(unbindOutput.c_str(), expected.str().c_str()) << unbindOutput;
 }
 
@@ -518,16 +574,16 @@ TEST(DrmBufferObject, givenPrintBOBindingResultWhenBOBindAndUnbindFailsThenPrint
     struct DrmMockToFailBindBufferObject : public DrmMock {
         DrmMockToFailBindBufferObject(RootDeviceEnvironment &rootDeviceEnvironment)
             : DrmMock(rootDeviceEnvironment) {}
-        int bindBufferObject(OsContext *osContext, uint32_t vmHandleId, BufferObject *bo) override { return -1; }
+        int bindBufferObject(OsContext *osContext, uint32_t vmHandleId, BufferObject *bo, const bool forcePagingFence) override { return -1; }
         int unbindBufferObject(OsContext *osContext, uint32_t vmHandleId, BufferObject *bo) override { return -1; }
         int getErrno() override { return EINVAL; }
     };
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.PrintBOBindingResult.set(true);
+    debugManager.flags.PrintBOBindingResult.set(true);
 
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -538,7 +594,7 @@ TEST(DrmBufferObject, givenPrintBOBindingResultWhenBOBindAndUnbindFailsThenPrint
     drm->latestCreatedVmId = 1;
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
 
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
 
@@ -552,30 +608,33 @@ TEST(DrmBufferObject, givenPrintBOBindingResultWhenBOBindAndUnbindFailsThenPrint
     auto osContext = engines[contextId].osContext;
     osContext->ensureContextInitialized();
 
-    testing::internal::CaptureStderr();
+    StreamCapture capture;
+    capture.captureStderr();
 
-    bo.bind(osContext, 0);
+    bo.bind(osContext, 0, false);
     EXPECT_FALSE(bo.bindInfo[contextId][0]);
 
-    std::string bindOutput = testing::internal::GetCapturedStderr();
+    std::string bindOutput = capture.getCapturedStderr();
     std::stringstream expected;
-    expected << "bind BO-0 to VM 0, drmVmId = " << drm->latestCreatedVmId << ", range: 0 - 0, size: 0, result: -1, errno: 22\n";
+    expected << "bind BO-0 to VM " << drm->latestCreatedVmId << ", vmHandleId = 0"
+             << ", range: 0 - 0, size: 0, result: -1, errno: 22\n";
     EXPECT_TRUE(hasSubstr(expected.str(), expected.str())) << bindOutput;
     expected.str("");
-    testing::internal::CaptureStderr();
+    capture.captureStderr();
     bo.bindInfo[contextId][0] = true;
 
     bo.unbind(osContext, 0);
     EXPECT_TRUE(bo.bindInfo[contextId][0]);
 
-    std::string unbindOutput = testing::internal::GetCapturedStderr();
-    expected << "unbind BO-0 from VM 0, drmVmId = " << drm->latestCreatedVmId << ", range: 0 - 0, size: 0, result: -1, errno: 22";
+    std::string unbindOutput = capture.getCapturedStderr();
+    expected << "unbind BO-0 from VM " << drm->latestCreatedVmId << ", vmHandleId = 0"
+             << ", range: 0 - 0, size: 0, result: -1, errno: 22";
     EXPECT_TRUE(hasSubstr(unbindOutput, expected.str())) << unbindOutput;
 }
 
 TEST(DrmBufferObject, givenDrmWhenBindOperationFailsThenFenceValueNotGrow) {
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -585,12 +644,12 @@ TEST(DrmBufferObject, givenDrmWhenBindOperationFailsThenFenceValueNotGrow) {
     drm->requirePerContextVM = false;
     drm->isVMBindImmediateSupported = true;
     auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
-    ioctlHelper->failBind = true;
-    ioctlHelper->waitBeforeBindRequired = true;
+    ioctlHelper->vmBindResult = -1;
+    ioctlHelper->requiresUserFenceSetupResult = true;
     drm->ioctlHelper.reset(ioctlHelper.release());
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
     uint64_t initFenceValue = 10u;
     drm->fenceVal[0] = initFenceValue;
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
@@ -600,14 +659,18 @@ TEST(DrmBufferObject, givenDrmWhenBindOperationFailsThenFenceValueNotGrow) {
     auto contextId = osContextCount / 2;
     auto osContext = engines[contextId].osContext;
     MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
-    drm->bindBufferObject(osContext, 0, &bo);
+    drm->bindBufferObject(osContext, 0, &bo, false);
 
     EXPECT_EQ(drm->fenceVal[0], initFenceValue);
 }
 
 TEST(DrmBufferObject, givenDrmWhenBindOperationSucceedsThenFenceValueGrow) {
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(1);
+
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -617,12 +680,11 @@ TEST(DrmBufferObject, givenDrmWhenBindOperationSucceedsThenFenceValueGrow) {
     drm->requirePerContextVM = false;
     drm->isVMBindImmediateSupported = true;
     auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
-    ioctlHelper->failBind = false;
-    ioctlHelper->waitBeforeBindRequired = true;
+    ioctlHelper->requiresUserFenceSetupResult = true;
     drm->ioctlHelper.reset(ioctlHelper.release());
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
     uint64_t initFenceValue = 10u;
     drm->fenceVal[0] = initFenceValue;
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
@@ -632,14 +694,259 @@ TEST(DrmBufferObject, givenDrmWhenBindOperationSucceedsThenFenceValueGrow) {
     auto contextId = osContextCount / 2;
     auto osContext = engines[contextId].osContext;
     MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
-    drm->bindBufferObject(osContext, 0, &bo);
+    drm->bindBufferObject(osContext, 0, &bo, false);
 
     EXPECT_EQ(drm->fenceVal[0], initFenceValue + 1);
 }
 
+using ::testing::Combine;
+using ::testing::Values;
+using ::testing::WithParamInterface;
+
+class DrmBufferObjectBindTestWithForcePagingFenceSucceeds : public ::testing::TestWithParam<std::tuple<int32_t, bool, bool>> {};
+
+TEST_P(DrmBufferObjectBindTestWithForcePagingFenceSucceeds, givenDrmWhenBindOperationSucceedsWithForcePagingFenceThenFenceValueGrow) {
+    int32_t waitOnUserFenceAfterBindAndUnbindVal = std::get<0>(GetParam());
+    bool isVMBindImmediateSupportedVal = std::get<1>(GetParam());
+    bool requiresUserFenceSetupResultVal = std::get<2>(GetParam());
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(waitOnUserFenceAfterBindAndUnbindVal);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmWithWaitUserFence : public DrmMock {
+      public:
+        MockDrmWithWaitUserFence(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, ValueWidth dataWidth, int64_t timeout, uint16_t flags, bool userInterrupt,
+                          uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+            waitUserFenceCalled = true;
+            return 0;
+        }
+
+        bool waitUserFenceCalled = false;
+    };
+
+    auto drm = new MockDrmWithWaitUserFence(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = isVMBindImmediateSupportedVal;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = requiresUserFenceSetupResultVal;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    auto osContext = new OsContextLinux(*drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    osContext->ensureContextInitialized();
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    // Make sure to disable the debugging mode
+    executionEnvironment->setDebuggingMode(DebuggingMode::disabled);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->bindBufferObject(osContext, 0, &bo, true);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue + 1);
+    EXPECT_TRUE(drm->waitUserFenceCalled);
+    delete osContext;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DrmBufferObjectBindTestsWithForcePagingFenceSucceeds,
+    DrmBufferObjectBindTestWithForcePagingFenceSucceeds,
+    Combine(
+        Values(0, 1),
+        Values(true, false),
+        Values(true, false)));
+
+class DrmBufferObjectBindTestWithForcePagingFenceFalseWaitUserFenceNotCalled : public ::testing::TestWithParam<std::tuple<int32_t, bool, bool>> {};
+
+TEST_P(DrmBufferObjectBindTestWithForcePagingFenceFalseWaitUserFenceNotCalled, givenDrmWhenBindOperationSucceedsWithForcePagingFenceFalseThenFenceValueDoesNotGrow) {
+    int32_t waitOnUserFenceAfterBindAndUnbindVal = std::get<0>(GetParam());
+    bool isVMBindImmediateSupportedVal = std::get<1>(GetParam());
+    bool requiresUserFenceSetupResultVal = std::get<2>(GetParam());
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(waitOnUserFenceAfterBindAndUnbindVal);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmWithWaitUserFence : public DrmMock {
+      public:
+        MockDrmWithWaitUserFence(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, ValueWidth dataWidth, int64_t timeout, uint16_t flags, bool userInterrupt,
+                          uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+            waitUserFenceCalled = true;
+            return 0;
+        }
+
+        bool waitUserFenceCalled = false;
+    };
+
+    auto drm = new MockDrmWithWaitUserFence(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = isVMBindImmediateSupportedVal;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = requiresUserFenceSetupResultVal;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    auto osContext = new OsContextLinux(*drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    osContext->ensureContextInitialized();
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    // Make sure to disable the debugging mode
+    executionEnvironment->setDebuggingMode(DebuggingMode::disabled);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->bindBufferObject(osContext, 0, &bo, false);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue);
+    EXPECT_FALSE(drm->waitUserFenceCalled);
+    delete osContext;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DrmBufferObjectBindTestsWithForcePagingFenceFalseWaitUserFenceNotCalled,
+    DrmBufferObjectBindTestWithForcePagingFenceFalseWaitUserFenceNotCalled,
+    Values(
+        std::make_tuple(0, true, false),
+        std::make_tuple(0, false, false),
+        std::make_tuple(0, false, true),
+        std::make_tuple(1, true, false),
+        std::make_tuple(1, false, false),
+        std::make_tuple(1, false, true)));
+
+TEST(DrmBufferObject, givenDrmWhenBindOperationSucceedsWithForcePagingFenceWithDebuggingEnabledWithWaitOnUserFenceAfterBindAndUnbindAndNotUseVMBindImmediateThenFenceValueDoesNotGrow) {
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(1);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmWithWaitUserFence : public DrmMock {
+      public:
+        MockDrmWithWaitUserFence(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, ValueWidth dataWidth, int64_t timeout, uint16_t flags, bool userInterrupt,
+                          uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+            waitUserFenceCalled = true;
+            return 0;
+        }
+
+        bool waitUserFenceCalled = false;
+    };
+
+    auto drm = new MockDrmWithWaitUserFence(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    // Making the useVMBindImmediate() false
+    drm->isVMBindImmediateSupported = false;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = true;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    auto osContext = new OsContextLinux(*drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    osContext->ensureContextInitialized();
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    // Make sure to enable the debugging mode
+    executionEnvironment->setDebuggingMode(DebuggingMode::online);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->bindBufferObject(osContext, 0, &bo, true);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue);
+    EXPECT_FALSE(drm->waitUserFenceCalled);
+    delete osContext;
+}
+
+TEST(DrmBufferObject, givenDebuggingEnabledWhenBindAndUnbindBufferObjectThenBindAddDebugDataCalled) {
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmDebugData : public DrmMock {
+      public:
+        MockDrmDebugData(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int bindAddDebugData(OsContext *osContext, BufferObject *bo, uint32_t vmHandleId, bool isAdd) override {
+            bindAddDebugDataCalled = true;
+            return 0;
+        }
+
+        bool bindAddDebugDataCalled = false;
+    };
+
+    auto drm = new MockDrmDebugData(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = true;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = true;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+    auto contextId = osContextCount / 2;
+    auto osContext = engines[contextId].osContext;
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->bindBufferObject(osContext, 0, &bo, false);
+
+    EXPECT_TRUE(drm->bindAddDebugDataCalled);
+
+    drm->bindAddDebugDataCalled = false;
+    drm->unbindBufferObject(osContext, 0, &bo);
+    EXPECT_TRUE(drm->bindAddDebugDataCalled);
+}
+
 TEST(DrmBufferObject, givenDrmWhenUnBindOperationFailsThenFenceValueNotGrow) {
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -649,12 +956,12 @@ TEST(DrmBufferObject, givenDrmWhenUnBindOperationFailsThenFenceValueNotGrow) {
     drm->requirePerContextVM = false;
     drm->isVMBindImmediateSupported = true;
     auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
-    ioctlHelper->failBind = true;
-    ioctlHelper->waitBeforeBindRequired = true;
+    ioctlHelper->vmUnbindResult = -1;
+    ioctlHelper->requiresUserFenceSetupResult = true;
     drm->ioctlHelper.reset(ioctlHelper.release());
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
     uint64_t initFenceValue = 10u;
     drm->fenceVal[0] = initFenceValue;
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
@@ -671,7 +978,7 @@ TEST(DrmBufferObject, givenDrmWhenUnBindOperationFailsThenFenceValueNotGrow) {
 
 TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsThenFenceValueGrow) {
     auto executionEnvironment = new ExecutionEnvironment;
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -681,12 +988,11 @@ TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsThenFenceValueGrow) {
     drm->requirePerContextVM = false;
     drm->isVMBindImmediateSupported = true;
     auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
-    ioctlHelper->failBind = false;
-    ioctlHelper->waitBeforeBindRequired = true;
+    ioctlHelper->requiresUserFenceSetupResult = true;
     drm->ioctlHelper.reset(ioctlHelper.release());
 
     executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
     uint64_t initFenceValue = 10u;
     drm->fenceVal[0] = initFenceValue;
     std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
@@ -699,6 +1005,200 @@ TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsThenFenceValueGrow) {
     drm->unbindBufferObject(osContext, 0, &bo);
 
     EXPECT_EQ(drm->fenceVal[0], initFenceValue + 1);
+}
+
+TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsAndForceUserFenceUponUnbindAndDisableFenceWaitThenFenceValueGrow) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUserFenceUponUnbind.set(1);
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(0);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    auto drm = new DrmMock(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = true;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = true;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+    auto contextId = osContextCount / 2;
+    auto osContext = engines[contextId].osContext;
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->unbindBufferObject(osContext, 0, &bo);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue + 1);
+}
+
+TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsAndForceFenceWaitThenFenceValueGrow) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUserFenceUponUnbind.set(1);
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(1);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmWithWaitUserFence : public DrmMock {
+      public:
+        MockDrmWithWaitUserFence(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, ValueWidth dataWidth, int64_t timeout, uint16_t flags, bool userInterrupt,
+                          uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+            waitUserFenceCalled = true;
+            return 0;
+        }
+
+        bool waitUserFenceCalled = false;
+    };
+
+    auto drm = new MockDrmWithWaitUserFence(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = true;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = true;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    auto osContext = new OsContextLinux(*drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    osContext->ensureContextInitialized();
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->unbindBufferObject(static_cast<OsContext *>(osContext), 0, &bo);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue + 1);
+    EXPECT_TRUE(drm->waitUserFenceCalled);
+    delete osContext;
+}
+
+TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsWaitBeforeBindFalseAndForceFenceWaitButWaitNotTrueThenFenceDoesNotGrow) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUserFenceUponUnbind.set(0);
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(1);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmWithWaitUserFence : public DrmMock {
+      public:
+        MockDrmWithWaitUserFence(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, ValueWidth dataWidth, int64_t timeout, uint16_t flags, bool userInterrupt,
+                          uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+            waitUserFenceCalled = true;
+            return 0;
+        }
+
+        bool waitUserFenceCalled = false;
+    };
+
+    auto drm = new MockDrmWithWaitUserFence(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = true;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = false;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    auto osContext = new OsContextLinux(*drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    osContext->ensureContextInitialized();
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->unbindBufferObject(static_cast<OsContext *>(osContext), 0, &bo);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue);
+    EXPECT_FALSE(drm->waitUserFenceCalled);
+    delete osContext;
+}
+
+TEST(DrmBufferObject, givenDrmWhenUnBindOperationSucceedsWaitBeforeBindTrueAndForceFenceWaitButNotVmBindImmediateThenWaitUserFenceNotCalled) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUserFenceUponUnbind.set(1);
+    debugManager.flags.EnableWaitOnUserFenceAfterBindAndUnbind.set(1);
+
+    auto executionEnvironment = new ExecutionEnvironment;
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
+
+    class MockDrmWithWaitUserFence : public DrmMock {
+      public:
+        MockDrmWithWaitUserFence(RootDeviceEnvironment &rootDeviceEnvironment)
+            : DrmMock(rootDeviceEnvironment) {}
+
+        int waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, ValueWidth dataWidth, int64_t timeout, uint16_t flags, bool userInterrupt,
+                          uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) override {
+            waitUserFenceCalled = true;
+            return 0;
+        }
+
+        bool waitUserFenceCalled = false;
+    };
+
+    auto drm = new MockDrmWithWaitUserFence(*executionEnvironment->rootDeviceEnvironments[0]);
+    drm->requirePerContextVM = false;
+    drm->isVMBindImmediateSupported = false;
+    auto ioctlHelper = std::make_unique<MockIoctlHelper>(*drm);
+    ioctlHelper->requiresUserFenceSetupResult = true;
+    drm->ioctlHelper.reset(ioctlHelper.release());
+
+    auto osContext = new OsContextLinux(*drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
+    osContext->ensureContextInitialized();
+
+    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
+    executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
+    uint64_t initFenceValue = 10u;
+    drm->fenceVal[0] = initFenceValue;
+    std::unique_ptr<Device> device(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+
+    auto &engines = device->getExecutionEnvironment()->memoryManager->getRegisteredEngines(device->getRootDeviceIndex());
+    auto osContextCount = engines.size();
+
+    MockBufferObject bo(device->getRootDeviceIndex(), drm, 3, 0, 0, osContextCount);
+    drm->unbindBufferObject(static_cast<OsContext *>(osContext), 0, &bo);
+
+    EXPECT_EQ(drm->fenceVal[0], initFenceValue);
+    EXPECT_FALSE(drm->waitUserFenceCalled);
+    delete osContext;
 }
 
 TEST(DrmBufferObject, whenBindExtHandleAddedThenItIsStored) {
@@ -741,7 +1241,7 @@ TEST_F(DrmBufferObjectTest, givenBoMarkedForCaptureWhenFillingExecObjectThenCapt
 TEST_F(DrmBufferObjectTest, givenAsyncDebugFlagWhenFillingExecObjectThenFlagIsSet) {
     MockExecObject execObject{};
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UseAsyncDrmExec.set(1);
+    debugManager.flags.UseAsyncDrmExec.set(1);
 
     memset(&execObject, 0, sizeof(execObject));
     bo->setAddress(0x45000);
@@ -804,30 +1304,33 @@ TEST_F(DrmBufferObjectTest, whenBoRequiresExplicitResidencyThenTheCorrespondingQ
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperConstructedFromNonSharedHandleThenControlBlockIsNotCreatedAndInternalHandleIsStored) {
     constexpr int boHandle{5};
-    MockBufferObjectHandleWrapper boHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper boHandleWrapper{boHandle, 1u};
 
     EXPECT_EQ(nullptr, boHandleWrapper.controlBlock);
     EXPECT_EQ(boHandle, boHandleWrapper.getBoHandle());
+    EXPECT_EQ(1u, boHandleWrapper.getRootDeviceIndex());
 }
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperConstructedFromNonSharedHandleWhenAskingIfCanBeClosedThenReturnTrue) {
     constexpr int boHandle{21};
-    MockBufferObjectHandleWrapper boHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper boHandleWrapper{boHandle, 1u};
 
     EXPECT_TRUE(boHandleWrapper.canCloseBoHandle());
 }
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperWhenSettingNewValueThenStoreIt) {
     constexpr int boHandle{13};
-    MockBufferObjectHandleWrapper boHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper boHandleWrapper{boHandle, 1u};
 
     boHandleWrapper.setBoHandle(-1);
+    boHandleWrapper.setRootDeviceIndex(4u);
     EXPECT_EQ(-1, boHandleWrapper.getBoHandle());
+    EXPECT_EQ(4u, boHandleWrapper.getRootDeviceIndex());
 }
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperConstructedFromNonSharedHandleWhenMakingItSharedThenControlBlockIsCreatedAndReferenceCounterIsValid) {
     constexpr int boHandle{85};
-    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle, 1u};
     MockBufferObjectHandleWrapper secondBoHandleWrapper = firstBoHandleWrapper.acquireSharedOwnership();
 
     ASSERT_NE(nullptr, firstBoHandleWrapper.controlBlock);
@@ -841,7 +1344,7 @@ TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperConstructedFromNonSharedHandl
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenMoreThanOneSharedHandleWrapperWhenAskingIfHandleCanBeClosedThenReturnFalse) {
     constexpr int boHandle{121};
-    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle, 1u};
     MockBufferObjectHandleWrapper secondBoHandleWrapper = firstBoHandleWrapper.acquireSharedOwnership();
 
     EXPECT_FALSE(firstBoHandleWrapper.canCloseBoHandle());
@@ -850,7 +1353,7 @@ TEST(DrmBufferObjectHandleWrapperTest, GivenMoreThanOneSharedHandleWrapperWhenAs
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenControlBlockCreatedWhenOnlyOneReferenceLeftThenHandleCanBeClosed) {
     constexpr int boHandle{121};
-    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle, 1u};
 
     {
         MockBufferObjectHandleWrapper secondBoHandleWrapper = firstBoHandleWrapper.acquireSharedOwnership();
@@ -867,7 +1370,7 @@ TEST(DrmBufferObjectHandleWrapperTest, GivenControlBlockCreatedWhenOnlyOneRefere
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenControlBlockCreatedWhenOnlyWeakReferencesLeftThenItIsNotDestroyed) {
     constexpr int boHandle{777};
-    auto firstBoHandleWrapper = std::make_unique<MockBufferObjectHandleWrapper>(boHandle);
+    auto firstBoHandleWrapper = std::make_unique<MockBufferObjectHandleWrapper>(boHandle, 1u);
     MockBufferObjectHandleWrapper weakHandleWrapper = firstBoHandleWrapper->acquireWeakOwnership();
 
     ASSERT_NE(nullptr, firstBoHandleWrapper->controlBlock);
@@ -882,7 +1385,7 @@ TEST(DrmBufferObjectHandleWrapperTest, GivenControlBlockCreatedWhenOnlyWeakRefer
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenControlBlockCreatedWhenWeakReferencesLeftAndOnlyOneStrongReferenceLeftThenHandleCanBeClosed) {
     constexpr int boHandle{353};
-    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle, 1u};
     MockBufferObjectHandleWrapper firstWeakHandleWrapper = firstBoHandleWrapper.acquireWeakOwnership();
     MockBufferObjectHandleWrapper secondWeakHandleWrapper = firstBoHandleWrapper.acquireWeakOwnership();
 
@@ -901,7 +1404,7 @@ TEST(DrmBufferObjectHandleWrapperTest, GivenControlBlockCreatedWhenWeakReference
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperWhenConstructingMoreThanTwoSharedResourcesControlBlockRemainsTheSameAndReferenceCounterIsUpdatedOnCreationAndDestruction) {
     constexpr int boHandle{85};
-    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle, 1u};
     MockBufferObjectHandleWrapper secondBoHandleWrapper = firstBoHandleWrapper.acquireSharedOwnership();
 
     ASSERT_EQ(firstBoHandleWrapper.controlBlock, secondBoHandleWrapper.controlBlock);
@@ -923,7 +1426,7 @@ TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperWhenConstructingMoreThanTwoSh
 
 TEST(DrmBufferObjectHandleWrapperTest, GivenWrapperWhenMoveConstructingAnotherObjectThenInternalDataIsCleared) {
     constexpr int boHandle{27};
-    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle};
+    MockBufferObjectHandleWrapper firstBoHandleWrapper{boHandle, 1u};
     MockBufferObjectHandleWrapper secondBoHandleWrapper = firstBoHandleWrapper.acquireSharedOwnership();
 
     auto oldControlBlock = firstBoHandleWrapper.controlBlock;

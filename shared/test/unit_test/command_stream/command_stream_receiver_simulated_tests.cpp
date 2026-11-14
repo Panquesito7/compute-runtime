@@ -1,28 +1,30 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/command_stream/command_stream_receiver_simulated_hw.h"
+#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/array_count.h"
 #include "shared/source/helpers/hardware_context_controller.h"
+#include "shared/source/helpers/timestamp_packet.h"
 #include "shared/source/memory_manager/memory_pool.h"
-#include "shared/source/os_interface/os_context.h"
-#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/helpers/gfx_core_helper_tests.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_aub_manager.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/mocks/mock_os_context.h"
 #include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/unit_test/mocks/mock_csr_simulated_common_hw.h"
 
-#include <array>
 #include <memory>
+
 using namespace NEO;
 
 using CommandStreamSimulatedTests = GfxCoreHelperTest;
@@ -34,8 +36,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndAllocationWithStorageIn
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::LocalMemory, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::localMemory, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x2u;
 
     auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(executionEnvironment, 0, 1);
@@ -53,13 +55,13 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndNonLocalMemoryAllocatio
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
 
     executionEnvironment.initializeMemoryManager();
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::System4KBPages, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::system4KBPages, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x2u;
 
     auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(executionEnvironment, 0, 1);
     auto bank = csr->getMemoryBank(&allocation);
-    EXPECT_EQ(MemoryBanks::MainBank, bank);
+    EXPECT_EQ(MemoryBanks::mainBank, bank);
 }
 
 HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndAllocationWithStorageInfoZeroWhenMemoryBankIsQueriedThenBankForCsrIsReturned) {
@@ -69,8 +71,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndAllocationWithStorageIn
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::LocalMemory, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::localMemory, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x0u;
 
     DeviceBitfield deviceBitfield(0b100);
@@ -88,8 +90,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndNonLocalMemoryAllocatio
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::System64KBPages, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::system64KBPages, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x3u;
 
     DeviceBitfield deviceBitfield(1);
@@ -107,8 +109,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryNoncloneableAllocationWith
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::LocalMemory, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::localMemory, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x3u;
     allocation.storageInfo.cloningOfPageTables = false;
 
@@ -131,8 +133,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryCloneableAllocationWithMan
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::LocalMemory, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::localMemory, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x3u;
     allocation.storageInfo.cloningOfPageTables = true;
 
@@ -155,8 +157,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryNoncloneableAllocationWith
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::LocalMemory, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::localMemory, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x3u;
     allocation.storageInfo.cloningOfPageTables = false;
 
@@ -180,8 +182,8 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndAllocationWithStorageIn
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
     executionEnvironment.initializeMemoryManager();
 
-    MemoryAllocation allocation(0, AllocationType::UNKNOWN, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
-                                MemoryConstants::pageSize, 0, MemoryPool::LocalMemory, false, false, MemoryManager::maxOsContextCount);
+    MemoryAllocation allocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, reinterpret_cast<void *>(0x1000), 0x1000u,
+                                MemoryConstants::pageSize, 0, MemoryPool::localMemory, false, false, MemoryManager::maxOsContextCount);
     allocation.storageInfo.memoryBanks = 0x0u;
 
     DeviceBitfield deviceBitfield(0b100);
@@ -193,83 +195,6 @@ HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryAndAllocationWithStorageIn
     auto banksBitfield = csr->getMemoryBanksBitfield(&allocation);
     EXPECT_EQ(1u, banksBitfield.count());
     EXPECT_TRUE(banksBitfield.test(deviceIndex));
-}
-
-HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryWhenSimulatedCsrGetAddressSpaceIsCalledWithDifferentHintsThenCorrectSpaceIsReturned) {
-    ExecutionEnvironment executionEnvironment;
-    hardwareInfo.featureTable.flags.ftrLocalMemory = true;
-    executionEnvironment.prepareRootDeviceEnvironments(1);
-    executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
-    executionEnvironment.initializeMemoryManager();
-
-    std::array<uint32_t, 6> localMemoryHints = {AubMemDump::DataTypeHintValues::TraceLogicalRingContextRcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextCcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextBcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextVcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextVecs,
-                                                AubMemDump::DataTypeHintValues::TraceCommandBuffer};
-
-    auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(executionEnvironment, 0, 1);
-
-    if (csr->localMemoryEnabled) {
-        for (const uint32_t hint : localMemoryHints) {
-            EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, csr->getAddressSpace(hint));
-        }
-    }
-    std::array<uint32_t, 1> nonLocalMemoryHints = {AubMemDump::DataTypeHintValues::TraceNotype};
-
-    for (const uint32_t hint : nonLocalMemoryHints) {
-        EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceNonlocal, csr->getAddressSpace(hint));
-    }
-}
-
-HWTEST_F(CommandStreamSimulatedTests, givenLocalMemoryDisabledWhenSimulatedCsrGetAddressSpaceIsCalledWithDifferentHintsThenCorrectSpaceIsReturned) {
-    ExecutionEnvironment executionEnvironment;
-    hardwareInfo.featureTable.flags.ftrLocalMemory = false;
-    executionEnvironment.prepareRootDeviceEnvironments(1);
-    executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
-    executionEnvironment.initializeMemoryManager();
-
-    std::array<uint32_t, 7> nonLocalMemoryHints = {AubMemDump::DataTypeHintValues::TraceNotype,
-                                                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextRcs,
-                                                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextCcs,
-                                                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextBcs,
-                                                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextVcs,
-                                                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextVecs,
-                                                   AubMemDump::DataTypeHintValues::TraceCommandBuffer};
-
-    auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(executionEnvironment, 0, 1);
-
-    for (const uint32_t hint : nonLocalMemoryHints) {
-        EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceNonlocal, csr->getAddressSpace(hint));
-    }
-}
-
-HWTEST_F(CommandStreamSimulatedTests, givenAUBDumpForceAllToLocalMemoryWhenSimulatedCsrGetAddressSpaceIsCalledWithDifferentHintsThenTraceLocalIsReturned) {
-    DebugManagerStateRestore debugRestorer;
-    DebugManager.flags.AUBDumpForceAllToLocalMemory.set(true);
-
-    hardwareInfo.featureTable.flags.ftrLocalMemory = false;
-    ExecutionEnvironment executionEnvironment;
-    executionEnvironment.prepareRootDeviceEnvironments(1);
-    executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hardwareInfo);
-    executionEnvironment.initializeMemoryManager();
-
-    std::array<uint32_t, 7> localMemoryHints = {AubMemDump::DataTypeHintValues::TraceNotype,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextRcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextCcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextBcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextVcs,
-                                                AubMemDump::DataTypeHintValues::TraceLogicalRingContextVecs,
-                                                AubMemDump::DataTypeHintValues::TraceCommandBuffer};
-
-    auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(executionEnvironment, 0, 1);
-
-    if (csr->localMemoryEnabled) {
-        for (const uint32_t hint : localMemoryHints) {
-            EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, csr->getAddressSpace(hint));
-        }
-    }
 }
 
 HWTEST_F(CommandStreamSimulatedTests, givenMultipleBitsInStorageInfoWhenQueryingDeviceIndexThenLowestDeviceIndexIsReturned) {
@@ -304,13 +229,14 @@ HWTEST_F(CommandStreamSimulatedTests, givenSimulatedCommandStreamReceiverWhenClo
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     csr->setupContext(osContext);
+    csr->initializeEngine();
     auto mockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::MemoryNull, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::memoryNull, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = true;
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
     EXPECT_FALSE(mockHardwareContext->writeMemory2Called);
     EXPECT_TRUE(mockManager->writeMemory2Called);
@@ -324,19 +250,23 @@ HWTEST_F(CommandStreamSimulatedTests, givenCompressedAllocationWhenCloningPageTa
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     csr->setupContext(osContext);
+    csr->initializeEngine();
     auto mockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
 
-    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true);
-    gmm.isCompressionEnabled = true;
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, {}, gmmRequirements);
+    gmm.setCompressionEnabled(true);
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::MemoryNull, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::memoryNull, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = true;
 
     graphicsAllocation.setDefaultGmm(&gmm);
 
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
     EXPECT_FALSE(mockHardwareContext->writeMemory2Called);
     EXPECT_TRUE(mockManager->writeMemory2Called);
@@ -354,19 +284,23 @@ HWTEST_F(CommandStreamSimulatedTests, givenUncachedAllocationWhenCloningPageTabl
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     csr->setupContext(osContext);
+    csr->initializeEngine();
     auto mockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
 
-    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED, false, {}, true);
-    gmm.isCompressionEnabled = false;
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED, {}, gmmRequirements);
+    gmm.setCompressionEnabled(false);
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::MemoryNull, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::memoryNull, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = true;
 
     graphicsAllocation.setDefaultGmm(&gmm);
 
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
     EXPECT_FALSE(mockHardwareContext->writeMemory2Called);
     EXPECT_TRUE(mockManager->writeMemory2Called);
@@ -383,17 +317,18 @@ HWTEST_F(CommandStreamSimulatedTests, givenTileInstancedAllocationWhenWriteMemor
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor(0b11));
     csr->hardwareContextController = std::make_unique<HardwareContextController>(*mockManager, osContext, 0);
+    csr->hardwareContextController->createHardwareContexts(*mockManager);
     auto firstMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
     auto secondMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[1].get());
     csr->multiOsContextCapable = true;
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::LocalMemory, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::localMemory, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = false;
     graphicsAllocation.storageInfo.tileInstanced = true;
     graphicsAllocation.storageInfo.memoryBanks = 0b11u;
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
     EXPECT_TRUE(firstMockHardwareContext->writeMemory2Called);
     EXPECT_EQ(0b01u, firstMockHardwareContext->memoryBanksPassed);
@@ -409,6 +344,7 @@ HWTEST_F(CommandStreamSimulatedTests, givenCompressedTileInstancedAllocationWhen
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor(0b11));
     csr->hardwareContextController = std::make_unique<HardwareContextController>(*mockManager, osContext, 0);
+    csr->hardwareContextController->createHardwareContexts(*mockManager);
     auto firstMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
     firstMockHardwareContext->storeAllocationParams = true;
     auto secondMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[1].get());
@@ -416,19 +352,22 @@ HWTEST_F(CommandStreamSimulatedTests, givenCompressedTileInstancedAllocationWhen
 
     csr->multiOsContextCapable = true;
 
-    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true);
-    gmm.isCompressionEnabled = true;
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, {}, gmmRequirements);
+    gmm.setCompressionEnabled(true);
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::LocalMemory, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::localMemory, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = false;
     graphicsAllocation.storageInfo.tileInstanced = true;
     graphicsAllocation.storageInfo.memoryBanks = 0b11u;
 
     graphicsAllocation.setDefaultGmm(&gmm);
 
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
     EXPECT_TRUE(firstMockHardwareContext->writeMemory2Called);
     EXPECT_EQ(1u, firstMockHardwareContext->storedAllocationParams.size());
@@ -448,6 +387,7 @@ HWTEST_F(CommandStreamSimulatedTests, givenUncachedTileInstancedAllocationWhenWr
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor(0b11));
     csr->hardwareContextController = std::make_unique<HardwareContextController>(*mockManager, osContext, 0);
+    csr->hardwareContextController->createHardwareContexts(*mockManager);
     auto firstMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
     firstMockHardwareContext->storeAllocationParams = true;
     auto secondMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[1].get());
@@ -455,19 +395,22 @@ HWTEST_F(CommandStreamSimulatedTests, givenUncachedTileInstancedAllocationWhenWr
 
     csr->multiOsContextCapable = true;
 
-    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED, false, {}, true);
-    gmm.isCompressionEnabled = false;
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    MockGmm gmm(csr->peekGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED, {}, gmmRequirements);
+    gmm.setCompressionEnabled(false);
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::LocalMemory, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::localMemory, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = false;
     graphicsAllocation.storageInfo.tileInstanced = true;
     graphicsAllocation.storageInfo.memoryBanks = 0b11u;
 
     graphicsAllocation.setDefaultGmm(&gmm);
 
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
     EXPECT_TRUE(firstMockHardwareContext->writeMemory2Called);
     EXPECT_EQ(1u, firstMockHardwareContext->storedAllocationParams.size());
@@ -487,17 +430,19 @@ HWTEST_F(CommandStreamSimulatedTests, givenTileInstancedAllocationWithMissingMem
     csr->aubManager = mockManager.get();
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor(0b11));
     csr->hardwareContextController = std::make_unique<HardwareContextController>(*mockManager, osContext, 0);
+    csr->hardwareContextController->createHardwareContexts(*mockManager);
     auto firstMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
     auto secondMockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[1].get());
     csr->multiOsContextCapable = true;
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::UNKNOWN,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::LocalMemory, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::unknown,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::localMemory, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = false;
     graphicsAllocation.storageInfo.tileInstanced = true;
     graphicsAllocation.storageInfo.memoryBanks = 2u;
-    EXPECT_THROW(csr->writeMemoryWithAubManager(graphicsAllocation), std::exception);
+    graphicsAllocation.storageInfo.pageTablesVisibility = osContext.getDeviceBitfield();
+    EXPECT_THROW(csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0), std::exception);
     EXPECT_FALSE(firstMockHardwareContext->writeMemory2Called);
     EXPECT_FALSE(secondMockHardwareContext->writeMemory2Called);
 }
@@ -508,12 +453,12 @@ HWTEST_F(CommandStreamSimulatedTests, givenCommandBufferAllocationWhenWriteMemor
     csr->aubManager = mockManager.get();
 
     int dummy = 1;
-    GraphicsAllocation graphicsAllocation{0, AllocationType::COMMAND_BUFFER,
-                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::MemoryNull, MemoryManager::maxOsContextCount};
+    GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::commandBuffer,
+                                          &dummy, 0, 0, sizeof(dummy), MemoryPool::memoryNull, MemoryManager::maxOsContextCount};
     graphicsAllocation.storageInfo.cloningOfPageTables = true;
-    csr->writeMemoryWithAubManager(graphicsAllocation);
+    csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceBatchBuffer, mockManager->hintToWriteMemory);
+    EXPECT_EQ(aub_stream::DataTypeHintValues::TraceBatchBuffer, mockManager->hintToWriteMemory);
     EXPECT_TRUE(mockManager->writeMemory2Called);
 }
 
@@ -525,14 +470,15 @@ HWTEST_F(CommandStreamSimulatedTests, givenSpecificMemoryPoolAllocationWhenWrite
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     csr->hardwareContextController = std::make_unique<HardwareContextController>(*mockManager, osContext, 0);
     csr->setupContext(osContext);
+    csr->initializeEngine();
     auto mockHardwareContext = static_cast<MockHardwareContext *>(csr->hardwareContextController->hardwareContexts[0].get());
 
     int dummy = 1;
 
     MemoryPool poolsWith4kPages[] = {
-        MemoryPool::System4KBPages,
-        MemoryPool::System4KBPagesWith32BitGpuAddressing,
-        MemoryPool::SystemCpuInaccessible};
+        MemoryPool::system4KBPages,
+        MemoryPool::system4KBPagesWith32BitGpuAddressing,
+        MemoryPool::systemCpuInaccessible};
 
     for (size_t i = 0; i < arrayCount(poolsWith4kPages); i++) {
 
@@ -542,16 +488,16 @@ HWTEST_F(CommandStreamSimulatedTests, givenSpecificMemoryPoolAllocationWhenWrite
         mockHardwareContext->writeMemoryPageSizePassed = 0;
         mockHardwareContext->writeMemory2Called = false;
 
-        GraphicsAllocation graphicsAllocation{0, AllocationType::COMMAND_BUFFER,
+        GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::commandBuffer,
                                               &dummy, 0, 0, sizeof(dummy), poolsWith4kPages[i], MemoryManager::maxOsContextCount};
         graphicsAllocation.storageInfo.cloningOfPageTables = true;
-        csr->writeMemoryWithAubManager(graphicsAllocation);
+        csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
         EXPECT_TRUE(mockManager->writeMemory2Called);
         EXPECT_EQ(MemoryConstants::pageSize, mockManager->writeMemoryPageSizePassed);
 
         graphicsAllocation.storageInfo.cloningOfPageTables = false;
-        csr->writeMemoryWithAubManager(graphicsAllocation);
+        csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
         if (graphicsAllocation.isAllocatedInLocalMemoryPool()) {
             EXPECT_TRUE(mockHardwareContext->writeMemory2Called);
@@ -563,9 +509,9 @@ HWTEST_F(CommandStreamSimulatedTests, givenSpecificMemoryPoolAllocationWhenWrite
     }
 
     MemoryPool poolsWith64kPages[] = {
-        MemoryPool::System64KBPages,
-        MemoryPool::System64KBPagesWith32BitGpuAddressing,
-        MemoryPool::LocalMemory};
+        MemoryPool::system64KBPages,
+        MemoryPool::system64KBPagesWith32BitGpuAddressing,
+        MemoryPool::localMemory};
 
     for (size_t i = 0; i < arrayCount(poolsWith64kPages); i++) {
 
@@ -575,16 +521,16 @@ HWTEST_F(CommandStreamSimulatedTests, givenSpecificMemoryPoolAllocationWhenWrite
         mockHardwareContext->writeMemoryPageSizePassed = 0;
         mockHardwareContext->writeMemory2Called = false;
 
-        GraphicsAllocation graphicsAllocation{0, AllocationType::COMMAND_BUFFER,
+        GraphicsAllocation graphicsAllocation{0, 1u /*num gmms*/, AllocationType::commandBuffer,
                                               &dummy, 0, 0, sizeof(dummy), poolsWith64kPages[i], MemoryManager::maxOsContextCount};
         graphicsAllocation.storageInfo.cloningOfPageTables = true;
-        csr->writeMemoryWithAubManager(graphicsAllocation);
+        csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
         EXPECT_TRUE(mockManager->writeMemory2Called);
         EXPECT_EQ(MemoryConstants::pageSize64k, mockManager->writeMemoryPageSizePassed);
 
         graphicsAllocation.storageInfo.cloningOfPageTables = false;
-        csr->writeMemoryWithAubManager(graphicsAllocation);
+        csr->writeMemoryWithAubManager(graphicsAllocation, false, 0, 0);
 
         if (graphicsAllocation.isAllocatedInLocalMemoryPool()) {
             EXPECT_TRUE(mockHardwareContext->writeMemory2Called);
@@ -593,5 +539,101 @@ HWTEST_F(CommandStreamSimulatedTests, givenSpecificMemoryPoolAllocationWhenWrite
             EXPECT_TRUE(mockManager->writeMemory2Called);
             EXPECT_EQ(MemoryConstants::pageSize64k, mockManager->writeMemoryPageSizePassed);
         }
+    }
+}
+
+HWTEST_F(CommandStreamSimulatedTests, givenBarrierNodesWhenProgramStallingCommandsForBarrierCalledThenPostSyncWritePipeControlIsProgrammed) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+    MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
+    csr->setupContext(osContext);
+    csr->initializeEngine();
+
+    TagAllocatorBase *allocator = pDevice->getGpgpuCommandStreamReceiver().getTimestampPacketAllocator();
+    auto barrierNode = allocator->getTag();
+    const auto barrierNodeAddress = TimestampPacketHelper::getContextEndGpuAddress(*barrierNode);
+    TimestampPacketContainer barrierNodes{};
+    barrierNodes.add(barrierNode);
+
+    {
+        MockGraphicsAllocation streamAllocation{};
+        uint32_t streamBuffer[100] = {};
+        LinearStream linearStream(&streamAllocation, streamBuffer, sizeof(streamBuffer));
+
+        csr->programStallingCommandsForBarrier(linearStream, &barrierNodes, false);
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(linearStream);
+        auto pipeControlItor = find<PIPE_CONTROL *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+        auto pipeControl = genCmdCast<PIPE_CONTROL *>(*pipeControlItor);
+        if (UnitTestHelper<FamilyType>::isPipeControlWArequired(hardwareInfo)) {
+            auto nextPipeControlItor = find<PIPE_CONTROL *>(++pipeControlItor, hwParser.cmdList.end());
+            pipeControl = genCmdCast<PIPE_CONTROL *>(*nextPipeControlItor);
+        }
+        ASSERT_NE(nullptr, pipeControl);
+        EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA, pipeControl->getPostSyncOperation());
+        EXPECT_FALSE(pipeControl->getDcFlushEnable());
+        EXPECT_EQ(barrierNodeAddress, UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl));
+    }
+    {
+        MockGraphicsAllocation streamAllocation{};
+        uint32_t streamBuffer[100] = {};
+        LinearStream linearStream(&streamAllocation, streamBuffer, sizeof(streamBuffer));
+
+        csr->programStallingCommandsForBarrier(linearStream, &barrierNodes, true);
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(linearStream);
+        auto pipeControlItor = find<PIPE_CONTROL *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+        auto pipeControl = genCmdCast<PIPE_CONTROL *>(*pipeControlItor);
+        if (UnitTestHelper<FamilyType>::isPipeControlWArequired(hardwareInfo)) {
+            auto nextPipeControlItor = find<PIPE_CONTROL *>(++pipeControlItor, hwParser.cmdList.end());
+            pipeControl = genCmdCast<PIPE_CONTROL *>(*nextPipeControlItor);
+        }
+        ASSERT_NE(nullptr, pipeControl);
+        EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA, pipeControl->getPostSyncOperation());
+        EXPECT_EQ(csr->getDcFlushSupport(), pipeControl->getDcFlushEnable());
+        EXPECT_EQ(barrierNodeAddress, UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl));
+    }
+}
+
+HWTEST_F(CommandStreamSimulatedTests, givenEmptyBarrierNodesWhenProgramStallingCommandsForBarrierCalledThenNoWritePipeControlIsProgrammed) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    auto csr = std::make_unique<MockSimulatedCsrHw<FamilyType>>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+    MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
+    csr->setupContext(osContext);
+    csr->initializeEngine();
+    {
+        TimestampPacketContainer barrierNodes{};
+
+        MockGraphicsAllocation streamAllocation{};
+        uint32_t streamBuffer[100] = {};
+        LinearStream linearStream(&streamAllocation, streamBuffer, sizeof(streamBuffer));
+
+        csr->programStallingCommandsForBarrier(linearStream, &barrierNodes, false);
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(linearStream);
+        const auto pipeControlItor = find<PIPE_CONTROL *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+        const auto pipeControl = genCmdCast<PIPE_CONTROL *>(*pipeControlItor);
+        ASSERT_NE(nullptr, pipeControl);
+        EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_NO_WRITE, pipeControl->getPostSyncOperation());
+        EXPECT_EQ(0u, UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl));
+    }
+
+    {
+        MockGraphicsAllocation streamAllocation{};
+        uint32_t streamBuffer[100] = {};
+        LinearStream linearStream(&streamAllocation, streamBuffer, sizeof(streamBuffer));
+
+        csr->programStallingCommandsForBarrier(linearStream, nullptr, false);
+
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(linearStream);
+        const auto pipeControlItor = find<PIPE_CONTROL *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+        const auto pipeControl = genCmdCast<PIPE_CONTROL *>(*pipeControlItor);
+        ASSERT_NE(nullptr, pipeControl);
+        EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_NO_WRITE, pipeControl->getPostSyncOperation());
+        EXPECT_EQ(0u, UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl));
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,26 +14,26 @@
 
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
 enum class NewAluOpcodes : uint32_t {
-    OPCODE_LOAD = 0x080,
-    OPCODE_LOAD0 = 0x081,
-    OPCODE_LOAD1 = 0x481,
-    OPCODE_LOADIND = 0x082,
-    OPCODE_STOREIND = 0x181,
-    OPCODE_SHL = 0x105,
-    OPCODE_SHR = 0x106,
-    OPCODE_SAR = 0x107,
-    OPCODE_FENCE = 0x001
+    opcodeLoad = 0x080,
+    opcodeLoad0 = 0x081,
+    opcodeLoad1 = 0x481,
+    opcodeLoadind = 0x082,
+    opcodeStoreind = 0x181,
+    opcodeShl = 0x105,
+    opcodeShr = 0x106,
+    opcodeSar = 0x107,
+    opcodeFence = 0x001
 };
 
 struct MiMath : public AUBFixture, public ::testing::Test {
     void SetUp() override {
         AUBFixture::setUp(defaultHwInfo.get());
 
-        streamAllocation = this->device->getMemoryManager()->allocateGraphicsMemoryWithProperties({device->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::COMMAND_BUFFER, device->getDeviceBitfield()});
+        streamAllocation = this->device->getMemoryManager()->allocateGraphicsMemoryWithProperties({device->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::commandBuffer, device->getDeviceBitfield()});
         taskStream = std::make_unique<LinearStream>(streamAllocation);
     }
     void TearDown() override {
@@ -46,9 +46,9 @@ struct MiMath : public AUBFixture, public ::testing::Test {
         dispatchFlags.guardCommandBufferWithPipeControl = true;
 
         csr->flushTask(*taskStream, 0,
-                       &csr->getIndirectHeap(IndirectHeapType::DYNAMIC_STATE, 0u),
-                       &csr->getIndirectHeap(IndirectHeapType::INDIRECT_OBJECT, 0u),
-                       &csr->getIndirectHeap(IndirectHeapType::SURFACE_STATE, 0u),
+                       &csr->getIndirectHeap(IndirectHeapType::dynamicState, 0u),
+                       &csr->getIndirectHeap(IndirectHeapType::indirectObject, 0u),
+                       &csr->getIndirectHeap(IndirectHeapType::surfaceState, 0u),
                        0u, dispatchFlags, device->getDevice());
 
         csr->flushBatchedSubmissions();
@@ -92,31 +92,31 @@ struct MiMath : public AUBFixture, public ::testing::Test {
     void loadAddressToMiMathAccu(uint32_t lowAddressRegister, uint32_t highAddressRegister, uint32_t shiftReg) {
         using MI_MATH_ALU_INST_INLINE = typename FamilyType::MI_MATH_ALU_INST_INLINE;
         MI_MATH_ALU_INST_INLINE *pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(numberOfOperationToLoadAddressToMiMathAccu * sizeof(MI_MATH_ALU_INST_INLINE)));
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load high part of address from register with older to SRCA
-        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load high part of address from register with older to SRCA
+        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
         pAluParam->DW0.BitField.Operand2 = highAddressRegister;
         pAluParam++;
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load 32 - value from shiftReg , to SRCB (to shift high part in register)
-        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load 32 - value from shiftReg , to SRCB (to shift high part in register)
+        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
         pAluParam->DW0.BitField.Operand2 = shiftReg;
         pAluParam++;
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SHL); // shift high part
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeShl); // shift high part
         pAluParam->DW0.BitField.Operand1 = 0;
         pAluParam->DW0.BitField.Operand2 = 0;
         pAluParam++;
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // move result to highAddressRegister
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // move result to highAddressRegister
         pAluParam->DW0.BitField.Operand1 = highAddressRegister;
-        pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+        pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
         pAluParam++;
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load highAddressRegister to SRCA
-        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load highAddressRegister to SRCA
+        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
         pAluParam->DW0.BitField.Operand2 = highAddressRegister;
         pAluParam++;
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load low part of address to SRCB
-        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load low part of address to SRCB
+        pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
         pAluParam->DW0.BitField.Operand2 = lowAddressRegister;
         pAluParam++;
-        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_OR); // join parts of address and locate in ACCU
+        pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeOr); // join parts of address and locate in ACCU
         pAluParam->DW0.BitField.Operand1 = 0;
         pAluParam->DW0.BitField.Operand2 = 0;
     }
@@ -148,67 +148,67 @@ HWTEST2_F(MiMath, givenLoadIndirectFromMemoryWhenUseMiMathToSimpleOperationThenS
     uint32_t valueToAdd = 5u;
     uint64_t valueAfterMiMathOperation = bufferMemory[0] + valueToAdd;
 
-    loadAddressToRegisters<FamilyType>(CS_GPR_R0, CS_GPR_R1, CS_GPR_R2, allocation->getGpuAddress()); // prepare registers to mi_math operation
-    loadValueToRegister<FamilyType>(valueToAdd, CS_GPR_R3);
+    loadAddressToRegisters<FamilyType>(RegisterOffsets::csGprR0, RegisterOffsets::csGprR1, RegisterOffsets::csGprR2, allocation->getGpuAddress()); // prepare registers to mi_math operation
+    loadValueToRegister<FamilyType>(valueToAdd, RegisterOffsets::csGprR3);
 
     auto pCmd = reinterpret_cast<uint32_t *>(taskStream->getSpace(sizeof(MI_MATH)));
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.Value = 0x0;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionType = MI_MATH::COMMAND_TYPE_MI_COMMAND;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionOpcode = MI_MATH::MI_COMMAND_OPCODE_MI_MATH;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.DwordLength = numberOfOperationToLoadAddressToMiMathAccu + 13 - 1;
-    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::R_0), static_cast<uint32_t>(AluRegisters::R_1), static_cast<uint32_t>(AluRegisters::R_2)); // GPU address of buffer load to ACCU register
+    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::gpr0), static_cast<uint32_t>(AluRegisters::gpr1), static_cast<uint32_t>(AluRegisters::gpr2)); // GPU address of buffer load to ACCU register
     MI_MATH_ALU_INST_INLINE *pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(13 * sizeof(MI_MATH_ALU_INST_INLINE)));
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_LOADIND); // load dword from memory address located in ACCU
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_0);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeLoadind); // load dword from memory address located in ACCU
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr0);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // copy address from ACCU to R2
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_2);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // copy address from ACCU to R2
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr2);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // R0 to SRCA
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_0);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // R0 to SRCA
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr0);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // R3 to SRCB where is value of 'valueToAdd'
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_3);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // R3 to SRCB where is value of 'valueToAdd'
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr3);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_ADD); // do simple add on registers SRCA and SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeAdd); // do simple add on registers SRCA and SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // R3 to SRCB where is value of 'valueToAdd'
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_1);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // R3 to SRCB where is value of 'valueToAdd'
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr1);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load address from R2 where is copy of address to SRCA
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_2);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load address from R2 where is copy of address to SRCA
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr2);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_LOAD0);
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeLoad0);
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_ADD); // move address to ACCU
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeAdd); // move address to ACCU
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_STOREIND); // store to memory from ACCU, value from register R1
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_ACCU);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_1);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeStoreind); // store to memory from ACCU, value from register R1
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::accu);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr1);
 
     flushStream();
 
@@ -236,8 +236,8 @@ HWTEST2_F(MiMath, givenLoadIndirectFromMemoryWhenUseMiMathThenStoreIndirectToAno
     csr->makeResident(*buffer->getGraphicsAllocation(rootDeviceIndex));
     csr->makeResident(*bufferB->getGraphicsAllocation(rootDeviceIndex));
 
-    loadAddressToRegisters<FamilyType>(CS_GPR_R0, CS_GPR_R1, CS_GPR_R2, buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress());  // prepare registers to mi_math operation
-    loadAddressToRegisters<FamilyType>(CS_GPR_R3, CS_GPR_R4, CS_GPR_R2, bufferB->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress()); // prepare registers to mi_math operation
+    loadAddressToRegisters<FamilyType>(RegisterOffsets::csGprR0, RegisterOffsets::csGprR1, RegisterOffsets::csGprR2, buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress());  // prepare registers to mi_math operation
+    loadAddressToRegisters<FamilyType>(RegisterOffsets::csGprR3, RegisterOffsets::csGprR4, RegisterOffsets::csGprR2, bufferB->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress()); // prepare registers to mi_math operation
 
     auto pCmd = reinterpret_cast<uint32_t *>(taskStream->getSpace(sizeof(MI_MATH)));
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.Value = 0x0;
@@ -245,33 +245,33 @@ HWTEST2_F(MiMath, givenLoadIndirectFromMemoryWhenUseMiMathThenStoreIndirectToAno
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionOpcode = MI_MATH::MI_COMMAND_OPCODE_MI_MATH;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.DwordLength = numberOfOperationToLoadAddressToMiMathAccu * 2 + 6 - 1;
 
-    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::R_0), static_cast<uint32_t>(AluRegisters::R_1), static_cast<uint32_t>(AluRegisters::R_2)); // GPU address of buffer load to ACCU register
+    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::gpr0), static_cast<uint32_t>(AluRegisters::gpr1), static_cast<uint32_t>(AluRegisters::gpr2)); // GPU address of buffer load to ACCU register
 
     MI_MATH_ALU_INST_INLINE *pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(3 * sizeof(MI_MATH_ALU_INST_INLINE)));
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_LOADIND); // load dword from memory address located in ACCU to R0
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_0);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeLoadind); // load dword from memory address located in ACCU to R0
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr0);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
 
-    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::R_3), static_cast<uint32_t>(AluRegisters::R_4), static_cast<uint32_t>(AluRegisters::R_2)); // GPU address of bufferB load to ACCU register
+    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::gpr3), static_cast<uint32_t>(AluRegisters::gpr4), static_cast<uint32_t>(AluRegisters::gpr2)); // GPU address of bufferB load to ACCU register
 
     pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(3 * sizeof(MI_MATH_ALU_INST_INLINE)));
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_STOREIND); // store to memory from ACCU, value from register R0
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_ACCU);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_0);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeStoreind); // store to memory from ACCU, value from register R0
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::accu);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr0);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
 
@@ -299,9 +299,9 @@ HWTEST2_F(MiMath, givenValueToMakeLeftLogicalShiftWhenUseMiMathThenShiftIsDonePr
     uint32_t notPowerOfTwoShift = 5u;
     uint32_t expectedUsedShift = 4u;
 
-    loadValueToRegister<FamilyType>(value, CS_GPR_R0);
-    loadValueToRegister<FamilyType>(shift, CS_GPR_R1);
-    loadValueToRegister<FamilyType>(notPowerOfTwoShift, CS_GPR_R2);
+    loadValueToRegister<FamilyType>(value, RegisterOffsets::csGprR0);
+    loadValueToRegister<FamilyType>(shift, RegisterOffsets::csGprR1);
+    loadValueToRegister<FamilyType>(notPowerOfTwoShift, RegisterOffsets::csGprR2);
     auto pCmd = reinterpret_cast<uint32_t *>(taskStream->getSpace(sizeof(MI_MATH)));
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.Value = 0x0;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionType = MI_MATH::COMMAND_TYPE_MI_COMMAND;
@@ -309,36 +309,36 @@ HWTEST2_F(MiMath, givenValueToMakeLeftLogicalShiftWhenUseMiMathThenShiftIsDonePr
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.DwordLength = 7 - 1;
 
     MI_MATH_ALU_INST_INLINE *pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(7 * sizeof(MI_MATH_ALU_INST_INLINE)));
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value from R0 to SRCA
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_0);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value from R0 to SRCA
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr0);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_1);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr1);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SHL); // load value to shift to SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeShl); // load value to shift to SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_1);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr1);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_2);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr2);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SHL); // load value to shift to SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeShl); // load value to shift to SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_2);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr2);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
 
-    storeValueInRegisterToMemory<FamilyType>(buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), CS_GPR_R1);
-    storeValueInRegisterToMemory<FamilyType>(buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress() + 4, CS_GPR_R2);
+    storeValueInRegisterToMemory<FamilyType>(buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), RegisterOffsets::csGprR1);
+    storeValueInRegisterToMemory<FamilyType>(buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress() + 4, RegisterOffsets::csGprR2);
     flushStream();
 
     uint32_t firstShift = value << shift;
@@ -370,9 +370,9 @@ HWTEST2_F(MiMath, givenValueToMakeRightLogicalShiftWhenUseMiMathThenShiftIsDoneP
     uint32_t notPowerOfTwoShift = 5u;
     uint32_t expectedUsedShift = 4u;
 
-    loadValueToRegister<FamilyType>(value, CS_GPR_R0);
-    loadValueToRegister<FamilyType>(shift, CS_GPR_R1);
-    loadValueToRegister<FamilyType>(notPowerOfTwoShift, CS_GPR_R2);
+    loadValueToRegister<FamilyType>(value, RegisterOffsets::csGprR0);
+    loadValueToRegister<FamilyType>(shift, RegisterOffsets::csGprR1);
+    loadValueToRegister<FamilyType>(notPowerOfTwoShift, RegisterOffsets::csGprR2);
     auto pCmd = reinterpret_cast<uint32_t *>(taskStream->getSpace(sizeof(MI_MATH)));
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.Value = 0x0;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionType = MI_MATH::COMMAND_TYPE_MI_COMMAND;
@@ -380,36 +380,36 @@ HWTEST2_F(MiMath, givenValueToMakeRightLogicalShiftWhenUseMiMathThenShiftIsDoneP
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.DwordLength = 7 - 1;
 
     MI_MATH_ALU_INST_INLINE *pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(7 * sizeof(MI_MATH_ALU_INST_INLINE)));
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value from R0 to SRCA
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_0);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value from R0 to SRCA
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr0);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_1);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr1);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SHR); // load value to shift to SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeShr); // load value to shift to SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_1);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr1);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_2);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr2);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SHR); // load value to shift to SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeShr); // load value to shift to SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_2);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr2);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
 
-    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress(), CS_GPR_R1);
-    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress() + 4, CS_GPR_R2);
+    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress(), RegisterOffsets::csGprR1);
+    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress() + 4, RegisterOffsets::csGprR2);
     flushStream();
 
     uint32_t firstShift = value >> shift;
@@ -441,55 +441,55 @@ HWTEST2_F(MiMath, givenValueToMakeRightAritmeticShiftWhenUseMiMathThenShiftIsDon
     uint32_t notPowerOfTwoShift = 5u;
     uint32_t expectedUsedShift = 4u;
 
-    loadAddressToRegisters<FamilyType>(CS_GPR_R0, CS_GPR_R1, CS_GPR_R2, allocation->getGpuAddress()); // prepare registers to mi_math operation
-    loadValueToRegister<FamilyType>(shift, CS_GPR_R4);
-    loadValueToRegister<FamilyType>(notPowerOfTwoShift, CS_GPR_R5);
+    loadAddressToRegisters<FamilyType>(RegisterOffsets::csGprR0, RegisterOffsets::csGprR1, RegisterOffsets::csGprR2, allocation->getGpuAddress()); // prepare registers to mi_math operation
+    loadValueToRegister<FamilyType>(shift, RegisterOffsets::csGprR4);
+    loadValueToRegister<FamilyType>(notPowerOfTwoShift, RegisterOffsets::csGprR5);
 
     auto pCmd = reinterpret_cast<uint32_t *>(taskStream->getSpace(sizeof(MI_MATH)));
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.Value = 0x0;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionType = MI_MATH::COMMAND_TYPE_MI_COMMAND;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.InstructionOpcode = MI_MATH::MI_COMMAND_OPCODE_MI_MATH;
     reinterpret_cast<MI_MATH *>(pCmd)->DW0.BitField.DwordLength = numberOfOperationToLoadAddressToMiMathAccu + 9 - 1;
-    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::R_0), static_cast<uint32_t>(AluRegisters::R_1), static_cast<uint32_t>(AluRegisters::R_2)); // GPU address of buffer load to ACCU register
+    loadAddressToMiMathAccu<FamilyType>(static_cast<uint32_t>(AluRegisters::gpr0), static_cast<uint32_t>(AluRegisters::gpr1), static_cast<uint32_t>(AluRegisters::gpr2)); // GPU address of buffer load to ACCU register
     MI_MATH_ALU_INST_INLINE *pAluParam = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(taskStream->getSpace(9 * sizeof(MI_MATH_ALU_INST_INLINE)));
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_LOADIND); // load value from R0 to SRCA
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_3);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeLoadind); // load value from R0 to SRCA
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr3);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_FENCE); // to be sure that all writes and reads are completed
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeFence); // to be sure that all writes and reads are completed
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value from R0 to SRCA
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCA);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_3);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value from R0 to SRCA
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srca);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr3);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_4);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr4);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SAR); // load value to shift to SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeSar); // load value to shift to SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_4);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr4);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_LOAD); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_SRCB);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_5);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeLoad); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::srcb);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::gpr5);
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::OPCODE_SAR); // load value to shift to SRCB
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(NewAluOpcodes::opcodeSar); // load value to shift to SRCB
     pAluParam->DW0.BitField.Operand1 = 0;
     pAluParam->DW0.BitField.Operand2 = 0;
     pAluParam++;
-    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::OPCODE_STORE); // load value to shift to SRCB
-    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::R_5);
-    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::R_ACCU);
+    pAluParam->DW0.BitField.ALUOpcode = static_cast<uint32_t>(AluRegisters::opcodeStore); // load value to shift to SRCB
+    pAluParam->DW0.BitField.Operand1 = static_cast<uint32_t>(AluRegisters::gpr5);
+    pAluParam->DW0.BitField.Operand2 = static_cast<uint32_t>(AluRegisters::accu);
 
-    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress(), CS_GPR_R4);
-    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress() + 4, CS_GPR_R5);
+    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress(), RegisterOffsets::csGprR4);
+    storeValueInRegisterToMemory<FamilyType>(allocation->getGpuAddress() + 4, RegisterOffsets::csGprR5);
     flushStream();
 
     int64_t firstShift = bufferMemory[0];
@@ -510,12 +510,19 @@ HWTEST2_F(MiMath, givenValueToMakeRightAritmeticShiftWhenUseMiMathThenShiftIsDon
     expectMemory<FamilyType>(reinterpret_cast<void *>(allocation->getGpuAddress() + 4), &executeSecondShift, sizeof(uint32_t));
 }
 
+template <typename CompareDataT>
 struct ConditionalBbStartTests : public MiMath {
+    using TestCompareDataT = CompareDataT;
+
     void SetUp() override {
         MiMath::SetUp();
 
-        std::vector<uint32_t> bufferMemory;
+        std::vector<CompareDataT> bufferMemory;
         bufferMemory.resize(compareBufferSize);
+
+        if constexpr (isQwordData) {
+            baseCompareValue = 0x1'0000'0000;
+        }
 
         std::fill(bufferMemory.begin(), bufferMemory.end(), baseCompareValue);
 
@@ -527,213 +534,279 @@ struct ConditionalBbStartTests : public MiMath {
 
         buffer = std::unique_ptr<Buffer>(Buffer::create(context,
                                                         CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                                        compareBufferSize * sizeof(uint32_t), bufferMemory.data(), retVal));
+                                                        compareBufferSize * sizeof(CompareDataT), bufferMemory.data(), retVal));
 
         csr->makeResident(*buffer->getGraphicsAllocation(rootDeviceIndex));
 
-        baseGpuVa = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress();
-        baseWriteGpuVa = baseGpuVa + (sizeof(uint32_t) * numCompareModes);
+        baseGpuVa = ptrOffset(buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), buffer->getOffset());
+        baseWriteGpuVa = baseGpuVa + (sizeof(CompareDataT) * numCompareModes);
     }
+
+    template <typename AtomicT>
+    typename AtomicT::ATOMIC_OPCODES getAtomicOpcode() const {
+        return isQwordData ? AtomicT::ATOMIC_OPCODES::ATOMIC_8B_INCREMENT : AtomicT::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT;
+    }
+
+    template <typename AtomicT>
+    typename AtomicT::DATA_SIZE geDataSize() const {
+        return isQwordData ? AtomicT::DATA_SIZE::DATA_SIZE_QWORD : AtomicT::DATA_SIZE::DATA_SIZE_DWORD;
+    }
+
+    template <typename FamilyType>
+    void whenDispatchingEqualModeThenResultsAreValidImpl();
+
+    template <typename FamilyType>
+    void whenDispatchingNotEqualModeThenResultsAreValidImpl();
+
+    template <typename FamilyType>
+    void whenDispatchingGreaterOrEqualModeThenResultsAreValidImpl();
+
+    template <typename FamilyType>
+    void whenDispatchingLessModeThenResultsAreValidImpl();
 
     uint64_t baseGpuVa = 0;
     uint64_t baseWriteGpuVa = 0;
     uint64_t invalidGpuVa = 0x1230000;
     uint32_t numCompareModes = 3;
     const size_t compareBufferSize = numCompareModes * 3;
-    const uint32_t baseCompareValue = 10;
+    CompareDataT baseCompareValue = 10;
     std::unique_ptr<Buffer> buffer;
+    static constexpr bool isQwordData = std::is_same<uint64_t, TestCompareDataT>::value;
 };
 
-HWTEST2_F(ConditionalBbStartTests, whenDispatchingEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+using ConditionalBbStartTests32b = ConditionalBbStartTests<uint32_t>;
+using ConditionalBbStartTests64b = ConditionalBbStartTests<uint64_t>;
+
+template <typename T>
+template <typename FamilyType>
+void ConditionalBbStartTests<T>::whenDispatchingEqualModeThenResultsAreValidImpl() {
     using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
 
     // Equal
     {
-        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart() + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
+        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart(isQwordData) + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
 
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa, baseCompareValue, NEO::CompareOperation::Equal, false);
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa, baseCompareValue, NEO::CompareOperation::equal, false, isQwordData, false);
 
         NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
 
         EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa,
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
                                                   0, 0, 0, 0);
     }
 
     // Greater
     {
 
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + sizeof(uint32_t), baseCompareValue, NEO::CompareOperation::Equal, false);
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + sizeof(TestCompareDataT), baseCompareValue, NEO::CompareOperation::equal, false, isQwordData, false);
 
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(uint32_t),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(TestCompareDataT),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
                                                   0, 0, 0, 0);
     }
 
     // Less
     {
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + (sizeof(uint32_t) * 2), baseCompareValue, NEO::CompareOperation::Equal, false);
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + (sizeof(TestCompareDataT) * 2), baseCompareValue, NEO::CompareOperation::equal, false, isQwordData, false);
 
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(uint32_t) * 2),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(TestCompareDataT) * 2),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
                                                   0, 0, 0, 0);
     }
 
     flushStream();
 
-    uint32_t expectedValue = baseCompareValue + 1;
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(uint32_t)), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(uint32_t) * 2)), &expectedValue, sizeof(uint32_t));
+    TestCompareDataT expectedValue = baseCompareValue + 1;
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(TestCompareDataT)), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(TestCompareDataT) * 2)), &expectedValue, sizeof(TestCompareDataT));
 }
 
-HWTEST2_F(ConditionalBbStartTests, whenDispatchingNotEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
-    using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
-
-    // Equal
-    {
-
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa, baseCompareValue, NEO::CompareOperation::NotEqual, false);
-
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa,
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
-                                                  0, 0, 0, 0);
-    }
-
-    // Greater
-    {
-
-        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart() + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
-
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + sizeof(uint32_t), baseCompareValue, NEO::CompareOperation::NotEqual, false);
-
-        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
-
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(uint32_t),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
-                                                  0, 0, 0, 0);
-    }
-
-    // Less
-    {
-        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart() + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
-
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + (sizeof(uint32_t) * 2), baseCompareValue, NEO::CompareOperation::NotEqual, false);
-
-        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
-
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(uint32_t) * 2),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
-                                                  0, 0, 0, 0);
-    }
-
-    flushStream();
-
-    uint32_t expectedValue = baseCompareValue + 1;
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(uint32_t)), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(uint32_t) * 2)), &expectedValue, sizeof(uint32_t));
+HWTEST2_F(ConditionalBbStartTests32b, whenDispatchingEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingEqualModeThenResultsAreValidImpl<FamilyType>();
 }
 
-HWTEST2_F(ConditionalBbStartTests, whenDispatchingGreaterOrEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
-    using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
-
-    // Equal
-    {
-        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart() + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
-
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa, baseCompareValue, NEO::CompareOperation::GreaterOrEqual, false);
-
-        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
-
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa,
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
-                                                  0, 0, 0, 0);
-    }
-
-    // Greater
-    {
-
-        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart() + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
-
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + sizeof(uint32_t), baseCompareValue, NEO::CompareOperation::GreaterOrEqual, false);
-
-        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
-
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(uint32_t),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
-                                                  0, 0, 0, 0);
-    }
-
-    // Less
-    {
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + (sizeof(uint32_t) * 2), baseCompareValue, NEO::CompareOperation::GreaterOrEqual, false);
-
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(uint32_t) * 2),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
-                                                  0, 0, 0, 0);
-    }
-
-    flushStream();
-
-    uint32_t expectedValue = baseCompareValue + 1;
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(uint32_t)), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(uint32_t) * 2)), &expectedValue, sizeof(uint32_t));
+HWTEST2_F(ConditionalBbStartTests64b, whenDispatchingEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingEqualModeThenResultsAreValidImpl<FamilyType>();
 }
 
-HWTEST2_F(ConditionalBbStartTests, whenDispatchingLessModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+template <typename T>
+template <typename FamilyType>
+void ConditionalBbStartTests<T>::whenDispatchingNotEqualModeThenResultsAreValidImpl() {
     using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
 
     // Equal
     {
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa, baseCompareValue, NEO::CompareOperation::Less, false);
+
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa, baseCompareValue, NEO::CompareOperation::notEqual, false, isQwordData, false);
 
         EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa,
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
                                                   0, 0, 0, 0);
     }
 
     // Greater
     {
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + sizeof(uint32_t), baseCompareValue, NEO::CompareOperation::Less, false);
 
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(uint32_t),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
+        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart(isQwordData) + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
+
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + sizeof(TestCompareDataT), baseCompareValue, NEO::CompareOperation::notEqual, false, isQwordData, false);
+
+        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(TestCompareDataT),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
                                                   0, 0, 0, 0);
     }
 
     // Less
     {
-        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart() + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
+        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart(isQwordData) + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
 
-        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + (sizeof(uint32_t) * 2), baseCompareValue, NEO::CompareOperation::Less, false);
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + (sizeof(TestCompareDataT) * 2), baseCompareValue, NEO::CompareOperation::notEqual, false, isQwordData, false);
 
         NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
 
-        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(uint32_t) * 2),
-                                                  MI_ATOMIC::ATOMIC_OPCODES::ATOMIC_4B_INCREMENT,
-                                                  MI_ATOMIC::DATA_SIZE::DATA_SIZE_DWORD,
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(TestCompareDataT) * 2),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
                                                   0, 0, 0, 0);
     }
 
     flushStream();
 
-    uint32_t expectedValue = baseCompareValue + 1;
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(uint32_t)), &expectedValue, sizeof(uint32_t));
-    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(uint32_t) * 2)), &expectedValue, sizeof(uint32_t));
+    TestCompareDataT expectedValue = baseCompareValue + 1;
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(TestCompareDataT)), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(TestCompareDataT) * 2)), &expectedValue, sizeof(TestCompareDataT));
+}
+
+HWTEST2_F(ConditionalBbStartTests32b, whenDispatchingNotEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingNotEqualModeThenResultsAreValidImpl<FamilyType>();
+}
+
+HWTEST2_F(ConditionalBbStartTests64b, whenDispatchingNotEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingNotEqualModeThenResultsAreValidImpl<FamilyType>();
+}
+
+template <typename T>
+template <typename FamilyType>
+void ConditionalBbStartTests<T>::whenDispatchingGreaterOrEqualModeThenResultsAreValidImpl() {
+    using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
+
+    // Equal
+    {
+        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart(isQwordData) + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
+
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa, baseCompareValue, NEO::CompareOperation::greaterOrEqual, false, isQwordData, false);
+
+        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa,
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
+                                                  0, 0, 0, 0);
+    }
+
+    // Greater
+    {
+
+        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart(isQwordData) + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
+
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + sizeof(TestCompareDataT), baseCompareValue, NEO::CompareOperation::greaterOrEqual, false, isQwordData, false);
+
+        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(TestCompareDataT),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
+                                                  0, 0, 0, 0);
+    }
+
+    // Less
+    {
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + (sizeof(TestCompareDataT) * 2), baseCompareValue, NEO::CompareOperation::greaterOrEqual, false, isQwordData, false);
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(TestCompareDataT) * 2),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
+                                                  0, 0, 0, 0);
+    }
+
+    flushStream();
+
+    TestCompareDataT expectedValue = baseCompareValue + 1;
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(TestCompareDataT)), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(TestCompareDataT) * 2)), &expectedValue, sizeof(TestCompareDataT));
+}
+
+HWTEST2_F(ConditionalBbStartTests32b, whenDispatchingGreaterOrEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingGreaterOrEqualModeThenResultsAreValidImpl<FamilyType>();
+}
+
+HWTEST2_F(ConditionalBbStartTests64b, whenDispatchingGreaterOrEqualModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingGreaterOrEqualModeThenResultsAreValidImpl<FamilyType>();
+}
+
+template <typename T>
+template <typename FamilyType>
+void ConditionalBbStartTests<T>::whenDispatchingLessModeThenResultsAreValidImpl() {
+    using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
+
+    // Equal
+    {
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa, baseCompareValue, NEO::CompareOperation::less, false, isQwordData, false);
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa,
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
+                                                  0, 0, 0, 0);
+    }
+
+    // Greater
+    {
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, invalidGpuVa, baseGpuVa + sizeof(TestCompareDataT), baseCompareValue, NEO::CompareOperation::less, false, isQwordData, false);
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + sizeof(TestCompareDataT),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
+                                                  0, 0, 0, 0);
+    }
+
+    // Less
+    {
+        uint64_t jumpAddress = taskStream->getCurrentGpuAddressPosition() + EncodeBatchBufferStartOrEnd<FamilyType>::getCmdSizeConditionalDataMemBatchBufferStart(isQwordData) + EncodeBatchBufferStartOrEnd<FamilyType>::getBatchBufferEndSize();
+
+        EncodeBatchBufferStartOrEnd<FamilyType>::programConditionalDataMemBatchBufferStart(*taskStream, jumpAddress, baseGpuVa + (sizeof(TestCompareDataT) * 2), baseCompareValue, NEO::CompareOperation::less, false, isQwordData, false);
+
+        NEO::EncodeBatchBufferStartOrEnd<FamilyType>::programBatchBufferEnd(*taskStream); // should be skipped
+
+        EncodeAtomic<FamilyType>::programMiAtomic(*taskStream, baseWriteGpuVa + (sizeof(TestCompareDataT) * 2),
+                                                  getAtomicOpcode<MI_ATOMIC>(),
+                                                  geDataSize<MI_ATOMIC>(),
+                                                  0, 0, 0, 0);
+    }
+
+    flushStream();
+
+    TestCompareDataT expectedValue = baseCompareValue + 1;
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + sizeof(TestCompareDataT)), &expectedValue, sizeof(TestCompareDataT));
+    expectMemory<FamilyType>(reinterpret_cast<void *>(baseWriteGpuVa + (sizeof(TestCompareDataT) * 2)), &expectedValue, sizeof(TestCompareDataT));
+}
+
+HWTEST2_F(ConditionalBbStartTests32b, whenDispatchingLessModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingLessModeThenResultsAreValidImpl<FamilyType>();
+}
+
+HWTEST2_F(ConditionalBbStartTests64b, whenDispatchingLessModeThenResultsAreValid, IsAtLeastXeHpcCore) {
+    whenDispatchingLessModeThenResultsAreValidImpl<FamilyType>();
 }
 
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,12 @@
 
 #pragma once
 
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/test/common/mocks/mock_device.h"
+
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
@@ -18,9 +22,12 @@ struct EnqueueFillBufferFixture : public CommandEnqueueFixture {
     void setUp() {
         CommandEnqueueFixture::setUp();
 
-        BufferDefaults::context = new MockContext;
+        BufferDefaults::context = new MockContext(pClDevice);
 
         buffer = BufferHelper<>::create();
+
+        auto &compilerProductHelper = this->pDevice->getCompilerProductHelper();
+        isHeaplessEnabled = compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo);
     }
 
     void tearDown() {
@@ -39,7 +46,7 @@ struct EnqueueFillBufferFixture : public CommandEnqueueFixture {
         parseCommands<FamilyType>(*pCmdQ);
     }
 
-    MockContext context;
     Buffer *buffer = nullptr;
+    bool isHeaplessEnabled = false;
 };
 } // namespace NEO

@@ -1,30 +1,29 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_container/implicit_scaling.h"
-#include "shared/source/os_interface/os_interface.h"
-#include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
+#include <list>
+
 struct EnqueueWithWalkerPartitionTests : public ::testing::Test {
     void SetUp() override {
-        if (!OSInterface::osEnableLocalMemory) {
-            GTEST_SKIP();
-        }
-        DebugManager.flags.EnableWalkerPartition.set(1u);
-        DebugManager.flags.CreateMultipleSubDevices.set(numberOfTiles);
+        debugManager.flags.EnableWalkerPartition.set(1u);
+        debugManager.flags.CreateMultipleSubDevices.set(numberOfTiles);
 
         rootDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr, 0));
 
@@ -35,7 +34,7 @@ struct EnqueueWithWalkerPartitionTests : public ::testing::Test {
 
     DebugManagerStateRestore restore;
     VariableBackup<bool> mockDeviceFlagBackup{&MockDevice::createSingleDevice, false};
-    const uint32_t numberOfTiles = 3;
+    const uint32_t numberOfTiles = 4;
     EngineControl engineControlForFusedQueue = {};
     std::unique_ptr<MockClDevice> rootDevice;
     std::unique_ptr<MockContext> context;
@@ -50,7 +49,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, EnqueueWithWalkerPartitionTests,
     MockCommandQueueHw<FamilyType> commandQueue(context.get(), rootDevice.get(), nullptr);
     commandQueue.gpgpuEngine = &engineControlForFusedQueue;
     rootDevice->setPreemptionMode(PreemptionMode::Disabled);
-    MockKernelWithInternals kernel(*rootDevice, context.get());
+    MockKernelWithInternals kernel(*context);
 
     size_t offset[3] = {0, 0, 0};
     size_t gws[3] = {32, 32, 32};
@@ -68,10 +67,41 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, EnqueueWithWalkerPartitionTests,
             if (UnitTestHelper<FamilyType>::isAdditionalMiSemaphoreWait(*semaphoreCmd)) {
                 continue;
             }
-            EXPECT_EQ(numberOfTiles, semaphoreCmd->getSemaphoreDataDword());
+            EXPECT_EQ(numberOfTiles, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
             lastSemaphoreFound = true;
             break;
         }
     }
     EXPECT_TRUE(lastSemaphoreFound);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE, EnqueueWithWalkerPartitionTests, givenOoqWhenDispatchingWithoutEventsThenDontAllocateTimestampPacket) {
+    rootDevice->setPreemptionMode(PreemptionMode::Disabled);
+
+    MockCommandQueueHw<FamilyType> commandQueue(context.get(), rootDevice.get(), nullptr);
+    commandQueue.setOoqEnabled();
+
+    TimestampPacketContainer *timestampPacketContainer = commandQueue.timestampPacketContainer.get();
+    TimestampPacketContainer *deferredTimestampPackets = commandQueue.deferredTimestampPackets.get();
+
+    EXPECT_EQ(0u, timestampPacketContainer->peekNodes().size());
+    EXPECT_EQ(0u, deferredTimestampPackets->peekNodes().size());
+
+    MockKernelWithInternals kernel(*context);
+
+    size_t offset[3] = {0, 0, 0};
+    size_t gws[3] = {32, 32, 32};
+
+    cl_event event;
+    commandQueue.enqueueKernel(kernel, 3, offset, gws, nullptr, 0, nullptr, &event);
+
+    EXPECT_EQ(1u, timestampPacketContainer->peekNodes().size());
+    EXPECT_EQ(0u, deferredTimestampPackets->peekNodes().size());
+
+    commandQueue.enqueueKernel(kernel, 3, offset, gws, nullptr, 0, nullptr, nullptr);
+
+    EXPECT_EQ(0u, timestampPacketContainer->peekNodes().size());
+    EXPECT_EQ(1u, deferredTimestampPackets->peekNodes().size());
+
+    clReleaseEvent(event);
 }

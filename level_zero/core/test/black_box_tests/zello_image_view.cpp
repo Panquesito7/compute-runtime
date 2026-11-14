@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,40 +10,10 @@
 
 #include <cstring>
 
-const char *readNV12Module = R"===(
-    __kernel void
-    ReadNV12Kernel(
-        read_only image2d_t nv12Img,
-        uint width,
-        uint height,
-        __global uchar *pDest) {
-    int tid_x = get_global_id(0);
-    int tid_y = get_global_id(1);
-    float4 colorY;
-    int2 coord;
-    const sampler_t samplerA = CLK_NORMALIZED_COORDS_FALSE |
-                               CLK_ADDRESS_NONE |
-                               CLK_FILTER_NEAREST;
-    if (tid_x < width && tid_y < height) {
-        coord = (int2)(tid_x, tid_y);
-        if (((tid_y * width) + tid_x) < (width * height)) {
-            colorY = read_imagef(nv12Img, samplerA, coord);
-            pDest[(tid_y * width) + tid_x] = (uchar)(255.0f * colorY.y);
-            if ((tid_x % 2 == 0) && (tid_y % 2 == 0)) {
-                pDest[(width * height) + (tid_y / 2 * width) + (tid_x)] = (uchar)(255.0f * colorY.z);
-                pDest[(width * height) + (tid_y / 2 * width) + (tid_x) + 1] = (uchar)(255.0f * colorY.x);
-            }
-        }
-    }
-}
-)===";
-
 void testAppendImageViewNV12Copy(ze_context_handle_t &context, ze_device_handle_t &device, bool &validRet) {
     std::string buildLog;
-    auto spirV = compileToSpirV(readNV12Module, "", buildLog);
-    if (buildLog.size() > 0) {
-        std::cout << "Build log " << buildLog;
-    }
+    auto spirV = LevelZeroBlackBoxTests::compileToSpirV(LevelZeroBlackBoxTests::readNV12Module, "", buildLog);
+    LevelZeroBlackBoxTests::printBuildLog(buildLog);
     SUCCESS_OR_TERMINATE((0 == spirV.size()));
 
     const size_t width = 32;
@@ -106,10 +76,6 @@ void testAppendImageViewNV12Copy(ze_context_handle_t &context, ze_device_handle_
                                            0,
                                            0};
     ze_image_handle_t planeYImageView;
-
-    SUCCESS_OR_TERMINATE(
-        zeImageViewCreateExp(context, device, &imageViewDescPlaneY, srcImg, &planeYImageView));
-
     planeYdesc.stype = ZE_STRUCTURE_TYPE_IMAGE_VIEW_PLANAR_EXT_DESC;
     SUCCESS_OR_TERMINATE(
         zeImageViewCreateExt(context, device, &imageViewDescPlaneY, srcImg, &planeYImageView));
@@ -132,10 +98,6 @@ void testAppendImageViewNV12Copy(ze_context_handle_t &context, ze_device_handle_
                                             0,
                                             0};
     ze_image_handle_t planeUVImageView;
-
-    SUCCESS_OR_TERMINATE(
-        zeImageViewCreateExp(context, device, &imageViewDescPlaneUV, srcImg, &planeUVImageView));
-
     planeUVdesc.stype = ZE_STRUCTURE_TYPE_IMAGE_VIEW_PLANAR_EXT_DESC;
     SUCCESS_OR_TERMINATE(
         zeImageViewCreateExt(context, device, &imageViewDescPlaneUV, srcImg, &planeUVImageView));
@@ -200,11 +162,11 @@ void testAppendImageViewNV12Copy(ze_context_handle_t &context, ze_device_handle_
 
             char *strLog = (char *)malloc(szLog);
             zeModuleBuildLogGetString(buildlog, &szLog, strLog);
-            std::cout << "Build log:" << strLog << std::endl;
+            LevelZeroBlackBoxTests::printBuildLog(strLog);
 
             free(strLog);
             SUCCESS_OR_TERMINATE(zeModuleBuildLogDestroy(buildlog));
-            std::cout << "\nZello Image View Results validation FAILED. Module creation error."
+            std::cerr << "\nZello Image View Results validation FAILED. Module creation error."
                       << std::endl;
             SUCCESS_OR_TERMINATE_BOOL(false);
         }
@@ -257,41 +219,40 @@ void testAppendImageViewNV12Copy(ze_context_handle_t &context, ze_device_handle_
     SUCCESS_OR_TERMINATE(zeCommandQueueExecuteCommandLists(cmdQueue, 1, &cmdList, nullptr));
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
-    // validate Y plane data
-    auto result = memcmp(srcVecY.data(), dstVecY.data(), width * height);
-
     validRet = true;
-    if (result != 0) {
-        std::cout << "Failed to validate data read for plane Y from Y-plane view" << std::endl;
+
+    // validate Y plane data
+    auto result = LevelZeroBlackBoxTests::validate(srcVecY.data(), dstVecY.data(), width * height);
+    if (!result) {
+        std::cerr << "Failed to validate data read for plane Y from Y-plane view" << std::endl;
         validRet = false;
     }
 
-    result = memcmp(dstVecY.data(), dstMem, width * height);
-
-    if (result != 0 && validRet) {
-        std::cout << "Failed to validate data read for plane Y from nv12 surface" << std::endl;
+    result = LevelZeroBlackBoxTests::validate(dstVecY.data(), dstMem, width * height);
+    if (!result && validRet) {
+        std::cerr << "Failed to validate data read for plane Y from nv12 surface" << std::endl;
         validRet = false;
     }
 
     // validate UV plane data
-    result = memcmp(srcVecUV.data(), dstVecUV.data(), (width / 2) * (height));
-
-    if (result != 0 && validRet) {
-        std::cout << "Failed to validate data read for plane Y from Y-plane view" << std::endl;
+    result = LevelZeroBlackBoxTests::validate(srcVecUV.data(), dstVecUV.data(), (width / 2) * (height));
+    if (!result && validRet) {
+        std::cerr << "Failed to validate data read for plane Y from Y-plane view" << std::endl;
         validRet = false;
     }
 
-    result = memcmp(dstVecUV.data(), (dstMem + (width * height)), (width / 2) * (height));
-
-    if (result != 0 && validRet) {
-        std::cout << "Failed to validate data read for plane UV from nv12 surface" << std::endl;
+    result = LevelZeroBlackBoxTests::validate(dstVecUV.data(), (dstMem + (width * height)), (width / 2) * (height));
+    if (!result && validRet) {
+        std::cerr << "Failed to validate data read for plane UV from nv12 surface" << std::endl;
         validRet = false;
     }
 
     // cleanup
-    SUCCESS_OR_TERMINATE(zeImageDestroy(srcImg));
     SUCCESS_OR_TERMINATE(zeImageDestroy(planeYImageView));
     SUCCESS_OR_TERMINATE(zeImageDestroy(planeUVImageView));
+
+    SUCCESS_OR_TERMINATE(zeImageDestroy(srcImg));
+
     SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
     SUCCESS_OR_TERMINATE(zeCommandQueueDestroy(cmdQueue));
     SUCCESS_OR_TERMINATE(zeKernelDestroy(kernel));
@@ -506,60 +467,61 @@ void testAppendImageViewRGBPCopy(ze_context_handle_t &context, ze_device_handle_
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     // validate Y plane data
-    auto result = memcmp(srcVecY.data(), dstVecY.data(), width * height);
-
-    if (result != 0) {
-        std::cout << "Failed to validate data read for plane Y from Y-plane view" << std::endl;
+    auto result = LevelZeroBlackBoxTests::validate(srcVecY.data(), dstVecY.data(), width * height);
+    if (!result) {
+        std::cerr << "Failed to validate data read for plane Y from Y-plane view" << std::endl;
         validRet = false;
     }
 
     // validate U plane data
-    result = memcmp(srcVecU.data(), dstVecU.data(), width * height);
-
-    if (result != 0 && validRet) {
-        std::cout << "Failed to validate data read for plane U from U-plane view" << std::endl;
+    result = LevelZeroBlackBoxTests::validate(srcVecU.data(), dstVecU.data(), width * height);
+    if (!result && validRet) {
+        std::cerr << "Failed to validate data read for plane U from U-plane view" << std::endl;
         validRet = false;
     }
 
     // validate V plane data
-    result = memcmp(srcVecV.data(), dstVecV.data(), width * height);
-
-    if (result != 0 && validRet) {
-        std::cout << "Failed to validate data read for plane V from V-plane view" << std::endl;
+    result = LevelZeroBlackBoxTests::validate(srcVecV.data(), dstVecV.data(), width * height);
+    if (!result && validRet) {
+        std::cerr << "Failed to validate data read for plane V from V-plane view" << std::endl;
         validRet = false;
     }
 
     // cleanup
-    SUCCESS_OR_TERMINATE(zeImageDestroy(srcImg));
     SUCCESS_OR_TERMINATE(zeImageDestroy(planeYImageView));
     SUCCESS_OR_TERMINATE(zeImageDestroy(planeUImageView));
     SUCCESS_OR_TERMINATE(zeImageDestroy(planeVImageView));
+
+    SUCCESS_OR_TERMINATE(zeImageDestroy(srcImg));
+
     SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
     SUCCESS_OR_TERMINATE(zeCommandQueueDestroy(cmdQueue));
 }
 
 int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello Image View";
-    verbose = isVerbose(argc, argv);
-    bool aubMode = isAubMode(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
 
     ze_context_handle_t context = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context);
     auto device = devices[0];
     bool outputValidationSuccessful = false;
 
     ze_device_properties_t deviceProperties = {};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
+
+    if (!LevelZeroBlackBoxTests::checkImageSupport(device, false, true, false, false)) {
+        return 0;
+    }
 
     testAppendImageViewNV12Copy(context, device, outputValidationSuccessful);
     if (outputValidationSuccessful || aubMode) {
         testAppendImageViewRGBPCopy(context, device, outputValidationSuccessful);
     }
 
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
-
-    printResult(aubMode, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(aubMode, outputValidationSuccessful, blackBoxName);
     outputValidationSuccessful = aubMode ? true : outputValidationSuccessful;
     return (outputValidationSuccessful ? 0 : 1);
 }

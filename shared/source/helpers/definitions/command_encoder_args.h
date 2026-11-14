@@ -1,11 +1,17 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
+#include "shared/source/kernel/dispatch_kernel_encoder_interface.h"
+
+#include <array>
+#include <cstdint>
+#include <limits>
 
 namespace NEO {
 struct RootDeviceEnvironment;
@@ -24,4 +30,31 @@ struct MiFlushArgs {
     EncodeDummyBlitWaArgs &waArgs;
     MiFlushArgs(EncodeDummyBlitWaArgs &args) : waArgs(args) {}
 };
+
+struct EncodeSlmSizePerSubSliceArgs {
+    uint32_t threadsPerThreadGroup = 0;
+    uint32_t workloadThreadGroupCount = 0;
+    uint32_t slmTotalSizePerThreadGroup = 0;
+    uint32_t grfCount = 0;
+    SlmPolicy slmPolicy = SlmPolicy::slmPolicyNone;
+};
+
+enum class RequiredPartitionDim : uint32_t {
+    none = 0,
+    x,
+    y,
+    z
+};
+
+enum class RequiredDispatchWalkOrder : uint32_t {
+    none = 0,
+    x,
+    y,
+};
+
+namespace EncodeParamsApiMappings {
+static constexpr std::array<NEO::RequiredPartitionDim, 3> partitionDim = {{RequiredPartitionDim::x, NEO::RequiredPartitionDim::y, NEO::RequiredPartitionDim::z}};
+static constexpr std::array<NEO::RequiredDispatchWalkOrder, 2> dispatchWalkOrder = {{NEO::RequiredDispatchWalkOrder::x, NEO::RequiredDispatchWalkOrder::y}};
+} // namespace EncodeParamsApiMappings
+
 } // namespace NEO

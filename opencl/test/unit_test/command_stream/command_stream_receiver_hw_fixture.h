@@ -1,13 +1,18 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/blit_properties.h"
+#include "shared/source/helpers/blit_properties_container.h"
 #include "shared/source/helpers/timestamp_packet_container.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
@@ -16,7 +21,8 @@
 using namespace NEO;
 struct BcsTests : public Test<ClDeviceFixture> {
     void SetUp() override {
-        DebugManager.flags.ForceDummyBlitWa.set(-1);
+        debugManager.flags.ForceDummyBlitWa.set(-1);
+
         Test<ClDeviceFixture>::SetUp();
         context = std::make_unique<MockContext>(pClDevice);
     }
@@ -30,7 +36,7 @@ struct BcsTests : public Test<ClDeviceFixture> {
         BlitPropertiesContainer container;
         container.push_back(blitProperties);
 
-        return bcsCsr->flushBcsTask(container, blocking, false, device);
+        return bcsCsr->flushBcsTask(container, blocking, device);
     }
 
     TimestampPacketContainer timestampPacketContainer;

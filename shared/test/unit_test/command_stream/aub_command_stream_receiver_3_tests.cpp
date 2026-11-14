@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/aub_mem_dump/aub_alloc_dump.h"
+#include "shared/source/command_stream/aub_command_stream_receiver.h"
+#include "shared/source/gmm_helper/gmm_resource_usage_ocl_buffer.h"
 #include "shared/source/helpers/hardware_context_controller.h"
 #include "shared/test/common/fixtures/aub_command_stream_receiver_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
@@ -22,44 +24,7 @@ using namespace NEO;
 
 using AubCsrTest = ::testing::Test;
 
-HWTEST_F(AubCsrTest, givenLocalMemoryEnabledWhenGettingAddressSpaceForRingDataTypeThenTraceLocalIsReturned) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableLocalMemory.set(1);
-    auto hwInfo = *NEO::defaultHwInfo.get();
-    hwInfo.featureTable.flags.ftrLocalMemory = true;
-
-    std::unique_ptr<ExecutionEnvironment> executionEnvironment(new ExecutionEnvironment);
-    DeviceBitfield deviceBitfield(1);
-    executionEnvironment->prepareRootDeviceEnvironments(1);
-    uint32_t rootDeviceIndex = 0u;
-
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setHwInfoAndInitHelpers(&hwInfo);
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initGmm();
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->aubCenter.reset(new AubCenter());
-
-    executionEnvironment->initializeMemoryManager();
-
-    std::unique_ptr<MockAubCsr<FamilyType>> aubCsr(new MockAubCsr<FamilyType>("", false, *executionEnvironment, rootDeviceIndex, deviceBitfield));
-
-    int types[] = {AubMemDump::DataTypeHintValues::TraceLogicalRingContextRcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextCcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextBcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextVcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextVecs,
-                   AubMemDump::DataTypeHintValues::TraceCommandBuffer};
-
-    for (uint32_t i = 0; i < 6; i++) {
-        auto addressSpace = aubCsr->getAddressSpace(types[i]);
-        EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-    }
-
-    auto addressSpace = aubCsr->getAddressSpace(AubMemDump::DataTypeHintValues::TraceNotype);
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceNonlocal, addressSpace);
-}
-
-HWTEST_F(AubCsrTest, givenAUBDumpForceAllToLocalMemoryWhenGettingAddressSpaceForAnyDataTypeThenTraceLocalIsReturned) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.AUBDumpForceAllToLocalMemory.set(1);
+HWTEST_F(AubCsrTest, WhenWriteWithAubManagerIsCalledThenAubManagerIsInvokedWithCorrectHintAndParams) {
     auto hwInfo = *NEO::defaultHwInfo.get();
 
     std::unique_ptr<ExecutionEnvironment> executionEnvironment(new ExecutionEnvironment);
@@ -69,65 +34,132 @@ HWTEST_F(AubCsrTest, givenAUBDumpForceAllToLocalMemoryWhenGettingAddressSpaceFor
 
     executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setHwInfoAndInitHelpers(&hwInfo);
     executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initGmm();
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->aubCenter.reset(new AubCenter());
+
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initAubCenter(false, "", CommandStreamReceiverType::aub);
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->aubCenter->getAubManager();
 
     executionEnvironment->initializeMemoryManager();
-
-    std::unique_ptr<MockAubCsr<FamilyType>> aubCsr(new MockAubCsr<FamilyType>("", false, *executionEnvironment, rootDeviceIndex, deviceBitfield));
-
-    int types[] = {AubMemDump::DataTypeHintValues::TraceLogicalRingContextRcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextCcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextBcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextVcs,
-                   AubMemDump::DataTypeHintValues::TraceLogicalRingContextVecs,
-                   AubMemDump::DataTypeHintValues::TraceCommandBuffer};
-
-    for (uint32_t i = 0; i < 6; i++) {
-        auto addressSpace = aubCsr->getAddressSpace(types[i]);
-        EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-    }
-
-    auto addressSpace = aubCsr->getAddressSpace(AubMemDump::DataTypeHintValues::TraceNotype);
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-}
-
-HWTEST_F(AubCsrTest, WhenWriteWithAubManagerIsCalledThenAubManagerIsInvokedWithCorrectHint) {
-    auto hwInfo = *NEO::defaultHwInfo.get();
-
-    std::unique_ptr<ExecutionEnvironment> executionEnvironment(new ExecutionEnvironment);
-    DeviceBitfield deviceBitfield(1);
-    executionEnvironment->prepareRootDeviceEnvironments(1);
-    uint32_t rootDeviceIndex = 0u;
-
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setHwInfoAndInitHelpers(&hwInfo);
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initGmm();
-    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->aubCenter.reset(new AubCenter());
-
-    executionEnvironment->initializeMemoryManager();
-    auto allocation = executionEnvironment->memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, true, MemoryConstants::pageSize, AllocationType::COMMAND_BUFFER});
+    auto allocation = executionEnvironment->memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, true, MemoryConstants::pageSize, AllocationType::commandBuffer});
 
     MockAubManager aubManager;
     std::unique_ptr<MockAubCsr<FamilyType>> aubCsr(new MockAubCsr<FamilyType>("", false, *executionEnvironment, rootDeviceIndex, deviceBitfield));
     aubCsr->aubManager = &aubManager;
     auto osContext = executionEnvironment->memoryManager->createAndRegisterOsContext(aubCsr.get(),
-                                                                                     EngineDescriptorHelper::getDefaultDescriptor({getChosenEngineType(hwInfo), EngineUsage::Regular},
+                                                                                     EngineDescriptorHelper::getDefaultDescriptor({getChosenEngineType(hwInfo), EngineUsage::regular},
                                                                                                                                   PreemptionHelper::getDefaultPreemptionMode(hwInfo)));
     aubCsr->setupContext(*osContext);
 
-    aubCsr->writeMemoryWithAubManager(*allocation);
+    aubCsr->writeMemoryWithAubManager(*allocation, false, 0, 0);
     EXPECT_TRUE(aubManager.writeMemory2Called);
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceBatchBuffer, aubManager.hintToWriteMemory);
+    EXPECT_EQ(aub_stream::DataTypeHintValues::TraceBatchBuffer, aubManager.hintToWriteMemory);
 
     aubManager.writeMemory2Called = false;
 
-    auto allocation2 = executionEnvironment->memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, true, MemoryConstants::pageSize, AllocationType::LINEAR_STREAM});
+    auto allocation2 = executionEnvironment->memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, true, MemoryConstants::pageSize, AllocationType::linearStream});
 
-    aubCsr->writeMemoryWithAubManager(*allocation2);
+    aubManager.storeAllocationParams = true;
+    aubCsr->writeMemoryWithAubManager(*allocation2, true, 1, 1);
     EXPECT_TRUE(aubManager.writeMemory2Called);
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceNotype, aubManager.hintToWriteMemory);
+    EXPECT_EQ(aub_stream::DataTypeHintValues::TraceNotype, aubManager.hintToWriteMemory);
+    ASSERT_EQ(1u, aubManager.storedAllocationParams.size());
+
+    EXPECT_EQ(ptrOffset(allocation2->getUnderlyingBuffer(), 1), aubManager.storedAllocationParams[0].memory);
+    EXPECT_EQ(ptrOffset(allocation2->getGpuAddress(), 1), aubManager.storedAllocationParams[0].gfxAddress);
+    EXPECT_EQ(1u, aubManager.storedAllocationParams[0].size);
 
     executionEnvironment->memoryManager->freeGraphicsMemory(allocation);
     executionEnvironment->memoryManager->freeGraphicsMemory(allocation2);
+}
+
+HWTEST_F(AubCsrTest, GivenCopyLockedMemoryBeforeWriteWhenWriteWithAubManagerIsCalledThenAubManagerIsInvokedWithCorrectHintAndParams) {
+    auto hwInfo = *NEO::defaultHwInfo.get();
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.CopyLockedMemoryBeforeWrite.set(true);
+
+    std::unique_ptr<ExecutionEnvironment> executionEnvironment(new ExecutionEnvironment);
+    DeviceBitfield deviceBitfield(1);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    uint32_t rootDeviceIndex = 0u;
+
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setHwInfoAndInitHelpers(&hwInfo);
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initGmm();
+
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initAubCenter(false, "", CommandStreamReceiverType::aub);
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->aubCenter->getAubManager();
+
+    executionEnvironment->initializeMemoryManager();
+    MockAubManager aubManager;
+    std::unique_ptr<MockAubCsr<FamilyType>> aubCsr(new MockAubCsr<FamilyType>("", false, *executionEnvironment, rootDeviceIndex, deviceBitfield));
+    aubCsr->aubManager = &aubManager;
+    auto osContext = executionEnvironment->memoryManager->createAndRegisterOsContext(aubCsr.get(),
+                                                                                     EngineDescriptorHelper::getDefaultDescriptor({getChosenEngineType(hwInfo), EngineUsage::regular},
+                                                                                                                                  PreemptionHelper::getDefaultPreemptionMode(hwInfo)));
+    aubCsr->setupContext(*osContext);
+    aubManager.writeMemory2Called = false;
+
+    auto allocation = executionEnvironment->memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, true, MemoryConstants::pageSize, AllocationType::linearStream});
+    executionEnvironment->memoryManager->lockResource(allocation);
+
+    EXPECT_TRUE(allocation->isLocked());
+    aubManager.storeAllocationParams = true;
+    aubCsr->writeMemoryWithAubManager(*allocation, true, 1, 1);
+    EXPECT_TRUE(aubManager.writeMemory2Called);
+    EXPECT_EQ(aub_stream::DataTypeHintValues::TraceNotype, aubManager.hintToWriteMemory);
+    ASSERT_EQ(1u, aubManager.storedAllocationParams.size());
+
+    EXPECT_NE(ptrOffset(allocation->getUnderlyingBuffer(), 1), aubManager.storedAllocationParams[0].memory);
+    EXPECT_EQ(ptrOffset(allocation->getGpuAddress(), 1), aubManager.storedAllocationParams[0].gfxAddress);
+    EXPECT_EQ(1u, aubManager.storedAllocationParams[0].size);
+
+    executionEnvironment->memoryManager->freeGraphicsMemory(allocation);
+}
+
+HWTEST_F(AubCsrTest, GivenCopyLockedMemoryBeforeWriteWhenAubMemoryOperationsWritesWithAubManagerThenAubManagerIsInvokedWithCorrectHintAndParams) {
+    auto hwInfo = *NEO::defaultHwInfo.get();
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.CopyLockedMemoryBeforeWrite.set(true);
+
+    std::unique_ptr<ExecutionEnvironment> executionEnvironment(new ExecutionEnvironment);
+    DeviceBitfield deviceBitfield(1);
+    executionEnvironment->prepareRootDeviceEnvironments(1);
+    uint32_t rootDeviceIndex = 0u;
+
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setHwInfoAndInitHelpers(&hwInfo);
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initGmm();
+
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->initAubCenter(false, "", CommandStreamReceiverType::aub);
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->aubCenter->getAubManager();
+
+    executionEnvironment->initializeMemoryManager();
+    MockAubManager aubManager;
+
+    auto memoryOperationsHandler = new NEO::MockAubMemoryOperationsHandler(&aubManager);
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface.reset(memoryOperationsHandler);
+
+    std::unique_ptr<MockAubCsr<FamilyType>> aubCsr(new MockAubCsr<FamilyType>("", false, *executionEnvironment, rootDeviceIndex, deviceBitfield));
+    aubCsr->aubManager = &aubManager;
+    auto osContext = executionEnvironment->memoryManager->createAndRegisterOsContext(aubCsr.get(),
+                                                                                     EngineDescriptorHelper::getDefaultDescriptor({getChosenEngineType(hwInfo), EngineUsage::regular},
+                                                                                                                                  PreemptionHelper::getDefaultPreemptionMode(hwInfo)));
+    aubCsr->setupContext(*osContext);
+    aubManager.writeMemory2Called = false;
+
+    auto allocation = executionEnvironment->memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, true, MemoryConstants::pageSize, AllocationType::linearStream});
+    executionEnvironment->memoryManager->lockResource(allocation);
+
+    EXPECT_TRUE(allocation->isLocked());
+    aubManager.storeAllocationParams = true;
+
+    memoryOperationsHandler->makeResidentWithinDevice(ArrayRef<NEO::GraphicsAllocation *>(&allocation, 1), false, deviceBitfield, false);
+
+    EXPECT_TRUE(aubManager.writeMemory2Called);
+    EXPECT_EQ(aub_stream::DataTypeHintValues::TraceNotype, aubManager.hintToWriteMemory);
+    ASSERT_EQ(1u, aubManager.storedAllocationParams.size());
+
+    EXPECT_NE(allocation->getUnderlyingBuffer(), aubManager.storedAllocationParams[0].memory);
+
+    executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface.reset(nullptr);
+    executionEnvironment->memoryManager->freeGraphicsMemory(allocation);
 }
 
 using HardwareContextContainerTests = ::testing::Test;
@@ -137,6 +169,8 @@ TEST_F(HardwareContextContainerTests, givenOsContextWithMultipleDevicesSupported
     MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor(0b11));
 
     HardwareContextController hwContextControler(aubManager, osContext, 0);
+    hwContextControler.createHardwareContexts(aubManager);
+
     EXPECT_EQ(2u, hwContextControler.hardwareContexts.size());
     EXPECT_EQ(2u, osContext.getNumSupportedDevices());
     auto mockHwContext0 = static_cast<MockHardwareContext *>(hwContextControler.hardwareContexts[0].get());
@@ -149,8 +183,9 @@ TEST_F(HardwareContextContainerTests, givenSingleHwContextWhenSubmitMethodIsCall
     MockAubManager aubManager;
     MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor());
     HardwareContextController hwContextContainer(aubManager, osContext, 0);
+    EXPECT_EQ(0u, hwContextContainer.hardwareContexts.size());
+    hwContextContainer.createHardwareContexts(aubManager);
     EXPECT_EQ(1u, hwContextContainer.hardwareContexts.size());
-
     auto mockHwContext0 = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[0].get());
 
     EXPECT_FALSE(mockHwContext0->writeAndSubmitCalled);
@@ -167,6 +202,7 @@ TEST_F(HardwareContextContainerTests, givenSingleHwContextWhenWriteMemoryIsCalle
     MockAubManager aubManager;
     MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor());
     HardwareContextController hwContextContainer(aubManager, osContext, 0);
+    hwContextContainer.createHardwareContexts(aubManager);
     EXPECT_EQ(1u, hwContextContainer.hardwareContexts.size());
 
     auto mockHwContext0 = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[0].get());
@@ -182,6 +218,8 @@ TEST_F(HardwareContextContainerTests, givenMultipleHwContextWhenSingleMethodIsCa
     MockAubManager aubManager;
     MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor(0b11));
     HardwareContextController hwContextContainer(aubManager, osContext, 0);
+    EXPECT_EQ(0u, hwContextContainer.hardwareContexts.size());
+    hwContextContainer.createHardwareContexts(aubManager);
     EXPECT_EQ(2u, hwContextContainer.hardwareContexts.size());
 
     auto mockHwContext0 = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[0].get());
@@ -220,10 +258,30 @@ TEST_F(HardwareContextContainerTests, givenMultipleHwContextWhenSingleMethodIsCa
     EXPECT_EQ(2u, mockHwContext1->memoryBanksPassed);
 }
 
+TEST_F(HardwareContextContainerTests, givenActiveAndInactiveHwContextsWhenResubmitInactiveContextsIsCalledThenOnlyInactiveContextIsResubmitted) {
+    MockAubManager aubManager;
+    MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor(0b11));
+    HardwareContextController hwContextContainer(aubManager, osContext, 0);
+    hwContextContainer.createHardwareContexts(aubManager);
+    ASSERT_EQ(2u, hwContextContainer.hardwareContexts.size());
+
+    auto activeHwContext = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[0].get());
+    auto inactiveHwContext = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[1].get());
+    activeHwContext->isActiveReturnValue = true;
+    inactiveHwContext->isActiveReturnValue = false;
+
+    hwContextContainer.resubmitInactiveContexts();
+
+    EXPECT_FALSE(activeHwContext->resubmitCalled);
+    EXPECT_TRUE(inactiveHwContext->resubmitCalled);
+}
+
 TEST_F(HardwareContextContainerTests, givenHwContextWhenWriteMMIOIsCalledThenUseFirstContext) {
     MockAubManager aubManager;
     MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor());
     HardwareContextController hwContextContainer(aubManager, osContext, 0);
+    EXPECT_EQ(0u, hwContextContainer.hardwareContexts.size());
+    hwContextContainer.createHardwareContexts(aubManager);
     EXPECT_EQ(1u, hwContextContainer.hardwareContexts.size());
 
     auto mockHwContext = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[0].get());
@@ -239,6 +297,7 @@ TEST_F(HardwareContextContainerTests, givenMultipleHwContextWhenSingleMethodIsCa
     MockAubManager aubManager;
     MockOsContext osContext(1, EngineDescriptorHelper::getDefaultDescriptor(0b11));
     HardwareContextController hwContextContainer(aubManager, osContext, 0);
+    hwContextContainer.createHardwareContexts(aubManager);
     EXPECT_EQ(2u, hwContextContainer.hardwareContexts.size());
 
     auto mockHwContext0 = static_cast<MockHardwareContext *>(hwContextContainer.hardwareContexts[0].get());
@@ -267,19 +326,23 @@ using AubCommandStreamReceiverTests = Test<AubCommandStreamReceiverFixture>;
 
 HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWritableWhenDumpAllocationIsCalledAndDumpFormatIsSpecifiedThenGraphicsAllocationShouldBeDumped) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
-    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
 
     EXPECT_TRUE(AubAllocDump::isWritableBuffer(*gfxAllocation));
 
@@ -292,16 +355,17 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWritableWhenDumpA
 
 HWTEST_F(AubCommandStreamReceiverTests, givenBcsEngineWhenDumpAllocationCalledThenIgnore) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular}));
+    MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular}));
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
     EXPECT_TRUE(AubAllocDump::isWritableBuffer(*gfxAllocation));
 
@@ -315,26 +379,30 @@ HWTEST_F(AubCommandStreamReceiverTests, givenBcsEngineWhenDumpAllocationCalledTh
 
 HWTEST_F(AubCommandStreamReceiverTests, givenCompressedGraphicsAllocationWritableWhenDumpAllocationIsCalledAndDumpFormatIsSpecifiedThenGraphicsAllocationShouldBeDumped) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpBufferFormat.set("TRE");
+    debugManager.flags.AUBDumpBufferFormat.set("TRE");
 
     auto gmmHelper = pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper();
-    MockAubCenter *mockAubCenter = new MockAubCenter(pDevice->getRootDeviceEnvironment(), false, "aubfile", CommandStreamReceiverType::CSR_AUB);
+    MockAubCenter *mockAubCenter = new MockAubCenter(pDevice->getRootDeviceEnvironment(), false, "aubfile", CommandStreamReceiverType::aub);
     mockAubCenter->aubManager = std::make_unique<MockAubManager>();
 
     pDevice->executionEnvironment->rootDeviceEnvironments[0]->aubCenter.reset(mockAubCenter);
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    AllocationProperties properties(pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield());
+    AllocationProperties properties(pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield());
     properties.flags.preferCompressed = true;
 
     auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties(properties);
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
-    gfxAllocation->setDefaultGmm(new Gmm(gmmHelper, nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    gfxAllocation->setDefaultGmm(new Gmm(gmmHelper, nullptr, 1, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
 
     EXPECT_TRUE(AubAllocDump::isWritableBuffer(*gfxAllocation));
 
@@ -351,11 +419,12 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWritableWhenDumpA
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
     EXPECT_TRUE(AubAllocDump::isWritableBuffer(*gfxAllocation));
@@ -369,16 +438,17 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWritableWhenDumpA
 
 HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationNonWritableWhenDumpAllocationIsCalledAndFormatIsSpecifiedThenGraphicsAllocationShouldNotBeDumped) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(false);
     EXPECT_FALSE(AubAllocDump::isWritableBuffer(*gfxAllocation));
@@ -392,17 +462,18 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationNonWritableWhenDu
 
 HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationNotDumpableWhenDumpAllocationIsCalledAndAUBDumpAllocsOnEnqueueReadOnlyIsSetThenGraphicsAllocationShouldNotBeDumpedAndRemainNonDumpable) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.set(true);
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.set(true);
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
     gfxAllocation->setAllocDumpable(false, false);
@@ -417,20 +488,24 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationNotDumpableWhenDu
 
 HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationDumpableWhenDumpAllocationIsCalledAndAUBDumpAllocsOnEnqueueReadOnlyIsOnThenGraphicsAllocationShouldBeDumpedAndMarkedNonDumpable) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.set(true);
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.set(true);
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
-    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
 
     auto &csrOsContext = static_cast<MockOsContext &>(aubCsr.getOsContext());
 
@@ -486,21 +561,25 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationDumpableWhenDumpA
 
 HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWhenDumpAllocationIsCalledAndAUBDumpAllocsOnEnqueueSVMMemcpyOnlyIsSetThenDumpableFlagShouldBeRespected) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpAllocsOnEnqueueSVMMemcpyOnly.set(true);
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpAllocsOnEnqueueSVMMemcpyOnly.set(true);
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
     gfxAllocation->setAllocDumpable(false, false);
-    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
 
     aubCsr.dumpAllocation(*gfxAllocation);
     EXPECT_FALSE(mockHardwareContext->dumpSurfaceCalled);
@@ -516,20 +595,24 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWhenDumpAllocatio
 
 HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWritableWhenDumpAllocationIsCalledAndDumpFormatIsSpecifiedThenPollForCompletionShouldBeCalledBeforeGraphicsAllocationIsDumped) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
     aubCsr.latestSentTaskCount = 1;
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = pDevice->getMemoryManager();
-    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::BUFFER, pDevice->getDeviceBitfield()});
+    auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::buffer, pDevice->getDeviceBitfield()});
 
     gfxAllocation->setMemObjectsAllocationWithWritableFlags(true);
-    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
 
     EXPECT_TRUE(AubAllocDump::isWritableBuffer(*gfxAllocation));
 
@@ -542,27 +625,31 @@ HWTEST_F(AubCommandStreamReceiverTests, givenGraphicsAllocationWritableWhenDumpA
 
 HWTEST_F(AubCommandStreamReceiverTests, givenUsmAllocationWhenDumpAllocationIsCalledAndDumpFormatIsSpecifiedThenUsmAllocationIsDumped) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.AUBDumpBufferFormat.set("BIN");
+    debugManager.flags.AUBDumpBufferFormat.set("BIN");
 
     MockAubCsr<FamilyType> aubCsr("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockOsContext osContext(0, EngineDescriptorHelper::getDefaultDescriptor());
     aubCsr.setupContext(osContext);
+    aubCsr.initializeEngine();
 
     auto mockHardwareContext = static_cast<MockHardwareContext *>(aubCsr.hardwareContextController->hardwareContexts[0].get());
 
     auto memoryManager = std::make_unique<MockMemoryManager>(false, true, *pDevice->executionEnvironment);
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager.get(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager.get());
 
     RootDeviceIndicesContainer rootDeviceIndices = {rootDeviceIndex};
     std::map<uint32_t, DeviceBitfield> deviceBitfields{{rootDeviceIndex, pDevice->getDeviceBitfield()}};
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::DEVICE_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
     unifiedMemoryProperties.device = pDevice;
     auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
     ASSERT_NE(nullptr, ptr);
 
     auto gfxAllocation = svmManager->getSVMAlloc(ptr)->gpuAllocations.getGraphicsAllocation(0);
-    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    gfxAllocation->setDefaultGmm(new Gmm(pDevice->executionEnvironment->rootDeviceEnvironments[0]->getGmmHelper(), nullptr, 1, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
 
     ASSERT_NE(nullptr, gfxAllocation);
 
@@ -575,8 +662,45 @@ HWTEST_F(AubCommandStreamReceiverTests, givenUsmAllocationWhenDumpAllocationIsCa
     svmManager->freeSVMAlloc(ptr);
 }
 
+TEST_F(AubCommandStreamReceiverTests, givenNotUsedAubStreamAndAUBDumpSubCaptureModeWhenAubCsrIsCreatedThenNonNullptrAubCsrIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.UseAubStream.set(false);
+    debugManager.flags.AUBDumpSubCaptureMode.set(1);
+
+    std::string aubFileName = "";
+
+    std::unique_ptr<CommandStreamReceiver> aubCsr(AUBCommandStreamReceiver::create(aubFileName, true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield()));
+    EXPECT_NE(nullptr, aubCsr);
+}
+
+HWTEST_F(AubCommandStreamReceiverTests, givenAubCommandStreamReceiverWhenRunAloneContextFlagIsNotSetThenContextFlagsAreNotSet) {
+    std::unique_ptr<MemoryManager> memoryManager(nullptr);
+    MockAubManager mockAubManager;
+    auto aubCsr = std::make_unique<AUBCommandStreamReceiverHw<FamilyType>>("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+    memoryManager.reset(new OsAgnosticMemoryManager(*pDevice->executionEnvironment));
+    aubCsr->aubManager = &mockAubManager;
+
+    aubCsr->setupContext(*pDevice->getDefaultEngine().osContext);
+    EXPECT_EQ(0u, mockAubManager.contextFlags & aub_stream::hardwareContextFlags::runAlone);
+}
+
+HWTEST_F(AubCommandStreamReceiverTests, givenAubCommandStreamReceiverWhenRunAloneContextFlagIsSetThenContextFlagsAreSet) {
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.ForceRunAloneContext.set(1);
+
+    std::unique_ptr<MemoryManager> memoryManager(nullptr);
+    MockAubManager mockAubManager;
+    auto aubCsr = std::make_unique<AUBCommandStreamReceiverHw<FamilyType>>("", true, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+    memoryManager.reset(new OsAgnosticMemoryManager(*pDevice->executionEnvironment));
+    aubCsr->aubManager = &mockAubManager;
+
+    aubCsr->setupContext(*pDevice->getDefaultEngine().osContext);
+    aubCsr->initializeEngine();
+    EXPECT_EQ(aub_stream::hardwareContextFlags::runAlone, mockAubManager.contextFlags & aub_stream::hardwareContextFlags::runAlone);
+}
+
 using SimulatedCsrTest = ::testing::Test;
-HWTEST_F(SimulatedCsrTest, givenAubCsrTypeWhenCreateCommandStreamReceiverThenProperAubCenterIsInitalized) {
+HWTEST_F(SimulatedCsrTest, givenAubCsrTypeWhenCreateCommandStreamReceiverThenProperAubCenterIsInitialized) {
     uint32_t expectedRootDeviceIndex = 10;
     MockExecutionEnvironment executionEnvironment(defaultHwInfo.get(), true, expectedRootDeviceIndex + 2);
     executionEnvironment.initializeMemoryManager();

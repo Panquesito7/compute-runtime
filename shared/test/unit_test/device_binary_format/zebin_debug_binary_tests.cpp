@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -41,42 +41,42 @@ TEST(DebugZebinTest, givenValidZebinThenDebugZebinIsGenerated) {
     auto zeInfoSectionIndex = elfEncoder.getLastSectionHeaderIndex();
     elfEncoder.appendSection(SHT_ZEBIN_SPIRV, SectionNames::spv, std::string{});
 
-    using SymbolEntry = ElfSymbolEntry<ELF_IDENTIFIER_CLASS::EI_CLASS_64>;
-    using Relocation = ElfRela<ELF_IDENTIFIER_CLASS::EI_CLASS_64>;
+    using SymbolEntry = ElfSymbolEntry<ElfIdentifierClass::EI_CLASS_64>;
+    using Relocation = ElfRela<ElfIdentifierClass::EI_CLASS_64>;
 
     SymbolEntry symbols[7]{};
     symbols[0].name = elfEncoder.appendSectionName("kernel");
-    symbols[0].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[0].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[0].shndx = static_cast<decltype(SymbolEntry::shndx)>(kernelSectionIndex);
     symbols[0].value = 0U;
 
     symbols[1].name = elfEncoder.appendSectionName("constData");
-    symbols[1].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[1].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[1].shndx = static_cast<decltype(SymbolEntry::shndx)>(constDataSectionIndex);
     symbols[1].value = 0U;
 
     symbols[2].name = elfEncoder.appendSectionName("varData");
-    symbols[2].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[2].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[2].shndx = static_cast<decltype(SymbolEntry::shndx)>(varDataSectionIndex);
     symbols[2].value = 0U;
 
     symbols[3].name = elfEncoder.appendSectionName("debugInfo");
-    symbols[3].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[3].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[3].shndx = static_cast<decltype(SymbolEntry::shndx)>(debugAbbrevSectionIndex);
     symbols[3].value = 0x1U;
 
     symbols[4].name = elfEncoder.appendSectionName("zeInfo");
-    symbols[4].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[4].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[4].shndx = static_cast<decltype(SymbolEntry::shndx)>(zeInfoSectionIndex);
     symbols[4].value = 0U;
 
     symbols[5].name = elfEncoder.appendSectionName(SectionNames::textPrefix.str() + "kernel");
-    symbols[5].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[5].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[5].shndx = static_cast<decltype(SymbolEntry::shndx)>(debugInfoSectionIndex);
     symbols[5].value = 0U;
 
     symbols[6].name = elfEncoder.appendSectionName("kernel_payload_offset");
-    symbols[6].info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbols[6].info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbols[6].shndx = static_cast<decltype(SymbolEntry::shndx)>(kernelSectionIndex);
     symbols[6].value = 0x10U;
 
@@ -188,7 +188,7 @@ TEST(DebugZebinTest, givenValidZebinThenDebugZebinIsGenerated) {
             EXPECT_EQ(static_cast<uint32_t>(((segments.varData.address + symbols[2].value + debugRelocations[2].addend) >> 32) & 0xffffffff),
                       *reinterpret_cast<const uint32_t *>(ptrDebugInfo + debugRelocations[2].offset));
 
-            // debug symbols with name different than text segments are not offseted
+            // debug symbols with name different than text segments are not offset
             EXPECT_EQ(symbols[3].value + debugRelocations[3].addend,
                       *reinterpret_cast<const uint64_t *>(ptrDebugInfo + debugRelocations[3].offset));
 
@@ -196,7 +196,7 @@ TEST(DebugZebinTest, givenValidZebinThenDebugZebinIsGenerated) {
             EXPECT_EQ(*reinterpret_cast<uint64_t *>(debugInfo + debugRelocations[4].offset),
                       *reinterpret_cast<const uint64_t *>(ptrDebugInfo + debugRelocations[4].offset));
 
-            // debug symbols with text segment name are offseted by corresponding segment's address
+            // debug symbols with text segment name are offset by corresponding segment's address
             EXPECT_EQ(segments.nameToSegMap["kernel"].address,
                       *reinterpret_cast<const uint64_t *>(ptrDebugInfo + debugRelocations[5].offset));
 
@@ -261,12 +261,12 @@ TEST(DebugZebinTest, givenSymTabShndxUndefinedThenDoNotApplyRelocations) {
     elfEncoder.appendSection(SHT_PROGBITS, SectionNames::textPrefix.str() + "kernel", ArrayRef<const uint8_t>(kernelISA, sizeof(kernelISA)));
     auto kernelSectionIndex = elfEncoder.getLastSectionHeaderIndex();
 
-    using SymbolEntry = ElfSymbolEntry<ELF_IDENTIFIER_CLASS::EI_CLASS_64>;
-    using Relocation = ElfRela<ELF_IDENTIFIER_CLASS::EI_CLASS_64>;
+    using SymbolEntry = ElfSymbolEntry<ElfIdentifierClass::EI_CLASS_64>;
+    using Relocation = ElfRela<ElfIdentifierClass::EI_CLASS_64>;
 
     SymbolEntry symbol{};
     symbol.name = elfEncoder.appendSectionName("kernel");
-    symbol.info = SYMBOL_TABLE_TYPE::STT_SECTION | SYMBOL_TABLE_BIND::STB_LOCAL << 4;
+    symbol.info = SymbolTableType::STT_SECTION | SymbolTableBind::STB_LOCAL << 4;
     symbol.shndx = static_cast<decltype(SymbolEntry::shndx)>(kernelSectionIndex);
     symbol.value = 0xAU;
 

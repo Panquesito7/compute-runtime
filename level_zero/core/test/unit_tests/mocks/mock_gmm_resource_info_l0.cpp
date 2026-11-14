@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,7 +16,7 @@ using namespace ::testing;
 namespace NEO {
 
 void MockGmmResourceInfo::setSurfaceFormat() {
-    auto iterateL0Formats = [&](const std::array<L0::ImageFormats::FormatTypes, L0::ImageFormats::ZE_IMAGE_FORMAT_RENDER_LAYOUT_MAX> &formats) {
+    auto iterateL0Formats = [&](const std::array<L0::ImageFormats::FormatTypes, L0::ImageFormats::maxLayoutCount> &formats) {
         if (!surfaceFormatInfo) {
             for (auto &formatArray : formats) {
                 for (auto &format : formatArray) {
@@ -31,6 +31,18 @@ void MockGmmResourceInfo::setSurfaceFormat() {
     };
 
     iterateL0Formats(L0::ImageFormats::formats);
+
+    if (!surfaceFormatInfo && mockResourceCreateParams.Format == L0::ImageFormats::srgbFormatRGBA8.gmmSurfaceFormat) {
+        surfaceFormatInfo = &L0::ImageFormats::srgbFormatRGBA8;
+    }
+
+    if (!surfaceFormatInfo && mockResourceCreateParams.Format == L0::ImageFormats::depthStencilFormatD24S8.gmmSurfaceFormat) {
+        surfaceFormatInfo = &L0::ImageFormats::depthStencilFormatD24S8;
+    }
+
+    if (!surfaceFormatInfo && mockResourceCreateParams.Format == L0::ImageFormats::depthStencilFormatD32FS8.gmmSurfaceFormat) {
+        surfaceFormatInfo = &L0::ImageFormats::depthStencilFormatD32FS8;
+    }
 
     if (mockResourceCreateParams.Format == GMM_FORMAT_GENERIC_8BIT) {
         static const NEO::SurfaceFormatInfo surfaceFormatGMM8BIT = {GMM_FORMAT_GENERIC_8BIT, GFX3DSTATE_SURFACEFORMAT_R8_UNORM, 0, 1, 1, 1};

@@ -1,0 +1,79 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "level_zero/api/opencl/source/api/leo_cl_types.h"
+#include "level_zero/api/opencl/source/context/leo_context.h"
+#include "level_zero/api/opencl/source/helpers/leo_base_object.h"
+
+#include <vector>
+
+namespace NEO {
+namespace LEO {
+
+class CommandQueue;
+class Kernel;
+class MemObj;
+
+template <>
+struct OpenCLObjectMapper<_cl_command_buffer_khr> {
+    typedef class CommandBuffer DerivedType;
+};
+
+// An OpenCL command buffer is a record-once, replay-many container, which maps onto a
+// regular (non-immediate) L0 command list. Replay appends that list onto the immediate
+// command list backing the target CommandQueue.
+class CommandBuffer : public BaseObject<_cl_command_buffer_khr> {
+  public:
+    static const cl_ulong objectMagic = 0x7C31A5D0428E9B16LL;
+    static constexpr cl_command_queue_properties supportedQueueProperties = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE;
+
+    CommandBuffer(Context *context, CommandQueue *commandQueue, ze_command_list_handle_t cmdListHandle, const cl_command_buffer_properties_khr *properties);
+    CommandBuffer() = delete;
+    ~CommandBuffer() override;
+
+    static bool isSupported();
+
+    cl_int finalize();
+    cl_int enqueue(CommandQueue *commandQueue, cl_uint numEventsInWaitList, const cl_event *eventWaitList, cl_event *event);
+
+    cl_int getInfo(cl_command_buffer_info_khr paramName, size_t paramValueSize,
+                   void *paramValue, size_t *paramValueSizeRet);
+
+    cl_int validateCommand(cl_command_queue commandQueue, const cl_command_properties_khr *properties,
+                           cl_uint numSyncPointsInWaitList, const cl_sync_point_khr *syncPointWaitList,
+                           const cl_mutable_command_khr *mutableHandle) const;
+    ze_result_t appendSyncPointBarrier(cl_uint numSyncPointsInWaitList);
+    cl_int recordCommand(ze_result_t appendResult, cl_sync_point_khr *syncPoint);
+    void keepAlive(Kernel *kernel);
+    void keepAlive(MemObj *memObj);
+
+    bool isFinalized() const { return this->state == CL_COMMAND_BUFFER_STATE_EXECUTABLE_KHR; };
+
+    Context *getContext() const { return this->context; };
+    CommandQueue *getCommandQueue() const { return this->commandQueue; };
+    ze_command_list_handle_t getL0Handle() const { return this->cmdListHandle; };
+    uint32_t getOrdinal() const;
+
+  protected:
+    void storeProperties(const cl_command_buffer_properties_khr *properties);
+
+    std::vector<cl_command_buffer_properties_khr> bufferProperties{};
+    std::vector<Kernel *> recordedKernels{};
+    std::vector<MemObj *> recordedMemObjs{};
+    std::vector<CommandQueue *> replayQueues{};
+    Context *context = nullptr;
+    CommandQueue *commandQueue = nullptr;
+    ze_command_list_handle_t cmdListHandle = nullptr;
+    cl_uint numRecordedCommands = 0u;
+    cl_command_buffer_state_khr state = CL_COMMAND_BUFFER_STATE_RECORDING_KHR;
+};
+
+static_assert(NEO::NonCopyableAndNonMovable<CommandBuffer>);
+
+} // namespace LEO
+} // namespace NEO

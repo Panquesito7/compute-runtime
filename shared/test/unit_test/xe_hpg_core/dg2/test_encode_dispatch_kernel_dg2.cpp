@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/kernel/dispatch_kernel_encoder_interface.h"
+#include "shared/source/kernel/grf_config.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/xe_hpg_core/hw_cmds_dg2.h"
 #include "shared/test/common/helpers/default_hw_info.h"
@@ -22,7 +23,7 @@ using namespace NEO;
 
 using CommandEncodeStatesDg2Test = ::testing::Test;
 
-DG2TEST_F(CommandEncodeStatesDg2Test, givenNoWorkaroundNeededWhenSelectingPreferredSlmSizePerDssThenUseDssCount) {
+DG2TEST_F(CommandEncodeStatesDg2Test, whenSelectingPreferredSlmSizePerDssThenUseDssCount) {
     using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
     using PREFERRED_SLM_ALLOCATION_SIZE = typename INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
 
@@ -37,69 +38,49 @@ DG2TEST_F(CommandEncodeStatesDg2Test, givenNoWorkaroundNeededWhenSelectingPrefer
     hwInfo.gtSystemInfo.DualSubSliceCount = 8;
     hwInfo.gtSystemInfo.SubSliceCount = 2 * hwInfo.gtSystemInfo.DualSubSliceCount;
 
-    {
-        const uint32_t threadsPerThreadGroup = 7; // 18 groups will fit in one DSS
-        const uint32_t slmSizePerThreadGroup = 2 * MemoryConstants::kiloByte;
+    struct PreferredSlmSizePerDssTestValues {
+        uint32_t threadsPerThreadGroup;
+        uint32_t slmSizePerThreadGroup;
+        PREFERRED_SLM_ALLOCATION_SIZE expectedValueInIdd;
+    };
+
+    const PreferredSlmSizePerDssTestValues valuesToTest[] = {
+        {7, 2 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64KB},   // 18 groups will fit in one DSS
+        {8, 2 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB},   // 16 groups will fit in one DSS
+        {9, 2 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB},   // 14 groups will fit in one DSS
+        {50, 16 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64KB}, // 2 groups will fit in one DSS
+    };
+
+    for (const auto &valueToTest : valuesToTest) {
         INTERFACE_DESCRIPTOR_DATA idd = FamilyType::cmdInitInterfaceDescriptorData;
-        EncodeDispatchKernel<FamilyType>::appendAdditionalIDDFields(&idd, rootDeviceEnvironment, threadsPerThreadGroup, slmSizePerThreadGroup, SlmPolicy::SlmPolicyLargeSlm);
-        EXPECT_EQ(PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64K, idd.getPreferredSlmAllocationSize());
-    }
-    {
-        const uint32_t threadsPerThreadGroup = 8; // 16 groups will fit in one DSS
-        const uint32_t slmSizePerThreadGroup = 2 * MemoryConstants::kiloByte;
-        INTERFACE_DESCRIPTOR_DATA idd = FamilyType::cmdInitInterfaceDescriptorData;
-        EncodeDispatchKernel<FamilyType>::appendAdditionalIDDFields(&idd, rootDeviceEnvironment, threadsPerThreadGroup, slmSizePerThreadGroup, SlmPolicy::SlmPolicyLargeSlm);
-        EXPECT_EQ(PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K, idd.getPreferredSlmAllocationSize());
-    }
-    {
-        const uint32_t threadsPerThreadGroup = 9; // 14 groups will fit in one DSS
-        const uint32_t slmSizePerThreadGroup = 2 * MemoryConstants::kiloByte;
-        INTERFACE_DESCRIPTOR_DATA idd = FamilyType::cmdInitInterfaceDescriptorData;
-        EncodeDispatchKernel<FamilyType>::appendAdditionalIDDFields(&idd, rootDeviceEnvironment, threadsPerThreadGroup, slmSizePerThreadGroup, SlmPolicy::SlmPolicyLargeSlm);
-        EXPECT_EQ(PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K, idd.getPreferredSlmAllocationSize());
-    }
-    {
-        const uint32_t threadsPerThreadGroup = 50; // 2 groups will fit in one DSS
-        const uint32_t slmSizePerThreadGroup = 16 * MemoryConstants::kiloByte;
-        INTERFACE_DESCRIPTOR_DATA idd = FamilyType::cmdInitInterfaceDescriptorData;
-        EncodeDispatchKernel<FamilyType>::appendAdditionalIDDFields(&idd, rootDeviceEnvironment, threadsPerThreadGroup, slmSizePerThreadGroup, SlmPolicy::SlmPolicyLargeSlm);
-        EXPECT_EQ(PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K, idd.getPreferredSlmAllocationSize());
+
+        EncodeSlmSizePerSubSliceArgs slmArgs{
+            .threadsPerThreadGroup = valueToTest.threadsPerThreadGroup,
+            .workloadThreadGroupCount = 1024,
+            .slmTotalSizePerThreadGroup = valueToTest.slmSizePerThreadGroup,
+            .grfCount = GrfConfig::defaultGrfNumber,
+            .slmPolicy = SlmPolicy::slmPolicyLargeSlm};
+
+        EncodeDispatchKernel<FamilyType>::encodeSlmSizePerSubSlice(&idd, rootDeviceEnvironment, slmArgs);
+
+        EXPECT_EQ(valueToTest.expectedValueInIdd, idd.getPreferredSlmAllocationSize())
+            << "threadsPerThreadGroup: " << valueToTest.threadsPerThreadGroup
+            << ", slmSizePerThreadGroup: " << valueToTest.slmSizePerThreadGroup;
     }
 }
 
-DG2TEST_F(CommandEncodeStatesDg2Test, GivenVariousSlmTotalSizesAndSettingRevIDToDifferentValuesWhenSetAdditionalInfoIsCalledThenCorrectValuesAreSet) {
+DG2TEST_F(CommandEncodeStatesDg2Test, GivenVariousSlmTotalSizesWhenSetPreferredSlmIsCalledThenCorrectValuesAreSet) {
     using PREFERRED_SLM_ALLOCATION_SIZE = typename FamilyType::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
 
-    const std::vector<PreferredSlmTestValues<FamilyType>> valuesToTest = {
-        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K},
-        {16 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16K},
-        {32 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K},
+    const std::vector<PreferredSlmTestValuesPreXe2<FamilyType>> valuesToTest = {
+        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0KB},
+        {16 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16KB},
+        {32 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32KB},
         // since we can't set 48KB as SLM size for workgroup, we need to ask for 64KB here.
-        {64 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64K},
-    };
-
-    const std::vector<PreferredSlmTestValues<FamilyType>> valuesToTestForDg2G10AStep = {
-        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K},
-        {16 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K},
-        {32 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K},
-        {64 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K},
+        {64 * MemoryConstants::kiloByte, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64KB},
     };
 
     MockExecutionEnvironment executionEnvironment{};
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
-    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-
-    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
-    for (uint8_t revision : {REVISION_A0, REVISION_A1, REVISION_B, REVISION_C}) {
-        for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-            hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(revision, hwInfo);
-            hwInfo.platform.usDeviceID = deviceId;
-            setHwInfoValuesFromConfig(0x200040005, hwInfo);
-            if (DG2::isG10(hwInfo) && (revision < REVISION_B)) {
-                verifyPreferredSlmValues<FamilyType>(valuesToTestForDg2G10AStep, rootDeviceEnvironment);
-            } else {
-                verifyPreferredSlmValues<FamilyType>(valuesToTest, rootDeviceEnvironment);
-            }
-        }
-    }
+    verifyPreferredSlmValuesPreXe2<FamilyType>(valuesToTest, rootDeviceEnvironment);
 }

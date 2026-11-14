@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -63,6 +63,7 @@ class WslComputeHelperUmKmDataTranslator : public UmKmDataTranslator {
         commandBufferHeaderStructSize = getStructSizeFn(TOK_S_COMMAND_BUFFER_HEADER_REC);
         gmmResourceInfoStructSize = getStructSizeFn(TOK_S_GMM_RESOURCE_INFO_WIN_STRUCT);
         gmmGfxPartitioningStructSize = getStructSizeFn(TOK_S_GMM_GFX_PARTITIONING);
+        createHwQueueDataStructSize = getStructSizeFn(TOK_S_CREATEHWQUEUE_PVTDATA);
 
         procAddr = this->wslComputeHelperLibrary->getProcAddress(getSizeRequiredForTokensName);
         UNRECOVERABLE_IF(nullptr == procAddr);
@@ -128,18 +129,6 @@ class WslComputeHelperUmKmDataTranslator : public UmKmDataTranslator {
             switch (prod) {
             default:
                 break;
-            case 28:
-                prod = IGFX_ICELAKE;
-                break;
-            case 29:
-                prod = IGFX_ICELAKE_LP;
-                break;
-            case 30:
-                prod = IGFX_LAKEFIELD;
-                break;
-            case 31:
-                prod = IGFX_JASPERLAKE;
-                break;
             case 33:
                 prod = IGFX_TIGERLAKE_LP;
                 break;
@@ -165,6 +154,23 @@ class WslComputeHelperUmKmDataTranslator : public UmKmDataTranslator {
     bool translateCreateContextDataToInternalRepresentation(void *dst, size_t dstSize, const CREATECONTEXT_PVTDATA &src) override {
         auto marshalled = Marshaller<TOK_S_CREATECONTEXT_PVTDATA>::marshall(src);
         return tokensToStructFn(TOK_S_CREATECONTEXT_PVTDATA, dst, dstSize, &marshalled.base.header, reinterpret_cast<TokenHeader *>(&marshalled + 1));
+    }
+
+    size_t getSizeForCreateHwQueueDataInternalRepresentation() override {
+        if (computeHelperLibraryVersion <= 2) {
+            return sizeof(CREATEHWQUEUE_PVTDATA);
+        }
+
+        return createHwQueueDataStructSize;
+    }
+
+    bool translateCreateHwQueueDataToInternalRepresentation(void *dst, size_t dstSize, const CREATEHWQUEUE_PVTDATA &src) override {
+        if (computeHelperLibraryVersion <= 2) {
+            return (0 == memcpy_s(dst, dstSize, &src, sizeof(src)));
+        }
+
+        auto marshalled = Marshaller<TOK_S_CREATEHWQUEUE_PVTDATA>::marshall(src);
+        return tokensToStructFn(TOK_S_CREATEHWQUEUE_PVTDATA, dst, dstSize, &marshalled.base.header, reinterpret_cast<TokenHeader *>(&marshalled + 1));
     }
 
     bool translateCommandBufferHeaderDataToInternalRepresentation(void *dst, size_t dstSize, const COMMAND_BUFFER_HEADER &src) override {
@@ -234,6 +240,7 @@ class WslComputeHelperUmKmDataTranslator : public UmKmDataTranslator {
     size_t gmmResourceInfoTokensSize = 0U;
     size_t gmmGfxPartitioningStructSize = 0U;
     size_t gmmGfxPartitioningTokensSize = 0U;
+    size_t createHwQueueDataStructSize = 0U;
 };
 
 WslComputeHelperGmmHandleAllocator::WslComputeHelperGmmHandleAllocator(WslComputeHelperUmKmDataTranslator *translator)
@@ -244,8 +251,7 @@ WslComputeHelperGmmHandleAllocator::WslComputeHelperGmmHandleAllocator(WslComput
 
 void *WslComputeHelperGmmHandleAllocator::createHandle(const GMM_RESOURCE_INFO *gmmResourceInfo) {
     size_t sizeU64 = (translator->getSizeForGmmResourceInfoInternalRepresentation() + sizeof(uint64_t) - 1) / sizeof(uint64_t);
-    std::unique_ptr<uint64_t[]> ret{new uint64_t[sizeU64]};
-    memset(ret.get(), 0, sizeU64 * sizeof(uint64_t));
+    auto ret = std::make_unique<uint64_t[]>(sizeU64);
     translator->translateGmmResourceInfoToInternalRepresentation(ret.get(), sizeU64 * sizeof(uint64_t), *gmmResourceInfo);
 
     return ret.release();
@@ -271,21 +277,21 @@ std::unique_ptr<UmKmDataTranslator> createUmKmDataTranslator(const Gdi &gdi, D3D
 #if !defined(_WIN32)
     requiresWslComputeHelper = true;
 #endif
-    if (requiresWslComputeHelper || NEO::DebugManager.flags.UseUmKmDataTranslator.get()) {
-        auto wpath = queryAdapterDriverStorePath(gdi, adapter);
+    if (requiresWslComputeHelper || NEO::debugManager.flags.UseUmKmDataTranslator.get()) {
+        auto driverStorePath = queryAdapterDriverStorePath(gdi, adapter);
+        UNRECOVERABLE_IF(driverStorePath.empty());
         std::string path;
         if (strlen(wslComputeHelperLibNameToLoad)) {
-            path.reserve(wpath.size() + 1 + strlen(wslComputeHelperLibName));
-            for (wchar_t wc : wpath) {
-                path += static_cast<char>(wc);
-            }
+            path = std::move(driverStorePath);
             path.append(Os::fileSeparator);
             path.append(wslComputeHelperLibNameToLoad);
         }
-        return std::make_unique<WslComputeHelperUmKmDataTranslator>(std::unique_ptr<OsLibrary>(OsLibrary::load(path)));
-    } else {
-        return std::make_unique<UmKmDataTranslator>();
+        std::unique_ptr<OsLibrary> lib{OsLibrary::loadFunc(path)};
+        if ((nullptr != lib) && (lib->isLoaded())) {
+            return std::make_unique<WslComputeHelperUmKmDataTranslator>(std::move(lib));
+        }
     }
+    return std::make_unique<UmKmDataTranslator>();
 }
 
 } // namespace NEO

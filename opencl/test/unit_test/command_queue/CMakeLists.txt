@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2022 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -10,6 +10,7 @@ set(IGDRCL_SRCS_tests_command_queue
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_enqueue_1_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_enqueue_2_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/buffer_operations_fixture.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/command_enqueue_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/command_enqueue_fixture.h
     ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_hw_1_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/command_queue_hw_2_tests.cpp
@@ -48,11 +49,9 @@ set(IGDRCL_SRCS_tests_command_queue
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_kernel_two_ooq_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_kernel_two_walker_ioq_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_kernel_two_walker_ooq_tests.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_map_buffer_fixture.h
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_map_buffer_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_map_image_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_marker_tests.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_media_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_migrate_mem_objects_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_read_buffer_event_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_read_buffer_fixture.h
@@ -117,5 +116,10 @@ if(TESTS_PVC_AND_LATER)
   )
 endif()
 
+if(TESTS_XE3P_AND_LATER)
+  list(APPEND IGDRCL_SRCS_tests_command_queue
+       ${CMAKE_CURRENT_SOURCE_DIR}/enqueue_heapless_tests.cpp
+  )
+endif()
 target_sources(igdrcl_tests PRIVATE ${IGDRCL_SRCS_tests_command_queue})
 add_subdirectories()

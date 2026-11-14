@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include <mutex>
 
@@ -18,15 +19,15 @@ class Device;
 class GraphicsAllocation;
 class MemoryManager;
 
-class SyncBufferHandler {
+class SyncBufferHandler : NonCopyableAndNonMovableClass {
   public:
     ~SyncBufferHandler();
 
     SyncBufferHandler(Device &device);
 
-    template <typename KernelT>
-    void prepareForEnqueue(size_t workGroupsCount, KernelT &kernel);
     void makeResident(CommandStreamReceiver &csr);
+
+    std::pair<GraphicsAllocation *, size_t> obtainAllocationAndOffset(size_t requiredSize);
 
   protected:
     void allocateNewBuffer();
@@ -34,9 +35,11 @@ class SyncBufferHandler {
     Device &device;
     MemoryManager &memoryManager;
     GraphicsAllocation *graphicsAllocation;
-    const size_t bufferSize = 64 * KB;
+    const size_t bufferSize = 64 * MemoryConstants::kiloByte;
     size_t usedBufferSize = 0;
     std::mutex mutex;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<SyncBufferHandler>);
 
 } // namespace NEO

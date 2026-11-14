@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,13 +10,11 @@
 
 namespace NEO {
 
-using Family = XeHpgCoreFamily;
-
-template <>
-void setFilterMode<Family>(Family::RENDER_SURFACE_STATE *surfaceState, const HardwareInfo *hwInfo) {
-    surfaceState->setDisallowLowQualityFiltering(false);
+using GfxFamily = XeHpgCoreFamily;
 }
-// clang-format off
-#include "shared/source/image/image_skl_and_later.inl"
-// clang-format on
+#include "shared/source/image/image_surface_state.inl"
+#include "shared/source/image/image_surface_state_before_xe2.inl"
+
+namespace NEO {
+template class ImageSurfaceStateHelper<GfxFamily>;
 } // namespace NEO

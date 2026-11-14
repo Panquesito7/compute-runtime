@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,14 +9,12 @@
 #include "shared/source/helpers/get_info.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/raii_gfx_core_helper.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_driver_info.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
-#include "shared/test/common/mocks/mock_os_context.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "opencl/source/cl_device/cl_device_info_map.h"
 #include "opencl/source/helpers/cl_gfx_core_helper.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/fixtures/device_info_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_execution_environment.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
@@ -53,7 +51,7 @@ TEST(GetDeviceInfo, GivenInvalidParametersWhenGettingDeviceInfoThenValueSizeRetI
     EXPECT_EQ(0x1234u, valueSizeRet);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, GetDeviceInfoMemCapabilitiesTest, GivenValidParametersWhenGetDeviceInfoIsCalledForBdwAndLaterThenClSuccessIsReturned) {
+HWTEST2_F(GetDeviceInfoMemCapabilitiesTest, GivenValidParametersWhenGetDeviceInfoIsCalledThenClSuccessIsReturned, IsGen12LP) {
 
     std::vector<TestParams> params = {
         {CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL,
@@ -504,11 +502,7 @@ TEST(GetDeviceInfo, GivenMaxGlobalVariableSizeWhenGettingDeviceInfoThenCorrectVa
     auto retVal = device->getDeviceInfo(CL_DEVICE_MAX_GLOBAL_VARIABLE_SIZE, sizeof(size_t), &value, &size);
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(size_t), size);
-    if (device->areOcl21FeaturesEnabled()) {
-        EXPECT_EQ(value, 65536u);
-    } else {
-        EXPECT_EQ(value, 0u);
-    }
+    EXPECT_EQ(value, 65536u);
 }
 
 TEST(GetDeviceInfo, GivenGlobalVariablePreferredTotalSizeWhenGettingDeviceInfoThenCorrectValueIsReturned) {
@@ -520,11 +514,7 @@ TEST(GetDeviceInfo, GivenGlobalVariablePreferredTotalSizeWhenGettingDeviceInfoTh
     auto retVal = device->getDeviceInfo(CL_DEVICE_GLOBAL_VARIABLE_PREFERRED_TOTAL_SIZE, sizeof(size_t), &value, &size);
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(size_t), size);
-    if (device->areOcl21FeaturesEnabled()) {
-        EXPECT_EQ(value, static_cast<size_t>(device->getSharedDeviceInfo().maxMemAllocSize));
-    } else {
-        EXPECT_EQ(value, 0u);
-    }
+    EXPECT_EQ(value, static_cast<size_t>(device->getSharedDeviceInfo().maxMemAllocSize));
 }
 
 TEST(GetDeviceInfo, GivenPreferredInteropsWhenGettingDeviceInfoThenCorrectValueIsReturned) {
@@ -538,18 +528,25 @@ TEST(GetDeviceInfo, GivenPreferredInteropsWhenGettingDeviceInfoThenCorrectValueI
     EXPECT_EQ(sizeof(cl_bool), size);
     EXPECT_TRUE(value == 1u);
 }
+
 TEST(GetDeviceInfo, WhenQueryingIlsWithVersionThenProperValueIsReturned) {
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
 
-    cl_name_version ilsWithVersion[1];
+    constexpr auto ilCount = 6;
+    cl_name_version ilsWithVersion[ilCount];
     size_t paramRetSize;
 
     const auto retVal = device->getDeviceInfo(CL_DEVICE_ILS_WITH_VERSION, sizeof(ilsWithVersion), &ilsWithVersion,
                                               &paramRetSize);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(sizeof(cl_name_version), paramRetSize);
-    EXPECT_EQ(CL_MAKE_VERSION(1u, 2u, 0u), ilsWithVersion->version);
-    EXPECT_STREQ("SPIR-V", ilsWithVersion->name);
+    EXPECT_EQ(sizeof(cl_name_version) * ilCount, paramRetSize);
+    for (int i = 0; i < ilCount; i++) {
+        const unsigned minor = ilCount - i - 1;
+        EXPECT_EQ(1u, CL_VERSION_MAJOR(ilsWithVersion[i].version));
+        EXPECT_EQ(minor, CL_VERSION_MINOR(ilsWithVersion[i].version));
+        EXPECT_EQ(0u, CL_VERSION_PATCH(ilsWithVersion[i].version));
+        EXPECT_STREQ("SPIR-V", ilsWithVersion[i].name);
+    }
 }
 
 TEST(GetDeviceInfo, WhenQueryingAtomicMemoryCapabilitiesThenProperValueIsReturned) {
@@ -562,11 +559,8 @@ TEST(GetDeviceInfo, WhenQueryingAtomicMemoryCapabilitiesThenProperValueIsReturne
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(cl_device_atomic_capabilities), paramRetSize);
 
-    cl_device_atomic_capabilities expectedCapabilities = CL_DEVICE_ATOMIC_ORDER_RELAXED | CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP;
-    if (device->areOcl21FeaturesSupported()) {
-        expectedCapabilities |= CL_DEVICE_ATOMIC_ORDER_ACQ_REL | CL_DEVICE_ATOMIC_ORDER_SEQ_CST |
-                                CL_DEVICE_ATOMIC_SCOPE_ALL_DEVICES | CL_DEVICE_ATOMIC_SCOPE_DEVICE;
-    }
+    cl_device_atomic_capabilities expectedCapabilities = CL_DEVICE_ATOMIC_ORDER_RELAXED | CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP | CL_DEVICE_ATOMIC_ORDER_ACQ_REL | CL_DEVICE_ATOMIC_ORDER_SEQ_CST |
+                                                         CL_DEVICE_ATOMIC_SCOPE_ALL_DEVICES | CL_DEVICE_ATOMIC_SCOPE_DEVICE;
     EXPECT_EQ(expectedCapabilities, atomicMemoryCapabilities);
 }
 
@@ -581,11 +575,8 @@ TEST(GetDeviceInfo, WhenQueryingAtomicFenceCapabilitiesThenProperValueIsReturned
     EXPECT_EQ(sizeof(cl_device_atomic_capabilities), paramRetSize);
 
     cl_device_atomic_capabilities expectedCapabilities = CL_DEVICE_ATOMIC_ORDER_RELAXED | CL_DEVICE_ATOMIC_ORDER_ACQ_REL |
-                                                         CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP;
-    if (device->areOcl21FeaturesSupported()) {
-        expectedCapabilities |= CL_DEVICE_ATOMIC_ORDER_SEQ_CST | CL_DEVICE_ATOMIC_SCOPE_ALL_DEVICES |
-                                CL_DEVICE_ATOMIC_SCOPE_DEVICE | CL_DEVICE_ATOMIC_SCOPE_WORK_ITEM;
-    }
+                                                         CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP | CL_DEVICE_ATOMIC_ORDER_SEQ_CST | CL_DEVICE_ATOMIC_SCOPE_ALL_DEVICES |
+                                                         CL_DEVICE_ATOMIC_SCOPE_DEVICE | CL_DEVICE_ATOMIC_SCOPE_WORK_ITEM;
     EXPECT_EQ(expectedCapabilities, atomicFenceCapabilities);
 }
 
@@ -627,8 +618,8 @@ TEST(GetDeviceInfo, WhenQueryingPipesSupportThenProperValueIsReturned) {
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(cl_bool), paramRetSize);
 
-    cl_bool expectedPipesSupport = deviceFactory.rootDevices[0]->arePipesSupported() ? CL_TRUE : CL_FALSE;
-    EXPECT_EQ(expectedPipesSupport, pipesSupport);
+    cl_bool expectedValue = CL_FALSE;
+    EXPECT_EQ(expectedValue, pipesSupport);
 }
 
 TEST(GetDeviceInfo, WhenQueryingNonUniformWorkGroupSupportThenProperValueIsReturned) {
@@ -655,8 +646,7 @@ TEST(GetDeviceInfo, WhenQueryingWorkGroupCollectiveFunctionsSupportThenProperVal
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(cl_bool), paramRetSize);
 
-    cl_bool expectedWorkGroupCollectiveFunctionsSupport =
-        deviceFactory.rootDevices[0]->areOcl21FeaturesSupported() ? CL_TRUE : CL_FALSE;
+    cl_bool expectedWorkGroupCollectiveFunctionsSupport = CL_TRUE;
     EXPECT_EQ(expectedWorkGroupCollectiveFunctionsSupport, workGroupCollectiveFunctionsSupport);
 }
 
@@ -670,7 +660,7 @@ TEST(GetDeviceInfo, WhenQueryingGenericAddressSpaceSupportThenProperValueIsRetur
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(cl_bool), paramRetSize);
 
-    cl_bool expectedGenericAddressSpaceSupport = deviceFactory.rootDevices[0]->areOcl21FeaturesSupported() ? CL_TRUE : CL_FALSE;
+    cl_bool expectedGenericAddressSpaceSupport = CL_TRUE;
     EXPECT_EQ(expectedGenericAddressSpaceSupport, genericAddressSpaceSupport);
 }
 
@@ -680,10 +670,10 @@ class MockGfxCoreHelper : public GfxCoreHelperHw<GfxFamily> {
     const EngineInstancesContainer getGpgpuEngineInstances(const RootDeviceEnvironment &rootDeviceEnvironment) const override {
         EngineInstancesContainer result{};
         for (int i = 0; i < ccsCount; i++) {
-            result.push_back({static_cast<aub_stream::EngineType>(aub_stream::ENGINE_CCS + i), EngineUsage::Regular});
+            result.push_back({static_cast<aub_stream::EngineType>(aub_stream::ENGINE_CCS + i), EngineUsage::regular});
         }
         for (int i = 0; i < bcsCount; i++) {
-            result.push_back({aub_stream::ENGINE_BCS, EngineUsage::Regular});
+            result.push_back({aub_stream::ENGINE_BCS, EngineUsage::regular});
         }
         return result;
     }
@@ -691,14 +681,14 @@ class MockGfxCoreHelper : public GfxCoreHelperHw<GfxFamily> {
     EngineGroupType getEngineGroupType(aub_stream::EngineType engineType, EngineUsage engineUsage, const HardwareInfo &hwInfo) const override {
         switch (engineType) {
         case aub_stream::ENGINE_RCS:
-            return EngineGroupType::RenderCompute;
+            return EngineGroupType::renderCompute;
         case aub_stream::ENGINE_CCS:
         case aub_stream::ENGINE_CCS1:
         case aub_stream::ENGINE_CCS2:
         case aub_stream::ENGINE_CCS3:
-            return EngineGroupType::Compute;
+            return EngineGroupType::compute;
         case aub_stream::ENGINE_BCS:
-            return EngineGroupType::Copy;
+            return EngineGroupType::copy;
         default:
             UNRECOVERABLE_IF(true);
         }
@@ -744,7 +734,7 @@ HWTEST_F(GetDeviceInfoQueueFamilyTest, givenSingleDeviceWhenInitializingCapsThen
     EXPECT_EQ(3u, families[0].count);
     EXPECT_EQ(clDevice.getDeviceInfo().queueOnHostProperties, families[0].properties);
 
-    EXPECT_EQ(clDevice.getQueueFamilyCapabilities(EngineGroupType::Copy), families[1].capabilities);
+    EXPECT_EQ(clDevice.getQueueFamilyCapabilities(EngineGroupType::copy), families[1].capabilities);
     EXPECT_EQ(1u, families[1].count);
     EXPECT_EQ(clDevice.getDeviceInfo().queueOnHostProperties, families[1].properties);
 }
@@ -771,7 +761,7 @@ HWTEST_F(GetDeviceInfoQueueFamilyTest, givenSubDeviceWhenInitializingCapsThenRet
     EXPECT_EQ(3u, families[0].count);
     EXPECT_EQ(clDevice.getDeviceInfo().queueOnHostProperties, families[0].properties);
 
-    EXPECT_EQ(clDevice.getQueueFamilyCapabilities(EngineGroupType::Copy), families[1].capabilities);
+    EXPECT_EQ(clDevice.getQueueFamilyCapabilities(EngineGroupType::copy), families[1].capabilities);
     EXPECT_EQ(1u, families[1].count);
     EXPECT_EQ(clDevice.getDeviceInfo().queueOnHostProperties, families[1].properties);
 }
@@ -810,7 +800,7 @@ HWTEST_F(GetDeviceInfoQueueFamilyTest, givenSubDeviceWithoutSupportedEngineWhenI
         EXPECT_EQ(3u, families[0].count);
         EXPECT_EQ(clDevice0.getDeviceInfo().queueOnHostProperties, families[0].properties);
 
-        EXPECT_EQ(clDevice0.getQueueFamilyCapabilities(EngineGroupType::Copy), families[1].capabilities);
+        EXPECT_EQ(clDevice0.getQueueFamilyCapabilities(EngineGroupType::copy), families[1].capabilities);
         EXPECT_EQ(1u, families[1].count);
         EXPECT_EQ(clDevice0.getDeviceInfo().queueOnHostProperties, families[1].properties);
     }
@@ -851,40 +841,7 @@ HWTEST_F(GetDeviceInfoQueueFamilyTest, givenDeviceRootDeviceWhenInitializingCaps
     EXPECT_EQ(clDevice.getDeviceInfo().queueOnHostProperties, families[0].properties);
 }
 
-struct GetDeviceInfo : public ::testing::TestWithParam<uint32_t /*cl_device_info*/> {
-    void SetUp() override {
-        param = GetParam();
-    }
-
-    cl_device_info param;
-};
-
-TEST_P(GetDeviceInfo, GivenValidParamsWhenGettingDeviceInfoThenSuccessIsReturned) {
-    auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-
-    size_t sizeReturned = GetInfo::invalidSourceSize;
-    auto retVal = device->getDeviceInfo(
-        param,
-        0,
-        nullptr,
-        &sizeReturned);
-    if (CL_SUCCESS != retVal) {
-        ASSERT_EQ(CL_SUCCESS, retVal) << " param = " << param;
-    }
-    ASSERT_NE(GetInfo::invalidSourceSize, sizeReturned);
-
-    auto *object = new char[sizeReturned];
-    retVal = device->getDeviceInfo(
-        param,
-        sizeReturned,
-        object,
-        nullptr);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    delete[] object;
-}
-
-// Define new command types to run the parameterized tests
+// Define params to run the device info tests
 cl_device_info deviceInfoParams[] = {
     CL_DEVICE_ADDRESS_BITS,
     CL_DEVICE_AVAILABLE,
@@ -991,10 +948,32 @@ cl_device_info deviceInfoParams[] = {
     CL_DRIVER_VERSION,
     CL_DRIVER_UUID_KHR};
 
-INSTANTIATE_TEST_CASE_P(
-    Device_,
-    GetDeviceInfo,
-    testing::ValuesIn(deviceInfoParams));
+TEST(GetDeviceInfo, GivenValidParamsWhenGettingDeviceInfoThenSuccessIsReturned) {
+    auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
+
+    for (auto param : deviceInfoParams) {
+        size_t sizeReturned = GetInfo::invalidSourceSize;
+        auto retVal = device->getDeviceInfo(
+            param,
+            0,
+            nullptr,
+            &sizeReturned);
+        if (CL_SUCCESS != retVal) {
+            ASSERT_EQ(CL_SUCCESS, retVal) << " param = " << param;
+        }
+        ASSERT_NE(GetInfo::invalidSourceSize, sizeReturned);
+
+        auto *object = new char[sizeReturned];
+        retVal = device->getDeviceInfo(
+            param,
+            sizeReturned,
+            object,
+            nullptr);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+
+        delete[] object;
+    }
+}
 
 TEST(GetDeviceInfoTest, givenDeviceWithSubDevicesWhenGettingNumberOfComputeUnitsThenRootDeviceExposesAllComputeUnits) {
     UltClDeviceFactory deviceFactory{1, 3};
@@ -1086,12 +1065,8 @@ TEST(GetDeviceInfo, givenDeviceUuidWhenGettingDeviceInfoThenGenerateDeviceUuidFr
     EXPECT_EQ(generateDeviceUuid, deviceUuidKHR);
 }
 
-struct DeviceAttributeQueryTest : public ::testing::TestWithParam<uint32_t /*cl_device_info*/> {
-    void SetUp() override {
-        param = GetParam();
-    }
-
-    void verifyDeviceAttribute(ClDevice &device) {
+struct DeviceAttributeQueryTest : public ::testing::Test {
+    void verifyDeviceAttribute(cl_device_info param, ClDevice &device) {
         size_t sizeReturned = GetInfo::invalidSourceSize;
         auto retVal = device.getDeviceInfo(
             param,
@@ -1111,51 +1086,46 @@ struct DeviceAttributeQueryTest : public ::testing::TestWithParam<uint32_t /*cl_
             nullptr);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
+        const auto &hwInfo = device.getHardwareInfo();
+
         switch (param) {
         case CL_DEVICE_IP_VERSION_INTEL: {
             auto pDeviceIpVersion = reinterpret_cast<cl_version *>(object.get());
-            auto &hwInfo = device.getHardwareInfo();
 
-            if (DebugManager.flags.UseDeprecatedClDeviceIpVersion.get()) {
-                auto &clGfxCoreHelper = device.getRootDeviceEnvironment().getHelper<ClGfxCoreHelper>();
-                EXPECT_EQ(clGfxCoreHelper.getDeviceIpVersion(hwInfo), *pDeviceIpVersion);
-            } else {
-                auto &compilerProductHelper = device.getCompilerProductHelper();
-                EXPECT_EQ(static_cast<cl_version>(compilerProductHelper.getHwIpVersion(hwInfo)), *pDeviceIpVersion);
-            }
+            auto &compilerProductHelper = device.getCompilerProductHelper();
+            EXPECT_EQ(static_cast<cl_version>(compilerProductHelper.getHwIpVersion(hwInfo)), *pDeviceIpVersion);
             EXPECT_EQ(sizeof(cl_version), sizeReturned);
             break;
         }
         case CL_DEVICE_ID_INTEL: {
             auto pDeviceId = reinterpret_cast<cl_uint *>(object.get());
-            EXPECT_EQ(device.getHardwareInfo().platform.usDeviceID, *pDeviceId);
+            EXPECT_EQ(hwInfo.platform.usDeviceID, *pDeviceId);
             EXPECT_EQ(sizeof(cl_uint), sizeReturned);
             break;
         }
         case CL_DEVICE_NUM_SLICES_INTEL: {
             auto pNumSlices = reinterpret_cast<cl_uint *>(object.get());
-            const auto &gtSysInfo = device.getHardwareInfo().gtSystemInfo;
+            const auto &gtSysInfo = hwInfo.gtSystemInfo;
             EXPECT_EQ(gtSysInfo.SliceCount * std::max(device.getNumGenericSubDevices(), 1u), *pNumSlices);
             EXPECT_EQ(sizeof(cl_uint), sizeReturned);
             break;
         }
         case CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL: {
             auto pNumSubslicesPerSlice = reinterpret_cast<cl_uint *>(object.get());
-            const auto &gtSysInfo = device.getHardwareInfo().gtSystemInfo;
-            EXPECT_EQ(gtSysInfo.SubSliceCount / gtSysInfo.SliceCount, *pNumSubslicesPerSlice);
+            EXPECT_EQ(4u, *pNumSubslicesPerSlice);
             EXPECT_EQ(sizeof(cl_uint), sizeReturned);
             break;
         }
         case CL_DEVICE_NUM_EUS_PER_SUB_SLICE_INTEL: {
             auto pNumEusPerSubslice = reinterpret_cast<cl_uint *>(object.get());
-            const auto &gtSysInfo = device.getHardwareInfo().gtSystemInfo;
+            const auto &gtSysInfo = hwInfo.gtSystemInfo;
             EXPECT_EQ(gtSysInfo.MaxEuPerSubSlice, *pNumEusPerSubslice);
             EXPECT_EQ(sizeof(cl_uint), sizeReturned);
             break;
         }
         case CL_DEVICE_NUM_THREADS_PER_EU_INTEL: {
             auto pNumThreadsPerEu = reinterpret_cast<cl_uint *>(object.get());
-            const auto &gtSysInfo = device.getHardwareInfo().gtSystemInfo;
+            const auto &gtSysInfo = hwInfo.gtSystemInfo;
             EXPECT_EQ(gtSysInfo.ThreadCount / gtSysInfo.EUCount, *pNumThreadsPerEu);
             EXPECT_EQ(sizeof(cl_uint), sizeReturned);
             break;
@@ -1163,7 +1133,7 @@ struct DeviceAttributeQueryTest : public ::testing::TestWithParam<uint32_t /*cl_
         case CL_DEVICE_FEATURE_CAPABILITIES_INTEL: {
             auto pCapabilities = reinterpret_cast<cl_device_feature_capabilities_intel *>(object.get());
             auto &clGfxCoreHelper = device.getRootDeviceEnvironment().getHelper<ClGfxCoreHelper>();
-            EXPECT_EQ(clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(device.getRootDeviceEnvironment()), *pCapabilities);
+            EXPECT_EQ(clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(hwInfo), *pCapabilities);
             EXPECT_EQ(sizeof(cl_device_feature_capabilities_intel), sizeReturned);
             break;
         }
@@ -1173,34 +1143,24 @@ struct DeviceAttributeQueryTest : public ::testing::TestWithParam<uint32_t /*cl_
         }
     }
 
-    cl_device_info param;
     DebugManagerStateRestore restorer;
 };
 
-TEST_P(DeviceAttributeQueryTest, givenDeprecatedDeviceIpVersionWhenVerifyDeviceAttributeThenCorrectResultsAreReturned) {
-    DebugManager.flags.UseDeprecatedClDeviceIpVersion.set(true);
-    auto pClDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    verifyDeviceAttribute(*pClDevice);
-}
+TEST(GetDeviceInfo, WhenQueryingDeviceBfloatAtomicCapabilitiesThenProperValueFromCapsIsReturnedOrNone) {
+    auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
+    const auto &hwInfo = device->getHardwareInfo();
+    uint64_t value = 0u;
+    size_t retSize = 0u;
 
-TEST_P(DeviceAttributeQueryTest, givenNewDeviceIpVersionWhenVerifyDeviceAttributeThenCorrectResultsAreReturned) {
-    DebugManager.flags.UseDeprecatedClDeviceIpVersion.set(false);
-    auto pClDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    verifyDeviceAttribute(*pClDevice);
-}
+    auto retVal = device->getDeviceInfo(
+        CL_DEVICE_BFLOAT16_FP_ATOMIC_CAPABILITIES_EXT,
+        sizeof(cl_device_atomic_capabilities),
+        &value,
+        &retSize);
 
-TEST_P(DeviceAttributeQueryTest, givenGetDeviceInfoWhenDeviceAttributeIsQueriedOnRootDeviceAndSubDevicesThenReturnCorrectAttributeValues) {
-    DebugManager.flags.CreateMultipleSubDevices.set(2);
-    VariableBackup<bool> mockDeviceFlagBackup(&MockDevice::createSingleDevice, false);
-
-    auto pRootClDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    ASSERT_EQ(2u, pRootClDevice->subDevices.size());
-
-    verifyDeviceAttribute(*pRootClDevice);
-
-    for (const auto &pClSubDevice : pRootClDevice->subDevices) {
-        verifyDeviceAttribute(*pClSubDevice);
-    }
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(hwInfo.caps.kernelBFloat16AtomicCapabilities, value);
+    EXPECT_EQ(sizeof(cl_device_atomic_capabilities), retSize);
 }
 
 cl_device_info deviceAttributeQueryParams[] = {
@@ -1212,7 +1172,36 @@ cl_device_info deviceAttributeQueryParams[] = {
     CL_DEVICE_NUM_THREADS_PER_EU_INTEL,
     CL_DEVICE_FEATURE_CAPABILITIES_INTEL};
 
-INSTANTIATE_TEST_CASE_P(
-    Device_,
-    DeviceAttributeQueryTest,
-    testing::ValuesIn(deviceAttributeQueryParams));
+TEST_F(DeviceAttributeQueryTest, givenGetDeviceInfoWhenDeviceAttributeIsQueriedOnRootDeviceAndSubDevicesThenReturnCorrectAttributeValues) {
+    debugManager.flags.CreateMultipleSubDevices.set(2);
+    VariableBackup<bool> mockDeviceFlagBackup(&MockDevice::createSingleDevice, false);
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.gtSystemInfo.SliceCount = 2;
+    hwInfo.gtSystemInfo.DualSubSliceCount = 7;
+    hwInfo.gtSystemInfo.SubSliceCount = 7;
+
+    auto pRootClDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
+    ASSERT_EQ(2u, pRootClDevice->subDevices.size());
+
+    for (auto param : deviceAttributeQueryParams) {
+        verifyDeviceAttribute(param, *pRootClDevice);
+
+        for (const auto &pClSubDevice : pRootClDevice->subDevices) {
+            verifyDeviceAttribute(param, *pClSubDevice);
+        }
+    }
+}
+
+TEST(ExposedIpVersionOverrideTest, givenGetDeviceInfoWhenDeviceIpOverrideIsSetThenReturnOverriddenValue) {
+    HardwareInfo hwInfoWithOverride = *defaultHwInfo;
+    uint32_t versionExpected = 7U;
+    hwInfoWithOverride.ipVersionOverrideExposedToTheApplication.value = versionExpected;
+
+    auto deviceWithOverride = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfoWithOverride));
+    uint32_t versionGot = 0;
+    auto retVal = deviceWithOverride->getDeviceInfo(CL_DEVICE_IP_VERSION_INTEL, sizeof(uint32_t), &versionGot, nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    EXPECT_EQ(versionExpected, versionGot);
+}

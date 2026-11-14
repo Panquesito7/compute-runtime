@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,9 +10,10 @@
 #include "shared/source/memory_manager/residency_container.h"
 #include "shared/source/os_interface/windows/windows_defs.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/spinlock.h"
+#include "shared/source/utilities/stackvec.h"
 
-#include <atomic>
 #include <mutex>
 
 struct _D3DKMT_TRIMNOTIFICATION;
@@ -24,63 +25,54 @@ namespace NEO {
 class GraphicsAllocation;
 class WddmAllocation;
 class Wddm;
+class CommandStreamReceiver;
+class OsContextWin;
 
 class WddmResidencyController {
   public:
-    WddmResidencyController(Wddm &wddm, uint32_t osContextId);
-    MOCKABLE_VIRTUAL ~WddmResidencyController();
+    WddmResidencyController(Wddm &wddm);
+    MOCKABLE_VIRTUAL ~WddmResidencyController() = default;
 
     static void APIENTRY trimCallback(_Inout_ D3DKMT_TRIMNOTIFICATION *trimNotification);
 
     [[nodiscard]] MOCKABLE_VIRTUAL std::unique_lock<SpinLock> acquireLock();
     [[nodiscard]] std::unique_lock<SpinLock> acquireTrimCallbackLock();
 
-    WddmAllocation *getTrimCandidateHead();
-    void addToTrimCandidateList(GraphicsAllocation *allocation);
-    void removeFromTrimCandidateList(GraphicsAllocation *allocation, bool compactList);
-    void removeFromTrimCandidateListIfUsed(WddmAllocation *allocation, bool compactList);
-    void checkTrimCandidateCount();
-
-    MOCKABLE_VIRTUAL bool checkTrimCandidateListCompaction();
-    void compactTrimCandidateList();
-
-    bool wasAllocationUsedSinceLastTrim(uint64_t fenceValue) { return fenceValue > lastTrimFenceValue; }
-    void updateLastTrimFenceValue() { lastTrimFenceValue = *this->getMonitoredFence().cpuAddress; }
-    const ResidencyContainer &peekTrimCandidateList() const { return trimCandidateList; }
-    uint32_t peekTrimCandidatesCount() const { return trimCandidatesCount; }
-
-    MonitoredFence &getMonitoredFence() { return monitoredFence; }
-    void resetMonitoredFenceParams(D3DKMT_HANDLE &handle, uint64_t *cpuAddress, D3DGPU_VIRTUAL_ADDRESS &gpuAddress);
-
     void registerCallback();
+    void unregisterCallback();
 
     void trimResidency(const D3DDDI_TRIMRESIDENCYSET_FLAGS &flags, uint64_t bytes);
-    bool trimResidencyToBudget(uint64_t bytes);
+    MOCKABLE_VIRTUAL bool trimResidencyToBudget(uint64_t bytes);
+    bool trimResidencyToBudget(uint64_t bytes, const StackVec<CommandStreamReceiver *, 5> &skippedCsrs);
 
     bool isMemoryBudgetExhausted() const { return memoryBudgetExhausted; }
     void setMemoryBudgetExhausted() { memoryBudgetExhausted = true; }
 
-    bool makeResidentResidencyAllocations(const ResidencyContainer &allocationsForResidency);
-    void makeNonResidentEvictionAllocations(const ResidencyContainer &evictionAllocations);
+    bool makeResidentResidencyAllocations(ResidencyContainer &allocationsForResidency, bool &requiresBlockingResidencyHandling, CommandStreamReceiver *csr);
 
     bool isInitialized() const;
 
-  protected:
-    MonitoredFence monitoredFence = {};
+    void removeAllocation(ResidencyContainer &container, GraphicsAllocation *gfxAllocation);
 
-    ResidencyContainer trimCandidateList;
+    ResidencyContainer &getEvictionAllocations() {
+        return this->evictionAllocations;
+    }
+
+  protected:
+    size_t fillHandlesContainer(ResidencyContainer &allocationsForResidency, bool &requiresBlockingResidencyHandling, OsContextWin &osContext);
+    void removeAllocationImpl(ResidencyContainer &container, GraphicsAllocation *gfxAllocation);
 
     SpinLock lock;
     SpinLock trimCallbackLock;
 
-    uint64_t lastTrimFenceValue = 0u;
-
     Wddm &wddm;
     VOID *trimCallbackHandle = nullptr;
 
-    uint32_t osContextId;
-    uint32_t trimCandidatesCount = 0;
-
     bool memoryBudgetExhausted = false;
+
+    ResidencyContainer evictionAllocations;
+
+    ResidencyContainer backupResidencyContainer;    // Stores allocations which should be resident
+    std::vector<D3DKMT_HANDLE> handlesForResidency; // Stores D3DKMT handles of allocations which are not yet resident
 };
 } // namespace NEO

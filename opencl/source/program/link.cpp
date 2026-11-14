@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,18 +7,12 @@
 
 #include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/source/compiler_interface/compiler_options.h"
-#include "shared/source/compiler_interface/external_functions.h"
-#include "shared/source/compiler_interface/linker.h"
 #include "shared/source/device/device.h"
-#include "shared/source/device_binary_format/device_binary_formats.h"
 #include "shared/source/device_binary_format/elf/elf.h"
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
 #include "shared/source/device_binary_format/elf/ocl_elf.h"
-#include "shared/source/program/kernel_info.h"
 
 #include "opencl/source/cl_device/cl_device.h"
-#include "opencl/source/gtpin/gtpin_notify.h"
-#include "opencl/source/helpers/cl_validators.h"
 #include "opencl/source/program/program.h"
 
 namespace NEO {
@@ -34,10 +28,9 @@ cl_int Program::link(
     auto defaultClDevice = deviceVector[0];
     UNRECOVERABLE_IF(defaultClDevice == nullptr);
     auto &defaultDevice = defaultClDevice->getDevice();
-    std::unordered_map<uint32_t, bool> kernelDebugDataNotified;
-    std::unordered_map<uint32_t, bool> debugOptionsAppended;
     auto internalOptions = getInternalOptions();
     cl_program_binary_type binaryType = CL_PROGRAM_BINARY_TYPE_NONE;
+
     do {
         if ((numInputPrograms == 0) || (inputPrograms == nullptr)) {
             retVal = CL_INVALID_VALUE;
@@ -50,8 +43,6 @@ cl_int Program::link(
         }
 
         for (const auto &device : deviceVector) {
-            kernelDebugDataNotified[device->getRootDeviceIndex()] = false;
-            debugOptionsAppended[device->getRootDeviceIndex()] = false;
             deviceBuildInfos[device].buildStatus = CL_BUILD_IN_PROGRESS;
         }
 
@@ -62,17 +53,6 @@ cl_int Program::link(
             if (pos != std::string::npos) {
                 options.erase(pos, optionString.length());
                 CompilerOptions::concatenateAppend(internalOptions, optionString);
-            }
-        }
-
-        if (isKernelDebugEnabled()) {
-            for (auto &device : deviceVector) {
-                if (debugOptionsAppended[device->getRootDeviceIndex()]) {
-                    continue;
-                }
-                appendKernelDebugOptions(*device, internalOptions);
-
-                debugOptionsAppended[device->getRootDeviceIndex()] = true;
             }
         }
 
@@ -137,7 +117,6 @@ cl_int Program::link(
         inputArgs.src = ArrayRef<const char>(reinterpret_cast<const char *>(clLinkInput.data()), clLinkInput.size());
         inputArgs.apiOptions = ArrayRef<const char>(options.c_str(), options.length());
         inputArgs.internalOptions = ArrayRef<const char>(internalOptions.c_str(), internalOptions.length());
-        inputArgs.gtPinInput = gtpinGetIgcInit();
 
         if (!isCreateLibrary) {
             for (const auto &device : deviceVector) {
@@ -161,14 +140,6 @@ cl_int Program::link(
                     break;
                 }
                 binaryType = CL_PROGRAM_BINARY_TYPE_EXECUTABLE;
-
-                if (isKernelDebugEnabled()) {
-                    if (kernelDebugDataNotified[rootDeviceIndex]) {
-                        continue;
-                    }
-                    notifyDebuggerWithDebugData(device);
-                    kernelDebugDataNotified[device->getRootDeviceIndex()] = true;
-                }
             }
 
         } else {

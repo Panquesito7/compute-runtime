@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,13 +11,13 @@
 #include "opencl/source/mem_obj/buffer.h"
 namespace NEO {
 
-BuiltInOp<EBuiltInOps::AuxTranslation>::BuiltInOp(BuiltIns &kernelsLib, ClDevice &device) : BuiltinDispatchInfoBuilder(kernelsLib, device) {
-    BuiltinDispatchInfoBuilder::populate(EBuiltInOps::AuxTranslation, "", "fullCopy", multiDeviceBaseKernel);
+AuxTranslationBuiltin::AuxTranslationBuiltin(BuiltIns &kernelsLib, ClDevice &device, BuiltIn::AddressingMode mode) : BuiltIn::DispatchInfoBuilder(kernelsLib, device) {
+    BuiltIn::DispatchInfoBuilder::populate(BuiltIn::BaseKernel::auxTranslation, mode, "", "fullCopy", multiDeviceBaseKernel);
     baseKernel = multiDeviceBaseKernel->getKernel(clDevice.getRootDeviceIndex());
     resizeKernelInstances(5);
 }
 
-void BuiltInOp<EBuiltInOps::AuxTranslation>::resizeKernelInstances(size_t size) const {
+void AuxTranslationBuiltin::resizeKernelInstances(size_t size) const {
     convertToNonAuxKernel.reserve(size);
     convertToAuxKernel.reserve(size);
 
@@ -25,11 +25,11 @@ void BuiltInOp<EBuiltInOps::AuxTranslation>::resizeKernelInstances(size_t size) 
         cl_int retVal{CL_SUCCESS};
         auto clonedNonAuxToAuxKernel = Kernel::create(baseKernel->getProgram(), baseKernel->getKernelInfo(), clDevice, retVal);
         UNRECOVERABLE_IF(CL_SUCCESS != retVal);
-        clonedNonAuxToAuxKernel->setAuxTranslationDirection(AuxTranslationDirection::NonAuxToAux);
+        clonedNonAuxToAuxKernel->setAuxTranslationDirection(AuxTranslationDirection::nonAuxToAux);
 
         auto clonedAuxToNonAuxKernel = Kernel::create(baseKernel->getProgram(), baseKernel->getKernelInfo(), clDevice, retVal);
         UNRECOVERABLE_IF(CL_SUCCESS != retVal);
-        clonedAuxToNonAuxKernel->setAuxTranslationDirection(AuxTranslationDirection::AuxToNonAux);
+        clonedAuxToNonAuxKernel->setAuxTranslationDirection(AuxTranslationDirection::auxToNonAux);
 
         clonedNonAuxToAuxKernel->cloneKernel(baseKernel);
         clonedAuxToNonAuxKernel->cloneKernel(baseKernel);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,5 +11,8 @@ namespace L0 {
 namespace ult {
 extern const char *testLoaderDllName;
 extern const char *testDllName;
+
+void *backupAdditionalGlobalState();
+void restoreAdditionalGlobalState(void *saved);
 } // namespace ult
 } // namespace L0

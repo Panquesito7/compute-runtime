@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,10 @@
 namespace NEO {
 bool MockOsLibrary::isLoaded() {
     return true;
+}
+
+std::string MockOsLibrary::getFullPath() {
+    return std::string();
 }
 
 void *MockOsLibrary::getProcAddress(const std::string &procName) {
@@ -63,6 +67,9 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     if (procName == "D3DKMTCreateSynchronizationObject2") {
         return reinterpret_cast<void *>(mockD3DKMTCreateSynchronizationObject2);
     }
+    if (procName == "D3DKMTCreateNativeFence") {
+        return reinterpret_cast<void *>(mockD3DKMTCreateNativeFence);
+    }
     if (procName == "D3DKMTDestroySynchronizationObject") {
         return reinterpret_cast<void *>(mockD3DKMTDestroySynchronizationObject);
     }
@@ -86,6 +93,9 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     }
     if (procName == "D3DKMTSubmitCommandToHwQueue") {
         return reinterpret_cast<void *>(mockD3DKMTSubmitCommandToHwQueue);
+    }
+    if (procName == "D3DKMTSubmitWaitForSyncObjectsToHwQueue") {
+        return reinterpret_cast<void *>(mockD3DKMTSubmitWaitForSyncObjectsToHwQueue);
     }
     if (procName == "D3DKMTMakeResident") {
         return reinterpret_cast<void *>(mockD3DKMTMakeResident);
@@ -126,6 +136,12 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     if (procName == "setMockCreateDeviceParams") {
         return reinterpret_cast<void *>(setMockCreateDeviceParams);
     }
+    if (procName == "setMockDeviceExecutionState") {
+        return reinterpret_cast<void *>(setMockDeviceExecutionState);
+    }
+    if (procName == "setMockGetDeviceStateReturnValue") {
+        return reinterpret_cast<void *>(setMockGetDeviceStateReturnValue);
+    }
     if (procName == "getMockAllocation") {
         return reinterpret_cast<void *>(getMockAllocation);
     }
@@ -153,11 +169,20 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     if (procName == "getSubmitCommandToHwQueueData") {
         return reinterpret_cast<void *>(getSubmitCommandToHwQueueData);
     }
+    if (procName == "getSubmitWaitForSyncObjectsToHwQueueData") {
+        return reinterpret_cast<void *>(getSubmitWaitForSyncObjectsToHwQueueData);
+    }
+    if (procName == "getWaitForSynchronizationObjectFromGpuData") {
+        return reinterpret_cast<void *>(getWaitForSynchronizationObjectFromGpuData);
+    }
     if (procName == "getDestroySynchronizationObjectData") {
         return reinterpret_cast<void *>(getDestroySynchronizationObjectData);
     }
     if (procName == "getMonitorFenceCpuFenceAddress") {
         return reinterpret_cast<void *>(getMonitorFenceCpuFenceAddress);
+    }
+    if (procName == "getMonitorFenceCpuAddressSelector") {
+        return reinterpret_cast<void *>(getMonitorFenceCpuAddressSelector);
     }
     if (procName == "getCreateSynchronizationObject2FailCall") {
         return reinterpret_cast<void *>(getCreateSynchronizationObject2FailCall);
@@ -170,6 +195,12 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     }
     if (procName == "getRegisterTrimNotificationFailCall") {
         return reinterpret_cast<void *>(getRegisterTrimNotificationFailCall);
+    }
+    if (procName == "getSubmitWaitForSyncObjectsToHwQueueFailCall") {
+        return reinterpret_cast<void *>(getSubmitWaitForSyncObjectsToHwQueueFailCall);
+    }
+    if (procName == "getWaitForSynchronizationObjectFromGpuFailCall") {
+        return reinterpret_cast<void *>(getWaitForSynchronizationObjectFromGpuFailCall);
     }
     if (procName == "getLastPriority") {
         return reinterpret_cast<void *>(getLastPriority);
@@ -185,6 +216,9 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     }
     if (procName == "D3DKMTCloseAdapter") {
         return reinterpret_cast<void *>(mockD3DKMTCloseAdapter);
+    }
+    if (procName == "D3DKMTEnumAdapters3") {
+        return reinterpret_cast<void *>(mockD3DKMTEnumAdapters3);
     }
     if (procName == "D3DKMTLock") {
         return reinterpret_cast<void *>(mockD3DKMTLock);
@@ -216,6 +250,15 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     if (procName == "D3DKMTSignalSynchronizationObjectFromGpu") {
         return reinterpret_cast<void *>(mockD3DKMTSignalSynchronizationObjectFromGpu);
     }
+    if (procName == "D3DKMTOpenSyncObjectFromNtHandle2") {
+        return reinterpret_cast<void *>(mockD3DKMTOpenSyncObjectFromNtHandle2);
+    }
+    if (procName == "D3DKMTOpenSyncObjectNtHandleFromName") {
+        return reinterpret_cast<void *>(mockD3DKMTOpenSyncObjectNtHandleFromName);
+    }
+    if (procName == "D3DKMTOpenNtHandleFromName") {
+        return reinterpret_cast<void *>(mockD3DKMTOpenNtHandleFromName);
+    }
     if (procName == "D3DKMTFreeGpuVirtualAddress") {
         return reinterpret_cast<void *>(mockD3DKMTFreeGpuVirtualAddress);
     }
@@ -234,7 +277,15 @@ void *MockOsLibrary::getProcAddress(const std::string &procName) {
     if (procName == "D3DKMTUnregisterTrimNotification") {
         return reinterpret_cast<void *>(mockD3DKMTUnregisterTrimNotification);
     }
-
+    if (procName == "setCapturingCreateAllocationFlags") {
+        return reinterpret_cast<void *>(setCapturingCreateAllocationFlags);
+    }
+    if (procName == "getCapturedCreateAllocationFlags") {
+        return reinterpret_cast<void *>(getCapturedCreateAllocationFlags);
+    }
+    if (procName == "setSupportCreateAllocationWithReadWriteExisitingSysMemory") {
+        return reinterpret_cast<void *>(setSupportCreateAllocationWithReadWriteExisitingSysMemory);
+    }
     return nullptr;
 }
 

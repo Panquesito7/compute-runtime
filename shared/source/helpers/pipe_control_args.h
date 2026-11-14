@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,10 +9,18 @@
 
 namespace NEO {
 
+namespace QueueDrainMode {
+constexpr bool drainAllQueues = false;
+constexpr bool drainOnlyCurrentQueue = true;
+} // namespace QueueDrainMode
+
 struct PipeControlArgs {
     PipeControlArgs() = default;
+    void *postSyncCmd = nullptr;
 
+    bool blockSettingPostSyncProperties = false;
     bool csStallOnly = false;
+    bool disableCsStall = false;
     bool dcFlushEnable = false;
     bool renderTargetCacheFlushEnable = false;
     bool instructionCacheInvalidateEnable = false;
@@ -32,6 +40,10 @@ struct PipeControlArgs {
     bool depthCacheFlushEnable = false;
     bool depthStallEnable = false;
     bool protectedMemoryDisable = false;
+    bool isWalkerWithProfilingEnqueued = false;
+    bool commandCacheInvalidateEnable = false;
+    bool isL1InvalidateRequired = false;
+    bool isL1FlushRequired = false;
 };
 
 } // namespace NEO

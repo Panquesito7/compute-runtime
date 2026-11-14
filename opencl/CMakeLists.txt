@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2021-2023 Intel Corporation
+# Copyright (C) 2021-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -19,15 +19,15 @@ macro(generate_runtime_lib LIB_NAME MOCKABLE GENERATE_EXEC)
   else()
     add_subdirectory(source "${NEO_BUILD_DIR}/${LIB_NAME}" EXCLUDE_FROM_ALL)
   endif()
-  target_compile_definitions(${BUILTINS_SOURCES_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
-  target_compile_definitions(${BUILTINS_VME_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
 
   if(${MOCKABLE})
     target_compile_definitions(${LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=virtual)
     target_compile_definitions(${SHARINGS_ENABLE_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=virtual)
   else()
-    target_compile_definitions(${LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
-    target_compile_definitions(${SHARINGS_ENABLE_LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
+    if(WIN32 AND NOT RELEASE_WITH_REGKEYS)
+      target_compile_definitions(${LIB_NAME} PRIVATE $<$<CONFIG:Release>:NEO_USE_CONSTEXPR_DEBUG_VARIABLES>)
+      target_compile_definitions(${SHARINGS_ENABLE_LIB_NAME} PRIVATE $<$<CONFIG:Release>:NEO_USE_CONSTEXPR_DEBUG_VARIABLES>)
+    endif()
   endif()
 endmacro()
 
@@ -58,3 +58,15 @@ else()
 endif()
 
 add_subdirectory(test)
+
+if(MSVC AND NOT DISABLE_ULT_PCH_WIN)
+  target_sources(${NEO_RELEASE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/igdrcl_lib_pch.h)
+  target_precompile_headers(${NEO_RELEASE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/igdrcl_lib_pch.h)
+
+  if(NOT DONT_CARE_OF_VIRTUALS AND NOT NEO_SKIP_OCL_UNIT_TESTS)
+    target_sources(${NEO_MOCKABLE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/igdrcl_lib_pch.h)
+    target_precompile_headers(${NEO_MOCKABLE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/igdrcl_lib_pch.h)
+  endif()
+endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake${BRANCH_DIR_SUFFIX}verify_headers.cmake")

@@ -1,16 +1,19 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/helpers/gfx_core_helper_tests.h"
+#include "shared/source/program/kernel_info.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/helpers/cl_gfx_core_helper.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+
+using namespace NEO;
 
 using ClGfxCoreHelperTestXeHpAndLater = Test<ClDeviceFixture>;
 
@@ -29,8 +32,21 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, ClGfxCoreHelperTestXeHpAndLater, givenCLImageFormat
     }
 }
 
-HWTEST2_F(ClGfxCoreHelperTestXeHpAndLater, WhenGettingSupportedDeviceFeatureCapabilitiesThenReturnCorrectValue, IsAtLeastXeHpCore) {
-    cl_device_feature_capabilities_intel expectedCapabilities = CL_DEVICE_FEATURE_FLAG_DPAS_INTEL | CL_DEVICE_FEATURE_FLAG_DP4A_INTEL;
+HWTEST2_F(ClGfxCoreHelperTestXeHpAndLater, WhenGettingSupportedDeviceFeatureCapabilitiesThenReturnCorrectValue, IsAtLeastXeCore) {
     auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
-    EXPECT_EQ(expectedCapabilities, clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(getRootDeviceEnvironment()));
+    const auto &hwInfo = pDevice->getHardwareInfo();
+    if (!hwInfo.caps.dotProductAccumulateSystolicSupported) {
+        cl_device_feature_capabilities_intel expectedCapabilities = CL_DEVICE_FEATURE_FLAG_DP4A_INTEL;
+        EXPECT_EQ(expectedCapabilities, clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(hwInfo));
+    } else {
+        cl_device_feature_capabilities_intel expectedCapabilities = CL_DEVICE_FEATURE_FLAG_DPAS_INTEL | CL_DEVICE_FEATURE_FLAG_DP4A_INTEL;
+        EXPECT_EQ(expectedCapabilities, clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(hwInfo));
+    }
+}
+
+HWTEST2_F(ClGfxCoreHelperTestXeHpAndLater, whenCheckingRequiresAuxResolvesThenAuxTranslationIsNotRequired, IsAtLeastXeHpcCore) {
+    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
+    KernelInfo kernelInfo{};
+
+    EXPECT_FALSE(clGfxCoreHelper.requiresAuxResolves(kernelInfo));
 }

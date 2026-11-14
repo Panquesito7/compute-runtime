@@ -1,17 +1,16 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/tools/source/sysman/scheduler/os_scheduler.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/sysman/scheduler/scheduler_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/windows/mock_sysman_fixture.h"
 
 extern bool sysmanUltsEnable;
 
-using ::testing::_;
 namespace L0 {
 namespace ult {
 

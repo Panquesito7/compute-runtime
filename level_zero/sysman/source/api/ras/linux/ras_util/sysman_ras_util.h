@@ -1,0 +1,170 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+
+#include "level_zero/sysman/source/shared/linux/nl_api/sysman_drm_ras_types.h"
+#include "level_zero/sysman/source/sysman_const.h"
+#include <level_zero/zes_api.h>
+
+#include <map>
+#include <memory>
+#include <set>
+#include <vector>
+
+namespace L0 {
+namespace Sysman {
+
+class PmuInterface;
+class LinuxSysmanImp;
+class FsAccessInterface;
+class SysFsAccessInterface;
+class FirmwareUtil;
+class DrmNlApi;
+struct DrmRasNode;
+
+enum class RasInterfaceType {
+    pmu = 0,
+    pmt,
+    gsc,
+    netlink,
+    none,
+};
+
+class RasUtil : public NEO::NonCopyableAndNonMovableClass {
+  public:
+    RasUtil() = default;
+    static std::unique_ptr<RasUtil> create(RasInterfaceType rasInterface, LinuxSysmanImp *pLinuxSysmanImp, zes_ras_error_type_t type, ze_bool_t onSubdevice, uint32_t subdeviceId);
+    virtual ze_result_t rasGetState(zes_ras_state_t &state, ze_bool_t clear) = 0;
+    virtual ze_result_t rasGetStateExp(uint32_t numCategoriesRequested, zes_ras_state_exp_t *pState) = 0;
+    virtual ze_result_t rasGetStateExp2(const uint32_t count, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) = 0;
+    virtual ze_result_t rasClearStateExp(zes_ras_error_category_exp_t category) = 0;
+    virtual uint32_t rasGetCategoryCount() = 0;
+    virtual std::vector<zes_ras_error_category_exp_t> getSupportedErrorCategoriesExp() = 0;
+    virtual ze_result_t rasSetConfigExp(const uint32_t count, const zes_ras_config_exp_t *pConfig) = 0;
+    virtual ze_result_t rasGetConfigExp(const uint32_t count, zes_ras_config_exp_t *pConfig) = 0;
+    virtual ~RasUtil() = default;
+};
+
+class PmuRasUtil : public RasUtil {
+  public:
+    PmuRasUtil(zes_ras_error_type_t type, LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t onSubdevice, uint32_t subdeviceId);
+    ze_result_t rasGetState(zes_ras_state_t &state, ze_bool_t clear) override;
+    ze_result_t rasGetStateExp(uint32_t numCategoriesRequested, zes_ras_state_exp_t *pState) override;
+    ze_result_t rasGetStateExp2(const uint32_t count, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) override;
+    ze_result_t rasClearStateExp(zes_ras_error_category_exp_t category) override;
+    uint32_t rasGetCategoryCount() override;
+    std::vector<zes_ras_error_category_exp_t> getSupportedErrorCategoriesExp() override;
+    ze_result_t rasSetConfigExp(const uint32_t count, const zes_ras_config_exp_t *pConfig) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; }
+    ze_result_t rasGetConfigExp(const uint32_t count, zes_ras_config_exp_t *pConfig) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; }
+    static void getSupportedRasErrorTypes(std::set<zes_ras_error_type_t> &errorType, LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t isSubDevice, uint32_t subDeviceId);
+    ~PmuRasUtil() override;
+
+  protected:
+    PmuInterface *pPmuInterface = nullptr;
+    FsAccessInterface *pFsAccess = nullptr;
+    SysFsAccessInterface *pSysfsAccess = nullptr;
+    LinuxSysmanImp *pLinuxSysmanImp = nullptr;
+    zes_ras_error_type_t rasErrorType = {};
+
+  private:
+    std::vector<int64_t> memberFds = {};
+    int64_t groupFd = -1;
+    // Holds the mapped errno when PMU init fails with one, otherwise stays at
+    // DEPENDENCY_UNAVAILABLE to report that no PMU event could be enumerated.
+    ze_result_t initStatus = ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    uint64_t absoluteErrorCount[maxRasErrorCategoryExpCount] = {0};
+    uint32_t clearStatus = 0;
+    std::map<zes_ras_error_category_exp_t, uint64_t> errorCategoryToEventCount;
+    bool isSubdevice = false;
+    uint32_t subdeviceId = 0;
+    void closeFds();
+    void initRasErrors(ze_bool_t clear);
+    ze_result_t getConfig(
+        const std::string &eventDirectory,
+        const std::vector<std::string> &listOfEvents,
+        const std::string &errorFileToGetConfig,
+        std::string &pmuConfig);
+    ze_result_t getAbsoluteErrorCount(
+        std::string nameOfError,
+        const std::string &errorCounterDir,
+        uint64_t &errorVal);
+    inline bool getAbsoluteCount(zes_ras_error_category_exp_t category) {
+        return !(clearStatus & (1 << category));
+    }
+};
+
+class GscRasUtil : public RasUtil {
+  public:
+    ze_result_t rasGetState(zes_ras_state_t &state, ze_bool_t clear) override;
+    ze_result_t rasGetStateExp(uint32_t numCategoriesRequested, zes_ras_state_exp_t *pState) override;
+    ze_result_t rasGetStateExp2(const uint32_t count, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) override;
+    ze_result_t rasClearStateExp(zes_ras_error_category_exp_t category) override;
+    static void getSupportedRasErrorTypes(std::set<zes_ras_error_type_t> &errorType, LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t isSubDevice, uint32_t subDeviceId);
+    uint32_t rasGetCategoryCount() override;
+    std::vector<zes_ras_error_category_exp_t> getSupportedErrorCategoriesExp() override;
+    ze_result_t rasSetConfigExp(const uint32_t count, const zes_ras_config_exp_t *pConfig) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; }
+    ze_result_t rasGetConfigExp(const uint32_t count, zes_ras_config_exp_t *pConfig) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; }
+    GscRasUtil(zes_ras_error_type_t type, LinuxSysmanImp *pLinuxSysmanImp, uint32_t subdeviceId);
+    ~GscRasUtil() override {};
+
+  protected:
+    ze_result_t getMemoryErrorCountFromFw(zes_ras_error_type_t rasErrorType, uint32_t subDeviceCount, uint64_t &errorCount);
+    LinuxSysmanImp *pLinuxSysmanImp = nullptr;
+    zes_ras_error_type_t rasErrorType = {};
+    FirmwareUtil *pFwInterface = nullptr;
+
+  private:
+    uint64_t errorBaseline = 0;
+    uint32_t subdeviceId = 0;
+    uint32_t subDeviceCount = 0;
+};
+
+class NetlinkRasUtil : public RasUtil {
+  public:
+    ze_result_t rasGetState(zes_ras_state_t &state, ze_bool_t clear) override;
+    ze_result_t rasGetStateExp(uint32_t numCategoriesRequested, zes_ras_state_exp_t *pState) override;
+    ze_result_t rasGetStateExp2(const uint32_t count, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) override;
+    ze_result_t rasClearStateExp(zes_ras_error_category_exp_t category) override;
+    static void getSupportedRasErrorTypes(std::set<zes_ras_error_type_t> &errorType, LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t isSubDevice, uint32_t subDeviceId);
+    uint32_t rasGetCategoryCount() override;
+    std::vector<zes_ras_error_category_exp_t> getSupportedErrorCategoriesExp() override;
+    ze_result_t rasSetConfigExp(const uint32_t count, const zes_ras_config_exp_t *pConfig) override;
+    ze_result_t rasGetConfigExp(const uint32_t count, zes_ras_config_exp_t *pConfig) override;
+    NetlinkRasUtil(zes_ras_error_type_t type, L0::Sysman::LinuxSysmanImp *pLinuxSysmanImp, uint32_t subdeviceId);
+    ~NetlinkRasUtil() override;
+    static std::unique_ptr<DrmNlApi> (*createDrmNlApi)();
+    static const std::vector<DrmRasNode> &getRasNodes() { return rasNodes; }
+    static ze_result_t initializeRasNodes(DrmNlApi *pDrmNl);
+
+  protected:
+    LinuxSysmanImp *pLinuxSysmanImp = nullptr;
+    zes_ras_error_type_t rasErrorType = {};
+    std::unique_ptr<DrmNlApi> drmNl;
+    uint32_t rasNodeId = 0;
+    static std::vector<DrmRasNode> rasNodes;
+    static std::map<uint32_t, std::vector<DrmErrorCounter>> rasErrorList;
+};
+
+class RasUtilNone : public RasUtil {
+  public:
+    ze_result_t rasGetState(zes_ras_state_t &state, ze_bool_t clear) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; };
+    ze_result_t rasGetStateExp(uint32_t numCategoriesRequested, zes_ras_state_exp_t *pState) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; };
+    ze_result_t rasGetStateExp2(const uint32_t count, const zes_ras_error_category_exp_t *pCategories, zes_ras_state_exp2_t *pStates) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; };
+    ze_result_t rasClearStateExp(zes_ras_error_category_exp_t category) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; };
+    uint32_t rasGetCategoryCount() override { return 0u; };
+    std::vector<zes_ras_error_category_exp_t> getSupportedErrorCategoriesExp() override { return {}; };
+    ze_result_t rasSetConfigExp(const uint32_t count, const zes_ras_config_exp_t *pConfig) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; };
+    ze_result_t rasGetConfigExp(const uint32_t count, zes_ras_config_exp_t *pConfig) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; };
+    RasUtilNone() = default;
+    ~RasUtilNone() override {};
+};
+
+} // namespace Sysman
+} // namespace L0

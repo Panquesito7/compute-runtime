@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,15 @@
 
 #include "level_zero/core/source/sampler/sampler_imp.h"
 
+#include "shared/source/device/device.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/os_interface/product_helper.h"
+
 #include "level_zero/core/source/device/device.h"
 
 namespace L0 {
 
-SamplerAllocatorFn samplerFactory[IGFX_MAX_PRODUCT] = {};
+SamplerAllocatorFn samplerFactory[NEO::maxCoreEnumValue] = {};
 
 ze_result_t SamplerImp::destroy() {
     delete this;
@@ -23,10 +27,17 @@ ze_result_t SamplerImp::initialize(Device *device, const ze_sampler_desc_t *desc
     return ZE_RESULT_SUCCESS;
 }
 
-Sampler *Sampler::create(uint32_t productFamily, Device *device, const ze_sampler_desc_t *desc) {
+void SamplerImp::adjustSamplerState(void *samplerState, Device *device) {
+    auto &hwInfo = device->getHwInfo();
+    auto &helper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::ProductHelper>();
+    helper.adjustSamplerState(samplerState, hwInfo);
+}
+
+Sampler *Sampler::create(Device *device, const ze_sampler_desc_t *desc) {
     SamplerAllocatorFn allocator = nullptr;
-    if (productFamily < IGFX_MAX_PRODUCT) {
-        allocator = samplerFactory[productFamily];
+    auto gfxCoreFamily = device->getNEODevice()->getRenderCoreFamily();
+    if (gfxCoreFamily < NEO::maxCoreEnumValue) {
+        allocator = samplerFactory[gfxCoreFamily];
     }
 
     SamplerImp *sampler = nullptr;

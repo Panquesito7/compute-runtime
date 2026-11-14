@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,6 +14,8 @@
 
 namespace NEO {
 using FamilyType = XeHpgCoreFamily;
-
-template struct HardwareCommandsHelper<FamilyType>;
 } // namespace NEO
+
+template struct NEO::HardwareCommandsHelperWithHeap<NEO::FamilyType>;
+
+#include "opencl/source/helpers/enable_hardware_commands_helper_cw.inl"

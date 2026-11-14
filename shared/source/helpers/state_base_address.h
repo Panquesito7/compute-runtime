@@ -1,11 +1,14 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
+#include "shared/source/helpers/state_base_address_types.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -16,20 +19,20 @@ enum class MemoryCompressionState;
 class GmmHelper;
 class IndirectHeap;
 class LinearStream;
-
 struct DispatchFlags;
 struct HardwareInfo;
 struct StateBaseAddressProperties;
 
 template <typename GfxFamily>
 struct StateBaseAddressHelperArgs {
-    using STATE_BASE_ADDRESS = typename GfxFamily::STATE_BASE_ADDRESS;
+    using STATE_BASE_ADDRESS = typename StateBaseAddressTypeHelper<GfxFamily>::type;
 
     uint64_t generalStateBaseAddress = 0;
     uint64_t indirectObjectHeapBaseAddress = 0;
     uint64_t instructionHeapBaseAddress = 0;
     uint64_t globalHeapsBaseAddress = 0;
     uint64_t surfaceStateBaseAddress = 0;
+    uint64_t bindlessSurfaceStateBaseAddress = 0;
 
     STATE_BASE_ADDRESS *stateBaseAddressCmd = nullptr;
 
@@ -49,16 +52,16 @@ struct StateBaseAddressHelperArgs {
     bool setGeneralStateBaseAddress = false;
     bool useGlobalHeapsBaseAddress = false;
     bool isMultiOsContextCapable = false;
-    bool useGlobalAtomics = false;
     bool areMultipleSubDevicesInContext = false;
     bool overrideSurfaceStateBaseAddress = false;
     bool isDebuggerActive = false;
     bool doubleSbaWa = false;
+    bool heaplessModeEnabled = false;
 };
 
 template <typename GfxFamily>
 struct StateBaseAddressHelper {
-    using STATE_BASE_ADDRESS = typename GfxFamily::STATE_BASE_ADDRESS;
+    using STATE_BASE_ADDRESS = typename StateBaseAddressTypeHelper<GfxFamily>::type;
 
     static STATE_BASE_ADDRESS *getSpaceForSbaCmd(LinearStream &cmdStream);
 
@@ -76,5 +79,8 @@ struct StateBaseAddressHelper {
     static void programBindingTableBaseAddress(LinearStream &commandStream, uint64_t baseAddress, uint32_t sizeInPages, GmmHelper *gmmHelper);
 
     static uint32_t getMaxBindlessSurfaceStates();
+
+    static void programHeaplessStateBaseAddress(STATE_BASE_ADDRESS &sba);
+    static size_t getSbaCmdSize();
 };
 } // namespace NEO

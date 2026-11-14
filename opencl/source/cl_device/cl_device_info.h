@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,7 +26,7 @@ struct ClDeviceInfoParam {
 
 // clang-format off
 struct ClDeviceInfo {
-    cl_name_version                                                               ilsWithVersion[1];
+    std::vector<cl_name_version>                                                  ilsWithVersion;
     StackVec<cl_name_version, 3>                                                  builtInKernelsWithVersion;
     StackVec<cl_name_version, 5>                                                  openclCAllVersions;
     OpenClCFeaturesContainer                                                      openclCFeatures;
@@ -136,7 +136,7 @@ struct ClDeviceInfo {
     bool                                                                          platformLP;
     bool                                                                          packedYuvExtension;
     cl_uint                                                                       externalMemorySharing;
-    /*Unified Shared Memory Capabilites*/
+    /*Unified Shared Memory Capabilities*/
     cl_unified_shared_memory_capabilities_intel                                   hostMemCapabilities;
     cl_unified_shared_memory_capabilities_intel                                   deviceMemCapabilities;
     cl_unified_shared_memory_capabilities_intel                                   singleDeviceSharedMemCapabilities;
@@ -146,6 +146,9 @@ struct ClDeviceInfo {
     cl_device_integer_dot_product_capabilities_khr                                integerDotCapabilities;
     cl_device_integer_dot_product_acceleration_properties_khr                     integerDotAccelerationProperties8Bit;
     cl_device_integer_dot_product_acceleration_properties_khr                     integerDotAccelerationProperties4x8BitPacked;
+    std::vector<const char*>                                                      spirvExtensions;
+    std::vector<const char*>                                                      spirvExtendedInstructionSets;
+    std::vector<cl_uint>                                                          spirvCapabilities;
 };
 // clang-format on
 

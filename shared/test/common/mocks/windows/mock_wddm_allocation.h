@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,8 +15,8 @@ namespace NEO {
 class MockWddmAllocation : public WddmAllocation {
   public:
     MockWddmAllocation(GmmHelper *gmmHelper) : MockWddmAllocation(gmmHelper, EngineLimits::maxHandleCount) {}
-    MockWddmAllocation(GmmHelper *gmmHelper, uint32_t numGmms) : WddmAllocation(0, numGmms, AllocationType::UNKNOWN,
-                                                                                nullptr, 0, 0, nullptr, MemoryPool::MemoryNull, 0u, 3u),
+    MockWddmAllocation(GmmHelper *gmmHelper, uint32_t numGmms) : WddmAllocation(0, numGmms, AllocationType::unknown,
+                                                                                nullptr, 0, 0, nullptr, MemoryPool::memoryNull, 0u, 3u),
                                                                  gpuPtr(gpuAddress), handle(handles[0]) {
         for (uint32_t i = 0; i < numGmms; i++) {
             setGmm(new MockGmm(gmmHelper), i);
@@ -27,7 +27,7 @@ class MockWddmAllocation : public WddmAllocation {
         for (uint32_t i = 0; i < getNumGmms(); i++) {
             delete getGmm(i);
         }
-        gmms.resize(0);
+        gmms.clear();
     }
     ~MockWddmAllocation() override {
         clearGmms();
@@ -37,9 +37,12 @@ class MockWddmAllocation : public WddmAllocation {
         gmms.resize(newSize);
         handles.resize(newSize);
     }
+    using GraphicsAllocation::parentAllocation;
     using WddmAllocation::cpuPtr;
+    using WddmAllocation::gmms;
     using WddmAllocation::handles;
     using WddmAllocation::memoryPool;
+    using WddmAllocation::ntSecureHandle;
     using WddmAllocation::size;
 
     D3DGPU_VIRTUAL_ADDRESS &gpuPtr;

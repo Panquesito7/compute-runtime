@@ -1,19 +1,68 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#pragma once
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/command_stream/linear_stream.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/pipe_control_args.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 
 namespace NEO {
 
-template <>
+template <typename Family>
+size_t EncodeComputeMode<Family>::getCmdSizeForComputeMode(const RootDeviceEnvironment &rootDeviceEnvironment, bool hasSharedHandles, bool isRcs) {
+    size_t size = 0;
+    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    const bool isBasicWARequired = hwInfo.caps.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired;
+
+    if (isBasicWARequired) {
+        size += MemorySynchronizationCommands<Family>::getSizeForSingleBarrier();
+    }
+    size += sizeof(typename Family::STATE_COMPUTE_MODE);
+    if (hasSharedHandles) {
+        size += MemorySynchronizationCommands<Family>::getSizeForStallingBarrier();
+    }
+    if (productHelper.is3DPipelineSelectWARequired() && isRcs) {
+        size += (2 * PreambleHelper<Family>::getCmdSizeForPipelineSelect(rootDeviceEnvironment));
+    }
+    return size;
+}
+
+template <typename GfxFamily>
+inline size_t EncodeComputeMode<GfxFamily>::getSizeForComputeMode() {
+    return sizeof(typename GfxFamily::STATE_COMPUTE_MODE);
+}
+
+template <typename Family>
+void EncodeSetMMIO<Family>::remapOffset(MI_LOAD_REGISTER_MEM *pMiLoadReg) {
+    if (isRemapApplicable(pMiLoadReg->getRegisterAddress())) {
+        pMiLoadReg->setMmioRemapEnable(true);
+    }
+}
+
+template <typename Family>
+void EncodeSetMMIO<Family>::remapOffset(MI_LOAD_REGISTER_REG *pMiLoadReg) {
+    if (isRemapApplicable(pMiLoadReg->getSourceRegisterAddress())) {
+        pMiLoadReg->setMmioRemapEnableSource(true);
+    }
+    if (isRemapApplicable(pMiLoadReg->getDestinationRegisterAddress())) {
+        pMiLoadReg->setMmioRemapEnableDestination(true);
+    }
+}
+
+template <typename Family>
+inline bool EncodeSetMMIO<Family>::isRemapApplicable(uint32_t offset) {
+    return (0x2000 <= offset && offset <= 0x27ff) ||
+           (0x4200 <= offset && offset <= 0x420f) ||
+           (0x4400 <= offset && offset <= 0x441f);
+}
+
+template <typename Family>
 void EncodeWA<Family>::addPipeControlBeforeStateBaseAddress(LinearStream &commandStream,
                                                             const RootDeviceEnvironment &rootDeviceEnvironment, bool isRcs, bool dcFlushRequired) {
     PipeControlArgs args;
@@ -24,14 +73,19 @@ void EncodeWA<Family>::addPipeControlBeforeStateBaseAddress(LinearStream &comman
     NEO::EncodeWA<Family>::addPipeControlPriorToNonPipelinedStateCommand(commandStream, args, rootDeviceEnvironment, isRcs);
 }
 
-template <>
+template <typename Family>
 inline void EncodeMiArbCheck<Family>::adjust(MI_ARB_CHECK &miArbCheck, std::optional<bool> preParserDisable) {
-    if (DebugManager.flags.ForcePreParserEnabledForMiArbCheck.get() != -1) {
-        preParserDisable = !DebugManager.flags.ForcePreParserEnabledForMiArbCheck.get();
+    if (debugManager.flags.ForcePreParserEnabledForMiArbCheck.get() != -1) {
+        preParserDisable = !debugManager.flags.ForcePreParserEnabledForMiArbCheck.get();
     }
     if (preParserDisable.has_value()) {
         miArbCheck.setPreParserDisable(preParserDisable.value());
     }
+}
+
+template <typename Family>
+inline void EncodeStoreMemory<Family>::encodeForceCompletionCheck(MI_STORE_DATA_IMM &storeDataImmCmd) {
+    storeDataImmCmd.setForceWriteCompletionCheck(true);
 }
 
 } // namespace NEO

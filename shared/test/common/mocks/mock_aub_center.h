@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,19 +8,8 @@
 #pragma once
 
 #include "shared/source/aub/aub_center.h"
-#include "shared/source/aub/aub_stream_provider.h"
-#include "shared/test/common/mocks/mock_aub_file_stream.h"
 
 namespace NEO {
-class MockAubStreamProvider : public AubStreamProvider {
-  public:
-    AubMemDump::AubFileStream *getStream() override {
-        return &stream;
-    }
-
-  protected:
-    MockAubFileStream stream;
-};
 
 class MockAubCenter : public AubCenter {
   public:
@@ -30,9 +19,15 @@ class MockAubCenter : public AubCenter {
     using AubCenter::stepping;
 
     MockAubCenter() {
-        streamProvider.reset(new MockAubStreamProvider());
     }
 
     ~MockAubCenter() override = default;
+
+    std::unique_lock<std::mutex> obtainPageTablesLock() override {
+        obtainPageTablesLockCalled++;
+        return AubCenter::obtainPageTablesLock();
+    }
+
+    uint32_t obtainPageTablesLockCalled = 0u;
 };
 } // namespace NEO

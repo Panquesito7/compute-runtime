@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,12 @@
 
 #include "opencl/source/sharings/unified/unified_sharing.h"
 
+#include "shared/source/helpers/get_info.h"
 #include "shared/source/helpers/string.h"
+#include "shared/source/helpers/surface_format_info.h"
 #include "shared/source/helpers/timestamp_packet.h"
 #include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/utilities/stackvec.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/context/context.h"
@@ -33,25 +36,30 @@ void UnifiedSharing::synchronizeObject(UpdateData &updateData) {
 void UnifiedSharing::releaseResource(MemObj *memObject, uint32_t rootDeviceIndex) {
 }
 
-GraphicsAllocation *UnifiedSharing::createGraphicsAllocation(Context *context, UnifiedSharingMemoryDescription description, AllocationType allocationType) {
+std::unique_ptr<MultiGraphicsAllocation> UnifiedSharing::createMultiGraphicsAllocation(Context *context, UnifiedSharingMemoryDescription description, ImageInfo *imgInfo, AllocationType allocationType, cl_int *errcodeRet, const RootDeviceIndicesContainer &targetRootDeviceIndices) {
+    ErrorCodeHelper errorCode(errcodeRet, CL_SUCCESS);
     auto memoryManager = context->getMemoryManager();
-    switch (description.type) {
-    case UnifiedSharingHandleType::Win32Nt: {
-        return memoryManager->createGraphicsAllocationFromNTHandle(description.handle, context->getDevice(0)->getRootDeviceIndex(), allocationType);
-    }
-    case UnifiedSharingHandleType::LinuxFd:
-    case UnifiedSharingHandleType::Win32Shared: {
-        const AllocationProperties properties{context->getDevice(0)->getRootDeviceIndex(),
-                                              false, // allocateMemory
-                                              0u,    // size
-                                              allocationType,
-                                              false, // isMultiStorageAllocation
-                                              context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex())};
-        return memoryManager->createGraphicsAllocationFromSharedHandle(toOsHandle(description.handle), properties, false, false, true, nullptr);
-    }
-    default:
+
+    if (description.type != UnifiedSharingHandleType::win32Nt && description.type != UnifiedSharingHandleType::linuxFd && description.type != UnifiedSharingHandleType::win32Shared) {
+        errorCode.set(CL_INVALID_MEM_OBJECT);
         return nullptr;
     }
+
+    auto &rootDeviceIndices = (targetRootDeviceIndices.size() > 0) ? targetRootDeviceIndices
+                                                                   : context->getRootDeviceIndices();
+
+    StackVec<AllocationProperties, 4> properties;
+    for (auto &rootDeviceIndex : rootDeviceIndices) {
+        properties.push_back(AllocationProperties{rootDeviceIndex, false, imgInfo, allocationType, context->getDeviceBitfieldForAllocation(rootDeviceIndex)});
+    }
+
+    auto multiGraphicsAllocation = memoryManager->createMultiGraphicsAllocationFromSharedHandle(MemoryManager::OsHandleData{description.handle}, properties, true);
+    if (!multiGraphicsAllocation) {
+        errorCode.set(CL_INVALID_MEM_OBJECT);
+        return nullptr;
+    }
+
+    return multiGraphicsAllocation;
 }
 
 template <>

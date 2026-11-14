@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
 #include "level_zero/api/sysman/zes_handles_struct.h"
 #include <level_zero/zes_api.h>
 
@@ -20,7 +22,7 @@ struct OsSysman;
 
 class Diagnostics : _zes_diag_handle_t {
   public:
-    ~Diagnostics() override {}
+    virtual ~Diagnostics() = default;
     virtual ze_result_t diagnosticsGetProperties(zes_diag_properties_t *pProperties) = 0;
     virtual ze_result_t diagnosticsGetTests(uint32_t *pCount, zes_diag_test_t *pTests) = 0;
     virtual ze_result_t diagnosticsRunTests(uint32_t start, uint32_t end, zes_diag_result_t *pResult) = 0;
@@ -32,7 +34,7 @@ class Diagnostics : _zes_diag_handle_t {
 };
 
 struct DiagnosticsHandleContext {
-    DiagnosticsHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    DiagnosticsHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     void releaseDiagnosticsHandles();
     MOCKABLE_VIRTUAL ~DiagnosticsHandleContext();
 

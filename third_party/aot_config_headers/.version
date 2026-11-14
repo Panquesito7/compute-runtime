@@ -1,0 +1,4 @@
+components:
+  aot_config_headers:
+    type: git
+    revision: 89a85f00ff785e1c2d460e970abaeb656244df08

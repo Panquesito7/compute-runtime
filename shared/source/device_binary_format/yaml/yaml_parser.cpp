@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -65,35 +65,35 @@ struct TokenizerContext {
 
 bool tokenizeEndLine(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens, std::string &outErrReason, std::string &outWarning, TokenizerContext &context) {
     TokenId lineEnd = static_cast<uint32_t>(outTokens.size());
-    outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::SingleCharacter));
+    outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::singleCharacter));
     auto lineBegToken = outTokens[context.lineBegin];
-    Line::LineType lineType = Line::LineType::Empty;
+    Line::LineType lineType = Line::LineType::empty;
     if (lineEnd != context.lineBegin) {
         switch (lineBegToken.traits.type) {
         default:
             outErrReason = constructYamlError(outLines.size(), lineBegToken.pos, context.pos, "Internal error - undefined line type");
             return false;
-        case Token::SingleCharacter:
+        case Token::singleCharacter:
             switch (lineBegToken.traits.character0) {
             default:
                 outErrReason = constructYamlError(outLines.size(), lineBegToken.pos, context.pos, (std::string("Unhandled keyword character : ") + lineBegToken.traits.character0).c_str());
                 return false;
             case '#':
-                lineType = Line::LineType::Comment;
+                lineType = Line::LineType::comment;
                 break;
             case '-':
-                lineType = Line::LineType::ListEntry;
+                lineType = Line::LineType::listEntry;
                 break;
             }
             break;
-        case Token::Identifier:
-            lineType = Line::LineType::DictionaryEntry;
+        case Token::identifier:
+            lineType = Line::LineType::dictionaryEntry;
             break;
-        case Token::FileSectionBeg:
-            lineType = Line::LineType::FileSection;
+        case Token::fileSectionBeg:
+            lineType = Line::LineType::fileSection;
             break;
-        case Token::FileSectionEnd:
-            lineType = Line::LineType::FileSection;
+        case Token::fileSectionEnd:
+            lineType = Line::LineType::fileSection;
             break;
         }
     }
@@ -122,7 +122,10 @@ bool isValidInlineCollectionFormat(const char *context, const char *contextEnd) 
         if (isWhitespace(*context)) {
             context++;
         } else if (false == endNum) {
-            if (isAlphaNumeric(*context)) {
+            if (*context == ']') {
+                context++;
+                endCollection = true;
+            } else if (isAlphaNumeric(*context)) {
                 consumeAlphaNum(context);
                 endNum = true;
             } else {
@@ -174,7 +177,7 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
             break;
         case '#': {
             context.isParsingIdent = false;
-            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::SingleCharacter));
+            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::singleCharacter));
             auto commentIt = context.pos + 1;
             while (commentIt < context.end) {
                 if ('\n' == commentIt[0]) {
@@ -183,7 +186,7 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
                 ++commentIt;
             }
             if (context.pos + 1 != commentIt) {
-                outTokens.push_back(Token(ConstStringRef(context.pos + 1, commentIt - (context.pos + 1)), Token::Comment));
+                outTokens.push_back(Token(ConstStringRef(context.pos + 1, commentIt - (context.pos + 1)), Token::comment));
             }
             context.pos = commentIt;
             break;
@@ -202,21 +205,21 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
                 outErrReason = constructYamlError(outLines.size(), context.lineBeginPos, context.pos, "Unterminated string");
                 return false;
             }
-            outTokens.push_back(Token(ConstStringRef(context.pos, parseTokEnd - context.pos), Token::LiteralString));
+            outTokens.push_back(Token(ConstStringRef(context.pos, parseTokEnd - context.pos), Token::literalString));
             context.pos = parseTokEnd;
             break;
         }
         case '-': {
             ConstStringRef fileSectionMarker("---");
             if ((context.isParsingIdent) && isMatched(text, context.pos, fileSectionMarker)) {
-                outTokens.push_back(Token(ConstStringRef(context.pos, fileSectionMarker.size()), Token::FileSectionBeg));
+                outTokens.push_back(Token(ConstStringRef(context.pos, fileSectionMarker.size()), Token::fileSectionBeg));
                 context.pos += fileSectionMarker.size();
             } else {
                 auto tokEnd = consumeNumberOrSign(text, context.pos);
                 if (tokEnd > context.pos + 1) {
-                    outTokens.push_back(Token(ConstStringRef(context.pos, tokEnd - context.pos), Token::LiteralNumber));
+                    outTokens.push_back(Token(ConstStringRef(context.pos, tokEnd - context.pos), Token::literalNumber));
                 } else {
-                    outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::SingleCharacter));
+                    outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::singleCharacter));
                 }
 
                 context.pos = tokEnd;
@@ -227,10 +230,10 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
         case '.': {
             ConstStringRef fileSectionMarker("...");
             if ((context.isParsingIdent) && isMatched(text, context.pos, fileSectionMarker)) {
-                outTokens.push_back(Token(ConstStringRef(context.pos, fileSectionMarker.size()), Token::FileSectionEnd));
+                outTokens.push_back(Token(ConstStringRef(context.pos, fileSectionMarker.size()), Token::fileSectionEnd));
                 context.pos += fileSectionMarker.size();
             } else {
-                outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::SingleCharacter));
+                outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::singleCharacter));
                 ++context.pos;
             }
             context.isParsingIdent = false;
@@ -242,7 +245,7 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
                 return false;
             }
             context.lineTraits.hasInlineDataMarkers = true;
-            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::CollectionBeg));
+            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::collectionBeg));
             ++context.pos;
             break;
         case ']':
@@ -250,7 +253,7 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
                 outErrReason = constructYamlError(outLines.size(), context.lineBeginPos, context.pos, inlineCollectionYamlErrorMsg.data());
                 return false;
             }
-            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::CollectionEnd));
+            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::collectionEnd));
             ++context.pos;
             break;
         case ',':
@@ -258,7 +261,7 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
                 outErrReason = constructYamlError(outLines.size(), context.lineBeginPos, context.pos, inlineCollectionYamlErrorMsg.data());
                 return false;
             }
-            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::SingleCharacter));
+            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::singleCharacter));
             ++context.pos;
             break;
         case '{':
@@ -268,7 +271,7 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
         case ':':
             context.lineTraits.hasDictionaryEntry = true;
             context.isParsingIdent = false;
-            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::SingleCharacter));
+            outTokens.push_back(Token(ConstStringRef(context.pos, 1), Token::singleCharacter));
             ++context.pos;
             break;
         default: {
@@ -278,14 +281,14 @@ bool tokenize(ConstStringRef text, LinesCache &outLines, TokensCache &outTokens,
                 auto tokenData = ConstStringRef(context.pos, tokEnd - context.pos);
                 tokenData = tokenData.trimEnd(isWhitespace);
                 if (context.lineTraits.hasDictionaryEntry) {
-                    outTokens.push_back(Token(tokenData, Token::LiteralString));
+                    outTokens.push_back(Token(tokenData, Token::literalString));
                 } else {
-                    outTokens.push_back(Token(tokenData, Token::Identifier));
+                    outTokens.push_back(Token(tokenData, Token::identifier));
                 }
             } else {
                 tokEnd = consumeNumberOrSign(text, context.pos);
                 if (tokEnd > context.pos) {
-                    outTokens.push_back(Token(ConstStringRef(context.pos, tokEnd - context.pos), Token::LiteralNumber));
+                    outTokens.push_back(Token(ConstStringRef(context.pos, tokEnd - context.pos), Token::literalNumber));
                 } else {
                     outErrReason = constructYamlError(outLines.size(), context.lineBeginPos, context.pos, "Invalid numeric literal");
                     return false;
@@ -326,8 +329,11 @@ void finalizeNode(NodeId nodeId, const TokensCache &tokens, NodesCache &outNodes
         ++valueTokenIt;
     }
     UNRECOVERABLE_IF((colon == invalidTokenId) || (colon + 1 == valueTokenIt));
-    UNRECOVERABLE_IF(invalidNodeID == node.lastChildId)
-    outNodes[node.lastChildId].nextSiblingId = static_cast<NodeId>(outNodes.size());
+    if (invalidNodeID != node.lastChildId) {
+        outNodes[node.lastChildId].nextSiblingId = static_cast<NodeId>(outNodes.size());
+    } else {
+        node.firstChildId = static_cast<NodeId>(outNodes.size());
+    }
 
     outNodes.push_back(Node());
     auto &newNode = *outNodes.rbegin();
@@ -343,8 +349,10 @@ void finalizeNode(NodeId nodeId, const TokensCache &tokens, NodesCache &outNodes
 
 bool isEmptyVector(const Token &token, size_t lineId, std::string &outError) {
     if (isVectorDataType(token)) {
-        outError = constructYamlError(lineId, token.pos, token.pos + token.len, "Vector data type expects to have at least one value starting with -");
-        return false;
+        if (!allowEmptyVectorDataType(token)) {
+            outError = constructYamlError(lineId, token.pos, token.pos + token.len, "Vector data type expects to have at least one value starting with -");
+            return false;
+        }
     }
     return true;
 }
@@ -358,19 +366,24 @@ bool buildTree(const LinesCache &lines, const TokensCache &tokens, NodesCache &o
     outNodes.rbegin()->firstChildId = 1U;
     outNodes.rbegin()->lastChildId = 1U;
     nesting.resize(1); // root
+    NodeId unfinalizedSingleEntryDictNodeId = invalidNodeID;
     while (lineId < lines.size()) {
         if (isUnused(lines[lineId].lineType)) {
             ++lineId;
             continue;
         }
         auto currLineIndent = lines[lineId].indent;
+
         if (currLineIndent == outNodes.rbegin()->indent) {
             if (lineId > 0u && false == isEmptyVector(tokens[lines[lastUsedLine].first], lastUsedLine, outErrReason)) {
                 return false;
             }
-            reserveBasedOnEstimates(outNodes, static_cast<size_t>(0U), lines.size(), lineId);
+            reserveBasedOnEstimates(outNodes, static_cast<size_t>(0U), lines.size(), lineId, 2U);
             auto &prev = *outNodes.rbegin();
             auto &parent = outNodes[*nesting.rbegin()];
+            if (invalidNodeID != unfinalizedSingleEntryDictNodeId) {
+                finalizeNode(unfinalizedSingleEntryDictNodeId, tokens, outNodes, outErrReason, outWarning);
+            }
             auto &curr = addNode(outNodes, prev, parent);
             curr.indent = currLineIndent;
         } else if (currLineIndent > outNodes.rbegin()->indent) {
@@ -391,15 +404,19 @@ bool buildTree(const LinesCache &lines, const TokensCache &tokens, NodesCache &o
                 outErrReason = constructYamlError(lineId, tokens[lines[lineId].first].pos, tokens[lines[lineId].first].pos + 1, "Invalid indentation");
                 return false;
             } else {
-                reserveBasedOnEstimates(outNodes, static_cast<size_t>(0U), lines.size(), lineId);
+                reserveBasedOnEstimates(outNodes, static_cast<size_t>(0U), lines.size(), lineId, 2U);
                 auto &prev = outNodes[*nesting.rbegin()];
                 auto &parent = outNodes[prev.parentId];
+                if (invalidNodeID != unfinalizedSingleEntryDictNodeId) {
+                    finalizeNode(unfinalizedSingleEntryDictNodeId, tokens, outNodes, outErrReason, outWarning);
+                }
                 auto &curr = addNode(outNodes, prev, parent);
                 curr.indent = currLineIndent;
             }
         }
+        unfinalizedSingleEntryDictNodeId = invalidNodeID;
 
-        if (Line::LineType::DictionaryEntry == lines[lineId].lineType) {
+        if (Line::LineType::dictionaryEntry == lines[lineId].lineType) {
             auto numTokensInLine = lines[lineId].last - lines[lineId].first + 1;
             outNodes.rbegin()->key = lines[lineId].first;
             UNRECOVERABLE_IF(numTokensInLine < 3); // at least key, : and \n
@@ -407,28 +424,30 @@ bool buildTree(const LinesCache &lines, const TokensCache &tokens, NodesCache &o
             if (lines[lineId].traits.hasInlineDataMarkers) {
                 auto collectionBeg = lines[lineId].first + 2;
                 auto collectionEnd = lines[lineId].last - 1;
-                UNRECOVERABLE_IF(tokens[collectionBeg].traits.type != Token::Type::CollectionBeg || tokens[collectionEnd].traits.type != Token::Type::CollectionEnd);
+                UNRECOVERABLE_IF(tokens[collectionBeg].traits.type != Token::Type::collectionBeg || tokens[collectionEnd].traits.type != Token::Type::collectionEnd);
 
-                auto parentNodeId = outNodes.size() - 1;
-                auto previousSiblingId = std::numeric_limits<size_t>::max();
+                if (collectionEnd - collectionBeg > 1) {
+                    auto parentNodeId = outNodes.size() - 1;
+                    auto previousSiblingId = std::numeric_limits<size_t>::max();
 
-                for (auto currTokenId = collectionBeg + 1; currTokenId < collectionEnd; currTokenId += 2) {
-                    auto tokenType = tokens[currTokenId].traits.type;
-                    UNRECOVERABLE_IF(tokenType != Token::Type::LiteralNumber && tokenType != Token::Type::LiteralString);
-                    reserveBasedOnEstimates(outNodes, static_cast<size_t>(0U), lines.size(), lineId);
+                    for (auto currTokenId = collectionBeg + 1; currTokenId < collectionEnd; currTokenId += 2) {
+                        auto tokenType = tokens[currTokenId].traits.type;
+                        UNRECOVERABLE_IF(tokenType != Token::Type::literalNumber && tokenType != Token::Type::literalString);
+                        reserveBasedOnEstimates(outNodes, static_cast<size_t>(0U), lines.size(), lineId);
 
-                    auto &parentNode = outNodes[parentNodeId];
-                    if (previousSiblingId == std::numeric_limits<size_t>::max()) {
-                        addNode(outNodes, parentNode);
-                    } else {
-                        auto &previousSibling = outNodes[previousSiblingId];
-                        addNode(outNodes, previousSibling, parentNode);
+                        auto &parentNode = outNodes[parentNodeId];
+                        if (previousSiblingId == std::numeric_limits<size_t>::max()) {
+                            addNode(outNodes, parentNode);
+                        } else {
+                            auto &previousSibling = outNodes[previousSiblingId];
+                            addNode(outNodes, previousSibling, parentNode);
+                        }
+                        previousSiblingId = outNodes.size() - 1;
+                        outNodes[previousSiblingId].indent = currLineIndent + 1;
+                        outNodes[previousSiblingId].value = currTokenId;
                     }
-                    previousSiblingId = outNodes.size() - 1;
-                    outNodes[previousSiblingId].indent = currLineIndent + 1;
-                    outNodes[previousSiblingId].value = currTokenId;
+                    nesting.push_back(static_cast<NodeId>(parentNodeId));
                 }
-                nesting.push_back(static_cast<NodeId>(parentNodeId));
             } else if (('#' != tokens[lines[lineId].first + 2]) && ('\n' != tokens[lines[lineId].first + 2])) {
                 outNodes.rbegin()->value = lines[lineId].first + 2;
             }
@@ -436,14 +455,23 @@ bool buildTree(const LinesCache &lines, const TokensCache &tokens, NodesCache &o
             auto numTokensInLine = lines[lineId].last - lines[lineId].first + 1;
             (void)numTokensInLine;
             UNRECOVERABLE_IF(numTokensInLine < 2); // at least : - and \n
-            UNRECOVERABLE_IF(Line::LineType::ListEntry != lines[lineId].lineType);
+            UNRECOVERABLE_IF(Line::LineType::listEntry != lines[lineId].lineType);
             UNRECOVERABLE_IF('-' != tokens[lines[lineId].first]);
             if (('#' != tokens[lines[lineId].first + 1]) && ('\n' != tokens[lines[lineId].first + 1])) {
                 outNodes.rbegin()->value = lines[lineId].first + 1;
+                for (auto valueTokId = outNodes.rbegin()->value; valueTokId != lines[lineId].last; ++valueTokId) {
+                    if (':' == tokens[valueTokId]) {
+                        unfinalizedSingleEntryDictNodeId = outNodes.rbegin()->id;
+                        break;
+                    }
+                }
             }
         }
         lastUsedLine = lineId;
         ++lineId;
+    }
+    if (invalidNodeID != unfinalizedSingleEntryDictNodeId) {
+        nesting.push_back(unfinalizedSingleEntryDictNodeId);
     }
     outNodes.reserve(outNodes.size() + nesting.size());
     while (false == nesting.empty()) {

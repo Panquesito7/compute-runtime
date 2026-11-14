@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,6 @@
 #include "level_zero/tools/test/black_box_tests/zello_metrics/zello_metrics.h"
 
 #include <cstring>
-#include <getopt.h>
 #include <iomanip>
 #include <mutex>
 #include <thread>
@@ -25,12 +24,14 @@ void createL0() {
 
 ze_driver_handle_t getDriver() {
     uint32_t driverCount = 0;
-    ze_driver_handle_t driverHandle = {};
+    std::vector<ze_driver_handle_t> driverHandles = {};
     // Obtain driver.
     VALIDATECALL(zeDriverGet(&driverCount, nullptr));
     EXPECT(driverCount > 0);
-    VALIDATECALL(zeDriverGet(&driverCount, &driverHandle));
-    return driverHandle;
+    driverHandles.resize(driverCount);
+
+    VALIDATECALL(zeDriverGet(&driverCount, driverHandles.data()));
+    return driverHandles[0];
 }
 
 ze_context_handle_t createContext(ze_driver_handle_t &driverHandle) {
@@ -69,6 +70,19 @@ bool getTestMachineConfiguration(TestMachineConfiguration &machineConfig) {
     deviceProperties.pNext = nullptr;
     VALIDATECALL(zeDeviceGetProperties(devices[0], &deviceProperties));
     machineConfig.deviceId = deviceProperties.deviceId;
+
+    uint32_t extensionsCount = 0;
+    VALIDATECALL(zeDriverGetExtensionProperties(driverHandle, &extensionsCount, nullptr));
+    if (extensionsCount != 0) {
+        machineConfig.driverExtensionsProperties.resize(extensionsCount);
+        VALIDATECALL(zeDriverGetExtensionProperties(driverHandle, &extensionsCount, machineConfig.driverExtensionsProperties.data()));
+
+        for (uint32_t i = 0; i < extensionsCount; i++) {
+            uint32_t supportedVersion = machineConfig.driverExtensionsProperties[i].version;
+            LOG(LogLevel::DEBUG) << "Extension #" << i << " name: " << machineConfig.driverExtensionsProperties[i].name << " version: " << ZE_MAJOR_VERSION(supportedVersion) << "." << ZE_MINOR_VERSION(supportedVersion) << std::endl;
+        }
+    }
+
     return true;
 }
 
@@ -87,6 +101,13 @@ bool isDeviceAvailable(uint32_t deviceIndex, int32_t subDeviceIndex) {
         LOG(LogLevel::WARNING) << "Warning:: Unsupported Configuration: Device :" << deviceIndex << "  Sub Device :" << subDeviceIndex << "\n";
     }
     return checkStatus;
+}
+
+bool isDeviceSubDevice(ze_device_handle_t deviceHandle) {
+    ze_device_properties_t deviceProperties = {};
+    deviceProperties.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+    VALIDATECALL(zeDeviceGetProperties(deviceHandle, &deviceProperties));
+    return (deviceProperties.flags & ZE_DEVICE_PROPERTY_FLAG_SUBDEVICE) != 0;
 }
 
 ze_device_handle_t getDevice(ze_driver_handle_t &driverHandle, uint32_t deviceIndex) {
@@ -196,6 +217,35 @@ ze_command_list_handle_t createImmediateCommandList(ze_context_handle_t &context
     return commandList;
 }
 
+void printMetricGroupAndMetricProperties(zet_metric_group_handle_t metricGroup) {
+    if (TestSettings::get()->verboseLevel.get() >= LogLevel::DEBUG) {
+        zet_metric_group_properties_t metricGroupProperties = {};
+        // Obtain metric group properties to check the group name and sampling type.
+        VALIDATECALL(zetMetricGroupGetProperties(metricGroup, &metricGroupProperties));
+        printMetricGroupProperties(metricGroupProperties);
+
+        // Print metrics from metric group.
+        uint32_t metricCount = 0;
+        std::vector<zet_metric_handle_t> metrics = {};
+
+        // Obtain metrics count for verbose purpose.
+        VALIDATECALL(zetMetricGet(metricGroup, &metricCount, nullptr));
+
+        // Obtain metrics for verbose purpose.
+        metrics.resize(metricCount);
+        VALIDATECALL(zetMetricGet(metricGroup, &metricCount, metrics.data()));
+
+        // Enumerate metric group metrics for verbose purpose.
+        for (uint32_t j = 0; j < metricCount; ++j) {
+
+            const zet_metric_handle_t metric = metrics[j];
+            zet_metric_properties_t metricProperties = {};
+            VALIDATECALL(zetMetricGetProperties(metric, &metricProperties));
+            printMetricProperties(metricProperties);
+        }
+    }
+}
+
 void printMetricGroupProperties(const zet_metric_group_properties_t &properties) {
     LOG(LogLevel::DEBUG) << "METRIC GROUP: "
                          << "name: " << properties.name << ", "
@@ -227,7 +277,7 @@ void sleep(uint32_t milliseconds) {
 }
 
 zet_metric_group_handle_t findMetricGroup(const char *groupName,
-                                          const zet_metric_group_sampling_type_flag_t samplingType,
+                                          const zet_metric_group_sampling_type_flags_t samplingType,
                                           ze_device_handle_t deviceHandle) {
 
     uint32_t metricGroupCount = 0;
@@ -358,9 +408,14 @@ void obtainCalculatedMetrics(zet_metric_group_handle_t metricGroup, uint8_t *raw
         const uint32_t metricCount = properties.metricCount;
         const uint32_t metricCountForSet = metricCounts[i];
 
+        uint32_t previousMetricSetMetricCount = 0;
+        if (i > 0) {
+            previousMetricSetMetricCount = metricCounts[i - 1];
+        }
+
         for (uint32_t j = 0; j < metricCountForSet; j++) {
 
-            const uint32_t resultIndex = j + metricCount * i;
+            const uint32_t resultIndex = j + previousMetricSetMetricCount;
             const uint32_t metricIndex = j % metricCount;
             zet_metric_properties_t metricProperties = {};
 
@@ -417,6 +472,38 @@ void obtainCalculatedMetrics(zet_metric_group_handle_t metricGroup, uint8_t *raw
     }
 }
 
+inline bool isParamEnabled(int argc, char *argv[], const char *shortName, const char *longName, int *optind) {
+    if (argc < 2) {
+        return false;
+    }
+    int index = 1;
+    char **arg = &argv[1];
+    char **argE = &argv[argc];
+
+    for (; arg != argE; ++arg) {
+        if ((0 == strcmp(*arg, shortName)) || (0 == strcmp(*arg, longName))) {
+            *optind = index;
+            return true;
+        }
+        index++;
+    }
+
+    return false;
+}
+
+inline std::string copyArg(int argc, char *argv[], int optind) {
+    std::string valToReturn;
+    char *optarg = nullptr;
+    optind = optind + 1;
+    if (optind < argc) {
+        optarg = argv[optind];
+    }
+    if (optarg != nullptr) {
+        valToReturn = optarg;
+    }
+    return valToReturn;
+}
+
 void TestSettings::readMetricNames(char *optArg) {
     std::string args = optArg;
     std::string delim(",");
@@ -437,24 +524,19 @@ void TestSettings::readMetricNames(char *optArg) {
     }
 }
 
+bool isEnvVariableSet(const char *name) {
+    const char *env = getenv(name);
+    if ((nullptr == env) || (0 == strcmp("0", env))) {
+        return false;
+    }
+    return (0 == strcmp("1", env));
+}
+
 ////////////////
 // Test Settings
 ////////////////
 void TestSettings::parseArguments(int argc, char *argv[]) {
-    int opt;
-
-    struct option longOpts[] = {
-        {"help", no_argument, nullptr, 'h'},
-        {"test", required_argument, nullptr, 't'},
-        {"device", required_argument, nullptr, 'd'},
-        {"subdevice", required_argument, nullptr, 's'},
-        {"verboseLevel", required_argument, nullptr, 'v'},
-        {"metricGroupName", required_argument, nullptr, 'M'},
-        {"metricName", required_argument, nullptr, 'm'},
-        {"eventNReports", required_argument, nullptr, 'e'},
-        {"showSystemInfo", no_argument, nullptr, 'y'},
-        {0, 0, 0, 0},
-    };
+    int optind = 0;
 
     auto printUsage = []() {
         std::cout << "\n set Environment variable ZET_ENABLE_METRICS=1"
@@ -466,11 +548,12 @@ void TestSettings::parseArguments(int argc, char *argv[]) {
                      "\n  -d,   --device <deviceId>             device ID to run the test"
                      "\n  -s,   --subdevice <subdeviceId>       sub-device ID to run the test"
                      "\n  -v,   --verboseLevel <verboseLevel>   verbosity level(-2:error|-1:warning|(default)0:info|1:debug)"
-                     "\n  -m,   --metricName <name1,name2,..>   metric names seperated by a comma"
+                     "\n  -m,   --metricName <name1,name2,..>   metric names separated by a comma"
                      "\n  -M,   --metricGroupName <name>        metric group name"
                      "\n  -e,   --eventNReports <report count>  report count threshold for event generation"
                      "\n  -y,   --showSystemInfo                capture and show system info like frequency and power"
                      "\n                                        (requires ZES_ENABLE_SYSMAN=1)"
+                     "\n  -p,   --programmableLimit <count>     max number of programmables to iterate (0 = no limit)"
                      "\n  -h,   --help                          display help message"
                      "\n";
     };
@@ -480,50 +563,45 @@ void TestSettings::parseArguments(int argc, char *argv[]) {
         return;
     }
 
-    while ((opt = getopt_long(argc, argv, "ht:d:s:v:M:m:e:y", longOpts, nullptr)) != -1) {
-        switch (opt) {
-        case 't':
-            testName = optarg;
-            break;
+    if (isParamEnabled(argc, argv, "-h", "--help", &optind)) {
+        printUsage();
+        exit(0);
+    }
 
-        case 'd':
-            deviceId.set(std::atoi(optarg));
-            break;
+    if (isParamEnabled(argc, argv, "-t", "--test", &optind)) {
+        testName = copyArg(argc, argv, optind);
+    }
 
-        case 's':
-            subDeviceId.set(std::atoi(optarg));
-            break;
+    if (isParamEnabled(argc, argv, "-d", "--device", &optind)) {
+        deviceId.set(std::atoi(copyArg(argc, argv, optind).c_str()));
+    }
 
-        case 'v':
-            verboseLevel.set(std::atoi(optarg));
-            break;
+    if (isParamEnabled(argc, argv, "-s", "--subdevice", &optind)) {
+        subDeviceId.set(std::atoi(copyArg(argc, argv, optind).c_str()));
+    }
 
-        case 'M':
-            metricGroupName.set(optarg);
-            break;
+    if (isParamEnabled(argc, argv, "-v", "--verboseLevel", &optind)) {
+        verboseLevel.set(std::atoi(copyArg(argc, argv, optind).c_str()));
+    }
 
-        case 'm':
-            readMetricNames(optarg);
-            break;
+    if (isParamEnabled(argc, argv, "-M", "--metricGroupName", &optind)) {
+        metricGroupName.set(copyArg(argc, argv, optind));
+    }
 
-        case 'e':
-            eventNReportCount.set(std::atoi(optarg));
-            break;
+    if (isParamEnabled(argc, argv, "-m", "--metricName", &optind)) {
+        readMetricNames(&copyArg(argc, argv, optind)[0]);
+    }
 
-        case 'y':
-            showSystemInfo.set(true);
-            break;
+    if (isParamEnabled(argc, argv, "-e", "--eventNReports", &optind)) {
+        eventNReportCount.set(std::atoi(copyArg(argc, argv, optind).c_str()));
+    }
 
-        case 'h':
-            printUsage();
-            break;
+    if (isParamEnabled(argc, argv, "-y", "--showSystemInfo", &optind)) {
+        showSystemInfo.set(true);
+    }
 
-        default:
-            // Do not run tests in case of invalid option
-            testName.clear();
-            printUsage();
-            return;
-        }
+    if (isParamEnabled(argc, argv, "-p", "--programmableLimit", &optind)) {
+        programmableLimit.set(static_cast<uint32_t>(std::atoi(copyArg(argc, argv, optind).c_str())));
     }
 }
 
@@ -535,6 +613,31 @@ TestSettings *TestSettings::get() {
 }
 
 TestSettings *TestSettings::settings = nullptr;
+
+ZetIntelMetricExtensions::ZetIntelMetricExtensions(ze_driver_handle_t driverHandle) {
+    ze_result_t result;
+
+    result = zeDriverGetExtensionFunctionAddress(
+        driverHandle, "zetIntelMetricScopesGetExp",
+        reinterpret_cast<void **>(&zetIntelMetricScopesGetExp));
+    if (result != ZE_RESULT_SUCCESS) {
+        LOG(LogLevel::ERROR) << "Failed to get zetIntelMetricScopesGetExp function pointer, result: " << result << std::endl;
+    }
+
+    result = zeDriverGetExtensionFunctionAddress(
+        driverHandle, "zetIntelMetricScopeGetPropertiesExp",
+        reinterpret_cast<void **>(&zetIntelMetricScopeGetPropertiesExp));
+    if (result != ZE_RESULT_SUCCESS) {
+        LOG(LogLevel::ERROR) << "Failed to get zetIntelMetricScopeGetPropertiesExp function pointer, result: " << result << std::endl;
+    }
+
+    result = zeDriverGetExtensionFunctionAddress(
+        driverHandle, "zetIntelMetricSupportedScopesGetExp",
+        reinterpret_cast<void **>(&zetIntelMetricSupportedScopesGetExp));
+    if (result != ZE_RESULT_SUCCESS) {
+        LOG(LogLevel::ERROR) << "Failed to get zetIntelMetricSupportedScopesGetExp function pointer, result: " << result << std::endl;
+    }
+}
 
 class DummyStreamBuf : public std::streambuf {};
 DummyStreamBuf emptyStreamBuf;

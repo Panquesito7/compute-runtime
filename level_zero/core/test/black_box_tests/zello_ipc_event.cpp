@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -40,8 +40,8 @@ void initializeProcess(ze_context_handle_t &context,
     printDeviceProperties(deviceProperties);
 
     // Create command queue
-    cmdQueue = createCommandQueue(context, device, nullptr, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = createCommandQueue(context, device, nullptr, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, false);
+    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList, false));
 }
 
 void runClient(int commSocket, uint32_t clientId) {
@@ -58,7 +58,7 @@ void runClient(int commSocket, uint32_t clientId) {
         heapBuffer[i] = static_cast<char>(i + 1);
     }
 
-    // receieve the IPC handle for the memory from the other process
+    // receive the IPC handle for the memory from the other process
     ze_ipc_mem_handle_t pIpcHandle = {};
     int dmaBufFd = recvmsgForIpcHandle(commSocket, pIpcHandle.data);
     if (dmaBufFd < 0) {
@@ -72,7 +72,7 @@ void runClient(int commSocket, uint32_t clientId) {
     SUCCESS_OR_TERMINATE(zeMemOpenIpcHandle(context, device, pIpcHandle,
                                             0u, &zeIpcBuffer));
 
-    // receieve the IPC handle for the event pool from the other process
+    // receive the IPC handle for the event pool from the other process
     ze_ipc_event_pool_handle_t pIpcEventPoolHandle = {};
     dmaBufFd = recvmsgForIpcHandle(commSocket, pIpcEventPoolHandle.data);
     if (dmaBufFd < 0) {
@@ -259,7 +259,7 @@ void runServer(bool &validRet) {
 
 int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello IPC Event";
-    verbose = isVerbose(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
     bool outputValidationSuccessful;
 
     if (verbose) {
@@ -288,6 +288,6 @@ int main(int argc, char *argv[]) {
     }
     runServer(outputValidationSuccessful);
 
-    printResult(false, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(false, outputValidationSuccessful, blackBoxName);
     return (outputValidationSuccessful ? 0 : 1);
 }

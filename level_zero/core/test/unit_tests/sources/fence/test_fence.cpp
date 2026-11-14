@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,17 @@
 
 #include "shared/source/built_ins/sip.h"
 #include "shared/source/helpers/completion_stamp.h"
+#include "shared/source/utilities/wait_util.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_csr.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_driver_model.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/cmdlist/cmdlist.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/source/fence/fence.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_built_ins.h"
@@ -19,15 +25,13 @@
 #include "level_zero/core/test/unit_tests/mocks/mock_fence.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
 
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
 
-using namespace std::chrono_literals;
-
 namespace CpuIntrinsicsTests {
 extern std::atomic<uint32_t> pauseCounter;
+extern std::atomic<uint32_t> yieldCounter;
 extern volatile TagAddressType *pauseAddress;
 extern TaskCountType pauseValue;
 extern uint32_t pauseOffset;
@@ -47,11 +51,11 @@ TEST_F(FenceTest, whenQueryingStatusThenCsrAllocationsAreDownloaded) {
 
     EXPECT_NE(nullptr, fence);
 
-    EXPECT_FALSE(csr->downloadAllocationsCalled);
+    EXPECT_EQ(0u, csr->downloadAllocationsCalledCount);
 
     auto status = fence->queryStatus();
     EXPECT_EQ(ZE_RESULT_NOT_READY, status);
-    EXPECT_TRUE(csr->downloadAllocationsCalled);
+    EXPECT_EQ(1u, csr->downloadAllocationsCalledCount);
 
     status = fence->destroy();
     EXPECT_EQ(ZE_RESULT_SUCCESS, status);
@@ -70,7 +74,7 @@ TEST_F(FenceTest, givenFenceSignalFlagUsedWhenQueryingFenceAfterCreationThenRetu
     auto fence = Fence::create(&cmdQueue, &fenceDesc);
     EXPECT_NE(nullptr, fence);
 
-    EXPECT_FALSE(csr->downloadAllocationsCalled);
+    EXPECT_EQ(0u, csr->downloadAllocationsCalledCount);
 
     auto status = fence->queryStatus();
     EXPECT_EQ(ZE_RESULT_SUCCESS, status);
@@ -92,10 +96,26 @@ TEST_F(FenceTest, whenQueryingStatusWithoutCsrAndFenceUnsignaledThenReturnsNotRe
     fence->destroy();
 }
 
-TEST_F(FenceTest, GivenGpuHangWhenHostSynchronizeIsCalledThenDeviceLostIsReturned) {
+TEST_F(FenceTest, GivenNotReadyFenceWhenQueryStatusIsCalledThenCoreIsNotYielded) {
     const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
-    csr->isGpuHangDetectedReturnValue = true;
-    csr->testTaskCountReadyReturnValue = false;
+    Mock<CommandQueue> cmdqueue(device, csr.get());
+    ze_fence_desc_t desc = {};
+
+    std::unique_ptr<WhiteBox<L0::Fence>> fence;
+    fence.reset(whiteboxCast(Fence::create(&cmdqueue, &desc)));
+    ASSERT_NE(nullptr, fence);
+
+    fence->taskCount = 1;
+    *csr->getTagAddress() = 0u;
+
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, fence->queryStatus());
+    EXPECT_EQ(yieldCountBefore, CpuIntrinsicsTests::yieldCounter);
+}
+
+TEST_F(FenceTest, GivenNotReadyFenceWhenHostSynchronizeWithZeroTimeoutThenCoreIsNotYielded) {
+    const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr->isGpuHangDetectedReturnValue = false;
 
     Mock<CommandQueue> cmdqueue(device, csr.get());
     ze_fence_desc_t desc = {};
@@ -105,7 +125,46 @@ TEST_F(FenceTest, GivenGpuHangWhenHostSynchronizeIsCalledThenDeviceLostIsReturne
     ASSERT_NE(nullptr, fence);
 
     fence->taskCount = 1;
-    fence->gpuHangCheckPeriod = 0ms;
+    *csr->getTagAddress() = 0u;
+
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, fence->hostSynchronize(0));
+    EXPECT_EQ(yieldCountBefore, CpuIntrinsicsTests::yieldCounter);
+}
+
+TEST_F(FenceTest, GivenNotReadyFenceWhenHostSynchronizeWithTimeoutThenCoreIsYieldedBetweenPolls) {
+    const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr->isGpuHangDetectedReturnValue = false;
+
+    Mock<CommandQueue> cmdqueue(device, csr.get());
+    ze_fence_desc_t desc = {};
+
+    std::unique_ptr<WhiteBox<L0::Fence>> fence;
+    fence.reset(whiteboxCast(Fence::create(&cmdqueue, &desc)));
+    ASSERT_NE(nullptr, fence);
+
+    fence->taskCount = 1;
+    *csr->getTagAddress() = 0u;
+
+    const auto yieldCountBefore = CpuIntrinsicsTests::yieldCounter.load();
+    EXPECT_EQ(ZE_RESULT_NOT_READY, fence->hostSynchronize(1));
+    EXPECT_GT(CpuIntrinsicsTests::yieldCounter.load(), yieldCountBefore);
+}
+
+TEST_F(FenceTest, GivenGpuHangWhenHostSynchronizeIsCalledThenDeviceLostIsReturned) {
+    const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr->isGpuHangDetectedReturnValue = true;
+    csr->testTaskCountReadyReturnValue = false;
+    csr->gpuHangCheckPeriodUs = 0;
+
+    Mock<CommandQueue> cmdqueue(device, csr.get());
+    ze_fence_desc_t desc = {};
+
+    std::unique_ptr<WhiteBox<L0::Fence>> fence;
+    fence.reset(whiteboxCast(Fence::create(&cmdqueue, &desc)));
+    ASSERT_NE(nullptr, fence);
+
+    fence->taskCount = 1;
 
     constexpr uint64_t timeout = std::numeric_limits<std::uint64_t>::max();
     auto result = fence->hostSynchronize(timeout);
@@ -126,7 +185,6 @@ TEST_F(FenceTest, GivenNoGpuHangAndOneNanosecondTimeoutWhenHostSynchronizeIsCall
     ASSERT_NE(nullptr, fence);
 
     fence->taskCount = 1;
-    fence->gpuHangCheckPeriod = 0ms;
 
     constexpr uint64_t timeoutNanoseconds = 1;
     auto result = fence->hostSynchronize(timeoutNanoseconds);
@@ -134,9 +192,11 @@ TEST_F(FenceTest, GivenNoGpuHangAndOneNanosecondTimeoutWhenHostSynchronizeIsCall
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 }
 
-TEST_F(FenceTest, GivenLongPeriodOfGpuCheckAndOneNanosecondTimeoutWhenHostSynchronizeIsCalledThenResultNotReadyIsReturnedDueToTimeout) {
+TEST_F(FenceTest, GivenGpuHangAndOneNanosecondTimeoutWhenHostSynchronizeIsCalledThenCsrHangCheckPeriodIsRespected) {
     const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr->isGpuHangDetectedReturnValue = true;
     csr->testTaskCountReadyReturnValue = false;
+    csr->gpuHangCheckPeriodUs = std::numeric_limits<int64_t>::max();
 
     Mock<CommandQueue> cmdqueue(device, csr.get());
     ze_fence_desc_t desc = {};
@@ -146,12 +206,14 @@ TEST_F(FenceTest, GivenLongPeriodOfGpuCheckAndOneNanosecondTimeoutWhenHostSynchr
     ASSERT_NE(nullptr, fence);
 
     fence->taskCount = 1;
-    fence->gpuHangCheckPeriod = 50000000ms;
 
     constexpr uint64_t timeoutNanoseconds = 1;
     auto result = fence->hostSynchronize(timeoutNanoseconds);
 
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
+
+    csr->gpuHangCheckPeriodUs = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, fence->hostSynchronize(timeoutNanoseconds));
 }
 
 TEST_F(FenceTest, GivenSuccessfulQueryResultAndNoTimeoutWhenHostSynchronizeIsCalledThenResultSuccessIsReturned) {
@@ -237,9 +299,12 @@ TEST_F(FenceSynchronizeTest, givenInfiniteTimeoutWhenWaitingForFenceCompletionTh
     constexpr uint32_t activePartitions = 2;
     constexpr uint32_t postSyncOffset = 16;
 
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::noUse);
+    VariableBackup<uint32_t> backupWaitCount(&NEO::WaitUtils::waitCount, 1);
+
     const auto csr = std::make_unique<MockCommandStreamReceiver>(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
     ASSERT_NE(nullptr, csr->getTagAddress());
-    csr->postSyncWriteOffset = postSyncOffset;
+    csr->immWritePostSyncWriteOffset = postSyncOffset;
     csr->activePartitions = activePartitions;
 
     Mock<CommandQueue> cmdqueue(device, csr.get());
@@ -265,7 +330,7 @@ TEST_F(FenceSynchronizeTest, givenInfiniteTimeoutWhenWaitingForFenceCompletionTh
     }
 
     CpuIntrinsicsTests::setupPauseAddress = [&]() {
-        if (CpuIntrinsicsTests::pauseCounter > 10) {
+        if (CpuIntrinsicsTests::pauseCounter > 1) {
             volatile TagAddressType *nextPacket = CpuIntrinsicsTests::pauseAddress;
             for (uint32_t i = 0; i < activePartitions; i++) {
                 *nextPacket = 1;
@@ -282,21 +347,22 @@ TEST_F(FenceSynchronizeTest, givenInfiniteTimeoutWhenWaitingForFenceCompletionTh
 using FenceAubCsrTest = Test<DeviceFixture>;
 
 HWTEST_F(FenceAubCsrTest, givenCallToFenceHostSynchronizeWithAubModeCsrReturnsSuccess) {
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
 
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCsrAub<FamilyType>>();
+
     neoDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get());
     auto mockBuiltIns = new MockBuiltins();
-    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->builtins.reset(mockBuiltIns);
+    MockRootDeviceEnvironment::resetBuiltins(neoDevice->executionEnvironment->rootDeviceEnvironments[0].get(), mockBuiltIns);
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
     device = driverHandle->devices[0];
-    int32_t tag = 1;
-    auto aubCsr = new MockCsrAub<FamilyType>(tag, *neoDevice->executionEnvironment, neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield());
-    neoDevice->resetCommandStreamReceiver(aubCsr);
+    auto aubCsr = static_cast<MockCsrAub<FamilyType> *>(&neoDevice->getUltCommandStreamReceiver<FamilyType>());
 
     Mock<CommandQueue> cmdQueue(device, aubCsr);
     ze_fence_desc_t fenceDesc = {};
@@ -355,21 +421,20 @@ TEST_F(FenceTest, givenFenceWhenResettingThenTaskCountIsReset) {
 HWTEST_F(FenceTest, givenPrintfKernelWhenSynchronizingFenceThenPrintPrintfOutputIsCalled) {
     const ze_command_queue_desc_t desc{};
     ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
                                                           false,
                                                           false,
                                                           returnValue));
-    Mock<Kernel> kernel;
+    std::shared_ptr<Mock<KernelImp>> kernel{new Mock<KernelImp>{}};
     TaskCountType currentTaskCount = 33u;
     auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
-    csr.returnWaitForCompletionWithTimeout = WaitStatus::Ready;
+    csr.returnWaitForCompletionWithTimeout = WaitStatus::ready;
     csr.latestWaitForCompletionWithTimeoutTaskCount = currentTaskCount;
     *csr.tagAddress = currentTaskCount;
-    commandQueue->printfKernelContainer.push_back(&kernel);
+    commandQueue->printfKernelContainer.push_back(std::weak_ptr<Kernel>{kernel});
 
     ze_fence_desc_t fenceDesc = {ZE_STRUCTURE_TYPE_FENCE_DESC,
                                  nullptr,
@@ -381,8 +446,8 @@ HWTEST_F(FenceTest, givenPrintfKernelWhenSynchronizingFenceThenPrintPrintfOutput
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     EXPECT_EQ(0u, commandQueue->printfKernelContainer.size());
-    EXPECT_EQ(1u, kernel.printPrintfOutputCalledTimes);
-    EXPECT_FALSE(kernel.hangDetectedPassedToPrintfOutput);
+    EXPECT_EQ(1u, kernel->printPrintfOutputCalledTimes);
+    EXPECT_FALSE(kernel->hangDetectedPassedToPrintfOutput);
 
     delete fence;
 
@@ -397,8 +462,7 @@ HWTEST_F(FenceTest, givenPrintfKernelAndDetectedHangWhenSynchronizingFenceThenPr
 
     const ze_command_queue_desc_t desc{};
     ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
@@ -406,14 +470,14 @@ HWTEST_F(FenceTest, givenPrintfKernelAndDetectedHangWhenSynchronizingFenceThenPr
                                                           false,
                                                           returnValue));
 
-    Mock<Kernel> kernel;
+    std::shared_ptr<Mock<KernelImp>> kernel{new Mock<KernelImp>{}};
     TaskCountType currentTaskCount = 33u;
     auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
     csr.latestWaitForCompletionWithTimeoutTaskCount = currentTaskCount;
-    csr.returnWaitForCompletionWithTimeout = WaitStatus::GpuHang;
+    csr.returnWaitForCompletionWithTimeout = WaitStatus::gpuHang;
     *csr.tagAddress = 0;
-    csr.gpuHangCheckPeriod = 0us;
-    commandQueue->printfKernelContainer.push_back(&kernel);
+    csr.gpuHangCheckPeriodUs = 0;
+    commandQueue->printfKernelContainer.push_back(std::weak_ptr<Kernel>{kernel});
 
     ze_fence_desc_t fenceDesc = {ZE_STRUCTURE_TYPE_FENCE_DESC,
                                  nullptr,
@@ -425,8 +489,8 @@ HWTEST_F(FenceTest, givenPrintfKernelAndDetectedHangWhenSynchronizingFenceThenPr
     EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
 
     EXPECT_EQ(0u, commandQueue->printfKernelContainer.size());
-    EXPECT_EQ(1u, kernel.printPrintfOutputCalledTimes);
-    EXPECT_TRUE(kernel.hangDetectedPassedToPrintfOutput);
+    EXPECT_EQ(1u, kernel->printPrintfOutputCalledTimes);
+    EXPECT_TRUE(kernel->hangDetectedPassedToPrintfOutput);
 
     delete fence;
     commandQueue->destroy();
@@ -435,22 +499,21 @@ HWTEST_F(FenceTest, givenPrintfKernelAndDetectedHangWhenSynchronizingFenceThenPr
 HWTEST_F(FenceTest, givenPrintfKernelNotCompletedWhenSynchronizingFenceWithZeroTimeoutThenPrintfOutputIsNotFlushed) {
     const ze_command_queue_desc_t desc{};
     ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
                                                           false,
                                                           false,
                                                           returnValue));
-    Mock<Kernel> kernel;
+    std::shared_ptr<Mock<KernelImp>> kernel{new Mock<KernelImp>{}};
     TaskCountType currentTaskCount = 33u;
     auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
-    csr.returnWaitForCompletionWithTimeout = WaitStatus::Ready;
+    csr.returnWaitForCompletionWithTimeout = WaitStatus::ready;
     csr.latestWaitForCompletionWithTimeoutTaskCount = currentTaskCount;
     *csr.tagAddress = currentTaskCount - 1;
 
-    commandQueue->printfKernelContainer.push_back(&kernel);
+    commandQueue->printfKernelContainer.push_back(std::weak_ptr<Kernel>{kernel});
 
     ze_fence_desc_t fenceDesc = {ZE_STRUCTURE_TYPE_FENCE_DESC,
                                  nullptr,
@@ -462,10 +525,59 @@ HWTEST_F(FenceTest, givenPrintfKernelNotCompletedWhenSynchronizingFenceWithZeroT
     EXPECT_EQ(ZE_RESULT_NOT_READY, result);
 
     EXPECT_EQ(1u, commandQueue->printfKernelContainer.size());
-    EXPECT_EQ(0u, kernel.printPrintfOutputCalledTimes);
+    EXPECT_EQ(0u, kernel->printPrintfOutputCalledTimes);
 
     delete fence;
     commandQueue->destroy();
 }
+
+HWTEST_F(FenceTest, givenFenceCreatedFromSingleCommandQueueWhenExecutedOnAnotherQueueThenExpectSynchronizationObjectError) {
+    const ze_command_queue_desc_t desc{};
+    ze_result_t returnValue;
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                          neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                          &desc,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto otherCommandQueue = whiteboxCast(CommandQueue::create(device,
+                                                               neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                               &desc,
+                                                               false,
+                                                               false,
+                                                               false,
+                                                               returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto cmdList = whiteboxCast(CommandList::create(device,
+                                                    NEO::EngineGroupType::compute,
+                                                    0u,
+                                                    returnValue,
+                                                    false));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    cmdList->close();
+    auto cmdListHandle = cmdList->toHandle();
+
+    ze_fence_desc_t fenceDesc = {ZE_STRUCTURE_TYPE_FENCE_DESC,
+                                 nullptr,
+                                 0};
+    auto fence = whiteboxCast(Fence::create(commandQueue, &fenceDesc));
+    auto fenceHandle = fence->toHandle();
+
+    CommandListExecutionInternalOptions internalOptions = {};
+
+    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, fenceHandle, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    returnValue = otherCommandQueue->executeCommandLists(1, &cmdListHandle, fenceHandle, internalOptions);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_SYNCHRONIZATION_OBJECT, returnValue);
+
+    cmdList->destroy();
+    fence->destroy();
+    commandQueue->destroy();
+    otherCommandQueue->destroy();
+}
+
 } // namespace ult
 } // namespace L0

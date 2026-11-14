@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,10 +17,21 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #elif defined(_WIN32)
-#include <windows.h>
+#include "shared/source/os_interface/windows/windows_wrapper.h"
 #pragma warning(push)           // Saves the current warning state.
 #pragma warning(disable : 4091) // Temporarily disables warning 4091.
+
+#if __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpragma-pack"
+#endif
+
 #include <DbgHelp.h>
+
+#if __clang__
+#pragma clang diagnostic pop
+#endif
+
 #pragma warning(pop) // Restores the warning state.
 #pragma comment(lib, "Dbghelp.lib")
 #endif
@@ -130,7 +141,7 @@ void MemoryManagementFixture::checkForLeaks() {
                 auto invalidLeakIndexValues = MemoryManagement::invalidLeakIndex;
                 EXPECT_EQ(leakEventIndex, invalidLeakIndexValues);
             } while (leakEventIndex != MemoryManagement::invalidLeakIndex);
-        } else {
+        } else if (!testResult->Skipped()) {
             printf("*** WARNING: Leaks found but dumping disabled during test failure ***\n");
         }
     }

@@ -5,8 +5,11 @@
 %global NEO_OCL_VERSION_MINOR xxx
 %global NEO_OCL_VERSION_BUILD xxx
 %global NEO_RELEASE_WITH_REGKEYS FALSE
-%global NEO_ENABLE_XE_DRM_DETECTION FALSE
-%global I915_HEADERS_DIR %{nil}
+%global NEO_ENABLE_I915_PRELIM_DETECTION FALSE
+%global NEO_ENABLE_XE_PRELIM_DETECTION FALSE
+%global NEO_ENABLE_XE_EU_DEBUG_SUPPORT FALSE
+%global NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM FALSE
+%global NEO_I915_PRELIM_HEADERS_DIR %{nil}
 
 %define _source_payload w5T16.xzdio
 %define _binary_payload w5T16.xzdio
@@ -22,12 +25,12 @@ License: MIT
 URL: https://github.com/intel/compute-runtime
 Source0: %{url}/archive/%{version}/compute-runtime.tar.xz
 Source1: copyright
-%if "%{I915_HEADERS_DIR}" != ""
+%if "%{NEO_I915_PRELIM_HEADERS_DIR}" != ""
 Source2: uapi.tar.xz
 %endif
 
 Requires:      intel-gmmlib
-Requires:      intel-igc-opencl
+Requires:      intel-igc-opencl-2
 
 BuildRequires: libva-devel gcc-c++ cmake ninja-build make
 BuildRequires: intel-gmmlib-devel
@@ -38,14 +41,14 @@ Intel(R) Graphics Compute Runtime for OpenCL(TM) is a open source project to con
 
 %package       -n intel-ocloc
 Summary:       ocloc package for opencl
-Requires:      intel-igc-opencl
+Requires:      intel-igc-opencl-2
 %description   -n intel-ocloc
 Intel(R) Graphics Compute Runtime for OpenCL(TM) is a open source project to converge Intel's development efforts on OpenCL(TM) compute stacks supporting the GEN graphics hardware architecture.
 
 %define debug_package %{nil}
 
 %prep
-%if "%{I915_HEADERS_DIR}" == ""
+%if "%{NEO_I915_PRELIM_HEADERS_DIR}" == ""
 %autosetup -p1 -n compute-runtime
 %else
 %autosetup -p1 -n compute-runtime -b 2
@@ -62,11 +65,13 @@ cd build
    -DCMAKE_BUILD_TYPE=Release \
    -DBUILD_WITH_L0=FALSE \
    -DNEO_SKIP_UNIT_TESTS=TRUE \
-   -DNEO_ENABLE_i915_PRELIM_DETECTION=TRUE \
-   -DNEO_ENABLE_XE_DRM_DETECTION=%{NEO_ENABLE_XE_DRM_DETECTION} \
+   -DNEO_ENABLE_I915_PRELIM_DETECTION=%{NEO_ENABLE_I915_PRELIM_DETECTION} \
+   -DNEO_ENABLE_XE_PRELIM_DETECTION=%{NEO_ENABLE_XE_PRELIM_DETECTION} \
+   -DNEO_ENABLE_XE_EU_DEBUG_SUPPORT=%{NEO_ENABLE_XE_EU_DEBUG_SUPPORT} \
+   -DNEO_USE_XE_EU_DEBUG_EXP_UPSTREAM=%{NEO_USE_XE_EU_DEBUG_EXP_UPSTREAM} \
    -DRELEASE_WITH_REGKEYS=%{NEO_RELEASE_WITH_REGKEYS} \
    -DCMAKE_VERBOSE_MAKEFILE=FALSE \
-   -DI915_HEADERS_DIR=$(realpath %{I915_HEADERS_DIR})
+   -DNEO_I915_PRELIM_HEADERS_DIR=$(realpath %{NEO_I915_PRELIM_HEADERS_DIR})
 %ninja_build
 
 %install
@@ -83,6 +88,10 @@ mkdir -p %{buildroot}/usr/share/doc/intel-opencl/
 cp -pvR %{_sourcedir}/copyright %{buildroot}/usr/share/doc/intel-opencl/.
 mkdir -p %{buildroot}/usr/share/doc/intel-ocloc/
 cp -pvR %{_sourcedir}/copyright %{buildroot}/usr/share/doc/intel-ocloc/.
+
+if [ -d "${NEO_NINJA_DUMP}" ]; then
+    cp -v .ninja* ${NEO_NINJA_DUMP}/
+fi
 
 %files
 %defattr(-,root,root)

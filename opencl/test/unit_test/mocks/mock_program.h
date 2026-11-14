@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,8 @@
 #include "shared/source/helpers/string.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/program/kernel_info.h"
+#include "shared/source/utilities/shared_pool_allocation.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include "opencl/source/cl_device/cl_device.h"
@@ -21,6 +23,11 @@
 namespace NEO {
 
 class GraphicsAllocation;
+namespace BuiltIn {
+class DispatchInfoBuilder;
+}
+class Context;
+
 ClDeviceVector toClDeviceVector(ClDevice &clDevice);
 ////////////////////////////////////////////////////////////////////////////////
 // Program - Core implementation
@@ -47,23 +54,23 @@ class MockProgram : public Program {
     using Program::allowNonUniform;
     using Program::areSpecializationConstantsInitialized;
     using Program::buildInfos;
-    using Program::containsVmeUsage;
     using Program::context;
     using Program::createdFrom;
     using Program::createProgramFromBinary;
     using Program::debuggerInfos;
     using Program::deviceBuildInfos;
-    using Program::disableZebinIfVmeEnabled;
+    using Program::dumpKernelInfoToAubComments;
     using Program::extractInternalOptions;
     using Program::getKernelInfo;
     using Program::getModuleAllocations;
+    using Program::indirectAccessBufferMajorVersion;
     using Program::internalOptionsToExtract;
     using Program::irBinary;
     using Program::irBinarySize;
     using Program::isBuiltIn;
     using Program::isCreatedFromBinary;
     using Program::isSpirV;
-    using Program::kernelDebugEnabled;
+    using Program::linkAgainstRequiredLibs;
     using Program::linkBinary;
     using Program::notifyModuleCreate;
     using Program::notifyModuleDestroy;
@@ -72,6 +79,7 @@ class MockProgram : public Program {
     using Program::processGenBinaries;
     using Program::Program;
     using Program::requiresRebuild;
+    using Program::resolveRequiredLibs;
     using Program::setBuildStatus;
     using Program::sourceCode;
     using Program::specConstantsIds;
@@ -83,8 +91,9 @@ class MockProgram : public Program {
     }
 
     ~MockProgram() override {
-        if (contextSet)
+        if (contextSet) {
             context = nullptr;
+        }
     }
     KernelInfo mockKernelInfo;
     void setBuildOptions(const char *buildOptions) {
@@ -92,21 +101,45 @@ class MockProgram : public Program {
     }
     void setConstantSurface(GraphicsAllocation *gfxAllocation) {
         if (gfxAllocation) {
-            buildInfos[gfxAllocation->getRootDeviceIndex()].constantSurface = gfxAllocation;
+            buildInfos[gfxAllocation->getRootDeviceIndex()].constantSurface = std::make_unique<SharedPoolAllocation>(gfxAllocation);
         } else {
             for (auto &buildInfo : buildInfos) {
-                buildInfo.constantSurface = nullptr;
+                buildInfo.constantSurface.reset();
             }
         }
     }
-    void setGlobalSurface(GraphicsAllocation *gfxAllocation) {
-        if (gfxAllocation) {
-            buildInfos[gfxAllocation->getRootDeviceIndex()].globalSurface = gfxAllocation;
+    void setConstantSurface(std::unique_ptr<SharedPoolAllocation> constantSurface) {
+        if (constantSurface) {
+            buildInfos[constantSurface->getGraphicsAllocation()->getRootDeviceIndex()].constantSurface = std::move(constantSurface);
         } else {
             for (auto &buildInfo : buildInfos) {
-                buildInfo.globalSurface = nullptr;
+                buildInfo.constantSurface.reset();
             }
         }
+    }
+    [[nodiscard]] NonCopyableVariableBackup<std::unique_ptr<SharedPoolAllocation>> setScopedConstantSurface(GraphicsAllocation *gfxAllocation) {
+        return {&buildInfos[gfxAllocation->getRootDeviceIndex()].constantSurface, std::make_unique<SharedPoolAllocation>(gfxAllocation)};
+    }
+    void setGlobalSurface(GraphicsAllocation *gfxAllocation) {
+        if (gfxAllocation) {
+            buildInfos[gfxAllocation->getRootDeviceIndex()].globalSurface = std::make_unique<SharedPoolAllocation>(gfxAllocation);
+        } else {
+            for (auto &buildInfo : buildInfos) {
+                buildInfo.globalSurface.reset();
+            }
+        }
+    }
+    void setGlobalSurface(std::unique_ptr<SharedPoolAllocation> globalSurface) {
+        if (globalSurface) {
+            buildInfos[globalSurface->getGraphicsAllocation()->getRootDeviceIndex()].globalSurface = std::move(globalSurface);
+        } else {
+            for (auto &buildInfo : buildInfos) {
+                buildInfo.globalSurface.reset();
+            }
+        }
+    }
+    [[nodiscard]] NonCopyableVariableBackup<std::unique_ptr<SharedPoolAllocation>> setScopedGlobalSurface(GraphicsAllocation *gfxAllocation) {
+        return {&buildInfos[gfxAllocation->getRootDeviceIndex()].globalSurface, std::make_unique<SharedPoolAllocation>(gfxAllocation)};
     }
     std::vector<KernelInfo *> &getKernelInfoArray(uint32_t rootDeviceIndex) {
         return buildInfos[rootDeviceIndex].kernelInfoArray;
@@ -155,7 +188,7 @@ class MockProgram : public Program {
         this->isCreatedFromBinary = false;
         this->requiresRebuild = true;
         setBuildStatus(CL_BUILD_NONE);
-        std::unordered_map<std::string, BuiltinDispatchInfoBuilder *> builtins;
+        std::unordered_map<std::string, BuiltIn::DispatchInfoBuilder *> builtins;
         return this->build(getDevices(), this->options.c_str(), builtins);
     }
 
@@ -167,20 +200,12 @@ class MockProgram : public Program {
     }
 
     void replaceDeviceBinary(std::unique_ptr<char[]> &&newBinary, size_t newBinarySize, uint32_t rootDeviceIndex) override {
-        if (replaceDeviceBinaryCalledPerRootDevice.find(rootDeviceIndex) == replaceDeviceBinaryCalledPerRootDevice.end()) {
-            replaceDeviceBinaryCalledPerRootDevice.insert({rootDeviceIndex, 1});
-        } else {
-            replaceDeviceBinaryCalledPerRootDevice[rootDeviceIndex]++;
-        }
+        replaceDeviceBinaryCalledPerRootDevice[rootDeviceIndex]++;
         Program::replaceDeviceBinary(std::move(newBinary), newBinarySize, rootDeviceIndex);
     }
-    cl_int processGenBinary(const ClDevice &clDevice) override {
+    cl_int processGenBinary(ClDevice &clDevice) override {
         auto rootDeviceIndex = clDevice.getRootDeviceIndex();
-        if (processGenBinaryCalledPerRootDevice.find(rootDeviceIndex) == processGenBinaryCalledPerRootDevice.end()) {
-            processGenBinaryCalledPerRootDevice.insert({rootDeviceIndex, 1});
-        } else {
-            processGenBinaryCalledPerRootDevice[rootDeviceIndex]++;
-        }
+        processGenBinaryCalledPerRootDevice[rootDeviceIndex]++;
         return Program::processGenBinary(clDevice);
     }
 
@@ -202,19 +227,9 @@ class MockProgram : public Program {
         return kernelInfos;
     }
 
-    void processDebugData(uint32_t rootDeviceIndex) override {
-        Program::processDebugData(rootDeviceIndex);
-        wasProcessDebugDataCalled = true;
-    }
-
     void createDebugZebin(uint32_t rootDeviceIndex) override {
         Program::createDebugZebin(rootDeviceIndex);
         wasCreateDebugZebinCalled = true;
-    }
-
-    void debugNotify(const ClDeviceVector &deviceVector, std::unordered_map<uint32_t, BuildPhase> &phasesReached) override {
-        Program::debugNotify(deviceVector, phasesReached);
-        wasDebuggerNotified = true;
     }
 
     void callPopulateZebinExtendedArgsMetadataOnce(uint32_t rootDeviceIndex) override {
@@ -225,25 +240,35 @@ class MockProgram : public Program {
         }
     }
 
+    bool transferIsaSegmentsToAllocation(Device *pDevice, std::vector<KernelInfo *> &kernelInfoArray, const Linker::PatchableSegments *isaSegmentsForPatching, uint32_t rootDeviceIndex) override {
+        if (transferIsaSegmentsToAllocationOverride != -1) {
+            return (transferIsaSegmentsToAllocationOverride > 0);
+        }
+        return Program::transferIsaSegmentsToAllocation(pDevice, kernelInfoArray, isaSegmentsForPatching, rootDeviceIndex);
+    }
+
+    bool isIsaPoolingEnabled(Device &neoDevice) override {
+        if (isIsaPoolingEnabledOverride != -1) {
+            return (isIsaPoolingEnabledOverride > 0);
+        }
+        return Program::isIsaPoolingEnabled(neoDevice);
+    }
+
     std::vector<NEO::ExternalFunctionInfo> externalFunctions;
     std::map<uint32_t, int> processGenBinaryCalledPerRootDevice;
     std::map<uint32_t, int> replaceDeviceBinaryCalledPerRootDevice;
     static int getInternalOptionsCalled;
-    bool contextSet = false;
     int isFlagOptionOverride = -1;
     int isOptionValueValidOverride = -1;
-    bool wasProcessDebugDataCalled = false;
+    int transferIsaSegmentsToAllocationOverride = -1;
+    int isIsaPoolingEnabledOverride = -1;
+    bool contextSet = false;
     bool wasCreateDebugZebinCalled = false;
-    bool wasDebuggerNotified = false;
     bool wasPopulateZebinExtendedArgsMetadataOnceCalled = false;
     bool callBasePopulateZebinExtendedArgsMetadataOnce = false;
-};
-
-class MockProgramAppendKernelDebugOptions : public Program {
-  public:
-    using Program::Program;
-    ADDMETHOD_NOBASE(appendKernelDebugOptions, bool, true, (ClDevice & clDevice, std::string &internalOptions));
-    ADDMETHOD_NOBASE(processGenBinary, cl_int, CL_SUCCESS, (const ClDevice &clDevice));
+    auto getIntermediateRepresentation() const { return this->intermediateRepresentation; }
+    auto getIsGeneratedByIgc() const { return this->isGeneratedByIgc; }
+    auto &getBuildInfos() { return this->buildInfos; }
 };
 
 } // namespace NEO

@@ -1,25 +1,24 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/addressing_mode_helper.h"
 #include "shared/source/helpers/cache_policy.h"
 #include "shared/source/helpers/engine_node_helper.h"
-#include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
+#include "shared/source/unified_memory/unified_memory.h"
 
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
 #include "opencl/source/command_queue/enqueue_common.h"
-#include "opencl/source/helpers/hardware_commands_helper.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
-
-#include <new>
 
 namespace NEO {
 
@@ -34,11 +33,28 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBuffer(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
-
     const cl_command_type cmdType = CL_COMMAND_READ_BUFFER;
 
     CsrSelectionArgs csrSelectionArgs{cmdType, buffer, {}, device->getRootDeviceIndex(), &size};
     CommandStreamReceiver &csr = selectCsrForBuiltinOperation(csrSelectionArgs);
+    return enqueueReadBufferImpl(buffer, blockingRead, offset, size, ptr, mapAllocation, numEventsInWaitList, eventWaitList, event, csr);
+}
+
+template <typename GfxFamily>
+cl_int CommandQueueHw<GfxFamily>::enqueueReadBufferImpl(
+    Buffer *buffer,
+    cl_bool blockingRead,
+    size_t offset,
+    size_t size,
+    void *ptr,
+    GraphicsAllocation *mapAllocation,
+    cl_uint numEventsInWaitList,
+    const cl_event *eventWaitList,
+    cl_event *event, CommandStreamReceiver &csr) {
+
+    const cl_command_type cmdType = CL_COMMAND_READ_BUFFER;
+
+    CsrSelectionArgs csrSelectionArgs{cmdType, buffer, {}, device->getRootDeviceIndex(), &size};
 
     if (nullptr == mapAllocation) {
         notifyEnqueueReadBuffer(buffer, !!blockingRead, EngineHelpers::isBcs(csr.getOsContext().getEngineType()));
@@ -48,7 +64,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBuffer(
     bool isMemTransferNeeded = buffer->isMemObjZeroCopy() ? buffer->checkIfMemoryTransferIsRequired(offset, 0, ptr, cmdType) : true;
     bool isCpuCopyAllowed = bufferCpuCopyAllowed(buffer, cmdType, blockingRead, size, ptr,
                                                  numEventsInWaitList, eventWaitList);
-    InternalMemoryType memoryType = InternalMemoryType::NOT_SPECIFIED;
+    InternalMemoryType memoryType = InternalMemoryType::notSpecified;
 
     if (!mapAllocation) {
         cl_int retVal = getContext().tryGetExistingHostPtrAllocation(ptr, size, rootDeviceIndex, mapAllocation, memoryType, isCpuCopyAllowed);
@@ -70,10 +86,8 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBuffer(
                                                   numEventsInWaitList, eventWaitList, event);
     }
 
-    auto eBuiltInOps = EBuiltInOps::CopyBufferToBuffer;
-    if (forceStateless(buffer->getSize())) {
-        eBuiltInOps = EBuiltInOps::CopyBufferToBufferStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(buffer->getSize());
 
     void *dstPtr = ptr;
 
@@ -102,7 +116,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBuffer(
     void *alignedDstPtr = alignDown(dstPtr, 4);
     size_t dstPtrOffset = ptrDiff(dstPtr, alignedDstPtr);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.dstPtr = alignedDstPtr;
     dc.dstOffset = {dstPtrOffset, 0, 0};
     dc.srcMemObj = buffer;
@@ -121,7 +135,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueReadBuffer(
         }
     }
 
-    return dispatchBcsOrGpgpuEnqueue<CL_COMMAND_READ_BUFFER>(dispatchInfo, surfaces, eBuiltInOps, numEventsInWaitList, eventWaitList, event, blockingRead, csr);
+    return dispatchBcsOrGpgpuEnqueue<CL_COMMAND_READ_BUFFER>(dispatchInfo, surfaces, {BuiltIn::BaseKernel::copyBufferToBuffer, builtInMode}, numEventsInWaitList, eventWaitList, event, blockingRead, csr);
 }
 
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,50 +13,41 @@
 #include <array>
 #include <cstring>
 #include <iostream>
-#include <numeric>
-#ifdef WIN32
+#include <sstream>
+
+#if defined(_WIN32)
 #include <windows.h>
 
 #include <io.h>
+#include <process.h>
 
 #pragma warning(disable : 4996)
 #else
 #include <unistd.h>
 #endif
-const char *source = R"===(
-__kernel void printf_kernel(char byteValue, short shortValue, int intValue, long longValue){
-    printf("byte = %hhd\nshort = %hd\nint = %d\nlong = %ld", byteValue, shortValue, intValue, longValue);
-}
 
-__kernel void printf_kernel1(){
-    uint gid = get_global_id(0);
-    if( get_local_id(0) == 0 )
-    {
-        printf("id == %d\n", 0);
-    }
-}
-)===";
-static constexpr std::array<const char *, 2> kernelNames = {"printf_kernel",
-                                                            "printf_kernel1"};
+static constexpr std::array<const char *, 5> kernelNames = {"printf_kernel",
+                                                            "printf_kernel1",
+                                                            "print_string",
+                                                            "print_macros",
+                                                            "print_from_function_kernel"};
 
 enum class PrintfExecutionMode : uint32_t {
-    CommandQueue,
-    ImmSyncCmdList
+    commandQueue,
+    immSyncCmdList
 };
 
-void createModule(const ze_context_handle_t context, const ze_device_handle_t device, ze_module_handle_t &module) {
+void createModule(const ze_context_handle_t context, const ze_device_handle_t device, const char *source, ze_module_handle_t &module) {
     std::string buildLog;
-    auto spirV = compileToSpirV(source, "", buildLog);
-    if (buildLog.size() > 0) {
-        std::cout << "Build log " << buildLog;
-    }
+    auto spirV = LevelZeroBlackBoxTests::compileToSpirV(source, "", buildLog);
+    LevelZeroBlackBoxTests::printBuildLog(buildLog);
     SUCCESS_OR_TERMINATE((0 == spirV.size()));
 
     ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
     moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
     moduleDesc.pInputModule = spirV.data();
     moduleDesc.inputSize = spirV.size();
-    moduleDesc.pBuildFlags = "";
+    moduleDesc.pBuildFlags = "-library-compilation";
 
     SUCCESS_OR_TERMINATE(zeModuleCreate(context, device, &moduleDesc, &module, nullptr));
 }
@@ -71,8 +62,8 @@ void createKernel(const ze_module_handle_t module, ze_kernel_handle_t &kernel, c
 void runPrintfKernel(const ze_module_handle_t &module, const ze_kernel_handle_t &kernel,
                      ze_context_handle_t &context, ze_device_handle_t &device, uint32_t id, PrintfExecutionMode mode) {
 
-    CommandHandler commandHandler;
-    bool isImmediateCmdList = (mode == PrintfExecutionMode::ImmSyncCmdList);
+    LevelZeroBlackBoxTests::CommandHandler commandHandler;
+    bool isImmediateCmdList = (mode == PrintfExecutionMode::immSyncCmdList);
 
     SUCCESS_OR_TERMINATE(commandHandler.create(context, device, isImmediateCmdList));
 
@@ -99,6 +90,12 @@ void runPrintfKernel(const ze_module_handle_t &module, const ze_kernel_handle_t 
         dispatchTraits.groupCountX = 10u;
         dispatchTraits.groupCountY = 1u;
         dispatchTraits.groupCountZ = 1u;
+    } else if (id == 2 || id == 3 || id == 4) {
+        SUCCESS_OR_TERMINATE(zeKernelSetGroupSize(kernel, 1U, 1U, 1U));
+
+        dispatchTraits.groupCountX = 1u;
+        dispatchTraits.groupCountY = 1u;
+        dispatchTraits.groupCountZ = 1u;
     }
     SUCCESS_OR_TERMINATE(commandHandler.appendKernel(kernel, dispatchTraits));
 
@@ -106,52 +103,92 @@ void runPrintfKernel(const ze_module_handle_t &module, const ze_kernel_handle_t 
     SUCCESS_OR_TERMINATE(commandHandler.synchronize());
 }
 
+void cleanUp(ze_module_handle_t module, ze_module_handle_t module2, ze_kernel_handle_t *kernels, uint32_t kernelsCount) {
+    for (uint32_t i = 0; i < kernelsCount; i++) {
+        SUCCESS_OR_TERMINATE(zeKernelDestroy(kernels[i]));
+    }
+    SUCCESS_OR_TERMINATE(zeModuleDestroy(module));
+    SUCCESS_OR_TERMINATE(zeModuleDestroy(module2));
+}
+
 int main(int argc, char *argv[]) {
-    verbose = isVerbose(argc, argv);
-    const char *fileName = "zello_printf_output.txt";
-    bool validatePrintfOutput = true;
+    constexpr uint32_t kernelsCount = 5;
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    auto pid = getpid();
+    std::stringstream filenameWithPid;
+    filenameWithPid << "zello_printf_output_" << pid << ".txt";
+    auto fileNameStr = filenameWithPid.str();
+    auto *fileName = fileNameStr.c_str();
+
+    bool validatePrintfOutput = LevelZeroBlackBoxTests::getParamValue(argc, argv, "-c", "--check-output", 1);
     bool printfValidated = false;
     int stdoutFd = -1;
 
     ze_context_handle_t context = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context);
     auto device = devices[0];
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
     ze_module_handle_t module = nullptr;
-    createModule(context, device, module);
+    ze_module_handle_t module2 = nullptr;
+    createModule(context, device, LevelZeroBlackBoxTests::printfKernelSource, module);
+    createModule(context, device, LevelZeroBlackBoxTests::printfFunctionSource, module2);
 
-    std::array<std::string, 2> expectedStrings = {
+    {
+        ze_module_handle_t modulesToLink[] = {module, module2};
+        ze_module_build_log_handle_t dynLinkLog;
+        SUCCESS_OR_TERMINATE(zeModuleDynamicLink(2, modulesToLink, &dynLinkLog));
+        size_t buildLogSize = 0;
+        SUCCESS_OR_TERMINATE(zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr));
+        char *logBuffer = new char[buildLogSize]();
+        SUCCESS_OR_TERMINATE(zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer));
+
+        if (LevelZeroBlackBoxTests::verbose) {
+            std::cout << "Dynamically linked modules\n";
+            std::cout << logBuffer << "\n";
+        }
+    }
+
+    ze_kernel_handle_t kernels[kernelsCount] = {};
+    for (uint32_t i = 0; i < kernelsCount; i++) {
+        createKernel(module, kernels[i], kernelNames[i]);
+    }
+
+    std::array<std::string, kernelsCount> expectedStrings = {
         "byte = 127\nshort = 32767\nint = 2147483647\nlong = 9223372036854775807",
         "id == 0\nid == 0\nid == 0\nid == 0\nid == 0\n"
-        "id == 0\nid == 0\nid == 0\nid == 0\nid == 0\n"};
+        "id == 0\nid == 0\nid == 0\nid == 0\nid == 0\n",
+        "string with tab(\\t) new line(\\n):\nusing tab \tand new line \nin this string",
+        "string with tab(\\t) new line(\\n):\nusing tab \tand new line \nin this string",
+        "test function\n"};
 
-    PrintfExecutionMode executionModes[] = {PrintfExecutionMode::CommandQueue, PrintfExecutionMode::ImmSyncCmdList};
+    PrintfExecutionMode executionModes[] = {PrintfExecutionMode::commandQueue, PrintfExecutionMode::immSyncCmdList};
+    std::string executionModeNames[] = {"Asynchronous Command Queue", "Synchronous Immediate Command List"};
 
     for (auto mode : executionModes) {
-        for (uint32_t i = 0; i < 2; i++) {
+        std::cout << "**** Executing mode: " << executionModeNames[static_cast<uint32_t>(mode)] << std::endl;
+        for (uint32_t i = 0; i < kernelsCount; i++) {
+
+            std::cout << "*** Executing kernel: " << kernelNames[i] << std::endl;
 
             if (validatePrintfOutput) {
                 // duplicate stdout descriptor
                 stdoutFd = dup(fileno(stdout));
                 auto newFile = freopen(fileName, "w", stdout);
                 if (newFile == nullptr) {
-                    std::cout << "Failed in freopen()" << std::endl;
+                    std::cerr << "Failed in freopen()" << std::endl;
                     abort();
                 }
             }
 
-            ze_kernel_handle_t kernel = nullptr;
-            createKernel(module, kernel, kernelNames[i]);
-
-            runPrintfKernel(module, kernel, context, device, i, mode);
+            runPrintfKernel(module, kernels[i], context, device, i, mode);
 
             if (validatePrintfOutput) {
                 printfValidated = false;
-                auto sizeOfBuffer = expectedStrings[0].size() + 1024;
+                auto sizeOfBuffer = expectedStrings[i].size() + 1024;
                 auto kernelOutput = std::make_unique<char[]>(sizeOfBuffer);
                 memset(kernelOutput.get(), 0, sizeOfBuffer);
                 auto kernelOutputFile = fopen(fileName, "r");
@@ -186,18 +223,15 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            SUCCESS_OR_TERMINATE(zeKernelDestroy(kernel));
-
             if (validatePrintfOutput && !printfValidated) {
-                SUCCESS_OR_TERMINATE(zeContextDestroy(context));
-                std::cout << "\nZello Printf FAILED " << std::endl;
+                cleanUp(module, module2, kernels, kernelsCount);
+                std::cerr << "\nZello Printf FAILED " << std::endl;
                 return -1;
             }
         }
     }
 
-    SUCCESS_OR_TERMINATE(zeModuleDestroy(module));
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
+    cleanUp(module, module2, kernels, kernelsCount);
     std::cout << "\nZello Printf PASSED " << std::endl;
 
     return 0;

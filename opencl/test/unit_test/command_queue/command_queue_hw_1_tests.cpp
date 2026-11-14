@@ -1,134 +1,110 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/memory_manager/unified_memory_manager.h"
-#include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/source/utilities/buffer_pool_allocator.inl"
+#include "shared/source/utilities/isa_pool_allocator.h"
+#include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
-#include "shared/test/common/mocks/mock_builtins.h"
 #include "shared/test/common/mocks/mock_csr.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_direct_submission_hw.h"
-#include "shared/test/common/mocks/mock_os_library.h"
-#include "shared/test/common/mocks/mock_source_level_debugger.h"
 #include "shared/test/common/mocks/mock_timestamp_container.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
+#include "opencl/source/helpers/task_information.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
-#include "opencl/test/unit_test/helpers/cl_hw_parse.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_event.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
+#include "opencl/test/unit_test/mocks/mock_platform.h"
+#include "opencl/test/unit_test/mocks/mock_sharing_handler.h"
+
+namespace NEO {
+class ClDevice;
+class Context;
+template <typename GfxFamily>
+class RenderDispatcher;
+template <typename GfxFamily>
+class UltCommandStreamReceiver;
+} // namespace NEO
 
 using namespace NEO;
 
-HWTEST_F(CommandQueueHwTest, WhenConstructingTwoCommandQueuesThenOnlyOneDebugSurfaceIsAllocated) {
-    ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
-    executionEnvironment->rootDeviceEnvironments[0]->debugger.reset(new MockActiveSourceLevelDebugger(new MockOsLibrary));
-    auto device = std::make_unique<MockClDevice>(MockDevice::create<MockDeviceWithDebuggerActive>(executionEnvironment, 0u));
-    auto sipType = SipKernel::getSipKernelType(device->getDevice());
-    SipKernel::initSipKernel(sipType, device->getDevice());
-
-    MockCommandQueueHw<FamilyType> mockCmdQueueHw1(context, device.get(), nullptr);
-
-    auto dbgSurface = mockCmdQueueHw1.getGpgpuCommandStreamReceiver().getDebugSurfaceAllocation();
-    EXPECT_NE(dbgSurface, nullptr);
-
-    MockCommandQueueHw<FamilyType> mockCmdQueueHw2(context, device.get(), nullptr);
-    EXPECT_EQ(dbgSurface, mockCmdQueueHw1.getGpgpuCommandStreamReceiver().getDebugSurfaceAllocation());
-}
-
 HWTEST_F(CommandQueueHwTest, givenNoTimestampPacketsWhenWaitForTimestampsThenNoWaitAndTagIsNotUpdated) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableTimestampPacket.set(0);
-    DebugManager.flags.EnableTimestampWaitForQueues.set(4);
+    debugManager.flags.EnableTimestampPacket.set(0);
+    debugManager.flags.EnableTimestampWaitForQueues.set(4);
     ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
     auto device = std::make_unique<MockClDevice>(MockDevice::create<MockDeviceWithDebuggerActive>(executionEnvironment, 0u));
     device->getUltCommandStreamReceiver<FamilyType>().timestampPacketWriteEnabled = false;
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
     auto taskCount = device->getUltCommandStreamReceiver<FamilyType>().peekLatestFlushedTaskCount();
-    auto status = WaitStatus::NotReady;
+    auto status = WaitStatus::notReady;
 
-    cmdQ.waitForTimestamps({}, 101u, status, cmdQ.timestampPacketContainer.get(), cmdQ.deferredTimestampPackets.get());
+    cmdQ.waitForTimestamps({}, status, cmdQ.timestampPacketContainer.get(), cmdQ.deferredTimestampPackets.get());
 
     EXPECT_EQ(device->getUltCommandStreamReceiver<FamilyType>().peekLatestFlushedTaskCount(), taskCount);
 }
 
+HWTEST_F(CommandQueueHwTest, whenCallingIsCompletedThenTestTaskCountValue) {
+    auto &ultCsr = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    std::unique_ptr<OsContext> osContext(OsContext::create(pDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), pDevice->getRootDeviceIndex(), 0,
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular},
+                                                                                                        PreemptionMode::Disabled, pDevice->getDeviceBitfield())));
+
+    auto bcsCsr = std::make_unique<UltCommandStreamReceiver<FamilyType>>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+    bcsCsr->setupContext(*osContext);
+    bcsCsr->initializeTagAllocation();
+    EngineControl control(bcsCsr.get(), osContext.get());
+    CopyEngineState state{aub_stream::EngineType::ENGINE_BCS, 1, false};
+
+    MockCommandQueueHw<FamilyType> cmdQ(context, pClDevice, nullptr);
+
+    cmdQ.bcsEngines[0] = &control;
+    cmdQ.bcsStates[0] = state;
+
+    std::span<CopyEngineState> states{&state, 1};
+
+    EXPECT_EQ(0u, ultCsr.downloadAllocationsCalledCount);
+    EXPECT_EQ(0u, bcsCsr->downloadAllocationsCalledCount);
+    cmdQ.isCompleted(1, states);
+    EXPECT_EQ(1u, ultCsr.downloadAllocationsCalledCount);
+    EXPECT_EQ(1u, bcsCsr->downloadAllocationsCalledCount);
+}
+
 HWTEST_F(CommandQueueHwTest, givenEnableTimestampWaitForQueuesWhenGpuHangDetectedWhileWaitingForAllEnginesThenReturnCorrectStatus) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableTimestampWaitForQueues.set(4);
+    debugManager.flags.EnableTimestampWaitForQueues.set(4);
 
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCommandStreamReceiver>();
     ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
     auto device = std::make_unique<MockClDevice>(MockDevice::create<MockDevice>(executionEnvironment, 0u));
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
-    auto status = WaitStatus::NotReady;
+    auto status = WaitStatus::notReady;
 
-    auto mockCSR = new MockCommandStreamReceiver(*executionEnvironment, 0, device->getDeviceBitfield());
+    auto mockCSR = static_cast<MockCommandStreamReceiver *>(&device->getGpgpuCommandStreamReceiver());
     mockCSR->isGpuHangDetectedReturnValue = true;
-    device->resetCommandStreamReceiver(mockCSR);
+    mockCSR->gpuHangCheckPeriodUs = 0;
 
     auto mockTagAllocator = new MockTagAllocator<>(0, device->getMemoryManager());
     mockCSR->timestampPacketAllocator.reset(mockTagAllocator);
     cmdQ.timestampPacketContainer = std::make_unique<TimestampPacketContainer>();
     cmdQ.timestampPacketContainer->add(mockTagAllocator->getTag());
 
-    status = cmdQ.waitForAllEngines(false, nullptr, false);
+    status = cmdQ.waitForAllEngines(false, nullptr, false, false);
 
-    EXPECT_EQ(WaitStatus::GpuHang, status);
-}
-
-HWTEST_F(CommandQueueHwTest, WhenDebugSurfaceIsAllocatedThenBufferIsZeroed) {
-    ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
-    executionEnvironment->rootDeviceEnvironments[0]->debugger.reset(new MockActiveSourceLevelDebugger(new MockOsLibrary));
-    auto device = std::make_unique<MockClDevice>(MockDevice::create<MockDeviceWithDebuggerActive>(executionEnvironment, 0u));
-    auto sipType = SipKernel::getSipKernelType(device->getDevice());
-    SipKernel::initSipKernel(sipType, device->getDevice());
-
-    MockCommandQueueHw<FamilyType> mockCmdQueueHw1(context, device.get(), nullptr);
-
-    auto dbgSurface = mockCmdQueueHw1.getGpgpuCommandStreamReceiver().getDebugSurfaceAllocation();
-    EXPECT_NE(dbgSurface, nullptr);
-    auto mem = dbgSurface->getUnderlyingBuffer();
-    ASSERT_NE(nullptr, mem);
-
-    auto &stateSaveAreaHeader = SipKernel::getSipKernel(device->getDevice()).getStateSaveAreaHeader();
-    mem = ptrOffset(mem, stateSaveAreaHeader.size());
-    auto size = dbgSurface->getUnderlyingBufferSize() - stateSaveAreaHeader.size();
-    EXPECT_TRUE(memoryZeroed(mem, size));
-}
-
-HWTEST_F(CommandQueueHwTest, WhenConstructingCommandQueueDebugOnButIgcDoesNotReturnSSAHDoNotCopyIt) {
-    ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
-    executionEnvironment->rootDeviceEnvironments[0]->debugger.reset(new MockActiveSourceLevelDebugger(new MockOsLibrary));
-
-    MockGraphicsAllocation sipAlloc1;
-    auto mockSip1 = std::make_unique<MockSipKernel>(SipKernelType::DbgCsrLocal, &sipAlloc1);
-    mockSip1->mockStateSaveAreaHeader.clear();
-
-    MockGraphicsAllocation sipAlloc2;
-    auto mockSip2 = std::make_unique<MockSipKernel>(SipKernelType::DbgCsr, &sipAlloc2);
-    mockSip2->mockStateSaveAreaHeader.clear();
-
-    auto mockBuiltIns = new MockBuiltins();
-    mockBuiltIns->overrideSipKernel(std::move(mockSip1));
-    mockBuiltIns->overrideSipKernel(std::move(mockSip2));
-
-    executionEnvironment->rootDeviceEnvironments[0]->builtins.reset(mockBuiltIns);
-
-    auto device = std::make_unique<MockClDevice>(MockDevice::create<MockDeviceWithDebuggerActive>(executionEnvironment, 0u));
-
-    MockCommandQueueHw<FamilyType> mockCmdQueueHw1(context, device.get(), nullptr);
-
-    auto dbgSurface = mockCmdQueueHw1.getGpgpuCommandStreamReceiver().getDebugSurfaceAllocation();
-    EXPECT_NE(dbgSurface, nullptr);
-
-    auto &stateSaveAreaHeader = SipKernel::getSipKernel(device->getDevice()).getStateSaveAreaHeader();
-    EXPECT_EQ(static_cast<size_t>(0), stateSaveAreaHeader.size());
+    EXPECT_EQ(WaitStatus::gpuHang, status);
 }
 
 HWTEST_F(CommandQueueHwTest, givenMultiDispatchInfoWhenAskingForAuxTranslationThenCheckMemObjectsCountAndDebugFlag) {
@@ -138,7 +114,7 @@ HWTEST_F(CommandQueueHwTest, givenMultiDispatchInfoWhenAskingForAuxTranslationTh
     MultiDispatchInfo multiDispatchInfo;
     HardwareInfo *hwInfo = pClDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->getMutableHardwareInfo();
 
-    DebugManager.flags.ForceAuxTranslationMode.set(static_cast<int32_t>(AuxTranslationMode::Blit));
+    debugManager.flags.ForceAuxTranslationMode.set(static_cast<int32_t>(AuxTranslationMode::blit));
 
     MockCommandQueueHw<FamilyType> mockCmdQueueHw(context, pClDevice, nullptr);
 
@@ -150,7 +126,7 @@ HWTEST_F(CommandQueueHwTest, givenMultiDispatchInfoWhenAskingForAuxTranslationTh
     EXPECT_FALSE(mockCmdQueueHw.isBlitAuxTranslationRequired(multiDispatchInfo));
 
     auto kernelObjsForAuxTranslation = std::make_unique<KernelObjsForAuxTranslation>();
-    kernelObjsForAuxTranslation->insert({KernelObjForAuxTranslation::Type::MEM_OBJ, &buffer});
+    kernelObjsForAuxTranslation->insert({KernelObjForAuxTranslation::Type::memObj, &buffer});
     multiDispatchInfo.setKernelObjsForAuxTranslation(std::move(kernelObjsForAuxTranslation));
     EXPECT_TRUE(mockCmdQueueHw.isBlitAuxTranslationRequired(multiDispatchInfo));
 
@@ -158,7 +134,7 @@ HWTEST_F(CommandQueueHwTest, givenMultiDispatchInfoWhenAskingForAuxTranslationTh
     EXPECT_FALSE(mockCmdQueueHw.isBlitAuxTranslationRequired(multiDispatchInfo));
 
     hwInfo->capabilityTable.blitterOperationsSupported = true;
-    DebugManager.flags.ForceAuxTranslationMode.set(static_cast<int32_t>(AuxTranslationMode::Builtin));
+    debugManager.flags.ForceAuxTranslationMode.set(static_cast<int32_t>(AuxTranslationMode::builtin));
     EXPECT_FALSE(mockCmdQueueHw.isBlitAuxTranslationRequired(multiDispatchInfo));
 }
 
@@ -174,7 +150,7 @@ HWTEST_F(CommandQueueHwTest, WhenEnqueuingBlockedMapUnmapOperationThenVirtualEve
     MemObjOffsetArray offset = {{0, 0, 0}};
     pHwQ->enqueueBlockedMapUnmapOperation(nullptr,
                                           0,
-                                          MAP,
+                                          MapOperationType::map,
                                           &buffer,
                                           size, offset, false,
                                           eventBuilder);
@@ -231,10 +207,32 @@ HWTEST_F(CommandQueueHwTest, GivenCommandQueueWhenItIsCreatedThenInitDirectSubmi
     }
 }
 
-HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenAskingForCacheFlushOnBcsThenReturnTrue) {
-    auto pHwQ = static_cast<CommandQueueHw<FamilyType> *>(pCmdQ);
+HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenAskingForCacheFlushOnBcsThenReturnCorrectValue) {
+    auto clDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+    MockContext context(clDevice.get());
 
-    EXPECT_TRUE(pHwQ->isCacheFlushForBcsRequired());
+    cl_int retVal = CL_SUCCESS;
+    auto commandQueue = std::unique_ptr<CommandQueue>(CommandQueue::create(&context, clDevice.get(), nullptr, false, retVal));
+    auto commandQueueHw = static_cast<CommandQueueHw<FamilyType> *>(commandQueue.get());
+
+    const auto &productHelper = clDevice->getProductHelper();
+    EXPECT_EQ(productHelper.isDcFlushAllowed(), commandQueueHw->isCacheFlushForBcsRequired());
+}
+
+HWTEST_F(CommandQueueHwTest, givenDebugFlagSetWhenCheckingBcsCacheFlushRequirementThenReturnCorrectValue) {
+    DebugManagerStateRestore restorer;
+    auto clDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+    MockContext context(clDevice.get());
+
+    cl_int retVal = CL_SUCCESS;
+    auto commandQueue = std::unique_ptr<CommandQueue>(CommandQueue::create(&context, clDevice.get(), nullptr, false, retVal));
+    auto commandQueueHw = static_cast<CommandQueueHw<FamilyType> *>(commandQueue.get());
+
+    debugManager.flags.ForceCacheFlushForBcs.set(0);
+    EXPECT_FALSE(commandQueueHw->isCacheFlushForBcsRequired());
+
+    debugManager.flags.ForceCacheFlushForBcs.set(1);
+    EXPECT_TRUE(commandQueueHw->isCacheFlushForBcsRequired());
 }
 
 HWTEST_F(CommandQueueHwTest, givenBlockedMapBufferCallWhenMemObjectIsPassedToCommandThenItsRefCountIsBeingIncreased) {
@@ -249,7 +247,7 @@ HWTEST_F(CommandQueueHwTest, givenBlockedMapBufferCallWhenMemObjectIsPassedToCom
     MemObjOffsetArray offset = {{0, 0, 0}};
     pHwQ->enqueueBlockedMapUnmapOperation(nullptr,
                                           0,
-                                          MAP,
+                                          MapOperationType::map,
                                           &buffer,
                                           size, offset, false,
                                           eventBuilder);
@@ -275,7 +273,7 @@ HWTEST_F(CommandQueueHwTest, givenNoReturnEventWhenCallingEnqueueBlockedMapUnmap
     MemObjOffsetArray offset = {{0, 0, 0}};
     pHwQ->enqueueBlockedMapUnmapOperation(nullptr,
                                           0,
-                                          MAP,
+                                          MapOperationType::map,
                                           &buffer,
                                           size, offset, false,
                                           eventBuilder);
@@ -303,7 +301,7 @@ HWTEST_F(CommandQueueHwTest, WhenAddMapUnmapToWaitlistEventsThenDependenciesAreN
     MemObjOffsetArray offset = {{0, 0, 0}};
     pHwQ->enqueueBlockedMapUnmapOperation(&eventWaitList,
                                           1,
-                                          MAP,
+                                          MapOperationType::map,
                                           buffer,
                                           size, offset, false,
                                           eventBuilder);
@@ -327,7 +325,7 @@ HWTEST_F(CommandQueueHwTest, givenMapCommandWhenZeroStateCommandIsSubmittedThenT
     MemObjOffsetArray offset = {{0, 0, 0}};
     mockCmdQueueHw.enqueueBlockedMapUnmapOperation(nullptr,
                                                    0,
-                                                   MAP,
+                                                   MapOperationType::map,
                                                    buffer,
                                                    size, offset, false,
                                                    eventBuilder);
@@ -349,14 +347,15 @@ HWTEST_F(CommandQueueHwTest, givenMapCommandWhenZeroStateCommandIsSubmittedOnNon
     MemObjOffsetArray offset = {{0, 0, 0}};
     mockCmdQueueHw.enqueueBlockedMapUnmapOperation(nullptr,
                                                    0,
-                                                   MAP,
+                                                   MapOperationType::map,
                                                    buffer,
                                                    size, offset, false,
                                                    eventBuilder);
 
     EXPECT_NE(nullptr, mockCmdQueueHw.virtualEvent);
     mockCmdQueueHw.virtualEvent->setStatus(CL_COMPLETE);
-    EXPECT_EQ(1u, mockCmdQueueHw.latestTaskCountWaited);
+
+    EXPECT_EQ(mockCmdQueueHw.getHeaplessModeEnabled() ? 2u : 1u, mockCmdQueueHw.latestTaskCountWaited);
 
     buffer->decRefInternal();
 }
@@ -372,7 +371,7 @@ HWTEST_F(CommandQueueHwTest, GivenEventWhenEnqueuingBlockedMapUnmapOperationThen
     MemObjOffsetArray offset = {{0, 0, 0}};
     pHwQ->enqueueBlockedMapUnmapOperation(nullptr,
                                           0,
-                                          MAP,
+                                          MapOperationType::map,
                                           buffer,
                                           size, offset, false,
                                           eventBuilder);
@@ -404,7 +403,7 @@ HWTEST_F(CommandQueueHwTest, GivenEventWhenEnqueuingBlockedMapUnmapOperationThen
     MemObjOffsetArray offset = {{0, 0, 0}};
     pHwQ->enqueueBlockedMapUnmapOperation(nullptr,
                                           0,
-                                          MAP,
+                                          MapOperationType::map,
                                           buffer,
                                           size, offset, false,
                                           eventBuilder);
@@ -422,7 +421,7 @@ HWTEST_F(CommandQueueHwTest, GivenNonEmptyQueueOnBlockingWhenMappingBufferThenWi
             : CommandQueueHw<FamilyType>(context, device, 0, false) {
             finishWasCalled = false;
         }
-        cl_int finish() override {
+        cl_int finish(bool resolvePendingL3Flushes) override {
             finishWasCalled = true;
             return 0;
         }
@@ -453,6 +452,39 @@ HWTEST_F(CommandQueueHwTest, GivenNonEmptyQueueOnBlockingWhenMappingBufferThenWi
     clReleaseMemObject(b2);
 
     clReleaseEvent(gatingEvent);
+}
+
+HWTEST2_F(CommandQueueHwTest, GivenFillBufferBlockedOnUserEventWhenEventIsAbortedThenClearTimestamps, IsAtLeastXeCore) {
+    CommandQueueHw<FamilyType> cmdQ(context, pCmdQ->getDevice().getSpecializedDevice<ClDevice>(), 0, false);
+
+    auto buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, 20, nullptr, nullptr);
+    uint32_t pattern = 0xf0f1f2f3;
+
+    auto clUserEvent = clCreateUserEvent(context, nullptr);
+    cl_event clWaitingEvent;
+    auto retVal = clEnqueueFillBuffer(&cmdQ, buffer, &pattern, sizeof(pattern), 0, sizeof(pattern), 1, &clUserEvent, &clWaitingEvent);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto waitingEvent = castToObject<Event>(clWaitingEvent);
+
+    clSetUserEventStatus(clUserEvent, CL_INVALID_VALUE);
+    cmdQ.finish(false);
+
+    auto timestampPacketNodes = waitingEvent->getTimestampPacketNodes();
+    ASSERT_NE(timestampPacketNodes, nullptr);
+    const auto &timestamps = timestampPacketNodes->peekNodes();
+    for (const auto &node : timestamps) {
+        for (uint32_t i = 0; i < node->getPacketsUsed(); i++) {
+            EXPECT_EQ(0ULL, node->getContextStartValue(i));
+            EXPECT_EQ(0ULL, node->getContextEndValue(i));
+            EXPECT_EQ(0ULL, node->getGlobalStartValue(i));
+            EXPECT_EQ(0ULL, node->getGlobalEndValue(i));
+        }
+    }
+
+    clReleaseMemObject(buffer);
+    clReleaseEvent(clUserEvent);
+    clReleaseEvent(clWaitingEvent);
 }
 
 HWTEST_F(CommandQueueHwTest, GivenEventsWaitlistOnBlockingWhenMappingBufferThenWillWaitForEvents) {
@@ -488,14 +520,29 @@ HWTEST_F(CommandQueueHwTest, GivenEventsWaitlistOnBlockingWhenMappingBufferThenW
     me->release();
 }
 
-HWTEST_F(CommandQueueHwTest, GivenNotCompleteUserEventPassedToEnqueueWhenEventIsUnblockedThenAllSurfacesForBlockedCommandsAreMadeResident) {
-    int32_t executionStamp = 0;
-    auto mockCSR = new MockCsr<FamilyType>(executionStamp, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(mockCSR);
+struct CommandQueueHwTestWithMockCsr : public CommandQueueHwTest {
+    void SetUp() override {}
+    void TearDown() override {}
+
+    template <typename FamilyType>
+    void setUpT() {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MockCsr<FamilyType>>();
+        CommandQueueHwTest::SetUp();
+    }
+
+    template <typename FamilyType>
+    void tearDownT() {
+        CommandQueueHwTest::TearDown();
+    }
+};
+
+HWTEST_TEMPLATED_F(CommandQueueHwTestWithMockCsr, GivenNotCompleteUserEventPassedToEnqueueWhenEventIsUnblockedThenAllSurfacesForBlockedCommandsAreMadeResident) {
+    auto mockCSR = static_cast<MockCsr<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     auto userEvent = makeReleaseable<UserEvent>(context);
     KernelInfo kernelInfo;
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
     auto mockProgram = mockKernelWithInternals.mockProgram;
 
@@ -508,7 +555,7 @@ HWTEST_F(CommandQueueHwTest, GivenNotCompleteUserEventPassedToEnqueueWhenEventIs
     GraphicsAllocation *printfSurface = mockCSR->getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{mockCSR->getRootDeviceIndex(), MemoryConstants::pageSize});
     GraphicsAllocation *privateSurface = mockCSR->getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{mockCSR->getRootDeviceIndex(), MemoryConstants::pageSize});
 
-    mockKernel->setPrivateSurface(privateSurface, 10);
+    mockKernel->setPrivateSurface(privateSurface);
 
     cl_event blockedEvent = userEvent.get();
     pCmdQ->enqueueKernel(mockKernel, 1, &offset, &size, &size, 1, &blockedEvent, nullptr);
@@ -518,7 +565,7 @@ HWTEST_F(CommandQueueHwTest, GivenNotCompleteUserEventPassedToEnqueueWhenEventIs
     EXPECT_TRUE(mockCSR->isMadeResident(constantSurface));
     EXPECT_TRUE(mockCSR->isMadeResident(privateSurface));
 
-    mockKernel->setPrivateSurface(nullptr, 0);
+    mockKernel->setPrivateSurface(nullptr);
     mockProgram->setConstantSurface(nullptr);
 
     mockCSR->getMemoryManager()->freeGraphicsMemory(privateSurface);
@@ -540,7 +587,7 @@ using BlockedCommandQueueTest = CommandQueueHwTest;
 
 HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWhenBlockedCommandIsBeingSubmittedThenQueueHeapsAreNotUsed) {
     UserEvent userEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -551,11 +598,11 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWhenBlockedCommandIsBeingSubm
     pCmdQ->enqueueKernel(mockKernel, 1, &offset, &size, &size, 1, &blockedEvent, nullptr);
     userEvent.setStatus(CL_COMPLETE);
 
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 4096u);
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 4096u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 4096u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 4096u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 4096u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 4096u);
 
-    uint32_t defaultSshUse = UnitTestHelper<FamilyType>::getDefaultSshUsage();
+    uint32_t defaultSshUse = UnitTestHelper<FamilyType>::getDefaultSshUsage(pDevice->getProductHelper());
 
     EXPECT_EQ(0u, ioh.getUsed());
     EXPECT_EQ(0u, dsh.getUsed());
@@ -566,7 +613,7 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWhenBlockedCommandIsBeingSubm
 
 HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWithUsedHeapsWhenBlockedCommandIsBeingSubmittedThenQueueHeapsAreNotUsed) {
     UserEvent userEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -574,9 +621,9 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWithUsedHeapsWhenBlockedComma
 
     cl_event blockedEvent = &userEvent;
 
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 4096u);
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 4096u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 4096u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 4096u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 4096u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 4096u);
 
     auto spaceToUse = 4u;
 
@@ -587,7 +634,7 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWithUsedHeapsWhenBlockedComma
     pCmdQ->enqueueKernel(mockKernel, 1, &offset, &size, &size, 1, &blockedEvent, nullptr);
     userEvent.setStatus(CL_COMPLETE);
 
-    uint32_t sshSpaceUse = spaceToUse + UnitTestHelper<FamilyType>::getDefaultSshUsage();
+    uint32_t sshSpaceUse = spaceToUse + UnitTestHelper<FamilyType>::getDefaultSshUsage(pDevice->getProductHelper());
 
     EXPECT_EQ(spaceToUse, ioh.getUsed());
     EXPECT_EQ(spaceToUse, dsh.getUsed());
@@ -598,7 +645,7 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWithUsedHeapsWhenBlockedComma
 
 HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWhichHasSomeUnusedHeapsWhenBlockedCommandIsBeingSubmittedThenThoseHeapsAreBeingUsed) {
     UserEvent userEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -606,9 +653,9 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWhichHasSomeUnusedHeapsWhenBl
 
     cl_event blockedEvent = &userEvent;
 
-    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 4096u);
-    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 4096u);
-    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 4096u);
+    auto &ioh = pCmdQ->getIndirectHeap(IndirectHeap::Type::indirectObject, 4096u);
+    auto &dsh = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 4096u);
+    auto &ssh = pCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 4096u);
 
     auto iohBase = ioh.getCpuBase();
     auto dshBase = dsh.getCpuBase();
@@ -626,7 +673,7 @@ HWTEST_F(BlockedCommandQueueTest, givenCommandQueueWhichHasSomeUnusedHeapsWhenBl
 
 HWTEST_F(BlockedCommandQueueTest, givenEnqueueBlockedByUserEventWhenItIsEnqueuedThenKernelReferenceCountIsIncreased) {
     UserEvent userEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -649,7 +696,7 @@ HWTEST_F(CommandQueueHwRefCountTest, givenBlockedCmdQWhenNewBlockedEnqueueReplac
     auto mockCmdQ = new MockCommandQueueHw<FamilyType>(context, pClDevice, 0);
 
     UserEvent userEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -669,7 +716,7 @@ HWTEST_F(CommandQueueHwRefCountTest, givenBlockedCmdQWhenNewBlockedEnqueueReplac
     EXPECT_EQ(3, mockCmdQ->getRefInternalCount());
 
     userEvent.setStatus(CL_COMPLETE);
-    // UserEvent is set to complete and event tree is unblocked, queue has only 1 refference to itself after this operation
+    // UserEvent is set to complete and event tree is unblocked, queue has only 1 reference to itself after this operation
     EXPECT_EQ(2, mockCmdQ->getRefInternalCount());
 
     // this call will release the queue
@@ -681,7 +728,7 @@ HWTEST_F(CommandQueueHwRefCountTest, givenBlockedCmdQWithOutputEventAsVirtualEve
     auto mockCmdQ = new MockCommandQueueHw<FamilyType>(context, pClDevice, 0);
 
     UserEvent userEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -726,7 +773,7 @@ HWTEST_F(CommandQueueHwRefCountTest, givenSeriesOfBlockedEnqueuesWhenEveryEventI
     auto mockCmdQ = new MockCommandQueueHw<FamilyType>(context, pClDevice, 0);
 
     UserEvent *userEvent = new UserEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -776,7 +823,7 @@ HWTEST_F(CommandQueueHwRefCountTest, givenSeriesOfBlockedEnqueuesWhenCmdQIsRelea
     auto mockCmdQ = new MockCommandQueueHw<FamilyType>(context, pClDevice, 0);
 
     UserEvent *userEvent = new UserEvent(context);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     size_t offset = 0;
@@ -820,7 +867,7 @@ HWTEST_F(CommandQueueHwRefCountTest, givenSeriesOfBlockedEnqueuesWhenCmdQIsRelea
 HWTEST_F(CommandQueueHwTest, GivenEventThatIsNotCompletedWhenFinishIsCalledAndItGetsCompletedThenItStatusIsUpdatedAfterFinishCall) {
     cl_int ret;
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
 
     struct ClbFuncTempStruct {
         static void CL_CALLBACK clbFuncT(cl_event e, cl_int execStatus, void *valueForUpdate) {
@@ -845,12 +892,12 @@ HWTEST_F(CommandQueueHwTest, GivenEventThatIsNotCompletedWhenFinishIsCalledAndIt
 
 HWTEST_F(CommandQueueHwTest, GivenMultiTileQueueWhenEventNotCompletedAndFinishIsCalledThenItGetsCompletedOnAllTilesAndItStatusIsUpdatedAfterFinishCall) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
 
     auto &csr = this->pCmdQ->getGpgpuCommandStreamReceiver();
     csr.setActivePartitions(2u);
     auto ultCsr = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(&csr);
-    ultCsr->postSyncWriteOffset = 32;
+    ultCsr->immWritePostSyncWriteOffset = 32;
 
     auto tagAddress = csr.getTagAddress();
     *ptrOffset(tagAddress, 32) = *tagAddress;
@@ -894,43 +941,9 @@ HWTEST_F(CommandQueueHwTest, givenCommandQueueThatIsBlockedAndUsesCpuCopyWhenEve
     clReleaseEvent(returnEvent);
 }
 
-HWTEST_F(CommandQueueHwTest, givenEventWithRecordedCommandWhenSubmitCommandIsCalledThenTaskCountMustBeUpdatedFromOtherThread) {
-    std::atomic_bool go{false};
-
-    struct MockEvent : public Event {
-        using Event::Event;
-        using Event::eventWithoutCommand;
-        using Event::submitCommand;
-        void synchronizeTaskCount() override {
-            *atomicFence = true;
-            Event::synchronizeTaskCount();
-        }
-        uint32_t synchronizeCallCount = 0u;
-        std::atomic_bool *atomicFence = nullptr;
-    };
-
-    MockEvent neoEvent(this->pCmdQ, CL_COMMAND_MAP_BUFFER, CompletionStamp::notReady, CompletionStamp::notReady);
-    neoEvent.atomicFence = &go;
-    EXPECT_TRUE(neoEvent.eventWithoutCommand);
-    neoEvent.eventWithoutCommand = false;
-
-    EXPECT_EQ(CompletionStamp::notReady, neoEvent.peekTaskCount());
-
-    std::thread t([&]() {
-        while (!go) {
-        }
-        neoEvent.updateTaskCount(77u, 0);
-    });
-
-    neoEvent.submitCommand(false);
-
-    EXPECT_EQ(77u, neoEvent.peekTaskCount());
-    t.join();
-}
-
 HWTEST_F(CommandQueueHwTest, givenNonBlockedEnqueueWhenEventIsPassedThenUpdateItsFlushStamp) {
     CommandQueueHw<FamilyType> *cmdQHw = static_cast<CommandQueueHw<FamilyType> *>(this->pCmdQ);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
     csr.flushStamp->setStamp(5);
 
@@ -951,7 +964,7 @@ HWTEST_F(CommandQueueHwTest, givenBlockedEnqueueWhenEventIsPassedThenDontUpdateI
     UserEvent userEvent;
     cl_event event, clUserEvent;
     CommandQueueHw<FamilyType> *cmdQHw = static_cast<CommandQueueHw<FamilyType> *>(this->pCmdQ);
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
     csr.flushStamp->setStamp(5);
 
@@ -974,15 +987,12 @@ HWTEST_F(CommandQueueHwTest, givenBlockedEnqueueWhenEventIsPassedThenDontUpdateI
     eventObj->release();
 }
 
-HWTEST_F(CommandQueueHwTest, givenBlockedInOrderCmdQueueAndAsynchronouslyCompletedEventWhenEnqueueCompletesVirtualEventThenUpdatedTaskLevelIsPassedToEnqueueAndFlushTask) {
+HWTEST_TEMPLATED_F(CommandQueueHwTestWithMockCsr, givenBlockedInOrderCmdQueueAndAsynchronouslyCompletedEventWhenEnqueueCompletesVirtualEventThenUpdatedTaskLevelIsPassedToEnqueueAndFlushTask) {
     CommandQueueHw<FamilyType> *cmdQHw = static_cast<CommandQueueHw<FamilyType> *>(this->pCmdQ);
 
-    int32_t executionStamp = 0;
-    auto mockCSR = new MockCsr<FamilyType>(executionStamp, *pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+    auto mockCSR = static_cast<MockCsr<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
-    pDevice->resetCommandStreamReceiver(mockCSR);
-
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
     size_t offset = 0;
     size_t size = 1;
@@ -1025,7 +1035,7 @@ HWTEST_F(CommandQueueHwTest, givenBlockedOutOfOrderQueueWhenUserEventIsSubmitted
     CommandQueueHw<FamilyType> *cmdQHw = static_cast<CommandQueueHw<FamilyType> *>(this->pCmdQ);
     auto &mockCsr = pDevice->getUltCommandStreamReceiver<FamilyType>();
 
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
     size_t offset = 0;
     size_t size = 1;
@@ -1047,7 +1057,7 @@ HWTEST_F(CommandQueueHwTest, givenBlockedOutOfOrderQueueWhenUserEventIsSubmitted
     clSetUserEventStatus(userEvent, 0u);
 
     EXPECT_EQ(neoEvent->peekExecutionStatus(), CL_SUBMITTED);
-    EXPECT_EQ(neoEvent->peekTaskCount(), 1u);
+    EXPECT_EQ(neoEvent->peekTaskCount(), mockCsr.heaplessPrologProgrammed ? 2u : 1u);
 
     *mockCsr.getTagAddress() = initialHardwareTag;
     clReleaseEvent(blockedEvent);
@@ -1056,7 +1066,7 @@ HWTEST_F(CommandQueueHwTest, givenBlockedOutOfOrderQueueWhenUserEventIsSubmitted
 
 HWTEST_F(CommandQueueHwTest, givenWalkerSplitEnqueueNDRangeWhenNoBlockedThenKernelMakeResidentCalledOnce) {
     KernelInfo kernelInfo;
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
     auto mockProgram = mockKernelWithInternals.mockProgram;
     mockProgram->setAllowNonUniform(true);
@@ -1075,7 +1085,7 @@ HWTEST_F(CommandQueueHwTest, givenWalkerSplitEnqueueNDRangeWhenNoBlockedThenKern
 HWTEST_F(CommandQueueHwTest, givenWalkerSplitEnqueueNDRangeWhenBlockedThenKernelGetResidencyCalledOnce) {
     UserEvent userEvent(context);
     KernelInfo kernelInfo;
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
     auto mockProgram = mockKernelWithInternals.mockProgram;
     mockProgram->setAllowNonUniform(true);
@@ -1097,10 +1107,11 @@ HWTEST_F(CommandQueueHwTest, givenWalkerSplitEnqueueNDRangeWhenBlockedThenKernel
 }
 
 HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenDispatchingWorkThenRegisterCsrClient) {
-    MockKernelWithInternals mockKernelWithInternals(*pClDevice);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    pDevice->disableSecondaryEngines = true;
 
     size_t gws = 1;
 
@@ -1136,7 +1147,55 @@ HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenDispatchingWorkThenRegisterCsr
     EXPECT_EQ(baseNumClients, csr.getNumClients());
 }
 
+HWTEST_F(CommandQueueHwTest, givenCsrClientWhenCallingSyncPointsThenUnregister) {
+
+    MockKernelWithInternals mockKernelWithInternals(*context);
+    auto mockKernel = mockKernelWithInternals.mockKernel;
+
+    auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    size_t gws = 1;
+
+    auto baseNumClients = csr.getNumClients();
+
+    MockCommandQueueHw<FamilyType> mockCmdQueueHw{context, pClDevice, nullptr};
+
+    EXPECT_EQ(CL_SUCCESS, mockCmdQueueHw.enqueueKernel(mockKernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr));
+
+    EXPECT_EQ(baseNumClients + 1, csr.getNumClients());
+
+    mockCmdQueueHw.finish(false);
+
+    EXPECT_EQ(baseNumClients, csr.getNumClients()); // queue synchronized
+
+    cl_event e0, e1;
+
+    EXPECT_EQ(CL_SUCCESS, mockCmdQueueHw.enqueueKernel(mockKernel, 1, nullptr, &gws, nullptr, 0, nullptr, &e0));
+    EXPECT_EQ(baseNumClients + 1, csr.getNumClients());
+    *csr.tagAddress = mockCmdQueueHw.taskCount;
+
+    EXPECT_EQ(CL_SUCCESS, mockCmdQueueHw.enqueueKernel(mockKernel, 1, nullptr, &gws, nullptr, 0, nullptr, &e1));
+    EXPECT_EQ(baseNumClients + 1, csr.getNumClients());
+
+    clWaitForEvents(1, &e0);
+    EXPECT_EQ(baseNumClients + 1, csr.getNumClients()); // CSR task count < queue task count
+
+    if (csr.isUpdateTagFromWaitEnabled()) {
+        *csr.tagAddress = mockCmdQueueHw.taskCount + 1;
+    } else {
+        *csr.tagAddress = mockCmdQueueHw.taskCount;
+    }
+
+    clWaitForEvents(1, &e0);
+    EXPECT_EQ(baseNumClients, csr.getNumClients()); // queue ready
+
+    clReleaseEvent(e0);
+    clReleaseEvent(e1);
+}
+
 HWTEST_F(CommandQueueHwTest, givenKernelSplitEnqueueReadBufferWhenBlockedThenEnqueueSurfacesMakeResidentIsCalledOnce) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetAmountOfReusableAllocationsPerCmdQueue.set(0);
     UserEvent userEvent(context);
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
     csr.storeMakeResidentAllocations = true;
@@ -1164,17 +1223,19 @@ HWTEST_F(CommandQueueHwTest, givenKernelSplitEnqueueReadBufferWhenBlockedThenEnq
         if (it->first == bufferAllocation) {
             expected = 3u;
         }
+
+        // Shared parent isa allocation for all kernels
+        if (pDevice->getIsaPoolAllocator().isPoolBuffer(it->first)) {
+            expected = 2u;
+        }
+
         EXPECT_EQ(expected, it->second);
     }
 
     pCmdQ->isQueueBlocked();
 }
 
-HWTEST_F(CommandQueueHwTest, givenDefaultHwCommandQueueThenCacheFlushAfterWalkerIsNotNeeded) {
-    EXPECT_FALSE(pCmdQ->getRequiresCacheFlushAfterWalker());
-}
-
-HWTEST_F(CommandQueueHwTest, givenSizeWhenForceStatelessIsCalledThenCorrectValueIsReturned) {
+HWTEST_F(CommandQueueHwTest, givenSizeAndIsForceStatelessDisabledWhenForceStatelessIsCalledThenCorrectValueIsReturned) {
 
     if (is32bit) {
         GTEST_SKIP();
@@ -1182,14 +1243,36 @@ HWTEST_F(CommandQueueHwTest, givenSizeWhenForceStatelessIsCalledThenCorrectValue
 
     struct MockCommandQueueHw : public CommandQueueHw<FamilyType> {
         using CommandQueueHw<FamilyType>::forceStateless;
+        using CommandQueueHw<FamilyType>::isForceStateless;
     };
 
     MockCommandQueueHw *pCmdQHw = reinterpret_cast<MockCommandQueueHw *>(pCmdQ);
+    pCmdQHw->isForceStateless = false;
     uint64_t bigSize = 4ull * MemoryConstants::gigaByte;
     EXPECT_TRUE(pCmdQHw->forceStateless(static_cast<size_t>(bigSize)));
 
     uint64_t smallSize = bigSize - 1;
     EXPECT_FALSE(pCmdQHw->forceStateless(static_cast<size_t>(smallSize)));
+}
+
+HWTEST_F(CommandQueueHwTest, givenSizeAndIsForceStatelessEnabledWhenForceStatelessIsCalledThenCorrectValueIsReturned) {
+
+    if (is32bit) {
+        GTEST_SKIP();
+    }
+
+    struct MockCommandQueueHw : public CommandQueueHw<FamilyType> {
+        using CommandQueueHw<FamilyType>::forceStateless;
+        using CommandQueueHw<FamilyType>::isForceStateless;
+    };
+
+    MockCommandQueueHw *pCmdQHw = reinterpret_cast<MockCommandQueueHw *>(pCmdQ);
+    pCmdQHw->isForceStateless = true;
+    uint64_t bigSize = 4ull * MemoryConstants::gigaByte;
+    EXPECT_TRUE(pCmdQHw->forceStateless(static_cast<size_t>(bigSize)));
+
+    uint64_t smallSize = bigSize - 1;
+    EXPECT_TRUE(pCmdQHw->forceStateless(static_cast<size_t>(smallSize)));
 }
 
 HWTEST_F(CommandQueueHwTest, givenFlushWhenFlushBatchedSubmissionsFailsThenErrorIsRetured) {
@@ -1204,17 +1287,17 @@ HWTEST_F(CommandQueueHwTest, givenFinishWhenFlushBatchedSubmissionsFailsThenErro
     MockCommandQueueHwWithOverwrittenCsr<FamilyType> cmdQueue(context, pClDevice, nullptr, false);
     MockCommandStreamReceiverWithFailingFlushBatchedSubmission csr(*pDevice->executionEnvironment, 0, pDevice->getDeviceBitfield());
     cmdQueue.csr = &csr;
-    cl_int errorCode = cmdQueue.finish();
+    cl_int errorCode = cmdQueue.finish(false);
     EXPECT_EQ(CL_OUT_OF_RESOURCES, errorCode);
 }
 
 HWTEST_F(CommandQueueHwTest, givenGpuHangWhenFinishingCommandQueueHwThenWaitForEnginesIsCalledAndOutOfResourcesIsReturned) {
     MockCommandQueueHw<FamilyType> mockCmdQueueHw{context, pClDevice, nullptr};
 
-    mockCmdQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCmdQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
     mockCmdQueueHw.getUltCommandStreamReceiver().shouldFlushBatchedSubmissionsReturnSuccess = true;
 
-    const auto finishResult = mockCmdQueueHw.finish();
+    const auto finishResult = mockCmdQueueHw.finish(false);
     EXPECT_EQ(1, mockCmdQueueHw.waitForAllEnginesCalledCount);
     EXPECT_EQ(CL_OUT_OF_RESOURCES, finishResult);
 }
@@ -1222,10 +1305,10 @@ HWTEST_F(CommandQueueHwTest, givenGpuHangWhenFinishingCommandQueueHwThenWaitForE
 HWTEST_F(CommandQueueHwTest, givenNoGpuHangWhenFinishingCommandQueueHwThenWaitForEnginesIsCalledAndSuccessIsReturned) {
     MockCommandQueueHw<FamilyType> mockCmdQueueHw{context, pClDevice, nullptr};
 
-    mockCmdQueueHw.waitForAllEnginesReturnValue = WaitStatus::Ready;
+    mockCmdQueueHw.waitForAllEnginesReturnValue = WaitStatus::ready;
     mockCmdQueueHw.getUltCommandStreamReceiver().shouldFlushBatchedSubmissionsReturnSuccess = true;
 
-    const auto finishResult = mockCmdQueueHw.finish();
+    const auto finishResult = mockCmdQueueHw.finish(false);
     EXPECT_EQ(1, mockCmdQueueHw.waitForAllEnginesCalledCount);
     EXPECT_EQ(CL_SUCCESS, finishResult);
 }
@@ -1245,24 +1328,238 @@ HWTEST_F(CommandQueueHwTest, givenRelaxedOrderingEnabledWhenCheckingIfAllowedByC
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(0));
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(1));
 
-    DebugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(1);
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(0));
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(1));
 
-    ultCsr.registerClient();
+    int client1, client2;
+    ultCsr.registerClient(&client1);
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(0));
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(1));
 
-    ultCsr.registerClient();
+    ultCsr.registerClient(&client2);
 
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(0));
     EXPECT_TRUE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(1));
 
-    DebugManager.flags.DirectSubmissionRelaxedOrdering.set(-1);
+    debugManager.flags.DirectSubmissionRelaxedOrdering.set(-1);
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(0));
     EXPECT_TRUE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(1));
 
     ultCsr.heapStorageRequiresRecyclingTag = true;
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(0));
     EXPECT_FALSE(mockCmdQueueHw.relaxedOrderingForGpgpuAllowed(1));
+}
+
+HWTEST_F(CommandQueueHwTest, givenBlockedCommandQueueWhenTransferOnCpuThenEnqueueMarkerIsNotCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = CompletionStamp::notReady;
+    size_t offset = 0;
+    size_t size = 4096u;
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(0, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    auto retEvent = reinterpret_cast<MockEvent<Event> *>(castToObject<Event>(returnEvent));
+    [[maybe_unused]] auto cmd = std::unique_ptr<Command>(retEvent->cmdToSubmit.exchange(nullptr));
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenCpuTransferIsBlockedThenEnqueueMarkerIsNotCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    auto mem = std::make_unique<uint8_t[]>(size);
+    buffer->hostPtr = mem.get();
+    buffer->memoryStorage = mem.get();
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, true, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(0, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenCpuTransferOperationIsOtherThanUnmapAndMemoryIsNotZeroCopyCommandThenEnqueueMarkerIsNotCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    buffer->isZeroCopy = false;
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    auto mem = std::make_unique<uint8_t[]>(size);
+    buffer->hostPtr = mem.get();
+    buffer->memoryStorage = mem.get();
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(0, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenOOQWhenCpuTransferIsCalledThenEnqueueMarkerIsNotCalled) {
+    cl_queue_properties ooqProperties[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0};
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, ooqProperties);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    auto mem = std::make_unique<uint8_t[]>(size);
+    buffer->hostPtr = mem.get();
+    buffer->memoryStorage = mem.get();
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(0, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenCommandQueueWhenOutEventIsNotPassedToCpuTransferThenEnqueueMarkerIsNotCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    auto mem = std::make_unique<uint8_t[]>(size);
+    buffer->hostPtr = mem.get();
+    buffer->memoryStorage = mem.get();
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, nullptr);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(0, commandQueue->enqueueMarkerWithWaitListCalledCount);
+}
+
+HWTEST_F(CommandQueueHwTest, givenNotBlockedIOQWhenCpuTransferIsNotBlockedOutEventPassedCommandTypeIsUnmapAndMemoryIsZeroCopyThenEnqueueMarkerIsCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_UNMAP_MEM_OBJECT, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+
+    auto returnPtr = ptrOffset(transferProperties.memObj->getCpuAddressForMapping(),
+                               transferProperties.memObj->calculateOffsetForMapping(transferProperties.offset, transferProperties.mipLevel) + transferProperties.mipPtrOffset);
+    transferProperties.memObj->addMappedPtr(returnPtr, transferProperties.memObj->calculateMappedPtrLength(transferProperties.size, transferProperties.mipLevel),
+                                            transferProperties.mapFlags, transferProperties.size, transferProperties.offset, transferProperties.mipLevel, nullptr);
+
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(1, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenNotBlockedIOQWhenCpuTransferIsBlockedOutEventPassedCommandTypeIsUnmapAndMemoryIsNotZeroCopyThenEnqueueMarkerIsCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    buffer->isZeroCopy = false;
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_UNMAP_MEM_OBJECT, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+
+    auto returnPtr = ptrOffset(transferProperties.memObj->getCpuAddressForMapping(),
+                               transferProperties.memObj->calculateOffsetForMapping(transferProperties.offset, transferProperties.mipLevel) + transferProperties.mipPtrOffset);
+    transferProperties.memObj->addMappedPtr(returnPtr, transferProperties.memObj->calculateMappedPtrLength(transferProperties.size, transferProperties.mipLevel),
+                                            transferProperties.mapFlags, transferProperties.size, transferProperties.offset, transferProperties.mipLevel, nullptr);
+
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(1, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenNotBlockedIOQWhenCpuTransferIsBlockedOutEventPassedCommandTypeIsOtherThanUnmapAndMemoryIsZeroCopyThenEnqueueMarkerIsCalled) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    cl_event returnEvent = nullptr;
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, &returnEvent);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(1, commandQueue->enqueueMarkerWithWaitListCalledCount);
+    clReleaseEvent(returnEvent);
+}
+
+HWTEST_F(CommandQueueHwTest, givenCpuMapOperationWhenCpuDataTransferHandlerCalledThenMapInfoStoresGraphicsAllocation) {
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    MockGraphicsAllocation alloc{};
+    auto buffer = std::make_unique<MockBuffer>(context, alloc);
+    auto mem = std::make_unique<uint8_t[]>(4096u);
+    buffer->hostPtr = mem.get();
+    buffer->memoryStorage = mem.get();
+    auto retVal = CL_SUCCESS;
+    commandQueue->taskLevel = 0u;
+    size_t offset = 0;
+    size_t size = 4096u;
+    TransferProperties transferProperties(buffer.get(), CL_COMMAND_MAP_BUFFER, 0, false, &offset, &size, nullptr, false, pDevice->getRootDeviceIndex());
+    EventsRequest eventsRequest(0, nullptr, nullptr);
+    commandQueue->cpuDataTransferHandler(transferProperties, eventsRequest, retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    MapInfo mapInfo{};
+    auto mappedPtr = buffer->getCpuAddressForMapping();
+    EXPECT_TRUE(buffer->findMappedPtr(mappedPtr, mapInfo));
+    EXPECT_EQ(&alloc, mapInfo.graphicsAllocation);
+    buffer->removeMappedPtr(mappedPtr);
+}
+
+HWTEST_F(CommandQueueHwTest, givenDirectSubmissionAndSharedDisplayableImageWhenReleasingSharedObjectThenFlushRenderStateCacheAndForceDcFlush) {
+    MockCommandQueueHw<FamilyType> mockCmdQueueHw{context, pClDevice, nullptr};
+    mockCmdQueueHw.updateLatestSentEnqueueType(EnqueueProperties::Operation::profilingOnly);
+    MockSharingHandler *mockSharingHandler = new MockSharingHandler;
+
+    auto &ultCsr = mockCmdQueueHw.getUltCommandStreamReceiver();
+    ultCsr.heapStorageRequiresRecyclingTag = false;
+
+    auto directSubmission = new MockDirectSubmissionHw<FamilyType, RenderDispatcher<FamilyType>>(ultCsr);
+    ultCsr.directSubmission.reset(directSubmission);
+
+    auto image = std::unique_ptr<Image>(ImageHelperUlt<Image2dDefaults>::create(context));
+    image->setSharingHandler(mockSharingHandler);
+    image->getGraphicsAllocation(0u)->setAllocationType(AllocationType::sharedImage);
+
+    cl_mem memObject = image.get();
+    cl_uint numObjects = 1;
+    cl_mem *memObjects = &memObject;
+
+    cl_int result = mockCmdQueueHw.enqueueAcquireSharedObjects(numObjects, memObjects, 0, nullptr, nullptr, 0);
+    EXPECT_EQ(result, CL_SUCCESS);
+    image->setIsDisplayable(true);
+
+    ultCsr.directSubmissionAvailable = true;
+    ultCsr.callBaseSendRenderStateCacheFlush = true;
+    EXPECT_FALSE(ultCsr.renderStateCacheFlushed);
+
+    const auto taskCountBefore = mockCmdQueueHw.taskCount + (ultCsr.heaplessPrologProgrammed ? 1u : 0u);
+    const auto finishCalledBefore = mockCmdQueueHw.finishCalledCount;
+    result = mockCmdQueueHw.enqueueReleaseSharedObjects(numObjects, memObjects, 0, nullptr, nullptr, 0);
+    EXPECT_EQ(result, CL_SUCCESS);
+    EXPECT_TRUE(ultCsr.renderStateCacheFlushed);
+    EXPECT_EQ(finishCalledBefore + 2u, mockCmdQueueHw.finishCalledCount);
+    EXPECT_EQ(taskCountBefore + 1u, mockCmdQueueHw.taskCount);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,29 +13,32 @@
 #include <fcntl.h>
 #include <iostream>
 #include <poll.h>
-#include <stdio.h>
 #include <string>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
 
 namespace NEO {
 
 namespace SysCalls {
-
-bool pathExists(const std::string &path) {
-    struct stat statbuf = {};
-
-    if (stat(path.c_str(), &statbuf) == -1) {
-        return false;
-    }
-
-    return (statbuf.st_mode & S_IFDIR) != 0;
+char **getEnviron() {
+    return environ;
 }
-
 void exit(int code) {
     std::exit(code);
 }
@@ -45,25 +48,68 @@ unsigned int getProcessId() {
     return pid;
 }
 
+unsigned int getCurrentProcessId() {
+    return getpid();
+}
+
+std::string getProcessName() {
+    char path[512] = {0};
+    auto result = ::readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (result == -1) {
+        return "";
+    }
+    path[result] = '\0';
+
+    std::string executablePath(path);
+    auto lastSeparator = executablePath.find_last_of('/');
+    if (lastSeparator != std::string::npos) {
+        return executablePath.substr(lastSeparator + 1u);
+    }
+    return executablePath;
+}
+
 unsigned long getNumThreads() {
     struct stat taskStat;
-    stat("/proc/self/task", &taskStat);
-    return taskStat.st_nlink - 2;
+    if (stat("/proc/self/task", &taskStat) == 0) {
+        return taskStat.st_nlink - 2;
+    }
+    return 0;
+}
+
+bool isShutdownInProgress() {
+    return false;
 }
 
 int mkdir(const std::string &path) {
     return ::mkdir(path.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 }
 
-int close(int fileDescriptor) {
-    return ::close(fileDescriptor);
+int rmdir(const std::string &path) {
+    return ::rmdir(path.c_str());
+}
+
+int close(int fd) {
+    return ::close(fd);
 }
 int open(const char *file, int flags) {
     return ::open(file, flags);
 }
+int ftruncate(int fd, off_t length) {
+    return ::ftruncate(fd, length);
+}
+
 int openWithMode(const char *file, int flags, int mode) {
     return ::open(file, flags, mode);
 }
+
+void sync() {
+    ::sync();
+}
+
+int fsync(int fd) {
+    return ::fsync(fd);
+}
+
 int ioctl(int fileDescriptor, unsigned long int request, void *arg) {
     return ::ioctl(fileDescriptor, request, arg);
 }
@@ -72,8 +118,12 @@ void *dlopen(const char *filename, int flag) {
     return ::dlopen(filename, flag);
 }
 
-int access(const char *pathName, int mode) {
-    return ::access(pathName, mode);
+int dlinfo(void *handle, int request, void *info) {
+    return ::dlinfo(handle, request, info);
+}
+
+int access(const std::string &pathName, int mode) {
+    return ::access(pathName.c_str(), mode);
 }
 
 int readlink(const char *path, char *buf, size_t bufsize) {
@@ -116,12 +166,36 @@ int munmap(void *addr, size_t size) noexcept {
     return ::munmap(addr, size);
 }
 
+void *mremapFixed(void *oldAddress, size_t size, void *newAddress) noexcept {
+    return ::mremap(oldAddress, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, newAddress);
+}
+
+void *mmapFixedNoReplace(void *address, size_t size) noexcept {
+    return ::mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+}
+
 ssize_t read(int fd, void *buf, size_t count) {
     return ::read(fd, buf, count);
 }
 
-ssize_t write(int fd, void *buf, size_t count) {
+ssize_t write(int fd, const void *buf, size_t count) {
     return ::write(fd, buf, count);
+}
+
+FILE *fdopen(int fd, const char *mode) {
+    return ::fdopen(fd, mode);
+}
+
+char *fgets(char *s, int size, FILE *stream) {
+    return ::fgets(s, size, stream);
+}
+
+int fclose(FILE *stream) {
+    return ::fclose(stream);
+}
+
+int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
+    return ::setvbuf(stream, buf, mode, size);
 }
 
 int fcntl(int fd, int cmd) {
@@ -165,6 +239,94 @@ int scandir(const char *dirp,
 
 int unlink(const std::string &pathname) {
     return ::unlink(pathname.c_str());
+}
+
+DIR *opendir(const char *name) {
+    return ::opendir(name);
+}
+
+struct dirent *readdir(DIR *dir) {
+    return ::readdir(dir);
+}
+
+int closedir(DIR *dir) {
+    return ::closedir(dir);
+}
+
+int pidfdopen(pid_t pid, unsigned int flags) {
+    long retval = ::syscall(SYS_pidfd_open, pid, flags);
+    return static_cast<int>(retval);
+}
+
+int pidfdgetfd(int pidfd, int targetfd, unsigned int flags) {
+    long retval = ::syscall(SYS_pidfd_getfd, pidfd, targetfd, flags);
+    return static_cast<int>(retval);
+}
+
+int prctl(int option, unsigned long arg) {
+    return ::prctl(option, arg);
+}
+
+off_t lseek(int fd, off_t offset, int whence) noexcept {
+    return ::lseek(fd, offset, whence);
+}
+long sysconf(int name) {
+    return ::sysconf(name);
+}
+int mkfifo(const char *pathname, mode_t mode) {
+    return ::mkfifo(pathname, mode);
+}
+
+int socket(int domain, int type, int protocol) {
+    return ::socket(domain, type, protocol);
+}
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    return ::bind(sockfd, addr, addrlen);
+}
+
+int listen(int sockfd, int backlog) {
+    return ::listen(sockfd, backlog);
+}
+
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    return ::accept(sockfd, addr, addrlen);
+}
+
+int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    return ::connect(sockfd, addr, addrlen);
+}
+
+ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
+    return ::send(sockfd, buf, len, flags);
+}
+
+ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
+    return ::recv(sockfd, buf, len, flags);
+}
+
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
+    return ::sendmsg(sockfd, msg, flags);
+}
+
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
+    return ::recvmsg(sockfd, msg, flags);
+}
+
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    return ::setsockopt(sockfd, level, optname, optval, optlen);
+}
+
+int dup(int oldfd) {
+    return ::dup(oldfd);
+}
+
+pid_t getpid() {
+    return ::getpid();
+}
+
+int getrlimit(int resource, struct rlimit *rlim) {
+    return ::getrlimit(resource, rlim);
 }
 
 } // namespace SysCalls

@@ -1,18 +1,25 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 namespace NEO {
+
+class ExecutionEnvironment;
 struct UltHwConfig {
+    const char *aubTestName = nullptr;
+    ExecutionEnvironment *sourceExecutionEnvironment = nullptr;
+
     bool mockedPrepareDeviceEnvironmentsFuncResult = true;
     bool useHwCsr = false;
     bool useMockedPrepareDeviceEnvironmentsFunc = true;
     bool forceOsAgnosticMemoryManager = true;
     bool useinitBuiltinsAsyncEnabled = false;
+    bool useGemCloseWorker = false;
     bool useWaitForTimestamps = false;
     bool useBlitSplit = false;
     bool useFirstSubmissionInitDevice = false;
@@ -26,6 +33,13 @@ struct UltHwConfig {
 
     bool csrBaseCallCreatePreemption = true;
     bool csrCreatePreemptionReturnValue = true;
+
+    bool recompileKernelsWhenL1PolicyMissmatch = false;
+
+    bool leoForwardingSelfLoad = true;
+    bool leoDetectionEnabled = false;
+
+    char padding[5];
 };
 
 extern UltHwConfig ultHwConfig;

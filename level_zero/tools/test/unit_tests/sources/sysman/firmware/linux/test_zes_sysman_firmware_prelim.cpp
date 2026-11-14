@@ -1,9 +1,11 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "level_zero/tools/source/sysman/firmware/firmware_imp.h"
 
 #include "mock_zes_sysman_firmware_prelim.h"
 
@@ -302,6 +304,19 @@ TEST_F(ZesSysmanFirmwareFixture, GivenNewFirmwareContextWithHandleSizeZeroWhenFi
     ze_result_t result = zesDeviceEnumFirmwares(device->toHandle(), &count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(3u, count);
+}
+
+TEST_F(ZesSysmanFirmwareFixture, GivenValidFirmwareHandleWhenGettingFirmwareFlashProgressThenUnsupportedIsReturned) {
+    initFirmware();
+
+    FirmwareImp *ptestFirmwareImp = new FirmwareImp(pSysmanDeviceImp->pFirmwareHandleContext->pOsSysman, mockSupportedFirmwareTypes[1]);
+    pSysmanDeviceImp->pFirmwareHandleContext->handleList.push_back(ptestFirmwareImp);
+
+    auto handles = getFirmwareHandles(mockFwHandlesCount);
+
+    uint32_t completionPercent = 0;
+
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesFirmwareGetFlashProgress(handles[1], &completionPercent));
 }
 
 class ZesFirmwareUninitializedFixture : public SysmanDeviceFixture {

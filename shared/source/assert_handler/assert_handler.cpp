@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,7 +16,7 @@
 namespace NEO {
 AssertHandler::AssertHandler(Device *device) : device(device) {
     auto rootDeviceIndex = device->getRootDeviceIndex();
-    assertBuffer = device->getMemoryManager()->allocateGraphicsMemoryWithProperties({rootDeviceIndex, assertBufferSize, AllocationType::ASSERT_BUFFER, device->getDeviceBitfield()});
+    assertBuffer = device->getMemoryManager()->allocateGraphicsMemoryWithProperties({rootDeviceIndex, assertBufferSize, AllocationType::assertBuffer, device->getDeviceBitfield()});
 
     AssertBufferHeader initialHeader = {};
     initialHeader.size = assertBufferSize;
@@ -35,22 +35,41 @@ bool AssertHandler::checkAssert() const {
 
 void AssertHandler::printMessage() const {
 
-    auto messageBuffer = ptrOffset(static_cast<uint8_t *>(assertBuffer->getUnderlyingBuffer()), offsetof(AssertBufferHeader, begin));
+    auto messageBuffer = static_cast<uint8_t *>(assertBuffer->getUnderlyingBuffer());
     auto messageBufferSize = static_cast<uint32_t>(assertBuffer->getUnderlyingBufferSize());
 
     NEO::PrintFormatter printfFormatter{
         messageBuffer,
-        messageBufferSize,
-        false,
-        nullptr};
+        messageBufferSize};
+    printfFormatter.setInitialOffset(offsetof(AssertBufferHeader, begin));
+
+    printToStderr("AssertHandler::printMessage\n");
     printfFormatter.printKernelOutput([](char *str) { printToStderr(str); });
 }
 
+void AssertHandler::resetAssertBuffer() {
+    auto header = reinterpret_cast<AssertBufferHeader *>(assertBuffer->getUnderlyingBuffer());
+    header->flags = 0;
+    header->begin = sizeof(AssertBufferHeader);
+}
+
 void AssertHandler::printAssertAndAbort() {
-    std::lock_guard<std::mutex> lock(this->mtx);
-    if (checkAssert()) {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    auto header = reinterpret_cast<AssertBufferHeader *>(assertBuffer->getUnderlyingBuffer());
+    bool hasMessages = header->begin > sizeof(AssertBufferHeader);
+    bool assertFired = checkAssert();
+
+    if (hasMessages) {
         printMessage();
+    }
+
+    resetAssertBuffer();
+
+    if (assertFired) {
+        device->stopDirectSubmissionAndWaitForCompletion();
         abortExecution();
     }
 }
+
 } // namespace NEO

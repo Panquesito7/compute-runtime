@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -60,6 +60,11 @@ constexpr uint32_t aubFile = 0;
 constexpr uint32_t tbx = 1;
 constexpr uint32_t aubFileAndTbx = 2;
 constexpr uint32_t tbxShm = 3;
+constexpr uint32_t tbxShm3 = 4;
+constexpr uint32_t tbxShm4 = 5;
+constexpr uint32_t null = 6;
+constexpr uint32_t aubFileAndShm = 7;
+constexpr uint32_t aubFileAndShm4 = 8;
 } // namespace mode
 
 namespace clearColorType {
@@ -68,13 +73,74 @@ constexpr uint32_t address = 1;
 } // namespace clearColorType
 
 using MMIOPair = std::pair<uint32_t, uint32_t>;
+struct MaskedMMIOWrite {
+    uint32_t offset;
+    uint32_t value;
+    uint32_t mask;
+
+    // Default constructor and constructor for direct initialization
+    MaskedMMIOWrite(uint32_t offset = 0, uint32_t value = 0, uint32_t mask = 0xFFFFFFFFu)
+        : offset(offset), value(value), mask(mask) {}
+
+    // Implicit conversion from MMIOPair (mask defaults to 0xFFFFFFFF)
+    MaskedMMIOWrite(const MMIOPair &pair)
+        : offset(pair.first), value(pair.second), mask(0xFFFFFFFFu) {}
+};
+
 using MMIOList = std::vector<MMIOPair>;
+using MaskedMMIOList = std::vector<MaskedMMIOWrite>;
 
 extern "C" void injectMMIOList(MMIOList mmioList);
+extern "C" void injectMaskedMMIOList(MaskedMMIOList maskedMmioList);
 extern "C" void setTbxServerPort(uint16_t port);
 extern "C" void setTbxServerIp(std::string server);
 extern "C" void setTbxFrontdoorMode(bool frontdoor);
+extern "C" void setAubStreamCaller(uint32_t caller);
 
-static_assert(std::is_pod<SurfaceInfo>::value, "SurfaceInfo is not POD type");
+extern "C" void injectMMIOListLegacy(MMIOList mmioList);
+extern "C" void setTbxServerIpLegacy(std::string server);
+
+namespace caller {
+constexpr uint32_t neo = 0;
+constexpr uint32_t rlr = 1;
+constexpr uint32_t rlc = 2;
+constexpr uint32_t rll = 3;
+constexpr uint32_t rl = 4;
+} // namespace caller
+
+namespace hardwareContextFlags {
+constexpr uint32_t contextGroup = 1 << 15;
+constexpr uint32_t highPriority = 1 << 14;
+constexpr uint32_t lowPriority = 1 << 13;
+constexpr uint32_t runAlone = 1 << 0;
+} // namespace hardwareContextFlags
+
+namespace hardwareContextId {
+constexpr uint32_t invalidContextId = -1;
+}
+
+struct CreateHardwareContext2Params {
+    uint32_t contextId;
+    uint32_t primaryContextId = hardwareContextId::invalidContextId;
+};
+
+struct HardwareContextParamsHeader {
+    uint32_t version = 1;
+    uint32_t size = 0;
+};
+
+struct CreateHardwareContext3Params {
+    HardwareContextParamsHeader header;
+    uint32_t device;
+    uint32_t engine;
+    uint32_t flags;
+    uint32_t contextId;
+    uint32_t primaryContextId = hardwareContextId::invalidContextId;
+    uint32_t priority;
+};
+
+static_assert(std::is_standard_layout_v<SurfaceInfo> && std::is_trivial_v<SurfaceInfo> && std::is_trivially_copyable_v<SurfaceInfo>, "SurfaceInfo is not POD type");
+static_assert(std::is_standard_layout_v<CreateHardwareContext2Params>, "CreateHardwareContext2Params is not standard layout type");
+static_assert(std::is_standard_layout_v<CreateHardwareContext3Params>, "CreateHardwareContext3Params is not standard layout type");
 
 } // namespace aub_stream

@@ -1,0 +1,31 @@
+/*
+ * Copyright (C) 2019-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "igc.opencl.h"
+
+#include <cstdint>
+
+namespace Os {
+// Compiler library names
+const char *frontEndDllName = FCL_LIBRARY_NAME;
+const char *igcDllName = IGC_LIBRARY_NAME;
+const char *libvaDllName = "libva.so.2";
+const char *gdiDllName = "/usr/lib/wsl/lib/libdxcore.so";
+const char *dxcoreDllName = "/usr/lib/wsl/lib/libdxcore.so";
+
+const char *sysFsPciPathPrefix = "/sys/bus/pci/devices/";
+const char *pciDevicesDirectory = "/dev/dri/by-path";
+const char *sysFsProcPathPrefix = "/proc";
+const char *sysFsSystemCpuPathPrefix = "/sys/devices/system/cpu";
+
+// Metrics Library name
+const char *metricsLibraryDllName = "libigdml.so.1";
+} // namespace Os
+
+namespace ContextGroup {
+uint32_t maxContextCount = 64;
+}

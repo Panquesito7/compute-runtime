@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/patch_store_operation.h"
 #include "shared/source/helpers/ptr_math.h"
 
 #include "gtest/gtest.h"
@@ -36,6 +37,15 @@ TEST(PtrMath, WhenConvertingAddressToPtrThenPtrIsCorrect) {
 
     EXPECT_EQ(ptr32BitAddr, addrToPtr(addr32Bit));
     EXPECT_EQ(ptr64BitAddr, addrToPtr(addr64Bit));
+}
+
+TEST(PtrMath, given64bValueWhenConvertingToHighAndLowThenReturnCorrectValues) {
+    const uint32_t low = 0x98765432;
+    const uint32_t high = 0x12345678;
+    const uint64_t value = (static_cast<uint64_t>(high) << 32) | low;
+
+    EXPECT_EQ(low, getLowPart(value));
+    EXPECT_EQ(high, getHighPart(value));
 }
 
 TEST(PtrMath, givenCastToUint64FunctionWhenItIsCalledThenProperValueIsReturned) {
@@ -82,4 +92,21 @@ TEST(ptrDiff, WhenGettingPtrDiffThen64BitIsPreserved) {
 
     auto ptrBefore3 = ptrDiff(ptrAfter, 0x1234ull);
     EXPECT_EQ(0x800000000ull, ptrBefore3);
+}
+
+TEST(ByteRangeContains, WhenInRangeThenReturnTrue) {
+    char stack[3] = {};
+    EXPECT_TRUE(byteRangeContains(stack, 3, &stack[0]));
+    EXPECT_TRUE(byteRangeContains(stack, 3, &stack[1]));
+    EXPECT_TRUE(byteRangeContains(stack, 3, &stack[2]));
+}
+
+TEST(ByteRangeContains, WhenNotInRangeThenReturnFalse) {
+    char stack[3] = {};
+    std::vector<char> heap(3, 0);
+    EXPECT_FALSE(byteRangeContains(stack + 1, 1, &stack[2]));
+    EXPECT_FALSE(byteRangeContains(stack + 1, 1, &stack[0]));
+    EXPECT_FALSE(byteRangeContains(stack, 3, &heap[0]));
+    EXPECT_FALSE(byteRangeContains(stack, 3, &heap[1]));
+    EXPECT_FALSE(byteRangeContains(stack, 3, &heap[2]));
 }

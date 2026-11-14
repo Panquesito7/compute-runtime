@@ -1,145 +1,109 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "os_metric_ip_sampling_imp_linux.h"
+
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/engine_info.h"
-#include "shared/source/os_interface/linux/i915.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
 
 #include "level_zero/core/source/device/device.h"
-#include "level_zero/core/source/device/device_imp.h"
-#include "level_zero/tools/source/metrics/os_metric_ip_sampling.h"
+#include "level_zero/tools/source/metrics/metric.h"
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 namespace L0 {
 
-constexpr uint32_t maxDssBufferSize = 512 * KB;
-constexpr uint32_t defaultPollPeriodNs = 10000000u;
-constexpr uint32_t unitReportSize = 64u;
-
-class MetricIpSamplingLinuxImp : public MetricIpSamplingOsInterface {
-  public:
-    MetricIpSamplingLinuxImp(Device &device);
-    ~MetricIpSamplingLinuxImp() override = default;
-    ze_result_t startMeasurement(uint32_t &notifyEveryNReports, uint32_t &samplingPeriodNs) override;
-    ze_result_t stopMeasurement() override;
-    ze_result_t readData(uint8_t *pRawData, size_t *pRawDataSize) override;
-    uint32_t getRequiredBufferSize(const uint32_t maxReportCount) override;
-    uint32_t getUnitReportSize() override;
-    bool isNReportsAvailable() override;
-    bool isDependencyAvailable() override;
-
-  private:
-    int32_t stream = -1;
-    Device &device;
-
-    ze_result_t getNearestSupportedSamplingUnit(uint32_t &samplingPeriodNs, uint32_t &samplingRate);
-};
-
 MetricIpSamplingLinuxImp::MetricIpSamplingLinuxImp(Device &device) : device(device) {}
-
-ze_result_t MetricIpSamplingLinuxImp::getNearestSupportedSamplingUnit(uint32_t &samplingPeriodNs, uint32_t &samplingUnit) {
-
-    static constexpr uint64_t nsecPerSec = 1000000000ull;
-    static constexpr uint32_t samplingClockGranularity = 251u;
-    static constexpr uint32_t minSamplingUnit = 1u;
-    static constexpr uint32_t maxSamplingUnit = 7u;
-    const auto drm = device.getOsInterface().getDriverModel()->as<NEO::Drm>();
-    int32_t gpuTimeStampfrequency = 0;
-    int32_t ret = drm->getTimestampFrequency(gpuTimeStampfrequency);
-    if (ret < 0 || gpuTimeStampfrequency == 0) {
-        return ZE_RESULT_ERROR_UNKNOWN;
-    }
-
-    uint64_t gpuClockPeriodNs = nsecPerSec / static_cast<uint64_t>(gpuTimeStampfrequency);
-    uint64_t numberOfClocks = samplingPeriodNs / gpuClockPeriodNs;
-
-    samplingUnit = std::clamp(static_cast<uint32_t>(numberOfClocks / samplingClockGranularity), minSamplingUnit, maxSamplingUnit);
-    samplingPeriodNs = samplingUnit * samplingClockGranularity * static_cast<uint32_t>(gpuClockPeriodNs);
-    return ZE_RESULT_SUCCESS;
-}
 
 ze_result_t MetricIpSamplingLinuxImp::startMeasurement(uint32_t &notifyEveryNReports, uint32_t &samplingPeriodNs) {
 
-    const auto drm = device.getOsInterface().getDriverModel()->as<NEO::Drm>();
-
-    uint32_t samplingUnit = 0;
-    if (getNearestSupportedSamplingUnit(samplingPeriodNs, samplingUnit) != ZE_RESULT_SUCCESS) {
-        return ZE_RESULT_ERROR_UNKNOWN;
+    const auto drm = device.getOsInterface()->getDriverModel()->as<NEO::Drm>();
+    // gpuTimeStampfrequency will be in Hertz
+    uint64_t gpuTimeStampfrequency = 0;
+    ze_result_t ret = getMetricsTimerResolution(gpuTimeStampfrequency);
+    if (ret != ZE_RESULT_SUCCESS) {
+        return ret;
     }
-
-    DeviceImp &deviceImp = static_cast<DeviceImp &>(device);
 
     auto ioctlHelper = drm->getIoctlHelper();
     uint32_t euStallFdParameter = ioctlHelper->getEuStallFdParameter();
-    std::array<uint64_t, 12u> properties;
     auto engineInfo = drm->getEngineInfo();
     if (engineInfo == nullptr) {
+        METRICS_LOG_ERR("%s", "Engine info is not available");
         return ZE_RESULT_ERROR_UNKNOWN;
     }
-    auto classInstance = engineInfo->getEngineInstance(deviceImp.getPhysicalSubDeviceId(), aub_stream::ENGINE_CCS);
+    auto classInstance = engineInfo->getEngineInstance(device.getPhysicalSubDeviceId(), aub_stream::ENGINE_CCS);
     if (classInstance == nullptr) {
+        METRICS_LOG_ERR("%s", "Compute engine instance is not available");
         return ZE_RESULT_ERROR_UNKNOWN;
     }
 
-    notifyEveryNReports = std::max(notifyEveryNReports, 1u);
-
-    if (!ioctlHelper->getEuStallProperties(properties, maxDssBufferSize, samplingUnit, defaultPollPeriodNs,
-                                           classInstance->engineInstance, notifyEveryNReports)) {
+    if (ze_result_t clampResult = clampNReports(notifyEveryNReports); clampResult != ZE_RESULT_SUCCESS) {
+        return clampResult;
+    }
+    if (!ioctlHelper->perfOpenEuStallStream(euStallFdParameter, samplingPeriodNs, classInstance->engineInstance, notifyEveryNReports, gpuTimeStampfrequency, &stream)) {
+        METRICS_LOG_ERR("%s", "Failed to open EU stall stream");
         return ZE_RESULT_ERROR_UNKNOWN;
     }
 
-    struct drm_i915_perf_open_param param = {
-        .flags = I915_PERF_FLAG_FD_CLOEXEC |
-                 euStallFdParameter |
-                 I915_PERF_FLAG_FD_NONBLOCK,
-        .num_properties = sizeof(properties) / 16,
-        .properties_ptr = reinterpret_cast<uintptr_t>(properties.data()),
-    };
+    return ZE_RESULT_SUCCESS;
+}
 
-    stream = NEO::SysCalls::ioctl(drm->getFileDescriptor(), DRM_IOCTL_I915_PERF_OPEN, &param);
-    if (stream < 0) {
+ze_result_t MetricIpSamplingLinuxImp::clampNReports(uint32_t &notifyEveryNReports) {
+    const auto drm = device.getOsInterface()->getDriverModel()->as<NEO::Drm>();
+    const int64_t perXeCoreMaxReports = drm->getIoctlHelper()->getEuStallMaxReportsPerXeCore();
+    if (perXeCoreMaxReports < 0) {
+        // The KMD exposes the capacity query but it failed; we cannot tell whether the request will
+        // be accepted, and the static estimate does not match a query-capable xe KMD. Fail rather
+        // than risk a stream open the KMD will reject.
+        METRICS_LOG_ERR("%s", "Failed to query EU stall max reports per Xe-core");
         return ZE_RESULT_ERROR_UNKNOWN;
     }
-
-    auto ret = NEO::SysCalls::ioctl(stream, I915_PERF_IOCTL_ENABLE, 0);
-    PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get() && (ret < 0), stderr,
-                       "PRELIM_I915_PERF_IOCTL_ENABLE failed errno = %d | ret = %d \n", errno, ret);
-
-    return (ret == 0) ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_UNKNOWN;
+    if (perXeCoreMaxReports == 0) {
+        // No KMD capacity query (i915 or an older xe KMD): clamp to the static buffer estimate,
+        // matching long-standing pre-query behaviour.
+        notifyEveryNReports = clampToMaxSupportedReports(notifyEveryNReports);
+        return ZE_RESULT_SUCCESS;
+    }
+    const auto &hwInfo = device.getNEODevice()->getHardwareInfo();
+    // The EU-stall buffer is allocated per Xe-core, so device-wide capacity is the per-Xe-core
+    // report count scaled by the number of Xe-cores. A Xe-core maps to a DualSubSlice, and on the
+    // Linux topology path NEO sets DualSubSliceCount == SubSliceCount == subSliceCount
+    // (drm_neo.cpp), so this holds on platforms where gmmlib leaves DualSubSliceCount unset. A live
+    // device always has at least one enabled Xe-core; a zero count means the topology query is
+    // broken, which is an unrecoverable invariant violation rather than something to paper over.
+    UNRECOVERABLE_IF(hwInfo.gtSystemInfo.DualSubSliceCount == 0);
+    const uint64_t maxReports = static_cast<uint64_t>(perXeCoreMaxReports) * hwInfo.gtSystemInfo.DualSubSliceCount;
+    notifyEveryNReports = static_cast<uint32_t>(std::min<uint64_t>(notifyEveryNReports,
+                                                                   std::min<uint64_t>(maxReports, std::numeric_limits<uint32_t>::max())));
+    return ZE_RESULT_SUCCESS;
 }
 
 ze_result_t MetricIpSamplingLinuxImp::stopMeasurement() {
+    const auto drm = device.getOsInterface()->getDriverModel()->as<NEO::Drm>();
+    auto ioctlHelper = drm->getIoctlHelper();
+    bool result = ioctlHelper->perfDisableEuStallStream(&stream);
 
-    int disableStatus = NEO::SysCalls::ioctl(stream, I915_PERF_IOCTL_DISABLE, 0);
-    PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get() && (disableStatus < 0), stderr,
-                       "I915_PERF_IOCTL_DISABLE failed errno = %d | ret = %d \n", errno, disableStatus);
-
-    int closeStatus = NEO::SysCalls::close(stream);
-    PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get() && (closeStatus < 0), stderr,
-                       "close() failed errno = %d | ret = %d \n", errno, closeStatus);
-    stream = -1;
-
-    return ((closeStatus == 0) && (disableStatus == 0)) ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_UNKNOWN;
+    return result ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_UNKNOWN;
 }
 
 ze_result_t MetricIpSamplingLinuxImp::readData(uint8_t *pRawData, size_t *pRawDataSize) {
 
     ssize_t ret = NEO::SysCalls::read(stream, pRawData, *pRawDataSize);
-    PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get() && (ret < 0), stderr, "read() failed errno = %d | ret = %d \n",
-                       errno, ret);
-
     if (ret >= 0) {
         *pRawDataSize = ret;
         return ZE_RESULT_SUCCESS;
@@ -149,8 +113,15 @@ ze_result_t MetricIpSamplingLinuxImp::readData(uint8_t *pRawData, size_t *pRawDa
 
     // If read needs to try again, do not return error
     if (errno == EINTR || errno == EAGAIN || errno == EBUSY) {
+        METRICS_LOG_INFO("read() needs to try again. errno = %d ", errno);
         return ZE_RESULT_SUCCESS;
+    } else if (errno == EIO) {
+        // on i915 EIO is not returned by KMD for any error conditions. Hence we can use this safely for both xe and i915.
+        METRICS_LOG_INFO("Some data was lost during read(). errno = %d ", errno);
+        return ZE_RESULT_WARNING_DROPPED_DATA;
     }
+
+    METRICS_LOG_ERR("read() failed errno = %d | ret = %d", errno, ret);
 
     return ZE_RESULT_ERROR_UNKNOWN;
 }
@@ -177,8 +148,9 @@ bool MetricIpSamplingLinuxImp::isNReportsAvailable() {
     pollParams.events = POLLIN;
 
     int32_t pollResult = NEO::SysCalls::poll(&pollParams, 1, 0u);
-    PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get() && (pollResult < 0), stderr, "poll() failed errno = %d | pollResult = %d \n",
-                       errno, pollResult);
+    if (pollResult < 0) {
+        METRICS_LOG_ERR("poll() failed errno = %d | pollResult = %d", errno, pollResult);
+    }
 
     if (pollResult > 0) {
         return true;
@@ -186,23 +158,27 @@ bool MetricIpSamplingLinuxImp::isNReportsAvailable() {
     return false;
 }
 
-bool MetricIpSamplingLinuxImp::isDependencyAvailable() {
+bool MetricIpSamplingLinuxImp::isOsSupportAvailable() {
+    const auto drm = device.getOsInterface()->getDriverModel()->as<NEO::Drm>();
+    auto ioctlHelper = drm->getIoctlHelper();
+    return ioctlHelper->isEuStallSupported();
+}
 
-    const auto &hardwareInfo = device.getNEODevice()->getHardwareInfo();
-    const auto &productHelper = device.getNEODevice()->getProductHelper();
+ze_result_t MetricIpSamplingLinuxImp::getMetricsTimerResolution(uint64_t &timerResolution) {
+    ze_result_t result = ZE_RESULT_SUCCESS;
 
-    if (!productHelper.isIpSamplingSupported(hardwareInfo)) {
-        return false;
+    const auto drm = device.getOsInterface()->getDriverModel()->as<NEO::Drm>();
+    int32_t gpuTimeStampfrequency = 0;
+    int32_t ret = drm->getTimestampFrequency(gpuTimeStampfrequency);
+    if (ret < 0 || gpuTimeStampfrequency == 0) {
+        timerResolution = 0;
+        result = ZE_RESULT_ERROR_UNKNOWN;
+        METRICS_LOG_ERR("getTimestampFrequency() failed errno = %d | ret = %d", errno, ret);
+    } else {
+        timerResolution = static_cast<uint64_t>(gpuTimeStampfrequency);
     }
 
-    uint32_t notifyEveryNReports = 1u;
-    uint32_t samplingPeriod = 100;
-
-    ze_result_t status = startMeasurement(notifyEveryNReports, samplingPeriod);
-    if (stream != -1) {
-        stopMeasurement();
-    }
-    return status == ZE_RESULT_SUCCESS ? true : false;
+    return result;
 }
 
 std::unique_ptr<MetricIpSamplingOsInterface> MetricIpSamplingOsInterface::create(Device &device) {

@@ -1,0 +1,107 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/driver_model_type.h"
+#include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/ipc_socket_server.h"
+#include "shared/source/os_interface/linux/sys_calls.h"
+#include "shared/source/os_interface/os_interface.h"
+
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+
+namespace NEO {
+
+void IpcSocketServerDeleter::operator()(IpcSocketServer *ptr) const {
+    delete ptr;
+}
+
+} // namespace NEO
+
+namespace L0 {
+
+bool DriverHandle::isFabricAccessSupported() {
+    if (this->devices.empty() || this->devices.front() == nullptr) {
+        return false;
+    }
+
+    auto *osInterface = this->devices.front()->getOsInterface();
+    if (osInterface == nullptr ||
+        osInterface->getDriverModel()->getDriverModelType() != NEO::DriverModelType::drm) {
+        return false;
+    }
+
+    return osInterface->getDriverModel()->as<NEO::Drm>()->isFabricAccessSupported();
+}
+
+bool DriverHandle::initializeIpcSocketServer() {
+    std::lock_guard<std::mutex> lock(ipcSocketServerMutex);
+
+    if (ipcSocketServer && ipcSocketServer->isRunning()) {
+        return true;
+    }
+
+    ipcSocketServer.reset(new NEO::IpcSocketServer());
+    if (!ipcSocketServer->initialize()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "DriverHandle: Failed to initialize IPC socket server\n");
+        ipcSocketServer.reset();
+        return false;
+    }
+
+    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                 "DriverHandle: IPC socket server initialized at %s\n",
+                 ipcSocketServer->getSocketPath().c_str());
+    return true;
+}
+
+void DriverHandle::shutdownIpcSocketServer() {
+    std::lock_guard<std::mutex> lock(ipcSocketServerMutex);
+    if (ipcSocketServer) {
+        ipcSocketServer->shutdown();
+        ipcSocketServer.reset();
+    }
+}
+
+bool DriverHandle::registerIpcHandleWithServer(uint64_t handleId, int fd) {
+    std::lock_guard<std::mutex> lock(ipcSocketServerMutex);
+
+    if (!ipcSocketServer || !ipcSocketServer->isRunning()) {
+        return false;
+    }
+
+    return ipcSocketServer->registerHandle(handleId, fd);
+}
+
+bool DriverHandle::unregisterIpcHandleWithServer(uint64_t handleId) {
+    std::lock_guard<std::mutex> lock(ipcSocketServerMutex);
+
+    if (!ipcSocketServer || !ipcSocketServer->isRunning()) {
+        return false;
+    }
+
+    return ipcSocketServer->unregisterHandle(handleId);
+}
+
+std::string DriverHandle::getIpcSocketServerPath() {
+    std::lock_guard<std::mutex> lock(ipcSocketServerMutex);
+    if (ipcSocketServer && ipcSocketServer->isRunning()) {
+        return ipcSocketServer->getSocketPath();
+    }
+    return "";
+}
+
+int DriverHandle::duplicateFd(int fd) {
+    return NEO::SysCalls::dup(fd);
+}
+
+void DriverHandle::closeFd(int fd) {
+    NEO::SysCalls::close(fd);
+}
+
+} // namespace L0

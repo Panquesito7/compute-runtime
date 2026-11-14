@@ -1,0 +1,59 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+
+#include "level_zero/core/source/driver/base_driver.h"
+#include "level_zero/zes_intel_gpu_sysman.h"
+#include <level_zero/ze_api.h>
+#include <level_zero/zes_api.h>
+
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace NEO {
+class ExecutionEnvironment;
+}
+
+namespace L0 {
+namespace Sysman {
+
+struct SysmanDriverHandle : BaseDriver, NEO::NonCopyableAndNonMovableClass {
+    static constexpr uint32_t initialDriverVersionValue = 0x01030000;
+
+    static SysmanDriverHandle *fromHandle(zes_driver_handle_t handle);
+    static zes_intel_api_version_exp_t getSupportedApiVersion();
+    inline zes_driver_handle_t toHandle() { return this; }
+
+    static SysmanDriverHandle *create(NEO::ExecutionEnvironment &executionEnvironment, ze_result_t *returnValue);
+    static SysmanDriverHandle *createDeferred(NEO::ExecutionEnvironment &executionEnvironment, ze_result_t *returnValue);
+    virtual ze_result_t getDeviceByUuid(zes_uuid_t uuid, zes_device_handle_t *phDevice, ze_bool_t *onSubdevice, uint32_t *subdeviceId) = 0;
+    virtual ze_result_t getDevice(uint32_t *pCount, zes_device_handle_t *phDevices) = 0;
+    virtual ze_result_t getExtensionProperties(uint32_t *pCount, zes_driver_extension_properties_t *pExtensionProperties,
+                                               const std::vector<std::pair<std::string, uint32_t>> &extensionsSupported) = 0;
+    virtual ze_result_t sysmanEventsListen(uint32_t timeout, uint32_t count, zes_device_handle_t *phDevices,
+                                           uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents) = 0;
+    virtual ze_result_t sysmanEventsListenEx(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices,
+                                             uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents) = 0;
+    virtual ze_result_t sysmanDriverEventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices,
+                                                 uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents,
+                                                 zes_event_type_flags_t *pDriverEvents) = 0;
+    virtual ze_result_t driverEventRegister(zes_event_type_flags_t events) = 0;
+    virtual ze_result_t enumInfoLogs(uint32_t *pCount, zes_info_log_handle_t *phInfoLogs) = 0;
+    virtual ze_result_t getDeviceRescan(uint32_t *pCount, zes_device_handle_t *phDevices) = 0;
+    virtual ze_result_t getApiVersion(zes_intel_api_version_exp_t *pVersion) = 0;
+    virtual ze_result_t getDriverProperties(zes_driver_properties_t *pProperties) = 0;
+    virtual ze_result_t getPciDeviceProperties(uint32_t *pCount, zes_driver_pci_device_properties_t *pProperties) = 0;
+};
+
+static_assert(NEO::NonCopyableAndNonMovable<SysmanDriverHandle>);
+
+} // namespace Sysman
+} // namespace L0

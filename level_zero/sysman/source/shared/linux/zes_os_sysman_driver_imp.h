@@ -1,0 +1,85 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include "level_zero/sysman/source/driver/os_sysman_driver.h"
+#include "level_zero/sysman/source/shared/linux/udev/udev_lib.h"
+
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace NEO {
+class HwDeviceId;
+struct PhysicalDevicePciBusInfo;
+} // namespace NEO
+
+namespace L0 {
+namespace Sysman {
+
+class DrmNlApi;
+class LinuxEventsUtil;
+struct InfoLogHandleContext;
+struct SysmanDevice;
+struct SysmanDeviceImp;
+struct SysmanDriverHandleImp;
+class UdevLib;
+
+class LinuxSysmanDriverImp : public OsSysmanDriver, NEO::NonCopyableAndNonMovableClass {
+  public:
+    LinuxSysmanDriverImp();
+    ~LinuxSysmanDriverImp() override;
+
+    LinuxSysmanDriverImp(const LinuxSysmanDriverImp &) = delete;
+    LinuxSysmanDriverImp(LinuxSysmanDriverImp &&) = delete;
+    LinuxSysmanDriverImp &operator=(const LinuxSysmanDriverImp &) = delete;
+    LinuxSysmanDriverImp &operator=(LinuxSysmanDriverImp &&) = delete;
+
+    ze_result_t eventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents) override;
+    ze_result_t driverEventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents, zes_event_type_flags_t *pDriverEvents) override;
+    ze_result_t driverEventRegister(zes_event_type_flags_t events) override;
+    ze_result_t enumInfoLogs(uint32_t *pCount, zes_info_log_handle_t *phInfoLogs) override;
+    ze_result_t rescanDevices(SysmanDriverHandleImp *driverHandle, uint32_t *pCount, zes_device_handle_t *phDevices) override;
+    ze_result_t getPciDeviceProperties(uint32_t *pCount, zes_driver_pci_device_properties_t *pProperties) override;
+    MOCKABLE_VIRTUAL std::vector<zes_pci_address_t> getPciDeviceAddresses();
+    MOCKABLE_VIRTUAL ze_result_t getPciBdfForHwDevice(NEO::HwDeviceId *hwDeviceId, std::string &pciBdf);
+    MOCKABLE_VIRTUAL ze_result_t getPciUuidForHwDevice(NEO::HwDeviceId *hwDeviceId, std::string &pciUuid);
+    MOCKABLE_VIRTUAL ze_result_t updateHwDeviceId(SysmanDevice *sysmanDevice, NEO::HwDeviceId *hwDeviceId);
+    MOCKABLE_VIRTUAL ze_result_t reinitDeviceCachedInfo(SysmanDevice *sysmanDevice, NEO::HwDeviceId *hwDeviceId);
+    static SysmanDevice *getSysmanDeviceByPciUuid(const SysmanDriverHandleImp *driverHandle, const std::string &pciUuid);
+    static SysmanDevice *getSysmanDeviceByPciBusInfo(const SysmanDriverHandleImp *driverHandle, const NEO::PhysicalDevicePciBusInfo &pciBusInfo);
+    static void removeLostSysmanDevices(SysmanDriverHandleImp *driverHandle, const std::vector<SysmanDevice *> &foundDevices);
+    void eventRegister(zes_event_type_flags_t events, SysmanDeviceImp *pSysmanDevice);
+    L0::Sysman::UdevLib *getUdevLibHandle();
+    DrmNlApi *getDrmNlApiHandle();
+    static DrmNlApi *createDrmNlApi();
+    static void destroyDrmNlApi(DrmNlApi *pDrmNl);
+
+    void registerCperTracePipeFd(int fd);
+    void unregisterCperTracePipeFd(int fd);
+    MOCKABLE_VIRTUAL std::vector<int> getCperTracePipeFds() const;
+    MOCKABLE_VIRTUAL int getCperTracePipeFd() const;
+    void clearCperTracePipeFds();
+
+  protected:
+    L0::Sysman::UdevLib *pUdevLib = nullptr;
+    DrmNlApi *pDrmNl = nullptr;
+    L0::Sysman::LinuxEventsUtil *pLinuxEventsUtil = nullptr;
+    InfoLogHandleContext *pInfoLogHandleContext = nullptr;
+    std::vector<int> cperTracePipeFds;
+    mutable std::mutex cperFdsMutex;
+
+  private:
+    void netlinkCleanup();
+};
+
+} // namespace Sysman
+} // namespace L0

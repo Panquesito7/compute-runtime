@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,12 +10,14 @@
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include "level_zero/tools/source/sysman/fabric_port/fabric_port.h"
-#include "level_zero/tools/source/sysman/fabric_port/os_fabric_port.h"
 #include <level_zero/zes_api.h>
 
 namespace L0 {
+class OsFabricDevice;
+class OsFabricPort;
+struct OsSysman;
 
-class FabricDeviceImp : public FabricDevice, NEO::NonCopyableOrMovableClass {
+class FabricDeviceImp : public FabricDevice, NEO::NonCopyableAndNonMovableClass {
   public:
     FabricDeviceImp() = delete;
     FabricDeviceImp(OsSysman *pOsSysman);
@@ -27,7 +29,7 @@ class FabricDeviceImp : public FabricDevice, NEO::NonCopyableOrMovableClass {
     OsFabricDevice *pOsFabricDevice = nullptr;
 };
 
-class FabricPortImp : public FabricPort, NEO::NonCopyableOrMovableClass {
+class FabricPortImp : public FabricPort, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t fabricPortGetProperties(zes_fabric_port_properties_t *pProperties) override;
     ze_result_t fabricPortGetLinkType(zes_fabric_link_type_t *pLinkType) override;
@@ -35,6 +37,7 @@ class FabricPortImp : public FabricPort, NEO::NonCopyableOrMovableClass {
     ze_result_t fabricPortSetConfig(const zes_fabric_port_config_t *pConfig) override;
     ze_result_t fabricPortGetState(zes_fabric_port_state_t *pState) override;
     ze_result_t fabricPortGetThroughput(zes_fabric_port_throughput_t *pThroughput) override;
+    ze_result_t fabricPortGetErrorCounters(zes_fabric_port_error_counters_t *pErrors) override;
 
     FabricPortImp() = delete;
     FabricPortImp(FabricDevice *pFabricDevice, uint32_t portNum);

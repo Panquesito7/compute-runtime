@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,19 +7,16 @@
 
 #include "opencl/test/unit_test/fixtures/kernel_arg_fixture.h"
 
-#include "shared/source/helpers/api_specific_config.h"
-#include "shared/source/program/kernel_info.h"
-
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
-#include "opencl/test/unit_test/mocks/mock_image.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_program.h"
 
 using namespace NEO;
 
 KernelImageArgTest::~KernelImageArgTest() = default;
+KernelImageArgTest::KernelImageArgTest() = default;
 
 void KernelImageArgTest::SetUp() {
     pKernelInfo = std::make_unique<MockKernelInfo>();
@@ -33,10 +30,6 @@ void KernelImageArgTest::SetUp() {
     pKernelInfo->addArgImage(0, 0);
     auto &img0 = pKernelInfo->argAsImg(0);
     img0.metadataPayload.imgWidth = 0x4;
-    img0.metadataPayload.flatBaseOffset = 0x8;
-    img0.metadataPayload.flatWidth = 0x10;
-    img0.metadataPayload.flatHeight = 0x18;
-    img0.metadataPayload.flatPitch = 0x24;
     img0.metadataPayload.numSamples = 0x3c;
     img0.metadataPayload.numMipLevels = offsetNumMipLevelsImage0;
 
@@ -49,8 +42,8 @@ void KernelImageArgTest::SetUp() {
 
     pKernelInfo->addArgImage(4, 0x20);
 
-    pKernelInfo->kernelDescriptor.kernelAttributes.bufferAddressingMode = ApiSpecificConfig::getBindlessMode() ? KernelDescriptor::AddressingMode::BindlessAndStateless : KernelDescriptor::AddressingMode::BindfulAndStateless;
-    pKernelInfo->kernelDescriptor.kernelAttributes.imageAddressingMode = ApiSpecificConfig::getBindlessMode() ? KernelDescriptor::AddressingMode::Bindless : KernelDescriptor::AddressingMode::Bindful;
+    pKernelInfo->kernelDescriptor.kernelAttributes.bufferAddressingMode = debugManager.flags.UseBindlessMode.get() == 1 ? KernelDescriptor::AddressingMode::BindlessAndStateless : KernelDescriptor::AddressingMode::BindfulAndStateless;
+    pKernelInfo->kernelDescriptor.kernelAttributes.imageAddressingMode = debugManager.flags.UseBindlessMode.get() == 1 ? KernelDescriptor::AddressingMode::Bindless : KernelDescriptor::AddressingMode::Bindful;
 
     ClDeviceFixture::setUp();
     context.reset(new MockContext(pClDevice));
@@ -70,7 +63,7 @@ void KernelImageArgTest::SetUp() {
     crossThreadData[0x20 / sizeof(uint32_t)] = 0x12344321;
     pKernel->setCrossThreadData(crossThreadData, sizeof(crossThreadData));
 
-    image.reset(Image2dHelper<>::create(context.get()));
+    image.reset(Image2dHelperUlt<>::create(context.get()));
     ASSERT_NE(nullptr, image);
 }
 

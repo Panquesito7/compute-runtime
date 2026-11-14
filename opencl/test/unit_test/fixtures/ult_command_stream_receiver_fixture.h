@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,10 +12,11 @@
 #include "shared/source/command_stream/preemption.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/cache_policy.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/helpers/logical_state_helper.h"
 #include "shared/source/helpers/preamble.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
@@ -45,10 +46,15 @@ struct UltCommandStreamReceiverTest
         ASSERT_NE(nullptr, sshBuffer);
 
         initHeaps();
-        auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-        flushTaskFlags.threadArbitrationPolicy = gfxCoreHelper.getDefaultThreadArbitrationPolicy();
+        const auto &hwInfo = pDevice->getHardwareInfo();
+        flushTaskFlags.threadArbitrationPolicy = hwInfo.caps.defaultThreadArbitrationPolicy;
 
         pDevice->getGpgpuCommandStreamReceiver().setupContext(*pDevice->getDefaultEngine().osContext);
+
+        auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+
+        auto heaplessEnabled = compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo);
+        this->heaplessStateEnabled = heaplessEnabled;
     }
 
     void initHeaps() {
@@ -89,6 +95,14 @@ struct UltCommandStreamReceiverTest
         ClDeviceFixture::tearDown();
     }
 
+    template <typename GfxFamily, typename CommandStreamReceiverType>
+    CompletionStamp flushTaskMethod(CommandStreamReceiverType &commandStreamReceiver, LinearStream &commandStream, size_t commandStreamStart,
+                                    const IndirectHeap *dsh, const IndirectHeap *ioh, const IndirectHeap *ssh,
+                                    TaskCountType taskLevel, DispatchFlags &dispatchFlags, Device &device) {
+
+        return commandStreamReceiver.flushTask(commandStream, commandStreamStart, dsh, ioh, ssh, taskLevel, dispatchFlags, device);
+    }
+
     template <typename CommandStreamReceiverType>
     CompletionStamp flushTask(CommandStreamReceiverType &commandStreamReceiver,
                               bool block = false,
@@ -97,7 +111,6 @@ struct UltCommandStreamReceiverTest
                               bool lowPriority = false) {
 
         flushTaskFlags.blocking = block;
-        flushTaskFlags.requiresCoherency = requiresCoherency;
         flushTaskFlags.lowPriority = lowPriority;
         flushTaskFlags.preemptionMode = PreemptionHelper::getDefaultPreemptionMode(pDevice->getHardwareInfo());
 
@@ -130,13 +143,6 @@ struct UltCommandStreamReceiverTest
 
     template <typename GfxFamily>
     void configureCSRtoNonDirtyState(bool isL1CacheEnabled) {
-        bool slmUsed = false;
-        if (DebugManager.flags.ForceSLML3Config.get()) {
-            slmUsed = true;
-        }
-
-        uint32_t l3Config = PreambleHelper<GfxFamily>::getL3Config(*defaultHwInfo, slmUsed);
-
         auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<GfxFamily>();
         commandStreamReceiver.isPreambleSent = true;
         commandStreamReceiver.isEnginePrologueSent = true;
@@ -148,27 +154,18 @@ struct UltCommandStreamReceiverTest
         auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
         auto mocsIndex = gfxCoreHelper.getMocsIndex(*gmmHelper, true, isL1CacheEnabled);
 
+        if (this->heaplessStateEnabled) {
+            commandStreamReceiver.heaplessPrologProgrammed = true;
+        }
         commandStreamReceiver.latestSentStatelessMocsConfig = mocsIndex;
-        commandStreamReceiver.lastSentL3Config = l3Config;
         configureCSRHeapStatesToNonDirty<GfxFamily>();
         commandStreamReceiver.taskLevel = taskLevel;
 
-        commandStreamReceiver.lastMediaSamplerConfig = 0;
-        commandStreamReceiver.lastSentUseGlobalAtomics = false;
-        commandStreamReceiver.streamProperties.pipelineSelect.setPropertiesAll(true, false, false);
-        commandStreamReceiver.streamProperties.stateComputeMode.setPropertiesAll(0, GrfConfig::DefaultGrfNumber,
-                                                                                 gfxCoreHelper.getDefaultThreadArbitrationPolicy(), pDevice->getPreemptionMode());
-        commandStreamReceiver.streamProperties.frontEndState.setPropertiesAll(false, false, false, -1);
-
-        auto logicalStateHelper = commandStreamReceiver.getLogicalStateHelper();
-
-        if (logicalStateHelper) {
-            uint8_t buffer[512] = {};
-            LinearStream tempStream(buffer, sizeof(buffer));
-
-            EncodeKernelArgsBuffer<GfxFamily>::encodeKernelArgsBufferCmds(commandStreamReceiver.getKernelArgsBufferAllocation(), logicalStateHelper);
-            logicalStateHelper->writeStreamInline(tempStream, false);
-        }
+        const auto &hwInfo = pDevice->getHardwareInfo();
+        commandStreamReceiver.streamProperties.pipelineSelect.setPropertiesAll(true, false);
+        commandStreamReceiver.streamProperties.stateComputeMode.setPropertiesAll(GrfConfig::defaultGrfNumber,
+                                                                                 hwInfo.caps.defaultThreadArbitrationPolicy, false);
+        commandStreamReceiver.streamProperties.frontEndState.setPropertiesAll(false, false, false);
     }
 
     template <typename GfxFamily>
@@ -194,5 +191,51 @@ struct UltCommandStreamReceiverTest
 
     const size_t sizeStream = 512;
     const size_t alignmentStream = 0x1000;
+    bool heaplessStateEnabled = false;
+};
+
+template <typename CsrType>
+struct UltCommandStreamReceiverTestWithCsr
+    : public UltCommandStreamReceiverTest {
+  public:
+    void SetUp() override {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<CsrType>();
+
+        UltCommandStreamReceiverTest::SetUp();
+    }
+
+    void TearDown() override {
+        UltCommandStreamReceiverTest::TearDown();
+    }
+};
+
+template <template <typename> class CsrType>
+struct UltCommandStreamReceiverTestWithCsrT
+    : public UltCommandStreamReceiverTest {
+  public:
+    void SetUp() override {}
+    void TearDown() override {}
+
+    template <typename FamilyType>
+    void setUpT() {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<CsrType<FamilyType>>();
+        beforeDefStateFlag = debugManager.flags.DeferStateInitSubmissionToFirstRegularUsage.get();
+        debugManager.flags.DeferStateInitSubmissionToFirstRegularUsage.set(1);
+        debugManager.flags.EnableDirectSubmission.set(0);
+
+        UltCommandStreamReceiverTest::SetUp();
+    }
+
+    template <typename FamilyType>
+    void tearDownT() {
+        UltCommandStreamReceiverTest::TearDown();
+        debugManager.flags.DeferStateInitSubmissionToFirstRegularUsage.set(beforeDefStateFlag);
+    }
+
+  private:
+    int32_t beforeDefStateFlag;
+    DebugManagerStateRestore stateRestore;
 };
 } // namespace NEO

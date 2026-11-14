@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #include "shared/source/command_container/implicit_scaling.h"
 #include "shared/source/command_stream/preemption_mode.h"
 #include "shared/source/compiler_interface/compiler_interface.h"
+#include "shared/source/compiler_interface/spirv_capabilities_parser.h"
 #include "shared/source/debugger/debugger.h"
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/execution_environment.h"
@@ -15,18 +16,23 @@
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
-#include "shared/source/source_level_debugger/source_level_debugger.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 
-#include <iomanip>
+#include "spirv/unified1/spirv.hpp"
+
+#include <algorithm>
+#include <iterator>
+#include <sstream>
 
 namespace NEO {
 
-static const char *spirvWithVersion = "SPIR-V_1.2 ";
+static const char *spirvWithVersion = "SPIR-V_1.5 SPIR-V_1.4 SPIR-V_1.3 SPIR-V_1.2 SPIR-V_1.1 SPIR-V_1.0 ";
 
 size_t Device::getMaxParameterSizeFromIGC() const {
     CompilerInterface *compilerInterface = getCompilerInterface();
@@ -39,21 +45,10 @@ size_t Device::getMaxParameterSizeFromIGC() const {
 
 void Device::initializeCaps() {
     auto &hwInfo = getHardwareInfo();
-    auto addressing32bitAllowed = is64bit;
 
     auto &productHelper = this->getRootDeviceEnvironment().getHelper<NEO::ProductHelper>();
     auto &gfxCoreHelper = this->getRootDeviceEnvironment().getHelper<NEO::GfxCoreHelper>();
-
-    bool ocl21FeaturesEnabled = hwInfo.capabilityTable.supportsOcl21Features;
-    if (DebugManager.flags.ForceOCLVersion.get() != 0) {
-        ocl21FeaturesEnabled = (DebugManager.flags.ForceOCLVersion.get() == 21);
-    }
-    if (DebugManager.flags.ForceOCL21FeaturesSupport.get() != -1) {
-        ocl21FeaturesEnabled = DebugManager.flags.ForceOCL21FeaturesSupport.get();
-    }
-    if (ocl21FeaturesEnabled) {
-        addressing32bitAllowed = false;
-    }
+    const auto &releaseHelper = this->getRootDeviceEnvironment().getReleaseHelper();
 
     deviceInfo.vendorId = 0x8086;
     deviceInfo.maxReadImageArgs = 128;
@@ -66,7 +61,7 @@ void Device::initializeCaps() {
     // copy system info to prevent misaligned reads
     const auto systemInfo = hwInfo.gtSystemInfo;
 
-    deviceInfo.globalMemCachelineSize = 64;
+    deviceInfo.globalMemCachelineSize = hwInfo.caps.cacheLineSize;
 
     uint32_t allSubDevicesMask = static_cast<uint32_t>(getDeviceBitfield().to_ulong());
     constexpr uint32_t singleSubDeviceMask = 1;
@@ -74,11 +69,10 @@ void Device::initializeCaps() {
     deviceInfo.globalMemSize = getGlobalMemorySize(allSubDevicesMask);
     deviceInfo.maxMemAllocSize = getGlobalMemorySize(singleSubDeviceMask); // Allocation can be placed only on one SubDevice
 
-    if (DebugManager.flags.Force32bitAddressing.get() || addressing32bitAllowed || is32bit) {
+    if (is32bit) {
         double percentOfGlobalMemoryAvailable = getPercentOfGlobalMemoryAvailable();
-        deviceInfo.globalMemSize = std::min(deviceInfo.globalMemSize, static_cast<uint64_t>(4 * GB * percentOfGlobalMemoryAvailable));
+        deviceInfo.globalMemSize = std::min(deviceInfo.globalMemSize, static_cast<uint64_t>(4 * MemoryConstants::gigaByte * percentOfGlobalMemoryAvailable));
         deviceInfo.addressBits = 32;
-        deviceInfo.force32BitAddressess = is64bit;
     }
 
     deviceInfo.globalMemSize = alignDown(deviceInfo.globalMemSize, MemoryConstants::pageSize);
@@ -87,16 +81,15 @@ void Device::initializeCaps() {
     uint32_t subDeviceCount = gfxCoreHelper.getSubDevicesCount(&getHardwareInfo());
     auto &rootDeviceEnvironment = this->getRootDeviceEnvironment();
     bool platformImplicitScaling = gfxCoreHelper.platformSupportsImplicitScaling(rootDeviceEnvironment);
+    const auto &compilerProductHelper = rootDeviceEnvironment.getHelper<NEO::CompilerProductHelper>();
 
-    if (((NEO::ImplicitScalingHelper::isImplicitScalingEnabled(
-            getDeviceBitfield(), platformImplicitScaling))) &&
+    if ((NEO::ImplicitScalingHelper::isImplicitScalingEnabled(
+            getDeviceBitfield(), platformImplicitScaling)) &&
         (!isSubDevice()) && (subDeviceCount > 1)) {
         deviceInfo.maxMemAllocSize = deviceInfo.globalMemSize;
-    }
-
-    if (!areSharedSystemAllocationsAllowed()) {
+    } else if (!compilerProductHelper.isForceToStatelessRequired()) {
         deviceInfo.maxMemAllocSize = ApiSpecificConfig::getReducedMaxAllocSize(deviceInfo.maxMemAllocSize);
-        deviceInfo.maxMemAllocSize = std::min(deviceInfo.maxMemAllocSize, gfxCoreHelper.getMaxMemAllocSize());
+        deviceInfo.maxMemAllocSize = std::min(deviceInfo.maxMemAllocSize, MemoryConstants::maxStatefulBufferSize);
     }
 
     // Some specific driver model configurations may impose additional limitations
@@ -106,9 +99,13 @@ void Device::initializeCaps() {
     }
     deviceInfo.maxMemAllocSize = std::min<std::uint64_t>(driverModelMaxMemAlloc, deviceInfo.maxMemAllocSize);
 
+    if (debugManager.flags.OverrideMaxMemAllocSizeMb.get() != -1) {
+        deviceInfo.maxMemAllocSize = static_cast<uint64_t>(debugManager.flags.OverrideMaxMemAllocSizeMb.get()) * MemoryConstants::megaByte;
+    }
+
     deviceInfo.profilingTimerResolution = getProfilingTimerResolution();
-    if (DebugManager.flags.OverrideProfilingTimerResolution.get() != -1) {
-        deviceInfo.profilingTimerResolution = static_cast<double>(DebugManager.flags.OverrideProfilingTimerResolution.get());
+    if (debugManager.flags.OverrideProfilingTimerResolution.get() != -1) {
+        deviceInfo.profilingTimerResolution = static_cast<double>(debugManager.flags.OverrideProfilingTimerResolution.get());
         deviceInfo.outProfilingTimerClock = static_cast<size_t>(1000000000.0 / deviceInfo.profilingTimerResolution);
     } else {
         deviceInfo.outProfilingTimerClock = static_cast<size_t>(getProfilingTimerClock());
@@ -121,9 +118,9 @@ void Device::initializeCaps() {
 
     deviceInfo.maxNumEUsPerSubSlice = 0;
     deviceInfo.numThreadsPerEU = 0;
-    auto simdSizeUsed = DebugManager.flags.UseMaxSimdSizeToDeduceMaxWorkgroupSize.get()
+    auto simdSizeUsed = debugManager.flags.UseMaxSimdSizeToDeduceMaxWorkgroupSize.get()
                             ? CommonConstants::maximalSimdSize
-                            : gfxCoreHelper.getMinimalSIMDSize();
+                            : hwInfo.caps.minimalSimdSize;
 
     deviceInfo.maxNumEUsPerSubSlice = (systemInfo.EuCountPerPoolMin == 0 || hwInfo.featureTable.flags.ftrPooledEuEnabled == 0)
                                           ? (systemInfo.EUCount / systemInfo.SubSliceCount)
@@ -137,31 +134,26 @@ void Device::initializeCaps() {
         deviceInfo.maxNumEUsPerDualSubSlice = deviceInfo.maxNumEUsPerSubSlice;
     }
     deviceInfo.numThreadsPerEU = systemInfo.ThreadCount / systemInfo.EUCount;
-    deviceInfo.threadsPerEUConfigs = gfxCoreHelper.getThreadsPerEUConfigs();
+
+    deviceInfo.threadsPerEUConfigs = releaseHelper.getThreadsPerEUConfigs(deviceInfo.numThreadsPerEU);
     auto maxWS = productHelper.getMaxThreadsForWorkgroupInDSSOrSS(hwInfo, static_cast<uint32_t>(deviceInfo.maxNumEUsPerSubSlice), static_cast<uint32_t>(deviceInfo.maxNumEUsPerDualSubSlice)) * simdSizeUsed;
 
     maxWS = Math::prevPowerOfTwo(maxWS);
-    deviceInfo.maxWorkGroupSize = std::min(maxWS, 1024u);
+    deviceInfo.maxWorkGroupSize = gfxCoreHelper.overrideMaxWorkGroupSize(maxWS);
 
-    const auto minGrfSize = gfxCoreHelper.getMinimalGrfSize();
-    deviceInfo.maxWorkGroupSize = gfxCoreHelper.adjustMaxWorkGroupSize(minGrfSize, simdSizeUsed, static_cast<uint32_t>(deviceInfo.maxWorkGroupSize));
-
-    if (DebugManager.flags.OverrideMaxWorkgroupSize.get() != -1) {
-        deviceInfo.maxWorkGroupSize = DebugManager.flags.OverrideMaxWorkgroupSize.get();
+    if (debugManager.flags.OverrideMaxWorkgroupSize.get() != -1) {
+        deviceInfo.maxWorkGroupSize = debugManager.flags.OverrideMaxWorkgroupSize.get();
     }
 
     deviceInfo.maxWorkItemSizes[0] = deviceInfo.maxWorkGroupSize;
     deviceInfo.maxWorkItemSizes[1] = deviceInfo.maxWorkGroupSize;
     deviceInfo.maxWorkItemSizes[2] = deviceInfo.maxWorkGroupSize;
-    deviceInfo.maxSamplers = productHelper.getMaxNumSamplers();
+    deviceInfo.maxSamplers = hwInfo.caps.maxNumSamplers;
 
     deviceInfo.computeUnitsUsedForScratch = gfxCoreHelper.getComputeUnitsUsedForScratch(this->getRootDeviceEnvironment());
     deviceInfo.maxFrontEndThreads = gfxCoreHelper.getMaxThreadsForVfe(hwInfo);
 
-    deviceInfo.localMemSize = hwInfo.capabilityTable.slmSize * KB;
-    if (DebugManager.flags.OverrideSlmSize.get() != -1) {
-        deviceInfo.localMemSize = DebugManager.flags.OverrideSlmSize.get() * KB;
-    }
+    deviceInfo.localMemSize = hwInfo.capabilityTable.maxProgrammableSlmSize * MemoryConstants::kiloByte;
 
     deviceInfo.imageSupport = hwInfo.capabilityTable.supportsImages;
     deviceInfo.image2DMaxWidth = 16384;
@@ -169,23 +161,10 @@ void Device::initializeCaps() {
     deviceInfo.image3DMaxDepth = 2048;
     deviceInfo.imageMaxArraySize = 2048;
 
-    deviceInfo.printfBufferSize = 4 * MB;
+    deviceInfo.printfBufferSize = 4 * MemoryConstants::megaByte;
     deviceInfo.maxClockFrequency = hwInfo.capabilityTable.maxRenderFrequency;
 
     deviceInfo.maxSubGroups = gfxCoreHelper.getDeviceSubGroupSizes();
-
-    deviceInfo.vmeAvcSupportsPreemption = hwInfo.capabilityTable.ftrSupportsVmeAvcPreemption;
-
-    NEO::Debugger *debugger = getRootDeviceEnvironment().debugger.get();
-    deviceInfo.debuggerActive = false;
-    if (debugger) {
-        UNRECOVERABLE_IF(!debugger->isLegacy());
-        deviceInfo.debuggerActive = static_cast<NEO::SourceLevelDebugger *>(debugger)->isDebuggerActive();
-    }
-
-    if (deviceInfo.debuggerActive) {
-        this->preemptionMode = PreemptionMode::Disabled;
-    }
 
     deviceInfo.name = this->getDeviceName();
 
@@ -193,6 +172,81 @@ void Device::initializeCaps() {
     if (maxParameterSizeFromIgc > 0) {
         deviceInfo.maxParameterSize = maxParameterSizeFromIgc;
     }
+
+    deviceInfo.semaphore64bCmdSupport = this->getRootDeviceEnvironment().getHelper<CompilerProductHelper>().isAvailableSemaphore64(hwInfo);
+}
+
+std::vector<uint32_t> Device::getSpirvBaseCapabilities() const {
+    std::stringstream ilsStringStream{this->deviceInfo.ilVersion};
+    std::vector<std::string> ilsVector{
+        std::istream_iterator<std::string>{ilsStringStream}, std::istream_iterator<std::string>{}};
+
+    std::vector<uint32_t> capabilities;
+    capabilities.reserve(64);
+
+    capabilities.push_back(spv::CapabilityAddresses);
+    capabilities.push_back(spv::CapabilityFloat16Buffer);
+    capabilities.push_back(spv::CapabilityInt16);
+    capabilities.push_back(spv::CapabilityInt8);
+    capabilities.push_back(spv::CapabilityKernel);
+    capabilities.push_back(spv::CapabilityLinkage);
+    capabilities.push_back(spv::CapabilityVector16);
+
+    capabilities.push_back(spv::CapabilityInt64);
+
+    if (this->deviceInfo.imageSupport) {
+        capabilities.push_back(spv::CapabilityImage1D);
+        capabilities.push_back(spv::CapabilityImageBasic);
+        capabilities.push_back(spv::CapabilityImageBuffer);
+        capabilities.push_back(spv::CapabilityLiteralSampler);
+        capabilities.push_back(spv::CapabilitySampled1D);
+        capabilities.push_back(spv::CapabilitySampledBuffer);
+    }
+
+    if (std::find(ilsVector.begin(), ilsVector.end(), "SPIR-V_1.6") != ilsVector.end()) {
+        capabilities.push_back(spv::CapabilityUniformDecoration);
+    }
+
+    return capabilities;
+}
+
+void Device::initializeSpirvQueries() {
+    std::call_once(this->initializeSpirvQueriesOnce, [this]() {
+        this->deviceInfo.spirvCapabilities = this->getSpirvBaseCapabilities();
+        if (debugManager.flags.EnableSpirvQueriesFromIgc.get() != 1) {
+            return;
+        }
+
+        auto *compilerInterface = this->getCompilerInterface();
+        if (!compilerInterface) {
+            return;
+        }
+
+        const auto yamlStr = compilerInterface->getSpirvExtensionsYAML(*this);
+        if (yamlStr.empty()) {
+            return;
+        }
+
+        std::vector<SpirvExtensionInfo> extensions;
+        std::string errReason, warning;
+        if (!SpirvCapabilitiesParser::parseSpirvExtensionsYAML(yamlStr, extensions, errReason, warning)) {
+            return;
+        }
+
+        auto &spirvExtensions = this->deviceInfo.spirvExtensions;
+        auto &spirvCapabilities = this->deviceInfo.spirvCapabilities;
+        spirvExtensions.reserve(extensions.size());
+        for (const auto &ext : extensions) {
+            if (std::find(spirvExtensions.begin(), spirvExtensions.end(), ext.name) == spirvExtensions.end()) {
+                spirvExtensions.push_back(ext.name);
+            }
+            for (const auto &capInfo : ext.supportedCapabilities) {
+                if (capInfo.id != 0 && std::find(spirvCapabilities.begin(), spirvCapabilities.end(), capInfo.id) == spirvCapabilities.end()) {
+                    spirvCapabilities.push_back(capInfo.id);
+                }
+            }
+        }
+    });
 }
 
 } // namespace NEO

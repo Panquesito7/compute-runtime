@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,6 +13,7 @@ using Family = XeHpcCoreFamily;
 } // namespace NEO
 
 #include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/helpers/preamble_xe_hpg_and_xe_hpc.inl"
 #include "shared/source/helpers/preamble_xehp_and_later.inl"
 #include "shared/source/os_interface/product_helper.h"
 
@@ -23,27 +24,20 @@ template <>
 void PreambleHelper<Family>::appendProgramVFEState(const RootDeviceEnvironment &rootDeviceEnvironment, const StreamProperties &streamProperties, void *cmd) {
     auto command = static_cast<CFE_STATE *>(cmd);
 
-    command->setComputeOverdispatchDisable(streamProperties.frontEndState.disableOverdispatch.value == 1);
-    command->setSingleSliceDispatchCcsMode(streamProperties.frontEndState.singleSliceDispatchCcsMode.value == 1);
-
     if (streamProperties.frontEndState.computeDispatchAllWalkerEnable.value > 0) {
         command->setComputeDispatchAllWalkerEnable(true);
     }
 
-    if (DebugManager.flags.CFEComputeDispatchAllWalkerEnable.get() != -1) {
-        command->setComputeDispatchAllWalkerEnable(DebugManager.flags.CFEComputeDispatchAllWalkerEnable.get());
-    }
-
-    if (DebugManager.flags.CFEComputeOverdispatchDisable.get() != -1) {
-        command->setComputeOverdispatchDisable(DebugManager.flags.CFEComputeOverdispatchDisable.get());
-    }
-    if (DebugManager.flags.CFESingleSliceDispatchCCSMode.get() != -1) {
-        command->setSingleSliceDispatchCcsMode(DebugManager.flags.CFESingleSliceDispatchCCSMode.get());
+    if (debugManager.flags.CFEComputeDispatchAllWalkerEnable.get() != -1) {
+        command->setComputeDispatchAllWalkerEnable(debugManager.flags.CFEComputeDispatchAllWalkerEnable.get());
     }
 
     command->setNumberOfWalkers(1);
-    if (DebugManager.flags.CFENumberOfWalkers.get() != -1) {
-        command->setNumberOfWalkers(DebugManager.flags.CFENumberOfWalkers.get());
+    if (debugManager.flags.CFENumberOfWalkers.get() != -1) {
+        command->setNumberOfWalkers(debugManager.flags.CFENumberOfWalkers.get());
+    }
+    if (debugManager.flags.CFELargeGRFThreadAdjustDisable.get() != -1) {
+        command->setLargeGRFThreadAdjustDisable(debugManager.flags.CFELargeGRFThreadAdjustDisable.get());
     }
 }
 

@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
@@ -13,8 +14,10 @@
 #include "level_zero/tools/source/sysman/standby/standby_imp.h"
 
 namespace L0 {
+class SysfsAccess;
+struct OsSysman;
 
-class LinuxStandbyImp : public OsStandby, NEO::NonCopyableOrMovableClass {
+class LinuxStandbyImp : public OsStandby, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t getMode(zes_standby_promo_mode_t &mode) override;
     ze_result_t setMode(zes_standby_promo_mode_t mode) override;

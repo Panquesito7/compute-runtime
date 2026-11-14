@@ -15,6 +15,10 @@ uint32_t LinuxFabricDeviceImp::getNumPorts() {
     return numPorts;
 }
 
+ze_result_t LinuxFabricDeviceImp::getMultiPortThroughput(std::vector<zes_fabric_port_id_t> &portIdList, zes_fabric_port_throughput_t **pThroughput) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
 LinuxFabricDeviceImp::LinuxFabricDeviceImp(OsSysman *pOsSysman) {
 }
 
@@ -54,6 +58,10 @@ ze_result_t LinuxFabricPortImp::getThroughput(zes_fabric_port_throughput_t *pThr
     pThroughput->rxCounter = 0LU;
     pThroughput->txCounter = 0LU;
     return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t LinuxFabricPortImp::getErrorCounters(zes_fabric_port_error_counters_t *pErrors) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 }
 
 ze_result_t LinuxFabricPortImp::getProperties(zes_fabric_port_properties_t *pProperties) {

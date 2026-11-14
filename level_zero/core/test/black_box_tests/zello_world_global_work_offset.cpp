@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,13 +13,6 @@
 
 #include <cstring>
 
-const char *moduleSrc = R"===(
-__kernel void kernel_copy(__global char *dst, __global char *src){
-    uint gid = get_global_id(0);
-    dst[gid] = src[gid];
-}
-)===";
-
 void executeKernelAndValidate(ze_context_handle_t &context,
                               ze_device_handle_t &device,
                               ze_kernel_exp_dditable_t &kernelExpDdiTable,
@@ -28,11 +21,11 @@ void executeKernelAndValidate(ze_context_handle_t &context,
     ze_command_queue_desc_t cmdQueueDesc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
     ze_command_list_handle_t cmdList;
 
-    cmdQueueDesc.ordinal = getCommandQueueOrdinal(device);
+    cmdQueueDesc.ordinal = LevelZeroBlackBoxTests::getCommandQueueOrdinal(device, false);
     cmdQueueDesc.index = 0;
     cmdQueueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
     SUCCESS_OR_TERMINATE(zeCommandQueueCreate(context, device, &cmdQueueDesc, &cmdQueue));
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
     // Create two shared buffers
     constexpr size_t allocSize = 4096;
     ze_device_mem_alloc_desc_t deviceDesc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
@@ -61,10 +54,8 @@ void executeKernelAndValidate(ze_context_handle_t &context,
     }
 
     std::string buildLog;
-    auto spirV = compileToSpirV(moduleSrc, "", buildLog);
-    if (buildLog.size() > 0) {
-        std::cout << "Build log " << buildLog;
-    }
+    auto spirV = LevelZeroBlackBoxTests::compileToSpirV(LevelZeroBlackBoxTests::openCLKernelsSource, "", buildLog);
+    LevelZeroBlackBoxTests::printBuildLog(buildLog);
     SUCCESS_OR_TERMINATE((0 == spirV.size()));
 
     ze_module_handle_t module = nullptr;
@@ -83,22 +74,22 @@ void executeKernelAndValidate(ze_context_handle_t &context,
 
         char *strLog = (char *)malloc(szLog);
         zeModuleBuildLogGetString(buildlog, &szLog, strLog);
-        std::cout << "Build log:" << strLog << std::endl;
+        LevelZeroBlackBoxTests::printBuildLog(strLog);
 
         free(strLog);
         SUCCESS_OR_TERMINATE(zeModuleBuildLogDestroy(buildlog));
-        std::cout << "\nZello World Global Work Offset Results validation FAILED. Module creation error."
+        std::cerr << "\nZello World Global Work Offset Results validation FAILED. Module creation error."
                   << std::endl;
         SUCCESS_OR_TERMINATE_BOOL(false);
     }
     SUCCESS_OR_TERMINATE(zeModuleBuildLogDestroy(buildlog));
 
     ze_kernel_desc_t kernelDesc = {ZE_STRUCTURE_TYPE_KERNEL_DESC};
-    kernelDesc.pKernelName = "kernel_copy";
+    kernelDesc.pKernelName = "memcpy_bytes";
     SUCCESS_OR_TERMINATE(zeKernelCreate(module, &kernelDesc, &kernel));
     ze_kernel_properties_t kernProps = {ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeKernelGetProperties(kernel, &kernProps));
-    printKernelProperties(kernProps, kernelDesc.pKernelName);
+    LevelZeroBlackBoxTests::printKernelProperties(kernProps, kernelDesc.pKernelName);
 
     uint32_t groupSizeX = 32u;
     uint32_t groupSizeY = 1u;
@@ -140,15 +131,13 @@ void executeKernelAndValidate(ze_context_handle_t &context,
                 outputValidationSuccessful = false;
                 break;
             }
-        } else {
-            if (dstCharBuffer[i] != srcCharBuffer[i]) {
-                std::cout << "dstBuffer[" << i << "] = "
-                          << std::dec << static_cast<unsigned int>(dstCharBuffer[i]) << " not equal to "
-                          << "srcBuffer[" << i << "] = "
-                          << std::dec << static_cast<unsigned int>(srcCharBuffer[i]) << "\n";
-                outputValidationSuccessful = false;
-                break;
-            }
+        } else if (dstCharBuffer[i] != srcCharBuffer[i]) {
+            std::cout << "dstBuffer[" << i << "] = "
+                      << std::dec << static_cast<unsigned int>(dstCharBuffer[i]) << " not equal to "
+                      << "srcBuffer[" << i << "] = "
+                      << std::dec << static_cast<unsigned int>(srcCharBuffer[i]) << "\n";
+            outputValidationSuccessful = false;
+            break;
         }
     }
 
@@ -163,12 +152,12 @@ void executeKernelAndValidate(ze_context_handle_t &context,
 
 int main(int argc, char *argv[]) {
     const std::string blackBoxName("Zello World Global Work Offset");
-    verbose = isVerbose(argc, argv);
-    bool aubMode = isAubMode(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
 
     ze_driver_handle_t driverHandle;
     ze_context_handle_t context = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context, driverHandle);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context, driverHandle);
     auto device = devices[0];
 
     ze_api_version_t apiVersion = ZE_API_VERSION_CURRENT;
@@ -181,38 +170,33 @@ int main(int argc, char *argv[]) {
     uint32_t extensionsCount = 0;
     SUCCESS_OR_TERMINATE(zeDriverGetExtensionProperties(driverHandle, &extensionsCount, nullptr));
     if (extensionsCount == 0) {
-        std::cout << "No extensions supported on this driver\n";
+        std::cerr << "No extensions supported on this driver\n";
         std::terminate();
     }
 
-    std::vector<ze_driver_extension_properties_t> extensionsSupported(extensionsCount);
-    SUCCESS_OR_TERMINATE(zeDriverGetExtensionProperties(driverHandle, &extensionsCount, extensionsSupported.data()));
-    bool globalOffsetExtensionFound = false;
     std::string globalOffsetName = "ZE_experimental_global_offset";
-    for (uint32_t i = 0; i < extensionsSupported.size(); i++) {
-        if (verbose) {
-            std::cout << "Extension #" << i << " name : " << extensionsSupported[i].name << " version : " << extensionsSupported[i].version << std::endl;
-        }
-        if (strncmp(extensionsSupported[i].name, globalOffsetName.c_str(), globalOffsetName.size()) == 0) {
-            if (extensionsSupported[i].version == ZE_GLOBAL_OFFSET_EXP_VERSION_1_0) {
-                globalOffsetExtensionFound = true;
-            }
-        }
-    }
+
+    ze_driver_extension_properties_t globalOffsetExtension{};
+
+    std::snprintf(globalOffsetExtension.name, sizeof(globalOffsetExtension.name), "%s", globalOffsetName.c_str());
+    globalOffsetExtension.version = ZE_GLOBAL_OFFSET_EXP_VERSION_1_0;
+
+    std::vector<ze_driver_extension_properties_t> extensionsToCheck;
+    extensionsToCheck.push_back(globalOffsetExtension);
+
+    bool globalOffsetExtensionFound = LevelZeroBlackBoxTests::checkExtensionIsPresent(driverHandle, extensionsToCheck);
     if (globalOffsetExtensionFound == false) {
-        std::cout << "No global offset extension found on this driver\n";
+        std::cerr << "No global offset extension found on this driver\n";
         std::terminate();
     }
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
     executeKernelAndValidate(context, device, kernelExpDdiTable, outputValidationSuccessful);
 
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
-
-    printResult(aubMode, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(aubMode, outputValidationSuccessful, blackBoxName);
     outputValidationSuccessful = aubMode ? true : outputValidationSuccessful;
     return (outputValidationSuccessful ? 0 : 1);
 }

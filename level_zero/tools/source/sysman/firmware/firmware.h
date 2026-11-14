@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
 #include "level_zero/api/sysman/zes_handles_struct.h"
 #include <level_zero/zes_api.h>
 
@@ -19,9 +21,10 @@ struct OsSysman;
 
 class Firmware : _zes_firmware_handle_t {
   public:
-    ~Firmware() override {}
+    virtual ~Firmware() = default;
     virtual ze_result_t firmwareGetProperties(zes_firmware_properties_t *pProperties) = 0;
     virtual ze_result_t firmwareFlash(void *pImage, uint32_t size) = 0;
+    virtual ze_result_t firmwareGetFlashProgress(uint32_t *pCompletionPercent) = 0;
 
     inline zes_firmware_handle_t toHandle() { return this; }
 
@@ -31,7 +34,7 @@ class Firmware : _zes_firmware_handle_t {
 };
 
 struct FirmwareHandleContext {
-    FirmwareHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    FirmwareHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     MOCKABLE_VIRTUAL ~FirmwareHandleContext();
     void releaseFwHandles();
 

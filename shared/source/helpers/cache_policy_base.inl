@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,11 +14,11 @@ namespace NEO {
 
 template <PRODUCT_FAMILY gfxProduct>
 uint32_t L1CachePolicyHelper<gfxProduct>::getL1CachePolicy(bool isDebuggerActive) {
-    if (DebugManager.flags.ForceAllResourcesUncached.get()) {
+    if (debugManager.flags.ForceAllResourcesUncached.get()) {
         return L1CachePolicyHelper<gfxProduct>::getUncachedL1CachePolicy();
     }
-    if (DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.get() != -1) {
-        return DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.get();
+    if (debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.get() != -1) {
+        return debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.get();
     }
     return L1CachePolicyHelper<gfxProduct>::getDefaultL1CachePolicy(isDebuggerActive);
 }

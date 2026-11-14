@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2021 Intel Corporation
+# Copyright (C) 2021-2024 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -112,18 +112,16 @@ endif()
 
 if(IS_DIRECTORY ${IGA_INCLUDE_DIR})
   set(IGA_HEADERS_AVAILABLE TRUE)
-  set(IGA_LIBRARY_NAME "iga${NEO_BITS}")
+  if(NEO__IGC_FOUND)
+    string(REPLACE "." ";" IGA_VERSION ${NEO__IGC_VERSION})
+    list(GET IGA_VERSION 0 IGA_VERSION_MAJOR)
+    set(IGA_LIBRARY_FILENAME "${CMAKE_SHARED_LIBRARY_PREFIX}iga${NEO_BITS}${CMAKE_SHARED_LIBRARY_SUFFIX}.${IGA_VERSION_MAJOR}")
+  else()
+    set(IGA_LIBRARY_FILENAME "${CMAKE_SHARED_LIBRARY_PREFIX}iga${NEO_BITS}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  endif()
+  message(STATUS "IGA library name: ${IGA_LIBRARY_FILENAME}")
 else()
   set(IGA_HEADERS_AVAILABLE FALSE)
 endif()
 
 message(STATUS "IGA Includes dir: ${IGA_INCLUDE_DIR}")
-
-if(WIN32)
-  set(IGC_LIBRARY_NAME "igc${NEO_BITS}")
-  set(FCL_LIBRARY_NAME "igdfcl${NEO_BITS}")
-endif()
-
-if(WIN32 AND NOT NEO__IGC_FOUND)
-  configure_file(igc.opencl.h.in ${NEO_BUILD_DIR}/igc.opencl.h)
-endif()

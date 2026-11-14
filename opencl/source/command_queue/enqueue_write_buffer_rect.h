@@ -1,20 +1,19 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/helpers/hardware_commands_helper.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
-
-#include <new>
 
 namespace NEO {
 
@@ -53,15 +52,13 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBufferRect(
 
     const size_t hostPtrSize = Buffer::calculateHostPtrSize(hostOrigin, region, hostRowPitch, hostSlicePitch);
     const uint32_t rootDeviceIndex = getDevice().getRootDeviceIndex();
-    InternalMemoryType memoryType = InternalMemoryType::NOT_SPECIFIED;
+    InternalMemoryType memoryType = InternalMemoryType::notSpecified;
     GraphicsAllocation *mapAllocation = nullptr;
     bool isCpuCopyAllowed = false;
     getContext().tryGetExistingHostPtrAllocation(ptr, hostPtrSize, rootDeviceIndex, mapAllocation, memoryType, isCpuCopyAllowed);
 
-    auto eBuiltInOps = EBuiltInOps::CopyBufferRect;
-    if (forceStateless(buffer->getSize())) {
-        eBuiltInOps = EBuiltInOps::CopyBufferRectStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(buffer->getSize());
 
     void *srcPtr = const_cast<void *>(ptr);
 
@@ -92,7 +89,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBufferRect(
     void *alignedSrcPtr = alignDown(srcPtr, 4);
     size_t srcPtrOffset = ptrDiff(srcPtr, alignedSrcPtr);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = alignedSrcPtr;
     dc.dstMemObj = buffer;
     dc.srcOffset = hostOrigin;
@@ -108,7 +105,7 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteBufferRect(
     dc.direction = csrSelectionArgs.direction;
 
     MultiDispatchInfo dispatchInfo(dc);
-    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_WRITE_BUFFER_RECT>(dispatchInfo, surfaces, eBuiltInOps, numEventsInWaitList, eventWaitList, event, blockingWrite, csr);
+    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_WRITE_BUFFER_RECT>(dispatchInfo, surfaces, {BuiltIn::BaseKernel::copyBufferRect, builtInMode}, numEventsInWaitList, eventWaitList, event, blockingWrite, csr);
     if (dispatchResult != CL_SUCCESS) {
         return dispatchResult;
     }

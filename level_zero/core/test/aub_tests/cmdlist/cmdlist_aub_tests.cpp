@@ -1,0 +1,630 @@
+/*
+ * Copyright (C) 2021-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_stream/transfer_direction.h"
+#include "shared/source/helpers/array_count.h"
+#include "shared/source/helpers/file_io.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/test_files.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/test_macros/hw_test.h"
+
+#include "level_zero/api/internal/l0_event.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/bcs_split.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/source/event/event.h"
+#include "level_zero/core/test/aub_tests/fixtures/aub_fixture.h"
+#include "level_zero/core/test/aub_tests/fixtures/multicontext_l0_aub_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+#include "level_zero/core/test/unit_tests/sources/helper/ze_object_utils.h"
+
+#include "multitile_matchers.h"
+
+extern std::optional<uint32_t> blitterMaskOverride;
+
+namespace L0 {
+namespace ult {
+
+using AUBAppendKernelIndirectL0 = Test<AUBFixtureL0>;
+
+TEST_F(AUBAppendKernelIndirectL0, whenAppendKernelIndirectThenGlobalWorkSizeIsProperlyProgrammed) {
+    const uint32_t groupSize[] = {1, 2, 3};
+    const uint32_t groupCount[] = {4, 3, 1};
+    const uint32_t expectedGlobalWorkSize[] = {groupSize[0] * groupCount[0],
+                                               groupSize[1] * groupCount[1],
+                                               groupSize[2] * groupCount[2]};
+    uint8_t size = 3 * sizeof(uint32_t);
+
+    auto pDispatchTraits = this->allocateHostMemory(sizeof(ze_group_count_t), 0u);
+    auto outBuffer = this->allocateHostMemory(size, 0u);
+    ASSERT_NE(nullptr, pDispatchTraits);
+    ASSERT_NE(nullptr, outBuffer);
+    memset(outBuffer, 0, size);
+
+    ze_group_count_t &dispatchTraits = *reinterpret_cast<ze_group_count_t *>(pDispatchTraits);
+    dispatchTraits.groupCountX = groupCount[0];
+    dispatchTraits.groupCountY = groupCount[1];
+    dispatchTraits.groupCountZ = groupCount[2];
+
+    auto kernel = this->createKernel("test_kernel", "test_get_global_sizes", false);
+    ASSERT_NE(nullptr, kernel);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 0, sizeof(void *), &outBuffer));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernel, groupSize[0], groupSize[1], groupSize[2]));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchKernelIndirect(this->commandList->toHandle(), kernel, &dispatchTraits, nullptr, 0, nullptr));
+    this->executeAndSynchronize();
+
+    EXPECT_TRUE(this->csr->expectMemory(outBuffer, expectedGlobalWorkSize, size, aub_stream::CompareOperationValues::CompareEqual));
+}
+
+TEST_F(AUBAppendKernelIndirectL0, whenAppendKernelIndirectThenGroupCountIsProperlyProgrammed) {
+    const uint32_t groupSize[] = {1, 2, 3};
+    const uint32_t groupCount[] = {4, 3, 1};
+    uint8_t size = 3 * sizeof(uint32_t);
+
+    auto pDispatchTraits = this->allocateHostMemory(sizeof(ze_group_count_t), 0u);
+    auto outBuffer = this->allocateHostMemory(size, 0u);
+    ASSERT_NE(nullptr, pDispatchTraits);
+    ASSERT_NE(nullptr, outBuffer);
+    memset(outBuffer, 0, size);
+
+    ze_group_count_t &dispatchTraits = *reinterpret_cast<ze_group_count_t *>(pDispatchTraits);
+    dispatchTraits.groupCountX = groupCount[0];
+    dispatchTraits.groupCountY = groupCount[1];
+    dispatchTraits.groupCountZ = groupCount[2];
+
+    auto kernel = this->createKernel("test_kernel", "test_get_group_count", false);
+    ASSERT_NE(nullptr, kernel);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 0, sizeof(void *), &outBuffer));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernel, groupSize[0], groupSize[1], groupSize[2]));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchKernelIndirect(this->commandList->toHandle(), kernel, &dispatchTraits, nullptr, 0, nullptr));
+    this->executeAndSynchronize();
+
+    EXPECT_TRUE(this->csr->expectMemory(outBuffer, groupCount, size, aub_stream::CompareOperationValues::CompareEqual));
+}
+
+TEST_F(AUBAppendKernelIndirectL0, whenAppendMultipleKernelsIndirectThenGroupCountIsProperlyProgrammed) {
+    const uint32_t groupSize[] = {1, 2, 3};
+    const uint32_t groupCount[] = {4, 3, 1};
+    const uint32_t groupCount2[] = {7, 6, 4};
+    uint8_t size = 3 * sizeof(uint32_t);
+
+    auto pDispatchTraits = this->allocateHostMemory(2 * sizeof(ze_group_count_t), 0u);
+    auto kernelCount = static_cast<uint32_t *>(this->allocateHostMemory(sizeof(uint32_t), 0u));
+    auto outBuffer = this->allocateHostMemory(size, 0u);
+    auto outBuffer2 = this->allocateHostMemory(size, 0u);
+    ASSERT_NE(nullptr, pDispatchTraits);
+    ASSERT_NE(nullptr, kernelCount);
+    ASSERT_NE(nullptr, outBuffer);
+    ASSERT_NE(nullptr, outBuffer2);
+    kernelCount[0] = 2;
+    memset(outBuffer, 0, size);
+    memset(outBuffer2, 0, size);
+
+    ze_group_count_t *dispatchTraits = reinterpret_cast<ze_group_count_t *>(pDispatchTraits);
+    dispatchTraits[0].groupCountX = groupCount[0];
+    dispatchTraits[0].groupCountY = groupCount[1];
+    dispatchTraits[0].groupCountZ = groupCount[2];
+
+    dispatchTraits[1].groupCountX = groupCount2[0];
+    dispatchTraits[1].groupCountY = groupCount2[1];
+    dispatchTraits[1].groupCountZ = groupCount2[2];
+
+    ze_kernel_handle_t kernels[2] = {this->createKernel("test_kernel", "test_get_group_count", false),
+                                     this->createKernel("test_kernel", "test_get_group_count", false)};
+    ASSERT_NE(nullptr, kernels[0]);
+    ASSERT_NE(nullptr, kernels[1]);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernels[0], 0, sizeof(void *), &outBuffer));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernels[0], groupSize[0], groupSize[1], groupSize[2]));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernels[1], 0, sizeof(void *), &outBuffer2));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernels[1], groupSize[0], groupSize[1], groupSize[2]));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchMultipleKernelsIndirect(this->commandList->toHandle(), 2, kernels, kernelCount, dispatchTraits, nullptr, 0, nullptr));
+    this->executeAndSynchronize();
+
+    EXPECT_TRUE(this->csr->expectMemory(outBuffer, groupCount, size, aub_stream::CompareOperationValues::CompareEqual));
+    EXPECT_TRUE(this->csr->expectMemory(outBuffer2, groupCount2, size, aub_stream::CompareOperationValues::CompareEqual));
+}
+
+TEST_F(AUBAppendKernelIndirectL0, whenAppendKernelIndirectThenWorkDimIsProperlyProgrammed) {
+    std::tuple<std::array<uint32_t, 3> /*groupSize*/, std::array<uint32_t, 3> /*groupCount*/, uint32_t /*expected workdim*/> testData[]{
+        {{1, 1, 1}, {1, 1, 1}, 1},
+        {{1, 1, 1}, {2, 1, 1}, 1},
+        {{1, 1, 1}, {1, 2, 1}, 2},
+        {{1, 1, 1}, {1, 1, 2}, 3},
+        {{2, 1, 1}, {1, 1, 1}, 1},
+        {{2, 1, 1}, {2, 1, 1}, 1},
+        {{2, 1, 1}, {1, 2, 1}, 2},
+        {{2, 1, 1}, {1, 1, 2}, 3},
+        {{1, 2, 1}, {1, 1, 1}, 2},
+        {{1, 2, 1}, {2, 1, 1}, 2},
+        {{1, 2, 1}, {1, 2, 1}, 2},
+        {{1, 2, 1}, {1, 1, 2}, 3},
+        {{1, 1, 2}, {1, 1, 1}, 3},
+        {{1, 1, 2}, {2, 1, 1}, 3},
+        {{1, 1, 2}, {1, 2, 1}, 3},
+        {{1, 1, 2}, {1, 1, 2}, 3}};
+
+    auto kernel = this->createKernel("test_kernel", "test_get_work_dim", false);
+    ASSERT_NE(nullptr, kernel);
+
+    constexpr uint8_t size = sizeof(uint32_t);
+    const auto testCount = arrayCount<>(testData);
+    std::vector<void *> outBuffers(testCount, nullptr);
+    for (auto i = 0u; i < testCount; i++) {
+        std::array<uint32_t, 3> groupSize;
+        std::array<uint32_t, 3> groupCount;
+        uint32_t expectedWorkDim;
+
+        std::tie(groupSize, groupCount, expectedWorkDim) = testData[i];
+
+        auto dispatchTraitsBuffer = this->allocateHostMemory(sizeof(ze_group_count_t), 0u);
+        outBuffers[i] = this->allocateHostMemory(size, 0u);
+        ASSERT_NE(nullptr, dispatchTraitsBuffer);
+        ASSERT_NE(nullptr, outBuffers[i]);
+        memset(outBuffers[i], 0, size);
+
+        ze_group_count_t &dispatchTraits = *reinterpret_cast<ze_group_count_t *>(dispatchTraitsBuffer);
+        dispatchTraits.groupCountX = groupCount[0];
+        dispatchTraits.groupCountY = groupCount[1];
+        dispatchTraits.groupCountZ = groupCount[2];
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 0, sizeof(void *), &outBuffers[i]));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernel, groupSize[0], groupSize[1], groupSize[2]));
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchKernelIndirect(this->commandList->toHandle(), kernel, &dispatchTraits, nullptr, 0, nullptr));
+    }
+    this->executeAndSynchronize();
+
+    for (auto i = 0u; i < testCount; i++) {
+        const auto expectedWorkDim = std::get<2>(testData[i]);
+        EXPECT_TRUE(this->csr->expectMemory(outBuffers[i], &expectedWorkDim, size, aub_stream::CompareOperationValues::CompareEqual));
+    }
+}
+
+using AUBAppendQueryKernelTimestampsImmediateL0 = Test<AUBFixtureL0>;
+
+HWTEST_F(AUBAppendQueryKernelTimestampsImmediateL0, whenAppendQueryKernelTimestampsOnImmediateCommandListThenKernelTimestampsAreWritten) {
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+    std::unique_ptr<L0::CommandList> immediateCommandList(CommandList::createImmediate(device, &queueDesc, false,
+                                                                                       NEO::EngineGroupType::compute, returnValue));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto cmdListHandle = immediateCommandList->toHandle();
+
+    ze_event_pool_desc_t eventPoolDesc = {ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP | ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+    auto deviceHandle = device->toHandle();
+    ze_event_pool_handle_t eventPool = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeEventPoolCreate(context->toHandle(), &eventPoolDesc, 1, &deviceHandle, &eventPool));
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
+    ze_event_handle_t kernelTimestampEvent = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeEventCreate(eventPool, &eventDesc, &kernelTimestampEvent));
+
+    NEO::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory,
+                                                         1,
+                                                         context->rootDeviceIndices,
+                                                         context->deviceBitfields);
+
+    const uint32_t groupSize[] = {1, 1, 1};
+    const uint32_t expectedGlobalWorkSize[] = {1, 1, 1};
+    auto kernelOutput = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(3 * sizeof(uint32_t), unifiedMemoryProperties);
+    memset(kernelOutput, 0, 3 * sizeof(uint32_t));
+
+    auto timestampResult = static_cast<ze_kernel_timestamp_result_t *>(
+        driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(sizeof(ze_kernel_timestamp_result_t), unifiedMemoryProperties));
+    memset(timestampResult, 0, sizeof(ze_kernel_timestamp_result_t));
+    const uint64_t notExpectedEndTimestamp = 1;
+    timestampResult->global.kernelStart = notExpectedEndTimestamp;
+
+    ze_module_handle_t moduleHandle = createModuleFromFile("test_kernel", context, device, "");
+    ASSERT_NE(nullptr, moduleHandle);
+    ze_kernel_handle_t kernel;
+    ze_kernel_desc_t kernelDesc = {ZE_STRUCTURE_TYPE_KERNEL_DESC};
+    kernelDesc.pKernelName = "test_get_global_sizes";
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeKernelCreate(moduleHandle, &kernelDesc, &kernel));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernel, groupSize[0], groupSize[1], groupSize[2]));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 0, sizeof(void *), &kernelOutput));
+
+    ze_group_count_t dispatchTraits = {1, 1, 1};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchKernel(cmdListHandle, kernel, &dispatchTraits, kernelTimestampEvent, 0, nullptr));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendQueryKernelTimestamps(cmdListHandle, 1, &kernelTimestampEvent, timestampResult, nullptr, nullptr, 0, nullptr));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventHostSynchronize(kernelTimestampEvent, std::numeric_limits<uint64_t>::max()));
+
+    EXPECT_TRUE(csr->expectMemory(kernelOutput, expectedGlobalWorkSize, sizeof(expectedGlobalWorkSize), aub_stream::CompareOperationValues::CompareEqual));
+
+    EXPECT_TRUE(csr->expectMemory(&timestampResult->global.kernelStart, &notExpectedEndTimestamp, sizeof(uint64_t), aub_stream::CompareOperationValues::CompareNotEqual));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelDestroy(kernel));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeModuleDestroy(moduleHandle));
+    driverHandle->svmAllocsManager->freeSVMAlloc(kernelOutput);
+    driverHandle->svmAllocsManager->freeSVMAlloc(timestampResult);
+    zeEventDestroy(kernelTimestampEvent);
+    zeEventPoolDestroy(eventPool);
+}
+
+template <uint32_t TileCount>
+struct BcsSplitAubFixture : public MulticontextL0AubFixture {
+    virtual void setUp() {
+        std::bitset<bcsInfoMaskSize> bcsMask = 0b110;
+
+        if (blitterMaskOverride.has_value()) {
+            bcsMask = blitterMaskOverride.value();
+        }
+
+        int32_t numEnabledEngines = static_cast<int32_t>(bcsMask.count());
+        int32_t bcsMaskValue = static_cast<int32_t>(bcsMask.to_ulong());
+
+        debugManager.flags.BlitterEnableMaskOverride.set(bcsMaskValue);
+        debugManager.flags.SplitBcsCopy.set(1);
+        debugManager.flags.SplitBcsRequiredTileCount.set(1);
+        debugManager.flags.SplitBcsRequiredEnginesCount.set(numEnabledEngines);
+        debugManager.flags.SplitBcsMask.set(bcsMaskValue);
+        debugManager.flags.SplitBcsSize.set(64);
+        debugManager.flags.SplitBcsTransferDirectionMask.set(~(1 << static_cast<int32_t>(TransferDirection::localToLocal)));
+        debugManager.flags.ContextGroupSize.set(0);
+
+        if (static_cast<int32_t>(defaultHwInfo->featureTable.ftrBcsInfo.count()) < numEnabledEngines) {
+            GTEST_SKIP();
+        }
+
+        this->dispatchMode = DispatchMode::immediateDispatch;
+        MulticontextL0AubFixture::setUp(TileCount, EnabledCommandStreamers::single, (TileCount > 1));
+        debugManager.flags.EnableBlitterForEnqueueOperations.set(1);
+
+        if (skipped) {
+            GTEST_SKIP();
+        }
+
+        ze_context_handle_t hContext;
+        ze_context_desc_t desc = {ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
+        driverHandle->createContext(&desc, 0u, nullptr, &hContext);
+        ASSERT_NE(nullptr, hContext);
+        context.reset(Context::fromHandle(hContext));
+
+        ze_result_t returnValue;
+        commandList.reset(ult::CommandList::whiteboxCast(CommandList::create(rootDevice, NEO::EngineGroupType::compute, 0u, returnValue, false)));
+        ASSERT_NE(nullptr, commandList.get());
+
+        ze_command_queue_desc_t queueDesc = {
+            .ordinal = queryCopyOrdinal(),
+            .flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+        };
+
+        commandList.reset(CommandList::createImmediate(rootDevice,
+                                                       &queueDesc,
+                                                       false,
+                                                       NEO::EngineGroupType::copy,
+                                                       returnValue));
+
+        ASSERT_NE(nullptr, commandList.get());
+    }
+
+    uint32_t queryCopyOrdinal() {
+        uint32_t count = 0;
+        rootDevice->getCommandQueueGroupProperties(&count, nullptr);
+
+        std::vector<ze_command_queue_group_properties_t> groups;
+        groups.resize(count);
+
+        rootDevice->getCommandQueueGroupProperties(&count, groups.data());
+
+        for (uint32_t i = 0; i < count; i++) {
+            if (groups[i].flags == ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) {
+                return i;
+            }
+        }
+
+        EXPECT_TRUE(false);
+        return 0;
+    }
+
+    DestroyableZeUniquePtr<Event> createAggregatedEvent(uint64_t incValue, uint64_t completionValue) {
+        ze_device_mem_alloc_desc_t deviceDesc = {};
+        void *devAddress = nullptr;
+        context->allocDeviceMem(rootDevice->toHandle(), &deviceDesc, sizeof(uint64_t), 4096u, &devAddress);
+        ze_event_handle_t outEvent = nullptr;
+        ze_event_counter_based_external_aggregate_storage_desc_t externalStorageAllocProperties = {
+            .stype = ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_EXTERNAL_AGGREGATE_STORAGE_DESC,
+            .deviceAddress = reinterpret_cast<uint64_t *>(devAddress),
+            .incrementValue = incValue,
+            .completionValue = completionValue,
+        };
+
+        ze_event_counter_based_desc_t counterBasedDesc = {
+            .stype = ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC,
+            .pNext = &externalStorageAllocProperties,
+            .flags = ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE,
+        };
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zeEventCounterBasedCreate(context.get(), rootDevice, &counterBasedDesc, &outEvent));
+
+        return DestroyableZeUniquePtr<Event>(Event::fromHandle(outEvent));
+    }
+
+    DestroyableZeUniquePtr<Context> context;
+    DestroyableZeUniquePtr<L0::CommandList> commandList;
+};
+
+using BcsSplitAubTests = Test<BcsSplitAubFixture<1>>;
+
+HWTEST2_F(BcsSplitAubTests, whenAppendingCopyWithAggregatedEventThenEventIsSignaledAndDataIsCorrect, IsAtLeastXeHpcCore) {
+    auto whiteboxCmdList = static_cast<ult::WhiteBox<L0::CommandList> *>(commandList.get());
+    if (!whiteboxCmdList->isBcsSplitEnabled()) {
+        GTEST_SKIP();
+    }
+
+    size_t bufferSize = whiteboxCmdList->minimalSizeForBcsSplit;
+    NEO::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory,
+                                                         1,
+                                                         context->rootDeviceIndices,
+                                                         context->deviceBitfields);
+
+    auto srcBuffer = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+    auto dstBuffer1 = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+    auto dstBuffer2 = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+
+    std::fill(static_cast<uint8_t *>(srcBuffer), ptrOffset(static_cast<uint8_t *>(srcBuffer), bufferSize), 1);
+    memset(dstBuffer1, 0, bufferSize);
+    memset(dstBuffer2, 0, bufferSize);
+
+    uint32_t incValue = 0;
+    zeDeviceGetAggregatedCopyOffloadIncrementValue(rootDevice->toHandle(), &incValue);
+    auto event = createAggregatedEvent(incValue, incValue * 2);
+    auto eventStorage = reinterpret_cast<uint64_t *>(event->getInOrderExecEventHelper().getBaseDeviceAddress());
+    *event->getInOrderExecEventHelper().getBaseHostCpuAddress() = 0;
+
+    auto csr = getRootSimulatedCsr<FamilyType>();
+    csr->writeMemory(*event->getInOrderExecEventHelper().getDeviceCounterAllocation());
+
+    zeCommandListAppendMemoryCopy(commandList->toHandle(), dstBuffer1, srcBuffer, bufferSize, event->toHandle(), 0, nullptr);
+    zeCommandListHostSynchronize(commandList->toHandle(), std::numeric_limits<uint64_t>::max());
+
+    auto bcsSplit = static_cast<Device *>(rootDevice)->bcsSplit.get();
+    ASSERT_NE(nullptr, bcsSplit);
+
+    auto whiteboxSplitCmdList = static_cast<ult::WhiteBox<L0::CommandList> *>(bcsSplit->cmdLists[0]);
+
+    auto taskCount = whiteboxSplitCmdList->cmdQImmediate->getTaskCount();
+    EXPECT_TRUE(taskCount >= 1);
+
+    auto expectedIncValue = static_cast<uint64_t>(incValue);
+    EXPECT_TRUE(csr->expectMemory(dstBuffer1, srcBuffer, bufferSize, aub_stream::CompareOperationValues::CompareEqual));
+    EXPECT_TRUE(csr->expectMemory(eventStorage, &expectedIncValue, sizeof(uint64_t), aub_stream::CompareOperationValues::CompareEqual));
+
+    zeCommandListAppendMemoryCopy(commandList->toHandle(), dstBuffer2, srcBuffer, bufferSize, event->toHandle(), 0, nullptr);
+    zeCommandListHostSynchronize(commandList->toHandle(), std::numeric_limits<uint64_t>::max());
+
+    EXPECT_TRUE(whiteboxSplitCmdList->cmdQImmediate->getTaskCount() > taskCount);
+
+    expectedIncValue = incValue * 2;
+    EXPECT_TRUE(csr->expectMemory(dstBuffer2, srcBuffer, bufferSize, aub_stream::CompareOperationValues::CompareEqual));
+    EXPECT_TRUE(csr->expectMemory(eventStorage, &expectedIncValue, sizeof(uint64_t), aub_stream::CompareOperationValues::CompareEqual));
+
+    driverHandle->svmAllocsManager->freeSVMAlloc(srcBuffer);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dstBuffer1);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dstBuffer2);
+    context->freeMem(eventStorage);
+}
+
+HWTEST2_F(BcsSplitAubTests, whenAppendingCopyOnTwoCmdListsWithEventsThenDataIsCorrect, IsAtLeastXeHpcCore) {
+    size_t bufferSize = 3 * 32 * sizeof(uint32_t);
+    NEO::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory,
+                                                         1,
+                                                         context->rootDeviceIndices,
+                                                         context->deviceBitfields);
+
+    auto srcBuffer = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+    auto dstBuffer = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+
+    std::fill(static_cast<uint8_t *>(srcBuffer), ptrOffset(static_cast<uint8_t *>(srcBuffer), bufferSize), 5);
+    memset(dstBuffer, 0, bufferSize);
+
+    ze_event_pool_handle_t eventPool;
+    constexpr uint32_t numEvents = 3;
+    std::vector<ze_event_handle_t> events(numEvents);
+    for (auto &event : events) {
+        event = nullptr;
+    }
+
+    ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC};
+    eventPoolDesc.count = numEvents;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+    auto device = rootDevice->toHandle();
+    zeEventPoolCreate(context->toHandle(), &eventPoolDesc, 1, &device, &eventPool);
+
+    ze_command_queue_desc_t queueDesc = {
+        .ordinal = queryCopyOrdinal(),
+        .flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER,
+    };
+
+    DestroyableZeUniquePtr<L0::CommandList> commandList2;
+    ze_result_t returnValue;
+    commandList2.reset(CommandList::createImmediate(rootDevice,
+                                                    &queueDesc,
+                                                    false,
+                                                    NEO::EngineGroupType::copy,
+                                                    returnValue));
+
+    ze_event_desc_t eventDesc = {ZE_STRUCTURE_TYPE_EVENT_DESC};
+    for (uint32_t i = 0; i < numEvents; i++) {
+        eventDesc.index = i;
+        eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+        eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
+        zeEventCreate(eventPool, &eventDesc, &events[i]);
+    }
+
+    auto csr = getRootSimulatedCsr<FamilyType>();
+
+    auto buffer = reinterpret_cast<uint32_t *>(dstBuffer);
+    auto offsetBuffer1 = &(buffer[32]);
+    auto offsetBuffer2 = &(buffer[2 * 32]);
+
+    zeCommandListAppendMemoryCopy(commandList->toHandle(), buffer, srcBuffer, 32 * sizeof(uint32_t), events[0], 0, nullptr);
+    zeCommandListAppendMemoryCopy(commandList2->toHandle(), offsetBuffer1, srcBuffer, 32 * sizeof(uint32_t), events[1], 1, &events[0]);
+    zeCommandListAppendMemoryCopy(commandList->toHandle(), offsetBuffer2, srcBuffer, 32 * sizeof(uint32_t), events[2], 1, &events[1]);
+
+    zeEventHostSynchronize(events[2], 0);
+
+    EXPECT_TRUE(csr->expectMemory(dstBuffer, srcBuffer, bufferSize, aub_stream::CompareOperationValues::CompareEqual));
+
+    driverHandle->svmAllocsManager->freeSVMAlloc(srcBuffer);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dstBuffer);
+
+    for (auto event : events) {
+        zeEventDestroy(event);
+    }
+    zeEventPoolDestroy(eventPool);
+}
+
+using BcsSplitMultiTileAubTests = Test<BcsSplitAubFixture<2>>;
+
+HWTEST2_F(BcsSplitMultiTileAubTests, whenAppendingCopyWithAggregatedEventThenEventIsSignaledAndDataIsCorrect, SupportsMultiTile) {
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc = {.flags = ZE_COMMAND_QUEUE_FLAG_IN_ORDER | ZE_COMMAND_QUEUE_FLAG_COPY_OFFLOAD_HINT};
+    commandList.reset(CommandList::createImmediate(rootDevice, &queueDesc, false, NEO::EngineGroupType::compute, returnValue));
+    ASSERT_NE(nullptr, commandList.get());
+
+    auto whiteboxCmdList = static_cast<ult::WhiteBox<L0::CommandList> *>(commandList.get());
+    EXPECT_TRUE(whiteboxCmdList->isCopyOffloadEnabled());
+    EXPECT_TRUE(whiteboxCmdList->isBcsSplitEnabled());
+
+    size_t bufferSize = whiteboxCmdList->minimalSizeForBcsSplit;
+    NEO::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory,
+                                                         1,
+                                                         context->rootDeviceIndices,
+                                                         context->deviceBitfields);
+
+    auto srcBuffer = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+    auto dstBuffer1 = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+    auto dstBuffer2 = driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(bufferSize, unifiedMemoryProperties);
+
+    std::fill(static_cast<uint8_t *>(srcBuffer), ptrOffset(static_cast<uint8_t *>(srcBuffer), bufferSize), 1);
+    memset(dstBuffer1, 0, bufferSize);
+    memset(dstBuffer2, 0, bufferSize);
+
+    uint32_t incValue = 0;
+    zeDeviceGetAggregatedCopyOffloadIncrementValue(rootDevice->toHandle(), &incValue);
+    auto event = createAggregatedEvent(incValue, incValue * 2);
+    auto eventStorage = reinterpret_cast<uint64_t *>(event->getInOrderExecEventHelper().getBaseDeviceAddress());
+    *event->getInOrderExecEventHelper().getBaseHostCpuAddress() = 0;
+
+    auto csr = getRootSimulatedCsr<FamilyType>();
+    csr->writeMemory(*event->getInOrderExecEventHelper().getDeviceCounterAllocation());
+
+    zeCommandListAppendMemoryCopy(commandList->toHandle(), dstBuffer1, srcBuffer, bufferSize, event->toHandle(), 0, nullptr);
+    zeCommandListHostSynchronize(commandList->toHandle(), std::numeric_limits<uint64_t>::max());
+
+    auto bcsSplit = static_cast<Device *>(rootDevice)->bcsSplit.get();
+    ASSERT_NE(nullptr, bcsSplit);
+
+    auto whiteboxSplitCmdList = static_cast<ult::WhiteBox<L0::CommandList> *>(bcsSplit->cmdLists[0]);
+
+    auto taskCount = whiteboxSplitCmdList->cmdQImmediate->getTaskCount();
+    EXPECT_TRUE(taskCount >= 1);
+
+    auto expectedIncValue = static_cast<uint64_t>(incValue);
+    EXPECT_TRUE(csr->expectMemory(dstBuffer1, srcBuffer, bufferSize, aub_stream::CompareOperationValues::CompareEqual));
+    EXPECT_TRUE(csr->expectMemory(eventStorage, &expectedIncValue, sizeof(uint64_t), aub_stream::CompareOperationValues::CompareEqual));
+
+    zeCommandListAppendMemoryCopy(commandList->toHandle(), dstBuffer2, srcBuffer, bufferSize, event->toHandle(), 0, nullptr);
+    zeCommandListHostSynchronize(commandList->toHandle(), std::numeric_limits<uint64_t>::max());
+
+    EXPECT_TRUE(whiteboxSplitCmdList->cmdQImmediate->getTaskCount() > taskCount);
+
+    expectedIncValue = incValue * 2;
+    EXPECT_TRUE(csr->expectMemory(dstBuffer2, srcBuffer, bufferSize, aub_stream::CompareOperationValues::CompareEqual));
+    EXPECT_TRUE(csr->expectMemory(eventStorage, &expectedIncValue, sizeof(uint64_t), aub_stream::CompareOperationValues::CompareEqual));
+
+    driverHandle->svmAllocsManager->freeSVMAlloc(srcBuffer);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dstBuffer1);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dstBuffer2);
+    context->freeMem(eventStorage);
+}
+
+struct AubDirectSubmissionImmCmdListFixture : AUBFixtureL0 {
+
+    void setUp() {
+        debugManager.flags.EnableDirectSubmission.set(1);
+        debugManager.flags.EnableDirectSubmissionInSimulationMode.set(1);
+        AUBFixtureL0::setUp();
+
+        ze_result_t returnValue;
+        ze_command_queue_desc_t queueDesc = {};
+        commandList.reset(ult::CommandList::whiteboxCast(
+            CommandList::createImmediate(device, &queueDesc, false,
+                                         NEO::EngineGroupType::compute, returnValue)));
+        ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
+        ASSERT_NE(nullptr, commandList.get());
+        csr = commandList->getCsr(true);
+    }
+};
+
+using AubDirectSubmissionImmCmdListTests = Test<AubDirectSubmissionImmCmdListFixture>;
+
+HWTEST2_F(AubDirectSubmissionImmCmdListTests,
+          givenImmediateCmdListWithDirectSubmissionWhenTwoKernelsAppendedThenBothExecute,
+          IsAtLeastXeHpcCore) {
+    constexpr uint32_t numBytes = 64u;
+
+    NEO::UnifiedMemoryProperties usmProps(InternalMemoryType::hostUnifiedMemory, 1,
+                                          context->rootDeviceIndices, context->deviceBitfields);
+    auto *src1 = static_cast<char *>(driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(numBytes, usmProps));
+    auto *dst1 = static_cast<char *>(driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(numBytes, usmProps));
+    auto *src2 = static_cast<char *>(driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(numBytes, usmProps));
+    auto *dst2 = static_cast<char *>(driverHandle->svmAllocsManager->createHostUnifiedMemoryAllocation(numBytes, usmProps));
+
+    for (uint32_t i = 0u; i < numBytes; i++) {
+        src1[i] = static_cast<char>(i + 1u);
+        src2[i] = static_cast<char>(~i);
+    }
+    memset(dst1, 0, numBytes);
+    memset(dst2, 0, numBytes);
+
+    ze_module_handle_t module = createModuleFromFile("test_kernel", context, device, "");
+    ASSERT_NE(nullptr, module);
+
+    ze_kernel_desc_t kernelDesc = {ZE_STRUCTURE_TYPE_KERNEL_DESC};
+    kernelDesc.pKernelName = "memcpy_bytes";
+    ze_kernel_handle_t kernel;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeKernelCreate(module, &kernelDesc, &kernel));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, zeKernelSetGroupSize(kernel, numBytes, 1u, 1u));
+
+    ze_group_count_t groupCount = {1u, 1u, 1u};
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 0, sizeof(void *), &dst1));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 1, sizeof(void *), &src1));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchKernel(commandList->toHandle(), kernel, &groupCount, nullptr, 0u, nullptr));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 0, sizeof(void *), &dst2));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelSetArgumentValue(kernel, 1, sizeof(void *), &src2));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListAppendLaunchKernel(commandList->toHandle(), kernel, &groupCount, nullptr, 0u, nullptr));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeCommandListHostSynchronize(commandList->toHandle(), std::numeric_limits<uint64_t>::max()));
+
+    expectMemory<FamilyType>(dst1, src1, numBytes);
+    expectMemory<FamilyType>(dst2, src2, numBytes);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeKernelDestroy(kernel));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zeModuleDestroy(module));
+    driverHandle->svmAllocsManager->freeSVMAlloc(src1);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dst1);
+    driverHandle->svmAllocsManager->freeSVMAlloc(src2);
+    driverHandle->svmAllocsManager->freeSVMAlloc(dst2);
+}
+} // namespace ult
+} // namespace L0

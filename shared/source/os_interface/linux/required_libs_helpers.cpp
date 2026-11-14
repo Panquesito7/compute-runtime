@@ -1,0 +1,58 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/required_libs_helpers.h"
+
+#include <algorithm>
+#include <array>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace NEO {
+
+const std::span<const std::string_view> RequiredLibsHelpers::getDefaultBinarySearchPaths() {
+    using namespace std::string_view_literals;
+    static constexpr auto fixedPaths = std::to_array({"/usr/lib/intel-gpu"sv,
+                                                      "/lib"sv,
+                                                      "/lib64"sv,
+                                                      "/lib/x86_64-linux-gnu"sv,
+                                                      "/usr/lib"sv,
+                                                      "/usr/lib64"sv,
+                                                      "/usr/lib/x86_64-linux-gnu"sv,
+                                                      "/usr/local/lib"sv});
+    return fixedPaths;
+}
+
+const std::span<const std::string> RequiredLibsHelpers::getOptionalBinarySearchPaths(LockableSearchPaths &optionalPathsCache) {
+    auto lock = optionalPathsCache.lock();
+
+    if (not optionalPathsCache->empty()) {
+        return *optionalPathsCache;
+    }
+
+    const std::string &ldLibraryPath = NEO::debugManager.flags.EnvLdLibraryPath.getRef();
+    if (ldLibraryPath.empty()) {
+        return {};
+    }
+    auto ldPathsView = std::string_view(ldLibraryPath);
+
+    optionalPathsCache->reserve(std::ranges::count(ldPathsView, ':') + 1);
+    for (auto &&entry : ldPathsView | std::views::split(':')) {
+        const auto entrySize = static_cast<size_t>(std::ranges::distance(entry));
+        if (0 == entrySize) {
+            continue;
+        }
+        optionalPathsCache->emplace_back(&*entry.begin(), entrySize);
+    }
+
+    return *optionalPathsCache;
+}
+
+} // namespace NEO

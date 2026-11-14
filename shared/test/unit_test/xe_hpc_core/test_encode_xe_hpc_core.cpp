@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,15 @@
 
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/gmm_helper/cache_settings_helper.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/definitions/command_encoder_args.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/kernel/kernel_descriptor.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/product_helper.h"
+#include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
@@ -21,8 +24,6 @@
 #include "shared/test/unit_test/fixtures/command_container_fixture.h"
 #include "shared/test/unit_test/helpers/state_base_address_tests.h"
 #include "shared/test/unit_test/mocks/mock_dispatch_kernel_encoder_interface.h"
-
-#include "hw_cmds_xe_hpc_core_base.h"
 
 using namespace NEO;
 
@@ -59,7 +60,7 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenOffsetWhenProgrammingStatePre
     constexpr uint64_t gpuVa = 0x100000;
     constexpr uint32_t gpuVaOffset = 0x10000;
 
-    const GraphicsAllocation allocation(0, AllocationType::BUFFER, nullptr, gpuVa, 0, 4096, MemoryPool::LocalMemory, MemoryManager::maxOsContextCount);
+    const GraphicsAllocation allocation(0, 1u /*num gmms*/, AllocationType::buffer, nullptr, gpuVa, 0, 4096, MemoryPool::localMemory, MemoryManager::maxOsContextCount);
 
     memset(buffer, 0, sizeof(buffer));
     LinearStream linearStream(buffer, sizeof(buffer));
@@ -87,12 +88,15 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenDebugVariableSetwhenProgramin
     auto statePrefetchCmd = reinterpret_cast<STATE_PREFETCH *>(buffer);
 
     constexpr uint64_t gpuVa = 0x100000;
-    constexpr uint32_t mocsIndexForL3 = (2 << 1);
     constexpr size_t numCachelines = 3;
 
-    const GraphicsAllocation allocation(0, AllocationType::BUFFER, nullptr, gpuVa, 0, 4096, MemoryPool::LocalMemory, MemoryManager::maxOsContextCount);
+    const GraphicsAllocation allocation(0, 1u /*num gmms*/, AllocationType::buffer, nullptr, gpuVa, 0, 4096, MemoryPool::localMemory, MemoryManager::maxOsContextCount);
 
-    constexpr std::array<uint32_t, 7> expectedSizes = {{
+    auto rootDeviceEnv = mockExecutionEnvironment.rootDeviceEnvironments[0].get();
+    auto usage = CacheSettingsHelper::getGmmUsageType(allocation.getAllocationType(), false, rootDeviceEnv->getProductHelper(), *rootDeviceEnv->getHardwareInfo());
+    uint32_t mocs = rootDeviceEnv->getGmmHelper()->getMOCS(usage);
+
+    static constexpr std::array<uint32_t, 7> expectedSizes = {{
         MemoryConstants::cacheLineSize - 1,
         MemoryConstants::cacheLineSize,
         MemoryConstants::cacheLineSize + 1,
@@ -115,15 +119,15 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenDebugVariableSetwhenProgramin
         EXPECT_EQ(sizeof(STATE_PREFETCH) * expectedCmdsCount, linearStream.getUsed());
 
         for (uint32_t i = 0; i < expectedCmdsCount; i++) {
-            uint32_t programmedSize = (statePrefetchCmd[i].getPrefetchSize() + 1) * MemoryConstants::cacheLineSize;
+            uint32_t programmedSize = statePrefetchCmd[i].getPrefetchSize() * MemoryConstants::cacheLineSize;
 
             EXPECT_EQ(statePrefetchCmd[i].getAddress(), gpuVa + (i * MemoryConstants::pageSize64k));
             EXPECT_FALSE(statePrefetchCmd[i].getKernelInstructionPrefetch());
             EXPECT_FALSE(statePrefetchCmd[i].getParserStall());
-            EXPECT_EQ(mocsIndexForL3, statePrefetchCmd[i].getMemoryObjectControlState());
+            EXPECT_EQ(mocs, statePrefetchCmd[i].getMemoryObjectControlState());
 
             if (programmedSize > expectedSize) {
-                // cacheline alignemnt
+                // cacheline alignment
                 EXPECT_TRUE((programmedSize - expectedSize) < MemoryConstants::cacheLineSize);
                 expectedSize = 0;
             } else {
@@ -146,14 +150,14 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenIsaAllocationWhenProgrammingP
 
     EXPECT_EQ(sizeof(STATE_PREFETCH), EncodeMemoryPrefetch<FamilyType>::getSizeForMemoryPrefetch(1, *mockExecutionEnvironment.rootDeviceEnvironments[0]));
 
-    AllocationType isaTypes[] = {AllocationType::KERNEL_ISA, AllocationType::KERNEL_ISA_INTERNAL};
+    AllocationType isaTypes[] = {AllocationType::kernelIsa, AllocationType::kernelIsaInternal};
 
     for (auto &isaType : isaTypes) {
         memset(buffer, 0, sizeof(STATE_PREFETCH));
         LinearStream linearStream(buffer, sizeof(buffer));
 
-        const GraphicsAllocation allocation(0, isaType,
-                                            nullptr, 1234, 0, 4096, MemoryPool::LocalMemory, MemoryManager::maxOsContextCount);
+        const GraphicsAllocation allocation(0, 1u /*num gmms*/, isaType,
+                                            nullptr, 1234, 0, 4096, MemoryPool::localMemory, MemoryManager::maxOsContextCount);
 
         EncodeMemoryPrefetch<FamilyType>::programMemoryPrefetch(linearStream, allocation, 123, 0, *mockExecutionEnvironment.rootDeviceEnvironments[0]);
         EXPECT_EQ(sizeof(STATE_PREFETCH), linearStream.getUsed());
@@ -172,21 +176,21 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenDebugFlagSetWhenProgramPrefet
 
     uint8_t buffer[sizeof(STATE_PREFETCH)] = {};
 
-    AllocationType isaTypes[] = {AllocationType::KERNEL_ISA, AllocationType::KERNEL_ISA_INTERNAL};
+    AllocationType isaTypes[] = {AllocationType::kernelIsa, AllocationType::kernelIsaInternal};
 
     for (auto &isaType : isaTypes) {
         memset(buffer, 0, sizeof(STATE_PREFETCH));
-        const GraphicsAllocation allocation(0, isaType,
-                                            nullptr, 1234, 0, 4096, MemoryPool::LocalMemory, MemoryManager::maxOsContextCount);
+        const GraphicsAllocation allocation(0, 1u /*num gmms*/, isaType,
+                                            nullptr, 1234, 0, 4096, MemoryPool::localMemory, MemoryManager::maxOsContextCount);
 
         LinearStream linearStream(buffer, sizeof(buffer));
 
-        DebugManager.flags.EnableMemoryPrefetch.set(0);
+        debugManager.flags.EnableMemoryPrefetch.set(0);
         EXPECT_EQ(0u, EncodeMemoryPrefetch<FamilyType>::getSizeForMemoryPrefetch(100, *mockExecutionEnvironment.rootDeviceEnvironments[0]));
         EncodeMemoryPrefetch<FamilyType>::programMemoryPrefetch(linearStream, allocation, 100, 0, *mockExecutionEnvironment.rootDeviceEnvironments[0]);
         EXPECT_EQ(0u, linearStream.getUsed());
 
-        DebugManager.flags.EnableMemoryPrefetch.set(1);
+        debugManager.flags.EnableMemoryPrefetch.set(1);
         EncodeMemoryPrefetch<FamilyType>::programMemoryPrefetch(linearStream, allocation, 123, 0, *mockExecutionEnvironment.rootDeviceEnvironments[0]);
         EXPECT_EQ(sizeof(STATE_PREFETCH), linearStream.getUsed());
         auto statePrefetchCmd = reinterpret_cast<STATE_PREFETCH *>(buffer);
@@ -199,13 +203,13 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenDebugFlagSetWhenProgrammingPr
     MockExecutionEnvironment mockExecutionEnvironment{};
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.ForceCsStallForStatePrefetch.set(1);
+    debugManager.flags.ForceCsStallForStatePrefetch.set(1);
 
     auto &hwInfo = *mockExecutionEnvironment.rootDeviceEnvironments[0]->getMutableHardwareInfo();
     hwInfo.platform.usRevId = 0b0010'1000; // [3:5] - BaseDie != A0
 
-    const GraphicsAllocation allocation(0, AllocationType::BUFFER,
-                                        nullptr, 1234, 0, 4096, MemoryPool::LocalMemory, MemoryManager::maxOsContextCount);
+    const GraphicsAllocation allocation(0, 1u /*num gmms*/, AllocationType::buffer,
+                                        nullptr, 1234, 0, 4096, MemoryPool::localMemory, MemoryManager::maxOsContextCount);
     uint8_t buffer[sizeof(STATE_PREFETCH)] = {};
 
     LinearStream linearStream(buffer, sizeof(buffer));
@@ -219,47 +223,47 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, givenDebugFlagSetWhenProgrammingPr
 
 XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, whenProgrammingStateComputeModeThenProperFieldsAreSet) {
     using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
-    using EU_THREAD_SCHEDULING_MODE_OVERRIDE = typename STATE_COMPUTE_MODE::EU_THREAD_SCHEDULING_MODE_OVERRIDE;
+    using EU_THREAD_SCHEDULING_MODE = typename STATE_COMPUTE_MODE::EU_THREAD_SCHEDULING_MODE;
     uint8_t buffer[64]{};
     MockExecutionEnvironment executionEnvironment{};
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
     StateComputeModeProperties properties;
     auto pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment, nullptr);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment);
     auto pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     EXPECT_EQ(0u, pScm->getMaskBits());
     EXPECT_EQ(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_DISABLED, pScm->getForceNonCoherent());
-    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_HW_DEFAULT, pScm->getEuThreadSchedulingModeOverride());
+    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_HW_DEFAULT, pScm->getEuThreadSchedulingMode());
     EXPECT_FALSE(pScm->getLargeGrfMode());
 
     properties.isCoherencyRequired.value = 0;
     properties.threadArbitrationPolicy.value = ThreadArbitrationPolicy::RoundRobin;
     properties.largeGrfMode.value = 1;
     pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment, nullptr);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment);
     pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     EXPECT_EQ(0u, pScm->getMaskBits());
     EXPECT_EQ(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_DISABLED, pScm->getForceNonCoherent());
-    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_HW_DEFAULT, pScm->getEuThreadSchedulingModeOverride());
+    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_HW_DEFAULT, pScm->getEuThreadSchedulingMode());
     EXPECT_FALSE(pScm->getLargeGrfMode());
 
     properties.isCoherencyRequired.isDirty = true;
     properties.threadArbitrationPolicy.isDirty = true;
     properties.largeGrfMode.isDirty = true;
     pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment, nullptr);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment);
     pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     auto expectedMask = FamilyType::stateComputeModeForceNonCoherentMask | FamilyType::stateComputeModeEuThreadSchedulingModeOverrideMask |
                         FamilyType::stateComputeModeLargeGrfModeMask;
     EXPECT_EQ(expectedMask, pScm->getMaskBits());
     EXPECT_EQ(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_GPU_NON_COHERENT, pScm->getForceNonCoherent());
-    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_ROUND_ROBIN, pScm->getEuThreadSchedulingModeOverride());
+    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_ROUND_ROBIN, pScm->getEuThreadSchedulingMode());
     EXPECT_TRUE(pScm->getLargeGrfMode());
 }
 
 XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, whenAdjustComputeModeIsCalledThenCorrectPolicyIsProgrammed) {
     using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
-    using EU_THREAD_SCHEDULING_MODE_OVERRIDE = typename STATE_COMPUTE_MODE::EU_THREAD_SCHEDULING_MODE_OVERRIDE;
+    using EU_THREAD_SCHEDULING_MODE = typename STATE_COMPUTE_MODE::EU_THREAD_SCHEDULING_MODE;
 
     uint8_t buffer[64]{};
     StreamProperties properties{};
@@ -269,49 +273,48 @@ XE_HPC_CORETEST_F(CommandEncodeXeHpcCoreTest, whenAdjustComputeModeIsCalledThenC
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
     auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
     properties.initSupport(rootDeviceEnvironment);
-    properties.stateComputeMode.setPropertiesAll(false, 0, ThreadArbitrationPolicy::AgeBased, PreemptionMode::Disabled);
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment, nullptr);
+    properties.stateComputeMode.setPropertiesAll(0, ThreadArbitrationPolicy::AgeBased, false);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment);
     auto pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     if (productHelper.isThreadArbitrationPolicyReportedWithScm()) {
-        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_OLDEST_FIRST, pScm->getEuThreadSchedulingModeOverride());
+        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_OLDEST_FIRST, pScm->getEuThreadSchedulingMode());
     } else {
-        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_HW_DEFAULT, pScm->getEuThreadSchedulingModeOverride());
+        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_HW_DEFAULT, pScm->getEuThreadSchedulingMode());
     }
 
     pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    properties.stateComputeMode.setPropertiesAll(false, 0, ThreadArbitrationPolicy::RoundRobin, PreemptionMode::Disabled);
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment, nullptr);
+    properties.stateComputeMode.setPropertiesAll(0, ThreadArbitrationPolicy::RoundRobin, false);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment);
     pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     if (productHelper.isThreadArbitrationPolicyReportedWithScm()) {
-        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_ROUND_ROBIN, pScm->getEuThreadSchedulingModeOverride());
+        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_ROUND_ROBIN, pScm->getEuThreadSchedulingMode());
     } else {
-        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_HW_DEFAULT, pScm->getEuThreadSchedulingModeOverride());
+        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_HW_DEFAULT, pScm->getEuThreadSchedulingMode());
     }
 
     pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    properties.stateComputeMode.setPropertiesAll(false, 0, ThreadArbitrationPolicy::RoundRobinAfterDependency, PreemptionMode::Disabled);
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment, nullptr);
+    properties.stateComputeMode.setPropertiesAll(0, ThreadArbitrationPolicy::RoundRobinAfterDependency, false);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment);
     pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     if (productHelper.isThreadArbitrationPolicyReportedWithScm()) {
-        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_STALL_BASED_ROUND_ROBIN, pScm->getEuThreadSchedulingModeOverride());
+        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_STALL_BASED_ROUND_ROBIN, pScm->getEuThreadSchedulingMode());
     } else {
-        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_HW_DEFAULT, pScm->getEuThreadSchedulingModeOverride());
+        EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_HW_DEFAULT, pScm->getEuThreadSchedulingMode());
     }
 
     pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    properties.stateComputeMode.setPropertiesAll(false, 0, ThreadArbitrationPolicy::NotPresent, PreemptionMode::Disabled);
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment, nullptr);
+    properties.stateComputeMode.setPropertiesAll(0, ThreadArbitrationPolicy::NotPresent, false);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties.stateComputeMode, rootDeviceEnvironment);
     pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
-    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE_OVERRIDE::EU_THREAD_SCHEDULING_MODE_OVERRIDE_HW_DEFAULT, pScm->getEuThreadSchedulingModeOverride());
+    EXPECT_EQ(EU_THREAD_SCHEDULING_MODE::EU_THREAD_SCHEDULING_MODE_HW_DEFAULT, pScm->getEuThreadSchedulingMode());
 }
 
 using EncodeKernelXeHpcCoreTest = Test<CommandEncodeStatesFixture>;
 
 XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenNoFenceAsPostSyncOperationInComputeWalkerWhenEnqueueKernelIsCalledThenDoNotGenerateFenceCommands) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     DebugManagerStateRestore restore;
-    DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
+    debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
 
     uint32_t dims[] = {1, 1, 1};
     std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
@@ -320,24 +323,23 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenNoFenceAsPostSyncOperationInCo
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
 
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
 
-    auto walkerCmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto walkerCmd = genCmdCast<DefaultWalkerType *>(*itor);
     auto &postSyncData = walkerCmd->getPostSync();
     EXPECT_FALSE(postSyncData.getSystemMemoryFenceRequest());
 }
 
 XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenFenceAsPostSyncOperationInComputeWalkerWhenEnqueueKernelIsCalledThenGenerateFenceCommands) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     DebugManagerStateRestore restore;
-    DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(1);
+    debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(1);
 
     uint32_t dims[] = {1, 1, 1};
     std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
@@ -346,24 +348,24 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenFenceAsPostSyncOperationInComp
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
 
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
 
-    auto walkerCmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto walkerCmd = genCmdCast<DefaultWalkerType *>(*itor);
     auto &postSyncData = walkerCmd->getPostSync();
     EXPECT_TRUE(postSyncData.getSystemMemoryFenceRequest());
 }
 
 XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenKernelUsesSystemMemoryFlagTrueAndNoHostSignalEventThenNotUseSystemFence) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
+    debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
 
     auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     auto &productHelper = pDevice->getProductHelper();
@@ -377,9 +379,9 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenKern
 
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
-    dispatchArgs.isKernelUsingSystemAllocation = true;
+    dispatchArgs.postSyncArgs.isUsingSystemAllocation = true;
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(
@@ -387,19 +389,19 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenKern
         cmdContainer->getCommandStream()->getCpuBase(),
         cmdContainer->getCommandStream()->getUsed());
 
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
 
-    auto walkerCmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto walkerCmd = genCmdCast<DefaultWalkerType *>(*itor);
     auto &postSyncData = walkerCmd->getPostSync();
     EXPECT_FALSE(postSyncData.getSystemMemoryFenceRequest());
 }
 
 XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenEventHostSignalScopeFlagTrueAndNoSystemMemoryThenNotUseSystemFence) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
+    debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
 
     auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     auto &productHelper = pDevice->getProductHelper();
@@ -413,9 +415,9 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenEven
 
     bool requiresUncachedMocs = false;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
-    dispatchArgs.isHostScopeSignalEvent = true;
+    dispatchArgs.postSyncArgs.isHostScopeSignalEvent = true;
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(
@@ -423,19 +425,19 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenEven
         cmdContainer->getCommandStream()->getCpuBase(),
         cmdContainer->getCommandStream()->getUsed());
 
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
 
-    auto walkerCmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto walkerCmd = genCmdCast<DefaultWalkerType *>(*itor);
     auto &postSyncData = walkerCmd->getPostSync();
     EXPECT_FALSE(postSyncData.getSystemMemoryFenceRequest());
 }
 
 XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenKernelUsesSystemMemoryAndHostSignalEventFlagTrueThenUseSystemFence) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
+    debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(-1);
 
     auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     auto &productHelper = pDevice->getProductHelper();
@@ -448,33 +450,34 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDefaultSettingForFenceWhenKern
     dispatchInterface->getCrossThreadDataSizeResult = 0;
 
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, false);
-    dispatchArgs.isKernelUsingSystemAllocation = true;
-    dispatchArgs.isHostScopeSignalEvent = true;
+    dispatchArgs.postSyncArgs.isUsingSystemAllocation = true;
+    dispatchArgs.postSyncArgs.isHostScopeSignalEvent = true;
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
 
-    auto itor = find<WALKER_TYPE *>(commands.begin(), commands.end());
+    auto itor = find<DefaultWalkerType *>(commands.begin(), commands.end());
     ASSERT_NE(itor, commands.end());
 
-    auto walkerCmd = genCmdCast<WALKER_TYPE *>(*itor);
+    auto walkerCmd = genCmdCast<DefaultWalkerType *>(*itor);
     auto &postSyncData = walkerCmd->getPostSync();
     EXPECT_TRUE(postSyncData.getSystemMemoryFenceRequest());
 }
 
 XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenCleanHeapsAndSlmNotChangedAndUncachedMocsRequestedThenSBAIsProgrammedAndMocsAreSet) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
     uint32_t dims[] = {2, 1, 1};
     std::unique_ptr<MockDispatchKernelEncoder> dispatchInterface(new MockDispatchKernelEncoder());
     cmdContainer->slmSizeRef() = 1;
     cmdContainer->setDirtyStateForAllHeaps(false);
-    dispatchInterface->getSlmTotalSizeResult = cmdContainer->slmSizeRef();
+    dispatchInterface->getSlmTotalSizePerThreadGroupResult = cmdContainer->slmSizeRef();
 
     bool requiresUncachedMocs = true;
     EncodeDispatchKernelArgs dispatchArgs = createDefaultDispatchKernelArgs(pDevice, dispatchInterface.get(), dims, requiresUncachedMocs);
 
-    EncodeDispatchKernel<FamilyType>::encode(*cmdContainer.get(), dispatchArgs, nullptr);
+    EncodeDispatchKernel<FamilyType>::template encode<DefaultWalkerType>(*cmdContainer.get(), dispatchArgs);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(cmdContainer->getCommandStream()->getCpuBase(), 0), cmdContainer->getCommandStream()->getUsed());
@@ -486,204 +489,7 @@ XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenCleanHeapsAndSlmNotChangedAndU
     auto cmdSba = genCmdCast<STATE_BASE_ADDRESS *>(*itor);
     auto gmmHelper = cmdContainer->getDevice()->getGmmHelper();
     EXPECT_EQ(cmdSba->getStatelessDataPortAccessMemoryObjectControlState(),
-              (gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED)));
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDispatchSizeSmallerOrEqualToAvailableThreadCountWhenAdjustInterfaceDescriptorDataIsCalledThenThreadGroupDispatchSizeIsCorrectlySet) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-    hwInfo.gtSystemInfo.EUCount = 2u;
-
-    const uint32_t numGrf = GrfConfig::LargeGrfNumber;
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    iddArg.setNumberOfThreadsInGpgpuThreadGroup(1u);
-
-    for (const auto threadGroupCount : {1u, 2u}) {
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
-    }
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenMultipleTilesAndImplicitScalingWhenAdjustInterfaceDescriptorDataIsCalledThenThreadGroupDispatchSizeIsCorrectlySet) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableWalkerPartition.set(0);
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-    hwInfo.gtSystemInfo.EUCount = 32;
-    hwInfo.gtSystemInfo.DualSubSliceCount = hwInfo.gtSystemInfo.MaxDualSubSlicesSupported;
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    const uint32_t numGrf = GrfConfig::DefaultGrfNumber;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    const uint32_t threadGroupCount = gfxCoreHelper.calculateAvailableThreadCount(hwInfo, numGrf) / 32u;
-    iddArg.setNumberOfThreadsInGpgpuThreadGroup(64u);
-
-    EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-    ASSERT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_2, iddArg.getThreadGroupDispatchSize());
-
-    DebugManager.flags.EnableWalkerPartition.set(1);
-    pDevice->numSubDevices = 2;
-    EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-    EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenNumberOfThreadsInThreadGroupWhenCallingAdjustInterfaceDescriptorDataThenThreadGroupDispatchSizeIsCorrectlySet) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    const uint32_t threadGroupCount = 512u;
-    const uint32_t numGrf = GrfConfig::DefaultGrfNumber;
-    std::array<std::pair<uint32_t, uint32_t>, 3> testParams = {{{16u, INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_8},
-                                                                {32u, INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_4},
-                                                                {64u, INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_2}}};
-
-    for (const auto &[numberOfThreadsInThreadGroup, expectedThreadGroupDispatchSize] : testParams) {
-        iddArg.setNumberOfThreadsInGpgpuThreadGroup(numberOfThreadsInThreadGroup);
-
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-
-        EXPECT_EQ(expectedThreadGroupDispatchSize, iddArg.getThreadGroupDispatchSize());
-    }
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenNumberOfThreadsInThreadGroupAndDimensionsWhenCallingAdjustInterfaceDescriptorDataThenThreadGroupDispatchSizeIsCorrectlySet) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    const uint32_t threadGroupCount = 512u;
-    const uint32_t numGrf = GrfConfig::DefaultGrfNumber;
-
-    iddArg.setNumberOfThreadsInGpgpuThreadGroup(16u);
-
-    {
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_8, iddArg.getThreadGroupDispatchSize());
-    }
-    walkerCmd.setThreadGroupIdYDimension(2);
-    walkerCmd.setThreadGroupIdZDimension(1);
-    {
-        walkerCmd.setThreadGroupIdXDimension(4);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_4, iddArg.getThreadGroupDispatchSize());
-    }
-    {
-        walkerCmd.setThreadGroupIdXDimension(2);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_2, iddArg.getThreadGroupDispatchSize());
-    }
-    {
-        walkerCmd.setThreadGroupIdXDimension(1);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
-    }
-    walkerCmd.setThreadGroupIdYDimension(1);
-    walkerCmd.setThreadGroupIdZDimension(2);
-    {
-        walkerCmd.setThreadGroupIdXDimension(4);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_4, iddArg.getThreadGroupDispatchSize());
-    }
-    {
-        walkerCmd.setThreadGroupIdXDimension(2);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_2, iddArg.getThreadGroupDispatchSize());
-    }
-    {
-        walkerCmd.setThreadGroupIdXDimension(1);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
-    }
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenDifferentNumGrfWhenCallingAdjustInterfaceDescriptorDataThenThreadGroupDispatchSizeIsCorrectlySet) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    const uint32_t numberOfThreadsInThreadGroup = 1u;
-
-    {
-        const uint32_t numGrf = GrfConfig::DefaultGrfNumber;
-        const uint32_t threadGroupCount = gfxCoreHelper.calculateAvailableThreadCount(hwInfo, numGrf);
-        iddArg.setNumberOfThreadsInGpgpuThreadGroup(numberOfThreadsInThreadGroup);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        ASSERT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
-    }
-
-    {
-        const uint32_t numGrf = GrfConfig::LargeGrfNumber;
-        const uint32_t threadGroupCount = gfxCoreHelper.calculateAvailableThreadCount(hwInfo, numGrf);
-        iddArg.setNumberOfThreadsInGpgpuThreadGroup(numberOfThreadsInThreadGroup);
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-        EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
-    }
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenNumberOfThreadsInThreadGroupAndDebugFlagDisabledWhenCallingAdjustInterfaceDescriptorDataThenThreadGroupDispatchSizeIsDefault) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.AdjustThreadGroupDispatchSize.set(0);
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    const uint32_t threadGroupCount = 512u;
-    const uint32_t numGrf = GrfConfig::DefaultGrfNumber;
-    std::array<std::pair<uint32_t, uint32_t>, 3> testParams = {{{16u, INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1},
-                                                                {32u, INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1},
-                                                                {64u, INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1}}};
-
-    for (const auto &[numberOfThreadsInThreadGroup, expectedThreadGroupDispatchSize] : testParams) {
-        iddArg.setNumberOfThreadsInGpgpuThreadGroup(numberOfThreadsInThreadGroup);
-
-        EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-
-        EXPECT_EQ(expectedThreadGroupDispatchSize, iddArg.getThreadGroupDispatchSize());
-    }
-}
-
-XE_HPC_CORETEST_F(EncodeKernelXeHpcCoreTest, givenThreadGroupCountZeroWhenCallingAdjustInterfaceDescriptorDataThenThreadGroupDispatchSizeIsSetToDefault) {
-    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE walkerCmd{};
-    const auto &productHelper = pDevice->getProductHelper();
-    auto hwInfo = pDevice->getHardwareInfo();
-    hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
-
-    const uint32_t threadGroupCount = 0u;
-    const uint32_t numGrf = GrfConfig::DefaultGrfNumber;
-    INTERFACE_DESCRIPTOR_DATA iddArg = FamilyType::cmdInitInterfaceDescriptorData;
-    iddArg.setNumberOfThreadsInGpgpuThreadGroup(1u);
-
-    EncodeDispatchKernel<FamilyType>::adjustInterfaceDescriptorData(iddArg, *pDevice, hwInfo, threadGroupCount, numGrf, walkerCmd);
-
-    EXPECT_EQ(INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1, iddArg.getThreadGroupDispatchSize());
+              (gmmHelper->getUncachedMOCS()));
 }
 
 using XeHpcSbaTest = SbaTest;
@@ -695,12 +501,12 @@ XE_HPC_CORETEST_F(XeHpcSbaTest, givenSpecificProductFamilyWhenAppendingSbaThenPr
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_POLICY_WBP, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_CONTROL_WBP, sbaCmd.getL1CacheControlCachePolicy());
 }
 
 XE_HPC_CORETEST_F(XeHpcSbaTest, givenL1CachingOverrideWhenStateBaseAddressIsProgrammedThenItMatchesTheOverrideValue) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceStatelessL1CachingPolicy.set(0u);
+    debugManager.flags.ForceStatelessL1CachingPolicy.set(0u);
     auto sbaCmd = FamilyType::cmdInitStateBaseAddress;
     StateBaseAddressHelperArgs<FamilyType> args = createSbaHelperArgs<FamilyType>(&sbaCmd, pDevice->getRootDeviceEnvironment().getGmmHelper(), &ssh, nullptr, nullptr);
     args.setGeneralStateBaseAddress = true;
@@ -710,19 +516,19 @@ XE_HPC_CORETEST_F(XeHpcSbaTest, givenL1CachingOverrideWhenStateBaseAddressIsProg
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(0u, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(0u, sbaCmd.getL1CacheControlCachePolicy());
 
-    DebugManager.flags.ForceStatelessL1CachingPolicy.set(2u);
+    debugManager.flags.ForceStatelessL1CachingPolicy.set(2u);
     updateSbaHelperArgsL1CachePolicy<FamilyType>(args, productHelper);
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(2u, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(2u, sbaCmd.getL1CacheControlCachePolicy());
 
-    DebugManager.flags.ForceAllResourcesUncached.set(true);
+    debugManager.flags.ForceAllResourcesUncached.set(true);
     updateSbaHelperArgsL1CachePolicy<FamilyType>(args, productHelper);
 
     StateBaseAddressHelper<FamilyType>::appendStateBaseAddressParameters(args);
 
-    EXPECT_EQ(1u, sbaCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(1u, sbaCmd.getL1CacheControlCachePolicy());
 }

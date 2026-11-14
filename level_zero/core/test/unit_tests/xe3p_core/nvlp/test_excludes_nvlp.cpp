@@ -1,0 +1,15 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/test/common/test_macros/test_excludes.h"
+
+namespace L0 {
+namespace ult {
+HWTEST_EXCLUDE_PRODUCT(CommandQueueGroupTest, givenVaryingBlitterSupportAndCCSThenBCSGroupContainsCorrectNumberOfEngines, IGFX_NVL);
+HWTEST_EXCLUDE_PRODUCT(CommandQueueGroupTest, givenBlitterSupportAndCCSThenThreeQueueGroupsAreReturned, IGFX_NVL);
+} // namespace ult
+} // namespace L0

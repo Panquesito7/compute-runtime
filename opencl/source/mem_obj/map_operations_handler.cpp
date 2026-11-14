@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,8 @@
 #include "opencl/source/mem_obj/map_operations_handler.h"
 
 #include "shared/source/helpers/ptr_math.h"
+
+#include <algorithm>
 
 using namespace NEO;
 
@@ -42,7 +44,7 @@ bool MapOperationsHandler::isOverlapping(MapInfo &inputMapInfo) {
         auto mappedEndPtr = ptrOffset(mappedStartPtr, mapInfo.ptrLength);
 
         // Requested ptr starts before or inside existing ptr range and overlapping end
-        if (inputStartPtr < mappedEndPtr && inputEndPtr >= mappedStartPtr) {
+        if (inputStartPtr < mappedEndPtr && inputEndPtr > mappedStartPtr) {
             return true;
         }
     }

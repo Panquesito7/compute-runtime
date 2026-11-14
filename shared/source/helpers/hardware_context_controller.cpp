@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,18 +7,40 @@
 
 #include "shared/source/helpers/hardware_context_controller.h"
 
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/os_interface/os_context.h"
 
 #include "aubstream/allocation_params.h"
+#include "aubstream/aubstream.h"
 using namespace NEO;
 
-HardwareContextController::HardwareContextController(aub_stream::AubManager &aubManager, OsContext &osContext, uint32_t flags) {
+HardwareContextController::HardwareContextController(aub_stream::AubManager &aubManager, OsContext &osContext, uint32_t flags) : osContext(osContext), flags(flags) {}
+
+void HardwareContextController::createHardwareContexts(aub_stream::AubManager &aubManager) {
     auto deviceBitfield = osContext.getDeviceBitfield();
     for (uint32_t deviceIndex = 0; deviceIndex < deviceBitfield.size(); deviceIndex++) {
         if (deviceBitfield.test(deviceIndex)) {
-            hardwareContexts.emplace_back(aubManager.createHardwareContext(deviceIndex, osContext.getEngineType(), flags));
+            aub_stream::CreateHardwareContext3Params params = {};
+
+            params.device = deviceIndex;
+            params.engine = osContext.getEngineType();
+            params.flags = flags;
+            params.contextId = osContext.getContextId();
+            params.primaryContextId = aub_stream::hardwareContextId::invalidContextId;
+            params.priority = 0;
+            if (osContext.hasPriorityLevel()) {
+                params.priority = osContext.getPriorityLevel();
+
+                // clear priority flags
+                params.flags &= ~(aub_stream::hardwareContextFlags::highPriority | aub_stream::hardwareContextFlags::lowPriority);
+            } else {
+                params.priority = osContext.isHighPriority() ? 2 : 1;
+            }
+
+            if (osContext.getPrimaryContext()) {
+                params.primaryContextId = osContext.getPrimaryContext()->getContextId();
+            }
+            hardwareContexts.emplace_back(aubManager.createHardwareContext3(&params.header));
         }
     }
 }
@@ -32,6 +54,14 @@ void HardwareContextController::initialize() {
 void HardwareContextController::pollForCompletion() {
     for (auto &hardwareContext : hardwareContexts) {
         hardwareContext->pollForCompletion();
+    }
+}
+
+void HardwareContextController::resubmitInactiveContexts() {
+    for (auto &hardwareContext : hardwareContexts) {
+        if (!hardwareContext->isActive()) {
+            hardwareContext->resubmit();
+        }
     }
 }
 

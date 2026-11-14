@@ -1,13 +1,15 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace NEO {
 class LinearStream;
@@ -17,7 +19,6 @@ struct RootDeviceEnvironment;
 class Device;
 class GraphicsAllocation;
 struct KernelDescriptor;
-class LogicalStateHelper;
 struct RuntimeCapabilityTable;
 class OsContext;
 
@@ -28,12 +29,10 @@ struct PreemptionFlags {
     union {
         struct {
             uint32_t disabledMidThreadPreemptionKernel : 1;
-            uint32_t vmeKernel : 1;
-            uint32_t deviceSupportsVmePreemption : 1;
             uint32_t disablePerCtxtPreemptionGranularityControl : 1;
             uint32_t usesFencesForReadWriteImages : 1;
             uint32_t disableLSQCROPERFforOCL : 1;
-            uint32_t reserved : 26;
+            uint32_t reserved : 28;
         } flags;
         uint32_t data;
     };
@@ -56,13 +55,10 @@ class PreemptionHelper {
     static size_t getRequiredStateSipCmdSize(Device &device, bool isRcs);
 
     template <typename GfxFamily>
-    static void programCsrBaseAddress(LinearStream &preambleCmdStream, Device &device, const GraphicsAllocation *preemptionCsr, LogicalStateHelper *logicalStateHelper);
+    static void programCsrBaseAddress(LinearStream &preambleCmdStream, Device &device, const GraphicsAllocation *preemptionCsr);
 
     template <typename GfxFamily>
-    static void programStateSip(LinearStream &preambleCmdStream, Device &device, LogicalStateHelper *logicalStateHelper, OsContext *context);
-
-    template <typename GfxFamily>
-    static void programStateSipEndWa(LinearStream &cmdStream, const RootDeviceEnvironment &rootDeviceEnvironment);
+    static void programStateSip(LinearStream &preambleCmdStream, Device &device, OsContext *context);
 
     template <typename GfxFamily>
     static size_t getRequiredCmdStreamSize(PreemptionMode newPreemptionMode, PreemptionMode oldPreemptionMode);
@@ -72,25 +68,22 @@ class PreemptionHelper {
                                  GraphicsAllocation *preemptionCsr);
 
     template <typename GfxFamily>
-    static size_t getPreemptionWaCsSize(const Device &device);
+    static size_t getRequiredCmdStreamSizeForLateStart();
 
     template <typename GfxFamily>
-    static void applyPreemptionWaCmdsBegin(LinearStream *pCommandStream, const Device &device);
-
-    template <typename GfxFamily>
-    static void applyPreemptionWaCmdsEnd(LinearStream *pCommandStream, const Device &device);
+    static void programCmdStreamForLateStart(LinearStream &cmdStream);
 
     static PreemptionMode getDefaultPreemptionMode(const HardwareInfo &hwInfo);
 
-    template <typename GfxFamily>
-    static void programInterfaceDescriptorDataPreemption(INTERFACE_DESCRIPTOR_DATA<GfxFamily> *idd, PreemptionMode preemptionMode);
+    template <typename GfxFamily, typename InterfaceDescriptorType>
+    static void programInterfaceDescriptorDataPreemption(InterfaceDescriptorType *idd, PreemptionMode preemptionMode);
 
   protected:
     template <typename GfxFamily>
-    static void programCsrBaseAddressCmd(LinearStream &preambleCmdStream, const GraphicsAllocation *preemptionCsr, LogicalStateHelper *logicalStateHelper);
+    static void programCsrBaseAddressCmd(LinearStream &preambleCmdStream, const GraphicsAllocation *preemptionCsr);
 
     template <typename GfxFamily>
-    static void programStateSipCmd(LinearStream &preambleCmdStream, GraphicsAllocation *sipAllocation, LogicalStateHelper *logicalStateHelper);
+    static void programStateSipCmd(LinearStream &preambleCmdStream, GraphicsAllocation *sipAllocation, bool useFullAddress);
 };
 
 template <typename GfxFamily>

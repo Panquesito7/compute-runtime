@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,9 @@
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/os_interface/linux/drm_memory_manager.h"
+#include "shared/test//common/helpers/ult_hw_config.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
 
@@ -23,8 +26,9 @@ class DrmMockDefault : public DrmMock {
         storedRetValForPooledEU = 0;
         storedRetValForMinEUinPool = 0;
 
-        if (hwDeviceIdIn != nullptr)
+        if (hwDeviceIdIn != nullptr) {
             this->hwDeviceId = std::move(hwDeviceIdIn);
+        }
     }
 };
 
@@ -49,7 +53,7 @@ Drm *Drm::create(std::unique_ptr<HwDeviceIdDrm> &&hwDeviceId, RootDeviceEnvironm
     drm->queryPageFaultSupport();
 
     if (rootDeviceEnvironment.executionEnvironment.isDebuggingEnabled()) {
-        if (drm->getRootDeviceEnvironment().executionEnvironment.getDebuggingMode() == DebuggingMode::Offline) {
+        if (drm->getRootDeviceEnvironment().executionEnvironment.getDebuggingMode() == DebuggingMode::offline) {
             drm->setPerContextVMRequired(false);
         } else {
             if (drm->isVmBindAvailable()) {
@@ -69,9 +73,13 @@ void Drm::overrideBindSupport(bool &useVmBind) {
     if (disableBindDefaultInTests) {
         useVmBind = false;
     }
-    if (DebugManager.flags.UseVmBind.get() == 1) {
+    if (debugManager.flags.UseVmBind.get() == 1) {
         useVmBind = true;
     }
+}
+
+bool DrmMemoryManager::isGemCloseWorkerSupported() {
+    return ultHwConfig.useGemCloseWorker;
 }
 
 } // namespace NEO

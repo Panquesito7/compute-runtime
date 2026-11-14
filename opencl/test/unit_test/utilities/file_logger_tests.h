@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,22 +10,33 @@
 #include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/string_helpers.h"
 #include "shared/source/utilities/directory.h"
+#include "shared/test/common/utilities/logger_tests.h"
 
 #include "opencl/source/utilities/cl_logger.h"
 
 #include <map>
 
-using FullyEnabledClFileLogger = NEO::ClFileLogger<DebugFunctionalityLevel::Full>;
-using FullyDisabledClFileLogger = NEO::ClFileLogger<DebugFunctionalityLevel::None>;
-
-template <bool DebugFunctionality>
-class TestLoggerApiEnterWrapper : public NEO::LoggerApiEnterWrapper<DebugFunctionality> {
+template <DebugFunctionalityLevel debugLevel>
+class TestClFileLogger : public NEO::ClFileLogger<debugLevel> {
   public:
-    TestLoggerApiEnterWrapper(const char *functionName, int *errCode) : NEO::LoggerApiEnterWrapper<DebugFunctionality>(functionName, errCode) {
-        if (DebugFunctionality) {
+    TestClFileLogger(TestFileLogger<debugLevel> &baseLoggerInm, const NEO::DebugVariables &flags)
+        : NEO::ClFileLogger<debugLevel>(baseLoggerInm, flags), baseLogger(baseLoggerInm) {}
+
+  protected:
+    TestFileLogger<debugLevel> &baseLogger;
+};
+
+template <bool debugFunctionality>
+class TestLoggerApiEnterWrapper : public NEO::LoggerApiEnterWrapper<debugFunctionality> {
+  public:
+    TestLoggerApiEnterWrapper(const char *functionName, int *errCode) : NEO::LoggerApiEnterWrapper<debugFunctionality>(functionName, errCode) {
+        if (debugFunctionality) {
             loggedEnter = true;
         }
     }
 
     bool loggedEnter = false;
 };
+
+using FullyEnabledClFileLogger = TestClFileLogger<DebugFunctionalityLevel::full>;
+using FullyDisabledClFileLogger = TestClFileLogger<DebugFunctionalityLevel::none>;

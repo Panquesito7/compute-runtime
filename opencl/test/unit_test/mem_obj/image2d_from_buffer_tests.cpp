@@ -1,22 +1,24 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/compiler_interface/oclc_extensions.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/surface_format_info.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/helpers/raii_gfx_core_helper.h"
-#include "shared/test/common/mocks/mock_gmm.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/cl_device/cl_device_info_map.h"
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/test_macros/test_checks_ocl.h"
@@ -24,7 +26,7 @@
 using namespace NEO;
 
 namespace NEO {
-extern GfxCoreHelperCreateFunctionType gfxCoreHelperFactory[IGFX_MAX_CORE];
+extern GfxCoreHelperCreateFunctionType gfxCoreHelperFactory[NEO::maxCoreEnumValue];
 }
 
 // Tests for cl_khr_image2d_from_buffer
@@ -47,7 +49,6 @@ class Image2dFromBufferTest : public ::testing::Test {
         imageDesc.image_slice_pitch = 0;
         imageDesc.num_samples = 0;
 
-        size = 128 * 256 * 4;
         hostPtr = alignedMalloc(size, 16);
         ASSERT_NE(nullptr, hostPtr);
         imageDesc.mem_object = clCreateBuffer(&context, CL_MEM_USE_HOST_PTR, size, hostPtr, &retVal);
@@ -60,8 +61,7 @@ class Image2dFromBufferTest : public ::testing::Test {
 
     Image *createImage() {
         cl_mem_flags flags = CL_MEM_READ_ONLY;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(
-            flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         return Image::create(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              flags, 0, surfaceFormat, &imageDesc, NULL, retVal);
     }
@@ -70,7 +70,7 @@ class Image2dFromBufferTest : public ::testing::Test {
     cl_int retVal = CL_SUCCESS;
     MockContext context;
     void *hostPtr;
-    size_t size;
+    static constexpr size_t size = 128 * 256 * 4;
 };
 
 TEST_F(Image2dFromBufferTest, WhenCreatingImage2dFromBufferThenImagePropertiesAreCorrect) {
@@ -84,7 +84,7 @@ TEST_F(Image2dFromBufferTest, WhenCreatingImage2dFromBufferThenImagePropertiesAr
     EXPECT_NE(nullptr, imageFromBuffer);
 
     EXPECT_FALSE(imageFromBuffer->isTiledAllocation());
-    EXPECT_EQ(imageFromBuffer->getCubeFaceIndex(), static_cast<uint32_t>(__GMM_NO_CUBE_MAP));
+    EXPECT_EQ(imageFromBuffer->getCubeFaceIndex(), gmmNoCubeMap);
 
     delete imageFromBuffer;
     EXPECT_EQ(1, buffer->getRefInternalCount());
@@ -93,8 +93,7 @@ TEST_F(Image2dFromBufferTest, WhenCreatingImage2dFromBufferThenImagePropertiesAr
 TEST_F(Image2dFromBufferTest, givenBufferWhenCreateImage2dArrayFromBufferThenImageDescriptorIsInvalid) {
     imageDesc.image_type = CL_MEM_OBJECT_IMAGE2D_ARRAY;
     cl_mem_flags flags = CL_MEM_READ_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_DESCRIPTOR, retVal);
@@ -110,8 +109,7 @@ TEST_F(Image2dFromBufferTest, givenInvalidRowPitchWhenCreateImage2dFromBufferThe
     char ptr[10];
     imageDesc.image_row_pitch = 255;
     cl_mem_flags flags = CL_MEM_READ_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, ptr);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -130,19 +128,15 @@ TEST_F(Image2dFromBufferTest, givenRowPitchThatIsGreaterThenComputedWhenImageIsC
 
 TEST_F(Image2dFromBufferTest, GivenInvalidHostPtrAlignmentWhenCreatingImageThenInvalidImageFormatDescriptorErrorIsReturned) {
     REQUIRE_IMAGES_OR_SKIP(&context);
-    std::unique_ptr<void, decltype(free) *> myHostPtr(malloc(size + 1), free);
-    ASSERT_NE(nullptr, myHostPtr);
-    void *nonAlignedHostPtr = myHostPtr.get();
-    if ((reinterpret_cast<uint64_t>(myHostPtr.get()) % 4) == 0) {
-        nonAlignedHostPtr = reinterpret_cast<void *>((reinterpret_cast<uint64_t>(myHostPtr.get()) + 1));
-    }
+    alignas(4) uint8_t hostStorage[size + 1];
+    void *nonAlignedHostPtr = hostStorage + 1;
+    ASSERT_NE(0u, reinterpret_cast<uint64_t>(nonAlignedHostPtr) % 4);
 
     cl_mem origBuffer = imageDesc.mem_object;
     imageDesc.mem_object = clCreateBuffer(&context, CL_MEM_USE_HOST_PTR, size, nonAlignedHostPtr, &retVal);
     ASSERT_NE(nullptr, imageDesc.mem_object);
     cl_mem_flags flags = CL_MEM_READ_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -156,8 +150,7 @@ TEST_F(Image2dFromBufferTest, givenInvalidFlagsWhenValidateIsCalledThenReturnErr
     cl_mem_flags flags[] = {CL_MEM_USE_HOST_PTR, CL_MEM_COPY_HOST_PTR};
 
     for (auto flag : flags) {
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(
-            flag, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flag, &imageFormat);
         retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flag, 0, 0, &context.getDevice(0)->getDevice()),
                                  surfaceFormat, &imageDesc, reinterpret_cast<void *>(0x12345));
         EXPECT_EQ(CL_INVALID_VALUE, retVal);
@@ -171,8 +164,7 @@ TEST_F(Image2dFromBufferTest, givenOneChannel8BitColorsNoRowPitchSpecifiedAndToo
     imageFormat.image_channel_data_type = CL_UNORM_INT8;
     imageFormat.image_channel_order = CL_R;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -185,8 +177,7 @@ TEST_F(Image2dFromBufferTest, givenOneChannel16BitColorsNoRowPitchSpecifiedAndTo
     imageFormat.image_channel_data_type = CL_UNORM_INT16;
     imageFormat.image_channel_order = CL_R;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -199,8 +190,7 @@ TEST_F(Image2dFromBufferTest, givenFourChannel8BitColorsNoRowPitchSpecifiedAndTo
     imageFormat.image_channel_data_type = CL_UNORM_INT8;
     imageFormat.image_channel_order = CL_RGBA;
 
-    const auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    const auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -213,8 +203,7 @@ TEST_F(Image2dFromBufferTest, givenFourChannel16BitColorsNoRowPitchSpecifiedAndT
     imageFormat.image_channel_data_type = CL_UNORM_INT16;
     imageFormat.image_channel_order = CL_RGBA;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -228,8 +217,7 @@ TEST_F(Image2dFromBufferTest, givenFourChannel8BitColorsAndNotTooLargeRowPitchSp
     imageFormat.image_channel_data_type = CL_UNORM_INT8;
     imageFormat.image_channel_order = CL_RGBA;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -244,8 +232,7 @@ TEST_F(Image2dFromBufferTest, givenFourChannel8BitColorsAndTooLargeRowPitchSpeci
     imageFormat.image_channel_data_type = CL_UNORM_INT8;
     imageFormat.image_channel_order = CL_RGBA;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -260,8 +247,7 @@ TEST_F(Image2dFromBufferTest, givenUnalignedImageWidthAndNoSpaceInBufferForAlign
     imageFormat.image_channel_data_type = CL_UNORM_INT8;
     imageFormat.image_channel_order = CL_R;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     retVal = Image::validate(&context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
                              surfaceFormat, &imageDesc, NULL);
     EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
@@ -327,7 +313,12 @@ TEST_F(Image2dFromBufferTest, givenBufferWhenImageFromBufferThenIsImageFromBuffe
 
     EXPECT_TRUE(imageFromBuffer->isImageFromBuffer());
     auto graphicsAllocation = imageFromBuffer->getGraphicsAllocation(context.getDevice(0)->getRootDeviceIndex());
-    EXPECT_TRUE(AllocationType::BUFFER_HOST_MEMORY == graphicsAllocation->getAllocationType());
+    const auto &hwInfo = context.getDevice(0)->getHardwareInfo();
+    if (!hwInfo.caps.newCoherencyModelSupported) {
+        EXPECT_EQ(graphicsAllocation->getAllocationType(), AllocationType::bufferHostMemory);
+    } else {
+        EXPECT_EQ(graphicsAllocation->getAllocationType(), AllocationType::buffer);
+    }
 
     buffer->release();
     imageDesc.mem_object = memObj;

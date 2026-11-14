@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,16 +14,22 @@ namespace NEO {
 
 template <PRODUCT_FAMILY productFamily>
 struct MockProductHelperHw : NEO::ProductHelperHw<productFamily> {
+    using ProductHelper::applyLimitGrfSupported;
     using ProductHelper::getDefaultLocalMemoryAccessMode;
     std::vector<int32_t> getKernelSupportedThreadArbitrationPolicies() const override;
     bool isCooperativeEngineSupported(const HardwareInfo &hwInfo) const override;
-    bool getUuid(Device *device, std::array<uint8_t, ProductHelper::uuidSize> &uuid) const override;
+    bool getUuid(NEO::DriverModel *driverModel, const uint32_t subDeviceCount, const uint32_t deviceIndex, std::array<uint8_t, CommonConstants::uuidSize> &uuid) const override;
     uint32_t getSteppingFromHwRevId(const HardwareInfo &hwInfo) const override;
     int configureHardwareCustom(HardwareInfo *hwInfo, OSInterface *osIface) const override;
-    uint64_t getDeviceMemoryPhysicalSizeInBytes(const OSInterface *osIface, uint32_t subDeviceIndex) const override;
     uint32_t getDeviceMemoryMaxClkRate(const HardwareInfo &hwInfo, const OSInterface *osIface, uint32_t subDeviceIndex) const override;
     uint32_t getL1CachePolicy(bool isDebuggerActive) const override;
     bool isUnlockingLockedPtrNecessary(const HardwareInfo &hwInfo) const override;
+    const SupportedNumGrfs getSupportedNumGrfs(const ReleaseHelper &releaseHelper) const override;
+    aub_stream::EngineType getDefaultCopyEngine() const override;
+    bool useAdditionalBlitProperties(const BlitProperties &blitProperties) const override { return enableAdditionalBlitProperties; }
+    bool isIpSamplingSupported(const HardwareInfo &hwInfo) const override {
+        return isIpSamplingSupportedValue;
+    }
 
     bool use128MbEdram = false;
     bool enableMidThreadPreemption = false;
@@ -32,9 +38,13 @@ struct MockProductHelperHw : NEO::ProductHelperHw<productFamily> {
     bool failOnConfigureHardwareCustom = false;
     bool isCooperativeEngineSupportedValue = true;
     bool returnedIsUnlockingLockedPtrNecessary = false;
+    bool enableAdditionalBlitProperties = false;
+    bool isIpSamplingSupportedValue = true;
     uint32_t returnedStepping = 0;
     uint32_t returnedL1CachePolicy = 0;
     uint32_t returnedL1CachePolicyIfDebugger = 0;
+    uint32_t returnedExtraKernelCapabilities = 0;
     std::vector<int32_t> threadArbPolicies = {};
+    aub_stream::EngineType mockDefaultCopyEngine = aub_stream::EngineType::ENGINE_BCS;
 };
 } // namespace NEO

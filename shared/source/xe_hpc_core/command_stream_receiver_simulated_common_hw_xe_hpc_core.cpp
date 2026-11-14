@@ -1,18 +1,19 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/command_stream_receiver_simulated_common_hw_xehp_and_later.inl"
+#include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
 
 namespace NEO {
 using Family = XeHpcCoreFamily;
 
 template <>
 bool CommandStreamReceiverSimulatedCommonHw<Family>::expectMemoryCompressed(void *gfxAddress, const void *srcAddress, size_t length) {
-    auto format = static_cast<uint32_t>(DebugManager.flags.FormatForStatelessCompressionWithUnifiedMemory.get());
+    auto format = static_cast<uint32_t>(debugManager.flags.FormatForStatelessCompressionWithUnifiedMemory.get());
     UNRECOVERABLE_IF(format > 0x1F);
 
     uint32_t value = (format << 3); // [3:7] compression_format
@@ -22,7 +23,7 @@ bool CommandStreamReceiverSimulatedCommonHw<Family>::expectMemoryCompressed(void
     this->writeMMIO(0xE4C0, value);
 
     bool ret = this->expectMemory(gfxAddress, srcAddress, length,
-                                  AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareNotEqual);
+                                  aub_stream::CompareOperationValues::CompareNotEqual);
 
     value |= 1; // [0] enable
     this->writeMMIO(0x519C, value);

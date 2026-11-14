@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,18 +7,31 @@
 
 #include "shared/source/command_stream/stream_property.h"
 
+#include <optional>
+#include <stream_properties_ext.h>
+
 namespace NEO {
-enum PreemptionMode : uint32_t;
-struct HardwareInfo;
 struct RootDeviceEnvironment;
 
 struct StateComputeModePropertiesSupport {
-    bool coherencyRequired = false;
-    bool largeGrfMode = false;
-    bool zPassAsyncComputeThreadLimit = false;
-    bool pixelAsyncComputeThreadLimit = false;
-    bool threadArbitrationPolicy = false;
-    bool devicePreemptionMode = false;
+    bool largeGrfMode : 1 = false;
+    bool zPassAsyncComputeThreadLimit : 1 = false;
+    bool pixelAsyncComputeThreadLimit : 1 = false;
+    bool threadArbitrationPolicy : 1 = false;
+    bool allocationForScratchAndMidthreadPreemption : 1 = false;
+    bool enableVariableRegisterSizeAllocation : 1 = false;
+    bool pipelinedEuThreadArbitration : 1 = false;
+    bool enableL1FlushUavCoherencyMode : 1 = false;
+    bool enableTypedGlobalMemoryCached : 1 = false;
+    bool lscSamplerBackingThreshold : 1 = false;
+    bool enableOutOfBoundariesInTranslationException : 1 = false;
+    bool enablePageFaultException : 1 = false;
+    bool enableSystemMemoryReadFence : 1 = false;
+    bool enableMemoryException : 1 = false;
+    bool enableBreakpoints : 1 = false;
+    bool enableForceExternalHaltAndForceException : 1 = false;
+    bool l1CachePolicy : 1 = false;
+    StateComputeModePropertiesSupportExt ext{};
 };
 
 struct StateComputeModeProperties {
@@ -27,14 +40,27 @@ struct StateComputeModeProperties {
     StreamProperty zPassAsyncComputeThreadLimit{};
     StreamProperty pixelAsyncComputeThreadLimit{};
     StreamProperty threadArbitrationPolicy{};
-    StreamProperty devicePreemptionMode{};
+    StreamProperty memoryAllocationForScratchAndMidthreadPreemptionBuffers{};
+    StreamProperty enableVariableRegisterSizeAllocation{};
+    StreamProperty pipelinedEuThreadArbitration{};
+    StreamProperty enableL1FlushUavCoherencyMode{};
+    StreamProperty enableTypedGlobalMemoryCached{};
+    StreamProperty lscSamplerBackingThreshold{};
+    StreamProperty enableOutOfBoundariesInTranslationException{};
+    StreamProperty enablePageFaultException{};
+    StreamProperty enableSystemMemoryReadFence{};
+    StreamProperty enableMemoryException{};
+    StreamProperty enableBreakpoints{};
+    StreamProperty enableForceExternalHaltAndForceException{};
+    StreamProperty l1CachePolicy{};
+    StateComputeModePropertiesExt propertiesExt{};
 
     void initSupport(const RootDeviceEnvironment &rootDeviceEnvironment);
     void resetState();
 
-    void setPropertiesAll(bool requiresCoherency, uint32_t numGrfRequired, int32_t threadArbitrationPolicy, PreemptionMode devicePreemptionMode);
+    void setPropertiesAll(uint32_t numGrfRequired, int32_t threadArbitrationPolicy, std::optional<bool> hasPeerAccess);
+    void setPropertiesPerContext(bool clearDirtyState, std::optional<bool> hasPeerAccess);
     void setPropertiesGrfNumberThreadArbitration(uint32_t numGrfRequired, int32_t threadArbitrationPolicy);
-    void setPropertiesCoherencyDevicePreemption(bool requiresCoherency, PreemptionMode devicePreemptionMode, bool clearDirtyState);
 
     void copyPropertiesAll(const StateComputeModeProperties &properties);
     void copyPropertiesGrfNumberThreadArbitration(const StateComputeModeProperties &properties);
@@ -42,32 +68,36 @@ struct StateComputeModeProperties {
     bool isDirty() const;
     void clearIsDirty();
 
+    bool isPipelinedEuThreadArbitrationEnabled() const {
+        return this->scmPropertiesSupport.pipelinedEuThreadArbitration;
+    }
+
   protected:
+    void clearIsDirtyPerContext();
     void clearIsDirtyExtraPerContext();
-    void clearIsDirtyExtraPerKernel();
     bool isDirtyExtra() const;
     void resetStateExtra();
 
     void setPropertiesExtraPerContext();
-    void setPropertiesExtraPerKernel();
 
     void copyPropertiesExtra(const StateComputeModeProperties &properties);
 
-    void setCoherencyProperty(bool requiresCoherency);
-    void setDevicePreemptionProperty(PreemptionMode devicePreemptionMode);
     void setGrfNumberProperty(uint32_t numGrfRequired);
     void setThreadArbitrationProperty(int32_t threadArbitrationPolicy);
 
     StateComputeModePropertiesSupport scmPropertiesSupport = {};
+    const RootDeviceEnvironment *rootDeviceEnvironment = nullptr;
     int32_t defaultThreadArbitrationPolicy = 0;
+    int32_t defaultL1CachePolicy = StreamProperty::initValue;
+    int32_t defaultL1CachePolicyDebuggerActive = StreamProperty::initValue;
     bool propertiesSupportLoaded = false;
 };
 
 struct FrontEndPropertiesSupport {
-    bool computeDispatchAllWalker = false;
-    bool disableEuFusion = false;
-    bool disableOverdispatch = false;
-    bool singleSliceDispatchCcsMode = false;
+    bool computeDispatchAllWalker : 1 = false;
+    bool disableEuFusion : 1 = false;
+    bool disableOverdispatch : 1 = false;
+    bool singleSliceDispatchCcsMode : 1 = false;
 };
 
 struct FrontEndProperties {
@@ -79,9 +109,9 @@ struct FrontEndProperties {
     void initSupport(const RootDeviceEnvironment &rootDeviceEnvironment);
     void resetState();
 
-    void setPropertiesAll(bool isCooperativeKernel, bool disableEuFusion, bool disableOverdispatch, int32_t engineInstancedDevice);
-    void setPropertySingleSliceDispatchCcsMode(int32_t engineInstancedDevice);
-    void setPropertiesDisableOverdispatchEngineInstanced(bool disableOverdispatch, int32_t engineInstancedDevice, bool clearDirtyState);
+    void setPropertiesAll(bool isCooperativeKernel, bool disableEuFusion, bool disableOverdispatch);
+    void setPropertySingleSliceDispatchCcsMode();
+    void setPropertiesDisableOverdispatch(bool disableOverdispatch, bool clearDirtyState);
     void setPropertiesComputeDispatchAllWalkerEnableDisableEuFusion(bool isCooperativeKernel, bool disableEuFusion);
 
     void copyPropertiesAll(const FrontEndProperties &properties);
@@ -95,36 +125,7 @@ struct FrontEndProperties {
     bool propertiesSupportLoaded = false;
 };
 
-struct PipelineSelectPropertiesSupport {
-    bool mediaSamplerDopClockGate = false;
-    bool systolicMode = false;
-};
-
-struct PipelineSelectProperties {
-    StreamProperty modeSelected{};
-    StreamProperty mediaSamplerDopClockGate{};
-    StreamProperty systolicMode{};
-
-    void initSupport(const RootDeviceEnvironment &rootDeviceEnvironment);
-    void resetState();
-
-    void setPropertiesAll(bool modeSelected, bool mediaSamplerDopClockGate, bool systolicMode);
-    void setPropertiesModeSelectedMediaSamplerClockGate(bool modeSelected, bool mediaSamplerDopClockGate, bool clearDirtyState);
-    void setPropertySystolicMode(bool systolicMode);
-
-    void copyPropertiesAll(const PipelineSelectProperties &properties);
-    void copyPropertiesSystolicMode(const PipelineSelectProperties &properties);
-
-    bool isDirty() const;
-    void clearIsDirty();
-
-  protected:
-    PipelineSelectPropertiesSupport pipelineSelectPropertiesSupport = {};
-    bool propertiesSupportLoaded = false;
-};
-
 struct StateBaseAddressPropertiesSupport {
-    bool globalAtomics = false;
     bool bindingTablePoolBaseAddress = false;
 };
 
@@ -137,13 +138,13 @@ struct StateBaseAddressProperties {
     StreamPropertySizeT surfaceStateSize{};
     StreamPropertySizeT dynamicStateSize{};
     StreamPropertySizeT indirectObjectSize{};
-    StreamProperty globalAtomics{};
     StreamProperty statelessMocs{};
+    StreamProperty l1CachePolicy{};
 
     void initSupport(const RootDeviceEnvironment &rootDeviceEnvironment);
     void resetState();
 
-    void setPropertiesAll(bool globalAtomics, int32_t statelessMocs,
+    void setPropertiesAll(int32_t statelessMocs,
                           int64_t bindingTablePoolBaseAddress, size_t bindingTablePoolSize,
                           int64_t surfaceStateBaseAddress, size_t surfaceStateSize,
                           int64_t dynamicStateBaseAddress, size_t dynamicStateSize,
@@ -154,11 +155,14 @@ struct StateBaseAddressProperties {
     void setPropertiesDynamicState(int64_t dynamicStateBaseAddress, size_t dynamicStateSize);
     void setPropertiesIndirectState(int64_t indirectObjectBaseAddress, size_t indirectObjectSize);
     void setPropertyStatelessMocs(int32_t statelessMocs);
-    void setPropertyGlobalAtomics(bool globalAtomics, bool clearDirtyState);
+    void setPropertyL1CachePolicy(int32_t l1CachePolicy);
 
     void copyPropertiesAll(const StateBaseAddressProperties &properties);
     void copyPropertiesStatelessMocs(const StateBaseAddressProperties &properties);
     void copyPropertiesStatelessMocsIndirectState(const StateBaseAddressProperties &properties);
+    void copyPropertiesBindingTableSurfaceState(const StateBaseAddressProperties &properties);
+    void copyPropertiesSurfaceState(const StateBaseAddressProperties &properties);
+    void copyPropertiesDynamicState(const StateBaseAddressProperties &properties);
 
     bool isDirty() const;
     void clearIsDirty();

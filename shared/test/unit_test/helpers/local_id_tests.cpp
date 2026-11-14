@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,13 @@
 
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/local_id_gen.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/source/kernel/grf_config.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include <algorithm>
@@ -21,26 +25,31 @@ using LocalIdTests = ::testing::Test;
 
 HWTEST_F(LocalIdTests, GivenSimd8WhenGettingGrfsPerThreadThenOneIsReturned) {
     uint32_t simd = 8;
-    EXPECT_EQ(1u, getGRFsPerThread(simd, 32));
+    EXPECT_EQ(1u, getNumGrfsPerLocalIdCoordinate(simd, 32));
 }
 
 HWTEST_F(LocalIdTests, GivenSimd16WhenGettingGrfsPerThreadThenOneIsReturned) {
     uint32_t simd = 16;
-    EXPECT_EQ(1u, getGRFsPerThread(simd, 32));
+    EXPECT_EQ(1u, getNumGrfsPerLocalIdCoordinate(simd, 32));
 }
 
 HWTEST_F(LocalIdTests, GivenSimd32WhenGettingGrfsPerThreadThenTwoIsReturned) {
     uint32_t simd = 32;
-    EXPECT_EQ(2u, getGRFsPerThread(simd, 32));
+    EXPECT_EQ(2u, getNumGrfsPerLocalIdCoordinate(simd, 32));
+}
+
+HWTEST_F(LocalIdTests, GivenSimd1WhenGettingGrfsPerThreadThenOneIsReturned) {
+    uint32_t simd = 1;
+    EXPECT_EQ(1u, getNumGrfsPerLocalIdCoordinate(simd, 32));
 }
 
 HWTEST_F(LocalIdTests, GivenSimd32AndNon32GrfSizeWhenGettingGrfsPerThreadThenTwoIsReturned) {
     uint32_t simd = 32;
-    EXPECT_EQ(1u, getGRFsPerThread(simd, 33));
+    EXPECT_EQ(1u, getNumGrfsPerLocalIdCoordinate(simd, 33));
 }
 
 TEST(LocalID, GivenSimd32AndLws33WhenGettingThreadsPerWorkgroupThenTwoIsReturned) {
-    size_t lws = 33;
+    uint32_t lws = 33;
     uint32_t simd = 32;
     EXPECT_EQ(2u, getThreadsPerWG(simd, lws));
 }
@@ -50,7 +59,7 @@ TEST(LocalID, GivenSimd8WhenGettingPerThreadSizeLocalIdsThenValueIsThreeTimesGrf
     uint32_t grfSize = 32;
 
     // 3 channels (x,y,z) * 1 GRFs per thread (@SIMD8)
-    EXPECT_EQ(3 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize));
+    EXPECT_EQ(3 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 3));
 }
 
 TEST(LocalID, GivenSimd16WhenGettingPerThreadSizeLocalIdsThenValueIsThreeTimesGrfSize) {
@@ -58,7 +67,7 @@ TEST(LocalID, GivenSimd16WhenGettingPerThreadSizeLocalIdsThenValueIsThreeTimesGr
     uint32_t grfSize = 32;
 
     // 3 channels (x,y,z) * 1 GRFs per thread (@SIMD16)
-    EXPECT_EQ(3 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize));
+    EXPECT_EQ(3 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 3));
 }
 
 TEST(LocalID, GivenSimd8WhenGettingPerThreadSizeLocalIdsThenValueIsSixTimesGrfSize) {
@@ -66,23 +75,60 @@ TEST(LocalID, GivenSimd8WhenGettingPerThreadSizeLocalIdsThenValueIsSixTimesGrfSi
     uint32_t grfSize = 32;
 
     // 3 channels (x,y,z) * 2 GRFs per thread (@SIMD32)
-    EXPECT_EQ(6 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize));
+    EXPECT_EQ(6 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 3));
 }
 
 TEST(LocalID, GivenSimd1WhenGettingPerThreadSizeLocalIdsThenValueIsEqualGrfSize) {
     uint32_t simd = 1;
     uint32_t grfSize = 32;
 
-    EXPECT_EQ(grfSize, getPerThreadSizeLocalIDs(simd, grfSize));
+    EXPECT_EQ(grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 3));
 }
-TEST(LocalID, givenVariadicGrfSizeWhenLocalSizesAreEmittedThenUseFullRowSize) {
+
+TEST(LocalID, GivenActiveChannelDiffersWhenGettingPerThreadSizeLocalIdsThenDifferentValueIsReturned) {
+    uint32_t simd = 32;
+    uint32_t grfSize = 32;
+
+    // 1 channel (x,y,z) * 2 GRFs per thread (@SIMD32)
+    EXPECT_EQ(2 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 1u));
+    // 2 channels (x,y,z) * 2 GRFs per thread (@SIMD32)
+    EXPECT_EQ(4 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 2u));
+    // 3 channels (x,y,z) * 2 GRFs per thread (@SIMD32)
+    EXPECT_EQ(6 * grfSize, getPerThreadSizeLocalIDs(simd, grfSize, 3u));
+}
+
+TEST(LocalID, WhenThreadsPerWgAreGeneratedThenCalculationsAreCorrect) {
+    const auto lws = 33u;
+    for (const auto &simd : {1u, 8u, 16u, 32u}) {
+        switch (simd) {
+        case 1u:
+            EXPECT_EQ(lws, getThreadsPerWG(simd, lws));
+            break;
+        case 32u:
+            EXPECT_EQ((lws + std::max(32u, simd) - 1) >> 5, getThreadsPerWG(simd, lws));
+            break;
+        case 8u:
+            EXPECT_EQ((lws + simd - 1) >> 3, getThreadsPerWG(simd, lws));
+            break;
+        case 16u:
+            EXPECT_EQ((lws + simd - 1) >> 4, getThreadsPerWG(simd, lws));
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+TEST(LocalIdTest, givenVariadicGrfSizeWhenLocalSizesAreEmittedThenUseFullRowSize) {
     auto localIdsPtr = allocateAlignedMemory(3 * 64u, MemoryConstants::cacheLineSize);
 
     uint16_t *localIdsView = reinterpret_cast<uint16_t *>(localIdsPtr.get());
     std::array<uint16_t, 3u> localSizes = {{2u, 2u, 1u}};
     std::array<uint8_t, 3u> dimensionsOrder = {{0u, 1u, 2u}};
 
-    generateLocalIDs(localIdsPtr.get(), 16u, localSizes, dimensionsOrder, false, 64u);
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    generateLocalIDs(localIdsPtr.get(), 16u, localSizes, dimensionsOrder, false, 64u, GrfConfig::defaultGrfNumber, rootDeviceEnvironment, 3u);
     EXPECT_EQ(localIdsView[0], 0u);
     EXPECT_EQ(localIdsView[1], 1u);
     EXPECT_EQ(localIdsView[2], 0u);
@@ -99,13 +145,25 @@ TEST(LocalID, givenVariadicGrfSizeWhenLocalSizesAreEmittedThenUseFullRowSize) {
     EXPECT_EQ(localIdsView[67], 0u);
 }
 
-struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, int>> {
+TEST(LocalIdTest, givenInvalidActiveChannelsThenAbortIsTriggered) {
+    auto localIdsPtr = allocateAlignedMemory(3 * 64u, MemoryConstants::cacheLineSize);
+
+    std::array<uint16_t, 3u> localSizes = {{2u, 2u, 1u}};
+    std::array<uint8_t, 3u> dimensionsOrder = {{0u, 1u, 2u}};
+
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    EXPECT_ANY_THROW(generateLocalIDs(localIdsPtr.get(), 16u, localSizes, dimensionsOrder, false, 64u, GrfConfig::defaultGrfNumber, rootDeviceEnvironment, 0u));
+}
+
+struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, int, int>> {
     void SetUp() override {
         simd = std::get<0>(GetParam());
         grfSize = std::get<1>(GetParam());
         localWorkSizeX = std::get<2>(GetParam());
         localWorkSizeY = std::get<3>(GetParam());
         localWorkSizeZ = std::get<4>(GetParam());
+        activeChannels = std::get<5>(GetParam());
 
         localWorkSize = localWorkSizeX * localWorkSizeY * localWorkSizeZ;
         if (localWorkSize > 256) {
@@ -133,18 +191,28 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
         auto pBufferY = pBufferX + skipPerThread;
         auto pBufferZ = pBufferY + skipPerThread;
 
-        auto numWorkItems = lwsX * lwsY * lwsZ;
+        auto numWorkItems = lwsX;
+        if (activeChannels >= 2) {
+            numWorkItems *= lwsY;
+        }
+        if (activeChannels == 3) {
+            numWorkItems *= lwsZ;
+        }
 
         size_t itemIndex = 0;
         while (numWorkItems > 0) {
             EXPECT_LT(pBufferX[itemIndex], lwsX) << simd << " " << lwsX << " " << lwsY << " " << lwsZ;
-            EXPECT_LT(pBufferY[itemIndex], lwsY) << simd << " " << lwsX << " " << lwsY << " " << lwsZ;
-            EXPECT_LT(pBufferZ[itemIndex], lwsZ) << simd << " " << lwsX << " " << lwsY << " " << lwsZ;
+            if (activeChannels >= 2) {
+                EXPECT_LT(pBufferY[itemIndex], lwsY) << simd << " " << lwsX << " " << lwsY << " " << lwsZ;
+            }
+            if (activeChannels == 3) {
+                EXPECT_LT(pBufferZ[itemIndex], lwsZ) << simd << " " << lwsX << " " << lwsY << " " << lwsZ;
+            }
             ++itemIndex;
             if (idsPerThread == itemIndex) {
-                pBufferX += skipPerThread * 3;
-                pBufferY += skipPerThread * 3;
-                pBufferZ += skipPerThread * 3;
+                pBufferX += skipPerThread * activeChannels;
+                pBufferY += skipPerThread * activeChannels;
+                pBufferZ += skipPerThread * activeChannels;
 
                 itemIndex = 0;
             }
@@ -162,7 +230,13 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
         auto pBufferY = pBufferX + skipPerThread;
         auto pBufferZ = pBufferY + skipPerThread;
 
-        auto numWorkItems = lwsX * lwsY * lwsZ;
+        auto numWorkItems = lwsX;
+        if (activeChannels >= 2) {
+            numWorkItems *= lwsY;
+        }
+        if (activeChannels == 3) {
+            numWorkItems *= lwsZ;
+        }
 
         // Initialize local ID hit table
         uint32_t localIDHitTable[8];
@@ -171,7 +245,13 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
         size_t itemIndex = 0;
         while (numWorkItems > 0) {
             // Flatten out the IDs
-            auto workItem = pBufferX[itemIndex] + pBufferY[itemIndex] * lwsX + pBufferZ[itemIndex] * lwsX * lwsY;
+            auto workItem = pBufferX[itemIndex];
+            if (activeChannels >= 2) {
+                workItem += pBufferY[itemIndex] * lwsX;
+            }
+            if (activeChannels == 3) {
+                workItem += pBufferZ[itemIndex] * lwsX * lwsY;
+            }
             ASSERT_LT(workItem, 256u);
 
             // Look up in the hit table
@@ -186,9 +266,9 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
 
             ++itemIndex;
             if (idsPerThread == itemIndex) {
-                pBufferX += skipPerThread * 3;
-                pBufferY += skipPerThread * 3;
-                pBufferZ += skipPerThread * 3;
+                pBufferX += skipPerThread * activeChannels;
+                pBufferY += skipPerThread * activeChannels;
+                pBufferZ += skipPerThread * activeChannels;
 
                 itemIndex = 0;
             }
@@ -223,10 +303,13 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
                 for (uint32_t id0 = 0; id0 < sizes[walkOrder[0]]; ++id0) {
                     uint32_t threadId = flattenedId / simd;
                     uint32_t channelId = flattenedId % simd;
-                    uint16_t foundId0 = ids[walkOrder[0]][channelId + threadId * skipPerThread * 3];
-                    uint16_t foundId1 = ids[walkOrder[1]][channelId + threadId * skipPerThread * 3];
-                    uint16_t foundId2 = ids[walkOrder[2]][channelId + threadId * skipPerThread * 3];
-                    if ((id0 != foundId0) || (id1 != foundId1) || (id2 != foundId2)) {
+                    uint16_t foundId0 = ids[walkOrder[0]][channelId + threadId * skipPerThread * activeChannels];
+                    uint16_t foundId1 = ids[walkOrder[1]][channelId + threadId * skipPerThread * activeChannels];
+                    uint16_t foundId2 = ids[walkOrder[2]][channelId + threadId * skipPerThread * activeChannels];
+                    auto xValid = id0 == foundId0;
+                    auto yValid = id1 == foundId1 || activeChannels < 2;
+                    auto zValid = id2 == foundId2 || activeChannels < 3;
+                    if (!xValid || !yValid || !zValid) {
                         EXPECT_EQ(id0, foundId0) << simd << " X @ (" << id0 << ", " << id1 << ", " << id2 << ") - flat " << flattenedId;
                         EXPECT_EQ(id1, foundId1) << simd << " Y @ (" << id0 << ", " << id1 << ", " << id2 << ") - flat " << flattenedId;
                         EXPECT_EQ(id2, foundId2) << simd << " Z @ (" << id0 << ", " << id1 << ", " << id2 << ") - flat " << flattenedId;
@@ -261,6 +344,19 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
         }
     }
 
+    bool isSimdSupported(const RootDeviceEnvironment &rootDeviceEnvironment) {
+        auto &gfxHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
+        bool isSimdSupported = false;
+        for (auto size : gfxHelper.getDeviceSubGroupSizes()) {
+            if (size == simd) {
+                isSimdSupported = true;
+                break;
+            }
+        }
+
+        return isSimdSupported;
+    }
+
     // Test parameters
     uint32_t localWorkSizeX;
     uint32_t localWorkSizeY;
@@ -268,6 +364,8 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
     uint32_t localWorkSize;
     uint32_t simd;
     uint32_t grfSize;
+    uint32_t numGrf = GrfConfig::defaultGrfNumber;
+    uint8_t activeChannels;
 
     // Provide support for a max LWS of 256
     // 32 threads @ SIMD8
@@ -277,51 +375,81 @@ struct LocalIDFixture : ::testing::TestWithParam<std::tuple<int, int, int, int, 
 };
 
 HWTEST_P(LocalIDFixture, WhenGeneratingLocalIdsThenIdsAreWithinLimits) {
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    if (!isSimdSupported(rootDeviceEnvironment)) {
+        GTEST_SKIP();
+    }
+
     generateLocalIDs(buffer, simd, std::array<uint16_t, 3>{{static_cast<uint16_t>(localWorkSizeX), static_cast<uint16_t>(localWorkSizeY), static_cast<uint16_t>(localWorkSizeZ)}},
-                     std::array<uint8_t, 3>{{0, 1, 2}}, false, grfSize);
+                     std::array<uint8_t, 3>{{0, 1, 2}}, false, grfSize, numGrf, rootDeviceEnvironment, activeChannels);
     validateIDWithinLimits(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, UnitTestHelper<FamilyType>::useFullRowForLocalIdsGeneration);
 }
 
 HWTEST_P(LocalIDFixture, WhenGeneratingLocalIdsThenAllWorkItemsCovered) {
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    if (!isSimdSupported(rootDeviceEnvironment)) {
+        GTEST_SKIP();
+    }
+
     generateLocalIDs(buffer, simd, std::array<uint16_t, 3>{{static_cast<uint16_t>(localWorkSizeX), static_cast<uint16_t>(localWorkSizeY), static_cast<uint16_t>(localWorkSizeZ)}},
-                     std::array<uint8_t, 3>{{0, 1, 2}}, false, grfSize);
+                     std::array<uint8_t, 3>{{0, 1, 2}}, false, grfSize, numGrf, rootDeviceEnvironment, activeChannels);
     validateAllWorkItemsCovered(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, UnitTestHelper<FamilyType>::useFullRowForLocalIdsGeneration);
 }
 
 HWTEST_P(LocalIDFixture, WhenWalkOrderIsXyzThenProperLocalIdsAreGenerated) {
     auto dimensionsOrder = std::array<uint8_t, 3>{{0, 1, 2}};
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    if (!isSimdSupported(rootDeviceEnvironment)) {
+        GTEST_SKIP();
+    }
+
     generateLocalIDs(buffer, simd, std::array<uint16_t, 3>{{static_cast<uint16_t>(localWorkSizeX), static_cast<uint16_t>(localWorkSizeY), static_cast<uint16_t>(localWorkSizeZ)}},
-                     dimensionsOrder, false, grfSize);
+                     dimensionsOrder, false, grfSize, numGrf, rootDeviceEnvironment, activeChannels);
     validateAllWorkItemsCovered(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, UnitTestHelper<FamilyType>::useFullRowForLocalIdsGeneration);
     validateWalkOrder(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, dimensionsOrder);
 }
 
 HWTEST_P(LocalIDFixture, WhenWalkOrderIsYxzThenProperLocalIdsAreGenerated) {
     auto dimensionsOrder = std::array<uint8_t, 3>{{1, 0, 2}};
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    if (!isSimdSupported(rootDeviceEnvironment) || activeChannels < 2) {
+        GTEST_SKIP();
+    }
+
     generateLocalIDs(buffer, simd, std::array<uint16_t, 3>{{static_cast<uint16_t>(localWorkSizeX), static_cast<uint16_t>(localWorkSizeY), static_cast<uint16_t>(localWorkSizeZ)}},
-                     dimensionsOrder, false, grfSize);
+                     dimensionsOrder, false, grfSize, numGrf, rootDeviceEnvironment, activeChannels);
     validateAllWorkItemsCovered(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, UnitTestHelper<FamilyType>::useFullRowForLocalIdsGeneration);
     validateWalkOrder(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, dimensionsOrder);
 }
 
 HWTEST_P(LocalIDFixture, WhenWalkOrderIsZyxThenProperLocalIdsAreGenerated) {
     auto dimensionsOrder = std::array<uint8_t, 3>{{2, 1, 0}};
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    if (!isSimdSupported(rootDeviceEnvironment) || activeChannels < 3) {
+        GTEST_SKIP();
+    }
+
     generateLocalIDs(buffer, simd, std::array<uint16_t, 3>{{static_cast<uint16_t>(localWorkSizeX), static_cast<uint16_t>(localWorkSizeY), static_cast<uint16_t>(localWorkSizeZ)}},
-                     dimensionsOrder, false, grfSize);
+                     dimensionsOrder, false, grfSize, numGrf, rootDeviceEnvironment, activeChannels);
     validateAllWorkItemsCovered(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, UnitTestHelper<FamilyType>::useFullRowForLocalIdsGeneration);
     validateWalkOrder(simd, localWorkSizeX, localWorkSizeY, localWorkSizeZ, dimensionsOrder);
 }
 
 TEST_P(LocalIDFixture, WhenThreadsPerWgAreGeneratedThenSizeCalculationAreCorrect) {
-    auto workItems = localWorkSizeX * localWorkSizeY * localWorkSizeZ;
-    auto sizeTotalPerThreadData = getThreadsPerWG(simd, workItems) * getPerThreadSizeLocalIDs(simd, grfSize);
+    auto workItems = static_cast<uint32_t>(localWorkSizeX * localWorkSizeY * localWorkSizeZ);
+    auto sizeTotalPerThreadData = getThreadsPerWG(simd, workItems) * getPerThreadSizeLocalIDs(simd, grfSize, activeChannels);
 
     // Should be multiple of GRFs
     EXPECT_EQ(0u, sizeTotalPerThreadData % grfSize);
 
     auto numGRFsPerThread = (simd == 32) ? 2 : 1;
     auto numThreadsExpected = Math::divideAndRoundUp(workItems, simd);
-    auto numGRFsExpected = 3 * numGRFsPerThread * numThreadsExpected;
+    auto numGRFsExpected = activeChannels * numGRFsPerThread * numThreadsExpected;
     EXPECT_EQ(numGRFsExpected * grfSize, sizeTotalPerThreadData);
 }
 
@@ -335,8 +463,8 @@ struct LocalIdsLayoutForImagesTest : ::testing::TestWithParam<std::tuple<uint16_
         rowWidth = simd == 32u ? 32u : 16u;
         xDelta = simd == 8u ? 2u : 4u;
     }
-    void generateLocalIds() {
 
+    void generateLocalIds() {
         auto numGrfs = (localWorkSize.at(0) * localWorkSize.at(1) + (simd - 1)) / simd;
         elemsInBuffer = 3u * simd * numGrfs;
         if (simd == 8u) {
@@ -347,7 +475,9 @@ struct LocalIdsLayoutForImagesTest : ::testing::TestWithParam<std::tuple<uint16_
         memset(memory.get(), 0xff, size);
         buffer = reinterpret_cast<uint16_t *>(memory.get());
         EXPECT_TRUE(isCompatibleWithLayoutForImages(localWorkSize, dimensionsOrder, simd));
-        generateLocalIDs(buffer, simd, localWorkSize, dimensionsOrder, true, grfSize);
+        NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+        auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+        generateLocalIDs(buffer, simd, localWorkSize, dimensionsOrder, true, grfSize, numGrfs, rootDeviceEnvironment, 3u);
     }
     void validateGRF() {
         uint32_t totalLocalIds = localWorkSize.at(0) * localWorkSize.at(1);
@@ -360,8 +490,9 @@ struct LocalIdsLayoutForImagesTest : ::testing::TestWithParam<std::tuple<uint16_
             uint16_t baseY = buffer[i * 3 * rowWidth + rowWidth];
             uint16_t currentX = baseX;
             for (int j = 1; j < simd; j++) {
-                if (simd * i + j == totalLocalIds)
+                if (simd * i + j == totalLocalIds) {
                     break;
+                }
                 if (simd == 32u && baseY + 8u > localWorkSize.at(1) && j == 16u) {
                     baseX += xDelta;
                     if (baseX == localWorkSize.at(0)) {
@@ -374,8 +505,9 @@ struct LocalIdsLayoutForImagesTest : ::testing::TestWithParam<std::tuple<uint16_
 
             // validate Y row
             for (int j = 0; j < simd; j++) {
-                if (simd * i + j == totalLocalIds)
+                if (simd * i + j == totalLocalIds) {
                     break;
+                }
                 uint16_t expectedY = baseY + ((j / xDelta) & 0b111);
                 if (expectedY >= localWorkSize.at(1)) {
                     expectedY -= (localWorkSize.at(1) - baseY);
@@ -385,8 +517,9 @@ struct LocalIdsLayoutForImagesTest : ::testing::TestWithParam<std::tuple<uint16_
 
             // validate Z row
             for (int j = 0; j < simd; j++) {
-                if (simd * i + j == totalLocalIds)
+                if (simd * i + j == totalLocalIds) {
                     break;
+                }
                 EXPECT_EQ(buffer[i * 3 * rowWidth + 2 * rowWidth + j], 0u);
             }
         }
@@ -447,9 +580,10 @@ TEST_P(LocalIdsLayoutTest, givenLocalWorkgroupSize4x4x1WhenGenerateLocalIdsThenH
     auto alignedMemory2 = allocateAlignedMemory(size, 32);
     auto buffer2 = reinterpret_cast<uint16_t *>(alignedMemory2.get());
     memset(buffer2, 0xff, size);
-
-    generateLocalIDs(buffer1, simd, localWorkSize, dimensionsOrder, false, grfSize);
-    generateLocalIDs(buffer2, simd, localWorkSize, dimensionsOrder, true, grfSize);
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    generateLocalIDs(buffer1, simd, localWorkSize, dimensionsOrder, false, grfSize, GrfConfig::defaultGrfNumber, rootDeviceEnvironment, 3u);
+    generateLocalIDs(buffer2, simd, localWorkSize, dimensionsOrder, true, grfSize, GrfConfig::defaultGrfNumber, rootDeviceEnvironment, 3u);
 
     for (auto i = 0u; i < elemsInBuffer / rowWidth; i++) {
         for (auto j = 0u; j < rowWidth; j++) {
@@ -468,6 +602,7 @@ TEST_P(LocalIdsLayoutForImagesTest, givenLocalWorkgroupSizeCompatibleWithLayoutF
 }
 
 #define SIMDParams ::testing::Values(8, 16, 32)
+#define ACTIVECHANNELS ::testing::Values(1, 2, 3)
 #if HEAVY_DUTY_TESTING
 #define LWSXParams ::testing::Values(1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 128, 256)
 #define LWSYParams ::testing::Values(1, 2, 3, 4, 5, 6, 7, 8)
@@ -480,16 +615,17 @@ TEST_P(LocalIdsLayoutForImagesTest, givenLocalWorkgroupSizeCompatibleWithLayoutF
 
 #define GRFSizeParams ::testing::Values(32)
 
-INSTANTIATE_TEST_CASE_P(AllCombinations, LocalIDFixture, ::testing::Combine(SIMDParams, GRFSizeParams, LWSXParams, LWSYParams, LWSZParams));
-INSTANTIATE_TEST_CASE_P(LayoutTests, LocalIdsLayoutTest, SIMDParams);
-INSTANTIATE_TEST_CASE_P(LayoutForImagesTests, LocalIdsLayoutForImagesTest, ::testing::Combine(SIMDParams, GRFSizeParams, ::testing::Values(4, 8, 12, 20), ::testing::Values(4, 8, 12, 20)));
+INSTANTIATE_TEST_SUITE_P(AllCombinations, LocalIDFixture, ::testing::Combine(SIMDParams, GRFSizeParams, LWSXParams, LWSYParams, LWSZParams, ACTIVECHANNELS));
+INSTANTIATE_TEST_SUITE_P(LayoutTests, LocalIdsLayoutTest, SIMDParams);
+INSTANTIATE_TEST_SUITE_P(LayoutForImagesTests, LocalIdsLayoutForImagesTest, ::testing::Combine(SIMDParams, GRFSizeParams, ::testing::Values(4, 8, 12, 20), ::testing::Values(4, 8, 12, 20)));
 
 // To debug a specific configuration replace the list of Values with specific values.
 // NOTE: You'll need a unique test prefix
-INSTANTIATE_TEST_CASE_P(SingleTest, LocalIDFixture,
-                        ::testing::Combine(
-                            ::testing::Values(32),  // SIMD
-                            ::testing::Values(32),  // GRF
-                            ::testing::Values(5),   // LWSX
-                            ::testing::Values(6),   // LWSY
-                            ::testing::Values(7))); // LWSZ
+INSTANTIATE_TEST_SUITE_P(SingleTest, LocalIDFixture,
+                         ::testing::Combine(
+                             ::testing::Values(32),  // SIMD
+                             ::testing::Values(32),  // GRF
+                             ::testing::Values(5),   // LWSX
+                             ::testing::Values(6),   // LWSY
+                             ::testing::Values(7),   // LWSZ
+                             ::testing::Values(3))); // active channels

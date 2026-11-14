@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 #include "shared/source/os_interface/linux/drm_allocation.h"
 #include "shared/source/os_interface/linux/drm_buffer_object.h"
 #include "shared/source/os_interface/linux/drm_memory_manager.h"
+#include "shared/test/common/libult/linux/drm_mock.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/mocks/mock_host_ptr_manager.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
@@ -19,21 +20,16 @@
 #include <atomic>
 
 namespace NEO {
-off_t lseekReturn = 4096u;
-std::atomic<int> lseekCalledCount(0);
 std::atomic<int> closeInputFd(0);
 std::atomic<int> closeCalledCount(0);
 
-TestedDrmMemoryManager::TestedDrmMemoryManager(ExecutionEnvironment &executionEnvironment) : MemoryManagerCreate(gemCloseWorkerMode::gemCloseWorkerInactive,
+TestedDrmMemoryManager::TestedDrmMemoryManager(ExecutionEnvironment &executionEnvironment) : MemoryManagerCreate(GemCloseWorkerMode::gemCloseWorkerInactive,
                                                                                                                  false,
                                                                                                                  false,
                                                                                                                  executionEnvironment) {
     this->mmapFunction = SysCalls::mmap;
     this->munmapFunction = SysCalls::munmap;
-    this->lseekFunction = &lseekMock;
     this->closeFunction = &closeMock;
-    lseekReturn = 4096;
-    lseekCalledCount = 0;
     closeInputFd = 0;
     closeCalledCount = 0;
     hostPtrManager.reset(new MockHostPtrManager);
@@ -43,16 +39,13 @@ TestedDrmMemoryManager::TestedDrmMemoryManager(bool enableLocalMemory,
                                                bool allowForcePin,
                                                bool validateHostPtrMemory,
                                                ExecutionEnvironment &executionEnvironment) : MemoryManagerCreate(false, enableLocalMemory,
-                                                                                                                 gemCloseWorkerMode::gemCloseWorkerInactive,
+                                                                                                                 GemCloseWorkerMode::gemCloseWorkerInactive,
                                                                                                                  allowForcePin,
                                                                                                                  validateHostPtrMemory,
                                                                                                                  executionEnvironment) {
     this->mmapFunction = SysCalls::mmap;
     this->munmapFunction = SysCalls::munmap;
-    this->lseekFunction = &lseekMock;
     this->closeFunction = &closeMock;
-    lseekReturn = 4096;
-    lseekCalledCount = 0;
     closeInputFd = 0;
     closeCalledCount = 0;
     this->executionEnvironment = &executionEnvironment;
@@ -60,9 +53,9 @@ TestedDrmMemoryManager::TestedDrmMemoryManager(bool enableLocalMemory,
 
 BufferObject *TestedDrmMemoryManager::findAndReferenceSharedBufferObject(int boHandle, uint32_t rootDeviceIndex) {
     if (failOnfindAndReferenceSharedBufferObject) {
-        DrmMockCustom drmMock(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]);
-        auto patIndex = drmMock.getPatIndex(nullptr, AllocationType::BUFFER, CacheRegion::Default, CachePolicy::WriteBack, false);
-        return new (std::nothrow) BufferObject(rootDeviceIndex, &drmMock, patIndex, boHandle, 4096u, 2u);
+        auto drmMock = DrmMockCustom::create(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]);
+        auto patIndex = drmMock->getPatIndex(nullptr, AllocationType::buffer, CacheRegion::defaultRegion, CachePolicy::writeBack, false, false, false);
+        return new (std::nothrow) BufferObject(rootDeviceIndex, drmMock.release(), patIndex, boHandle, 4096u, 2u);
     }
     return MemoryManagerCreate<DrmMemoryManager>::findAndReferenceSharedBufferObject(boHandle, rootDeviceIndex);
 }
@@ -77,7 +70,7 @@ void TestedDrmMemoryManager::injectPinBB(BufferObject *newPinBB, uint32_t rootDe
 DrmGemCloseWorker *TestedDrmMemoryManager::getgemCloseWorker() { return this->gemCloseWorker.get(); }
 void TestedDrmMemoryManager::forceLimitedRangeAllocator(uint64_t range) {
     for (auto &gfxPartition : gfxPartitions) {
-        gfxPartition->init(range, getSizeToReserve(), 0, 1, false, 0u);
+        gfxPartition->init(range, getSizeToReserve(), 0, 1, false, 0u, range + 1, nullptr);
     }
 }
 void TestedDrmMemoryManager::overrideGfxPartition(GfxPartition *newGfxPartition) { gfxPartitions[0].reset(newGfxPartition); }
@@ -87,8 +80,7 @@ DrmAllocation *TestedDrmMemoryManager::allocate32BitGraphicsMemory(uint32_t root
     AllocationData allocationData;
     MockAllocationProperties properties(rootDeviceIndex, allocateMemory, size, allocationType);
     getAllocationData(allocationData, properties, ptr, createStorageInfoFromProperties(properties));
-    bool useLocalMemory = !allocationData.flags.useSystemMemory && this->localMemorySupported[rootDeviceIndex];
-    return static_cast<DrmAllocation *>(allocate32BitGraphicsMemoryImpl(allocationData, useLocalMemory));
+    return static_cast<DrmAllocation *>(allocate32BitGraphicsMemoryImpl(allocationData));
 }
 
 void TestedDrmMemoryManager::closeSharedHandle(GraphicsAllocation *gfxAllocation) {

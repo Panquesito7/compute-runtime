@@ -1,16 +1,23 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
-#include "shared/source/kernel/kernel_descriptor.h"
+#include "shared/source/helpers/definitions/indirect_detection_versions.h"
+#include "shared/source/helpers/engine_node_helper.h"
+#include "shared/source/helpers/string_helpers.h"
+#include "shared/source/os_interface/product_helper.inl"
+#include "shared/source/os_interface/product_helper_before_xe2.inl"
+#include "shared/source/os_interface/product_helper_xe_hpg_and_later.inl"
 
 #include "aubstream/product_family.h"
 
 namespace NEO {
+
 template <>
 bool ProductHelperHw<gfxProduct>::isMaxThreadsForWorkgroupWARequired(const HardwareInfo &hwInfo) const {
     return PVC::isXl(hwInfo);
@@ -18,7 +25,11 @@ bool ProductHelperHw<gfxProduct>::isMaxThreadsForWorkgroupWARequired(const Hardw
 
 template <>
 uint32_t ProductHelperHw<gfxProduct>::getHwRevIdFromStepping(uint32_t stepping, const HardwareInfo &hwInfo) const {
-    if (PVC::isXt(hwInfo)) {
+    if (PVC::isXtVg(hwInfo)) {
+        if (stepping == REVISION_C) {
+            return 0x7;
+        }
+    } else if (PVC::isXt(hwInfo)) {
         switch (stepping) {
         case REVISION_A0:
             return 0x3;
@@ -44,7 +55,13 @@ uint32_t ProductHelperHw<gfxProduct>::getHwRevIdFromStepping(uint32_t stepping, 
 
 template <>
 uint32_t ProductHelperHw<gfxProduct>::getSteppingFromHwRevId(const HardwareInfo &hwInfo) const {
-    switch (hwInfo.platform.usRevId & PVC::pvcSteppingBits) {
+    auto rev = hwInfo.platform.usRevId & PVC::pvcSteppingBits;
+
+    if (PVC::isXtVg(hwInfo) && rev != 7) {
+        return CommonConstants::invalidStepping;
+    }
+
+    switch (rev) {
     case 0x0:
     case 0x1:
     case 0x3:
@@ -69,13 +86,8 @@ bool ProductHelperHw<gfxProduct>::isSystolicModeConfigurable(const HardwareInfo 
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::isGlobalFenceInCommandStreamRequired(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<gfxProduct>::isReleaseGlobalFenceInCommandStreamRequired(const HardwareInfo &hwInfo) const {
     return !PVC::isXlA0(hwInfo);
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isAdjustProgrammableIdPreferredSlmSizeRequired(const HardwareInfo &hwInfo) const {
-    return PVC::isXlA0(hwInfo);
 }
 
 template <>
@@ -90,23 +102,23 @@ bool isBaseDieA0(const HardwareInfo &hwInfo) {
 template <>
 bool ProductHelperHw<gfxProduct>::isTilePlacementResourceWaRequired(const HardwareInfo &hwInfo) const {
     bool baseDieA0 = isBaseDieA0(hwInfo);
-    bool applyWa = ((DebugManager.flags.ForceTile0PlacementForTile1ResourcesWaActive.get() == 1) || baseDieA0);
-    applyWa &= (DebugManager.flags.ForceTile0PlacementForTile1ResourcesWaActive.get() != 0);
+    bool applyWa = ((debugManager.flags.ForceTile0PlacementForTile1ResourcesWaActive.get() == 1) || baseDieA0);
+    applyWa &= (debugManager.flags.ForceTile0PlacementForTile1ResourcesWaActive.get() != 0);
     return applyWa;
 }
 
 template <>
 bool ProductHelperHw<gfxProduct>::allowMemoryPrefetch(const HardwareInfo &hwInfo) const {
     bool prefetch = !isBaseDieA0(hwInfo);
-    if (DebugManager.flags.EnableMemoryPrefetch.get() != -1) {
-        prefetch = !!DebugManager.flags.EnableMemoryPrefetch.get();
+    if (debugManager.flags.EnableMemoryPrefetch.get() != -1) {
+        prefetch = !!debugManager.flags.EnableMemoryPrefetch.get();
     }
     return prefetch;
 }
 template <>
 bool ProductHelperHw<gfxProduct>::isBcsReportWaRequired(const HardwareInfo &hwInfo) const {
-    if (DebugManager.flags.DoNotReportTile1BscWaActive.get() != -1) {
-        return DebugManager.flags.DoNotReportTile1BscWaActive.get();
+    if (debugManager.flags.DoNotReportTile1BscWaActive.get() != -1) {
+        return debugManager.flags.DoNotReportTile1BscWaActive.get();
     }
     return isBaseDieA0(hwInfo);
 }
@@ -118,7 +130,7 @@ bool ProductHelperHw<gfxProduct>::isBlitCopyRequiredForLocalMemory(const RootDev
     }
 
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
-    if (getLocalMemoryAccessMode(hwInfo) == LocalMemoryAccessMode::CpuAccessDisallowed) {
+    if (getLocalMemoryAccessMode(hwInfo) == LocalMemoryAccessMode::cpuAccessDisallowed) {
         // Regular L3 WA
         return true;
     }
@@ -138,32 +150,64 @@ bool ProductHelperHw<gfxProduct>::isBlitCopyRequiredForLocalMemory(const RootDev
 }
 
 template <>
+bool ProductHelperHw<gfxProduct>::parseCcsMode(std::string ccsModeString, std::unordered_map<uint32_t, uint32_t> &rootDeviceNumCcsMap, uint32_t rootDeviceIndex, RootDeviceEnvironment *rootDeviceEnvironment) const {
+    auto numberOfCcsEntries = StringHelpers::split(ccsModeString, ",");
+
+    for (const auto &entry : numberOfCcsEntries) {
+        auto subEntries = StringHelpers::split(entry, ":");
+        if (subEntries.size() < 2) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error: Invalid ZEX_NUMBER_OF_CCS format - %s\n", ccsModeString.c_str());
+            return false;
+        }
+
+        uint32_t rootDeviceIndexParsed = StringHelpers::toUint32t(subEntries[0]);
+
+        if (rootDeviceIndexParsed == rootDeviceIndex) {
+            uint32_t maxCcsCount = StringHelpers::toUint32t(subEntries[1]);
+            if (!rootDeviceEnvironment->setNumberOfCcs(maxCcsCount)) {
+                return false;
+            }
+
+            if (maxCcsCount > 1 && rootDeviceEnvironment->executionEnvironment.getDebuggingMode() == DebuggingMode::online) {
+                IoFunctions::fprintf(stderr, "Error: ZEX_NUMBER_OF_CCS requests more than 1 CCS for device %u, which is not supported with online debugging\n",
+                                     rootDeviceIndex);
+                return false;
+            }
+
+            rootDeviceNumCcsMap.emplace(rootDeviceIndex, maxCcsCount);
+        }
+    }
+
+    return true;
+}
+
+template <>
 bool ProductHelperHw<gfxProduct>::isTlbFlushRequired() const {
     bool tlbFlushRequired = false;
-    if (DebugManager.flags.ForceTlbFlush.get() != -1) {
-        tlbFlushRequired = !!DebugManager.flags.ForceTlbFlush.get();
+    if (debugManager.flags.ForceTlbFlush.get() != -1) {
+        tlbFlushRequired = !!debugManager.flags.ForceTlbFlush.get();
     }
     return tlbFlushRequired;
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::isBlitSplitEnqueueWARequired(const HardwareInfo &hwInfo) const {
-    return true;
-}
+BcsSplitSettings ProductHelperHw<gfxProduct>::getBcsSplitSettings(const HardwareInfo &hwInfo) const {
+    constexpr BcsInfoMask oddLinkedCopyEnginesMask = NEO::EngineHelpers::oddLinkedCopyEnginesMask;
 
-template <>
-bool ProductHelperHw<gfxProduct>::isInitDeviceWithFirstSubmissionRequired(const HardwareInfo &hwInfo) const {
-    return true;
+    return {
+        .allEngines = oddLinkedCopyEnginesMask,
+        .h2dEngines = NEO::EngineHelpers::h2dCopyEngineMask,
+        .d2hEngines = NEO::EngineHelpers::d2hCopyEngineMask,
+        .perEngineMaxSize = 1, // split evenly on all available engines
+        .minRequiredTotalCsrCount = static_cast<uint32_t>(oddLinkedCopyEnginesMask.count()),
+        .requiredTileCount = 1,
+        .enabled = true,
+    };
 }
 
 template <>
 bool ProductHelperHw<gfxProduct>::isImplicitScalingSupported(const HardwareInfo &hwInfo) const {
     return getSteppingFromHwRevId(hwInfo) >= REVISION_B;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isComputeDispatchAllWalkerEnableInComputeWalkerRequired(const HardwareInfo &hwInfo) const {
-    return false;
 }
 
 template <>
@@ -183,7 +227,7 @@ bool ProductHelperHw<gfxProduct>::isComputeDispatchAllWalkerEnableInCfeStateRequ
 
 template <>
 bool ProductHelperHw<gfxProduct>::isIpSamplingSupported(const HardwareInfo &hwInfo) const {
-    return PVC::isXt(hwInfo);
+    return PVC::isXt(hwInfo) || PVC::isXtVg(hwInfo);
 }
 
 template <>
@@ -192,15 +236,13 @@ void ProductHelperHw<gfxProduct>::adjustNumberOfCcs(HardwareInfo &hwInfo) const 
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::isStatefulAddressingModeSupported() const {
-    return false;
+uint32_t ProductHelperHw<gfxProduct>::getRequiredDetectIndirectVersion() const {
+    return IndirectDetectionVersions::requiredDetectIndirectVersionPVC;
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::isDetectIndirectAccessInKernelSupported(const KernelDescriptor &kernelDescriptor) const {
-    const bool isZebin = kernelDescriptor.kernelAttributes.binaryFormat == DeviceBinaryFormat::Zebin;
-    const bool isCMKernelHeuristic = kernelDescriptor.kernelAttributes.simdSize == 1;
-    return isZebin && !isCMKernelHeuristic;
+uint32_t ProductHelperHw<gfxProduct>::getRequiredDetectIndirectVersionVC() const {
+    return IndirectDetectionVersions::requiredDetectIndirectVersionPVCVectorCompiler;
 }
 
 template <>
@@ -209,7 +251,37 @@ std::optional<aub_stream::ProductFamily> ProductHelperHw<gfxProduct>::getAubStre
 };
 
 template <>
-uint32_t ProductHelperHw<gfxProduct>::getNumberOfPartsInTileForConcurrentKernel() const {
+uint32_t ProductHelperHw<gfxProduct>::getNumberOfPartsInTileForConcurrentKernel(uint32_t ccsCount) const {
+    if (ccsCount == 1) {
+        return 1;
+    } else if (ccsCount == 2) {
+        return 4;
+    }
     return PVC::numberOfpartsInTileForConcurrentKernels;
 }
+
+template <>
+bool ProductHelperHw<gfxProduct>::isSkippingStatefulInformationRequired(const KernelDescriptor &kernelDescriptor) const {
+    bool isGeneratedByNgen = !kernelDescriptor.kernelMetadata.isGeneratedByIgc;
+    return isGeneratedByNgen;
+}
+
+template <>
+uint64_t ProductHelperHw<gfxProduct>::getHostMemCapabilitiesValue() const {
+    return (UnifiedSharedMemoryFlags::access);
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isTile64With3DSurfaceOnBCSSupported(const HardwareInfo &hwInfo) const {
+    return false;
+}
+
+template <>
+uint32_t ProductHelperHw<gfxProduct>::getMaxThreadsForWorkgroupInDSSOrSS(const HardwareInfo &hwInfo, uint32_t maxNumEUsPerSubSlice, uint32_t maxNumEUsPerDualSubSlice) const {
+    if (isMaxThreadsForWorkgroupWARequired(hwInfo)) {
+        return std::min(getMaxThreadsForWorkgroup(hwInfo, maxNumEUsPerDualSubSlice), 64u);
+    }
+    return getMaxThreadsForWorkgroup(hwInfo, maxNumEUsPerDualSubSlice);
+}
+
 } // namespace NEO

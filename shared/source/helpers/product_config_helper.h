@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,15 +10,16 @@
 #include "shared/source/helpers/hw_ip_version.h"
 #include "shared/source/utilities/const_stringref.h"
 
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 
 #include <algorithm>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace AOT {
-enum PRODUCT_CONFIG : uint32_t;
+enum PRODUCT_CONFIG : uint32_t; // NOLINT(readability-identifier-naming)
 enum RELEASE : uint32_t;
 enum FAMILY : uint32_t;
 } // namespace AOT
@@ -36,9 +37,20 @@ struct DeviceAotInfo {
     std::vector<NEO::ConstStringRef> deviceAcronyms{};
     std::vector<NEO::ConstStringRef> rtlIdAcronyms{};
 
-    bool operator==(const DeviceAotInfo &rhs) {
+    bool operator==(const DeviceAotInfo &rhs) const {
         return aotConfig.value == rhs.aotConfig.value && family == rhs.family && release == rhs.release && hwInfo == rhs.hwInfo;
     }
+};
+
+namespace IgcaFeatureSet {
+inline constexpr uint32_t compute = 0x1;
+inline constexpr uint32_t render = 0x2;
+inline constexpr uint32_t exact = 0x4;
+} // namespace IgcaFeatureSet
+
+struct IgcaTarget {
+    uint32_t target = 0;
+    uint32_t featureSets = 0;
 };
 
 struct ProductConfigHelper {
@@ -59,9 +71,15 @@ struct ProductConfigHelper {
     }
 
     static std::vector<NEO::ConstStringRef> getDeviceAcronyms();
+    AOT::PRODUCT_CONFIG getLastProductConfigFromFamilyName(AOT::FAMILY family);
+    AOT::PRODUCT_CONFIG getLastProductConfigFromReleaseName(AOT::RELEASE release);
     static NEO::ConstStringRef getAcronymFromAFamily(AOT::FAMILY family);
+    static NEO::ConstStringRef getAcronymFromARelease(AOT::RELEASE release);
     static uint32_t getProductConfigFromVersionValue(const std::string &device);
     static AOT::PRODUCT_CONFIG getProductConfigFromAcronym(const std::string &device);
+    static std::vector<std::string> getCompatibilityFallbackProductAbbreviations(AOT::PRODUCT_CONFIG requestedConfig);
+    static const std::map<AOT::PRODUCT_CONFIG, std::vector<AOT::PRODUCT_CONFIG>> &getInvertedCompatibilityMapping();
+    static bool getIgcaTarget(NEO::HardwareIpVersion ipVersion, IgcaTarget &igcaTarget);
 
     static bool compareConfigs(DeviceAotInfo deviceAotInfo0, DeviceAotInfo deviceAotInfo1);
 
@@ -104,6 +122,7 @@ struct ProductConfigHelper {
     }
 
     void initialize();
+    void adjustClosedRangeDeviceLegacyAcronyms(std::string &rangeFromStr, std::string &rangeToStr);
     bool isSupportedFamily(uint32_t family) const;
     bool isSupportedRelease(uint32_t release) const;
     bool isSupportedProductConfig(uint32_t config) const;
@@ -120,6 +139,7 @@ struct ProductConfigHelper {
     PRODUCT_FAMILY getProductFamilyFromDeviceName(const std::string &device) const;
     AOT::RELEASE getReleaseFromDeviceName(const std::string &device) const;
     const std::string getAcronymForProductConfig(uint32_t config) const;
+    uint32_t getDeviceIdFromIpVersion(uint32_t ipVersion) const;
 
   protected:
     std::vector<DeviceAotInfo> deviceAotInfo;

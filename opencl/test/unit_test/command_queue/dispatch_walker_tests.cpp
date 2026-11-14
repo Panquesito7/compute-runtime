@@ -1,23 +1,26 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_container/encode_surface_state.h"
-#include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/local_work_size.h"
-#include "shared/source/kernel/implicit_args.h"
+#include "shared/source/helpers/vec.h"
+#include "shared/source/kernel/implicit_args_helper.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
 #include "shared/source/utilities/hw_timestamps.h"
-#include "shared/source/utilities/perf_counter.h"
 #include "shared/source/utilities/tag_allocator.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/mocks/mock_timestamp_container.h"
 #include "shared/test/common/test_macros/hw_test.h"
@@ -30,8 +33,9 @@
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/command_queue/hardware_interface_helper.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_buffer.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_event.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_mdi.h"
@@ -44,7 +48,7 @@ struct DispatchWalkerTest : public CommandQueueFixture, public ClDeviceFixture, 
     using CommandQueueFixture::setUp;
 
     void SetUp() override {
-        DebugManager.flags.EnableTimestampPacket.set(0);
+        debugManager.flags.EnableTimestampPacket.set(0);
         ClDeviceFixture::setUp();
         context = std::make_unique<MockContext>(pClDevice);
         CommandQueueFixture::setUp(context.get(), pClDevice, 0);
@@ -95,17 +99,9 @@ struct DispatchWalkerTest : public CommandQueueFixture, public ClDeviceFixture, 
     DebugManagerStateRestore dbgRestore;
 };
 
-struct DispatchWalkerTestForAuxTranslation : DispatchWalkerTest, public ::testing::WithParamInterface<KernelObjForAuxTranslation::Type> {
-    void SetUp() override {
-        DispatchWalkerTest::SetUp();
-        kernelObjType = GetParam();
-    }
+struct DispatchWalkerTestForAuxTranslation : DispatchWalkerTest {
     KernelObjForAuxTranslation::Type kernelObjType;
 };
-
-INSTANTIATE_TEST_CASE_P(,
-                        DispatchWalkerTestForAuxTranslation,
-                        testing::ValuesIn({KernelObjForAuxTranslation::Type::MEM_OBJ, KernelObjForAuxTranslation::Type::GFX_ALLOC}));
 
 HWTEST_F(DispatchWalkerTest, WhenGettingComputeDimensionsThenCorrectNumberOfDimensionsIsReturned) {
     const size_t workItems1D[] = {100, 1, 1};
@@ -123,11 +119,10 @@ HWTEST_F(DispatchWalkerTest, givenSimd1WhenSetGpgpuWalkerThreadDataThenSimdInWal
     MockGraphicsAllocation gfxAllocation(static_cast<void *>(pCmdBuffer), sizeof(pCmdBuffer));
     LinearStream linearStream(&gfxAllocation);
 
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    WALKER_TYPE *computeWalker = static_cast<WALKER_TYPE *>(linearStream.getSpace(sizeof(WALKER_TYPE)));
-    *computeWalker = FamilyType::cmdInitGpgpuWalker;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    DefaultWalkerType *computeWalker = static_cast<DefaultWalkerType *>(linearStream.getSpace(sizeof(DefaultWalkerType)));
+    *computeWalker = FamilyType::template getInitGpuWalker<DefaultWalkerType>();
 
-    size_t globalOffsets[] = {0, 0, 0};
     size_t startWorkGroups[] = {0, 0, 0};
     size_t numWorkGroups[] = {1, 1, 1};
     size_t localWorkSizesIn[] = {32, 1, 1};
@@ -135,7 +130,7 @@ HWTEST_F(DispatchWalkerTest, givenSimd1WhenSetGpgpuWalkerThreadDataThenSimdInWal
 
     KernelDescriptor kd;
     GpgpuWalkerHelper<FamilyType>::setGpgpuWalkerThreadData(
-        computeWalker, kd, globalOffsets, startWorkGroups, numWorkGroups, localWorkSizesIn, simd, 3, true, false, 5u);
+        computeWalker, kd, startWorkGroups, numWorkGroups, localWorkSizesIn, simd, 3, true, false, 5u);
     EXPECT_EQ(computeWalker->getSimdSize(), 32 >> 4);
 }
 
@@ -146,7 +141,7 @@ HWTEST_F(DispatchWalkerTest, WhenDispatchingWalkerThenCommandStreamMemoryIsntCha
     auto &commandStream = pCmdQ->getCS(4096);
 
     // Consume all memory except what is needed for this enqueue
-    auto sizeDispatchWalkerNeeds = sizeof(typename FamilyType::WALKER_TYPE) +
+    auto sizeDispatchWalkerNeeds = sizeof(typename FamilyType::DefaultWalkerType) +
                                    HardwareCommandsHelper<FamilyType>::getSizeRequiredCS();
 
     // cs has a minimum required size
@@ -169,7 +164,7 @@ HWTEST_F(DispatchWalkerTest, WhenDispatchingWalkerThenCommandStreamMemoryIsntCha
     multiDispatchInfo.push(dispatchInfo);
 
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -182,7 +177,6 @@ HWTEST_F(DispatchWalkerTest, WhenDispatchingWalkerThenCommandStreamMemoryIsntCha
 
 HWTEST_F(DispatchWalkerTest, GivenNoLocalIdsWhenDispatchingWalkerThenWalkerIsDispatched) {
     kernelInfo.setLocalIds({0, 0, 0});
-    kernelInfo.kernelDescriptor.kernelAttributes.flags.perThreadDataUnusedGrfIsPresent = true;
 
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     ASSERT_EQ(CL_SUCCESS, kernel.initialize());
@@ -190,7 +184,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalIdsWhenDispatchingWalkerThenWalkerIsDis
     auto &commandStream = pCmdQ->getCS(4096);
 
     // Consume all memory except what is needed for this enqueue
-    auto sizeDispatchWalkerNeeds = sizeof(typename FamilyType::WALKER_TYPE) +
+    auto sizeDispatchWalkerNeeds = sizeof(typename FamilyType::DefaultWalkerType) +
                                    HardwareCommandsHelper<FamilyType>::getSizeRequiredCS();
 
     // cs has a minimum required size
@@ -212,7 +206,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalIdsWhenDispatchingWalkerThenWalkerIsDis
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -239,7 +233,7 @@ HWTEST_F(DispatchWalkerTest, GivenDefaultLwsAlgorithmWhenDispatchingWalkerThenDi
         MultiDispatchInfo multiDispatchInfo;
         multiDispatchInfo.push(dispatchInfo);
         HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-        HardwareInterface<FamilyType>::dispatchWalker(
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
             *pCmdQ,
             multiDispatchInfo,
             CsrDependencies(),
@@ -251,8 +245,8 @@ HWTEST_F(DispatchWalkerTest, GivenDefaultLwsAlgorithmWhenDispatchingWalkerThenDi
 
 HWTEST_F(DispatchWalkerTest, GivenSquaredLwsAlgorithmWhenDispatchingWalkerThenDimensionsAreCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeND.set(false);
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(true);
+    debugManager.flags.EnableComputeWorkSizeND.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(true);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
     ASSERT_EQ(CL_SUCCESS, kernel.initialize());
@@ -267,7 +261,7 @@ HWTEST_F(DispatchWalkerTest, GivenSquaredLwsAlgorithmWhenDispatchingWalkerThenDi
         MultiDispatchInfo multiDispatchInfo;
         multiDispatchInfo.push(dispatchInfo);
         HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-        HardwareInterface<FamilyType>::dispatchWalker(
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
             *pCmdQ,
             multiDispatchInfo,
             CsrDependencies(),
@@ -278,7 +272,7 @@ HWTEST_F(DispatchWalkerTest, GivenSquaredLwsAlgorithmWhenDispatchingWalkerThenDi
 
 HWTEST_F(DispatchWalkerTest, GivenNdLwsAlgorithmWhenDispatchingWalkerThenDimensionsAreCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeND.set(true);
+    debugManager.flags.EnableComputeWorkSizeND.set(true);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
     ASSERT_EQ(CL_SUCCESS, kernel.initialize());
@@ -293,7 +287,7 @@ HWTEST_F(DispatchWalkerTest, GivenNdLwsAlgorithmWhenDispatchingWalkerThenDimensi
         MultiDispatchInfo multiDispatchInfo;
         multiDispatchInfo.push(dispatchInfo);
         HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-        HardwareInterface<FamilyType>::dispatchWalker(
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
             *pCmdQ,
             multiDispatchInfo,
             CsrDependencies(),
@@ -304,8 +298,8 @@ HWTEST_F(DispatchWalkerTest, GivenNdLwsAlgorithmWhenDispatchingWalkerThenDimensi
 
 HWTEST_F(DispatchWalkerTest, GivenOldLwsAlgorithmWhenDispatchingWalkerThenDimensionsAreCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeND.set(false);
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    debugManager.flags.EnableComputeWorkSizeND.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
     ASSERT_EQ(CL_SUCCESS, kernel.initialize());
@@ -320,7 +314,7 @@ HWTEST_F(DispatchWalkerTest, GivenOldLwsAlgorithmWhenDispatchingWalkerThenDimens
         MultiDispatchInfo multiDispatchInfo;
         multiDispatchInfo.push(dispatchInfo);
         HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-        HardwareInterface<FamilyType>::dispatchWalker(
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
             *pCmdQ,
             multiDispatchInfo,
             CsrDependencies(),
@@ -347,7 +341,7 @@ HWTEST_F(DispatchWalkerTest, GivenNumWorkGroupsWhenDispatchingWalkerThenNumWorkG
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -377,7 +371,7 @@ HWTEST_F(DispatchWalkerTest, GivenGlobalWorkOffsetWhenDispatchingWalkerThenGloba
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -391,7 +385,7 @@ HWTEST_F(DispatchWalkerTest, GivenGlobalWorkOffsetWhenDispatchingWalkerThenGloba
 
 HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndDefaultAlgorithmWhenDispatchingWalkerThenLwsIsCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeND.set(false);
+    debugManager.flags.EnableComputeWorkSizeND.set(false);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] = 0;
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[1] = 4;
@@ -407,7 +401,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndDefaultAlgorithmWhenDispatch
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -421,7 +415,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndDefaultAlgorithmWhenDispatch
 
 HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndNdOnWhenDispatchingWalkerThenLwsIsCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeND.set(true);
+    debugManager.flags.EnableComputeWorkSizeND.set(true);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] = 0;
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[1] = 4;
@@ -437,7 +431,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndNdOnWhenDispatchingWalkerThe
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -451,8 +445,8 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndNdOnWhenDispatchingWalkerThe
 
 HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndSquaredAlgorithmWhenDispatchingWalkerThenLwsIsCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(true);
-    DebugManager.flags.EnableComputeWorkSizeND.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(true);
+    debugManager.flags.EnableComputeWorkSizeND.set(false);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] = 0;
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[1] = 4;
@@ -468,7 +462,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndSquaredAlgorithmWhenDispatch
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -482,8 +476,8 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndSquaredAlgorithmWhenDispatch
 
 HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndSquaredAlgorithmOffAndNdOffWhenDispatchingWalkerThenLwsIsCorrect) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableComputeWorkSizeSquared.set(false);
-    DebugManager.flags.EnableComputeWorkSizeND.set(false);
+    debugManager.flags.EnableComputeWorkSizeSquared.set(false);
+    debugManager.flags.EnableComputeWorkSizeND.set(false);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] = 0;
     kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[1] = 4;
@@ -499,7 +493,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeAndSquaredAlgorithmOffAndNdOffW
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -528,7 +522,7 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeWhenDispatchingWalkerThenLwsIsC
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -538,42 +532,6 @@ HWTEST_F(DispatchWalkerTest, GivenNoLocalWorkSizeWhenDispatchingWalkerThenLwsIsC
     EXPECT_EQ(1u, *localWorkSize[0]);
     EXPECT_EQ(2u, *localWorkSize[1]);
     EXPECT_EQ(3u, *localWorkSize[2]);
-}
-
-HWTEST_F(DispatchWalkerTest, GivenTwoSetsOfLwsOffsetsWhenDispatchingWalkerThenLwsIsCorrect) {
-    MockKernel kernel(program.get(), kernelInfo, *pClDevice);
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] = 0;
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[1] = 4;
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[2] = 8;
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize2[0] = 12;
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize2[1] = 16;
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize2[2] = 20;
-    ASSERT_EQ(CL_SUCCESS, kernel.initialize());
-
-    size_t globalOffsets[3] = {0, 0, 0};
-    size_t workItems[3] = {2, 5, 10};
-    size_t workGroupSize[3] = {1, 2, 3};
-    cl_uint dimensions = 3;
-    DispatchInfo dispatchInfo(pClDevice, const_cast<MockKernel *>(&kernel), dimensions, workItems, workGroupSize, globalOffsets);
-    dispatchInfo.setNumberOfWorkgroups({1, 1, 1});
-    dispatchInfo.setTotalNumberOfWorkgroups({1, 1, 1});
-    MultiDispatchInfo multiDispatchInfo;
-    multiDispatchInfo.push(dispatchInfo);
-    HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo,
-        CsrDependencies(),
-        walkerArgs);
-
-    auto localWorkSize = kernel.getLocalWorkSizeValues();
-    EXPECT_EQ(1u, *localWorkSize[0]);
-    EXPECT_EQ(2u, *localWorkSize[1]);
-    EXPECT_EQ(3u, *localWorkSize[2]);
-    auto localWorkSize2 = kernel.getLocalWorkSize2Values();
-    EXPECT_EQ(1u, *localWorkSize2[0]);
-    EXPECT_EQ(2u, *localWorkSize2[1]);
-    EXPECT_EQ(3u, *localWorkSize2[2]);
 }
 
 HWTEST_F(DispatchWalkerTest, GivenSplitKernelWhenDispatchingWalkerThenLwsIsCorrect) {
@@ -598,7 +556,7 @@ HWTEST_F(DispatchWalkerTest, GivenSplitKernelWhenDispatchingWalkerThenLwsIsCorre
 
     MockMultiDispatchInfo multiDispatchInfo(std::vector<DispatchInfo *>({&di1, &di2}));
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -629,9 +587,6 @@ HWTEST_F(DispatchWalkerTest, GivenSplitWalkerWhenDispatchingWalkerThenLwsIsCorre
     dispatchTraits.localWorkSize[0] = 0;
     dispatchTraits.localWorkSize[1] = 4;
     dispatchTraits.localWorkSize[2] = 8;
-    dispatchTraits.localWorkSize2[0] = 12;
-    dispatchTraits.localWorkSize2[1] = 16;
-    dispatchTraits.localWorkSize2[2] = 20;
     dispatchTraits.numWorkGroups[0] = 24;
     dispatchTraits.numWorkGroups[1] = 28;
     dispatchTraits.numWorkGroups[2] = 32;
@@ -650,7 +605,7 @@ HWTEST_F(DispatchWalkerTest, GivenSplitWalkerWhenDispatchingWalkerThenLwsIsCorre
     multiDispatchInfo.push(di2);
 
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -659,25 +614,18 @@ HWTEST_F(DispatchWalkerTest, GivenSplitWalkerWhenDispatchingWalkerThenLwsIsCorre
     for (auto &dispatchInfo : multiDispatchInfo) {
         auto &kernel = static_cast<MockKernel &>(*dispatchInfo.getKernel());
         auto localWorkSize = kernel.getLocalWorkSizeValues();
-        auto localWorkSize2 = kernel.getLocalWorkSize2Values();
         auto numWorkGroups = kernel.getNumWorkGroupsValues();
         if (&kernel == &mainKernel) {
             EXPECT_EQ(4u, *localWorkSize[0]);
             EXPECT_EQ(5u, *localWorkSize[1]);
             EXPECT_EQ(6u, *localWorkSize[2]);
-            EXPECT_EQ(4u, *localWorkSize2[0]);
-            EXPECT_EQ(5u, *localWorkSize2[1]);
-            EXPECT_EQ(6u, *localWorkSize2[2]);
             EXPECT_EQ(3u, *numWorkGroups[0]);
             EXPECT_EQ(2u, *numWorkGroups[1]);
             EXPECT_EQ(2u, *numWorkGroups[2]);
         } else {
-            EXPECT_EQ(0u, *localWorkSize[0]);
-            EXPECT_EQ(0u, *localWorkSize[1]);
-            EXPECT_EQ(0u, *localWorkSize[2]);
-            EXPECT_EQ(1u, *localWorkSize2[0]);
-            EXPECT_EQ(2u, *localWorkSize2[1]);
-            EXPECT_EQ(3u, *localWorkSize2[2]);
+            EXPECT_EQ(1u, *localWorkSize[0]);
+            EXPECT_EQ(2u, *localWorkSize[1]);
+            EXPECT_EQ(3u, *localWorkSize[2]);
             EXPECT_EQ(0u, *numWorkGroups[0]);
             EXPECT_EQ(0u, *numWorkGroups[1]);
             EXPECT_EQ(0u, *numWorkGroups[2]);
@@ -703,7 +651,7 @@ HWTEST_F(DispatchWalkerTest, GivenBlockedQueueWhenDispatchingWalkerThenCommandSt
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -735,16 +683,14 @@ HWTEST_F(DispatchWalkerTest, GivenBlockedQueueWhenDispatchingWalkerThenRequiredH
     multiDispatchInfo.push(dispatchInfo);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
         walkerArgs);
 
-    Vec3<size_t> localWorkgroupSize(workGroupSize);
-
     auto expectedSizeDSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredDSH(kernel);
-    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(kernel, Math::computeTotalElementsCount(localWorkgroupSize));
+    auto expectedSizeIOH = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(kernel, workGroupSize, pClDevice->getRootDeviceEnvironment());
     auto expectedSizeSSH = HardwareCommandsHelper<FamilyType>::getSizeRequiredSSH(kernel);
 
     EXPECT_LE(expectedSizeDSH, blockedCommandsData->dsh->getMaxAvailableSpace());
@@ -784,7 +730,7 @@ HWTEST_F(DispatchWalkerTest, GivenBlockedQueueWhenDispatchingWalkerThenRequiredH
     auto blockedCommandsData = createBlockedCommandsData(*pCmdQ);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -807,7 +753,7 @@ HWTEST_F(DispatchWalkerTest, givenBlockedQueueWhenDispatchWalkerIsCalledThenComm
     auto blockedCommandsData = createBlockedCommandsData(*pCmdQ);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -818,20 +764,23 @@ HWTEST_F(DispatchWalkerTest, givenBlockedQueueWhenDispatchWalkerIsCalledThenComm
 }
 
 HWTEST_F(DispatchWalkerTest, givenThereAreAllocationsForReuseWhenDispatchWalkerIsCalledThenCommandStreamObtainsReusableAllocation) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetAmountOfReusableAllocationsPerCmdQueue.set(0);
+    debugManager.flags.EnableCommandBufferPoolAllocator.set(0);
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
     ASSERT_EQ(CL_SUCCESS, kernel.initialize());
     MockMultiDispatchInfo multiDispatchInfo(pClDevice, &kernel);
 
     auto &csr = pCmdQ->getGpgpuCommandStreamReceiver();
     auto allocation = csr.getMemoryManager()->allocateGraphicsMemoryWithProperties({csr.getRootDeviceIndex(), MemoryConstants::pageSize64k + CSRequirements::csOverfetchSize,
-                                                                                    AllocationType::COMMAND_BUFFER, csr.getOsContext().getDeviceBitfield()});
+                                                                                    AllocationType::commandBuffer, csr.getOsContext().getDeviceBitfield()});
     csr.getInternalAllocationStorage()->storeAllocation(std::unique_ptr<GraphicsAllocation>{allocation}, REUSABLE_ALLOCATION);
     ASSERT_FALSE(csr.getInternalAllocationStorage()->getAllocationsForReuse().peekIsEmpty());
 
     auto blockedCommandsData = createBlockedCommandsData(*pCmdQ);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -851,7 +800,7 @@ HWTEST_F(DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenWorkDi
 
     MockMultiDispatchInfo multiDispatchInfo(pClDevice, std::vector<Kernel *>({&kernel1, &kernel2}));
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -863,12 +812,12 @@ HWTEST_F(DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenWorkDi
     }
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenInterfaceDescriptorsAreProgrammedCorrectly) {
+HWTEST2_F(DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenInterfaceDescriptorsAreProgrammedCorrectly, IsGen12LP) {
     using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
 
     auto memoryManager = this->pDevice->getMemoryManager();
-    auto kernelIsaAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::KERNEL_ISA, pDevice->getDeviceBitfield()});
-    auto kernelIsaWithSamplerAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::KERNEL_ISA, pDevice->getDeviceBitfield()});
+    auto kernelIsaAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::kernelIsa, pDevice->getDeviceBitfield()});
+    auto kernelIsaWithSamplerAllocation = memoryManager->allocateGraphicsMemoryWithProperties({pDevice->getRootDeviceIndex(), MemoryConstants::pageSize, AllocationType::kernelIsa, pDevice->getDeviceBitfield()});
     kernelInfo.kernelAllocation = kernelIsaAllocation;
     kernelInfoWithSampler.kernelAllocation = kernelIsaWithSamplerAllocation;
     auto gpuAddress1 = kernelIsaAllocation->getGpuAddressToPatch();
@@ -882,13 +831,13 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     MockMultiDispatchInfo multiDispatchInfo(pClDevice, std::vector<Kernel *>({&kernel1, &kernel2}));
 
     // create Indirect DSH heap
-    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 8192);
+    auto &indirectHeap = pCmdQ->getIndirectHeap(IndirectHeap::Type::dynamicState, 8192);
 
     indirectHeap.align(EncodeStates<FamilyType>::alignInterfaceDescriptorData);
     auto dshBeforeMultiDisptach = indirectHeap.getUsed();
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
 
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -904,18 +853,12 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     INTERFACE_DESCRIPTOR_DATA *pID = reinterpret_cast<INTERFACE_DESCRIPTOR_DATA *>(ptrOffset(indirectHeap.getCpuBase(), dshBeforeMultiDisptach));
 
     for (uint32_t index = 0; index < multiDispatchInfo.size(); index++) {
-        uint32_t addressLow = pID[index].getKernelStartPointer();
-        uint32_t addressHigh = pID[index].getKernelStartPointerHigh();
-        uint64_t fullAddress = ((uint64_t)addressHigh << 32) | addressLow;
+        uint64_t fullAddress = pID[index].getKernelStartPointer();
 
         if (index > 0) {
-            uint32_t addressLowOfPrevious = pID[index - 1].getKernelStartPointer();
-            uint32_t addressHighOfPrevious = pID[index - 1].getKernelStartPointerHigh();
+            uint64_t addressPrevious = pID[index - 1].getKernelStartPointer();
 
-            uint64_t addressPrevious = ((uint64_t)addressHighOfPrevious << 32) | addressLowOfPrevious;
-            uint64_t address = ((uint64_t)addressHigh << 32) | addressLow;
-
-            EXPECT_NE(addressPrevious, address);
+            EXPECT_NE(addressPrevious, fullAddress);
         }
 
         if (index == 0) {
@@ -958,7 +901,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     memoryManager->freeGraphicsMemory(kernelIsaWithSamplerAllocation);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenGpgpuWalkerIdOffsetIsProgrammedCorrectly) {
+HWTEST2_F(DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenGpgpuWalkerIdOffsetIsProgrammedCorrectly, IsGen12LP) {
     using GPGPU_WALKER = typename FamilyType::GPGPU_WALKER;
 
     MockKernel kernel1(program.get(), kernelInfo, *pClDevice);
@@ -971,7 +914,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     // create commandStream
     auto &cmdStream = pCmdQ->getCS(0);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -998,7 +941,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     }
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenThreadGroupIdStartingCoordinatesAreProgrammedCorrectly) {
+HWTEST2_F(DispatchWalkerTest, GivenMultipleKernelsWhenDispatchingWalkerThenThreadGroupIdStartingCoordinatesAreProgrammedCorrectly, IsGen12LP) {
     using GPGPU_WALKER = typename FamilyType::GPGPU_WALKER;
 
     MockKernel kernel1(program.get(), kernelInfo, *pClDevice);
@@ -1011,7 +954,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     // create commandStream
     auto &cmdStream = pCmdQ->getCS(0);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -1042,7 +985,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleKernelsWhenDispatch
     }
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleDispatchInfoAndSameKernelWhenDispatchingWalkerThenGpgpuWalkerThreadGroupIdStartingCoordinatesAreCorrectlyProgrammed) {
+HWTEST2_F(DispatchWalkerTest, GivenMultipleDispatchInfoAndSameKernelWhenDispatchingWalkerThenGpgpuWalkerThreadGroupIdStartingCoordinatesAreCorrectlyProgrammed, IsGen12LP) {
     using GPGPU_WALKER = typename FamilyType::GPGPU_WALKER;
 
     MockKernel kernel(program.get(), kernelInfo, *pClDevice);
@@ -1056,7 +999,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleDispatchInfoAndSame
     // create commandStream
     auto &cmdStream = pCmdQ->getCS(0);
     HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfo,
         CsrDependencies(),
@@ -1087,109 +1030,6 @@ HWCMDTEST_F(IGFX_GEN8_CORE, DispatchWalkerTest, GivenMultipleDispatchInfoAndSame
     }
 }
 
-HWTEST_F(DispatchWalkerTest, GivenCacheFlushAfterWalkerDisabledWhenAllocationRequiresCacheFlushThenFlushCommandNotPresentAfterWalker) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableCacheFlushAfterWalker.set(0);
-
-    MockKernel kernel1(program.get(), kernelInfo, *pClDevice);
-    ASSERT_EQ(CL_SUCCESS, kernel1.initialize());
-    kernel1.kernelArgRequiresCacheFlush.resize(1);
-    MockGraphicsAllocation cacheRequiringAllocation;
-    kernel1.kernelArgRequiresCacheFlush[0] = &cacheRequiringAllocation;
-
-    MockMultiDispatchInfo multiDispatchInfo(pClDevice, std::vector<Kernel *>({&kernel1}));
-    // create commandStream
-    auto &cmdStream = pCmdQ->getCS(0);
-    HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo,
-        CsrDependencies(),
-        walkerArgs);
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(cmdStream);
-    PIPE_CONTROL *pipeControl = hwParse.getCommand<PIPE_CONTROL>();
-    EXPECT_EQ(nullptr, pipeControl);
-}
-
-HWTEST_F(DispatchWalkerTest, GivenCacheFlushAfterWalkerEnabledWhenWalkerWithTwoKernelsThenFlushCommandPresentOnce) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableCacheFlushAfterWalker.set(1);
-
-    MockKernel kernel1(program.get(), kernelInfo, *pClDevice);
-    ASSERT_EQ(CL_SUCCESS, kernel1.initialize());
-    MockKernel kernel2(program.get(), kernelInfoWithSampler, *pClDevice);
-    ASSERT_EQ(CL_SUCCESS, kernel2.initialize());
-
-    kernel1.kernelArgRequiresCacheFlush.resize(1);
-    kernel2.kernelArgRequiresCacheFlush.resize(1);
-    MockGraphicsAllocation cacheRequiringAllocation;
-    kernel1.kernelArgRequiresCacheFlush[0] = &cacheRequiringAllocation;
-    kernel2.kernelArgRequiresCacheFlush[0] = &cacheRequiringAllocation;
-
-    MockMultiDispatchInfo multiDispatchInfo(pClDevice, std::vector<Kernel *>({&kernel1, &kernel2}));
-    // create commandStream
-    auto &cmdStream = pCmdQ->getCS(0);
-    HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo,
-        CsrDependencies(),
-        walkerArgs);
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(cmdStream);
-    uint32_t pipeControlCount = hwParse.getCommandCount<PIPE_CONTROL>();
-    EXPECT_EQ(pipeControlCount, 1u);
-}
-
-HWTEST_F(DispatchWalkerTest, GivenCacheFlushAfterWalkerEnabledWhenTwoWalkersForQueueThenFlushCommandPresentTwice) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableCacheFlushAfterWalker.set(1);
-
-    MockKernel kernel1(program.get(), kernelInfo, *pClDevice);
-    ASSERT_EQ(CL_SUCCESS, kernel1.initialize());
-    MockKernel kernel2(program.get(), kernelInfoWithSampler, *pClDevice);
-    ASSERT_EQ(CL_SUCCESS, kernel2.initialize());
-
-    kernel1.kernelArgRequiresCacheFlush.resize(1);
-    kernel2.kernelArgRequiresCacheFlush.resize(1);
-    MockGraphicsAllocation cacheRequiringAllocation;
-    kernel1.kernelArgRequiresCacheFlush[0] = &cacheRequiringAllocation;
-    kernel2.kernelArgRequiresCacheFlush[0] = &cacheRequiringAllocation;
-
-    MockMultiDispatchInfo multiDispatchInfo1(pClDevice, std::vector<Kernel *>({&kernel1}));
-    MockMultiDispatchInfo multiDispatchInfo2(pClDevice, std::vector<Kernel *>({&kernel2}));
-    // create commandStream
-    auto &cmdStream = pCmdQ->getCS(0);
-
-    HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo1,
-        CsrDependencies(),
-        walkerArgs);
-
-    HardwareInterfaceWalkerArgs walkerArgs2 = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo2,
-        CsrDependencies(),
-        walkerArgs2);
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(cmdStream);
-    uint32_t pipeControlCount = hwParse.getCommandCount<PIPE_CONTROL>();
-    EXPECT_EQ(pipeControlCount, 2u);
-}
-
 TEST(DispatchWalker, WhenCalculatingDispatchDimensionsThenCorrectValuesAreReturned) {
     Vec3<size_t> dim0{0, 0, 0};
     Vec3<size_t> dim1{2, 1, 1};
@@ -1207,103 +1047,110 @@ TEST(DispatchWalker, WhenCalculatingDispatchDimensionsThenCorrectValuesAreReturn
     }
 }
 
-HWTEST_P(DispatchWalkerTestForAuxTranslation, givenKernelWhenAuxToNonAuxWhenTranslationRequiredThenPipeControlWithStallAndDCFlushAdded) {
-    BuiltinDispatchInfoBuilder &baseBuilder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::AuxTranslation, *pClDevice);
-    auto &builder = static_cast<BuiltInOp<EBuiltInOps::AuxTranslation> &>(baseBuilder);
+using IsAuxTranslationSupported = IsAtMostXeCore;
 
-    MockKernel kernel(program.get(), kernelInfo, *pClDevice);
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
-    ASSERT_EQ(CL_SUCCESS, kernel.initialize());
+HWTEST2_F(DispatchWalkerTestForAuxTranslation, givenKernelWhenAuxToNonAuxWhenTranslationRequiredThenPipeControlWithStallAndDCFlushAdded, IsAuxTranslationSupported) {
+    for (auto kernelObjTypeParam : {KernelObjForAuxTranslation::Type::memObj, KernelObjForAuxTranslation::Type::gfxAlloc}) {
+        kernelObjType = kernelObjTypeParam;
 
-    auto &cmdStream = pCmdQ->getCS(0);
-    void *buffer = cmdStream.getCpuBase();
-    kernel.auxTranslationRequired = true;
-    MockKernelObjForAuxTranslation mockKernelObj1(kernelObjType);
-    MockKernelObjForAuxTranslation mockKernelObj2(kernelObjType);
+        BuiltIn::DispatchInfoBuilder &baseBuilder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::auxTranslation, pCmdQ->getDefaultBuiltInMode(), *pClDevice);
+        auto &builder = static_cast<AuxTranslationBuiltin &>(baseBuilder);
 
-    auto kernelObjsForAuxTranslation = std::make_unique<KernelObjsForAuxTranslation>();
-    kernelObjsForAuxTranslation->insert(mockKernelObj1);
-    kernelObjsForAuxTranslation->insert(mockKernelObj2);
-    MultiDispatchInfo multiDispatchInfo;
-    multiDispatchInfo.setKernelObjsForAuxTranslation(std::move(kernelObjsForAuxTranslation));
+        MockKernel kernel(program.get(), kernelInfo, *pClDevice);
+        kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
+        ASSERT_EQ(CL_SUCCESS, kernel.initialize());
 
-    BuiltinOpParams builtinOpsParams;
-    builtinOpsParams.auxTranslationDirection = AuxTranslationDirection::AuxToNonAux;
+        auto &cmdStream = pCmdQ->getCS(0);
+        auto startOffset = cmdStream.getUsed();
+        kernel.auxTranslationRequired = true;
+        MockKernelObjForAuxTranslation mockKernelObj1(kernelObjType);
+        MockKernelObjForAuxTranslation mockKernelObj2(kernelObjType);
 
-    builder.buildDispatchInfosForAuxTranslation<FamilyType>(multiDispatchInfo, builtinOpsParams);
-    HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo,
-        CsrDependencies(),
-        walkerArgs);
+        auto kernelObjsForAuxTranslation = std::make_unique<KernelObjsForAuxTranslation>();
+        kernelObjsForAuxTranslation->insert(mockKernelObj1);
+        kernelObjsForAuxTranslation->insert(mockKernelObj2);
+        MultiDispatchInfo multiDispatchInfo;
+        multiDispatchInfo.setKernelObjsForAuxTranslation(std::move(kernelObjsForAuxTranslation));
 
-    auto sizeUsed = cmdStream.getUsed();
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, buffer, sizeUsed));
+        BuiltIn::OpParams builtinOpsParams;
+        builtinOpsParams.auxTranslationDirection = AuxTranslationDirection::auxToNonAux;
 
-    auto pipeControls = findAll<typename FamilyType::PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
+        builder.buildDispatchInfosForAuxTranslation<FamilyType>(multiDispatchInfo, builtinOpsParams);
+        HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
+            *pCmdQ,
+            multiDispatchInfo,
+            CsrDependencies(),
+            walkerArgs);
 
-    ASSERT_EQ(2u, pipeControls.size());
+        auto sizeUsed = cmdStream.getUsed() - startOffset;
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream.getCpuBase(), startOffset), sizeUsed));
 
-    auto beginPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[0]));
-    EXPECT_EQ(MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pClDevice->getRootDeviceEnvironment()), beginPipeControl->getDcFlushEnable());
-    EXPECT_TRUE(beginPipeControl->getCommandStreamerStallEnable());
+        auto pipeControls = findAll<typename FamilyType::PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
 
-    auto endPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[1]));
-    bool dcFlushRequired = (pClDevice->getHardwareInfo().platform.eRenderCoreFamily == IGFX_GEN8_CORE);
-    EXPECT_EQ(dcFlushRequired, endPipeControl->getDcFlushEnable());
-    EXPECT_TRUE(endPipeControl->getCommandStreamerStallEnable());
+        ASSERT_EQ(2u, pipeControls.size());
+
+        auto beginPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[0]));
+        EXPECT_EQ(MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pClDevice->getRootDeviceEnvironment()), beginPipeControl->getDcFlushEnable());
+        EXPECT_TRUE(beginPipeControl->getCommandStreamerStallEnable());
+
+        auto endPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[1]));
+        EXPECT_FALSE(endPipeControl->getDcFlushEnable());
+        EXPECT_TRUE(endPipeControl->getCommandStreamerStallEnable());
+    }
 }
 
-HWTEST_P(DispatchWalkerTestForAuxTranslation, givenKernelWhenNonAuxToAuxWhenTranslationRequiredThenPipeControlWithStallAdded) {
-    BuiltinDispatchInfoBuilder &baseBuilder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::AuxTranslation, *pClDevice);
-    auto &builder = static_cast<BuiltInOp<EBuiltInOps::AuxTranslation> &>(baseBuilder);
+HWTEST2_F(DispatchWalkerTestForAuxTranslation, givenKernelWhenNonAuxToAuxWhenTranslationRequiredThenPipeControlWithStallAdded, IsAuxTranslationSupported) {
+    for (auto kernelObjTypeParam : {KernelObjForAuxTranslation::Type::memObj, KernelObjForAuxTranslation::Type::gfxAlloc}) {
+        kernelObjType = kernelObjTypeParam;
 
-    MockKernel kernel(program.get(), kernelInfo, *pClDevice);
-    kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
-    ASSERT_EQ(CL_SUCCESS, kernel.initialize());
+        BuiltIn::DispatchInfoBuilder &baseBuilder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::auxTranslation, pCmdQ->getDefaultBuiltInMode(), *pClDevice);
+        auto &builder = static_cast<AuxTranslationBuiltin &>(baseBuilder);
 
-    auto &cmdStream = pCmdQ->getCS(0);
-    void *buffer = cmdStream.getCpuBase();
-    kernel.auxTranslationRequired = true;
-    MockKernelObjForAuxTranslation mockKernelObj1(kernelObjType);
-    MockKernelObjForAuxTranslation mockKernelObj2(kernelObjType);
+        MockKernel kernel(program.get(), kernelInfo, *pClDevice);
+        kernelInfo.kernelDescriptor.payloadMappings.dispatchTraits.workDim = 0;
+        ASSERT_EQ(CL_SUCCESS, kernel.initialize());
 
-    auto kernelObjsForAuxTranslation = std::make_unique<KernelObjsForAuxTranslation>();
-    kernelObjsForAuxTranslation->insert(mockKernelObj1);
-    kernelObjsForAuxTranslation->insert(mockKernelObj2);
-    MultiDispatchInfo multiDispatchInfo;
-    multiDispatchInfo.setKernelObjsForAuxTranslation(std::move(kernelObjsForAuxTranslation));
+        auto &cmdStream = pCmdQ->getCS(0);
+        auto startOffset = cmdStream.getUsed();
+        kernel.auxTranslationRequired = true;
+        MockKernelObjForAuxTranslation mockKernelObj1(kernelObjType);
+        MockKernelObjForAuxTranslation mockKernelObj2(kernelObjType);
 
-    BuiltinOpParams builtinOpsParams;
-    builtinOpsParams.auxTranslationDirection = AuxTranslationDirection::NonAuxToAux;
+        auto kernelObjsForAuxTranslation = std::make_unique<KernelObjsForAuxTranslation>();
+        kernelObjsForAuxTranslation->insert(mockKernelObj1);
+        kernelObjsForAuxTranslation->insert(mockKernelObj2);
+        MultiDispatchInfo multiDispatchInfo;
+        multiDispatchInfo.setKernelObjsForAuxTranslation(std::move(kernelObjsForAuxTranslation));
 
-    builder.buildDispatchInfosForAuxTranslation<FamilyType>(multiDispatchInfo, builtinOpsParams);
-    HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
-    HardwareInterface<FamilyType>::dispatchWalker(
-        *pCmdQ,
-        multiDispatchInfo,
-        CsrDependencies(),
-        walkerArgs);
+        BuiltIn::OpParams builtinOpsParams;
+        builtinOpsParams.auxTranslationDirection = AuxTranslationDirection::nonAuxToAux;
 
-    auto sizeUsed = cmdStream.getUsed();
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, buffer, sizeUsed));
+        builder.buildDispatchInfosForAuxTranslation<FamilyType>(multiDispatchInfo, builtinOpsParams);
+        HardwareInterfaceWalkerArgs walkerArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
+            *pCmdQ,
+            multiDispatchInfo,
+            CsrDependencies(),
+            walkerArgs);
 
-    auto pipeControls = findAll<typename FamilyType::PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
+        auto sizeUsed = cmdStream.getUsed() - startOffset;
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream.getCpuBase(), startOffset), sizeUsed));
 
-    ASSERT_EQ(2u, pipeControls.size());
+        auto pipeControls = findAll<typename FamilyType::PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
 
-    bool dcFlushRequired = (pClDevice->getHardwareInfo().platform.eRenderCoreFamily == IGFX_GEN8_CORE);
+        ASSERT_EQ(2u, pipeControls.size());
 
-    auto beginPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[0]));
-    EXPECT_EQ(MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pClDevice->getRootDeviceEnvironment()), beginPipeControl->getDcFlushEnable());
-    EXPECT_TRUE(beginPipeControl->getCommandStreamerStallEnable());
+        auto beginPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[0]));
+        EXPECT_EQ(MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, pClDevice->getRootDeviceEnvironment()), beginPipeControl->getDcFlushEnable());
+        EXPECT_TRUE(beginPipeControl->getCommandStreamerStallEnable());
 
-    auto endPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[1]));
-    EXPECT_EQ(dcFlushRequired, endPipeControl->getDcFlushEnable());
-    EXPECT_TRUE(endPipeControl->getCommandStreamerStallEnable());
+        auto endPipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*(pipeControls[1]));
+        EXPECT_FALSE(endPipeControl->getDcFlushEnable());
+        EXPECT_TRUE(endPipeControl->getCommandStreamerStallEnable());
+    }
 }
 
 struct ProfilingCommandsTest : public DispatchWalkerTest, ::testing::WithParamInterface<bool> {
@@ -1315,125 +1162,12 @@ struct ProfilingCommandsTest : public DispatchWalkerTest, ::testing::WithParamIn
     }
 };
 
-HWCMDTEST_F(IGFX_GEN8_CORE, ProfilingCommandsTest, givenKernelWhenProfilingCommandStartIsTakenThenTimeStampAddressIsProgrammedCorrectly) {
-    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    auto &cmdStream = pCmdQ->getCS(0);
-    MockTagAllocator<HwTimeStamps> timeStampAllocator(pDevice->getRootDeviceIndex(), this->pDevice->getMemoryManager(), 10,
-                                                      MemoryConstants::cacheLineSize, sizeof(HwTimeStamps), false, pDevice->getDeviceBitfield());
-
-    auto hwTimeStamp1 = timeStampAllocator.getTag();
-    ASSERT_NE(nullptr, hwTimeStamp1);
-
-    GpgpuWalkerHelper<FamilyType>::dispatchProfilingCommandsStart(*hwTimeStamp1, &cmdStream, pDevice->getRootDeviceEnvironment());
-
-    auto hwTimeStamp2 = timeStampAllocator.getTag();
-    ASSERT_NE(nullptr, hwTimeStamp2);
-
-    GpgpuWalkerHelper<FamilyType>::dispatchProfilingCommandsStart(*hwTimeStamp2, &cmdStream, pDevice->getRootDeviceEnvironment());
-
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
-
-    auto itorStoreReg = find<typename FamilyType::MI_STORE_REGISTER_MEM *>(cmdList.begin(), cmdList.end());
-    ASSERT_NE(cmdList.end(), itorStoreReg);
-    auto storeReg = genCmdCast<MI_STORE_REGISTER_MEM *>(*itorStoreReg);
-    ASSERT_NE(nullptr, storeReg);
-
-    uint64_t gpuAddress = storeReg->getMemoryAddress();
-    auto contextTimestampFieldOffset = offsetof(HwTimeStamps, contextStartTS);
-    uint64_t expectedAddress = hwTimeStamp1->getGpuAddress() + contextTimestampFieldOffset;
-    EXPECT_EQ(expectedAddress, gpuAddress);
-
-    itorStoreReg++;
-    itorStoreReg = find<typename FamilyType::MI_STORE_REGISTER_MEM *>(itorStoreReg, cmdList.end());
-    ASSERT_NE(cmdList.end(), itorStoreReg);
-    storeReg = genCmdCast<MI_STORE_REGISTER_MEM *>(*itorStoreReg);
-    ASSERT_NE(nullptr, storeReg);
-
-    gpuAddress = storeReg->getMemoryAddress();
-    expectedAddress = hwTimeStamp2->getGpuAddress() + contextTimestampFieldOffset;
-    EXPECT_EQ(expectedAddress, gpuAddress);
-
-    auto itorPipeCtrl = find<typename FamilyType::PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
-    ASSERT_NE(cmdList.end(), itorPipeCtrl);
-    if (MemorySynchronizationCommands<FamilyType>::isBarrierWaRequired(pDevice->getRootDeviceEnvironment())) {
-        itorPipeCtrl++;
-    }
-    if (UnitTestHelper<FamilyType>::isAdditionalSynchronizationRequired()) {
-        itorPipeCtrl++;
-    }
-    auto pipeControl = genCmdCast<PIPE_CONTROL *>(*itorPipeCtrl);
-    ASSERT_NE(nullptr, pipeControl);
-
-    gpuAddress = NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl);
-    expectedAddress = hwTimeStamp1->getGpuAddress() + offsetof(HwTimeStamps, globalStartTS);
-    EXPECT_EQ(expectedAddress, gpuAddress);
-
-    itorPipeCtrl++;
-    itorPipeCtrl = find<typename FamilyType::PIPE_CONTROL *>(itorPipeCtrl, cmdList.end());
-    if (MemorySynchronizationCommands<FamilyType>::isBarrierWaRequired(pDevice->getRootDeviceEnvironment())) {
-        itorPipeCtrl++;
-    }
-    if (UnitTestHelper<FamilyType>::isAdditionalSynchronizationRequired()) {
-        itorPipeCtrl++;
-    }
-    ASSERT_NE(cmdList.end(), itorPipeCtrl);
-    pipeControl = genCmdCast<PIPE_CONTROL *>(*itorPipeCtrl);
-    ASSERT_NE(nullptr, pipeControl);
-
-    gpuAddress = NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl);
-    expectedAddress = hwTimeStamp2->getGpuAddress() + offsetof(HwTimeStamps, globalStartTS);
-    EXPECT_EQ(expectedAddress, gpuAddress);
-}
-
-HWCMDTEST_F(IGFX_GEN8_CORE, ProfilingCommandsTest, givenKernelWhenProfilingCommandStartIsNotTakenThenTimeStampAddressIsProgrammedCorrectly) {
-    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    auto &cmdStream = pCmdQ->getCS(0);
-    MockTagAllocator<HwTimeStamps> timeStampAllocator(pDevice->getRootDeviceIndex(), this->pDevice->getMemoryManager(), 10,
-                                                      MemoryConstants::cacheLineSize, sizeof(HwTimeStamps), false, pDevice->getDeviceBitfield());
-
-    auto hwTimeStamp1 = timeStampAllocator.getTag();
-    ASSERT_NE(nullptr, hwTimeStamp1);
-    GpgpuWalkerHelper<FamilyType>::dispatchProfilingCommandsEnd(*hwTimeStamp1, &cmdStream, pDevice->getRootDeviceEnvironment());
-
-    auto hwTimeStamp2 = timeStampAllocator.getTag();
-    ASSERT_NE(nullptr, hwTimeStamp2);
-    GpgpuWalkerHelper<FamilyType>::dispatchProfilingCommandsEnd(*hwTimeStamp2, &cmdStream, pDevice->getRootDeviceEnvironment());
-
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
-
-    auto itorStoreReg = find<typename FamilyType::MI_STORE_REGISTER_MEM *>(cmdList.begin(), cmdList.end());
-    ASSERT_NE(cmdList.end(), itorStoreReg);
-    auto storeReg = genCmdCast<MI_STORE_REGISTER_MEM *>(*itorStoreReg);
-    ASSERT_NE(nullptr, storeReg);
-
-    uint64_t gpuAddress = storeReg->getMemoryAddress();
-    auto contextTimestampFieldOffset = offsetof(HwTimeStamps, contextEndTS);
-    uint64_t expectedAddress = hwTimeStamp1->getGpuAddress() + contextTimestampFieldOffset;
-    EXPECT_EQ(expectedAddress, gpuAddress);
-
-    itorStoreReg++;
-    itorStoreReg = find<typename FamilyType::MI_STORE_REGISTER_MEM *>(itorStoreReg, cmdList.end());
-    ASSERT_NE(cmdList.end(), itorStoreReg);
-    storeReg = genCmdCast<MI_STORE_REGISTER_MEM *>(*itorStoreReg);
-    ASSERT_NE(nullptr, storeReg);
-
-    gpuAddress = storeReg->getMemoryAddress();
-    expectedAddress = hwTimeStamp2->getGpuAddress() + contextTimestampFieldOffset;
-    EXPECT_EQ(expectedAddress, gpuAddress);
-}
-
 HWTEST_F(DispatchWalkerTest, WhenKernelRequiresImplicitArgsThenIohRequiresMoreSpace) {
     size_t globalOffsets[3] = {0, 0, 0};
     size_t workItems[3] = {1, 1, 1};
     size_t workGroupSize[3] = {2, 5, 10};
     cl_uint dimensions = 1;
-    Vec3<size_t> localWorkgroupSize(workGroupSize);
+
     auto blockedCommandsData = createBlockedCommandsData(*pCmdQ);
 
     kernelInfo.kernelDescriptor.kernelAttributes.simdSize = 1u;
@@ -1452,13 +1186,14 @@ HWTEST_F(DispatchWalkerTest, WhenKernelRequiresImplicitArgsThenIohRequiresMoreSp
     multiDispatchInfoWithoutImplicitArgs.push(dispatchInfoWithoutImplicitArgs);
     HardwareInterfaceWalkerArgs walkerArgsWithoutImplicitArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgsWithoutImplicitArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfoWithoutImplicitArgs,
         CsrDependencies(),
         walkerArgsWithoutImplicitArgs);
+    const auto &rootDeviceEnvironment = pClDevice->getRootDeviceEnvironment();
 
-    auto iohSizeWithoutImplicitArgs = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(kernelWithoutImplicitArgs, Math::computeTotalElementsCount(localWorkgroupSize));
+    auto iohSizeWithoutImplicitArgs = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(kernelWithoutImplicitArgs, workGroupSize, rootDeviceEnvironment);
 
     DispatchInfo dispatchInfoWithImplicitArgs(pClDevice, const_cast<MockKernel *>(&kernelWithImplicitArgs), dimensions, workItems, workGroupSize, globalOffsets);
     dispatchInfoWithImplicitArgs.setNumberOfWorkgroups({1, 1, 1});
@@ -1467,13 +1202,13 @@ HWTEST_F(DispatchWalkerTest, WhenKernelRequiresImplicitArgsThenIohRequiresMoreSp
     multiDispatchInfoWithImplicitArgs.push(dispatchInfoWithImplicitArgs);
     HardwareInterfaceWalkerArgs walkerArgsWithImplicitArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
     walkerArgsWithImplicitArgs.blockedCommandsData = blockedCommandsData.get();
-    HardwareInterface<FamilyType>::dispatchWalker(
+    HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
         *pCmdQ,
         multiDispatchInfoWithImplicitArgs,
         CsrDependencies(),
         walkerArgsWithImplicitArgs);
 
-    auto iohSizeWithImplicitArgs = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(kernelWithImplicitArgs, Math::computeTotalElementsCount(localWorkgroupSize));
+    auto iohSizeWithImplicitArgs = HardwareCommandsHelper<FamilyType>::getSizeRequiredIOH(kernelWithImplicitArgs, workGroupSize, rootDeviceEnvironment);
 
     EXPECT_LE(iohSizeWithoutImplicitArgs, iohSizeWithImplicitArgs);
 
@@ -1481,11 +1216,72 @@ HWTEST_F(DispatchWalkerTest, WhenKernelRequiresImplicitArgsThenIohRequiresMoreSp
         auto numChannels = kernelInfo.kernelDescriptor.kernelAttributes.numLocalIdChannels;
         auto simdSize = kernelInfo.getMaxSimdSize();
         uint32_t grfSize = sizeof(typename FamilyType::GRF);
-        auto size = kernelWithImplicitArgs.getCrossThreadDataSize() +
-                    HardwareCommandsHelper<FamilyType>::getPerThreadDataSizeTotal(simdSize, grfSize, numChannels, Math::computeTotalElementsCount(localWorkgroupSize)) +
-                    ImplicitArgsHelper::getSizeForImplicitArgsPatching(kernelWithImplicitArgs.getImplicitArgs(), kernelWithImplicitArgs.getDescriptor());
+        auto numGrf = GrfConfig::defaultGrfNumber;
 
-        size = alignUp(size, MemoryConstants::cacheLineSize);
+        auto size = kernelWithImplicitArgs.getCrossThreadDataSize() +
+                    HardwareCommandsHelper<FamilyType>::getPerThreadDataSizeTotal(simdSize, grfSize, numGrf, numChannels, Math::computeTotalElementsCount(workGroupSize), rootDeviceEnvironment) +
+                    ImplicitArgsHelper::getSizeForImplicitArgsPatching(kernelWithImplicitArgs.getImplicitArgs(), kernelWithImplicitArgs.getDescriptor(), false, rootDeviceEnvironment);
+
+        size = alignUp(size, NEO::EncodeDispatchKernel<FamilyType>::getDefaultIOHAlignment());
         EXPECT_EQ(size, iohSizeWithImplicitArgs);
     }
+}
+
+HWTEST_F(DispatchWalkerTest, givenProfilingEnabledWhenProgrammingWalkerThenSetIsWalkerWithProfilingEnqueued) {
+    size_t globalOffsets[3] = {0, 0, 0};
+    size_t workItems[3] = {1, 1, 1};
+    size_t workGroupSize[3] = {2, 5, 10};
+    cl_uint dimensions = 1;
+
+    auto blockedCommandsData = createBlockedCommandsData(*pCmdQ);
+
+    kernelInfo.kernelDescriptor.kernelAttributes.simdSize = 1u;
+    kernelInfo.kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs = false;
+    MockKernel kernelWithoutImplicitArgs(program.get(), kernelInfo, *pClDevice);
+    ASSERT_EQ(CL_SUCCESS, kernelWithoutImplicitArgs.initialize());
+
+    DispatchInfo dispatchInfoWithoutImplicitArgs(pClDevice, const_cast<MockKernel *>(&kernelWithoutImplicitArgs), dimensions, workItems, workGroupSize, globalOffsets);
+    dispatchInfoWithoutImplicitArgs.setNumberOfWorkgroups({1, 1, 1});
+    dispatchInfoWithoutImplicitArgs.setTotalNumberOfWorkgroups({1, 1, 1});
+    MultiDispatchInfo multiDispatchInfoWithoutImplicitArgs(&kernelWithoutImplicitArgs);
+    multiDispatchInfoWithoutImplicitArgs.push(dispatchInfoWithoutImplicitArgs);
+    HardwareInterfaceWalkerArgs walkerArgsWithoutImplicitArgs = createHardwareInterfaceWalkerArgs(CL_COMMAND_NDRANGE_KERNEL);
+    walkerArgsWithoutImplicitArgs.blockedCommandsData = blockedCommandsData.get();
+    auto *event = new MockEvent<Event>(nullptr, 0, 0, 0);
+
+    {
+        walkerArgsWithoutImplicitArgs.event = event;
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
+            *pCmdQ,
+            multiDispatchInfoWithoutImplicitArgs,
+            CsrDependencies(),
+            walkerArgsWithoutImplicitArgs);
+
+        EXPECT_FALSE(pCmdQ->getAndClearIsWalkerWithProfilingEnqueued());
+    }
+
+    reinterpret_cast<MockCommandQueue *>(pCmdQ)->setProfilingEnabled();
+    {
+        walkerArgsWithoutImplicitArgs.event = nullptr;
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
+            *pCmdQ,
+            multiDispatchInfoWithoutImplicitArgs,
+            CsrDependencies(),
+            walkerArgsWithoutImplicitArgs);
+
+        EXPECT_FALSE(pCmdQ->getAndClearIsWalkerWithProfilingEnqueued());
+    }
+
+    {
+        walkerArgsWithoutImplicitArgs.event = event;
+        HardwareInterface<FamilyType>::template dispatchWalker<typename FamilyType::DefaultWalkerType>(
+            *pCmdQ,
+            multiDispatchInfoWithoutImplicitArgs,
+            CsrDependencies(),
+            walkerArgsWithoutImplicitArgs);
+
+        EXPECT_EQ(pClDevice->getRootDeviceEnvironment().getProductHelper().shouldRegisterEnqueuedWalkerWithProfiling(), pCmdQ->getAndClearIsWalkerWithProfilingEnqueued());
+    }
+
+    event->release();
 }

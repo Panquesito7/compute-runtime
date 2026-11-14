@@ -1,12 +1,12 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/aligned_memory.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
@@ -61,8 +61,7 @@ class CreateImage3DTest : public ClDeviceFixture,
 
 HWTEST_F(CreateImage3DTest, WhenCreatingImageThenPropertiesAreSetCorrectly) {
     cl_mem_flags flags = CL_MEM_READ_WRITE;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(
-        flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     auto image = Image::create(context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context->getDevice(0)->getDevice()),
                                flags, 0, surfaceFormat, &imageDesc, nullptr, retVal);
 
@@ -78,7 +77,7 @@ HWTEST_F(CreateImage3DTest, WhenCreatingImageThenPropertiesAreSetCorrectly) {
     EXPECT_EQ(0u, imgDesc.image_array_size);
     EXPECT_NE(0u, imgDesc.image_row_pitch);
 
-    EXPECT_EQ(image->getCubeFaceIndex(), static_cast<uint32_t>(__GMM_NO_CUBE_MAP));
+    EXPECT_EQ(image->getCubeFaceIndex(), gmmNoCubeMap);
     EXPECT_EQ(!defaultHwInfo->capabilityTable.supportsImages, image->isMemObjZeroCopy());
 
     typedef typename FamilyType::RENDER_SURFACE_STATE SURFACE_STATE;
@@ -89,9 +88,10 @@ HWTEST_F(CreateImage3DTest, WhenCreatingImageThenPropertiesAreSetCorrectly) {
 }
 
 HWTEST_F(CreateImage3DTest, GivenTiledOrForcedLinearWhenCreatingImageThenPropertiesAreSetCorrectly) {
-    bool defaultTiling = DebugManager.flags.ForceLinearImages.get();
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ForceLinearImages.set(false);
     imageDesc.image_height = 1;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(0, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(0, &imageFormat);
     auto imageDescriptor = Image::convertDescriptor(imageDesc);
     auto imgInfo = MockGmm::initImgInfo(imageDescriptor, 0, &surfaceFormat->surfaceFormat);
     MockGmm::queryImgParams(context->getDevice(0)->getGmmHelper(), imgInfo, false);
@@ -115,10 +115,10 @@ HWTEST_F(CreateImage3DTest, GivenTiledOrForcedLinearWhenCreatingImageThenPropert
 
     delete image;
 
-    DebugManager.flags.ForceLinearImages.set(!defaultTiling);
+    debugManager.flags.ForceLinearImages.set(true);
 
     // query again
-    surfaceFormat = Image::getSurfaceFormatFromTable(0, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    surfaceFormat = Image::getSurfaceFormatFromTable(0, &imageFormat);
     MockGmm::queryImgParams(context->getDevice(0)->getGmmHelper(), imgInfo, false);
 
     image = Image::create(
@@ -139,5 +139,4 @@ HWTEST_F(CreateImage3DTest, GivenTiledOrForcedLinearWhenCreatingImageThenPropert
     EXPECT_EQ(image->getQPitch(), imgInfo.qPitch);
 
     delete image;
-    DebugManager.flags.ForceLinearImages.set(defaultTiling);
 }

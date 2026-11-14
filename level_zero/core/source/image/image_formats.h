@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,22 +7,26 @@
 
 #pragma once
 
+#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/surface_format_info.h"
 
 #include <array>
 
 namespace L0 {
 namespace ImageFormats {
-inline constexpr uint32_t ZE_IMAGE_FORMAT_RENDER_LAYOUT_MAX = 43u;
+inline constexpr uint32_t maxLayoutCount = 46u;
+inline constexpr uint32_t maxTypeCount = 5u;
 
-using FormatTypes = std::array<NEO::SurfaceFormatInfo, 5u>;
+using FormatTypes = std::array<NEO::SurfaceFormatInfo, maxTypeCount>;
 
-inline constexpr std::array<NEO::SurfaceFormatInfo, 5u> surfaceFormatsForRedescribe = {
+inline constexpr std::array<NEO::SurfaceFormatInfo, 7u> surfaceFormatsForRedescribe = {
     {{GMM_FORMAT_R8_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8_UINT, 0, 1, 1, 1},
      {GMM_FORMAT_R16_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16_UINT, 0, 1, 2, 2},
      {GMM_FORMAT_R32_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32_UINT, 0, 1, 4, 4},
      {GMM_FORMAT_R32G32_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32_UINT, 0, 2, 4, 8},
-     {GMM_FORMAT_R32G32B32A32_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_UINT, 0, 4, 4, 16}}};
+     {GMM_FORMAT_R32G32B32A32_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_UINT, 0, 4, 4, 16},
+     {GMM_FORMAT_R8G8B8_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8_UINT, 0, 3, 1, 3},
+     {GMM_FORMAT_R16G16B16_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16_UINT, 0, 3, 2, 6}}};
 
 inline constexpr FormatTypes layout8 = {{{GMM_FORMAT_R8_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8_UINT, 0, 1, 1, 1},
                                          {GMM_FORMAT_R8_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8_SINT, 0, 1, 1, 1},
@@ -34,6 +38,10 @@ inline constexpr FormatTypes layout88 = {{{GMM_FORMAT_R8G8_UINT_TYPE, NEO::GFX3D
                                           {GMM_FORMAT_R8G8_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8_UNORM, 0, 2, 1, 2},
                                           {GMM_FORMAT_R8G8_SNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8_SNORM, 0, 2, 1, 2},
                                           {GMM_FORMAT_R8G8_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8_UINT, 0, 2, 1, 2}}};
+inline constexpr FormatTypes layout888 = {{{GMM_FORMAT_R8G8B8_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8_UINT, 0, 3, 1, 3},
+                                           {GMM_FORMAT_R8G8B8_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8_SINT, 0, 3, 1, 3},
+                                           {GMM_FORMAT_R8G8B8_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8_UNORM, 0, 3, 1, 3},
+                                           {GMM_FORMAT_R8G8B8_SNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8_SNORM, 0, 3, 1, 3}}};
 inline constexpr FormatTypes layout8888 = {{{GMM_FORMAT_R8G8B8A8_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8A8_UINT, 0, 4, 1, 4},
                                             {GMM_FORMAT_R8G8B8A8_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8A8_SINT, 0, 4, 1, 4},
                                             {GMM_FORMAT_R8G8B8A8_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8A8_UNORM, 0, 4, 1, 4},
@@ -49,6 +57,11 @@ inline constexpr FormatTypes layout1616 = {{{GMM_FORMAT_R16G16_UINT_TYPE, NEO::G
                                             {GMM_FORMAT_R16G16_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16_UNORM, 0, 2, 2, 4},
                                             {GMM_FORMAT_R16G16_SNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16_SNORM, 0, 2, 2, 4},
                                             {GMM_FORMAT_R16G16_FLOAT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16_FLOAT, 0, 2, 2, 4}}};
+inline constexpr FormatTypes layout161616 = {{{GMM_FORMAT_R16G16B16_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16_UINT, 0, 3, 2, 6},
+                                              {GMM_FORMAT_R16G16B16_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16_SINT, 0, 3, 2, 6},
+                                              {GMM_FORMAT_R16G16B16_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16_UNORM, 0, 3, 2, 6},
+                                              {GMM_FORMAT_R16G16B16_SNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16_SNORM, 0, 3, 2, 6},
+                                              {GMM_FORMAT_R16G16B16_FLOAT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16_FLOAT, 0, 3, 2, 6}}};
 inline constexpr FormatTypes layout16161616 = {{{GMM_FORMAT_R16G16B16A16_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16A16_UINT, 0, 4, 2, 8},
                                                 {GMM_FORMAT_R16G16B16A16_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16A16_SINT, 0, 4, 2, 8},
                                                 {GMM_FORMAT_R16G16B16A16_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R16G16B16A16_UNORM, 0, 4, 2, 8},
@@ -64,6 +77,11 @@ inline constexpr FormatTypes layout3232 = {{{GMM_FORMAT_R32G32_UINT_TYPE, NEO::G
                                             {GMM_FORMAT_R32G32_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32_UNORM, 0, 2, 4, 8},
                                             {GMM_FORMAT_R32G32_SNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32_SNORM, 0, 2, 4, 8},
                                             {GMM_FORMAT_R32G32_FLOAT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32_FLOAT, 0, 2, 4, 8}}};
+inline constexpr FormatTypes layout323232 = {{{GMM_FORMAT_R32G32B32_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32_UINT, 0, 3, 4, 12},
+                                              {GMM_FORMAT_R32G32B32_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32_SINT, 0, 3, 4, 12},
+                                              {GMM_FORMAT_R32G32B32_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32_UNORM, 0, 3, 4, 12},
+                                              {GMM_FORMAT_R32G32B32_SNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32_SNORM, 0, 3, 4, 12},
+                                              {GMM_FORMAT_R32G32B32_FLOAT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32_FLOAT, 0, 3, 4, 12}}};
 inline constexpr FormatTypes layout32323232 = {{{GMM_FORMAT_R32G32B32A32_UINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_UINT, 0, 4, 4, 16},
                                                 {GMM_FORMAT_R32G32B32A32_SINT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_SINT, 0, 4, 4, 16},
                                                 {GMM_FORMAT_R32G32B32A32_UNORM_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_UNORM, 0, 4, 4, 16},
@@ -240,10 +258,16 @@ inline constexpr FormatTypes layoutBGRP = {{{GMM_FORMAT_BGRP, NEO::GFX3DSTATE_SU
                                             {GMM_FORMAT_BGRP, NEO::GFX3DSTATE_SURFACEFORMAT_R8_UINT, 0, 3, 1, 3},
                                             {GMM_FORMAT_BGRP, NEO::GFX3DSTATE_SURFACEFORMAT_R8_UINT, 0, 3, 1, 3}}};
 
-inline constexpr std::array<FormatTypes, ZE_IMAGE_FORMAT_RENDER_LAYOUT_MAX> formats = {layout8, layout16, layout32, layout88, layout8888, layout1616, layout16161616, layout3232, layout32323232, layout1010102,
-                                                                                       layout111110, layout565, layout5551, layout4444, layoutY8, layoutNV12, layoutYUYV, layoutVYUY, layoutYVYU, layoutUYVY,
-                                                                                       layoutAYUV, layoutP010, layoutY410, layoutP012, layoutY16, layoutP016, layoutY216, layoutP216, layoutP8, layoutYUY2,
-                                                                                       layoutA8P8, layoutIA44, layoutAI44, layoutY416, layoutY210, layoutI420, layoutYV12, layout400P, layout422H, layout422V,
-                                                                                       layout444P, layoutRGBP, layoutBGRP};
+inline constexpr NEO::SurfaceFormatInfo srgbFormatRGBA8 = {GMM_FORMAT_R8G8B8A8_UNORM_SRGB_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R8G8B8A8_UNORM_SRGB, 0, 4, 1, 4};
+
+inline constexpr NEO::SurfaceFormatInfo depthStencilFormatD24S8 = {GMM_FORMAT_GENERIC_32BIT, NEO::GFX3DSTATE_SURFACEFORMAT_R24_UNORM_X8_TYPELESS, 0, 1, 4, 4};
+
+inline constexpr NEO::SurfaceFormatInfo depthStencilFormatD32FS8 = {GMM_FORMAT_R32G32_FLOAT_TYPE, NEO::GFX3DSTATE_SURFACEFORMAT_R32_FLOAT_X8X24_TYPELESS, 0, 2, 4, 8};
+
+inline constexpr std::array<FormatTypes, maxLayoutCount> formats = {layout8, layout16, layout32, layout88, layout8888, layout1616, layout16161616, layout3232, layout32323232, layout1010102,
+                                                                    layout111110, layout565, layout5551, layout4444, layoutY8, layoutNV12, layoutYUYV, layoutVYUY, layoutYVYU, layoutUYVY,
+                                                                    layoutAYUV, layoutP010, layoutY410, layoutP012, layoutY16, layoutP016, layoutY216, layoutP216, layoutP8, layoutYUY2,
+                                                                    layoutA8P8, layoutIA44, layoutAI44, layoutY416, layoutY210, layoutI420, layoutYV12, layout400P, layout422H, layout422V,
+                                                                    layout444P, layoutRGBP, layoutBGRP, layout888, layout161616, layout323232};
 } // namespace ImageFormats
 } // namespace L0

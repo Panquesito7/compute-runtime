@@ -1,11 +1,14 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
+
 #include "level_zero/core/test/unit_tests/mocks/mock_memory_manager.h"
+#include "level_zero/tools/source/sysman/pci/pci_utils.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysman_fixture.h"
 
 #include "mock_sysfs_pci.h"
@@ -27,37 +30,15 @@ constexpr int convertMegabitsPerSecondToBytesPerSecond = 125000;
 constexpr int convertGigabitToMegabit = 1000;
 constexpr double encodingGen1Gen2 = 0.8;
 constexpr double encodingGen3andAbove = 0.98461538461;
-constexpr int pciExtendedConfigSpaceSize = 4096;
-constexpr int pciConfigSpaceSize = 256;
-static int fakeFileDescriptor = 123;
-static int fakeFileDescriptor1 = 124;
-
-inline static int openMock(const char *pathname, int flags) {
-    if (strcmp(pathname, mockRealPathConfig.c_str()) == 0) {
-        return fakeFileDescriptor;
-    }
-
-    if (strcmp(pathname, mockRealPath2LevelsUpConfig.c_str()) == 0) {
-        return fakeFileDescriptor1;
-    }
-    return -1;
-}
 
 inline static int openMockReturnFailure(const char *pathname, int flags) {
-    return -1;
-}
-
-inline static int closeMock(int fd) {
-    if ((fd == fakeFileDescriptor) || (fd == fakeFileDescriptor1)) {
-        return 0;
-    }
     return -1;
 }
 
 ssize_t preadMock(int fd, void *buf, size_t count, off_t offset) {
     uint8_t *mockBuf = static_cast<uint8_t *>(buf);
     // Sample config values
-    if (fd == fakeFileDescriptor) {
+    if (count == PCI_CFG_SPACE_EXP_SIZE) {
         mockBuf[0x006] = 0x10;
         mockBuf[0x034] = 0x40;
         mockBuf[0x040] = 0x0d;
@@ -88,8 +69,8 @@ ssize_t preadMock(int fd, void *buf, size_t count, off_t offset) {
         mockBuf[0x323] = 0x40;
         mockBuf[0x400] = 0x18;
         mockBuf[0x402] = 0x01;
-        return pciExtendedConfigSpaceSize;
-    } else {
+        return PCI_CFG_SPACE_EXP_SIZE;
+    } else if (count == PCI_CFG_SPACE_SIZE) {
         mockBuf[0x006] = 0x10;
         mockBuf[0x034] = 0x40;
         mockBuf[0x040] = 0x0d;
@@ -102,22 +83,24 @@ ssize_t preadMock(int fd, void *buf, size_t count, off_t offset) {
         mockBuf[0x072] = 0xa0;
         mockBuf[0x0ac] = 0x10;
         mockBuf[0x0b8] = 0x11;
-        return pciConfigSpaceSize;
+        return PCI_CFG_SPACE_SIZE;
     }
+    return -1;
 }
 
 ssize_t preadMockHeaderFailure(int fd, void *buf, size_t count, off_t offset) {
-    if (fd == fakeFileDescriptor) {
-        return pciExtendedConfigSpaceSize;
-    } else {
-        return pciConfigSpaceSize;
+    if (count == PCI_CFG_SPACE_EXP_SIZE) {
+        return PCI_CFG_SPACE_EXP_SIZE;
+    } else if (count == PCI_CFG_SPACE_SIZE) {
+        return PCI_CFG_SPACE_SIZE;
     }
+    return -1;
 }
 
 ssize_t preadMockInvalidPos(int fd, void *buf, size_t count, off_t offset) {
     uint8_t *mockBuf = static_cast<uint8_t *>(buf);
     // Sample config values
-    if (fd == fakeFileDescriptor) {
+    if (count == PCI_CFG_SPACE_EXP_SIZE) {
         mockBuf[0x006] = 0x10;
         mockBuf[0x034] = 0x40;
         mockBuf[0x040] = 0x0d;
@@ -143,8 +126,8 @@ ssize_t preadMockInvalidPos(int fd, void *buf, size_t count, off_t offset) {
         mockBuf[0x323] = 0x40;
         mockBuf[0x400] = 0x18;
         mockBuf[0x402] = 0x01;
-        return pciExtendedConfigSpaceSize;
-    } else {
+        return PCI_CFG_SPACE_EXP_SIZE;
+    } else if (count == PCI_CFG_SPACE_SIZE) {
         mockBuf[0x006] = 0x10;
         mockBuf[0x034] = 0x40;
         mockBuf[0x040] = 0x0d;
@@ -157,14 +140,15 @@ ssize_t preadMockInvalidPos(int fd, void *buf, size_t count, off_t offset) {
         mockBuf[0x072] = 0xa0;
         mockBuf[0x0ac] = 0x11;
         mockBuf[0x0ad] = 0x00;
-        return pciConfigSpaceSize;
+        return PCI_CFG_SPACE_SIZE;
     }
+    return -1;
 }
 
 ssize_t preadMockLoop(int fd, void *buf, size_t count, off_t offset) {
     uint8_t *mockBuf = static_cast<uint8_t *>(buf);
     // Sample config values
-    if (fd == fakeFileDescriptor) {
+    if (count == PCI_CFG_SPACE_EXP_SIZE) {
         mockBuf[0x006] = 0x10;
         mockBuf[0x034] = 0x40;
         mockBuf[0x040] = 0x0d;
@@ -192,8 +176,8 @@ ssize_t preadMockLoop(int fd, void *buf, size_t count, off_t offset) {
         mockBuf[0x323] = 0x40;
         mockBuf[0x400] = 0x18;
         mockBuf[0x402] = 0x01;
-        return pciExtendedConfigSpaceSize;
-    } else {
+        return PCI_CFG_SPACE_EXP_SIZE;
+    } else if (count == PCI_CFG_SPACE_SIZE) {
         mockBuf[0x006] = 0x10;
         mockBuf[0x034] = 0x40;
         mockBuf[0x040] = 0x0d;
@@ -207,8 +191,9 @@ ssize_t preadMockLoop(int fd, void *buf, size_t count, off_t offset) {
         mockBuf[0x0ac] = 0x0d;
         mockBuf[0x0ad] = 0x40;
         mockBuf[0x0b8] = 0x11;
-        return pciConfigSpaceSize;
+        return PCI_CFG_SPACE_SIZE;
     }
+    return -1;
 }
 
 ssize_t preadMockFailure(int fd, void *buf, size_t count, off_t offset) {
@@ -228,7 +213,7 @@ class ZesPciFixture : public SysmanDeviceFixture {
     FsAccess *pOriginalFsAccess = nullptr;
     L0::PciImp *pPciImp;
     OsPci *pOsPciPrev;
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     MemoryManager *pMemoryManagerOld;
 
     void SetUp() override {
@@ -251,12 +236,8 @@ class ZesPciFixture : public SysmanDeviceFixture {
         pPciImp->pOsPci = nullptr;
         memoryManager->localMemorySupported[0] = 0;
         PublicLinuxPciImp *pLinuxPciImp = new PublicLinuxPciImp(pOsSysman);
-        pLinuxPciImp->openFunction = openMock;
-        pLinuxPciImp->closeFunction = closeMock;
         pLinuxPciImp->preadFunction = preadMock;
 
-        pLinuxPciImp->pciExtendedConfigRead();
-        pLinuxPciImp->pciCardBusConfigRead();
         pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImp);
         pPciImp->pciGetStaticFields();
     }
@@ -271,7 +252,6 @@ class ZesPciFixture : public SysmanDeviceFixture {
         }
         pPciImp->pOsPci = pOsPciPrev;
         pPciImp = nullptr;
-        unsetenv("ZES_ENABLE_SYSMAN");
         pLinuxSysmanImp->pSysfsAccess = pOriginalSysfsAccess;
         if (memoryManager != nullptr) {
             delete memoryManager;
@@ -315,12 +295,8 @@ TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenSettingLmemSupportAndCallingzetS
     memoryManager->localMemorySupported[0] = 1;
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMock;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
-    pLinuxPciImpTemp->pciCardBusConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
 
@@ -372,12 +348,28 @@ TEST_F(ZesPciFixture, GivenSysmanHandleWhenGettingPCIWidthAndSpeedAndCapabilityL
     memoryManager->localMemorySupported[0] = 1;
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMockInvalidPos;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
-    pLinuxPciImpTemp->pciCardBusConfigRead();
+    pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
+    pPciImp->pciGetStaticFields();
+    pPciImp->pOsPci->getMaxLinkCaps(speed, width);
+    EXPECT_EQ(width, -1);
+    EXPECT_EQ(speed, 0);
+
+    delete pLinuxPciImpTemp;
+    pPciImp->pOsPci = pOsPciOriginal;
+}
+
+TEST_F(ZesPciFixture, GivenSysmanHandleWhenGettingPCIWidthAndSpeedAndUserIsNonRootThenInvalidValuesAreReturned) {
+    int32_t width = 0;
+    double speed = 0;
+    memoryManager->localMemorySupported[0] = 1;
+    OsPci *pOsPciOriginal = pPciImp->pOsPci;
+    PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
+    pLinuxPciImpTemp->preadFunction = preadMock;
+
+    pSysfsAccess->isRootUserResult = false;
+
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     pPciImp->pOsPci->getMaxLinkCaps(speed, width);
@@ -394,12 +386,8 @@ TEST_F(ZesPciFixture, GivenSysmanHandleWhenGettingPCIWidthAndSpeedAndPCIExpressC
     memoryManager->localMemorySupported[0] = 1;
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMockLoop;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
-    pLinuxPciImpTemp->pciCardBusConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     pPciImp->pOsPci->getMaxLinkCaps(speed, width);
@@ -416,12 +404,9 @@ TEST_F(ZesPciFixture, GivenSysmanHandleWhenInitializingPciAndPciConfigOpenFailsT
     memoryManager->localMemorySupported[0] = 1;
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMockReturnFailure;
-    pLinuxPciImpTemp->closeFunction = closeMock;
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> openBackup(&NEO::SysCalls::sysCallsOpen, openMockReturnFailure);
     pLinuxPciImpTemp->preadFunction = preadMock;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
-    pLinuxPciImpTemp->pciCardBusConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     pPciImp->pOsPci->getMaxLinkCaps(speed, width);
@@ -438,12 +423,7 @@ TEST_F(ZesPciFixture, GivenSysmanHandleWhenGettingPCIWidthAndSpeedAndPCIHeaderIs
     memoryManager->localMemorySupported[0] = 1;
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
-    pLinuxPciImpTemp->preadFunction = preadMockHeaderFailure;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
-    pLinuxPciImpTemp->pciCardBusConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     pPciImp->pOsPci->getMaxLinkCaps(speed, width);
@@ -478,11 +458,9 @@ TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenCallingzetSysmanPciGetBarsThenVe
 TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenInitializingPciAndPciConfigOpenFailsThenResizableBarSupportWillBeFalse) {
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMockReturnFailure;
-    pLinuxPciImpTemp->closeFunction = closeMock;
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> openBackup(&NEO::SysCalls::sysCallsOpen, openMockReturnFailure);
     pLinuxPciImpTemp->preadFunction = preadMock;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     EXPECT_FALSE(pPciImp->pOsPci->resizableBarSupported());
@@ -495,11 +473,8 @@ TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenInitializingPciAndPciConfigOpenF
 TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenInitializingPciAndPciConfigReadFailsThenResizableBarSupportWillBeFalse) {
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMockFailure;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     EXPECT_FALSE(pPciImp->pOsPci->resizableBarSupported());
@@ -512,11 +487,8 @@ TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenInitializingPciAndPciConfigReadF
 TEST_F(ZesPciFixture, GivenSysmanHandleWhenCheckForResizableBarSupportAndHeaderFieldNotPresentThenResizableBarSupportFalseReturned) {
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMockHeaderFailure;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     EXPECT_FALSE(pPciImp->pOsPci->resizableBarSupported());
@@ -529,11 +501,8 @@ TEST_F(ZesPciFixture, GivenSysmanHandleWhenCheckForResizableBarSupportAndHeaderF
 TEST_F(ZesPciFixture, GivenSysmanHandleWhenCheckForResizableBarSupportAndCapabilityLinkListIsBrokenThenResizableBarSupportFalseReturned) {
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMockInvalidPos;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     EXPECT_FALSE(pPciImp->pOsPci->resizableBarSupported());
@@ -546,11 +515,8 @@ TEST_F(ZesPciFixture, GivenSysmanHandleWhenCheckForResizableBarSupportAndCapabil
 TEST_F(ZesPciFixture, GivenSysmanHandleWhenCheckForResizableBarSupportAndIfRebarCapabilityNotPresentThenResizableBarSupportFalseReturned) {
     OsPci *pOsPciOriginal = pPciImp->pOsPci;
     PublicLinuxPciImp *pLinuxPciImpTemp = new PublicLinuxPciImp(pOsSysman);
-    pLinuxPciImpTemp->openFunction = openMock;
-    pLinuxPciImpTemp->closeFunction = closeMock;
     pLinuxPciImpTemp->preadFunction = preadMockLoop;
 
-    pLinuxPciImpTemp->pciExtendedConfigRead();
     pPciImp->pOsPci = static_cast<OsPci *>(pLinuxPciImpTemp);
     pPciImp->pciGetStaticFields();
     EXPECT_FALSE(pPciImp->pOsPci->resizableBarSupported());
@@ -653,7 +619,7 @@ TEST_F(ZesPciFixture, GivenValidSysmanHandleWhenCallingzetSysmanPciGetStatsThenV
 }
 
 TEST_F(ZesPciFixture, WhenConvertingLinkSpeedThenResultIsCorrect) {
-    for (int32_t i = PciGenerations::PciGen1; i <= PciGenerations::PciGen5; i++) {
+    for (int32_t i = static_cast<int32_t>(PciGenerations::pciGen1); i <= static_cast<int32_t>(PciGenerations::pciGen5); i++) {
         double speed = convertPciGenToLinkSpeed(i);
         int32_t gen = convertLinkSpeedToPciGen(speed);
         EXPECT_EQ(i, gen);
@@ -669,17 +635,17 @@ TEST_F(ZesPciFixture, WhenConvertingLinkSpeedThenResultIsCorrect) {
 // maxLinkSpeedInGt * (Gigabit to Megabit) * Encoding * (Mb/s to bytes/second) =
 // maxLinkSpeedInGt * convertGigabitToMegabit * Encoding * convertMegabitsPerSecondToBytesPerSecond;
 
-TEST_F(ZesPciFixture, WhenConvertingLinkSpeedFromGigatransfersPerSecondToBytesPerSecondThenResultIsCorrect) {
-    int64_t speedPci320 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::Pci32_0GigatransfersPerSecond);
-    EXPECT_EQ(speedPci320, static_cast<int64_t>(PciLinkSpeeds::Pci32_0GigatransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen3andAbove));
-    int64_t speedPci160 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::Pci16_0GigatransfersPerSecond);
-    EXPECT_EQ(speedPci160, static_cast<int64_t>(PciLinkSpeeds::Pci16_0GigatransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen3andAbove));
-    int64_t speedPci80 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::Pci8_0GigatransfersPerSecond);
-    EXPECT_EQ(speedPci80, static_cast<int64_t>(PciLinkSpeeds::Pci8_0GigatransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen3andAbove));
-    int64_t speedPci50 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::Pci5_0GigatransfersPerSecond);
-    EXPECT_EQ(speedPci50, static_cast<int64_t>(PciLinkSpeeds::Pci5_0GigatransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen1Gen2));
-    int64_t speedPci25 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::Pci2_5GigatransfersPerSecond);
-    EXPECT_EQ(speedPci25, static_cast<int64_t>(PciLinkSpeeds::Pci2_5GigatransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen1Gen2));
+TEST_F(ZesPciFixture, WhenConvertingLinkSpeedFromGigaTransfersPerSecondToBytesPerSecondThenResultIsCorrect) {
+    int64_t speedPci320 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::pci32GigaTransfersPerSecond);
+    EXPECT_EQ(speedPci320, static_cast<int64_t>(PciLinkSpeeds::pci32GigaTransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen3andAbove));
+    int64_t speedPci160 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::pci16GigaTransfersPerSecond);
+    EXPECT_EQ(speedPci160, static_cast<int64_t>(PciLinkSpeeds::pci16GigaTransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen3andAbove));
+    int64_t speedPci80 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::pci8GigaTransfersPerSecond);
+    EXPECT_EQ(speedPci80, static_cast<int64_t>(PciLinkSpeeds::pci8GigaTransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen3andAbove));
+    int64_t speedPci50 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::pci5GigaTransfersPerSecond);
+    EXPECT_EQ(speedPci50, static_cast<int64_t>(PciLinkSpeeds::pci5GigaTransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen1Gen2));
+    int64_t speedPci25 = convertPcieSpeedFromGTsToBs(PciLinkSpeeds::pci2Dot5GigaTransfersPerSecond);
+    EXPECT_EQ(speedPci25, static_cast<int64_t>(PciLinkSpeeds::pci2Dot5GigaTransfersPerSecond * convertMegabitsPerSecondToBytesPerSecond * convertGigabitToMegabit * encodingGen1Gen2));
     EXPECT_EQ(0, convertPcieSpeedFromGTsToBs(0.0));
 }
 TEST_F(SysmanDeviceFixture, GivenValidSysmanHandleWhenCallingzesSysmanPciGetStateThenVerifyzetSysmanPciGetStatsCallReturnNotSupported) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,11 +12,12 @@ namespace NEO {
 class GraphicsAllocation;
 struct ImplicitArgs;
 struct KernelDescriptor;
+enum ThreadArbitrationPolicy : int32_t;
 
 enum class SlmPolicy {
-    SlmPolicyNone,
-    SlmPolicyLargeSlm,
-    SlmPolicyLargeData
+    slmPolicyNone,
+    slmPolicyLargeSlm,
+    slmPolicyLargeData
 };
 
 struct DispatchKernelEncoderI {
@@ -24,7 +25,7 @@ struct DispatchKernelEncoderI {
 
     virtual const KernelDescriptor &getKernelDescriptor() const = 0;
     virtual const uint32_t *getGroupSize() const = 0;
-    virtual uint32_t getSlmTotalSize() const = 0;
+    virtual uint32_t getSlmTotalSizePerThreadGroup() const = 0;
     virtual SlmPolicy getSlmPolicy() const = 0;
 
     virtual const uint8_t *getCrossThreadData() const = 0;
@@ -40,11 +41,15 @@ struct DispatchKernelEncoderI {
     virtual uint32_t getSurfaceStateHeapDataSize() const = 0;
 
     virtual GraphicsAllocation *getIsaAllocation() const = 0;
+    virtual uint64_t getIsaOffsetInParentAllocation() const = 0;
     virtual const uint8_t *getDynamicStateHeapData() const = 0;
 
     virtual uint32_t getRequiredWorkgroupOrder() const = 0;
     virtual bool requiresGenerationOfLocalIdsByRuntime() const = 0;
+    virtual ThreadArbitrationPolicy getThreadArbitrationPolicy() const = 0;
 
     virtual ImplicitArgs *getImplicitArgs() const = 0;
+    virtual void patchBindlessOffsetsInCrossThreadData(uint64_t bindlessSurfaceStateBaseOffset) const = 0;
+    virtual void patchSamplerBindlessOffsetsInCrossThreadData(uint64_t samplerStateOffset) const = 0;
 };
 } // namespace NEO

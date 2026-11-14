@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/gfx_partition.h"
 #include "shared/source/memory_manager/memory_pool.h"
@@ -65,12 +66,12 @@ class ImageInLocalMemoryTest : public testing::Test {
     char memory[10];
 };
 
-TEST_F(ImageInLocalMemoryTest, givenImageWithoutHostPtrWhenLocalMemoryIsEnabledThenImageAllocationIsInLocalMemoryAndGpuAddressIsInStandard64KHeap) {
+TEST_F(ImageInLocalMemoryTest, givenImageWithoutHostPtrWhenLocalMemoryIsEnabledThenImageAllocationIsInLocalMemoryAndGpuAddressIsInExpectedStandardHeap) {
 
     cl_int retVal = 0;
     cl_mem_flags flags = CL_MEM_READ_WRITE;
 
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
 
     std::unique_ptr<Image> image(Image::create(
         context.get(), ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context->getDevice(0)->getDevice()),
@@ -79,13 +80,16 @@ TEST_F(ImageInLocalMemoryTest, givenImageWithoutHostPtrWhenLocalMemoryIsEnabledT
     ASSERT_NE(nullptr, image);
     auto imgGfxAlloc = image->getGraphicsAllocation(device->getRootDeviceIndex());
     ASSERT_NE(nullptr, imgGfxAlloc);
-    EXPECT_EQ(MemoryPool::LocalMemory, imgGfxAlloc->getMemoryPool());
+    EXPECT_EQ(MemoryPool::localMemory, imgGfxAlloc->getMemoryPool());
     EXPECT_LE(imageDesc.image_width * surfaceFormat->surfaceFormat.imageElementSizeInBytes, imgGfxAlloc->getUnderlyingBufferSize());
-    EXPECT_EQ(AllocationType::IMAGE, imgGfxAlloc->getAllocationType());
-    EXPECT_EQ(0u, imgGfxAlloc->getDefaultGmm()->resourceParams.Flags.Info.NonLocalOnly);
+    EXPECT_EQ(AllocationType::image, imgGfxAlloc->getAllocationType());
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(imgGfxAlloc->getDefaultGmm()->resourceParamsData.data());
+    EXPECT_EQ(0u, gmmResourceParams->Flags.Info.NonLocalOnly);
 
     auto gmmHelper = context->getDevice(0)->getGmmHelper();
-    EXPECT_LT(gmmHelper->canonize(mockMemoryManager->getGfxPartition(imgGfxAlloc->getRootDeviceIndex())->getHeapBase(HeapIndex::HEAP_STANDARD64KB)), imgGfxAlloc->getGpuAddress());
-    EXPECT_GT(gmmHelper->canonize(mockMemoryManager->getGfxPartition(imgGfxAlloc->getRootDeviceIndex())->getHeapLimit(HeapIndex::HEAP_STANDARD64KB)), imgGfxAlloc->getGpuAddress());
+    auto &productHelper = context->getDevice(0)->getProductHelper();
+    auto expectedHeap = productHelper.is2MBLocalMemAlignmentEnabled() ? HeapIndex::heapStandard2MB : HeapIndex::heapStandard64KB;
+    EXPECT_LT(gmmHelper->canonize(mockMemoryManager->getGfxPartition(imgGfxAlloc->getRootDeviceIndex())->getHeapBase(expectedHeap)), imgGfxAlloc->getGpuAddress());
+    EXPECT_GT(gmmHelper->canonize(mockMemoryManager->getGfxPartition(imgGfxAlloc->getRootDeviceIndex())->getHeapLimit(expectedHeap)), imgGfxAlloc->getGpuAddress());
     EXPECT_EQ(0llu, imgGfxAlloc->getGpuBaseAddress());
 }

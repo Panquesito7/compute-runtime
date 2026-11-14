@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,7 @@
 
 #include "shared/source/command_stream/wait_status.h"
 #include "shared/source/helpers/local_memory_access_modes.h"
-#include "shared/source/kernel/implicit_args.h"
+#include "shared/source/kernel/implicit_args_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_device.h"
@@ -89,17 +89,18 @@ TEST_F(PrintfHandlerTests, givenPreparedPrintfHandlerWithUndefinedSshOffsetWhenG
 TEST_F(PrintfHandlerTests, givenKernelWithImplicitArgsWhenPreparingPrintfHandlerThenProperAddressIsPatchedInImplicitArgsStruct) {
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
     MockContext context(device.get());
+    const auto &hwInfo = device->getHardwareInfo();
 
     auto pKernelInfo = std::make_unique<MockKernelInfo>();
     pKernelInfo->setPrintfSurface(sizeof(uintptr_t), 0);
-    pKernelInfo->kernelDescriptor.kernelAttributes.simdSize = 16;
+    pKernelInfo->kernelDescriptor.kernelAttributes.simdSize = hwInfo.caps.minimalSimdSize;
     pKernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs = true;
 
     MockProgram program{&context, false, toClDeviceVector(*device)};
 
-    uint64_t crossThread[10];
+    uint64_t crossThread[10] = {};
     MockKernel kernel{&program, *pKernelInfo, *device};
-    kernel.setCrossThreadData(&crossThread, sizeof(uint64_t) * 10);
+    kernel.setCrossThreadData(crossThread, sizeof(uint64_t) * 10);
     kernel.initialize();
 
     MockMultiDispatchInfo multiDispatchInfo(device.get(), &kernel);
@@ -112,87 +113,7 @@ TEST_F(PrintfHandlerTests, givenKernelWithImplicitArgsWhenPreparingPrintfHandler
     auto pImplicitArgs = kernel.getImplicitArgs();
     ASSERT_NE(nullptr, pImplicitArgs);
 
-    EXPECT_EQ(printfSurface->getGpuAddress(), pImplicitArgs->printfBufferPtr);
-}
-
-HWTEST_F(PrintfHandlerTests, givenEnabledStatelessCompressionWhenPrintEnqueueOutputIsCalledThenBCSEngineIsUsedToDecompressPrintfOutput) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    hwInfo.capabilityTable.blitterOperationsSupported = true;
-    DebugManagerStateRestore restore;
-
-    for (auto enable : {-1, 0, 1}) {
-        DebugManager.flags.EnableStatelessCompression.set(enable);
-
-        auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
-
-        REQUIRE_BLITTER_OR_SKIP(device->getRootDeviceEnvironment());
-
-        MockContext context(device.get());
-
-        auto kernelInfo = std::make_unique<MockKernelInfo>();
-        kernelInfo->setPrintfSurface(sizeof(uintptr_t), 0);
-
-        auto program = std::make_unique<MockProgram>(&context, false, toClDeviceVector(*device));
-
-        uint64_t crossThread[10];
-        auto kernel = std::make_unique<MockKernel>(program.get(), *kernelInfo, *device);
-        kernel->setCrossThreadData(&crossThread, sizeof(uint64_t) * 8);
-
-        MockMultiDispatchInfo multiDispatchInfo(device.get(), kernel.get());
-        std::unique_ptr<PrintfHandler> printfHandler(PrintfHandler::create(multiDispatchInfo, device->getDevice()));
-        printfHandler->prepareDispatch(multiDispatchInfo);
-        EXPECT_NE(nullptr, printfHandler->getSurface());
-
-        EXPECT_TRUE(printfHandler->printEnqueueOutput());
-
-        auto &bcsEngine = device->getEngine(EngineHelpers::getBcsEngineType(device->getRootDeviceEnvironment(), device->getDeviceBitfield(), device->getSelectorCopyEngine(), true), EngineUsage::Regular);
-        auto bcsCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
-
-        if (enable > 0) {
-            EXPECT_EQ(1u, bcsCsr->blitBufferCalled);
-            EXPECT_EQ(BlitterConstants::BlitDirection::BufferToHostPtr, bcsCsr->receivedBlitProperties[0].blitDirection);
-        } else {
-            EXPECT_EQ(0u, bcsCsr->blitBufferCalled);
-        }
-    }
-}
-
-HWTEST_F(PrintfHandlerTests, givenGpuHangOnFlushBcsStreamAndEnabledStatelessCompressionWhenPrintEnqueueOutputIsCalledThenBCSEngineIsUsedToDecompressPrintfOutputAndFalseIsReturned) {
-
-    DebugManagerStateRestore restore;
-    DebugManager.flags.EnableStatelessCompression.set(1);
-    HardwareInfo hwInfo = *defaultHwInfo;
-    hwInfo.capabilityTable.blitterOperationsSupported = true;
-    auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
-
-    REQUIRE_BLITTER_OR_SKIP(device->getRootDeviceEnvironment());
-
-    MockContext context(device.get());
-
-    auto kernelInfo = std::make_unique<MockKernelInfo>();
-    kernelInfo->setPrintfSurface(sizeof(uintptr_t), 0);
-
-    auto program = std::make_unique<MockProgram>(&context, false, toClDeviceVector(*device));
-
-    uint64_t crossThread[10];
-    auto kernel = std::make_unique<MockKernel>(program.get(), *kernelInfo, *device);
-    kernel->setCrossThreadData(&crossThread, sizeof(uint64_t) * 8);
-
-    MockMultiDispatchInfo multiDispatchInfo(device.get(), kernel.get());
-    std::unique_ptr<PrintfHandler> printfHandler(PrintfHandler::create(multiDispatchInfo, device->getDevice()));
-    printfHandler->prepareDispatch(multiDispatchInfo);
-    EXPECT_NE(nullptr, printfHandler->getSurface());
-
-    auto &bcsEngine = device->getEngine(EngineHelpers::getBcsEngineType(device->getRootDeviceEnvironment(), device->getDeviceBitfield(), device->getSelectorCopyEngine(), true), EngineUsage::Regular);
-    auto bcsCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
-    bcsCsr->callBaseFlushBcsTask = false;
-    bcsCsr->flushBcsTaskReturnValue = CompletionStamp::gpuHang;
-
-    EXPECT_FALSE(printfHandler->printEnqueueOutput());
-    EXPECT_EQ(1u, bcsCsr->blitBufferCalled);
-    EXPECT_EQ(BlitterConstants::BlitDirection::BufferToHostPtr, bcsCsr->receivedBlitProperties[0].blitDirection);
-    EXPECT_EQ(1u, bcsCsr->receivedBlitProperties[0].dstAllocation->hostPtrTaskCountAssignment.load());
-    bcsCsr->receivedBlitProperties[0].dstAllocation->hostPtrTaskCountAssignment--;
+    EXPECT_EQ(printfSurface->getGpuAddress(), pImplicitArgs->v0.printfBufferPtr);
 }
 
 HWTEST_F(PrintfHandlerTests, givenDisallowedLocalMemoryCpuAccessWhenPrintEnqueueOutputIsCalledThenBCSEngineIsUsedToCopyPrintfOutput) {
@@ -200,8 +121,8 @@ HWTEST_F(PrintfHandlerTests, givenDisallowedLocalMemoryCpuAccessWhenPrintEnqueue
     hwInfo.capabilityTable.blitterOperationsSupported = true;
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::CpuAccessDisallowed));
-    DebugManager.flags.EnableLocalMemory.set(1);
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::cpuAccessDisallowed));
+    debugManager.flags.EnableLocalMemory.set(1);
 
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
     REQUIRE_BLITTER_OR_SKIP(device->getRootDeviceEnvironment());
@@ -226,29 +147,81 @@ HWTEST_F(PrintfHandlerTests, givenDisallowedLocalMemoryCpuAccessWhenPrintEnqueue
     device->getMemoryManager()->freeGraphicsMemory(printfHandler->printfSurface);
 
     auto allocation = new MockGraphicsAllocation(reinterpret_cast<void *>(0x1000), 0x1000);
-    allocation->memoryPool = MemoryPool::LocalMemory;
+    allocation->memoryPool = MemoryPool::localMemory;
 
     printfHandler->printfSurface = allocation;
 
     printfHandler->printEnqueueOutput();
 
-    auto &bcsEngine = device->getEngine(EngineHelpers::getBcsEngineType(device->getRootDeviceEnvironment(), device->getDeviceBitfield(), device->getSelectorCopyEngine(), true), EngineUsage::Regular);
-    auto bcsCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine.commandStreamReceiver);
+    auto bcsEngine = device->getDevice().getInternalLinkCopyEngine();
+    ASSERT_NE(nullptr, bcsEngine);
+    auto bcsCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine->commandStreamReceiver);
 
     EXPECT_TRUE(bcsCsr->blitBufferCalled >= 1);
-    EXPECT_EQ(BlitterConstants::BlitDirection::BufferToHostPtr, bcsCsr->receivedBlitProperties[0].blitDirection);
+    EXPECT_EQ(BlitterConstants::BlitDirection::bufferToHostPtr, bcsCsr->receivedBlitProperties[0].blitDirection);
+}
+
+HWTEST2_F(PrintfHandlerTests, givenInternalBcsEnginePreferredAndDisallowedLocalMemoryCpuAccessWhenPrintEnqueueOutputIsCalledThenInternalCopyEngineContextCopiesPrintfOutput, IsAtLeastXeCore) {
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+
+    DebugManagerStateRestore restore;
+    debugManager.flags.ExperimentalUseSecondaryContextForInternalEngine.set(0);
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::cpuAccessDisallowed));
+    debugManager.flags.EnableLocalMemory.set(1);
+    debugManager.flags.PreferInternalBcsEngine.set(1);
+
+    auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
+    REQUIRE_BLITTER_OR_SKIP(device->getRootDeviceEnvironment());
+    MockContext context(device.get());
+
+    auto bcsEngine = device->getDevice().getInternalLinkCopyEngine();
+    ASSERT_NE(nullptr, bcsEngine);
+    ASSERT_EQ(EngineUsage::internal, bcsEngine->getEngineUsage());
+    auto regularBcsEngine = device->getDevice().tryGetEngine(bcsEngine->getEngineType(), EngineUsage::regular);
+
+    auto kernelInfo = std::make_unique<MockKernelInfo>();
+    kernelInfo->setPrintfSurface(sizeof(uintptr_t), 0);
+
+    auto program = std::make_unique<MockProgram>(&context, false, toClDeviceVector(*device));
+
+    uint64_t crossThread[10]{};
+    auto kernel = std::make_unique<MockKernel>(program.get(), *kernelInfo, *device);
+    kernel->setCrossThreadData(&crossThread, sizeof(uint64_t) * 8);
+
+    MockMultiDispatchInfo multiDispatchInfo(device.get(), kernel.get());
+    auto printfHandler = std::make_unique<MockPrintfHandler>(device->getDevice());
+
+    printfHandler->callBasePrintEnqueueOutput = true;
+    printfHandler->prepareDispatch(multiDispatchInfo);
+    EXPECT_NE(nullptr, printfHandler->getSurface());
+
+    device->getMemoryManager()->freeGraphicsMemory(printfHandler->printfSurface);
+
+    auto allocation = new MockGraphicsAllocation(reinterpret_cast<void *>(0x1000), 0x1000);
+    allocation->memoryPool = MemoryPool::localMemory;
+
+    printfHandler->printfSurface = allocation;
+
+    printfHandler->printEnqueueOutput();
+
+    auto bcsCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(bcsEngine->commandStreamReceiver);
+    EXPECT_TRUE(bcsCsr->blitBufferCalled >= 1);
+    if (regularBcsEngine) {
+        auto regularBcsCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(regularBcsEngine->commandStreamReceiver);
+        EXPECT_EQ(0u, regularBcsCsr->blitBufferCalled);
+    }
 }
 
 HWTEST_F(PrintfHandlerTests, givenPrintfHandlerWhenEnqueueIsBlockedThenDontUsePrintfObjectAfterMove) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
     class MyMockCommandQueueHw : public CommandQueueHw<FamilyType> {
       public:
         using CommandQueueHw<FamilyType>::CommandQueueHw;
-        using CommandQueueHw<FamilyType>::enqueueKernel;
 
-        WaitStatus waitForAllEngines(bool blockedQueue, PrintfHandler *printfHandler, bool cleanTemporaryAllocationsList) override {
+        WaitStatus waitForAllEngines(bool blockedQueue, PrintfHandler *printfHandler, bool cleanTemporaryAllocationsList, bool waitForTaskCountRequired) override {
             waitCalled = true;
             printfHandlerUsedForWait = printfHandler;
 
@@ -257,7 +230,7 @@ HWTEST_F(PrintfHandlerTests, givenPrintfHandlerWhenEnqueueIsBlockedThenDontUsePr
 
         bool waitCalled = false;
         PrintfHandler *printfHandlerUsedForWait = nullptr;
-        WaitStatus waitForAllEnginesReturnValue = WaitStatus::Ready;
+        WaitStatus waitForAllEnginesReturnValue = WaitStatus::ready;
     };
 
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
@@ -322,7 +295,8 @@ TEST_F(PrintfHandlerTests, givenMultiDispatchInfoWithMultipleKernelsWhenCreating
 
 TEST_F(PrintfHandlerTests, GivenEmptyMultiDispatchInfoWhenCreatingPrintfHandlerThenPrintfHandlerIsNotCreated) {
     MockClDevice device{new MockDevice};
-    MockKernelWithInternals mockKernelWithInternals{device};
+    MockContext mockCtx(&device);
+    MockKernelWithInternals mockKernelWithInternals(mockCtx);
     MockMultiDispatchInfo multiDispatchInfo{&device, mockKernelWithInternals.mockKernel};
     multiDispatchInfo.dispatchInfos.resize(0);
     EXPECT_EQ(nullptr, multiDispatchInfo.peekMainKernel());
@@ -345,20 +319,20 @@ TEST_F(PrintfHandlerTests, GivenAllocationInLocalMemoryWhichRequiresBlitterWhenP
     auto mockBlitMemoryToAllocation = [&blitsCounter](const Device &device, GraphicsAllocation *memory, size_t offset, const void *hostPtr,
                                                       Vec3<size_t> size) -> BlitOperationResult {
         blitsCounter++;
-        return BlitOperationResult::Success;
+        return BlitOperationResult::success;
     };
     VariableBackup<BlitHelperFunctions::BlitMemoryToAllocationFunc> blitMemoryToAllocationFuncBackup{
         &BlitHelperFunctions::blitMemoryToAllocation, mockBlitMemoryToAllocation};
 
     LocalMemoryAccessMode localMemoryAccessModes[] = {
-        LocalMemoryAccessMode::Default,
-        LocalMemoryAccessMode::CpuAccessAllowed,
-        LocalMemoryAccessMode::CpuAccessDisallowed};
+        LocalMemoryAccessMode::defaultMode,
+        LocalMemoryAccessMode::cpuAccessAllowed,
+        LocalMemoryAccessMode::cpuAccessDisallowed};
 
     for (auto localMemoryAccessMode : localMemoryAccessModes) {
-        DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(localMemoryAccessMode));
+        debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(localMemoryAccessMode));
         for (auto isLocalMemorySupported : ::testing::Bool()) {
-            DebugManager.flags.EnableLocalMemory.set(isLocalMemorySupported);
+            debugManager.flags.EnableLocalMemory.set(isLocalMemorySupported);
             auto pClDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
             MockContext context{pClDevice.get()};
 
@@ -375,7 +349,7 @@ TEST_F(PrintfHandlerTests, GivenAllocationInLocalMemoryWhichRequiresBlitterWhenP
             printfHandler->prepareDispatch(multiDispatchInfo);
 
             if (printfHandler->getSurface()->isAllocatedInLocalMemoryPool() &&
-                (localMemoryAccessMode == LocalMemoryAccessMode::CpuAccessDisallowed)) {
+                (localMemoryAccessMode == LocalMemoryAccessMode::cpuAccessDisallowed)) {
                 expectedBlitsCount++;
             }
             EXPECT_EQ(expectedBlitsCount, blitsCounter);

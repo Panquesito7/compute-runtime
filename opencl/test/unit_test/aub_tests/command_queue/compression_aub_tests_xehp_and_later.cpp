@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,19 +9,18 @@
 #include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/test_traits.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/test_macros/hw_test.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
 #include "opencl/source/command_queue/command_queue.h"
+#include "opencl/source/context/context_type.h"
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/source/platform/platform.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
-
-#include "test_traits_common.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
 
@@ -32,11 +31,17 @@ struct CompressionXeHPAndLater : public AUBFixture,
     void SetUp() override {
         REQUIRE_64BIT_OR_SKIP();
 
+        auto &ftrTable = defaultHwInfo->featureTable;
+        if ((!ftrTable.flags.ftrFlatPhysCCS) ||
+            (!ftrTable.flags.ftrLocalMemory && useLocalMemory)) {
+            GTEST_SKIP();
+        }
+
         debugRestorer = std::make_unique<DebugManagerStateRestore>();
-        DebugManager.flags.RenderCompressedBuffersEnabled.set(true);
-        DebugManager.flags.RenderCompressedImagesEnabled.set(true);
-        DebugManager.flags.EnableLocalMemory.set(useLocalMemory);
-        DebugManager.flags.NodeOrdinal.set(GetParam());
+        debugManager.flags.RenderCompressedBuffersEnabled.set(true);
+        debugManager.flags.RenderCompressedImagesEnabled.set(true);
+        debugManager.flags.EnableLocalMemory.set(useLocalMemory);
+        debugManager.flags.NodeOrdinal.set(GetParam());
 
         AUBFixture::setUp(defaultHwInfo.get());
 
@@ -55,11 +60,6 @@ struct CompressionXeHPAndLater : public AUBFixture,
             GTEST_SKIP();
         }
 
-        auto &ftrTable = device->getHardwareInfo().featureTable;
-        if ((!ftrTable.flags.ftrFlatPhysCCS) ||
-            (!ftrTable.flags.ftrLocalMemory && useLocalMemory)) {
-            GTEST_SKIP();
-        }
         context->contextType = ContextType::CONTEXT_TYPE_SPECIALIZED;
     }
     void TearDown() override {
@@ -84,30 +84,30 @@ void CompressionXeHPAndLater<testLocalMemory>::givenCompressedBuffersWhenWriting
     uint8_t writePattern[bufferSize];
     std::fill(writePattern, writePattern + sizeof(writePattern), 1);
 
-    device->getGpgpuCommandStreamReceiver().overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    device->getGpgpuCommandStreamReceiver().overrideDispatchPolicy(DispatchMode::batchedDispatch);
 
     auto compressedBuffer = std::unique_ptr<Buffer>(Buffer::create(context, CL_MEM_READ_WRITE | CL_MEM_COMPRESSED_HINT_INTEL, bufferSize, nullptr, retVal));
     auto compressedAllocation = compressedBuffer->getGraphicsAllocation(device->getRootDeviceIndex());
     memset(compressedAllocation->getUnderlyingBuffer(), 0, bufferSize);
     EXPECT_NE(nullptr, compressedAllocation->getDefaultGmm()->gmmResourceInfo->peekHandle());
-    EXPECT_TRUE(compressedAllocation->getDefaultGmm()->isCompressionEnabled);
+    EXPECT_TRUE(compressedAllocation->getDefaultGmm()->isCompressionEnabled());
     if (testLocalMemory) {
-        EXPECT_EQ(MemoryPool::LocalMemory, compressedAllocation->getMemoryPool());
+        EXPECT_EQ(MemoryPool::localMemory, compressedAllocation->getMemoryPool());
     } else {
-        EXPECT_EQ(MemoryPool::System4KBPages, compressedAllocation->getMemoryPool());
+        EXPECT_EQ(MemoryPool::systemCpuInaccessible, compressedAllocation->getMemoryPool());
     }
 
     auto notCompressedBuffer = std::unique_ptr<Buffer>(Buffer::create(context, CL_MEM_READ_WRITE, bufferSize, nullptr, retVal));
     auto nonCompressedAllocation = notCompressedBuffer->getGraphicsAllocation(device->getRootDeviceIndex());
-    nonCompressedAllocation->setAllocationType(AllocationType::BUFFER);
+    nonCompressedAllocation->setAllocationType(AllocationType::buffer);
     if (nonCompressedAllocation->getDefaultGmm()) {
-        nonCompressedAllocation->getDefaultGmm()->isCompressionEnabled = false;
+        nonCompressedAllocation->getDefaultGmm()->setCompressionEnabled(false);
     }
     memset(nonCompressedAllocation->getUnderlyingBuffer(), 0, bufferSize);
 
     pCmdQ->enqueueWriteBuffer(compressedBuffer.get(), CL_FALSE, 0, bufferSize, writePattern, nullptr, 0, nullptr, nullptr);
     pCmdQ->enqueueCopyBuffer(compressedBuffer.get(), notCompressedBuffer.get(), 0, 0, bufferSize, 0, nullptr, nullptr);
-    pCmdQ->finish();
+    pCmdQ->finish(false);
 
     expectNotEqualMemory<FamilyType>(AUBFixture::getGpuPointer(compressedAllocation),
                                      writePattern, bufferSize);
@@ -122,11 +122,11 @@ void CompressionXeHPAndLater<testLocalMemory>::givenCompressedImage2DFromBufferW
     const size_t imageWidth = 16;
     const size_t imageHeight = 16;
 
-    const size_t bufferSize = 64 * KB;
+    const size_t bufferSize = 64 * MemoryConstants::kiloByte;
     uint8_t writePattern[bufferSize];
     std::fill(writePattern, writePattern + sizeof(writePattern), 1);
 
-    device->getGpgpuCommandStreamReceiver().overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    device->getGpgpuCommandStreamReceiver().overrideDispatchPolicy(DispatchMode::batchedDispatch);
 
     auto compressedBuffer = std::unique_ptr<Buffer>(Buffer::create(context, CL_MEM_COPY_HOST_PTR | CL_MEM_COMPRESSED_HINT_INTEL, bufferSize, writePattern, retVal));
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -175,10 +175,10 @@ void CompressionXeHPAndLater<testLocalMemory>::givenCompressedImage2DFromBufferW
     // make sure our objects are in in fact compressed
     auto graphicsAllocation = compressedBuffer->getGraphicsAllocation(device->getRootDeviceIndex());
     EXPECT_NE(nullptr, graphicsAllocation->getDefaultGmm());
-    EXPECT_TRUE(graphicsAllocation->getDefaultGmm()->isCompressionEnabled);
-    EXPECT_TRUE(compressedImage->getGraphicsAllocation(device->getRootDeviceIndex())->getDefaultGmm()->isCompressionEnabled);
+    EXPECT_TRUE(graphicsAllocation->getDefaultGmm()->isCompressionEnabled());
+    EXPECT_TRUE(compressedImage->getGraphicsAllocation(device->getRootDeviceIndex())->getDefaultGmm()->isCompressionEnabled());
 
-    expectNotEqualMemory<FamilyType>(reinterpret_cast<void *>(graphicsAllocation->getGpuAddress()), writePattern, bufferSize);
+    expectNotEqualMemory<FamilyType>(addrToPtr(ptrOffset(graphicsAllocation->getGpuAddress(), compressedBuffer->getOffset())), writePattern, bufferSize);
 
     clReleaseMemObject(clCompressedImage);
 }
@@ -227,7 +227,7 @@ void CompressionXeHPAndLater<testLocalMemory>::givenCompressedImageWhenReadingTh
     csr->getInternalAllocationStorage()->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
 
     cl_mem_flags flags = CL_MEM_USE_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     auto retVal = CL_INVALID_VALUE;
     std::unique_ptr<Image> srcImage(Image::create(
         context,
@@ -261,7 +261,7 @@ void CompressionXeHPAndLater<testLocalMemory>::givenCompressedImageWhenReadingTh
         event);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    allocation = csr->getTemporaryAllocations().peekHead();
+    allocation = pCmdQ->getGpgpuCommandStreamReceiver().getTemporaryAllocations().peekHead();
     while (allocation && allocation->getUnderlyingBuffer() != destMemory) {
         allocation = allocation->next;
     }
@@ -305,10 +305,10 @@ HWTEST2_P(CompressionLocalXeHPAndLater, givenCompressedImageWhenReadingThenResul
     givenCompressedImageWhenReadingThenResultsAreCorrect<FamilyType>();
 }
 
-INSTANTIATE_TEST_CASE_P(,
-                        CompressionLocalXeHPAndLater,
-                        ::testing::Values(aub_stream::ENGINE_RCS,
-                                          aub_stream::ENGINE_CCS));
+INSTANTIATE_TEST_SUITE_P(,
+                         CompressionLocalXeHPAndLater,
+                         ::testing::Values(aub_stream::ENGINE_RCS,
+                                           aub_stream::ENGINE_CCS));
 
 using CompressionSystemXeHPAndLater = CompressionXeHPAndLater<false>;
 HWTEST2_P(CompressionSystemXeHPAndLater, GENERATEONLY_givenCompressedBuffersWhenWritingAndCopyingThenResultsAreCorrect, CompressionSystemAubsSupportedMatcher) {
@@ -321,7 +321,7 @@ HWTEST2_P(CompressionSystemXeHPAndLater, givenCompressedImageWhenReadingThenResu
     givenCompressedImageWhenReadingThenResultsAreCorrect<FamilyType>();
 }
 
-INSTANTIATE_TEST_CASE_P(,
-                        CompressionSystemXeHPAndLater,
-                        ::testing::Values(aub_stream::ENGINE_RCS,
-                                          aub_stream::ENGINE_CCS));
+INSTANTIATE_TEST_SUITE_P(,
+                         CompressionSystemXeHPAndLater,
+                         ::testing::Values(aub_stream::ENGINE_RCS,
+                                           aub_stream::ENGINE_CCS));

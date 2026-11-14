@@ -1,0 +1,124 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/host_function/host_function_scheduler.h"
+
+#include "shared/source/host_function/host_function.h"
+#include "shared/source/utilities/wait_util.h"
+
+#include <chrono>
+
+namespace NEO {
+
+HostFunctionScheduler::HostFunctionScheduler(int32_t threadsInThreadPoolLimit)
+    : threadPool(threadsInThreadPoolLimit) {
+}
+
+HostFunctionScheduler::~HostFunctionScheduler() = default;
+
+void HostFunctionScheduler::start(HostFunctionStreamer *streamer) {
+
+    this->registerHostFunctionStreamer(streamer);
+    this->threadPool.registerThread();
+
+    if (!schedulerStarted.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lock(workerMutex);
+        if (!schedulerStarted.load(std::memory_order_relaxed)) {
+            worker = std::make_unique<std::jthread>([this](std::stop_token st) {
+                this->schedulerLoop(st);
+            });
+            schedulerStarted.store(true, std::memory_order_release);
+        }
+    }
+}
+
+void HostFunctionScheduler::finish() {
+
+    std::call_once(shutdownOnceFlag, [&]() {
+        threadPool.shutdown();
+        {
+            std::unique_lock<std::mutex> lock(workerMutex);
+            if (worker) {
+                worker->request_stop();
+                semaphore.release();
+                worker->join();
+                worker.reset(nullptr);
+            }
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(registeredStreamersMutex);
+            registeredStreamers.clear();
+        }
+    });
+}
+
+void HostFunctionScheduler::submit(uint32_t nHostFunctions) noexcept {
+    semaphore.release(static_cast<ptrdiff_t>(nHostFunctions));
+}
+
+void HostFunctionScheduler::scheduleHostFunctionToThreadPool(HostFunctionStreamer *streamer, uint64_t id) noexcept {
+
+    auto hostFunction = streamer->getHostFunction(id);
+    threadPool.registerHostFunctionToExecute(streamer, std::move(hostFunction));
+}
+
+void HostFunctionScheduler::schedulerLoop(std::stop_token st) noexcept {
+
+    std::unique_lock<std::mutex> registeredStreamersLock(registeredStreamersMutex, std::defer_lock);
+    auto waitStart = std::chrono::steady_clock::now();
+
+    while (st.stop_requested() == false) {
+        semaphore.acquire(); // wait until there is at least one pending host function
+        semaphore.release(); // leave count unchanged intentionally
+
+        if (st.stop_requested()) {
+            return;
+        }
+
+        registeredStreamersLock.lock();
+        for (auto streamer : registeredStreamers) {
+            uint64_t id = HostFunctionStatus::notReady;
+            if (isHostFunctionReadyToExecute(streamer, id)) {
+                scheduleHostFunctionToThreadPool(streamer, id);
+                waitStart = std::chrono::steady_clock::now();
+            }
+        }
+        registeredStreamersLock.unlock();
+
+        if (st.stop_requested()) {
+            return;
+        }
+
+        auto waitTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart);
+        WaitUtils::waitFunctionWithoutPredicate(waitTime.count());
+    }
+}
+
+void HostFunctionScheduler::registerHostFunctionStreamer(HostFunctionStreamer *streamer) {
+    std::lock_guard<std::mutex> lock(registeredStreamersMutex);
+    registeredStreamers.push_back(streamer);
+}
+
+bool HostFunctionScheduler::isHostFunctionReadyToExecute(HostFunctionStreamer *streamer, uint64_t &hostFunctionId) {
+    if (!semaphore.try_acquire()) {
+        return false;
+    }
+
+    auto id = streamer->tryReserveHostFunctionReadyToExecute();
+    if (id.has_value()) {
+        hostFunctionId = id.value();
+        return true;
+    }
+
+    semaphore.release();
+    return false;
+}
+
+static_assert(NonCopyableAndNonMovable<HostFunctionScheduler>);
+
+} // namespace NEO

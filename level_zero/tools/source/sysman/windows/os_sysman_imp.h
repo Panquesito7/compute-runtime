@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -21,7 +21,7 @@ class KmdSysManager;
 
 struct Device;
 
-class WddmSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
+class WddmSysmanImp : public OsSysman, NEO::NonCopyableAndNonMovableClass {
   public:
     WddmSysmanImp(SysmanDeviceImp *pParentSysmanDeviceImp);
     ~WddmSysmanImp() override;
@@ -35,6 +35,7 @@ class WddmSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
     void releaseFwUtilInterface();
     std::vector<ze_device_handle_t> &getDeviceHandles() override;
     ze_device_handle_t getCoreDeviceHandle() override;
+    ze_bool_t isDriverModelSupported() override;
 
   protected:
     FirmwareUtil *pFwUtilInterface = nullptr;

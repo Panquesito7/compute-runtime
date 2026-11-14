@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,14 +8,15 @@
 #include "shared/source/indirect_heap/heap_size.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/constants.h"
 
 namespace NEO {
 namespace HeapSize {
 
-size_t getDefaultHeapSize(size_t defaultValue) {
+size_t getHeapSize(size_t defaultValue) {
     auto defaultSize = defaultValue;
-    if (DebugManager.flags.ForceDefaultHeapSize.get() != -1) {
-        defaultSize = DebugManager.flags.ForceDefaultHeapSize.get() * MemoryConstants::kiloByte;
+    if (debugManager.flags.ForceDefaultHeapSize.get() != -1) {
+        defaultSize = debugManager.flags.ForceDefaultHeapSize.get() * MemoryConstants::kiloByte;
     }
     return defaultSize;
 }

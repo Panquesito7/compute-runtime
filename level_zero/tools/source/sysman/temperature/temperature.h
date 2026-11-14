@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "level_zero/api/sysman/zes_handles_struct.h"
 #include <level_zero/zes_api.h>
 
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -17,6 +18,7 @@ namespace L0 {
 struct OsSysman;
 class Temperature : _zes_temp_handle_t {
   public:
+    virtual ~Temperature() = default;
     virtual ze_result_t temperatureGetProperties(zes_temp_properties_t *pProperties) = 0;
     virtual ze_result_t temperatureGetConfig(zes_temp_config_t *pConfig) = 0;
     virtual ze_result_t temperatureSetConfig(const zes_temp_config_t *pConfig) = 0;
@@ -31,19 +33,25 @@ class Temperature : _zes_temp_handle_t {
 };
 
 struct TemperatureHandleContext {
-    TemperatureHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    TemperatureHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     ~TemperatureHandleContext();
 
     void init(std::vector<ze_device_handle_t> &deviceHandles);
 
     ze_result_t temperatureGet(uint32_t *pCount, zes_temp_handle_t *phTemperature);
+    void releaseTemperatureHandles();
 
     OsSysman *pOsSysman = nullptr;
-    std::vector<std::unique_ptr<Temperature>> handleList = {};
+    std::vector<std::unique_ptr<Temperature>> handleList;
+
+    bool isTempInitDone() {
+        return tempInitDone;
+    }
 
   private:
     void createHandle(const ze_device_handle_t &deviceHandle, zes_temp_sensors_t type);
     std::once_flag initTemperatureOnce;
+    bool tempInitDone = false;
 };
 
 } // namespace L0

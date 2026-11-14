@@ -1,18 +1,27 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/sysman/test/unit_tests/sources/windows/mock_sysman_driver.h"
+#include "shared/source/helpers/string.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/variable_backup.h"
 
+#include "level_zero/core/source/driver/driver.h"
+#include "level_zero/sysman/source/shared/windows/zes_os_sysman_driver_imp.h"
+#include "level_zero/sysman/test/unit_tests/sources/windows/mock_sysman_driver.h"
+#include "level_zero/zes_intel_gpu_sysman.h"
+
+#include "driver_version.h"
 #include "gtest/gtest.h"
 
 #include <bitset>
 #include <cstring>
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 TEST(zesInit, whenCallingZesInitThenInitializeOnDriverIsCalled) {
@@ -39,5 +48,372 @@ TEST(zesInit, whenCallingZesInitWithoutGpuOnlyFlagThenInitializeOnDriverIsNotCal
     EXPECT_EQ(0u, driver.initCalledCount);
 }
 
+TEST(zesInit, whenCallingZesInitWhenDriverInitFailsThenUninitializedIsReturned) {
+    MockSysmanDriver driver;
+    driver.useBaseInit = false;
+    driver.useBaseDriverInit = true;
+    driver.sysmanInitFail = true;
+
+    auto result = zesInit(0);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, result);
+    EXPECT_EQ(1u, driver.initCalledCount);
+}
+
+bool verifyExtensionDefinition(std::vector<zes_driver_extension_properties_t> &extensionsReturned, uint32_t count) {
+    const std::vector<std::pair<std::string, uint32_t>> supportedExtensions = {
+        {ZES_DEVICE_ECC_DEFAULT_PROPERTIES_EXT_NAME, ZES_DEVICE_ECC_DEFAULT_PROPERTIES_EXT_VERSION_CURRENT},
+        {ZES_POWER_LIMITS_EXT_NAME, ZES_POWER_LIMITS_EXT_VERSION_CURRENT},
+        {ZES_ENGINE_ACTIVITY_EXT_NAME, ZES_ENGINE_ACTIVITY_EXT_VERSION_CURRENT},
+        {ZES_RAS_GET_STATE_EXP_NAME, ZES_RAS_STATE_EXP_VERSION_CURRENT},
+        {ZES_MEM_PAGE_OFFLINE_STATE_EXP_NAME, ZES_MEM_PAGE_OFFLINE_STATE_EXP_VERSION_CURRENT},
+        {ZES_MEMORY_BANDWIDTH_COUNTER_BITS_EXP_PROPERTIES_NAME, ZES_MEM_BANDWIDTH_COUNTER_BITS_EXP_VERSION_CURRENT},
+        {ZES_SYSMAN_DEVICE_MAPPING_EXP_NAME, ZES_SYSMAN_DEVICE_MAPPING_EXP_VERSION_CURRENT},
+        {ZES_VIRTUAL_FUNCTION_MANAGEMENT_EXP_NAME, ZES_VF_MANAGEMENT_EXP_VERSION_CURRENT},
+        {ZES_PCI_LINK_SPEED_DOWNGRADE_EXT_NAME, ZES_PCI_LINK_SPEED_DOWNGRADE_EXT_VERSION_CURRENT},
+        {ZES_DEVICE_EXT_STATE_NAME, ZES_DEVICE_EXT_STATE_VERSION_CURRENT},
+        {ZES_OEM_SERIAL_ID_EXT_NAME, ZES_OEM_SERIAL_ID_EXT_VERSION_CURRENT},
+        {ZES_DEVICE_HEALTH_EXT_NAME, ZES_DEVICE_HEALTH_EXT_VERSION_CURRENT},
+        {ZES_MEMORY_VENDOR_INFO_EXT_NAME, ZES_MEMORY_VENDOR_INFO_EXT_VERSION_CURRENT},
+        {ZES_INFO_LOGS_EXT_NAME, ZES_INFO_LOGS_EXT_VERSION_CURRENT},
+        {ZES_DEVICE_INDEX_EXT_NAME, ZES_DEVICE_INDEX_EXT_VERSION_CURRENT},
+        {ZES_DEVICE_GPU_TOPOLOGY_EXT_NAME, ZES_DEVICE_GPU_TOPOLOGY_EXT_VERSION_CURRENT},
+        {ZES_INTEL_DRIVER_NAME_EXP_PROPERTY_NAME, ZES_INTEL_DRIVER_NAME_EXP_PROPERTIES_VERSION_CURRENT},
+        {ZES_INTEL_FREQ_THROTTLE_REASON_EXP_NAME, ZES_INTEL_FREQ_THROTTLE_REASON_EXP_VERSION_CURRENT},
+        {ZES_INTEL_MEMORY_PAGE_OFFLINE_EXP_NAME, ZES_INTEL_MEMORY_PAGE_OFFLINE_EXP_VERSION_CURRENT},
+        {ZES_INTEL_MEMORY_PAGE_OFFLINE_PROPERTY_EXP_NAME, ZES_INTEL_MEM_PAGE_OFFLINE_PROPERTIES_EXP_VERSION_CURRENT},
+        {ZES_INTEL_PCI_LINK_SPEED_DOWNGRADE_EXP_PROPERTY_NAME, ZES_INTEL_PCI_LINK_SPEED_DOWNGRADE_EXP_PROPERTIES_VERSION_CURRENT},
+        {ZES_INTEL_PCI_LINK_SPEED_DOWNGRADE_EXP_STATE_NAME, ZES_INTEL_PCI_LINK_SPEED_DOWNGRADE_EXP_STATE_VERSION_CURRENT},
+        {ZES_INTEL_PCI_LINK_SPEED_UPDATE_EXP_NAME, ZES_INTEL_PCI_LINK_SPEED_UPDATE_EXP_VERSION_CURRENT},
+        {ZES_INTEL_PCI_CONFIG_EXP_STATE_NAME, ZES_INTEL_PCI_CONFIG_EXP_STATE_VERSION_CURRENT},
+        {ZES_INTEL_DRIVER_RESCAN_DEVICES_EXP_NAME, ZES_INTEL_DRIVER_RESCAN_DEVICES_EXP_VERSION_CURRENT},
+        {ZES_INTEL_INFO_LOG_SIG_ID_EXP_NAME, ZES_INTEL_INFO_LOG_SIG_ID_EXP_VERSION_CURRENT},
+        {ZES_INTEL_DEVICE_STATE_PENDING_ACTION_EXP_NAME, ZES_INTEL_DEVICE_STATE_PENDING_ACTION_EXP_VERSION_CURRENT},
+        {ZES_INTEL_DEVICE_POWER_OFF_REASON_EXP_NAME, ZES_INTEL_DEVICE_POWER_OFF_REASON_EXP_VERSION_CURRENT},
+        {ZES_INTEL_DRIVER_API_VERSION_EXP_NAME, ZES_INTEL_DRIVER_API_VERSION_EXP_VERSION_CURRENT},
+        {ZES_INTEL_DEVICE_SOC_UID_EXP_PROPERTY_NAME, ZES_INTEL_DEVICE_SOC_UID_EXP_PROPERTIES_VERSION_CURRENT},
+        {ZES_INTEL_ENGINE_ACTIVITY_COLLECTION_EXP_NAME, ZES_INTEL_ENGINE_ACTIVITY_COLLECTION_EXP_VERSION_CURRENT}};
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (extensionsReturned[i].name != supportedExtensions[i].first) {
+            return false;
+        }
+        if (extensionsReturned[i].version != supportedExtensions[i].second) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST_F(SysmanDriverHandleTest,
+       givenInitializedDriverWhenzesDriverGetExtensionPropertiesIsCalledThenAllSupportedExtensionsAreReturned) {
+    uint32_t pCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetExtensionProperties(driverHandle->toHandle(), &pCount, nullptr));
+    EXPECT_GE(pCount, 0u);
+    std::vector<zes_driver_extension_properties_t> extensionsSupported(pCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetExtensionProperties(driverHandle->toHandle(), &pCount, extensionsSupported.data()));
+    EXPECT_TRUE(verifyExtensionDefinition(extensionsSupported, pCount));
+}
+
+TEST_F(SysmanDriverHandleTest,
+       givenInitializedDriverWhenzesDriverGetExtensionPropertiesIsCalledWithInvalidCountThenValidSupportedExtensionsCountIsReturned) {
+    uint32_t pCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetExtensionProperties(driverHandle->toHandle(), &pCount, nullptr));
+    EXPECT_GE(pCount, 0u);
+    std::vector<zes_driver_extension_properties_t> extensionsSupported(pCount);
+    auto actualCount = pCount; // Store the actual count
+    pCount += 5;               // Intentionally increase the count to check if function adjusts it correctly
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetExtensionProperties(driverHandle->toHandle(), &pCount, extensionsSupported.data()));
+    EXPECT_EQ(actualCount, pCount);
+}
+
+TEST_F(SysmanDriverHandleTest,
+       givenInitializedDriverWhenzesDriverGetExtensionPropertiesIsCalledWithCountLessThanActualSizeThenSameNumberOfSupportedExtensionsReturned) {
+    uint32_t pCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetExtensionProperties(driverHandle->toHandle(), &pCount, nullptr));
+    EXPECT_GE(pCount, 0u);
+    auto actualCount = pCount; // Store the actual count
+
+    std::vector<zes_driver_extension_properties_t> extensionsSupported(actualCount);
+    pCount -= 1; // Intentionally decrease the count to check if function adjusts it correctly
+    // Filled with invalid data to ensure only valid extensions are filled by driver function
+    strcpy_s(extensionsSupported[pCount].name, ZES_MAX_EXTENSION_NAME, "Invalid_Extension_Name");
+    extensionsSupported[pCount].version = 1234;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetExtensionProperties(driverHandle->toHandle(), &pCount, extensionsSupported.data()));
+    EXPECT_EQ(actualCount - 1, pCount);
+    EXPECT_TRUE(verifyExtensionDefinition(extensionsSupported, pCount));
+    // Verify that the last entry remains unchanged
+    EXPECT_EQ(strcmp(extensionsSupported[actualCount - 1].name, "Invalid_Extension_Name"), 0);
+    EXPECT_EQ(extensionsSupported[actualCount - 1].version, static_cast<uint32_t>(1234));
+}
+
+TEST_F(SysmanDriverHandleTest,
+       givenDriverWhenGetExtensionFunctionAddressIsCalledWithValidAndInvalidFunctionNamesThenCorrectResultIsReturned) {
+    void *funPtr = nullptr;
+
+    auto result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zexDriverImportUnKnownPointer", &funPtr);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDevicePciLinkSpeedUpdateExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDeviceMemoryGetPageOfflineStateExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDriverEnumInfoLogsExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogGetPropertiesExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogCreateInstanceExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogInstanceReadWithMetadataExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDeviceGetPowerOffReasonExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogInstancePeekWithMetadataExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogInstanceDeleteExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogCreateDecoderContextExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogDecoderGetFieldInfoExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogDecoderDecodeStartExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogDecoderReadFieldExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogDecoderDecodeStopExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelInfoLogDeleteDecoderContextExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelEngineStartActivityCollectionExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelEngineStopActivityCollectionExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDriverEventRegisterExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDriverEventListenExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = zesDriverGetExtensionFunctionAddress(driverHandle->toHandle(), "zesIntelDriverGetApiVersionExp", &funPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+using SysmanRescanDriverHandleTest = SysmanDriverHandleTest;
+
+TEST_F(SysmanRescanDriverHandleTest, GivenWddmDriverWhenCallingGetDeviceRescanThenUnsupportedFeatureIsReturned) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, driverHandle->getDeviceRescan(&count, nullptr));
+}
+
+TEST_F(SysmanRescanDriverHandleTest, GivenNullOsSysmanDriverWhenCallingGetDeviceRescanThenUninitializedIsReturned) {
+    auto savedOsSysmanDriver = driverHandle->pOsSysmanDriver;
+    driverHandle->pOsSysmanDriver = nullptr;
+
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, driverHandle->getDeviceRescan(&count, nullptr));
+
+    driverHandle->pOsSysmanDriver = savedOsSysmanDriver;
+}
+
+TEST_F(SysmanRescanDriverHandleTest, GivenWddmDriverWhenCallingRescanEntrypointThenUnsupportedFeatureIsReturned) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesIntelDriverRescanDevicesExp(driverHandle->toHandle(), &count, nullptr));
+}
+
+using SysmanDriverEventRegisterTest = SysmanDriverHandleTest;
+
+TEST_F(SysmanDriverEventRegisterTest, GivenWddmDriverWhenCallingDriverEventRegisterThenUnsupportedFeatureIsReturned) {
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, driverHandle->driverEventRegister(ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT));
+}
+
+TEST_F(SysmanDriverEventRegisterTest, GivenNullOsSysmanDriverWhenCallingDriverEventRegisterThenUninitializedIsReturned) {
+    auto savedOsSysmanDriver = driverHandle->pOsSysmanDriver;
+    driverHandle->pOsSysmanDriver = nullptr;
+
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, driverHandle->driverEventRegister(ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT));
+
+    driverHandle->pOsSysmanDriver = savedOsSysmanDriver;
+}
+
+TEST_F(SysmanDriverEventRegisterTest, GivenWddmDriverWhenCallingDriverEventRegisterEntrypointThenUnsupportedFeatureIsReturned) {
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesDriverEventRegisterExt(driverHandle->toHandle(), ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT));
+}
+
+using SysmanDriverEventListenTest = SysmanDriverHandleTest;
+
+TEST_F(SysmanDriverEventListenTest, GivenWddmDriverWhenCallingSysmanDriverEventsListenThenUnsupportedFeatureIsReturned) {
+    uint32_t numDeviceEvents = 0;
+    zes_event_type_flags_t deviceEvents = 0;
+    zes_event_type_flags_t driverEvents = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, driverHandle->sysmanDriverEventsListen(0u, 1u, nullptr, &numDeviceEvents, &deviceEvents, &driverEvents));
+}
+
+TEST_F(SysmanDriverEventListenTest, GivenNullOsSysmanDriverWhenCallingSysmanDriverEventsListenThenUninitializedIsReturned) {
+    auto savedOsSysmanDriver = driverHandle->pOsSysmanDriver;
+    driverHandle->pOsSysmanDriver = nullptr;
+
+    uint32_t numDeviceEvents = 0;
+    zes_event_type_flags_t deviceEvents = 0;
+    zes_event_type_flags_t driverEvents = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, driverHandle->sysmanDriverEventsListen(0u, 1u, nullptr, &numDeviceEvents, &deviceEvents, &driverEvents));
+
+    driverHandle->pOsSysmanDriver = savedOsSysmanDriver;
+}
+
+TEST_F(SysmanDriverEventListenTest, GivenWddmDriverWhenCallingDriverEventListenEntrypointThenUnsupportedFeatureIsReturned) {
+    uint32_t numDeviceEvents = 0;
+    zes_event_type_flags_t deviceEvents = 0;
+    zes_event_type_flags_t driverEvents = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesDriverEventListenExt(driverHandle->toHandle(), 0u, 1u, nullptr, &numDeviceEvents, &deviceEvents, &driverEvents));
+}
+
+using SysmanDriverPciDevicePropertiesTest = SysmanDriverHandleTest;
+
+TEST_F(SysmanDriverPciDevicePropertiesTest, GivenWddmDriverWhenCallingGetPciDevicePropertiesThenUnsupportedFeatureIsReturned) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, driverHandle->getPciDeviceProperties(&count, nullptr));
+}
+
+TEST_F(SysmanDriverPciDevicePropertiesTest, GivenNullOsSysmanDriverWhenCallingGetPciDevicePropertiesThenOsSysmanDriverIsCreatedAndUnsupportedFeatureIsReturned) {
+    delete driverHandle->pOsSysmanDriver;
+    driverHandle->pOsSysmanDriver = nullptr;
+
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, driverHandle->getPciDeviceProperties(&count, nullptr));
+    EXPECT_NE(nullptr, driverHandle->pOsSysmanDriver);
+}
+
+TEST_F(SysmanDriverPciDevicePropertiesTest, GivenWddmDriverWhenCallingGetPciDevicePropertiesEntrypointThenUnsupportedFeatureIsReturned) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesDriverGetPciDeviceProperties(driverHandle->toHandle(), &count, nullptr));
+}
+
+struct PublicSysmanDriverHandleImp : public L0::Sysman::SysmanDriverHandleImp {
+    using L0::Sysman::SysmanDriverHandleImp::uuidTimestamp;
+};
+
+using SysmanDriverGetPropertiesTest = SysmanDriverHandleTest;
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenSysmanOnlyInitWhenCallingGetDriverPropertiesEntrypointThenDriverVersionAndUuidAreReturned) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.OverrideDriverVersion.set(-1);
+    NEO::debugManager.flags.OverrideVersionBuild.set(-1);
+
+    zes_driver_properties_t properties = {ZES_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    memset(properties.uuid.id, 0xFF, sizeof(properties.uuid.id));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetProperties(driverHandle->toHandle(), &properties));
+    EXPECT_EQ(0x01030000u + static_cast<uint32_t>(NEO_VERSION_BUILD), properties.driverVersion);
+
+    for (size_t i = sizeof(uint64_t); i < sizeof(properties.uuid.id); i++) {
+        EXPECT_EQ(0u, properties.uuid.id[i]);
+    }
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenKnownDriverVersionAndUuidTimestampWhenCallingGetDriverPropertiesEntrypointThenUuidPacksTimestampHighHalfOverDriverVersion) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.OverrideDriverVersion.set(0x0badf00d);
+
+    auto pDriverHandleImp = static_cast<PublicSysmanDriverHandleImp *>(driverHandle.get());
+    pDriverHandleImp->uuidTimestamp = 0x1122334455667788ull;
+
+    zes_driver_properties_t properties = {ZES_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    memset(properties.uuid.id, 0xFF, sizeof(properties.uuid.id));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetProperties(driverHandle->toHandle(), &properties));
+    EXPECT_EQ(0x0badf00du, properties.driverVersion);
+
+    uint64_t reportedUniqueId = 0u;
+    memcpy_s(&reportedUniqueId, sizeof(reportedUniqueId), properties.uuid.id, sizeof(reportedUniqueId));
+    EXPECT_EQ(0x112233440badf00dull, reportedUniqueId);
+
+    for (size_t i = sizeof(reportedUniqueId); i < sizeof(properties.uuid.id); i++) {
+        EXPECT_EQ(0u, properties.uuid.id[i]);
+    }
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenOverrideDriverVersionSetWhenCallingGetDriverPropertiesEntrypointThenOverriddenVersionIsReturned) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.OverrideDriverVersion.set(1234);
+
+    zes_driver_properties_t properties = {ZES_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetProperties(driverHandle->toHandle(), &properties));
+    EXPECT_EQ(1234u, properties.driverVersion);
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenOverrideVersionBuildSetWhenCallingGetDriverPropertiesEntrypointThenOverriddenBuildIsUsed) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.OverrideVersionBuild.set(10);
+    NEO::debugManager.flags.OverrideDriverVersion.set(-1);
+
+    zes_driver_properties_t properties = {ZES_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDriverGetProperties(driverHandle->toHandle(), &properties));
+    EXPECT_EQ(0x0103000au, properties.driverVersion);
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenSysmanInitFromCoreWhenCallingGetDriverPropertiesEntrypointThenUnsupportedFeatureIsReturned) {
+    VariableBackup<bool> sysmanInitFromCoreBackup(&L0::sysmanInitFromCore, true);
+
+    zes_driver_properties_t properties = {ZES_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesDriverGetProperties(driverHandle->toHandle(), &properties));
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenNeitherInitFlagSetWhenCallingGetDriverPropertiesEntrypointThenUninitializedIsReturned) {
+    VariableBackup<bool> sysmanInitFromCoreBackup(&L0::sysmanInitFromCore, false);
+    VariableBackup<bool> sysmanOnlyInitBackup(&L0::Sysman::sysmanOnlyInit, false);
+
+    zes_driver_properties_t properties = {ZES_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, zesDriverGetProperties(driverHandle->toHandle(), &properties));
+}
+
+using SysmanDriverGetApiVersionTest = SysmanDriverHandleTest;
+
+TEST_F(SysmanDriverGetApiVersionTest, GivenSysmanOnlyInitWhenCallingGetApiVersionEntrypointThenExpectedVersionIsReturned) {
+    zes_intel_api_version_exp_t version = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesIntelDriverGetApiVersionExp(driverHandle->toHandle(), &version));
+    EXPECT_EQ(ZES_INTEL_API_VERSION_EXP_1_20, version);
+}
+
+TEST_F(SysmanDriverGetApiVersionTest, GivenSysmanInitFromCoreWhenCallingGetApiVersionEntrypointThenUnsupportedFeatureIsReturned) {
+    VariableBackup<bool> sysmanInitFromCoreBackup(&L0::sysmanInitFromCore, true);
+
+    zes_intel_api_version_exp_t version = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesIntelDriverGetApiVersionExp(driverHandle->toHandle(), &version));
+}
+
+TEST_F(SysmanDriverGetApiVersionTest, GivenNeitherInitFlagSetWhenCallingGetApiVersionEntrypointThenUninitializedIsReturned) {
+    VariableBackup<bool> sysmanInitFromCoreBackup(&L0::sysmanInitFromCore, false);
+    VariableBackup<bool> sysmanOnlyInitBackup(&L0::Sysman::sysmanOnlyInit, false);
+
+    zes_intel_api_version_exp_t version = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, zesIntelDriverGetApiVersionExp(driverHandle->toHandle(), &version));
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenInitializedDriverHandleWhenCallingGetUuidTimestampThenSameNonZeroTimestampIsReturned) {
+    auto uuidTimestamp = driverHandle->getUuidTimestamp();
+    EXPECT_NE(0u, uuidTimestamp);
+    EXPECT_EQ(uuidTimestamp, driverHandle->getUuidTimestamp());
+}
+
+TEST_F(SysmanDriverGetPropertiesTest, GivenUninitializedDriverHandleWhenCallingGetUuidTimestampThenZeroIsReturned) {
+    L0::Sysman::SysmanDriverHandleImp uninitializedDriverHandle;
+    EXPECT_EQ(0u, uninitializedDriverHandle.getUuidTimestamp());
+}
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

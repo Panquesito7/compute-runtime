@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,10 @@
 
 #include "shared/source/os_interface/linux/drm_buffer_object.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/task_count_helper.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/aligned_memory.h"
@@ -19,9 +22,8 @@
 #include "shared/source/os_interface/linux/ioctl_helper.h"
 #include "shared/source/os_interface/linux/os_context_linux.h"
 #include "shared/source/os_interface/os_context.h"
+#include "shared/source/utilities/logger.h"
 
-#include <errno.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -35,7 +37,7 @@ BufferObjectHandleWrapper BufferObjectHandleWrapper::acquireSharedOwnership() {
     std::lock_guard lock{controlBlock->blockMutex};
     controlBlock->refCount++;
 
-    return BufferObjectHandleWrapper{boHandle, Ownership::Strong, controlBlock};
+    return BufferObjectHandleWrapper{boHandle, rootDeviceIndex, Ownership::strong, controlBlock};
 }
 
 BufferObjectHandleWrapper BufferObjectHandleWrapper::acquireWeakOwnership() {
@@ -46,7 +48,7 @@ BufferObjectHandleWrapper BufferObjectHandleWrapper::acquireWeakOwnership() {
     std::lock_guard lock{controlBlock->blockMutex};
     controlBlock->weakRefCount++;
 
-    return BufferObjectHandleWrapper{boHandle, Ownership::Weak, controlBlock};
+    return BufferObjectHandleWrapper{boHandle, rootDeviceIndex, Ownership::weak, controlBlock};
 }
 
 BufferObjectHandleWrapper::~BufferObjectHandleWrapper() {
@@ -56,7 +58,7 @@ BufferObjectHandleWrapper::~BufferObjectHandleWrapper() {
 
     std::unique_lock lock{controlBlock->blockMutex};
 
-    if (ownership == Ownership::Strong) {
+    if (ownership == Ownership::strong) {
         controlBlock->refCount--;
     } else {
         controlBlock->weakRefCount--;
@@ -65,6 +67,7 @@ BufferObjectHandleWrapper::~BufferObjectHandleWrapper() {
     if (controlBlock->refCount == 0 && controlBlock->weakRefCount == 0) {
         lock.unlock();
         delete controlBlock;
+        controlBlock = nullptr;
     }
 }
 
@@ -78,28 +81,22 @@ bool BufferObjectHandleWrapper::canCloseBoHandle() {
 }
 
 BufferObject::BufferObject(uint32_t rootDeviceIndex, Drm *drm, uint64_t patIndex, int handle, size_t size, size_t maxOsContextCount)
-    : BufferObject(rootDeviceIndex, drm, patIndex, BufferObjectHandleWrapper{handle}, size, maxOsContextCount) {}
+    : BufferObject(rootDeviceIndex, drm, patIndex, BufferObjectHandleWrapper{handle, rootDeviceIndex}, size, maxOsContextCount) {}
 
 BufferObject::BufferObject(uint32_t rootDeviceIndex, Drm *drm, uint64_t patIndex, BufferObjectHandleWrapper &&handle, size_t size, size_t maxOsContextCount)
-    : drm(drm), refCount(1), rootDeviceIndex(rootDeviceIndex), handle(std::move(handle)), size(size) {
+    : drm(drm), handle(std::move(handle)), size(size), refCount(1), rootDeviceIndex(rootDeviceIndex) {
 
     auto ioctlHelper = drm->getIoctlHelper();
-    this->tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingNone);
+    this->tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingNone);
     this->lockedAddress = nullptr;
     this->patIndex = patIndex;
 
     perContextVmsUsed = drm->isPerContextVMRequired();
     requiresExplicitResidency = drm->hasPageFaultSupport();
-
-    if (perContextVmsUsed) {
-        bindInfo.resize(maxOsContextCount);
-        for (auto &iter : bindInfo) {
-            iter.fill(false);
-        }
-    } else {
-        bindInfo.resize(1);
-        bindInfo[0].fill(false);
-    }
+    auto maxOsContextUsedCount = perContextVmsUsed ? maxOsContextCount : 1;
+    bindInfo.resize(maxOsContextUsedCount, {});
+    asyncPagingFence.resize(maxOsContextUsedCount, {});
+    asyncFenceVal.resize(maxOsContextUsedCount, {});
 }
 
 uint32_t BufferObject::getRefCount() const {
@@ -114,21 +111,26 @@ void BufferObject::setAddress(uint64_t address) {
 
 bool BufferObject::close() {
     if (!this->handle.canCloseBoHandle()) {
-        PRINT_DEBUG_STRING(DebugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "Skipped closing BO-%d - more shared users!\n", this->handle.getBoHandle());
+        PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "Skipped closing BO-%d - more shared users!\n", this->handle.getBoHandle());
         return true;
     }
 
     GemClose close{};
     close.handle = this->handle.getBoHandle();
+    close.userptr = this->userptr;
 
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "Calling gem close on handle: BO-%d\n", this->handle.getBoHandle());
+    PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "Calling gem close on handle: BO-%d\n", this->handle.getBoHandle());
 
     auto ioctlHelper = this->drm->getIoctlHelper();
-    int ret = ioctlHelper->ioctl(DrmIoctl::GemClose, &close);
+    int ret = ioctlHelper->ioctl(DrmIoctl::gemClose, &close);
     if (ret != 0) {
         int err = errno;
-        PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr, "ioctl(GEM_CLOSE) failed with %d. errno=%d(%s)\n", ret, err, strerror(err));
+
+        CREATE_DEBUG_STRING(str, "ioctl(GEM_CLOSE) failed with %d. errno=%d(%s)\n", ret, err, strerror(err));
+        drm->getRootDeviceEnvironment().executionEnvironment.setErrorDescription(std::string(str.get()));
+        PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, str.get());
         DEBUG_BREAK_IF(true);
+
         return false;
     }
 
@@ -159,10 +161,9 @@ bool BufferObject::setTiling(uint32_t mode, uint32_t stride) {
     setTiling.stride = stride;
     auto ioctlHelper = this->drm->getIoctlHelper();
 
-    if (ioctlHelper->ioctl(DrmIoctl::GemSetTiling, &setTiling) != 0) {
+    if (!ioctlHelper->setGemTiling(&setTiling)) {
         return false;
     }
-
     this->tilingMode = setTiling.tilingMode;
 
     return setTiling.tilingMode == mode;
@@ -192,34 +193,35 @@ int BufferObject::exec(uint32_t used, size_t startOffset, unsigned int flags, bo
                                 static_cast<uint32_t>(residencyCount + 1u), static_cast<uint32_t>(startOffset),
                                 alignUp(used, 8), flags, drmContextId);
 
-    if (DebugManager.flags.PrintExecutionBuffer.get()) {
-        PRINT_DEBUG_STRING(DebugManager.flags.PrintExecutionBuffer.get(), stdout, "Exec called with drmVmId = %u\n",
-                           static_cast<const OsContextLinux *>(osContext)->getDrmVmIds().size() ? static_cast<const OsContextLinux *>(osContext)->getDrmVmIds()[vmHandleId] : 0);
+    if (debugManager.flags.PrintExecutionBuffer.get()) {
+        PRINT_STRING(debugManager.flags.PrintExecutionBuffer.get(), stdout, "Exec called with drmVmId = %u\n", drm->getVmIdForContext(*osContext, vmHandleId));
 
         printExecutionBuffer(execbuf, residencyCount, execObjectsStorage, residency);
     }
 
     int ret = ioctlHelper->execBuffer(&execbuf, completionGpuAddress, completionValue);
 
-    if (ret != 0) {
-        int err = this->drm->getErrno();
-        if (err == EOPNOTSUPP) {
-            PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr, "ioctl(I915_GEM_EXECBUFFER2) failed with %d. errno=%d(%s)\n", ret, err, strerror(err));
-            return err;
+    if (!osContext->isDirectSubmissionLightActive()) {
+        if (ret != 0) {
+            int err = this->drm->getErrno();
+            if (err == EOPNOTSUPP) {
+                PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "ioctl(I915_GEM_EXECBUFFER2) failed with %d. errno=%d(%s)\n", ret, err, strerror(err));
+                return err;
+            }
+
+            evictUnusedAllocations(false, true);
+            ret = ioctlHelper->execBuffer(&execbuf, completionGpuAddress, completionValue);
         }
 
-        evictUnusedAllocations(false, true);
-        ret = ioctlHelper->execBuffer(&execbuf, completionGpuAddress, completionValue);
-    }
+        if (ret != 0) {
+            const auto status = evictUnusedAllocations(true, true);
+            if (status == MemoryOperationsStatus::gpuHangDetectedDuringOperation) {
+                PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "Error! GPU hang detected in BufferObject::exec(). Returning %d\n", gpuHangDetected);
+                return gpuHangDetected;
+            }
 
-    if (ret != 0) {
-        const auto status = evictUnusedAllocations(true, true);
-        if (status == MemoryOperationsStatus::GPU_HANG_DETECTED_DURING_OPERATION) {
-            PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr, "Error! GPU hang detected in BufferObject::exec(). Returning %d\n", gpuHangDetected);
-            return gpuHangDetected;
+            ret = ioctlHelper->execBuffer(&execbuf, completionGpuAddress, completionValue);
         }
-
-        ret = ioctlHelper->execBuffer(&execbuf, completionGpuAddress, completionValue);
     }
 
     if (ret == 0) {
@@ -227,7 +229,7 @@ int BufferObject::exec(uint32_t used, size_t startOffset, unsigned int flags, bo
     }
 
     int err = this->drm->getErrno();
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr, "ioctl(I915_GEM_EXECBUFFER2) failed with %d. errno=%d(%s)\n", ret, err, strerror(err));
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "ioctl(I915_GEM_EXECBUFFER2) failed with %d. errno=%d(%s)\n", ret, err, strerror(err));
     return err;
 }
 
@@ -236,32 +238,33 @@ MemoryOperationsStatus BufferObject::evictUnusedAllocations(bool waitForCompleti
 }
 
 void BufferObject::printBOBindingResult(OsContext *osContext, uint32_t vmHandleId, bool bind, int retVal) {
+    auto vmId = this->drm->getVmIdForContext(*osContext, vmHandleId);
     if (retVal == 0) {
         if (bind) {
-            PRINT_DEBUG_STRING(DebugManager.flags.PrintBOBindingResult.get(), stdout, "bind BO-%d to VM %u, drmVmId = %u, range: %llx - %llx, size: %lld, result: %d\n",
-                               this->handle.getBoHandle(), vmHandleId, static_cast<const OsContextLinux *>(osContext)->getDrmVmIds().size() ? static_cast<const OsContextLinux *>(osContext)->getDrmVmIds()[vmHandleId] : 0, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal);
+            PRINT_STRING(debugManager.flags.PrintBOBindingResult.get(), stdout, "bind BO-%d to VM %u, vmHandleId = %u, range: %llx - %llx, size: %lld, result: %d\n",
+                         this->handle.getBoHandle(), vmId, vmHandleId, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal);
         } else {
-            PRINT_DEBUG_STRING(DebugManager.flags.PrintBOBindingResult.get(), stdout, "unbind BO-%d from VM %u, drmVmId = %u, range: %llx - %llx, size: %lld, result: %d\n",
-                               this->handle.getBoHandle(), vmHandleId, static_cast<const OsContextLinux *>(osContext)->getDrmVmIds().size() ? static_cast<const OsContextLinux *>(osContext)->getDrmVmIds()[vmHandleId] : 0, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal);
+            PRINT_STRING(debugManager.flags.PrintBOBindingResult.get(), stdout, "unbind BO-%d from VM %u, vmHandleId = %u, range: %llx - %llx, size: %lld, result: %d\n",
+                         this->handle.getBoHandle(), vmId, vmHandleId, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal);
         }
     } else {
         auto err = this->drm->getErrno();
         if (bind) {
-            PRINT_DEBUG_STRING(DebugManager.flags.PrintBOBindingResult.get(), stderr, "bind BO-%d to VM %u, drmVmId = %u, range: %llx - %llx, size: %lld, result: %d, errno: %d(%s)\n",
-                               this->handle.getBoHandle(), vmHandleId, static_cast<const OsContextLinux *>(osContext)->getDrmVmIds().size() ? static_cast<const OsContextLinux *>(osContext)->getDrmVmIds()[vmHandleId] : 0, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal, err, strerror(err));
+            PRINT_STRING(debugManager.flags.PrintBOBindingResult.get(), stderr, "bind BO-%d to VM %u, vmHandleId = %u, range: %llx - %llx, size: %lld, result: %d, errno: %d(%s)\n",
+                         this->handle.getBoHandle(), vmId, vmHandleId, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal, err, strerror(err));
         } else {
-            PRINT_DEBUG_STRING(DebugManager.flags.PrintBOBindingResult.get(), stderr, "unbind BO-%d from VM %u, drmVmId = %u, range: %llx - %llx, size: %lld, result: %d, errno: %d(%s)\n",
-                               this->handle.getBoHandle(), vmHandleId, static_cast<const OsContextLinux *>(osContext)->getDrmVmIds().size() ? static_cast<const OsContextLinux *>(osContext)->getDrmVmIds()[vmHandleId] : 0, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal, err, strerror(err));
+            PRINT_STRING(debugManager.flags.PrintBOBindingResult.get(), stderr, "unbind BO-%d from VM %u, vmHandleId = %u, range: %llx - %llx, size: %lld, result: %d, errno: %d(%s)\n",
+                         this->handle.getBoHandle(), vmId, vmHandleId, this->gpuAddress, ptrOffset(this->gpuAddress, this->size), this->size, retVal, err, strerror(err));
         }
     }
 }
 
-int BufferObject::bind(OsContext *osContext, uint32_t vmHandleId) {
+int BufferObject::bind(OsContext *osContext, uint32_t vmHandleId, const bool forcePagingFence) {
     int retVal = 0;
     auto contextId = getOsContextId(osContext);
-    if (!this->bindInfo[contextId][vmHandleId]) {
-        retVal = this->drm->bindBufferObject(osContext, vmHandleId, this);
-        if (DebugManager.flags.PrintBOBindingResult.get()) {
+    if (!this->bindInfo[contextId][vmHandleId] || this->isResourceDecompressRequired()) {
+        retVal = this->drm->bindBufferObject(osContext, vmHandleId, this, forcePagingFence);
+        if (debugManager.flags.PrintBOBindingResult.get()) {
             printBOBindingResult(osContext, vmHandleId, true, retVal);
         }
         if (!retVal) {
@@ -276,7 +279,7 @@ int BufferObject::unbind(OsContext *osContext, uint32_t vmHandleId) {
     auto contextId = getOsContextId(osContext);
     if (this->bindInfo[contextId][vmHandleId]) {
         retVal = this->drm->unbindBufferObject(osContext, vmHandleId, this);
-        if (DebugManager.flags.PrintBOBindingResult.get()) {
+        if (debugManager.flags.PrintBOBindingResult.get()) {
             printBOBindingResult(osContext, vmHandleId, false, retVal);
         }
         if (!retVal) {
@@ -298,16 +301,16 @@ void BufferObject::printExecutionBuffer(ExecBuffer &execbuf, const size_t &resid
     logger << "Command ";
     ioctlHelper->logExecObject(execObjectsStorage[i], logger, this->peekSize());
 
-    printf("%s\n", logger.str().c_str());
+    PRINT_STRING(debugManager.flags.PrintExecutionBuffer.get(), stdout, "%s\n", logger.str().c_str());
 }
 
-int bindBOsWithinContext(BufferObject *const boToPin[], size_t numberOfBos, OsContext *osContext, uint32_t vmHandleId) {
+int bindBOsWithinContext(BufferObject *const boToPin[], size_t numberOfBos, OsContext *osContext, uint32_t vmHandleId, const bool forcePagingFence) {
     auto retVal = 0;
 
     for (auto drmIterator = 0u; drmIterator < osContext->getDeviceBitfield().size(); drmIterator++) {
         if (osContext->getDeviceBitfield().test(drmIterator)) {
             for (size_t i = 0; i < numberOfBos; i++) {
-                retVal |= boToPin[i]->bind(osContext, drmIterator);
+                retVal |= boToPin[i]->bind(osContext, drmIterator, forcePagingFence);
             }
         }
     }
@@ -319,7 +322,8 @@ int BufferObject::pin(BufferObject *const boToPin[], size_t numberOfBos, OsConte
     auto retVal = 0;
 
     if (this->drm->isVmBindAvailable()) {
-        retVal = bindBOsWithinContext(boToPin, numberOfBos, osContext, vmHandleId);
+        auto lock = static_cast<DrmMemoryOperationsHandler *>(this->drm->getRootDeviceEnvironment().memoryOperationsInterface.get())->lockHandlerIfUsed();
+        retVal = bindBOsWithinContext(boToPin, numberOfBos, osContext, vmHandleId, false);
     } else {
         StackVec<ExecObject, maxFragmentsCount + 1> execObject(numberOfBos + 1);
         retVal = this->exec(4u, 0u, 0u, false, osContext, vmHandleId, drmContextId, boToPin, numberOfBos, &execObject[0], 0, 0);
@@ -332,13 +336,24 @@ int BufferObject::validateHostPtr(BufferObject *const boToPin[], size_t numberOf
     auto retVal = 0;
 
     if (this->drm->isVmBindAvailable()) {
+        auto lock = static_cast<DrmMemoryOperationsHandler *>(this->drm->getRootDeviceEnvironment().memoryOperationsInterface.get())->lockHandlerIfUsed();
         for (size_t i = 0; i < numberOfBos; i++) {
-            retVal = boToPin[i]->bind(osContext, vmHandleId);
+            retVal = boToPin[i]->bind(osContext, vmHandleId, false);
             if (retVal) {
                 break;
             }
         }
     } else {
+        StackVec<std::unique_lock<NEO::CommandStreamReceiver::MutexType>, 1> locks{};
+        if (this->drm->getRootDeviceEnvironment().executionEnvironment.memoryManager.get()) {
+            const auto &engines = this->drm->getRootDeviceEnvironment().executionEnvironment.memoryManager->getRegisteredEngines(osContext->getRootDeviceIndex());
+            for (const auto &engine : engines) {
+                if (engine.osContext->isDirectSubmissionLightActive()) {
+                    locks.push_back(engine.commandStreamReceiver->obtainUniqueOwnership());
+                    engine.commandStreamReceiver->stopDirectSubmission(false, false);
+                }
+            }
+        }
         StackVec<ExecObject, maxFragmentsCount + 1> execObject(numberOfBos + 1);
         retVal = this->exec(4u, 0u, 0u, false, osContext, vmHandleId, drmContextId, boToPin, numberOfBos, &execObject[0], 0, 0);
     }
@@ -348,6 +363,12 @@ int BufferObject::validateHostPtr(BufferObject *const boToPin[], size_t numberOf
 
 void BufferObject::addBindExtHandle(uint32_t handle) {
     bindExtHandles.push_back(handle);
+}
+
+uint32_t BufferObject::waitOnAsyncPagingFence(OsContext *osContext, uint32_t vmHandleId) {
+    auto fenceAddress = castToUint64(getAsyncFenceAddr(osContext, vmHandleId));
+    auto fenceToWait = getAsyncFenceVal(osContext, vmHandleId);
+    return drm->waitUserFence(0u, fenceAddress, fenceToWait, Drm::ValueWidth::u64, -1, drm->getIoctlHelper()->getWaitUserFenceSoftFlag(), false, NEO::InterruptId::notUsed, nullptr);
 }
 
 } // namespace NEO

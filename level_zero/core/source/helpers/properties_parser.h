@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,31 +7,40 @@
 
 #pragma once
 
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/surface_format_info.h"
+#include "shared/source/memory_manager/external_memory_type.h"
 
+#include "level_zero/core/source/image/internal_core_image_ext.h"
+#include "level_zero/core/source/memory/internal_mem_alloc_ext.h"
+#include "level_zero/driver_experimental/zex_common.h"
+#include "level_zero/include/level_zero/ze_intel_gpu.h"
+#include "level_zero/include/level_zero/ze_stypes.h"
 #include <level_zero/ze_api.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace L0 {
 inline NEO::ImageType convertType(const ze_image_type_t type) {
     switch (type) {
     case ZE_IMAGE_TYPE_2D:
-        return NEO::ImageType::Image2D;
+        return NEO::ImageType::image2D;
     case ZE_IMAGE_TYPE_3D:
-        return NEO::ImageType::Image3D;
+        return NEO::ImageType::image3D;
     case ZE_IMAGE_TYPE_2DARRAY:
-        return NEO::ImageType::Image2DArray;
+        return NEO::ImageType::image2DArray;
     case ZE_IMAGE_TYPE_1D:
-        return NEO::ImageType::Image1D;
+        return NEO::ImageType::image1D;
     case ZE_IMAGE_TYPE_1DARRAY:
-        return NEO::ImageType::Image1DArray;
+        return NEO::ImageType::image1DArray;
     case ZE_IMAGE_TYPE_BUFFER:
-        return NEO::ImageType::Image1DBuffer;
+        return NEO::ImageType::image1DBuffer;
     default:
         break;
     }
-    return NEO::ImageType::Invalid;
+    return NEO::ImageType::invalid;
 }
 
 inline NEO::ImageDescriptor convertDescriptor(const ze_image_desc_t &imageDesc) {
@@ -49,20 +58,87 @@ inline NEO::ImageDescriptor convertDescriptor(const ze_image_desc_t &imageDesc) 
     return desc;
 }
 
+inline NEO::ExternalMemoryType toExternalMemoryType(ze_external_memory_type_flags_t flags) {
+    switch (flags) {
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD:
+        return NEO::ExternalMemoryType::opaqueFd;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF:
+        return NEO::ExternalMemoryType::dmaBuf;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32_KMT:
+        return NEO::ExternalMemoryType::opaqueWin32Kmt;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D11_TEXTURE:
+        return NEO::ExternalMemoryType::d3d11Texture;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D11_TEXTURE_KMT:
+        return NEO::ExternalMemoryType::d3d11TextureKmt;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_HEAP:
+        return NEO::ExternalMemoryType::d3d12Heap;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32:
+        return NEO::ExternalMemoryType::opaqueWin32;
+    case ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE:
+        return NEO::ExternalMemoryType::d3d12Resource;
+    default:
+        DEBUG_BREAK_IF(true);
+        return NEO::ExternalMemoryType::invalid;
+    }
+}
+
 struct StructuresLookupTable {
     struct ImageProperties {
         NEO::ImageDescriptor imageDescriptor;
+        NEO::AllocationType imageAllocationType;
         uint32_t planeIndex;
         bool isPlanarExtension;
+        void *pitchedPtr;
+        const ze_sampler_desc_t *samplerDesc;
+        size_t customRowPitch;
+        size_t customSlicePitch;
     } imageProperties;
 
     struct SharedHandleType {
-        void *ntHnadle;
+        void *ntHandle;
+        const void *ntHandleName;
         int fd;
         bool isSupportedHandle;
+        bool isOpaqueFDHandle;
         bool isDMABUFHandle;
         bool isNTHandle;
+        NEO::ExternalMemoryType externalMemoryType;
     } sharedHandleType;
+
+    struct ExternalMemmapSystem {
+        const void *systemMemory;
+        uint64_t size;
+    } externalMemmapSystem;
+
+    struct GlTextureExt {
+        void *pGmmResInfo;
+        uint64_t textureBufferOffset;
+        uint32_t glHWFormat;
+        uint32_t cubeFaceIndex;
+        bool isAuxEnabled;
+        bool present;
+
+        // Multisample / MCS sharing
+        uint32_t numberOfSamples;
+        void *mcsNtHandle;
+        void *pGmmResInfoMcs;
+        bool hasUnifiedMcsSurface;
+    } glTextureExt;
+
+    struct ImageTilingOverride {
+        bool present;
+        bool linearStorage;
+        NEO::ImageTilingMode forceTiling;
+        uint64_t rowPitch;
+    } imageTilingOverride;
+
+    struct D3DTextureExt {
+        uint32_t arrayIndex;
+        bool present;
+    } d3dTextureExt;
+
+    bool isDepthStencilFormat;
+    ze_depth_stencil_format_t depthStencilFormat;
 
     bool areImageProperties;
     bool exportMemory;
@@ -71,6 +147,13 @@ struct StructuresLookupTable {
     bool compressedHint;
     bool uncompressedHint;
     bool rayTracingMemory;
+    bool writeCombinedMemory;
+    bool bindlessImage;
+    bool sampledImage;
+    bool isExternalMemmapSystem;
+    bool isSrgb;
+    bool overrideAllocationType;
+    uint32_t ipcHandleTypeFlags = 0;
 };
 
 inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupTable, const void *desc) {
@@ -83,10 +166,16 @@ inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupT
         } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD) {
             lookupTable.isSharedHandle = true;
             const ze_external_memory_import_fd_t *linuxExternalMemoryImportDesc = reinterpret_cast<const ze_external_memory_import_fd_t *>(extendedDesc);
-            if (linuxExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF) {
+            if (linuxExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD) {
+                lookupTable.sharedHandleType.isSupportedHandle = true;
+                lookupTable.sharedHandleType.isOpaqueFDHandle = true;
+                lookupTable.sharedHandleType.fd = linuxExternalMemoryImportDesc->fd;
+                lookupTable.sharedHandleType.externalMemoryType = toExternalMemoryType(linuxExternalMemoryImportDesc->flags);
+            } else if (linuxExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF) {
                 lookupTable.sharedHandleType.isSupportedHandle = true;
                 lookupTable.sharedHandleType.isDMABUFHandle = true;
                 lookupTable.sharedHandleType.fd = linuxExternalMemoryImportDesc->fd;
+                lookupTable.sharedHandleType.externalMemoryType = toExternalMemoryType(linuxExternalMemoryImportDesc->flags);
             } else {
                 lookupTable.sharedHandleType.isSupportedHandle = false;
                 return ZE_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
@@ -94,10 +183,18 @@ inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupT
         } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32) {
             lookupTable.isSharedHandle = true;
             const ze_external_memory_import_win32_handle_t *windowsExternalMemoryImportDesc = reinterpret_cast<const ze_external_memory_import_win32_handle_t *>(extendedDesc);
-            if (windowsExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32) {
+            if ((windowsExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32) ||
+                (windowsExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_HEAP) ||
+                (windowsExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D12_RESOURCE) ||
+                (windowsExternalMemoryImportDesc->flags == ZE_EXTERNAL_MEMORY_TYPE_FLAG_D3D11_TEXTURE)) {
+                if ((windowsExternalMemoryImportDesc->handle == nullptr) == (windowsExternalMemoryImportDesc->name == nullptr)) {
+                    return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+                }
                 lookupTable.sharedHandleType.isSupportedHandle = true;
                 lookupTable.sharedHandleType.isNTHandle = true;
-                lookupTable.sharedHandleType.ntHnadle = windowsExternalMemoryImportDesc->handle;
+                lookupTable.sharedHandleType.ntHandle = windowsExternalMemoryImportDesc->handle;
+                lookupTable.sharedHandleType.ntHandleName = windowsExternalMemoryImportDesc->name;
+                lookupTable.sharedHandleType.externalMemoryType = toExternalMemoryType(windowsExternalMemoryImportDesc->flags);
             } else {
                 lookupTable.sharedHandleType.isSupportedHandle = false;
                 return ZE_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
@@ -112,6 +209,19 @@ inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupT
             lookupTable.areImageProperties = true;
             lookupTable.imageProperties.isPlanarExtension = true;
             lookupTable.imageProperties.planeIndex = imageViewDesc->planeIndex;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_BINDLESS_IMAGE_EXP_DESC) {
+            const ze_image_bindless_exp_desc_t *imageBindlessDesc =
+                reinterpret_cast<const ze_image_bindless_exp_desc_t *>(extendedDesc);
+            lookupTable.bindlessImage = imageBindlessDesc->flags & ZE_IMAGE_BINDLESS_EXP_FLAG_BINDLESS;
+            lookupTable.sampledImage = imageBindlessDesc->flags & ZE_IMAGE_BINDLESS_EXP_FLAG_SAMPLED_IMAGE;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_PITCHED_IMAGE_EXP_DESC) {
+            const ze_image_pitched_exp_desc_t *pitchedDesc = reinterpret_cast<const ze_image_pitched_exp_desc_t *>(extendedDesc);
+            lookupTable.areImageProperties = true;
+            lookupTable.imageProperties.pitchedPtr = pitchedDesc->ptr;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_SAMPLER_DESC) {
+            const ze_sampler_desc_t *samplerDesc = reinterpret_cast<const ze_sampler_desc_t *>(extendedDesc);
+            lookupTable.areImageProperties = true;
+            lookupTable.imageProperties.samplerDesc = samplerDesc;
         } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_RELAXED_ALLOCATION_LIMITS_EXP_DESC) {
             const ze_relaxed_allocation_limits_exp_desc_t *relaxedLimitsDesc =
                 reinterpret_cast<const ze_relaxed_allocation_limits_exp_desc_t *>(extendedDesc);
@@ -122,7 +232,9 @@ inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupT
         } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC) {
             const ze_external_memory_export_desc_t *externalMemoryExportDesc =
                 reinterpret_cast<const ze_external_memory_export_desc_t *>(extendedDesc);
-            if (externalMemoryExportDesc->flags & ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF || externalMemoryExportDesc->flags & ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32) {
+            if (externalMemoryExportDesc->flags & ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF ||
+                externalMemoryExportDesc->flags & ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD ||
+                externalMemoryExportDesc->flags & ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32) {
                 lookupTable.exportMemory = true;
             } else {
                 return ZE_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
@@ -139,6 +251,55 @@ inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupT
             }
         } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_RAYTRACING_MEM_ALLOC_EXT_DESC) {
             lookupTable.rayTracingMemory = true;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_WRITE_COMBINED_MEM_ALLOC_EXT_DESC) {
+            lookupTable.writeCombinedMemory = true;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMMAP_SYSMEM_EXT_DESC) {
+            auto sysMemDesc = reinterpret_cast<const ze_external_memmap_sysmem_ext_desc_t *>(extendedDesc);
+            lookupTable.externalMemmapSystem.systemMemory = sysMemDesc->pSystemMemory;
+            lookupTable.externalMemmapSystem.size = sysMemDesc->size;
+            lookupTable.isExternalMemmapSystem = true;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_IPC_MEM_HANDLE_TYPE_EXT_DESC) {
+            lookupTable.exportMemory = true;
+            auto ipcHandleTypeDesc = reinterpret_cast<const ze_ipc_mem_handle_type_ext_desc_t *>(extendedDesc);
+            lookupTable.ipcHandleTypeFlags = ipcHandleTypeDesc->typeFlags;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_CUSTOM_PITCH_EXP_DESC) {
+            const ze_custom_pitch_exp_desc_t *customPitchDesc = reinterpret_cast<const ze_custom_pitch_exp_desc_t *>(extendedDesc);
+            lookupTable.areImageProperties = true;
+            lookupTable.imageProperties.customRowPitch = customPitchDesc->rowPitch;
+            lookupTable.imageProperties.customSlicePitch = customPitchDesc->slicePitch;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_SRGB_EXT_DESC) {
+            const ze_srgb_ext_desc_t *srgbDesc = reinterpret_cast<const ze_srgb_ext_desc_t *>(extendedDesc);
+            lookupTable.isSrgb = srgbDesc->sRGB;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_IMAGE_ALLOCATION_TYPE_EXT_DESC) {
+            const ze_image_allocation_type_ext_desc_t *allocationTypeDesc = reinterpret_cast<const ze_image_allocation_type_ext_desc_t *>(extendedDesc);
+            lookupTable.imageProperties.imageAllocationType = allocationTypeDesc->allocationType;
+            lookupTable.overrideAllocationType = true;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_GL_TEXTURE_EXT_DESC) {
+            const ze_external_gl_texture_ext_desc_t *glDesc = reinterpret_cast<const ze_external_gl_texture_ext_desc_t *>(extendedDesc);
+            lookupTable.glTextureExt.pGmmResInfo = glDesc->pGmmResInfo;
+            lookupTable.glTextureExt.textureBufferOffset = glDesc->textureBufferOffset;
+            lookupTable.glTextureExt.glHWFormat = glDesc->glHWFormat;
+            lookupTable.glTextureExt.cubeFaceIndex = glDesc->cubeFaceIndex;
+            lookupTable.glTextureExt.isAuxEnabled = glDesc->isAuxEnabled;
+            lookupTable.glTextureExt.numberOfSamples = glDesc->numberOfSamples;
+            lookupTable.glTextureExt.mcsNtHandle = glDesc->mcsNtHandle;
+            lookupTable.glTextureExt.pGmmResInfoMcs = glDesc->pGmmResInfoMcs;
+            lookupTable.glTextureExt.hasUnifiedMcsSurface = glDesc->hasUnifiedMcsSurface;
+            lookupTable.glTextureExt.present = true;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_D3D_TEXTURE_EXT_DESC) {
+            const ze_external_d3d_texture_ext_desc_t *d3dDesc = reinterpret_cast<const ze_external_d3d_texture_ext_desc_t *>(extendedDesc);
+            lookupTable.d3dTextureExt.arrayIndex = d3dDesc->arrayIndex;
+            lookupTable.d3dTextureExt.present = true;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_DEPTH_STENCIL_FORMAT_EXT_DESC) {
+            const ze_depth_stencil_format_ext_desc_t *dsDesc = reinterpret_cast<const ze_depth_stencil_format_ext_desc_t *>(extendedDesc);
+            lookupTable.isDepthStencilFormat = true;
+            lookupTable.depthStencilFormat = dsDesc->format;
+        } else if (extendedDesc->stype == ZE_STRUCTURE_TYPE_IMAGE_TILING_EXT_DESC) {
+            const ze_image_tiling_ext_desc_t *tilingDesc = reinterpret_cast<const ze_image_tiling_ext_desc_t *>(extendedDesc);
+            lookupTable.imageTilingOverride.present = true;
+            lookupTable.imageTilingOverride.linearStorage = tilingDesc->linearStorage;
+            lookupTable.imageTilingOverride.forceTiling = tilingDesc->forceTiling;
+            lookupTable.imageTilingOverride.rowPitch = tilingDesc->rowPitch;
         } else {
             return ZE_RESULT_ERROR_UNSUPPORTED_ENUMERATION;
         }
@@ -151,5 +312,14 @@ inline ze_result_t prepareL0StructuresLookupTable(StructuresLookupTable &lookupT
     }
 
     return ZE_RESULT_SUCCESS;
+}
+
+inline std::optional<NEO::SynchronizedDispatchMode> getSyncDispatchMode(const ze_base_desc_t *desc) {
+    if (static_cast<uint32_t>(desc->stype) == ZE_STRUCTURE_TYPE_SYNCHRONIZED_DISPATCH_EXP_DESC) {
+        auto syncDispatch = reinterpret_cast<const ze_synchronized_dispatch_exp_desc_t *>(desc);
+        return (syncDispatch->flags == ZE_SYNCHRONIZED_DISPATCH_ENABLED_EXP_FLAG ? NEO::SynchronizedDispatchMode::full : NEO::SynchronizedDispatchMode::limited);
+    }
+
+    return std::nullopt;
 }
 } // namespace L0

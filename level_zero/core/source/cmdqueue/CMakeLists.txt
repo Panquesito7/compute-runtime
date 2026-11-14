@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -9,12 +9,25 @@ target_sources(${L0_STATIC_LIB_NAME}
                ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_cmdlist_execution_context.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_cmdlist_execution_context.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_cmdlist_execution_internal_options.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_helpers.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_helpers.h
                ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_hw.h
                ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_hw.inl
-               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_hw_skl_to_tgllp.inl
-               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_imp.h
-               ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_extended${BRANCH_DIR_SUFFIX}cmdqueue_extended.inl
+               ${CMAKE_CURRENT_SOURCE_DIR}/counters_cross_sync_definitions.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/immediate_completion_cross_sync_definitions.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/patch_preamble_cross_sync_definitions.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/patch_preamble_data_types.h
 )
+if(SUPPORT_GEN12LP)
+  target_sources(${L0_STATIC_LIB_NAME}
+                 PRIVATE
+                 ${CMAKE_CURRENT_SOURCE_DIR}/cmdqueue_hw_gen12lp.inl
+  )
+
+endif()
 if(SUPPORT_XEHP_AND_LATER)
   target_sources(${L0_STATIC_LIB_NAME}
                  PRIVATE

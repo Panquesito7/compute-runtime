@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,24 +7,19 @@
 
 #pragma once
 
-#include "shared/offline_compiler/source/decoder/binary_decoder.h"
-#include "shared/offline_compiler/source/decoder/binary_encoder.h"
-#include "shared/offline_compiler/source/offline_compiler.h"
-#include "shared/offline_compiler/source/utilities/get_current_dir.h"
-#include "shared/offline_compiler/source/utilities/safety_caller.h"
-#include "shared/source/os_interface/os_library.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
-#include <CL/cl.h>
-
-#include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
+
+class OclocArgHelper;
 
 namespace NEO {
 
-class MultiCommand {
+class MultiCommand : NEO::NonCopyableAndNonMovableClass {
   public:
-    MultiCommand &operator=(const MultiCommand &) = delete;
-    MultiCommand(const MultiCommand &) = delete;
     MOCKABLE_VIRTUAL ~MultiCommand() = default;
 
     static MultiCommand *create(const std::vector<std::string> &args, int &retVal, OclocArgHelper *helper);
@@ -51,4 +46,7 @@ class MultiCommand {
     std::stringstream outputFile;
     bool quiet = false;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<MultiCommand>);
+
 } // namespace NEO

@@ -1,9 +1,11 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "level_zero/tools/source/sysman/linux/pmt/pmt_xml_offsets.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysman_fixture.h"
@@ -102,6 +104,7 @@ TEST_F(SysmanMultiDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZe
 HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureThenValidTemperatureReadingsRetrieved, IsPVC) {
     auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_properties_t properties = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
         double temperature;
@@ -123,6 +126,7 @@ HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTe
 TEST_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureConfigThenUnsupportedIsReturned) {
     auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_config_t config = {};
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureGetConfig(handle, &config));
     }
@@ -131,6 +135,7 @@ TEST_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTempe
 TEST_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenSettingTemperatureConfigThenUnsupportedIsReturned) {
     auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_config_t config = {};
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureSetConfig(handle, &config));
     }
@@ -222,6 +227,20 @@ class SysmanDeviceTemperatureFixture : public SysmanDeviceFixture {
         return handles;
     }
 };
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidPowerHandleAndHandleCountZeroWhenCallingReInitThenValidCountIsReturnedAndVerifyzesDeviceEnumPowerHandleSucceeds, IsPVC) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumTemperatureSensors(device->toHandle(), &count, NULL));
+    EXPECT_EQ(count, handleComponentCountForSingleTileDevice);
+
+    pSysmanDeviceImp->pTempHandleContext->handleList.clear();
+
+    pLinuxSysmanImp->reInitSysmanDeviceResources();
+
+    count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumTemperatureSensors(device->toHandle(), &count, NULL));
+    EXPECT_EQ(count, handleComponentCountForSingleTileDevice);
+}
 
 HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingGPUAndGlobalTemperatureThenValidTemperatureReadingsRetrieved, IsDG1) {
     auto handles = getTempHandles(handleComponentCountForNoSubDevices);
@@ -359,7 +378,7 @@ TEST_F(SysmanDeviceTemperatureFixture, GivenCreatePmtObjectsWhenRootTileIndexEnu
     PlatformMonitoringTech::create(deviceHandles, pFsAccess.get(), gpuUpstreamPortPathInTemperature, mapOfSubDeviceIdToPmtObject1);
     for (auto &subDeviceIdToPmtEntry : mapOfSubDeviceIdToPmtObject1) {
         EXPECT_NE(subDeviceIdToPmtEntry.second, nullptr);
-        EXPECT_EQ(subDeviceIdToPmtEntry.first, 0u); // We know that subdeviceID is zero as core device didnt have any subdevices
+        EXPECT_EQ(subDeviceIdToPmtEntry.first, 0u); // We know that subdeviceID is zero as core device did not have any subdevices
         delete subDeviceIdToPmtEntry.second;        // delete memory to avoid mem leak here, as we finished our test validation just above.
     }
 
@@ -390,6 +409,7 @@ HWTEST2_F(SysmanDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZetS
 HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureThenValidTemperatureReadingsRetrieved, IsPVC) {
     auto handles = getTempHandles(handleComponentCountForSingleTileDevice);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_properties_t properties = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
         double temperature;

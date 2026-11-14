@@ -1,20 +1,21 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/helpers/device_bitfield.h"
 
+#include <cstdint>
 #include <string>
 
 namespace NEO {
 struct HardwareInfo;
 class CommandStreamReceiver;
 class ExecutionEnvironment;
+class ReleaseHelper;
 
 struct AUBCommandStreamReceiver {
     static CommandStreamReceiver *create(const std::string &filename,
@@ -22,9 +23,9 @@ struct AUBCommandStreamReceiver {
                                          ExecutionEnvironment &executionEnvironment,
                                          uint32_t rootDeviceIndex,
                                          const DeviceBitfield deviceBitfield);
-    static std::string createFullFilePath(const HardwareInfo &hwInfo, const std::string &filename, uint32_t rootDeviceIndex);
-
-    using AubFileStream = AubMemDump::AubFileStream;
+    static std::string createFullFilePath(const HardwareInfo &hwInfo, const ReleaseHelper &releaseHelper, const std::string &filename, uint32_t rootDeviceIndex);
+    static std::string getDirectoryPathForFilePath(const std::string &filePath);
+    static void createDirectoriesForFilePath(const std::string &filePath);
 };
 
 typedef CommandStreamReceiver *(*AubCommandStreamReceiverCreateFunc)(const std::string &fileName,

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,16 +7,24 @@
 
 #pragma once
 
-#include <string>
+#include <cstddef>
+#include <string_view>
 
 namespace NEO {
 
+// links itself into a static list, so the node, its name and its resource must live as long as the module
 struct RegisterEmbeddedResource {
     RegisterEmbeddedResource(const char *name, const char *resource, size_t resourceLength);
 
-    RegisterEmbeddedResource(const char *name, std::string &&resource)
-        : RegisterEmbeddedResource(name, resource.data(), resource.size() + 1) {
-    }
+    RegisterEmbeddedResource(const RegisterEmbeddedResource &) = delete;
+    RegisterEmbeddedResource &operator=(const RegisterEmbeddedResource &) = delete;
+
+    static const RegisterEmbeddedResource *find(std::string_view name);
+
+    std::string_view name;
+    const char *resource;
+    size_t resourceLength;
+    RegisterEmbeddedResource *next = nullptr;
 };
 
 } // namespace NEO

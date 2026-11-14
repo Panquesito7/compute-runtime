@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,39 +8,42 @@
 #include "shared/source/command_container/implicit_scaling.h"
 #include "shared/source/command_container/walker_partition_xehp_and_later.h"
 #include "shared/source/command_stream/aub_command_stream_receiver_hw.h"
-#include "shared/source/memory_manager/internal_allocation_storage.h"
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/mocks/mock_allocation_properties.h"
-#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/command_queue.h"
+#include "opencl/source/context/context.h"
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/test/unit_test/aub_tests/fixtures/multicontext_aub_fixture.h"
-#include "opencl/test/unit_test/fixtures/simple_arg_kernel_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_kernel_fixture.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/multicontext_ocl_aub_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
+
+#include "multitile_matchers.h"
 
 using namespace NEO;
 
-template <uint32_t numberOfTiles, MulticontextAubFixture::EnabledCommandStreamers enabledCommandStreamers>
-struct MultitileMulticontextTests : public MulticontextAubFixture, public ::testing::Test {
+template <uint32_t numberOfTiles, MulticontextOclAubFixture::EnabledCommandStreamers enabledCommandStreamers>
+struct MultitileMulticontextTests : public MulticontextOclAubFixture, public ::testing::Test {
     void SetUp() override {
-        MulticontextAubFixture::setUp(numberOfTiles, enabledCommandStreamers, false);
+        debugManager.flags.ExperimentalSmallBufferPoolAllocator.set(0);
+        MulticontextOclAubFixture::setUp(numberOfTiles, enabledCommandStreamers, false);
     }
     void TearDown() override {
-        MulticontextAubFixture::tearDown();
+        MulticontextOclAubFixture::tearDown();
     }
 
     template <typename FamilyType>
     void runAubTest() {
         cl_int retVal = CL_SUCCESS;
-        const uint32_t bufferSize = 64 * KB;
+        const uint32_t bufferSize = 64 * MemoryConstants::kiloByte;
         uint8_t writePattern[bufferSize];
         uint8_t initPattern[bufferSize];
         std::fill(writePattern, writePattern + sizeof(writePattern), 1);
@@ -55,7 +58,7 @@ struct MultitileMulticontextTests : public MulticontextAubFixture, public ::test
         tileOnlyBuffers.resize(tileDevices.size());
         for (uint32_t tile = 0; tile < tileDevices.size(); tile++) {
             for (uint32_t tileEngine = 0; tileEngine < commandQueues[tile].size(); tileEngine++) {
-                DebugManager.flags.DoCpuCopyOnWriteBuffer.set(true);
+                debugManager.flags.DoCpuCopyOnWriteBuffer.set(true);
                 auto memoryProperties = ClMemoryPropertiesHelper::createMemoryProperties(CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, 0, 0,
                                                                                          &context->getDevice(0)->getDevice());
                 auto regularBuffer = Buffer::create(
@@ -63,7 +66,7 @@ struct MultitileMulticontextTests : public MulticontextAubFixture, public ::test
                 auto tileOnlyProperties = ClMemoryPropertiesHelper::createMemoryProperties(
                     flags, 0, 0, context->getDevice(0)->getDevice().getNearestGenericSubDevice(tile));
                 auto tileOnlyBuffer = Buffer::create(context.get(), tileOnlyProperties, flags, 0, bufferSize, initPattern, retVal);
-                DebugManager.flags.DoCpuCopyOnWriteBuffer.set(false);
+                debugManager.flags.DoCpuCopyOnWriteBuffer.set(false);
                 regularBuffer->forceDisallowCPUCopy = true;
                 tileOnlyBuffer->forceDisallowCPUCopy = true;
                 regularBuffers[tile].push_back(std::unique_ptr<Buffer>(regularBuffer));
@@ -80,10 +83,10 @@ struct MultitileMulticontextTests : public MulticontextAubFixture, public ::test
             for (uint32_t tileEngine = 0; tileEngine < commandQueues[tile].size(); tileEngine++) {
                 getSimulatedCsr<FamilyType>(tile, tileEngine)->pollForCompletion();
 
-                auto regularBufferGpuAddress = static_cast<uintptr_t>(regularBuffers[tile][tileEngine]->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress());
-                auto tileOnlyBufferGpuAddress = static_cast<uintptr_t>(tileOnlyBuffers[tile][tileEngine]->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress());
-                expectMemory<FamilyType>(reinterpret_cast<void *>(regularBufferGpuAddress), writePattern, bufferSize, tile, tileEngine);
-                expectMemory<FamilyType>(reinterpret_cast<void *>(tileOnlyBufferGpuAddress), writePattern, bufferSize, tile, tileEngine);
+                auto regularBufferGpuAddress = ptrOffset(regularBuffers[tile][tileEngine]->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), regularBuffers[tile][tileEngine]->getOffset());
+                auto tileOnlyBufferGpuAddress = ptrOffset(tileOnlyBuffers[tile][tileEngine]->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), tileOnlyBuffers[tile][tileEngine]->getOffset());
+                expectMemory<FamilyType>(addrToPtr(regularBufferGpuAddress), writePattern, bufferSize, tile, tileEngine);
+                expectMemory<FamilyType>(addrToPtr(tileOnlyBufferGpuAddress), writePattern, bufferSize, tile, tileEngine);
             }
         }
     }
@@ -105,7 +108,7 @@ struct MultitileMulticontextTests : public MulticontextAubFixture, public ::test
         imageFormat.image_channel_order = CL_RGBA;
 
         cl_mem_flags flags = 0;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
 
         cl_image_desc imageDesc;
         imageDesc.image_type = CL_MEM_OBJECT_IMAGE2D;
@@ -208,26 +211,26 @@ struct MultitileMulticontextTests : public MulticontextAubFixture, public ::test
 };
 
 // 4 Tiles
-using FourTilesAllContextsTest = MultitileMulticontextTests<4, MulticontextAubFixture::EnabledCommandStreamers::All>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, FourTilesAllContextsTest, GENERATEONLY_givenFourTilesAndAllContextsWhenSubmittingThenDataIsValid) {
+using FourTilesAllContextsTest = MultitileMulticontextTests<4, MulticontextOclAubFixture::EnabledCommandStreamers::all>;
+HWTEST2_F(FourTilesAllContextsTest, GENERATEONLY_givenFourTilesAndAllContextsWhenSubmittingThenDataIsValid, IsPVC) {
     runAubTest<FamilyType>();
 }
 
-using FourTilesDualContextTest = MultitileMulticontextTests<4, MulticontextAubFixture::EnabledCommandStreamers::Dual>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, FourTilesDualContextTest, HEAVY_givenFourTilesAndDualContextWhenSubmittingThenDataIsValid) {
+using FourTilesDualContextTest = MultitileMulticontextTests<4, MulticontextOclAubFixture::EnabledCommandStreamers::dual>;
+HWTEST2_F(FourTilesDualContextTest, HEAVY_givenFourTilesAndDualContextWhenSubmittingThenDataIsValid, IsPVC) {
     runAubTest<FamilyType>();
 }
 
-using FourTilesSingleContextTest = MultitileMulticontextTests<4, MulticontextAubFixture::EnabledCommandStreamers::Single>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, FourTilesSingleContextTest, givenFourTilesAndSingleContextWhenSubmittingThenDataIsValid) {
+using FourTilesSingleContextTest = MultitileMulticontextTests<4, MulticontextOclAubFixture::EnabledCommandStreamers::single>;
+HWTEST2_F(FourTilesSingleContextTest, givenFourTilesAndSingleContextWhenSubmittingThenDataIsValid, SupportsMultiTile) {
     runAubTest<FamilyType>();
 }
 
 struct EnqueueWithWalkerPartitionFourTilesTests : public FourTilesSingleContextTest, SimpleKernelFixture {
     void SetUp() override {
-        DebugManager.flags.EnableWalkerPartition.set(1u);
+        debugManager.flags.EnableWalkerPartition.set(1u);
         kernelIds |= (1 << 5);
-        kernelIds |= (1 << 8);
+        kernelIds |= (1 << 3);
 
         FourTilesSingleContextTest::SetUp();
         SimpleKernelFixture::setUp(rootDevice, context.get());
@@ -253,7 +256,7 @@ struct EnqueueWithWalkerPartitionFourTilesTests : public FourTilesSingleContextT
     }
 
     void *getGpuAddress(Buffer &buffer) {
-        return reinterpret_cast<void *>(buffer.getGraphicsAllocation(this->rootDeviceIndex)->getGpuAddress());
+        return addrToPtr(ptrOffset(buffer.getGraphicsAllocation(this->rootDeviceIndex)->getGpuAddress(), buffer.getOffset()));
     }
 
     uint32_t bufferSize = 0;
@@ -265,13 +268,13 @@ struct EnqueueWithWalkerPartitionFourTilesTests : public FourTilesSingleContextT
 
 struct DynamicWalkerPartitionFourTilesTests : EnqueueWithWalkerPartitionFourTilesTests {
     void SetUp() override {
-        DebugManager.flags.EnableStaticPartitioning.set(0);
+        debugManager.flags.EnableStaticPartitioning.set(0);
         EnqueueWithWalkerPartitionFourTilesTests::SetUp();
     }
     DebugManagerStateRestore restore{};
 };
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, DynamicWalkerPartitionFourTilesTests, whenWalkerPartitionIsEnabledForKernelWithAtomicThenOutputDataIsValid) {
+HWTEST2_F(DynamicWalkerPartitionFourTilesTests, whenWalkerPartitionIsEnabledForKernelWithAtomicThenOutputDataIsValid, SupportsMultiTile) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     auto mockCommandQueue = new MockCommandQueueHw<FamilyType>(multiTileDefaultContext.get(), rootDevice, nullptr);
@@ -301,8 +304,8 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DynamicWalkerPartitionFourTilesTests, whenWalkerPar
             if (UnitTestHelper<FamilyType>::isAdditionalMiSemaphoreWait(*semaphoreCmd)) {
                 continue;
             }
-            EXPECT_EQ(4u, semaphoreCmd->getSemaphoreDataDword());
-            tileAtomicGpuAddress = semaphoreCmd->getSemaphoreGraphicsAddress();
+            EXPECT_EQ(4u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
+            tileAtomicGpuAddress = NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd);
             lastSemaphoreFound = true;
             break;
         }
@@ -330,7 +333,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DynamicWalkerPartitionFourTilesTests, whenWalkerPar
     expectMemory<FamilyType>(groupSpecificWorkCounts, &workgroupCounts[0], workgroupCounts.size() * sizeof(uint32_t), 0, 0);
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, DynamicWalkerPartitionFourTilesTests, whenWalkerPartitionIsEnabledForKernelWithoutAtomicThenOutputDataIsValid) {
+HWTEST2_F(DynamicWalkerPartitionFourTilesTests, whenWalkerPartitionIsEnabledForKernelWithoutAtomicThenOutputDataIsValid, SupportsMultiTile) {
 
     auto mockCommandQueue = new MockCommandQueueHw<FamilyType>(multiTileDefaultContext.get(), rootDevice, nullptr);
 
@@ -343,9 +346,9 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DynamicWalkerPartitionFourTilesTests, whenWalkerPar
     cl_uint kernelIncrementCounter = 1024;
     cl_int retVal = CL_SUCCESS;
 
-    kernels[8]->setArg(0, sizeof(cl_mem), &clBuffer);
-    kernels[8]->setArg(1, kernelIncrementCounter);
-    retVal = mockCommandQueue->enqueueKernel(kernels[8].get(), workingDimensions, globalWorkOffset, gwsSize, lwsSize, 0, nullptr, nullptr);
+    kernels[3]->setArg(0, sizeof(cl_mem), &clBuffer);
+    kernels[3]->setArg(1, kernelIncrementCounter);
+    retVal = mockCommandQueue->enqueueKernel(kernels[3].get(), workingDimensions, globalWorkOffset, gwsSize, lwsSize, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
     mockCommandQueue->flush();
 
@@ -358,8 +361,8 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, DynamicWalkerPartitionFourTilesTests, whenWalkerPar
 
 struct StaticWalkerPartitionFourTilesTests : EnqueueWithWalkerPartitionFourTilesTests {
     void SetUp() override {
-        DebugManager.flags.EnableStaticPartitioning.set(1);
-        DebugManager.flags.EnableBlitterOperationsSupport.set(1);
+        debugManager.flags.EnableStaticPartitioning.set(1);
+        debugManager.flags.EnableBlitterOperationsSupport.set(1);
         EnqueueWithWalkerPartitionFourTilesTests::SetUp();
     }
 
@@ -367,7 +370,7 @@ struct StaticWalkerPartitionFourTilesTests : EnqueueWithWalkerPartitionFourTiles
         const AllocationProperties commandStreamAllocationProperties{rootDevice->getRootDeviceIndex(),
                                                                      true,
                                                                      MemoryConstants::pageSize,
-                                                                     AllocationType::COMMAND_BUFFER,
+                                                                     AllocationType::commandBuffer,
                                                                      true,
                                                                      false,
                                                                      rootDevice->getDeviceBitfield()};
@@ -384,9 +387,9 @@ struct StaticWalkerPartitionFourTilesTests : EnqueueWithWalkerPartitionFourTiles
         dispatchFlags.guardCommandBufferWithPipeControl = true;
 
         rootCsr->flushTask(stream, 0,
-                           &rootCsr->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u),
-                           &rootCsr->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u),
-                           &rootCsr->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u),
+                           &rootCsr->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u),
+                           &rootCsr->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u),
+                           &rootCsr->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u),
                            0u, dispatchFlags, rootDevice->getDevice());
 
         rootCsr->flushBatchedSubmissions();
@@ -401,7 +404,7 @@ struct StaticWalkerPartitionFourTilesTests : EnqueueWithWalkerPartitionFourTiles
     DebugManagerStateRestore restore{};
 };
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, givenFourTilesWhenStaticWalkerPartitionIsEnabledForKernelThenOutputDataIsValid) {
+HWTEST2_F(StaticWalkerPartitionFourTilesTests, givenFourTilesWhenStaticWalkerPartitionIsEnabledForKernelThenOutputDataIsValid, SupportsMultiTile) {
 
     auto mockCommandQueue = new MockCommandQueueHw<FamilyType>(multiTileDefaultContext.get(), rootDevice, nullptr);
 
@@ -414,9 +417,9 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, givenFourTiles
     cl_uint kernelIncrementCounter = 1024;
     cl_int retVal = CL_SUCCESS;
 
-    kernels[8]->setArg(0, sizeof(cl_mem), &clBuffer);
-    kernels[8]->setArg(1, kernelIncrementCounter);
-    retVal = mockCommandQueue->enqueueKernel(kernels[8].get(), workingDimensions, globalWorkOffset, gwsSize, lwsSize, 0, nullptr, nullptr);
+    kernels[3]->setArg(0, sizeof(cl_mem), &clBuffer);
+    kernels[3]->setArg(1, kernelIncrementCounter);
+    retVal = mockCommandQueue->enqueueKernel(kernels[3].get(), workingDimensions, globalWorkOffset, gwsSize, lwsSize, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
     mockCommandQueue->flush();
 
@@ -427,17 +430,20 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, givenFourTiles
     expectMemoryOnRootCsr<FamilyType>(getGpuAddress(*buffer), &workgroupCounts[0], workgroupCounts.size() * sizeof(uint32_t));
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, givenPreWalkerSyncWhenStaticWalkerPartitionIsThenAtomicsAreIncrementedCorrectly) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+HWTEST2_F(StaticWalkerPartitionFourTilesTests, givenPreWalkerSyncWhenStaticWalkerPartitionIsThenAtomicsAreIncrementedCorrectly, SupportsMultiTile) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
 
     auto taskStream = createTaskStream();
     auto taskStreamCpu = taskStream->getSpace(0);
     auto taskStreamGpu = taskStream->getGraphicsAllocation()->getGpuAddress();
 
     uint32_t totalBytesProgrammed = 0u;
-    WALKER_TYPE walkerCmd = FamilyType::cmdInitGpgpuWalker;
-    walkerCmd.setPartitionType(WALKER_TYPE::PARTITION_TYPE::PARTITION_TYPE_X);
+    DefaultWalkerType walkerCmd = FamilyType::template getInitGpuWalker<DefaultWalkerType>();
+    walkerCmd.setPartitionType(DefaultWalkerType::PARTITION_TYPE::PARTITION_TYPE_X);
     walkerCmd.getInterfaceDescriptor().setNumberOfThreadsInGpgpuThreadGroup(1u);
+    if constexpr (FamilyType::template isHeaplessMode<DefaultWalkerType>()) {
+        walkerCmd.setMaximumNumberOfThreads(64);
+    }
 
     WalkerPartition::WalkerPartitionArgs testArgs = {};
     testArgs.initializeWparidRegister = true;
@@ -454,15 +460,16 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, givenPreWalker
 
     WalkerPartition::constructStaticallyPartitionedCommandBuffer<FamilyType>(
         taskStreamCpu,
+        nullptr,
         taskStreamGpu,
         &walkerCmd,
         totalBytesProgrammed,
         testArgs,
-        *defaultHwInfo);
+        this->rootDevice->getDevice());
     taskStream->getSpace(totalBytesProgrammed);
     flushTaskStream(*taskStream);
 
-    const auto controlSectionAddress = taskStreamGpu + WalkerPartition::computeStaticPartitioningControlSectionOffset<FamilyType>(testArgs);
+    const auto controlSectionAddress = taskStreamGpu + WalkerPartition::computeStaticPartitioningControlSectionOffset<FamilyType, DefaultWalkerType>(testArgs);
     const auto preWalkerSyncAddress = controlSectionAddress + offsetof(WalkerPartition::StaticPartitioningControlSection, synchronizeBeforeWalkerCounter);
     const auto postWalkerSyncAddress = controlSectionAddress + offsetof(WalkerPartition::StaticPartitioningControlSection, synchronizeAfterWalkerCounter);
     uint32_t expectedValue = 0x4;
@@ -472,17 +479,20 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, givenPreWalker
     destroyTaskStream(*taskStream);
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, whenNoPreWalkerSyncThenAtomicsAreIncrementedCorrectly) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+HWTEST2_F(StaticWalkerPartitionFourTilesTests, whenNoPreWalkerSyncThenAtomicsAreIncrementedCorrectly, SupportsMultiTile) {
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
 
     auto taskStream = createTaskStream();
     auto taskStreamCpu = taskStream->getSpace(0);
     auto taskStreamGpu = taskStream->getGraphicsAllocation()->getGpuAddress();
 
     uint32_t totalBytesProgrammed = 0u;
-    WALKER_TYPE walkerCmd = FamilyType::cmdInitGpgpuWalker;
-    walkerCmd.setPartitionType(WALKER_TYPE::PARTITION_TYPE::PARTITION_TYPE_X);
+    DefaultWalkerType walkerCmd = FamilyType::template getInitGpuWalker<DefaultWalkerType>();
+    walkerCmd.setPartitionType(DefaultWalkerType::PARTITION_TYPE::PARTITION_TYPE_X);
     walkerCmd.getInterfaceDescriptor().setNumberOfThreadsInGpgpuThreadGroup(1u);
+    if constexpr (FamilyType::template isHeaplessMode<DefaultWalkerType>()) {
+        walkerCmd.setMaximumNumberOfThreads(64);
+    }
 
     WalkerPartition::WalkerPartitionArgs testArgs = {};
     testArgs.initializeWparidRegister = true;
@@ -499,15 +509,16 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, whenNoPreWalke
 
     WalkerPartition::constructStaticallyPartitionedCommandBuffer<FamilyType>(
         taskStreamCpu,
+        nullptr,
         taskStreamGpu,
         &walkerCmd,
         totalBytesProgrammed,
         testArgs,
-        *defaultHwInfo);
+        this->rootDevice->getDevice());
     taskStream->getSpace(totalBytesProgrammed);
     flushTaskStream(*taskStream);
 
-    const auto controlSectionAddress = taskStreamGpu + WalkerPartition::computeStaticPartitioningControlSectionOffset<FamilyType>(testArgs);
+    const auto controlSectionAddress = taskStreamGpu + WalkerPartition::computeStaticPartitioningControlSectionOffset<FamilyType, DefaultWalkerType>(testArgs);
     const auto preWalkerSyncAddress = controlSectionAddress + offsetof(WalkerPartition::StaticPartitioningControlSection, synchronizeBeforeWalkerCounter);
     const auto postWalkerSyncAddress = controlSectionAddress + offsetof(WalkerPartition::StaticPartitioningControlSection, synchronizeAfterWalkerCounter);
     uint32_t expectedValue = 0x0;
@@ -519,101 +530,107 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, StaticWalkerPartitionFourTilesTests, whenNoPreWalke
 }
 
 // 2 Tiles
-using TwoTilesAllContextsTest = MultitileMulticontextTests<2, MulticontextAubFixture::EnabledCommandStreamers::All>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, TwoTilesAllContextsTest, HEAVY_givenTwoTilesAndAllContextsWhenSubmittingThenDataIsValid) {
+using TwoTilesAllContextsTest = MultitileMulticontextTests<2, MulticontextOclAubFixture::EnabledCommandStreamers::all>;
+HWTEST2_F(TwoTilesAllContextsTest, HEAVY_givenTwoTilesAndAllContextsWhenSubmittingThenDataIsValid, IsPVC) {
     runAubTest<FamilyType>();
 }
 
-using TwoTilesDualContextTest = MultitileMulticontextTests<2, MulticontextAubFixture::EnabledCommandStreamers::Dual>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, TwoTilesDualContextTest, givenTwoTilesAndDualContextWhenSubmittingThenDataIsValid) {
+using TwoTilesDualContextTest = MultitileMulticontextTests<2, MulticontextOclAubFixture::EnabledCommandStreamers::dual>;
+HWTEST2_F(TwoTilesDualContextTest, givenTwoTilesAndDualContextWhenSubmittingThenDataIsValid, IsPVC) {
     runAubTest<FamilyType>();
 }
 
-using TwoTilesSingleContextTest = MultitileMulticontextTests<2, MulticontextAubFixture::EnabledCommandStreamers::Single>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, TwoTilesSingleContextTest, givenTwoTilesAndSingleContextWhenSubmittingThenDataIsValid) {
+using TwoTilesSingleContextTest = MultitileMulticontextTests<2, MulticontextOclAubFixture::EnabledCommandStreamers::single>;
+HWTEST2_F(TwoTilesSingleContextTest, givenTwoTilesAndSingleContextWhenSubmittingThenDataIsValid, SupportsMultiTile) {
     runAubTest<FamilyType>();
 }
 
 // 1 Tile
-using SingleTileAllContextsTest = MultitileMulticontextTests<1, MulticontextAubFixture::EnabledCommandStreamers::All>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, SingleTileAllContextsTest, GENERATEONLY_givenSingleTileAndAllContextsWhenSubmittingThenDataIsValid) {
+using SingleTileAllContextsTest = MultitileMulticontextTests<1, MulticontextOclAubFixture::EnabledCommandStreamers::all>;
+HWTEST2_F(SingleTileAllContextsTest, GENERATEONLY_givenSingleTileAndAllContextsWhenSubmittingThenDataIsValid, IsPVC) {
     runAubTest<FamilyType>();
 }
 
-using SingleTileDualContextTest = MultitileMulticontextTests<1, MulticontextAubFixture::EnabledCommandStreamers::Dual>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, SingleTileDualContextTest, givenSingleTileAndDualContextWhenSubmittingThenDataIsValid) {
+using SingleTileDualContextTest = MultitileMulticontextTests<1, MulticontextOclAubFixture::EnabledCommandStreamers::dual>;
+HWTEST2_F(SingleTileDualContextTest, givenSingleTileAndDualContextWhenSubmittingThenDataIsValid, IsPVC) {
     runAubTest<FamilyType>();
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, SingleTileDualContextTest, givenSingleAllocationWhenUpdatedFromDifferentContextThenDataIsValid) {
+HWTEST2_F(SingleTileDualContextTest, givenSingleAllocationWhenUpdatedFromDifferentContextThenDataIsValid, IsPVC) {
     cl_int retVal = CL_SUCCESS;
     const uint32_t bufferSize = 256;
     const uint32_t halfBufferSize = bufferSize / 2;
-    uint8_t writePattern1[halfBufferSize];
-    uint8_t writePattern2[halfBufferSize];
     uint8_t initPattern[bufferSize];
     std::fill(initPattern, initPattern + sizeof(initPattern), 0);
-    std::fill(writePattern1, writePattern1 + sizeof(writePattern1), 1);
-    std::fill(writePattern2, writePattern2 + sizeof(writePattern2), 2);
-
     std::unique_ptr<Buffer> buffer(Buffer::create(context.get(), CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, bufferSize, initPattern, retVal));
     buffer->forceDisallowCPUCopy = true;
 
+    auto svmManager = context->getSVMAllocsManager();
+    NEO::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, context->rootDeviceIndices, context->deviceBitfields);
+    auto writePattern1 = static_cast<uint8_t *>(svmManager->createUnifiedMemoryAllocation(halfBufferSize, unifiedMemoryProperties));
+    auto writePattern2 = static_cast<uint8_t *>(svmManager->createUnifiedMemoryAllocation(halfBufferSize, unifiedMemoryProperties));
+
+    std::fill(writePattern1, writePattern1 + halfBufferSize, 1);
+    std::fill(writePattern2, writePattern2 + halfBufferSize, 2);
+
     auto simulatedCsr0 = getSimulatedCsr<FamilyType>(0, 0);
-    simulatedCsr0->overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    simulatedCsr0->overrideDispatchPolicy(DispatchMode::batchedDispatch);
     auto simulatedCsr1 = getSimulatedCsr<FamilyType>(0, 1);
-    simulatedCsr1->overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    simulatedCsr1->overrideDispatchPolicy(DispatchMode::batchedDispatch);
 
     commandQueues[0][0]->enqueueWriteBuffer(buffer.get(), CL_FALSE, 0, halfBufferSize, writePattern1, nullptr, 0, nullptr, nullptr);
     commandQueues[0][1]->enqueueWriteBuffer(buffer.get(), CL_FALSE, halfBufferSize, halfBufferSize, writePattern2, nullptr, 0, nullptr, nullptr);
 
-    commandQueues[0][1]->finish(); // submit second enqueue first to make sure that residency flow is correct
-    commandQueues[0][0]->finish();
+    commandQueues[0][1]->finish(false); // submit second enqueue first to make sure that residency flow is correct
+    commandQueues[0][0]->finish(false);
 
     auto gpuPtr = reinterpret_cast<void *>(buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress() + buffer->getOffset());
     expectMemory<FamilyType>(gpuPtr, writePattern1, halfBufferSize, 0, 0);
     expectMemory<FamilyType>(ptrOffset(gpuPtr, halfBufferSize), writePattern2, halfBufferSize, 0, 1);
+
+    svmManager->freeSVMAlloc(writePattern1);
+    svmManager->freeSVMAlloc(writePattern2);
 }
 
 // 1 Tile
-using SingleTileDualContextTest = MultitileMulticontextTests<1, MulticontextAubFixture::EnabledCommandStreamers::Dual>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, SingleTileDualContextTest, givenSingleTileAndDualContextWhenWritingImageThenDataIsValid) {
+using SingleTileDualContextTest = MultitileMulticontextTests<1, MulticontextOclAubFixture::EnabledCommandStreamers::dual>;
+HWTEST2_F(SingleTileDualContextTest, givenSingleTileAndDualContextWhenWritingImageThenDataIsValid, IsPVC) {
     runAubWriteImageTest<FamilyType>();
 }
 
-using SingleTileAllContextsTest = MultitileMulticontextTests<1, MulticontextAubFixture::EnabledCommandStreamers::All>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, SingleTileAllContextsTest, HEAVY_givenSingleTileAndAllContextsWhenWritingImageThenDataIsValid) {
+using SingleTileAllContextsTest = MultitileMulticontextTests<1, MulticontextOclAubFixture::EnabledCommandStreamers::all>;
+HWTEST2_F(SingleTileAllContextsTest, HEAVY_givenSingleTileAndAllContextsWhenWritingImageThenDataIsValid, IsPVC) {
     runAubWriteImageTest<FamilyType>();
 }
 
 // 2 Tiles
-using TwoTilesSingleContextTest = MultitileMulticontextTests<2, MulticontextAubFixture::EnabledCommandStreamers::Single>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, TwoTilesSingleContextTest, givenTwoTilesAndSingleContextWhenWritingImageThenDataIsValid) {
+using TwoTilesSingleContextTest = MultitileMulticontextTests<2, MulticontextOclAubFixture::EnabledCommandStreamers::single>;
+HWTEST2_F(TwoTilesSingleContextTest, givenTwoTilesAndSingleContextWhenWritingImageThenDataIsValid, SupportsMultiTile) {
     runAubWriteImageTest<FamilyType>();
 }
 
-using TwoTilesDualContextTest = MultitileMulticontextTests<2, MulticontextAubFixture::EnabledCommandStreamers::Dual>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, TwoTilesDualContextTest, givenTwoTilesAndDualContextWhenWritingImageThenDataIsValid) {
+using TwoTilesDualContextTest = MultitileMulticontextTests<2, MulticontextOclAubFixture::EnabledCommandStreamers::dual>;
+HWTEST2_F(TwoTilesDualContextTest, givenTwoTilesAndDualContextWhenWritingImageThenDataIsValid, IsPVC) {
     runAubWriteImageTest<FamilyType>();
 }
 
-using TwoTilesAllContextsTest = MultitileMulticontextTests<2, MulticontextAubFixture::EnabledCommandStreamers::All>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, TwoTilesAllContextsTest, GENERATEONLY_givenTwoTilesAndAllContextsWhenWritingImageThenDataIsValid) {
+using TwoTilesAllContextsTest = MultitileMulticontextTests<2, MulticontextOclAubFixture::EnabledCommandStreamers::all>;
+HWTEST2_F(TwoTilesAllContextsTest, GENERATEONLY_givenTwoTilesAndAllContextsWhenWritingImageThenDataIsValid, IsPVC) {
     runAubWriteImageTest<FamilyType>();
 }
 
 // 4 Tiles
-using FourTilesSingleContextTest = MultitileMulticontextTests<4, MulticontextAubFixture::EnabledCommandStreamers::Single>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, FourTilesSingleContextTest, givenFourTilesAndSingleContextWhenWritingImageThenDataIsValid) {
+using FourTilesSingleContextTest = MultitileMulticontextTests<4, MulticontextOclAubFixture::EnabledCommandStreamers::single>;
+HWTEST2_F(FourTilesSingleContextTest, givenFourTilesAndSingleContextWhenWritingImageThenDataIsValid, SupportsMultiTile) {
     runAubWriteImageTest<FamilyType>();
 }
 
-using FourTilesDualContextTest = MultitileMulticontextTests<4, MulticontextAubFixture::EnabledCommandStreamers::Dual>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, FourTilesDualContextTest, GENERATEONLY_givenFourTilesAndDualContextWhenWritingImageThenDataIsValid) {
+using FourTilesDualContextTest = MultitileMulticontextTests<4, MulticontextOclAubFixture::EnabledCommandStreamers::dual>;
+HWTEST2_F(FourTilesDualContextTest, GENERATEONLY_givenFourTilesAndDualContextWhenWritingImageThenDataIsValid, IsPVC) {
     runAubWriteImageTest<FamilyType>();
 }
 
-using FourTilesAllContextsTest = MultitileMulticontextTests<4, MulticontextAubFixture::EnabledCommandStreamers::All>;
-HWCMDTEST_F(IGFX_XE_HP_CORE, FourTilesAllContextsTest, GENERATEONLY_givenFourTilesAndAllContextsWhenWritingImageThenDataIsValid) {
+using FourTilesAllContextsTest = MultitileMulticontextTests<4, MulticontextOclAubFixture::EnabledCommandStreamers::all>;
+HWTEST2_F(FourTilesAllContextsTest, GENERATEONLY_givenFourTilesAndAllContextsWhenWritingImageThenDataIsValid, IsPVC) {
     runAubWriteImageTest<FamilyType>();
 }

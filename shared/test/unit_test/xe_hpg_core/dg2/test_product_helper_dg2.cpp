@@ -1,18 +1,23 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/local_memory_access_modes.h"
+#include "shared/source/helpers/topology.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/xe_hpg_core/hw_cmds_dg2.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
-#include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/os_interface/product_helper_tests.h"
 
+#include "gtest/gtest.h"
+namespace NEO {
+extern ApiSpecificConfig::ApiType apiTypeForUlts;
+}
 using namespace NEO;
 
 using Dg2ProductHelper = ProductHelperTest;
@@ -47,63 +52,134 @@ DG2TEST_F(Dg2ProductHelper, givenDG2WithBSteppingThenMaxThreadsForWorkgroupWAIsN
 DG2TEST_F(Dg2ProductHelper, givenSteppingWhenAskingForLocalMemoryAccessModeThenDisallowOnA0) {
     pInHwInfo.platform.usDeviceID = dg2G10DeviceIds[0];
     pInHwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(REVISION_A0, pInHwInfo);
-    EXPECT_EQ(LocalMemoryAccessMode::CpuAccessDisallowed, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::cpuAccessDisallowed, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 
     pInHwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(REVISION_B, pInHwInfo);
-    EXPECT_EQ(LocalMemoryAccessMode::Default, productHelper->getLocalMemoryAccessMode(pInHwInfo));
-}
-
-DG2TEST_F(Dg2ProductHelper, givenDG2ProductHelperWhenCheckDirectSubmissionSupportedThenTrueIsReturned) {
-    EXPECT_TRUE(productHelper->isDirectSubmissionSupported(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::defaultMode, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 }
 
 DG2TEST_F(Dg2ProductHelper, givenProductHelperWhenGetCommandsStreamPropertiesSupportThenExpectCorrectValues) {
 
     EXPECT_FALSE(productHelper->getScmPropertyThreadArbitrationPolicySupport());
-    EXPECT_TRUE(productHelper->getScmPropertyCoherencyRequiredSupport());
     EXPECT_TRUE(productHelper->getScmPropertyZPassAsyncComputeThreadLimitSupport());
     EXPECT_TRUE(productHelper->getScmPropertyPixelAsyncComputeThreadLimitSupport());
     EXPECT_TRUE(productHelper->getScmPropertyLargeGrfModeSupport());
-    EXPECT_FALSE(productHelper->getScmPropertyDevicePreemptionModeSupport());
 
-    EXPECT_FALSE(productHelper->getStateBaseAddressPropertyGlobalAtomicsSupport());
     EXPECT_TRUE(productHelper->getStateBaseAddressPropertyBindingTablePoolBaseAddressSupport());
-
-    EXPECT_TRUE(productHelper->getFrontEndPropertyScratchSizeSupport());
-    EXPECT_TRUE(productHelper->getFrontEndPropertyPrivateScratchSizeSupport());
-
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyPreemptionModeSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyStateSipSupport());
-    EXPECT_FALSE(productHelper->getPreemptionDbgPropertyCsrSurfaceSupport());
 
     EXPECT_FALSE(productHelper->getFrontEndPropertyComputeDispatchAllWalkerSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertyDisableEuFusionSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertyDisableOverDispatchSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertySingleSliceDispatchCcsModeSupport());
 
-    EXPECT_FALSE(productHelper->getPipelineSelectPropertyMediaSamplerDopClockGateSupport());
     EXPECT_TRUE(productHelper->getPipelineSelectPropertySystolicModeSupport());
 }
 
 DG2TEST_F(Dg2ProductHelper, givenDG2WhenGettingLocalMemoryAccessModeThenCorrectValueIsReturned) {
 
-    pInHwInfo.platform.usRevId = REV_ID_A0;
+    pInHwInfo.platform.usRevId = revIdA0;
     pInHwInfo.platform.usDeviceID = dg2G10DeviceIds[0];
-    EXPECT_EQ(LocalMemoryAccessMode::CpuAccessDisallowed, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::cpuAccessDisallowed, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 
     pInHwInfo.platform.usDeviceID = dg2G11DeviceIds[0];
-    EXPECT_EQ(LocalMemoryAccessMode::Default, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::defaultMode, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 
     pInHwInfo.platform.usDeviceID = dg2G12DeviceIds[0];
-    EXPECT_EQ(LocalMemoryAccessMode::Default, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::defaultMode, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 
-    pInHwInfo.platform.usRevId = REV_ID_B0;
+    pInHwInfo.platform.usRevId = revIdB0;
     pInHwInfo.platform.usDeviceID = dg2G10DeviceIds[0];
-    EXPECT_EQ(LocalMemoryAccessMode::Default, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::defaultMode, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 
     pInHwInfo.platform.usDeviceID = dg2G11DeviceIds[0];
-    EXPECT_EQ(LocalMemoryAccessMode::Default, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::defaultMode, productHelper->getLocalMemoryAccessMode(pInHwInfo));
 
     pInHwInfo.platform.usDeviceID = dg2G12DeviceIds[0];
-    EXPECT_EQ(LocalMemoryAccessMode::Default, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+    EXPECT_EQ(LocalMemoryAccessMode::defaultMode, productHelper->getLocalMemoryAccessMode(pInHwInfo));
+}
+
+DG2TEST_F(Dg2ProductHelper, whenConfiguringHardwareInfoThenWa15010089951IsSet) {
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.workaroundTable = {};
+    productHelper->configureHardwareCustom(&hwInfo, nullptr);
+    EXPECT_TRUE(hwInfo.workaroundTable.flags.wa_15010089951);
+}
+
+DG2TEST_F(Dg2ProductHelper, givenProductHelperThenCompressionIsNotForbidden) {
+    auto hwInfo = *defaultHwInfo;
+    EXPECT_FALSE(productHelper->isCompressionForbidden(hwInfo));
+}
+
+DG2TEST_F(Dg2ProductHelper, givenProductHelperWhenCheckingIsUsmAllocationReuseSupportedThenCorrectValueIsReturned) {
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_TRUE(productHelper->isHostUsmAllocationReuseSupported());
+        EXPECT_FALSE(productHelper->isDeviceUsmAllocationReuseSupported());
+    }
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        EXPECT_FALSE(productHelper->isHostUsmAllocationReuseSupported());
+        EXPECT_FALSE(productHelper->isDeviceUsmAllocationReuseSupported());
+    }
+}
+
+DG2TEST_F(Dg2ProductHelper, givenDssComputeBitmapNotStartingWithOnesWhenGetTopologyInfoMultiTileThenCorrectValuesAreReturned) {
+    uint8_t dssCompute[]{0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t dssGeometry[]{0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t l3Banks[]{0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00};
+    uint8_t eu[]{0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    TopologyBitmap topologyBitmap = {
+        .dssGeometry = dssGeometry,
+        .dssCompute = dssCompute,
+        .l3Banks = l3Banks,
+        .eu = eu,
+    };
+
+    TopologyLimits topologyLimits = {
+        .maxRegions = 1,
+        .maxSlices = 4,
+        .maxSubSlicesPerSlice = 4,
+        .maxEusPerSubSlice = 16,
+    };
+
+    TopologyMapping topologyMapping{};
+
+    auto topologyInfo = getTopologyInfo(pInHwInfo, topologyBitmap, topologyLimits, topologyMapping, productHelper->scanFullTopologyBitmap());
+
+    EXPECT_EQ(topologyInfo.sliceCount, 4);
+    EXPECT_EQ(topologyInfo.subSliceCount, 16);
+    EXPECT_EQ(topologyInfo.euCount, 256);
+    EXPECT_EQ(topologyInfo.l3BankCount, 16);
+}
+
+DG2TEST_F(Dg2ProductHelper, givenBitmapDssComputeEmptyAndDssGeometryNotStartingWithOnesWhenGetTopologyInfoMultiTileThenCorrectValuesAreReturned) {
+    uint8_t dssCompute[]{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t dssGeometry[]{0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t l3Banks[]{0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00};
+    uint8_t eu[]{0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    TopologyBitmap topologyBitmap = {
+        .dssGeometry = dssGeometry,
+        .dssCompute = dssCompute,
+        .l3Banks = l3Banks,
+        .eu = eu,
+    };
+
+    TopologyLimits topologyLimits = {
+        .maxRegions = 1,
+        .maxSlices = 4,
+        .maxSubSlicesPerSlice = 4,
+        .maxEusPerSubSlice = 16,
+    };
+
+    TopologyMapping topologyMapping{};
+
+    auto topologyInfo = getTopologyInfo(pInHwInfo, topologyBitmap, topologyLimits, topologyMapping, productHelper->scanFullTopologyBitmap());
+
+    EXPECT_EQ(topologyInfo.regionCount, 1);
+    EXPECT_EQ(topologyInfo.sliceCount, 4);
+    EXPECT_EQ(topologyInfo.subSliceCount, 16);
+    EXPECT_EQ(topologyInfo.euCount, 256);
+    EXPECT_EQ(topologyInfo.l3BankCount, 16);
 }

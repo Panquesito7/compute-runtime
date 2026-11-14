@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,47 +9,49 @@
 
 #include "shared/source/helpers/debug_helpers.h"
 
-#include <algorithm>
+#include <concepts>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-template <size_t OnStackCapacity>
+template <size_t onStackCapacity>
 struct StackVecSize {
     static constexpr size_t max32 = std::numeric_limits<uint32_t>::max();
     static constexpr size_t max16 = std::numeric_limits<uint16_t>::max();
     static constexpr size_t max8 = std::numeric_limits<uint8_t>::max();
 
-    using SizeT = std::conditional_t<(OnStackCapacity < max8), uint8_t,
-                                     std::conditional_t<(OnStackCapacity < max16), uint16_t,
-                                                        std::conditional_t<(OnStackCapacity < max32), uint32_t, size_t>>>;
+    using SizeT = std::conditional_t<(onStackCapacity < max8), uint8_t,
+                                     std::conditional_t<(onStackCapacity < max16), uint16_t,
+                                                        std::conditional_t<(onStackCapacity < max32), uint32_t, size_t>>>;
 };
 
-template <typename DataType, size_t OnStackCapacity,
-          typename StackSizeT = typename StackVecSize<OnStackCapacity>::SizeT>
+template <typename DataType, size_t onStackCapacity,
+          typename StackSizeT = typename StackVecSize<onStackCapacity>::SizeT>
 class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
   public:
-    using value_type = DataType;
+    using value_type = DataType; // NOLINT(readability-identifier-naming)
     using SizeT = StackSizeT;
-    using iterator = DataType *;
-    using const_iterator = const DataType *;
-    using reverse_iterator = std::reverse_iterator<iterator>;
-    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+    using iterator = DataType *;                                          // NOLINT(readability-identifier-naming)
+    using const_iterator = const DataType *;                              // NOLINT(readability-identifier-naming)
+    using reverse_iterator = std::reverse_iterator<iterator>;             // NOLINT(readability-identifier-naming)
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>; // NOLINT(readability-identifier-naming)
 
-    static constexpr SizeT onStackCaps = OnStackCapacity;
+    static constexpr SizeT onStackCaps = onStackCapacity;
 
     StackVec() {
-        onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
+        switchToStackMem();
     }
 
     template <typename ItType>
     StackVec(ItType beginIt, ItType endIt) {
-        onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
+        switchToStackMem();
         size_t count = (endIt - beginIt);
-        if (count > OnStackCapacity) {
+        if (count > onStackCapacity) {
             dynamicMem = new std::vector<DataType>(beginIt, endIt);
-            setUsesDynamicMem();
             return;
         }
 
@@ -61,10 +63,9 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
     }
 
     StackVec(const StackVec &rhs) {
-        onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
+        switchToStackMem();
         if (onStackCaps < rhs.size()) {
             dynamicMem = new std::vector<DataType>(rhs.begin(), rhs.end());
-            setUsesDynamicMem();
             return;
         }
 
@@ -75,12 +76,12 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
 
     explicit StackVec(size_t initialSize)
         : StackVec() {
-        onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
+        switchToStackMem();
         resize(initialSize);
     }
 
     StackVec(std::initializer_list<DataType> init) {
-        onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
+        switchToStackMem();
         reserve(init.size());
         for (const auto &obj : init) {
             push_back(obj);
@@ -100,7 +101,6 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
 
         if (onStackCaps < rhs.size()) {
             this->dynamicMem = new std::vector<DataType>(rhs.begin(), rhs.end());
-            setUsesDynamicMem();
             return *this;
         }
 
@@ -111,12 +111,11 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
         return *this;
     }
 
-    StackVec(StackVec &&rhs) {
+    StackVec(StackVec &&rhs) noexcept {
         onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
         if (rhs.usesDynamicMem()) {
             this->dynamicMem = rhs.dynamicMem;
-            setUsesDynamicMem();
-            rhs.onStackSize = 0U;
+            rhs.switchToStackMem();
             return;
         }
 
@@ -126,7 +125,7 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
         rhs.clear();
     }
 
-    StackVec &operator=(StackVec &&rhs) {
+    StackVec &operator=(StackVec &&rhs) noexcept {
         if (this == &rhs) {
             return *this;
         }
@@ -138,8 +137,7 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
                 delete this->dynamicMem;
             }
             this->dynamicMem = rhs.dynamicMem;
-            this->setUsesDynamicMem();
-            rhs.onStackSize = 0U;
+            rhs.switchToStackMem();
             return *this;
         }
 
@@ -154,6 +152,16 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
         rhs.clear();
 
         return *this;
+    }
+
+    template <typename T>
+    constexpr iterator insert(const_iterator pos, T &&value) {
+        auto offset = pos - begin();
+        push_back(std::forward<T>(value));
+        for (auto it = end() - 1; it != begin() + offset; --it) {
+            std::swap(*it, *(it - 1));
+        }
+        return begin() + offset;
     }
 
     template <typename RhsT>
@@ -205,7 +213,7 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
         if (usesDynamicMem()) {
             return dynamicMem->capacity();
         }
-        return OnStackCapacity;
+        return onStackCapacity;
     }
 
     void reserve(size_t newCapacity) {
@@ -247,22 +255,6 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
         ++onStackSize;
     }
 
-    void sort() {
-        std::sort(this->begin(), this->end());
-    }
-
-    void remove_duplicates() { // NOLINT(readability-identifier-naming)
-        if (1 >= this->size()) {
-            return;
-        }
-        this->sort();
-        const auto last = std::unique(this->begin(), this->end());
-        auto currentEnd = this->end();
-        while (last != currentEnd--) {
-            this->pop_back();
-        }
-    }
-
     void pop_back() { // NOLINT(readability-identifier-naming)
         if (usesDynamicMem()) {
             dynamicMem->pop_back();
@@ -273,6 +265,20 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
 
         clearStackObjects(onStackSize - 1, 1U);
         --onStackSize;
+    }
+
+    DataType &back() {
+        if (usesDynamicMem()) {
+            return dynamicMem->back();
+        }
+        return *(reinterpret_cast<DataType *>(onStackMemRawBytes) + onStackSize - 1);
+    }
+
+    const DataType &back() const {
+        if (usesDynamicMem()) {
+            return dynamicMem->back();
+        }
+        return *(reinterpret_cast<const DataType *>(onStackMemRawBytes) + onStackSize - 1);
     }
 
     DataType &operator[](std::size_t idx) {
@@ -342,32 +348,40 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
     }
 
     void resize(size_t newSize) {
-        this->resizeImpl(newSize, nullptr);
+        this->resizeImpl(newSize);
     }
 
     void resize(size_t newSize, const DataType &value) {
-        resizeImpl(newSize, &value);
+        resizeImpl(newSize, value);
     }
 
     bool usesDynamicMem() const {
-        return std::numeric_limits<decltype(onStackSize)>::max() == this->onStackSize;
+        return reinterpret_cast<uintptr_t>(this->onStackMem) != reinterpret_cast<uintptr_t>(onStackMemRawBytes) && this->dynamicMem;
     }
 
-    auto data() {
+    DataType *data() {
         if (usesDynamicMem()) {
             return dynamicMem->data();
         }
         return reinterpret_cast<DataType *>(onStackMemRawBytes);
     }
 
-  private:
-    template <typename RhsDataType, size_t RhsOnStackCapacity, typename RhsStackSizeT>
-    friend class StackVec;
-    void setUsesDynamicMem() {
-        this->onStackSize = std::numeric_limits<decltype(onStackSize)>::max();
+    const DataType *data() const {
+        if (usesDynamicMem()) {
+            return dynamicMem->data();
+        }
+        return reinterpret_cast<const DataType *>(onStackMemRawBytes);
     }
 
-    void resizeImpl(size_t newSize, const DataType *value) {
+  private:
+    template <typename RhsDataType, size_t rhsOnStackCapacity, typename RhsStackSizeT>
+    friend class StackVec;
+
+    template <typename... OptValueT>
+    void resizeImpl(size_t newSize, OptValueT &&...optValue) {
+        constexpr bool nonDefaultInitializer = sizeof...(OptValueT) > 0;
+        static_assert(!nonDefaultInitializer || std::is_copy_constructible<DataType>(), "Stackvec cannot resize with value if DataType is not copy-constructible!");
+
         // new size does not fit into internal mem
         if (newSize > onStackCaps) {
             ensureDynamicMem();
@@ -375,34 +389,29 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
 
         // memory already backed by stl vector
         if (usesDynamicMem()) {
-            if (value != nullptr) {
-                dynamicMem->resize(newSize, *value);
+            if constexpr (nonDefaultInitializer) {
+                dynamicMem->resize(newSize, std::forward<OptValueT>(optValue)...);
             } else {
                 dynamicMem->resize(newSize);
             }
             return;
         }
 
-        if (newSize <= onStackSize) {
+        auto currentSize = onStackSize;
+        if (newSize <= currentSize) {
             // trim elements
-            clearStackObjects(newSize, onStackSize - newSize);
+            clearStackObjects(newSize, currentSize - newSize);
             onStackSize = static_cast<SizeT>(newSize);
             return;
         }
 
-        // add new elements
-        if (value != nullptr) {
-            // copy-construct elements
-            while (onStackSize < newSize) {
-                new (reinterpret_cast<DataType *>(onStackMemRawBytes) + onStackSize) DataType(*value);
-                ++onStackSize;
-            }
-        } else {
-            // default-construct elements
-            while (onStackSize < newSize) {
+        while (onStackSize < newSize) {
+            if constexpr (nonDefaultInitializer) {
+                new (reinterpret_cast<DataType *>(onStackMemRawBytes) + onStackSize) DataType(std::forward<OptValueT>(optValue)...);
+            } else {
                 new (reinterpret_cast<DataType *>(onStackMemRawBytes) + onStackSize) DataType();
-                ++onStackSize;
             }
+            ++onStackSize;
         }
     }
 
@@ -424,7 +433,6 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
             }
             clearStackObjects();
         }
-        setUsesDynamicMem();
     }
 
     void clearStackObjects() {
@@ -437,6 +445,9 @@ class StackVec { // NOLINT(clang-analyzer-optin.performance.Padding)
         for (auto it = reinterpret_cast<DataType *>(onStackMemRawBytes) + offset, end = reinterpret_cast<DataType *>(onStackMemRawBytes) + offset + count; it != end; ++it) {
             it->~DataType();
         }
+    }
+    void switchToStackMem() {
+        onStackMem = reinterpret_cast<DataType *const>(onStackMemRawBytes);
     }
 
     union {
@@ -454,9 +465,9 @@ static_assert(sizeof(StackVec<char, 7U>) <= 16u, "");
 static_assert(sizeof(StackVec<uint32_t, 3U>) <= 24u, "");
 } // namespace
 
-template <typename T, size_t LhsStackCaps, size_t RhsStackCaps>
-bool operator==(const StackVec<T, LhsStackCaps> &lhs,
-                const StackVec<T, RhsStackCaps> &rhs) {
+template <typename T, size_t lhsStackCaps, size_t rhsStackCaps>
+bool operator==(const StackVec<T, lhsStackCaps> &lhs,
+                const StackVec<T, rhsStackCaps> &rhs) {
     if (lhs.size() != rhs.size()) {
         return false;
     }
@@ -474,12 +485,43 @@ bool operator==(const StackVec<T, LhsStackCaps> &lhs,
     return true;
 }
 
-template <typename T, size_t LhsStackCaps, size_t RhsStackCaps>
-bool operator!=(const StackVec<T, LhsStackCaps> &lhs,
-                const StackVec<T, RhsStackCaps> &rhs) {
+template <typename T, size_t lhsStackCaps, size_t rhsStackCaps>
+bool operator!=(const StackVec<T, lhsStackCaps> &lhs,
+                const StackVec<T, rhsStackCaps> &rhs) {
     return false == (lhs == rhs);
 }
 
-constexpr size_t MaxRootDeviceIndices = 16;
-using RootDeviceIndicesContainer = StackVec<uint32_t, MaxRootDeviceIndices>;
-using RootDeviceIndicesMap = StackVec<std::tuple<uint32_t, uint32_t>, MaxRootDeviceIndices>;
+constexpr size_t maxRootDeviceIndices = 16;
+class RootDeviceIndicesContainer : protected StackVec<uint32_t, maxRootDeviceIndices> {
+  public:
+    using StackVec<uint32_t, maxRootDeviceIndices>::StackVec;
+    using StackVec<uint32_t, maxRootDeviceIndices>::at;
+    using StackVec<uint32_t, maxRootDeviceIndices>::begin;
+    using StackVec<uint32_t, maxRootDeviceIndices>::end;
+    using StackVec<uint32_t, maxRootDeviceIndices>::size;
+    using StackVec<uint32_t, maxRootDeviceIndices>::operator[];
+
+    inline void pushUnique(uint32_t rootDeviceIndex) {
+        if (indexPresent.size() <= rootDeviceIndex) {
+            indexPresent.resize(rootDeviceIndex + 1);
+        }
+        if (!indexPresent[rootDeviceIndex]) {
+            push_back(rootDeviceIndex);
+            indexPresent[rootDeviceIndex] = 1;
+        }
+    }
+
+  protected:
+    StackVec<int8_t, maxRootDeviceIndices> indexPresent;
+};
+using RootDeviceIndicesMap = StackVec<std::tuple<uint32_t, uint32_t>, maxRootDeviceIndices>;
+
+template <typename DataType, size_t onStackCapacity,
+          typename StackSizeT = typename StackVecSize<onStackCapacity>::SizeT>
+class ConstrainedStackVec : public StackVec<DataType, onStackCapacity, StackSizeT> {
+  public:
+    template <std::same_as<DataType>... Args>
+    ConstrainedStackVec(Args &&...args) : StackVec<DataType, onStackCapacity, StackSizeT>({std::forward<Args>(args)...}) {
+        static_assert(sizeof...(Args) <= onStackCapacity, "Initializer size exceeds ConstrainedStackVec capacity");
+    }
+};

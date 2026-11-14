@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 #include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/mocks/mock_host_ptr_manager.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
 
 namespace NEO {
 class MockWddmMemoryManager : public MemoryManagerCreate<WddmMemoryManager> {
@@ -21,22 +22,34 @@ class MockWddmMemoryManager : public MemoryManagerCreate<WddmMemoryManager> {
     using BaseClass::allocateGraphicsMemoryForNonSvmHostPtr;
     using BaseClass::allocateGraphicsMemoryWithAlignment;
     using BaseClass::allocateGraphicsMemoryWithGpuVa;
+    using BaseClass::allocateGraphicsMemoryWithHostPtr;
     using BaseClass::allocateGraphicsMemoryWithProperties;
     using BaseClass::allocateMemoryByKMD;
     using BaseClass::allocatePhysicalDeviceMemory;
+    using BaseClass::allocatePhysicalHostMemory;
     using BaseClass::allocatePhysicalLocalDeviceMemory;
     using BaseClass::allRegisteredEngines;
+    using BaseClass::createBufferAllocationFromSection;
     using BaseClass::createGraphicsAllocation;
+    using BaseClass::createImageAllocationFromSection;
     using BaseClass::createPhysicalAllocation;
     using BaseClass::createWddmAllocation;
     using BaseClass::getWddm;
     using BaseClass::gfxPartitions;
     using BaseClass::localMemorySupported;
-    using BaseClass::mapPhysicalToVirtualMemory;
+    using BaseClass::mapGpuVirtualAddress;
+    using BaseClass::mapPhysicalDeviceMemoryToVirtualMemory;
+    using BaseClass::mapPhysicalHostMemoryToVirtualMemory;
     using BaseClass::supportsMultiStorageResources;
-    using BaseClass::unMapPhysicalToVirtualMemory;
+    using BaseClass::unMapPhysicalDeviceMemoryFromVirtualMemory;
+    using BaseClass::unMapPhysicalHostMemoryFromVirtualMemory;
     using MemoryManagerCreate<WddmMemoryManager>::MemoryManagerCreate;
+    using BaseClass::executionEnvironment;
     using BaseClass::getHugeGfxMemoryChunkSize;
+    using BaseClass::getPreferredAllocationMethod;
+    using BaseClass::isStatelessAccessRequired;
+    using BaseClass::pdhInterface;
+    using BaseClass::selectAlignmentAndHeap;
 
     GraphicsAllocation *allocateGraphicsMemory64kb(const AllocationData &allocationData) override {
         allocationGraphicsMemory64kbCreated = true;
@@ -50,17 +63,19 @@ class MockWddmMemoryManager : public MemoryManagerCreate<WddmMemoryManager> {
         return BaseClass::allocateGraphicsMemoryInDevicePool(allocationData, status);
     }
 
-    size_t hugeGfxMemoryChunkSize = BaseClass::getHugeGfxMemoryChunkSize(preferredAllocationMethod);
-    size_t getHugeGfxMemoryChunkSize(GfxMemoryAllocationMethod allocationMethod) const override { return hugeGfxMemoryChunkSize; }
+    size_t hugeGfxMemoryChunkSize = BaseClass::getHugeGfxMemoryChunkSize(preferredAllocationMethod, false);
+    size_t getHugeGfxMemoryChunkSize(GfxMemoryAllocationMethod allocationMethod, bool isLocalMemory) const override {
+        if (callBaseGetHugeGfxMemoryChunkSize) {
+            return BaseClass::getHugeGfxMemoryChunkSize(preferredAllocationMethod, isLocalMemory);
+        }
+        return hugeGfxMemoryChunkSize;
+    }
 
     MockWddmMemoryManager(ExecutionEnvironment &executionEnvironment) : MemoryManagerCreate(false, false, executionEnvironment) {
         hostPtrManager.reset(new MockHostPtrManager);
     };
     void setDeferredDeleter(DeferredDeleter *deleter) {
         this->deferredDeleter.reset(deleter);
-    }
-    void setForce32bitAllocations(bool newValue) {
-        this->force32bitAllocations = newValue;
     }
     bool validateAllocationMock(WddmAllocation *graphicsAllocation) {
         return this->validateAllocation(graphicsAllocation);
@@ -70,8 +85,7 @@ class MockWddmMemoryManager : public MemoryManagerCreate<WddmMemoryManager> {
         AllocationData allocationData;
         MockAllocationProperties properties(rootDeviceIndex, allocateMemory, size, allocationType);
         getAllocationData(allocationData, properties, ptr, createStorageInfoFromProperties(properties));
-        bool useLocalMemory = !allocationData.flags.useSystemMemory && this->localMemorySupported[rootDeviceIndex];
-        return allocate32BitGraphicsMemoryImpl(allocationData, useLocalMemory);
+        return allocate32BitGraphicsMemoryImpl(allocationData);
     }
 
     void freeGraphicsMemoryImpl(GraphicsAllocation *gfxAllocation) override {
@@ -82,6 +96,11 @@ class MockWddmMemoryManager : public MemoryManagerCreate<WddmMemoryManager> {
     bool copyMemoryToAllocationBanks(GraphicsAllocation *graphicsAllocation, size_t destinationOffset, const void *memoryToCopy, size_t sizeToCopy, DeviceBitfield handleMask) override {
         copyMemoryToAllocationBanksCalled++;
         return BaseClass::copyMemoryToAllocationBanks(graphicsAllocation, destinationOffset, memoryToCopy, sizeToCopy, handleMask);
+    }
+
+    bool memsetAllocationBanks(GraphicsAllocation *graphicsAllocation, size_t destinationOffset, int value, size_t sizeToSet, DeviceBitfield handleMask) override {
+        memsetAllocationBanksCalled++;
+        return BaseClass::memsetAllocationBanks(graphicsAllocation, destinationOffset, value, sizeToSet, handleMask);
     }
 
     void freeGraphicsMemoryImpl(GraphicsAllocation *gfxAllocation, bool isImportedAllocation) override {
@@ -97,11 +116,16 @@ class MockWddmMemoryManager : public MemoryManagerCreate<WddmMemoryManager> {
         registerAllocationInOsCalled++;
         BaseClass::registerAllocationInOs(gfxAllocation);
     }
+
+    ADDMETHOD(createGraphicsAllocationFromSectionHandle, GraphicsAllocation *, true, nullptr, (HANDLE handle, const AllocationProperties &properties), (handle, properties));
+
     uint32_t copyMemoryToAllocationBanksCalled = 0u;
+    uint32_t memsetAllocationBanksCalled = 0u;
     uint32_t freeGraphicsMemoryImplCalled = 0u;
     uint32_t registerAllocationInOsCalled = 0;
     bool allocationGraphicsMemory64kbCreated = false;
     bool allocateGraphicsMemoryInNonDevicePool = false;
     bool allocateHugeGraphicsMemoryCalled = false;
+    bool callBaseGetHugeGfxMemoryChunkSize = false;
 };
 } // namespace NEO

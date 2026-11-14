@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,7 @@
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/test/common/mocks/mock_csr.h"
 #include "shared/test/common/mocks/mock_device.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/context/context.h"
 #include "opencl/source/event/user_event.h"
@@ -49,9 +49,9 @@ TEST(GlArbSyncEvent, whenCreateArbSyncEventNameIsCalledMultipleTimesThenEachCall
     NEO::destroyArbSyncEventName(name3);
 }
 
-template <bool SignalWaited>
+template <bool signalWaited>
 inline void glArbSyncObjectWaitServerMock(NEO::OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo) {
-    glSyncInfo.waitCalled = SignalWaited;
+    glSyncInfo.waitCalled = signalWaited;
 }
 
 struct MockBaseEvent : Event {
@@ -68,11 +68,11 @@ struct GlArbSyncEventTest : public ::testing::Test {
     }
 
     void SetUp() override {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MockCommandStreamReceiver>();
         executionEnvironment = platform()->peekExecutionEnvironment();
         executionEnvironment->memoryManager = std::make_unique<OsAgnosticMemoryManager>(*executionEnvironment);
         device = std::make_unique<MockClDevice>(MockDevice::create<MockDevice>(executionEnvironment, 0u));
-        auto mockCsr = new MockCommandStreamReceiver(*executionEnvironment, 0, device->getDeviceBitfield());
-        device->resetCommandStreamReceiver(mockCsr);
         ctx.reset(new MockContext);
         cmdQ.reset(new MockCommandQueue(ctx.get(), device.get(), nullptr, false));
         sharing = new GlSharingFunctionsMock();
@@ -219,6 +219,39 @@ TEST_F(GlArbSyncEventTest, whenGlArbSyncEventGetsUnblockedByQueuedBaseEventThenS
     auto *syncEv = createArbEventMock<DummyArbEvent<false>>();
     syncEv->unblockEventBy(*this->baseEvent, 0, CL_QUEUED);
     EXPECT_FALSE(syncEv->getSyncInfo()->waitCalled);
+    syncEv->release();
+}
+
+TEST_F(GlArbSyncEventTest, whenUnblockCompletedEventThenStopDirectSubmission) {
+    auto *syncEv = new DummyArbEvent<false>(*ctx);
+    syncEv->useBaseSetEvent = true;
+    bool ret = syncEv->setBaseEvent(*getBaseEvent());
+    EXPECT_TRUE(ret);
+    EXPECT_FALSE(static_cast<MockCommandStreamReceiver *>(&syncEv->getCommandQueue()->getGpgpuCommandStreamReceiver())->blockingStopDirectSubmissionCalled);
+    syncEv->unblockEventBy(*this->baseEvent, 0, CL_COMPLETE);
+    EXPECT_TRUE(static_cast<MockCommandStreamReceiver *>(&syncEv->getCommandQueue()->getGpgpuCommandStreamReceiver())->blockingStopDirectSubmissionCalled);
+    syncEv->release();
+}
+
+TEST_F(GlArbSyncEventTest, givenSubmittedAndCompletedBaseEventWhenGlArbSyncEventGetsUnblockedThenSyncObjectIsSignalledAtSubmissionOnlyForCompletedEvent) {
+    static bool signalAtSubmissionValues[2];
+    static uint32_t signalCount;
+    signalCount = 0u;
+    sharing->pfnGlArbSyncObjectSignal = [](OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo, bool signalAtSubmission) {
+        if (signalCount < 2u) {
+            signalAtSubmissionValues[signalCount] = signalAtSubmission;
+        }
+        signalCount++;
+    };
+    auto *syncEv = new DummyArbEvent<false>(*ctx);
+    syncEv->useBaseSetEvent = true;
+    EXPECT_TRUE(syncEv->setBaseEvent(*getBaseEvent()));
+
+    syncEv->unblockEventBy(*this->baseEvent, 0, CL_SUBMITTED);
+    syncEv->unblockEventBy(*this->baseEvent, 0, CL_COMPLETE);
+    ASSERT_EQ(2u, signalCount);
+    EXPECT_FALSE(signalAtSubmissionValues[0]);
+    EXPECT_TRUE(signalAtSubmissionValues[1]);
     syncEv->release();
 }
 

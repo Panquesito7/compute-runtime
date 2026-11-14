@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,14 +14,19 @@
 #include "shared/source/device/root_device.h"
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/source/source_level_debugger/source_level_debugger.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
+#include "shared/source/memory_manager/usm_pool_params.h"
+#include "shared/source/os_interface/device_factory.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/pin/pin.h"
+#include "shared/source/utilities/staging_buffer_manager.h"
 
 #include "opencl/source/api/api.h"
 #include "opencl/source/cl_device/cl_device.h"
-#include "opencl/source/gtpin/gtpin_notify.h"
 #include "opencl/source/helpers/get_info_status_mapper.h"
 #include "opencl/source/platform/platform_info.h"
 #include "opencl/source/sharings/sharing_factory.h"
@@ -33,6 +38,7 @@
 namespace NEO {
 
 std::vector<std::unique_ptr<Platform>> *platformsImpl = nullptr;
+std::vector<LeoPlatformEntry> *leoPlatformEntries = nullptr;
 
 Platform::Platform(ExecutionEnvironment &executionEnvironmentIn) : executionEnvironment(executionEnvironmentIn) {
     clDevices.reserve(4);
@@ -42,12 +48,15 @@ Platform::Platform(ExecutionEnvironment &executionEnvironmentIn) : executionEnvi
 Platform::~Platform() {
     executionEnvironment.prepareForCleanup();
 
-    for (auto clDevice : this->clDevices) {
-        clDevice->getDevice().getRootDeviceEnvironmentRef().debugger.reset(nullptr);
-        clDevice->decRefInternal();
+    if (isInitialized()) {
+        svmAllocsManager->cleanupUSMAllocCaches();
+        usmHostMemAllocPoolsManager.cleanup();
+        delete stagingBufferManager;
     }
-
-    gtpinNotifyPlatformShutdown();
+    devicesCleanup(false);
+    if (isInitialized()) {
+        delete svmAllocsManager;
+    }
     executionEnvironment.decRefInternal();
 }
 
@@ -58,7 +67,7 @@ cl_int Platform::getInfo(cl_platform_info paramName,
     auto retVal = CL_INVALID_VALUE;
     const std::string *param = nullptr;
     size_t paramSize = GetInfo::invalidSourceSize;
-    auto getInfoStatus = GetInfoStatus::INVALID_VALUE;
+    auto getInfoStatus = GetInfoStatus::invalidValue;
 
     switch (paramName) {
     case CL_PLATFORM_HOST_TIMER_RESOLUTION: {
@@ -102,6 +111,17 @@ cl_int Platform::getInfo(cl_platform_info paramName,
     case CL_PLATFORM_ICD_SUFFIX_KHR:
         param = &platformInfo->icdSuffixKhr;
         break;
+    case CL_PLATFORM_EXTERNAL_MEMORY_IMPORT_HANDLE_TYPES_KHR: {
+        paramSize = sizeof(this->clDevices[0]->getDeviceInfo().externalMemorySharing);
+        getInfoStatus = GetInfo::getInfo(paramValue, paramValueSize, &this->clDevices[0]->getDeviceInfo().externalMemorySharing, paramSize);
+        break;
+    }
+    case CL_PLATFORM_UNLOADABLE_KHR: {
+        cl_bool unloadable = CL_TRUE;
+        paramSize = sizeof(unloadable);
+        getInfoStatus = GetInfo::getInfo(paramValue, paramValueSize, &unloadable, paramSize);
+        break;
+    }
     default:
         break;
     }
@@ -130,53 +150,67 @@ bool Platform::initialize(std::vector<std::unique_ptr<Device>> devices) {
 
     state = StateIniting;
 
+    RootDeviceIndicesContainer rootDeviceIndices;
+    std::map<uint32_t, DeviceBitfield> deviceBitfields;
+
     for (auto &inputDevice : devices) {
         ClDevice *pClDevice = nullptr;
         auto pDevice = inputDevice.release();
         UNRECOVERABLE_IF(!pDevice);
         pClDevice = new ClDevice{*pDevice, this};
         this->clDevices.push_back(pClDevice);
-
-        if (pClDevice->getDevice().getExecutionEnvironment()->isDebuggingEnabled()) {
-            const auto rootDeviceIndex = pClDevice->getDevice().getRootDeviceIndex();
-            auto rootDeviceEnvironment = pClDevice->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex].get();
-            rootDeviceEnvironment->initDebuggerL0(&pClDevice->getDevice());
-        }
-
-        if (pClDevice->getPreemptionMode() == PreemptionMode::MidThread || pClDevice->isDebuggerActive()) {
-            bool ret = SipKernel::initSipKernel(SipKernel::getSipKernelType(*pDevice), *pDevice);
-            UNRECOVERABLE_IF(!ret);
-        }
+        rootDeviceIndices.pushUnique(pClDevice->getRootDeviceIndex());
     }
+
+    for (auto &rootDeviceIndex : rootDeviceIndices) {
+        DeviceBitfield deviceBitfield{};
+        for (const auto &pDevice : this->clDevices) {
+            if (pDevice->getRootDeviceIndex() == rootDeviceIndex) {
+                deviceBitfield |= pDevice->getDeviceBitfield();
+            }
+        }
+        deviceBitfields.emplace(rootDeviceIndex, deviceBitfield);
+    }
+
+    this->svmAllocsManager = new SVMAllocsManager(this->clDevices[0]->getMemoryManager());
+    this->svmAllocsManager->initUsmAllocationsCaches(this->clDevices[0]->getDevice());
+
+    bool requiresWritableStaging = this->clDevices[0]->getDefaultEngine().commandStreamReceiver->getType() != CommandStreamReceiverType::hardware;
+    this->stagingBufferManager = new StagingBufferManager(this->svmAllocsManager, rootDeviceIndices, deviceBitfields, requiresWritableStaging);
 
     DEBUG_BREAK_IF(this->platformInfo);
     this->platformInfo.reset(new PlatformInfo);
 
     this->platformInfo->extensions = this->clDevices[0]->getDeviceInfo().deviceExtensions;
 
-    if (DebugManager.flags.OverridePlatformName.get() != "unk") {
-        this->platformInfo->name.assign(DebugManager.flags.OverridePlatformName.get().c_str());
+    const auto &capabilityTable = this->clDevices[0]->getHardwareInfo().capabilityTable;
+    if (capabilityTable.preferredPlatformName != nullptr) {
+        this->platformInfo->name = capabilityTable.preferredPlatformName;
+    } else {
+        this->platformInfo->name += capabilityTable.isIntegratedDevice ? " (integrated)" : " (discrete)";
     }
 
-    switch (this->clDevices[0]->getEnabledClVersion()) {
-    case 30:
-        this->platformInfo->version = "OpenCL 3.0 ";
-        this->platformInfo->numericVersion = CL_MAKE_VERSION(3, 0, 0);
-        break;
-    case 21:
-        this->platformInfo->version = "OpenCL 2.1 ";
-        this->platformInfo->numericVersion = CL_MAKE_VERSION(2, 1, 0);
-        break;
-    default:
-        this->platformInfo->version = "OpenCL 1.2 ";
-        this->platformInfo->numericVersion = CL_MAKE_VERSION(1, 2, 0);
-        break;
+    if (debugManager.flags.OverridePlatformName.get() != "unk") {
+        this->platformInfo->name.assign(debugManager.flags.OverridePlatformName.get().c_str());
     }
+
+    this->platformInfo->version = "OpenCL 3.0 ";
+    this->platformInfo->numericVersion = CL_MAKE_VERSION(3, 0, 0);
 
     this->fillGlobalDispatchTable();
-    DEBUG_BREAK_IF(DebugManager.flags.CreateMultipleSubDevices.get() > 1 && !this->clDevices[0]->getDefaultEngine().commandStreamReceiver->peekTimestampPacketWriteEnabled());
+    DEBUG_BREAK_IF(debugManager.flags.CreateMultipleSubDevices.get() > 1 && !this->clDevices[0]->getDefaultEngine().commandStreamReceiver->peekTimestampPacketWriteEnabled());
     state = StateInited;
     return true;
+}
+
+void Platform::tryNotifyGtpinInit() {
+    auto notifyGTPin = []() {
+        if (debugManager.flags.ZET_ENABLE_PROGRAM_INSTRUMENTATION.get()) {
+            const std::string gtpinFuncName{"OpenGTPinOCL"};
+            PinContext::init(gtpinFuncName);
+        }
+    };
+    std::call_once(this->oclInitGTPinOnce, notifyGTPin);
 }
 
 void Platform::fillGlobalDispatchTable() {
@@ -222,6 +256,21 @@ ClDevice **Platform::getClDevices() {
     return clDevices.data();
 }
 
+void Platform::devicesCleanup(bool processTermination) {
+    for (auto clDevice : this->clDevices) {
+        clDevice->getDevice().stopDirectSubmissionAndWaitForCompletion();
+        clDevice->getDevice().pollForCompletion();
+        if (processTermination) {
+            continue;
+        }
+        clDevice->getDevice().getRootDeviceEnvironmentRef().debugger.reset(nullptr);
+        clDevice->decRefInternal();
+    }
+    if (!processTermination) {
+        this->clDevices.clear();
+    }
+}
+
 const PlatformInfo &Platform::getPlatformInfo() const {
     DEBUG_BREAK_IF(!platformInfo);
     return *platformInfo;
@@ -231,23 +280,69 @@ std::unique_ptr<Platform> (*Platform::createFunc)(ExecutionEnvironment &) = [](E
     return std::make_unique<Platform>(executionEnvironment);
 };
 
-std::vector<DeviceVector> Platform::groupDevices(DeviceVector devices) {
-    std::map<PRODUCT_FAMILY, size_t> platformsMap;
-    std::vector<DeviceVector> outDevices;
-    for (auto &device : devices) {
-        auto productFamily = device->getHardwareInfo().platform.eProductFamily;
-        auto result = platformsMap.find(productFamily);
-        if (result == platformsMap.end()) {
-            platformsMap.insert({productFamily, platformsMap.size()});
-            outDevices.push_back(DeviceVector{});
-        }
-        auto platformId = platformsMap[productFamily];
-        outDevices[platformId].push_back(std::move(device));
-    }
-    std::sort(outDevices.begin(), outDevices.end(), [](DeviceVector &lhs, DeviceVector &rhs) -> bool {
-        return lhs[0]->getHardwareInfo().platform.eProductFamily > rhs[0]->getHardwareInfo().platform.eProductFamily;
-    });
-    return outDevices;
+SVMAllocsManager *Platform::getSVMAllocsManager() const {
+    return this->svmAllocsManager;
 }
 
+StagingBufferManager *Platform::getStagingBufferManager() const {
+    return this->stagingBufferManager;
+}
+
+UsmMemAllocPoolsFacade &Platform::getHostMemAllocPoolManager() {
+    return this->usmHostMemAllocPoolsManager;
+}
+
+void Platform::incActiveContextCount() {
+    TakeOwnershipWrapper<Platform> platformOwnership(*this);
+    this->activeContextCount++;
+}
+
+void Platform::decActiveContextCount() {
+    TakeOwnershipWrapper<Platform> platformOwnership(*this);
+    this->activeContextCount--;
+    DEBUG_BREAK_IF(this->activeContextCount < 0);
+    if (this->activeContextCount == 0) {
+        this->stagingBufferManager->freeAllocations();
+        this->svmAllocsManager->trimUSMAllocCaches();
+    }
+}
+
+void Platform::initializeHostUsmAllocationPool() {
+    if (this->usmPoolInitialized) {
+        return;
+    }
+    auto svmMemoryManager = this->getSVMAllocsManager();
+
+    TakeOwnershipWrapper<Platform> platformOwnership(*this);
+    if (this->usmPoolInitialized) {
+        return;
+    }
+
+    auto usmHostAllocPoolingEnabled = ApiSpecificConfig::isHostUsmPoolingEnabled();
+    for (auto &device : this->clDevices) {
+        usmHostAllocPoolingEnabled &= device->getProductHelper().isHostUsmPoolAllocatorSupported() && DeviceFactory::isHwModeSelected();
+    }
+    usmHostAllocPoolingEnabled = UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::hostUnifiedMemory, usmHostAllocPoolingEnabled);
+    if (usmHostAllocPoolingEnabled) {
+        for (auto &device : this->clDevices) {
+            rootDeviceIndices.pushUnique(device->getRootDeviceIndex());
+        }
+
+        for (auto &rootDeviceIndex : rootDeviceIndices) {
+            DeviceBitfield deviceBitfield{};
+            for (const auto &pDevice : this->clDevices) {
+                if (pDevice->getRootDeviceIndex() == rootDeviceIndex) {
+                    deviceBitfield |= pDevice->getDeviceBitfield();
+                }
+            }
+            deviceBitfields.emplace(rootDeviceIndex, deviceBitfield);
+        }
+
+        UnifiedMemoryProperties memoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M,
+                                                 rootDeviceIndices, deviceBitfields);
+        auto &device = this->clDevices[0]->getDevice();
+        this->usmHostMemAllocPoolsManager.initialize(InternalMemoryType::hostUnifiedMemory, rootDeviceIndices, deviceBitfields, &device, svmMemoryManager, {});
+    }
+    this->usmPoolInitialized = true;
+}
 } // namespace NEO

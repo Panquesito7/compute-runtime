@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,14 +8,13 @@
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
 
-#include "level_zero/sysman/source/linux/sysman_hw_device_id_linux.h"
+#include "level_zero/sysman/source/device/sysman_hw_device_id.h"
+#include "level_zero/sysman/source/shared/linux/sysman_hw_device_id_linux.h"
 
 #include "gtest/gtest.h"
 
-#include <bitset>
-#include <cstring>
-
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 TEST(sysmanHwDeviceIdTest, whenOpenFileDescriptorIsCalledMultipleTimesThenOpenIsCalledOnlyOnce) {
@@ -29,9 +28,10 @@ TEST(sysmanHwDeviceIdTest, whenOpenFileDescriptorIsCalledMultipleTimesThenOpenIs
     });
 
     openCallCount = 0;
-    hwDeviceId.openFileDescriptor();
+
+    auto instance1 = hwDeviceId.getSingleInstance();
     EXPECT_EQ(openCallCount, 1u);
-    hwDeviceId.openFileDescriptor();
+    auto instance2 = hwDeviceId.getSingleInstance();
     EXPECT_EQ(openCallCount, 1u);
 }
 
@@ -43,16 +43,29 @@ TEST(sysmanHwDeviceIdTest, whenOpenFileDescriptorIsCalledMultipleTimesThenCloseI
     });
 
     const auto referenceCloseCount = NEO::SysCalls::closeFuncCalled;
-    hwDeviceId.openFileDescriptor();
-    hwDeviceId.openFileDescriptor();
-    hwDeviceId.openFileDescriptor();
-    hwDeviceId.closeFileDescriptor();
-    EXPECT_EQ(NEO::SysCalls::closeFuncCalled, referenceCloseCount);
-    hwDeviceId.closeFileDescriptor();
-    EXPECT_EQ(NEO::SysCalls::closeFuncCalled, referenceCloseCount);
-    hwDeviceId.closeFileDescriptor();
+    {
+        auto instance1 = hwDeviceId.getSingleInstance();
+        EXPECT_EQ(NEO::SysCalls::closeFuncCalled, referenceCloseCount);
+        {
+            auto instance2 = hwDeviceId.getSingleInstance();
+            {
+                auto instance3 = hwDeviceId.getSingleInstance();
+            }
+            EXPECT_EQ(NEO::SysCalls::closeFuncCalled, referenceCloseCount);
+        }
+        EXPECT_EQ(NEO::SysCalls::closeFuncCalled, referenceCloseCount);
+    }
     EXPECT_EQ(NEO::SysCalls::closeFuncCalled, referenceCloseCount + 1u);
 }
 
+TEST(sysmanHwDeviceIdTest, whenCreatingSysmanHwDeviceIdforWddmSystemThenSameHwDeviceIdIsReturned) {
+
+    std::unique_ptr<NEO::HwDeviceId> hwDeviceId = std::make_unique<NEO::HwDeviceId>(NEO::DriverModelType::wddm);
+    auto tempHwDeviceId = hwDeviceId.get();
+    auto sysmanHwDeviceId = createSysmanHwDeviceId(hwDeviceId);
+    EXPECT_EQ(tempHwDeviceId, sysmanHwDeviceId.get());
+}
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

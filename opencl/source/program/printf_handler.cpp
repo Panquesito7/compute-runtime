@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,11 +9,9 @@
 
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/device/device.h"
-#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/blit_properties.h"
-#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/patch_store_operation.h"
 #include "shared/source/helpers/ptr_math.h"
-#include "shared/source/kernel/implicit_args.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/compression_selector.h"
 #include "shared/source/memory_manager/memory_manager.h"
@@ -47,12 +45,16 @@ void PrintfHandler::prepareDispatch(const MultiDispatchInfo &multiDispatchInfo) 
     if (printfSurfaceSize == 0) {
         return;
     }
-    auto rootDeviceIndex = device.getRootDeviceIndex();
-    kernel = multiDispatchInfo.peekMainKernel();
-    printfSurface = device.getMemoryManager()->allocateGraphicsMemoryWithProperties({rootDeviceIndex, printfSurfaceSize, AllocationType::PRINTF_SURFACE, device.getDeviceBitfield()});
 
     auto &rootDeviceEnvironment = device.getRootDeviceEnvironment();
     const auto &productHelper = device.getProductHelper();
+
+    DEBUG_BREAK_IF(productHelper.is2MBLocalMemAlignmentEnabled() &&
+                   !isAligned(printfSurfaceSize, MemoryConstants::pageSize2M));
+
+    auto rootDeviceIndex = device.getRootDeviceIndex();
+    kernel = multiDispatchInfo.peekMainKernel();
+    printfSurface = device.getMemoryManager()->allocateGraphicsMemoryWithProperties({rootDeviceIndex, printfSurfaceSize, AllocationType::printfSurface, device.getDeviceBitfield()});
 
     MemoryTransferHelper::transferMemoryToAllocation(productHelper.isBlitCopyRequiredForLocalMemory(rootDeviceEnvironment, *printfSurface),
                                                      device, printfSurface, 0, printfSurfaceInitialDataSizePtr.get(),
@@ -60,18 +62,17 @@ void PrintfHandler::prepareDispatch(const MultiDispatchInfo &multiDispatchInfo) 
 
     const auto &printfSurfaceArg = kernel->getKernelInfo().kernelDescriptor.payloadMappings.implicitArgs.printfSurfaceAddress;
     auto printfPatchAddress = ptrOffset(reinterpret_cast<uintptr_t *>(kernel->getCrossThreadData()), printfSurfaceArg.stateless);
-    patchWithRequiredSize(printfPatchAddress, printfSurfaceArg.pointerSize, (uintptr_t)printfSurface->getGpuAddressToPatch());
+    patchWithRequiredSize(printfPatchAddress, printfSurfaceArg.pointerSize, printfSurface->getGpuAddressToPatch());
     if (isValidOffset(printfSurfaceArg.bindful)) {
         auto surfaceState = ptrOffset(reinterpret_cast<uintptr_t *>(kernel->getSurfaceStateHeap()), printfSurfaceArg.bindful);
         void *addressToPatch = printfSurface->getUnderlyingBuffer();
         size_t sizeToPatch = printfSurface->getUnderlyingBufferSize();
         Buffer::setSurfaceState(&device, surfaceState, false, false, sizeToPatch, addressToPatch, 0, printfSurface, 0, 0,
-                                kernel->getKernelInfo().kernelDescriptor.kernelAttributes.flags.useGlobalAtomics,
                                 kernel->areMultipleSubDevicesInContext());
     }
     auto pImplicitArgs = kernel->getImplicitArgs();
     if (pImplicitArgs) {
-        pImplicitArgs->printfBufferPtr = printfSurface->getGpuAddress();
+        pImplicitArgs->setPrintfBuffer(printfSurface->getGpuAddress());
     }
 }
 
@@ -81,33 +82,32 @@ void PrintfHandler::makeResident(CommandStreamReceiver &commandStreamReceiver) {
 
 bool PrintfHandler::printEnqueueOutput() {
     auto &rootDeviceEnvironment = device.getRootDeviceEnvironment();
-    auto usesStringMap = kernel->getDescriptor().kernelAttributes.usesStringMap();
     const auto &productHelper = device.getProductHelper();
-    auto printfOutputBuffer = reinterpret_cast<const uint8_t *>(printfSurface->getUnderlyingBuffer());
+    auto printfOutputBuffer = reinterpret_cast<uint8_t *>(printfSurface->getUnderlyingBuffer());
     auto printfOutputSize = static_cast<uint32_t>(printfSurface->getUnderlyingBufferSize());
     std::unique_ptr<uint8_t[]> printfOutputDecompressed;
 
-    if (CompressionSelector::allowStatelessCompression() || productHelper.isBlitCopyRequiredForLocalMemory(rootDeviceEnvironment, *printfSurface)) {
+    if (productHelper.isBlitCopyRequiredForLocalMemory(rootDeviceEnvironment, *printfSurface)) {
         printfOutputDecompressed = std::make_unique<uint8_t[]>(printfOutputSize);
         printfOutputBuffer = printfOutputDecompressed.get();
-        auto &bcsEngine = device.getEngine(EngineHelpers::getBcsEngineType(rootDeviceEnvironment, device.getDeviceBitfield(), device.getSelectorCopyEngine(), true), EngineUsage::Regular);
+        auto bcsEngine = device.getInternalLinkCopyEngine();
+        UNRECOVERABLE_IF(bcsEngine == nullptr);
 
         BlitPropertiesContainer blitPropertiesContainer;
         blitPropertiesContainer.push_back(
-            BlitProperties::constructPropertiesForReadWrite(BlitterConstants::BlitDirection::BufferToHostPtr,
-                                                            *bcsEngine.commandStreamReceiver, printfSurface, nullptr,
+            BlitProperties::constructPropertiesForReadWrite(BlitterConstants::BlitDirection::bufferToHostPtr,
+                                                            *bcsEngine->commandStreamReceiver, printfSurface, nullptr,
                                                             printfOutputDecompressed.get(),
                                                             printfSurface->getGpuAddress(),
                                                             0, 0, 0, Vec3<size_t>(printfOutputSize, 0, 0), 0, 0, 0, 0));
 
-        const auto newTaskCount = bcsEngine.commandStreamReceiver->flushBcsTask(blitPropertiesContainer, true, false, device);
+        const auto newTaskCount = bcsEngine->commandStreamReceiver->flushBcsTask(blitPropertiesContainer, true, device);
         if (newTaskCount > CompletionStamp::notReady) {
             return false;
         }
     }
-
-    PrintFormatter printFormatter(printfOutputBuffer, printfOutputSize, kernel->is32Bit(),
-                                  usesStringMap ? &kernel->getDescriptor().kernelMetadata.printfStringsMap : nullptr);
+    printfOutputBuffer[printfOutputSize - 1] = 0;
+    PrintFormatter printFormatter(printfOutputBuffer, printfOutputSize);
     printFormatter.printKernelOutput();
 
     return true;

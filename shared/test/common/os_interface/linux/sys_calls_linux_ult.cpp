@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,8 +12,6 @@
 #include "shared/source/os_interface/linux/drm_wrappers.h"
 #include "shared/source/os_interface/linux/i915.h"
 
-#include "test_files_setup.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -21,16 +19,21 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <iostream>
+#include <link.h>
 #include <poll.h>
-#include <string.h>
 #include <string_view>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <system_error>
 
 namespace NEO {
 namespace SysCalls {
 uint32_t closeFuncCalled = 0u;
 uint32_t openFuncCalled = 0u;
+uint32_t accessFuncCalled = 0u;
+uint32_t pollFuncCalled = 0u;
+int openFuncRetVal = 0;
 int closeFuncArgPassed = 0;
 int closeFuncRetVal = 0;
 int dlOpenFlags = 0;
@@ -46,37 +49,76 @@ int fstatFuncRetVal = 0;
 int flockRetVal = 0;
 uint32_t preadFuncCalled = 0u;
 uint32_t pwriteFuncCalled = 0u;
+uint32_t readFuncCalled = 0u;
+uint32_t writeFuncCalled = 0u;
 bool isInvalidAILTest = false;
 const char *drmVersion = "i915";
-int passedFileDescriptorFlagsToSet = 0;
-int getFileDescriptorFlagsCalled = 0;
-int setFileDescriptorFlagsCalled = 0;
 int unlinkCalled = 0;
 int scandirCalled = 0;
 int mkstempCalled = 0;
 int renameCalled = 0;
 int pathFileExistsCalled = 0;
 int flockCalled = 0;
+int opendirCalled = 0;
+int readdirCalled = 0;
+int closedirCalled = 0;
+int rmdirCalled = 0;
+int pidfdopenCalled = 0;
+int pidfdgetfdCalled = 0;
+int prctlCalled = 0;
+int socketCalled = 0;
+int bindCalled = 0;
+int listenCalled = 0;
+int acceptCalled = 0;
+int connectCalled = 0;
+int sendCalled = 0;
+int recvCalled = 0;
+int sendmsgCalled = 0;
+int recvmsgCalled = 0;
+int setsockoptCalled = 0;
+int dupCalled = 0;
+int getpidCalled = 0;
+int getrlimitCalled = 0;
+int syncCalled = 0;
+int fsyncCalled = 0;
+int fsyncArgPassed = 0;
+int fsyncRetVal = 0;
+uint32_t mkfifoFuncCalled = 0;
+bool failMkfifo = 0;
+bool failFcntl = false;
+bool failFcntl1 = false;
+bool failAccess = false;
 
-std::vector<void *> mmapVector(64);
-std::vector<void *> mmapCapturedExtendedPointers(64);
+static std::vector<void *> createPtrVectorWithReservedCapacity() {
+    std::vector<void *> ptrs;
+    ptrs.reserve(64);
+    return ptrs;
+}
+
+std::vector<void *> mmapVector = createPtrVectorWithReservedCapacity();
+std::vector<void *> mmapCapturedExtendedPointers = createPtrVectorWithReservedCapacity();
 bool mmapCaptureExtendedPointers = false;
-bool pathExistsMock = false;
 bool mmapAllowExtendedPointers = false;
 bool failMmap = false;
 uint32_t mmapFuncCalled = 0u;
 uint32_t munmapFuncCalled = 0u;
+bool failMunmap = false;
+uint32_t mremapFixedFuncCalled = 0u;
+uint32_t mmapFixedNoReplaceFuncCalled = 0u;
 
 int (*sysCallsOpen)(const char *pathname, int flags) = nullptr;
 int (*sysCallsClose)(int fileDescriptor) = nullptr;
 int (*sysCallsOpenWithMode)(const char *pathname, int flags, int mode) = nullptr;
+int (*sysCallsFtruncate)(int fd, off_t length) = nullptr;
+int (*sysCallsAccess)(const char *pathname, int mode) = nullptr;
+int (*sysCallsDlinfo)(void *handle, int request, void *info) = nullptr;
 ssize_t (*sysCallsPread)(int fd, void *buf, size_t count, off_t offset) = nullptr;
 ssize_t (*sysCallsPwrite)(int fd, const void *buf, size_t count, off_t offset) = nullptr;
 int (*sysCallsReadlink)(const char *path, char *buf, size_t bufsize) = nullptr;
 int (*sysCallsIoctl)(int fileDescriptor, unsigned long int request, void *arg) = nullptr;
 int (*sysCallsPoll)(struct pollfd *pollFd, unsigned long int numberOfFds, int timeout) = nullptr;
 ssize_t (*sysCallsRead)(int fd, void *buf, size_t count) = nullptr;
-ssize_t (*sysCallsWrite)(int fd, void *buf, size_t count) = nullptr;
+ssize_t (*sysCallsWrite)(int fd, const void *buf, size_t count) = nullptr;
 int (*sysCallsPipe)(int pipeFd[2]) = nullptr;
 int (*sysCallsFstat)(int fd, struct stat *buf) = nullptr;
 char *(*sysCallsRealpath)(const char *path, char *buf) = nullptr;
@@ -90,7 +132,44 @@ int (*sysCallsUnlink)(const std::string &pathname) = nullptr;
 int (*sysCallsStat)(const std::string &filePath, struct stat *statbuf) = nullptr;
 int (*sysCallsMkstemp)(char *fileName) = nullptr;
 int (*sysCallsMkdir)(const std::string &dir) = nullptr;
-bool (*sysCallsPathExists)(const std::string &path) = nullptr;
+int (*sysCallsRmdir)(const std::string &dir) = nullptr;
+DIR *(*sysCallsOpendir)(const char *name) = nullptr;
+struct dirent *(*sysCallsReaddir)(DIR *dir) = nullptr;
+int (*sysCallsClosedir)(DIR *dir) = nullptr;
+int (*sysCallsGetDevicePath)(int deviceFd, char *buf, size_t &bufSize) = nullptr;
+int (*sysCallsPidfdOpen)(pid_t pid, unsigned int flags) = nullptr;
+int (*sysCallsPidfdGetfd)(int pidfd, int fd, unsigned int flags) = nullptr;
+int (*sysCallsPrctl)(int option, unsigned long arg) = nullptr;
+off_t (*sysCallsLseek)(int fd, off_t offset, int whence) = nullptr;
+int (*sysCallsSocket)(int domain, int type, int protocol) = nullptr;
+int (*sysCallsBind)(int sockfd, const struct sockaddr *addr, socklen_t addrlen) = nullptr;
+int (*sysCallsListen)(int sockfd, int backlog) = nullptr;
+int (*sysCallsAccept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen) = nullptr;
+int (*sysCallsConnect)(int sockfd, const struct sockaddr *addr, socklen_t addrlen) = nullptr;
+ssize_t (*sysCallsSend)(int sockfd, const void *buf, size_t len, int flags) = nullptr;
+ssize_t (*sysCallsRecv)(int sockfd, void *buf, size_t len, int flags) = nullptr;
+ssize_t (*sysCallsSendmsg)(int sockfd, const struct msghdr *msg, int flags) = nullptr;
+ssize_t (*sysCallsRecvmsg)(int sockfd, struct msghdr *msg, int flags) = nullptr;
+int (*sysCallsSetsockopt)(int sockfd, int level, int optname, const void *optval, socklen_t optlen) = nullptr;
+int (*sysCallsDup)(int oldfd) = nullptr;
+int (*sysCallsFcntl)(int fd, int cmd, int arg) = nullptr;
+void *(*sysCallsMmap)(void *addr, size_t size, int prot, int flags, int fd, off_t off) = nullptr;
+int (*sysCallsMunmap)(void *addr, size_t size) = nullptr;
+void *(*sysCallsMremapFixed)(void *oldAddress, size_t size, void *newAddress) = nullptr;
+void *(*sysCallsMmapFixedNoReplace)(void *address, size_t size) = nullptr;
+int (*sysCallsGetpid)() = nullptr;
+int (*sysCallsGetrlimit)(int resource, struct rlimit *rlim) = nullptr;
+FILE *(*sysCallsFdopen)(int fd, const char *mode) = nullptr;
+char *(*sysCallsFgets)(char *s, int size, FILE *stream) = nullptr;
+int (*sysCallsFclose)(FILE *stream) = nullptr;
+int (*sysCallsSetvbuf)(FILE *stream, char *buf, int mode, size_t size) = nullptr;
+off_t lseekReturn = 4096u;
+std::atomic<int> lseekCalledCount(0);
+long sysconfReturn = 1ull << 30;
+std::string dlOpenFilePathPassed;
+bool captureDlOpenFilePath = false;
+std::string mkfifoPathNamePassed;
+std::string getProcessNameResult = "process_name";
 
 int mkdir(const std::string &path) {
     if (sysCallsMkdir != nullptr) {
@@ -100,12 +179,13 @@ int mkdir(const std::string &path) {
     return 0;
 }
 
-bool pathExists(const std::string &path) {
-    if (sysCallsPathExists != nullptr) {
-        return sysCallsPathExists(path);
+int rmdir(const std::string &path) {
+    rmdirCalled++;
+    if (sysCallsRmdir != nullptr) {
+        return sysCallsRmdir(path);
     }
 
-    return pathExistsMock;
+    return 0;
 }
 
 void exit(int code) {
@@ -116,7 +196,20 @@ void exit(int code) {
 int close(int fileDescriptor) {
     closeFuncCalled++;
     closeFuncArgPassed = fileDescriptor;
+    if (sysCallsClose != nullptr) {
+        return sysCallsClose(fileDescriptor);
+    }
     return closeFuncRetVal;
+}
+
+void sync() {
+    syncCalled++;
+}
+
+int fsync(int fd) {
+    fsyncCalled++;
+    fsyncArgPassed = fd;
+    return fsyncRetVal;
 }
 
 int open(const char *file, int flags) {
@@ -128,7 +221,7 @@ int open(const char *file, int flags) {
     if (strcmp(file, "/dev/dri/by-path/pci-0000:invalid-render") == 0) {
         return 0;
     }
-    if (strcmp(file, NEO_SHARED_TEST_FILES_DIR "/linux/by-path/pci-0000:00:02.0-render") == 0) {
+    if (strcmp(file, "/linux/by-path/pci-0000:00:02.0-render") == 0) {
         return fakeFileDescriptor;
     }
     std::string_view configFile = file;
@@ -136,6 +229,13 @@ int open(const char *file, int flags) {
         return fakeFileDescriptor;
     }
 
+    return openFuncRetVal;
+}
+
+int ftruncate(int fd, off_t length) {
+    if (sysCallsFtruncate != nullptr) {
+        return sysCallsFtruncate(fd, length);
+    }
     return 0;
 }
 
@@ -154,7 +254,25 @@ int openWithMode(const char *file, int flags, int mode) {
 void *dlopen(const char *filename, int flag) {
     dlOpenFlags = flag;
     dlOpenCalled = true;
+    if (captureDlOpenFilePath) {
+        if (filename) {
+            dlOpenFilePathPassed = filename;
+        } else {
+            dlOpenFilePathPassed = {};
+        }
+    }
     return ::dlopen(filename, flag);
+}
+
+int dlinfo(void *handle, int request, void *info) {
+    if (sysCallsDlinfo != nullptr) {
+        return sysCallsDlinfo(handle, request, info);
+    }
+
+    if (request == RTLD_DI_LINKMAP) {
+        return ::dlinfo(handle, request, info);
+    }
+    return -1;
 }
 
 int ioctl(int fileDescriptor, unsigned long int request, void *arg) {
@@ -184,13 +302,36 @@ unsigned int getProcessId() {
     return 0xABCEDF;
 }
 
+unsigned int getCurrentProcessId() {
+    return 0xABCEDF;
+}
+
+std::string getProcessName() {
+    return getProcessNameResult;
+}
+
 unsigned long getNumThreads() {
     getNumThreadsCalled = true;
     return 1;
 }
 
-int access(const char *pathName, int mode) {
-    if (allowFakeDevicePath || strcmp(pathName, "/sys/dev/char/226:128") == 0) {
+int access(const std::string &pathName, int mode) {
+    accessFuncCalled++;
+    if (sysCallsAccess != nullptr) {
+        return sysCallsAccess(pathName.c_str(), mode);
+    }
+    if (failAccess) {
+        return -1;
+    }
+    if (R_OK == mode) {
+        return 0;
+    }
+    if (F_OK == mode) {
+        if (mkfifoPathNamePassed == pathName) {
+            return 0;
+        }
+    }
+    if (allowFakeDevicePath || pathName == "/sys/dev/char/226:128") {
         return 0;
     }
     return -1;
@@ -222,6 +363,10 @@ int readlink(const char *path, char *buf, size_t bufsize) {
 }
 
 int getDevicePath(int deviceFd, char *buf, size_t &bufSize) {
+    if (sysCallsGetDevicePath != nullptr) {
+        return sysCallsGetDevicePath(deviceFd, buf, bufSize);
+    }
+
     if (deviceFd <= 0) {
         return -1;
     }
@@ -234,6 +379,7 @@ int getDevicePath(int deviceFd, char *buf, size_t &bufSize) {
 }
 
 int poll(struct pollfd *pollFd, unsigned long int numberOfFds, int timeout) {
+    pollFuncCalled++;
     if (sysCallsPoll != nullptr) {
         return sysCallsPoll(pollFd, numberOfFds, timeout);
     }
@@ -265,6 +411,9 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
 
 void *mmap(void *addr, size_t size, int prot, int flags, int fd, off_t off) noexcept {
     mmapFuncCalled++;
+    if (sysCallsMmap != nullptr) {
+        return sysCallsMmap(addr, size, prot, flags, fd, off);
+    }
     if (failMmap) {
         return reinterpret_cast<void *>(-1);
     }
@@ -290,8 +439,31 @@ void *mmap(void *addr, size_t size, int prot, int flags, int fd, off_t off) noex
     return ptr;
 }
 
+void *mremapFixed(void *oldAddress, size_t size, void *newAddress) noexcept {
+    mremapFixedFuncCalled++;
+    if (sysCallsMremapFixed != nullptr) {
+        return sysCallsMremapFixed(oldAddress, size, newAddress);
+    }
+    return newAddress;
+}
+
+void *mmapFixedNoReplace(void *address, size_t size) noexcept {
+    mmapFixedNoReplaceFuncCalled++;
+    if (sysCallsMmapFixedNoReplace != nullptr) {
+        return sysCallsMmapFixedNoReplace(address, size);
+    }
+    return address;
+}
+
 int munmap(void *addr, size_t size) noexcept {
     munmapFuncCalled++;
+    if (sysCallsMunmap != nullptr) {
+        return sysCallsMunmap(addr, size);
+    }
+    if (failMunmap) {
+        return -1;
+    }
+
     auto ptrIt = std::find(mmapVector.begin(), mmapVector.end(), addr);
     if (ptrIt != mmapVector.end()) {
         mmapVector.erase(ptrIt);
@@ -304,13 +476,15 @@ ssize_t read(int fd, void *buf, size_t count) {
     if (sysCallsRead != nullptr) {
         return sysCallsRead(fd, buf, count);
     }
+    readFuncCalled++;
     return 0;
 }
 
-ssize_t write(int fd, void *buf, size_t count) {
+ssize_t write(int fd, const void *buf, size_t count) {
     if (sysCallsWrite != nullptr) {
         return sysCallsWrite(fd, buf, count);
     }
+    writeFuncCalled++;
     return 0;
 }
 
@@ -322,16 +496,22 @@ int pipe(int pipeFd[2]) {
 }
 
 int fcntl(int fd, int cmd) {
+    if (failFcntl) {
+        return -1;
+    }
+
     if (cmd == F_GETFL) {
-        getFileDescriptorFlagsCalled++;
         return O_RDWR;
     }
     return 0;
 }
+
 int fcntl(int fd, int cmd, int arg) {
-    if (cmd == F_SETFL) {
-        setFileDescriptorFlagsCalled++;
-        passedFileDescriptorFlagsToSet = arg;
+    if (failFcntl1) {
+        return -1;
+    }
+    if (sysCallsFcntl != nullptr) {
+        return sysCallsFcntl(fd, cmd, arg);
     }
 
     return 0;
@@ -357,7 +537,7 @@ int mkstemp(char *fileName) {
 int flock(int fd, int flag) {
     flockCalled++;
 
-    if (fd > 0 && flockRetVal == 0) {
+    if (fd >= 0 && flockRetVal == 0) {
         return 0;
     }
 
@@ -393,6 +573,10 @@ int unlink(const std::string &pathname) {
     if (sysCallsUnlink != nullptr) {
         return sysCallsUnlink(pathname);
     }
+    if (mkfifoPathNamePassed == pathname) {
+        mkfifoPathNamePassed.clear();
+        mkfifoPathNamePassed.shrink_to_fit();
+    }
 
     return 0;
 }
@@ -405,5 +589,263 @@ int stat(const std::string &filePath, struct stat *statbuf) {
     return 0;
 }
 
+DIR *opendir(const char *name) {
+    opendirCalled++;
+    if (sysCallsOpendir != nullptr) {
+        return sysCallsOpendir(name);
+    }
+
+    return nullptr;
+}
+
+struct dirent *readdir(DIR *dir) {
+    readdirCalled++;
+    if (sysCallsReaddir != nullptr) {
+        return sysCallsReaddir(dir);
+    }
+
+    return nullptr;
+}
+
+int closedir(DIR *dir) {
+    closedirCalled++;
+    if (sysCallsClosedir != nullptr) {
+        return sysCallsClosedir(dir);
+    }
+
+    return 0;
+}
+
+off_t lseek(int fd, off_t offset, int whence) noexcept {
+    lseekCalledCount++;
+    if (sysCallsLseek != nullptr) {
+        return sysCallsLseek(fd, offset, whence);
+    }
+    return lseekReturn;
+}
+long sysconf(int name) {
+    return sysconfReturn;
+}
+int mkfifo(const char *pathname, mode_t mode) {
+    mkfifoFuncCalled++;
+    if (failMkfifo) {
+        errno = 0;
+        if (setErrno != 0) {
+            errno = setErrno;
+            setErrno = 0;
+        }
+        return -1;
+    }
+    if (nullptr == pathname) {
+        return -1;
+    }
+    mkfifoPathNamePassed = pathname;
+    return 0;
+}
+
+int pidfdopen(pid_t pid, unsigned int flags) {
+    pidfdopenCalled++;
+    if (sysCallsPidfdOpen != nullptr) {
+        return sysCallsPidfdOpen(pid, flags);
+    }
+    return 0;
+}
+
+int pidfdgetfd(int pid, int targetfd, unsigned int flags) {
+    pidfdgetfdCalled++;
+    if (sysCallsPidfdGetfd != nullptr) {
+        return sysCallsPidfdGetfd(pid, targetfd, flags);
+    }
+    return targetfd;
+}
+
+int prctl(int option, unsigned long arg) {
+    prctlCalled++;
+    if (sysCallsPrctl != nullptr) {
+        return sysCallsPrctl(option, arg);
+    }
+    return 0;
+}
+
+int socket(int domain, int type, int protocol) {
+    socketCalled++;
+    if (sysCallsSocket != nullptr) {
+        return sysCallsSocket(domain, type, protocol);
+    }
+    return 0;
+}
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    bindCalled++;
+    if (sysCallsBind != nullptr) {
+        return sysCallsBind(sockfd, addr, addrlen);
+    }
+    return 0;
+}
+
+int listen(int sockfd, int backlog) {
+    listenCalled++;
+    if (sysCallsListen != nullptr) {
+        return sysCallsListen(sockfd, backlog);
+    }
+    return 0;
+}
+
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    acceptCalled++;
+    if (sysCallsAccept != nullptr) {
+        return sysCallsAccept(sockfd, addr, addrlen);
+    }
+    return 0;
+}
+
+int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    connectCalled++;
+    if (sysCallsConnect != nullptr) {
+        return sysCallsConnect(sockfd, addr, addrlen);
+    }
+    return 0;
+}
+
+ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
+    sendCalled++;
+    if (sysCallsSend != nullptr) {
+        return sysCallsSend(sockfd, buf, len, flags);
+    }
+    return 0;
+}
+
+ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
+    recvCalled++;
+    if (sysCallsRecv != nullptr) {
+        return sysCallsRecv(sockfd, buf, len, flags);
+    }
+    return 0;
+}
+
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
+    sendmsgCalled++;
+    if (sysCallsSendmsg != nullptr) {
+        return sysCallsSendmsg(sockfd, msg, flags);
+    }
+    return 0;
+}
+
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
+    recvmsgCalled++;
+    if (sysCallsRecvmsg != nullptr) {
+        return sysCallsRecvmsg(sockfd, msg, flags);
+    }
+    return 0;
+}
+
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    setsockoptCalled++;
+    if (sysCallsSetsockopt != nullptr) {
+        return sysCallsSetsockopt(sockfd, level, optname, optval, optlen);
+    }
+    return 0;
+}
+
+int dup(int oldfd) {
+    dupCalled++;
+    if (sysCallsDup != nullptr) {
+        return sysCallsDup(oldfd);
+    }
+    return oldfd;
+}
+
+pid_t getpid() {
+    getpidCalled++;
+    if (sysCallsGetpid != nullptr) {
+        return sysCallsGetpid();
+    }
+    return 0;
+}
+
+int getrlimit(int resource, struct rlimit *rlim) {
+    getrlimitCalled++;
+    if (sysCallsGetrlimit != nullptr) {
+        return sysCallsGetrlimit(resource, rlim);
+    }
+    // Default: succeed with a reasonable limit
+    if (rlim != nullptr) {
+        rlim->rlim_cur = 1024;
+        rlim->rlim_max = 4096;
+    }
+    return 0;
+}
+
+FILE *fdopen(int fd, const char *mode) {
+    if (sysCallsFdopen != nullptr) {
+        return sysCallsFdopen(fd, mode);
+    }
+    return ::fdopen(fd, mode);
+}
+
+char *fgets(char *s, int size, FILE *stream) {
+    if (sysCallsFgets != nullptr) {
+        return sysCallsFgets(s, size, stream);
+    }
+    return ::fgets(s, size, stream);
+}
+
+int fclose(FILE *stream) {
+    if (sysCallsFclose != nullptr) {
+        return sysCallsFclose(stream);
+    }
+    return ::fclose(stream);
+}
+
+int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
+    if (sysCallsSetvbuf != nullptr) {
+        return sysCallsSetvbuf(stream, buf, mode, size);
+    }
+    return ::setvbuf(stream, buf, mode, size);
+}
+
+char **getEnviron() {
+    return NEO::ULT::getCurrentEnviron();
+}
+
 } // namespace SysCalls
+
+namespace ULT {
+
+static char *defaultTestEnviron[] = {nullptr};
+static char **mockEnviron = defaultTestEnviron;
+
+MockEnvironBackup::MockEnvironBackup(char **newEnviron)
+    : mockEnvironBackup(&mockEnviron, newEnviron) {
+}
+
+int MockEnvironBackup::defaultStatMock(const std::string &filePath, struct stat *statbuf) noexcept {
+    statbuf->st_mode = S_IFDIR;
+    return 0;
+}
+
+std::vector<char *> MockEnvironBackup::buildEnvironFromMap(
+    const std::unordered_map<std::string, std::string> &envs,
+    std::vector<std::string> &storage) {
+    storage.clear();
+    for (const auto &kv : envs) {
+        storage.push_back(kv.first + "=" + kv.second);
+    }
+    std::vector<char *> result;
+    for (auto &str : storage) {
+        result.push_back(const_cast<char *>(str.c_str()));
+    }
+    result.push_back(nullptr);
+    return result;
+}
+
+char **getCurrentEnviron() {
+    return mockEnviron;
+}
+
+void setMockEnviron(char **mock) {
+    mockEnviron = mock ? mock : defaultTestEnviron;
+}
+
+} // namespace ULT
 } // namespace NEO

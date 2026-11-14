@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,21 +22,36 @@ struct CrossThreadInfo;
 struct MultiDispatchInfo;
 
 template <typename GfxFamily>
-struct HardwareCommandsHelper : public PerThreadDataHelper {
-    using WALKER_TYPE = typename GfxFamily::WALKER_TYPE;
+struct HardwareCommandsHelperNoHeap : public PerThreadDataHelper {};
+
+template <typename GfxFamily>
+struct HardwareCommandsHelperWithHeap : public PerThreadDataHelper {
     using BINDING_TABLE_STATE = typename GfxFamily::BINDING_TABLE_STATE;
+};
+
+template <typename GfxFamily>
+using HardwareCommandsHelperBase = std::conditional_t<
+    GfxFamily::isHeaplessRequired(),
+    HardwareCommandsHelperNoHeap<GfxFamily>,
+    HardwareCommandsHelperWithHeap<GfxFamily>>;
+
+template <typename GfxFamily>
+struct HardwareCommandsHelper : public HardwareCommandsHelperBase<GfxFamily> {
+    using DefaultWalkerType = typename GfxFamily::DefaultWalkerType;
+    using INTERFACE_DESCRIPTOR_DATA = typename DefaultWalkerType::InterfaceDescriptorType;
     using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
-    using INTERFACE_DESCRIPTOR_DATA = typename GfxFamily::INTERFACE_DESCRIPTOR_DATA;
     using MI_ATOMIC = typename GfxFamily::MI_ATOMIC;
     using COMPARE_OPERATION = typename GfxFamily::MI_SEMAPHORE_WAIT::COMPARE_OPERATION;
 
-    static INTERFACE_DESCRIPTOR_DATA *getInterfaceDescriptor(
+    template <typename InterfaceDescryptorType>
+    static InterfaceDescryptorType *getInterfaceDescriptor(
         const IndirectHeap &indirectHeap,
         uint64_t offsetInterfaceDescriptor,
-        INTERFACE_DESCRIPTOR_DATA *inlineInterfaceDescriptor);
+        InterfaceDescryptorType *inlineInterfaceDescriptor);
 
     inline static uint32_t additionalSizeRequiredDsh();
 
+    template <typename WalkerType, typename InterfaceDescriptorType>
     static size_t sendInterfaceDescriptorData(
         const IndirectHeap &indirectHeap,
         uint64_t offsetInterfaceDescriptor,
@@ -51,9 +66,9 @@ struct HardwareCommandsHelper : public PerThreadDataHelper {
         const Kernel &kernel,
         uint32_t bindingTablePrefetchSize,
         PreemptionMode preemptionMode,
-        INTERFACE_DESCRIPTOR_DATA *inlineInterfaceDescriptor,
         const Device &device,
-        WALKER_TYPE *walkerCmd);
+        WalkerType *walkerCmd,
+        InterfaceDescriptorType *inlineInterfaceDescriptor);
 
     static void sendMediaStateFlush(
         LinearStream &commandStream,
@@ -64,13 +79,19 @@ struct HardwareCommandsHelper : public PerThreadDataHelper {
         size_t offsetInterfaceDescriptorData,
         size_t sizeInterfaceDescriptorData);
 
+    template <typename WalkerType>
     static size_t sendCrossThreadData(
         IndirectHeap &indirectHeap,
         Kernel &kernel,
         bool inlineDataProgrammingRequired,
-        WALKER_TYPE *walkerCmd,
-        uint32_t &sizeCrossThreadData);
+        bool localIdsGenerationByRuntime,
+        uint32_t requiredWalkOrder,
+        WalkerType *walkerCmd,
+        uint32_t &sizeCrossThreadData,
+        uint64_t scratchAddress,
+        const RootDeviceEnvironment &rootDeviceEnvironment);
 
+    template <typename WalkerType, typename InterfaceDescriptorType>
     static size_t sendIndirectState(
         LinearStream &commandStream,
         IndirectHeap &dsh,
@@ -84,10 +105,15 @@ struct HardwareCommandsHelper : public PerThreadDataHelper {
         const uint64_t offsetInterfaceDescriptorTable,
         uint32_t &interfaceDescriptorIndex,
         PreemptionMode preemptionMode,
-        WALKER_TYPE *walkerCmd,
-        INTERFACE_DESCRIPTOR_DATA *inlineInterfaceDescriptor,
+        WalkerType *walkerCmd,
+        InterfaceDescriptorType *inlineInterfaceDescriptor,
         bool localIdsGenerationByRuntime,
+        uint32_t requiredWalkOrder,
+        uint64_t scratchAddress,
         const Device &device);
+
+    template <typename WalkerType>
+    static void programInlineData(Kernel &kernel, WalkerType *walkerCmd, uint64_t indirectDataAddress, uint64_t scratchAddress);
 
     static void programPerThreadData(
         bool localIdsGenerationByRuntime,
@@ -98,13 +124,13 @@ struct HardwareCommandsHelper : public PerThreadDataHelper {
         const size_t localWorkSize[3]);
 
     static size_t getSizeRequiredCS();
-    static size_t getSizeRequiredForCacheFlush(const CommandQueue &commandQueue, const Kernel *kernel, uint64_t postSyncAddress);
 
     static size_t getSizeRequiredDSH(
         const Kernel &kernel);
     static size_t getSizeRequiredIOH(
         const Kernel &kernel,
-        size_t localWorkSize = 256);
+        const size_t localWorkSizes[3],
+        const RootDeviceEnvironment &rootDeviceEnvironment);
     static size_t getSizeRequiredSSH(
         const Kernel &kernel);
 
@@ -115,13 +141,11 @@ struct HardwareCommandsHelper : public PerThreadDataHelper {
     static size_t getTotalSizeRequiredSSH(
         const MultiDispatchInfo &multiDispatchInfo);
 
+    template <typename WalkerType>
     static void setInterfaceDescriptorOffset(
-        WALKER_TYPE *walkerCmd,
+        WalkerType *walkerCmd,
         uint32_t &interfaceDescriptorIndex);
 
-    static void programCacheFlushAfterWalkerCommand(LinearStream *commandStream, const CommandQueue &commandQueue, const Kernel *kernel, uint64_t postSyncAddress);
-
-    static bool inlineDataProgrammingRequired(const Kernel &kernel);
     static bool kernelUsesLocalIds(const Kernel &kernel);
     static size_t checkForAdditionalBTAndSetBTPointer(IndirectHeap &ssh, const Kernel &kernel);
 };

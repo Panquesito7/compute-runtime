@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/gmm_helper/resource_info.h"
@@ -15,6 +16,7 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/gl_wrapper.h"
 #include "shared/source/os_interface/product_helper.h"
 
 #include "opencl/extensions/public/cl_gl_private_intel.h"
@@ -27,7 +29,6 @@
 
 #include "CL/cl_gl.h"
 #include "config.h"
-#include <GL/gl.h>
 
 namespace NEO {
 Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl_GLenum target, cl_GLint miplevel, cl_GLuint texture,
@@ -56,18 +57,20 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
     AllocationProperties allocProperties(context->getDevice(0)->getRootDeviceIndex(),
                                          false, // allocateMemory
                                          0u,    // size
-                                         AllocationType::SHARED_IMAGE,
+                                         AllocationType::sharedImage,
                                          false, // isMultiStorageAllocation
                                          context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex()));
-    auto alloc = memoryManager->createGraphicsAllocationFromSharedHandle(texInfo.globalShareHandle, allocProperties, false, false, true, nullptr);
+    MemoryManager::OsHandleData osHandleData{texInfo.globalShareHandle};
+    auto alloc = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, allocProperties, false, false, true, nullptr);
 
     if (alloc == nullptr) {
         errorCode.set(CL_INVALID_GL_OBJECT);
         return nullptr;
     }
     if (texInfo.pGmmResInfo) {
-        DEBUG_BREAK_IF(alloc->getDefaultGmm() != nullptr);
-        alloc->setDefaultGmm(new Gmm(gmmHelper, texInfo.pGmmResInfo));
+        auto gmmResInfo = gmmHelper->getClientContext()->getGmmResInfoFromExternalResourceHandle(texInfo.pGmmResInfo);
+        auto gmmResourceInfo = std::unique_ptr<GmmResourceInfo>(GmmResourceInfo::create(gmmHelper->getClientContext(), gmmResInfo));
+        alloc->setDefaultGmm(std::make_unique<Gmm>(gmmHelper, gmmResourceInfo.get()));
     }
 
     auto gmm = alloc->getDefaultGmm();
@@ -95,26 +98,26 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
     }
 
     if (imgDesc.image_array_size > 1 || imgDesc.image_depth > 1) {
-        GMM_REQ_OFFSET_INFO GMMReqInfo = {};
-        GMMReqInfo.ArrayIndex = imgDesc.image_array_size > 1 ? 1 : 0;
-        GMMReqInfo.Slice = imgDesc.image_depth > 1 ? 1 : 0;
-        GMMReqInfo.ReqLock = 1;
-        gmm->gmmResourceInfo->getOffset(GMMReqInfo);
-        imgDesc.image_slice_pitch = GMMReqInfo.Lock.Offset;
+        GMM_REQ_OFFSET_INFO gmmReqInfo = {};
+        gmmReqInfo.ArrayIndex = imgDesc.image_array_size > 1 ? 1 : 0;
+        gmmReqInfo.Slice = imgDesc.image_depth > 1 ? 1 : 0;
+        gmmReqInfo.ReqLock = 1;
+        gmm->gmmResourceInfo->getOffset(gmmReqInfo);
+        imgDesc.image_slice_pitch = gmmReqInfo.Lock.Offset;
     } else {
         imgDesc.image_slice_pitch = alloc->getUnderlyingBufferSize();
     }
 
     uint32_t cubeFaceIndex = GmmTypesConverter::getCubeFaceIndex(target);
 
-    auto qPitch = gmm->queryQPitch(gmm->gmmResourceInfo->getResourceType());
+    auto qPitch = gmm->queryQPitch();
 
     if (setClImageFormat(texInfo.glInternalFormat, imgFormat) == false) {
         memoryManager->freeGraphicsMemory(alloc);
         errorCode.set(CL_INVALID_GL_OBJECT);
         return nullptr;
     }
-    auto surfaceFormatInfoAddress = Image::getSurfaceFormatFromTable(flags, &imgFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormatInfoAddress = Image::getSurfaceFormatFromTable(flags, &imgFormat);
     if (!surfaceFormatInfoAddress) {
         memoryManager->freeGraphicsMemory(alloc);
         errorCode.set(CL_INVALID_GL_OBJECT);
@@ -122,19 +125,25 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
     }
     auto surfaceFormatInfo = *surfaceFormatInfoAddress;
     if (texInfo.glInternalFormat != GL_RGB10) {
-        surfaceFormatInfo.surfaceFormat.genxSurfaceFormat = (GFX3DSTATE_SURFACEFORMAT)texInfo.glHWFormat;
+        surfaceFormatInfo.surfaceFormat.genxSurfaceFormat = (SurfaceFormat)texInfo.glHWFormat;
     }
+    bool hasUnifiedMcsSurface = texInfo.numberOfSamples > 1 && texInfo.globalShareHandleMCS == NULL && gmm->hasMultisampleControlSurface();
 
     GraphicsAllocation *mcsAlloc = nullptr;
     if (texInfo.globalShareHandleMCS) {
-        AllocationProperties allocProperties(context->getDevice(0)->getRootDeviceIndex(), 0, AllocationType::MCS, context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex()));
-        mcsAlloc = memoryManager->createGraphicsAllocationFromSharedHandle(texInfo.globalShareHandleMCS, allocProperties, false, false, true, nullptr);
+        AllocationProperties allocProperties(context->getDevice(0)->getRootDeviceIndex(), 0, AllocationType::mcs, context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex()));
+        MemoryManager::OsHandleData osHandleData{texInfo.globalShareHandleMCS};
+        mcsAlloc = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, allocProperties, false, false, true, nullptr);
         if (texInfo.pGmmResInfoMCS) {
-            DEBUG_BREAK_IF(mcsAlloc->getDefaultGmm() != nullptr);
-            mcsAlloc->setDefaultGmm(new Gmm(gmmHelper, texInfo.pGmmResInfoMCS));
+            auto gmmResInfoMcs = gmmHelper->getClientContext()->getGmmResInfoFromExternalResourceHandle(texInfo.pGmmResInfoMCS);
+            auto gmmResourceInfo = std::unique_ptr<GmmResourceInfo>(GmmResourceInfo::create(gmmHelper->getClientContext(), gmmResInfoMcs));
+            mcsAlloc->setDefaultGmm(std::make_unique<Gmm>(gmmHelper, gmmResourceInfo.get()));
         }
         mcsSurfaceInfo.pitch = getValidParam(static_cast<uint32_t>(mcsAlloc->getDefaultGmm()->gmmResourceInfo->getRenderPitch() / 128));
         mcsSurfaceInfo.qPitch = mcsAlloc->getDefaultGmm()->gmmResourceInfo->getQPitch();
+    } else if (hasUnifiedMcsSurface) {
+        mcsSurfaceInfo.pitch = getValidParam(static_cast<uint32_t>(gmm->gmmResourceInfo->getRenderPitch() / 128));
+        mcsSurfaceInfo.qPitch = gmm->gmmResourceInfo->getQPitch();
     }
     mcsSurfaceInfo.multisampleCount = GmmTypesConverter::getRenderMultisamplesCount(static_cast<uint32_t>(imgDesc.num_samples));
 
@@ -146,20 +155,21 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
     imgInfo.imgDesc = Image::convertDescriptor(imgDesc);
     imgInfo.surfaceFormat = &surfaceFormatInfo.surfaceFormat;
     imgInfo.qPitch = qPitch;
+    imgInfo.isDisplayable = gmm->gmmResourceInfo->isDisplayable();
 
     auto glTexture = new GlTexture(sharingFunctions, getClGlObjectType(target), texture, texInfo, target, std::max(miplevel, 0));
 
     if (texInfo.isAuxEnabled && alloc->getDefaultGmm()->unifiedAuxTranslationCapable()) {
         const auto &hwInfo = context->getDevice(0)->getHardwareInfo();
         const auto &productHelper = context->getDevice(0)->getProductHelper();
-        alloc->getDefaultGmm()->isCompressionEnabled = productHelper.isPageTableManagerSupported(hwInfo) ? memoryManager->mapAuxGpuVA(alloc)
-                                                                                                         : true;
+        alloc->getDefaultGmm()->setCompressionEnabled(productHelper.isPageTableManagerSupported(hwInfo) ? memoryManager->mapAuxGpuVA(alloc)
+                                                                                                        : true);
     }
     auto multiGraphicsAllocation = MultiGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex());
     multiGraphicsAllocation.addAllocation(alloc);
 
     return Image::createSharedImage(context, glTexture, mcsSurfaceInfo, std::move(multiGraphicsAllocation), mcsAlloc, flags, 0, &surfaceFormatInfo, imgInfo, cubeFaceIndex,
-                                    std::max(miplevel, 0), imgInfo.imgDesc.numMipLevels);
+                                    std::max(miplevel, 0), imgInfo.imgDesc.numMipLevels, hasUnifiedMcsSurface, errcodeRet);
 } // namespace NEO
 
 void GlTexture::synchronizeObject(UpdateData &updateData) {
@@ -200,7 +210,7 @@ cl_gl_object_type GlTexture::getClGlObjectType(cl_GLenum glType) {
 }
 
 uint32_t GlTexture::getClObjectType(cl_GLenum glType, bool returnClGlObjectType) {
-    // return cl_gl_object_type if returnClGlObjectType is ture, otherwise cl_mem_object_type
+    // return cl_gl_object_type if returnClGlObjectType is true, otherwise cl_mem_object_type
     uint32_t retValue = 0;
     switch (glType) {
     case GL_TEXTURE_1D:

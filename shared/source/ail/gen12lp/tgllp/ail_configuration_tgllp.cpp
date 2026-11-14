@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,11 +10,15 @@
 #include <map>
 #include <vector>
 
+constexpr static auto gfxProduct = IGFX_TIGERLAKE_LP;
+
+#include "shared/source/ail/ail_configuration_microsecond_resolution_adjustment.inl"
+
 namespace NEO {
-static EnableAIL<IGFX_TIGERLAKE_LP> enableAILTGLLP;
+static EnableAIL<gfxProduct> enableAILTGLLP;
 
 std::map<std::string_view, std::vector<AILEnumeration>> applicationMapTGLLP = {};
 
-template class AILConfigurationHw<IGFX_TIGERLAKE_LP>;
+template class AILConfigurationHw<gfxProduct>;
 
 } // namespace NEO

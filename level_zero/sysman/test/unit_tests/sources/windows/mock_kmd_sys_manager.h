@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,13 @@
 
 #pragma once
 
-#include "level_zero/sysman/source/windows/sysman_kmd_sys_manager.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include "level_zero/sysman/source/shared/windows/sysman_kmd_sys_manager.h"
 #include "level_zero/zes_api.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 constexpr uint32_t mockKmdVersionMajor = 1;
@@ -23,7 +26,7 @@ struct MockEventHandle {
     bool inited = false;
 };
 
-uint64_t convertTStoMicroSec(uint64_t TS, uint32_t freq);
+uint64_t convertTStoMicroSec(uint64_t ts, uint32_t freq);
 namespace KmdSysman = L0::Sysman::KmdSysman;
 struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
     ze_bool_t allowSetCalls = false;
@@ -35,6 +38,8 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
     bool requestMultipleSizeDiff = false;
     ze_result_t mockRequestSingleResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
     ze_result_t mockRequestMultipleResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    uint32_t failSelectiveRequestMultipleCount = 0;
+    uint32_t requestMultipleCallCount = 0;
 
     MockEventHandle handles[KmdSysman::Events::MaxEvents][mockKmdMaxHandlesPerEvent];
 
@@ -53,6 +58,12 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
         pBuffer += sizeof(KmdSysman::GfxSysmanReqHeaderOut);
 
         if (pRequest->inRequestId == KmdSysman::Requests::Power::CurrentPowerLimit1) {
+
+            if (pRequest->inDataSize != 0) {
+                pResponse->outDataSize = 0;
+                pResponse->outReturnCode = KmdSysman::KmdSysmanFail;
+                return;
+            }
             uint32_t *pPl1 = reinterpret_cast<uint32_t *>(pBuffer);
             *pPl1 = mockPowerLimit1;
             pResponse->outReturnCode = KmdSysman::KmdSysmanSuccess;
@@ -199,7 +210,6 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
     }
 
     bool validateInputBuffer(KmdSysman::GfxSysmanMainHeaderIn *pHeaderIn) {
-        uint32_t sizeCheck = pHeaderIn->inTotalsize;
         uint8_t *pBufferPtr = pHeaderIn->inBuffer;
 
         for (uint32_t i = 0; i < pHeaderIn->inNumElements; i++) {
@@ -209,7 +219,6 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
                 pRequest->inCommand == KmdSysman::Command::RegisterEvent) {
                 if (pRequest->inComponent >= KmdSysman::Component::InterfaceProperties && pRequest->inComponent < KmdSysman::Component::MaxComponents) {
                     pBufferPtr += sizeof(KmdSysman::GfxSysmanReqHeaderIn);
-                    sizeCheck -= sizeof(KmdSysman::GfxSysmanReqHeaderIn);
 
                     if (pRequest->inCommand == KmdSysman::Command::Set ||
                         pRequest->inCommand == KmdSysman::Command::RegisterEvent) {
@@ -217,7 +226,6 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
                             return false;
                         }
                         pBufferPtr += pRequest->inDataSize;
-                        sizeCheck -= pRequest->inDataSize;
                     }
                 } else {
                     return false;
@@ -225,10 +233,6 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
             } else {
                 return false;
             }
-        }
-
-        if (sizeCheck != 0) {
-            return false;
         }
 
         return true;
@@ -256,8 +260,7 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
             for (uint32_t i = 0; i < mockKmdMaxHandlesPerEvent; i++) {
                 if (!handles[pRequest->inRequestId][i].inited) {
                     handles[pRequest->inRequestId][i].inited = true;
-                    unsigned long long eventID = *(unsigned long long *)pBuffer;
-                    handles[pRequest->inRequestId][i].eventHandle = reinterpret_cast<HANDLE>(eventID);
+                    memcpy_s(&handles[pRequest->inRequestId][i].eventHandle, sizeof(HANDLE), pBuffer, sizeof(HANDLE));
                     found = true;
                     break;
                 }
@@ -309,10 +312,14 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
     }
 
     ze_result_t requestMultiple(std::vector<KmdSysman::RequestProperty> &vIn, std::vector<KmdSysman::ResponseProperty> &vOut) {
+        requestMultipleCallCount++;
         if (mockRequestMultiple == false) {
             return KmdSysManager::requestMultiple(vIn, vOut);
         } else {
-            if (requestMultipleSizeDiff == true) {
+            if (failSelectiveRequestMultipleCount && (failSelectiveRequestMultipleCount > requestMultipleCallCount)) {
+                return KmdSysManager::requestMultiple(vIn, vOut);
+            }
+            if (requestMultipleSizeDiff == true && vOut.size() == vIn.size()) {
                 KmdSysman::ResponseProperty temp;
                 vOut.push_back(temp);
             }
@@ -511,4 +518,5 @@ struct MockKmdSysManager : public L0::Sysman::KmdSysManager {
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

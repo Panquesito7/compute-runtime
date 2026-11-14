@@ -1,15 +1,17 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/context/context.h"
-#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue.h"
 
 #include "cl_api_tests.h"
 
@@ -19,7 +21,7 @@ using ClCreateCommandQueueTest = ApiTests;
 
 namespace ULT {
 
-TEST_F(ClCreateCommandQueueTest, GivenCorrectParametersWhenCreatingCommandQueueThenCommandQueueIsCreatedAndSuccessIsReturned) {
+TEST_F(ClCreateCommandQueueTest, givenCorrectParametersWhenCreatingCommandQueueThenCommandQueueIsCreatedAndSuccessIsReturned) {
     cl_command_queue cmdQ = nullptr;
     cl_queue_properties properties = 0;
 
@@ -32,24 +34,24 @@ TEST_F(ClCreateCommandQueueTest, GivenCorrectParametersWhenCreatingCommandQueueT
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-TEST_F(ClCreateCommandQueueTest, GivenNullContextWhenCreatingCommandQueueThenInvalidContextErrorIsReturned) {
+TEST_F(ClCreateCommandQueueTest, givenNullContextWhenCreatingCommandQueueThenInvalidContextErrorIsReturned) {
     clCreateCommandQueue(nullptr, testedClDevice, 0, &retVal);
     EXPECT_EQ(CL_INVALID_CONTEXT, retVal);
 }
 
-TEST_F(ClCreateCommandQueueTest, GivenNullDeviceWhenCreatingCommandQueueThenInvalidDeviceErrorIsReturned) {
+TEST_F(ClCreateCommandQueueTest, givenNullDeviceWhenCreatingCommandQueueThenInvalidDeviceErrorIsReturned) {
     clCreateCommandQueue(pContext, nullptr, 0, &retVal);
     EXPECT_EQ(CL_INVALID_DEVICE, retVal);
 }
 
-TEST_F(ClCreateCommandQueueTest, GivenDeviceNotAssociatedWithContextWhenCreatingCommandQueueThenInvalidDeviceErrorIsReturned) {
+TEST_F(ClCreateCommandQueueTest, givenDeviceNotAssociatedWithContextWhenCreatingCommandQueueThenInvalidDeviceErrorIsReturned) {
     UltClDeviceFactory deviceFactory{1, 0};
     EXPECT_FALSE(pContext->isDeviceAssociated(*deviceFactory.rootDevices[0]));
     clCreateCommandQueue(pContext, deviceFactory.rootDevices[0], 0, &retVal);
     EXPECT_EQ(CL_INVALID_DEVICE, retVal);
 }
 
-TEST_F(ClCreateCommandQueueTest, GivenInvalidPropertiesWhenCreatingCommandQueueThenInvalidValueErrorIsReturned) {
+TEST_F(ClCreateCommandQueueTest, givenInvalidPropertiesWhenCreatingCommandQueueThenInvalidValueErrorIsReturned) {
     cl_command_queue cmdQ = nullptr;
     cl_queue_properties properties = 0xf0000;
 
@@ -59,7 +61,7 @@ TEST_F(ClCreateCommandQueueTest, GivenInvalidPropertiesWhenCreatingCommandQueueT
     ASSERT_EQ(CL_INVALID_VALUE, retVal);
 }
 
-TEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedThenQueueIsSucesfullyCreated) {
+TEST_F(ClCreateCommandQueueTest, givenOoqParametersWhenQueueIsCreatedThenQueueIsSuccessfullyCreated) {
     cl_int retVal = CL_SUCCESS;
     cl_queue_properties ooq = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
     auto cmdq = clCreateCommandQueue(pContext, testedClDevice, ooq, &retVal);
@@ -68,24 +70,9 @@ TEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedThenQueueIs
     retVal = clReleaseCommandQueue(cmdq);
 }
 
-HWTEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedThenCommandStreamReceiverSwitchesToBatchingMode) {
-    using BaseType = typename CommandQueue::BaseType;
-    cl_int retVal = CL_SUCCESS;
-    cl_queue_properties ooq = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
-    auto clDevice = castToObject<ClDevice>(testedClDevice);
-    auto mockDevice = reinterpret_cast<MockDevice *>(&clDevice->getDevice());
-    auto &csr = mockDevice->getUltCommandStreamReceiver<FamilyType>();
-    EXPECT_EQ(DispatchMode::ImmediateDispatch, csr.dispatchMode);
-
-    auto cmdq = clCreateCommandQueue(pContext, testedClDevice, ooq, &retVal);
-    auto queue = castToObject<CommandQueue>(static_cast<BaseType *>(cmdq));
-    EXPECT_EQ(DispatchMode::BatchedDispatch, queue->getGpgpuCommandStreamReceiver().getDispatchMode());
-    retVal = clReleaseCommandQueue(cmdq);
-}
-
-HWTEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedAndUpdateTaskCountFromWaitEnabledThenCommandStreamReceiverDoesntSwitchToBatchingMode) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.UpdateTaskCountFromWait.set(3);
+HWTEST_F(ClCreateCommandQueueTest, givenOoqParametersWhenQueueIsCreatedThenCommandStreamReceiverSwitchesToBatchingMode) {
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
 
     using BaseType = typename CommandQueue::BaseType;
     cl_int retVal = CL_SUCCESS;
@@ -93,31 +80,52 @@ HWTEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedAndUpdate
     auto clDevice = castToObject<ClDevice>(testedClDevice);
     auto mockDevice = reinterpret_cast<MockDevice *>(&clDevice->getDevice());
     auto &csr = mockDevice->getUltCommandStreamReceiver<FamilyType>();
-    EXPECT_EQ(DispatchMode::ImmediateDispatch, csr.dispatchMode);
+    EXPECT_EQ(DispatchMode::immediateDispatch, csr.dispatchMode);
 
     auto cmdq = clCreateCommandQueue(pContext, testedClDevice, ooq, &retVal);
     auto queue = castToObject<CommandQueue>(static_cast<BaseType *>(cmdq));
-    EXPECT_EQ(DispatchMode::ImmediateDispatch, queue->getGpgpuCommandStreamReceiver().getDispatchMode());
+    EXPECT_EQ(DispatchMode::batchedDispatch, queue->getGpgpuCommandStreamReceiver().getDispatchMode());
     retVal = clReleaseCommandQueue(cmdq);
 }
 
-HWTEST_F(ClCreateCommandQueueTest, GivenForcedDispatchModeAndOoqParametersWhenQueueIsCreatedThenCommandStreamReceiverDoesntSwitchToBatchingMode) {
+HWTEST_F(ClCreateCommandQueueTest, givenOoqParametersWhenQueueIsCreatedAndUpdateTaskCountFromWaitEnabledThenCommandStreamReceiverDoesntSwitchToBatchingMode) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CsrDispatchMode.set(static_cast<int32_t>(DispatchMode::ImmediateDispatch));
+    debugManager.flags.UpdateTaskCountFromWait.set(3);
+
+    using BaseType = typename CommandQueue::BaseType;
+    cl_int retVal = CL_SUCCESS;
+    cl_queue_properties ooq = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
+    auto clDevice = castToObject<ClDevice>(testedClDevice);
+    auto mockDevice = reinterpret_cast<MockDevice *>(&clDevice->getDevice());
+    auto &csr = mockDevice->getUltCommandStreamReceiver<FamilyType>();
+    EXPECT_EQ(DispatchMode::immediateDispatch, csr.dispatchMode);
+
+    auto cmdq = clCreateCommandQueue(pContext, testedClDevice, ooq, &retVal);
+    auto queue = castToObject<CommandQueue>(static_cast<BaseType *>(cmdq));
+    EXPECT_EQ(DispatchMode::immediateDispatch, queue->getGpgpuCommandStreamReceiver().getDispatchMode());
+    retVal = clReleaseCommandQueue(cmdq);
+}
+
+HWTEST_F(ClCreateCommandQueueTest, givenForcedDispatchModeAndOoqParametersWhenQueueIsCreatedThenCommandStreamReceiverDoesntSwitchToBatchingMode) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.CsrDispatchMode.set(static_cast<int32_t>(DispatchMode::immediateDispatch));
 
     cl_int retVal = CL_SUCCESS;
     cl_queue_properties ooq = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
     auto clDevice = castToObject<ClDevice>(testedClDevice);
     auto mockDevice = reinterpret_cast<MockDevice *>(&clDevice->getDevice());
     auto &csr = mockDevice->getUltCommandStreamReceiver<FamilyType>();
-    EXPECT_EQ(DispatchMode::ImmediateDispatch, csr.dispatchMode);
+    EXPECT_EQ(DispatchMode::immediateDispatch, csr.dispatchMode);
 
     auto cmdq = clCreateCommandQueue(pContext, testedClDevice, ooq, &retVal);
-    EXPECT_EQ(DispatchMode::ImmediateDispatch, csr.dispatchMode);
+    EXPECT_EQ(DispatchMode::immediateDispatch, csr.dispatchMode);
     retVal = clReleaseCommandQueue(cmdq);
 }
 
-HWTEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedThenCommandStreamReceiverSwitchesToNTo1SubmissionModel) {
+HWTEST_F(ClCreateCommandQueueTest, givenOoqParametersWhenQueueIsCreatedThenCommandStreamReceiverSwitchesToNTo1SubmissionModel) {
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
+
     using BaseType = typename CommandQueue::BaseType;
     cl_int retVal = CL_SUCCESS;
     cl_queue_properties ooq = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
@@ -129,6 +137,20 @@ HWTEST_F(ClCreateCommandQueueTest, GivenOoqParametersWhenQueueIsCreatedThenComma
     auto cmdq = clCreateCommandQueue(pContext, testedClDevice, ooq, &retVal);
     auto queue = castToObject<CommandQueue>(static_cast<BaseType *>(cmdq));
     EXPECT_TRUE(queue->getGpgpuCommandStreamReceiver().isNTo1SubmissionModelEnabled());
+    retVal = clReleaseCommandQueue(cmdq);
+}
+
+HWTEST_F(ClCreateCommandQueueTest, givenGfxFamilyWhenQueueIsCreatedThenBcsEngineCountSetToValueFromGfxFamily) {
+    using BaseType = typename CommandQueue::BaseType;
+    cl_int retVal = CL_SUCCESS;
+    cl_queue_properties properties{};
+
+    auto cmdq = clCreateCommandQueue(pContext, testedClDevice, properties, &retVal);
+    auto queue = castToObject<CommandQueue>(static_cast<BaseType *>(cmdq));
+    auto mockQueue = static_cast<MockCommandQueue *>(queue);
+
+    EXPECT_EQ(FamilyType::bcsEngineCount, mockQueue->bcsEngineCount);
+
     retVal = clReleaseCommandQueue(cmdq);
 }
 

@@ -1,16 +1,24 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_container/encode_surface_state.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/image/image_surface_state.h"
+#include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/mocks/mock_gmm.h"
+#include "shared/test/common/mocks/mock_gmm_resource_info.h"
+#include "shared/test/common/mocks/mock_release_helper.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
-#include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/image/image_surface_state_fixture.h"
 
-#include "hw_cmds_xe_hpc_core_base.h"
+#include "gtest/gtest.h"
+
+#include <memory>
 
 using namespace NEO;
 
@@ -22,11 +30,11 @@ XE_HPC_CORETEST_F(ImageSurfaceStateTestsXeHpcCore, givenGmmWithMediaCompressedWh
     auto castSurfaceState = reinterpret_cast<typename FamilyType::RENDER_SURFACE_STATE *>(surfaceState.get());
     castSurfaceState->setAuxiliarySurfaceMode(FamilyType::RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE::AUXILIARY_SURFACE_MODE_AUX_CCS_E);
 
-    mockGmm->gmmResourceInfo->getResourceFlags()->Info.MediaCompressed = false;
+    static_cast<MockGmmResourceInfo *>(mockGmm->gmmResourceInfo.get())->mockResourceCreateParams.Flags.Info.MediaCompressed = false;
     EncodeSurfaceState<FamilyType>::setFlagsForMediaCompression(castSurfaceState, mockGmm.get());
     EXPECT_EQ(castSurfaceState->getAuxiliarySurfaceMode(), FamilyType::RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE::AUXILIARY_SURFACE_MODE_AUX_CCS_E);
     EXPECT_EQ(castSurfaceState->getMemoryCompressionEnable(), false);
-    mockGmm->gmmResourceInfo->getResourceFlags()->Info.MediaCompressed = true;
+    static_cast<MockGmmResourceInfo *>(mockGmm->gmmResourceInfo.get())->mockResourceCreateParams.Flags.Info.MediaCompressed = true;
     EncodeSurfaceState<FamilyType>::setFlagsForMediaCompression(castSurfaceState, mockGmm.get());
     EXPECT_EQ(castSurfaceState->getAuxiliarySurfaceMode(), FamilyType::RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE::AUXILIARY_SURFACE_MODE_AUX_NONE);
     EXPECT_EQ(castSurfaceState->getMemoryCompressionEnable(), true);
@@ -37,7 +45,7 @@ XE_HPC_CORETEST_F(ImageSurfaceStateTestsXeHpcCore, givenGmmWhenSetClearColorPara
     auto surfaceState = std::make_unique<char[]>(size);
     auto castSurfaceState = reinterpret_cast<typename FamilyType::RENDER_SURFACE_STATE *>(surfaceState.get());
 
-    mockGmm->gmmResourceInfo->getResourceFlags()->Gpu.IndirectClearColor = true;
+    static_cast<MockGmmResourceInfo *>(mockGmm->gmmResourceInfo.get())->mockResourceCreateParams.Flags.Gpu.IndirectClearColor = true;
     EncodeSurfaceState<FamilyType>::setClearColorParams(castSurfaceState, mockGmm.get());
     EXPECT_EQ(castSurfaceState->getClearValueAddressEnable(), true);
 }
@@ -47,11 +55,11 @@ XE_HPC_CORETEST_F(ImageSurfaceStateTestsXeHpcCore, givenGmmWithMediaCompressedWh
     auto surfaceState = std::make_unique<char[]>(size);
     auto castSurfaceState = reinterpret_cast<typename FamilyType::RENDER_SURFACE_STATE *>(surfaceState.get());
 
-    setMipTailStartLod<FamilyType>(castSurfaceState, nullptr);
+    ImageSurfaceStateHelper<FamilyType>::setMipTailStartLOD(castSurfaceState, nullptr);
 
-    EXPECT_EQ(castSurfaceState->getMipTailStartLod(), 0u);
+    EXPECT_EQ(castSurfaceState->getMipTailStartLOD(), 0u);
 
-    setMipTailStartLod<FamilyType>(castSurfaceState, mockGmm.get());
+    ImageSurfaceStateHelper<FamilyType>::setMipTailStartLOD(castSurfaceState, mockGmm.get());
 
-    EXPECT_EQ(castSurfaceState->getMipTailStartLod(), mockGmm->gmmResourceInfo->getMipTailStartLodSurfaceState());
+    EXPECT_EQ(castSurfaceState->getMipTailStartLOD(), mockGmm->gmmResourceInfo->getMipTailStartLODSurfaceState());
 }

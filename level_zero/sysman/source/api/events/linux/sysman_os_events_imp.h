@@ -1,0 +1,123 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include "level_zero/sysman/source/api/events/sysman_os_events.h"
+#include "level_zero/sysman/source/shared/linux/udev/udev_lib.h"
+#include <level_zero/zes_intel_gpu_sysman.h>
+
+#include <map>
+#include <mutex>
+#include <poll.h>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace L0 {
+namespace Sysman {
+
+class DrmNlApi;
+class LinuxSysmanDriverImp;
+class LinuxSysmanImp;
+class Ras;
+class UdevLib;
+class FsAccessInterface;
+struct DrmRasEvent;
+struct OsSysman;
+struct SysmanDeviceImp;
+
+enum class PollSourceType { udev,
+                            pipe,
+                            netlink,
+                            tracefs };
+
+struct PollDescriptor {
+    struct pollfd pfd;
+    PollSourceType type;
+};
+
+class LinuxEventsImp : public OsEvents, NEO::NonCopyableAndNonMovableClass {
+  public:
+    bool eventListen(zes_event_type_flags_t &pEvent, uint64_t timeout) override;
+    ze_result_t eventRegister(zes_event_type_flags_t events) override;
+    LinuxEventsImp() = delete;
+    LinuxEventsImp(OsSysman *pOsSysman);
+    ~LinuxEventsImp() override = default;
+
+  protected:
+    LinuxSysmanImp *pLinuxSysmanImp = nullptr;
+};
+
+class LinuxEventsUtil {
+
+  public:
+    LinuxEventsUtil() = delete;
+    LinuxEventsUtil(LinuxSysmanDriverImp *pOsSysmanDriverImp);
+    MOCKABLE_VIRTUAL ~LinuxEventsUtil() = default;
+
+    ze_result_t eventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents, zes_event_type_flags_t *pDriverEvents = nullptr);
+    void eventRegister(zes_event_type_flags_t events, SysmanDeviceImp *pSysmanDevice);
+    ze_result_t driverEventRegister(zes_event_type_flags_t events);
+
+  protected:
+    UdevLib *pUdevLib = nullptr;
+    DrmNlApi *pDrmNl = nullptr;
+    LinuxSysmanDriverImp *pLinuxSysmanDriverImp = nullptr;
+    int pipeFd[2] = {-1, -1};
+    std::map<SysmanDeviceImp *, zes_event_type_flags_t> deviceEventsMap;
+    std::map<SysmanDeviceImp *, std::string> sysmanDeviceToLastBdfPathMap;
+    zes_event_type_flags_t registeredDriverEvents = 0;
+    std::set<std::string> supportedPciDeviceAddresses;
+    bool supportedPciDeviceAddressesOutdated = false;
+    bool checkRasEvent(zes_event_type_flags_t &pEvent, SysmanDeviceImp *pSysmanDeviceImp, zes_event_type_flags_t registeredEvents);
+    bool isResetRequired(void *dev, zes_event_type_flags_t &pEvent);
+    bool checkDeviceDetachEvent(zes_event_type_flags_t &pEvent);
+    bool checkDeviceAttachEvent(zes_event_type_flags_t &pEvent);
+    bool checkDriverAttachDetachEvent(void *dev, zes_event_type_flags_t driverRegisteredEvents, zes_event_type_flags_t &driverEvents);
+    bool checkIfMemHealthChanged(void *dev, zes_event_type_flags_t &pEvent);
+    bool checkIfFabricPortStatusChanged(void *dev, zes_event_type_flags_t &pEvent);
+    bool checkDeviceWedgedEvent(void *dev, zes_event_type_flags_t &pEvent);
+    ze_result_t checkEventSourcesAvailable(const std::vector<zes_event_type_flags_t> &registeredEvents, zes_event_type_flags_t driverRegisteredEvents, uint32_t count, zes_device_handle_t *phDevices);
+    ze_result_t listenSystemEvents(zes_event_type_flags_t *pEvents, uint32_t count, std::vector<zes_event_type_flags_t> &registeredEvents, zes_device_handle_t *phDevices, uint64_t timeout, bool &eventReceived, zes_event_type_flags_t *pDriverEvents = nullptr);
+    bool checkDeviceEvents(std::vector<zes_event_type_flags_t> &registeredEvents, const std::map<uint32_t, std::string> &devIndexToDevBdfPathMap, FsAccessInterface *pFsAccess, zes_event_type_flags_t *pEvents, void *dev, zes_device_handle_t *phDevices);
+    void updateLastBdfPath(SysmanDeviceImp *device, LinuxSysmanImp *osInterface);
+    void getDevIndexToDevPathMap(std::vector<zes_event_type_flags_t> &registeredEvents, uint32_t count, zes_device_handle_t *phDevices, std::map<uint32_t, std::string> &devIndexToDevBdfPathMap, FsAccessInterface *&pFsAccess);
+    MOCKABLE_VIRTUAL void updateCperPollSource(zes_event_type_flags_t driverRegisteredEvents, std::vector<PollDescriptor> &pollSources, bool &cperRegistered);
+    void refreshDriverEventPollSources(zes_event_type_flags_t *pDriverEvents, zes_event_type_flags_t &driverRegisteredEvents, std::vector<PollDescriptor> &pollSources, bool &cperRegistered);
+    bool handleNetlinkEvents(zes_event_type_flags_t *pEvents, uint32_t count, zes_device_handle_t *phDevices, const std::vector<zes_event_type_flags_t> &registeredEvents);
+    bool processNetlinkRasEvent(const DrmRasEvent &netlinkEvent, zes_event_type_flags_t *pEvents, uint32_t count, zes_device_handle_t *phDevices, const std::vector<zes_event_type_flags_t> &registeredEvents);
+    static bool isSurvivabilityModeAsExpected(FsAccessInterface *pFsAccess, const std::string &devPath, const std::string &mode);
+    static bool isDrmCardNode(const std::string &eventDevPath, const std::string &pciDevPath);
+    static bool getPciAddressOfDrmCardNode(const std::string &eventDevPath, std::string &pciAddress);
+    void getSupportedPciDeviceAddresses(std::set<std::string> &pciAddresses);
+    void updateSupportedPciDeviceAddresses(zes_event_type_flags_t driverRegisteredEvents);
+    std::string action;
+
+  private:
+    static const std::string add;
+    static const std::string remove;
+    static const std::string change;
+    static const std::string unbind;
+    static const std::string bind;
+    static bool checkRasEventOccured(Ras *rasHandle);
+    std::once_flag initEventsOnce;
+    std::once_flag initNetlinkOnce;
+    std::once_flag initCperEventSupportOnce;
+    bool cperEventSupported = false;
+    std::mutex eventsMutex;
+
+  protected:
+    void init();
+    void initNetlink();
+};
+
+} // namespace Sysman
+} // namespace L0

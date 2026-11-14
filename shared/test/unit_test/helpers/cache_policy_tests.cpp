@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,61 +14,34 @@
 
 using namespace NEO;
 
-HWTEST2_F(ProductHelperTest, givenL1CachePolicyHelperWhenUnsupportedL1PoliciesAndGetDefaultL1CachePolicyThenReturnZero, IsAtMostXeHpCore) {
-    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(false), 0u);
-    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(true), 0u);
-}
-
-HWTEST2_F(ProductHelperTest, givenL1CachePolicyHelperWhenUnsupportedL1PoliciesAndGetUncached1CachePolicyThenReturnOne, IsAtMostXeHpCore) {
-    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getUncachedL1CachePolicy(), 1u);
-}
-
-HWTEST2_F(ProductHelperTest, givenAtLeastXeHpgCoreWhenGetL1CachePolicyThenReturnCorrectValue, IsAtLeastXeHpgCore) {
+HWTEST2_PRODUCT_F(ProductHelperTest, givenAtLeastXeHpgCoreWhenGetUncached1CachePolicyThenReturnCorrectValue, IsAtLeastXeCore) {
     using GfxFamily = typename HwMapper<productFamily>::GfxFamily;
-    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(false), GfxFamily::STATE_BASE_ADDRESS::L1_CACHE_POLICY_WBP);
-    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(true), GfxFamily::STATE_BASE_ADDRESS::L1_CACHE_POLICY_WBP);
+    auto policy = [&]() -> uint32_t {
+        if constexpr (GfxFamily::isHeaplessRequired()) {
+            return GfxFamily::RENDER_SURFACE_STATE::L1_CACHE_CONTROL_UC;
+        } else {
+            return GfxFamily::STATE_BASE_ADDRESS::L1_CACHE_CONTROL_UC;
+        }
+    }();
+    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getUncachedL1CachePolicy(), policy);
 }
 
-HWTEST2_F(ProductHelperTest, givenAtLeastXeHpgCoreWhenGetUncached1CachePolicyThenReturnCorrectValue, IsAtLeastXeHpgCore) {
-    using GfxFamily = typename HwMapper<productFamily>::GfxFamily;
-    EXPECT_EQ(L1CachePolicyHelper<productFamily>::getUncachedL1CachePolicy(), GfxFamily::STATE_BASE_ADDRESS::L1_CACHE_POLICY_UC);
-}
-
-HWTEST2_F(ProductHelperTest, givenAtLeastXeHpgCoreAndWriteBackPolicyWhenGetL1CachePolicyThenReturnCorrectValue, IsAtLeastXeHpgCore) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
-
-    const char *expectedStr = "-cl-store-cache-default=7 -cl-load-cache-default=4";
-    EXPECT_EQ(0, memcmp(L1CachePolicyHelper<productFamily>::getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
-    EXPECT_EQ(0, memcmp(L1CachePolicyHelper<productFamily>::getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
-}
-
-HWTEST2_F(ProductHelperTest, givenAtLeastXeHpgCoreAndForceAllResourcesUncachedWhenGetL1CachePolicyThenReturnCorrectValue, IsAtLeastXeHpgCore) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceAllResourcesUncached.set(true);
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(4);
-
-    const char *expectedStr = "-cl-store-cache-default=1 -cl-load-cache-default=1";
-    EXPECT_EQ(0, memcmp(L1CachePolicyHelper<productFamily>::getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
-    EXPECT_EQ(0, memcmp(L1CachePolicyHelper<productFamily>::getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
-}
-
-HWTEST2_F(ProductHelperTest, givenL1CachePolicyHelperWhenDebugFlagSetAndGetL1CachePolicyThenReturnCorrectValue, MatchAny) {
+HWTEST2_PRODUCT_F(ProductHelperTest, givenL1CachePolicyHelperWhenDebugFlagSetAndGetL1CachePolicyThenReturnCorrectValue, MatchAny) {
     DebugManagerStateRestore restorer;
 
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(0);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(0);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(false), 0u);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(true), 0u);
 
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(false), 2u);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(true), 2u);
 
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(3);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(3);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(false), 3u);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(true), 3u);
 
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(4);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(4);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(false), 4u);
     EXPECT_EQ(L1CachePolicyHelper<productFamily>::getL1CachePolicy(true), 4u);
 }
@@ -77,4 +50,14 @@ HWTEST_F(ProductHelperTest, givenL1CachePolicyInitializedWhenGettingPolicySettin
     L1CachePolicy policy(*productHelper);
     EXPECT_EQ(productHelper->getL1CachePolicy(true), policy.getL1CacheValue(true));
     EXPECT_EQ(productHelper->getL1CachePolicy(false), policy.getL1CacheValue(false));
+}
+
+HWTEST_F(ProductHelperTest, givenL1CachePolicyWhenSettingCachingPolicyThenBothDebuggerActiveAndInactiveValuesAreSet) {
+    L1CachePolicy policy(*productHelper);
+
+    constexpr uint32_t newCachingPolicy = 4;
+    policy.setCachingPolicy(newCachingPolicy);
+
+    EXPECT_EQ(newCachingPolicy, policy.getL1CacheValue(false));
+    EXPECT_EQ(newCachingPolicy, policy.getL1CacheValue(true));
 }

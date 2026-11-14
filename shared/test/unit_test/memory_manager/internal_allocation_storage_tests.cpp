@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,7 +11,9 @@
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/unit_test/utilities/containers_tests_helpers.h"
 
@@ -30,13 +32,44 @@ struct InternalAllocationStorageTest : public MemoryAllocatorFixture,
 
 TEST_F(InternalAllocationStorageTest, givenDebugFlagThatDisablesAllocationReuseWhenStoreReusableAllocationIsCalledThenAllocationIsReleased) {
     DebugManagerStateRestore stateRestorer;
-    DebugManager.flags.DisableResourceRecycling.set(true);
+    debugManager.flags.DisableResourceRecycling.set(true);
 
     auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), MemoryConstants::pageSize});
 
     storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), REUSABLE_ALLOCATION);
     EXPECT_NE(allocation, csr->getAllocationsForReuse().peekHead());
     EXPECT_TRUE(csr->getAllocationsForReuse().peekIsEmpty());
+}
+
+TEST_F(InternalAllocationStorageTest, givenRequiredSizeWhenDetachingThenOnlyTheFirstMatchingAllocationIsRemoved) {
+    auto first = std::make_unique<MockGraphicsAllocation>(nullptr, MemoryConstants::pageSize);
+    auto second = std::make_unique<MockGraphicsAllocation>(nullptr, MemoryConstants::pageSize64k);
+    auto third = std::make_unique<MockGraphicsAllocation>(nullptr, MemoryConstants::pageSize64k);
+    auto firstPtr = first.get();
+    auto secondPtr = second.get();
+    auto thirdPtr = third.get();
+    const auto allocationType = first->getAllocationType();
+    AllocationsList allocations;
+    allocations.pushTailOne(*first.release());
+    allocations.pushTailOne(*second.release());
+    allocations.pushTailOne(*third.release());
+
+    auto detached = allocations.detachAllocation(MemoryConstants::pageSize64k, nullptr, nullptr, allocationType);
+    ASSERT_EQ(secondPtr, detached.get());
+    EXPECT_EQ(firstPtr, allocations.peekHead());
+    EXPECT_EQ(thirdPtr, allocations.peekTail());
+    EXPECT_EQ(thirdPtr, firstPtr->next);
+    EXPECT_EQ(firstPtr, thirdPtr->prev);
+    EXPECT_EQ(nullptr, detached->next);
+    EXPECT_EQ(nullptr, detached->prev);
+
+    EXPECT_EQ(nullptr, allocations.detachAllocation(MemoryConstants::pageSize64k + 1, nullptr, nullptr, allocationType));
+    EXPECT_EQ(firstPtr, allocations.peekHead());
+    EXPECT_EQ(thirdPtr, allocations.peekTail());
+    EXPECT_EQ(firstPtr, allocations.detachAllocation(0, nullptr, nullptr, allocationType).get());
+    EXPECT_EQ(thirdPtr, allocations.detachAllocation(0, nullptr, nullptr, allocationType).get());
+    EXPECT_TRUE(allocations.peekIsEmpty());
+    EXPECT_EQ(nullptr, allocations.detachAllocation(0, nullptr, nullptr, allocationType));
 }
 
 TEST_F(InternalAllocationStorageTest, whenCleanAllocationListThenRemoveOnlyCompletedAllocations) {
@@ -78,14 +111,14 @@ TEST_F(InternalAllocationStorageTest, whenCleanAllocationListThenRemoveOnlyCompl
 }
 
 TEST_F(InternalAllocationStorageTest, whenAllocationIsStoredAsReusableButIsStillUsedThenCannotBeObtained) {
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::BUFFER, mockDeviceBitfield});
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::buffer, mockDeviceBitfield});
 
     storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(allocation), REUSABLE_ALLOCATION, 2u);
 
     auto *hwTag = csr->getTagAddress();
 
     *hwTag = 1u;
-    auto newAllocation = storage->obtainReusableAllocation(1, AllocationType::BUFFER);
+    auto newAllocation = storage->obtainReusableAllocation(1, AllocationType::buffer);
     EXPECT_EQ(nullptr, newAllocation);
     storage->cleanAllocationList(2u, REUSABLE_ALLOCATION);
 }
@@ -95,14 +128,14 @@ TEST_F(InternalAllocationStorageTest, whenGetDeferredAllocationsThenReturnDeferr
 }
 
 TEST_F(InternalAllocationStorageTest, whenAllocationIsStoredAsTemporaryAndIsStillUsedThenCanBeObtained) {
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::BUFFER, mockDeviceBitfield});
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::buffer, mockDeviceBitfield});
 
     storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION, 2u);
 
     auto *hwTag = csr->getTagAddress();
 
     *hwTag = 1u;
-    auto newAllocation = storage->obtainTemporaryAllocationWithPtr(1, allocation->getUnderlyingBuffer(), AllocationType::BUFFER);
+    auto newAllocation = storage->obtainTemporaryAllocationWithPtr(1, allocation->getUnderlyingBuffer(), AllocationType::buffer);
     EXPECT_EQ(allocation, newAllocation.get());
     EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
     memoryManager->freeGraphicsMemory(newAllocation.release());
@@ -112,23 +145,23 @@ TEST_F(InternalAllocationStorageTest, givenTemporaryAllocationWhenAllocationIsOb
     const uint32_t initialTaskCount = 37u;
     const uint32_t contextId = csr->getOsContext().getContextId();
 
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::BUFFER, mockDeviceBitfield});
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::buffer, mockDeviceBitfield});
     storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION, initialTaskCount);
     ASSERT_EQ(initialTaskCount, allocation->getTaskCount(contextId));
 
-    auto newAllocation = storage->obtainTemporaryAllocationWithPtr(1, allocation->getUnderlyingBuffer(), AllocationType::BUFFER);
+    auto newAllocation = storage->obtainTemporaryAllocationWithPtr(1, allocation->getUnderlyingBuffer(), AllocationType::buffer);
     EXPECT_EQ(allocation, newAllocation.get());
     EXPECT_EQ(CompletionStamp::notReady, allocation->getTaskCount(contextId));
     memoryManager->freeGraphicsMemory(newAllocation.release());
 }
 
 TEST_F(InternalAllocationStorageTest, whenObtainAllocationFromEmptyReuseListThenReturnNullptr) {
-    auto allocation2 = storage->obtainReusableAllocation(1, AllocationType::BUFFER);
+    auto allocation2 = storage->obtainReusableAllocation(1, AllocationType::buffer);
     EXPECT_EQ(nullptr, allocation2);
 }
 
 TEST_F(InternalAllocationStorageTest, whenCompletedAllocationIsStoredAsReusableAndThenCanBeObtained) {
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::BUFFER, mockDeviceBitfield});
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::buffer, mockDeviceBitfield});
     EXPECT_NE(nullptr, allocation);
 
     storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(allocation), REUSABLE_ALLOCATION, 2u);
@@ -137,16 +170,21 @@ TEST_F(InternalAllocationStorageTest, whenCompletedAllocationIsStoredAsReusableA
     auto *hwTag = csr->getTagAddress();
 
     *hwTag = 2u;
-    auto reusedAllocation = storage->obtainReusableAllocation(1, AllocationType::BUFFER).release();
+    auto reusedAllocation = storage->obtainReusableAllocation(1, AllocationType::buffer).release();
 
     EXPECT_EQ(allocation, reusedAllocation);
     EXPECT_TRUE(csr->getAllocationsForReuse().peekIsEmpty());
     memoryManager->freeGraphicsMemory(allocation);
 }
 
-TEST_F(InternalAllocationStorageTest, whenNotUsedAllocationIsStoredAsReusableAndThenCanBeObtained) {
+HWTEST_F(InternalAllocationStorageTest, whenNotUsedAllocationIsStoredAsReusableAndThenCanBeObtained) {
 
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::BUFFER, mockDeviceBitfield});
+    auto ultCsr = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(csr);
+    if (ultCsr->heaplessPrologProgrammed) {
+        ultCsr->taskCount.store(0);
+    }
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::buffer, mockDeviceBitfield});
     EXPECT_NE(nullptr, allocation);
     EXPECT_FALSE(allocation->isUsed());
     EXPECT_EQ(0u, csr->peekTaskCount());
@@ -156,7 +194,7 @@ TEST_F(InternalAllocationStorageTest, whenNotUsedAllocationIsStoredAsReusableAnd
     EXPECT_EQ(0u, allocation->getTaskCount(csr->getOsContext().getContextId()));
     EXPECT_FALSE(csr->getAllocationsForReuse().peekIsEmpty());
 
-    auto reusedAllocation = storage->obtainReusableAllocation(1, AllocationType::BUFFER).release();
+    auto reusedAllocation = storage->obtainReusableAllocation(1, AllocationType::buffer).release();
 
     EXPECT_EQ(allocation, reusedAllocation);
     EXPECT_TRUE(csr->getAllocationsForReuse().peekIsEmpty());
@@ -167,9 +205,9 @@ TEST_F(InternalAllocationStorageTest, whenObtainAllocationFromMidlleOfReusableLi
     auto &reusableAllocations = csr->getAllocationsForReuse();
     EXPECT_TRUE(reusableAllocations.peekIsEmpty());
 
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, 1, AllocationType::BUFFER, mockDeviceBitfield});
-    auto allocation2 = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, 10000, AllocationType::BUFFER, mockDeviceBitfield});
-    auto allocation3 = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, 1, AllocationType::BUFFER, mockDeviceBitfield});
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, 1, AllocationType::buffer, mockDeviceBitfield});
+    auto allocation2 = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, 10000, AllocationType::buffer, mockDeviceBitfield});
+    auto allocation3 = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, 1, AllocationType::buffer, mockDeviceBitfield});
 
     EXPECT_TRUE(reusableAllocations.peekIsEmpty());
     EXPECT_EQ(nullptr, allocation2->next);
@@ -199,7 +237,7 @@ TEST_F(InternalAllocationStorageTest, whenObtainAllocationFromMidlleOfReusableLi
     EXPECT_EQ(allocation3, allocation2->next);
     EXPECT_EQ(allocation, allocation2->prev);
 
-    auto reusableAllocation = storage->obtainReusableAllocation(10000, AllocationType::BUFFER).release();
+    auto reusableAllocation = storage->obtainReusableAllocation(10000, AllocationType::buffer).release();
     EXPECT_EQ(reusableAllocation, allocation2);
     EXPECT_EQ(nullptr, allocation2->next);
     EXPECT_EQ(nullptr, allocation2->prev);
@@ -220,70 +258,27 @@ TEST_F(InternalAllocationStorageTest, whenObtainAllocationFromMidlleOfReusableLi
 TEST_F(InternalAllocationStorageTest, givenAllocationWhenItIsPutOnReusableListWhenOtherAllocationTypeIsRequestedThenNullIsReturned) {
     EXPECT_TRUE(csr->getAllocationsForReuse().peekIsEmpty());
 
-    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::BUFFER, mockDeviceBitfield});
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, MemoryConstants::pageSize, AllocationType::buffer, mockDeviceBitfield});
     storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), REUSABLE_ALLOCATION);
 
     EXPECT_FALSE(csr->getAllocationsForReuse().peekIsEmpty());
 
-    auto internalAllocation = storage->obtainReusableAllocation(1, AllocationType::INTERNAL_HEAP);
+    auto internalAllocation = storage->obtainReusableAllocation(1, AllocationType::internalHeap);
     EXPECT_EQ(nullptr, internalAllocation);
 }
 
-class WaitAtDeletionAllocation : public MockGraphicsAllocation {
-  public:
-    WaitAtDeletionAllocation(void *buffer, size_t sizeIn)
-        : MockGraphicsAllocation(buffer, sizeIn) {
-        inDestructor = false;
-    }
-
-    std::mutex mutex;
-    std::atomic<bool> inDestructor;
-    ~WaitAtDeletionAllocation() override {
-        inDestructor = true;
-        std::lock_guard<std::mutex> lock(mutex);
-    }
-};
-
-TEST_F(InternalAllocationStorageTest, givenAllocationListWhenTwoThreadsCleanConcurrentlyThenBothThreadsCanAccessTheList) {
-    auto allocation1 = new WaitAtDeletionAllocation(nullptr, 0);
-    allocation1->updateTaskCount(1, csr->getOsContext().getContextId());
-    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation1), TEMPORARY_ALLOCATION);
-
-    std::unique_lock<std::mutex> allocationDeletionLock(allocation1->mutex);
-
-    auto allocation2 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), MemoryConstants::pageSize});
-    allocation2->updateTaskCount(2, csr->getOsContext().getContextId());
-    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation2), TEMPORARY_ALLOCATION);
-
-    std::mutex mutex;
-    std::unique_lock<std::mutex> lock(mutex);
-
-    std::thread thread1([&] {
-        storage->cleanAllocationList(1, TEMPORARY_ALLOCATION);
-    });
-
-    std::thread thread2([&] {
-        std::lock_guard<std::mutex> lock(mutex);
-        storage->cleanAllocationList(2, TEMPORARY_ALLOCATION);
-    });
-
-    while (!allocation1->inDestructor)
-        ;
-    lock.unlock();
-    allocationDeletionLock.unlock();
-
-    thread1.join();
-    thread2.join();
-
-    EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
-}
-
 HWTEST_F(InternalAllocationStorageTest, givenMultipleActivePartitionsWhenDetachingReusableAllocationThenCheckTaskCountFinishedOnAllTiles) {
-    auto ultCsr = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(csr);
-    csr->setActivePartitions(2u);
-    ultCsr->postSyncWriteOffset = 32;
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
 
-    auto tagAddress = csr->getTagAddress();
+    auto memoryManager = deviceFactory->rootDevices[0]->getMemoryManager();
+
+    auto ultCsr = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(deviceFactory->rootDevices[0]->getDefaultEngine().commandStreamReceiver);
+    ultCsr->setActivePartitions(2);
+    ultCsr->immWritePostSyncWriteOffset = 32;
+
+    auto storage = ultCsr->getInternalAllocationStorage();
+
+    auto tagAddress = ultCsr->getTagAddress();
     *tagAddress = 0xFF;
     tagAddress = ptrOffset(tagAddress, 32);
     *tagAddress = 0x0;
@@ -291,25 +286,108 @@ HWTEST_F(InternalAllocationStorageTest, givenMultipleActivePartitionsWhenDetachi
     auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), MemoryConstants::pageSize});
 
     storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), REUSABLE_ALLOCATION);
-    EXPECT_EQ(allocation, csr->getAllocationsForReuse().peekHead());
-    EXPECT_FALSE(csr->getAllocationsForReuse().peekIsEmpty());
-    allocation->updateTaskCount(1u, csr->getOsContext().getContextId());
+    EXPECT_EQ(allocation, ultCsr->getAllocationsForReuse().peekHead());
+    EXPECT_FALSE(ultCsr->getAllocationsForReuse().peekIsEmpty());
+    allocation->updateTaskCount(1u, ultCsr->getOsContext().getContextId());
 
-    std::unique_ptr<GraphicsAllocation> allocationReusable = csr->getAllocationsForReuse().detachAllocation(0, nullptr, csr, AllocationType::INTERNAL_HOST_MEMORY);
+    std::unique_ptr<GraphicsAllocation> allocationReusable = ultCsr->getAllocationsForReuse().detachAllocation(0, nullptr, ultCsr, AllocationType::internalHostMemory);
     EXPECT_EQ(nullptr, allocationReusable.get());
 
     *tagAddress = 0x1;
-    allocationReusable = csr->getAllocationsForReuse().detachAllocation(0, nullptr, csr, AllocationType::INTERNAL_HOST_MEMORY);
+    allocationReusable = ultCsr->getAllocationsForReuse().detachAllocation(0, nullptr, ultCsr, AllocationType::internalHostMemory);
     EXPECT_EQ(allocation, allocationReusable.get());
 
     memoryManager->freeGraphicsMemory(allocationReusable.release());
 }
+
+HWTEST_F(InternalAllocationStorageTest, givenSingleTempAllocationsListWhenStoringFromDifferentRootDeviceThenSelectCorrectly) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(2, 1));
+
+    auto memoryManager = deviceFactory->rootDevices[0]->getMemoryManager();
+
+    auto rootCsr0 = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(deviceFactory->rootDevices[0]->getDefaultEngine().commandStreamReceiver);
+    auto rootCsr1 = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(deviceFactory->rootDevices[1]->getDefaultEngine().commandStreamReceiver);
+
+    auto allocation0 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootCsr0->getRootDeviceIndex(), MemoryConstants::pageSize});
+    auto allocation1 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootCsr1->getRootDeviceIndex(), MemoryConstants::pageSize});
+
+    memoryManager->storeTemporaryAllocation(std::unique_ptr<GraphicsAllocation>(allocation0), rootCsr0->getOsContext().getContextId(), 0);
+    memoryManager->storeTemporaryAllocation(std::unique_ptr<GraphicsAllocation>(allocation1), rootCsr1->getOsContext().getContextId(), 0);
+
+    std::unique_ptr<GraphicsAllocation> allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(rootCsr1, MemoryConstants::pageSize, allocation0->getUnderlyingBuffer(), allocation0->getAllocationType());
+    EXPECT_EQ(nullptr, allocationReusable.get());
+
+    allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(rootCsr0, MemoryConstants::pageSize, allocation0->getUnderlyingBuffer(), allocation0->getAllocationType());
+    EXPECT_NE(nullptr, allocationReusable.get());
+
+    memoryManager->freeGraphicsMemory(allocationReusable.release());
+
+    allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(rootCsr0, MemoryConstants::pageSize, allocation1->getUnderlyingBuffer(), allocation1->getAllocationType());
+    EXPECT_EQ(nullptr, allocationReusable.get());
+
+    allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(rootCsr1, MemoryConstants::pageSize, allocation1->getUnderlyingBuffer(), allocation1->getAllocationType());
+    EXPECT_NE(nullptr, allocationReusable.get());
+
+    memoryManager->freeGraphicsMemory(allocationReusable.release());
+}
+
+HWTEST_F(InternalAllocationStorageTest, givenSingleTempAllocationsListWhenStoringFromDifferentTileThenSelectCorrectly) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+
+    auto memoryManager = deviceFactory->rootDevices[0]->getMemoryManager();
+
+    auto csr0 = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(deviceFactory->rootDevices[0]->getDefaultEngine().commandStreamReceiver);
+    auto csr1 = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(deviceFactory->subDevices[0]->getDefaultEngine().commandStreamReceiver);
+
+    auto allocation0 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr0->getRootDeviceIndex(), MemoryConstants::pageSize});
+    allocation0->storageInfo.subDeviceBitfield = csr0->deviceBitfield;
+    auto allocation1 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr1->getRootDeviceIndex(), MemoryConstants::pageSize});
+    allocation1->storageInfo.subDeviceBitfield = csr1->deviceBitfield;
+
+    memoryManager->storeTemporaryAllocation(std::unique_ptr<GraphicsAllocation>(allocation0), csr0->getOsContext().getContextId(), 0);
+    memoryManager->storeTemporaryAllocation(std::unique_ptr<GraphicsAllocation>(allocation1), csr1->getOsContext().getContextId(), 0);
+
+    std::unique_ptr<GraphicsAllocation> allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(csr1, MemoryConstants::pageSize, allocation0->getUnderlyingBuffer(), allocation0->getAllocationType());
+    EXPECT_EQ(nullptr, allocationReusable.get());
+
+    allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(csr0, MemoryConstants::pageSize, allocation0->getUnderlyingBuffer(), allocation0->getAllocationType());
+    EXPECT_NE(nullptr, allocationReusable.get());
+
+    memoryManager->freeGraphicsMemory(allocationReusable.release());
+
+    allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(csr0, MemoryConstants::pageSize, allocation1->getUnderlyingBuffer(), allocation1->getAllocationType());
+    EXPECT_EQ(nullptr, allocationReusable.get());
+
+    allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(csr1, MemoryConstants::pageSize, allocation1->getUnderlyingBuffer(), allocation1->getAllocationType());
+    EXPECT_NE(nullptr, allocationReusable.get());
+
+    memoryManager->freeGraphicsMemory(allocationReusable.release());
+}
+
+HWTEST_F(InternalAllocationStorageTest, givenSingleTempAllocationsListWhenStoringSysMemThenObtainCorrectly) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+
+    auto memoryManager = deviceFactory->rootDevices[0]->getMemoryManager();
+
+    auto csr = reinterpret_cast<UltCommandStreamReceiver<FamilyType> *>(deviceFactory->subDevices[0]->getDefaultEngine().commandStreamReceiver);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), MemoryConstants::pageSize});
+    allocation->storageInfo.subDeviceBitfield = 0;
+
+    memoryManager->storeTemporaryAllocation(std::unique_ptr<GraphicsAllocation>(allocation), csr->getOsContext().getContextId(), 0);
+
+    std::unique_ptr<GraphicsAllocation> allocationReusable = memoryManager->obtainTemporaryAllocationWithPtr(csr, MemoryConstants::pageSize, allocation->getUnderlyingBuffer(), allocation->getAllocationType());
+    EXPECT_NE(nullptr, allocationReusable.get());
+
+    memoryManager->freeGraphicsMemory(allocationReusable.release());
+}
+
 TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenTaskCountMetsExpectationAndItHasBeenAssignedThenAllocIsRemoved) {
     auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), MemoryConstants::pageSize});
     uint32_t expectedTaskCount = 10u;
     *csr->getTagAddress() = expectedTaskCount;
     allocation->updateTaskCount(expectedTaskCount, csr->getOsContext().getContextId());
-    allocation->hostPtrTaskCountAssignment = 0;
+    allocation->setHostPtrTaskCountAssignment(0);
     storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
     storage->cleanAllocationList(expectedTaskCount, TEMPORARY_ALLOCATION);
     EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
@@ -320,9 +398,320 @@ TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenTaskCountMetsEx
     uint32_t expectedTaskCount = 10u;
     *csr->getTagAddress() = expectedTaskCount;
     allocation->updateTaskCount(expectedTaskCount, csr->getOsContext().getContextId());
-    allocation->hostPtrTaskCountAssignment = 1;
+    allocation->setHostPtrTaskCountAssignment(1);
     storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
     storage->cleanAllocationList(expectedTaskCount, TEMPORARY_ALLOCATION);
     EXPECT_FALSE(csr->getTemporaryAllocations().peekIsEmpty());
-    allocation->hostPtrTaskCountAssignment = 0;
+    allocation->setHostPtrTaskCountAssignment(0);
+}
+
+struct InternalAllocationStorageTwoCsrsTest : public InternalAllocationStorageTest {
+    void SetUp() override {
+        InternalAllocationStorageTest::SetUp();
+        secondCsr = std::make_unique<MockCommandStreamReceiver>(*executionEnvironment, csr->getRootDeviceIndex(), csr->getOsContext().getDeviceBitfield());
+        auto secondContext = memoryManager->createAndRegisterOsContext(secondCsr.get(), EngineDescriptorHelper::getDefaultDescriptor());
+        secondCsr->setupContext(*secondContext);
+        memoryManager->callBaseAllocInUse = true;
+        *csr->getTagAddress() = completedTaskCount;
+        *secondCsr->getTagAddress() = completedTaskCount;
+    }
+
+    void TearDown() override {
+        secondCsr.reset();
+        InternalAllocationStorageTest::TearDown();
+    }
+
+    GraphicsAllocation *storeCompletedAllocationUsedByBothCsrs(AllocationType allocationType) {
+        const auto secondContextId = secondCsr->getOsContext().getContextId();
+        auto allocation = new MockGraphicsAllocation(csr->getRootDeviceIndex(), 1u, allocationType, nullptr, uint64_t{0}, uint64_t{0}, size_t{0}, MemoryPool::memoryNull, static_cast<size_t>(secondContextId) + 1u);
+        allocation->updateTaskCount(completedTaskCount, secondContextId);
+        storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION, completedTaskCount);
+        return allocation;
+    }
+
+    static constexpr TaskCountType completedTaskCount = 1u;
+    std::unique_ptr<MockCommandStreamReceiver> secondCsr;
+};
+
+TEST_F(InternalAllocationStorageTwoCsrsTest, givenCompletedExternalHostPtrAllocationUsedByTwoCsrsWhenOneCsrIsBusyThenAllocationIsKeptUntilBothCsrsAreFree) {
+    auto allocation = storeCompletedAllocationUsedByBothCsrs(AllocationType::externalHostPtr);
+    EXPECT_TRUE(allocation->isUsedByManyOsContexts());
+
+    secondCsr->tryObtainUniqueOwnershipFails = true;
+    storage->cleanAllocationList(completedTaskCount, TEMPORARY_ALLOCATION);
+    EXPECT_EQ(1u, secondCsr->tryObtainUniqueOwnershipCalled);
+    EXPECT_EQ(allocation, csr->getTemporaryAllocations().peekHead());
+
+    secondCsr->tryObtainUniqueOwnershipFails = false;
+    storage->cleanAllocationList(completedTaskCount, TEMPORARY_ALLOCATION);
+    EXPECT_EQ(2u, secondCsr->tryObtainUniqueOwnershipCalled);
+    EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
+}
+
+TEST_F(InternalAllocationStorageTwoCsrsTest, givenCompletedHostCopyAllocationUsedByTwoCsrsWhenOneCsrIsBusyThenAllocationIsKeptUntilBothCsrsAreFree) {
+    auto allocation = storeCompletedAllocationUsedByBothCsrs(AllocationType::internalHostMemory);
+
+    secondCsr->tryObtainUniqueOwnershipFails = true;
+    storage->cleanAllocationList(completedTaskCount, TEMPORARY_ALLOCATION);
+    EXPECT_EQ(1u, secondCsr->tryObtainUniqueOwnershipCalled);
+    EXPECT_EQ(allocation, csr->getTemporaryAllocations().peekHead());
+
+    secondCsr->tryObtainUniqueOwnershipFails = false;
+    storage->cleanAllocationList(completedTaskCount, TEMPORARY_ALLOCATION);
+    EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
+}
+
+TEST_F(InternalAllocationStorageTwoCsrsTest, givenCompletedAllocationNotBackedByHostPtrUsedByTwoCsrsWhenOneCsrIsBusyThenAllocationIsFreedWithoutLockingCsrs) {
+    storeCompletedAllocationUsedByBothCsrs(AllocationType::buffer);
+
+    secondCsr->tryObtainUniqueOwnershipFails = true;
+    storage->cleanAllocationList(completedTaskCount, TEMPORARY_ALLOCATION);
+    EXPECT_EQ(0u, secondCsr->tryObtainUniqueOwnershipCalled);
+    EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenDetectingOverlapWithExternalHostPtrThenOverlapIsDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *overlappingNonUsmHostPtr = reinterpret_cast<void *>(0x1800);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, overlappingNonUsmHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_TRUE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenRequestedAllocationIsOutsideImportedPageBoundaryThenOverlapIsNotDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *nonOverlappingNonUsmHostPtr = reinterpret_cast<void *>(0x3000);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, nonOverlappingNonUsmHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_FALSE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenOverlapAtStartBoundaryThenOverlapIsDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *overlappingNonUsmHostPtr = reinterpret_cast<void *>(0x800);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, overlappingNonUsmHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_TRUE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenOverlapAtEndBoundaryThenOverlapIsDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *overlappingNonUsmHostPtr = ptrOffset(hostPtr, allocSize - 0x100);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, overlappingNonUsmHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_TRUE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhennonUsmHostPtrPartialOverlapFoundIsNullptrThenNoOverlapDetection) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    void *overlappingNonUsmHostPtr = reinterpret_cast<void *>(0x1800);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, overlappingNonUsmHostPtr, AllocationType::externalHostPtr, nullptr);
+
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenTypeMatchesButIsNotExternalHostPtrThenNoOverlapDetection) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::buffer, mockDeviceBitfield});
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *overlappingNonUsmHostPtr = reinterpret_cast<void *>(0x1800);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, overlappingNonUsmHostPtr, AllocationType::buffer, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_FALSE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenAllocationUsageIsOtherThanTemporaryThenNoOverlapDetection) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), REUSABLE_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *overlappingNonUsmHostPtr = reinterpret_cast<void *>(0x1800);
+    auto result = csr->getAllocationsForReuse().detachAllocation(allocSize * 2, overlappingNonUsmHostPtr, csr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_FALSE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenSystemMemoryFlagMismatchThenNoOverlapDetection) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *hostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    allocation->storageInfo.systemMemoryForced = true;
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *overlappingNonUsmHostPtr = reinterpret_cast<void *>(0x1800);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, overlappingNonUsmHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_FALSE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenImportedStartPtrIsGreaterThanRequiredEndPtrThenNoOverlapDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *importedHostPtr = reinterpret_cast<void *>(0x4000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = importedHostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *requiredHostPtr = reinterpret_cast<void *>(0x1000);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, requiredHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_FALSE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenImportedEndPtrIsLessThanRequiredStartPtrThenNoOverlapDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *importedHostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = importedHostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *requiredHostPtr = reinterpret_cast<void *>(0x4000);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, requiredHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_FALSE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenInternalAllocationWhenImportedStartPtrIsLessThanRequiredEndPtrAndImportedEndPtrIsGreaterThanRequiredStartPtrThenOverlapDetected) {
+    constexpr size_t allocSize = MemoryConstants::pageSize;
+    void *importedHostPtr = reinterpret_cast<void *>(0x1000);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, allocSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = importedHostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    bool nonUsmHostPtrPartialOverlapFound = false;
+    void *requiredHostPtr = reinterpret_cast<void *>(0x1800);
+    auto result = storage->obtainTemporaryAllocationWithPtr(allocSize * 2, requiredHostPtr, AllocationType::externalHostPtr, &nonUsmHostPtrPartialOverlapFound);
+
+    EXPECT_TRUE(nonUsmHostPtrPartialOverlapFound);
+    EXPECT_EQ(nullptr, result);
+}
+
+TEST_F(InternalAllocationStorageTest, givenExternalHostPtrAllocationWhenObtainedWithoutOverlapDetectionAndRequestedSizeExceedsUnderlyingSizeThenAllocationNotReused) {
+    constexpr size_t underlyingSize = 256u;
+    constexpr size_t requestedSize = 2048u;
+    void *hostPtr = reinterpret_cast<void *>(MemoryConstants::pageSize);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, underlyingSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    allocation->setSize(underlyingSize);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    auto result = storage->obtainTemporaryAllocationWithPtr(requestedSize, hostPtr, AllocationType::externalHostPtr, nullptr);
+
+    EXPECT_EQ(nullptr, result);
+    EXPECT_FALSE(csr->getTemporaryAllocations().peekIsEmpty());
+}
+
+TEST_F(InternalAllocationStorageTest, givenExternalHostPtrAllocationWhenObtainedWithoutOverlapDetectionAndRequestedSizeFitsUnderlyingSizeThenAllocationReused) {
+    constexpr size_t underlyingSize = 2048u;
+    constexpr size_t requestedSize = 256u;
+    void *hostPtr = reinterpret_cast<void *>(MemoryConstants::pageSize);
+
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(AllocationProperties{0, underlyingSize, AllocationType::externalHostPtr, mockDeviceBitfield});
+    allocation->setAllocationType(AllocationType::externalHostPtr);
+    allocation->setSize(underlyingSize);
+    auto mockAllocation = static_cast<MockGraphicsAllocation *>(allocation);
+    mockAllocation->cpuPtr = hostPtr;
+
+    storage->storeAllocation(std::unique_ptr<GraphicsAllocation>(allocation), TEMPORARY_ALLOCATION);
+
+    auto result = storage->obtainTemporaryAllocationWithPtr(requestedSize, hostPtr, AllocationType::externalHostPtr, nullptr);
+
+    EXPECT_EQ(allocation, result.get());
+    EXPECT_TRUE(csr->getTemporaryAllocations().peekIsEmpty());
+    memoryManager->freeGraphicsMemory(result.release());
 }

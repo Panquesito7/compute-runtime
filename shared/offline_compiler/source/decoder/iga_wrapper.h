@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2021 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,21 +7,20 @@
 
 #pragma once
 
-#include "igfxfmid.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
+#include "neo_igfxfmid.h"
+
+#include <cstdint>
 #include <memory>
 #include <string>
 
 class MessagePrinter;
 
-struct IgaWrapper {
+struct IgaWrapper : NEO::NonCopyableAndNonMovableClass {
     IgaWrapper();
     MOCKABLE_VIRTUAL ~IgaWrapper();
-
-    IgaWrapper(IgaWrapper &) = delete;
-    IgaWrapper(const IgaWrapper &&) = delete;
-    IgaWrapper &operator=(const IgaWrapper &) = delete;
-    IgaWrapper &operator=(IgaWrapper &&) = delete;
 
     MOCKABLE_VIRTUAL bool tryDisassembleGenISA(const void *kernelPtr, uint32_t kernelSize, std::string &out);
     MOCKABLE_VIRTUAL bool tryAssembleGenISA(const std::string &inAsm, std::string &outBinary);
@@ -41,3 +40,5 @@ struct IgaWrapper {
 
     MessagePrinter *messagePrinter = nullptr;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<IgaWrapper>);

@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/offline_compiler/source/ocloc_error_code.h"
+#include "shared/offline_compiler/source/ocloc_api.h"
 #include "shared/source/device_binary_format/ar/ar_encoder.h"
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
 #include "shared/test/common/mocks/mock_modules_zebin.h"
@@ -24,11 +24,11 @@ TEST(OclocConcatTest, GivenNoArgumentsWhenInitializingThenErrorIsReturned) {
     auto oclocConcat = MockOclocConcat(&mockArgHelper);
     std::vector<std::string> args = {"ocloc", "concat"};
 
-    ::testing::internal::CaptureStdout();
+    mockArgHelper.messagePrinter.setSuppressMessages(true);
     auto error = oclocConcat.initialize(args);
-    const auto output = ::testing::internal::GetCapturedStdout();
+    const auto output = mockArgHelper.getLog();
 
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::INVALID_COMMAND_LINE), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_INVALID_COMMAND_LINE), error);
     const std::string expectedOutput = "No files to concatenate were provided.\n";
     EXPECT_EQ(expectedOutput, output);
 }
@@ -39,11 +39,11 @@ TEST(OclocConcatTest, GivenMissingFilesWhenInitializingThenErrorIsReturned) {
     auto oclocConcat = MockOclocConcat(&mockArgHelper);
     std::vector<std::string> args = {"ocloc", "concat", "fatBinary1.ar", "fatBinary2.ar"};
 
-    ::testing::internal::CaptureStdout();
+    mockArgHelper.messagePrinter.setSuppressMessages(true);
     auto error = oclocConcat.initialize(args);
-    const auto output = ::testing::internal::GetCapturedStdout();
+    const auto output = mockArgHelper.getLog();
 
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::INVALID_COMMAND_LINE), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_INVALID_COMMAND_LINE), error);
     const std::string expectedOutput = "fatBinary1.ar doesn't exist!\nfatBinary2.ar doesn't exist!\n";
     EXPECT_EQ(expectedOutput, output);
 }
@@ -56,11 +56,11 @@ TEST(OclocConcatTest, GivenValidArgsWhenInitializingThenFileNamesToConcatAndOutp
     auto oclocConcat = MockOclocConcat(&mockArgHelper);
     std::vector<std::string> args = {"ocloc", "concat", "fatBinary1.ar", "fatBinary2.ar", "-out", "fatBinary.ar"};
 
-    ::testing::internal::CaptureStdout();
+    mockArgHelper.messagePrinter.setSuppressMessages(true);
     auto error = oclocConcat.initialize(args);
-    const auto output = ::testing::internal::GetCapturedStdout();
+    const auto output = mockArgHelper.getLog();
 
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::SUCCESS), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_SUCCESS), error);
     EXPECT_TRUE(output.empty());
 
     EXPECT_EQ(args[2], oclocConcat.fileNamesToConcat[0]);
@@ -68,17 +68,17 @@ TEST(OclocConcatTest, GivenValidArgsWhenInitializingThenFileNamesToConcatAndOutp
     EXPECT_EQ(args[5], oclocConcat.fatBinaryName);
 }
 
-TEST(OclocConcatTest, GivenMissingOutFileNameAfterOutArgumentWhenInitalizingThenErrorIsReturned) {
+TEST(OclocConcatTest, GivenMissingOutFileNameAfterOutArgumentWhenInitializingThenErrorIsReturned) {
     MockOclocArgHelper::FilesMap mockArgHelperFilesMap{};
     MockOclocArgHelper mockArgHelper{mockArgHelperFilesMap};
     auto oclocConcat = MockOclocConcat(&mockArgHelper);
     std::vector<std::string> args = {"ocloc", "concat", "fatBinary1.ar", "fatBinary2.ar", "-out"};
 
-    ::testing::internal::CaptureStdout();
+    mockArgHelper.messagePrinter.setSuppressMessages(true);
     auto error = oclocConcat.initialize(args);
-    const auto output = ::testing::internal::GetCapturedStdout();
+    const auto output = mockArgHelper.getLog();
 
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::INVALID_COMMAND_LINE), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_INVALID_COMMAND_LINE), error);
     const std::string expectedOutput = "Missing out file name after \"-out\" argument\n";
     EXPECT_EQ(expectedOutput, output);
 }
@@ -95,7 +95,7 @@ TEST(OclocConcatTest, GivenErrorDuringDecodingArWhenConcatenatingThenErrorIsRetu
                                      "fatBinary2.ar"};
     auto error = oclocConcat.concatenate();
     const auto output = mockArgHelper.messagePrinter.getLog().str();
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::INVALID_FILE), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_INVALID_FILE), error);
     EXPECT_EQ("fatBinary1.ar : Error while decoding AR file\n", output);
 }
 
@@ -108,7 +108,7 @@ TEST(OclocConcatTest, GivenBinaryFileNonZebinWhenConcatenatingThenErrorIsReturne
     oclocConcat.fileNamesToConcat = {"binary.bin"};
     auto error = oclocConcat.concatenate();
     const auto output = mockArgHelper.messagePrinter.getLog().str();
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::INVALID_FILE), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_INVALID_FILE), error);
     EXPECT_EQ("binary.bin : Not a zebin file\n", output);
 }
 
@@ -124,7 +124,7 @@ TEST(OclocConcatTest, GivenZebinWithoutAOTProductConfigWhenConcatenatingThenErro
         oclocConcat.fileNamesToConcat = {"zebin.bin"};
         auto error = oclocConcat.concatenate();
         const auto output = mockArgHelper.messagePrinter.getLog().str();
-        EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::INVALID_FILE), error);
+        EXPECT_EQ(static_cast<uint32_t>(OCLOC_INVALID_FILE), error);
         EXPECT_EQ("zebin.bin : Couldn't find AOT product configuration in intelGTNotes section.\n", output);
     }
 }
@@ -139,15 +139,16 @@ TEST(OclocConcatTest, GivenZebinWithAOTNoteAndFatBinaryWhenConcatenatingThenCorr
         fatBinary = arEncoder.encode();
     }
 
-    ZebinTestData::ValidEmptyProgram zebin;
-    {
-        AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL; // 12.0.0
-        zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
-                            ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion), productConfig));
-    }
+    const AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL; // 12.0.0
+    const auto intelGTNote = ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion), productConfig);
+    ZebinTestData::ValidEmptyProgram zebin64;
+    zebin64.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT, intelGTNote);
+    ZebinTestData::ValidEmptyProgram<Elf::EI_CLASS_32> zebin32;
+    zebin32.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT, intelGTNote);
 
     MockOclocArgHelper::FilesMap mockArgHelperFilesMap{
-        {"binary.bin", std::string(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size())},
+        {"binary64.bin", std::string(reinterpret_cast<const char *>(zebin64.storage.data()), zebin64.storage.size())},
+        {"binary32.bin", std::string(reinterpret_cast<const char *>(zebin32.storage.data()), zebin32.storage.size())},
         {"fatBinary.ar", std::string(reinterpret_cast<const char *>(fatBinary.data()), fatBinary.size())}};
     MockOclocArgHelper mockArgHelper{mockArgHelperFilesMap};
     mockArgHelper.interceptOutput = true;
@@ -156,13 +157,14 @@ TEST(OclocConcatTest, GivenZebinWithAOTNoteAndFatBinaryWhenConcatenatingThenCorr
     auto oclocConcat = MockOclocConcat(&mockArgHelper);
     oclocConcat.fileNamesToConcat = {
         "fatBinary.ar",
-        "binary.bin",
+        "binary64.bin",
+        "binary32.bin",
     };
 
     auto error = oclocConcat.concatenate();
     const auto output = mockArgHelper.messagePrinter.getLog().str();
 
-    EXPECT_EQ(static_cast<uint32_t>(OclocErrorCode::SUCCESS), error);
+    EXPECT_EQ(static_cast<uint32_t>(OCLOC_SUCCESS), error);
     EXPECT_TRUE(output.empty());
     EXPECT_EQ(1U, mockArgHelper.interceptedFiles.size());
 
@@ -171,10 +173,11 @@ TEST(OclocConcatTest, GivenZebinWithAOTNoteAndFatBinaryWhenConcatenatingThenCorr
     auto concatedAr = NEO::Ar::decodeAr(ArrayRef<const uint8_t>::fromAny(reinterpret_cast<const uint8_t *>(concatedFatBinary.data()), concatedFatBinary.size()), errors, warnings);
     EXPECT_TRUE(errors.empty());
     EXPECT_TRUE(warnings.empty());
-    ASSERT_EQ(6U, concatedAr.files.size());
+    ASSERT_EQ(8U, concatedAr.files.size());
     EXPECT_EQ("10.0.0", concatedAr.files[1].fileName);
     EXPECT_EQ("11.0.0", concatedAr.files[3].fileName);
-    EXPECT_EQ("12.0.0", concatedAr.files[5].fileName);
+    EXPECT_EQ("64.12.0.0", concatedAr.files[5].fileName);
+    EXPECT_EQ("32.12.0.0", concatedAr.files[7].fileName);
 }
 
 } // namespace NEO

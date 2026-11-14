@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,13 +18,17 @@ namespace NEO {
 class MockBuiltins : public BuiltIns {
   public:
     using BuiltIns::perContextSipKernels;
+    using BuiltIns::sipKernels;
 
     const SipKernel &getSipKernel(SipKernelType type, Device &device) override {
-        if (sipKernelsOverride.find(type) != sipKernelsOverride.end()) {
-            return *sipKernelsOverride[type];
-        }
         getSipKernelCalled = true;
         getSipKernelType = type;
+        if (auto it = sipKernelsOverride.find(type); it != sipKernelsOverride.end()) {
+            return *it->second;
+        }
+        if (callBaseGetSipKernel) {
+            return BuiltIns::getSipKernel(type, device);
+        }
         MockSipData::mockSipKernel->type = type;
         return *MockSipData::mockSipKernel;
     }
@@ -34,6 +38,7 @@ class MockBuiltins : public BuiltIns {
     }
     std::map<SipKernelType, std::unique_ptr<MockSipKernel>> sipKernelsOverride;
     bool getSipKernelCalled = false;
-    SipKernelType getSipKernelType = SipKernelType::COUNT;
+    bool callBaseGetSipKernel = false;
+    SipKernelType getSipKernelType = SipKernelType::count;
 };
 } // namespace NEO

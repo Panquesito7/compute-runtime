@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,12 @@
 
 #pragma once
 
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
+
+namespace NEO {
+class GmmHelper;
+}
 
 using namespace NEO;
 
@@ -29,22 +31,22 @@ enum DumpFormat {
 };
 
 inline bool isWritableBuffer(GraphicsAllocation &gfxAllocation) {
-    return (gfxAllocation.getAllocationType() == AllocationType::BUFFER ||
-            gfxAllocation.getAllocationType() == AllocationType::BUFFER_HOST_MEMORY ||
-            gfxAllocation.getAllocationType() == AllocationType::EXTERNAL_HOST_PTR ||
-            gfxAllocation.getAllocationType() == AllocationType::MAP_ALLOCATION ||
-            gfxAllocation.getAllocationType() == AllocationType::SVM_GPU) &&
+    return (gfxAllocation.getAllocationType() == AllocationType::buffer ||
+            gfxAllocation.getAllocationType() == AllocationType::bufferHostMemory ||
+            gfxAllocation.getAllocationType() == AllocationType::externalHostPtr ||
+            gfxAllocation.getAllocationType() == AllocationType::mapAllocation ||
+            gfxAllocation.getAllocationType() == AllocationType::svmGpu) &&
            gfxAllocation.isMemObjectsAllocationWithWritableFlags();
 }
 
 inline bool isWritableImage(GraphicsAllocation &gfxAllocation) {
-    return (gfxAllocation.getAllocationType() == AllocationType::IMAGE) &&
+    return (gfxAllocation.getAllocationType() == AllocationType::image) &&
            gfxAllocation.isMemObjectsAllocationWithWritableFlags();
 }
 
 inline DumpFormat getDumpFormat(GraphicsAllocation &gfxAllocation) {
-    auto dumpBufferFormat = DebugManager.flags.AUBDumpBufferFormat.get();
-    auto dumpImageFormat = DebugManager.flags.AUBDumpImageFormat.get();
+    auto dumpBufferFormat = debugManager.flags.AUBDumpBufferFormat.get();
+    auto dumpImageFormat = debugManager.flags.AUBDumpImageFormat.get();
     auto isDumpableBuffer = isWritableBuffer(gfxAllocation);
     auto isDumpableImage = isWritableImage(gfxAllocation);
     auto dumpFormat = DumpFormat::NONE;
@@ -75,23 +77,5 @@ inline bool isImageDumpFormat(DumpFormat dumpFormat) {
 }
 
 template <typename GfxFamily>
-aub_stream::SurfaceInfo *getDumpSurfaceInfo(GraphicsAllocation &gfxAllocation, DumpFormat dumpFormat);
-
-template <typename GfxFamily>
-uint32_t getImageSurfaceTypeFromGmmResourceType(GMM_RESOURCE_TYPE gmmResourceType);
-
-template <typename GfxFamily>
-void dumpBufferInBinFormat(GraphicsAllocation &gfxAllocation, AubMemDump::AubFileStream *stream, uint32_t context);
-
-template <typename GfxFamily>
-void dumpImageInBmpFormat(GraphicsAllocation &gfxAllocation, AubMemDump::AubFileStream *stream, uint32_t context);
-
-template <typename GfxFamily>
-void dumpBufferInTreFormat(GraphicsAllocation &gfxAllocation, AubMemDump::AubFileStream *stream, uint32_t context);
-
-template <typename GfxFamily>
-void dumpImageInTreFormat(GraphicsAllocation &gfxAllocation, AubMemDump::AubFileStream *stream, uint32_t context);
-
-template <typename GfxFamily>
-void dumpAllocation(DumpFormat dumpFormat, GraphicsAllocation &gfxAllocation, AubMemDump::AubFileStream *stream, uint32_t context);
+aub_stream::SurfaceInfo *getDumpSurfaceInfo(GraphicsAllocation &gfxAllocation, const GmmHelper &gmmHelper, DumpFormat dumpFormat);
 } // namespace AubAllocDump

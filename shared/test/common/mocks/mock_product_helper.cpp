@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/cache_policy.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/hw_info.h"
@@ -13,6 +13,9 @@
 #include "shared/source/helpers/local_memory_access_modes.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/os_interface/product_helper_hw.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+
+#include "aubstream/stepping_values.h"
 
 namespace NEO {
 
@@ -31,15 +34,11 @@ uint32_t ProductHelperHw<IGFX_UNKNOWN>::getMaxThreadsForWorkgroup(const Hardware
 }
 
 template <>
-void ProductHelperHw<IGFX_UNKNOWN>::setForceNonCoherent(void *const commandPtr, const StateComputeModeProperties &properties) const {
+void ProductHelperHw<IGFX_UNKNOWN>::setForceNonCoherent(void *const commandPtr) const {
 }
 
 template <>
-void ProductHelperHw<IGFX_UNKNOWN>::adjustPlatformForProductFamily(HardwareInfo *hwInfo) {
-}
-
-template <>
-uint64_t ProductHelperHw<IGFX_UNKNOWN>::getHostMemCapabilities(const HardwareInfo *hwInfo) const {
+uint64_t ProductHelperHw<IGFX_UNKNOWN>::getHostMemCapabilities() const {
     return 0;
 }
 
@@ -49,7 +48,7 @@ uint64_t ProductHelperHw<IGFX_UNKNOWN>::getDeviceMemCapabilities() const {
 }
 
 template <>
-uint64_t ProductHelperHw<IGFX_UNKNOWN>::getSingleDeviceSharedMemCapabilities() const {
+uint64_t ProductHelperHw<IGFX_UNKNOWN>::getSingleDeviceSharedMemCapabilities(bool) const {
     return 0;
 }
 
@@ -59,26 +58,17 @@ uint64_t ProductHelperHw<IGFX_UNKNOWN>::getCrossDeviceSharedMemCapabilities() co
 }
 
 template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::useGemCreateExtInAllocateMemoryByKMD() const {
+    return false;
+}
+
+template <>
 uint64_t ProductHelperHw<IGFX_UNKNOWN>::getSharedSystemMemCapabilities(const HardwareInfo *hwInfo) const {
     return 0;
 }
 
 template <>
-void ProductHelperHw<IGFX_UNKNOWN>::getKernelExtendedProperties(uint32_t *fp16, uint32_t *fp32, uint32_t *fp64) const {
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::overrideGfxPartitionLayoutForWsl() const {
-    return false;
-}
-
-template <>
 uint32_t ProductHelperHw<IGFX_UNKNOWN>::getDeviceMemoryMaxClkRate(const HardwareInfo &hwInfo, const OSInterface *osIface, uint32_t subDeviceIndex) const {
-    return 0;
-}
-
-template <>
-uint64_t ProductHelperHw<IGFX_UNKNOWN>::getDeviceMemoryPhysicalSizeInBytes(const OSInterface *osIface, uint32_t subDeviceIndex) const {
     return 0;
 }
 
@@ -129,25 +119,16 @@ uint32_t ProductHelperHw<IGFX_UNKNOWN>::getAubStreamSteppingFromHwRevId(const Ha
     case REVISION_A0:
     case REVISION_A1:
     case REVISION_A3:
-        return AubMemDump::SteppingValues::A;
+        return aub_stream::SteppingValues::A;
     case REVISION_B:
-        return AubMemDump::SteppingValues::B;
+        return aub_stream::SteppingValues::B;
     case REVISION_C:
-        return AubMemDump::SteppingValues::C;
+        return aub_stream::SteppingValues::C;
     case REVISION_D:
-        return AubMemDump::SteppingValues::D;
+        return aub_stream::SteppingValues::D;
     case REVISION_K:
-        return AubMemDump::SteppingValues::K;
+        return aub_stream::SteppingValues::K;
     }
-}
-template <>
-std::string ProductHelperHw<IGFX_UNKNOWN>::getDeviceMemoryName() const {
-    return "";
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isDefaultEngineTypeAdjustmentRequired(const HardwareInfo &hwInfo) const {
-    return false;
 }
 
 template <>
@@ -156,23 +137,23 @@ bool ProductHelperHw<IGFX_UNKNOWN>::isDisableOverdispatchAvailable(const Hardwar
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::allowCompression(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::isDirectSubmissionSupported() const {
     return false;
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isDirectSubmissionSupported(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::isDirectSubmissionConstantCacheInvalidationNeeded(const HardwareInfo &hwInfo) const {
     return false;
 }
 
 template <>
 LocalMemoryAccessMode ProductHelperHw<IGFX_UNKNOWN>::getDefaultLocalMemoryAccessMode(const HardwareInfo &hwInfo) const {
-    return LocalMemoryAccessMode::Default;
+    return LocalMemoryAccessMode::defaultMode;
 }
 
 template <>
 LocalMemoryAccessMode ProductHelperHw<IGFX_UNKNOWN>::getLocalMemoryAccessMode(const HardwareInfo &hwInfo) const {
-    return LocalMemoryAccessMode::Default;
+    return LocalMemoryAccessMode::defaultMode;
 }
 
 template <>
@@ -181,56 +162,16 @@ std::vector<int32_t> ProductHelperHw<IGFX_UNKNOWN>::getKernelSupportedThreadArbi
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isAllocationSizeAdjustmentRequired(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::deferMOCSToPatIndex(bool isWddmOnLinux) const {
     return false;
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isPrefetchDisablingRequired(const ReleaseHelper *releaseHelper) const {
-    return false;
+void ProductHelperHw<IGFX_UNKNOWN>::setCapabilityCoherencyFlag(const HardwareInfo &hwInfo, bool &coherencyFlag) const {
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isNewResidencyModelSupported() const {
-    return false;
-}
-
-template <>
-std::pair<bool, bool> ProductHelperHw<IGFX_UNKNOWN>::isPipeControlPriorToNonPipelinedStateCommandsWARequired(const HardwareInfo &hwInfo, bool isRcs, const ReleaseHelper *releaseHelper) const {
-    return {false, false};
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::heapInLocalMem(const HardwareInfo &hwInfo) const {
-    return false;
-}
-
-template <>
-void ProductHelperHw<IGFX_UNKNOWN>::setCapabilityCoherencyFlag(const HardwareInfo &hwInfo, bool &coherencyFlag) {
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isInitBuiltinAsyncSupported(const HardwareInfo &hwInfo) const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isAdditionalMediaSamplerProgrammingRequired() const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isInitialFlagsProgrammingRequired() const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isReturnedCmdSizeForMediaSamplerAdjustmentRequired() const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::extraParametersInvalid(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::isCopyBufferRectSplitSupported() const {
     return false;
 }
 
@@ -255,11 +196,6 @@ bool ProductHelperHw<IGFX_UNKNOWN>::is3DPipelineSelectWARequired() const {
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isStorageInfoAdjustmentRequired() const {
-    return false;
-}
-
-template <>
 bool ProductHelperHw<IGFX_UNKNOWN>::isBlitterForImagesSupported() const {
     return false;
 }
@@ -280,22 +216,7 @@ uint32_t ProductHelperHw<IGFX_UNKNOWN>::computeMaxNeededSubSliceSpace(const Hard
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::getUuid(Device *device, std::array<uint8_t, ProductHelper::uuidSize> &uuid) const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isFlushTaskAllowed() const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::programAllStateComputeCommandFields() const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isComputeDispatchAllWalkerEnableInComputeWalkerRequired(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::getUuid(NEO::DriverModel *driverModel, const uint32_t subDeviceCount, const uint32_t deviceIndex, std::array<uint8_t, CommonConstants::uuidSize> &uuid) const {
     return false;
 }
 
@@ -305,12 +226,7 @@ bool ProductHelperHw<IGFX_UNKNOWN>::isCopyEngineSelectorEnabled(const HardwareIn
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isGlobalFenceInCommandStreamRequired(const HardwareInfo &hwInfo) const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isAdjustProgrammableIdPreferredSlmSizeRequired(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::isReleaseGlobalFenceInCommandStreamRequired(const HardwareInfo &hwInfo) const {
     return false;
 }
 
@@ -330,15 +246,8 @@ bool ProductHelperHw<IGFX_UNKNOWN>::isVmBindPatIndexProgrammingSupported() const
 }
 
 template <>
-void ProductHelperHw<IGFX_UNKNOWN>::updateScmCommand(void *const commandPtr, const StateComputeModeProperties &properties) const {
-}
-
-template <>
-void ProductHelperHw<IGFX_UNKNOWN>::updateIddCommand(void *const commandPtr, uint32_t numGrf, int32_t threadArbitrationPolicy) const {
-}
-
-template <>
-void ProductHelperHw<IGFX_UNKNOWN>::enableCompression(HardwareInfo *hwInfo) const {
+bool ProductHelperHw<IGFX_UNKNOWN>::isVmBindDecompressionProbeAllowed(const HardwareInfo &hwInfo) const {
+    return false;
 }
 
 template <>
@@ -352,13 +261,13 @@ bool ProductHelperHw<IGFX_UNKNOWN>::isTimestampWaitSupportedForEvents() const {
 }
 
 template <>
-uint64_t ProductHelperHw<IGFX_UNKNOWN>::getHostMemCapabilitiesValue() const {
-    return 0;
+uint32_t ProductHelperHw<IGFX_UNKNOWN>::getInternalHeapsPreallocated() const {
+    return 0u;
 }
 
 template <>
-bool ProductHelperHw<IGFX_UNKNOWN>::isEvictionIfNecessaryFlagSupported() const {
-    return true;
+uint64_t ProductHelperHw<IGFX_UNKNOWN>::getHostMemCapabilitiesValue() const {
+    return 0;
 }
 
 template <>
@@ -377,11 +286,6 @@ bool ProductHelperHw<IGFX_UNKNOWN>::isPrefetcherDisablingInDirectSubmissionRequi
 }
 
 template <>
-uint32_t ProductHelperHw<IGFX_UNKNOWN>::getMaxNumSamplers() const {
-    return 0u;
-}
-
-template <>
 uint32_t L1CachePolicyHelper<IGFX_UNKNOWN>::getL1CachePolicy(bool isDebuggerActive) {
     return L1CachePolicyHelper<IGFX_UNKNOWN>::getDefaultL1CachePolicy(isDebuggerActive);
 }
@@ -391,10 +295,43 @@ uint32_t L1CachePolicyHelper<IGFX_UNKNOWN>::getUncachedL1CachePolicy() {
     return 1u;
 }
 
+template <>
+const SupportedNumGrfs ProductHelperHw<IGFX_UNKNOWN>::getSupportedNumGrfs(const ReleaseHelper &releaseHelper) const {
+    return releaseHelper.getSupportedNumGrfs();
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isHostUsmPoolAllocatorSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isDeviceUsmPoolAllocatorSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isDeviceUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isHostUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+std::optional<bool> ProductHelperHw<IGFX_UNKNOWN>::isCoherentAllocation(uint64_t patIndex) const {
+    return std::nullopt;
+}
+
+template <>
+uint32_t ProductHelperHw<IGFX_UNKNOWN>::getIsaPrefetchSize(uint32_t isaSize) const {
+    return std::min(isaSize, static_cast<uint32_t>(MemoryConstants::kiloByte));
+}
+
 struct UnknownProduct {
     struct FrontEndStateSupport {
-        static constexpr bool scratchSize = false;
-        static constexpr bool privateScratchSize = false;
         static constexpr bool computeDispatchAllWalker = false;
 
         static constexpr bool disableEuFusion = false;
@@ -404,27 +341,17 @@ struct UnknownProduct {
 
     struct StateComputeModeStateSupport {
         static constexpr bool threadArbitrationPolicy = false;
-        static constexpr bool coherencyRequired = false;
         static constexpr bool largeGrfMode = false;
         static constexpr bool zPassAsyncComputeThreadLimit = false;
         static constexpr bool pixelAsyncComputeThreadLimit = false;
-        static constexpr bool devicePreemptionMode = false;
     };
 
     struct StateBaseAddressStateSupport {
-        static constexpr bool globalAtomics = false;
         static constexpr bool bindingTablePoolBaseAddress = false;
     };
 
     struct PipelineSelectStateSupport {
-        static constexpr bool mediaSamplerDopClockGate = false;
         static constexpr bool systolicMode = false;
-    };
-
-    struct PreemptionDebugSupport {
-        static constexpr bool preemptionMode = false;
-        static constexpr bool stateSip = false;
-        static constexpr bool csrSurface = false;
     };
 
     static const uint32_t threadsPerEu = 8;
@@ -437,6 +364,49 @@ struct HwMapper<IGFX_UNKNOWN> {
     static const char *abbreviation;
     using GfxProduct = UnknownProduct;
 };
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::is48bResourceNeededForRayTracing() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isGraphPatchPreambleBarrierSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isCompressionForbidden(const HardwareInfo &hwInfo) const {
+    return false;
+}
+
+template <>
+void ProductHelperHw<IGFX_UNKNOWN>::setRenderCompressedFlags(HardwareInfo &hwInfo) const {}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isResourceUncachedForCS(AllocationType allocationType) const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isNonCoherentTimestampsModeEnabled() const {
+    return false;
+}
+
+template <>
+void ProductHelperHw<IGFX_UNKNOWN>::overrideDirectSubmissionTimeouts(uint64_t &timeoutUs) const {
+}
+
+template <>
+bool ProductHelperHw<IGFX_UNKNOWN>::isDisableScratchPagesSupported() const {
+    return false;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+uint32_t ProductHelperHw<gfxProduct>::getAvailableSlmSizePerSubslice(const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    return hwInfo.gtSystemInfo.SLMSizeInKb;
+}
 
 } // namespace NEO
 

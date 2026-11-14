@@ -1,0 +1,1696 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
+#include "shared/source/helpers/sleep.h"
+#include "shared/source/os_interface/linux/pmt_util.h"
+
+#include "level_zero/sysman/source/api/global_operations/linux/sysman_os_global_operations_imp.h"
+#include "level_zero/sysman/source/shared/linux/pmt/sysman_pmt.h"
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_hw.h"
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_hw.inl"
+#include "level_zero/sysman/source/shared/linux/zes_os_sysman_imp.h"
+#include "level_zero/sysman/source/sysman_const.h"
+#include "level_zero/zes_intel_gpu_sysman.h"
+
+#include <algorithm>
+#include <bit>
+#include <cctype>
+#include <chrono>
+#include <limits>
+#include <unordered_set>
+
+namespace L0 {
+namespace Sysman {
+constexpr static auto gfxProduct = IGFX_CRI;
+
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_xe_hp_and_later.inl"
+#include "level_zero/sysman/source/shared/product_helper/sysman_os_agnostic_product_helper_xe2_and_later.inl"
+
+constexpr static uint32_t busWidthPerMsuInBits = 64;
+constexpr static uint32_t transactionSize = 64;
+constexpr static uint32_t memoryBridgeCount = 2;
+constexpr static uint32_t maxMemoryMsuCount = 20;
+constexpr static uint32_t msuBitmaskMask = (1u << maxMemoryMsuCount) - 1;
+constexpr static uint32_t vramFrequencyClockRatio = 4;
+constexpr static uint32_t maxVrTemperatureSensorCount = 4;
+constexpr static uint32_t maxGpuBoardTemperatureSensorCount = 2;
+constexpr static uint32_t temperatureNotAvailable = 0xFFFFFFFF;
+const std::string throttleReasonPath = "freq0/throttle/";
+
+constexpr static std::string_view standbyPowerControlDefault("auto");
+constexpr static std::string_view standbyPowerControlNever("on");
+static const std::string standbyPowerControlFile("device/power/control");
+
+// XTAL clock frequency is denoted as an integer between [0-3] with a predefined value for each number.
+// This vector defines the predefined value for each integer represented by the index of the vector.
+static const std::vector<double> indexToXtalClockFrequencyMap = {24, 19.2, 38.4, 25};
+
+static std::map<std::string, std::map<std::string, uint64_t>> guidToKeyOffsetMap = {
+    {"0x1e2fa030", // CRI PUNIT rev 0
+     {{"ACCUM_PACKAGE_ENERGY", 48},
+      {"ACCUM_PSYS_ENERGY", 52},
+      {"AMB_TEMPERATURE", 176},
+      {"COMPOSITE_TEMPERATURE", 272},
+      {"INSTANTANEOUS_POWER_CONTAINER", 128},
+      {"VCCGT_ENERGY_ACCUMULATOR", 44},
+      {"VR_TEMPERATURE_0", 224},
+      {"VR_TEMPERATURE_1", 228},
+      {"VR_TEMPERATURE_2", 232},
+      {"VR_TEMPERATURE_3", 236},
+      {"VRAM_BANDWIDTH", 56},
+      {"VRAM_ENERGY_ACCUM_CONTAINER", 200},
+      {"VRAM_FREQUENCY", 56},
+      {"VCCDDRQX_VID", 60},
+      {"VCCDDRQ_VID", 60},
+      {"XTAL_COUNT", 512},
+      {"XTAL_CLK_FREQUENCY", 4}}},
+    {"0x5e2fa230", // CRI OOBMSM Rev 0
+     {{"SOC_TOPDIE_TEMPERATURE", 128},
+      {"VRAM_TEMPERATURE", 132},
+      {"PCIE_RECEIVE_BYTES", 520},
+      {"PCIE_TRANSMIT_BYTES", 528},
+      {"PCIE_RECEIVE_PACKETS", 536},
+      {"PCIE_TRANSMIT_PACKETS", 544},
+      {"PCIE_DNS_PARITY_ERRORS", 552},
+      {"PCIE_UPS_PARITY_ERRORS", 556},
+      {"SMLH_LTSSM_STATE", 560},
+      {"LPDDR_TELEM_CAPTURE_TIMESTAMP", 664},
+      {"MEMSS0_PERF_CTR_MB0_CFI_NUM_READ_REQ", 688},
+      {"MEMSS1_PERF_CTR_MB0_CFI_NUM_READ_REQ", 768},
+      {"MEMSS2_PERF_CTR_MB0_CFI_NUM_READ_REQ", 848},
+      {"MEMSS3_PERF_CTR_MB0_CFI_NUM_READ_REQ", 928},
+      {"MEMSS4_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1008},
+      {"MEMSS5_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1088},
+      {"MEMSS6_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1168},
+      {"MEMSS7_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1248},
+      {"MEMSS8_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1328},
+      {"MEMSS9_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1408},
+      {"MEMSS10_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1488},
+      {"MEMSS11_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1568},
+      {"MEMSS12_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1648},
+      {"MEMSS13_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1728},
+      {"MEMSS14_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1808},
+      {"MEMSS15_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1888},
+      {"MEMSS16_PERF_CTR_MB0_CFI_NUM_READ_REQ", 1968},
+      {"MEMSS17_PERF_CTR_MB0_CFI_NUM_READ_REQ", 2048},
+      {"MEMSS18_PERF_CTR_MB0_CFI_NUM_READ_REQ", 2128},
+      {"MEMSS19_PERF_CTR_MB0_CFI_NUM_READ_REQ", 2208},
+      {"MEMSS0_PERF_CTR_MB1_CFI_NUM_READ_REQ", 728},
+      {"MEMSS1_PERF_CTR_MB1_CFI_NUM_READ_REQ", 808},
+      {"MEMSS2_PERF_CTR_MB1_CFI_NUM_READ_REQ", 888},
+      {"MEMSS3_PERF_CTR_MB1_CFI_NUM_READ_REQ", 968},
+      {"MEMSS4_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1048},
+      {"MEMSS5_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1128},
+      {"MEMSS6_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1208},
+      {"MEMSS7_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1288},
+      {"MEMSS8_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1368},
+      {"MEMSS9_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1448},
+      {"MEMSS10_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1528},
+      {"MEMSS11_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1608},
+      {"MEMSS12_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1688},
+      {"MEMSS13_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1768},
+      {"MEMSS14_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1848},
+      {"MEMSS15_PERF_CTR_MB1_CFI_NUM_READ_REQ", 1928},
+      {"MEMSS16_PERF_CTR_MB1_CFI_NUM_READ_REQ", 2008},
+      {"MEMSS17_PERF_CTR_MB1_CFI_NUM_READ_REQ", 2088},
+      {"MEMSS18_PERF_CTR_MB1_CFI_NUM_READ_REQ", 2168},
+      {"MEMSS19_PERF_CTR_MB1_CFI_NUM_READ_REQ", 2248},
+      {"MEMSS0_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 680},
+      {"MEMSS1_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 760},
+      {"MEMSS2_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 840},
+      {"MEMSS3_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 920},
+      {"MEMSS4_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1000},
+      {"MEMSS5_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1080},
+      {"MEMSS6_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1160},
+      {"MEMSS7_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1240},
+      {"MEMSS8_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1320},
+      {"MEMSS9_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1400},
+      {"MEMSS10_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1480},
+      {"MEMSS11_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1560},
+      {"MEMSS12_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1640},
+      {"MEMSS13_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1720},
+      {"MEMSS14_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1800},
+      {"MEMSS15_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1880},
+      {"MEMSS16_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 1960},
+      {"MEMSS17_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 2040},
+      {"MEMSS18_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 2120},
+      {"MEMSS19_PERF_CTR_MB0_CFI_NUM_WRITE_REQ", 2200},
+      {"MEMSS0_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 720},
+      {"MEMSS1_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 800},
+      {"MEMSS2_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 880},
+      {"MEMSS3_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 960},
+      {"MEMSS4_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1040},
+      {"MEMSS5_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1120},
+      {"MEMSS6_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1200},
+      {"MEMSS7_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1280},
+      {"MEMSS8_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1360},
+      {"MEMSS9_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1440},
+      {"MEMSS10_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1520},
+      {"MEMSS11_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1600},
+      {"MEMSS12_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1680},
+      {"MEMSS13_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1760},
+      {"MEMSS14_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1840},
+      {"MEMSS15_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 1920},
+      {"MEMSS16_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 2000},
+      {"MEMSS17_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 2080},
+      {"MEMSS18_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 2160},
+      {"MEMSS19_PERF_CTR_MB1_CFI_NUM_WRITE_REQ", 2240}}},
+    {"0x5e2fa270", // CRI GFSP Rev 0
+     {{"ECC_STATE", 56},
+      {"NUM_OF_MEM_CHANNEL", 80},
+      {"MSU_BITMASK", 108},
+      {"MEM_VENDOR_ID", 132}}}};
+
+static ze_result_t getErrorCode(ze_result_t result) {
+    if (result == ZE_RESULT_ERROR_NOT_AVAILABLE) {
+        result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+    return result;
+}
+
+template <>
+const std::map<std::string, std::map<std::string, uint64_t>> *SysmanProductHelperHw<gfxProduct>::getGuidToKeyOffsetMap() {
+    return &guidToKeyOffsetMap;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isPmtBasedPowerSupported(zes_power_domain_t powerDomain) {
+    // Card and Package energy counters are read from hwmon
+    return (powerDomain == ZES_POWER_DOMAIN_GPU) || (powerDomain == ZES_POWER_DOMAIN_MEMORY);
+}
+
+static ze_result_t buildKeyOffsetMapFromTelemNodes(const std::string &rootPath,
+                                                   std::map<std::string, uint64_t> &keyOffsetMap,
+                                                   std::unordered_map<std::string, std::string> &keyTelemInfoMap) {
+    std::map<uint32_t, std::string> telemNodes;
+    NEO::PmtUtil::getTelemNodesInPciPath(std::string_view(rootPath), telemNodes);
+    if (telemNodes.empty()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): No telemetry nodes found in PCI path, returning error 0x%x>\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    keyOffsetMap.clear();
+    keyTelemInfoMap.clear();
+
+    for (const auto &it : telemNodes) {
+        std::string telemNodeDir = it.second;
+
+        std::array<char, NEO::PmtUtil::guidStringSize> guidString = {};
+        int errorNum = 0;
+        if (!NEO::PmtUtil::readGuid(telemNodeDir, guidString, errorNum)) {
+            continue;
+        }
+
+        auto keyOffsetMapIterator = guidToKeyOffsetMap.find(guidString.data());
+        if (keyOffsetMapIterator == guidToKeyOffsetMap.end()) {
+            continue;
+        }
+
+        const auto &tempKeyOffsetMap = keyOffsetMapIterator->second;
+        for (const auto &[key, value] : tempKeyOffsetMap) {
+            keyOffsetMap[key] = value;
+            keyTelemInfoMap[key] = telemNodeDir;
+        }
+    }
+
+    if (keyOffsetMap.empty()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to find KeyOffsetMap, returning error 0x%x>\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getEccState(LinuxSysmanImp *pLinuxSysmanImp, zes_device_ecc_properties_t *pState) {
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    const std::string key = "ECC_STATE";
+    uint32_t eccState = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, eccState);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Error@ %s(): Failed to read ECC_STATE from PMT, returning error:0x%x \n",
+                     NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    pState->currentState = (eccState & 0x1u) ? ZES_DEVICE_ECC_STATE_ENABLED : ZES_DEVICE_ECC_STATE_DISABLED;
+    pState->pendingState = ZES_DEVICE_ECC_STATE_UNAVAILABLE;
+    pState->pendingAction = ZES_DEVICE_ACTION_NONE;
+
+    void *pNext = pState->pNext;
+    while (pNext) {
+        auto *pExtProps = reinterpret_cast<zes_device_ecc_default_properties_ext_t *>(pNext);
+        if (pExtProps->stype == ZES_STRUCTURE_TYPE_DEVICE_ECC_DEFAULT_PROPERTIES_EXT) {
+            pExtProps->defaultState = pState->currentState;
+            break;
+        }
+        pNext = pExtProps->pNext;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getEccAvailable(LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t *pAvailable) {
+    zes_device_ecc_properties_t state{};
+    ze_result_t result = getEccState(pLinuxSysmanImp, &state);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+    *pAvailable = (state.currentState == ZES_DEVICE_ECC_STATE_ENABLED);
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getEccConfigurable(LinuxSysmanImp *pLinuxSysmanImp, ze_bool_t *pConfigurable) {
+    *pConfigurable = false;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+int32_t SysmanProductHelperHw<gfxProduct>::getPowerMinLimit(const int32_t &defaultLimit) {
+    return static_cast<int32_t>(defaultLimit * minPowerLimitFactor);
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getLimitsExt2(SysmanKmdInterface *pSysmanKmdInterface, const std::map<std::string, std::pair<std::string, bool>> &powerLimitFiles, uint32_t *pLimit) {
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    uint64_t powerLimit = 0;
+    auto pFsAccess = pSysmanKmdInterface->getFsAccess();
+
+    const auto &[sustainedPowerLimitFile, sustainedPowerLimitFileExists] = powerLimitFiles.at("sustainedLimitFile");
+    const auto &[burstPowerLimitFile, burstPowerLimitFileExists] = powerLimitFiles.at("burstLimitFile");
+
+    // Return PL1 if enabled, otherwise return PL2
+    if (sustainedPowerLimitFileExists) {
+        result = pFsAccess->read(sustainedPowerLimitFile, powerLimit);
+        if (ZE_RESULT_SUCCESS != result) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->read() failed to read %s and returning error:0x%x \n", NEO_FUNCTION_NAME, sustainedPowerLimitFile.c_str(), getErrorCode(result));
+            return getErrorCode(result);
+        }
+    } else if (burstPowerLimitFileExists) {
+        result = pFsAccess->read(burstPowerLimitFile, powerLimit);
+        if (ZE_RESULT_SUCCESS != result) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->read() failed to read %s and returning error:0x%x \n", NEO_FUNCTION_NAME, burstPowerLimitFile.c_str(), getErrorCode(result));
+            return getErrorCode(result);
+        }
+    } else {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): No power limit files exist for given power domain , returning unsupported feature\n", NEO_FUNCTION_NAME);
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    pSysmanKmdInterface->convertSysfsValueUnit(SysfsValueUnit::milli, SysfsValueUnit::micro, powerLimit, powerLimit);
+    *pLimit = static_cast<uint32_t>(powerLimit);
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::setLimitsExt2(SysmanKmdInterface *pSysmanKmdInterface, const std::map<std::string, std::pair<std::string, bool>> &powerLimitFiles, zes_power_domain_t powerDomain, const uint32_t limit) {
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    uint64_t val = static_cast<uint64_t>(limit);
+    bool anyLimitSet = false;
+    auto pFsAccess = pSysmanKmdInterface->getFsAccess();
+
+    const auto &[sustainedPowerLimitFile, sustainedPowerLimitFileExists] = powerLimitFiles.at("sustainedLimitFile");
+    const auto &[burstPowerLimitFile, burstPowerLimitFileExists] = powerLimitFiles.at("burstLimitFile");
+    const auto &[criticalPowerLimitFile, criticalPowerLimitFileExists] = powerLimitFiles.at("criticalLimitFile");
+
+    pSysmanKmdInterface->convertSysfsValueUnit(SysfsValueUnit::micro, SysfsValueUnit::milli, val, val);
+
+    if (powerDomain == ZES_POWER_DOMAIN_CARD) {
+        // Card domain: Apply to PL1 and PL2 if enabled, Apply x2 to PsysCRIT if enabled
+        if (sustainedPowerLimitFileExists) {
+            result = pFsAccess->write(sustainedPowerLimitFile, val);
+            if (ZE_RESULT_SUCCESS != result) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->write() failed to write into %s and returning error:0x%x \n", NEO_FUNCTION_NAME, sustainedPowerLimitFile.c_str(), getErrorCode(result));
+                return getErrorCode(result);
+            }
+            anyLimitSet = true;
+        }
+
+        if (burstPowerLimitFileExists) {
+            result = pFsAccess->write(burstPowerLimitFile, val);
+            if (ZE_RESULT_SUCCESS != result) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->write() failed to write into %s and returning error:0x%x \n", NEO_FUNCTION_NAME, burstPowerLimitFile.c_str(), getErrorCode(result));
+                return getErrorCode(result);
+            }
+            anyLimitSet = true;
+        }
+
+        if (criticalPowerLimitFileExists) {
+            val = val * criticalLimitMultiplyFactor;
+            result = pFsAccess->write(criticalPowerLimitFile, val);
+            if (ZE_RESULT_SUCCESS != result) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->write() failed to write into %s and returning error:0x%x \n", NEO_FUNCTION_NAME, criticalPowerLimitFile.c_str(), getErrorCode(result));
+                return getErrorCode(result);
+            }
+            anyLimitSet = true;
+        }
+    } else if (powerDomain == ZES_POWER_DOMAIN_PACKAGE) {
+        // Package domain: Apply to PL1 and PL2 if enabled
+        if (sustainedPowerLimitFileExists) {
+            result = pFsAccess->write(sustainedPowerLimitFile, val);
+            if (ZE_RESULT_SUCCESS != result) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->write() failed to write into %s and returning error:0x%x \n", NEO_FUNCTION_NAME, sustainedPowerLimitFile.c_str(), getErrorCode(result));
+                return getErrorCode(result);
+            }
+            anyLimitSet = true;
+        }
+
+        if (burstPowerLimitFileExists) {
+            result = pFsAccess->write(burstPowerLimitFile, val);
+            if (ZE_RESULT_SUCCESS != result) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->write() failed to write into %s and returning error:0x%x \n", NEO_FUNCTION_NAME, burstPowerLimitFile.c_str(), getErrorCode(result));
+                return getErrorCode(result);
+            }
+            anyLimitSet = true;
+        }
+    } else {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Power Limits for given domain do not exist , returning error:0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    if (!anyLimitSet) {
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t readEnergyCounters(const std::map<std::string, uint64_t> &keyOffsetMap,
+                                      std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                      zes_power_domain_t powerDomain,
+                                      std::vector<uint32_t> &energyCounters) {
+    const std::unordered_map<zes_power_domain_t, std::string> powerDomainToKeyMap = {
+        {ZES_POWER_DOMAIN_PACKAGE, "ACCUM_PACKAGE_ENERGY"},
+        {ZES_POWER_DOMAIN_CARD, "ACCUM_PSYS_ENERGY"},
+        {ZES_POWER_DOMAIN_GPU, "VCCGT_ENERGY_ACCUMULATOR"},
+        {ZES_POWER_DOMAIN_MEMORY, "VRAM_ENERGY_ACCUM_CONTAINER"}};
+
+    auto powerDomainToKeyMapIter = powerDomainToKeyMap.find(powerDomain);
+    if (powerDomainToKeyMapIter == powerDomainToKeyMap.end()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Power domain not supported for Energy counter, returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    const std::string &key = powerDomainToKeyMapIter->second;
+    if (powerDomain == ZES_POWER_DOMAIN_MEMORY) {
+        // bits [0:31] - VCCDDRQ_ENERGY_ACCUMULATOR, bits [32:63] - VCCDDRQX_ENERGY_ACCUMULATOR
+        uint64_t vramEnergyContainer = 0;
+        ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, vramEnergyContainer);
+        if (result != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Energy counter from Telemetry, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+            return result;
+        }
+        energyCounters.push_back(static_cast<uint32_t>(vramEnergyContainer & 0xFFFFFFFF));
+        energyCounters.push_back(static_cast<uint32_t>(vramEnergyContainer >> 32));
+    } else {
+        uint32_t energyCounter = 0;
+        ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, energyCounter);
+        if (result != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Energy counter from Telemetry, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+            return result;
+        }
+        energyCounters.push_back(energyCounter);
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getPowerEnergyCounter(zes_power_energy_counter_t *pEnergy, LinuxSysmanImp *pLinuxSysmanImp, zes_power_domain_t powerDomain, uint32_t subdeviceId) {
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    ze_result_t result = buildKeyOffsetMapFromTelemNodes(rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    // Energy Counter calculation, energy of a domain is the sum of all its accumulators
+    std::vector<uint32_t> energyCounters;
+    result = readEnergyCounters(keyOffsetMap, keyTelemInfoMap, powerDomain, energyCounters);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    double energyInJoules = 0.0;
+    for (const auto &energyCounter : energyCounters) {
+        energyInJoules += convertU18p14(energyCounter);
+    }
+
+    // Convert Energy in Joules to MicroJoules
+    pEnergy->energy = static_cast<uint64_t>(energyInJoules * microFactor);
+
+    // Timestamp calculation
+    uint64_t timestampValue = 0;
+    std::string key = "XTAL_COUNT";
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, timestampValue);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Xtal clock from Telemetry, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t frequency = 0;
+    key = "XTAL_CLK_FREQUENCY";
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, frequency);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Xtal clock frequency from Telemetry, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    // 0x3 masks the 2-bit XTAL_CLK_FREQUENCY field (register bits [1:0]).
+    double timestamp = timestampValue / indexToXtalClockFrequencyMap[frequency & 0x3];
+    pEnergy->timestamp = static_cast<uint64_t>(timestamp);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getPowerUsage(LinuxSysmanImp *pLinuxSysmanImp, zes_power_domain_t powerDomain, uint32_t *pInstantPower, uint32_t *pAveragePower) {
+    if (powerDomain != ZES_POWER_DOMAIN_CARD && powerDomain != ZES_POWER_DOMAIN_PACKAGE && powerDomain != ZES_POWER_DOMAIN_MEMORY) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Unsupported power domain, returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    ze_result_t result = buildKeyOffsetMapFromTelemNodes(rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    // Average power calculation based on energy counter samples with 100ms sampling interval
+    // averagePower (W) = energy consumed during the sampling interval (J) / sampleIntervalSeconds
+    // averagePower (mW) = averagePower (W) * milliFactor
+    if (pAveragePower != nullptr) {
+        // Read first energy counter sample
+        std::vector<uint32_t> energyCountersSample1;
+        result = readEnergyCounters(keyOffsetMap, keyTelemInfoMap, powerDomain, energyCountersSample1);
+        if (result != ZE_RESULT_SUCCESS) {
+            return result;
+        }
+
+        // Sampling interval (100ms)
+        constexpr uint32_t sampleIntervalMilliSeconds = 100;
+        constexpr double sampleIntervalSeconds = sampleIntervalMilliSeconds / 1000.0;
+        NEO::sleep(std::chrono::milliseconds(sampleIntervalMilliSeconds));
+
+        // Read second energy counter sample
+        std::vector<uint32_t> energyCountersSample2;
+        result = readEnergyCounters(keyOffsetMap, keyTelemInfoMap, powerDomain, energyCountersSample2);
+        if (result != ZE_RESULT_SUCCESS) {
+            return result;
+        }
+
+        // Unsigned subtraction handles counter rollover correctly for a single wrap of the uint32_t counter.
+        double energyDeltaInJoules = 0.0;
+        for (size_t index = 0; index < energyCountersSample1.size(); index++) {
+            energyDeltaInJoules += convertU18p14(energyCountersSample2[index] - energyCountersSample1[index]);
+        }
+
+        *pAveragePower = static_cast<uint32_t>((energyDeltaInJoules / sampleIntervalSeconds) * milliFactor);
+    }
+
+    // Power Values read from PMT are in U13.3 format (13 integer bits + 3 fractional bits = 16 bits) and in Watts
+    if (pInstantPower != nullptr) {
+        uint64_t instantaneousPowerValue = 0;
+        std::string key = "INSTANTANEOUS_POWER_CONTAINER"; // 64-bit container with Instantaneous power values at different bit offsets
+        result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, instantaneousPowerValue);
+        if (result != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Instantaneous Power from Telemetry, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+            return result;
+        }
+
+        if (powerDomain == ZES_POWER_DOMAIN_CARD) {
+            // bits [32:47] - INSTANTANEOUS_PSYSGPU_POWER
+            *pInstantPower = static_cast<uint32_t>(convertU13p3((instantaneousPowerValue >> 32) & 0xFFFF) * milliFactor);
+        } else if (powerDomain == ZES_POWER_DOMAIN_PACKAGE) {
+            // bits [0:15] - INSTANTANEOUS_PACKAGE_POWER
+            *pInstantPower = static_cast<uint32_t>(convertU13p3(instantaneousPowerValue & 0xFFFF) * milliFactor);
+        } else {
+            // ZES_POWER_DOMAIN_MEMORY
+            // bits [16:31] INSTANTANEOUS_VRAM_VCCDDRQX_POWER + bits [48:63] INSTANTANEOUS_VRAM_VCCDDRQ_POWER
+            double instVccdrqx = convertU13p3((instantaneousPowerValue >> 16) & 0xFFFF);
+            double instVccddrq = convertU13p3((instantaneousPowerValue >> 48) & 0xFFFF);
+            double instTotalWatts = instVccdrqx + instVccddrq;
+            double instMilliWatts = instTotalWatts * milliFactor;
+            *pInstantPower = static_cast<uint32_t>(instMilliWatts);
+        }
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+RasInterfaceType SysmanProductHelperHw<gfxProduct>::getGtRasUtilInterface() {
+    return RasInterfaceType::netlink;
+}
+
+template <>
+RasInterfaceType SysmanProductHelperHw<gfxProduct>::getHbmRasUtilInterface() {
+    return RasInterfaceType::netlink;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isUpstreamPortConnected() {
+    return true;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getPciProperties(zes_pci_properties_t *pProperties) {
+    pProperties->haveBandwidthCounters = true;
+    pProperties->havePacketCounters = true;
+    pProperties->haveReplayCounters = false;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+int32_t SysmanProductHelperHw<gfxProduct>::maxPcieGenSupported() {
+    constexpr int32_t maxPcieGenSupported = 5;
+    return maxPcieGenSupported;
+}
+
+static ze_result_t getPciStatsValues(zes_pci_stats_t *pStats, std::map<std::string, uint64_t> &keyOffsetMap, const std::string &telemNodeDir) {
+    uint64_t rxCounter = 0;
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, telemNodeDir, "PCIE_RECEIVE_BYTES", 0, rxCounter);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    uint64_t txCounter = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, telemNodeDir, "PCIE_TRANSMIT_BYTES", 0, txCounter);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    uint64_t rxPacketCounter = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, telemNodeDir, "PCIE_RECEIVE_PACKETS", 0, rxPacketCounter);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    uint64_t txPacketCounter = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, telemNodeDir, "PCIE_TRANSMIT_PACKETS", 0, txPacketCounter);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    uint64_t timeStamp = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, telemNodeDir, "LPDDR_TELEM_CAPTURE_TIMESTAMP", 0, timeStamp);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    pStats->speed.gen = -1;
+    pStats->speed.width = -1;
+    pStats->speed.maxBandwidth = -1;
+    pStats->replayCounter = 0;
+    pStats->rxCounter = rxCounter;
+    pStats->txCounter = txCounter;
+    pStats->packetCounter = rxPacketCounter + txPacketCounter;
+    pStats->timestamp = timeStamp * milliSecsToMicroSecs;
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getPciStats(zes_pci_stats_t *pStats, LinuxSysmanImp *pLinuxSysmanImp) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<uint32_t, std::string> telemNodes;
+    NEO::PmtUtil::getTelemNodesInPciPath(std::string_view(rootPath), telemNodes);
+    if (telemNodes.empty()) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    ze_result_t result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    for (auto &it : telemNodes) {
+        std::string telemNodeDir = it.second;
+
+        std::array<char, NEO::PmtUtil::guidStringSize> guidString = {};
+        int errorNum = 0;
+        if (!NEO::PmtUtil::readGuid(telemNodeDir, guidString, errorNum)) {
+            continue;
+        }
+
+        auto keyOffsetMapIterator = guidToKeyOffsetMap.find(guidString.data());
+        if (keyOffsetMapIterator == guidToKeyOffsetMap.end()) {
+            continue;
+        }
+
+        result = getPciStatsValues(pStats, keyOffsetMapIterator->second, telemNodeDir);
+        if (result == ZE_RESULT_SUCCESS) {
+            break;
+        }
+    }
+
+    return result;
+};
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getPciConfigState(zes_intel_pci_config_exp_state_t *pState, LinuxSysmanImp *pLinuxSysmanImp) {
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    // Lower 16 bits hold the command parity error count and upper 16 bits hold the data parity error count
+    std::string key = "PCIE_DNS_PARITY_ERRORS";
+    uint32_t dsParityErrors = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, dsParityErrors);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read %s from telemetry node %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), keyTelemInfoMap[key].c_str(), result);
+        return result;
+    }
+
+    key = "PCIE_UPS_PARITY_ERRORS";
+    uint32_t usParityErrors = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, usParityErrors);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read %s from telemetry node %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), keyTelemInfoMap[key].c_str(), result);
+        return result;
+    }
+
+    key = "SMLH_LTSSM_STATE";
+    uint32_t ltssmState = 0;
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, ltssmState);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read %s from telemetry node %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), keyTelemInfoMap[key].c_str(), result);
+        return result;
+    }
+
+    pState->dsCommandParityErrors = bits(dsParityErrors, 0, 16); // bits 0-15
+    pState->dsDataParityErrors = bits(dsParityErrors, 16, 16);   // bits 16-31
+    pState->usCommandParityErrors = bits(usParityErrors, 0, 16); // bits 0-15
+    pState->usDataParityErrors = bits(usParityErrors, 16, 16);   // bits 16-31
+    pState->linkPresentState = bits(ltssmState, 0, 6);           // bits 0-5
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static zes_freq_throttle_reason_flags_t getAggregatedThrottleReasons(const zes_intel_freq_throttle_detailed_reason_exp_flags_t &pDetailedThrottleReasons) {
+
+    const zes_freq_throttle_reason_flags_t powerFlags =
+        static_cast<zes_freq_throttle_reason_flags_t>(ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_CARD_PL1 |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_CARD_PL2 |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_CARD_PL4 |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_PACKAGE_PL1 |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_PACKAGE_PL2 |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_PACKAGE_PL4 |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_FAST_VMODE |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_ICCMAX);
+
+    const zes_freq_throttle_reason_flags_t thermalFlags =
+        static_cast<zes_freq_throttle_reason_flags_t>(ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_MEMORY |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_PROCHOT |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_SOC |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_SOC_AVG |
+                                                      ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_VR);
+
+    const zes_freq_throttle_reason_flags_t voltageFlags =
+        static_cast<zes_freq_throttle_reason_flags_t>(ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_VOLTAGE_P0_FREQ);
+
+    zes_freq_throttle_reason_flags_t aggregatedReasons = 0u;
+
+    if (pDetailedThrottleReasons & powerFlags) {
+        aggregatedReasons |= ZES_FREQ_THROTTLE_REASON_FLAG_POWER;
+    }
+    if (pDetailedThrottleReasons & thermalFlags) {
+        aggregatedReasons |= ZES_FREQ_THROTTLE_REASON_FLAG_THERMAL;
+    }
+    if (pDetailedThrottleReasons & voltageFlags) {
+        aggregatedReasons |= ZES_FREQ_THROTTLE_REASON_FLAG_VOLTAGE;
+    }
+
+    return aggregatedReasons;
+}
+
+static ze_result_t getDetailedThrottleReasons(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subdeviceId, const std::string &baseDir, bool baseDirectoryExists, zes_intel_freq_throttle_detailed_reason_exp_flags_t &detailedThrottleReasons) {
+
+    uint32_t reasonStatusVal = 0;
+    std::string throttleReasonStatusFile = pSysmanKmdInterface->getSysfsFilePath(SysfsName::sysfsNameThrottleReasonStatus, subdeviceId, baseDirectoryExists);
+    auto result = pSysfsAccess->read(throttleReasonStatusFile, reasonStatusVal);
+
+    if (ZE_RESULT_SUCCESS != result || reasonStatusVal == 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read Throttle reason status file %s or no throttle reasons are active, returning error 0x%x>\n", NEO_FUNCTION_NAME, throttleReasonStatusFile.c_str(), result);
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    static constexpr std::pair<const char *, zes_intel_freq_throttle_detailed_reason_exp_flag_t> throttleReasonMap[] = {
+        {"reason_psys_pl1", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_CARD_PL1},
+        {"reason_psys_pl2", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_CARD_PL2},
+        {"reason_psys_crit", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_CARD_PL4},
+        {"reason_pl1", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_PACKAGE_PL1},
+        {"reason_pl2", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_PACKAGE_PL2},
+        {"reason_pl4", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_PACKAGE_PL4},
+        {"reason_fastvmode", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_FAST_VMODE},
+        {"reason_iccmax", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_POWER_ICCMAX},
+        {"reason_soc_thermal", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_SOC},
+        {"reason_soc_avg_thermal", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_SOC_AVG},
+        {"reason_mem_thermal", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_MEMORY},
+        {"reason_vr_thermal", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_VR},
+        {"reason_prochot", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_THERMAL_PROCHOT},
+        {"reason_p0_freq", ZES_INTEL_FREQ_THROTTLE_DETAILED_REASON_EXP_FLAG_VOLTAGE_P0_FREQ}};
+
+    uint32_t detailedThrottleReasonVal = 0u;
+    for (const auto &reasonPair : throttleReasonMap) {
+        const std::string filePath = baseDirectoryExists ? baseDir + throttleReasonPath + reasonPair.first : std::string("");
+        detailedThrottleReasonVal = 0u;
+        if ((pSysfsAccess->read(filePath, detailedThrottleReasonVal) == ZE_RESULT_SUCCESS) && detailedThrottleReasonVal) {
+            detailedThrottleReasons |= reasonPair.second;
+        }
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+zes_freq_throttle_reason_flags_t SysmanProductHelperHw<gfxProduct>::getThrottleReasons(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subdeviceId, void *pNext) {
+    const std::string baseDir = pSysmanKmdInterface->getBasePath(subdeviceId);
+    bool baseDirectoryExists = pSysfsAccess->directoryExists(baseDir);
+
+    zes_intel_freq_throttle_detailed_reason_exp_flags_t detailedThrottleReasons = 0u;
+    ze_result_t result = getDetailedThrottleReasons(pSysmanKmdInterface, pSysfsAccess, subdeviceId, baseDir, baseDirectoryExists, detailedThrottleReasons);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stdout, "Info@ %s(): Failed to get detailed throttle reasons, returning 0 reasons\n", NEO_FUNCTION_NAME);
+        return static_cast<zes_freq_throttle_reason_flags_t>(0);
+    }
+
+    zes_freq_throttle_reason_flags_t aggregatedReasons = getAggregatedThrottleReasons(detailedThrottleReasons);
+
+    // "reason_pwrbrk" maps directly to ZES_FREQ_THROTTLE_REASON_FLAG_PSU_ALERT and is not
+    // part of the detailed reasons enum, so it is handled separately here.
+    const std::string pwrbrkReasonFile = "reason_pwrbrk";
+    uint32_t pwrbrkVal = 0u;
+    if (baseDirectoryExists) {
+        const std::string pwrbrkFilePath = baseDir + throttleReasonPath + pwrbrkReasonFile;
+        if ((pSysfsAccess->read(pwrbrkFilePath, pwrbrkVal) == ZE_RESULT_SUCCESS) && pwrbrkVal) {
+            aggregatedReasons |= ZES_FREQ_THROTTLE_REASON_FLAG_PSU_ALERT;
+        }
+    }
+
+    void *pCurrent = pNext;
+    while (pCurrent) {
+        auto pExpThrottleReason = reinterpret_cast<zes_base_properties_t *>(pCurrent);
+        if (pExpThrottleReason->stype == ZES_INTEL_STRUCTURE_TYPE_FREQUENCY_THROTTLE_DETAILED_REASON_EXP) {
+            auto pDetailedThrottleReason = reinterpret_cast<zes_intel_freq_throttle_detailed_reason_exp_t *>(pExpThrottleReason);
+            pDetailedThrottleReason->detailedReasons = detailedThrottleReasons;
+            break;
+        }
+        pCurrent = pExpThrottleReason->pNext;
+    }
+
+    // Set Utilization Limited reason flag if none of the detailed reasons are active
+    if (detailedThrottleReasons == 0u) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stdout, "Info@ %s(): No detailed throttle reasons are active, setting Utilization Limited reason flag\n", NEO_FUNCTION_NAME);
+        aggregatedReasons |= static_cast<zes_freq_throttle_reason_flags_t>(ZES_INTEL_FREQ_THROTTLE_REASON_EXP_FLAG_UTILIZATION_LIMITED);
+    }
+
+    return aggregatedReasons;
+}
+
+template <>
+void SysmanProductHelperHw<gfxProduct>::getSupportedSensors(std::map<zes_temp_sensors_t, uint32_t> &supportedSensorTypeMap) {
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_GLOBAL] = 1;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_GPU] = 1;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_MEMORY] = 1;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_VOLTAGE_REGULATOR] = 1;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_GPU_BOARD] = 1;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_VOLTAGE_REGULATOR_SINGLE] = maxVrTemperatureSensorCount;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_GPU_BOARD_SINGLE] = maxGpuBoardTemperatureSensorCount;
+    supportedSensorTypeMap[ZES_TEMP_SENSORS_COMPOSITE] = 1;
+}
+
+static ze_result_t readVoltageRegulatorTemperature(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                                   double *pTemperature, uint32_t sensorIndex) {
+    std::string key = "VR_TEMPERATURE_" + std::to_string(sensorIndex);
+
+    uint32_t rawVrTemperature = 0;
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, rawVrTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read VR temperature value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    if (rawVrTemperature == temperatureNotAvailable) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): VR temperature is not available for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    *pTemperature = static_cast<double>(std::bit_cast<float>(rawVrTemperature));
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getVoltageRegulatorTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId, uint32_t sensorIndex) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    return readVoltageRegulatorTemperature(keyOffsetMap, keyTelemInfoMap, pTemperature, sensorIndex);
+}
+
+static ze_result_t readVoltageRegulatorMaxTemperature(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                                      double *pTemperature) {
+    ze_result_t result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    bool isAnySensorAvailable = false;
+    double vrMaxTemperature = 0;
+    for (uint32_t sensorIndex = 0; sensorIndex < maxVrTemperatureSensorCount; sensorIndex++) {
+        double vrTemperature = 0;
+        result = readVoltageRegulatorTemperature(keyOffsetMap, keyTelemInfoMap, &vrTemperature, sensorIndex);
+        if (result != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stdout, "Info@ %s(): VR temperature sensor %u is not available, ignoring it for the max VR temperature, error:0x%x \n", NEO_FUNCTION_NAME, sensorIndex, result);
+            continue;
+        }
+        vrMaxTemperature = isAnySensorAvailable ? std::max(vrMaxTemperature, vrTemperature) : vrTemperature;
+        isAnySensorAvailable = true;
+    }
+
+    if (!isAnySensorAvailable) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): None of the VR temperature sensors are available, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    *pTemperature = vrMaxTemperature;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getVoltageRegulatorMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    return readVoltageRegulatorMaxTemperature(keyOffsetMap, keyTelemInfoMap, pTemperature);
+}
+
+static ze_result_t readGpuBoardTemperature(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                           double *pTemperature, uint32_t sensorIndex) {
+    std::string key = "AMB_TEMPERATURE";
+
+    uint64_t ambientTemperatureContainer = 0;
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, 0, ambientTemperatureContainer);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read ambient temperature value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    uint32_t rawAmbientTemperature = static_cast<uint32_t>((ambientTemperatureContainer >> (32 * sensorIndex)) & 0xFFFFFFFF);
+
+    if (rawAmbientTemperature == temperatureNotAvailable) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Ambient temperature is not available for sensor index %u of key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, sensorIndex, key.c_str(), ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    *pTemperature = static_cast<double>(std::bit_cast<float>(rawAmbientTemperature));
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getGpuBoardTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId, uint32_t sensorIndex) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    return readGpuBoardTemperature(keyOffsetMap, keyTelemInfoMap, pTemperature, sensorIndex);
+}
+
+static ze_result_t readGpuBoardMaxTemperature(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                              double *pTemperature) {
+    ze_result_t result = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    bool isAnySensorAvailable = false;
+    double gpuBoardMaxTemperature = 0;
+    for (uint32_t sensorIndex = 0; sensorIndex < maxGpuBoardTemperatureSensorCount; sensorIndex++) {
+        double gpuBoardTemperature = 0;
+        result = readGpuBoardTemperature(keyOffsetMap, keyTelemInfoMap, &gpuBoardTemperature, sensorIndex);
+        if (result != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stdout, "Info@ %s(): GPU board temperature sensor %u is not available, ignoring it for the max GPU board temperature, error:0x%x \n", NEO_FUNCTION_NAME, sensorIndex, result);
+            continue;
+        }
+        gpuBoardMaxTemperature = isAnySensorAvailable ? std::max(gpuBoardMaxTemperature, gpuBoardTemperature) : gpuBoardTemperature;
+        isAnySensorAvailable = true;
+    }
+
+    if (!isAnySensorAvailable) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): None of the GPU board temperature sensors are available, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    *pTemperature = gpuBoardMaxTemperature;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getGpuBoardMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    return readGpuBoardMaxTemperature(keyOffsetMap, keyTelemInfoMap, pTemperature);
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isMemoryMaxTemperatureSupported() {
+    return true;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isTemperatureReadFromSysfsSupported() {
+    return true;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isMemoryDomainSupported() {
+    return true;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isMediaDomainSupported(LinuxSysmanImp *pLinuxSysmanImp) {
+    return true;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getActualFrequency(LinuxSysmanImp *pLinuxSysmanImp, zes_freq_domain_t frequencyDomain, uint32_t subdeviceId, double *pActual) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t memoryActualFreq = 0;
+    uint64_t telemOffset = 0;
+    std::string key("VRAM_FREQUENCY");
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, memoryActualFreq);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+    *pActual = static_cast<double>(memoryActualFreq & 0xFFFF) / vramFrequencyClockRatio;
+
+    return result;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getCurrentVoltage(LinuxSysmanImp *pLinuxSysmanImp, zes_freq_domain_t frequencyDomain, uint32_t subdeviceId, double *pVoltage) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t memoryVoltage = 0;
+    uint64_t telemOffset = 0;
+    std::string key("VCCDDRQX_VID");
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, memoryVoltage);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    double vccddrqxVoltage = convertU1p8(memoryVoltage & 0x1FF);
+    double vccddrqVoltage = convertU1p8((memoryVoltage >> 18) & 0x1FF);
+
+    *pVoltage = std::max(vccddrqxVoltage, vccddrqVoltage);
+
+    return result;
+}
+
+static ze_result_t readGpuMaxTemperature(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                         double *pTemperature) {
+    uint32_t rawGpuMaxTemperature = 0;
+    uint64_t telemOffset = 0;
+    std::string key("SOC_TOPDIE_TEMPERATURE");
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, rawGpuMaxTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    if (rawGpuMaxTemperature == temperatureNotAvailable) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): GPU temperature is not available for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    *pTemperature = static_cast<double>(std::bit_cast<float>(rawGpuMaxTemperature));
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getGpuMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) {
+
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    return readGpuMaxTemperature(keyOffsetMap, keyTelemInfoMap, pTemperature);
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getCompositeTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) {
+
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t compositeTemperature = 0;
+    uint64_t telemOffset = 0;
+    std::string key("COMPOSITE_TEMPERATURE");
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, compositeTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    if (compositeTemperature == temperatureNotAvailable) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Composite temperature is not reported by the hardware, returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    *pTemperature = static_cast<double>(std::bit_cast<float>(compositeTemperature));
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t getMsuBitmask(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                 uint32_t &msuBitmask) {
+
+    uint64_t telemOffset = 0;
+    std::string key("MSU_BITMASK");
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, msuBitmask);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    msuBitmask &= msuBitmaskMask;
+    if (msuBitmask == 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): No MSU is enabled in the MSU bitmask, returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t getChannelCountPerMsu(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                         uint32_t &channelCountPerMsu) {
+
+    uint64_t telemOffset = 0;
+    std::string key("NUM_OF_MEM_CHANNEL");
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, channelCountPerMsu);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t getChannelCountAndBusWidth(LinuxSysmanImp *pLinuxSysmanImp, int32_t &numChannels, int32_t &busWidth) {
+
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t msuBitmask = 0;
+    result = getMsuBitmask(keyOffsetMap, keyTelemInfoMap, msuBitmask);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get the MSU bitmask, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t channelCountPerMsu = 0;
+    result = getChannelCountPerMsu(keyOffsetMap, keyTelemInfoMap, channelCountPerMsu);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get the channel count per MSU, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    if (channelCountPerMsu == 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Channel count per MSU is 0, returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    uint32_t msuCount = static_cast<uint32_t>(std::popcount(msuBitmask));
+
+    // channelCountPerMsu is raw telemetry with no defined reserved bits to mask off, so the
+    // product is computed in 64 bits and range checked. Reporting a wrapped negative value
+    // would be worse than reporting unknown, because -1 is the spec's "unknown" sentinel.
+    uint64_t totalChannelCount = static_cast<uint64_t>(msuCount) * static_cast<uint64_t>(channelCountPerMsu);
+    if (totalChannelCount > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): MSU count %u and channel count per MSU %u exceed the reportable channel count, returning error:0x%x \n", NEO_FUNCTION_NAME, msuCount, channelCountPerMsu, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    numChannels = static_cast<int32_t>(totalChannelCount);
+    busWidth = static_cast<int32_t>(msuCount * busWidthPerMsuInBits);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t getMemoryBandwidthCounterValues(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                                   uint32_t msuBitmask, zes_mem_bandwidth_t *pBandwidth) {
+
+    uint64_t readCounter = 0;
+    uint64_t writeCounter = 0;
+    uint64_t telemOffset = 0;
+
+    for (uint32_t i = 0; i < maxMemoryMsuCount; i++) {
+        if (!(msuBitmask & (1u << i))) {
+            continue;
+        }
+
+        uint64_t msuReadCounter = 0;
+        uint64_t msuWriteCounter = 0;
+
+        for (uint32_t mb = 0; mb < memoryBridgeCount; mb++) {
+            std::string mbSuffix = "MB" + std::to_string(mb);
+
+            std::string readKey = "MEMSS" + std::to_string(i) + "_PERF_CTR_" + mbSuffix + "_CFI_NUM_READ_REQ";
+            uint64_t readCounterValue = 0;
+            ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[readKey], readKey, telemOffset, readCounterValue);
+            if (result != ZE_RESULT_SUCCESS) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, readKey.c_str(), result);
+                return result;
+            }
+            msuReadCounter += readCounterValue;
+
+            std::string writeKey = "MEMSS" + std::to_string(i) + "_PERF_CTR_" + mbSuffix + "_CFI_NUM_WRITE_REQ";
+            uint64_t writeCounterValue = 0;
+            result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[writeKey], writeKey, telemOffset, writeCounterValue);
+            if (result != ZE_RESULT_SUCCESS) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, writeKey.c_str(), result);
+                return result;
+            }
+            msuWriteCounter += writeCounterValue;
+        }
+
+        readCounter += msuReadCounter;
+        writeCounter += msuWriteCounter;
+    }
+
+    pBandwidth->readCounter = readCounter * transactionSize;
+    pBandwidth->writeCounter = writeCounter * transactionSize;
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t getMemoryMaxBandwidth(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                         zes_mem_bandwidth_t *pBandwidth) {
+
+    uint64_t telemOffset = 0;
+    uint32_t maxBandwidth = 0;
+    std::string key = "VRAM_BANDWIDTH";
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, maxBandwidth);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    maxBandwidth = maxBandwidth >> 16;
+    pBandwidth->maxBandwidth = static_cast<uint64_t>(maxBandwidth) * gigaBytesToBytes;
+
+    return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t readMemoryMaxTemperature(const std::map<std::string, uint64_t> &keyOffsetMap, std::unordered_map<std::string, std::string> &keyTelemInfoMap,
+                                            double *pTemperature) {
+    uint64_t telemOffset = 0;
+    uint32_t memoryMaxTemperature = 0;
+    std::string key("VRAM_TEMPERATURE");
+    ze_result_t result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, memoryMaxTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+    memoryMaxTemperature &= 0xFFu; // Extract least significant 8 bits
+    *pTemperature = static_cast<double>(memoryMaxTemperature);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getMemoryMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) {
+
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    return readMemoryMaxTemperature(keyOffsetMap, keyTelemInfoMap, pTemperature);
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getMemoryBandwidth(zes_mem_bandwidth_t *pBandwidth, LinuxSysmanImp *pLinuxSysmanImp, uint32_t subdeviceId) {
+
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t msuBitmask = 0;
+    result = getMsuBitmask(keyOffsetMap, keyTelemInfoMap, msuBitmask);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get the MSU bitmask, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    if (ZE_RESULT_SUCCESS != getMemoryBandwidthCounterValues(keyOffsetMap, keyTelemInfoMap, msuBitmask, pBandwidth)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get the Read and Write Counter Values, returning error 0x%x>\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    if (ZE_RESULT_SUCCESS != getMemoryMaxBandwidth(keyOffsetMap, keyTelemInfoMap, pBandwidth)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get the Max Bandwidth Value, returning error 0x%x>\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    pBandwidth->timestamp = SysmanDevice::getSysmanTimestamp();
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getGlobalMaxTemperature(LinuxSysmanImp *pLinuxSysmanImp, double *pTemperature, uint32_t subdeviceId) {
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    // All sensors are read from the same set of telemetry nodes, hence the key offsets are looked up only once.
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    double gpuMaxTemperature = 0;
+    result = readGpuMaxTemperature(keyOffsetMap, keyTelemInfoMap, &gpuMaxTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    double memoryMaxTemperature = 0;
+    result = readMemoryMaxTemperature(keyOffsetMap, keyTelemInfoMap, &memoryMaxTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    double vrMaxTemperature = 0;
+    result = readVoltageRegulatorMaxTemperature(keyOffsetMap, keyTelemInfoMap, &vrMaxTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    double gpuBoardMaxTemperature = 0;
+    result = readGpuBoardMaxTemperature(keyOffsetMap, keyTelemInfoMap, &gpuBoardMaxTemperature);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    *pTemperature = std::max({gpuMaxTemperature, memoryMaxTemperature, vrMaxTemperature, gpuBoardMaxTemperature});
+    return result;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getMemoryVendorId(LinuxSysmanImp *pLinuxSysmanImp, uint32_t *pVendorId) {
+
+    std::string &rootPath = pLinuxSysmanImp->getPciRootPath();
+    std::map<std::string, uint64_t> keyOffsetMap;
+    std::unordered_map<std::string, std::string> keyTelemInfoMap;
+
+    ze_result_t result = PlatformMonitoringTech::buildKeyOffsetMapFromTelemNodes(guidToKeyOffsetMap, rootPath, keyOffsetMap, keyTelemInfoMap);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to build key offset map from telemetry nodes, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    uint32_t memVendorId = 0;
+    uint64_t telemOffset = 0;
+    std::string key("MEM_VENDOR_ID");
+    result = PlatformMonitoringTech::readValue(keyOffsetMap, keyTelemInfoMap[key], key, telemOffset, memVendorId);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read value for key: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, key.c_str(), result);
+        return result;
+    }
+
+    *pVendorId = memVendorId;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getMemoryProperties(zes_mem_properties_t *pProperties, LinuxSysmanImp *pLinuxSysmanImp, NEO::Drm *pDrm, SysmanKmdInterface *pSysmanKmdInterface, uint32_t subDeviceId, bool isSubdevice) {
+
+    uint64_t physicalMemorySize = 0;
+    ze_result_t result = pSysmanKmdInterface->getPhysicalMemorySize(physicalMemorySize, isSubdevice, subDeviceId, pLinuxSysmanImp);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get physical memory size from KMD interface, returning error:0x%x \n", NEO_FUNCTION_NAME, result);
+    }
+    pProperties->location = ZES_MEM_LOC_DEVICE;
+    pProperties->type = ZES_MEM_TYPE_LPDDR5X;
+    pProperties->onSubdevice = isSubdevice;
+    pProperties->subdeviceId = subDeviceId;
+    pProperties->physicalSize = physicalMemorySize;
+
+    // Channel count and bus width come from telemetry, which may be unavailable. Per the spec
+    // -1 reports them as unknown, so a telemetry failure must not fail the whole call. The
+    // helper logs the reason on every failure path, so the result is intentionally discarded.
+    pProperties->numChannels = -1;
+    pProperties->busWidth = -1;
+    [[maybe_unused]] auto telemetryResult = getChannelCountAndBusWidth(pLinuxSysmanImp, pProperties->numChannels, pProperties->busWidth);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+// Parse a single page offline information line from vram_bad_pages file
+// Expected line format: "<address> : <size> : <status>"
+// Example: "0x00001234 : 0x00001000 : R"
+// Where:
+//   - address: Hexadecimal page address (e.g., 0x00001234)
+//   - size:    Hexadecimal page size (e.g., 0x00001000)
+//   - status:  Single character - 'R' (Retired/Offline), 'P' (Pending), 'F' (Failed)
+static bool parsePageOfflineInfoLine(const std::string &line, MemPageInfo &pageInfo) {
+
+    // Find colon positions for efficient parsing
+    size_t firstColon = line.find(':');
+    size_t secondColon = line.find(':', firstColon + 1);
+    if (firstColon == std::string::npos || secondColon == std::string::npos) {
+        return false;
+    }
+
+    // Find start of address and size fields
+    size_t addrStart = line.find_first_not_of(" \t");
+    size_t sizeStart = line.find_first_not_of(" \t", firstColon + 1);
+    if (addrStart >= firstColon || sizeStart >= secondColon) {
+        return false;
+    }
+
+    // Parse address and size
+    char *endPtr = nullptr;
+    pageInfo.pageAddress = std::strtoull(line.c_str() + addrStart, &endPtr, 16);
+    if (endPtr == line.c_str() + addrStart) {
+        return false;
+    }
+
+    pageInfo.pageSize = static_cast<uint32_t>(std::strtoul(line.c_str() + sizeStart, &endPtr, 16));
+    if (endPtr == line.c_str() + sizeStart) {
+        return false;
+    }
+
+    // Extract and validate status character (after second colon)
+    size_t statusStart = line.find_first_not_of(" \t", secondColon + 1);
+    if (statusStart == std::string::npos) {
+        return false;
+    }
+    char statusChar = line[statusStart];
+    if (statusChar != 'R' && statusChar != 'P' && statusChar != 'F') {
+        return false;
+    }
+
+    // Map status character to enum value
+    // 'R' -> Retired (offline), 'P'/'F' -> Pending offline
+    pageInfo.pageStatus = (statusChar == 'R') ? ZES_INTEL_MEM_PAGE_STATUS_EXP_OFFLINE
+                                              : ZES_INTEL_MEM_PAGE_STATUS_EXP_PENDING_OFFLINE;
+
+    return true;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::memoryGetPageOfflineStateExp(SysFsAccessInterface *pSysFsAccess, zes_intel_mem_page_status_exp_t pageStatus, uint32_t *pCount, std::vector<MemPageInfo> &memPageInfoList, zes_intel_mem_page_info_exp_t *pPageOfflineInfo) {
+
+    // Read vram_bad_pages file which contains memory page offline information
+    // File format:
+    //   max_pages : <max_count>         - Maximum number of pages that can be marked offline
+    //   <address> : <size> : <status>   - Page information entries where:
+    //     address: Memory page address in hexadecimal (e.g., 0x00001234)
+    //     size:    Page size in hexadecimal (e.g., 0x00001000)
+    //     status:  Single character indicating page state:
+    //              'R' - Retired (offline)
+    //              'P' - Pending offline
+    //              'F' - Failed/other status
+    const std::string pageOfflineInfoFile = "device/vram_bad_pages";
+    std::vector<std::string> memPageInfoData = {};
+
+    ze_result_t result = pSysFsAccess->read(pageOfflineInfoFile, memPageInfoData);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read memory page offline state file: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, pageOfflineInfoFile.c_str(), result);
+        return result;
+    }
+
+    // Initialize addressSet with already cached entries to support caching and prevent duplicates
+    std::unordered_set<uint64_t> addressSet;
+    for (const auto &pageInfo : memPageInfoList) {
+        addressSet.insert(pageInfo.pageAddress);
+    }
+
+    // Parse new entries from file and add only unique addresses
+    for (const auto &line : memPageInfoData) {
+        // Skip empty lines and max_pages header
+        if (line.empty() || line.find("max_pages") != std::string::npos) {
+            continue;
+        }
+
+        MemPageInfo parsedPageInfo = {};
+
+        // If parsing fails then return error
+        if (!parsePageOfflineInfoLine(line, parsedPageInfo)) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to parse memory page offline line: '%s', returning error:0x%x \n", NEO_FUNCTION_NAME, line.c_str(), ZE_RESULT_ERROR_UNKNOWN);
+            return ZE_RESULT_ERROR_UNKNOWN;
+        }
+
+        // Check if this address already exists to avoid duplicates
+        if (!addressSet.contains(parsedPageInfo.pageAddress)) {
+            addressSet.insert(parsedPageInfo.pageAddress);
+            memPageInfoList.push_back(parsedPageInfo);
+        }
+    }
+
+    uint32_t pageCount = static_cast<uint32_t>(std::count_if(memPageInfoList.begin(), memPageInfoList.end(),
+                                                             [pageStatus](const MemPageInfo &info) { return info.pageStatus == pageStatus; }));
+    if (*pCount == 0) {
+        *pCount = pageCount;
+        return ZE_RESULT_SUCCESS;
+    } else {
+        *pCount = std::min(*pCount, pageCount);
+    }
+
+    uint32_t index = 0;
+    for (auto it = memPageInfoList.begin(); it != memPageInfoList.end() && index < *pCount; ++it) {
+        if (it->pageStatus == pageStatus) {
+            pPageOfflineInfo[index].pageAddress = it->pageAddress;
+            pPageOfflineInfo[index].pageSize = it->pageSize;
+            index++;
+        }
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getMaxMemoryOfflinePages(SysFsAccessInterface *pSysFsAccess, uint32_t *pMaxOfflinePages) {
+
+    // Read vram_bad_pages file to extract the maximum number of pages that can be offlined
+    // File format:
+    //   max_pages : <max_count>         - Maximum number of pages that can be marked offline
+    //   <address> : <size> : <status>   - Page information entries
+    const std::string pageOfflineInfoFile = "device/vram_bad_pages";
+    std::vector<std::string> memPageInfoData = {};
+
+    ze_result_t result = pSysFsAccess->read(pageOfflineInfoFile, memPageInfoData);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read memory page offline state file: %s, returning error:0x%x \n", NEO_FUNCTION_NAME, pageOfflineInfoFile.c_str(), result);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    for (const auto &line : memPageInfoData) {
+        if (line.find("max_pages") != std::string::npos) {
+            size_t colonPos = line.find(':');
+            if (colonPos != std::string::npos) {
+                size_t valueStart = line.find_first_not_of(" \t", colonPos + 1);
+                if (valueStart != std::string::npos) {
+                    uint32_t maxPages = static_cast<uint32_t>(std::strtoul(line.c_str() + valueStart, nullptr, 10));
+                    *pMaxOfflinePages = maxPages;
+                    return ZE_RESULT_SUCCESS;
+                }
+            }
+        }
+    }
+
+    return ZE_RESULT_ERROR_NOT_AVAILABLE;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getSocUid(SysFsAccessInterface *pSysFsAccess, zes_uuid_t *pSocUid) {
+    const std::string socUidSysfsNode = "device/device_uid";
+    std::string socUidStr;
+    ze_result_t result = pSysFsAccess->read(socUidSysfsNode, socUidStr);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read %s and returning error:0x%x \n", NEO_FUNCTION_NAME, socUidSysfsNode.c_str(), result);
+        return result;
+    }
+
+    constexpr size_t socUidHexCharCount = 2 * sizeof(uint64_t);
+    if (socUidStr.length() != socUidHexCharCount) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Invalid length of SOC UID:%s and returning error:0x%x \n", NEO_FUNCTION_NAME, socUidStr.c_str(), ZE_RESULT_ERROR_UNKNOWN);
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    zes_uuid_t socUid = {};
+    for (size_t i = 0; i < socUidStr.length(); i += 2) {
+        if (!std::isxdigit(static_cast<unsigned char>(socUidStr[i])) || !std::isxdigit(static_cast<unsigned char>(socUidStr[i + 1]))) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Invalid hex character in SOC UID:%s and returning error:0x%x \n", NEO_FUNCTION_NAME, socUidStr.c_str(), ZE_RESULT_ERROR_UNKNOWN);
+            return ZE_RESULT_ERROR_UNKNOWN;
+        }
+        socUid.id[i / 2] = static_cast<uint8_t>(std::stoul(socUidStr.substr(i, 2), nullptr, 16));
+    }
+    *pSocUid = socUid;
+    return ZE_RESULT_SUCCESS;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isNetlinkEventSupported() {
+    return true;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isFlashOverrideSupported() {
+    return true;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isStandbySupported(SysmanKmdInterface *pSysmanKmdInterface) {
+    return true;
+}
+
+template <>
+bool SysmanProductHelperHw<gfxProduct>::isSetStandbyModeSupported() {
+    return true;
+}
+
+template <>
+std::string SysmanProductHelperHw<gfxProduct>::getStandbyModeFile(SysmanKmdInterface *pSysmanKmdInterface, SysFsAccessInterface *pSysfsAccess, uint32_t subDeviceId) {
+    return standbyPowerControlFile;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::getStandbyMode(SysFsAccessInterface *pSysfsAccess, const std::string &standbyModeFile, zes_standby_promo_mode_t &mode) {
+    std::string currentMode;
+    ze_result_t result = pSysfsAccess->read(standbyModeFile, currentMode);
+    if (ZE_RESULT_SUCCESS != result) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "error@<%s> <failed to read file %s> <result: 0x%x>\n", NEO_FUNCTION_NAME, standbyModeFile.c_str(), result);
+        return result;
+    }
+    if (standbyPowerControlDefault == currentMode) {
+        mode = ZES_STANDBY_PROMO_MODE_DEFAULT;
+    } else if (standbyPowerControlNever == currentMode) {
+        mode = ZES_STANDBY_PROMO_MODE_NEVER;
+    } else {
+        result = ZE_RESULT_ERROR_UNKNOWN;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "error@<%s> <unknown or internal error occurred> <currentMode: %s & result: 0x%x>\n", NEO_FUNCTION_NAME, currentMode.c_str(), result);
+    }
+    return result;
+}
+
+template <>
+ze_result_t SysmanProductHelperHw<gfxProduct>::setStandbyMode(SysFsAccessInterface *pSysfsAccess, const std::string &standbyModeFile, zes_standby_promo_mode_t mode) {
+    return pSysfsAccess->write(standbyModeFile, (ZES_STANDBY_PROMO_MODE_DEFAULT == mode) ? standbyPowerControlDefault : standbyPowerControlNever);
+}
+
+template <>
+std::string SysmanProductHelperHw<gfxProduct>::getGpuGeneration() {
+    return "xe3p";
+}
+
+template <>
+std::string SysmanProductHelperHw<gfxProduct>::getProductCodeName() {
+    return "Crescent Island";
+}
+
+template class SysmanProductHelperHw<gfxProduct>;
+
+static EnableSysmanProductHelper<gfxProduct> enableCRI;
+
+} // namespace Sysman
+} // namespace L0

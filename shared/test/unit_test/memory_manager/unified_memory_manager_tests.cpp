@@ -1,51 +1,35 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/memory_manager/svm_allocation_cache.h"
+#include "shared/source/unified_memory/usm_memory_support.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
 #include "shared/test/common/mocks/mock_svm_manager.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
-#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "gtest/gtest.h"
 
 using namespace NEO;
 
-TEST(SvmDeviceAllocationTest, givenGivenSvmAllocsManagerWhenObtainOwnershipCalledThenLockedUniqueLockReturned) {
-    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 1));
-    auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
-
-    auto lock = svmManager->obtainOwnership();
-    std::thread th1([&] {
-        EXPECT_FALSE(svmManager->mtxForIndirectAccess.try_lock());
-    });
-    th1.join();
-    lock.unlock();
-    std::thread th2([&] {
-        EXPECT_TRUE(svmManager->mtxForIndirectAccess.try_lock());
-        svmManager->mtxForIndirectAccess.unlock();
-    });
-    th2.join();
-}
-
-using SVMLocalMemoryAllocatorTest = Test<SVMMemoryAllocatorFixture<true>>;
+using SVMLocalMemoryAllocatorTest = Test<SVMMemoryAllocatorFixture<true, 1u>>;
 TEST_F(SVMLocalMemoryAllocatorTest, whenFreeSharedAllocWithOffsetPointerThenResourceIsRemovedProperly) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.EnableLocalMemory.set(1);
+    debugManager.flags.EnableLocalMemory.set(1);
     void *cmdQ = reinterpret_cast<void *>(0x12345);
     auto mockPageFaultManager = new MockPageFaultManager();
     memoryManager->pageFaultManager.reset(mockPageFaultManager);
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::SHARED_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
     auto allocationSize = 4096u;
     auto ptr = svmManager->createSharedUnifiedMemoryAllocation(allocationSize, unifiedMemoryProperties, &cmdQ);
     EXPECT_NE(nullptr, ptr);
@@ -62,18 +46,48 @@ TEST_F(SVMLocalMemoryAllocatorTest, whenFreeSharedAllocWithOffsetPointerThenReso
     EXPECT_EQ(pageFaultMemoryData, mockPageFaultManager->memoryData.end());
 }
 
-TEST_F(SVMLocalMemoryAllocatorTest, whenFreeSVMAllocIsDeferredThenFreedSubsequently) {
+TEST_F(SVMLocalMemoryAllocatorTest, whenFreeSvmAllocationDeferThenAllocationsCountIsProper) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.EnableLocalMemory.set(1);
+    debugManager.flags.EnableLocalMemory.set(1);
 
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
     auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
     csr->setupContext(*device->getDefaultEngine().osContext);
     void *cmdQ = reinterpret_cast<void *>(0x12345);
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::SHARED_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
+    EXPECT_NE(nullptr, ptr);
+
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    memoryManager->deferAllocInUse = true;
+    EXPECT_EQ(0u, svmManager->getNumClaimableDeferFreeAllocs());
+    svmManager->freeSVMAllocDefer(ptr);
+    EXPECT_EQ(1u, svmManager->getNumClaimableDeferFreeAllocs());
+    svmManager->freeSVMAllocDefer(ptr);
+    EXPECT_EQ(1u, svmManager->getNumClaimableDeferFreeAllocs());
+    memoryManager->deferAllocInUse = false;
+    svmManager->freeSVMAllocDefer(ptr);
+    EXPECT_EQ(0u, svmManager->getNumClaimableDeferFreeAllocs());
+    ASSERT_EQ(svmManager->getSVMAlloc(ptr), nullptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, whenFreeSVMAllocIsDeferredThenFreedSubsequently) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.EnableLocalMemory.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
     unifiedMemoryProperties.device = device;
 
     auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
@@ -87,15 +101,59 @@ TEST_F(SVMLocalMemoryAllocatorTest, whenFreeSVMAllocIsDeferredThenFreedSubsequen
     ASSERT_EQ(svmManager->getSVMAlloc(ptr), nullptr);
 }
 
+TEST_F(SVMLocalMemoryAllocatorTest, GivenTwoRootDevicesWhenAllocatingSharedMemoryForDevice2ThenAllocationsHappenForRootDeviceIndexOneAndNotZero) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.EnableLocalMemory.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(2, 0));
+    auto device = deviceFactory->rootDevices[1];
+    std::map<uint32_t, NEO::DeviceBitfield> deviceBitfieldsLocal;
+    deviceBitfieldsLocal[1] = device->getDeviceBitfield();
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfieldsLocal);
+    unifiedMemoryProperties.device = device;
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
+    EXPECT_NE(nullptr, ptr);
+
+    EXPECT_EQ(svmManager->getNumAllocs(), 1u);
+    EXPECT_EQ(svmManager->getSVMAlloc(ptr)->gpuAllocations.getGraphicsAllocation(0), nullptr);
+    EXPECT_NE(svmManager->getSVMAlloc(ptr)->gpuAllocations.getGraphicsAllocation(1), nullptr);
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    memoryManager->deferAllocInUse = true;
+    svmManager->freeSVMAllocDefer(ptr);
+    memoryManager->deferAllocInUse = false;
+    svmManager->freeSVMAllocDefer(ptr);
+    ASSERT_EQ(svmManager->getSVMAlloc(ptr), nullptr);
+}
+
+TEST(MapBasedAllocationTrackerTest, givenPointersAroundSingleAllocationWhenGettingThenOnlyPointersInsideAllocationAreFound) {
+    SVMAllocsManager::MapBasedAllocationTracker tracker;
+    SvmAllocationData allocData(1u);
+    allocData.size = MemoryConstants::pageSize;
+    tracker.allocations.insert(std::make_pair(reinterpret_cast<const void *>(0x10000), allocData));
+
+    EXPECT_EQ(nullptr, tracker.get(reinterpret_cast<const void *>(0x8000)));
+    EXPECT_EQ(nullptr, tracker.get(reinterpret_cast<const void *>(0x8010)));
+    EXPECT_NE(nullptr, tracker.get(reinterpret_cast<const void *>(0x10000)));
+    EXPECT_NE(nullptr, tracker.get(reinterpret_cast<const void *>(0x10010)));
+    EXPECT_EQ(nullptr, tracker.get(reinterpret_cast<const void *>(0x11000)));
+    EXPECT_EQ(nullptr, tracker.get(reinterpret_cast<const void *>(0x20000)));
+}
+
 TEST_F(SVMLocalMemoryAllocatorTest, whenMultipleFreeSVMAllocDeferredThenFreedSubsequently) {
 
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
     auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
     csr->setupContext(*device->getDefaultEngine().osContext);
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::DEVICE_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
     unifiedMemoryProperties.device = device;
 
     auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
@@ -121,22 +179,104 @@ TEST_F(SVMLocalMemoryAllocatorTest, whenMultipleFreeSVMAllocDeferredThenFreedSub
     ASSERT_EQ(svmManager->getSVMAlloc(ptr2), nullptr);
 }
 
+TEST_F(SVMLocalMemoryAllocatorTest, givenDeferredFreeEntryWithAllocationAlreadyRemovedWhenDeferredFreeProcessedThenEntryIsDropped) {
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+
+    auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    memoryManager->deferAllocInUse = true;
+    svmManager->freeSVMAllocDefer(ptr);
+    memoryManager->deferAllocInUse = false;
+
+    ASSERT_EQ(1ul, svmManager->getNumDeferFreeAllocs());
+    auto *svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+
+    SvmAllocationData orphanedData = *svmData;
+    svmManager->removeSVMAlloc(orphanedData);
+    ASSERT_EQ(nullptr, svmManager->getSVMAlloc(ptr));
+
+    svmManager->freeSVMAllocDeferImpl();
+
+    EXPECT_EQ(0ul, svmManager->getNumDeferFreeAllocs());
+
+    for (auto *gpuAllocation : orphanedData.gpuAllocations.getGraphicsAllocations()) {
+        memoryManager->freeGraphicsMemory(gpuAllocation);
+    }
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenDeferredFreeEntriesStillInUseWhenDeferredFreeProcessedThenEntriesAreRetainedUntilNoLongerInUse) {
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+
+    auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    auto ptr1 = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr1);
+
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    memoryManager->deferAllocInUse = true;
+    svmManager->freeSVMAllocDefer(ptr);
+    svmManager->freeSVMAllocDefer(ptr1);
+    ASSERT_EQ(2ul, svmManager->getNumDeferFreeAllocs());
+
+    std::vector<size_t> claimableCountsDuringProcessing;
+    std::vector<size_t> outstandingCountsDuringProcessing;
+    memoryManager->allocInUseCallback = [&]() {
+        claimableCountsDuringProcessing.push_back(svmManager->getNumClaimableDeferFreeAllocs());
+        outstandingCountsDuringProcessing.push_back(svmManager->getNumDeferFreeAllocs());
+    };
+
+    svmManager->freeSVMAllocDeferImpl();
+    memoryManager->allocInUseCallback = nullptr;
+
+    ASSERT_FALSE(claimableCountsDuringProcessing.empty());
+    EXPECT_EQ(0ul, claimableCountsDuringProcessing[0]);
+    EXPECT_EQ(2ul, outstandingCountsDuringProcessing[0]);
+    for (auto outstandingCount : outstandingCountsDuringProcessing) {
+        EXPECT_NE(0ul, outstandingCount);
+    }
+
+    EXPECT_EQ(2ul, svmManager->getNumDeferFreeAllocs());
+    EXPECT_NE(nullptr, svmManager->getSVMAlloc(ptr));
+    EXPECT_NE(nullptr, svmManager->getSVMAlloc(ptr1));
+
+    memoryManager->deferAllocInUse = false;
+    svmManager->freeSVMAllocDeferImpl();
+    EXPECT_EQ(0ul, svmManager->getNumDeferFreeAllocs());
+    EXPECT_EQ(nullptr, svmManager->getSVMAlloc(ptr));
+    EXPECT_EQ(nullptr, svmManager->getSVMAlloc(ptr1));
+}
+
 TEST_F(SVMLocalMemoryAllocatorTest, whenPointerWithOffsetPassedThenProperDataRetrieved) {
 
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::DEVICE_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
     unifiedMemoryProperties.device = device;
 
     auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
     EXPECT_NE(nullptr, ptr);
 
-    auto offsetedPointer = ptrOffset(ptr, 4u);
+    auto offsetPointer = ptrOffset(ptr, 4u);
     auto usmAllocationData = svmManager->getSVMAlloc(ptr);
     ASSERT_NE(nullptr, usmAllocationData);
-    auto usmAllocationData2 = svmManager->getSVMAlloc(offsetedPointer);
+    auto usmAllocationData2 = svmManager->getSVMAlloc(offsetPointer);
     ASSERT_NE(nullptr, usmAllocationData2);
     EXPECT_EQ(usmAllocationData2, usmAllocationData);
     svmManager->freeSVMAlloc(ptr, true);
@@ -146,9 +286,9 @@ TEST_F(SVMLocalMemoryAllocatorTest, whenMultiplePointerWithOffsetPassedThenPrope
 
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::DEVICE_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
     unifiedMemoryProperties.device = device;
 
     auto ptr = svmManager->createUnifiedMemoryAllocation(2048, unifiedMemoryProperties);
@@ -160,45 +300,43 @@ TEST_F(SVMLocalMemoryAllocatorTest, whenMultiplePointerWithOffsetPassedThenPrope
     MockGraphicsAllocation mockAllocation(unalignedPointer, 512u);
     SvmAllocationData allocationData(1u);
 
-    allocationData.memoryType = InternalMemoryType::HOST_UNIFIED_MEMORY;
+    allocationData.memoryType = InternalMemoryType::hostUnifiedMemory;
     allocationData.size = mockAllocation.getUnderlyingBufferSize();
     allocationData.gpuAllocations.addAllocation(&mockAllocation);
-    svmManager->svmAllocs.insert(allocationData);
+    svmManager->svmAllocs.insert(unalignedPointer, allocationData);
 
-    auto offsetedPointer = ptrOffset(ptr, 2048);
-    auto usmAllocationData = svmManager->getSVMAlloc(offsetedPointer);
+    auto offsetPointer = ptrOffset(ptr, 2048);
+    auto usmAllocationData = svmManager->getSVMAlloc(offsetPointer);
     EXPECT_EQ(nullptr, usmAllocationData);
-    offsetedPointer = ptrOffset(ptr2, 2048);
-    usmAllocationData = svmManager->getSVMAlloc(offsetedPointer);
+    offsetPointer = ptrOffset(ptr2, 2048);
+    usmAllocationData = svmManager->getSVMAlloc(offsetPointer);
     EXPECT_EQ(nullptr, usmAllocationData);
     usmAllocationData = svmManager->getSVMAlloc(unalignedPointer);
     EXPECT_NE(nullptr, usmAllocationData);
 
-    svmManager->svmAllocs.remove(allocationData);
+    svmManager->svmAllocs.remove(reinterpret_cast<void *>(allocationData.gpuAllocations.getDefaultGraphicsAllocation()->getGpuAddress()));
     svmManager->freeSVMAlloc(ptr, true);
     svmManager->freeSVMAlloc(ptr2, true);
 }
 
 TEST_F(SVMLocalMemoryAllocatorTest, givenKmdMigratedSharedAllocationWhenPrefetchMemoryIsCalledForMultipleActivePartitionsThenPrefetchAllocationToSubDevices) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.UseKmdMigration.set(1);
+    debugManager.flags.UseKmdMigration.set(1);
 
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
     auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
     csr->setupContext(*device->getDefaultEngine().osContext);
     void *cmdQ = reinterpret_cast<void *>(0x12345);
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::SHARED_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
 
     auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
     EXPECT_NE(nullptr, ptr);
 
-    auto svmData = svmManager->getSVMAlloc(ptr);
-
     csr->setActivePartitions(2);
-    svmManager->prefetchMemory(*device, *csr, *svmData);
+    svmManager->prefetchMemory(*device, *csr, ptr, 4096);
 
     auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
     EXPECT_TRUE(mockMemoryManager->setMemPrefetchCalled);
@@ -211,19 +349,161 @@ TEST_F(SVMLocalMemoryAllocatorTest, givenKmdMigratedSharedAllocationWhenPrefetch
     svmManager->freeSVMAlloc(ptr);
 }
 
-TEST_F(SVMLocalMemoryAllocatorTest, givenForceMemoryPrefetchForKmdMigratedSharedAllocationsWhenSVMAllocsIsCalledThenPrefetchSharedUnifiedMemoryInSvmAllocsManager) {
+TEST_F(SVMLocalMemoryAllocatorTest, givenNonKmdMigratedSharedAllocationWhenPrefetchMemoryIsCalledThenSetMemPrefetchNotCalled) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.UseKmdMigration.set(1);
-    DebugManager.flags.ForceMemoryPrefetchForKmdMigratedSharedAllocations.set(true);
+    debugManager.flags.UseKmdMigration.set(0);
 
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager(), false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
     auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
     csr->setupContext(*device->getDefaultEngine().osContext);
     void *cmdQ = reinterpret_cast<void *>(0x12345);
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::SHARED_UNIFIED_MEMORY, 1, rootDeviceIndices, deviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
+    EXPECT_NE(nullptr, ptr);
+
+    csr->setActivePartitions(2);
+    svmManager->prefetchMemory(*device, *csr, ptr, 4096);
+
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    EXPECT_FALSE(mockMemoryManager->setMemPrefetchCalled);
+    EXPECT_EQ(0u, mockMemoryManager->memPrefetchSubDeviceIds.size());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenNonSharedUnifiedMemoryAllocationWhenPrefetchMemoryIsCalledThenSetMemPrefetchNotCalled) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.UseKmdMigration.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
+    EXPECT_NE(nullptr, ptr);
+
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    svmData->memoryType = InternalMemoryType::deviceUnifiedMemory;
+
+    csr->setActivePartitions(2);
+    svmManager->prefetchMemory(*device, *csr, ptr, 4096);
+
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    EXPECT_FALSE(mockMemoryManager->setMemPrefetchCalled);
+    EXPECT_EQ(0u, mockMemoryManager->memPrefetchSubDeviceIds.size());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenSharedSystemAllocationWhenPrefetchMemoryIsCalledThenPrefetchAllocationToSystemMemory) {
+    DebugManagerStateRestore restore;
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    auto &hwInfo = *device->getRootDeviceEnvironment().getMutableHardwareInfo();
+
+    VariableBackup<uint64_t> sharedSystemMemCapabilities{&hwInfo.capabilityTable.sharedSystemMemCapabilities};
+    sharedSystemMemCapabilities = (UnifiedSharedMemoryFlags::access | UnifiedSharedMemoryFlags::atomicAccess | UnifiedSharedMemoryFlags::concurrentAccess | UnifiedSharedMemoryFlags::concurrentAtomicAccess);
+
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    debugManager.flags.EnableSharedSystemUsmSupport.set(1);
+
+    uint8_t data{};
+
+    svmManager->prefetchMemory(*device, *csr, &data, sizeof(data));
+
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    EXPECT_TRUE(mockMemoryManager->prefetchSharedSystemAllocCalled);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenSharedSystemAllocationWhenPrefetchMemoryIsCalledAndNotEnabledThenNoPrefetchAllocationToSystemMemory) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.EnableSharedSystemUsmSupport.set(0);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    uint8_t data{};
+
+    svmManager->prefetchMemory(*device, *csr, &data, sizeof(data));
+
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    EXPECT_FALSE(mockMemoryManager->prefetchSharedSystemAllocCalled);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenSharedSystemAllocationWhenSharedSystemMemAdviseIsCalledThenMemoryManagerSetSharedSystemMemAdviseIsCalled) {
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    MemAdvise memAdviseOp = MemAdvise::setSystemMemoryPreferredLocation;
+    uint8_t data{};
+
+    svmManager->sharedSystemMemAdvise(*device, *device, memAdviseOp, &data, sizeof(data));
+
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    EXPECT_TRUE(mockMemoryManager->setSharedSystemMemAdviseCalled);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenSharedSystemAllocationWhenSharedSystemAtomicAccessIsCalledThenMemoryManagerSetSharedSystemAtomicAccessIsCalled) {
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    AtomicAccessMode mode = AtomicAccessMode::device;
+    uint8_t data{};
+
+    svmManager->sharedSystemAtomicAccess(*device, mode, &data, sizeof(data));
+
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    EXPECT_TRUE(mockMemoryManager->setSharedSystemAtomicAccessCalled);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenSharedSystemAllocationWhenGetSharedSystemAtomicAccessIsCalledThenMemoryManagerGetSharedSystemAtomicAccessIsCalledAndFails) {
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    mockMemoryManager->failGetSharedSystemAtomicAccess = true;
+
+    uint8_t data{};
+    auto ret = svmManager->getSharedSystemAtomicAccess(*device, &data, sizeof(data));
+    EXPECT_EQ(AtomicAccessMode::invalid, ret);
+
+    EXPECT_TRUE(mockMemoryManager->getSharedSystemAtomicAccessCalled);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenForceMemoryPrefetchForKmdMigratedSharedAllocationsWhenSVMAllocsIsCalledThenPrefetchSharedUnifiedMemoryInSvmAllocsManager) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.UseKmdMigration.set(1);
+    debugManager.flags.ForceMemoryPrefetchForKmdMigratedSharedAllocations.set(true);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
 
     auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
     EXPECT_NE(nullptr, ptr);
@@ -237,11 +517,11 @@ TEST_F(SVMLocalMemoryAllocatorTest, givenForceMemoryPrefetchForKmdMigratedShared
     svmManager->freeSVMAlloc(ptr);
 }
 
-TEST_F(SVMLocalMemoryAllocatorTest, givenAlignmentThenSharedUnifiedMemoryAllocationsAreAlignedCorrectly) {
+TEST_F(SVMLocalMemoryAllocatorTest, givenAlignmentThenUnifiedMemoryAllocationsAreAlignedCorrectly) {
     std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
     auto device = deviceFactory->rootDevices[0];
     auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
-    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager, false);
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
     auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
     csr->setupContext(*device->getDefaultEngine().osContext);
 
@@ -249,15 +529,799 @@ TEST_F(SVMLocalMemoryAllocatorTest, givenAlignmentThenSharedUnifiedMemoryAllocat
     do {
         alignment >>= 1;
         memoryManager->validateAllocateProperties = [alignment](const AllocationProperties &properties) {
-            EXPECT_EQ(properties.alignment, alignUp<size_t>(alignment, MemoryConstants::pageSize64k));
+            EXPECT_EQ(properties.alignment, alignUpNonZero<size_t>(alignment, MemoryConstants::pageSize64k));
         };
-        SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::SHARED_UNIFIED_MEMORY, alignment, rootDeviceIndices, deviceBitfields);
+        UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, alignment, rootDeviceIndices, deviceBitfields);
         unifiedMemoryProperties.device = device;
         auto ptr = svmManager->createUnifiedMemoryAllocation(1, unifiedMemoryProperties);
         EXPECT_NE(nullptr, ptr);
         if (alignment != 0) {
             EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) & (~(alignment - 1)), reinterpret_cast<uintptr_t>(ptr));
         }
+        EXPECT_EQ(svmManager->getSVMAlloc(ptr)->pageSizeForAlignment, MemoryConstants::pageSize64k);
         svmManager->freeSVMAlloc(ptr);
     } while (alignment != 0);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenAlignmentThenHostUnifiedMemoryAllocationsAreAlignedCorrectly) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    size_t alignment = 8 * MemoryConstants::megaByte;
+    do {
+        alignment >>= 1;
+        memoryManager->validateAllocateProperties = [alignment](const AllocationProperties &properties) {
+            EXPECT_EQ(properties.alignment, alignUpNonZero<size_t>(alignment, MemoryConstants::pageSize));
+        };
+        UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, alignment, rootDeviceIndices, deviceBitfields);
+        unifiedMemoryProperties.device = device;
+        auto ptr = svmManager->createHostUnifiedMemoryAllocation(1, unifiedMemoryProperties);
+        EXPECT_NE(nullptr, ptr);
+        if (alignment != 0) {
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) & (~(alignment - 1)), reinterpret_cast<uintptr_t>(ptr));
+        }
+        EXPECT_EQ(svmManager->getSVMAlloc(ptr)->pageSizeForAlignment, MemoryConstants::pageSize);
+        svmManager->freeSVMAlloc(ptr);
+    } while (alignment != 0);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenExternalHostPointerWhenCreatingHostUnifiedMemoryAllocationThenRequestedSizeIsNotAlignedUpAndAlignmentIsNotSet) {
+    constexpr size_t requestedSize = MemoryConstants::pageSize + 1;
+    auto externalHostPointer = alignedMalloc(requestedSize, MemoryConstants::pageSize);
+    ASSERT_NE(nullptr, externalHostPointer);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.allocationFlags.hostptr = reinterpret_cast<uintptr_t>(externalHostPointer);
+
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(requestedSize, unifiedMemoryProperties);
+    ASSERT_EQ(externalHostPointer, ptr);
+
+    ASSERT_NE(nullptr, memoryManager->lastAllocationProperties);
+    EXPECT_EQ(requestedSize, memoryManager->lastAllocationProperties->size);
+
+    svmManager->freeSVMAlloc(ptr);
+    alignedFree(externalHostPointer);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenDefaultSettingsAndExternalHostPointerWhenCreatingUnifiedMemoryAllocationThenRequestedSizeIsAlignedUpToPage) {
+    constexpr size_t requestedSize = MemoryConstants::pageSize + 1;
+    auto externalHostPointer = alignedMalloc(2 * MemoryConstants::pageSize, MemoryConstants::pageSize);
+    ASSERT_NE(nullptr, externalHostPointer);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.allocationFlags.hostptr = reinterpret_cast<uintptr_t>(externalHostPointer);
+
+    auto ptr = svmManager->createUnifiedMemoryAllocation(requestedSize, unifiedMemoryProperties);
+    ASSERT_EQ(externalHostPointer, ptr);
+
+    ASSERT_NE(nullptr, memoryManager->lastAllocationProperties);
+    EXPECT_EQ(2 * MemoryConstants::pageSize, memoryManager->lastAllocationProperties->size);
+
+    svmManager->freeSVMAlloc(ptr);
+    alignedFree(externalHostPointer);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenUsmHostPtrFragmentsEnabledAndExternalHostPointerWhenCreatingUnifiedMemoryAllocationThenRequestedSizeIsNotAlignedUp) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUsmHostPtrFragments.set(1);
+    constexpr size_t requestedSize = MemoryConstants::pageSize + 1;
+    auto externalHostPointer = alignedMalloc(requestedSize, MemoryConstants::pageSize);
+    ASSERT_NE(nullptr, externalHostPointer);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.allocationFlags.hostptr = reinterpret_cast<uintptr_t>(externalHostPointer);
+
+    auto ptr = svmManager->createUnifiedMemoryAllocation(requestedSize, unifiedMemoryProperties);
+    ASSERT_EQ(externalHostPointer, ptr);
+
+    ASSERT_NE(nullptr, memoryManager->lastAllocationProperties);
+    EXPECT_EQ(requestedSize, memoryManager->lastAllocationProperties->size);
+
+    svmManager->freeSVMAlloc(ptr);
+    alignedFree(externalHostPointer);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenShareableHostUnifiedMemoryPropertiesWhenCreatingAllocationThenShareableAndIpcSupportedFlagsArePassedToAllocationProperties) {
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.allocationFlags.flags.shareable = 1u;
+    unifiedMemoryProperties.allocationFlags.flags.ipcSupportedAllocationByDefault = 1u;
+
+    uint32_t validatedCount = 0u;
+    memoryManager->validateAllocateProperties = [&validatedCount](const AllocationProperties &properties) {
+        EXPECT_EQ(1u, properties.flags.shareable);
+        EXPECT_EQ(1u, properties.flags.ipcSupportedAllocationByDefault);
+        validatedCount++;
+    };
+
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    EXPECT_EQ(1u, validatedCount);
+
+    memoryManager->validateAllocateProperties = [](const AllocationProperties &) -> void {};
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenNonShareableHostUnifiedMemoryPropertiesWhenCreatingAllocationThenShareableAndIpcSupportedFlagsAreNotSetInAllocationProperties) {
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    uint32_t validatedCount = 0u;
+    memoryManager->validateAllocateProperties = [&validatedCount](const AllocationProperties &properties) {
+        EXPECT_EQ(0u, properties.flags.shareable);
+        EXPECT_EQ(0u, properties.flags.ipcSupportedAllocationByDefault);
+        validatedCount++;
+    };
+
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    EXPECT_EQ(1u, validatedCount);
+
+    memoryManager->validateAllocateProperties = [](const AllocationProperties &) -> void {};
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenUncachedHostAllocationThenSetAllocationAsUncached) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 0ull, rootDeviceIndices, deviceBitfields);
+
+    unifiedMemoryProperties.allocationFlags.flags.locallyUncachedResource = true;
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(1, unifiedMemoryProperties);
+    EXPECT_NE(nullptr, ptr);
+    auto mockedAllocation = static_cast<MemoryAllocation *>(svmManager->getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation());
+    EXPECT_TRUE(mockedAllocation->uncacheable);
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenAlignmentThenSharedUnifiedMemoryAllocationsAreAlignedCorrectly) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.ForcePreemptionMode.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 0));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+
+    const size_t representativeAlignments[] = {0, MemoryConstants::pageSize, MemoryConstants::pageSize64k, 2 * MemoryConstants::pageSize64k, MemoryConstants::pageSize2M};
+    for (size_t alignment : representativeAlignments) {
+        memoryManager->validateAllocateProperties = [alignment](const AllocationProperties &properties) {
+            EXPECT_EQ(properties.alignment, alignUpNonZero<size_t>(alignment, MemoryConstants::pageSize64k));
+        };
+        UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, alignment, rootDeviceIndices, deviceBitfields);
+        unifiedMemoryProperties.device = device;
+        auto ptr = svmManager->createSharedUnifiedMemoryAllocation(1, unifiedMemoryProperties, cmdQ);
+        EXPECT_NE(nullptr, ptr);
+        if (alignment != 0) {
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) & (~(alignment - 1)), reinterpret_cast<uintptr_t>(ptr));
+        }
+        EXPECT_EQ(svmManager->getSVMAlloc(ptr)->pageSizeForAlignment, MemoryConstants::pageSize64k);
+        svmManager->freeSVMAlloc(ptr);
+    }
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenAlignmentWhenLocalMemoryIsEnabledThenSharedUnifiedMemoryAllocationsAreAlignedCorrectly) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.EnableLocalMemory.set(1);
+    debugManager.flags.ForcePreemptionMode.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 0));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+
+    const auto &hwInfo = *memoryManager->peekExecutionEnvironment().rootDeviceEnvironments[0]->getHardwareInfo();
+    const size_t svmCpuAlignment = hwInfo.caps.svmCpuAlignment;
+    const size_t representativeAlignments[] = {0, MemoryConstants::pageSize, MemoryConstants::pageSize64k, 2 * MemoryConstants::pageSize64k, MemoryConstants::pageSize2M};
+    for (size_t alignment : representativeAlignments) {
+        memoryManager->validateAllocateProperties = [alignment, svmCpuAlignment](const AllocationProperties &properties) {
+            EXPECT_EQ(properties.alignment, alignUpNonZero<size_t>(alignment, std::max(MemoryConstants::pageSize64k, svmCpuAlignment)));
+        };
+        UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, alignment, rootDeviceIndices, deviceBitfields);
+        unifiedMemoryProperties.device = device;
+        auto ptr = svmManager->createSharedUnifiedMemoryAllocation(1, unifiedMemoryProperties, cmdQ);
+        EXPECT_NE(nullptr, ptr);
+        if (alignment != 0) {
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) & (~(alignment - 1)), reinterpret_cast<uintptr_t>(ptr));
+        }
+        const size_t pageSizeForAlignment = std::max(MemoryConstants::pageSize64k, svmCpuAlignment);
+        EXPECT_EQ(svmManager->getSVMAlloc(ptr)->pageSizeForAlignment, pageSizeForAlignment);
+        svmManager->freeSVMAlloc(ptr);
+    }
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenInternalAllocationWhenItIsMadeResidentThenNewTrackingEntryIsCreated) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+
+    ASSERT_NE(nullptr, ptr);
+    auto graphicsAllocation = svmManager->getSVMAlloc(ptr);
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    EXPECT_EQ(0u, svmManager->indirectAllocationsResidency.size());
+
+    EXPECT_TRUE(svmManager->submitIndirectAllocationsAsPack(*csr));
+    EXPECT_TRUE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    EXPECT_EQ(GraphicsAllocation::objectAlwaysResident, graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->getResidencyTaskCount(csr->getOsContext().getContextId()));
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->peekEvictable());
+
+    EXPECT_EQ(1u, svmManager->indirectAllocationsResidency.size());
+    auto internalEntry = svmManager->indirectAllocationsResidency.find(csr.get())->second;
+    EXPECT_EQ(1u, internalEntry.latestSentTaskCount);
+    EXPECT_EQ(1u, internalEntry.latestResidentObjectId);
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, whenSubmitIndirectAllocationsAsPackCalledButAllocationsAsPackNotAllowedThenDontMakeResident) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.MakeIndirectAllocationsResidentAsPack.set(0);
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+
+    ASSERT_NE(nullptr, ptr);
+    auto graphicsAllocation = svmManager->getSVMAlloc(ptr);
+
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    EXPECT_EQ(0u, svmManager->indirectAllocationsResidency.size());
+
+    EXPECT_FALSE(svmManager->submitIndirectAllocationsAsPack(*csr));
+
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    EXPECT_EQ(0u, svmManager->indirectAllocationsResidency.size());
+    EXPECT_FALSE(svmManager->indirectAllocationsResidency.contains(csr.get()));
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenTbxCsrWhenSubmitIndirectAllocationsAsPackCalledThenDontMakeResident) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+    csr->commandStreamReceiverType = CommandStreamReceiverType::tbx;
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+
+    ASSERT_NE(nullptr, ptr);
+    auto graphicsAllocation = svmManager->getSVMAlloc(ptr);
+
+    EXPECT_FALSE(svmManager->submitIndirectAllocationsAsPack(*csr));
+
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    EXPECT_EQ(0u, svmManager->indirectAllocationsResidency.size());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenInternalAllocationWhenItIsMadeResidentThenSubsequentCallsDoNotCallResidency) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+    ASSERT_NE(nullptr, ptr);
+
+    auto graphicsAllocation = svmManager->getSVMAlloc(ptr);
+    svmManager->makeIndirectAllocationsResident(*csr, 1u);
+
+    EXPECT_TRUE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    // now call with task count 2 , allocations shouldn't change
+    svmManager->makeIndirectAllocationsResident(*csr, 2u);
+    auto internalEntry = svmManager->indirectAllocationsResidency.find(csr.get())->second;
+
+    EXPECT_EQ(2u, internalEntry.latestSentTaskCount);
+    EXPECT_TRUE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    // force Graphics Allocation to be non resident
+    graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->updateResidencyTaskCount(GraphicsAllocation::objectNotResident, csr->getOsContext().getContextId());
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    // now call with task count 3 , allocations shouldn't change
+    svmManager->makeIndirectAllocationsResident(*csr, 2u);
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenInternalAllocationWhenNewAllocationIsCreatedThenItIsMadeResident) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+    ASSERT_NE(nullptr, ptr);
+
+    auto graphicsAllocation = svmManager->getSVMAlloc(ptr);
+    svmManager->makeIndirectAllocationsResident(*csr, 1u);
+
+    EXPECT_TRUE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    // force to non resident
+    graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->updateResidencyTaskCount(GraphicsAllocation::objectNotResident, csr->getOsContext().getContextId());
+
+    auto ptr2 = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+    auto graphicsAllocation2 = svmManager->getSVMAlloc(ptr2);
+
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    EXPECT_FALSE(graphicsAllocation2->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    // now call with task count 2, first allocation shouldn't be modified
+    svmManager->makeIndirectAllocationsResident(*csr, 2u);
+
+    EXPECT_FALSE(graphicsAllocation->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+    EXPECT_TRUE(graphicsAllocation2->gpuAllocations.getDefaultGraphicsAllocation()->isResident(csr->getOsContext().getContextId()));
+
+    svmManager->freeSVMAlloc(ptr);
+    svmManager->freeSVMAlloc(ptr2);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenIndirectAllocationsMadeResidentWhenCsrIsAddedOrNewAllocationIsCreatedThenMaxLatestResidentObjectIdIsUpdated) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto memoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(memoryManager);
+    auto csr = std::make_unique<MockCommandStreamReceiver>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr->setupContext(*device->getDefaultEngine().osContext);
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    auto mockPageFaultManager = new MockPageFaultManager();
+    memoryManager->pageFaultManager.reset(mockPageFaultManager);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+    EXPECT_EQ(0u, svmManager->maxLatestResidentObjectId.load());
+    svmManager->makeIndirectAllocationsResident(*csr, 1u);
+    EXPECT_EQ(svmManager->allocationsCounter.load(), svmManager->maxLatestResidentObjectId.load());
+
+    auto ptr2 = svmManager->createSharedUnifiedMemoryAllocation(4096u, unifiedMemoryProperties, &cmdQ);
+    EXPECT_LT(svmManager->maxLatestResidentObjectId.load(), svmManager->allocationsCounter.load());
+    svmManager->makeIndirectAllocationsResident(*csr, 2u);
+    EXPECT_EQ(svmManager->allocationsCounter.load(), svmManager->maxLatestResidentObjectId.load());
+
+    svmManager->freeSVMAlloc(ptr);
+    svmManager->freeSVMAlloc(ptr2);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenLocalMemoryEnabledAndCompressionEnabledThenDeviceSideSharedUsmIsCompressed) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+
+    auto &hwInfo = device->getHardwareInfo();
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    if (!gfxCoreHelper.usmCompressionSupported(hwInfo)) {
+        GTEST_SKIP();
+    }
+
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
+    EXPECT_NE(nullptr, ptr);
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    EXPECT_TRUE(svmData->gpuAllocations.getDefaultGraphicsAllocation()->isCompressionEnabled());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+struct SVMLocalMemoryAllocatorUsmCompressionDisabledTest : public SVMLocalMemoryAllocatorTest {
+    void SetUp() override {
+        debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+        debugManager.flags.EnableUsmCompression.set(0);
+        SVMLocalMemoryAllocatorTest::SetUp();
+        deviceFactory = std::make_unique<UltDeviceFactory>(1, 2);
+        device = deviceFactory->rootDevices[0];
+        if (!device->getGfxCoreHelper().usmCompressionSupported(device->getHardwareInfo())) {
+            GTEST_SKIP();
+        }
+    }
+
+    DebugManagerStateRestore restore;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    MockDevice *device = nullptr;
+};
+
+TEST_F(SVMLocalMemoryAllocatorUsmCompressionDisabledTest, givenUsmCompressionDisabledByDebugFlagWhenAllocatingDeviceUsmThenAllocationIsNotCompressed) {
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+    auto ptr = svmManager->createUnifiedMemoryAllocation(MemoryConstants::pageSize64k, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    EXPECT_FALSE(svmManager->getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation()->isCompressionEnabled());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorUsmCompressionDisabledTest, givenUsmCompressionDisabledByDebugFlagWhenAllocatingDeviceUsmWithCompressedHintThenAllocationIsNotCompressed) {
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+    unifiedMemoryProperties.allocationFlags.flags.compressedHint = 1u;
+    auto ptr = svmManager->createUnifiedMemoryAllocation(MemoryConstants::pageSize64k, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    EXPECT_FALSE(svmManager->getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation()->isCompressionEnabled());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+TEST_F(SVMLocalMemoryAllocatorUsmCompressionDisabledTest, givenUsmCompressionDisabledByDebugFlagWhenAllocatingSharedUsmThenDeviceSideIsNotCompressed) {
+    void *cmdQ = reinterpret_cast<void *>(0x12345);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+    auto ptr = svmManager->createSharedUnifiedMemoryAllocation(4096, unifiedMemoryProperties, &cmdQ);
+    ASSERT_NE(nullptr, ptr);
+
+    EXPECT_FALSE(svmManager->getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation()->isCompressionEnabled());
+
+    svmManager->freeSVMAlloc(ptr);
+}
+
+struct SVMLocalMemoryAllocatorPeerAccessCompressionTest : public SVMLocalMemoryAllocatorTest {
+    void SetUp() override {
+        debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+        SVMLocalMemoryAllocatorTest::SetUp();
+        deviceFactory = std::make_unique<UltDeviceFactory>(1, 2);
+        device = deviceFactory->rootDevices[0];
+        if (!device->getGfxCoreHelper().usmCompressionSupported(device->getHardwareInfo())) {
+            GTEST_SKIP();
+        }
+        device->hasPeerAccess = true;
+    }
+
+    bool isDeviceUsmCompressed(UnifiedMemoryProperties &unifiedMemoryProperties) {
+        auto ptr = svmManager->createUnifiedMemoryAllocation(MemoryConstants::pageSize64k, unifiedMemoryProperties);
+        EXPECT_NE(nullptr, ptr);
+        const bool compressed = svmManager->getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation()->isCompressionEnabled();
+        svmManager->freeSVMAlloc(ptr);
+        return compressed;
+    }
+
+    DebugManagerStateRestore restore;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    MockDevice *device = nullptr;
+};
+
+TEST_F(SVMLocalMemoryAllocatorPeerAccessCompressionTest, givenPeerAccessAndResourceDecompressionDisabledWhenAllocatingDeviceUsmWithoutHintThenAllocationIsNotCompressed) {
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(false);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+
+    EXPECT_FALSE(isDeviceUsmCompressed(unifiedMemoryProperties));
+}
+
+TEST_F(SVMLocalMemoryAllocatorPeerAccessCompressionTest, givenPeerAccessAndResourceDecompressionDisabledWhenAllocatingDeviceUsmWithCompressedHintThenAllocationIsCompressed) {
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(false);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+    unifiedMemoryProperties.allocationFlags.flags.compressedHint = 1u;
+
+    EXPECT_TRUE(isDeviceUsmCompressed(unifiedMemoryProperties));
+}
+
+TEST_F(SVMLocalMemoryAllocatorPeerAccessCompressionTest, givenPeerAccessAndResourceDecompressionEnabledWhenAllocatingDeviceUsmWithoutHintThenAllocationIsCompressed) {
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(true);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+
+    EXPECT_TRUE(isDeviceUsmCompressed(unifiedMemoryProperties));
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenReadOnlyFlagSetInAllocationPropertiesWhenCreatingUnifiedMemoryAllocationThenAllocationIsNotWritable) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.allocationFlags.flags.readOnly = 1;
+
+    auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+
+    auto graphicsAllocation = svmData->gpuAllocations.getDefaultGraphicsAllocation();
+    ASSERT_NE(nullptr, graphicsAllocation);
+    EXPECT_FALSE(graphicsAllocation->isMemObjectsAllocationWithWritableFlags());
+
+    svmManager->freeSVMAlloc(ptr, true);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenReadOnlyFlagNotSetInAllocationPropertiesWhenCreatingUnifiedMemoryAllocationThenAllocationIsWritable) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+
+    auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+
+    auto graphicsAllocation = svmData->gpuAllocations.getDefaultGraphicsAllocation();
+    ASSERT_NE(nullptr, graphicsAllocation);
+    EXPECT_TRUE(graphicsAllocation->isMemObjectsAllocationWithWritableFlags());
+
+    svmManager->freeSVMAlloc(ptr, true);
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenFabricAccessibleIpcHandleRequestedWhenReusingCachedHostAllocationThenPropertyIsSetOnSvmData) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.ExperimentalEnableHostAllocationCache.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    device->usmReuseInfo.init(1 * MemoryConstants::gigaByte, UsmReuseInfo::notLimited);
+    svmManager->initUsmAllocationsCaches(*device);
+    ASSERT_NE(nullptr, svmManager->usmHostAllocationsCache);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    auto cachedPtr = svmManager->createHostUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, cachedPtr);
+    svmManager->freeSVMAlloc(cachedPtr);
+    ASSERT_EQ(1u, svmManager->usmHostAllocationsCache->allocations.size());
+
+    unifiedMemoryProperties.ipcHandleTypeFlags = NEO::unifiedMemoryPropertiesIpcHandleTypeFlagFabricAccessible;
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    EXPECT_EQ(cachedPtr, ptr);
+
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_TRUE(svmData->ipcHandleTypeFlags & NEO::unifiedMemoryPropertiesIpcHandleTypeFlagFabricAccessible);
+
+    svmManager->freeSVMAlloc(ptr);
+    svmManager->cleanupUSMAllocCaches();
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenFabricAccessibleIpcHandleRequestedWhenCachedHostAllocationNotInSvmAllocsThenPropertyIsNotSet) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.ExperimentalEnableHostAllocationCache.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    device->usmReuseInfo.init(1 * MemoryConstants::gigaByte, UsmReuseInfo::notLimited);
+    svmManager->initUsmAllocationsCaches(*device);
+    ASSERT_NE(nullptr, svmManager->usmHostAllocationsCache);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    auto cachedPtr = svmManager->createHostUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, cachedPtr);
+    svmManager->freeSVMAlloc(cachedPtr);
+    ASSERT_EQ(1u, svmManager->usmHostAllocationsCache->allocations.size());
+
+    // Replace the cached allocation pointer with one not tracked in svmAllocs so that
+    // getSVMAlloc returns null, exercising the defensive null check at the decision point.
+    void *unmappedPtr = reinterpret_cast<void *>(uintptr_t(1));
+    svmManager->usmHostAllocationsCache->allocations[0].allocation = unmappedPtr;
+
+    unifiedMemoryProperties.ipcHandleTypeFlags = NEO::unifiedMemoryPropertiesIpcHandleTypeFlagFabricAccessible;
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    EXPECT_EQ(unmappedPtr, ptr);
+    EXPECT_EQ(nullptr, svmManager->getSVMAlloc(unmappedPtr));
+    EXPECT_EQ(0u, svmManager->usmHostAllocationsCache->allocations.size());
+
+    svmManager->freeSVMAlloc(cachedPtr);
+    svmManager->cleanupUSMAllocCaches();
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenFabricAccessibleIpcHandleRequestedWhenReusingCachedDeviceAllocationThenPropertyIsSetOnSvmData) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.ExperimentalEnableDeviceAllocationCache.set(1);
+
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 2));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+    device->usmReuseInfo.init(1 * MemoryConstants::gigaByte, UsmReuseInfo::notLimited);
+    svmManager->initUsmAllocationsCaches(*device);
+    ASSERT_NE(nullptr, svmManager->usmDeviceAllocationsCache);
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, 1, rootDeviceIndices, deviceBitfields);
+    unifiedMemoryProperties.device = device;
+    auto cachedPtr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, cachedPtr);
+    svmManager->freeSVMAlloc(cachedPtr);
+    ASSERT_EQ(1u, svmManager->usmDeviceAllocationsCache->allocations.size());
+
+    unifiedMemoryProperties.ipcHandleTypeFlags = NEO::unifiedMemoryPropertiesIpcHandleTypeFlagFabricAccessible;
+    auto ptr = svmManager->createUnifiedMemoryAllocation(4096, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    EXPECT_EQ(cachedPtr, ptr);
+
+    auto svmData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_TRUE(svmData->ipcHandleTypeFlags & NEO::unifiedMemoryPropertiesIpcHandleTypeFlagFabricAccessible);
+
+    svmManager->freeSVMAlloc(ptr);
+    svmManager->cleanupUSMAllocCaches();
+}
+
+TEST_F(SVMLocalMemoryAllocatorTest, givenAllocationAbsentOnOneRootDeviceWhenCapturingEngineCompletionSnapshotThenAbsentAllocationIsSkipped) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(2, 1));
+    auto secondRootDevice = deviceFactory->rootDevices[1];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(secondRootDevice->getMemoryManager());
+
+    constexpr TaskCountType taskCount = 7u;
+    auto &defaultEngine = secondRootDevice->getDefaultEngine();
+    MockGraphicsAllocation allocationOnSecondRootDevice(1u, reinterpret_cast<void *>(0x1000), 4096u);
+    allocationOnSecondRootDevice.updateTaskCount(taskCount, defaultEngine.osContext->getContextId());
+
+    SvmAllocationData allocationData(1u);
+    allocationData.gpuAllocations.addAllocation(&allocationOnSecondRootDevice);
+    ASSERT_EQ(nullptr, allocationData.gpuAllocations.getGraphicsAllocation(0u));
+
+    EngineCompletionSnapshot snapshot;
+    svmManager->captureEngineCompletionSnapshot(&allocationData, snapshot);
+
+    ASSERT_EQ(1u, snapshot.size());
+    EXPECT_EQ(defaultEngine.commandStreamReceiver, snapshot[0].first);
+    EXPECT_EQ(taskCount, snapshot[0].second);
+}
+
+class NumaPreferringMockMemoryManager : public MockMemoryManager {
+  public:
+    using MockMemoryManager::MockMemoryManager;
+    std::optional<uint32_t> getRootDeviceIndexClosestToPreferredNumaNode(const RootDeviceIndicesContainer &rootDeviceIndices) override {
+        getRootDeviceIndexClosestToPreferredNumaNodeCalled++;
+        return numaRootDeviceIndex;
+    }
+    std::optional<uint32_t> numaRootDeviceIndex;
+    uint32_t getRootDeviceIndexClosestToPreferredNumaNodeCalled = 0u;
+};
+
+struct SvmHostAllocationNumaTest : public ::testing::Test {
+    SvmHostAllocationNumaTest() : executionEnvironment(defaultHwInfo.get(), false, 3u),
+                                  memoryManager(false, false, executionEnvironment),
+                                  svmManager(&memoryManager) {}
+
+    MockExecutionEnvironment executionEnvironment;
+    NumaPreferringMockMemoryManager memoryManager;
+    MockSVMAllocsManager svmManager;
+    RootDeviceIndicesContainer rootDeviceIndices = {0u, 1u, 2u};
+    std::map<uint32_t, DeviceBitfield> deviceBitfields{{0u, mockDeviceBitfield}, {1u, mockDeviceBitfield}, {2u, mockDeviceBitfield}};
+    UnifiedMemoryProperties unifiedMemoryProperties{InternalMemoryType::hostUnifiedMemory, 1, rootDeviceIndices, deviceBitfields};
+};
+
+TEST_F(SvmHostAllocationNumaTest, givenRootDeviceClosestToPreferredNumaNodeWhenCreatingHostAllocationThenItOwnsStorageAndOtherRootDevicesImportIt) {
+    memoryManager.numaRootDeviceIndex = 1u;
+
+    auto ptr = svmManager.createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    auto svmData = svmManager.getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, svmData);
+    EXPECT_EQ(1u, memoryManager.getRootDeviceIndexClosestToPreferredNumaNodeCalled);
+    EXPECT_EQ(1u, svmData->gpuAllocations.getDefaultGraphicsAllocation()->getRootDeviceIndex());
+    for (const auto rootDeviceIndex : rootDeviceIndices) {
+        EXPECT_NE(nullptr, svmData->gpuAllocations.getGraphicsAllocation(rootDeviceIndex));
+    }
+    EXPECT_EQ(2u, memoryManager.createGraphicsAllocationFromExistingStorageCalled);
+
+    svmManager.freeSVMAlloc(ptr);
+}
+
+TEST_F(SvmHostAllocationNumaTest, givenNoRootDeviceClosestToPreferredNumaNodeWhenCreatingHostAllocationThenFirstRootDeviceOwnsStorage) {
+    auto ptr = svmManager.createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptr);
+
+    EXPECT_EQ(1u, memoryManager.getRootDeviceIndexClosestToPreferredNumaNodeCalled);
+    EXPECT_EQ(0u, svmManager.getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation()->getRootDeviceIndex());
+
+    svmManager.freeSVMAlloc(ptr);
+}
+
+TEST_F(SvmHostAllocationNumaTest, givenExternalHostPointerWhenCreatingHostAllocationThenRootDeviceClosestToPreferredNumaNodeIsNotQueried) {
+    memoryManager.numaRootDeviceIndex = 1u;
+    auto externalHostPointer = alignedMalloc(MemoryConstants::pageSize, MemoryConstants::pageSize);
+    unifiedMemoryProperties.allocationFlags.hostptr = reinterpret_cast<uintptr_t>(externalHostPointer);
+
+    auto ptr = svmManager.createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_EQ(externalHostPointer, ptr);
+
+    EXPECT_EQ(0u, memoryManager.getRootDeviceIndexClosestToPreferredNumaNodeCalled);
+    EXPECT_EQ(0u, svmManager.getSVMAlloc(ptr)->gpuAllocations.getDefaultGraphicsAllocation()->getRootDeviceIndex());
+
+    svmManager.freeSVMAlloc(ptr);
+    alignedFree(externalHostPointer);
+}
+
+TEST_F(SvmHostAllocationNumaTest, givenHostAllocationCacheWhenRootDeviceClosestToPreferredNumaNodeChangesThenAllocationOwnedByOtherRootDeviceIsNotReused) {
+    memoryManager.usmReuseInfo.init(1 * MemoryConstants::gigaByte, UsmReuseInfo::notLimited);
+    svmManager.initUsmHostAllocationsCache();
+    ASSERT_NE(nullptr, svmManager.usmHostAllocationsCache);
+
+    memoryManager.numaRootDeviceIndex = 1u;
+    auto ptrOwnedByRootDevice1 = svmManager.createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptrOwnedByRootDevice1);
+    svmManager.freeSVMAlloc(ptrOwnedByRootDevice1);
+    ASSERT_EQ(1u, svmManager.usmHostAllocationsCache->allocations.size());
+
+    memoryManager.numaRootDeviceIndex = 2u;
+    auto ptrOwnedByRootDevice2 = svmManager.createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, ptrOwnedByRootDevice2);
+    EXPECT_NE(ptrOwnedByRootDevice1, ptrOwnedByRootDevice2);
+    EXPECT_EQ(2u, svmManager.getSVMAlloc(ptrOwnedByRootDevice2)->gpuAllocations.getDefaultGraphicsAllocation()->getRootDeviceIndex());
+    EXPECT_EQ(1u, svmManager.usmHostAllocationsCache->allocations.size());
+
+    memoryManager.numaRootDeviceIndex = 1u;
+    auto reusedPtr = svmManager.createHostUnifiedMemoryAllocation(MemoryConstants::pageSize, unifiedMemoryProperties);
+    EXPECT_EQ(ptrOwnedByRootDevice1, reusedPtr);
+    EXPECT_EQ(0u, svmManager.usmHostAllocationsCache->allocations.size());
+
+    svmManager.freeSVMAlloc(reusedPtr);
+    svmManager.freeSVMAlloc(ptrOwnedByRootDevice2);
+    svmManager.cleanupUSMAllocCaches();
 }

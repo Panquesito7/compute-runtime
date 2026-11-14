@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/os_interface/windows/dxgi_wrapper.h"
+#include "shared/test/common/os_interface/windows/ult_adapter_luid.h"
 
 #include "dxcore_interface.h"
 
@@ -27,7 +28,7 @@ class UltDxCoreAdapter : public IDXCoreAdapter {
     virtual ~UltDxCoreAdapter() = default;
 
     const static char *description;
-    LUID luid = {0u, 0x1234u};
+    LUID luid = {};
     bool STDMETHODCALLTYPE IsValid() override {
         return true;
     }
@@ -125,8 +126,8 @@ class UltDxCoreAdapter : public IDXCoreAdapter {
     }
 
     // IUnknown
-#ifdef _WIN32
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void __RPC_FAR *__RPC_FAR *ppvObject) override {
+#if defined(_WIN32)
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void __RPC_FAR * __RPC_FAR * ppvObject) override {
         UNRECOVERABLE_IF(true);
         return error;
     }
@@ -156,6 +157,7 @@ class UltDXCoreAdapterList : public IDXCoreAdapterList {
     static bool firstInvalid;
     HRESULT STDMETHODCALLTYPE GetAdapter(uint32_t index, REFIID riid, _COM_Outptr_ void **ppvAdapter) override {
         auto adapter = new UltDxCoreAdapter;
+        adapter->luid = UltAdapterLuid::create(UltAdapterLuid::dxCoreFactoryId, index);
         if (firstInvalid && 0 == index) {
             adapter->luid.HighPart = 0u;
             adapter->luid.LowPart = 0u;
@@ -188,8 +190,8 @@ class UltDXCoreAdapterList : public IDXCoreAdapterList {
     }
 
     // IUnknown
-#ifdef _WIN32
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void __RPC_FAR *__RPC_FAR *ppvObject) override {
+#if defined(_WIN32)
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void __RPC_FAR * __RPC_FAR * ppvObject) override {
         UNRECOVERABLE_IF(true);
         return error;
     }
@@ -260,8 +262,8 @@ class UltDXCoreAdapterFactory : public IDXCoreAdapterFactory {
     }
 
     // IUnknown
-#ifdef _WIN32
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void __RPC_FAR *__RPC_FAR *ppvObject) override {
+#if defined(_WIN32)
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void __RPC_FAR * __RPC_FAR * ppvObject) override {
         UNRECOVERABLE_IF(true);
         return error;
     }

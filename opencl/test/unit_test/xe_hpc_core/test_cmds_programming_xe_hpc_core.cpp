@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,8 @@
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/state_base_address.h"
 #include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
@@ -21,7 +23,6 @@
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 #include "encode_surface_state_args.h"
-#include "hw_cmds_xe_hpc_core_base.h"
 
 using namespace NEO;
 using CmdsProgrammingTestsXeHpcCore = UltCommandStreamReceiverTest;
@@ -30,7 +31,7 @@ XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, givenL3ToL1DebugFlagWhenStatele
     using STATE_BASE_ADDRESS = typename FamilyType::STATE_BASE_ADDRESS;
 
     DebugManagerStateRestore restore;
-    DebugManager.flags.ForceL1Caching.set(1u);
+    debugManager.flags.ForceL1Caching.set(1u);
 
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     flushTask(commandStreamReceiver);
@@ -42,7 +43,7 @@ XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, givenL3ToL1DebugFlagWhenStatele
 
     auto stateBaseAddress = static_cast<STATE_BASE_ADDRESS *>(hwParserCsr.cmdStateBaseAddress);
 
-    auto actualL1CachePolocy = static_cast<uint8_t>(stateBaseAddress->getL1CachePolicyL1CacheControl());
+    auto actualL1CachePolocy = static_cast<uint8_t>(stateBaseAddress->getL1CacheControlCachePolicy());
 
     const uint8_t expectedL1CachePolicy = 0;
     EXPECT_EQ(expectedL1CachePolicy, actualL1CachePolocy);
@@ -51,7 +52,7 @@ XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, givenL3ToL1DebugFlagWhenStatele
 XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, whenAppendingRssThenProgramWtL1CachePolicy) {
     auto memoryManager = pDevice->getExecutionEnvironment()->memoryManager.get();
     size_t allocationSize = MemoryConstants::pageSize;
-    AllocationProperties properties(pDevice->getRootDeviceIndex(), allocationSize, AllocationType::BUFFER, pDevice->getDeviceBitfield());
+    AllocationProperties properties(pDevice->getRootDeviceIndex(), allocationSize, AllocationType::buffer, pDevice->getDeviceBitfield());
     auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(properties);
 
     auto rssCmd = FamilyType::cmdInitRenderSurfaceState;
@@ -75,7 +76,7 @@ XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, whenAppendingRssThenProgramWtL1
 
     EncodeSurfaceState<FamilyType>::encodeBuffer(args);
 
-    EXPECT_EQ(FamilyType::RENDER_SURFACE_STATE::L1_CACHE_POLICY_WBP, rssCmd.getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(FamilyType::RENDER_SURFACE_STATE::L1_CACHE_CONTROL_WBP, rssCmd.getL1CacheControlCachePolicy());
 }
 
 XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, givenAlignedCacheableReadOnlyBufferThenChoseOclBufferConstPolicy) {
@@ -94,13 +95,13 @@ XE_HPC_CORETEST_F(CmdsProgrammingTestsXeHpcCore, givenAlignedCacheableReadOnlyBu
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     typename FamilyType::RENDER_SURFACE_STATE surfaceState = {};
-    buffer->setArgStateful(&surfaceState, false, false, false, false, context.getDevice(0)->getDevice(), false, false);
+    buffer->setArgStateful(&surfaceState, false, false, false, false, context.getDevice(0)->getDevice(), false);
 
-    const auto expectedMocs = context.getDevice(0)->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CONST);
+    const auto expectedMocs = context.getDevice(0)->getGmmHelper()->getL1EnabledMOCS();
     const auto actualMocs = surfaceState.getMemoryObjectControlState();
     EXPECT_EQ(expectedMocs, actualMocs);
 
-    auto actualL1CachePolocy = static_cast<uint8_t>(surfaceState.getL1CachePolicyL1CacheControl());
+    auto actualL1CachePolocy = static_cast<uint8_t>(surfaceState.getL1CacheControlCachePolicy());
 
     const uint8_t expectedL1CachePolicy = 0;
     EXPECT_EQ(expectedL1CachePolicy, actualL1CachePolocy);

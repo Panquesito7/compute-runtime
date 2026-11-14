@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,13 +15,21 @@
 #include "shared/test/common/libult/linux/drm_query_mock.h"
 #include "shared/test/common/mocks/linux/mock_drm_allocation.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
 #include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "gtest/gtest.h"
 
 using namespace NEO;
 
-TEST(DrmQueryTest, givenDirectSubmissionActiveWhenCreateDrmContextThenProperFlagIsSet) {
+using DrmQueryTest = ::testing::Test;
+using DrmPrelimTest = ::testing::Test;
+using DrmBufferObjectTestPrelim = ::testing::Test;
+using DrmBufferObjectPrelim = ::testing::Test;
+using DrmTestPrelim = ::testing::Test;
+
+HWTEST2_F(DrmQueryTest, givenDirectSubmissionActiveWhenCreateDrmContextThenProperFlagIsSet, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
@@ -30,31 +38,7 @@ TEST(DrmQueryTest, givenDirectSubmissionActiveWhenCreateDrmContextThenProperFlag
     EXPECT_TRUE(drm.receivedContextCreateFlags & DrmPrelimHelper::getLongRunningContextCreateFlag());
 }
 
-TEST(DrmQueryTest, givenDirectSubmissionDisabledAndDirectSubmissionDrmContextSetWhenCreateDrmContextThenProperFlagIsSet) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionDrmContext.set(1);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-
-    drm.createDrmContext(0, false, false);
-
-    EXPECT_TRUE(drm.receivedContextCreateFlags & DrmPrelimHelper::getLongRunningContextCreateFlag());
-}
-
-TEST(DrmQueryTest, givenDirectSubmissionActiveAndDirectSubmissionDrmContextSetZeroWhenCreateDrmContextThenProperFlagIsNotSet) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DirectSubmissionDrmContext.set(0);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-
-    drm.createDrmContext(0, true, false);
-
-    EXPECT_FALSE(drm.receivedContextCreateFlags & DrmPrelimHelper::getLongRunningContextCreateFlag());
-}
-
-TEST(DrmQueryTest, givenCooperativeEngineWhenCreateDrmContextThenRunAloneContextIsRequested) {
+HWTEST2_F(DrmQueryTest, givenCooperativeEngineWhenCreateDrmContextThenRunAloneContextIsRequested, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
@@ -72,37 +56,9 @@ TEST(DrmQueryTest, givenCooperativeEngineWhenCreateDrmContextThenRunAloneContext
     EXPECT_EQ(0u, extSetparam.param.value);
 }
 
-TEST(DrmQueryTest, givenForceRunAloneContextFlagSetWhenCreateDrmContextThenRunAloneContextIsRequested) {
+HWTEST2_F(DrmQueryTest, givenCreateContextWithAccessCountersWhenDrmContextIsCreatedThenProgramAccessCountersWithDefaultGranularity, IsAtMostXeCore) {
     DebugManagerStateRestore restorer;
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-
-    {
-        DebugManager.flags.ForceRunAloneContext.set(0);
-        drm.createDrmContext(0, false, false);
-
-        auto extSetparam = drm.receivedContextCreateSetParam;
-        EXPECT_NE(static_cast<uint64_t>(DrmPrelimHelper::getRunAloneContextParam()), extSetparam.param.param);
-    }
-    {
-        DebugManager.flags.ForceRunAloneContext.set(1);
-        drm.createDrmContext(0, false, false);
-
-        auto extSetparam = drm.receivedContextCreateSetParam;
-        EXPECT_EQ(static_cast<uint32_t>(I915_CONTEXT_CREATE_EXT_SETPARAM), extSetparam.base.name);
-        EXPECT_EQ(0u, extSetparam.base.nextExtension);
-        EXPECT_EQ(0u, extSetparam.base.flags);
-
-        EXPECT_EQ(static_cast<uint64_t>(DrmPrelimHelper::getRunAloneContextParam()), extSetparam.param.param);
-        EXPECT_EQ(0u, extSetparam.param.size);
-        EXPECT_EQ(0u, extSetparam.param.contextId);
-        EXPECT_EQ(0u, extSetparam.param.value);
-    }
-}
-
-TEST(DrmQueryTest, givenCreateContextWithAccessCountersWhenDrmContextIsCreatedThenProgramAccessCountersWithDefaultGranularity) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateContextWithAccessCounters.set(0);
+    debugManager.flags.CreateContextWithAccessCounters.set(1);
 
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
@@ -130,24 +86,15 @@ TEST(DrmQueryTest, givenCreateContextWithAccessCountersWhenDrmContextIsCreatedTh
     EXPECT_EQ(static_cast<uint8_t>(DrmPrelimHelper::getContextAcgValues()[1]), paramAcc->granularity);
 }
 
-TEST(DrmQueryTest, GivenDrmWhenAskedForContextThatFailsThenFalseIsReturned) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmMock *pDrm = new DrmMock(*executionEnvironment->rootDeviceEnvironments[0]);
-    pDrm->storedRetVal = -1;
-    EXPECT_EQ(-1, pDrm->createDrmContext(1, false, false));
-    pDrm->storedRetVal = 0;
-    delete pDrm;
-}
-
-TEST(DrmQueryTest, givenCreateContextWithAccessCounterWhenDrmContextIsCreatedThenProgramAccessCountersWithSpecifiedTriggeringThreshold) {
+HWTEST2_F(DrmQueryTest, givenCreateContextWithAccessCounterWhenDrmContextIsCreatedThenProgramAccessCountersWithSpecifiedTriggeringThreshold, IsAtMostXeCore) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateContextWithAccessCounters.set(0);
+    debugManager.flags.CreateContextWithAccessCounters.set(1);
 
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
     for (uint16_t threshold : {0, 1, 1024, 65535}) {
-        DebugManager.flags.AccessCountersTrigger.set(threshold);
+        debugManager.flags.AccessCountersTrigger.set(threshold);
 
         auto ret = drm.createDrmContext(0, false, false);
         EXPECT_EQ(0, ret);
@@ -173,15 +120,15 @@ TEST(DrmQueryTest, givenCreateContextWithAccessCounterWhenDrmContextIsCreatedThe
     }
 }
 
-TEST(DrmQueryTest, givenCreateContextWithAccessCounterWhenDrmContextIsCreatedThenProgramAccessCountersWithSpecifiedGranularity) {
+HWTEST2_F(DrmQueryTest, givenCreateContextWithAccessCounterWhenDrmContextIsCreatedThenProgramAccessCountersWithSpecifiedGranularity, IsAtMostXeCore) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateContextWithAccessCounters.set(0);
+    debugManager.flags.CreateContextWithAccessCounters.set(1);
 
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
     for (uint8_t granularity : DrmPrelimHelper::getContextAcgValues()) {
-        DebugManager.flags.AccessCountersGranularity.set(granularity);
+        debugManager.flags.AccessCountersGranularity.set(granularity);
 
         auto ret = drm.createDrmContext(0, false, false);
         EXPECT_EQ(0, ret);
@@ -207,7 +154,7 @@ TEST(DrmQueryTest, givenCreateContextWithAccessCounterWhenDrmContextIsCreatedThe
     }
 }
 
-TEST(DrmQueryTest, givenPrelimEuDebugEnabledWhenCallingIsDebugAttachAvailableThenReturnValueIsTrue) {
+HWTEST2_F(DrmQueryTest, givenPrelimEuDebugEnabledWhenCallingIsDebugAttachAvailableThenReturnValueIsTrue, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     drm.allowDebugAttachCallBase = true;
@@ -216,7 +163,7 @@ TEST(DrmQueryTest, givenPrelimEuDebugEnabledWhenCallingIsDebugAttachAvailableThe
     EXPECT_TRUE(drm.isDebugAttachAvailable());
 }
 
-TEST(DrmQueryTest, givenPrelimEuDebugDisabledWhenCallingIsDebugAttachAvailableThenReturnValueIsFalse) {
+HWTEST2_F(DrmQueryTest, givenPrelimEuDebugDisabledWhenCallingIsDebugAttachAvailableThenReturnValueIsFalse, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     drm.allowDebugAttachCallBase = true;
@@ -225,10 +172,11 @@ TEST(DrmQueryTest, givenPrelimEuDebugDisabledWhenCallingIsDebugAttachAvailableTh
     EXPECT_FALSE(drm.isDebugAttachAvailable());
 }
 
-TEST(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEbusyReturnedThenErrorIsReturnedWithoutReinvokingIoctl) {
+HWTEST2_F(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEbusyReturnedThenErrorIsReturnedWithoutReinvokingIoctl, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     drm.allowDebugAttachCallBase = true;
+    drm.baseErrno = false;
 
     VariableBackup<decltype(SysCalls::sysCallsIoctl)> mockIoctl(&SysCalls::sysCallsIoctl, [](int fileDescriptor, unsigned long int request, void *arg) -> int {
         return -1;
@@ -239,11 +187,11 @@ TEST(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEbusyReturnedThenErrorIsRetur
     drm.context.debuggerOpenRetval = -1;
     drm.errnoRetVal = EBUSY;
 
-    auto ret = drm.Drm::ioctl(DrmIoctl::DebuggerOpen, &open);
+    auto ret = drm.Drm::ioctl(DrmIoctl::debuggerOpen, &open);
     EXPECT_EQ(-1, ret);
 }
 
-TEST(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEAgainOrEIntrReturnedThenIoctlIsCalledAgain) {
+HWTEST2_F(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEAgainOrEIntrReturnedThenIoctlIsCalledAgain, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     drm.allowDebugAttachCallBase = true;
@@ -265,7 +213,7 @@ TEST(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEAgainOrEIntrReturnedThenIoct
 
         drm.errnoRetVal = EAGAIN;
 
-        auto ret = drm.Drm::ioctl(DrmIoctl::DebuggerOpen, &open);
+        auto ret = drm.Drm::ioctl(DrmIoctl::debuggerOpen, &open);
         EXPECT_EQ(0, ret);
     }
 
@@ -282,7 +230,7 @@ TEST(DrmPrelimTest, GivenDebuggerOpenIoctlWhenErrorEAgainOrEIntrReturnedThenIoct
         drm.ioctlCallsCount = 0;
         drm.errnoRetVal = EINTR;
 
-        auto ret = drm.Drm::ioctl(DrmIoctl::DebuggerOpen, &open);
+        auto ret = drm.Drm::ioctl(DrmIoctl::debuggerOpen, &open);
         EXPECT_EQ(0, ret);
     }
 }
@@ -292,142 +240,7 @@ struct BufferObjectMock : public BufferObject {
     using BufferObject::fillExecObject;
 };
 
-TEST(DrmBufferObjectTestPrelim, givenDisableScratchPagesWhenCreateDrmVirtualMemoryThenProperFlagIsSet) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DisableScratchPages.set(1);
-    DebugManager.flags.UseTileMemoryBankInVirtualMemoryCreation.set(0u);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-
-    uint32_t vmId = 0;
-    drm.createDrmVirtualMemory(vmId);
-
-    EXPECT_TRUE(drm.receivedGemVmControl.flags & DrmPrelimHelper::getDisableScratchVmCreateFlag());
-}
-
-TEST(DrmBufferObjectTestPrelim, givenDebuggingEnabledWithoutDisableScratchPagesFlagSetWhenCreateDrmVirtualMemoryThenDisableScratchPagesFlagIsNotSet) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.UseTileMemoryBankInVirtualMemoryCreation.set(0u);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
-
-    uint32_t vmId = 0;
-    drm.createDrmVirtualMemory(vmId);
-
-    EXPECT_FALSE(drm.receivedGemVmControl.flags & DrmPrelimHelper::getDisableScratchVmCreateFlag());
-}
-
-TEST(DrmBufferObjectTestPrelim, givenDisableScratchPagesAndDebuggingEnabledWhenCreateDrmVirtualMemoryThenEnvVariableIsPriority) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.DisableScratchPages.set(1);
-    DebugManager.flags.UseTileMemoryBankInVirtualMemoryCreation.set(0u);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
-
-    uint32_t vmId = 0;
-    drm.createDrmVirtualMemory(vmId);
-
-    EXPECT_TRUE(drm.receivedGemVmControl.flags & DrmPrelimHelper::getDisableScratchVmCreateFlag());
-}
-
-TEST(DrmBufferObjectTestPrelim, givenLocalMemoryDisabledWhenCreateDrmVirtualMemoryThenVmRegionExtensionIsNotPassed) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableLocalMemory.set(0);
-    DebugManager.flags.UseTileMemoryBankInVirtualMemoryCreation.set(1u);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-
-    uint32_t vmId = 0;
-    drm.createDrmVirtualMemory(vmId);
-
-    EXPECT_EQ(drm.receivedGemVmControl.extensions, 0ull);
-}
-
-TEST(DrmBufferObjectTestPrelim, givenLocalMemoryEnabledWhenCreateDrmVirtualMemoryThenVmRegionExtensionIsPassed) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableLocalMemory.set(1);
-    DebugManager.flags.UseTileMemoryBankInVirtualMemoryCreation.set(1u);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    HardwareInfo testHwInfo = *defaultHwInfo;
-
-    testHwInfo.gtSystemInfo.MultiTileArchInfo.IsValid = true;
-    testHwInfo.gtSystemInfo.MultiTileArchInfo.TileCount = 1;
-    testHwInfo.gtSystemInfo.MultiTileArchInfo.Tile0 = 1;
-    testHwInfo.gtSystemInfo.MultiTileArchInfo.TileMask = 0b1;
-    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&testHwInfo);
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-
-    uint32_t vmId = 0;
-    drm.createDrmVirtualMemory(vmId);
-
-    EXPECT_NE(drm.receivedGemVmControl.extensions, 0ull);
-}
-
-TEST(DrmBufferObjectTestPrelim, givenBufferObjectSetToColourWithBindWhenBindingThenSetProperAddressAndSize) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
-    executionEnvironment->initializeMemoryManager();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    BufferObjectMock bo(0u, &drm, 3, 1, 0, 1);
-    bo.setColourWithBind();
-    bo.setColourChunk(MemoryConstants::pageSize64k);
-    bo.addColouringAddress(0xffeeffee);
-    OsContextLinux osContext(drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
-    osContext.ensureContextInitialized();
-
-    bo.bind(&osContext, 0);
-    ASSERT_TRUE(drm.context.receivedVmBind);
-    EXPECT_EQ(drm.context.receivedVmBind->length, MemoryConstants::pageSize64k);
-    EXPECT_EQ(drm.context.receivedVmBind->start, 0xffeeffee);
-}
-
-TEST(DrmBufferObjectTestPrelim, givenPageFaultNotSupportedWhenCallingCreateDrmVirtualMemoryThenDontEnablePageFaultsOnVirtualMemory) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    EXPECT_FALSE(drm.pageFaultSupported);
-
-    uint32_t vmId = 0;
-    drm.createDrmVirtualMemory(vmId);
-
-    EXPECT_FALSE(drm.receivedGemVmControl.flags & DrmPrelimHelper::getEnablePageFaultVmCreateFlag());
-
-    drm.destroyDrmVirtualMemory(vmId);
-}
-
-TEST(DrmBufferObjectTestPrelim, givenPageFaultSupportedWhenVmBindIsAvailableThenEnablePageFaultsOnVirtualMemory) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-
-    drm.pageFaultSupported = true;
-
-    for (auto vmBindAvailable : {false, true}) {
-        drm.bindAvailable = vmBindAvailable;
-
-        uint32_t vmId = 0;
-        drm.ioctlCount.gemVmCreate = 0;
-        drm.createDrmVirtualMemory(vmId);
-        EXPECT_EQ(1, drm.ioctlCount.gemVmCreate.load());
-
-        if (drm.isVmBindAvailable()) {
-            EXPECT_TRUE(drm.receivedGemVmControl.flags & DrmPrelimHelper::getEnablePageFaultVmCreateFlag());
-        } else {
-            EXPECT_FALSE(drm.receivedGemVmControl.flags & DrmPrelimHelper::getEnablePageFaultVmCreateFlag());
-        }
-
-        drm.ioctlCount.gemVmDestroy = 0;
-        drm.destroyDrmVirtualMemory(vmId);
-        EXPECT_EQ(1, drm.ioctlCount.gemVmDestroy.load());
-    }
-}
-
-TEST(DrmBufferObjectTestPrelim, givenContextWhenQueryingVmIdThenIoctlIsCalled) {
+HWTEST2_F(DrmBufferObjectTestPrelim, givenContextWhenQueryingVmIdThenIoctlIsCalled, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
     executionEnvironment->initializeMemoryManager();
@@ -444,57 +257,7 @@ TEST(DrmBufferObjectTestPrelim, givenContextWhenQueryingVmIdThenIoctlIsCalled) {
     EXPECT_EQ(static_cast<uint32_t>(drm.storedRetValForVmId), vmId);
 }
 
-TEST(DrmBufferObjectTestPrelim, givenBufferObjectMarkedForCaptureWhenBindingThenCaptureFlagIsSet) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
-    executionEnvironment->initializeMemoryManager();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    BufferObjectMock bo(0, &drm, 3, 1, 0, 1);
-    OsContextLinux osContext(drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
-    osContext.ensureContextInitialized();
-    bo.markForCapture();
-
-    bo.bind(&osContext, 0);
-    ASSERT_TRUE(drm.context.receivedVmBind);
-    EXPECT_TRUE(drm.context.receivedVmBind->flags & DrmPrelimHelper::getCaptureVmBindFlag());
-}
-
-TEST(DrmBufferObjectTestPrelim, givenNoActiveDirectSubmissionAndForceUseImmediateExtensionWhenBindingThenImmediateFlagIsSetAndExtensionListIsNotNull) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableImmediateVmBindExt.set(1);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
-    executionEnvironment->initializeMemoryManager();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    BufferObjectMock bo(0u, &drm, 3, 1, 0, 1);
-    OsContextLinux osContext(drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
-    osContext.ensureContextInitialized();
-
-    bo.bind(&osContext, 0);
-    ASSERT_TRUE(drm.context.receivedVmBind);
-    EXPECT_TRUE(drm.context.receivedVmBind->flags & DrmPrelimHelper::getImmediateVmBindFlag());
-    EXPECT_NE(drm.context.receivedVmBind->extensions, 0u);
-}
-
-TEST(DrmBufferObjectTestPrelim, whenBindingThenImmediateFlagIsSetAndExtensionListIsNotNull) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
-    executionEnvironment->initializeMemoryManager();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    drm.setDirectSubmissionActive(true);
-    BufferObjectMock bo(0u, &drm, 3, 1, 0, 1);
-    OsContextLinux osContext(drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
-    osContext.ensureContextInitialized();
-    osContext.setDirectSubmissionActive();
-
-    bo.bind(&osContext, 0);
-    ASSERT_TRUE(drm.context.receivedVmBind);
-    EXPECT_TRUE(drm.context.receivedVmBind->flags & DrmPrelimHelper::getImmediateVmBindFlag());
-    EXPECT_NE(drm.context.receivedVmBind->extensions, 0u);
-}
-
-TEST(DrmBufferObjectTestPrelim, givenProvidedCtxIdWhenCallingWaitUserFenceThenExpectCtxFlagSetAndNoSoftFlagSet) {
+HWTEST2_F(DrmBufferObjectTestPrelim, givenProvidedCtxIdWhenCallingWaitUserFenceThenExpectCtxFlagSetAndNoSoftFlagSet, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     OsContextLinux osContext(drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
@@ -502,7 +265,7 @@ TEST(DrmBufferObjectTestPrelim, givenProvidedCtxIdWhenCallingWaitUserFenceThenEx
 
     uint64_t gpuAddress = 0x1020304000ull;
     uint64_t value = 0x98765ull;
-    drm.waitUserFence(10u, gpuAddress, value, Drm::ValueWidth::U8, -1, 0u);
+    drm.waitUserFence(10u, gpuAddress, value, Drm::ValueWidth::u8, -1, 0u, false, NEO::InterruptId::notUsed, nullptr);
 
     EXPECT_EQ(1u, drm.context.waitUserFenceCalled);
     const auto &waitUserFence = drm.context.receivedWaitUserFence;
@@ -515,7 +278,7 @@ TEST(DrmBufferObjectTestPrelim, givenProvidedCtxIdWhenCallingWaitUserFenceThenEx
     EXPECT_EQ(-1, waitUserFence->timeout);
 }
 
-TEST(DrmBufferObjectTestPrelim, givenProvidedNoCtxIdWhenCallingWaitUserFenceThenExpectCtxFlagNotSetAndSoftFlagSet) {
+HWTEST2_F(DrmBufferObjectTestPrelim, givenProvidedNoCtxIdWhenCallingWaitUserFenceThenExpectCtxFlagNotSetAndSoftFlagSet, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     OsContextLinux osContext(drm, 0, 0u, EngineDescriptorHelper::getDefaultDescriptor());
@@ -523,7 +286,7 @@ TEST(DrmBufferObjectTestPrelim, givenProvidedNoCtxIdWhenCallingWaitUserFenceThen
 
     uint64_t gpuAddress = 0x1020304000ull;
     uint64_t value = 0x98765ull;
-    drm.waitUserFence(0u, gpuAddress, value, Drm::ValueWidth::U16, 2, 3u);
+    drm.waitUserFence(0u, gpuAddress, value, Drm::ValueWidth::u16, 2, 3u, false, NEO::InterruptId::notUsed, nullptr);
 
     EXPECT_EQ(1u, drm.context.waitUserFenceCalled);
     const auto &waitUserFence = drm.context.receivedWaitUserFence;
@@ -536,7 +299,7 @@ TEST(DrmBufferObjectTestPrelim, givenProvidedNoCtxIdWhenCallingWaitUserFenceThen
     EXPECT_EQ(2, waitUserFence->timeout);
 }
 
-TEST(DrmTestPrelim, givenHungContextWhenCallingWaitUserFenceThenSmallTimeoutIsPassed) {
+HWTEST2_F(DrmTestPrelim, givenHungContextWhenCallingWaitUserFenceThenSmallTimeoutIsPassed, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     OsContextLinux osContext(drm, 0, 10u, EngineDescriptorHelper::getDefaultDescriptor());
@@ -545,7 +308,7 @@ TEST(DrmTestPrelim, givenHungContextWhenCallingWaitUserFenceThenSmallTimeoutIsPa
 
     uint64_t memory = 0;
     uint64_t value = 20;
-    drm.waitOnUserFences(osContext, reinterpret_cast<uint64_t>(&memory), value, 1, 0);
+    drm.waitOnUserFences(osContext, reinterpret_cast<uint64_t>(&memory), value, 1, -1, 0, false, NEO::InterruptId::notUsed, nullptr);
 
     EXPECT_EQ(osContext.getDrmContextIds().size(), drm.context.waitUserFenceCalled);
     const auto &waitUserFence = drm.context.receivedWaitUserFence;

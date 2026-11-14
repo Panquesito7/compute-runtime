@@ -1,15 +1,15 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/debugger/debugger_l0.h"
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/kernel/debug_data.h"
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 #include "shared/source/os_interface/windows/wddm_allocation.h"
 #include "shared/source/os_interface/windows/wddm_debug.h"
@@ -44,16 +44,16 @@ void DebuggerL0::registerAllocationType(GraphicsAllocation *allocation) {
 
     auto wddmAllocation = static_cast<WddmAllocation *>(allocation);
     switch (wddmAllocation->getAllocationType()) {
-    case AllocationType::DEBUG_CONTEXT_SAVE_AREA:
+    case AllocationType::debugContextSaveArea:
         dataType = SIP_CONTEXT_SAVE_AREA;
         break;
-    case AllocationType::DEBUG_SBA_TRACKING_BUFFER:
+    case AllocationType::debugSbaTrackingBuffer:
         dataType = SBA_BUFFER_AREA;
         break;
-    case AllocationType::DEBUG_MODULE_AREA:
+    case AllocationType::debugModuleArea:
         dataType = MODULE_HEAP_DEBUG_AREA;
         break;
-    case AllocationType::KERNEL_ISA:
+    case AllocationType::kernelIsa:
         dataType = ISA;
     default:
         break;
@@ -63,7 +63,7 @@ void DebuggerL0::registerAllocationType(GraphicsAllocation *allocation) {
         return;
     }
 
-    WddmAllocation::RegistrationData registrationData = {0};
+    WddmAllocation::RegistrationData registrationData = {};
     registrationData.gpuVirtualAddress = wddmAllocation->getGpuAddress();
     registrationData.size = wddmAllocation->getUnderlyingBufferSize();
 
@@ -75,7 +75,7 @@ void DebuggerL0::registerAllocationType(GraphicsAllocation *allocation) {
     allocationDebugDataInfo.DataSize = sizeof(registrationData);
     allocationDebugDataInfo.DataPointer = reinterpret_cast<uint64_t>(&registrationData);
 
-    KM_ESCAPE_INFO escapeInfo = {0};
+    KM_ESCAPE_INFO escapeInfo = {};
     escapeInfo.Header.EscapeCode = GFX_ESCAPE_KMD;
     escapeInfo.Header.Size = sizeof(escapeInfo) - sizeof(escapeInfo.Header);
     escapeInfo.EscapeOperation = KM_ESCAPE_EUDBG_UMD_REGISTER_ALLOCATION_TYPE;
@@ -84,7 +84,7 @@ void DebuggerL0::registerAllocationType(GraphicsAllocation *allocation) {
     escapeInfo.KmEuDbgUmdRegisterAllocationData.NumOfDebugDataInfo = 1;
     escapeInfo.KmEuDbgUmdRegisterAllocationData.DebugDataBufferPtr = reinterpret_cast<uint64_t>(&allocationDebugDataInfo);
 
-    D3DKMT_ESCAPE escapeCommand = {0};
+    D3DKMT_ESCAPE escapeCommand = {};
     escapeCommand.Flags.HardwareAccess = 0;
     escapeCommand.Flags.Reserved = 0;
     escapeCommand.hAdapter = wddm->getAdapter();
@@ -98,10 +98,7 @@ void DebuggerL0::registerAllocationType(GraphicsAllocation *allocation) {
     DEBUG_BREAK_IF(STATUS_SUCCESS != status);
 }
 
-void DebuggerL0::registerElfAndLinkWithAllocation(NEO::DebugData *debugData, NEO::GraphicsAllocation *allocation) {
-}
-
-uint32_t DebuggerL0::registerElf(NEO::DebugData *debugData) {
+uint32_t DebuggerL0::registerElf(ArrayRef<const char> debugZebin) {
     return 0;
 }
 
@@ -109,23 +106,23 @@ bool DebuggerL0::attachZebinModuleToSegmentAllocations(const StackVec<NEO::Graph
     return false;
 }
 
-void DebuggerL0::notifyModuleCreate(void *module, uint32_t moduleSize, uint64_t moduleLoadAddress) {
+void DebuggerL0::notifyModuleCreate(ArrayRef<const char> debugZebin, uint64_t moduleLoadAddress) {
     if (device->getRootDeviceEnvironment().osInterface == nullptr) {
         return;
     }
 
     // Register ELF
-    KM_ESCAPE_INFO escapeInfo = {0};
+    KM_ESCAPE_INFO escapeInfo = {};
     escapeInfo.Header.EscapeCode = GFX_ESCAPE_KMD;
     escapeInfo.Header.Size = sizeof(escapeInfo) - sizeof(escapeInfo.Header);
     escapeInfo.EscapeOperation = KM_ESCAPE_EUDBG_UMD_CREATE_DEBUG_DATA;
     escapeInfo.KmEuDbgUmdCreateDebugData.DebugDataType = ELF_BINARY;
-    escapeInfo.KmEuDbgUmdCreateDebugData.DataSize = moduleSize;
-    escapeInfo.KmEuDbgUmdCreateDebugData.hElfAddressPtr = reinterpret_cast<uint64_t>(module);
+    escapeInfo.KmEuDbgUmdCreateDebugData.DataSize = static_cast<uint32_t>(debugZebin.size());
+    escapeInfo.KmEuDbgUmdCreateDebugData.hElfAddressPtr = reinterpret_cast<uint64_t>(debugZebin.begin());
 
     auto wddm = device->getRootDeviceEnvironment().osInterface->getDriverModel()->as<NEO::Wddm>();
 
-    D3DKMT_ESCAPE escapeCommand = {0};
+    D3DKMT_ESCAPE escapeCommand = {};
     escapeCommand.Flags.HardwareAccess = 0;
     escapeCommand.Flags.Reserved = 0;
     escapeCommand.hAdapter = wddm->getAdapter();
@@ -145,13 +142,13 @@ void DebuggerL0::notifyModuleCreate(void *module, uint32_t moduleSize, uint64_t 
     PRINT_DEBUGGER_INFO_LOG("KM_ESCAPE_EUDBG_UMD_CREATE_DEBUG_DATA - Success\n");
 
     // Fire MODULE_CREATE event
-    escapeInfo = {0};
+    escapeInfo = {};
     escapeInfo.Header.EscapeCode = GFX_ESCAPE_KMD;
     escapeInfo.Header.Size = sizeof(escapeInfo) - sizeof(escapeInfo.Header);
     escapeInfo.EscapeOperation = KM_ESCAPE_EUDBG_UMD_MODULE_CREATE_NOTIFY;
     escapeInfo.KmEuDbgUmdCreateModuleNotification.IsCreate = true;
-    escapeInfo.KmEuDbgUmdCreateModuleNotification.Modulesize = moduleSize;
-    escapeInfo.KmEuDbgUmdCreateModuleNotification.hElfAddressPtr = reinterpret_cast<uint64_t>(module);
+    escapeInfo.KmEuDbgUmdCreateModuleNotification.Modulesize = static_cast<uint32_t>(debugZebin.size());
+    escapeInfo.KmEuDbgUmdCreateModuleNotification.hElfAddressPtr = reinterpret_cast<uint64_t>(debugZebin.begin());
     escapeInfo.KmEuDbgUmdCreateModuleNotification.LoadAddress = moduleLoadAddress;
 
     status = wddm->escape(escapeCommand);
@@ -169,7 +166,7 @@ void DebuggerL0::notifyModuleDestroy(uint64_t moduleLoadAddress) {
         return;
     }
 
-    KM_ESCAPE_INFO escapeInfo = {0};
+    KM_ESCAPE_INFO escapeInfo = {};
     escapeInfo.Header.EscapeCode = GFX_ESCAPE_KMD;
     escapeInfo.Header.Size = sizeof(escapeInfo) - sizeof(escapeInfo.Header);
     escapeInfo.EscapeOperation = KM_ESCAPE_EUDBG_UMD_MODULE_CREATE_NOTIFY;
@@ -180,7 +177,7 @@ void DebuggerL0::notifyModuleDestroy(uint64_t moduleLoadAddress) {
 
     auto wddm = device->getRootDeviceEnvironment().osInterface->getDriverModel()->as<NEO::Wddm>();
 
-    D3DKMT_ESCAPE escapeCommand = {0};
+    D3DKMT_ESCAPE escapeCommand = {};
     escapeCommand.Flags.HardwareAccess = 0;
     escapeCommand.Flags.Reserved = 0;
     escapeCommand.hAdapter = wddm->getAdapter();
@@ -205,7 +202,7 @@ bool DebuggerL0::removeZebinModule(uint32_t moduleHandle) {
 }
 
 static NTSTATUS runEscape(NEO::Wddm *wddm, KM_ESCAPE_INFO &escapeInfo) {
-    D3DKMT_ESCAPE escapeCommand = {0};
+    D3DKMT_ESCAPE escapeCommand = {};
 
     escapeInfo.Header.EscapeCode = GFX_ESCAPE_KMD;
     escapeInfo.Header.Size = sizeof(escapeInfo) - sizeof(escapeInfo.Header);
@@ -229,7 +226,7 @@ void DebuggerL0::notifyCommandQueueCreated(NEO::Device *deviceIn) {
         if (++commandQueueCount[0] == 1) {
             auto pWddm = device->getRootDeviceEnvironment().osInterface->getDriverModel()->as<NEO::Wddm>();
             int val = 0;
-            KM_ESCAPE_INFO escapeInfo = {0};
+            KM_ESCAPE_INFO escapeInfo = {};
             escapeInfo.KmEuDbgUmdCreateDebugData.DataSize = sizeof(val);
             escapeInfo.KmEuDbgUmdCreateDebugData.DebugDataType = static_cast<uint32_t>(NEO::DebugDataType::CMD_QUEUE_CREATED);
             escapeInfo.KmEuDbgUmdCreateDebugData.hElfAddressPtr = reinterpret_cast<uint64_t>(&val);
@@ -245,7 +242,7 @@ void DebuggerL0::notifyCommandQueueDestroyed(NEO::Device *deviceIn) {
         if (--commandQueueCount[0] == 0) {
             auto pWddm = device->getRootDeviceEnvironment().osInterface->getDriverModel()->as<NEO::Wddm>();
             int val = 0;
-            KM_ESCAPE_INFO escapeInfo = {0};
+            KM_ESCAPE_INFO escapeInfo = {};
             escapeInfo.KmEuDbgUmdCreateDebugData.DataSize = sizeof(val);
             escapeInfo.KmEuDbgUmdCreateDebugData.DebugDataType = static_cast<uint32_t>(NEO::DebugDataType::CMD_QUEUE_DESTROYED);
             escapeInfo.KmEuDbgUmdCreateDebugData.hElfAddressPtr = reinterpret_cast<uint64_t>(&val);
@@ -254,5 +251,7 @@ void DebuggerL0::notifyCommandQueueDestroyed(NEO::Device *deviceIn) {
         }
     }
 }
+
+void DebuggerL0::removeTempFiles() {}
 
 } // namespace NEO

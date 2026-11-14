@@ -1,24 +1,66 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+
 #include <cinttypes>
-#include <string.h>
+#include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace NEO {
 
-namespace Directory {
-extern bool ReturnEmptyFilesVector;
+class Directory : NEO::NonCopyableAndNonMovableClass {
+  public:
+    static inline constexpr char returnDirs{1 << 0};
+    static inline constexpr char createDirs{1 << 1};
 
-std::vector<std::string> getFiles(const std::string &path);
-void createDirectory(const std::string &path);
-} // namespace Directory
+    static std::vector<std::string> getFiles(const std::string &path);
+    static void createDirectory(const std::string &path);
+
+    Directory() = default;
+    Directory(const std::string &path) : path(path) {}
+
+    inline std::optional<std::vector<std::string>> parseDirectories(char flags) {
+        std::optional<std::vector<std::string>> directories;
+        if (flags & returnDirs) {
+            directories.emplace();
+        }
+        std::string tmp;
+        size_t pos = 0;
+
+        while (pos != std::string::npos) {
+            pos = this->path.find_first_of("/\\", pos + 1);
+            tmp = this->path.substr(0, pos);
+            if (flags & createDirs) {
+                this->create(tmp);
+            }
+            if (flags & returnDirs) {
+                directories->push_back(tmp);
+            }
+        }
+        return directories;
+    }
+
+    void operator()(const std::string &path) {
+        this->path = path;
+    }
+
+  protected:
+    virtual void create(const std::string &path) {
+        createDirectory(path);
+    }
+
+    std::string path;
+};
+
+static_assert(NEO::NonCopyableAndNonMovable<Directory>);
 
 inline int parseBdfString(const std::string &pciBDF, uint16_t &domain, uint8_t &bus, uint8_t &device, uint8_t &function) {
     if (strlen(pciBDF.c_str()) == 12) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,16 +10,19 @@
 #include "shared/source/command_stream/task_count_helper.h"
 #include "shared/source/helpers/common_types.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/memory_manager/definitions/engine_limits.h"
 #include "shared/source/memory_manager/memory_operations_status.h"
 #include "shared/source/os_interface/linux/cache_info.h"
+#include "shared/source/os_interface/linux/drm_debug.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/stackvec.h"
 
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <mutex>
-#include <stdint.h>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -31,7 +34,7 @@ class DrmMemoryManager;
 class Drm;
 class OsContext;
 
-class BufferObjectHandleWrapper {
+class BufferObjectHandleWrapper : NEO::NonCopyableClass {
   private:
     struct ControlBlock {
         int refCount{0};
@@ -40,21 +43,19 @@ class BufferObjectHandleWrapper {
     };
 
     enum class Ownership : std::uint8_t {
-        Weak = 0,
-        Strong = 1,
+        weak = 0,
+        strong = 1,
     };
 
   public:
-    explicit BufferObjectHandleWrapper(int boHandle) noexcept
-        : boHandle{boHandle} {}
+    explicit BufferObjectHandleWrapper(int boHandle, uint32_t rootDeviceIndex) noexcept
+        : boHandle{boHandle}, rootDeviceIndex(rootDeviceIndex) {}
 
     BufferObjectHandleWrapper(BufferObjectHandleWrapper &&other) noexcept
-        : boHandle(std::exchange(other.boHandle, -1)), ownership(other.ownership), controlBlock(std::exchange(other.controlBlock, nullptr)) {}
+        : boHandle(std::exchange(other.boHandle, -1)), rootDeviceIndex(std::exchange(other.rootDeviceIndex, UINT32_MAX)), ownership(other.ownership), controlBlock(std::exchange(other.controlBlock, nullptr)) {}
 
     ~BufferObjectHandleWrapper();
 
-    BufferObjectHandleWrapper(const BufferObjectHandleWrapper &) = delete;
-    BufferObjectHandleWrapper &operator=(const BufferObjectHandleWrapper &) = delete;
     BufferObjectHandleWrapper &operator=(BufferObjectHandleWrapper &&) = delete;
 
     BufferObjectHandleWrapper acquireSharedOwnership();
@@ -65,19 +66,28 @@ class BufferObjectHandleWrapper {
     int getBoHandle() const {
         return boHandle;
     }
+    uint32_t getRootDeviceIndex() const {
+        return rootDeviceIndex;
+    }
 
     void setBoHandle(int handle) {
         boHandle = handle;
     }
+    void setRootDeviceIndex(uint32_t index) {
+        rootDeviceIndex = index;
+    }
 
   protected:
-    BufferObjectHandleWrapper(int boHandle, Ownership ownership, ControlBlock *controlBlock)
-        : boHandle{boHandle}, ownership{ownership}, controlBlock{controlBlock} {}
+    BufferObjectHandleWrapper(int boHandle, uint32_t rootDeviceIndex, Ownership ownership, ControlBlock *controlBlock)
+        : boHandle{boHandle}, rootDeviceIndex{rootDeviceIndex}, ownership{ownership}, controlBlock{controlBlock} {}
 
     int boHandle{};
-    Ownership ownership{Ownership::Strong};
-    ControlBlock *controlBlock{};
+    uint32_t rootDeviceIndex{UINT32_MAX};
+    Ownership ownership{Ownership::strong};
+    ControlBlock *controlBlock{nullptr};
 };
+
+static_assert(NEO::NonCopyable<BufferObjectHandleWrapper>);
 
 class BufferObject {
   public:
@@ -93,6 +103,12 @@ class BufferObject {
         }
     };
 
+    enum class BOType {
+        legacy,
+        coherent,
+        nonCoherent
+    };
+
     bool setTiling(uint32_t mode, uint32_t stride);
 
     int pin(BufferObject *const boToPin[], size_t numberOfBos, OsContext *osContext, uint32_t vmHandleId, uint32_t drmContextId);
@@ -101,8 +117,8 @@ class BufferObject {
     MOCKABLE_VIRTUAL int exec(uint32_t used, size_t startOffset, unsigned int flags, bool requiresCoherency, OsContext *osContext, uint32_t vmHandleId, uint32_t drmContextId,
                               BufferObject *const residency[], size_t residencyCount, ExecObject *execObjectsStorage, uint64_t completionGpuAddress, TaskCountType completionValue);
 
-    int bind(OsContext *osContext, uint32_t vmHandleId);
-    int unbind(OsContext *osContext, uint32_t vmHandleId);
+    int bind(OsContext *osContext, uint32_t vmHandleId, const bool forcePagingFence);
+    MOCKABLE_VIRTUAL int unbind(OsContext *osContext, uint32_t vmHandleId);
 
     void printExecutionBuffer(ExecBuffer &execbuf, const size_t &residencyCount, ExecObject *execObjectsStorage, BufferObject *const residency[]);
 
@@ -158,9 +174,32 @@ class BufferObject {
     bool isImmediateBindingRequired() {
         return requiresImmediateBinding;
     }
+    bool isReadOnlyGpuResource() {
+        return readOnlyGpuResource;
+    }
+    bool isResourceDecompressRequired() {
+        return requiresResourceDecompress;
+    }
+
+    void setAsReadOnly(bool isReadOnly) {
+        readOnlyGpuResource = isReadOnly;
+    }
+
     void requireImmediateBinding(bool required) {
         requiresImmediateBinding = required;
     }
+
+    void setDeferBackingUsed(bool used) {
+        deferBackingUsed = used;
+    }
+    bool isDeferBackingUsed() const {
+        return deferBackingUsed;
+    }
+    void requireResourceDecompress(bool required) {
+        requiresResourceDecompress = required;
+    }
+    uint64_t peekResourceDecompressPatIndex() const { return resourceDecompressPatIndex; }
+    void setResourceDecompressPatIndex(uint64_t newPatIndex) { this->resourceDecompressPatIndex = newPatIndex; }
 
     bool isExplicitResidencyRequired() {
         return requiresExplicitResidency;
@@ -203,50 +242,135 @@ class BufferObject {
     std::vector<uint64_t> &getColourAddresses() {
         return this->bindAddresses;
     }
+    void requireExplicitLockedMemory(bool locked) { requiresLocked = locked; }
+    bool isExplicitLockedMemoryRequired() { return requiresLocked; }
+
     uint64_t peekPatIndex() const { return patIndex; }
     void setPatIndex(uint64_t newPatIndex) { this->patIndex = newPatIndex; }
+    BOType peekBOType() const { return boType; }
+    void setBOType(BOType newBoType) { this->boType = newBoType; }
+
+    void setUserptr(uint64_t ptr) { this->userptr = ptr; };
+    uint64_t getUserptr() const { return this->userptr; };
+
+    void setMmapOffset(uint64_t offset) { this->mmapOffset = offset; };
+    uint64_t getMmapOffset() const { return this->mmapOffset; };
+
+    void setPhysicalMemoryOffset(uint64_t offset) { this->physicalMemoryOffset = offset; };
+    uint64_t getPhysicalMemoryOffset() const { return this->physicalMemoryOffset; };
+
+    void setVirtualMappingSize(size_t size) { this->virtualMappingSize = size; };
+    size_t getVirtualMappingSize() const { return this->virtualMappingSize; };
+
+    void resetBindInfo() {
+        for (auto &entry : bindInfo) {
+            entry.fill(false);
+        }
+    }
 
     static constexpr int gpuHangDetected{-7171};
 
     uint32_t getOsContextId(OsContext *osContext);
-    std::vector<std::array<bool, EngineLimits::maxHandleCount>> bindInfo;
+
+    const auto &getBindInfo() const { return bindInfo; }
+
+    void setChunked(bool chunked) { this->chunked = chunked; }
+    bool isChunked() const { return this->chunked; }
+
+    void setRegisteredBindHandleCookie(uint64_t cookie) {
+        registeredBindHandleCookie = cookie;
+    }
+
+    uint64_t getRegisteredBindHandleCookie() {
+        return registeredBindHandleCookie;
+    }
+
+    void setDrmResourceClass(DrmResourceClass resourceClassToSet) {
+        resourceClass = resourceClassToSet;
+    }
+
+    DrmResourceClass getDrmResourceClass() {
+        return resourceClass;
+    }
+
+    void setIsaDebugDataHandle(uint32_t handle) {
+        isaDebugDataHandle = handle;
+    }
+
+    std::optional<uint32_t> getIsaDebugDataHandle() {
+        return isaDebugDataHandle;
+    }
+
+    bool isAsyncPagingFenceRequired() const {
+        return this->asynchronousPagingFence;
+    }
+
+    void setAsyncPagingFenceRequired() {
+        this->asynchronousPagingFence = true;
+    }
+
+    uint32_t waitOnAsyncPagingFence(OsContext *osContext, uint32_t vmHandleId);
+
+    uint64_t *getAsyncFenceAddr(OsContext *osContext, uint32_t vmHandleId) {
+        auto osContextId = getOsContextId(osContext);
+        return &this->asyncPagingFence[osContextId][vmHandleId];
+    }
+    uint64_t getAsyncFenceVal(OsContext *osContext, uint32_t vmHandleId) {
+        auto osContextId = getOsContextId(osContext);
+        return this->asyncFenceVal[osContextId][vmHandleId];
+    }
+    void incAsyncFenceVal(OsContext *osContext, uint32_t vmHandleId) {
+        auto osContextId = getOsContextId(osContext);
+        this->asyncFenceVal[osContextId][vmHandleId]++;
+    }
 
   protected:
     MOCKABLE_VIRTUAL MemoryOperationsStatus evictUnusedAllocations(bool waitForCompletion, bool isLockNeeded);
-
-    Drm *drm = nullptr;
-    bool perContextVmsUsed = false;
-    std::atomic<uint32_t> refCount;
-
-    uint32_t rootDeviceIndex = std::numeric_limits<uint32_t>::max();
-    BufferObjectHandleWrapper handle; // i915 gem object handle
-    uint64_t size;
-    bool isReused = false;
-    bool boHandleShared = false;
-
-    uint32_t tilingMode;
-    bool allowCapture = false;
-    bool requiresImmediateBinding = false;
-    bool requiresExplicitResidency = false;
-
     MOCKABLE_VIRTUAL void fillExecObject(ExecObject &execObject, OsContext *osContext, uint32_t vmHandleId, uint32_t drmContextId);
     void printBOBindingResult(OsContext *osContext, uint32_t vmHandleId, bool bind, int retVal);
 
-    void *lockedAddress; // CPU side virtual address
+    Drm *drm = nullptr;
+    BufferObjectHandleWrapper handle; // i915 gem object handle
+    void *lockedAddress = nullptr;    // CPU side virtual address
 
+    uint64_t size = 0;
     uint64_t unmapSize = 0;
     uint64_t patIndex = CommonConstants::unsupportedPatIndex;
+    uint64_t resourceDecompressPatIndex = CommonConstants::unsupportedPatIndex;
+    uint64_t userptr = 0u;
+    uint64_t mmapOffset = 0u;
+    uint64_t physicalMemoryOffset = 0u;
+    size_t virtualMappingSize = 0u;
+    size_t colourChunk = 0;
+    uint64_t gpuAddress = 0llu;
 
-    CacheRegion cacheRegion = CacheRegion::Default;
-    CachePolicy cachePolicy = CachePolicy::WriteBack;
-
+    std::vector<std::array<uint64_t, EngineLimits::maxHandleCount>> asyncPagingFence{};
+    std::vector<std::array<uint64_t, EngineLimits::maxHandleCount>> asyncFenceVal{};
+    std::vector<uint64_t> bindAddresses;
+    std::vector<std::array<bool, EngineLimits::maxHandleCount>> bindInfo;
     StackVec<uint32_t, 2> bindExtHandles;
+    std::optional<uint32_t> isaDebugDataHandle;
+    uint64_t registeredBindHandleCookie = 0;
+    DrmResourceClass resourceClass = DrmResourceClass::maxSize;
+    BOType boType = BOType::legacy;
+    std::atomic<uint32_t> refCount;
+    uint32_t rootDeviceIndex = std::numeric_limits<uint32_t>::max();
+    uint32_t tilingMode = 0;
+    CachePolicy cachePolicy = CachePolicy::writeBack;
+    CacheRegion cacheRegion = CacheRegion::defaultRegion;
 
     bool colourWithBind = false;
-    size_t colourChunk = 0;
-    std::vector<uint64_t> bindAddresses;
-
-  private:
-    uint64_t gpuAddress = 0llu;
+    bool perContextVmsUsed = false;
+    bool boHandleShared = false;
+    bool allowCapture = false;
+    bool requiresImmediateBinding = false;
+    bool requiresResourceDecompress = false;
+    bool requiresExplicitResidency = false;
+    bool requiresLocked = false;
+    bool chunked = false;
+    bool isReused = false;
+    bool readOnlyGpuResource = false;
+    bool asynchronousPagingFence = false;
+    bool deferBackingUsed = false;
 };
 } // namespace NEO

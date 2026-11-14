@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,6 @@
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/os_interface/os_library.h"
 
-#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/sysman/firmware_util/firmware_util.h"
 
 #include <mutex>
@@ -26,7 +25,7 @@ typedef int (*pIgscDeviceFwVersion)(struct igsc_device_handle *handle,
                                     struct igsc_fw_version *version);
 typedef int (*pIgscDeviceIteratorCreate)(struct igsc_device_iterator **iter);
 typedef int (*pIgscDeviceIteratorNext)(struct igsc_device_iterator *iter,
-                                       struct igsc_device_info *info);
+                                       IgscDeviceInfo *info);
 typedef void (*pIgscDeviceIteratorDestroy)(struct igsc_device_iterator *iter);
 typedef int (*pIgscDeviceFwUpdate)(struct igsc_device_handle *handle,
                                    const uint8_t *buffer,
@@ -102,12 +101,12 @@ extern pIgscIfrRunMemPPRTest deviceIfrRunMemPPRTest;
 extern pIgscGetEccConfig getEccConfig;
 extern pIgscSetEccConfig setEccConfig;
 
-class FirmwareUtilImp : public FirmwareUtil, NEO::NonCopyableOrMovableClass {
+class FirmwareUtilImp : public FirmwareUtil, NEO::NonCopyableAndNonMovableClass {
   public:
     FirmwareUtilImp(uint16_t domain, uint8_t bus, uint8_t device, uint8_t function);
     ~FirmwareUtilImp() override;
     ze_result_t fwDeviceInit() override;
-    ze_result_t getFirstDevice(igsc_device_info *) override;
+    ze_result_t getFirstDevice(IgscDeviceInfo *) override;
     ze_result_t getFwVersion(std::string fwType, std::string &firmwareVersion) override;
     ze_result_t flashFirmware(std::string fwType, void *pImage, uint32_t size) override;
     ze_result_t fwIfrApplied(bool &ifrStatus) override;
@@ -127,9 +126,8 @@ class FirmwareUtilImp : public FirmwareUtil, NEO::NonCopyableOrMovableClass {
     ze_result_t fwFlashIafPsc(void *pImage, uint32_t size);
     ze_result_t fwCallGetstatusExt(uint32_t &supportedTests, uint32_t &ifrApplied, uint32_t &prevErrors, uint32_t &pendingReset);
 
-    using OsLibraryLoadPtr = std::add_pointer<NEO::OsLibrary *(const std::string &)>::type;
-    static OsLibraryLoadPtr osLibraryLoadFunction;
-    static std::string fwUtilLibraryName;
+    static int fwUtilLoadFlags;
+    static std::vector<std::string> fwUtilLibraryNames;
     std::string fwDevicePath{};
     struct igsc_device_handle fwDeviceHandle = {};
     bool loadEntryPoints();

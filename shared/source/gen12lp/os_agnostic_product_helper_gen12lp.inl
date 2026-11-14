@@ -1,33 +1,43 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-namespace NEO {
-template <>
-void ProductHelperHw<gfxProduct>::adjustPlatformForProductFamily(HardwareInfo *hwInfo) {
-    hwInfo->platform.eRenderCoreFamily = GFXCORE_FAMILY::IGFX_GEN12LP_CORE;
-    hwInfo->platform.eDisplayCoreFamily = GFXCORE_FAMILY::IGFX_GEN12LP_CORE;
-}
+#include "shared/source/gen12lp/product_helper_gen12lp.inl"
+#include "shared/source/os_interface/product_helper.inl"
+#include "shared/source/os_interface/product_helper_before_xe2.inl"
 
+namespace NEO {
 template <>
 bool ProductHelperHw<gfxProduct>::isPageTableManagerSupported(const HardwareInfo &hwInfo) const {
     return hwInfo.capabilityTable.ftrRenderCompressedBuffers || hwInfo.capabilityTable.ftrRenderCompressedImages;
 }
 
 template <>
-void ProductHelperHw<gfxProduct>::adjustSamplerState(void *sampler, const HardwareInfo &hwInfo) const {
-    using SAMPLER_STATE = typename Gen12LpFamily::SAMPLER_STATE;
-    auto samplerState = reinterpret_cast<SAMPLER_STATE *>(sampler);
-    if (DebugManager.flags.ForceSamplerLowFilteringPrecision.get()) {
-        samplerState->setLowQualityFilter(SAMPLER_STATE::LOW_QUALITY_FILTER_ENABLE);
-    }
+bool ProductHelperHw<gfxProduct>::isHostUsmPoolAllocatorSupported() const {
+    return false;
 }
 
 template <>
-uint32_t ProductHelperHw<gfxProduct>::getMaxThreadsForWorkgroupInDSSOrSS(const HardwareInfo &hwInfo, uint32_t maxNumEUsPerSubSlice, uint32_t maxNumEUsPerDualSubSlice) const {
-    return getMaxThreadsForWorkgroup(hwInfo, maxNumEUsPerDualSubSlice);
+bool ProductHelperHw<gfxProduct>::isDeviceUsmPoolAllocatorSupported() const {
+    return false;
 }
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDeviceUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isHostUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isFlushBetweenBlitsRequired() const {
+    return false;
+}
+
 } // namespace NEO

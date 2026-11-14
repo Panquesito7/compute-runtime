@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,7 +12,7 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/source/kernel/implicit_args.h"
+#include "shared/source/kernel/implicit_args_helper.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 
 #include "opencl/source/cl_device/cl_device.h"
@@ -22,17 +22,12 @@
 
 using namespace NEO;
 
-bool TestChecks::supportsSvm(const ClDevice *pClDevice) {
-    return supportsSvm(&pClDevice->getDevice());
-}
-
 bool TestChecks::supportsImages(const Context *pContext) {
     return pContext->getDevice(0)->getSharedDeviceInfo().imageSupport;
 }
 
 bool TestChecks::supportsOcl21(const std::unique_ptr<HardwareInfo> &pHardwareInfo) {
-    return (pHardwareInfo->capabilityTable.supportsOcl21Features && pHardwareInfo->capabilityTable.supportsPipes &&
-            pHardwareInfo->capabilityTable.supportsIndependentForwardProgress);
+    return pHardwareInfo->capabilityTable.supportsIndependentForwardProgress;
 }
 
 bool TestChecks::supportsAuxResolves(const RootDeviceEnvironment &rootDeviceEnvironment) {

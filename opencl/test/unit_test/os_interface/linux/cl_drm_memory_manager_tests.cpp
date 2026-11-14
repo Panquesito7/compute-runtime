@@ -1,42 +1,27 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/built_ins/sip.h"
-#include "shared/source/command_stream/device_command_stream.h"
-#include "shared/source/command_stream/linear_stream.h"
-#include "shared/source/command_stream/preemption.h"
-#include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/constants.h"
-#include "shared/source/helpers/logical_state_helper.h"
-#include "shared/source/helpers/ptr_math.h"
-#include "shared/source/helpers/timestamp_packet.h"
-#include "shared/source/os_interface/linux/allocator_helper.h"
 #include "shared/source/os_interface/linux/drm_allocation.h"
-#include "shared/source/os_interface/linux/drm_buffer_object.h"
-#include "shared/source/os_interface/linux/drm_command_stream.h"
-#include "shared/source/os_interface/linux/drm_memory_manager.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/helpers/gtest_helpers.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/libult/linux/drm_mock.h"
-#include "shared/test/common/mocks/linux/mock_drm_allocation.h"
-#include "shared/test/common/mocks/linux/mock_drm_command_stream_receiver.h"
 #include "shared/test/common/mocks/linux/mock_drm_memory_manager.h"
 #include "shared/test/common/mocks/mock_gmm.h"
+#include "shared/test/common/mocks/mock_sip.h"
+#include "shared/test/common/mocks/mock_sip_wrapper.h"
 #include "shared/test/common/os_interface/linux/drm_memory_manager_fixture.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "opencl/source/command_queue/command_queue.h"
-#include "opencl/source/event/event.h"
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_execution_environment.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
 
@@ -49,244 +34,28 @@ using namespace NEO;
 using DrmMemoryManagerTest = Test<DrmMemoryManagerFixture>;
 
 struct ClDrmMemoryManagerTest : public DrmMemoryManagerTest {
-    void SetUp() override {
+    template <typename GfxFamily>
+    void setUpT() {
         MemoryManagementFixture::setUp();
 
+        MockSipWrapper sipWrapper;
+
         executionEnvironment = MockClDevice::prepareExecutionEnvironment(defaultHwInfo.get(), numRootDevices - 1);
-        DrmMemoryManagerFixture::setUp(new DrmMockCustom(*executionEnvironment->rootDeviceEnvironments[0]), false);
-        pClDevice = new MockClDevice{device}; // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+        DrmMemoryManagerFixture::setUpT<GfxFamily>(DrmMockCustom::create(*executionEnvironment->rootDeviceEnvironments[0]).release(), false);
+        pClDevice = new MockClDevice{device};
         device->incRefInternal();
     }
-    void TearDown() override {
+
+    template <typename GfxFamily>
+    void tearDownT() {
         delete pClDevice;
-        DrmMemoryManagerTest::TearDown();
+        DrmMemoryManagerFixture::tearDownT<GfxFamily>();
     }
 
     MockClDevice *pClDevice = nullptr;
 };
 
-TEST_F(ClDrmMemoryManagerTest, Given32bitAllocatorWhenAskedForBufferAllocationThen32BitBufferIsReturned) {
-    DebugManagerStateRestore dbgRestorer;
-    mock->ioctlExpected.gemUserptr = 1;
-    mock->ioctlExpected.gemWait = 1;
-    mock->ioctlExpected.gemClose = 1;
-
-    DebugManager.flags.Force32bitAddressing.set(true);
-    MockContext context(pClDevice);
-    memoryManager->setForce32BitAllocations(true);
-
-    auto size = MemoryConstants::pageSize;
-    auto retVal = CL_SUCCESS;
-
-    auto buffer = Buffer::create(
-        &context,
-        CL_MEM_ALLOC_HOST_PTR,
-        size,
-        nullptr,
-        retVal);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    EXPECT_TRUE(buffer->isMemObjZeroCopy());
-    auto bufferAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress();
-    auto baseAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuBaseAddress();
-
-    EXPECT_LT(ptrDiff(bufferAddress, baseAddress), MemoryConstants::max32BitAddress);
-
-    delete buffer;
-}
-
-TEST_F(ClDrmMemoryManagerTest, Given32bitAllocatorWhenAskedForBufferCreatedFromHostPtrThen32BitBufferIsReturned) {
-    DebugManagerStateRestore dbgRestorer;
-    mock->ioctlExpected.gemUserptr = 1;
-    mock->ioctlExpected.gemWait = 1;
-    mock->ioctlExpected.gemClose = 1;
-
-    DebugManager.flags.Force32bitAddressing.set(true);
-    MockContext context(pClDevice);
-    memoryManager->setForce32BitAllocations(true);
-
-    auto size = MemoryConstants::pageSize;
-    void *ptr = reinterpret_cast<void *>(0x1000);
-    auto ptrOffset = MemoryConstants::cacheLineSize;
-    uintptr_t offsetedPtr = (uintptr_t)ptr + ptrOffset;
-    auto retVal = CL_SUCCESS;
-
-    auto buffer = Buffer::create(
-        &context,
-        CL_MEM_USE_HOST_PTR,
-        size,
-        reinterpret_cast<void *>(offsetedPtr),
-        retVal);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    EXPECT_TRUE(buffer->isMemObjZeroCopy());
-    auto bufferAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress();
-    auto drmAllocation = static_cast<DrmAllocation *>(buffer->getGraphicsAllocation(rootDeviceIndex));
-
-    auto baseAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuBaseAddress();
-    EXPECT_LT(ptrDiff(bufferAddress, baseAddress), MemoryConstants::max32BitAddress);
-
-    EXPECT_TRUE(drmAllocation->is32BitAllocation());
-
-    auto allocationCpuPtr = drmAllocation->getUnderlyingBuffer();
-    auto allocationPageOffset = ptrDiff(allocationCpuPtr, alignDown(allocationCpuPtr, MemoryConstants::pageSize));
-
-    auto allocationGpuPtr = drmAllocation->getGpuAddress();
-    auto allocationGpuOffset = ptrDiff(allocationGpuPtr, alignDown(allocationGpuPtr, MemoryConstants::pageSize));
-
-    auto bufferObject = drmAllocation->getBO();
-
-    EXPECT_EQ(drmAllocation->getUnderlyingBuffer(), reinterpret_cast<void *>(offsetedPtr));
-
-    // Gpu address should be different
-    EXPECT_NE(offsetedPtr, drmAllocation->getGpuAddress());
-    // Gpu address offset iqual to cpu offset
-    EXPECT_EQ(allocationGpuOffset, ptrOffset);
-
-    EXPECT_EQ(allocationPageOffset, ptrOffset);
-
-    auto boAddress = bufferObject->peekAddress();
-    EXPECT_EQ(alignDown(boAddress, MemoryConstants::pageSize), boAddress);
-
-    delete buffer;
-}
-
-TEST_F(ClDrmMemoryManagerTest, Given32bitAllocatorWhenAskedForBufferCreatedFrom64BitHostPtrThen32BitBufferIsReturned) {
-    DebugManagerStateRestore dbgRestorer;
-    {
-        if (is32bit) {
-            mock->ioctlExpected.total = -1;
-        } else {
-            mock->ioctlExpected.gemUserptr = 1;
-            mock->ioctlExpected.gemWait = 1;
-            mock->ioctlExpected.gemClose = 1;
-
-            DebugManager.flags.Force32bitAddressing.set(true);
-            MockContext context(pClDevice);
-            memoryManager->setForce32BitAllocations(true);
-
-            auto size = MemoryConstants::pageSize;
-            void *ptr = reinterpret_cast<void *>(0x100000000000);
-            auto ptrOffset = MemoryConstants::cacheLineSize;
-            uintptr_t offsetedPtr = (uintptr_t)ptr + ptrOffset;
-            auto retVal = CL_SUCCESS;
-
-            auto buffer = Buffer::create(
-                &context,
-                CL_MEM_USE_HOST_PTR,
-                size,
-                reinterpret_cast<void *>(offsetedPtr),
-                retVal);
-            EXPECT_EQ(CL_SUCCESS, retVal);
-
-            EXPECT_TRUE(buffer->isMemObjZeroCopy());
-            auto bufferAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress();
-
-            auto baseAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuBaseAddress();
-            EXPECT_LT(ptrDiff(bufferAddress, baseAddress), MemoryConstants::max32BitAddress);
-
-            auto drmAllocation = static_cast<DrmAllocation *>(buffer->getGraphicsAllocation(rootDeviceIndex));
-
-            EXPECT_TRUE(drmAllocation->is32BitAllocation());
-
-            auto allocationCpuPtr = drmAllocation->getUnderlyingBuffer();
-            auto allocationPageOffset = ptrDiff(allocationCpuPtr, alignDown(allocationCpuPtr, MemoryConstants::pageSize));
-            auto bufferObject = drmAllocation->getBO();
-
-            EXPECT_EQ(allocationPageOffset, ptrOffset);
-
-            auto boAddress = bufferObject->peekAddress();
-            EXPECT_EQ(alignDown(boAddress, MemoryConstants::pageSize), boAddress);
-
-            delete buffer;
-            DebugManager.flags.Force32bitAddressing.set(false);
-        }
-    }
-}
-
-TEST_F(ClDrmMemoryManagerTest, GivenSizeAbove2GBWhenUseHostPtrAndAllocHostPtrAreCreatedThenFirstSucceedsAndSecondFails) {
-    DebugManagerStateRestore dbgRestorer;
-    mock->ioctlExpected.total = -1;
-    DebugManager.flags.Force32bitAddressing.set(true);
-    MockContext context(pClDevice);
-    memoryManager->setForce32BitAllocations(true);
-
-    size_t size = 2 * GB;
-    void *ptr = reinterpret_cast<void *>(0x100000000000);
-    auto retVal = CL_SUCCESS;
-
-    auto buffer = Buffer::create(
-        &context,
-        CL_MEM_USE_HOST_PTR,
-        size,
-        ptr,
-        retVal);
-
-    size_t size2 = 4 * GB - MemoryConstants::pageSize; // Keep size aligned
-
-    auto buffer2 = Buffer::create(
-        &context,
-        CL_MEM_ALLOC_HOST_PTR,
-        size2,
-        nullptr,
-        retVal);
-
-    EXPECT_NE(retVal, CL_SUCCESS);
-    EXPECT_EQ(nullptr, buffer2);
-
-    if (buffer) {
-        auto bufferPtr = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress();
-
-        EXPECT_TRUE(buffer->getGraphicsAllocation(rootDeviceIndex)->is32BitAllocation());
-        auto baseAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuBaseAddress();
-        EXPECT_LT(ptrDiff(bufferPtr, baseAddress), MemoryConstants::max32BitAddress);
-    }
-
-    delete buffer;
-}
-
-TEST_F(ClDrmMemoryManagerTest, GivenSizeAbove2GBWhenAllocHostPtrAndUseHostPtrAreCreatedThenFirstSucceedsAndSecondFails) {
-    DebugManagerStateRestore dbgRestorer;
-    mock->ioctlExpected.total = -1;
-    DebugManager.flags.Force32bitAddressing.set(true);
-    MockContext context(pClDevice);
-    memoryManager->setForce32BitAllocations(true);
-
-    size_t size = 2 * GB;
-    void *ptr = reinterpret_cast<void *>(0x100000000000);
-    auto retVal = CL_SUCCESS;
-
-    auto buffer = Buffer::create(
-        &context,
-        CL_MEM_ALLOC_HOST_PTR,
-        size,
-        nullptr,
-        retVal);
-
-    size_t size2 = 4 * GB - MemoryConstants::pageSize; // Keep size aligned
-
-    auto buffer2 = Buffer::create(
-        &context,
-        CL_MEM_USE_HOST_PTR,
-        size2,
-        ptr,
-        retVal);
-
-    EXPECT_NE(retVal, CL_SUCCESS);
-    EXPECT_EQ(nullptr, buffer2);
-
-    if (buffer) {
-        auto bufferPtr = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress();
-
-        EXPECT_TRUE(buffer->getGraphicsAllocation(rootDeviceIndex)->is32BitAllocation());
-        auto baseAddress = buffer->getGraphicsAllocation(rootDeviceIndex)->getGpuBaseAddress();
-        EXPECT_LT(ptrDiff(bufferPtr, baseAddress), MemoryConstants::max32BitAddress);
-    }
-
-    delete buffer;
-}
-
-TEST_F(ClDrmMemoryManagerTest, givenDrmBufferWhenItIsQueriedForInternalAllocationThenBoIsReturned) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmBufferWhenItIsQueriedForInternalAllocationThenBoIsReturned) {
     mock->ioctlExpected.total = -1;
     mock->outputFd = 1337;
     MockContext context(pClDevice);
@@ -311,7 +80,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmBufferWhenItIsQueriedForInternalAllocatio
     clReleaseMemObject(buffer);
 }
 
-HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCountZeroIsBeingCreatedThenallocateGraphicsMemoryForImageIsUsed) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCountZeroIsBeingCreatedThenallocateGraphicsMemoryForImageIsUsed) {
     if (!defaultHwInfo->capabilityTable.supportsImages) {
         GTEST_SKIP();
     }
@@ -335,7 +104,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCount
     auto retVal = CL_SUCCESS;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, nullptr, retVal));
@@ -343,7 +112,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCount
     ASSERT_NE(nullptr, dstImage);
     auto imageGraphicsAllocation = dstImage->getGraphicsAllocation(rootDeviceIndex);
     ASSERT_NE(nullptr, imageGraphicsAllocation);
-    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->resourceParams.Usage ==
+    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->getResourceUsageType() ==
                 GMM_RESOURCE_USAGE_TYPE::GMM_RESOURCE_USAGE_OCL_IMAGE);
 
     DrmAllocation *drmAllocation = static_cast<DrmAllocation *>(imageGraphicsAllocation);
@@ -353,13 +122,13 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCount
     EXPECT_EQ(1u, this->mock->createParamsHandle);
     EXPECT_EQ(imageSize, this->mock->createParamsSize);
     auto ioctlHelper = this->mock->getIoctlHelper();
-    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingY);
+    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingY);
     EXPECT_EQ(tilingMode, this->mock->setTilingMode);
     EXPECT_EQ(rowPitch, this->mock->setTilingStride);
     EXPECT_EQ(1u, this->mock->setTilingHandle);
 }
 
-HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCountNonZeroIsBeingCreatedThenallocateGraphicsMemoryForImageIsUsed) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCountNonZeroIsBeingCreatedThenallocateGraphicsMemoryForImageIsUsed) {
     if (!defaultHwInfo->capabilityTable.supportsImages) {
         GTEST_SKIP();
     }
@@ -384,7 +153,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCount
     auto retVal = CL_SUCCESS;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, nullptr, retVal));
@@ -393,8 +162,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCount
     EXPECT_EQ(static_cast<uint32_t>(imageDesc.num_mip_levels), dstImage->peekMipCount());
     auto imageGraphicsAllocation = dstImage->getGraphicsAllocation(rootDeviceIndex);
     ASSERT_NE(nullptr, imageGraphicsAllocation);
-    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->resourceParams.Usage ==
-                GMM_RESOURCE_USAGE_TYPE::GMM_RESOURCE_USAGE_OCL_IMAGE);
+    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->getResourceUsageType() == GMM_RESOURCE_USAGE_TYPE::GMM_RESOURCE_USAGE_OCL_IMAGE);
 
     DrmAllocation *drmAllocation = static_cast<DrmAllocation *>(imageGraphicsAllocation);
     auto imageSize = drmAllocation->getUnderlyingBufferSize();
@@ -403,13 +171,13 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageWithMipCount
     EXPECT_EQ(1u, this->mock->createParamsHandle);
     EXPECT_EQ(imageSize, this->mock->createParamsSize);
     auto ioctlHelper = this->mock->getIoctlHelper();
-    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingY);
+    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingY);
     EXPECT_EQ(tilingMode, this->mock->setTilingMode);
     EXPECT_EQ(rowPitch, this->mock->setTilingStride);
     EXPECT_EQ(1u, this->mock->setTilingHandle);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreatedAndAllocationFailsThenReturnNullptr) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreatedAndAllocationFailsThenReturnNullptr) {
     MockContext context(pClDevice);
 
     cl_image_format imageFormat;
@@ -426,7 +194,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreated
 
     InjectedFunction method = [&](size_t failureIndex) {
         cl_mem_flags flags = CL_MEM_WRITE_ONLY;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         std::unique_ptr<Image> dstImage(Image::create(
             &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
             flags, 0, surfaceFormat, &imageDesc, nullptr, retVal));
@@ -441,25 +209,27 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreated
     mock->reset();
 }
 
-HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreatedFromHostPtrThenAllocateGraphicsMemoryForImageIsUsed) {
+HWTEST2_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreatedFromHostPtrThenAllocateGraphicsMemoryForImageIsUsed, IsAtMostXe3Core) {
     if (!defaultHwInfo->capabilityTable.supportsImages) {
         GTEST_SKIP();
     }
 
-    device->setPreemptionMode(PreemptionMode::Disabled);
+    DebugManagerStateRestore dbgRestore;
+    debugManager.flags.EnableIsaAllocationPool.set(false);
 
-    auto csr = static_cast<TestedDrmCommandStreamReceiver<DEFAULT_TEST_FAMILY_NAME> *>(device->getDefaultEngine().commandStreamReceiver);
-    csr->flushInternalCallBase = false;
+    device->setPreemptionMode(PreemptionMode::Disabled);
 
     mock->ioctlExpected.gemCreate = 1;
     mock->ioctlExpected.gemSetTiling = 1;
     mock->ioctlExpected.gemWait = 2;
     mock->ioctlExpected.gemClose = 2;
     mock->ioctlExpected.gemUserptr = 1;
-    mock->ioctlExpected.execbuffer2 = 0;
+    mock->ioctlExpected.execbuffer2 = 1;
 
     // builtins kernels
-    mock->ioctlExpected.gemUserptr += 5;
+    mock->ioctlExpected.gemUserptr += 8;
+    mock->ioctlExpected.gemClose += 8; // builtins cleaned up in ClDevice destructor
+    mock->ioctlExpected.gemWait += 8;
 
     // command buffers
     mock->ioctlExpected.gemUserptr += 2;
@@ -485,9 +255,6 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreat
 
     MockContext context(pClDevice);
 
-    auto testedCsr = static_cast<TestedDrmCommandStreamReceiver<FamilyType> *>(context.getSpecialQueue(rootDeviceIndex)->getGpgpuEngine().commandStreamReceiver);
-    testedCsr->logicalStateHelper.reset(LogicalStateHelper::create<FamilyType>());
-
     cl_image_format imageFormat;
     imageFormat.image_channel_data_type = CL_UNORM_INT8;
     imageFormat.image_channel_order = CL_R;
@@ -503,7 +270,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreat
     auto retVal = CL_SUCCESS;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, data, retVal));
@@ -511,7 +278,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreat
     ASSERT_NE(nullptr, dstImage);
     auto imageGraphicsAllocation = dstImage->getGraphicsAllocation(rootDeviceIndex);
     ASSERT_NE(nullptr, imageGraphicsAllocation);
-    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->resourceParams.Usage ==
+    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->getResourceUsageType() ==
                 GMM_RESOURCE_USAGE_TYPE::GMM_RESOURCE_USAGE_OCL_IMAGE);
 
     DrmAllocation *drmAllocation = static_cast<DrmAllocation *>(imageGraphicsAllocation);
@@ -521,7 +288,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreat
     EXPECT_EQ(1u, this->mock->createParamsHandle);
     EXPECT_EQ(imageSize, this->mock->createParamsSize);
     auto ioctlHelper = this->mock->getIoctlHelper();
-    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingY);
+    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingY);
     EXPECT_EQ(tilingMode, this->mock->setTilingMode);
     EXPECT_EQ(rowPitch, this->mock->setTilingStride);
     EXPECT_EQ(1u, this->mock->setTilingHandle);
@@ -529,7 +296,7 @@ HWTEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenTiledImageIsBeingCreat
     alignedFree(data);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenMemoryAllocatedForImageThenUnmapSizeCorrectlySetWhenLimitedRangeAllocationUsedOrNotUsed) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenMemoryAllocatedForImageThenUnmapSizeCorrectlySetWhenLimitedRangeAllocationUsedOrNotUsed) {
     mock->ioctlExpected.gemUserptr = 2;
     mock->ioctlExpected.gemWait = 2;
     mock->ioctlExpected.gemClose = 2;
@@ -550,7 +317,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenMemoryAllocatedForImageT
     auto retVal = CL_SUCCESS;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, data, retVal));
@@ -562,7 +329,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenMemoryAllocatedForImageT
     alignedFree(data);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountZeroisBeingCreatedThenAllocateGraphicsMemoryIsUsed) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountZeroisBeingCreatedThenAllocateGraphicsMemoryIsUsed) {
     mock->ioctlExpected.gemUserptr = 2;
     mock->ioctlExpected.gemWait = 2;
     mock->ioctlExpected.gemClose = 2;
@@ -585,7 +352,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountZ
     this->mock->createParamsSize = 0;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, data, retVal));
@@ -593,13 +360,13 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountZ
     ASSERT_NE(nullptr, dstImage);
     auto imageGraphicsAllocation = dstImage->getGraphicsAllocation(rootDeviceIndex);
     ASSERT_NE(nullptr, imageGraphicsAllocation);
-    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->resourceParams.Usage ==
+    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->getResourceUsageType() ==
                 GMM_RESOURCE_USAGE_TYPE::GMM_RESOURCE_USAGE_OCL_IMAGE);
 
     EXPECT_EQ(0u, this->mock->createParamsHandle);
     EXPECT_EQ(0u, this->mock->createParamsSize);
     auto ioctlHelper = this->mock->getIoctlHelper();
-    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingNone);
+    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingNone);
     EXPECT_EQ(tilingMode, this->mock->setTilingMode);
     EXPECT_EQ(0u, this->mock->setTilingStride);
     EXPECT_EQ(0u, this->mock->setTilingHandle);
@@ -609,7 +376,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountZ
     alignedFree(data);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountNonZeroisBeingCreatedThenAllocateGraphicsMemoryIsUsed) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountNonZeroisBeingCreatedThenAllocateGraphicsMemoryIsUsed) {
     mock->ioctlExpected.gemUserptr = 1;
     mock->ioctlExpected.gemWait = 1;
     mock->ioctlExpected.gemClose = 1;
@@ -634,7 +401,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountN
     this->mock->createParamsSize = 0;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, data, retVal));
@@ -643,13 +410,13 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountN
     EXPECT_EQ(static_cast<uint32_t>(imageDesc.num_mip_levels), dstImage->peekMipCount());
     auto imageGraphicsAllocation = dstImage->getGraphicsAllocation(rootDeviceIndex);
     ASSERT_NE(nullptr, imageGraphicsAllocation);
-    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->resourceParams.Usage ==
+    EXPECT_TRUE(imageGraphicsAllocation->getDefaultGmm()->getResourceUsageType() ==
                 GMM_RESOURCE_USAGE_TYPE::GMM_RESOURCE_USAGE_OCL_IMAGE);
 
     EXPECT_EQ(0u, this->mock->createParamsHandle);
     EXPECT_EQ(0u, this->mock->createParamsSize);
     auto ioctlHelper = this->mock->getIoctlHelper();
-    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingNone);
+    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingNone);
     EXPECT_EQ(tilingMode, this->mock->setTilingMode);
     EXPECT_EQ(0u, this->mock->setTilingStride);
     EXPECT_EQ(0u, this->mock->setTilingHandle);
@@ -659,7 +426,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenNonTiledImgWithMipCountN
     alignedFree(data);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhen1DarrayImageIsBeingCreatedFromHostPtrThenTilingIsNotCalled) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhen1DarrayImageIsBeingCreatedFromHostPtrThenTilingIsNotCalled) {
     mock->ioctlExpected.gemUserptr = 2;
     mock->ioctlExpected.gemWait = 2;
     mock->ioctlExpected.gemClose = 2;
@@ -682,7 +449,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhen1DarrayImageIsBeingCreat
     this->mock->createParamsSize = 0;
 
     cl_mem_flags flags = CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     std::unique_ptr<Image> dstImage(Image::create(
         &context, ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context.getDevice(0)->getDevice()),
         flags, 0, surfaceFormat, &imageDesc, data, retVal));
@@ -692,7 +459,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhen1DarrayImageIsBeingCreat
     EXPECT_EQ(0u, this->mock->createParamsHandle);
     EXPECT_EQ(0u, this->mock->createParamsSize);
     auto ioctlHelper = this->mock->getIoctlHelper();
-    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::TilingNone);
+    uint32_t tilingMode = ioctlHelper->getDrmParamValue(DrmParam::tilingNone);
     EXPECT_EQ(tilingMode, this->mock->setTilingMode);
     EXPECT_EQ(0u, this->mock->setTilingStride);
     EXPECT_EQ(0u, this->mock->setTilingHandle);
@@ -702,13 +469,13 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhen1DarrayImageIsBeingCreat
     alignedFree(data);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenHostPointerNotRequiringCopyWhenAllocateGraphicsMemoryForImageIsCalledThenGraphicsAllocationIsReturned) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenHostPointerNotRequiringCopyWhenAllocateGraphicsMemoryForImageIsCalledThenGraphicsAllocationIsReturned) {
     mock->ioctlExpected.gemUserptr = 1;
     mock->ioctlExpected.gemWait = 1;
     mock->ioctlExpected.gemClose = 1;
 
     ImageDescriptor imgDesc = {};
-    imgDesc.imageType = ImageType::Image1D;
+    imgDesc.imageType = ImageType::image1D;
     imgDesc.imageWidth = MemoryConstants::pageSize;
     imgDesc.imageHeight = 1;
 
@@ -718,7 +485,7 @@ TEST_F(ClDrmMemoryManagerTest, givenHostPointerNotRequiringCopyWhenAllocateGraph
 
     cl_mem_flags flags = CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR;
     MockContext context(pClDevice);
-    auto surfaceFormat = &Image::getSurfaceFormatFromTable(flags, &imageFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features)->surfaceFormat;
+    auto surfaceFormat = &Image::getSurfaceFormatFromTable(flags, &imageFormat)->surfaceFormat;
 
     auto imgInfo = MockGmm::initImgInfo(imgDesc, 0, surfaceFormat);
     imgInfo.rowPitch = imgDesc.imageWidth * surfaceFormat->imageElementSizeInBytes;
@@ -743,15 +510,15 @@ TEST_F(ClDrmMemoryManagerTest, givenHostPointerNotRequiringCopyWhenAllocateGraph
     alignedFree(hostPtr);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenOsHandleWithNonTiledObjectWhenCreateFromSharedHandleIsCalledThenNonTiledGmmIsCreatedAndSetInAllocation) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenOsHandleWithNonTiledObjectWhenCreateFromSharedHandleIsCalledThenNonTiledGmmIsCreatedAndSetInAllocation) {
     mock->ioctlExpected.primeFdToHandle = 1;
     mock->ioctlExpected.gemWait = 1;
     mock->ioctlExpected.gemClose = 1;
     mock->ioctlExpected.gemGetTiling = 1;
     auto ioctlHelper = this->mock->getIoctlHelper();
-    mock->getTilingModeOut = ioctlHelper->getDrmParamValue(DrmParam::TilingNone);
+    mock->getTilingModeOut = ioctlHelper->getDrmParamValue(DrmParam::tilingNone);
 
-    osHandle handle = 1u;
+    TestedDrmMemoryManager::OsHandleData osHandleData{1u};
     uint32_t boHandle = 2u;
     mock->outputHandle = boHandle;
 
@@ -767,34 +534,35 @@ TEST_F(ClDrmMemoryManagerTest, givenOsHandleWithNonTiledObjectWhenCreateFromShar
 
     imgInfo.imgDesc = Image::convertDescriptor(imgDesc);
     MockContext context(pClDevice);
-    gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &gmmImgFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &gmmImgFormat);
     imgInfo.surfaceFormat = &gmmSurfaceFormat->surfaceFormat;
-    imgInfo.plane = GMM_PLANE_Y;
+    imgInfo.plane = ImagePlane::planeY;
 
-    AllocationProperties properties(rootDeviceIndex, false, imgInfo, AllocationType::SHARED_IMAGE, context.getDevice(0)->getDeviceBitfield());
+    AllocationProperties properties(rootDeviceIndex, false, &imgInfo, AllocationType::sharedImage, context.getDevice(0)->getDeviceBitfield());
 
-    auto graphicsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(handle, properties, false, false, true, nullptr);
+    auto graphicsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
     ASSERT_NE(nullptr, graphicsAllocation);
     EXPECT_EQ(boHandle, mock->getTilingHandleIn);
-    EXPECT_EQ(AllocationType::SHARED_IMAGE, graphicsAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::sharedImage, graphicsAllocation->getAllocationType());
 
     auto gmm = graphicsAllocation->getDefaultGmm();
     ASSERT_NE(nullptr, gmm);
-    EXPECT_EQ(1u, gmm->resourceParams.Flags.Info.Linear);
-    EXPECT_EQ(0u, gmm->resourceParams.Flags.Info.TiledY);
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm->resourceParamsData.data());
+    EXPECT_EQ(1u, gmmResourceParams->Flags.Info.Linear);
+    EXPECT_EQ(0u, gmmResourceParams->Flags.Info.TiledY);
 
     memoryManager->freeGraphicsMemory(graphicsAllocation);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenOsHandleWithTileYObjectWhenCreateFromSharedHandleIsCalledThenTileYGmmIsCreatedAndSetInAllocation) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenOsHandleWithTileYObjectWhenCreateFromSharedHandleIsCalledThenTileYGmmIsCreatedAndSetInAllocation) {
     mock->ioctlExpected.primeFdToHandle = 1;
     mock->ioctlExpected.gemWait = 1;
     mock->ioctlExpected.gemClose = 1;
     mock->ioctlExpected.gemGetTiling = 1;
     auto ioctlHelper = this->mock->getIoctlHelper();
-    mock->getTilingModeOut = ioctlHelper->getDrmParamValue(DrmParam::TilingY);
+    mock->getTilingModeOut = ioctlHelper->getDrmParamValue(DrmParam::tilingY);
 
-    osHandle handle = 1u;
+    TestedDrmMemoryManager::OsHandleData osHandleData{1u};
     uint32_t boHandle = 2u;
     mock->outputHandle = boHandle;
 
@@ -810,25 +578,26 @@ TEST_F(ClDrmMemoryManagerTest, givenOsHandleWithTileYObjectWhenCreateFromSharedH
 
     imgInfo.imgDesc = Image::convertDescriptor(imgDesc);
     MockContext context(pClDevice);
-    gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &gmmImgFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &gmmImgFormat);
     imgInfo.surfaceFormat = &gmmSurfaceFormat->surfaceFormat;
-    imgInfo.plane = GMM_PLANE_Y;
+    imgInfo.plane = ImagePlane::planeY;
 
-    AllocationProperties properties(rootDeviceIndex, false, imgInfo, AllocationType::SHARED_IMAGE, context.getDevice(0)->getDeviceBitfield());
+    AllocationProperties properties(rootDeviceIndex, false, &imgInfo, AllocationType::sharedImage, context.getDevice(0)->getDeviceBitfield());
 
-    auto graphicsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(handle, properties, false, false, true, nullptr);
+    auto graphicsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
     ASSERT_NE(nullptr, graphicsAllocation);
     EXPECT_EQ(boHandle, mock->getTilingHandleIn);
-    EXPECT_EQ(AllocationType::SHARED_IMAGE, graphicsAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::sharedImage, graphicsAllocation->getAllocationType());
 
     auto gmm = graphicsAllocation->getDefaultGmm();
     ASSERT_NE(nullptr, gmm);
-    EXPECT_EQ(0u, gmm->resourceParams.Flags.Info.Linear);
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm->resourceParamsData.data());
+    EXPECT_EQ(0u, gmmResourceParams->Flags.Info.Linear);
 
     memoryManager->freeGraphicsMemory(graphicsAllocation);
 }
 
-TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenCreateFromSharedHandleFailsToCallGetTilingThenNonLinearStorageIsAssumed) {
+HWTEST_TEMPLATED_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenCreateFromSharedHandleFailsToCallGetTilingThenNonLinearStorageIsAssumed) {
     mock->ioctlExpected.primeFdToHandle = 1;
     mock->ioctlExpected.gemGetTiling = 1;
     mock->ioctlExpected.gemWait = 1;
@@ -836,7 +605,7 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenCreateFromSharedHandleFa
     this->ioctlResExt = {mock->ioctlCnt.total + 1, -1};
     mock->ioctlResExt = &ioctlResExt;
 
-    osHandle handle = 1u;
+    TestedDrmMemoryManager::OsHandleData osHandleData{1u};
     uint32_t boHandle = 2u;
     mock->outputHandle = boHandle;
 
@@ -852,27 +621,28 @@ TEST_F(ClDrmMemoryManagerTest, givenDrmMemoryManagerWhenCreateFromSharedHandleFa
 
     imgInfo.imgDesc = Image::convertDescriptor(imgDesc);
     MockContext context(pClDevice);
-    gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &gmmImgFormat, context.getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &gmmImgFormat);
     imgInfo.surfaceFormat = &gmmSurfaceFormat->surfaceFormat;
-    imgInfo.plane = GMM_PLANE_Y;
+    imgInfo.plane = ImagePlane::planeY;
 
-    AllocationProperties properties(rootDeviceIndex, false, imgInfo, AllocationType::SHARED_IMAGE, context.getDevice(0)->getDeviceBitfield());
+    AllocationProperties properties(rootDeviceIndex, false, &imgInfo, AllocationType::sharedImage, context.getDevice(0)->getDeviceBitfield());
 
-    auto graphicsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(handle, properties, false, false, true, nullptr);
+    auto graphicsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
     ASSERT_NE(nullptr, graphicsAllocation);
     EXPECT_EQ(boHandle, mock->getTilingHandleIn);
-    EXPECT_EQ(AllocationType::SHARED_IMAGE, graphicsAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::sharedImage, graphicsAllocation->getAllocationType());
 
     auto gmm = graphicsAllocation->getDefaultGmm();
     ASSERT_NE(nullptr, gmm);
-    EXPECT_EQ(0u, gmm->resourceParams.Flags.Info.Linear);
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm->resourceParamsData.data());
+    EXPECT_EQ(0u, gmmResourceParams->Flags.Info.Linear);
 
     memoryManager->freeGraphicsMemory(graphicsAllocation);
 }
 
-TEST(DrmMemoryMangerTest, givenMultipleRootDeviceWhenMemoryManagerGetsDrmThenDrmIsFromCorrectRootDevice) {
+TEST(MultiDeviceDrmMemoryManagerTest, givenMultipleRootDeviceWhenMemoryManagerGetsDrmThenDrmIsFromCorrectRootDevice) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleRootDevices.set(4);
+    debugManager.flags.CreateMultipleRootDevices.set(4);
     VariableBackup<UltHwConfig> backup{&ultHwConfig};
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
     initPlatform();
@@ -884,4 +654,5 @@ TEST(DrmMemoryMangerTest, givenMultipleRootDeviceWhenMemoryManagerGetsDrmThenDrm
         EXPECT_EQ(i, drmMemoryManager.getRootDeviceIndex(drmFromRootDevice));
     }
     EXPECT_EQ(CommonConstants::unspecifiedDeviceIndex, drmMemoryManager.getRootDeviceIndex(nullptr));
+    platformsImpl->clear();
 }

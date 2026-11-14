@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,6 +17,9 @@
 
 void NEO::UltConfigListener::OnTestStart(const ::testing::TestInfo &testInfo) {
     BaseUltConfigListener::OnTestStart(testInfo);
+    if (testExcluded) {
+        return;
+    }
 
     auto executionEnvironment = constructPlatform()->peekExecutionEnvironment();
     executionEnvironment->prepareRootDeviceEnvironments(1);
@@ -26,6 +29,11 @@ void NEO::UltConfigListener::OnTestStart(const ::testing::TestInfo &testInfo) {
 }
 
 void NEO::UltConfigListener::OnTestEnd(const ::testing::TestInfo &testInfo) {
+    if (testExcluded) {
+        BaseUltConfigListener::OnTestEnd(testInfo);
+        return;
+    }
+
     // Clear global platform that it shouldn't be reused between tests
     platformsImpl->clear();
     MemoryManager::maxOsContextCount = 0u;

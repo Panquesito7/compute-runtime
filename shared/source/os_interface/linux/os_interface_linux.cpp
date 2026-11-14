@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/os_interface/linux/drm_memory_operations_handler.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/hw_device_id.h"
@@ -23,7 +25,7 @@ bool OSInterface::gpuIdleImplicitFlush = true;
 bool OSInterface::requiresSupportForWddmTrimNotification = false;
 
 bool OSInterface::isDebugAttachAvailable() const {
-    if (driverModel && driverModel->getDriverModelType() == DriverModelType::DRM) {
+    if (driverModel && driverModel->getDriverModelType() == DriverModelType::drm) {
         return driverModel->as<Drm>()->isDebugAttachAvailable();
     }
     return false;
@@ -50,12 +52,28 @@ bool initDrmOsInterface(std::unique_ptr<HwDeviceId> &&hwDeviceId, uint32_t rootD
     if (productHelper.configureHwInfoDrm(hardwareInfo, hardwareInfo, *rootDeviceEnv)) {
         return false;
     }
-    rootDeviceEnv->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, rootDeviceIndex);
 
-    [[maybe_unused]] bool result = rootDeviceEnv->initAilConfiguration();
-    DEBUG_BREAK_IF(!result);
+    const bool isCsrHwWithAub = obtainCsrTypeFromIntegerValue(debugManager.flags.SetCommandStreamReceiver.get(), CommandStreamReceiverType::hardware) == CommandStreamReceiverType::hardwareWithAub;
+    rootDeviceEnv->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, rootDeviceIndex, isCsrHwWithAub);
 
     return true;
 }
+
+bool OSInterface::isSizeWithinThresholdForStaging(const void *ptr, size_t size) const {
+    if (isAligned<MemoryConstants::pageSize2M>(ptr)) {
+        return size < 64 * MemoryConstants::megaByte;
+    }
+    return size < 512 * MemoryConstants::megaByte;
+}
+
+uint32_t OSInterface::getAggregatedProcessCount() const {
+    if (driverModel && driverModel->getDriverModelType() == DriverModelType::drm) {
+        return driverModel->as<Drm>()->getAggregatedProcessCount();
+    }
+    return 0;
+}
+
+void OSInterface::registerTrimCallback() {}
+void OSInterface::unregisterTrimCallback() {}
 
 } // namespace NEO

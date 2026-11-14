@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 #include "shared/source/command_stream/aub_subcapture_status.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <atomic>
 #include <memory>
@@ -20,10 +21,10 @@ class SettingsReader;
 class AubSubCaptureCommon {
   public:
     enum class SubCaptureMode {
-        Off = 0, // subcapture off
-        Filter,  // subcapture kernel specified by filter (static regkey)
-        Toggle   // toggle subcapture on/off (dynamic regkey)
-    } subCaptureMode = SubCaptureMode::Off;
+        off = 0, // subcapture off
+        filter,  // subcapture kernel specified by filter (static regkey)
+        toggle   // toggle subcapture on/off (dynamic regkey)
+    } subCaptureMode = SubCaptureMode::off;
 
     struct SubCaptureFilter {
         std::string dumpKernelName = "";
@@ -47,7 +48,7 @@ class AubSubCaptureManager {
     using SubCaptureFilter = AubSubCaptureCommon::SubCaptureFilter;
 
     inline bool isSubCaptureMode() const {
-        return subCaptureCommon.subCaptureMode > SubCaptureMode::Off;
+        return subCaptureCommon.subCaptureMode > SubCaptureMode::off;
     }
 
     bool isSubCaptureEnabled() const;

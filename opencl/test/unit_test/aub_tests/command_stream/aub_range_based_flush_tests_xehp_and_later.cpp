@@ -1,35 +1,42 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_container/command_encoder.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/cache_flush_xehp_and_later.inl"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/helpers/timestamp_packet.h"
-#include "shared/source/utilities/tag_allocator.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/test/common/helpers/cmd_buffer_validator.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
-#include "shared/test/common/mocks/mock_device.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/helpers/test_traits.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
-#include "opencl/test/unit_test/aub_tests/fixtures/hello_world_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_kernel_fixture.h"
 
-#include "test_traits_common.h"
+#include "gtest/gtest.h"
+
+#include <memory>
+#include <vector>
 
 using namespace NEO;
 
 struct RangeBasedFlushTest : public KernelAUBFixture<SimpleKernelFixture>, public ::testing::Test {
 
     void SetUp() override {
-        DebugManager.flags.PerformImplicitFlushForNewResource.set(0);
-        DebugManager.flags.PerformImplicitFlushForIdleGpu.set(0);
+        debugManager.flags.PerformImplicitFlushForNewResource.set(0);
+        debugManager.flags.PerformImplicitFlushForIdleGpu.set(0);
+        debugManager.flags.EnableDirectSubmission.set(0);
+        debugManager.flags.CsrDispatchMode.set(static_cast<int32_t>(DispatchMode::batchedDispatch));
+
         KernelAUBFixture<SimpleKernelFixture>::setUp();
     };
 
@@ -54,11 +61,10 @@ struct L3ControlSupportedMatcher {
 HWTEST2_F(RangeBasedFlushTest, givenNoDcFlushInPipeControlWhenL3ControlFlushesCachesThenExpectFlushedCaches, L3ControlSupportedMatcher) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using WALKER = typename FamilyType::WALKER_TYPE;
     using L3_CONTROL = typename FamilyType::L3_CONTROL;
     using L3_FLUSH_ADDRESS_RANGE = typename FamilyType::L3_FLUSH_ADDRESS_RANGE;
 
-    DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+    debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
 
     constexpr size_t bufferSize = MemoryConstants::pageSize;
     char bufferAMemory[bufferSize];
@@ -91,7 +97,7 @@ HWTEST2_F(RangeBasedFlushTest, givenNoDcFlushInPipeControlWhenL3ControlFlushesCa
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     L3RangesVec ranges;
-    ranges.push_back(L3Range::fromAddressSizeWithPolicy(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), MemoryConstants::pageSize,
+    ranges.push_back(L3Range::fromAddressSizeWithPolicy(ptrOffset(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), dstBuffer->getOffset()), MemoryConstants::pageSize,
                                                         L3_FLUSH_ADDRESS_RANGE::L3_FLUSH_EVICTION_POLICY_FLUSH_L3_WITH_EVICTION));
     size_t requiredSize = getSizeNeededToFlushGpuCache<FamilyType>(ranges, false) + 2 * sizeof(PIPE_CONTROL);
     LinearStream &l3FlushCmdStream = pCmdQ->getCS(requiredSize);
@@ -105,11 +111,11 @@ HWTEST2_F(RangeBasedFlushTest, givenNoDcFlushInPipeControlWhenL3ControlFlushesCa
     auto flags = DispatchFlagsHelper::createDefaultDispatchFlags();
     flags.blocking = true;
 
-    DebugManager.flags.DisableDcFlushInEpilogue.set(true);
+    debugManager.flags.DisableDcFlushInEpilogue.set(true);
     csr.flushTask(l3FlushCmdStream, offset,
-                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::DYNAMIC_STATE, 0),
-                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::INDIRECT_OBJECT, 0),
-                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::SURFACE_STATE, 0),
+                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::dynamicState, 0),
+                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::indirectObject, 0),
+                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::surfaceState, 0),
                   pCmdQ->taskLevel,
                   flags,
                   pCmdQ->getDevice());
@@ -117,30 +123,29 @@ HWTEST2_F(RangeBasedFlushTest, givenNoDcFlushInPipeControlWhenL3ControlFlushesCa
     std::string err;
 
     std::vector<MatchCmd *> expectedCommands{
-        new MatchAnyCmd(AnyNumber),
+        new MatchAnyCmd(anyNumber),
         new MatchHwCmd<FamilyType, PIPE_CONTROL>(1, Expects{EXPECT_MEMBER(PIPE_CONTROL, getCommandStreamerStallEnable, true), EXPECT_MEMBER(PIPE_CONTROL, getDcFlushEnable, false)}),
         new MatchHwCmd<FamilyType, L3_CONTROL>(1, Expects{EXPECT_MEMBER(L3_CONTROL, getPostSyncOperation, L3_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_NO_WRITE)}),
     };
     if (MemorySynchronizationCommands<FamilyType>::isBarrierWaRequired(device->getRootDeviceEnvironment())) {
         expectedCommands.push_back(new MatchHwCmd<FamilyType, PIPE_CONTROL>(1, Expects{EXPECT_MEMBER(PIPE_CONTROL, getDcFlushEnable, false)}));
-        if (MemorySynchronizationCommands<FamilyType>::getSizeForAdditonalSynchronization(device->getRootDeviceEnvironment()) > 0) {
+        if (MemorySynchronizationCommands<FamilyType>::getSizeForAdditionalSynchronization(NEO::FenceType::release, device->getRootDeviceEnvironment()) > 0) {
             expectedCommands.push_back(new MatchHwCmd<FamilyType, MI_SEMAPHORE_WAIT>(1, Expects{EXPECT_MEMBER(MI_SEMAPHORE_WAIT, getSemaphoreDataDword, EncodeSemaphore<FamilyType>::invalidHardwareTag)}));
         }
     }
     expectedCommands.push_back(new MatchHwCmd<FamilyType, PIPE_CONTROL>(1, Expects{EXPECT_MEMBER(PIPE_CONTROL, getDcFlushEnable, false)}));
-    expectedCommands.push_back(new MatchAnyCmd(AnyNumber));
+    expectedCommands.push_back(new MatchAnyCmd(anyNumber));
     expectedCommands.push_back(new MatchHwCmd<FamilyType, PIPE_CONTROL>(0));
 
     auto cmdBuffOk = expectCmdBuff<FamilyType>(l3FlushCmdStream, 0, std::move(expectedCommands), &err);
     EXPECT_TRUE(cmdBuffOk) << err;
 
-    expectMemory<FamilyType>(reinterpret_cast<void *>(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress()),
+    expectMemory<FamilyType>(addrToPtr(ptrOffset(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), dstBuffer->getOffset())),
                              bufferAMemory, bufferSize);
 }
 
 HWTEST2_F(RangeBasedFlushTest, givenL3ControlWhenPostSyncIsSetThenExpectPostSyncWrite, L3ControlSupportedMatcher) {
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using WALKER = typename FamilyType::WALKER_TYPE;
     using L3_CONTROL = typename FamilyType::L3_CONTROL;
     using L3_FLUSH_ADDRESS_RANGE = typename FamilyType::L3_FLUSH_ADDRESS_RANGE;
 
@@ -186,7 +191,7 @@ HWTEST2_F(RangeBasedFlushTest, givenL3ControlWhenPostSyncIsSetThenExpectPostSync
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     L3RangesVec ranges;
-    ranges.push_back(L3Range::fromAddressSizeWithPolicy(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(),
+    ranges.push_back(L3Range::fromAddressSizeWithPolicy(ptrOffset(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), dstBuffer->getOffset()),
                                                         MemoryConstants::pageSize, L3_FLUSH_ADDRESS_RANGE::L3_FLUSH_EVICTION_POLICY_FLUSH_L3_WITH_EVICTION));
     size_t requiredSize = getSizeNeededToFlushGpuCache<FamilyType>(ranges, true) + 2 * sizeof(PIPE_CONTROL);
     LinearStream &l3FlushCmdStream = pCmdQ->getCS(requiredSize);
@@ -194,18 +199,18 @@ HWTEST2_F(RangeBasedFlushTest, givenL3ControlWhenPostSyncIsSetThenExpectPostSync
     auto pcBeforeFlush = l3FlushCmdStream.getSpaceForCmd<PIPE_CONTROL>();
     *pcBeforeFlush = FamilyType::cmdInitPipeControl;
 
-    flushGpuCache<FamilyType>(&l3FlushCmdStream, ranges, postSyncBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), device->getHardwareInfo());
+    flushGpuCache<FamilyType>(&l3FlushCmdStream, ranges, ptrOffset(postSyncBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), postSyncBuffer->getOffset()), device->getHardwareInfo());
 
     auto &csr = pCmdQ->getGpgpuCommandStreamReceiver();
     auto flags = DispatchFlagsHelper::createDefaultDispatchFlags();
     flags.blocking = true;
 
-    DebugManager.flags.DisableDcFlushInEpilogue.set(true);
+    debugManager.flags.DisableDcFlushInEpilogue.set(true);
     csr.makeResident(*postSyncBuffer->getGraphicsAllocation(rootDeviceIndex));
     csr.flushTask(l3FlushCmdStream, offset,
-                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::DYNAMIC_STATE, 0),
-                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::INDIRECT_OBJECT, 0),
-                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::SURFACE_STATE, 0),
+                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::dynamicState, 0),
+                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::indirectObject, 0),
+                  &pCmdQ->getIndirectHeap(NEO::IndirectHeap::Type::surfaceState, 0),
                   pCmdQ->taskLevel,
                   flags,
                   pCmdQ->getDevice());
@@ -213,19 +218,19 @@ HWTEST2_F(RangeBasedFlushTest, givenL3ControlWhenPostSyncIsSetThenExpectPostSync
     std::string err;
     auto cmdBuffOk = expectCmdBuff<FamilyType>(l3FlushCmdStream, 0,
                                                std::vector<MatchCmd *>{
-                                                   new MatchAnyCmd(AnyNumber),
+                                                   new MatchAnyCmd(anyNumber),
                                                    new MatchHwCmd<FamilyType, PIPE_CONTROL>(1, Expects{EXPECT_MEMBER(PIPE_CONTROL, getCommandStreamerStallEnable, true), EXPECT_MEMBER(PIPE_CONTROL, getDcFlushEnable, false)}),
                                                    new MatchHwCmd<FamilyType, L3_CONTROL>(1, Expects{EXPECT_MEMBER(L3_CONTROL, getPostSyncOperation, L3_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA)}),
                                                    new MatchHwCmd<FamilyType, PIPE_CONTROL>(1, Expects{EXPECT_MEMBER(PIPE_CONTROL, getDcFlushEnable, false)}), // epilogue
-                                                   new MatchAnyCmd(AnyNumber),
+                                                   new MatchAnyCmd(anyNumber),
                                                    new MatchHwCmd<FamilyType, PIPE_CONTROL>(0),
                                                },
                                                &err);
     EXPECT_TRUE(cmdBuffOk) << err;
 
-    expectMemory<FamilyType>(reinterpret_cast<void *>(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress()),
+    expectMemory<FamilyType>(addrToPtr(ptrOffset(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), dstBuffer->getOffset())),
                              bufferAMemory, bufferSize);
 
-    expectMemory<FamilyType>(reinterpret_cast<void *>(postSyncBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress()),
+    expectMemory<FamilyType>(addrToPtr(ptrOffset(postSyncBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), postSyncBuffer->getOffset())),
                              &expectedPostSyncData, sizeof(expectedPostSyncData));
 }

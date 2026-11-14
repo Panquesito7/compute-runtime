@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,8 @@
 #pragma once
 
 #include "shared/source/compiler_interface/compiler_cache.h"
+
+#include <vector>
 
 namespace NEO {
 class CompilerCacheMock : public CompilerCache {
@@ -19,6 +21,8 @@ class CompilerCacheMock : public CompilerCache {
 
     bool cacheBinary(const std::string &kernelFileHash, const char *pBinary, size_t binarySize) override {
         cacheInvoked++;
+        hashToBinaryMap[kernelFileHash] = std::string(pBinary, binarySize);
+        cacheBinaryKernelFileHashes.push_back(kernelFileHash);
         return cacheResult;
     }
 
@@ -27,13 +31,25 @@ class CompilerCacheMock : public CompilerCache {
             numberOfLoadResult--;
             cachedBinarySize = sizeof(char);
             return std::unique_ptr<char[]>{new char[1]};
-        } else
+        }
+
+        auto it = hashToBinaryMap.find(kernelFileHash);
+        if (it != hashToBinaryMap.end()) {
+            cachedBinarySize = it->second.size();
+            auto binaryCopy = std::make_unique<char[]>(cachedBinarySize);
+            std::copy(it->second.begin(), it->second.end(), binaryCopy.get());
+            return binaryCopy;
+        } else {
+            cachedBinarySize = 0;
             return nullptr;
+        }
     }
 
+    std::vector<std::string> cacheBinaryKernelFileHashes{};
     bool cacheResult = false;
     uint32_t cacheInvoked = 0u;
     bool loadResult = false;
     uint32_t numberOfLoadResult = 0u;
+    std::unordered_map<std::string, std::string> hashToBinaryMap;
 };
 } // namespace NEO

@@ -1,0 +1,2623 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/test_macros/hw_test.h"
+
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/event/event.h"
+#include "level_zero/core/source/mutable_cmdlist/mcl_kernel_ext.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+#include "level_zero/core/test/unit_tests/sources/mutable_cmdlist/fixtures/variable_fixture.h"
+
+namespace L0 {
+namespace ult {
+
+namespace {
+struct CbProfilingEventAccessor : public ::L0::Event {
+    using ::L0::Event::cbEventWithProfiling;
+};
+} // namespace
+
+using VariableTest = Test<VariableFixture>;
+using VariableInOrderTest = Test<VariableInOrderFixture>;
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGroupCountVariableWhenSettingGroupCountValueThenValueIsRetained) {
+    uint32_t groupCountValues[3] = {4, 2, 1};
+    const void *argValue = &groupCountValues;
+
+    createVariable(L0::MCL::VariableType::groupCount, true, -1, -1);
+
+    auto ret = this->variable->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(groupCountValues[0], this->variable->desc.kernelDispatch.groupCount[0]);
+    EXPECT_EQ(groupCountValues[1], this->variable->desc.kernelDispatch.groupCount[1]);
+    EXPECT_EQ(groupCountValues[2], this->variable->desc.kernelDispatch.groupCount[2]);
+
+    EXPECT_TRUE(this->variable->desc.commitRequired);
+
+    auto groupCountVar = this->variable.get();
+    auto variableHandle = this->variable->toHandle();
+    EXPECT_EQ(groupCountVar, variableHandle);
+
+    ret = this->variable->setValue(kernelDispatchVariableSize + 1, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenSettingBufferUsagesThenOffsetsAreSet) {
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    L0::MCL::BufferUsages bufferUsages;
+    bufferUsages.statelessWithoutOffset.push_back(0x40);
+
+    this->variable->setBufferUsages(std::move(bufferUsages));
+    auto &bufferUsage = this->variable->getBufferUsages();
+    ASSERT_EQ(1u, bufferUsage.statelessWithoutOffset.size());
+    EXPECT_EQ(0x40u, bufferUsage.statelessWithoutOffset[0]);
+
+    auto &desc = this->variable->getDesc();
+    EXPECT_EQ(L0::MCL::VariableType::buffer, desc.type);
+
+    EXPECT_EQ(nullptr, this->variable->getInitialVariableDispatch());
+
+    const Variable *constVariable = const_cast<const Variable *>(this->variable.get());
+
+    auto &constBufferUsage = constVariable->getBufferUsages();
+    EXPECT_EQ(constBufferUsage.statelessWithoutOffset.size(), bufferUsage.statelessWithoutOffset.size());
+
+    auto &constDesc = constVariable->getDesc();
+    EXPECT_EQ(constDesc.type, desc.type);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenValueVariableWhenSettingValueUsagesThenOffsetsAreSet) {
+    createVariable(L0::MCL::VariableType::value, true, -1, -1);
+
+    L0::MCL::ValueUsages valueUsages;
+    valueUsages.commandBufferWithoutOffset.push_back(0x40);
+
+    this->variable->setValueUsages(std::move(valueUsages));
+    auto &valueUsage = this->variable->getValueUsages();
+    ASSERT_EQ(1u, valueUsage.commandBufferWithoutOffset.size());
+    EXPECT_EQ(0x40u, valueUsage.commandBufferWithoutOffset[0]);
+
+    const Variable *constVariable = const_cast<const Variable *>(this->variable.get());
+    auto constValueUsage = constVariable->getValueUsages();
+    EXPECT_EQ(constValueUsage.commandBufferWithoutOffset.size(), valueUsage.commandBufferWithoutOffset.size());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGroupCountVariableDispatchWhenSettingGroupCountThenGroupCountIsPatched) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(true, false, false, false);
+
+    uint32_t groupCountValues[3] = {4, 2, 1};
+    const void *argValue = &groupCountValues;
+
+    Variable *groupCount = getVariable(L0::MCL::VariableType::groupCount);
+    EXPECT_EQ(groupCount, this->variableDispatch->getGroupCountVar());
+
+    EXPECT_NE(nullptr, groupCount->getInitialVariableDispatch());
+
+    auto ret = groupCount->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_TRUE(groupCount->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+    auto groupCountIt = std::find(mutableCommandList->stageCommitVariables.begin(), mutableCommandList->stageCommitVariables.end(), groupCount);
+    EXPECT_NE(groupCountIt, mutableCommandList->stageCommitVariables.end());
+
+    groupCount->commitVariable();
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(groupCountValues[0], walkerCmdCpuBuffer->getThreadGroupIdXDimension());
+    EXPECT_EQ(groupCountValues[1], walkerCmdCpuBuffer->getThreadGroupIdYDimension());
+    EXPECT_EQ(groupCountValues[2], walkerCmdCpuBuffer->getThreadGroupIdZDimension());
+
+    EXPECT_EQ(groupCountValues[0], walkerCmdGpuBuffer->getThreadGroupIdXDimension());
+    EXPECT_EQ(groupCountValues[1], walkerCmdGpuBuffer->getThreadGroupIdYDimension());
+    EXPECT_EQ(groupCountValues[2], walkerCmdGpuBuffer->getThreadGroupIdZDimension());
+
+    uint32_t *numWorkGroupsPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.numWorkGroups));
+    EXPECT_EQ(groupCountValues[0], numWorkGroupsPatch[0]);
+    EXPECT_EQ(groupCountValues[1], numWorkGroupsPatch[1]);
+    EXPECT_EQ(groupCountValues[2], numWorkGroupsPatch[2]);
+
+    uint32_t *globalWorkSizePatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.globalWorkSize));
+    EXPECT_EQ(groupCountValues[0], globalWorkSizePatch[0]);
+    EXPECT_EQ(groupCountValues[1], globalWorkSizePatch[1]);
+    EXPECT_EQ(groupCountValues[2], globalWorkSizePatch[2]);
+
+    uint32_t *workDimPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.workDimensions));
+    EXPECT_EQ(2u, *workDimPatch);
+
+    EXPECT_FALSE(groupCount->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupCountValues[1] = 4;
+    ret = groupCount->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(groupCount->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupCount->commitVariable();
+    EXPECT_EQ(groupCountValues[1], walkerCmdCpuBuffer->getThreadGroupIdYDimension());
+    EXPECT_EQ(groupCountValues[1], numWorkGroupsPatch[1]);
+    EXPECT_EQ(groupCountValues[1], globalWorkSizePatch[1]);
+
+    groupCountValues[2] = 4;
+    ret = groupCount->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(groupCount->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupCount->commitVariable();
+    EXPECT_EQ(groupCountValues[2], walkerCmdCpuBuffer->getThreadGroupIdZDimension());
+    EXPECT_EQ(groupCountValues[2], numWorkGroupsPatch[2]);
+    EXPECT_EQ(groupCountValues[2], globalWorkSizePatch[2]);
+
+    groupCountValues[0] = 4;
+    groupCountValues[1] = 1;
+    groupCountValues[2] = 1;
+    ret = groupCount->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(groupCount->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupCount->commitVariable();
+    EXPECT_EQ(1u, *workDimPatch);
+
+    ret = groupCount->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(groupCount->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGroupCountVariableNonCommitDispatchWhenSettingGroupCountThenGroupCountIsPatchedImmediately) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    this->stageCommitMode = false;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(true, false, false, false);
+
+    uint32_t groupCountValues[3] = {4, 2, 1};
+    const void *argValue = &groupCountValues;
+
+    Variable *groupCount = getVariable(L0::MCL::VariableType::groupCount);
+
+    auto ret = groupCount->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(groupCount->desc.commitRequired);
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(groupCountValues[0], walkerCmdCpuBuffer->getThreadGroupIdXDimension());
+    EXPECT_EQ(groupCountValues[1], walkerCmdCpuBuffer->getThreadGroupIdYDimension());
+    EXPECT_EQ(groupCountValues[2], walkerCmdCpuBuffer->getThreadGroupIdZDimension());
+
+    EXPECT_EQ(groupCountValues[0], walkerCmdGpuBuffer->getThreadGroupIdXDimension());
+    EXPECT_EQ(groupCountValues[1], walkerCmdGpuBuffer->getThreadGroupIdYDimension());
+    EXPECT_EQ(groupCountValues[2], walkerCmdGpuBuffer->getThreadGroupIdZDimension());
+
+    uint32_t *numWorkGroupsPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.numWorkGroups));
+    EXPECT_EQ(groupCountValues[0], numWorkGroupsPatch[0]);
+    EXPECT_EQ(groupCountValues[1], numWorkGroupsPatch[1]);
+    EXPECT_EQ(groupCountValues[2], numWorkGroupsPatch[2]);
+
+    uint32_t *globalWorkSizePatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.globalWorkSize));
+    EXPECT_EQ(groupCountValues[0], globalWorkSizePatch[0]);
+    EXPECT_EQ(groupCountValues[1], globalWorkSizePatch[1]);
+    EXPECT_EQ(groupCountValues[2], globalWorkSizePatch[2]);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGroupSizeVariableDispatchWhenSettingGroupSizeThenGroupSizeIsPatched) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 3;
+    this->kernelDispatch->kernelData->simdSize = 32;
+
+    uint32_t groupSizeValues[3] = {4, 2, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+    EXPECT_EQ(groupSize, this->variableDispatch->getGroupSizeVar());
+
+    groupSize->setAsKernelGroupSize(this->kernelHandle);
+    auto &mclKernelExt = L0::MCL::MclKernelExt::get(this->kernel.get());
+    EXPECT_EQ(groupSize, mclKernelExt.getGroupSizeVariable());
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_TRUE(groupSize->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+    auto groupSizeIt = std::find(mutableCommandList->stageCommitVariables.begin(), mutableCommandList->stageCommitVariables.end(), groupSize);
+    EXPECT_NE(groupSizeIt, mutableCommandList->stageCommitVariables.end());
+
+    groupSize->commitVariable();
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(groupSizeValues[1] - 1, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(groupSizeValues[2] - 1, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(groupSizeValues[1] - 1, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(groupSizeValues[2] - 1, walkerCmdGpuBuffer->getLocalZMaximum());
+
+    uint32_t *localWorkSizePatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.localWorkSize));
+    EXPECT_EQ(groupSizeValues[0], localWorkSizePatch[0]);
+    EXPECT_EQ(groupSizeValues[1], localWorkSizePatch[1]);
+    EXPECT_EQ(groupSizeValues[2], localWorkSizePatch[2]);
+
+    uint32_t *enqLocalWorkSizePatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.enqLocalWorkSize));
+    EXPECT_EQ(groupSizeValues[0], enqLocalWorkSizePatch[0]);
+    EXPECT_EQ(groupSizeValues[1], enqLocalWorkSizePatch[1]);
+    EXPECT_EQ(groupSizeValues[2], enqLocalWorkSizePatch[2]);
+
+    EXPECT_FALSE(groupSize->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupSizeValues[1] = 4;
+    ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(groupSize->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupSize->commitVariable();
+    EXPECT_EQ(groupSizeValues[1] - 1, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(groupSizeValues[1], localWorkSizePatch[1]);
+    EXPECT_EQ(groupSizeValues[1], enqLocalWorkSizePatch[1]);
+
+    groupSizeValues[2] = 4;
+    ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(groupSize->desc.commitRequired);
+    EXPECT_TRUE(this->variableDispatch->doCommitVariableDispatch());
+
+    groupSize->commitVariable();
+    EXPECT_EQ(groupSizeValues[2] - 1, walkerCmdCpuBuffer->getLocalZMaximum());
+    EXPECT_EQ(groupSizeValues[2], localWorkSizePatch[2]);
+    EXPECT_EQ(groupSizeValues[2], enqLocalWorkSizePatch[2]);
+
+    ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(groupSize->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGroupSizeVariableNonCommitDispatchWhenSettingGroupSizeThenGroupSizeIsPatchedImmediately) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    this->stageCommitMode = false;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 3;
+
+    uint32_t groupSizeValues[3] = {4, 2, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(groupSize->desc.commitRequired);
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(groupSizeValues[1] - 1, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(groupSizeValues[2] - 1, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(groupSizeValues[1] - 1, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(groupSizeValues[2] - 1, walkerCmdGpuBuffer->getLocalZMaximum());
+
+    uint32_t *localWorkSizePatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.localWorkSize));
+    EXPECT_EQ(groupSizeValues[0], localWorkSizePatch[0]);
+    EXPECT_EQ(groupSizeValues[1], localWorkSizePatch[1]);
+    EXPECT_EQ(groupSizeValues[2], localWorkSizePatch[2]);
+
+    uint32_t *enqLocalWorkSizePatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.enqLocalWorkSize));
+    EXPECT_EQ(groupSizeValues[0], enqLocalWorkSizePatch[0]);
+    EXPECT_EQ(groupSizeValues[1], enqLocalWorkSizePatch[1]);
+    EXPECT_EQ(groupSizeValues[2], enqLocalWorkSizePatch[2]);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenLocalIdDimensionsNotThreeThenCorrectlySetMaximumLocalIdsInWalker) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    this->stageCommitMode = false;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 1;
+
+    uint32_t groupSizeValues[3] = {4, 1, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(groupSize->desc.commitRequired);
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalZMaximum());
+}
+
+template <typename FamilyType>
+void verifyHwLocalIdsGenerationWhenSettingGroupSize(VariableFixture &fixture, uint32_t numLocalIdChannels, const uint32_t (&groupSizeValues)[3], uint32_t expectedWalkOrder) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    fixture.stageCommitMode = false;
+    fixture.template createMutableComputeWalker<FamilyType, WalkerType>(0);
+    fixture.createVariableDispatch(false, true, false, false);
+    fixture.kernelDispatch->kernelData->numLocalIdChannels = numLocalIdChannels;
+
+    const void *argValue = &groupSizeValues;
+    Variable *groupSize = fixture.getVariable(L0::MCL::VariableType::groupSize);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, groupSize->setValue(VariableFixture::kernelDispatchVariableSize, 0, argValue));
+
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(fixture.walkerBuffer);
+    EXPECT_TRUE(walkerCmdGpuBuffer->getGenerateLocalId());
+    EXPECT_EQ((1u << numLocalIdChannels) - 1u, walkerCmdGpuBuffer->getEmitLocalId());
+    EXPECT_EQ(expectedWalkOrder, walkerCmdGpuBuffer->getWalkOrder());
+    EXPECT_EQ(groupSizeValues[0] - 1, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(groupSizeValues[1] - 1, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(groupSizeValues[2] - 1, walkerCmdGpuBuffer->getLocalZMaximum());
+}
+
+HWTEST2_F(VariableTest,
+          givenSingleLocalIdChannelAndNonEmittedYLargerThanOneWhenSettingGroupSizeThenHwGeneratesLocalIdsWithFullLocalMaximums,
+          IsXe3pCore) {
+    verifyHwLocalIdsGenerationWhenSettingGroupSize<FamilyType>(*this, 1u, {16, 7, 1}, 1u);
+}
+
+HWTEST2_F(VariableTest,
+          givenTwoLocalIdChannelsAndNonEmittedZLargerThanOneWhenSettingGroupSizeThenHwGeneratesLocalIdsWithFullLocalMaximums,
+          IsXe3pCore) {
+    verifyHwLocalIdsGenerationWhenSettingGroupSize<FamilyType>(*this, 2u, {8, 8, 4}, 0u);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenKernelChannelsZeroAndGroupSizeVariableDispatchWhenSettingGroupSizeThenGenerateLocalIdsDisabledAndKernelStartOffsetAdded) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 0;
+    this->kernelDispatch->kernelData->kernelStartAddress = 0x4000;
+    this->kernelDispatch->kernelData->skipPerThreadDataLoad = 0x100;
+    uint64_t kernelStartAddress = this->kernelDispatch->kernelData->kernelStartAddress + this->kernelDispatch->kernelData->skipPerThreadDataLoad;
+
+    uint32_t groupSizeValues[3] = {4, 2, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    groupSize->commitVariable();
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdCpuBuffer->getGenerateLocalId());
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdGpuBuffer->getGenerateLocalId());
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_FALSE(variableDispatch->localIdGenerationByRuntime);
+    EXPECT_EQ(0u, variableDispatch->perThreadDataSize);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenKernelChannelsZeroAndGroupSizeVariableInNonCommitDispatchWhenSettingGroupSizeThenGenerateLocalIdsDisabledAndKernelStartOffsetAdded) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    this->stageCommitMode = false;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 0;
+    this->kernelDispatch->kernelData->kernelStartAddress = 0x4000;
+    this->kernelDispatch->kernelData->skipPerThreadDataLoad = 0x100;
+    uint64_t kernelStartAddress = this->kernelDispatch->kernelData->kernelStartAddress + this->kernelDispatch->kernelData->skipPerThreadDataLoad;
+
+    uint32_t groupSizeValues[3] = {4, 2, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdCpuBuffer->getGenerateLocalId());
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdGpuBuffer->getGenerateLocalId());
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_FALSE(variableDispatch->localIdGenerationByRuntime);
+    EXPECT_EQ(0u, variableDispatch->perThreadDataSize);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSwLocalIdGenerationForcedAndGroupSizeVariableInNonCommitDispatchWhenSettingGroupSizeThenGenerateLocalIdsDisabledAndKernelStartOffsetNotAdded) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableHwGenerationLocalIds.set(false);
+
+    this->usePerThread = true;
+    this->stageCommitMode = false;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 3;
+    this->kernelDispatch->kernelData->kernelStartAddress = 0x4000;
+    this->kernelDispatch->kernelData->skipPerThreadDataLoad = 0x100;
+    uint64_t kernelStartAddress = this->kernelDispatch->kernelData->kernelStartAddress;
+
+    uint32_t groupSizeValues[3] = {4, 2, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdCpuBuffer->getGenerateLocalId());
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdGpuBuffer->getGenerateLocalId());
+
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_TRUE(variableDispatch->localIdGenerationByRuntime);
+    EXPECT_NE(0u, variableDispatch->perThreadDataSize);
+
+    uint32_t *lwsOffsetPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.localWorkSize));
+    EXPECT_EQ(groupSizeValues[0], lwsOffsetPatch[0]);
+    EXPECT_EQ(groupSizeValues[1], lwsOffsetPatch[1]);
+    EXPECT_EQ(groupSizeValues[2], lwsOffsetPatch[2]);
+
+    groupSizeValues[0] = 2;
+    ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(groupSizeValues[0], lwsOffsetPatch[0]);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSwLocalIdGenerationForcedAndGroupSizeVariableDispatchWhenSettingGroupSizeThenGenerateLocalIdsDisabledAndKernelStartOffsetNotAdded) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableHwGenerationLocalIds.set(false);
+
+    this->usePerThread = true;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, true, false, false);
+    this->kernelDispatch->kernelData->numLocalIdChannels = 3;
+    this->kernelDispatch->kernelData->kernelStartAddress = 0x4000;
+    this->kernelDispatch->kernelData->skipPerThreadDataLoad = 0x100;
+    this->kernelDispatch->kernelData->requiresWorkgroupWalkOrder = true;
+    uint64_t kernelStartAddress = this->kernelDispatch->kernelData->kernelStartAddress;
+
+    uint32_t groupSizeValues[3] = {4, 2, 1};
+    const void *argValue = &groupSizeValues;
+
+    Variable *groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    auto ret = groupSize->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    groupSize->commitVariable();
+
+    WalkerType *walkerCmdCpuBuffer = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    WalkerType *walkerCmdGpuBuffer = reinterpret_cast<WalkerType *>(this->walkerBuffer);
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdCpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdCpuBuffer->getGenerateLocalId());
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalXMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalYMaximum());
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getLocalZMaximum());
+
+    EXPECT_EQ(0u, walkerCmdGpuBuffer->getEmitLocalId());
+    EXPECT_EQ(false, walkerCmdGpuBuffer->getGenerateLocalId());
+
+    EXPECT_EQ(kernelStartAddress, walkerCmdCpuBuffer->getInterfaceDescriptor().getKernelStartPointer());
+
+    EXPECT_TRUE(variableDispatch->localIdGenerationByRuntime);
+    EXPECT_NE(0u, variableDispatch->perThreadDataSize);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGlobalOffsetVariableDispatchWhenSettingGlobalOffsetThenGlobalOffsetIsPatched) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    createVariableDispatch(false, false, true, false);
+
+    uint32_t globalOffsetValues[3] = {4, 2, 1};
+    const void *argValue = &globalOffsetValues;
+
+    Variable *globalOffset = getVariable(L0::MCL::VariableType::globalOffset);
+    EXPECT_EQ(globalOffset, this->variableDispatch->getGlobalOffsetVar());
+
+    auto ret = globalOffset->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(globalOffset->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+    auto globalOffsetIt = std::find(mutableCommandList->stageCommitVariables.begin(), mutableCommandList->stageCommitVariables.end(), globalOffset);
+    EXPECT_EQ(globalOffsetIt, mutableCommandList->stageCommitVariables.end());
+
+    uint32_t *globalOffsetPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->crossThreadData.get(), this->offsets.globalWorkOffset));
+    EXPECT_EQ(globalOffsetValues[0], globalOffsetPatch[0]);
+    EXPECT_EQ(globalOffsetValues[1], globalOffsetPatch[1]);
+    EXPECT_EQ(globalOffsetValues[2], globalOffsetPatch[2]);
+
+    EXPECT_FALSE(globalOffset->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+
+    globalOffsetValues[1] = 4;
+    ret = globalOffset->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(globalOffsetValues[1], globalOffsetPatch[1]);
+
+    globalOffsetValues[2] = 4;
+    ret = globalOffset->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(globalOffsetValues[2], globalOffsetPatch[2]);
+
+    ret = globalOffset->setValue(kernelDispatchVariableSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_FALSE(globalOffset->desc.commitRequired);
+    EXPECT_FALSE(this->variableDispatch->doCommitVariableDispatch());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableAndInlineEnabledWhenBufferPatchOffsetInsideInlineThenUseInline) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    auto svmPtr = allocateUsm(4096);
+    uint64_t svmGpuAddress = reinterpret_cast<uint64_t>(svmPtr);
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    auto &arg = this->kernelArgPtr.as<NEO::ArgDescPointer>();
+    auto qwordAlignment = alignUp(this->mutableComputeWalker->getInlineDataOffset(), sizeof(uint64_t));
+    CrossThreadDataOffset offsetWithinInline = 16 + static_cast<CrossThreadDataOffset>(qwordAlignment - this->mutableComputeWalker->getInlineDataOffset());
+    arg.stateless = offsetWithinInline;
+
+    this->inlineData = true;
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->mutableComputeWalker->getInlineDataPointer(), offsetWithinInline));
+    *gpuAddressPatch = 0;
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(svmGpuAddress, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableAndInlineEnabledWhenBufferPatchOffsetOutsideInlineThenUseIndirectHeap) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    auto svmPtr = allocateUsm(4096);
+    uint64_t svmGpuAddress = reinterpret_cast<uint64_t>(svmPtr);
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    auto &arg = this->kernelArgPtr.as<NEO::ArgDescPointer>();
+    CrossThreadDataOffset offsetOutsideInline = static_cast<CrossThreadDataOffset>(mutableComputeWalker->getInlineDataSize() * 2);
+    arg.stateless = offsetOutsideInline;
+
+    CrossThreadDataOffset actualIndirectHeapOffset = offsetOutsideInline - static_cast<CrossThreadDataOffset>(mutableComputeWalker->getInlineDataSize());
+
+    this->inlineData = true;
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, actualIndirectHeapOffset));
+    *gpuAddressPatch = 0;
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(svmGpuAddress, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenValueVariableAndInlineEnabledWhenMutatingArgumentInsideInlineThenPayloadIsPatchedInInline) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    constexpr size_t arraySize = defaultValueStatelessSize;
+    alignas(8) uint8_t immediateValue[arraySize];
+    const void *argValue = &immediateValue;
+
+    CrossThreadDataOffset offsetWithinInline = 16;
+    auto &argValueDesc = this->kernelArgValue.as<NEO::ArgDescValue>();
+    argValueDesc.elements[0].offset = offsetWithinInline;
+
+    this->inlineData = true;
+    createVariable(L0::MCL::VariableType::value, true, -1, -1);
+    uint8_t *valuesPatch = reinterpret_cast<uint8_t *>(ptrOffset(this->mutableComputeWalker->getInlineDataPointer(), offsetWithinInline));
+    // invalidate memory
+    memset(valuesPatch, 0, this->defaultValueStatelessSize);
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(i);
+    }
+    auto ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        EXPECT_EQ(*(valuesPatch + i), immediateValue[i]);
+    }
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(this->defaultValueStatelessSize - i);
+    }
+    ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        EXPECT_EQ(*(valuesPatch + i), immediateValue[i]);
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenValueVariableAndInlineEnabledWhenMutatingArgumentOutsudeInlineThenPayloadIsPatchedInIndirectHeap) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    CrossThreadDataOffset offsetOutsideInline = static_cast<CrossThreadDataOffset>(mutableComputeWalker->getInlineDataSize() * 2);
+
+    constexpr size_t arraySize = defaultValueStatelessSize;
+    alignas(8) uint8_t immediateValue[arraySize];
+    const void *argValue = &immediateValue;
+
+    auto &argValueDesc = this->kernelArgValue.as<NEO::ArgDescValue>();
+    argValueDesc.elements[0].offset = offsetOutsideInline;
+
+    CrossThreadDataOffset actualIndirectHeapOffset = offsetOutsideInline - static_cast<CrossThreadDataOffset>(mutableComputeWalker->getInlineDataSize());
+
+    this->inlineData = true;
+    createVariable(L0::MCL::VariableType::value, true, -1, -1);
+    uint8_t *valuesPatch = reinterpret_cast<uint8_t *>(ptrOffset(this->cmdListIndirectCpuBase, actualIndirectHeapOffset));
+    // invalidate memory
+    memset(valuesPatch, 0, this->defaultValueStatelessSize);
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(i);
+    }
+    auto ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        EXPECT_EQ(*(valuesPatch + i), immediateValue[i]);
+    }
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(this->defaultValueStatelessSize - i);
+    }
+    ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        EXPECT_EQ(*(valuesPatch + i), immediateValue[i]);
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenValueVariableAndInlineEnabledWhenMutatingArgumentSplitBetweenInlineAndHeapThenPayloadIsPatchedInBoth) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    size_t splitOffset = this->defaultValueStatelessSize / 2;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+    CrossThreadDataOffset baseInlineOffset = static_cast<CrossThreadDataOffset>(mutableComputeWalker->getInlineDataSize() - splitOffset);
+
+    constexpr size_t arraySize = defaultValueStatelessSize;
+    alignas(8) uint8_t immediateValue[arraySize];
+    const void *argValue = &immediateValue;
+
+    auto &argValueDesc = this->kernelArgValue.as<NEO::ArgDescValue>();
+    argValueDesc.elements[0].offset = baseInlineOffset;
+
+    CrossThreadDataOffset actualIndirectHeapOffset = 0; // it starts from the beginning of the indirect heap
+
+    this->inlineData = true;
+    createVariable(L0::MCL::VariableType::value, true, -1, -1);
+    uint8_t *valuesPatchInline = reinterpret_cast<uint8_t *>(ptrOffset(this->mutableComputeWalker->getInlineDataPointer(), baseInlineOffset));
+    uint8_t *valuesPatchHeap = reinterpret_cast<uint8_t *>(ptrOffset(this->cmdListIndirectCpuBase, actualIndirectHeapOffset));
+
+    // invalidate memory
+    memset(valuesPatchInline, 0, splitOffset);
+    memset(valuesPatchHeap, 0, splitOffset);
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(i);
+    }
+    auto ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < splitOffset; i++) {
+        EXPECT_EQ(*(valuesPatchInline + i), immediateValue[i]);
+        EXPECT_EQ(*(valuesPatchHeap + i), immediateValue[i + splitOffset]);
+    }
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(this->defaultValueStatelessSize - i);
+    }
+    ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < splitOffset; i++) {
+        EXPECT_EQ(*(valuesPatchInline + i), immediateValue[i]);
+        EXPECT_EQ(*(valuesPatchHeap + i), immediateValue[i + splitOffset]);
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSingleSlmVariableWhenMutatingSlmArgumentThenSlmSizeChanged) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmSize = 1 * MemoryConstants::kiloByte;
+
+    createVariableDispatch(false, false, false, true);
+    Variable *slmArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    EXPECT_EQ(slmArgument, this->variableDispatch->getLastSlmArgumentVariable());
+
+    EXPECT_EQ(nullptr, slmArgument->desc.slmValue.nextSlmVariable);
+    EXPECT_EQ(0u, slmArgument->desc.slmValue.slmOffsetValue);
+
+    auto ret = slmArgument->setValue(slmSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(slmArgument->desc.commitRequired);
+    EXPECT_EQ(slmSize, slmArgument->desc.slmValue.slmSize);
+
+    slmArgument->commitVariable();
+    EXPECT_EQ(slmSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+    EXPECT_FALSE(slmArgument->desc.commitRequired);
+
+    ret = slmArgument->setValue(slmSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_FALSE(slmArgument->desc.commitRequired);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSingleSlmVariableInNonCommitModeWhenMutatingSlmArgumentThenSlmSizeChangedImmediately) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmSize = 1 * MemoryConstants::kiloByte;
+
+    this->stageCommitMode = false;
+    createVariableDispatch(false, false, false, true);
+    Variable *slmArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    EXPECT_EQ(nullptr, slmArgument->desc.slmValue.nextSlmVariable);
+    EXPECT_EQ(0u, slmArgument->desc.slmValue.slmOffsetValue);
+
+    auto ret = slmArgument->setValue(slmSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_FALSE(slmArgument->desc.commitRequired);
+    EXPECT_EQ(slmSize, slmArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSingleSlmVariableWhenMutatingMisalignedSlmValueThenSlmSizeChangedWithAlignedValues) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmSize = 1;
+    uint32_t expectedSlmSize = alignUp(slmSize, totalSlmAlignment);
+
+    createVariableDispatch(false, false, false, true);
+    Variable *slmArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    EXPECT_EQ(nullptr, slmArgument->desc.slmValue.nextSlmVariable);
+    EXPECT_EQ(0u, slmArgument->desc.slmValue.slmOffsetValue);
+
+    auto ret = slmArgument->setValue(slmSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(slmArgument->desc.commitRequired);
+    EXPECT_EQ(slmSize, slmArgument->desc.slmValue.slmSize);
+
+    slmArgument->commitVariable();
+    EXPECT_EQ(expectedSlmSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+    EXPECT_FALSE(slmArgument->desc.commitRequired);
+
+    slmSize = 2;
+    expectedSlmSize = alignUp(slmSize, totalSlmAlignment);
+    ret = slmArgument->setValue(slmSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmSize, slmArgument->desc.slmValue.slmSize);
+
+    slmArgument->commitVariable();
+    EXPECT_EQ(expectedSlmSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSingleSlmArgumentAndInlineSlmWhenMutatingSlmArgumentThenSlmSizeChangedAndInlineAdded) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmSize = 1 * MemoryConstants::kiloByte;
+    this->slmInlineSize = 1 * MemoryConstants::kiloByte;
+
+    createVariableDispatch(false, false, false, true);
+    Variable *slmArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+
+    auto ret = slmArgument->setValue(slmSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    slmArgument->commitVariable();
+    EXPECT_EQ(slmSize + this->slmInlineSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenRuntimeAdjustedSlmAllocationModeWithInlineSlmWhenMutatingSlmArgumentThenInlineSlmIsNotAddedTwice) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    constexpr uint32_t inlineSlmSize = 256;
+    constexpr uint32_t slmArgSize = 1024;
+    constexpr uint32_t expectedSlmTotalSize = 2 * MemoryConstants::kiloByte;
+
+    this->slmInlineSize = inlineSlmSize;
+    this->slmOffset = inlineSlmSize;
+    this->mockKernelImmData->kernelDescriptor->kernelAttributes.slmAllocationMode = NEO::KernelDescriptor::SlmAllocationMode::runtimeAdjusted;
+
+    createVariableDispatch(false, false, false, true);
+    Variable *slmArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+
+    auto ret = slmArgument->setValue(slmArgSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    slmArgument->commitVariable();
+    EXPECT_EQ(expectedSlmTotalSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenTwoSlmArgumentsWhenMutatingSlmArgumentsStartingFirstThenTotalSlmSizeChanged) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmFirstSize = 1 * MemoryConstants::kiloByte;
+    uint32_t slmSecondSize = 2 * MemoryConstants::kiloByte;
+
+    createVariableDispatch(false, false, false, true);
+    Variable *slmLastArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    createVariable(L0::MCL::VariableType::slmBuffer, true, -1, -1);
+    Variable *slmFirstArgument = this->variable.get();
+
+    slmFirstArgument->desc.slmValue.nextSlmVariable = slmLastArgument;
+
+    uint32_t *slmOffsetPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultSlmSecondOffset));
+    memset(slmOffsetPatch, 0, sizeof(uint32_t));
+
+    auto ret = slmFirstArgument->setValue(slmFirstSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmFirstSize, slmFirstArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    slmLastArgument->commitVariable();
+    EXPECT_EQ(slmFirstSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+
+    ret = slmLastArgument->setValue(slmSecondSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmSecondSize, slmLastArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    slmLastArgument->commitVariable();
+    EXPECT_EQ(slmFirstSize + slmSecondSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+
+    auto slmNextValue = slmFirstSize + 1;
+    ret = slmFirstArgument->setValue(slmNextValue, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmNextValue, slmFirstArgument->desc.slmValue.slmSize);
+    auto slmLastOffset = alignUp(slmNextValue, defaultSlmArgumentAlignment);
+    EXPECT_EQ(slmLastOffset, slmLastArgument->desc.slmValue.slmOffsetValue);
+
+    slmNextValue += 1;
+    ret = slmFirstArgument->setValue(slmNextValue, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmNextValue, slmFirstArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmLastOffset, slmLastArgument->desc.slmValue.slmOffsetValue);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenTwoSlmArgumentsWhenMutatingSlmArgumentsStartingSecondThenTotalSlmSizeChanged) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmFirstSize = 1 * MemoryConstants::kiloByte;
+    uint32_t slmSecondSize = 2 * MemoryConstants::kiloByte;
+
+    createVariableDispatch(false, false, false, true);
+    Variable *slmLastArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    createVariable(L0::MCL::VariableType::slmBuffer, true, -1, -1);
+    Variable *slmFirstArgument = this->variable.get();
+
+    slmFirstArgument->desc.slmValue.nextSlmVariable = slmLastArgument;
+
+    uint32_t *slmOffsetPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultSlmSecondOffset));
+    memset(slmOffsetPatch, 0, sizeof(uint32_t));
+
+    auto ret = slmLastArgument->setValue(slmSecondSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(0u, slmFirstArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmSecondSize, slmLastArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(0u, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(0u, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    slmLastArgument->commitVariable();
+    EXPECT_EQ(slmSecondSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+
+    ret = slmFirstArgument->setValue(slmFirstSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmFirstSize, slmFirstArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmSecondSize, slmLastArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    slmLastArgument->commitVariable();
+    EXPECT_EQ(slmFirstSize + slmSecondSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenTwoSlmArgumentsInlineModeEnabledWhenMutatingSlmArgumentsInsideInlineThenPatchInlineMemory) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmFirstSize = 1 * MemoryConstants::kiloByte;
+    uint32_t slmSecondSize = 2 * MemoryConstants::kiloByte;
+
+    CrossThreadDataOffset slmInlineOffset = 16;
+
+    this->kernelArgSlmSecond.as<NEO::ArgDescPointer>().slmOffset = slmInlineOffset;
+
+    this->inlineData = true;
+    createVariableDispatch(false, false, false, true);
+    Variable *slmLastArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    createVariable(L0::MCL::VariableType::slmBuffer, true, -1, -1);
+    Variable *slmFirstArgument = this->variable.get();
+
+    slmFirstArgument->desc.slmValue.nextSlmVariable = slmLastArgument;
+
+    uint32_t *slmOffsetPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->mutableComputeWalker->getInlineDataPointer(), slmInlineOffset));
+    memset(slmOffsetPatch, 0, sizeof(uint32_t));
+
+    auto ret = slmFirstArgument->setValue(slmFirstSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmFirstSize, slmFirstArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    ret = slmLastArgument->setValue(slmSecondSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmSecondSize, slmLastArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    slmLastArgument->commitVariable();
+    EXPECT_EQ(slmFirstSize + slmSecondSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenTwoSlmArgumentsInlineModeEnabledWhenMutatingSlmArgumentsOutsideInlineThenPatchIndirectMemory) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    createMutableComputeWalker<FamilyType, WalkerType>(0);
+
+    uint32_t slmFirstSize = 1 * MemoryConstants::kiloByte;
+    uint32_t slmSecondSize = 2 * MemoryConstants::kiloByte;
+
+    CrossThreadDataOffset slmOutsideInlineOffset = static_cast<CrossThreadDataOffset>(this->mutableComputeWalker->getInlineDataSize() + 16);
+
+    this->kernelArgSlmSecond.as<NEO::ArgDescPointer>().slmOffset = slmOutsideInlineOffset;
+    CrossThreadDataOffset actualHeapOffset = slmOutsideInlineOffset - static_cast<CrossThreadDataOffset>(this->mutableComputeWalker->getInlineDataSize());
+
+    this->inlineData = true;
+    createVariableDispatch(false, false, false, true);
+    Variable *slmLastArgument = getVariable(L0::MCL::VariableType::slmBuffer);
+    createVariable(L0::MCL::VariableType::slmBuffer, true, -1, -1);
+    Variable *slmFirstArgument = this->variable.get();
+
+    slmFirstArgument->desc.slmValue.nextSlmVariable = slmLastArgument;
+
+    uint32_t *slmOffsetPatch = reinterpret_cast<uint32_t *>(ptrOffset(this->cmdListIndirectCpuBase, actualHeapOffset));
+    memset(slmOffsetPatch, 0, sizeof(uint32_t));
+
+    auto ret = slmFirstArgument->setValue(slmFirstSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmFirstSize, slmFirstArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    ret = slmLastArgument->setValue(slmSecondSize, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(slmSecondSize, slmLastArgument->desc.slmValue.slmSize);
+    EXPECT_EQ(slmFirstSize, slmLastArgument->desc.slmValue.slmOffsetValue);
+    EXPECT_EQ(slmFirstSize, *slmOffsetPatch);
+
+    EXPECT_FALSE(slmFirstArgument->desc.commitRequired);
+    EXPECT_TRUE(slmLastArgument->desc.commitRequired);
+
+    slmLastArgument->commitVariable();
+    EXPECT_EQ(slmFirstSize + slmSecondSize, this->kernelDispatch->slmTotalSizePerThreadGroup);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenGroupCountAndSizeAndGlobalOffsetVariablesWhenPassingIncorrectVariableToDispatchThenErrorIsReturned) {
+    Variable *groupCount = nullptr;
+    Variable *groupSize = nullptr;
+
+    createVariable(L0::MCL::VariableType::groupCount, false, -1, -1);
+    groupCount = getVariable(L0::MCL::VariableType::groupCount);
+    createVariable(L0::MCL::VariableType::groupSize, false, -1, -1);
+    groupSize = getVariable(L0::MCL::VariableType::groupSize);
+
+    this->kernelDispatch = std::make_unique<::L0::MCL::KernelDispatch>();
+
+    uint32_t initialGroupCount[3] = {1, 1, 1};
+    uint32_t initialGroupSize[3] = {1, 1, 1};
+    uint32_t initialGlobalOffset[3] = {1, 1, 1};
+
+    L0::MCL::MutableKernelDispatchParameters dispatchParams = {
+        initialGroupCount,   // groupCount
+        initialGroupSize,    // groupSize
+        initialGlobalOffset, // globalOffset
+    };
+
+    auto result = this->mutableCommandList->addVariableDispatch(*this->mockKernelImmData->kernelDescriptor, *kernelDispatch.get(), groupCount, nullptr, nullptr, nullptr, nullptr, nullptr, dispatchParams);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+
+    result = this->mutableCommandList->addVariableDispatch(*this->mockKernelImmData->kernelDescriptor, *kernelDispatch.get(), nullptr, groupSize, nullptr, nullptr, nullptr, nullptr, dispatchParams);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+
+    result = this->mutableCommandList->addVariableDispatch(*this->mockKernelImmData->kernelDescriptor, *kernelDispatch.get(), nullptr, nullptr, groupCount, nullptr, nullptr, nullptr, dispatchParams);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenMutatingUsmPointerThenPayloadIsPatched) {
+    auto svmPtr = allocateUsm(4096);
+    uint64_t svmGpuAddress = reinterpret_cast<uint64_t>(svmPtr);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultBufferStatelessOffset));
+    // invalidate memory
+    *gpuAddressPatch = 0;
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(svmGpuAddress, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenMutatingTwoUsmPointersThenPayloadIsPatchedTwice) {
+    auto svmPtr = allocateUsm(4096);
+    uint64_t svmGpuAddress = reinterpret_cast<uint64_t>(svmPtr);
+
+    auto svmPtr2 = allocateUsm(4096);
+    uint64_t svmGpuAddress2 = reinterpret_cast<uint64_t>(svmPtr2);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultBufferStatelessOffset));
+    // invalidate memory
+    *gpuAddressPatch = 0;
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(svmGpuAddress, *gpuAddressPatch);
+
+    ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr2);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(svmGpuAddress2, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenSameUsmPointerIsSetAgainAfterAnotherAllocationThenAllocIdIsKeptAndManagerCounterIsUpdated) {
+    auto svmPtr = allocateUsm(4096);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultBufferStatelessOffset));
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    const auto allocId = this->variable->getDesc().allocId;
+    const auto managerCounter = this->variable->getDesc().allocIdMemoryManagerCounter;
+
+    allocateUsm(4096);
+    *gpuAddressPatch = 0;
+
+    ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(allocId, this->variable->getDesc().allocId);
+    EXPECT_LT(managerCounter, this->variable->getDesc().allocIdMemoryManagerCounter);
+    EXPECT_EQ(this->device->getDriverHandle()->getSvmAllocsManager()->allocationsCounter.load(), this->variable->getDesc().allocIdMemoryManagerCounter);
+    EXPECT_EQ(0u, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWithPooledChunkWhenChunkIsReallocatedAtSameAddressAndSetAgainThenPayloadIsPatchedAgain) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableUsmAllocationPoolManager.set(0);
+    NEO::debugManager.flags.EnableHostUsmAllocationPool.set(1);
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    void *chunk = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, this->context->allocHostMem(&hostDesc, 4096, 4096, &chunk));
+    ASSERT_NE(nullptr, this->device->getDriverHandle()->getHostUsmPoolOwningPtr(chunk).pool);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultBufferStatelessOffset));
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &chunk);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(chunk)->getAllocId(), this->variable->getDesc().allocId);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, this->context->freeMem(chunk));
+    void *reallocatedChunk = nullptr;
+    ASSERT_EQ(ZE_RESULT_SUCCESS, this->context->allocHostMem(&hostDesc, 4096, 4096, &reallocatedChunk));
+    ASSERT_EQ(chunk, reallocatedChunk);
+    *gpuAddressPatch = 0;
+
+    ret = this->variable->setValue(kernelArgVariableSize, 0, &reallocatedChunk);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(reallocatedChunk), *gpuAddressPatch);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, this->context->freeMem(reallocatedChunk));
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenValueVariableWhenMutatingArgumentThenPayloadIsPatched) {
+    constexpr size_t arraySize = defaultValueStatelessSize;
+    alignas(8) uint8_t immediateValue[arraySize];
+    const void *argValue = &immediateValue;
+
+    createVariable(L0::MCL::VariableType::value, true, -1, -1);
+    uint8_t *valuesPatch = reinterpret_cast<uint8_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultValueStatelessOffset));
+    // invalidate memory
+    memset(valuesPatch, 0, this->defaultValueStatelessSize);
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(i);
+    }
+    auto ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        EXPECT_EQ(*(valuesPatch + i), immediateValue[i]);
+    }
+
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        immediateValue[i] = static_cast<uint8_t>(this->defaultValueStatelessSize - i);
+    }
+    ret = this->variable->setValue(this->defaultValueStatelessSize, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    for (uint32_t i = 0; i < this->defaultValueStatelessSize; i++) {
+        EXPECT_EQ(*(valuesPatch + i), immediateValue[i]);
+    }
+
+    ret = this->variable->setValue(0, 0, argValue);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenChunkedValueVariableWhenMutatingArgumentThenPayloadIsPatched) {
+    struct alignas(8) TestStruct {
+        bool flag = false;
+        uint64_t value = 0;
+    };
+    TestStruct immediateValue;
+    memset(reinterpret_cast<void *>(&immediateValue), 0, sizeof(TestStruct));
+    const void *argValue = &immediateValue;
+
+    auto &argValueDesc = this->kernelArgValue.as<NEO::ArgDescValue>();
+    argValueDesc.elements[0].size = 1; // size of bool
+
+    NEO::ArgDescValue::Element elementQword{};
+    elementQword.offset = this->defaultValueStatelessOffset + 8; // offset within heap
+    elementQword.size = 8;                                       // size of element
+    elementQword.sourceOffset = 8;                               // offset within structure
+    argValueDesc.elements.push_back(elementQword);
+
+    createVariable(L0::MCL::VariableType::value, true, -1, -1);
+    void *memoryPatch = ptrOffset(this->cmdListIndirectCpuBase, this->defaultValueStatelessOffset);
+    // invalidate memory
+    memset(memoryPatch, 0, sizeof(TestStruct));
+
+    immediateValue.flag = true;
+    immediateValue.value = 0xFED5;
+    auto ret = this->variable->setValue(sizeof(TestStruct), 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(0, memcmp(memoryPatch, &immediateValue, sizeof(TestStruct)));
+
+    immediateValue.flag = false;
+    immediateValue.value = 0xFAAC10DDFF;
+    ret = this->variable->setValue(sizeof(TestStruct), 0, argValue);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(0, memcmp(memoryPatch, &immediateValue, sizeof(TestStruct)));
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenMutatingUsmSharedSystemThenPayloadIsPatched) {
+    uint64_t svmGpuAddress = 0x12340000;
+    void *svmPtr = reinterpret_cast<void *>(svmGpuAddress);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultBufferStatelessOffset));
+    // invalidate memory
+    *gpuAddressPatch = 0;
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(svmGpuAddress, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWithDisabledSystemPointerWhenMutatingUsmSharedSystemThenPayloadIsNotPatched) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.DisableSystemPointerKernelArgument.set(1);
+
+    uint64_t svmGpuAddress = 0x12320000;
+    void *svmPtr = reinterpret_cast<void *>(svmGpuAddress);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    uint64_t *gpuAddressPatch = reinterpret_cast<uint64_t *>(ptrOffset(this->cmdListIndirectCpuBase, this->defaultBufferStatelessOffset));
+    // invalidate memory
+    *gpuAddressPatch = 0;
+
+    auto ret = this->variable->setValue(kernelArgVariableSize, 0, &svmPtr);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+
+    EXPECT_EQ(0u, *gpuAddressPatch);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSignalEventRegularNoCounterBasedNoSignalScopeNoTimestampWhenMutatingVariableThenNewPostSyncAddressSet) {
+    using WalkerType = typename FamilyType::PorWalkerType;
+
+    auto event = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+    auto postSyncAddress = event->getGpuAddress(device);
+    createMutableComputeWalker<FamilyType, WalkerType>(postSyncAddress);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, this->mutableComputeWalker.get(), nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+
+    auto newEvent = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    auto newPostSyncAddress = newEvent->getGpuAddress(device);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    auto walkerCmdCpu = reinterpret_cast<WalkerType *>(this->cpuWalkerBuffer);
+    auto testPostSyncAddress = walkerCmdCpu->getPostSync().getDestinationAddress();
+    EXPECT_EQ(newPostSyncAddress, testPostSyncAddress);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSignalEventRegularNoCounterBasedSignalScopeNoTimestampWhenMutatingVariableThenNewPostSyncAddressSet) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+    auto event = this->createTestEvent(false, true, false, false, false);
+    ASSERT_NE(nullptr, event);
+    createMutablePipeControl<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, this->mutablePipeControl.get());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+
+    auto newEvent = this->createTestEvent(false, true, false, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    auto newPostSyncAddress = newEvent->getGpuAddress(device);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    auto pipeControlCmd = reinterpret_cast<PIPE_CONTROL *>(this->pipeControlBuffer);
+    auto testPostSyncAddress = NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControlCmd);
+    EXPECT_EQ(newPostSyncAddress, testPostSyncAddress);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenSignalEventRegularNoCounterBasedSignalScopeTimestampWhenMutatingVariableThenNewPostSyncAddressSet) {
+    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
+
+    auto event = this->createTestEvent(false, true, true, false, false);
+    ASSERT_NE(nullptr, event);
+    size_t offset = 0x10;
+    createMutableStoreRegisterMem<FamilyType>(offset);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    this->variable->getStoreRegMemList().push_back(this->mutableStoreRegisterMem.get());
+
+    auto newEvent = this->createTestEvent(false, true, true, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    auto expectedPostSyncAddress = newEvent->getGpuAddress(device) + offset;
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    auto storeRegisterMemCmd = reinterpret_cast<MI_STORE_REGISTER_MEM *>(this->storeRegisterMemBuffer);
+    auto testPostSyncAddress = storeRegisterMemCmd->getMemoryAddress();
+    EXPECT_EQ(expectedPostSyncAddress, testPostSyncAddress);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenWaitEventRegularNoCounterBasedWhenMutatingVariableThenNewWaitAddressSet) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    auto event = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+    size_t offset = 0x10;
+    createMutableSemaphoreWait<FamilyType>(offset, L0::MCL::MutableSemaphoreWait::Type::regularEventWait, false, false);
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+    EXPECT_FALSE(this->variable->desc.eventValue.counterBasedEvent);
+
+    auto newEvent = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    auto expectedWaitAddress = newEvent->getGpuAddress(device) + offset;
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    auto semWaitCmd = reinterpret_cast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    auto testWaitAddress = UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd);
+    EXPECT_EQ(expectedWaitAddress, testWaitAddress);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenWaitEventRegularNoCounterBasedWhenNoopingAndRestoringVariableThenWaitCommandIsNoopedAndRestored) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    memset(noopSemaphoreSpace, 0, sizeof(MI_SEMAPHORE_WAIT));
+
+    auto event = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+    size_t offset = 0x10;
+    createMutableSemaphoreWait<FamilyType>(offset, L0::MCL::MutableSemaphoreWait::Type::regularEventWait, false, false);
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+    EXPECT_FALSE(this->variable->desc.eventValue.counterBasedEvent);
+    auto expectedWaitAddress = event->getGpuAddress(device) + offset;
+
+    auto newEvent = nullptr;
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+    EXPECT_TRUE(this->variable->desc.eventValue.noopState);
+
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+
+    ret = this->variable->setValue(0, 0, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    EXPECT_FALSE(this->variable->desc.eventValue.noopState);
+
+    auto semWaitCmd = reinterpret_cast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    auto testWaitAddress = UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd);
+    EXPECT_EQ(expectedWaitAddress, testWaitAddress);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenWaitEventVariableWhenSavingDeviceCounterAllocationThenPeerCounterAllocIsSaved) {
+    auto event = this->createTestEvent(true, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+
+    uint32_t peerDeviceIndex = this->device->getRootDeviceIndex() + 1;
+    MockGraphicsAllocation peerCounterDeviceAlloc(peerDeviceIndex, reinterpret_cast<void *>(0x1234), 0x0u);
+
+    event->getInOrderExecEventHelper().assignData(1, 0, 1, 1, &peerCounterDeviceAlloc, &peerCounterDeviceAlloc, 1, 0, nullptr, 0, 0, false, true);
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(peerCounterDeviceAlloc.getGpuAddress(), this->variable->desc.eventValue.cbEventDeviceCounterAllocation->getGpuAddress());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenImageArgIsSetAsKernelArgInVariableThenErrorIsReturned) {
+    resizeKernelArg(1);
+    NEO::ArgDescriptor kernelArgImage = {NEO::ArgDescriptor::argTImage};
+    mockKernelImmData->kernelDescriptor->payloadMappings.explicitArgs[0] = kernelArgImage;
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    auto ret = this->variable->setAsKernelArg(this->kernelHandle, 0);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenArgIndexUsedBiggerThanMaxArgSizeThenErrorIsReturned) {
+    resizeKernelArg(1);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    auto ret = this->variable->setAsKernelArg(this->kernelHandle, 255);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableNotDefinedStateWhenAddKernelArgUsageThenErrorIsReturned) {
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+    this->variable->desc.state = L0::MCL::VariableDescriptor::State::declared;
+
+    L0::MCL::IndirectObjectHeapOffset relativeIohOffset = 0;
+    L0::MCL::CommandBufferOffset relativeWalkerOffset = 0;
+
+    auto ret = this->variable->addKernelArgUsage(this->kernelArgPtr,
+                                                 relativeIohOffset, reinterpret_cast<L0::MCL::IndirectObjectHeapOffset>(this->cmdListIndirectCpuBase),
+                                                 undefined<L0::MCL::SurfaceStateHeapOffset>,
+                                                 0, 0,
+                                                 relativeWalkerOffset, this->mutableComputeWalker.get(),
+                                                 this->inlineData);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenWaitVariableWhenAddKernelArgUsageThenErrorIsReturned) {
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+
+    L0::MCL::IndirectObjectHeapOffset relativeIohOffset = 0;
+    L0::MCL::CommandBufferOffset relativeWalkerOffset = 0;
+
+    auto ret = this->variable->addKernelArgUsage(this->kernelArgPtr,
+                                                 relativeIohOffset, reinterpret_cast<L0::MCL::IndirectObjectHeapOffset>(this->cmdListIndirectCpuBase),
+                                                 undefined<L0::MCL::SurfaceStateHeapOffset>,
+                                                 0, 0,
+                                                 relativeWalkerOffset, this->mutableComputeWalker.get(),
+                                                 this->inlineData);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenSetAsWaitEventThenErrorIsReturned) {
+    auto event = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenSetAsSignalEventThenErrorIsReturned) {
+    auto event = this->createTestEvent(false, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableWhenSetAsGroupSizeThenErrorIsReturned) {
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    auto ret = this->variable->setAsKernelGroupSize(this->kernelHandle);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, ret);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableTest,
+            givenBufferVariableInInitializedStateWhenQueriedTypeThenReturnFalse) {
+    createVariable(L0::MCL::VariableType::buffer, true, -1, -1);
+
+    this->variable->getDesc().state = L0::MCL::VariableDescriptor::State::initialized;
+    EXPECT_FALSE(this->variable->isType(L0::MCL::VariableType::buffer));
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenSignalEventRegularNoCounterBasedSignalScopeTimestampWhenMutatingVariableThenNewPostSyncAddressSet) {
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    auto event = this->createTestEvent(false, true, true, false, false);
+    size_t offset = 0x10;
+    createMutableStoreDataImm<FamilyType>(offset, false);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    this->variable->getStoreDataImmList().push_back(this->mutableStoreDataImm.get());
+
+    auto newEvent = this->createTestEvent(false, true, true, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    auto expectedPostSyncAddress = newEvent->getGpuAddress(device) + offset;
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    auto storeDataImmCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(this->storeDataImmBuffer);
+    auto testPostSyncAddress = storeDataImmCmd->getAddress();
+    EXPECT_EQ(expectedPostSyncAddress, testPostSyncAddress);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCbSignalEventWhenMutatingEventThenDataIsUpdated) {
+    auto event = this->createTestEvent(true, false, false, false, false);
+    ASSERT_NE(nullptr, event);
+
+    this->attachCbEvent(event);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    EXPECT_EQ(this->cmdListInOrderAllocationOffset, this->variable->desc.eventValue.inOrderAllocationOffset);
+    EXPECT_EQ(this->cmdListInOrderCounterValue, this->variable->desc.eventValue.inOrderExecBaseSignalValue);
+
+    auto newEvent = this->createTestEvent(true, false, false, false, false);
+    ASSERT_NE(nullptr, newEvent);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+    EXPECT_EQ(this->cmdListInOrderAllocationOffset, newEvent->getInOrderAllocationOffset());
+    EXPECT_EQ(this->cmdListInOrderCounterValue, newEvent->getInOrderExecBaseSignalValue());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCbSignalTimestampEventWhenMutatingEventThenDataIsUpdatedAndTimestampPropertySet) {
+    auto event = this->createTestEvent(true, false, true, false, false);
+    ASSERT_NE(nullptr, event);
+
+    this->attachCbEvent(event);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    EXPECT_EQ(this->cmdListInOrderAllocationOffset, this->variable->desc.eventValue.inOrderAllocationOffset);
+    EXPECT_EQ(this->cmdListInOrderCounterValue, this->variable->desc.eventValue.inOrderExecBaseSignalValue);
+    EXPECT_TRUE(this->variable->desc.eventValue.hasStandaloneProfilingNode);
+
+    auto newEvent = this->createTestEvent(true, false, true, false, false);
+    ASSERT_NE(nullptr, newEvent);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+    EXPECT_EQ(this->cmdListInOrderAllocationOffset, newEvent->getInOrderAllocationOffset());
+    EXPECT_EQ(this->cmdListInOrderCounterValue, newEvent->getInOrderExecBaseSignalValue());
+    EXPECT_TRUE(newEvent->hasInOrderTimestampNode());
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCbSignalTimestampEventWithProfilingWhenMutatingSignalEventThenProfilingFlagIsPropagated) {
+    auto event = this->createTestEvent(true, false, true, false, false);
+    ASSERT_NE(nullptr, event);
+
+    this->attachCbEvent(event);
+    event->setCbEventWithProfiling(true);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    ASSERT_TRUE(this->variable->desc.eventValue.hasStandaloneProfilingNode);
+    EXPECT_TRUE(this->variable->desc.eventValue.cbEventWithProfiling);
+
+    auto newEvent = this->createTestEvent(true, false, true, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    EXPECT_FALSE(static_cast<CbProfilingEventAccessor *>(newEvent)->cbEventWithProfiling);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    EXPECT_TRUE(static_cast<CbProfilingEventAccessor *>(newEvent)->cbEventWithProfiling);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCbSignalTimestampEventWithoutProfilingSignalingWhenMutatingSignalEventThenProfilingFlagIsCleared) {
+    auto event = this->createTestEvent(true, false, true, false, false);
+    ASSERT_NE(nullptr, event);
+
+    this->attachCbEvent(event);
+    ASSERT_FALSE(event->isCbEventWithProfiling());
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, nullptr, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    ASSERT_TRUE(this->variable->desc.eventValue.hasStandaloneProfilingNode);
+    EXPECT_FALSE(this->variable->desc.eventValue.cbEventWithProfiling);
+
+    auto newEvent = this->createTestEvent(true, false, true, false, false);
+    ASSERT_NE(nullptr, newEvent);
+    static_cast<CbProfilingEventAccessor *>(newEvent)->cbEventWithProfiling = true;
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+
+    EXPECT_FALSE(static_cast<CbProfilingEventAccessor *>(newEvent)->cbEventWithProfiling);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCbSignalExternalEventWhenMutatingEventThenDataIsUpdatedAndExternalPropertySet) {
+    auto event = this->createTestEvent(true, false, false, true, false);
+    ASSERT_NE(nullptr, event);
+
+    createVariable(L0::MCL::VariableType::signalEvent, true, -1, -1);
+    auto ret = this->variable->setAsSignalEvent(event, this->mutableComputeWalker.get(), nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    EXPECT_EQ(this->externalEventCounterValue, this->variable->desc.eventValue.inOrderExecBaseSignalValue);
+
+    auto newEvent = this->createTestEvent(true, false, false, true, false);
+    ASSERT_NE(nullptr, newEvent);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+    EXPECT_EQ(this->externalEventCounterValue * 2, newEvent->getInOrderExecBaseSignalValue());
+    EXPECT_EQ(this->externalEventCounterValue * 2, this->variable->desc.eventValue.inOrderExecBaseSignalValue);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenExternalCounterBasedWaitEventWhenMutatingIntoOtherExternalCounterBasedEventThenWaitIsUpdated) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    auto event = this->createTestEvent(true, false, false, true, false);
+    ASSERT_NE(nullptr, event);
+
+    prepareInOrderWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    if (this->qwordIndirect) {
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    auto newEvent = this->createTestEvent(true, false, false, true, false);
+    ASSERT_NE(nullptr, newEvent);
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+    EXPECT_FALSE(this->variable->desc.eventValue.noopState);
+    EXPECT_FALSE(this->variable->desc.eventValue.isCbEventBoundToCmdList);
+    EXPECT_NE(nullptr, this->variable->desc.eventValue.cbEventDeviceCounterAllocation);
+
+    auto expectedWaitAddress = newEvent->getInOrderExecEventHelper().getBaseDeviceAddress() + newEvent->getInOrderAllocationOffset() + this->semWaitOffset;
+
+    auto semWaitCmd = reinterpret_cast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    auto testWaitAddress = UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd);
+    EXPECT_EQ(expectedWaitAddress, testWaitAddress);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenExternalCounterBasedWaitEventWhenNoopingAndRestoringEventThenWaitIsNoopedAndRestored) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    memset(noopSemaphoreSpace, 0, sizeof(MI_SEMAPHORE_WAIT));
+
+    auto event = this->createTestEvent(true, false, false, true, false);
+    ASSERT_NE(nullptr, event);
+
+    prepareInOrderWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    if (this->qwordIndirect) {
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    auto expectedWaitAddress = event->getInOrderExecEventHelper().getBaseDeviceAddress() + event->getInOrderAllocationOffset() + this->semWaitOffset;
+
+    auto newEvent = nullptr;
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, newEvent);
+    EXPECT_TRUE(this->variable->desc.eventValue.noopState);
+    EXPECT_EQ(nullptr, this->variable->desc.eventValue.cbEventDeviceCounterAllocation);
+
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+
+    ret = this->variable->setValue(0, 0, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_EQ(this->variable->desc.eventValue.event, event);
+    EXPECT_FALSE(this->variable->desc.eventValue.noopState);
+    EXPECT_NE(nullptr, this->variable->desc.eventValue.cbEventDeviceCounterAllocation);
+
+    auto semWaitCmd = reinterpret_cast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    auto testWaitAddress = UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd);
+    EXPECT_EQ(expectedWaitAddress, testWaitAddress);
+}
+
+template <typename FamilyType>
+void VariableInOrderFixture::testAsyncMutationWaitEventTest(bool indirect) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    this->mutableCommandList->semaphore64bCmdSupported = !indirect;
+    this->qwordIndirect = indirect;
+    this->asyncMutation = true;
+
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    memset(noopSemaphoreSpace, 0, sizeof(MI_SEMAPHORE_WAIT));
+    alignas(uint32_t) uint8_t noopLriSpace[sizeof(MI_LOAD_REGISTER_IMM)] = {};
+    memset(noopLriSpace, 0, sizeof(MI_LOAD_REGISTER_IMM));
+
+    auto event = this->createTestEvent(true, false, false, true, false);
+    ASSERT_NE(nullptr, event);
+
+    uint64_t gpuDstExpected[3] = {0x0, 0x0, 0x0};
+    if (this->qwordIndirect) {
+        gpuDstExpected[0] = this->gpuDestAddress + 2 * sizeof(MI_LOAD_REGISTER_IMM);
+        gpuDstExpected[1] = this->gpuDestAddress;
+        gpuDstExpected[2] = this->gpuDestAddress + sizeof(MI_LOAD_REGISTER_IMM);
+    } else {
+        gpuDstExpected[0] = this->gpuDestAddress;
+    }
+
+    prepareInOrderWaitCommands<FamilyType>();
+
+    void *hostSrcExpected[3] = {nullptr, nullptr, nullptr};
+    if (this->qwordIndirect) {
+        hostSrcExpected[0] = this->mutableSemaphoreWait->getCommandView();
+        hostSrcExpected[1] = this->mutableLoadRegisterImms[0]->getCommandView();
+        hostSrcExpected[2] = this->mutableLoadRegisterImms[1]->getCommandView();
+    } else {
+        hostSrcExpected[0] = this->mutableSemaphoreWait->getCommandView();
+    }
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->restore();
+        this->mutableLoadRegisterImms[1]->restore();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->restoreWithSemaphoreAddress(event->getInOrderExecEventHelper().getBaseDeviceAddress() + event->getInOrderAllocationOffset());
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    auto expectedWaitAddress = event->getInOrderExecEventHelper().getBaseDeviceAddress() + event->getInOrderAllocationOffset() + this->semWaitOffset;
+
+    ze_event_handle_t newEvent = nullptr;
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_TRUE(this->variable->desc.eventValue.noopState);
+
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->mutableSemaphoreWait->getCommandView(), sizeof(MI_SEMAPHORE_WAIT)));
+    if (this->qwordIndirect) {
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->mutableLoadRegisterImms[0]->getCommandView(), sizeof(MI_LOAD_REGISTER_IMM)));
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->mutableLoadRegisterImms[1]->getCommandView(), sizeof(MI_LOAD_REGISTER_IMM)));
+    }
+
+    auto &asyncPatchContainer = this->mutableCommandList->getBase()->getAsyncPatchContainer();
+    size_t expectedPatchCount = 1u + (this->qwordIndirect ? 2u : 0u);
+    EXPECT_EQ(expectedPatchCount, asyncPatchContainer.size());
+
+    for (uint32_t i = 0; i < asyncPatchContainer.size(); i++) {
+        EXPECT_EQ(gpuDstExpected[i], asyncPatchContainer[i].gpuDestinationAddress);
+        EXPECT_EQ(hostSrcExpected[i], asyncPatchContainer[i].hostSourceAddress);
+    }
+    asyncPatchContainer.clear();
+
+    ret = this->variable->setValue(0, 0, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    EXPECT_FALSE(this->variable->desc.eventValue.noopState);
+
+    auto semWait = genCmdCast<MI_SEMAPHORE_WAIT *>(this->mutableSemaphoreWait->getCommandView());
+    EXPECT_NE(nullptr, semWait);
+    auto testWaitAddress = UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWait);
+    EXPECT_EQ(expectedWaitAddress, testWaitAddress);
+
+    if (this->qwordIndirect) {
+        auto lri0 = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->mutableLoadRegisterImms[0]->getCommandView());
+        EXPECT_NE(nullptr, lri0);
+        auto lri1 = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->mutableLoadRegisterImms[1]->getCommandView());
+        EXPECT_NE(nullptr, lri1);
+    }
+
+    EXPECT_EQ(expectedPatchCount, asyncPatchContainer.size());
+
+    for (uint32_t i = 0; i < asyncPatchContainer.size(); i++) {
+        EXPECT_EQ(gpuDstExpected[i], asyncPatchContainer[i].gpuDestinationAddress);
+        EXPECT_EQ(hostSrcExpected[i], asyncPatchContainer[i].hostSourceAddress);
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedWaitWithIndirectOffEventWhenNoopAndRestoreThenCommandViewUpdatedAndAsyncPatchlistFilled) {
+    testAsyncMutationWaitEventTest<FamilyType>(false);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedExternalWaitWhenEmptyPatchPreambleUsedAndIsSetWithEmptyPatchPreambleThenNoopPatchPreambleSemWaitRemains) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    alignas(uint32_t) uint8_t noopLriSpace[sizeof(MI_LOAD_REGISTER_IMM)] = {};
+
+    auto otherCmdList = this->createMutableCmdList();
+
+    auto event = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, event);
+    this->attachCbEvent(event, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    auto newEvent = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, newEvent);
+    this->attachCbEvent(newEvent, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    this->semWaitOffset = 0;
+    preparePatchPreambleWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    auto &eventValue = this->variable->getDesc().eventValue;
+    EXPECT_TRUE(eventValue.isExternalFlag);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->noop();
+        this->mutableLoadRegisterImms[1]->noop();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->noop();
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+
+    if (this->qwordIndirect) {
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[0], sizeof(MI_LOAD_REGISTER_IMM)));
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[1], sizeof(MI_LOAD_REGISTER_IMM)));
+    }
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedExternalWaitWhenEmptyPatchPreambleUsedAndIsSetWithCounterPatchPreambleThenPatchPreambleSemWaitRestored) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    auto otherCmdList = this->createMutableCmdList();
+
+    auto event = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, event);
+    this->attachCbEvent(event, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    auto newEvent = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, newEvent);
+    this->attachCbEvent(newEvent, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t newCounterValue = 0x1234;
+    auto newCounterLow = getLowPart(newCounterValue);
+
+    uint64_t newGpuAddress = 0x10000;
+    MockGraphicsAllocation newCounterAlloc(0, reinterpret_cast<void *>(newGpuAddress), 0x1000);
+    newEvent->getInOrderExecEventHelper().assignPatchPreambleData(newCounterValue, nullptr, 0, nullptr, newGpuAddress, &newCounterAlloc);
+
+    this->semWaitOffset = 0;
+    preparePatchPreambleWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    auto &eventValue = this->variable->getDesc().eventValue;
+    EXPECT_TRUE(eventValue.isExternalFlag);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->noop();
+        this->mutableLoadRegisterImms[1]->noop();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->noop();
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(newCounterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&newCounterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &newCounterAlloc));
+
+    if (this->qwordIndirect) {
+        constexpr uint32_t firstRegister = 0x2600;
+        constexpr uint32_t secondRegister = 0x2604;
+
+        auto lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[0]);
+        ASSERT_NE(nullptr, lriCmd);
+        EXPECT_EQ(firstRegister, lriCmd->getRegisterOffset());
+        EXPECT_EQ(newCounterLow, lriCmd->getDataDword());
+
+        lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[1]);
+        ASSERT_NE(nullptr, lriCmd);
+        EXPECT_EQ(secondRegister, lriCmd->getRegisterOffset());
+    }
+    auto semWaitCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    ASSERT_NE(nullptr, semWaitCmd);
+    EXPECT_EQ(newGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd));
+    if (this->qwordIndirect == false) {
+        EXPECT_EQ(newCounterValue, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semWaitCmd));
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedExternalWaitWhenCounterPatchPreambleUsedAndIsSetWithEmptyPatchPreambleThenPatchPreambleSemWaitNooped) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    alignas(uint32_t) uint8_t noopLriSpace[sizeof(MI_LOAD_REGISTER_IMM)] = {};
+
+    auto otherCmdList = this->createMutableCmdList();
+
+    auto event = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, event);
+    this->attachCbEvent(event, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t counterValue = 0x1234;
+    uint64_t gpuAddress = 0x10000;
+    MockGraphicsAllocation counterAlloc(0, reinterpret_cast<void *>(gpuAddress), 0x1000);
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, nullptr, 0, nullptr, gpuAddress, &counterAlloc);
+
+    auto newEvent = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, newEvent);
+    this->attachCbEvent(newEvent, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    this->semWaitOffset = 0;
+    preparePatchPreambleWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    // adding counter allocation to residency container is done at MCL level
+    mutableCommandList->addToResidencyContainer(&counterAlloc, false);
+
+    auto &eventValue = this->variable->getDesc().eventValue;
+    EXPECT_TRUE(eventValue.isExternalFlag);
+
+    EXPECT_EQ(counterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&counterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->restore();
+        this->mutableLoadRegisterImms[1]->restore();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->restoreWithSemaphoreAddress(gpuAddress);
+    this->mutableSemaphoreWait->setSemaphoreValue(counterValue);
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(nullptr, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_FALSE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[0], sizeof(MI_LOAD_REGISTER_IMM)));
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[1], sizeof(MI_LOAD_REGISTER_IMM)));
+    }
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedExternalWaitWhenCounterPatchPreambleUsedAndIsSetWithNewCounterPatchPreambleThenPatchPreambleSemWaitUpdated) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    auto otherCmdList = this->createMutableCmdList();
+
+    auto event = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, event);
+    this->attachCbEvent(event, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t counterValue = 0x1000;
+    auto counterLow = getLowPart(counterValue);
+    uint64_t gpuAddress = 0x1A000;
+    MockGraphicsAllocation counterAlloc(0, reinterpret_cast<void *>(gpuAddress), 0x1000);
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, nullptr, 0, nullptr, gpuAddress, &counterAlloc);
+
+    auto newEvent = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, newEvent);
+    this->attachCbEvent(newEvent, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t newCounterValue = 0x1234;
+    auto newCounterLow = getLowPart(newCounterValue);
+    uint64_t newGpuAddress = 0x10000;
+    MockGraphicsAllocation newCounterAlloc(0, reinterpret_cast<void *>(newGpuAddress), 0x1000);
+    newEvent->getInOrderExecEventHelper().assignPatchPreambleData(newCounterValue, nullptr, 0, nullptr, newGpuAddress, &newCounterAlloc);
+
+    this->semWaitOffset = 0;
+    preparePatchPreambleWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    // adding counter allocation to residency container is done at MCL level
+    mutableCommandList->addToResidencyContainer(&counterAlloc, false);
+
+    auto &eventValue = this->variable->getDesc().eventValue;
+    EXPECT_TRUE(eventValue.isExternalFlag);
+
+    EXPECT_EQ(counterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&counterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->restore();
+        this->mutableLoadRegisterImms[0]->setValue(counterLow);
+        this->mutableLoadRegisterImms[1]->restore();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->restoreWithSemaphoreAddress(gpuAddress);
+    if (this->qwordIndirect == false) {
+        this->mutableSemaphoreWait->setSemaphoreValue(counterValue);
+    }
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(newCounterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&newCounterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &newCounterAlloc));
+    EXPECT_FALSE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        constexpr uint32_t firstRegister = 0x2600;
+        constexpr uint32_t secondRegister = 0x2604;
+
+        auto lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[0]);
+        ASSERT_NE(nullptr, lriCmd);
+        EXPECT_EQ(firstRegister, lriCmd->getRegisterOffset());
+        EXPECT_EQ(newCounterLow, lriCmd->getDataDword());
+
+        lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[1]);
+        ASSERT_NE(nullptr, lriCmd);
+        EXPECT_EQ(secondRegister, lriCmd->getRegisterOffset());
+    }
+    auto semWaitCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    ASSERT_NE(nullptr, semWaitCmd);
+    EXPECT_EQ(newGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd));
+    if (this->qwordIndirect == false) {
+        EXPECT_EQ(newCounterValue, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semWaitCmd));
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedExternalWaitWhenCounterPatchPreambleUsedAndIsNoopedAndRestoredWithNewCounterPatchPreambleThenPatchPreambleSemWaitRestored) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    alignas(uint32_t) uint8_t noopLriSpace[sizeof(MI_LOAD_REGISTER_IMM)] = {};
+
+    auto otherCmdList = this->createMutableCmdList();
+
+    auto event = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, event);
+    this->attachCbEvent(event, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t counterValue = 0x1000;
+    auto counterLow = getLowPart(counterValue);
+    uint64_t gpuAddress = 0x1A000;
+    MockGraphicsAllocation counterAlloc(0, reinterpret_cast<void *>(gpuAddress), 0x1000);
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, nullptr, 0, nullptr, gpuAddress, &counterAlloc);
+
+    auto newEvent = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, newEvent);
+    this->attachCbEvent(newEvent, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t newCounterValue = 0x1234;
+    auto newCounterLow = getLowPart(newCounterValue);
+    uint64_t newGpuAddress = 0x10000;
+    MockGraphicsAllocation newCounterAlloc(0, reinterpret_cast<void *>(newGpuAddress), 0x1000);
+    newEvent->getInOrderExecEventHelper().assignPatchPreambleData(newCounterValue, nullptr, 0, nullptr, newGpuAddress, &newCounterAlloc);
+
+    this->semWaitOffset = 0;
+    preparePatchPreambleWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    // adding counter allocation to residency container is done at MCL level
+    mutableCommandList->addToResidencyContainer(&counterAlloc, false);
+
+    auto &eventValue = this->variable->getDesc().eventValue;
+    EXPECT_TRUE(eventValue.isExternalFlag);
+
+    EXPECT_EQ(counterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&counterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->restore();
+        this->mutableLoadRegisterImms[0]->setValue(counterLow);
+        this->mutableLoadRegisterImms[1]->restore();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->restoreWithSemaphoreAddress(gpuAddress);
+    if (this->qwordIndirect == false) {
+        this->mutableSemaphoreWait->setSemaphoreValue(counterValue);
+    }
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    // noop wait event by providing nullptr event
+    ret = this->variable->setValue(0, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(nullptr, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_FALSE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[0], sizeof(MI_LOAD_REGISTER_IMM)));
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[1], sizeof(MI_LOAD_REGISTER_IMM)));
+    }
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(newCounterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&newCounterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &newCounterAlloc));
+
+    if (this->qwordIndirect) {
+        constexpr uint32_t firstRegister = 0x2600;
+        constexpr uint32_t secondRegister = 0x2604;
+
+        auto lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[0]);
+        ASSERT_NE(nullptr, lriCmd);
+        EXPECT_EQ(firstRegister, lriCmd->getRegisterOffset());
+        EXPECT_EQ(newCounterLow, lriCmd->getDataDword());
+
+        lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[1]);
+        ASSERT_NE(nullptr, lriCmd);
+        EXPECT_EQ(secondRegister, lriCmd->getRegisterOffset());
+    }
+    auto semWaitCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+    ASSERT_NE(nullptr, semWaitCmd);
+    EXPECT_EQ(newGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd));
+    if (this->qwordIndirect == false) {
+        EXPECT_EQ(newCounterValue, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semWaitCmd));
+    }
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderTest,
+            givenCounterBasedExternalWaitWhenCounterPatchPreambleUsedAndIsNoopedAndRestoredWithZeroCounterPatchPreambleThenPatchPreambleSemWaitRemainsNooped) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+    alignas(uint32_t) uint8_t noopSemaphoreSpace[sizeof(MI_SEMAPHORE_WAIT)] = {};
+    alignas(uint32_t) uint8_t noopLriSpace[sizeof(MI_LOAD_REGISTER_IMM)] = {};
+
+    auto otherCmdList = this->createMutableCmdList();
+
+    auto event = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, event);
+    this->attachCbEvent(event, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    uint64_t counterValue = 0x1000;
+    auto counterLow = getLowPart(counterValue);
+    uint64_t gpuAddress = 0x1A000;
+    MockGraphicsAllocation counterAlloc(0, reinterpret_cast<void *>(gpuAddress), 0x1000);
+    event->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, nullptr, 0, nullptr, gpuAddress, &counterAlloc);
+
+    auto newEvent = this->createTestEvent(true, false, false, false, true);
+    ASSERT_NE(nullptr, newEvent);
+    this->attachCbEvent(newEvent, static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase()));
+
+    this->semWaitOffset = 0;
+    preparePatchPreambleWaitCommands<FamilyType>();
+
+    createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+    L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+    waitEventVarDesc.event = event;
+    auto ret = this->variable->setAsWaitEvent(waitEventVarDesc);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+    // adding counter allocation to residency container is done at MCL level
+    mutableCommandList->addToResidencyContainer(&counterAlloc, false);
+
+    auto &eventValue = this->variable->getDesc().eventValue;
+    EXPECT_TRUE(eventValue.isExternalFlag);
+
+    EXPECT_EQ(counterValue, eventValue.patchPreambleCounterValue);
+    EXPECT_FALSE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(&counterAlloc, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_TRUE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        this->mutableLoadRegisterImms[0]->restore();
+        this->mutableLoadRegisterImms[0]->setValue(counterLow);
+        this->mutableLoadRegisterImms[1]->restore();
+
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[0].get());
+        this->variable->getLoadRegImmList().push_back(this->mutableLoadRegisterImms[1].get());
+    }
+
+    this->mutableSemaphoreWait->restoreWithSemaphoreAddress(gpuAddress);
+    if (this->qwordIndirect == false) {
+        this->mutableSemaphoreWait->setSemaphoreValue(counterValue);
+    }
+    this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+    // noop wait event by providing nullptr event
+    ret = this->variable->setValue(0, 0, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(nullptr, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_FALSE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[0], sizeof(MI_LOAD_REGISTER_IMM)));
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[1], sizeof(MI_LOAD_REGISTER_IMM)));
+    }
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+
+    ret = this->variable->setValue(0, 0, newEvent);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ret);
+
+    EXPECT_EQ(0u, eventValue.patchPreambleCounterValue);
+    EXPECT_TRUE(eventValue.patchPreambleNoopState);
+    EXPECT_EQ(nullptr, eventValue.patchPreambleCounterDeviceAllocation);
+    EXPECT_FALSE(isAllocationInMutableResidency(mutableCommandList.get(), &counterAlloc));
+
+    if (this->qwordIndirect) {
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[0], sizeof(MI_LOAD_REGISTER_IMM)));
+        EXPECT_EQ(0, memcmp(noopLriSpace, this->loadRegisterImmBuffers[1], sizeof(MI_LOAD_REGISTER_IMM)));
+    }
+    EXPECT_EQ(0, memcmp(noopSemaphoreSpace, this->semaphoreWaitBuffer, sizeof(MI_SEMAPHORE_WAIT)));
+}
+
+struct VariableInOrderRegularWaitFixture : public VariableInOrderFixture {
+    template <typename FamilyType>
+    void testRefreshWithPatchPreambleCounter(bool externalFlag) {
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+        using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
+        // regular wait path is taken only by heapful cmdlists, LRI path is forced wherever qword counter is used
+        static_cast<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>> *>(this->mutableCommandList->getBase())->heaplessModeEnabled = false;
+        this->mutableCommandList->semaphore64bCmdSupported = false;
+        this->qwordIndirect = this->mutableCommandList->isQwordInOrderCounter();
+
+        auto otherCmdList = this->createMutableCmdList();
+        auto otherBaseCmdList = static_cast<L0::ult::MockCommandList *>(otherCmdList->getBase());
+        auto event = this->createTestEvent(true, false, true, false, externalFlag);
+        auto newEvent = this->createTestEvent(true, false, true, false, externalFlag);
+        this->attachCbEvent(event, otherBaseCmdList);
+        this->attachCbEvent(newEvent, otherBaseCmdList);
+        ASSERT_TRUE(newEvent->hasInOrderTimestampNode());
+
+        this->semWaitOffset = 0;
+        preparePatchPreambleWaitCommands<FamilyType>();
+
+        createVariable(L0::MCL::VariableType::waitEvent, true, -1, -1);
+        L0::MCL::WaitEventVariableDescriptor waitEventVarDesc{};
+        waitEventVarDesc.event = event;
+        waitEventVarDesc.waitEventPackets = event->getInOrderExecEventHelper().getEventData()->devicePartitions;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, this->variable->setAsWaitEvent(waitEventVarDesc));
+
+        auto &eventValue = this->variable->getDesc().eventValue;
+        EXPECT_EQ(externalFlag, eventValue.isExternalFlag);
+        EXPECT_TRUE(eventValue.patchPreambleNoopState);
+
+        for (auto &mutableLoadRegisterImm : this->mutableLoadRegisterImms) {
+            mutableLoadRegisterImm->noop();
+            this->variable->getLoadRegImmList().push_back(mutableLoadRegisterImm.get());
+        }
+        this->mutableSemaphoreWait->noop();
+        this->variable->getSemWaitList().push_back(this->mutableSemaphoreWait.get());
+
+        uint64_t counterValue = (3ull << 32) | 4;
+        uint64_t gpuAddress = 0x10000;
+        MockGraphicsAllocation counterAlloc(0, reinterpret_cast<void *>(gpuAddress), 0x1000);
+        newEvent->getInOrderExecEventHelper().assignPatchPreambleData(counterValue, nullptr, 0, nullptr, gpuAddress, &counterAlloc);
+
+        EXPECT_EQ(ZE_RESULT_SUCCESS, this->variable->setValue(0, 0, newEvent));
+        EXPECT_FALSE(eventValue.patchPreambleNoopState);
+
+        auto semWaitCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(this->semaphoreWaitBuffer);
+        ASSERT_NE(nullptr, semWaitCmd);
+        EXPECT_EQ(gpuAddress, UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd));
+
+        if (this->qwordIndirect) {
+            auto lriCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[0]);
+            ASSERT_NE(nullptr, lriCmd);
+            EXPECT_EQ(getLowPart(counterValue), lriCmd->getDataDword());
+
+            auto lriHighCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(this->loadRegisterImmBuffers[1]);
+            ASSERT_NE(nullptr, lriHighCmd);
+            EXPECT_EQ(getHighPart(counterValue), lriHighCmd->getDataDword());
+        } else {
+            EXPECT_EQ(getLowPart(counterValue), semWaitCmd->getSemaphoreDataDword());
+        }
+    }
+};
+
+using VariableInOrderRegularWaitTest = Test<VariableInOrderRegularWaitFixture>;
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderRegularWaitTest,
+            givenExternalCbTimestampEventWhenRefreshingWithEventHavingPatchPreambleCounterThenPatchPreambleCommandsAreProgrammed) {
+    testRefreshWithPatchPreambleCounter<FamilyType>(true);
+}
+
+HWCMDTEST_F(IGFX_XE_HP_CORE,
+            VariableInOrderRegularWaitTest,
+            givenNotExternalCbTimestampEventWhenRefreshingWithEventHavingPatchPreambleCounterThenPatchPreambleCommandsAreProgrammed) {
+    testRefreshWithPatchPreambleCounter<FamilyType>(false);
+}
+
+} // namespace ult
+} // namespace L0

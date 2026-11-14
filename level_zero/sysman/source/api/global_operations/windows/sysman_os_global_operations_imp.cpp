@@ -1,0 +1,221 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/sysman/source/api/global_operations/windows/sysman_os_global_operations_imp.h"
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/preprocessor.h"
+#include "shared/source/os_interface/os_interface.h"
+
+#include "level_zero/sysman/source/device/sysman_device_imp.h"
+#include "level_zero/sysman/source/shared/firmware_util/sysman_firmware_util.h"
+#include "level_zero/sysman/source/shared/windows/sysman_kmd_sys_manager.h"
+
+namespace L0 {
+namespace Sysman {
+
+bool WddmGlobalOperationsImp::getSerialNumber(char (&serialNumber)[ZES_STRING_PROPERTY_SIZE]) {
+    return false;
+}
+
+bool WddmGlobalOperationsImp::getOemSerialNumber(std::array<uint8_t, IGSC_MAX_OEM_SN_LENGTH> &serialNumber, uint16_t &serialNumberLen) {
+    auto pFwInterface = pWddmSysmanImp->getFwUtilInterface();
+    if (pFwInterface == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to get firmware interface\n", NEO_FUNCTION_NAME);
+        return false;
+    }
+
+    ze_result_t result = pFwInterface->fwGetSerialNumber(serialNumber, serialNumberLen);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to read serial number from firmware\n", NEO_FUNCTION_NAME);
+        return false;
+    }
+    return true;
+}
+
+bool WddmGlobalOperationsImp::getBoardNumber(char (&boardNumber)[ZES_STRING_PROPERTY_SIZE]) {
+    return false;
+}
+
+void WddmGlobalOperationsImp::getBrandName(char (&brandName)[ZES_STRING_PROPERTY_SIZE]) {
+}
+
+void WddmGlobalOperationsImp::getModelName(char (&modelName)[ZES_STRING_PROPERTY_SIZE]) {
+}
+
+void WddmGlobalOperationsImp::getVendorName(char (&vendorName)[ZES_STRING_PROPERTY_SIZE]) {
+}
+
+void WddmGlobalOperationsImp::getDriverVersion(char (&driverVersion)[ZES_STRING_PROPERTY_SIZE]) {
+}
+
+void WddmGlobalOperationsImp::getRepairStatus(zes_device_state_t *pState) {
+}
+
+void WddmGlobalOperationsImp::getTimerResolution(double *pTimerResolution) {
+    *pTimerResolution = pWddmSysmanImp->getSysmanDeviceImp()->getTimerResolution();
+}
+
+bool WddmGlobalOperationsImp::getUuid(std::array<uint8_t, CommonConstants::uuidSize> &uuid) {
+    if (pWddmSysmanImp->getSysmanDeviceImp()->getRootDeviceEnvironment().osInterface != nullptr) {
+        auto driverModel = pWddmSysmanImp->getSysmanDeviceImp()->getRootDeviceEnvironment().osInterface->getDriverModel();
+        if (!this->uuid.isValid) {
+            NEO::PhysicalDevicePciBusInfo pciBusInfo = driverModel->getPciBusInfo();
+            this->uuid.isValid = generateUuidFromPciBusInfo(pciBusInfo, this->uuid.id);
+        }
+
+        if (this->uuid.isValid) {
+            uuid = this->uuid.id;
+        }
+    }
+
+    return this->uuid.isValid;
+}
+
+bool WddmGlobalOperationsImp::generateUuidFromPciBusInfo(const NEO::PhysicalDevicePciBusInfo &pciBusInfo, std::array<uint8_t, CommonConstants::uuidSize> &uuid) {
+    if (pciBusInfo.pciDomain != NEO::PhysicalDevicePciBusInfo::invalidValue) {
+        uuid.fill(0);
+
+        // Device UUID uniquely identifies a device within a system.
+        // We generate it based on device information along with PCI information
+        // This guarantees uniqueness of UUIDs on a system even when multiple
+        // identical Intel GPUs are present.
+        //
+
+        // We want to have UUID matching between different GPU APIs (including outside
+        // of compute_runtime project - i.e. other than L0 or OCL). This structure definition
+        // has been agreed upon by various Intel driver teams.
+        //
+        // Consult other driver teams before changing this.
+        //
+
+        struct DeviceUUID {
+            uint16_t vendorID;
+            uint16_t deviceID;
+            uint16_t revisionID;
+            uint16_t pciDomain;
+            uint8_t pciBus;
+            uint8_t pciDev;
+            uint8_t pciFunc;
+            uint8_t reserved[4];
+            uint8_t subDeviceID;
+        };
+
+        auto &hwInfo = pWddmSysmanImp->getSysmanDeviceImp()->getHardwareInfo();
+        DeviceUUID deviceUUID = {};
+        deviceUUID.vendorID = 0x8086; // Intel
+        deviceUUID.deviceID = hwInfo.platform.usDeviceID;
+        deviceUUID.revisionID = hwInfo.platform.usRevId;
+        deviceUUID.pciDomain = static_cast<uint16_t>(pciBusInfo.pciDomain);
+        deviceUUID.pciBus = static_cast<uint8_t>(pciBusInfo.pciBus);
+        deviceUUID.pciDev = static_cast<uint8_t>(pciBusInfo.pciDevice);
+        deviceUUID.pciFunc = static_cast<uint8_t>(pciBusInfo.pciFunction);
+        deviceUUID.subDeviceID = 0;
+
+        static_assert(sizeof(DeviceUUID) == CommonConstants::uuidSize);
+
+        memcpy_s(uuid.data(), CommonConstants::uuidSize, &deviceUUID, sizeof(DeviceUUID));
+
+        return true;
+    }
+
+    return false;
+}
+
+ze_bool_t WddmGlobalOperationsImp::getDeviceInfoByUuid(zes_uuid_t uuid, ze_bool_t *onSubdevice, uint32_t *subdeviceId) {
+    std::array<uint8_t, CommonConstants::uuidSize> deviceUuid;
+    bool uuidValid = getUuid(deviceUuid);
+    if (uuidValid) {
+        if (0 == std::memcmp(uuid.id, deviceUuid.data(), ZE_MAX_DEVICE_UUID_SIZE)) {
+            *onSubdevice = false;
+            *subdeviceId = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+ze_result_t WddmGlobalOperationsImp::getSubDeviceProperties(uint32_t *pCount, zes_subdevice_exp_properties_t *pSubdeviceProps) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+void WddmGlobalOperationsImp::getDriverName(char (&driverVersion)[ZES_STRING_PROPERTY_SIZE]) {
+    std::string driverName = "WDDM";
+    strncpy_s(driverVersion, ZES_STRING_PROPERTY_SIZE, driverName.c_str(), driverName.size());
+    driverVersion[driverName.size()] = '\0';
+}
+
+ze_result_t WddmGlobalOperationsImp::reset(ze_bool_t force) {
+    uint32_t value = 0;
+    KmdSysman::RequestProperty request;
+    KmdSysman::ResponseProperty response;
+    request.commandId = KmdSysman::Command::Set;
+    request.componentId = KmdSysman::Component::GlobalOperationsComponent;
+    request.requestId = KmdSysman::Requests::GlobalOperation::TriggerDeviceLevelReset;
+    request.dataSize = sizeof(uint32_t);
+    value = static_cast<uint32_t>(force);
+    memcpy_s(request.dataBuffer, sizeof(uint32_t), &value, sizeof(uint32_t));
+    ze_result_t result = pKmdSysManager->requestSingle(request, response);
+    if (result == ZE_RESULT_SUCCESS) {
+        pWddmSysmanImp->getSysmanDeviceImp()->isDeviceInSurvivabilityMode = false;
+    }
+    return result;
+}
+
+ze_result_t WddmGlobalOperationsImp::resetExt(zes_reset_properties_t *pProperties) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::scanProcessesState(std::vector<zes_process_state_t> &pProcessList) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::deviceGetState(zes_device_state_t *pState) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::memoryGetPageOfflineStateExp(zes_intel_mem_page_status_exp_t pageStatus, uint32_t *pCount, zes_intel_mem_page_info_exp_t *pPageOfflineInfo) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::getMaxMemoryOfflinePages(uint32_t *pMaxOfflinePages) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::getSocUid(zes_uuid_t *pSocUid) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::getDeviceHealthStatus(zes_device_health_status_ext_t *pHealth) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::setDeviceHealthStatus(zes_device_health_status_ext_t health) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t WddmGlobalOperationsImp::getPowerOffReasonExp(zes_intel_device_power_off_reason_exp_t *pReason) {
+    return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+std::string WddmGlobalOperationsImp::getGpuGeneration() {
+    return "unknown";
+}
+
+WddmGlobalOperationsImp::WddmGlobalOperationsImp(OsSysman *pOsSysman) {
+    pWddmSysmanImp = static_cast<WddmSysmanImp *>(pOsSysman);
+    pKmdSysManager = &pWddmSysmanImp->getKmdSysManager();
+}
+
+OsGlobalOperations *OsGlobalOperations::create(OsSysman *pOsSysman) {
+    WddmGlobalOperationsImp *pWddmGlobalOperationsImp = new WddmGlobalOperationsImp(pOsSysman);
+    return static_cast<OsGlobalOperations *>(pWddmGlobalOperationsImp);
+}
+
+} // namespace Sysman
+} // namespace L0

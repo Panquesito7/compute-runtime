@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,8 @@
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/os_interface/product_helper.h"
 
 using namespace NEO;
 
@@ -39,6 +40,10 @@ bool TestChecks::fullySupportsBlitter(const RootDeviceEnvironment &rootDeviceEnv
     return false;
 }
 
+bool TestChecks::allowsDcFlush(const Device *device) {
+    return device->getProductHelper().isDcFlushAllowed();
+}
+
 bool TestChecks::supportsImages(const HardwareInfo &hardwareInfo) {
     return hardwareInfo.capabilityTable.supportsImages;
 }
@@ -47,12 +52,6 @@ bool TestChecks::supportsImages(const std::unique_ptr<HardwareInfo> &pHardwareIn
     return supportsImages(*pHardwareInfo);
 }
 
-bool TestChecks::supportsSvm(const HardwareInfo *pHardwareInfo) {
-    return pHardwareInfo->capabilityTable.ftrSvm;
-}
-bool TestChecks::supportsSvm(const std::unique_ptr<HardwareInfo> &pHardwareInfo) {
-    return supportsSvm(pHardwareInfo.get());
-}
-bool TestChecks::supportsSvm(const Device *pDevice) {
-    return supportsSvm(&pDevice->getHardwareInfo());
+bool TestChecks::isIntegrated(const HardwareInfo &hardwareInfo) {
+    return hardwareInfo.capabilityTable.isIntegratedDevice;
 }

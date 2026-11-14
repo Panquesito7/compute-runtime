@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,17 +7,21 @@
 
 #include "opencl/source/mem_obj/mem_obj.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/bit_helpers.h"
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/utilities/buffer_pool_allocator.inl"
+#include "shared/source/utilities/heap_allocator.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/get_info_status_mapper.h"
 #include "opencl/source/helpers/mipmap.h"
+#include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/sharings/sharing.h"
 
 #include <algorithm>
@@ -76,10 +80,12 @@ MemObj::~MemObj() {
             peekSharingHandler()->releaseReusedGraphicsAllocation();
         }
 
-        needWait |= multiGraphicsAllocation.getGraphicsAllocations().size() > 1u;
-        for (auto graphicsAllocation : multiGraphicsAllocation.getGraphicsAllocations()) {
-            auto rootDeviceIndex = graphicsAllocation ? graphicsAllocation->getRootDeviceIndex() : 0;
-            bool doAsyncDestructions = DebugManager.flags.EnableAsyncDestroyAllocations.get();
+        const auto &graphicsAllocations = multiGraphicsAllocation.getGraphicsAllocations();
+        needWait |= graphicsAllocations.size() > 1u;
+        for (auto rootDeviceIndex = 0u; rootDeviceIndex < graphicsAllocations.size(); ++rootDeviceIndex) {
+            auto graphicsAllocation = graphicsAllocations[rootDeviceIndex];
+
+            bool doAsyncDestructions = debugManager.flags.EnableAsyncDestroyAllocations.get() && !this->memoryProperties.flags.useHostPtr;
             if (graphicsAllocation && !associatedMemObject && !isHostPtrSVM && graphicsAllocation->peekReuseCount() == 0) {
                 memoryManager->removeAllocationFromHostPtrManager(graphicsAllocation);
                 if (!doAsyncDestructions) {
@@ -89,18 +95,20 @@ MemObj::~MemObj() {
                     memoryManager->waitForEnginesCompletion(*graphicsAllocation);
                 }
                 destroyGraphicsAllocation(graphicsAllocation, doAsyncDestructions);
-                graphicsAllocation = nullptr;
             }
             if (!associatedMemObject) {
                 releaseMapAllocation(rootDeviceIndex, doAsyncDestructions);
             }
             if (mcsAllocation) {
                 destroyGraphicsAllocation(mcsAllocation, false);
+                mcsAllocation = nullptr;
             }
         }
         if (associatedMemObject) {
+            context->forEachBufferPoolAllocator([this](auto &bufferPoolAllocator) {
+                bufferPoolAllocator.tryFreeFromPoolBuffer(this->associatedMemObject, this->offset, this->sizeInPoolAllocator);
+            });
             associatedMemObject->decRefInternal();
-            context->getBufferPoolAllocator().tryFreeFromPoolBuffer(associatedMemObject, this->offset, this->sizeInPoolAllocator);
         }
         if (!associatedMemObject) {
             releaseAllocatedMapPtr();
@@ -109,7 +117,7 @@ MemObj::~MemObj() {
 
     destructorCallbacks.invoke(this);
 
-    const bool needDecrementContextRefCount = !context->getBufferPoolAllocator().isPoolBuffer(this);
+    const bool needDecrementContextRefCount = !context->isPoolBuffer(this);
     if (needDecrementContextRefCount) {
         context->decRefInternal();
     }
@@ -123,13 +131,19 @@ cl_int MemObj::getMemObjectInfo(cl_mem_info paramName,
     size_t srcParamSize = GetInfo::invalidSourceSize;
     void *srcParam = nullptr;
     cl_bool usesSVMPointer;
+    size_t clOffset = 0;
     cl_uint refCnt = 0;
     cl_uint mapCount = 0;
     cl_mem clAssociatedMemObject = static_cast<cl_mem>(this->associatedMemObject);
     cl_context ctx = nullptr;
     uint64_t internalHandle = 0llu;
-    auto allocation = getMultiGraphicsAllocation().getDefaultGraphicsAllocation();
+    auto allocation = multiGraphicsAllocation.getGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex());
+    if (allocation == nullptr) {
+        allocation = multiGraphicsAllocation.getDefaultGraphicsAllocation();
+    }
     cl_bool usesCompression;
+    size_t extendedSize = 0;
+    size_t extendedTailSize = 0;
 
     switch (paramName) {
     case CL_MEM_TYPE:
@@ -145,6 +159,9 @@ cl_int MemObj::getMemObjectInfo(cl_mem_info paramName,
     case CL_MEM_SIZE:
         srcParamSize = sizeof(size);
         srcParam = &size;
+        if ((memObjectType == CL_MEM_OBJECT_BUFFER) && Buffer::getExtendedTailRegion(size, extendedSize, extendedTailSize)) {
+            srcParam = &extendedSize;
+        }
         break;
 
     case CL_MEM_HOST_PTR:
@@ -165,19 +182,20 @@ cl_int MemObj::getMemObjectInfo(cl_mem_info paramName,
         break;
 
     case CL_MEM_OFFSET:
+        clOffset = this->getOffset();
         if (nullptr != this->associatedMemObject) {
-            if (this->getContext()->getBufferPoolAllocator().isPoolBuffer(this->associatedMemObject)) {
-                offset = 0;
+            if (this->getContext()->isPoolBuffer(this->associatedMemObject)) {
+                clOffset = 0;
             } else {
-                offset -= this->associatedMemObject->getOffset();
+                clOffset -= this->associatedMemObject->getOffset();
             }
         }
-        srcParamSize = sizeof(offset);
-        srcParam = &offset;
+        srcParamSize = sizeof(clOffset);
+        srcParam = &clOffset;
         break;
 
     case CL_MEM_ASSOCIATED_MEMOBJECT:
-        if (this->getContext()->getBufferPoolAllocator().isPoolBuffer(this->associatedMemObject)) {
+        if (this->getContext()->isPoolBuffer(this->associatedMemObject)) {
             clAssociatedMemObject = nullptr;
         }
         srcParamSize = sizeof(clAssociatedMemObject);
@@ -196,11 +214,15 @@ cl_int MemObj::getMemObjectInfo(cl_mem_info paramName,
         srcParam = &refCnt;
         break;
 
-    case CL_MEM_ALLOCATION_HANDLE_INTEL:
-        multiGraphicsAllocation.getDefaultGraphicsAllocation()->peekInternalHandle(this->memoryManager, internalHandle);
+    case CL_MEM_ALLOCATION_HANDLE_INTEL: {
+        auto retVal = allocation->peekInternalHandle(this->memoryManager, internalHandle, nullptr);
+        if (retVal != 0) {
+            return CL_OUT_OF_RESOURCES;
+        }
         srcParamSize = sizeof(internalHandle);
         srcParam = &internalHandle;
         break;
+    }
 
     case CL_MEM_USES_COMPRESSION_INTEL:
         usesCompression = allocation->isCompressionEnabled();
@@ -262,6 +284,10 @@ bool MemObj::isMemObjUncacheable() const {
 
 bool MemObj::isMemObjUncacheableForSurfaceState() const {
     return isAnyBitSet(flagsIntel, CL_MEM_LOCALLY_UNCACHED_SURFACE_STATE_RESOURCE | CL_MEM_LOCALLY_UNCACHED_RESOURCE);
+}
+
+bool MemObj::isMemObjDisplayable() const {
+    return this->isDisplayable;
 }
 
 GraphicsAllocation *MemObj::getGraphicsAllocation(uint32_t rootDeviceIndex) const {
@@ -378,14 +404,15 @@ void *MemObj::getBasePtrForMap(uint32_t rootDeviceIndex) {
         if (getMapAllocation(rootDeviceIndex)) {
             return getMapAllocation(rootDeviceIndex)->getUnderlyingBuffer();
         } else {
+            const auto hostMapStorageSize = this->getHostMapStorageSize();
             auto memory = getAllocatedMapPtr();
             if (!memory) {
-                memory = memoryManager->allocateSystemMemory(getSize(), MemoryConstants::pageSize);
+                memory = memoryManager->allocateSystemMemory(hostMapStorageSize, MemoryConstants::pageSize);
                 setAllocatedMapPtr(memory);
             }
             AllocationProperties properties{rootDeviceIndex,
                                             false, // allocateMemory
-                                            getSize(), AllocationType::MAP_ALLOCATION,
+                                            hostMapStorageSize, AllocationType::mapAllocation,
                                             false, // isMultiStorageAllocation
                                             context->getDeviceBitfieldForAllocation(rootDeviceIndex)};
 
@@ -426,8 +453,26 @@ bool MemObj::isTiledAllocation() const {
 
 bool MemObj::mappingOnCpuAllowed() const {
     auto graphicsAllocation = multiGraphicsAllocation.getDefaultGraphicsAllocation();
-    return !isTiledAllocation() && !peekSharingHandler() && !isMipMapped(this) && !DebugManager.flags.DisableZeroCopyForBuffers.get() &&
-           !graphicsAllocation->isCompressionEnabled() && MemoryPoolHelper::isSystemMemoryPool(graphicsAllocation->getMemoryPool());
+    return !isTiledAllocation() && !peekSharingHandler() && !isMipMapped(this) && !debugManager.flags.DisableZeroCopyForBuffers.get() &&
+           !graphicsAllocation->isCompressionEnabled() && MemoryPoolHelper::isSystemMemoryPool(graphicsAllocation->getMemoryPool()) &&
+           allowCpuForMapUnmap();
+}
+
+bool MemObj::allowCpuAccess() const {
+    auto graphicsAllocation = this->multiGraphicsAllocation.getDefaultGraphicsAllocation();
+    if (graphicsAllocation->getDefaultGmm() == nullptr) {
+        return true;
+    }
+
+    return !graphicsAllocation->getDefaultGmm()->getPreferNoCpuAccess();
+}
+
+bool MemObj::allowCpuForMapUnmap() const {
+    auto ret = allowCpuAccess();
+    if (debugManager.flags.AllowZeroCopyWithoutCoherency.get() != -1) {
+        ret = debugManager.flags.AllowZeroCopyWithoutCoherency.get();
+    }
+    return ret;
 }
 
 void MemObj::storeProperties(const cl_mem_properties *properties) {

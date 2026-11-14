@@ -1,18 +1,20 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/commands/bxml_generator_glue.h"
 #include "shared/source/device/device.h"
+#include "shared/source/os_interface/performance_counters.h"
 #include "shared/test/common/mocks/mock_device.h"
 
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <vector>
 
 namespace NEO {
 
@@ -32,41 +34,6 @@ using MetricsLibraryApi::GpuMemory_1_0;
 using MetricsLibraryApi::QueryHandle_1_0;
 
 //////////////////////////////////////////////////////
-// MI_REPORT_PERF_COUNT definition for all GENs
-//////////////////////////////////////////////////////
-struct MI_REPORT_PERF_COUNT { // NOLINT(readability-identifier-naming)
-    uint32_t dwordLength : BITFIELD_RANGE(0, 5);
-    uint32_t reserved6 : BITFIELD_RANGE(6, 22);
-    uint32_t miCommandOpcode : BITFIELD_RANGE(23, 28);
-    uint32_t commandType : BITFIELD_RANGE(29, 31);
-    uint64_t useGlobalGtt : BITFIELD_RANGE(0, 0);
-    uint64_t reserved33 : BITFIELD_RANGE(1, 3);
-    uint64_t coreModeEnable : BITFIELD_RANGE(4, 4);
-    uint64_t reserved37 : BITFIELD_RANGE(5, 5);
-    uint64_t memoryAddress : BITFIELD_RANGE(6, 63);
-    uint32_t reportId;
-
-    typedef enum tagDWORD_LENGTH {
-        DWORD_LENGTH_EXCLUDES_DWORD_0_1 = 0x2,
-    } DWORD_LENGTH;
-
-    typedef enum tagMI_COMMAND_OPCODE {
-        MI_COMMAND_OPCODE_MI_REPORT_PERF_COUNT = 0x28,
-    } MI_COMMAND_OPCODE;
-
-    typedef enum tagCOMMAND_TYPE {
-        COMMAND_TYPE_MI_COMMAND = 0x0,
-    } COMMAND_TYPE;
-
-    inline void init(void) {
-        memset(this, 0, sizeof(MI_REPORT_PERF_COUNT));
-        dwordLength = DWORD_LENGTH_EXCLUDES_DWORD_0_1;
-        miCommandOpcode = MI_COMMAND_OPCODE_MI_REPORT_PERF_COUNT;
-        commandType = COMMAND_TYPE_MI_COMMAND;
-    }
-};
-
-//////////////////////////////////////////////////////
 // MockMetricsLibrary
 //////////////////////////////////////////////////////
 class MockMetricsLibrary : public MetricsLibrary {
@@ -76,6 +43,7 @@ class MockMetricsLibrary : public MetricsLibrary {
     uint32_t queryCount = 0;
     bool validOpen = true;
     bool validGetData = true;
+    std::vector<CommandBufferData_1_0> commandBufferGetCalls;
 
     // Library open / close functions.
     bool open() override;
@@ -191,6 +159,7 @@ class MockMetricsLibraryDll : public OsLibrary {
 
     void *getProcAddress(const std::string &procName) override;
     bool isLoaded() override;
+    std::string getFullPath() override;
 };
 
 //////////////////////////////////////////////////////
@@ -225,8 +194,6 @@ struct PerformanceCountersFixture {
     std::unique_ptr<MockContext> context;
     std::unique_ptr<MockCommandQueue> queue;
     std::unique_ptr<MockExecutionEnvironment> executionEnvironment;
-    std::unique_ptr<RootDeviceEnvironment> rootDeviceEnvironment;
-    std::unique_ptr<OSInterface> osInterface;
 };
 
 //////////////////////////////////////////////////////

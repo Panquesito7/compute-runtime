@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,10 +10,10 @@
 namespace NEO {
 
 template <typename GfxFamily>
-const AuxTranslationMode UnitTestHelper<GfxFamily>::requiredAuxTranslationMode = AuxTranslationMode::Blit;
+const AuxTranslationMode UnitTestHelper<GfxFamily>::requiredAuxTranslationMode = AuxTranslationMode::blit;
 
 template <typename GfxFamily>
-GenCmdList::iterator UnitTestHelper<GfxFamily>::findMidThreadPreemptionAllocationCommand(GenCmdList::iterator begin, GenCmdList::iterator end) {
+GenCmdList::iterator UnitTestHelper<GfxFamily>::findCsrBaseAddressCommand(GenCmdList::iterator begin, GenCmdList::iterator end) {
     return end;
 }
 
@@ -26,11 +26,6 @@ std::vector<GenCmdList::iterator> UnitTestHelper<GfxFamily>::findAllMidThreadPre
 template <typename GfxFamily>
 bool UnitTestHelper<GfxFamily>::timestampRegisterHighAddress() {
     return false;
-}
-
-template <typename GfxFamily>
-void UnitTestHelper<GfxFamily>::setExtraMidThreadPreemptionFlag(HardwareInfo &hwInfo, bool value) {
-    hwInfo.featureTable.flags.ftrGpGpuMidThreadLevelPreempt = value;
 }
 
 template <typename GfxFamily>

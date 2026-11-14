@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,7 @@
 #include "shared/source/memory_manager/local_memory_usage.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 
-#include "third_party/gtest/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 namespace NEO {
 
@@ -70,7 +70,7 @@ TEST(localMemoryUsageTest, givenOverrideLeastOccupiedBankDebugFlagWhenGetLeastOc
     EXPECT_EQ(0u, bankIndex);
 
     uint32_t forcedBankIndex = 64u;
-    DebugManager.flags.OverrideLeastOccupiedBank.set(static_cast<int32_t>(forcedBankIndex));
+    debugManager.flags.OverrideLeastOccupiedBank.set(static_cast<int32_t>(forcedBankIndex));
     bankIndex = selector.getLeastOccupiedBank(selector.bitfield);
     EXPECT_EQ(forcedBankIndex, bankIndex);
 }

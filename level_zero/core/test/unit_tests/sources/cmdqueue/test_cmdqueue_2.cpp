@@ -1,31 +1,55 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/scratch_space_controller_base.h"
 #include "shared/source/command_stream/scratch_space_controller_xehp_and_later.h"
 #include "shared/source/command_stream/wait_status.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/utilities/buffer_pool_allocator.inl"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
-#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_host_function_allocator.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
 #include "shared/test/common/mocks/mock_memory_operations_handler.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_context.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
+#include "level_zero/core/source/context/context.h"
 #include "level_zero/core/test/unit_tests/fixtures/aub_csr_fixture.h"
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_module.h"
 
-#include "test_traits_common.h"
+using namespace NEO;
+#include "shared/test/common/test_macros/heapless_matchers.h"
+
+namespace L0 {
+template <GFXCORE_FAMILY gfxCoreFamily>
+struct CommandListCoreFamily;
+} // namespace L0
+namespace NEO {
+class InternalAllocationStorage;
+class ScratchSpaceController;
+enum QueueThrottle : uint32_t;
+template <typename GfxFamily>
+class UltAubCommandStreamReceiver;
+} // namespace NEO
 
 namespace L0 {
 namespace ult {
@@ -85,11 +109,11 @@ HWTEST_F(ContextCreateCommandQueueTest, givenRootDeviceAndImplicitScalingDisable
     auto &subDevice0 = *deviceFactory.subDevices[0];
     rootDevice.regularEngineGroups.resize(1);
     subDevice0.getRegularEngineGroups().push_back(NEO::EngineGroupT{});
-    subDevice0.getRegularEngineGroups().back().engineGroupType = EngineGroupType::Compute;
+    subDevice0.getRegularEngineGroups().back().engineGroupType = EngineGroupType::compute;
     subDevice0.getRegularEngineGroups().back().engines.resize(1);
     subDevice0.getRegularEngineGroups().back().engines[0].commandStreamReceiver = &rootDevice.getGpgpuCommandStreamReceiver();
     auto ordinal = static_cast<uint32_t>(subDevice0.getRegularEngineGroups().size() - 1);
-    Mock<L0::DeviceImp> l0RootDevice(&rootDevice, rootDevice.getExecutionEnvironment());
+    MockDeviceImp l0RootDevice(&rootDevice);
 
     l0RootDevice.driverHandle = driverHandle.get();
 
@@ -112,27 +136,57 @@ HWTEST_F(ContextCreateCommandQueueTest, givenRootDeviceAndImplicitScalingDisable
 
 using AubCsrTest = Test<AubCsrFixture>;
 
-HWTEST_TEMPLATED_F(AubCsrTest, givenAubCsrWhenCallingExecuteCommandListsThenPollForCompletionIsCalled) {
+HWTEST_TEMPLATED_F(AubCsrTest, givenAubCsrSyncQueueAndKmdWaitWhenCallingExecuteCommandListsThenPollForCompletionIsCalled) {
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.OverrideUseKmdWaitFunction.set(1);
+
     auto csr = neoDevice->getDefaultEngine().commandStreamReceiver;
     ze_result_t returnValue;
     ze_command_queue_desc_t desc = {};
+    desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
     ze_command_queue_handle_t commandQueue = {};
     ze_result_t res = context->createCommandQueue(device, &desc, &commandQueue);
     ASSERT_EQ(ZE_RESULT_SUCCESS, res);
     ASSERT_NE(nullptr, commandQueue);
 
     auto aubCsr = static_cast<NEO::UltAubCommandStreamReceiver<FamilyType> *>(csr);
-    CommandQueue *queue = static_cast<CommandQueue *>(L0::CommandQueue::fromHandle(commandQueue));
+    auto queue = L0::CommandQueue::fromHandle(commandQueue);
     EXPECT_EQ(aubCsr->pollForCompletionCalled, 0u);
 
-    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(productFamily, device, NEO::EngineGroupType::Compute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false));
     ASSERT_NE(nullptr, commandList);
 
     auto commandListHandle = commandList->toHandle();
     commandList->close();
-
-    queue->executeCommandLists(1, &commandListHandle, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    queue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
     EXPECT_EQ(aubCsr->pollForCompletionCalled, 1u);
+
+    L0::CommandQueue::fromHandle(commandQueue)->destroy();
+}
+
+HWTEST_TEMPLATED_F(AubCsrTest, givenAubCsrAndAsyncQueueWhenCallingExecuteCommandListsThenPollForCompletionIsNotCalled) {
+    auto csr = neoDevice->getDefaultEngine().commandStreamReceiver;
+    ze_result_t returnValue;
+    ze_command_queue_desc_t desc = {};
+    desc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+    ze_command_queue_handle_t commandQueue = {};
+    ze_result_t res = context->createCommandQueue(device, &desc, &commandQueue);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, res);
+    ASSERT_NE(nullptr, commandQueue);
+
+    auto aubCsr = static_cast<NEO::UltAubCommandStreamReceiver<FamilyType> *>(csr);
+    auto queue = L0::CommandQueue::fromHandle(commandQueue);
+    EXPECT_EQ(aubCsr->pollForCompletionCalled, 0u);
+
+    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false));
+    ASSERT_NE(nullptr, commandList);
+
+    auto commandListHandle = commandList->toHandle();
+    commandList->close();
+    CommandListExecutionInternalOptions internalOptions = {};
+    queue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(aubCsr->pollForCompletionCalled, 0u);
 
     L0::CommandQueue::fromHandle(commandQueue)->destroy();
 }
@@ -166,7 +220,7 @@ struct SynchronizeCsr : public NEO::UltCommandStreamReceiver<GfxFamily> {
     uint32_t waitForTaskCountWithKmdNotifyFallbackCalled = 0;
     uint32_t partitionCountSet = 0;
     bool enableTimeoutSet = false;
-    WaitStatus waitForCompletionWithTimeoutResult = WaitStatus::Ready;
+    WaitStatus waitForCompletionWithTimeoutResult = WaitStatus::ready;
 };
 
 template <typename GfxFamily>
@@ -207,7 +261,7 @@ HWTEST_F(CommandQueueSynchronizeTest, givenCallToSynchronizeThenCorrectEnableTim
 HWTEST_F(CommandQueueSynchronizeTest, givenGpuHangWhenCallingSynchronizeThenErrorIsPropagated) {
     auto csr = std::unique_ptr<SynchronizeCsr<FamilyType>>(new SynchronizeCsr<FamilyType>(*device->getNEODevice()->getExecutionEnvironment(),
                                                                                           device->getNEODevice()->getDeviceBitfield()));
-    csr->waitForCompletionWithTimeoutResult = NEO::WaitStatus::GpuHang;
+    csr->waitForCompletionWithTimeoutResult = NEO::WaitStatus::gpuHang;
 
     ze_command_queue_desc_t desc{};
     ze_command_queue_handle_t commandQueue{};
@@ -232,11 +286,11 @@ HWTEST_F(CommandQueueSynchronizeTest, givenGpuHangWhenCallingSynchronizeThenErro
 
 HWTEST_F(CommandQueueSynchronizeTest, givenDebugOverrideEnabledAndGpuHangWhenCallingSynchronizeThenErrorIsPropagated) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.OverrideUseKmdWaitFunction.set(1);
+    NEO::debugManager.flags.OverrideUseKmdWaitFunction.set(1);
 
     auto csr = std::unique_ptr<SynchronizeCsr<FamilyType>>(new SynchronizeCsr<FamilyType>(*device->getNEODevice()->getExecutionEnvironment(),
                                                                                           device->getNEODevice()->getDeviceBitfield()));
-    csr->waitForCompletionWithTimeoutResult = NEO::WaitStatus::GpuHang;
+    csr->waitForCompletionWithTimeoutResult = NEO::WaitStatus::gpuHang;
 
     ze_command_queue_desc_t desc{};
     ze_command_queue_handle_t commandQueue{};
@@ -261,7 +315,7 @@ HWTEST_F(CommandQueueSynchronizeTest, givenDebugOverrideEnabledAndGpuHangWhenCal
 
 HWTEST_F(CommandQueueSynchronizeTest, givenDebugOverrideEnabledWhenCallToSynchronizeThenCorrectEnableTimeoutAndTimeoutValuesAreUsed) {
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.OverrideUseKmdWaitFunction.set(1);
+    NEO::debugManager.flags.OverrideUseKmdWaitFunction.set(1);
 
     auto csr = std::unique_ptr<SynchronizeCsr<FamilyType>>(new SynchronizeCsr<FamilyType>(*device->getNEODevice()->getExecutionEnvironment(),
                                                                                           device->getNEODevice()->getDeviceBitfield()));
@@ -294,23 +348,19 @@ HWTEST_F(CommandQueueSynchronizeTest, givenDebugOverrideEnabledWhenCallToSynchro
     L0::CommandQueue::fromHandle(commandQueue)->destroy();
 }
 
-HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenMultiplePartitionCountWhenCallingSynchronizeThenExpectTheSameNumberCsrSynchronizeCalls, IsAtLeastXeHpCore) {
+HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenMultiplePartitionCountWhenCallingSynchronizeThenExpectTheSameNumberCsrSynchronizeCalls, IsAtLeastXeCore) {
     const ze_command_queue_desc_t desc{};
     ze_result_t returnValue;
 
     auto csr = reinterpret_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
-    if (device->getNEODevice()->getPreemptionMode() == PreemptionMode::MidThread || device->getNEODevice()->isDebuggerActive()) {
-        csr->createPreemptionAllocation();
-    }
-    EXPECT_NE(0u, csr->getPostSyncWriteOffset());
+    EXPECT_NE(0u, csr->getImmWritePostSyncWriteOffset());
     volatile TagAddressType *tagAddress = csr->getTagAddress();
     for (uint32_t i = 0; i < 2; i++) {
         *tagAddress = 0xFF;
-        tagAddress = ptrOffset(tagAddress, csr->getPostSyncWriteOffset());
+        tagAddress = ptrOffset(tagAddress, csr->getImmWritePostSyncWriteOffset());
     }
     csr->activePartitions = 2u;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
@@ -321,14 +371,14 @@ HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenMultiplePartitionCountWhenC
     ASSERT_NE(nullptr, commandQueue);
     EXPECT_EQ(2u, commandQueue->activeSubDevices);
 
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)));
+    auto commandList = std::unique_ptr<CommandList>(CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)));
     ASSERT_NE(nullptr, commandList);
     commandList->partitionCount = 2;
 
     ze_command_list_handle_t cmdListHandle = commandList->toHandle();
     commandList->close();
-
-    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, internalOptions);
     EXPECT_EQ(returnValue, ZE_RESULT_SUCCESS);
 
     uint64_t timeout = std::numeric_limits<uint64_t>::max();
@@ -337,23 +387,20 @@ HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenMultiplePartitionCountWhenC
     L0::CommandQueue::fromHandle(commandQueue)->destroy();
 }
 
-HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenCsrHasMultipleActivePartitionWhenExecutingCmdListOnNewCmdQueueThenExpectCmdPartitionCountMatchCsrActivePartitions, IsAtLeastXeHpCore) {
+HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenCsrHasMultipleActivePartitionWhenExecutingCmdListOnNewCmdQueueThenExpectCmdPartitionCountMatchCsrActivePartitions, IsAtLeastXeCore) {
     const ze_command_queue_desc_t desc{};
     ze_result_t returnValue;
 
     auto csr = reinterpret_cast<NEO::UltCommandStreamReceiver<FamilyType> *>(neoDevice->getDefaultEngine().commandStreamReceiver);
-    if (device->getNEODevice()->getPreemptionMode() == PreemptionMode::MidThread || device->getNEODevice()->isDebuggerActive()) {
-        csr->createPreemptionAllocation();
-    }
-    EXPECT_NE(0u, csr->getPostSyncWriteOffset());
+
+    EXPECT_NE(0u, csr->getImmWritePostSyncWriteOffset());
     volatile TagAddressType *tagAddress = csr->getTagAddress();
     for (uint32_t i = 0; i < 2; i++) {
         *tagAddress = 0xFF;
-        tagAddress = ptrOffset(tagAddress, csr->getPostSyncWriteOffset());
+        tagAddress = ptrOffset(tagAddress, csr->getImmWritePostSyncWriteOffset());
     }
     csr->activePartitions = 2u;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
@@ -364,45 +411,16 @@ HWTEST2_F(MultiTileCommandQueueSynchronizeTest, givenCsrHasMultipleActivePartiti
     ASSERT_NE(nullptr, commandQueue);
     EXPECT_EQ(2u, commandQueue->activeSubDevices);
 
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)));
+    auto commandList = std::unique_ptr<CommandList>(CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)));
     ASSERT_NE(nullptr, commandList);
 
     ze_command_list_handle_t cmdListHandle = commandList->toHandle();
     commandList->close();
-
-    commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, internalOptions);
     EXPECT_EQ(returnValue, ZE_RESULT_SUCCESS);
 
     EXPECT_EQ(2u, commandQueue->partitionCount);
-
-    L0::CommandQueue::fromHandle(commandQueue)->destroy();
-}
-
-HWTEST_F(CommandQueueSynchronizeTest, givenSingleTileCsrWhenExecutingMultiTileCommandListThenExpectErrorOnExecute) {
-    const ze_command_queue_desc_t desc{};
-    ze_result_t returnValue;
-
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
-                                                          neoDevice->getDefaultEngine().commandStreamReceiver,
-                                                          &desc,
-                                                          false,
-                                                          false,
-                                                          false,
-                                                          returnValue));
-    EXPECT_EQ(returnValue, ZE_RESULT_SUCCESS);
-    ASSERT_NE(nullptr, commandQueue);
-    EXPECT_EQ(1u, commandQueue->activeSubDevices);
-
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)));
-    ASSERT_NE(nullptr, commandList);
-    commandList->partitionCount = 2;
-
-    ze_command_list_handle_t cmdListHandle = commandList->toHandle();
-    commandList->close();
-
-    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, false);
-    EXPECT_EQ(returnValue, ZE_RESULT_ERROR_INVALID_COMMAND_LIST_TYPE);
 
     L0::CommandQueue::fromHandle(commandQueue)->destroy();
 }
@@ -413,7 +431,7 @@ struct TestCmdQueueCsr : public NEO::UltCommandStreamReceiver<GfxFamily> {
         : NEO::UltCommandStreamReceiver<GfxFamily>(const_cast<NEO::ExecutionEnvironment &>(executionEnvironment), 0, deviceBitfield) {
     }
 
-    ADDMETHOD_NOBASE(waitForCompletionWithTimeout, NEO::WaitStatus, NEO::WaitStatus::NotReady, (const WaitParams &params, TaskCountType taskCountToWait));
+    ADDMETHOD_NOBASE(waitForCompletionWithTimeout, NEO::WaitStatus, NEO::WaitStatus::notReady, (const WaitParams &params, TaskCountType taskCountToWait));
 };
 
 HWTEST_F(CommandQueueSynchronizeTest, givenSinglePartitionCountWhenWaitFunctionFailsThenReturnNotReady) {
@@ -423,8 +441,7 @@ HWTEST_F(CommandQueueSynchronizeTest, givenSinglePartitionCountWhenWaitFunctionF
 
     const ze_command_queue_desc_t desc{};
     ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           csr.get(),
                                                           &desc,
                                                           false,
@@ -447,11 +464,11 @@ HWTEST_F(CommandQueueSynchronizeTest, givenSynchronousCommandQueueWhenTagUpdateF
     using POST_SYNC_OPERATION = typename FamilyType::PIPE_CONTROL::POST_SYNC_OPERATION;
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
     using MI_BATCH_BUFFER_END = typename FamilyType::MI_BATCH_BUFFER_END;
-    using PARSE = typename FamilyType::PARSE;
+    using Parse = typename FamilyType::Parse;
 
     DebugManagerStateRestore restore;
-    NEO::DebugManager.flags.UpdateTaskCountFromWait.set(3);
-    DebugManager.flags.DispatchCmdlistCmdBufferPrimary.set(0);
+    NEO::debugManager.flags.UpdateTaskCountFromWait.set(3);
+    debugManager.flags.DispatchCmdlistCmdBufferPrimary.set(0);
 
     size_t expectedSize = sizeof(MI_BATCH_BUFFER_START);
     if (neoDevice->getDefaultEngine().commandStreamReceiver->isAnyDirectSubmissionEnabled()) {
@@ -459,14 +476,13 @@ HWTEST_F(CommandQueueSynchronizeTest, givenSynchronousCommandQueueWhenTagUpdateF
     } else {
         expectedSize += sizeof(MI_BATCH_BUFFER_END);
     }
-    expectedSize += NEO::MemorySynchronizationCommands<FamilyType>::getSizeForBarrierWithPostSyncOperation(neoDevice->getRootDeviceEnvironment(), false);
+    expectedSize += NEO::MemorySynchronizationCommands<FamilyType>::getSizeForBarrierWithPostSyncOperation(neoDevice->getRootDeviceEnvironment(), NEO::PostSyncMode::immediateData);
     expectedSize = alignUp(expectedSize, 8);
 
     const ze_command_queue_desc_t desc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 0, ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
     ze_result_t returnValue;
 
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
@@ -475,21 +491,20 @@ HWTEST_F(CommandQueueSynchronizeTest, givenSynchronousCommandQueueWhenTagUpdateF
                                                           returnValue));
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
     ASSERT_NE(nullptr, commandQueue);
-    EXPECT_EQ(ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, commandQueue->getSynchronousMode());
+    EXPECT_EQ(ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, commandQueue->getCommandQueueMode());
 
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)));
+    auto commandList = std::unique_ptr<CommandList>(CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)));
     ASSERT_NE(nullptr, commandList);
 
     // 1st execute provides all preamble commands
     ze_command_list_handle_t cmdListHandle = commandList->toHandle();
     commandList->close();
-
-    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, internalOptions);
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
 
     auto usedSpaceBefore = commandQueue->commandStream.getUsed();
-
-    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, false);
+    returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, internalOptions);
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
 
     auto usedSpaceAfter = commandQueue->commandStream.getUsed();
@@ -500,7 +515,7 @@ HWTEST_F(CommandQueueSynchronizeTest, givenSynchronousCommandQueueWhenTagUpdateF
     EXPECT_EQ(expectedSize, executionConsumedSize);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(Parse::parseCommandBuffer(cmdList,
                                           ptrOffset(commandQueue->commandStream.getCpuBase(), usedSpaceBefore),
                                           executionConsumedSize));
 
@@ -521,52 +536,6 @@ HWTEST_F(CommandQueueSynchronizeTest, givenSynchronousCommandQueueWhenTagUpdateF
 }
 
 using CommandQueuePowerHintTest = Test<DeviceFixture>;
-
-HWTEST_F(CommandQueuePowerHintTest, givenDriverHandleWithPowerHintAndOsContextPowerHintUnsetThenSuccessIsReturned) {
-    auto csr = std::unique_ptr<TestCmdQueueCsr<FamilyType>>(new TestCmdQueueCsr<FamilyType>(*device->getNEODevice()->getExecutionEnvironment(),
-                                                                                            device->getNEODevice()->getDeviceBitfield()));
-    csr->setupContext(*device->getNEODevice()->getDefaultEngine().osContext);
-    DriverHandleImp *driverHandleImp = static_cast<DriverHandleImp *>(device->getDriverHandle());
-    driverHandleImp->powerHint = 1;
-
-    const ze_command_queue_desc_t desc{};
-    ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
-                                                          csr.get(),
-                                                          &desc,
-                                                          false,
-                                                          false,
-                                                          false,
-                                                          returnValue));
-    EXPECT_EQ(returnValue, ZE_RESULT_SUCCESS);
-    ASSERT_NE(nullptr, commandQueue);
-    commandQueue->destroy();
-}
-
-HWTEST_F(CommandQueuePowerHintTest, givenDriverHandleWithPowerHintAndOsContextPowerHintAlreadySetThenSuccessIsReturned) {
-    auto csr = std::unique_ptr<TestCmdQueueCsr<FamilyType>>(new TestCmdQueueCsr<FamilyType>(*device->getNEODevice()->getExecutionEnvironment(),
-                                                                                            device->getNEODevice()->getDeviceBitfield()));
-    csr->setupContext(*device->getNEODevice()->getDefaultEngine().osContext);
-    DriverHandleImp *driverHandleImp = static_cast<DriverHandleImp *>(device->getDriverHandle());
-    driverHandleImp->powerHint = 1;
-    auto &osContext = csr->getOsContext();
-    osContext.setUmdPowerHintValue(1);
-
-    const ze_command_queue_desc_t desc{};
-    ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
-                                                          csr.get(),
-                                                          &desc,
-                                                          false,
-                                                          false,
-                                                          false,
-                                                          returnValue));
-    EXPECT_EQ(returnValue, ZE_RESULT_SUCCESS);
-    ASSERT_NE(nullptr, commandQueue);
-    commandQueue->destroy();
-}
 
 struct MemoryManagerCommandQueueCreateNegativeTest : public NEO::MockMemoryManager {
     MemoryManagerCommandQueueCreateNegativeTest(NEO::ExecutionEnvironment &executionEnvironment) : NEO::MockMemoryManager(const_cast<NEO::ExecutionEnvironment &>(executionEnvironment)) {}
@@ -597,7 +566,7 @@ struct CommandQueueCreateNegativeTest : public ::testing::Test {
             devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
         }
 
-        driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+        driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
         driverHandle->initialize(std::move(devices));
 
         device = driverHandle->devices[0];
@@ -606,7 +575,7 @@ struct CommandQueueCreateNegativeTest : public ::testing::Test {
     }
 
     NEO::ExecutionEnvironment *executionEnvironment = nullptr;
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
     MemoryManagerCommandQueueCreateNegativeTest *memoryManager = nullptr;
@@ -614,14 +583,16 @@ struct CommandQueueCreateNegativeTest : public ::testing::Test {
 };
 
 TEST_F(CommandQueueCreateNegativeTest, whenDeviceAllocationFailsDuringCommandQueueCreateThenAppropriateValueIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableCommandBufferPoolAllocator.set(0);
+
     const ze_command_queue_desc_t desc = {};
     auto csr = std::unique_ptr<NEO::CommandStreamReceiver>(neoDevice->createCommandStreamReceiver());
     csr->setupContext(*neoDevice->getDefaultEngine().osContext);
     memoryManager->forceFailureInPrimaryAllocation = true;
 
     ze_result_t returnValue;
-    L0::CommandQueue *commandQueue = CommandQueue::create(productFamily,
-                                                          device,
+    L0::CommandQueue *commandQueue = CommandQueue::create(device,
                                                           csr.get(),
                                                           &desc,
                                                           false,
@@ -630,6 +601,7 @@ TEST_F(CommandQueueCreateNegativeTest, whenDeviceAllocationFailsDuringCommandQue
                                                           returnValue);
     EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, returnValue);
     ASSERT_EQ(nullptr, commandQueue);
+    EXPECT_EQ(0u, csr->getOwningQueueCount());
 }
 
 struct CommandQueueInitTests : public ::testing::Test {
@@ -646,7 +618,7 @@ struct CommandQueueInitTests : public ::testing::Test {
     };
 
     void SetUp() override {
-        DebugManager.flags.CreateMultipleSubDevices.set(numSubDevices);
+        debugManager.flags.CreateMultipleSubDevices.set(numSubDevices);
 
         auto executionEnvironment = new NEO::MockExecutionEnvironment(defaultHwInfo.get(), true, numRootDevices);
         executionEnvironment->rootDeviceEnvironments[0]->initGmm();
@@ -658,7 +630,7 @@ struct CommandQueueInitTests : public ::testing::Test {
         std::vector<std::unique_ptr<NEO::Device>> devices;
         devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
 
-        driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+        driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
         driverHandle->initialize(std::move(devices));
 
         device = driverHandle->devices[0];
@@ -668,7 +640,7 @@ struct CommandQueueInitTests : public ::testing::Test {
     DebugManagerStateRestore restore;
 
     NEO::MockDevice *neoDevice = nullptr;
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     L0::Device *device = nullptr;
     MyMemoryManager *memoryManager = nullptr;
     const uint32_t numRootDevices = 1;
@@ -680,22 +652,33 @@ TEST_F(CommandQueueInitTests, givenMultipleSubDevicesWhenInitializingThenAllocat
     auto csr = std::unique_ptr<NEO::CommandStreamReceiver>(neoDevice->createCommandStreamReceiver());
     csr->setupContext(*neoDevice->getDefaultEngine().osContext);
 
+    memoryManager->storedAllocationProperties.clear();
+
     ze_result_t returnValue;
-    L0::CommandQueue *commandQueue = CommandQueue::create(productFamily, device, csr.get(), &desc, false, false, false, returnValue);
+    L0::CommandQueue *commandQueue = CommandQueue::create(device, csr.get(), &desc, false, false, false, returnValue);
     EXPECT_NE(nullptr, commandQueue);
 
     const uint64_t expectedBitfield = maxNBitValue(numSubDevices);
 
+    auto &productHelper = neoDevice->getRootDeviceEnvironment().getHelper<NEO::ProductHelper>();
+    bool usePoolAllocator = CommandBufferPoolAllocator::isEnabled(productHelper);
+
     uint32_t cmdBufferAllocationsFound = 0;
     for (auto &allocationProperties : memoryManager->storedAllocationProperties) {
-        if (allocationProperties.allocationType == NEO::AllocationType::COMMAND_BUFFER) {
+        if (allocationProperties.allocationType == NEO::AllocationType::commandBuffer) {
             cmdBufferAllocationsFound++;
             EXPECT_EQ(expectedBitfield, allocationProperties.subDevicesBitfield.to_ulong());
             EXPECT_EQ(1u, allocationProperties.flags.multiOsContextCapable);
         }
     }
 
-    EXPECT_EQ(static_cast<uint32_t>(CommandQueueImp::CommandBufferManager::BUFFER_ALLOCATION::COUNT), cmdBufferAllocationsFound);
+    if (usePoolAllocator) {
+        // Pool parent was already allocated during device initialization (before storedAllocationProperties was cleared).
+        // CommandQueue::create only sub-allocates chunks from the existing pool.
+        EXPECT_EQ(0u, cmdBufferAllocationsFound);
+    } else {
+        EXPECT_EQ(static_cast<uint32_t>(CommandBufferManager::BufferAllocation::count), cmdBufferAllocationsFound);
+    }
 
     commandQueue->destroy();
 }
@@ -706,37 +689,105 @@ TEST_F(CommandQueueInitTests, whenDestroyCommandQueueThenStoreCommandBuffersAsRe
     csr->setupContext(*neoDevice->getDefaultEngine().osContext);
 
     ze_result_t returnValue;
-    L0::CommandQueue *commandQueue = CommandQueue::create(productFamily, device, csr.get(), &desc, false, false, false, returnValue);
+    L0::CommandQueue *commandQueue = CommandQueue::create(device, csr.get(), &desc, false, false, false, returnValue);
     EXPECT_NE(nullptr, commandQueue);
-    auto deviceImp = static_cast<DeviceImp *>(device);
-    EXPECT_TRUE(deviceImp->allocationsForReuse->peekIsEmpty());
+    auto l0Device = static_cast<Device *>(device);
+    EXPECT_TRUE(l0Device->allocationsForReuse->peekIsEmpty());
+
+    auto &productHelper = neoDevice->getRootDeviceEnvironment().getHelper<NEO::ProductHelper>();
+    bool usePoolAllocator = CommandBufferPoolAllocator::isEnabled(productHelper);
 
     commandQueue->destroy();
 
-    EXPECT_FALSE(deviceImp->allocationsForReuse->peekIsEmpty());
+    if (usePoolAllocator) {
+        EXPECT_TRUE(l0Device->allocationsForReuse->peekIsEmpty());
+    } else {
+        EXPECT_FALSE(l0Device->allocationsForReuse->peekIsEmpty());
+    }
+}
+
+TEST_F(CommandQueueInitTests, givenPoolAllocatorDisabledWhenInitializingThenBuffersAreRegularAllocations) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableCommandBufferPoolAllocator.set(0);
+
+    ze_command_queue_desc_t desc = {};
+    auto csr = std::unique_ptr<NEO::CommandStreamReceiver>(neoDevice->createCommandStreamReceiver());
+    csr->setupContext(*neoDevice->getDefaultEngine().osContext);
+
+    ze_result_t returnValue;
+    auto commandQueue = static_cast<L0::ult::CommandQueue *>(CommandQueue::create(device, csr.get(), &desc, false, false, false, returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    ASSERT_NE(nullptr, commandQueue);
+
+    auto firstBuffer = commandQueue->buffers.getCurrentBufferAllocation();
+    ASSERT_NE(nullptr, firstBuffer);
+    EXPECT_FALSE(firstBuffer->isView());
+
+    auto l0Device = static_cast<Device *>(device);
+    EXPECT_TRUE(l0Device->allocationsForReuse->peekIsEmpty());
+
+    commandQueue->destroy();
+
+    EXPECT_FALSE(l0Device->allocationsForReuse->peekIsEmpty());
+}
+
+TEST_F(CommandQueueInitTests, givenPoolAllocatorEnabledWhenInitializingThenBuffersAreViewsFromPool) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableCommandBufferPoolAllocator.set(1);
+
+    ze_command_queue_desc_t desc = {};
+    auto csr = std::unique_ptr<NEO::CommandStreamReceiver>(neoDevice->createCommandStreamReceiver());
+    csr->setupContext(*neoDevice->getDefaultEngine().osContext);
+
+    ze_result_t returnValue;
+    auto commandQueue = static_cast<L0::ult::CommandQueue *>(CommandQueue::create(device, csr.get(), &desc, false, false, false, returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    ASSERT_NE(nullptr, commandQueue);
+
+    auto firstBuffer = commandQueue->buffers.getCurrentBufferAllocation();
+    ASSERT_NE(nullptr, firstBuffer);
+    EXPECT_TRUE(firstBuffer->isView());
+    EXPECT_NE(nullptr, firstBuffer->getParentAllocation());
+
+    auto &poolAllocator = neoDevice->getCommandBufferPoolAllocator();
+    EXPECT_TRUE(poolAllocator.isPoolBuffer(firstBuffer->getParentAllocation()));
+
+    auto l0Device = static_cast<Device *>(device);
+    EXPECT_TRUE(l0Device->allocationsForReuse->peekIsEmpty());
+
+    commandQueue->destroy();
+
+    EXPECT_TRUE(l0Device->allocationsForReuse->peekIsEmpty());
 }
 
 struct DeviceWithDualStorage : Test<DeviceFixture> {
     void SetUp() override {
 
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.AllocateSharedAllocationsWithCpuAndGpuStorage.set(1);
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.AllocateSharedAllocationsWithCpuAndGpuStorage.set(1);
         DeviceFixture::setUp();
+
+        mockModule = std::make_unique<L0::ult::Module>(device, nullptr, ModuleType::builtin);
     }
     void TearDown() override {
         DeviceFixture::tearDown();
     }
     DebugManagerStateRestore restorer;
+    std::unique_ptr<L0::ult::Module> mockModule;
 };
 
-HWTEST2_F(DeviceWithDualStorage, givenCmdListWithAppendedKernelAndUsmTransferAndBlitterDisabledWhenExecuteCmdListThenCfeStateOnceProgrammed, IsAtLeastXeHpCore) {
+HWTEST2_F(DeviceWithDualStorage, givenCmdListWithAppendedKernelAndUsmTransferAndBlitterDisabledWhenExecuteCmdListThenCfeStateOnceProgrammed, IsHeapfulRequiredAndAtLeastXeCore) {
+
+    auto &compilerProductHelper = neoDevice->getCompilerProductHelper();
+    if (compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo)) {
+        GTEST_SKIP();
+    }
+
     using CFE_STATE = typename FamilyType::CFE_STATE;
-    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->memoryOperationsInterface = std::make_unique<MockMemoryOperationsHandler>();
     ze_result_t res = ZE_RESULT_SUCCESS;
 
     const ze_command_queue_desc_t desc = {};
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getInternalEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
@@ -746,11 +797,12 @@ HWTEST2_F(DeviceWithDualStorage, givenCmdListWithAppendedKernelAndUsmTransferAnd
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     ASSERT_NE(nullptr, commandQueue);
 
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, res)));
+    auto commandList = std::unique_ptr<CommandList>(CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, res, false)));
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     ASSERT_NE(nullptr, commandList);
-    Mock<Kernel> kernel;
+    Mock<KernelImp> kernel;
     kernel.immutableData.device = device;
+    kernel.module = mockModule.get();
     size_t size = 10;
     size_t alignment = 1u;
     void *ptr = nullptr;
@@ -762,24 +814,32 @@ HWTEST2_F(DeviceWithDualStorage, givenCmdListWithAppendedKernelAndUsmTransferAnd
                                   size, alignment, &ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     auto gpuAlloc = device->getDriverHandle()->getSvmAllocsManager()->getSVMAllocs()->get(ptr)->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
-    kernel.residencyContainer.push_back(gpuAlloc);
+    kernel.privateState.argumentsResidencyContainer.push_back(gpuAlloc);
 
     ze_group_count_t dispatchKernelArguments{1, 1, 1};
     CmdListKernelLaunchParams launchParams = {};
-    commandList->appendLaunchKernel(kernel.toHandle(), &dispatchKernelArguments, nullptr, 0, nullptr, launchParams, false);
-    auto deviceImp = static_cast<DeviceImp *>(device);
+    commandList->appendLaunchKernel(kernel.toHandle(), dispatchKernelArguments, nullptr, 0, nullptr, launchParams);
+    auto l0Device = static_cast<Device *>(device);
     commandList->close();
 
-    auto pageFaultCmdQueue = whiteboxCast(whiteboxCast(deviceImp->pageFaultCommandList)->cmdQImmediate);
+    auto pageFaultCmdQueue = whiteboxCast(CommandList::whiteboxCast(l0Device->pageFaultCommandList)->cmdQImmediate);
+
+    auto pageFaultCsr = pageFaultCmdQueue->getCsr();
+    auto &pageFaultCsrStream = pageFaultCsr->getCS(0);
+    auto pageFaultCsrStreamBefore = pageFaultCsrStream.getUsed();
 
     auto sizeBefore = commandQueue->commandStream.getUsed();
     auto pageFaultSizeBefore = pageFaultCmdQueue->commandStream.getUsed();
     auto handle = commandList->toHandle();
-    commandQueue->executeCommandLists(1, &handle, nullptr, true);
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    commandQueue->executeCommandLists(1, &handle, nullptr, internalOptions);
     auto sizeAfter = commandQueue->commandStream.getUsed();
     auto pageFaultSizeAfter = pageFaultCmdQueue->commandStream.getUsed();
+    auto pageFaultCsrStreamAfter = pageFaultCsrStream.getUsed();
     EXPECT_LT(sizeBefore, sizeAfter);
-    EXPECT_LT(pageFaultSizeBefore, pageFaultSizeAfter);
+    EXPECT_EQ(pageFaultSizeBefore, pageFaultSizeAfter);
+    EXPECT_LT(pageFaultCsrStreamBefore, pageFaultCsrStreamAfter);
 
     GenCmdList commands;
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(commandQueue->commandStream.getCpuBase(), 0),
@@ -789,6 +849,11 @@ HWTEST2_F(DeviceWithDualStorage, givenCmdListWithAppendedKernelAndUsmTransferAnd
 
     CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(pageFaultCmdQueue->commandStream.getCpuBase(), 0),
                                              pageFaultSizeAfter);
+    count = findAll<CFE_STATE *>(commands.begin(), commands.end()).size();
+    EXPECT_EQ(0u, count);
+
+    CmdParse<FamilyType>::parseCommandBuffer(commands, ptrOffset(pageFaultCsrStream.getCpuBase(), 0),
+                                             pageFaultCsrStreamAfter);
     count = findAll<CFE_STATE *>(commands.begin(), commands.end()).size();
     EXPECT_EQ(1u, count);
 
@@ -810,19 +875,19 @@ HWTEST2_F(CommandQueueScratchTests, givenCommandQueueWhenHandleScratchSpaceThenP
                                                NEO::ExecutionEnvironment &environment,
                                                InternalAllocationStorage &allocationStorage) : NEO::ScratchSpaceControllerXeHPAndLater(rootDeviceIndex, environment, allocationStorage) {}
 
-        void programHeaps(HeapContainer &heapContainer,
+        bool programHeaps(HeapContainer &heapContainer,
                           uint32_t scratchSlot,
-                          uint32_t requiredPerThreadScratchSize,
-                          uint32_t requiredPerThreadPrivateScratchSize,
-                          TaskCountType currentTaskCount,
+                          uint32_t requiredPerThreadScratchSizeSlot0,
+                          uint32_t requiredPerThreadScratchSizeSlot1,
                           OsContext &osContext,
                           bool &stateBaseAddressDirty,
                           bool &vfeStateDirty) override {
             this->scratchSlot = scratchSlot;
             programHeapsCalled = true;
+            return true;
         }
 
-        NEO::GraphicsAllocation *getScratchSpaceAllocation() override {
+        NEO::GraphicsAllocation *getScratchSpaceSlot0Allocation() override {
             return scratchAllocation;
         }
 
@@ -833,30 +898,30 @@ HWTEST2_F(CommandQueueScratchTests, givenCommandQueueWhenHandleScratchSpaceThenP
     csr.initializeTagAllocation();
     csr.setupContext(*neoDevice->getDefaultEngine().osContext);
 
-    NEO::ExecutionEnvironment *execEnv = static_cast<NEO::ExecutionEnvironment *>(device->getExecEnvironment());
+    NEO::ExecutionEnvironment *execEnv = neoDevice->getExecutionEnvironment();
     std::unique_ptr<ScratchSpaceController> scratchController = std::make_unique<MockScratchSpaceControllerXeHPAndLater>(device->getRootDeviceIndex(),
                                                                                                                          *execEnv,
                                                                                                                          *csr.getInternalAllocationStorage());
 
     const ze_command_queue_desc_t desc = {};
 
-    std::unique_ptr<L0::CommandQueue> commandQueue = std::make_unique<MockCommandQueueHw<gfxCoreFamily>>(device, &csr, &desc);
-    auto commandQueueHw = static_cast<MockCommandQueueHw<gfxCoreFamily> *>(commandQueue.get());
+    std::unique_ptr<L0::CommandQueue> commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+    auto commandQueueHw = static_cast<MockCommandQueueHw<FamilyType::gfxCoreFamily> *>(commandQueue.get());
 
     NEO::ResidencyContainer residencyContainer;
     NEO::HeapContainer heapContainer;
 
     void *surfaceHeap = alignedMalloc(0x1000, 0x1000);
-    NEO::GraphicsAllocation graphicsAllocationHeap(0, NEO::AllocationType::BUFFER, surfaceHeap, 0u, 0u, 1u, MemoryPool::System4KBPages, 1u);
+    NEO::GraphicsAllocation graphicsAllocationHeap(0, 1u /*num gmms*/, NEO::AllocationType::buffer, surfaceHeap, 0u, 0u, 1u, MemoryPool::system4KBPages, 1u);
     heapContainer.push_back(&graphicsAllocationHeap);
     bool gsbaStateDirty = false;
     bool frontEndStateDirty = false;
 
-    NEO::GraphicsAllocation graphicsAllocation(1u, NEO::AllocationType::BUFFER, nullptr, 0u, 0u, 0u, MemoryPool::System4KBPages, 0u);
+    NEO::GraphicsAllocation graphicsAllocation(1u, 1u /*num gmms*/, NEO::AllocationType::buffer, nullptr, 0u, 0u, 0u, MemoryPool::system4KBPages, 0u);
 
     auto scratch = static_cast<MockScratchSpaceControllerXeHPAndLater *>(scratchController.get());
     scratch->scratchAllocation = &graphicsAllocation;
-    commandQueueHw->handleScratchSpace(heapContainer, scratchController.get(), gsbaStateDirty, frontEndStateDirty, 0x1000, 0u);
+    commandQueueHw->handleScratchSpace(heapContainer, scratchController.get(), nullptr, gsbaStateDirty, frontEndStateDirty, 0x1000, 0u);
 
     EXPECT_TRUE(scratch->programHeapsCalled);
     EXPECT_GT(csr.makeResidentCalledTimes, 0u);
@@ -867,21 +932,21 @@ HWTEST2_F(CommandQueueScratchTests, givenCommandQueueWhenHandleScratchSpaceThenP
 HWTEST2_F(CommandQueueScratchTests, givenCommandQueueWhenHandleScratchSpaceAndHeapContainerIsZeroSizeThenNoFunctionIsCalled, Platforms) {
     class MockScratchSpaceControllerXeHPAndLater : public NEO::ScratchSpaceControllerXeHPAndLater {
       public:
-        using NEO::ScratchSpaceControllerXeHPAndLater::scratchAllocation;
+        using NEO::ScratchSpaceControllerXeHPAndLater::scratchSlot0Allocation;
         bool programHeapsCalled = false;
         MockScratchSpaceControllerXeHPAndLater(uint32_t rootDeviceIndex,
                                                NEO::ExecutionEnvironment &environment,
                                                InternalAllocationStorage &allocationStorage) : NEO::ScratchSpaceControllerXeHPAndLater(rootDeviceIndex, environment, allocationStorage) {}
 
-        void programHeaps(HeapContainer &heapContainer,
+        bool programHeaps(HeapContainer &heapContainer,
                           uint32_t scratchSlot,
-                          uint32_t requiredPerThreadScratchSize,
-                          uint32_t requiredPerThreadPrivateScratchSize,
-                          TaskCountType currentTaskCount,
+                          uint32_t requiredPerThreadScratchSizeSlot0,
+                          uint32_t requiredPerThreadScratchSizeSlot1,
                           OsContext &osContext,
                           bool &stateBaseAddressDirty,
                           bool &vfeStateDirty) override {
             programHeapsCalled = true;
+            return true;
         }
 
       protected:
@@ -891,166 +956,595 @@ HWTEST2_F(CommandQueueScratchTests, givenCommandQueueWhenHandleScratchSpaceAndHe
     csr.initializeTagAllocation();
     csr.setupContext(*neoDevice->getDefaultEngine().osContext);
 
-    NEO::ExecutionEnvironment *execEnv = static_cast<NEO::ExecutionEnvironment *>(device->getExecEnvironment());
+    NEO::ExecutionEnvironment *execEnv = neoDevice->getExecutionEnvironment();
     std::unique_ptr<ScratchSpaceController> scratchController = std::make_unique<MockScratchSpaceControllerXeHPAndLater>(device->getRootDeviceIndex(),
                                                                                                                          *execEnv,
                                                                                                                          *csr.getInternalAllocationStorage());
 
     const ze_command_queue_desc_t desc = {};
 
-    std::unique_ptr<L0::CommandQueue> commandQueue = std::make_unique<MockCommandQueueHw<gfxCoreFamily>>(device, &csr, &desc);
-    auto commandQueueHw = static_cast<MockCommandQueueHw<gfxCoreFamily> *>(commandQueue.get());
+    std::unique_ptr<L0::CommandQueue> commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+    auto commandQueueHw = static_cast<MockCommandQueueHw<FamilyType::gfxCoreFamily> *>(commandQueue.get());
 
     NEO::ResidencyContainer residencyContainer;
     NEO::HeapContainer heapContainer;
     bool gsbaStateDirty = false;
     bool frontEndStateDirty = false;
 
-    NEO::GraphicsAllocation graphicsAllocation(1u, NEO::AllocationType::BUFFER, nullptr, 0u, 0u, 0u, MemoryPool::System4KBPages, 0u);
+    NEO::GraphicsAllocation graphicsAllocation(1u, 1u /*num gmms*/, NEO::AllocationType::buffer, nullptr, 0u, 0u, 0u, MemoryPool::system4KBPages, 0u);
 
     auto scratch = static_cast<MockScratchSpaceControllerXeHPAndLater *>(scratchController.get());
-    scratch->scratchAllocation = &graphicsAllocation;
-    commandQueueHw->handleScratchSpace(heapContainer, scratchController.get(), gsbaStateDirty, frontEndStateDirty, 0x1000, 0u);
+    scratch->scratchSlot0Allocation = &graphicsAllocation;
+    commandQueueHw->handleScratchSpace(heapContainer, scratchController.get(), nullptr, gsbaStateDirty, frontEndStateDirty, 0x1000, 0u);
 
     EXPECT_FALSE(scratch->programHeapsCalled);
-    scratch->scratchAllocation = nullptr;
+    scratch->scratchSlot0Allocation = nullptr;
 }
 
-HWTEST2_F(CommandQueueScratchTests, givenCommandQueueWhenBindlessEnabledThenHandleScratchSpaceCallsProgramBindlessSurfaceStateForScratch, Platforms) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.UseBindlessMode.set(1);
-    class MockScratchSpaceControllerXeHPAndLater : public NEO::ScratchSpaceControllerXeHPAndLater {
-      public:
-        bool programHeapsCalled = false;
-        NEO::MockGraphicsAllocation alloc;
-        MockScratchSpaceControllerXeHPAndLater(uint32_t rootDeviceIndex,
-                                               NEO::ExecutionEnvironment &environment,
-                                               InternalAllocationStorage &allocationStorage) : NEO::ScratchSpaceControllerXeHPAndLater(rootDeviceIndex, environment, allocationStorage) {}
+class MockFailingScratchSpaceControllerXeHPAndLater : public NEO::ScratchSpaceControllerXeHPAndLater {
+  public:
+    using NEO::ScratchSpaceControllerXeHPAndLater::ScratchSpaceControllerXeHPAndLater;
 
-        void programBindlessSurfaceStateForScratch(BindlessHeapsHelper *heapsHelper,
-                                                   uint32_t requiredPerThreadScratchSize,
-                                                   uint32_t requiredPerThreadPrivateScratchSize,
-                                                   TaskCountType currentTaskCount,
-                                                   OsContext &osContext,
-                                                   bool &stateBaseAddressDirty,
-                                                   bool &vfeStateDirty,
-                                                   NEO::CommandStreamReceiver *csr) override {
-            programHeapsCalled = true;
-        }
+    bool setRequiredScratchSpace(void *sshBaseAddress,
+                                 uint32_t scratchSlot,
+                                 uint32_t requiredPerThreadScratchSizeSlot0,
+                                 uint32_t requiredPerThreadScratchSizeSlot1,
+                                 OsContext &osContext,
+                                 bool &stateBaseAddressDirty,
+                                 bool &vfeStateDirty) override {
+        setRequiredScratchSpaceCalled = true;
+        return false;
+    }
 
-        NEO::GraphicsAllocation *getScratchSpaceAllocation() override {
-            return &alloc;
-        }
+    bool programHeaps(HeapContainer &heapContainer,
+                      uint32_t scratchSlot,
+                      uint32_t requiredPerThreadScratchSizeSlot0,
+                      uint32_t requiredPerThreadScratchSizeSlot1,
+                      OsContext &osContext,
+                      bool &stateBaseAddressDirty,
+                      bool &vfeStateDirty) override {
+        programHeapsCalled = true;
+        return false;
+    }
 
-      protected:
-    };
-    MockCsrHw2<FamilyType> csr(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    bool setRequiredScratchSpaceCalled = false;
+    bool programHeapsCalled = false;
+};
+
+HWTEST2_F(CommandQueueScratchTests, givenProgramHeapsFailureWhenHandleScratchSpaceThenFalseIsReturnedAndNothingIsMadeResident, Platforms) {
+    MockCommandStreamReceiver csr(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
     csr.initializeTagAllocation();
     csr.setupContext(*neoDevice->getDefaultEngine().osContext);
 
-    NEO::ExecutionEnvironment *execEnv = static_cast<NEO::ExecutionEnvironment *>(device->getExecEnvironment());
-    std::unique_ptr<ScratchSpaceController> scratchController = std::make_unique<MockScratchSpaceControllerXeHPAndLater>(device->getRootDeviceIndex(),
-                                                                                                                         *execEnv,
-                                                                                                                         *csr.getInternalAllocationStorage());
+    MockFailingScratchSpaceControllerXeHPAndLater scratchController(device->getRootDeviceIndex(), *neoDevice->getExecutionEnvironment(), *csr.getInternalAllocationStorage());
+
     const ze_command_queue_desc_t desc = {};
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+    commandQueue->cmdListHeapAddressModel = NEO::HeapAddressModel::privateHeaps;
 
-    std::unique_ptr<L0::CommandQueue> commandQueue = std::make_unique<MockCommandQueueHw<gfxCoreFamily>>(device, &csr, &desc);
-    auto commandQueueHw = static_cast<MockCommandQueueHw<gfxCoreFamily> *>(commandQueue.get());
-
+    void *surfaceHeap = alignedMalloc(0x1000, 0x1000);
+    NEO::GraphicsAllocation graphicsAllocationHeap(0, 1u /*num gmms*/, NEO::AllocationType::buffer, surfaceHeap, 0u, 0u, 1u, MemoryPool::system4KBPages, 1u);
+    NEO::HeapContainer heapContainer{&graphicsAllocationHeap};
     bool gsbaStateDirty = false;
     bool frontEndStateDirty = false;
-    NEO::ResidencyContainer residency;
+
+    EXPECT_FALSE(commandQueue->handleScratchSpace(heapContainer, &scratchController, nullptr, gsbaStateDirty, frontEndStateDirty, 0x1000, 0u));
+    EXPECT_TRUE(scratchController.programHeapsCalled);
+    EXPECT_FALSE(scratchController.setRequiredScratchSpaceCalled);
+    EXPECT_EQ(0u, csr.makeResidentCalledTimes);
+
+    alignedFree(surfaceHeap);
+}
+
+HWTEST2_F(CommandQueueScratchTests, givenGlobalStatelessScratchFailureWhenHandleScratchSpaceThenFalseIsReturnedAndHeapsAreNotProgrammed, Platforms) {
+    MockCommandStreamReceiver csr(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr.initializeTagAllocation();
+    csr.setupContext(*neoDevice->getDefaultEngine().osContext);
+
+    MockFailingScratchSpaceControllerXeHPAndLater scratchController(device->getRootDeviceIndex(), *neoDevice->getExecutionEnvironment(), *csr.getInternalAllocationStorage());
+
+    const ze_command_queue_desc_t desc = {};
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+    commandQueue->cmdListHeapAddressModel = NEO::HeapAddressModel::globalStateless;
+
+    void *surfaceHeap = alignedMalloc(0x1000, 0x1000);
+    NEO::GraphicsAllocation globalStatelessAllocation(0, 1u /*num gmms*/, NEO::AllocationType::buffer, surfaceHeap, 0u, 0u, 1u, MemoryPool::system4KBPages, 1u);
+    NEO::HeapContainer heapContainer{&globalStatelessAllocation};
+    bool gsbaStateDirty = false;
+    bool frontEndStateDirty = false;
+
+    EXPECT_FALSE(commandQueue->handleScratchSpace(heapContainer, &scratchController, &globalStatelessAllocation, gsbaStateDirty, frontEndStateDirty, 0x1000, 0u));
+    EXPECT_TRUE(scratchController.setRequiredScratchSpaceCalled);
+    EXPECT_FALSE(scratchController.programHeapsCalled);
+    EXPECT_EQ(0u, csr.makeResidentCalledTimes);
+
+    alignedFree(surfaceHeap);
+}
+
+HWTEST2_F(CommandQueueScratchTests, givenScratchAllocationFailureWhenHandleScratchSpaceThenFalseIsReturnedAndNothingIsMadeResident, IsGen12LP) {
+    MockCommandStreamReceiver csr(*neoDevice->getExecutionEnvironment(), 0, neoDevice->getDeviceBitfield());
+    csr.initializeTagAllocation();
+    csr.setupContext(*neoDevice->getDefaultEngine().osContext);
+
+    auto memoryManager = static_cast<NEO::MockMemoryManager *>(neoDevice->getMemoryManager());
+    memoryManager->isMockHostMemoryManager = true;
+    memoryManager->forceFailureInPrimaryAllocation = true;
+
+    NEO::ScratchSpaceControllerBase scratchController(device->getRootDeviceIndex(), *neoDevice->getExecutionEnvironment(), *csr.getInternalAllocationStorage());
+
+    const ze_command_queue_desc_t desc = {};
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+
     NEO::HeapContainer heapContainer;
+    bool gsbaStateDirty = false;
+    bool frontEndStateDirty = false;
 
-    // scratch part
-    commandQueueHw->handleScratchSpace(heapContainer, scratchController.get(), gsbaStateDirty, frontEndStateDirty, 0x1000, 0u);
+    EXPECT_FALSE(commandQueue->handleScratchSpace(heapContainer, &scratchController, nullptr, gsbaStateDirty, frontEndStateDirty, 0x1000, 0u));
+    EXPECT_EQ(nullptr, scratchController.getScratchSpaceSlot0Allocation());
+    EXPECT_EQ(0u, csr.makeResidentCalledTimes);
 
-    EXPECT_TRUE(static_cast<MockScratchSpaceControllerXeHPAndLater *>(scratchController.get())->programHeapsCalled);
-
-    // private part
-    static_cast<MockScratchSpaceControllerXeHPAndLater *>(scratchController.get())->programHeapsCalled = false;
-
-    commandQueueHw->handleScratchSpace(heapContainer, scratchController.get(), gsbaStateDirty, frontEndStateDirty, 0x0, 0x1000);
-
-    EXPECT_TRUE(static_cast<MockScratchSpaceControllerXeHPAndLater *>(scratchController.get())->programHeapsCalled);
+    memoryManager->forceFailureInPrimaryAllocation = false;
+    EXPECT_TRUE(commandQueue->handleScratchSpace(heapContainer, &scratchController, nullptr, gsbaStateDirty, frontEndStateDirty, 0x1000, 0u));
+    EXPECT_NE(nullptr, scratchController.getScratchSpaceSlot0Allocation());
+    EXPECT_GT(csr.makeResidentCalledTimes, 0u);
 }
 
-HWTEST2_F(CommandQueueScratchTests, whenPatchCommandsIsCalledThenCommandsAreCorrectlyPatched, IsAtLeastXeHpCore) {
-    using CFE_STATE = typename FamilyType::CFE_STATE;
-
+HWTEST2_F(CommandQueueScratchTests, whenPatchCommandsIsCalledThenCommandsAreCorrectlyPatched, IsAtLeastXeCore) {
     ze_command_queue_desc_t desc = {};
     NEO::CommandStreamReceiver *csr = nullptr;
-    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u);
-    auto commandQueue = std::make_unique<MockCommandQueueHw<gfxCoreFamily>>(device, csr, &desc);
-    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
+    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0);
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, csr, &desc);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
 
-    EXPECT_NO_THROW(commandQueue->patchCommands(*commandList, 0));
-    commandList->commandsToPatch.push_back({});
-    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0));
+    EXPECT_NO_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
+    commandList->commandsToPatch.push_back(PatchInvalidPatchType{});
+    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
     commandList->commandsToPatch.clear();
 
-    CFE_STATE destinationCfeStates[4];
-    int32_t initialScratchAddress = 0x123400;
-    for (size_t i = 0; i < 4; i++) {
-        auto sourceCfeState = new CFE_STATE;
-        *sourceCfeState = FamilyType::cmdInitCfeState;
-        if constexpr (TestTraits<gfxCoreFamily>::numberOfWalkersInCfeStateSupported) {
-            sourceCfeState->setNumberOfWalkers(2);
-        }
-        sourceCfeState->setMaximumNumberOfThreads(16);
-        sourceCfeState->setScratchSpaceBuffer(initialScratchAddress);
+    if constexpr (FamilyType::isHeaplessRequired()) {
+        PatchFrontEndState patch{};
+        patch.pDestination = nullptr;
+        patch.pCommand = nullptr;
+        commandList->commandsToPatch.push_back(patch);
 
-        destinationCfeStates[i] = FamilyType::cmdInitCfeState;
-        if constexpr (TestTraits<gfxCoreFamily>::numberOfWalkersInCfeStateSupported) {
-            EXPECT_NE(destinationCfeStates[i].getNumberOfWalkers(), sourceCfeState->getNumberOfWalkers());
-        }
-        EXPECT_NE(destinationCfeStates[i].getMaximumNumberOfThreads(), sourceCfeState->getMaximumNumberOfThreads());
+        EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
+        commandList->commandsToPatch.clear();
+    } else {
+        using CFE_STATE = typename FamilyType::CFE_STATE;
+        CFE_STATE destinationCfeStates[4];
+        int32_t initialScratchAddress = 0x123400;
 
-        CommandList::CommandToPatch commandToPatch;
-        commandToPatch.pDestination = &destinationCfeStates[i];
-        commandToPatch.pCommand = sourceCfeState;
-        commandToPatch.type = CommandList::CommandToPatch::CommandType::FrontEndState;
-        commandList->commandsToPatch.push_back(commandToPatch);
-    }
+        for (size_t i = 0; i < 4; i++) {
+            auto sourceCfeState = new CFE_STATE;
+            *sourceCfeState = FamilyType::cmdInitCfeState;
+            if constexpr (TestTraits<FamilyType::gfxCoreFamily>::numberOfWalkersInCfeStateSupported) {
+                sourceCfeState->setNumberOfWalkers(2);
+            }
+            sourceCfeState->setMaximumNumberOfThreads(16);
+            sourceCfeState->setScratchSpaceBuffer(initialScratchAddress);
 
-    uint64_t patchedScratchAddress = 0xABCD00;
-    commandQueue->patchCommands(*commandList, patchedScratchAddress);
-    for (size_t i = 0; i < 4; i++) {
-        EXPECT_EQ(patchedScratchAddress, destinationCfeStates[i].getScratchSpaceBuffer());
-        auto &sourceCfeState = *reinterpret_cast<CFE_STATE *>(commandList->commandsToPatch[i].pCommand);
-        if constexpr (TestTraits<gfxCoreFamily>::numberOfWalkersInCfeStateSupported) {
-            EXPECT_EQ(destinationCfeStates[i].getNumberOfWalkers(), sourceCfeState.getNumberOfWalkers());
+            destinationCfeStates[i] = FamilyType::cmdInitCfeState;
+            if constexpr (TestTraits<FamilyType::gfxCoreFamily>::numberOfWalkersInCfeStateSupported) {
+                EXPECT_NE(destinationCfeStates[i].getNumberOfWalkers(), sourceCfeState->getNumberOfWalkers());
+            }
+            EXPECT_NE(destinationCfeStates[i].getMaximumNumberOfThreads(), sourceCfeState->getMaximumNumberOfThreads());
+
+            PatchFrontEndState patch{};
+            patch.pDestination = &destinationCfeStates[i];
+            patch.pCommand = sourceCfeState;
+            commandList->commandsToPatch.push_back(patch);
         }
-        EXPECT_EQ(destinationCfeStates[i].getMaximumNumberOfThreads(), sourceCfeState.getMaximumNumberOfThreads());
-        EXPECT_EQ(destinationCfeStates[i].getScratchSpaceBuffer(), sourceCfeState.getScratchSpaceBuffer());
+
+        uint64_t patchedScratchAddress = 0xABCD00;
+        commandQueue->patchCommands(*commandList, patchedScratchAddress, false, false, nullptr);
+
+        for (size_t i = 0; i < 4; i++) {
+            EXPECT_EQ(patchedScratchAddress, destinationCfeStates[i].getScratchSpaceBuffer());
+
+            auto *patch = std::get_if<PatchFrontEndState>(&commandList->commandsToPatch[i]);
+            ASSERT_NE(nullptr, patch);
+
+            auto &sourceCfeState = *reinterpret_cast<CFE_STATE *>(patch->pCommand);
+            if constexpr (TestTraits<FamilyType::gfxCoreFamily>::numberOfWalkersInCfeStateSupported) {
+                EXPECT_EQ(destinationCfeStates[i].getNumberOfWalkers(), sourceCfeState.getNumberOfWalkers());
+            }
+            EXPECT_EQ(destinationCfeStates[i].getMaximumNumberOfThreads(), sourceCfeState.getMaximumNumberOfThreads());
+            EXPECT_EQ(destinationCfeStates[i].getScratchSpaceBuffer(), sourceCfeState.getScratchSpaceBuffer());
+        }
     }
 }
 
-using IsWithinNotSupported = IsWithinGfxCore<IGFX_GEN9_CORE, IGFX_GEN12LP_CORE>;
-
-HWTEST2_F(CommandQueueScratchTests, givenCommandsToPatchToNotSupportedPlatformWhenPatchCommandsIsCalledThenAbortIsThrown, IsWithinNotSupported) {
+HWTEST2_F(CommandQueueScratchTests, givenCommandsToPatchToNotSupportedPlatformWhenPatchCommandsIsCalledThenAbortIsThrown, IsGen12LP) {
     ze_command_queue_desc_t desc = {};
     NEO::CommandStreamReceiver *csr = nullptr;
-    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u);
-    auto commandQueue = std::make_unique<MockCommandQueueHw<gfxCoreFamily>>(device, csr, &desc);
-    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
+    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0);
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, csr, &desc);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
 
-    EXPECT_NO_THROW(commandQueue->patchCommands(*commandList, 0));
-    commandList->commandsToPatch.push_back({});
-    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0));
+    EXPECT_NO_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
+
+    commandList->commandsToPatch.push_back(PatchFrontEndState{});
+    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
     commandList->commandsToPatch.clear();
 
-    CommandList::CommandToPatch commandToPatch;
+    commandList->commandsToPatch.push_back(PatchInvalidPatchType{});
+    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
+    commandList->commandsToPatch.clear();
 
-    commandToPatch.type = CommandList::CommandToPatch::FrontEndState;
+    commandList->commandsToPatch.push_back(PatchComputeWalkerInlineDataScratch{});
+    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
+    commandList->commandsToPatch.clear();
+
+    commandList->commandsToPatch.push_back(PatchComputeWalkerImplicitArgsScratch{});
+    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0, false, false, nullptr));
+    commandList->commandsToPatch.clear();
+}
+
+HWTEST2_F(CommandQueueScratchTests, givenInlineDataScratchWhenPatchCommandsIsCalledThenCommandsAreCorrectlyPatched, IsAtLeastXeCore) {
+    ze_command_queue_desc_t desc = {};
+    NEO::CommandStreamReceiver *csr = nullptr;
+    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0);
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, csr, &desc);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+
+    constexpr uint64_t dummyScratchAddress = 0xdeadu;
+    constexpr uint64_t baseAddress = 0x1234u;
+    constexpr uint64_t scratchAddress = 0x5000u;
+    constexpr uint64_t expectedPatchedScratchAddress = baseAddress + scratchAddress;
+
+    struct TestCase {
+        bool undefinedPatchSize;
+        bool undefinedOffset;
+        bool scratchAlreadyPatched;
+        bool scratchControllerChanged;
+        uint64_t expectedValue;
+    };
+
+    const TestCase testCases[] = {
+        {false, false, false, false, expectedPatchedScratchAddress}, // Valid patchSize and offset - should patch
+        {false, false, false, true, expectedPatchedScratchAddress},  // scratchControllerChanged - should patch
+        {true, false, false, false, dummyScratchAddress},            // Undefined patchSize - should not patch
+        {false, true, false, false, dummyScratchAddress},            // Undefined offset - should not patch
+        {false, false, true, false, dummyScratchAddress},            // scratchAddressAfterPatch==scratchAddress - should not patch
+    };
+
+    for (const auto &testCase : testCases) {
+        uint64_t scratchBuffer = dummyScratchAddress;
+        commandList->commandsToPatch.clear();
+
+        PatchComputeWalkerInlineDataScratch patch{};
+        patch.pDestination = &scratchBuffer;
+        patch.offset = testCase.undefinedOffset ? NEO::undefined<size_t> : 0;
+        patch.patchSize = testCase.undefinedPatchSize ? NEO::undefined<size_t> : sizeof(uint64_t);
+        patch.baseAddress = baseAddress;
+        patch.scratchAddressAfterPatch = testCase.scratchAlreadyPatched ? scratchAddress : 0;
+
+        commandList->commandsToPatch.push_back(patch);
+        commandQueue->patchCommands(*commandList, scratchAddress, testCase.scratchControllerChanged, false, nullptr);
+
+        EXPECT_EQ(testCase.expectedValue, scratchBuffer);
+    }
+}
+
+HWTEST2_F(CommandQueueScratchTests, givenImplicitArgsScratchWhenPatchCommandsIsCalledThenCommandsAreCorrectlyPatched, IsAtLeastXeCore) {
+    ze_command_queue_desc_t desc = {};
+    NEO::CommandStreamReceiver *csr = nullptr;
+    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0);
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, csr, &desc);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+
+    constexpr uint64_t dummyScratchAddress = 0xdeadu;
+    constexpr uint64_t baseAddress = 0x1234u;
+    constexpr uint64_t scratchAddress = 0x5000u;
+    constexpr uint64_t expectedPatchedScratchAddress = baseAddress + scratchAddress;
+
+    for (const bool scratchControllerChanged : {false, true}) {
+        for (const bool scratchAlreadyPatched : {false, true}) {
+            const uint64_t expectedValue =
+                (scratchControllerChanged || !scratchAlreadyPatched) ? expectedPatchedScratchAddress : dummyScratchAddress;
+
+            uint64_t scratchBuffer = dummyScratchAddress;
+            commandList->commandsToPatch.clear();
+
+            PatchComputeWalkerImplicitArgsScratch patch{};
+            patch.pDestination = &scratchBuffer;
+            patch.baseAddress = baseAddress;
+            patch.offset = 0;
+            patch.patchSize = sizeof(uint64_t);
+            patch.scratchAddressAfterPatch = scratchAlreadyPatched ? scratchAddress : 0;
+
+            commandList->commandsToPatch.push_back(patch);
+            commandQueue->patchCommands(*commandList, scratchAddress, scratchControllerChanged, false, nullptr);
+
+            EXPECT_EQ(expectedValue, scratchBuffer);
+        }
+    }
+}
+
+using CommandQueueCreate = Test<DeviceFixture>;
+
+HWTEST_F(CommandQueueCreate, givenCommandsToPatchWithNoopSpacePatchWhenPatchCommandsIsCalledThenSpaceIsNooped) {
+    ze_command_queue_desc_t desc = {};
+    NEO::CommandStreamReceiver *csr = nullptr;
+    device->getCsrForOrdinalAndIndex(&csr, 0u, 0u, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0);
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, csr, &desc);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+
+    constexpr uint32_t dataSize = 64;
+    auto patchBuffer = std::make_unique<uint8_t[]>(dataSize);
+    auto zeroBuffer = std::make_unique<uint8_t[]>(dataSize);
+    memset(patchBuffer.get(), 0xFF, dataSize);
+    memset(zeroBuffer.get(), 0x0, dataSize);
+
+    CommandToPatchOnQueue commandToPatch{PatchNoopSpace{
+        .pDestination = patchBuffer.get(),
+        .patchSize = dataSize,
+    }};
+
     commandList->commandsToPatch.push_back(commandToPatch);
-    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0));
-    commandList->commandsToPatch.clear();
+    commandQueue->patchCommands(*commandList, 0, false, false, nullptr);
+    EXPECT_EQ(0, memcmp(patchBuffer.get(), zeroBuffer.get(), dataSize));
 
-    commandToPatch.type = CommandList::CommandToPatch::Invalid;
-    commandList->commandsToPatch.push_back(commandToPatch);
-    EXPECT_ANY_THROW(commandQueue->patchCommands(*commandList, 0));
-    commandList->commandsToPatch.clear();
+    memset(patchBuffer.get(), 0xFF, dataSize);
+    std::get<PatchNoopSpace>(commandList->commandsToPatch[0]).pDestination = nullptr;
+    commandQueue->patchCommands(*commandList, 0, false, false, nullptr);
+    EXPECT_NE(0, memcmp(patchBuffer.get(), zeroBuffer.get(), dataSize));
+}
+
+using HostFunctionsCmdPatchTests = Test<DeviceFixture>;
+
+HWTEST_F(HostFunctionsCmdPatchTests, givenHostFunctionPatchCommandsWhenPatchCommandsIsCalledThenCorrectInstructionsWereProgrammed) {
+
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+    constexpr bool hasMemFence = requires { typename FamilyType::MI_MEM_FENCE; };
+
+    for (int32_t useMemorySynchronization : {0, 1}) {
+
+        for (auto nPartitions : {1u, 2u}) {
+            DebugManagerStateRestore restorer;
+            debugManager.flags.UseMemorySynchronizationForHostFunction.set(useMemorySynchronization);
+
+            if (nPartitions > 1u) {
+                debugManager.flags.EnableImplicitScaling.set(1);
+            }
+
+            ze_command_queue_desc_t desc = {};
+            NEO::CommandStreamReceiver *csr = nullptr;
+            device->getCsrForOrdinalAndIndex(&csr, 0u, 0u, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0);
+            auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, csr, &desc);
+
+            auto mask = maxNBitValue(nPartitions);
+            auto deviceBitfield = NEO::DeviceBitfield{mask};
+
+            MockCommandStreamReceiver mockCsr(*neoDevice->executionEnvironment, neoDevice->getRootDeviceIndex(), deviceBitfield);
+            mockCsr.activePartitions = nPartitions;
+            mockCsr.dcFlushSupport = csr->getDcFlushSupport();
+
+            const auto oldCsr = commandQueue->csr;
+            commandQueue->csr = &mockCsr;
+
+            auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+            commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+            commandList->partitionCount = nPartitions;
+            commandList->commandsToPatch.clear();
+
+            constexpr uint64_t pHostFunction1 = std::numeric_limits<uint64_t>::max() - 1024u;
+            constexpr uint64_t pUserData1 = std::numeric_limits<uint64_t>::max() - 4096u;
+
+            HostFunction hostFunction1{
+                .hostFunctionAddress = pHostFunction1,
+                .userDataAddress = pUserData1,
+            };
+
+            commandList->addHostFunctionToPatchCommands(hostFunction1, true);
+
+            auto index = 0u;
+
+            auto *cmdToProgrammHostFunctionId1 = std::get<PatchHostFunctionId>(commandList->commandsToPatch[index++]).cmdBufferSpace;
+            auto *miWait1 = reinterpret_cast<MI_SEMAPHORE_WAIT *>(std::get<PatchHostFunctionWait>(commandList->commandsToPatch[index++]).cmdBufferSpace);
+            MI_SEMAPHORE_WAIT *miWait1Partition2 = nullptr;
+            if (nPartitions > 1) {
+                miWait1Partition2 = reinterpret_cast<MI_SEMAPHORE_WAIT *>(std::get<PatchHostFunctionWait>(commandList->commandsToPatch[index++]).cmdBufferSpace);
+            }
+
+            constexpr uint64_t pHostFunction2 = std::numeric_limits<uint64_t>::max() - 1024u - 8;
+            constexpr uint64_t pUserData2 = std::numeric_limits<uint64_t>::max() - 4096u - 8;
+
+            HostFunction hostFunction2{
+                .hostFunctionAddress = pHostFunction2,
+                .userDataAddress = pUserData2,
+            };
+
+            commandList->addHostFunctionToPatchCommands(hostFunction2, true);
+
+            auto *cmdToProgrammHostFunctionId2 = std::get<PatchHostFunctionId>(commandList->commandsToPatch[index++]).cmdBufferSpace;
+            auto *miWait2 = reinterpret_cast<MI_SEMAPHORE_WAIT *>(std::get<PatchHostFunctionWait>(commandList->commandsToPatch[index++]).cmdBufferSpace);
+            MI_SEMAPHORE_WAIT *miWait2Partition2 = nullptr;
+            if (nPartitions > 1) {
+                miWait2Partition2 = reinterpret_cast<MI_SEMAPHORE_WAIT *>(std::get<PatchHostFunctionWait>(commandList->commandsToPatch[index++]).cmdBufferSpace);
+            }
+
+            commandQueue->patchCommands(*commandList, 0, false, false, nullptr);
+
+            EXPECT_EQ(2u, mockCsr.signalHostFunctionWorkerCounter);
+
+            auto &hostFunctionStreamer = commandQueue->csr->getHostFunctionStreamer();
+            uint64_t hostFunctionIdGpuAddress = hostFunctionStreamer.getHostFunctionIdGpuAddress(0u);
+            uint64_t expectedId = 1u;
+            {
+                // callback id - mi store
+                if (commandList->dcFlushSupport && useMemorySynchronization) {
+                    auto *pipeControl = reinterpret_cast<PIPE_CONTROL *>(cmdToProgrammHostFunctionId1);
+                    EXPECT_TRUE(pipeControl->getDcFlushEnable());
+                    EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA, pipeControl->getPostSyncOperation());
+                    EXPECT_EQ(expectedId, pipeControl->getImmediateData());
+                    EXPECT_EQ(getLowPart(hostFunctionIdGpuAddress), pipeControl->getAddress());
+                    EXPECT_EQ(getHighPart(hostFunctionIdGpuAddress), pipeControl->getAddressHigh());
+
+                    if constexpr (requires { &pipeControl->getWorkloadPartitionIdOffsetEnable; }) {
+                        auto expectedWorkloadPartitionIdOffset = nPartitions > 1U;
+                        EXPECT_EQ(expectedWorkloadPartitionIdOffset, pipeControl->getWorkloadPartitionIdOffsetEnable());
+                    }
+
+                } else {
+                    if (useMemorySynchronization) {
+                        if constexpr (hasMemFence) {
+                            using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
+
+                            auto *memFence = reinterpret_cast<MI_MEM_FENCE *>(cmdToProgrammHostFunctionId1);
+                            EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, memFence->getFenceType());
+
+                            cmdToProgrammHostFunctionId1 = ptrOffset(cmdToProgrammHostFunctionId1, sizeof(MI_MEM_FENCE));
+                        }
+                    }
+
+                    auto *miStore1 = reinterpret_cast<MI_STORE_DATA_IMM *>(cmdToProgrammHostFunctionId1);
+                    EXPECT_EQ(getLowPart(expectedId), miStore1->getDataDword0());
+                    EXPECT_EQ(getHighPart(expectedId), miStore1->getDataDword1());
+                    EXPECT_TRUE(miStore1->getStoreQword());
+                    EXPECT_EQ(hostFunctionIdGpuAddress, miStore1->getAddress());
+
+                    if constexpr (requires { &miStore1->getWorkloadPartitionIdOffsetEnable; }) {
+                        auto expectedWorkloadPartitionIdOffset = nPartitions > 1U;
+                        EXPECT_EQ(expectedWorkloadPartitionIdOffset, miStore1->getWorkloadPartitionIdOffsetEnable());
+                    }
+                }
+
+                // semaphore wait
+                for (auto partitionId = 0u; partitionId < nPartitions; partitionId++) {
+                    uint64_t expectedHostFunctionIdGpuAddress = hostFunctionStreamer.getHostFunctionIdGpuAddress(partitionId);
+
+                    if (partitionId == 0) {
+                        EXPECT_EQ(expectedHostFunctionIdGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(miWait1));
+                        EXPECT_EQ(static_cast<uint32_t>(HostFunctionStatus::completed), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(miWait1));
+
+                    } else {
+                        EXPECT_EQ(expectedHostFunctionIdGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(miWait1Partition2));
+                        EXPECT_EQ(static_cast<uint32_t>(HostFunctionStatus::completed), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(miWait1Partition2));
+                    }
+                }
+
+                // host function data programmed in host function streamer
+                for (auto partitionId = 0u; partitionId < nPartitions; partitionId++) {
+                    *hostFunctionStreamer.getHostFunctionIdPtr(partitionId) = expectedId;
+                }
+                auto hostFunction = hostFunctionStreamer.getHostFunction(expectedId);
+                EXPECT_EQ(pHostFunction1, hostFunction.hostFunctionAddress);
+                EXPECT_EQ(pUserData1, hostFunction.userDataAddress);
+            }
+            {
+                // callback id - mi store
+                expectedId = 3u;
+                if (commandList->dcFlushSupport && useMemorySynchronization) {
+                    auto *pipeControl = reinterpret_cast<PIPE_CONTROL *>(cmdToProgrammHostFunctionId2);
+                    EXPECT_TRUE(pipeControl->getDcFlushEnable());
+                    EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA, pipeControl->getPostSyncOperation());
+                    EXPECT_EQ(expectedId, pipeControl->getImmediateData());
+                    EXPECT_EQ(getLowPart(hostFunctionIdGpuAddress), pipeControl->getAddress());
+                    EXPECT_EQ(getHighPart(hostFunctionIdGpuAddress), pipeControl->getAddressHigh());
+                } else {
+
+                    if (useMemorySynchronization) {
+                        if constexpr (hasMemFence) {
+                            using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
+
+                            auto *memFence = reinterpret_cast<MI_MEM_FENCE *>(cmdToProgrammHostFunctionId2);
+                            EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, memFence->getFenceType());
+
+                            cmdToProgrammHostFunctionId2 = ptrOffset(cmdToProgrammHostFunctionId2, sizeof(MI_MEM_FENCE));
+                        }
+                    }
+
+                    auto *miStore2 = reinterpret_cast<MI_STORE_DATA_IMM *>(cmdToProgrammHostFunctionId2);
+                    EXPECT_EQ(getLowPart(expectedId), miStore2->getDataDword0());
+                    EXPECT_EQ(getHighPart(expectedId), miStore2->getDataDword1());
+                    EXPECT_TRUE(miStore2->getStoreQword());
+                    EXPECT_EQ(hostFunctionIdGpuAddress, miStore2->getAddress());
+                }
+                // semaphore wait
+                for (auto partitionId = 0u; partitionId < nPartitions; partitionId++) {
+                    uint64_t expectedHostFunctionIdGpuAddress = hostFunctionStreamer.getHostFunctionIdGpuAddress(partitionId);
+
+                    if (partitionId == 0) {
+                        EXPECT_EQ(expectedHostFunctionIdGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(miWait2));
+                        EXPECT_EQ(static_cast<uint32_t>(HostFunctionStatus::completed), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(miWait2));
+
+                    } else {
+                        EXPECT_EQ(expectedHostFunctionIdGpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(miWait2Partition2));
+                        EXPECT_EQ(static_cast<uint32_t>(HostFunctionStatus::completed), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(miWait2Partition2));
+                    }
+                }
+
+                // host function data programmed in host function streamer
+                for (auto partitionId = 0u; partitionId < nPartitions; partitionId++) {
+                    *hostFunctionStreamer.getHostFunctionIdPtr(partitionId) = expectedId;
+                }
+                auto hostFunction = hostFunctionStreamer.getHostFunction(expectedId);
+                EXPECT_EQ(pHostFunction2, hostFunction.hostFunctionAddress);
+                EXPECT_EQ(pUserData2, hostFunction.userDataAddress);
+            }
+
+            commandQueue->csr = oldCsr;
+        }
+    }
+}
+
+HWTEST_F(CommandQueueSynchronizeTest, givenCmdQueueWhenCallWaitForCommandQueueCompletionThenSynchronizeWithoutLockOnCsr) {
+    DebugManagerStateRestore restore;
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    ze_command_queue_desc_t desc = {};
+    desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+
+    auto ownership = csr.obtainUniqueOwnership();
+    auto ctx = CommandListExecutionContext();
+    ctx.lockCSR = &ownership;
+    commandQueue->waitForCommandQueueCompletion(ctx);
+    EXPECT_FALSE(ownership.owns_lock());
+}
+
+HWTEST_F(CommandQueueSynchronizeTest, givenDebuggerAndSwTagsDisabledWhenPreparingBatchBufferThenLeftoverMemoryIsCleaned) {
+    using MI_BATCH_BUFFER_END = typename FamilyType::MI_BATCH_BUFFER_END;
+    DebugManagerStateRestore restore;
+    NEO::debugManager.flags.EnableSWTags.set(0);
+
+    auto &csr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    ze_command_queue_desc_t desc = {};
+    auto commandQueue = std::make_unique<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, &csr, &desc);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->initialize(false, false, false));
+
+    auto &outerCommandStream = commandQueue->commandStream;
+    constexpr size_t outerUsedSize = 512;
+    ASSERT_GE(outerCommandStream.getAvailableSpace(), outerUsedSize);
+
+    // simulate overestimated inner stream filled with garbage
+    auto outerBase = outerCommandStream.getSpace(0);
+    memset(outerBase, 0xFF, outerUsedSize);
+    outerCommandStream.getSpace(outerUsedSize);
+
+    NEO::LinearStream innerCommandStream(outerBase, outerUsedSize);
+
+    CommandListExecutionContext ctx{};
+    ctx.isNEODebuggerActive = false;
+    ctx.isDirectSubmissionEnabled = false;
+
+    commandQueue->prepareAndSubmitBatchBuffer(ctx, innerCommandStream);
+
+    EXPECT_EQ(outerUsedSize, innerCommandStream.getUsed());
+
+    auto leftoverPtr = static_cast<uint8_t *>(ptrOffset(outerBase, sizeof(MI_BATCH_BUFFER_END)));
+    auto leftoverSize = outerUsedSize - sizeof(MI_BATCH_BUFFER_END);
+    for (size_t i = 0; i < leftoverSize; i++) {
+        EXPECT_EQ(0u, leftoverPtr[i]) << "offset " << i;
+    }
+
+    commandQueue->destroy();
+    commandQueue.release();
 }
 
 } // namespace ult

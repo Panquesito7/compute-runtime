@@ -1,18 +1,22 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
-
-#include "shared/source/helpers/basic_math.h"
 
 #include "level_zero/tools/source/sysman/os_sysman.h"
 #include "level_zero/tools/source/sysman/temperature/temperature_imp.h"
 
 namespace L0 {
 
-TemperatureHandleContext::~TemperatureHandleContext() {}
+TemperatureHandleContext::~TemperatureHandleContext() {
+    releaseTemperatureHandles();
+}
+
+void TemperatureHandleContext::releaseTemperatureHandles() {
+    handleList.clear();
+}
 
 void TemperatureHandleContext::createHandle(const ze_device_handle_t &deviceHandle, zes_temp_sensors_t type) {
     std::unique_ptr<Temperature> pTemperature = std::make_unique<TemperatureImp>(deviceHandle, pOsSysman, type);
@@ -32,6 +36,7 @@ void TemperatureHandleContext::init(std::vector<ze_device_handle_t> &deviceHandl
 ze_result_t TemperatureHandleContext::temperatureGet(uint32_t *pCount, zes_temp_handle_t *phTemperature) {
     std::call_once(initTemperatureOnce, [this]() {
         this->init(pOsSysman->getDeviceHandles());
+        this->tempInitDone = true;
     });
     uint32_t handleListSize = static_cast<uint32_t>(handleList.size());
     uint32_t numToCopy = std::min(*pCount, handleListSize);

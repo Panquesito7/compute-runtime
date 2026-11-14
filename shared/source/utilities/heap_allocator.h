@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/helpers/constants.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <cstdint>
 #include <mutex>
@@ -31,20 +32,27 @@ class HeapAllocator {
     HeapAllocator(uint64_t address, uint64_t size, size_t allocationAlignment) : HeapAllocator(address, size, allocationAlignment, 4 * MemoryConstants::megaByte) {
     }
 
-    HeapAllocator(uint64_t address, uint64_t size, size_t allocationAlignment, size_t threshold) : size(size), availableSize(size), allocationAlignment(allocationAlignment), sizeThreshold(threshold) {
+    HeapAllocator(uint64_t address, uint64_t size, size_t allocationAlignment, size_t threshold) : baseAddress(address), size(size), availableSize(size), allocationAlignment(allocationAlignment), sizeThreshold(threshold) {
         pLeftBound = address;
         pRightBound = address + size;
         freedChunksBig.reserve(10);
         freedChunksSmall.reserve(50);
     }
 
+    MOCKABLE_VIRTUAL ~HeapAllocator() = default;
+
     uint64_t allocate(size_t &sizeToAllocate) {
         return allocateWithCustomAlignment(sizeToAllocate, 0u);
     }
 
+    uint64_t allocateWithStartAddressHint(const uint64_t requiredStartAddress, size_t &sizeToAllocate) {
+        return allocateWithCustomAlignmentWithStartAddressHint(requiredStartAddress, sizeToAllocate, 0u);
+    }
+
+    uint64_t allocateWithCustomAlignmentWithStartAddressHint(const uint64_t requiredStartAddress, size_t &sizeToAllocate, size_t alignment);
     uint64_t allocateWithCustomAlignment(size_t &sizeToAllocate, size_t alignment);
 
-    void free(uint64_t ptr, size_t size);
+    MOCKABLE_VIRTUAL void free(uint64_t ptr, size_t size);
 
     uint64_t getLeftSize() const {
         return availableSize;
@@ -56,7 +64,16 @@ class HeapAllocator {
 
     double getUsage() const;
 
+    uint64_t getBaseAddress() const {
+        return this->baseAddress;
+    }
+
+    size_t getAllocationAlignment() const {
+        return this->allocationAlignment;
+    }
+
   protected:
+    const uint64_t baseAddress;
     const uint64_t size;
     uint64_t availableSize;
     uint64_t pLeftBound;
@@ -69,6 +86,7 @@ class HeapAllocator {
     std::mutex mtx;
 
     uint64_t getFromFreedChunks(size_t size, std::vector<HeapChunk> &freedChunks, size_t &sizeOfFreedChunk, size_t requiredAlignment);
+    MOCKABLE_VIRTUAL uint64_t getFromFreedChunksWithStartAddressHint(const uint64_t requiredStartAddress, size_t size, std::vector<HeapChunk> &freedChunks);
 
     void storeInFreedChunks(uint64_t ptr, size_t size, std::vector<HeapChunk> &freedChunks) {
         for (auto &freedChunk : freedChunks) {
@@ -80,13 +98,6 @@ class HeapAllocator {
             if (freedChunk.ptr + freedChunk.size == ptr) {
                 freedChunk.size += size;
                 return;
-            }
-            if ((freedChunk.ptr + freedChunk.size) == (ptr + size)) {
-                if (ptr < freedChunk.ptr) {
-                    freedChunk.ptr = ptr;
-                    freedChunk.size = size;
-                    return;
-                }
             }
         }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,10 +26,13 @@ TEST(clReleaseCommandQueueTest, GivenNullCmdQueueWhenReleasingCmdQueueThenClInva
 using ClReleaseCommandQueueTests = ApiTests;
 
 TEST_F(ClReleaseCommandQueueTests, givenBlockedEnqueueWithOutputEventStoredAsVirtualEventWhenReleasingCmdQueueThenInternalRefCountIsDecrementedAndQueueDeleted) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableLinearStreamPoolAllocator.set(0);
+    debugManager.flags.EnableInternalHeapPoolAllocator.set(0);
+
     cl_command_queue cmdQ = nullptr;
     cl_queue_properties properties = 0;
-    ClDevice *device = (ClDevice *)testedClDevice;
-    MockKernelWithInternals kernelInternals(*device, pContext);
+    MockKernelWithInternals kernelInternals(*pContext);
 
     cmdQ = clCreateCommandQueue(pContext, testedClDevice, properties, &retVal);
 

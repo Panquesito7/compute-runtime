@@ -1,0 +1,42 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/direct_submission/direct_submission_controller.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/memory_manager/allocation_properties.h"
+
+#include "aubstream/product_family.h"
+
+namespace NEO {
+
+template <>
+bool ProductHelperHw<gfxProduct>::overrideAllocationCpuCacheable(const AllocationData &allocationData) const {
+    return GraphicsAllocation::isAccessedFromCommandStreamer(allocationData.type);
+}
+
+template <>
+std::optional<aub_stream::ProductFamily> ProductHelperHw<gfxProduct>::getAubStreamProductFamily() const {
+    return aub_stream::ProductFamily::Lnl;
+}
+
+template <>
+std::optional<GfxMemoryAllocationMethod> ProductHelperHw<gfxProduct>::getPreferredAllocationMethod(AllocationType allocationType) const {
+    return GfxMemoryAllocationMethod::allocateByKmd;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::blitEnqueuePreferred(bool isWriteToImageFromBuffer) const {
+    return isWriteToImageFromBuffer;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::initializeInternalEngineImmediately() const {
+    return false;
+}
+
+} // namespace NEO

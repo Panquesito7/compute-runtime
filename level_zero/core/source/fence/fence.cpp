@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,28 +8,31 @@
 #include "level_zero/core/source/fence/fence.h"
 
 #include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/utilities/host_clock.h"
 
-#include "level_zero/core/source/cmdqueue/cmdqueue_imp.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue.h"
+
+#include <limits>
 
 namespace L0 {
 namespace FenceDefinition {
 static constexpr TaskCountType fenceNotReady = NEO::CompletionStamp::notReady;
 } // namespace FenceDefinition
 
-Fence *Fence::create(CommandQueueImp *cmdQueue, const ze_fence_desc_t *desc) {
+Fence *Fence::create(CommandQueue *cmdQueue, const ze_fence_desc_t *desc) {
     auto fence = new Fence(cmdQueue);
     UNRECOVERABLE_IF(fence == nullptr);
     fence->reset(!!(desc->flags & ZE_FENCE_FLAG_SIGNALED));
     return fence;
 }
 
-ze_result_t Fence::queryStatus() {
+ze_result_t Fence::queryStatus(bool blockOnMiss) {
     auto csr = cmdQueue->getCsr();
-    csr->downloadAllocations();
+    cmdQueue->downloadAllocations();
 
     auto *hostAddr = csr->getTagAddress();
 
-    return csr->testTaskCountReady(hostAddr, taskCount) ? ZE_RESULT_SUCCESS : ZE_RESULT_NOT_READY;
+    return csr->testTaskCountReady(hostAddr, taskCount, blockOnMiss) ? ZE_RESULT_SUCCESS : ZE_RESULT_NOT_READY;
 }
 
 ze_result_t Fence::assignTaskCountFromCsr() {
@@ -48,12 +51,11 @@ ze_result_t Fence::reset(bool signaled) {
 }
 
 ze_result_t Fence::hostSynchronize(uint64_t timeout) {
-    std::chrono::high_resolution_clock::time_point waitStartTime, lastHangCheckTime, currentTime;
     uint64_t timeDiff = 0;
     ze_result_t ret = ZE_RESULT_NOT_READY;
     const auto csr = cmdQueue->getCsr();
 
-    if (csr->getType() == NEO::CommandStreamReceiverType::CSR_AUB) {
+    if (csr->getType() == NEO::CommandStreamReceiverType::aub) {
         return ZE_RESULT_SUCCESS;
     }
 
@@ -61,17 +63,17 @@ ze_result_t Fence::hostSynchronize(uint64_t timeout) {
         return ZE_RESULT_NOT_READY;
     }
 
-    waitStartTime = std::chrono::high_resolution_clock::now();
-    lastHangCheckTime = waitStartTime;
+    const auto waitStartTime = NEO::HostClock::getCurrentTimeInNs();
+    auto lastHangCheckTime = waitStartTime;
     do {
-        ret = queryStatus();
+        ret = queryStatus(timeout != 0);
         if (ret == ZE_RESULT_SUCCESS) {
             cmdQueue->printKernelsPrintfOutput(false);
             cmdQueue->checkAssert();
             return ZE_RESULT_SUCCESS;
         }
 
-        currentTime = std::chrono::high_resolution_clock::now();
+        const auto currentTime = NEO::HostClock::getCurrentTimeInNs();
         if (csr->checkGpuHangDetected(currentTime, lastHangCheckTime)) {
             cmdQueue->printKernelsPrintfOutput(true);
             cmdQueue->checkAssert();
@@ -84,7 +86,7 @@ ze_result_t Fence::hostSynchronize(uint64_t timeout) {
             break;
         }
 
-        timeDiff = std::chrono::duration_cast<std::chrono::nanoseconds>(currentTime - waitStartTime).count();
+        timeDiff = static_cast<uint64_t>(currentTime - waitStartTime);
     } while (timeDiff < timeout);
 
     return ret;

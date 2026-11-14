@@ -1,13 +1,11 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "level_zero/tools/source/sysman/frequency/frequency.h"
-
-#include "shared/source/helpers/basic_math.h"
 
 #include "level_zero/tools/source/sysman/frequency/frequency_imp.h"
 #include "level_zero/tools/source/sysman/frequency/os_frequency.h"
@@ -28,9 +26,8 @@ void FrequencyHandleContext::createHandle(ze_device_handle_t deviceHandle, zes_f
 
 ze_result_t FrequencyHandleContext::init(std::vector<ze_device_handle_t> &deviceHandles) {
     for (const auto &deviceHandle : deviceHandles) {
-        auto totalDomains = OsFrequency::getNumberOfFreqDoainsSupported(pOsSysman);
-        UNRECOVERABLE_IF(totalDomains > 2);
-        for (uint32_t frequencyDomain = 0; frequencyDomain < totalDomains; frequencyDomain++) {
+        auto totalDomains = OsFrequency::getNumberOfFreqDomainsSupported(pOsSysman);
+        for (const auto &frequencyDomain : totalDomains) {
             createHandle(deviceHandle, static_cast<zes_freq_domain_t>(frequencyDomain));
         }
     }

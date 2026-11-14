@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2020 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "opencl/source/mem_obj/image.h"
 
+#include "CL/cl_gl.h"
 #include "gtest/gtest.h"
 
 using namespace NEO;
@@ -53,7 +54,7 @@ std::tuple<uint32_t, bool> paramsForAlphaChannelTests[] = {
     {CL_YVYU_INTEL, false},
     {CL_VYUY_INTEL, false}};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     ImageFormatTests,
     HasAlphaChannelTest,
     ::testing::ValuesIn(paramsForAlphaChannelTests));

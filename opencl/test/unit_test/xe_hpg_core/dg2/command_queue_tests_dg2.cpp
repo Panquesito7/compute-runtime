@@ -1,25 +1,36 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/scratch_space_controller_base.h"
-#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/helpers/timestamp_packet_container.h"
+#include "shared/source/kernel/kernel_descriptor.h"
+#include "shared/source/os_interface/os_context.h"
 #include "shared/source/xe_hpg_core/hw_cmds_dg2.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
-#include "shared/test/common/test_macros/test.h"
 
-#include "opencl/source/command_queue/enqueue_common.h"
+#include "opencl/source/cl_device/cl_device.h"
+#include "opencl/source/context/context.h"
 #include "opencl/source/event/event_builder.h"
-#include "opencl/source/helpers/task_information.h"
+#include "opencl/source/helpers/dispatch_info.h"
+#include "opencl/source/helpers/enqueue_properties.h"
+#include "opencl/source/helpers/properties_helper.h"
+#include "opencl/source/kernel/kernel.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_mdi.h"
+
+#include "gtest/gtest.h"
+
+#include <memory>
 
 using namespace NEO;
 
@@ -58,18 +69,18 @@ DG2TEST_F(CommandQueueHwTest, GivenKernelWithDpasAndOddWorkGroupWhenenqueueNonBl
     auto hardwareInfo = *defaultHwInfo;
     auto mockDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, 0));
     std::unique_ptr<OsContext> osContext(OsContext::create(mockDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), mockDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, mockDevice->getDeviceBitfield())));
     auto csr = std::make_unique<MyMockCommandStreamReceiver>(*mockDevice->getExecutionEnvironment(), mockDevice->getRootDeviceIndex(), mockDevice->getDeviceBitfield());
     csr->setupContext(*osContext);
     auto scratchController = new ScratchSpaceControllerBase(pDevice->getRootDeviceIndex(), *pDevice->executionEnvironment, *csr->getInternalAllocationStorage());
     csr->scratchSpaceController.reset(scratchController);
     MockCmdQueueOverrideCsr<FamilyType> cmdQ(pContext, mockDevice.get(), csr.get());
-    MockKernelWithInternals mockKernelWithInternals(*mockDevice.get());
+    MockKernelWithInternals mockKernelWithInternals(*pContext);
     auto pKernel = mockKernelWithInternals.mockKernel;
     MockMultiDispatchInfo multiDispatchInfo(mockDevice.get(), pKernel);
     BlitPropertiesContainer blitPropertiesContainer;
-    const EnqueueProperties enqueueProperties(false, true, false, false, false, &blitPropertiesContainer);
+    const EnqueueProperties enqueueProperties(false, true, false, false, false, false, &blitPropertiesContainer);
     TimestampPacketDependencies timestampPacketDependencies;
     EventsRequest eventsRequest(0, nullptr, nullptr);
     EventBuilder eventBuilder;
@@ -89,18 +100,18 @@ DG2TEST_F(CommandQueueHwTest, GivenKernelWithDpasAndNotOddWorkGroupWhenenqueueNo
     auto hardwareInfo = *defaultHwInfo;
     auto mockDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, 0));
     std::unique_ptr<OsContext> osContext(OsContext::create(mockDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), mockDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, mockDevice->getDeviceBitfield())));
     auto csr = std::make_unique<MyMockCommandStreamReceiver>(*mockDevice->getExecutionEnvironment(), mockDevice->getRootDeviceIndex(), mockDevice->getDeviceBitfield());
     csr->setupContext(*osContext);
     auto scratchController = new ScratchSpaceControllerBase(pDevice->getRootDeviceIndex(), *pDevice->executionEnvironment, *csr->getInternalAllocationStorage());
     csr->scratchSpaceController.reset(scratchController);
     MockCmdQueueOverrideCsr<FamilyType> cmdQ(pContext, mockDevice.get(), csr.get());
-    MockKernelWithInternals mockKernelWithInternals(*mockDevice.get());
+    MockKernelWithInternals mockKernelWithInternals(*pContext);
     auto pKernel = mockKernelWithInternals.mockKernel;
     MockMultiDispatchInfo multiDispatchInfo(mockDevice.get(), pKernel);
     BlitPropertiesContainer blitPropertiesContainer;
-    const EnqueueProperties enqueueProperties(false, true, false, false, false, &blitPropertiesContainer);
+    const EnqueueProperties enqueueProperties(false, true, false, false, false, false, &blitPropertiesContainer);
     TimestampPacketDependencies timestampPacketDependencies;
     EventsRequest eventsRequest(0, nullptr, nullptr);
     EventBuilder eventBuilder;
@@ -125,18 +136,18 @@ DG2TEST_F(CommandQueueHwTest, GivenKernelWithRequiredDisableEuFusionWhenenqueueN
     auto hardwareInfo = *defaultHwInfo;
     auto mockDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, 0));
     std::unique_ptr<OsContext> osContext(OsContext::create(mockDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), mockDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, mockDevice->getDeviceBitfield())));
     auto csr = std::make_unique<MyMockCommandStreamReceiver>(*mockDevice->getExecutionEnvironment(), mockDevice->getRootDeviceIndex(), mockDevice->getDeviceBitfield());
     csr->setupContext(*osContext);
     auto scratchController = new ScratchSpaceControllerBase(pDevice->getRootDeviceIndex(), *pDevice->executionEnvironment, *csr->getInternalAllocationStorage());
     csr->scratchSpaceController.reset(scratchController);
     MockCmdQueueOverrideCsr<FamilyType> cmdQ(pContext, mockDevice.get(), csr.get());
-    MockKernelWithInternals mockKernelWithInternals(*mockDevice.get());
+    MockKernelWithInternals mockKernelWithInternals(*pContext);
     auto pKernel = mockKernelWithInternals.mockKernel;
     MockMultiDispatchInfo multiDispatchInfo(mockDevice.get(), pKernel);
     BlitPropertiesContainer blitPropertiesContainer;
-    const EnqueueProperties enqueueProperties(false, true, false, false, false, &blitPropertiesContainer);
+    const EnqueueProperties enqueueProperties(false, true, false, false, false, false, &blitPropertiesContainer);
     TimestampPacketDependencies timestampPacketDependencies;
     EventsRequest eventsRequest(0, nullptr, nullptr);
     EventBuilder eventBuilder;
@@ -152,18 +163,18 @@ DG2TEST_F(CommandQueueHwTest, GivenKernelWithoutRequiredDisableEuFusionWhenenque
     auto hardwareInfo = *defaultHwInfo;
     auto mockDevice = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, 0));
     std::unique_ptr<OsContext> osContext(OsContext::create(mockDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.get(), mockDevice->getRootDeviceIndex(), 0,
-                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::Regular},
+                                                           EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS1, EngineUsage::regular},
                                                                                                         PreemptionMode::ThreadGroup, mockDevice->getDeviceBitfield())));
     auto csr = std::make_unique<MyMockCommandStreamReceiver>(*mockDevice->getExecutionEnvironment(), mockDevice->getRootDeviceIndex(), mockDevice->getDeviceBitfield());
     csr->setupContext(*osContext);
     auto scratchController = new ScratchSpaceControllerBase(pDevice->getRootDeviceIndex(), *pDevice->executionEnvironment, *csr->getInternalAllocationStorage());
     csr->scratchSpaceController.reset(scratchController);
     MockCmdQueueOverrideCsr<FamilyType> cmdQ(pContext, mockDevice.get(), csr.get());
-    MockKernelWithInternals mockKernelWithInternals(*mockDevice.get());
+    MockKernelWithInternals mockKernelWithInternals(*pContext);
     auto pKernel = mockKernelWithInternals.mockKernel;
     MockMultiDispatchInfo multiDispatchInfo(mockDevice.get(), pKernel);
     BlitPropertiesContainer blitPropertiesContainer;
-    const EnqueueProperties enqueueProperties(false, true, false, false, false, &blitPropertiesContainer);
+    const EnqueueProperties enqueueProperties(false, true, false, false, false, false, &blitPropertiesContainer);
     TimestampPacketDependencies timestampPacketDependencies;
     EventsRequest eventsRequest(0, nullptr, nullptr);
     EventBuilder eventBuilder;

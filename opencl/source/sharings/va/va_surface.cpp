@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "opencl/source/sharings/va/va_surface.h"
 
+#include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/allocation_properties.h"
@@ -17,7 +18,8 @@
 #include "opencl/source/context/context.h"
 #include "opencl/source/mem_obj/image.h"
 
-#include <drm/drm_fourcc.h>
+#include "drm_fourcc.h"
+
 #include <va/va_drmcommon.h>
 
 namespace NEO {
@@ -39,6 +41,8 @@ bool VASurface::isSupportedPackedFormat(uint32_t imageFourcc) {
     case VA_FOURCC_YUY2:
         return true;
     case VA_FOURCC_Y210:
+        return true;
+    case VA_FOURCC_ARGB:
         return true;
     default:
         return false;
@@ -105,26 +109,26 @@ VAStatus VASurface::getSurfaceDescription(SharedSurfaceInfo &surfaceInfo, VAShar
     return vaStatus;
 }
 
-void VASurface::applyPlanarOptions(SharedSurfaceInfo &sharedSurfaceInfo, cl_uint plane, cl_mem_flags flags, bool supportOcl21) {
-    bool isRGBPFormat = DebugManager.flags.EnableExtendedVaFormats.get() && sharedSurfaceInfo.imageFourcc == VA_FOURCC_RGBP;
+void VASurface::applyPlanarOptions(SharedSurfaceInfo &sharedSurfaceInfo, cl_uint plane, cl_mem_flags flags) {
+    bool isRGBPFormat = debugManager.flags.EnableExtendedVaFormats.get() && sharedSurfaceInfo.imageFourcc == VA_FOURCC_RGBP;
 
     if (plane == 0) {
-        sharedSurfaceInfo.imgInfo.plane = GMM_PLANE_Y;
+        sharedSurfaceInfo.imgInfo.plane = ImagePlane::planeY;
         sharedSurfaceInfo.channelOrder = CL_R;
     } else if (plane == 1) {
-        sharedSurfaceInfo.imgInfo.plane = GMM_PLANE_U;
+        sharedSurfaceInfo.imgInfo.plane = ImagePlane::planeU;
         sharedSurfaceInfo.channelOrder = isRGBPFormat ? CL_R : CL_RG;
     } else if (plane == 2) {
         UNRECOVERABLE_IF(!isRGBPFormat);
-        sharedSurfaceInfo.imgInfo.plane = GMM_PLANE_V;
+        sharedSurfaceInfo.imgInfo.plane = ImagePlane::planeV;
         sharedSurfaceInfo.channelOrder = CL_R;
     } else {
         UNRECOVERABLE_IF(true);
     }
 
-    auto gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &sharedSurfaceInfo.gmmImgFormat, supportOcl21); // vaImage.format.fourcc == VA_FOURCC_NV12
+    auto gmmSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &sharedSurfaceInfo.gmmImgFormat); // vaImage.format.fourcc == VA_FOURCC_NV12
 
-    if (DebugManager.flags.EnableExtendedVaFormats.get() && sharedSurfaceInfo.imageFourcc == VA_FOURCC_RGBP) {
+    if (debugManager.flags.EnableExtendedVaFormats.get() && sharedSurfaceInfo.imageFourcc == VA_FOURCC_RGBP) {
         sharedSurfaceInfo.channelType = CL_UNORM_INT8;
         gmmSurfaceFormat = VASurface::getExtendedSurfaceFormatInfo(sharedSurfaceInfo.imageFourcc);
     } else if (sharedSurfaceInfo.imageFourcc == VA_FOURCC_P010 || sharedSurfaceInfo.imageFourcc == VA_FOURCC_P016) {
@@ -135,7 +139,7 @@ void VASurface::applyPlanarOptions(SharedSurfaceInfo &sharedSurfaceInfo, cl_uint
 }
 
 void VASurface::applyPlaneSettings(SharedSurfaceInfo &sharedSurfaceInfo, cl_uint plane) {
-    bool isRGBPFormat = DebugManager.flags.EnableExtendedVaFormats.get() && sharedSurfaceInfo.imageFourcc == VA_FOURCC_RGBP;
+    bool isRGBPFormat = debugManager.flags.EnableExtendedVaFormats.get() && sharedSurfaceInfo.imageFourcc == VA_FOURCC_RGBP;
 
     sharedSurfaceInfo.imgInfo.slicePitch = 0u;
     sharedSurfaceInfo.imgInfo.yOffset = 0;
@@ -156,6 +160,9 @@ void VASurface::applyPlaneSettings(SharedSurfaceInfo &sharedSurfaceInfo, cl_uint
 void VASurface::applyPackedOptions(SharedSurfaceInfo &sharedSurfaceInfo) {
     if (sharedSurfaceInfo.imageFourcc == VA_FOURCC_Y210) {
         sharedSurfaceInfo.channelType = CL_UNORM_INT16;
+        sharedSurfaceInfo.channelOrder = CL_RGBA;
+    } else if (sharedSurfaceInfo.imageFourcc == VA_FOURCC_ARGB) {
+        sharedSurfaceInfo.channelType = CL_UNORM_INT8;
         sharedSurfaceInfo.channelOrder = CL_RGBA;
     } else {
         sharedSurfaceInfo.channelType = CL_UNORM_INT8;
@@ -184,12 +191,10 @@ Image *VASurface::createSharedVaSurface(Context *context, VASharingFunctions *sh
         return nullptr;
     }
 
-    sharedSurfaceInfo.imgInfo.imgDesc.imageType = ImageType::Image2D;
-
-    bool supportOcl21 = context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features;
+    sharedSurfaceInfo.imgInfo.imgDesc.imageType = ImageType::image2D;
 
     if (VASurface::isSupportedPlanarFormat(sharedSurfaceInfo.imageFourcc)) {
-        applyPlanarOptions(sharedSurfaceInfo, plane, flags, supportOcl21);
+        applyPlanarOptions(sharedSurfaceInfo, plane, flags);
     } else if (VASurface::isSupportedPackedFormat(sharedSurfaceInfo.imageFourcc)) {
         applyPackedOptions(sharedSurfaceInfo);
     } else {
@@ -199,10 +204,11 @@ Image *VASurface::createSharedVaSurface(Context *context, VASharingFunctions *sh
 
     AllocationProperties properties(context->getDevice(0)->getRootDeviceIndex(),
                                     false, // allocateMemory
-                                    sharedSurfaceInfo.imgInfo, AllocationType::SHARED_IMAGE,
+                                    &sharedSurfaceInfo.imgInfo, AllocationType::sharedImage,
                                     context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex()));
 
-    auto alloc = memoryManager->createGraphicsAllocationFromSharedHandle(sharedSurfaceInfo.sharedHandle, properties, false, false, true, nullptr);
+    MemoryManager::OsHandleData osHandleData{sharedSurfaceInfo.sharedHandle};
+    auto alloc = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
 
     memoryManager->closeSharedHandle(alloc);
 
@@ -217,7 +223,7 @@ Image *VASurface::createSharedVaSurface(Context *context, VASharingFunctions *sh
     lock.unlock();
 
     cl_image_format imgFormat = {sharedSurfaceInfo.channelOrder, sharedSurfaceInfo.channelType};
-    auto imgSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &imgFormat, supportOcl21);
+    auto imgSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &imgFormat);
     sharedSurfaceInfo.imgInfo.surfaceFormat = &imgSurfaceFormat->surfaceFormat;
     sharedSurfaceInfo.imgInfo.imgDesc.imageRowPitch = sharedSurfaceInfo.imgInfo.rowPitch;
 
@@ -225,7 +231,10 @@ Image *VASurface::createSharedVaSurface(Context *context, VASharingFunctions *sh
     auto multiGraphicsAllocation = MultiGraphicsAllocation(context->getDevice(0)->getRootDeviceIndex());
     multiGraphicsAllocation.addAllocation(alloc);
 
-    auto image = Image::createSharedImage(context, vaSurface, mcsSurfaceInfo, std::move(multiGraphicsAllocation), nullptr, flags, flagsIntel, imgSurfaceFormat, sharedSurfaceInfo.imgInfo, __GMM_NO_CUBE_MAP, 0, 0);
+    auto image = Image::createSharedImage(context, vaSurface, mcsSurfaceInfo, std::move(multiGraphicsAllocation), nullptr, flags, flagsIntel, imgSurfaceFormat, sharedSurfaceInfo.imgInfo, __GMM_NO_CUBE_MAP, 0, 0, false, errcodeRet);
+    if (image == nullptr) {
+        return nullptr;
+    }
     image->setMediaPlaneType(plane);
     return image;
 }
@@ -255,7 +264,7 @@ bool VASurface::validate(cl_mem_flags flags, cl_uint plane) {
     default:
         return false;
     }
-    if (plane > 1 && !DebugManager.flags.EnableExtendedVaFormats.get()) {
+    if (plane > 1 && !debugManager.flags.EnableExtendedVaFormats.get()) {
         return false;
     }
     return true;
@@ -265,7 +274,7 @@ const ClSurfaceFormatInfo *VASurface::getExtendedSurfaceFormatInfo(uint32_t form
     if (formatFourCC == VA_FOURCC_P010) {
         static const ClSurfaceFormatInfo formatInfoP010 = {{CL_NV12_INTEL, CL_UNORM_INT16},
                                                            {GMM_RESOURCE_FORMAT::GMM_FORMAT_P010,
-                                                            static_cast<GFX3DSTATE_SURFACEFORMAT>(NUM_GFX3DSTATE_SURFACEFORMATS), // not used for plane images
+                                                            static_cast<SurfaceFormat>(NUM_GFX3DSTATE_SURFACEFORMATS), // not used for plane images
                                                             0,
                                                             1,
                                                             2,
@@ -275,7 +284,7 @@ const ClSurfaceFormatInfo *VASurface::getExtendedSurfaceFormatInfo(uint32_t form
     if (formatFourCC == VA_FOURCC_P016) {
         static const ClSurfaceFormatInfo formatInfoP016 = {{CL_NV12_INTEL, CL_UNORM_INT16},
                                                            {GMM_RESOURCE_FORMAT::GMM_FORMAT_P016,
-                                                            static_cast<GFX3DSTATE_SURFACEFORMAT>(NUM_GFX3DSTATE_SURFACEFORMATS), // not used for plane images
+                                                            static_cast<SurfaceFormat>(NUM_GFX3DSTATE_SURFACEFORMATS), // not used for plane images
                                                             0,
                                                             1,
                                                             2,
@@ -285,7 +294,7 @@ const ClSurfaceFormatInfo *VASurface::getExtendedSurfaceFormatInfo(uint32_t form
     if (formatFourCC == VA_FOURCC_RGBP) {
         static const ClSurfaceFormatInfo formatInfoRGBP = {{CL_NV12_INTEL, CL_UNORM_INT8},
                                                            {GMM_RESOURCE_FORMAT::GMM_FORMAT_RGBP,
-                                                            static_cast<GFX3DSTATE_SURFACEFORMAT>(GFX3DSTATE_SURFACEFORMAT_R8_UNORM), // not used for plane images
+                                                            static_cast<SurfaceFormat>(GFX3DSTATE_SURFACEFORMAT_R8_UNORM), // not used for plane images
                                                             0,
                                                             1,
                                                             1,
@@ -295,7 +304,7 @@ const ClSurfaceFormatInfo *VASurface::getExtendedSurfaceFormatInfo(uint32_t form
     if (formatFourCC == VA_FOURCC_YUY2) {
         static const ClSurfaceFormatInfo formatInfoYUY2 = {{CL_YUYV_INTEL, CL_UNORM_INT8},
                                                            {GMM_RESOURCE_FORMAT::GMM_FORMAT_YUY2,
-                                                            static_cast<GFX3DSTATE_SURFACEFORMAT>(GFX3DSTATE_SURFACEFORMAT_YCRCB_NORMAL),
+                                                            static_cast<SurfaceFormat>(GFX3DSTATE_SURFACEFORMAT_YCRCB_NORMAL),
                                                             0,
                                                             2,
                                                             1,
@@ -305,12 +314,23 @@ const ClSurfaceFormatInfo *VASurface::getExtendedSurfaceFormatInfo(uint32_t form
     if (formatFourCC == VA_FOURCC_Y210) {
         static const ClSurfaceFormatInfo formatInfoY210 = {{CL_RGBA, CL_UNORM_INT16},
                                                            {GMM_RESOURCE_FORMAT::GMM_FORMAT_Y210,
-                                                            static_cast<GFX3DSTATE_SURFACEFORMAT>(GFX3DSTATE_SURFACEFORMAT_R16G16B16A16_UNORM),
+                                                            static_cast<SurfaceFormat>(GFX3DSTATE_SURFACEFORMAT_R16G16B16A16_UNORM),
                                                             0,
                                                             4,
                                                             2,
                                                             8}};
         return &formatInfoY210;
+    }
+
+    if (formatFourCC == VA_FOURCC_ARGB) {
+        static const ClSurfaceFormatInfo formatInfoARGB = {{CL_RGBA, CL_UNORM_INT8},
+                                                           {GMM_RESOURCE_FORMAT::GMM_FORMAT_R8G8B8A8_UNORM_TYPE,
+                                                            static_cast<SurfaceFormat>(GFX3DSTATE_SURFACEFORMAT_R8G8B8A8_UNORM),
+                                                            0,
+                                                            4,
+                                                            1,
+                                                            4}};
+        return &formatInfoARGB;
     }
 
     return nullptr;
@@ -326,7 +346,7 @@ bool VASurface::isSupportedFourCCTwoPlaneFormat(int fourcc) {
 }
 
 bool VASurface::isSupportedFourCCThreePlaneFormat(int fourcc) {
-    if (DebugManager.flags.EnableExtendedVaFormats.get() && fourcc == VA_FOURCC_RGBP) {
+    if (debugManager.flags.EnableExtendedVaFormats.get() && fourcc == VA_FOURCC_RGBP) {
         return true;
     }
     return false;

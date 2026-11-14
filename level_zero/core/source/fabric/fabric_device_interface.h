@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -20,11 +20,10 @@ class FabricDeviceInterface {
 
   public:
     enum class Type {
-        Undefined,
-        Iaf,
-        Mdfi
+        iaf,
+        mdfi
     };
-    virtual ~FabricDeviceInterface(){};
+    virtual ~FabricDeviceInterface() {};
     virtual ze_result_t enumerate() = 0;
     static std::unique_ptr<FabricDeviceInterface> createFabricDeviceInterfaceIaf(const FabricVertex *fabricVertex);
     static std::unique_ptr<FabricDeviceInterface> createFabricDeviceInterfaceMdfi(const FabricVertex *fabricVertex);

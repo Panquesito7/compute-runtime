@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,6 @@
 #include "shared/test/common/helpers/variable_backup.h"
 
 #include "opencl/source/platform/platform.h"
-#include "opencl/test/unit_test/mocks/mock_platform.h"
 
 #include "gtest/gtest.h"
 
@@ -22,8 +21,8 @@ TEST(MultiDeviceTests, givenCreateMultipleRootDevicesAndLimitAmountOfReturnedDev
     ultHwConfig.forceOsAgnosticMemoryManager = false;
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.CreateMultipleRootDevices.set(2);
-    DebugManager.flags.LimitAmountOfReturnedDevices.set(1);
+    debugManager.flags.CreateMultipleRootDevices.set(2);
+    debugManager.flags.LimitAmountOfReturnedDevices.set(1);
     cl_uint numDevices = 0;
 
     auto retVal = clGetDeviceIDs(nullptr, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices);

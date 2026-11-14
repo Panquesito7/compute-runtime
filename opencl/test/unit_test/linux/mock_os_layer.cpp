@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,25 +7,25 @@
 
 #include "mock_os_layer.h"
 
+#include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/drm_wrappers.h"
-#include "shared/source/os_interface/linux/i915.h"
+#include "shared/source/os_interface/linux/i915_prelim.h"
 
 #include <cassert>
+#include <cstdarg>
 #include <dirent.h>
-#include <iostream>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 
-int (*c_open)(const char *pathname, int flags, ...) = nullptr;
+int (*openFunc)(const char *pathname, int flags, ...) = nullptr;
 int (*openFull)(const char *pathname, int flags, ...) = nullptr;
 
 int fakeFd = 1023;
 int haveDri = 0;                                       // index of dri to serve, -1 - none
 int deviceId = NEO::deviceDescriptorTable[0].deviceId; // default supported DeviceID
 int revisionId = 17;
-int haveSoftPin = 1;
 int havePreemption = I915_SCHEDULER_CAP_ENABLED |
                      I915_SCHEDULER_CAP_PRIORITY |
                      I915_SCHEDULER_CAP_PREEMPTION;
@@ -34,7 +34,6 @@ int failOnDeviceId = 0;
 int failOnEuTotal = 0;
 int failOnSubsliceTotal = 0;
 int failOnRevisionId = 0;
-int failOnSoftPin = 0;
 int failOnParamBoost = 0;
 int failOnSetParamSseu = 0;
 int failOnGetParamSseu = 0;
@@ -43,6 +42,7 @@ int failOnVirtualMemoryCreate = 0;
 int failOnSetPriority = 0;
 int failOnPreemption = 0;
 int failOnDrmVersion = 0;
+int captureVirtualMemoryCreate = 0;
 int accessCalledTimes = 0;
 int readLinkCalledTimes = 0;
 int fstatCalledTimes = 0;
@@ -51,6 +51,7 @@ char providedDrmVersion[5] = {'i', '9', '1', '5', '\0'};
 uint64_t gpuTimestamp = 0;
 int ioctlSeq[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 size_t ioctlCnt = 0;
+std::vector<NEO::GemVmControl> capturedVmCreate{};
 
 int fstat(int fd, struct stat *buf) {
     ++fstatCalledTimes;
@@ -81,8 +82,8 @@ int open(const char *pathname, int flags, ...) {
     if (openFull != nullptr) {
         return openFull(pathname, flags);
     }
-    if (c_open == nullptr) {
-        c_open = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
+    if (openFunc == nullptr) {
+        openFunc = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
     }
 
     if (strncmp("/dev/dri/", pathname, 9) == 0) {
@@ -93,7 +94,7 @@ int open(const char *pathname, int flags, ...) {
         }
     }
 
-    return c_open(pathname, flags);
+    return openFunc(pathname, flags);
 }
 bool failOnOpenDir = false;
 DIR *validDir = reinterpret_cast<DIR *>(0xc001);
@@ -155,10 +156,6 @@ int drmGetParam(NEO::GetParam *param) {
     case I915_PARAM_REVISION:
         *param->value = revisionId;
         ret = failOnRevisionId;
-        break;
-    case I915_PARAM_HAS_EXEC_SOFTPIN:
-        *param->value = haveSoftPin;
-        ret = failOnSoftPin;
         break;
 #if defined(I915_PARAM_HAS_SCHEDULER)
     case I915_PARAM_HAS_SCHEDULER:
@@ -229,16 +226,20 @@ int drmContextCreate(NEO::GemContextCreateExt *create) {
 int drmContextDestroy(NEO::GemContextDestroy *destroy) {
     assert(destroy);
 
-    if (destroy->contextId == 1)
+    if (destroy->contextId == 1) {
         return 0;
-    else
+    } else {
         return -1;
+    }
 }
 
 int drmVirtualMemoryCreate(NEO::GemVmControl *control) {
     assert(control);
     if (!failOnVirtualMemoryCreate) {
         control->vmId = ++vmId;
+    }
+    if (captureVirtualMemoryCreate) {
+        capturedVmCreate.push_back(*control);
     }
     return failOnVirtualMemoryCreate;
 }
@@ -258,22 +259,31 @@ int drmVersion(NEO::DrmVersion *version) {
 
 int drmQueryItem(NEO::Query *query) {
     auto queryItemArg = reinterpret_cast<NEO::QueryItem *>(query->itemsPtr);
+
+    constexpr int sliceCount = 1;
+    constexpr int subsliceCount = 1;
+    constexpr int euCount = 3;
+    const auto dataSize = static_cast<size_t>(Math::divideAndRoundUp(sliceCount, 8u) + Math::divideAndRoundUp(subsliceCount, 8u) + Math::divideAndRoundUp(euCount, 8u));
+
     if (queryItemArg->length == 0) {
         if (queryItemArg->queryId == DRM_I915_QUERY_TOPOLOGY_INFO) {
-            queryItemArg->length = sizeof(NEO::QueryTopologyInfo) + 1;
+            queryItemArg->length = static_cast<int32_t>(sizeof(NEO::QueryTopologyInfo) + dataSize);
             return 0;
         }
-    } else {
-        if (queryItemArg->queryId == DRM_I915_QUERY_TOPOLOGY_INFO) {
-            auto topologyArg = reinterpret_cast<NEO::QueryTopologyInfo *>(queryItemArg->dataPtr);
-            topologyArg->maxSlices = 1;
-            topologyArg->maxSubslices = 1;
-            topologyArg->maxEusPerSubslice = 3;
-            topologyArg->data[0] = 0xFF;
-            return failOnEuTotal || failOnSubsliceTotal;
-        }
+    } else if (queryItemArg->queryId == DRM_I915_QUERY_TOPOLOGY_INFO) {
+        auto topologyArg = reinterpret_cast<NEO::QueryTopologyInfo *>(queryItemArg->dataPtr);
+        topologyArg->maxSlices = 1;
+        topologyArg->maxSubslices = 1;
+        topologyArg->maxEusPerSubslice = 3;
+        topologyArg->subsliceOffset = 1;
+        topologyArg->subsliceStride = 1;
+        topologyArg->euOffset = 2;
+        topologyArg->euStride = 1;
+        memset(topologyArg->data, 0xFF, dataSize);
+        return failOnEuTotal || failOnSubsliceTotal;
     }
-    return drmOtherRequests(DRM_IOCTL_I915_QUERY, query);
+
+    return drmQuery(query);
 }
 
 int ioctl(int fd, unsigned long int request, ...) throw() {
@@ -324,9 +334,6 @@ int ioctl(int fd, unsigned long int request, ...) throw() {
             case DRM_IOCTL_I915_QUERY:
                 res = drmQueryItem(va_arg(vl, NEO::Query *));
                 break;
-            default:
-                res = drmOtherRequests(request, vl);
-                break;
             }
         }
         va_end(vl);
@@ -335,4 +342,93 @@ int ioctl(int fd, unsigned long int request, ...) throw() {
 
     va_end(vl);
     return -1;
+}
+
+namespace DrmQueryConfig {
+int failOnQueryEngineInfo = 0;
+int failOnQueryMemoryInfo = 0;
+unsigned int retrieveQueryMemoryInfoRegionCount = 3;
+} // namespace DrmQueryConfig
+
+uint32_t getTileFromEngineOrMemoryInstance(uint16_t instanceValue) {
+    uint8_t tileMask = (instanceValue >> 8);
+
+    return Math::log2(static_cast<uint64_t>(tileMask));
+}
+
+uint16_t getEngineOrMemoryInstanceValue(uint16_t tile) {
+    return ((1 << tile) << 8);
+}
+
+int drmQuery(NEO::Query *param) {
+    auto expectedQueryEngineLength = static_cast<int32_t>(sizeof(drm_i915_query_engine_info) + (sizeof(drm_i915_engine_info) * DrmQueryConfig::retrieveQueryMemoryInfoRegionCount));
+    assert(param);
+    int ret = -1;
+    int32_t requiredLength = 0u;
+
+    for (uint32_t i = 0; i < param->numItems; i++) {
+        auto itemArray = reinterpret_cast<NEO::QueryItem *>(param->itemsPtr);
+        auto item = &itemArray[i];
+        switch (item->queryId) {
+        case DRM_I915_QUERY_ENGINE_INFO:
+
+            if (0 == item->length) {
+                item->length = expectedQueryEngineLength;
+            } else {
+                assert(expectedQueryEngineLength == item->length);
+                auto queryEngineInfo = reinterpret_cast<drm_i915_query_engine_info *>(item->dataPtr);
+                auto engineInfo = queryEngineInfo->engines;
+
+                for (uint32_t i = 0; i < DrmQueryConfig::retrieveQueryMemoryInfoRegionCount; i++) {
+                    engineInfo++->engine = {I915_ENGINE_CLASS_RENDER, getEngineOrMemoryInstanceValue(i)};
+                }
+
+                queryEngineInfo->num_engines = DrmQueryConfig::retrieveQueryMemoryInfoRegionCount;
+            }
+            ret = DrmQueryConfig::failOnQueryEngineInfo ? -1 : 0;
+            break;
+        case DRM_I915_QUERY_MEMORY_REGIONS:
+            requiredLength = static_cast<int32_t>(sizeof(drm_i915_query_memory_regions) +
+                                                  DrmQueryConfig::retrieveQueryMemoryInfoRegionCount * sizeof(drm_i915_memory_region_info));
+
+            if (0 == item->length) {
+                item->length = requiredLength;
+            } else {
+                assert(requiredLength == item->length);
+                auto region = reinterpret_cast<drm_i915_query_memory_regions *>(item->dataPtr);
+                region->num_regions = DrmQueryConfig::retrieveQueryMemoryInfoRegionCount;
+                for (uint32_t i = 0; i < DrmQueryConfig::retrieveQueryMemoryInfoRegionCount; i++) {
+                    drm_i915_memory_region_info regionInfo = {};
+                    regionInfo.region.memory_class = (i == 0) ? I915_MEMORY_CLASS_SYSTEM : I915_MEMORY_CLASS_DEVICE;
+                    if (i >= 1) {
+                        regionInfo.region.memory_instance = getEngineOrMemoryInstanceValue(i - 1);
+                    }
+                    region->regions[i] = regionInfo;
+                }
+            }
+            ret = DrmQueryConfig::failOnQueryMemoryInfo ? -1 : 0;
+            break;
+        case PRELIM_DRM_I915_QUERY_DISTANCE_INFO:
+            auto queryDistanceInfo = reinterpret_cast<prelim_drm_i915_query_distance_info *>(item->dataPtr);
+            switch (queryDistanceInfo->region.memory_class) {
+            case I915_MEMORY_CLASS_SYSTEM:
+                queryDistanceInfo->distance = -1;
+                break;
+            case I915_MEMORY_CLASS_DEVICE: {
+                auto engineTile = getTileFromEngineOrMemoryInstance(queryDistanceInfo->engine.engine_instance);
+                auto memoryTile = getTileFromEngineOrMemoryInstance(queryDistanceInfo->region.memory_instance);
+
+                queryDistanceInfo->distance = (memoryTile == engineTile) ? 0 : 100;
+                break;
+            }
+            default:
+                item->length = -EINVAL;
+                break;
+            }
+            ret = 0;
+            break;
+        }
+    }
+
+    return ret;
 }

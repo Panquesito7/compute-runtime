@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,113 +7,88 @@
 
 #pragma once
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/hw_mapper.h"
+#include "shared/source/helpers/pause_on_gpu_properties.h"
 #include "shared/source/unified_memory/unified_memory.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
-#include "level_zero/core/source/cmdqueue/cmdqueue_imp.h"
+#include "level_zero/core/source/cmdlist/command_to_patch.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue.h"
 
 namespace NEO {
 class ScratchSpaceController;
 } // namespace NEO
 
 namespace L0 {
+struct CommandListExecutionContext;
+struct CountersCrossSyncContainer;
+struct PatchPreambleBarrier;
+struct CommandList;
 
 template <GFXCORE_FAMILY gfxCoreFamily>
-struct CommandQueueHw : public CommandQueueImp {
-    using CommandQueueImp::CommandQueueImp;
+struct CommandQueueHw : public CommandQueue {
+    using CommandQueue::CommandQueue;
     using GfxFamily = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-
+    CommandQueueHw(Device *device, NEO::CommandStreamReceiver *csr, const ze_command_queue_desc_t *desc);
     ze_result_t createFence(const ze_fence_desc_t *desc, ze_fence_handle_t *phFence) override;
     ze_result_t executeCommandLists(uint32_t numCommandLists,
                                     ze_command_list_handle_t *phCommandLists,
-                                    ze_fence_handle_t hFence, bool performMigration) override;
-    ze_result_t executeCommands(uint32_t numCommands,
-                                void *phCommands,
-                                ze_fence_handle_t hFence) override;
+                                    ze_fence_handle_t hFence,
+                                    CommandListExecutionInternalOptions &internalOptions) override;
 
     void programStateBaseAddress(uint64_t gsba, bool useLocalMemoryForIndirectHeap, NEO::LinearStream &commandStream, bool cachedMOCSAllowed, NEO::StreamProperties *streamProperties);
     size_t estimateStateBaseAddressCmdSize();
-    MOCKABLE_VIRTUAL void programFrontEnd(uint64_t scratchAddress, uint32_t perThreadScratchSpaceSize, NEO::LinearStream &commandStream, NEO::StreamProperties &streamProperties);
+    size_t estimatePatchPreambleCrossSyncSize(size_t numberCrossSyncs) {
+        size_t waitSize = estimateSingleSynchronizationCommandSize(numberCrossSyncs, numberCrossSyncs);
+        return waitSize;
+    }
+    size_t estimateSingleImmediateCompletionCrossSyncSize(size_t numberCrossSyncs, uint32_t partitions) {
+        size_t waitSize = estimateSingleSynchronizationCommandSize(numberCrossSyncs * partitions, numberCrossSyncs);
+        return waitSize;
+    }
+    size_t estimatePatchPreambleBarrierSize(const CountersCrossSyncContainer &countersCrossSyncContainer);
+    MOCKABLE_VIRTUAL void programFrontEnd(uint64_t scratchAddress, uint32_t perThreadScratchSpaceSlot0Size, NEO::LinearStream &commandStream, NEO::StreamProperties &streamProperties);
 
-    MOCKABLE_VIRTUAL size_t estimateFrontEndCmdSizeForMultipleCommandLists(bool &isFrontEndStateDirty, int32_t engineInstanced, CommandList *commandList,
-                                                                           NEO::StreamProperties &csrState,
-                                                                           const NEO::StreamProperties &cmdListRequired,
-                                                                           const NEO::StreamProperties &cmdListFinal,
-                                                                           NEO::StreamProperties &requiredState,
-                                                                           bool &propertyDirty,
-                                                                           bool &frontEndReturnPoint);
     size_t estimateFrontEndCmdSize();
     size_t estimateFrontEndCmdSize(bool isFrontEndDirty);
 
     void programPipelineSelectIfGpgpuDisabled(NEO::LinearStream &commandStream);
 
-    MOCKABLE_VIRTUAL void handleScratchSpace(NEO::HeapContainer &heapContainer,
+    MOCKABLE_VIRTUAL bool handleScratchSpace(NEO::HeapContainer &heapContainer,
                                              NEO::ScratchSpaceController *scratchController,
+                                             NEO::GraphicsAllocation *globalStatelessAllocation,
                                              bool &gsbaState, bool &frontEndState,
-                                             uint32_t perThreadScratchSpaceSize,
-                                             uint32_t perThreadPrivateScratchSize);
+                                             uint32_t perThreadScratchSpaceSlot0Size,
+                                             uint32_t perThreadScratchSpaceSlot1Size);
 
     bool getPreemptionCmdProgramming() override;
-    void patchCommands(CommandList &commandList, uint64_t scratchAddress);
+    void patchCommands(CommandList &commandList, uint64_t scratchAddress, bool patchNewScratchController,
+                       bool patchPreambleEnabled, void **patchPreambleBuffer);
+    COLD_SECTION NEO::PauseOnGpuProperties::PauseSelection patchDebugPauses(ze_command_list_handle_t *phCommandLists, uint32_t numCommandLists);
+    COLD_SECTION void programDebugPause(NEO::LinearStream &commandStream, bool isBlit, bool beforeWorkload);
 
   protected:
-    struct CommandListExecutionContext {
-
-        CommandListExecutionContext() {}
-
-        CommandListExecutionContext(ze_command_list_handle_t *commandListHandles,
-                                    uint32_t numCommandLists,
-                                    NEO::PreemptionMode contextPreemptionMode,
-                                    Device *device,
-                                    bool debugEnabled,
-                                    bool programActivePartitionConfig,
-                                    bool performMigration);
-
-        inline bool isNEODebuggerActive(Device *device);
-
-        NEO::StreamProperties cmdListBeginState{};
-        uint64_t scratchGsba = 0;
-        uint64_t childGpuAddressPositionBeforeDynamicPreamble = 0;
-
-        size_t spaceForResidency = 10;
-        CommandList *firstCommandList = nullptr;
-        CommandList *lastCommandList = nullptr;
-        void *currentPatchForChainedBbStart = nullptr;
-
-        NEO::PreemptionMode preemptionMode{};
-        NEO::PreemptionMode statePreemption{};
-        uint32_t perThreadScratchSpaceSize = 0;
-        uint32_t perThreadPrivateScratchSize = 0;
-        int32_t engineInstanced = -1;
-        UnifiedMemoryControls unifiedMemoryControls{};
-
-        bool anyCommandListWithCooperativeKernels = false;
-        bool anyCommandListWithoutCooperativeKernels = false;
-        bool anyCommandListRequiresDisabledEUFusion = false;
-        bool cachedMOCSAllowed = true;
-        bool containsAnyRegularCmdList = false;
-        bool gsbaStateDirty = false;
+    struct EstimateRegularHeapfulPerCmdlistData {
+        CommandListRequiredStateChange cmdListState;
         bool frontEndStateDirty = false;
-        const bool isPreemptionModeInitial{false};
-        bool isDevicePreemptionModeMidThread{};
-        bool isDebugEnabled{};
-        bool stateSipRequired{};
-        bool isProgramActivePartitionConfigRequired{};
-        bool isMigrationRequested{};
-        bool isDirectSubmissionEnabled{};
-        bool isDispatchTaskCountPostSyncRequired{};
-        bool hasIndirectAccess{};
-        bool rtDispatchRequired = false;
-        bool globalInit = false;
+        bool gpgpuEnabled = false;
+        bool baseAddressStateDirty = false;
+        bool scmStateDirty = false;
     };
+    inline void processMemAdviseOperations(CommandList *commandList);
 
-    ze_result_t validateCommandListsParams(ze_command_list_handle_t *phCommandLists,
-                                           uint32_t numCommandLists);
-    ze_result_t executeCommandListsRegular(CommandListExecutionContext &ctx,
-                                           uint32_t numCommandLists,
-                                           ze_command_list_handle_t *commandListHandles,
-                                           ze_fence_handle_t hFence);
+    MOCKABLE_VIRTUAL ze_result_t executeCommandListsRegularHeapless(CommandListExecutionContext &ctx,
+                                                                    uint32_t numCommandLists,
+                                                                    ze_command_list_handle_t *commandListHandles,
+                                                                    ze_fence_handle_t hFence);
+
+    MOCKABLE_VIRTUAL ze_result_t executeCommandListsRegular(CommandListExecutionContext &ctx,
+                                                            uint32_t numCommandLists,
+                                                            ze_command_list_handle_t *commandListHandles,
+                                                            ze_fence_handle_t hFence);
     inline ze_result_t executeCommandListsCopyOnly(CommandListExecutionContext &ctx,
                                                    uint32_t numCommandLists,
                                                    ze_command_list_handle_t *phCommandLists,
@@ -122,27 +97,50 @@ struct CommandQueueHw : public CommandQueueImp {
     inline size_t computePreemptionSizeForCommandList(CommandListExecutionContext &ctx,
                                                       CommandList *commandList,
                                                       bool &dirtyState);
-    inline void setupCmdListsAndContextParams(CommandListExecutionContext &ctx,
-                                              ze_command_list_handle_t *phCommandLists,
-                                              uint32_t numCommandLists,
-                                              ze_fence_handle_t hFence);
-    MOCKABLE_VIRTUAL bool isDispatchTaskCountPostSyncRequired(ze_fence_handle_t hFence, bool containsAnyRegularCmdList) const;
-    inline size_t estimateLinearStreamSizeInitial(CommandListExecutionContext &ctx);
+    inline ze_result_t setupCmdListsAndContextParams(CommandListExecutionContext &ctx,
+                                                     ze_command_list_handle_t *phCommandLists,
+                                                     uint32_t numCommandLists,
+                                                     ze_fence_handle_t hFence);
+    MOCKABLE_VIRTUAL bool isDispatchTaskCountPostSyncRequired(ze_fence_handle_t hFence, CommandListExecutionContext &ctx) const;
+    inline size_t estimateLinearStreamSizeTotal(CommandListExecutionContext &ctx,
+                                                ze_command_list_handle_t *commandListHandles,
+                                                uint32_t numCommandLists);
+    inline size_t estimateLinearStreamSizeSharedPerCmdList(CommandListExecutionContext &ctx,
+                                                           CommandList *commandList);
+    inline size_t estimateLinearStreamSizeRegularHeapfulPerCmdList(CommandListExecutionContext &ctx,
+                                                                   CommandList *commandList,
+                                                                   uint32_t index,
+                                                                   EstimateRegularHeapfulPerCmdlistData &sharedData,
+                                                                   NEO::StreamProperties &csrStreamProperties);
+    inline size_t estimateLinearStreamSizeRegularHeapfulPostCmdList(CommandListExecutionContext &ctx);
+    inline size_t estimateLinearStreamSizeSharedPostCmdList(CommandListExecutionContext &ctx, uint32_t numCommandLists);
+    inline size_t estimateLinearStreamSizeSharedInitial(CommandListExecutionContext &ctx);
     inline size_t estimateCommandListSecondaryStart(CommandList *commandList);
     inline size_t estimateCommandListPrimaryStart(bool required);
+    size_t estimateCommandListPatchPreambleWaitSyncSize(CommandListExecutionContext &ctx, ze_command_list_handle_t *commandListHandles, uint32_t numCommandLists);
+    size_t estimateSingleSynchronizationCommandSize(size_t semaphoreCount, size_t indirectLoadCount);
+    inline void dispatchSingleSynchronizationCommand(void *&inputCommandBuffer, uint64_t waitAddress, uint64_t waitValue, size_t semaphoreCount, uint32_t offset, NEO::GraphicsAllocation *waitAllocation);
+    inline void dispatchSingleSynchronizationCommand(NEO::LinearStream &commandStream, uint64_t waitAddress, uint64_t waitValue, size_t semaphoreCount, uint32_t offset, NEO::GraphicsAllocation *waitAllocation);
+    inline size_t estimateCommandListPatchPreambleRequiredSize(CommandListExecutionContext &ctx, CommandList *commandList);
+    inline size_t estimateCommandListPatchPreambleInitialSize(CommandListExecutionContext &ctx, uint32_t numCommandLists);
+    size_t estimateCommandListCrossSyncCommands(CommandListExecutionContext &ctx);
+    inline void retrivePatchPreambleSpace(CommandListExecutionContext &ctx, NEO::LinearStream &commandStream);
+    inline void dispatchPatchPreambleEnding(CommandListExecutionContext &ctx);
+    inline void dispatchPatchPreambleInOrderNoop(CommandListExecutionContext &ctx, CommandList *commandList);
+    inline void dispatchPatchPreambleAsyncPatchElems(CommandListExecutionContext &ctx, CommandList *commandList);
+    inline void dispatchPatchPreambleCrossSync(CommandListExecutionContext &ctx, CommandList *commandList, NEO::LinearStream &commandStream);
+    inline void dispatchPatchPreambleBarrierSignalAndWait(const PatchPreambleBarrier &barrier, uint64_t waitValue, NEO::LinearStream &commandStream);
+    inline void ensurePatchPreambleCounterForCopyOffload(CommandListExecutionContext &ctx, ze_command_list_handle_t *phCommandLists, uint32_t numCommandLists);
     inline size_t estimateCommandListResidencySize(CommandList *commandList);
     inline void setFrontEndStateProperties(CommandListExecutionContext &ctx);
-    inline void handleScratchSpaceAndUpdateGSBAStateDirtyFlag(CommandListExecutionContext &ctx);
-    inline size_t estimateLinearStreamSizeComplementary(CommandListExecutionContext &ctx,
-                                                        ze_command_list_handle_t *phCommandLists,
-                                                        uint32_t numCommandLists);
-    MOCKABLE_VIRTUAL ze_result_t makeAlignedChildStreamAndSetGpuBase(NEO::LinearStream &child, size_t requiredSize);
+    inline ze_result_t handleScratchSpaceAndUpdateGSBAStateDirtyFlag(CommandListExecutionContext &ctx);
+    MOCKABLE_VIRTUAL ze_result_t makeAlignedChildStreamAndSetGpuBase(NEO::LinearStream &child, size_t requiredSize, CommandListExecutionContext &ctx, NEO::LinearStream *&streamForDispatch);
     inline void getGlobalFenceAndMakeItResident();
     inline void getWorkPartitionAndMakeItResident();
-    inline void getGlobalStatelessHeapAndMakeItResident();
+    inline void getGlobalStatelessHeapAndMakeItResident(CommandListExecutionContext &ctx);
     inline void getTagsManagerHeapsAndMakeThemResidentIfSWTagsEnabled(NEO::LinearStream &commandStream);
     inline void makeSbaTrackingBufferResidentIfL0DebuggerEnabled(bool isDebugEnabled);
-    inline void programCommandQueueDebugCmdsForSourceLevelOrL0DebuggerIfEnabled(bool isDebugEnabled, NEO::LinearStream &commandStream);
+    inline void programCommandQueueDebugCmdsForDebuggerIfEnabled(bool isDebugEnabled, NEO::LinearStream &commandStream);
     inline void programStateBaseAddressWithGsbaIfDirty(CommandListExecutionContext &ctx,
                                                        ze_command_list_handle_t hCommandList,
                                                        NEO::LinearStream &commandStream);
@@ -157,8 +155,13 @@ struct CommandQueueHw : public CommandQueueImp {
     inline void makeRayTracingBufferResident(NEO::GraphicsAllocation *rtBuffer);
 
     inline void programActivePartitionConfig(bool isProgramActivePartitionConfigRequired, NEO::LinearStream &commandStream);
-    inline void encodeKernelArgsBufferAndMakeItResident();
-    inline void writeCsrStreamInlineIfLogicalStateHelperAvailable(NEO::LinearStream &commandStream);
+    size_t estimateFrontEndCmdSizeForMultipleCommandLists(bool &isFrontEndStateDirty, CommandList *commandList,
+                                                          NEO::StreamProperties &csrState,
+                                                          const NEO::StreamProperties &cmdListRequired,
+                                                          const NEO::StreamProperties &cmdListFinal,
+                                                          NEO::StreamProperties &requiredState,
+                                                          bool &propertyDirty,
+                                                          bool &frontEndReturnPoint);
     inline void programOneCmdListFrontEndIfDirty(CommandListExecutionContext &ctx,
                                                  NEO::LinearStream &commandStream,
                                                  CommandListRequiredStateChange &cmdListRequiredState);
@@ -168,7 +171,6 @@ struct CommandQueueHw : public CommandQueueImp {
     inline void programLastCommandListReturnBbStart(
         NEO::LinearStream &commandStream,
         CommandListExecutionContext &ctx);
-    inline void mergeOneCmdListPipelinedState(CommandList *commandList);
     inline void programFrontEndAndClearDirtyFlag(bool shouldFrontEndBeProgrammed,
                                                  CommandListExecutionContext &ctx,
                                                  NEO::LinearStream &commandStream,
@@ -176,16 +178,19 @@ struct CommandQueueHw : public CommandQueueImp {
     inline void collectPrintfContentsFromCommandsList(CommandList *commandList);
     inline void migrateSharedAllocationsIfRequested(bool isMigrationRequested, CommandList *commandList);
     inline void prefetchMemoryToDeviceAssociatedWithCmdList(CommandList *commandList);
-    inline void programStateSipEndWA(bool isStateSipRequired, NEO::LinearStream &commandStream);
     inline void assignCsrTaskCountToFenceIfAvailable(ze_fence_handle_t hFence);
     inline void dispatchTaskCountPostSyncRegular(bool isDispatchTaskCountPostSyncRequired, NEO::LinearStream &commandStream);
-    inline void dispatchTaskCountPostSyncByMiFlushDw(bool isDispatchTaskCountPostSyncRequired, NEO::LinearStream &commandStream);
+    inline void dispatchTaskCountPostSyncByMiFlushDw(bool isDispatchTaskCountPostSyncRequired, bool fenceRequired, NEO::LinearStream &commandStream);
     NEO::SubmissionStatus prepareAndSubmitBatchBuffer(CommandListExecutionContext &ctx, NEO::LinearStream &innerCommandStream);
 
     inline void cleanLeftoverMemory(NEO::LinearStream &outerCommandStream, NEO::LinearStream &innerCommandStream);
-    inline void updateTaskCountAndPostSync(bool isDispatchTaskCountPostSyncRequired);
-    inline ze_result_t waitForCommandQueueCompletionAndCleanHeapContainer();
-    inline ze_result_t handleSubmissionAndCompletionResults(NEO::SubmissionStatus submitRet, ze_result_t completionRet);
+    inline void updateTaskCountAndPostSync(bool isDispatchTaskCountPostSyncRequired,
+                                           uint32_t numCommandLists,
+                                           ze_command_list_handle_t *commandListHandles);
+    ze_result_t waitForCommandQueueCompletion(CommandListExecutionContext &ctx);
+    inline ze_result_t handleNonParentImmediateStream(ze_fence_handle_t hFence, CommandListExecutionContext &ctx, uint32_t numCommandLists,
+                                                      ze_command_list_handle_t *phCommandLists, NEO::LinearStream *streamForDispatch);
+    inline ze_result_t handleSubmission(NEO::SubmissionStatus submitRet);
     inline size_t estimatePipelineSelectCmdSizeForMultipleCommandLists(NEO::StreamProperties &csrState,
                                                                        const NEO::StreamProperties &cmdListRequired,
                                                                        const NEO::StreamProperties &cmdListFinal,
@@ -231,7 +236,34 @@ struct CommandQueueHw : public CommandQueueImp {
     inline void programRequiredStateBaseAddressForCommandList(CommandListExecutionContext &ctx,
                                                               NEO::LinearStream &commandStream,
                                                               CommandListRequiredStateChange &cmdListRequired);
+    inline void programRequiredCacheFlushes(CommandListExecutionContext &ctx,
+                                            NEO::LinearStream &commandStream);
     inline void updateBaseAddressState(CommandList *lastCommandList);
+    inline void updateDebugSurfaceState(CommandListExecutionContext &ctx);
+    inline void patchCommands(CommandList &commandList, CommandListExecutionContext &ctx);
+    void prepareInOrderCommandList(CommandList *commandList, CommandListExecutionContext &ctx);
+    inline void handleIndirectMigration(CommandListExecutionContext &ctx, std::unique_lock<std::mutex> &lockForIndirect);
+    struct CommandsToPatchVisitor {
+        CommandQueueHw &queue;
+        uint32_t &hostFunctionsCounter;
+        uint64_t scratchAddress;
+        void **patchPreambleBuffer;
+        bool patchNewScratchController;
+        bool patchPreambleEnabled;
+
+        void operator()(PatchInvalidPatchType &patchElem) {
+            UNRECOVERABLE_IF(true);
+        }
+
+        void operator()(PatchDebugPause &) {}
+
+        void operator()(PatchFrontEndState &patchElem);
+        void operator()(PatchComputeWalkerInlineDataScratch &patchElem);
+        void operator()(PatchComputeWalkerImplicitArgsScratch &patchElem);
+        void operator()(PatchNoopSpace &patchElem);
+        void operator()(PatchHostFunctionId &patchElem);
+        void operator()(PatchHostFunctionWait &patchElem);
+    };
 
     size_t alignedChildStreamPadding{};
 };

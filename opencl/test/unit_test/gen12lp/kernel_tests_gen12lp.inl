@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/mocks/mock_gmm_resource_info.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/helpers/hardware_commands_helper.h"
@@ -16,19 +17,16 @@
 using namespace NEO;
 
 using Gen12LpKernelTest = Test<ClDeviceFixture>;
-GEN12LPTEST_F(Gen12LpKernelTest, givenKernelWhenCanTransformImagesIsCalledThenReturnsFalse) {
-    MockKernelWithInternals mockKernel(*pClDevice);
-    auto retVal = mockKernel.mockKernel->Kernel::canTransformImages();
-    EXPECT_FALSE(retVal);
-}
 
 GEN12LPTEST_F(Gen12LpKernelTest, GivenKernelWhenNotUsingSharedObjArgsThenWaDisableRccRhwoOptimizationIsNotRequired) {
-    MockKernelWithInternals kernel(*pClDevice);
+    MockContext mockCtx(&*pClDevice);
+    MockKernelWithInternals kernel(mockCtx);
     EXPECT_FALSE(kernel.mockKernel->requiresWaDisableRccRhwoOptimization());
 }
 
 GEN12LPTEST_F(Gen12LpKernelTest, GivenKernelWhenAtLeastOneArgIsMediaCompressedThenWaDisableRccRhwoOptimizationIsRequired) {
-    MockKernelWithInternals kernel(*pClDevice);
+    MockContext mockCtx(&*pClDevice);
+    MockKernelWithInternals kernel(mockCtx);
     kernel.kernelInfo.kernelDescriptor.payloadMappings.explicitArgs.resize(3);
     kernel.kernelInfo.addArgBuffer(0);
     kernel.kernelInfo.addArgImmediate(1);
@@ -52,7 +50,7 @@ GEN12LPTEST_F(Gen12LpKernelTest, GivenKernelWhenAtLeastOneArgIsMediaCompressedTh
     allocation = bufferMediaCompressed.getGraphicsAllocation(pClDevice->getRootDeviceIndex());
     auto gmm2 = new MockGmm(pDevice->getGmmHelper());
     allocation->setGmm(gmm2, 0);
-    allocation->getGmm(0)->gmmResourceInfo->getResourceFlags()->Info.MediaCompressed = 1;
+    static_cast<MockGmmResourceInfo *>(allocation->getGmm(0)->gmmResourceInfo.get())->mockResourceCreateParams.Flags.Info.MediaCompressed = 1;
     cl_mem clMem2 = &bufferMediaCompressed;
     kernel.mockKernel->setArgBuffer(2, sizeof(cl_mem *), &clMem2);
 

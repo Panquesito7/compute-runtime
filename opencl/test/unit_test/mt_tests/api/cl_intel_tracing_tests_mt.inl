@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,7 @@
 
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/ult_limits.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/tracing/tracing_api.h"
@@ -20,7 +20,7 @@ namespace ULT {
 
 struct IntelTracingMtTest : public Test<PlatformFixture> {
     void SetUp() override {
-        DebugManager.flags.CreateMultipleRootDevices.set(maxRootDeviceCount);
+        debugManager.flags.CreateMultipleRootDevices.set(maxRootDeviceCount);
         Test<PlatformFixture>::SetUp();
         testedClDevice = pPlatform->getClDevice(rootDeviceIndex);
     }
@@ -63,13 +63,13 @@ struct IntelTracingMtTest : public Test<PlatformFixture> {
         }
     }
 
-    static void callback(cl_function_id fid, cl_callback_data *callbackData, void *userData) {
+    static void callback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) {
         ASSERT_NE(nullptr, userData);
         IntelTracingMtTest *base = (IntelTracingMtTest *)userData;
         base->vcallback(fid, callbackData, nullptr);
     }
 
-    virtual void vcallback(cl_function_id fid, cl_callback_data *callbackData, void *userData) {
+    virtual void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) {
         if (fid == CL_FUNCTION_clGetDeviceInfo ||
             fid == CL_FUNCTION_clGetPlatformInfo) {
             ++count;
@@ -84,7 +84,7 @@ struct IntelTracingMtTest : public Test<PlatformFixture> {
     std::atomic<int> count{0};
 };
 
-TEST_F(IntelTracingMtTest, WhenTracingFromMultipleThreadsThenAllThreadsAreCreated) {
+TEST_F_DEFAULT(IntelTracingMtTest, WhenTracingFromMultipleThreadsThenAllThreadsAreCreated) {
     status = clCreateTracingHandleINTEL(testedClDevice, callback, this, &handle);
     EXPECT_EQ(CL_SUCCESS, status);
 
@@ -98,7 +98,7 @@ TEST_F(IntelTracingMtTest, WhenTracingFromMultipleThreadsThenAllThreadsAreCreate
     EXPECT_EQ(CL_SUCCESS, status);
 
     int numThreads = 4;
-    int iterationCount = 1024;
+    int iterationCount = 256;
     std::vector<std::thread> threads;
 
     for (int i = 0; i < numThreads; ++i) {

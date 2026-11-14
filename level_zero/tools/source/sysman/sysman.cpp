@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,24 +8,25 @@
 #include "level_zero/tools/source/sysman/sysman.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/helpers/sleep.h"
 
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/driver/driver.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/sysman/source/driver/sysman_driver.h"
 #include "level_zero/tools/source/sysman/os_sysman_driver.h"
 #include "level_zero/tools/source/sysman/sysman_imp.h"
 
-#include <cstring>
-#include <vector>
-
 namespace L0 {
+
+SysmanDevice *SysmanDevice::fromHandle(zes_device_handle_t handle) {
+    return Device::fromHandle(handle)->getSysmanHandle();
+}
 bool sysmanInitFromCore = false;
 
-struct OsSysmanDriver *GlobalOsSysmanDriver = nullptr;
+struct OsSysmanDriver *globalOsSysmanDriver = nullptr;
 
-void DeviceImp::createSysmanHandle(bool isSubDevice) {
-    if (static_cast<DriverHandleImp *>(driverHandle)->enableSysman && !isSubDevice) {
+void Device::createSysmanHandle(bool isSubDevice) {
+    if (static_cast<DriverHandle *>(driverHandle)->enableSysman && !isSubDevice) {
         if (this->getSysmanHandle() == nullptr) {
             // Sysman handles are created only during zeInit time device creation. And destroyed during L0::device destroy.
             this->setSysmanHandle(L0::SysmanDeviceHandleContext::init(this->toHandle()));
@@ -34,62 +35,70 @@ void DeviceImp::createSysmanHandle(bool isSubDevice) {
 }
 
 SysmanDevice *SysmanDeviceHandleContext::init(ze_device_handle_t coreDevice) {
+    if (L0::Sysman::sysmanOnlyInit) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Sysman Initialization already happened via zesInit\n");
+        return nullptr;
+    }
+
     SysmanDeviceImp *sysmanDevice = new SysmanDeviceImp(coreDevice);
     DEBUG_BREAK_IF(!sysmanDevice);
     if (ZE_RESULT_SUCCESS != sysmanDevice->init()) {
         delete sysmanDevice;
         sysmanDevice = nullptr;
+        sysmanInitFromCore = false;
+    } else {
+        sysmanInitFromCore = true;
     }
-    sysmanInitFromCore = true;
 
-    L0::DeviceImp *device = static_cast<DeviceImp *>(Device::fromHandle(coreDevice));
+    L0::Device *device = Device::fromHandle(coreDevice);
     for (auto &subDevice : device->subDevices) {
-        static_cast<DeviceImp *>(subDevice)->setSysmanHandle(sysmanDevice);
+        subDevice->setSysmanHandle(sysmanDevice);
     }
 
-    if (GlobalOsSysmanDriver == nullptr) {
-        GlobalOsSysmanDriver = L0::OsSysmanDriver::create();
+    if (globalOsSysmanDriver == nullptr) {
+        globalOsSysmanDriver = L0::OsSysmanDriver::create();
     }
     return sysmanDevice;
 }
 
-void DeviceImp::setSysmanHandle(SysmanDevice *pSysmanDev) {
+void Device::setSysmanHandle(SysmanDevice *pSysmanDev) {
     pSysmanDevice = pSysmanDev;
 }
 
-SysmanDevice *DeviceImp::getSysmanHandle() {
+SysmanDevice *Device::getSysmanHandle() {
     return pSysmanDevice;
 }
 
-ze_result_t DriverHandleImp::sysmanEventsListen(
+ze_result_t DriverHandle::sysmanEventsListen(
     uint32_t timeout,
     uint32_t count,
     zes_device_handle_t *phDevices,
     uint32_t *pNumDeviceEvents,
     zes_event_type_flags_t *pEvents) {
 
-    if (GlobalOsSysmanDriver == nullptr) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "%s", "Os Sysman Driver Not initialized\n");
+    if (globalOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
         return ZE_RESULT_ERROR_UNINITIALIZED;
     }
 
-    return GlobalOsSysmanDriver->eventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents);
+    return globalOsSysmanDriver->eventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents);
 }
 
-ze_result_t DriverHandleImp::sysmanEventsListenEx(
+ze_result_t DriverHandle::sysmanEventsListenEx(
     uint64_t timeout,
     uint32_t count,
     zes_device_handle_t *phDevices,
     uint32_t *pNumDeviceEvents,
     zes_event_type_flags_t *pEvents) {
 
-    if (GlobalOsSysmanDriver == nullptr) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "%s", "Os Sysman Driver Not initialized\n");
+    if (globalOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
         return ZE_RESULT_ERROR_UNINITIALIZED;
     }
-    return GlobalOsSysmanDriver->eventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents);
+    return globalOsSysmanDriver->eventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents);
 }
 
 ze_result_t SysmanDevice::performanceGet(zes_device_handle_t hDevice, uint32_t *pCount, zes_perf_handle_t *phPerformance) {
@@ -305,6 +314,26 @@ ze_result_t SysmanDevice::deviceSetEccState(zes_device_handle_t hDevice, const z
         return ZE_RESULT_ERROR_UNINITIALIZED;
     }
     return pSysmanDevice->deviceSetEccState(newState, pState);
+}
+
+uint64_t SysmanDevice::getSysmanTimestamp() {
+    std::chrono::time_point<std::chrono::steady_clock> ts = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(ts.time_since_epoch()).count();
+}
+
+ze_result_t SysmanDevice::deviceResetExt(zes_device_handle_t hDevice, zes_reset_properties_t *pProperties) {
+    auto pSysmanDevice = L0::SysmanDevice::fromHandle(hDevice);
+    return pSysmanDevice->deviceResetExt(pProperties);
+}
+
+ze_result_t SysmanDevice::fabricPortGetMultiPortThroughput(zes_device_handle_t hDevice, uint32_t numPorts, zes_fabric_port_handle_t *phPort, zes_fabric_port_throughput_t **pThroughput) {
+    auto pSysmanDevice = L0::SysmanDevice::fromHandle(hDevice);
+    return pSysmanDevice->fabricPortGetMultiPortThroughput(numPorts, phPort, pThroughput);
+}
+
+ze_result_t SysmanDevice::deviceEnumEnabledVF(zes_device_handle_t hDevice, uint32_t *pCount, zes_vf_handle_t *phVFhandle) {
+    auto pSysmanDevice = L0::SysmanDevice::fromHandle(hDevice);
+    return pSysmanDevice->deviceEnumEnabledVF(pCount, phVFhandle);
 }
 
 } // namespace L0

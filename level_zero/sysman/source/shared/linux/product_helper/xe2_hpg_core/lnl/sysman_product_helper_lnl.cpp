@@ -1,0 +1,28 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_hw.h"
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_hw.inl"
+
+namespace L0 {
+namespace Sysman {
+constexpr static auto gfxProduct = IGFX_LUNARLAKE;
+
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper_xe_hp_and_later.inl"
+#include "level_zero/sysman/source/shared/product_helper/sysman_os_agnostic_product_helper_xe2_and_later.inl"
+
+template <>
+std::string SysmanProductHelperHw<gfxProduct>::getGpuGeneration() {
+    return "xe2";
+}
+
+template class SysmanProductHelperHw<gfxProduct>;
+
+static EnableSysmanProductHelper<gfxProduct> enableLNL;
+
+} // namespace Sysman
+} // namespace L0

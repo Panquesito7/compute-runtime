@@ -1,36 +1,54 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/linux/engine_info.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/libult/linux/drm_mock_prelim_context.h"
 #include "shared/test/common/libult/linux/drm_query_mock.h"
 #include "shared/test/common/mocks/linux/mock_drm_allocation.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "gtest/gtest.h"
 
-#include <cmath>
+using DrmQueryTopologyTest = ::testing::Test;
+using DrmQueryTest = ::testing::Test;
 
-TEST(DrmQueryTopologyTest, givenDrmWhenQueryTopologyCalledThenPassNoFlags) {
+HWTEST2_F(DrmQueryTopologyTest, givenDrmWhenQueryTopologyCalledThenPassNoFlags, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
-    Drm::QueryTopologyData topologyData = {};
-
+    DrmQueryTopologyData topologyData = {};
+    drm.engineInfoQueried = true;
+    drm.systemInfoQueried = true;
     EXPECT_TRUE(drm.queryTopology(*drm.context.hwInfo, topologyData));
 
     constexpr uint32_t expectedFlag = 0;
     EXPECT_EQ(expectedFlag, drm.storedQueryItem.flags);
+}
+
+HWTEST2_F(DrmQueryTopologyTest, givenPrelimIoctlHelperWhenQueryTopologyCalledThenRegionCountIsOne, IsAtMostXeCore) {
+    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
+
+    drm.ioctlHelper = std::make_unique<IoctlHelperPrelim20>(drm);
+
+    DrmQueryTopologyData topologyData = {};
+    drm.engineInfoQueried = true;
+    drm.systemInfoQueried = true;
+    EXPECT_TRUE(drm.queryTopology(*drm.context.hwInfo, topologyData));
+
+    EXPECT_EQ(1, topologyData.regionCount);
 }
 
 struct QueryTopologyTests : ::testing::Test {
@@ -50,8 +68,22 @@ struct QueryTopologyTests : ::testing::Test {
                 return false;
             }
 
-            auto realEuCount = rootDeviceEnvironment.getHardwareInfo()->gtSystemInfo.EUCount;
-            auto dataSize = static_cast<size_t>(std::ceil(realEuCount / 8.0));
+            // Values cannot exceed what this GT allows
+            queryComputeSlicesSCount = std::min(queryComputeSlicesSCount, static_cast<uint16_t>(rootDeviceEnvironment.getHardwareInfo()->gtSystemInfo.SliceCount));
+            queryComputeSlicesSSCount = std::min(queryComputeSlicesSSCount, static_cast<uint16_t>(rootDeviceEnvironment.getHardwareInfo()->gtSystemInfo.SubSliceCount));
+            queryComputeSlicesEuCount = std::min(queryComputeSlicesEuCount, static_cast<uint16_t>(rootDeviceEnvironment.getHardwareInfo()->gtSystemInfo.EUCount));
+
+            UNRECOVERABLE_IF((queryComputeSlicesSCount != 0) && (queryComputeSlicesSSCount % queryComputeSlicesSCount != 0));
+            UNRECOVERABLE_IF((queryComputeSlicesSSCount != 0) && (queryComputeSlicesEuCount % queryComputeSlicesSSCount != 0));
+
+            uint16_t subslicesPerSlice = queryComputeSlicesSCount ? (queryComputeSlicesSSCount / queryComputeSlicesSCount) : 0u;
+            uint16_t eusPerSubslice = queryComputeSlicesSSCount ? (queryComputeSlicesEuCount / queryComputeSlicesSSCount) : 0u;
+            uint16_t subsliceOffset = static_cast<uint16_t>(Math::divideAndRoundUp(queryComputeSlicesSCount, 8u));
+            uint16_t subsliceStride = static_cast<uint16_t>(Math::divideAndRoundUp(subslicesPerSlice, 8u));
+            uint16_t euOffset = subsliceOffset + queryComputeSlicesSCount * subsliceStride;
+            uint16_t euStride = static_cast<uint16_t>(Math::divideAndRoundUp(eusPerSubslice, 8u));
+
+            const uint16_t dataSize = euOffset + queryComputeSlicesSSCount * euStride;
 
             if (queryItem->length == 0) {
                 queryItem->length = static_cast<int32_t>(sizeof(QueryTopologyInfo) + dataSize);
@@ -63,14 +95,33 @@ struct QueryTopologyTests : ::testing::Test {
                 uint16_t finalEUVal = queryComputeSlicesEuCount;
 
                 if (useSmallerValuesOnSecondCall && queryComputeSlicesCallCount == 2) {
-                    finalSVal /= 2;
-                    finalSSVal /= 2;
-                    finalEUVal /= 2;
+                    if ((finalSSVal % 2 == 0) && (finalEUVal % 2 == 0)) {
+                        finalSSVal /= 2;
+                        finalEUVal /= 2;
+                    } else if ((finalSSVal % 3 == 0) && (finalEUVal % 3 == 0)) {
+                        finalSSVal /= 3;
+                        finalEUVal /= 3;
+                    } else {
+                        finalSVal = 1;
+                        finalSSVal = subslicesPerSlice;
+                        finalEUVal = subslicesPerSlice * eusPerSubslice;
+                    }
+
+                    subslicesPerSlice = finalSVal ? (finalSSVal / finalSVal) : 0u;
+                    eusPerSubslice = finalSSVal ? (finalEUVal / finalSSVal) : 0u;
+                    subsliceOffset = static_cast<uint16_t>(Math::divideAndRoundUp(finalSVal, 8u));
+                    subsliceStride = static_cast<uint16_t>(Math::divideAndRoundUp(subslicesPerSlice, 8u));
+                    euOffset = subsliceOffset + finalSVal * subsliceStride;
+                    euStride = static_cast<uint16_t>(Math::divideAndRoundUp(eusPerSubslice, 8u));
                 }
 
                 topologyArg->maxSlices = finalSVal;
-                topologyArg->maxSubslices = (finalSSVal / finalSVal);
-                topologyArg->maxEusPerSubslice = (finalEUVal / finalSSVal);
+                topologyArg->maxSubslices = subslicesPerSlice;
+                topologyArg->maxEusPerSubslice = eusPerSubslice;
+                topologyArg->subsliceOffset = subsliceOffset;
+                topologyArg->subsliceStride = subsliceStride;
+                topologyArg->euOffset = euOffset;
+                topologyArg->euStride = euStride;
 
                 memset(topologyArg->data, 0xFF, dataSize);
             }
@@ -101,16 +152,18 @@ struct QueryTopologyTests : ::testing::Test {
 
         drmMock = std::make_unique<MyDrmQueryMock>(*rootDeviceEnvironment);
 
-        drmMock->storedSVal = 8;
-        drmMock->storedSSVal = 32;
-        drmMock->storedEUVal = 512;
+        drmMock->storedSVal = rootDeviceEnvironment->getHardwareInfo()->gtSystemInfo.SliceCount;
+        drmMock->storedSSVal = rootDeviceEnvironment->getHardwareInfo()->gtSystemInfo.SubSliceCount;
+        drmMock->storedEUVal = rootDeviceEnvironment->getHardwareInfo()->gtSystemInfo.EUCount;
 
-        drmMock->queryComputeSlicesSCount = 4;
-        drmMock->queryComputeSlicesSSCount = 16;
-        drmMock->queryComputeSlicesEuCount = 256;
+        drmMock->queryComputeSlicesSCount = rootDeviceEnvironment->getHardwareInfo()->gtSystemInfo.SliceCount;
+        drmMock->queryComputeSlicesSSCount = rootDeviceEnvironment->getHardwareInfo()->gtSystemInfo.SubSliceCount;
+        drmMock->queryComputeSlicesEuCount = rootDeviceEnvironment->getHardwareInfo()->gtSystemInfo.EUCount;
 
+        drmMock->memoryInfoQueried = false;
         EXPECT_TRUE(drmMock->queryMemoryInfo());
         EXPECT_TRUE(drmMock->queryEngineInfo());
+        drmMock->systemInfoQueried = true;
     }
 
     DebugManagerStateRestore stateRestorer;
@@ -122,31 +175,12 @@ struct QueryTopologyTests : ::testing::Test {
     int receivedEuCount = 0;
 };
 
-TEST_F(QueryTopologyTests, givenZeroTilesWhenQueryingThenFallbackToQueryTopology) {
+HWTEST2_F(QueryTopologyTests, givenZeroTilesWhenQueryingThenFallbackToQueryTopology, IsAtMostXeCore) {
     createDrm(0);
 
-    Drm::QueryTopologyData topologyData = {};
+    DrmQueryTopologyData topologyData = {};
 
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
-
-    EXPECT_EQ(0u, drmMock->queryComputeSlicesCallCount);
-
-    EXPECT_EQ(drmMock->storedSVal, topologyData.sliceCount);
-    EXPECT_EQ(drmMock->storedSSVal, topologyData.subSliceCount);
-    EXPECT_EQ(drmMock->storedEUVal, topologyData.euCount);
-
-    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEuCount);
-}
-
-TEST_F(QueryTopologyTests, givenNonZeroTilesWhenDebugFlagDisabledThenFallbackToQueryTopology) {
-    DebugManager.flags.UseNewQueryTopoIoctl.set(false);
-    createDrm(2);
-
-    Drm::QueryTopologyData topologyData = {};
-
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     EXPECT_EQ(0u, drmMock->queryComputeSlicesCallCount);
 
@@ -154,17 +188,36 @@ TEST_F(QueryTopologyTests, givenNonZeroTilesWhenDebugFlagDisabledThenFallbackToQ
     EXPECT_EQ(drmMock->storedSSVal, topologyData.subSliceCount);
     EXPECT_EQ(drmMock->storedEUVal, topologyData.euCount);
 
-    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEuCount);
+    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEusPerSubSlice);
 }
 
-TEST_F(QueryTopologyTests, givenNonZeroTilesWhenQueryingThenUseOnlyNewIoctl) {
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesWhenDebugFlagDisabledThenFallbackToQueryTopology, IsAtMostXeCore) {
+    debugManager.flags.UseNewQueryTopoIoctl.set(false);
     createDrm(2);
 
-    Drm::QueryTopologyData topologyData = {};
+    DrmQueryTopologyData topologyData = {};
 
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
+
+    EXPECT_EQ(0u, drmMock->queryComputeSlicesCallCount);
+
+    EXPECT_EQ(drmMock->storedSVal, topologyData.sliceCount);
+    EXPECT_EQ(drmMock->storedSSVal, topologyData.subSliceCount);
+    EXPECT_EQ(drmMock->storedEUVal, topologyData.euCount);
+
+    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEusPerSubSlice);
+}
+
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesWhenQueryingThenUseOnlyNewIoctl, IsAtMostXeCore) {
+    createDrm(2);
+
+    DrmQueryTopologyData topologyData = {};
+
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     EXPECT_EQ(4u, drmMock->queryComputeSlicesCallCount); // 2x length + 2x query
 
@@ -172,18 +225,37 @@ TEST_F(QueryTopologyTests, givenNonZeroTilesWhenQueryingThenUseOnlyNewIoctl) {
     EXPECT_EQ(drmMock->queryComputeSlicesSSCount, topologyData.subSliceCount);
     EXPECT_EQ(drmMock->queryComputeSlicesEuCount, topologyData.euCount);
 
-    EXPECT_EQ(drmMock->queryComputeSlicesSCount, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->queryComputeSlicesSSCount / drmMock->queryComputeSlicesSCount, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->queryComputeSlicesEuCount / drmMock->queryComputeSlicesSSCount, topologyData.maxEuCount);
+    EXPECT_EQ(drmMock->queryComputeSlicesSCount, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->queryComputeSlicesSSCount / drmMock->queryComputeSlicesSCount, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->queryComputeSlicesEuCount / drmMock->queryComputeSlicesSSCount, topologyData.maxEusPerSubSlice);
 }
 
-TEST_F(QueryTopologyTests, givenNonZeroTilesWithoutEngineInfoThenFallback) {
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesAndNoComputeEnginesWhenQueryingThenUseNewIoctlWithRenderEngine, IsAtMostXeCore) {
+    auto hwInfo = rootDeviceEnvironment->getMutableHardwareInfo();
+    hwInfo->gtSystemInfo.CCSInfo.IsValid = false;
+    hwInfo->capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
+    createDrm(2);
+    ASSERT_FALSE(hwInfo->featureTable.flags.ftrCCSNode);
+    EXPECT_EQ(aub_stream::ENGINE_CCS, hwInfo->capabilityTable.defaultEngineType);
+
+    DrmQueryTopologyData topologyData = {};
+
+    drmMock->queryTopology(*hwInfo, topologyData);
+
+    EXPECT_EQ(4u, drmMock->queryComputeSlicesCallCount); // 2x length + 2x query
+
+    EXPECT_EQ(drmMock->queryComputeSlicesSCount, topologyData.sliceCount);
+    EXPECT_EQ(drmMock->queryComputeSlicesSSCount, topologyData.subSliceCount);
+    EXPECT_EQ(drmMock->queryComputeSlicesEuCount, topologyData.euCount);
+}
+
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesWithoutEngineInfoThenFallback, IsAtMostXeCore) {
     createDrm(2);
 
     drmMock->engineInfo.reset();
 
-    Drm::QueryTopologyData topologyData = {};
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    DrmQueryTopologyData topologyData = {};
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     EXPECT_EQ(0u, drmMock->queryComputeSlicesCallCount);
 
@@ -191,18 +263,18 @@ TEST_F(QueryTopologyTests, givenNonZeroTilesWithoutEngineInfoThenFallback) {
     EXPECT_EQ(drmMock->storedSSVal, topologyData.subSliceCount);
     EXPECT_EQ(drmMock->storedEUVal, topologyData.euCount);
 
-    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEuCount);
+    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEusPerSubSlice);
 }
 
-TEST_F(QueryTopologyTests, givenNonZeroTilesWhenFailOnNewQueryThenFallback) {
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesWhenFailOnNewQueryThenFallback, IsAtMostXeCore) {
     createDrm(2);
 
     drmMock->queryComputeSlicesEuCount = 0;
 
-    Drm::QueryTopologyData topologyData = {};
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    DrmQueryTopologyData topologyData = {};
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     EXPECT_EQ(2u, drmMock->queryComputeSlicesCallCount);
 
@@ -210,18 +282,18 @@ TEST_F(QueryTopologyTests, givenNonZeroTilesWhenFailOnNewQueryThenFallback) {
     EXPECT_EQ(drmMock->storedSSVal, topologyData.subSliceCount);
     EXPECT_EQ(drmMock->storedEUVal, topologyData.euCount);
 
-    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEuCount);
+    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEusPerSubSlice);
 }
 
-TEST_F(QueryTopologyTests, givenNonZeroTilesWhenIncorrectValuesQueriedThenFallback) {
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesWhenIncorrectValuesQueriedThenFallback, IsAtMostXeCore) {
     createDrm(2);
 
     drmMock->failOnQuery = true;
 
-    Drm::QueryTopologyData topologyData = {};
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    DrmQueryTopologyData topologyData = {};
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     EXPECT_EQ(1u, drmMock->queryComputeSlicesCallCount);
 
@@ -229,41 +301,51 @@ TEST_F(QueryTopologyTests, givenNonZeroTilesWhenIncorrectValuesQueriedThenFallba
     EXPECT_EQ(drmMock->storedSSVal, topologyData.subSliceCount);
     EXPECT_EQ(drmMock->storedEUVal, topologyData.euCount);
 
-    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEuCount);
+    EXPECT_EQ(drmMock->storedSVal, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->storedSSVal / drmMock->storedSVal, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->storedEUVal / drmMock->storedSSVal, topologyData.maxEusPerSubSlice);
 }
 
-TEST_F(QueryTopologyTests, givenAsymetricTilesWhenQueryingThenPickSmallerValue) {
+HWTEST2_F(QueryTopologyTests, givenAsymetricTilesWhenQueryingThenPickSmallerValue, IsAtMostXeCore) {
     createDrm(2);
 
     drmMock->useSmallerValuesOnSecondCall = true;
 
-    Drm::QueryTopologyData topologyData = {};
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    DrmQueryTopologyData topologyData = {};
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
-    EXPECT_EQ(drmMock->queryComputeSlicesSCount / 2, topologyData.sliceCount);
-    EXPECT_EQ(drmMock->queryComputeSlicesSSCount / 2, topologyData.subSliceCount);
-    EXPECT_EQ(drmMock->queryComputeSlicesEuCount / 2, topologyData.euCount);
+    EXPECT_NE(0, drmMock->queryComputeSlicesSCount);
+    EXPECT_NE(0, topologyData.sliceCount);
+    EXPECT_LE(topologyData.sliceCount, drmMock->queryComputeSlicesSCount);
+    if ((drmMock->queryComputeSlicesSSCount % 2 == 0) && (drmMock->queryComputeSlicesEuCount % 2 == 0)) {
+        EXPECT_EQ(drmMock->queryComputeSlicesSSCount / 2, topologyData.subSliceCount);
+        EXPECT_EQ(drmMock->queryComputeSlicesEuCount / 2, topologyData.euCount);
+    } else if ((drmMock->queryComputeSlicesSSCount % 3 == 0) && (drmMock->queryComputeSlicesEuCount % 3 == 0)) {
+        EXPECT_EQ(drmMock->queryComputeSlicesSSCount / 3, topologyData.subSliceCount);
+        EXPECT_EQ(drmMock->queryComputeSlicesEuCount / 3, topologyData.euCount);
+    } else {
+        EXPECT_EQ(drmMock->queryComputeSlicesSSCount / drmMock->queryComputeSlicesSCount, topologyData.subSliceCount);
+        EXPECT_EQ(drmMock->queryComputeSlicesEuCount / drmMock->queryComputeSlicesSSCount * topologyData.subSliceCount, topologyData.euCount);
+    }
 
-    EXPECT_EQ(drmMock->queryComputeSlicesSCount, topologyData.maxSliceCount);
-    EXPECT_EQ(drmMock->queryComputeSlicesSSCount / drmMock->queryComputeSlicesSCount, topologyData.maxSubSliceCount);
-    EXPECT_EQ(drmMock->queryComputeSlicesEuCount / drmMock->queryComputeSlicesSSCount, topologyData.maxEuCount);
+    EXPECT_EQ(drmMock->queryComputeSlicesSCount, topologyData.maxSlices);
+    EXPECT_EQ(drmMock->queryComputeSlicesSSCount / drmMock->queryComputeSlicesSCount, topologyData.maxSubSlicesPerSlice);
+    EXPECT_EQ(drmMock->queryComputeSlicesEuCount / drmMock->queryComputeSlicesSSCount, topologyData.maxEusPerSubSlice);
 }
 
-TEST_F(QueryTopologyTests, givenAsymetricTilesWhenGettingSliceMappingsThenCorrectMappingsReturnedForBothDeviceIndexes) {
+HWTEST2_F(QueryTopologyTests, givenAsymetricTilesWhenGettingSliceMappingsThenCorrectMappingsReturnedForBothDeviceIndexes, IsAtMostXeCore) {
     createDrm(2);
 
     drmMock->useSmallerValuesOnSecondCall = true;
 
-    Drm::QueryTopologyData topologyData = {};
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    DrmQueryTopologyData topologyData = {};
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     auto device0SliceMapping = drmMock->getSliceMappings(0);
     auto device1SliceMapping = drmMock->getSliceMappings(1);
 
-    ASSERT_EQ(static_cast<size_t>(drmMock->queryComputeSlicesSCount / 2), device0SliceMapping.size());
-    for (int i = 0; i < drmMock->queryComputeSlicesSCount / 2; i++) {
+    ASSERT_GE(static_cast<size_t>(drmMock->queryComputeSlicesSCount), device0SliceMapping.size());
+    for (int i = 0; i < static_cast<int>(device0SliceMapping.size()); i++) {
         EXPECT_EQ(i, device0SliceMapping[i]);
     }
 
@@ -273,13 +355,13 @@ TEST_F(QueryTopologyTests, givenAsymetricTilesWhenGettingSliceMappingsThenCorrec
     }
 }
 
-TEST_F(QueryTopologyTests, givenNonZeroTilesAndFallbackPathWhenGettingSliceMappingsThenMappingStoredForIndexZeroOnly) {
-    DebugManager.flags.UseNewQueryTopoIoctl.set(false);
+HWTEST2_F(QueryTopologyTests, givenNonZeroTilesAndFallbackPathWhenGettingSliceMappingsThenMappingStoredForIndexZeroOnly, IsAtMostXeCore) {
+    debugManager.flags.UseNewQueryTopoIoctl.set(false);
     createDrm(2);
 
-    Drm::QueryTopologyData topologyData = {};
+    DrmQueryTopologyData topologyData = {};
 
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     EXPECT_EQ(0u, drmMock->queryComputeSlicesCallCount);
 
@@ -298,10 +380,10 @@ TEST_F(QueryTopologyTests, givenNonZeroTilesAndFallbackPathWhenGettingSliceMappi
     ASSERT_EQ(0u, device1SliceMapping.size());
 }
 
-TEST_F(QueryTopologyTests, givenDrmWhenGettingTopologyMapThenCorrectMapIsReturned) {
+HWTEST2_F(QueryTopologyTests, givenDrmWhenGettingTopologyMapThenCorrectMapIsReturned, IsAtMostXeCore) {
     createDrm(2);
-    Drm::QueryTopologyData topologyData = {};
-    drmMock->queryTopology(*rootDeviceEnvironment->getHardwareInfo(), topologyData);
+    DrmQueryTopologyData topologyData = {};
+    drmMock->queryTopology(*rootDeviceEnvironment->getMutableHardwareInfo(), topologyData);
 
     auto topologyMap = drmMock->getTopologyMap();
 
@@ -316,7 +398,7 @@ TEST_F(QueryTopologyTests, givenDrmWhenGettingTopologyMapThenCorrectMapIsReturne
     }
 }
 
-TEST(DrmQueryTest, WhenCallingQueryPageFaultSupportThenReturnFalseByDefault) {
+HWTEST2_F(DrmQueryTest, WhenCallingQueryPageFaultSupportThenReturnFalseByDefault, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
@@ -325,7 +407,7 @@ TEST(DrmQueryTest, WhenCallingQueryPageFaultSupportThenReturnFalseByDefault) {
     EXPECT_FALSE(drm.hasPageFaultSupport());
 }
 
-TEST(DrmQueryTest, givenPageFaultSupportEnabledWhenCallingQueryPageFaultSupportThenReturnCorrectValue) {
+HWTEST2_F(DrmQueryTest, givenPageFaultSupportEnabledWhenCallingQueryPageFaultSupportThenReturnCorrectValue, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
     const auto &productHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<ProductHelper>();
@@ -342,7 +424,51 @@ TEST(DrmQueryTest, givenPageFaultSupportEnabledWhenCallingQueryPageFaultSupportT
     }
 }
 
-TEST(DrmQueryTest, WhenQueryPageFaultSupportFailsThenReturnFalse) {
+HWTEST2_F(DrmQueryTest, givenPrintIoctlDebugFlagSetWhenCallingQueryPageFaultSupportThenCaptureExpectedOutput, IsAtMostXeCore) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.PrintIoctlEntries.set(true);
+
+    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
+    const auto &productHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<ProductHelper>();
+
+    bool hasPageFaultSupport = true;
+    drm.context.hasPageFaultQueryValue = hasPageFaultSupport;
+
+    StreamCapture capture;
+    capture.captureStdout(); // start capturing
+    drm.queryPageFaultSupport();
+    debugManager.flags.PrintIoctlEntries.set(false);
+    std::string outputString = capture.getCapturedStdout(); // stop capturing
+
+    if (productHelper.isPageFaultSupported()) {
+        std::string expectedString = "DRM_IOCTL_I915_GETPARAM: param: PRELIM_I915_PARAM_HAS_PAGE_FAULT, output value: 1, retCode: 0\n";
+        EXPECT_NE(std::string::npos, outputString.find(expectedString));
+    } else {
+        EXPECT_TRUE(outputString.empty());
+    }
+}
+
+HWTEST2_F(DrmQueryTest, givenPrintIoctlDebugFlagNotSetWhenIsPageFaultSupportedCalledThenNoCapturedOutput, IsAtMostXeCore) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.PrintIoctlEntries.set(false);
+
+    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
+
+    bool hasPageFaultSupport = true;
+    drm.context.hasPageFaultQueryValue = hasPageFaultSupport;
+
+    StreamCapture capture;
+    capture.captureStdout(); // start capturing
+    drm.queryPageFaultSupport();
+    debugManager.flags.PrintIoctlEntries.set(false);
+    std::string outputString = capture.getCapturedStdout(); // stop capturing
+
+    EXPECT_TRUE(outputString.empty());
+}
+
+HWTEST2_F(DrmQueryTest, WhenQueryPageFaultSupportFailsThenReturnFalse, IsAtMostXeCore) {
     auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
     DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
 
@@ -350,92 +476,4 @@ TEST(DrmQueryTest, WhenQueryPageFaultSupportFailsThenReturnFalse) {
     drm.queryPageFaultSupport();
 
     EXPECT_FALSE(drm.hasPageFaultSupport());
-}
-
-TEST(DrmQueryTest, givenUseKmdMigrationWhenShouldAllocationFaultIsCalledOnFaultableHardwareThenReturnCorrectValue) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.UseKmdMigration.set(true);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    drm.pageFaultSupported = true;
-
-    AllocationType allocationTypesThatShouldFault[] = {
-        AllocationType::UNIFIED_SHARED_MEMORY};
-
-    for (auto allocationType : allocationTypesThatShouldFault) {
-        MockDrmAllocation allocation(0u, allocationType, MemoryPool::MemoryNull);
-        EXPECT_TRUE(allocation.shouldAllocationPageFault(&drm));
-    }
-
-    MockDrmAllocation allocation(0u, AllocationType::BUFFER, MemoryPool::MemoryNull);
-    EXPECT_FALSE(allocation.shouldAllocationPageFault(&drm));
-}
-
-TEST(DrmQueryTest, givenRecoverablePageFaultsEnabledWhenCallingHasPageFaultSupportThenReturnCorrectValue) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-
-    for (bool hasPageFaultSupport : {false, true}) {
-        drm.pageFaultSupported = hasPageFaultSupport;
-
-        EXPECT_EQ(hasPageFaultSupport, drm.hasPageFaultSupport());
-    }
-}
-
-TEST(DrmQueryTest, givenDrmAllocationWhenShouldAllocationFaultIsCalledOnNonFaultableHardwareThenReturnFalse) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    drm.pageFaultSupported = false;
-
-    MockDrmAllocation allocation(0u, AllocationType::BUFFER, MemoryPool::MemoryNull);
-    EXPECT_FALSE(allocation.shouldAllocationPageFault(&drm));
-}
-
-TEST(DrmQueryTest, givenEnableImplicitMigrationOnFaultableHardwareWhenShouldAllocationFaultIsCalledThenReturnTrue) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableImplicitMigrationOnFaultableHardware.set(true);
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm{*executionEnvironment->rootDeviceEnvironments[0]};
-    drm.pageFaultSupported = true;
-
-    MockDrmAllocation allocation(0u, AllocationType::BUFFER, MemoryPool::MemoryNull);
-    EXPECT_TRUE(allocation.shouldAllocationPageFault(&drm));
-}
-
-TEST(DrmQueryTest, givenUseKmdMigrationSetWhenCallingHasKmdMigrationSupportThenReturnCorrectValue) {
-    DebugManagerStateRestore restorer;
-
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
-    executionEnvironment->initializeMemoryManager();
-
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    drm.pageFaultSupported = true;
-
-    for (auto useKmdMigration : {-1, 0, 1}) {
-        DebugManager.flags.UseKmdMigration.set(useKmdMigration);
-        if (useKmdMigration == -1) {
-            auto &productHelper = drm.getRootDeviceEnvironment().getHelper<ProductHelper>();
-            EXPECT_EQ(productHelper.isKmdMigrationSupported(), drm.hasKmdMigrationSupport());
-        } else {
-            EXPECT_EQ(useKmdMigration, drm.hasKmdMigrationSupport());
-        }
-    }
-}
-
-TEST(DrmQueryTest, givenKmdMigrationSupportedWhenShouldAllocationPageFaultIsCalledOnUnifiedSharedMemoryThenReturnTrue) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    executionEnvironment->rootDeviceEnvironments[0]->initGmm();
-    executionEnvironment->initializeMemoryManager();
-
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    drm.pageFaultSupported = true;
-
-    MockBufferObject bo(0u, &drm, 3, 0, 0, 1);
-    MockDrmAllocation allocation(0u, AllocationType::UNIFIED_SHARED_MEMORY, MemoryPool::LocalMemory);
-    allocation.bufferObjects[0] = &bo;
-
-    EXPECT_EQ(drm.hasKmdMigrationSupport(), allocation.shouldAllocationPageFault(&drm));
 }

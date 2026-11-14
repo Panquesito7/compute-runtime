@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/linear_stream.h"
 #include "shared/source/device/device_info.h"
 #include "shared/source/helpers/hw_info.h"
@@ -12,6 +13,7 @@
 #include "shared/test/common/cmd_parse/hw_parse.h"
 
 #include "gtest/gtest.h"
+#include "unit_test_helper.h"
 
 namespace NEO {
 
@@ -61,12 +63,12 @@ void UnitTestHelper<GfxFamily>::validateSbaMocs(uint32_t expectedMocs, CommandSt
 }
 
 template <typename GfxFamily>
-bool UnitTestHelper<GfxFamily>::getDisableFusionStateFromFrontEndCommand(const typename GfxFamily::VFE_STATE_TYPE &feCmd) {
+bool UnitTestHelperWithHeap<GfxFamily>::getDisableFusionStateFromFrontEndCommand(const typename GfxFamily::FrontEndStateCommand &feCmd) {
     return false;
 }
 
 template <typename GfxFamily>
-bool UnitTestHelper<GfxFamily>::getComputeDispatchAllWalkerFromFrontEndCommand(const typename GfxFamily::VFE_STATE_TYPE &feCmd) {
+bool UnitTestHelperWithHeap<GfxFamily>::getComputeDispatchAllWalkerFromFrontEndCommand(const typename GfxFamily::FrontEndStateCommand &feCmd) {
     return false;
 }
 
@@ -79,7 +81,13 @@ bool UnitTestHelper<GfxFamily>::expectNullDsh(const DeviceInfo &deviceInfo) {
 }
 
 template <typename GfxFamily>
-bool UnitTestHelper<GfxFamily>::findStateCacheFlushPipeControl(LinearStream &csrStream) {
+uint32_t UnitTestHelper<GfxFamily>::getInlineDataSize(bool isHeaplessEnabled) {
+    using DefaultWalkerType = typename GfxFamily::DefaultWalkerType;
+    return DefaultWalkerType::getInlineDataSize();
+}
+
+template <typename GfxFamily>
+bool UnitTestHelper<GfxFamily>::findStateCacheFlushPipeControl(CommandStreamReceiver &csr, LinearStream &csrStream) {
     using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
 
     HardwareParse hwParserCsr;
@@ -94,7 +102,8 @@ bool UnitTestHelper<GfxFamily>::findStateCacheFlushPipeControl(LinearStream &csr
 
         if (pipeControl->getRenderTargetCacheFlushEnable() &&
             pipeControl->getStateCacheInvalidationEnable() &&
-            pipeControl->getTextureCacheInvalidationEnable()) {
+            pipeControl->getTextureCacheInvalidationEnable() &&
+            ((csr.isTlbFlushRequiredForStateCacheFlush() && pipeControl->getTlbInvalidate()) || (!csr.isTlbFlushRequiredForStateCacheFlush() && !pipeControl->getTlbInvalidate()))) {
             stateCacheFlushFound = true;
             break;
         }
@@ -111,6 +120,12 @@ uint32_t UnitTestHelper<GfxFamily>::getProgrammedGrfValue(CommandStreamReceiver 
 template <typename GfxFamily>
 uint32_t UnitTestHelper<GfxFamily>::getMiLoadRegisterImmProgrammedCmdsCount(bool debuggingEnabled) {
     return (debuggingEnabled ? 2u : 0u);
+}
+
+template <typename GfxFamily>
+size_t UnitTestHelper<GfxFamily>::getWalkerSize(bool isHeaplessEnabled) {
+    using DefaultWalkerType = typename GfxFamily::DefaultWalkerType;
+    return sizeof(DefaultWalkerType);
 }
 
 } // namespace NEO

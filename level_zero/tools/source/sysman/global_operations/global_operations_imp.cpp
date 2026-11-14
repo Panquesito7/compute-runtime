@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,8 @@
 
 #include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/sysman/sysman_const.h"
+
+#include "os_global_operations.h"
 
 #include <algorithm>
 
@@ -60,6 +62,11 @@ ze_result_t GlobalOperationsImp::reset(ze_bool_t force) {
     return pOsGlobalOperations->reset(force);
 }
 
+ze_result_t GlobalOperationsImp::resetExt(zes_reset_properties_t *pProperties) {
+    initGlobalOperations();
+    return pOsGlobalOperations->resetExt(pProperties);
+}
+
 ze_result_t GlobalOperationsImp::deviceGetState(zes_device_state_t *pState) {
     initGlobalOperations();
     return pOsGlobalOperations->deviceGetState(pState);
@@ -76,11 +83,11 @@ void GlobalOperationsImp::init() {
     pOsGlobalOperations->getBrandName(sysmanProperties.brandName);
     memset(sysmanProperties.boardNumber, 0, ZES_STRING_PROPERTY_SIZE);
     if (!pOsGlobalOperations->getBoardNumber(sysmanProperties.boardNumber)) {
-        memcpy_s(sysmanProperties.boardNumber, ZES_STRING_PROPERTY_SIZE, unknown.c_str(), unknown.length() + 1);
+        memcpy_s(sysmanProperties.boardNumber, ZES_STRING_PROPERTY_SIZE, unknown.data(), unknown.length() + 1);
     }
     memset(sysmanProperties.serialNumber, 0, ZES_STRING_PROPERTY_SIZE);
     if (!pOsGlobalOperations->getSerialNumber(sysmanProperties.serialNumber)) {
-        memcpy_s(sysmanProperties.serialNumber, ZES_STRING_PROPERTY_SIZE, unknown.c_str(), unknown.length() + 1);
+        memcpy_s(sysmanProperties.serialNumber, ZES_STRING_PROPERTY_SIZE, unknown.data(), unknown.length() + 1);
     }
 }
 void GlobalOperationsImp::initGlobalOperations() {

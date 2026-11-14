@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,21 +19,28 @@ struct Swizzles {
     ze_image_format_swizzle_t z;
     ze_image_format_swizzle_t w;
 
-    bool operator==(const Swizzles &rhs) {
-        if (x != rhs.x)
+    bool operator==(const Swizzles &rhs) const {
+        if (x != rhs.x) {
             return false;
-        if (y != rhs.y)
+        }
+        if (y != rhs.y) {
             return false;
-        if (z != rhs.z)
+        }
+        if (z != rhs.z) {
             return false;
-        if (w != rhs.w)
+        }
+        if (w != rhs.w) {
             return false;
+        }
 
         return true;
     }
 };
 
 cl_channel_type getClChannelDataType(const ze_image_format_t &imgDescription);
-cl_channel_order getClChannelOrder(const ze_image_format_t &imgDescription);
+cl_channel_order getClChannelOrder(const ze_image_format_t &imgDescription, bool srgb = false);
+
+// Chroma plane is half sized. Excludes 3-plane layouts (RGBP, BRGP, I420).
+bool isTwoPlaneYuv420Format(ze_image_format_layout_t layout);
 
 } // namespace L0

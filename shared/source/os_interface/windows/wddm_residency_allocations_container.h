@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 #include "shared/source/memory_manager/memory_operations_status.h"
 #include "shared/source/os_interface/windows/windows_defs.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/spinlock.h"
 
 #include <mutex>
@@ -19,6 +20,7 @@ class Wddm;
 class WddmResidentAllocationsContainer {
   public:
     WddmResidentAllocationsContainer(Wddm *wddm) : wddm(wddm) {}
+    WddmResidentAllocationsContainer(Wddm *wddm, bool evictionAllowed) : wddm(wddm), isEvictionOnMakeResidentAllowed(evictionAllowed) {}
     MOCKABLE_VIRTUAL ~WddmResidentAllocationsContainer();
 
     MemoryOperationsStatus isAllocationResident(const D3DKMT_HANDLE &handle);
@@ -28,6 +30,7 @@ class WddmResidentAllocationsContainer {
     MOCKABLE_VIRTUAL MemoryOperationsStatus makeResidentResource(const D3DKMT_HANDLE &handle, size_t size);
     MemoryOperationsStatus makeResidentResources(const D3DKMT_HANDLE *handles, const uint32_t count, size_t size);
     MOCKABLE_VIRTUAL void removeResource(const D3DKMT_HANDLE &handle);
+    void removeResourceReference(const D3DKMT_HANDLE &handle);
 
   protected:
     [[nodiscard]] MOCKABLE_VIRTUAL std::unique_lock<SpinLock> acquireLock(SpinLock &lock) {
@@ -39,6 +42,7 @@ class WddmResidentAllocationsContainer {
     Wddm *wddm;
     std::vector<D3DKMT_HANDLE> resourceHandles;
     SpinLock resourcesLock;
+    const bool isEvictionOnMakeResidentAllowed{true};
 };
 
 } // namespace NEO

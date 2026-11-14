@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,8 +12,11 @@
 #include "shared/source/compiler_interface/compiler_interface.inl"
 #include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/compiler_interface/igc_platform_helper.h"
+#include "shared/source/compiler_interface/os_compiler_cache_helper.h"
+#include "shared/source/compiler_interface/spirv_capabilities_parser.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
+#include "shared/source/device_binary_format/device_binary_formats.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/os_inc_base.h"
@@ -31,12 +34,6 @@
 namespace NEO {
 SpinLock CompilerInterface::spinlock;
 
-enum CachingMode {
-    None,
-    Direct,
-    PreProcess
-};
-
 void TranslationOutput::makeCopy(MemAndSize &dst, CIF::Builtins::BufferSimple *src) {
     if ((nullptr == src) || (src->GetSizeRaw() == 0)) {
         dst.mem.reset();
@@ -50,15 +47,18 @@ void TranslationOutput::makeCopy(MemAndSize &dst, CIF::Builtins::BufferSimple *s
 
 CompilerInterface::CompilerInterface()
     : cache() {
+    if (debugManager.flags.FinalizerInputType.get() != "unk") {
+        this->finalizerInputType = IGC::CodeType::CodeTypeCoder::Enc(debugManager.flags.FinalizerInputType.get().c_str());
+    }
 }
 CompilerInterface::~CompilerInterface() = default;
 
-TranslationOutput::ErrorCode CompilerInterface::build(
+TranslationErrorCode CompilerInterface::build(
     const NEO::Device &device,
     const TranslationInput &input,
     TranslationOutput &output) {
-    if (false == isCompilerAvailable(input.srcType, input.outType)) {
-        return TranslationOutput::ErrorCode::CompilerNotAvailable;
+    if (false == isCompilerAvailable(&device, input.srcType, input.outType)) {
+        return TranslationErrorCode::compilerNotAvailable;
     }
 
     IGC::CodeType::CodeType_t srcCodeType = input.srcType;
@@ -68,34 +68,29 @@ TranslationOutput::ErrorCode CompilerInterface::build(
         intermediateCodeType = input.preferredIntermediateType;
     }
 
-    CachingMode cachingMode = None;
-
-    if (cache != nullptr && cache->getConfig().enabled) {
-        if ((srcCodeType == IGC::CodeType::oclC) && (std::strstr(input.src.begin(), "#include") == nullptr)) {
-            cachingMode = CachingMode::Direct;
-        } else {
-            cachingMode = CachingMode::PreProcess;
-        }
-    }
+    CachingMode cachingMode = CompilerCacheHelper::getCachingMode(cache.get(), srcCodeType, input.src);
 
     std::string kernelFileHash;
-    if (cachingMode == CachingMode::Direct) {
+    const auto &igc = *getIgc(&device);
+    if (cachingMode == CachingMode::direct) {
         kernelFileHash = cache->getCachedFileName(device.getHardwareInfo(),
                                                   input.src,
                                                   input.apiOptions,
-                                                  input.internalOptions);
-        output.deviceBinary.mem = cache->loadCachedBinary(kernelFileHash, output.deviceBinary.size);
-        if (output.deviceBinary.mem) {
-            return TranslationOutput::ErrorCode::Success;
+                                                  input.internalOptions, ArrayRef<const char>(), ArrayRef<const char>(), igc.revision, igc.igcRegKeys, igc.libSize, igc.libMTime);
+
+        bool success = CompilerCacheHelper::loadCacheAndSetOutput(*cache, kernelFileHash, output);
+        if (success) {
+            return TranslationErrorCode::success;
         }
     }
 
-    auto inSrc = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.src.begin(), input.src.size());
-    auto fclOptions = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.apiOptions.begin(), input.apiOptions.size());
-    auto fclInternalOptions = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.internalOptions.begin(), input.internalOptions.size());
+    auto *igcMain = igc.entryPoint.get();
+    auto inSrc = CIF::Builtins::CreateConstBuffer(igcMain, input.src.begin(), input.src.size());
+    auto fclOptions = CIF::Builtins::CreateConstBuffer(igcMain, input.apiOptions.begin(), input.apiOptions.size());
+    auto fclInternalOptions = CIF::Builtins::CreateConstBuffer(igcMain, input.internalOptions.begin(), input.internalOptions.size());
 
-    auto idsBuffer = CIF::Builtins::CreateConstBuffer(igcMain.get(), nullptr, 0);
-    auto valuesBuffer = CIF::Builtins::CreateConstBuffer(igcMain.get(), nullptr, 0);
+    auto idsBuffer = CIF::Builtins::CreateConstBuffer(igcMain, nullptr, 0);
+    auto valuesBuffer = CIF::Builtins::CreateConstBuffer(igcMain, nullptr, 0);
     for (const auto &specConst : input.specializedValues) {
         idsBuffer->PushBackRawCopy(specConst.first);
         valuesBuffer->PushBackRawCopy(specConst.second);
@@ -108,18 +103,28 @@ TranslationOutput::ErrorCode CompilerInterface::build(
             intermediateCodeType = getPreferredIntermediateRepresentation(device);
         }
 
-        auto fclTranslationCtx = createFclTranslationCtx(device, srcCodeType, intermediateCodeType);
-        auto fclOutput = translate(fclTranslationCtx.get(), inSrc.get(),
-                                   fclOptions.get(), fclInternalOptions.get());
+        const auto frontendApiOptions = input.getFrontendApiOptions();
+        auto frontendOptions = CIF::Builtins::CreateConstBuffer(igcMain, frontendApiOptions.begin(), frontendApiOptions.size());
+
+        CIF::RAII::UPtr_t<NEO::OclTranslationOutputTag> fclOutput;
+        if (this->useIgcAsFcl(&device)) {
+            auto igcTranslationCtx = createIgcTranslationCtx(device, srcCodeType, intermediateCodeType);
+            fclOutput = translate(igcTranslationCtx.get(), inSrc.get(),
+                                  frontendOptions.get(), fclInternalOptions.get());
+        } else {
+            auto fclTranslationCtx = createFclTranslationCtx(device, srcCodeType, intermediateCodeType);
+            fclOutput = translate(fclTranslationCtx.get(), inSrc.get(),
+                                  frontendOptions.get(), fclInternalOptions.get());
+        }
 
         if (fclOutput == nullptr) {
-            return TranslationOutput::ErrorCode::UnknownError;
+            return TranslationErrorCode::unknownError;
         }
 
         TranslationOutput::makeCopy(output.frontendCompilerLog, fclOutput->GetBuildLog());
 
         if (fclOutput->Successful() == false) {
-            return TranslationOutput::ErrorCode::BuildFailure;
+            return TranslationErrorCode::buildFailure;
         }
 
         output.intermediateCodeType = intermediateCodeType;
@@ -133,105 +138,147 @@ TranslationOutput::ErrorCode CompilerInterface::build(
         intermediateCodeType = srcCodeType;
     }
 
-    if (cachingMode == CachingMode::PreProcess) {
-        kernelFileHash = cache->getCachedFileName(device.getHardwareInfo(), ArrayRef<const char>(intermediateRepresentation->GetMemory<char>(), intermediateRepresentation->GetSize<char>()),
+    if (cachingMode == CachingMode::preProcess) {
+        const ArrayRef<const char> irRef(intermediateRepresentation->GetMemory<char>(), intermediateRepresentation->GetSize<char>());
+        const ArrayRef<const char> specIdsRef(idsBuffer->GetMemory<char>(), idsBuffer->GetSize<char>());
+        const ArrayRef<const char> specValuesRef(valuesBuffer->GetMemory<char>(), valuesBuffer->GetSize<char>());
+        const auto &igc = *getIgc(&device);
+        kernelFileHash = cache->getCachedFileName(device.getHardwareInfo(), irRef,
                                                   input.apiOptions,
-                                                  input.internalOptions);
-        output.deviceBinary.mem = cache->loadCachedBinary(kernelFileHash, output.deviceBinary.size);
-        if (output.deviceBinary.mem) {
-            return TranslationOutput::ErrorCode::Success;
+                                                  input.internalOptions, specIdsRef, specValuesRef, igc.revision, igc.igcRegKeys, igc.libSize, igc.libMTime);
+
+        bool success = CompilerCacheHelper::loadCacheAndSetOutput(*cache, kernelFileHash, output);
+        if (success) {
+            return TranslationErrorCode::success;
         }
     }
 
-    auto igcTranslationCtx = createIgcTranslationCtx(device, intermediateCodeType, IGC::CodeType::oclGenBin);
-
-    auto igcOutput = translate(igcTranslationCtx.get(), intermediateRepresentation.get(), idsBuffer.get(), valuesBuffer.get(),
-                               fclOptions.get(), fclInternalOptions.get(), input.gtPinInput);
-
-    if (igcOutput == nullptr) {
-        return TranslationOutput::ErrorCode::UnknownError;
+    auto igcOutputType = IGC::CodeType::oclGenBin;
+    if (this->finalizerInputType != IGC::CodeType::undefined) {
+        igcOutputType = this->finalizerInputType;
     }
 
-    TranslationOutput::makeCopy(output.backendCompilerLog, igcOutput->GetBuildLog());
+    auto igcTranslationCtx = createIgcTranslationCtx(device, intermediateCodeType, igcOutputType);
 
-    if (igcOutput->Successful() == false) {
-        return TranslationOutput::ErrorCode::BuildFailure;
+    auto buildOutput = translate(igcTranslationCtx.get(), intermediateRepresentation.get(), idsBuffer.get(), valuesBuffer.get(),
+                                 fclOptions.get(), fclInternalOptions.get(), nullptr);
+
+    if (buildOutput == nullptr) {
+        return TranslationErrorCode::unknownError;
     }
+
+    TranslationOutput::makeCopy(output.backendCompilerLog, buildOutput->GetBuildLog());
+
+    if (buildOutput->Successful() == false) {
+        return TranslationErrorCode::buildFailure;
+    }
+
+    if (igcOutputType == this->finalizerInputType) {
+        TranslationOutput::makeCopy(output.finalizerInputRepresentation, buildOutput->GetOutput());
+
+        auto finalizerTranslationCtx = createFinalizerTranslationCtx(device, this->finalizerInputType, IGC::CodeType::oclGenBin);
+
+        auto finalizerOutput = translate(finalizerTranslationCtx.get(), buildOutput->GetOutput(),
+                                         fclOptions.get(), fclInternalOptions.get(), nullptr);
+        buildOutput = std::move(finalizerOutput);
+
+        TranslationOutput::append(output.backendCompilerLog, buildOutput->GetBuildLog(), "\n", 0);
+        if (buildOutput->Successful() == false) {
+            return TranslationErrorCode::buildFailure;
+        }
+    }
+
+    TranslationOutput::makeCopy(output.deviceBinary, buildOutput->GetOutput());
+    TranslationOutput::makeCopy(output.debugData, buildOutput->GetDebugData());
 
     if (cache != nullptr && cache->getConfig().enabled) {
-        cache->cacheBinary(kernelFileHash, igcOutput->GetOutput()->GetMemory<char>(), static_cast<uint32_t>(igcOutput->GetOutput()->GetSize<char>()));
+        CompilerCacheHelper::packAndCacheBinary(*cache, kernelFileHash, NEO::getTargetDevice(device.getRootDeviceEnvironment()), output);
     }
 
-    TranslationOutput::makeCopy(output.deviceBinary, igcOutput->GetOutput());
-    TranslationOutput::makeCopy(output.debugData, igcOutput->GetDebugData());
-
-    return TranslationOutput::ErrorCode::Success;
+    return TranslationErrorCode::success;
 }
 
-TranslationOutput::ErrorCode CompilerInterface::compile(
+TranslationErrorCode CompilerInterface::compile(
     const NEO::Device &device,
     const TranslationInput &input,
     TranslationOutput &output) {
 
     if ((IGC::CodeType::oclC != input.srcType) && (IGC::CodeType::elf != input.srcType)) {
-        return TranslationOutput::ErrorCode::AlreadyCompiled;
+        return TranslationErrorCode::alreadyCompiled;
     }
 
-    if (false == isCompilerAvailable(input.srcType, input.outType)) {
-        return TranslationOutput::ErrorCode::CompilerNotAvailable;
+    if (false == isCompilerAvailable(&device, input.srcType, input.outType)) {
+        return TranslationErrorCode::compilerNotAvailable;
     }
 
     auto outType = input.outType;
 
     if (outType == IGC::CodeType::undefined) {
         outType = getPreferredIntermediateRepresentation(device);
+        if (outType != IGC::CodeType::spirV) {
+            outType = IGC::CodeType::llvmBc;
+        }
     }
 
-    auto fclSrc = CIF::Builtins::CreateConstBuffer(fclMain.get(), input.src.begin(), input.src.size());
-    auto fclOptions = CIF::Builtins::CreateConstBuffer(fclMain.get(), input.apiOptions.begin(), input.apiOptions.size());
-    auto fclInternalOptions = CIF::Builtins::CreateConstBuffer(fclMain.get(), input.internalOptions.begin(), input.internalOptions.size());
+    CIF::CIFMain *fclMain = nullptr;
+    if (this->useIgcAsFcl(&device)) {
+        fclMain = getIgc(&device)->entryPoint.get();
+    } else {
+        fclMain = fcl.entryPoint.get();
+    }
+    auto fclSrc = CIF::Builtins::CreateConstBuffer(fclMain, input.src.begin(), input.src.size());
+    const auto frontendApiOptions = input.getFrontendApiOptions();
+    auto fclOptions = CIF::Builtins::CreateConstBuffer(fclMain, frontendApiOptions.begin(), frontendApiOptions.size());
+    auto fclInternalOptions = CIF::Builtins::CreateConstBuffer(fclMain, input.internalOptions.begin(), input.internalOptions.size());
 
-    auto fclTranslationCtx = createFclTranslationCtx(device, input.srcType, outType);
-
-    auto fclOutput = translate(fclTranslationCtx.get(), fclSrc.get(),
-                               fclOptions.get(), fclInternalOptions.get());
+    CIF::RAII::UPtr_t<NEO::OclTranslationOutputTag> fclOutput;
+    if (this->useIgcAsFcl(&device)) {
+        auto igcTranslationCtx = createIgcTranslationCtx(device, input.srcType, outType);
+        fclOutput = translate(igcTranslationCtx.get(), fclSrc.get(),
+                              fclOptions.get(), fclInternalOptions.get());
+    } else {
+        auto fclTranslationCtx = createFclTranslationCtx(device, input.srcType, outType);
+        fclOutput = translate(fclTranslationCtx.get(), fclSrc.get(),
+                              fclOptions.get(), fclInternalOptions.get());
+    }
 
     if (fclOutput == nullptr) {
-        return TranslationOutput::ErrorCode::UnknownError;
+        return TranslationErrorCode::unknownError;
     }
 
     TranslationOutput::makeCopy(output.frontendCompilerLog, fclOutput->GetBuildLog());
 
     if (fclOutput->Successful() == false) {
-        return TranslationOutput::ErrorCode::CompilationFailure;
+        return TranslationErrorCode::compilationFailure;
     }
 
     output.intermediateCodeType = outType;
     TranslationOutput::makeCopy(output.intermediateRepresentation, fclOutput->GetOutput());
 
-    return TranslationOutput::ErrorCode::Success;
+    return TranslationErrorCode::success;
 }
 
-TranslationOutput::ErrorCode CompilerInterface::link(
+TranslationErrorCode CompilerInterface::link(
     const NEO::Device &device,
     const TranslationInput &input,
     TranslationOutput &output) {
-    if (false == isCompilerAvailable(input.srcType, input.outType)) {
-        return TranslationOutput::ErrorCode::CompilerNotAvailable;
+    if (false == isCompilerAvailable(&device, input.srcType, input.outType)) {
+        return TranslationErrorCode::compilerNotAvailable;
     }
 
-    auto inSrc = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.src.begin(), input.src.size());
-    auto igcOptions = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.apiOptions.begin(), input.apiOptions.size());
-    auto igcInternalOptions = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.internalOptions.begin(), input.internalOptions.size());
+    auto *igcMain = getIgc(&device)->entryPoint.get();
+    auto inSrc = CIF::Builtins::CreateConstBuffer(igcMain, input.src.begin(), input.src.size());
+    auto igcOptions = CIF::Builtins::CreateConstBuffer(igcMain, input.apiOptions.begin(), input.apiOptions.size());
+    auto igcInternalOptions = CIF::Builtins::CreateConstBuffer(igcMain, input.internalOptions.begin(), input.internalOptions.size());
 
     if (inSrc == nullptr) {
-        return TranslationOutput::ErrorCode::UnknownError;
+        return TranslationErrorCode::unknownError;
     }
 
-    CIF::RAII::UPtr_t<IGC::OclTranslationOutputTagOCL> currOut;
+    CIF::RAII::UPtr_t<NEO::OclTranslationOutputTag> currOut;
     inSrc->Retain(); // shared with currSrc
     CIF::RAII::UPtr_t<CIF::Builtins::BufferSimple> currSrc(inSrc.get());
-    IGC::CodeType::CodeType_t translationChain[] = {IGC::CodeType::elf, IGC::CodeType::oclGenBin};
+    IGC::CodeType::CodeType_t translationChain[] = {IGC::CodeType::elf, input.outType};
     constexpr size_t numTranslations = sizeof(translationChain) / sizeof(translationChain[0]);
     for (size_t ti = 1; ti < numTranslations; ti++) {
         IGC::CodeType::CodeType_t inType = translationChain[ti - 1];
@@ -239,15 +286,15 @@ TranslationOutput::ErrorCode CompilerInterface::link(
 
         auto igcTranslationCtx = createIgcTranslationCtx(device, inType, outType);
         currOut = translate(igcTranslationCtx.get(), currSrc.get(),
-                            igcOptions.get(), igcInternalOptions.get(), input.gtPinInput);
+                            igcOptions.get(), igcInternalOptions.get(), nullptr);
 
         if (currOut == nullptr) {
-            return TranslationOutput::ErrorCode::UnknownError;
+            return TranslationErrorCode::unknownError;
         }
 
         if (currOut->Successful() == false) {
             TranslationOutput::makeCopy(output.backendCompilerLog, currOut->GetBuildLog());
-            return TranslationOutput::ErrorCode::LinkFailure;
+            return TranslationErrorCode::linkFailure;
         }
 
         currOut->GetOutput()->Retain(); // shared with currSrc
@@ -258,40 +305,43 @@ TranslationOutput::ErrorCode CompilerInterface::link(
     TranslationOutput::makeCopy(output.deviceBinary, currOut->GetOutput());
     TranslationOutput::makeCopy(output.debugData, currOut->GetDebugData());
 
-    return TranslationOutput::ErrorCode::Success;
+    return TranslationErrorCode::success;
 }
 
-TranslationOutput::ErrorCode CompilerInterface::getSpecConstantsInfo(const NEO::Device &device, ArrayRef<const char> srcSpirV, SpecConstantInfo &output) {
-    if (false == isIgcAvailable()) {
-        return TranslationOutput::ErrorCode::CompilerNotAvailable;
+TranslationErrorCode CompilerInterface::getSpecConstantsInfo(const NEO::Device &device, ArrayRef<const char> src, SpecConstantInfo &output,
+                                                             IGC::CodeType::CodeType_t srcCodeType) {
+    if (false == isIgcAvailable(&device)) {
+        return TranslationErrorCode::compilerNotAvailable;
     }
 
-    auto igcTranslationCtx = createIgcTranslationCtx(device, IGC::CodeType::spirV, IGC::CodeType::oclGenBin);
+    auto igcTranslationCtx = createIgcTranslationCtx(device, srcCodeType, IGC::CodeType::oclGenBin);
 
-    auto inSrc = CIF::Builtins::CreateConstBuffer(igcMain.get(), srcSpirV.begin(), srcSpirV.size());
-    output.idsBuffer = CIF::Builtins::CreateConstBuffer(igcMain.get(), nullptr, 0);
-    output.sizesBuffer = CIF::Builtins::CreateConstBuffer(igcMain.get(), nullptr, 0);
+    auto *igcMain = getIgc(&device)->entryPoint.get();
+    auto inSrc = CIF::Builtins::CreateConstBuffer(igcMain, src.begin(), src.size());
+    output.idsBuffer = CIF::Builtins::CreateConstBuffer(igcMain, nullptr, 0);
+    output.sizesBuffer = CIF::Builtins::CreateConstBuffer(igcMain, nullptr, 0);
 
     auto retVal = getSpecConstantsInfoImpl(igcTranslationCtx.get(), inSrc.get(), output.idsBuffer.get(), output.sizesBuffer.get());
 
     if (!retVal) {
-        return TranslationOutput::ErrorCode::UnknownError;
+        return TranslationErrorCode::unknownError;
     }
 
-    return TranslationOutput::ErrorCode::Success;
+    return TranslationErrorCode::success;
 }
 
-TranslationOutput::ErrorCode CompilerInterface::createLibrary(
+TranslationErrorCode CompilerInterface::createLibrary(
     NEO::Device &device,
     const TranslationInput &input,
     TranslationOutput &output) {
-    if (false == isIgcAvailable()) {
-        return TranslationOutput::ErrorCode::CompilerNotAvailable;
+    if (false == isIgcAvailable(&device)) {
+        return TranslationErrorCode::compilerNotAvailable;
     }
 
-    auto igcSrc = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.src.begin(), input.src.size());
-    auto igcOptions = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.apiOptions.begin(), input.apiOptions.size());
-    auto igcInternalOptions = CIF::Builtins::CreateConstBuffer(igcMain.get(), input.internalOptions.begin(), input.internalOptions.size());
+    auto *igcMain = getIgc(&device)->entryPoint.get();
+    auto igcSrc = CIF::Builtins::CreateConstBuffer(igcMain, input.src.begin(), input.src.size());
+    auto igcOptions = CIF::Builtins::CreateConstBuffer(igcMain, input.apiOptions.begin(), input.apiOptions.size());
+    auto igcInternalOptions = CIF::Builtins::CreateConstBuffer(igcMain, input.internalOptions.begin(), input.internalOptions.size());
 
     auto intermediateRepresentation = IGC::CodeType::llvmBc;
     auto igcTranslationCtx = createIgcTranslationCtx(device, IGC::CodeType::elf, intermediateRepresentation);
@@ -300,42 +350,46 @@ TranslationOutput::ErrorCode CompilerInterface::createLibrary(
                                igcOptions.get(), igcInternalOptions.get());
 
     if (igcOutput == nullptr) {
-        return TranslationOutput::ErrorCode::UnknownError;
+        return TranslationErrorCode::unknownError;
     }
 
     TranslationOutput::makeCopy(output.backendCompilerLog, igcOutput->GetBuildLog());
 
     if (igcOutput->Successful() == false) {
-        return TranslationOutput::ErrorCode::LinkFailure;
+        return TranslationErrorCode::linkFailure;
     }
 
     output.intermediateCodeType = intermediateRepresentation;
     TranslationOutput::makeCopy(output.intermediateRepresentation, igcOutput->GetOutput());
 
-    return TranslationOutput::ErrorCode::Success;
+    return TranslationErrorCode::success;
 }
 
-TranslationOutput::ErrorCode CompilerInterface::getSipKernelBinary(NEO::Device &device, SipKernelType type, std::vector<char> &retBinary,
-                                                                   std::vector<char> &stateSaveAreaHeader) {
-    if (false == isIgcAvailable()) {
-        return TranslationOutput::ErrorCode::CompilerNotAvailable;
+TranslationErrorCode CompilerInterface::getSipKernelBinary(NEO::Device &device, SipKernelType type, std::vector<char> &retBinary,
+                                                           std::vector<char> &stateSaveAreaHeader) {
+    if (false == isIgcAvailable(&device)) {
+        return TranslationErrorCode::compilerNotAvailable;
     }
 
     bool bindlessSip = false;
     IGC::SystemRoutineType::SystemRoutineType_t typeOfSystemRoutine = IGC::SystemRoutineType::undefined;
     switch (type) {
-    case SipKernelType::Csr:
+    case SipKernelType::csr:
         typeOfSystemRoutine = IGC::SystemRoutineType::contextSaveRestore;
         break;
-    case SipKernelType::DbgCsr:
+    case SipKernelType::dbgCsr:
         typeOfSystemRoutine = IGC::SystemRoutineType::debug;
         break;
-    case SipKernelType::DbgCsrLocal:
+    case SipKernelType::dbgCsrLocal:
         typeOfSystemRoutine = IGC::SystemRoutineType::debugSlm;
         break;
-    case SipKernelType::DbgBindless:
+    case SipKernelType::dbgBindless:
         typeOfSystemRoutine = IGC::SystemRoutineType::debug;
         bindlessSip = true;
+        break;
+    case SipKernelType::dbgHeapless:
+        typeOfSystemRoutine = IGC::SystemRoutineType::debug;
+        bindlessSip = false;
         break;
     default:
         break;
@@ -344,9 +398,10 @@ TranslationOutput::ErrorCode CompilerInterface::getSipKernelBinary(NEO::Device &
     auto deviceCtx = getIgcDeviceCtx(device);
 
     if (deviceCtx == nullptr) {
-        return TranslationOutput::ErrorCode::UnknownError;
+        return TranslationErrorCode::unknownError;
     }
 
+    auto *igcMain = getIgc(&device)->entryPoint.get();
     auto systemRoutineBuffer = igcMain->CreateBuiltin<CIF::Builtins::BufferLatest>();
     auto stateSaveAreaBuffer = igcMain->CreateBuiltin<CIF::Builtins::BufferLatest>();
 
@@ -356,59 +411,83 @@ TranslationOutput::ErrorCode CompilerInterface::getSipKernelBinary(NEO::Device &
                                               stateSaveAreaBuffer.get());
 
     if (!result) {
-        return TranslationOutput::ErrorCode::UnknownError;
+        return TranslationErrorCode::unknownError;
     }
 
     retBinary.assign(systemRoutineBuffer->GetMemory<char>(), systemRoutineBuffer->GetMemory<char>() + systemRoutineBuffer->GetSizeRaw());
     stateSaveAreaHeader.assign(stateSaveAreaBuffer->GetMemory<char>(), stateSaveAreaBuffer->GetMemory<char>() + stateSaveAreaBuffer->GetSizeRaw());
 
-    return TranslationOutput::ErrorCode::Success;
+    return TranslationErrorCode::success;
 }
 
-CIF::RAII::UPtr_t<IGC::IgcFeaturesAndWorkaroundsTagOCL> CompilerInterface::getIgcFeaturesAndWorkarounds(NEO::Device const &device) {
-    return getIgcDeviceCtx(device)->GetIgcFeaturesAndWorkaroundsHandle();
+CIF::RAII::UPtr_t<NEO::IgcFeaturesAndWorkaroundsTag> CompilerInterface::getIgcFeaturesAndWorkarounds(NEO::Device const &device) {
+    return getIgcDeviceCtx(device)->GetIgcFeaturesAndWorkaroundsHandle<NEO::IgcFeaturesAndWorkaroundsTag>();
+}
+
+std::string CompilerInterface::getSpirvExtensionsYAML(const NEO::Device &device) {
+    auto *igc = getIgc(&device);
+    if (igc == nullptr) {
+        return "";
+    }
+    return SpirvCapabilitiesParser::getSpirvExtensionsYAMLFromDeviceCtx(getIgcDeviceCtx(device), igc->entryPoint.get());
 }
 
 bool CompilerInterface::loadFcl() {
-    return NEO::loadCompiler<IGC::FclOclDeviceCtx>(Os::frontEndDllName, fclLib, fclMain);
+    return NEO::loadCompiler<IGC::FclOclDeviceCtx>(Os::frontEndDllName, fcl.library, fcl.entryPoint);
 }
 
-bool CompilerInterface::loadIgc() {
-    return NEO::loadCompiler<IGC::IgcOclDeviceCtx>(Os::igcDllName, igcLib, igcMain);
+bool CompilerInterface::loadIgcBasedCompiler(CompilerLibraryEntry &entry, const char *libName) {
+    bool result = NEO::loadCompiler<IGC::IgcOclDeviceCtx>(libName, entry.library, entry.entryPoint);
+
+    if (result) {
+        std::string libPath = entry.library->getFullPath();
+        entry.libSize = NEO::getFileSize(libPath);
+        entry.libMTime = NEO::getFileModificationTime(libPath);
+
+        auto igcDeviceCtx = entry.entryPoint->CreateInterface<NEO::IgcOclDeviceCtxTag>();
+        if (igcDeviceCtx) {
+            entry.revision = igcDeviceCtx->GetIGCRevision();
+            auto igcRegKeysBuffer = entry.entryPoint->CreateBuiltin<CIF::Builtins::BufferLatest>();
+            if (igcRegKeysBuffer) {
+                igcDeviceCtx->GetIGCRegKeys(igcRegKeysBuffer.get());
+                if (igcRegKeysBuffer->GetSizeRaw() > 0) {
+                    entry.igcRegKeys.assign(igcRegKeysBuffer->GetMemory<char>(), igcRegKeysBuffer->GetSizeRaw());
+                }
+            }
+        }
+    }
+    return result;
 }
 
 bool CompilerInterface::initialize(std::unique_ptr<CompilerCache> &&cache, bool requireFcl) {
-    bool fclAvailable = requireFcl ? this->loadFcl() : false;
-    bool igcAvailable = this->loadIgc();
-    bool compilerVersionCorrect = true;
-
-    if (!DebugManager.flags.ZebinIgnoreIcbeVersion.get()) {
-        compilerVersionCorrect = verifyIcbeVersion();
+    if (requireFcl) {
+        this->loadFcl();
     }
+    bool igcAvailable = this->loadIgcBasedCompiler(defaultIgc, Os::igcDllName);
 
     this->cache.swap(cache);
 
-    return this->cache && igcAvailable && (fclAvailable || (false == requireFcl)) && compilerVersionCorrect;
+    return this->cache && igcAvailable;
 }
 
-IGC::FclOclDeviceCtxTagOCL *CompilerInterface::getFclDeviceCtx(const Device &device) {
+NEO::FclOclDeviceCtxTag *CompilerInterface::getFclDeviceCtx(const Device &device) {
     auto ulock = this->lock();
     auto it = fclDeviceContexts.find(&device);
     if (it != fclDeviceContexts.end()) {
         return it->second.get();
     }
 
-    if (fclMain == nullptr) {
+    if (fcl.entryPoint == nullptr) {
         DEBUG_BREAK_IF(true); // compiler not available
         return nullptr;
     }
 
-    auto newDeviceCtx = fclMain->CreateInterface<IGC::FclOclDeviceCtxTagOCL>();
+    auto newDeviceCtx = fcl.entryPoint->CreateInterface<NEO::FclOclDeviceCtxTag>();
     if (newDeviceCtx == nullptr) {
         DEBUG_BREAK_IF(true); // could not create device context
         return nullptr;
     }
-    newDeviceCtx->SetOclApiVersion(device.getHardwareInfo().capabilityTable.clVersionSupport * 10);
+    newDeviceCtx->SetOclApiVersion(ocl30ApiVersion);
     if (newDeviceCtx->GetUnderlyingVersion() > 4U) {
         auto igcPlatform = newDeviceCtx->GetPlatformHandle();
         if (nullptr == igcPlatform.get()) {
@@ -423,55 +502,87 @@ IGC::FclOclDeviceCtxTagOCL *CompilerInterface::getFclDeviceCtx(const Device &dev
     return fclDeviceContexts[&device].get();
 }
 
-IGC::IgcOclDeviceCtxTagOCL *CompilerInterface::getIgcDeviceCtx(const Device &device) {
+NEO::IgcOclDeviceCtxTag *CompilerInterface::getIgcDeviceCtx(const Device &device) {
     auto ulock = this->lock();
     auto it = igcDeviceContexts.find(&device);
     if (it != igcDeviceContexts.end()) {
         return it->second.get();
     }
 
-    if (igcMain == nullptr) {
+    auto *igc = getIgc(&device);
+    if (igc == nullptr) {
         DEBUG_BREAK_IF(true); // compiler not available
         return nullptr;
     }
+    auto *igcMain = igc->entryPoint.get();
 
-    auto newDeviceCtx = igcMain->CreateInterface<IGC::IgcOclDeviceCtxTagOCL>();
+    auto newDeviceCtx = igcMain->CreateInterface<NEO::IgcOclDeviceCtxTag>();
     if (newDeviceCtx == nullptr) {
         DEBUG_BREAK_IF(true); // could not create device context
         return nullptr;
     }
 
     newDeviceCtx->SetProfilingTimerResolution(static_cast<float>(device.getDeviceInfo().outProfilingTimerResolution));
-    auto igcPlatform = newDeviceCtx->GetPlatformHandle();
-    auto igcGtSystemInfo = newDeviceCtx->GetGTSystemInfoHandle();
-    auto igcFtrWa = newDeviceCtx->GetIgcFeaturesAndWorkaroundsHandle();
-    if (false == NEO::areNotNullptr(igcPlatform.get(), igcGtSystemInfo.get(), igcFtrWa.get())) {
-        DEBUG_BREAK_IF(true); // could not acquire handles to device descriptors
-        return nullptr;
-    }
+
     const HardwareInfo *hwInfo = &device.getHardwareInfo();
-    auto productFamily = DebugManager.flags.ForceCompilerUsePlatform.get();
+    auto productFamily = debugManager.flags.ForceCompilerUsePlatform.get();
     if (productFamily != "unk") {
         getHwInfoForPlatformString(productFamily, hwInfo);
     }
 
-    populateIgcPlatform(*igcPlatform, *hwInfo);
-    IGC::GtSysInfoHelper::PopulateInterfaceWith(*igcGtSystemInfo, hwInfo->gtSystemInfo);
-
-    auto &compilerProductHelper = device.getCompilerProductHelper();
-    igcFtrWa->SetFtrGpGpuMidThreadLevelPreempt(compilerProductHelper.isMidThreadPreemptionSupported(*hwInfo));
-    igcFtrWa->SetFtrWddm2Svm(device.getHardwareInfo().featureTable.flags.ftrWddm2Svm);
-    igcFtrWa->SetFtrPooledEuEnabled(device.getHardwareInfo().featureTable.flags.ftrPooledEuEnabled);
+    if (!initializeIgcDeviceContext(newDeviceCtx.get(), *hwInfo)) {
+        DEBUG_BREAK_IF(true); // could not initialize device context
+        return nullptr;
+    }
 
     igcDeviceContexts[&device] = std::move(newDeviceCtx);
     return igcDeviceContexts[&device].get();
 }
 
-IGC::CodeType::CodeType_t CompilerInterface::getPreferredIntermediateRepresentation(const Device &device) {
-    return getFclDeviceCtx(device)->GetPreferredIntermediateRepresentation();
+NEO::IgcOclDeviceCtxTag *CompilerInterface::getFinalizerDeviceCtx(const Device &device) {
+    auto ulock = this->lock();
+    auto it = finalizerDeviceContexts.find(&device);
+    if (it != finalizerDeviceContexts.end()) {
+        return it->second.get();
+    }
+
+    auto finalizer = this->getFinalizer(&device);
+    if (finalizer == nullptr) {
+        DEBUG_BREAK_IF(true); // compiler not available
+        return nullptr;
+    }
+
+    auto newDeviceCtx = finalizer->entryPoint->CreateInterface<NEO::IgcOclDeviceCtxTag>();
+    if (newDeviceCtx == nullptr) {
+        DEBUG_BREAK_IF(true); // could not create device context
+        return nullptr;
+    }
+
+    newDeviceCtx->SetProfilingTimerResolution(static_cast<float>(device.getDeviceInfo().outProfilingTimerResolution));
+    const HardwareInfo *hwInfo = &device.getHardwareInfo();
+    auto productFamily = debugManager.flags.ForceCompilerUsePlatform.get();
+    if (productFamily != "unk") {
+        getHwInfoForPlatformString(productFamily, hwInfo);
+    }
+
+    if (!initializeIgcDeviceContext(newDeviceCtx.get(), *hwInfo)) {
+        DEBUG_BREAK_IF(true); // could not initialize device context
+        return nullptr;
+    }
+
+    finalizerDeviceContexts[&device] = std::move(newDeviceCtx);
+    return finalizerDeviceContexts[&device].get();
 }
 
-CIF::RAII::UPtr_t<IGC::FclOclTranslationCtxTagOCL> CompilerInterface::createFclTranslationCtx(const Device &device, IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType) {
+IGC::CodeType::CodeType_t CompilerInterface::getPreferredIntermediateRepresentation(const Device &device) {
+    if (useIgcAsFcl(&device)) {
+        return device.getCompilerProductHelper().getPreferredIntermediateRepresentation();
+    } else {
+        return getFclDeviceCtx(device)->GetPreferredIntermediateRepresentation();
+    }
+}
+
+CIF::RAII::UPtr_t<NEO::FclOclTranslationCtxTag> CompilerInterface::createFclTranslationCtx(const Device &device, IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType) {
     auto deviceCtx = getFclDeviceCtx(device);
     if (deviceCtx == nullptr) {
         DEBUG_BREAK_IF(true); // could not create device context
@@ -481,79 +592,179 @@ CIF::RAII::UPtr_t<IGC::FclOclTranslationCtxTagOCL> CompilerInterface::createFclT
     if (fclBaseTranslationCtx == nullptr) {
         auto ulock = this->lock();
         if (fclBaseTranslationCtx == nullptr) {
-            fclBaseTranslationCtx = deviceCtx->CreateTranslationCtx(inType, outType);
+            fclBaseTranslationCtx = deviceCtx->CreateTranslationCtx<NEO::FclOclTranslationCtxTag>(inType, outType);
         }
     }
 
-    return deviceCtx->CreateTranslationCtx(inType, outType);
+    return deviceCtx->CreateTranslationCtx<NEO::FclOclTranslationCtxTag>(inType, outType);
 }
 
-CIF::RAII::UPtr_t<IGC::IgcOclTranslationCtxTagOCL> CompilerInterface::createIgcTranslationCtx(const Device &device, IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType) {
+CIF::RAII::UPtr_t<NEO::IgcOclTranslationCtxTag> CompilerInterface::createIgcTranslationCtx(const Device &device, IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType) {
     auto deviceCtx = getIgcDeviceCtx(device);
     if (deviceCtx == nullptr) {
         DEBUG_BREAK_IF(true); // could not create device context
         return nullptr;
     }
 
-    return deviceCtx->CreateTranslationCtx(inType, outType);
+    return deviceCtx->CreateTranslationCtx<NEO::IgcOclTranslationCtxTag>(inType, outType);
 }
 
-template <template <CIF::Version_t> class EntryPointT>
-void checkIcbeVersion(CIF::CIFMain *main, const char *libName, bool &ret) {
-    if (false == main->IsCompatible<EntryPointT>()) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Installed Compiler Library %s is incompatible\n", libName);
-        DEBUG_BREAK_IF(true); // given compiler library is not compatible
-        ret = false;
-        return;
+CIF::RAII::UPtr_t<NEO::IgcOclTranslationCtxTag> CompilerInterface::createFinalizerTranslationCtx(const Device &device, IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType) {
+    auto deviceCtx = getFinalizerDeviceCtx(device);
+    if (deviceCtx == nullptr) {
+        DEBUG_BREAK_IF(true); // could not create device context
+        return nullptr;
     }
-    ret = true;
+
+    return deviceCtx->CreateTranslationCtx<NEO::IgcOclTranslationCtxTag>(inType, outType);
 }
 
-template <>
-std::once_flag &CompilerInterface::getIcbeVersionCallOnceFlag<IGC::IgcOclDeviceCtx>() {
-    return igcIcbeCheckVersionCallOnce;
+bool CompilerInterface::isFclAvailable(const Device *device) {
+    return useIgcAsFcl(device) ? isIgcAvailable(device) : static_cast<bool>(fcl.entryPoint);
 }
 
-template <>
-std::once_flag &CompilerInterface::getIcbeVersionCallOnceFlag<IGC::FclOclDeviceCtx>() {
-    return fclIcbeCheckVersionCallOnce;
+bool CompilerInterface::isIgcAvailable(const Device *device) {
+    return nullptr != getIgc(device);
 }
 
-template <template <CIF::Version_t> class EntryPointT>
-bool CompilerInterface::checkIcbeVersionOnce(CIF::CIFMain *main, const char *libName) {
-    bool ret = true;
-    std::call_once(getIcbeVersionCallOnceFlag<EntryPointT>(), checkIcbeVersion<EntryPointT>, main, libName, ret);
-    return ret;
+bool CompilerInterface::isFinalizerAvailable(const Device *device) {
+    return nullptr != getFinalizer(device);
 }
 
-bool CompilerInterface::verifyIcbeVersion() {
-    bool versionIsCorrect = true;
-    if (isFclAvailable()) {
-        versionIsCorrect = checkIcbeVersionOnce<IGC::FclOclDeviceCtx>(fclMain.get(), Os::frontEndDllName);
+bool CompilerInterface::useIgcAsFcl(const Device *device) {
+    if (0 != debugManager.flags.UseIgcAsFcl.get()) {
+        if (1 == debugManager.flags.UseIgcAsFcl.get()) {
+            return true;
+        } else if (2 == debugManager.flags.UseIgcAsFcl.get()) {
+            return false;
+        }
     }
-    if (isIgcAvailable()) {
-        versionIsCorrect &= checkIcbeVersionOnce<IGC::IgcOclDeviceCtx>(igcMain.get(), Os::igcDllName);
-    }
-    return versionIsCorrect;
-}
 
-bool CompilerInterface::addOptionDisableZebin(std::string &options, std::string &internalOptions) {
-    CompilerOptions::concatenateAppend(internalOptions, CompilerOptions::disableZebin);
-    auto pos = options.find(NEO::CompilerOptions::enableZebin.str());
-    if (pos != std::string::npos || !verifyIcbeVersion()) {
+    if (nullptr == device) {
         return false;
     }
+
+    return device->getCompilerProductHelper().useIgcAsFcl();
+}
+
+const CompilerInterface::CompilerLibraryEntry *CompilerInterface::getIgc(const Device *device) {
+    if (nullptr == device) {
+        if (defaultIgc.entryPoint == nullptr) {
+            return nullptr;
+        }
+        return &defaultIgc;
+    }
+    return getIgc(device->getCompilerProductHelper().getCustomIgcLibraryName());
+}
+
+const CompilerInterface::CompilerLibraryEntry *CompilerInterface::getFinalizer(const Device *device) {
+    if (nullptr == device) {
+        return nullptr;
+    }
+
+    const char *finalizerLibName = nullptr;
+    if (debugManager.flags.FinalizerLibraryName.get() != "unk") {
+        finalizerLibName = debugManager.flags.FinalizerLibraryName.getRef().c_str();
+    }
+
+    return getFinalizer(finalizerLibName);
+}
+
+const CompilerInterface::CompilerLibraryEntry *CompilerInterface::getCustomCompilerLibrary(const char *libName) {
+    std::lock_guard<decltype(customCompilerLibraryLoadMutex)> lock{customCompilerLibraryLoadMutex};
+    auto it = customCompilerLibraries.find(libName);
+    if (it != customCompilerLibraries.end()) {
+        return it->second.get();
+    }
+
+    CompilerLibraryEntry newEntry = {};
+    this->loadIgcBasedCompiler(newEntry, libName);
+    if (newEntry.entryPoint == nullptr) {
+        return nullptr;
+    }
+
+    customCompilerLibraries[libName].reset(new CompilerLibraryEntry(std::move(newEntry)));
+
+    return customCompilerLibraries[libName].get();
+}
+
+void CompilerCacheHelper::packAndCacheBinary(CompilerCache &compilerCache, const std::string &kernelFileHash, const NEO::TargetDevice &targetDevice, const NEO::TranslationOutput &translationOutput) {
+    NEO::SingleDeviceBinary singleDeviceBinary = {};
+    singleDeviceBinary.targetDevice = targetDevice;
+    singleDeviceBinary.deviceBinary = ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(translationOutput.deviceBinary.mem.get()), translationOutput.deviceBinary.size);
+    singleDeviceBinary.debugData = ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(translationOutput.debugData.mem.get()), translationOutput.debugData.size);
+    singleDeviceBinary.intermediateRepresentation = ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(translationOutput.intermediateRepresentation.mem.get()), translationOutput.intermediateRepresentation.size);
+
+    if (NEO::isAnyPackedDeviceBinaryFormat(singleDeviceBinary.deviceBinary)) {
+        compilerCache.cacheBinary(kernelFileHash, translationOutput.deviceBinary.mem.get(), translationOutput.deviceBinary.size);
+        return;
+    }
+
+    std::string packWarnings;
+    std::string packErrors;
+    auto packedBinary = packDeviceBinary<DeviceBinaryFormat::oclElf>(singleDeviceBinary, packErrors, packWarnings);
+
+    if (false == packedBinary.empty()) {
+        compilerCache.cacheBinary(kernelFileHash, reinterpret_cast<const char *>(packedBinary.data()), packedBinary.size());
+    }
+}
+
+bool CompilerCacheHelper::loadCacheAndSetOutput(CompilerCache &compilerCache, const std::string &kernelFileHash, NEO::TranslationOutput &output) {
+    size_t cacheBinarySize = 0u;
+    auto cacheBinary = compilerCache.loadCachedBinary(kernelFileHash, cacheBinarySize);
+
+    if (cacheBinary) {
+        output.deviceBinary.mem = std::move(cacheBinary);
+        output.deviceBinary.size = cacheBinarySize;
+        return true;
+    }
+
+    return false;
+}
+
+CachingMode CompilerCacheHelper::getCachingMode(CompilerCache *compilerCache, IGC::CodeType::CodeType_t srcCodeType, const ArrayRef<const char> source) {
+    if (compilerCache == nullptr || !compilerCache->getConfig().enabled) {
+        return CachingMode::none;
+    }
+
+    if (srcCodeType == IGC::CodeType::oclC &&
+        validateIncludes(source, CompilerCacheHelper::whitelistedIncludes)) {
+        return CachingMode::direct;
+    }
+
+    return CachingMode::preProcess;
+}
+
+bool CompilerCacheHelper::validateIncludes(const ArrayRef<const char> source, const WhitelistedIncludesVec &whitelistedIncludes) {
+    const char *sourcePtr = source.begin();
+    const char *sourceEnd = source.end();
+
+    while (sourcePtr < sourceEnd) {
+        const char *includePos = std::strstr(sourcePtr, "#include");
+        if (includePos == nullptr) {
+            break;
+        }
+
+        bool isKnownInclude = false;
+        for (const auto &knownInclude : whitelistedIncludes) {
+            if (std::strncmp(includePos, knownInclude.data(), knownInclude.size()) == 0) {
+                isKnownInclude = true;
+                break;
+            }
+        }
+
+        if (!isKnownInclude) {
+            return false;
+        }
+
+        sourcePtr = includePos + 1;
+    }
+
     return true;
 }
 
-bool CompilerInterface::disableZebin(std::string &options, std::string &internalOptions) {
-    auto pos = options.find(NEO::CompilerOptions::enableZebin.str());
-    if (pos != std::string::npos) {
-        options.erase(pos, pos + CompilerOptions::enableZebin.length());
-    }
-    return addOptionDisableZebin(options, internalOptions);
-}
+CompilerCacheHelper::WhitelistedIncludesVec CompilerCacheHelper::whitelistedIncludes{
+    "#include <cm/cm.h>",
+    "#include <cm/cmtl.h>"};
 
-template bool CompilerInterface::checkIcbeVersionOnce<IGC::FclOclDeviceCtx>(CIF::CIFMain *main, const char *libName);
-template bool CompilerInterface::checkIcbeVersionOnce<IGC::IgcOclDeviceCtx>(CIF::CIFMain *main, const char *libName);
 } // namespace NEO

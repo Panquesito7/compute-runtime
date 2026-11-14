@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,45 +9,23 @@
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/topology_map.h"
+#include "shared/source/os_interface/external_semaphore.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace NEO {
 struct PhysicalDevicePciBusInfo;
 struct PhysicalDevicePciSpeedInfo;
+struct HardwareInfo;
 enum class DriverModelType;
 class ExecutionEnvironment;
+class HwDeviceId;
 class MemoryManager;
 class OsContext;
-
-class HwDeviceId : public NonCopyableClass {
-  public:
-    HwDeviceId(DriverModelType driverModel) : driverModelType(driverModel) {
-    }
-
-    virtual ~HwDeviceId() = default;
-
-    DriverModelType getDriverModelType() const {
-        return driverModelType;
-    }
-
-    template <typename DerivedType>
-    DerivedType *as() {
-        UNRECOVERABLE_IF(DerivedType::driverModelType != this->driverModelType);
-        return static_cast<DerivedType *>(this);
-    }
-
-    template <typename DerivedType>
-    DerivedType *as() const {
-        UNRECOVERABLE_IF(DerivedType::driverModelType != this->driverModelType);
-        return static_cast<const DerivedType *>(this);
-    }
-
-  protected:
-    DriverModelType driverModelType;
-};
 
 class DriverModel : public NonCopyableClass {
   public:
@@ -73,15 +51,25 @@ class DriverModel : public NonCopyableClass {
 
     virtual uint32_t getDeviceHandle() const = 0;
 
-    DriverModelType getDriverModelType() const {
+    MOCKABLE_VIRTUAL DriverModelType getDriverModelType() const {
         return driverModelType;
     }
 
     virtual PhysicalDevicePciBusInfo getPciBusInfo() const = 0;
     virtual PhysicalDevicePciSpeedInfo getPciSpeedInfo() const = 0;
 
+    virtual void unregisterTrimCallback() {};
+
     virtual size_t getMaxMemAllocSize() const {
         return std::numeric_limits<size_t>::max();
+    }
+
+    virtual uint64_t getDeviceMemoryPhysicalSizeInBytes(uint32_t tileId) {
+        return 0u;
+    }
+
+    virtual uint32_t getDeviceMemoryMaxClockRateInMhz(uint32_t tileId) {
+        return 0u;
     }
 
     virtual bool isDriverAvailable() {
@@ -92,9 +80,23 @@ class DriverModel : public NonCopyableClass {
         return skipResourceCleanupVar;
     }
 
+    virtual bool isLatePreemptionStartSupported(const HardwareInfo &hwInfo) = 0;
+
     virtual void cleanup() {}
 
     virtual bool isGpuHangDetected(OsContext &osContext) = 0;
+    virtual const HardwareInfo *getHardwareInfo() const = 0;
+    virtual bool getDeviceState() {
+        return false;
+    }
+
+    virtual bool isVmBindSupported() {
+        return false;
+    }
+
+    virtual bool waitExternalSemaphoresFromCpu(std::span<const ExternalSemaphoreOperation> waits) { return false; }
+    virtual bool signalExternalSemaphoresFromCpu(std::span<const ExternalSemaphoreOperation> signals) { return false; }
+
     const TopologyMap &getTopologyMap() {
         return topologyMap;
     };
@@ -114,8 +116,12 @@ class OSInterface : public NonCopyableClass {
 
     MOCKABLE_VIRTUAL bool isDebugAttachAvailable() const;
     MOCKABLE_VIRTUAL bool isLockablePointer(bool isLockable) const;
+    MOCKABLE_VIRTUAL bool isSizeWithinThresholdForStaging(const void *ptr, size_t size) const;
+    MOCKABLE_VIRTUAL uint32_t getAggregatedProcessCount() const;
+    void registerTrimCallback();
+    void unregisterTrimCallback();
+
     static bool osEnabled64kbPages;
-    static bool osEnableLocalMemory;
     static bool are64kbPagesEnabled();
     static bool newResourceImplicitFlush;
     static bool gpuIdleImplicitFlush;

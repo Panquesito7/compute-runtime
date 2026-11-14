@@ -1,11 +1,14 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <cstdint>
 #include <memory>
@@ -18,7 +21,7 @@ class GraphicsAllocation;
 class Device;
 struct MultiDispatchInfo;
 
-class PrintfHandler {
+class PrintfHandler : NonCopyableAndNonMovableClass {
   public:
     static PrintfHandler *create(const MultiDispatchInfo &multiDispatchInfo, Device &deviceArg);
 
@@ -40,4 +43,7 @@ class PrintfHandler {
     Kernel *kernel = nullptr;
     GraphicsAllocation *printfSurface = nullptr;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<PrintfHandler>);
+
 } // namespace NEO

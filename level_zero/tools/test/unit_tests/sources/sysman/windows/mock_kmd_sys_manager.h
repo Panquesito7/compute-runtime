@@ -1,15 +1,16 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
 #include "level_zero/core/test/unit_tests/mock.h"
 #include "level_zero/tools/source/sysman/windows/kmd_sys_manager.h"
-
-#include "gmock/gmock.h"
+#include <level_zero/zes_api.h>
 
 namespace L0 {
 namespace ult {
@@ -24,7 +25,7 @@ struct MockEventHandle {
     bool inited = false;
 };
 
-uint64_t convertTStoMicroSec(uint64_t TS, uint32_t freq);
+uint64_t convertTStoMicroSec(uint64_t ts, uint32_t freq);
 
 class MockKmdSysManager : public KmdSysManager {};
 
@@ -58,6 +59,11 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
         pBuffer += sizeof(KmdSysman::GfxSysmanReqHeaderOut);
 
         if (pRequest->inRequestId == KmdSysman::Requests::Power::CurrentPowerLimit1) {
+            if (pRequest->inDataSize != 0) {
+                pResponse->outDataSize = 0;
+                pResponse->outReturnCode = KmdSysman::KmdSysmanFail;
+                return;
+            }
             uint32_t *pPl1 = reinterpret_cast<uint32_t *>(pBuffer);
             *pPl1 = mockPowerLimit1;
             pResponse->outReturnCode = KmdSysman::KmdSysmanSuccess;
@@ -204,7 +210,6 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
     }
 
     bool validateInputBuffer(KmdSysman::GfxSysmanMainHeaderIn *pHeaderIn) {
-        uint32_t sizeCheck = pHeaderIn->inTotalsize;
         uint8_t *pBufferPtr = pHeaderIn->inBuffer;
 
         for (uint32_t i = 0; i < pHeaderIn->inNumElements; i++) {
@@ -214,7 +219,6 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
                 pRequest->inCommand == KmdSysman::Command::RegisterEvent) {
                 if (pRequest->inComponent >= KmdSysman::Component::InterfaceProperties && pRequest->inComponent < KmdSysman::Component::MaxComponents) {
                     pBufferPtr += sizeof(KmdSysman::GfxSysmanReqHeaderIn);
-                    sizeCheck -= sizeof(KmdSysman::GfxSysmanReqHeaderIn);
 
                     if (pRequest->inCommand == KmdSysman::Command::Set ||
                         pRequest->inCommand == KmdSysman::Command::RegisterEvent) {
@@ -222,7 +226,6 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
                             return false;
                         }
                         pBufferPtr += pRequest->inDataSize;
-                        sizeCheck -= pRequest->inDataSize;
                     }
                 } else {
                     return false;
@@ -230,10 +233,6 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
             } else {
                 return false;
             }
-        }
-
-        if (sizeCheck != 0) {
-            return false;
         }
 
         return true;
@@ -261,8 +260,7 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
             for (uint32_t i = 0; i < mockKmdMaxHandlesPerEvent; i++) {
                 if (!handles[pRequest->inRequestId][i].inited) {
                     handles[pRequest->inRequestId][i].inited = true;
-                    unsigned long long eventID = *(unsigned long long *)pBuffer;
-                    handles[pRequest->inRequestId][i].eventHandle = reinterpret_cast<HANDLE>(eventID);
+                    memcpy_s(&handles[pRequest->inRequestId][i].eventHandle, sizeof(HANDLE), pBuffer, sizeof(HANDLE));
                     found = true;
                     break;
                 }
@@ -306,14 +304,14 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
         }
     }
 
-    ze_result_t requestSingle(KmdSysman::RequestProperty &In, KmdSysman::ResponseProperty &Out) {
+    ze_result_t requestSingle(KmdSysman::RequestProperty &In, KmdSysman::ResponseProperty &Out) override {
         if (mockRequestSingle == false) {
             return KmdSysManager::requestSingle(In, Out);
         }
         return mockRequestSingleResult;
     }
 
-    ze_result_t requestMultiple(std::vector<KmdSysman::RequestProperty> &vIn, std::vector<KmdSysman::ResponseProperty> &vOut) {
+    ze_result_t requestMultiple(std::vector<KmdSysman::RequestProperty> &vIn, std::vector<KmdSysman::ResponseProperty> &vOut) override {
         if (mockRequestMultiple == false) {
             return KmdSysManager::requestMultiple(vIn, vOut);
         } else {
@@ -422,7 +420,7 @@ struct Mock<MockKmdSysManager> : public MockKmdSysManager {
         }
     }
 
-    NTSTATUS escape(uint32_t escapeOp, uint64_t pInPtr, uint32_t dataInSize, uint64_t pOutPtr, uint32_t dataOutSize) {
+    NTSTATUS escape(uint32_t escapeOp, uint64_t pInPtr, uint32_t dataInSize, uint64_t pOutPtr, uint32_t dataOutSize) override {
         if (mockEscapeResult != STATUS_SUCCESS) {
             return mockEscapeResult;
         }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,15 +8,17 @@
 #include "shared/test/unit_test/fixtures/command_container_fixture.h"
 
 #include "shared/source/indirect_heap/heap_size.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
 
 namespace NEO {
 
 void CommandEncodeStatesFixture::setUp() {
     DeviceFixture::setUp();
     cmdContainer = std::make_unique<MyMockCommandContainer>();
-    cmdContainer->initialize(pDevice, nullptr, HeapSize::defaultHeapSize, true, false);
+    cmdContainer->initialize(pDevice, nullptr, HeapSize::getDefaultHeapSize(IndirectHeapType::surfaceState), true, false);
     cmdContainer->setDirtyStateForAllHeaps(false);
     const auto &hwInfo = pDevice->getHardwareInfo();
     auto &productHelper = pDevice->getProductHelper();
@@ -31,38 +33,35 @@ void CommandEncodeStatesFixture::tearDown() {
     DeviceFixture::tearDown();
 }
 
-EncodeDispatchKernelArgs CommandEncodeStatesFixture::createDefaultDispatchKernelArgs(Device *device,
-                                                                                     DispatchKernelEncoderI *dispatchInterface,
-                                                                                     const void *threadGroupDimensions,
-                                                                                     bool requiresUncachedMocs) {
+EncodeWalkerArgs CommandEncodeStatesFixture::createDefaultEncodeWalkerArgs(const KernelDescriptor &kernelDescriptor) {
 
-    EncodeDispatchKernelArgs args{
-        0,                        // eventAddress
-        device,                   // device
-        dispatchInterface,        // dispatchInterface
-        nullptr,                  // surfaceStateHeap
-        nullptr,                  // dynamicStateHeap
-        threadGroupDimensions,    // threadGroupDimensions
-        nullptr,                  // additionalCommands
-        PreemptionMode::Disabled, // preemptionMode
-        1,                        // partitionCount
-        0,                        // postSyncImmValue
-        false,                    // inOrderExecEnabled
-        false,                    // isIndirect
-        false,                    // isPredicate
-        false,                    // isTimestampEvent
-        requiresUncachedMocs,     // requiresUncachedMocs
-        false,                    // useGlobalAtomics
-        false,                    // isInternal
-        false,                    // isCooperative
-        false,                    // isHostScopeSignalEvent
-        false,                    // isKernelUsingSystemAllocation
-        false,                    // isKernelDispatchedFromImmediateCmdList
-        false,                    // isRcs
-        false                     // dcFlushEnable
-    };
+    EncodeWalkerArgs args{
+        .kernelExecutionType = KernelExecutionType::defaultType,
+        .requiredDispatchWalkOrder = RequiredDispatchWalkOrder::none,
+        .maxFrontEndThreads = 0,
+        .requiredSystemFence = false,
+        .hasSample = kernelDescriptor.kernelAttributes.flags.hasSample};
 
     return args;
+}
+
+void ScratchProgrammingFixture::setUp() {
+    NEO::DeviceFixture::setUp();
+    size_t sizeStream = 512;
+    size_t alignmentStream = 0x1000;
+    ssh = new IndirectHeap{nullptr};
+    sshBuffer = alignedMalloc(sizeStream, alignmentStream);
+    ASSERT_NE(nullptr, sshBuffer);
+    ssh->replaceBuffer(sshBuffer, sizeStream);
+    auto graphicsAllocation = new MockGraphicsAllocation(sshBuffer, sizeStream);
+    ssh->replaceGraphicsAllocation(graphicsAllocation);
+}
+
+void ScratchProgrammingFixture::tearDown() {
+    delete ssh->getGraphicsAllocation();
+    delete ssh;
+    alignedFree(sshBuffer);
+    NEO::DeviceFixture::tearDown();
 }
 
 } // namespace NEO

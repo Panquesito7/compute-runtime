@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,7 +19,6 @@
 #include "shared/test/common/mocks/linux/mock_drm_memory_manager.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
-#include "shared/test/common/os_interface/linux/device_command_stream_fixture.h"
 #include "shared/test/common/os_interface/linux/drm_buffer_object_fixture.h"
 #include "shared/test/common/os_interface/linux/drm_command_stream_fixture.h"
 #include "shared/test/common/test_macros/hw_test.h"
@@ -39,41 +38,41 @@ struct DrmCommandStreamMemExecTest : public DrmCommandStreamEnhancedTemplate<Drm
 
 HWTEST_F(DrmCommandStreamMMTest, GivenForcePinThenMemoryManagerCreatesPinBb) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.EnableForcePin.set(true);
+    debugManager.flags.EnableForcePin.set(true);
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
 
     MockExecutionEnvironment executionEnvironment;
-    auto drm = new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]);
+    auto drm = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]).release();
 
     executionEnvironment.rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
     executionEnvironment.rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+    executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
     executionEnvironment.rootDeviceEnvironments[0]->initGmm();
 
-    DrmCommandStreamReceiver<FamilyType> csr(executionEnvironment, 0, 1, gemCloseWorkerMode::gemCloseWorkerInactive);
+    DrmCommandStreamReceiver<FamilyType> csr(executionEnvironment, 0, 1);
 
     auto memoryManager = new TestedDrmMemoryManager(false, true, false, executionEnvironment);
     executionEnvironment.memoryManager.reset(memoryManager);
-    ASSERT_NE(nullptr, memoryManager);
     EXPECT_NE(nullptr, memoryManager->pinBBs[0]);
 }
 
 HWTEST_F(DrmCommandStreamMMTest, givenForcePinDisabledWhenMemoryManagerIsCreatedThenPinBBIsCreated) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.EnableForcePin.set(false);
+    debugManager.flags.EnableForcePin.set(false);
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
 
     MockExecutionEnvironment executionEnvironment;
-    auto drm = new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]);
+    auto drm = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]).release();
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
 
     executionEnvironment.rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
     executionEnvironment.rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
     executionEnvironment.rootDeviceEnvironments[0]->initGmm();
 
-    DrmCommandStreamReceiver<FamilyType> csr(executionEnvironment, 0, 1, gemCloseWorkerMode::gemCloseWorkerInactive);
+    DrmCommandStreamReceiver<FamilyType> csr(executionEnvironment, 0, 1);
     auto memoryManager = new TestedDrmMemoryManager(false, true, false, executionEnvironment);
 
     executionEnvironment.memoryManager.reset(memoryManager);
-    ASSERT_NE(nullptr, memoryManager);
     EXPECT_NE(nullptr, memoryManager->pinBBs[0]);
 }
 
@@ -85,15 +84,14 @@ HWTEST_F(DrmCommandStreamMMTest, givenExecutionEnvironmentWithMoreThanOneRootDev
         executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->setHwInfoAndInitHelpers(defaultHwInfo.get());
         executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->osInterface = std::make_unique<OSInterface>();
         executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->initGmm();
-        auto drm = new DrmMockCustom(*executionEnvironment.rootDeviceEnvironments[0]);
+        auto drm = DrmMockCustom::create(*executionEnvironment.rootDeviceEnvironments[0]).release();
         executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-        executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u);
+        executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, 0u, false);
     }
 
     auto memoryManager = new TestedDrmMemoryManager(false, true, false, executionEnvironment);
 
     executionEnvironment.memoryManager.reset(memoryManager);
-    ASSERT_NE(nullptr, memoryManager);
     for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < executionEnvironment.rootDeviceEnvironments.size(); rootDeviceIndex++) {
         EXPECT_NE(nullptr, memoryManager->pinBBs[rootDeviceIndex]);
     }
@@ -104,8 +102,11 @@ HWTEST_TEMPLATED_F(DrmCommandStreamMemExecTest, GivenDrmSupportsVmBindAndComplet
     mock->isVmBindAvailableCall.callParent = false;
     mock->isVmBindAvailableCall.returnValue = true;
 
+    auto *testCsr = static_cast<TestedDrmCommandStreamReceiver<FamilyType> *>(csr);
+    *const_cast<bool *>(&testCsr->vmBindAvailable) = true;
+
     TestedBufferObject bo(rootDeviceIndex, mock, 128);
-    MockDrmAllocation cmdBuffer(rootDeviceIndex, AllocationType::COMMAND_BUFFER, MemoryPool::System4KBPages);
+    MockDrmAllocation cmdBuffer(rootDeviceIndex, AllocationType::commandBuffer, MemoryPool::system4KBPages);
     cmdBuffer.bufferObjects[0] = &bo;
     uint8_t buff[128];
 
@@ -121,7 +122,6 @@ HWTEST_TEMPLATED_F(DrmCommandStreamMemExecTest, GivenDrmSupportsVmBindAndComplet
     csr->makeResident(*csr->getTagAllocation());
 
     uint64_t expectedCompletionGpuAddress = csr->getTagAllocation()->getGpuAddress() + TagAllocationLayout::completionFenceOffset;
-    auto *testCsr = static_cast<TestedDrmCommandStreamReceiver<FamilyType> *>(csr);
     testCsr->latestSentTaskCount = 2;
 
     int ret = testCsr->exec(batchBuffer, 1, 2, 0);
@@ -139,7 +139,7 @@ HWTEST_TEMPLATED_F(DrmCommandStreamMemExecTest, GivenDrmSupportsVmBindAndNotComp
     mock->isVmBindAvailableCall.returnValue = true;
 
     TestedBufferObject bo(rootDeviceIndex, mock, 128);
-    MockDrmAllocation cmdBuffer(rootDeviceIndex, AllocationType::COMMAND_BUFFER, MemoryPool::System4KBPages);
+    MockDrmAllocation cmdBuffer(rootDeviceIndex, AllocationType::commandBuffer, MemoryPool::system4KBPages);
     cmdBuffer.bufferObjects[0] = &bo;
     uint8_t buff[128];
 
@@ -174,7 +174,7 @@ HWTEST_TEMPLATED_F(DrmCommandStreamMemExecTest, GivenDrmSupportsCompletionFenceA
     mock->isVmBindAvailableCall.returnValue = false;
 
     TestedBufferObject bo(rootDeviceIndex, mock, 128);
-    MockDrmAllocation cmdBuffer(rootDeviceIndex, AllocationType::COMMAND_BUFFER, MemoryPool::System4KBPages);
+    MockDrmAllocation cmdBuffer(rootDeviceIndex, AllocationType::commandBuffer, MemoryPool::system4KBPages);
     cmdBuffer.bufferObjects[0] = &bo;
     uint8_t buff[128];
 

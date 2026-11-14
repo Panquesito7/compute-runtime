@@ -1,0 +1,76 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/core/source/cmdlist/cmdlist_hw.h"
+#include "level_zero/core/source/cmdlist/cmdlist_hw_immediate.h"
+
+namespace L0 {
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+constexpr bool CommandListCoreFamily<gfxCoreFamily>::checkIfAllocationImportedRequired() {
+    return false;
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void CommandListCoreFamily<gfxCoreFamily>::addPatchScratchAddressInImplicitArgs(CommandsToPatch &commandsToPatch, NEO::EncodeDispatchKernelArgs &args, const NEO::KernelDescriptor &kernelDescriptor, bool kernelNeedsImplicitArgs) {
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void CommandListCoreFamily<gfxCoreFamily>::addPatchScratchAddress(CommandsToPatch &commandsToPatch, NEO::EncodeDispatchKernelArgs &dispatchKernelArgs, const NEO::KernelDescriptor &kernelDescriptor, CmdListKernelLaunchParams &launchParams, bool kernelNeedsScratchSpace, bool kernelNeedsImplicitArgs) {
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void CommandListCoreFamily<gfxCoreFamily>::addPatchScratchAddressInInlineData(CommandsToPatch &commandsToPatch, NEO::EncodeDispatchKernelArgs &dispatchKernelArgs, const NEO::KernelDescriptor &kernelDescriptor, CmdListKernelLaunchParams &launchParams) {
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void CommandListCoreFamily<gfxCoreFamily>::addPatchScratchAddressInCrossThreadData(CommandsToPatch &commandsToPatch, NEO::EncodeDispatchKernelArgs &dispatchKernelArgs, const NEO::KernelDescriptor &kernelDescriptor, CmdListKernelLaunchParams &launchParams) {
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void CommandListCoreFamily<gfxCoreFamily>::setupFlushL3Flags(bool &isFlushL3ForExternalAllocationRequired, bool &isFlushL3ForHostUsmRequired, bool isFlushL3AfterPostSync, bool isKernelUsingExternalAllocation, bool isKernelUsingSystemAllocation) {
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void CommandListCoreFamily<gfxCoreFamily>::clearCommandsToPatch() {
+
+    auto clearCommandToPatchLambda = [&](auto &patch) {
+        using PatchT = std::decay_t<decltype(patch)>;
+        if constexpr (std::is_same_v<PatchT, PatchDebugPause>) {
+            UNRECOVERABLE_IF(patch.pCommand == nullptr);
+        } else if constexpr (std::is_same_v<PatchT, PatchFrontEndState>) {
+            using FrontEndStateCommand = typename GfxFamily::FrontEndStateCommand;
+            UNRECOVERABLE_IF(patch.pCommand == nullptr);
+            delete reinterpret_cast<FrontEndStateCommand *>(patch.pCommand);
+        } else if constexpr (NEO::isAnyOfType<PatchT,
+                                              PatchComputeWalkerInlineDataScratch,
+                                              PatchComputeWalkerImplicitArgsScratch,
+                                              PatchNoopSpace,
+                                              PatchHostFunctionId,
+                                              PatchHostFunctionWait>) {
+            // nothing to clear
+
+        } else {
+            UNRECOVERABLE_IF(true);
+        }
+    };
+
+    for (auto &commandToPatch : commandsToPatch) {
+        std::visit(clearCommandToPatchLambda,
+                   commandToPatch);
+    }
+
+    commandsToPatch.clear();
+
+    this->frontEndPatchListCount = 0;
+    this->activeScratchPatchElements = 0;
+    this->activeScratchSizePatchElements = 0;
+    this->hostFunctionWithMemorySynchronizationCount = 0;
+    this->hostFunctionWithoutMemorySynchronizationCount = 0;
+}
+
+} // namespace L0

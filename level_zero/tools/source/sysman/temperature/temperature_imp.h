@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,8 +11,11 @@
 
 #include "level_zero/tools/source/sysman/temperature/os_temperature.h"
 #include "level_zero/tools/source/sysman/temperature/temperature.h"
+
 namespace L0 {
-class TemperatureImp : public Temperature, NEO::NonCopyableOrMovableClass {
+struct OsSysman;
+
+class TemperatureImp : public Temperature, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t temperatureGetProperties(zes_temp_properties_t *pProperties) override;
     ze_result_t temperatureGetConfig(zes_temp_config_t *pConfig) override;

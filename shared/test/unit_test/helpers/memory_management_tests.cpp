@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -21,18 +21,14 @@ using MemoryManagement::indexAllocation;
 using MemoryManagement::indexDeallocation;
 using MemoryManagement::numAllocations;
 
-namespace NEO {
-extern bool isStatelessCompressionSupportedForUlts;
-}
-
-TEST(allocation, GivenFailingAllocationNegativeOneWhenCreatingAllocationThenAllocationIsCreatedSuccesfully) {
+TEST(allocation, GivenFailingAllocationNegativeOneWhenCreatingAllocationThenAllocationIsCreatedSuccessfully) {
     ASSERT_EQ(failingAllocation, static_cast<size_t>(-1));
     auto ptr = new (std::nothrow) char;
     EXPECT_NE(nullptr, ptr);
     delete ptr;
 }
 
-TEST(allocation, GivenFailingAllocationOneWhenCreatingAllocationsThenOnlyOneAllocationIsCreatedSuccesfully) {
+TEST(allocation, GivenFailingAllocationOneWhenCreatingAllocationsThenOnlyOneAllocationIsCreatedSuccessfully) {
     MemoryManagement::detailedAllocationLoggingActive = true;
     ASSERT_EQ(static_cast<size_t>(-1), failingAllocation);
     auto previousAllocations = numAllocations.load();
@@ -52,27 +48,6 @@ TEST(allocation, GivenFailingAllocationOneWhenCreatingAllocationsThenOnlyOneAllo
     MemoryManagement::detailedAllocationLoggingActive = false;
 }
 
-TEST(CompressionSelector, WhenAllowStatelessCompressionIsCalledThenReturnCorrectValue) {
-    DebugManagerStateRestore restore;
-
-    VariableBackup<bool> backup(&NEO::isStatelessCompressionSupportedForUlts);
-
-    NEO::isStatelessCompressionSupportedForUlts = false;
-    EXPECT_FALSE(CompressionSelector::allowStatelessCompression());
-
-    NEO::isStatelessCompressionSupportedForUlts = true;
-
-    for (auto enable : {-1, 0, 1}) {
-        DebugManager.flags.EnableStatelessCompression.set(enable);
-
-        if (enable > 0) {
-            EXPECT_TRUE(CompressionSelector::allowStatelessCompression());
-        } else {
-            EXPECT_FALSE(CompressionSelector::allowStatelessCompression());
-        }
-    }
-}
-
 struct MemoryManagementTest : public MemoryManagementFixture,
                               public ::testing::Test {
     void SetUp() override {
@@ -84,7 +59,7 @@ struct MemoryManagementTest : public MemoryManagementFixture,
     }
 };
 
-TEST_F(MemoryManagementTest, GivenFailingAllocationOneWhenCreatingAllocationsThenOnlyOneAllocationIsCreatedSuccesfully) {
+TEST_F(MemoryManagementTest, GivenFailingAllocationOneWhenCreatingAllocationsThenOnlyOneAllocationIsCreatedSuccessfully) {
     setFailingAllocation(1);
     auto ptr1 = new (std::nothrow) char;
     auto ptr2 = new (std::nothrow) char;

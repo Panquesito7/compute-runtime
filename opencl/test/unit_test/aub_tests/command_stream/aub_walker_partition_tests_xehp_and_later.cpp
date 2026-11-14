@@ -1,266 +1,36 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_container/walker_partition_xehp_and_later.h"
 #include "shared/source/helpers/array_count.h"
 #include "shared/source/helpers/basic_math.h"
-#include "shared/source/helpers/timestamp_packet.h"
 #include "shared/source/utilities/io_functions.h"
 #include "shared/source/utilities/tag_allocator.h"
-#include "shared/test/common/cmd_parse/hw_parse.h"
-#include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/helpers/dispatch_flags_helper.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
-#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/event/event.h"
-#include "opencl/source/mem_obj/buffer.h"
-#include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
-#include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
-#include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
-#include "opencl/test/unit_test/fixtures/simple_arg_kernel_fixture.h"
-#include "opencl/test/unit_test/indirect_heap/indirect_heap_fixture.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_walker_partition_fixture.h"
 
 using namespace NEO;
 using namespace WalkerPartition;
 
-static int32_t testPartitionCount[] = {1, 2, 4, 8, 16};
-static int32_t testPartitionType[] = {1, 2, 3};
-static uint32_t testWorkingDimensions[] = {3};
+int32_t testPartitionCount[] = {1, 2, 4, 8, 16};
+int32_t testPartitionType[] = {1, 2, 3};
+uint32_t testWorkingDimensions[] = {3};
 
-extern bool generateRandomInput;
-
-struct DispatchParamters {
-    size_t globalWorkSize[3];
-    size_t localWorkSize[3];
-} DispatchParamtersForTests[] = {
+DispatchParameters dispatchParametersForTests[] = {
     {{12, 25, 21}, {3, 5, 7}},
     {{8, 16, 20}, {8, 4, 2}},
     {{7, 13, 17}, {1, 1, 1}},
 };
 
-struct AubWalkerPartitionFixture : public KernelAUBFixture<SimpleKernelFixture> {
-    void setUp() {
-        debugRestorer = std::make_unique<DebugManagerStateRestore>();
-        DebugManager.flags.EnableTimestampPacket.set(1);
-        kernelIds |= (1 << 5);
-        KernelAUBFixture<SimpleKernelFixture>::setUp();
-
-        size_t userMemorySize = 16 * MemoryConstants::kiloByte;
-        if (generateRandomInput) {
-            userMemorySize = 16000 * MemoryConstants::kiloByte;
-        }
-
-        sizeUserMemory = userMemorySize;
-        auto destMemory = alignedMalloc(sizeUserMemory, 4096);
-        ASSERT_NE(nullptr, destMemory);
-        memset(destMemory, 0x0, sizeUserMemory);
-
-        dstBuffer.reset(Buffer::create(context, CL_MEM_COPY_HOST_PTR, sizeUserMemory, destMemory, retVal));
-        ASSERT_NE(nullptr, dstBuffer);
-        alignedFree(destMemory);
-
-        kernels[5]->setArg(0, dstBuffer.get());
-    }
-
-    void tearDown() {
-        pCmdQ->flush();
-
-        KernelAUBFixture<SimpleKernelFixture>::tearDown();
-    }
-    template <typename FamilyType>
-    void validatePartitionProgramming(uint64_t postSyncAddress, int32_t partitionCount) {
-        using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-        using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-        uint32_t totalWorkgroupCount = 1u;
-        uint32_t totalWorkItemsInWorkgroup = 1u;
-        uint32_t totalWorkItemsCount = 1;
-
-        for (auto dimension = 0u; dimension < workingDimensions; dimension++) {
-            totalWorkgroupCount *= static_cast<uint32_t>(dispatchParamters.globalWorkSize[dimension] / dispatchParamters.localWorkSize[dimension]);
-            totalWorkItemsInWorkgroup *= static_cast<uint32_t>(dispatchParamters.localWorkSize[dimension]);
-            totalWorkItemsCount *= static_cast<uint32_t>(dispatchParamters.globalWorkSize[dimension]);
-        }
-
-        const uint32_t workgroupCount = static_cast<uint32_t>(dispatchParamters.globalWorkSize[partitionType - 1] / dispatchParamters.localWorkSize[partitionType - 1]);
-        auto partitionSize = Math::divideAndRoundUp(workgroupCount, partitionCount);
-
-        if (static_cast<uint32_t>(partitionType) > workingDimensions) {
-            partitionSize = 1;
-        }
-
-        hwParser.parseCommands<FamilyType>(pCmdQ->getCS(0), 0);
-
-        uint32_t walkersCount = hwParser.getCommandCount<WALKER_TYPE>();
-        EXPECT_EQ(walkersCount, 1u);
-        GenCmdList walkerList = hwParser.getCommandsList<WALKER_TYPE>();
-        WALKER_TYPE *walkerCmd = static_cast<WALKER_TYPE *>(*walkerList.begin());
-        EXPECT_EQ(0u, walkerCmd->getPartitionId());
-        if (partitionCount > 1) {
-            EXPECT_TRUE(walkerCmd->getWorkloadPartitionEnable());
-            EXPECT_EQ(partitionSize, walkerCmd->getPartitionSize());
-            EXPECT_EQ(partitionType, walkerCmd->getPartitionType());
-        } else {
-            EXPECT_FALSE(walkerCmd->getWorkloadPartitionEnable());
-            EXPECT_EQ(0u, walkerCmd->getPartitionSize());
-            EXPECT_EQ(0u, walkerCmd->getPartitionType());
-        }
-
-        EXPECT_EQ(FamilyType::POSTSYNC_DATA::OPERATION::OPERATION_WRITE_TIMESTAMP, walkerCmd->getPostSync().getOperation());
-        EXPECT_EQ(postSyncAddress, walkerCmd->getPostSync().getDestinationAddress());
-
-        int notExpectedValue[] = {1, 1, 1, 1};
-
-        for (auto partitionId = 0; partitionId < DebugManager.flags.ExperimentalSetWalkerPartitionCount.get(); partitionId++) {
-            expectNotEqualMemory<FamilyType>(reinterpret_cast<void *>(postSyncAddress), &notExpectedValue, sizeof(notExpectedValue));
-            postSyncAddress += 16; // next post sync needs to be right after the previous one
-        }
-
-        auto dstGpuAddress = reinterpret_cast<void *>(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress());
-        expectMemory<FamilyType>(dstGpuAddress, &totalWorkItemsCount, sizeof(uint32_t));
-        auto groupSpecificWorkCounts = ptrOffset(dstGpuAddress, 4);
-        StackVec<uint32_t, 8> workgroupCounts;
-        workgroupCounts.resize(totalWorkgroupCount);
-
-        for (uint32_t workgroupId = 0u; workgroupId < totalWorkgroupCount; workgroupId++) {
-            workgroupCounts[workgroupId] = totalWorkItemsInWorkgroup;
-        }
-
-        expectMemory<FamilyType>(groupSpecificWorkCounts, workgroupCounts.begin(), workgroupCounts.size() * sizeof(uint32_t));
-    }
-
-    template <typename FamilyType>
-    typename FamilyType::PIPE_CONTROL *retrieveSyncPipeControl(void *startAddress,
-                                                               const RootDeviceEnvironment &rootDeviceEnvironment) {
-        using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-        uint8_t buffer[256];
-        LinearStream stream(buffer, 256);
-        MemorySynchronizationCommands<FamilyType>::addBarrierWa(stream, 0ull, rootDeviceEnvironment);
-        void *syncPipeControlAddress = reinterpret_cast<void *>(reinterpret_cast<size_t>(startAddress) + stream.getUsed());
-        PIPE_CONTROL *pipeControl = genCmdCast<PIPE_CONTROL *>(syncPipeControlAddress);
-        return pipeControl;
-    }
-
-    std::unique_ptr<DebugManagerStateRestore> debugRestorer;
-    std::unique_ptr<Buffer> dstBuffer;
-    size_t sizeUserMemory = 0;
-
-    cl_uint workingDimensions = 1;
-    int32_t partitionCount;
-    int32_t partitionType;
-
-    HardwareParse hwParser;
-    DispatchParamters dispatchParamters;
-};
-
-struct AubWalkerPartitionTest : public AubWalkerPartitionFixture,
-                                public ::testing::TestWithParam<std::tuple<int32_t, int32_t, DispatchParamters, uint32_t>> {
-    void SetUp() override {
-        AubWalkerPartitionFixture::setUp();
-        std::tie(partitionCount, partitionType, dispatchParamters, workingDimensions) = GetParam();
-
-        if (generateRandomInput) {
-            workingDimensions = (rand() % 3 + 1);
-            partitionType = (rand() % 3 + 1);
-            partitionCount = rand() % 16 + 1;
-
-            // now generate dimensions that makes sense
-            auto goodWorkingSizeGenerated = false;
-            while (!goodWorkingSizeGenerated) {
-                dispatchParamters.localWorkSize[0] = rand() % 128 + 1;
-                dispatchParamters.localWorkSize[1] = rand() % 128 + 1;
-                dispatchParamters.localWorkSize[2] = rand() % 128 + 1;
-                auto totalWorkItemsInWorkgroup = 1;
-                for (auto dimension = 0u; dimension < workingDimensions; dimension++) {
-                    totalWorkItemsInWorkgroup *= static_cast<uint32_t>(dispatchParamters.localWorkSize[dimension]);
-                }
-                if (totalWorkItemsInWorkgroup <= 1024) {
-                    dispatchParamters.globalWorkSize[0] = dispatchParamters.localWorkSize[0] * (rand() % 32 + 1);
-                    dispatchParamters.globalWorkSize[1] = dispatchParamters.localWorkSize[1] * (rand() % 32 + 1);
-                    dispatchParamters.globalWorkSize[2] = dispatchParamters.localWorkSize[2] * (rand() % 32 + 1);
-
-                    printf("\n generated following dispatch paramters work dim %u gws %zu %zu %zu lws %zu %zu %zu, partition type %d partitionCount %d",
-                           workingDimensions,
-                           dispatchParamters.globalWorkSize[0],
-                           dispatchParamters.globalWorkSize[1],
-                           dispatchParamters.globalWorkSize[2],
-                           dispatchParamters.localWorkSize[0],
-                           dispatchParamters.localWorkSize[1],
-                           dispatchParamters.localWorkSize[2],
-                           partitionType,
-                           partitionCount);
-                    IoFunctions::fflushPtr(stdout);
-                    goodWorkingSizeGenerated = true;
-                }
-            };
-        }
-
-        DebugManager.flags.ExperimentalSetWalkerPartitionCount.set(partitionCount);
-        DebugManager.flags.ExperimentalSetWalkerPartitionType.set(partitionType);
-        DebugManager.flags.EnableWalkerPartition.set(1u);
-    }
-    void TearDown() override {
-        AubWalkerPartitionFixture::tearDown();
-    }
-};
-
-struct AubWalkerPartitionZeroFixture : public AubWalkerPartitionFixture {
-    void setUp() {
-        AubWalkerPartitionFixture::setUp();
-
-        partitionCount = 0;
-        partitionType = 0;
-
-        workingDimensions = 1;
-
-        DebugManager.flags.ExperimentalSetWalkerPartitionCount.set(0);
-        DebugManager.flags.ExperimentalSetWalkerPartitionType.set(0);
-
-        commandBufferProperties = std::make_unique<AllocationProperties>(device->getRootDeviceIndex(), true, MemoryConstants::pageSize, AllocationType::COMMAND_BUFFER, false, device->getDeviceBitfield());
-        auto memoryManager = this->device->getMemoryManager();
-        streamAllocation = memoryManager->allocateGraphicsMemoryWithProperties(*commandBufferProperties);
-        helperSurface = memoryManager->allocateGraphicsMemoryWithProperties(*commandBufferProperties);
-        memset(helperSurface->getUnderlyingBuffer(), 0, MemoryConstants::pageSize);
-        taskStream = std::make_unique<LinearStream>(streamAllocation);
-    }
-    void tearDown() {
-        auto memoryManager = this->device->getMemoryManager();
-        memoryManager->freeGraphicsMemory(streamAllocation);
-        memoryManager->freeGraphicsMemory(helperSurface);
-        AubWalkerPartitionFixture::tearDown();
-    }
-
-    void flushStream() {
-        DispatchFlags dispatchFlags = DispatchFlagsHelper::createDefaultDispatchFlags();
-        dispatchFlags.guardCommandBufferWithPipeControl = true;
-
-        csr->makeResident(*helperSurface);
-        csr->flushTask(*taskStream, 0,
-                       &csr->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u),
-                       &csr->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u),
-                       &csr->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u),
-                       0u, dispatchFlags, device->getDevice());
-
-        csr->flushBatchedSubmissions();
-    }
-    std::unique_ptr<LinearStream> taskStream;
-    GraphicsAllocation *streamAllocation = nullptr;
-    GraphicsAllocation *helperSurface = nullptr;
-    std::unique_ptr<AllocationProperties> commandBufferProperties;
-};
-
 using AubWalkerPartitionZeroTest = Test<AubWalkerPartitionZeroFixture>;
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, whenPartitionCountSetToZeroThenProvideEqualSingleWalker) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
-    using PARTITION_TYPE = typename FamilyType::WALKER_TYPE::PARTITION_TYPE;
 
     size_t globalWorkOffset[3] = {0, 0, 0};
     cl_uint numEventsInWaitList = 0;
@@ -282,25 +52,30 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, whenPartitionCountSetTo
 
     pCmdQ->flush();
 
-    auto cmdPartitionType = static_cast<PARTITION_TYPE>(partitionType);
-    uint32_t cmdPartitionCount = static_cast<uint32_t>(partitionCount);
+    auto cmdPartitionCount = static_cast<uint32_t>(partitionCount);
 
-    hwParser.parseCommands<FamilyType>(pCmdQ->getCS(0), 0);
-    uint32_t walkersCount = hwParser.getCommandCount<WALKER_TYPE>();
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PARTITION_TYPE = typename WalkerType::PARTITION_TYPE;
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, pCmdQ->getCS(0).getCpuBase(), pCmdQ->getCS(0).getUsed()));
+
+    auto walkerCmds = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
+
+    auto walkersCount = static_cast<uint32_t>(walkerCmds.size());
     EXPECT_EQ(cmdPartitionCount + 1, walkersCount);
 
-    GenCmdList walkerList = hwParser.getCommandsList<WALKER_TYPE>();
-    EXPECT_EQ(walkersCount, static_cast<uint32_t>(walkerList.size()));
+    for (auto &walkerCmd : walkerCmds) {
+        auto walker = genCmdCast<WalkerType *>(*walkerCmd);
+        auto cmdPartitionType = static_cast<PARTITION_TYPE>(partitionType);
 
-    uint32_t i = 0;
-    for (GenCmdList::iterator walker = walkerList.begin(); walker != walkerList.end(); ++walker, ++i) {
-        WALKER_TYPE *walkerCmd = static_cast<WALKER_TYPE *>(*walker);
-        EXPECT_EQ(cmdPartitionCount, walkerCmd->getPartitionId());
-        EXPECT_EQ(cmdPartitionType, walkerCmd->getPartitionType());
-        EXPECT_EQ(cmdPartitionCount, walkerCmd->getPartitionSize());
+        EXPECT_EQ(cmdPartitionCount, walker->getPartitionId());
+        EXPECT_EQ(cmdPartitionType, walker->getPartitionType());
+        EXPECT_EQ(cmdPartitionCount, walker->getPartitionSize());
     }
 
-    auto dstGpuAddress = reinterpret_cast<void *>(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress());
+    auto dstGpuAddress = addrToPtr(ptrOffset(dstBuffer->getGraphicsAllocation(rootDeviceIndex)->getGpuAddress(), dstBuffer->getOffset()));
     expectMemory<FamilyType>(dstGpuAddress, &gwsSize[workingDimensions - 1], sizeof(uint32_t));
 
     const uint32_t workgroupCount = static_cast<uint32_t>(gwsSize[workingDimensions - 1] / lwsSize[workingDimensions - 1]);
@@ -333,7 +108,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, whenPipeControlIsBeingE
     void *pipeControlAddress = taskStream->getSpace(0);
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     auto pipeControl = retrieveSyncPipeControl<FamilyType>(pipeControlAddress, device->getRootDeviceEnvironment());
@@ -379,7 +154,6 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenAtomicOperationInc
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenVariousCompareModesWhenConditionalBatchBufferEndIsEmittedItThenHandlesCompareCorrectly) {
     using CONDITIONAL_BATCH_BUFFER_END = typename FamilyType::MI_CONDITIONAL_BATCH_BUFFER_END;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     auto writeAddress = helperSurface->getGpuAddress();
     auto compareAddress = reinterpret_cast<int *>(helperSurface->getUnderlyingBuffer());
 
@@ -396,7 +170,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenVariousCompareMode
     void *pipeControlAddress = taskStream->getSpace(0);
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     auto pipeControl = retrieveSyncPipeControl<FamilyType>(pipeControlAddress, device->getRootDeviceEnvironment());
@@ -589,18 +363,18 @@ struct MultiLevelBatchAubFixture : public AUBFixture {
     void setUp() {
         if (enableNesting) {
             // turn on Batch Buffer nesting
-            DebugManager.flags.AubDumpAddMmioRegistersList.set(
+            debugManager.flags.AubDumpAddMmioRegistersList.set(
                 "0x1A09C;0x10001000");
         } else {
             // turn off Batch Buffer nesting
-            DebugManager.flags.AubDumpAddMmioRegistersList.set(
+            debugManager.flags.AubDumpAddMmioRegistersList.set(
                 "0x1A09C;0x10000000");
         }
         AUBFixture::setUp(nullptr);
 
         auto memoryManager = this->device->getMemoryManager();
 
-        commandBufferProperties = std::make_unique<AllocationProperties>(device->getRootDeviceIndex(), true, MemoryConstants::pageSize, AllocationType::COMMAND_BUFFER, false, device->getDeviceBitfield());
+        commandBufferProperties = std::make_unique<AllocationProperties>(device->getRootDeviceIndex(), true, MemoryConstants::pageSize, AllocationType::commandBuffer, false, device->getDeviceBitfield());
         streamAllocation = memoryManager->allocateGraphicsMemoryWithProperties(*commandBufferProperties);
         helperSurface = memoryManager->allocateGraphicsMemoryWithProperties(*commandBufferProperties);
         memset(helperSurface->getUnderlyingBuffer(), 0, MemoryConstants::pageSize);
@@ -612,8 +386,7 @@ struct MultiLevelBatchAubFixture : public AUBFixture {
         thirdLevelBatchStream = std::make_unique<LinearStream>(thirdLevelBatch);
     };
     void tearDown() {
-        DebugManager.flags.AubDumpAddMmioRegistersList.getRef() = "unk";
-        DebugManager.flags.AubDumpAddMmioRegistersList.getRef().shrink_to_fit();
+        debugManager.flags.AubDumpAddMmioRegistersList.set("unk");
 
         auto memoryManager = this->device->getMemoryManager();
         memoryManager->freeGraphicsMemory(thirdLevelBatch);
@@ -630,9 +403,9 @@ struct MultiLevelBatchAubFixture : public AUBFixture {
 
         csr->makeResident(*helperSurface);
         csr->flushTask(*taskStream, 0,
-                       &csr->getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0u),
-                       &csr->getIndirectHeap(IndirectHeap::Type::INDIRECT_OBJECT, 0u),
-                       &csr->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0u),
+                       &csr->getIndirectHeap(IndirectHeap::Type::dynamicState, 0u),
+                       &csr->getIndirectHeap(IndirectHeap::Type::indirectObject, 0u),
+                       &csr->getIndirectHeap(IndirectHeap::Type::surfaceState, 0u),
                        0u, dispatchFlags, device->getDevice());
 
         csr->flushBatchedSubmissions();
@@ -660,7 +433,6 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenConditionalBa
 
     using CONDITIONAL_BATCH_BUFFER_END = typename FamilyType::MI_CONDITIONAL_BATCH_BUFFER_END;
     using BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
     getSimulatedCsr<FamilyType>()->initializeEngine();
     writeMMIO<FamilyType>(0x1A09C, 0x10001000);
@@ -689,7 +461,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenConditionalBa
     // this pipe control should be executed
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *secondLevelBatchStream, PostSyncMode::ImmediateData,
+        *secondLevelBatchStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     conditionalBatchBufferEnd = reinterpret_cast<CONDITIONAL_BATCH_BUFFER_END *>(secondLevelBatchStream->getSpace(sizeof(CONDITIONAL_BATCH_BUFFER_END)));
@@ -701,7 +473,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenConditionalBa
     writeAddress += sizeof(uint64_t);
     writeValue++;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     csr->makeResident(*secondLevelBatch);
@@ -723,7 +495,6 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenConditionalBa
 
     using CONDITIONAL_BATCH_BUFFER_END = typename FamilyType::MI_CONDITIONAL_BATCH_BUFFER_END;
     using BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
     // nest to second level
     auto batchBufferStart = reinterpret_cast<BATCH_BUFFER_START *>(taskStream->getSpace(sizeof(BATCH_BUFFER_START)));
@@ -749,7 +520,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenConditionalBa
     // this pipe control should NOT be executed
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *secondLevelBatchStream, PostSyncMode::ImmediateData,
+        *secondLevelBatchStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     conditionalBatchBufferEnd = reinterpret_cast<CONDITIONAL_BATCH_BUFFER_END *>(secondLevelBatchStream->getSpace(sizeof(CONDITIONAL_BATCH_BUFFER_END)));
@@ -761,7 +532,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenConditionalBa
     writeAddress += sizeof(uint64_t);
     writeValue++;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     csr->makeResident(*secondLevelBatch);
@@ -794,7 +565,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithNesting, givenCommandBuffer
     // this pipe control should be executed
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *secondLevelBatchStream, PostSyncMode::ImmediateData,
+        *secondLevelBatchStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     auto batchBufferEnd = reinterpret_cast<BATCH_BUFFER_END *>(secondLevelBatchStream->getSpace(sizeof(BATCH_BUFFER_END)));
@@ -835,10 +606,10 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithoutNesting, givenConditiona
     writeAddress += sizeof(uint64_t);
     auto writeValue = 7u;
 
-    // this pipe control should't be executed
+    // this pipe control should not be executed
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *secondLevelBatchStream, PostSyncMode::ImmediateData,
+        *secondLevelBatchStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     conditionalBatchBufferEnd = reinterpret_cast<CONDITIONAL_BATCH_BUFFER_END *>(secondLevelBatchStream->getSpace(sizeof(CONDITIONAL_BATCH_BUFFER_END)));
@@ -851,7 +622,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithoutNesting, givenConditiona
     writeValue++;
     // and this shouldn't as well, we returned to ring
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     csr->makeResident(*secondLevelBatch);
@@ -895,10 +666,10 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithoutNesting, givenConditiona
     writeAddress += sizeof(uint64_t);
     auto writeValue = 7u;
 
-    // this pipe control should't be executed
+    // this pipe control should not be executed
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *secondLevelBatchStream, PostSyncMode::ImmediateData,
+        *secondLevelBatchStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     conditionalBatchBufferEnd = reinterpret_cast<CONDITIONAL_BATCH_BUFFER_END *>(secondLevelBatchStream->getSpace(sizeof(CONDITIONAL_BATCH_BUFFER_END)));
@@ -911,7 +682,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiLevelBatchTestsWithoutNesting, givenConditiona
     writeValue++;
     // and this should , we returned to primary batch
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     csr->makeResident(*secondLevelBatch);
@@ -975,17 +746,21 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenNonBlockingAtomicO
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenPredicatedCommandBufferWhenItIsExecutedThenAtomicIsIncrementedEquallyToPartitionCountPlusOne) {
     MockExecutionEnvironment mockExecutionEnvironment{};
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+    using DefaultWalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<DefaultWalkerType>());
 
     auto streamCpuPointer = taskStream->getSpace(0);
     auto postSyncAddress = helperSurface->getGpuAddress();
 
     uint32_t totalBytesProgrammed = 0u;
-    WALKER_TYPE walkerCmd = FamilyType::cmdInitGpgpuWalker;
-    walkerCmd.setPartitionType(WALKER_TYPE::PARTITION_TYPE::PARTITION_TYPE_X);
+    DefaultWalkerType walkerCmd = FamilyType::template getInitGpuWalker<DefaultWalkerType>();
+    walkerCmd.setPartitionType(DefaultWalkerType::PARTITION_TYPE::PARTITION_TYPE_X);
     walkerCmd.getInterfaceDescriptor().setNumberOfThreadsInGpgpuThreadGroup(1u);
     walkerCmd.getPostSync().setDestinationAddress(postSyncAddress);
-    walkerCmd.getPostSync().setOperation(POSTSYNC_DATA<FamilyType>::OPERATION::OPERATION_WRITE_TIMESTAMP);
+    walkerCmd.getPostSync().setOperation(PostSyncType::OPERATION::OPERATION_WRITE_TIMESTAMP);
+    if constexpr (FamilyType::template isHeaplessMode<DefaultWalkerType>()) {
+        walkerCmd.setMaximumNumberOfThreads(64);
+    }
 
     WalkerPartition::WalkerPartitionArgs testArgs = {};
     testArgs.initializeWparidRegister = true;
@@ -1000,15 +775,16 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenPredicatedCommandB
 
     WalkerPartition::constructDynamicallyPartitionedCommandBuffer<FamilyType>(
         streamCpuPointer,
+        nullptr,
         taskStream->getGraphicsAllocation()->getGpuAddress(),
         &walkerCmd,
         totalBytesProgrammed,
         testArgs,
-        *defaultHwInfo);
+        this->device->getDevice());
     taskStream->getSpace(totalBytesProgrammed);
     flushStream();
     auto expectedGpuAddress = taskStream->getGraphicsAllocation()->getGpuAddress() +
-                              WalkerPartition::computeControlSectionOffset<FamilyType>(testArgs);
+                              WalkerPartition::computeControlSectionOffset<FamilyType, DefaultWalkerType>(testArgs);
 
     // 16 partitions updated atomic to value 16
     // 17th partition updated it to 17 and was predicated out of the batch buffer
@@ -1039,7 +815,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenGeneralPurposeRegi
     taskStream->getSpace(totalBytesProgrammed);
     PipeControlArgs args;
     MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-        *taskStream, PostSyncMode::ImmediateData,
+        *taskStream, PostSyncMode::immediateData,
         writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
     streamCpuPointer = taskStream->getSpace(0);
@@ -1071,7 +847,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenPredicationWhenItI
         // emit pipe control
         PipeControlArgs args;
         MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-            *taskStream, PostSyncMode::ImmediateData,
+            *taskStream, PostSyncMode::immediateData,
             writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
         // turn off predication
@@ -1099,8 +875,6 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenPredicationWhenItI
 }
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenPredicationWhenItIsOnThenPipeControlInWparidIsNotExecuted) {
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
     auto streamCpuPointer = taskStream->getSpace(0);
     uint32_t totalBytesProgrammed = 0u;
     auto writeValue = 1u;
@@ -1124,7 +898,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWalkerPartitionZeroTest, givenPredicationWhenItI
         void *pipeControlAddress = taskStream->getSpace(0);
         PipeControlArgs args;
         MemorySynchronizationCommands<FamilyType>::addBarrierWithPostSyncOperation(
-            *taskStream, PostSyncMode::ImmediateData,
+            *taskStream, PostSyncMode::immediateData,
             writeAddress, writeValue, device->getRootDeviceEnvironment(), args);
 
         auto pipeControl = retrieveSyncPipeControl<FamilyType>(pipeControlAddress, device->getRootDeviceEnvironment());
@@ -1163,8 +937,8 @@ HWCMDTEST_P(IGFX_XE_HP_CORE, AubWalkerPartitionTest, whenPartitionsAreUsedWithVa
         kernels[5].get(),
         workingDimensions,
         globalWorkOffset,
-        dispatchParamters.globalWorkSize,
-        dispatchParamters.localWorkSize,
+        dispatchParameters.globalWorkSize,
+        dispatchParameters.localWorkSize,
         numEventsInWaitList,
         eventWaitList,
         &event);
@@ -1180,13 +954,13 @@ HWCMDTEST_P(IGFX_XE_HP_CORE, AubWalkerPartitionTest, whenPartitionsAreUsedWithVa
     clReleaseEvent(event);
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     AUBWPARID,
     AubWalkerPartitionTest,
     ::testing::Combine(
         ::testing::ValuesIn(testPartitionCount),
         ::testing::ValuesIn(testPartitionType),
-        ::testing::ValuesIn(DispatchParamtersForTests),
+        ::testing::ValuesIn(dispatchParametersForTests),
         ::testing::ValuesIn(testWorkingDimensions)));
 
 using AubWparidTests = Test<AubWalkerPartitionFixture>;
@@ -1197,27 +971,27 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, AubWparidTests, whenPartitionCountSetAndPartitionId
     cl_event *eventWaitList = nullptr;
     cl_event event;
     workingDimensions = 3;
-    dispatchParamters.globalWorkSize[0] = 30;
-    dispatchParamters.globalWorkSize[1] = 39;
-    dispatchParamters.globalWorkSize[2] = 5;
-    dispatchParamters.localWorkSize[0] = 10;
-    dispatchParamters.localWorkSize[1] = 3;
-    dispatchParamters.localWorkSize[2] = 1;
+    dispatchParameters.globalWorkSize[0] = 30;
+    dispatchParameters.globalWorkSize[1] = 39;
+    dispatchParameters.globalWorkSize[2] = 5;
+    dispatchParameters.localWorkSize[0] = 10;
+    dispatchParameters.localWorkSize[1] = 3;
+    dispatchParameters.localWorkSize[2] = 1;
 
     partitionType = 3;
 
     int32_t partitionCount = 4;
 
-    DebugManager.flags.ExperimentalSetWalkerPartitionType.set(partitionType);
-    DebugManager.flags.ExperimentalSetWalkerPartitionCount.set(partitionCount);
-    DebugManager.flags.EnableWalkerPartition.set(1u);
+    debugManager.flags.ExperimentalSetWalkerPartitionType.set(partitionType);
+    debugManager.flags.ExperimentalSetWalkerPartitionCount.set(partitionCount);
+    debugManager.flags.EnableWalkerPartition.set(1u);
 
     auto retVal = pCmdQ->enqueueKernel(
         kernels[5].get(),
         workingDimensions,
         globalWorkOffset,
-        dispatchParamters.globalWorkSize,
-        dispatchParamters.localWorkSize,
+        dispatchParameters.globalWorkSize,
+        dispatchParameters.localWorkSize,
         numEventsInWaitList,
         eventWaitList,
         &event);

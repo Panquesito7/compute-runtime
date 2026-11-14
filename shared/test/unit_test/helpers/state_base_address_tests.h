@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -71,6 +71,7 @@ struct SbaFixture : public NEO::DeviceFixture {
             0,                                        // instructionHeapBaseAddress
             0,                                        // globalHeapsBaseAddress
             0,                                        // surfaceStateBaseAddress
+            0,                                        // bindlessSurfaceStateBaseAddress
             sbaCommand,                               // stateBaseAddressCmd
             sbaProperties,                            // sbaProperties
             dsh,                                      // dsh
@@ -80,12 +81,11 @@ struct SbaFixture : public NEO::DeviceFixture {
             0,                                        // statelessMocsIndex
             l1CachePolicyData.getL1CacheValue(false), // l1CachePolicy
             l1CachePolicyData.getL1CacheValue(true),  // l1CachePolicyDebuggerActive
-            MemoryCompressionState::NotApplicable,    // memoryCompressionState
+            MemoryCompressionState::notApplicable,    // memoryCompressionState
             false,                                    // setInstructionStateBaseAddress
             false,                                    // setGeneralStateBaseAddress
             false,                                    // useGlobalHeapsBaseAddress
             false,                                    // isMultiOsContextCapable
-            false,                                    // useGlobalAtomics
             false,                                    // areMultipleSubDevicesInContext
             false,                                    // overrideSurfaceStateBaseAddress
             false                                     // doubleSbaWa

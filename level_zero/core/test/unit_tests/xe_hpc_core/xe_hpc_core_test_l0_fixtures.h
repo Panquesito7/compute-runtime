@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,10 @@
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
 
+namespace NEO {
+struct HardwareInfo;
+} // namespace NEO
+
 namespace L0 {
 namespace ult {
 struct DeviceFixtureXeHpcTests : public DeviceFixture {
@@ -19,9 +23,6 @@ struct DeviceFixtureXeHpcTests : public DeviceFixture {
     DebugManagerStateRestore restorer;
 };
 
-struct CommandListStatePrefetchXeHpcCore : public ModuleFixture {
-    void checkIfDebugFlagSetWhenPrefetchApiCalledAThenStatePrefetchProgrammed(HardwareInfo *hwInfo);
-    void checkIfCommandBufferIsExhaustedWhenPrefetchApiCalledThenStatePrefetchProgrammed(HardwareInfo *hwInfo);
-};
+struct CommandListStatePrefetchXeHpcCore : public ModuleFixture {};
 } // namespace ult
 } // namespace L0

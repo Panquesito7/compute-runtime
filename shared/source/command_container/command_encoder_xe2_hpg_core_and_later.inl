@@ -1,0 +1,232 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/hw_walk_order.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+
+namespace NEO {
+template <typename Family>
+size_t EncodeDispatchKernel<Family>::getDefaultIOHAlignment() {
+    size_t alignment = Family::cacheLineSize;
+    if (NEO::debugManager.flags.ForceIOHAlignment.get() != -1) {
+        alignment = static_cast<size_t>(debugManager.flags.ForceIOHAlignment.get());
+    }
+    return alignment;
+}
+
+template <typename Family>
+uint32_t EncodeDispatchKernel<Family>::getMaxConcurrentThreadCountPerSubslice(const RootDeviceEnvironment &rootDeviceEnvironment, uint32_t grfCount) {
+    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    if (!hwInfo.caps.grfLimitedPreferredSlmSizeEnabled) {
+        return hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.SubSliceCount;
+    }
+
+    UNRECOVERABLE_IF(grfCount == 0u);
+    auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
+
+    return gfxCoreHelper.calculateAvailableThreadCount(hwInfo, grfCount, rootDeviceEnvironment) / hwInfo.gtSystemInfo.SubSliceCount;
+}
+
+template <typename Family>
+uint32_t EncodeDispatchKernel<Family>::calculateThreadGroupCountPerSubslice(const HardwareInfo &hwInfo, const uint32_t workloadThreadGroupCount) {
+    return static_cast<uint32_t>(Math::divideAndRoundUp(workloadThreadGroupCount, hwInfo.gtSystemInfo.SubSliceCount));
+}
+
+template <typename Family>
+uint32_t EncodeDispatchKernel<Family>::calculateThreadGroupCountSharingSubsliceSlm(const RootDeviceEnvironment &rootDeviceEnvironment, const EncodeSlmSizePerSubSliceArgs &slmArgs) {
+    UNRECOVERABLE_IF(slmArgs.threadsPerThreadGroup == 0u);
+
+    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+
+    const uint32_t maxConcurrentThreadCountPerSubslice = EncodeDispatchKernel<Family>::getMaxConcurrentThreadCountPerSubslice(rootDeviceEnvironment, slmArgs.grfCount);
+    const uint32_t maxConcurrentThreadGroupCountPerSubslice = maxConcurrentThreadCountPerSubslice / slmArgs.threadsPerThreadGroup;
+    const uint32_t threadGroupCountPerSubsliceWithoutGrfLimit = hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.SubSliceCount / slmArgs.threadsPerThreadGroup;
+    const uint32_t workloadThreadGroupCountPerSubslice = EncodeDispatchKernel<Family>::calculateThreadGroupCountPerSubslice(hwInfo, slmArgs.workloadThreadGroupCount);
+
+    uint32_t threadGroupHeadroom = hwInfo.caps.preferredSlmThreadGroupHeadroom;
+    if (debugManager.flags.OverridePreferredSlmThreadGroupHeadroom.get() != -1) {
+        threadGroupHeadroom = static_cast<uint32_t>(debugManager.flags.OverridePreferredSlmThreadGroupHeadroom.get());
+    }
+    const uint32_t cappedThreadGroupCountWithHeadroom = std::min(maxConcurrentThreadGroupCountPerSubslice + threadGroupHeadroom, threadGroupCountPerSubsliceWithoutGrfLimit);
+
+    return std::min(workloadThreadGroupCountPerSubslice, cappedThreadGroupCountWithHeadroom);
+}
+
+template <typename Family>
+template <typename InterfaceDescriptorType>
+void EncodeDispatchKernel<Family>::encodeSlmSizePerSubSlice(InterfaceDescriptorType *pInterfaceDescriptor, const RootDeviceEnvironment &rootDeviceEnvironment, const EncodeSlmSizePerSubSliceArgs &slmArgs) {
+    using PREFERRED_SLM_ALLOCATION_SIZE = typename InterfaceDescriptorType::PREFERRED_SLM_ALLOCATION_SIZE;
+
+    const uint32_t threadGroupCountSharingSubsliceSlm = EncodeDispatchKernel<Family>::calculateThreadGroupCountSharingSubsliceSlm(rootDeviceEnvironment, slmArgs);
+
+    const auto &releaseHelper = rootDeviceEnvironment.getReleaseHelper();
+    const uint32_t alignedSlmSizePerThreadGroup = EncodeDispatchKernel<Family>::alignSlmSizePerThreadGroup(slmArgs.slmTotalSizePerThreadGroup, releaseHelper);
+
+    uint32_t slmSizePerSubslice = 0u;
+
+    switch (slmArgs.slmPolicy) {
+    case SlmPolicy::slmPolicyLargeData:
+        slmSizePerSubslice = alignedSlmSizePerThreadGroup;
+        break;
+    case SlmPolicy::slmPolicyLargeSlm:
+        [[fallthrough]];
+    default:
+        slmSizePerSubslice = alignedSlmSizePerThreadGroup * threadGroupCountSharingSubsliceSlm;
+        break;
+    }
+
+    uint32_t availableSlmSizePerSubslice = rootDeviceEnvironment.getProductHelper().getAvailableSlmSizePerSubslice(rootDeviceEnvironment);
+    slmSizePerSubslice = std::min(slmSizePerSubslice, static_cast<uint32_t>(availableSlmSizePerSubslice * MemoryConstants::kiloByte));
+
+    const auto &sizeToPreferredSlmValueArray = releaseHelper.getSizeToPreferredSlmValue();
+
+    uint32_t programmableIdPreferredSlmSize = 0;
+    for (auto &range : sizeToPreferredSlmValueArray) {
+        if (slmSizePerSubslice <= range.upperLimit) {
+            programmableIdPreferredSlmSize = range.valueToProgram;
+            break;
+        }
+    }
+
+    if (debugManager.flags.OverridePreferredSlmAllocationSizePerDss.get() != -1) {
+        programmableIdPreferredSlmSize = static_cast<uint32_t>(debugManager.flags.OverridePreferredSlmAllocationSizePerDss.get());
+    }
+
+    pInterfaceDescriptor->setPreferredSlmAllocationSize(static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(programmableIdPreferredSlmSize));
+}
+
+template <typename Family>
+template <typename WalkerType, typename InterfaceDescriptorType>
+void EncodeDispatchKernel<Family>::encodeComputeDispatchAllWalker(WalkerType &walkerCmd, const InterfaceDescriptorType *idd, const RootDeviceEnvironment &rootDeviceEnvironment, const EncodeWalkerArgs &walkerArgs) {
+    bool computeDispatchAllWalkerEnable = walkerArgs.kernelExecutionType == KernelExecutionType::concurrent || (rootDeviceEnvironment.getProductHelper().adjustDispatchAllRequired(*rootDeviceEnvironment.getHardwareInfo()) &&
+                                                                                                                idd &&
+                                                                                                                idd->getThreadGroupDispatchSize() == InterfaceDescriptorType::THREAD_GROUP_DISPATCH_SIZE_TG_SIZE_1 &&
+                                                                                                                walkerCmd.getThreadGroupIdXDimension() * walkerCmd.getThreadGroupIdYDimension() * walkerCmd.getThreadGroupIdZDimension() * idd->getNumberOfThreadsInGpgpuThreadGroup() < walkerArgs.maxFrontEndThreads);
+    int32_t overrideComputeDispatchAllWalkerEnable = debugManager.flags.ComputeDispatchAllWalkerEnableInComputeWalker.get();
+    if (overrideComputeDispatchAllWalkerEnable != -1) {
+        computeDispatchAllWalkerEnable = !!overrideComputeDispatchAllWalkerEnable;
+    }
+    walkerCmd.setComputeDispatchAllWalkerEnable(computeDispatchAllWalkerEnable);
+}
+
+template <typename Family>
+void EncodeSurfaceState<Family>::disableCompressionFlags(R_SURFACE_STATE *surfaceState) {
+}
+
+template <typename Family>
+void EncodeSurfaceState<Family>::appendImageCompressionParams(R_SURFACE_STATE *surfaceState, GraphicsAllocation *allocation,
+                                                              GmmHelper *gmmHelper, bool imageFromBuffer, ImagePlane plane) {
+    if (!allocation->isCompressionEnabled()) {
+        return;
+    }
+
+    using COMPRESSION_FORMAT = typename R_SURFACE_STATE::COMPRESSION_FORMAT;
+
+    auto gmmResourceInfo = allocation->getDefaultGmm()->gmmResourceInfo.get();
+
+    auto compressionFormat = gmmHelper->getClientContext()->getSurfaceStateCompressionFormat(gmmResourceInfo->getResourceFormat());
+
+    surfaceState->setCompressionFormat(static_cast<COMPRESSION_FORMAT>(compressionFormat));
+}
+
+template <typename Family>
+void EncodeSurfaceState<Family>::setClearColorParams(R_SURFACE_STATE *surfaceState, Gmm *gmm) {
+}
+
+template <typename Family>
+inline void EncodeSurfaceState<Family>::setFlagsForMediaCompression(R_SURFACE_STATE *surfaceState, Gmm *gmm) {
+}
+
+template <typename Family>
+void EncodeSurfaceState<Family>::setImageAuxParamsForCCS(R_SURFACE_STATE *surfaceState, Gmm *gmm) {
+}
+
+template <typename Family>
+void EncodeSurfaceState<Family>::setBufferAuxParamsForCCS(R_SURFACE_STATE *surfaceState) {
+}
+
+template <typename Family>
+bool EncodeSurfaceState<Family>::isAuxModeEnabled(R_SURFACE_STATE *surfaceState, Gmm *gmm) {
+    return gmm && gmm->isCompressionEnabled();
+}
+
+template <typename Family>
+template <typename WalkerType>
+void EncodeDispatchKernel<Family>::adjustWalkOrder(WalkerType &walkerCmd, uint32_t requiredWorkGroupOrder, const HardwareInfo &hwInfo) {
+    if (HwWalkOrderHelper::compatibleDimensionOrders[requiredWorkGroupOrder] == HwWalkOrderHelper::linearWalk) {
+        walkerCmd.setDispatchWalkOrder(WalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK);
+    } else if (HwWalkOrderHelper::compatibleDimensionOrders[requiredWorkGroupOrder] == HwWalkOrderHelper::yOrderWalk) {
+        walkerCmd.setDispatchWalkOrder(WalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK);
+    }
+}
+
+template <typename StateComputeModeType>
+void appendMidthreadPreemptionDelayTimer(StateComputeModeType &stateComputeMode, uint32_t &maskBits2, const HardwareInfo &hwInfo,
+                                         uint32_t midthreadPreemptionDelayTimerMask) {
+    using MIDTHREAD_PREEMPTION_DELAY_TIMER = typename StateComputeModeType::MIDTHREAD_PREEMPTION_DELAY_TIMER;
+
+    uint32_t timer = hwInfo.caps.defaultMidthreadPreemptionDelayTimer;
+
+    // the field starts at STATE_COMPUTE_MODE DWORD 2 bit 0, so its mask is also its highest encoding
+    const int32_t requestedTimer = debugManager.flags.ScmMidthreadPreemptionDelayTimerOverride.get();
+    if ((requestedTimer >= 0) && (requestedTimer <= static_cast<int32_t>(midthreadPreemptionDelayTimerMask))) {
+        timer = static_cast<uint32_t>(requestedTimer);
+    }
+
+    if (timer == 0) {
+        return;
+    }
+
+    DEBUG_BREAK_IF(timer > MIDTHREAD_PREEMPTION_DELAY_TIMER::MIDTHREAD_PREEMPTION_DELAY_TIMER_MTP_TIMER_VAL_150);
+
+    stateComputeMode.setMidthreadPreemptionDelayTimer(static_cast<MIDTHREAD_PREEMPTION_DELAY_TIMER>(timer));
+    maskBits2 |= midthreadPreemptionDelayTimerMask;
+}
+
+template <typename Family>
+void EncodeSurfaceState<Family>::setCoherencyType(R_SURFACE_STATE *surfaceState, COHERENCY_TYPE coherencyType) {
+}
+
+template <typename Family>
+void EncodeWA<Family>::adjustCompressionFormatForPlanarImage(uint32_t &compressionFormat, int plane) {
+}
+
+template <typename Family>
+size_t EncodeMemoryPrefetch<Family>::getSizeForMemoryPrefetch(size_t size, const RootDeviceEnvironment &rootDeviceEnvironment) {
+    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
+    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    if (!productHelper.allowMemoryPrefetch(hwInfo)) {
+        return 0;
+    }
+
+    size = alignUp(size, MemoryConstants::pageSize64k);
+
+    size_t count = size / MemoryConstants::pageSize64k;
+
+    return (count * sizeof(typename Family::STATE_PREFETCH));
+}
+
+template <typename Family>
+inline void EncodeMiFlushDW<Family>::setFlushes(MI_FLUSH_DW *miFlushDwCmd, const ProductHelper &productHelper) {
+    miFlushDwCmd->setFlushLlc(1);
+
+    if (productHelper.isDcFlushAllowed()) {
+        miFlushDwCmd->setFlushCcs(1);
+    }
+}
+
+template <typename Family>
+bool EncodeSurfaceState<Family>::shouldProgramAuxForMcs(bool isAuxCapable, bool hasMcsSurface) {
+    return hasMcsSurface;
+}
+
+} // namespace NEO

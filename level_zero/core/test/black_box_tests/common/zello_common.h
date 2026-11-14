@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,13 @@
 
 #pragma once
 
+#include "level_zero/driver_experimental/zex_graph.h"
+#include "level_zero/include/level_zero/driver_experimental/zex_visit.h"
 #include <level_zero/ze_api.h>
+#include <level_zero/ze_intel_gpu.h>
+#include <level_zero/zer_api.h>
 
+#include <bitset>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -16,38 +21,44 @@
 #include <string>
 #include <vector>
 
-#define QTR(a) #a
-#define TOSTR(b) QTR(b)
+namespace LevelZeroBlackBoxTests {
+template <bool terminateOnFailure, typename ResulT>
+inline void validate(ResulT result, const char *message, int line);
+} // namespace LevelZeroBlackBoxTests
 
+#define SUCCESS_OR_TERMINATE(CALL) LevelZeroBlackBoxTests::validate<true>(CALL, #CALL, __LINE__)
+#define SUCCESS_OR_TERMINATE_BOOL(FLAG) LevelZeroBlackBoxTests::validate<true>(!(FLAG), #FLAG, __LINE__)
+#define SUCCESS_OR_WARNING(CALL) LevelZeroBlackBoxTests::validate<false>(CALL, #CALL, __LINE__)
+#define SUCCESS_OR_WARNING_BOOL(FLAG) LevelZeroBlackBoxTests::validate<false>(!(FLAG), #FLAG, __LINE__)
+
+namespace LevelZeroBlackBoxTests {
 extern bool verbose;
 
-template <bool TerminateOnFailure, typename ResulT>
-inline void validate(ResulT result, const char *message) {
+template <bool terminateOnFailure, typename ResulT>
+inline void validate(ResulT result, const char *message, int line) {
     if (result == ZE_RESULT_SUCCESS) {
         if (verbose) {
-            std::cerr << "SUCCESS : " << message << std::endl;
+            std::cerr << "SUCCESS : " << message << " (line " << line << ")" << std::endl;
         }
         return;
     }
 
     if (verbose) {
-        std::cerr << (TerminateOnFailure ? "ERROR : " : "WARNING : ") << message << " : " << result
-                  << std::endl;
+        std::cerr << (terminateOnFailure ? "ERROR : " : "WARNING : ") << message << " : " << result
+                  << " (line " << line << ")" << std::endl;
     }
 
-    if (TerminateOnFailure) {
+    if (terminateOnFailure) {
         std::terminate();
     }
 }
 
-#define SUCCESS_OR_TERMINATE(CALL) validate<true>(CALL, #CALL)
-#define SUCCESS_OR_TERMINATE_BOOL(FLAG) validate<true>(!(FLAG), #FLAG)
-#define SUCCESS_OR_WARNING(CALL) validate<false>(CALL, #CALL)
-#define SUCCESS_OR_WARNING_BOOL(FLAG) validate<false>(!(FLAG), #FLAG)
+constexpr uint32_t undefinedQueueOrdinal = std::numeric_limits<uint32_t>::max();
 
 bool isParamEnabled(int argc, char *argv[], const char *shortName, const char *longName);
 
 int getParamValue(int argc, char *argv[], const char *shortName, const char *longName, int defaultValue);
+uint32_t getParamValue(int argc, char *argv[], const char *shortName, const char *longName, uint32_t defaultValue);
 
 const char *getParamValue(int argc, char *argv[], const char *shortName, const char *longName, const char *defaultString);
 
@@ -67,35 +78,168 @@ bool isImmediateFirst(int argc, char *argv[]);
 
 bool getAllocationFlag(int argc, char *argv[], int defaultValue);
 
-void selectQueueMode(ze_command_queue_desc_t &desc, bool useSync);
+void selectQueueMode(ze_command_queue_mode_t &mode, bool useSync);
+inline void selectQueueMode(ze_command_queue_desc_t &desc, bool useSync) {
+    selectQueueMode(desc.mode, useSync);
+}
 
 uint32_t getBufferLength(int argc, char *argv[], uint32_t defaultLength);
 
-void printResult(bool aubMode, bool outputValidationSuccessful, const std::string &blackBoxName, const std::string &currentTest);
+void getErrorMax(int argc, char *argv[]);
 
-void printResult(bool aubMode, bool outputValidationSuccessful, const std::string &blackBoxName);
+void printTestHeader(const std::string_view currentTest);
 
-uint32_t getCommandQueueOrdinal(ze_device_handle_t &device);
+void printResult(bool aubMode, bool outputValidationSuccessful, const std::string_view blackBoxName, const std::string_view currentTest);
+
+void printResult(bool aubMode, bool outputValidationSuccessful, const std::string_view blackBoxName);
+
+uint32_t getCommandQueueOrdinal(ze_device_handle_t &device, bool useCooperativeFlag);
+
+std::vector<uint32_t> getComputeQueueOrdinals(ze_device_handle_t &device);
 
 uint32_t getCopyOnlyCommandQueueOrdinal(ze_device_handle_t &device);
 
+size_t getQueueMaxFillPatternSize(ze_device_handle_t &device, uint32_t queueQroupOrdinal);
+
 ze_command_queue_handle_t createCommandQueue(ze_context_handle_t &context, ze_device_handle_t &device,
                                              uint32_t *ordinal, ze_command_queue_mode_t mode,
-                                             ze_command_queue_priority_t priority);
+                                             ze_command_queue_priority_t priority, bool useCooperativeFlag);
 
-ze_command_queue_handle_t createCommandQueue(ze_context_handle_t &context, ze_device_handle_t &device, uint32_t *ordinal);
+ze_command_queue_handle_t createCommandQueueWithOrdinal(ze_context_handle_t &context, ze_device_handle_t &device,
+                                                        uint32_t ordinal, ze_command_queue_mode_t mode,
+                                                        ze_command_queue_priority_t priority);
 
-ze_result_t createCommandList(ze_context_handle_t &context, ze_device_handle_t &device, ze_command_list_handle_t &cmdList);
-ze_result_t createCommandList(ze_context_handle_t &context, ze_device_handle_t &device, ze_command_list_handle_t &cmdList, uint32_t ordinal);
+ze_command_queue_handle_t createCommandQueue(ze_context_handle_t &context, ze_device_handle_t &device, uint32_t *ordinal, bool useCooperativeFlag);
+
+ze_result_t createCommandList(ze_context_handle_t &context, ze_device_handle_t &device, ze_command_list_handle_t &cmdList, uint32_t ordinal, uint32_t flags);
+
+inline ze_result_t createCommandList(ze_context_handle_t &context, ze_device_handle_t &device, ze_command_list_handle_t &cmdList, bool useCooperativeFlag, uint32_t flags) {
+    return createCommandList(context, device, cmdList, getCommandQueueOrdinal(device, useCooperativeFlag), flags);
+}
+
+void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                    ze_device_handle_t device,
+                                    ze_command_queue_mode_t mode,
+                                    ze_command_queue_flags_t flags,
+                                    ze_command_queue_priority_t priority,
+                                    uint32_t ordinal,
+                                    ze_command_list_handle_t &cmdList);
+
+void createImmediateCmdlistWithMode(
+    ze_context_handle_t context,
+    ze_device_handle_t device,
+    const void *pNext,
+    bool useCopyQueue,
+    bool useSyncMode,
+    ze_command_list_handle_t &cmdListOut);
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           ze_command_queue_flags_t flags,
+                                           ze_command_queue_priority_t priority,
+                                           uint32_t ordinal,
+                                           bool syncMode,
+                                           ze_command_list_handle_t &cmdList) {
+    ze_command_queue_mode_t mode = ZE_COMMAND_QUEUE_MODE_DEFAULT;
+    selectQueueMode(mode, syncMode);
+    createImmediateCmdlistWithMode(context, device, mode, flags, priority, ordinal, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           ze_command_queue_priority_t priority,
+                                           uint32_t ordinal,
+                                           bool syncMode,
+                                           ze_command_list_handle_t &cmdList) {
+    constexpr ze_command_queue_flags_t constFlags = 0;
+    createImmediateCmdlistWithMode(context, device, constFlags, priority, ordinal, syncMode, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           ze_command_queue_flags_t flags,
+                                           uint32_t ordinal,
+                                           bool syncMode,
+                                           ze_command_list_handle_t &cmdList) {
+    createImmediateCmdlistWithMode(context, device, flags, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, ordinal, syncMode, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           uint32_t ordinal,
+                                           bool syncMode,
+                                           ze_command_list_handle_t &cmdList) {
+    constexpr ze_command_queue_flags_t constFlags = 0;
+    createImmediateCmdlistWithMode(context, device, constFlags, ZE_COMMAND_QUEUE_PRIORITY_NORMAL, ordinal, syncMode, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           ze_command_queue_priority_t priority,
+                                           bool syncMode,
+                                           bool copyEngine,
+                                           ze_command_list_handle_t &cmdList) {
+    uint32_t ordinal = copyEngine ? getCopyOnlyCommandQueueOrdinal(device) : getCommandQueueOrdinal(device, false);
+    createImmediateCmdlistWithMode(context, device, priority, ordinal, syncMode, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           ze_command_queue_flags_t flags,
+                                           bool syncMode,
+                                           bool copyEngine,
+                                           ze_command_list_handle_t &cmdList) {
+    uint32_t ordinal = copyEngine ? getCopyOnlyCommandQueueOrdinal(device) : getCommandQueueOrdinal(device, false);
+    createImmediateCmdlistWithMode(context, device, flags, ordinal, syncMode, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           bool syncMode,
+                                           bool copyEngine,
+                                           ze_command_list_handle_t &cmdList) {
+    constexpr ze_command_queue_flags_t constFlags = 0;
+    createImmediateCmdlistWithMode(context, device, constFlags, syncMode, copyEngine, cmdList);
+}
+
+inline void createImmediateCmdlistWithMode(ze_context_handle_t context,
+                                           ze_device_handle_t device,
+                                           ze_command_list_handle_t &cmdList) {
+    constexpr bool syncMode = false;
+    constexpr bool copyEngine = false;
+    createImmediateCmdlistWithMode(context, device, syncMode, copyEngine, cmdList);
+}
+
+inline void createPreferredCopyEngineCmdList(ze_context_handle_t context,
+                                             ze_device_handle_t device,
+                                             ze_command_queue_flags_t flags,
+                                             bool syncMode,
+                                             ze_command_list_handle_t &cmdList) {
+    bool getUseCopyEngine = getCopyOnlyCommandQueueOrdinal(device) == undefinedQueueOrdinal ? false : true;
+    std::cout << "Copy engine available for input/output operations: " << (getUseCopyEngine ? "yes" : "no") << std::endl;
+    createImmediateCmdlistWithMode(context, device, flags, syncMode, getUseCopyEngine, cmdList);
+}
+
+inline void createPreferredCopyEngineCmdList(ze_context_handle_t context,
+                                             ze_device_handle_t device,
+                                             ze_command_queue_flags_t flags,
+                                             ze_command_list_handle_t &cmdList) {
+    constexpr bool syncMode = false;
+    createPreferredCopyEngineCmdList(context, device, flags, syncMode, cmdList);
+}
 
 void createEventPoolAndEvents(ze_context_handle_t &context,
                               ze_device_handle_t &device,
                               ze_event_pool_handle_t &eventPool,
-                              ze_event_pool_flag_t poolFlag,
+                              ze_event_pool_flags_t poolFlag,
+                              bool counterEvents,
+                              const ze_event_counter_based_desc_t *counterBasedDesc,
                               uint32_t poolSize,
                               ze_event_handle_t *events,
-                              ze_event_scope_flag_t signalScope,
-                              ze_event_scope_flag_t waitScope);
+                              ze_event_scope_flags_t signalScope,
+                              ze_event_scope_flags_t waitScope);
+
+bool counterBasedEventsExtensionPresent(ze_driver_handle_t &driverHandle);
 
 std::vector<ze_device_handle_t> zelloGetSubDevices(ze_device_handle_t &device, uint32_t &subDevCount);
 
@@ -105,7 +249,9 @@ std::vector<ze_device_handle_t> zelloInitContextAndGetDevices(ze_context_handle_
 
 void initialize(ze_driver_handle_t &driver, ze_context_handle_t &context, ze_device_handle_t &device, ze_command_queue_handle_t &cmdQueue, uint32_t &ordinal);
 
-void teardown(ze_context_handle_t context, ze_command_queue_handle_t cmdQueue);
+bool checkImageSupport(ze_device_handle_t hDevice, bool test1D, bool test2D, bool test3D, bool testArray);
+
+void teardown(ze_command_queue_handle_t cmdQueue);
 
 void printDeviceProperties(const ze_device_properties_t &props);
 
@@ -118,6 +264,8 @@ void printKernelProperties(const ze_kernel_properties_t &props, const char *kern
 void printCommandQueueGroupsProperties(ze_device_handle_t &device);
 
 const std::vector<const char *> &getResourcesSearchLocations();
+
+void setEnvironmentVariable(const char *variableName, const char *variableValue);
 
 // read binary file into a non-NULL-terminated string
 template <typename SizeT>
@@ -202,64 +350,93 @@ inline bool validate(const void *expected, const void *tested, size_t len) {
     return resultsAreOk;
 }
 
+extern uint32_t overrideErrorMax;
+
+template <typename T>
+inline bool validateToValue(const T expected, const void *tested, size_t len) {
+    bool resultsAreOk = true;
+    size_t offset = 0;
+
+    const T *testedT = reinterpret_cast<const T *>(tested);
+    uint32_t errorsCount = 0;
+    uint32_t errorsMax = verbose ? 20 : 1;
+    errorsMax = overrideErrorMax > 0 ? overrideErrorMax : errorsMax;
+    while (offset < len) {
+        if (expected != testedT[offset]) {
+            resultsAreOk = false;
+
+            std::cerr << "Data mismatch expected != tested[" << offset
+                      << "]   ->    " << +expected << " != " << +testedT[offset]
+                      << std::endl;
+            ++errorsCount;
+            if (errorsCount >= errorsMax) {
+                std::cerr << "Found " << errorsCount
+                          << " data mismatches - skipping further comparison " << std::endl;
+                break;
+            }
+        }
+        ++offset;
+    }
+
+    return resultsAreOk;
+}
+
 struct CommandHandler {
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
     bool isImmediate = false;
 
-    ze_result_t create(ze_context_handle_t context, ze_device_handle_t device, bool immediate) {
-        isImmediate = immediate;
-        ze_result_t result;
-        ze_command_queue_desc_t cmdQueueDesc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
-        cmdQueueDesc.ordinal = getCommandQueueOrdinal(device);
-        cmdQueueDesc.index = 0;
-
-        if (isImmediate) {
-            cmdQueueDesc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
-            result = zeCommandListCreateImmediate(context, device, &cmdQueueDesc, &cmdList);
-        } else {
-            cmdQueueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-            result = zeCommandQueueCreate(context, device, &cmdQueueDesc, &cmdQueue);
-            if (result != ZE_RESULT_SUCCESS) {
-                return result;
-            }
-            result = createCommandList(context, device, cmdList);
-        }
-
-        return result;
-    }
+    ze_result_t create(ze_context_handle_t context, ze_device_handle_t device, bool immediate);
 
     ze_result_t appendKernel(ze_kernel_handle_t kernel, const ze_group_count_t &dispatchTraits, ze_event_handle_t event = nullptr) {
         return zeCommandListAppendLaunchKernel(cmdList, kernel, &dispatchTraits,
                                                event, 0, nullptr);
     }
 
-    ze_result_t execute() {
-        auto result = ZE_RESULT_SUCCESS;
-
-        if (!isImmediate) {
-            result = zeCommandListClose(cmdList);
-            if (result == ZE_RESULT_SUCCESS) {
-                result = zeCommandQueueExecuteCommandLists(cmdQueue, 1, &cmdList, nullptr);
-            }
-        }
-        return result;
-    }
-
-    ze_result_t synchronize() {
-        if (!isImmediate) {
-            return zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max());
-        }
-
-        return ZE_RESULT_SUCCESS;
-    }
-
-    ze_result_t destroy() {
-        auto result = zeCommandListDestroy(cmdList);
-        if (result == ZE_RESULT_SUCCESS && !isImmediate) {
-            result = zeCommandQueueDestroy(cmdQueue);
-        }
-        return result;
-    }
+    ze_result_t execute();
+    ze_result_t synchronize();
+    ze_result_t destroy();
 };
+
+using TestBitMask = std::bitset<32>;
+
+TestBitMask getTestMask(int argc, char *argv[], uint32_t defaultValue);
+TestBitMask getTestSubmask(int argc, char *argv[], uint32_t defaultValue);
+
+void printGroupCount(ze_group_count_t &groupCount);
+
+void printBuildLog(std::string &buildLog);
+
+void printBuildLog(const char *strLog);
+
+void loadDriverExtensions(ze_driver_handle_t &driverHandle, std::vector<ze_driver_extension_properties_t> &driverExtensions);
+
+bool checkExtensionIsPresent(ze_driver_handle_t &driverHandle, std::vector<ze_driver_extension_properties_t> &extensionsToCheck);
+
+void prepareScratchTestValues(uint32_t &arraySize, uint32_t &vectorSize, uint32_t &expectedMemorySize, uint32_t &srcAdditionalMul, uint32_t &srcMemorySize, uint32_t &idxMemorySize);
+void prepareScratchTestBuffers(void *srcBuffer, void *idxBuffer, void *expectedMemory, uint32_t arraySize, uint32_t vectorSize, uint32_t expectedMemorySize, uint32_t srcAdditionalMul);
+
+namespace VisitExtension {
+using zeCommandListVisitExtFP = ze_result_t(ZE_APICALL *)(ze_command_list_handle_t, const ze_command_visit_ext_desc_t *);
+using zeGraphVisitExtFP = ze_result_t(ZE_APICALL *)(ze_graph_handle_t, const ze_command_visit_ext_desc_t *);
+
+struct VisitApi {
+    zeCommandListVisitExtFP commandListVisit = nullptr;
+    zeGraphVisitExtFP graphVisit = nullptr;
+
+    bool valid() const {
+        return commandListVisit != nullptr || graphVisit != nullptr;
+    }
+    bool loaded = false;
+};
+
+VisitApi &loadVisitApi(ze_driver_handle_t driver);
+} // namespace VisitExtension
+
+constexpr uint32_t undefinedTestNumber = std::numeric_limits<uint32_t>::max();
+void addFailedCase(bool caseResult, const std::string &caseName, uint32_t testNumber, uint32_t subTestNumber);
+void printFailedCases();
+int printTestResult(bool boxTestPass, bool aubMode, const std::string &blackBoxName);
+
+} // namespace LevelZeroBlackBoxTests

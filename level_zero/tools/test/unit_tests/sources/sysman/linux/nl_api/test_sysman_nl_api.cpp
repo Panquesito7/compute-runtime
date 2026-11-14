@@ -1,10 +1,12 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "gtest/gtest.h"
+#include "iaf_netlink.h"
 #include "mock_nl_dll.h"
 
 extern bool sysmanUltsEnable;
@@ -78,6 +80,8 @@ TEST_F(SysmanNlApiFixture, GivenNlApiWhenMissingDllEntryPointThenVerifyLoadEntry
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nlmsg_attrlen"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nlmsg_free"));
     EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nlmsg_hdr"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_nest_start"));
+    EXPECT_FALSE(testLoadEntryPointsWithMissingFunction("nla_nest_end"));
 }
 
 TEST_F(SysmanNlApiFixture, GivenNlApiWhenMissingDllHandleThenVerifyLoadEntryPointsFails) {
@@ -211,5 +215,14 @@ TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlmsgAttrlen
 TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlmsgHdrReturnsNlmsghdr) {
     EXPECT_EQ(&MockNlDll::mockNlmsghdr, testNlApi.nlmsgHdr(&MockNlDll::mockNlMsg));
 }
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaNestStartReturnsZero) {
+    EXPECT_EQ(&MockNlDll::mockNlattr, testNlApi.nlaNestStart(&MockNlDll::mockNlMsg, IAF_ATTR_FABRIC_PORT));
+}
+
+TEST_F(SysmanNlApiFixture, GivenNlApiWhenCompleteMockNlDllThenVerifyNlaNestEndReturnsZero) {
+    EXPECT_EQ(0, testNlApi.nlaNestEnd(&MockNlDll::mockNlMsg, &MockNlDll::mockNlattr));
+}
+
 } // namespace ult
 } // namespace L0

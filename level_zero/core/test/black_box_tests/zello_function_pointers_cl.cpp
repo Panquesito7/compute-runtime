@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,62 +11,7 @@
 #include "zello_compile.h"
 
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <memory>
-
-const char *functionPointersProgram = R"==(
-__global char *__builtin_IB_get_function_pointer(__constant char *function_name);
-void __builtin_IB_call_function_pointer(__global char *function_pointer,
-                                        char *argument_structure);
-
-struct FunctionData {
-    __global char *dst;
-    const __global char *src;
-    unsigned int gid;
-};
-
-kernel void memcpy_bytes(__global char *dst, const __global char *src, __global char *pBufferWithFunctionPointer) {
-    unsigned int gid = get_global_id(0);
-    struct FunctionData functionData;
-    functionData.dst = dst;
-    functionData.src = src;
-    functionData.gid = gid;
-    __global char * __global *pBufferWithFunctionPointerChar = (__global char * __global *)pBufferWithFunctionPointer;
-    __builtin_IB_call_function_pointer(pBufferWithFunctionPointerChar[0], (char *)&functionData);
-}
-
-void copy_helper(char *data) {
-    if(data != NULL) {
-        struct FunctionData *pFunctionData = (struct FunctionData *)data;
-        __global char *dst = pFunctionData->dst;
-        const __global char *src = pFunctionData->src;
-        unsigned int gid = pFunctionData->gid;
-        dst[gid] = src[gid];
-    }
-}
-
-void other_indirect_f(unsigned int *dimNum) {
-    if(dimNum != NULL) {
-        if(*dimNum > 2) {
-            *dimNum += 2;
-        }
-    }
-}
-
-__kernel void workaround_kernel() {
-    __global char *fp = 0;
-    switch (get_global_id(0)) {
-    case 0:
-        fp = __builtin_IB_get_function_pointer("copy_helper");
-        break;
-    case 1:
-        fp = __builtin_IB_get_function_pointer("other_indirect_f");
-        break;
-    }
-    __builtin_IB_call_function_pointer(fp, 0);
-}
-)==";
 
 int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello Function Pointers CL";
@@ -75,23 +20,21 @@ int main(int argc, char *argv[]) {
 
     // 1. Setup
     bool outputValidationSuccessful;
-    verbose = isVerbose(argc, argv);
-    bool aubMode = isAubMode(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
 
     ze_context_handle_t context = nullptr;
     ze_driver_handle_t driverHandle = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context, driverHandle);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context, driverHandle);
     auto device = devices[0];
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
     std::string buildLog;
-    auto spirV = compileToSpirV(functionPointersProgram, "", buildLog);
-    if (buildLog.size() > 0) {
-        std::cout << "Build log " << buildLog;
-    }
+    auto spirV = LevelZeroBlackBoxTests::compileToSpirV(LevelZeroBlackBoxTests::functionPointersProgram, "", buildLog);
+    LevelZeroBlackBoxTests::printBuildLog(buildLog);
     SUCCESS_OR_TERMINATE((0 == spirV.size()));
 
     ze_module_handle_t module;
@@ -107,11 +50,11 @@ int main(int argc, char *argv[]) {
 
         char *strLog = (char *)malloc(szLog);
         zeModuleBuildLogGetString(buildlog, &szLog, strLog);
-        std::cout << "Build log:" << strLog << std::endl;
+        LevelZeroBlackBoxTests::printBuildLog(strLog);
 
         free(strLog);
         SUCCESS_OR_TERMINATE(zeModuleBuildLogDestroy(buildlog));
-        std::cout << "\nZello Function Pointers CL Results validation FAILED. Module creation error."
+        std::cerr << "\nZello Function Pointers CL Results validation FAILED. Module creation error."
                   << std::endl;
         return 1;
     }
@@ -121,6 +64,10 @@ int main(int argc, char *argv[]) {
     ze_kernel_desc_t kernelDesc = {ZE_STRUCTURE_TYPE_KERNEL_DESC};
     kernelDesc.pKernelName = "memcpy_bytes";
     SUCCESS_OR_TERMINATE(zeKernelCreate(module, &kernelDesc, &kernel));
+    ze_kernel_properties_t kernProps = {ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES};
+    SUCCESS_OR_TERMINATE(zeKernelGetProperties(kernel, &kernProps));
+    std::cout << "function pointer memcpy_bytes Private size = " << std::dec << kernProps.privateMemSize << std::endl;
+    std::cout << "function pointer memcpy_bytes Spill size = " << std::dec << kernProps.spillMemSize << std::endl;
 
     uint32_t groupSizeX = 1u;
     uint32_t groupSizeY = 1u;
@@ -131,13 +78,13 @@ int main(int argc, char *argv[]) {
 
     ze_command_queue_handle_t cmdQueue;
     ze_command_queue_desc_t cmdQueueDesc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
-    cmdQueueDesc.ordinal = getCommandQueueOrdinal(device);
+    cmdQueueDesc.ordinal = LevelZeroBlackBoxTests::getCommandQueueOrdinal(device, false);
     cmdQueueDesc.index = 0;
     cmdQueueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
     SUCCESS_OR_TERMINATE(zeCommandQueueCreate(context, device, &cmdQueueDesc, &cmdQueue));
 
     ze_command_list_handle_t cmdList;
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     ze_device_mem_alloc_desc_t deviceDesc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
     deviceDesc.ordinal = 0;
@@ -165,7 +112,7 @@ int main(int argc, char *argv[]) {
     void *copyHelperFunction = nullptr;
     SUCCESS_OR_TERMINATE(zeModuleGetFunctionPointer(module, "copy_helper", &copyHelperFunction));
     if (nullptr == copyHelperFunction) {
-        std::cout << "Pointer to function helper not found\n";
+        std::cerr << "Pointer to function helper not found\n";
         std::terminate();
     }
 
@@ -211,10 +158,7 @@ int main(int argc, char *argv[]) {
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     // 6. Validate
-    outputValidationSuccessful = (0 == memcmp(initDataSrc, readBackData, sizeof(readBackData)));
-    if (verbose && (false == outputValidationSuccessful)) {
-        validate(initDataSrc, readBackData, sizeof(readBackData));
-    }
+    outputValidationSuccessful = LevelZeroBlackBoxTests::validate(initDataSrc, readBackData, sizeof(readBackData));
     SUCCESS_OR_WARNING_BOOL(outputValidationSuccessful);
 
     // 7. Cleanup
@@ -225,9 +169,8 @@ int main(int argc, char *argv[]) {
     SUCCESS_OR_TERMINATE(zeCommandQueueDestroy(cmdQueue));
     SUCCESS_OR_TERMINATE(zeKernelDestroy(kernel));
     SUCCESS_OR_TERMINATE(zeModuleDestroy(module));
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
 
-    printResult(aubMode, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(aubMode, outputValidationSuccessful, blackBoxName);
     int resultOnFailure = aubMode ? 0 : 1;
     return outputValidationSuccessful ? 0 : resultOnFailure;
 }

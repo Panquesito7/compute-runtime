@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,12 @@
 
 #pragma once
 #include "shared/offline_compiler/source/decoder/zebin_manipulator.h"
+#include "shared/offline_compiler/source/ocloc_api.h"
 #include "shared/source/device_binary_format/elf/elf_decoder.h"
 
-template <NEO::Elf::ELF_IDENTIFIER_CLASS numBits>
+struct MockIgaWrapper;
+
+template <NEO::Elf::ElfIdentifierClass numBits>
 struct MockZebinDecoder : public NEO::Zebin::Manipulator::ZebinDecoder<numBits> {
     using Base = NEO::Zebin::Manipulator::ZebinDecoder<numBits>;
     using ErrorCode = NEO::Zebin::Manipulator::ErrorCode;
@@ -52,7 +55,7 @@ struct MockZebinDecoder : public NEO::Zebin::Manipulator::ZebinDecoder<numBits> 
 
     bool callBaseGetIntelGTNotes = false;
     bool callBaseDecodeZebin = false;
-    ErrorCode returnValueDecodeZebin = NEO::OclocErrorCode::SUCCESS;
+    ErrorCode returnValueDecodeZebin = OCLOC_SUCCESS;
     std::vector<NEO::Zebin::Manipulator::SectionInfo> returnValueDumpElfSections;
     std::vector<NEO::Zebin::Elf::IntelGTNote> returnValueGetIntelGTNotes;
     bool getIntelGTNotesCalled = false;

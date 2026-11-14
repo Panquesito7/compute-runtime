@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,17 @@
 
 #include "shared/source/command_stream/csr_definitions.h"
 #include "shared/source/command_stream/scratch_space_controller.h"
-#include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gen_common/reg_configs_common.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/helpers/state_base_address.h"
+#include "shared/source/kernel/kernel_descriptor.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
 #include "shared/source/os_interface/os_context.h"
+#include "shared/source/program/kernel_info.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
 #include "shared/test/common/helpers/raii_gfx_core_helper.h"
+#include "shared/test/common/helpers/test_traits.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/mocks/mock_csr.h"
@@ -23,18 +26,20 @@
 #include "shared/test/common/mocks/mock_submissions_aggregator.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/cl_device/cl_device_vector.h"
 #include "opencl/test/unit_test/fixtures/ult_command_stream_receiver_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_event.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
-#include "reg_configs_common.h"
-
 using namespace NEO;
+#include "shared/test/common/test_macros/heapless_matchers.h"
 
 using CommandStreamReceiverFlushTaskTests = UltCommandStreamReceiverTest;
+using CommandStreamReceiverFlushTaskTestsWithMockCsrHw = UltCommandStreamReceiverTestWithCsrT<MockCsrHw>;
+using CommandStreamReceiverFlushTaskTestsWithMockCsrHw2 = UltCommandStreamReceiverTestWithCsrT<MockCsrHw2>;
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenBlockedKernelNotRequiringDCFlushWhenUnblockedThenDCFlushIsNotAdded) {
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
@@ -53,10 +58,12 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenBlockedKernelNotRequiringDCFl
 
     auto &commandStreamCSR = commandStreamReceiver.getCS();
 
+    auto usedBefore = commandStreamCSR.getUsed();
     commandQueue.enqueueWriteBuffer(buffer, CL_FALSE, 0, sizeof(tempBuffer), dstBuffer, nullptr, 1, &blockingEvent, 0);
+    auto usedAfter = commandStreamCSR.getUsed();
 
     // Expect nothing was sent
-    EXPECT_EQ(0u, commandStreamCSR.getUsed());
+    EXPECT_EQ(usedBefore, usedAfter);
 
     // Unblock Event
     mockEvent.setStatus(CL_COMPLETE);
@@ -83,7 +90,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenBlockedKernelNotRequiringDCFl
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenEnableUpdateTaskFromWaitWhenNonBlockingCallIsMadeThenNoPipeControlInsertedOnDevicesWithoutDCFlushRequirements) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UpdateTaskCountFromWait.set(3u);
+    debugManager.flags.UpdateTaskCountFromWait.set(3u);
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
     MockContext ctx(pClDevice);
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
@@ -111,7 +118,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenEnableUpdateTaskFromWaitWhenN
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenEnableUpdateTaskFromWaitWhenEnqueueFillIsMadeThenPipeControlInserted) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UpdateTaskCountFromWait.set(3u);
+    debugManager.flags.UpdateTaskCountFromWait.set(3u);
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
     MockContext ctx(pClDevice);
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
@@ -172,19 +179,19 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenEmptyQueueWhenFinishingThenTa
     commandStreamReceiver.taskLevel = taskCount;
     commandStreamReceiver.taskCount = taskCount;
 
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
-    mockCmdQueue.finish();
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
-    mockCmdQueue.finish();
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u, commandStreamReceiver.peekLatestSentTaskCount());
+    mockCmdQueue.finish(false);
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u, commandStreamReceiver.peekLatestSentTaskCount());
+    mockCmdQueue.finish(false);
     // nothings sent to the HW, no need to bump tags
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u, commandStreamReceiver.peekLatestSentTaskCount());
     EXPECT_EQ(0u, mockCmdQueue.latestTaskCountWaited);
 }
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenTaskCountToWaitBiggerThanLatestSentTaskCountWhenWaitForCompletionThenFlushPipeControl) {
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UpdateTaskCountFromWait.set(3);
+    debugManager.flags.UpdateTaskCountFromWait.set(3);
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
 
@@ -199,7 +206,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenTaskCountToWaitBiggerThanLate
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenNonDcFlushWithInitialTaskCountZeroWhenFinishingThenTaskCountIncremented) {
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     MockCommandQueueHw<FamilyType> mockCmdQueue(&ctx, pClDevice, nullptr);
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     size_t gws = 1;
@@ -210,17 +217,17 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenNonDcFlushWithInitialTaskCoun
     mockCmdQueue.taskLevel = taskCount;
     commandStreamReceiver.taskLevel = taskCount;
     commandStreamReceiver.taskCount = taskCount;
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u, commandStreamReceiver.peekLatestSentTaskCount());
 
     // finish after enqueued kernel(cmdq task count = 1)
     mockCmdQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
-    mockCmdQueue.finish();
+    mockCmdQueue.finish(false);
     EXPECT_EQ(1u, commandStreamReceiver.peekLatestSentTaskCount());
     EXPECT_EQ(1u, mockCmdQueue.latestTaskCountWaited);
     EXPECT_EQ(1u, commandStreamReceiver.peekTaskCount());
 
     // finish again - dont call flush task
-    mockCmdQueue.finish();
+    mockCmdQueue.finish(false);
     EXPECT_EQ(1u, commandStreamReceiver.peekLatestSentTaskCount());
     EXPECT_EQ(1u, mockCmdQueue.latestTaskCountWaited);
     EXPECT_EQ(1u, commandStreamReceiver.peekTaskCount());
@@ -228,7 +235,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenNonDcFlushWithInitialTaskCoun
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenDcFlushWhenFinishingThenTaskCountIncremented) {
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     MockCommandQueueHw<FamilyType> mockCmdQueue(&ctx, pClDevice, nullptr);
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     size_t gws = 1;
@@ -244,7 +251,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenDcFlushWhenFinishingThenTaskC
     mockCmdQueue.taskLevel = taskCount;
     commandStreamReceiver.taskLevel = taskCount;
     commandStreamReceiver.taskCount = taskCount;
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u, commandStreamReceiver.peekLatestSentTaskCount());
 
     // finish(dcFlush=true) from blocking MapBuffer after enqueued kernel
     mockCmdQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
@@ -255,12 +262,12 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenDcFlushWhenFinishingThenTaskC
     EXPECT_EQ(1u, commandStreamReceiver.peekLatestSentTaskCount());
 
     // cmdQ task count = 2, finish again
-    mockCmdQueue.finish();
+    mockCmdQueue.finish(false);
 
     EXPECT_EQ(1u, commandStreamReceiver.peekLatestSentTaskCount());
 
     // finish again - dont flush task again
-    mockCmdQueue.finish();
+    mockCmdQueue.finish(false);
 
     EXPECT_EQ(1u, commandStreamReceiver.peekLatestSentTaskCount());
 
@@ -279,10 +286,10 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenDcFlushWhenFinishingThenTaskC
     EXPECT_EQ(retVal, CL_SUCCESS);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenPowerOfTwoGlobalWorkSizeAndNullLocalWorkgroupSizeWhenEnqueueKernelIsCalledThenGpGpuWalkerHasOptimalSIMDmask) {
+HWTEST2_F(CommandStreamReceiverFlushTaskTests, givenPowerOfTwoGlobalWorkSizeAndNullLocalWorkgroupSizeWhenEnqueueKernelIsCalledThenGpGpuWalkerHasOptimalSIMDmask, IsGen12LP) {
     typedef typename FamilyType::GPGPU_WALKER GPGPU_WALKER;
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     size_t gws = 1024;
     CommandQueueHw<FamilyType> commandQueue(&ctx, pClDevice, 0, false);
     commandQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
@@ -318,7 +325,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenEventIsQueriedWhenEnqueuingTh
     commandQueue.taskLevel = taskCount;
     commandStreamReceiver.taskLevel = taskCount;
     commandStreamReceiver.taskCount = taskCount;
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u, commandStreamReceiver.peekLatestSentTaskCount());
 
     commandQueue.enqueueReadBuffer(buffer, CL_FALSE, 0, sizeof(tempBuffer), dstBuffer, nullptr, 0, 0, &event);
 
@@ -339,6 +346,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenNonBlockingMapEnqueueWhenFini
 
     MockContext ctx(pClDevice);
     CommandQueueHw<FamilyType> commandQueue(&ctx, pClDevice, 0, false);
+    commandQueue.updateLatestSentEnqueueType(EnqueueProperties::Operation::profilingOnly);
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     size_t tempBuffer[] = {0, 1, 2};
     cl_int retVal;
@@ -353,17 +361,18 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenNonBlockingMapEnqueueWhenFini
     commandQueue.taskLevel = taskCount;
     commandStreamReceiver.taskLevel = taskCount;
     commandStreamReceiver.taskCount = taskCount;
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    auto expectedTaskCount = commandStreamReceiver.heaplessPrologProgrammed ? 1u : 0u;
+    EXPECT_EQ(expectedTaskCount, commandStreamReceiver.peekLatestSentTaskCount());
 
     auto ptr = commandQueue.enqueueMapBuffer(&mockBuffer, CL_FALSE, CL_MAP_READ, 0, sizeof(tempBuffer), 0, nullptr, nullptr, retVal);
     EXPECT_EQ(retVal, CL_SUCCESS);
     EXPECT_NE(nullptr, ptr);
 
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    EXPECT_EQ(expectedTaskCount, commandStreamReceiver.peekLatestSentTaskCount());
 
-    commandQueue.finish();
+    commandQueue.finish(false);
 
-    EXPECT_EQ(0u, commandStreamReceiver.peekLatestSentTaskCount());
+    EXPECT_EQ(expectedTaskCount, commandStreamReceiver.peekLatestSentTaskCount());
 
     auto &commandStreamTask = commandQueue.getCS(1024);
     parseCommands<FamilyType>(commandStreamTask, 0);
@@ -372,8 +381,8 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenNonBlockingMapEnqueueWhenFini
     ASSERT_EQ(cmdList.end(), itorPC);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests,
-            GivenFlushedCallRequiringDCFlushWhenBlockingEnqueueIsCalledThenPipeControlWithDCFlushIsAdded) {
+HWTEST2_F(CommandStreamReceiverFlushTaskTests,
+          GivenFlushedCallRequiringDCFlushWhenBlockingEnqueueIsCalledThenPipeControlWithDCFlushIsAdded, IsGen12LP) {
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
 
     MockContext ctx(pClDevice);
@@ -408,7 +417,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests,
     cmdList.clear();
     parseCommands<FamilyType>(commandStreamTask, 0);
 
-    auto itorWalker = find<typename FamilyType::WALKER_TYPE *>(cmdList.begin(), cmdList.end());
+    auto itorWalker = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
 
     auto itorCmd = find<PIPE_CONTROL *>(itorWalker, cmdList.end());
     ASSERT_NE(cmdList.end(), itorCmd);
@@ -433,9 +442,9 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests,
     retVal = clReleaseMemObject(buffer);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenDefaultCommandStreamReceiverThenRoundRobinPolicyIsSelected) {
+HWTEST2_F(CommandStreamReceiverFlushTaskTests, givenDefaultCommandStreamReceiverThenRoundRobinPolicyIsSelected, IsAtMostXe3Core) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
+    debugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
 
     auto pCommandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     pDevice->resetCommandStreamReceiver(pCommandStreamReceiver);
@@ -443,26 +452,20 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenDefaultCommandStreamReceiverT
 
     flushTask(*pCommandStreamReceiver);
 
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    EXPECT_EQ(gfxCoreHelper.getDefaultThreadArbitrationPolicy(), pCommandStreamReceiver->peekThreadArbitrationPolicy());
+    const auto &hwInfo = pDevice->getHardwareInfo();
+    EXPECT_EQ(hwInfo.caps.defaultThreadArbitrationPolicy, pCommandStreamReceiver->peekThreadArbitrationPolicy());
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenKernelWithSlmWhenPreviousSLML3WasSentThenDontProgramL3) {
-    typedef typename FamilyType::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw, GivenKernelWithSlmWhenPreviousSLML3WasSentThenDontProgramL3) {
     size_t gws = 1;
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     CommandQueueHw<FamilyType> commandQueue(&ctx, pClDevice, 0, false);
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
+    auto commandStreamReceiver = static_cast<MockCsrHw<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     auto &commandStreamCSR = commandStreamReceiver->getCS();
 
-    uint32_t l3Config = PreambleHelper<FamilyType>::getL3Config(*defaultHwInfo, true);
-
-    // Mark Pramble as sent, override L3Config to SLM config
     commandStreamReceiver->isPreambleSent = true;
-    commandStreamReceiver->lastSentL3Config = l3Config;
 
     ((MockKernel *)kernel)->setTotalSLMSize(1024);
 
@@ -485,19 +488,27 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, WhenCreatingCommandStreamReceiverH
     EXPECT_EQ(nullptr, ptm);
     delete csrHw;
 
-    DebugManager.flags.SetCommandStreamReceiver.set(0);
-    int32_t getCsr = DebugManager.flags.SetCommandStreamReceiver.get();
+    debugManager.flags.SetCommandStreamReceiver.set(0);
+    int32_t getCsr = debugManager.flags.SetCommandStreamReceiver.get();
     EXPECT_EQ(0, getCsr);
 
     auto csr = NEO::createCommandStream(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     EXPECT_NE(nullptr, csr);
     delete csr;
-    DebugManager.flags.SetCommandStreamReceiver.set(0);
+    debugManager.flags.SetCommandStreamReceiver.set(0);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, WhenFlushingThenScratchAllocationIsReused) {
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
+struct FlushTaskNonHeaplessMatcher {
+    template <PRODUCT_FAMILY productFamily>
+    static constexpr bool isMatched() {
+        return !(TestTraits<NEO::ToGfxCoreFamily<productFamily>::get()>::heaplessRequired);
+    }
+};
+
+HWTEST2_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw, WhenFlushingThenScratchAllocationIsReused, FlushTaskNonHeaplessMatcher) {
+
+    auto commandStreamReceiver = static_cast<MockCsrHw<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
+    commandStreamReceiver->heaplessModeEnabled = false;
 
     commandStreamReceiver->setRequiredScratchSizes(1024, 0); // whatever > 0
 
@@ -532,7 +543,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, WhenFlushingThenScratchAllocationI
 }
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFenceAllocationIsRequiredAndFlushTaskIsCalledThenFenceAllocationIsMadeResident) {
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperWithFenceAllocation<FamilyType>> gfxCoreHelperBackup{
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> gfxCoreHelperBackup{
         *pDevice->executionEnvironment->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]};
 
     auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
@@ -551,7 +562,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFenc
 }
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFenceAllocationIsRequiredAndCreatedThenItIsMadeResidentDuringFlushSmallTask) {
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperWithFenceAllocation<FamilyType>> gfxCoreHelperBackup{
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> gfxCoreHelperBackup{
         *pDevice->executionEnvironment->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]};
 
     MockCsrHw<FamilyType> csr(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
@@ -563,17 +574,17 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFenc
     EXPECT_FALSE(csr.isMadeResident(csr.globalFenceAllocation));
     EXPECT_FALSE(csr.isMadeNonResident(csr.globalFenceAllocation));
 
-    EXPECT_EQ(SubmissionStatus::SUCCESS, flushSmallTask(csr));
+    EXPECT_EQ(SubmissionStatus::success, flushSmallTask(csr));
 
     EXPECT_TRUE(csr.isMadeResident(csr.globalFenceAllocation));
     EXPECT_TRUE(csr.isMadeNonResident(csr.globalFenceAllocation));
 
     ASSERT_NE(nullptr, csr.globalFenceAllocation);
-    EXPECT_EQ(AllocationType::GLOBAL_FENCE, csr.globalFenceAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::globalFence, csr.globalFenceAllocation->getAllocationType());
 }
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFenceAllocationIsRequiredButNotCreatedThenItIsNotMadeResidentDuringFlushSmallTask) {
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperWithFenceAllocation<FamilyType>> gfxCoreHelperBackup{
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> gfxCoreHelperBackup{
         *pDevice->executionEnvironment->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]};
 
     MockCsrHw<FamilyType> csr(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
@@ -581,69 +592,75 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFenc
 
     EXPECT_EQ(nullptr, csr.globalFenceAllocation);
 
-    EXPECT_EQ(SubmissionStatus::SUCCESS, flushSmallTask(csr));
+    EXPECT_EQ(SubmissionStatus::success, flushSmallTask(csr));
 
     ASSERT_EQ(nullptr, csr.globalFenceAllocation);
 }
 
 struct MockScratchController : public ScratchSpaceController {
-    using ScratchSpaceController::privateScratchAllocation;
-    using ScratchSpaceController::scratchAllocation;
+    using ScratchSpaceController::scratchSlot0Allocation;
+    using ScratchSpaceController::scratchSlot1Allocation;
     using ScratchSpaceController::ScratchSpaceController;
-    void setRequiredScratchSpace(void *sshBaseAddress,
+    bool setRequiredScratchSpace(void *sshBaseAddress,
                                  uint32_t scratchSlot,
-                                 uint32_t requiredPerThreadScratchSize,
-                                 uint32_t requiredPerThreadPrivateScratchSize,
-                                 TaskCountType currentTaskCount,
+                                 uint32_t requiredPerThreadScratchSizeSlot0,
+                                 uint32_t requiredPerThreadScratchSizeSlot1,
                                  OsContext &osContext,
                                  bool &stateBaseAddressDirty,
                                  bool &vfeStateDirty) override {
-        if (requiredPerThreadScratchSize > scratchSizeBytes) {
-            scratchSizeBytes = requiredPerThreadScratchSize;
-            scratchAllocation = getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, requiredPerThreadScratchSize});
+        if (requiredPerThreadScratchSizeSlot0 > scratchSlot0SizeInBytes) {
+            scratchSlot0SizeInBytes = requiredPerThreadScratchSizeSlot0;
+            scratchSlot0Allocation = getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, requiredPerThreadScratchSizeSlot0});
         }
-        if (requiredPerThreadPrivateScratchSize > privateScratchSizeBytes) {
-            privateScratchSizeBytes = requiredPerThreadPrivateScratchSize;
-            privateScratchAllocation = getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, requiredPerThreadPrivateScratchSize});
+        if (requiredPerThreadScratchSizeSlot1 > scratchSlot1SizeInBytes) {
+            scratchSlot1SizeInBytes = requiredPerThreadScratchSizeSlot1;
+            scratchSlot1Allocation = getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, requiredPerThreadScratchSizeSlot1});
         }
+        return true;
+    }
+    bool reserveScratchSpace(uint32_t requiredPerThreadScratchSizeSlot0,
+                             uint32_t requiredPerThreadScratchSizeSlot1,
+                             OsContext &osContext) override {
+        return true;
     }
     uint64_t calculateNewGSH() override { return 0u; };
     uint64_t getScratchPatchAddress() override { return 0u; };
-    void programHeaps(HeapContainer &heapContainer,
+    bool programHeaps(HeapContainer &heapContainer,
                       uint32_t scratchSlot,
-                      uint32_t requiredPerThreadScratchSize,
-                      uint32_t requiredPerThreadPrivateScratchSize,
-                      TaskCountType currentTaskCount,
+                      uint32_t requiredPerThreadScratchSizeSlot0,
+                      uint32_t requiredPerThreadScratchSizeSlot1,
                       OsContext &osContext,
                       bool &stateBaseAddressDirty,
                       bool &vfeStateDirty) override {
+        return true;
     }
     void programBindlessSurfaceStateForScratch(BindlessHeapsHelper *heapsHelper,
-                                               uint32_t requiredPerThreadScratchSize,
-                                               uint32_t requiredPerThreadPrivateScratchSize,
-                                               TaskCountType currentTaskCount,
+                                               uint32_t requiredPerThreadScratchSizeSlot0,
+                                               uint32_t requiredPerThreadScratchSizeSlot1,
                                                OsContext &osContext,
                                                bool &stateBaseAddressDirty,
                                                bool &vfeStateDirty,
                                                NEO::CommandStreamReceiver *csr) override {
     }
-    void reserveHeap(IndirectHeap::Type heapType, IndirectHeap *&indirectHeap) override{};
+    size_t getReservedSshSize() const override { return 0u; };
+    void reserveHeap(IndirectHeap::Type heapType, IndirectHeap *&indirectHeap) override {};
 };
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, whenScratchIsRequiredForFirstFlushAndPrivateScratchForSecondFlushThenHandleResidencyProperly) {
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+HWTEST2_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw, whenScratchIsRequiredForFirstFlushAndPrivateScratchForSecondFlushThenHandleResidencyProperly, FlushTaskNonHeaplessMatcher) {
+
+    auto commandStreamReceiver = static_cast<MockCsrHw<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
+    commandStreamReceiver->heaplessModeEnabled = false;
     auto scratchController = new MockScratchController(pDevice->getRootDeviceIndex(), *pDevice->executionEnvironment, *commandStreamReceiver->getInternalAllocationStorage());
     commandStreamReceiver->scratchSpaceController.reset(scratchController);
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
 
     commandStreamReceiver->setRequiredScratchSizes(1024, 0);
 
     flushTask(*commandStreamReceiver);
 
-    EXPECT_NE(nullptr, scratchController->scratchAllocation);
-    EXPECT_EQ(nullptr, scratchController->privateScratchAllocation);
+    EXPECT_NE(nullptr, scratchController->scratchSlot0Allocation);
+    EXPECT_EQ(nullptr, scratchController->scratchSlot1Allocation);
 
-    auto scratchAllocation = scratchController->scratchAllocation;
+    auto scratchAllocation = scratchController->scratchSlot0Allocation;
 
     EXPECT_TRUE(commandStreamReceiver->isMadeResident(scratchAllocation));
     EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(scratchAllocation));
@@ -654,34 +671,35 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, whenScratchIsRequiredForFirstFlush
 
     flushTask(*commandStreamReceiver); // 2nd flush
 
-    EXPECT_NE(nullptr, scratchController->scratchAllocation);
-    EXPECT_NE(nullptr, scratchController->privateScratchAllocation);
+    EXPECT_NE(nullptr, scratchController->scratchSlot0Allocation);
+    EXPECT_NE(nullptr, scratchController->scratchSlot1Allocation);
 
-    auto privateScratchAllocation = scratchController->privateScratchAllocation;
+    auto scratch1Allocation = scratchController->scratchSlot1Allocation;
 
     EXPECT_TRUE(commandStreamReceiver->isMadeResident(scratchAllocation));
     EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(scratchAllocation));
-    EXPECT_TRUE(commandStreamReceiver->isMadeResident(privateScratchAllocation));
-    EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(privateScratchAllocation));
+    EXPECT_TRUE(commandStreamReceiver->isMadeResident(scratch1Allocation));
+    EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(scratch1Allocation));
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, whenPrivateScratchIsRequiredForFirstFlushAndCommonScratchForSecondFlushThenHandleResidencyProperly) {
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+HWTEST2_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw, whenPrivateScratchIsRequiredForFirstFlushAndCommonScratchForSecondFlushThenHandleResidencyProperly, FlushTaskNonHeaplessMatcher) {
+
+    auto commandStreamReceiver = static_cast<MockCsrHw<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
+    commandStreamReceiver->heaplessModeEnabled = false;
     auto scratchController = new MockScratchController(pDevice->getRootDeviceIndex(), *pDevice->executionEnvironment, *commandStreamReceiver->getInternalAllocationStorage());
     commandStreamReceiver->scratchSpaceController.reset(scratchController);
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
 
     commandStreamReceiver->setRequiredScratchSizes(0, 1024);
 
     flushTask(*commandStreamReceiver);
 
-    EXPECT_EQ(nullptr, scratchController->scratchAllocation);
-    EXPECT_NE(nullptr, scratchController->privateScratchAllocation);
+    EXPECT_EQ(nullptr, scratchController->scratchSlot0Allocation);
+    EXPECT_NE(nullptr, scratchController->scratchSlot1Allocation);
 
-    auto privateScratchAllocation = scratchController->privateScratchAllocation;
+    auto scratch1Allocation = scratchController->scratchSlot1Allocation;
 
-    EXPECT_TRUE(commandStreamReceiver->isMadeResident(privateScratchAllocation));
-    EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(privateScratchAllocation));
+    EXPECT_TRUE(commandStreamReceiver->isMadeResident(scratch1Allocation));
+    EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(scratch1Allocation));
 
     commandStreamReceiver->madeResidentGfxAllocations.clear(); // this is only history - we can clean this
     commandStreamReceiver->madeNonResidentGfxAllocations.clear();
@@ -689,45 +707,37 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, whenPrivateScratchIsRequiredForFir
 
     flushTask(*commandStreamReceiver); // 2nd flush
 
-    EXPECT_NE(nullptr, scratchController->scratchAllocation);
-    EXPECT_NE(nullptr, scratchController->privateScratchAllocation);
+    EXPECT_NE(nullptr, scratchController->scratchSlot0Allocation);
+    EXPECT_NE(nullptr, scratchController->scratchSlot1Allocation);
 
-    auto scratchAllocation = scratchController->scratchAllocation;
+    auto scratchAllocation = scratchController->scratchSlot0Allocation;
 
     EXPECT_TRUE(commandStreamReceiver->isMadeResident(scratchAllocation));
     EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(scratchAllocation));
-    EXPECT_TRUE(commandStreamReceiver->isMadeResident(privateScratchAllocation));
-    EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(privateScratchAllocation));
+    EXPECT_TRUE(commandStreamReceiver->isMadeResident(scratch1Allocation));
+    EXPECT_TRUE(commandStreamReceiver->isMadeNonResident(scratch1Allocation));
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenTwoConsecutiveNdRangeKernelsThenStateBaseAddressIsProgrammedOnceAndScratchAddressInMediaVfeStateIsProgrammedTwiceBothWithCorrectAddress) {
-    typedef typename FamilyType::PARSE PARSE;
-    typedef typename PARSE::MEDIA_VFE_STATE MEDIA_VFE_STATE;
-    typedef typename PARSE::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
+HWCMDTEST_TEMPLATED_F(IGFX_GEN12LP_CORE, CommandStreamReceiverFlushTaskTestsWithMockCsrHw, givenTwoConsecutiveNdRangeKernelsThenStateBaseAddressIsProgrammedOnceAndScratchAddressInMediaVfeStateIsProgrammedTwiceBothWithCorrectAddress) {
+    typedef typename FamilyType::Parse Parse;
+    typedef typename Parse::MEDIA_VFE_STATE MEDIA_VFE_STATE;
+    typedef typename Parse::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
 
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     CommandQueueHw<FamilyType> commandQueue(&ctx, pClDevice, 0, false);
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
+    auto commandStreamReceiver = static_cast<MockCsrHw<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     size_t gws = 1;
     uint32_t scratchSize = 1024;
-    kernel.kernelInfo.setPerThreadScratchSize(scratchSize, 0);
+    kernel.kernelInfo.kernelDescriptor.kernelAttributes.perThreadScratchSize[0] = scratchSize;
 
     EXPECT_EQ(false, kernel.mockKernel->isBuiltIn);
 
     auto deviceInfo = pClDevice->getDeviceInfo();
     auto sharedDeviceInfo = pDevice->getDeviceInfo();
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_FALSE(commandStreamReceiver->getGSBAFor32BitProgrammed());
-    }
 
     commandQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
-
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_TRUE(commandStreamReceiver->getGSBAFor32BitProgrammed());
-    }
 
     cmdList.clear();
     // Parse command list
@@ -744,15 +754,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenTwoConsecu
     auto gsHaddress = (uintptr_t)sba->getGeneralStateBaseAddress();
     uint64_t graphicsAddress = 0;
 
-    // Get address ( offset in 32 bit addressing ) of sratch
+    // Get address ( offset in 32 bit addressing ) of scratch
     graphicsAddress = (uint64_t)graphicsAllocationScratch->getGpuAddressToPatch();
 
-    if (sharedDeviceInfo.force32BitAddressess && is64bit) {
-        EXPECT_TRUE(graphicsAllocationScratch->is32BitAllocation());
-
-        auto gmmHelper = pDevice->getGmmHelper();
-        EXPECT_EQ(gmmHelper->decanonize(graphicsAllocationScratch->getGpuAddress()) - gsHaddress, graphicsAddress);
-    } else if (!deviceInfo.svmCapabilities && is64bit) {
+    if (!deviceInfo.svmCapabilities && is64bit) {
         EXPECT_EQ(ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, mediaVfeState->getScratchSpaceBasePointer());
         EXPECT_EQ(gsHaddress + ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, graphicsAllocationScratch->getGpuAddressToPatch());
     } else {
@@ -765,7 +770,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenTwoConsecu
     uint64_t scratchBaseLowPart = (uint64_t)mediaVfeState->getScratchSpaceBasePointer();
     uint64_t scratchBaseHighPart = (uint64_t)mediaVfeState->getScratchSpaceBasePointerHigh();
 
-    if (is64bit && !sharedDeviceInfo.force32BitAddressess) {
+    if (is64bit) {
         uint64_t expectedAddress = ScratchSpaceConstants::scratchSpaceOffsetFor64Bit;
         EXPECT_EQ(expectedAddress, scratchBaseLowPart);
         EXPECT_EQ(0u, scratchBaseHighPart);
@@ -774,19 +779,15 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenTwoConsecu
         EXPECT_EQ(highPartGraphicsAddress, scratchBaseHighPart);
     }
 
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_EQ(pDevice->getMemoryManager()->getExternalHeapBaseAddress(graphicsAllocationScratch->getRootDeviceIndex(), false), gsHaddress);
+    if constexpr (is64bit) {
+        EXPECT_EQ(graphicsAddress - ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, gsHaddress);
     } else {
-        if constexpr (is64bit) {
-            EXPECT_EQ(graphicsAddress - ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, gsHaddress);
-        } else {
-            EXPECT_EQ(0u, gsHaddress);
-        }
+        EXPECT_EQ(0u, gsHaddress);
     }
 
     // now re-try to see if SBA is not programmed
     scratchSize *= 2;
-    kernel.kernelInfo.setPerThreadScratchSize(scratchSize, 0);
+    kernel.kernelInfo.kernelDescriptor.kernelAttributes.perThreadScratchSize[0] = scratchSize;
 
     commandQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
 
@@ -795,53 +796,33 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenTwoConsecu
 
     itorCmdForStateBase = find<STATE_BASE_ADDRESS *>(itorWalker, cmdList.end());
 
-    // In 32 Bit addressing sba shouldn't be reprogrammed
-    if (sharedDeviceInfo.force32BitAddressess == true) {
-        EXPECT_EQ(itorCmdForStateBase, cmdList.end());
-    }
-
     auto itorMediaVfeStateSecond = find<MEDIA_VFE_STATE *>(itorWalker, cmdList.end());
     auto *cmdMediaVfeStateSecond = (MEDIA_VFE_STATE *)*itorMediaVfeStateSecond;
 
     EXPECT_NE(mediaVfeState, cmdMediaVfeStateSecond);
-
-    uint64_t oldScratchAddr = ((uint64_t)scratchBaseHighPart << 32u) | scratchBaseLowPart;
-    uint64_t newScratchAddr = ((uint64_t)cmdMediaVfeStateSecond->getScratchSpaceBasePointerHigh() << 32u) | cmdMediaVfeStateSecond->getScratchSpaceBasePointer();
-
-    if (sharedDeviceInfo.force32BitAddressess == true) {
-        EXPECT_NE(oldScratchAddr, newScratchAddr);
-    }
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenNdRangeKernelAndReadBufferStateBaseAddressAndScratchAddressInMediaVfeStateThenProgrammingIsCorrect) {
+HWCMDTEST_TEMPLATED_F(IGFX_GEN12LP_CORE, CommandStreamReceiverFlushTaskTestsWithMockCsrHw, givenNdRangeKernelAndReadBufferStateBaseAddressAndScratchAddressInMediaVfeStateThenProgrammingIsCorrect) {
 
-    typedef typename FamilyType::PARSE PARSE;
-    typedef typename PARSE::MEDIA_VFE_STATE MEDIA_VFE_STATE;
-    typedef typename PARSE::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
+    typedef typename FamilyType::Parse Parse;
+    typedef typename Parse::MEDIA_VFE_STATE MEDIA_VFE_STATE;
+    typedef typename Parse::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
 
     MockContext ctx(pClDevice);
-    MockKernelWithInternals kernel(*pClDevice);
+    MockKernelWithInternals kernel(ctx);
     CommandQueueHw<FamilyType> commandQueue(&ctx, pClDevice, 0, false);
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
+    auto commandStreamReceiver = static_cast<MockCsrHw<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     size_t gws = 1;
     uint32_t scratchSize = 1024;
-    kernel.kernelInfo.setPerThreadScratchSize(scratchSize, 0);
+    kernel.kernelInfo.kernelDescriptor.kernelAttributes.perThreadScratchSize[0] = scratchSize;
 
     EXPECT_EQ(false, kernel.mockKernel->isBuiltIn);
 
     auto deviceInfo = pClDevice->getDeviceInfo();
     auto sharedDeviceInfo = pDevice->getDeviceInfo();
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_FALSE(commandStreamReceiver->getGSBAFor32BitProgrammed());
-    }
 
     commandQueue.enqueueKernel(kernel, 1, nullptr, &gws, nullptr, 0, nullptr, nullptr);
-
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_TRUE(commandStreamReceiver->getGSBAFor32BitProgrammed());
-    }
 
     cmdList.clear();
     // Parse command list
@@ -858,15 +839,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenNdRangeKer
     auto gsHaddress = (uintptr_t)sba->getGeneralStateBaseAddress();
     uint64_t graphicsAddress = 0;
 
-    // Get address ( offset in 32 bit addressing ) of sratch
+    // Get address ( offset in 32 bit addressing ) of scratch
     graphicsAddress = (uint64_t)graphicsAllocationScratch->getGpuAddressToPatch();
 
-    if (sharedDeviceInfo.force32BitAddressess && is64bit) {
-        EXPECT_TRUE(graphicsAllocationScratch->is32BitAllocation());
-
-        auto gmmHelper = pDevice->getGmmHelper();
-        EXPECT_EQ(gmmHelper->decanonize(graphicsAllocationScratch->getGpuAddress()) - gsHaddress, graphicsAddress);
-    } else if (!deviceInfo.svmCapabilities && is64bit) {
+    if (!deviceInfo.svmCapabilities && is64bit) {
         EXPECT_EQ(ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, mediaVfeState->getScratchSpaceBasePointer());
         EXPECT_EQ(gsHaddress + ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, graphicsAllocationScratch->getGpuAddressToPatch());
     } else {
@@ -879,7 +855,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenNdRangeKer
     uint64_t scratchBaseLowPart = (uint64_t)mediaVfeState->getScratchSpaceBasePointer();
     uint64_t scratchBaseHighPart = (uint64_t)mediaVfeState->getScratchSpaceBasePointerHigh();
 
-    if (is64bit && !sharedDeviceInfo.force32BitAddressess) {
+    if (is64bit) {
         lowPartGraphicsAddress = ScratchSpaceConstants::scratchSpaceOffsetFor64Bit;
         highPartGraphicsAddress = 0u;
     }
@@ -887,14 +863,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenNdRangeKer
     EXPECT_EQ(lowPartGraphicsAddress, scratchBaseLowPart);
     EXPECT_EQ(highPartGraphicsAddress, scratchBaseHighPart);
 
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_EQ(pDevice->getMemoryManager()->getExternalHeapBaseAddress(graphicsAllocationScratch->getRootDeviceIndex(), false), gsHaddress);
+    if constexpr (is64bit) {
+        EXPECT_EQ(graphicsAddress - ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, gsHaddress);
     } else {
-        if constexpr (is64bit) {
-            EXPECT_EQ(graphicsAddress - ScratchSpaceConstants::scratchSpaceOffsetFor64Bit, gsHaddress);
-        } else {
-            EXPECT_EQ(0u, gsHaddress);
-        }
+        EXPECT_EQ(0u, gsHaddress);
     }
 
     size_t tempBuffer[] = {0, 1, 2};
@@ -910,96 +882,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenNdRangeKer
 
     itorCmdForStateBase = find<STATE_BASE_ADDRESS *>(itorWalker, cmdList.end());
 
-    if (sharedDeviceInfo.force32BitAddressess) {
-        EXPECT_NE(itorWalker, itorCmdForStateBase);
-
-        if (itorCmdForStateBase != cmdList.end()) {
-
-            auto *sba2 = (STATE_BASE_ADDRESS *)*itorCmdForStateBase;
-            auto gsHaddress2 = (uintptr_t)sba2->getGeneralStateBaseAddress();
-
-            EXPECT_NE(sba, sba2);
-            EXPECT_EQ(0u, gsHaddress2);
-
-            if (sharedDeviceInfo.force32BitAddressess) {
-                EXPECT_FALSE(commandStreamReceiver->getGSBAFor32BitProgrammed());
-            }
-        }
-    }
     delete buffer;
-
-    if (sharedDeviceInfo.force32BitAddressess) {
-        // Asserts placed after restoring old CSR to avoid heap corruption
-        ASSERT_NE(itorCmdForStateBase, cmdList.end());
-    }
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenForced32BitAllocationsModeStore32bitWhenFlushingTaskThenScratchAllocationIsNotReused) {
-    DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.Force32bitAddressing.set(true);
-
-    auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-
-    pDevice->getMemoryManager()->setForce32BitAllocations(true);
-
-    pDevice->resetCommandStreamReceiver(commandStreamReceiver);
-
-    commandStreamReceiver->setRequiredScratchSizes(4096, 0); // whatever > 0 (in page size)
-    flushTask(*commandStreamReceiver);
-
-    auto scratchAllocation = commandStreamReceiver->getScratchAllocation();
-    ASSERT_NE(scratchAllocation, nullptr);
-
-    commandStreamReceiver->setRequiredScratchSizes(8196, 0); // whatever > first size
-
-    flushTask(*commandStreamReceiver); // 2nd flush
-
-    auto newScratchAllocation = commandStreamReceiver->getScratchAllocation();
-    EXPECT_NE(scratchAllocation, newScratchAllocation); // Allocation changed
-
-    std::unique_ptr<GraphicsAllocation> allocationReusable = commandStreamReceiver->getInternalAllocationStorage()->obtainReusableAllocation(4096, AllocationType::LINEAR_STREAM);
-
-    if (allocationReusable.get() != nullptr) {
-        if constexpr (is64bit) {
-            EXPECT_NE(scratchAllocation, allocationReusable.get());
-        }
-        pDevice->getMemoryManager()->freeGraphicsMemory(allocationReusable.release());
-    }
-}
-
-HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenForced32BitAllocationsModeStore32bitWhenFlushingTaskThenScratchAllocationStoredOnTemporaryAllocationList) {
-    if constexpr (is64bit) {
-        DebugManagerStateRestore dbgRestorer;
-        DebugManager.flags.Force32bitAddressing.set(true);
-
-        auto commandStreamReceiver = new MockCsrHw<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-
-        pDevice->getMemoryManager()->setForce32BitAllocations(true);
-
-        pDevice->resetCommandStreamReceiver(commandStreamReceiver);
-
-        commandStreamReceiver->setRequiredScratchSizes(4096, 0); // whatever > 0 (in page size)
-        flushTask(*commandStreamReceiver);
-
-        auto scratchAllocation = commandStreamReceiver->getScratchAllocation();
-        ASSERT_NE(scratchAllocation, nullptr);
-
-        commandStreamReceiver->setRequiredScratchSizes(8196, 0); // whatever > first size
-
-        flushTask(*commandStreamReceiver); // 2nd flush
-
-        auto newScratchAllocation = commandStreamReceiver->getScratchAllocation();
-        EXPECT_NE(scratchAllocation, newScratchAllocation); // Allocation changed
-
-        CommandStreamReceiver *csrPtr = reinterpret_cast<CommandStreamReceiver *>(commandStreamReceiver);
-        std::unique_ptr<GraphicsAllocation> allocationTemporary = commandStreamReceiver->getTemporaryAllocations().detachAllocation(0, nullptr, csrPtr, AllocationType::SCRATCH_SURFACE);
-
-        EXPECT_EQ(scratchAllocation, allocationTemporary.get());
-        pDevice->getMemoryManager()->freeGraphicsMemory(allocationTemporary.release());
-    }
-}
-
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenEnabledPreemptionWhenFlushTaskCalledThenDontProgramMediaVfeStateAgain) {
+HWTEST2_F(CommandStreamReceiverFlushTaskTests, givenEnabledPreemptionWhenFlushTaskCalledThenDontProgramMediaVfeStateAgain, IsGen12LP) {
     pDevice->setPreemptionMode(PreemptionMode::ThreadGroup);
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
     HardwareParse hwParser;
@@ -1021,145 +907,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenEnabledPre
     EXPECT_EQ(nullptr, cmd);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, GivenPreambleSentAndL3ConfigChangedWhenFlushingTaskThenPipeControlIsAdded) {
-    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
-    typedef typename FamilyType::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
-    typedef typename FamilyType::MI_BATCH_BUFFER_START MI_BATCH_BUFFER_START;
-    typedef typename FamilyType::MI_LOAD_REGISTER_IMM MI_LOAD_REGISTER_IMM;
-    typedef typename FamilyType::MEDIA_VFE_STATE MEDIA_VFE_STATE;
-    CsrSizeRequestFlags csrSizeRequest = {};
-
-    commandStream.getSpace(sizeof(PIPE_CONTROL));
-    flushTaskFlags.useSLM = true;
-    flushTaskFlags.preemptionMode = PreemptionHelper::getDefaultPreemptionMode(pDevice->getHardwareInfo());
-
-    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    // Force a PIPE_CONTROL through a taskLevel transition
-    taskLevel = commandStreamReceiver.peekTaskLevel() + 1;
-    commandStreamReceiver.isPreambleSent = true;
-    commandStreamReceiver.lastPreemptionMode = pDevice->getPreemptionMode();
-    commandStreamReceiver.lastMediaSamplerConfig = 0;
-    commandStreamReceiver.streamProperties.stateComputeMode.isCoherencyRequired.value = 0;
-    csrSizeRequest.l3ConfigChanged = true;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-
-    auto &csrCS = commandStreamReceiver.getCS();
-    size_t sizeNeeded = commandStreamReceiver.getRequiredCmdStreamSize(flushTaskFlags, *pDevice);
-
-    auto expectedUsed = csrCS.getUsed() + sizeNeeded;
-    expectedUsed = alignUp(expectedUsed, MemoryConstants::cacheLineSize);
-
-    commandStreamReceiver.streamProperties.stateComputeMode.setPropertiesAll(flushTaskFlags.requiresCoherency, flushTaskFlags.numGrfRequired,
-                                                                             flushTaskFlags.threadArbitrationPolicy, PreemptionMode::Disabled);
-    commandStreamReceiver.flushTask(commandStream, 0, &dsh, &ioh, &ssh, taskLevel, flushTaskFlags, *pDevice);
-
-    // Verify that we didn't grab a new CS buffer
-    EXPECT_EQ(expectedUsed, csrCS.getUsed());
-}
-
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCsrWhenPreambleSentThenRequiredCsrSizeDependsOnL3ConfigChanged) {
-    UltCommandStreamReceiver<FamilyType> &commandStreamReceiver = (UltCommandStreamReceiver<FamilyType> &)pDevice->getGpgpuCommandStreamReceiver();
-    CsrSizeRequestFlags csrSizeRequest = {};
-    commandStreamReceiver.isPreambleSent = true;
-
-    csrSizeRequest.l3ConfigChanged = true;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto l3ConfigChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flushTaskFlags, *pDevice);
-    auto expectedDifference = commandStreamReceiver.getCmdSizeForL3Config();
-
-    csrSizeRequest.l3ConfigChanged = false;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto l3ConfigNotChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flushTaskFlags, *pDevice);
-
-    auto difference = l3ConfigChangedSize - l3ConfigNotChangedSize;
-    EXPECT_EQ(expectedDifference, difference);
-}
-
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCsrWhenPreambleNotSentThenRequiredCsrSizeDoesntDependOnL3ConfigChanged) {
-    UltCommandStreamReceiver<FamilyType> &commandStreamReceiver = (UltCommandStreamReceiver<FamilyType> &)pDevice->getGpgpuCommandStreamReceiver();
-    CsrSizeRequestFlags csrSizeRequest = {};
-    commandStreamReceiver.isPreambleSent = false;
-
-    csrSizeRequest.l3ConfigChanged = true;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto l3ConfigChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flushTaskFlags, *pDevice);
-
-    csrSizeRequest.l3ConfigChanged = false;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto l3ConfigNotChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flushTaskFlags, *pDevice);
-
-    EXPECT_EQ(l3ConfigNotChangedSize, l3ConfigChangedSize);
-}
-
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCsrWhenPreambleNotSentThenRequiredCsrSizeDoesntDependOnmediaSamplerConfigChanged) {
-    UltCommandStreamReceiver<FamilyType> &commandStreamReceiver = (UltCommandStreamReceiver<FamilyType> &)pDevice->getGpgpuCommandStreamReceiver();
-    CsrSizeRequestFlags csrSizeRequest = {};
-    DispatchFlags flags = DispatchFlagsHelper::createDefaultDispatchFlags();
-
-    commandStreamReceiver.isPreambleSent = false;
-
-    csrSizeRequest.mediaSamplerConfigChanged = false;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto mediaSamplerConfigNotChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flags, *pDevice);
-
-    csrSizeRequest.mediaSamplerConfigChanged = true;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto mediaSamplerConfigChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flags, *pDevice);
-
-    EXPECT_EQ(mediaSamplerConfigChangedSize, mediaSamplerConfigNotChangedSize);
-}
-
-HWTEST2_F(CommandStreamReceiverFlushTaskTests, givenSpecialPipelineSelectModeChangedWhenGetCmdSizeForPielineSelectIsCalledThenCorrectSizeIsReturned, IsAtMostXeHpcCore) {
-    using PIPELINE_SELECT = typename FamilyType::PIPELINE_SELECT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    UltCommandStreamReceiver<FamilyType> &commandStreamReceiver = (UltCommandStreamReceiver<FamilyType> &)pDevice->getGpgpuCommandStreamReceiver();
-
-    CsrSizeRequestFlags csrSizeRequest = {};
-    DispatchFlags flags = DispatchFlagsHelper::createDefaultDispatchFlags();
-
-    csrSizeRequest.systolicPipelineSelectMode = true;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    size_t size = commandStreamReceiver.getCmdSizeForPipelineSelect();
-
-    size_t expectedSize = sizeof(PIPELINE_SELECT);
-    if (MemorySynchronizationCommands<FamilyType>::isBarrierPriorToPipelineSelectWaRequired(pDevice->getRootDeviceEnvironment())) {
-        expectedSize += sizeof(PIPE_CONTROL);
-    }
-    EXPECT_EQ(expectedSize, size);
-}
-
-HWTEST2_F(CommandStreamReceiverFlushTaskTests, givenCsrWhenPreambleSentThenRequiredCsrSizeDependsOnmediaSamplerConfigChanged, IsAtMostXeHpcCore) {
-    using PIPELINE_SELECT = typename FamilyType::PIPELINE_SELECT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    UltCommandStreamReceiver<FamilyType> &commandStreamReceiver = (UltCommandStreamReceiver<FamilyType> &)pDevice->getGpgpuCommandStreamReceiver();
-    CsrSizeRequestFlags csrSizeRequest = {};
-    DispatchFlags flags = DispatchFlagsHelper::createDefaultDispatchFlags();
-
-    commandStreamReceiver.isPreambleSent = true;
-
-    csrSizeRequest.mediaSamplerConfigChanged = false;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto mediaSamplerConfigNotChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flags, *pDevice);
-
-    csrSizeRequest.mediaSamplerConfigChanged = true;
-    commandStreamReceiver.overrideCsrSizeReqFlags(csrSizeRequest);
-    auto mediaSamplerConfigChangedSize = commandStreamReceiver.getRequiredCmdStreamSize(flags, *pDevice);
-
-    EXPECT_NE(mediaSamplerConfigChangedSize, mediaSamplerConfigNotChangedSize);
-    auto difference = mediaSamplerConfigChangedSize - mediaSamplerConfigNotChangedSize;
-
-    size_t expectedDifference = sizeof(PIPELINE_SELECT);
-    if (MemorySynchronizationCommands<FamilyType>::isBarrierPriorToPipelineSelectWaRequired(pDevice->getRootDeviceEnvironment())) {
-        expectedDifference += sizeof(PIPE_CONTROL);
-    }
-
-    EXPECT_EQ(expectedDifference, difference);
-}
-
 HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCsrWhenSamplerCacheFlushSentThenRequiredCsrSizeContainsPipecontrolSize) {
-    typedef typename FamilyType::PIPELINE_SELECT PIPELINE_SELECT;
     UltCommandStreamReceiver<FamilyType> &commandStreamReceiver = (UltCommandStreamReceiver<FamilyType> &)pDevice->getGpgpuCommandStreamReceiver();
     CsrSizeRequestFlags csrSizeRequest = {};
     DispatchFlags flags = DispatchFlagsHelper::createDefaultDispatchFlags();
@@ -1181,12 +929,11 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCsrWhenSamplerCacheFlushSentT
     EXPECT_EQ(sizeof(typename FamilyType::PIPE_CONTROL), difference);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenCsrInNonDirtyStateWhenflushTaskIsCalledThenNoFlushIsCalled) {
+HWCMDTEST_TEMPLATED_F(IGFX_GEN12LP_CORE, CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenCsrInNonDirtyStateWhenflushTaskIsCalledThenNoFlushIsCalled) {
     CommandQueueHw<FamilyType> commandQueue(nullptr, pClDevice, 0, false);
     auto &commandStream = commandQueue.getCS(4096u);
 
-    auto mockCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(mockCsr);
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     configureCSRtoNonDirtyState<FamilyType>(false);
 
@@ -1202,17 +949,16 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenCsrInNonDi
                        dispatchFlags,
                        *pDevice);
 
-    EXPECT_EQ(0, mockCsr->flushCalledCount);
+    EXPECT_EQ(0u, mockCsr->flushCalledCount);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenCsrInNonDirtyStateAndBatchingModeWhenflushTaskIsCalledWithDisabledPreemptionThenSubmissionIsNotRecorded) {
+HWCMDTEST_TEMPLATED_F(IGFX_GEN12LP_CORE, CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenCsrInNonDirtyStateAndBatchingModeWhenflushTaskIsCalledWithDisabledPreemptionThenSubmissionIsNotRecorded) {
     CommandQueueHw<FamilyType> commandQueue(nullptr, pClDevice, 0, false);
     auto &commandStream = commandQueue.getCS(4096u);
 
-    auto mockCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(mockCsr);
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
-    mockCsr->overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    mockCsr->overrideDispatchPolicy(DispatchMode::batchedDispatch);
 
     auto mockedSubmissionsAggregator = new MockSubmissionsAggregator();
     mockCsr->overrideSubmissionAggregator(mockedSubmissionsAggregator);
@@ -1231,7 +977,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenCsrInNonDi
                        dispatchFlags,
                        *pDevice);
 
-    EXPECT_EQ(0, mockCsr->flushCalledCount);
+    EXPECT_EQ(0u, mockCsr->flushCalledCount);
 
     EXPECT_TRUE(mockedSubmissionsAggregator->peekCmdBufferList().peekIsEmpty());
 
@@ -1240,10 +986,14 @@ HWCMDTEST_F(IGFX_GEN8_CORE, CommandStreamReceiverFlushTaskTests, givenCsrInNonDi
     EXPECT_EQ(0u, surfacesForResidency.size());
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFlushTaskIsCalledThenInitializePageTableManagerRegister) {
-    auto csr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenCommandStreamReceiverWhenFlushTaskIsCalledThenInitializePageTableManagerRegister) {
+    auto csr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
+
+    if (csr->getHeaplessModeEnabled()) {
+        GTEST_SKIP();
+    }
+
     auto csr2 = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(csr);
 
     MockGmmPageTableMngr *pageTableManager = new MockGmmPageTableMngr();
     csr->pageTableManager.reset(pageTableManager);
@@ -1280,10 +1030,9 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenFlus
     EXPECT_EQ(csr2, pageTableManager2->initContextAuxTableRegisterParamsPassed[0].initialBBHandle);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCallBlitBufferThenPageTableManagerInitializedForProperCsr) {
-    auto bcsCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenPageTableManagerPointerWhenCallBlitBufferThenPageTableManagerInitializedForProperCsr) {
+    auto bcsCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
     auto bcsCsr2 = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(bcsCsr);
 
     MockGmmPageTableMngr *pageTableManager = new MockGmmPageTableMngr();
     bcsCsr->pageTableManager.reset(pageTableManager);
@@ -1296,21 +1045,14 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCa
     EXPECT_FALSE(bcsCsr->pageTableManagerInitialized);
     EXPECT_FALSE(bcsCsr2->pageTableManagerInitialized);
 
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(graphicsAllocation,               // dstAllocation
-                                                                     graphicsAllocation,               // srcAllocation
-                                                                     0,                                // dstOffset
-                                                                     0,                                // srcOffset
-                                                                     0,                                // copySize
-                                                                     0,                                // srcRowPitch
-                                                                     0,                                // srcSlicePitch
-                                                                     0,                                // dstRowPitch
-                                                                     0,                                // dstSlicePitch
-                                                                     bcsCsr->getClearColorAllocation() // clearColorAllocation
-    );
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        graphicsAllocation, 0,
+        graphicsAllocation, 0,
+        0, 0, 0, 0, 0, 0, 0, bcsCsr->getClearColorAllocation(), false);
     BlitPropertiesContainer container;
     container.push_back(blitProperties);
 
-    bcsCsr->flushBcsTask(container, true, false, *pDevice);
+    bcsCsr->flushBcsTask(container, true, *pDevice);
 
     EXPECT_TRUE(bcsCsr->pageTableManagerInitialized);
     EXPECT_FALSE(bcsCsr2->pageTableManagerInitialized);
@@ -1319,7 +1061,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCa
     EXPECT_EQ(bcsCsr, pageTableManager->initContextAuxTableRegisterParamsPassed[0].initialBBHandle);
 
     pDevice->resetCommandStreamReceiver(bcsCsr2);
-    bcsCsr2->flushBcsTask(container, true, false, *pDevice);
+    bcsCsr2->flushBcsTask(container, true, *pDevice);
 
     EXPECT_TRUE(bcsCsr2->pageTableManagerInitialized);
 
@@ -1329,9 +1071,8 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCa
     EXPECT_EQ(bcsCsr2, pageTableManager2->initContextAuxTableRegisterParamsPassed[0].initialBBHandle);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCallBlitBufferAndPageTableManagerInitializedThenNotInitializeAgain) {
-    auto bcsCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(bcsCsr);
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenPageTableManagerPointerWhenCallBlitBufferAndPageTableManagerInitializedThenNotInitializeAgain) {
+    auto bcsCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
 
     MockGmmPageTableMngr *pageTableManager = new MockGmmPageTableMngr();
     bcsCsr->pageTableManager.reset(pageTableManager);
@@ -1341,8 +1082,8 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCa
 
     EXPECT_FALSE(bcsCsr->pageTableManagerInitialized);
 
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(graphicsAllocation,               // dstAllocation
-                                                                     graphicsAllocation,               // srcAllocation
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(graphicsAllocation, 0,            // dstAllocation
+                                                                     graphicsAllocation, 0,            // srcAllocation
                                                                      0,                                // dstOffset
                                                                      0,                                // srcOffset
                                                                      0,                                // copySize
@@ -1351,15 +1092,16 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCa
                                                                      0,                                // dstRowPitch
                                                                      0,                                // dstSlicePitch
                                                                      bcsCsr->getClearColorAllocation() // clearColorAllocation
-    );
+                                                                     ,
+                                                                     false);
     BlitPropertiesContainer container;
     container.push_back(blitProperties);
 
-    bcsCsr->flushBcsTask(container, true, false, *pDevice);
+    bcsCsr->flushBcsTask(container, true, *pDevice);
 
     EXPECT_TRUE(bcsCsr->pageTableManagerInitialized);
 
-    bcsCsr->flushBcsTask(container, true, false, *pDevice);
+    bcsCsr->flushBcsTask(container, true, *pDevice);
 
     memoryManager->freeGraphicsMemory(graphicsAllocation);
 
@@ -1368,10 +1110,9 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenPageTableManagerPointerWhenCa
     EXPECT_EQ(bcsCsr, pageTableManager->initContextAuxTableRegisterParamsPassed[0].initialBBHandle);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenNullPageTableManagerWhenCallBlitBufferThenPageTableManagerIsNotInitialized) {
-    auto bcsCsr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenNullPageTableManagerWhenCallBlitBufferThenPageTableManagerIsNotInitialized) {
+    auto bcsCsr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
     auto bcsCsr2 = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(bcsCsr);
 
     bcsCsr->pageTableManager.reset(nullptr);
     bcsCsr2->pageTableManager.reset(nullptr);
@@ -1382,8 +1123,8 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenNullPageTableManagerWhenCallB
     EXPECT_FALSE(bcsCsr->pageTableManagerInitialized);
     EXPECT_FALSE(bcsCsr2->pageTableManagerInitialized);
 
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(graphicsAllocation,               // dstAllocation
-                                                                     graphicsAllocation,               // srcAllocation
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(graphicsAllocation, 0,            // dstAllocation
+                                                                     graphicsAllocation, 0,            // srcAllocation
                                                                      0,                                // dstOffset
                                                                      0,                                // srcOffset
                                                                      0,                                // copySize
@@ -1392,34 +1133,37 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenNullPageTableManagerWhenCallB
                                                                      0,                                // dstRowPitch
                                                                      0,                                // dstSlicePitch
                                                                      bcsCsr->getClearColorAllocation() // clearColorAllocation
-    );
+                                                                     ,
+                                                                     false);
     BlitPropertiesContainer container;
     container.push_back(blitProperties);
 
-    bcsCsr->flushBcsTask(container, true, false, *pDevice);
+    bcsCsr->flushBcsTask(container, true, *pDevice);
 
     EXPECT_FALSE(bcsCsr->pageTableManagerInitialized);
     EXPECT_FALSE(bcsCsr2->pageTableManagerInitialized);
 
     pDevice->resetCommandStreamReceiver(bcsCsr2);
-    bcsCsr2->flushBcsTask(container, true, false, *pDevice);
+    bcsCsr2->flushBcsTask(container, true, *pDevice);
 
     EXPECT_FALSE(bcsCsr2->pageTableManagerInitialized);
 
     bcsCsr2->pageTableManagerInitialized = true;
-    EXPECT_NO_THROW(bcsCsr2->flushBcsTask(container, true, false, *pDevice));
+    EXPECT_NO_THROW(bcsCsr2->flushBcsTask(container, true, *pDevice));
 
     memoryManager->freeGraphicsMemory(graphicsAllocation);
 }
 
-HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenInitializingPageTableManagerRegisterFailsThenPageTableManagerIsNotInitialized) {
-    auto csr = new MockCsrHw2<FamilyType>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
-    pDevice->resetCommandStreamReceiver(csr);
+HWTEST_TEMPLATED_F(CommandStreamReceiverFlushTaskTestsWithMockCsrHw2, givenCommandStreamReceiverWhenInitializingPageTableManagerRegisterFailsThenPageTableManagerIsNotInitialized) {
+    auto csr = static_cast<MockCsrHw2<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver());
+    if (csr->getHeaplessModeEnabled()) {
+        GTEST_SKIP();
+    }
 
     MockGmmPageTableMngr *pageTableManager = new MockGmmPageTableMngr();
     csr->pageTableManager.reset(pageTableManager);
 
-    pageTableManager->initContextAuxTableRegisterResult = GMM_ERROR;
+    pageTableManager->initContextAuxTableRegisterResult = false;
 
     auto memoryManager = pDevice->getMemoryManager();
     auto graphicsAllocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{pDevice->getRootDeviceIndex(), MemoryConstants::pageSize});
@@ -1444,7 +1188,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, givenCommandStreamReceiverWhenInit
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, WhenCsrIsMarkedWithNewResourceThenCallBatchedSubmission) {
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    commandStreamReceiver.dispatchMode = DispatchMode::BatchedDispatch;
+    commandStreamReceiver.dispatchMode = DispatchMode::batchedDispatch;
     commandStreamReceiver.newResources = true;
 
     flushTask(commandStreamReceiver);
@@ -1454,7 +1198,7 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, WhenCsrIsMarkedWithNewResourceThen
 
 HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenGpuIsIdleWhenCsrIsEnabledToFlushOnGpuIdleThenCallBatchedSubmission) {
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    commandStreamReceiver.dispatchMode = DispatchMode::BatchedDispatch;
+    commandStreamReceiver.dispatchMode = DispatchMode::batchedDispatch;
     commandStreamReceiver.useGpuIdleImplicitFlush = true;
     commandStreamReceiver.taskCount = 1u;
     *commandStreamReceiver.getTagAddress() = 1u;
@@ -1466,17 +1210,13 @@ HWTEST_F(CommandStreamReceiverFlushTaskTests, GivenGpuIsIdleWhenCsrIsEnabledToFl
     *commandStreamReceiver.getTagAddress() = 2u;
 }
 
-using SingleRootDeviceCommandStreamReceiverTests = CommandStreamReceiverFlushTaskTests;
+using SingleRootDeviceCommandStreamReceiverTests = UltCommandStreamReceiverTestWithCsr<MockCommandStreamReceiver>;
 
 HWTEST_F(SingleRootDeviceCommandStreamReceiverTests, givenMultipleEventInSingleRootDeviceEnvironmentWhenTheyArePassedToEnqueueWithoutSubmissionThenSemaphoreWaitCommandIsNotProgrammed) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
     auto deviceFactory = std::make_unique<UltClDeviceFactory>(1, 0);
     auto device0 = deviceFactory->rootDevices[0];
-
-    auto mockCsr0 = new MockCommandStreamReceiver(*device0->executionEnvironment, device0->getRootDeviceIndex(), device0->getDeviceBitfield());
-
-    device0->resetCommandStreamReceiver(mockCsr0);
 
     cl_device_id devices[] = {device0};
 

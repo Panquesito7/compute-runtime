@@ -1,0 +1,55 @@
+/*
+ * Copyright (C) 2018-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/test/common/helpers/test_files.h"
+#include "shared/test/common/tests_configuration.h"
+
+#include "opencl/source/platform/platform.h"
+#include "opencl/test/unit_test/ult_config_listener.h"
+
+namespace NEO {
+const char *apiName = "OCL";
+}
+using namespace NEO;
+
+void applyWorkarounds() {
+    platformsImpl = new std::vector<std::unique_ptr<Platform>>;
+    leoPlatformEntries = new std::vector<LeoPlatformEntry>;
+    platformsImpl->reserve(8);
+}
+
+void cleanTestHelpers() {
+    delete platformsImpl;
+}
+
+void setupTestFiles(std::string testBinaryFiles, int32_t revId) {
+    testBinaryFiles.append("/");
+    testBinaryFiles.append(binaryNameSuffix);
+    testBinaryFiles.append("/");
+    testBinaryFiles.append(std::to_string(revId));
+    testBinaryFiles.append("/");
+    testBinaryFiles.append(testFiles);
+    testFiles = testBinaryFiles;
+}
+
+std::string getBaseExecutionDir() {
+    if (!isAubTestMode(testMode)) {
+        return "opencl/";
+    }
+    return "";
+}
+
+bool isChangeDirectoryRequired() {
+    return testMode == TestMode::aubTests;
+}
+
+void addUltListener(::testing::TestEventListeners &listeners) {
+    listeners.Append(new UltConfigListener);
+}
+
+void populateApiSpecificVirtualFileList(const NEO::HardwareInfo &hwInfo) {
+}

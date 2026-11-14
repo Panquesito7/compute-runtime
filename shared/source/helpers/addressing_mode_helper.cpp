@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,12 +14,12 @@
 
 namespace NEO::AddressingModeHelper {
 
-bool failBuildProgramWithStatefulAccess(const RootDeviceEnvironment &rootDeviceEnvironment) {
+bool failBuildProgramWithBufferStatefulAccess(const RootDeviceEnvironment &rootDeviceEnvironment) {
     const auto &compilerProductHelper = rootDeviceEnvironment.getHelper<CompilerProductHelper>();
 
-    auto failBuildProgram = compilerProductHelper.failBuildProgramWithStatefulAccessPreference();
-    if (NEO::DebugManager.flags.FailBuildProgramWithStatefulAccess.get() != -1) {
-        failBuildProgram = static_cast<bool>(NEO::DebugManager.flags.FailBuildProgramWithStatefulAccess.get());
+    auto failBuildProgram = compilerProductHelper.failBuildProgramWithBufferStatefulAccessPreference();
+    if (NEO::debugManager.flags.FailBuildProgramWithStatefulAccess.get() != -1) {
+        failBuildProgram = static_cast<bool>(NEO::debugManager.flags.FailBuildProgramWithStatefulAccess.get());
     }
 
     auto forceToStatelessRequired = compilerProductHelper.isForceToStatelessRequired();
@@ -28,16 +28,13 @@ bool failBuildProgramWithStatefulAccess(const RootDeviceEnvironment &rootDeviceE
 }
 
 inline bool argPointerIsStateful(const ArgDescriptor &arg) {
-    return arg.is<NEO::ArgDescriptor::ArgTPointer>() &&
+    return arg.is<NEO::ArgDescriptor::argTPointer>() &&
            (NEO::isValidOffset(arg.as<NEO::ArgDescPointer>().bindless) ||
             NEO::isValidOffset(arg.as<NEO::ArgDescPointer>().bindful));
 }
 
-bool containsStatefulAccess(const KernelDescriptor &kernelDescriptor, bool skipLastExplicitArg) {
+bool containsBufferStatefulAccess(const KernelDescriptor &kernelDescriptor) {
     auto size = static_cast<int32_t>(kernelDescriptor.payloadMappings.explicitArgs.size());
-    if (skipLastExplicitArg) {
-        size--;
-    }
     for (auto i = 0; i < size; i++) {
         if (argPointerIsStateful(kernelDescriptor.payloadMappings.explicitArgs[i])) {
             return true;
@@ -46,9 +43,39 @@ bool containsStatefulAccess(const KernelDescriptor &kernelDescriptor, bool skipL
     return false;
 }
 
-bool containsStatefulAccess(const std::vector<KernelInfo *> &kernelInfos, bool skipLastExplicitArg) {
+bool containsBufferStatefulAccess(const std::vector<KernelInfo *> &kernelInfos) {
     for (const auto &kernelInfo : kernelInfos) {
-        if (containsStatefulAccess(kernelInfo->kernelDescriptor, skipLastExplicitArg)) {
+        if (containsBufferStatefulAccess(kernelInfo->kernelDescriptor)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool argIsStateful(const ArgDescriptor &arg) {
+    if (arg.is<NEO::ArgDescriptor::argTPointer>()) {
+        return (NEO::isValidOffset(arg.as<NEO::ArgDescPointer>().bindless) || NEO::isValidOffset(arg.as<NEO::ArgDescPointer>().bindful));
+    } else if (arg.is<NEO::ArgDescriptor::argTImage>()) {
+        return (NEO::isValidOffset(arg.as<NEO::ArgDescImage>().bindless) || NEO::isValidOffset(arg.as<NEO::ArgDescImage>().bindful));
+    } else if (arg.is<NEO::ArgDescriptor::argTSampler>()) {
+        return (NEO::isValidOffset(arg.as<NEO::ArgDescSampler>().bindless) || NEO::isValidOffset(arg.as<NEO::ArgDescSampler>().bindful));
+    }
+    return false;
+}
+
+bool containsStatefulAccess(const KernelDescriptor &kernelDescriptor) {
+    auto size = static_cast<int32_t>(kernelDescriptor.payloadMappings.explicitArgs.size());
+    for (auto i = 0; i < size; i++) {
+        if (argIsStateful(kernelDescriptor.payloadMappings.explicitArgs[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool containsBindlessKernel(const std::vector<KernelInfo *> &kernelInfos) {
+    for (const auto &kernelInfo : kernelInfos) {
+        if (NEO::KernelDescriptor::isBindlessAddressingKernel(kernelInfo->kernelDescriptor)) {
             return true;
         }
     }

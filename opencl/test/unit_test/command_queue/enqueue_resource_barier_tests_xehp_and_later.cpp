@@ -1,23 +1,21 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/mocks/mock_timestamp_container.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/resource_barrier.h"
-#include "opencl/source/event/event_builder.h"
-#include "opencl/source/event/user_event.h"
+#include "opencl/source/event/event.h"
+#include "opencl/source/helpers/base_object.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/resource_surface.h"
 #include "opencl/test/unit_test/fixtures/enqueue_handler_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 
 namespace NEO {
 
@@ -36,7 +34,7 @@ using EnqueueResourceBarrierTestXeHpCoreAndLater = EnqueueHandlerTest;
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, EnqueueResourceBarrierTestXeHpCoreAndLater, GivenCommandStreamWithoutKernelAndTimestampPacketEnabledWhenEnqueuedResourceBarrierWithEventThenTimestampAddedToEvent) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableTimestampPacket.set(1);
+    debugManager.flags.EnableTimestampPacket.set(1);
     pDevice->getUltCommandStreamReceiver<FamilyType>().timestampPacketWriteEnabled = true;
     std::unique_ptr<MockCommandQueueWithCacheFlush<FamilyType>> mockCmdQ(new MockCommandQueueWithCacheFlush<FamilyType>(context, pClDevice, 0));
     mockCmdQ->commandRequireCacheFlush = true;
@@ -80,7 +78,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, EnqueueResourceBarrierTestXeHpCoreAndLater, GivenCo
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, EnqueueResourceBarrierTestXeHpCoreAndLater, GivenCommandStreamWithoutKernelAndTimestampPacketDisabledWhenEnqueuedResourceBarrierWithEventThenTimestampNotAddedToEvent) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableTimestampPacket.set(0);
+    debugManager.flags.EnableTimestampPacket.set(0);
     static_cast<UltCommandStreamReceiver<FamilyType> *>(&pDevice->getGpgpuCommandStreamReceiver())->timestampPacketWriteEnabled = false;
     std::unique_ptr<MockCommandQueueWithCacheFlush<FamilyType>> mockCmdQ(new MockCommandQueueWithCacheFlush<FamilyType>(context, pClDevice, 0));
     mockCmdQ->commandRequireCacheFlush = true;

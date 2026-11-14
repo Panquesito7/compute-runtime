@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,17 +8,19 @@
 #include "level_zero/tools/source/sysman/events/linux/os_events_imp.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/utilities/directory.h"
 
-#include "level_zero/tools/source/sysman/events/events_imp.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/sysman/source/device/sysman_device_imp.h"
+#include "level_zero/tools/source/sysman/global_operations/global_operations.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_driver_imp.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
-#include "level_zero/tools/source/sysman/memory/linux/os_memory_imp_prelim.h"
-
-#include <sys/stat.h>
+#include "level_zero/tools/source/sysman/ras/ras.h"
+#include "level_zero/tools/source/sysman/sysman.h"
+#include "level_zero/tools/source/sysman/sysman_imp.h"
+#include "level_zero/tools/source/sysman/sysman_steady_clock.h"
 
 namespace L0 {
-
 const std::string LinuxEventsUtil::add("add");
 const std::string LinuxEventsUtil::remove("remove");
 const std::string LinuxEventsUtil::change("change");
@@ -36,12 +38,12 @@ ze_result_t LinuxEventsImp::eventRegister(zes_event_type_flags_t events) {
         return ZE_RESULT_ERROR_INVALID_ENUMERATION;
     }
 
-    if (GlobalOsSysmanDriver == nullptr) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "%s", "Os Sysman driver not initialized\n");
+    if (globalOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman driver not initialized\n");
         return ZE_RESULT_ERROR_UNINITIALIZED;
     }
-    static_cast<LinuxSysmanDriverImp *>(GlobalOsSysmanDriver)->eventRegister(events, pLinuxSysmanImp->getSysmanDeviceImp());
+    static_cast<LinuxSysmanDriverImp *>(globalOsSysmanDriver)->eventRegister(events, pLinuxSysmanImp->getSysmanDeviceImp());
     return ZE_RESULT_SUCCESS;
 }
 
@@ -98,56 +100,45 @@ void LinuxEventsUtil::eventRegister(zes_event_type_flags_t events, SysmanDeviceI
         this->init();
     });
 
-    zes_event_type_flags_t prevRegisteredEvents = 0;
-    if (deviceEventsMap.find(pSysmanDevice) != deviceEventsMap.end()) {
-        prevRegisteredEvents = deviceEventsMap[pSysmanDevice];
-    }
-
     eventsMutex.lock();
+    auto &registeredEvents = deviceEventsMap[pSysmanDevice];
+    const zes_event_type_flags_t prevRegisteredEvents = registeredEvents;
     if (!events) {
         // If user is trying to register events with empty events argument, then clear all the registered events
-        if (deviceEventsMap.find(pSysmanDevice) != deviceEventsMap.end()) {
-            deviceEventsMap[pSysmanDevice] = events;
-        } else {
-            deviceEventsMap.emplace(pSysmanDevice, events);
-        }
+        registeredEvents = events;
     } else {
-        zes_event_type_flags_t registeredEvents = 0;
         // supportedEventMask --> this mask checks for events that supported currently
         zes_event_type_flags_t supportedEventMask = ZES_EVENT_TYPE_FLAG_FABRIC_PORT_HEALTH | ZES_EVENT_TYPE_FLAG_DEVICE_DETACH |
                                                     ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH | ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED |
                                                     ZES_EVENT_TYPE_FLAG_MEM_HEALTH | ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS |
                                                     ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS;
-        if (deviceEventsMap.find(pSysmanDevice) != deviceEventsMap.end()) {
-            registeredEvents = deviceEventsMap[pSysmanDevice];
-        }
         registeredEvents |= (events & supportedEventMask);
-        deviceEventsMap.emplace(pSysmanDevice, registeredEvents);
     }
 
     // Write to Pipe only if eventregister() is called during listen and previously registered events are modified.
-    if ((pipeFd[1] != -1) && (prevRegisteredEvents != deviceEventsMap[pSysmanDevice])) {
+    if ((pipeFd[1] != -1) && (prevRegisteredEvents != registeredEvents)) {
         uint8_t value = 0x00;
         if (NEO::SysCalls::write(pipeFd[1], &value, 1) < 0) {
-            NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                                  "%s", "Write to Pipe failed\n");
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "%s", "Write to Pipe failed\n");
         }
     }
     eventsMutex.unlock();
 }
 
 void LinuxEventsUtil::init() {
-    pUdevLib = static_cast<LinuxSysmanDriverImp *>(GlobalOsSysmanDriver)->getUdevLibHandle();
+    pUdevLib = static_cast<LinuxSysmanDriverImp *>(globalOsSysmanDriver)->getUdevLibHandle();
 }
 
 ze_result_t LinuxEventsUtil::eventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents) {
     memset(pEvents, 0, count * sizeof(zes_event_type_flags_t));
+    *pNumDeviceEvents = 0;
     std::vector<zes_event_type_flags_t> registeredEvents(count);
     for (uint32_t devIndex = 0; devIndex < count; devIndex++) {
         auto device = static_cast<SysmanDeviceImp *>(L0::SysmanDevice::fromHandle(phDevices[devIndex]));
         eventsMutex.lock();
-        if (deviceEventsMap.find(device) != deviceEventsMap.end()) {
-            registeredEvents[devIndex] = deviceEventsMap[device];
+        if (auto it = deviceEventsMap.find(device); it != deviceEventsMap.end()) {
+            registeredEvents[devIndex] = it->second;
         }
         eventsMutex.unlock();
         if (registeredEvents[devIndex]) {
@@ -262,16 +253,16 @@ void LinuxEventsUtil::getDevIndexToDevPathMap(std::vector<zes_event_type_flags_t
                 // Example of DEVPATH: /devices/pci0000:97/0000:97:02.0/0000:98:00.0/0000:99:01.0/0000:9a:00.0/i915.iaf.0
                 const auto loc = bdf.find("/devices");
                 if (loc == std::string::npos) {
-                    NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                                          "%s", "Invalid device path\n");
+                    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                                 "%s", "Invalid device path\n");
                     continue;
                 }
 
                 bdf = bdf.substr(loc);
-                mapOfDevIndexToDevPath.insert({devIndex, bdf});
+                mapOfDevIndexToDevPath.emplace(devIndex, bdf);
             } else {
-                NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                                      "%s", "Failed to get real path of device\n");
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                             "%s", "Failed to get real path of device\n");
             }
         }
     }
@@ -327,8 +318,8 @@ bool LinuxEventsUtil::listenSystemEvents(zes_event_type_flags_t *pEvents, uint32
     std::map<uint32_t, std::string> mapOfDevIndexToDevPath = {};
 
     if (pUdevLib == nullptr) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "%s", "libudev library instantiation failed\n");
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "libudev library instantiation failed\n");
         return retval;
     }
 
@@ -340,8 +331,8 @@ bool LinuxEventsUtil::listenSystemEvents(zes_event_type_flags_t *pEvents, uint32
 
     eventsMutex.lock();
     if (NEO::SysCalls::pipe(pipeFd) < 0) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "%s", "Creation of pipe failed\n");
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Creation of pipe failed\n");
     }
 
     pfd[1].fd = pipeFd[0];
@@ -359,7 +350,9 @@ bool LinuxEventsUtil::listenSystemEvents(zes_event_type_flags_t *pEvents, uint32
                 if (pfd[i].fd == pipeFd[0]) {
                     eventsMutex.lock();
                     uint8_t dummy;
-                    NEO::SysCalls::read(pipeFd[0], &dummy, 1);
+                    ssize_t pipeReadRet = NEO::SysCalls::read(pipeFd[0], &dummy, 1);
+                    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get() && (pipeReadRet < 0),
+                                 stderr, "read() on event pipe fd=%d failed errno=%d\n", pipeFd[0], errno);
                     mapOfDevIndexToDevPath.clear();
                     getDevIndexToDevPathMap(registeredEvents, count, phDevices, mapOfDevIndexToDevPath);
                     eventsMutex.unlock();

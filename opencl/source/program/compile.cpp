@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,19 +8,14 @@
 #include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/compiler_interface/compiler_warnings/compiler_warnings.h"
-#include "shared/source/compiler_interface/external_functions.h"
-#include "shared/source/compiler_interface/linker.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
 #include "shared/source/device_binary_format/elf/elf.h"
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
 #include "shared/source/device_binary_format/elf/ocl_elf.h"
-#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/helpers/compiler_options_parser.h"
-#include "shared/source/source_level_debugger/source_level_debugger.h"
 
 #include "opencl/source/cl_device/cl_device.h"
-#include "opencl/source/helpers/cl_validators.h"
-#include "opencl/source/platform/platform.h"
 
 #include "program.h"
 
@@ -40,7 +35,7 @@ cl_int Program::compile(
     UNRECOVERABLE_IF(defaultClDevice == nullptr);
     auto &defaultDevice = defaultClDevice->getDevice();
     auto internalOptions = getInternalOptions();
-    std::unordered_map<uint32_t, bool> sourceLevelDebuggerNotified;
+
     do {
         if (numInputHeaders == 0) {
             if ((headerIncludeNames != nullptr) || (inputHeaders != nullptr)) {
@@ -59,12 +54,11 @@ cl_int Program::compile(
             break;
         }
 
-        if ((createdFrom == CreatedFrom::IL) || std::all_of(deviceVector.begin(), deviceVector.end(), [&](auto device) { return CL_PROGRAM_BINARY_TYPE_INTERMEDIATE == deviceBuildInfos[device].programBinaryType; })) {
+        if ((createdFrom == CreatedFrom::il) || std::all_of(deviceVector.begin(), deviceVector.end(), [&](auto device) { return CL_PROGRAM_BINARY_TYPE_INTERMEDIATE == deviceBuildInfos[device].programBinaryType; })) {
             retVal = CL_SUCCESS;
             break;
         }
         for (const auto &device : deviceVector) {
-            sourceLevelDebuggerNotified[device->getRootDeviceIndex()] = false;
             deviceBuildInfos[device].buildStatus = CL_BUILD_IN_PROGRESS;
         }
 
@@ -120,28 +114,16 @@ cl_int Program::compile(
         // set parameters for compilation
         std::string extensions = requiresOpenClCFeatures(options) ? defaultClDevice->peekCompilerExtensionsWithFeatures()
                                                                   : defaultClDevice->peekCompilerExtensions();
-        if (requiresAdditionalExtensions(options)) {
-            extensions.erase(extensions.length() - 1);
-            extensions += ",+cl_khr_3d_image_writes ";
-        }
+
+        appendAdditionalExtensions(extensions, options, internalOptions);
         CompilerOptions::concatenateAppend(internalOptions, extensions);
 
-        if (isKernelDebugEnabled()) {
-            for (const auto &device : deviceVector) {
-                if (sourceLevelDebuggerNotified[device->getRootDeviceIndex()]) {
-                    continue;
-                }
-                std::string filename;
-                appendKernelDebugOptions(*device, internalOptions);
-                notifyDebuggerWithSourceCode(*device, filename);
-                prependFilePathToOptions(filename);
-
-                sourceLevelDebuggerNotified[device->getRootDeviceIndex()] = true;
-            }
+        if (!this->getIsBuiltIn() && debugManager.flags.EnableDivergentBarrierHandling.get()) {
+            CompilerOptions::concatenateAppend(internalOptions, CompilerOptions::enableDivergentBarriers);
         }
 
-        if (!this->getIsBuiltIn() && DebugManager.flags.InjectInternalBuildOptions.get() != "unk") {
-            NEO::CompilerOptions::concatenateAppend(internalOptions, NEO::DebugManager.flags.InjectInternalBuildOptions.get());
+        if (!this->getIsBuiltIn() && NEO::debugManager.flags.InjectInternalBuildOptions.get() != "unk") {
+            NEO::CompilerOptions::concatenateAppend(internalOptions, NEO::debugManager.flags.InjectInternalBuildOptions.get());
         }
 
         inputArgs.src = ArrayRef<const char>(reinterpret_cast<const char *>(compileData.data()), compileData.size());

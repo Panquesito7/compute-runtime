@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -48,23 +48,22 @@ class SysmanDeviceSchedulerFixture : public SysmanDeviceFixture {
         pSysfsAccess = std::make_unique<MockSchedulerSysfsAccess>();
         pSysfsAccess->deviceNames = {"card0", "controlD64", "renderD128"};
         pLinuxSysmanImp->pSysfsAccess = pSysfsAccess.get();
-        for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-                 [=](std::string engineName) {
-                     pSysfsAccess->setFileProperties(engineName, defaultPreemptTimeoutMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-                     pSysfsAccess->setFileProperties(engineName, defaultTimesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-                     pSysfsAccess->setFileProperties(engineName, defaultHeartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-                     pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-                     pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-                     pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+        for (const auto &engineName : listOfMockedEngines) {
+            pSysfsAccess->setFileProperties(engineName, defaultPreemptTimeoutMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+            pSysfsAccess->setFileProperties(engineName, defaultTimesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+            pSysfsAccess->setFileProperties(engineName, defaultHeartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+            pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+            pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+            pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
 
-                     pSysfsAccess->write(engineDir + "/" + engineName + "/" + defaultPreemptTimeoutMilliSecs, defaultTimeoutMilliSecs);
-                     pSysfsAccess->write(engineDir + "/" + engineName + "/" + defaultTimesliceDurationMilliSecs, defaultTimesliceMilliSecs);
-                     pSysfsAccess->write(engineDir + "/" + engineName + "/" + defaultHeartbeatIntervalMilliSecs, defaultHeartbeatMilliSecs);
-                     pSysfsAccess->write(engineDir + "/" + engineName + "/" + preemptTimeoutMilliSecs, timeoutMilliSecs);
-                     pSysfsAccess->write(engineDir + "/" + engineName + "/" + timesliceDurationMilliSecs, timesliceMilliSecs);
-                     pSysfsAccess->write(engineDir + "/" + engineName + "/" + heartbeatIntervalMilliSecs, heartbeatMilliSecs);
-                     pSysfsAccess->write(enableEuDebug, 0);
-                 });
+            pSysfsAccess->write(engineDir + "/" + engineName + "/" + defaultPreemptTimeoutMilliSecs, defaultTimeoutMilliSecs);
+            pSysfsAccess->write(engineDir + "/" + engineName + "/" + defaultTimesliceDurationMilliSecs, defaultTimesliceMilliSecs);
+            pSysfsAccess->write(engineDir + "/" + engineName + "/" + defaultHeartbeatIntervalMilliSecs, defaultHeartbeatMilliSecs);
+            pSysfsAccess->write(engineDir + "/" + engineName + "/" + preemptTimeoutMilliSecs, timeoutMilliSecs);
+            pSysfsAccess->write(engineDir + "/" + engineName + "/" + timesliceDurationMilliSecs, timesliceMilliSecs);
+            pSysfsAccess->write(engineDir + "/" + engineName + "/" + heartbeatIntervalMilliSecs, heartbeatMilliSecs);
+            pSysfsAccess->write(enableEuDebug, 0);
+        }
         std::string dummy;
         pSysfsAccess->setFileProperties(dummy, enableEuDebug, true, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
         pSysfsAccess->write(enableEuDebug, 0);
@@ -87,7 +86,6 @@ class SysmanDeviceSchedulerFixture : public SysmanDeviceFixture {
         if (!sysmanUltsEnable) {
             GTEST_SKIP();
         }
-        pSysfsAccess->cleanUpMap();
         pLinuxSysmanImp->pSysfsAccess = pSysfsAccessOld;
         SysmanDeviceFixture::TearDown();
     }
@@ -164,6 +162,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenComponentCountZeroWhenCallingzesDevice
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetCurrentModeThenVerifyzesSchedulerGetCurrentModeCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         auto mode = fixtureGetCurrentMode(handle);
         EXPECT_EQ(mode, ZES_SCHED_MODE_TIMESLICE);
     }
@@ -172,6 +171,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetTimeoutModePropertiesThenVerifyzesSchedulerGetTimeoutModePropertiesCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         auto config = fixtureGetTimeoutModeProperties(handle, false);
         EXPECT_EQ(config.watchdogTimeout, expectedHeartbeatTimeoutMicroSecs);
     }
@@ -179,6 +179,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenSomeInvalidSchedulerModeWhenCheckingForCurrentModeThenAPIReportUnknownMode) {
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     auto pSchedulerImp = static_cast<SchedulerImp *>(Scheduler::fromHandle(handles[0]));
     auto pOsScheduler = static_cast<PublicLinuxSchedulerImp *>((pSchedulerImp->pOsScheduler).get());
     uint64_t timeslice = 0, timeout = 0, heartbeat = 3000;
@@ -196,6 +197,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
     pSysfsAccess->write(engineDir + "/" + "vcs1" + "/" + heartbeatIntervalMilliSecs, (heartbeatMilliSecs + 5));
 
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_properties_t properties = {};
         zes_sched_timeout_properties_t config;
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -210,6 +212,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetTimeoutModePropertiesWithDefaultsThenVerifyzesSchedulerGetTimeoutModePropertiesCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         auto config = fixtureGetTimeoutModeProperties(handle, true);
         EXPECT_EQ(config.watchdogTimeout, expectedDefaultHeartbeatTimeoutMicroSecs);
     }
@@ -218,6 +221,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetTimesliceModePropertiesThenVerifyzesSchedulerGetTimesliceModePropertiesCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         auto config = fixtureGetTimesliceModeProperties(handle, false);
         EXPECT_EQ(config.interval, expectedTimesliceMicroSecs);
         EXPECT_EQ(config.yieldTimeout, expectedTimeoutMicroSecs);
@@ -230,6 +234,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
     pSysfsAccess->write(engineDir + "/" + "vcs1" + "/" + preemptTimeoutMilliSecs, (timeoutMilliSecs + 5));
 
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_properties_t properties = {};
         zes_sched_timeslice_properties_t config;
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -247,6 +252,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
     pSysfsAccess->write(engineDir + "/" + "vcs1" + "/" + timesliceDurationMilliSecs, (timesliceMilliSecs + 5));
 
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_properties_t properties = {};
         zes_sched_timeslice_properties_t config;
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -262,6 +268,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
     auto handles = getSchedHandles(handleComponentCount);
 
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_properties_t properties = {};
         zes_sched_timeout_properties_t config;
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -280,6 +287,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
     auto handles = getSchedHandles(handleComponentCount);
 
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_properties_t properties = {};
         zes_sched_timeout_properties_t config;
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -298,6 +306,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_timeslice_properties_t config;
         zes_sched_properties_t properties = {};
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -320,6 +329,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetTimescliceModePropertiesThenVerifyzesSchedulerGetTimescliceModePropertiesForReadFileFailureDueToInsufficientPermissions) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_timeslice_properties_t config;
         zes_sched_properties_t properties = {};
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
@@ -337,6 +347,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetTimesliceModePropertiesWithDefaultsThenVerifyzesSchedulerGetTimesliceModePropertiesCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         auto config = fixtureGetTimesliceModeProperties(handle, true);
         EXPECT_EQ(config.interval, expectedDefaultTimesliceMicroSecs);
         EXPECT_EQ(config.yieldTimeout, expectedDefaultTimeoutMicroSecs);
@@ -346,6 +357,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeThenVerifyzesSchedulerSetTimeoutModeCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setConfig;
         setConfig.watchdogTimeout = 10000u;
@@ -360,12 +372,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenCallingzesSchedulerSetTimeoutModeThenVerifyCallSucceeds) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
 
     // First set compute unit debug mode
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     setComputeUnitDebugModeMock(handles[0]);
 
     // Change mode to ZES_SCHED_MODE_EXCLUSIVE and validate
@@ -378,18 +390,16 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenCallingzesSc
     EXPECT_EQ(getConfig.watchdogTimeout, setConfig.watchdogTimeout);
     auto mode = fixtureGetCurrentMode(handles[0]);
     EXPECT_EQ(mode, ZES_SCHED_MODE_TIMEOUT);
-
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenSettingTimeoutModeAndDebugModeCantBeChangedThenVerifyCallFails) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
-    pMockSchedulerProcfsAccess->listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE; // Expect failure when calling gpuProcessCleanup()
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
+    mockSchedulerProcfsAccess.listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
 
     // First set compute unit debug mode
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     setComputeUnitDebugModeMock(handles[0]);
 
     // Change mode to ZES_SCHED_MODE_EXCLUSIVE and validate
@@ -399,13 +409,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenSettingTimeo
     EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, zesSchedulerSetTimeoutMode(handles[0], &setConfig, &needReboot));
     EXPECT_FALSE(needReboot);
     EXPECT_EQ(ZES_SCHED_MODE_COMPUTE_UNIT_DEBUG, fixtureGetCurrentMode(handles[0]));
-
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeWhenTimeoutLessThanMinimumThenVerifyzesSchedulerSetTimeoutModeCallFails) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setConfig;
         setConfig.watchdogTimeout = minTimeoutModeHeartbeat - 1;
@@ -417,6 +426,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeWhenCurrentModeIsTimeoutModeThenVerifyzesSchedulerSetTimeoutModeCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setTimeOutConfig;
         setTimeOutConfig.watchdogTimeout = 10000u;
@@ -429,12 +439,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeWhenHeartBeatSettingFailsThenVerifyzesSchedulerSetTimeoutModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setTimeOutConfig;
         setTimeOutConfig.watchdogTimeout = 10000u;
@@ -443,12 +453,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeWhenGetCurrentModeFailsThenVerifyzesSchedulerSetTimeoutModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setConfig;
         setConfig.watchdogTimeout = minTimeoutModeHeartbeat;
@@ -458,12 +468,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeWhenPreEmptTimeoutNoPermissionThenVerifyzesSchedulerSetTimeoutModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setConfig;
         setConfig.watchdogTimeout = minTimeoutModeHeartbeat;
@@ -473,12 +483,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimeoutModeWhenTimeSliceDurationNoPermissionThenVerifyzesSchedulerSetTimeoutModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeout_properties_t setConfig;
         setConfig.watchdogTimeout = minTimeoutModeHeartbeat;
@@ -490,6 +500,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimesliceModeThenVerifyzesSchedulerSetTimesliceModeCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = 1000u;
@@ -506,12 +517,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenCallingzesSchedulerSetTimesliceModeThenVerifyCallSucceeds) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
 
     // First set compute unit debug mode
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     setComputeUnitDebugModeMock(handles[0]);
 
     // Change mode to ZES_SCHED_MODE_EXCLUSIVE and validate
@@ -526,18 +537,16 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenCallingzesSc
     EXPECT_EQ(getConfig.yieldTimeout, setConfig.yieldTimeout);
     auto mode = fixtureGetCurrentMode(handles[0]);
     EXPECT_EQ(mode, ZES_SCHED_MODE_TIMESLICE);
-
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenSettingTimesliceModeAndDebugModeCantBeChangedThenVerifyCallFails) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
-    pMockSchedulerProcfsAccess->listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE; // Expect failure when calling gpuProcessCleanup()
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
+    mockSchedulerProcfsAccess.listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
 
     // First set compute unit debug mode
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     setComputeUnitDebugModeMock(handles[0]);
 
     // Change mode to ZES_SCHED_MODE_EXCLUSIVE and validate
@@ -548,17 +557,15 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenSettingTimes
     EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, zesSchedulerSetTimesliceMode(handles[0], &setConfig, &needReboot));
     EXPECT_FALSE(needReboot);
     EXPECT_EQ(ZES_SCHED_MODE_COMPUTE_UNIT_DEBUG, fixtureGetCurrentMode(handles[0]));
-
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenGetCurrentModeFailsWhenCallingzesSchedulerSetTimesliceModeThenVerifyzesSchedulerSetTimesliceModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = 1000u;
@@ -571,6 +578,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenGetCurrentModeFailsWhenCallingzesSched
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimesliceModeWhenIntervalIsLessThanMinimumThenVerifyzesSchedulerSetTimesliceModeCallFails) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = minTimeoutInMicroSeconds - 1;
@@ -581,12 +589,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetTimesliceModeWhenNoAccessToTimeSliceDurationThenVerifyzesSchedulerSetTimesliceModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = minTimeoutInMicroSeconds;
@@ -597,12 +605,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenNoAccessToHeartBeatIntervalWhenSettingTimesliceModeThenThenVerifyzesSchedulerSetTimesliceModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = minTimeoutInMicroSeconds;
@@ -613,12 +621,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenNoAccessToHeartBeatIntervalWhenSetting
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenHeartBeatIntervalFileNotPresentWhenSettingHeartbeatIntervalThenThenCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH);
+    }
 
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     auto pSchedulerImp = static_cast<SchedulerImp *>(Scheduler::fromHandle(handles[0]));
     auto pOsScheduler = static_cast<PublicLinuxSchedulerImp *>((pSchedulerImp->pOsScheduler).get());
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pOsScheduler->setHeartbeatInterval(2000));
@@ -627,6 +635,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenHeartBeatIntervalFileNotPresentWhenSet
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetExclusiveModeThenVerifyCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         ze_result_t result = zesSchedulerSetExclusiveMode(handle, &needReboot);
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -637,12 +646,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenCallingzesSchedulerSetExclusiveModeThenVerifyCallSucceeds) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
 
     // First set compute unit debug mode
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     ze_bool_t needReload;
     setComputeUnitDebugModeMock(handles[0]);
 
@@ -650,18 +659,16 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenCallingzesSc
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesSchedulerSetExclusiveMode(handles[0], &needReload));
     EXPECT_FALSE(needReload);
     EXPECT_EQ(ZES_SCHED_MODE_EXCLUSIVE, fixtureGetCurrentMode(handles[0]));
-
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenSettingExclusiveModeAndDebugModeCantBeChangedThenVerifyCallFails) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
-    pMockSchedulerProcfsAccess->listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE; // Expect failure when calling gpuProcessCleanup()
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
+    mockSchedulerProcfsAccess.listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
 
     // First set compute unit debug mode
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     ze_bool_t needReload;
     setComputeUnitDebugModeMock(handles[0]);
 
@@ -669,17 +676,15 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenCurrentModeIsDebugModeWhenSettingExclu
     EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, zesSchedulerSetExclusiveMode(handles[0], &needReload));
     EXPECT_FALSE(needReload);
     EXPECT_EQ(ZES_SCHED_MODE_COMPUTE_UNIT_DEBUG, fixtureGetCurrentMode(handles[0]));
-
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetExclusiveModeWhenPreEmptTimeoutNotAvailableThenVerifyzesSchedulerSetExclusiveModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         ze_result_t result = zesSchedulerSetExclusiveMode(handle, &needReboot);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -687,12 +692,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetExclusiveModeWhenTimeSliceDurationNotAvailableThenVerifyzesSchedulerSetExclusiveModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         ze_result_t result = zesSchedulerSetExclusiveMode(handle, &needReboot);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -700,12 +705,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetExclusiveModeWhenTimeSliceDurationHasNoPermissionsThenVerifyzesSchedulerSetExclusiveModeCallFails) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRUSR | S_IRGRP | S_IROTH);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         ze_result_t result = zesSchedulerSetExclusiveMode(handle, &needReboot);
         EXPECT_EQ(ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS, result);
@@ -713,12 +718,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetCurrentModeWhenPreEmptTimeOutNotAvailableThenFailureIsReturned) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_mode_t mode;
         ze_result_t result = zesSchedulerGetCurrentMode(handle, &mode);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -726,12 +731,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetCurrentModeWhenTimeSliceDurationNotAvailableThenFailureIsReturned) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_mode_t mode;
         ze_result_t result = zesSchedulerGetCurrentMode(handle, &mode);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -739,12 +744,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetCurrentModeWhenHeartBeatIntervalNotAvailableThenFailureIsReturned) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, heartbeatIntervalMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_mode_t mode;
         ze_result_t result = zesSchedulerGetCurrentMode(handle, &mode);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -752,12 +757,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetCurrentModeWhenTimeSliceDurationHasNoPermissionThenFailureIsReturned) {
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, true, S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_mode_t mode;
         ze_result_t result = zesSchedulerGetCurrentMode(handle, &mode);
         EXPECT_EQ(ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS, result);
@@ -765,11 +770,11 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerSetComputeUnitDebugModeThenSuccessIsReturned) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
 
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     uint64_t val = 0;
     pSysfsAccess->read(enableEuDebug, val);
     EXPECT_EQ(val, 0u);
@@ -781,16 +786,15 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     pSysfsAccess->read(enableEuDebug, val);
     EXPECT_EQ(val, 1u);
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenGpuProcessCleanupFailedWhenCallingzesSchedulerSetComputeUnitDebugModeThenErrorIsReturned) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
-    pMockSchedulerProcfsAccess->listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE; // Expect failure when calling gpuProcessCleanup()
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
+    mockSchedulerProcfsAccess.listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
 
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     uint64_t val = 0;
     pSysfsAccess->read(enableEuDebug, val);
     EXPECT_EQ(val, 0u);
@@ -802,15 +806,14 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenGpuProcessCleanupFailedWhenCallingzesS
     EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
     pSysfsAccess->read(enableEuDebug, val);
     EXPECT_EQ(val, 0u);
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenEuDebugNodeWriteFailsWhenCallingzesSchedulerSetComputeUnitDebugModeThenErrorIsReturned) {
-    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess);
-    auto pMockSchedulerProcfsAccess = new MockSchedulerProcfsAccess;
-    pLinuxSysmanImp->pProcfsAccess = pMockSchedulerProcfsAccess;
+    MockSchedulerProcfsAccess mockSchedulerProcfsAccess;
+    VariableBackup<ProcfsAccess *> backup(&pLinuxSysmanImp->pProcfsAccess, &mockSchedulerProcfsAccess);
 
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     uint64_t val = 0;
     pSysfsAccess->read(enableEuDebug, val);
     EXPECT_EQ(val, 0u);
@@ -828,11 +831,11 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenEuDebugNodeWriteFailsWhenCallingzesSch
     EXPECT_EQ(ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE, result);
     pSysfsAccess->read(enableEuDebug, val);
     EXPECT_EQ(val, 0u);
-    delete pMockSchedulerProcfsAccess;
 }
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenNodeRequiredToEnableEuDebugNotPresentWhenCheckingForDebugModeThenCallReturnsFalse) {
     auto handles = getSchedHandles(handleComponentCount);
+    ASSERT_NE(nullptr, handles[0]);
     auto pSchedulerImp = static_cast<SchedulerImp *>(Scheduler::fromHandle(handles[0]));
     auto pOsScheduler = static_cast<PublicLinuxSchedulerImp *>((pSchedulerImp->pOsScheduler).get());
     std::string dummy;
@@ -845,6 +848,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenPrelimEnableEuDebugNodeNotAvailableWhe
     pSysfsAccess->setFileProperties(dummy, enableEuDebug, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReload;
         ze_result_t result = zesSchedulerSetComputeUnitDebugMode(handle, &needReload);
         EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
@@ -853,12 +857,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenPrelimEnableEuDebugNodeNotAvailableWhe
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenExclusiveModeSetFailWhenCallingzesSchedulerSetComputeUnitDebugModeThenErrorReturned1) {
     // Fail exclusive mode set due to preemptTimeoutMilliSecs file not available
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, preemptTimeoutMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReload;
         ze_result_t result = zesSchedulerSetComputeUnitDebugMode(handle, &needReload);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -867,12 +871,12 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenExclusiveModeSetFailWhenCallingzesSche
 
 TEST_F(SysmanDeviceSchedulerFixture, GivenExclusiveModeSetFailWhenCallingzesSchedulerSetComputeUnitDebugModeThenErrorReturned2) {
     // Fail exclusive mode set due to timesliceDurationMilliSecs file not available
-    for_each(listOfMockedEngines.begin(), listOfMockedEngines.end(),
-             [=](std::string engineName) {
-                 pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
-             });
+    for (const auto &engineName : listOfMockedEngines) {
+        pSysfsAccess->setFileProperties(engineName, timesliceDurationMilliSecs, false, S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR);
+    }
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReload;
         ze_result_t result = zesSchedulerSetComputeUnitDebugMode(handle, &needReload);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -885,6 +889,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_timeout_properties_t config;
         ze_result_t result = zesSchedulerGetTimeoutModeProperties(handle, true, &config);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -897,6 +902,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_timeslice_properties_t config;
         ze_result_t result = zesSchedulerGetTimesliceModeProperties(handle, true, &config);
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -909,6 +915,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = 1000u;
@@ -924,6 +931,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         ze_bool_t needReboot;
         zes_sched_timeslice_properties_t setConfig;
         setConfig.interval = 1000u;
@@ -941,6 +949,7 @@ TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedul
 TEST_F(SysmanDeviceSchedulerFixture, GivenValidDeviceHandleWhenCallingzesSchedulerGetPropertiesThenVerifyzesSchedulerGetPropertiesCallSucceeds) {
     auto handles = getSchedHandles(handleComponentCount);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_sched_properties_t properties = {};
         ze_result_t result = zesSchedulerGetProperties(handle, &properties);
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);

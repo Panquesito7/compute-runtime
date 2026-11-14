@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,12 +8,11 @@
 #pragma once
 
 #include "shared/source/command_stream/transfer_direction.h"
-#include "shared/source/helpers/engine_node_helper.h"
-#include "shared/source/sku_info/sku_info_base.h"
 
 #include "level_zero/core/source/cmdlist/cmdlist_hw_immediate.h"
-#include "level_zero/core/source/cmdqueue/cmdqueue_imp.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue.h"
 #include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/bcs_split_params.h"
 #include "level_zero/core/source/event/event.h"
 
 #include <functional>
@@ -22,120 +21,131 @@
 
 namespace NEO {
 class CommandStreamReceiver;
-}
+enum class TransferDirection;
+enum class EngineUsage : uint32_t;
+} // namespace NEO
 
 namespace L0 {
 struct CommandQueue;
-struct DeviceImp;
+struct Device;
+class BcsSplit;
 
-struct BcsSplit {
-    DeviceImp &device;
+class BcsSplitEvents {
+  public:
+    BcsSplitEvents(BcsSplit &bcsSplit) : bcsSplit(bcsSplit) {}
+
+    bool isAggregatedEventMode() const { return aggregatedEventsMode; }
+    void setAggregatedEventMode(bool mode) { aggregatedEventsMode = mode; }
+    BcsSplitParams::SplitEventPackage *obtainForImmediateSplit(Context *context, size_t maxEventCountInPool);
+    BcsSplitParams::SplitEventPackage *obtainForRecordedSplit(Context *context);
+    void releaseResources();
+    std::lock_guard<std::mutex> obtainLock() { return std::lock_guard<std::mutex>(mtx); }
+    void resetAggregatedEventState(BcsSplitParams::SplitEventPackage &package, bool markerCompleted, bool keepRecordedCmdListReservation);
+    const BcsSplitParams::EventsResources &getEventResources() const { return eventResources; }
+    void resetAggregatedEventsStateForRecordedSubmission(const std::vector<BcsSplitParams::SplitEventPackage *> &packages, bool keepRecordedCmdListReservation);
+
+  protected:
+    BcsSplitParams::SplitEventPackage *acquireAggregatedPackage(Context *context, bool reserveForRecordedCmdList);
+    BcsSplitParams::SplitEventPackage *tryRecyclePoolPackage();
+    BcsSplitParams::SplitEventPackage &acquireOldestPackageBlocking();
+    void resetPoolPackage(BcsSplitParams::SplitEventPackage &package);
+    bool allocatePool(Context *context, size_t maxEventCountInPool, size_t neededEvents);
+    BcsSplitParams::SplitEventPackage *createFromPool(Context *context, size_t maxEventCountInPool);
+    BcsSplitParams::SplitEventPackage *createAggregatedEvents(Context *context);
+    uint64_t *getNextAllocationForAggregatedEvent();
+
+    BcsSplit &bcsSplit;
+
+    BcsSplitParams::EventsResources eventResources;
+
+    std::mutex mtx;
+    bool aggregatedEventsMode = false;
+};
+
+class BcsSplit {
+  public:
+    template <GFXCORE_FAMILY gfxCoreFamily>
+    using AppendCallFuncT = std::function<ze_result_t(CommandListCoreFamily<gfxCoreFamily> *, const BcsSplitParams::CopyParams &, size_t, ze_event_handle_t, uint64_t)>;
+
+    template <typename GfxFamily>
+    static constexpr size_t maxEventCountInPool = MemoryConstants::pageSize64k / sizeof(typename GfxFamily::TimestampPacketType);
+
+    BcsSplitEvents events;
+
+    std::vector<CommandList *> cmdLists;
+    std::vector<CommandList *> h2dCmdLists;
+    std::vector<CommandList *> d2hCmdLists;
+
+    template <GFXCORE_FAMILY gfxCoreFamily>
+    ze_result_t appendImmediateSplitCall(CommandListCoreFamilyImmediate<gfxCoreFamily> *cmdList,
+                                         const BcsSplitParams::CopyParams &copyParams,
+                                         size_t size,
+                                         ze_event_handle_t hSignalEvent,
+                                         uint32_t numWaitEvents,
+                                         ze_event_handle_t *phWaitEvents,
+                                         bool performMigration,
+                                         bool hasRelaxedOrderingDependencies,
+                                         NEO::TransferDirection direction,
+                                         size_t estimatedCmdBufferSize,
+                                         AppendCallFuncT<gfxCoreFamily> appendCall);
+
+    template <GFXCORE_FAMILY gfxCoreFamily>
+    ze_result_t appendRecordedInOrderSplitCall(CommandListCoreFamily<gfxCoreFamily> *cmdList,
+                                               const BcsSplitParams::CopyParams &copyParams,
+                                               size_t size,
+                                               ze_event_handle_t hSignalEvent,
+                                               uint32_t numWaitEvents,
+                                               ze_event_handle_t *phWaitEvents,
+                                               AppendCallFuncT<gfxCoreFamily> appendCall);
+
+    void dispatchRecordedCmdLists(const std::vector<CommandList *> &recordedSubCmdLists);
+
+    bool setupDevice(NEO::CommandStreamReceiver *csr, bool copyOffloadEnabled);
+    void releaseResources();
+    Device &getDevice() const { return device; }
+
+    BcsSplitParams::CmdListsForSplitContainer getCmdListsForSplit(NEO::TransferDirection direction, size_t totalTransferSize);
+
+    BcsSplit(Device &device) : events(*this), device(device) {};
+
+  protected:
+    std::vector<CommandList *> &selectCmdLists(NEO::TransferDirection direction);
+    uint64_t getAggregatedEventIncrementValForSplit(const Event *signalEvent, bool useSignalEventForSplit, size_t engineCountForSplit);
+    void setupEnginesMask();
+    bool setupQueues();
+    void populateCsrsForQueues(BcsSplitParams::CsrContainer &csrs, NEO::EngineUsage engineUsage);
+
+    template <GFXCORE_FAMILY gfxCoreFamily>
+    ze_result_t appendSubSplitCommon(CommandListCoreFamily<gfxCoreFamily> *mainCmdList,
+                                     CommandListCoreFamily<gfxCoreFamily> *subCmdList,
+                                     const BcsSplitParams::CopyParams &copyParams,
+                                     size_t size,
+                                     Event *signalEvent,
+                                     uint32_t numWaitEvents,
+                                     ze_event_handle_t *phWaitEvents,
+                                     ze_event_handle_t subCopyOutEventHandle,
+                                     uint64_t aggregatedEventIncrementVal,
+                                     size_t &totalSize,
+                                     size_t &engineCount,
+                                     bool useSignalEventForSubcopy,
+                                     bool appendStartProfiling,
+                                     AppendCallFuncT<gfxCoreFamily> appendCall);
+
+    template <GFXCORE_FAMILY gfxCoreFamily>
+    void appendPostSubCopySync(CommandListCoreFamily<gfxCoreFamily> *mainCmdList,
+                               StackVec<ze_event_handle_t, 16> &subCopyEvents,
+                               Event *signalEvent,
+                               Event *markerEvent,
+                               bool useSignalEventForSubCopy,
+                               bool hasRelaxedOrderingDependencies);
+
+    Device &device;
+    NEO::BcsSplitSettings splitSettings = {};
     uint32_t clientCount = 0u;
 
     std::mutex mtx;
-
-    struct Events {
-        BcsSplit &bcsSplit;
-
-        std::mutex mtx;
-        std::vector<EventPool *> pools;
-        std::vector<Event *> barrier;
-        std::vector<Event *> subcopy;
-        std::vector<Event *> marker;
-        size_t createdFromLatestPool = 0u;
-
-        size_t obtainForSplit(Context *context, size_t maxEventCountInPool);
-        size_t allocateNew(Context *context, size_t maxEventCountInPool);
-
-        void releaseResources();
-
-        Events(BcsSplit &bcsSplit) : bcsSplit(bcsSplit){};
-    } events;
-
-    std::vector<CommandQueue *> cmdQs;
-    std::vector<CommandQueue *> h2dCmdQs;
-    std::vector<CommandQueue *> d2hCmdQs;
-
-    NEO::BcsInfoMask engines = NEO::EngineHelpers::oddLinkedCopyEnginesMask;
-    NEO::BcsInfoMask h2dEngines = NEO::EngineHelpers::h2dCopyEngineMask;
-    NEO::BcsInfoMask d2hEngines = NEO::EngineHelpers::d2hCopyEngineMask;
-
-    template <GFXCORE_FAMILY gfxCoreFamily, typename T, typename K>
-    ze_result_t appendSplitCall(CommandListCoreFamilyImmediate<gfxCoreFamily> *cmdList,
-                                T dstptr,
-                                K srcptr,
-                                size_t size,
-                                ze_event_handle_t hSignalEvent,
-                                uint32_t numWaitEvents,
-                                ze_event_handle_t *phWaitEvents,
-                                bool performMigration,
-                                bool hasRelaxedOrderingDependencies,
-                                NEO::TransferDirection direction,
-                                std::function<ze_result_t(T, K, size_t, ze_event_handle_t)> appendCall) {
-        ze_result_t result = ZE_RESULT_SUCCESS;
-
-        auto markerEventIndex = this->events.obtainForSplit(Context::fromHandle(cmdList->getCmdListContext()), MemoryConstants::pageSize64k / sizeof(typename CommandListCoreFamilyImmediate<gfxCoreFamily>::GfxFamily::TimestampPacketType));
-
-        auto barrierRequired = cmdList->isBarrierRequired();
-        if (barrierRequired) {
-            cmdList->appendSignalEvent(this->events.barrier[markerEventIndex]->toHandle());
-        }
-
-        auto subcopyEventIndex = markerEventIndex * this->cmdQs.size();
-        StackVec<ze_event_handle_t, 4> eventHandles;
-
-        auto &cmdQsForSplit = this->getCmdQsForSplit(direction);
-
-        auto totalSize = size;
-        auto engineCount = cmdQsForSplit.size();
-        for (size_t i = 0; i < cmdQsForSplit.size(); i++) {
-            if (barrierRequired) {
-                auto barrierEventHandle = this->events.barrier[markerEventIndex]->toHandle();
-                cmdList->addEventsToCmdList(1u, &barrierEventHandle, hasRelaxedOrderingDependencies, false);
-            }
-
-            cmdList->addEventsToCmdList(numWaitEvents, phWaitEvents, hasRelaxedOrderingDependencies, false);
-            if (hSignalEvent && i == 0u) {
-                cmdList->appendEventForProfilingAllWalkers(Event::fromHandle(hSignalEvent), true, true);
-            }
-
-            auto localSize = totalSize / engineCount;
-            auto localDstPtr = ptrOffset(dstptr, size - totalSize);
-            auto localSrcPtr = ptrOffset(srcptr, size - totalSize);
-
-            auto eventHandle = this->events.subcopy[subcopyEventIndex + i]->toHandle();
-            result = appendCall(localDstPtr, localSrcPtr, localSize, eventHandle);
-
-            if (cmdList->flushTaskSubmissionEnabled()) {
-                cmdList->executeCommandListImmediateWithFlushTaskImpl(performMigration, false, hasRelaxedOrderingDependencies, cmdQsForSplit[i]);
-            } else {
-                cmdList->executeCommandListImmediateImpl(performMigration, cmdQsForSplit[i]);
-            }
-
-            eventHandles.push_back(eventHandle);
-
-            totalSize -= localSize;
-            engineCount--;
-
-            if (hSignalEvent) {
-                Event::fromHandle(hSignalEvent)->appendAdditionalCsr(static_cast<CommandQueueImp *>(cmdQsForSplit[i])->getCsr());
-            }
-        }
-
-        cmdList->addEventsToCmdList(static_cast<uint32_t>(cmdQsForSplit.size()), eventHandles.data(), hasRelaxedOrderingDependencies, false);
-        if (hSignalEvent) {
-            cmdList->appendEventForProfilingAllWalkers(Event::fromHandle(hSignalEvent), false, true);
-        }
-        cmdList->appendEventForProfilingAllWalkers(this->events.marker[markerEventIndex], false, true);
-
-        return result;
-    }
-
-    bool setupDevice(uint32_t productFamily, bool internalUsage, const ze_command_queue_desc_t *desc, NEO::CommandStreamReceiver *csr);
-    void releaseResources();
-    std::vector<CommandQueue *> &getCmdQsForSplit(NEO::TransferDirection direction);
-
-    BcsSplit(DeviceImp &device) : device(device), events(*this){};
 };
 
 } // namespace L0
+
+#include "level_zero/core/source/device/bcs_split.inl"

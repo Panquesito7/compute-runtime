@@ -1,13 +1,15 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "opencl/source/api/api.h"
 #include "opencl/source/tracing/tracing_api.h"
 #include "opencl/source/tracing/tracing_notify.h"
 #include "opencl/test/unit_test/api/cl_api_tests.h"
+#include "opencl/test/unit_test/fixtures/platform_fixture.h"
 
 using namespace NEO;
 
@@ -26,13 +28,13 @@ struct IntelTracingTest : public ApiTests {
     }
 
   protected:
-    static void callback(cl_function_id fid, cl_callback_data *callbackData, void *userData) {
+    static void callback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) {
         ASSERT_NE(nullptr, userData);
         IntelTracingTest *base = (IntelTracingTest *)userData;
         base->vcallback(fid, callbackData, nullptr);
     }
 
-    virtual void vcallback(cl_function_id fid, cl_callback_data *callbackData, void *userData) {}
+    virtual void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) {}
 
   protected:
     cl_tracing_handle handle = nullptr;
@@ -89,59 +91,59 @@ TEST_F(IntelTracingTest, GivenInactiveHandleWhenCallingTracingFunctionThenInvali
 }
 
 TEST_F(IntelTracingTest, GivenTooManyHandlesWhenEnablingTracingFunctionThenOutOfResourcesErrorIsReturned) {
-    cl_tracing_handle handle[HostSideTracing::TRACING_MAX_HANDLE_COUNT + 1] = {nullptr};
+    cl_tracing_handle handle[HostSideTracing::tracingMaxHandleCount + 1] = {nullptr};
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT + 1; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount + 1; ++i) {
         status = clCreateTracingHandleINTEL(testedClDevice, callback, nullptr, &(handle[i]));
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
         status = clEnableTracingINTEL(handle[i]);
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
-    status = clEnableTracingINTEL(handle[HostSideTracing::TRACING_MAX_HANDLE_COUNT]);
+    status = clEnableTracingINTEL(handle[HostSideTracing::tracingMaxHandleCount]);
     EXPECT_EQ(CL_OUT_OF_RESOURCES, status);
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
         status = clDisableTracingINTEL(handle[i]);
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT + 1; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount + 1; ++i) {
         status = clDestroyTracingHandleINTEL(handle[i]);
         EXPECT_EQ(CL_SUCCESS, status);
     }
 }
 
 TEST_F(IntelTracingTest, GivenInactiveHandleWhenDisablingTracingThenInvalidValueIsReturned) {
-    cl_tracing_handle handle[HostSideTracing::TRACING_MAX_HANDLE_COUNT + 1] = {nullptr};
+    cl_tracing_handle handle[HostSideTracing::tracingMaxHandleCount + 1] = {nullptr};
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT + 1; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount + 1; ++i) {
         status = clCreateTracingHandleINTEL(testedClDevice, callback, nullptr, &(handle[i]));
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
         status = clEnableTracingINTEL(handle[i]);
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
-    status = clDisableTracingINTEL(handle[HostSideTracing::TRACING_MAX_HANDLE_COUNT]);
+    status = clDisableTracingINTEL(handle[HostSideTracing::tracingMaxHandleCount]);
     EXPECT_EQ(CL_INVALID_VALUE, status);
 
     cl_bool enable = CL_TRUE;
-    status = clGetTracingStateINTEL(handle[HostSideTracing::TRACING_MAX_HANDLE_COUNT], &enable);
+    status = clGetTracingStateINTEL(handle[HostSideTracing::tracingMaxHandleCount], &enable);
     EXPECT_EQ(CL_SUCCESS, status);
     EXPECT_EQ(static_cast<cl_bool>(CL_FALSE), enable);
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
         status = clDisableTracingINTEL(handle[i]);
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
-    for (uint32_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT + 1; ++i) {
+    for (uint32_t i = 0; i < HostSideTracing::tracingMaxHandleCount + 1; ++i) {
         status = clDestroyTracingHandleINTEL(handle[i]);
         EXPECT_EQ(CL_SUCCESS, status);
     }
@@ -229,7 +231,7 @@ struct IntelAllTracingTest : public IntelTracingTest {
         ASSERT_EQ(CL_SUCCESS, status);
 
         for (uint32_t i = 0; i < CL_FUNCTION_COUNT; ++i) {
-            status = clSetTracingPointINTEL(handle, static_cast<cl_function_id>(i), CL_TRUE);
+            status = clSetTracingPointINTEL(handle, static_cast<ClFunctionId>(i), CL_TRUE);
             ASSERT_EQ(CL_SUCCESS, status);
         }
 
@@ -248,7 +250,7 @@ struct IntelAllTracingTest : public IntelTracingTest {
     }
 
   protected:
-    void vcallback(cl_function_id fid, cl_callback_data *callbackData, void *userData) override {
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
         if (fid == functionId) {
             if (callbackData->site == CL_CALLBACK_SITE_ENTER) {
                 ++enterCount;
@@ -347,6 +349,10 @@ struct IntelAllTracingTest : public IntelTracingTest {
         ++count;
         functionId = CL_FUNCTION_clCreateSubBuffer;
         clCreateSubBuffer(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateSubDevices;
+        clCreateSubDevices(0, 0, 0, 0, 0);
 
         ++count;
         functionId = CL_FUNCTION_clCreateUserEvent;
@@ -696,13 +702,177 @@ struct IntelAllTracingTest : public IntelTracingTest {
         functionId = CL_FUNCTION_clWaitForEvents;
         clWaitForEvents(0, 0);
 
+        ++count;
+        functionId = CL_FUNCTION_clMemFreeINTEL;
+        clMemFreeINTEL(0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clIcdGetPlatformIDsKHR;
+        clIcdGetPlatformIDsKHR(0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateBufferWithProperties;
+        clCreateBufferWithProperties(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateBufferWithPropertiesINTEL;
+        clCreateBufferWithPropertiesINTEL(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateImageWithProperties;
+        clCreateImageWithProperties(0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateImageWithPropertiesINTEL;
+        clCreateImageWithPropertiesINTEL(0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetImageParamsINTEL;
+        clGetImageParamsINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreatePerfCountersCommandQueueINTEL;
+        clCreatePerfCountersCommandQueueINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clHostMemAllocINTEL;
+        clHostMemAllocINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clDeviceMemAllocINTEL;
+        clDeviceMemAllocINTEL(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clSharedMemAllocINTEL;
+        clSharedMemAllocINTEL(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clMemBlockingFreeINTEL;
+        clMemBlockingFreeINTEL(0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetMemAllocInfoINTEL;
+        clGetMemAllocInfoINTEL(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clSetKernelArgMemPointerINTEL;
+        clSetKernelArgMemPointerINTEL(0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueMemsetINTEL;
+        clEnqueueMemsetINTEL(0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueMemFillINTEL;
+        clEnqueueMemFillINTEL(0, 0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueMemcpyINTEL;
+        clEnqueueMemcpyINTEL(0, 0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueMigrateMemINTEL;
+        clEnqueueMigrateMemINTEL(0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueMemAdviseINTEL;
+        clEnqueueMemAdviseINTEL(0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateCommandQueueWithPropertiesKHR;
+        clCreateCommandQueueWithPropertiesKHR(0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateAcceleratorINTEL;
+        clCreateAcceleratorINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clRetainAcceleratorINTEL;
+        clRetainAcceleratorINTEL(0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetAcceleratorInfoINTEL;
+        clGetAcceleratorInfoINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clReleaseAcceleratorINTEL;
+        clReleaseAcceleratorINTEL(0);
+
+        ++count;
+        functionId = CL_FUNCTION_clCreateProgramWithILKHR;
+        clCreateProgramWithILKHR(0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetKernelSuggestedLocalWorkSizeKHR;
+        clGetKernelSuggestedLocalWorkSizeKHR(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetKernelSuggestedLocalWorkSize;
+        clGetKernelSuggestedLocalWorkSize(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetKernelSubGroupInfoKHR;
+        clGetKernelSubGroupInfoKHR(0, 0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueVerifyMemoryINTEL;
+        clEnqueueVerifyMemoryINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clAddCommentINTEL;
+        clAddCommentINTEL(0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetDeviceGlobalVariablePointerINTEL;
+        clGetDeviceGlobalVariablePointerINTEL(0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetDeviceFunctionPointerINTEL;
+        clGetDeviceFunctionPointerINTEL(0, 0, "test", 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clSetProgramReleaseCallback;
+        clSetProgramReleaseCallback(0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clSetProgramSpecializationConstant;
+        clSetProgramSpecializationConstant(0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetKernelSuggestedLocalWorkSizeINTEL;
+        clGetKernelSuggestedLocalWorkSizeINTEL(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clGetKernelMaxConcurrentWorkGroupCountINTEL;
+        clGetKernelMaxConcurrentWorkGroupCountINTEL(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueNDCountKernelINTEL;
+        clEnqueueNDCountKernelINTEL(0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clSetContextDestructorCallback;
+        clSetContextDestructorCallback(0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueExternalMemObjectsKHR;
+        clEnqueueExternalMemObjectsKHR(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueAcquireExternalMemObjectsKHR;
+        clEnqueueAcquireExternalMemObjectsKHR(0, 0, 0, 0, 0, 0);
+
+        ++count;
+        functionId = CL_FUNCTION_clEnqueueReleaseExternalMemObjectsKHR;
+        clEnqueueReleaseExternalMemObjectsKHR(0, 0, 0, 0, 0, 0);
+
         return count;
     }
 
   protected:
     uint16_t enterCount = 0;
     uint16_t exitCount = 0;
-    cl_function_id functionId = CL_FUNCTION_COUNT;
+    ClFunctionId functionId = CL_FUNCTION_COUNT;
 };
 
 TEST_F(IntelAllTracingTest, GivenValidFunctionWhenTracingThenTracingIsPerformed) {
@@ -713,7 +883,7 @@ TEST_F(IntelAllTracingTest, GivenValidFunctionWhenTracingThenTracingIsPerformed)
 
 TEST_F(IntelAllTracingTest, GivenNoFunctionsWhenTracingThenTracingIsNotPerformed) {
     for (uint32_t i = 0; i < CL_FUNCTION_COUNT; ++i) {
-        status = clSetTracingPointINTEL(handle, static_cast<cl_function_id>(i), CL_FALSE);
+        status = clSetTracingPointINTEL(handle, static_cast<ClFunctionId>(i), CL_FALSE);
         EXPECT_EQ(CL_SUCCESS, status);
     }
 
@@ -730,27 +900,27 @@ struct IntelAllTracingWithMaxHandlesTest : public IntelAllTracingTest {
     void SetUp() override {
         IntelTracingTest::SetUp();
 
-        for (size_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+        for (size_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
             status = clCreateTracingHandleINTEL(testedClDevice, callback, this, handleList + i);
             ASSERT_NE(nullptr, handleList[i]);
             ASSERT_EQ(CL_SUCCESS, status);
         }
 
-        for (size_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+        for (size_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
             for (uint32_t j = 0; j < CL_FUNCTION_COUNT; ++j) {
-                status = clSetTracingPointINTEL(handleList[i], static_cast<cl_function_id>(j), CL_TRUE);
+                status = clSetTracingPointINTEL(handleList[i], static_cast<ClFunctionId>(j), CL_TRUE);
                 ASSERT_EQ(CL_SUCCESS, status);
             }
         }
 
-        for (size_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+        for (size_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
             status = clEnableTracingINTEL(handleList[i]);
             ASSERT_EQ(CL_SUCCESS, status);
         }
     }
 
     void TearDown() override {
-        for (size_t i = 0; i < HostSideTracing::TRACING_MAX_HANDLE_COUNT; ++i) {
+        for (size_t i = 0; i < HostSideTracing::tracingMaxHandleCount; ++i) {
             status = clDisableTracingINTEL(handleList[i]);
             ASSERT_EQ(CL_SUCCESS, status);
 
@@ -762,13 +932,13 @@ struct IntelAllTracingWithMaxHandlesTest : public IntelAllTracingTest {
     }
 
   protected:
-    cl_tracing_handle handleList[HostSideTracing::TRACING_MAX_HANDLE_COUNT] = {nullptr};
+    cl_tracing_handle handleList[HostSideTracing::tracingMaxHandleCount] = {nullptr};
 };
 
 TEST_F(IntelAllTracingWithMaxHandlesTest, GivenAllFunctionsWithMaxHandlesWhenTracingThenTracingIsPerformed) {
     uint16_t count = callFunctions();
-    EXPECT_EQ(count * HostSideTracing::TRACING_MAX_HANDLE_COUNT, enterCount);
-    EXPECT_EQ(count * HostSideTracing::TRACING_MAX_HANDLE_COUNT, exitCount);
+    EXPECT_EQ(count * HostSideTracing::tracingMaxHandleCount, enterCount);
+    EXPECT_EQ(count * HostSideTracing::tracingMaxHandleCount, exitCount);
 }
 
 struct IntelClGetDeviceInfoTracingCollectTest : public IntelAllTracingTest {
@@ -781,7 +951,7 @@ struct IntelClGetDeviceInfoTracingCollectTest : public IntelAllTracingTest {
         status = clGetDeviceInfo(device, CL_DEVICE_VENDOR, 0, nullptr, &paramValueSizeRet);
     }
 
-    void vcallback(cl_function_id fid, cl_callback_data *callbackData, void *userData) override {
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
         EXPECT_EQ(CL_FUNCTION_clGetDeviceInfo, fid);
         EXPECT_NE(nullptr, callbackData);
 
@@ -848,7 +1018,7 @@ struct IntelClGetDeviceInfoTracingChangeParamsTest : public IntelAllTracingTest 
         status = clGetDeviceInfo(device, CL_DEVICE_VENDOR, 0, nullptr, &paramValueSizeRet);
     }
 
-    void vcallback(cl_function_id fid, cl_callback_data *callbackData, void *userData) override {
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
         if (callbackData->site == CL_CALLBACK_SITE_ENTER) {
             cl_params_clGetDeviceInfo *params = (cl_params_clGetDeviceInfo *)callbackData->functionParams;
             *params->paramValueSize = paramValueSize;
@@ -881,7 +1051,7 @@ struct IntelClGetDeviceInfoTracingChangeRetValTest : public IntelAllTracingTest 
         status = clGetDeviceInfo(device, CL_DEVICE_VENDOR, 0, nullptr, &paramValueSizeRet);
     }
 
-    void vcallback(cl_function_id fid, cl_callback_data *callbackData, void *userData) override {
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
         if (callbackData->site == CL_CALLBACK_SITE_EXIT) {
             cl_int *retVal = reinterpret_cast<cl_int *>(callbackData->functionReturnValue);
             *retVal = CL_INVALID_VALUE;
@@ -938,6 +1108,269 @@ TEST_F(IntelClGetDeviceInfoTwoHandlesTracingCollectTest, GivenTwoHandlesWhenTrac
 
     EXPECT_EQ(2u, enterCount);
     EXPECT_EQ(2u, exitCount);
+}
+
+struct IntelClCreateContextFromTypeTracingTest : public IntelTracingTest, PlatformFixture {
+  public:
+    void SetUp() override {
+        PlatformFixture::setUp();
+        IntelTracingTest::setUp();
+
+        status = clCreateTracingHandleINTEL(devices[0], callback, this, &handle);
+        ASSERT_NE(nullptr, handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clSetTracingPointINTEL(handle, CL_FUNCTION_clCreateContextFromType, CL_TRUE);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clEnableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+    }
+    void TearDown() override {
+        status = clDisableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clDestroyTracingHandleINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+        IntelTracingTest::tearDown();
+        PlatformFixture::tearDown();
+    }
+
+  protected:
+    void call() {
+        context = clCreateContextFromType(nullptr, CL_DEVICE_TYPE_GPU, nullptr, nullptr, nullptr);
+    }
+
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
+        ASSERT_EQ(CL_FUNCTION_clCreateContextFromType, fid);
+        if (callbackData->site == CL_CALLBACK_SITE_ENTER) {
+            ++enterCount;
+        } else if (callbackData->site == CL_CALLBACK_SITE_EXIT) {
+            obtainedContextCallback = *reinterpret_cast<cl_context *>(callbackData->functionReturnValue);
+            ++exitCount;
+        }
+    }
+
+    cl_context context = nullptr;
+    cl_context obtainedContextCallback = nullptr;
+    uint16_t enterCount = 0;
+    uint16_t exitCount = 0;
+};
+
+TEST_F(IntelClCreateContextFromTypeTracingTest, givenCreateContextFromTypeCallTracingWhenInvokingCallbackThenPointersFromCallAndCallbackPointToTheSameAddress) {
+    call();
+    EXPECT_EQ(1u, enterCount);
+    EXPECT_EQ(1u, exitCount);
+
+    EXPECT_NE(nullptr, context);
+    EXPECT_NE(nullptr, obtainedContextCallback);
+    EXPECT_EQ(context, obtainedContextCallback);
+    clReleaseContext(context);
+}
+
+struct IntelClLinkProgramTracingTest : public IntelTracingTest, PlatformFixture {
+  public:
+    void SetUp() override {
+        PlatformFixture::setUp();
+        IntelTracingTest::setUp();
+
+        status = clCreateTracingHandleINTEL(devices[0], callback, this, &handle);
+        ASSERT_NE(nullptr, handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clSetTracingPointINTEL(handle, CL_FUNCTION_clLinkProgram, CL_TRUE);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clEnableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        pProgram->irBinary = makeCopy(ir, sizeof(ir));
+        pProgram->irBinarySize = sizeof(ir);
+    }
+    void TearDown() override {
+        status = clDisableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clDestroyTracingHandleINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+        IntelTracingTest::tearDown();
+        PlatformFixture::tearDown();
+    }
+
+  protected:
+    void call() {
+        cl_program inputPrograms = pProgram;
+        programReturned = clLinkProgram(pContext, 1, &testedClDevice, nullptr, 1, &inputPrograms, nullptr, nullptr, &retVal);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+    }
+
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
+        ASSERT_EQ(CL_FUNCTION_clLinkProgram, fid);
+        if (callbackData->site == CL_CALLBACK_SITE_ENTER) {
+            ++enterCount;
+        } else if (callbackData->site == CL_CALLBACK_SITE_EXIT) {
+            obtainedProgramCallback = *reinterpret_cast<cl_program *>(callbackData->functionReturnValue);
+            ++exitCount;
+        }
+    }
+
+    uint8_t ir[10] = {'m', 'o', 'c', 'k', 'i', 'r', 'd', 'a', 't', 'a'};
+    cl_program programReturned = nullptr;
+    cl_program obtainedProgramCallback = nullptr;
+    uint16_t enterCount = 0;
+    uint16_t exitCount = 0;
+};
+
+TEST_F(IntelClLinkProgramTracingTest, givenLinkProgramCallTracingWhenInvokingCallbackThenPointersFromCallAndCallbackPointToTheSameAddress) {
+    MockZebinWrapper zebin{*defaultHwInfo};
+    zebin.setAsMockCompilerReturnedBinary();
+
+    call();
+    EXPECT_EQ(1u, enterCount);
+    EXPECT_EQ(1u, exitCount);
+
+    EXPECT_NE(nullptr, programReturned);
+    EXPECT_NE(nullptr, obtainedProgramCallback);
+    EXPECT_EQ(programReturned, obtainedProgramCallback);
+    clReleaseProgram(programReturned);
+}
+
+struct IntelClCloneKernelTracingTest : public IntelTracingTest, PlatformFixture {
+  public:
+    void SetUp() override {
+        PlatformFixture::setUp();
+        IntelTracingTest::setUp();
+
+        status = clCreateTracingHandleINTEL(devices[0], callback, this, &handle);
+        ASSERT_NE(nullptr, handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clSetTracingPointINTEL(handle, CL_FUNCTION_clCloneKernel, CL_TRUE);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clEnableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        const auto &hwInfo = pDevice->getHardwareInfo();
+        const_cast<KernelDescriptor &>(pKernel->getKernelInfo().kernelDescriptor).kernelAttributes.simdSize = hwInfo.caps.minimalSimdSize;
+    }
+    void TearDown() override {
+        status = clDisableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clDestroyTracingHandleINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+        IntelTracingTest::tearDown();
+        PlatformFixture::tearDown();
+    }
+
+  protected:
+    void call() {
+        cl_kernel sourceKernel = pMultiDeviceKernel;
+        clonedKernel = clCloneKernel(sourceKernel, &retVal);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+    }
+
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
+        ASSERT_EQ(CL_FUNCTION_clCloneKernel, fid);
+        if (callbackData->site == CL_CALLBACK_SITE_ENTER) {
+            ++enterCount;
+        } else if (callbackData->site == CL_CALLBACK_SITE_EXIT) {
+            obtainedClonedKernelCallback = *reinterpret_cast<cl_kernel *>(callbackData->functionReturnValue);
+            ++exitCount;
+        }
+    }
+
+    cl_kernel clonedKernel = nullptr;
+    cl_kernel obtainedClonedKernelCallback = nullptr;
+    uint16_t enterCount = 0;
+    uint16_t exitCount = 0;
+};
+
+TEST_F(IntelClCloneKernelTracingTest, givenCloneKernelCallTracingWhenInvokingCallbackThenPointersFromCallAndCallbackPointToTheSameAddress) {
+    call();
+    EXPECT_EQ(1u, enterCount);
+    EXPECT_EQ(1u, exitCount);
+
+    EXPECT_NE(nullptr, clonedKernel);
+    EXPECT_NE(nullptr, obtainedClonedKernelCallback);
+    EXPECT_EQ(clonedKernel, obtainedClonedKernelCallback);
+    clReleaseKernel(clonedKernel);
+}
+
+struct IntelClCreateSubDevicesTracingTest : public IntelTracingTest {
+  public:
+    void SetUp() override {
+        IntelTracingTest::setUp();
+
+        debugManager.flags.CreateMultipleSubDevices.set(deviceCount);
+        device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+        status = clCreateTracingHandleINTEL(testedClDevice, callback, this, &handle);
+        ASSERT_NE(nullptr, handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clSetTracingPointINTEL(handle, CL_FUNCTION_clCreateSubDevices, CL_TRUE);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clEnableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+    }
+    void TearDown() override {
+        status = clDisableTracingINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+
+        status = clDestroyTracingHandleINTEL(handle);
+        ASSERT_EQ(CL_SUCCESS, status);
+        IntelTracingTest::tearDown();
+    }
+
+    void call() {
+        auto retVal = clCreateSubDevices(device.get(), properties, deviceCount, outDevices, numDevicesRet);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+    }
+
+    void vcallback(ClFunctionId fid, cl_callback_data *callbackData, void *userData) override {
+        ASSERT_EQ(CL_FUNCTION_clCreateSubDevices, fid);
+        if (callbackData->site == CL_CALLBACK_SITE_ENTER) {
+            ++enterCount;
+        } else if (callbackData->site == CL_CALLBACK_SITE_EXIT) {
+            auto funcParams = reinterpret_cast<const cl_params_clCreateSubDevices *>(callbackData->functionParams); // check at tracing exit, once api call has been executed
+            EXPECT_EQ(static_cast<cl_device_id>(device.get()), *(funcParams->inDevice));
+            EXPECT_EQ(2u, *(funcParams->numDevices));
+            EXPECT_EQ(numDevicesRet[0], *(funcParams->numDevicesRet[0]));
+
+            auto outDevicesCallback = *(funcParams->outDevices);
+            EXPECT_EQ(static_cast<cl_device_id>(device->getSubDevice(0)), outDevicesCallback[0]);
+            EXPECT_EQ(static_cast<cl_device_id>(device->getSubDevice(1)), outDevicesCallback[1]);
+
+            auto propertiesCallback = *(funcParams->properties);
+            EXPECT_EQ(CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN, propertiesCallback[0]);
+            EXPECT_EQ(CL_DEVICE_AFFINITY_DOMAIN_NUMA, propertiesCallback[1]);
+            EXPECT_EQ(0, propertiesCallback[2]);
+
+            EXPECT_STREQ("clCreateSubDevices", callbackData->functionName);
+            EXPECT_EQ(CL_SUCCESS, *reinterpret_cast<cl_int *>(callbackData->functionReturnValue));
+            ++exitCount;
+        }
+    }
+
+  protected:
+    DebugManagerStateRestore restorer;
+    std::unique_ptr<MockClDevice> device;
+    cl_device_partition_property properties[3] = {CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN, CL_DEVICE_AFFINITY_DOMAIN_NUMA, 0};
+    cl_uint deviceCount = 2u;
+    cl_device_id outDevices[2] = {0, 0};
+    cl_uint numDevicesRet[1] = {0u};
+
+    uint16_t enterCount = 0u;
+    uint16_t exitCount = 0u;
+};
+
+TEST_F(IntelClCreateSubDevicesTracingTest, givenCreateSubDevicesCallTracingEnabledWhenInvokingThisCallThenCallIsSuccessfullyTraced) {
+    call();
+    EXPECT_EQ(1u, enterCount);
+    EXPECT_EQ(1u, exitCount);
 }
 
 } // namespace ULT

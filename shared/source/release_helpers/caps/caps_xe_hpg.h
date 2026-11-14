@@ -1,0 +1,96 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/command_stream/thread_arbitration_policy.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_ip_version.h"
+#include "shared/source/kernel/kernel_properties.h"
+#include "shared/source/release_helpers/caps/materialize_caps.h"
+
+#include "platforms.h"
+
+#include <optional>
+
+namespace NEO {
+
+struct CapsXeHpgCore {
+    static constexpr uint32_t cacheLineSize = 64u;
+    static constexpr uint32_t commandBuffersPreallocatedPerCommandQueue = 2u;
+    static constexpr int32_t defaultThreadArbitrationPolicy = ThreadArbitrationPolicy::AgeBased;
+    static constexpr uint32_t kernelFp16AtomicCapabilities = FpAtomicExtFlags::minMaxAtomicCaps | FpAtomicExtFlags::loadStoreAtomicCaps;
+    static constexpr uint32_t maxNumSamplers = 16u;
+    static constexpr uint32_t minimalSimdSize = 8u;
+    static constexpr uint32_t planarYuvMaxHeight = 16128u;
+    static constexpr uint32_t rtasFormat = 1u;
+    static constexpr uint32_t shareMemoryWithoutNTHandle = 1u;
+    static constexpr uint32_t systolicDotProductInputTypes = DotProductInputTypeFlags::int8Pack4 | DotProductInputTypeFlags::int4Pack8 | DotProductInputTypeFlags::int2Pack8 | DotProductInputTypeFlags::fp16Pack2 | DotProductInputTypeFlags::bf16Pack2;
+    static constexpr uint32_t systolicDotProductOutputTypes = DotProductOutputTypeFlags::int32 | DotProductOutputTypeFlags::fp32;
+    static constexpr uint32_t systolicDotProductSimdLaneCount = 8u;
+
+    static constexpr size_t max3dImageWidthOrHeight = 16384u;
+    static constexpr size_t svmCpuAlignment = MemoryConstants::pageSize2M;
+
+    static constexpr bool bFloat16ConversionSupported = true;
+    static constexpr bool bufferPoolAllocatorSupported = true;
+    static constexpr bool dotProductAccumulateSystolicSupported = true;
+    static constexpr bool dummyBlitWaRequired = true;
+    static constexpr bool exposingSubdevicesAllowed = true;
+    static constexpr bool globalBindlessAllocatorEnabled = true;
+    static constexpr bool localOnlyAllowed = true;
+    static constexpr bool newResidencyModelSupported = true;
+    static constexpr bool numRtStacksPerDssFixedValue = true;
+    static constexpr bool pipeControlPriorToNonPipelinedStateCommandsBaseWARequired = true;
+    static constexpr bool postImageWriteFlushRequired = true;
+    static constexpr bool programAllStateComputeCommandFieldsWARequired = true;
+    static constexpr bool rayTracingSupported = true;
+    static constexpr bool rcsExposureDisabled = true;
+    static constexpr bool scratchSpaceBasePointerInGrf = true;
+    static constexpr bool sharingWith3dOrMediaAllowed = true;
+    static constexpr bool splitMatrixMultiplyAccumulateSupported = true;
+    static constexpr bool storageInfoAdjustmentRequired = is32bit;
+    static constexpr bool useLocalPreferredForCacheableBuffers = true;
+};
+
+struct CapsDg2G10 : CapsXeHpgCore {};
+struct CapsDg2G11 : CapsXeHpgCore {};
+struct CapsDg2G12 : CapsXeHpgCore {};
+
+constexpr std::optional<Caps> resolveCapsDg2G10(HardwareIpVersion ipVersion) {
+    switch (ipVersion.value) {
+    case AOT::DG2_G10_A0:
+    case AOT::DG2_G10_A1:
+    case AOT::DG2_G10_B0:
+    case AOT::DG2_G10_C0:
+        return materializeCaps<CapsDg2G10>();
+    default:
+        return std::nullopt;
+    }
+}
+
+constexpr std::optional<Caps> resolveCapsDg2G11(HardwareIpVersion ipVersion) {
+    switch (ipVersion.value) {
+    case AOT::DG2_G11_A0:
+    case AOT::DG2_G11_B0:
+    case AOT::DG2_G11_B1:
+        return materializeCaps<CapsDg2G11>();
+    default:
+        return std::nullopt;
+    }
+}
+
+constexpr std::optional<Caps> resolveCapsDg2G12(HardwareIpVersion ipVersion) {
+    switch (ipVersion.value) {
+    case AOT::DG2_G12_A0:
+        return materializeCaps<CapsDg2G12>();
+    default:
+        return std::nullopt;
+    }
+}
+
+} // namespace NEO

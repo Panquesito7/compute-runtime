@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,12 @@
 
 #include "level_zero/core/source/fabric/fabric.h"
 
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/string.h"
 
-#include "level_zero/core/source/device/device_imp.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/source/fabric/fabric_device_interface.h"
 
 namespace L0 {
@@ -25,22 +27,12 @@ FabricVertex::~FabricVertex() {
 
 FabricVertex *FabricVertex::createFromDevice(Device *device) {
 
-    // Fabric Vertices are not created for engine instanced devices
-    if (device->getNEODevice()->isEngineInstanced()) {
-        return nullptr;
-    }
-
     auto fabricVertex = new FabricVertex();
-    UNRECOVERABLE_IF(fabricVertex == nullptr);
 
-    auto deviceImpl = static_cast<DeviceImp *>(device);
-    for (auto &subDevice : deviceImpl->subDevices) {
+    for (auto &subDevice : device->subDevices) {
         auto subVertex = FabricVertex::createFromDevice(subDevice);
-        if (subVertex == nullptr) {
-            continue;
-        }
-        auto subDeviceImpl = static_cast<DeviceImp *>(subDevice);
-        subDeviceImpl->setFabricVertex(subVertex);
+
+        subDevice->setFabricVertex(subVertex);
         fabricVertex->subVertices.push_back(subVertex);
     }
 
@@ -69,8 +61,8 @@ FabricVertex *FabricVertex::createFromDevice(Device *device) {
         fabricVertex->properties.address.function = pciProperties.address.function;
     }
 
-    fabricVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf] = FabricDeviceInterface::createFabricDeviceInterfaceIaf(fabricVertex);
-    fabricVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Mdfi] = FabricDeviceInterface::createFabricDeviceInterfaceMdfi(fabricVertex);
+    fabricVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf] = FabricDeviceInterface::createFabricDeviceInterfaceIaf(fabricVertex);
+    fabricVertex->pFabricDeviceInterfaces[FabricDeviceInterface::Type::mdfi] = FabricDeviceInterface::createFabricDeviceInterfaceMdfi(fabricVertex);
 
     for (auto const &fabricDeviceInterface : fabricVertex->pFabricDeviceInterfaces) {
         fabricDeviceInterface.second->enumerate();
@@ -79,7 +71,32 @@ FabricVertex *FabricVertex::createFromDevice(Device *device) {
     return fabricVertex;
 }
 
+FabricVertex *FabricVertex::createFromVertexInfo(Device *device, const NEO::FabricVertexInfo &vertexInfo) {
+
+    auto fabricVertex = new FabricVertex();
+
+    fabricVertex->properties.stype = ZE_STRUCTURE_TYPE_FABRIC_VERTEX_EXP_PROPERTIES;
+    memcpy_s(fabricVertex->properties.uuid.id, ZE_MAX_UUID_SIZE, vertexInfo.uuid, sizeof(vertexInfo.uuid));
+
+    fabricVertex->properties.type = static_cast<ze_fabric_vertex_exp_type_t>(vertexInfo.type);
+    fabricVertex->properties.remote = false;
+    fabricVertex->device = device;
+    fabricVertex->fabricId = vertexInfo.fabricId;
+    fabricVertex->properties.address.domain = (vertexInfo.pciBdf >> 16) & 0xffff;
+    fabricVertex->properties.address.bus = (vertexInfo.pciBdf >> 8) & 0xff;
+    fabricVertex->properties.address.device = (vertexInfo.pciBdf >> 3) & 0x1f;
+    fabricVertex->properties.address.function = vertexInfo.pciBdf & 0x7;
+
+    return fabricVertex;
+}
+
 ze_result_t FabricVertex::getSubVertices(uint32_t *pCount, ze_fabric_vertex_handle_t *phSubvertices) {
+
+    if (device->getNEODevice()->getExecutionEnvironment()->getDeviceHierarchyMode() == NEO::DeviceHierarchyMode::flat ||
+        device->getNEODevice()->getRootDeviceEnvironment().isExposeSingleDeviceMode()) {
+        *pCount = 0;
+        return ZE_RESULT_SUCCESS;
+    }
 
     uint32_t subVertexCount = static_cast<uint32_t>(subVertices.size());
     if (*pCount == 0) {
@@ -108,8 +125,7 @@ ze_result_t FabricVertex::getDevice(ze_device_handle_t *phDevice) const {
 
 ze_result_t FabricVertex::edgeGet(ze_fabric_vertex_handle_t hVertexB,
                                   uint32_t *pCount, ze_fabric_edge_handle_t *phEdges) {
-    DriverHandleImp *driverHandleImp = static_cast<L0::DriverHandleImp *>(device->getDriverHandle());
-    return driverHandleImp->fabricEdgeGetExp(this->toHandle(), hVertexB, pCount, phEdges);
+    return device->getDriverHandle()->fabricEdgeGetExp(this->toHandle(), hVertexB, pCount, phEdges);
 }
 
 FabricEdge *FabricEdge::create(FabricVertex *vertexA, FabricVertex *vertexB, ze_fabric_edge_exp_properties_t &properties) {
@@ -119,33 +135,6 @@ FabricEdge *FabricEdge::create(FabricVertex *vertexA, FabricVertex *vertexB, ze_
     edge->vertexB = vertexB;
     edge->properties = properties;
     return edge;
-}
-
-void FabricEdge::createEdgesFromVertices(const std::vector<FabricVertex *> &vertices, std::vector<FabricEdge *> &edges) {
-
-    // Get all vertices and sub-vertices
-    std::vector<FabricVertex *> allVertices = {};
-    for (auto &fabricVertex : vertices) {
-        allVertices.push_back(fabricVertex);
-        for (auto &fabricSubVertex : fabricVertex->subVertices) {
-            allVertices.push_back(fabricSubVertex);
-        }
-    }
-
-    // Get edges between all vertices
-    for (uint32_t vertexAIndex = 0; vertexAIndex < allVertices.size(); vertexAIndex++) {
-        for (uint32_t vertexBIndex = vertexAIndex + 1; vertexBIndex < allVertices.size(); vertexBIndex++) {
-            ze_fabric_edge_exp_properties_t edgeProperty = {};
-
-            for (auto const &fabricDeviceInterface : allVertices[vertexAIndex]->pFabricDeviceInterfaces) {
-                bool isConnected =
-                    fabricDeviceInterface.second->getEdgeProperty(allVertices[vertexBIndex], edgeProperty);
-                if (isConnected) {
-                    edges.push_back(create(allVertices[vertexAIndex], allVertices[vertexBIndex], edgeProperty));
-                }
-            }
-        }
-    }
 }
 
 } // namespace L0

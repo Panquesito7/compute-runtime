@@ -1,14 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "opencl/test/unit_test/fixtures/program_fixture.h"
-
-#include "shared/source/helpers/file_io.h"
-#include "shared/test/common/helpers/test_files.h"
 
 #include "opencl/source/program/create.inl"
 #include "opencl/test/unit_test/mocks/mock_context.h"
@@ -17,22 +14,15 @@
 #include "gtest/gtest.h"
 
 namespace NEO {
-void ProgramFixture::createProgramWithSource(Context *pContext,
-                                             const std::string &sourceFileName) {
+
+void ProgramFixture::createProgramWithSource(Context *pContext) {
     cleanup();
     cl_int retVal = CL_SUCCESS;
-    std::string testFile;
 
-    testFile.append(clFiles);
-    testFile.append(sourceFileName);
-    ASSERT_EQ(true, fileExists(testFile));
-
-    knownSource = loadDataFromFile(
-        testFile.c_str(),
-        knownSourceSize);
-
-    ASSERT_NE(0u, knownSourceSize);
-    ASSERT_NE(nullptr, knownSource);
+    const char *sampleKernel = "example_kernel(){}";
+    knownSourceSize = std::strlen(sampleKernel) + 1;
+    knownSource = std::make_unique<char[]>(knownSourceSize);
+    std::copy(sampleKernel, sampleKernel + knownSourceSize, knownSource.get());
 
     const char *sources[1] = {knownSource.get()};
     pProgram = Program::create<MockProgram>(
@@ -55,42 +45,18 @@ void ProgramFixture::cleanup() {
 
 void ProgramFixture::createProgramFromBinary(Context *pContext,
                                              const ClDeviceVector &deviceVector,
-                                             const std::string &binaryFileName,
-                                             cl_int &retVal,
-                                             const std::string &options) {
-    retVal = CL_SUCCESS;
-
-    std::string testFile;
-    retrieveBinaryKernelFilename(testFile, binaryFileName + "_", ".bin", options);
-
-    knownSource = loadDataFromFile(
-        testFile.c_str(),
-        knownSourceSize);
-
-    ASSERT_NE(0u, knownSourceSize);
-    ASSERT_NE(nullptr, knownSource);
+                                             const unsigned char **binary,
+                                             const size_t *binarySize) {
+    cleanup();
+    cl_int retVal = CL_SUCCESS;
 
     pProgram = Program::create<MockProgram>(
         pContext,
         deviceVector,
-        &knownSourceSize,
-        (const unsigned char **)&knownSource,
+        binarySize,
+        binary,
         nullptr,
         retVal);
-}
-
-void ProgramFixture::createProgramFromBinary(Context *pContext,
-                                             const ClDeviceVector &deviceVector,
-                                             const std::string &binaryFileName,
-                                             const std::string &options) {
-    cleanup();
-    cl_int retVal = CL_SUCCESS;
-    createProgramFromBinary(
-        pContext,
-        deviceVector,
-        binaryFileName,
-        retVal,
-        options);
 
     ASSERT_NE(nullptr, pProgram);
     ASSERT_EQ(CL_SUCCESS, retVal);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,45 +7,96 @@
 
 #include "shared/source/aub/aub_helper.h"
 
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/aub_mem_dump/page_table_entry_bits.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/bit_helpers.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/tbx/tbx_proto.h"
+#include "shared/source/helpers/path.h"
+#include "shared/source/helpers/string.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 
 #include "aubstream/aubstream.h"
 
 namespace NEO {
 
-uint64_t AubHelper::getTotalMemBankSize() {
-    return 32ull * MemoryConstants::gigaByte;
-}
-
-int AubHelper::getMemTrace(uint64_t pdEntryBits) {
-    if (pdEntryBits & BIT(PageTableEntry::localMemoryBit)) {
-        return AubMemDump::AddressSpaceValues::TraceLocal;
+bool AubHelper::isOneTimeAubWritableAllocationType(const AllocationType &type) {
+    switch (type) {
+    case AllocationType::constantSurface:
+    case AllocationType::globalSurface:
+    case AllocationType::kernelIsa:
+    case AllocationType::kernelIsaInternal:
+    case AllocationType::privateSurface:
+    case AllocationType::scratchSurface:
+    case AllocationType::workPartitionSurface:
+    case AllocationType::buffer:
+    case AllocationType::image:
+    case AllocationType::timestampPacketTagBuffer:
+    case AllocationType::externalHostPtr:
+    case AllocationType::mapAllocation:
+    case AllocationType::svmCpu:
+    case AllocationType::svmGpu:
+    case AllocationType::gpuTimestampDeviceBuffer:
+    case AllocationType::assertBuffer:
+    case AllocationType::tagBuffer:
+    case AllocationType::syncDispatchToken:
+    case AllocationType::hostFunction:
+    case AllocationType::commandBuffer:
+        return true;
+    case AllocationType::bufferHostMemory:
+        return NEO::debugManager.isTbxPageFaultManagerEnabled() ||
+               (NEO::debugManager.flags.SetBufferHostMemoryAlwaysAubWritable.get() == false);
+    default:
+        return false;
     }
-    return AubMemDump::AddressSpaceValues::TraceNonlocal;
 }
 
 uint64_t AubHelper::getPTEntryBits(uint64_t pdEntryBits) {
-    pdEntryBits &= ~BIT(PageTableEntry::localMemoryBit);
+    pdEntryBits &= ~makeBitMask<PageTableEntry::localMemoryBit>();
     return pdEntryBits;
 }
 
-uint32_t AubHelper::getMemType(uint32_t addressSpace) {
-    if (addressSpace == AubMemDump::AddressSpaceValues::TraceLocal) {
-        return mem_types::MEM_TYPE_LOCALMEM;
+uint64_t AubHelper::getPerTileLocalMemorySize(const HardwareInfo *pHwInfo, const ReleaseHelper &releaseHelper) {
+    if (debugManager.flags.HBMSizePerTileInGigabytes.get() > 0) {
+        return debugManager.flags.HBMSizePerTileInGigabytes.get() * MemoryConstants::gigaByte;
     }
-    return mem_types::MEM_TYPE_SYSTEM;
+    return releaseHelper.getTotalMemBankSize() / GfxCoreHelper::getSubDevicesCount(pHwInfo);
 }
 
-uint64_t AubHelper::getPerTileLocalMemorySize(const HardwareInfo *pHwInfo) {
-    if (DebugManager.flags.HBMSizePerTileInGigabytes.get() > 0) {
-        return DebugManager.flags.HBMSizePerTileInGigabytes.get() * MemoryConstants::gigaByte;
+std::string AubHelper::getDeviceConfigString(bool includeTileCount, bool includeXeCuSegment, uint32_t tileCount, uint32_t sliceCount, uint32_t subSliceCount, uint32_t euPerSubSliceCount) {
+    char configString[16] = {0};
+    int err = 0;
+    if (includeXeCuSegment) {
+        uint32_t xecuCount = 1;
+        if (sliceCount > 4) {
+            UNRECOVERABLE_IF(sliceCount % 4u != 0u);
+            xecuCount = sliceCount / 4;
+            sliceCount = sliceCount / xecuCount;
+        }
+        err = snprintf_s(configString, sizeof(configString), sizeof(configString), "%utx%ux%ux%ux%u", tileCount, xecuCount, sliceCount, subSliceCount, euPerSubSliceCount);
+    } else if (includeTileCount || tileCount > 1) {
+        err = snprintf_s(configString, sizeof(configString), sizeof(configString), "%utx%ux%ux%u", tileCount, sliceCount, subSliceCount, euPerSubSliceCount);
+    } else {
+        err = snprintf_s(configString, sizeof(configString), sizeof(configString), "%ux%ux%u", sliceCount, subSliceCount, euPerSubSliceCount);
     }
-    return getTotalMemBankSize() / GfxCoreHelper::getSubDevicesCount(pHwInfo);
+    UNRECOVERABLE_IF(err < 0);
+    return configString;
 }
+
+uint16_t AubHelper::getTbxPort(uint32_t rootDeviceIndex) {
+    auto port = static_cast<uint16_t>(debugManager.flags.TbxPort.get());
+    if (debugManager.flags.CreateMultipleRootDevices.get() > 1) {
+        port = static_cast<uint16_t>(port + rootDeviceIndex);
+    }
+    return port;
+}
+
+std::string AubHelper::getTbxSharedMemoryFileName(const std::string &fileName, uint32_t rootDeviceIndex) {
+    if (rootDeviceIndex == 0) {
+        return fileName;
+    }
+    return addSuffixBeforeExtension(fileName, "_" + std::to_string(rootDeviceIndex));
+}
+
 } // namespace NEO

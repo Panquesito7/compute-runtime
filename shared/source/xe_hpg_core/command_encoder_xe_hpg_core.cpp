@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,136 +7,78 @@
 
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/command_container/command_encoder.inl"
+#include "shared/source/command_container/command_encoder_from_gen12lp_to_xe2_hpg.inl"
+#include "shared/source/command_container/command_encoder_from_xe_hpg_core_to_xe2_hpg.inl"
+#include "shared/source/command_container/command_encoder_from_xe_hpg_core_to_xe3_core.inl"
+#include "shared/source/command_container/command_encoder_gen12lp_and_xe_hpg.inl"
+#include "shared/source/command_container/command_encoder_pre_xe2_hpg_core.inl"
+#include "shared/source/command_container/command_encoder_tgllp_and_later.inl"
+#include "shared/source/command_container/command_encoder_xe_hpg_core_and_xe_hpc.inl"
 #include "shared/source/command_container/command_encoder_xehp_and_later.inl"
-#include "shared/source/command_container/encode_compute_mode_tgllp_and_later.inl"
 #include "shared/source/command_stream/stream_properties.h"
 #include "shared/source/helpers/cache_flush_xehp_and_later.inl"
 #include "shared/source/os_interface/product_helper.h"
-#include "shared/source/release_helper/release_helper.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/source/utilities/lookup_array.h"
 #include "shared/source/xe_hpg_core/hw_cmds_xe_hpg_core_base.h"
 
 using Family = NEO::XeHpgCoreFamily;
 
-#include "shared/source/command_container/command_encoder_tgllp_and_later.inl"
-#include "shared/source/command_container/command_encoder_xe_hpg_core_and_later.inl"
-#include "shared/source/command_container/image_surface_state/compression_params_tgllp_and_later.inl"
-#include "shared/source/command_container/image_surface_state/compression_params_xehp_and_later.inl"
+#include "shared/source/command_container/command_encoder_heap_addressing.inl"
 
 namespace NEO {
 
 template <>
-void EncodeDispatchKernel<Family>::adjustTimestampPacket(WALKER_TYPE &walkerCmd, const HardwareInfo &hwInfo) {
-    auto &postSyncData = walkerCmd.getPostSync();
-
-    postSyncData.setDataportSubsliceCacheFlush(true);
-}
-
-template <>
-void EncodeDispatchKernel<Family>::appendAdditionalIDDFields(INTERFACE_DESCRIPTOR_DATA *pInterfaceDescriptor, const RootDeviceEnvironment &rootDeviceEnvironment, const uint32_t threadsPerThreadGroup, uint32_t slmTotalSize, SlmPolicy slmPolicy) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename Family::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
-    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
-    const uint32_t threadsPerDssCount = hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.DualSubSliceCount;
-    const uint32_t workGroupCountPerDss = threadsPerDssCount / threadsPerThreadGroup;
-    auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
-    const uint32_t workgroupSlmSize = gfxCoreHelper.alignSlmSize(slmTotalSize);
-
-    uint32_t slmSize = 0u;
-
-    switch (slmPolicy) {
-    case SlmPolicy::SlmPolicyLargeData:
-        slmSize = workgroupSlmSize;
-        break;
-    case SlmPolicy::SlmPolicyLargeSlm:
-    default:
-        slmSize = workgroupSlmSize * workGroupCountPerDss;
-        break;
-    }
-
-    struct SizeToPreferredSlmValue {
-        uint32_t upperLimit;
-        PREFERRED_SLM_ALLOCATION_SIZE valueToProgram;
-    };
-    const std::array<SizeToPreferredSlmValue, 6> ranges = {{
-        // upper limit, retVal
-        {0, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K},
-        {16 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_16K},
-        {32 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_32K},
-        {64 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_64K},
-        {96 * KB, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_96K},
-    }};
-
-    auto programmableIdPreferredSlmSize = PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K;
-    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
-    programmableIdPreferredSlmSize = static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(productHelper.getProductMaxPreferredSlmSize(hwInfo, programmableIdPreferredSlmSize));
-    for (auto &range : ranges) {
-        if (slmSize <= range.upperLimit) {
-            programmableIdPreferredSlmSize = range.valueToProgram;
-            break;
-        }
-    }
-    if (productHelper.isAllocationSizeAdjustmentRequired(hwInfo)) {
-        pInterfaceDescriptor->setPreferredSlmAllocationSize(PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_128K);
-    } else {
-        pInterfaceDescriptor->setPreferredSlmAllocationSize(programmableIdPreferredSlmSize);
-    }
-    if (DebugManager.flags.OverridePreferredSlmAllocationSizePerDss.get() != -1) {
-        auto toProgram =
-            static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(DebugManager.flags.OverridePreferredSlmAllocationSizePerDss.get());
-        pInterfaceDescriptor->setPreferredSlmAllocationSize(toProgram);
-    }
-}
-
-template <>
-void EncodeDispatchKernel<Family>::adjustInterfaceDescriptorData(INTERFACE_DESCRIPTOR_DATA &interfaceDescriptor, const Device &device, const HardwareInfo &hwInfo, const uint32_t threadGroupCount, const uint32_t numGrf, WALKER_TYPE &walkerCmd) {
+template <typename WalkerType, typename InterfaceDescriptorType>
+void EncodeDispatchKernel<Family>::encodeThreadGroupDispatch(InterfaceDescriptorType &interfaceDescriptor, const Device &device, const HardwareInfo &hwInfo,
+                                                             const uint32_t *threadGroupDimensions, const uint32_t threadGroupCount, const uint32_t requiredThreadGroupDispatchSize,
+                                                             const uint32_t grfCount, const uint32_t threadsPerThreadGroup, WalkerType &walkerCmd) {
     const auto &productHelper = device.getProductHelper();
-    if (productHelper.isDisableOverdispatchAvailable(hwInfo)) {
-        if (interfaceDescriptor.getNumberOfThreadsInGpgpuThreadGroup() == 1) {
+    if (requiredThreadGroupDispatchSize != 0) {
+        interfaceDescriptor.setThreadGroupDispatchSize(static_cast<typename InterfaceDescriptorType::THREAD_GROUP_DISPATCH_SIZE>(requiredThreadGroupDispatchSize));
+    } else if (productHelper.isDisableOverdispatchAvailable(hwInfo)) {
+        if (threadsPerThreadGroup == 1) {
             interfaceDescriptor.setThreadGroupDispatchSize(static_cast<INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE>(2u));
         } else {
             interfaceDescriptor.setThreadGroupDispatchSize(static_cast<INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE>(3u));
         }
     }
 
-    if (DebugManager.flags.ForceThreadGroupDispatchSize.get() != -1) {
+    if (debugManager.flags.ForceThreadGroupDispatchSize.get() != -1) {
         interfaceDescriptor.setThreadGroupDispatchSize(
-            static_cast<INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE>(DebugManager.flags.ForceThreadGroupDispatchSize.get()));
+            static_cast<INTERFACE_DESCRIPTOR_DATA::THREAD_GROUP_DISPATCH_SIZE>(debugManager.flags.ForceThreadGroupDispatchSize.get()));
     }
 }
 
 template <>
-void EncodeDispatchKernel<Family>::programBarrierEnable(INTERFACE_DESCRIPTOR_DATA &interfaceDescriptor, uint32_t value, const HardwareInfo &hwInfo) {
+template <>
+void EncodeDispatchKernel<Family>::programBarrierEnable(INTERFACE_DESCRIPTOR_DATA &interfaceDescriptor, const KernelDescriptor &kernelDescriptor) {
     using BARRIERS = INTERFACE_DESCRIPTOR_DATA::NUMBER_OF_BARRIERS;
     static const LookupArray<uint32_t, BARRIERS, 2> barrierLookupArray({{{0, BARRIERS::NUMBER_OF_BARRIERS_NONE},
                                                                          {1, BARRIERS::NUMBER_OF_BARRIERS_B1}}});
-    BARRIERS numBarriers = barrierLookupArray.lookUp(value);
+    BARRIERS numBarriers = barrierLookupArray.lookUp(kernelDescriptor.kernelAttributes.barrierCount);
     interfaceDescriptor.setNumberOfBarriers(numBarriers);
 }
 
 template <>
-void EncodeDispatchKernel<Family>::encodeAdditionalWalkerFields(const RootDeviceEnvironment &rootDeviceEnvironment, WALKER_TYPE &walkerCmd, const EncodeWalkerArgs &walkerArgs) {
-    auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
-    auto *releaseHelper = rootDeviceEnvironment.getReleaseHelper();
-    bool l3PrefetchDisable = productHelper.isPrefetchDisablingRequired(releaseHelper);
-    int32_t overrideL3PrefetchDisable = DebugManager.flags.ForceL3PrefetchForComputeWalker.get();
-    if (overrideL3PrefetchDisable != -1) {
-        l3PrefetchDisable = !overrideL3PrefetchDisable;
-    }
-    walkerCmd.setL3PrefetchDisable(l3PrefetchDisable);
-}
+template <typename WalkerType>
+void EncodeDispatchKernel<Family>::encodeWalkerPostSyncFields(WalkerType &walkerCmd, const RootDeviceEnvironment &rootDeviceEnvironment, const EncodeWalkerArgs &walkerArgs) {}
 
 template <>
-void EncodeComputeMode<Family>::programComputeModeCommand(LinearStream &csr, StateComputeModeProperties &properties, const RootDeviceEnvironment &rootDeviceEnvironment, LogicalStateHelper *logicalStateHelper) {
+template <typename WalkerType, typename InterfaceDescriptorType>
+void EncodeDispatchKernel<Family>::encodeComputeDispatchAllWalker(WalkerType &walkerCmd, const InterfaceDescriptorType *idd, const RootDeviceEnvironment &rootDeviceEnvironment, const EncodeWalkerArgs &walkerArgs) {}
+
+template <>
+void EncodeComputeMode<Family>::programComputeModeCommand(LinearStream &csr, StateComputeModeProperties &properties, const RootDeviceEnvironment &rootDeviceEnvironment) {
     using STATE_COMPUTE_MODE = typename Family::STATE_COMPUTE_MODE;
-    using FORCE_NON_COHERENT = typename STATE_COMPUTE_MODE::FORCE_NON_COHERENT;
     using PIXEL_ASYNC_COMPUTE_THREAD_LIMIT = typename STATE_COMPUTE_MODE::PIXEL_ASYNC_COMPUTE_THREAD_LIMIT;
     using Z_PASS_ASYNC_COMPUTE_THREAD_LIMIT = typename STATE_COMPUTE_MODE::Z_PASS_ASYNC_COMPUTE_THREAD_LIMIT;
 
     STATE_COMPUTE_MODE stateComputeMode = Family::cmdInitStateComputeMode;
     auto maskBits = stateComputeMode.getMaskBits();
 
-    auto &productHelper = rootDeviceEnvironment.getProductHelper();
-    bool ignoreIsDirty = productHelper.programAllStateComputeCommandFields();
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    bool ignoreIsDirty = hwInfo.caps.programAllStateComputeCommandFieldsWARequired;
 
     if (properties.zPassAsyncComputeThreadLimit.isDirty ||
         (ignoreIsDirty && (properties.zPassAsyncComputeThreadLimit.value != -1))) {
@@ -159,7 +101,8 @@ void EncodeComputeMode<Family>::programComputeModeCommand(LinearStream &csr, Sta
 
     stateComputeMode.setMaskBits(maskBits);
 
-    productHelper.setForceNonCoherent(&stateComputeMode, properties);
+    auto &productHelper = rootDeviceEnvironment.getProductHelper();
+    productHelper.setForceNonCoherent(&stateComputeMode);
 
     auto buffer = csr.getSpaceForCmd<STATE_COMPUTE_MODE>();
     *buffer = stateComputeMode;
@@ -169,7 +112,7 @@ template <>
 void EncodeSurfaceState<Family>::appendParamsForImageFromBuffer(R_SURFACE_STATE *surfaceState) {
     const auto ccsMode = R_SURFACE_STATE::AUXILIARY_SURFACE_MODE::AUXILIARY_SURFACE_MODE_AUX_CCS_E;
     if (ccsMode == surfaceState->getAuxiliarySurfaceMode() && R_SURFACE_STATE::SURFACE_TYPE::SURFACE_TYPE_SURFTYPE_2D == surfaceState->getSurfaceType()) {
-        if (DebugManager.flags.DecompressInL3ForImage2dFromBuffer.get() != 0) {
+        if (debugManager.flags.DecompressInL3ForImage2dFromBuffer.get() != 0) {
             surfaceState->setAuxiliarySurfaceMode(AUXILIARY_SURFACE_MODE::AUXILIARY_SURFACE_MODE_AUX_NONE);
             surfaceState->setDecompressInL3(R_SURFACE_STATE::DECOMPRESS_IN_L3_ENABLE);
             surfaceState->setMemoryCompressionEnable(1);
@@ -179,15 +122,37 @@ void EncodeSurfaceState<Family>::appendParamsForImageFromBuffer(R_SURFACE_STATE 
 }
 
 template <>
-void EncodeDispatchKernel<Family>::adjustWalkOrder(WALKER_TYPE &walkerCmd, uint32_t requiredWorkGroupOrder, const RootDeviceEnvironment &rootDeviceEnvironment) {
-    auto &productHelper = rootDeviceEnvironment.template getHelper<ProductHelper>();
-    if (productHelper.isAdjustWalkOrderAvailable(rootDeviceEnvironment.getReleaseHelper())) {
+template <typename WalkerType>
+void EncodeDispatchKernel<Family>::adjustWalkOrder(WalkerType &walkerCmd, uint32_t requiredWorkGroupOrder, const HardwareInfo &hwInfo) {
+    if (hwInfo.caps.adjustWalkOrderAvailable) {
         if (HwWalkOrderHelper::compatibleDimensionOrders[requiredWorkGroupOrder] == HwWalkOrderHelper::linearWalk) {
-            walkerCmd.setDispatchWalkOrder(WALKER_TYPE::DISPATCH_WALK_ORDER::LINERAR_WALKER);
+            walkerCmd.setDispatchWalkOrder(WalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_LINEAR_WALK);
         } else if (HwWalkOrderHelper::compatibleDimensionOrders[requiredWorkGroupOrder] == HwWalkOrderHelper::yOrderWalk) {
-            walkerCmd.setDispatchWalkOrder(WALKER_TYPE::DISPATCH_WALK_ORDER::Y_ORDER_WALKER);
+            walkerCmd.setDispatchWalkOrder(WalkerType::DISPATCH_WALK_ORDER::DISPATCH_WALK_ORDER_Y_ORDER_WALK);
         }
     }
+}
+
+template <>
+uint32_t EncodeDispatchKernel<Family>::alignSlmSizePerThreadGroup(uint32_t slmSize, [[maybe_unused]] const ReleaseHelper &releaseHelper) {
+    if (slmSize == 0u) {
+        return 0u;
+    }
+    slmSize = std::max(slmSize, 1024u);
+    slmSize = Math::nextPowerOfTwo(slmSize);
+    UNRECOVERABLE_IF(slmSize > 64u * MemoryConstants::kiloByte);
+    return slmSize;
+}
+
+template <>
+uint32_t EncodeDispatchKernel<Family>::computeSlmValues(const HardwareInfo &hwInfo, uint32_t slmSize, [[maybe_unused]] const ReleaseHelper &releaseHelper) {
+    auto slmValue = std::max(slmSize, 1024u);
+    slmValue = Math::nextPowerOfTwo(slmValue);
+    slmValue = Math::getMinLsbSet(slmValue);
+    slmValue = slmValue - 9;
+    DEBUG_BREAK_IF(slmValue > 7);
+    slmValue *= !!slmSize;
+    return slmValue;
 }
 
 template <>
@@ -198,10 +163,11 @@ void adjustL3ControlField<Family>(void *l3ControlBuffer) {
 }
 
 template <>
-void EncodeMiFlushDW<Family>::appendWa(LinearStream &commandStream, MiFlushArgs &args) {
-    BlitCommandsHelper<Family>::dispatchDummyBlit(commandStream, args.waArgs);
-    auto miFlushDwCmd = commandStream.getSpaceForCmd<MI_FLUSH_DW>();
-    *miFlushDwCmd = Family::cmdInitMiFlushDw;
+void EncodeMiFlushDW<Family>::appendWa(void *&cmdBuffer, MiFlushArgs &args) {
+    BlitCommandsHelper<Family>::dispatchDummyBlit(cmdBuffer, args.waArgs);
+
+    *reinterpret_cast<MI_FLUSH_DW *>(cmdBuffer) = Family::cmdInitMiFlushDw;
+    cmdBuffer = ptrOffset(cmdBuffer, sizeof(MI_FLUSH_DW));
 }
 
 template <>
@@ -209,30 +175,19 @@ size_t EncodeMiFlushDW<Family>::getWaSize(const EncodeDummyBlitWaArgs &waArgs) {
     return sizeof(typename Family::MI_FLUSH_DW) + BlitCommandsHelper<Family>::getDummyBlitSize(waArgs);
 }
 
-template void flushGpuCache<Family>(LinearStream *commandStream, const Range<L3Range> &ranges, uint64_t postSyncAddress, const HardwareInfo &hwInfo);
+template <typename Family>
+void EncodeMiFlushDW<Family>::setFlushes(MI_FLUSH_DW *miFlushDwCmd, const ProductHelper &productHelper) {
+    miFlushDwCmd->setFlushCcs(1);
+    miFlushDwCmd->setFlushLlc(1);
+}
 
-template struct EncodeDispatchKernel<Family>;
-template struct EncodeStates<Family>;
-template struct EncodeMath<Family>;
-template struct EncodeMathMMIO<Family>;
-template struct EncodeIndirectParams<Family>;
-template struct EncodeSetMMIO<Family>;
-template struct EncodeMediaInterfaceDescriptorLoad<Family>;
-template struct EncodeStateBaseAddress<Family>;
-template struct EncodeStoreMMIO<Family>;
-template struct EncodeSurfaceState<Family>;
-template struct EncodeComputeMode<Family>;
-template struct EncodeAtomic<Family>;
-template struct EncodeSemaphore<Family>;
-template struct EncodeBatchBufferStartOrEnd<Family>;
-template struct EncodeMiFlushDW<Family>;
-template struct EncodeMiPredicate<Family>;
-template struct EncodeMemoryPrefetch<Family>;
-template struct EncodeMiArbCheck<Family>;
-template struct EncodeWA<Family>;
-template struct EncodeEnableRayTracing<Family>;
-template struct EncodeNoop<Family>;
-template struct EncodeStoreMemory<Family>;
-template struct EncodeMemoryFence<Family>;
-template struct EncodeKernelArgsBuffer<Family>;
+} // namespace NEO
+
+#include "shared/source/command_container/command_encoder_enablers.inl"
+
+namespace NEO {
+template void flushGpuCache<Family>(LinearStream *commandStream, std::span<const L3Range> ranges, uint64_t postSyncAddress, const HardwareInfo &hwInfo);
+template struct EncodeDispatchKernelWithHeap<Family>;
+template void NEO::EncodeDispatchKernelWithHeap<Family>::adjustBindingTablePrefetch<Family::DefaultWalkerType::InterfaceDescriptorType>(Family::DefaultWalkerType::InterfaceDescriptorType &, unsigned int, unsigned int);
+
 } // namespace NEO

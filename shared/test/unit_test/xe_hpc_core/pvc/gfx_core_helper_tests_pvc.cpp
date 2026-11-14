@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -63,14 +63,14 @@ PVCTEST_F(GfxCoreHelperTestsPvc, givenRevisionEnumAndPlatformFamilyTypeThenPrope
 }
 
 PVCTEST_F(GfxCoreHelperTestsPvc, givenDefaultMemorySynchronizationCommandsWhenGettingSizeForAdditionalSynchronizationThenCorrectValueIsReturned) {
-    EXPECT_EQ(sizeof(typename FamilyType::MI_MEM_FENCE), MemorySynchronizationCommands<XeHpcCoreFamily>::getSizeForAdditonalSynchronization(pDevice->getRootDeviceEnvironment()));
+    EXPECT_EQ(sizeof(typename FamilyType::MI_MEM_FENCE), MemorySynchronizationCommands<XeHpcCoreFamily>::getSizeForAdditionalSynchronization(NEO::FenceType::release, pDevice->getRootDeviceEnvironment()));
 }
 
 PVCTEST_F(GfxCoreHelperTestsPvc, givenDebugMemorySynchronizationCommandsWhenGettingSizeForAdditionalSynchronizationThenCorrectValueIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DisablePipeControlPrecedingPostSyncCommand.set(1);
+    debugManager.flags.DisablePipeControlPrecedingPostSyncCommand.set(1);
 
-    EXPECT_EQ(2 * sizeof(typename FamilyType::MI_MEM_FENCE), MemorySynchronizationCommands<XeHpcCoreFamily>::getSizeForAdditonalSynchronization(pDevice->getRootDeviceEnvironment()));
+    EXPECT_EQ(2 * sizeof(typename FamilyType::MI_MEM_FENCE), MemorySynchronizationCommands<XeHpcCoreFamily>::getSizeForAdditionalSynchronization(NEO::FenceType::release, pDevice->getRootDeviceEnvironment()));
 }
 
 PVCTEST_F(GfxCoreHelperTestsPvc, givenRevisionIdWhenGetComputeUnitsUsedForScratchThenReturnValidValue) {
@@ -128,13 +128,13 @@ PVCTEST_F(GfxCoreHelperTestsPvc, givenMemorySynchronizationCommandsWhenAddingSyn
 
     for (auto &testInput : testInputs) {
         hardwareInfo.platform.usRevId = testInput.revisionId;
-        DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(
             testInput.programGlobalFenceAsMiMemFenceCommandInCommandStream);
 
         LinearStream commandStream(buffer, 128);
-        auto synchronizationSize = MemorySynchronizationCommands<FamilyType>::getSizeForSingleAdditionalSynchronization(rootDeviceEnvironment);
+        auto synchronizationSize = MemorySynchronizationCommands<FamilyType>::getSizeForSingleAdditionalSynchronization(NEO::FenceType::release, rootDeviceEnvironment);
 
-        MemorySynchronizationCommands<FamilyType>::addAdditionalSynchronization(commandStream, gpuAddress, false, rootDeviceEnvironment);
+        MemorySynchronizationCommands<FamilyType>::addAdditionalSynchronization(commandStream, gpuAddress, NEO::FenceType::release, rootDeviceEnvironment);
 
         HardwareParse hwParser;
         hwParser.parseCommands<FamilyType>(commandStream);
@@ -145,15 +145,15 @@ PVCTEST_F(GfxCoreHelperTestsPvc, givenMemorySynchronizationCommandsWhenAddingSyn
 
             auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*hwParser.cmdList.begin());
             ASSERT_NE(nullptr, semaphoreCmd);
-            EXPECT_EQ(static_cast<uint32_t>(-2), semaphoreCmd->getSemaphoreDataDword());
-            EXPECT_EQ(gpuAddress, semaphoreCmd->getSemaphoreGraphicsAddress());
+            EXPECT_EQ(static_cast<uint32_t>(-2), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
+            EXPECT_EQ(gpuAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
             EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD, semaphoreCmd->getCompareOperation());
         } else {
             EXPECT_EQ(sizeof(MI_MEM_FENCE), synchronizationSize);
 
             auto fenceCmd = genCmdCast<MI_MEM_FENCE *>(*hwParser.cmdList.begin());
             ASSERT_NE(nullptr, fenceCmd);
-            EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE, fenceCmd->getFenceType());
+            EXPECT_EQ(MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE, fenceCmd->getFenceType());
         }
     }
 }
@@ -167,40 +167,29 @@ PVCTEST_F(GfxCoreHelperTestsPvc, GivenCooperativeEngineSupportedAndNotUsedWhenAd
     auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
 
     hwInfo.capabilityTable.defaultEngineType = aub_stream::EngineType::ENGINE_CCS;
-    hwInfo.featureTable.flags.ftrRcsNode = false;
 
     auto tilePartsForConcurrentKernels = PVC::numberOfpartsInTileForConcurrentKernels;
     auto passedMaxWorkGroupCount = 1024;
 
-    uint32_t revisions[] = {REVISION_A0, REVISION_B};
+    uint32_t revisions[] = {REVISION_A0, REVISION_B, REVISION_C};
     for (auto &revision : revisions) {
         auto hwRevId = productHelper.getHwRevIdFromStepping(revision, hwInfo);
-        if (hwRevId == CommonConstants::invalidStepping) {
-            continue;
-        }
         hwInfo.platform.usRevId = hwRevId;
-
-        for (auto isEngineInstanced : ::testing::Bool()) {
+        for (auto engineGroupType : {EngineGroupType::renderCompute, EngineGroupType::compute, EngineGroupType::cooperativeCompute}) {
             for (auto isRcsEnabled : ::testing::Bool()) {
-                hwInfo.featureTable.flags.ftrRcsNode = isRcsEnabled;
-                for (auto engineGroupType : {EngineGroupType::RenderCompute, EngineGroupType::Compute, EngineGroupType::CooperativeCompute}) {
-                    if (productHelper.isCooperativeEngineSupported(hwInfo)) {
-                        bool disallowDispatch = (engineGroupType == EngineGroupType::RenderCompute) ||
-                                                ((engineGroupType == EngineGroupType::Compute) && isRcsEnabled);
-                        bool applyLimitation = !isEngineInstanced &&
-                                               (engineGroupType != EngineGroupType::CooperativeCompute);
-                        if (disallowDispatch) {
-                            EXPECT_EQ(1u, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment, isEngineInstanced));
-                        } else if (applyLimitation) {
-                            hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
-                            EXPECT_EQ(passedMaxWorkGroupCount / tilePartsForConcurrentKernels, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment, isEngineInstanced));
-                            hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 16;
-                            EXPECT_EQ(passedMaxWorkGroupCount / hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment, isEngineInstanced));
-                        } else {
-                            EXPECT_EQ(passedMaxWorkGroupCount / tilePartsForConcurrentKernels, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment, isEngineInstanced));
-                        }
-                    } else {
-                        EXPECT_EQ(passedMaxWorkGroupCount / tilePartsForConcurrentKernels, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment, isEngineInstanced));
+                hwInfo.caps.rcsExposureDisabled = !isRcsEnabled;
+                bool disallowDispatch = (engineGroupType == EngineGroupType::renderCompute ||
+                                         (engineGroupType == EngineGroupType::compute && isRcsEnabled)) &&
+                                        productHelper.isCooperativeEngineSupported(hwInfo);
+                if (disallowDispatch) {
+                    EXPECT_EQ(1u, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment));
+                } else {
+                    for (uint32_t ccsCount : {1, 2, 4}) {
+                        hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = ccsCount;
+                        tilePartsForConcurrentKernels = ccsCount == 1   ? 1
+                                                        : ccsCount == 2 ? 4
+                                                                        : 8;
+                        EXPECT_EQ(passedMaxWorkGroupCount / tilePartsForConcurrentKernels, gfxCoreHelper.adjustMaxWorkGroupCount(passedMaxWorkGroupCount, engineGroupType, rootDeviceEnvironment));
                     }
                 }
             }

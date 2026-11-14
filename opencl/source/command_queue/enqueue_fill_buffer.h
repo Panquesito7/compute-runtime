@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,13 @@
 
 #pragma once
 #include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/helpers/addressing_mode_helper.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
 #include "shared/source/memory_manager/memory_manager.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
 
@@ -30,37 +32,38 @@ cl_int CommandQueueHw<GfxFamily>::enqueueFillBuffer(
     auto memoryManager = getDevice().getMemoryManager();
     DEBUG_BREAK_IF(nullptr == memoryManager);
 
-    auto commandStreamReceieverOwnership = getGpgpuCommandStreamReceiver().obtainUniqueOwnership();
+    auto commandStreamReceiverOwnership = getGpgpuCommandStreamReceiver().obtainUniqueOwnership();
     auto storageWithAllocations = getGpgpuCommandStreamReceiver().getInternalAllocationStorage();
-    auto allocationType = AllocationType::FILL_PATTERN;
+    auto allocationType = AllocationType::fillPattern;
     auto patternAllocation = storageWithAllocations->obtainReusableAllocation(patternSize, allocationType).release();
-    commandStreamReceieverOwnership.unlock();
+    commandStreamReceiverOwnership.unlock();
 
     if (!patternAllocation) {
-        patternAllocation = memoryManager->allocateGraphicsMemoryWithProperties({getDevice().getRootDeviceIndex(), alignUp(patternSize, MemoryConstants::cacheLineSize), AllocationType::FILL_PATTERN, getDevice().getDeviceBitfield()});
+        patternAllocation = memoryManager->allocateGraphicsMemoryWithProperties({getDevice().getRootDeviceIndex(), alignUp(patternSize, MemoryConstants::cacheLineSize), AllocationType::fillPattern, getDevice().getDeviceBitfield()});
     }
 
     if (patternSize == 1) {
-        int patternInt = (uint32_t)((*(uint8_t *)pattern << 24) | (*(uint8_t *)pattern << 16) | (*(uint8_t *)pattern << 8) | *(uint8_t *)pattern);
-        memcpy_s(patternAllocation->getUnderlyingBuffer(), sizeof(int), &patternInt, sizeof(int));
+        auto patternValue = *reinterpret_cast<const uint8_t *>(pattern);
+        int patternInt = static_cast<uint32_t>((patternValue << 24) | (patternValue << 16) | (patternValue << 8) | patternValue);
+        memcpy_s(patternAllocation->getUnderlyingBuffer(), sizeof(uint32_t), &patternInt, sizeof(uint32_t));
     } else if (patternSize == 2) {
-        int patternInt = (uint32_t)((*(uint16_t *)pattern << 16) | *(uint16_t *)pattern);
-        memcpy_s(patternAllocation->getUnderlyingBuffer(), sizeof(int), &patternInt, sizeof(int));
+        auto patternValue = *reinterpret_cast<const uint16_t *>(pattern);
+        int patternInt = static_cast<uint32_t>((patternValue << 16) | patternValue);
+        memcpy_s(patternAllocation->getUnderlyingBuffer(), sizeof(uint32_t), &patternInt, sizeof(uint32_t));
     } else {
         memcpy_s(patternAllocation->getUnderlyingBuffer(), patternSize, pattern, patternSize);
     }
 
-    auto eBuiltInOps = EBuiltInOps::FillBuffer;
-    if (forceStateless(buffer->getSize())) {
-        eBuiltInOps = EBuiltInOps::FillBufferStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(buffer->getSize());
+    BuiltIn::BuiltInId builtIn{BuiltIn::BaseKernel::fillBuffer, builtInMode};
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(eBuiltInOps,
-                                                                            this->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(builtIn,
+                                                                              this->getClDevice());
 
-    BuiltInOwnershipWrapper builtInLock(builder, this->context);
+    BuiltIn::OwnershipWrapper builtInLock(builder, this->context);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     auto multiGraphicsAllocation = MultiGraphicsAllocation(getDevice().getRootDeviceIndex());
     multiGraphicsAllocation.addAllocation(patternAllocation);
 

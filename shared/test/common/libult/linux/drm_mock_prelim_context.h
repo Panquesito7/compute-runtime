@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -37,6 +37,8 @@ struct CreateGemExt {
         uint64_t param{0};
     };
     std::optional<SetParam> setParamExt{};
+    std::optional<SetParam> pairSetParamExt{};
+    std::optional<SetParam> chunkingSetParamExt{};
 
     struct MemoryClassInstance {
         uint16_t memoryClass{0};
@@ -48,6 +50,12 @@ struct CreateGemExt {
         std::optional<uint32_t> vmId{};
     };
     VmPrivate vmPrivateExt{};
+
+    struct MemPolicy {
+        std::optional<uint32_t> mode{};
+        std::optional<std::vector<unsigned long>> nodeMask{};
+    };
+    MemPolicy memPolicyExt{};
 };
 
 struct GemContextParamAcc {
@@ -89,7 +97,7 @@ struct UuidVmBindExt {
 };
 
 struct DrmMockPrelimContext {
-    const HardwareInfo *hwInfo;
+    HardwareInfo *hwInfo;
     const RootDeviceEnvironment &rootDeviceEnvironment;
     const CacheInfo *cacheInfo;
     const bool &failRetTopology;
@@ -111,6 +119,10 @@ struct DrmMockPrelimContext {
     size_t vmBindQueryCalled{0};
     int vmBindQueryValue{0};
     int vmBindQueryReturn{0};
+
+    size_t chunkingQueryCalled{0};
+    int chunkingQueryValue{0};
+    int chunkingQueryReturn{0};
 
     size_t vmBindCalled{0};
     std::optional<VmBindParams> receivedVmBind{};

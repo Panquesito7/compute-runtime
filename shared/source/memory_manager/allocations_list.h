@@ -1,19 +1,20 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/memory_manager/allocation_usage.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
-#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/utilities/idlist.h"
 
 #include <memory>
 
 namespace NEO {
 class CommandStreamReceiver;
+class Device;
 
 class AllocationsList : public IDList<GraphicsAllocation, true, true> {
   public:
@@ -21,7 +22,10 @@ class AllocationsList : public IDList<GraphicsAllocation, true, true> {
     AllocationsList(AllocationUsage allocationUsage);
 
     std::unique_ptr<GraphicsAllocation> detachAllocation(size_t requiredMinimalSize, const void *requiredPtr, CommandStreamReceiver *commandStreamReceiver, AllocationType allocationType);
+    std::unique_ptr<GraphicsAllocation> detachAllocation(size_t requiredMinimalSize, const void *requiredPtr, CommandStreamReceiver *commandStreamReceiver, AllocationType allocationType, bool *nonUsmHostPtrPartialOverlapFound);
     std::unique_ptr<GraphicsAllocation> detachAllocation(size_t requiredMinimalSize, const void *requiredPtr, bool forceSystemMemoryFlag, CommandStreamReceiver *commandStreamReceiver, AllocationType allocationType);
+    std::unique_ptr<GraphicsAllocation> detachAllocation(size_t requiredMinimalSize, const void *requiredPtr, bool forceSystemMemoryFlag, CommandStreamReceiver *commandStreamReceiver, AllocationType allocationType, bool *nonUsmHostPtrPartialOverlapFound);
+    std::unique_ptr<GraphicsAllocation> detachAllocation(size_t requiredMinimalSize, const void *requiredPtr, bool forceSystemMemoryFlag, CommandStreamReceiver *commandStreamReceiver, AllocationType allocationType, Device &device);
     void freeAllGraphicsAllocations(Device *neoDevice);
 
   private:

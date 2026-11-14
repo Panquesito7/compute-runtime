@@ -1,15 +1,31 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#if _WIN32
-#include <windows.h>
+#if defined(_WIN32)
+#if __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wignored-pragma-intrinsic"
+#pragma clang diagnostic ignored "-Wpragma-pack"
+#pragma clang diagnostic ignored "-Wignored-attributes"
+#pragma clang diagnostic ignored "-Wmacro-redefined"
+#endif
 
+#include <Windows.h>
+
+#include <SetupAPI.h>
+#include <ShlObj.h>
+#include <cfgmgr32.h>
 #include <winternl.h>
+#pragma comment(lib, "cfgmgr32.lib")
+
+#if __clang__
+#pragma clang diagnostic pop
+#endif
 
 #pragma warning(push)
 #pragma warning(disable : 4005)
@@ -33,9 +49,10 @@
 #if __clang__
 #pragma clang diagnostic pop
 #endif
-#include <x86intrin.h>
 
 #define STATUS_GRAPHICS_NO_VIDEO_MEMORY ((NTSTATUS)0xC01E0100L)
+
+#define STANDARD_RIGHTS_REQUIRED 0x000F0000
 
 #define PAGE_NOACCESS 0x01
 #define PAGE_READWRITE 0x04
@@ -44,6 +61,9 @@
 #define MEM_TOP_DOWN 0x00100000
 #define MEM_RELEASE 0x00008000
 #define MEM_FREE 0x00010000
+
+#define FILE_MAP_WRITE 0x0002
+#define FILE_MAP_READ 0x0004
 
 #define DXGI_RESOURCE_PRIORITY_NORMAL 0x78000000
 #define DXGI_RESOURCE_PRIORITY_HIGH 0xa0000000

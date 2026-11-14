@@ -1,24 +1,25 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/core/source/cmdlist/cmdlist.h"
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
+
+#include <cstring>
 
 namespace L0 {
 
-DeviceImp::CmdListCreateFunPtrT DeviceImp::getCmdListCreateFunc(const ze_command_list_desc_t *desc) {
-    return &CommandList::create;
+bool Device::fabricEdgeModelSupportsBandwidthAndLatency(const char *model) {
+    return strstr(model, "XeLink") != nullptr;
 }
 
-uint32_t DeviceImp::getAdditionalEngines(uint32_t numAdditionalEnginesRequested,
-                                         ze_command_queue_group_properties_t *pCommandQueueGroupProperties) {
+uint32_t Device::getAdditionalEngines(uint32_t numAdditionalEnginesRequested,
+                                      ze_command_queue_group_properties_t *pCommandQueueGroupProperties) {
     return 0;
 }
 
-void DeviceImp::getExtendedDeviceModuleProperties(ze_base_desc_t *pExtendedProperties) {}
+void Device::getAdditionalExtProperties(ze_base_properties_t *extendedProperties) {}
 
 } // namespace L0

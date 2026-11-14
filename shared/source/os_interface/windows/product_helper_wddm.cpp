@@ -1,66 +1,28 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/preemption.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
-#include "shared/source/helpers/compiler_product_helper.h"
-#include "shared/source/helpers/constants.h"
-#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/product_helper.h"
-
-#include "hw_cmds.h"
 
 namespace NEO {
 
 int ProductHelper::configureHwInfoWddm(const HardwareInfo *inHwInfo, HardwareInfo *outHwInfo, const RootDeviceEnvironment &rootDeviceEnvironment) {
-    auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
-    auto &compilerProductHelper = rootDeviceEnvironment.getHelper<CompilerProductHelper>();
-    outHwInfo->capabilityTable.ftrSvm = outHwInfo->featureTable.flags.ftrSVM;
-
-    gfxCoreHelper.adjustDefaultEngineType(outHwInfo, *this);
-    outHwInfo->capabilityTable.defaultEngineType = getChosenEngineType(*outHwInfo);
-
     this->setCapabilityCoherencyFlag(*outHwInfo, outHwInfo->capabilityTable.ftrSupportsCoherency);
     outHwInfo->capabilityTable.ftrSupportsCoherency &= inHwInfo->featureTable.flags.ftrL3IACoherency;
 
-    PreemptionHelper::adjustDefaultPreemptionMode(outHwInfo->capabilityTable,
-                                                  compilerProductHelper.isMidThreadPreemptionSupported(*outHwInfo),
-                                                  static_cast<bool>(outHwInfo->featureTable.flags.ftrGpGpuThreadGroupLevelPreempt),
-                                                  static_cast<bool>(outHwInfo->featureTable.flags.ftrGpGpuMidBatchPreempt));
-
-    if (DebugManager.flags.OverridePreemptionSurfaceSizeInMb.get() >= 0) {
-        outHwInfo->gtSystemInfo.CsrSizeInMb = static_cast<uint32_t>(DebugManager.flags.OverridePreemptionSurfaceSizeInMb.get());
-    }
-    outHwInfo->capabilityTable.requiredPreemptionSurfaceSize = outHwInfo->gtSystemInfo.CsrSizeInMb * MemoryConstants::megaByte;
-    gfxCoreHelper.adjustPreemptionSurfaceSize(outHwInfo->capabilityTable.requiredPreemptionSurfaceSize);
-
-    auto &kmdNotifyProperties = outHwInfo->capabilityTable.kmdNotifyProperties;
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideEnableKmdNotify.get(), kmdNotifyProperties.enableKmdNotify);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideKmdNotifyDelayMicroseconds.get(), kmdNotifyProperties.delayKmdNotifyMicroseconds);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideEnableQuickKmdSleep.get(), kmdNotifyProperties.enableQuickKmdSleep);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideQuickKmdSleepDelayMicroseconds.get(), kmdNotifyProperties.delayQuickKmdSleepMicroseconds);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideEnableQuickKmdSleepForSporadicWaits.get(), kmdNotifyProperties.enableQuickKmdSleepForSporadicWaits);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideDelayQuickKmdSleepForSporadicWaitsMicroseconds.get(), kmdNotifyProperties.delayQuickKmdSleepForSporadicWaitsMicroseconds);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideEnableQuickKmdSleepForDirectSubmission.get(), kmdNotifyProperties.enableQuickKmdSleepForDirectSubmission);
-    KmdNotifyHelper::overrideFromDebugVariable(DebugManager.flags.OverrideDelayQuickKmdSleepForDirectSubmissionMicroseconds.get(), kmdNotifyProperties.delayQuickKmdSleepForDirectSubmissionMicroseconds);
-
-    auto osInterface = rootDeviceEnvironment.osInterface.get();
-    // Product specific config
-    int ret = configureHardwareCustom(outHwInfo, osInterface);
-    if (ret != 0) {
-        *outHwInfo = {};
-    }
-
-    if (DebugManager.flags.ForceImagesSupport.get() != -1) {
-        outHwInfo->capabilityTable.supportsImages = DebugManager.flags.ForceImagesSupport.get();
-    }
-
+    EngineHelpers::setupDefaultEngineType(rootDeviceEnvironment);
+    setupPreemptionMode(*outHwInfo, true);
+    setupPreemptionSurfaceSize(*outHwInfo, rootDeviceEnvironment);
+    setupKmdNotifyProperties(outHwInfo->capabilityTable.kmdNotifyProperties);
+    auto ret = setupProductSpecificConfig(*outHwInfo, rootDeviceEnvironment);
+    setupImageSupport(*outHwInfo);
     return ret;
 }
 

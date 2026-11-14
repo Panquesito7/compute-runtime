@@ -1,35 +1,43 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/gmm_helper/gmm_lib.h"
+#include "shared/source/gmm_helper/gmm_resource_usage_type.h"
+
+#include <cstddef>
+#include <cstdint>
 
 namespace CacheSettings {
-inline constexpr uint32_t unknownMocs = GMM_RESOURCE_USAGE_UNKNOWN;
+inline constexpr uint32_t unknownMocs = -1;
 } // namespace CacheSettings
 
 namespace NEO {
+
 enum class AllocationType;
 struct HardwareInfo;
 class ProductHelper;
+class ReleaseHelper;
+struct RootDeviceEnvironment;
 
 struct CacheSettingsHelper {
-    static GMM_RESOURCE_USAGE_TYPE_ENUM getGmmUsageType(AllocationType allocationType, bool forceUncached, const ProductHelper &productHelper);
+    static GmmResourceUsageType getGmmUsageType(AllocationType allocationType, bool forceUncached, const ProductHelper &productHelper, const HardwareInfo &hwInfo);
+    static GmmResourceUsageType getGmmUsageTypeForImage();
+    static GmmResourceUsageType getGmmUsageTypeForKmdMappedIsa(AllocationType allocationType, bool forceUncached, const ProductHelper &productHelper, const HardwareInfo &hwInfo);
+    static GmmResourceUsageType getGmmUsageTypeForUserPtr(bool isCacheFlushRequired, const void *userPtr, size_t size, const HardwareInfo &hwInfo, const ReleaseHelper &releaseHelper);
+    static GmmResourceUsageType getGmmUsageTypeForCoherentSystemMemory(GmmResourceUsageType preferredUsageType, const ProductHelper &productHelper, const ReleaseHelper &releaseHelper);
 
-    static constexpr bool isUncachedType(GMM_RESOURCE_USAGE_TYPE_ENUM gmmResourceUsageType) {
-        return ((gmmResourceUsageType == GMM_RESOURCE_USAGE_OCL_BUFFER_CSR_UC) ||
-                (gmmResourceUsageType == GMM_RESOURCE_USAGE_OCL_SYSTEM_MEMORY_BUFFER_CACHELINE_MISALIGNED) ||
-                (gmmResourceUsageType == GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED));
-    }
+    static GmmResourceUsageType getGmmUsageTypeForStateHeap(bool forceUncached);
+    static bool isUncachedType(GmmResourceUsageType gmmResourceUsageType);
 
-    static bool isResourceCacheableOnCpu(GMM_RESOURCE_USAGE_TYPE_ENUM gmmResourceUsageType, const ProductHelper &productHelper, bool isWsl);
+    static bool preferNoCpuAccess(GmmResourceUsageType gmmResourceUsageType, const RootDeviceEnvironment &rootDeviceEnvironment);
 
   protected:
-    static GMM_RESOURCE_USAGE_TYPE_ENUM getDefaultUsageTypeWithCachingEnabled(AllocationType allocationType, const ProductHelper &productHelper);
-    static GMM_RESOURCE_USAGE_TYPE_ENUM getDefaultUsageTypeWithCachingDisabled(AllocationType allocationType);
+    static GmmResourceUsageType getDefaultUsageTypeWithCachingEnabled(AllocationType allocationType, const ProductHelper &productHelper, const HardwareInfo &hwInfo);
+    static GmmResourceUsageType getDefaultUsageTypeWithCachingDisabled(AllocationType allocationType, const HardwareInfo &hwInfo);
+    static bool isCpuCachingOfDeviceBuffersAllowed(const RootDeviceEnvironment &rootDeviceEnvironment);
 };
 } // namespace NEO

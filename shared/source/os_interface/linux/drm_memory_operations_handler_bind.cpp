@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,33 +13,107 @@
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/os_interface/linux/drm_allocation.h"
 #include "shared/source/os_interface/linux/drm_buffer_object.h"
 #include "shared/source/os_interface/linux/drm_memory_manager.h"
+#include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/os_context.h"
+
+#include <algorithm>
 
 namespace NEO {
 
 DrmMemoryOperationsHandlerBind::DrmMemoryOperationsHandlerBind(const RootDeviceEnvironment &rootDeviceEnvironment, uint32_t rootDeviceIndex)
-    : DrmMemoryOperationsHandler(rootDeviceIndex), rootDeviceEnvironment(rootDeviceEnvironment){};
+    : DrmMemoryOperationsHandler(rootDeviceEnvironment, rootDeviceIndex) {};
 
 DrmMemoryOperationsHandlerBind::~DrmMemoryOperationsHandlerBind() = default;
 
-MemoryOperationsStatus DrmMemoryOperationsHandlerBind::makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) {
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations, bool isDummyExecNeeded, const bool forcePagingFence) {
     auto &engines = device->getAllEngines();
-    MemoryOperationsStatus result = MemoryOperationsStatus::SUCCESS;
+    MemoryOperationsStatus result = MemoryOperationsStatus::success;
     for (const auto &engine : engines) {
-        engine.commandStreamReceiver->initializeResources();
-        result = this->makeResidentWithinOsContext(engine.osContext, gfxAllocations, false);
-        if (result != MemoryOperationsStatus::SUCCESS) {
+        engine.commandStreamReceiver->initializeResources(device->getPreemptionMode());
+        result = this->makeResidentWithinOsContext(engine.osContext, gfxAllocations, false, forcePagingFence, true);
+        if (result != MemoryOperationsStatus::success) {
             break;
         }
     }
     return result;
 }
 
-MemoryOperationsStatus DrmMemoryOperationsHandlerBind::makeResidentWithinOsContext(OsContext *osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable) {
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::decompress(Device *device, GraphicsAllocation &gfxAllocation) {
+    auto drmAllocation = static_cast<DrmAllocation *>(&gfxAllocation);
+    auto &engines = device->getAllEngines();
+    const auto drm = rootDeviceEnvironment.osInterface->getDriverModel()->as<Drm>();
+
+    // The compression state is read and changed only under this lock, so concurrent callers decompress once.
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!gfxAllocation.isCompressionEnabled()) {
+        return MemoryOperationsStatus::success;
+    }
+
+    const uint64_t decompressPatIndex = drm->getDecompressPatIndex(*drmAllocation->getDefaultGmm());
+
+    auto setDecompressOnBO = [&](BufferObject &bo, bool value) {
+        bo.requireResourceDecompress(value);
+        bo.setResourceDecompressPatIndex(value ? decompressPatIndex : CommonConstants::unsupportedPatIndex);
+    };
+
+    auto setDecompressOnBOs = [&](bool value) {
+        if (drmAllocation->storageInfo.isChunked) {
+            if (auto bo = drmAllocation->getBO()) {
+                setDecompressOnBO(*bo, value);
+            }
+        } else {
+            for (auto &bo : drmAllocation->getBOs()) {
+                if (bo) {
+                    setDecompressOnBO(*bo, value);
+                }
+            }
+        }
+    };
+
+    const bool perContextVms = drm->isPerContextVMRequired();
+    for (const auto &engine : engines) {
+        auto osContext = engine.osContext;
+        auto deviceBitfield = osContext->getDeviceBitfield();
+
+        uint32_t devicesDone = 0u;
+        for (uint32_t vmHandleId = 0u; devicesDone < deviceBitfield.count(); vmHandleId++) {
+            if (not deviceBitfield.test(vmHandleId)) {
+                continue;
+            }
+            devicesDone++;
+
+            setDecompressOnBOs(true);
+
+            int retVal = drmAllocation->bindBOs(osContext, vmHandleId, nullptr, true, true);
+
+            setDecompressOnBOs(false);
+
+            if (retVal) {
+                return MemoryOperationsStatus::failed;
+            }
+        }
+
+        if (not perContextVms) {
+            break;
+        }
+    }
+    gfxAllocation.getDefaultGmm()->applyAuxFlagsForBuffer(false);
+    return MemoryOperationsStatus::success;
+}
+
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::lock(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) {
+    for (auto gfxAllocation = gfxAllocations.begin(); gfxAllocation != gfxAllocations.end(); gfxAllocation++) {
+        (*gfxAllocation)->setLockedMemory(true);
+    }
+    return makeResident(device, gfxAllocations, false, false);
+}
+
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::makeResidentWithinOsContext(OsContext *osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable, const bool forcePagingFence, const bool acquireLock) {
     auto deviceBitfield = osContext->getDeviceBitfield();
 
     std::lock_guard<std::mutex> lock(mutex);
@@ -52,52 +126,71 @@ MemoryOperationsStatus DrmMemoryOperationsHandlerBind::makeResidentWithinOsConte
 
         for (auto gfxAllocation = gfxAllocations.begin(); gfxAllocation != gfxAllocations.end(); gfxAllocation++) {
             auto drmAllocation = static_cast<DrmAllocation *>(*gfxAllocation);
-            auto bo = drmAllocation->storageInfo.getNumBanks() > 1 ? drmAllocation->getBOs()[drmIterator] : drmAllocation->getBO();
+            const auto bufferObjects = drmAllocation->getBOsForResidency(drmIterator);
+            const bool allBound = std::all_of(bufferObjects.begin(), bufferObjects.end(), [&](BufferObject *bo) {
+                return bo->getBindInfo()[bo->getOsContextId(osContext)][drmIterator];
+            });
 
-            if (!bo->bindInfo[bo->getOsContextId(osContext)][drmIterator]) {
-                int result = drmAllocation->makeBOsResident(osContext, drmIterator, nullptr, true);
+            if (!allBound) {
+                for (auto bo : bufferObjects) {
+                    bo->requireExplicitLockedMemory(drmAllocation->isLockedMemory());
+                    bo->requireImmediateBinding(true);
+                }
+
+                int result = drmAllocation->makeBOsResident(osContext, drmIterator, nullptr, true, forcePagingFence);
                 if (result) {
-                    return MemoryOperationsStatus::OUT_OF_MEMORY;
+                    return MemoryOperationsStatus::outOfMemory;
                 }
             }
-
             if (!evictable) {
                 drmAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContext->getContextId());
+                if (auto parentAllocation = drmAllocation->getParentAllocation()) {
+                    parentAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContext->getContextId());
+                }
             }
         }
     }
 
-    return MemoryOperationsStatus::SUCCESS;
+    return MemoryOperationsStatus::success;
 }
 
 MemoryOperationsStatus DrmMemoryOperationsHandlerBind::evict(Device *device, GraphicsAllocation &gfxAllocation) {
     auto &engines = device->getAllEngines();
-    auto retVal = MemoryOperationsStatus::SUCCESS;
+    auto retVal = MemoryOperationsStatus::success;
+    gfxAllocation.setLockedMemory(false);
     for (const auto &engine : engines) {
         retVal = this->evictWithinOsContext(engine.osContext, gfxAllocation);
-        if (retVal != MemoryOperationsStatus::SUCCESS) {
+        if (retVal != MemoryOperationsStatus::success) {
             return retVal;
         }
     }
-    return MemoryOperationsStatus::SUCCESS;
+    return MemoryOperationsStatus::success;
+}
+
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::releaseExplicitResidency(Device *device, GraphicsAllocation &gfxAllocation) {
+    // the always-resident mark is shared with indirect and creation residency, so an unbind faults in-flight work that relies on them
+    return MemoryOperationsStatus::success;
 }
 
 MemoryOperationsStatus DrmMemoryOperationsHandlerBind::evictWithinOsContext(OsContext *osContext, GraphicsAllocation &gfxAllocation) {
     std::lock_guard<std::mutex> lock(mutex);
     int retVal = evictImpl(osContext, gfxAllocation, osContext->getDeviceBitfield());
     if (retVal) {
-        return MemoryOperationsStatus::FAILED;
+        return MemoryOperationsStatus::failed;
     }
-    return MemoryOperationsStatus::SUCCESS;
+    return MemoryOperationsStatus::success;
 }
 
 int DrmMemoryOperationsHandlerBind::evictImpl(OsContext *osContext, GraphicsAllocation &gfxAllocation, DeviceBitfield deviceBitfield) {
     auto drmAllocation = static_cast<DrmAllocation *>(&gfxAllocation);
     for (auto drmIterator = 0u; drmIterator < deviceBitfield.size(); drmIterator++) {
         if (deviceBitfield.test(drmIterator)) {
-            int retVal = drmAllocation->makeBOsResident(osContext, drmIterator, nullptr, false);
+            int retVal = drmAllocation->makeBOsResident(osContext, drmIterator, nullptr, false, false);
             if (retVal) {
                 return retVal;
+            }
+            for (auto bo : drmAllocation->getBOsForResidency(drmIterator)) {
+                bo->requireImmediateBinding(false);
             }
         }
     }
@@ -115,30 +208,30 @@ MemoryOperationsStatus DrmMemoryOperationsHandlerBind::isResident(Device *device
     }
 
     if (isResident) {
-        return MemoryOperationsStatus::SUCCESS;
+        return MemoryOperationsStatus::success;
     }
-    return MemoryOperationsStatus::MEMORY_NOT_FOUND;
+    return MemoryOperationsStatus::memoryNotFound;
 }
 
 MemoryOperationsStatus DrmMemoryOperationsHandlerBind::mergeWithResidencyContainer(OsContext *osContext, ResidencyContainer &residencyContainer) {
-    if (DebugManager.flags.MakeEachAllocationResident.get() == 2) {
+    if (debugManager.flags.MakeEachAllocationResident.get() == 2) {
         auto memoryManager = static_cast<DrmMemoryManager *>(this->rootDeviceEnvironment.executionEnvironment.memoryManager.get());
 
         auto allocLock = memoryManager->acquireAllocLock();
-        this->makeResidentWithinOsContext(osContext, ArrayRef<GraphicsAllocation *>(memoryManager->getSysMemAllocs()), true);
-        this->makeResidentWithinOsContext(osContext, ArrayRef<GraphicsAllocation *>(memoryManager->getLocalMemAllocs(this->rootDeviceIndex)), true);
+        this->makeResidentWithinOsContext(osContext, ArrayRef<GraphicsAllocation *>(memoryManager->getSysMemAllocs()), true, false, true);
+        this->makeResidentWithinOsContext(osContext, ArrayRef<GraphicsAllocation *>(memoryManager->getLocalMemAllocs(this->rootDeviceIndex)), true, false, true);
     }
 
-    auto retVal = this->makeResidentWithinOsContext(osContext, ArrayRef<GraphicsAllocation *>(residencyContainer), true);
-    if (retVal != MemoryOperationsStatus::SUCCESS) {
+    auto retVal = this->makeResidentWithinOsContext(osContext, ArrayRef<GraphicsAllocation *>(residencyContainer), true, false, true);
+    if (retVal != MemoryOperationsStatus::success) {
         return retVal;
     }
 
-    return MemoryOperationsStatus::SUCCESS;
+    return MemoryOperationsStatus::success;
 }
 
 std::unique_lock<std::mutex> DrmMemoryOperationsHandlerBind::lockHandlerIfUsed() {
-    return std::unique_lock<std::mutex>();
+    return std::unique_lock<std::mutex>(mutex);
 }
 
 MemoryOperationsStatus DrmMemoryOperationsHandlerBind::evictUnusedAllocations(bool waitForCompletion, bool isLockNeeded) {
@@ -155,65 +248,67 @@ MemoryOperationsStatus DrmMemoryOperationsHandlerBind::evictUnusedAllocations(bo
              this->evictUnusedAllocationsImpl(memoryManager->getSysMemAllocs(), waitForCompletion),
              this->evictUnusedAllocationsImpl(memoryManager->getLocalMemAllocs(this->rootDeviceIndex), waitForCompletion)}) {
 
-        if (status == MemoryOperationsStatus::GPU_HANG_DETECTED_DURING_OPERATION) {
-            return MemoryOperationsStatus::GPU_HANG_DETECTED_DURING_OPERATION;
+        if (status == MemoryOperationsStatus::gpuHangDetectedDuringOperation) {
+            return MemoryOperationsStatus::gpuHangDetectedDuringOperation;
         }
     }
 
-    return MemoryOperationsStatus::SUCCESS;
+    return MemoryOperationsStatus::success;
 }
 
-MemoryOperationsStatus DrmMemoryOperationsHandlerBind::evictUnusedAllocationsImpl(std::vector<GraphicsAllocation *> &allocationsForEviction, bool waitForCompletion) {
-    const auto &engines = this->rootDeviceEnvironment.executionEnvironment.memoryManager->getRegisteredEngines(this->rootDeviceIndex);
-    std::vector<GraphicsAllocation *> evictCandidates;
-
-    for (auto subdeviceIndex = 0u; subdeviceIndex < GfxCoreHelper::getSubDevicesCount(rootDeviceEnvironment.getHardwareInfo()); subdeviceIndex++) {
-        for (auto &allocation : allocationsForEviction) {
-            bool evict = true;
-
-            if (allocation->getRootDeviceIndex() != this->rootDeviceIndex) {
-                continue;
-            }
-
-            for (const auto &engine : engines) {
-                if (engine.osContext->getDeviceBitfield().test(subdeviceIndex)) {
-                    if (allocation->isAlwaysResident(engine.osContext->getContextId())) {
-                        evict = false;
-                        break;
-                    }
-
-                    if (waitForCompletion) {
-                        const auto waitStatus = engine.commandStreamReceiver->waitForCompletionWithTimeout(WaitParams{false, false, 0}, engine.commandStreamReceiver->peekLatestFlushedTaskCount());
-                        if (waitStatus == WaitStatus::GpuHang) {
-                            return MemoryOperationsStatus::GPU_HANG_DETECTED_DURING_OPERATION;
-                        }
-                    }
-
-                    if (allocation->isUsedByOsContext(engine.osContext->getContextId()) &&
-                        allocation->getTaskCount(engine.osContext->getContextId()) > *engine.commandStreamReceiver->getTagAddress()) {
-                        evict = false;
-                        break;
-                    }
-                }
-            }
-            if (evict) {
-                evictCandidates.push_back(allocation);
-            }
-        }
-
-        for (auto &allocationToEvict : evictCandidates) {
-            for (const auto &engine : engines) {
-                if (engine.osContext->getDeviceBitfield().test(subdeviceIndex)) {
-                    DeviceBitfield deviceBitfield;
-                    deviceBitfield.set(subdeviceIndex);
-                    this->evictImpl(engine.osContext, *allocationToEvict, deviceBitfield);
-                }
-            }
-        }
-        evictCandidates.clear();
+/**
+ * @note CSR won't implicitly wait for residency of this allocation.
+ * Caller must ensure that waitForAsyncResidency is called before submitting any command that uses this allocation.
+ */
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::makeResidentAsync(OsContext *osContext, GraphicsAllocation *gfxAllocation) {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        gfxAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContext->getContextId());
     }
 
-    return MemoryOperationsStatus::SUCCESS;
+    auto deviceBitfield = osContext->getDeviceBitfield();
+    auto devicesDone = 0u;
+    for (auto drmIterator = 0u; devicesDone < deviceBitfield.count(); drmIterator++) {
+        if (!deviceBitfield.test(drmIterator)) {
+            continue;
+        }
+        devicesDone++;
+        auto &drmAllocation = *static_cast<DrmAllocation *>(gfxAllocation);
+        for (auto bo : drmAllocation.getBOsForResidency(drmIterator)) {
+            bo->requireExplicitLockedMemory(drmAllocation.isLockedMemory());
+            bo->requireImmediateBinding(true);
+            bo->setAsyncPagingFenceRequired();
+        }
+
+        int result = drmAllocation.makeBOsResident(osContext, drmIterator, nullptr, true, false);
+        if (result) {
+            std::lock_guard<std::mutex> lock(mutex);
+            gfxAllocation->updateResidencyTaskCount(GraphicsAllocation::objectNotResident, osContext->getContextId());
+            return MemoryOperationsStatus::outOfMemory;
+        }
+    }
+    return MemoryOperationsStatus::success;
+}
+
+MemoryOperationsStatus DrmMemoryOperationsHandlerBind::waitForAsyncResidency(OsContext *osContext, GraphicsAllocation *gfxAllocation) {
+    auto deviceBitfield = osContext->getDeviceBitfield();
+    auto devicesDone = 0u;
+    for (auto drmIterator = 0u; devicesDone < deviceBitfield.count(); drmIterator++) {
+        if (!deviceBitfield.test(drmIterator)) {
+            continue;
+        }
+        devicesDone++;
+
+        auto &drmAllocation = *static_cast<DrmAllocation *>(gfxAllocation);
+        for (auto bo : drmAllocation.getBOsForResidency(drmIterator)) {
+            UNRECOVERABLE_IF(!bo->isAsyncPagingFenceRequired());
+            auto ret = bo->waitOnAsyncPagingFence(osContext, drmIterator);
+            if (ret != 0) {
+                return MemoryOperationsStatus::gpuHangDetectedDuringOperation;
+            }
+        }
+    }
+    return MemoryOperationsStatus::success;
 }
 
 } // namespace NEO

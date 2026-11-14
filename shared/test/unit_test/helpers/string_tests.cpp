@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -34,15 +34,17 @@ TEST(StringHelpers, GivenParamsWhenUsingStrncpyThenReturnIsCorrect) {
     ret = strncpy_s(dst, 1024, src, strlen(src) / 2);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(0, memcmp(dst, src, strlen(src) / 2));
-    for (size_t i = strlen(src) / 2; i < sizeof(dst); i++)
+    for (size_t i = strlen(src) / 2; i < sizeof(dst); i++) {
         EXPECT_EQ(0, dst[i]);
+    }
 
     ret = strncpy_s(dst, 1024, src, 1024);
     ASSERT_EQ(0, ret);
 
     EXPECT_EQ(0, memcmp(dst, src, strlen(src)));
-    for (size_t i = strlen(src); i < sizeof(dst); i++)
+    for (size_t i = strlen(src); i < sizeof(dst); i++) {
         EXPECT_EQ(0, dst[i]);
+    }
 }
 
 TEST(StringHelpers, GivenCountGreaterEqualToNumberOfElementsThenReturnErangeAndSetFirstStringToNullTerminator) {
@@ -126,8 +128,9 @@ TEST(StringHelpers, GivenParamsWhenUsingStrcpyThenReturnIsCorrect) {
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(0, memcmp(dst, src, strlen(src)));
     EXPECT_EQ(0, dst[strlen(src)]);
-    for (size_t i = strlen(src) + 1; i < sizeof(dst); i++)
+    for (size_t i = strlen(src) + 1; i < sizeof(dst); i++) {
         EXPECT_EQ(pattern, dst[i]);
+    }
 }
 
 TEST(StringHelpers, GivenParamsWhenUsingStrnlenThenReturnIsCorrect) {
@@ -165,8 +168,9 @@ TEST(StringHelpers, GivenParamsWhenUsingMemcpyThenReturnIsCorrect) {
     ret = memcpy_s(dst, sizeof(dst), src, strlen(src) / 2);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(0, memcmp(dst, src, strlen(src) / 2));
-    for (size_t i = strlen(src) / 2; i < sizeof(dst); i++)
+    for (size_t i = strlen(src) / 2; i < sizeof(dst); i++) {
         EXPECT_EQ(0, dst[i]);
+    }
 }
 
 #endif
@@ -187,4 +191,22 @@ TEST(StringHelpers, GivenParamsWhenUsingSnprintfsThenReturnIsCorrect) {
 
     int retVal4 = snprintf_s(nullptr, sizeof(buffer), sizeof(buffer), nullptr, fmtStr);
     ASSERT_EQ(-EINVAL, retVal4);
+}
+
+TEST(StringHelpers, givenNonEmptyDataWhenMakingCopyThenCopyWithSameContentInSeparateMemoryIsReturned) {
+    const char source[] = "HelloWorld";
+
+    auto copiedData = makeCopy<char>(source, sizeof(source));
+
+    ASSERT_NE(nullptr, copiedData);
+    EXPECT_NE(source, copiedData.get());
+    EXPECT_EQ(0, memcmp(source, copiedData.get(), sizeof(source)));
+}
+
+TEST(StringHelpers, givenZeroSizeWhenMakingCopyThenNullptrIsReturned) {
+    const char source[] = "HelloWorld";
+
+    auto copiedData = makeCopy<char>(source, 0u);
+
+    EXPECT_EQ(nullptr, copiedData);
 }

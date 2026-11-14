@@ -1,49 +1,124 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/constants.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
+#include "shared/source/os_interface/linux/memory_info.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include <optional>
 
 namespace NEO {
 
+constexpr uint64_t probedSizeRegionZero = 8 * MemoryConstants::gigaByte;
+constexpr uint64_t probedSizeRegionOne = 16 * MemoryConstants::gigaByte;
+constexpr uint64_t probedSizeRegionFour = 32 * MemoryConstants::gigaByte;
+constexpr uint64_t unallocatedSizeRegionZero = 6 * MemoryConstants::gigaByte;
+constexpr uint64_t unallocatedSizeRegionOne = 12 * MemoryConstants::gigaByte;
+constexpr uint64_t unallocatedSizeRegionFour = 4 * MemoryConstants::gigaByte;
+
 class MockIoctlHelper : public IoctlHelperPrelim20 {
+    static constexpr int memoryClassSystem = 0x123;
+    static constexpr int memoryClassDevice = 0x124;
+
   public:
     using IoctlHelperPrelim20::IoctlHelperPrelim20;
-    unsigned int getIoctlRequestValue(DrmIoctl ioctlRequest) const override {
-        return ioctlRequestValue;
-    };
+    ADDMETHOD_CONST_NOBASE(isImmediateVmBindRequired, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(getIoctlRequestValue, unsigned int, 1234u, (DrmIoctl));
+    ADDMETHOD_CONST_NOBASE(requiresUserFenceSetup, bool, false, (bool));
+    ADDMETHOD_CONST_NOBASE(isDeferBackingEnabledForAllocation, bool, false, (size_t allocationSize, AllocationType allocationType));
+    ADDMETHOD_CONST_NOBASE(isDrmFabricSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isMmapWindowRelocationSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isDmaBufMmapPreferredForImportedHostMemory, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isLocalMemorySizeNetOfKmdReservations, bool, false, ());
+
+    ADDMETHOD_NOBASE(vmBind, int, 0, (const VmBindParams &));
+    ADDMETHOD_NOBASE(vmUnbind, int, 0, (const VmBindParams &));
+    ADDMETHOD_CONST_NOBASE(overrideMaxSlicesSupported, bool, true, ());
+    ADDMETHOD_NOBASE(queryDeviceParams, bool, true, (uint32_t *, uint16_t *));
+
+    ADDMETHOD_NOBASE(closAlloc, CacheRegion, CacheRegion::none, (CacheLevel));
+    ADDMETHOD_NOBASE(closFree, CacheRegion, CacheRegion::none, (CacheRegion));
+    ADDMETHOD_NOBASE(closAllocWays, uint16_t, 0U, (CacheRegion, uint16_t, uint16_t));
+    ADDMETHOD_NOBASE(isEuStallSupported, bool, true, ());
+    ADDMETHOD_NOBASE(getEuStallMaxReportsPerXeCore, int64_t, 0, ());
 
     int getDrmParamValue(DrmParam drmParam) const override {
-        return drmParamValue;
-    }
-    int vmBind(const VmBindParams &vmBindParams) override {
-        if (failBind.has_value())
-            return *failBind ? -1 : 0;
-        else
-            return IoctlHelperPrelim20::vmBind(vmBindParams);
-    }
-    int vmUnbind(const VmBindParams &vmBindParams) override {
-        if (failBind.has_value())
-            return *failBind ? -1 : 0;
-        else
-            return IoctlHelperPrelim20::vmUnbind(vmBindParams);
-    }
-    bool isWaitBeforeBindRequired(bool bind) const override {
-        if (waitBeforeBindRequired.has_value())
-            return *waitBeforeBindRequired;
-        else
-            return IoctlHelperPrelim20::isWaitBeforeBindRequired(bind);
+        if (drmParam == DrmParam::memoryClassSystem) {
+            return memoryClassSystem;
+        }
+        if (drmParam == DrmParam::memoryClassDevice) {
+            return memoryClassDevice;
+        }
+        return getDrmParamValueResult;
     }
 
-    unsigned int ioctlRequestValue = 1234u;
-    int drmParamValue = 1234;
-    std::optional<bool> failBind{};
-    std::optional<bool> waitBeforeBindRequired{};
+    std::optional<uint32_t> getVmAdviseAtomicAttribute() override {
+        if (callBaseVmAdviseAtomicAttribute) {
+            return IoctlHelperPrelim20::getVmAdviseAtomicAttribute();
+        }
+        return vmAdviseAtomicAttribute;
+    }
+
+    int getContextHealth(ContextHealth &contextHealth) override {
+        if (!contextBanReasonToReturn.has_value()) {
+            return IoctlHelperPrelim20::getContextHealth(contextHealth);
+        }
+        contextHealth.banned = *contextBanReasonToReturn != ContextBanReason::none;
+        contextHealth.banReason = *contextBanReasonToReturn;
+        return 0;
+    }
+
+    std::unique_ptr<MemoryInfo> createMemoryInfo() override {
+
+        std::vector<MemoryRegion> regionInfo(3);
+        regionInfo[0].region = {memoryClassSystem, 0};
+        regionInfo[0].probedSize = probedSizeRegionZero;
+        regionInfo[0].unallocatedSize = unallocatedSizeRegionZero;
+        regionInfo[1].region = {memoryClassDevice, 0};
+        regionInfo[1].probedSize = probedSizeRegionOne;
+        regionInfo[1].unallocatedSize = unallocatedSizeRegionOne;
+        regionInfo[2].region = {memoryClassDevice, 1};
+        regionInfo[2].probedSize = probedSizeRegionFour;
+        regionInfo[2].unallocatedSize = unallocatedSizeRegionFour;
+
+        std::unique_ptr<MemoryInfo> memoryInfo = std::make_unique<MemoryInfo>(regionInfo, drm);
+        return memoryInfo;
+    }
+    bool getTopologyDataAndMap(HardwareInfo &hwInfo, DrmQueryTopologyData &topologyData, TopologyMap &topologyMap) override {
+        topologyData = topologyDataToSet;
+        topologyMap = topologyMapToSet;
+        return true;
+    }
+
+    bool is2MBSizeAlignmentRequired(AllocationType allocationType) const override {
+        return is2MBSizeAlignmentRequiredResult;
+    }
+
+    DrmQueryTopologyData topologyDataToSet{};
+    TopologyMap topologyMapToSet{};
+    int getDrmParamValueResult = 1234;
+    bool callBaseVmAdviseAtomicAttribute = true;
+    bool is2MBSizeAlignmentRequiredResult = false;
+    std::optional<uint32_t> vmAdviseAtomicAttribute{};
+    std::optional<ContextBanReason> contextBanReasonToReturn{};
+    void *pciBarrierMmapReturnValue = nullptr;
+    bool pciBarrierMmapCalled = false;
+    void *pciBarrierMmap() override {
+        pciBarrierMmapCalled = true;
+        return pciBarrierMmapReturnValue;
+    }
+
+    MmioTimestampPtrHelper mmioTimestampPtrHelperReturnValue{};
+    uint32_t getMmioTimestampPtrHelperCalled = 0u;
+    MmioTimestampPtrHelper getMmioTimestampPtrHelper() override {
+        getMmioTimestampPtrHelperCalled++;
+        return mmioTimestampPtrHelperReturnValue;
+    }
 };
 } // namespace NEO

@@ -1,0 +1,37 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
+#include "level_zero/core/source/mutable_cmdlist/mutable_semaphore_wait_hw.h"
+#include "level_zero/core/test/unit_tests/white_box.h"
+
+namespace L0 {
+namespace ult {
+
+template <typename GfxFamily>
+struct WhiteBox<::L0::MCL::MutableSemaphoreWaitHw<GfxFamily>>
+    : public ::L0::MCL::MutableSemaphoreWaitHw<GfxFamily> {
+
+    using BaseClass = ::L0::MCL::MutableSemaphoreWaitHw<GfxFamily>;
+
+    using BaseClass::commandSize;
+    using BaseClass::commandView;
+    using BaseClass::gpuDestinationAddress;
+    using BaseClass::offset;
+    using BaseClass::qwordData;
+    using BaseClass::semWait;
+    using BaseClass::type;
+};
+
+template <typename GfxFamily>
+using MockMutableSemaphoreWaitHw = WhiteBox<::L0::MCL::MutableSemaphoreWaitHw<GfxFamily>>;
+
+} // namespace ult
+} // namespace L0

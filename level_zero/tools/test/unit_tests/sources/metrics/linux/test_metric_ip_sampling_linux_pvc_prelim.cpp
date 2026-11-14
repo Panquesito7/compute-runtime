@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,14 +11,19 @@
 #include "shared/source/os_interface/linux/ioctl_helper.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
-#include "level_zero/tools/source/metrics/os_metric_ip_sampling.h"
+#include "level_zero/tools/source/metrics/linux/os_metric_ip_sampling_imp_linux.h"
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 
 namespace NEO {
 namespace SysCalls {
@@ -33,8 +38,7 @@ namespace ult {
 class IoctlHelperPrelim20Mock : public NEO::IoctlHelperPrelim20 {
   public:
     using NEO::IoctlHelperPrelim20::IoctlHelperPrelim20;
-    bool getEuStallProperties(std::array<uint64_t, 12u> &properties, uint64_t dssBufferSize, uint64_t samplingRate,
-                              uint64_t pollPeriod, uint64_t engineInstance, uint64_t notifyNReports) override {
+    bool perfOpenEuStallStream(uint32_t euStallFdParameter, uint32_t &samplingPeriodNs, uint64_t engineInstance, uint64_t notifyNReports, uint64_t gpuTimeStampfrequency, int32_t *stream) override {
         return false;
     }
 };
@@ -44,7 +48,7 @@ class DrmPrelimMock : public DrmMock {
     DrmPrelimMock(RootDeviceEnvironment &rootDeviceEnvironment) : DrmPrelimMock(rootDeviceEnvironment, defaultHwInfo.get()) {}
     DrmPrelimMock(RootDeviceEnvironment &rootDeviceEnvironment, HardwareInfo *inputHwInfo, bool invokeQueryEngineInfo = true) : DrmMock(rootDeviceEnvironment) {
         customHwInfo = std::make_unique<NEO::HardwareInfo>(&inputHwInfo->platform, &inputHwInfo->featureTable,
-                                                           &inputHwInfo->workaroundTable, &inputHwInfo->gtSystemInfo, inputHwInfo->capabilityTable, 0u);
+                                                           &inputHwInfo->workaroundTable, &inputHwInfo->gtSystemInfo, inputHwInfo->capabilityTable);
         customHwInfo->gtSystemInfo.MaxDualSubSlicesSupported = 64;
         rootDeviceEnvironment.setHwInfoAndInitHelpers(customHwInfo.get());
         this->ioctlHelper = std::make_unique<IoctlHelperPrelim20>(*this);
@@ -54,16 +58,16 @@ class DrmPrelimMock : public DrmMock {
     }
 
     bool queryEngineInfo() override {
-        uint16_t computeEngineClass = getIoctlHelper()->getDrmParamValue(DrmParam::EngineClassCompute);
+        uint16_t computeEngineClass = getIoctlHelper()->getDrmParamValue(DrmParam::engineClassCompute);
         std::vector<EngineCapabilities> engines(4);
         engines[0].engine = {computeEngineClass, 0};
-        engines[0].capabilities = 0;
+        engines[0].capabilities = {};
         engines[1].engine = {computeEngineClass, 1};
-        engines[1].capabilities = 0;
+        engines[1].capabilities = {};
         engines[2].engine = {computeEngineClass, 2};
-        engines[2].capabilities = 0;
+        engines[2].capabilities = {};
         engines[3].engine = {computeEngineClass, 3};
-        engines[3].capabilities = 0;
+        engines[3].capabilities = {};
 
         std::vector<DistanceInfo> distances(4);
         distances[0].engine = engines[0].engine;
@@ -85,10 +89,10 @@ class DrmPrelimMock : public DrmMock {
     }
 
     bool queryEngineInfo1SubDevice() {
-        uint16_t computeEngineClass = getIoctlHelper()->getDrmParamValue(DrmParam::EngineClassCompute);
+        uint16_t computeEngineClass = getIoctlHelper()->getDrmParamValue(DrmParam::engineClassCompute);
         std::vector<EngineCapabilities> engines(1);
         engines[0].engine = {computeEngineClass, 0};
-        engines[0].capabilities = 0;
+        engines[0].capabilities = {};
 
         std::vector<DistanceInfo> distances(1);
         distances[0].engine = engines[0].engine;
@@ -122,7 +126,7 @@ class MetricIpSamplingLinuxTestPrelim : public DeviceFixture,
     void SetUp() override {
         DeviceFixture::setUp();
         neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-        auto &osInterface = device->getOsInterface();
+        auto &osInterface = *device->getOsInterface();
         osInterface.setDriverModel(std::make_unique<DrmPrelimMock>(const_cast<NEO::RootDeviceEnvironment &>(neoDevice->getRootDeviceEnvironment())));
 
         metricIpSamplingOsInterface = MetricIpSamplingOsInterface::create(static_cast<L0::Device &>(*device));
@@ -146,7 +150,7 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenCorrectArgumentsWhenStartMeasure
 
 HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenGetTimestampFrequencyFailsWhenStartMeasurementIsCalledThenReturnFailure, IsPVC) {
 
-    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface().getDriverModel()->as<NEO::Drm>());
+    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface()->getDriverModel()->as<NEO::Drm>());
     VariableBackup<int> backupCsTimeStampFrequency(&drm->storedCsTimestampFrequency, 0);
     VariableBackup<int> backupStoredRetVal(&drm->storedRetVal, -1);
 
@@ -156,7 +160,7 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenGetTimestampFrequencyFailsWhenSt
 
 HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenGetTimestampFrequencyReturnsFrequencyEqualZeroWhenStartMeasurementIsCalledThenReturnFailure, IsPVC) {
 
-    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface().getDriverModel()->as<NEO::Drm>());
+    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface()->getDriverModel()->as<NEO::Drm>());
     VariableBackup<int> backupCsTimeStampFrequency(&drm->storedCsTimestampFrequency, 0);
 
     uint32_t notifyEveryNReports = 0, samplingPeriodNs = 10000;
@@ -188,6 +192,43 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenI915PerfIoctlEnableFailsWhenStar
     EXPECT_EQ(metricIpSamplingOsInterface->startMeasurement(notifyEveryNReports, samplingPeriodNs), ZE_RESULT_ERROR_UNKNOWN);
 }
 
+HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenI915PerfIoctlEnableFailsThenClampingNotifyEveryNReportsReturnsCorrectValue, IsPVC) {
+    VariableBackup<decltype(SysCalls::sysCallsIoctl)> mockIoctl(&SysCalls::sysCallsIoctl, [](int fileDescriptor, unsigned long int request, void *arg) -> int {
+        if (request == I915_PERF_IOCTL_ENABLE) {
+            return -1;
+        }
+        return 0;
+    });
+
+    auto linuxIface = static_cast<MetricIpSamplingLinuxImp *>(metricIpSamplingOsInterface.get());
+
+    uint32_t notifyEveryNReports = 0u;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, linuxIface->clampNReports(notifyEveryNReports));
+    EXPECT_EQ(0u, notifyEveryNReports);
+
+    notifyEveryNReports = 1u;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, linuxIface->clampNReports(notifyEveryNReports));
+    EXPECT_EQ(1u, notifyEveryNReports);
+
+    // PVC uses the i915 KMD, which has no capacity query, so the request is clamped to the static
+    // buffer estimate rather than passed through.
+    const uint32_t maxSupportedReportCount =
+        metricIpSamplingOsInterface->getRequiredBufferSize(std::numeric_limits<uint32_t>::max()) /
+        metricIpSamplingOsInterface->getUnitReportSize();
+    notifyEveryNReports = std::numeric_limits<uint32_t>::max();
+    EXPECT_EQ(ZE_RESULT_SUCCESS, linuxIface->clampNReports(notifyEveryNReports));
+    EXPECT_EQ(maxSupportedReportCount, notifyEveryNReports);
+}
+
+HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenPerfOpenEuStallStreamWhenStartMeasurementIsCalledThenReturnFailure, IsPVC) {
+
+    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface()->getDriverModel()->as<NEO::Drm>());
+    drm->setIoctlHelperPrelim20Mock();
+    uint32_t notifyEveryNReports = 0, samplingPeriodNs = 10000;
+    EXPECT_EQ(metricIpSamplingOsInterface->startMeasurement(notifyEveryNReports, samplingPeriodNs), ZE_RESULT_ERROR_UNKNOWN);
+    drm->restoreIoctlHelperPrelim20();
+}
+
 HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenCloseSucceedsWhenStopMeasurementIsCalledThenReturnSuccess, IsPVC) {
 
     VariableBackup<int> backupCloseFuncRetval(&NEO::SysCalls::closeFuncRetVal, 0);
@@ -200,7 +241,7 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenCloseFailsWhenStopMeasurementIsC
     EXPECT_EQ(metricIpSamplingOsInterface->stopMeasurement(), ZE_RESULT_ERROR_UNKNOWN);
 }
 
-HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenI915PerfIoctlDisableFailsWhenStartMeasurementIsCalledThenReturnFailure, IsPVC) {
+HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenI915PerfIoctlDisableFailsWhenStopMeasurementIsCalledThenReturnFailure, IsPVC) {
 
     VariableBackup<decltype(SysCalls::sysCallsIoctl)> mockIoctl(&SysCalls::sysCallsIoctl, [](int fileDescriptor, unsigned long int request, void *arg) -> int {
         if (request == I915_PERF_IOCTL_DISABLE) {
@@ -225,8 +266,8 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenReadSucceedsWhenReadDataIsCalled
 HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenReadFailsWhenReadDataIsCalledThenReturnFailure, IsPVC) {
 
     VariableBackup<decltype(SysCalls::sysCallsRead)> mockRead(&SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
-        return -1;
         errno = EBADF;
+        return -1;
     });
     uint8_t pRawData = 0u;
     size_t pRawDataSize = 0;
@@ -246,6 +287,8 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, givenReadFailsWithRetryErrorNumberWhe
     EXPECT_EQ(metricIpSamplingOsInterface->readData(&pRawData, &pRawDataSize), ZE_RESULT_SUCCESS);
     errno = EAGAIN;
     EXPECT_EQ(metricIpSamplingOsInterface->readData(&pRawData, &pRawDataSize), ZE_RESULT_SUCCESS);
+    errno = EIO;
+    EXPECT_EQ(metricIpSamplingOsInterface->readData(&pRawData, &pRawDataSize), ZE_RESULT_WARNING_DROPPED_DATA);
 }
 
 HWTEST2_F(MetricIpSamplingLinuxTestPrelim, WhenGetRequiredBufferSizeIsCalledThenCorrectSizeIsReturned, IsPVC) {
@@ -270,56 +313,11 @@ HWTEST2_F(MetricIpSamplingLinuxTestPrelim, GivenPollIsFailureWhenisNReportsAvail
     EXPECT_FALSE(metricIpSamplingOsInterface->isNReportsAvailable());
 }
 
-HWTEST2_F(MetricIpSamplingLinuxTestPrelim, GivenSupportedProductFamilyAndUnsupportedDeviceIdIsUsedWhenIsDependencyAvailableIsCalledThenReturnFailure, IsPVC) {
-
-    auto hwInfo = neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
-    hwInfo->platform.eProductFamily = productFamily;
-    hwInfo->platform.usDeviceID = NEO::pvcXlDeviceIds.front();
-    EXPECT_FALSE(metricIpSamplingOsInterface->isDependencyAvailable());
-}
-
-HWTEST2_F(MetricIpSamplingLinuxTestPrelim, GivenSupportedProductFamilyAndSupportedDeviceIdIsUsedWhenIsDependencyAvailableIsCalledThenReturnFailure, IsPVC) {
-
-    auto hwInfo = neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
-    hwInfo->platform.eProductFamily = productFamily;
-
-    for (const auto &deviceId : NEO::pvcXtDeviceIds) {
-        hwInfo->platform.usDeviceID = deviceId;
-        EXPECT_TRUE(metricIpSamplingOsInterface->isDependencyAvailable());
-    }
-}
-
-HWTEST2_F(MetricIpSamplingLinuxTestPrelim, GivenDriverOpenFailsWhenIsDependencyAvailableIsCalledThenReturnFailure, IsPVC) {
-
-    auto hwInfo = neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
-    hwInfo->platform.eProductFamily = productFamily;
-    hwInfo->platform.usDeviceID = NEO::pvcXtDeviceIds.front();
-
-    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface().getDriverModel()->as<NEO::Drm>());
-    VariableBackup<int> backupCsTimeStampFrequency(&drm->storedCsTimestampFrequency, 0);
-    VariableBackup<int> backupStoredRetVal(&drm->storedRetVal, -1);
-
-    EXPECT_FALSE(metricIpSamplingOsInterface->isDependencyAvailable());
-}
-
-HWTEST2_F(MetricIpSamplingLinuxTestPrelim, GivenIoctlHelperFailsWhenIsDependencyAvailableIsCalledThenReturnFailure, IsPVC) {
-
-    auto hwInfo = neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
-    hwInfo->platform.eProductFamily = productFamily;
-    hwInfo->platform.usDeviceID = NEO::pvcXtDeviceIds.front();
-
-    auto drm = static_cast<DrmPrelimMock *>(device->getOsInterface().getDriverModel()->as<NEO::Drm>());
-
-    drm->setIoctlHelperPrelim20Mock();
-    EXPECT_FALSE(metricIpSamplingOsInterface->isDependencyAvailable());
-    drm->restoreIoctlHelperPrelim20();
-}
-
 struct MetricIpSamplingLinuxMultiDeviceTest : public ::testing::Test {
 
     std::unique_ptr<UltDeviceFactory> createDevices(uint32_t numSubDevices) {
-        DebugManager.flags.CreateMultipleSubDevices.set(numSubDevices);
-        DebugManager.flags.UseDrmVirtualEnginesForCcs.set(0);
+        debugManager.flags.CreateMultipleSubDevices.set(numSubDevices);
+        debugManager.flags.UseDrmVirtualEnginesForCcs.set(0);
         NEO::ExecutionEnvironment *executionEnvironment = new MockExecutionEnvironment(defaultHwInfo.get(), false, 1);
         executionEnvironment->parseAffinityMask();
         executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OSInterface);
@@ -334,15 +332,15 @@ struct MetricIpSamplingLinuxMultiDeviceTest : public ::testing::Test {
 };
 
 HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenCombinationOfAffinityMaskWhenStartMeasurementIsCalledForRootDeviceThenInstanceIdIsCorrect, IsPVC) {
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0.1,0.2,0.3");
+    debugManager.flags.ZE_AFFINITY_MASK.set("0.1,0.2,0.3");
 
     auto deviceFactory = createDevices(4);
-    auto driverHandle = std::make_unique<DriverHandleImp>();
+    auto driverHandle = std::make_unique<DriverHandle>();
     ze_result_t returnValue = ZE_RESULT_SUCCESS;
     auto rootDevice = std::unique_ptr<L0::Device>(L0::Device::create(driverHandle.get(), deviceFactory->rootDevices[0], false, &returnValue));
     auto metricIpSamplingOsInterface = MetricIpSamplingOsInterface::create(static_cast<L0::Device &>(*rootDevice));
     uint32_t notifyEveryNReports = 0, samplingPeriodNs = 10000;
-    auto drm = static_cast<DrmPrelimMock *>(rootDevice->getOsInterface().getDriverModel()->as<NEO::Drm>());
+    auto drm = static_cast<DrmPrelimMock *>(rootDevice->getOsInterface()->getDriverModel()->as<NEO::Drm>());
     drm->queryEngineInfo();
     VariableBackup<decltype(SysCalls::sysCallsIoctl)> mockIoctl(&SysCalls::sysCallsIoctl, [](int fileDescriptor, unsigned long int request, void *arg) -> int {
         if (request == DRM_IOCTL_I915_PERF_OPEN) {
@@ -356,10 +354,10 @@ HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenCombinationOfAffinityMaskWh
 }
 
 HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenCombinationOfAffinityMaskWhenStartMeasurementIsCalledForSubDeviceThenInstanceIdIsCorrect, IsPVC) {
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0.2,0.3");
+    debugManager.flags.ZE_AFFINITY_MASK.set("0.2,0.3");
 
     auto deviceFactory = createDevices(4);
-    auto driverHandle = std::make_unique<DriverHandleImp>();
+    auto driverHandle = std::make_unique<DriverHandle>();
     ze_result_t returnValue = ZE_RESULT_SUCCESS;
     auto rootDevice = std::unique_ptr<L0::Device>(L0::Device::create(driverHandle.get(), deviceFactory->rootDevices[0], false, &returnValue));
 
@@ -369,7 +367,7 @@ HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenCombinationOfAffinityMaskWh
     rootDevice->getSubDevices(&subDeviceCount, subDevices);
     auto metricIpSamplingOsInterface = MetricIpSamplingOsInterface::create(static_cast<L0::Device &>(*subDevices[0]));
     uint32_t notifyEveryNReports = 0, samplingPeriodNs = 10000;
-    auto drm = static_cast<DrmPrelimMock *>(rootDevice->getOsInterface().getDriverModel()->as<NEO::Drm>());
+    auto drm = static_cast<DrmPrelimMock *>(rootDevice->getOsInterface()->getDriverModel()->as<NEO::Drm>());
     drm->queryEngineInfo();
 
     {
@@ -400,24 +398,24 @@ HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenCombinationOfAffinityMaskWh
 }
 
 HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenEngineInfoIsNullWhenStartMeasurementIsCalledForRootDeviceThenErrorIsReturned, IsPVC) {
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0.1");
+    debugManager.flags.ZE_AFFINITY_MASK.set("0.1");
 
     auto deviceFactory = createDevices(4);
-    auto driverHandle = std::make_unique<DriverHandleImp>();
+    auto driverHandle = std::make_unique<DriverHandle>();
     ze_result_t returnValue = ZE_RESULT_SUCCESS;
     auto rootDevice = std::unique_ptr<L0::Device>(L0::Device::create(driverHandle.get(), deviceFactory->rootDevices[0], false, &returnValue));
     auto metricIpSamplingOsInterface = MetricIpSamplingOsInterface::create(static_cast<L0::Device &>(*rootDevice));
     uint32_t notifyEveryNReports = 0, samplingPeriodNs = 10000;
-    auto drm = static_cast<DrmPrelimMock *>(rootDevice->getOsInterface().getDriverModel()->as<NEO::Drm>());
+    auto drm = static_cast<DrmPrelimMock *>(rootDevice->getOsInterface()->getDriverModel()->as<NEO::Drm>());
     drm->queryEngineInfo1SubDevice();
     EXPECT_EQ(metricIpSamplingOsInterface->startMeasurement(notifyEveryNReports, samplingPeriodNs), ZE_RESULT_ERROR_UNKNOWN);
 }
 
 HWTEST2_F(MetricIpSamplingLinuxMultiDeviceTest, GivenEngineInstanceIsNullWhenStartMeasurementIsCalledForRootDeviceThenErrorIsReturned, IsPVC) {
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0.1");
+    debugManager.flags.ZE_AFFINITY_MASK.set("0.1");
 
     auto deviceFactory = createDevices(4);
-    auto driverHandle = std::make_unique<DriverHandleImp>();
+    auto driverHandle = std::make_unique<DriverHandle>();
     ze_result_t returnValue = ZE_RESULT_SUCCESS;
     auto rootDevice = std::unique_ptr<L0::Device>(L0::Device::create(driverHandle.get(), deviceFactory->rootDevices[0], false, &returnValue));
     auto metricIpSamplingOsInterface = MetricIpSamplingOsInterface::create(static_cast<L0::Device &>(*rootDevice));

@@ -1,19 +1,19 @@
 <!---
 
-Copyright (C) 2022 Intel Corporation
+Copyright (C) 2022-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
 -->
 
 
-# Level Zero GPU Driver Driver Experimental Extensions
+# Level Zero GPU Driver Experimental Extensions
 
 ## Introduction
 
 The following document describes the driver experimental extensions implemented in the Level Zero Intel(R) GPU driver. These extensions are meant to test and/or gather feedback on interfaces before they could potentially be added Level Zero specification, as well to provide access to functionality specific to Intel(R) GPUs.
 
-Driver extensions may be defined as APIs (interfaces), flags, or environment variables. In the case of interfaces, these shall be accessed through [zeDriverGetExtensionFunctionAddress](https://spec.oneapi.io/level-zero/latest/core/api.html?highlight=zedrivergetextensionfunctionaddress#_CPPv435zeDriverGetExtensionFunctionAddress18ze_driver_handle_tPKcPPv). Sample code:
+Driver extensions may be defined as APIs (interfaces), flags, or environment variables. In the case of interfaces, these shall be accessed through [zeDriverGetExtensionFunctionAddress](https://oneapi-src.github.io/level-zero-spec/level-zero/latest/core/api/apis/driver.html#zedrivergetextensionfunctionaddress). Sample code:
 
 
 ```cpp
@@ -26,3 +26,6 @@ ze_result_t res = zeDriverGetExtensionFunctionAddress(hDriver, "zexMemOpenIpcHan
 
 ### [Multiple IPC Handles](MULTIPLE_IPC_HANDLES.md)
 ### [Multi-CCS Modes](MULTI_CCS_MODES.md)
+### [Local memory allocation mode](LOCAL_MEMORY_ALLOCATION_MODE.md)
+### [External Memory Mapping for System Memory](EXTERNAL_MEMMAP_SYSMEM.md)
+### [Get Handle For Address Range](MEM_GET_HANDLE_FOR_ADDRESS_RANGE.md)

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,8 +11,10 @@
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/image_aub_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
 
@@ -34,6 +36,7 @@ struct AUBReadImage
       public ::testing::WithParamInterface<std::tuple<uint32_t /*cl_channel_type*/, uint32_t /*cl_channel_order*/, ReadImageParams>>,
       public ::testing::Test {
     void SetUp() override {
+        debugManager.flags.EnableFreeMemory.set(false);
         ImageAubFixture::setUp(enableBlitter);
     }
 
@@ -113,7 +116,7 @@ struct AUBReadImage
         memset(dstMemoryUnaligned, 0xFF, numPixels * elementSize);
 
         cl_mem_flags flags = CL_MEM_USE_HOST_PTR;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         auto retVal = CL_INVALID_VALUE;
         srcImage.reset(Image::create(
             context,
@@ -147,7 +150,7 @@ struct AUBReadImage
             nullptr);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
-        retVal = pCmdQ->finish();
+        retVal = pCmdQ->finish(false);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
         auto imageMemory = srcMemory;
@@ -192,7 +195,14 @@ struct AUBReadImage
     }
 
     template <typename FamilyType>
-    void testReadImageMisaligned(size_t offset, size_t size, size_t pixelSize) {
+    void testReadImageMisaligned() {
+        for (auto pixelSize : {1u, 2u, 4u}) {
+            testReadImageMisalignedForPixelSize<FamilyType>(pixelSize);
+        }
+    }
+
+    template <typename FamilyType>
+    void testReadImageMisalignedForPixelSize(size_t pixelSize) {
         const size_t testWidth = 14 / pixelSize;
         const size_t testHeight = 4;
         const size_t testDepth = 1;
@@ -226,9 +236,6 @@ struct AUBReadImage
         imageDesc.num_samples = 0;
         imageDesc.mem_object = NULL;
 
-        auto dstMemoryAligned = alignedMalloc(pixelSize * numPixels, MemoryConstants::cacheLineSize);
-        memset(dstMemoryAligned, 0x0, pixelSize * numPixels);
-
         auto srcMemoryAligned = alignedMalloc(4 + pixelSize * numPixels, 4);
         auto srcMemoryUnaligned = reinterpret_cast<uint8_t *>(ptrOffset(srcMemoryAligned, 4));
         for (auto i = 0u; i < pixelSize * numPixels; ++i) {
@@ -236,7 +243,7 @@ struct AUBReadImage
         }
 
         cl_mem_flags flags = CL_MEM_USE_HOST_PTR | CL_MEM_READ_WRITE;
-        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, pClDevice->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
         auto retVal = CL_INVALID_VALUE;
         auto image = std::unique_ptr<Image>(Image::create(
             context,
@@ -250,66 +257,75 @@ struct AUBReadImage
         ASSERT_NE(nullptr, image);
         EXPECT_FALSE(image->isMemObjZeroCopy());
 
-        auto csr = enableBlitter ? pCmdQ->getBcsCommandStreamReceiver(aub_stream::EngineType::ENGINE_BCS) : pCommandStreamReceiver;
-        auto graphicsAllocation = csr->getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, pixelSize * numPixels}, dstMemoryAligned);
-        csr->makeResidentHostPtrAllocation(graphicsAllocation);
-        csr->getInternalAllocationStorage()->storeAllocation(std::unique_ptr<GraphicsAllocation>(graphicsAllocation), TEMPORARY_ALLOCATION);
-        auto dstMemoryGPUPtr = reinterpret_cast<uint8_t *>(graphicsAllocation->getGpuAddress());
+        struct MisalignedReadCase {
+            void *dstMemory;
+            uint8_t *dstMemoryGpuPtr;
+            size_t offset;
+            size_t size;
+        };
+        std::vector<MisalignedReadCase> readCases;
 
+        const size_t dstMemorySize = pixelSize * numPixels;
         const size_t origin[3] = {0, 1, 0};
-        const size_t region[3] = {size, 1, 1};
         size_t inputRowPitch = testWidth * pixelSize;
         size_t inputSlicePitch = inputRowPitch * testHeight;
-        retVal = pCmdQ->enqueueReadImage(
-            image.get(),
-            CL_FALSE,
-            origin,
-            region,
-            inputRowPitch,
-            inputSlicePitch,
-            ptrOffset(dstMemoryAligned, offset),
-            nullptr,
-            0,
-            nullptr,
-            nullptr);
+        auto csr = enableBlitter ? pCmdQ->getBcsCommandStreamReceiver(aub_stream::EngineType::ENGINE_BCS) : pCommandStreamReceiver;
 
-        EXPECT_EQ(CL_SUCCESS, retVal);
-        pCmdQ->finish();
+        for (auto offset : {0u, 4u, 8u, 12u}) {
+            for (auto size : {3u, 2u, 1u}) {
+                auto dstMemory = alignedMalloc(dstMemorySize, MemoryConstants::pageSize);
+                memset(dstMemory, 0x0, dstMemorySize);
 
-        std::vector<uint8_t> referenceMemory(pixelSize * numPixels, 0x0);
+                auto graphicsAllocation = csr->getMemoryManager()->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, dstMemorySize}, dstMemory);
+                csr->makeResidentHostPtrAllocation(graphicsAllocation);
+                csr->getInternalAllocationStorage()->storeAllocation(std::unique_ptr<GraphicsAllocation>(graphicsAllocation), TEMPORARY_ALLOCATION);
+                readCases.push_back({dstMemory, reinterpret_cast<uint8_t *>(graphicsAllocation->getGpuAddress()), offset, size});
 
-        AUBCommandStreamFixture::expectMemory<FamilyType>(dstMemoryGPUPtr, referenceMemory.data(), offset);
-        AUBCommandStreamFixture::expectMemory<FamilyType>(ptrOffset(dstMemoryGPUPtr, offset), &srcMemoryUnaligned[inputRowPitch * origin[1]], size * pixelSize);
-        AUBCommandStreamFixture::expectMemory<FamilyType>(ptrOffset(dstMemoryGPUPtr, offset + size * pixelSize), referenceMemory.data(), pixelSize * numPixels - offset - size * pixelSize);
+                const size_t region[3] = {size, 1, 1};
+                retVal = pCmdQ->enqueueReadImage(
+                    image.get(),
+                    CL_FALSE,
+                    origin,
+                    region,
+                    inputRowPitch,
+                    inputSlicePitch,
+                    ptrOffset(dstMemory, offset),
+                    nullptr,
+                    0,
+                    nullptr,
+                    nullptr);
+                EXPECT_EQ(CL_SUCCESS, retVal);
+                if constexpr (enableBlitter) {
+                    EXPECT_EQ(EnqueueProperties::Operation::blit, pCmdQ->peekLatestSentEnqueueOperation());
+                }
+            }
+        }
+        pCmdQ->finish(false);
 
-        alignedFree(dstMemoryAligned);
+        std::vector<uint8_t> referenceMemory(dstMemorySize, 0x0);
+        for (const auto &readCase : readCases) {
+            AUBCommandStreamFixture::expectMemory<FamilyType>(readCase.dstMemoryGpuPtr, referenceMemory.data(), readCase.offset);
+            AUBCommandStreamFixture::expectMemory<FamilyType>(ptrOffset(readCase.dstMemoryGpuPtr, readCase.offset), &srcMemoryUnaligned[inputRowPitch * origin[1]], readCase.size * pixelSize);
+            AUBCommandStreamFixture::expectMemory<FamilyType>(ptrOffset(readCase.dstMemoryGpuPtr, readCase.offset + readCase.size * pixelSize), referenceMemory.data(), dstMemorySize - readCase.offset - readCase.size * pixelSize);
+            alignedFree(readCase.dstMemory);
+        }
         alignedFree(srcMemoryAligned);
     }
-
+    DebugManagerStateRestore restorer;
     std::unique_ptr<Image> srcImage;
 };
 
 using AUBReadImageCCS = AUBReadImage<false>;
 
-HWTEST2_F(AUBReadImageCCS, GivenMisalignedHostPtrWhenReadingImageThenExpectationsAreMet, ImagesSupportedMatcher) {
-    const std::vector<size_t> pixelSizes = {1, 2, 4};
-    const std::vector<size_t> offsets = {0, 4, 8, 12};
-    const std::vector<size_t> sizes = {3, 2, 1};
-
-    for (auto pixelSize : pixelSizes) {
-        for (auto offset : offsets) {
-            for (auto size : sizes) {
-                testReadImageMisaligned<FamilyType>(offset, size, pixelSize);
-            }
-        }
-    }
+HWTEST2_F(AUBReadImageCCS, GivenMisalignedHostPtrWhenReadingImageThenExpectationsAreMet, ImageSupport) {
+    testReadImageMisaligned<FamilyType>();
 }
 
-HWTEST2_P(AUBReadImageCCS, GivenUnalignedMemoryWhenReadingImageThenExpectationsAreMet, ImagesSupportedMatcher) {
+HWTEST2_P(AUBReadImageCCS, GivenUnalignedMemoryWhenReadingImageThenExpectationsAreMet, ImageSupport) {
     testReadImageUnaligned<FamilyType>();
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     AUBReadImage_simple, AUBReadImageCCS,
     ::testing::Combine(::testing::Values( // formats
                            CL_UNORM_INT8, CL_SIGNED_INT16, CL_UNSIGNED_INT32,
@@ -320,35 +336,24 @@ INSTANTIATE_TEST_CASE_P(
 
 using AUBReadImageBCS = AUBReadImage<true>;
 
-HWTEST2_F(AUBReadImageBCS, GivenMisalignedHostPtrWhenReadingImageWithBlitterEnabledThenExpectationsAreMet, ImagesSupportedMatcher) {
-    const std::vector<size_t> pixelSizes = {1, 2, 4};
-    const std::vector<size_t> offsets = {0, 4, 8, 12};
-    const std::vector<size_t> sizes = {3, 2, 1};
-
-    for (auto pixelSize : pixelSizes) {
-        for (auto offset : offsets) {
-            for (auto size : sizes) {
-                testReadImageMisaligned<FamilyType>(offset, size, pixelSize);
-                ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::Blit);
-            }
-        }
+struct AUBReadImageBCSParam : AUBReadImage<true> {
+    void SetUp() override {
+        debugManager.flags.EnableFreeMemory.set(false);
+        ImageAubFixture::setUp(true, std::get<2>(GetParam()).imageType);
     }
+};
+
+HWTEST2_F(AUBReadImageBCS, GivenMisalignedHostPtrWhenReadingImageWithBlitterEnabledThenExpectationsAreMet, ImageSupport) {
+    testReadImageMisaligned<FamilyType>();
 }
 
-HWTEST2_P(AUBReadImageBCS, GivenUnalignedMemoryWhenReadingImageWithBlitterEnabledThenExpectationsAreMet, ImagesSupportedMatcher) {
-
-    auto &productHelper = pCmdQ->getDevice().getProductHelper();
-    if (std::get<2>(GetParam()).imageType == CL_MEM_OBJECT_IMAGE3D &&
-        !(productHelper.isTile64With3DSurfaceOnBCSSupported(*defaultHwInfo))) {
-        GTEST_SKIP();
-    }
-
+HWTEST2_P(AUBReadImageBCSParam, GivenUnalignedMemoryWhenReadingImageWithBlitterEnabledThenExpectationsAreMet, ImageSupport) {
     testReadImageUnaligned<FamilyType>();
-    ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::Blit);
+    ASSERT_EQ(pCmdQ->peekLatestSentEnqueueOperation(), EnqueueProperties::Operation::blit);
 }
 
-INSTANTIATE_TEST_CASE_P(
-    AUBReadImage_simple, AUBReadImageBCS,
+INSTANTIATE_TEST_SUITE_P(
+    AUBReadImage_simple, AUBReadImageBCSParam,
     ::testing::Combine(::testing::Values( // formats
                            CL_UNORM_INT8, CL_SIGNED_INT16, CL_UNSIGNED_INT32,
                            CL_HALF_FLOAT, CL_FLOAT),

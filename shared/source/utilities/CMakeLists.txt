@@ -1,13 +1,16 @@
 #
-# Copyright (C) 2019-2022 Intel Corporation
+# Copyright (C) 2019-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
 
 set(NEO_CORE_UTILITIES
     ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+    ${CMAKE_CURRENT_SOURCE_DIR}/allocation_logger.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/allocation_logger.h
     ${CMAKE_CURRENT_SOURCE_DIR}/api_intercept.h
     ${CMAKE_CURRENT_SOURCE_DIR}/arrayref.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/bitcontainers.h
     ${CMAKE_CURRENT_SOURCE_DIR}/cpuintrinsics.h
     ${CMAKE_CURRENT_SOURCE_DIR}/const_stringref.h
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu_info.h
@@ -17,26 +20,39 @@ set(NEO_CORE_UTILITIES
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_settings_reader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_settings_reader.h
     ${CMAKE_CURRENT_SOURCE_DIR}/directory.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/generic_pool_allocator.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/generic_pool_allocator.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/heap_allocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/heap_allocator.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/host_clock.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/host_clock.h
     ${CMAKE_CURRENT_SOURCE_DIR}/hw_timestamps.h
     ${CMAKE_CURRENT_SOURCE_DIR}/iflist.h
     ${CMAKE_CURRENT_SOURCE_DIR}/idlist.h
     ${CMAKE_CURRENT_SOURCE_DIR}/io_functions.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernel_dispatch_stats.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernel_dispatch_stats.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/lockable.h
     ${CMAKE_CURRENT_SOURCE_DIR}/logger.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/logger.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/logger_neo_only.h
     ${CMAKE_CURRENT_SOURCE_DIR}/lookup_array.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/mem_lifetime.h
     ${CMAKE_CURRENT_SOURCE_DIR}/metrics_library.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/mockable_virtual_defaults.h
     ${CMAKE_CURRENT_SOURCE_DIR}/numeric.h
     ${CMAKE_CURRENT_SOURCE_DIR}/perf_counter.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/perf_profiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/perf_profiler.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/range.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pool_allocator_traits.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/pool_allocator_traits.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pool_allocators.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/pool_allocators.h
     ${CMAKE_CURRENT_SOURCE_DIR}/reference_tracked_object.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/shared_pool_allocation.h
     ${CMAKE_CURRENT_SOURCE_DIR}/software_tags.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/software_tags.h
     ${CMAKE_CURRENT_SOURCE_DIR}/software_tags_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/software_tags_manager.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/sorted_vector.h
     ${CMAKE_CURRENT_SOURCE_DIR}/spinlock.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stackvec.h
     ${CMAKE_CURRENT_SOURCE_DIR}/tag_allocator.cpp
@@ -46,6 +62,14 @@ set(NEO_CORE_UTILITIES
     ${CMAKE_CURRENT_SOURCE_DIR}/timer_util.h
     ${CMAKE_CURRENT_SOURCE_DIR}/wait_util.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wait_util.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/isa_pool_allocator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/isa_pool_allocator.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/staging_buffer_manager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/staging_buffer_manager.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_data_map.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_data_map.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_data_hash.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_data_hash.h
 )
 
 set(NEO_CORE_UTILITIES_WINDOWS

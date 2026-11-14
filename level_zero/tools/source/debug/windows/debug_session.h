@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/os_interface/windows/wddm_allocation.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/debug/debug_session.h"
@@ -45,7 +46,7 @@ struct DebugSessionWindows : DebugSessionImp {
 
   protected:
     ze_result_t resumeImp(const std::vector<EuThread::ThreadId> &threads, uint32_t deviceIndex) override;
-    void DebugSessionWindows::pushApiEvent(zet_debug_event_t &debugEvent, uint32_t seqNo, uint32_t type) {
+    void pushApiEvent(zet_debug_event_t &debugEvent, uint32_t seqNo, uint32_t type) {
         std::unique_lock<std::mutex> lock(asyncThreadMutex);
         apiEvents.push(debugEvent);
         if (debugEvent.flags & ZET_DEBUG_EVENT_FLAG_NEED_ACK) {
@@ -56,6 +57,10 @@ struct DebugSessionWindows : DebugSessionImp {
 
     ze_result_t interruptImp(uint32_t deviceIndex) override;
     ze_result_t acknowledgeEventImp(uint32_t seqNo, uint32_t eventType);
+
+    MOCKABLE_VIRTUAL ze_result_t interruptContextImp();
+    MOCKABLE_VIRTUAL ze_result_t resumeContextImp(uint64_t memoryHandle);
+    MOCKABLE_VIRTUAL ze_result_t continueExecutionImp(uint64_t memoryHandle);
 
     ze_result_t readGpuMemory(uint64_t memoryHandle, char *output, size_t size, uint64_t gpuVa) override;
     ze_result_t writeGpuMemory(uint64_t memoryHandle, const char *input, size_t size, uint64_t gpuVa) override;
@@ -78,6 +83,7 @@ struct DebugSessionWindows : DebugSessionImp {
     ze_result_t handleContextCreateDestroyEvent(DBGUMD_READ_EVENT_CONTEXT_CREATE_DESTROY_EVENT_PARAMS &contextCreateDestroyParams);
     ze_result_t handleDeviceCreateDestroyEvent(DBGUMD_READ_EVENT_DEVICE_CREATE_DESTROY_EVENT_PARAMS &deviceCreateDestroyParams);
     ze_result_t handleCreateDebugDataEvent(DBGUMD_READ_EVENT_CREATE_DEBUG_DATA_PARAMS &createDebugDataParams);
+    ze_result_t handleSyncHostEvent(DBGUMD_READ_EVENT_SYNC_HOST_DATA_PARAMS &syncHostDataParams);
     ze_result_t readAllocationDebugData(uint32_t seqNo, uint64_t umdDataBufferPtr, void *outBuf, size_t outBufSize);
 
     void enqueueApiEvent(zet_debug_event_t &debugEvent) override;
@@ -94,6 +100,8 @@ struct DebugSessionWindows : DebugSessionImp {
     void cleanRootSessionAfterDetach(uint32_t deviceIndex) override {
         UNRECOVERABLE_IF(true);
     }
+
+    ze_result_t updateStoppedThreadsAndCheckTriggerEvents(const AttentionEventFields &attention, uint32_t tileIndex, std::vector<EuThread::ThreadId> &threadsWithAttention) override;
 
     static void *asyncThreadFunction(void *arg);
 
@@ -117,8 +125,8 @@ struct DebugSessionWindows : DebugSessionImp {
         uint32_t size;
     };
 
-    uint64_t debugAreaVA;
-    NEO::DebugAreaHeader debugArea;
+    uint64_t debugAreaVA{};
+    NEO::DebugAreaHeader debugArea{};
     std::atomic<uint64_t> stateSaveAreaVA{0};
     std::atomic<size_t> stateSaveAreaSize{0};
     bool stateSaveAreaCaptured = false;

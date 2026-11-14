@@ -1,0 +1,27 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/os_interface/product_helper_hw.h"
+#include "shared/source/xe3_core/hw_cmds_nvls.h"
+#include "shared/source/xe3_core/hw_info_nvls.h"
+
+constexpr static auto gfxProduct = IGFX_NVL_XE3G;
+
+#include "shared/source/os_interface/windows/product_helper_xe2_and_later_wddm.inl"
+#include "shared/source/xe3_core/os_agnostic_product_helper_xe3_core.inl"
+
+namespace NEO {
+
+template <>
+bool ProductHelperHw<gfxProduct>::isLEOSupported() const {
+    return true;
+}
+
+template class ProductHelperHw<gfxProduct>;
+template struct EnableProductHelper<gfxProduct>;
+
+} // namespace NEO

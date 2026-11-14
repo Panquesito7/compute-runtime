@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,7 +18,6 @@ struct BatchBufferHelper {
             chainedBatchBufferStartOffset,      // chainedBatchBufferStartOffset
             0,                                  // taskStartAddress
             nullptr,                            // chainedBatchBuffer
-            false,                              // requiresCoherency
             false,                              // lowPriority
             QueueThrottle::MEDIUM,              // throttle
             QueueSliceCount::defaultSliceCount, // sliceCount
@@ -27,7 +26,9 @@ struct BatchBufferHelper {
             nullptr,                            // endCmdPtr
             0,                                  // numCsrClients
             false,                              // hasStallingCmds
-            false                               // hasRelaxedOrderingDependencies
+            false,                              // hasRelaxedOrderingDependencies
+            false,                              // dispatchMonitorFence
+            false                               // taskCountUpdateOnly
         );
     }
 

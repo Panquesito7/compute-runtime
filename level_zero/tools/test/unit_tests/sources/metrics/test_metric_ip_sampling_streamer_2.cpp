@@ -1,0 +1,1295 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/test/common/test_macros/hw_test.h"
+
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/tools/test/unit_tests/sources/metrics/metric_ip_sampling_fixture.h"
+
+namespace L0 {
+namespace ult {
+
+using MetricIpSamplingCalcOpSingleDeviceTest = MetricIpSamplingCalculateOperationFixture;
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCalcOpCallingMetricCalculateValuesOnSubDeviceThenSuccessIsReturned, HasIPSamplingSupport) {
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+    uint32_t metricsInReportCount = expectedMetricsInGroup;
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation,
+                                                                                      &metricsInReportCount,
+                                                                                      metricsInReport.data(),
+                                                                                      metricScopesInReport.data()));
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+    std::vector<zet_metric_properties_t> metricProperties(metricsInReportCount);
+
+    for (uint32_t i = 0; i < metricsInReportCount; i++) {
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricGetProperties(metricsInReport[i], &metricProperties[i]));
+    }
+
+    // The raw data holds one report per unique IP in it
+    uint32_t totalMetricReportCount = IpSamplingTestProductHelper::numberOfIpsInRawData;
+    bool lastCall = true;
+    size_t usedSize = 0;
+    std::vector<zet_intel_metric_result_exp_t> metricResults(totalMetricReportCount * metricsInReportCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawReportsBytesSize, reinterpret_cast<uint8_t *>(rawReports.data()),
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, IpSamplingTestProductHelper::numberOfIpsInRawData);
+    EXPECT_EQ(usedSize, rawReportsBytesSize);
+
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+
+    for (uint32_t i = 0; i < totalMetricReportCount; i++) {
+        for (uint32_t j = 0; j < metricsInReportCount; j++) {
+            uint32_t resultIndex = i * metricsInReportCount + j;
+            EXPECT_EQ(metricProperties[j].resultType, ZET_VALUE_TYPE_UINT64);
+            EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricCalculateValues[resultIndex]);
+            EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+        }
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCalcOpCallingMetricCalculateValuesOnSubDeviceThenHandleErrorForRootDeviceData, HasIPSamplingSupport) {
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+
+    std::vector<uint8_t> rawDataWithHeader(rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader));
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+
+    uint32_t metricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation, &metricsInReportCount, nullptr, nullptr));
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    uint32_t totalMetricReportCount = 1;
+    bool lastCall = true;
+    size_t usedSize = 0;
+    // sub-device calcOp does not accept root device data
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zetIntelMetricCalculateValuesExp(rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                                 hCalculationOperation,
+                                                                                 lastCall, &usedSize,
+                                                                                 &totalMetricReportCount, metricResults.data()));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCalcOpCallingMetricCalculateValuesOnSubDeviceThenHandleInvalidDataSize, HasIPSamplingSupport) {
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+
+    std::vector<uint8_t> rawDataWithHeader(rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader));
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+
+    bool lastCall = true;
+    size_t usedSize = 0;
+
+    // Handle invalid input raw data size when getting values
+    std::vector<zet_intel_metric_result_exp_t> metricResults(1);
+    uint32_t totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, zetIntelMetricCalculateValuesExp(rawReportsBytesSize / 30, reinterpret_cast<uint8_t *>(rawReports.data()),
+                                                                             hCalculationOperation,
+                                                                             lastCall, &usedSize,
+                                                                             &totalMetricReportCount, metricResults.data()));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCalcOpOnSubDeviceCallingMetricCalculateValuesWithZeroRawDataSizeThenOnlyALastCallIsAccepted, HasIPSamplingSupport) {
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+
+    uint32_t metricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation, &metricsInReportCount, nullptr, nullptr));
+    std::vector<zet_intel_metric_result_exp_t> metricResults(2 * metricsInReportCount);
+
+    size_t usedSize = 0;
+    uint8_t *rawdata = reinterpret_cast<uint8_t *>(rawReports.data());
+
+    // Request a single report out of the three the raw data holds, so a single raw report is consumed and
+    // the remaining two are left cached for the calls to come.
+    uint32_t totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawReportsBytesSize, rawdata,
+                                                                  hCalculationOperation, false, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+    // An empty buffer holds no raw report to process, so a call that is not the last one has nothing to do
+    // with it: calculating what is still cached without being handed any raw data is what a last call is
+    // for, and the caller is expected to hand the raw data it did not consume back instead.
+    totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, zetIntelMetricCalculateValuesExp(0u, rawdata,
+                                                                             hCalculationOperation, false, &usedSize,
+                                                                             &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 0U);
+    EXPECT_EQ(usedSize, 0U);
+
+    // The rejected call left the cached reports untouched, so a last call with no raw data left still
+    // calculates both of them, consuming nothing.
+    totalMetricReportCount = 2;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(0u, rawdata,
+                                                                  hCalculationOperation, true, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 2U);
+    EXPECT_EQ(usedSize, 0U);
+
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    // Report format is sorted by IP and the first call calculated the report of the first IP, so the two
+    // reports drained here are the ones of the second and third IPs of the raw data.
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+    for (uint32_t i = 0; i < 2 * metricsInReportCount; i++) {
+        EXPECT_EQ(metricResults[i].value.ui64, expectedMetricCalculateValues[metricsInReportCount + i]);
+        EXPECT_EQ(metricResults[i].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCalcOpOnSubDeviceCallingMetricCalculateValuesWithZeroRawDataSizeAndNothingCachedThenNoReportIsCalculated, HasIPSamplingSupport) {
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+
+    uint32_t metricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation, &metricsInReportCount, nullptr, nullptr));
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    size_t usedSize = 0;
+    // A last call handed no raw data on a calculation operation that has not cached anything from previous
+    // calls has nothing to calculate at all: it is not an error, it simply yields no metric report.
+    uint32_t totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(0u, reinterpret_cast<uint8_t *>(rawReports.data()),
+                                                                  hCalculationOperation, true, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 0U);
+    EXPECT_EQ(usedSize, 0U);
+
+    // The calculation operation was left untouched by it, so it still calculates the whole raw data.
+    totalMetricReportCount = IpSamplingTestProductHelper::numberOfIpsInRawData;
+    metricResults.resize(totalMetricReportCount * metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawReportsBytesSize, reinterpret_cast<uint8_t *>(rawReports.data()),
+                                                                  hCalculationOperation, true, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, IpSamplingTestProductHelper::numberOfIpsInRawData);
+    EXPECT_EQ(usedSize, rawReportsBytesSize);
+
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+    for (uint32_t i = 0; i < totalMetricReportCount * metricsInReportCount; i++) {
+        EXPECT_EQ(metricResults[i].value.ui64, expectedMetricCalculateValues[i]);
+        EXPECT_EQ(metricResults[i].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCalcOpCallingMetricCalculateValuesOnSubDeviceWithZeroReportCountThenErrorIsReturned, HasIPSamplingSupport) {
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+
+    uint32_t metricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation, &metricsInReportCount, nullptr, nullptr));
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    bool lastCall = true;
+    size_t usedSize = 0;
+    // Querying the number of available reports is not supported, so a report count of zero is invalid
+    uint32_t totalMetricReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zetIntelMetricCalculateValuesExp(rawReportsBytesSize, reinterpret_cast<uint8_t *>(rawReports.data()),
+                                                                                 hCalculationOperation,
+                                                                                 lastCall, &usedSize,
+                                                                                 &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 0u);
+    EXPECT_EQ(usedSize, 0u);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenSubDeviceCreatingCalcOpWithOnlyOddMetricsHandlesThenExpectToFindOnlyThoseInResults, HasIPSamplingSupport) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+    std::vector<IpSamplingTestProductHelper::MetricProperties> expectedMetricsProperties = {};
+    ipSamplingTestProductHelper->getExpectedMetricsProperties(productFamily, expectedMetricsProperties);
+
+    uint32_t metricCount = 0;
+    EXPECT_EQ(zetMetricGet(metricGroupHandlePerDevice[subDevice], &metricCount, nullptr), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(metricCount, expectedMetricsInGroup);
+    std::vector<zet_metric_handle_t> phMetrics(metricCount);
+    EXPECT_EQ(zetMetricGet(metricGroupHandlePerDevice[subDevice], &metricCount, phMetrics.data()), ZE_RESULT_SUCCESS);
+
+    std::vector<zet_metric_handle_t> metricsToCalculate;
+
+    // Select only odd index metrics.
+    for (uint32_t i = 0; i < metricCount; i++) {
+        if (i % 2) {
+            metricsToCalculate.push_back(phMetrics[i]);
+        }
+    }
+
+    uint32_t metricsToCalculateCount = static_cast<uint32_t>(metricsToCalculate.size());
+    EXPECT_EQ(metricsToCalculateCount, expectedMetricsInGroup / 2);
+
+    calcDescPerDevice[subDevice].metricGroupCount = 0;
+    calcDescPerDevice[subDevice].phMetricGroups = nullptr;
+    calcDescPerDevice[subDevice].metricCount = metricsToCalculateCount;
+    calcDescPerDevice[subDevice].phMetrics = metricsToCalculate.data();
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+    uint32_t metricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation, &metricsInReportCount, nullptr, nullptr));
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup / 2); // NOTE: sub-devices support only one metric scope
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation, &metricsInReportCount,
+                                                                                      metricsInReport.data(), metricScopesInReport.data()));
+
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup / 2);
+    // Expect only odd index metrics in the result report
+    zet_metric_properties_t metricProperties = {};
+    metricProperties.stype = ZET_STRUCTURE_TYPE_METRIC_PROPERTIES;
+    metricProperties.pNext = nullptr;
+    zet_intel_metric_scope_properties_exp_t scopeProperties{};
+    scopeProperties.stype = ZET_STRUCTURE_TYPE_INTEL_METRIC_SCOPE_PROPERTIES_EXP;
+    scopeProperties.pNext = nullptr;
+
+    for (uint32_t i = 0; i < metricsInReportCount; i++) {
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricGetProperties(metricsInReport[i], &metricProperties));
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricScopeGetPropertiesExp(metricScopesInReport[i],
+                                                                         &scopeProperties));
+        EXPECT_STREQ(metricProperties.name, expectedMetricsProperties[i * 2 + 1].name); // odd index metrics
+        EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), scopesPerDevice[subDevice][0]);
+        EXPECT_EQ(scopeProperties.iD, 0U); // sub-devices support only one metric scope, with ID 0
+    }
+
+    // Only use the first raw reports, so can easily verify the results for each metric
+    uint8_t *rawdata = reinterpret_cast<uint8_t *>(rawReports.data());
+    size_t dataSize = IpSamplingCalculation::rawReportSize;
+
+    // A single raw report holds a single IP, so it yields a single result report
+    uint32_t totalMetricReportCount = 1;
+    bool lastCall = true;
+    size_t usedSize = 0;
+
+    std::vector<zet_intel_metric_result_exp_t> metricResults(totalMetricReportCount * metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataSize, rawdata,
+                                                                  hCalculationOperation,
+                                                                  lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::FirstRawReportOnly, expectedMetricCalculateValues);
+    // Expect only odd index metrics results of the first report
+    for (uint32_t j = 0; j < metricsInReportCount; j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j * 2 + 1]);
+        EXPECT_EQ(metricResults[j].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCallingMetricCalculateValuesOnSubDeviceCanRequestFewerValuesThanAvailable, HasIPSamplingSupport) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+    uint32_t metricsInReportCount = expectedMetricsInGroup;
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation,
+                                                                                      &metricsInReportCount,
+                                                                                      metricsInReport.data(),
+                                                                                      metricScopesInReport.data()));
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint8_t *rawdata = reinterpret_cast<uint8_t *>(rawReports.data());
+    size_t dataBytesSize = rawReportsBytesSize;
+
+    // Request only one report even if three are available
+    totalMetricReportCount = 1;
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataBytesSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    // Report format will be sorted by IP, so expect IP1 to be in the output first
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j]);
+    }
+
+    dataBytesSize -= usedSize;
+    rawdata += usedSize;
+
+    // Two reports remain available, cached. Request only one of them
+    totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataBytesSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        // Expect results for IP10, which is the second report in the raw data, to be in the output now
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[metricsInReportCount + j]);
+    }
+
+    dataBytesSize -= usedSize;
+    rawdata += usedSize;
+
+    // One report remains available, cached. Request it
+    totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataBytesSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, dataBytesSize);
+
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        // Expect results for IP100, which is the third report in the raw data, to be in the output now
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[metricsInReportCount * 2 + j]);
+    }
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCallingMetricCalculateValuesOnSubDeviceCanRequestFewerValuesThanAvailablelastCallTrue, HasIPSamplingSupport) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+    uint32_t metricsInReportCount = expectedMetricsInGroup;
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation,
+                                                                                      &metricsInReportCount,
+                                                                                      metricsInReport.data(),
+                                                                                      metricScopesInReport.data()));
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = true;
+    size_t usedSize = 0;
+    uint8_t *rawdata = reinterpret_cast<uint8_t *>(rawReports.data());
+
+    // Request only one report even if three are available
+    totalMetricReportCount = 1;
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawReportsBytesSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    // Setting lastCall to true processes all data available
+    EXPECT_EQ(usedSize, rawReportsBytesSize);
+
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    // Report format will be sorted by IP, so expect IP1 to be in the output first
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j]);
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCallingMetricCalculateValuesOnSubDeviceCanConcatenateData, HasIPSamplingSupport) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+    uint32_t metricsInReportCount = expectedMetricsInGroup;
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation,
+                                                                                      &metricsInReportCount,
+                                                                                      metricsInReport.data(),
+                                                                                      metricScopesInReport.data()));
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint8_t *rawdata = reinterpret_cast<uint8_t *>(rawReports.data());
+    size_t dataSize = 2 * IpSamplingCalculation::rawReportSize; // Only use the first two raw reports
+
+    // Two reports are available: IP1 from the first raw report, IP10 from the second one.
+    // Request only one of them, leave result for IP 10 (second raw report) cached
+    totalMetricReportCount = 1;
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize); // If cached results remain, used size will be a single raw report
+
+    // Expect IP1 only from the first report
+    std::vector<uint64_t> expectedMetricCalculateValues = {};
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::FirstRawReportOnly, expectedMetricCalculateValues);
+
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j]);
+    }
+
+    // Advance already processed data and simulate appending
+    rawdata += usedSize; // now points to second raw report
+    // simulate appending one new raw report at the end. Third of rawReports
+    dataSize = 2 * IpSamplingCalculation::rawReportSize;
+
+    // Two reports are available now: IP 10 cached plus new IP 1 from third raw report. Request only one
+    totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize); // If cached results remain, used size will be a single raw report
+
+    // Once again expect to find results for IP1, but this time from the third raw report.
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::ThirdRawReportOnly, expectedMetricCalculateValues);
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j]);
+    }
+
+    // Advance already processed data and simulate appending
+    rawdata += usedSize; // now points to the third raw report
+    // simulate appending two new raw reports at the end. Fourth and fifth of rawReports
+    dataSize = 3 * IpSamplingCalculation::rawReportSize;
+
+    // Two reports are available now: IP 10 cached and also new from forth report and IP 100 from fifth
+    // raw report. Request only one
+    totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize); // If cached results remain, used size will be a single raw report
+
+    // Results from IP 10 should be the sum of the values cached plus new data found
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[expectedMetricsInGroup + j]);
+    }
+
+    // Advance already processed data and simulate appending
+    rawdata += usedSize; // // now points to the fourth raw report
+    // simulate appending one new raw report at the end. sixth of rawReports
+    // Note: since previously appended two but progressed only one, now the new size is 3 raw reports
+    dataSize = 3 * IpSamplingCalculation::rawReportSize;
+
+    // A single report is available now: IP100, cached and from the sixth raw report. Request it
+    totalMetricReportCount = 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, dataSize); // all cached data consumed, usedSize should be equal to input size
+
+    // Results from IP 100 should be the sum of the values cached plus new data found
+    ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+    for (uint32_t j = 0; j < metricResults.size(); j++) {
+        EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[expectedMetricsInGroup * 2 + j]);
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcOpSingleDeviceTest, GivenIpSamplingCallingMetricCalculateValuesOnSubDeviceCachesareFreed, HasIPSamplingSupport) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalculationOperation;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(),
+                                                                             subDevice->toHandle(), &calcDescPerDevice[subDevice],
+                                                                             &hCalculationOperation));
+    uint32_t metricsInReportCount = expectedMetricsInGroup;
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalculationOperation,
+                                                                                      &metricsInReportCount,
+                                                                                      metricsInReport.data(),
+                                                                                      metricScopesInReport.data()));
+    EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint8_t *rawdata = reinterpret_cast<uint8_t *>(rawReports.data());
+    size_t dataBytesSize = rawReportsBytesSize;
+
+    // Request only one report even if three are available
+    totalMetricReportCount = 1;
+    std::vector<zet_intel_metric_result_exp_t> metricResults(metricsInReportCount);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(dataBytesSize, rawdata,
+                                                                  hCalculationOperation, lastCall, &usedSize,
+                                                                  &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, 1U);
+    EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+    // 2 IPs remain cached.
+    // Destroying calcOp should free the cached IP results
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalculationOperation));
+}
+
+using MetricIpSamplingCalcAggregationTest = MetricIpSamplingMetricsAggregationMultiDevFixture;
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceCalculatingOnSingleDataReadExpectSuccess, IsAtLeastXe2HpgCore) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+    std::vector<IpSamplingTestProductHelper::MetricProperties> expectedMetricsProperties = {};
+    ipSamplingTestProductHelper->getExpectedMetricsProperties(productFamily, expectedMetricsProperties);
+
+    // Raw data for a single read with different data for sub-device 0 and 1
+    size_t rawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data() + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader),
+                                            rawDataWithHeader.size() - (rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader)),
+                                            reinterpret_cast<uint8_t *>(rawReports2.data()), rawReports2BytesSize, 1);
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint32_t metricsInReportCount = 0;
+    zet_metric_properties_t metricProperties = {};
+    metricProperties.stype = ZET_STRUCTURE_TYPE_METRIC_PROPERTIES;
+    metricProperties.pNext = nullptr;
+    std::vector<zet_metric_handle_t> metricsInReport = {};
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport = {};
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+
+    for (auto &calcOp : hCalcOps) {
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+        // Expect the number of metric in the metric group to be metrics per single scope included in the calcOp
+        if (calcOp == hCalcOpCompScope1 || calcOp == hCalcOpCompScope2 || calcOp == hCalcOpAggScope) {
+            EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+        } else if (calcOp == hCalcOpAllCompScopes) {
+            EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup * 2); // two compute scopes included in the calcOp
+        } else if (calcOp == hCalcOpAllScopes) {
+            EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup * 3); // three scopes included in the calcOp
+        }
+
+        metricsInReport.resize(metricsInReportCount);
+        metricScopesInReport.resize(metricsInReportCount);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp,
+                                                                                          &metricsInReportCount,
+                                                                                          metricsInReport.data(),
+                                                                                          metricScopesInReport.data()));
+        for (uint32_t i = 0; i < metricsInReportCount; i++) {
+            EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricGetProperties(metricsInReport[i], &metricProperties));
+            EXPECT_STREQ(metricProperties.name, expectedMetricsProperties[i % expectedMetricsProperties.size()].name);
+
+            if (calcOp == hCalcOpCompScope1) {
+                EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeCompute0);
+            } else if (calcOp == hCalcOpCompScope2) {
+                EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeCompute1);
+            } else if (calcOp == hCalcOpAllCompScopes) {
+                if (i < expectedMetricsInGroup) {
+                    EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeCompute0);
+                } else {
+                    EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeCompute1);
+                }
+            } else if (calcOp == hCalcOpAggScope) {
+                EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeAggregated);
+            } else if (calcOp == hCalcOpAllScopes) {
+                if (i < expectedMetricsInGroup) {
+                    // Expect aggregated scope first
+                    EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeAggregated);
+                } else if (i >= expectedMetricsInGroup && i < expectedMetricsInGroup * 2) {
+                    EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeCompute0);
+                } else {
+                    EXPECT_EQ(static_cast<MockMetricScope *>(MetricScope::fromHandle(metricScopesInReport[i])), mockMetricScopeCompute1);
+                }
+            }
+        }
+
+        // Number of reports the raw data yields for this calculation operation
+        if (calcOp == hCalcOpCompScope1 || calcOp == hCalcOpAllCompScopes) {
+            // three IPs in raw data for sub-dev 0 (rawReports), two IPs for sub-dev 1 (rawReports2), expect the biggest for hCalcOpAllCompScopes
+            totalMetricReportCount = IpSamplingTestProductHelper::numberOfIpsInRawData;
+        } else if (calcOp == hCalcOpCompScope2) {
+            // two IPs in raw data for sub-dev 1 (rawReports2)
+            totalMetricReportCount = 2U;
+        } else {
+            // When aggregated scope is included expect unique IPs from both sub-devices: IP1, IP2, IP10, IP100
+            totalMetricReportCount = 4U;
+        }
+
+        metricResults.resize(totalMetricReportCount * metricsInReportCount);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(usedSize, rawDataSize);
+        if (calcOp == hCalcOpCompScope1 || calcOp == hCalcOpAllCompScopes) {
+            EXPECT_EQ(totalMetricReportCount, IpSamplingTestProductHelper::numberOfIpsInRawData);
+        } else if (calcOp == hCalcOpCompScope2) {
+            EXPECT_EQ(totalMetricReportCount, 2U);
+        } else if (calcOp == hCalcOpAggScope || calcOp == hCalcOpAllScopes) {
+            EXPECT_EQ(totalMetricReportCount, 4U);
+        }
+
+        std::vector<uint64_t> expectedMetricCalculateValues = {};
+        ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+        for (uint32_t i = 0; i < totalMetricReportCount; i++) {
+            for (uint32_t j = 0; j < metricsInReportCount; j++) {
+                uint32_t resultIndex = i * metricsInReportCount + j;
+                if (calcOp == hCalcOpCompScope1) {
+                    // Data for sub dev 0 is from rawReports so expected results are from expectedMetricValues for IP1, IP10 and IP100
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricCalculateValues[resultIndex]); // same expected values for the three IPs since they are from the same raw report
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                } else if (calcOp == hCalcOpCompScope2) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValues2Xe2AndLater[resultIndex]);
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                } else if (calcOp == hCalcOpAllCompScopes) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesCalcOpAllCompScopesXe2AndLater[resultIndex]);
+                    if (resultIndex < 55) {
+                        // First two result reports have valid entries in compute caches
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                    } else {
+                        // Third result report does not have IPs for sub-dev 1 in the cache: 3 IPs for subdev 0, 2 IPs for subdev 1
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_INVALID);
+                    }
+
+                } else if (calcOp == hCalcOpAggScope) {
+                    // Expected results are the aggregation of both sub-devices
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesCalcOpAggScopeXe2AndLater[resultIndex]);
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                } else if (calcOp == hCalcOpAllScopes) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesCalcOpAllScopesXe2AndLater[resultIndex]);
+                    // Sub-dev 0 has 3 IPs, sub-dev 1 has 2 IPs, aggregated scope has 4 IPs
+                    if (resultIndex < 88) {
+                        // First two reports: all results are valid.
+                        // Third result report: aggregated scope cache has IPs, sub-dev 0 has IPs
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                    } else if (resultIndex >= 88 && resultIndex < 99) {
+                        // Third result report: sub-dev 1 cache ran out of IPs
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_INVALID);
+                    } else if (resultIndex >= 99 && resultIndex < 110) {
+                        // Fourth result report: only aggregated scope cache has IPs
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                    } else {
+                        // Fourth result report: both sub-devices caches ran out of IPs
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_INVALID);
+                    }
+                }
+            }
+        }
+    }
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcAggregationTest, GivenMetricsSupportingDifferentScopesWhenCalculatingThenResultsFollowThePerScopeReportFormat, IsAtLeastXe2HpgCore) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+    ASSERT_GE(expectedMetricsInGroup, 2u);
+
+    // Raw data for a single read with different data for sub-device 0 and 1
+    size_t rawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data() + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader),
+                                            rawDataWithHeader.size() - (rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader)),
+                                            reinterpret_cast<uint8_t *>(rawReports2.data()), rawReports2BytesSize, 1);
+
+    // Calculate with the calcOp of the fixture including both compute scopes, where every metric
+    // supports every scope, to use its results as the reference of the per scope results.
+    const uint32_t referenceReportSize = expectedMetricsInGroup * 2;
+    uint32_t referenceMetricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalcOpAllCompScopes, &referenceMetricsInReportCount, nullptr, nullptr));
+    ASSERT_EQ(referenceMetricsInReportCount, referenceReportSize);
+
+    // three IPs in raw data for sub-dev 0 (rawReports), two IPs for sub-dev 1 (rawReports2), expect the biggest
+    uint32_t referenceReportCount = IpSamplingTestProductHelper::numberOfIpsInRawData;
+    size_t usedSize = 0;
+    std::vector<zet_intel_metric_result_exp_t> referenceResults(referenceReportCount * referenceMetricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, rawDataWithHeader.data(), hCalcOpAllCompScopes,
+                                                                  false, &usedSize, &referenceReportCount, referenceResults.data()));
+    EXPECT_EQ(referenceReportCount, IpSamplingTestProductHelper::numberOfIpsInRawData);
+
+    // Restrict the scopes of two metrics: the first one is not reported by the compute scope of
+    // sub-device 1 and the second one is not reported by the compute scope of sub-device 0.
+    uint32_t metricCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricGet(rootDevMetricGroupHandle, &metricCount, nullptr));
+    std::vector<zet_metric_handle_t> hMetrics(metricCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetMetricGet(rootDevMetricGroupHandle, &metricCount, hMetrics.data()));
+
+    std::vector<zet_intel_metric_scope_exp_handle_t> onlyCompute0Scope = {hMockScopeCompute0};
+    std::vector<zet_intel_metric_scope_exp_handle_t> onlyCompute1Scope = {hMockScopeCompute1};
+    static_cast<MockMetric *>(Metric::fromHandle(hMetrics[0]))->setScopes(onlyCompute0Scope);
+    static_cast<MockMetric *>(Metric::fromHandle(hMetrics[1]))->setScopes(onlyCompute1Scope);
+
+    // Indexes in the HW report of the metrics each compute scope reports
+    std::vector<uint32_t> compute0MetricIndexes = {};
+    std::vector<uint32_t> compute1MetricIndexes = {};
+    for (uint32_t i = 0; i < expectedMetricsInGroup; i++) {
+        if (i != 1) {
+            compute0MetricIndexes.push_back(i);
+        }
+        if (i != 0) {
+            compute1MetricIndexes.push_back(i);
+        }
+    }
+
+    zet_intel_metric_calculation_exp_desc_t calculationDesc{};
+    calculationDesc.stype = ZET_INTEL_STRUCTURE_TYPE_METRIC_CALCULATION_DESC_EXP;
+    calculationDesc.metricGroupCount = 1;
+    calculationDesc.phMetricGroups = &rootDevMetricGroupHandle;
+    calculationDesc.metricScopesCount = static_cast<uint32_t>(hComputeMetricScopes.size());
+    calculationDesc.phMetricScopes = hComputeMetricScopes.data();
+
+    zet_intel_metric_calculation_operation_exp_handle_t hCalcOp = nullptr;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationCreateExp(context->toHandle(), rootDevice->toHandle(),
+                                                                             &calculationDesc, &hCalcOp));
+    ASSERT_NE(hCalcOp, nullptr);
+
+    // Each scope reports only the metrics supporting it, and the scope with the lowest ID goes first
+    uint32_t metricsInReportCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalcOp, &metricsInReportCount, nullptr, nullptr));
+    ASSERT_EQ(metricsInReportCount, compute0MetricIndexes.size() + compute1MetricIndexes.size());
+
+    std::vector<zet_metric_handle_t> metricsInReport(metricsInReportCount);
+    std::vector<zet_intel_metric_scope_exp_handle_t> metricScopesInReport(metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(hCalcOp, &metricsInReportCount,
+                                                                                      metricsInReport.data(), metricScopesInReport.data()));
+    for (uint32_t i = 0; i < metricsInReportCount; i++) {
+        if (i < compute0MetricIndexes.size()) {
+            EXPECT_EQ(metricScopesInReport[i], hMockScopeCompute0);
+            EXPECT_EQ(metricsInReport[i], hMetrics[compute0MetricIndexes[i]]);
+        } else {
+            EXPECT_EQ(metricScopesInReport[i], hMockScopeCompute1);
+            EXPECT_EQ(metricsInReport[i], hMetrics[compute1MetricIndexes[i - compute0MetricIndexes.size()]]);
+        }
+    }
+
+    // Leaving metrics out of a scope does not change the IPs in the raw data, so it yields as many reports as the reference
+    uint32_t totalMetricReportCount = referenceReportCount;
+    std::vector<zet_intel_metric_result_exp_t> metricResults(totalMetricReportCount * metricsInReportCount);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, rawDataWithHeader.data(), hCalcOp,
+                                                                  false, &usedSize, &totalMetricReportCount, metricResults.data()));
+    EXPECT_EQ(totalMetricReportCount, referenceReportCount);
+
+    // Every result of the report has to be the same metric and scope got when no metric was
+    // filtered out, so leaving a metric out of a scope only removes its own results from the report.
+    for (uint32_t reportIndex = 0; reportIndex < totalMetricReportCount; reportIndex++) {
+        const uint32_t resultBase = reportIndex * metricsInReportCount;
+        const uint32_t referenceBase = reportIndex * referenceReportSize;
+
+        for (size_t i = 0; i < compute0MetricIndexes.size(); i++) {
+            const auto &result = metricResults[resultBase + i];
+            const auto &referenceResult = referenceResults[referenceBase + compute0MetricIndexes[i]];
+            EXPECT_EQ(result.value.ui64, referenceResult.value.ui64);
+            EXPECT_EQ(result.resultStatus, referenceResult.resultStatus);
+        }
+
+        for (size_t i = 0; i < compute1MetricIndexes.size(); i++) {
+            const auto &result = metricResults[resultBase + compute0MetricIndexes.size() + i];
+            const auto &referenceResult = referenceResults[referenceBase + expectedMetricsInGroup + compute1MetricIndexes[i]];
+            EXPECT_EQ(result.value.ui64, referenceResult.value.ui64);
+            EXPECT_EQ(result.resultStatus, referenceResult.resultStatus);
+        }
+    }
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationDestroyExp(hCalcOp));
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceCalculatingConcatenatedDataExpectSuccess, IsAtLeastXe2HpgCore) {
+
+    uint32_t expectedMetricsInGroup = 0;
+    ipSamplingTestProductHelper->getExpectedMetricCount(productFamily, expectedMetricsInGroup);
+
+    // Raw data for two reads of two sub-devices
+    size_t rawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize +
+                         sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize +
+                         sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize +
+                         sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize;
+
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    uint8_t *readRawDataStart = reinterpret_cast<uint8_t *>(rawDataWithHeader.data());
+    size_t availableSize = rawDataSize;
+    // First read for both sub-devices
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(readRawDataStart, availableSize,
+                                            reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    readRawDataStart += sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize;
+    availableSize -= sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize;
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(readRawDataStart, availableSize,
+                                            reinterpret_cast<uint8_t *>(rawReports2.data()), rawReports2BytesSize, 1);
+    readRawDataStart += sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+    availableSize -= sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+
+    // Simulate appending second read for both sub-devices
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(readRawDataStart, availableSize,
+                                            reinterpret_cast<uint8_t *>(rawReportsAppend.data()), rawReportsAppendBytesSize, 0);
+    readRawDataStart += sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize;
+    availableSize -= sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize;
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(readRawDataStart, availableSize,
+                                            reinterpret_cast<uint8_t *>(rawReportsAppend.data()), rawReportsAppendBytesSize, 1);
+    readRawDataStart += sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize;
+    availableSize -= sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize;
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint32_t metricsInReportCount = 0;
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+    for (auto &calcOp : hCalcOps) {
+        // Process first read
+        uint8_t *computeRawDataStart = reinterpret_cast<uint8_t *>(rawDataWithHeader.data());
+        size_t computeRawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize +
+                                    sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+        // Expect 11 metrics in the metric group, so 11 per scope included in the calcOp
+        if (calcOp == hCalcOpCompScope1 || calcOp == hCalcOpCompScope2 || calcOp == hCalcOpAggScope) {
+            EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup);
+        } else if (calcOp == hCalcOpAllCompScopes) {
+            EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup * 2); // two compute scopes included in the calcOp
+        } else if (calcOp == hCalcOpAllScopes) {
+            EXPECT_EQ(metricsInReportCount, expectedMetricsInGroup * 3); // three scopes included in the calcOp
+        }
+
+        // The first read yields three reports for sub-dev 0 (rawReports) and two for sub-dev 1
+        // (rawReports2), or four when the aggregated scope is included (IP1, IP2, IP10, IP100).
+        // Request only one of them.
+        totalMetricReportCount = 1;
+        metricResults.resize(metricsInReportCount);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(computeRawDataSize, computeRawDataStart,
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(totalMetricReportCount, 1U);
+        EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+        std::vector<uint64_t> expectedMetricCalculateValues = {};
+        ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+        for (uint32_t j = 0; j < metricsInReportCount; j++) {
+            if (calcOp == hCalcOpCompScope1) {
+                // Data for sub dev 0 is from rawReports so expected results are from expectedMetricValues for IP1
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j]); // same expected values for the three IPs since they are from the same raw report
+            } else if (calcOp == hCalcOpCompScope2) {
+                // Data for sub dev 1 is from rawReports2 so expected results are from expectedMetricValues2 for IP2
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValues2Xe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllCompScopes) {
+                // Data for both sub-devices, IP1 from sub-dev 0 and IP2 from sub-dev 1.
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesCalcOpAllCompScopesXe2AndLater[j]);
+            } else if (calcOp == hCalcOpAggScope) {
+                // Data for aggregated scope, Expect IP1
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesCalcOpAggScopeXe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllScopes) {
+                // Data for aggregated and both compute scopes. Same as the ones listed above for each scope.
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesCalcOpAllScopesXe2AndLater[j]);
+            }
+
+            EXPECT_EQ(metricResults[j].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+        }
+
+        // Progress data after processing the first report
+        computeRawDataStart += usedSize;
+        computeRawDataSize -= usedSize;
+
+        // Simulate data appending by adjusting the new size for the second read, including both sub-devices
+        computeRawDataSize += sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize +
+                              sizeof(IpSamplingMultiDevDataHeader) + rawReportsAppendBytesSize;
+
+        // After appending the second read more reports are available: 3 for the compute scopes of
+        // sub-dev 0 (IP10 and IP100 cached plus the new IP3), 2 for sub-dev 1 (IP100 cached plus IP3)
+        // and 4 when the aggregated scope is included (IP2, IP10 and IP100 cached plus IP3).
+        // Request only one report after appending second read
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(computeRawDataSize, computeRawDataStart,
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+
+        EXPECT_EQ(totalMetricReportCount, 1U);
+        EXPECT_EQ(usedSize, IpSamplingCalculation::rawReportSize);
+
+        for (uint32_t j = 0; j < metricsInReportCount; j++) {
+            if (calcOp == hCalcOpCompScope1 || calcOp == hCalcOpCompScope2 || calcOp == hCalcOpAllCompScopes) {
+                // Check results for IP3 from second read. Since the appended data is the same for both sub-devices.
+                // NOTE: Results are ordered by ascending IP address. So, IP3 is added as part of appended data but is expected ahead
+                // of the existing cached ones. IP10, IP100.
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesIP3Xe2AndLater[j % expectedMetricValuesIP3Xe2AndLater.size()]);
+            } else if (calcOp == hCalcOpAggScope) {
+                // When aggregated scope is included, the next IP to process is IP2.
+                // IP1 was returned in the first result report, IP2 is the next in the processed data (part of the appended data).
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValues2Xe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllScopes) {
+                // Expect to find IP 2 for aggregated scope and IP3 for both compute scopes
+                if (j < 11) {
+                    // Aggregated scope
+                    EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValues2Xe2AndLater[j]);
+                } else {
+                    // Compute scopes
+                    EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesIP3Xe2AndLater[j % expectedMetricValuesIP3Xe2AndLater.size()]);
+                }
+            }
+
+            EXPECT_TRUE(metricResults[j].resultStatus == ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+        }
+
+        // Progress data after processing one IP
+        computeRawDataStart += usedSize;
+        computeRawDataSize -= usedSize;
+
+        // Number of reports still cached for this calculation operation
+        if (calcOp == hCalcOpCompScope1 || calcOp == hCalcOpAllCompScopes) {
+            // Two IPs remaining in cache IP10 and IP100 cached
+            totalMetricReportCount = 2U;
+        } else if (calcOp == hCalcOpCompScope2) {
+            // One IP remaining in cache IP100
+            totalMetricReportCount = 1U;
+        } else {
+            // Three IPs remaining in cache: IP3, IP10, IP100
+            totalMetricReportCount = 3U;
+        }
+
+        // Calculate remaining IPs
+        metricResults.resize(metricsInReportCount * totalMetricReportCount);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(computeRawDataSize, computeRawDataStart,
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+
+        for (uint32_t i = 0; i < totalMetricReportCount; i++) {
+            for (uint32_t j = 0; j < metricsInReportCount; j++) {
+                uint32_t resultIndex = i * metricsInReportCount + j;
+
+                if (calcOp == hCalcOpCompScope1) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesIP10IP100AppendToRawReportsXe2AndLater[resultIndex]);
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                } else if (calcOp == hCalcOpCompScope2) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesIP100AppendToRawReportsXe2AndLater[resultIndex]);
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                } else if (calcOp == hCalcOpAllCompScopes) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesAppendToAllComputeScopesXe2AndLater[resultIndex]);
+                    if (resultIndex < 33) {
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                    } else {
+                        // Scope for sub-dev 1 has run out of IPs
+                        EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_INVALID);
+                    }
+                } else if (calcOp == hCalcOpAggScope) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricValuesAppendToAggregatedScopeXe2AndLater[resultIndex]);
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+                } else if (calcOp == hCalcOpAllScopes) {
+                    EXPECT_EQ(metricResults[resultIndex].value.ui64, expectedMetricResultsAfterAppendForAllScopesXe2AndLater[resultIndex].value.ui64);
+                    EXPECT_EQ(metricResults[resultIndex].resultStatus, expectedMetricResultsAfterAppendForAllScopesXe2AndLater[resultIndex].resultStatus);
+                }
+            }
+        }
+    }
+}
+
+HWTEST2_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceWhenDestroyingCalcOpsAndCachesHaveDataExpectCachedBeCleared, HasIPSamplingSupport) {
+
+    // Raw data for a single read with different data for sub-device 0 and 1
+    size_t rawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data() + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader),
+                                            rawDataWithHeader.size() - (rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader)),
+                                            reinterpret_cast<uint8_t *>(rawReports2.data()), rawReports2BytesSize, 1);
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint32_t metricsInReportCount = 0;
+    std::vector<zet_metric_handle_t> metricsInReport = {};
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+
+    for (auto &calcOp : hCalcOps) {
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+        metricResults.resize(metricsInReportCount);
+        // request only one report even if more are available, this leaves the caches with data
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+    }
+
+    // Leave the MetricIpSamplingCalcAggregationTest fixture TearDown to destroy calcOps and verify caches are cleared
+}
+
+HWTEST2_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceWhenUsingCorruptedDataErrorIsHandled, HasIPSamplingSupport) {
+
+    size_t rawDataSize = (sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize) * 2;
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    uint8_t *readRawDataStart = reinterpret_cast<uint8_t *>(rawDataWithHeader.data());
+    size_t availableSize = rawDataSize;
+    // Raw data read for both sub-devices
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(readRawDataStart, availableSize,
+                                            reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    auto header1 = reinterpret_cast<IpSamplingMultiDevDataHeader *>(readRawDataStart);
+    header1->rawDataSize = 0x1; // invalid size
+
+    readRawDataStart += sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize;
+    availableSize -= sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize;
+
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(readRawDataStart, availableSize,
+                                            reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 1);
+    auto header2 = reinterpret_cast<IpSamplingMultiDevDataHeader *>(readRawDataStart);
+    header2->rawDataSize = 0x2; // invalid size
+
+    uint32_t totalMetricReportCount = 0;
+    bool lastCall = false;
+    size_t usedSize = 0;
+    uint32_t metricsInReportCount = 0;
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+
+    for (auto &calcOp : hCalcOps) {
+        if (calcOp == hCalcOpCompScope2) { // sub-dev 1
+            // Make sub-dev 0 have valid data such traversing data can reach sub-dev 1 data
+            header1->rawDataSize = static_cast<uint32_t>(rawReportsBytesSize);
+        }
+
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+
+        metricResults.resize(metricsInReportCount);
+        // request only one report even if more are available, this leaves the caches with data. But failure should clear them
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, zetIntelMetricCalculateValuesExp(rawDataSize, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                                 calcOp, lastCall, &usedSize,
+                                                                                 &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(usedSize, 0U);
+        if (calcOp == hCalcOpCompScope2) {
+            header1->rawDataSize = 0x1; // restore invalid size for next iterations
+        }
+    }
+}
+
+HWTEST2_PRODUCT_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceCanCalllastCallMidWayAndStartWithNewData, IsAtLeastXe2HpgCore) {
+
+    // Raw data for a single read with different data for sub-device 0 and 1
+    size_t rawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data() + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader),
+                                            rawDataWithHeader.size() - (rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader)),
+                                            reinterpret_cast<uint8_t *>(rawReports2.data()), rawReports2BytesSize, 1);
+    uint32_t totalMetricReportCount = 0;
+    size_t usedSize = 0;
+    uint32_t metricsInReportCount = 0;
+    std::vector<zet_metric_handle_t> metricsInReport = {};
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+
+    for (auto &calcOp : hCalcOps) {
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+        metricResults.resize(metricsInReportCount);
+        // request only one report even if more are available, this leaves the caches with data
+        totalMetricReportCount = 1;
+        // set lastCall to true mid-way to clear caches
+        bool lastCall = true;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        // forcing lastCall should have cleared the caches, so all data is assumed processed
+        EXPECT_EQ(usedSize, rawDataSize);
+
+        std::vector<uint64_t> expectedMetricCalculateValues = {};
+        ipSamplingTestProductHelper->getExpectedCalculateResults(productFamily, IpSamplingTestProductHelper::CalculationResultType::CompleteResults, expectedMetricCalculateValues);
+        for (uint32_t j = 0; j < metricsInReportCount; j++) {
+            if (calcOp == hCalcOpCompScope1) {
+                // Data for sub dev 0 is from rawReports so expected results are from expectedMetricValues for IP1
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricCalculateValues[j]);
+            } else if (calcOp == hCalcOpCompScope2) {
+                // Data for sub dev 1 is from rawReports2 so expected results are from expectedMetricValues2 for IP2
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValues2Xe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllCompScopes) {
+                // Data for both sub-devices
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesCalcOpAllCompScopesXe2AndLater[j]);
+            } else if (calcOp == hCalcOpAggScope) {
+                // Data for aggregated scope
+                EXPECT_EQ(metricResults[j].value.ui64, expectedMetricValuesCalcOpAggScopeXe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllScopes) {
+                // Data for aggregated and both compute scopes
+                EXPECT_TRUE(metricResults[j].value.ui64 == expectedMetricValuesCalcOpAllScopesXe2AndLater[j]);
+            }
+            EXPECT_TRUE(metricResults[j].resultStatus == ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+        }
+
+        // Call again with new data, caches should be empty so results are as if first time processing
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                      calcOp, lastCall, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        // forcing lastCall should have cleared the caches, so all data is assumed processed
+        EXPECT_EQ(usedSize, rawDataSize);
+
+        for (uint32_t j = 0; j < metricsInReportCount; j++) {
+            if (calcOp == hCalcOpCompScope1) {
+                // Data for sub dev 0 is from rawReports so expected results are from expectedMetricValues for IP1
+                EXPECT_TRUE(metricResults[j].value.ui64 == expectedMetricCalculateValues[j]);
+            } else if (calcOp == hCalcOpCompScope2) {
+                // Data for sub dev 1 is from rawReports2 so expected results are from expectedMetricValues2 for IP2
+                EXPECT_TRUE(metricResults[j].value.ui64 == expectedMetricValues2Xe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllCompScopes) {
+                // Data for both sub-devices
+                EXPECT_TRUE(metricResults[j].value.ui64 == expectedMetricValuesCalcOpAllCompScopesXe2AndLater[j]);
+            } else if (calcOp == hCalcOpAggScope) {
+                // Data for aggregated scope
+                EXPECT_TRUE(metricResults[j].value.ui64 == expectedMetricValuesCalcOpAggScopeXe2AndLater[j]);
+            } else if (calcOp == hCalcOpAllScopes) {
+                // Data for aggregated and both compute scopes
+                EXPECT_TRUE(metricResults[j].value.ui64 == expectedMetricValuesCalcOpAllScopesXe2AndLater[j]);
+            }
+
+            EXPECT_TRUE(metricResults[j].resultStatus == ZET_INTEL_METRIC_CALCULATION_EXP_RESULT_VALID);
+        }
+    }
+}
+
+HWTEST2_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceCallingMetricCalculateValuesWithZeroRawDataSizeThenOnlyALastCallIsAccepted, HasIPSamplingSupport) {
+
+    // Raw data for a single read with different data for sub-device 0 and 1
+    size_t rawDataSize = sizeof(IpSamplingMultiDevDataHeader) + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader) + rawReports2BytesSize;
+    std::vector<uint8_t> rawDataWithHeader(rawDataSize);
+    // sub device index 0
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data(), rawDataWithHeader.size(), reinterpret_cast<uint8_t *>(rawReports.data()), rawReportsBytesSize, 0);
+    // sub device index 1
+    MockRawDataHelper::addMultiSubDevHeader(rawDataWithHeader.data() + rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader),
+                                            rawDataWithHeader.size() - (rawReportsBytesSize + sizeof(IpSamplingMultiDevDataHeader)),
+                                            reinterpret_cast<uint8_t *>(rawReports2.data()), rawReports2BytesSize, 1);
+
+    uint32_t totalMetricReportCount = 0;
+    size_t usedSize = 0;
+    uint32_t metricsInReportCount = 0;
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+
+    // The empty buffer is rejected before the raw data is told apart, so every root device calculation
+    // operation rejects it exactly as a sub-device one does, whichever scopes it reports.
+    for (auto &calcOp : hCalcOps) {
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+        metricResults.resize(metricsInReportCount);
+
+        // Request only one report even if more are available, so the remaining ones are left cached
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(rawDataSize, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                      calcOp, false, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(totalMetricReportCount, 1U);
+
+        // An empty buffer holds no raw report to process, so a call that is not the last one has nothing
+        // to do with it, not even calculate what is still cached.
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, zetIntelMetricCalculateValuesExp(0u, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                                 calcOp, false, &usedSize,
+                                                                                 &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(totalMetricReportCount, 0U);
+        EXPECT_EQ(usedSize, 0U);
+
+        // The rejected call left the cached reports untouched, so a last call with no raw data left still
+        // calculates one of them, consuming nothing.
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(0u, reinterpret_cast<uint8_t *>(rawDataWithHeader.data()),
+                                                                      calcOp, true, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(totalMetricReportCount, 1U);
+        EXPECT_EQ(usedSize, 0U);
+    }
+}
+
+HWTEST2_F(MetricIpSamplingCalcAggregationTest, GivenIpSamplingCalcOpOnRootDeviceCallingMetricCalculateValuesWithZeroRawDataSizeAndNothingCachedThenNoReportIsCalculated, HasIPSamplingSupport) {
+
+    size_t usedSize = 0;
+    uint32_t totalMetricReportCount = 0;
+    uint32_t metricsInReportCount = 0;
+    std::vector<zet_intel_metric_result_exp_t> metricResults = {};
+
+    // Nothing is cached before the first call, so a last call handed no raw data has nothing to calculate
+    // at all on any of the root device calculation operations, whichever scopes they report. The buffer is
+    // never told apart, so it is not taken for the sub-device raw data a root device calculation operation
+    // rejects, and its contents are never read.
+    for (auto &calcOp : hCalcOps) {
+        metricsInReportCount = 0;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculationOperationGetReportFormatExp(calcOp, &metricsInReportCount, nullptr, nullptr));
+        metricResults.resize(metricsInReportCount);
+
+        totalMetricReportCount = 1;
+        EXPECT_EQ(ZE_RESULT_SUCCESS, zetIntelMetricCalculateValuesExp(0u, reinterpret_cast<uint8_t *>(rawReports.data()),
+                                                                      calcOp, true, &usedSize,
+                                                                      &totalMetricReportCount, metricResults.data()));
+        EXPECT_EQ(totalMetricReportCount, 0U);
+        EXPECT_EQ(usedSize, 0U);
+    }
+}
+
+} // namespace ult
+} // namespace L0

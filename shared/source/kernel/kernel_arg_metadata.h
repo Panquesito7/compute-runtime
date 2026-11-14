@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -187,8 +187,8 @@ struct ArgTypeTraits {
 };
 
 namespace {
-inline constexpr auto ArgTypeMetadataSize = sizeof(ArgTypeTraits);
-static_assert(ArgTypeMetadataSize <= 4, "Keep it small");
+inline constexpr auto argTypeMetadataSize = sizeof(ArgTypeTraits);
+static_assert(argTypeMetadataSize <= 4, "Keep it small");
 } // namespace
 
 struct ArgTypeMetadataExtended {
@@ -197,6 +197,7 @@ struct ArgTypeMetadataExtended {
     std::string accessQualifier;
     std::string addressQualifier;
     std::string typeQualifiers;
+    size_t typeSize = 0u;
 };
 
 } // namespace NEO

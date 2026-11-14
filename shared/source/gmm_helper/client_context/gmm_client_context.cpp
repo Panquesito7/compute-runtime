@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,16 +7,21 @@
 
 #include "shared/source/gmm_helper/client_context/gmm_client_context.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/client_context/gmm_handle_allocator.h"
 #include "shared/source/gmm_helper/gmm_interface.h"
+#include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/sku_info/operations/sku_info_transfer.h"
 
 namespace NEO {
-GmmClientContext::GmmClientContext(const RootDeviceEnvironment &rootDeviceEnvironment) {
+
+GmmClientContext::~GmmClientContext() = default;
+
+void GmmClientContext::initialize(const RootDeviceEnvironment &rootDeviceEnvironment) {
     auto hardwareInfo = rootDeviceEnvironment.getHardwareInfo();
     _SKU_FEATURE_TABLE gmmFtrTable = {};
     _WA_TABLE gmmWaTable = {};
@@ -26,9 +31,9 @@ GmmClientContext::GmmClientContext(const RootDeviceEnvironment &rootDeviceEnviro
     GMM_INIT_IN_ARGS inArgs{};
     GMM_INIT_OUT_ARGS outArgs{};
 
-    auto gtSystemInfo = hardwareInfo->gtSystemInfo;
+    const auto &gtSystemInfo = hardwareInfo->gtSystemInfo;
     inArgs.ClientType = GMM_CLIENT::GMM_OCL_VISTA;
-    inArgs.pGtSysInfo = &gtSystemInfo;
+    inArgs.pGtSysInfo = const_cast<GT_SYSTEM_INFO *>(&gtSystemInfo);
     inArgs.pSkuTable = &gmmFtrTable;
     inArgs.pWaTable = &gmmWaTable;
     inArgs.Platform = hardwareInfo->platform;
@@ -37,22 +42,20 @@ GmmClientContext::GmmClientContext(const RootDeviceEnvironment &rootDeviceEnviro
     if (osInterface && osInterface->getDriverModel()) {
         osInterface->getDriverModel()->setGmmInputArgs(&inArgs);
     }
+    if (debugManager.flags.EnableFtrTile64Optimization.get() != -1) {
+        reinterpret_cast<_SKU_FEATURE_TABLE *>(inArgs.pSkuTable)->FtrTile64Optimization = debugManager.flags.EnableFtrTile64Optimization.get();
+    }
 
     auto ret = GmmInterface::initialize(&inArgs, &outArgs);
 
     UNRECOVERABLE_IF(ret != GMM_SUCCESS);
 
-    clientContext = outArgs.pGmmClientContext;
-}
-GmmClientContext::~GmmClientContext() {
-    GMM_INIT_OUT_ARGS outArgs;
-    outArgs.pGmmClientContext = clientContext;
-
-    GmmInterface::destroy(&outArgs);
-};
-
-MEMORY_OBJECT_CONTROL_STATE GmmClientContext::cachePolicyGetMemoryObject(GMM_RESOURCE_INFO *pResInfo, GMM_RESOURCE_USAGE_TYPE usage) {
-    return clientContext->CachePolicyGetMemoryObject(pResInfo, usage);
+    auto deleter = [](auto clientContextHandle) {
+        GMM_INIT_OUT_ARGS outArgs;
+        outArgs.pGmmClientContext = clientContextHandle;
+        GmmInterface::destroy(&outArgs);
+    };
+    clientContext = {outArgs.pGmmClientContext, deleter};
 }
 
 GMM_RESOURCE_INFO *GmmClientContext::createResInfoObject(GMM_RESCREATE_PARAMS *pCreateParams) {
@@ -67,8 +70,25 @@ void GmmClientContext::destroyResInfoObject(GMM_RESOURCE_INFO *pResInfo) {
     clientContext->DestroyResInfoObject(pResInfo);
 }
 
-GMM_CLIENT_CONTEXT *GmmClientContext::getHandle() const {
-    return clientContext;
+GMM_RESOURCE_INFO *GmmClientContext::getGmmResInfoFromExternalResourceHandle(const void *externalResourceHandle) {
+    return static_cast<GMM_RESOURCE_INFO *>(const_cast<void *>(externalResourceHandle));
+}
+
+GmmResourceInfo *GmmClientContext::createResInfoFromWddmPrivateData(const void *pPrivateDriverData, uint32_t privateDriverDataSize) {
+    return GmmResourceInfo::create(this, static_cast<GMM_RESOURCE_INFO *>(const_cast<void *>(pPrivateDriverData)));
+}
+
+MEMORY_OBJECT_CONTROL_STATE GmmClientContext::cachePolicyGetMemoryObject(GMM_RESOURCE_INFO *pResInfo, GmmResourceUsageType usage) {
+    return clientContext->CachePolicyGetMemoryObject(pResInfo, static_cast<GMM_RESOURCE_USAGE_TYPE_ENUM>(usage));
+}
+
+uint32_t GmmClientContext::cachePolicyGetPATIndex(GMM_RESOURCE_INFO *gmmResourceInfo, GmmResourceUsageType usage, bool compressed, bool cpuCacheable) {
+    bool outValue = compressed;
+    uint32_t patIndex = clientContext->CachePolicyGetPATIndex(gmmResourceInfo, static_cast<GMM_RESOURCE_USAGE_TYPE_ENUM>(usage), &outValue, cpuCacheable);
+
+    DEBUG_BREAK_IF(outValue != compressed);
+
+    return patIndex;
 }
 
 uint8_t GmmClientContext::getSurfaceStateCompressionFormat(GMM_RESOURCE_FORMAT format) {
@@ -77,22 +97,6 @@ uint8_t GmmClientContext::getSurfaceStateCompressionFormat(GMM_RESOURCE_FORMAT f
 
 uint8_t GmmClientContext::getMediaSurfaceStateCompressionFormat(GMM_RESOURCE_FORMAT format) {
     return clientContext->GetMediaSurfaceStateCompressionFormat(format);
-}
-
-void GmmClientContext::setGmmDeviceInfo(GMM_DEVICE_INFO *deviceInfo) {
-    clientContext->GmmSetDeviceInfo(deviceInfo);
-}
-
-uint32_t GmmClientContext::cachePolicyGetPATIndex(GMM_RESOURCE_INFO *gmmResourceInfo, GMM_RESOURCE_USAGE_TYPE usage, bool compressed, bool cachable) {
-    bool outValue = compressed;
-    uint32_t patIndex = clientContext->CachePolicyGetPATIndex(gmmResourceInfo, usage, &outValue, cachable);
-
-    DEBUG_BREAK_IF(outValue != compressed);
-
-    return patIndex;
-}
-void GmmClientContext::setHandleAllocator(std::unique_ptr<GmmHandleAllocator> allocator) {
-    this->handleAllocator = std::move(allocator);
 }
 
 } // namespace NEO

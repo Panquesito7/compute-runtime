@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -25,10 +25,12 @@ HWTEST2_P(ProductConfigHwInfoTests, givenAotConfigWhenSetHwInfoGmdIdThenCorrectV
     EXPECT_EQ(ret, productConfig);
 }
 
-HWTEST2_P(ProductConfigHwInfoTests, givenUnknownAotConfigWhenGetProductConfigThenUnknownIsaIsReturned, IsAtLeastMtl) {
+HWTEST2_P(ProductConfigHwInfoTests, givenUnknownAotConfigWhenGetProductConfigThenDefaultConfigIsReturned, IsAtLeastMtl) {
     hwInfo.ipVersion = {};
+    hwInfo.platform.usDeviceID = 0;
+    hwInfo.platform.usRevId = CommonConstants::invalidRevisionID;
     auto ret = compilerProductHelper->getHwIpVersion(hwInfo);
-    EXPECT_EQ(ret, AOT::UNKNOWN_ISA);
+    EXPECT_EQ(ret, compilerProductHelper->getDefaultHwIpVersion());
 }
 
 HWTEST2_P(ProductConfigHwInfoTests, givenAotConfigWhenGetProductConfigThenCorrectValueIsReturned, IsAtLeastMtl) {
@@ -40,6 +42,7 @@ HWTEST2_P(ProductConfigHwInfoTests, givenAotConfigWhenGetProductConfigThenCorrec
     auto ret = compilerProductHelper->getHwIpVersion(hwInfo);
     EXPECT_EQ(ret, productConfig);
 }
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProductConfigHwInfoTests);
 
 TEST(ProductConfigHwInfoTest, givenDefaultAotConfigWhenGetProductConfigThenSameValueIsReturned) {
     MockExecutionEnvironment mockExecutionEnvironment{};

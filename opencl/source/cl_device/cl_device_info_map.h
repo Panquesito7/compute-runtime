@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,10 +19,9 @@ namespace NEO {
 
 namespace ClDeviceInfoTable {
 
-template <cl_device_info Param, typename _Type, _Type ClDeviceInfo::*val>
+template <cl_device_info clDeviceInfoParam, typename Type, Type ClDeviceInfo::*val>
 struct ClMapBase {
-    enum { param = Param };
-    typedef _Type Type;
+    enum { param = clDeviceInfoParam };
     enum { size = sizeof(Type) };
 
     static const Type &getValue(const NEO::ClDevice &clDevice) {
@@ -30,10 +29,9 @@ struct ClMapBase {
     }
 };
 
-template <cl_device_info Param, typename _Type, _Type DeviceInfo::*val>
+template <cl_device_info clDeviceInfoParam, typename Type, Type DeviceInfo::*val>
 struct MapBase {
-    enum { param = Param };
-    typedef _Type Type;
+    enum { param = clDeviceInfoParam };
     enum { size = sizeof(Type) };
 
     static const Type &getValue(const NEO::ClDevice &clDevice) {
@@ -41,15 +39,15 @@ struct MapBase {
     }
 };
 
-template <cl_device_info Param>
+template <cl_device_info param>
 struct Map {};
 
 //////////////////////////////////////////////////////
 // DeviceInfo mapping table
-// Map<Param>::param    - i.e. CL_DEVICE_ADDRESS_BITS
-// Map<Param>::Type     - i.e. cl_uint
-// Map<Param>::size     - ie. sizeof( cl_uint )
-// Map<Param>::getValue - ie. return deviceInfo.AddressBits
+// Map<param>::param    - i.e. CL_DEVICE_ADDRESS_BITS
+// Map<param>::Type     - i.e. cl_uint
+// Map<param>::size     - ie. sizeof( cl_uint )
+// Map<param>::getValue - ie. return deviceInfo.AddressBits
 //////////////////////////////////////////////////////
 // clang-format off
 // please keep alphabetical order
@@ -102,7 +100,6 @@ template<> struct Map<CL_DEVICE_HALF_FP_ATOMIC_CAPABILITIES_EXT             > : 
 template<> struct Map<CL_DEVICE_HALF_FP_CONFIG                              > : public ClMapBase<CL_DEVICE_HALF_FP_CONFIG,                              uint64_t,                        &ClDeviceInfo::halfFpConfig> {};
 template<> struct Map<CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL                 > : public ClMapBase<CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL,                 uint64_t,                        &ClDeviceInfo::hostMemCapabilities> {};
 template<> struct Map<CL_DEVICE_HOST_UNIFIED_MEMORY                         > : public ClMapBase<CL_DEVICE_HOST_UNIFIED_MEMORY,                         uint32_t,                        &ClDeviceInfo::hostUnifiedMemory> {};
-template<> struct Map<CL_DEVICE_ILS_WITH_VERSION                            > : public ClMapBase<CL_DEVICE_ILS_WITH_VERSION,                            cl_name_version[1],              &ClDeviceInfo::ilsWithVersion> {};
 template<> struct Map<CL_DEVICE_IMAGE3D_MAX_HEIGHT                          > : public ClMapBase<CL_DEVICE_IMAGE3D_MAX_HEIGHT,                          size_t,                          &ClDeviceInfo::image3DMaxHeight> {};
 template<> struct Map<CL_DEVICE_IMAGE3D_MAX_WIDTH                           > : public ClMapBase<CL_DEVICE_IMAGE3D_MAX_WIDTH,                           size_t,                          &ClDeviceInfo::image3DMaxWidth> {};
 template<> struct Map<CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT                > : public ClMapBase<CL_DEVICE_IMAGE_BASE_ADDRESS_ALIGNMENT,                uint32_t,                        &ClDeviceInfo::imageBaseAddressAlignment> {};

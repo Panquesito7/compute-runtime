@@ -1,25 +1,26 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/device/device.h"
-#include "shared/source/helpers/get_info.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/helpers/ult_hw_config.h"
 #include "shared/test/common/mocks/mock_device.h"
 
-#include "opencl/source/api/api.h"
-#include "opencl/source/platform/platform.h"
+#include "opencl/source/api/cl_types.h"
+#include "opencl/source/api/dispatch.h"
+#include "opencl/source/context/context.h"
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
 
+#include "CL/cl.h"
 #include "gtest/gtest.h"
 
 using namespace ::testing;
@@ -49,8 +50,6 @@ TEST(DeviceOsTest, GivenDefaultClDeviceWhenCheckingForOsSpecificExtensionsThenCo
 
 TEST(DeviceOsTest, GivenDefaultClDeviceWhenCheckingForOsSpecificExtensionsThenDeviceInfoReportsSupportOfExternalMemorySharing) {
     VariableBackup<UltHwConfig> backup(&ultHwConfig);
-    DebugManagerStateRestore stateRestore;
-    DebugManager.flags.ClKhrExternalMemoryExtension.set(1);
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
 
     auto hwInfo = defaultHwInfo.get();
@@ -71,7 +70,7 @@ TEST(DeviceOsTest, WhenDeviceIsCreatedThenSimultaneousInteropsIsSupported) {
     EXPECT_TRUE(pDevice->simultaneousInterops == expected);
 }
 
-TEST(ApiOsTest, GivenUnupportedApiTokensWhenGettingInfoThenInvalidValueErrorIsReturned) {
+TEST(ApiOsTest, GivenUnsupportedApiTokensWhenGettingInfoThenInvalidValueErrorIsReturned) {
     MockContext context;
     MockBuffer buffer;
 
@@ -81,8 +80,11 @@ TEST(ApiOsTest, GivenUnupportedApiTokensWhenGettingInfoThenInvalidValueErrorIsRe
     EXPECT_EQ(CL_INVALID_VALUE, retVal);
 
     void *paramVal = nullptr;
+    buffer.context = &context;
     retVal = buffer.getMemObjectInfo(CL_MEM_D3D10_RESOURCE_KHR, sizeof(void *), paramVal, &size);
     EXPECT_EQ(CL_INVALID_VALUE, retVal);
+
+    buffer.context = nullptr;
 }
 
 TEST(ApiOsTest, GivenUnsupportedApiWhenGettingDispatchThenNullIsReturned) {

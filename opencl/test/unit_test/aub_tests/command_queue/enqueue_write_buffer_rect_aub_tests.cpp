@@ -1,19 +1,24 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/device/device.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <cstdint>
+#include <memory>
+#include <tuple>
+#include <vector>
 
 using namespace NEO;
 
@@ -36,20 +41,21 @@ using AUBWriteBufferRect = WriteBufferRectHw;
 HWTEST_P(AUBWriteBufferRect, Given3dWhenWritingBufferThenExpectationsAreMet) {
 
     MockContext context(this->pClDevice);
-    const size_t width = 10;
-    size_t rowPitch = width;
-    size_t slicePitch = rowPitch * rowPitch;
-
-    size_t bufferSizeBuff = rowPitch * rowPitch * rowPitch;
-    size_t bufferSize = alignUp(bufferSizeBuff, 4096);
+    static constexpr size_t width = 10;
+    static constexpr size_t rowPitch = width;
+    static constexpr size_t slicePitch = rowPitch * rowPitch;
+    static constexpr size_t bufferSizeBuff = rowPitch * rowPitch * rowPitch;
+    static constexpr size_t bufferSize = alignUp(bufferSizeBuff, size_t{4096});
 
     auto [zBuffOffs, zHostOffs] = GetParam();
 
     ASSERT_LT(zBuffOffs, width);
     ASSERT_LT(zHostOffs, width);
 
-    auto srcMemory = static_cast<uint8_t *>(::alignedMalloc(bufferSize, 4096));
-    auto destMemory = static_cast<uint8_t *>(::alignedMalloc(bufferSize, 4096));
+    alignas(4096) uint8_t srcRaw[bufferSize];
+    alignas(4096) uint8_t destRaw[bufferSize];
+    auto *srcMemory = srcRaw;
+    auto *destMemory = destRaw;
 
     for (unsigned int i = 0; i < bufferSize; i++) {
         auto oneBytePattern = static_cast<uint8_t>(i & 0xff);
@@ -67,7 +73,7 @@ HWTEST_P(AUBWriteBufferRect, Given3dWhenWritingBufferThenExpectationsAreMet) {
         retVal));
     ASSERT_NE(nullptr, dstBuffer);
 
-    uint8_t *pDestMemory = reinterpret_cast<uint8_t *>(dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress());
+    uint8_t *pDestMemory = reinterpret_cast<uint8_t *>(ptrOffset(dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), dstBuffer->getOffset()));
 
     cl_bool blockingWrite = CL_TRUE;
 
@@ -96,20 +102,17 @@ HWTEST_P(AUBWriteBufferRect, Given3dWhenWritingBufferThenExpectationsAreMet) {
     for (unsigned int i = 0; i < rowPitch; i++) {
         // one slice will be copied from src. all others should be zeros
         if (i == zBuffOffs) {
-            AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory + slicePitch * i, srcMemory + slicePitch * zHostOffs, slicePitch);
+            expectMemory<FamilyType>(pDestMemory + slicePitch * i, srcMemory + slicePitch * zHostOffs, slicePitch);
         } else {
-            AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory + slicePitch * i, ptr.data(), slicePitch);
+            expectMemory<FamilyType>(pDestMemory + slicePitch * i, ptr.data(), slicePitch);
         }
     }
-
-    ::alignedFree(srcMemory);
-    ::alignedFree(destMemory);
 }
-INSTANTIATE_TEST_CASE_P(AUBWriteBufferRect_simple,
-                        AUBWriteBufferRect,
-                        ::testing::Combine(
-                            ::testing::Values(0u, 1u, 2u, 3u, 4u),
-                            ::testing::Values(0u, 1u, 2u, 3u, 4u)));
+INSTANTIATE_TEST_SUITE_P(AUBWriteBufferRect_simple,
+                         AUBWriteBufferRect,
+                         ::testing::Combine(
+                             ::testing::Values(0u, 1u, 2u, 3u, 4u),
+                             ::testing::Values(0u, 1u, 2u, 3u, 4u)));
 
 struct AUBWriteBufferRectUnaligned
     : public CommandEnqueueAUBFixture,
@@ -124,8 +127,7 @@ struct AUBWriteBufferRectUnaligned
     }
 
     template <typename FamilyType>
-    void testWriteBufferUnaligned(size_t offset, size_t size) {
-        MockContext context(pCmdQ->getDevice().getSpecializedDevice<ClDevice>());
+    void testWriteBufferUnaligned(MockContext &context, size_t offset, size_t size) {
 
         char srcMemory[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         const auto bufferSize = sizeof(srcMemory);
@@ -144,7 +146,7 @@ struct AUBWriteBufferRectUnaligned
 
         buffer->forceDisallowCPUCopy = true;
 
-        uint8_t *pDestMemory = reinterpret_cast<uint8_t *>(buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress());
+        uint8_t *pDestMemory = reinterpret_cast<uint8_t *>(ptrOffset(buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), buffer->getOffset()));
 
         cl_bool blockingWrite = CL_TRUE;
 
@@ -170,20 +172,21 @@ struct AUBWriteBufferRectUnaligned
             nullptr);
 
         EXPECT_EQ(CL_SUCCESS, retVal);
-        pCmdQ->finish();
+        pCmdQ->finish(false);
 
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, referenceMemory, rowPitch);
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory + rowPitch * bufferOrigin[1], ptrOffset(srcMemory, offset), size);
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory + rowPitch * bufferOrigin[1] + size, referenceMemory, bufferSize - size - rowPitch);
+        expectMemory<FamilyType>(pDestMemory, referenceMemory, rowPitch);
+        expectMemory<FamilyType>(pDestMemory + rowPitch * bufferOrigin[1], ptrOffset(srcMemory, offset), size);
+        expectMemory<FamilyType>(pDestMemory + rowPitch * bufferOrigin[1] + size, referenceMemory, bufferSize - size - rowPitch);
     }
 };
 
 HWTEST_F(AUBWriteBufferRectUnaligned, GivenMisalignedHostPtrWhenWritingBufferThenExpectationsAreMet) {
-    const std::vector<size_t> offsets = {0, 1, 2, 3};
-    const std::vector<size_t> sizes = {4, 3, 2, 1};
+    MockContext context(pCmdQ->getDevice().getSpecializedDevice<ClDevice>());
+    static constexpr size_t offsets[] = {0, 1, 2, 3};
+    static constexpr size_t sizes[] = {4, 3, 2, 1};
     for (auto offset : offsets) {
         for (auto size : sizes) {
-            testWriteBufferUnaligned<FamilyType>(offset, size);
+            testWriteBufferUnaligned<FamilyType>(context, offset, size);
         }
     }
 }

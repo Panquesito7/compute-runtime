@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,94 +7,132 @@
 
 #include "shared/source/compiler_interface/compiler_cache.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/helpers/file_io.h"
-#include "shared/source/helpers/string.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/helpers/path.h"
+#include "shared/source/os_interface/linux/elements_struct.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
-#include "shared/source/utilities/io_functions.h"
-
-#include "os_inc.h"
+#include "shared/source/os_interface/os_handle.h"
 
 #include <algorithm>
 #include <dirent.h>
-#include <fcntl.h>
-#include <iostream>
-#include <sstream>
+#include <queue>
 #include <string_view>
 #include <sys/file.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <vector>
 
 namespace NEO {
-std::string makePath(const std::string &lhs, const std::string &rhs) {
-    if (lhs.size() == 0) {
-        return rhs;
-    }
-
-    if (rhs.size() == 0) {
-        return lhs;
-    }
-
-    if (*lhs.rbegin() == PATH_SEPARATOR) {
-        return lhs + rhs;
-    }
-
-    return lhs + PATH_SEPARATOR + rhs;
+bool CompilerCache::compareByLastAccessTime(const ElementsStruct &a, const ElementsStruct &b) {
+    return a.lastAccessTime < b.lastAccessTime;
 }
 
-int filterFunction(const struct dirent *file) {
-    std::string_view fileName = file->d_name;
-    if (fileName.find(".cl_cache") != fileName.npos || fileName.find(".l0_cache") != fileName.npos) {
-        return 1;
+bool CompilerCache::createCacheDirectories(const std::string &cacheFile) {
+    std::string path = config.cacheDir;
+    for (int i = 0; i <= maxCacheDepth; i++) {
+        if (NEO::SysCalls::mkdir(path)) {
+            int error = errno;
+            if (error != EEXIST) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Creating cache directories failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+                return false;
+            }
+        }
+
+        if (config.statsEnabled) {
+            createStats(joinPath(path, "stats"));
+        }
+
+        path = joinPath(path, std::string(1, cacheFile[i]));
     }
 
-    return 0;
+    return true;
 }
 
-struct ElementsStruct {
-    std::string path;
-    struct stat statEl;
-};
+bool CompilerCache::getFiles(const std::string &startPath, const std::function<bool(const std::string_view &)> &filter, std::vector<ElementsStruct> &foundFiles) {
+    struct DirectoryEntry {
+        std::string path;
+        int depth;
+    };
 
-bool compareByLastAccessTime(const ElementsStruct &a, ElementsStruct &b) {
-    return a.statEl.st_atime < b.statEl.st_atime;
+    foundFiles.clear();
+    std::queue<DirectoryEntry> directories;
+    directories.push({startPath, 0});
+
+    while (!directories.empty()) {
+        DirectoryEntry currentDir = std::move(directories.front());
+        directories.pop();
+
+        DIR *dir = NEO::SysCalls::opendir(currentDir.path.c_str());
+        if (!dir) {
+            int error = errno;
+            if (error == ENOENT) {
+                return true;
+            }
+
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening directory %s failed! errno: %d\n", NEO::SysCalls::getProcessId(), currentDir.path.c_str(), error);
+            return false;
+        }
+
+        struct dirent *entry;
+        errno = 0;
+        while ((entry = NEO::SysCalls::readdir(dir)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            std::string fullPath = joinPath(currentDir.path, entry->d_name);
+            struct stat statBuf = {};
+            if (NEO::SysCalls::stat(fullPath, &statBuf) != 0) {
+                int error = errno;
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Reading file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+                NEO::SysCalls::closedir(dir);
+                return false;
+            }
+
+            if (S_ISDIR(statBuf.st_mode)) {
+                if (currentDir.depth < maxCacheDepth) {
+                    directories.push({std::move(fullPath), currentDir.depth + 1});
+                }
+            } else if (S_ISREG(statBuf.st_mode) && filter(fullPath)) {
+                ElementsStruct fileElement = {};
+                fileElement.path = std::move(fullPath);
+                fileElement.lastAccessTime = statBuf.st_atime;
+                fileElement.fileSize = statBuf.st_size;
+                foundFiles.push_back(std::move(fileElement));
+            }
+
+            errno = 0;
+        }
+        int error = errno;
+        if (error != 0) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Reading directory entries failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+            NEO::SysCalls::closedir(dir);
+            return false;
+        }
+
+        NEO::SysCalls::closedir(dir);
+    }
+
+    return true;
 }
 
-bool CompilerCache::evictCache() {
-    struct dirent **files = 0;
-
-    int filesCount = NEO::SysCalls::scandir(config.cacheDir.c_str(), &files, filterFunction, NULL);
-
-    if (filesCount == -1) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Scandir failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
+bool CompilerCache::evictCache(uint64_t &bytesEvicted) {
+    std::vector<ElementsStruct> cacheFiles;
+    if (!getCachedFiles(cacheFiles)) {
         return false;
     }
 
-    std::vector<ElementsStruct> vec;
-    vec.reserve(static_cast<size_t>(filesCount));
-    for (int i = 0; i < filesCount; ++i) {
-        ElementsStruct fileElement = {};
-        fileElement.path = makePath(config.cacheDir, files[i]->d_name);
-        if (NEO::SysCalls::stat(fileElement.path.c_str(), &fileElement.statEl) == 0) {
-            vec.push_back(std::move(fileElement));
+    bytesEvicted = 0;
+    const auto evictionLimit = config.cacheSize / 3;
+
+    for (const auto &file : cacheFiles) {
+        auto res = NEO::SysCalls::unlink(file.path);
+        if (res == -1) {
+            continue;
         }
-    }
 
-    for (int i = 0; i < filesCount; ++i) {
-        free(files[i]);
-    }
-    free(files);
-
-    std::sort(vec.begin(), vec.end(), compareByLastAccessTime);
-
-    size_t evictionLimit = config.cacheSize / 3;
-
-    size_t evictionSizeCount = 0;
-    for (size_t i = 0; i < vec.size(); ++i) {
-        NEO::SysCalls::unlink(vec[i].path);
-        evictionSizeCount += vec[i].statEl.st_size;
-
-        if (evictionSizeCount > evictionLimit) {
+        bytesEvicted += file.fileSize;
+        if (bytesEvicted > evictionLimit) {
             return true;
         }
     }
@@ -105,11 +143,13 @@ bool CompilerCache::evictCache() {
 bool CompilerCache::createUniqueTempFileAndWriteData(char *tmpFilePathTemplate, const char *pBinary, size_t binarySize) {
     int fd = NEO::SysCalls::mkstemp(tmpFilePathTemplate);
     if (fd == -1) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Creating temporary file failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Creating temporary file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
         return false;
     }
     if (NEO::SysCalls::pwrite(fd, pBinary, binarySize, 0) == -1) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Writing to temporary file failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Writing to temporary file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
         NEO::SysCalls::close(fd);
         NEO::SysCalls::unlink(tmpFilePathTemplate);
         return false;
@@ -122,8 +162,8 @@ bool CompilerCache::renameTempFileBinaryToProperName(const std::string &oldName,
     int err = NEO::SysCalls::rename(oldName.c_str(), kernelFileHash.c_str());
 
     if (err < 0) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Rename temp file failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
-        NEO::SysCalls::unlink(oldName);
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Rename temp file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
         return false;
     }
 
@@ -134,148 +174,379 @@ void unlockFileAndClose(int fd) {
     int lockErr = NEO::SysCalls::flock(fd, LOCK_UN);
 
     if (lockErr < 0) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: unlock file failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: unlock file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
     }
 
     NEO::SysCalls::close(fd);
 }
 
-void CompilerCache::lockConfigFileAndReadSize(const std::string &configFilePath, int &fd, size_t &directorySize) {
+bool CompilerCache::createStats(const std::string &statsPath) {
+    int fd = NEO::SysCalls::openWithMode(statsPath.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    if (fd < 0) {
+        int error = errno;
+        if (error != EEXIST) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Creating stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+            return false;
+        }
+
+        fd = NEO::SysCalls::open(statsPath.c_str(), O_RDWR);
+        if (fd < 0) {
+            error = errno;
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening existing stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+            return false;
+        }
+    }
+
+    const int lockErr = NEO::SysCalls::flock(fd, LOCK_EX);
+    if (lockErr < 0) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Locking stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        NEO::SysCalls::close(fd);
+        return false;
+    }
+
+    CacheStats stats{};
+    ssize_t readBytes = NEO::SysCalls::pread(fd, &stats, sizeof(stats), 0);
+    if (readBytes == sizeof(stats) && stats.version == CompilerCache::cacheVersion) {
+        unlockFileAndClose(fd);
+        return true;
+    }
+    stats = {};
+    stats.version = CompilerCache::cacheVersion;
+
+    ssize_t written = NEO::SysCalls::pwrite(fd, &stats, sizeof(stats), 0);
+    if (written != sizeof(stats)) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Writing into stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        unlockFileAndClose(fd);
+        return false;
+    }
+
+    unlockFileAndClose(fd);
+    return true;
+}
+
+bool CompilerCache::updateStats(const std::string &statsPath, bool hit) {
+    int fd = NEO::SysCalls::open(statsPath.c_str(), O_RDWR);
+    if (fd < 0) {
+        int error = errno;
+        if (error != ENOENT) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+            return false;
+        }
+
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Stats file missing, creating a new one.\n", NEO::SysCalls::getProcessId());
+        if (!createStats(statsPath)) {
+            return false;
+        }
+
+        fd = NEO::SysCalls::open(statsPath.c_str(), O_RDWR);
+        if (fd < 0) {
+            error = errno;
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening newly created stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+            return false;
+        }
+    }
+
+    const int lockErr = NEO::SysCalls::flock(fd, LOCK_EX);
+    if (lockErr < 0) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Locking stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        NEO::SysCalls::close(fd);
+        return false;
+    }
+
+    CacheStats stats = {};
+    const ssize_t readBytes = NEO::SysCalls::pread(fd, &stats, sizeof(stats), 0);
+    if (readBytes != sizeof(stats)) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Reading stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        unlockFileAndClose(fd);
+        return false;
+    }
+
+    if (stats.version != CompilerCache::cacheVersion) {
+        stats = {};
+        stats.version = CompilerCache::cacheVersion;
+    }
+
+    if (hit) {
+        stats.hits++;
+    } else {
+        stats.misses++;
+    }
+
+    ssize_t written = NEO::SysCalls::pwrite(fd, &stats, sizeof(stats), 0);
+    if (written != sizeof(stats)) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Writing stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        unlockFileAndClose(fd);
+        return false;
+    }
+
+    unlockFileAndClose(fd);
+    return true;
+}
+
+CompilerCache::StatsResult CompilerCache::readStatsFromFile(const std::string &statsPath, CacheStats &cacheStats) {
+    auto fd = NEO::SysCalls::open(statsPath.c_str(), O_RDONLY);
+    if (fd < 0) {
+        int error = errno;
+        if (error == ENOENT) {
+            return StatsResult::notFound;
+        }
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening existing stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        return StatsResult::error;
+    }
+
+    const int lockErr = NEO::SysCalls::flock(fd, LOCK_SH);
+    if (lockErr < 0) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Locking stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        NEO::SysCalls::close(fd);
+        return StatsResult::error;
+    }
+
+    ssize_t readBytes = NEO::SysCalls::pread(fd, &cacheStats, sizeof(cacheStats), 0);
+    if (readBytes != sizeof(cacheStats)) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Reading stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        unlockFileAndClose(fd);
+        return StatsResult::error;
+    }
+
+    unlockFileAndClose(fd);
+    return StatsResult::success;
+}
+
+bool CompilerCache::writeStatsToFile(const std::string &statsPath, const CacheStats &cacheStats) {
+    int fd = NEO::SysCalls::open(statsPath.c_str(), O_WRONLY);
+    if (fd < 0) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        return false;
+    }
+
+    const int lockErr = NEO::SysCalls::flock(fd, LOCK_EX);
+    if (lockErr < 0) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Locking stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        NEO::SysCalls::close(fd);
+        return false;
+    }
+
+    ssize_t written = NEO::SysCalls::pwrite(fd, &cacheStats, sizeof(cacheStats), 0);
+    if (written != sizeof(cacheStats)) {
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Writing stats file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        unlockFileAndClose(fd);
+        return false;
+    }
+
+    unlockFileAndClose(fd);
+    return true;
+}
+
+void CompilerCache::lockConfigFileAndReadSize(const std::string &configFilePath, UnifiedHandle &fd, size_t &directorySize) {
     bool countDirectorySize = false;
     errno = 0;
-    fd = NEO::SysCalls::open(configFilePath.c_str(), O_RDWR);
+    std::get<int>(fd) = NEO::SysCalls::open(configFilePath.c_str(), O_RDWR);
 
-    if (fd < 0) {
-        if (errno == ENOENT) {
-            fd = NEO::SysCalls::openWithMode(configFilePath.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
-            if (fd < 0) {
-                fd = NEO::SysCalls::open(configFilePath.c_str(), O_RDWR);
+    if (std::get<int>(fd) < 0) {
+        int error = errno;
+        if (error == ENOENT) {
+            std::get<int>(fd) = NEO::SysCalls::openWithMode(configFilePath.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+            if (std::get<int>(fd) < 0) {
+                std::get<int>(fd) = NEO::SysCalls::open(configFilePath.c_str(), O_RDWR);
             } else {
                 countDirectorySize = true;
             }
         } else {
-            NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Open config file failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Open config file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
             return;
         }
     }
 
-    int lockErr = NEO::SysCalls::flock(fd, LOCK_EX);
+    const int lockErr = NEO::SysCalls::flock(std::get<int>(fd), LOCK_EX);
 
     if (lockErr < 0) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Lock config file failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
-        NEO::SysCalls::close(fd);
-        fd = -1;
+        int error = errno;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Lock config file failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+        NEO::SysCalls::close(std::get<int>(fd));
+        std::get<int>(fd) = -1;
 
         return;
     }
 
     if (countDirectorySize) {
-        struct dirent **files = {};
-
-        int filesCount = NEO::SysCalls::scandir(config.cacheDir.c_str(), &files, filterFunction, NULL);
-
-        if (filesCount == -1) {
-            unlockFileAndClose(fd);
-            NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Scandir failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
-            fd = -1;
+        std::vector<ElementsStruct> cacheFiles;
+        if (!getCachedFiles(cacheFiles)) {
+            unlockFileAndClose(std::get<int>(fd));
+            std::get<int>(fd) = -1;
             return;
         }
 
-        std::vector<ElementsStruct> vec;
-        vec.reserve(static_cast<size_t>(filesCount));
-        for (int i = 0; i < filesCount; ++i) {
-            std::string_view fileName = files[i]->d_name;
-            if (fileName.find(config.cacheFileExtension) != fileName.npos) {
-                ElementsStruct fileElement = {};
-                fileElement.path = makePath(config.cacheDir, files[i]->d_name);
-                if (NEO::SysCalls::stat(fileElement.path.c_str(), &fileElement.statEl) == 0) {
-                    vec.push_back(std::move(fileElement));
-                }
-            }
-        }
-
-        for (int i = 0; i < filesCount; ++i) {
-            free(files[i]);
-        }
-        free(files);
-
-        for (auto &element : vec) {
-            directorySize += element.statEl.st_size;
+        for (const auto &element : cacheFiles) {
+            directorySize += element.fileSize;
         }
 
     } else {
-        ssize_t readErr = NEO::SysCalls::pread(fd, &directorySize, sizeof(directorySize), 0);
+        const ssize_t readErr = NEO::SysCalls::pread(std::get<int>(fd), &directorySize, sizeof(directorySize), 0);
 
         if (readErr < 0) {
             directorySize = 0;
-            NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Read config failed! errno: %d\n", NEO::SysCalls::getProcessId(), errno);
-            unlockFileAndClose(fd);
-            fd = -1;
+            int error = errno;
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Read config failed! errno: %d\n", NEO::SysCalls::getProcessId(), error);
+            unlockFileAndClose(std::get<int>(fd));
+            std::get<int>(fd) = -1;
         }
     }
 }
 
+class HandleGuard : NonCopyableAndNonMovableClass {
+  public:
+    HandleGuard() = delete;
+    explicit HandleGuard(int &fileDescriptor) : fd(fileDescriptor) {}
+    ~HandleGuard() {
+        if (fd != -1) {
+            unlockFileAndClose(fd);
+        }
+    }
+
+  private:
+    int fd = -1;
+};
+
+static_assert(NonCopyableAndNonMovable<HandleGuard>);
+
 bool CompilerCache::cacheBinary(const std::string &kernelFileHash, const char *pBinary, size_t binarySize) {
-    if (pBinary == nullptr || binarySize == 0) {
+    if (pBinary == nullptr || binarySize == 0 || binarySize > config.cacheSize) {
         return false;
     }
 
     std::unique_lock<std::mutex> lock(cacheAccessMtx);
     constexpr std::string_view configFileName = "config.file";
 
-    std::string configFilePath = makePath(config.cacheDir, configFileName.data());
-    std::string filePath = makePath(config.cacheDir, kernelFileHash + config.cacheFileExtension);
+    std::string configFilePath = joinPath(config.cacheDir, configFileName.data());
+    std::string cacheFileName = kernelFileHash + config.cacheFileExtension;
+    std::string cacheFilePath = getCachedFilePath(cacheFileName);
 
-    int fd = -1;
+    if (cacheFileName.length() < maxCacheDepth + config.cacheFileExtension.length()) {
+        DEBUG_BREAK_IF(true);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Cache binary failed - cache file name is too short!\n", NEO::SysCalls::getProcessId());
+        return false;
+    }
+
+    UnifiedHandle fd{-1};
     size_t directorySize = 0u;
 
     lockConfigFileAndReadSize(configFilePath, fd, directorySize);
 
-    if (fd < 0) {
+    if (std::get<int>(fd) < 0) {
         return false;
     }
 
+    HandleGuard configGuard(std::get<int>(fd));
+
     struct stat statbuf = {};
-    if (NEO::SysCalls::stat(filePath, &statbuf) == 0) {
-        unlockFileAndClose(fd);
+    if (NEO::SysCalls::stat(cacheFilePath, &statbuf) == 0) {
         return true;
     }
 
-    size_t maxSize = config.cacheSize;
+    const size_t maxSize = config.cacheSize;
+    if (maxSize < (directorySize + binarySize)) {
+        uint64_t bytesEvicted{0u};
+        const auto evictSuccess = evictCache(bytesEvicted);
+        const auto availableSpace = maxSize - directorySize + bytesEvicted;
 
-    if (maxSize < directorySize + binarySize) {
-        if (!evictCache()) {
-            unlockFileAndClose(fd);
+        directorySize = std::max<size_t>(0, directorySize - bytesEvicted);
+
+        if (!evictSuccess || binarySize > availableSpace) {
+            if (bytesEvicted > 0) {
+                NEO::SysCalls::pwrite(std::get<int>(fd), &directorySize, sizeof(directorySize), 0);
+            }
             return false;
         }
     }
 
     std::string tmpFileName = "cl_cache.XXXXXX";
-
-    std::string tmpFilePath = makePath(config.cacheDir, tmpFileName);
+    std::string tmpFilePath = joinPath(config.cacheDir, tmpFileName);
 
     if (!createUniqueTempFileAndWriteData(tmpFilePath.data(), pBinary, binarySize)) {
-        unlockFileAndClose(fd);
         return false;
     }
 
-    if (!renameTempFileBinaryToProperName(tmpFilePath, filePath)) {
-        unlockFileAndClose(fd);
+    if (!createCacheDirectories(cacheFileName)) {
+        NEO::SysCalls::unlink(tmpFilePath.c_str());
+        return false;
+    }
+
+    if (!renameTempFileBinaryToProperName(tmpFilePath, cacheFilePath)) {
+        NEO::SysCalls::unlink(tmpFilePath.c_str());
         return false;
     }
 
     directorySize += binarySize;
 
-    NEO::SysCalls::pwrite(fd, &directorySize, sizeof(directorySize), 0);
-
-    unlockFileAndClose(fd);
+    NEO::SysCalls::pwrite(std::get<int>(fd), &directorySize, sizeof(directorySize), 0);
 
     return true;
 }
 
-std::unique_ptr<char[]> CompilerCache::loadCachedBinary(const std::string &kernelFileHash, size_t &cachedBinarySize) {
-    std::string filePath = makePath(config.cacheDir, kernelFileHash + config.cacheFileExtension);
+bool CompilerCache::clearDirectoryContents(const std::string &dirPath) {
+    DIR *dir = NEO::SysCalls::opendir(dirPath.c_str());
+    if (!dir) {
+        int error = errno;
+        if (error == ENOENT) {
+            return true;
+        }
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Opening directory %s failed! errno: %d\n", NEO::SysCalls::getProcessId(), dirPath.c_str(), error);
+        return false;
+    }
 
-    return loadDataFromFile(filePath.c_str(), cachedBinarySize);
+    struct dirent *entry;
+    while ((entry = NEO::SysCalls::readdir(dir)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        std::string fullPath = joinPath(dirPath, entry->d_name);
+        struct stat statBuf = {};
+        if (NEO::SysCalls::stat(fullPath.c_str(), &statBuf) != 0) {
+            int error = errno;
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Stat on %s failed! errno: %d\n", NEO::SysCalls::getProcessId(), fullPath.c_str(), error);
+            NEO::SysCalls::closedir(dir);
+            return false;
+        }
+
+        if (S_ISDIR(statBuf.st_mode)) {
+            if (!clearDirectoryContents(fullPath)) {
+                NEO::SysCalls::closedir(dir);
+                return false;
+            }
+            if (NEO::SysCalls::rmdir(fullPath) != 0) {
+                int error = errno;
+                if (error != ENOENT) {
+                    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Removing directory %s failed! errno: %d\n", NEO::SysCalls::getProcessId(), fullPath.c_str(), error);
+                    NEO::SysCalls::closedir(dir);
+                    return false;
+                }
+            }
+        } else {
+            if (NEO::SysCalls::unlink(fullPath) != 0) {
+                int error = errno;
+                if (error != ENOENT) {
+                    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "PID %d [Cache failure]: Unlinking file %s failed! errno: %d\n", NEO::SysCalls::getProcessId(), fullPath.c_str(), error);
+                    NEO::SysCalls::closedir(dir);
+                    return false;
+                }
+            }
+        }
+    }
+
+    NEO::SysCalls::closedir(dir);
+    return true;
 }
+
 } // namespace NEO

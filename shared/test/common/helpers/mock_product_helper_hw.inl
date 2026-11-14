@@ -1,9 +1,13 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+
+namespace NEO {
 
 template <>
 std::vector<int32_t> MockProductHelperHw<gfxProduct>::getKernelSupportedThreadArbitrationPolicies() const {
@@ -15,7 +19,7 @@ bool MockProductHelperHw<gfxProduct>::isCooperativeEngineSupported(const Hardwar
 }
 
 template <>
-bool MockProductHelperHw<gfxProduct>::getUuid(Device *device, std::array<uint8_t, ProductHelper::uuidSize> &uuid) const {
+bool MockProductHelperHw<gfxProduct>::getUuid(NEO::DriverModel *driverModel, const uint32_t subDeviceCount, const uint32_t deviceIndex, std::array<uint8_t, CommonConstants::uuidSize> &uuid) const {
     return false;
 }
 
@@ -27,7 +31,6 @@ uint32_t MockProductHelperHw<gfxProduct>::getSteppingFromHwRevId(const HardwareI
 template <>
 int MockProductHelperHw<gfxProduct>::configureHardwareCustom(HardwareInfo *hwInfo, OSInterface *osIface) const {
     FeatureTable *featureTable = &hwInfo->featureTable;
-    featureTable->flags.ftrGpGpuMidThreadLevelPreempt = 0;
     featureTable->flags.ftrGpGpuThreadGroupLevelPreempt = 0;
     featureTable->flags.ftrGpGpuMidBatchPreempt = 0;
 
@@ -36,7 +39,7 @@ int MockProductHelperHw<gfxProduct>::configureHardwareCustom(HardwareInfo *hwInf
         gtSystemInfo->EdramSizeInKb = 128 * 1000;
     }
     if (enableMidThreadPreemption) {
-        featureTable->flags.ftrGpGpuMidThreadLevelPreempt = 1;
+        featureTable->flags.ftrWalkerMTP = 1;
     }
     if (enableThreadGroupPreemption) {
         featureTable->flags.ftrGpGpuThreadGroupLevelPreempt = 1;
@@ -45,11 +48,6 @@ int MockProductHelperHw<gfxProduct>::configureHardwareCustom(HardwareInfo *hwInf
         featureTable->flags.ftrGpGpuMidBatchPreempt = 1;
     }
     return (failOnConfigureHardwareCustom) ? -1 : 0;
-}
-
-template <>
-uint64_t MockProductHelperHw<gfxProduct>::getDeviceMemoryPhysicalSizeInBytes(const OSInterface *osIface, uint32_t subDeviceIndex) const {
-    return 1024u;
 }
 
 template <>
@@ -69,3 +67,14 @@ template <>
 bool MockProductHelperHw<gfxProduct>::isUnlockingLockedPtrNecessary(const HardwareInfo &hwInfo) const {
     return this->returnedIsUnlockingLockedPtrNecessary;
 }
+
+template <>
+const SupportedNumGrfs MockProductHelperHw<gfxProduct>::getSupportedNumGrfs(const ReleaseHelper &releaseHelper) const {
+    return releaseHelper.getSupportedNumGrfs();
+}
+
+template <>
+aub_stream::EngineType MockProductHelperHw<gfxProduct>::getDefaultCopyEngine() const {
+    return this->mockDefaultCopyEngine;
+}
+} // namespace NEO

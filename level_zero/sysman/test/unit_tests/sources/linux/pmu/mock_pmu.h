@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,16 @@
 
 #pragma once
 
-#include "level_zero/sysman/source/linux/pmu/sysman_pmu_imp.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
+#include "level_zero/sysman/source/shared/linux/pmu/sysman_pmu_imp.h"
 
 using namespace NEO;
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
+
 constexpr uint64_t mockEventVal = 2u;
 constexpr uint64_t mockTimeStamp = 100u;
 constexpr int64_t mockPmuFd = 5;
@@ -20,8 +25,11 @@ constexpr uint64_t mockEvent1Val = 100u;
 constexpr uint64_t mockEvent2Val = 150u;
 class MockPmuInterfaceImpForSysman : public L0::Sysman::PmuInterfaceImp {
   public:
+    using L0::Sysman::PmuInterfaceImp::getConfigAfterFormat;
+    using L0::Sysman::PmuInterfaceImp::getConfigFromEventFile;
     using L0::Sysman::PmuInterfaceImp::getErrorNo;
     using L0::Sysman::PmuInterfaceImp::perfEventOpen;
+    using L0::Sysman::PmuInterfaceImp::pSysmanKmdInterface;
     using L0::Sysman::PmuInterfaceImp::readFunction;
     using L0::Sysman::PmuInterfaceImp::syscallFunction;
     MockPmuInterfaceImpForSysman(L0::Sysman::LinuxSysmanImp *pLinuxSysmanImp) : L0::Sysman::PmuInterfaceImp(pLinuxSysmanImp) {}
@@ -42,12 +50,6 @@ struct MockPmuInterface : public MockPmuInterfaceImpForSysman {
     ADDMETHOD_NOBASE(getErrorNo, int, EINVAL, ());
 };
 
-struct MockPmuFsAccess : public L0::Sysman::FsAccess {
-    ze_result_t read(const std::string file, uint32_t &val) override {
-        val = 18;
-        return ZE_RESULT_SUCCESS;
-    }
-};
-
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

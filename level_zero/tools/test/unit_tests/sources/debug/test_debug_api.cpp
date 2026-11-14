@@ -1,42 +1,30 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_io_functions.h"
 #include "shared/test/common/mocks/mock_sip.h"
+#include "shared/test/common/mocks/mock_sip_external_lib.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_built_ins.h"
-#include "level_zero/include/zet_intel_gpu_debug.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_device.h"
 #include "level_zero/tools/source/debug/debug_handlers.h"
+#include "level_zero/tools/test/unit_tests/sources/debug/debug_session_common.h"
 #include "level_zero/tools/test/unit_tests/sources/debug/mock_debug_session.h"
+#include "level_zero/zet_intel_gpu_debug.h"
 
 namespace L0 {
 namespace ult {
-
-struct DebugApiFixture : public DeviceFixture {
-    void setUp() {
-        DeviceFixture::setUp();
-        neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new NEO::OSInterface);
-        mockBuiltins = new MockBuiltins();
-        mockBuiltins->stateSaveAreaHeader = MockSipData::createStateSaveAreaHeader(2);
-        neoDevice->executionEnvironment->rootDeviceEnvironments[0]->builtins.reset(mockBuiltins);
-    }
-
-    void tearDown() {
-        DeviceFixture::tearDown();
-    }
-
-    MockBuiltins *mockBuiltins = nullptr;
-};
 
 using DebugApiTest = Test<DebugApiFixture>;
 using MultiTileDebugApiTest = Test<MultipleDevicesWithCustomHwInfo>;
@@ -68,10 +56,10 @@ TEST_F(DebugApiTest, givenDebugAttachSupportedInOsWhenCallingDebugAttachThenSucc
 
     neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OsInterfaceWithDebugAttach);
 
-    L0::DeviceImp *deviceImp = static_cast<DeviceImp *>(device);
+    L0::Device *l0Device = static_cast<Device *>(device);
     auto sessionMock = new MockDebugSession(config, device, true);
     sessionMock->initialize();
-    deviceImp->setDebugSession(sessionMock);
+    l0Device->setDebugSession(sessionMock);
 
     zet_debug_session_handle_t debugSession = nullptr;
     auto result = zetDebugAttach(device->toHandle(), &config, &debugSession);
@@ -92,10 +80,10 @@ TEST_F(DebugApiTest, givenDebugSessionWithPidWhenCallingDebugAttachForOtherPidTh
 
     neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OsInterfaceWithDebugAttach);
 
-    L0::DeviceImp *deviceImp = static_cast<DeviceImp *>(device);
+    L0::Device *l0Device = static_cast<Device *>(device);
     auto sessionMock = new MockDebugSession(config, device, true);
     sessionMock->initialize();
-    deviceImp->setDebugSession(sessionMock);
+    l0Device->setDebugSession(sessionMock);
 
     zet_debug_session_handle_t debugSession = nullptr;
     auto result = zetDebugAttach(device->toHandle(), &config, &debugSession);
@@ -116,7 +104,7 @@ TEST_F(MultiTileDebugApiTest, givenDebugSessionWithPidWhenCallingDebugAttachForO
     config.pid = 0x1234;
 
     L0::Device *device = driverHandle->devices[0];
-    L0::DeviceImp *deviceImp = static_cast<DeviceImp *>(device);
+    L0::Device *l0Device = static_cast<Device *>(device);
     auto neoDevice = device->getNEODevice();
     auto osInterface = new OsInterfaceWithDebugAttach;
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.reset(osInterface);
@@ -125,7 +113,7 @@ TEST_F(MultiTileDebugApiTest, givenDebugSessionWithPidWhenCallingDebugAttachForO
 
     auto sessionMock = new MockDebugSession(config, device, false);
     sessionMock->initialize();
-    deviceImp->setDebugSession(sessionMock);
+    l0Device->setDebugSession(sessionMock);
 
     zet_debug_session_handle_t debugSession = nullptr;
     auto result = zetDebugAttach(subDevice0->toHandle(), &config, &debugSession);
@@ -146,16 +134,16 @@ TEST_F(DebugApiTest, givenSubDeviceWhenCallingDebugAttachThenErrorIsReturned) {
     config.pid = 0x1234;
     zet_debug_session_handle_t debugSession = nullptr;
 
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.isSubdevice = true;
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.isSubdevice = true;
 
-    auto result = zetDebugAttach(deviceImp.toHandle(), &config, &debugSession);
+    auto result = zetDebugAttach(mockDevice.toHandle(), &config, &debugSession);
 
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
     EXPECT_EQ(nullptr, debugSession);
 }
 
-using isDebugSupportedProduct = IsWithinProducts<IGFX_DG1, IGFX_METEORLAKE>;
+using isDebugSupportedProduct = IsWithinProducts<IGFX_DG1, IGFX_PTL>;
 HWTEST2_F(DebugApiTest, givenDeviceWhenDebugAttachIsAvaialbleThenGetPropertiesReturnsCorrectFlag, isDebugSupportedProduct) {
     zet_device_debug_properties_t debugProperties = {};
     debugProperties.flags = ZET_DEVICE_DEBUG_PROPERTY_FLAG_FORCE_UINT32;
@@ -168,7 +156,7 @@ HWTEST2_F(DebugApiTest, givenDeviceWhenDebugAttachIsAvaialbleThenGetPropertiesRe
     EXPECT_EQ(ZET_DEVICE_DEBUG_PROPERTY_FLAG_ATTACH, debugProperties.flags);
 }
 
-using isDebugNotSupportedProduct = IsNotWithinProducts<IGFX_DG1, IGFX_METEORLAKE>;
+using isDebugNotSupportedProduct = IsAtMostProduct<IGFX_ALDERLAKE_N>;
 HWTEST2_F(DebugApiTest, givenDeviceWhenDebugIsNotSupportedThenGetPropertiesReturnsCorrectFlag, isDebugNotSupportedProduct) {
     zet_device_debug_properties_t debugProperties = {};
     debugProperties.flags = ZET_DEVICE_DEBUG_PROPERTY_FLAG_FORCE_UINT32;
@@ -181,7 +169,7 @@ HWTEST2_F(DebugApiTest, givenDeviceWhenDebugIsNotSupportedThenGetPropertiesRetur
     EXPECT_EQ(0u, debugProperties.flags);
 }
 
-TEST_F(DebugApiTest, givenStateSaveAreaHeaderUnavailableWhenGettingDebugPropertiesThenAttachFlagIsNotReturned) {
+HWTEST2_F(DebugApiTest, givenStateSaveAreaHeaderUnavailableWhenGettingDebugPropertiesThenAttachFlagIsNotReturned, IsDebugSipFromIgc) {
     zet_device_debug_properties_t debugProperties = {};
     debugProperties.flags = ZET_DEVICE_DEBUG_PROPERTY_FLAG_FORCE_UINT32;
 
@@ -194,19 +182,19 @@ TEST_F(DebugApiTest, givenStateSaveAreaHeaderUnavailableWhenGettingDebugProperti
     EXPECT_EQ(0u, debugProperties.flags);
 }
 
-TEST_F(DebugApiTest, givenTileAttachedDisabledAndSubDeviceWhenDebugAttachIsAvaialbleThenGetPropertiesReturnsNoFlag) {
+HWTEST2_F(DebugApiTest, givenTileAttachedDisabledAndSubDeviceWhenDebugAttachIsAvaialbleThenGetPropertiesReturnsNoFlag, IsDebugSipFromIgc) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.ExperimentalEnableTileAttach.set(0);
+    NEO::debugManager.flags.ExperimentalEnableTileAttach.set(0);
 
     zet_device_debug_properties_t debugProperties = {};
     debugProperties.flags = ZET_DEVICE_DEBUG_PROPERTY_FLAG_FORCE_UINT32;
 
     neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OsInterfaceWithDebugAttach);
 
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.isSubdevice = true;
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.isSubdevice = true;
 
-    auto result = zetDeviceGetDebugProperties(deviceImp.toHandle(), &debugProperties);
+    auto result = zetDeviceGetDebugProperties(mockDevice.toHandle(), &debugProperties);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(0u, debugProperties.flags);
@@ -216,48 +204,48 @@ TEST_F(DebugApiTest, givenDeviceWithDebugSessionWhenDebugAttachIsCalledThenSessi
     zet_debug_config_t config = {};
     config.pid = 0x1234;
 
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.debugSession.reset(new DebugSessionMock(config, &deviceImp));
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.debugSession.reset(new DebugSessionMock(config, &mockDevice));
 
     zet_debug_session_handle_t debugSession = nullptr;
-    auto result = zetDebugAttach(deviceImp.toHandle(), &config, &debugSession);
+    auto result = zetDebugAttach(mockDevice.toHandle(), &config, &debugSession);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    EXPECT_EQ(deviceImp.debugSession->toHandle(), debugSession);
+    EXPECT_EQ(mockDevice.debugSession->toHandle(), debugSession);
 }
 
 TEST_F(DebugApiTest, givenDeviceWithDebugSessionWhenDebugDetachIsCalledThenSuccessIsReturnedAndSessionDeleted) {
     zet_debug_config_t config = {};
     config.pid = 0x1234;
 
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.debugSession.reset(new DebugSessionMock(config, &deviceImp));
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.debugSession.reset(new DebugSessionMock(config, &mockDevice));
 
-    zet_debug_session_handle_t debugSession = deviceImp.debugSession->toHandle();
+    zet_debug_session_handle_t debugSession = mockDevice.debugSession->toHandle();
     auto result = zetDebugDetach(debugSession);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    EXPECT_EQ(nullptr, deviceImp.debugSession);
+    EXPECT_EQ(nullptr, mockDevice.debugSession);
 }
 
 TEST_F(DebugApiTest, givenDeviceWithoutSessionWhenDebugDetachIsCalledThenSuccessIsReturned) {
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoDevice);
 
     zet_debug_session_handle_t debugSession = 0;
     auto result = zetDebugDetach(debugSession);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    EXPECT_EQ(nullptr, deviceImp.debugSession);
+    EXPECT_EQ(nullptr, mockDevice.debugSession);
 }
 
 TEST_F(DebugApiTest, WhenUnsupportedFunctionCalledThenErrorIsReturned) {
     zet_debug_config_t config = {};
     config.pid = 0x1234;
 
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.debugSession.reset(new DebugSessionMock(config, &deviceImp));
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.debugSession.reset(new DebugSessionMock(config, &mockDevice));
 
-    zet_debug_session_handle_t session = deviceImp.debugSession->toHandle();
+    zet_debug_session_handle_t session = mockDevice.debugSession->toHandle();
 
     auto result = L0::DebugApiHandlers::debugReadEvent(session, 0, nullptr);
     EXPECT_EQ(result, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
@@ -290,20 +278,27 @@ TEST_F(DebugApiTest, givenNullCountPointerWhenGetRegisterSetPropertiesCalledThen
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NULL_POINTER, zetDebugGetRegisterSetProperties(device->toHandle(), nullptr, nullptr));
 }
 
-TEST_F(DebugApiTest, givenZeroCountWhenGetRegisterSetPropertiesCalledThenCorrectCountIsSet) {
+HWTEST2_F(DebugApiTest, givenZeroCountWhenGetRegisterSetPropertiesCalledThenCorrectCountIsSet, IsDebugSipFromIgc) {
     uint32_t count = 0;
     EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
-    EXPECT_EQ(12u, count);
+    EXPECT_EQ(13u, count);
 }
 
-TEST_F(DebugApiTest, givenGetRegisterSetPropertiesCalledAndExtraSpaceIsProvidedThenCorrectPropertiesReturned) {
+HWTEST2_F(DebugApiTest, givenZeroCountWhenGetRegisterSetPropertiesCalledWithV3HeaderThenCorrectCountIsSet, IsDebugSipFromIgc) {
+    uint32_t count = 0;
+    setUpV3Header();
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(17u, count);
+}
+
+HWTEST2_F(DebugApiTest, givenGetRegisterSetPropertiesCalledAndExtraSpaceIsProvidedThenCorrectPropertiesReturned, IsDebugSipFromIgc) {
     uint32_t count = 100;
     std::vector<zet_debug_regset_properties_t> regsetProps(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
-    EXPECT_EQ(12u, count);
+    EXPECT_EQ(13u, count);
 }
 
-TEST_F(DebugApiTest, givenNoStateSaveHeaderWhenGettingRegSetPropertiesThenZeroCountIsReturned) {
+HWTEST2_F(DebugApiTest, givenNoStateSaveHeaderWhenGettingRegSetPropertiesThenZeroCountIsReturned, IsDebugSipFromIgc) {
     uint32_t count = 10;
     std::vector<zet_debug_regset_properties_t> regsetProps(count);
 
@@ -318,15 +313,224 @@ TEST_F(DebugApiTest, givenNonZeroCountAndNullRegsetPointerWhenGetRegisterSetProp
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NULL_POINTER, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
 }
 
-TEST_F(DebugApiTest, givenGetRegisterSetPropertiesCalledCorrectPropertiesReturned) {
+HWTEST2_F(DebugApiTest, givenSsaHeaderVersionGreaterThan5WhenGetRegisterSetPropertiesCalledThenUnknownIsReturned, IsDebugSipFromIgc) {
+    auto stateSaveAreaHeader = MockSipData::createStateSaveAreaHeader(5);
+    auto versionHeader = &reinterpret_cast<SIP::StateSaveAreaHeader *>(stateSaveAreaHeader.data())->versionHeader;
+    versionHeader->version.major = 99;
+    mockBuiltins->stateSaveAreaHeader = stateSaveAreaHeader;
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+}
+
+HWTEST2_F(DebugApiTest, givenSIPHeaderHasZeroSizeMMEThenNotExposedAsRegset, IsDebugSipFromIgc) {
+    mockBuiltins = new MockBuiltins();
+    mockBuiltins->stateSaveAreaHeader = MockSipData::createStateSaveAreaHeader(2, 128, 0);
+    MockRootDeviceEnvironment::resetBuiltins(neoDevice->executionEnvironment->rootDeviceEnvironments[0].get(), mockBuiltins);
     uint32_t count = 0;
     EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
     EXPECT_EQ(12u, count);
 
     std::vector<zet_debug_regset_properties_t> regsetProps(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
-
     EXPECT_EQ(12u, count);
+    for (auto prop : regsetProps) {
+        EXPECT_NE(prop.type, ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU);
+    }
+}
+
+HWTEST2_F(DebugApiTest, givenSIPHeaderGRFCountNotEqualTo128ThenGetRegisterSetPropertiesReturns128, IsDebugSipFromIgc) {
+    static_cast<MockBuiltins *>(neoDevice->executionEnvironment->rootDeviceEnvironments[0]->builtins.get())->stateSaveAreaHeader =
+        MockSipData::createStateSaveAreaHeader(2, 256);
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+
+    std::vector<zet_debug_regset_properties_t> regsetProps(count);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
+    ASSERT_EQ(13u, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (regsetProps[i].type == ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU) {
+            EXPECT_EQ(128u, regsetProps[i].count);
+            break;
+        }
+    }
+}
+
+HWTEST2_F(DebugApiTest, givenGetRegisterSetPropertiesCalledWithV3HeaderCorrectPropertiesReturned, IsDebugSipFromIgc) {
+
+    setUpV3Header();
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(17u, count);
+
+    std::vector<zet_debug_regset_properties_t> regsetProps(count);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
+
+    EXPECT_EQ(17u, count);
+
+    auto validateRegsetProps = [](const zet_debug_regset_properties_t &regsetProps,
+                                  zet_debug_regset_type_intel_gpu_t type, zet_debug_regset_flags_t flags,
+                                  uint32_t num, uint32_t bits, uint32_t bytes) {
+        EXPECT_EQ(regsetProps.stype, ZET_STRUCTURE_TYPE_DEBUG_REGSET_PROPERTIES);
+        EXPECT_EQ(regsetProps.pNext, nullptr);
+        EXPECT_EQ(regsetProps.type, type);
+        EXPECT_EQ(regsetProps.version, 0u);
+        EXPECT_EQ(regsetProps.generalFlags, flags);
+        EXPECT_EQ(regsetProps.count, num);
+        EXPECT_EQ(regsetProps.bitSize, bits);
+        EXPECT_EQ(regsetProps.byteSize, bytes);
+    };
+
+    validateRegsetProps(regsetProps[0], ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 128, 512, 64);
+    validateRegsetProps(regsetProps[1], ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 256, 32);
+    validateRegsetProps(regsetProps[2], ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 2, 32, 4);
+    validateRegsetProps(regsetProps[3], ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[4], ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 2, 160, 20);
+    validateRegsetProps(regsetProps[5], ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[6], ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[7], ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 10, 256, 32);
+    validateRegsetProps(regsetProps[8], ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 256, 32);
+    validateRegsetProps(regsetProps[9], ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[10], ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+    validateRegsetProps(regsetProps[11], ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[12], ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+    validateRegsetProps(regsetProps[13], ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[14], ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 2, 64, 8);
+    validateRegsetProps(regsetProps[15], ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 2, 64, 8);
+    validateRegsetProps(regsetProps[16], ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+}
+
+TEST_F(DebugApiTest, givenGetRegisterSetPropertiesCalledWithV5HeaderCorrectPropertiesReturned) {
+    MockSipExternalLib *sipExternalLib = new MockSipExternalLib(); // DeviceFixture takes ownership
+    sipExternalLib->getRegsetDescExtMap = {
+        {NEO::SipRegisterType::eGRF, {.num = 128, .bytes = 64}},
+        {NEO::SipRegisterType::eAddress, {.num = 1, .bytes = 32}},
+        {NEO::SipRegisterType::eFlags, {.num = 2, .bytes = 4}},
+        {NEO::SipRegisterType::eChannelEnable, {.num = 1, .bytes = 4}},
+        {NEO::SipRegisterType::eState, {.num = 2, .bytes = 20}},
+        {NEO::SipRegisterType::eControl, {.num = 1, .bytes = 16}},
+        {NEO::SipRegisterType::eTDR, {.num = 1, .bytes = 16}},
+        {NEO::SipRegisterType::eAccumulator, {.num = 10, .bytes = 32}},
+        {NEO::SipRegisterType::eMME, {.num = 1, .bytes = 32}},
+        {NEO::SipRegisterType::eStackPointer, {.num = 1, .bytes = 16}},
+        {NEO::SipRegisterType::eDebug, {.num = 1, .bytes = 8}},
+        {NEO::SipRegisterType::eFlowControl, {.num = 1, .bytes = 4}},
+        {NEO::SipRegisterType::eMessageControl, {.num = 1, .bytes = 8}},
+        {NEO::SipRegisterType::eScalar, {.num = 1, .bytes = 8}},
+        {NEO::SipRegisterType::eStatus, {.num = 1, .bytes = 4}},
+        {NEO::SipRegisterType::eRandom, {.num = 1, .bytes = 16}},
+        {NEO::SipRegisterType::eDirect, {.num = 1, .bytes = 8}},
+    };
+    setUpV5Header(sipExternalLib);
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(20u, count);
+
+    std::vector<zet_debug_regset_properties_t> regsetProps(count);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
+
+    std::map<uint32_t, zet_debug_regset_properties_t> propsMap;
+    for (const auto &p : regsetProps) {
+        propsMap[p.type] = p;
+    }
+
+    auto validateRegsetProps = [&](zet_debug_regset_type_intel_gpu_t type, zet_debug_regset_flags_t flags,
+                                   uint32_t num, uint32_t bytes) {
+        const std::string debugMsg = "ZET Regset Type = " + std::to_string(type);
+        const auto &propsIt = propsMap.find(type);
+        EXPECT_NE(propsIt, propsMap.end()) << debugMsg;
+        if (propsIt == propsMap.end()) {
+            return;
+        }
+        const zet_debug_regset_properties_t &regsetProps = propsIt->second;
+        EXPECT_EQ(regsetProps.stype, ZET_STRUCTURE_TYPE_DEBUG_REGSET_PROPERTIES) << debugMsg;
+        EXPECT_EQ(regsetProps.pNext, nullptr) << debugMsg;
+        EXPECT_EQ(regsetProps.type, type) << debugMsg;
+        EXPECT_EQ(regsetProps.version, 0u) << debugMsg;
+        EXPECT_EQ(regsetProps.generalFlags, flags) << debugMsg;
+        EXPECT_EQ(regsetProps.count, num) << debugMsg;
+        EXPECT_EQ(regsetProps.bitSize, bytes * 8) << debugMsg;
+        EXPECT_EQ(regsetProps.byteSize, bytes) << debugMsg;
+    };
+
+    constexpr zet_debug_regset_flags_t readOnly = ZET_DEBUG_REGSET_FLAG_READABLE;
+    constexpr zet_debug_regset_flags_t readWrite = readOnly | ZET_DEBUG_REGSET_FLAG_WRITEABLE;
+
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU, readWrite, 128, 64);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU, readWrite, 1, 32);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU, readWrite, 2, 4);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU, readOnly, 1, 4);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU, readWrite, 2, 20);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, readWrite, 1, 16);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU, readOnly, 1, 16);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU, readWrite, 10, 32);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU, readWrite, 1, 32);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU, readWrite, 1, 16);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU, readWrite, 1, 8);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU, readWrite, 1, 4);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU, readWrite, 1, 8);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU, readOnly, 1, 4);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU, readOnly, 2, 8);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_THREAD_SCRATCH_INTEL_GPU, readOnly, 2, 8);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU, readWrite, 1, 8);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_STATUS_INTEL_GPU, readWrite, 1, 4);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_RANDOM_INTEL_GPU, readOnly, 1, 16);
+    validateRegsetProps(ZET_DEBUG_REGSET_TYPE_DIRECT_INTEL_GPU, readOnly, 1, 8);
+}
+
+HWTEST2_F(DebugApiTest, givenGetRegisterSetPropertiesCalledWhenV3HeaderHeaplessThenCorrectPropertiesReturned, IsDebugSipFromIgc) {
+
+    setUpV3HeaderWithoutHeapless();
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(17u, count);
+
+    std::vector<zet_debug_regset_properties_t> regsetProps(count);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
+
+    EXPECT_EQ(17u, count);
+
+    auto validateRegsetProps = [](const zet_debug_regset_properties_t &regsetProps,
+                                  zet_debug_regset_type_intel_gpu_t type, zet_debug_regset_flags_t flags,
+                                  uint32_t num, uint32_t bits, uint32_t bytes) {
+        EXPECT_EQ(regsetProps.stype, ZET_STRUCTURE_TYPE_DEBUG_REGSET_PROPERTIES);
+        EXPECT_EQ(regsetProps.pNext, nullptr);
+        EXPECT_EQ(regsetProps.type, type);
+        EXPECT_EQ(regsetProps.version, 0u);
+        EXPECT_EQ(regsetProps.generalFlags, flags);
+        EXPECT_EQ(regsetProps.count, num);
+        EXPECT_EQ(regsetProps.bitSize, bits);
+        EXPECT_EQ(regsetProps.byteSize, bytes);
+    };
+
+    validateRegsetProps(regsetProps[0], ZET_DEBUG_REGSET_TYPE_GRF_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 128, 512, 64);
+    validateRegsetProps(regsetProps[1], ZET_DEBUG_REGSET_TYPE_ADDR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 256, 32);
+    validateRegsetProps(regsetProps[2], ZET_DEBUG_REGSET_TYPE_FLAG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 2, 32, 4);
+    validateRegsetProps(regsetProps[3], ZET_DEBUG_REGSET_TYPE_CE_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[4], ZET_DEBUG_REGSET_TYPE_SR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 2, 160, 20);
+    validateRegsetProps(regsetProps[5], ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[6], ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[7], ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 10, 256, 32);
+    validateRegsetProps(regsetProps[8], ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 256, 32);
+    validateRegsetProps(regsetProps[9], ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[10], ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, ZET_DEBUG_SBA_COUNT_INTEL_GPU, 64, 8);
+    validateRegsetProps(regsetProps[11], ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+    validateRegsetProps(regsetProps[12], ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[13], ZET_DEBUG_REGSET_TYPE_MSG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+    validateRegsetProps(regsetProps[14], ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[15], ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 2, 64, 8);
+    validateRegsetProps(regsetProps[16], ZET_DEBUG_REGSET_TYPE_SCALAR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+}
+
+HWTEST2_F(DebugApiTest, givenGetRegisterSetPropertiesCalledCorrectPropertiesReturned, IsDebugSipFromIgc) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(13u, count);
+
+    std::vector<zet_debug_regset_properties_t> regsetProps(count);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugGetRegisterSetProperties(device->toHandle(), &count, regsetProps.data()));
+
+    EXPECT_EQ(13u, count);
 
     auto validateRegsetProps = [](const zet_debug_regset_properties_t &regsetProps,
                                   zet_debug_regset_type_intel_gpu_t type, zet_debug_regset_flags_t flags,
@@ -349,11 +553,11 @@ TEST_F(DebugApiTest, givenGetRegisterSetPropertiesCalledCorrectPropertiesReturne
     validateRegsetProps(regsetProps[5], ZET_DEBUG_REGSET_TYPE_CR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
     validateRegsetProps(regsetProps[6], ZET_DEBUG_REGSET_TYPE_TDR_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, 1, 128, 16);
     validateRegsetProps(regsetProps[7], ZET_DEBUG_REGSET_TYPE_ACC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 10, 256, 32);
-    // MME is not present
-    validateRegsetProps(regsetProps[8], ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
-    validateRegsetProps(regsetProps[9], ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, ZET_DEBUG_SBA_COUNT_INTEL_GPU, 64, 8);
-    validateRegsetProps(regsetProps[10], ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 32, 4);
-    validateRegsetProps(regsetProps[11], ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 32, 4);
+    validateRegsetProps(regsetProps[8], ZET_DEBUG_REGSET_TYPE_MME_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 256, 32);
+    validateRegsetProps(regsetProps[9], ZET_DEBUG_REGSET_TYPE_SP_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 128, 16);
+    validateRegsetProps(regsetProps[10], ZET_DEBUG_REGSET_TYPE_SBA_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE, ZET_DEBUG_SBA_COUNT_INTEL_GPU, 64, 8);
+    validateRegsetProps(regsetProps[11], ZET_DEBUG_REGSET_TYPE_DBG_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 64, 8);
+    validateRegsetProps(regsetProps[12], ZET_DEBUG_REGSET_TYPE_FC_INTEL_GPU, ZET_DEBUG_REGSET_FLAG_READABLE | ZET_DEBUG_REGSET_FLAG_WRITEABLE, 1, 32, 4);
 }
 
 TEST(DebugSessionTest, givenDebugSessionWhenConvertingToAndFromHandleCorrectHandleAndPointerIsReturned) {
@@ -361,8 +565,8 @@ TEST(DebugSessionTest, givenDebugSessionWhenConvertingToAndFromHandleCorrectHand
     config.pid = 0x1234;
 
     NEO::Device *neoDevice(NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get(), 0));
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    auto debugSession = std::make_unique<DebugSessionMock>(config, &deviceImp);
+    MockDeviceImp mockDevice(neoDevice);
+    auto debugSession = std::make_unique<DebugSessionMock>(config, &mockDevice);
     L0::DebugSession *session = debugSession.get();
 
     zet_debug_session_handle_t debugSessionHandle = debugSession->toHandle();
@@ -377,13 +581,13 @@ TEST(DebugSessionTest, givenDebugSessionWhenGettingConnectedDeviceThenCorrectDev
     config.pid = 0x1234;
 
     NEO::Device *neoDevice(NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get(), 0));
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    auto debugSession = std::make_unique<DebugSessionMock>(config, &deviceImp);
+    MockDeviceImp mockDevice(neoDevice);
+    auto debugSession = std::make_unique<DebugSessionMock>(config, &mockDevice);
     L0::DebugSession *session = debugSession.get();
 
     auto device = session->getConnectedDevice();
 
-    EXPECT_EQ(&deviceImp, device);
+    EXPECT_EQ(&mockDevice, device);
 }
 
 TEST(DebugSessionTest, givenDeviceWithDebugSessionWhenRemoveCalledThenSessionIsNotDeleted) {
@@ -391,28 +595,28 @@ TEST(DebugSessionTest, givenDeviceWithDebugSessionWhenRemoveCalledThenSessionIsN
     config.pid = 0x1234;
 
     NEO::Device *neoDevice(NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get(), 0));
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    auto debugSession = std::make_unique<DebugSessionMock>(config, &deviceImp);
+    MockDeviceImp mockDevice(neoDevice);
+    auto debugSession = std::make_unique<DebugSessionMock>(config, &mockDevice);
     L0::DebugSession *session = debugSession.get();
-    deviceImp.debugSession.reset(session);
-    deviceImp.removeDebugSession();
+    mockDevice.debugSession.reset(session);
+    mockDevice.removeDebugSession();
 
-    EXPECT_EQ(nullptr, deviceImp.debugSession.get());
+    EXPECT_EQ(nullptr, mockDevice.debugSession.get());
 }
 
 TEST(DebugSessionTest, givenTileAttachDisabledAndSubDeviceWhenCreatingSessionThenNullptrReturned) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.ExperimentalEnableTileAttach.set(0);
+    NEO::debugManager.flags.ExperimentalEnableTileAttach.set(0);
 
     zet_debug_config_t config = {};
     config.pid = 0x1234;
 
     NEO::Device *neoDevice(NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get(), 0));
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.isSubdevice = true;
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.isSubdevice = true;
 
     ze_result_t result = ZE_RESULT_ERROR_DEVICE_LOST;
-    auto session = deviceImp.createDebugSession(config, result, false);
+    auto session = mockDevice.createDebugSession(config, result, false);
 
     EXPECT_EQ(nullptr, session);
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -420,7 +624,7 @@ TEST(DebugSessionTest, givenTileAttachDisabledAndSubDeviceWhenCreatingSessionThe
 
 TEST(DebugSessionTest, givenTileAttachDisabledAndSubDeviceWhenDebugAttachCalledThenErrorReturned) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.ExperimentalEnableTileAttach.set(0);
+    NEO::debugManager.flags.ExperimentalEnableTileAttach.set(0);
 
     zet_debug_config_t config = {};
     config.pid = 0x1234;
@@ -429,12 +633,12 @@ TEST(DebugSessionTest, givenTileAttachDisabledAndSubDeviceWhenDebugAttachCalledT
     neoDevice->incRefInternal();
     auto neoSubdevice = std::unique_ptr<NEO::SubDevice>(neoDevice->createSubDevice(0));
 
-    auto deviceImp = std::make_unique<Mock<L0::DeviceImp>>(neoSubdevice.get(), neoSubdevice->getExecutionEnvironment());
-    deviceImp->isSubdevice = true;
+    auto mockDevice = std::make_unique<MockDeviceImp>(neoSubdevice.get());
+    mockDevice->isSubdevice = true;
 
     ze_result_t result = ZE_RESULT_ERROR_DEVICE_LOST;
     zet_debug_session_handle_t debugSession = nullptr;
-    result = zetDebugAttach(deviceImp->toHandle(), &config, &debugSession);
+    result = zetDebugAttach(mockDevice->toHandle(), &config, &debugSession);
 
     EXPECT_EQ(nullptr, debugSession);
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -450,11 +654,11 @@ TEST(DebugSessionTest, givenRootDeviceWhenCreatingSessionThenResultReturnedIsCor
     osInterface->debugAttachAvailable = false;
 
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->osInterface.reset(osInterface);
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.isSubdevice = false;
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.isSubdevice = false;
 
     ze_result_t result = ZE_RESULT_ERROR_DEVICE_LOST;
-    auto session = deviceImp.createDebugSession(config, result, true);
+    auto session = mockDevice.createDebugSession(config, result, true);
 
     EXPECT_EQ(nullptr, session);
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
@@ -462,24 +666,64 @@ TEST(DebugSessionTest, givenRootDeviceWhenCreatingSessionThenResultReturnedIsCor
 
 TEST_F(DebugApiTest, givenZeAffinityMaskAndEnabledDebugMessagesWhenDebugAttachCalledThenMessageIsPrinted) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.PrintDebugMessages.set(1);
-
-    VariableBackup<uint32_t> mockGetenvCalledBackup(&IoFunctions::mockGetenvCalled, 0);
-    std::unordered_map<std::string, std::string> mockableEnvs = {{"ZE_AFFINITY_MASK", "0.1"}};
-    VariableBackup<std::unordered_map<std::string, std::string> *> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+    NEO::debugManager.flags.PrintDebugMessages.set(1);
+    NEO::debugManager.flags.ZE_AFFINITY_MASK.set("0.1");
 
     zet_debug_config_t config = {};
     config.pid = 0x1234;
 
-    Mock<L0::DeviceImp> deviceImp(neoDevice, neoDevice->getExecutionEnvironment());
-    deviceImp.debugSession.reset(new DebugSessionMock(config, &deviceImp));
+    MockDeviceImp mockDevice(neoDevice);
+    mockDevice.debugSession.reset(new DebugSessionMock(config, &mockDevice));
 
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     zet_debug_session_handle_t debugSession = nullptr;
-    zetDebugAttach(deviceImp.toHandle(), &config, &debugSession);
+    zetDebugAttach(mockDevice.toHandle(), &config, &debugSession);
 
-    std::string output = testing::internal::GetCapturedStdout();
+    std::string output = capture.getCapturedStdout();
     EXPECT_EQ(std::string("ZE_AFFINITY_MASK is not recommended while using program debug API\n"), output);
+}
+
+TEST_F(DebugApiTest, givenReadDebugScratchRegisterCalledThenSuccessIsReturned) {
+    zet_debug_config_t config = {};
+    config.pid = 0x1234;
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OsInterfaceWithDebugAttach);
+
+    L0::Device *l0Device = static_cast<Device *>(device);
+    auto session = new MockDebugSession(config, device, true);
+    session->initialize();
+    l0Device->setDebugSession(session);
+    SIP::version version = {3, 0, 0};
+    initStateSaveArea(session->stateSaveAreaHeader, version, device);
+    ze_device_thread_t stoppedThread = {0, 0, 0, 0};
+    EuThread::ThreadId stoppedThreadId{0, stoppedThread};
+    session->allThreads[stoppedThreadId]->stopThread(1u);
+    session->allThreads[stoppedThreadId]->reportAsStopped();
+    uint64_t scratch[2];
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugReadRegisters(session->toHandle(), {0, 0, 0, 0}, ZET_DEBUG_REGSET_TYPE_DEBUG_SCRATCH_INTEL_GPU, 0, 2, scratch));
+    EXPECT_EQ(scratch[0], 0u);
+    EXPECT_EQ(scratch[1], 0u);
+}
+
+HWTEST2_F(DebugApiTest, givenReadModeRegisterCalledThenSuccessIsReturned, IsDebugSipFromIgc) {
+    zet_debug_config_t config = {};
+    config.pid = 0x1234;
+
+    neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OsInterfaceWithDebugAttach);
+
+    L0::Device *l0Device = static_cast<Device *>(device);
+    auto session = new MockDebugSession(config, device, true);
+    session->initialize();
+    l0Device->setDebugSession(session);
+    SIP::version version = {3, 0, 0};
+    initStateSaveArea(session->stateSaveAreaHeader, version, device);
+    ze_device_thread_t stoppedThread = {0, 0, 0, 0};
+    EuThread::ThreadId stoppedThreadId{0, stoppedThread};
+    session->allThreads[stoppedThreadId]->stopThread(1u);
+    session->allThreads[stoppedThreadId]->reportAsStopped();
+    uint32_t modeFlags;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zetDebugReadRegisters(session->toHandle(), {0, 0, 0, 0}, ZET_DEBUG_REGSET_TYPE_MODE_FLAGS_INTEL_GPU, 0, 1, &modeFlags));
 }
 
 } // namespace ult

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,20 +7,27 @@
 
 #pragma once
 
-#include <level_zero/ze_api.h>
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/stackvec.h"
 
-struct _ze_module_build_log_handle_t {};
+#include "level_zero/core/source/helpers/api_handle_helper.h"
+
+#include <string>
+
+struct _ze_module_build_log_handle_t : BaseHandle {};
+static_assert(IsCompliantWithDdiHandlesExt<_ze_module_build_log_handle_t>);
 
 namespace L0 {
 
 struct Module;
 
-struct ModuleBuildLog : _ze_module_build_log_handle_t {
+struct ModuleBuildLog : _ze_module_build_log_handle_t, NEO::NonCopyableAndNonMovableClass {
     static ModuleBuildLog *create();
     virtual ~ModuleBuildLog() = default;
 
     virtual ze_result_t destroy() = 0;
     virtual ze_result_t getString(size_t *pSize, char *pBuildLog) = 0;
+    virtual const char *getBuildLog() const = 0;
     virtual void appendString(const char *pBuildLog, size_t size) = 0;
 
     ModuleBuildLog() = default;
@@ -35,5 +42,41 @@ struct ModuleBuildLog : _ze_module_build_log_handle_t {
 
     inline ze_module_build_log_handle_t toHandle() { return this; }
 };
+
+inline void append(ModuleBuildLog *dst, std::string_view src) {
+    if (nullptr == dst) {
+        return;
+    }
+
+    dst->appendString(src.data(), src.size());
+}
+
+inline void append(ModuleBuildLog &dst, ModuleBuildLog &src) {
+    size_t srcLen = 0U;
+    src.getString(&srcLen, nullptr);
+    if (srcLen == 0) {
+        return;
+    }
+    StackVec<char, 256> srcStr;
+    srcStr.resize(srcLen);
+    src.getString(&srcLen, srcStr.data());
+    dst.appendString(srcStr.data(), srcLen);
+}
+
+inline std::string read(ModuleBuildLog &src) {
+    size_t srcLen = 0U;
+    src.getString(&srcLen, nullptr);
+    if (srcLen == 0) {
+        return "";
+    }
+    StackVec<char, 256> srcStr;
+    srcStr.resize(srcLen);
+    src.getString(&srcLen, srcStr.data());
+    std::string ret;
+    ret.assign(srcStr.data(), srcLen);
+    return ret;
+}
+
+static_assert(NEO::NonCopyableAndNonMovable<ModuleBuildLog>);
 
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,24 +7,22 @@
 
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
-#include "shared/source/built_ins/built_ins.h"
-#include "shared/source/compiler_interface/compiler_interface.h"
-#include "shared/source/compiler_interface/external_functions.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/blit_properties.h"
 #include "shared/source/memory_manager/deferred_deleter.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
+#include "shared/source/utilities/staging_buffer_manager.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
-#include "shared/test/common/mocks/mock_svm_manager.h"
 
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/sharings/sharing.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 #include "opencl/test/unit_test/mocks/mock_cl_execution_environment.h"
-#include "opencl/test/unit_test/mocks/mock_kernel.h"
 
-#include "d3d_sharing_functions.h"
+#include <cassert>
 
 namespace NEO {
 
@@ -47,7 +45,6 @@ MockContext::MockContext(
     userData = data;
     memoryManager = nullptr;
     driverDiagnostics = nullptr;
-    rootDeviceIndices = {};
     maxRootDeviceIndex = std::numeric_limits<uint32_t>::max();
     deviceBitfields = {};
 }
@@ -63,10 +60,21 @@ MockContext::~MockContext() {
         memoryManager->getDeferredDeleter()->removeClient();
     }
     memoryManager = nullptr;
+
+    if (!platformManagersInitialized && stagingBufferManager) {
+        delete stagingBufferManager;
+        stagingBufferManager = nullptr;
+    }
+    if (!platformManagersInitialized && svmAllocsManager) {
+        usmDeviceMemAllocPoolsManager.cleanup();
+        svmAllocsManager->cleanupUSMAllocCaches();
+        delete svmAllocsManager;
+        svmAllocsManager = nullptr;
+    }
 }
 
 MockContext::MockContext() {
-    pDevice = new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)};
+    pDevice = new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)};
     cl_device_id deviceId = pDevice;
     initializeWithDevices(ClDeviceVector{&deviceId, 1}, false);
     pDevice->decRefInternal();
@@ -100,16 +108,13 @@ std::unique_ptr<AsyncEventsHandler> &MockContext::getAsyncEventsHandlerUniquePtr
 void MockContext::initializeWithDevices(const ClDeviceVector &devices, bool noSpecialQueue) {
     for (auto &pClDevice : devices) {
         pClDevice->incRefInternal();
-        rootDeviceIndices.push_back(pClDevice->getRootDeviceIndex());
+        rootDeviceIndices.pushUnique(pClDevice->getRootDeviceIndex());
     }
-    rootDeviceIndices.remove_duplicates();
     maxRootDeviceIndex = *std::max_element(rootDeviceIndices.begin(), rootDeviceIndices.end(), std::less<uint32_t const>());
     specialQueues.resize(maxRootDeviceIndex + 1u);
 
     this->devices = devices;
     memoryManager = devices[0]->getMemoryManager();
-    svmAllocsManager = new MockSVMAllocsManager(memoryManager,
-                                                true);
 
     for (auto &rootDeviceIndex : rootDeviceIndices) {
         DeviceBitfield deviceBitfield{};
@@ -118,12 +123,15 @@ void MockContext::initializeWithDevices(const ClDeviceVector &devices, bool noSp
                 deviceBitfield |= pDevice->getDeviceBitfield();
             }
             for (auto &engine : pDevice->getDevice().getAllEngines()) {
-                if (engine.commandStreamReceiver->getTagsMultiAllocation())
+                if (engine.commandStreamReceiver->getTagsMultiAllocation()) {
                     engine.commandStreamReceiver->ensureTagAllocationForRootDeviceIndex(rootDeviceIndex);
+                }
             }
         }
         deviceBitfields.insert({rootDeviceIndex, deviceBitfield});
     }
+
+    initializeManagers();
 
     cl_int retVal;
     if (!noSpecialQueue) {
@@ -137,6 +145,16 @@ void MockContext::initializeWithDevices(const ClDeviceVector &devices, bool noSp
     }
 
     setupContextType();
+}
+
+void MockContext::initializeManagers() {
+    auto platform = this->getDevice(0)->getPlatform();
+    if (platform != nullptr && platform->isInitialized()) {
+        Context::initializeManagers();
+    } else {
+        svmAllocsManager = new SVMAllocsManager(memoryManager);
+        stagingBufferManager = new StagingBufferManager(svmAllocsManager, rootDeviceIndices, deviceBitfields, true);
+    }
 }
 
 MockDefaultContext::MockDefaultContext() : MockDefaultContext(false) {}
@@ -165,20 +183,6 @@ MockUnrestrictiveContext::MockUnrestrictiveContext() : MockContext(nullptr, null
     initializeWithDevices(ClDeviceVector{deviceIds, 3}, true);
 }
 
-MockUnrestrictiveDebuggingSupportedContext::MockUnrestrictiveDebuggingSupportedContext() : MockContext(nullptr, nullptr) {
-    NEO::HardwareInfo hwInfo = *NEO::defaultHwInfo;
-    hwInfo.capabilityTable.debuggerSupported = true;
-    auto executionEnvironment = MockDevice::prepareExecutionEnvironment(&hwInfo, 0u);
-
-    ultClDeviceFactory = std::make_unique<UltClDeviceFactory>(1, 2, static_cast<ClExecutionEnvironment *>(executionEnvironment));
-
-    pRootDevice = ultClDeviceFactory->rootDevices[0];
-    pSubDevice0 = ultClDeviceFactory->subDevices[0];
-    pSubDevice1 = ultClDeviceFactory->subDevices[1];
-    cl_device_id deviceIds[] = {pRootDevice, pSubDevice0, pSubDevice1};
-    initializeWithDevices(ClDeviceVector{deviceIds, 3}, true);
-}
-
 MockUnrestrictiveContextMultiGPU::MockUnrestrictiveContextMultiGPU() : MockContext(nullptr, nullptr) {
     pRootDevice0 = ultClDeviceFactory.rootDevices[0];
     pSubDevice00 = ultClDeviceFactory.subDevices[0];
@@ -192,7 +196,9 @@ MockUnrestrictiveContextMultiGPU::MockUnrestrictiveContextMultiGPU() : MockConte
 }
 
 BcsMockContext::BcsMockContext(ClDevice *device) : MockContext(device) {
-    bcsOsContext.reset(OsContext::create(nullptr, device->getRootDeviceIndex(), 0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular}, device->getDeviceBitfield())));
+    auto &productHelper = device->getDevice().getProductHelper();
+    auto defaultCopyEngine = productHelper.getDefaultCopyEngine();
+    bcsOsContext.reset(OsContext::create(nullptr, device->getRootDeviceIndex(), 0, EngineDescriptorHelper::getDefaultDescriptor({defaultCopyEngine, EngineUsage::regular}, device->getDeviceBitfield())));
     bcsCsr.reset(createCommandStream(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield()));
     bcsCsr->setupContext(*bcsOsContext);
     bcsCsr->initializeTagAllocation();
@@ -200,7 +206,7 @@ BcsMockContext::BcsMockContext(ClDevice *device) : MockContext(device) {
 
     auto mockBlitMemoryToAllocation = [this](const Device &device, GraphicsAllocation *memory, size_t offset, const void *hostPtr,
                                              Vec3<size_t> size) -> BlitOperationResult {
-        auto blitProperties = BlitProperties::constructPropertiesForReadWrite(BlitterConstants::BlitDirection::HostPtrToBuffer,
+        auto blitProperties = BlitProperties::constructPropertiesForReadWrite(BlitterConstants::BlitDirection::hostPtrToBuffer,
                                                                               *bcsCsr, memory, nullptr,
                                                                               hostPtr,
                                                                               memory->getGpuAddress(), 0,
@@ -208,9 +214,9 @@ BcsMockContext::BcsMockContext(ClDevice *device) : MockContext(device) {
 
         BlitPropertiesContainer container;
         container.push_back(blitProperties);
-        bcsCsr->flushBcsTask(container, true, false, const_cast<Device &>(device));
+        bcsCsr->flushBcsTask(container, true, const_cast<Device &>(device));
 
-        return BlitOperationResult::Success;
+        return BlitOperationResult::success;
     };
     blitMemoryToAllocationFuncBackup = mockBlitMemoryToAllocation;
 }

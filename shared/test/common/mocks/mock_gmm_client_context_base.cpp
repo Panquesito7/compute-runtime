@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,11 +11,11 @@
 
 namespace NEO {
 GMM_RESOURCE_INFO *MockGmmClientContextBase::createResInfoObject(GMM_RESCREATE_PARAMS *pCreateParams) {
-    return reinterpret_cast<GMM_RESOURCE_INFO *>(new char[1]);
+    return reinterpret_cast<GMM_RESOURCE_INFO *>(new char[sizeof(GMM_RESOURCE_INFO)]);
 }
 
 GMM_RESOURCE_INFO *MockGmmClientContextBase::copyResInfoObject(GMM_RESOURCE_INFO *pSrcRes) {
-    return reinterpret_cast<GMM_RESOURCE_INFO *>(new char[1]);
+    return reinterpret_cast<GMM_RESOURCE_INFO *>(new char[sizeof(GMM_RESOURCE_INFO)]);
 }
 
 void MockGmmClientContextBase::destroyResInfoObject(GMM_RESOURCE_INFO *pResInfo) {
@@ -34,14 +34,14 @@ uint8_t MockGmmClientContextBase::getMediaSurfaceStateCompressionFormat(GMM_RESO
     return compressionFormatToReturn;
 }
 
-void MockGmmClientContextBase::setGmmDeviceInfo(GMM_DEVICE_INFO *deviceInfo) {
-    EXPECT_NE(deviceInfo, nullptr);
-
-    GMM_DEVICE_CALLBACKS_INT emptyStruct{};
-    EXPECT_EQ(0, memcmp(deviceInfo->pDeviceCb, &emptyStruct, sizeof(GMM_DEVICE_CALLBACKS_INT)));
-}
 uint64_t MockGmmClientContextBase::freeGpuVirtualAddress(FreeGpuVirtualAddressGmm *pFreeGpuVa) {
     freeGpuVirtualAddressCalled++;
     return 0;
 }
+
+void MockGmmClientContextBase::initialize(const RootDeviceEnvironment &rootDeviceEnvironment) {
+    initializeCalled++;
+    deviceHandle = 0x08;
+    clientContext = {reinterpret_cast<GMM_CLIENT_CONTEXT *>(deviceHandle), [](auto) {}};
+};
 } // namespace NEO

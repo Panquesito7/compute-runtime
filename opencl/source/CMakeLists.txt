@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2022 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -27,7 +27,7 @@ add_library(${NEO_STATIC_LIB_NAME} STATIC EXCLUDE_FROM_ALL
 add_subdirectories()
 include(enable_cores.cmake)
 
-if(WIN32)
+if(MSVC)
   if("${IGDRCL_OPTION__BITS}" STREQUAL "32")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /SAFESEH:NO")
   endif()
@@ -35,18 +35,17 @@ endif()
 
 target_include_directories(${NEO_STATIC_LIB_NAME} PRIVATE
                            ${CMAKE_CURRENT_BINARY_DIR}
-                           ${KMDAF_HEADERS_DIR}
 )
 
 target_include_directories(${NEO_STATIC_LIB_NAME} PUBLIC
                            ${ENGINE_NODE_DIR}
                            ${KHRONOS_HEADERS_DIR}
                            ${KHRONOS_GL_HEADERS_DIR}
+                           ${KHRONOS_SPIRV_HEADERS_DIR}
                            ${CIF_BASE_DIR}
                            ${IGC_OCL_ADAPTOR_DIR}
                            ${VISA_INCLUDE_DIR}
                            ${NEO__IGC_INCLUDE_DIR}
-                           ${THIRD_PARTY_DIR}
                            ${NEO__GMM_INCLUDE_DIR}
 )
 
@@ -107,9 +106,7 @@ if(${GENERATE_EXECUTABLE})
   list(APPEND NEO_DYNAMIC_LIB__TARGET_OBJECTS
        $<TARGET_OBJECTS:${SHARINGS_ENABLE_LIB_NAME}>
        $<TARGET_OBJECTS:${BUILTINS_SOURCES_LIB_NAME}>
-       $<TARGET_OBJECTS:${BUILTINS_VME_LIB_NAME}>
-       $<TARGET_OBJECTS:${BUILTINS_BINARIES_STATELESS_LIB_NAME}>
-       $<TARGET_OBJECTS:${BUILTINS_BINARIES_BINDFUL_LIB_NAME}>
+       $<TARGET_OBJECTS:${BUILTINS_BINARIES_LIB_NAME}>
   )
 
   add_library(${NEO_DYNAMIC_LIB_NAME} SHARED
@@ -121,12 +118,12 @@ if(${GENERATE_EXECUTABLE})
                    $<TARGET_OBJECTS:${AUB_STREAM_PROJECT_NAME}_all_hw>
                    ${NEO_SOURCE_DIR}/shared/source/aub/aub_stream_interface.cpp
     )
+    target_link_libraries(${NEO_DYNAMIC_LIB_NAME} PRIVATE ${AUB_STREAM_PROJECT_NAME})
   else()
     target_sources(${NEO_DYNAMIC_LIB_NAME}
                    PRIVATE
-                   ${NEO_SOURCE_DIR}/shared/source/aub/aub_stream_interface_stub.cpp
+                   $<TARGET_OBJECTS:aub_stream_stubs>
     )
-
   endif()
 
   if(UNIX)
@@ -153,33 +150,22 @@ if(${GENERATE_EXECUTABLE})
     set_property(GLOBAL APPEND PROPERTY NEO_OCL_COMPONENTS_LIST "opencl")
   endif()
 
-  if(NOT DISABLED_GTPIN_SUPPORT)
-    macro(macro_for_each_core_type)
-      foreach(BRANCH_DIR ${BRANCH_DIR_LIST})
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR}${CORE_TYPE_LOWER}/gtpin_setup_${CORE_TYPE_LOWER}.cpp)
-          target_sources(${NEO_DYNAMIC_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR}${CORE_TYPE_LOWER}/gtpin_setup_${CORE_TYPE_LOWER}.cpp)
-        endif()
-      endforeach()
-    endmacro()
-    apply_macro_for_each_core_type("SUPPORTED")
-  endif()
-
   add_subdirectory(dll)
 
-  target_link_libraries(${NEO_DYNAMIC_LIB_NAME} ${NEO_STATIC_LIB_NAME} ${NEO_SHARED_LIB} ${NEO_STATIC_LIB_NAME} ${NEO_SHARED_LIB} ${NEO_EXTRA_LIBS})
+  target_link_libraries(${NEO_DYNAMIC_LIB_NAME} PRIVATE ${NEO_STATIC_LIB_NAME} ${NEO_SHARED_LIB} ${NEO_STATIC_LIB_NAME} ${NEO_SHARED_LIB} ${NEO_EXTRA_LIBS})
 
   target_include_directories(${NEO_DYNAMIC_LIB_NAME} BEFORE PRIVATE
                              ${CMAKE_CURRENT_BINARY_DIR}
   )
 
   if(WIN32)
-    target_link_libraries(${NEO_DYNAMIC_LIB_NAME} dxgi)
+    target_link_libraries(${NEO_DYNAMIC_LIB_NAME} PRIVATE dxgi)
     add_dependencies(${NEO_DYNAMIC_LIB_NAME} ${GMM_TARGET_NAME})
     target_sources(${NEO_DYNAMIC_LIB_NAME} PRIVATE
                    ${NEO_SHARED_DIRECTORY}/os_interface/windows/gmm_interface_win.cpp
     )
   else()
-    target_link_libraries(${NEO_DYNAMIC_LIB_NAME} ${GMM_LINK_NAME})
+    target_link_libraries(${NEO_DYNAMIC_LIB_NAME} PRIVATE ${GMM_LINK_NAME})
     target_include_directories(${NEO_DYNAMIC_LIB_NAME} PRIVATE
                                ${NEO_SHARED_DIRECTORY}/dll/devices${BRANCH_DIR_SUFFIX}
     )
@@ -198,10 +184,10 @@ if(${GENERATE_EXECUTABLE})
   endif()
 
   set_target_properties(${NEO_DYNAMIC_LIB_NAME} PROPERTIES
-                        DEBUG_OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}"
-                        RELEASE_OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}"
-                        RELEASEINTERNAL_OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}"
-                        OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}"
+                        DEBUG_OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}${NEO__SO_NAME_SUFFIX}"
+                        RELEASE_OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}${NEO__SO_NAME_SUFFIX}"
+                        RELEASEINTERNAL_OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}${NEO__SO_NAME_SUFFIX}"
+                        OUTPUT_NAME "${NEO_DLL_NAME_BASE}${IGDRCL_NAME_POSTFIX}${IGDRCL_OPTION__BITS}${NEO__SO_NAME_SUFFIX}"
   )
   set_target_properties(${NEO_DYNAMIC_LIB_NAME} PROPERTIES FOLDER ${OPENCL_RUNTIME_PROJECTS_FOLDER})
   create_project_source_tree_with_exports(${NEO_DYNAMIC_LIB_NAME} "${EXPORTS_FILENAME}")

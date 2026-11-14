@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/device/device.h"
+#include "shared/source/os_interface/gl_wrapper.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
 #include "shared/source/os_interface/windows/os_context_win.h"
@@ -14,13 +15,13 @@
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 
 #include "opencl/extensions/public/cl_gl_private_intel.h"
+#include "opencl/source/api/leo_forwarding.h"
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/base_object.h"
+#include "opencl/source/mem_obj/mem_obj.h"
 #include "opencl/source/sharings/gl/gl_arb_sync_event.h"
 #include "opencl/source/sharings/gl/windows/gl_sharing_windows.h"
-
-#include <GL/gl.h>
 
 namespace NEO {
 
@@ -114,18 +115,18 @@ bool setupArbSyncObject(GLSharingFunctions &sharing, OSInterface &osInterface, C
     return true;
 }
 
-void signalArbSyncObject(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo) {
+void signalArbSyncObject(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo, bool signalAtSubmission) {
     auto osContextWin = static_cast<OsContextWin *>(&osContext);
     UNRECOVERABLE_IF(!osContextWin);
     auto wddm = osContextWin->getWddm();
 
     D3DKMT_SIGNALSYNCHRONIZATIONOBJECT signalServerClientSyncInfo = {};
     signalServerClientSyncInfo.hContext = osContextWin->getWddmContextHandle();
-    signalServerClientSyncInfo.Flags.SignalAtSubmission = 0; // Wait for GPU to complete processing command buffer
+    signalServerClientSyncInfo.Flags.SignalAtSubmission = signalAtSubmission;
     signalServerClientSyncInfo.ObjectHandleArray[0] = glSyncInfo.serverSynchronizationObject;
     signalServerClientSyncInfo.ObjectHandleArray[1] = glSyncInfo.clientSynchronizationObject;
     signalServerClientSyncInfo.ObjectCount = 2;
-    NTSTATUS status = wddm->getGdi()->signalSynchronizationObject(&signalServerClientSyncInfo);
+    [[maybe_unused]] NTSTATUS status = wddm->getGdi()->signalSynchronizationObject(&signalServerClientSyncInfo);
     if (STATUS_SUCCESS != status) {
         DEBUG_BREAK_IF(true);
         return;
@@ -153,6 +154,13 @@ void serverWaitForArbSyncObject(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyn
         DEBUG_BREAK_IF(true);
         return;
     }
+
+    [[maybe_unused]] auto ret = SysCalls::waitForSingleObject(glSyncInfo.submissionEvent, INFINITE);
+    if (ret != WAIT_OBJECT_0) {
+        DEBUG_BREAK_IF(true);
+        return;
+    }
+
     glSyncInfo.waitCalled = true;
 }
 
@@ -207,7 +215,8 @@ void GlArbSyncEvent::unblockEventBy(Event &event, TaskCountType taskLevel, int32
         return;
     }
 
-    ctx->getSharing<GLSharingFunctionsWindows>()->glArbSyncObjectSignal(event.getCommandQueue()->getGpgpuCommandStreamReceiver().getOsContext(), *glSyncInfo);
+    event.getCommandQueue()->getGpgpuCommandStreamReceiver().stopDirectSubmission(true, true);
+    ctx->getSharing<GLSharingFunctionsWindows>()->glArbSyncObjectSignal(event.getCommandQueue()->getGpgpuCommandStreamReceiver().getOsContext(), *glSyncInfo, transitionStatus == CL_COMPLETE);
     ctx->getSharing<GLSharingFunctionsWindows>()->glArbSyncObjectWaitServer(*osInterface, *glSyncInfo);
 }
 } // namespace NEO
@@ -216,17 +225,26 @@ extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clEnqueueMarkerWithSyncObjectINTEL(cl_command_queue commandQueue,
                                    cl_event *event,
                                    cl_context *context) {
+    if (nullptr == NEO::castToObject<NEO::CommandQueue>(commandQueue) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClEnqueueMarkerWithSyncObjectINTEL(commandQueue, event, context);
+    }
     return CL_INVALID_OPERATION;
 }
 
 extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clGetCLObjectInfoINTEL(cl_mem memObj,
                        void *pResourceInfo) {
+    if (nullptr == NEO::castToObject<NEO::MemObj>(memObj) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClGetCLObjectInfoINTEL(memObj, pResourceInfo);
+    }
     return CL_INVALID_OPERATION;
 }
 
 extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clGetCLEventInfoINTEL(cl_event event, PCL_GL_SYNC_INFO *pSyncInfoHandleRet, cl_context *pClContextRet) {
+    if (nullptr == NEO::castToObject<NEO::Event>(event) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClGetCLEventInfoINTEL(event, reinterpret_cast<void **>(pSyncInfoHandleRet), pClContextRet);
+    }
     if ((nullptr == pSyncInfoHandleRet) || (nullptr == pClContextRet)) {
         return CL_INVALID_ARG_VALUE;
     }
@@ -262,6 +280,9 @@ clGetCLEventInfoINTEL(cl_event event, PCL_GL_SYNC_INFO *pSyncInfoHandleRet, cl_c
 
 extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clReleaseGlSharedEventINTEL(cl_event event) {
+    if (nullptr == NEO::castToObject<NEO::Event>(event) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClReleaseGlSharedEventINTEL(event);
+    }
     auto neoEvent = NEO::castToObject<NEO::Event>(event);
     if (nullptr == neoEvent) {
         return CL_INVALID_EVENT;

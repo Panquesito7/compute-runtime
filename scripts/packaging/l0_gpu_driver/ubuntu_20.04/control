@@ -5,7 +5,7 @@ Maintainer: Intel Graphics Team <linux-graphics@intel.com>
 XSBC-Original-Maintainer: Debian OpenCL Maintainers <pkg-opencl-devel@lists.alioth.debian.org>
 Build-Depends: debhelper (>= 11),
  cmake,
- level-zero-devel,
+ libze-dev,
  intel-igc-opencl-devel,
  libigdgmm-dev,
  pkg-config
@@ -17,7 +17,7 @@ Architecture: amd64 arm64
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
- intel-igc-core,
+ intel-igc-core-2,
  libigdgmm12
 Description: Intel(R) Graphics Compute Runtime for oneAPI Level Zero.
  Level Zero is the primary low-level interface for language and runtime

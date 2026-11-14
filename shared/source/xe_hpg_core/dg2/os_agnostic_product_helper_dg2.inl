@@ -1,13 +1,16 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/local_memory_access_modes.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/unified_memory/usm_memory_support.h"
 
 #include "aubstream/product_family.h"
 
@@ -16,7 +19,7 @@ template <>
 void ProductHelperHw<gfxProduct>::adjustSamplerState(void *sampler, const HardwareInfo &hwInfo) const {
     using SAMPLER_STATE = typename XeHpgCoreFamily::SAMPLER_STATE;
     auto samplerState = reinterpret_cast<SAMPLER_STATE *>(sampler);
-    if (DebugManager.flags.ForceSamplerLowFilteringPrecision.get()) {
+    if (debugManager.flags.ForceSamplerLowFilteringPrecision.get()) {
         samplerState->setLowQualityFilter(SAMPLER_STATE::LOW_QUALITY_FILTER_ENABLE);
     }
 
@@ -63,12 +66,7 @@ uint32_t ProductHelperHw<gfxProduct>::getSteppingFromHwRevId(const HardwareInfo 
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::isGlobalFenceInDirectSubmissionRequired(const HardwareInfo &hwInfo) const {
-    return true;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isDirectSubmissionSupported(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<gfxProduct>::isAcquireGlobalFenceInDirectSubmissionRequired(const HardwareInfo &hwInfo) const {
     return true;
 }
 
@@ -89,23 +87,16 @@ bool ProductHelperHw<gfxProduct>::isMaxThreadsForWorkgroupWARequired(const Hardw
 }
 
 template <>
-void ProductHelperHw<gfxProduct>::setForceNonCoherent(void *const statePtr, const StateComputeModeProperties &properties) const {
+void ProductHelperHw<gfxProduct>::setForceNonCoherent(void *const statePtr) const {
     using STATE_COMPUTE_MODE = typename XeHpgCoreFamily::STATE_COMPUTE_MODE;
     using FORCE_NON_COHERENT = typename STATE_COMPUTE_MODE::FORCE_NON_COHERENT;
 
     STATE_COMPUTE_MODE &stateComputeMode = *static_cast<STATE_COMPUTE_MODE *>(statePtr);
-    FORCE_NON_COHERENT coherencyValue = (properties.isCoherencyRequired.value == 1) ? FORCE_NON_COHERENT::FORCE_NON_COHERENT_FORCE_DISABLED
-                                                                                    : FORCE_NON_COHERENT::FORCE_NON_COHERENT_FORCE_GPU_NON_COHERENT;
-    stateComputeMode.setForceNonCoherent(coherencyValue);
+    stateComputeMode.setForceNonCoherent(FORCE_NON_COHERENT::FORCE_NON_COHERENT_FORCE_GPU_NON_COHERENT);
 
     auto mask = stateComputeMode.getMaskBits();
     mask |= XeHpgCoreFamily::stateComputeModeForceNonCoherentMask;
     stateComputeMode.setMaskBits(mask);
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isDefaultEngineTypeAdjustmentRequired(const HardwareInfo &hwInfo) const {
-    return DG2::isG10(hwInfo) && GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_B, hwInfo, *this);
 }
 
 template <>
@@ -117,37 +108,11 @@ bool ProductHelperHw<gfxProduct>::isDisableOverdispatchAvailable(const HardwareI
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::allowCompression(const HardwareInfo &hwInfo) const {
-    if (DG2::isG10(hwInfo) && GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_A1, hwInfo, *this)) {
-        return false;
-    }
-    return true;
-}
-
-template <>
 LocalMemoryAccessMode ProductHelperHw<gfxProduct>::getDefaultLocalMemoryAccessMode(const HardwareInfo &hwInfo) const {
     if (DG2::isG10(hwInfo) && GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_B, hwInfo, *this)) {
-        return LocalMemoryAccessMode::CpuAccessDisallowed;
+        return LocalMemoryAccessMode::cpuAccessDisallowed;
     }
-    return LocalMemoryAccessMode::Default;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isAllocationSizeAdjustmentRequired(const HardwareInfo &hwInfo) const {
-    return DG2::isG10(hwInfo) && GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_B, hwInfo, *this);
-}
-
-template <>
-std::pair<bool, bool> ProductHelperHw<gfxProduct>::isPipeControlPriorToNonPipelinedStateCommandsWARequired(const HardwareInfo &hwInfo, bool isRcs, const ReleaseHelper *releaseHelper) const {
-    auto isAcm = DG2::isG10(hwInfo) || DG2::isG11(hwInfo) || DG2::isG12(hwInfo);
-    auto isBasicWARequired = isAcm;
-    auto isExtendedWARequired = isAcm && hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled > 1 && !isRcs;
-
-    if (DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.get() != -1) {
-        isExtendedWARequired = DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.get();
-    }
-
-    return {isBasicWARequired, isExtendedWARequired};
+    return LocalMemoryAccessMode::defaultMode;
 }
 
 template <>
@@ -170,23 +135,12 @@ template <>
 uint32_t ProductHelperHw<gfxProduct>::computeMaxNeededSubSliceSpace(const HardwareInfo &hwInfo) const {
     const uint32_t highestEnabledSlice = NEO::GfxCoreHelper::getHighestEnabledSlice(hwInfo);
 
+    UNRECOVERABLE_IF(highestEnabledSlice == 0);
+    UNRECOVERABLE_IF(hwInfo.gtSystemInfo.MaxSlicesSupported == 0);
     auto subSlicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
-    auto maxSubSlice = highestEnabledSlice * subSlicesPerSlice;
+    auto maxSubSlice = std::max(highestEnabledSlice * subSlicesPerSlice, hwInfo.gtSystemInfo.MaxSubSlicesSupported);
 
-    if (highestEnabledSlice == 0) {
-        UNRECOVERABLE_IF(true);
-    }
     return maxSubSlice;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::programAllStateComputeCommandFields() const {
-    return true;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isTimestampWaitSupportedForEvents() const {
-    return true;
 }
 
 template <>
@@ -202,25 +156,10 @@ bool ProductHelperHw<gfxProduct>::isCpuCopyNecessary(const void *ptr, MemoryMana
     }
 }
 template <>
-bool ProductHelperHw<gfxProduct>::isStorageInfoAdjustmentRequired() const {
-    if constexpr (is32bit) {
-        return true;
-    } else {
-        return false;
+bool ProductHelperHw<gfxProduct>::isResolveDependenciesByPipeControlsSupported() const {
+    if (debugManager.flags.ResolveDependenciesViaPipeControls.get() != -1) {
+        return debugManager.flags.ResolveDependenciesViaPipeControls.get() == 1;
     }
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isResolveDependenciesByPipeControlsSupported(const HardwareInfo &hwInfo, bool isOOQ, TaskCountType queueTaskCount, const CommandStreamReceiver &queueCsr) const {
-    const bool enabled = !isOOQ && queueTaskCount == queueCsr.peekTaskCount();
-    if (DebugManager.flags.ResolveDependenciesViaPipeControls.get() != -1) {
-        return DebugManager.flags.ResolveDependenciesViaPipeControls.get() == 1;
-    }
-    return enabled;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isBufferPoolAllocatorSupported() const {
     return true;
 }
 
@@ -250,14 +189,45 @@ template <>
 bool ProductHelperHw<gfxProduct>::isCalculationForDisablingEuFusionWithDpasNeeded(const HardwareInfo &hwInfo) const {
     return DG2::isG10(hwInfo) || DG2::isG11(hwInfo) || DG2::isG12(hwInfo);
 }
-template <>
-bool ProductHelperHw<gfxProduct>::isDummyBlitWaRequired() const {
-    return false;
-}
 
 template <>
 bool ProductHelperHw<gfxProduct>::disableL3CacheForDebug(const HardwareInfo &hwInfo) const {
     return DG2::isG10(hwInfo) && GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_B, hwInfo, *this);
+}
+
+template <>
+void ProductHelperHw<gfxProduct>::adjustNumberOfCcs(HardwareInfo &hwInfo) const {
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDeviceUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+uint64_t ProductHelperHw<gfxProduct>::getHostMemCapabilitiesValue() const {
+    return (UnifiedSharedMemoryFlags::access);
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isCompressionForbidden(const HardwareInfo &hwInfo) const {
+    return isCompressionForbiddenCommon(false);
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDeviceUsmPoolAllocatorSupported() const {
+    return ApiSpecificConfig::OCL == ApiSpecificConfig::getApiType();
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isHostUsmPoolAllocatorSupported() const {
+    return ApiSpecificConfig::OCL == ApiSpecificConfig::getApiType();
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::scanFullTopologyBitmap() const {
+    return true;
 }
 
 } // namespace NEO

@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/built_ins/built_in_ops_base.h"
 #include "shared/source/command_stream/csr_definitions.h"
 #include "shared/source/helpers/completion_stamp.h"
 #include "shared/source/helpers/engine_node_helper.h"
@@ -15,7 +16,7 @@
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/sku_info/sku_info_base.h"
 #include "shared/source/unified_memory/unified_memory.h"
-#include "shared/source/utilities/range.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "opencl/source/api/cl_types.h"
 #include "opencl/source/command_queue/copy_engine_state.h"
@@ -23,10 +24,16 @@
 #include "opencl/source/helpers/enqueue_properties.h"
 #include "opencl/source/helpers/properties_helper.h"
 
-#include <cstdint>
-#include <optional>
+#include "CL/cl_ext.h"
 
-enum InternalMemoryType : uint32_t;
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <span>
+
+namespace aub_stream {
+enum EngineType : uint32_t;
+} // namespace aub_stream
 
 namespace NEO {
 class BarrierCommand;
@@ -43,15 +50,25 @@ class LinearStream;
 class PerformanceCounters;
 class PrintfHandler;
 enum class WaitStatus;
-struct BuiltinOpParams;
+namespace BuiltIn {
+struct OpParams;
+}
 struct CsrSelectionArgs;
 struct MultiDispatchInfo;
 struct TimestampPacketDependencies;
+struct StagingTransferStatus;
+class CommandStreamReceiver;
+class CsrDependencies;
+class Device;
+class MemObj;
+class TagNodeBase;
+enum class MapOperationType;
+struct EngineControl;
 
 enum class QueuePriority {
-    LOW,
-    MEDIUM,
-    HIGH
+    low,
+    medium,
+    high
 };
 
 template <>
@@ -74,9 +91,6 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     CommandQueue() = delete;
 
     CommandQueue(Context *context, ClDevice *device, const cl_queue_properties *properties, bool internalUsage);
-
-    CommandQueue &operator=(const CommandQueue &) = delete;
-    CommandQueue(const CommandQueue &) = delete;
 
     ~CommandQueue() override;
 
@@ -124,7 +138,7 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
                                   void *userData, cl_uint numEventsInWaitList, const cl_event *eventWaitList, cl_event *event) = 0;
 
     virtual cl_int enqueueSVMMemcpy(cl_bool blockingCopy, void *dstPtr, const void *srcPtr, size_t size, cl_uint numEventsInWaitList,
-                                    const cl_event *eventWaitList, cl_event *event) = 0;
+                                    const cl_event *eventWaitList, cl_event *event, CommandStreamReceiver *csrParam) = 0;
 
     virtual cl_int enqueueSVMMemFill(void *svmPtr, const void *pattern, size_t patternSize,
                                      size_t size, cl_uint numEventsInWaitList, const cl_event *eventWaitList, cl_event *event) = 0;
@@ -144,10 +158,17 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     virtual cl_int enqueueReadBuffer(Buffer *buffer, cl_bool blockingRead, size_t offset, size_t size, void *ptr,
                                      GraphicsAllocation *mapAllocation, cl_uint numEventsInWaitList,
                                      const cl_event *eventWaitList, cl_event *event) = 0;
+    virtual cl_int enqueueReadBufferImpl(Buffer *buffer, cl_bool blockingRead, size_t offset, size_t size,
+                                         void *ptr, GraphicsAllocation *mapAllocation, cl_uint numEventsInWaitList,
+                                         const cl_event *eventWaitList, cl_event *event, CommandStreamReceiver &csr) = 0;
 
     virtual cl_int enqueueReadImage(Image *srcImage, cl_bool blockingRead, const size_t *origin, const size_t *region,
                                     size_t rowPitch, size_t slicePitch, void *ptr, GraphicsAllocation *mapAllocation,
                                     cl_uint numEventsInWaitList, const cl_event *eventWaitList, cl_event *event) = 0;
+
+    virtual cl_int enqueueReadImageImpl(Image *srcImage, cl_bool blockingRead, const size_t *origin, const size_t *region,
+                                        size_t rowPitch, size_t slicePitch, void *ptr, GraphicsAllocation *mapAllocation,
+                                        cl_uint numEventsInWaitList, const cl_event *eventWaitList, cl_event *event, CommandStreamReceiver &csr) = 0;
 
     virtual cl_int enqueueWriteBuffer(Buffer *buffer, cl_bool blockingWrite, size_t offset, size_t cb,
                                       const void *ptr, GraphicsAllocation *mapAllocation, cl_uint numEventsInWaitList,
@@ -157,6 +178,15 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
                                      const size_t *region, size_t inputRowPitch, size_t inputSlicePitch,
                                      const void *ptr, GraphicsAllocation *mapAllocation, cl_uint numEventsInWaitList,
                                      const cl_event *eventWaitList, cl_event *event) = 0;
+
+    virtual cl_int enqueueWriteBufferImpl(Buffer *buffer, cl_bool blockingWrite, size_t offset, size_t cb,
+                                          const void *ptr, GraphicsAllocation *mapAllocation, cl_uint numEventsInWaitList,
+                                          const cl_event *eventWaitList, cl_event *event, CommandStreamReceiver &csr) = 0;
+
+    virtual cl_int enqueueWriteImageImpl(Image *dstImage, cl_bool blockingWrite, const size_t *origin,
+                                         const size_t *region, size_t inputRowPitch, size_t inputSlicePitch,
+                                         const void *ptr, GraphicsAllocation *mapAllocation, cl_uint numEventsInWaitList,
+                                         const cl_event *eventWaitList, cl_event *event, CommandStreamReceiver &csr) = 0;
 
     virtual cl_int enqueueCopyBufferRect(Buffer *srcBuffer, Buffer *dstBuffer, const size_t *srcOrigin, const size_t *dstOrigin,
                                          const size_t *region, size_t srcRowPitch, size_t srcSlicePitch, size_t dstRowPitch, size_t dstSlicePitch,
@@ -198,9 +228,11 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     virtual cl_int enqueueResourceBarrier(BarrierCommand *resourceBarrier, cl_uint numEventsInWaitList,
                                           const cl_event *eventWaitList, cl_event *event) = 0;
 
-    virtual cl_int finish() = 0;
+    virtual cl_int finish(bool resolvePendingL3Flushes) = 0;
 
     virtual cl_int flush() = 0;
+
+    virtual void programPendingL3Flushes(CommandStreamReceiver &csr, bool &waitForTaskCountRequired, bool resolvePendingL3Flushes) = 0;
 
     void updateFromCompletionStamp(const CompletionStamp &completionStamp, Event *outEvent);
 
@@ -214,20 +246,20 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
 
     volatile TagAddressType *getHwTagAddress() const;
 
-    bool isCompleted(TaskCountType gpgpuTaskCount, CopyEngineState bcsState);
+    MOCKABLE_VIRTUAL bool isCompleted(TaskCountType gpgpuTaskCount, std::span<const CopyEngineState> bcsStates);
 
     bool isWaitForTimestampsEnabled() const;
-    virtual bool waitForTimestamps(Range<CopyEngineState> copyEnginesToWait, TaskCountType taskCount, WaitStatus &status, TimestampPacketContainer *mainContainer, TimestampPacketContainer *deferredContainer) = 0;
+    virtual bool waitForTimestamps(std::span<CopyEngineState> copyEnginesToWait, WaitStatus &status, TimestampPacketContainer *mainContainer, TimestampPacketContainer *deferredContainer) = 0;
 
     MOCKABLE_VIRTUAL bool isQueueBlocked();
 
-    MOCKABLE_VIRTUAL WaitStatus waitUntilComplete(TaskCountType gpgpuTaskCountToWait, Range<CopyEngineState> copyEnginesToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, bool cleanTemporaryAllocationList, bool skipWait);
-    MOCKABLE_VIRTUAL WaitStatus waitUntilComplete(TaskCountType gpgpuTaskCountToWait, Range<CopyEngineState> copyEnginesToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep) {
+    MOCKABLE_VIRTUAL WaitStatus waitUntilComplete(TaskCountType gpgpuTaskCountToWait, std::span<CopyEngineState> copyEnginesToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, bool cleanTemporaryAllocationList, bool skipWait);
+    MOCKABLE_VIRTUAL WaitStatus waitUntilComplete(TaskCountType gpgpuTaskCountToWait, std::span<CopyEngineState> copyEnginesToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep) {
         return this->waitUntilComplete(gpgpuTaskCountToWait, copyEnginesToWait, flushStampToWait, useQuickKmdSleep, true, false);
     }
-    MOCKABLE_VIRTUAL WaitStatus waitForAllEngines(bool blockedQueue, PrintfHandler *printfHandler, bool cleanTemporaryAllocationsList);
-    MOCKABLE_VIRTUAL WaitStatus waitForAllEngines(bool blockedQueue, PrintfHandler *printfHandler) {
-        return this->waitForAllEngines(blockedQueue, printfHandler, true);
+    MOCKABLE_VIRTUAL WaitStatus waitForAllEngines(bool blockedQueue, PrintfHandler *printfHandler, bool cleanTemporaryAllocationsList, bool waitForTaskCountRequired);
+    MOCKABLE_VIRTUAL WaitStatus waitForAllEngines(bool blockedQueue, PrintfHandler *printfHandler, bool waitForTaskCountRequired) {
+        return this->waitForAllEngines(blockedQueue, printfHandler, true, waitForTaskCountRequired);
     }
 
     static TaskCountType getTaskLevelFromWaitList(TaskCountType taskLevel,
@@ -262,7 +294,6 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     void allocateHeapMemory(IndirectHeapType heapType,
                             size_t minRequiredSize, IndirectHeap *&indirectHeap);
 
-    static bool isAssignEngineRoundRobinEnabled();
     static bool isTimestampWaitEnabled();
 
     MOCKABLE_VIRTUAL void releaseIndirectHeap(IndirectHeapType heapType);
@@ -329,10 +360,6 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     cl_uint getQueueIndexWithinFamily() const { return queueIndexWithinFamily; }
     bool isQueueFamilySelected() const { return queueFamilySelected; }
 
-    bool getRequiresCacheFlushAfterWalker() const {
-        return requiresCacheFlushAfterWalker;
-    }
-
     template <typename PtrType>
     static PtrType convertAddressWithOffsetToGpuVa(PtrType ptr, InternalMemoryType memoryType, GraphicsAllocation &allocation);
 
@@ -348,8 +375,16 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     void fillCsrDependenciesWithLastBcsPackets(CsrDependencies &csrDeps);
     void clearLastBcsPackets();
 
-    void setStallingCommandsOnNextFlush(bool isStallingCommandsOnNextFlushRequired) { stallingCommandsOnNextFlushRequired = isStallingCommandsOnNextFlushRequired; }
+    void setStallingCommandsOnNextFlush(const bool isStallingCommandsOnNextFlushRequired) {
+        stallingCommandsOnNextFlushRequired = isStallingCommandsOnNextFlushRequired;
+        if (!isStallingCommandsOnNextFlushRequired) {
+            dcFlushRequiredOnStallingCommandsOnNextFlush = false;
+        }
+    }
     bool isStallingCommandsOnNextFlushRequired() const { return stallingCommandsOnNextFlushRequired; }
+
+    void setDcFlushRequiredOnStallingCommandsOnNextFlush(const bool isDcFlushRequiredOnStallingCommandsOnNextFlush) { dcFlushRequiredOnStallingCommandsOnNextFlush = isDcFlushRequiredOnStallingCommandsOnNextFlush; }
+    bool isDcFlushRequiredOnStallingCommandsOnNextFlush() const { return dcFlushRequiredOnStallingCommandsOnNextFlush; }
 
     // taskCount of last task
     TaskCountType taskCount = 0;
@@ -362,8 +397,6 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     // virtual event that holds last Enqueue information
     Event *virtualEvent = nullptr;
 
-    size_t estimateTimestampPacketNodesCount(const MultiDispatchInfo &dispatchInfo) const;
-
     uint64_t getSliceCount() const { return sliceCount; }
 
     TimestampPacketContainer *getDeferredTimestampPackets() const { return deferredTimestampPackets.get(); }
@@ -371,8 +404,49 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     uint64_t dispatchHints = 0;
 
     bool isTextureCacheFlushNeeded(uint32_t commandType) const;
+    bool isDirectSubmissionImageCacheFlushNeeded(uint32_t commandType) const;
 
     const std::array<CopyEngineState, bcsInfoMaskSize> &peekActiveBcsStates() const { return bcsStates; }
+
+    void handlePostCompletionOperations(bool checkQueueCompletion);
+
+    bool getHeaplessModeEnabled() const { return this->heaplessModeEnabled; }
+    bool isPostSyncRequiredForAllWalkers() const { return this->postSyncRequiredForAllWalkers; }
+    BuiltIn::AddressingMode getDefaultBuiltInMode() const { return this->defaultBuiltInMode; }
+
+    bool isBcsSplitInitialized() const { return this->bcsSplitInitialized; }
+    bool isBcs() const { return isCopyOnly; };
+
+    cl_int enqueueStagingBufferMemcpy(cl_bool blockingCopy, void *dstPtr, const void *srcPtr, size_t size, cl_event *event);
+    cl_int enqueueStagingImageTransfer(cl_command_type commandType, Image *dstImage, cl_bool blockingCopy, const size_t *globalOrigin, const size_t *globalRegion,
+                                       size_t inputRowPitch, size_t inputSlicePitch, const void *ptr, cl_event *event);
+    cl_int enqueueStagingBufferTransfer(cl_command_type commandType, Buffer *buffer, cl_bool blockingCopy, size_t offset, size_t size, const void *ptr, cl_event *event);
+
+    bool isValidForStagingBufferCopy(Device &device, void *dstPtr, const void *srcPtr, size_t size, bool hasDependencies);
+    bool isValidForStagingTransfer(MemObj *memObj, const void *ptr, size_t size, cl_command_type commandType, bool isBlocking, bool hasDependencies);
+
+    size_t calculateHostPtrSizeForImage(const size_t *region, size_t rowPitch, size_t slicePitch, Image *image) const;
+
+    bool isCacheFlushForImageRequired(cl_int cmdType) const {
+        return this->isCacheFlushOnNextBcsWriteRequired && this->isImageWriteOperation(cmdType);
+    }
+
+    void registerWalkerWithProfilingEnqueued(Event *event);
+    bool getAndClearIsWalkerWithProfilingEnqueued() {
+        bool retVal = this->isWalkerWithProfilingEnqueued;
+        this->isWalkerWithProfilingEnqueued = false;
+        return retVal;
+    }
+
+    bool waitOnDestructionNeeded() const;
+
+    bool getPendingL3FlushForHostVisibleResources() const {
+        return pendingL3FlushForHostVisibleResources;
+    }
+
+    void setPendingL3FlushForHostVisibleResources(bool newValue) {
+        pendingL3FlushForHostVisibleResources = newValue;
+    }
 
   protected:
     void *enqueueReadMemObjForMap(TransferProperties &transferProperties, EventsRequest &eventsRequest, cl_int &errcodeRet);
@@ -381,19 +455,22 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     void *enqueueMapMemObject(TransferProperties &transferProperties, EventsRequest &eventsRequest, cl_int &errcodeRet);
     cl_int enqueueUnmapMemObject(TransferProperties &transferProperties, EventsRequest &eventsRequest);
 
-    virtual void obtainTaskLevelAndBlockedStatus(TaskCountType &taskLevel, cl_uint &numEventsInWaitList, const cl_event *&eventWaitList, bool &blockQueueStatus, unsigned int commandType){};
+    virtual void obtainTaskLevelAndBlockedStatus(TaskCountType &taskLevel, cl_uint &numEventsInWaitList, const cl_event *&eventWaitList, bool &blockQueueStatus, unsigned int commandType) {};
     bool isBlockedCommandStreamRequired(uint32_t commandType, const EventsRequest &eventsRequest, bool blockedQueue, bool isMarkerWithProfiling) const;
+
+    bool isDependenciesFlushForMarkerRequired(const EventsRequest &eventsRequest) const;
 
     MOCKABLE_VIRTUAL void obtainNewTimestampPacketNodes(size_t numberOfNodes, TimestampPacketContainer &previousNodes, bool clearAllDependencies, CommandStreamReceiver &csr);
     void storeProperties(const cl_queue_properties *properties);
     void processProperties(const cl_queue_properties *properties);
     void overrideEngine(aub_stream::EngineType engineType, EngineUsage engineUsage);
+    void releaseGpgpuQueueOwnership();
     bool bufferCpuCopyAllowed(Buffer *buffer, cl_command_type commandType, cl_bool blocking, size_t size, void *ptr,
                               cl_uint numEventsInWaitList, const cl_event *eventWaitList);
     void providePerformanceHint(TransferProperties &transferProperties);
     bool queueDependenciesClearRequired() const;
     bool blitEnqueueAllowed(const CsrSelectionArgs &args) const;
-    MOCKABLE_VIRTUAL bool migrateMultiGraphicsAllocationsIfRequired(const BuiltinOpParams &operationParams, CommandStreamReceiver &csr);
+    MOCKABLE_VIRTUAL bool migrateMultiGraphicsAllocationsIfRequired(const BuiltIn::OpParams &operationParams, CommandStreamReceiver &csr);
 
     inline bool shouldFlushDC(uint32_t commandType, PrintfHandler *printfHandler) const {
         return (commandType == CL_COMMAND_READ_BUFFER ||
@@ -401,19 +478,46 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
                 commandType == CL_COMMAND_READ_IMAGE ||
                 commandType == CL_COMMAND_SVM_MAP ||
                 printfHandler ||
-                isTextureCacheFlushNeeded(commandType));
+                isDirectSubmissionImageCacheFlushNeeded(commandType));
+    }
+
+    bool isImageWriteOperation(cl_command_type commandType) const {
+        switch (commandType) {
+        case CL_COMMAND_WRITE_IMAGE:
+        case CL_COMMAND_COPY_IMAGE:
+        case CL_COMMAND_FILL_IMAGE:
+        case CL_COMMAND_COPY_BUFFER_TO_IMAGE:
+            return true;
+        default:
+            return false;
+        }
     }
 
     MOCKABLE_VIRTUAL bool blitEnqueueImageAllowed(const size_t *origin, const size_t *region, const Image &image) const;
+    static void overrideBuiltinForImage1dBufferWithParentBuffer(BuiltIn::OpParams &operationParams, BuiltIn::BuiltInId &builtIn, bool imageIsSource);
     void aubCaptureHook(bool &blocking, bool &clearAllDependencies, const MultiDispatchInfo &multiDispatchInfo);
-    virtual bool obtainTimestampPacketForCacheFlush(bool isCacheFlushRequired) const = 0;
     void assignDataToOverwrittenBcsNode(TagNodeBase *node);
+
+    void registerGpgpuCsrClient();
+    void registerBcsCsrClient(CommandStreamReceiver &bcsCsr);
+
+    void unregisterGpgpuCsrClient();
+    void unregisterBcsCsrClient(CommandStreamReceiver &bcsCsr);
+
+    void unregisterGpgpuAndBcsCsrClients();
+
+    cl_int postStagingTransferSync(const StagingTransferStatus &status, cl_event *event, const cl_event profilingEvent, bool isSingleTransfer, bool isBlocking, cl_command_type commandType);
+    cl_event *assignEventForStaging(cl_event *userEvent, cl_event *profilingEvent, bool isFirstTransfer, bool isLastTransfer) const;
 
     Context *context = nullptr;
     ClDevice *device = nullptr;
     mutable EngineControl *gpgpuEngine = nullptr;
+    mutable bool gpgpuQueueOwnershipTaken = false;
     std::array<EngineControl *, bcsInfoMaskSize> bcsEngines = {};
+    std::array<bool, bcsInfoMaskSize> bcsQueueOwnershipTaken = {};
     std::optional<aub_stream::EngineType> bcsQueueEngineType{};
+    std::mutex bcsInitMutex;
+    size_t bcsEngineCount = bcsInfoMaskSize;
 
     cl_command_queue_properties commandQueueProperties = 0;
     std::vector<uint64_t> propertiesVector;
@@ -421,30 +525,19 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
     cl_command_queue_capabilities_intel queueCapabilities = CL_QUEUE_DEFAULT_CAPABILITIES_INTEL;
     cl_uint queueFamilyIndex = 0;
     cl_uint queueIndexWithinFamily = 0;
-    bool queueFamilySelected = false;
 
-    QueuePriority priority = QueuePriority::MEDIUM;
+    QueuePriority priority = QueuePriority::medium;
     QueueThrottle throttle = QueueThrottle::MEDIUM;
-    EnqueueProperties::Operation latestSentEnqueueType = EnqueueProperties::Operation::None;
+    EnqueueProperties::Operation latestSentEnqueueType = EnqueueProperties::Operation::none;
     uint64_t sliceCount = QueueSliceCount::defaultSliceCount;
     std::array<CopyEngineState, bcsInfoMaskSize> bcsStates = {};
 
-    bool perfCountersEnabled = false;
-    bool isInternalUsage = false;
-    bool isCopyOnly = false;
-    bool bcsAllowed = false;
-    bool bcsInitialized = false;
-
-    bool bcsSplitInitialized = false;
     BcsInfoMask splitEngines = EngineHelpers::oddLinkedCopyEnginesMask;
     BcsInfoMask h2dEngines = NEO::EngineHelpers::h2dCopyEngineMask;
     BcsInfoMask d2hEngines = NEO::EngineHelpers::d2hCopyEngineMask;
     size_t minimalSizeForBcsSplit = 16 * MemoryConstants::megaByte;
 
     LinearStream *commandStream = nullptr;
-
-    bool isSpecialCommandQueue = false;
-    bool requiresCacheFlushAfterWalker = false;
 
     std::unique_ptr<TimestampPacketContainer> deferredTimestampPackets;
     std::unique_ptr<TimestampPacketContainer> deferredMultiRootSyncNodes;
@@ -455,15 +548,39 @@ class CommandQueue : public BaseObject<_cl_command_queue> {
         TimestampPacketContainer lastSignalledPacket;
     };
     std::array<BcsTimestampPacketContainers, bcsInfoMaskSize> bcsTimestampPacketContainers;
+
+    bool perfCountersEnabled = false;
+    bool isInternalUsage = false;
+    bool isCopyOnly = false;
+    bool bcsAllowed = false;
+    bool bcsInitialized = false;
+    bool isSpecialCommandQueue = false;
+    bool bcsSplitInitialized = false;
+    bool queueFamilySelected = false;
     bool stallingCommandsOnNextFlushRequired = false;
+    bool dcFlushRequiredOnStallingCommandsOnNextFlush = false;
+    bool isCacheFlushOnNextBcsWriteRequired = false;
     bool splitBarrierRequired = false;
+    bool gpgpuCsrClientRegistered = false;
+    bool heaplessModeEnabled = false;
+    bool isForceStateless = false;
+    BuiltIn::AddressingMode defaultBuiltInMode;
+    bool l3FlushAfterPostSyncEnabled = false;
+    bool isWalkerWithProfilingEnqueued = false;
+    bool shouldRegisterEnqueuedWalkerWithProfiling = false;
+    bool pendingL3FlushForHostVisibleResources = false;
+    bool isBarrierForImplicitDependenciesAllowed = false;
+    bool isWalkerPostSyncSkipEnabled = false;
+    bool postSyncRequiredForAllWalkers = false;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<CommandQueue>);
 
 template <typename PtrType>
 PtrType CommandQueue::convertAddressWithOffsetToGpuVa(PtrType ptr, InternalMemoryType memoryType, GraphicsAllocation &allocation) {
     // If this is device or shared USM pointer, it is already a gpuVA and we don't have to do anything.
     // Otherwise, we assume this is a cpuVA and we have to convert to gpuVA, while preserving offset from allocation start.
-    const bool isCpuPtr = (memoryType != DEVICE_UNIFIED_MEMORY) && (memoryType != SHARED_UNIFIED_MEMORY);
+    const bool isCpuPtr = (memoryType != InternalMemoryType::deviceUnifiedMemory) && (memoryType != InternalMemoryType::sharedUnifiedMemory);
     if (isCpuPtr) {
         size_t dstOffset = ptrDiff(ptr, allocation.getUnderlyingBuffer());
         ptr = reinterpret_cast<PtrType>(allocation.getGpuAddress() + dstOffset);
@@ -471,6 +588,6 @@ PtrType CommandQueue::convertAddressWithOffsetToGpuVa(PtrType ptr, InternalMemor
     return ptr;
 }
 
-using CommandQueueCreateFunc = CommandQueue *(*)(Context *context, ClDevice *device, const cl_queue_properties *properties, bool internalUsage);
+using CommandQueueCreateFunc = CommandQueue *(*)(Context * context, ClDevice *device, const cl_queue_properties *properties, bool internalUsage);
 
 } // namespace NEO

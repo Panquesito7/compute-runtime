@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,17 +8,17 @@
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_io_functions.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 #include "level_zero/tools/test/unit_tests/sources/metrics/mock_metric_oa.h"
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-
-using ::testing::_;
-using ::testing::Return;
 
 namespace NEO {
 namespace SysCalls {
@@ -35,7 +35,7 @@ class MetricQueryPoolLinuxTest : public MetricContextFixture,
     void SetUp() override {
         MetricContextFixture::setUp();
         neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-        auto &osInterface = device->getOsInterface();
+        auto &osInterface = *device->getOsInterface();
         osInterface.setDriverModel(std::make_unique<DrmMock>(const_cast<NEO::RootDeviceEnvironment &>(neoDevice->getRootDeviceEnvironment())));
     }
 
@@ -59,10 +59,53 @@ TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenGetContextDataIsCalled
 
     EXPECT_EQ(mockMetricsLibrary->metricsLibraryGetContextData(*device, contextData), true);
 
-    auto &osInterface = device->getOsInterface();
+    auto &osInterface = *device->getOsInterface();
 
     EXPECT_EQ(contextData.ClientData->Linux.Adapter->DrmFileDescriptor, osInterface.getDriverModel()->as<Drm>()->getFileDescriptor());
     EXPECT_EQ(contextData.ClientData->Linux.Adapter->Type, LinuxAdapterType::DrmFileDescriptor);
+}
+
+TEST_F(MetricQueryPoolLinuxTest, givenValidDeviceHandleWhenFlushCommandBufferCallbackIsCalledThenReturnsSuccess) {
+
+    ClientData_1_0 clientData = {};
+    ContextCreateData_1_0 contextData = {};
+    ClientDataLinuxAdapter_1_0 adapter = {};
+
+    adapter.Type = LinuxAdapterType::Last;
+    adapter.DrmFileDescriptor = -1;
+
+    clientData.Linux.Adapter = &adapter;
+    contextData.ClientData = &clientData;
+    contextData.ClientData->Linux.Adapter = &adapter;
+
+    EXPECT_EQ(mockMetricsLibrary->metricsLibraryGetContextData(*device, contextData), true);
+
+    auto &callback = mockMetricsLibrary->metricsLibraryGetCallbacks().CommandBufferFlush;
+
+    EXPECT_NE(callback, nullptr);
+    EXPECT_EQ(callback(clientData.Handle), StatusCode::Success);
+}
+
+TEST_F(MetricQueryPoolLinuxTest, givenInvalidDeviceHandleWhenFlushCommandBufferCallbackIsCalledThenReturnsFailed) {
+
+    ClientData_1_0 clientData = {};
+    ContextCreateData_1_0 contextData = {};
+    ClientDataLinuxAdapter_1_0 adapter = {};
+
+    adapter.Type = LinuxAdapterType::Last;
+    adapter.DrmFileDescriptor = -1;
+
+    clientData.Linux.Adapter = &adapter;
+    contextData.ClientData = &clientData;
+    contextData.ClientData->Linux.Adapter = &adapter;
+
+    EXPECT_EQ(mockMetricsLibrary->metricsLibraryGetContextData(*device, contextData), true);
+
+    auto &callback = mockMetricsLibrary->metricsLibraryGetCallbacks().CommandBufferFlush;
+    clientData.Handle.data = nullptr;
+
+    EXPECT_NE(callback, nullptr);
+    EXPECT_EQ(callback(clientData.Handle), StatusCode::Failed);
 }
 
 TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenActivateConfigurationIsCalledThenReturnsSuccess) {
@@ -71,8 +114,7 @@ TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenActivateConfigurationI
     dummyConfigurationHandle.data = &dummyConfigurationHandle;
     mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
 
-    EXPECT_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationActivate(_, _))
-        .WillOnce(Return(StatusCode::Success));
+    mockMetricsLibrary->g_mockApi->configurationActivationCounter = 1;
     EXPECT_TRUE(mockMetricsLibrary->activateConfiguration(dummyConfigurationHandle));
 }
 
@@ -82,9 +124,30 @@ TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenActivateConfigurationI
     dummyConfigurationHandle.data = &dummyConfigurationHandle;
     mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
 
-    EXPECT_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationActivate(_, _))
-        .WillOnce(Return(StatusCode::Failed));
+    mockMetricsLibrary->g_mockApi->configurationActivationCounter = 1;
+    mockMetricsLibrary->g_mockApi->configurationActivateResult = StatusCode::Failed;
     EXPECT_FALSE(mockMetricsLibrary->activateConfiguration(dummyConfigurationHandle));
+}
+
+TEST_F(MetricQueryPoolLinuxTest, givenErrorLogsEnabledAndMetricLibraryActivateFailsWhenActivateConfigurationIsCalledThenErrorWithStatusCodeIsPrinted) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.PrintL0MetricLogs.set(METRICS_LOG_BITMASK::LOG_ERROR);
+
+    ConfigurationHandle_1_0 dummyConfigurationHandle;
+    dummyConfigurationHandle.data = &dummyConfigurationHandle;
+    mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
+
+    mockMetricsLibrary->g_mockApi->configurationActivationCounter = 1;
+    mockMetricsLibrary->g_mockApi->configurationActivateResult = StatusCode::Failed;
+
+    StreamCapture capture;
+    capture.captureStderr();
+    const bool result = mockMetricsLibrary->activateConfiguration(dummyConfigurationHandle);
+    const std::string errorLog = capture.getCapturedStderr();
+
+    EXPECT_FALSE(result);
+    const std::string expectedMessage = "MDAPI ConfigurationActivate failed with status code: " + std::to_string(static_cast<int>(StatusCode::Failed));
+    EXPECT_NE(errorLog.find(expectedMessage), std::string::npos);
 }
 
 TEST_F(MetricQueryPoolLinuxTest, givenInCorrectConfigurationWhenActivateConfigurationIsCalledThenReturnsFail) {
@@ -93,8 +156,6 @@ TEST_F(MetricQueryPoolLinuxTest, givenInCorrectConfigurationWhenActivateConfigur
     dummyConfigurationHandle.data = nullptr;
     mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
 
-    ON_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationActivate(_, _))
-        .WillByDefault(Return(StatusCode::Success));
     EXPECT_FALSE(mockMetricsLibrary->activateConfiguration(dummyConfigurationHandle));
 }
 
@@ -104,8 +165,7 @@ TEST_F(MetricQueryPoolLinuxTest, givenMetricLibraryIsInIncorrectInitializedState
     dummyConfigurationHandle.data = &dummyConfigurationHandle;
     mockMetricsLibrary->initializationState = ZE_RESULT_ERROR_UNKNOWN;
 
-    ON_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationActivate(_, _))
-        .WillByDefault(Return(StatusCode::Success));
+    mockMetricsLibrary->g_mockApi->configurationActivationCounter = 1;
     EXPECT_FALSE(mockMetricsLibrary->activateConfiguration(dummyConfigurationHandle));
 }
 
@@ -115,8 +175,7 @@ TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenDeActivateConfiguratio
     dummyConfigurationHandle.data = &dummyConfigurationHandle;
     mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
 
-    EXPECT_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationDeactivate(_))
-        .WillOnce(Return(StatusCode::Success));
+    mockMetricsLibrary->g_mockApi->configurationDeactivationCounter = 1;
     EXPECT_TRUE(mockMetricsLibrary->deactivateConfiguration(dummyConfigurationHandle));
 }
 
@@ -126,9 +185,30 @@ TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenDeActivateConfiguratio
     dummyConfigurationHandle.data = &dummyConfigurationHandle;
     mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
 
-    EXPECT_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationDeactivate(_))
-        .WillOnce(Return(StatusCode::Failed));
+    mockMetricsLibrary->g_mockApi->configurationDeactivationCounter = 1;
+    mockMetricsLibrary->g_mockApi->configurationDeactivateResult = StatusCode::Failed;
     EXPECT_FALSE(mockMetricsLibrary->deactivateConfiguration(dummyConfigurationHandle));
+}
+
+TEST_F(MetricQueryPoolLinuxTest, givenErrorLogsEnabledAndMetricLibraryDeactivateFailsWhenDeactivateConfigurationIsCalledThenErrorWithStatusCodeIsPrinted) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.PrintL0MetricLogs.set(METRICS_LOG_BITMASK::LOG_ERROR);
+
+    ConfigurationHandle_1_0 dummyConfigurationHandle;
+    dummyConfigurationHandle.data = &dummyConfigurationHandle;
+    mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
+
+    mockMetricsLibrary->g_mockApi->configurationDeactivationCounter = 1;
+    mockMetricsLibrary->g_mockApi->configurationDeactivateResult = StatusCode::Failed;
+
+    StreamCapture capture;
+    capture.captureStderr();
+    const bool result = mockMetricsLibrary->deactivateConfiguration(dummyConfigurationHandle);
+    const std::string errorLog = capture.getCapturedStderr();
+
+    EXPECT_FALSE(result);
+    const std::string expectedMessage = "MDAPI ConfigurationDeactivate failed with status code: " + std::to_string(static_cast<int>(StatusCode::Failed));
+    EXPECT_NE(errorLog.find(expectedMessage), std::string::npos);
 }
 
 TEST_F(MetricQueryPoolLinuxTest, givenInCorrectConfigurationWhenDeActivateConfigurationIsCalledThenReturnsFail) {
@@ -136,9 +216,7 @@ TEST_F(MetricQueryPoolLinuxTest, givenInCorrectConfigurationWhenDeActivateConfig
     ConfigurationHandle_1_0 dummyConfigurationHandle;
     dummyConfigurationHandle.data = nullptr;
     mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
-
-    ON_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationDeactivate(_))
-        .WillByDefault(Return(StatusCode::Success));
+    mockMetricsLibrary->g_mockApi->configurationDeactivationCounter = 1;
     EXPECT_FALSE(mockMetricsLibrary->deactivateConfiguration(dummyConfigurationHandle));
 }
 
@@ -148,42 +226,44 @@ TEST_F(MetricQueryPoolLinuxTest, givenMetricLibraryIsInIncorrectInitializedState
     dummyConfigurationHandle.data = &dummyConfigurationHandle;
     mockMetricsLibrary->initializationState = ZE_RESULT_ERROR_UNKNOWN;
 
-    ON_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationDeactivate(_))
-        .WillByDefault(Return(StatusCode::Success));
     EXPECT_FALSE(mockMetricsLibrary->deactivateConfiguration(dummyConfigurationHandle));
 }
 
 TEST_F(MetricQueryPoolLinuxTest, givenCorrectArgumentsWhenCacheConfigurationIsCalledThenCacheingIsSuccessfull) {
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup0;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.SymbolName = "OA";
     metricsConcurrentGroupParams.MetricSetsCount = 1;
-    Mock<MetricsDiscovery::IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
+
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    Mock<MetricsDiscovery::IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     openMetricsAdapter();
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .WillOnce(Return(&metricsConcurrentGroup0));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup0, GetParams())
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
 
-    EXPECT_CALL(metricsConcurrentGroup0, GetMetricSet(_))
-        .WillRepeatedly(Return(&metricsSet));
-
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(*mockMetricsLibrary->g_mockApi, MockConfigurationDelete(_))
-        .WillOnce(Return(StatusCode::Success));
+    metricsSet.GetParamsResult = &metricsSetParams;
 
     uint32_t metricGroupCount = 0;
     EXPECT_EQ(zetMetricGroupGet(device->toHandle(), &metricGroupCount, nullptr), ZE_RESULT_SUCCESS);
@@ -212,7 +292,7 @@ class MetricEnumerationTestLinux : public MetricContextFixture,
     void SetUp() override {
         MetricContextFixture::setUp();
         neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-        auto &osInterface = device->getOsInterface();
+        auto &osInterface = *device->getOsInterface();
         osInterface.setDriverModel(std::make_unique<DrmMock>(const_cast<NEO::RootDeviceEnvironment &>(neoDevice->getRootDeviceEnvironment())));
     }
 
@@ -235,23 +315,14 @@ TEST_F(MetricEnumerationTestLinux, givenCorrectLinuxDrmAdapterWhenGetMetricsAdap
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .Times(1)
-        .WillOnce(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
-
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(adapterParams.SystemId.MajorMinor.Major), ::testing::SetArgReferee<1>(adapterParams.SystemId.MajorMinor.Minor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
+    mockMetricEnumeration->getAdapterIdOutMajor = adapterParams.SystemId.MajorMinor.Major;
+    mockMetricEnumeration->getAdapterIdOutMinor = adapterParams.SystemId.MajorMinor.Minor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
     EXPECT_EQ(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
@@ -276,22 +347,14 @@ TEST_F(MetricEnumerationTestLinux, givenCorrectLinuxMinorPrimaryNodeDrmAdapterWh
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .WillRepeatedly(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
-
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(drmMajor), ::testing::SetArgReferee<1>(drmMinor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
+    mockMetricEnumeration->getAdapterIdOutMajor = drmMajor;
+    mockMetricEnumeration->getAdapterIdOutMinor = drmMinor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
     EXPECT_EQ(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
@@ -316,22 +379,14 @@ TEST_F(MetricEnumerationTestLinux, givenCorrectLinuxMinorRenderNodeDrmAdapterWhe
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .WillRepeatedly(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
-
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(drmMajor), ::testing::SetArgReferee<1>(drmMinor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
+    mockMetricEnumeration->getAdapterIdOutMajor = drmMajor;
+    mockMetricEnumeration->getAdapterIdOutMinor = drmMinor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
     EXPECT_EQ(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
@@ -346,31 +401,16 @@ TEST_F(MetricEnumerationTestLinux, givenIcorrectMetricDiscoveryAdapterTypeWhenGe
     adapterParams.SystemId.MajorMinor.Major = 0;
     adapterParams.SystemId.MajorMinor.Minor = 0;
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .Times(1)
-        .WillOnce(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
-
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(adapterParams.SystemId.MajorMinor.Major), ::testing::SetArgReferee<1>(adapterParams.SystemId.MajorMinor.Minor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    mockMetricEnumeration->getAdapterIdOutMajor = adapterParams.SystemId.MajorMinor.Major;
+    mockMetricEnumeration->getAdapterIdOutMinor = adapterParams.SystemId.MajorMinor.Minor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
@@ -390,31 +430,16 @@ TEST_F(MetricEnumerationTestLinux, givenIcorrectMetricDiscoveryAdapterMajorWhenG
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .Times(1)
-        .WillOnce(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
-
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(incorrectMajor), ::testing::SetArgReferee<1>(adapterParams.SystemId.MajorMinor.Minor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    mockMetricEnumeration->getAdapterIdOutMajor = incorrectMajor;
+    mockMetricEnumeration->getAdapterIdOutMinor = adapterParams.SystemId.MajorMinor.Minor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
     EXPECT_NE(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
@@ -432,36 +457,21 @@ TEST_F(MetricEnumerationTestLinux, givenIcorrectMetricDiscoveryAdapterMinorWhenG
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .Times(1)
-        .WillOnce(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
-
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(adapterParams.SystemId.MajorMinor.Major), ::testing::SetArgReferee<1>(incorrectMinor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    mockMetricEnumeration->getAdapterIdOutMajor = adapterParams.SystemId.MajorMinor.Major;
+    mockMetricEnumeration->getAdapterIdOutMinor = incorrectMinor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
     EXPECT_NE(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
 
-TEST_F(MetricEnumerationTestLinux, givenIcorrectOpenMetricDeviceOnAdapterWhenGetMetricsAdapterThenReturnFail) {
+TEST_F(MetricEnumerationTestLinux, givenIncorrectOpenMetricDeviceOnAdapterWhenGetMetricsAdapterThenReturnFail) {
 
     auto adapterGroupParams = TAdapterGroupParams_1_6{};
     auto adapterParams = TAdapterParams_1_9{};
@@ -473,35 +483,18 @@ TEST_F(MetricEnumerationTestLinux, givenIcorrectOpenMetricDeviceOnAdapterWhenGet
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
 
-    EXPECT_CALL(adapterGroup, GetParams())
-        .Times(1)
-        .WillOnce(Return(&adapterGroupParams));
+    adapterGroup.GetParamsResult = &adapterGroupParams;
+    adapterGroup.GetAdapterResult = &adapter;
 
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .WillRepeatedly(Return(&adapter));
+    adapter.GetParamsResult = &adapterParams;
 
-    EXPECT_CALL(adapter, GetParams())
-        .WillRepeatedly(Return(&adapterParams));
+    mockMetricEnumeration->getAdapterIdOutMajor = adapterParams.SystemId.MajorMinor.Major;
+    mockMetricEnumeration->getAdapterIdOutMinor = adapterParams.SystemId.MajorMinor.Minor;
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
-    EXPECT_CALL(*mockMetricEnumeration, getAdapterId(_, _))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgReferee<0>(adapterParams.SystemId.MajorMinor.Major), ::testing::SetArgReferee<1>(adapterParams.SystemId.MajorMinor.Minor), Return(true)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce([&]() { return mockMetricEnumeration->baseGetMetricsAdapter(); });
-
-    EXPECT_CALL(adapter, OpenMetricsDevice(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(nullptr), Return(TCompletionCode::CC_ERROR_GENERAL)));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    adapter.openMetricsDeviceResult = TCompletionCode::CC_ERROR_GENERAL;
 
     EXPECT_NE(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
@@ -514,7 +507,8 @@ TEST_F(MetricEnumerationTestLinux, givenCorrectDrmFileForFstatWhenGetMetricsAdap
     VariableBackup<int> fstatBackup(&NEO::SysCalls::fstatFuncRetVal);
     NEO::SysCalls::fstatFuncRetVal = 0;
 
-    EXPECT_EQ(mockMetricEnumeration->baseGetAdapterId(drmMajor, drmMinor), true);
+    mockMetricEnumeration->getAdapterIdCallBase = true;
+    EXPECT_EQ(mockMetricEnumeration->getAdapterId(drmMajor, drmMinor), true);
 }
 
 TEST_F(MetricEnumerationTestLinux, givenIncorrectDrmFileForFstatWhenGetMetricsAdapterThenReturnFail) {
@@ -525,7 +519,8 @@ TEST_F(MetricEnumerationTestLinux, givenIncorrectDrmFileForFstatWhenGetMetricsAd
     VariableBackup<int> fstatBackup(&NEO::SysCalls::fstatFuncRetVal);
     NEO::SysCalls::fstatFuncRetVal = -1;
 
-    EXPECT_EQ(mockMetricEnumeration->baseGetAdapterId(drmMajor, drmMinor), false);
+    mockMetricEnumeration->getAdapterIdCallBase = true;
+    EXPECT_EQ(mockMetricEnumeration->getAdapterId(drmMajor, drmMinor), false);
 }
 
 } // namespace ult

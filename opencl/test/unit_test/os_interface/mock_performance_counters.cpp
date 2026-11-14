@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,6 @@
 
 #include "mock_performance_counters.h"
 
-#include "shared/source/execution_environment/root_device_environment.h"
-#include "shared/source/os_interface/os_interface.h"
 #include "shared/source/utilities/perf_counter.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 
@@ -95,10 +93,10 @@ uint32_t MockMetricsLibrary::hwCountersGetGpuReportSize() {
 // MockMetricsLibrary::commandBufferGet
 //////////////////////////////////////////////////////
 bool MockMetricsLibrary::commandBufferGet(CommandBufferData_1_0 &data) {
-    MI_REPORT_PERF_COUNT mirpc = {};
-    mirpc.init();
+    const uint32_t noop = 0;
     DEBUG_BREAK_IF(data.Data == nullptr);
-    memcpy(data.Data, &mirpc, sizeof(mirpc));
+    memcpy(data.Data, &noop, sizeof(noop));
+    commandBufferGetCalls.push_back(data);
     return true;
 }
 
@@ -106,7 +104,7 @@ bool MockMetricsLibrary::commandBufferGet(CommandBufferData_1_0 &data) {
 // MockMetricsLibrary::commandBufferGetSize
 //////////////////////////////////////////////////////
 bool MockMetricsLibrary::commandBufferGetSize(const CommandBufferData_1_0 &commandBufferData, CommandBufferSize_1_0 &commandBufferSize) {
-    commandBufferSize.GpuMemorySize = sizeof(MI_REPORT_PERF_COUNT);
+    commandBufferSize.GpuMemorySize = sizeof(uint32_t);
     return true;
 }
 
@@ -132,6 +130,13 @@ void *MockMetricsLibraryDll::getProcAddress(const std::string &procName) {
 //////////////////////////////////////////////////////
 bool MockMetricsLibraryDll::isLoaded() {
     return validIsLoaded;
+}
+
+//////////////////////////////////////////////////////
+// MockMetricsLibrary::getFullPath
+//////////////////////////////////////////////////////
+std::string MockMetricsLibraryDll::getFullPath() {
+    return std::string();
 }
 
 //////////////////////////////////////////////////////
@@ -325,7 +330,7 @@ StatusCode MockMetricsLibraryValidInterface::getData(GetReportData_1_0 *data) {
 //////////////////////////////////////////////////////
 void PerformanceCountersDeviceFixture::setUp() {
     createFunc = Device::createPerformanceCountersFunc;
-    Device::createPerformanceCountersFunc = [](Device *) { return MockPerformanceCounters::create(); };
+    Device::createPerformanceCountersFunc = [](Device *) -> std::unique_ptr<PerformanceCounters> { return MockPerformanceCounters::create(); };
 }
 
 //////////////////////////////////////////////////////
@@ -354,8 +359,6 @@ void PerformanceCountersMetricsLibraryFixture::tearDown() {
 //////////////////////////////////////////////////////
 PerformanceCountersFixture::PerformanceCountersFixture() {
     executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    rootDeviceEnvironment = std::make_unique<RootDeviceEnvironment>(*executionEnvironment);
-    rootDeviceEnvironment->setHwInfoAndInitHelpers(defaultHwInfo.get());
 }
 
 //////////////////////////////////////////////////////
@@ -397,8 +400,7 @@ PerformanceCounters *PerformanceCountersMetricsLibraryFixture::initDeviceWithPer
 
     EXPECT_NE(metricsLibraryInterface->api, nullptr);
 
-    auto rawPerformanceCounters = performanceCounters.get();
     device->setPerfCounters(std::move(performanceCounters));
-    return rawPerformanceCounters;
+    return device->getPerformanceCounters();
 }
 } // namespace NEO

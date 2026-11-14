@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/os_interface/driver_info.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <functional>
 #include <memory>
@@ -17,17 +18,14 @@ namespace NEO {
 
 class SettingsReader;
 
-bool isCompatibleDriverStore(std::string &&deviceRegistryPath);
-
 class DriverInfoWindows : public DriverInfo {
   public:
-    static constexpr DriverInfoType driverInfoType = DriverInfoType::WINDOWS;
+    static constexpr DriverInfoType driverInfoType = DriverInfoType::windowsType;
 
     DriverInfoWindows(const std::string &path, const PhysicalDevicePciBusInfo &pciBusInfo);
     ~DriverInfoWindows() override;
     std::string getDeviceName(std::string defaultName) override;
     std::string getVersion(std::string defaultVersion) override;
-    bool isCompatibleDriverStore() const;
     MOCKABLE_VIRTUAL bool containsSetting(const char *setting);
     static std::function<std::unique_ptr<SettingsReader>(const std::string &registryPath)> createRegistryReaderFunc;
 

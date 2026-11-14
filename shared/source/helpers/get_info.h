@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,29 +22,29 @@ inline GetInfoStatus getInfo(void *destParamValue, size_t destParamValueSize,
 
     if (srcParamValueSize == 0) {
         // Report ok if there is nothing to copy.
-        return GetInfoStatus::SUCCESS;
+        return GetInfoStatus::success;
     }
 
     if ((srcParamValue == nullptr) || (srcParamValueSize == invalidSourceSize)) {
-        return GetInfoStatus::INVALID_VALUE;
+        return GetInfoStatus::invalidValue;
     }
 
     if (destParamValue == nullptr) {
         // Report ok if only size is queried.
-        return GetInfoStatus::SUCCESS;
+        return GetInfoStatus::success;
     }
 
     if (destParamValueSize < srcParamValueSize) {
-        return GetInfoStatus::INVALID_VALUE;
+        return GetInfoStatus::invalidValue;
     }
 
     // Report ok if we can copy safely.
     memcpy_s(destParamValue, destParamValueSize, srcParamValue, srcParamValueSize);
-    return GetInfoStatus::SUCCESS;
+    return GetInfoStatus::success;
 }
 
 inline void setParamValueReturnSize(size_t *paramValueSizeRet, size_t newValue, GetInfoStatus getInfoStatus) {
-    if ((paramValueSizeRet != nullptr) && (getInfoStatus == GetInfoStatus::SUCCESS)) {
+    if ((paramValueSizeRet != nullptr) && (getInfoStatus == GetInfoStatus::success)) {
         *paramValueSizeRet = newValue;
     }
 }
@@ -58,7 +58,7 @@ struct GetInfoHelper {
 
     template <typename DataType>
     GetInfoStatus set(const DataType &val) {
-        auto errCode = GetInfoStatus::SUCCESS;
+        auto errCode = GetInfoStatus::success;
         if (retSize != nullptr) {
             *retSize = sizeof(val);
         }
@@ -66,11 +66,12 @@ struct GetInfoHelper {
             if (dstSize >= sizeof(val)) {
                 *reinterpret_cast<DataType *>(dst) = val;
             } else {
-                errCode = GetInfoStatus::INVALID_VALUE;
+                errCode = GetInfoStatus::invalidValue;
             }
         }
-        if (retVal)
+        if (retVal) {
             *retVal = errCode;
+        }
         return errCode;
     }
 

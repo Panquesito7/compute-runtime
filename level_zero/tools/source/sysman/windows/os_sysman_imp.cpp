@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/tools/source/sysman/firmware_util/firmware_util.h"
 #include "level_zero/tools/source/sysman/sysman_imp.h"
@@ -20,8 +21,8 @@ ze_result_t WddmSysmanImp::init() {
     pDevice = Device::fromHandle(pParentSysmanDeviceImp->hCoreDevice);
     UNRECOVERABLE_IF(nullptr == pDevice);
 
-    NEO::OSInterface &OsInterface = pDevice->getOsInterface();
-    auto driverModel = OsInterface.getDriverModel();
+    NEO::OSInterface &osInterface = *pDevice->getOsInterface();
+    auto driverModel = osInterface.getDriverModel();
     if (driverModel) {
         pWddm = driverModel->as<NEO::Wddm>();
     }
@@ -53,6 +54,11 @@ FirmwareUtil *WddmSysmanImp::getFwUtilInterface() {
 Device *WddmSysmanImp::getDeviceHandle() {
     return pDevice;
 }
+
+ze_bool_t WddmSysmanImp::isDriverModelSupported() {
+    return true;
+}
+
 std::vector<ze_device_handle_t> &WddmSysmanImp::getDeviceHandles() {
     return pParentSysmanDeviceImp->deviceHandles;
 }

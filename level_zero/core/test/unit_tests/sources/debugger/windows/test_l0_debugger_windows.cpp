@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 #include "shared/source/os_interface/windows/os_environment_win.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/windows/mock_gdi_interface.h"
 #include "shared/test/common/mocks/windows/mock_wddm_eudebug.h"
@@ -19,6 +20,7 @@
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "level_zero/core/source/device/device.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_driver_handle.h"
 #include "level_zero/core/test/unit_tests/sources/debugger/l0_debugger_fixture.h"
@@ -33,9 +35,12 @@ namespace ult {
 
 struct L0DebuggerWindowsFixture {
     void setUp() {
+        debugManager.flags.ForcePreferredAllocationMethod.set(static_cast<int32_t>(GfxMemoryAllocationMethod::useUmdSystemPtr));
+        debugManager.flags.EnableDeviceUsmAllocationPool.set(0);
+        debugManager.flags.EnableHostUsmAllocationPool.set(0);
         executionEnvironment = new NEO::ExecutionEnvironment;
+        executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
         executionEnvironment->prepareRootDeviceEnvironments(1);
-        executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
         rootDeviceEnvironment = executionEnvironment->rootDeviceEnvironments[0].get();
         auto osEnvironment = new OsEnvironmentWin();
         gdi = new MockGdi();
@@ -55,8 +60,8 @@ struct L0DebuggerWindowsFixture {
 
         NEO::DeviceVector devices;
         devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-        driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
-        driverHandle->enableProgramDebugging = NEO::DebuggingMode::Online;
+        driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
+        driverHandle->enableProgramDebugging = NEO::DebuggingMode::online;
 
         driverHandle->initialize(std::move(devices));
         device = driverHandle->devices[0];
@@ -65,7 +70,8 @@ struct L0DebuggerWindowsFixture {
     void tearDown() {
     }
 
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle;
+    DebugManagerStateRestore restorer;
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle;
     NEO::MockDevice *neoDevice = nullptr;
     L0::Device *device = nullptr;
     WddmEuDebugInterfaceMock *wddm = nullptr;
@@ -78,25 +84,24 @@ using L0DebuggerWindowsTest = Test<L0DebuggerWindowsFixture>;
 
 TEST_F(L0DebuggerWindowsTest, givenProgramDebuggingEnabledWhenDriverHandleIsCreatedThenItAllocatesL0Debugger) {
     EXPECT_NE(nullptr, neoDevice->getDebugger());
-    EXPECT_FALSE(neoDevice->getDebugger()->isLegacy());
-    EXPECT_EQ(nullptr, neoDevice->getSourceLevelDebugger());
 }
 
-TEST_F(L0DebuggerWindowsTest, givenWindowsOSWhenL0DebuggerIsCreatedAddressModeIsSingleSpace) {
+using PlatformsSupportingSbaTracking = IsWithinGfxCore<IGFX_GEN12_CORE, IGFX_XE3_CORE>;
+HWTEST2_F(L0DebuggerWindowsTest, givenWindowsOSWhenL0DebuggerIsCreatedAddressModeIsSingleSpace, PlatformsSupportingSbaTracking) {
     EXPECT_TRUE(device->getL0Debugger()->getSingleAddressSpaceSbaTracking());
 }
 
-HWTEST_F(L0DebuggerWindowsTest, givenDebuggingEnabledAndCommandQueuesAreCreatedAndDestroyedThanDebuggerL0IsNotified) {
+HWTEST_F(L0DebuggerWindowsTest, givenDebuggingEnabledAndCommandQueuesAreCreatedAndDestroyedThenDebuggerL0IsNotified) {
     auto debuggerL0Hw = static_cast<MockDebuggerL0Hw<FamilyType> *>(device->getL0Debugger());
 
     neoDevice->getDefaultEngine().commandStreamReceiver->getOsContext().ensureContextInitialized();
 
     ze_command_queue_desc_t queueDesc = {};
     ze_result_t returnValue;
-    auto commandQueue1 = CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue);
+    auto commandQueue1 = CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue);
     EXPECT_EQ(1u, debuggerL0Hw->commandQueueCreatedCount);
 
-    auto commandQueue2 = CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue);
+    auto commandQueue2 = CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue);
     EXPECT_EQ(2u, debuggerL0Hw->commandQueueCreatedCount);
 
     commandQueue1->destroy();
@@ -106,15 +111,36 @@ HWTEST_F(L0DebuggerWindowsTest, givenDebuggingEnabledAndCommandQueuesAreCreatedA
     EXPECT_EQ(2u, debuggerL0Hw->commandQueueDestroyedCount);
 }
 
+HWTEST_F(L0DebuggerWindowsTest, givenDebuggingEnabledAndImmediateCommandListsAreCreatedAndDestroyedThenDebuggerL0IsNotified) {
+    auto debuggerL0Hw = static_cast<MockDebuggerL0Hw<FamilyType> *>(device->getL0Debugger());
+
+    neoDevice->getDefaultEngine().commandStreamReceiver->getOsContext().ensureContextInitialized();
+
+    ze_command_queue_desc_t queueDesc = {};
+    ze_result_t returnValue;
+    auto engineGroupType = NEO::EngineHelpers::engineTypeToEngineGroupType(neoDevice->getDefaultEngine().osContext->getEngineType());
+    auto commandList1 = CommandList::createImmediate(device, &queueDesc, false, engineGroupType, neoDevice->getDefaultEngine().commandStreamReceiver, returnValue);
+    EXPECT_EQ(1u, debuggerL0Hw->commandQueueCreatedCount);
+
+    auto commandList2 = CommandList::createImmediate(device, &queueDesc, false, engineGroupType, neoDevice->getDefaultEngine().commandStreamReceiver, returnValue);
+    EXPECT_EQ(2u, debuggerL0Hw->commandQueueCreatedCount);
+
+    commandList1->destroy();
+    EXPECT_EQ(1u, debuggerL0Hw->commandQueueDestroyedCount);
+
+    commandList2->destroy();
+    EXPECT_EQ(2u, debuggerL0Hw->commandQueueDestroyedCount);
+}
+
 TEST_F(L0DebuggerWindowsTest, givenAllocateGraphicsMemoryWhenAllocationRegistrationIsRequiredThenAllocationIsRegistered) {
     auto memoryManager = executionEnvironment->memoryManager.get();
 
     EXPECT_LE(3u, wddm->registerAllocationTypeCalled); // At least 1xSBA + 1xMODULE_DEBUG + 1xSTATE_SAVE_AREA during DebuggerL0 init
     uint32_t registerAllocationTypeCalled = wddm->registerAllocationTypeCalled;
-    for (auto allocationType : {AllocationType::DEBUG_CONTEXT_SAVE_AREA,
-                                AllocationType::DEBUG_SBA_TRACKING_BUFFER,
-                                AllocationType::DEBUG_MODULE_AREA,
-                                AllocationType::KERNEL_ISA}) {
+    for (auto allocationType : {AllocationType::debugContextSaveArea,
+                                AllocationType::debugSbaTrackingBuffer,
+                                AllocationType::debugModuleArea,
+                                AllocationType::kernelIsa}) {
         auto wddmAlloc = static_cast<WddmAllocation *>(memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0u, MemoryConstants::pageSize, allocationType}));
         EXPECT_EQ(++registerAllocationTypeCalled, wddm->registerAllocationTypeCalled);
 
@@ -132,7 +158,7 @@ TEST_F(L0DebuggerWindowsTest, givenAllocateGraphicsMemoryWhenAllocationRegistrat
 
     EXPECT_LE(3u, wddm->registerAllocationTypeCalled); // At least 1xSBA + 1xMODULE_DEBUG + 1xSTATE_SAVE_AREA during DebuggerL0 init
     uint32_t registerAllocationTypeCalled = wddm->registerAllocationTypeCalled;
-    auto wddmAlloc = static_cast<WddmAllocation *>(memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0u, MemoryConstants::pageSize, AllocationType::BUFFER}));
+    auto wddmAlloc = static_cast<WddmAllocation *>(memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0u, MemoryConstants::pageSize, AllocationType::buffer}));
     EXPECT_EQ(registerAllocationTypeCalled, wddm->registerAllocationTypeCalled);
     memoryManager->freeGraphicsMemory(wddmAlloc);
 }
@@ -140,34 +166,34 @@ TEST_F(L0DebuggerWindowsTest, givenAllocateGraphicsMemoryWhenAllocationRegistrat
 TEST_F(L0DebuggerWindowsTest, givenDebuggerL0NotifyModuleCreateCalledAndCreateDebugDataEscapeFailedThenModuleCreateNotifyEscapeIsNotCalled) {
     wddm->createDebugDataPassedParam.ntStatus = STATUS_UNSUCCESSFUL;
     auto debugger = static_cast<DebuggerL0 *>(neoDevice->getDebugger());
-    debugger->notifyModuleCreate((void *)0x12345678, 0x1000, 0x80000000);
+    debugger->notifyModuleCreate({reinterpret_cast<const char *>(0x12345678), 0x1000}, 0x80000000);
     EXPECT_EQ(1u, wddm->createDebugDataCalled);
-    EXPECT_EQ(0xDEADDEADu, wddm->createDebugDataPassedParam.param.hElfAddressPtr);
-    EXPECT_EQ(0, wddm->moduleCreateNotifyCalled);
+    EXPECT_EQ_VAL(0xDEADDEADu, wddm->createDebugDataPassedParam.param.hElfAddressPtr);
+    EXPECT_EQ(0u, wddm->moduleCreateNotifyCalled);
 }
 
 TEST_F(L0DebuggerWindowsTest, givenDebuggerL0NotifyModuleCreateCalledAndModuleCreateNotifyEscapeIsFailedThenModuleIsNotRegistered) {
     wddm->moduleCreateNotificationPassedParam.ntStatus = STATUS_UNSUCCESSFUL;
     auto debugger = static_cast<DebuggerL0 *>(neoDevice->getDebugger());
-    debugger->notifyModuleCreate((void *)0x12345678, 0x1000, 0x80000000);
+    debugger->notifyModuleCreate({reinterpret_cast<const char *>(0x12345678), 0x1000}, 0x80000000);
     EXPECT_EQ(1u, wddm->createDebugDataCalled);
-    EXPECT_EQ(0x12345678u, wddm->createDebugDataPassedParam.param.hElfAddressPtr);
+    EXPECT_EQ_VAL(0x12345678u, wddm->createDebugDataPassedParam.param.hElfAddressPtr);
     EXPECT_EQ(1u, wddm->moduleCreateNotifyCalled);
     EXPECT_EQ(0xDEADDEADu, wddm->moduleCreateNotificationPassedParam.param.hElfAddressPtr);
 }
 
 TEST_F(L0DebuggerWindowsTest, givenDebuggerL0NotifyModuleCreateCalledThenCreateDebugDataAndModuleCreateNotifyEscapesAreCalled) {
     auto debugger = static_cast<DebuggerL0 *>(neoDevice->getDebugger());
-    debugger->notifyModuleCreate((void *)0x12345678, 0x1000, 0x80000000);
+    debugger->notifyModuleCreate({reinterpret_cast<const char *>(0x12345678), 0x1000}, 0x80000000);
     EXPECT_EQ(1u, wddm->createDebugDataCalled);
     EXPECT_EQ(ELF_BINARY, wddm->createDebugDataPassedParam.param.DebugDataType);
-    EXPECT_EQ(0x1000, wddm->createDebugDataPassedParam.param.DataSize);
-    EXPECT_EQ(0x12345678u, wddm->createDebugDataPassedParam.param.hElfAddressPtr);
+    EXPECT_EQ(0x1000u, wddm->createDebugDataPassedParam.param.DataSize);
+    EXPECT_EQ_VAL(0x12345678u, wddm->createDebugDataPassedParam.param.hElfAddressPtr);
 
     EXPECT_EQ(1u, wddm->moduleCreateNotifyCalled);
     EXPECT_TRUE(wddm->moduleCreateNotificationPassedParam.param.IsCreate);
-    EXPECT_EQ(0x1000, wddm->moduleCreateNotificationPassedParam.param.Modulesize);
-    EXPECT_EQ(0x12345678u, wddm->moduleCreateNotificationPassedParam.param.hElfAddressPtr);
+    EXPECT_EQ(0x1000u, wddm->moduleCreateNotificationPassedParam.param.Modulesize);
+    EXPECT_EQ_VAL(0x12345678u, wddm->moduleCreateNotificationPassedParam.param.hElfAddressPtr);
     EXPECT_EQ(0x80000000, wddm->moduleCreateNotificationPassedParam.param.LoadAddress);
 }
 
@@ -178,27 +204,28 @@ TEST_F(L0DebuggerWindowsTest, givenDebuggerL0NotifyModuleDestroyCalledThenModule
     EXPECT_EQ(1u, wddm->moduleCreateNotifyCalled);
     EXPECT_FALSE(wddm->moduleCreateNotificationPassedParam.param.IsCreate);
     EXPECT_EQ(0u, wddm->moduleCreateNotificationPassedParam.param.Modulesize);
-    EXPECT_EQ(0ull, wddm->moduleCreateNotificationPassedParam.param.hElfAddressPtr);
-    EXPECT_EQ(0x80000000, wddm->moduleCreateNotificationPassedParam.param.LoadAddress);
+    EXPECT_EQ_VAL(0ull, wddm->moduleCreateNotificationPassedParam.param.hElfAddressPtr);
+    EXPECT_EQ(0x80000000u, wddm->moduleCreateNotificationPassedParam.param.LoadAddress);
 }
 
 TEST_F(L0DebuggerWindowsTest, givenDebuggerL0NotifyModuleDestroyCalledAndModuleDestroyNotifyEscapeIsFailedThenErrorMessageIsPrinted) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.DebuggerLogBitmask.set(255);
+    NEO::debugManager.flags.DebuggerLogBitmask.set(255);
 
-    testing::internal::CaptureStderr();
+    StreamCapture capture;
+    capture.captureStderr();
     wddm->moduleCreateNotificationPassedParam.ntStatus = STATUS_UNSUCCESSFUL;
     auto debugger = static_cast<DebuggerL0 *>(neoDevice->getDebugger());
     debugger->notifyModuleDestroy(0x80000000);
 
     EXPECT_EQ(1u, wddm->moduleCreateNotifyCalled);
-    EXPECT_TRUE(hasSubstr(testing::internal::GetCapturedStderr(), std::string("KM_ESCAPE_EUDBG_UMD_MODULE_DESTROY_NOTIFY: Failed - Status:")));
+    EXPECT_TRUE(hasSubstr(capture.getCapturedStderr(), std::string("KM_ESCAPE_EUDBG_UMD_MODULE_DESTROY_NOTIFY: Failed - Status:")));
 }
 
 TEST_F(L0DebuggerWindowsTest, givenProgramDebuggingEnabledAndDebugAttachAvailableWhenInitializingDriverThenSuccessIsReturned) {
     auto executionEnvironment = new NEO::ExecutionEnvironment();
     executionEnvironment->prepareRootDeviceEnvironments(1);
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
     auto hwInfo = *NEO::defaultHwInfo.get();
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hwInfo);
 
@@ -216,43 +243,13 @@ TEST_F(L0DebuggerWindowsTest, givenProgramDebuggingEnabledAndDebugAttachAvailabl
     auto neoDevice = NEO::MockDevice::create<NEO::MockDevice>(executionEnvironment, 0u);
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    auto driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    auto driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
 
-    driverHandle->enableProgramDebugging = NEO::DebuggingMode::Online;
+    driverHandle->enableProgramDebugging = NEO::DebuggingMode::online;
     wddm->debugAttachAvailable = true;
 
     ze_result_t result = driverHandle->initialize(std::move(devices));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-}
-
-TEST_F(L0DebuggerWindowsTest, givenProgramDebuggingEnabledAndDebugAttachNotAvailableWhenInitializingDriverThenErrorIsReturned) {
-    auto executionEnvironment = new NEO::ExecutionEnvironment();
-    executionEnvironment->prepareRootDeviceEnvironments(1);
-    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::Online);
-    auto hwInfo = *NEO::defaultHwInfo.get();
-    executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(&hwInfo);
-
-    WddmEuDebugInterfaceMock *wddm = new WddmEuDebugInterfaceMock(*executionEnvironment->rootDeviceEnvironments[0]);
-    wddm->callBaseDestroyAllocations = false;
-    wddm->callBaseMapGpuVa = false;
-    wddm->callBaseWaitFromCpu = false;
-
-    auto osInterface = new OSInterface();
-    executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(osInterface);
-    executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(wddm));
-    wddm->init();
-    executionEnvironment->memoryManager.reset(new MockWddmMemoryManager(*executionEnvironment));
-
-    auto neoDevice = NEO::MockDevice::create<NEO::MockDevice>(executionEnvironment, 0u);
-    NEO::DeviceVector devices;
-    devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    auto driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
-
-    driverHandle->enableProgramDebugging = NEO::DebuggingMode::Online;
-    wddm->debugAttachAvailable = false;
-
-    ze_result_t result = driverHandle->initialize(std::move(devices));
-    EXPECT_EQ(ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE, result);
 }
 
 } // namespace ult

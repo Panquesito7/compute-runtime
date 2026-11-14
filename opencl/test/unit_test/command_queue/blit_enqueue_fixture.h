@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,25 +7,23 @@
 
 #pragma once
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/gmm_helper/gmm.h"
-#include "shared/source/helpers/local_memory_access_modes.h"
-#include "shared/source/helpers/pause_on_gpu_properties.h"
+#include "shared/source/gmm_helper/gmm_resource_usage_ocl_buffer.h"
+#include "shared/source/helpers/aux_translation.h"
 #include "shared/source/helpers/vec.h"
-#include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
-#include "shared/test/common/compiler_interface/linker_mock.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_device.h"
-#include "shared/test/common/mocks/mock_timestamp_container.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
-#include "opencl/source/event/user_event.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_program.h"
@@ -38,7 +36,7 @@ struct BlitEnqueueTests : public ::testing::Test {
     class BcsMockContext : public MockContext {
       public:
         BcsMockContext(ClDevice *device) : MockContext(device) {
-            bcsOsContext.reset(OsContext::create(nullptr, device->getRootDeviceIndex(), 0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular})));
+            bcsOsContext.reset(OsContext::create(nullptr, device->getRootDeviceIndex(), 0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular})));
             bcsCsr.reset(createCommandStream(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield()));
             bcsCsr->setupContext(*bcsOsContext);
             bcsCsr->initializeTagAllocation();
@@ -46,10 +44,10 @@ struct BlitEnqueueTests : public ::testing::Test {
             auto mockBlitMemoryToAllocation = [this](const Device &device, GraphicsAllocation *memory, size_t offset, const void *hostPtr,
                                                      Vec3<size_t> size) -> BlitOperationResult {
                 if (!device.getRootDeviceEnvironment().getMutableHardwareInfo()->capabilityTable.blitterOperationsSupported) {
-                    return BlitOperationResult::Unsupported;
+                    return BlitOperationResult::unsupported;
                 }
 
-                auto blitProperties = BlitProperties::constructPropertiesForReadWrite(BlitterConstants::BlitDirection::HostPtrToBuffer,
+                auto blitProperties = BlitProperties::constructPropertiesForReadWrite(BlitterConstants::BlitDirection::hostPtrToBuffer,
                                                                                       *bcsCsr, memory, nullptr,
                                                                                       hostPtr,
                                                                                       memory->getGpuAddress(), 0,
@@ -57,9 +55,9 @@ struct BlitEnqueueTests : public ::testing::Test {
 
                 BlitPropertiesContainer container;
                 container.push_back(blitProperties);
-                bcsCsr->flushBcsTask(container, true, false, const_cast<Device &>(device));
+                bcsCsr->flushBcsTask(container, true, const_cast<Device &>(device));
 
-                return BlitOperationResult::Success;
+                return BlitOperationResult::success;
             };
             blitMemoryToAllocationFuncBackup = mockBlitMemoryToAllocation;
         }
@@ -76,15 +74,15 @@ struct BlitEnqueueTests : public ::testing::Test {
             GTEST_SKIP();
         }
 
-        DebugManager.flags.EnableTimestampPacket.set(timestampPacketEnabled);
-        DebugManager.flags.EnableBlitterForEnqueueOperations.set(1);
-        DebugManager.flags.ForceAuxTranslationMode.set(static_cast<int32_t>(AuxTranslationMode::Blit));
-        DebugManager.flags.RenderCompressedBuffersEnabled.set(1);
-        DebugManager.flags.ForceGpgpuSubmissionForBcsEnqueue.set(1);
-        DebugManager.flags.CsrDispatchMode.set(static_cast<int32_t>(DispatchMode::ImmediateDispatch));
-        DebugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.EnableTimestampPacket.set(timestampPacketEnabled);
+        debugManager.flags.EnableBlitterForEnqueueOperations.set(1);
+        debugManager.flags.ForceAuxTranslationMode.set(static_cast<int32_t>(AuxTranslationMode::blit));
+        debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+        debugManager.flags.ForceGpgpuSubmissionForBcsEnqueue.set(1);
+        debugManager.flags.CsrDispatchMode.set(static_cast<int32_t>(DispatchMode::immediateDispatch));
+        debugManager.flags.EnableLocalMemory.set(1);
 
-        device = std::make_unique<MockClDevice>(MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
+        device = std::make_unique<MockClDevice>(MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr));
 
         REQUIRE_AUX_RESOLVES(device->getRootDeviceEnvironment());
 
@@ -97,16 +95,16 @@ struct BlitEnqueueTests : public ::testing::Test {
             GTEST_SKIP();
         }
         if (createBcsEngine) {
-            auto &engine = device->getEngine(getChosenEngineType(device->getHardwareInfo()), EngineUsage::LowPriority);
+            auto &engine = device->getEngine(getChosenEngineType(device->getHardwareInfo()), EngineUsage::lowPriority);
             bcsOsContext.reset(OsContext::create(nullptr, device->getRootDeviceIndex(), 1,
-                                                 EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular}, device->getDeviceBitfield())));
+                                                 EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular}, device->getDeviceBitfield())));
             engine.osContext = bcsOsContext.get();
             engine.commandStreamReceiver->setupContext(*bcsOsContext);
         }
         bcsMockContext = std::make_unique<BcsMockContext>(device.get());
         auto mockCmdQueue = new MockCommandQueueHw<FamilyType>(bcsMockContext.get(), device.get(), nullptr);
         commandQueue.reset(mockCmdQueue);
-        mockKernel = std::make_unique<MockKernelWithInternals>(*device, bcsMockContext.get());
+        mockKernel = std::make_unique<MockKernelWithInternals>(*bcsMockContext);
         auto mockProgram = mockKernel->mockProgram;
         mockProgram->setAllowNonUniform(true);
 
@@ -117,8 +115,8 @@ struct BlitEnqueueTests : public ::testing::Test {
     template <typename FamilyType>
     void tearDownT() {}
 
-    template <size_t N>
-    void setMockKernelArgs(std::array<Buffer *, N> buffers) {
+    template <size_t n>
+    void setMockKernelArgs(std::array<Buffer *, n> buffers) {
         for (uint32_t i = 0; i < buffers.size(); i++) {
             mockKernel->kernelInfo.addArgBuffer(i, 0);
         }
@@ -132,8 +130,8 @@ struct BlitEnqueueTests : public ::testing::Test {
         }
     }
 
-    template <size_t N>
-    void setMockKernelArgs(std::array<GraphicsAllocation *, N> allocs) {
+    template <size_t n>
+    void setMockKernelArgs(std::array<GraphicsAllocation *, n> allocs) {
         for (uint32_t i = 0; i < allocs.size(); i++) {
             mockKernel->kernelInfo.addArgBuffer(i, 0);
         }
@@ -164,16 +162,18 @@ struct BlitEnqueueTests : public ::testing::Test {
     }
 
     void setAllocationType(GraphicsAllocation *graphicsAllocation, bool compressed) {
-        graphicsAllocation->setAllocationType(AllocationType::BUFFER);
+        graphicsAllocation->setAllocationType(AllocationType::buffer);
 
         if (compressed && !graphicsAllocation->getDefaultGmm()) {
             auto gmmHelper = device->getRootDeviceEnvironment().getGmmHelper();
-
-            graphicsAllocation->setDefaultGmm(new Gmm(gmmHelper, nullptr, 0, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true));
+            GmmRequirements gmmRequirements{};
+            gmmRequirements.allowLargePages = true;
+            gmmRequirements.preferCompressed = false;
+            graphicsAllocation->setDefaultGmm(new Gmm(gmmHelper, nullptr, 0, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
         }
 
         if (graphicsAllocation->getDefaultGmm()) {
-            graphicsAllocation->getDefaultGmm()->isCompressionEnabled = compressed;
+            graphicsAllocation->getDefaultGmm()->setCompressionEnabled(compressed);
         }
     }
 
@@ -248,7 +248,7 @@ struct BlitEnqueueTests : public ::testing::Test {
         using MI_SEMAPHORE_WAIT = typename Family::MI_SEMAPHORE_WAIT;
 
         auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*semaphoreItor);
-        EXPECT_EQ(expectedAddress, semaphoreCmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(expectedAddress, NEO::UnitTestHelper<Family>::getSemaphoreWaitAddress(semaphoreCmd));
     }
 
     DebugManagerStateRestore restore;

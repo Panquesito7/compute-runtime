@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -24,27 +24,24 @@
 #include <cassert>
 
 namespace NEO {
-using namespace iOpenCL;
-
-void populateKernelDescriptor(KernelDescriptor &dst, const SPatchExecutionEnvironment &execEnv);
 
 struct MockKernelObjForAuxTranslation : public KernelObjForAuxTranslation {
     MockKernelObjForAuxTranslation(Type type) : KernelObjForAuxTranslation(type, nullptr) {
-        if (type == KernelObjForAuxTranslation::Type::MEM_OBJ) {
+        if (type == KernelObjForAuxTranslation::Type::memObj) {
             mockBuffer.reset(new MockBuffer);
             this->object = mockBuffer.get();
         } else {
-            DEBUG_BREAK_IF(type != KernelObjForAuxTranslation::Type::GFX_ALLOC);
+            DEBUG_BREAK_IF(type != KernelObjForAuxTranslation::Type::gfxAlloc);
             mockGraphicsAllocation.reset(new MockGraphicsAllocation(nullptr, 0x100));
             this->object = mockGraphicsAllocation.get();
         }
     };
 
     MockKernelObjForAuxTranslation(Type type, size_t size) : MockKernelObjForAuxTranslation(type) {
-        if (type == KernelObjForAuxTranslation::Type::MEM_OBJ) {
+        if (type == KernelObjForAuxTranslation::Type::memObj) {
             mockBuffer->getGraphicsAllocation(0)->setSize(size);
         } else {
-            DEBUG_BREAK_IF(type != KernelObjForAuxTranslation::Type::GFX_ALLOC);
+            DEBUG_BREAK_IF(type != KernelObjForAuxTranslation::Type::gfxAlloc);
             mockGraphicsAllocation->setSize(size);
         }
     }
@@ -62,7 +59,7 @@ class MockMultiDeviceKernel : public MultiDeviceKernel {
         return kernelVector;
     }
     using MultiDeviceKernel::MultiDeviceKernel;
-    template <typename kernel_t = Kernel>
+    template <typename KernelType = Kernel>
     static MockMultiDeviceKernel *create(Program *programArg, const KernelInfoContainer &kernelInfoArg) {
         KernelVectorType kernelVector;
         kernelVector.resize(programArg->getMaxRootDeviceIndex() + 1);
@@ -71,7 +68,7 @@ class MockMultiDeviceKernel : public MultiDeviceKernel {
             if (kernelVector[rootDeviceIndex]) {
                 continue;
             }
-            kernelVector[rootDeviceIndex] = new kernel_t(programArg, *kernelInfoArg[rootDeviceIndex], *pDevice);
+            kernelVector[rootDeviceIndex] = new KernelType(programArg, *kernelInfoArg[rootDeviceIndex], *pDevice);
         }
         return new MockMultiDeviceKernel(std::move(kernelVector), kernelInfoArg);
     }
@@ -94,47 +91,40 @@ class MockMultiDeviceKernel : public MultiDeviceKernel {
 ////////////////////////////////////////////////////////////////////////////////
 class MockKernel : public Kernel {
   public:
-    using Kernel::addAllocationToCacheFlushVector;
     using Kernel::allBufferArgsStateful;
     using Kernel::anyKernelArgumentUsingSystemMemory;
     using Kernel::auxTranslationRequired;
     using Kernel::containsStatelessWrites;
-    using Kernel::dataParameterSimdSize;
+    using Kernel::crossThreadData;
+    using Kernel::crossThreadDataSize;
     using Kernel::executionType;
     using Kernel::getDevice;
     using Kernel::getHardwareInfo;
     using Kernel::graphicsAllocationTypeUseSystemMemory;
-    using Kernel::hasDirectStatelessAccessToHostMemory;
-    using Kernel::hasDirectStatelessAccessToSharedBuffer;
-    using Kernel::hasIndirectStatelessAccessToHostMemory;
+    using Kernel::imageFromBufferArgsCount;
+    using Kernel::implicitArgsVersion;
+    using Kernel::initializeLocalIdsCache;
+    using Kernel::isBuiltIn;
     using Kernel::isUnifiedMemorySyncRequired;
     using Kernel::kernelArgHandlers;
-    using Kernel::kernelArgRequiresCacheFlush;
     using Kernel::kernelArguments;
-    using Kernel::KernelConfig;
     using Kernel::kernelHasIndirectAccess;
-    using Kernel::kernelSubmissionMap;
     using Kernel::kernelSvmGfxAllocations;
     using Kernel::kernelUnifiedMemoryGfxAllocations;
     using Kernel::localBindingTableOffset;
     using Kernel::localIdsCache;
     using Kernel::maxKernelWorkGroupSize;
-    using Kernel::maxWorkGroupSizeForCrossThreadData;
     using Kernel::numberOfBindingTableStates;
-    using Kernel::parentEventOffset;
     using Kernel::patchBufferOffset;
     using Kernel::patchPrivateSurface;
     using Kernel::patchWithImplicitSurface;
     using Kernel::pImplicitArgs;
-    using Kernel::preferredWkgMultipleOffset;
     using Kernel::privateSurface;
     using Kernel::setInlineSamplers;
-    using Kernel::singleSubdevicePreferredInCurrentEnqueue;
-    using Kernel::svmAllocationsRequireCacheFlush;
-    using Kernel::unifiedMemoryControls;
-
     using Kernel::slmSizes;
-    using Kernel::slmTotalSize;
+    using Kernel::slmTotalSizePerThreadGroup;
+    using Kernel::unifiedMemoryControls;
+    using Kernel::usingImages;
 
     MockKernel(Program *programArg, const KernelInfo &kernelInfoArg, ClDevice &clDeviceArg)
         : Kernel(programArg, kernelInfoArg, clDeviceArg) {
@@ -154,7 +144,7 @@ class MockKernel : public Kernel {
 
     template <typename KernelType = MockKernel>
     static KernelType *create(Device &device, Program *program) {
-        return create<KernelType>(device, program, GrfConfig::DefaultGrfNumber);
+        return create<KernelType>(device, program, GrfConfig::defaultGrfNumber);
     }
 
     template <typename KernelType = MockKernel>
@@ -165,8 +155,6 @@ class MockKernel : public Kernel {
         info->setLocalIds({0, 0, 0});
         info->kernelDescriptor.kernelAttributes.numGrfRequired = grfNumber;
         info->kernelDescriptor.kernelAttributes.simdSize = 32;
-
-        info->crossThreadData = new char[crossThreadSize];
 
         auto kernel = new KernelType(program, *info, *device.getSpecializedDevice<ClDevice>());
         kernel->crossThreadData = new char[crossThreadSize];
@@ -184,8 +172,6 @@ class MockKernel : public Kernel {
 
     bool isPatched() const override;
 
-    bool canTransformImages() const override;
-
     ////////////////////////////////////////////////////////////////////////////////
     void setCrossThreadData(const void *crossThreadDataPattern, uint32_t newCrossThreadDataSize) {
         if ((crossThreadData != nullptr) && (crossThreadData != mockCrossThreadData.data())) {
@@ -194,8 +180,7 @@ class MockKernel : public Kernel {
             crossThreadDataSize = 0;
         }
         if (crossThreadDataPattern && (newCrossThreadDataSize > 0)) {
-            mockCrossThreadData.clear();
-            mockCrossThreadData.insert(mockCrossThreadData.begin(), (char *)crossThreadDataPattern, ((char *)crossThreadDataPattern) + newCrossThreadDataSize);
+            mockCrossThreadData.assign((char *)crossThreadDataPattern, ((char *)crossThreadDataPattern) + newCrossThreadDataSize);
         } else {
             mockCrossThreadData.resize(newCrossThreadDataSize, 0);
         }
@@ -222,13 +207,12 @@ class MockKernel : public Kernel {
         }
     }
 
-    void setPrivateSurface(GraphicsAllocation *gfxAllocation, uint32_t size) {
+    void setPrivateSurface(GraphicsAllocation *gfxAllocation) {
         privateSurface = gfxAllocation;
-        privateSurfaceSize = size;
     }
 
     void setTotalSLMSize(uint32_t size) {
-        slmTotalSize = size;
+        slmTotalSizePerThreadGroup = size;
     }
 
     void setKernelArguments(std::vector<SimpleKernelArgInfo> kernelArguments) {
@@ -237,6 +221,13 @@ class MockKernel : public Kernel {
 
     KernelInfo *getAllocatedKernelInfo() {
         return kernelInfoAllocated;
+    }
+
+    void setLocalWorkSizeValues(uint32_t localWorkSizeX, uint32_t localWorkSizeY, uint32_t localWorkSizeZ) override {
+        setLws[0] = localWorkSizeX;
+        setLws[1] = localWorkSizeY;
+        setLws[2] = localWorkSizeZ;
+        Kernel::setLocalWorkSizeValues(localWorkSizeX, localWorkSizeY, localWorkSizeZ);
     }
 
     std::vector<char> mockCrossThreadData;
@@ -249,14 +240,13 @@ class MockKernel : public Kernel {
 
     void setSystolicPipelineSelectMode(bool value) { systolicPipelineSelectMode = value; }
 
-    bool requiresCacheFlushCommand(const CommandQueue &commandQueue) const override;
-
     cl_int setArgSvmAlloc(uint32_t argIndex, void *svmPtr, GraphicsAllocation *svmAlloc, uint32_t allocId) override;
 
     uint32_t makeResidentCalls = 0;
     uint32_t getResidencyCalls = 0;
     uint32_t setArgSvmAllocCalls = 0;
     uint32_t moveArgsToGpuDomainCalls = 0;
+    uint32_t setLws[3] = {0, 0, 0};
 
     bool canKernelTransformImages = true;
     bool isPatchedOverride = true;
@@ -265,12 +255,19 @@ class MockKernel : public Kernel {
     KernelInfo *kernelInfoAllocated = nullptr;
 };
 
+struct MockKernelWithInternalsConfig {
+    bool requiresSubgroupIndependentForwardProgress = false;
+    ThreadArbitrationPolicy threadArbitrationPolicy = ThreadArbitrationPolicy::NotPresent;
+    bool addDefaultArgs = false;
+};
+
 // class below have enough internals to service Enqueue operation.
 class MockKernelWithInternals {
   public:
-    MockKernelWithInternals(const ClDeviceVector &deviceVector, Context *context = nullptr, bool addDefaultArg = false, SPatchExecutionEnvironment execEnv = {}) {
-        memset(&kernelHeader, 0, sizeof(SKernelBinaryHeaderCommon));
-
+    MockKernelWithInternals(Context &context) {
+        context.incRefInternal();
+        mockContext = &context;
+        const auto &deviceVector = context.getDevices();
         kernelInfo.heapInfo.pKernelHeap = kernelIsa;
         kernelInfo.heapInfo.kernelHeapSize = sizeof(kernelIsa);
         kernelInfo.heapInfo.pSsh = sshLocal;
@@ -278,20 +275,12 @@ class MockKernelWithInternals {
         kernelInfo.heapInfo.pDsh = dshLocal;
         kernelInfo.heapInfo.dynamicStateHeapSize = sizeof(dshLocal);
 
-        populateKernelDescriptor(kernelInfo.kernelDescriptor, execEnv);
-        kernelInfo.kernelDescriptor.kernelAttributes.numGrfRequired = GrfConfig::DefaultGrfNumber;
+        kernelInfo.kernelDescriptor.kernelAttributes.numGrfRequired = GrfConfig::defaultGrfNumber;
         kernelInfo.kernelDescriptor.kernelAttributes.simdSize = 32;
         kernelInfo.setCrossThreadDataSize(sizeof(crossThreadData));
         kernelInfo.setLocalIds({1, 1, 1});
         kernelInfo.kernelDescriptor.kernelAttributes.numLocalIdChannels = 3;
 
-        if (context == nullptr) {
-            mockContext = new MockContext(deviceVector);
-            context = mockContext;
-        } else {
-            context->incRefInternal();
-            mockContext = context;
-        }
         auto maxRootDeviceIndex = 0u;
 
         for (const auto &pClDevice : deviceVector) {
@@ -306,7 +295,7 @@ class MockKernelWithInternals {
             kernelInfos[pClDevice->getRootDeviceIndex()] = &kernelInfo;
         }
 
-        mockProgram = new MockProgram(context, false, deviceVector);
+        mockProgram = new MockProgram(mockContext, false, deviceVector);
         mockKernel = new MockKernel(mockProgram, kernelInfo, *deviceVector[0]);
         mockKernel->setCrossThreadData(&crossThreadData, sizeof(crossThreadData));
         KernelVectorType mockKernels;
@@ -320,8 +309,11 @@ class MockKernelWithInternals {
         mockMultiDeviceKernel = new MockMultiDeviceKernel(std::move(mockKernels), kernelInfos);
 
         mockKernel->setSshLocal(&sshLocal, sizeof(sshLocal));
+    }
 
-        if (addDefaultArg) {
+    MockKernelWithInternals(Context &context, const MockKernelWithInternalsConfig &config)
+        : MockKernelWithInternals(context) {
+        if (config.addDefaultArgs) {
             defaultKernelArguments.resize(2);
             defaultKernelArguments[0] = {};
             defaultKernelArguments[1] = {};
@@ -330,21 +322,18 @@ class MockKernelWithInternals {
             kernelInfo.setAddressQualifier(0, KernelArgMetadata::AddrGlobal);
             kernelInfo.setAccessQualifier(0, KernelArgMetadata::AccessReadWrite);
 
-            kernelInfo.addArgBuffer(1, 8, sizeof(uintptr_t), 72);
+            kernelInfo.addArgBuffer(1, 8, sizeof(uintptr_t), 0);
             kernelInfo.setAddressQualifier(1, KernelArgMetadata::AddrGlobal);
             kernelInfo.setAccessQualifier(1, KernelArgMetadata::AccessReadWrite);
 
             mockKernel->setKernelArguments(defaultKernelArguments);
-            mockKernel->kernelArgRequiresCacheFlush.resize(2);
             mockKernel->kernelArgHandlers.resize(2);
             mockKernel->kernelArgHandlers[0] = &Kernel::setArgBuffer;
             mockKernel->kernelArgHandlers[1] = &Kernel::setArgBuffer;
         }
-    }
 
-    MockKernelWithInternals(ClDevice &deviceArg, Context *context = nullptr, bool addDefaultArg = false, SPatchExecutionEnvironment execEnv = {}) : MockKernelWithInternals(toClDeviceVector(deviceArg), context, addDefaultArg, execEnv) {
-    }
-    MockKernelWithInternals(ClDevice &deviceArg, SPatchExecutionEnvironment execEnv) : MockKernelWithInternals(deviceArg, nullptr, false, execEnv) {
+        kernelInfo.kernelDescriptor.kernelAttributes.flags.requiresSubgroupIndependentForwardProgress = config.requiresSubgroupIndependentForwardProgress;
+        kernelInfo.kernelDescriptor.kernelAttributes.threadArbitrationPolicy = config.threadArbitrationPolicy;
         mockKernel->initialize();
     }
 
@@ -358,17 +347,17 @@ class MockKernelWithInternals {
         return mockKernel;
     }
 
+    alignas(64) char sshLocal[128];
+    alignas(64) char dshLocal[128];
+    char crossThreadData[256];
+    uint32_t kernelIsa[32];
+    MockKernelInfo kernelInfo;
+
     MockMultiDeviceKernel *mockMultiDeviceKernel = nullptr;
     MockKernel *mockKernel;
     MockProgram *mockProgram;
     Context *mockContext;
     KernelInfoContainer kernelInfos;
-    MockKernelInfo kernelInfo;
-    SKernelBinaryHeaderCommon kernelHeader = {};
-    uint32_t kernelIsa[32];
-    char crossThreadData[256];
-    char sshLocal[128];
-    char dshLocal[128];
     std::vector<Kernel::SimpleKernelArgInfo> defaultKernelArguments;
 };
 class MockDebugKernel : public MockKernel {
@@ -377,12 +366,10 @@ class MockDebugKernel : public MockKernel {
         if (!isValidOffset(kernelInfo.kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful)) {
             auto &kd = const_cast<KernelDescriptor &>(kernelInfo.kernelDescriptor);
             kd.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-            kd.kernelAttributes.perThreadSystemThreadSurfaceSize = MockDebugKernel::perThreadSystemThreadSurfaceSize;
         }
     }
 
     ~MockDebugKernel() override {}
-    static const uint32_t perThreadSystemThreadSurfaceSize;
 };
 
 } // namespace NEO

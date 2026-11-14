@@ -1,396 +1,33 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/compiler_interface/external_functions.h"
-#include "shared/source/device_binary_format/patchtokens_decoder.h"
-#include "shared/source/helpers/file_io.h"
-#include "shared/source/kernel/kernel_descriptor_from_patchtokens.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/program/kernel_info.h"
-#include "shared/source/program/kernel_info_from_patchtokens.h"
 #include "shared/test/common/compiler_interface/linker_mock.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/mocks/mock_compilers.h"
-#include "shared/test/common/mocks/mock_elf.h"
+#include "shared/test/common/helpers/mock_file_io.h"
+#include "shared/test/common/mocks/mock_compiler_interface.h"
 #include "shared/test/common/mocks/mock_l0_debugger.h"
+#include "shared/test/common/mocks/mock_modules_zebin.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/module/module_imp.h"
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_module.h"
 #include "level_zero/core/test/unit_tests/sources/debugger/l0_debugger_fixture.h"
 
-#include "active_debugger_fixture.h"
-
 namespace L0 {
+struct ModuleBuildLog;
+
 namespace ult {
-using DeviceWithDebuggerEnabledTest = Test<ActiveDebuggerFixture>;
-TEST_F(DeviceWithDebuggerEnabledTest, givenDebuggingEnabledWhenModuleIsCreatedThenDebugOptionsAreUsed) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    device->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    debugger->isOptDisabled = true;
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(deviceL0, moduleBuildLog, ModuleType::User));
-    ASSERT_NE(nullptr, module.get());
-    module->initialize(&moduleDesc, device);
-
-    EXPECT_TRUE(CompilerOptions::contains(cip->buildInternalOptions, L0::BuildOptions::debugKernelEnable));
-    EXPECT_TRUE(CompilerOptions::contains(cip->buildOptions, NEO::CompilerOptions::generateDebugInfo));
-    EXPECT_TRUE(CompilerOptions::contains(cip->buildOptions, L0::BuildOptions::optDisable));
-};
-
-TEST_F(DeviceWithDebuggerEnabledTest, GivenDebugVarDebuggerOptDisableZeroWhenOptDisableIsTrueFromDebuggerThenOptDisableIsNotAdded) {
-    DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.DebuggerOptDisable.set(0);
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    device->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    debugger->isOptDisabled = true;
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(deviceL0, moduleBuildLog, ModuleType::User));
-    ASSERT_NE(nullptr, module.get());
-    module->initialize(&moduleDesc, device);
-
-    EXPECT_FALSE(CompilerOptions::contains(cip->buildOptions, L0::BuildOptions::optDisable));
-};
-
-TEST_F(DeviceWithDebuggerEnabledTest, GivenDebugVarDebuggerOptDisableOneWhenOptDisableIsFalseFromDebuggerThenOptDisableIsAdded) {
-    DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.DebuggerOptDisable.set(1);
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    device->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    debugger->isOptDisabled = false;
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(deviceL0, moduleBuildLog, ModuleType::User));
-    ASSERT_NE(nullptr, module.get());
-    module->initialize(&moduleDesc, device);
-
-    EXPECT_TRUE(CompilerOptions::contains(cip->buildOptions, L0::BuildOptions::optDisable));
-};
-
-TEST_F(DeviceWithDebuggerEnabledTest, GivenDebuggeableKernelWhenModuleIsInitializedThenDebugEnabledIsTrue) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    device->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    auto module = std::make_unique<WhiteBox<::L0::Module>>(deviceL0, moduleBuildLog, ModuleType::User);
-    ASSERT_NE(nullptr, module.get());
-
-    NEO::PatchTokenBinary::KernelFromPatchtokens kernelTokens;
-    iOpenCL::SKernelBinaryHeaderCommon kernelHeader;
-    kernelTokens.header = &kernelHeader;
-    iOpenCL::SPatchAllocateSystemThreadSurface systemThreadSurface = {};
-    systemThreadSurface.Offset = 2;
-    systemThreadSurface.PerThreadSystemThreadSurfaceSize = 3;
-    kernelTokens.tokens.allocateSystemThreadSurface = &systemThreadSurface;
-
-    auto kernelInfo = std::make_unique<KernelInfo>();
-    populateKernelInfo(*kernelInfo, kernelTokens, sizeof(size_t));
-
-    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
-    module->initialize(&moduleDesc, device);
-
-    EXPECT_TRUE(module->isDebugEnabled());
-}
-
-TEST_F(DeviceWithDebuggerEnabledTest, GivenNonDebuggeableKernelWhenModuleIsInitializedThenDebugEnabledIsFalse) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    device->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    auto module = std::make_unique<WhiteBox<::L0::Module>>(deviceL0, moduleBuildLog, ModuleType::User);
-    ASSERT_NE(nullptr, module.get());
-
-    NEO::PatchTokenBinary::KernelFromPatchtokens kernelTokens;
-    iOpenCL::SKernelBinaryHeaderCommon kernelHeader;
-    kernelTokens.header = &kernelHeader;
-    kernelTokens.tokens.allocateSystemThreadSurface = nullptr;
-
-    auto kernelInfo = std::make_unique<KernelInfo>();
-    populateKernelInfo(*kernelInfo, kernelTokens, sizeof(size_t));
-
-    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
-    module->initialize(&moduleDesc, device);
-
-    EXPECT_FALSE(module->isDebugEnabled());
-}
-
-using ModuleWithSLDTest = Test<ModuleFixture>;
-
-TEST_F(ModuleWithSLDTest, GivenNoDebugDataWhenInitializingModuleThenRelocatedDebugDataIsNotCreated) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    auto debugger = new MockActiveSourceLevelDebugger(new MockOsLibrary);
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> module = std::make_unique<MockModule>(device,
-                                                                      moduleBuildLog,
-                                                                      ModuleType::User);
-    module->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(module->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernel;
-    kernel.module = module.get();
-    kernel.immutableData.kernelInfo = kernelInfo;
-
-    kernel.immutableData.surfaceStateHeapSize = 64;
-    kernel.immutableData.surfaceStateHeapTemplate.reset(new uint8_t[64]);
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    module->kernelImmData = &kernel.immutableData;
-    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    EXPECT_EQ(nullptr, module->translationUnit->debugData.get());
-    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    result = module->initialize(&moduleDesc, neoDevice);
-    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_EQ(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData);
-}
-
-TEST_F(ModuleWithSLDTest, GivenDebugDataWithSingleRelocationWhenInitializingModuleThenRelocatedDebugDataIsNotCreated) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    auto debugger = new MockActiveSourceLevelDebugger(new MockOsLibrary);
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-
-    kernelMock.immutableData.surfaceStateHeapSize = 64;
-    kernelMock.immutableData.surfaceStateHeapTemplate.reset(new uint8_t[64]);
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    constexpr size_t mockVIsaSize = 0x10;
-    char mockVIsa[mockVIsaSize]{0};
-
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = mockVIsa;
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = mockVIsaSize;
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
-
-    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    result = moduleMock->initialize(&moduleDesc, neoDevice);
-    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_EQ(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData);
-}
-
-TEST_F(ModuleWithSLDTest, GivenDebugDataWithMultipleRelocationsWhenInitializingModuleThenRelocatedDebugDataIsCreated) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    auto debugger = new MockActiveSourceLevelDebugger(new MockOsLibrary);
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-
-    auto debugData = MockElfEncoder<>::createRelocateableDebugDataElf();
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(debugData.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(debugData.data());
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
-
-    EXPECT_EQ(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData);
-    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    result = moduleMock->initialize(&moduleDesc, neoDevice);
-    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData);
-}
-
-using ModuleWithZebinAndSLDTest = Test<ModuleWithZebinFixture>;
-TEST_F(ModuleWithZebinAndSLDTest, GivenZebinThenCreateDebugZebinAndPassToSLD) {
-    module->addEmptyZebin();
-    module->addSegments();
-
-    auto debugger = new MockActiveSourceLevelDebugger(new MockOsLibrary);
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
-    module->passDebugData();
-
-    EXPECT_TRUE(module->translationUnit->debugData);
-}
-
-using KernelDebugSurfaceTest = Test<ModuleFixture>;
-
-HWTEST_F(KernelDebugSurfaceTest, givenDebuggerAndBindfulKernelWhenAppendingKernelToCommandListThenBindfulSurfaceStateForDebugSurfaceIsProgrammed) {
-
-    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
-
-    auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
-
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
-    auto &hwInfo = *NEO::defaultHwInfo.get();
-    auto &gfxCoreHelper = neoDevice->getGfxCoreHelper();
-    auto maxDbgSurfaceSize = gfxCoreHelper.getSipKernelMaxDbgSurfaceSize(hwInfo);
-    auto debugSurface = neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), true,
-         maxDbgSurfaceSize,
-         NEO::AllocationType::DEBUG_CONTEXT_SAVE_AREA,
-         false,
-         false,
-         device->getNEODevice()->getDeviceBitfield()});
-    static_cast<L0::DeviceImp *>(device)->setDebugSurface(debugSurface);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> module = std::make_unique<MockModule>(device,
-                                                                      moduleBuildLog,
-                                                                      ModuleType::User);
-
-    module->debugEnabled = true;
-
-    uint32_t kernelHeap = 0;
-    KernelInfo kernelInfo;
-    kernelInfo.heapInfo.kernelHeapSize = 1;
-    kernelInfo.heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernel;
-    kernel.module = module.get();
-    kernel.immutableData.kernelInfo = &kernelInfo;
-
-    ze_kernel_desc_t desc = {};
-
-    kernel.immutableData.kernelDescriptor->payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = sizeof(RENDER_SURFACE_STATE);
-    kernel.immutableData.surfaceStateHeapSize = 2 * sizeof(RENDER_SURFACE_STATE);
-    kernel.immutableData.surfaceStateHeapTemplate.reset(new uint8_t[2 * sizeof(RENDER_SURFACE_STATE)]);
-    module->kernelImmData = &kernel.immutableData;
-
-    kernel.initialize(&desc);
-
-    auto debugSurfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(kernel.surfaceStateHeapData.get());
-    debugSurfaceState = ptrOffset(debugSurfaceState, sizeof(RENDER_SURFACE_STATE));
-
-    SURFACE_STATE_BUFFER_LENGTH length;
-    length.length = static_cast<uint32_t>(debugSurface->getUnderlyingBufferSize() - 1);
-
-    EXPECT_EQ(length.surfaceState.depth + 1u, debugSurfaceState->getDepth());
-    EXPECT_EQ(length.surfaceState.width + 1u, debugSurfaceState->getWidth());
-    EXPECT_EQ(length.surfaceState.height + 1u, debugSurfaceState->getHeight());
-    EXPECT_EQ(debugSurface->getGpuAddress(), debugSurfaceState->getSurfaceBaseAddress());
-
-    EXPECT_EQ(RENDER_SURFACE_STATE::SURFACE_TYPE_SURFTYPE_BUFFER, debugSurfaceState->getSurfaceType());
-}
 
 using ModuleWithDebuggerL0Test = Test<L0DebuggerHwFixture>;
-TEST_F(ModuleWithDebuggerL0Test, givenDebuggingEnabledWhenModuleIsCreatedThenDebugOptionsAreNotUsed) {
+TEST_F(ModuleWithDebuggerL0Test, givenL0DebuggerWhenModuleIsCreatedThenDebugOptionsAreNotUsed) {
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -403,11 +40,9 @@ TEST_F(ModuleWithDebuggerL0Test, givenDebuggingEnabledWhenModuleIsCreatedThenDeb
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::User));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
     ASSERT_NE(nullptr, module.get());
     module->initialize(&moduleDesc, neoDevice);
-
-    EXPECT_TRUE(module->isDebugEnabled());
 
     EXPECT_FALSE(CompilerOptions::contains(cip->buildInternalOptions, L0::BuildOptions::debugKernelEnable));
     EXPECT_FALSE(CompilerOptions::contains(cip->buildOptions, NEO::CompilerOptions::generateDebugInfo));
@@ -423,12 +58,15 @@ TEST_F(KernelInitializeTest, givenDebuggingEnabledWhenKernelsAreInitializedThenA
     kernelInfo.heapInfo.pKernelHeap = &kernelHeap;
 
     KernelImmutableData kernelImmutableData(device);
+    kernelImmutableData.setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo.heapInfo.kernelHeapSize, false));
+    auto isa = kernelImmutableData.getIsaGraphicsAllocation()->getUnderlyingBuffer();
+
+    *reinterpret_cast<uint32_t *>(isa) = 0;
 
     memoryOperationsHandler->makeResidentCalledCount = 0;
-    kernelImmutableData.initialize(&kernelInfo, device, 0, nullptr, nullptr, false);
+    kernelImmutableData.initialize(&kernelInfo, device, nullptr, nullptr);
     EXPECT_EQ(0, memoryOperationsHandler->makeResidentCalledCount);
 
-    auto isa = kernelImmutableData.getIsaGraphicsAllocation()->getUnderlyingBuffer();
     EXPECT_NE(0, memcmp(isa, &kernelHeap, sizeof(kernelHeap)));
 };
 
@@ -438,7 +76,11 @@ HWTEST_F(ModuleWithDebuggerL0MultiTileTest, GivenSubDeviceWhenCreatingModuleThen
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    neoDevice->getExecutionEnvironment()->setDebuggingMode(NEO::DebuggingMode::Online);
+    auto zebin = ZebinTestData::ValidEmptyProgram<>();
+    cip->output.intermediateRepresentation.size = zebin.storage.size();
+    cip->output.intermediateRepresentation.mem.reset(new char[zebin.storage.size()]);
+    memcpy_s(cip->output.intermediateRepresentation.mem.get(), zebin.storage.size(), zebin.storage.data(), zebin.storage.size());
+    neoDevice->getExecutionEnvironment()->setDebuggingMode(NEO::DebuggingMode::online);
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->initDebuggerL0(neoDevice);
     auto memoryOperationsHandler = new NEO::MockMemoryOperations();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->memoryOperationsInterface.reset(memoryOperationsHandler);
@@ -452,7 +94,7 @@ HWTEST_F(ModuleWithDebuggerL0MultiTileTest, GivenSubDeviceWhenCreatingModuleThen
     moduleDesc.inputSize = 10;
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(subDevice0, moduleBuildLog, ModuleType::User);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(subDevice0, moduleBuildLog, ModuleType::user);
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(subDevice0);
     auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
     mockTranslationUnit->processUnpackedBinaryCallBase = false;
@@ -461,22 +103,16 @@ HWTEST_F(ModuleWithDebuggerL0MultiTileTest, GivenSubDeviceWhenCreatingModuleThen
     auto kernelInfo = new KernelInfo();
     kernelInfo->heapInfo.kernelHeapSize = 1;
     kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
+    kernelInfo->kernelDescriptor.kernelMetadata.kernelName = ZebinTestData::ValidEmptyProgram<>::kernelName;
 
-    Mock<::L0::Kernel> kernelMock;
+    Mock<::L0::KernelImp> kernelMock;
     kernelMock.module = moduleMock.get();
     kernelMock.immutableData.kernelInfo = kernelInfo;
     kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
 
-    moduleMock->kernelImmData = &kernelMock.immutableData;
+    moduleMock->data = &kernelMock.immutableData;
     moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
 
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-
-    auto debugData = MockElfEncoder<>::createRelocateableDebugDataElf();
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(debugData.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(debugData.data());
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
     EXPECT_EQ(moduleMock->initialize(&moduleDesc, subDevice0->getNEODevice()), ZE_RESULT_SUCCESS);
 
     auto debuggerL0Hw = static_cast<MockDebuggerL0Hw<FamilyType> *>(device->getL0Debugger());
@@ -487,8 +123,7 @@ HWTEST_F(ModuleWithDebuggerL0MultiTileTest, GivenSubDeviceWhenCreatingModuleThen
     EXPECT_EQ(1, memoryOperationsHandler->makeResidentCalledCount);
 }
 
-HWTEST_F(ModuleWithDebuggerL0Test, GivenDebugDataWithRelocationsWhenInitializingModuleThenRegisterElfWithRelocatedElfAndModuleCreateNotified) {
-
+HWTEST_F(ModuleWithDebuggerL0Test, GivenModuleWithoutDeviceBinaryWhenInitializingModuleThenElfIsNotRegisteredAndModuleCreateIsNotNotified) {
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
 
@@ -497,47 +132,35 @@ HWTEST_F(ModuleWithDebuggerL0Test, GivenDebugDataWithRelocationsWhenInitializing
     moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
     moduleDesc.pInputModule = binary;
     moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
 
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
     auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
     mockTranslationUnit->processUnpackedBinaryCallBase = false;
+    ASSERT_EQ(nullptr, mockTranslationUnit->unpackedDeviceBinary);
 
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-
-    auto debugData = MockElfEncoder<>::createRelocateableDebugDataElf();
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(debugData.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(debugData.data());
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
-
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
     EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->registerElfAndLinkCount);
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
+    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
+    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
+}
 
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData.get());
-    EXPECT_EQ(reinterpret_cast<char *>(kernelInfo->kernelDescriptor.external.relocatedDebugData.get()), getMockDebuggerL0Hw<FamilyType>()->lastReceivedElf);
+HWTEST_F(ModuleWithDebuggerL0Test, GivenModuleNotInitializedWithDeviceBinaryWhenDestroyingModuleThenModuleDestroyIsNotNotified) {
+    auto moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
+    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
+
+    moduleMock->destroy();
+    moduleMock.release();
+
+    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleDestroyCount);
 }
 
 HWTEST_F(ModuleWithDebuggerL0Test, GivenBuiltinModuleWhenInitializingModuleThenModuleAndElfNOtificationsAreNotCalled) {
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
+    auto zebin = ZebinTestData::ValidEmptyProgram<>();
+    cip->output.intermediateRepresentation.size = zebin.storage.size();
+    cip->output.intermediateRepresentation.mem.reset(new char[zebin.storage.size()]);
+    memcpy_s(cip->output.intermediateRepresentation.mem.get(), zebin.storage.size(), zebin.storage.data(), zebin.storage.size());
 
     uint8_t binary[10];
     ze_module_desc_t moduleDesc = {};
@@ -546,134 +169,33 @@ HWTEST_F(ModuleWithDebuggerL0Test, GivenBuiltinModuleWhenInitializingModuleThenM
     moduleDesc.inputSize = 10;
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::Builtin);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::builtin);
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
 
     uint32_t kernelHeap = 0;
     auto kernelInfo = new KernelInfo();
     kernelInfo->heapInfo.kernelHeapSize = 1;
     kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
+    kernelInfo->kernelDescriptor.kernelMetadata.kernelName = ZebinTestData::ValidEmptyProgram<>::kernelName;
 
-    Mock<::L0::Kernel> kernelMock;
+    Mock<::L0::KernelImp> kernelMock;
     kernelMock.module = moduleMock.get();
     kernelMock.immutableData.kernelInfo = kernelInfo;
     kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-    moduleMock->kernelImmData = &kernelMock.immutableData;
+    moduleMock->data = &kernelMock.immutableData;
     moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
     auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
     mockTranslationUnit->processUnpackedBinaryCallBase = false;
 
-    auto debugData = MockElfEncoder<>::createRelocateableDebugDataElf();
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(debugData.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(debugData.data());
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
-
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
     EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfAndLinkCount);
+    ASSERT_NE(nullptr, mockTranslationUnit->unpackedDeviceBinary);
+    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
     EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
 
     EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData.get());
-    EXPECT_EQ(nullptr, getMockDebuggerL0Hw<FamilyType>()->lastReceivedElf);
 }
 
-HWTEST_F(ModuleWithDebuggerL0Test, GivenDebugDataWithoutRelocationsWhenInitializingModuleThenRegisterElfWithUnrelocatedElfAndModuleCreateNotified) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-
-    std::vector<uint8_t> data;
-    data.resize(4);
-    NEO::Elf::ElfEncoder<> elfEncoder;
-    elfEncoder.getElfFileHeader().type = NEO::Elf::SHT_PROGBITS;
-    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix, data);
-    auto elfBinary = elfEncoder.encode();
-
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(elfBinary.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(elfBinary.data());
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
-
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
-    EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->registerElfAndLinkCount);
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
-
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_EQ(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData.get());
-    EXPECT_EQ(kernelInfo->kernelDescriptor.external.debugData->vIsa, getMockDebuggerL0Hw<FamilyType>()->lastReceivedElf);
-}
-
-HWTEST_F(ModuleWithDebuggerL0Test, GivenNoDebugDataWhenInitializingModuleThenDoNotRegisterElfAndNotifyModuleCreate) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
-    EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
-}
-
-using ModuleWithZebinAndL0DebuggerTest = Test<L0DebuggerHwFixture>;
-
-HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinDebugDataWhenInitializingModuleThenRegisterElfAndNotifyModuleCreate) {
+HWTEST_F(ModuleWithDebuggerL0Test, GivenZebinDebugDataWhenInitializingModuleThenRegisterElfAndNotifyModuleCreate) {
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -690,14 +212,16 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinDebugDataWhenInitializingMo
     kernelInfo->kernelDescriptor.kernelMetadata.kernelName = ZebinTestData::ValidEmptyProgram<>::kernelName;
 
     auto kernelImmutableData = ::std::make_unique<KernelImmutableData>(device);
-    kernelImmutableData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
+    kernelImmutableData->setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo->heapInfo.kernelHeapSize, false));
+    kernelImmutableData->initialize(kernelInfo.get(), device, nullptr, nullptr);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    moduleMock->kernelImmDatas.push_back(std::move(kernelImmutableData));
+    moduleMock->kernelImmData.push_back(std::move(kernelImmutableData));
 
     kernelImmutableData = ::std::make_unique<KernelImmutableData>(device);
-    kernelImmutableData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
-    moduleMock->kernelImmDatas.push_back(std::move(kernelImmutableData));
+    kernelImmutableData->setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo->heapInfo.kernelHeapSize, false));
+    kernelImmutableData->initialize(kernelInfo.get(), device, nullptr, nullptr);
+    moduleMock->kernelImmData.push_back(std::move(kernelImmutableData));
 
     auto zebin = ZebinTestData::ValidEmptyProgram<>();
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
@@ -711,9 +235,9 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinDebugDataWhenInitializingMo
     EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
 }
 
-HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenDumpElfFlagAndZebinWhenInitializingModuleThenDebugElfIsDumpedToFile) {
+HWTEST_F(ModuleWithDebuggerL0Test, GivenDumpElfFlagAndZebinWhenInitializingModuleThenDebugElfIsDumpedToFile) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.DebuggerLogBitmask.set(NEO::DebugVariables::DEBUGGER_LOG_BITMASK::DUMP_ELF);
+    debugManager.flags.DebuggerLogBitmask.set(NEO::DebugVariables::DEBUGGER_LOG_BITMASK::DUMP_ELF);
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -724,7 +248,7 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenDumpElfFlagAndZebinWhenInitializ
     moduleDesc.pInputModule = binary;
     moduleDesc.inputSize = 10;
 
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
 
     uint32_t kernelHeap = 0;
@@ -734,12 +258,14 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenDumpElfFlagAndZebinWhenInitializ
     kernelInfo->kernelDescriptor.kernelMetadata.kernelName = ZebinTestData::ValidEmptyProgram<>::kernelName;
 
     auto kernelImmutableData = ::std::make_unique<KernelImmutableData>(device);
-    kernelImmutableData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
-    moduleMock->kernelImmDatas.push_back(std::move(kernelImmutableData));
+    kernelImmutableData->setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo->heapInfo.kernelHeapSize, false));
+    kernelImmutableData->initialize(kernelInfo.get(), device, nullptr, nullptr);
+    moduleMock->kernelImmData.push_back(std::move(kernelImmutableData));
 
     kernelImmutableData = ::std::make_unique<KernelImmutableData>(device);
-    kernelImmutableData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
-    moduleMock->kernelImmDatas.push_back(std::move(kernelImmutableData));
+    kernelImmutableData->setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo->heapInfo.kernelHeapSize, false));
+    kernelImmutableData->initialize(kernelInfo.get(), device, nullptr, nullptr);
+    moduleMock->kernelImmData.push_back(std::move(kernelImmutableData));
 
     auto zebin = ZebinTestData::ValidEmptyProgram<>();
 
@@ -749,37 +275,15 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenDumpElfFlagAndZebinWhenInitializ
              zebin.storage.data(), zebin.storage.size());
 
     std::string fileName = "dumped_debug_module.elf";
-    EXPECT_FALSE(fileExists(fileName));
+    EXPECT_FALSE(virtualFileExists(fileName));
 
+    VariableBackup<decltype(NEO::IoFunctions::fopenPtr)> mockFopenToNullAsNotNeededHere{&NEO::IoFunctions::fopenPtr, [](const char *filename, const char *mode) -> FILE * { return nullptr; }};
     EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_TRUE(fileExists(fileName));
-    std::remove(fileName.c_str());
+    EXPECT_TRUE(virtualFileExists(fileName));
+    removeVirtualFile(fileName.c_str());
 }
 
-HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinNoDebugDataWhenInitializingModuleThenDoNotRegisterElfAndDoNotNotifyModuleCreate) {
-
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(cip);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
-    EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->registerElfCount);
-    EXPECT_EQ(0u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleCreateCount);
-}
-
-HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinWhenModuleIsInitializedAndDestroyedThenModuleHandleIsAttachedAndRemoved) {
+HWTEST_F(ModuleWithDebuggerL0Test, GivenZebinWhenModuleIsInitializedAndDestroyedThenModuleHandleIsAttachedAndRemoved) {
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -796,10 +300,11 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinWhenModuleIsInitializedAndD
     kernelInfo->kernelDescriptor.kernelMetadata.kernelName = ZebinTestData::ValidEmptyProgram<>::kernelName;
 
     auto kernelImmutableData = ::std::make_unique<KernelImmutableData>(device);
-    kernelImmutableData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
+    kernelImmutableData->setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo->heapInfo.kernelHeapSize, false));
+    kernelImmutableData->initialize(kernelInfo.get(), device, nullptr, nullptr);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    moduleMock->kernelImmDatas.push_back(std::move(kernelImmutableData));
+    moduleMock->kernelImmData.push_back(std::move(kernelImmutableData));
 
     auto zebin = ZebinTestData::ValidEmptyProgram<>();
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
@@ -825,95 +330,7 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenZebinWhenModuleIsInitializedAndD
     EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleDestroyCount);
 }
 
-HWTEST_F(ModuleWithDebuggerL0Test, GivenNonZebinBinaryWhenDestroyModuleThenModuleDestroyNotified) {
-
-    auto cip = std::make_unique<NEO::MockCompilerInterfaceCaptureBuildOptions>();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface = std::move(cip);
-
-    uint8_t binary[10] = {0};
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-
-    std::vector<uint8_t> data;
-    data.resize(4);
-    NEO::Elf::ElfEncoder<> elfEncoder;
-    elfEncoder.getElfFileHeader().type = NEO::Elf::SHT_PROGBITS;
-    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix, data);
-    auto elfBinary = elfEncoder.encode();
-
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(elfBinary.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(elfBinary.data());
-    kernelInfo->kernelDescriptor.external.debugData->genIsa = nullptr;
-    kernelInfo->kernelDescriptor.external.debugData->genIsaSize = 0;
-
-    EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    moduleMock->destroy();
-    moduleMock.release();
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleDestroyCount);
-}
-
-HWTEST_F(ModuleWithDebuggerL0Test, GivenNoDebugDataWhenDestroyingModuleThenNotifyModuleDestroy) {
-
-    auto cip = std::make_unique<NEO::MockCompilerInterfaceCaptureBuildOptions>();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface = std::move(cip);
-
-    uint8_t binary[10] = {0};
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, moduleBuildLog, ModuleType::User);
-    moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-    auto mockTranslationUnit = toMockPtr(moduleMock->translationUnit.get());
-    mockTranslationUnit->processUnpackedBinaryCallBase = false;
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    Mock<::L0::Kernel> kernelMock;
-    kernelMock.module = moduleMock.get();
-    kernelMock.immutableData.kernelInfo = kernelInfo;
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-
-    moduleMock->kernelImmData = &kernelMock.immutableData;
-    moduleMock->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    EXPECT_EQ(moduleMock->initialize(&moduleDesc, neoDevice), ZE_RESULT_SUCCESS);
-    EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-    moduleMock->destroy();
-    moduleMock.release();
-    EXPECT_EQ(1u, getMockDebuggerL0Hw<FamilyType>()->notifyModuleDestroyCount);
-}
-
-HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenModuleDebugHandleZeroWhenInitializingAndDestoryingModuleThenHandleIsNotPassedToDebugger) {
+HWTEST_F(ModuleWithDebuggerL0Test, GivenModuleDebugHandleZeroWhenInitializingAndDestoryingModuleThenHandleIsNotPassedToDebugger) {
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -930,9 +347,10 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenModuleDebugHandleZeroWhenInitial
     kernelInfo->kernelDescriptor.kernelMetadata.kernelName = ZebinTestData::ValidEmptyProgram<>::kernelName;
 
     auto kernelImmutableData = ::std::make_unique<KernelImmutableData>(device);
-    kernelImmutableData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
-    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
-    moduleMock->kernelImmDatas.push_back(std::move(kernelImmutableData));
+    kernelImmutableData->setIsaPerKernelAllocation(this->allocateIsaMemory(kernelInfo->heapInfo.kernelHeapSize, false));
+    kernelImmutableData->initialize(kernelInfo.get(), device, nullptr, nullptr);
+    std::unique_ptr<MockModule> moduleMock = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
+    moduleMock->kernelImmData.push_back(std::move(kernelImmutableData));
 
     auto zebin = ZebinTestData::ValidEmptyProgram<>();
     moduleMock->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
@@ -955,7 +373,7 @@ HWTEST_F(ModuleWithZebinAndL0DebuggerTest, GivenModuleDebugHandleZeroWhenInitial
     EXPECT_EQ(std::numeric_limits<uint32_t>::max(), getMockDebuggerL0Hw<FamilyType>()->removedZebinModuleHandle);
 }
 
-using NotifyModuleLoadTest = Test<ModuleFixture>;
+using NotifyModuleLoadTest = Test<ModuleFixtureWithoutModule>;
 
 HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleIsCreatedAndFullyLinkedThenIsaAllocationsAreCopiedAndResidentOnlyForUserModules) {
 
@@ -968,7 +386,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleIsCreatedAndFullyL
     auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
 
-    auto elfAdditionalSections = {ZebinTestData::appendElfAdditionalSection::CONSTANT}; // for const surface allocation copy
+    auto elfAdditionalSections = {ZebinTestData::AppendElfAdditionalSection::constant}; // for const surface allocation copy
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), elfAdditionalSections);
     const auto &src = zebinData->storage;
 
@@ -980,7 +398,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleIsCreatedAndFullyL
     ModuleBuildLog *moduleBuildLog = nullptr;
     neoDevice->executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(nullptr);
 
-    auto module = std::make_unique<WhiteBox<::L0::Module>>(device, moduleBuildLog, ModuleType::User);
+    auto module = std::make_unique<WhiteBox<::L0::Module>>(device, moduleBuildLog, ModuleType::user);
     ASSERT_NE(nullptr, module.get());
 
     memoryOperationsHandler->makeResidentCalledCount = 0;
@@ -1001,7 +419,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleIsCreatedAndFullyL
         EXPECT_TRUE(ki->isIsaCopiedToAllocation());
     }
 
-    auto moduleBuiltin = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::Builtin));
+    auto moduleBuiltin = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::builtin));
     ASSERT_NE(nullptr, moduleBuiltin.get());
 
     memoryOperationsHandler->makeResidentCalledCount = 0;
@@ -1036,7 +454,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleWithUnresolvedSymb
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<Module>(new Module(device, moduleBuildLog, ModuleType::User));
+    auto module = std::unique_ptr<Module>(new Module(device, moduleBuildLog, ModuleType::user));
     ASSERT_NE(nullptr, module.get());
 
     NEO::Linker::RelocationInfo unresolvedRelocation;
@@ -1084,7 +502,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleWithUnresolvedSymb
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<Module>(new Module(device, moduleBuildLog, ModuleType::User));
+    auto module = std::unique_ptr<Module>(new Module(device, moduleBuildLog, ModuleType::user));
     ASSERT_NE(nullptr, module.get());
 
     constexpr uint64_t gpuAddress = 0x12345;
@@ -1093,7 +511,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleWithUnresolvedSymb
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
@@ -1117,7 +535,7 @@ HWTEST_F(NotifyModuleLoadTest, givenDebuggingEnabledWhenModuleWithUnresolvedSymb
     NEO::SymbolInfo symbolInfo{};
     NEO::Linker::RelocatedSymbol<SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
-    auto module1 = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module1 = std::make_unique<Module>(device, nullptr, ModuleType::user);
 
     module1->symbols[unresolvedRelocation.symbolName] = relocatedSymbol;
 

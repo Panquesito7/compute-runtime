@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,7 +8,6 @@
 #include "opencl/source/event/async_events_handler.h"
 
 #include "shared/source/command_stream/wait_status.h"
-#include "shared/source/helpers/timestamp_packet.h"
 #include "shared/source/os_interface/os_thread.h"
 
 #include "opencl/source/event/event.h"
@@ -81,7 +80,7 @@ void *AsyncEventsHandler::asyncProcess(void *arg) {
         sleepCandidate = self->processList();
         if (sleepCandidate) {
             waitStatus = sleepCandidate->wait(true, true);
-            if (waitStatus == WaitStatus::GpuHang) {
+            if (waitStatus == WaitStatus::gpuHang) {
                 sleepCandidate->abortExecutionDueToGpuHang();
             }
         }
@@ -105,7 +104,7 @@ void AsyncEventsHandler::openThread() {
     if (!thread.get()) {
         DEBUG_BREAK_IF(allowAsyncProcess);
         allowAsyncProcess = true;
-        thread = Thread::create(asyncProcess, reinterpret_cast<void *>(this));
+        thread = Thread::createFunc(asyncProcess, reinterpret_cast<void *>(this));
     }
 }
 

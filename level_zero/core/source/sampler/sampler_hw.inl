@@ -1,19 +1,15 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#pragma once
-
-#include "shared/source/device/device.h"
-#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/utilities/numeric.h"
 
-#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/image/internal_core_image_ext.h"
 #include "level_zero/core/source/sampler/sampler_hw.h"
 
 namespace L0 {
@@ -22,6 +18,7 @@ ze_result_t SamplerCoreFamily<gfxCoreFamily>::initialize(Device *device, const z
     using SAMPLER_STATE = typename GfxFamily::SAMPLER_STATE;
 
     BaseClass::initialize(device, desc);
+    samplerState = GfxFamily::cmdInitSamplerState;
 
     samplerState.setNonNormalizedCoordinateEnable(!desc->isNormalized);
 
@@ -104,6 +101,21 @@ ze_result_t SamplerCoreFamily<gfxCoreFamily>::initialize(Device *device, const z
     samplerState.setTcyAddressControlMode(addressControlModeY);
     samplerState.setTczAddressControlMode(addressControlModeZ);
 
+    auto *extendedDesc = reinterpret_cast<const ze_base_desc_t *>(desc->pNext);
+    while (extendedDesc) {
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_SAMPLER_LOD_EXT_DESC) {
+            auto *lodDesc = reinterpret_cast<const ze_sampler_lod_ext_desc_t *>(extendedDesc);
+            this->lodMin = lodDesc->lodMin;
+            this->lodMax = lodDesc->lodMax;
+            if (lodDesc->mipFilterLinear) {
+                mipMode = SAMPLER_STATE::MIP_MODE_FILTER_LINEAR;
+                samplerState.setMipModeFilter(mipMode);
+            }
+            break;
+        }
+        extendedDesc = reinterpret_cast<const ze_base_desc_t *>(extendedDesc->pNext);
+    }
+
     NEO::FixedU4D8 minLodValue =
         NEO::FixedU4D8(std::min(getGenSamplerMaxLod(), this->lodMin));
     NEO::FixedU4D8 maxLodValue =
@@ -111,24 +123,19 @@ ze_result_t SamplerCoreFamily<gfxCoreFamily>::initialize(Device *device, const z
     samplerState.setMinLod(minLodValue.getRawAccess());
     samplerState.setMaxLod(maxLodValue.getRawAccess());
 
-    auto &hwInfo = device->getHwInfo();
-    auto &helper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::ProductHelper>();
-    helper.adjustSamplerState(&samplerState, hwInfo);
+    BaseClass::adjustSamplerState(&samplerState, device);
 
     return ZE_RESULT_SUCCESS;
 }
 
 template <GFXCORE_FAMILY gfxCoreFamily>
-void SamplerCoreFamily<gfxCoreFamily>::copySamplerStateToDSH(void *dynamicStateHeap,
-                                                             const uint32_t dynamicStateHeapSize,
+void SamplerCoreFamily<gfxCoreFamily>::copySamplerStateToDSH(ArrayRef<uint8_t> dynamicStateHeap,
                                                              const uint32_t samplerOffset) {
     using GfxFamily = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
     using SAMPLER_STATE = typename GfxFamily::SAMPLER_STATE;
-    using BINDING_TABLE_STATE = typename GfxFamily::BINDING_TABLE_STATE;
 
-    auto destSamplerState = ptrOffset(dynamicStateHeap, samplerOffset);
-    auto freeSpace = dynamicStateHeapSize - samplerOffset;
-    memcpy_s(destSamplerState, freeSpace, &samplerState, sizeof(SAMPLER_STATE));
+    auto freeSpace = dynamicStateHeap.size() - samplerOffset;
+    memcpy_s(&dynamicStateHeap[samplerOffset], freeSpace, &samplerState, sizeof(SAMPLER_STATE));
 }
 
 } // namespace L0

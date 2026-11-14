@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include <atomic>
 #include <thread>
@@ -167,10 +168,10 @@ struct IDNode {
     NodeObjectType *next;
 };
 
-template <typename NodeObjectType, bool ThreadSafe = true, bool OwnsNodes = false, bool SupportRecursiveLock = true>
-class IDList {
+template <typename NodeObjectType, bool threadSafe = true, bool ownsNodes = false, bool supportRecursiveLock = true>
+class IDList : NEO::NonCopyableAndNonMovableClass {
   public:
-    using ThisType = IDList<NodeObjectType, ThreadSafe, OwnsNodes, SupportRecursiveLock>;
+    using ThisType = IDList<NodeObjectType, threadSafe, ownsNodes, supportRecursiveLock>;
 
     IDList()
         : head(nullptr), tail(nullptr), locked(), spinLockedListener(nullptr) {
@@ -191,9 +192,6 @@ class IDList {
     ~IDList() {
         this->cleanup();
     }
-
-    IDList(const IDList &) = delete;
-    IDList &operator=(const IDList &) = delete;
 
     void pushFrontOne(NodeObjectType &node) {
         processLocked<ThisType, &ThisType::pushFrontOneImpl>(&node);
@@ -251,8 +249,9 @@ class IDList {
     NodeObjectType *peekTailImpl(NodeObjectType *, void *) {
         return tail;
     }
-    template <bool C = OwnsNodes>
-    typename std::enable_if<C, void>::type cleanup() {
+    template <bool listOwnsNodes = ownsNodes>
+        requires(listOwnsNodes)
+    void cleanup() {
         if (head != nullptr) {
             head->deleteThisAndAllNext();
         }
@@ -260,8 +259,9 @@ class IDList {
         tail = nullptr;
     }
 
-    template <bool C = OwnsNodes>
-    typename std::enable_if<!C, void>::type cleanup() {
+    template <bool listOwnsNodes = ownsNodes>
+        requires(!listOwnsNodes)
+    void cleanup() {
         ;
     }
 
@@ -271,15 +271,16 @@ class IDList {
         }
     }
 
-    template <typename T, NodeObjectType *(T::*Process)(NodeObjectType *node1, void *data), bool C1 = ThreadSafe, bool C2 = SupportRecursiveLock>
-    typename std::enable_if<C1 && !C2, NodeObjectType *>::type processLocked(NodeObjectType *node1 = nullptr, void *data = nullptr) {
+    template <typename T, NodeObjectType *(T::*process)(NodeObjectType *node1, void *data), bool listIsThreadSafe = threadSafe, bool recursiveLockIsSupported = supportRecursiveLock>
+        requires(listIsThreadSafe && !recursiveLockIsSupported)
+    NodeObjectType *processLocked(NodeObjectType *node1 = nullptr, void *data = nullptr) {
         while (locked.test_and_set(std::memory_order_acquire)) {
             notifySpinLocked();
         }
 
         NodeObjectType *ret = nullptr;
         try {
-            ret = (static_cast<T *>(this)->*Process)(node1, data);
+            ret = (static_cast<T *>(this)->*process)(node1, data);
         } catch (...) {
             locked.clear(std::memory_order_release);
             throw;
@@ -290,11 +291,12 @@ class IDList {
         return ret;
     }
 
-    template <typename T, NodeObjectType *(T::*Process)(NodeObjectType *node1, void *data), bool C1 = ThreadSafe, bool C2 = SupportRecursiveLock>
-    typename std::enable_if<C1 && C2, NodeObjectType *>::type processLocked(NodeObjectType *node1 = nullptr, void *data = nullptr) {
+    template <typename T, NodeObjectType *(T::*process)(NodeObjectType *node1, void *data), bool listIsThreadSafe = threadSafe, bool recursiveLockIsSupported = supportRecursiveLock>
+        requires(listIsThreadSafe && recursiveLockIsSupported)
+    NodeObjectType *processLocked(NodeObjectType *node1 = nullptr, void *data = nullptr) {
         std::thread::id currentThreadId = std::this_thread::get_id();
         if (lockOwner == currentThreadId) {
-            return (static_cast<T *>(this)->*Process)(node1, data);
+            return (static_cast<T *>(this)->*process)(node1, data);
         }
 
         while (locked.test_and_set(std::memory_order_acquire)) {
@@ -305,7 +307,7 @@ class IDList {
 
         NodeObjectType *ret = nullptr;
         try {
-            ret = (static_cast<T *>(this)->*Process)(node1, data);
+            ret = (static_cast<T *>(this)->*process)(node1, data);
         } catch (...) {
             lockOwner = std::thread::id();
             locked.clear(std::memory_order_release);
@@ -318,9 +320,10 @@ class IDList {
         return ret;
     }
 
-    template <typename T, NodeObjectType *(T::*Process)(NodeObjectType *node, void *data), bool C = ThreadSafe>
-    typename std::enable_if<!C, NodeObjectType *>::type processLocked(NodeObjectType *node = nullptr, void *data = nullptr) {
-        return (this->*Process)(node, data);
+    template <typename T, NodeObjectType *(T::*process)(NodeObjectType *node, void *data), bool listIsThreadSafe = threadSafe>
+        requires(!listIsThreadSafe)
+    NodeObjectType *processLocked(NodeObjectType *node = nullptr, void *data = nullptr) {
+        return (this->*process)(node, data);
     }
 
     NodeObjectType *pushFrontOneImpl(NodeObjectType *node, void *) {
@@ -459,11 +462,11 @@ struct IDNodeRef : IDNode<IDNodeRef<NodeObjectType>> {
     NodeObjectType *ref;
 };
 
-template <typename NodeObjectType, bool ThreadSafe = true, bool OwnsNodes = true>
-class IDRefList : public IDList<IDNodeRef<NodeObjectType>, ThreadSafe, OwnsNodes> {
+template <typename NodeObjectType, bool threadSafe = true, bool ownsNodes = true>
+class IDRefList : public IDList<IDNodeRef<NodeObjectType>, threadSafe, ownsNodes> {
   public:
     void pushRefFrontOne(NodeObjectType &node) {
-        auto refNode = std::unique_ptr<IDNodeRef<NodeObjectType>>(new IDNodeRef<NodeObjectType>(&node));
+        auto refNode = std::make_unique<IDNodeRef<NodeObjectType>>(&node);
         this->pushFrontOne(*refNode);
         refNode.release();
     }

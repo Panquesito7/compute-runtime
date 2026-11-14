@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,12 @@
 
 #pragma once
 
+#include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/engine_info.h"
+#include "shared/source/os_interface/linux/hw_device_id.h"
 #include "shared/source/os_interface/linux/i915_prelim.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/scheduler/linux/os_scheduler_imp.h"
@@ -30,19 +33,19 @@ const std::vector<std::string> listOfMockedEngines = {"rcs0", "bcs0", "vcs0", "v
 uint32_t tileCount = 2u;
 uint32_t numberOfEnginesInSched = 34u;
 
-struct MockSchedulerNeoDrm : public Drm {
-    using Drm::getEngineInfo;
-    using Drm::setupIoctlHelper;
-    const int mockFd = 0;
-    MockSchedulerNeoDrm(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<HwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
+struct MockSchedulerNeoDrm : public NEO::Drm {
+    using NEO::Drm::getEngineInfo;
+    using NEO::Drm::setupIoctlHelper;
+    static constexpr int mockFd = 0;
+    MockSchedulerNeoDrm(NEO::RootDeviceEnvironment &rootDeviceEnvironment) : NEO::Drm(std::make_unique<NEO::HwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
 
     bool sysmanQueryEngineInfo() override {
 
-        uint16_t engineClassCopy = ioctlHelper->getDrmParamValue(DrmParam::EngineClassCopy);
-        uint16_t engineClassCompute = ioctlHelper->getDrmParamValue(DrmParam::EngineClassCompute);
-        uint16_t engineClassVideo = ioctlHelper->getDrmParamValue(DrmParam::EngineClassVideo);
-        uint16_t engineClassVideoEnhance = ioctlHelper->getDrmParamValue(DrmParam::EngineClassVideoEnhance);
-        uint16_t engineClassInvalid = ioctlHelper->getDrmParamValue(DrmParam::EngineClassInvalid);
+        uint16_t engineClassCopy = ioctlHelper->getDrmParamValue(NEO::DrmParam::engineClassCopy);
+        uint16_t engineClassCompute = ioctlHelper->getDrmParamValue(NEO::DrmParam::engineClassCompute);
+        uint16_t engineClassVideo = ioctlHelper->getDrmParamValue(NEO::DrmParam::engineClassVideo);
+        uint16_t engineClassVideoEnhance = ioctlHelper->getDrmParamValue(NEO::DrmParam::engineClassVideoEnhance);
+        uint16_t engineClassInvalid = ioctlHelper->getDrmParamValue(NEO::DrmParam::engineClassInvalid);
 
         // Fill distanceInfos vector with dummy values
         std::vector<NEO::DistanceInfo> distanceInfos = {
@@ -69,7 +72,7 @@ struct MockSchedulerNeoDrm : public Drm {
             {{1, 1}, {engineClassInvalid, 7}, 0},
         };
 
-        std::vector<QueryItem> queryItems{distanceInfos.size()};
+        std::vector<NEO::QueryItem> queryItems{distanceInfos.size()};
         for (auto i = 0u; i < distanceInfos.size(); i++) {
             queryItems[i].queryId = PRELIM_DRM_I915_QUERY_DISTANCE_INFO;
             queryItems[i].length = sizeof(NEO::PrelimI915::prelim_drm_i915_query_distance_info);
@@ -149,7 +152,7 @@ struct MockSchedulerNeoDrm : public Drm {
         i915QueryEngineInfo[33].engine.engineClass = engineClassCompute;
         i915QueryEngineInfo[33].engine.engineInstance = 7;
 
-        this->engineInfo.reset(new EngineInfo(this, tileCount, distanceInfos, queryItems, i915QueryEngineInfo));
+        this->engineInfo.reset(new NEO::EngineInfo(this, tileCount, distanceInfos, queryItems, i915QueryEngineInfo));
         return true;
     }
 
@@ -241,8 +244,6 @@ class MockSchedulerProcfsAccess : public ProcfsAccess {
     ADDMETHOD_NOBASE_VOIDRETURN(kill, (const ::pid_t pid));
 };
 
-// class SchedulerSysfsAccess : public SysfsAccess {};
-
 typedef struct SchedulerConfigValues {
     uint64_t defaultVal;
     uint64_t actualVal;
@@ -280,7 +281,7 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
     bool mockGetValueForError = false;
     bool mockGetValueForErrorWhileWrite = false;
 
-    std::map<std::string, SchedulerConfig_t *> engineSchedMap;
+    std::map<std::string, SchedulerConfig_t> engineSchedMap;
     std::map<std::string, SchedulerFileProperties> engineSchedFilePropertiesMap;
 
     ze_result_t getValForError(const std::string file, uint64_t &val) {
@@ -289,15 +290,6 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
 
     ze_result_t getValForErrorWhileWrite(const std::string file, const uint64_t val) {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
-    }
-
-    void cleanUpMap() {
-        for (std::string mappedEngine : listOfMockedEngines) {
-            auto it = engineSchedMap.find(mappedEngine);
-            if (it != engineSchedMap.end()) {
-                delete it->second;
-            }
-        }
     }
 
     ze_result_t getFileProperties(const std::string file, SchedulerFileProperties &fileProps) {
@@ -385,7 +377,7 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
                 // As "prelim_enable_eu_debug" node is common across system, hence below we could find
                 // using any engine node. Lets use rcs0 here.
                 auto it = engineSchedMap.find("rcs0");
-                val = it->second->euDebugEnable;
+                val = it->second.euDebugEnable;
                 return ZE_RESULT_SUCCESS;
             }
             if (file.find(mappedEngine) == std::string::npos) {
@@ -398,15 +390,15 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
             if (file.compare(file.length() - enableEuDebug.length(),
                              enableEuDebug.length(),
                              enableEuDebug) == 0) {
-                val = it->second->euDebugEnable;
+                val = it->second.euDebugEnable;
             }
             if (file.compare((file.length() - preemptTimeoutMilliSecs.length()),
                              preemptTimeoutMilliSecs.length(),
                              preemptTimeoutMilliSecs) == 0) {
                 if (file.find(".defaults") != std::string::npos) {
-                    val = it->second->timeOut.defaultVal;
+                    val = it->second.timeOut.defaultVal;
                 } else {
-                    val = it->second->timeOut.actualVal;
+                    val = it->second.timeOut.actualVal;
                 }
                 return ZE_RESULT_SUCCESS;
             }
@@ -414,9 +406,9 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
                              timesliceDurationMilliSecs.length(),
                              timesliceDurationMilliSecs) == 0) {
                 if (file.find(".defaults") != std::string::npos) {
-                    val = it->second->timeSclice.defaultVal;
+                    val = it->second.timeSclice.defaultVal;
                 } else {
-                    val = it->second->timeSclice.actualVal;
+                    val = it->second.timeSclice.actualVal;
                 }
                 return ZE_RESULT_SUCCESS;
             }
@@ -424,9 +416,9 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
                              heartbeatIntervalMilliSecs.length(),
                              heartbeatIntervalMilliSecs) == 0) {
                 if (file.find(".defaults") != std::string::npos) {
-                    val = it->second->heartBeat.defaultVal;
+                    val = it->second.heartBeat.defaultVal;
                 } else {
-                    val = it->second->heartBeat.actualVal;
+                    val = it->second.heartBeat.actualVal;
                 }
                 return ZE_RESULT_SUCCESS;
             }
@@ -467,80 +459,45 @@ struct MockSchedulerSysfsAccess : public SysfsAccess {
             // This node is not engine specific. Hence it needs to be handled separately.
             // All other engine specific nodes are handled outside of this if block inside for loop
             for (auto &mappedEngine : listOfMockedEngines) {
-                SchedulerConfig_t *schedConfig = new SchedulerConfig_t();
-                schedConfig->euDebugEnable = val;
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    itr->second->euDebugEnable = val;
-                    delete schedConfig;
-                }
+                engineSchedMap[mappedEngine].euDebugEnable = val;
             }
             return ZE_RESULT_SUCCESS;
         }
 
-        for (std::string mappedEngine : listOfMockedEngines) { // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+        for (const auto &mappedEngine : listOfMockedEngines) {
             if (file.find(mappedEngine) == std::string::npos) {
                 continue;
             }
-            SchedulerConfig_t *schedConfig = new SchedulerConfig_t();
             if (file.compare((file.length() - preemptTimeoutMilliSecs.length()),
                              preemptTimeoutMilliSecs.length(),
                              preemptTimeoutMilliSecs) == 0) {
+                auto &schedConfig = engineSchedMap[mappedEngine];
                 if (file.find(".defaults") != std::string::npos) {
-                    schedConfig->timeOut.defaultVal = val;
+                    schedConfig.timeOut.defaultVal = val;
                 } else {
-                    schedConfig->timeOut.actualVal = val;
-                }
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    if (file.find(".defaults") != std::string::npos) {
-                        itr->second->timeOut.defaultVal = val;
-                    } else {
-                        itr->second->timeOut.actualVal = val;
-                    }
-                    delete schedConfig;
+                    schedConfig.timeOut.actualVal = val;
                 }
                 return ZE_RESULT_SUCCESS;
             }
             if (file.compare((file.length() - timesliceDurationMilliSecs.length()),
                              timesliceDurationMilliSecs.length(),
                              timesliceDurationMilliSecs) == 0) {
+                auto &schedConfig = engineSchedMap[mappedEngine];
                 if (file.find(".defaults") != std::string::npos) {
-                    schedConfig->timeSclice.defaultVal = val;
+                    schedConfig.timeSclice.defaultVal = val;
                 } else {
-                    schedConfig->timeSclice.actualVal = val;
-                }
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    if (file.find(".defaults") != std::string::npos) {
-                        itr->second->timeSclice.defaultVal = val;
-                    } else {
-                        itr->second->timeSclice.actualVal = val;
-                    }
-                    delete schedConfig;
+                    schedConfig.timeSclice.actualVal = val;
                 }
                 return ZE_RESULT_SUCCESS;
             }
             if (file.compare((file.length() - heartbeatIntervalMilliSecs.length()),
                              heartbeatIntervalMilliSecs.length(),
                              heartbeatIntervalMilliSecs) == 0) {
+                auto &schedConfig = engineSchedMap[mappedEngine];
                 if (file.find(".defaults") != std::string::npos) {
-                    schedConfig->heartBeat.defaultVal = val;
+                    schedConfig.heartBeat.defaultVal = val;
                 } else {
-                    schedConfig->heartBeat.actualVal = val;
-                }
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    if (file.find(".defaults") != std::string::npos) {
-                        itr->second->heartBeat.defaultVal = val;
-                    } else {
-                        itr->second->heartBeat.actualVal = val;
-                    }
-                    delete schedConfig;
+                    schedConfig.heartBeat.actualVal = val;
                 }
                 return ZE_RESULT_SUCCESS;
             }

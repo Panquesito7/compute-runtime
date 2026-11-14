@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,21 +7,20 @@
 
 #include "shared/source/compiler_interface/igc_platform_helper.h"
 
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/validators.h"
 
-#include "ocl_igc_interface/gt_system_info.h"
-#include "ocl_igc_interface/igc_features_and_workarounds.h"
 #include "ocl_igc_interface/platform_helper.h"
 
 namespace NEO {
 
-template <>
-void populateIgcPlatform<>(IGC::Platform<1> &igcPlatform, const HardwareInfo &hwInfo) {
-    IGC::PlatformHelper::PopulateInterfaceWith(igcPlatform, hwInfo.platform);
-}
-
-template <>
-void populateIgcPlatform<>(IGC::Platform<2> &igcPlatform, const HardwareInfo &hwInfo) {
+void populateIgcPlatform(PlatformTag &igcPlatform, const HardwareInfo &inputHwInfo) {
+    auto hwInfo = inputHwInfo;
+    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
+    if (compilerProductHelper) {
+        compilerProductHelper->adjustHwInfoForIgc(hwInfo);
+    }
     igcPlatform.SetProductFamily(hwInfo.platform.eProductFamily);
     igcPlatform.SetPCHProductFamily(hwInfo.platform.ePCHProductFamily);
     igcPlatform.SetDisplayCoreFamily(hwInfo.platform.eDisplayCoreFamily);
@@ -33,6 +32,26 @@ void populateIgcPlatform<>(IGC::Platform<2> &igcPlatform, const HardwareInfo &hw
     igcPlatform.SetRevId_PCH(hwInfo.platform.usRevId_PCH);
     igcPlatform.SetGTType(hwInfo.platform.eGTType);
     igcPlatform.SetRenderBlockID(hwInfo.ipVersion.value);
+}
+
+bool initializeIgcDeviceContext(NEO::IgcOclDeviceCtxTag *igcDeviceCtx, const HardwareInfo &hwInfo) {
+    auto igcPlatform = igcDeviceCtx->GetPlatformHandle<NEO::PlatformTag>();
+    auto igcGtSystemInfo = igcDeviceCtx->GetGTSystemInfoHandle<NEO::GTSystemInfoTag>();
+    auto igcFtrWa = igcDeviceCtx->GetIgcFeaturesAndWorkaroundsHandle<NEO::IgcFeaturesAndWorkaroundsTag>();
+
+    if (false == NEO::areNotNullptr(igcPlatform.get(), igcGtSystemInfo.get(), igcFtrWa.get())) {
+        return false;
+    }
+    populateIgcPlatform(*igcPlatform, hwInfo);
+
+    IGC::GtSysInfoHelper::PopulateInterfaceWith(*igcGtSystemInfo, hwInfo.gtSystemInfo);
+
+    igcFtrWa->SetFtrGpGpuMidThreadLevelPreempt(hwInfo.featureTable.flags.ftrWalkerMTP);
+    igcFtrWa->SetFtrWddm2Svm(hwInfo.featureTable.flags.ftrWddm2Svm);
+    igcFtrWa->SetFtrPooledEuEnabled(hwInfo.featureTable.flags.ftrPooledEuEnabled);
+    igcFtrWa->SetFtrEfficient64BitAddressing(hwInfo.featureTable.flags.ftrHeaplessMode);
+
+    return true;
 }
 
 } // namespace NEO

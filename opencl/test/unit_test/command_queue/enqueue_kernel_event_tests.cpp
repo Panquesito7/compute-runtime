@@ -1,13 +1,18 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/cmd_parse/hw_parse.h"
+#include "shared/test/common/test_macros/hw_test.h"
+
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/event/event.h"
+#include "opencl/source/event/user_event.h"
 #include "opencl/test/unit_test/fixtures/hello_world_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 
 #include "gtest/gtest.h"
 
@@ -86,9 +91,14 @@ TEST_F(EventTests, WhenWaitingForEventThenPipeControlIsNotInserted) {
     TaskCountType taskCountOfEvent = pEvent->peekTaskCount();
     EXPECT_LE(taskCountOfEvent, pCmdQ->getHwTag());
     // no more tasks after WFE, no need to write PC
-    EXPECT_EQ(pEvent->taskLevel + 1, csr.peekTaskLevel());
 
-    pCmdQ->finish();
+    auto expectedTaskLevel = pEvent->taskLevel.load();
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        expectedTaskLevel++;
+    }
+    EXPECT_EQ(expectedTaskLevel, csr.peekTaskLevel());
+
+    pCmdQ->finish(false);
 
     // Check CL_EVENT_COMMAND_TYPE
     {
@@ -130,10 +140,14 @@ TEST_F(EventTests, GivenTwoEnqueuesWhenWaitingForBothEventsThenTaskLevelIsCorrec
 
     retVal = Event::waitForEvents(2, event);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(pEvent1->taskLevel + 1, csr.peekTaskLevel());
 
-    pCmdQ->finish();
-    EXPECT_EQ(pEvent1->taskLevel + 1, csr.peekTaskLevel());
+    auto expectedTaskLevel1 = pEvent1->taskLevel.load();
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        expectedTaskLevel1++;
+    }
+    EXPECT_EQ(expectedTaskLevel1, csr.peekTaskLevel());
+    pCmdQ->finish(false);
+    EXPECT_EQ(expectedTaskLevel1, csr.peekTaskLevel());
     // Check CL_EVENT_COMMAND_TYPE
     {
         cl_command_type cmdType = 0;
@@ -165,15 +179,28 @@ TEST_F(EventTests, GivenNoEventsWhenEnqueuingKernelThenTaskLevelIsIncremented) {
 
     retVal = Event::waitForEvents(1, &event);
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(pEvent->taskLevel + 1, csr.peekTaskLevel());
+
+    auto taskLevelEvent = pEvent->taskLevel.load();
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        taskLevelEvent++;
+    }
+
+    EXPECT_EQ(taskLevelEvent, csr.peekTaskLevel());
 
     retVal = callOneWorkItemNDRKernel(eventWaitList, numEventsInWaitList, nullptr);
 
     ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(pEvent->taskLevel + 2, csr.peekTaskLevel());
 
-    pCmdQ->finish();
-    EXPECT_EQ(pEvent->taskLevel + 2, csr.peekTaskLevel());
+    taskLevelEvent = pEvent->taskLevel.load();
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        taskLevelEvent += 2;
+    } else {
+        taskLevelEvent += 1;
+    }
+    EXPECT_EQ(taskLevelEvent, csr.peekTaskLevel());
+
+    pCmdQ->finish(false);
+    EXPECT_EQ(taskLevelEvent, csr.peekTaskLevel());
 
     // Check CL_EVENT_COMMAND_TYPE
     {
@@ -189,6 +216,9 @@ TEST_F(EventTests, GivenNoEventsWhenEnqueuingKernelThenTaskLevelIsIncremented) {
 }
 
 TEST_F(EventTests, WhenEnqueuingMarkerThenPassedEventHasTheSameLevelAsPreviousCommand) {
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
+
     cl_uint numEventsInWaitList = 0;
     cl_event *eventWaitList = nullptr;
     cl_event event = nullptr;
@@ -229,4 +259,29 @@ TEST_F(EventTests, WhenEnqueuingMarkerThenPassedEventHasTheSameLevelAsPreviousCo
 
     clReleaseEvent(event);
     clReleaseEvent(event2);
+}
+
+HWTEST_F(EventTests, givenEnqueueKernelBlockedOnserEventWhenEnqueueHasOutEventWithProfilingThenPCisProgrammed) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+    MockKernelWithInternals mockKernelWithInternals(*context);
+    MockKernel *kernel = mockKernelWithInternals.mockKernel;
+    UserEvent userEvent;
+    cl_event userEventWaitlist[] = {&userEvent};
+    cl_event outEvent;
+    auto ccsStart = pCmdQ->getGpgpuCommandStreamReceiver().getCS().getUsed();
+    auto mockCmdQueue = static_cast<MockCommandQueueHw<FamilyType> *>(pCmdQ);
+    mockCmdQueue->commandQueueProperties |= CL_QUEUE_PROFILING_ENABLE;
+    EXPECT_EQ(CL_SUCCESS, pCmdQ->enqueueKernel(kernel, 1, nullptr, nullptr, nullptr, 1, userEventWaitlist, &outEvent));
+
+    userEvent.setStatus(CL_COMPLETE);
+    {
+        HardwareParse ccsHwParser;
+        ccsHwParser.parseCommands<FamilyType>(pCmdQ->getGpgpuCommandStreamReceiver().getCS(0), ccsStart);
+        const auto pipeControlItor = find<PIPE_CONTROL *>(ccsHwParser.cmdList.begin(), ccsHwParser.cmdList.end());
+        EXPECT_NE(pipeControlItor, ccsHwParser.cmdList.end());
+    }
+
+    EXPECT_EQ(CL_SUCCESS, pCmdQ->finish(false));
+    clReleaseEvent(outEvent);
 }

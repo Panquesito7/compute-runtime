@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,15 +15,15 @@
 using namespace NEO;
 
 TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenIsCreatedThenAllInspectionIdsAreSetToZero) {
-    MockGraphicsAllocation graphicsAllocation(0, AllocationType::UNKNOWN, nullptr, 0u, 0u, 0, MemoryPool::MemoryNull, MemoryManager::maxOsContextCount);
+    MockGraphicsAllocation graphicsAllocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0u, 0u, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount);
     for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
         EXPECT_EQ(0u, graphicsAllocation.getInspectionId(i));
     }
 }
 
 TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenIsCreatedThenTaskCountsAreInitializedProperly) {
-    GraphicsAllocation graphicsAllocation1(0, AllocationType::UNKNOWN, nullptr, 0u, 0u, 0, MemoryPool::MemoryNull, MemoryManager::maxOsContextCount);
-    GraphicsAllocation graphicsAllocation2(0, AllocationType::UNKNOWN, nullptr, 0u, 0u, 0, MemoryPool::MemoryNull, MemoryManager::maxOsContextCount);
+    GraphicsAllocation graphicsAllocation1(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0u, 0u, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount);
+    GraphicsAllocation graphicsAllocation2(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0u, 0u, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount);
     for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
         EXPECT_EQ(MockGraphicsAllocation::objectNotUsed, graphicsAllocation1.getTaskCount(i));
         EXPECT_EQ(MockGraphicsAllocation::objectNotUsed, graphicsAllocation2.getTaskCount(i));
@@ -39,10 +39,39 @@ TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenUpdatedTaskCountThenAllo
     EXPECT_TRUE(graphicsAllocation.isUsed());
 }
 
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingSimulationInitialUploadDoneStateThenStateIsUpdated) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    EXPECT_FALSE(graphicsAllocation.isSimulationInitialUploadDone());
+
+    graphicsAllocation.setSimulationInitialUploadDone(true);
+    EXPECT_TRUE(graphicsAllocation.isSimulationInitialUploadDone());
+
+    graphicsAllocation.setSimulationInitialUploadDone(false);
+    EXPECT_FALSE(graphicsAllocation.isSimulationInitialUploadDone());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingSharedPhysicalMemoryMappingThenStateIsUpdated) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    EXPECT_FALSE(graphicsAllocation.isSharedPhysicalMemoryMapping());
+
+    graphicsAllocation.setSharedPhysicalMemoryMapping(true);
+    EXPECT_TRUE(graphicsAllocation.isSharedPhysicalMemoryMapping());
+
+    graphicsAllocation.setSharedPhysicalMemoryMapping(false);
+    EXPECT_FALSE(graphicsAllocation.isSharedPhysicalMemoryMapping());
+}
+
 TEST(GraphicsAllocationTest, givenGraphicsAllocationGetDefaultHandleAddressAndHandleSize) {
     MockGraphicsAllocation graphicsAllocation;
     EXPECT_EQ(0lu, graphicsAllocation.getHandleAddressBase(0));
     EXPECT_EQ(0lu, graphicsAllocation.getHandleSize(0));
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenCheckingPartialObjectMappingThenDefaultImplementationReturnsFalse) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_FALSE(graphicsAllocation.isPartialObjectMapping());
 }
 
 TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenUpdatedTaskCountThenOnlyOneTaskCountIsUpdated) {
@@ -59,6 +88,20 @@ TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenUpdatedTaskCountThenOnly
         EXPECT_EQ(MockGraphicsAllocation::objectNotUsed, graphicsAllocation.getTaskCount(i));
     }
 }
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenGettingTaskCountForInvalidContextIdThenObjectNotUsedIsReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
+        graphicsAllocation.updateTaskCount(1u, i);
+    }
+    EXPECT_EQ(MockGraphicsAllocation::objectNotUsed, graphicsAllocation.getTaskCount(MemoryManager::maxOsContextCount));
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenUpdatingTaskCountForInvalidContextIdThenAbortExecution) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_THROW(graphicsAllocation.updateTaskCount(1u, MemoryManager::maxOsContextCount), std::runtime_error);
+}
+
 TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenUpdatedTaskCountToobjectNotUsedValueThenUnregisterContext) {
     MockGraphicsAllocation graphicsAllocation;
     EXPECT_FALSE(graphicsAllocation.isUsed());
@@ -124,49 +167,53 @@ TEST(GraphicsAllocationTest, givenResidentGraphicsAllocationWhenCheckIfResidency
     EXPECT_TRUE(graphicsAllocation.isResidencyTaskCountBelow(currentResidencyTaskCount + 1u, 0u));
 }
 
-TEST(GraphicsAllocationTest, whenAllocationTypeIsCommandBufferThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::COMMAND_BUFFER));
+TEST(GraphicsAllocationTest, givenResidentGraphicsAllocationWhenUpdatingResidencyTaskCountForUnusedContextIdThenDoEarlyReturn) {
+    MockGraphicsAllocation graphicsAllocation;
+    auto contextId = static_cast<uint32_t>(graphicsAllocation.usageInfos.size());
+    graphicsAllocation.updateResidencyTaskCount(1u, contextId);
 }
 
-TEST(GraphicsAllocationTest, whenAllocationTypeIsConstantSurfaceThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::CONSTANT_SURFACE));
+TEST(GraphicsAllocationTest, givenImportedAllocationWhenCheckingAubWritableThenFalseIsReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_TRUE(graphicsAllocation.isAubWritable(GraphicsAllocation::defaultBank));
+
+    graphicsAllocation.setIsImported();
+    EXPECT_FALSE(graphicsAllocation.isAubWritable(GraphicsAllocation::defaultBank));
 }
 
-TEST(GraphicsAllocationTest, whenAllocationTypeIsGlobalSurfaceThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::GLOBAL_SURFACE));
-}
+TEST(GraphicsAllocationTest, givenAllocationTypeWhenCheckingCpuAccessRequiredThenReturnTrue) {
+    for (uint32_t i = 0; i < static_cast<uint32_t>(AllocationType::count); i++) {
+        auto allocType = static_cast<AllocationType>(i);
 
-TEST(GraphicsAllocationTest, whenAllocationTypeIsInternalHeapThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::INTERNAL_HEAP));
-}
-
-TEST(GraphicsAllocationTest, whenAllocationTypeIsKernelIsaThenCpuAccessIsNotRequired) {
-    EXPECT_FALSE(GraphicsAllocation::isCpuAccessRequired(AllocationType::KERNEL_ISA));
-}
-
-TEST(GraphicsAllocationTest, whenAllocationTypeIsKernelIsaInternalThenCpuAccessIsNotRequired) {
-    EXPECT_FALSE(GraphicsAllocation::isCpuAccessRequired(AllocationType::KERNEL_ISA_INTERNAL));
-}
-
-TEST(GraphicsAllocationTest, whenAllocationTypeIsLinearStreamThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::LINEAR_STREAM));
-}
-
-TEST(GraphicsAllocationTest, whenAllocationTypeIsPipeThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::PIPE));
-}
-
-TEST(GraphicsAllocationTest, whenAllocationTypeIsTimestampPacketThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::TIMESTAMP_PACKET_TAG_BUFFER));
-}
-
-TEST(GraphicsAllocationTest, whenAllocationTypeIsGpuTimestampDeviceBufferThenCpuAccessIsRequired) {
-    EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER));
+        switch (allocType) {
+        case AllocationType::commandBuffer:
+        case AllocationType::constantSurface:
+        case AllocationType::globalSurface:
+        case AllocationType::internalHeap:
+        case AllocationType::linearStream:
+        case AllocationType::printfSurface:
+        case AllocationType::timestampPacketTagBuffer:
+        case AllocationType::ringBuffer:
+        case AllocationType::semaphoreBuffer:
+        case AllocationType::debugContextSaveArea:
+        case AllocationType::debugSbaTrackingBuffer:
+        case AllocationType::gpuTimestampDeviceBuffer:
+        case AllocationType::debugModuleArea:
+        case AllocationType::assertBuffer:
+        case AllocationType::syncDispatchToken:
+        case AllocationType::syncBuffer:
+            EXPECT_TRUE(GraphicsAllocation::isCpuAccessRequired(allocType));
+            break;
+        default:
+            EXPECT_FALSE(GraphicsAllocation::isCpuAccessRequired(allocType));
+            break;
+        }
+    }
 }
 
 TEST(GraphicsAllocationTest, whenAllocationRequiresCpuAccessThenAllocationIsLockable) {
-    auto firstAllocationIdx = static_cast<int>(AllocationType::UNKNOWN);
-    auto lastAllocationIdx = static_cast<int>(AllocationType::COUNT);
+    auto firstAllocationIdx = static_cast<int>(AllocationType::unknown);
+    auto lastAllocationIdx = static_cast<int>(AllocationType::count);
 
     for (int allocationIdx = firstAllocationIdx; allocationIdx != lastAllocationIdx; allocationIdx++) {
         auto allocationType = static_cast<AllocationType>(allocationIdx);
@@ -177,32 +224,55 @@ TEST(GraphicsAllocationTest, whenAllocationRequiresCpuAccessThenAllocationIsLock
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsISAThenAllocationIsLockable) {
-    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::KERNEL_ISA));
-    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::KERNEL_ISA_INTERNAL));
+    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::kernelIsa));
+    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::kernelIsaInternal));
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsBufferThenAllocationIsNotLockable) {
-    EXPECT_FALSE(GraphicsAllocation::isLockable(AllocationType::BUFFER));
+    EXPECT_FALSE(GraphicsAllocation::isLockable(AllocationType::buffer));
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsBufferHostMemoryThenAllocationIsLockable) {
-    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::BUFFER_HOST_MEMORY));
+    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::bufferHostMemory));
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsGpuTimestampDeviceBufferThenAllocationIsLockable) {
-    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER));
+    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::gpuTimestampDeviceBuffer));
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsSvmGpuThenAllocationIsNotLockable) {
-    EXPECT_FALSE(GraphicsAllocation::isLockable(AllocationType::SVM_GPU));
+    EXPECT_FALSE(GraphicsAllocation::isLockable(AllocationType::svmGpu));
+}
+
+TEST(GraphicsAllocationTest, whenAllocationTypeIsSvmZeroCopyThenAllocationIsLockable) {
+    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::svmZeroCopy));
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsSharedResourceCopyThenAllocationIsLockable) {
-    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::SHARED_RESOURCE_COPY));
+    EXPECT_TRUE(GraphicsAllocation::isLockable(AllocationType::sharedResourceCopy));
 }
 
 TEST(GraphicsAllocationTest, whenAllocationTypeIsImageThenAllocationIsNotLockable) {
-    EXPECT_FALSE(GraphicsAllocation::isLockable(AllocationType::IMAGE));
+    EXPECT_FALSE(GraphicsAllocation::isLockable(AllocationType::image));
+}
+
+TEST(GraphicsAllocationTest, givenAllocationTypeWhenCheckingIs2MBPageAllocationTypeThenReturnTrue) {
+    for (uint32_t i = 0; i < static_cast<uint32_t>(AllocationType::count); i++) {
+        auto allocType = static_cast<AllocationType>(i);
+
+        switch (allocType) {
+        case AllocationType::timestampPacketTagBuffer:
+        case AllocationType::gpuTimestampDeviceBuffer:
+        case AllocationType::profilingTagBuffer:
+        case AllocationType::printfSurface:
+        case AllocationType::scratchSurface:
+            EXPECT_TRUE(GraphicsAllocation::is2MBPageAllocationType(allocType));
+            break;
+        default:
+            EXPECT_FALSE(GraphicsAllocation::is2MBPageAllocationType(allocType));
+            break;
+        }
+    }
 }
 
 TEST(GraphicsAllocationTest, givenNumMemoryBanksWhenGettingNumHandlesForKmdSharedAllocationThenReturnCorrectValue) {
@@ -211,10 +281,10 @@ TEST(GraphicsAllocationTest, givenNumMemoryBanksWhenGettingNumHandlesForKmdShare
     EXPECT_EQ(1u, GraphicsAllocation::getNumHandlesForKmdSharedAllocation(1));
     EXPECT_EQ(2u, GraphicsAllocation::getNumHandlesForKmdSharedAllocation(2));
 
-    DebugManager.flags.CreateKmdMigratedSharedAllocationWithMultipleBOs.set(0);
+    debugManager.flags.CreateKmdMigratedSharedAllocationWithMultipleBOs.set(0);
     EXPECT_EQ(1u, GraphicsAllocation::getNumHandlesForKmdSharedAllocation(2));
 
-    DebugManager.flags.CreateKmdMigratedSharedAllocationWithMultipleBOs.set(1);
+    debugManager.flags.CreateKmdMigratedSharedAllocationWithMultipleBOs.set(1);
     EXPECT_EQ(2u, GraphicsAllocation::getNumHandlesForKmdSharedAllocation(2));
 }
 
@@ -235,14 +305,14 @@ TEST(GraphicsAllocationTest, givenAlwaysResidentAllocationWhenUpdateTaskCountThe
 TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenInternalHandleIsBeingObtainedThenZeroIsReturned) {
     MockGraphicsAllocation graphicsAllocation;
     uint64_t handle = 0;
-    graphicsAllocation.peekInternalHandle(nullptr, handle);
+    graphicsAllocation.peekInternalHandle(nullptr, handle, nullptr);
     EXPECT_EQ(0ull, handle);
 }
 
 TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenInternalHandleIsBeingObtainedOrCreatedThenZeroIsReturned) {
     MockGraphicsAllocation graphicsAllocation;
     uint64_t handle = 0;
-    graphicsAllocation.createInternalHandle(nullptr, 0u, handle);
+    graphicsAllocation.createInternalHandle(nullptr, 0u, handle, nullptr);
     EXPECT_EQ(0ull, handle);
     graphicsAllocation.clearInternalHandle(0u);
 }
@@ -260,26 +330,48 @@ TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenGettingNumHandles
 
 TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenQueryingUsedPageSizeThenCorrectSizeForMemoryPoolUsedIsReturned) {
 
-    MemoryPool page4kPools[] = {MemoryPool::MemoryNull,
-                                MemoryPool::System4KBPages,
-                                MemoryPool::System4KBPagesWith32BitGpuAddressing,
-                                MemoryPool::SystemCpuInaccessible};
+    MemoryPool page4kPools[] = {MemoryPool::memoryNull,
+                                MemoryPool::system4KBPages,
+                                MemoryPool::system4KBPagesWith32BitGpuAddressing,
+                                MemoryPool::systemCpuInaccessible};
 
     for (auto pool : page4kPools) {
-        MockGraphicsAllocation graphicsAllocation(0, AllocationType::UNKNOWN, nullptr, 0u, 0u, static_cast<osHandle>(1), pool, MemoryManager::maxOsContextCount);
+        MockGraphicsAllocation graphicsAllocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0u, 0u, static_cast<osHandle>(1), pool, MemoryManager::maxOsContextCount);
 
         EXPECT_EQ(MemoryConstants::pageSize, graphicsAllocation.getUsedPageSize());
     }
 
-    MemoryPool page64kPools[] = {MemoryPool::System64KBPages,
-                                 MemoryPool::System64KBPagesWith32BitGpuAddressing,
-                                 MemoryPool::LocalMemory};
+    MemoryPool page64kPools[] = {MemoryPool::system64KBPages,
+                                 MemoryPool::system64KBPagesWith32BitGpuAddressing,
+                                 MemoryPool::localMemory};
 
     for (auto pool : page64kPools) {
-        MockGraphicsAllocation graphicsAllocation(0, AllocationType::UNKNOWN, nullptr, 0u, 0u, 0, pool, MemoryManager::maxOsContextCount);
+        MockGraphicsAllocation graphicsAllocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0u, 0u, 0, pool, MemoryManager::maxOsContextCount);
 
         EXPECT_EQ(MemoryConstants::pageSize64k, graphicsAllocation.getUsedPageSize());
     }
+}
+
+TEST(GraphicsAllocationTest, givenLocalMemoryAllocationWhenQualifiedFor2MBPagesThenUsedPageSizeIs2MB) {
+    MockGraphicsAllocation graphicsAllocation(nullptr, MemoryConstants::pageSize);
+    graphicsAllocation.overrideMemoryPool(MemoryPool::localMemory);
+    graphicsAllocation.setQualifiesFor2MBPages(true);
+
+    EXPECT_EQ(static_cast<uint32_t>(MemoryConstants::pageSize2M), graphicsAllocation.getUsedPageSize());
+}
+
+TEST(GraphicsAllocationTest, givenLocalMemoryAllocationWhenNotQualifiedFor2MBPagesThenUsedPageSizeIs64KB) {
+    MockGraphicsAllocation graphicsAllocation(nullptr, 10 * MemoryConstants::pageSize2M);
+    graphicsAllocation.overrideMemoryPool(MemoryPool::localMemory);
+
+    EXPECT_EQ(MemoryConstants::pageSize64k, graphicsAllocation.getUsedPageSize());
+}
+
+TEST(GraphicsAllocationTest, givenSystem64KBPagesAllocationWithSizeGreaterOrEqualTo2MBThenUsedPageSizeIs64KB) {
+    MockGraphicsAllocation graphicsAllocation(nullptr, MemoryConstants::pageSize2M);
+    graphicsAllocation.overrideMemoryPool(MemoryPool::system64KBPages);
+
+    EXPECT_EQ(MemoryConstants::pageSize64k, graphicsAllocation.getUsedPageSize());
 }
 
 struct GraphicsAllocationTests : public ::testing::Test {
@@ -298,16 +390,8 @@ struct GraphicsAllocationTests : public ::testing::Test {
     }
 
     void gfxAllocationSetToDefault() {
-        graphicsAllocation.storageInfo.readOnlyMultiStorage = false;
         graphicsAllocation.storageInfo.memoryBanks = 0;
-        graphicsAllocation.overrideMemoryPool(MemoryPool::MemoryNull);
-    }
-
-    void gfxAllocationEnableReadOnlyMultiStorage(uint32_t banks) {
-        graphicsAllocation.storageInfo.cloningOfPageTables = false;
-        graphicsAllocation.storageInfo.readOnlyMultiStorage = true;
-        graphicsAllocation.storageInfo.memoryBanks = banks;
-        graphicsAllocation.overrideMemoryPool(MemoryPool::LocalMemory);
+        graphicsAllocation.overrideMemoryPool(MemoryPool::memoryNull);
     }
 
     MockExecutionEnvironment executionEnvironment;
@@ -315,24 +399,13 @@ struct GraphicsAllocationTests : public ::testing::Test {
     MockGraphicsAllocation graphicsAllocation;
 };
 
-HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationWhenIsAubWritableIsCalledThenTrueIsReturned) {
-    initializeCsr<FamilyType>();
-    auto &aubCsr = getAubCsr<FamilyType>();
-
-    gfxAllocationSetToDefault();
-    EXPECT_TRUE(aubCsr.isAubWritable(graphicsAllocation));
-
-    gfxAllocationEnableReadOnlyMultiStorage(0b1111);
-    EXPECT_TRUE(aubCsr.isAubWritable(graphicsAllocation));
-}
-
 HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationThatHasPageTablesCloningWhenWriteableFlagsAreUsedThenDefaultBankIsUsed) {
     initializeCsr<FamilyType>();
     auto &aubCsr = getAubCsr<FamilyType>();
 
     gfxAllocationSetToDefault();
     graphicsAllocation.storageInfo.memoryBanks = 0x2;
-    graphicsAllocation.overrideMemoryPool(MemoryPool::LocalMemory);
+    graphicsAllocation.overrideMemoryPool(MemoryPool::localMemory);
     graphicsAllocation.storageInfo.cloningOfPageTables = true;
 
     EXPECT_TRUE(aubCsr.isAubWritable(graphicsAllocation));
@@ -356,99 +429,12 @@ HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationThatHasPageTablesClonin
     EXPECT_FALSE(aubCsr.isTbxWritable(graphicsAllocation));
 }
 
-HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationWhenAubWritableIsSetToFalseThenAubWritableIsFalse) {
-    initializeCsr<FamilyType>();
-    auto &aubCsr = getAubCsr<FamilyType>();
-
-    gfxAllocationSetToDefault();
-    aubCsr.setAubWritable(false, graphicsAllocation);
-    EXPECT_FALSE(aubCsr.isAubWritable(graphicsAllocation));
-
-    gfxAllocationEnableReadOnlyMultiStorage(0b1111);
-    aubCsr.setAubWritable(false, graphicsAllocation);
-    EXPECT_FALSE(aubCsr.isAubWritable(graphicsAllocation));
-}
-
-HWTEST_F(GraphicsAllocationTests, givenMultiStorageGraphicsAllocationWhenAubWritableIsSetOnSpecificBanksThenCorrectValuesAreSet) {
-    initializeCsr<FamilyType>();
-    auto &aubCsr = getAubCsr<FamilyType>();
-    gfxAllocationEnableReadOnlyMultiStorage(0b1010);
-
-    aubCsr.setAubWritable(false, graphicsAllocation);
-    EXPECT_EQ(graphicsAllocation.aubInfo.aubWritable, maxNBitValue(32) & ~(0b1010));
-
-    EXPECT_FALSE(graphicsAllocation.isAubWritable(0b10));
-    EXPECT_FALSE(graphicsAllocation.isAubWritable(0b1000));
-    EXPECT_FALSE(graphicsAllocation.isAubWritable(0b1010));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b1));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b100));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b101));
-
-    aubCsr.setAubWritable(true, graphicsAllocation);
-    EXPECT_EQ(graphicsAllocation.aubInfo.aubWritable, maxNBitValue(32));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b1));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b10));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b100));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b1000));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b101));
-    EXPECT_TRUE(graphicsAllocation.isAubWritable(0b1010));
-}
-
-HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationWhenIsTbxWritableIsCalledThenTrueIsReturned) {
-    initializeCsr<FamilyType>();
-    auto &aubCsr = getAubCsr<FamilyType>();
-
-    gfxAllocationSetToDefault();
-    EXPECT_TRUE(aubCsr.isTbxWritable(graphicsAllocation));
-
-    gfxAllocationEnableReadOnlyMultiStorage(0b1111);
-    EXPECT_TRUE(aubCsr.isTbxWritable(graphicsAllocation));
-};
-
-HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationWhenTbxWritableIsSetToFalseThenTbxWritableIsFalse) {
-    initializeCsr<FamilyType>();
-    auto &aubCsr = getAubCsr<FamilyType>();
-
-    gfxAllocationSetToDefault();
-    aubCsr.setTbxWritable(false, graphicsAllocation);
-    EXPECT_FALSE(aubCsr.isTbxWritable(graphicsAllocation));
-
-    gfxAllocationEnableReadOnlyMultiStorage(0b1111);
-    aubCsr.setTbxWritable(false, graphicsAllocation);
-    EXPECT_FALSE(aubCsr.isTbxWritable(graphicsAllocation));
-}
-
-HWTEST_F(GraphicsAllocationTests, givenMultiStorageGraphicsAllocationWhenTbxWritableIsSetOnSpecificBanksThenCorrectValuesAreSet) {
-    initializeCsr<FamilyType>();
-    auto &aubCsr = getAubCsr<FamilyType>();
-    gfxAllocationEnableReadOnlyMultiStorage(0b1010);
-
-    aubCsr.setTbxWritable(false, graphicsAllocation);
-    EXPECT_EQ(graphicsAllocation.aubInfo.tbxWritable, maxNBitValue(32) & ~(0b1010));
-
-    EXPECT_FALSE(graphicsAllocation.isTbxWritable(0b10));
-    EXPECT_FALSE(graphicsAllocation.isTbxWritable(0b1000));
-    EXPECT_FALSE(graphicsAllocation.isTbxWritable(0b1010));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b1));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b100));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b101));
-
-    aubCsr.setTbxWritable(true, graphicsAllocation);
-    EXPECT_EQ(graphicsAllocation.aubInfo.tbxWritable, maxNBitValue(32));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b1));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b10));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b100));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b1000));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b101));
-    EXPECT_TRUE(graphicsAllocation.isTbxWritable(0b1010));
-}
-
 uint32_t MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes = 0;
 
 TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenAssignedTaskCountEqualZeroThenPrepareForResidencyDoeNotCallGetTaskCount) {
     MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes = 0;
     MockGraphicsAllocationTaskCount graphicsAllocation;
-    graphicsAllocation.hostPtrTaskCountAssignment = 0;
+    graphicsAllocation.setHostPtrTaskCountAssignment(0);
     graphicsAllocation.prepareHostPtrForResidency(nullptr);
     EXPECT_EQ(MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes, 0u);
     MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes = 0;
@@ -458,10 +444,10 @@ HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationWhenAssignedTaskCountAb
     executionEnvironment.initializeMemoryManager();
     auto osContext = std::unique_ptr<OsContext>(OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor()));
     MockCommandStreamReceiver csr(executionEnvironment, 0, 1);
-    csr.osContext = osContext.get();
+    csr.setupContext(*osContext);
     MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes = 0;
     MockGraphicsAllocationTaskCount graphicsAllocation;
-    graphicsAllocation.hostPtrTaskCountAssignment = 1;
+    graphicsAllocation.setHostPtrTaskCountAssignment(1);
     graphicsAllocation.prepareHostPtrForResidency(&csr);
     EXPECT_EQ(MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes, 1u);
     MockGraphicsAllocationTaskCount::getTaskCountCalleedTimes = 0;
@@ -471,11 +457,11 @@ HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationAllocTaskCountHigherTha
     executionEnvironment.initializeMemoryManager();
     auto osContext = std::unique_ptr<OsContext>(OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor()));
     MockCommandStreamReceiver csr(executionEnvironment, 0, 1);
-    csr.osContext = osContext.get();
+    csr.setupContext(*osContext);
     MockGraphicsAllocationTaskCount graphicsAllocation;
     graphicsAllocation.updateTaskCount(10u, 0u);
     *csr.getTagAddress() = 5;
-    graphicsAllocation.hostPtrTaskCountAssignment = 1;
+    graphicsAllocation.setHostPtrTaskCountAssignment(1);
     auto calledTimesBefore = graphicsAllocation.updateTaskCountCalleedTimes;
     graphicsAllocation.prepareHostPtrForResidency(&csr);
     EXPECT_EQ(graphicsAllocation.updateTaskCountCalleedTimes, calledTimesBefore);
@@ -485,11 +471,11 @@ HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationAllocTaskCountLowerThan
     executionEnvironment.initializeMemoryManager();
     auto osContext = std::unique_ptr<OsContext>(OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor()));
     MockCommandStreamReceiver csr(executionEnvironment, 0, 1);
-    csr.osContext = osContext.get();
+    csr.setupContext(*osContext);
     MockGraphicsAllocationTaskCount graphicsAllocation;
     graphicsAllocation.updateTaskCount(5u, 0u);
     csr.taskCount = 10;
-    graphicsAllocation.hostPtrTaskCountAssignment = 1;
+    graphicsAllocation.setHostPtrTaskCountAssignment(1);
     auto calledTimesBefore = graphicsAllocation.updateTaskCountCalleedTimes;
     graphicsAllocation.prepareHostPtrForResidency(&csr);
     EXPECT_EQ(graphicsAllocation.updateTaskCountCalleedTimes, calledTimesBefore + 1u);
@@ -499,11 +485,11 @@ HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationAllocTaskCountNotUsedLo
     executionEnvironment.initializeMemoryManager();
     auto osContext = std::unique_ptr<OsContext>(OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor()));
     MockCommandStreamReceiver csr(executionEnvironment, 0, 1);
-    csr.osContext = osContext.get();
+    csr.setupContext(*osContext);
     MockGraphicsAllocationTaskCount graphicsAllocation;
     graphicsAllocation.updateTaskCount(GraphicsAllocation::objectNotResident, 0u);
     csr.taskCount = 10;
-    graphicsAllocation.hostPtrTaskCountAssignment = 1;
+    graphicsAllocation.setHostPtrTaskCountAssignment(1);
     auto calledTimesBefore = graphicsAllocation.updateTaskCountCalleedTimes;
     graphicsAllocation.prepareHostPtrForResidency(&csr);
     EXPECT_EQ(graphicsAllocation.updateTaskCountCalleedTimes, calledTimesBefore + 1u);
@@ -513,11 +499,257 @@ HWTEST_F(GraphicsAllocationTests, givenGraphicsAllocationAllocTaskCountLowerThan
     executionEnvironment.initializeMemoryManager();
     auto osContext = std::unique_ptr<OsContext>(OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor()));
     MockCommandStreamReceiver csr(executionEnvironment, 0, 1);
-    csr.osContext = osContext.get();
+    csr.setupContext(*osContext);
     MockGraphicsAllocationTaskCount graphicsAllocation;
     graphicsAllocation.updateTaskCount(5u, 0u);
     csr.taskCount = 10;
-    graphicsAllocation.hostPtrTaskCountAssignment = 1;
+    graphicsAllocation.setHostPtrTaskCountAssignment(1);
     graphicsAllocation.prepareHostPtrForResidency(&csr);
-    EXPECT_EQ(graphicsAllocation.hostPtrTaskCountAssignment, 0u);
+    EXPECT_EQ(graphicsAllocation.getHostPtrTaskCountAssignment(), 0u);
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWithFragmentsWhenCallingForUpateFenceThenAllResidencyDataHasUpdatedValue) {
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.fragmentsStorage.fragmentCount = 3;
+
+    auto residencyData1 = std::make_unique<ResidencyData>(3);
+    auto residencyData2 = std::make_unique<ResidencyData>(3);
+    auto residencyData3 = std::make_unique<ResidencyData>(3);
+
+    graphicsAllocation.fragmentsStorage.fragmentStorageData[0].residency = residencyData1.get();
+    graphicsAllocation.fragmentsStorage.fragmentStorageData[1].residency = residencyData2.get();
+    graphicsAllocation.fragmentsStorage.fragmentStorageData[2].residency = residencyData3.get();
+
+    uint64_t newFenceValue = 0x54321;
+    auto contextId = 0u;
+
+    graphicsAllocation.updateCompletionDataForAllocationAndFragments(newFenceValue, contextId);
+
+    EXPECT_EQ(graphicsAllocation.getResidencyData().getFenceValueForContextId(contextId), newFenceValue);
+
+    for (uint32_t allocationId = 0; allocationId < graphicsAllocation.fragmentsStorage.fragmentCount; allocationId++) {
+        auto residencyData = graphicsAllocation.fragmentsStorage.fragmentStorageData[allocationId].residency;
+        EXPECT_EQ(residencyData->getFenceValueForContextId(contextId), newFenceValue);
+    }
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenHasAllocationReadOnlyTypeCalledThenFalseReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::buffer;
+    EXPECT_FALSE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsKernelIsaAndMaskSupportItThenAllocationHasReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::kernelIsa) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::kernelIsa;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsInternalIsaAndMaskSupportItThenAllocationHasReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::kernelIsaInternal) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::kernelIsaInternal;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsCommandBufferAndMaskSupportItThenAllocationHasReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::commandBuffer) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::commandBuffer;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsLinearStreamAndMaskSupportItThenAllocationHasReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::linearStream) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::linearStream;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsKernelIsaAndMaskDoesNotSupportItThenAllocationHasReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::linearStream) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::kernelIsa;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsInternalIsaAndMaskDoesNotSupportItThenAllocationHasReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::kernelIsa) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::kernelIsaInternal;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsCommandBufferAndMaskDoesNotSupportItThenAllocationHasNotReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::kernelIsaInternal) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::commandBuffer;
+    EXPECT_FALSE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsLinearStreamAndMaskDoesNotSupportItThenAllocationHasNotReadonlyType) {
+    DebugManagerStateRestore restorer;
+    auto mask = 1llu << (static_cast<int64_t>(AllocationType::commandBuffer) - 1);
+    debugManager.flags.ReadOnlyAllocationsTypeMask.set(mask);
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::linearStream;
+    EXPECT_FALSE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenGraphicsAllocationsWhenAllocationTypeIsRingBufferThenAllocationHasReadonlyType) {
+    MockGraphicsAllocation graphicsAllocation;
+    graphicsAllocation.hasAllocationReadOnlyTypeCallBase = true;
+    graphicsAllocation.allocationType = AllocationType::ringBuffer;
+    EXPECT_TRUE(graphicsAllocation.hasAllocationReadOnlyType());
+}
+TEST(GraphicsAllocationTest, givenOtherThanPreemptionAllocationTypeWhenIsZeroInitRequiredIsCalledThenFalseReturned) {
+    for (std::underlying_type_t<AllocationType> allocType = 0; allocType < static_cast<std::underlying_type_t<AllocationType>>(AllocationType::count); allocType++) {
+        if (static_cast<AllocationType>(allocType) == AllocationType::preemption) {
+            EXPECT_TRUE(GraphicsAllocation::isZeroInitRequired(static_cast<AllocationType>(allocType)));
+        } else {
+            EXPECT_FALSE(GraphicsAllocation::isZeroInitRequired(static_cast<AllocationType>(allocType)));
+        }
+    }
+}
+
+TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenCheckingShareableHostMemoryThenFalseReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_FALSE(graphicsAllocation.isShareableHostMemory());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingShareableHostMemoryThenValueIsReflected) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    graphicsAllocation.setShareableHostMemory(true);
+    EXPECT_TRUE(graphicsAllocation.isShareableHostMemory());
+
+    graphicsAllocation.setShareableHostMemory(false);
+    EXPECT_FALSE(graphicsAllocation.isShareableHostMemory());
+}
+
+TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenCheckingCanBeReadOnlyThenTrueReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_TRUE(graphicsAllocation.canBeReadOnly());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingCantBeReadOnlyThenCanBeReadOnlyReturnsFalse) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    graphicsAllocation.setAsCantBeReadOnly(true);
+    EXPECT_FALSE(graphicsAllocation.canBeReadOnly());
+
+    graphicsAllocation.setAsCantBeReadOnly(false);
+    EXPECT_TRUE(graphicsAllocation.canBeReadOnly());
+}
+
+TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenCheckingExplicitlyMadeResidentThenFalseReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_FALSE(graphicsAllocation.isExplicitlyMadeResident());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingExplicitlyMadeResidentThenValueIsReflected) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    graphicsAllocation.setExplicitlyMadeResident(true);
+    EXPECT_TRUE(graphicsAllocation.isExplicitlyMadeResident());
+
+    graphicsAllocation.setExplicitlyMadeResident(false);
+    EXPECT_FALSE(graphicsAllocation.isExplicitlyMadeResident());
+}
+
+TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenCheckingIsImportedThenFalseReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_FALSE(graphicsAllocation.getIsImported());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingIsImportedThenGetIsImportedReturnsTrue) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    graphicsAllocation.setIsImported();
+    EXPECT_TRUE(graphicsAllocation.getIsImported());
+}
+
+TEST(GraphicsAllocationTest, givenDefaultGraphicsAllocationWhenCheckingQualifiesFor2MBPagesThenFalseReturned) {
+    MockGraphicsAllocation graphicsAllocation;
+    EXPECT_FALSE(graphicsAllocation.qualifiesFor2MBPages());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingQualifiesFor2MBPagesThenValueIsReflected) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    graphicsAllocation.setQualifiesFor2MBPages(true);
+    EXPECT_TRUE(graphicsAllocation.qualifiesFor2MBPages());
+
+    graphicsAllocation.setQualifiesFor2MBPages(false);
+    EXPECT_FALSE(graphicsAllocation.qualifiesFor2MBPages());
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenSettingInspectionIdThenGetInspectionIdReturnsUpdatedValue) {
+    MockGraphicsAllocation graphicsAllocation;
+    const uint32_t contextId = 0u;
+    EXPECT_EQ(0u, graphicsAllocation.getInspectionId(contextId));
+
+    graphicsAllocation.setInspectionId(42u, contextId);
+    EXPECT_EQ(42u, graphicsAllocation.getInspectionId(contextId));
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenResettingInspectionIdsThenAllContextsAreZero) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
+        graphicsAllocation.setInspectionId(i + 1u, i);
+    }
+
+    graphicsAllocation.resetInspectionIds();
+
+    for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
+        EXPECT_EQ(0u, graphicsAllocation.getInspectionId(i));
+    }
+}
+
+TEST(GraphicsAllocationTest, givenGraphicsAllocationWhenClearingUsageInfoThenInspectionIdsAreZeroed) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
+        graphicsAllocation.setInspectionId(i + 1u, i);
+        graphicsAllocation.updateTaskCount(1u, i);
+        graphicsAllocation.updateResidencyTaskCount(1u, i);
+    }
+
+    graphicsAllocation.clearUsageInfo();
+
+    for (auto i = 0u; i < MemoryManager::maxOsContextCount; i++) {
+        EXPECT_EQ(0u, graphicsAllocation.getInspectionId(i));
+        EXPECT_EQ(GraphicsAllocation::objectNotUsed, graphicsAllocation.getTaskCount(i));
+        EXPECT_EQ(GraphicsAllocation::objectNotResident, graphicsAllocation.getResidencyTaskCount(i));
+    }
+}
+
+TEST(GraphicsAllocationTest, givenAllocationInfoFlagsThatInspectionIdExistsInSeparateArrayFromTaskCounts) {
+    MockGraphicsAllocation graphicsAllocation;
+
+    graphicsAllocation.setInspectionId(99u, 0u);
+    graphicsAllocation.updateTaskCount(5u, 0u);
+    graphicsAllocation.updateResidencyTaskCount(3u, 0u);
+
+    EXPECT_EQ(99u, graphicsAllocation.getInspectionId(0u));
+    EXPECT_EQ(5u, graphicsAllocation.getTaskCount(0u));
+    EXPECT_EQ(3u, graphicsAllocation.getResidencyTaskCount(0u));
 }

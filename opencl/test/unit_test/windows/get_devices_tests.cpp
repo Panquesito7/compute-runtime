@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/os_interface/product_helper.h"
@@ -46,14 +47,13 @@ HWTEST_F(PrepareDeviceEnvironmentsTests, givenRcsAndCcsNotSupportedWhenInitializ
 
     NEO::ExecutionEnvironment executionEnvironment;
     executionEnvironment.prepareRootDeviceEnvironments(1u);
-    HardwareInfo hwInfo = *defaultHwInfo;
     executionEnvironment.rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+    auto *hwInfo = executionEnvironment.rootDeviceEnvironments[0]->getMutableHardwareInfo();
     auto &productHelper = executionEnvironment.rootDeviceEnvironments[0]->getProductHelper();
-
-    productHelper.configureHardwareCustom(&hwInfo, nullptr);
+    productHelper.configureHardwareCustom(hwInfo, nullptr);
 
     bool expectedValue = false;
-    if (hwInfo.featureTable.flags.ftrRcsNode || hwInfo.featureTable.flags.ftrCCSNode) {
+    if (EngineHelpers::isRcsExposed(*executionEnvironment.rootDeviceEnvironments[0]) || hwInfo->featureTable.flags.ftrCCSNode) {
         expectedValue = true;
     }
 
@@ -63,7 +63,7 @@ HWTEST_F(PrepareDeviceEnvironmentsTests, givenRcsAndCcsNotSupportedWhenInitializ
 HWTEST_F(PrepareDeviceEnvironmentsTests, Given32bitApplicationWhenDebugKeyIsSetThenSupportIsReported) {
     NEO::ExecutionEnvironment executionEnvironment;
     DebugManagerStateRestore restorer;
-    DebugManager.flags.Force32BitDriverSupport.set(true);
+    debugManager.flags.Force32BitDriverSupport.set(true);
     EXPECT_TRUE(NEO::prepareDeviceEnvironments(executionEnvironment));
 }
 } // namespace NEO

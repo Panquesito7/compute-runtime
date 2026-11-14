@@ -1,17 +1,16 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#pragma once
-
 #include "shared/source/helpers/flat_batch_buffer_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/l3_range.h"
 #include "shared/source/helpers/pipe_control_args.h"
-#include "shared/source/kernel/implicit_args.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/source/kernel/implicit_args_helper.h"
 
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/helpers/hardware_commands_helper.h"
@@ -20,11 +19,11 @@
 namespace NEO {
 
 template <typename GfxFamily>
-typename HardwareCommandsHelper<GfxFamily>::INTERFACE_DESCRIPTOR_DATA *HardwareCommandsHelper<GfxFamily>::getInterfaceDescriptor(
+template <typename InterfaceDescriptorType>
+InterfaceDescriptorType *HardwareCommandsHelper<GfxFamily>::getInterfaceDescriptor(
     const IndirectHeap &indirectHeap,
     uint64_t offsetInterfaceDescriptor,
-    INTERFACE_DESCRIPTOR_DATA *inlineInterfaceDescriptor) {
-
+    InterfaceDescriptorType *inlineInterfaceDescriptor) {
     return inlineInterfaceDescriptor;
 }
 
@@ -35,12 +34,6 @@ uint32_t HardwareCommandsHelper<GfxFamily>::additionalSizeRequiredDsh() {
 
 template <typename GfxFamily>
 size_t HardwareCommandsHelper<GfxFamily>::getSizeRequiredCS() {
-    return 0;
-}
-
-template <typename GfxFamily>
-size_t HardwareCommandsHelper<GfxFamily>::getSizeRequiredForCacheFlush(const CommandQueue &commandQueue, const Kernel *kernel, uint64_t postSyncAddress) {
-    UNRECOVERABLE_IF(true);
     return 0;
 }
 
@@ -58,14 +51,20 @@ void HardwareCommandsHelper<GfxFamily>::sendMediaInterfaceDescriptorLoad(
 }
 
 template <typename GfxFamily>
+template <typename WalkerType>
 size_t HardwareCommandsHelper<GfxFamily>::sendCrossThreadData(
     IndirectHeap &indirectHeap,
     Kernel &kernel,
     bool inlineDataProgrammingRequired,
-    WALKER_TYPE *walkerCmd,
-    uint32_t &sizeCrossThreadData) {
+    bool localIdsGenerationByRuntime,
+    uint32_t requiredWalkOrder,
+    WalkerType *walkerCmd,
+    uint32_t &sizeCrossThreadData,
+    [[maybe_unused]] uint64_t scratchAddress,
+    const RootDeviceEnvironment &rootDeviceEnvironment) {
+    constexpr bool heaplessModeEnabled = GfxFamily::template isHeaplessMode<WalkerType>();
 
-    indirectHeap.align(WALKER_TYPE::INDIRECTDATASTARTADDRESS_ALIGN_SIZE);
+    indirectHeap.align(GfxFamily::cacheLineSize);
 
     auto offsetCrossThreadData = indirectHeap.getUsed();
     char *dest = nullptr;
@@ -73,52 +72,57 @@ size_t HardwareCommandsHelper<GfxFamily>::sendCrossThreadData(
 
     auto pImplicitArgs = kernel.getImplicitArgs();
     if (pImplicitArgs) {
-        pImplicitArgs->localIdTablePtr = indirectHeap.getGraphicsAllocation()->getGpuAddress() + offsetCrossThreadData;
-
+        pImplicitArgs->setLocalIdTablePtr(indirectHeap.getGraphicsAllocation()->getGpuAddress() + offsetCrossThreadData);
         const auto &kernelDescriptor = kernel.getDescriptor();
-        auto sizeForImplicitArgsProgramming = ImplicitArgsHelper::getSizeForImplicitArgsPatching(pImplicitArgs, kernelDescriptor);
 
-        auto sizeForLocalIdsProgramming = sizeForImplicitArgsProgramming - sizeof(ImplicitArgs);
+        auto sizeForImplicitArgsProgramming = ImplicitArgsHelper::getSizeForImplicitArgsPatching(pImplicitArgs, kernelDescriptor, !localIdsGenerationByRuntime, rootDeviceEnvironment);
+
+        auto sizeForLocalIdsProgramming = sizeForImplicitArgsProgramming - NEO::ImplicitArgsHelper::getSizeForImplicitArgsStruct(pImplicitArgs, kernelDescriptor, true, rootDeviceEnvironment);
         offsetCrossThreadData += sizeForLocalIdsProgramming;
 
         auto ptrToPatchImplicitArgs = indirectHeap.getSpace(sizeForImplicitArgsProgramming);
+        EncodeDispatchKernel<GfxFamily>::patchScratchAddressInImplicitArgs(*pImplicitArgs, scratchAddress, true);
 
-        const auto &kernelAttributes = kernelDescriptor.kernelAttributes;
-        uint32_t requiredWalkOrder = 0u;
-        size_t localWorkSize[3] = {pImplicitArgs->localSizeX, pImplicitArgs->localSizeY, pImplicitArgs->localSizeZ};
-        auto generationOfLocalIdsByRuntime = EncodeDispatchKernel<GfxFamily>::isRuntimeLocalIdsGenerationRequired(
-            3,
-            localWorkSize,
-            std::array<uint8_t, 3>{
-                {kernelAttributes.workgroupWalkOrder[0],
-                 kernelAttributes.workgroupWalkOrder[1],
-                 kernelAttributes.workgroupWalkOrder[2]}},
-            kernelAttributes.flags.requiresWorkgroupWalkOrder,
-            requiredWalkOrder,
-            kernelDescriptor.kernelAttributes.simdSize);
-
-        ImplicitArgsHelper::patchImplicitArgs(ptrToPatchImplicitArgs, *pImplicitArgs, kernelDescriptor, std::make_pair(generationOfLocalIdsByRuntime, requiredWalkOrder));
+        ImplicitArgsHelper::patchImplicitArgs(ptrToPatchImplicitArgs, *pImplicitArgs, kernelDescriptor, std::make_pair(!localIdsGenerationByRuntime, requiredWalkOrder), rootDeviceEnvironment, nullptr);
     }
 
-    using InlineData = typename GfxFamily::INLINE_DATA;
-    using GRF = typename GfxFamily::GRF;
-    uint32_t inlineDataSize = sizeof(InlineData);
     uint32_t sizeToCopy = sizeCrossThreadData;
+    uint32_t inlineDataBytesConsumed = 0u;
     if (inlineDataProgrammingRequired == true) {
-        sizeToCopy = std::min(inlineDataSize, sizeCrossThreadData);
+
+        constexpr uint32_t inlineDataSize = WalkerType::getInlineDataSize();
+        sizeToCopy = inlineDataBytesConsumed = std::min(inlineDataSize, sizeCrossThreadData);
         dest = reinterpret_cast<char *>(walkerCmd->getInlineDataPointer());
         memcpy_s(dest, sizeToCopy, kernel.getCrossThreadData(), sizeToCopy);
-        auto offset = std::min(inlineDataSize, sizeCrossThreadData);
-        sizeCrossThreadData -= offset;
-        src += offset;
+        sizeCrossThreadData -= inlineDataBytesConsumed;
+        src += inlineDataBytesConsumed;
+
+        if constexpr (heaplessModeEnabled) {
+            uint64_t indirectDataAddress = indirectHeap.getHeapGpuBase();
+            indirectDataAddress += indirectHeap.getHeapGpuStartOffset();
+            indirectDataAddress += offsetCrossThreadData;
+            HardwareCommandsHelper<GfxFamily>::programInlineData<WalkerType>(kernel, walkerCmd, indirectDataAddress, scratchAddress);
+        }
     }
 
     if (sizeCrossThreadData > 0) {
+        if constexpr (!heaplessModeEnabled) {
+            DEBUG_BREAK_IF(indirectHeap.getUsed() % 64 != 0);
+        }
         dest = static_cast<char *>(indirectHeap.getSpace(sizeCrossThreadData));
         memcpy_s(dest, sizeCrossThreadData, src, sizeCrossThreadData);
+
+        if constexpr (heaplessModeEnabled) {
+            const auto &scratchPointerAddress = kernel.getDescriptor().payloadMappings.implicitArgs.scratchPointerAddress;
+            if (isDefined(scratchPointerAddress.pointerSize) && isValidOffset(scratchPointerAddress.offset) &&
+                (static_cast<uint32_t>(scratchPointerAddress.offset) >= inlineDataBytesConsumed)) {
+                char *crossThreadScratchPtr = dest + (static_cast<uint32_t>(scratchPointerAddress.offset) - inlineDataBytesConsumed);
+                memcpy_s(crossThreadScratchPtr, scratchPointerAddress.pointerSize, &scratchAddress, scratchPointerAddress.pointerSize);
+            }
+        }
     }
 
-    if (DebugManager.flags.AddPatchInfoCommentsForAUBDump.get()) {
+    if (debugManager.flags.AddPatchInfoCommentsForAUBDump.get()) {
         FlatBatchBufferHelper::fixCrossThreadDataInfo(kernel.getPatchInfoDataList(), offsetCrossThreadData, indirectHeap.getGraphicsAllocation()->getGpuAddress());
     }
 
@@ -126,38 +130,10 @@ size_t HardwareCommandsHelper<GfxFamily>::sendCrossThreadData(
 }
 
 template <typename GfxFamily>
+template <typename WalkerType>
 void HardwareCommandsHelper<GfxFamily>::setInterfaceDescriptorOffset(
-    WALKER_TYPE *walkerCmd,
+    WalkerType *walkerCmd,
     uint32_t &interfaceDescriptorIndex) {
 }
 
-template <typename GfxFamily>
-void HardwareCommandsHelper<GfxFamily>::programCacheFlushAfterWalkerCommand(LinearStream *commandStream, const CommandQueue &commandQueue, const Kernel *kernel, [[maybe_unused]] uint64_t postSyncAddress) {
-    // 1. make sure previous kernel finished
-    PipeControlArgs args;
-    args.unTypedDataPortCacheFlush = commandQueue.getDevice().getGfxCoreHelper().unTypedDataPortCacheFlushRequired();
-
-    MemorySynchronizationCommands<GfxFamily>::addSingleBarrier(*commandStream, args);
-
-    // 2. flush all affected L3 lines
-    if constexpr (GfxFamily::isUsingL3Control) {
-        StackVec<GraphicsAllocation *, 32> allocationsForCacheFlush;
-        kernel->getAllocationsForCacheFlush(allocationsForCacheFlush);
-        StackVec<L3Range, 128> subranges;
-        for (GraphicsAllocation *alloc : allocationsForCacheFlush) {
-            coverRangeExact(alloc->getGpuAddress(), alloc->getUnderlyingBufferSize(), subranges, GfxFamily::L3_FLUSH_ADDRESS_RANGE::L3_FLUSH_EVICTION_POLICY_FLUSH_L3_WITH_EVICTION);
-        }
-        for (size_t subrangeNumber = 0; subrangeNumber < subranges.size(); subrangeNumber += maxFlushSubrangeCount) {
-            size_t rangeCount = subranges.size() <= subrangeNumber + maxFlushSubrangeCount ? subranges.size() - subrangeNumber : maxFlushSubrangeCount;
-            Range<L3Range> range = createRange(subranges.begin() + subrangeNumber, rangeCount);
-            uint64_t postSyncAddressToFlush = 0;
-            if (rangeCount < maxFlushSubrangeCount || subranges.size() - subrangeNumber - maxFlushSubrangeCount == 0) {
-                postSyncAddressToFlush = postSyncAddress;
-            }
-
-            auto &hardwareInfo = commandQueue.getDevice().getHardwareInfo();
-            flushGpuCache<GfxFamily>(commandStream, range, postSyncAddressToFlush, hardwareInfo);
-        }
-    }
-}
 } // namespace NEO

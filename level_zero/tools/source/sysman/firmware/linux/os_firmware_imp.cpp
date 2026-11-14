@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,9 +8,14 @@
 #include "level_zero/tools/source/sysman/firmware/linux/os_firmware_imp.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
 #include "shared/source/helpers/string.h"
 
 #include "level_zero/tools/source/sysman/firmware_util/firmware_util.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
+#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+
+#include <algorithm>
 
 namespace L0 {
 
@@ -28,7 +33,7 @@ ze_result_t OsFirmware::getSupportedFwTypes(std::vector<std::string> &supportedF
     std::vector<std::string> mtdDescriptorStrings = {};
     ze_result_t result = pFsAccess->read(mtdDescriptor, mtdDescriptorStrings);
     if (result != ZE_RESULT_SUCCESS) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->read() failed to read %s and returning error:0x%x \n", __FUNCTION__, mtdDescriptor.c_str(), result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): FsAccess->read() failed to read %s and returning error:0x%x \n", NEO_FUNCTION_NAME, mtdDescriptor.c_str(), result);
         return result;
     }
     for (const auto &readByteLine : mtdDescriptorStrings) {
@@ -45,7 +50,7 @@ ze_result_t OsFirmware::getSupportedFwTypes(std::vector<std::string> &supportedF
 
 void LinuxFirmwareImp::osGetFwProperties(zes_firmware_properties_t *pProperties) {
     if (ZE_RESULT_SUCCESS != getFirmwareVersion(osFwType, pProperties)) {
-        strncpy_s(static_cast<char *>(pProperties->version), ZES_STRING_PROPERTY_SIZE, unknown.c_str(), ZES_STRING_PROPERTY_SIZE - 1);
+        strncpy_s(static_cast<char *>(pProperties->version), ZES_STRING_PROPERTY_SIZE, unknown.data(), ZES_STRING_PROPERTY_SIZE - 1);
     }
     pProperties->canControl = true; // Assuming that user has permission to flash the firmware
 }

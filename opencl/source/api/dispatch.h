@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,20 @@
 
 #pragma once
 
+#include "opencl/source/api/dispatch_table_types.h"
+
 #include "CL/cl.h"
 #include "CL/cl_ext.h"
 #include "CL/cl_gl.h"
 #if defined(_WIN32)
+#if __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wignored-pragma-intrinsic"
+#pragma clang diagnostic ignored "-Wpragma-pack"
+#pragma clang diagnostic ignored "-Wignored-attributes"
+#pragma clang diagnostic ignored "-Wmacro-redefined"
+#pragma clang diagnostic ignored "-Wcomment"
+#endif
 #include <d3d10_1.h>
 
 #include "CL/cl_d3d10.h"
@@ -20,6 +30,10 @@
 #include "shared/source/os_interface/windows/windows_wrapper.h"
 
 #include "CL/cl_dx9_media_sharing.h"
+
+#if __clang__
+#pragma clang diagnostic pop
+#endif
 #else
 #define CL_CONTEXT_D3D10_DEVICE_KHR 0x4014
 #define CL_CONTEXT_D3D10_PREFER_SHARED_RESOURCES_KHR 0x402C
@@ -608,7 +622,7 @@ typedef CL_API_ENTRY cl_int(CL_API_CALL *KHRpfn_clGetGLContextInfoKHR)(
     void *paramValue,
     size_t *paramValueSizeRet) CL_API_SUFFIX__VERSION_1_0;
 
-#ifndef _WIN32
+#if !defined(_WIN32)
 typedef void *clGetDeviceIDsFromDX9INTEL_fn;
 typedef void *clCreateFromDX9MediaSurfaceINTEL_fn;
 typedef void *clEnqueueAcquireDX9ObjectsINTEL_fn;
@@ -1009,6 +1023,15 @@ typedef CL_API_ENTRY cl_int(CL_API_CALL *KHRpfn_clSetContextDestructorCallback)(
     void(CL_CALLBACK *pfnNotify)(cl_context context, void *userData),
     void *userData) CL_API_SUFFIX__VERSION_3_0;
 
+/*OpenCL3.1*/
+typedef CL_API_ENTRY cl_int(CL_API_CALL *KHRpfn_clGetKernelSuggestedLocalWorkSize)(
+    cl_command_queue commandQueue,
+    cl_kernel kernel,
+    cl_uint workDim,
+    const size_t *globalWorkOffset,
+    const size_t *globalWorkSize,
+    size_t *suggestedLocalWorkSize) CL_API_SUFFIX__VERSION_3_1;
+
 /* clCreateImage */
 
 typedef CL_API_ENTRY cl_int(CL_API_CALL *INTELpfn_clGetImageParamsINTEL)(
@@ -1281,6 +1304,9 @@ struct SDispatchTable {
     KHRpfn_clCreateBufferWithProperties clCreateBufferWithProperties;
     KHRpfn_clCreateImageWithProperties clCreateImageWithProperties;
     KHRpfn_clSetContextDestructorCallback clSetContextDestructorCallback;
+
+    /* OpenCL 3.1 */
+    KHRpfn_clGetKernelSuggestedLocalWorkSize clGetKernelSuggestedLocalWorkSize;
 };
 
 struct SCRTDispatchTable {
@@ -1326,17 +1352,7 @@ struct SCRTDispatchTable {
     INTELpfn_clSetPerformanceConfigurationINTEL clSetPerformanceConfigurationINTEL;
 };
 
-extern SDispatchTable icdGlobalDispatchTable;
-extern SCRTDispatchTable crtGlobalDispatchTable;
-
-struct SEntryPointsTable {
-    SDispatchTable *icdDispatch;
-    SCRTDispatchTable *crtDispatch;
-};
-
 struct SEntryPointsTableData {
     SDispatchTable icdDispatch;
     SCRTDispatchTable crtDispatch;
 };
-
-extern SEntryPointsTable globalDispatchTable;

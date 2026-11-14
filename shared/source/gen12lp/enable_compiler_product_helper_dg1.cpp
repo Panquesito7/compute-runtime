@@ -1,19 +1,15 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/compiler_aot_config_bdw_and_later.inl"
+#include "shared/source/gen12lp/compiler_product_helper_gen12lp.inl"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/compiler_product_helper_base.inl"
-#include "shared/source/helpers/compiler_product_helper_bdw_and_later.inl"
-#include "shared/source/helpers/compiler_product_helper_before_xe_hp.inl"
 #include "shared/source/helpers/compiler_product_helper_before_xe_hpc.inl"
-#include "shared/source/helpers/compiler_product_helper_disable_split_matrix_multiply_accumulate.inl"
-#include "shared/source/helpers/compiler_product_helper_enable_subgroup_local_block_io.inl"
-#include "shared/source/helpers/compiler_product_helper_tgllp_and_later.inl"
+#include "shared/source/helpers/compiler_product_helper_product_config_default.inl"
 
 #include "platforms.h"
 
@@ -24,7 +20,7 @@ uint64_t CompilerProductHelperHw<IGFX_DG1>::getHwInfoConfig(const HardwareInfo &
 }
 
 template <>
-uint32_t CompilerProductHelperHw<IGFX_DG1>::getProductConfigFromHwInfo(const HardwareInfo &hwInfo) const {
+uint32_t CompilerProductHelperHw<IGFX_DG1>::getDefaultHwIpVersion() const {
     return AOT::DG1;
 }
 

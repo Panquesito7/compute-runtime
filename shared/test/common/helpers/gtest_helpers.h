@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,8 +8,7 @@
 #pragma once
 
 #include <cstdint>
-#include <regex>
-#include <stddef.h>
+#include <cstring>
 #include <string>
 
 #define EXPECT_EQ_VAL(a, b)      \
@@ -52,26 +51,15 @@ inline bool memoryZeroed(const void *mem, const size_t size) {
     return memoryZeroed;
 }
 
+inline bool memoryEqualsPointer(const void *mem, const uintptr_t expectedPointer) {
+    auto ptrToExpectedPointer = &expectedPointer;
+    return 0 == memcmp(mem, ptrToExpectedPointer, sizeof(uintptr_t));
+}
+
 inline bool hasSubstr(const std::string &str, const std::string &subStr) {
     return std::string::npos != str.find(subStr);
 }
 
-inline bool startsWith(const std::string &str, const std::string &subStr) {
-    return 0 == str.find(subStr, 0);
-}
-
-inline bool endsWith(const std::string &str, const std::string &subStr) {
-    if (subStr.size() > str.size()) {
-        return false;
-    }
-
-    return 0 == str.compare(str.size() - subStr.size(), subStr.size(), subStr);
-}
-
 inline bool isEmpty(const std::string &str) {
     return str.empty();
-}
-
-inline bool containsRegex(const std::string &str, const std::string &regex) {
-    return std::regex_search(str, std::regex(regex));
 }

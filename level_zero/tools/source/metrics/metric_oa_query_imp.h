@@ -1,21 +1,25 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/debug_settings/debug_settings_manager.h"
+
 #include "level_zero/tools/source/metrics/metric.h"
 
 #include "metrics_library_api_1_0.h"
 
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 using MetricsLibraryApi::ClientCallbacks_1_0;
 using MetricsLibraryApi::ClientGen;
+using MetricsLibraryApi::ClientHandle_1_0;
 using MetricsLibraryApi::ClientOptionsData_1_0;
 using MetricsLibraryApi::CommandBufferData_1_0;
 using MetricsLibraryApi::ConfigurationHandle_1_0;
@@ -25,13 +29,7 @@ using MetricsLibraryApi::ContextDeleteFunction_1_0;
 using MetricsLibraryApi::ContextHandle_1_0;
 using MetricsLibraryApi::Interface_1_0;
 using MetricsLibraryApi::QueryHandle_1_0;
-
-namespace L0 {
-struct Device;
-struct CommandList;
-struct MetricGroup;
-class OaMetricSourceImp;
-} // namespace L0
+using MetricsLibraryApi::StatusCode;
 
 namespace NEO {
 class OsLibrary;
@@ -40,6 +38,10 @@ class GfxCoreHelper;
 } // namespace NEO
 
 namespace L0 {
+struct Device;
+struct CommandList;
+struct MetricGroup;
+class OaMetricSourceImp;
 
 struct MetricsLibrary {
   public:
@@ -73,6 +75,7 @@ struct MetricsLibrary {
     bool getGpuCommands(CommandList &commandList, CommandBufferData_1_0 &commandBuffer);
     bool getGpuCommands(CommandBufferData_1_0 &commandBuffer);
     uint32_t getGpuCommandsSize(CommandBufferData_1_0 &commandBuffer);
+    static StatusCode ML_STDCALL flushCommandBufferCallback(ClientHandle_1_0 handle);
 
     // Metric group configuration.
     ConfigurationHandle_1_0 getConfiguration(const zet_metric_group_handle_t metricGroup);
@@ -93,8 +96,19 @@ struct MetricsLibrary {
 
     ClientGen getGenType(const NEO::GfxCoreHelper &gfxCoreHelper) const;
 
+    template <typename ApiFunctionT, typename... Args>
+    bool callMdapi(const char *functionName, ApiFunctionT apiFunction, Args &&...args) {
+        const StatusCode status = apiFunction(std::forward<Args>(args)...);
+        if (status != StatusCode::Success) {
+            METRICS_LOG_ERR("MDAPI %s failed with status code: %d", functionName, static_cast<int>(status));
+            DEBUG_BREAK_IF(true);
+            return false;
+        }
+        return true;
+    }
+
   protected:
-    NEO::OsLibrary *handle = nullptr;
+    std::unique_ptr<NEO::OsLibrary> handle;
     OaMetricSourceImp &metricSource;
     ze_result_t initializationState = ZE_RESULT_ERROR_UNINITIALIZED;
     bool isWorkloadPartitionEnabled = false;

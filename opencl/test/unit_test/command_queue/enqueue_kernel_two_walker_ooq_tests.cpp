@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/test_macros/test.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/test/unit_test/fixtures/hello_world_fixture.h"
 #include "opencl/test/unit_test/fixtures/two_walker_fixture.h"
@@ -24,13 +25,13 @@ HWTEST_F(OOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenTwoDiffe
     EXPECT_NE(itorWalker1, itorWalker2);
 }
 
-HWTEST2_F(OOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeHpcCore) {
+HWTEST2_F(OOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeCore) {
     enqueueTwoKernels<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, OOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState) {
+HWTEST2_F(OOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState, IsGen12LP) {
     enqueueTwoKernels<FamilyType>();
 
     auto numCommands = getCommandsList<typename FamilyType::MEDIA_VFE_STATE>().size();
@@ -43,5 +44,10 @@ HWTEST_F(OOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipeC
     auto itorCmd = find<typename FamilyType::PIPE_CONTROL *>(itorWalker1, itorWalker2);
     // Workaround for DRM i915 coherency patch
     // EXPECT_EQ(itorWalker2, itorCmd);
-    EXPECT_NE(itorWalker2, itorCmd);
+
+    if (pCmdQ->getGpgpuCommandStreamReceiver().isUpdateTagFromWaitEnabled()) {
+        EXPECT_EQ(itorWalker2, itorCmd);
+    } else {
+        EXPECT_NE(itorWalker2, itorCmd);
+    }
 }

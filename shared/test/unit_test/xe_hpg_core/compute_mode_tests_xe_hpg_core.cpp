@@ -1,12 +1,14 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/bit_helpers.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/source/xe_hpg_core/hw_cmds_xe_hpg_core_base.h"
 #include "shared/source/xe_hpg_core/hw_info_xe_hpg_core.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
@@ -27,10 +29,8 @@ XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, GivenVariousSettingsWhenComp
     using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
-    const auto &productHelper = this->device->getProductHelper();
-    auto *releaseHelper = device->getReleaseHelper();
-    const auto &[isBasicWARequired, isExtendedWARequired] = productHelper.isPipeControlPriorToNonPipelinedStateCommandsWARequired(*defaultHwInfo, csr->isRcs(), releaseHelper);
-    std::ignore = isExtendedWARequired;
+    const auto &deviceHwInfo = device->getHardwareInfo();
+    const bool isBasicWARequired = deviceHwInfo.caps.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired;
 
     auto cmdsSize = sizeof(STATE_COMPUTE_MODE);
     if (isBasicWARequired) {
@@ -63,12 +63,12 @@ XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, GivenVariousSettingsWhenComp
     };
     auto &rootDeviceEnvironment = device->getRootDeviceEnvironment();
     for (auto testValue : testValues) {
-        DebugManager.flags.ForceZPassAsyncComputeThreadLimit.set(testValue.zPassThreadLimit);
-        DebugManager.flags.ForcePixelAsyncComputeThreadLimit.set(testValue.pixelThreadLimit);
+        debugManager.flags.ForceZPassAsyncComputeThreadLimit.set(testValue.zPassThreadLimit);
+        debugManager.flags.ForcePixelAsyncComputeThreadLimit.set(testValue.pixelThreadLimit);
 
         pCsr->streamProperties.stateComputeMode = {};
         pCsr->streamProperties.stateComputeMode.initSupport(rootDeviceEnvironment);
-        pCsr->streamProperties.stateComputeMode.setPropertiesAll(false, 0u, 0u, PreemptionMode::Disabled);
+        pCsr->streamProperties.stateComputeMode.setPropertiesAll(0u, 0u, false);
         LinearStream stream(buff, 1024);
         pCsr->programComputeMode(stream, flags, *defaultHwInfo);
         EXPECT_EQ(cmdsSize, stream.getUsed());
@@ -85,12 +85,12 @@ XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, GivenVariousSettingsWhenComp
         EXPECT_TRUE(isValueSet(pScmCmd->getMaskBits(), expectedFields));
     }
 
-    DebugManager.flags.ForceZPassAsyncComputeThreadLimit.set(-1);
-    DebugManager.flags.ForcePixelAsyncComputeThreadLimit.set(-1);
+    debugManager.flags.ForceZPassAsyncComputeThreadLimit.set(-1);
+    debugManager.flags.ForcePixelAsyncComputeThreadLimit.set(-1);
 
     pCsr->streamProperties.stateComputeMode = {};
     pCsr->streamProperties.stateComputeMode.initSupport(rootDeviceEnvironment);
-    pCsr->streamProperties.stateComputeMode.setPropertiesAll(false, 0u, 0u, PreemptionMode::Disabled);
+    pCsr->streamProperties.stateComputeMode.setPropertiesAll(0u, 0u, false);
     LinearStream stream(buff, 1024);
     pCsr->programComputeMode(stream, flags, *defaultHwInfo);
     EXPECT_EQ(cmdsSize, stream.getUsed());
@@ -113,17 +113,24 @@ XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, givenComputeModeCmdSizeWhenL
     overrideComputeModeRequest<FamilyType>(false, false, false, false, 128u);
     EXPECT_FALSE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
 
-    auto cmdSize = sizeof(STATE_COMPUTE_MODE) + sizeof(PIPE_CONTROL);
+    auto expSize = sizeof(STATE_COMPUTE_MODE);
+    auto &rootDeviceEnvironment = csr->peekRootDeviceEnvironment();
+    const auto &deviceHwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    const bool isBasicWARequired = deviceHwInfo.caps.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired;
+
+    if (isBasicWARequired) {
+        expSize += sizeof(PIPE_CONTROL);
+    }
 
     overrideComputeModeRequest<FamilyType>(false, false, false, true, 256u);
     auto retSize = getCsrHw<FamilyType>()->getCmdSizeForComputeMode();
     EXPECT_TRUE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
-    EXPECT_EQ(cmdSize, retSize);
+    EXPECT_EQ(expSize, retSize);
 
     overrideComputeModeRequest<FamilyType>(true, false, false, true, 256u);
     retSize = getCsrHw<FamilyType>()->getCmdSizeForComputeMode();
     EXPECT_TRUE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
-    EXPECT_EQ(cmdSize, retSize);
+    EXPECT_EQ(expSize, retSize);
 }
 
 XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, givenCoherencyWithSharedHandlesWhenCommandSizeIsCalculatedThenCorrectCommandSizeIsReturned) {
@@ -137,31 +144,45 @@ XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, givenCoherencyWithSharedHand
     overrideComputeModeRequest<FamilyType>(false, true, true);
     EXPECT_FALSE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
 
-    auto cmdsSize = sizeof(STATE_COMPUTE_MODE) + (2 * sizeof(PIPE_CONTROL));
+    auto expSize = sizeof(STATE_COMPUTE_MODE) + (sizeof(PIPE_CONTROL));
+    auto &rootDeviceEnvironment = csr->peekRootDeviceEnvironment();
+    const auto &deviceHwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    const bool isBasicWARequired = deviceHwInfo.caps.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired;
+
+    if (isBasicWARequired) {
+        expSize += sizeof(PIPE_CONTROL);
+    }
 
     overrideComputeModeRequest<FamilyType>(true, true, true);
     auto retSize = getCsrHw<FamilyType>()->getCmdSizeForComputeMode();
     EXPECT_TRUE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
-    EXPECT_EQ(cmdsSize, retSize);
+    EXPECT_EQ(expSize, retSize);
 
     overrideComputeModeRequest<FamilyType>(true, false, true);
     retSize = getCsrHw<FamilyType>()->getCmdSizeForComputeMode();
     EXPECT_TRUE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
-    EXPECT_EQ(cmdsSize, retSize);
+    EXPECT_EQ(expSize, retSize);
 }
 
 XE_HPG_CORETEST_F(ComputeModeRequirementsXeHpgCore, givenCoherencyWithoutSharedHandlesWhenCommandSizeIsCalculatedThenCorrectCommandSizeIsReturned) {
     using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     setUpImpl<FamilyType>();
-
-    auto cmdsSize = sizeof(STATE_COMPUTE_MODE) + sizeof(PIPE_CONTROL);
-
     overrideComputeModeRequest<FamilyType>(false, false, false, false);
     EXPECT_FALSE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
 
     overrideComputeModeRequest<FamilyType>(false, false, false, true);
-    auto retSize = getCsrHw<FamilyType>()->getCmdSizeForComputeMode();
+
+    auto expSize = sizeof(STATE_COMPUTE_MODE);
+    auto &rootDeviceEnvironment = csr->peekRootDeviceEnvironment();
+    const auto &deviceHwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    const bool isBasicWARequired = deviceHwInfo.caps.pipeControlPriorToNonPipelinedStateCommandsBaseWARequired;
+
+    if (isBasicWARequired) {
+        expSize += sizeof(PIPE_CONTROL);
+    }
+
+    auto gotSize = getCsrHw<FamilyType>()->getCmdSizeForComputeMode();
     EXPECT_TRUE(getCsrHw<FamilyType>()->streamProperties.stateComputeMode.isDirty());
-    EXPECT_EQ(cmdsSize, retSize);
+    EXPECT_EQ(expSize, gotSize);
 }

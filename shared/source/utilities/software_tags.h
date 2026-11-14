@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,27 +8,50 @@
 #pragma once
 #include "shared/source/helpers/string.h"
 
+#include <cstdint>
 #include <string>
 
 namespace NEO {
 namespace SWTags {
 
 enum class OpCode : uint32_t {
-    Unknown,
-    KernelName,
-    PipeControlReason,
-    CallNameBegin,
-    CallNameEnd
+    unknown,
+    kernelName,
+    pipeControlReason,
+    callNameBegin,
+    callNameEnd,
+    arbitraryString,
 };
 
 enum class Component : uint32_t {
-    COMMON = 1
+    common = 1
 };
+
+enum class CounterType : uint32_t {
+    none,
+    dispatch,
+    rop,
+    flush,
+};
+
+uint32_t getCounterRegisterOffset(CounterType type);
+
+struct CounterContext {
+    uint32_t incrementAndGet(CounterType type);
+    void reset() { *this = CounterContext{}; }
+
+    uint32_t dispatch = 0;
+    uint32_t rop = 0;
+    uint32_t flush = 0;
+};
+
+inline constexpr uint32_t reservedDefault = 0u;
+inline constexpr uint32_t driverDebugDefault = 1u;
 
 struct BXMLHeapInfo {
     const uint32_t magicNumber = 0xDEB06D0C;
     const uint32_t heapSize;
-    const uint32_t component = static_cast<uint32_t>(Component::COMMON);
+    const uint32_t component = static_cast<uint32_t>(Component::common);
 
     BXMLHeapInfo(size_t size) : heapSize(static_cast<uint32_t>(size)) {}
 
@@ -38,7 +61,7 @@ struct BXMLHeapInfo {
 struct SWTagHeapInfo {
     const uint32_t magicNumber = 0xDEB06DD1;
     const uint32_t heapSize;
-    const uint32_t component = static_cast<uint32_t>(Component::COMMON);
+    const uint32_t component = static_cast<uint32_t>(Component::common);
 
     SWTagHeapInfo(size_t size) : heapSize(static_cast<uint32_t>(size)) {}
 
@@ -48,9 +71,9 @@ struct SWTagHeapInfo {
 struct BaseTag {
   public:
     BaseTag(OpCode code, size_t size) : opcode(static_cast<uint32_t>(code)),
-                                        reserved(0),
-                                        component(static_cast<uint32_t>(Component::COMMON)),
-                                        driverDebug(1),
+                                        reserved(reservedDefault),
+                                        component(static_cast<uint32_t>(Component::common)),
+                                        driverDebug(driverDebugDefault),
                                         dwordCount(static_cast<uint32_t>(size / sizeof(uint32_t) - 2)) {}
 
     OpCode getOpCode() const { return static_cast<OpCode>(opcode); }
@@ -86,35 +109,49 @@ struct BaseTag {
 struct KernelNameTag : public BaseTag {
   public:
     KernelNameTag(const char *name, uint32_t callId)
-        : BaseTag(OpCode::KernelName, sizeof(KernelNameTag)) {
+        : BaseTag(OpCode::kernelName, sizeof(KernelNameTag)) {
         strcpy_s(kernelName, kenelNameStrLength, name);
     }
 
     static void bxml(std::ostream &os);
 
   private:
-    static constexpr unsigned int kenelNameStrLength = sizeof(uint32_t) * 16; // Dword aligned
+    static constexpr uint32_t kenelNameStrLength = sizeof(uint32_t) * 16; // Dword aligned
     char kernelName[kenelNameStrLength] = {};
+};
+
+struct ArbitraryStringTag : public BaseTag {
+  public:
+    ArbitraryStringTag(const char *name)
+        : BaseTag(OpCode::arbitraryString, sizeof(ArbitraryStringTag)) {
+        strcpy_s(arbitraryString, tagStringLength, name);
+    }
+
+    static void bxml(std::ostream &os);
+
+  protected:
+    static constexpr uint32_t tagStringLength = sizeof(uint32_t) * 16; // Dword aligned
+    char arbitraryString[tagStringLength] = {};
 };
 
 struct PipeControlReasonTag : public BaseTag {
   public:
     PipeControlReasonTag(const char *reason, uint32_t callId)
-        : BaseTag(OpCode::PipeControlReason, sizeof(PipeControlReasonTag)) {
+        : BaseTag(OpCode::pipeControlReason, sizeof(PipeControlReasonTag)) {
         strcpy_s(reasonString, reasonStrLength, reason);
     }
 
     static void bxml(std::ostream &os);
 
   private:
-    static constexpr unsigned int reasonStrLength = sizeof(uint32_t) * 32; // Dword aligned
+    static constexpr uint32_t reasonStrLength = sizeof(uint32_t) * 32; // Dword aligned
     char reasonString[reasonStrLength] = {};
 };
 
 struct CallNameBeginTag : public BaseTag {
   public:
     CallNameBeginTag(const char *name, uint32_t callId)
-        : BaseTag(OpCode::CallNameBegin, sizeof(CallNameBeginTag)) {
+        : BaseTag(OpCode::callNameBegin, sizeof(CallNameBeginTag)) {
         strcpy_s(zeCallName, zeCallNameStrLength, name);
         snprintf(zeCallId, sizeof(uint32_t), "%x", callId);
     }
@@ -122,7 +159,7 @@ struct CallNameBeginTag : public BaseTag {
     static void bxml(std::ostream &os);
 
   private:
-    static constexpr unsigned int zeCallNameStrLength = sizeof(uint32_t) * 32; // Dword aligned
+    static constexpr uint32_t zeCallNameStrLength = sizeof(uint32_t) * 32; // Dword aligned
     char zeCallName[zeCallNameStrLength] = {};
     char zeCallId[zeCallNameStrLength] = {};
 };
@@ -130,7 +167,7 @@ struct CallNameBeginTag : public BaseTag {
 struct CallNameEndTag : public BaseTag {
   public:
     CallNameEndTag(const char *name, uint32_t callId)
-        : BaseTag(OpCode::CallNameEnd, sizeof(CallNameEndTag)) {
+        : BaseTag(OpCode::callNameEnd, sizeof(CallNameEndTag)) {
         strcpy_s(zeCallName, zeCallNameStrLength, name);
         snprintf(zeCallId, sizeof(uint32_t), "%x", callId);
     }
@@ -138,7 +175,7 @@ struct CallNameEndTag : public BaseTag {
     static void bxml(std::ostream &os);
 
   private:
-    static constexpr unsigned int zeCallNameStrLength = sizeof(uint32_t) * 32; // Dword aligned
+    static constexpr uint32_t zeCallNameStrLength = sizeof(uint32_t) * 32; // Dword aligned
     char zeCallName[zeCallNameStrLength] = {};
     char zeCallId[zeCallNameStrLength] = {};
 };

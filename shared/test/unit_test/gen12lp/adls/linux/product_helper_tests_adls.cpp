@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,53 +15,19 @@
 
 using namespace NEO;
 
-struct AdlsProductHelperLinux : ProductHelperTestLinux {
-    void SetUp() override {
-        ProductHelperTestLinux::SetUp();
-
-        drm = new DrmMock(*executionEnvironment->rootDeviceEnvironments[0]);
-        osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
-    }
-};
-
-ADLSTEST_F(AdlsProductHelperLinux, WhenConfiguringHwInfoThenConfigIsCorrect) {
-
-    auto ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-
-    EXPECT_EQ(0, ret);
-    EXPECT_EQ(static_cast<uint32_t>(drm->storedEUVal), outHwInfo.gtSystemInfo.EUCount);
-    EXPECT_EQ(static_cast<uint32_t>(drm->storedSSVal), outHwInfo.gtSystemInfo.SubSliceCount);
-    EXPECT_EQ(1u, outHwInfo.gtSystemInfo.SliceCount);
-
-    EXPECT_FALSE(outHwInfo.featureTable.flags.ftrTileY);
-}
-
-ADLSTEST_F(AdlsProductHelperLinux, GivenIncorrectDataWhenConfiguringHwInfoThenErrorIsReturned) {
-
-    drm->failRetTopology = true;
-    drm->storedRetValForEUVal = -1;
-    auto ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-    EXPECT_EQ(-1, ret);
-
-    drm->storedRetValForEUVal = 0;
-    drm->storedRetValForSSVal = -1;
-    ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-    EXPECT_EQ(-1, ret);
-}
-
 using AdlsHwInfoLinux = ::testing::Test;
 
 ADLSTEST_F(AdlsHwInfoLinux, WhenSettingUpHwInfoThenConfigIsCorrect) {
-    HardwareInfo hwInfo = *defaultHwInfo;
     auto executionEnvironment = std::make_unique<ExecutionEnvironment>();
     executionEnvironment->prepareRootDeviceEnvironments(1);
     executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
 
     DrmMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    DeviceDescriptor device = {0, &hwInfo, &AdlsHwConfig::setupHardwareInfo};
+    DeviceDescriptor device = {0, IGFX_ALDERLAKE_S};
+    drm.overrideDeviceDescriptor = &device;
 
-    int ret = drm.setupHardwareInfo(&device, false);
+    int ret = drm.setupHardwareInfo(0, false);
 
     const auto &gtSystemInfo = executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->gtSystemInfo;
 
@@ -73,7 +39,7 @@ ADLSTEST_F(AdlsHwInfoLinux, WhenSettingUpHwInfoThenConfigIsCorrect) {
     EXPECT_GT(gtSystemInfo.DualSubSliceCount, 0u);
     EXPECT_GT_VAL(gtSystemInfo.L3CacheSizeInKb, 0u);
     EXPECT_EQ(gtSystemInfo.CsrSizeInMb, 8u);
-    EXPECT_FALSE(gtSystemInfo.IsDynamicallyPopulated);
+    EXPECT_TRUE(gtSystemInfo.IsDynamicallyPopulated);
     EXPECT_GT(gtSystemInfo.DualSubSliceCount, 0u);
     EXPECT_GT(gtSystemInfo.MaxDualSubSlicesSupported, 0u);
 }

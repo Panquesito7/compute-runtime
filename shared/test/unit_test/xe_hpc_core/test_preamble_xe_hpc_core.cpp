@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -21,12 +21,16 @@ XE_HPC_CORETEST_F(PreambleCfeState, givenXeHpcCoreAndSetDebugFlagWhenPreambleCfe
     DebugManagerStateRestore dbgRestore;
     uint32_t expectedValue = 1u;
 
-    DebugManager.flags.CFEComputeDispatchAllWalkerEnable.set(expectedValue);
+    debugManager.flags.CFEComputeDispatchAllWalkerEnable.set(expectedValue);
+
+    uint64_t expectedBufferGpuAddress = linearStream.getCurrentGpuAddressPosition();
+    uint64_t cmdBufferGpuAddress = 0;
 
     uint64_t expectedAddress = 1 << CFE_STATE::SCRATCHSPACEBUFFER_BIT_SHIFT;
-    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, *defaultHwInfo, EngineGroupType::RenderCompute);
+    auto feCmdPtr = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, *defaultHwInfo, EngineGroupType::renderCompute, &cmdBufferGpuAddress);
+    ASSERT_EQ(expectedBufferGpuAddress, expectedBufferGpuAddress);
     StreamProperties emptyProperties{};
-    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, pDevice->getRootDeviceEnvironment(), 0u, expectedAddress, 16u, emptyProperties, nullptr);
+    PreambleHelper<FamilyType>::programVfeState(feCmdPtr, pDevice->getRootDeviceEnvironment(), 0u, expectedAddress, 16u, emptyProperties);
 
     parseCommands<FamilyType>(linearStream);
     auto cfeStateIt = find<CFE_STATE *>(cmdList.begin(), cmdList.end());
@@ -45,12 +49,12 @@ XE_HPC_CORETEST_F(PreambleCfeState, givenKernelExecutionTypeConcurrentAndRevisio
     const auto &productHelper = pDevice->getProductHelper();
     hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hwInfo);
 
-    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, hwInfo, EngineGroupType::RenderCompute);
+    auto feCmdPtr = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, hwInfo, EngineGroupType::renderCompute, nullptr);
     StreamProperties streamProperties{};
     streamProperties.initSupport(pDevice->getRootDeviceEnvironment());
-    streamProperties.frontEndState.setPropertiesAll(true, false, false, false);
+    streamProperties.frontEndState.setPropertiesAll(true, false, false);
 
-    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, pDevice->getRootDeviceEnvironment(), 0u, 0, 0, streamProperties, nullptr);
+    PreambleHelper<FamilyType>::programVfeState(feCmdPtr, pDevice->getRootDeviceEnvironment(), 0u, 0, 0, streamProperties);
     parseCommands<FamilyType>(linearStream);
     auto cfeStateIt = find<CFE_STATE *>(cmdList.begin(), cmdList.end());
     ASSERT_NE(cmdList.end(), cfeStateIt);
@@ -73,9 +77,9 @@ XE_HPC_CORETEST_F(PreambleCfeState, givenNotSetDebugFlagWhenPreambleCfeStateIsPr
 
     uint64_t expectedAddress = 1 << CFE_STATE::SCRATCHSPACEBUFFER_BIT_SHIFT;
     uint32_t expectedMaxThreads = GfxCoreHelper::getMaxThreadsForVfe(*defaultHwInfo);
-    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, *defaultHwInfo, EngineGroupType::RenderCompute);
+    auto feCmdPtr = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, *defaultHwInfo, EngineGroupType::renderCompute, nullptr);
     StreamProperties emptyProperties{};
-    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, pDevice->getRootDeviceEnvironment(), 0u, expectedAddress, expectedMaxThreads, emptyProperties, nullptr);
+    PreambleHelper<FamilyType>::programVfeState(feCmdPtr, pDevice->getRootDeviceEnvironment(), 0u, expectedAddress, expectedMaxThreads, emptyProperties);
     uint32_t maximumNumberOfThreads = cfeState->getMaximumNumberOfThreads();
 
     EXPECT_EQ(numberOfWalkers, cfeState->getNumberOfWalkers());
@@ -92,17 +96,17 @@ XE_HPC_CORETEST_F(PreambleCfeState, givenSetDebugFlagWhenPreambleCfeStateIsProgr
 
     DebugManagerStateRestore dbgRestore;
 
-    DebugManager.flags.CFEFusedEUDispatch.set(expectedValue1);
-    DebugManager.flags.CFEOverDispatchControl.set(expectedValue1);
-    DebugManager.flags.CFESingleSliceDispatchCCSMode.set(expectedValue1);
-    DebugManager.flags.CFELargeGRFThreadAdjustDisable.set(expectedValue1);
-    DebugManager.flags.CFENumberOfWalkers.set(expectedValue2);
-    DebugManager.flags.CFEMaximumNumberOfThreads.set(expectedValue2);
+    debugManager.flags.CFEFusedEUDispatch.set(expectedValue1);
+    debugManager.flags.OverDispatchControl.set(expectedValue1);
+    debugManager.flags.CFESingleSliceDispatchCCSMode.set(expectedValue1);
+    debugManager.flags.CFELargeGRFThreadAdjustDisable.set(expectedValue1);
+    debugManager.flags.CFENumberOfWalkers.set(expectedValue2);
+    debugManager.flags.MaximumNumberOfThreads.set(expectedValue2);
 
     uint64_t expectedAddress = 1 << CFE_STATE::SCRATCHSPACEBUFFER_BIT_SHIFT;
-    auto pVfeCmd = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, *defaultHwInfo, EngineGroupType::RenderCompute);
+    auto feCmdPtr = PreambleHelper<FamilyType>::getSpaceForVfeState(&linearStream, *defaultHwInfo, EngineGroupType::renderCompute, nullptr);
     StreamProperties emptyProperties{};
-    PreambleHelper<FamilyType>::programVfeState(pVfeCmd, pDevice->getRootDeviceEnvironment(), 0u, expectedAddress, 16u, emptyProperties, nullptr);
+    PreambleHelper<FamilyType>::programVfeState(feCmdPtr, pDevice->getRootDeviceEnvironment(), 0u, expectedAddress, 16u, emptyProperties);
 
     parseCommands<FamilyType>(linearStream);
     auto cfeStateIt = find<CFE_STATE *>(cmdList.begin(), cmdList.end());

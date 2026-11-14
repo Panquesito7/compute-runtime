@@ -1,13 +1,11 @@
 /*
- * Copyright (C) 2019-2021 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "opencl/source/sharings/unified/enable_unified.h"
-
-#include "shared/source/debug_settings/debug_settings_manager.h"
 
 #include "opencl/source/context/context.h"
 #include "opencl/source/context/context.inl"
@@ -22,8 +20,8 @@ namespace NEO {
 
 bool UnifiedSharingContextBuilder::processProperties(cl_context_properties &propertyType, cl_context_properties &propertyValue) {
     switch (propertyType) {
-    case static_cast<cl_context_properties>(UnifiedSharingContextType::DeviceHandle):
-    case static_cast<cl_context_properties>(UnifiedSharingContextType::DeviceGroup):
+    case static_cast<cl_context_properties>(UnifiedSharingContextType::deviceHandle):
+    case static_cast<cl_context_properties>(UnifiedSharingContextType::deviceGroup):
         this->contextData = std::make_unique<UnifiedCreateContextProperties>();
         return true;
     default:

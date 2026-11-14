@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,13 +11,20 @@
 namespace NEO {
 
 template <typename Family>
-bool GfxCoreHelperHw<Family>::isFenceAllocationRequired(const HardwareInfo &hwInfo) const {
-    if ((DebugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.get() == 0) &&
-        (DebugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.get() == 0) &&
-        (DebugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.get() == 0)) {
+bool GfxCoreHelperHw<Family>::isFenceAllocationRequired(const HardwareInfo &hwInfo, const ProductHelper &productHelper) const {
+    if ((debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.get() == 1) ||
+        (debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.get() == 1) ||
+        (debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.get() == 1) ||
+        (debugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.get() == 1)) {
+        return true;
+    }
+    if ((debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.get() == 0) &&
+        (debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.get() == 0) &&
+        (debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.get() == 0) &&
+        (debugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.get() == 0)) {
         return false;
     }
-    return true;
+    return !hwInfo.capabilityTable.isIntegratedDevice;
 }
 
 template <typename Family>
@@ -26,23 +33,16 @@ bool GfxCoreHelperHw<Family>::isCpuImageTransferPreferred(const HardwareInfo &hw
 }
 
 template <typename Family>
-bool GfxCoreHelperHw<Family>::isRcsAvailable(const HardwareInfo &hwInfo) const {
-    auto defaultEngine = getChosenEngineType(hwInfo);
-    return (defaultEngine == aub_stream::EngineType::ENGINE_RCS) ||
-           (defaultEngine == aub_stream::EngineType::ENGINE_CCCS) || hwInfo.featureTable.flags.ftrRcsNode;
-}
-
-template <typename Family>
 bool GfxCoreHelperHw<Family>::isCooperativeDispatchSupported(const EngineGroupType engineGroupType, const RootDeviceEnvironment &rootDeviceEnvironment) const {
     auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
     if (productHelper.isCooperativeEngineSupported(hwInfo)) {
-        if (engineGroupType == EngineGroupType::RenderCompute) {
+        if (engineGroupType == EngineGroupType::renderCompute) {
             return false;
         }
 
-        bool isExclusiveContextUsed = (engineGroupType == EngineGroupType::CooperativeCompute);
-        return !isRcsAvailable(hwInfo) || isExclusiveContextUsed;
+        bool isExclusiveContextUsed = (engineGroupType == EngineGroupType::cooperativeCompute);
+        return !EngineHelpers::isRcsExposed(rootDeviceEnvironment) || isExclusiveContextUsed;
     }
 
     return true;
@@ -50,9 +50,9 @@ bool GfxCoreHelperHw<Family>::isCooperativeDispatchSupported(const EngineGroupTy
 
 template <typename Family>
 uint32_t GfxCoreHelperHw<Family>::adjustMaxWorkGroupCount(uint32_t maxWorkGroupCount, const EngineGroupType engineGroupType,
-                                                          const RootDeviceEnvironment &rootDeviceEnvironment, bool isEngineInstanced) const {
-    if ((DebugManager.flags.ForceTheoreticalMaxWorkGroupCount.get()) ||
-        (DebugManager.flags.OverrideMaxWorkGroupCount.get() != -1)) {
+                                                          const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    if ((debugManager.flags.ForceTheoreticalMaxWorkGroupCount.get()) ||
+        (debugManager.flags.OverrideMaxWorkGroupCount.get() != -1)) {
         return maxWorkGroupCount;
     }
     if (!isCooperativeDispatchSupported(engineGroupType, rootDeviceEnvironment)) {
@@ -61,16 +61,15 @@ uint32_t GfxCoreHelperHw<Family>::adjustMaxWorkGroupCount(uint32_t maxWorkGroupC
     auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
     bool requiresLimitation = productHelper.isCooperativeEngineSupported(hwInfo) &&
-                              (engineGroupType != EngineGroupType::CooperativeCompute) &&
-                              (!isEngineInstanced);
-    auto numberOfpartsInTileForConcurrentKernels = productHelper.getNumberOfPartsInTileForConcurrentKernel();
-    if (requiresLimitation) {
+                              (engineGroupType != EngineGroupType::cooperativeCompute);
 
-        auto ccsCount = hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled;
+    auto ccsCount = hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled;
+    auto numberOfpartsInTileForConcurrentKernels = productHelper.getNumberOfPartsInTileForConcurrentKernel(ccsCount);
+    if (requiresLimitation) {
         UNRECOVERABLE_IF(ccsCount == 0);
         numberOfpartsInTileForConcurrentKernels = std::max(numberOfpartsInTileForConcurrentKernels, ccsCount);
     }
-    return maxWorkGroupCount / numberOfpartsInTileForConcurrentKernels;
+    return std::max(maxWorkGroupCount / numberOfpartsInTileForConcurrentKernels, 1u);
 }
 
 template <typename Family>
@@ -78,18 +77,24 @@ bool GfxCoreHelperHw<Family>::isEngineTypeRemappingToHwSpecificRequired() const 
     return true;
 }
 
+constexpr size_t defaultIsaPaddingPvcAndLater = 0xE00;
+
 template <typename Family>
 size_t GfxCoreHelperHw<Family>::getPaddingForISAAllocation() const {
-    if (DebugManager.flags.ForceExtendedKernelIsaSize.get() >= 1) {
-        return 0xE00 + (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedKernelIsaSize.get());
+    if (debugManager.flags.ForceExtendedKernelIsaSize.get() >= 1) {
+        return defaultIsaPaddingPvcAndLater + (MemoryConstants::pageSize * debugManager.flags.ForceExtendedKernelIsaSize.get());
     }
-    return 0xE00;
+    return defaultIsaPaddingPvcAndLater;
 }
 
 template <typename Family>
-uint32_t GfxCoreHelperHw<Family>::calculateAvailableThreadCount(const HardwareInfo &hwInfo, uint32_t grfCount) const {
-    auto maxThreadsPerEuCount = 1024u / grfCount;
-    return maxThreadsPerEuCount * hwInfo.gtSystemInfo.EUCount;
+void *MemorySynchronizationCommands<Family>::programMemoryFenceRelease(void *cmdBuffer) {
+    using MI_MEM_FENCE = Family::MI_MEM_FENCE;
+
+    MI_MEM_FENCE miMemFence = Family::cmdInitMemFence;
+    miMemFence.setFenceType(Family::MI_MEM_FENCE::FENCE_TYPE::FENCE_TYPE_RELEASE_FENCE);
+    *reinterpret_cast<MI_MEM_FENCE *>(cmdBuffer) = miMemFence;
+    return ptrOffset(cmdBuffer, sizeof(MI_MEM_FENCE));
 }
 
 } // namespace NEO

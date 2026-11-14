@@ -1,6 +1,6 @@
 <!---
 
-Copyright (C) 2020-2021 Intel Corporation
+Copyright (C) 2020-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -17,16 +17,26 @@ When adding new code, please also add corresponding unit level tests (ULT). Adde
 all the decision points introduced by the commit and should fail if executed without the code changes.
 Make sure it builds and passes _all_ ULT tests. For details about what compilers
 and build configurations we expect, refer to instructions for
-[building](https://github.com/intel/compute-runtime/blob/master/BUILD.md) the driver.
+[building](https://github.com/intel/compute-runtime/blob/master/documentation/BUILD.md) the driver.
 Make sure you adhere to our
-[coding standard](https://github.com/intel/compute-runtime/blob/master/GUIDELINES.md);
+[coding standard](https://github.com/intel/compute-runtime/blob/master/documentation/GUIDELINES.md);
 this will be verified by clang-format and clang-tidy
 (tool configuration is already included in NEO repository).
+For every file you modify, make sure the copyright header year range is up to date.
+When your change introduces, removes, or reshapes a fundamental concept (for example a
+new subsystem or core object, a hardware- or OS-abstraction mechanism, or a change to
+the object/ownership model or the command submission / memory management flow), update
+the relevant documentation in the same patch: the top-level architecture overview
+([ARCHITECTURE.md](https://github.com/intel/compute-runtime/blob/master/ARCHITECTURE.md))
+for cross-cutting concepts, and the
+[programmers guide](https://github.com/intel/compute-runtime/blob/master/programmers-guide/PROGRAMMERS_GUIDE.md)
+for feature-specific design details. Keep documentation generic and free of
+internal-only or non-public information.
 
 ### 2. Certificate of origin
 
 In order to get a clear contribution chain of trust we use the
-[signed-off-by language](https://01.org/community/signed-process) used by the Linux kernel project.
+[signed-off-by language](https://developercertificate.org/) used by the Linux kernel project.
 Please make sure your commit message adheres to this guideline.
 
 ### 3. Commit message content
@@ -41,6 +51,8 @@ the requirements above. Make sure your commit message follows these rules:
 * title (first line) should be self-contained (i.e. make sense without looking at the body)
 * additional description can be provided in the body
 * title and body need to be separated by an empty line
+* avoid Unicode characters in the title and body
+* do not include a "Test plan" section in the commit message; there is no need to document a ULT plan there
 
 ### 5. Initial (cursory) review
 
@@ -138,7 +150,7 @@ This reverts commit <ID of commit being reverted>
 3. Use **type** == **build** when your commit modifies the build flow, but does not modify the codebase of compute-runtime itself
 	* example: updating the header dependencies in third_party folder
 
-4. Use **type** == **test** when your commit modifies _only_ the files in test folders (unit_test, etc.) and not the actual runtime code
+4. Use **type** == **test** when your commit modifies _only_ the files in test folders (unit_test, target_aub_tests, target_unit_tests etc.) and not the actual runtime code. Also, modification of `aub_configs` component in `manifest.yml` is considered as test-only change
 
 5. Use **type** == **performance** when your commit is intended to improve observable performance without affecting functionality, 
     * when in doubt whether to use performance vs. fix as type, performance is usually a better fit

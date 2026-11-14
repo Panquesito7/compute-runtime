@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,10 @@
 
 #include "shared/test/common/test_macros/test.h"
 
+#include "level_zero/api/internal/l0_cmdlist.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_event.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
 #include <level_zero/ze_api.h>
 
@@ -54,9 +56,80 @@ TEST(zeCommandListAppendMemoryFill, whenCalledThenRedirectedToObject) {
     ASSERT_EQ(ZE_RESULT_SUCCESS, res);
 }
 
+TEST(zeCommandListAppendMemoryFill, whenPatternSizeNotPowerOf2ThenReturnError) {
+    MockCommandList commandList;
+    size_t bufferSize = 4096u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFill(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                             3u, bufferSize, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, res);
+}
+
+TEST(zeCommandListAppendMemoryFill, whenSizeNotMultipleOfPatternSizeThenReturnError) {
+    MockCommandList commandList;
+    size_t bufferSize = 4095u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFill(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                             4u, bufferSize, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, res);
+}
+
+TEST(zeCommandListAppendMemoryFill, whenPatternSizeIsZeroThenReturnError) {
+    MockCommandList commandList;
+    size_t bufferSize = 4096u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFill(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                             0u, bufferSize, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, res);
+}
+
+TEST(zeCommandListAppendMemoryFillWithParameters, whenCalledThenRedirectedToObject) {
+    MockCommandList commandList;
+    size_t bufferSize = 4096u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFillWithParameters(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                                           sizeof(value), bufferSize, nullptr, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, res);
+}
+
+TEST(zeCommandListAppendMemoryFillWithParameters, whenPatternSizeNotPowerOf2ThenReturnError) {
+    MockCommandList commandList;
+    size_t bufferSize = 4096u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFillWithParameters(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                                           3u, bufferSize, nullptr, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, res);
+}
+
+TEST(zeCommandListAppendMemoryFillWithParameters, whenSizeNotMultipleOfPatternSizeThenReturnError) {
+    MockCommandList commandList;
+    size_t bufferSize = 4095u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFillWithParameters(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                                           4u, bufferSize, nullptr, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, res);
+}
+
+TEST(zeCommandListAppendMemoryFillWithParameters, whenPatternSizeIsZeroThenReturnError) {
+    MockCommandList commandList;
+    size_t bufferSize = 4096u;
+
+    int value = 0;
+    auto res = zeCommandListAppendMemoryFillWithParameters(&commandList, reinterpret_cast<void *>(0x1000), reinterpret_cast<void *>(&value),
+                                                           0u, bufferSize, nullptr, nullptr, 0, nullptr);
+    ASSERT_EQ(ZE_RESULT_ERROR_INVALID_SIZE, res);
+}
+
 TEST(zeCommandListAppendWaitOnEvent, whenCalledThenRedirectedToObject) {
     MockCommandList commandList;
-    ze_event_handle_t event = reinterpret_cast<ze_event_handle_t>(0x2000);
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
 
     auto result = zeCommandListAppendWaitOnEvents(commandList.toHandle(), 1, &event);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -71,7 +144,7 @@ TEST(zeCommandListAppendWriteGlobalTimestamp, whenCalledThenRedirectedToObject) 
 
 TEST(zeCommandListAppendLaunchKernel, whenCalledThenRedirectedToObject) {
     MockCommandList commandList;
-    Mock<::L0::Kernel> kernel;
+    Mock<::L0::KernelImp> kernel;
     ze_group_count_t dispatchKernelArguments;
 
     auto result =
@@ -81,7 +154,8 @@ TEST(zeCommandListAppendLaunchKernel, whenCalledThenRedirectedToObject) {
 }
 TEST(zeCommandListAppendEventReset, whenCalledThenRedirectedToObject) {
     MockCommandList commandList;
-    ze_event_handle_t event = reinterpret_cast<ze_event_handle_t>(0x2000);
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
 
     auto result = zeCommandListAppendEventReset(commandList.toHandle(), event);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -96,10 +170,136 @@ TEST(zeCommandListAppendExecutionBarrier, whenCalledThenRedirectedToObject) {
 
 TEST(zeCommandListAppendSignalEvent, WhenAppendingSignalEventThenSuccessIsReturned) {
     MockCommandList commandList;
-    ze_event_handle_t event = reinterpret_cast<ze_event_handle_t>(0x2000);
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
 
     auto result = zeCommandListAppendSignalEvent(commandList.toHandle(), event);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+struct MockCommandListCaptureSignalWaitEventParams : public MockCommandList {
+    ze_result_t appendSignalEvent(ze_event_handle_t hEvent, CmdListSignalEventParameters &signalEventParameters) override {
+        capturedSignalEventParameters = signalEventParameters;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    ze_result_t appendWaitOnEvents(uint32_t numEvents, ze_event_handle_t *phEvent, CmdListWaitEventParameters &waitEventParams) override {
+        capturedWaitEventParameters = waitEventParams;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    CmdListSignalEventParameters capturedSignalEventParameters;
+    CmdListWaitEventParameters capturedWaitEventParameters;
+};
+
+TEST(zeCommandListAppendSignalEventWithParameters, WhenAppendingSignalEventWithFlagsExpExtensionThenParamIsCorrectlySet) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    ze_event_exp_flags_desc_t eventFlagsDesc = {ZE_STRUCTURE_TYPE_EVENT_EXP_FLAGS_DESC, nullptr, ZE_EVENT_EXP_FLAG_APPEND_GRAPH_EXTERNAL};
+
+    auto result = zeCommandListAppendSignalEventWithParameters(commandList.toHandle(), &eventFlagsDesc, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(commandList.capturedSignalEventParameters.apiRequestForGraphExternal);
+
+    eventFlagsDesc.flags = 0;
+    result = zeCommandListAppendSignalEventWithParameters(commandList.toHandle(), &eventFlagsDesc, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(commandList.capturedSignalEventParameters.apiRequestForGraphExternal);
+}
+
+TEST(zeCommandListAppendSignalEventWithParameters, WhenAppendingSignalEventWithFlagsCoreExtensionThenParamIsCorrectlySet) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    ze_event_ext_flags_desc_t eventFlagsDesc = {ZE_STRUCTURE_TYPE_EVENT_EXT_FLAGS_DESC, nullptr, ZE_EVENT_EXT_FLAG_APPEND_GRAPH_EXTERNAL};
+
+    auto result = zeCommandListAppendSignalEventWithParameters(commandList.toHandle(), &eventFlagsDesc, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(commandList.capturedSignalEventParameters.apiRequestForGraphExternal);
+
+    eventFlagsDesc.flags = 0;
+    result = zeCommandListAppendSignalEventWithParameters(commandList.toHandle(), &eventFlagsDesc, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(commandList.capturedSignalEventParameters.apiRequestForGraphExternal);
+}
+
+TEST(zeCommandListAppendSignalEventWithParameters, WhenAppendingSignalEventWithInvalidExtensionThenErrorIsReturned) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    ze_base_desc_t unknownDesc = {ZE_STRUCTURE_TYPE_FORCE_UINT32, nullptr};
+
+    auto result = zeCommandListAppendSignalEventWithParameters(commandList.toHandle(), &unknownDesc, event);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
+}
+
+TEST(zeCommandListAppendSignalEventWithParameters, WhenAppendingSignalEventWithNullptrExtensionThenNoParamIsSet) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    auto result = zeCommandListAppendSignalEventWithParameters(commandList.toHandle(), nullptr, event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(commandList.capturedSignalEventParameters.apiRequestForGraphExternal);
+}
+
+TEST(zeCommandListAppendWaitOnEventsWithParameters, WhenAppendingWaitOnEventsWithFlagsExpExtensionThenParamIsCorrectlySet) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    ze_event_exp_flags_desc_t eventFlagsDesc = {ZE_STRUCTURE_TYPE_EVENT_EXP_FLAGS_DESC, nullptr, ZE_EVENT_EXP_FLAG_APPEND_GRAPH_EXTERNAL};
+
+    auto result = zeCommandListAppendWaitOnEventsWithParameters(commandList.toHandle(), &eventFlagsDesc, 1, &event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(commandList.capturedWaitEventParameters.apiRequestForGraphExternal);
+
+    eventFlagsDesc.flags = 0;
+    result = zeCommandListAppendWaitOnEventsWithParameters(commandList.toHandle(), &eventFlagsDesc, 1, &event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(commandList.capturedWaitEventParameters.apiRequestForGraphExternal);
+}
+
+TEST(zeCommandListAppendWaitOnEventsWithParameters, WhenAppendingWaitOnEventsWithFlagsCoreExtensionThenParamIsCorrectlySet) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    ze_event_ext_flags_desc_t eventFlagsDesc = {ZE_STRUCTURE_TYPE_EVENT_EXT_FLAGS_DESC, nullptr, ZE_EVENT_EXT_FLAG_APPEND_GRAPH_EXTERNAL};
+
+    auto result = zeCommandListAppendWaitOnEventsWithParameters(commandList.toHandle(), &eventFlagsDesc, 1, &event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(commandList.capturedWaitEventParameters.apiRequestForGraphExternal);
+
+    eventFlagsDesc.flags = 0;
+    result = zeCommandListAppendWaitOnEventsWithParameters(commandList.toHandle(), &eventFlagsDesc, 1, &event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(commandList.capturedWaitEventParameters.apiRequestForGraphExternal);
+}
+
+TEST(zeCommandListAppendWaitOnEventsWithParameters, WhenAppendingWaitOnEventsWithInvalidExtensionThenErrorIsReturned) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    ze_base_desc_t unknownDesc = {ZE_STRUCTURE_TYPE_FORCE_UINT32, nullptr};
+
+    auto result = zeCommandListAppendWaitOnEventsWithParameters(commandList.toHandle(), &unknownDesc, 1, &event);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
+}
+
+TEST(zeCommandListAppendWaitOnEventsWithParameters, WhenAppendingWaitOnEventsWithNullptrExtensionThenNoParamIsSet) {
+    MockCommandListCaptureSignalWaitEventParams commandList;
+    Mock<Event> eventObj;
+    ze_event_handle_t event = eventObj.toHandle();
+
+    auto result = zeCommandListAppendWaitOnEventsWithParameters(commandList.toHandle(), nullptr, 1, &event);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_FALSE(commandList.capturedWaitEventParameters.apiRequestForGraphExternal);
 }
 
 } // namespace ult

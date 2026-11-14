@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,20 +7,20 @@
 
 #pragma once
 #include "shared/source/helpers/driver_model_type.h"
-#include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/hw_device_id.h"
 
 #include <string>
 namespace NEO {
 
 class HwDeviceIdDrm : public HwDeviceId {
   public:
-    static constexpr DriverModelType driverModelType = DriverModelType::DRM;
+    static constexpr DriverModelType driverModelType = DriverModelType::drm;
 
     HwDeviceIdDrm(int fileDescriptorIn, const char *pciPathIn)
-        : HwDeviceId(DriverModelType::DRM),
+        : HwDeviceId(DriverModelType::drm),
           fileDescriptor(fileDescriptorIn), pciPath(pciPathIn) {}
     HwDeviceIdDrm(int fileDescriptorIn, const char *pciPathIn, const char *devNodePathIn)
-        : HwDeviceId(DriverModelType::DRM),
+        : HwDeviceId(DriverModelType::drm),
           fileDescriptor(fileDescriptorIn), pciPath(pciPathIn), devNodePath(devNodePathIn) {}
     ~HwDeviceIdDrm() override;
     int getFileDescriptor() const { return fileDescriptor; }

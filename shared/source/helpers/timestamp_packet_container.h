@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 #include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/stackvec.h"
 
 namespace NEO {
@@ -39,6 +40,7 @@ struct TimestampPacketDependencies : public NonCopyableClass {
     TimestampPacketContainer barrierNodes;
     TimestampPacketContainer auxToNonAuxNodes;
     TimestampPacketContainer nonAuxToAuxNodes;
+    TimestampPacketContainer multiCsrDependencies;
 
     void moveNodesToNewContainer(TimestampPacketContainer &timestampPacketContainer);
 };

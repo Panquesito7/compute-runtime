@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,11 +8,11 @@
 #pragma once
 
 #include "shared/offline_compiler/source/decoder/helper.h"
-#include "shared/source/helpers/product_config_helper.h"
 #include "shared/source/utilities/const_stringref.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <algorithm>
-#include <fstream>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -20,9 +20,11 @@
 
 constexpr auto *oclocStdoutLogName = "stdout.log";
 
+struct ProductConfigHelper;
+struct FormerProductConfigHelper;
 namespace NEO {
 class CompilerProductHelper;
-class ReleaseHelper;
+struct HardwareInfo;
 } // namespace NEO
 
 struct Source {
@@ -30,7 +32,7 @@ struct Source {
     const size_t length;
     const char *name;
     Source(const uint8_t *data, const size_t length, const char *name)
-        : data(data), length(length), name(name){};
+        : data(data), length(length), name(name) {};
     void toVectorOfStrings(std::vector<std::string> &lines, bool replaceTabs = false);
     inline std::vector<char> toBinaryVector() {
         return std::vector<char>(data, data + length);
@@ -55,12 +57,15 @@ class OclocArgHelper {
     bool hasOutput = false;
     MessagePrinter messagePrinter;
     void moveOutputs();
+    std::string removeXePrefix(const std::string &deviceName) const;
     Source *findSourceFile(const std::string &filename);
     bool sourceFileExists(const std::string &filename) const;
 
     inline void addOutput(const std::string &filename, const void *data, const size_t &size) {
         outputs.push_back(std::make_unique<Output>(filename, data, size));
     }
+
+    bool verbose = false;
 
   public:
     OclocArgHelper();
@@ -73,14 +78,15 @@ class OclocArgHelper {
                    uint64_t **lenOutputs, char ***nameOutputs);
     virtual ~OclocArgHelper();
     MOCKABLE_VIRTUAL bool fileExists(const std::string &filename) const;
-    bool setHwInfoForProductConfig(uint32_t productConfig, NEO::HardwareInfo &hwInfo, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper, std::unique_ptr<NEO::ReleaseHelper> &releaseHelper);
-    uint32_t getProductConfigAndSetHwInfoBasedOnDeviceAndRevId(NEO::HardwareInfo &hwInfo, unsigned short deviceID, int revisionID, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper, std::unique_ptr<NEO::ReleaseHelper> &releaseHelper);
-    void setHwInfoForHwInfoConfig(NEO::HardwareInfo &hwInfo, uint64_t hwInfoConfig, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper, std::unique_ptr<NEO::ReleaseHelper> &releaseHelper);
+    bool setHwInfoForProductConfig(uint32_t productConfig, NEO::HardwareInfo &hwInfo, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper);
+    uint32_t getProductConfigAndSetHwInfoBasedOnDeviceAndRevId(NEO::HardwareInfo &hwInfo, unsigned short deviceID, int revisionID, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper);
+    void setHwInfoForHwInfoConfig(NEO::HardwareInfo &hwInfo, uint64_t hwInfoConfig, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper);
     std::vector<std::string> headersToVectorOfStrings();
     MOCKABLE_VIRTUAL void readFileToVectorOfStrings(const std::string &filename, std::vector<std::string> &lines);
     MOCKABLE_VIRTUAL std::vector<char> readBinaryFile(const std::string &filename);
     MOCKABLE_VIRTUAL std::unique_ptr<char[]> loadDataFromFile(const std::string &filename, size_t &retSize);
 
+    void dontSetupOutputs() { hasOutput = false; }
     bool outputEnabled() const {
         return hasOutput;
     }
@@ -91,8 +97,17 @@ class OclocArgHelper {
         return headers;
     }
 
+    bool isVerbose() const {
+        return verbose;
+    }
+
+    void setVerbose(bool verbose) {
+        this->verbose = verbose;
+    }
+
     MOCKABLE_VIRTUAL void saveOutput(const std::string &filename, const void *pData, const size_t &dataSize);
-    void saveOutput(const std::string &filename, const std::ostream &stream);
+
+    void removeXePrefixFromDeviceNames(std::vector<std::string> &args) const;
 
     MessagePrinter &getPrinterRef() { return messagePrinter; }
     void printf(const char *message) {
@@ -125,8 +140,9 @@ class OclocArgHelper {
         std::ostringstream os;
         for (const auto *acronyms : {std::addressof(args)...}) {
             for (const auto &acronym : *acronyms) {
-                if (os.tellp())
+                if (os.tellp()) {
                     os << ", ";
+                }
                 os << acronym.str();
             }
         }
@@ -134,4 +150,14 @@ class OclocArgHelper {
     }
 
     std::unique_ptr<ProductConfigHelper> productConfigHelper;
+    std::unique_ptr<FormerProductConfigHelper> formerProductConfigHelper;
+
+    uint32_t getNumSources() const { return static_cast<uint32_t>(inputs.size()); }
+    uint32_t getNumHeaders() const { return static_cast<uint32_t>(headers.size()); }
+
+    const std::vector<Source> &getInputs() const { return inputs; }
+    uint32_t *getNumOutputsPtr() const { return numOutputs; }
+    char ***getNameOutputsPtr() const { return nameOutputs; }
+    uint8_t ***getDataOutputsPtr() const { return dataOutputs; }
+    uint64_t **getLenOutputsPtr() const { return lenOutputs; }
 };

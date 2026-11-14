@@ -1,13 +1,16 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/command_container/cmdcontainer_types.h"
 #include "shared/source/helpers/bindless_heaps_helper.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,48 +31,51 @@ inline constexpr size_t scratchSpaceOffsetFor64Bit = 4096u;
 
 using ResidencyContainer = std::vector<GraphicsAllocation *>;
 
-class ScratchSpaceController {
+class ScratchSpaceController : NonCopyableAndNonMovableClass {
   public:
     ScratchSpaceController(uint32_t rootDeviceIndex, ExecutionEnvironment &environment, InternalAllocationStorage &allocationStorage);
     virtual ~ScratchSpaceController();
 
-    MOCKABLE_VIRTUAL GraphicsAllocation *getScratchSpaceAllocation() {
-        return scratchAllocation;
+    MOCKABLE_VIRTUAL GraphicsAllocation *getScratchSpaceSlot0Allocation() {
+        return scratchSlot0Allocation;
     }
-    GraphicsAllocation *getPrivateScratchSpaceAllocation() {
-        return privateScratchAllocation;
+    GraphicsAllocation *getScratchSpaceSlot1Allocation() {
+        return scratchSlot1Allocation;
     }
-    virtual void setRequiredScratchSpace(void *sshBaseAddress,
+    virtual bool setRequiredScratchSpace(void *sshBaseAddress,
                                          uint32_t scratchSlot,
-                                         uint32_t requiredPerThreadScratchSize,
-                                         uint32_t requiredPerThreadPrivateScratchSize,
-                                         TaskCountType currentTaskCount,
+                                         uint32_t requiredPerThreadScratchSizeSlot0,
+                                         uint32_t requiredPerThreadScratchSizeSlot1,
                                          OsContext &osContext,
                                          bool &stateBaseAddressDirty,
                                          bool &vfeStateDirty) = 0;
 
+    virtual bool reserveScratchSpace(uint32_t requiredPerThreadScratchSizeSlot0,
+                                     uint32_t requiredPerThreadScratchSizeSlot1,
+                                     OsContext &osContext) = 0;
+
     virtual uint64_t calculateNewGSH() = 0;
     virtual uint64_t getScratchPatchAddress() = 0;
-    inline uint32_t getPerThreadScratchSpaceSize() {
-        return static_cast<uint32_t>(scratchSizeBytes / computeUnitsUsedForScratch);
+
+    inline uint32_t getPerThreadScratchSpaceSizeSlot0() const {
+        return perThreadScratchSpaceSlot0Size;
     }
-    inline uint32_t getPerThreadPrivateScratchSize() {
-        return static_cast<uint32_t>(privateScratchSizeBytes / computeUnitsUsedForScratch);
+    inline uint32_t getPerThreadScratchSizeSlot1() const {
+        return perThreadScratchSpaceSlot1Size;
     }
 
+    virtual size_t getReservedSshSize() const = 0;
     virtual void reserveHeap(IndirectHeap::Type heapType, IndirectHeap *&indirectHeap) = 0;
-    virtual void programHeaps(HeapContainer &heapContainer,
+    virtual bool programHeaps(HeapContainer &heapContainer,
                               uint32_t scratchSlot,
-                              uint32_t requiredPerThreadScratchSize,
-                              uint32_t requiredPerThreadPrivateScratchSize,
-                              TaskCountType currentTaskCount,
+                              uint32_t requiredPerThreadScratchSizeSlot0,
+                              uint32_t requiredPerThreadScratchSizeSlot1,
                               OsContext &osContext,
                               bool &stateBaseAddressDirty,
                               bool &vfeStateDirty) = 0;
     virtual void programBindlessSurfaceStateForScratch(BindlessHeapsHelper *heapsHelper,
-                                                       uint32_t requiredPerThreadScratchSize,
-                                                       uint32_t requiredPerThreadPrivateScratchSize,
-                                                       TaskCountType currentTaskCount,
+                                                       uint32_t requiredPerThreadScratchSizeSlot0,
+                                                       uint32_t requiredPerThreadScratchSizeSlot1,
                                                        OsContext &osContext,
                                                        bool &stateBaseAddressDirty,
                                                        bool &vfeStateDirty,
@@ -80,12 +86,15 @@ class ScratchSpaceController {
 
     const uint32_t rootDeviceIndex;
     ExecutionEnvironment &executionEnvironment;
-    GraphicsAllocation *scratchAllocation = nullptr;
-    GraphicsAllocation *privateScratchAllocation = nullptr;
+    GraphicsAllocation *scratchSlot0Allocation = nullptr;
+    GraphicsAllocation *scratchSlot1Allocation = nullptr;
     InternalAllocationStorage &csrAllocationStorage;
-    size_t scratchSizeBytes = 0;
-    size_t privateScratchSizeBytes = 0;
+    size_t scratchSlot0SizeInBytes = 0;
+    size_t scratchSlot1SizeInBytes = 0;
+    uint32_t perThreadScratchSpaceSlot0Size = 0;
+    uint32_t perThreadScratchSpaceSlot1Size = 0;
     bool force32BitAllocation = false;
+    bool scratchSurfaceStateProgrammingPending = false;
     uint32_t computeUnitsUsedForScratch = 0;
 };
 } // namespace NEO

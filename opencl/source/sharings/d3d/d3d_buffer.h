@@ -1,14 +1,16 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/get_info.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
 
+#include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/sharings/d3d/d3d_sharing.h"
 
@@ -43,10 +45,11 @@ class D3DBuffer : public D3DSharing<D3D> {
         AllocationProperties properties = {context->getDevice(0)->getRootDeviceIndex(),
                                            false, // allocateMemory
                                            0,     // size
-                                           AllocationType::SHARED_BUFFER,
+                                           AllocationType::sharedBuffer,
                                            false, // isMultiStorageAllocation
                                            context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex())};
-        auto alloc = context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(toOsHandle(sharedHandle), properties, true, false, true, nullptr);
+        MemoryManager::OsHandleData osHandleData{sharedHandle};
+        auto alloc = context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(osHandleData, properties, true, false, true, nullptr);
 
         auto d3dBufferObj = new D3DBuffer<D3D>(context, d3dBuffer, bufferStaging, sharedResource);
 
@@ -60,6 +63,6 @@ class D3DBuffer : public D3DSharing<D3D> {
 
   protected:
     D3DBuffer(Context *context, D3DBufferObj *d3dBuffer, D3DBufferObj *bufferStaging, bool sharedResource)
-        : D3DSharing(context, d3dBuffer, bufferStaging, 0, sharedResource){};
+        : D3DSharing<D3D>(context, d3dBuffer, bufferStaging, 0, sharedResource) {};
 };
 } // namespace NEO

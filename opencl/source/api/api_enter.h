@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,15 +7,9 @@
 
 #pragma once
 
-#include "shared/source/utilities/logger.h"
-#include "shared/source/utilities/perf_profiler.h"
+#include "shared/source/helpers/preprocessor.h"
+
+#include "opencl/source/utilities/cl_logger.h"
 
 #define API_ENTER(retValPointer) \
-    LoggerApiEnterWrapper<NEO::FileLogger<globalDebugFunctionalityLevel>::enabled()> ApiWrapperForSingleCall(__FUNCTION__, retValPointer)
-
-#if KMD_PROFILING == 1
-#undef API_ENTER
-
-#define API_ENTER(x) \
-    PerfProfilerApiWrapper globalPerfProfilersWrapperInstanceForSingleApiFunction(__FUNCTION__)
-#endif
+    LoggerApiEnterWrapper<NEO::FileLogger<globalDebugFunctionalityLevel>::enabled()> ApiWrapperForSingleCall(NEO_FUNCTION_NAME, retValPointer)

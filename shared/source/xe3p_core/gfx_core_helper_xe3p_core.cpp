@@ -1,0 +1,74 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/populate_factory.h"
+#include "shared/source/xe3p_core/hw_cmds_base.h"
+using Family = NEO::Xe3pCoreFamily;
+#include "shared/source/helpers/flat_batch_buffer_helper_hw.inl"
+#include "shared/source/helpers/gfx_core_helper_base.inl"
+#include "shared/source/helpers/gfx_core_helper_dg2_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_pvc_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_tgllp_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_xe2_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_xe3_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_xe3p_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_xehp_and_later.inl"
+
+namespace NEO {
+template <>
+uint32_t GfxCoreHelperHw<Family>::getMetricsLibraryGenId() const {
+    return static_cast<uint32_t>(MetricsLibraryApi::ClientGen::Xe3P);
+}
+
+template <>
+const StackVec<size_t, 3> GfxCoreHelperHw<Family>::getDeviceSubGroupSizes() const {
+    return {16, 32};
+}
+
+template <>
+uint32_t GfxCoreHelperHw<Family>::overrideMaxWorkGroupSize(uint32_t maxWG) const {
+    return std::min(maxWG, 2048u);
+}
+
+template <>
+uint32_t GfxCoreHelperHw<Family>::calculateNumThreadsPerThreadGroup(uint32_t simd, uint32_t totalWorkItems, uint32_t grfCount, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    uint32_t numThreadsPerThreadGroup = getThreadsPerWG(simd, totalWorkItems);
+    if (debugManager.flags.RemoveRestrictionsOnNumberOfThreadsInGpgpuThreadGroup.get() == 1) {
+        return numThreadsPerThreadGroup;
+    }
+
+    const auto &productHelper = rootDeviceEnvironment.getProductHelper();
+
+    uint32_t maxThreadsPerThreadGroup = 64u;
+    if (grfCount == 512) {
+        maxThreadsPerThreadGroup = 16u;
+    } else if ((grfCount == 256) || (simd == 32u)) {
+        // NEO-11881
+        maxThreadsPerThreadGroup = 32u;
+    } else if (grfCount == 192) {
+        maxThreadsPerThreadGroup = 40u;
+    } else if (grfCount == 160) {
+        maxThreadsPerThreadGroup = 48u;
+    }
+
+    maxThreadsPerThreadGroup = productHelper.adjustMaxThreadsPerThreadGroup(*rootDeviceEnvironment.getHardwareInfo(), maxThreadsPerThreadGroup, simd, grfCount);
+
+    numThreadsPerThreadGroup = std::min(numThreadsPerThreadGroup, maxThreadsPerThreadGroup);
+    DEBUG_BREAK_IF(numThreadsPerThreadGroup * simd > CommonConstants::maxWorkgroupSize);
+    return numThreadsPerThreadGroup;
+}
+
+} // namespace NEO
+
+namespace NEO {
+#include "shared/source/helpers/gfx_core_helper_factory_init.inl"
+
+template class GfxCoreHelperHw<Family>;
+template class FlatBatchBufferHelperHw<Family>;
+template struct MemorySynchronizationCommands<Family>;
+template struct LriHelper<Family>;
+} // namespace NEO

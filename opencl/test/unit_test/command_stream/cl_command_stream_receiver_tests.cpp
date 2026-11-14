@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -48,7 +48,7 @@ TEST(ClCommandStreamReceiverTest, WhenMakingResidentThenBufferResidencyFlagIsSet
 using ClCommandStreamReceiverTests = Test<DeviceFixture>;
 
 HWTEST_F(ClCommandStreamReceiverTests, givenCommandStreamReceiverWhenFenceAllocationIsRequiredAndCreateGlobalFenceAllocationIsCalledThenFenceAllocationIsAllocated) {
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperWithFenceAllocation<FamilyType>> gfxCoreHelperBackup{
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> gfxCoreHelperBackup{
         *pDevice->executionEnvironment->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]};
 
     MockCsrHw<FamilyType> csr(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
@@ -58,11 +58,11 @@ HWTEST_F(ClCommandStreamReceiverTests, givenCommandStreamReceiverWhenFenceAlloca
     EXPECT_TRUE(csr.createGlobalFenceAllocation());
 
     ASSERT_NE(nullptr, csr.globalFenceAllocation);
-    EXPECT_EQ(AllocationType::GLOBAL_FENCE, csr.globalFenceAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::globalFence, csr.globalFenceAllocation->getAllocationType());
 }
 
 HWTEST_F(ClCommandStreamReceiverTests, givenCommandStreamReceiverWhenGettingFenceAllocationThenCorrectFenceAllocationIsReturned) {
-    RAIIGfxCoreHelperFactory<MockGfxCoreHelperWithFenceAllocation<FamilyType>> gfxCoreHelperBackup{
+    RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>> gfxCoreHelperBackup{
         *pDevice->executionEnvironment->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]};
 
     CommandStreamReceiverHw<FamilyType> csr(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
@@ -72,41 +72,49 @@ HWTEST_F(ClCommandStreamReceiverTests, givenCommandStreamReceiverWhenGettingFenc
     EXPECT_TRUE(csr.createGlobalFenceAllocation());
 
     ASSERT_NE(nullptr, csr.getGlobalFenceAllocation());
-    EXPECT_EQ(AllocationType::GLOBAL_FENCE, csr.getGlobalFenceAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::globalFence, csr.getGlobalFenceAllocation()->getAllocationType());
 }
 
 using CommandStreamReceiverMultiRootDeviceTest = MultiRootDeviceFixture;
 
 TEST_F(CommandStreamReceiverMultiRootDeviceTest, WhenCreatingCommandStreamGraphicsAllocationsThenTheyHaveCorrectRootDeviceIndex) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableLinearStreamPoolAllocator.set(0);
+    debugManager.flags.EnableInternalHeapPoolAllocator.set(0);
     auto commandStreamReceiver = &device1->getGpgpuCommandStreamReceiver();
 
+    auto originalLocalMemorySupported = mockMemoryManager->localMemorySupported[1];
     mockMemoryManager->localMemorySupported[1] = false;
 
     ASSERT_NE(nullptr, commandStreamReceiver);
     EXPECT_EQ(expectedRootDeviceIndex, commandStreamReceiver->getRootDeviceIndex());
 
     // Linear stream / Command buffer
-    GraphicsAllocation *allocation = mockMemoryManager->allocateGraphicsMemoryWithProperties({expectedRootDeviceIndex, 128u, AllocationType::COMMAND_BUFFER, device1->getDeviceBitfield()});
+    GraphicsAllocation *allocation = mockMemoryManager->allocateGraphicsMemoryWithProperties({expectedRootDeviceIndex, 128u, AllocationType::commandBuffer, device1->getDeviceBitfield()});
     LinearStream commandStream{allocation};
 
     commandStreamReceiver->ensureCommandBufferAllocation(commandStream, 100u, 0u);
     EXPECT_EQ(allocation, commandStream.getGraphicsAllocation());
-    EXPECT_EQ(128u, commandStream.getMaxAvailableSpace());
+    EXPECT_EQ(MemoryConstants::pageSize, commandStream.getMaxAvailableSpace());
     EXPECT_EQ(expectedRootDeviceIndex, commandStream.getGraphicsAllocation()->getRootDeviceIndex());
 
-    commandStreamReceiver->ensureCommandBufferAllocation(commandStream, 1024u, 0u);
+    commandStreamReceiver->ensureCommandBufferAllocation(commandStream, MemoryConstants::pageSize64k, 0u);
     EXPECT_NE(allocation, commandStream.getGraphicsAllocation());
-    EXPECT_EQ(0u, commandStream.getMaxAvailableSpace() % MemoryConstants::pageSize64k);
+    EXPECT_EQ(0u, commandStream.getMaxAvailableSpace() % MemoryConstants::pageSize);
     EXPECT_EQ(expectedRootDeviceIndex, commandStream.getGraphicsAllocation()->getRootDeviceIndex());
-    mockMemoryManager->freeGraphicsMemory(commandStream.getGraphicsAllocation());
-
+    auto newAllocation = commandStream.getGraphicsAllocation();
+    if (newAllocation->isView()) {
+        device1->getDevice().getCommandBufferPoolAllocator().free(newAllocation);
+    } else {
+        mockMemoryManager->freeGraphicsMemory(newAllocation);
+    }
     // Debug surface
     auto debugSurface = commandStreamReceiver->allocateDebugSurface(MemoryConstants::pageSize);
     ASSERT_NE(nullptr, debugSurface);
     EXPECT_EQ(expectedRootDeviceIndex, debugSurface->getRootDeviceIndex());
 
     // Indirect heaps
-    IndirectHeap::Type heapTypes[]{IndirectHeap::Type::DYNAMIC_STATE, IndirectHeap::Type::INDIRECT_OBJECT, IndirectHeap::Type::SURFACE_STATE};
+    IndirectHeap::Type heapTypes[]{IndirectHeap::Type::dynamicState, IndirectHeap::Type::indirectObject, IndirectHeap::Type::surfaceState};
     for (auto heapType : heapTypes) {
         IndirectHeap *heap = nullptr;
         commandStreamReceiver->allocateHeapMemory(heapType, MemoryConstants::pageSize, heap);
@@ -133,6 +141,8 @@ TEST_F(CommandStreamReceiverMultiRootDeviceTest, WhenCreatingCommandStreamGraphi
     EXPECT_TRUE(commandStreamReceiver->createAllocationForHostSurface(surface, false));
     ASSERT_NE(nullptr, surface.getAllocation());
     EXPECT_EQ(expectedRootDeviceIndex, surface.getAllocation()->getRootDeviceIndex());
-    EXPECT_EQ(1u, surface.getAllocation()->hostPtrTaskCountAssignment.load());
-    surface.getAllocation()->hostPtrTaskCountAssignment--;
+    EXPECT_EQ(1u, surface.getAllocation()->getHostPtrTaskCountAssignment());
+    surface.getAllocation()->decrementHostPtrTaskCountAssignment();
+
+    mockMemoryManager->localMemorySupported[1] = originalLocalMemorySupported;
 }

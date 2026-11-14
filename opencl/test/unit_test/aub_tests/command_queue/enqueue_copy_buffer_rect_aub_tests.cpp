@@ -1,19 +1,21 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
-#include <algorithm>
+#include <cstdint>
+#include <new>
+#include <tuple>
 
 using namespace NEO;
 
@@ -48,35 +50,34 @@ HWTEST_P(AUBCopyBufferRect, WhenCopyingThenExpectationsMet) {
     static const size_t elementCount = slicePitch * rowPitch;
     MockContext context(this->pClDevice);
 
-    cl_uchar *srcMemory = new uint8_t[elementCount + 8];
-    cl_uchar *dstMemory = new uint8_t[elementCount + 8];
+    cl_uchar srcMemory[elementCount + 8] = {};
+    cl_uchar dstMemory[elementCount + 8] = {};
 
     for (size_t i = 0; i < elementCount; i++) {
         srcMemory[i] = static_cast<cl_uchar>(i + 1);
-        dstMemory[i] = 0;
     }
 
     auto retVal = CL_INVALID_VALUE;
 
-    auto srcBuffer = Buffer::create(
+    std::unique_ptr<Buffer> srcBuffer(Buffer::create(
         &context,
         CL_MEM_USE_HOST_PTR,
         elementCount * sizeof(uint8_t),
         srcMemory,
-        retVal);
+        retVal));
     ASSERT_NE(nullptr, srcBuffer);
 
-    auto dstBuffer = Buffer::create(
+    std::unique_ptr<Buffer> dstBuffer(Buffer::create(
         &context,
         CL_MEM_USE_HOST_PTR,
         elementCount * sizeof(uint8_t),
         dstMemory,
-        retVal);
+        retVal));
     ASSERT_NE(nullptr, dstBuffer);
 
     auto pSrcMemory = &srcMemory[0];
 
-    auto pDestMemory = reinterpret_cast<cl_uchar *>(dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress());
+    auto pDestMemory = reinterpret_cast<cl_uchar *>(ptrOffset(dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), dstBuffer->getOffset()));
 
     size_t regionX = std::min(rowPitch / 2, rowPitch - std::max(srcOrigin0, dstOrigin0));
     size_t regionY = std::min(rowPitch / 2, rowPitch - std::max(srcOrigin1, dstOrigin1));
@@ -87,8 +88,8 @@ HWTEST_P(AUBCopyBufferRect, WhenCopyingThenExpectationsMet) {
     size_t region[] = {regionX, regionY, regionZ};
 
     retVal = pCmdQ->enqueueCopyBufferRect(
-        srcBuffer,
-        dstBuffer,
+        srcBuffer.get(),
+        dstBuffer.get(),
         srcOrigin,
         dstOrigin,
         region,
@@ -123,24 +124,18 @@ HWTEST_P(AUBCopyBufferRect, WhenCopyingThenExpectationsMet) {
         tSrc += slicePitch;
         tRef += slicePitch;
     }
-    AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, src, rowPitch * slicePitch);
-
-    delete srcBuffer;
-    delete dstBuffer;
-
-    delete[] srcMemory;
-    delete[] dstMemory;
+    expectMemory<FamilyType>(pDestMemory, src, rowPitch * slicePitch);
 }
 
 static size_t zero[] = {0};
 
-INSTANTIATE_TEST_CASE_P(AUBCopyBufferRect,
-                        AUBCopyBufferRect,
-                        ::testing::Combine(
-                            ::testing::Values(0, 3), // srcOrigin
-                            ::testing::ValuesIn(zero),
-                            ::testing::Values(0, 7),
-                            ::testing::Values(0, 3), // dstPrigin
-                            ::testing::ValuesIn(zero),
-                            ::testing::Values(0, 7),
-                            ::testing::Values(true, false)));
+INSTANTIATE_TEST_SUITE_P(AUBCopyBufferRect,
+                         AUBCopyBufferRect,
+                         ::testing::Combine(
+                             ::testing::Values(0, 3), // srcOrigin
+                             ::testing::ValuesIn(zero),
+                             ::testing::Values(0, 7),
+                             ::testing::Values(0, 3), // dstPrigin
+                             ::testing::ValuesIn(zero),
+                             ::testing::Values(0, 7),
+                             ::testing::Values(true, false)));

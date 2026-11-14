@@ -1,24 +1,34 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_walk_order.h"
 #include "shared/source/helpers/per_thread_data.h"
 #include "shared/source/helpers/ptr_math.h"
-#include "shared/source/kernel/implicit_args.h"
+#include "shared/source/kernel/implicit_args_base.h"
+#include "shared/source/kernel/implicit_args_helper.h"
 #include "shared/source/kernel/kernel_descriptor.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/test_macros/test.h"
+#include "shared/test/unit_test/kernel/implicit_args_layout_test_helper.h"
+
+#include "implicit_args.h"
+
+#include <cstring>
+#include <vector>
 
 using namespace NEO;
 
 TEST(ImplicitArgsHelperTest, whenLocalIdsAreGeneratedByRuntimeThenDimensionOrderIsTakedFromInput) {
     uint8_t inputDimensionOrder[3] = {2, 0, 1};
-    for (auto i = 0u; i < HwWalkOrderHelper::walkOrderPossibilties; i++) {
-        auto dimOrderForImplicitArgs = ImplicitArgsHelper::getDimensionOrderForLocalIds(inputDimensionOrder, std::make_pair(true, i));
+    for (auto i = 0u; i < HwWalkOrderHelper::walkOrderPossibilities; i++) {
+        auto dimOrderForImplicitArgs = ImplicitArgsHelper::getDimensionOrderForLocalIds(inputDimensionOrder, std::make_pair(false, i));
         EXPECT_EQ(inputDimensionOrder[0], dimOrderForImplicitArgs[0]);
         EXPECT_EQ(inputDimensionOrder[1], dimOrderForImplicitArgs[1]);
         EXPECT_EQ(inputDimensionOrder[2], dimOrderForImplicitArgs[2]);
@@ -30,13 +40,13 @@ TEST(ImplicitArgsHelperTest, whenLocalIdsAreGeneratedByRuntimeThenDimensionOrder
 }
 
 TEST(ImplicitArgsHelperTest, givenIncorrectcInputWhenGettingDimensionOrderThenAbortIsCalled) {
-    EXPECT_THROW(ImplicitArgsHelper::getDimensionOrderForLocalIds(nullptr, std::make_pair(true, 0u)), std::runtime_error);
-    EXPECT_THROW(ImplicitArgsHelper::getDimensionOrderForLocalIds(nullptr, std::make_pair(false, HwWalkOrderHelper::walkOrderPossibilties)), std::runtime_error);
+    EXPECT_THROW(ImplicitArgsHelper::getDimensionOrderForLocalIds(nullptr, std::make_pair(false, 0u)), std::runtime_error);
+    EXPECT_THROW(ImplicitArgsHelper::getDimensionOrderForLocalIds(nullptr, std::make_pair(true, HwWalkOrderHelper::walkOrderPossibilities)), std::runtime_error);
 }
 
 TEST(ImplicitArgsHelperTest, whenLocalIdsAreGeneratedByHwThenProperDimensionOrderIsReturned) {
-    for (auto i = 0u; i < HwWalkOrderHelper::walkOrderPossibilties; i++) {
-        auto dimOrderForImplicitArgs = ImplicitArgsHelper::getDimensionOrderForLocalIds(nullptr, std::make_pair(false, i));
+    for (auto i = 0u; i < HwWalkOrderHelper::walkOrderPossibilities; i++) {
+        auto dimOrderForImplicitArgs = ImplicitArgsHelper::getDimensionOrderForLocalIds(nullptr, std::make_pair(true, i));
         EXPECT_EQ(HwWalkOrderHelper::compatibleDimensionOrders[i], dimOrderForImplicitArgs);
     }
 }
@@ -55,121 +65,372 @@ TEST(ImplicitArgsHelperTest, givenSimdGreaterThanOneWhenGettingGrfSizeThenGrfSiz
 TEST(ImplicitArgsHelperTest, givenNoImplicitArgsWhenGettingSizeForImplicitArgsProgrammingThenZeroIsReturned) {
 
     KernelDescriptor kernelDescriptor{};
-
-    EXPECT_EQ(0u, ImplicitArgsHelper::getSizeForImplicitArgsPatching(nullptr, kernelDescriptor));
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    EXPECT_EQ(0u, ImplicitArgsHelper::getSizeForImplicitArgsPatching(nullptr, kernelDescriptor, false, rootDeviceEnvironment));
 }
 
 TEST(ImplicitArgsHelperTest, givenImplicitArgsWithoutImplicitArgsBufferOffsetInPayloadMappingWhenGettingSizeForImplicitArgsProgrammingThenCorrectSizeIsReturned) {
-    ImplicitArgs implicitArgs{sizeof(ImplicitArgs)};
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v0.header.structSize = ImplicitArgsV0::getSize();
+    implicitArgs.v0.header.structVersion = 0;
 
     KernelDescriptor kernelDescriptor{};
 
     EXPECT_TRUE(isUndefinedOffset<>(kernelDescriptor.payloadMappings.implicitArgs.implicitArgsBuffer));
 
-    implicitArgs.simdWidth = 32;
-    implicitArgs.localSizeX = 2;
-    implicitArgs.localSizeY = 3;
-    implicitArgs.localSizeZ = 4;
+    implicitArgs.v0.simdWidth = 32;
+    implicitArgs.v0.localSizeX = 2;
+    implicitArgs.v0.localSizeY = 3;
+    implicitArgs.v0.localSizeZ = 4;
 
-    auto totalWorkgroupSize = implicitArgs.localSizeX * implicitArgs.localSizeY * implicitArgs.localSizeZ;
+    auto totalWorkgroupSize = implicitArgs.v0.localSizeX * implicitArgs.v0.localSizeY * implicitArgs.v0.localSizeZ;
 
-    auto localIdsSize = alignUp(PerThreadDataHelper::getPerThreadDataSizeTotal(implicitArgs.simdWidth, 32u /* grfSize */, 3u /* num channels */, totalWorkgroupSize), MemoryConstants::cacheLineSize);
-    EXPECT_EQ(localIdsSize + implicitArgs.structSize, ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor));
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    auto localIdsSize = alignUp(PerThreadDataHelper::getPerThreadDataSizeTotal(implicitArgs.v0.simdWidth, 32u /* grfSize */, GrfConfig::defaultGrfNumber /* numGrf */, 3u /* num channels */, totalWorkgroupSize, rootDeviceEnvironment), MemoryConstants::cacheLineSize);
+    EXPECT_EQ(localIdsSize + ImplicitArgsV0::getAlignedSize(), ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor, false, rootDeviceEnvironment));
 }
 
 TEST(ImplicitArgsHelperTest, givenImplicitArgsWithImplicitArgsBufferOffsetInPayloadMappingWhenGettingSizeForImplicitArgsProgrammingThenCorrectSizeIsReturned) {
-    ImplicitArgs implicitArgs{sizeof(ImplicitArgs)};
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v0.header.structSize = ImplicitArgsV0::getSize();
+    implicitArgs.v0.header.structVersion = 0;
 
     KernelDescriptor kernelDescriptor{};
     kernelDescriptor.payloadMappings.implicitArgs.implicitArgsBuffer = 0x10;
     EXPECT_TRUE(isValidOffset<>(kernelDescriptor.payloadMappings.implicitArgs.implicitArgsBuffer));
 
-    implicitArgs.simdWidth = 32;
-    implicitArgs.localSizeX = 2;
-    implicitArgs.localSizeY = 3;
-    implicitArgs.localSizeZ = 4;
-
-    EXPECT_EQ(alignUp(implicitArgs.structSize, MemoryConstants::cacheLineSize), ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor));
+    implicitArgs.v0.simdWidth = 32;
+    implicitArgs.v0.localSizeX = 2;
+    implicitArgs.v0.localSizeY = 3;
+    implicitArgs.v0.localSizeZ = 4;
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    EXPECT_EQ(alignUp(implicitArgs.v0.header.structSize, MemoryConstants::cacheLineSize), implicitArgs.getAlignedSize());
+    EXPECT_EQ(alignUp(implicitArgs.v0.header.structSize, MemoryConstants::cacheLineSize), ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor, false, rootDeviceEnvironment));
 }
 
 TEST(ImplicitArgsHelperTest, givenImplicitArgsWithoutImplicitArgsBufferOffsetInPayloadMappingWhenPatchingImplicitArgsThenOnlyProperRegionIsPatched) {
-    ImplicitArgs implicitArgs{sizeof(ImplicitArgs)};
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v0.header.structSize = ImplicitArgsV0::getSize();
+    implicitArgs.v0.header.structVersion = 0;
 
+    void *outImplicitArgs = nullptr;
     KernelDescriptor kernelDescriptor{};
+    kernelDescriptor.kernelAttributes.simdSize = 32;
     kernelDescriptor.kernelAttributes.workgroupDimensionsOrder[0] = 0;
     kernelDescriptor.kernelAttributes.workgroupDimensionsOrder[1] = 1;
     kernelDescriptor.kernelAttributes.workgroupDimensionsOrder[2] = 2;
-
+    kernelDescriptor.kernelAttributes.numLocalIdChannels = 3;
     EXPECT_TRUE(isUndefinedOffset<>(kernelDescriptor.payloadMappings.implicitArgs.implicitArgsBuffer));
 
-    implicitArgs.simdWidth = 1;
-    implicitArgs.localSizeX = 2;
-    implicitArgs.localSizeY = 3;
-    implicitArgs.localSizeZ = 4;
+    implicitArgs.v0.simdWidth = 1;
+    implicitArgs.v0.localSizeX = 2;
+    implicitArgs.v0.localSizeY = 3;
+    implicitArgs.v0.localSizeZ = 4;
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    auto totalSizeForPatching = ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor, false, rootDeviceEnvironment);
 
-    auto totalSizeForPatching = ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor);
-
-    auto totalWorkgroupSize = implicitArgs.localSizeX * implicitArgs.localSizeY * implicitArgs.localSizeZ;
+    auto totalWorkgroupSize = implicitArgs.v0.localSizeX * implicitArgs.v0.localSizeY * implicitArgs.v0.localSizeZ;
     auto localIdsPatchingSize = totalWorkgroupSize * 3 * sizeof(uint16_t);
+    auto localIdsOffset = alignUp(localIdsPatchingSize, MemoryConstants::cacheLineSize);
 
-    auto memoryToPatch = std::make_unique<uint8_t[]>(totalSizeForPatching);
+    auto memoryToPatch = std::make_unique<uint8_t[]>(totalSizeForPatching + 64);
+    auto alignedMemory = alignUp(memoryToPatch.get(), 64);
 
     uint8_t pattern = 0xcd;
 
-    memset(memoryToPatch.get(), pattern, totalSizeForPatching);
+    memset(alignedMemory, pattern, totalSizeForPatching);
 
-    auto retVal = ImplicitArgsHelper::patchImplicitArgs(memoryToPatch.get(), implicitArgs, kernelDescriptor, {});
+    auto retVal = ImplicitArgsHelper::patchImplicitArgs(alignedMemory, implicitArgs, kernelDescriptor, {}, rootDeviceEnvironment, &outImplicitArgs);
 
-    EXPECT_EQ(retVal, ptrOffset(memoryToPatch.get(), totalSizeForPatching));
+    EXPECT_EQ(retVal, ptrOffset(alignedMemory, totalSizeForPatching));
+
+    void *expectedImplicitArgsPtr = ptrOffset(alignedMemory, localIdsOffset);
+    EXPECT_EQ(expectedImplicitArgsPtr, outImplicitArgs);
 
     uint32_t offset = 0;
 
     for (; offset < localIdsPatchingSize; offset++) {
-        EXPECT_NE(pattern, memoryToPatch.get()[offset]) << offset;
+        EXPECT_NE(pattern, alignedMemory[offset]) << offset;
+    }
+    offset = static_cast<uint32_t>(localIdsOffset);
+    for (; offset < totalSizeForPatching - ImplicitArgsV0::getAlignedSize(); offset++) {
+        EXPECT_EQ(pattern, alignedMemory[offset]);
     }
 
-    for (; offset < totalSizeForPatching - sizeof(implicitArgs); offset++) {
-        EXPECT_EQ(pattern, memoryToPatch.get()[offset]);
+    for (; offset < totalSizeForPatching - (ImplicitArgsV0::getAlignedSize() - ImplicitArgsV0::getSize()); offset++) {
+        EXPECT_NE(pattern, alignedMemory[offset]);
     }
-
     for (; offset < totalSizeForPatching; offset++) {
-        EXPECT_NE(pattern, memoryToPatch.get()[offset]);
+        EXPECT_EQ(pattern, alignedMemory[offset]);
     }
 }
 
 TEST(ImplicitArgsHelperTest, givenImplicitArgsWithImplicitArgsBufferOffsetInPayloadMappingWhenPatchingImplicitArgsThenOnlyProperRegionIsPatched) {
-    ImplicitArgs implicitArgs{sizeof(ImplicitArgs)};
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v0.header.structSize = ImplicitArgsV0::getSize();
+    implicitArgs.v0.header.structVersion = 0;
 
+    void *outImplicitArgs = nullptr;
     KernelDescriptor kernelDescriptor{};
     kernelDescriptor.payloadMappings.implicitArgs.implicitArgsBuffer = 0x10;
     EXPECT_TRUE(isValidOffset<>(kernelDescriptor.payloadMappings.implicitArgs.implicitArgsBuffer));
 
-    implicitArgs.simdWidth = 32;
-    implicitArgs.localSizeX = 2;
-    implicitArgs.localSizeY = 3;
-    implicitArgs.localSizeZ = 4;
+    implicitArgs.v0.simdWidth = 32;
+    implicitArgs.v0.localSizeX = 2;
+    implicitArgs.v0.localSizeY = 3;
+    implicitArgs.v0.localSizeZ = 4;
+    NEO::MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &rootDeviceEnvironment = *mockExecutionEnvironment.rootDeviceEnvironments[0];
+    auto totalSizeForPatching = ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor, false, rootDeviceEnvironment);
 
-    auto totalSizeForPatching = ImplicitArgsHelper::getSizeForImplicitArgsPatching(&implicitArgs, kernelDescriptor);
+    EXPECT_EQ(ImplicitArgsV0::getAlignedSize(), totalSizeForPatching);
 
-    EXPECT_EQ(0x80u, totalSizeForPatching);
-
-    auto memoryToPatch = std::make_unique<uint8_t[]>(totalSizeForPatching);
-
+    auto memoryToPatch = std::make_unique<uint8_t[]>(totalSizeForPatching + 64);
+    auto alignedMemory = alignUp(memoryToPatch.get(), 64);
     uint8_t pattern = 0xcd;
 
-    memset(memoryToPatch.get(), pattern, totalSizeForPatching);
+    memset(alignedMemory, pattern, totalSizeForPatching);
 
-    auto retVal = ImplicitArgsHelper::patchImplicitArgs(memoryToPatch.get(), implicitArgs, kernelDescriptor, {});
+    auto retVal = ImplicitArgsHelper::patchImplicitArgs(alignedMemory, implicitArgs, kernelDescriptor, {}, rootDeviceEnvironment, &outImplicitArgs);
 
-    EXPECT_EQ(retVal, ptrOffset(memoryToPatch.get(), totalSizeForPatching));
+    EXPECT_EQ(retVal, ptrOffset(alignedMemory, totalSizeForPatching));
+
+    void *expectedImplicitArgsPtr = alignedMemory;
+    EXPECT_EQ(expectedImplicitArgsPtr, outImplicitArgs);
 
     uint32_t offset = 0;
 
-    for (; offset < sizeof(implicitArgs); offset++) {
-        EXPECT_NE(pattern, memoryToPatch.get()[offset]);
+    for (; offset < ImplicitArgsV0::getSize(); offset++) {
+        EXPECT_NE(pattern, alignedMemory[offset]);
     }
 
     for (; offset < totalSizeForPatching; offset++) {
-        EXPECT_EQ(pattern, memoryToPatch.get()[offset]);
+        EXPECT_EQ(pattern, alignedMemory[offset]);
     }
+}
+
+TEST(ImplicitArgsV0Test, givenImplicitArgsV0WhenSettingFieldsThenCorrectFieldsAreSet) {
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v0.header.structSize = ImplicitArgsV0::getSize();
+    implicitArgs.v0.header.structVersion = 0;
+
+    EXPECT_EQ(ImplicitArgsV0::getSize(), implicitArgs.getSize());
+
+    implicitArgs.setAssertBufferPtr(0x4567000);
+    implicitArgs.setGlobalOffset(5, 6, 7);
+    implicitArgs.setGlobalSize(1, 2, 3);
+    implicitArgs.setGroupCount(10, 20, 30);
+    implicitArgs.setLocalSize(8, 9, 11);
+    implicitArgs.setLocalIdTablePtr(0x5699000);
+    implicitArgs.setPrintfBuffer(0xff000);
+    implicitArgs.setNumWorkDim(16);
+    implicitArgs.setRtGlobalBufferPtr(0x1000123400);
+    implicitArgs.setSimdWidth(32);
+    implicitArgs.setScratch0SizeAllocated(0x2000);
+
+    EXPECT_EQ(0x4567000u, implicitArgs.v0.assertBufferPtr);
+
+    EXPECT_EQ(5u, implicitArgs.v0.globalOffsetX);
+    EXPECT_EQ(6u, implicitArgs.v0.globalOffsetY);
+    EXPECT_EQ(7u, implicitArgs.v0.globalOffsetZ);
+
+    EXPECT_EQ(1u, implicitArgs.v0.globalSizeX);
+    EXPECT_EQ(2u, implicitArgs.v0.globalSizeY);
+    EXPECT_EQ(3u, implicitArgs.v0.globalSizeZ);
+
+    EXPECT_EQ(10u, implicitArgs.v0.groupCountX);
+    EXPECT_EQ(20u, implicitArgs.v0.groupCountY);
+    EXPECT_EQ(30u, implicitArgs.v0.groupCountZ);
+
+    EXPECT_EQ(8u, implicitArgs.v0.localSizeX);
+    EXPECT_EQ(9u, implicitArgs.v0.localSizeY);
+    EXPECT_EQ(11u, implicitArgs.v0.localSizeZ);
+
+    EXPECT_EQ(0x5699000u, implicitArgs.v0.localIdTablePtr);
+    EXPECT_EQ(0xff000u, implicitArgs.v0.printfBufferPtr);
+    EXPECT_EQ(16u, implicitArgs.v0.numWorkDim);
+    EXPECT_EQ(0x1000123400u, implicitArgs.v0.rtGlobalBufferPtr);
+
+    EXPECT_EQ(32u, implicitArgs.getSimdWidth().value());
+
+    EXPECT_EQ(0u, implicitArgs.v0.padding0);
+
+    EXPECT_FALSE(implicitArgs.getScratchPtrOffset().has_value());
+    EXPECT_FALSE(implicitArgs.getScratch0SizeAllocatedOffset().has_value());
+}
+
+TEST(ImplicitArgsV1Test, givenImplicitArgsV1WhenSettingFieldsThenCorrectFieldsAreSet) {
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v1.header.structSize = ImplicitArgsV1::getSize();
+    implicitArgs.v1.header.structVersion = 1;
+
+    EXPECT_EQ(ImplicitArgsV1::getSize(), implicitArgs.getSize());
+
+    implicitArgs.setAssertBufferPtr(0x4567000);
+    implicitArgs.setGlobalOffset(5, 6, 7);
+    implicitArgs.setGlobalSize(1, 2, 3);
+    implicitArgs.setGroupCount(10, 20, 30);
+    implicitArgs.setLocalSize(8, 9, 11);
+    implicitArgs.setLocalIdTablePtr(0x5699000);
+    implicitArgs.setPrintfBuffer(0xff000);
+    implicitArgs.setNumWorkDim(16);
+    implicitArgs.setRtGlobalBufferPtr(0x1000123400);
+    implicitArgs.setSimdWidth(32);
+    implicitArgs.setSyncBufferPtr(0x1234000);
+    implicitArgs.setEnqueuedLocalSize(2, 3, 4);
+    implicitArgs.setScratch0SizeAllocated(0x2000);
+
+    EXPECT_EQ(0x4567000u, implicitArgs.v1.assertBufferPtr);
+
+    EXPECT_EQ(5u, implicitArgs.v1.globalOffsetX);
+    EXPECT_EQ(6u, implicitArgs.v1.globalOffsetY);
+    EXPECT_EQ(7u, implicitArgs.v1.globalOffsetZ);
+
+    EXPECT_EQ(1u, implicitArgs.v1.globalSizeX);
+    EXPECT_EQ(2u, implicitArgs.v1.globalSizeY);
+    EXPECT_EQ(3u, implicitArgs.v1.globalSizeZ);
+
+    EXPECT_EQ(10u, implicitArgs.v1.groupCountX);
+    EXPECT_EQ(20u, implicitArgs.v1.groupCountY);
+    EXPECT_EQ(30u, implicitArgs.v1.groupCountZ);
+
+    EXPECT_EQ(8u, implicitArgs.v1.localSizeX);
+    EXPECT_EQ(9u, implicitArgs.v1.localSizeY);
+    EXPECT_EQ(11u, implicitArgs.v1.localSizeZ);
+
+    EXPECT_EQ(2u, implicitArgs.v1.enqueuedLocalSizeX);
+    EXPECT_EQ(3u, implicitArgs.v1.enqueuedLocalSizeY);
+    EXPECT_EQ(4u, implicitArgs.v1.enqueuedLocalSizeZ);
+
+    EXPECT_EQ(0x5699000u, implicitArgs.v1.localIdTablePtr);
+    EXPECT_EQ(0xff000u, implicitArgs.v1.printfBufferPtr);
+    EXPECT_EQ(16u, implicitArgs.v1.numWorkDim);
+    EXPECT_EQ(0x1000123400u, implicitArgs.v1.rtGlobalBufferPtr);
+    EXPECT_EQ(0x1234000u, implicitArgs.v1.syncBufferPtr);
+
+    EXPECT_EQ(32u, implicitArgs.getSimdWidth().value());
+
+    EXPECT_EQ(0u, implicitArgs.v1.padding0);
+
+    EXPECT_EQ(offsetof(ImplicitArgsV1, scratchPtr), implicitArgs.getScratchPtrOffset());
+    EXPECT_FALSE(implicitArgs.getScratch0SizeAllocatedOffset().has_value());
+}
+
+TEST(ImplicitArgsV2Test, givenImplicitArgsV2WhenSettingFieldsThenCorrectFieldsAreSet) {
+    ImplicitArgs implicitArgs{};
+    implicitArgs.v2.header.structSize = ImplicitArgsV2::getSize();
+    implicitArgs.v2.header.structVersion = 2;
+
+    EXPECT_EQ(ImplicitArgsV2::getSize(), implicitArgs.getSize());
+
+    implicitArgs.setAssertBufferPtr(0x4567000);
+    implicitArgs.setGlobalOffset(5, 6, 7);
+    implicitArgs.setGlobalSize(1, 2, 3);
+    implicitArgs.setGroupCount(10, 20, 30);
+    implicitArgs.setLocalSize(8, 9, 11);
+    implicitArgs.setLocalIdTablePtr(0x5699000);
+    implicitArgs.setPrintfBuffer(0xff000);
+    implicitArgs.setNumWorkDim(16);
+    implicitArgs.setRtGlobalBufferPtr(0x1000123400);
+    implicitArgs.setSimdWidth(32);
+    implicitArgs.setSyncBufferPtr(0x1234000);
+    implicitArgs.setEnqueuedLocalSize(2, 3, 4);
+    implicitArgs.setScratch0SizeAllocated(0x2000);
+
+    EXPECT_EQ(0x4567000u, implicitArgs.v1.assertBufferPtr);
+
+    EXPECT_EQ(5u, implicitArgs.v2.globalOffsetX);
+    EXPECT_EQ(6u, implicitArgs.v2.globalOffsetY);
+    EXPECT_EQ(7u, implicitArgs.v2.globalOffsetZ);
+
+    EXPECT_EQ(1u, implicitArgs.v2.globalSizeX);
+    EXPECT_EQ(2u, implicitArgs.v2.globalSizeY);
+    EXPECT_EQ(3u, implicitArgs.v2.globalSizeZ);
+
+    EXPECT_EQ(10u, implicitArgs.v2.groupCountX);
+    EXPECT_EQ(20u, implicitArgs.v2.groupCountY);
+    EXPECT_EQ(30u, implicitArgs.v2.groupCountZ);
+
+    EXPECT_EQ(8u, implicitArgs.v2.localSizeX);
+    EXPECT_EQ(9u, implicitArgs.v2.localSizeY);
+    EXPECT_EQ(11u, implicitArgs.v2.localSizeZ);
+
+    EXPECT_EQ(2u, implicitArgs.v2.enqueuedLocalSizeX);
+    EXPECT_EQ(3u, implicitArgs.v2.enqueuedLocalSizeY);
+    EXPECT_EQ(4u, implicitArgs.v2.enqueuedLocalSizeZ);
+
+    EXPECT_EQ(0x5699000u, implicitArgs.v2.localIdTablePtr);
+    EXPECT_EQ(0xff000u, implicitArgs.v2.printfBufferPtr);
+    EXPECT_EQ(16u, implicitArgs.v2.numWorkDim);
+    EXPECT_EQ(0x1000123400u, implicitArgs.v2.rtGlobalBufferPtr);
+    EXPECT_EQ(0x1234000u, implicitArgs.v2.syncBufferPtr);
+    EXPECT_EQ(0x2000u, implicitArgs.v2.scratch0SizeAllocated);
+
+    EXPECT_FALSE(implicitArgs.getScratchPtrOffset().has_value());
+    EXPECT_EQ(offsetof(ImplicitArgsV2, scratch0SizeAllocated), implicitArgs.getScratch0SizeAllocatedOffset());
+}
+
+TEST(ImplicitArgsV1Test, givenImplicitArgsWithUnknownVersionWhenSettingFieldsThenFieldsAreNotPopulated) {
+    ImplicitArgs implicitArgs{};
+
+    memset(&implicitArgs, 0, sizeof(implicitArgs));
+
+    implicitArgs.v1.header.structSize = ImplicitArgsV1::getSize();
+    implicitArgs.v1.header.structVersion = 3; // unknown version
+
+    EXPECT_EQ(0u, implicitArgs.getSize());
+
+    implicitArgs.setAssertBufferPtr(0x4567000);
+    implicitArgs.setGlobalOffset(5, 6, 7);
+    implicitArgs.setGlobalSize(1, 2, 3);
+    implicitArgs.setGroupCount(10, 20, 30);
+    implicitArgs.setLocalSize(8, 9, 11);
+    implicitArgs.setLocalIdTablePtr(0x5699000);
+    implicitArgs.setPrintfBuffer(0xff000);
+    implicitArgs.setNumWorkDim(16);
+    implicitArgs.setRtGlobalBufferPtr(0x1000123400);
+    implicitArgs.setSimdWidth(32);
+    implicitArgs.setScratch0SizeAllocated(0x2000);
+
+    EXPECT_EQ(0u, implicitArgs.v1.assertBufferPtr);
+
+    EXPECT_EQ(0u, implicitArgs.v1.globalOffsetX);
+    EXPECT_EQ(0u, implicitArgs.v1.globalOffsetY);
+    EXPECT_EQ(0u, implicitArgs.v1.globalOffsetZ);
+
+    EXPECT_EQ(0u, implicitArgs.v1.globalSizeX);
+    EXPECT_EQ(0u, implicitArgs.v1.globalSizeY);
+    EXPECT_EQ(0u, implicitArgs.v1.globalSizeZ);
+
+    EXPECT_EQ(0u, implicitArgs.v1.groupCountX);
+    EXPECT_EQ(0u, implicitArgs.v1.groupCountY);
+    EXPECT_EQ(0u, implicitArgs.v1.groupCountZ);
+
+    EXPECT_EQ(0u, implicitArgs.v1.localSizeX);
+    EXPECT_EQ(0u, implicitArgs.v1.localSizeY);
+    EXPECT_EQ(0u, implicitArgs.v1.localSizeZ);
+
+    EXPECT_EQ(0u, implicitArgs.v1.localIdTablePtr);
+    EXPECT_EQ(0u, implicitArgs.v1.printfBufferPtr);
+    EXPECT_EQ(0u, implicitArgs.v1.numWorkDim);
+    EXPECT_EQ(0u, implicitArgs.v1.rtGlobalBufferPtr);
+    EXPECT_EQ(0u, implicitArgs.v2.scratch0SizeAllocated);
+
+    EXPECT_FALSE(implicitArgs.getScratch0SizeAllocatedOffset().has_value());
+}
+
+TEST(ImplicitArgsLayoutString, givenImplicitArgV0WhenComparingPrintedLayoutWithStructOffsetsThenLayoutMatches) {
+    verifyStructLayoutMatchesPrintedString<NEO::ImplicitArgsV0>(getImplicitArgsV0ExpectedOffsets());
+}
+
+TEST(ImplicitArgsLayoutString, givenImplicitArgV1WhenComparingPrintedLayoutWithStructOffsetsThenLayoutMatches) {
+    verifyStructLayoutMatchesPrintedString<NEO::ImplicitArgsV1>(getImplicitArgsV1ExpectedOffsets());
+}
+
+TEST(ImplicitArgsLayoutString, givenImplicitArgV2WhenComparingPrintedLayoutWithStructOffsetsThenLayoutMatches) {
+    verifyStructLayoutMatchesPrintedString<NEO::ImplicitArgsV2>(getImplicitArgsV2ExpectedOffsets());
 }

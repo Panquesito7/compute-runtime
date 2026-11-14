@@ -1,12 +1,15 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/test_macros/test.h"
+
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/test/unit_test/fixtures/hello_world_fixture.h"
+#include "opencl/test/unit_test/fixtures/mock_kernel_fixture.h"
 
 #include "gtest/gtest.h"
 
@@ -31,23 +34,26 @@ TEST_F(EnqueueKernelLocalWorkSize, GivenNullLwsInWhenEnqueuingKernelThenSuccessI
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-struct EnqueueKernelRequiredWorkSize : public HelloWorldTest<HelloWorldFixtureFactory> {
-    typedef HelloWorldTest<HelloWorldFixtureFactory> Parent;
-
+struct EnqueueKernelRequiredWorkSize : public CommandQueueHwFixture,
+                                       public ClDeviceFixture,
+                                       public ::testing::Test {
     void SetUp() override {
-        Parent::kernelFilename = "required_work_group";
-        Parent::kernelName = "CopyBuffer";
-        Parent::SetUp();
+        ClDeviceFixture::setUp();
+        CommandQueueHwFixture::setUp(pClDevice, 0);
+        mockKernelWithInternals = createBufferArgsKernelWithRequiredWorkGroupSize(*context, {8, 2, 2});
+        pKernel = mockKernelWithInternals->mockKernel;
     }
 
     void TearDown() override {
-        Parent::TearDown();
+        mockKernelWithInternals.reset();
+        CommandQueueHwFixture::tearDown();
+        ClDeviceFixture::tearDown();
     }
+
+    std::unique_ptr<MockKernelWithInternals> mockKernelWithInternals;
+    MockKernel *pKernel = nullptr;
 };
 
-// Kernel specifies the optional reqd_work_group_size() attribute but it wasn't
-// specified.  We'll permit the user to not specify the local work group size
-// and pick up the correct values instead.
 TEST_F(EnqueueKernelRequiredWorkSize, GivenUnspecifiedWorkGroupSizeWhenEnqueueingKernelThenLwsIsSetCorrectly) {
     size_t globalWorkSize[3] = {32, 32, 32};
     size_t *localWorkSize = nullptr;
@@ -64,13 +70,15 @@ TEST_F(EnqueueKernelRequiredWorkSize, GivenUnspecifiedWorkGroupSizeWhenEnqueuein
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto localWorkSizeVal = pKernel->getLocalWorkSizeValues();
-    EXPECT_EQ(8u, *localWorkSizeVal[0]);
-    EXPECT_EQ(2u, *localWorkSizeVal[1]);
-    EXPECT_EQ(2u, *localWorkSizeVal[2]);
+    // IGC may inline local worksize here so tokens are optional
+    if (pKernel->getKernelInfo().kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] != undefined<CrossThreadDataOffset>) {
+        auto localWorkSizeVal = pKernel->getLocalWorkSizeValues();
+        EXPECT_EQ(8u, *localWorkSizeVal[0]);
+        EXPECT_EQ(2u, *localWorkSizeVal[1]);
+        EXPECT_EQ(2u, *localWorkSizeVal[2]);
+    }
 }
 
-// Fully specified
 TEST_F(EnqueueKernelRequiredWorkSize, GivenRequiredWorkGroupSizeWhenEnqueueingKernelThenLwsIsSetCorrectly) {
     size_t globalWorkOffset[3] = {0, 0, 0};
     size_t globalWorkSize[3] = {32, 32, 32};
@@ -87,15 +95,16 @@ TEST_F(EnqueueKernelRequiredWorkSize, GivenRequiredWorkGroupSizeWhenEnqueueingKe
         nullptr);
 
     EXPECT_EQ(CL_SUCCESS, retVal);
-
-    auto localWorkSizeVal = pKernel->getLocalWorkSizeValues();
-    EXPECT_EQ(8u, *localWorkSizeVal[0]);
-    EXPECT_EQ(2u, *localWorkSizeVal[1]);
-    EXPECT_EQ(2u, *localWorkSizeVal[2]);
+    // IGC may inline local worksize here so tokens are optional
+    if (pKernel->getKernelInfo().kernelDescriptor.payloadMappings.dispatchTraits.localWorkSize[0] != undefined<CrossThreadDataOffset>) {
+        auto localWorkSizeVal = pKernel->getLocalWorkSizeValues();
+        EXPECT_EQ(8u, *localWorkSizeVal[0]);
+        EXPECT_EQ(2u, *localWorkSizeVal[1]);
+        EXPECT_EQ(2u, *localWorkSizeVal[2]);
+    }
 }
 
-// Underspecified.  Won't permit.
-TEST_F(EnqueueKernelRequiredWorkSize, givenKernelRequiringLocalWorkgroupSizeWhen1DimensionIsPassedThatIsCorrectThenNdRangeIsSuccesful) {
+TEST_F(EnqueueKernelRequiredWorkSize, givenKernelRequiringLocalWorkgroupSizeWhen1DimensionIsPassedThatIsCorrectThenNdRangeIsSuccessful) {
     size_t globalWorkOffset[1] = {0};
     size_t globalWorkSize[1] = {32};
     size_t localWorkSize[1] = {8};
@@ -113,7 +122,6 @@ TEST_F(EnqueueKernelRequiredWorkSize, givenKernelRequiringLocalWorkgroupSizeWhen
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-// Incorrectly specified
 TEST_F(EnqueueKernelRequiredWorkSize, GivenInvalidRequiredWorkgroupSizeWhenEnqueuingKernelThenInvalidWorkGroupSizeErrorIsReturned) {
     size_t globalWorkOffset[3] = {0, 0, 0};
     size_t globalWorkSize[3] = {32, 32, 32};

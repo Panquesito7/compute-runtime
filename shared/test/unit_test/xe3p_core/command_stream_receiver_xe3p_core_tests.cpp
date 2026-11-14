@@ -1,0 +1,255 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/utilities/software_tags_manager.h"
+#include "shared/test/common/cmd_parse/hw_parse.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_csr.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_sip.h"
+#include "shared/test/common/mocks/ult_device_factory.h"
+#include "shared/test/common/test_macros/hw_test.h"
+
+using namespace NEO;
+
+using CommandStreamReceiverXe3pTest = ::testing::Test;
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenHeaplessProgramComputeModeHeaplessThenCorrectStateIsProgrammed) {
+    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+    UltCommandStreamReceiver<FamilyType> csr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr.setupContext(*device->getDefaultEngine().osContext);
+
+    auto &commandStream = csr.getCS(sizeof(STATE_COMPUTE_MODE));
+
+    csr.programComputeModeHeapless(*device, commandStream);
+
+    EXPECT_EQ(false, csr.getStateComputeModeDirty());
+
+    STATE_COMPUTE_MODE *encodedScm = reinterpret_cast<STATE_COMPUTE_MODE *>(commandStream.getCpuBase());
+
+    EXPECT_FALSE(encodedScm->getLargeGrfMode());
+    EXPECT_TRUE(encodedScm->getEnableVariableRegisterSizeAllocationVrt());
+    EXPECT_FALSE(encodedScm->getOutOfBoundariesInTranslationExceptionEnable());
+    EXPECT_FALSE(encodedScm->getPageFaultExceptionEnable());
+    EXPECT_FALSE(encodedScm->getMemoryExceptionEnable());
+    EXPECT_FALSE(encodedScm->getEnableBreakpoints());
+    EXPECT_FALSE(encodedScm->getEnableForceExternalHaltAndForceException());
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenTemporaryEnablePageFaultExceptionWhenProgramComputeModeHeaplessThenCorrectStateIsProgrammed) {
+    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+    DebugManagerStateRestore restorer;
+    {
+        debugManager.flags.TemporaryEnablePageFaultException.set(0);
+
+        UltCommandStreamReceiver<FamilyType> csr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+        csr.setupContext(*device->getDefaultEngine().osContext);
+
+        auto &commandStream = csr.getCS(sizeof(STATE_COMPUTE_MODE));
+
+        csr.programComputeModeHeapless(*device, commandStream);
+
+        STATE_COMPUTE_MODE *encodedScm = reinterpret_cast<STATE_COMPUTE_MODE *>(commandStream.getCpuBase());
+        EXPECT_FALSE(encodedScm->getPageFaultExceptionEnable());
+    }
+    {
+        debugManager.flags.TemporaryEnablePageFaultException.set(1);
+        auto &rootDeviceEnvironment = device->getRootDeviceEnvironmentRef();
+        rootDeviceEnvironment.initDebuggerL0(device.get());
+        UltCommandStreamReceiver<FamilyType> csr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+        csr.setupContext(*device->getDefaultEngine().osContext);
+
+        auto &commandStream = csr.getCS(sizeof(STATE_COMPUTE_MODE));
+
+        csr.programComputeModeHeapless(*device, commandStream);
+
+        STATE_COMPUTE_MODE *encodedScm = reinterpret_cast<STATE_COMPUTE_MODE *>(commandStream.getCpuBase());
+        EXPECT_TRUE(encodedScm->getPageFaultExceptionEnable());
+        EXPECT_TRUE(encodedScm->getMemoryExceptionEnable());
+        EXPECT_TRUE(encodedScm->getEnableBreakpoints());
+        EXPECT_TRUE(encodedScm->getEnableForceExternalHaltAndForceException());
+    }
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenDebugEnabledWhenInitializingDeviceThenExceptionsAreProgrammedInScm) {
+    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
+
+    VariableBackup<bool> backupUseMockSip(&MockSipData::useMockSip, true);
+    VariableBackup<bool> backupMockSipInit(&MockSipData::called, false);
+    DebugManagerStateRestore dbgRestorer;
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrCCSNode = true;
+
+    debugManager.flags.ForcePreemptionMode.set(static_cast<int32_t>(NEO::PreemptionMode::Disabled));
+    auto executionEnvironment = MockDevice::prepareExecutionEnvironment(&hwInfo, 0u);
+    executionEnvironment->setDebuggingMode(NEO::DebuggingMode::online);
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithExecutionEnvironment<MockDevice>(&hwInfo, executionEnvironment, 0u));
+    MockSipData::uninitializedSipRequested = false;
+
+    HardwareParse hwParser;
+    auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
+    hwParser.parseCommands<FamilyType>(csr.commandStream, 0);
+    auto itScm = find<STATE_COMPUTE_MODE *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+    ASSERT_NE(hwParser.cmdList.end(), itScm);
+    auto stateComputeCmd = static_cast<STATE_COMPUTE_MODE *>(*itScm);
+    ASSERT_NE(nullptr, stateComputeCmd);
+
+    EXPECT_TRUE(stateComputeCmd->getMemoryExceptionEnable());
+    EXPECT_TRUE(stateComputeCmd->getEnableBreakpoints());
+    EXPECT_TRUE(stateComputeCmd->getEnableForceExternalHaltAndForceException());
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, WhenFlushingImmediateTaskStatelessThenEnginePrologueIsNotSent) {
+    HardwareInfo hwInfo = *defaultHwInfo;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
+
+    auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
+    csr.isEnginePrologueSent = false;
+
+    EXPECT_FALSE(csr.isPerQueuePrologueEnabled());
+    EXPECT_FALSE(csr.isPerQueuePrologueRequired());
+
+    static constexpr uint64_t cmdBufferGpuAddress = 0x10000;
+    static constexpr size_t bufferSize = 1024;
+    uint32_t cmdBuffer[bufferSize / sizeof(uint32_t)];
+
+    NEO::LinearStream cmdStream;
+    cmdStream.replaceBuffer(cmdBuffer, bufferSize);
+    auto graphicsAllocation = std::make_unique<MockGraphicsAllocation>(cmdBuffer, cmdBufferGpuAddress, bufferSize);
+    cmdStream.replaceGraphicsAllocation(graphicsAllocation.get());
+
+    csr.flushImmediateTaskHeapless(cmdStream, 0, csr.recordedImmediateDispatchFlags, *device);
+
+    EXPECT_FALSE(csr.isEnginePrologueSent);
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenEnableSWTagsWhenFlushImmediateTaskHeaplessThenHeapAddressesAreProgrammedAndHeapsResident) {
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableSWTags.set(true);
+
+    HardwareInfo hwInfo = *defaultHwInfo;
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
+
+    auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
+    csr.storeMakeResidentAllocations = true;
+
+    auto tagsManager = device->getRootDeviceEnvironment().tagsManager.get();
+    ASSERT_NE(nullptr, tagsManager);
+    auto bxmlHeap = tagsManager->getBXMLHeapAllocation();
+    auto tagHeap = tagsManager->getSWTagHeapAllocation();
+
+    static constexpr uint64_t cmdBufferGpuAddress = 0x10000;
+    static constexpr size_t bufferSize = 1024;
+    uint32_t cmdBuffer[bufferSize / sizeof(uint32_t)];
+
+    NEO::LinearStream cmdStream;
+    cmdStream.replaceBuffer(cmdBuffer, bufferSize);
+    auto graphicsAllocation = std::make_unique<MockGraphicsAllocation>(cmdBuffer, cmdBufferGpuAddress, bufferSize);
+    cmdStream.replaceGraphicsAllocation(graphicsAllocation.get());
+
+    csr.flushImmediateTaskHeapless(cmdStream, 0, csr.recordedImmediateDispatchFlags, *device);
+
+    EXPECT_TRUE(csr.isMadeResident(bxmlHeap));
+    EXPECT_TRUE(csr.isMadeResident(tagHeap));
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(csr.commandStream, 0);
+    auto storeDataImmCmds = findAll<MI_STORE_DATA_IMM *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+
+    bool bxmlHeapAddressProgrammed = false;
+    bool tagHeapAddressProgrammed = false;
+    for (auto &entry : storeDataImmCmds) {
+        auto storeDataImm = genCmdCast<MI_STORE_DATA_IMM *>(*entry);
+        if (storeDataImm->getAddress() == bxmlHeap->getGpuAddress()) {
+            bxmlHeapAddressProgrammed = true;
+        }
+        if (storeDataImm->getAddress() == tagHeap->getGpuAddress()) {
+            tagHeapAddressProgrammed = true;
+        }
+    }
+    EXPECT_TRUE(bxmlHeapAddressProgrammed);
+    EXPECT_TRUE(tagHeapAddressProgrammed);
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenGlobalFenceAndOnPrimaryCsrWhenProgrammingEnginePrologueThenEstimatedSizeMatchesProgrammedSize) {
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+    UltCommandStreamReceiver<FamilyType> csr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr.setupContext(*device->getDefaultEngine().osContext);
+
+    MockGraphicsAllocation globalFence(nullptr, 0x20000, MemoryConstants::pageSize);
+    VariableBackup<GraphicsAllocation *> globalFenceBackup(&csr.globalFenceAllocation, &globalFence);
+    VariableBackup<CommandStreamReceiver *> primaryCsrBackup(&csr.primaryCsr, nullptr);
+    csr.isEnginePrologueSent = false;
+
+    auto estimatedSize = csr.getCmdSizeForPrologue();
+    EXPECT_EQ(EncodeMemoryFence<FamilyType>::getSystemMemoryFenceSize(), estimatedSize);
+    EXPECT_NE(0u, estimatedSize);
+
+    alignas(64) uint8_t buffer[1024] = {};
+    LinearStream stream(buffer, sizeof(buffer));
+    csr.programEnginePrologue(stream);
+
+    EXPECT_EQ(estimatedSize, stream.getUsed());
+    EXPECT_TRUE(csr.isEnginePrologueSent);
+    EXPECT_EQ(0u, csr.getCmdSizeForPrologue());
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenGlobalFenceAndOnSecondaryCsrWhenProgrammingEnginePrologueThenFenceIsSkippedAndEstimatedSizeIsZero) {
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+    UltCommandStreamReceiver<FamilyType> csr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr.setupContext(*device->getDefaultEngine().osContext);
+
+    UltCommandStreamReceiver<FamilyType> localPrimaryCsr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+
+    MockGraphicsAllocation globalFence(nullptr, 0x20000, MemoryConstants::pageSize);
+    VariableBackup<GraphicsAllocation *> globalFenceBackup(&csr.globalFenceAllocation, &globalFence);
+    VariableBackup<CommandStreamReceiver *> primaryCsrBackup(&csr.primaryCsr, &localPrimaryCsr);
+    VariableBackup<GraphicsAllocation *> primaryGlobalFenceBackup(&localPrimaryCsr.globalFenceAllocation, &globalFence);
+
+    csr.isEnginePrologueSent = false;
+
+    EXPECT_EQ(0u, csr.getCmdSizeForPrologue());
+
+    alignas(64) uint8_t buffer[1024] = {};
+    LinearStream stream(buffer, sizeof(buffer));
+    csr.programEnginePrologue(stream);
+
+    EXPECT_EQ(0u, stream.getUsed());
+    EXPECT_TRUE(csr.isEnginePrologueSent);
+}
+
+XE3P_CORETEST_F(CommandStreamReceiverXe3pTest, givenNoGlobalFenceWhenGettingPrologueSizeThenZeroIsReturned) {
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+    UltCommandStreamReceiver<FamilyType> csr(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
+    csr.setupContext(*device->getDefaultEngine().osContext);
+
+    VariableBackup<GraphicsAllocation *> globalFenceBackup(&csr.globalFenceAllocation, nullptr);
+    VariableBackup<CommandStreamReceiver *> primaryCsrBackup(&csr.primaryCsr, nullptr);
+    csr.isEnginePrologueSent = false;
+
+    EXPECT_EQ(0u, csr.getCmdSizeForPrologue());
+
+    alignas(64) uint8_t buffer[1024] = {};
+    LinearStream stream(buffer, sizeof(buffer));
+    csr.programEnginePrologue(stream);
+    EXPECT_EQ(0u, stream.getUsed());
+}

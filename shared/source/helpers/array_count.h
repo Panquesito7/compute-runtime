@@ -1,20 +1,19 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include <cstddef>
 
-#include <stddef.h>
-
-template <typename T, size_t N>
-constexpr size_t arrayCount(const T (&)[N]) {
-    return N;
+template <typename T, size_t n>
+constexpr size_t arrayCount(const T (&)[n]) {
+    return n;
 }
 
-template <typename T, size_t N>
-constexpr bool isInRange(size_t idx, const T (&)[N]) {
-    return (idx < N);
+template <typename T, size_t n>
+constexpr bool isInRange(size_t idx, const T (&)[n]) {
+    return (idx < n);
 }

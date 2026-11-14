@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,36 +22,20 @@ using namespace NEO;
 
 using Dg1HwInfo = ::testing::Test;
 
-DG1TEST_F(Dg1HwInfo, givenInvalidSystemInfoWhenSettingHardwareInfoThenExpectThrow) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
-    GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
-
-    uint64_t config = 0xdeadbeef;
-    gtSystemInfo = {0};
-    EXPECT_ANY_THROW(hardwareInfoSetup[productFamily](&hwInfo, false, config, *compilerProductHelper));
-    EXPECT_EQ(0u, gtSystemInfo.SliceCount);
-    EXPECT_EQ(0u, gtSystemInfo.SubSliceCount);
-    EXPECT_EQ(0u, gtSystemInfo.DualSubSliceCount);
-    EXPECT_EQ(0u, gtSystemInfo.EUCount);
-}
-
 DG1TEST_F(Dg1HwInfo, givenBoolWhenCallDg1HardwareInfoSetupThenFeatureTableAndWorkaroundTableAreSetCorrect) {
     bool boolValue[]{
         true, false};
     HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
     FeatureTable &featureTable = hwInfo.featureTable;
     WorkaroundTable &workaroundTable = hwInfo.workaroundTable;
 
-    uint64_t config = 0x100060010;
     for (auto setParamBool : boolValue) {
 
         gtSystemInfo = {0};
         featureTable = {};
         workaroundTable = {};
-        hardwareInfoSetup[productFamily](&hwInfo, setParamBool, config, *compilerProductHelper);
+        hardwareInfoSetup[productFamily](&hwInfo, setParamBool);
 
         EXPECT_EQ(setParamBool, featureTable.flags.ftrL3IACoherency);
         EXPECT_EQ(setParamBool, featureTable.flags.ftrPPGTT);
@@ -68,14 +52,10 @@ DG1TEST_F(Dg1HwInfo, givenBoolWhenCallDg1HardwareInfoSetupThenFeatureTableAndWor
         EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcHdr2D);
         EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuMidBatchPreempt);
         EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuThreadGroupLevelPreempt);
+        EXPECT_FALSE(featureTable.flags.ftrHeaplessMode);
 
         EXPECT_EQ(setParamBool, workaroundTable.flags.wa4kAlignUVOffsetNV12LinearSurface);
     }
-}
-
-DG1TEST_F(Dg1HwInfo, whenPlatformIsDg1ThenExpectSvmIsSet) {
-    const HardwareInfo &hardwareInfo = DG1::hwInfo;
-    EXPECT_TRUE(hardwareInfo.capabilityTable.ftrSvm);
 }
 
 using Dg1ProductHelper = ProductHelperTest;
@@ -102,10 +82,6 @@ DG1TEST_F(Dg1ProductHelper, givenA0SteppingAndDg1PlatformWhenAskingIfWAIsRequire
     }
 }
 
-DG1TEST_F(Dg1ProductHelper, givenProductHelperWhenAskedIfStorageInfoAdjustmentIsRequiredThenTrueIsReturned) {
-    EXPECT_TRUE(productHelper->isStorageInfoAdjustmentRequired());
-}
-
 DG1TEST_F(Dg1ProductHelper, givenProductHelperWhenAskedIf3DPipelineSelectWAIsRequiredThenTrueIsReturned) {
     EXPECT_TRUE(productHelper->is3DPipelineSelectWARequired());
 }
@@ -129,41 +105,22 @@ DG1TEST_F(Dg1ProductHelper, givenDg1WhenObtainingFullBlitterSupportThenReturnFal
     EXPECT_FALSE(productHelper->isBlitterFullySupported(hardwareInfo));
 }
 
-DG1TEST_F(Dg1ProductHelper, whenOverrideGfxPartitionLayoutForWslThenReturnTrue) {
-    EXPECT_TRUE(productHelper->overrideGfxPartitionLayoutForWsl());
-}
-
 DG1TEST_F(Dg1ProductHelper, givenCompilerProductHelperWhenGetProductConfigThenCorrectMatchIsFound) {
     EXPECT_EQ(compilerProductHelper->getHwIpVersion(*defaultHwInfo), AOT::DG1);
 }
 
-DG1TEST_F(Dg1ProductHelper, givenProductHelperWhenGettingEvictIfNecessaryFlagSupportedThenExpectTrue) {
-    EXPECT_TRUE(productHelper->isEvictionIfNecessaryFlagSupported());
-}
-
 DG1TEST_F(Dg1ProductHelper, givenProductHelperWhenGetCommandsStreamPropertiesSupportThenExpectCorrectValues) {
     EXPECT_FALSE(productHelper->getScmPropertyThreadArbitrationPolicySupport());
-    EXPECT_TRUE(productHelper->getScmPropertyCoherencyRequiredSupport());
     EXPECT_FALSE(productHelper->getScmPropertyZPassAsyncComputeThreadLimitSupport());
     EXPECT_FALSE(productHelper->getScmPropertyPixelAsyncComputeThreadLimitSupport());
     EXPECT_FALSE(productHelper->getScmPropertyLargeGrfModeSupport());
-    EXPECT_FALSE(productHelper->getScmPropertyDevicePreemptionModeSupport());
 
-    EXPECT_FALSE(productHelper->getStateBaseAddressPropertyGlobalAtomicsSupport());
     EXPECT_FALSE(productHelper->getStateBaseAddressPropertyBindingTablePoolBaseAddressSupport());
-
-    EXPECT_TRUE(productHelper->getFrontEndPropertyScratchSizeSupport());
-    EXPECT_FALSE(productHelper->getFrontEndPropertyPrivateScratchSizeSupport());
-
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyPreemptionModeSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyStateSipSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyCsrSurfaceSupport());
 
     EXPECT_FALSE(productHelper->getFrontEndPropertyComputeDispatchAllWalkerSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertyDisableEuFusionSupport());
     EXPECT_FALSE(productHelper->getFrontEndPropertyDisableOverDispatchSupport());
     EXPECT_FALSE(productHelper->getFrontEndPropertySingleSliceDispatchCcsModeSupport());
 
-    EXPECT_TRUE(productHelper->getPipelineSelectPropertyMediaSamplerDopClockGateSupport());
     EXPECT_FALSE(productHelper->getPipelineSelectPropertySystolicModeSupport());
 }

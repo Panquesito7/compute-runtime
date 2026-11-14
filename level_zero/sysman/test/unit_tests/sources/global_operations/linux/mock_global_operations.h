@@ -1,22 +1,28 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/test/common/libult/linux/drm_mock.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_ostime.h"
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
-#include "level_zero/sysman/source/firmware_util/sysman_firmware_util.h"
-#include "level_zero/sysman/source/global_operations/linux/sysman_os_global_operations_imp.h"
-#include "level_zero/sysman/source/global_operations/sysman_global_operations_imp.h"
-#include "level_zero/sysman/source/linux/sysman_fs_access.h"
+#include "level_zero/sysman/source/api/global_operations/linux/sysman_os_global_operations_imp.h"
+#include "level_zero/sysman/source/api/global_operations/sysman_global_operations_imp.h"
+#include "level_zero/sysman/source/shared/firmware_util/sysman_firmware_util.h"
+#include "level_zero/sysman/source/shared/linux/kmd_interface/sysman_kmd_interface.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_hw_device_id.h"
 
+#include <sstream>
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 const std::string vendorIntel("Intel(R) Corporation");
@@ -29,7 +35,7 @@ const std::string subsystemVendorFile("device/subsystem_vendor");
 const std::string driverFile("device/driver");
 const std::string agamaVersionFile("/sys/module/i915/agama_version");
 const std::string srcVersionFile("/sys/module/i915/srcversion");
-const std::string functionLevelReset("device/reset");
+const std::string xeSrcVersionFile("/sys/module/xe/srcversion");
 const std::string clientsDir("clients");
 constexpr uint64_t pid1 = 1711u;
 constexpr uint64_t pid2 = 1722u;
@@ -56,11 +62,16 @@ const std::string engine6("6");
 const std::string driverVersion("5.0.0-37-generic SMP mod_unload");
 const std::string srcVersion("5.0.0-37");
 const std::string ueventWedgedFile("/var/lib/libze_intel_gpu/wedged_file");
-const std::string mockFunctionResetPath("/MOCK_FUNCTION_LEVEL_RESET_PATH");
 const std::string mockDeviceDir("devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:01.0/0000:8c:00.0");
+const std::string mockFunctionResetPath(mockDeviceDir + "/reset");
 const std::string mockDeviceName("/MOCK_DEVICE_NAME");
+const std::string mockSlotPath("/sys/bus/pci/slots/1");
+const std::string mockSlotPathAddress("/sys/bus/pci/slots/1/address");
+const std::string mockRootAddress("devices");
+const std::string mockCardBusPath("/sys/devices");
+const std::string mockVramBadPagesFile("device/vram_bad_pages");
 
-enum mockEnumListProcessCall {
+enum MockEnumListProcessCall {
     DEVICE_IN_USE = 0,
     DEVICE_UNUSED = 1,
     RETURN_ERROR = 2
@@ -86,12 +97,13 @@ struct MockGlobalOperationsFirmwareHandleContext : public L0::Sysman::FirmwareHa
     ADDMETHOD_NOBASE_VOIDRETURN(init, ());
 };
 
-struct MockGlobalOperationsSysfsAccess : public L0::Sysman::SysfsAccess {
+struct MockGlobalOperationsSysfsAccess : public L0::Sysman::SysFsAccessInterface {
 
     ze_result_t mockScanDirEntriesError = ZE_RESULT_SUCCESS;
     ze_result_t mockReadError = ZE_RESULT_SUCCESS;
     ze_result_t mockBindDeviceError = ZE_RESULT_SUCCESS;
     ze_result_t mockUnbindDeviceError = ZE_RESULT_SUCCESS;
+
     uint32_t mockCount = 0;
     bool isRootSet = true;
     bool mockGetScannedDir4EntriesStatus = false;
@@ -99,40 +111,60 @@ struct MockGlobalOperationsSysfsAccess : public L0::Sysman::SysfsAccess {
     bool mockGetScannedDirPidEntriesForClientsStatus = false;
     bool mockReadStatus = false;
     bool mockGetValUnsignedLongStatus = false;
+    bool mockDeviceUnbound = false;
+    bool mockFileWithEmptyLines = false;
+    bool mockFileWithRepeatedEntries = false;
+    bool mockFileWithNoColonEntry = false;
+    bool mockFileWithOneColonEntry = false;
+    bool mockFileWithNoFieldsEntry = false;
+    bool mockFileWithNoSizeField = false;
+    bool mockFileWithInvalidAddress = false;
+    bool mockFileWithInvalidSize = false;
+    bool mockFileWithNoStatus = false;
+    bool mockFileWithInvalidStatus = false;
+    bool mockFileWithInvalidMaxPageEntry = false;
+    bool mockFileWithMaxPagesNoValue = false;
+    std::string mockGpuHealthVal = "ok";
+    std::string mockGpuHealthWrittenVal;
+    std::string mockSocUidVal = "76f7020e2140765b";
+    ze_result_t mockSocUidReadResult = ZE_RESULT_SUCCESS;
 
-    ze_result_t getRealPath(const std::string file, std::string &val) override {
-        if (file.compare(functionLevelReset) == 0) {
-            val = mockFunctionResetPath;
-        } else if (file.compare(deviceDir) == 0) {
+    ze_result_t getRealPath(const std::string &file, std::string &val) override {
+        if (file.compare(deviceDir) == 0) {
             val = mockDeviceDir;
         } else {
             return ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
-        return ZE_RESULT_SUCCESS;
+        return mockDeviceUnbound ? ZE_RESULT_ERROR_NOT_AVAILABLE : ZE_RESULT_SUCCESS;
     }
 
     enum class Index {
-        MockSubsystemVendor,
-        MockDevice,
-        MockVendor,
-        MockCount
+        mockSubsystemVendor,
+        mockDevice,
+        mockVendor,
+        mockCount
     };
 
     ze_result_t readResult = ZE_RESULT_SUCCESS;
-    std::string mockReadVal[static_cast<int>(Index::MockCount)] = {"0x8086", "0x3ea5", "0x8086"};
+    std::string mockReadVal[static_cast<int>(Index::mockCount)] = {"0x8086", "0x3ea5", "0x8086"};
     ze_result_t read(const std::string file, std::string &val) override {
         if (mockReadError != ZE_RESULT_SUCCESS) {
             return mockReadError;
         }
 
         if (file.compare(subsystemVendorFile) == 0) {
-            val = mockReadVal[static_cast<int>(Index::MockSubsystemVendor)];
+            val = mockReadVal[static_cast<int>(Index::mockSubsystemVendor)];
         } else if (file.compare(deviceFile) == 0) {
-            val = mockReadVal[static_cast<int>(Index::MockDevice)];
+            val = mockReadVal[static_cast<int>(Index::mockDevice)];
         } else if (file.compare(vendorFile) == 0) {
-            val = mockReadVal[static_cast<int>(Index::MockVendor)];
+            val = mockReadVal[static_cast<int>(Index::mockVendor)];
         } else if (file.compare("clients/8/pid") == 0) {
             val = bPid4;
+        } else if (file.compare("device/gpu_health") == 0) {
+            val = mockGpuHealthVal;
+        } else if (file.compare("device/device_uid") == 0) {
+            val = mockSocUidVal;
+            return mockSocUidReadResult;
         } else {
             return ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
@@ -334,37 +366,104 @@ struct MockGlobalOperationsSysfsAccess : public L0::Sysman::SysfsAccess {
         }
     }
 
-    ze_result_t unbindDevice(const std::string device) override {
+    ze_result_t unbindDevice(const std::string &gpuUnbindEntry, const std::string &device) override {
         if (mockUnbindDeviceError != ZE_RESULT_SUCCESS) {
             return mockUnbindDeviceError;
         }
 
+        mockDeviceUnbound = true;
+
         return ZE_RESULT_SUCCESS;
     }
 
-    ze_result_t bindDevice(const std::string device) override {
+    ze_result_t bindDevice(const std::string &gpuBindEntry, const std::string &device) override {
         if (mockBindDeviceError != ZE_RESULT_SUCCESS) {
             return mockBindDeviceError;
         }
 
+        mockDeviceUnbound = false;
+
+        return ZE_RESULT_SUCCESS;
+    }
+
+    ze_result_t read(const std::string file, std::vector<std::string> &val) override {
+        val.clear();
+        if (mockReadError != ZE_RESULT_SUCCESS) {
+            return mockReadError;
+        }
+
+        if (file.compare(mockVramBadPagesFile) == 0) {
+            if (mockFileWithEmptyLines == true) {
+                val.push_back("");
+            } else if (mockFileWithRepeatedEntries == true) {
+                val.push_back("max_pages : 10000");
+                val.push_back("0x00001234 : 0x00001000 : R");
+                val.push_back("0x00001234 : 0x00001000 : R");
+            } else if (mockFileWithNoColonEntry == true) {
+                val.push_back("0x00001234 0x00001000 R");
+            } else if (mockFileWithOneColonEntry == true) {
+                val.push_back("0x00001234 : 0x00001000");
+            } else if (mockFileWithNoFieldsEntry == true) {
+                val.push_back(" : : R");
+            } else if (mockFileWithNoSizeField == true) {
+                val.push_back("0x00001234 :: R");
+            } else if (mockFileWithInvalidAddress == true) {
+                val.push_back("INVALID : 0x00001000 : R");
+            } else if (mockFileWithInvalidSize == true) {
+                val.push_back("0x00001234 : INVALID : R");
+            } else if (mockFileWithNoStatus == true) {
+                val.push_back("0x00001234 : 0x00001000 : ");
+            } else if (mockFileWithInvalidStatus == true) {
+                val.push_back("0x00001234 : 0x00001000 : X");
+            } else if (mockFileWithInvalidMaxPageEntry == true) {
+                val.push_back("max_pages 10000");
+            } else if (mockFileWithMaxPagesNoValue == true) {
+                val.push_back("max_pages :");
+            } else {
+                val.push_back("max_pages : 10000");
+                val.push_back("0x00001234 : 0x00001000 : R");
+                val.push_back("0x00005678 : 0x00001000 : P");
+                val.push_back("0x00007890 : 0x00001000 : F");
+            }
+        }
         return ZE_RESULT_SUCCESS;
     }
 
     MockGlobalOperationsSysfsAccess() = default;
 
+    ze_result_t mockWriteError = ZE_RESULT_SUCCESS;
+    ze_result_t writeResult = ZE_RESULT_SUCCESS;
+    ze_result_t write(const std::string &file, std::string_view val) override {
+        if (mockWriteError != ZE_RESULT_SUCCESS) {
+            return mockWriteError;
+        }
+        if (file.compare("device/gpu_health") == 0) {
+            mockGpuHealthWrittenVal = std::string(val);
+        }
+        return writeResult;
+    }
+
     ADDMETHOD_NOBASE(fileExists, bool, true, (const std::string file));
 };
 
-struct MockGlobalOperationsProcfsAccess : public L0::Sysman::ProcfsAccess {
+struct MockGlobalOperationsProcfsAccess : public L0::Sysman::ProcFsAccessInterface {
 
     const ::pid_t extraPid = 4;
     const int extraFd = 5;
+    const int extraFd1 = 6;
+    const ::pid_t extraChildPid = 7;
+    const int extraChildFd = 8;
+    const int extraChildFd1 = 9;
     std::vector<::pid_t> pidList = {1, 2, 3};
     std::vector<int> fdList = {0, 1, 2};
     ::pid_t ourDevicePid = 0;
     int ourDeviceFd = 0;
+    int ourDeviceFd1 = 0;
+    ::pid_t ourDeviceChildPid = 0;
+    int ourDeviceChildFd = 0;
+    int ourDeviceChildFd1 = 0;
 
-    std::vector<mockEnumListProcessCall> mockListProcessCall{};
+    std::vector<MockEnumListProcessCall> mockListProcessCall{};
     std::vector<bool> isRepeated{};
     ze_result_t listProcessesResult = ZE_RESULT_SUCCESS;
     uint32_t listProcessCalled = 0u;
@@ -373,17 +472,20 @@ struct MockGlobalOperationsProcfsAccess : public L0::Sysman::ProcfsAccess {
         list = pidList;
 
         if (!mockListProcessCall.empty()) {
-            mockEnumListProcessCall mockListProcessCallValue = mockListProcessCall.front();
-            if (mockListProcessCallValue == mockEnumListProcessCall::DEVICE_IN_USE) {
+            MockEnumListProcessCall mockListProcessCallValue = mockListProcessCall.front();
+            if (mockListProcessCallValue == MockEnumListProcessCall::DEVICE_IN_USE) {
                 if (ourDevicePid) {
                     list.push_back(ourDevicePid);
                 }
+                if (ourDeviceChildPid) {
+                    list.push_back(ourDeviceChildPid);
+                }
             }
 
-            else if (mockListProcessCallValue == mockEnumListProcessCall::DEVICE_UNUSED) {
+            else if (mockListProcessCallValue == MockEnumListProcessCall::DEVICE_UNUSED) {
             }
 
-            else if (mockListProcessCallValue == mockEnumListProcessCall::RETURN_ERROR) {
+            else if (mockListProcessCallValue == MockEnumListProcessCall::RETURN_ERROR) {
                 listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
             }
 
@@ -415,6 +517,15 @@ struct MockGlobalOperationsProcfsAccess : public L0::Sysman::ProcfsAccess {
         list = fdList;
         if (ourDevicePid == pid) {
             list.push_back(ourDeviceFd);
+            if (ourDeviceFd1) {
+                list.push_back(ourDeviceFd1);
+            }
+        }
+        if (ourDeviceChildPid && (ourDeviceChildPid == pid)) {
+            list.push_back(ourDeviceChildFd);
+            if (ourDeviceChildFd1) {
+                list.push_back(ourDeviceChildFd1);
+            }
         }
         return getFileDescriptorsResult;
     }
@@ -426,7 +537,9 @@ struct MockGlobalOperationsProcfsAccess : public L0::Sysman::ProcfsAccess {
             return mockGetFileNameError;
         }
 
-        if (pid == ourDevicePid && fd == ourDeviceFd) {
+        if (pid == ourDevicePid && ((fd == ourDeviceFd) || (ourDeviceFd1 && (fd == ourDeviceFd1)))) {
+            val = mockDeviceName;
+        } else if (ourDeviceChildPid && (pid == ourDeviceChildPid) && ((fd == ourDeviceChildFd) || (ourDeviceChildFd1 && (fd == ourDeviceChildFd1)))) {
             val = mockDeviceName;
         } else {
             // return fake filenames for other file descriptors
@@ -453,17 +566,78 @@ struct MockGlobalOperationsProcfsAccess : public L0::Sysman::ProcfsAccess {
     MockGlobalOperationsProcfsAccess() = default;
 };
 
-struct MockGlobalOperationsFsAccess : public L0::Sysman::FsAccess {
+struct MockGlobalOperationsFsAccess : public L0::Sysman::FsAccessInterface {
     ze_result_t mockReadError = ZE_RESULT_SUCCESS;
-    ze_result_t readResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    ze_result_t readResult = ZE_RESULT_SUCCESS;
     std::string mockReadVal = "";
+    std::string mockFlrValue = "";
+    std::string mockColdResetValue = "unknown";
+    std::string mockWarmResetValue = "unknown";
+    std::string mockFdoModeValue = "disabled";
+    std::string mockSurvivabilityModeValue = "";
+    std::string mockAlertReason = "none";
+    ze_result_t mockAlertReasonReadResult = ZE_RESULT_SUCCESS;
+    bool mockDevicePciPathAccessible = true;
+    bool mockDriverLoaded = true;
+    bool mockExposeClientIdInFdInfo = true;
+    uint64_t mockClientIdForFirstFd = 1;
+    uint64_t mockClientIdForSecondFd = 2;
+    uint64_t mockClientIdForChildFirstFd = 3;
+    uint64_t mockClientIdForChildSecondFd = 4;
+    std::map<::pid_t, uint64_t> mockProcessStartTime = {};
+    std::map<::pid_t, std::vector<std::string>> mockStatFileContents = {};
+    std::string mockProcessName = "(gpu app)";
+
+    std::string buildStatFileLine(const ::pid_t pid, const std::string &processName, const std::string &startTime) {
+        constexpr uint32_t fieldsBetweenProcessStateAndStartTime = 18u;
+        std::ostringstream statFileLine;
+        statFileLine << pid << " " << processName << " S";
+        for (uint32_t fieldIndex = 0; fieldIndex < fieldsBetweenProcessStateAndStartTime; fieldIndex++) {
+            statFileLine << " 0";
+        }
+        statFileLine << " " << startTime << " 0 0";
+        return statFileLine.str();
+    }
+
+    bool directoryExists(const std::string path) override {
+        return mockDevicePciPathAccessible;
+    }
+
+    // The driver symlink is resolved by absolute path through FsAccess, so the
+    // per-device sysfs interface must not be involved here.
+    ze_result_t readSymLink(const std::string path, std::string &buf) override {
+        if (path.find("/driver") != std::string::npos) {
+            if (!mockDriverLoaded) {
+                return ZE_RESULT_ERROR_NOT_AVAILABLE;
+            }
+            buf = "../../../../../../bus/pci/drivers/xe";
+            return ZE_RESULT_SUCCESS;
+        }
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
     ze_result_t read(const std::string file, std::string &val) override {
         if (mockReadError != ZE_RESULT_SUCCESS) {
             return mockReadError;
         }
 
+        if (file.find("/survivability_info/fdo_mode") != std::string::npos) {
+            val = mockFdoModeValue;
+            return readResult;
+        }
+
+        if (file.find("/survivability_mode") != std::string::npos) {
+            val = mockSurvivabilityModeValue;
+            return readResult;
+        }
+
+        if (file.compare(mockSlotPathAddress) == 0) {
+            val = mockRootAddress;
+            return ZE_RESULT_SUCCESS;
+        }
+
         if (mockReadVal == srcVersion) {
-            if (file.compare(srcVersionFile) == 0) {
+            if ((file.compare(srcVersionFile) == 0) || (file.compare(xeSrcVersionFile) == 0)) {
                 val = mockReadVal;
                 readResult = ZE_RESULT_SUCCESS;
                 return readResult;
@@ -477,17 +651,149 @@ struct MockGlobalOperationsFsAccess : public L0::Sysman::FsAccess {
         } else {
             readResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
-        return readResult;
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    ze_result_t read(std::string file, std::vector<std::string> &val) override {
+        if (mockReadError != ZE_RESULT_SUCCESS) {
+            return mockReadError;
+        }
+
+        if (file.find("/xe_amc_alert_reason") != std::string::npos) {
+            if (mockAlertReasonReadResult != ZE_RESULT_SUCCESS) {
+                return mockAlertReasonReadResult;
+            }
+            if (!mockAlertReason.empty()) {
+                val.push_back(mockAlertReason);
+            }
+            return ZE_RESULT_SUCCESS;
+        }
+
+        const std::string procFsDir("/proc/");
+        const std::string statFileSuffix("/stat");
+        if (file.starts_with(procFsDir) && file.ends_with(statFileSuffix) &&
+            (file.size() > (procFsDir.size() + statFileSuffix.size()))) {
+            ::pid_t pid = 0;
+            std::istringstream pidStream(file.substr(procFsDir.size(), file.size() - procFsDir.size() - statFileSuffix.size()));
+            pidStream >> pid;
+            auto statFileContents = mockStatFileContents.find(pid);
+            if (statFileContents != mockStatFileContents.end()) {
+                val = statFileContents->second;
+                return ZE_RESULT_SUCCESS;
+            }
+
+            auto startTime = mockProcessStartTime.find(pid);
+            if (startTime == mockProcessStartTime.end()) {
+                return ZE_RESULT_ERROR_NOT_AVAILABLE;
+            }
+
+            val.push_back(buildStatFileLine(pid, mockProcessName, std::to_string(startTime->second)));
+            return ZE_RESULT_SUCCESS;
+        }
+
+        if (file == "/proc/4/fdinfo/5") {
+            val.push_back("pos: 0");
+            val.push_back("flags: 02100002");
+            if (mockExposeClientIdInFdInfo) {
+                val.push_back("drm-client-id: " + std::to_string(mockClientIdForFirstFd));
+            }
+            val.push_back("drm-total-vram0: 120 MiB");
+            val.push_back("drm-total-vram1: 50 KiB");
+            val.push_back("drm-total-system: 125 MiB");
+            val.push_back("drm-shared-vram0: 120 MiB");
+            val.push_back("drm-shared-vram1: 80 MiB");
+            val.push_back("drm-shared-system: 16 MiB");
+            val.push_back("drm-active-system: 110 MiB");
+            val.push_back("drm-resident-system: 125 MiB");
+            val.push_back("drm-total-stolen-system: 0");
+            val.push_back("drm-shared-stolen-system: 0");
+            val.push_back("drm-cycles-bcs: 200");
+            val.push_back("drm-total-cycles-bcs: 220000000");
+            val.push_back("drm-engine-capacity-bcs: 16");
+            val.push_back("drm-cycles-ccs: 100");
+            val.push_back("drm-total-cycles-ccs: 220000000");
+            val.push_back("drm-engine-capacity-ccs: 2");
+        }
+        if (file == "/proc/4/fdinfo/6") {
+            val.push_back("pos: 0");
+            val.push_back("flags: 02100002");
+            if (mockExposeClientIdInFdInfo) {
+                val.push_back("drm-client-id: " + std::to_string(mockClientIdForSecondFd));
+            }
+            val.push_back("drm-total-vram0: 534 ");
+            val.push_back("drm-total-vram1: 50 MiB");
+            val.push_back("drm-total-system: 125 MiB");
+            val.push_back("drm-shared-vram0: 120 KiB");
+            val.push_back("drm-shared-vram1: 689");
+            val.push_back("drm-shared-system: 16 MiB");
+            val.push_back("drm-active-system: 110 MiB");
+            val.push_back("drm-resident-system: 125 MiB");
+            val.push_back("drm-total-stolen-system: 0");
+            val.push_back("drm-shared-stolen-system: 0");
+            val.push_back("drm-cycles-bcs: 200");
+            val.push_back("drm-total-cycles-bcs: 220000000");
+            val.push_back("drm-engine-capacity-bcs: 16");
+            val.push_back("drm-cycles-ccs: 0");
+            val.push_back("drm-total-cycles-ccs: 0");
+            val.push_back("drm-engine-capacity-ccs: 2");
+        }
+        // An fd inherited through fork() reads back the same contents as the fd it was inherited from
+        if (file == "/proc/7/fdinfo/8") {
+            val.push_back("pos: 0");
+            val.push_back("flags: 02100002");
+            if (mockExposeClientIdInFdInfo) {
+                val.push_back("drm-client-id: " + std::to_string(mockClientIdForChildFirstFd));
+            }
+            val.push_back("drm-total-vram0: 120 MiB");
+            val.push_back("drm-total-vram1: 50 KiB");
+            val.push_back("drm-shared-vram0: 120 MiB");
+            val.push_back("drm-shared-vram1: 80 MiB");
+            val.push_back("drm-cycles-bcs: 200");
+            val.push_back("drm-total-cycles-bcs: 220000000");
+            val.push_back("drm-engine-capacity-bcs: 16");
+            val.push_back("drm-cycles-ccs: 100");
+            val.push_back("drm-total-cycles-ccs: 220000000");
+            val.push_back("drm-engine-capacity-ccs: 2");
+        }
+        if (file == "/proc/7/fdinfo/9") {
+            val.push_back("pos: 0");
+            val.push_back("flags: 02100002");
+            if (mockExposeClientIdInFdInfo) {
+                val.push_back("drm-client-id: " + std::to_string(mockClientIdForChildSecondFd));
+            }
+            val.push_back("drm-total-vram0: 10 MiB");
+            val.push_back("drm-shared-vram0: 5 MiB");
+            val.push_back("drm-cycles-ccs: 100");
+            val.push_back("drm-total-cycles-ccs: 220000000");
+            val.push_back("drm-engine-capacity-ccs: 2");
+        }
+        return ZE_RESULT_SUCCESS;
     }
 
     ze_result_t mockWriteError = ZE_RESULT_SUCCESS;
     ze_result_t writeResult = ZE_RESULT_SUCCESS;
-    ze_result_t write(const std::string file, const std::string val) override {
+    ze_result_t write(const std::string &file, std::string_view val) override {
         if (mockWriteError != ZE_RESULT_SUCCESS) {
             return mockWriteError;
         }
 
+        if (file.compare(mockFunctionResetPath) == 0) {
+            mockFlrValue = val;
+        } else if (file.compare(mockSlotPath + "/power") == 0) {
+            if (val.compare("0") == 0) {
+                mockColdResetValue = val;
+            } else if ((val.compare("1") == 0) && mockColdResetValue.compare("0") == 0) {
+                mockColdResetValue = val;
+            }
+        } else if (file.compare(mockCardBusPath + "/remove") == 0) {
+            mockWarmResetValue = val;
+        }
         return writeResult;
+    }
+
+    ze_result_t listDirectory(const std::string directory, std::vector<std::string> &listOfslots) override {
+        listOfslots.push_back("1");
+        return ZE_RESULT_SUCCESS;
     }
 
     ADDMETHOD_NOBASE(canWrite, ze_result_t, ZE_RESULT_SUCCESS, (const std::string file));
@@ -509,29 +815,48 @@ struct MockGlobalOpsFwInterface : public L0::Sysman::FirmwareUtil {
     MockGlobalOpsFwInterface() = default;
 
     ADDMETHOD_NOBASE(fwDeviceInit, ze_result_t, ZE_RESULT_SUCCESS, (void));
-    ADDMETHOD_NOBASE(getFirstDevice, ze_result_t, ZE_RESULT_SUCCESS, (igsc_device_info * info));
     ADDMETHOD_NOBASE(getFwVersion, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, std::string &firmwareVersion));
+    ADDMETHOD_NOBASE(getFlashFirmwareProgress, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t *pCompletionPercent));
     ADDMETHOD_NOBASE(flashFirmware, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, void *pImage, uint32_t size));
     ADDMETHOD_NOBASE(fwSupportedDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::vector<std::string> & supportedDiagTests));
     ADDMETHOD_NOBASE(fwRunDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::string & osDiagType, zes_diag_result_t *pResult));
     ADDMETHOD_NOBASE(fwGetMemoryErrorCount, ze_result_t, ZE_RESULT_SUCCESS, (zes_ras_error_type_t category, uint32_t subDeviceCount, uint32_t subDeviceId, uint64_t &count));
-    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t * currentState, uint8_t *pendingState));
+    ADDMETHOD_NOBASE(fwGetEccAvailable, ze_result_t, ZE_RESULT_SUCCESS, (ze_bool_t * pAvailable));
+    ADDMETHOD_NOBASE(fwGetEccConfigurable, ze_result_t, ZE_RESULT_SUCCESS, (ze_bool_t * pConfigurable));
+    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t *currentState, uint8_t *pendingState, uint8_t *defaultState));
     ADDMETHOD_NOBASE(fwSetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t newState, uint8_t *currentState, uint8_t *pendingState));
+    ADDMETHOD_NOBASE(fwSetGfspConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t gfspHeciCmdCode, std::vector<uint8_t> inBuf, std::vector<uint8_t> &outBuf));
+    ADDMETHOD_NOBASE(fwGetGfspConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint32_t gfspHeciCmdCode, std::vector<uint8_t> &outBuf));
     ADDMETHOD_NOBASE_VOIDRETURN(getDeviceSupportedFwTypes, (std::vector<std::string> & fwTypes));
     ADDMETHOD_NOBASE_VOIDRETURN(fwGetMemoryHealthIndicator, (zes_mem_health_t * health));
+    ADDMETHOD_NOBASE_VOIDRETURN(getLateBindingSupportedFwTypes, (std::vector<std::string> & fwTypes));
+
+    ze_result_t mockSerialNumberError = ZE_RESULT_SUCCESS;
+    std::array<uint8_t, IGSC_MAX_OEM_SN_LENGTH> mockSerialNumberData = {};
+    uint16_t mockSerialNumberLen = 0;
+
+    ze_result_t fwGetSerialNumber(std::array<uint8_t, IGSC_MAX_OEM_SN_LENGTH> &serialNumber, uint16_t &serialNumberLen) override {
+        if (mockSerialNumberError != ZE_RESULT_SUCCESS) {
+            return mockSerialNumberError;
+        }
+        serialNumber = mockSerialNumberData;
+        serialNumberLen = mockSerialNumberLen;
+        return ZE_RESULT_SUCCESS;
+    }
 };
 
 struct MockGlobalOpsLinuxSysmanImp : public L0::Sysman::LinuxSysmanImp {
     using LinuxSysmanImp::pFsAccess;
     using LinuxSysmanImp::pProcfsAccess;
     using LinuxSysmanImp::pSysfsAccess;
+    using LinuxSysmanImp::pSysmanKmdInterface;
     MockGlobalOpsLinuxSysmanImp(L0::Sysman::SysmanDeviceImp *pParentSysmanDeviceImp) : LinuxSysmanImp(pParentSysmanDeviceImp) {}
     std::vector<int> fdList = {0, 1, 2};
     ::pid_t ourDevicePid = 0;
     int ourDeviceFd = 0;
     ze_result_t mockError = ZE_RESULT_SUCCESS;
     ze_result_t mockInitDeviceError = ZE_RESULT_SUCCESS;
-    void getPidFdsForOpenDevice(L0::Sysman::ProcfsAccess *pProcfsAccess, L0::Sysman::SysfsAccess *pSysfsAccess, const ::pid_t pid, std::vector<int> &deviceFds) override {
+    void getPidFdsForOpenDevice(const ::pid_t pid, std::vector<int> &deviceFds) override {
         if (ourDevicePid) {
             deviceFds.push_back(ourDeviceFd);
         }
@@ -554,12 +879,37 @@ struct MockGlobalOpsLinuxSysmanImp : public L0::Sysman::LinuxSysmanImp {
     void setMockInitDeviceError(ze_result_t result) {
         mockInitDeviceError = result;
     }
+    ze_result_t reInitSysmanDeviceResources() override {
+        if (mockInitDeviceError != ZE_RESULT_SUCCESS) {
+            return mockInitDeviceError;
+        }
+        return ZE_RESULT_SUCCESS;
+    }
 };
 
 constexpr int mockFdGlobalOperations = 33;
+
+// Mirrors SysmanHwDeviceIdDrm: sysman keeps the device node closed while idle, so
+// the descriptor is valid only for the lifetime of a scoped single instance.
+// Callers that read the descriptor without acquiring one observe -1.
+class MockGlobalOpsSysmanHwDeviceIdDrm : public L0::Sysman::SysmanHwDeviceIdDrm {
+  public:
+    using L0::Sysman::SysmanHwDeviceIdDrm::SysmanHwDeviceIdDrm;
+
+    int openFileDescriptor() override {
+        fileDescriptor = mockFdGlobalOperations;
+        return fileDescriptor;
+    }
+
+    int closeFileDescriptor() override {
+        fileDescriptor = -1;
+        return 0;
+    }
+};
+
 class DrmGlobalOpsMock : public Drm {
   public:
-    DrmGlobalOpsMock(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<MockSysmanHwDeviceIdDrm>(mockFdGlobalOperations, ""), rootDeviceEnvironment) {}
+    DrmGlobalOpsMock(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<MockGlobalOpsSysmanHwDeviceIdDrm>(-1, ""), rootDeviceEnvironment) {}
     using Drm::setupIoctlHelper;
     int ioctlRetVal = 0;
     int ioctlErrno = 0;
@@ -572,8 +922,11 @@ class DrmGlobalOpsMock : public Drm {
 class PublicLinuxGlobalOperationsImp : public L0::Sysman::LinuxGlobalOperationsImp {
   public:
     using LinuxGlobalOperationsImp::pLinuxSysmanImp;
+    using LinuxGlobalOperationsImp::pProcfsAccess;
+    using LinuxGlobalOperationsImp::pSysfsAccess;
     using LinuxGlobalOperationsImp::resetTimeout;
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

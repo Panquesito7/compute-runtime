@@ -1,0 +1,59 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "level_zero/api/sysman/zes_handles_struct.h"
+#include <level_zero/zes_api.h>
+
+#include <memory>
+#include <mutex>
+#include <vector>
+
+namespace L0 {
+namespace Sysman {
+struct OsSysman;
+class Fan : _zes_fan_handle_t {
+  public:
+    virtual ~Fan() = default;
+    virtual ze_result_t fanGetProperties(zes_fan_properties_t *pProperties) = 0;
+    virtual ze_result_t fanGetConfig(zes_fan_config_t *pConfig) = 0;
+    virtual ze_result_t fanSetDefaultMode() = 0;
+    virtual ze_result_t fanSetFixedSpeedMode(const zes_fan_speed_t *pSpeed) = 0;
+    virtual ze_result_t fanSetSpeedTableMode(const zes_fan_speed_table_t *pSpeedTable) = 0;
+    virtual ze_result_t fanGetState(zes_fan_speed_units_t units, int32_t *pSpeed) = 0;
+
+    static Fan *fromHandle(zes_fan_handle_t handle) {
+        return static_cast<Fan *>(handle);
+    }
+    inline zes_fan_handle_t toHandle() { return this; }
+    virtual void reInit() = 0;
+};
+struct FanHandleContext {
+    FanHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
+    ~FanHandleContext();
+
+    void init();
+    void createHandle(uint32_t fanIndex, bool multipleFansSupported);
+
+    ze_result_t fanGet(uint32_t *pCount, zes_fan_handle_t *phFan);
+
+    void reInit();
+
+    bool isFanInitDone() {
+        return fanInitDone;
+    }
+
+    OsSysman *pOsSysman = nullptr;
+    std::vector<std::unique_ptr<Fan>> handleList = {};
+
+  private:
+    std::once_flag initFanOnce;
+    bool fanInitDone = false;
+};
+
+} // namespace Sysman
+} // namespace L0

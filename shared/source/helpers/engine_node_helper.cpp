@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,24 +7,32 @@
 
 #include "shared/source/helpers/engine_node_helper.h"
 
+#include "shared/source/ail/ail_configuration.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/driver_model_type.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/product_helper.h"
 
 namespace NEO::EngineHelpers {
 
 std::string engineUsageToString(EngineUsage usage) {
     switch (usage) {
-    case EngineUsage::Regular:
+    case EngineUsage::regular:
         return "Regular";
-    case EngineUsage::LowPriority:
+    case EngineUsage::lowPriority:
         return "LowPriority";
-    case EngineUsage::Internal:
+    case EngineUsage::highPriority:
+        return "HighPriority";
+    case EngineUsage::internal:
         return "Internal";
-    case EngineUsage::Cooperative:
+    case EngineUsage::cooperative:
         return "Cooperative";
+    case EngineUsage::powerHint:
+        return "PowerHint";
     default:
         return "Unknown";
     }
@@ -87,8 +95,8 @@ bool isBcsVirtualEngineEnabled(aub_stream::EngineType engineType) {
     bool useVirtualEnginesForBcs = engineType == aub_stream::EngineType::ENGINE_BCS ||
                                    engineType == aub_stream::EngineType::ENGINE_BCS1;
 
-    if (DebugManager.flags.UseDrmVirtualEnginesForBcs.get() != -1) {
-        useVirtualEnginesForBcs = !!DebugManager.flags.UseDrmVirtualEnginesForBcs.get();
+    if (debugManager.flags.UseDrmVirtualEnginesForBcs.get() != -1) {
+        useVirtualEnginesForBcs = !!debugManager.flags.UseDrmVirtualEnginesForBcs.get();
     }
 
     return useVirtualEnginesForBcs;
@@ -97,8 +105,9 @@ bool isBcsVirtualEngineEnabled(aub_stream::EngineType engineType) {
 aub_stream::EngineType getBcsEngineType(const RootDeviceEnvironment &rootDeviceEnvironment, const DeviceBitfield &deviceBitfield, SelectorCopyEngine &selectorCopyEngine, bool internalUsage) {
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
     auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
-    if (DebugManager.flags.ForceBcsEngineIndex.get() != -1) {
-        auto index = DebugManager.flags.ForceBcsEngineIndex.get();
+    auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
+    if (debugManager.flags.ForceBcsEngineIndex.get() != -1) {
+        auto index = debugManager.flags.ForceBcsEngineIndex.get();
         UNRECOVERABLE_IF(index > 8);
 
         return (index == 0) ? aub_stream::EngineType::ENGINE_BCS
@@ -110,22 +119,22 @@ aub_stream::EngineType getBcsEngineType(const RootDeviceEnvironment &rootDeviceE
     }
 
     if (internalUsage) {
-        if (DebugManager.flags.ForceBCSForInternalCopyEngine.get() != -1) {
-            return DebugManager.flags.ForceBCSForInternalCopyEngine.get() == 0 ? aub_stream::EngineType::ENGINE_BCS
-                                                                               : static_cast<aub_stream::EngineType>(aub_stream::EngineType::ENGINE_BCS1 + DebugManager.flags.ForceBCSForInternalCopyEngine.get() - 1);
-        }
-        return aub_stream::ENGINE_BCS3;
+        return EngineHelpers::mapBcsIndexToEngineType(gfxCoreHelper.getInternalCopyEngineIndex(hwInfo), true);
     }
 
     auto enableSelector = productHelper.isCopyEngineSelectorEnabled(hwInfo);
 
-    if (DebugManager.flags.EnableCopyEngineSelector.get() != -1) {
-        enableSelector = DebugManager.flags.EnableCopyEngineSelector.get();
+    if (debugManager.flags.EnableCopyEngineSelector.get() != -1) {
+        enableSelector = debugManager.flags.EnableCopyEngineSelector.get();
     }
+
+    const bool isBCS0Default = (aub_stream::ENGINE_BCS == productHelper.getDefaultCopyEngine());
 
     if (enableSelector) {
         const bool isMainCopyEngineAlreadyUsed = selectorCopyEngine.isMainUsed.exchange(true);
-        if (isMainCopyEngineAlreadyUsed) {
+        if (false == isMainCopyEngineAlreadyUsed && false == isBCS0Default) {
+            return productHelper.getDefaultCopyEngine();
+        } else if (isMainCopyEngineAlreadyUsed) {
             return selectLinkCopyEngine(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine.selector);
         }
     }
@@ -133,8 +142,8 @@ aub_stream::EngineType getBcsEngineType(const RootDeviceEnvironment &rootDeviceE
     return aub_stream::ENGINE_BCS;
 }
 
-void releaseBcsEngineType(aub_stream::EngineType engineType, SelectorCopyEngine &selectorCopyEngine) {
-    if (engineType == aub_stream::EngineType::ENGINE_BCS) {
+void releaseBcsEngineType(aub_stream::EngineType engineType, SelectorCopyEngine &selectorCopyEngine, const RootDeviceEnvironment &rootDeviceEnvironment) {
+    if (auto &productHelper = rootDeviceEnvironment.getProductHelper(); engineType == productHelper.getDefaultCopyEngine()) {
         selectorCopyEngine.isMainUsed.store(false);
     }
 }
@@ -150,6 +159,15 @@ aub_stream::EngineType remapEngineTypeToHwSpecific(aub_stream::EngineType inputT
     return inputType;
 }
 
+uint32_t getCcsIndex(aub_stream::EngineType engineType) {
+    UNRECOVERABLE_IF(!isCcs(engineType));
+    if (engineType == aub_stream::ENGINE_CCS) {
+        return 0;
+    } else {
+        return engineType - aub_stream::ENGINE_CCS;
+    }
+}
+
 uint32_t getBcsIndex(aub_stream::EngineType engineType) {
     UNRECOVERABLE_IF(!isBcs(engineType));
     if (engineType == aub_stream::ENGINE_BCS) {
@@ -157,6 +175,13 @@ uint32_t getBcsIndex(aub_stream::EngineType engineType) {
     } else {
         return 1 + engineType - aub_stream::ENGINE_BCS1;
     }
+}
+
+aub_stream::EngineType getBcsEngineAtIdx(uint32_t idx) {
+    if (idx == 0) {
+        return aub_stream::ENGINE_BCS;
+    }
+    return static_cast<aub_stream::EngineType>((idx - 1) + aub_stream::ENGINE_BCS1);
 }
 
 aub_stream::EngineType mapBcsIndexToEngineType(uint32_t index, bool includeMainCopyEngine) {
@@ -189,68 +214,78 @@ bool linkCopyEnginesSupported(const RootDeviceEnvironment &rootDeviceEnvironment
 
 aub_stream::EngineType selectLinkCopyEngine(const RootDeviceEnvironment &rootDeviceEnvironment, const DeviceBitfield &deviceBitfield, std::atomic<uint32_t> &selectorCopyEngine) {
     auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
+    auto &productHelper = rootDeviceEnvironment.getProductHelper();
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
-    auto enableCmdQRoundRobindBcsEngineAssign = false;
 
-    if (DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.get() != -1) {
-        enableCmdQRoundRobindBcsEngineAssign = DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.get();
-    }
-
-    if (enableCmdQRoundRobindBcsEngineAssign) {
-        aub_stream::EngineType engineType;
-
-        auto bcsRoundRobinLimit = EngineHelpers::numLinkedCopyEngines;
-        auto engineOffset = 0u;
-        auto mainCE = false;
-
-        if (DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignStartingValue.get() != -1) {
-            engineOffset = DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignStartingValue.get();
-            mainCE = engineOffset == 0;
-        }
-
-        if (mainCE) {
-            bcsRoundRobinLimit++;
-        }
-
-        if (DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignLimit.get() != -1) {
-            bcsRoundRobinLimit = DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignLimit.get();
-        }
-
-        do {
-            auto selectEngineValue = (selectorCopyEngine.fetch_add(1u) % bcsRoundRobinLimit) + engineOffset;
-
-            if (mainCE) {
-                if (selectEngineValue == 0u) {
-                    engineType = aub_stream::EngineType::ENGINE_BCS;
-                } else {
-                    engineType = static_cast<aub_stream::EngineType>(aub_stream::EngineType::ENGINE_BCS1 + selectEngineValue - 1);
-                }
-            } else {
-                engineType = static_cast<aub_stream::EngineType>(aub_stream::EngineType::ENGINE_BCS1 + selectEngineValue);
-            }
-
-        } while (!gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, engineType) || !hwInfo.featureTable.ftrBcsInfo.test(engineType == aub_stream::EngineType::ENGINE_BCS
-                                                                                                                                                          ? 0
-                                                                                                                                                          : engineType - aub_stream::EngineType::ENGINE_BCS1 + 1));
-
-        return engineType;
-    }
-
-    const aub_stream::EngineType engine1 = gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, aub_stream::ENGINE_BCS1)
+    const aub_stream::EngineType engine1 = gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, aub_stream::ENGINE_BCS1) && aub_stream::ENGINE_BCS1 != productHelper.getDefaultCopyEngine()
                                                ? aub_stream::ENGINE_BCS1
                                                : aub_stream::ENGINE_BCS4;
     const aub_stream::EngineType engine2 = aub_stream::ENGINE_BCS2;
 
-    if (isBcsEnabled(hwInfo, engine1) && isBcsEnabled(hwInfo, engine2)) {
+    auto hpEngine = gfxCoreHelper.getDefaultHpCopyEngine(hwInfo);
+
+    if (isBcsEnabled(hwInfo, engine1) && engine1 != hpEngine &&
+        isBcsEnabled(hwInfo, engine2) && engine2 != hpEngine) {
         // both BCS enabled, round robin
         return selectorCopyEngine.fetch_xor(1u) ? engine1 : engine2;
     } else {
         // one BCS enabled
-        return isBcsEnabled(hwInfo, engine1) ? engine1 : engine2;
+        if (isBcsEnabled(hwInfo, engine1) && (engine1 != hpEngine)) {
+            return engine1;
+        } else if (isBcsEnabled(hwInfo, engine2) && (engine2 != hpEngine)) {
+            return engine2;
+        } else {
+            return productHelper.getDefaultCopyEngine();
+        }
     }
 }
 aub_stream::EngineType mapCcsIndexToEngineType(uint32_t index) {
     return static_cast<aub_stream::EngineType>(index + static_cast<uint32_t>(aub_stream::ENGINE_CCS));
+}
+
+EngineGroupType engineTypeToEngineGroupType(aub_stream::EngineType engineType) {
+    if (isCcs(engineType)) {
+        return EngineGroupType::compute;
+    } else if (isComputeEngine(engineType)) {
+        return EngineGroupType::renderCompute;
+    } else if (engineType == aub_stream::ENGINE_BCS) {
+        return EngineGroupType::copy;
+    }
+    return EngineGroupType::linkedCopy;
+}
+
+bool isPowerHintEngineSupported(const RootDeviceEnvironment &rootDeviceEnvironment) {
+    return rootDeviceEnvironment.osInterface &&
+           rootDeviceEnvironment.osInterface->getDriverModel() &&
+           rootDeviceEnvironment.osInterface->getDriverModel()->getDriverModelType() == DriverModelType::wddm;
+}
+
+bool isInternalEngineFromContextGroupEnabled(const RootDeviceEnvironment &rootDeviceEnvironment) {
+    if (debugManager.flags.ExperimentalUseSecondaryContextForInternalEngine.get() == 0 ||
+        !rootDeviceEnvironment.getHelper<GfxCoreHelper>().areSecondaryContextsSupported()) {
+        return false;
+    }
+    const auto processCount = rootDeviceEnvironment.osInterface ? rootDeviceEnvironment.osInterface->getAggregatedProcessCount() : 1u;
+    return processCount <= maxProcessCountForInternalEngineFromContextGroup;
+}
+
+bool isRcsExposed(const RootDeviceEnvironment &rootDeviceEnvironment) {
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    if (!hwInfo.caps.rcsExposureDisabled) {
+        return true;
+    }
+    const auto defaultEngineType = getChosenEngineType(hwInfo);
+    return defaultEngineType == aub_stream::EngineType::ENGINE_RCS || defaultEngineType == aub_stream::EngineType::ENGINE_CCCS;
+}
+
+void setupDefaultEngineType(const RootDeviceEnvironment &rootDeviceEnvironment) {
+    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
+    auto ailConfiguration = rootDeviceEnvironment.getAILConfigurationHelper();
+    if ((ailConfiguration && ailConfiguration->forceRcs()) ||
+        (!hwInfo.featureTable.flags.ftrCCSNode && isRcsExposed(rootDeviceEnvironment))) {
+        hwInfo.capabilityTable.defaultEngineType = remapEngineTypeToHwSpecific(aub_stream::ENGINE_RCS, rootDeviceEnvironment);
+    }
+    hwInfo.capabilityTable.defaultEngineType = getChosenEngineType(hwInfo);
 }
 
 } // namespace NEO::EngineHelpers

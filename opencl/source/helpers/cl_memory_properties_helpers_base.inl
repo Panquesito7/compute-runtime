@@ -1,17 +1,18 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/bit_helpers.h"
+#include "shared/source/helpers/memory_properties_flags.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 
 #include "CL/cl_ext.h"
-#include "memory_properties_flags.h"
 
 namespace NEO {
 
@@ -61,7 +62,7 @@ MemoryProperties ClMemoryPropertiesHelper::createMemoryProperties(cl_mem_flags f
     }
     if (isValueSet(flags, CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL) ||
         isValueSet(flagsIntel, CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL) ||
-        DebugManager.flags.AllowUnrestrictedSize.get()) {
+        debugManager.flags.AllowUnrestrictedSize.get()) {
         memoryProperties.flags.allowUnrestrictedSize = true;
     }
     if (isValueSet(flagsIntel, CL_MEM_LOCALLY_UNCACHED_RESOURCE)) {

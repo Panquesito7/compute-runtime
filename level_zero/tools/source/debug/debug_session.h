@@ -1,22 +1,30 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/debugger/debugger_l0.h"
 #include "shared/source/helpers/topology_map.h"
 #include "shared/source/os_interface/os_thread.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
+#include "level_zero/core/source/helpers/api_handle_helper.h"
+#include "level_zero/include/level_zero/zet_intel_gpu_debug.h"
 #include "level_zero/tools/source/debug/eu_thread.h"
-#include <level_zero/ze_api.h>
-#include <level_zero/zet_api.h>
 
+#include <map>
 #include <memory>
 
-struct _zet_debug_session_handle_t {};
+namespace NEO {
+struct HardwareInfo;
+} // namespace NEO
+
+struct _zet_debug_session_handle_t : BaseHandle {};
+static_assert(IsCompliantWithDdiHandlesExt<_zet_debug_session_handle_t>);
 
 namespace L0 {
 
@@ -40,13 +48,17 @@ struct DebugSession : _zet_debug_session_handle_t {
     virtual ze_result_t readMemory(ze_device_thread_t thread, const zet_debug_memory_space_desc_t *desc, size_t size, void *buffer) = 0;
     virtual ze_result_t writeMemory(ze_device_thread_t thread, const zet_debug_memory_space_desc_t *desc, size_t size, const void *buffer) = 0;
     virtual ze_result_t acknowledgeEvent(const zet_debug_event_t *event) = 0;
-    virtual ze_result_t readRegisters(ze_device_thread_t thread, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) = 0;
-    virtual ze_result_t writeRegisters(ze_device_thread_t thread, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) = 0;
+    virtual ze_result_t readRegisters(ze_device_thread_t thread, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) = 0;
+    virtual ze_result_t writeRegisters(ze_device_thread_t thread, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) = 0;
     static ze_result_t getRegisterSetProperties(Device *device, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties);
     virtual ze_result_t getThreadRegisterSetProperties(ze_device_thread_t thread, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties);
     MOCKABLE_VIRTUAL bool areRequestedThreadsStopped(ze_device_thread_t thread);
+    virtual bool openSipWrapper(NEO::Device *neoDevice, uint64_t contextHandle, uint64_t gpuVa) = 0;
+    virtual bool closeSipWrapper(NEO::Device *neoDevice, uint64_t contextHandle) = 0;
+    virtual void closeExternalSipHandles() = 0;
+    virtual bool getRegisterAccessProperties(EuThread::ThreadId *threadId, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties) = 0;
 
-    Device *getConnectedDevice() { return connectedDevice; }
+    Device *getConnectedDevice() const { return connectedDevice; }
     zet_debug_config_t getDebugConfig() { return config; }
 
     static bool isThreadAll(ze_device_thread_t thread) {
@@ -110,11 +122,20 @@ struct DebugSession : _zet_debug_session_handle_t {
   protected:
     DebugSession(const zet_debug_config_t &config, Device *device);
     void createEuThreads();
+    void updateGrfRegisterSetProperties(EuThread::ThreadId thread, uint32_t *pCount, zet_debug_regset_properties_t *pRegisterSetProperties);
+    virtual uint32_t getRegisterSize(zet_debug_regset_type_intel_gpu_t type) = 0;
+    virtual ze_result_t readRegistersImp(EuThread::ThreadId thread, zet_debug_regset_type_intel_gpu_t type, uint32_t start, uint32_t count, void *pRegisterValues) = 0;
 
     virtual void startAsyncThread() = 0;
 
     virtual bool isBindlessSystemRoutine();
     virtual bool readModuleDebugArea() = 0;
+
+    struct DebugAreaInfo {
+        uint64_t gpuVa;
+        uint64_t size;
+    };
+    virtual DebugAreaInfo getModuleDebugAreaInfo() { return {0, 0}; }
     virtual ze_result_t readSbaBuffer(EuThread::ThreadId threadId, NEO::SbaTrackedAddresses &sbaBuffer) = 0;
 
     void fillDevicesFromThread(ze_device_thread_t thread, std::vector<uint8_t> &devices);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,16 +8,19 @@
 #include "level_zero/tools/source/sysman/pci/linux/os_pci_imp.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/linux/file_descriptor.h"
 #include "shared/source/utilities/directory.h"
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
-#include "level_zero/tools/source/sysman/pci/pci_imp.h"
+#include "level_zero/tools/source/sysman/pci/pci_utils.h"
 #include "level_zero/tools/source/sysman/sysman_const.h"
 
-#include <linux/pci_regs.h>
+#include <sstream>
 
 namespace L0 {
 
@@ -34,7 +37,7 @@ ze_result_t LinuxPciImp::getPciBdf(zes_pci_properties_t &pciProperties) {
     std::string bdfDir;
     ze_result_t result = pSysfsAccess->readSymLink(deviceDir, bdfDir);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): readSymLink() failed to retrive BDF from %s and returning error:0x%x \n", __FUNCTION__, deviceDir.c_str(), result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): readSymLink() failed to retrieve BDF from %s and returning error:0x%x \n", NEO_FUNCTION_NAME, deviceDir.c_str(), result);
         return result;
     }
     const auto loc = bdfDir.find_last_of('/');
@@ -50,17 +53,31 @@ ze_result_t LinuxPciImp::getPciBdf(zes_pci_properties_t &pciProperties) {
 }
 
 void LinuxPciImp::getMaxLinkCaps(double &maxLinkSpeed, int32_t &maxLinkWidth) {
-    uint16_t linkCaps = 0;
-    auto linkCapPos = getLinkCapabilityPos();
-    if (!linkCapPos) {
-        maxLinkSpeed = 0;
-        maxLinkWidth = -1;
+    maxLinkSpeed = 0;
+    maxLinkWidth = -1;
+
+    std::string pciConfigNode = {};
+    if (isLmemSupported) {
+        pSysfsAccess->getRealPath(deviceDir, pciConfigNode);
+        std::string cardBusPath = pLinuxSysmanImp->getPciCardBusDirectoryPath(pciConfigNode);
+        pciConfigNode = cardBusPath + "/config";
+    } else {
+        pSysfsAccess->getRealPath("device/config", pciConfigNode);
+    }
+
+    std::vector<uint8_t> configMemory(PCI_CFG_SPACE_SIZE);
+    if (!getPciConfigMemory(std::move(pciConfigNode), configMemory)) {
         return;
     }
 
-    linkCaps = getWordFromConfig(linkCapPos, isLmemSupported ? uspConfigMemory.get() : configMemory.get());
-    maxLinkSpeed = convertPciGenToLinkSpeed(BITS(linkCaps, 0, 4));
-    maxLinkWidth = BITS(linkCaps, 4, 6);
+    auto linkCapPos = L0::LinuxPciImp::getLinkCapabilityPos(configMemory.data());
+    if (!linkCapPos) {
+        return;
+    }
+
+    uint16_t linkCaps = L0::PciUtil::getWordFromConfig(linkCapPos, configMemory.data());
+    maxLinkSpeed = convertPciGenToLinkSpeed(bits(linkCaps, 0, 4));
+    maxLinkWidth = bits(linkCaps, 4, 6);
 
     return;
 }
@@ -83,7 +100,7 @@ ze_result_t LinuxPciImp::initializeBarProperties(std::vector<zes_pci_bar_propert
     std::vector<std::string> readBytes;
     ze_result_t result = pSysfsAccess->read(resourceFile, readBytes);
     if (result != ZE_RESULT_SUCCESS) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): read() failed to read %s and returning error:0x%x \n", __FUNCTION__, resourceFile.c_str(), result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): read() failed to read %s and returning error:0x%x \n", NEO_FUNCTION_NAME, resourceFile.c_str(), result);
         return result;
     }
     for (uint32_t i = 0; i <= maxPciBars; i++) {
@@ -111,49 +128,46 @@ ze_result_t LinuxPciImp::initializeBarProperties(std::vector<zes_pci_bar_propert
         }
     }
     if (pBarProperties.size() == 0) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): BarProperties = %d and returning error:0x%x \n", __FUNCTION__, pBarProperties.size(), result);
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): BarProperties = %d and returning error:0x%x \n", NEO_FUNCTION_NAME, pBarProperties.size(), result);
         result = ZE_RESULT_ERROR_UNKNOWN;
     }
     return result;
 }
 
-uint32_t LinuxPciImp::getRebarCapabilityPos() {
+uint32_t LinuxPciImp::getRebarCapabilityPos(uint8_t *configMemory, bool isVfBar) {
     uint32_t pos = PCI_CFG_SPACE_SIZE;
     uint32_t header = 0;
-
-    if (!configMemory) {
-        return 0;
-    }
 
     // Minimum 8 bytes per capability. Hence maximum capabilities that
     // could be present in PCI extended configuration space are
     // represented by loopCount.
     auto loopCount = (PCI_CFG_SPACE_EXP_SIZE - PCI_CFG_SPACE_SIZE) / 8;
-    header = getDwordFromConfig(pos);
+    header = L0::PciUtil::getDwordFromConfig(pos, configMemory);
     if (!header) {
         return 0;
     }
 
+    uint32_t capId = isVfBar ? PCI_EXT_CAP_ID_VF_REBAR : PCI_EXT_CAP_ID_REBAR;
+
     while (loopCount-- > 0) {
-        if (PCI_EXT_CAP_ID(header) == PCI_EXT_CAP_ID_REBAR) {
+        if (PCI_EXT_CAP_ID(header) == capId) {
             return pos;
         }
         pos = PCI_EXT_CAP_NEXT(header);
         if (pos < PCI_CFG_SPACE_SIZE) {
             return 0;
         }
-        header = getDwordFromConfig(pos);
+        header = L0::PciUtil::getDwordFromConfig(pos, configMemory);
     }
     return 0;
 }
 
-uint16_t LinuxPciImp::getLinkCapabilityPos() {
+uint16_t LinuxPciImp::getLinkCapabilityPos(uint8_t *configMem) {
     uint16_t pos = PCI_CAPABILITY_LIST;
     uint8_t id, type = 0;
     uint16_t capRegister = 0;
-    uint8_t *configMem = isLmemSupported ? uspConfigMemory.get() : configMemory.get();
 
-    if ((!configMem) || (!(getByteFromConfig(PCI_STATUS, configMem) & PCI_STATUS_CAP_LIST))) {
+    if (!(L0::PciUtil::getByteFromConfig(PCI_STATUS, configMem) & PCI_STATUS_CAP_LIST)) {
         return 0;
     }
 
@@ -162,24 +176,25 @@ uint16_t LinuxPciImp::getLinkCapabilityPos() {
     // represented by loopCount.
     auto loopCount = (PCI_CFG_SPACE_SIZE) / 8;
 
-    /* Bottom two bits of capability pointer register are reserved and
-     * software should mask these bits to get pointer to capability list.
-     */
-    pos = getByteFromConfig(pos, configMem) & 0xfc;
+    // Bottom two bits of capability pointer register are reserved and
+    // software should mask these bits to get pointer to capability list.
+
+    pos = L0::PciUtil::getByteFromConfig(pos, configMem) & 0xfc;
     while (loopCount-- > 0) {
-        id = getByteFromConfig(pos + PCI_CAP_LIST_ID, configMem);
+        id = L0::PciUtil::getByteFromConfig(pos + PCI_CAP_LIST_ID, configMem);
         if (id == PCI_CAP_ID_EXP) {
-            capRegister = getWordFromConfig(pos + PCI_CAP_FLAGS, configMem);
-            type = BITS(capRegister, 4, 4);
-            /* Root Complex Integrated end point and
-             * Root Complex Event collector will not implement link capabilities
-             */
+            capRegister = L0::PciUtil::getWordFromConfig(pos + PCI_CAP_FLAGS, configMem);
+            type = bits(capRegister, 4, 4);
+
+            // Root Complex Integrated end point and
+            // Root Complex Event collector will not implement link capabilities
+
             if ((type != PCI_EXP_TYPE_RC_END) && (type != PCI_EXP_TYPE_RC_EC)) {
                 return pos + PCI_EXP_LNKCAP;
             }
         }
 
-        pos = getByteFromConfig(pos + PCI_CAP_LIST_NEXT, configMem) & 0xfc;
+        pos = L0::PciUtil::getByteFromConfig(pos + PCI_CAP_LIST_NEXT, configMem) & 0xfc;
         if (!pos) {
             break;
         }
@@ -189,14 +204,30 @@ uint16_t LinuxPciImp::getLinkCapabilityPos() {
 
 // Parse PCIe configuration space to see if resizable Bar is supported
 bool LinuxPciImp::resizableBarSupported() {
-    return (getRebarCapabilityPos() > 0);
+    std::string pciConfigNode = {};
+    pSysfsAccess->getRealPath("device/config", pciConfigNode);
+    std::vector<uint8_t> configMemory(PCI_CFG_SPACE_EXP_SIZE);
+    if (!getPciConfigMemory(std::move(pciConfigNode), configMemory)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Unable to get pci config space \n", NEO_FUNCTION_NAME);
+        return false;
+    }
+    return (L0::LinuxPciImp::getRebarCapabilityPos(configMemory.data(), false) > 0);
 }
 
 bool LinuxPciImp::resizableBarEnabled(uint32_t barIndex) {
     bool isBarResizable = false;
     uint32_t capabilityRegister = 0, controlRegister = 0;
     uint32_t nBars = 1;
-    auto rebarCapabilityPos = getRebarCapabilityPos();
+
+    std::string pciConfigNode = {};
+    pSysfsAccess->getRealPath("device/config", pciConfigNode);
+    std::vector<uint8_t> configMemory(PCI_CFG_SPACE_EXP_SIZE);
+    if (!getPciConfigMemory(std::move(pciConfigNode), configMemory)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Unable to get pci config space \n", NEO_FUNCTION_NAME);
+        return false;
+    }
+
+    auto rebarCapabilityPos = L0::LinuxPciImp::getRebarCapabilityPos(configMemory.data(), false);
 
     // If resizable Bar is not supported then return false.
     if (!rebarCapabilityPos) {
@@ -221,12 +252,12 @@ bool LinuxPciImp::resizableBarEnabled(uint32_t barIndex) {
     // -------------------------------------------------------------|
 
     // Only first Control register(at offset 008h, as shown above), could tell about number of resizable Bars
-    controlRegister = getDwordFromConfig(rebarCapabilityPos + PCI_REBAR_CTRL);
-    nBars = BITS(controlRegister, 5, 3); // control register's bits 5,6 and 7 contain number of resizable bars information
+    controlRegister = L0::PciUtil::getDwordFromConfig(rebarCapabilityPos + PCI_REBAR_CTRL, configMemory.data());
+    nBars = bits(controlRegister, 5, 3); // control register's bits 5,6 and 7 contain number of resizable bars information
     for (auto barNumber = 0u; barNumber < nBars; barNumber++) {
         uint32_t barId = 0;
-        controlRegister = getDwordFromConfig(rebarCapabilityPos + PCI_REBAR_CTRL);
-        barId = BITS(controlRegister, 0, 3); // Control register's bit 0,1,2 tells the index of bar
+        controlRegister = L0::PciUtil::getDwordFromConfig(rebarCapabilityPos + PCI_REBAR_CTRL, configMemory.data());
+        barId = bits(controlRegister, 0, 3); // Control register's bit 0,1,2 tells the index of bar
         if (barId == barIndex) {
             isBarResizable = true;
             break;
@@ -238,59 +269,45 @@ bool LinuxPciImp::resizableBarEnabled(uint32_t barIndex) {
         return false;
     }
 
-    capabilityRegister = getDwordFromConfig(rebarCapabilityPos + PCI_REBAR_CAP);
+    capabilityRegister = L0::PciUtil::getDwordFromConfig(rebarCapabilityPos + PCI_REBAR_CAP, configMemory.data());
     // Capability register's bit 4 to 31 indicates supported Bar sizes.
     // In possibleBarSizes, position of each set bit indicates supported bar size. Example,  if set bit
     // position of possibleBarSizes is from 0 to n, then this indicates BAR size from 2^0 MB to 2^n MB
     auto possibleBarSizes = (capabilityRegister & PCI_REBAR_CAP_SIZES) >> 4; // First 4 bits are reserved
     uint32_t largestPossibleBarSize = 0;
-    while (possibleBarSizes >>= 1) { // most significant set bit position of possibleBarSizes would tell larget possible bar size
+    while (possibleBarSizes >>= 1) { // most significant set bit position of possibleBarSizes would tell largest possible bar size
         largestPossibleBarSize++;
     }
 
     // Control register's bit 8 to 13 indicates current BAR size in encoded form.
     // Example, real value of current size could be 2^currentSize MB
-    auto currentSize = BITS(controlRegister, 8, 6);
+    auto currentSize = bits(controlRegister, 8, 6);
 
-    // If current size is equal to larget possible BAR size, it indicates resizable BAR is enabled.
+    // If current size is equal to largest possible BAR size, it indicates resizable BAR is enabled.
     return (currentSize == largestPossibleBarSize);
 }
 
 ze_result_t LinuxPciImp::getState(zes_pci_state_t *state) {
-    NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s() returning UNSUPPORTED_FEATURE \n", __FUNCTION__);
+    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s() returning UNSUPPORTED_FEATURE \n", NEO_FUNCTION_NAME);
     return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 }
 
-void LinuxPciImp::pciExtendedConfigRead() {
-    std::string pciConfigNode;
-    pSysfsAccess->getRealPath("device/config", pciConfigNode);
-
-    int fdConfig = -1;
-    fdConfig = this->openFunction(pciConfigNode.c_str(), O_RDONLY);
-    if (fdConfig < 0) {
-        return;
+bool LinuxPciImp::getPciConfigMemory(std::string pciPath, std::vector<uint8_t> &configMem) {
+    if (!pSysfsAccess->isRootUser()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Need to be root to read config space \n", NEO_FUNCTION_NAME);
+        return false;
     }
-    configMemory = std::make_unique<uint8_t[]>(PCI_CFG_SPACE_EXP_SIZE);
-    memset(configMemory.get(), 0, PCI_CFG_SPACE_EXP_SIZE);
-    this->preadFunction(fdConfig, configMemory.get(), PCI_CFG_SPACE_EXP_SIZE, 0);
-    this->closeFunction(fdConfig);
-}
 
-void LinuxPciImp::pciCardBusConfigRead() {
-    std::string pciConfigNode;
-    std::string rootPortPath;
-    pSysfsAccess->getRealPath(deviceDir, pciConfigNode);
-    rootPortPath = pLinuxSysmanImp->getPciCardBusDirectoryPath(pciConfigNode);
-    pciConfigNode = rootPortPath + "/config";
-    int fdConfig = -1;
-    fdConfig = this->openFunction(pciConfigNode.c_str(), O_RDONLY);
-    if (fdConfig < 0) {
-        return;
+    auto fd = NEO::FileDescriptor(pciPath.c_str(), O_RDONLY);
+    if (fd < 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s() Config File Open Failed \n", NEO_FUNCTION_NAME);
+        return false;
     }
-    uspConfigMemory = std::make_unique<uint8_t[]>(PCI_CFG_SPACE_SIZE);
-    memset(uspConfigMemory.get(), 0, PCI_CFG_SPACE_SIZE);
-    this->preadFunction(fdConfig, uspConfigMemory.get(), PCI_CFG_SPACE_SIZE, 0);
-    this->closeFunction(fdConfig);
+    if (this->preadFunction(fd, configMem.data(), configMem.size(), 0) < 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s() Config Mem Read Failed \n", NEO_FUNCTION_NAME);
+        return false;
+    }
+    return true;
 }
 
 LinuxPciImp::LinuxPciImp(OsSysman *pOsSysman) {
@@ -298,10 +315,6 @@ LinuxPciImp::LinuxPciImp(OsSysman *pOsSysman) {
     pSysfsAccess = &pLinuxSysmanImp->getSysfsAccess();
     Device *pDevice = pLinuxSysmanImp->getDeviceHandle();
     isLmemSupported = pDevice->getDriverHandle()->getMemoryManager()->isLocalMemorySupported(pDevice->getRootDeviceIndex());
-    if (pSysfsAccess->isRootUser()) {
-        pciExtendedConfigRead();
-        pciCardBusConfigRead();
-    }
 }
 
 OsPci *OsPci::create(OsSysman *pOsSysman) {

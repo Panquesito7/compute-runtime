@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,11 @@
 
 #pragma once
 
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/timestamp_packet.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/mocks/mock_timestamp_packet.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/mocks/mock_device.h"
 
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
@@ -18,15 +19,19 @@
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
 
+#include "gtest/gtest.h"
+
+#include <memory>
+
 using namespace NEO;
 
 struct TimestampPacketTests : public ::testing::Test {
-    struct MockTagNode : public TagNode<TimestampPackets<uint32_t>> {
-        using TagNode<TimestampPackets<uint32_t>>::gpuAddress;
+    struct MockTagNode : public TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> {
+        using TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>>::gpuAddress;
     };
 
     void SetUp() override {
-        DebugManager.flags.EnableTimestampPacket.set(1);
+        debugManager.flags.EnableTimestampPacket.set(1);
 
         executionEnvironment = platform()->peekExecutionEnvironment();
         executionEnvironment->prepareRootDeviceEnvironments(2);
@@ -34,9 +39,10 @@ struct TimestampPacketTests : public ::testing::Test {
             executionEnvironment->rootDeviceEnvironments[i]->setHwInfoAndInitHelpers(defaultHwInfo.get());
             executionEnvironment->rootDeviceEnvironments[i]->initGmm();
         }
+        executionEnvironment->calculateMaxOsContextCount();
         device = std::make_unique<MockClDevice>(Device::create<MockDevice>(executionEnvironment, 0u));
         context = new MockContext(device.get());
-        kernel = std::make_unique<MockKernelWithInternals>(*device, context);
+        kernel = std::make_unique<MockKernelWithInternals>(*context);
         mockCmdQ = new MockCommandQueue(context, device.get(), nullptr, false);
     }
 
@@ -45,16 +51,17 @@ struct TimestampPacketTests : public ::testing::Test {
         context->release();
     }
 
-    template <typename MI_SEMAPHORE_WAIT>
-    void verifySemaphore(MI_SEMAPHORE_WAIT *semaphoreCmd, TagNodeBase *timestampPacketNode, uint32_t packetId) {
+    template <typename FamilyType>
+    void verifySemaphore(typename FamilyType::MI_SEMAPHORE_WAIT *semaphoreCmd, TagNodeBase *timestampPacketNode, uint32_t packetId) {
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
         ASSERT_NE(nullptr, semaphoreCmd);
         EXPECT_EQ(semaphoreCmd->getCompareOperation(), MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD);
-        EXPECT_EQ(1u, semaphoreCmd->getSemaphoreDataDword());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
 
-        uint64_t compareOffset = packetId * TimestampPackets<uint32_t>::getSinglePacketSize();
+        uint64_t compareOffset = packetId * TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize();
         auto dataAddress = TimestampPacketHelper::getContextEndGpuAddress(*timestampPacketNode) + compareOffset;
 
-        EXPECT_EQ(dataAddress, semaphoreCmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(dataAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
     };
 
     template <typename FamilyType>
@@ -78,4 +85,23 @@ struct TimestampPacketTests : public ::testing::Test {
     std::unique_ptr<MockKernelWithInternals> kernel;
     MockCommandQueue *mockCmdQ;
     DebugManagerStateRestore restorer;
+};
+
+template <template <typename> class CsrType>
+struct TimestampPacketTestsWithMockCsrT : public TimestampPacketTests {
+    void SetUp() override {}
+    void TearDown() override {}
+
+    template <typename FamilyType>
+    void setUpT() {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<CsrType<FamilyType>>();
+
+        TimestampPacketTests::SetUp();
+    }
+
+    template <typename FamilyType>
+    void tearDownT() {
+        TimestampPacketTests::TearDown();
+    }
 };

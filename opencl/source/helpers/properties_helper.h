@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,6 +17,7 @@ namespace NEO {
 class MemObj;
 class Buffer;
 class GraphicsAllocation;
+class CommandStreamReceiver;
 
 struct EventsRequest {
     EventsRequest() = delete;
@@ -50,9 +51,10 @@ struct TransferProperties {
     cl_command_type cmdType = 0;
     cl_map_flags mapFlags = 0;
     uint32_t mipLevel = 0;
-    uint32_t mipPtrOffset = 0;
+    size_t mipPtrOffset = 0;
     bool blocking = false;
     bool doTransferOnCpu = false;
+    bool finishRequired = false;
 
     void *getCpuPtrForReadWrite();
 };

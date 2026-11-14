@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,38 +9,45 @@
 
 #include "shared/source/device_binary_format/elf/elf_decoder.h"
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
+#include "shared/source/device_binary_format/zebin/zeinfo.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/source/helpers/string.h"
 #include "shared/test/common/mocks/mock_elf.h"
 
 namespace ZebinTestData {
-using ELF_IDENTIFIER_CLASS = NEO::Elf::ELF_IDENTIFIER_CLASS;
+using ElfIdentifierClass = NEO::Elf::ElfIdentifierClass;
 
-template struct ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_32>;
-template struct ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_64>;
+template struct ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_32>;
+template struct ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_64>;
 
-template ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_32>::ValidEmptyProgram();
-template ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_64>::ValidEmptyProgram();
-template <ELF_IDENTIFIER_CLASS numBits>
-ValidEmptyProgram<numBits>::ValidEmptyProgram() {
+template ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_32>::ValidEmptyProgram();
+template ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_64>::ValidEmptyProgram();
+template ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_32>::ValidEmptyProgram(const std::string &zeInfo);
+template ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_64>::ValidEmptyProgram(const std::string &zeInfo);
+
+template <ElfIdentifierClass numBits>
+ValidEmptyProgram<numBits>::ValidEmptyProgram(const std::string &zeInfo) {
     NEO::Elf::ElfEncoder<numBits> enc;
     enc.getElfFileHeader().type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
     enc.getElfFileHeader().machine = productFamily;
-    auto zeInfo = std::string{"---\nversion : \'" + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + "\'" + "\nkernels : \n  - name : " + kernelName + "\n    execution_env : \n      simd_size  : 32\n      grf_count : 128\n...\n"};
     enc.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, zeInfo);
     enc.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "valid_empty_kernel", zeInfo);
     storage = enc.encode();
     recalcPtr();
 }
 
-template <ELF_IDENTIFIER_CLASS numBits>
+template <ElfIdentifierClass numBits>
+ValidEmptyProgram<numBits>::ValidEmptyProgram() : ValidEmptyProgram(std::string{"---\nversion : \'" + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + "\'" + defaultZeInfo}) {}
+
+template <ElfIdentifierClass numBits>
 void ValidEmptyProgram<numBits>::recalcPtr() {
     elfHeader = reinterpret_cast<NEO::Elf::ElfFileHeader<numBits> *>(storage.data());
 }
 
-template NEO::Elf::ElfSectionHeader<ELF_IDENTIFIER_CLASS::EI_CLASS_32> &ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_32>::appendSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel, const ArrayRef<const uint8_t> sectionData);
-template NEO::Elf::ElfSectionHeader<ELF_IDENTIFIER_CLASS::EI_CLASS_64> &ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_64>::appendSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel, const ArrayRef<const uint8_t> sectionData);
-template <ELF_IDENTIFIER_CLASS numBits>
+template NEO::Elf::ElfSectionHeader<ElfIdentifierClass::EI_CLASS_32> &ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_32>::appendSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel, const ArrayRef<const uint8_t> sectionData);
+template NEO::Elf::ElfSectionHeader<ElfIdentifierClass::EI_CLASS_64> &ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_64>::appendSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel, const ArrayRef<const uint8_t> sectionData);
+template <ElfIdentifierClass numBits>
 NEO::Elf::ElfSectionHeader<numBits> &ValidEmptyProgram<numBits>::appendSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel, const ArrayRef<const uint8_t> sectionData) {
     std::string err, warn;
     auto decoded = NEO::Elf::decodeElf<numBits>(storage, err, warn);
@@ -78,9 +85,9 @@ NEO::Elf::ElfSectionHeader<numBits> &ValidEmptyProgram<numBits>::appendSection(u
     UNREACHABLE();
 }
 
-template void ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_32>::removeSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel);
-template void ValidEmptyProgram<ELF_IDENTIFIER_CLASS::EI_CLASS_64>::removeSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel);
-template <ELF_IDENTIFIER_CLASS numBits>
+template void ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_32>::removeSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel);
+template void ValidEmptyProgram<ElfIdentifierClass::EI_CLASS_64>::removeSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel);
+template <ElfIdentifierClass numBits>
 void ValidEmptyProgram<numBits>::removeSection(uint32_t sectionType, NEO::ConstStringRef sectionLabel) {
     std::string err, warn;
     auto decoded = NEO::Elf::decodeElf<numBits>(storage, err, warn);
@@ -132,13 +139,13 @@ ZebinWithExternalFunctionsInfo::ZebinWithExternalFunctionsInfo() {
 
     NEO::Elf::ElfSymbolEntry<NEO::Elf::EI_CLASS_64> symbols[2];
     symbols[0].name = decltype(symbols[0].name)(elfEncoder.appendSectionName(fun0Name));
-    symbols[0].info = NEO::Elf::SYMBOL_TABLE_TYPE::STT_FUNC | NEO::Elf::SYMBOL_TABLE_BIND::STB_GLOBAL << 4;
+    symbols[0].info = NEO::Elf::SymbolTableType::STT_FUNC | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
     symbols[0].shndx = decltype(symbols[0].shndx)(externalFunctionsIdx);
     symbols[0].size = 16;
     symbols[0].value = 0;
 
     symbols[1].name = decltype(symbols[1].name)(elfEncoder.appendSectionName(fun1Name));
-    symbols[1].info = NEO::Elf::SYMBOL_TABLE_TYPE::STT_FUNC | NEO::Elf::SYMBOL_TABLE_BIND::STB_GLOBAL << 4;
+    symbols[1].info = NEO::Elf::SymbolTableType::STT_FUNC | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
     symbols[1].shndx = decltype(symbols[1].shndx)(externalFunctionsIdx);
     symbols[1].size = 16;
     symbols[1].value = 16;
@@ -147,7 +154,7 @@ ZebinWithExternalFunctionsInfo::ZebinWithExternalFunctionsInfo() {
 
     NEO::Elf::ElfRel<NEO::Elf::EI_CLASS_64> extFuncSegReloc = {}; // fun0 calls fun1
     extFuncSegReloc.offset = 0x8;
-    extFuncSegReloc.info = (uint64_t(1) << 32) | NEO::Zebin::Elf::RELOC_TYPE_ZEBIN::R_ZE_SYM_ADDR;
+    extFuncSegReloc.info = (uint64_t(1) << 32) | NEO::Zebin::Elf::RelocTypeZebin::R_ZE_SYM_ADDR;
     auto &extFuncRelSection = elfEncoder.appendSection(NEO::Elf::SHT_REL, NEO::Elf::SpecialSectionNames::relPrefix.str() + NEO::Zebin::Elf::SectionNames::textPrefix.str() + NEO::Zebin::Elf::SectionNames::externalFunctions.str(),
                                                        {reinterpret_cast<uint8_t *>(&extFuncSegReloc), sizeof(extFuncSegReloc)});
     extFuncRelSection.info = externalFunctionsIdx;
@@ -155,7 +162,7 @@ ZebinWithExternalFunctionsInfo::ZebinWithExternalFunctionsInfo() {
     NEO::Elf::ElfRel<NEO::Elf::EI_CLASS_64>
         kernelSegReloc = {}; // kernel calls fun0
     kernelSegReloc.offset = 0x8;
-    kernelSegReloc.info = (uint64_t(0) << 32) | NEO::Zebin::Elf::RELOC_TYPE_ZEBIN::R_ZE_SYM_ADDR;
+    kernelSegReloc.info = (uint64_t(0) << 32) | NEO::Zebin::Elf::RelocTypeZebin::R_ZE_SYM_ADDR;
     auto &kernelRelSection = elfEncoder.appendSection(NEO::Elf::SHT_REL, NEO::Elf::SpecialSectionNames::relPrefix.str() + NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel",
                                                       {reinterpret_cast<uint8_t *>(&kernelSegReloc), sizeof(kernelSegReloc)});
     kernelRelSection.info = kernelSectionIdx;
@@ -181,14 +188,17 @@ NEO::Elf::Elf<NEO::Elf::EI_CLASS_64> ZebinWithExternalFunctionsInfo::getElf() {
     return elf;
 }
 
-ZebinWithL0TestCommonModule::ZebinWithL0TestCommonModule(const NEO::HardwareInfo &hwInfo, std::initializer_list<appendElfAdditionalSection> additionalSections, bool forceRecompilation) {
+ZebinWithL0TestCommonModule::ZebinWithL0TestCommonModule(const NEO::HardwareInfo &hwInfo, std::initializer_list<AppendElfAdditionalSection> additionalSections, bool forceRecompilation) {
     MockElfEncoder<> elfEncoder;
     auto &elfHeader = elfEncoder.getElfFileHeader();
     elfHeader.type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
     if (forceRecompilation) {
         elfHeader.machine = NEO::Elf::EM_NONE;
     } else {
-        elfHeader.machine = hwInfo.platform.eProductFamily;
+        auto compilerProductHelper = NEO::CompilerProductHelper::create(hwInfo.platform.eProductFamily);
+        auto copyHwInfo = hwInfo;
+        compilerProductHelper->adjustHwInfoForIgc(copyHwInfo);
+        elfHeader.machine = copyHwInfo.platform.eProductFamily;
     }
 
     const uint8_t testKernelData[0xac0] = {0u};
@@ -201,16 +211,19 @@ ZebinWithL0TestCommonModule::ZebinWithL0TestCommonModule(const NEO::HardwareInfo
     const uint8_t testAdditionalSectionsData[0x10] = {0u};
     for (const auto &s : additionalSections) {
         switch (s) {
-        case appendElfAdditionalSection::SPIRV:
+        case AppendElfAdditionalSection::spirv:
             elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, testAdditionalSectionsData);
             break;
-        case appendElfAdditionalSection::GLOBAL:
+        case AppendElfAdditionalSection::pisa:
+            elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_PISA, NEO::Zebin::Elf::SectionNames::pisa, testAdditionalSectionsData);
+            break;
+        case AppendElfAdditionalSection::global:
             elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataGlobal, testAdditionalSectionsData);
             break;
-        case appendElfAdditionalSection::CONSTANT:
+        case AppendElfAdditionalSection::constant:
             elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataConst, testAdditionalSectionsData);
             break;
-        case appendElfAdditionalSection::CONSTANT_STRING:
+        case AppendElfAdditionalSection::constantString:
             elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataConstString.str(), testAdditionalSectionsData);
             break;
         default:
@@ -225,20 +238,74 @@ void ZebinWithL0TestCommonModule::recalcPtr() {
     elfHeader = reinterpret_cast<NEO::Elf::ElfFileHeader<NEO::Elf::EI_CLASS_64> *>(storage.data());
 }
 
-template ZebinCopyBufferSimdModule<ELF_IDENTIFIER_CLASS::EI_CLASS_32>::ZebinCopyBufferSimdModule(const NEO::HardwareInfo &hwInfo, uint8_t simdSize);
-template ZebinCopyBufferSimdModule<ELF_IDENTIFIER_CLASS::EI_CLASS_64>::ZebinCopyBufferSimdModule(const NEO::HardwareInfo &hwInfo, uint8_t simdSize);
+template ZebinCopyImageModule<ElfIdentifierClass::EI_CLASS_32>::ZebinCopyImageModule(const NEO::HardwareInfo &hwInfo);
+template ZebinCopyImageModule<ElfIdentifierClass::EI_CLASS_64>::ZebinCopyImageModule(const NEO::HardwareInfo &hwInfo);
 
-template <ELF_IDENTIFIER_CLASS numBits>
-ZebinCopyBufferSimdModule<numBits>::ZebinCopyBufferSimdModule(const NEO::HardwareInfo &hwInfo, uint8_t simdSize) {
-    zeInfoSize = static_cast<size_t>(snprintf(nullptr, 0, zeInfoCopyBufferSimdPlaceholder.c_str(), simdSize, simdSize, getLocalIdSize(hwInfo, simdSize)) + 1);
+template <ElfIdentifierClass numBits>
+ZebinCopyImageModule<numBits>::ZebinCopyImageModule(const NEO::HardwareInfo &hwInfo) {
+    MockElfEncoder<numBits> elfEncoder;
+    auto &elfHeader = elfEncoder.getElfFileHeader();
+    elfHeader.type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
+
+    auto compilerProductHelper = NEO::CompilerProductHelper::create(hwInfo.platform.eProductFamily);
+    auto copyHwInfo = hwInfo;
+    compilerProductHelper->adjustHwInfoForIgc(copyHwInfo);
+
+    elfHeader.machine = copyHwInfo.platform.eProductFamily;
+
+    const uint8_t testKernel1Data[0xac0] = {0u};
+    const uint8_t testKernel2Data[0xac0] = {0u};
+    const uint8_t testKernel3Data[0xac0] = {0u};
+    const uint8_t testKernel4Data[0xac0] = {0u};
+
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "CopyImage3dToImage3d", testKernel1Data);
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "CopyImage1dBufferToImage3d", testKernel2Data);
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "CopyImage3dToImage1dBuffer", testKernel3Data);
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "CopyImage1dBufferToImage1dBuffer", testKernel4Data);
+    elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, zeInfoCopyImage);
+
+    storage = elfEncoder.encode();
+    this->elfHeader = reinterpret_cast<NEO::Elf::ElfFileHeader<numBits> *>(storage.data());
+}
+
+template ZebinCopyBufferModule<ElfIdentifierClass::EI_CLASS_32>::ZebinCopyBufferModule(const NEO::HardwareInfo &hwInfo, Descriptor desc);
+template ZebinCopyBufferModule<ElfIdentifierClass::EI_CLASS_64>::ZebinCopyBufferModule(const NEO::HardwareInfo &hwInfo, Descriptor desc);
+
+template <ElfIdentifierClass numBits>
+ZebinCopyBufferModule<numBits>::ZebinCopyBufferModule(const NEO::HardwareInfo &hwInfo, Descriptor desc) {
+    using namespace NEO::Zebin::ZeInfo::Tags::Kernel;
+    const char *addrmode = desc.isStateless ? "stateless" : "stateful";
+
+    if (!desc.isStateless) {
+        std::stringstream os;
+        os << "    binding_table_indices:\n";
+        if (!desc.bindingTableIndices.empty()) {
+            for (const auto &bti : desc.bindingTableIndices) {
+                os << "      - bti_value: " << std::to_string(bti.btiValue) << '\n';
+                os << "        arg_index: " << std::to_string(bti.argIndex) << '\n';
+            }
+        }
+        zeInfoCopyBufferSimdPlaceholder += os.str();
+    }
+
+    const std::string userAttributesStr = desc.userAttributes.toZeInfoYaml();
+    const std::string execEnvStr = desc.execEnv.toZeInfoYaml();
+
+    zeInfoSize = static_cast<size_t>(snprintf(nullptr, 0, zeInfoCopyBufferSimdPlaceholder.c_str(), userAttributesStr.c_str(), execEnvStr.c_str(), addrmode, addrmode));
     zeInfoCopyBuffer.resize(zeInfoSize);
-    snprintf(zeInfoCopyBuffer.data(), zeInfoSize, zeInfoCopyBufferSimdPlaceholder.c_str(), simdSize, simdSize, getLocalIdSize(hwInfo, simdSize));
+    snprintf(zeInfoCopyBuffer.data(), zeInfoSize, zeInfoCopyBufferSimdPlaceholder.c_str(), userAttributesStr.c_str(), execEnvStr.c_str(), addrmode, addrmode);
 
     MockElfEncoder<numBits> elfEncoder;
     auto &elfHeader = elfEncoder.getElfFileHeader();
     elfHeader.type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
 
-    elfHeader.machine = hwInfo.platform.eProductFamily;
+    auto compilerProductHelper = NEO::CompilerProductHelper::create(hwInfo.platform.eProductFamily);
+    auto copyHwInfo = hwInfo;
+    compilerProductHelper->adjustHwInfoForIgc(copyHwInfo);
+
+    elfHeader.machine = copyHwInfo.platform.eProductFamily;
+    auto &flags = reinterpret_cast<NEO::Zebin::Elf::ZebinTargetFlags &>(elfHeader.flags);
+    flags.generatorId = 1u;
 
     const uint8_t testKernelData[0x2c0] = {0u};
 
@@ -266,13 +333,13 @@ size_t writeElfNote(ArrayRef<uint8_t> dst, ArrayRef<const uint8_t> desc, NEO::Co
 }
 
 size_t writeIntelGTNote(ArrayRef<uint8_t> dst, NEO::Zebin::Elf::IntelGTSectionType sectionType, ArrayRef<const uint8_t> desc) {
-    return writeElfNote(dst, desc, NEO::Zebin::Elf::IntelGTNoteOwnerName, static_cast<uint32_t>(sectionType));
+    return writeElfNote(dst, desc, NEO::Zebin::Elf::intelGTNoteOwnerName, static_cast<uint32_t>(sectionType));
 }
 
 size_t writeIntelGTVersionNote(ArrayRef<uint8_t> dst, NEO::ConstStringRef version) {
     std::vector<uint8_t> desc(version.length() + 1U, 0U);
-    std::memcpy(desc.data(), version.begin(), version.length());
-    return writeIntelGTNote(dst, NEO::Zebin::Elf::ZebinVersion, {desc.data(), desc.size()});
+    memcpy_s(desc.data(), desc.size(), version.begin(), version.length());
+    return writeIntelGTNote(dst, NEO::Zebin::Elf::zebinVersion, {desc.data(), desc.size()});
 }
 
 std::vector<uint8_t> createIntelGTNoteSection(NEO::ConstStringRef version, AOT::PRODUCT_CONFIG productConfig) {
@@ -282,7 +349,7 @@ std::vector<uint8_t> createIntelGTNoteSection(NEO::ConstStringRef version, AOT::
     noteOffset += writeIntelGTVersionNote(ArrayRef<uint8_t>(ptrOffset(intelGTNotesSection.data(), noteOffset), intelGTNotesSection.size() - noteOffset), version);
 
     writeIntelGTNote(ArrayRef<uint8_t>(ptrOffset(intelGTNotesSection.data(), noteOffset), intelGTNotesSection.size() - noteOffset),
-                     NEO::Zebin::Elf::IntelGTSectionType::ProductConfig,
+                     NEO::Zebin::Elf::IntelGTSectionType::productConfig,
                      ArrayRef<const uint8_t>::fromAny(&productConfig, 1U));
     return intelGTNotesSection;
 }
@@ -292,15 +359,15 @@ std::vector<uint8_t> createIntelGTNoteSection(PRODUCT_FAMILY productFamily, GFXC
     std::vector<uint8_t> intelGTNotes(noteSectionSize, 0);
     size_t noteOffset = 0U;
     noteOffset += writeIntelGTNote(ArrayRef<uint8_t>(ptrOffset(intelGTNotes.data(), noteOffset), intelGTNotes.size() - noteOffset),
-                                   NEO::Zebin::Elf::ProductFamily,
+                                   NEO::Zebin::Elf::productFamily,
                                    ArrayRef<const uint8_t>::fromAny(&productFamily, 1U));
 
     noteOffset += writeIntelGTNote(ArrayRef<uint8_t>(ptrOffset(intelGTNotes.data(), noteOffset), intelGTNotes.size() - noteOffset),
-                                   NEO::Zebin::Elf::GfxCore,
+                                   NEO::Zebin::Elf::gfxCore,
                                    ArrayRef<const uint8_t>::fromAny(&coreFamily, 1U));
 
     noteOffset += writeIntelGTNote(ArrayRef<uint8_t>(ptrOffset(intelGTNotes.data(), noteOffset), intelGTNotes.size() - noteOffset),
-                                   NEO::Zebin::Elf::TargetMetadata,
+                                   NEO::Zebin::Elf::targetMetadata,
                                    ArrayRef<const uint8_t>::fromAny(&flags.packed, 1U));
 
     writeIntelGTVersionNote(ArrayRef<uint8_t>(ptrOffset(intelGTNotes.data(), noteOffset), intelGTNotes.size() - noteOffset),

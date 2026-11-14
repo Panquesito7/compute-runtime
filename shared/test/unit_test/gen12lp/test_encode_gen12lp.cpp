@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -23,15 +23,28 @@ GEN12LPTEST_F(CommandEncodeGen12LpTest, whenProgrammingStateComputeModeThenPrope
     auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
     StateComputeModeProperties properties;
     auto pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment, nullptr);
+    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment);
     auto pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
     EXPECT_EQ(FamilyType::stateComputeModeForceNonCoherentMask, pScm->getMaskBits());
     EXPECT_EQ(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_GPU_NON_COHERENT, pScm->getForceNonCoherent());
+}
 
-    properties.isCoherencyRequired.value = 1;
-    pLinearStream = std::make_unique<LinearStream>(buffer, sizeof(buffer));
-    EncodeComputeMode<FamilyType>::programComputeModeCommand(*pLinearStream, properties, rootDeviceEnvironment, nullptr);
-    pScm = reinterpret_cast<STATE_COMPUTE_MODE *>(pLinearStream->getCpuBase());
-    EXPECT_EQ(FamilyType::stateComputeModeForceNonCoherentMask, pScm->getMaskBits());
-    EXPECT_EQ(STATE_COMPUTE_MODE::FORCE_NON_COHERENT_FORCE_DISABLED, pScm->getForceNonCoherent());
+GEN12LPTEST_F(CommandEncodeGen12LpTest, givenEncodeDataInMemoryWhenProgrammingFeCmdThenTakeNoAction) {
+    constexpr size_t bufferSize = 256;
+    alignas(8) uint8_t buffer[bufferSize] = {0x0};
+    void *bufferPtr = buffer;
+    alignas(8) uint8_t zeroBuffer[bufferSize] = {0x0};
+    LinearStream cmdStream(buffer, bufferSize);
+
+    MockExecutionEnvironment executionEnvironment{};
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
+    StreamProperties properties;
+
+    uint64_t dstGpuAddress = 0x1000;
+
+    EncodeDataMemory<FamilyType>::programFrontEndState(bufferPtr, dstGpuAddress, rootDeviceEnvironment, 0x0, 0x0, 0x40, properties);
+    EXPECT_EQ(0, memcmp(buffer, zeroBuffer, bufferSize));
+
+    EncodeDataMemory<FamilyType>::programFrontEndState(cmdStream, dstGpuAddress, rootDeviceEnvironment, 0x0, 0x0, 0x40, properties);
+    EXPECT_EQ(0u, cmdStream.getUsed());
 }

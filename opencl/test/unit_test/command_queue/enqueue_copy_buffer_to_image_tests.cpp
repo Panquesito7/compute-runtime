@@ -1,35 +1,31 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_builtins.h"
 #include "shared/test/common/mocks/mock_gmm_resource_info.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
 
 #include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/test/unit_test/command_queue/enqueue_copy_buffer_to_image_fixture.h"
 #include "opencl/test/unit_test/fixtures/one_mip_level_image_fixture.h"
 #include "opencl/test/unit_test/gen_common/gen_commands_common_validation.h"
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
+#include "opencl/test/unit_test/mocks/mock_builder.h"
 #include "opencl/test/unit_test/mocks/mock_builtin_dispatch_info_builder.h"
-#include "opencl/test/unit_test/mocks/mock_cl_execution_environment.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
-
-#include "reg_configs_common.h"
-
-#include <algorithm>
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 
 using namespace NEO;
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenGpgpuWalkerIsCorrect) {
+HWTEST2_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenGpgpuWalkerIsCorrect, IsGen12LP) {
     typedef typename FamilyType::GPGPU_WALKER GPGPU_WALKER;
     enqueueCopyBufferToImage<FamilyType>();
 
@@ -69,7 +65,12 @@ HWTEST_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenTaskCountIsAl
 
     EnqueueCopyBufferToImageHelper<>::enqueueCopyBufferToImage(pCmdQ, srcBuffer, dstImage);
     EXPECT_EQ(csr.peekTaskCount(), pCmdQ->taskCount);
-    EXPECT_EQ(csr.peekTaskLevel(), pCmdQ->taskLevel + 1);
+
+    auto cmdQTaskLevel = pCmdQ->taskLevel;
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        cmdQTaskLevel++;
+    }
+    EXPECT_EQ(csr.peekTaskLevel(), cmdQTaskLevel);
 }
 
 HWTEST_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenTaskLevelIsIncremented) {
@@ -102,7 +103,7 @@ HWTEST_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenL3Programming
     validateL3Programming<FamilyType>(cmdList, itorWalker);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed) {
+HWTEST2_F(EnqueueCopyBufferToImageTest, WhenEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed, IsGen12LP) {
     enqueueCopyBufferToImage<FamilyType>();
     auto &ultCsr = this->pDevice->getUltCommandStreamReceiver<FamilyType>();
 
@@ -113,7 +114,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenEnqueueIsDoneThenS
                                          pDSH, pIOH, pSSH, itorPipelineSelect, itorWalker, cmdList, 0llu);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenMediaInterfaceDescriptorLoadIsCorrect) {
+HWTEST2_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenMediaInterfaceDescriptorLoadIsCorrect, IsGen12LP) {
     typedef typename FamilyType::MEDIA_INTERFACE_DESCRIPTOR_LOAD MEDIA_INTERFACE_DESCRIPTOR_LOAD;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -136,10 +137,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToIma
     EXPECT_EQ(0u, cmd->getInterfaceDescriptorTotalLength() % alignmentTotalLength);
 
     // Generically validate this command
-    FamilyType::PARSE::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorMediaInterfaceDescriptorLoad);
+    FamilyType::Parse::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorMediaInterfaceDescriptorLoad);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenInterfaceDescriptorDataIsCorrect) {
+HWTEST2_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenInterfaceDescriptorDataIsCorrect, IsGen12LP) {
     typedef typename FamilyType::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -150,7 +151,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToIma
     auto &interfaceDescriptorData = *(INTERFACE_DESCRIPTOR_DATA *)cmdInterfaceDescriptorData;
 
     // Validate the kernel start pointer.  Technically, a kernel can start at address 0 but let's force a value.
-    auto kernelStartPointer = ((uint64_t)interfaceDescriptorData.getKernelStartPointerHigh() << 32) + interfaceDescriptorData.getKernelStartPointer();
+    auto kernelStartPointer = interfaceDescriptorData.getKernelStartPointer();
     EXPECT_LE(kernelStartPointer, cmdSBA->getInstructionBufferSize() * MemoryConstants::pageSize);
 
     size_t maxLocalSize = 256u;
@@ -167,17 +168,16 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToIma
 }
 
 HWTEST_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenSurfaceStateIsCorrect) {
-    typedef typename FamilyType::RENDER_SURFACE_STATE RENDER_SURFACE_STATE;
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
 
     auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
     VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
     mockCmdQ->storeMultiDispatchInfo = true;
+
     enqueueCopyBufferToImage<FamilyType>();
 
-    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
-    uint32_t index = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(1).template as<ArgDescImage>().bindful) / sizeof(RENDER_SURFACE_STATE);
+    const auto surfaceState = SurfaceStateAccessor::getSurfaceState<FamilyType, RENDER_SURFACE_STATE>(mockCmdQ, 1);
 
-    const auto surfaceState = getSurfaceState<FamilyType>(&pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), index);
     const auto &imageDesc = dstImage->getImageDesc();
     // EnqueueReadImage uses multi-byte copies depending on per-pixel-size-in-bytes
     EXPECT_EQ(imageDesc.image_width, surfaceState->getWidth());
@@ -193,111 +193,115 @@ HWTEST_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenSurfaceStateI
         surfaceFormat == RENDER_SURFACE_STATE::SURFACE_FORMAT_R8_UINT;
     EXPECT_TRUE(isRedescribedFormat);
     EXPECT_EQ(MockGmmResourceInfo::getHAlignSurfaceStateResult, surfaceState->getSurfaceHorizontalAlignment());
-    EXPECT_EQ(RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4, surfaceState->getSurfaceVerticalAlignment());
+    EXPECT_EQ(static_cast<uint32_t>(FamilyType::RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4), static_cast<uint32_t>(surfaceState->getSurfaceVerticalAlignment()));
     EXPECT_EQ(dstImage->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), surfaceState->getSurfaceBaseAddress());
 }
 
-HWTEST2_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenNumberOfPipelineSelectsIsOne, IsAtMostXeHpcCore) {
+HWTEST2_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenNumberOfPipelineSelectsIsOne, IsAtMostXeCore) {
     enqueueCopyBufferToImage<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenMediaVfeStateIsSetCorrectly) {
+HWTEST2_F(EnqueueCopyBufferToImageTest, WhenCopyingBufferToImageThenMediaVfeStateIsSetCorrectly, IsGen12LP) {
     enqueueCopyBufferToImage<FamilyType>();
     validateMediaVFEState<FamilyType>(&pDevice->getHardwareInfo(), cmdMediaVfeState, cmdList, itorMediaVfeState);
 }
 
 typedef EnqueueCopyBufferToImageMipMapTest MipMapCopyBufferToImageTest;
 
-HWTEST_P(MipMapCopyBufferToImageTest, GivenImageWithMipLevelNonZeroWhenCopyBufferToImageIsCalledThenProperMipLevelIsSet) {
-    auto imageType = (cl_mem_object_type)GetParam();
-    auto builtIns = new MockBuiltins();
-    pCmdQ->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[pCmdQ->getDevice().getRootDeviceIndex()]->builtins.reset(builtIns);
-    auto &origBuilder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(
-        EBuiltInOps::CopyBufferToImage3d,
-        pCmdQ->getClDevice());
+HWTEST_F(MipMapCopyBufferToImageTest, GivenImageWithMipLevelNonZeroWhenCopyBufferToImageIsCalledThenProperMipLevelIsSet) {
+    const cl_mem_object_type imageTypes[] = {CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY,
+                                             CL_MEM_OBJECT_IMAGE2D, CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                                             CL_MEM_OBJECT_IMAGE3D};
+    for (auto imageType : imageTypes) {
+        auto builtIns = new MockBuiltins();
 
-    // substitute original builder with mock builder
-    auto oldBuilder = pClExecutionEnvironment->setBuiltinDispatchInfoBuilder(
-        rootDeviceIndex,
-        EBuiltInOps::CopyBufferToImage3d,
-        std::unique_ptr<NEO::BuiltinDispatchInfoBuilder>(new MockBuiltinDispatchInfoBuilder(*builtIns, pCmdQ->getClDevice(), &origBuilder)));
+        auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+        bool isStateless = compilerProductHelper.isForceToStatelessRequired();
+        auto builtInMode = getBuiltinMode(isStateless);
 
-    cl_int retVal = CL_SUCCESS;
-    cl_image_desc imageDesc = {};
-    uint32_t expectedMipLevel = 3;
-    imageDesc.image_type = imageType;
-    imageDesc.num_mip_levels = 10;
-    imageDesc.image_width = 4;
-    imageDesc.image_height = 1;
-    imageDesc.image_depth = 1;
-    size_t origin[] = {0, 0, 0, 0};
-    size_t region[] = {imageDesc.image_width, 1, 1};
-    std::unique_ptr<Image> image;
-    switch (imageType) {
-    case CL_MEM_OBJECT_IMAGE1D:
-        origin[1] = expectedMipLevel;
-        image = std::unique_ptr<Image>(ImageHelper<Image1dDefaults>::create(context, &imageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE1D_ARRAY:
-        imageDesc.image_array_size = 2;
-        origin[2] = expectedMipLevel;
-        image = std::unique_ptr<Image>(ImageHelper<Image1dArrayDefaults>::create(context, &imageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE2D:
-        origin[2] = expectedMipLevel;
-        image = std::unique_ptr<Image>(ImageHelper<Image2dDefaults>::create(context, &imageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE2D_ARRAY:
-        imageDesc.image_array_size = 2;
-        origin[3] = expectedMipLevel;
-        image = std::unique_ptr<Image>(ImageHelper<Image2dArrayDefaults>::create(context, &imageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE3D:
-        origin[3] = expectedMipLevel;
-        image = std::unique_ptr<Image>(ImageHelper<Image3dDefaults>::create(context, &imageDesc));
-        break;
+        MockRootDeviceEnvironment::resetBuiltins(pCmdQ->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[pCmdQ->getDevice().getRootDeviceIndex()].get(), builtIns);
+        auto &origBuilder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(
+            BuiltIn::BaseKernel::copyBufferToImage3d, builtInMode,
+            pCmdQ->getClDevice());
+
+        // substitute original builder with mock builder
+        auto oldBuilder = pClDevice->setBuiltinDispatchInfoBuilder(
+            BuiltIn::BaseKernel::copyBufferToImage3d, builtInMode,
+            std::unique_ptr<NEO::BuiltIn::DispatchInfoBuilder>(new MockBuiltInDispatchInfoBuilder(*builtIns, pCmdQ->getClDevice(), &origBuilder)));
+
+        cl_int retVal = CL_SUCCESS;
+        cl_image_desc imageDesc = {};
+        uint32_t expectedMipLevel = 3;
+        imageDesc.image_type = imageType;
+        imageDesc.num_mip_levels = 10;
+        imageDesc.image_width = 4;
+        imageDesc.image_height = 1;
+        imageDesc.image_depth = 1;
+        size_t origin[] = {0, 0, 0, 0};
+        size_t region[] = {imageDesc.image_width, 1, 1};
+        std::unique_ptr<Image> image;
+        switch (imageType) {
+        case CL_MEM_OBJECT_IMAGE1D:
+            origin[1] = expectedMipLevel;
+            image = std::unique_ptr<Image>(ImageHelperUlt<Image1dDefaults>::create(context, &imageDesc));
+            break;
+        case CL_MEM_OBJECT_IMAGE1D_ARRAY:
+            imageDesc.image_array_size = 2;
+            origin[2] = expectedMipLevel;
+            image = std::unique_ptr<Image>(ImageHelperUlt<Image1dArrayDefaults>::create(context, &imageDesc));
+            break;
+        case CL_MEM_OBJECT_IMAGE2D:
+            origin[2] = expectedMipLevel;
+            image = std::unique_ptr<Image>(ImageHelperUlt<Image2dDefaults>::create(context, &imageDesc));
+            break;
+        case CL_MEM_OBJECT_IMAGE2D_ARRAY:
+            imageDesc.image_array_size = 2;
+            origin[3] = expectedMipLevel;
+            image = std::unique_ptr<Image>(ImageHelperUlt<Image2dArrayDefaults>::create(context, &imageDesc));
+            break;
+        case CL_MEM_OBJECT_IMAGE3D:
+            origin[3] = expectedMipLevel;
+            image = std::unique_ptr<Image>(ImageHelperUlt<Image3dDefaults>::create(context, &imageDesc));
+            break;
+        }
+        EXPECT_NE(nullptr, image.get());
+
+        std::unique_ptr<uint32_t[]> ptr = std::unique_ptr<uint32_t[]>(new uint32_t[3]);
+        retVal = pCmdQ->enqueueCopyBufferToImage(srcBuffer,
+                                                 image.get(),
+                                                 0,
+                                                 origin,
+                                                 region,
+                                                 0,
+                                                 nullptr,
+                                                 nullptr);
+
+        EXPECT_EQ(CL_SUCCESS, retVal);
+
+        auto &mockBuilder = static_cast<MockBuiltInDispatchInfoBuilder &>(BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToImage3d, builtInMode,
+                                                                                                                                    pCmdQ->getClDevice()));
+        auto params = mockBuilder.getBuiltinOpParams();
+
+        EXPECT_EQ(expectedMipLevel, params->dstMipLevel);
+
+        // restore original builder and retrieve mock builder
+        auto newBuilder = pClDevice->setBuiltinDispatchInfoBuilder(
+            BuiltIn::BaseKernel::copyBufferToImage3d, builtInMode,
+            std::move(oldBuilder));
+        EXPECT_NE(nullptr, newBuilder);
     }
-    EXPECT_NE(nullptr, image.get());
-
-    std::unique_ptr<uint32_t[]> ptr = std::unique_ptr<uint32_t[]>(new uint32_t[3]);
-    retVal = pCmdQ->enqueueCopyBufferToImage(srcBuffer,
-                                             image.get(),
-                                             0,
-                                             origin,
-                                             region,
-                                             0,
-                                             nullptr,
-                                             nullptr);
-
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    auto &mockBuilder = static_cast<MockBuiltinDispatchInfoBuilder &>(BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyBufferToImage3d,
-                                                                                                                              pCmdQ->getClDevice()));
-    auto params = mockBuilder.getBuiltinOpParams();
-
-    EXPECT_EQ(expectedMipLevel, params->dstMipLevel);
-
-    // restore original builder and retrieve mock builder
-    auto newBuilder = pClExecutionEnvironment->setBuiltinDispatchInfoBuilder(
-        rootDeviceIndex,
-        EBuiltInOps::CopyBufferToImage3d,
-        std::move(oldBuilder));
-    EXPECT_NE(nullptr, newBuilder);
 }
-
-INSTANTIATE_TEST_CASE_P(MipMapCopyBufferToImageTest_GivenImageWithMipLevelNonZeroWhenCopyBufferToImageIsCalledThenProperMipLevelIsSet,
-                        MipMapCopyBufferToImageTest, ::testing::Values(CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY, CL_MEM_OBJECT_IMAGE2D, CL_MEM_OBJECT_IMAGE2D_ARRAY, CL_MEM_OBJECT_IMAGE3D));
 
 struct EnqueueCopyBufferToImageHw : public ::testing::Test {
 
     void SetUp() override {
         REQUIRE_64BIT_OR_SKIP();
         REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
-        device = std::make_unique<MockClDevice>(MockClDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+        device = std::make_unique<MockClDevice>(MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
         context = std::make_unique<MockContext>(device.get());
-        dstImage = std::unique_ptr<Image>(Image2dHelper<>::create(context.get()));
+        dstImage = std::unique_ptr<Image>(Image2dHelperUlt<>::create(context.get()));
     }
 
     std::unique_ptr<MockClDevice> device;
@@ -332,13 +336,13 @@ HWTEST_F(EnqueueCopyBufferToImageStatelessTest, givenBigBufferWhenCopyingBufferT
 
 HWTEST_F(EnqueueCopyBufferToImageStatelessTest, givenGpuHangAndBlockingCallAndBigBufferWhenCopyingBufferToImageStatelessThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context.get(), device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     srcBuffer.size = static_cast<size_t>(bigSize);
 
@@ -358,8 +362,11 @@ HWTEST_F(EnqueueCopyBufferToImageStatelessTest, givenGpuHangAndBlockingCallAndBi
 
 using EnqueueCopyBufferToImageStatefulTest = EnqueueCopyBufferToImageHw;
 
-HWTEST_F(EnqueueCopyBufferToImageStatefulTest, givenBigBufferWhenCopyingBufferToImageStatefulThenSuccessIsReturned) {
+HWTEST2_F(EnqueueCopyBufferToImageStatefulTest, givenBigBufferWhenCopyingBufferToImageStatefulThenSuccessIsReturned, IsStatefulBufferPreferredForProduct) {
     auto cmdQ = std::make_unique<CommandQueueStateful<FamilyType>>(context.get(), device.get());
+    if (cmdQ->getHeaplessModeEnabled()) {
+        GTEST_SKIP();
+    }
     srcBuffer.size = static_cast<size_t>(smallSize);
     auto retVal = cmdQ->enqueueCopyBufferToImage(
         &srcBuffer,
@@ -392,4 +399,81 @@ HWTEST_F(OneMipLevelCopyBufferToImageImageTests, GivenNotMippedImageWhenCopyingB
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_TRUE(builtinOpsParamsCaptured);
     EXPECT_EQ(0u, usedBuiltinOpsParams.dstMipLevel);
+}
+
+HWTEST_F(EnqueueCopyBufferToImageTest, given4gbBufferAndIsForceStatelessIsFalseWhenEnqueueCopyBufferToImageCallThenStatelessIsUsed) {
+    struct FourGbMockBuffer : MockBuffer {
+        size_t getSize() const override { return static_cast<size_t>(4ull * MemoryConstants::gigaByte); }
+    };
+
+    REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
+    if (is32bit) {
+        GTEST_SKIP();
+    }
+
+    auto mockCmdQ = static_cast<MockCommandQueueHw<FamilyType> *>(pCmdQ);
+    mockCmdQ->isForceStateless = false;
+
+    auto copyMode = pCmdQ->getDefaultBuiltInMode();
+    copyMode.adjustToWideStatelessIfRequired(4ull * MemoryConstants::gigaByte);
+
+    auto builtIns = new MockBuiltins();
+    MockRootDeviceEnvironment::resetBuiltins(pCmdQ->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[pCmdQ->getDevice().getRootDeviceIndex()].get(), builtIns);
+
+    // substitute original builder with mock builder
+    auto oldBuilder = pClDevice->setBuiltinDispatchInfoBuilder(
+        BuiltIn::BaseKernel::copyBufferToImage3d, copyMode,
+        std::unique_ptr<NEO::BuiltIn::DispatchInfoBuilder>(new MockBuilder(*builtIns, pCmdQ->getClDevice())));
+
+    FourGbMockBuffer srcBuffer;
+
+    auto mockBuilder = static_cast<MockBuilder *>(&BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(
+        BuiltIn::BaseKernel::copyBufferToImage3d, copyMode,
+        *pClDevice));
+
+    EXPECT_FALSE(mockBuilder->wasBuildDispatchInfosWithBuiltinOpParamsCalled);
+
+    EnqueueCopyBufferToImageHelper<>::enqueueCopyBufferToImage(pCmdQ, &srcBuffer, dstImage);
+
+    EXPECT_TRUE(mockBuilder->wasBuildDispatchInfosWithBuiltinOpParamsCalled);
+
+    // restore original builder and retrieve mock builder
+    auto newBuilder = pClDevice->setBuiltinDispatchInfoBuilder(
+        BuiltIn::BaseKernel::copyBufferToImage3d, copyMode,
+        std::move(oldBuilder));
+    EXPECT_EQ(mockBuilder, newBuilder.get());
+}
+
+HWTEST_F(EnqueueCopyBufferToImageTest, givenImage1dBufferWhenCopyBufferToImageIsEnqueuedThenParentBufferIsCopiedWithCopyBufferToBufferBuiltin) {
+    std::unique_ptr<Buffer> buffer(BufferHelper<>::create(context));
+    cl_image_format imageFormat = {CL_RGBA, CL_UNSIGNED_INT8};
+    cl_image_desc imageDesc = Image1dBufferDefaults::imageDesc;
+    imageDesc.mem_object = buffer.get();
+    std::unique_ptr<Image> image(Image1dHelperUlt<>::create(context, &imageDesc, &imageFormat));
+    ASSERT_NE(nullptr, image);
+    const size_t bytesPerPixel = image->getSurfaceFormatInfo().surfaceFormat.imageElementSizeInBytes;
+
+    auto builtIns = new MockBuiltins();
+    MockRootDeviceEnvironment::resetBuiltins(pCmdQ->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[pCmdQ->getDevice().getRootDeviceIndex()].get(), builtIns);
+    auto &origBuilder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToBuffer, pCmdQ->getDefaultBuiltInMode(), pCmdQ->getClDevice());
+    auto oldBuilder = pClDevice->setBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToBuffer, pCmdQ->getDefaultBuiltInMode(),
+                                                               std::unique_ptr<NEO::BuiltIn::DispatchInfoBuilder>(new MockBuiltInDispatchInfoBuilder(*builtIns, pCmdQ->getClDevice(), &origBuilder)));
+
+    const size_t srcOffset = 4;
+    size_t dstOrigin[] = {1, 0, 0};
+    size_t region[] = {2, 1, 1};
+    auto retVal = EnqueueCopyBufferToImageHelper<>::enqueueCopyBufferToImage(pCmdQ, srcBuffer, image.get(), srcOffset, dstOrigin, region);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto &mockBuilder = static_cast<MockBuiltInDispatchInfoBuilder &>(BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToBuffer, pCmdQ->getDefaultBuiltInMode(), pCmdQ->getClDevice()));
+    auto params = mockBuilder.getBuiltinOpParams();
+    EXPECT_EQ(srcBuffer, params->srcMemObj);
+    EXPECT_EQ(srcOffset, params->srcOffset.x);
+    EXPECT_EQ(buffer.get(), params->dstMemObj);
+    EXPECT_EQ(dstOrigin[0] * bytesPerPixel, params->dstOffset.x);
+    EXPECT_EQ(region[0] * bytesPerPixel, params->size.x);
+
+    auto newBuilder = pClDevice->setBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferToBuffer, pCmdQ->getDefaultBuiltInMode(), std::move(oldBuilder));
+    EXPECT_EQ(&mockBuilder, newBuilder.get());
+    pCmdQ->finish(false);
 }

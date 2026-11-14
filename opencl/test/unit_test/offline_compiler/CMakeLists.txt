@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2023 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -7,28 +7,28 @@
 project(ocloc_tests)
 
 set(IGDRCL_SRCS_cloc
-    ${OCLOC_DIRECTORY}/source/decoder/binary_decoder.cpp
-    ${OCLOC_DIRECTORY}/source/decoder/binary_encoder.cpp
     ${OCLOC_DIRECTORY}/source/offline_compiler.cpp
     ${OCLOC_DIRECTORY}/source/offline_linker.cpp
     ${OCLOC_DIRECTORY}/source/ocloc_concat.cpp
     ${OCLOC_DIRECTORY}/source/ocloc_fatbinary.cpp
+    ${OCLOC_DIRECTORY}/source/ocloc_supported_devices_helper.h
+    ${OCLOC_DIRECTORY}/source/ocloc_supported_devices_helper.cpp
 )
 
+if(WIN32)
+  list(APPEND IGDRCL_SRCS_cloc
+       ${OCLOC_DIRECTORY}/source/windows/ocloc_supported_devices_helper_windows.cpp
+  )
+else()
+  list(APPEND IGDRCL_SRCS_cloc
+       ${OCLOC_DIRECTORY}/source/linux/ocloc_supported_devices_helper_linux.cpp
+  )
+endif()
+
 set(IGDRCL_SRCS_offline_compiler_mock
-    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/mock/mock_decoder.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/mock/mock_encoder.h
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/mock/mock_zebin_decoder.h
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/mock/mock_zebin_encoder.h
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/mock/mock_iga_wrapper.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_argument_helper.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_multi_command.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_ocloc_concat.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_ocloc_fcl_facade.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_ocloc_igc_facade.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_offline_compiler.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_offline_linker.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_sip_ocloc_tests.cpp
 )
 
 set(CLOC_LIB_SRCS_UTILITIES
@@ -57,15 +57,12 @@ get_property(NEO_CORE_tests_compiler_mocks GLOBAL PROPERTY NEO_CORE_tests_compil
 set(IGDRCL_SRCS_offline_compiler_tests
     ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/decoder_tests.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/encoder_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/iga_wrapper_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/iga_wrapper_tests.h
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/zebin_manipulator_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/default_cache_config_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/environment.h
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_iga_dll.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/mock/mock_iga_dll.h
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_api_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_concat_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_fatbinary_tests.cpp
@@ -76,10 +73,12 @@ set(IGDRCL_SRCS_offline_compiler_tests
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_igc_facade_tests.h
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_product_config_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_product_config_tests.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_supported_devices_helper_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_tests_configuration.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_validator_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/offline_compiler_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/offline_compiler_tests.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/offline_compiler_pisa_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/offline_linker_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/offline_linker_tests.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stdout_capturer.h
@@ -88,9 +87,16 @@ set(IGDRCL_SRCS_offline_compiler_tests
     ${NEO_SHARED_DIRECTORY}/memory_manager/deferred_deleter.cpp
     ${NEO_SHARED_DIRECTORY}/memory_manager/deferred_deleter.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_compilers.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks${BRANCH_DIR_SUFFIX}/mock_igc_path.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_os_library.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_os_library.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_compilers.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_modules_zebin.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_modules_zebin.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_manager_state_restore.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_manager_state_restore.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_variables_listener.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_variables_listener.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/memory_leak_listener.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/memory_leak_listener.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/memory_management.cpp
@@ -98,8 +104,12 @@ set(IGDRCL_SRCS_offline_compiler_tests
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/file_io.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/test_files.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/signal_utils.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/signal_utils_common.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/create_directory.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/debug_settings_reader_creator.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/mock_io_functions.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_excludes.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_matcher_registry.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/virtual_file_system_listener.cpp
     ${IGDRCL_SRCS_cloc}
     ${IGDRCL_SRCS_offline_compiler_mock}
@@ -113,19 +123,26 @@ if(WIN32)
   list(APPEND IGDRCL_SRCS_offline_compiler_tests
        ${NEO_SHARED_DIRECTORY}/os_interface/windows/os_thread_win.cpp
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/signal_utils.cpp
+       ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/sys_calls.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/windows/ocloc_supported_devices_helper_windows_tests.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/windows/ocloc_api_windows_tests.cpp
   )
   list(REMOVE_ITEM IGDRCL_SRCS_offline_compiler_tests
        ${NEO_SHARED_DIRECTORY}/utilities/windows/directory.cpp
+       ${NEO_SHARED_DIRECTORY}/os_interface/windows/sys_calls.cpp
   )
 else()
   list(APPEND IGDRCL_SRCS_offline_compiler_tests
+       ${NEO_SHARED_DIRECTORY}/os_interface/linux/os_library_helper.cpp
        ${NEO_SHARED_DIRECTORY}/os_interface/linux/os_thread_linux.cpp
-       ${NEO_SHARED_DIRECTORY}/os_interface/linux/sys_calls_linux.cpp
+       ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/sys_calls_linux_ult.cpp
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/signal_utils.cpp
-       ${OCLOC_DIRECTORY}/source/linux/os_library_ocloc_helper.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/linux/ocloc_supported_devices_helper_linux_tests.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/linux/ocloc_api_linux_tests.cpp
   )
   list(REMOVE_ITEM IGDRCL_SRCS_offline_compiler_tests
        ${NEO_SHARED_DIRECTORY}/utilities/linux/directory.cpp
+       ${NEO_SHARED_DIRECTORY}/os_interface/linux/sys_calls_linux.cpp
   )
 endif()
 
@@ -135,12 +152,22 @@ add_executable(ocloc_tests ${IGDRCL_SRCS_offline_compiler_tests})
 
 target_include_directories(ocloc_tests PRIVATE
                            ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/header${BRANCH_DIR_SUFFIX}
+                           ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/includes${BRANCH_DIR_SUFFIX}
                            ${NEO_SHARED_TEST_DIRECTORY}/common/test_configuration/unit_tests
                            $<TARGET_PROPERTY:ocloc_lib,INCLUDE_DIRECTORIES>
 )
-target_compile_definitions(ocloc_tests PUBLIC MOCKABLE_VIRTUAL=virtual $<TARGET_PROPERTY:ocloc_lib,INTERFACE_COMPILE_DEFINITIONS> ${TESTED_CORE_FLAGS_DEFINITONS})
 
-target_link_libraries(ocloc_tests gmock-gtest)
+string(TOLOWER ${DEFAULT_TESTED_PLATFORM} CLOC_LIB_DEFAULT_DEVICE)
+target_compile_definitions(ocloc_tests PUBLIC
+                           MOCKABLE_VIRTUAL=virtual
+                           $<TARGET_PROPERTY:ocloc_lib,INTERFACE_COMPILE_DEFINITIONS>
+                           ${TESTED_CORE_FLAGS_DEFINITONS}
+                           NEO_OCLOC_CURRENT_LIB_NAME="ocloc-current"
+                           NEO_OCLOC_FORMER_LIB_NAME="ocloc-former"
+                           DEFAULT_TEST_PLATFORM_NAME="${CLOC_LIB_DEFAULT_DEVICE}"
+)
+
+target_link_libraries(ocloc_tests neo_gtest)
 
 if(WIN32)
   target_link_libraries(ocloc_tests dbghelp)
@@ -154,8 +181,10 @@ get_property(CLOC_LIB_FOLDER TARGET ocloc_lib PROPERTY FOLDER)
 get_property(CLOC_LIB_COMPILE_FLAGS TARGET ocloc_lib PROPERTY COMPILE_FLAGS)
 set_property(TARGET ocloc_tests PROPERTY FOLDER ${CLOC_LIB_FOLDER})
 set_property(TARGET ocloc_tests APPEND_STRING PROPERTY COMPILE_FLAGS ${CLOC_LIB_COMPILE_FLAGS} ${ASAN_FLAGS} ${TSAN_FLAGS})
-
-string(TOLOWER ${DEFAULT_TESTED_PLATFORM} CLOC_LIB_DEFAULT_DEVICE)
+set_property(TARGET ocloc_tests PROPERTY ENABLE_EXPORTS TRUE)
+if(USE_ASAN)
+  target_sources(ocloc_tests PRIVATE ${NEO_SHARED_TEST_DIRECTORY}/common/default_asan_options.cpp)
+endif()
 
 add_custom_target(run_ocloc_tests ALL
                   DEPENDS ocloc_tests
@@ -167,10 +196,7 @@ endif()
 
 macro(macro_for_each_platform)
   if("${PLATFORM_IT_LOWER}" STREQUAL "${CLOC_LIB_DEFAULT_DEVICE}")
-    list(GET ${PLATFORM_IT}_${CORE_TYPE}_REVISIONS 0 REVISION_ID)
-    add_dependencies(run_ocloc_tests prepare_test_kernels_${PLATFORM_IT_LOWER}_${REVISION_ID})
-    add_dependencies(unit_tests prepare_test_kernels_${PLATFORM_IT_LOWER}_${REVISION_ID})
-    set(run_tests_cmd ocloc_tests --device ${PLATFORM_IT_LOWER} --rev_id ${REVISION_ID})
+    set(run_tests_cmd ocloc_tests --device ${PLATFORM_IT_LOWER})
   endif()
 endmacro()
 macro(macro_for_each_core_type)
@@ -185,7 +211,7 @@ if(WIN32)
                      TARGET run_ocloc_tests
                      POST_BUILD
                      COMMAND echo deleting offline compiler files and directories...
-                     COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/copybuffer_${CLOC_LIB_DEFAULT_DEVICE}.bc
+                     COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/copybuffer_${CLOC_LIB_DEFAULT_DEVICE}.spv
                      COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/copybuffer_${CLOC_LIB_DEFAULT_DEVICE}.gen
                      COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/copybuffer_${CLOC_LIB_DEFAULT_DEVICE}.bin
                      COMMAND ${CMAKE_COMMAND} -E remove_directory ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/offline_compiler_test
@@ -197,7 +223,7 @@ else()
                      TARGET run_ocloc_tests
                      POST_BUILD
                      COMMAND echo deleting offline compiler files and directories...
-                     COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/*.bc
+                     COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/*.spv
                      COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/*.gen
                      COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/*.ll
                      COMMAND ${CMAKE_COMMAND} -E remove ${TargetDir}/${CLOC_LIB_DEFAULT_DEVICE}/*.bin
@@ -209,3 +235,8 @@ endif()
 
 add_subdirectories()
 create_project_source_tree(ocloc_tests)
+
+if(MSVC AND NOT DISABLE_ULT_PCH_WIN)
+  target_sources(ocloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_tests_pch.h)
+  target_precompile_headers(ocloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ocloc_tests_pch.h)
+endif()

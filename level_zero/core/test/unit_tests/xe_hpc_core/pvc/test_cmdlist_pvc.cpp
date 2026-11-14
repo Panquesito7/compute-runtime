@@ -1,50 +1,38 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/xe_hpc_core/hw_cmds_pvc.h"
-#include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
+#include "shared/source/helpers/definitions/engine_group_types.h"
+#include "shared/source/helpers/ptr_math.h"
+#include "shared/source/xe_hpc_core/hw_cmds_xe_hpc_core_base.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include "level_zero/core/source/context/context.h"
 #include "level_zero/core/source/event/event.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
-#include "level_zero/core/test/unit_tests/xe_hpc_core/xe_hpc_core_test_l0_fixtures.h"
+
+#include "igfxfmid.h"
+
+#include <list>
+#include <memory>
 
 namespace L0 {
 namespace ult {
 
-using CommandListStatePrefetchPvcXt = Test<CommandListStatePrefetchXeHpcCore>;
-
-PVCTEST_F(CommandListStatePrefetchPvcXt, givenCommandBufferIsExhaustedWhenPrefetchApiCalledAndIsPvcXtNotBaseDieA0ThenProgramStatePrefetch) {
-    auto hwInfo = device->getNEODevice()->getRootDeviceEnvironment().getMutableHardwareInfo();
-    auto &productHelper = device->getProductHelper();
-    hwInfo->platform.usDeviceID = pvcXtDeviceIds.front();
-    hwInfo->platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, *hwInfo); // not BD A0
-    checkIfCommandBufferIsExhaustedWhenPrefetchApiCalledThenStatePrefetchProgrammed(hwInfo);
-}
-
-PVCTEST_F(CommandListStatePrefetchPvcXt, givenDebugFlagSetWhenPrefetchApiCalledAndIsPvcXtNotBaseDieA0ThenProgramStatePrefetch) {
-    auto hwInfo = device->getNEODevice()->getRootDeviceEnvironment().getMutableHardwareInfo();
-    auto &productHelper = device->getProductHelper();
-    hwInfo = device->getNEODevice()->getRootDeviceEnvironment().getMutableHardwareInfo();
-    hwInfo->platform.usDeviceID = pvcXtDeviceIds.front();
-    hwInfo->platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, *hwInfo); // not BD A0
-    checkIfDebugFlagSetWhenPrefetchApiCalledAThenStatePrefetchProgrammed(hwInfo);
-}
-
 using CommandListEventFenceTestsPvc = Test<ModuleFixture>;
 
 PVCTEST_F(CommandListEventFenceTestsPvc, givenCommandListWithProfilingEventAfterCommandOnPvcRev00ThenMiFenceIsNotAdded) {
-    using GfxFamily = typename NEO::GfxFamilyMapper<IGFX_XE_HPC_CORE>::GfxFamily;
     using MI_MEM_FENCE = typename FamilyType::MI_MEM_FENCE;
 
     auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<IGFX_XE_HPC_CORE>>>();
-    commandList->initialize(device, NEO::EngineGroupType::Compute, 0u);
+    commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
     ze_event_pool_desc_t eventPoolDesc = {};
     eventPoolDesc.count = 1;
     eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
@@ -59,11 +47,11 @@ PVCTEST_F(CommandListEventFenceTestsPvc, givenCommandListWithProfilingEventAfter
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device));
-    commandList->appendEventForProfiling(event.get(), false);
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+    commandList->appendEventForProfiling(event.get(), nullptr, false, false, false, false);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->commandContainer.getCommandStream()->getCpuBase(), 0), commandList->commandContainer.getCommandStream()->getUsed()));
 
     auto itor = find<MI_MEM_FENCE *>(cmdList.begin(), cmdList.end());
@@ -76,11 +64,20 @@ PVCTEST_F(CommandListAppendBarrierXeHpcCore, givenCommandListWhenAppendingBarrie
     using GfxFamily = typename NEO::GfxFamilyMapper<IGFX_XE_HPC_CORE>::GfxFamily;
     using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
     auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<IGFX_XE_HPC_CORE>>>();
-    commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
-    ze_result_t returnValue = commandList->appendBarrier(nullptr, 0, nullptr);
+    commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    L0::CmdListSignalEventParameters signalEventParams = {};
+    ze_result_t returnValue = commandList->appendBarrier(nullptr, 0, nullptr, waitEventsParameters, signalEventParams);
     EXPECT_EQ(returnValue, ZE_RESULT_SUCCESS);
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->commandContainer.getCommandStream()->getCpuBase(), 0), commandList->commandContainer.getCommandStream()->getUsed()));
 
     bool correctPcFound = false;

@@ -1,50 +1,31 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/kernel/kernel_descriptor.h"
 #include "shared/source/program/heap_info.h"
 #include "shared/source/utilities/arrayref.h"
 
 #include <cstdint>
 #include <string>
-#include <utility>
-#include <vector>
-
-namespace gtpin {
-typedef struct igc_info_s igc_info_t;
-}
 
 namespace NEO {
-struct HardwareInfo;
-class BuiltinDispatchInfoBuilder;
+namespace BuiltIn {
+class DispatchInfoBuilder;
+}
 class Device;
-class Kernel;
-struct KernelInfo;
-class DispatchInfo;
-struct KernelArgumentType;
 class GraphicsAllocation;
-class MemoryManager;
 
-static const float YTilingRatioValue = 1.3862943611198906188344642429164f;
+static const float yTilingRatioValue = 1.3862943611198906188344642429164f;
 
-struct DeviceInfoKernelPayloadConstants {
-    void *slmWindow = nullptr;
-    uint32_t slmWindowSize = 0U;
-    uint32_t computeUnitsUsedForScratch = 0U;
-    uint32_t maxWorkGroupSize = 0U;
-};
-
-struct KernelInfo {
+struct KernelInfo : NEO::NonCopyableAndNonMovableClass {
   public:
     KernelInfo() = default;
-    KernelInfo(const KernelInfo &) = delete;
-    KernelInfo &operator=(const KernelInfo &) = delete;
-    ~KernelInfo();
 
     GraphicsAllocation *getGraphicsAllocation() const { return this->kernelAllocation; }
 
@@ -59,8 +40,6 @@ struct KernelInfo {
         DEBUG_BREAK_IF(index >= kernelDescriptor.explicitArgsExtendedMetadata.size());
         return kernelDescriptor.explicitArgsExtendedMetadata[index];
     }
-    size_t getSamplerStateArrayCount() const;
-    size_t getBorderColorOffset() const;
     unsigned int getMaxSimdSize() const {
         return kernelDescriptor.kernelAttributes.simdSize;
     }
@@ -71,38 +50,53 @@ struct KernelInfo {
         auto requiredWorkGroupSizeX = kernelDescriptor.kernelAttributes.requiredWorkgroupSize[0];
         auto requiredWorkGroupSizeY = kernelDescriptor.kernelAttributes.requiredWorkgroupSize[1];
         auto requiredWorkGroupSizeZ = kernelDescriptor.kernelAttributes.requiredWorkgroupSize[2];
-        size_t maxRequiredWorkGroupSize = requiredWorkGroupSizeX * requiredWorkGroupSizeY * requiredWorkGroupSizeZ;
+        size_t maxRequiredWorkGroupSize = static_cast<size_t>(requiredWorkGroupSizeX) * requiredWorkGroupSizeY * requiredWorkGroupSizeZ;
         if ((maxRequiredWorkGroupSize == 0) || (maxRequiredWorkGroupSize > maxWorkGroupSize)) {
             maxRequiredWorkGroupSize = maxWorkGroupSize;
         }
         return maxRequiredWorkGroupSize;
     }
 
-    bool isVmeUsed() const {
-        return kernelDescriptor.kernelAttributes.flags.usesVme;
-    }
-
-    uint32_t getConstantBufferSize() const;
-    int32_t getArgNumByName(const char *name) const;
-
     bool createKernelAllocation(const Device &device, bool internalIsa);
-    void apply(const DeviceInfoKernelPayloadConstants &constants);
+
+    uint32_t getIsaSize() const;
+    GraphicsAllocation *getIsaGraphicsAllocation() const;
+    void setIsaPerKernelAllocation(GraphicsAllocation *allocation);
+
+    inline GraphicsAllocation *getIsaParentAllocation() const {
+        return isaParentAllocation;
+    }
+    inline void setIsaParentAllocation(GraphicsAllocation *allocation) {
+        isaParentAllocation = allocation;
+    }
+    inline size_t getIsaOffsetInParentAllocation() const {
+        DEBUG_BREAK_IF(this->kernelAllocation != nullptr && 0u != isaSubAllocationOffset);
+        return isaSubAllocationOffset;
+    }
+    inline void setIsaSubAllocationOffset(size_t offset) {
+        isaSubAllocationOffset = offset;
+    }
+    inline void setIsaSubAllocationSize(size_t size) {
+        isaSubAllocationSize = size;
+    }
+    inline size_t getIsaSubAllocationSize() const {
+        return isaSubAllocationSize;
+    }
+    const NEO::KernelDescriptor &getDescriptor() const { return kernelDescriptor; }
 
     HeapInfo heapInfo = {};
-    std::vector<std::pair<uint32_t, uint32_t>> childrenKernelsIdOffset;
-    char *crossThreadData = nullptr;
-    const BuiltinDispatchInfoBuilder *builtinDispatchBuilder = nullptr;
-    uint32_t systemKernelOffset = 0;
-    uint64_t kernelId = 0;
-    bool isKernelHeapSubstituted = false;
+    const BuiltIn::DispatchInfoBuilder *builtinDispatchBuilder = nullptr;
     GraphicsAllocation *kernelAllocation = nullptr;
-    DebugData debugData;
-    bool computeMode = false;
-    const gtpin::igc_info_t *igcInfoForGtpin = nullptr;
 
-    uint64_t shaderHashCode;
     KernelDescriptor kernelDescriptor;
+
+  private:
+    GraphicsAllocation *isaParentAllocation = nullptr;
+    size_t isaSubAllocationOffset = 0lu;
+    size_t isaSubAllocationSize = 0lu;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<KernelInfo>);
 
 std::string concatenateKernelNames(ArrayRef<KernelInfo *> kernelInfos);
 

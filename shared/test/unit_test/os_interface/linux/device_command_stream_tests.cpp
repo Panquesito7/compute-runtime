@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,12 +12,17 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/os_interface/linux/device_command_stream.inl"
 #include "shared/source/os_interface/linux/drm_command_stream.h"
+#include "shared/source/os_interface/linux/drm_memory_manager.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/os_context.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/test/common/fixtures/mock_aub_center_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/helpers/execution_environment_helper.h"
-#include "shared/test/common/os_interface/linux/device_command_stream_fixture.h"
+#include "shared/test/common/helpers/ult_hw_config.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/libult/linux/drm_mock.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "gtest/gtest.h"
@@ -28,6 +33,7 @@ using namespace NEO;
 
 struct DeviceCommandStreamLeaksTest : ::testing::Test {
     void SetUp() override {
+        debugManager.flags.EnableL3FlushAfterPostSync.set(0);
         HardwareInfo *hwInfo = nullptr;
         executionEnvironment = getExecutionEnvironmentImpl(hwInfo, 1);
         executionEnvironment->incRefInternal();
@@ -39,29 +45,33 @@ struct DeviceCommandStreamLeaksTest : ::testing::Test {
     }
 
     ExecutionEnvironment *executionEnvironment;
+    DebugManagerStateRestore dbgState;
 };
 
 HWTEST_F(DeviceCommandStreamLeaksTest, WhenCreatingDeviceCsrThenValidPointerIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
     std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
     DrmMockSuccess mockDrm(mockFd, *executionEnvironment->rootDeviceEnvironments[0]);
     EXPECT_NE(nullptr, ptr);
 }
 
-HWTEST_F(DeviceCommandStreamLeaksTest, givenDefaultDrmCsrWhenItIsCreatedThenGemCloseWorkerInactiveModeIsSelected) {
-    std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
-    auto drmCsr = (DrmCommandStreamReceiver<FamilyType> *)ptr.get();
-    EXPECT_EQ(drmCsr->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerActive);
-}
-
 HWTEST_F(DeviceCommandStreamLeaksTest, givenDefaultDrmCsrWithAubDumWhenItIsCreatedThenGemCloseWorkerInactiveModeIsSelected) {
+    executionEnvironment->memoryManager = DrmMemoryManager::create(*executionEnvironment);
     std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(true, *executionEnvironment, 0, 1));
+    auto osContext = OsContext::create(executionEnvironment->rootDeviceEnvironments[0]->osInterface.get(), 0, 0,
+                                       EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::regular}, PreemptionMode::ThreadGroup, 0b1));
+    ptr->setupContext(*osContext);
     auto drmCsrWithAubDump = (CommandStreamReceiverWithAUBDump<DrmCommandStreamReceiver<FamilyType>> *)ptr.get();
-    EXPECT_EQ(drmCsrWithAubDump->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerActive);
+    EXPECT_FALSE(drmCsrWithAubDump->isGemCloseWorkerActive());
     auto aubCSR = static_cast<CommandStreamReceiverWithAUBDump<DrmCommandStreamReceiver<FamilyType>> *>(ptr.get())->aubCSR.get();
     EXPECT_NE(nullptr, aubCSR);
+    delete osContext;
 }
 
 HWTEST_F(DeviceCommandStreamLeaksTest, givenDefaultDrmCsrWhenOsInterfaceIsNullptrThenValidateDrm) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
     std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
     auto drmCsr = (DrmCommandStreamReceiver<FamilyType> *)ptr.get();
     EXPECT_NE(nullptr, executionEnvironment->rootDeviceEnvironments[0]->osInterface);
@@ -72,38 +82,41 @@ HWTEST_F(DeviceCommandStreamLeaksTest, givenDefaultDrmCsrWhenOsInterfaceIsNullpt
 
 HWTEST_F(DeviceCommandStreamLeaksTest, givenDisabledGemCloseWorkerWhenCsrIsCreatedThenGemCloseWorkerInactiveModeIsSelected) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableGemCloseWorker.set(0u);
+    debugManager.flags.EnableGemCloseWorker.set(0u);
+
+    executionEnvironment->memoryManager = DrmMemoryManager::create(*executionEnvironment);
 
     std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
+    auto osContext = OsContext::create(executionEnvironment->rootDeviceEnvironments[0]->osInterface.get(), 0, 0,
+                                       EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::regular}, PreemptionMode::ThreadGroup, 0b1));
+    ptr->setupContext(*osContext);
     auto drmCsr = (DrmCommandStreamReceiver<FamilyType> *)ptr.get();
 
-    EXPECT_EQ(drmCsr->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerInactive);
+    EXPECT_FALSE(drmCsr->isGemCloseWorkerActive());
+    delete osContext;
 }
 
-HWTEST_F(DeviceCommandStreamLeaksTest, givenEnabledGemCloseWorkerWhenCsrIsCreatedThenGemCloseWorkerActiveModeIsSelected) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableGemCloseWorker.set(1u);
-
+HWTEST2_F(DeviceCommandStreamLeaksTest, givenDirectSubmissionLightWhenCsrIsCreatedThenGemCloseWorkerInactiveModeIsSelected, IsXeLpg) {
+    executionEnvironment->memoryManager = DrmMemoryManager::create(*executionEnvironment);
     std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
+    auto osContext = OsContext::create(executionEnvironment->rootDeviceEnvironments[0]->osInterface.get(), 0, 0,
+                                       EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::regular}, PreemptionMode::ThreadGroup, 0b1));
+    ptr->setupContext(*osContext);
+    osContext->setDirectSubmissionActive();
     auto drmCsr = (DrmCommandStreamReceiver<FamilyType> *)ptr.get();
 
-    EXPECT_EQ(drmCsr->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerActive);
+    EXPECT_FALSE(drmCsr->isGemCloseWorkerActive());
+    delete osContext;
 }
 
-HWTEST_F(DeviceCommandStreamLeaksTest, givenDefaultGemCloseWorkerWhenCsrIsCreatedThenGemCloseWorkerActiveModeIsSelected) {
+HWTEST_F(DeviceCommandStreamLeaksTest, givenDefaultGemCloseWorkerWhenInternalCsrIsCreatedThenGemCloseWorkerInactiveModeIsSelected) {
+    executionEnvironment->memoryManager = DrmMemoryManager::create(*executionEnvironment);
     std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
+    auto osContext = OsContext::create(executionEnvironment->rootDeviceEnvironments[0]->osInterface.get(), 0, 0,
+                                       EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::internal}, PreemptionMode::ThreadGroup, 0b1));
+    ptr->setupContext(*osContext);
     auto drmCsr = (DrmCommandStreamReceiver<FamilyType> *)ptr.get();
 
-    EXPECT_EQ(drmCsr->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerActive);
-}
-
-using DeviceCommandStreamSetInternalUsageTests = DeviceCommandStreamLeaksTest;
-
-HWTEST_F(DeviceCommandStreamSetInternalUsageTests, givenValidDrmCsrThenGemCloseWorkerOperationModeIsSetToInactiveWhenInternalUsageIsSet) {
-    std::unique_ptr<CommandStreamReceiver> ptr(DeviceCommandStreamReceiver<FamilyType>::create(false, *executionEnvironment, 0, 1));
-    auto drmCsr = (DrmCommandStreamReceiver<FamilyType> *)ptr.get();
-    EXPECT_EQ(drmCsr->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerActive);
-
-    drmCsr->initializeDefaultsForInternalEngine();
-    EXPECT_EQ(drmCsr->peekGemCloseWorkerOperationMode(), gemCloseWorkerMode::gemCloseWorkerInactive);
+    EXPECT_FALSE(drmCsr->isGemCloseWorkerActive());
+    delete osContext;
 }

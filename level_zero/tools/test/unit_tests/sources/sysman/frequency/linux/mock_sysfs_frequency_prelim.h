@@ -1,12 +1,15 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
 #include "level_zero/tools/source/sysman/frequency/linux/os_frequency_imp_prelim.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 
 namespace L0 {
 namespace ult {

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,16 @@
 
 #pragma once
 
-#include <level_zero/ze_api.h>
+#include "level_zero/core/source/helpers/api_handle_helper.h"
 
-struct _ze_image_handle_t {};
+struct _ze_image_handle_t : BaseHandle {};
+static_assert(IsCompliantWithDdiHandlesExt<_ze_image_handle_t>);
 
 namespace NEO {
 struct ImageInfo;
 class GraphicsAllocation;
 struct ImageDescriptor;
+struct SurfaceStateInHeapInfo;
 } // namespace NEO
 
 namespace L0 {
@@ -30,19 +32,42 @@ struct Image : _ze_image_handle_t {
     virtual ze_result_t destroy() = 0;
     virtual ze_result_t destroyPeerImages(const void *ptr, Device *device) = 0;
 
-    static ze_result_t create(uint32_t productFamily, Device *device, const ze_image_desc_t *desc, Image **pImage);
+    static ze_result_t create(Device *device, const ze_image_desc_t *desc, Image **pImage);
 
     virtual ze_result_t createView(Device *device, const ze_image_desc_t *desc, ze_image_handle_t *pImage) = 0;
 
     virtual NEO::GraphicsAllocation *getAllocation() = 0;
+    virtual NEO::GraphicsAllocation *getImplicitArgsAllocation() = 0;
+    virtual NEO::GraphicsAllocation *getMcsAllocation() { return nullptr; }
     virtual void copySurfaceStateToSSH(void *surfaceStateHeap,
-                                       const uint32_t surfaceStateOffset,
-                                       bool isMediaBlockArg) = 0;
-    virtual void copyRedescribedSurfaceStateToSSH(void *surfaceStateHeap, const uint32_t surfaceStateOffset) = 0;
-    virtual NEO::ImageInfo getImageInfo() = 0;
+                                       uint32_t surfaceStateOffset,
+                                       uint32_t bindlessSlot,
+                                       bool isMediaBlockArg,
+                                       uint32_t mipLevel) = 0;
+    virtual const NEO::ImageInfo &getImageInfo() = 0;
     virtual ze_image_desc_t getImageDesc() = 0;
     virtual ze_result_t getMemoryProperties(ze_image_memory_properties_exp_t *pMemoryProperties) = 0;
+    virtual ze_result_t allocateBindlessSlot() = 0;
+    virtual NEO::SurfaceStateInHeapInfo *getBindlessSlot() = 0;
+    virtual ze_result_t allocateBindlessSlotWithMipmap(uint32_t mipLevel) = 0;
+    virtual NEO::SurfaceStateInHeapInfo *getBindlessSlotWithMipmap(uint32_t mipLevel) = 0;
+    virtual NEO::SurfaceStateInHeapInfo *getOrInitializeBindlessSlot(uint32_t bindlessSlot, uint32_t mipLevel, bool isMediaBlockArg) = 0;
+    virtual ze_result_t getDeviceOffset(uint64_t *deviceOffset) = 0;
+    virtual bool isMimickedImage() = 0;
+    virtual bool hasCustomPitch() const = 0;
+    virtual size_t getCustomRowPitch() const = 0;
+    virtual size_t getCustomSlicePitch() const = 0;
+    virtual ze_result_t allocateImplicitArgsOnDemand() = 0;
+    virtual void encodeImplicitArgsSurfaceState() = 0;
+    virtual bool isSrgb() const = 0;
+    virtual bool isDepthStencil() const = 0;
 
+    static ze_result_t getPitchFor2dImage(
+        ze_device_handle_t hDevice,
+        size_t imageWidth,
+        size_t imageHeight,
+        unsigned int elementSizeInByte,
+        size_t *rowPitch);
     static Image *fromHandle(ze_image_handle_t handle) { return static_cast<Image *>(handle); }
 
     inline ze_image_handle_t toHandle() { return this; }
@@ -51,9 +76,9 @@ struct Image : _ze_image_handle_t {
 using ImageAllocatorFn = Image *(*)();
 extern ImageAllocatorFn imageFactory[];
 
-template <uint32_t productFamily, typename ImageType>
+template <uint32_t gfxCoreFamily, typename ImageType>
 struct ImagePopulateFactory {
-    ImagePopulateFactory() { imageFactory[productFamily] = Image::Allocator<ImageType>::allocate; }
+    ImagePopulateFactory() { imageFactory[gfxCoreFamily] = Image::Allocator<ImageType>::allocate; }
 };
 
 } // namespace L0

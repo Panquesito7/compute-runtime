@@ -1,97 +1,64 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/heap_assigner.h"
-#include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/gfx_partition.h"
-#include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_memory_manager.h"
 
 namespace L0 {
 namespace ult {
 
-using AlocationHelperTests = Test<DeviceFixture>;
+using AllocationHelperTests = Test<DeviceFixture>;
 
 using Platforms = IsAtMostProduct<IGFX_TIGERLAKE_LP>;
 
-HWTEST2_F(AlocationHelperTests, givenLinearStreamTypeWhenUseExternalAllocatorForSshAndDshDisabledThenUse32BitIsFalse, Platforms) {
-    DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(false);
-    HeapAssigner heapAssigner = {};
-    EXPECT_FALSE(heapAssigner.use32BitHeap(AllocationType::LINEAR_STREAM));
+HWTEST2_F(AllocationHelperTests, givenLinearStreamTypeWhenUseExternalAllocatorForSshAndDshDisabledThenUse32BitIsFalse, Platforms) {
+    HeapAssigner heapAssigner{false};
+    EXPECT_FALSE(heapAssigner.use32BitHeap(AllocationType::linearStream));
 }
 
-HWTEST2_F(AlocationHelperTests, givenLinearStreamTypeWhenUseExternalAllocatorForSshAndDshEnabledThenUse32BitIsTrue, Platforms) {
-    DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(true);
-    HeapAssigner heapAssigner = {};
-    EXPECT_TRUE(heapAssigner.use32BitHeap(AllocationType::LINEAR_STREAM));
+HWTEST2_F(AllocationHelperTests, givenLinearStreamTypeWhenUseExternalAllocatorForSshAndDshEnabledThenUse32BitIsTrue, Platforms) {
+    HeapAssigner heapAssigner{true};
+    EXPECT_TRUE(heapAssigner.use32BitHeap(AllocationType::linearStream));
 }
 
-HWTEST2_F(AlocationHelperTests, givenLinearStreamTypeWhenUseIternalAllocatorThenUseHeapExternal, Platforms) {
-    DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(true);
-    HeapAssigner heapAssigner = {};
-    auto heapIndex = heapAssigner.get32BitHeapIndex(AllocationType::LINEAR_STREAM, true, *defaultHwInfo.get(), false);
-    EXPECT_EQ(heapIndex, NEO::HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY);
-}
-struct MockMemoryManagerAllocationHelper : public MemoryManagerMock {
-    MockMemoryManagerAllocationHelper(NEO::ExecutionEnvironment &executionEnvironment) : MemoryManagerMock(const_cast<NEO::ExecutionEnvironment &>(executionEnvironment)) {}
-    GraphicsAllocation *allocate32BitGraphicsMemoryImpl(const AllocationData &allocationData, bool useLocalMemory) override {
-        passedUseLocalMem = useLocalMemory;
-        return nullptr;
-    }
-    bool passedUseLocalMem = false;
-};
-TEST_F(AlocationHelperTests, GivenLinearStreamAllocTypeWhenUseExternalAllocatorForSshAndDshEnabledThenUseLocalMemEqualGfxCoreHelperValue) {
-    DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(true);
-    AllocationData allocationData;
-    allocationData.type = AllocationType::LINEAR_STREAM;
-    std::unique_ptr<MockMemoryManagerAllocationHelper> mockMemoryManager(new MockMemoryManagerAllocationHelper(*device->getNEODevice()->getExecutionEnvironment()));
-    mockMemoryManager->allocateGraphicsMemory(allocationData);
-    auto &productHelper = device->getProductHelper();
-    EXPECT_EQ(mockMemoryManager->passedUseLocalMem, productHelper.heapInLocalMem(device->getHwInfo()));
+HWTEST2_F(AllocationHelperTests, givenLinearStreamTypeWhenUseIternalAllocatorThenUseHeapExternal, Platforms) {
+    HeapAssigner heapAssigner{true};
+    auto heapIndex = heapAssigner.get32BitHeapIndex(AllocationType::linearStream, true, *defaultHwInfo.get(), false);
+    EXPECT_EQ(heapIndex, NEO::HeapIndex::heapExternalDeviceMemory);
 }
 
-TEST_F(AlocationHelperTests, GivenInternalAllocTypeWhenUseExternalAllocatorForSshAndDshDisabledThenUseLocalMemEqualFalse) {
+TEST_F(AllocationHelperTests, givenLinearStreamAllocationWhenSelectingHeapWithUseExternalAllocatorForSshAndDshEnabledThenExternalHeapIsUsed) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(false);
-    AllocationData allocationData;
-    allocationData.type = AllocationType::KERNEL_ISA;
-    std::unique_ptr<MockMemoryManagerAllocationHelper> mockMemoryManager(new MockMemoryManagerAllocationHelper(*device->getNEODevice()->getExecutionEnvironment()));
-    mockMemoryManager->allocateGraphicsMemory(allocationData);
-    EXPECT_FALSE(mockMemoryManager->passedUseLocalMem);
-}
-
-TEST_F(AlocationHelperTests, givenLinearStreamAllocationWhenSelectingHeapWithUseExternalAllocatorForSshAndDshEnabledThenExternalHeapIsUsed) {
-    DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.UseExternalAllocatorForSshAndDsh.set(true);
-    std::unique_ptr<MockMemoryManagerAllocationHelper> mockMemoryManager(new MockMemoryManagerAllocationHelper(*device->getNEODevice()->getExecutionEnvironment()));
-    GraphicsAllocation allocation{0, AllocationType::LINEAR_STREAM, nullptr, 0, 0, MemoryPool::MemoryNull, MemoryManager::maxOsContextCount, 0llu};
+    debugManager.flags.UseExternalAllocatorForSshAndDsh.set(true);
+    std::unique_ptr<MemoryManagerMock> mockMemoryManager(new MemoryManagerMock(*device->getNEODevice()->getExecutionEnvironment()));
+    GraphicsAllocation allocation{0, 1u /*num gmms*/, AllocationType::linearStream, nullptr, 0, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount, 0llu};
 
     allocation.set32BitAllocation(false);
     EXPECT_EQ(MemoryManager::selectExternalHeap(allocation.isAllocatedInLocalMemoryPool()), mockMemoryManager->selectHeap(&allocation, false, false, false));
+    EXPECT_TRUE(mockMemoryManager->heapAssigners[0]->apiAllowExternalHeapForSshAndDsh);
 }
 
-TEST_F(AlocationHelperTests, givenExternalHeapIndexWhenMapingToExternalFrontWindowThenEternalFrontWindowReturned) {
-    EXPECT_EQ(HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW, HeapAssigner::mapExternalWindowIndex(HeapIndex::HEAP_EXTERNAL));
+TEST_F(AllocationHelperTests, givenExternalHeapIndexWhenMapingToExternalFrontWindowThenEternalFrontWindowReturned) {
+    EXPECT_EQ(HeapIndex::heapExternalFrontWindow, HeapAssigner::mapExternalWindowIndex(HeapIndex::heapExternal));
 }
 
-TEST_F(AlocationHelperTests, givenExternalDeviceHeapIndexWhenMapingToExternalFrontWindowThenEternalDeviceFrontWindowReturned) {
-    EXPECT_EQ(HeapIndex::HEAP_EXTERNAL_DEVICE_FRONT_WINDOW, HeapAssigner::mapExternalWindowIndex(HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY));
+TEST_F(AllocationHelperTests, givenExternalDeviceHeapIndexWhenMapingToExternalFrontWindowThenEternalDeviceFrontWindowReturned) {
+    EXPECT_EQ(HeapIndex::heapExternalDeviceFrontWindow, HeapAssigner::mapExternalWindowIndex(HeapIndex::heapExternalDeviceMemory));
 }
 
-TEST_F(AlocationHelperTests, givenOtherThanExternalHeapIndexWhenMapingToExternalFrontWindowThenAbortHasBeenThrown) {
-    EXPECT_THROW(HeapAssigner::mapExternalWindowIndex(HeapIndex::HEAP_STANDARD), std::exception);
+TEST_F(AllocationHelperTests, givenOtherThanExternalHeapIndexWhenMapingToExternalFrontWindowThenAbortHasBeenThrown) {
+    EXPECT_THROW(HeapAssigner::mapExternalWindowIndex(HeapIndex::heapStandard), std::exception);
 }
 
 } // namespace ult

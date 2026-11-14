@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,7 +8,12 @@
 #include "shared/test/common/fixtures/device_fixture.h"
 
 #include "shared/source/built_ins/sip.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_device.h"
 
 #include "gtest/gtest.h"
@@ -26,6 +31,13 @@ void DeviceFixture::setUpImpl(const NEO::HardwareInfo *hardwareInfo) {
     auto &commandStreamReceiver = pDevice->getGpgpuCommandStreamReceiver();
     pTagMemory = commandStreamReceiver.getTagAddress();
     ASSERT_NE(nullptr, const_cast<TagAddressType *>(pTagMemory));
+
+    auto bindlessEnabled = NEO::ApiSpecificConfig::getBindlessMode(*pDevice);
+    if (pDevice->getCompilerProductHelper().isHeaplessModeEnabled(pDevice->getHardwareInfo())) {
+        bindlessEnabled = true;
+    }
+
+    this->defaultBuiltInMode = pDevice->getCompilerProductHelper().getDefaultBuiltInAddressingMode(bindlessEnabled);
 }
 
 void DeviceFixture::tearDown() {
@@ -46,13 +58,28 @@ HelperType &DeviceFixture::getHelper() const {
     return helper;
 }
 
-const ReleaseHelper *DeviceFixture::getReleaseHelper() {
-    const auto *releaseHelper = this->pDevice->getRootDeviceEnvironment().getReleaseHelper();
-    return releaseHelper;
+const ReleaseHelper &DeviceFixture::getReleaseHelper() {
+    return this->pDevice->getRootDeviceEnvironment().getReleaseHelper();
 }
 
 template ProductHelper &DeviceFixture::getHelper<ProductHelper>() const;
 template GfxCoreHelper &DeviceFixture::getHelper<GfxCoreHelper>() const;
 template CompilerProductHelper &DeviceFixture::getHelper<CompilerProductHelper>() const;
+
+void DeviceWithoutSipFixture::setUp() {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ForcePreemptionMode.set(static_cast<int32_t>(NEO::PreemptionMode::Disabled));
+    DeviceFixture::setUp();
+
+    for (auto &rootDeviceEnvironment : pDevice->executionEnvironment->rootDeviceEnvironments) {
+        for (auto &sipKernel : rootDeviceEnvironment->sipKernels) {
+            EXPECT_EQ(nullptr, sipKernel);
+        }
+    }
+}
+
+void DeviceWithoutSipFixture::tearDown() {
+    DeviceFixture::tearDown();
+}
 
 } // namespace NEO

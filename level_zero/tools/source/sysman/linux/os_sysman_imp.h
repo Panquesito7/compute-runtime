@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,40 +8,46 @@
 #pragma once
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
-#include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/sys_calls.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
-#include "level_zero/core/source/device/device.h"
-#include "level_zero/tools/source/sysman/linux/fs_access.h"
-#include "level_zero/tools/source/sysman/linux/pmt/pmt.h"
-#include "level_zero/tools/source/sysman/linux/pmu/pmu_imp.h"
-#include "level_zero/tools/source/sysman/linux/udev/udev_lib.h"
+#include "level_zero/tools/source/sysman/os_sysman.h"
 #include "level_zero/tools/source/sysman/sysman_const.h"
-#include "level_zero/tools/source/sysman/sysman_imp.h"
 
-#include <linux/pci_regs.h>
 #include <map>
 #include <mutex>
+
+namespace NEO {
+class Drm;
+} // namespace NEO
 
 namespace L0 {
 
 class PmuInterface;
 class FirmwareUtil;
+class FsAccess;
+class PlatformMonitoringTech;
+class ProcfsAccess;
+class SysfsAccess;
+struct Device;
+struct SysmanDeviceImp;
 
-class ExecutionEnvironmentRefCountRestore {
+class ExecutionEnvironmentRefCountRestore : public NEO::NonCopyableAndNonMovableClass {
   public:
     ExecutionEnvironmentRefCountRestore() = delete;
     ExecutionEnvironmentRefCountRestore(NEO::ExecutionEnvironment *executionEnvironmentRecevied) {
         executionEnvironment = executionEnvironmentRecevied;
         executionEnvironment->incRefInternal();
     }
+
     ~ExecutionEnvironmentRefCountRestore() {
         executionEnvironment->decRefInternal();
     }
     NEO::ExecutionEnvironment *executionEnvironment = nullptr;
 };
 
-class LinuxSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
+class LinuxSysmanImp : public OsSysman, NEO::NonCopyableAndNonMovableClass {
   public:
     LinuxSysmanImp(SysmanDeviceImp *pParentSysmanDeviceImp);
     ~LinuxSysmanImp() override;
@@ -58,6 +64,7 @@ class LinuxSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
     Device *getDeviceHandle();
     std::vector<ze_device_handle_t> &getDeviceHandles() override;
     ze_device_handle_t getCoreDeviceHandle() override;
+    ze_bool_t isDriverModelSupported() override;
     SysmanDeviceImp *getSysmanDeviceImp();
     std::string getPciCardBusDirectoryPath(std::string realPciPath);
     uint32_t getMemoryType();
@@ -74,10 +81,8 @@ class LinuxSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
     MOCKABLE_VIRTUAL void getPidFdsForOpenDevice(ProcfsAccess *, SysfsAccess *, const ::pid_t, std::vector<int> &);
     MOCKABLE_VIRTUAL ze_result_t osWarmReset();
     MOCKABLE_VIRTUAL ze_result_t osColdReset();
-    ze_result_t gpuProcessCleanup();
+    MOCKABLE_VIRTUAL ze_result_t gpuProcessCleanup(ze_bool_t force);
     std::string getAddressFromPath(std::string &rootPortPath);
-    decltype(&NEO::SysCalls::open) openFunction = NEO::SysCalls::open;
-    decltype(&NEO::SysCalls::close) closeFunction = NEO::SysCalls::close;
     decltype(&NEO::SysCalls::pread) preadFunction = NEO::SysCalls::pread;
     decltype(&NEO::SysCalls::pwrite) pwriteFunction = NEO::SysCalls::pwrite;
     std::string devicePciBdf = "";
@@ -87,6 +92,7 @@ class LinuxSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
     bool isMemoryDiagnostics = false;
     Device *pDevice = nullptr;
     std::string gtDevicePath;
+    bool isUsingPrelimEnabledKmd = false;
 
   protected:
     FsAccess *pFsAccess = nullptr;
@@ -95,7 +101,6 @@ class LinuxSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
     NEO::Drm *pDrm = nullptr;
     PmuInterface *pPmuInterface = nullptr;
     FirmwareUtil *pFwUtilInterface = nullptr;
-    L0::UdevLib *pUdevLib = nullptr;
     std::map<uint32_t, L0::PlatformMonitoringTech *> mapOfSubDeviceIdToPmtObject;
     ze_result_t initLocalDeviceAndDrmHandles();
     uint32_t memType = unknownMemoryType;
@@ -106,6 +111,7 @@ class LinuxSysmanImp : public OsSysman, NEO::NonCopyableOrMovableClass {
     SysmanDeviceImp *pParentSysmanDeviceImp = nullptr;
     static const std::string deviceDir;
     void clearHPIE(int fd);
+    ze_result_t resizeVfBar(uint8_t size);
     std::mutex fwLock;
 };
 

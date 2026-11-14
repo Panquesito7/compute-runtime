@@ -1,19 +1,20 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/helpers/flush_stamp.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/event/user_event.h"
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
@@ -22,8 +23,9 @@ using namespace NEO;
 using MarkerTest = Test<CommandEnqueueFixture>;
 
 HWTEST_F(MarkerTest, GivenCsrAndCmdqWithSameTaskLevelWhenEnqueingMarkerThenPipeControlIsAdded) {
-    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    pCmdQ->updateLatestSentEnqueueType(EnqueueProperties::Operation::gpuKernel);
 
     // Set task levels to known values.
     uint32_t originalCSRLevel = 2;
@@ -41,6 +43,8 @@ HWTEST_F(MarkerTest, GivenCsrAndCmdqWithSameTaskLevelWhenEnqueingMarkerThenPipeC
         eventWaitList,
         event);
     ASSERT_EQ(CL_SUCCESS, retVal);
+    auto mockCmdQ = static_cast<MockCommandQueue *>(pCmdQ);
+    EXPECT_FALSE(mockCmdQ->splitBarrierRequired);
 
     // Should sync CSR & CmdQ levels.
     EXPECT_EQ(commandStreamReceiver.peekTaskLevel(), pCmdQ->taskLevel);
@@ -49,11 +53,17 @@ HWTEST_F(MarkerTest, GivenCsrAndCmdqWithSameTaskLevelWhenEnqueingMarkerThenPipeC
 
     // If CSR == CQ then a PC is required.
     auto itorCmd = reverseFind<PIPE_CONTROL *>(cmdList.rbegin(), cmdList.rend());
-    EXPECT_EQ(cmdList.rend(), itorCmd);
+
+    if (mockCmdQ->getHeaplessModeEnabled()) {
+        EXPECT_NE(cmdList.rend(), itorCmd);
+    } else {
+        EXPECT_EQ(cmdList.rend(), itorCmd);
+    }
 }
 
 HWTEST_F(MarkerTest, GivenCsrAndCmdqWithDifferentTaskLevelsWhenEnqueingMarkerThenPipeControlIsNotAdded) {
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    pCmdQ->updateLatestSentEnqueueType(EnqueueProperties::Operation::profilingOnly);
 
     // Set task levels to known values.
     commandStreamReceiver.taskLevel = 2;
@@ -67,6 +77,8 @@ HWTEST_F(MarkerTest, GivenCsrAndCmdqWithDifferentTaskLevelsWhenEnqueingMarkerThe
         eventWaitList,
         event);
     ASSERT_EQ(CL_SUCCESS, retVal);
+    auto mockCmdQ = static_cast<MockCommandQueue *>(pCmdQ);
+    EXPECT_FALSE(mockCmdQ->splitBarrierRequired);
 
     // Should sync CSR & CmdQ levels.
     EXPECT_EQ(1u, pCmdQ->taskLevel);
@@ -74,7 +86,7 @@ HWTEST_F(MarkerTest, GivenCsrAndCmdqWithDifferentTaskLevelsWhenEnqueingMarkerThe
 
     auto sizeUsed = pCS->getUsed();
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, pCmdBuffer, sizeUsed));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, pCmdBuffer, sizeUsed));
 
     // If CSR > CQ then a PC isn't required.
     auto itorCmd = find<typename FamilyType::PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
@@ -106,13 +118,13 @@ TEST_F(MarkerTest, WhenEnqueingMarkerThenEventIsReturned) {
 
 HWTEST_F(MarkerTest, GivenGpuHangAndBlockingCallWhenEnqueingMarkerThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context, device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     cl_uint numEventsInWaitList = 0;
     const cl_event *eventWaitList = nullptr;
@@ -144,9 +156,6 @@ HWTEST_F(MarkerTest, WhenEnqueingMarkerThenReturnedEventShouldHaveEqualDepthToLa
     ASSERT_NE(nullptr, event);
     std::unique_ptr<Event> pEvent((Event *)(event));
 
-    // Shouldn't sync to CSR
-    // should sync to command queue last packet
-    EXPECT_EQ(1u, pEvent->taskLevel);
     EXPECT_EQ(pCmdQ->taskLevel, pEvent->taskLevel);
 }
 
@@ -182,7 +191,11 @@ HWTEST_F(MarkerTest, GivenEventWithWaitDependenciesWhenEnqueingMarkerThenCsrLeve
     // Should sync CSR & CmdQ levels.
     if (pCmdQ->getGpgpuCommandStreamReceiver().peekTimestampPacketWriteEnabled()) {
         EXPECT_EQ(initialTaskLevel, pCmdQ->taskLevel);
-        EXPECT_EQ(initialTaskLevel + 1, commandStreamReceiver.peekTaskLevel());
+
+        if (!commandStreamReceiver.isUpdateTagFromWaitEnabled()) {
+            initialTaskLevel++;
+        }
+        EXPECT_EQ(initialTaskLevel, commandStreamReceiver.peekTaskLevel());
     } else {
         EXPECT_EQ(commandStreamReceiver.peekTaskLevel(), pCmdQ->taskLevel);
     }
@@ -202,7 +215,8 @@ TEST_F(MarkerTest, givenMultipleEventWhenTheyArePassedToMarkerThenOutputEventHas
             &event3};
     cl_uint numEventsInWaitList = sizeof(eventWaitList) / sizeof(eventWaitList[0]);
     cl_event event = nullptr;
-    auto initialTaskCount = pCmdQ->taskCount;
+    auto &csr = pCmdQ->getGpgpuCommandStreamReceiver();
+    auto initialTaskCount = std::max(pCmdQ->taskCount, csr.peekTaskCount());
 
     pCmdQ->enqueueMarkerWithWaitList(
         numEventsInWaitList,
@@ -211,7 +225,7 @@ TEST_F(MarkerTest, givenMultipleEventWhenTheyArePassedToMarkerThenOutputEventHas
 
     std::unique_ptr<Event> pEvent((Event *)(event));
 
-    if (pCmdQ->getGpgpuCommandStreamReceiver().peekTimestampPacketWriteEnabled()) {
+    if (csr.peekTimestampPacketWriteEnabled()) {
         EXPECT_EQ(initialTaskCount + 1, pCmdQ->taskCount);
         EXPECT_EQ(initialTaskCount + 1, pEvent->peekTaskCount());
     } else {
@@ -236,7 +250,8 @@ TEST_F(MarkerTest, givenMultipleEventsAndCompletedUserEventWhenTheyArePassedToMa
             &userEvent};
     cl_uint numEventsInWaitList = sizeof(eventWaitList) / sizeof(eventWaitList[0]);
     cl_event event = nullptr;
-    auto initialTaskCount = pCmdQ->taskCount;
+
+    auto initialTaskCount = std::max(pCmdQ->getGpgpuCommandStreamReceiver().peekTaskCount(), pCmdQ->taskCount);
 
     pCmdQ->enqueueMarkerWithWaitList(
         numEventsInWaitList,
@@ -255,11 +270,11 @@ TEST_F(MarkerTest, givenMultipleEventsAndCompletedUserEventWhenTheyArePassedToMa
 }
 
 HWTEST_F(MarkerTest, givenMarkerCallFollowingNdrangeCallInBatchedModeWhenWaitForEventsIsCalledThenFlushStampIsProperlyUpdated) {
-    MockKernelWithInternals mockKernel(*this->pClDevice, this->context);
+    MockKernelWithInternals mockKernel(*this->context);
 
     auto &ultCommandStreamReceiver = this->pDevice->getUltCommandStreamReceiver<FamilyType>();
 
-    ultCommandStreamReceiver.overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    ultCommandStreamReceiver.overrideDispatchPolicy(DispatchMode::batchedDispatch);
 
     cl_event eventFromNdr = nullptr;
     size_t gws[] = {1};
@@ -281,7 +296,7 @@ HWTEST_F(MarkerTest, givenMarkerCallFollowingNdrangeCallInBatchedModeWhenWaitFor
 struct MarkerWithProfilingTest : public MarkerTest {
     void SetUp() override {
         dbgRestore = std::make_unique<DebugManagerStateRestore>();
-        DebugManager.flags.EnableTimestampPacket.set(0);
+        debugManager.flags.EnableTimestampPacket.set(0);
         MarkerTest::SetUp();
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -45,5 +45,3 @@ struct ProductConfigHwInfoTests : public ProductConfigTest<::testing::TestWithPa
 };
 
 using ProductConfigTests = ProductConfigTest<::testing::Test>;
-using ProductConfigHwInfoBadRevisionTests = ProductConfigHwInfoTests;
-using ProductConfigHwInfoBadArchTests = ProductConfigHwInfoTests;

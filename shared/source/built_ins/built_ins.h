@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,70 +7,85 @@
 
 #pragma once
 #include "shared/source/built_ins/built_in_ops_base.h"
+#include "shared/source/built_ins/built_in_resource.h"
 #include "shared/source/built_ins/sip_kernel_type.h"
 #include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/string.h"
+#include "shared/source/utilities/mem_lifetime.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/stackvec.h"
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace NEO {
-typedef std::vector<char> BuiltinResourceT;
 
 class Device;
 class SipKernel;
 class MemoryManager;
 class OsContext;
 
-inline constexpr ConstStringRef mediaKernelsBuildOptionsList[] = {
-    "-D cl_intel_device_side_advanced_vme_enable",
-    "-D cl_intel_device_side_avc_vme_enable",
-    "-D cl_intel_device_side_vme_enable",
-    "-D cl_intel_media_block_io",
-    CompilerOptions::fastRelaxedMath};
+namespace BuiltIn {
 
-inline constexpr CompilerOptions::ConstConcatenation<> mediaKernelsBuildOptions{mediaKernelsBuildOptionsList};
+enum class CodeType {
+    any = 0,          // for requesting "any" code available - priorities as below
+    binary = 1,       // ISA - highest priority
+    intermediate = 2, // SPIR/LLVM - medium priority
+    source = 3,       // OCL C - lowest priority
+    count,
+    invalid
+};
 
-struct BuiltinCode {
-    enum class ECodeType {
-        Any = 0,          // for requesting "any" code available - priorities as below
-        Binary = 1,       // ISA - highest priority
-        Intermediate = 2, // SPIR/LLVM - medium prioroty
-        Source = 3,       // OCL C - lowest priority
-        COUNT,
-        INVALID
-    };
-
-    static const char *getExtension(BuiltinCode::ECodeType ct) {
+struct Code {
+    static constexpr const char *getExtension(CodeType ct) {
         switch (ct) {
         default:
             return "";
-        case BuiltinCode::ECodeType::Binary:
+        case CodeType::binary:
             return ".bin";
-        case BuiltinCode::ECodeType::Intermediate:
-            return ".bc";
-        case BuiltinCode::ECodeType::Source:
+        case CodeType::intermediate:
+            return ".spv";
+        case CodeType::source:
             return ".cl";
         }
     }
 
-    BuiltinCode::ECodeType type;
-    BuiltinResourceT resource;
+    CodeType type;
+    Resource resource;
     Device *targetDevice;
 };
 
-BuiltinResourceT createBuiltinResource(const char *ptr, size_t size);
-BuiltinResourceT createBuiltinResource(const BuiltinResourceT &r);
-std::string createBuiltinResourceName(EBuiltInOps::Type builtin, const std::string &extension);
-StackVec<std::string, 3> getBuiltinResourceNames(EBuiltInOps::Type builtin, BuiltinCode::ECodeType type, const Device &device);
-std::string joinPath(const std::string &lhs, const std::string &rhs);
-const char *getBuiltinAsString(EBuiltInOps::Type builtin);
-const char *getAdditionalBuiltinAsString(EBuiltInOps::Type builtin);
+} // namespace BuiltIn
+
+namespace BuiltIn {
+
+StackVec<std::string, 3> getResourceNames(BaseKernel kernel, const AddressingMode &mode, CodeType type, const Device &device);
+
+template <BaseKernel kernel, CodeType codeType>
+constexpr auto makeResourceName() {
+    constexpr std::string_view baseName = getAsString(kernel);
+    constexpr std::string_view extension = Code::getExtension(codeType);
+
+    std::array<char, baseName.size() + extension.size() + 1> name{};
+    for (size_t i = 0; i < baseName.size(); ++i) {
+        name[i] = baseName[i];
+    }
+    for (size_t i = 0; i < extension.size(); ++i) {
+        name[baseName.size() + i] = extension[i];
+    }
+    return name;
+}
+
+template <BaseKernel kernel, CodeType codeType>
+inline constexpr auto resourceName = makeResourceName<kernel, codeType>();
 
 class Storage {
   public:
@@ -80,10 +95,10 @@ class Storage {
 
     virtual ~Storage() = default;
 
-    BuiltinResourceT load(const std::string &resourceName);
+    Resource load(const std::string &resourceName);
 
   protected:
-    virtual BuiltinResourceT loadImpl(const std::string &fullResourceName) = 0;
+    virtual Resource loadImpl(const std::string &fullResourceName) = 0;
 
     std::string rootPath;
 };
@@ -95,34 +110,7 @@ class FileStorage : public Storage {
     }
 
   protected:
-    BuiltinResourceT loadImpl(const std::string &fullResourceName) override;
-};
-
-struct EmbeddedStorageRegistry {
-    inline static bool exists = false;
-
-    static EmbeddedStorageRegistry &getInstance() {
-        static EmbeddedStorageRegistry gsr;
-        return gsr;
-    }
-
-    void store(const std::string &name, BuiltinResourceT &&resource) {
-        resources.emplace(name, BuiltinResourceT(std::move(resource)));
-    }
-
-    const BuiltinResourceT *get(const std::string &name) const;
-
-    ~EmbeddedStorageRegistry() {
-        exists = false;
-    }
-
-  protected:
-    EmbeddedStorageRegistry() {
-        exists = true;
-    }
-
-    using ResourcesContainer = std::unordered_map<std::string, BuiltinResourceT>;
-    ResourcesContainer resources;
+    Resource loadImpl(const std::string &fullResourceName) override;
 };
 
 class EmbeddedStorage : public Storage {
@@ -132,22 +120,24 @@ class EmbeddedStorage : public Storage {
     }
 
   protected:
-    BuiltinResourceT loadImpl(const std::string &fullResourceName) override;
+    Resource loadImpl(const std::string &fullResourceName) override;
 };
 
-class BuiltinsLib {
+class ResourceLoader {
   public:
-    BuiltinsLib();
-    BuiltinCode getBuiltinCode(EBuiltInOps::Type builtin, BuiltinCode::ECodeType requestedCodeType, Device &device);
+    ResourceLoader();
+    Code getBuiltinCode(BaseKernel kernel, const AddressingMode &mode, CodeType requestedCodeType, Device &device);
 
   protected:
-    BuiltinResourceT getBuiltinResource(EBuiltInOps::Type builtin, BuiltinCode::ECodeType requestedCodeType, Device &device);
+    Resource getBuiltinResource(BaseKernel kernel, const AddressingMode &mode, CodeType requestedCodeType, Device &device);
 
     using StoragesContainerT = std::vector<std::unique_ptr<Storage>>;
     StoragesContainerT allStorages; // sorted by priority allStorages[0] will be checked before allStorages[1], etc.
 
     std::mutex mutex;
 };
+
+} // namespace BuiltIn
 
 class BuiltIns {
   public:
@@ -158,22 +148,19 @@ class BuiltIns {
     MOCKABLE_VIRTUAL const SipKernel &getSipKernel(Device &device, OsContext *context);
     MOCKABLE_VIRTUAL void freeSipKernels(MemoryManager *memoryManager);
 
-    BuiltinsLib &getBuiltinsLib() {
+    BuiltIn::ResourceLoader &getBuiltinsLib() {
         DEBUG_BREAK_IF(!builtinsLib.get());
         return *builtinsLib;
     }
 
   protected:
     // sip builtins
-    std::pair<std::unique_ptr<SipKernel>, std::once_flag> sipKernels[static_cast<uint32_t>(SipKernelType::COUNT)];
+    std::pair<std::unique_ptr<SipKernel>, std::once_flag> sipKernels[static_cast<uint32_t>(SipKernelType::count)];
 
-    std::unique_ptr<BuiltinsLib> builtinsLib;
+    std::unique_ptr<BuiltIn::ResourceLoader> builtinsLib;
 
     using ContextId = uint32_t;
     std::unordered_map<ContextId, std::pair<std::unique_ptr<SipKernel>, std::once_flag>> perContextSipKernels;
 };
-
-template <EBuiltInOps::Type OpCode>
-class BuiltInOp;
 
 } // namespace NEO

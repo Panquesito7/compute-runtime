@@ -1,0 +1,20 @@
+;
+; Copyright (C) 2026 Intel Corporation
+;
+; SPDX-License-Identifier: MIT
+;
+
+LIBRARY    "ze_intel_gpu64"
+EXPORTS
+
+; OpenCL API entries queried by LEO forwarding
+clGetPlatformInfo
+clGetExtensionFunctionAddress
+
+clEnqueueMarkerWithSyncObjectINTEL
+clGetCLObjectInfoINTEL
+clGetCLEventInfoINTEL
+clReleaseGlSharedEventINTEL
+
+; Level Zero API ProcAddrTable entries are exported implicitly via ZE_DLLEXPORT
+; and do not need to be listed here.

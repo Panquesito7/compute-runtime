@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/in_order_cmd_helpers.h"
 #include "shared/source/helpers/timestamp_packet.h"
 #include "shared/source/utilities/hw_timestamps.h"
 #include "shared/source/utilities/perf_counter.h"
@@ -20,13 +21,15 @@
 
 #include "gtest/gtest.h"
 
+#include <array>
 #include <cstdint>
+#include <limits>
 
 using namespace NEO;
 
 struct TagAllocatorTest : public Test<MemoryAllocatorFixture> {
     void SetUp() override {
-        DebugManager.flags.CreateMultipleSubDevices.set(4);
+        debugManager.flags.CreateMultipleSubDevices.set(4);
         MemoryAllocatorFixture::setUp();
     }
 
@@ -35,15 +38,17 @@ struct TagAllocatorTest : public Test<MemoryAllocatorFixture> {
 };
 
 struct TimeStamps {
-    void initialize() {
+    using ValueT = uint64_t;
+    void initialize(uint64_t initValue) {
+        initializeCount++;
         start = 1;
         end = 2;
     }
     static constexpr AllocationType getAllocationType() {
-        return AllocationType::PROFILING_TAG_BUFFER;
+        return AllocationType::profilingTagBuffer;
     }
 
-    static constexpr TagNodeType getTagNodeType() { return TagNodeType::HwTimeStamps; }
+    static constexpr TagNodeType getTagNodeType() { return TagNodeType::hwTimeStamps; }
 
     uint64_t getContextStartValue(uint32_t packetIndex) const {
         return start;
@@ -61,6 +66,11 @@ struct TimeStamps {
         return end;
     }
 
+    void getGlobalTimestampValues(uint32_t packetIndex, uint64_t &globalStart, uint64_t &globalEnd) const {
+        globalStart = start;
+        globalEnd = end;
+    }
+
     void const *getContextEndAddress(uint32_t packetIndex) const { return &end; }
 
     uint64_t start;
@@ -68,6 +78,8 @@ struct TimeStamps {
 
     uint64_t contextCompleteTS;
     uint64_t globalEndTS;
+
+    uint32_t initializeCount = 0;
 };
 
 template <typename TagType>
@@ -87,17 +99,18 @@ class MockTagAllocator : public TagAllocator<TagType> {
     using BaseClass::TagAllocator;
     using BaseClass::usedTags;
     using BaseClass::TagAllocatorBase::cleanUpResources;
+    using BaseClass::TagAllocatorBase::memoryManager;
 
-    MockTagAllocator(uint32_t rootDeviceIndex, MemoryManager *memoryManager, size_t tagCount,
+    MockTagAllocator(uint32_t rootDeviceIndex, MemoryManager *memoryManager, uint32_t tagCount,
                      size_t tagAlignment, size_t tagSize, bool doNotReleaseNodes, DeviceBitfield deviceBitfield)
-        : BaseClass(RootDeviceIndicesContainer{rootDeviceIndex}, memoryManager, tagCount, tagAlignment, tagSize, doNotReleaseNodes, deviceBitfield) {
+        : BaseClass(RootDeviceIndicesContainer{rootDeviceIndex}, memoryManager, tagCount, tagAlignment, tagSize, 0, doNotReleaseNodes, true, deviceBitfield) {
     }
 
-    MockTagAllocator(MemoryManager *memMngr, size_t tagCount, size_t tagAlignment, bool disableCompletionCheck, DeviceBitfield deviceBitfield)
+    MockTagAllocator(MemoryManager *memMngr, uint32_t tagCount, size_t tagAlignment, bool disableCompletionCheck, DeviceBitfield deviceBitfield)
         : MockTagAllocator(0, memMngr, tagCount, tagAlignment, sizeof(TagType), disableCompletionCheck, deviceBitfield) {
     }
 
-    MockTagAllocator(MemoryManager *memMngr, size_t tagCount, size_t tagAlignment, DeviceBitfield deviceBitfield)
+    MockTagAllocator(MemoryManager *memMngr, uint32_t tagCount, size_t tagAlignment, DeviceBitfield deviceBitfield)
         : MockTagAllocator(memMngr, tagCount, tagAlignment, false, deviceBitfield) {
     }
 
@@ -174,6 +187,7 @@ TEST_F(TagAllocatorTest, WhenGettingAndReturningTagThenFreeAndUsedListsAreUpdate
 TEST_F(TagAllocatorTest, WhenTagAllocatorIsCreatedThenItPopulatesTagsWithProperDeviceBitfield) {
     size_t alignment = 64;
 
+    memoryManager->recentlyPassedDeviceBitfield = 0;
     EXPECT_NE(deviceBitfield, memoryManager->recentlyPassedDeviceBitfield);
     MockTagAllocator<TimeStamps> tagAllocator(memoryManager, 10, alignment, deviceBitfield);
     EXPECT_EQ(deviceBitfield, memoryManager->recentlyPassedDeviceBitfield);
@@ -217,20 +231,53 @@ TEST_F(TagAllocatorTest, givenTagAllocatorWhenAllNodesWereUsedThenCreateNewGraph
     EXPECT_EQ(2u, tagAllocator.getTagPoolCount());
 }
 
+TEST_F(TagAllocatorTest, givenAllocationFailureWhenTagAllocatorIsCreatedThenNoTagPoolIsCreatedAndGetTagReturnsNullptr) {
+    FailMemoryManager failMemoryManager(0, *executionEnvironment);
+    MockTagAllocator<TimeStamps> tagAllocator(&failMemoryManager, 10, 16, deviceBitfield);
+
+    EXPECT_EQ(0u, tagAllocator.getGraphicsAllocationsCount());
+    EXPECT_EQ(0u, tagAllocator.getTagPoolCount());
+    EXPECT_EQ(nullptr, tagAllocator.getFreeTagsHead());
+
+    EXPECT_EQ(nullptr, tagAllocator.getTag());
+    EXPECT_EQ(nullptr, tagAllocator.getUsedTagsHead());
+}
+
+TEST_F(TagAllocatorTest, givenAllTagsUsedAndAllocationFailureWhenGettingTagThenNullptrIsReturnedAndExistingPoolIsKept) {
+    MockTagAllocator<TimeStamps> tagAllocator(memoryManager, 2, 1024, deviceBitfield);
+
+    auto tag0 = tagAllocator.getTag();
+    auto tag1 = tagAllocator.getTag();
+    ASSERT_NE(nullptr, tag0);
+    ASSERT_NE(nullptr, tag1);
+
+    FailMemoryManager failMemoryManager(0, *executionEnvironment);
+    tagAllocator.memoryManager = &failMemoryManager;
+
+    EXPECT_EQ(nullptr, tagAllocator.getTag());
+    EXPECT_EQ(1u, tagAllocator.getGraphicsAllocationsCount());
+    EXPECT_EQ(1u, tagAllocator.getTagPoolCount());
+
+    tagAllocator.memoryManager = memoryManager;
+
+    tag0->returnTag();
+    tag1->returnTag();
+}
+
 TEST_F(TagAllocatorTest, givenInputTagCountWhenCreatingAllocatorThenRequestedNumberOfNodesIsCreated) {
     class MyMockMemoryManager : public MockMemoryManager {
       public:
         using MockMemoryManager::MockMemoryManager;
         GraphicsAllocation *allocateGraphicsMemoryWithAlignment(const AllocationData &allocationData) override {
-            return new MemoryAllocation(0, TimestampPackets<uint32_t>::getAllocationType(), nullptr, nullptr, 0, MemoryConstants::pageSize,
-                                        1, MemoryPool::System4KBPages, false, false, MemoryManager::maxOsContextCount);
+            return new MemoryAllocation(0, 1u /*num gmms*/, TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>::getAllocationType(), nullptr, nullptr, 0, MemoryConstants::pageSize,
+                                        1, MemoryPool::system4KBPages, false, false, MemoryManager::maxOsContextCount);
         }
     };
 
     auto mockMemoryManager = std::make_unique<MyMockMemoryManager>(true, true, *executionEnvironment);
 
     const size_t tagsCount = 3;
-    MockTagAllocator<TimestampPackets<uint32_t>> tagAllocator(mockMemoryManager.get(), tagsCount, 1, deviceBitfield);
+    MockTagAllocator<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> tagAllocator(mockMemoryManager.get(), tagsCount, 1, deviceBitfield);
 
     size_t nodesFound = 0;
     auto head = tagAllocator.freeTags.peekHead();
@@ -352,6 +399,27 @@ TEST_F(TagAllocatorTest, whenNewTagIsTakenThenItIsInitialized) {
     EXPECT_TRUE(node->isProfilingCapable());
 }
 
+TEST_F(TagAllocatorTest, givenReinitializationDisabledWhenGettingNewTagThenDontInitialize) {
+    MockTagAllocator<TimeStamps> tagAllocator1(RootDeviceIndicesContainer{0}, memoryManager, 1, 2, sizeof(TimeStamps), 0, false, true, deviceBitfield);
+    MockTagAllocator<TimeStamps> tagAllocator2(RootDeviceIndicesContainer{0}, memoryManager, 1, 2, sizeof(TimeStamps), 0, false, false, deviceBitfield);
+
+    tagAllocator1.freeTags.peekHead()->tagForCpuAccess->initializeCount = 0;
+    tagAllocator2.freeTags.peekHead()->tagForCpuAccess->initializeCount = 0;
+
+    auto node1 = static_cast<TagNode<TimeStamps> *>(tagAllocator1.getTag());
+    auto node2 = static_cast<TagNode<TimeStamps> *>(tagAllocator2.getTag());
+    EXPECT_EQ(1u, node1->tagForCpuAccess->initializeCount);
+    EXPECT_EQ(0u, node2->tagForCpuAccess->initializeCount);
+
+    node1->returnTag();
+    node2->returnTag();
+
+    node1 = static_cast<TagNode<TimeStamps> *>(tagAllocator1.getTag());
+    node2 = static_cast<TagNode<TimeStamps> *>(tagAllocator2.getTag());
+    EXPECT_EQ(2u, node1->tagForCpuAccess->initializeCount);
+    EXPECT_EQ(0u, node2->tagForCpuAccess->initializeCount);
+}
+
 TEST_F(TagAllocatorTest, givenMultipleReferencesOnTagWhenReleasingThenReturnWhenAllRefCountsAreReleased) {
     MockTagAllocator<TimeStamps> tagAllocator(memoryManager, 2, 1, deviceBitfield);
 
@@ -436,21 +504,27 @@ TEST_F(TagAllocatorTest, givenEmptyFreeListWhenAskingForNewTagThenTryToReleaseDe
     EXPECT_TRUE(tagAllocator.freeTags.peekIsEmpty());
     node = static_cast<TagNode<MockTimestampPackets32> *>(tagAllocator.getTag());
     EXPECT_NE(nullptr, node);
-    EXPECT_TRUE(tagAllocator.freeTags.peekIsEmpty()); // empty again - new pool wasnt allocated
+    EXPECT_TRUE(tagAllocator.freeTags.peekIsEmpty()); // empty again - new pool was not allocated
 }
 
 TEST_F(TagAllocatorTest, givenTagAllocatorWhenGraphicsAllocationIsCreatedThenSetValidllocationType) {
-    MockTagAllocator<TimestampPackets<uint32_t>> timestampPacketAllocator(mockRootDeviceIndex, memoryManager, 1, 1, sizeof(TimestampPackets<uint32_t>), false, mockDeviceBitfield);
+    MockTagAllocator<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> timestampPacketAllocator(mockRootDeviceIndex, memoryManager, 1, 1, sizeof(TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>), false, mockDeviceBitfield);
     MockTagAllocator<HwTimeStamps> hwTimeStampsAllocator(mockRootDeviceIndex, memoryManager, 1, 1, sizeof(HwTimeStamps), false, mockDeviceBitfield);
     MockTagAllocator<HwPerfCounter> hwPerfCounterAllocator(mockRootDeviceIndex, memoryManager, 1, 1, sizeof(HwPerfCounter), false, mockDeviceBitfield);
+    MockTagAllocator<DeviceAllocNodeType<true>> inOrderDeviceAllocator(mockRootDeviceIndex, memoryManager, 1, 1, sizeof(HwPerfCounter), false, mockDeviceBitfield);
+    MockTagAllocator<DeviceAllocNodeType<false>> inOrderHostAllocator(mockRootDeviceIndex, memoryManager, 1, 1, sizeof(HwPerfCounter), false, mockDeviceBitfield);
 
     auto timestampPacketTag = timestampPacketAllocator.getTag();
     auto hwTimeStampsTag = hwTimeStampsAllocator.getTag();
     auto hwPerfCounterTag = hwPerfCounterAllocator.getTag();
+    auto inOrderDeviceTag = inOrderDeviceAllocator.getTag();
+    auto inOrderHostTag = inOrderHostAllocator.getTag();
 
-    EXPECT_EQ(AllocationType::TIMESTAMP_PACKET_TAG_BUFFER, timestampPacketTag->getBaseGraphicsAllocation()->getAllocationType());
-    EXPECT_EQ(AllocationType::PROFILING_TAG_BUFFER, hwTimeStampsTag->getBaseGraphicsAllocation()->getAllocationType());
-    EXPECT_EQ(AllocationType::PROFILING_TAG_BUFFER, hwPerfCounterTag->getBaseGraphicsAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::timestampPacketTagBuffer, timestampPacketTag->getBaseGraphicsAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::profilingTagBuffer, hwTimeStampsTag->getBaseGraphicsAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::profilingTagBuffer, hwPerfCounterTag->getBaseGraphicsAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::gpuTimestampDeviceBuffer, inOrderDeviceTag->getBaseGraphicsAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::timestampPacketTagBuffer, inOrderHostTag->getBaseGraphicsAllocation()->getAllocationType());
 }
 
 TEST_F(TagAllocatorTest, givenMultipleRootDevicesWhenPopulatingTagsThenCreateMultiGraphicsAllocation) {
@@ -468,7 +542,9 @@ TEST_F(TagAllocatorTest, givenMultipleRootDevicesWhenPopulatingTagsThenCreateMul
 
     const RootDeviceIndicesContainer indices = {0, 2, maxRootDeviceIndex};
 
-    MockTagAllocator<TimestampPackets<uint32_t>> timestampPacketAllocator(indices, testMemoryManager, 1, 1, sizeof(TimestampPackets<uint32_t>), false, mockDeviceBitfield);
+    MockTagAllocator<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> timestampPacketAllocator(indices, testMemoryManager, 1, 1,
+                                                                                                                          sizeof(TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>), 0, false,
+                                                                                                                          true, mockDeviceBitfield);
 
     EXPECT_EQ(1u, timestampPacketAllocator.getGraphicsAllocationsCount());
 
@@ -498,18 +574,19 @@ HWTEST_F(TagAllocatorTest, givenMultipleRootDevicesWhenCallingMakeResidentThenUs
 
     const RootDeviceIndicesContainer indicesVector = {0, 1};
 
-    MockTagAllocator<TimestampPackets<uint32_t>> timestampPacketAllocator(indicesVector, testMemoryManager, 1, 1, sizeof(TimestampPackets<uint32_t>), false, mockDeviceBitfield);
+    MockTagAllocator<TimestampPackets<uint32_t, FamilyType::timestampPacketCount>> timestampPacketAllocator(indicesVector, testMemoryManager, 1, 1, sizeof(TimestampPackets<uint32_t, FamilyType::timestampPacketCount>),
+                                                                                                            0, false, true, mockDeviceBitfield);
 
     EXPECT_EQ(1u, timestampPacketAllocator.getGraphicsAllocationsCount());
 
     auto multiGraphicsAllocation = timestampPacketAllocator.gfxAllocations[0].get();
 
     auto rootCsr0 = std::unique_ptr<UltCommandStreamReceiver<FamilyType>>(static_cast<UltCommandStreamReceiver<FamilyType> *>(createCommandStream(*executionEnvironment, 0, 1)));
-    auto osContext0 = testMemoryManager->createAndRegisterOsContext(rootCsr0.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular}, true));
+    auto osContext0 = testMemoryManager->createAndRegisterOsContext(rootCsr0.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular}, true));
     rootCsr0->setupContext(*osContext0);
 
     auto rootCsr1 = std::unique_ptr<UltCommandStreamReceiver<FamilyType>>(static_cast<UltCommandStreamReceiver<FamilyType> *>(createCommandStream(*executionEnvironment, 1, 1)));
-    auto osContext1 = testMemoryManager->createAndRegisterOsContext(rootCsr1.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_BCS, EngineUsage::Regular}, true));
+    auto osContext1 = testMemoryManager->createAndRegisterOsContext(rootCsr1.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_BCS, EngineUsage::regular}, true));
     rootCsr1->setupContext(*osContext1);
 
     rootCsr0->storeMakeResidentAllocations = true;
@@ -542,6 +619,45 @@ TEST_F(TagAllocatorTest, givenNotSupportedTagTypeWhenCallingMethodThenAbortOrRet
         EXPECT_ANY_THROW(perfCounterNode.getGlobalEndRef());
         EXPECT_ANY_THROW(perfCounterNode.getSinglePacketSize());
         EXPECT_ANY_THROW(perfCounterNode.assignDataToAllTimestamps(0, nullptr));
+        uint64_t globalStart = 0u;
+        uint64_t globalEnd = 0u;
+        EXPECT_ANY_THROW(perfCounterNode.getGlobalTimestampValues(0, globalStart, globalEnd));
+    }
+
+    {
+        TagNode<DeviceAllocNodeType<true>> inOrder = {};
+
+        EXPECT_ANY_THROW(inOrder.getGlobalStartOffset());
+        EXPECT_ANY_THROW(inOrder.getContextStartOffset());
+        EXPECT_ANY_THROW(inOrder.getContextEndOffset());
+        EXPECT_ANY_THROW(inOrder.getGlobalEndOffset());
+        EXPECT_ANY_THROW(inOrder.getContextStartValue(0));
+        EXPECT_ANY_THROW(inOrder.getGlobalStartValue(0));
+        EXPECT_ANY_THROW(inOrder.getContextEndValue(0));
+        EXPECT_ANY_THROW(inOrder.getGlobalEndValue(0));
+        EXPECT_ANY_THROW(inOrder.getContextEndAddress(0));
+        EXPECT_ANY_THROW(inOrder.getContextCompleteRef());
+        EXPECT_ANY_THROW(inOrder.getGlobalEndRef());
+        EXPECT_ANY_THROW(inOrder.getSinglePacketSize());
+        EXPECT_ANY_THROW(inOrder.assignDataToAllTimestamps(0, nullptr));
+    }
+
+    {
+        TagNode<DeviceAllocNodeType<false>> inOrder = {};
+
+        EXPECT_ANY_THROW(inOrder.getGlobalStartOffset());
+        EXPECT_ANY_THROW(inOrder.getContextStartOffset());
+        EXPECT_ANY_THROW(inOrder.getContextEndOffset());
+        EXPECT_ANY_THROW(inOrder.getGlobalEndOffset());
+        EXPECT_ANY_THROW(inOrder.getContextStartValue(0));
+        EXPECT_ANY_THROW(inOrder.getGlobalStartValue(0));
+        EXPECT_ANY_THROW(inOrder.getContextEndValue(0));
+        EXPECT_ANY_THROW(inOrder.getGlobalEndValue(0));
+        EXPECT_ANY_THROW(inOrder.getContextEndAddress(0));
+        EXPECT_ANY_THROW(inOrder.getContextCompleteRef());
+        EXPECT_ANY_THROW(inOrder.getGlobalEndRef());
+        EXPECT_ANY_THROW(inOrder.getSinglePacketSize());
+        EXPECT_ANY_THROW(inOrder.assignDataToAllTimestamps(0, nullptr));
     }
 
     {
@@ -557,10 +673,108 @@ TEST_F(TagAllocatorTest, givenNotSupportedTagTypeWhenCallingMethodThenAbortOrRet
     }
 
     {
-        TagNode<TimestampPackets<uint32_t>> timestampPacketsNode = {};
+        using TsType = TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>;
+        TagNode<TsType> timestampPacketsNode = {};
+        TsType data = {};
+        timestampPacketsNode.tagForCpuAccess = &data;
 
         EXPECT_ANY_THROW(timestampPacketsNode.getContextCompleteRef());
         EXPECT_ANY_THROW(timestampPacketsNode.getGlobalEndRef());
         EXPECT_ANY_THROW(timestampPacketsNode.getQueryHandleRef());
+        EXPECT_NO_THROW(timestampPacketsNode.getContextEndValue(0));
+        EXPECT_NO_THROW(timestampPacketsNode.getContextStartValue(0));
+        EXPECT_NO_THROW(timestampPacketsNode.getGlobalEndValue(0));
+        EXPECT_NO_THROW(timestampPacketsNode.getGlobalStartValue(0));
+        uint64_t globalStart = 0u;
+        uint64_t globalEnd = 0u;
+        EXPECT_NO_THROW(timestampPacketsNode.getGlobalTimestampValues(0, globalStart, globalEnd));
     }
+}
+
+TEST_F(TagAllocatorTest, givenTagNodeWithoutAllocatorWhenMarkAsAbortedThenResetTagValueWithoutCallback) {
+    TagNode<DeviceAllocNodeType<true>> node = {};
+    DeviceAllocNodeType<true> data = {};
+    data.initialize(0x1234);
+    node.tagForCpuAccess = &data;
+
+    node.markAsAborted();
+
+    EXPECT_EQ(0u, *reinterpret_cast<uint64_t *>(node.getCpuBase()));
+}
+
+TEST_F(TagAllocatorTest, givenAllocatorCallbackWhenInitializingTagThenNotifyCallbackOnTagInitialization) {
+    MockTagAllocator<DeviceAllocNodeType<true>> tagAllocator(memoryManager, 1u, 64u, deviceBitfield);
+    uint32_t callbackCallCount = 0u;
+    uint64_t updatedOffset = std::numeric_limits<uint64_t>::max();
+    size_t updatedSize = 0u;
+
+    tagAllocator.setTagNodeUpdateCallback([&](TagNodeBase &, uint64_t tagOffset, size_t chunkSize) {
+        callbackCallCount++;
+        updatedOffset = tagOffset;
+        updatedSize = chunkSize;
+    });
+
+    auto *tagNode = static_cast<TagNode<DeviceAllocNodeType<true>> *>(tagAllocator.getTag());
+    ASSERT_NE(nullptr, tagNode);
+
+    EXPECT_EQ(1u, callbackCallCount);
+    EXPECT_EQ(0u, updatedOffset);
+    EXPECT_EQ(tagAllocator.getTagSize(), updatedSize);
+}
+
+TEST_F(TagAllocatorTest, givenTimestampTagNodeWithoutAllocatorWhenAssigningPacketDataThenCopyPacketData) {
+    using TimestampType = TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>;
+    TagNode<TimestampType> node = {};
+    TimestampType data = {};
+    node.tagForCpuAccess = &data;
+
+    const std::array<uint32_t, 4> sourcePacket = {1u, 2u, 3u, 4u};
+    node.assignDataToAllTimestamps(0u, sourcePacket.data());
+
+    EXPECT_EQ(1u, node.getContextStartValue(0u));
+    EXPECT_EQ(2u, node.getGlobalStartValue(0u));
+    EXPECT_EQ(3u, node.getContextEndValue(0u));
+    EXPECT_EQ(4u, node.getGlobalEndValue(0u));
+
+    uint64_t globalStart = 0u;
+    uint64_t globalEnd = 0u;
+    node.getGlobalTimestampValues(0u, globalStart, globalEnd);
+    EXPECT_EQ(node.getGlobalStartValue(0u), globalStart);
+    EXPECT_EQ(node.getGlobalEndValue(0u), globalEnd);
+}
+
+TEST_F(TagAllocatorTest, givenTimestampTagNodeWhenGettingGlobalTimestampValuesThenSingleCopyMatchesPerValueGetters) {
+    using TimestampType64 = TimestampPackets<uint64_t, TimestampPacketConstants::preferredPacketCount>;
+    TagNode<TimestampType64> node = {};
+    TimestampType64 data = {};
+    node.tagForCpuAccess = &data;
+
+    const std::array<uint64_t, 8> sourcePackets = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+    node.setPacketsUsed(2u);
+    node.assignDataToAllTimestamps(0u, sourcePackets.data());
+    node.assignDataToAllTimestamps(1u, sourcePackets.data() + 4u);
+
+    for (uint32_t i = 0u; i < node.getPacketsUsed(); i++) {
+        uint64_t globalStart = 0u;
+        uint64_t globalEnd = 0u;
+        node.getGlobalTimestampValues(i, globalStart, globalEnd);
+        EXPECT_EQ(node.getGlobalStartValue(i), globalStart);
+        EXPECT_EQ(node.getGlobalEndValue(i), globalEnd);
+    }
+}
+
+TEST_F(TagAllocatorTest, givenHwTimeStampsTagNodeWhenGettingGlobalTimestampValuesThenStartAndEndAreReturned) {
+    TagNode<HwTimeStamps> node = {};
+    HwTimeStamps data = {};
+    data.globalStartTS = 123u;
+    data.globalEndTS = 456u;
+    node.tagForCpuAccess = &data;
+
+    uint64_t globalStart = 0u;
+    uint64_t globalEnd = 0u;
+    node.getGlobalTimestampValues(0u, globalStart, globalEnd);
+    EXPECT_EQ(data.globalStartTS, globalStart);
+    EXPECT_EQ(data.globalEndTS, globalEnd);
+    EXPECT_EQ(node.getGlobalStartValue(0u), globalStart);
+    EXPECT_EQ(node.getGlobalEndValue(0u), globalEnd);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,16 +8,19 @@
 #include "shared/source/command_container/encode_surface_state.h"
 #include "shared/source/command_stream/csr_definitions.h"
 #include "shared/source/command_stream/scratch_space_controller.h"
+#include "shared/source/debugger/debugger_l0.h"
+#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/cache_policy.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/pipe_control_args.h"
 #include "shared/source/helpers/state_base_address.h"
+#include "shared/source/host_function/host_function.h"
 #include "shared/source/os_interface/product_helper.h"
 
 #include "level_zero/core/source/cmdqueue/cmdqueue_hw.h"
 
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 
 namespace L0 {
 
@@ -28,37 +31,35 @@ void CommandQueueHw<gfxCoreFamily>::programStateBaseAddress(uint64_t gsba, bool 
     uint32_t rootDeviceIndex = neoDevice->getRootDeviceIndex();
 
     auto csr = this->getCsr();
-    bool dispatchCommand = false;
-    bool multiOsContextCapable = device->isImplicitScalingCapable();
-    bool isRcs = csr->isRcs();
-    auto isDebuggerActive = neoDevice->isDebuggerActive() || neoDevice->getDebugger() != nullptr;
-    bool setGeneralStateBaseAddress = false;
-    bool useGlobalHeapsBaseAddress = false;
-
-    uint64_t globalHeapsBase = 0;
-    uint64_t indirectObjectStateBaseAddress = 0;
-    uint64_t instructionStateBaseAddress = neoDevice->getMemoryManager()->getInternalHeapBaseAddress(
-        rootDeviceIndex, neoDevice->getMemoryManager()->isLocalMemoryUsedForIsa(rootDeviceIndex));
-
-    NEO::StateBaseAddressProperties *sbaProperties = nullptr;
-
-    auto l1CachePolicyData = csr->getStoredL1CachePolicy();
 
     if (streamProperties != nullptr) {
-        dispatchCommand = true;
-        sbaProperties = &streamProperties->stateBaseAddress;
-    } else {
-        if (NEO::ApiSpecificConfig::getBindlessMode()) {
+        bool multiOsContextCapable = device->isImplicitScalingCapable();
+        bool isRcs = csr->isRcs();
+        auto isDebuggerActive = neoDevice->getDebugger() != nullptr;
+        bool setGeneralStateBaseAddress = false;
+        bool useGlobalSshAndDsh = false;
+
+        uint64_t globalHeapsBase = 0;
+        uint64_t indirectObjectStateBaseAddress = 0;
+        uint64_t instructionStateBaseAddress = neoDevice->getMemoryManager()->getInternalHeapBaseAddress(
+            rootDeviceIndex, neoDevice->getMemoryManager()->isLocalMemoryUsedForIsa(rootDeviceIndex));
+        uint64_t bindlessSurfStateBase = 0;
+
+        if (device->getNEODevice()->getBindlessHeapsHelper()) {
+            useGlobalSshAndDsh = true;
             globalHeapsBase = neoDevice->getBindlessHeapsHelper()->getGlobalHeapsBase();
-            indirectObjectStateBaseAddress = neoDevice->getMemoryManager()->getInternalHeapBaseAddress(rootDeviceIndex, useLocalMemoryForIndirectHeap);
 
-            dispatchCommand = true;
-            setGeneralStateBaseAddress = true;
-            useGlobalHeapsBaseAddress = true;
+            if (!device->getNEODevice()->getBindlessHeapsHelper()->isGlobalDshSupported()) {
+                bindlessSurfStateBase = device->getNEODevice()->getBindlessHeapsHelper()->getGlobalHeapsBase();
+            }
         }
-    }
 
-    if (dispatchCommand) {
+        NEO::StateBaseAddressProperties *sbaProperties = nullptr;
+
+        auto l1CachePolicyData = csr->getStoredL1CachePolicy();
+
+        sbaProperties = &streamProperties->stateBaseAddress;
+
         auto gmmHelper = neoDevice->getGmmHelper();
         NEO::EncodeWA<GfxFamily>::addPipeControlBeforeStateBaseAddress(commandStream, neoDevice->getRootDeviceEnvironment(), isRcs, csr->getDcFlushSupport());
 
@@ -69,6 +70,7 @@ void CommandQueueHw<gfxCoreFamily>::programStateBaseAddress(uint64_t gsba, bool 
             instructionStateBaseAddress,                      // instructionHeapBaseAddress
             globalHeapsBase,                                  // globalHeapsBaseAddress
             0,                                                // surfaceStateBaseAddress
+            bindlessSurfStateBase,                            // bindlessSurfaceStateBaseAddress
             &sbaCmd,                                          // stateBaseAddressCmd
             sbaProperties,                                    // sbaProperties
             nullptr,                                          // dsh
@@ -78,16 +80,16 @@ void CommandQueueHw<gfxCoreFamily>::programStateBaseAddress(uint64_t gsba, bool 
             (device->getMOCS(cachedMOCSAllowed, false) >> 1), // statelessMocsIndex
             l1CachePolicyData->getL1CacheValue(false),        // l1CachePolicy
             l1CachePolicyData->getL1CacheValue(true),         // l1CachePolicyDebuggerActive
-            NEO::MemoryCompressionState::NotApplicable,       // memoryCompressionState
+            NEO::MemoryCompressionState::notApplicable,       // memoryCompressionState
             true,                                             // setInstructionStateBaseAddress
             setGeneralStateBaseAddress,                       // setGeneralStateBaseAddress
-            useGlobalHeapsBaseAddress,                        // useGlobalHeapsBaseAddress
+            useGlobalSshAndDsh,                               // useGlobalHeapsBaseAddress
             multiOsContextCapable,                            // isMultiOsContextCapable
-            false,                                            // useGlobalAtomics
             false,                                            // areMultipleSubDevicesInContext
             false,                                            // overrideSurfaceStateBaseAddress
             isDebuggerActive,                                 // isDebuggerActive
-            this->doubleSbaWa                                 // doubleSbaWa
+            this->doubleSbaWa,                                // doubleSbaWa
+            this->heaplessModeEnabled                         // heaplessModeEnabled
         };
         NEO::StateBaseAddressHelper<GfxFamily>::programStateBaseAddressIntoCommandStream(stateBaseAddressHelperArgs, commandStream);
 
@@ -97,19 +99,11 @@ void CommandQueueHw<gfxCoreFamily>::programStateBaseAddress(uint64_t gsba, bool 
                                                                                      commandStream,
                                                                                      sbaCmd, true);
 
-        if (sbaProperties) {
-            if (sbaProperties->bindingTablePoolBaseAddress.value != NEO::StreamProperty64::initValue) {
-                NEO::StateBaseAddressHelper<GfxFamily>::programBindingTableBaseAddress(
-                    commandStream,
-                    static_cast<uint64_t>(sbaProperties->bindingTablePoolBaseAddress.value),
-                    static_cast<uint32_t>(sbaProperties->bindingTablePoolSize.value),
-                    gmmHelper);
-            }
-        } else {
-            auto heap = neoDevice->getBindlessHeapsHelper()->getHeap(NEO::BindlessHeapsHelper::GLOBAL_SSH);
+        if (sbaProperties->bindingTablePoolBaseAddress.value != NEO::StreamProperty64::initValue) {
             NEO::StateBaseAddressHelper<GfxFamily>::programBindingTableBaseAddress(
                 commandStream,
-                *heap,
+                static_cast<uint64_t>(sbaProperties->bindingTablePoolBaseAddress.value),
+                static_cast<uint32_t>(sbaProperties->bindingTablePoolSize.value),
                 gmmHelper);
         }
     }
@@ -120,15 +114,17 @@ void CommandQueueHw<gfxCoreFamily>::programStateBaseAddress(uint64_t gsba, bool 
 template <GFXCORE_FAMILY gfxCoreFamily>
 inline size_t CommandQueueHw<gfxCoreFamily>::estimateStateBaseAddressCmdDispatchSize(bool bindingTableBaseAddress) {
     using STATE_BASE_ADDRESS = typename GfxFamily::STATE_BASE_ADDRESS;
-    using _3DSTATE_BINDING_TABLE_POOL_ALLOC = typename GfxFamily::_3DSTATE_BINDING_TABLE_POOL_ALLOC;
 
-    size_t size = sizeof(STATE_BASE_ADDRESS) + NEO::MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier(false);
+    size_t size = sizeof(STATE_BASE_ADDRESS) + NEO::MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier();
 
     if (this->doubleSbaWa) {
         size += sizeof(STATE_BASE_ADDRESS);
     }
     if (bindingTableBaseAddress) {
-        size += sizeof(_3DSTATE_BINDING_TABLE_POOL_ALLOC);
+        if constexpr (!GfxFamily::isHeaplessRequired()) {
+            using _3DSTATE_BINDING_TABLE_POOL_ALLOC = typename GfxFamily::_3DSTATE_BINDING_TABLE_POOL_ALLOC;
+            size += sizeof(_3DSTATE_BINDING_TABLE_POOL_ALLOC);
+        }
     }
     size += estimateStateBaseAddressDebugTracking();
     return size;
@@ -136,116 +132,178 @@ inline size_t CommandQueueHw<gfxCoreFamily>::estimateStateBaseAddressCmdDispatch
 
 template <GFXCORE_FAMILY gfxCoreFamily>
 size_t CommandQueueHw<gfxCoreFamily>::estimateStateBaseAddressCmdSize() {
-    if (NEO::ApiSpecificConfig::getBindlessMode()) {
-        return estimateStateBaseAddressCmdDispatchSize(true);
-    }
     return 0;
 }
 
-constexpr uint32_t maxPtssIndex = 15u;
+template <GFXCORE_FAMILY gfxCoreFamily>
+bool CommandQueueHw<gfxCoreFamily>::handleScratchSpace(NEO::HeapContainer &sshHeaps,
+                                                       NEO::ScratchSpaceController *scratchController,
+                                                       NEO::GraphicsAllocation *globalStatelessAllocation,
+                                                       bool &gsbaState, bool &frontEndState,
+                                                       uint32_t perThreadScratchSpaceSlot0Size, uint32_t perThreadScratchSpaceSlot1Size) {
+    if (perThreadScratchSpaceSlot0Size > 0 || perThreadScratchSpaceSlot1Size > 0) {
+        if (this->cmdListHeapAddressModel == NEO::HeapAddressModel::globalStateless) {
+            if (!scratchController->setRequiredScratchSpace(globalStatelessAllocation->getUnderlyingBuffer(), 0, perThreadScratchSpaceSlot0Size, perThreadScratchSpaceSlot1Size,
+                                                            csr->getOsContext(), gsbaState, frontEndState)) {
+                return false;
+            }
+        }
+
+        if (sshHeaps.size() > 0) {
+            if (!scratchController->programHeaps(sshHeaps, 1u, perThreadScratchSpaceSlot0Size, perThreadScratchSpaceSlot1Size,
+                                                 csr->getOsContext(), gsbaState, frontEndState)) {
+                return false;
+            }
+        }
+
+        auto scratch0Allocation = scratchController->getScratchSpaceSlot0Allocation();
+        if (scratch0Allocation != nullptr) {
+            csr->makeResident(*scratch0Allocation);
+        }
+
+        auto scratch1Allocation = scratchController->getScratchSpaceSlot1Allocation();
+
+        if (scratch1Allocation != nullptr) {
+            csr->makeResident(*scratch1Allocation);
+        }
+    }
+    return true;
+}
 
 template <GFXCORE_FAMILY gfxCoreFamily>
-void CommandQueueHw<gfxCoreFamily>::handleScratchSpace(NEO::HeapContainer &sshHeaps,
-                                                       NEO::ScratchSpaceController *scratchController,
-                                                       bool &gsbaState, bool &frontEndState,
-                                                       uint32_t perThreadScratchSpaceSize, uint32_t perThreadPrivateScratchSize) {
-    if (perThreadScratchSpaceSize > 0 || perThreadPrivateScratchSize > 0) {
-        if (this->cmdListHeapAddressModel == NEO::HeapAddressModel::GlobalStateless) {
-            auto globalStatelessHeapAllocation = csr->getGlobalStatelessHeapAllocation();
-            scratchController->setRequiredScratchSpace(globalStatelessHeapAllocation->getUnderlyingBuffer(), 0, perThreadScratchSpaceSize, perThreadPrivateScratchSize, csr->peekTaskCount(),
-                                                       csr->getOsContext(), gsbaState, frontEndState);
-        }
-        if (sshHeaps.size() > 0) {
-            uint32_t offsetIndex = maxPtssIndex * csr->getOsContext().getEngineType() + 1u;
-            scratchController->programHeaps(sshHeaps, offsetIndex, perThreadScratchSpaceSize, perThreadPrivateScratchSize, csr->peekTaskCount(),
-                                            csr->getOsContext(), gsbaState, frontEndState);
-        }
-        if (NEO::ApiSpecificConfig::getBindlessMode()) {
-            scratchController->programBindlessSurfaceStateForScratch(device->getNEODevice()->getBindlessHeapsHelper(), perThreadScratchSpaceSize, perThreadPrivateScratchSize, csr->peekTaskCount(),
-                                                                     csr->getOsContext(), gsbaState, frontEndState, csr);
-        }
-        auto scratchAllocation = scratchController->getScratchSpaceAllocation();
-        if (scratchAllocation != nullptr) {
-            csr->makeResident(*scratchAllocation);
-        }
+inline void CommandQueueHw<gfxCoreFamily>::CommandsToPatchVisitor::operator()(PatchFrontEndState &patchElem) {
+    if constexpr (GfxFamily::isHeaplessRequired() == false) {
+        using CFE_STATE = typename GfxFamily::CFE_STATE;
+        uint32_t lowScratchAddress = uint32_t(0xFFFFFFFF & scratchAddress);
+        CFE_STATE *cfeStateCmd = nullptr;
+        cfeStateCmd = reinterpret_cast<CFE_STATE *>(patchElem.pCommand);
 
-        auto privateScratchAllocation = scratchController->getPrivateScratchSpaceAllocation();
+        cfeStateCmd->setScratchSpaceBuffer(lowScratchAddress);
+        NEO::PreambleHelper<GfxFamily>::setSingleSliceDispatchMode(cfeStateCmd, false);
 
-        if (privateScratchAllocation != nullptr) {
-            csr->makeResident(*privateScratchAllocation);
+        if (patchPreambleEnabled) {
+            NEO::EncodeDataMemory<GfxFamily>::programDataMemory(*patchPreambleBuffer, patchElem.gpuAddress, patchElem.pCommand, sizeof(CFE_STATE));
+        } else {
+            *reinterpret_cast<CFE_STATE *>(patchElem.pDestination) = *cfeStateCmd;
+        }
+    } else {
+        UNRECOVERABLE_IF(true);
+    }
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+inline void CommandQueueHw<gfxCoreFamily>::CommandsToPatchVisitor::operator()(PatchComputeWalkerInlineDataScratch &patchElem) {
+    if (NEO::isUndefined(patchElem.patchSize) || NEO::isUndefinedOffset(patchElem.offset)) {
+        return;
+    }
+    if (!patchNewScratchController && patchElem.scratchAddressAfterPatch == scratchAddress) {
+        return;
+    }
+
+    uint64_t fullScratchAddress = scratchAddress + patchElem.baseAddress;
+    if (patchPreambleEnabled) {
+        uint64_t gpuAddressToPatch = patchElem.gpuAddress + patchElem.offset;
+        NEO::EncodeDataMemory<GfxFamily>::programDataMemory(*patchPreambleBuffer, gpuAddressToPatch, &fullScratchAddress, patchElem.patchSize);
+    } else {
+        void *scratchAddressPatch = ptrOffset(patchElem.pDestination, patchElem.offset);
+        std::memcpy(scratchAddressPatch, &fullScratchAddress, patchElem.patchSize);
+    }
+    patchElem.scratchAddressAfterPatch = scratchAddress;
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+inline void CommandQueueHw<gfxCoreFamily>::CommandsToPatchVisitor::operator()(PatchComputeWalkerImplicitArgsScratch &patchElem) {
+    if (!patchNewScratchController && patchElem.scratchAddressAfterPatch == scratchAddress) {
+        return;
+    }
+
+    if (NEO::isDefined(patchElem.patchSize) && NEO::isValidOffset(patchElem.offset)) {
+        uint64_t fullScratchAddress = scratchAddress + patchElem.baseAddress;
+        if (patchPreambleEnabled) {
+            uint64_t gpuAddressToPatch = patchElem.gpuAddress + patchElem.offset;
+            NEO::EncodeDataMemory<GfxFamily>::programDataMemory(*patchPreambleBuffer, gpuAddressToPatch, &fullScratchAddress, patchElem.patchSize);
+        } else {
+            void *scratchAddressPatch = ptrOffset(patchElem.pDestination, patchElem.offset);
+            std::memcpy(scratchAddressPatch, &fullScratchAddress, patchElem.patchSize);
+        }
+    }
+
+    if (NEO::isValidOffset(patchElem.scratch0SizeAllocatedOffset)) {
+        uint32_t scratch0SizeAllocated = queue.csr->getPerThreadScratchSizeSlot0Allocated();
+        if (patchPreambleEnabled) {
+            uint64_t gpuAddressToPatch = patchElem.gpuAddress + patchElem.scratch0SizeAllocatedOffset;
+            NEO::EncodeDataMemory<GfxFamily>::programDataMemory(*patchPreambleBuffer, gpuAddressToPatch, &scratch0SizeAllocated, sizeof(scratch0SizeAllocated));
+        } else {
+            void *scratch0SizeAllocatedPatch = ptrOffset(patchElem.pDestination, patchElem.scratch0SizeAllocatedOffset);
+            std::memcpy(scratch0SizeAllocatedPatch, &scratch0SizeAllocated, sizeof(scratch0SizeAllocated));
+        }
+    }
+
+    patchElem.scratchAddressAfterPatch = scratchAddress;
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+inline void CommandQueueHw<gfxCoreFamily>::CommandsToPatchVisitor::operator()(PatchNoopSpace &patchElem) {
+    if (patchElem.pDestination != nullptr) {
+        if (patchPreambleEnabled) {
+            NEO::EncodeDataMemory<GfxFamily>::programNoop(*patchPreambleBuffer, patchElem.gpuAddress, patchElem.patchSize);
+        } else {
+            memset(patchElem.pDestination, 0, patchElem.patchSize);
         }
     }
 }
 
 template <GFXCORE_FAMILY gfxCoreFamily>
-void CommandQueueHw<gfxCoreFamily>::patchCommands(CommandList &commandList, uint64_t scratchAddress) {
-    using CFE_STATE = typename GfxFamily::CFE_STATE;
-    using MI_SEMAPHORE_WAIT = typename GfxFamily::MI_SEMAPHORE_WAIT;
-    using COMPARE_OPERATION = typename GfxFamily::MI_SEMAPHORE_WAIT::COMPARE_OPERATION;
+inline void CommandQueueHw<gfxCoreFamily>::CommandsToPatchVisitor::operator()(PatchHostFunctionId &patchElem) {
+    NEO::HostFunction hostFunction = {.hostFunctionAddress = patchElem.callbackAddress,
+                                      .userDataAddress = patchElem.userDataAddress};
 
-    auto &commandsToPatch = commandList.getCommandsToPatch();
-    for (auto &commandToPatch : commandsToPatch) {
-        switch (commandToPatch.type) {
-        case CommandList::CommandToPatch::FrontEndState: {
-            uint32_t lowScratchAddress = uint32_t(0xFFFFFFFF & scratchAddress);
-            CFE_STATE *cfeStateCmd = nullptr;
-            cfeStateCmd = reinterpret_cast<CFE_STATE *>(commandToPatch.pCommand);
+    auto allocator = queue.getDevice()->getHostFunctionAllocator(queue.csr);
+    queue.csr->ensureHostFunctionWorkerStarted(allocator);
+    auto &hostFunctionStreamer = queue.csr->getHostFunctionStreamer();
 
-            cfeStateCmd->setScratchSpaceBuffer(lowScratchAddress);
-            cfeStateCmd->setSingleSliceDispatchCcsMode(csr->getOsContext().isEngineInstanced());
+    if (patchPreambleEnabled) {
+        auto size = NEO::HostFunctionHelper<GfxFamily>::getSizeForHostFunctionIdProgramming(patchElem.memorySynchronizationRequired, queue.csr->getDcFlushSupport());
+        auto cmdStorage = allocateAlignedMemory(size, sizeof(uint32_t));
+        void *cmdBuffer = static_cast<void *>(cmdStorage.get());
 
-            *reinterpret_cast<CFE_STATE *>(commandToPatch.pDestination) = *cfeStateCmd;
-            break;
-        }
-        case CommandList::CommandToPatch::PauseOnEnqueueSemaphoreStart: {
-            NEO::EncodeSemaphore<GfxFamily>::programMiSemaphoreWait(reinterpret_cast<MI_SEMAPHORE_WAIT *>(commandToPatch.pCommand),
-                                                                    csr->getDebugPauseStateGPUAddress(),
-                                                                    static_cast<uint32_t>(NEO::DebugPauseState::hasUserStartConfirmation),
-                                                                    COMPARE_OPERATION::COMPARE_OPERATION_SAD_EQUAL_SDD,
-                                                                    false, true);
-            break;
-        }
-        case CommandList::CommandToPatch::PauseOnEnqueueSemaphoreEnd: {
-            NEO::EncodeSemaphore<GfxFamily>::programMiSemaphoreWait(reinterpret_cast<MI_SEMAPHORE_WAIT *>(commandToPatch.pCommand),
-                                                                    csr->getDebugPauseStateGPUAddress(),
-                                                                    static_cast<uint32_t>(NEO::DebugPauseState::hasUserEndConfirmation),
-                                                                    COMPARE_OPERATION::COMPARE_OPERATION_SAD_EQUAL_SDD,
-                                                                    false, true);
-            break;
-        }
-        case CommandList::CommandToPatch::PauseOnEnqueuePipeControlStart: {
+        NEO::HostFunctionHelper<GfxFamily>::programHostFunctionId(nullptr,
+                                                                  cmdBuffer,
+                                                                  hostFunctionStreamer,
+                                                                  std::move(hostFunction),
+                                                                  patchElem.memorySynchronizationRequired);
 
-            NEO::PipeControlArgs args;
-            args.dcFlushEnable = csr->getDcFlushSupport();
+        NEO::EncodeDataMemory<GfxFamily>::programDataMemory(*patchPreambleBuffer, patchElem.gpuAddress, cmdBuffer, size);
+    } else {
+        NEO::HostFunctionHelper<GfxFamily>::programHostFunctionId(nullptr,
+                                                                  patchElem.cmdBufferSpace,
+                                                                  hostFunctionStreamer,
+                                                                  std::move(hostFunction),
+                                                                  patchElem.memorySynchronizationRequired);
+    }
 
-            auto command = reinterpret_cast<void *>(commandToPatch.pCommand);
-            NEO::MemorySynchronizationCommands<GfxFamily>::setBarrierWithPostSyncOperation(
-                command,
-                NEO::PostSyncMode::ImmediateData,
-                csr->getDebugPauseStateGPUAddress(),
-                static_cast<uint64_t>(NEO::DebugPauseState::waitingForUserStartConfirmation),
-                device->getNEODevice()->getRootDeviceEnvironment(),
-                args);
-            break;
-        }
-        case CommandList::CommandToPatch::PauseOnEnqueuePipeControlEnd: {
+    hostFunctionsCounter++;
+}
 
-            NEO::PipeControlArgs args;
-            args.dcFlushEnable = csr->getDcFlushSupport();
+template <GFXCORE_FAMILY gfxCoreFamily>
+inline void CommandQueueHw<gfxCoreFamily>::CommandsToPatchVisitor::operator()(PatchHostFunctionWait &patchElem) {
+    auto partitionId = patchElem.partitionId;
 
-            auto command = reinterpret_cast<void *>(commandToPatch.pCommand);
-            NEO::MemorySynchronizationCommands<GfxFamily>::setBarrierWithPostSyncOperation(
-                command,
-                NEO::PostSyncMode::ImmediateData,
-                csr->getDebugPauseStateGPUAddress(),
-                static_cast<uint64_t>(NEO::DebugPauseState::waitingForUserEndConfirmation),
-                device->getNEODevice()->getRootDeviceEnvironment(),
-                args);
-            break;
-        }
-        default:
-            UNRECOVERABLE_IF(true);
-        }
+    if (patchPreambleEnabled) {
+        using MI_SEMAPHORE_WAIT = typename GfxFamily::MI_SEMAPHORE_WAIT;
+
+        MI_SEMAPHORE_WAIT miSemaphore{};
+        NEO::HostFunctionHelper<GfxFamily>::programHostFunctionWaitForCompletion(nullptr,
+                                                                                 &miSemaphore,
+                                                                                 queue.csr->getHostFunctionStreamer(),
+                                                                                 partitionId);
+        auto size = NEO::EncodeSemaphore<GfxFamily>::getSizeMiSemaphoreWait();
+        NEO::EncodeDataMemory<GfxFamily>::programDataMemory(*patchPreambleBuffer, patchElem.gpuAddress, &miSemaphore, size);
+    } else {
+        NEO::HostFunctionHelper<GfxFamily>::programHostFunctionWaitForCompletion(nullptr,
+                                                                                 patchElem.cmdBufferSpace,
+                                                                                 queue.csr->getHostFunctionStreamer(),
+                                                                                 partitionId);
     }
 }
 

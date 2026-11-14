@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -85,6 +85,18 @@ struct QueryTopologyInfo {
     uint8_t data[];
 };
 
+struct DrmQueryTopologyData {
+    int regionCount = 0;
+    int sliceCount = 0;
+    int subSliceCount = 0;
+    int euCount = 0;
+    int numL3Banks = 0;
+
+    int maxSlices = 0;
+    int maxSubSlicesPerSlice = 0;
+    int maxEusPerSubSlice = 0;
+};
+
 struct MemoryClassInstance {
     uint16_t memoryClass;
     uint16_t memoryInstance;
@@ -146,15 +158,6 @@ struct GemWait {
     int64_t timeoutNs;
 };
 
-struct ResetStats {
-    uint32_t contextId;
-    uint32_t flags;
-    uint32_t resetCount;
-    uint32_t batchActive;
-    uint32_t batchPending;
-    uint32_t reserved;
-};
-
 struct GetParam {
     int32_t param;
     int *value;
@@ -169,6 +172,20 @@ struct Query {
 struct GemClose {
     uint32_t handle;
     uint32_t reserved;
+    uint64_t userptr;
+};
+
+struct GemVmBind {
+    uint32_t vmId;
+    union {
+        uint32_t handle; /* For unbind, it is reserved and must be 0 */
+        int32_t fd;
+    };
+    uint64_t start;
+    uint64_t offset;
+    uint64_t length;
+    uint64_t flags;
+    uint64_t extensions;
 };
 
 struct PrimeHandle {
@@ -177,11 +194,65 @@ struct PrimeHandle {
     int32_t fileDescriptor;
 };
 
+struct SyncObjHandle {
+    uint32_t handle;
+    uint32_t flags;
+    int32_t fd;
+    uint32_t pad;
+    uint64_t point;
+};
+
+struct SyncObjDestroy {
+    uint32_t handle;
+    uint32_t pad;
+};
+
+struct SyncObjWait {
+    uint64_t handles;
+    int64_t timeoutNs;
+    uint32_t countHandles;
+    uint32_t flags;
+    uint32_t firstSignaled;
+    uint32_t pad;
+    uint64_t deadlineNs;
+};
+
+struct SyncObjTimelineWait {
+    uint64_t handles;
+    uint64_t points;
+    int64_t timeoutNs;
+    uint32_t countHandles;
+    uint32_t flags;
+    uint32_t firstSignaled;
+    uint32_t pad;
+    uint64_t deadlineNs;
+};
+
+struct SyncObjArray {
+    uint64_t handles;
+    uint32_t countHandles;
+    uint32_t pad;
+};
+
+struct SyncObjTimelineArray {
+    uint64_t handles;
+    uint64_t points;
+    uint32_t countHandles;
+    uint32_t flags;
+};
+
+struct PrimaryContextHandle {
+    uint32_t handle;
+    int32_t fd;
+    uint64_t reserved[2];
+};
+
 #pragma pack(1)
-template <uint32_t numEngines>
+template <uint32_t numEngines = 10> // 1 + max engines
 struct ContextParamEngines {
     uint64_t extensions;
-    EngineClassInstance engines[numEngines];
+    uint64_t enginesData[numEngines];
+    uint32_t numEnginesInContext;
 };
 
 template <uint32_t numEngines>
@@ -216,97 +287,110 @@ struct DrmDebuggerOpen {
 };
 
 enum class DrmIoctl {
-    GemExecbuffer2,
-    GemWait,
-    GemUserptr,
-    Getparam,
-    GemCreate,
-    GemSetDomain,
-    GemSetTiling,
-    GemGetTiling,
-    GemContextCreateExt,
-    GemContextDestroy,
-    RegRead,
-    GetResetStats,
-    GemContextGetparam,
-    GemContextSetparam,
-    Query,
-    GemMmapOffset,
-    GemVmCreate,
-    GemVmDestroy,
-    GemClose,
-    PrimeFdToHandle,
-    PrimeHandleToFd,
-    GemVmBind,
-    GemVmUnbind,
-    GemWaitUserFence,
-    DG1GemCreateExt,
-    GemCreateExt,
-    GemVmAdvise,
-    GemVmPrefetch,
-    UuidRegister,
-    UuidUnregister,
-    DebuggerOpen,
-    GemClosReserve,
-    GemClosFree,
-    GemCacheReserve,
-    SyncobjCreate,
-    SyncobjWait,
-    SyncobjDestroy,
-    Version,
+    gemExecbuffer2,
+    gemWait,
+    gemUserptr,
+    getparam,
+    gemCreate,
+    gemSetDomain,
+    gemSetTiling,
+    gemGetTiling,
+    gemContextCreateExt,
+    gemContextDestroy,
+    regRead,
+    queryContextHealth,
+    gemContextGetparam,
+    gemContextSetparam,
+    query,
+    gemMmapOffset,
+    gemVmCreate,
+    gemVmDestroy,
+    gemClose,
+    primeFdToHandle,
+    primeHandleToFd,
+    syncObjFdToHandle,
+    syncObjDestroy,
+    syncObjWait,
+    syncObjTimelineWait,
+    syncObjSignal,
+    syncObjTimelineSignal,
+    gemVmBind,
+    gemVmUnbind,
+    gemWaitUserFence,
+    gemCreateExt,
+    gemVmAdvise,
+    gemVmGetMemRangeAttr,
+    gemVmPrefetch,
+    uuidRegister,
+    uuidUnregister,
+    debuggerOpen,
+    gemClosReserve,
+    gemClosFree,
+    gemCacheReserve,
+    version,
+    vmExport,
+    metadataCreate,
+    metadataDestroy,
+    perfOpen,
+    perfEnable,
+    perfDisable,
+    perfQuery,
+    primaryContextExport,
+    primaryContextImport
 };
 
 enum class DrmParam {
-    ContextCreateExtSetparam,
-    ContextCreateFlagsUseExtensions,
-    ContextEnginesExtLoadBalance,
-    ContextParamEngines,
-    ContextParamGttSize,
-    ContextParamPersistence,
-    ContextParamPriority,
-    ContextParamRecoverable,
-    ContextParamSseu,
-    ContextParamVm,
-    EngineClassRender,
-    EngineClassCompute,
-    EngineClassCopy,
-    EngineClassVideo,
-    EngineClassVideoEnhance,
-    EngineClassInvalid,
-    EngineClassInvalidNone,
-    ExecBlt,
-    ExecDefault,
-    ExecNoReloc,
-    ExecRender,
-    MemoryClassDevice,
-    MemoryClassSystem,
-    MmapOffsetWb,
-    MmapOffsetWc,
-    ParamChipsetId,
-    ParamRevision,
-    ParamHasExecSoftpin,
-    ParamHasPooledEu,
-    ParamHasScheduler,
-    ParamEuTotal,
-    ParamSubsliceTotal,
-    ParamMinEuInPool,
-    ParamCsTimestampFrequency,
-    ParamHasVmBind,
-    ParamHasPageFault,
-    QueryEngineInfo,
-    QueryHwconfigTable,
-    QueryComputeSlices,
-    QueryMemoryRegions,
-    QueryTopologyInfo,
-    SchedulerCapPreemption,
-    TilingNone,
-    TilingY,
+    atomicClassUndefined,
+    atomicClassDevice,
+    atomicClassGlobal,
+    atomicClassSystem,
+    contextCreateExtSetparam,
+    contextCreateFlagsUseExtensions,
+    contextEnginesExtLoadBalance,
+    contextParamEngines,
+    contextParamGttSize,
+    contextParamPersistence,
+    contextParamPriority,
+    contextParamRecoverable,
+    contextParamSseu,
+    contextParamVm,
+    engineClassRender,
+    engineClassCompute,
+    engineClassCopy,
+    engineClassVideo,
+    engineClassVideoEnhance,
+    engineClassInvalid,
+    engineClassInvalidNone,
+    execBlt,
+    execDefault,
+    execNoReloc,
+    execRender,
+    memoryClassDevice,
+    memoryClassSystem,
+    memoryAdviseLocationDevice,
+    memoryAdviseLocationSystem,
+    memoryAdviseMigrationPolicyAllPages,
+    memoryAdviseMigrationPolicySystemPages,
+    mmapOffsetWb,
+    mmapOffsetWc,
+    paramHasPooledEu,
+    paramEuTotal,
+    paramSubsliceTotal,
+    paramMinEuInPool,
+    paramCsTimestampFrequency,
+    paramOATimestampFrequency,
+    paramHasVmBind,
+    paramHasPageFault,
+    queryEngineInfo,
+    queryHwconfigTable,
+    queryComputeSlices,
+    queryMemoryRegions,
+    queryTopologyInfo,
+    tilingNone,
+    tilingY,
 };
 
 unsigned int getIoctlRequestValue(DrmIoctl ioctlRequest, IoctlHelper *ioctlHelper);
-int getDrmParamValue(DrmParam drmParam, IoctlHelper *ioctlHelper);
-std::string getDrmParamString(DrmParam param, IoctlHelper *ioctlHelper);
-std::string getIoctlString(DrmIoctl ioctlRequest, IoctlHelper *ioctlHelper);
 bool checkIfIoctlReinvokeRequired(int error, DrmIoctl ioctlRequest, IoctlHelper *ioctlHelper);
 
 } // namespace NEO

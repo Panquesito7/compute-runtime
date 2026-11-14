@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,8 +9,15 @@
 #include "shared/test/common/libult/linux/drm_mock.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 
+#include "level_zero/tools/source/sysman/diagnostics/diagnostics.h"
+#include "level_zero/tools/source/sysman/engine/engine.h"
+#include "level_zero/tools/source/sysman/firmware/firmware.h"
+#include "level_zero/tools/source/sysman/firmware_util/firmware_util.h"
 #include "level_zero/tools/source/sysman/global_operations/global_operations_imp.h"
 #include "level_zero/tools/source/sysman/global_operations/linux/os_global_operations_imp.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
+#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+#include "level_zero/tools/source/sysman/ras/ras.h"
 
 namespace L0 {
 namespace ult {
@@ -23,7 +30,6 @@ const std::string subsystemVendorFile("device/subsystem_vendor");
 const std::string driverFile("device/driver");
 const std::string agamaVersionFile("/sys/module/i915/agama_version");
 const std::string srcVersionFile("/sys/module/i915/srcversion");
-const std::string functionLevelReset("device/reset");
 const std::string clientsDir("clients");
 constexpr uint64_t pid1 = 1711u;
 constexpr uint64_t pid2 = 1722u;
@@ -50,11 +56,11 @@ const std::string engine6("6");
 const std::string driverVersion("5.0.0-37-generic SMP mod_unload");
 const std::string srcVersion("5.0.0-37");
 const std::string ueventWedgedFile("/var/lib/libze_intel_gpu/wedged_file");
-const std::string mockFunctionResetPath("/MOCK_FUNCTION_LEVEL_RESET_PATH");
 const std::string mockDeviceDir("devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:01.0/0000:8c:00.0");
+const std::string mockFunctionResetPath(mockDeviceDir + "/reset");
 const std::string mockDeviceName("/MOCK_DEVICE_NAME");
 
-enum mockEnumListProcessCall {
+enum MockEnumListProcessCall {
     DEVICE_IN_USE = 0,
     DEVICE_UNUSED = 1,
     RETURN_ERROR = 2
@@ -93,16 +99,15 @@ struct MockGlobalOperationsSysfsAccess : public SysfsAccess {
     bool mockGetScannedDirPidEntriesForClientsStatus = false;
     bool mockReadStatus = false;
     bool mockGetValUnsignedLongStatus = false;
+    bool mockDeviceUnbound = false;
 
     ze_result_t getRealPath(const std::string file, std::string &val) override {
-        if (file.compare(functionLevelReset) == 0) {
-            val = mockFunctionResetPath;
-        } else if (file.compare(deviceDir) == 0) {
+        if (file.compare(deviceDir) == 0) {
             val = mockDeviceDir;
         } else {
             return ZE_RESULT_ERROR_NOT_AVAILABLE;
         }
-        return ZE_RESULT_SUCCESS;
+        return mockDeviceUnbound ? ZE_RESULT_ERROR_NOT_AVAILABLE : ZE_RESULT_SUCCESS;
     }
 
     ze_result_t readResult = ZE_RESULT_SUCCESS;
@@ -322,6 +327,8 @@ struct MockGlobalOperationsSysfsAccess : public SysfsAccess {
             return mockUnbindDeviceError;
         }
 
+        mockDeviceUnbound = true;
+
         return ZE_RESULT_SUCCESS;
     }
 
@@ -329,6 +336,8 @@ struct MockGlobalOperationsSysfsAccess : public SysfsAccess {
         if (mockBindDeviceError != ZE_RESULT_SUCCESS) {
             return mockBindDeviceError;
         }
+
+        mockDeviceUnbound = false;
 
         return ZE_RESULT_SUCCESS;
     }
@@ -347,7 +356,7 @@ struct MockGlobalOperationsProcfsAccess : public ProcfsAccess {
     ::pid_t ourDevicePid = 0;
     int ourDeviceFd = 0;
 
-    std::vector<mockEnumListProcessCall> mockListProcessCall{};
+    std::vector<MockEnumListProcessCall> mockListProcessCall{};
     std::vector<bool> isRepeated{};
     ze_result_t listProcessesResult = ZE_RESULT_SUCCESS;
     uint32_t listProcessCalled = 0u;
@@ -356,17 +365,17 @@ struct MockGlobalOperationsProcfsAccess : public ProcfsAccess {
         list = pidList;
 
         if (!mockListProcessCall.empty()) {
-            mockEnumListProcessCall mockListProcessCallValue = mockListProcessCall.front();
-            if (mockListProcessCallValue == mockEnumListProcessCall::DEVICE_IN_USE) {
+            MockEnumListProcessCall mockListProcessCallValue = mockListProcessCall.front();
+            if (mockListProcessCallValue == MockEnumListProcessCall::DEVICE_IN_USE) {
                 if (ourDevicePid) {
                     list.push_back(ourDevicePid);
                 }
             }
 
-            else if (mockListProcessCallValue == mockEnumListProcessCall::DEVICE_UNUSED) {
+            else if (mockListProcessCallValue == MockEnumListProcessCall::DEVICE_UNUSED) {
             }
 
-            else if (mockListProcessCallValue == mockEnumListProcessCall::RETURN_ERROR) {
+            else if (mockListProcessCallValue == MockEnumListProcessCall::RETURN_ERROR) {
                 listProcessesResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
             }
 
@@ -465,7 +474,7 @@ struct MockGlobalOperationsFsAccess : public FsAccess {
 
     ze_result_t mockWriteError = ZE_RESULT_SUCCESS;
     ze_result_t writeResult = ZE_RESULT_SUCCESS;
-    ze_result_t write(const std::string file, const std::string val) override {
+    ze_result_t write(const std::string file, std::string_view val) override {
         if (mockWriteError != ZE_RESULT_SUCCESS) {
             return mockWriteError;
         }
@@ -492,13 +501,13 @@ struct MockGlobalOpsFwInterface : public FirmwareUtil {
     MockGlobalOpsFwInterface() = default;
 
     ADDMETHOD_NOBASE(fwDeviceInit, ze_result_t, ZE_RESULT_SUCCESS, (void));
-    ADDMETHOD_NOBASE(getFirstDevice, ze_result_t, ZE_RESULT_SUCCESS, (igsc_device_info * info));
+    ADDMETHOD_NOBASE(getFirstDevice, ze_result_t, ZE_RESULT_SUCCESS, (IgscDeviceInfo * info));
     ADDMETHOD_NOBASE(getFwVersion, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, std::string &firmwareVersion));
     ADDMETHOD_NOBASE(flashFirmware, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, void *pImage, uint32_t size));
     ADDMETHOD_NOBASE(fwSupportedDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::vector<std::string> & supportedDiagTests));
     ADDMETHOD_NOBASE(fwRunDiagTests, ze_result_t, ZE_RESULT_SUCCESS, (std::string & osDiagType, zes_diag_result_t *pResult));
     ADDMETHOD_NOBASE(fwGetMemoryErrorCount, ze_result_t, ZE_RESULT_SUCCESS, (zes_ras_error_type_t category, uint32_t subDeviceCount, uint32_t subDeviceId, uint64_t &count));
-    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t * currentState, uint8_t *pendingState));
+    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t *currentState, uint8_t *pendingState));
     ADDMETHOD_NOBASE(fwSetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t newState, uint8_t *currentState, uint8_t *pendingState));
     ADDMETHOD_NOBASE_VOIDRETURN(getDeviceSupportedFwTypes, (std::vector<std::string> & fwTypes));
     ADDMETHOD_NOBASE_VOIDRETURN(fwGetMemoryHealthIndicator, (zes_mem_health_t * health));
@@ -541,6 +550,7 @@ struct MockGlobalOpsLinuxSysmanImp : public LinuxSysmanImp {
     void setMockInitDeviceError(ze_result_t result) {
         mockInitDeviceError = result;
     }
+    ADDMETHOD_NOBASE(gpuProcessCleanup, ze_result_t, ZE_RESULT_SUCCESS, (ze_bool_t force));
 };
 
 class DrmGlobalOpsMock : public DrmMock {

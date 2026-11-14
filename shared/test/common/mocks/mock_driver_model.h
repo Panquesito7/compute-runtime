@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,8 @@
 #include "shared/source/helpers/driver_model_type.h"
 #include "shared/source/os_interface/driver_info.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include <cstdint>
 #include <functional>
@@ -18,9 +20,12 @@ namespace NEO {
 
 class MockDriverModel : public NEO::DriverModel {
   public:
-    MockDriverModel() : NEO::DriverModel(NEO::DriverModelType::UNKNOWN) {}
-
-    void setGmmInputArgs(void *args) override {}
+    MockDriverModel() : MockDriverModel(NEO::DriverModelType::unknown) {}
+    MockDriverModel(DriverModelType driverModelType) : DriverModel(driverModelType) {}
+    ADDMETHOD_NOBASE_VOIDRETURN(cleanup, ());
+    ADDMETHOD_NOBASE_VOIDRETURN(setGmmInputArgs, (void *));
+    ADDMETHOD_NOBASE(isLatePreemptionStartSupported, bool, false, (const HardwareInfo &hwInfo));
+    ADDMETHOD_NOBASE(getDeviceMemoryPhysicalSizeInBytes, uint64_t, 0u, (uint32_t tileId));
 
     uint32_t getDeviceHandle() const override { return {}; }
 
@@ -38,26 +43,34 @@ class MockDriverModel : public NEO::DriverModel {
         return isGpuHangDetectedToReturn;
     }
 
+    bool getDeviceState() override {
+        getDeviceStateCalledCount++;
+        return false;
+    }
+
     PhysicalDevicePciSpeedInfo getPciSpeedInfo() const override { return pciSpeedInfo; }
+
+    const HardwareInfo *getHardwareInfo() const override { return nullptr; }
 
     PhysicalDevicePciSpeedInfo pciSpeedInfo{};
     PhysicalDevicePciBusInfo pciBusInfo{};
     bool isGpuHangDetectedToReturn{};
     std::function<void()> isGpuHangDetectedSideEffect{};
     size_t maxAllocSize = 0;
+    uint32_t getDeviceStateCalledCount = 0;
 };
 
 class MockDriverModelWDDM : public MockDriverModel {
   public:
     MockDriverModelWDDM() : MockDriverModel() {
-        driverModelType = DriverModelType::WDDM;
+        driverModelType = DriverModelType::wddm;
     }
 };
 
 class MockDriverModelDRM : public MockDriverModel {
   public:
     MockDriverModelDRM() : MockDriverModel() {
-        driverModelType = DriverModelType::DRM;
+        driverModelType = DriverModelType::drm;
     }
 };
 } // namespace NEO

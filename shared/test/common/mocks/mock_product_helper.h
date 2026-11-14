@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,9 +12,36 @@
 
 namespace NEO {
 
+enum class LocalMemAllocationMode : uint32_t;
+
 struct MockProductHelper : ProductHelperHw<IGFX_UNKNOWN> {
+    using ProductHelper::setupPreemptionSurfaceSize;
     MockProductHelper() = default;
 
+    ADDMETHOD_CONST_NOBASE(setupHardwareInfo, bool, true, (HardwareInfo & hwInfo, const DeviceCapsReader &capsReader));
     ADDMETHOD_CONST_NOBASE(is48bResourceNeededForRayTracing, bool, true, ());
+    ADDMETHOD_CONST_NOBASE(overrideAllocationCpuCacheable, bool, false, (const AllocationData &allocationData));
+    ADDMETHOD_NOBASE(configureHwInfoWddm, int, 0, (const HardwareInfo *inHwInfo, HardwareInfo *outHwInfo, const RootDeviceEnvironment &rootDeviceEnvironment));
+    ADDMETHOD_CONST_NOBASE(isBlitCopyRequiredForLocalMemory, bool, true, (const RootDeviceEnvironment &rootDeviceEnvironment, const GraphicsAllocation &allocation));
+    ADDMETHOD_CONST_NOBASE(isDeviceUsmAllocationReuseSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isHostUsmAllocationReuseSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isHostUsmPoolAllocatorSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isDeviceUsmPoolAllocatorSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(is2MBLocalMemAlignmentEnabled, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isDisableScratchPagesRequiredForDebugger, bool, true, ());
+    ADDMETHOD_CONST_NOBASE(isEuDebugPageFaultSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(getStorageInfoLocalOnlyFlag, bool, false, (LocalMemAllocationMode, bool));
+    ADDMETHOD_CONST_NOBASE(isInterruptSupported, bool, false, (const RootDeviceEnvironment &rootDeviceEnvironment));
+    ADDMETHOD_CONST_NOBASE(isDeviceCapsReaderSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(initializeInternalEngineImmediately, bool, true, ());
+    ADDMETHOD_CONST_NOBASE(sipUsesSubslicePools, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isFlushBetweenBlitsRequired, bool, true, ());
+    ADDMETHOD_CONST_NOBASE(isDualStreamCopyOffloadForRegularCmdListSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isStagingFor2MBAlignedHostPtrAllowed, bool, true, ());
+    ADDMETHOD_CONST_NOBASE(isGraphPatchPreambleBarrierSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isL3FlushAfterPostSyncSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(useAdditionalBlitProperties, bool, false, (const BlitProperties &blitProperties));
+    ADDMETHOD_CONST_NOBASE(isLEOSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isDirectSubmissionContextGroupIdleDetectionEnabled, bool, true, ());
 };
 } // namespace NEO

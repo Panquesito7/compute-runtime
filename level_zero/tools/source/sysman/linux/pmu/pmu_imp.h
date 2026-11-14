@@ -1,21 +1,28 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
 #include "level_zero/tools/source/sysman/linux/pmu/pmu.h"
 
 #include <linux/perf_event.h>
 #include <string>
 #include <sys/sysinfo.h>
+#include <unistd.h>
 
 namespace L0 {
+class FsAccess;
+class LinuxSysmanImp;
+class SysfsAccess;
+struct Device;
 
-class PmuInterfaceImp : public PmuInterface, NEO::NonCopyableOrMovableClass {
+class PmuInterfaceImp : public PmuInterface, NEO::NonCopyableAndNonMovableClass {
   public:
     PmuInterfaceImp() = delete;
     PmuInterfaceImp(LinuxSysmanImp *pLinuxSysmanImp);
@@ -28,8 +35,6 @@ class PmuInterfaceImp : public PmuInterface, NEO::NonCopyableOrMovableClass {
     MOCKABLE_VIRTUAL int64_t perfEventOpen(perf_event_attr *attr, pid_t pid, int cpu, int groupFd, uint64_t flags);
     decltype(&read) readFunction = read;
     decltype(&syscall) syscallFunction = syscall;
-
-  private:
     uint32_t getEventType();
     FsAccess *pFsAccess = nullptr;
     SysfsAccess *pSysfsAccess = nullptr;

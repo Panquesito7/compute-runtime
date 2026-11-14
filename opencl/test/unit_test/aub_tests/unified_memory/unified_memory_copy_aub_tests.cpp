@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,6 +19,7 @@ class UnifiedMemoryCopyAubTest : public UnifiedMemoryAubFixture,
     std::vector<char> srcValues, dstValues;
 
     void SetUp() override {
+        debugManager.flags.EnableFreeMemory.set(false);
         UnifiedMemoryAubFixture::setUp();
 
         srcMemoryType = std::get<0>(GetParam());
@@ -39,6 +40,7 @@ class UnifiedMemoryCopyAubTest : public UnifiedMemoryAubFixture,
         this->freeUSM(dstPtr, dstMemoryType);
         UnifiedMemoryAubFixture::tearDown();
     }
+    DebugManagerStateRestore restorer;
 };
 
 HWTEST_P(UnifiedMemoryCopyAubTest, givenTwoUnifiedMemoryAllocsWhenCopyingOneToAnotherThenValuesMatch) {
@@ -46,13 +48,13 @@ HWTEST_P(UnifiedMemoryCopyAubTest, givenTwoUnifiedMemoryAllocsWhenCopyingOneToAn
     expectMemory<FamilyType>(dstPtr, srcValues.data(), dataSize);
 }
 
-InternalMemoryType memoryTypes[] = {InternalMemoryType::HOST_UNIFIED_MEMORY,
-                                    InternalMemoryType::DEVICE_UNIFIED_MEMORY,
-                                    InternalMemoryType::SHARED_UNIFIED_MEMORY,
-                                    InternalMemoryType::NOT_SPECIFIED};
+InternalMemoryType memoryTypes[] = {InternalMemoryType::hostUnifiedMemory,
+                                    InternalMemoryType::deviceUnifiedMemory,
+                                    InternalMemoryType::sharedUnifiedMemory,
+                                    InternalMemoryType::notSpecified};
 
-INSTANTIATE_TEST_CASE_P(UnifiedMemoryCopyAubTest,
-                        UnifiedMemoryCopyAubTest,
-                        ::testing::Combine(::testing::ValuesIn(memoryTypes),
-                                           ::testing::ValuesIn(memoryTypes)));
+INSTANTIATE_TEST_SUITE_P(UnifiedMemoryCopyAubTest,
+                         UnifiedMemoryCopyAubTest,
+                         ::testing::Combine(::testing::ValuesIn(memoryTypes),
+                                            ::testing::ValuesIn(memoryTypes)));
 } // namespace NEO

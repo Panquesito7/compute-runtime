@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,10 @@
 #include "shared/source/os_interface/windows/device_time_wddm.h"
 #include "shared/source/os_interface/windows/sharedata_wrapper.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
+#include "shared/test/common/mock_gdi/mock_driver_store_paths.h"
+
+#include <optional>
+#include <string_view>
 
 #define ADAPTER_HANDLE (static_cast<D3DKMT_HANDLE>(0x40001234))
 #define SHADOW_ADAPTER_HANDLE (static_cast<D3DKMT_HANDLE>(0x30001234))
@@ -28,6 +32,8 @@
 #define TRIM_CALLBACK_HANDLE (reinterpret_cast<VOID *>(0x80123000010))
 
 #define GPUVA (static_cast<D3DGPU_VIRTUAL_ADDRESS>(0x80123000000))
+
+typedef struct _D3DKMT_CREATENATIVEFENCE D3DKMT_CREATENATIVEFENCE;
 
 void mockSetAdapterInfo(const void *pGfxPlatform, const void *pGTSystemInfo, uint64_t gpuAddressSpace);
 NTSTATUS __stdcall mockD3DKMTCreateAllocation(IN OUT D3DKMT_CREATEALLOCATION *allocation);
@@ -47,6 +53,7 @@ NTSTATUS __stdcall mockD3DKMTQueryResourceInfo(IN OUT D3DKMT_QUERYRESOURCEINFO *
 NTSTATUS __stdcall mockD3DKMTQueryResourceInfoFromNtHandle(IN OUT D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE *queryResourceInfo);
 NTSTATUS __stdcall mockD3DKMTCreateSynchronizationObject2(IN OUT D3DKMT_CREATESYNCHRONIZATIONOBJECT2 *synchObject);
 NTSTATUS __stdcall mockD3DKMTDestroySynchronizationObject(IN CONST D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *destroySynchronizationObject);
+NTSTATUS __stdcall mockD3DKMTCreateNativeFence(IN OUT D3DKMT_CREATENATIVEFENCE *synchObject);
 NTSTATUS __stdcall mockD3DKMTCreatePagingQueue(IN OUT D3DKMT_CREATEPAGINGQUEUE *createQueue);
 NTSTATUS __stdcall mockD3DKMTDestroyPagingQueue(IN OUT D3DDDI_DESTROYPAGINGQUEUE *destoryQueue);
 NTSTATUS __stdcall mockD3DKMTLock2(IN OUT D3DKMT_LOCK2 *lock2);
@@ -54,6 +61,7 @@ NTSTATUS __stdcall mockD3DKMTUnlock2(IN CONST D3DKMT_UNLOCK2 *unlock2);
 NTSTATUS __stdcall mockD3DKMTMapGpuVirtualAddress(IN OUT D3DDDI_MAPGPUVIRTUALADDRESS *mapGpuVA);
 NTSTATUS __stdcall mockD3DKMTReserveGpuVirtualAddress(IN OUT D3DDDI_RESERVEGPUVIRTUALADDRESS *reserveGpuVirtualAddress);
 NTSTATUS __stdcall mockD3DKMTSubmitCommandToHwQueue(IN CONST D3DKMT_SUBMITCOMMANDTOHWQUEUE *submitCommandToHwQueue);
+NTSTATUS __stdcall mockD3DKMTSubmitWaitForSyncObjectsToHwQueue(IN CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *submitWaitForSyncObjectsToHwQueue);
 NTSTATUS __stdcall mockD3DKMTMakeResident(IN OUT D3DDDI_MAKERESIDENT *makeResident);
 NTSTATUS __stdcall mockD3DKMTRegisterTrimNotification(IN D3DKMT_REGISTERTRIMNOTIFICATION *registerTrimNotification);
 NTSTATUS __stdcall mockD3DKMTSetAllocationPriority(IN CONST D3DKMT_SETALLOCATIONPRIORITY *setAllocationPriority);
@@ -63,6 +71,7 @@ NTSTATUS __stdcall mockD3DKMTDestroyHwQueue(IN CONST D3DKMT_DESTROYHWQUEUE *dest
 NTSTATUS __stdcall mockD3DKMTOpenAdapterFromHdc(IN OUT D3DKMT_OPENADAPTERFROMHDC *);
 NTSTATUS __stdcall mockD3DKMTDestroyAllocation(IN CONST D3DKMT_DESTROYALLOCATION *);
 NTSTATUS __stdcall mockD3DKMTCloseAdapter(IN CONST D3DKMT_CLOSEADAPTER *);
+NTSTATUS __stdcall mockD3DKMTEnumAdapters3(IN OUT D3DKMT_ENUMADAPTERS3 *enumAdapters);
 NTSTATUS __stdcall mockD3DKMTLock(IN OUT D3DKMT_LOCK *);
 NTSTATUS __stdcall mockD3DKMTUnlock(IN CONST D3DKMT_UNLOCK *);
 NTSTATUS __stdcall mockD3DKMTRender(IN OUT D3DKMT_RENDER *);
@@ -73,6 +82,9 @@ NTSTATUS __stdcall mockD3DKMTWaitForSynchronizationObjectFromCpu(IN CONST D3DKMT
 NTSTATUS __stdcall mockD3DKMTSignalSynchronizationObjectFromCpu(IN CONST D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU *);
 NTSTATUS __stdcall mockD3DKMTWaitForSynchronizationObjectFromGpu(IN CONST D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU *);
 NTSTATUS __stdcall mockD3DKMTSignalSynchronizationObjectFromGpu(IN CONST D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU *);
+NTSTATUS __stdcall mockD3DKMTOpenSyncObjectFromNtHandle2(IN OUT D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *);
+NTSTATUS __stdcall mockD3DKMTOpenSyncObjectNtHandleFromName(IN OUT D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *);
+NTSTATUS __stdcall mockD3DKMTOpenNtHandleFromName(IN OUT D3DKMT_OPENNTHANDLEFROMNAME *);
 NTSTATUS __stdcall mockD3DKMTFreeGpuVirtualAddress(IN CONST D3DKMT_FREEGPUVIRTUALADDRESS *);
 NTSTATUS __stdcall mockD3DKMTUpdateGpuVirtualAddress(IN CONST D3DKMT_UPDATEGPUVIRTUALADDRESS *);
 NTSTATUS __stdcall mockD3DKMTSubmitCommand(IN CONST D3DKMT_SUBMITCOMMAND *);
@@ -80,7 +92,7 @@ NTSTATUS __stdcall mockD3DKMTEvict(IN OUT D3DKMT_EVICT *);
 NTSTATUS __stdcall mockD3DKMTGetDeviceState(IN OUT D3DKMT_GETDEVICESTATE *);
 NTSTATUS __stdcall mockD3DKMTUnregisterTrimNotification(IN D3DKMT_UNREGISTERTRIMNOTIFICATION *);
 
-NTSTATUS setMockSizes(void *gmmPtr, UINT numAllocsToReturn, UINT gmmSize, UINT totalPrivateSize);
+NTSTATUS setMockSizes(void **gmmPtrArray, UINT numAllocsToReturn, UINT gmmSize, UINT totalPrivateSize);
 NTSTATUS getMockSizes(UINT &destroyAlloactionWithResourceHandleCalled, D3DKMT_DESTROYALLOCATION2 *&ptrDestroyAlloc);
 D3DKMT_HANDLE getMockLastDestroyedResHandle();
 void setMockLastDestroyedResHandle(D3DKMT_HANDLE handle);
@@ -95,13 +107,39 @@ D3DKMT_CREATECONTEXTVIRTUAL *getCreateContextData();
 D3DKMT_CREATEHWQUEUE *getCreateHwQueueData();
 D3DKMT_DESTROYHWQUEUE *getDestroyHwQueueData();
 D3DKMT_SUBMITCOMMANDTOHWQUEUE *getSubmitCommandToHwQueueData();
+D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *getSubmitWaitForSyncObjectsToHwQueueData();
+D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU *getWaitForSynchronizationObjectFromGpuData();
 D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *getDestroySynchronizationObjectData();
 VOID *getMonitorFenceCpuFenceAddress();
+bool *getMonitorFenceCpuAddressSelector();
 bool *getCreateSynchronizationObject2FailCall();
 bool *getFailOnSetContextSchedulingPriorityCall();
 D3DKMT_SETCONTEXTSCHEDULINGPRIORITY *getSetContextSchedulingPriorityDataCall();
 bool *getRegisterTrimNotificationFailCall();
+bool *getSubmitWaitForSyncObjectsToHwQueueFailCall();
+bool *getWaitForSynchronizationObjectFromGpuFailCall();
 uint32_t getLastPriority();
 void setAdapterBDF(ADAPTER_BDF &adapterBDF);
-
+void setMockDeviceExecutionState(D3DKMT_DEVICEEXECUTION_STATE newState);
+void setMockGetDeviceStateReturnValue(NTSTATUS newReturnValue, bool execution);
 void initGfxPartition();
+void setCapturingCreateAllocationFlags();
+void getCapturedCreateAllocationFlags(D3DKMT_CREATEALLOCATIONFLAGS &capturedCreateAllocationFlags, uint32_t &numCalled);
+void setSupportCreateAllocationWithReadWriteExisitingSysMemory(bool supportValue, bool &previousValue);
+extern bool failCreateDevice;
+extern bool failCreatePagingQueue;
+extern const wchar_t *queryRegistryDriverStorePath;
+extern const wchar_t *queryRegistryComputeRuntimePath;
+extern const wchar_t *queryRegistryOpenClDriverName;
+extern uint32_t queryAdapterInfoUmDriverPrivateCallCount;
+extern uint32_t closeAdapterCallCount;
+extern uint32_t enumAdapters3CallCount;
+extern uint32_t failEnumAdapters3OnCall;
+extern uint32_t mockEnumAdapters3Count;
+extern std::optional<uint32_t> mockSoftwareEnumeratedAdapterIndex;
+extern std::optional<KMTQUERYADAPTERINFOTYPE> failingEnumeratedAdapterQueryType;
+inline constexpr uint32_t mockEnumeratedAdapterDeviceIdBase = 0x1234u;
+inline constexpr std::string_view mockEnumeratedAdapterDescription = "Intel";
+extern LUID mockOtherDriverStoreAdapterLuid;
+extern D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroySynchronizationObjectData;
+extern uint32_t destroySynchronizationObjectCallCount;

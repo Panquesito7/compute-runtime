@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,14 +15,14 @@
 #include "shared/test/common/test_macros/test.h"
 
 #include "level_zero/core/source/device/device.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 namespace L0 {
 namespace ult {
 
 std::unique_ptr<NEO::UltDeviceFactory> PciSpeedInfoTest::createDevices(uint32_t numSubDevices, const NEO::PhysicalDevicePciSpeedInfo &pciSpeedInfo) {
 
-    DebugManager.flags.CreateMultipleSubDevices.set(numSubDevices);
-    DebugManager.flags.EnableChipsetUniqueUUID.set(0);
+    debugManager.flags.CreateMultipleSubDevices.set(numSubDevices);
+    debugManager.flags.EnableChipsetUniqueUUID.set(0);
     NEO::ExecutionEnvironment *executionEnvironment = new MockExecutionEnvironment(defaultHwInfo.get(), false, 1);
     executionEnvironment->rootDeviceEnvironments[0]->osInterface.reset(new OSInterface);
     executionEnvironment->memoryManager.reset(new MockMemoryManagerOsAgnosticContext(*executionEnvironment));
@@ -38,7 +38,7 @@ TEST_F(PciSpeedInfoTest, givenSuccessfulReadingOfSpeedValuesCorrectValuesAreRetu
     expectedSpeedInfo.maxBandwidth = 4096;
 
     auto deviceFactory = createDevices(2, expectedSpeedInfo);
-    auto driverHandle = std::make_unique<DriverHandleImp>();
+    auto driverHandle = std::make_unique<DriverHandle>();
     ze_result_t returnValue = ZE_RESULT_SUCCESS;
     auto device = std::unique_ptr<L0::Device>(L0::Device::create(driverHandle.get(), deviceFactory->rootDevices[0], false, &returnValue));
 

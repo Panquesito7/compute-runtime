@@ -3,35 +3,22 @@ components:
     branch: master
     dest_dir: aub_stream
     repository: https://github.com/intel/aubstream
-    revision: 86d029e8122ffcb6730d0b6dc3504d03b88dee7f
+    revision: 97235d594b0fed146adfd4cf100ede64527f31f1
     type: git
   gmmlib:
     asset_name: gmmlib
     dest_dir: gmmlib
     type: git
     branch: master
-    revision: intel-gmmlib-22.3.0
+    revision: intel-gmmlib-22.10.2
     repository: https://github.com/intel/gmmlib.git
   igc:
     asset_name: igc
     dest_dir: igc
     type: git
-    branch: releases/igc-1.0.13822
-    revision: f76f43110b8af770cc039002c66e06ef2177fdce
+    branch: master
+    revision: 4a733802c5fe0f55e98ca9cd8a6becbdbcbc9c3e
     repository: https://github.com/intel/intelgraphicscompiler
-  igsc:
-    asset_name: igsc
-    dest_dir: igsc
-    type: git
-    branch: master
-    revision: V0.8.9
-    repository: https://github.com/intel/igsc.git
-  infra:
-    branch: master
-    dest_dir: infra
-    fetch_tags: true
-    revision: v4897
-    type: git
   internal:
     branch: master
     dest_dir: internal
@@ -41,17 +28,13 @@ components:
     dest_dir: kernels_bin
     type: git
     branch: kernels_bin
-    revision: 2058-670
-  kmdaf:
-    branch: kmdaf
-    dest_dir: kmdaf
-    revision: d62f854554f512b9e3a5ee4bc1231c9a65abe1ff
-    type: git
+    revision: 4291-6856
   level_zero:
+    asset_name: level_zero
     dest_dir: level_zero
     type: git
     branch: master
-    revision: v1.11.0
+    revision: v1.35.0
     repository: https://github.com/oneapi-src/level-zero
   libva:
     asset_name: libva
@@ -65,29 +48,32 @@ components:
     dest_dir: metrics/discovery
     type: git
     branch: master
-    revision: metrics-discovery-1.12.164
+    revision: 1.16.199
     repository: https://github.com/intel/metrics-discovery.git
   metrics-library:
     asset_name: metrics-library
     dest_dir: metrics/library
     type: git
     branch: master
-    revision: metrics-library-1.0.133
+    revision: 1.0.249
     repository: https://github.com/intel/metrics-library.git
   neo-clang-format:
     dest_dir: tools/clang-format
     type: git
     branch: clang-format
-    revision: 15.0.6
+    revision: 22.1.1
   wdk:
     dest_dir: wdk
     type: git
     branch: wdk
-    revision: c57e8a80dc2294b49aeb1192cb00231d13a295c4-2058
+    revision: 9c671bc6aaf5b80cf0daa1a8a5e909ae4f1d5e15-4264
   wsl:
     branch: wsl
     dest_dir: wsl
     revision: 56430997dac34ca0e9e18c177636234cac26ad54
     type: git
-converter: M-2058
+converter: M-4291
+include:
+- aub_configs.yml
+- infra.yml
 version: '1'

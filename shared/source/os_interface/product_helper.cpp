@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,69 @@
 
 #include "shared/source/os_interface/product_helper.h"
 
+#include "shared/source/command_stream/preemption.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/kmd_notify_helper.h"
+#include "shared/source/helpers/kmd_notify_properties.h"
+
+#include <algorithm>
+
 namespace NEO {
 
-ProductHelperCreateFunctionType productHelperFactory[IGFX_MAX_PRODUCT] = {};
+ProductHelperCreateFunctionType productHelperFactory[NEO::maxProductEnumValue] = {};
 
+void ProductHelper::setupPreemptionSurfaceSize(HardwareInfo &hwInfo, const RootDeviceEnvironment &rootDeviceEnvironment) {
+    if (debugManager.flags.OverridePreemptionSurfaceSizeInMb.get() >= 0) {
+        hwInfo.gtSystemInfo.CsrSizeInMb = static_cast<uint32_t>(debugManager.flags.OverridePreemptionSurfaceSizeInMb.get());
+    }
+
+    hwInfo.capabilityTable.requiredPreemptionSurfaceSize = hwInfo.gtSystemInfo.CsrSizeInMb * MemoryConstants::megaByte;
+}
+
+void ProductHelper::setupKmdNotifyProperties(KmdNotifyProperties &kmdNotifyProperties) {
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideEnableKmdNotify.get(), kmdNotifyProperties.enableKmdNotify);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideKmdNotifyDelayMicroseconds.get(), kmdNotifyProperties.delayKmdNotifyMicroseconds);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideEnableQuickKmdSleep.get(), kmdNotifyProperties.enableQuickKmdSleep);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideQuickKmdSleepDelayMicroseconds.get(), kmdNotifyProperties.delayQuickKmdSleepMicroseconds);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideEnableQuickKmdSleepForSporadicWaits.get(), kmdNotifyProperties.enableQuickKmdSleepForSporadicWaits);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideDelayQuickKmdSleepForSporadicWaitsMicroseconds.get(), kmdNotifyProperties.delayQuickKmdSleepForSporadicWaitsMicroseconds);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideEnableQuickKmdSleepForDirectSubmission.get(), kmdNotifyProperties.enableQuickKmdSleepForDirectSubmission);
+    KmdNotifyHelper::overrideFromDebugVariable(debugManager.flags.OverrideDelayQuickKmdSleepForDirectSubmissionMicroseconds.get(), kmdNotifyProperties.delayQuickKmdSleepForDirectSubmissionMicroseconds);
+}
+
+int ProductHelper::setupProductSpecificConfig(HardwareInfo &hwInfo, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    auto osInterface = rootDeviceEnvironment.osInterface.get();
+    setRenderCompressedFlags(hwInfo);
+    int ret = configureHardwareCustom(&hwInfo, osInterface);
+    if (ret != 0) {
+        hwInfo = {};
+    }
+    return ret;
+}
+
+void ProductHelper::applyLimitGrfSupported(SupportedNumGrfs &grfs) const {
+    DEBUG_BREAK_IF(grfs.empty());
+    const auto limit = static_cast<uint32_t>(debugManager.flags.LimitNumGrfsSupported.get());
+    if (limit < grfs.back()) {
+        const auto it = std::find_if(grfs.begin(), grfs.end(), [=](uint32_t numGrfs) { return numGrfs > limit; });
+        grfs.resize(static_cast<size_t>(it - grfs.begin()));
+        DEBUG_BREAK_IF(grfs.empty());
+    }
+}
+
+void ProductHelper::setupPreemptionMode(HardwareInfo &hwInfo, bool kmdPreemptionSupport) {
+    PreemptionHelper::adjustDefaultPreemptionMode(hwInfo.capabilityTable,
+                                                  static_cast<bool>(hwInfo.featureTable.flags.ftrWalkerMTP) && kmdPreemptionSupport,
+                                                  static_cast<bool>(hwInfo.featureTable.flags.ftrGpGpuThreadGroupLevelPreempt) && kmdPreemptionSupport,
+                                                  static_cast<bool>(hwInfo.featureTable.flags.ftrGpGpuMidBatchPreempt) && kmdPreemptionSupport);
+}
+
+void ProductHelper::setupImageSupport(HardwareInfo &hwInfo) {
+    if (debugManager.flags.ForceImagesSupport.get() != -1) {
+        hwInfo.capabilityTable.supportsImages = debugManager.flags.ForceImagesSupport.get();
+    }
+}
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -25,14 +25,16 @@ Gdi::~Gdi() {
     if constexpr (GdiLogging::gdiLoggingSupport) {
         GdiLogging::close();
     }
+    this->profiler.printGdiTimes();
 }
 
 bool Gdi::setupHwQueueProcAddresses() {
     createHwQueue = gdiDll->getProcAddress("D3DKMTCreateHwQueue");
     destroyHwQueue = gdiDll->getProcAddress("D3DKMTDestroyHwQueue");
     submitCommandToHwQueue = gdiDll->getProcAddress("D3DKMTSubmitCommandToHwQueue");
+    submitWaitForSyncObjectsToHwQueue = gdiDll->getProcAddress("D3DKMTSubmitWaitForSyncObjectsToHwQueue");
 
-    if (!createHwQueue || !destroyHwQueue || !submitCommandToHwQueue) {
+    if (!createHwQueue || !destroyHwQueue || !submitCommandToHwQueue || !submitWaitForSyncObjectsToHwQueue) {
         return false;
     }
     return true;
@@ -46,6 +48,7 @@ bool Gdi::getAllProcAddresses() {
     destroyAllocation2 = gdiDll->getProcAddress("D3DKMTDestroyAllocation2");
     queryAdapterInfo = gdiDll->getProcAddress("D3DKMTQueryAdapterInfo");
     closeAdapter = gdiDll->getProcAddress("D3DKMTCloseAdapter");
+    enumAdapters3 = gdiDll->getProcAddress("D3DKMTEnumAdapters3");
     createDevice = gdiDll->getProcAddress("D3DKMTCreateDevice");
     destroyDevice = gdiDll->getProcAddress("D3DKMTDestroyDevice");
     escape = gdiDll->getProcAddress("D3DKMTEscape");
@@ -58,12 +61,16 @@ bool Gdi::getAllProcAddresses() {
     createSynchronizationObject = gdiDll->getProcAddress("D3DKMTCreateSynchronizationObject");
     createSynchronizationObject2 = gdiDll->getProcAddress("D3DKMTCreateSynchronizationObject2");
     destroySynchronizationObject = gdiDll->getProcAddress("D3DKMTDestroySynchronizationObject");
+    createNativeFence = gdiDll->getProcAddress("D3DKMTCreateNativeFence");
     signalSynchronizationObject = gdiDll->getProcAddress("D3DKMTSignalSynchronizationObject");
     waitForSynchronizationObject = gdiDll->getProcAddress("D3DKMTWaitForSynchronizationObject");
     waitForSynchronizationObjectFromCpu = gdiDll->getProcAddress("D3DKMTWaitForSynchronizationObjectFromCpu");
     signalSynchronizationObjectFromCpu = gdiDll->getProcAddress("D3DKMTSignalSynchronizationObjectFromCpu");
     waitForSynchronizationObjectFromGpu = gdiDll->getProcAddress("D3DKMTWaitForSynchronizationObjectFromGpu");
     signalSynchronizationObjectFromGpu = gdiDll->getProcAddress("D3DKMTSignalSynchronizationObjectFromGpu");
+    openSyncObjectFromNtHandle2 = gdiDll->getProcAddress("D3DKMTOpenSyncObjectFromNtHandle2");
+    openSyncObjectNtHandleFromName = gdiDll->getProcAddress("D3DKMTOpenSyncObjectNtHandleFromName");
+    openNtHandleFromName = gdiDll->getProcAddress("D3DKMTOpenNtHandleFromName");
     createPagingQueue = gdiDll->getProcAddress("D3DKMTCreatePagingQueue");
     destroyPagingQueue = gdiDll->getProcAddress("D3DKMTDestroyPagingQueue");
     lock2 = gdiDll->getProcAddress("D3DKMTLock2");

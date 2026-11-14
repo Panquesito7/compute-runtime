@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,20 +22,30 @@ void cpuidLinuxWrapper(int cpuInfo[4], int functionId) {
 void cpuidexLinuxWrapper(int *cpuInfo, int functionId, int subfunctionId) {
 }
 
+uint64_t xgetbvLinuxWrapper(uint32_t) {
+    return 0;
+}
+
 void getCpuFlagsLinux(std::string &cpuFlags) {
     std::ifstream cpuinfo(std::string(Os::sysFsProcPathPrefix) + "/cpuinfo");
     std::string line;
     while (std::getline(cpuinfo, line)) {
-        if (line.substr(0, 8) == "Features") {
+        if (line.starts_with("Features")) {
             cpuFlags = line;
             break;
         }
     }
 }
 
+size_t getLastLevelCacheSizeLinux() {
+    return 0u;
+}
+
 void (*CpuInfo::cpuidexFunc)(int *, int, int) = cpuidexLinuxWrapper;
 void (*CpuInfo::cpuidFunc)(int[4], int) = cpuidLinuxWrapper;
 void (*CpuInfo::getCpuFlagsFunc)(std::string &) = getCpuFlagsLinux;
+size_t (*CpuInfo::getLastLevelCacheSizeFunc)() = getLastLevelCacheSizeLinux;
+uint64_t (*CpuInfo::xgetbvFunc)(uint32_t) = xgetbvLinuxWrapper;
 
 const CpuInfo CpuInfo::instance;
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,16 +10,16 @@
 
 #include "level_zero/tools/source/sysman/temperature/os_temperature.h"
 
-#include "igfxfmid.h"
-
-#include <memory>
+#include "neo_igfxfmid.h"
 
 namespace L0 {
 
 class SysfsAccess;
 class PlatformMonitoringTech;
 struct Device;
-class LinuxTemperatureImp : public OsTemperature, NEO::NonCopyableOrMovableClass {
+struct OsSysman;
+
+class LinuxTemperatureImp : public OsTemperature, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t getProperties(zes_temp_properties_t *pProperties) override;
     ze_result_t getSensorTemperature(double *pTemperature) override;

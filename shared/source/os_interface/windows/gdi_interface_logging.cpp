@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -37,6 +37,11 @@ void getEnterString<CONST D3DKMT_OPENADAPTERFROMLUID *>(CONST D3DKMT_OPENADAPTER
 template <>
 void getEnterString<CONST D3DKMT_CLOSEADAPTER *>(CONST D3DKMT_CLOSEADAPTER *param, char *input, size_t size) {
     strcpy_s(input, size, "D3DKMT_CLOSEADAPTER");
+}
+
+template <>
+void getEnterString<D3DKMT_ENUMADAPTERS3 *>(D3DKMT_ENUMADAPTERS3 *param, char *input, size_t size) {
+    snprintf_s(input, size, size, "D3DKMT_ENUMADAPTERS3 Filter 0x%llx NumAdapters %u", static_cast<unsigned long long>(param->Filter.Value), param->NumAdapters);
 }
 
 template <>
@@ -233,6 +238,16 @@ void getEnterString<D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *>(D3DKMT_OPENSYNCOBJECTF
 }
 
 template <>
+void getEnterString<D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *>(D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *param, char *input, size_t size) {
+    strcpy_s(input, size, "D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME");
+}
+
+template <>
+void getEnterString<D3DKMT_OPENNTHANDLEFROMNAME *>(D3DKMT_OPENNTHANDLEFROMNAME *param, char *input, size_t size) {
+    snprintf_s(input, size, size, "D3DKMT_OPENNTHANDLEFROMNAME dwDesiredAccess 0x%x", param->dwDesiredAccess);
+}
+
+template <>
 void getEnterString<CONST D3DKMT_DESTROYALLOCATION2 *>(CONST D3DKMT_DESTROYALLOCATION2 *param, char *input, size_t size) {
     snprintf_s(input, size, size, "D3DKMT_DESTROYALLOCATION2 Flags 0x%x", param->Flags.Value);
 }
@@ -273,6 +288,11 @@ void getEnterString<CONST D3DKMT_SUBMITCOMMANDTOHWQUEUE *>(CONST D3DKMT_SUBMITCO
 }
 
 template <>
+void getEnterString<CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *>(CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *param, char *input, size_t size) {
+    snprintf_s(input, size, size, "D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE ObjectCount %u", param->ObjectCount);
+}
+
+template <>
 void getEnterString<CONST D3DKMT_SETALLOCATIONPRIORITY *>(CONST D3DKMT_SETALLOCATIONPRIORITY *param, char *input, size_t size) {
     strcpy_s(input, size, "D3DKMT_SETALLOCATIONPRIORITY");
 }
@@ -298,15 +318,15 @@ inline void logExit(NTSTATUS status, Param param) {
         constexpr size_t stringBufferSize = 256;
         char stringBuffer[stringBufferSize];
         getExitString<Param>(param, stringBuffer, stringBufferSize);
-        IoFunctions::fprintf(output, "GDI Call EXIT STATUS: 0x%lx %s\n", status, stringBuffer);
+        IoFunctions::fprintf(output, "GDI Call EXIT STATUS: 0x%x %s\n", status, stringBuffer);
     }
 }
 
 void init() {
-    enabledLogging = DebugManager.flags.LogGdiCalls.get();
+    enabledLogging = debugManager.flags.LogGdiCalls.get();
     if (enabledLogging) {
-        if (DebugManager.flags.LogGdiCallsToFile.get()) {
-            output = IoFunctions::fopenPtr("gdi.log", "rw");
+        if (debugManager.flags.LogGdiCallsToFile.get()) {
+            output = IoFunctions::fopenPtr("gdi.log", "w+");
         } else {
             output = stdout;
         }
@@ -315,7 +335,7 @@ void init() {
 
 void close() {
     if (enabledLogging) {
-        if (DebugManager.flags.LogGdiCallsToFile.get()) {
+        if (debugManager.flags.LogGdiCallsToFile.get()) {
             IoFunctions::fclosePtr(output);
         }
         enabledLogging = false;
@@ -328,6 +348,9 @@ template void logExit<CONST D3DKMT_OPENADAPTERFROMLUID *>(NTSTATUS status, CONST
 
 template void logEnter<CONST D3DKMT_CLOSEADAPTER *>(CONST D3DKMT_CLOSEADAPTER *param);
 template void logExit<CONST D3DKMT_CLOSEADAPTER *>(NTSTATUS status, CONST D3DKMT_CLOSEADAPTER *param);
+
+template void logEnter<D3DKMT_ENUMADAPTERS3 *>(D3DKMT_ENUMADAPTERS3 *param);
+template void logExit<D3DKMT_ENUMADAPTERS3 *>(NTSTATUS status, D3DKMT_ENUMADAPTERS3 *param);
 
 template void logEnter<CONST D3DKMT_QUERYADAPTERINFO *>(CONST D3DKMT_QUERYADAPTERINFO *param);
 template void logExit<CONST D3DKMT_QUERYADAPTERINFO *>(NTSTATUS status, CONST D3DKMT_QUERYADAPTERINFO *param);
@@ -428,6 +451,12 @@ template void logExit<CONST D3DKMT_SUBMITCOMMAND *>(NTSTATUS status, CONST D3DKM
 template void logEnter<D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *>(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *param);
 template void logExit<D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *>(NTSTATUS status, D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *param);
 
+template void logEnter<D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *>(D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *param);
+template void logExit<D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *>(NTSTATUS status, D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME *param);
+
+template void logEnter<D3DKMT_OPENNTHANDLEFROMNAME *>(D3DKMT_OPENNTHANDLEFROMNAME *param);
+template void logExit<D3DKMT_OPENNTHANDLEFROMNAME *>(NTSTATUS status, D3DKMT_OPENNTHANDLEFROMNAME *param);
+
 template void logEnter<CONST D3DKMT_DESTROYALLOCATION2 *>(CONST D3DKMT_DESTROYALLOCATION2 *param);
 template void logExit<CONST D3DKMT_DESTROYALLOCATION2 *>(NTSTATUS status, CONST D3DKMT_DESTROYALLOCATION2 *param);
 
@@ -452,11 +481,16 @@ template void logExit<CONST D3DKMT_DESTROYHWQUEUE *>(NTSTATUS status, CONST D3DK
 template void logEnter<CONST D3DKMT_SUBMITCOMMANDTOHWQUEUE *>(CONST D3DKMT_SUBMITCOMMANDTOHWQUEUE *param);
 template void logExit<CONST D3DKMT_SUBMITCOMMANDTOHWQUEUE *>(NTSTATUS status, CONST D3DKMT_SUBMITCOMMANDTOHWQUEUE *param);
 
+template void logEnter<CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *>(CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *param);
+template void logExit<CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *>(NTSTATUS status, CONST D3DKMT_SUBMITWAITFORSYNCOBJECTSTOHWQUEUE *param);
+
 template void logEnter<CONST D3DKMT_SETALLOCATIONPRIORITY *>(CONST D3DKMT_SETALLOCATIONPRIORITY *param);
 template void logExit<CONST D3DKMT_SETALLOCATIONPRIORITY *>(NTSTATUS status, CONST D3DKMT_SETALLOCATIONPRIORITY *param);
 
 template void logEnter<CONST D3DKMT_SETCONTEXTSCHEDULINGPRIORITY *>(CONST D3DKMT_SETCONTEXTSCHEDULINGPRIORITY *param);
 template void logExit<CONST D3DKMT_SETCONTEXTSCHEDULINGPRIORITY *>(NTSTATUS status, CONST D3DKMT_SETCONTEXTSCHEDULINGPRIORITY *param);
+
+#include "gdi_interface_logging.inl"
 
 } // namespace GdiLogging
 

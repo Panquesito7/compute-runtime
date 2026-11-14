@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
 namespace MemoryManagement {
 #if defined(__clang__)
@@ -48,31 +49,31 @@ struct AllocationEvent { // NOLINT(clang-analyzer-optin.performance.Padding)
     size_t size;
     int frames;
     void *callstack[CallStackSize];
-    bool fastLeakDetectionEnabled = false;
+    bool fastLeakDetectionEnabled;
 };
+static_assert(std::is_trivially_default_constructible_v<AllocationEvent>,
+              "a non-trivial default constructor makes the event arrays dynamically initialized");
 
 inline constexpr auto maxEvents = 1024 * 1024;
-inline constexpr auto fastEvents = 1024 * 1024;
 
 extern AllocationEvent eventsAllocated[maxEvents];
 extern AllocationEvent eventsDeallocated[maxEvents];
 
-extern void *fastEventsAllocated[maxEvents];
-extern void *fastEventsDeallocated[maxEvents];
+extern std::atomic<void *> fastEventsAllocated[maxEvents];
+extern std::atomic<void *> fastEventsDeallocated[maxEvents];
 extern std::atomic<int> fastEventsAllocatedCount;
 extern std::atomic<int> fastEventsDeallocatedCount;
 extern std::atomic<int> fastLeaksDetectionMode;
-extern bool memsetNewAllocations;
-
 extern size_t failingAllocation;
 extern std::atomic<size_t> numAllocations;
 extern std::atomic<size_t> indexAllocation;
 extern std::atomic<size_t> indexDeallocation;
 extern size_t breakOnAllocationEvent;
 extern size_t breakOnDeallocationEvent;
-extern bool logTraces;
-extern bool detailedAllocationLoggingActive;
-extern bool fastLeakDetectionEnabled;
+extern std::atomic_bool logTraces;
+extern std::atomic_bool detailedAllocationLoggingActive;
+extern std::atomic_bool fastLeakDetectionEnabled;
+extern std::atomic_bool pendingDetachedThreadCleanup;
 extern void (*deleteCallback)(void *);
 
 inline constexpr auto nonfailingAllocation = static_cast<size_t>(-1);

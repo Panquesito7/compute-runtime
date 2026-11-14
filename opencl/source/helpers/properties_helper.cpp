@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,7 +9,6 @@
 
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/device/device.h"
-#include "shared/source/helpers/timestamp_packet.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
 
@@ -51,9 +50,9 @@ void EventsRequest::fillCsrDependenciesForTimestampPacketContainer(CsrDependenci
             dependentCsr = &event->getCommandQueue()->getGpgpuCommandStreamReceiver();
         }
         const auto sameCsr = (dependentCsr == &currentCsr);
-        const auto pushDependency = (CsrDependencies::DependenciesType::OnCsr == depsType && sameCsr) ||
-                                    (CsrDependencies::DependenciesType::OutOfCsr == depsType && !sameCsr) ||
-                                    (CsrDependencies::DependenciesType::All == depsType);
+        const auto pushDependency = (CsrDependencies::DependenciesType::onCsr == depsType && sameCsr) ||
+                                    (CsrDependencies::DependenciesType::outOfCsr == depsType && !sameCsr) ||
+                                    (CsrDependencies::DependenciesType::all == depsType);
 
         if (pushDependency) {
             csrDeps.timestampPacketContainer.push_back(timestampPacketContainer);
@@ -65,7 +64,9 @@ void EventsRequest::fillCsrDependenciesForTimestampPacketContainer(CsrDependenci
                         flushDependentCsr(*dependentCsr, csrDeps);
                         currentCsr.makeResident(*dependentCsr->getTagAllocation());
                     }
+                    csrDeps.csrWithMultiEngineDependencies.insert(dependentCsr);
                 }
+                csrDeps.containsCrossEngineDependency = true;
             }
         }
     }
@@ -103,6 +104,7 @@ TransferProperties::TransferProperties(MemObj *memObj, cl_command_type cmdType, 
     : memObj(memObj), ptr(ptr), cmdType(cmdType), mapFlags(mapFlags), blocking(blocking), doTransferOnCpu(doTransferOnCpu) {
     // no size or offset passed for unmap operation
     if (cmdType != CL_COMMAND_UNMAP_MEM_OBJECT) {
+        finishRequired = !memObj->isMemObjZeroCopy() || blocking;
         if (memObj->peekClMemObjType() == CL_MEM_OBJECT_BUFFER) {
             size[0] = *sizePtr;
             offset[0] = *offsetPtr;

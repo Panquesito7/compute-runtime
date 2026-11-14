@@ -1,20 +1,23 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/tools/source/sysman/linux/udev/udev_lib.h"
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+
 #include "level_zero/tools/source/sysman/os_sysman_driver.h"
 
 namespace L0 {
 
 class LinuxEventsUtil;
 struct SysmanDeviceImp;
+class UdevLib;
 
-class LinuxSysmanDriverImp : public OsSysmanDriver {
+class LinuxSysmanDriverImp : public OsSysmanDriver, NEO::NonCopyableAndNonMovableClass {
   public:
     LinuxSysmanDriverImp();
     ~LinuxSysmanDriverImp() override;

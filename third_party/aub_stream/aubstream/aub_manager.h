@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,14 +9,16 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "allocation_params.h"
 #include "page_info.h"
 #include "shared_mem_info.h"
 #include "physical_allocation_info.h"
 
 namespace aub_stream {
 
-struct AllocationParams;
 struct HardwareContext;
+struct CreateHardwareContext2Params;
+struct HardwareContextParamsHeader;
 
 struct AubManagerOptions {
     uint32_t version{};
@@ -29,6 +31,9 @@ struct AubManagerOptions {
     uint64_t gpuAddressSpace{};
     SharedMemoryInfo sharedMemoryInfo{};
     bool throwOnError{};
+    uint64_t dataStolenMemorySize{};
+    bool programAdditionalEngineMMIO{};
+    uint64_t wopcmMemorySize{};
 };
 
 class AubManager {
@@ -57,6 +62,24 @@ class AubManager {
 
     virtual bool reservePhysicalMemory(AllocationParams allocationParams, PhysicalAllocationInfo &physicalAllocInfo) = 0;
     virtual bool mapGpuVa(uint64_t gfxAddress, size_t size, PhysicalAllocationInfo physicalAllocInfo) = 0;
+    virtual bool mapGpuVa2(uint64_t physicalAddress, AllocationParams params) { return false; }
+
+    virtual bool reserveOnlyPhysicalSpace(AllocationParams allocationParams, PhysicalAllocationInfo &physicalAllocInfo) { return false; }
+    virtual bool mapSystemMemoryToPhysicalAddress(uint64_t physAddress, size_t size, size_t alignment, bool isLocalMemory, const void *p) { return false; }
+    virtual void *translatePhysicalAddressToSystemMemory(uint64_t physicalAddress, bool isLocalMemory) { return nullptr; }
+    virtual void writeMMIO(uint32_t offset, uint32_t value) {}
+    virtual uint32_t readMMIO(uint32_t offset) { return 0; }
+    virtual void writePCICFG(uint32_t offset, uint32_t value) {}
+    virtual uint32_t readPCICFG(uint32_t offset) { return 0; }
+
+    virtual void blockMemWritesViaTbx(bool onoff) {}
+
+    virtual bool releaseHardwareContext(HardwareContext *context) { return false; };
+    virtual HardwareContext *createHardwareContext2(const CreateHardwareContext2Params &params, uint32_t device, uint32_t engine, uint32_t flags) { return nullptr; };
+
+    virtual void setCCSMode(uint32_t ccsCount) {}
+    virtual void closeSocket(void) {}
+    virtual HardwareContext *createHardwareContext3(const HardwareContextParamsHeader *params) { return nullptr; }
 };
 
 } // namespace aub_stream

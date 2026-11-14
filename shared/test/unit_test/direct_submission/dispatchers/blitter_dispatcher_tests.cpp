@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -53,31 +53,12 @@ HWTEST_F(BlitterDispatcheTest, givenBlitterWhenDispatchingMonitorFenceCmdThenDis
     for (auto &cmd : commandsList) {
         MI_FLUSH_DW *miFlush = static_cast<MI_FLUSH_DW *>(cmd);
         if (miFlush->getDestinationAddress() == expectedGpuAddress &&
-            miFlush->getImmediateData() == expectedValue) {
+            miFlush->getImmediateData() == expectedValue &&
+            miFlush->getNotifyEnable() == false) {
             foundPostSync = true;
         }
     }
     EXPECT_TRUE(foundPostSync);
-}
-HWTEST_F(BlitterDispatcheTest, givenBlitterWhenAskingForCacheFlushCmdSizeThenReturnExpetedSize) {
-    EncodeDummyBlitWaArgs waArgs{false, &(pDevice->getRootDeviceEnvironmentRef())};
-    size_t expectedSize = EncodeMiFlushDW<FamilyType>::getCommandSizeWithWa(waArgs);
-    EXPECT_EQ(expectedSize, BlitterDispatcher<FamilyType>::getSizeCacheFlush(pDevice->getRootDeviceEnvironment()));
-}
-
-HWTEST_F(BlitterDispatcheTest, givenBlitterWhenDispatchingCacheFlushCmdThenDispatchMiFlushCommand) {
-    using MI_FLUSH_DW = typename FamilyType::MI_FLUSH_DW;
-    EncodeDummyBlitWaArgs waArgs{false, &(pDevice->getRootDeviceEnvironmentRef())};
-    size_t expectedSize = EncodeMiFlushDW<FamilyType>::getCommandSizeWithWa(waArgs);
-
-    BlitterDispatcher<FamilyType>::dispatchCacheFlush(cmdBuffer, pDevice->getRootDeviceEnvironment(), 0ull);
-
-    EXPECT_EQ(expectedSize, cmdBuffer.getUsed());
-
-    HardwareParse hwParse;
-    hwParse.parseCommands<FamilyType>(cmdBuffer);
-    auto commandsList = hwParse.getCommandsList<MI_FLUSH_DW>();
-    EXPECT_LE(1u, commandsList.size());
 }
 
 HWTEST_F(BlitterDispatcheTest, givenBlitterWhenDispatchingTlbFlushThenDispatchMiFlushCommandWithproperBits) {
@@ -100,4 +81,8 @@ HWTEST_F(BlitterDispatcheTest, givenBlitterWhenDispatchingTlbFlushThenDispatchMi
 
 HWTEST_F(BlitterDispatcheTest, givenBlitterWhenCheckingForMultiTileSynchronizationSupportThenExpectFalse) {
     EXPECT_FALSE(BlitterDispatcher<FamilyType>::isMultiTileSynchronizationSupported());
+}
+
+HWTEST_F(BlitterDispatcheTest, givenBlitterWhenAskingIsCopyThenReturnTrue) {
+    EXPECT_TRUE(BlitterDispatcher<FamilyType>::isCopy());
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,8 @@
 
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_base.inl"
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_tgllp_to_dg2.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_tgllp_to_pvc.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_xe_hpg_and_xe_hpc.inl"
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_xehp_and_later.inl"
 #include "level_zero/core/source/helpers/l0_populate_factory.h"
 
@@ -17,12 +19,13 @@ namespace L0 {
 using Family = NEO::XeHpgCoreFamily;
 static auto gfxCore = IGFX_XE_HPG_CORE;
 
-#include "level_zero/core/source/helpers/l0_gfx_core_helper_factory_init.inl"
-
 template <>
-bool L0GfxCoreHelperHw<Family>::isResumeWARequired() {
-    return true;
+ze_mutable_command_ext_flags_t L0GfxCoreHelperHw<Family>::getPlatformCmdListUpdateCapabilities() const {
+    return ZE_MUTABLE_COMMAND_EXT_FLAG_GROUP_COUNT | ZE_MUTABLE_COMMAND_EXT_FLAG_GROUP_SIZE | ZE_MUTABLE_COMMAND_EXT_FLAG_GLOBAL_OFFSET |
+           ZE_MUTABLE_COMMAND_EXT_FLAG_SIGNAL_EVENT | ZE_MUTABLE_COMMAND_EXT_FLAG_WAIT_EVENTS;
 }
+
+#include "level_zero/core/source/helpers/l0_gfx_core_helper_factory_init.inl"
 
 template class L0GfxCoreHelperHw<Family>;
 

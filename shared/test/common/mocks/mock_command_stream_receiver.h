@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -20,6 +20,7 @@
 #include "shared/source/utilities/tag_allocator.h"
 #include "shared/test/common/helpers/dispatch_flags_helper.h"
 
+#include <atomic>
 #include <optional>
 #include <vector>
 
@@ -31,25 +32,35 @@ using namespace NEO;
 
 class MockCommandStreamReceiver : public CommandStreamReceiver {
   public:
+    using BaseClass = CommandStreamReceiver;
     using CommandStreamReceiver::activePartitions;
     using CommandStreamReceiver::baseWaitFunction;
     using CommandStreamReceiver::checkForNewResources;
     using CommandStreamReceiver::checkImplicitFlushForGpuIdle;
+    using CommandStreamReceiver::cleanupResources;
     using CommandStreamReceiver::CommandStreamReceiver;
+    using CommandStreamReceiver::dcFlushSupport;
     using CommandStreamReceiver::globalFenceAllocation;
+    using CommandStreamReceiver::gpuHangCheckPeriodUs;
+    using CommandStreamReceiver::heaplessModeEnabled;
+    using CommandStreamReceiver::heaplessPrologProgrammed;
+    using CommandStreamReceiver::immWritePostSyncWriteOffset;
     using CommandStreamReceiver::internalAllocationStorage;
     using CommandStreamReceiver::latestFlushedTaskCount;
     using CommandStreamReceiver::latestSentTaskCount;
+    using CommandStreamReceiver::localMemoryEnabled;
     using CommandStreamReceiver::newResources;
     using CommandStreamReceiver::numClients;
     using CommandStreamReceiver::osContext;
     using CommandStreamReceiver::ownershipMutex;
-    using CommandStreamReceiver::postSyncWriteOffset;
     using CommandStreamReceiver::preemptionAllocation;
+    using CommandStreamReceiver::primaryCsr;
+    using CommandStreamReceiver::requiresInstructionCacheFlush;
     using CommandStreamReceiver::tagAddress;
     using CommandStreamReceiver::tagsMultiAllocation;
     using CommandStreamReceiver::taskCount;
     using CommandStreamReceiver::timestampPacketAllocator;
+    using CommandStreamReceiver::timeStampPostSyncWriteOffset;
     using CommandStreamReceiver::useGpuIdleImplicitFlush;
     using CommandStreamReceiver::useNewResourceImplicitFlush;
 
@@ -57,6 +68,12 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
         : CommandStreamReceiver(executionEnvironment, rootDeviceIndex, deviceBitfield) {
         CommandStreamReceiver::tagAddress = &mockTagAddress[0];
         memset(const_cast<TagAddressType *>(CommandStreamReceiver::tagAddress), 0xFFFFFFFF, tagSize * sizeof(TagAddressType));
+        gpuHangCheckPeriodUs = 0;
+    }
+    ~MockCommandStreamReceiver() override {
+        if (initialOsContext) {
+            BaseClass::setupContext(*initialOsContext);
+        }
     }
 
     WaitStatus waitForCompletionWithTimeout(const WaitParams &params, TaskCountType taskCountToWait) override {
@@ -70,13 +87,23 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
 
     SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override;
 
-    SubmissionStatus flushTagUpdate() override { return SubmissionStatus::SUCCESS; };
-    void updateTagFromWait() override{};
+    SubmissionStatus flushTagUpdate() override { return SubmissionStatus::success; };
+    void updateTagFromWait() override {};
+    bool submitDependencyUpdate(TagNodeBase *tag) override {
+        submitDependencyUpdateCalledTimes++;
+        return submitDependencyUpdateReturnValue;
+    }
     bool isUpdateTagFromWaitEnabled() override { return false; };
 
-    bool isMultiOsContextCapable() const override { return multiOsContextCapable; }
+    void writeMemoryAub(aub_stream::AllocationParams &allocationParams) override {
+        writeMemoryAubCalled++;
+    }
 
-    void createKernelArgsBufferAllocation() override {}
+    void initializeEngine() override {
+        initializeEngineCalled++;
+    }
+
+    bool isMultiOsContextCapable() const override { return multiOsContextCapable; }
 
     bool isGpuHangDetected() const override {
         if (isGpuHangDetectedReturnValue.has_value()) {
@@ -86,20 +113,21 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
         }
     }
 
-    bool testTaskCountReady(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait) override {
+    using CommandStreamReceiver::testTaskCountReady;
+    bool testTaskCountReady(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait, bool blockOnMiss) override {
         if (testTaskCountReadyReturnValue.has_value()) {
             return *testTaskCountReadyReturnValue;
         } else {
-            return CommandStreamReceiver::testTaskCountReady(pollAddress, taskCountToWait);
+            return CommandStreamReceiver::testTaskCountReady(pollAddress, taskCountToWait, blockOnMiss);
         }
     }
 
     MemoryCompressionState getMemoryCompressionState(bool auxTranslationRequired) const override {
-        return MemoryCompressionState::NotApplicable;
+        return MemoryCompressionState::notApplicable;
     };
 
     TagAllocatorBase *getTimestampPacketAllocator() override { return nullptr; }
-    std::unique_ptr<TagAllocatorBase> createMultiRootDeviceTimestampPacketAllocator(const RootDeviceIndicesContainer rootDeviceIndices) override { return std::unique_ptr<TagAllocatorBase>(nullptr); }
+    std::unique_ptr<TagAllocatorBase> createMultiRootDeviceTimestampPacketAllocator(const RootDeviceIndicesContainer &rootDeviceIndices) override { return std::unique_ptr<TagAllocatorBase>(nullptr); }
 
     CompletionStamp flushTask(
         LinearStream &commandStream,
@@ -111,11 +139,43 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
         DispatchFlags &dispatchFlags,
         Device &device) override;
 
+    CompletionStamp flushTaskHeapless(
+        LinearStream &commandStream,
+        size_t commandStreamStart,
+        const IndirectHeap *dsh,
+        const IndirectHeap *ioh,
+        const IndirectHeap *ssh,
+        TaskCountType taskLevel,
+        DispatchFlags &dispatchFlags,
+        Device &device) override;
+
+    CompletionStamp flushTaskHeapful(
+        LinearStream &commandStream,
+        size_t commandStreamStart,
+        const IndirectHeap *dsh,
+        const IndirectHeap *ioh,
+        const IndirectHeap *ssh,
+        TaskCountType taskLevel,
+        DispatchFlags &dispatchFlags,
+        Device &device) override;
+
+    CompletionStamp flushImmediateTask(
+        LinearStream &immediateCommandStream,
+        size_t immediateCommandStreamStart,
+        ImmediateDispatchFlags &dispatchFlags,
+        Device &device) override;
+
+    CompletionStamp flushImmediateTaskHeapless(
+        LinearStream &immediateCommandStream,
+        size_t immediateCommandStreamStart,
+        ImmediateDispatchFlags &dispatchFlags,
+        Device &device) override;
+
     CompletionStamp flushBcsTask(LinearStream &commandStreamTask, size_t commandStreamTaskStart,
                                  const DispatchBcsFlags &dispatchBcsFlags, const HardwareInfo &hwInfo) override;
 
     SubmissionStatus sendRenderStateCacheFlush() override {
-        return SubmissionStatus::SUCCESS;
+        return SubmissionStatus::success;
     }
 
     bool flushBatchedSubmissions() override {
@@ -126,23 +186,30 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
     }
 
     WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool quickKmdSleep, QueueThrottle throttle) override {
-        return WaitStatus::Ready;
+        return waitForCompletionWithKmdNotifyFallbackReturnValue;
+    }
+
+    WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool quickKmdSleep, QueueThrottle throttle, uint64_t timeoutNanoseconds) override {
+        return waitForCompletionWithKmdNotifyFallbackReturnValue;
     }
 
     WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool quickKmdSleep, bool forcePowerSavingMode) {
-        return WaitStatus::Ready;
+        return waitForCompletionWithKmdNotifyFallbackReturnValue;
     }
 
-    TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, bool profilingEnabled, Device &device) override { return taskCount; };
+    TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, Device &device) override { return taskCount; };
 
     CommandStreamReceiverType getType() const override {
         return commandStreamReceiverType;
     }
 
-    void downloadAllocations() override {
-        downloadAllocationsCalled = true;
+    void downloadAllocations(bool blockingWait, TaskCountType taskCount) override {
+        downloadAllocationsCalledCount++;
     }
 
+    bool isPerQueuePrologueRequired() const override {
+        return false;
+    }
     void programHardwareContext(LinearStream &cmdStream) override {
         programHardwareContextCalled = true;
     }
@@ -156,6 +223,14 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
     size_t getCmdsSizeForComputeBarrierCommand() const override {
         return 0;
     }
+    void programStallingCommandsForBarrier(LinearStream &cmdStream, TimestampPacketContainer *barrierTimestampPacketNodes, const bool isDcFlushRequired) override {
+        programStallingCommandsForBarrierCalled = true;
+    }
+
+    void stopDirectSubmission(bool blocking, bool needsLock) override {
+        this->blockingStopDirectSubmissionCalled = blocking;
+        stopDirectSubmissionCalledTimes++;
+    }
 
     bool createPreemptionAllocation() override {
         if (createPreemptionAllocationParentCall) {
@@ -167,16 +242,27 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
     GraphicsAllocation *getClearColorAllocation() override { return nullptr; }
     void makeResident(GraphicsAllocation &gfxAllocation) override {
         makeResidentCalledTimes++;
+        if (makeResidentParentCall) {
+            return CommandStreamReceiver::makeResident(gfxAllocation);
+        }
     }
 
     std::unique_lock<CommandStreamReceiver::MutexType> obtainHostPtrSurfaceCreationLock() override {
         ++hostPtrSurfaceCreationMutexLockCount;
         return CommandStreamReceiver::obtainHostPtrSurfaceCreationLock();
     }
+    std::unique_lock<CommandStreamReceiver::MutexType> tryObtainUniqueOwnership() override {
+        ++tryObtainUniqueOwnershipCalled;
+        if (tryObtainUniqueOwnershipFails) {
+            return std::unique_lock<CommandStreamReceiver::MutexType>();
+        }
+        return CommandStreamReceiver::tryObtainUniqueOwnership();
+    }
     bool createAllocationForHostSurface(HostPtrSurface &surface, bool requiresL3Flush) override {
         bool status = CommandStreamReceiver::createAllocationForHostSurface(surface, requiresL3Flush);
-        if (status)
-            surface.getAllocation()->hostPtrTaskCountAssignment--;
+        if (status) {
+            surface.getAllocation()->decrementHostPtrTaskCountAssignment();
+        }
         return status;
     }
     void postInitFlagsSetup() override {}
@@ -187,7 +273,50 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
         }
         return isLocked;
     }
-    SubmissionStatus initializeDeviceWithFirstSubmission() override { return SubmissionStatus::SUCCESS; }
+    SubmissionStatus initializeDeviceWithFirstSubmission(Device &device) override { return SubmissionStatus::success; }
+
+    QueueThrottle getLastDirectSubmissionThrottle() override {
+        return getLastDirectSubmissionThrottleReturnValue;
+    }
+
+    bool getAcLineConnected(bool updateStatus) const override {
+        return getAcLineConnectedReturnValue;
+    }
+
+    void unblockPagingFenceSemaphore(uint64_t pagingFenceValue) override {
+        this->pagingFenceValueToUnblock = pagingFenceValue;
+    }
+
+    void setupContext(OsContext &osContext) override {
+        if (!initialOsContext) {
+            initialOsContext = this->osContext;
+        }
+        BaseClass::setupContext(osContext);
+    }
+
+    void startHostFunctionWorker(HostFunctionAllocator *allocator) override {
+        startHostFunctionWorkerCalledTimes++;
+        BaseClass::startHostFunctionWorker(allocator);
+    }
+
+    void signalHostFunctionWorker(uint32_t nHostFunction) override {
+        signalHostFunctionWorkerCounter += nHostFunction;
+    }
+
+    void createHostFunctionWorker() override {
+        createHostFunctionWorkerCounter++;
+    }
+
+    std::unique_lock<CommandStreamReceiver::MutexType> obtainUniqueOwnership() override {
+        obtainUniqueOwnershipCalledTimes++;
+        return BaseClass::obtainUniqueOwnership();
+    }
+
+    void submitLateMidThreadPreemptionStart() override {
+        submitLateMidThreadPreemptionStartCounter++;
+    }
+
+    void dispatchLateMidThreadPreemptionStart(LinearStream &cmdStream) override {}
 
     static constexpr size_t tagSize = 256;
     static volatile TagAddressType mockTagAddress[tagSize];
@@ -195,19 +324,40 @@ class MockCommandStreamReceiver : public CommandStreamReceiver {
     int *flushBatchedSubmissionsCallCounter = nullptr;
     uint32_t waitForCompletionWithTimeoutCalled = 0;
     uint32_t fillReusableAllocationsListCalled = 0;
+    uint32_t writeMemoryAubCalled = 0;
+    uint32_t initializeEngineCalled = 0;
     uint32_t makeResidentCalledTimes = 0;
+    uint32_t downloadAllocationsCalledCount = 0;
+    uint32_t submitDependencyUpdateCalledTimes = 0;
+    uint32_t stopDirectSubmissionCalledTimes = 0;
+    uint32_t startHostFunctionWorkerCalledTimes = 0;
+    uint32_t createHostFunctionWorkerCounter = 0;
+    uint32_t signalHostFunctionWorkerCounter = 0;
+    uint32_t submitLateMidThreadPreemptionStartCounter = 0;
+    std::atomic<uint32_t> obtainUniqueOwnershipCalledTimes = 0;
     int hostPtrSurfaceCreationMutexLockCount = 0;
+    uint32_t tryObtainUniqueOwnershipCalled = 0;
+    bool tryObtainUniqueOwnershipFails = false;
     bool multiOsContextCapable = false;
     bool memoryCompressionEnabled = false;
-    bool downloadAllocationsCalled = false;
     bool programHardwareContextCalled = false;
     bool createPreemptionAllocationReturn = true;
     bool createPreemptionAllocationParentCall = false;
+    bool makeResidentParentCall = false;
     bool programComputeBarrierCommandCalled = false;
+    bool programStallingCommandsForBarrierCalled = false;
+    bool blockingStopDirectSubmissionCalled = false;
     std::optional<bool> isGpuHangDetectedReturnValue{};
     std::optional<bool> testTaskCountReadyReturnValue{};
-    WaitStatus waitForCompletionWithTimeoutReturnValue{WaitStatus::Ready};
-    CommandStreamReceiverType commandStreamReceiverType = CommandStreamReceiverType::CSR_HW;
+    WaitStatus waitForCompletionWithTimeoutReturnValue{WaitStatus::ready};
+    WaitStatus waitForCompletionWithKmdNotifyFallbackReturnValue{WaitStatus::ready};
+    CommandStreamReceiverType commandStreamReceiverType = CommandStreamReceiverType::hardware;
+    BatchBuffer latestFlushedBatchBuffer = {};
+    QueueThrottle getLastDirectSubmissionThrottleReturnValue = QueueThrottle::MEDIUM;
+    bool getAcLineConnectedReturnValue = true;
+    bool submitDependencyUpdateReturnValue = true;
+    std::atomic<uint64_t> pagingFenceValueToUnblock{0u};
+    OsContext *initialOsContext = nullptr;
 };
 
 class MockCommandStreamReceiverWithFailingSubmitBatch : public MockCommandStreamReceiver {
@@ -215,7 +365,7 @@ class MockCommandStreamReceiverWithFailingSubmitBatch : public MockCommandStream
     MockCommandStreamReceiverWithFailingSubmitBatch(ExecutionEnvironment &executionEnvironment, uint32_t rootDeviceIndex, const DeviceBitfield deviceBitfield)
         : MockCommandStreamReceiver(executionEnvironment, rootDeviceIndex, deviceBitfield) {}
     SubmissionStatus submitBatchBuffer(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override {
-        return SubmissionStatus::FAILED;
+        return SubmissionStatus::failed;
     }
 };
 
@@ -224,7 +374,7 @@ class MockCommandStreamReceiverWithOutOfMemorySubmitBatch : public MockCommandSt
     MockCommandStreamReceiverWithOutOfMemorySubmitBatch(ExecutionEnvironment &executionEnvironment, uint32_t rootDeviceIndex, const DeviceBitfield deviceBitfield)
         : MockCommandStreamReceiver(executionEnvironment, rootDeviceIndex, deviceBitfield) {}
     SubmissionStatus submitBatchBuffer(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override {
-        return SubmissionStatus::OUT_OF_MEMORY;
+        return SubmissionStatus::outOfMemory;
     }
 };
 
@@ -233,7 +383,16 @@ class MockCommandStreamReceiverWithFailingFlush : public MockCommandStreamReceiv
     MockCommandStreamReceiverWithFailingFlush(ExecutionEnvironment &executionEnvironment, uint32_t rootDeviceIndex, const DeviceBitfield deviceBitfield)
         : MockCommandStreamReceiver(executionEnvironment, rootDeviceIndex, deviceBitfield) {}
     SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override {
-        return SubmissionStatus::FAILED;
+        return SubmissionStatus::failed;
+    }
+};
+
+template <bool isRelaxedOrderingEnabled>
+class MockCommandStreamReceiverWithDirectSubmissionRelaxedOrdering : public MockCommandStreamReceiver {
+  public:
+    using MockCommandStreamReceiver::MockCommandStreamReceiver;
+    bool directSubmissionRelaxedOrderingEnabled() const override {
+        return isRelaxedOrderingEnabled;
     }
 };
 
@@ -243,10 +402,11 @@ class MockCsrHw2 : public CommandStreamReceiverHw<GfxFamily> {
     using CommandStreamReceiverHw<GfxFamily>::CommandStreamReceiverHw;
     using CommandStreamReceiverHw<GfxFamily>::csrSizeRequestFlags;
     using CommandStreamReceiverHw<GfxFamily>::flushStamp;
+    using CommandStreamReceiverHw<GfxFamily>::getCmdsSizeForHardwareContext;
+    using CommandStreamReceiverHw<GfxFamily>::isPerQueuePrologueEnabled;
     using CommandStreamReceiverHw<GfxFamily>::postInitFlagsSetup;
-    using CommandStreamReceiverHw<GfxFamily>::programL3;
     using CommandStreamReceiverHw<GfxFamily>::programVFEState;
-    using CommandStreamReceiverHw<GfxFamily>::createKernelArgsBufferAllocation;
+    using CommandStreamReceiverHw<GfxFamily>::directSubmission;
     using CommandStreamReceiver::activePartitions;
     using CommandStreamReceiver::activePartitionsConfig;
     using CommandStreamReceiver::clearColorAllocation;
@@ -254,20 +414,23 @@ class MockCsrHw2 : public CommandStreamReceiverHw<GfxFamily> {
     using CommandStreamReceiver::dispatchMode;
     using CommandStreamReceiver::feSupportFlags;
     using CommandStreamReceiver::globalFenceAllocation;
+    using CommandStreamReceiver::heaplessModeEnabled;
+    using CommandStreamReceiver::heaplessPrologProgrammed;
     using CommandStreamReceiver::heapStorageRequiresRecyclingTag;
+    using CommandStreamReceiver::immWritePostSyncWriteOffset;
     using CommandStreamReceiver::isPreambleSent;
     using CommandStreamReceiver::latestFlushedTaskCount;
     using CommandStreamReceiver::mediaVfeStateDirty;
     using CommandStreamReceiver::nTo1SubmissionModelEnabled;
     using CommandStreamReceiver::pageTableManagerInitialized;
-    using CommandStreamReceiver::postSyncWriteOffset;
-    using CommandStreamReceiver::requiredScratchSize;
+    using CommandStreamReceiver::requiredScratchSlot0Size;
     using CommandStreamReceiver::sbaSupportFlags;
     using CommandStreamReceiver::streamProperties;
     using CommandStreamReceiver::tagAddress;
     using CommandStreamReceiver::taskCount;
     using CommandStreamReceiver::taskLevel;
     using CommandStreamReceiver::timestampPacketWriteEnabled;
+    using CommandStreamReceiver::timeStampPostSyncWriteOffset;
     using CommandStreamReceiver::useGpuIdleImplicitFlush;
     using CommandStreamReceiver::useNewResourceImplicitFlush;
 
@@ -296,7 +459,7 @@ class MockCsrHw2 : public CommandStreamReceiverHw<GfxFamily> {
         }
         copyOfAllocations = allocationsForResidency;
         flushStamp->setStamp(flushStamp->peekStamp() + 1);
-        return SubmissionStatus::SUCCESS;
+        return SubmissionStatus::success;
     }
 
     CompletionStamp flushTask(LinearStream &commandStream, size_t commandStreamStart,
@@ -308,6 +471,27 @@ class MockCsrHw2 : public CommandStreamReceiverHw<GfxFamily> {
         auto completionStamp = CommandStreamReceiverHw<GfxFamily>::flushTask(commandStream, commandStreamStart,
                                                                              dsh, ioh, ssh, taskLevel, dispatchFlags, device);
 
+        storeCommandStream(commandStream, commandStreamStart);
+
+        return completionStamp;
+    }
+
+    TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, Device &device) override {
+        if (!skipBlitCalls) {
+            return CommandStreamReceiverHw<GfxFamily>::flushBcsTask(blitPropertiesContainer, blocking, device);
+        }
+        return taskCount;
+    }
+
+    void programHardwareContext(LinearStream &cmdStream) override {
+        programHardwareContextCalled = true;
+        if (programHardwareContextParentCall) {
+            CommandStreamReceiverHw<GfxFamily>::programHardwareContext(cmdStream);
+        }
+    }
+
+  private:
+    void storeCommandStream(LinearStream &commandStream, size_t commandStreamStart) {
         if (storeFlushedTaskStream && commandStream.getUsed() > commandStreamStart) {
             storedTaskStreamSize = commandStream.getUsed() - commandStreamStart;
             // Overfetch to allow command parser verify if "big" command is programmed at the end of allocation
@@ -317,29 +501,18 @@ class MockCsrHw2 : public CommandStreamReceiverHw<GfxFamily> {
             memcpy_s(storedTaskStream.get(), storedTaskStreamSize,
                      ptrOffset(commandStream.getCpuBase(), commandStreamStart), storedTaskStreamSize);
         }
-
-        return completionStamp;
     }
 
-    TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, bool profilingEnabled, Device &device) override {
-        if (!skipBlitCalls) {
-            return CommandStreamReceiverHw<GfxFamily>::flushBcsTask(blitPropertiesContainer, blocking, profilingEnabled, device);
-        }
-        return taskCount;
-    }
-
-    void programHardwareContext(LinearStream &cmdStream) override {
-        programHardwareContextCalled = true;
-    }
-
+  public:
     bool skipBlitCalls = false;
     bool storeFlushedTaskStream = false;
     std::unique_ptr<uint8_t[]> storedTaskStream;
     size_t storedTaskStreamSize = 0;
 
-    int flushCalledCount = 0;
+    uint32_t flushCalledCount = 0;
     std::unique_ptr<CommandBuffer> recordedCommandBuffer = nullptr;
     ResidencyContainer copyOfAllocations;
     DispatchFlags passedDispatchFlags = DispatchFlagsHelper::createDefaultDispatchFlags();
     bool programHardwareContextCalled = false;
+    bool programHardwareContextParentCall = false;
 };

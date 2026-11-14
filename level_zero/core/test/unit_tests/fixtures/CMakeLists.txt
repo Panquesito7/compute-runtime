@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -14,21 +14,38 @@ set(L0_FIXTURES_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/cmdlist_fixture.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/device_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device_fixture.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/device_fixture_extended.h
     ${CMAKE_CURRENT_SOURCE_DIR}/event_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/event_fixture.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/host_pointer_manager_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/host_pointer_manager_fixture.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/in_order_cmd_list_fixture.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernel_max_cooperative_groups_count_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernel_max_cooperative_groups_count_fixture.h
     ${CMAKE_CURRENT_SOURCE_DIR}/module_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/module_fixture.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/memory_ipc_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/memory_ipc_fixture.h
     ${CMAKE_CURRENT_SOURCE_DIR}/multi_tile_fixture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/multi_tile_fixture.h
 )
 
+if(UNIX)
+  list(APPEND L0_FIXTURES_SOURCES
+       ${CMAKE_CURRENT_SOURCE_DIR}/os/linux/device_fixture_linux.cpp
+  )
+endif()
+
+if(WIN32)
+  list(APPEND L0_FIXTURES_SOURCES
+       ${CMAKE_CURRENT_SOURCE_DIR}/os/windows/device_fixture_windows.cpp
+  )
+endif()
+
 add_library(${TARGET_NAME} OBJECT ${L0_FIXTURES_SOURCES} ${NEO_CORE_tests_compiler_mocks})
 
 target_include_directories(${TARGET_NAME} PRIVATE
-                           $<TARGET_PROPERTY:gmock-gtest,INTERFACE_INCLUDE_DIRECTORIES>
+                           $<TARGET_PROPERTY:neo_gtest,INTERFACE_INCLUDE_DIRECTORIES>
                            $<TARGET_PROPERTY:${L0_MOCKABLE_LIB_NAME},INTERFACE_INCLUDE_DIRECTORIES>
                            $<TARGET_PROPERTY:${NEO_SHARED_MOCKABLE_LIB_NAME},INTERFACE_INCLUDE_DIRECTORIES>
                            ${NEO_SOURCE_DIR}/level_zero/core/test/unit_test

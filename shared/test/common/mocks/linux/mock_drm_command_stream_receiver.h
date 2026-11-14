@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -21,9 +21,10 @@ class TestedDrmCommandStreamReceiver : public DrmCommandStreamReceiver<GfxFamily
     using BaseClass::drm;
     using BaseClass::exec;
     using BaseClass::execObjectsStorage;
+    using BaseClass::isPerQueuePrologueEnabled;
     using BaseClass::residency;
-    using BaseClass::useContextForUserFenceWait;
     using BaseClass::useUserFenceWait;
+    using BaseClass::vmBindAvailable;
     using CommandStreamReceiver::activePartitions;
     using CommandStreamReceiver::clearColorAllocation;
     using CommandStreamReceiver::commandStream;
@@ -33,12 +34,14 @@ class TestedDrmCommandStreamReceiver : public DrmCommandStreamReceiver<GfxFamily
     using CommandStreamReceiver::getTagAddress;
     using CommandStreamReceiver::getTagAllocation;
     using CommandStreamReceiver::globalFenceAllocation;
+    using CommandStreamReceiver::heaplessPrologProgrammed;
+    using CommandStreamReceiver::immWritePostSyncWriteOffset;
     using CommandStreamReceiver::latestSentTaskCount;
-    using CommandStreamReceiver::logicalStateHelper;
     using CommandStreamReceiver::makeResident;
-    using CommandStreamReceiver::postSyncWriteOffset;
+    using CommandStreamReceiver::pushAllocationsForMakeResident;
     using CommandStreamReceiver::tagAddress;
     using CommandStreamReceiver::taskCount;
+    using CommandStreamReceiver::timeStampPostSyncWriteOffset;
     using CommandStreamReceiver::useGpuIdleImplicitFlush;
     using CommandStreamReceiver::useNewResourceImplicitFlush;
     using CommandStreamReceiver::useNotifyEnableForPostSync;
@@ -46,15 +49,14 @@ class TestedDrmCommandStreamReceiver : public DrmCommandStreamReceiver<GfxFamily
     using CommandStreamReceiverHw<GfxFamily>::blitterDirectSubmission;
     using CommandStreamReceiverHw<GfxFamily>::CommandStreamReceiver::lastSentSliceCount;
 
-    TestedDrmCommandStreamReceiver(gemCloseWorkerMode mode,
-                                   ExecutionEnvironment &executionEnvironment,
+    TestedDrmCommandStreamReceiver(ExecutionEnvironment &executionEnvironment,
                                    const DeviceBitfield deviceBitfield)
-        : DrmCommandStreamReceiver<GfxFamily>(executionEnvironment, 0, deviceBitfield, mode) {
+        : DrmCommandStreamReceiver<GfxFamily>(executionEnvironment, 0, deviceBitfield) {
     }
     TestedDrmCommandStreamReceiver(ExecutionEnvironment &executionEnvironment,
                                    uint32_t rootDeviceIndex,
                                    const DeviceBitfield deviceBitfield)
-        : DrmCommandStreamReceiver<GfxFamily>(executionEnvironment, rootDeviceIndex, deviceBitfield, gemCloseWorkerMode::gemCloseWorkerInactive) {
+        : DrmCommandStreamReceiver<GfxFamily>(executionEnvironment, rootDeviceIndex, deviceBitfield) {
     }
 
     void overrideDispatchPolicy(DispatchMode overrideValue) {
@@ -78,7 +80,7 @@ class TestedDrmCommandStreamReceiver : public DrmCommandStreamReceiver<GfxFamily
         return this->submissionAggregator.get();
     }
 
-    ADDMETHOD(processResidency, SubmissionStatus, true, SubmissionStatus::SUCCESS, (const ResidencyContainer &allocationsForResidency, uint32_t handleId), (allocationsForResidency, handleId));
+    ADDMETHOD(processResidency, SubmissionStatus, true, SubmissionStatus::success, (ResidencyContainer & allocationsForResidency, uint32_t handleId), (allocationsForResidency, handleId));
 
     ADDMETHOD(exec, int, true, 0, (const BatchBuffer &batchBuffer, uint32_t vmHandleId, uint32_t drmContextId, uint32_t index), (batchBuffer, vmHandleId, drmContextId, index));
 
@@ -107,18 +109,18 @@ class TestedDrmCommandStreamReceiver : public DrmCommandStreamReceiver<GfxFamily
 
     WaitUserFenceResult waitUserFenceResult;
 
-    int waitUserFence(TaskCountType waitValue) override {
+    bool waitUserFence(TaskCountType waitValue, uint64_t hostAddress, int64_t timeout, bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait, SyncFence *fence) override {
         waitUserFenceResult.called++;
         waitUserFenceResult.waitValue = waitValue;
 
         if (waitUserFenceResult.callParent) {
-            return BaseClass::waitUserFence(waitValue);
+            return BaseClass::waitUserFence(waitValue, hostAddress, timeout, userInterrupt, externalInterruptId, allocForInterruptWait, nullptr);
         } else {
-            return waitUserFenceResult.returnValue;
+            return (waitUserFenceResult.returnValue == 0);
         }
     }
 
-    ADDMETHOD(flushInternal, SubmissionStatus, true, SubmissionStatus::SUCCESS, (const BatchBuffer &batchBuffer, const ResidencyContainer &allocationsForResidency), (batchBuffer, allocationsForResidency));
+    ADDMETHOD(flushInternal, SubmissionStatus, true, SubmissionStatus::success, (const BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency), (batchBuffer, allocationsForResidency));
 
     void readBackAllocation(void *source) override {
         latestReadBackAddress = source;
@@ -129,19 +131,24 @@ class TestedDrmCommandStreamReceiver : public DrmCommandStreamReceiver<GfxFamily
         this->drm = proxyDrm;
     }
 
+    void stopDirectSubmission(bool blocking, bool needsLock) override {
+        stopDirectSubmissionCalled = true;
+        DrmCommandStreamReceiver<GfxFamily>::stopDirectSubmission(blocking, needsLock);
+    }
+
     void *latestReadBackAddress = nullptr;
     uint32_t fillReusableAllocationsListCalled = 0;
+    bool stopDirectSubmissionCalled = false;
 };
 
 template <typename GfxFamily>
 class TestedDrmCommandStreamReceiverWithFailingExec : public TestedDrmCommandStreamReceiver<GfxFamily> {
   public:
-    TestedDrmCommandStreamReceiverWithFailingExec(gemCloseWorkerMode mode,
-                                                  ExecutionEnvironment &executionEnvironment,
+    TestedDrmCommandStreamReceiverWithFailingExec(ExecutionEnvironment &executionEnvironment,
                                                   const DeviceBitfield deviceBitfield)
-        : TestedDrmCommandStreamReceiver<GfxFamily>(mode,
-                                                    executionEnvironment,
-                                                    deviceBitfield) {
+        : TestedDrmCommandStreamReceiver<GfxFamily>(
+              executionEnvironment,
+              deviceBitfield) {
     }
     TestedDrmCommandStreamReceiverWithFailingExec(ExecutionEnvironment &executionEnvironment,
                                                   uint32_t rootDeviceIndex,

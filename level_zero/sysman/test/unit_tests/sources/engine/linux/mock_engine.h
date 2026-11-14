@@ -1,36 +1,57 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/os_interface/linux/engine_info.h"
 #include "shared/source/os_interface/linux/i915.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
 
-#include "level_zero/sysman/source/engine/linux/sysman_os_engine_imp.h"
-#include "level_zero/sysman/source/engine/sysman_engine_imp.h"
-#include "level_zero/sysman/source/linux/pmu/sysman_pmu_imp.h"
-#include "level_zero/sysman/source/linux/zes_os_sysman_imp.h"
+#include "level_zero/sysman/source/api/engine/linux/sysman_os_engine_imp.h"
+#include "level_zero/sysman/source/api/engine/sysman_engine_imp.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+#include "level_zero/sysman/source/shared/linux/zes_os_sysman_imp.h"
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_hw_device_id.h"
+#include "level_zero/sysman/test/unit_tests/sources/linux/pmu/mock_pmu.h"
 
 using namespace NEO;
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
-constexpr int64_t mockPmuFd = 10;
-constexpr uint64_t mockTimestamp = 87654321;
-constexpr uint64_t mockActiveTime = 987654321;
-const uint32_t microSecondsToNanoSeconds = 1000u;
-constexpr uint16_t I915_INVALID_ENGINE_CLASS = UINT16_MAX;
-const std::string deviceDir("device");
+
+struct MockEngineFsAccess : public L0::Sysman::FsAccessInterface {
+    bool mockIsRootUser = true;
+    bool isRootUser() override {
+        return mockIsRootUser;
+    }
+};
+
+class MockEngineSysmanHwDeviceIdDrm : public MockSysmanHwDeviceIdDrm {
+  public:
+    using L0::Sysman::ult::MockSysmanHwDeviceIdDrm::MockSysmanHwDeviceIdDrm;
+    int returnOpenFileDescriptor = -1;
+    int returnCloseFileDescriptor = 0;
+
+    int openFileDescriptor() override {
+        return returnOpenFileDescriptor;
+    }
+
+    int closeFileDescriptor() override {
+        return returnCloseFileDescriptor;
+    }
+};
 
 struct MockEngineNeoDrm : public Drm {
     using Drm::getEngineInfo;
     using Drm::setupIoctlHelper;
-    const int mockFd = 0;
+    static constexpr int mockFd = 0;
     MockEngineNeoDrm(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<MockSysmanHwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
+    MockEngineNeoDrm(RootDeviceEnvironment &rootDeviceEnvironment, int mockFileDescriptor) : Drm(std::make_unique<MockEngineSysmanHwDeviceIdDrm>(mockFileDescriptor, ""), rootDeviceEnvironment) {}
 
     bool mockSysmanQueryEngineInfoReturnFalse = true;
     bool sysmanQueryEngineInfo() override {
@@ -49,21 +70,27 @@ struct MockEngineNeoDrm : public Drm {
         i915engineInfo[3].engine.engineInstance = 0;
         i915engineInfo[4].engine.engineClass = drm_i915_gem_engine_class::I915_ENGINE_CLASS_VIDEO_ENHANCE;
         i915engineInfo[4].engine.engineInstance = 0;
-        i915engineInfo[5].engine.engineClass = I915_INVALID_ENGINE_CLASS;
+        i915engineInfo[5].engine.engineClass = UINT16_MAX;
         i915engineInfo[5].engine.engineInstance = 0;
 
-        this->engineInfo.reset(new EngineInfo(this, i915engineInfo));
+        StackVec<std::vector<NEO::EngineCapabilities>, 2> engineInfosPerTile{i915engineInfo};
+
+        this->engineInfo = std::make_unique<NEO::EngineInfo>(this, engineInfosPerTile);
         return true;
     }
 };
 
-struct MockEnginePmuInterfaceImp : public L0::Sysman::PmuInterfaceImp {
-    using PmuInterfaceImp::perfEventOpen;
-    MockEnginePmuInterfaceImp(L0::Sysman::LinuxSysmanImp *pLinuxSysmanImp) : PmuInterfaceImp(pLinuxSysmanImp) {}
+struct MockEnginePmuInterfaceImp : public L0::Sysman::ult::MockPmuInterfaceImpForSysman {
+    int64_t mockPmuFd = 0;
+    uint64_t mockTimestamp = 0;
+    uint64_t mockActiveTime = 0;
+    MockEnginePmuInterfaceImp(L0::Sysman::LinuxSysmanImp *pLinuxSysmanImp) : MockPmuInterfaceImpForSysman(pLinuxSysmanImp) {}
 
     int64_t mockPerfEventFailureReturnValue = 0;
+    int32_t mockErrorNumber = ENOENT;
     int64_t perfEventOpen(perf_event_attr *attr, pid_t pid, int cpu, int groupFd, uint64_t flags) override {
         if (mockPerfEventFailureReturnValue == -1) {
+            errno = mockErrorNumber;
             return mockPerfEventFailureReturnValue;
         }
 
@@ -82,40 +109,24 @@ struct MockEnginePmuInterfaceImp : public L0::Sysman::PmuInterfaceImp {
     }
 };
 
-struct MockEngineFsAccess : public L0::Sysman::FsAccess {
-    uint32_t mockReadVal = 23;
-    ze_result_t mockReadErrorVal = ZE_RESULT_SUCCESS;
-    ze_result_t readResult = ZE_RESULT_SUCCESS;
-    ze_result_t read(const std::string file, uint32_t &val) override {
-        val = mockReadVal;
-        if (mockReadErrorVal != ZE_RESULT_SUCCESS) {
-            readResult = mockReadErrorVal;
-        }
-
-        return readResult;
+struct MockOsEngineWithoutActivityCollection : public L0::Sysman::OsEngine {
+    ze_result_t getActivity(zes_engine_stats_t *pStats) override {
+        return ZE_RESULT_SUCCESS;
     }
-};
-
-struct MockEngineSysfsAccess : public L0::Sysman::SysfsAccess {
-    ze_result_t mockReadSymLinkError = ZE_RESULT_SUCCESS;
-    ze_result_t readSymLinkResult = ZE_RESULT_SUCCESS;
-    uint32_t readSymLinkCalled = 0u;
-    ze_result_t readSymLink(const std::string file, std::string &val) override {
-        readSymLinkCalled++;
-        if ((mockReadSymLinkError != ZE_RESULT_SUCCESS) && (readSymLinkCalled == 1)) {
-            return mockReadSymLinkError;
-        }
-
-        if (file.compare(deviceDir) == 0) {
-            val = "/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:01.0/0000:03:00.0";
-        }
-        return readSymLinkResult;
+    ze_result_t getActivityExt(uint32_t *pCount, zes_engine_stats_t *pStats) override {
+        return ZE_RESULT_SUCCESS;
     }
-
-    MockEngineSysfsAccess() = default;
+    ze_result_t getProperties(zes_engine_properties_t &properties) override {
+        return ZE_RESULT_SUCCESS;
+    }
+    bool isEngineModuleSupported() override {
+        return true;
+    }
+    void reInit() override {}
 };
 
 using DrmMockEngineInfoFailing = DrmMock;
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

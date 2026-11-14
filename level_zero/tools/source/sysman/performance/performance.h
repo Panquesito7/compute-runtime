@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,9 @@
 
 #pragma once
 #include "level_zero/api/sysman/zes_handles_struct.h"
-#include "level_zero/core/source/device/device.h"
 #include <level_zero/zes_api.h>
 
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -19,7 +19,7 @@ struct OsSysman;
 
 class Performance : _zes_perf_handle_t {
   public:
-    ~Performance() override {}
+    virtual ~Performance() = default;
     virtual ze_result_t performanceGetProperties(zes_perf_properties_t *pProperties) = 0;
     virtual ze_result_t performanceGetConfig(double *pFactor) = 0;
     virtual ze_result_t performanceSetConfig(double pFactor) = 0;
@@ -33,7 +33,7 @@ class Performance : _zes_perf_handle_t {
 };
 
 struct PerformanceHandleContext {
-    PerformanceHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    PerformanceHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     ~PerformanceHandleContext();
 
     ze_result_t init(std::vector<ze_device_handle_t> &deviceHandles, ze_device_handle_t coreDevice);

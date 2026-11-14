@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,31 +16,14 @@ struct MTL : public XeHpgCoreFamily {
     static const HardwareInfo hwInfo;
     static FeatureTable featureTable;
     static WorkaroundTable workaroundTable;
-    // Initial non-zero values for unit tests
-    static const uint32_t maxEuPerSubslice = 16;
-    static const uint32_t maxSlicesSupported = 8;
-    static const uint32_t maxSubslicesSupported = 32;
-    static const uint32_t maxDualSubslicesSupported = 32;
     static const RuntimeCapabilityTable capabilityTable;
-    static void (*setupHardwareInfo)(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, uint64_t hwInfoConfig, const CompilerProductHelper &compilerProductHelper);
+    static void (*setupHardwareInfo)(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable);
     static void setupFeatureAndWorkaroundTable(HardwareInfo *hwInfo);
-    static void setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper);
-    static void setupHardwareInfoMultiTileBase(HardwareInfo *hwInfo);
-
-    static bool isLpg(const HardwareInfo &hwInfo) {
-        return ((hwInfo.ipVersion.architecture == 12) &&
-                (hwInfo.ipVersion.release <= 71));
-    }
-};
-
-class MtlHwConfig : public MTL {
-  public:
-    static void setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper);
-    static const HardwareInfo hwInfo;
+    static void setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable);
+    static void setupHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable);
 
   private:
     static GT_SYSTEM_INFO gtSystemInfo;
 };
 
-#include "hw_cmds_mtl.inl"
 } // namespace NEO

@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/sysman/fabric_port/fabric_port_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/windows/mock_sysman_fixture.h"
 
@@ -61,6 +62,24 @@ TEST_F(SysmanFabricPortFixture, GivenValidFabricPortHandleWhenCallingFabricPortG
 TEST_F(SysmanFabricPortFixture, GivenValidFabricPortHandleWhenCallingFabricPortGetLinkTupeThenFailureIsReturned) {
     zes_fabric_link_type_t pLinkType = {};
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pFabricPortImp->fabricPortGetLinkType(&pLinkType));
+}
+
+TEST_F(SysmanFabricPortFixture, GivenValidFabricPortHandleWhenCallingFabricPortErrorCountersThenUnsupportedFeatureErrorIsReturned) {
+    zes_fabric_port_error_counters_t pErrorType = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pFabricPortImp->fabricPortGetErrorCounters(&pErrorType));
+}
+
+TEST_F(SysmanFabricPortFixture, GivenDeviceHandleWhenCallingzesFabricPortGetMultiPortThroughputThenUnsupportedFeatureErrorIsReturned) {
+    uint32_t count = 1;
+    zes_fabric_port_handle_t hPorts[1] = {};
+    hPorts[0] = pFabricPortImp->toZesHandle();
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesFabricPortGetMultiPortThroughput(device->toHandle(), count, hPorts, nullptr));
+}
+
+TEST_F(SysmanFabricPortFixture, GivenDeviceHandleWhenCallingzesFabricPortGetMultiPortThroughputWithCountAsZeroThenInvalidArgumentErrorIsReturned) {
+    zes_fabric_port_handle_t hPorts[1] = {};
+    hPorts[0] = pFabricPortImp->toZesHandle();
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zesFabricPortGetMultiPortThroughput(device->toHandle(), 0, hPorts, nullptr));
 }
 
 } // namespace ult

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,7 @@
 #include "shared/source/helpers/hw_info.h"
 
 #include <map>
-#include <string_view>
+#include <vector>
 
 namespace NEO {
 /*
@@ -20,22 +20,43 @@ namespace NEO {
  *
  */
 
-std::map<std::string_view, std::vector<AILEnumeration>> applicationMap = {{"blender", {AILEnumeration::ENABLE_FP64}}};
+std::map<std::string_view, std::vector<AILEnumeration>> applicationMap = {{"blender", {AILEnumeration::enableFp64}},
+                                                                          // Modify reported platform name to ensure older versions of Adobe Premiere Pro are able to recognize the GPU device
+                                                                          {"Adobe Premiere Pro", {AILEnumeration::enableLegacyPlatformName}}};
 
-AILConfiguration *ailConfigurationTable[IGFX_MAX_PRODUCT] = {};
+std::map<std::string_view, std::vector<AILEnumeration>> applicationMapXeHpgLpg = {};
 
-AILConfiguration *AILConfiguration::get(PRODUCT_FAMILY productFamily) {
-    return ailConfigurationTable[productFamily];
-}
+const std::set<std::string_view> applicationsForceRcsDg2 = {};
 
-void AILConfiguration::apply(RuntimeCapabilityTable &runtimeCapabilityTable) {
+const std::set<std::string_view> applicationsContextSyncFlag = {};
+
+const std::set<std::string_view> applicationsBufferPoolDisabled = {};
+
+const std::set<std::string_view> applicationsBufferPoolDisabledXe = {};
+
+const std::set<std::string_view> applicationsOverfetchDisabled = {};
+
+const std::set<std::string_view> applicationsDrainHostptrsDisabled = {};
+
+const std::set<std::string_view> applicationsDeviceUSMRecyclingLimited = {};
+
+const std::set<std::string_view> applicationsMicrosecontResolutionAdjustment = {};
+
+const uint32_t microsecondAdjustment = 1000;
+
+AILConfigurationCreateFunctionType ailConfigurationFactory[NEO::maxProductEnumValue];
+
+void AILConfiguration::apply(HardwareInfo &hwInfo) {
     auto search = applicationMap.find(processName);
 
     if (search != applicationMap.end()) {
         for (size_t i = 0; i < search->second.size(); ++i) {
             switch (search->second[i]) {
-            case AILEnumeration::ENABLE_FP64:
-                runtimeCapabilityTable.ftrSupportsFP64 = true;
+            case AILEnumeration::enableFp64:
+                hwInfo.capabilityTable.ftrSupportsFP64 = true;
+                break;
+            case AILEnumeration::enableLegacyPlatformName:
+                hwInfo.capabilityTable.preferredPlatformName = legacyPlatformName;
                 break;
             default:
                 break;
@@ -43,7 +64,7 @@ void AILConfiguration::apply(RuntimeCapabilityTable &runtimeCapabilityTable) {
         }
     }
 
-    applyExt(runtimeCapabilityTable);
+    applyExt(hwInfo);
 }
 
 } // namespace NEO

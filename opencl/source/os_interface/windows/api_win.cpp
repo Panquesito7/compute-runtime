@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,12 +11,14 @@
 #include "shared/source/os_interface/windows/wddm/wddm.h"
 
 #include "opencl/source/api/api_enter.h"
+#include "opencl/source/api/leo_forwarding.h"
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/cl_validators.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/source/platform/platform.h"
+#include "opencl/source/sharings/d3d/cl_d3d_api.h"
 #include "opencl/source/sharings/d3d/d3d_buffer.h"
 #include "opencl/source/sharings/d3d/d3d_surface.h"
 #include "opencl/source/sharings/d3d/d3d_texture.h"
@@ -193,7 +195,7 @@ cl_int CL_API_CALL clEnqueueReleaseDX9ObjectsINTEL(cl_command_queue commandQueue
     for (unsigned int object = 0; object < numObjects; object++) {
         auto memObject = castToObject<MemObj>(memObjects[object]);
         if (!static_cast<D3DSharing<D3DTypesHelper::D3D9> *>(memObject->peekSharingHandler())->isSharedResource()) {
-            cmdQ->finish();
+            cmdQ->finish(false);
             break;
         }
     }
@@ -201,7 +203,7 @@ cl_int CL_API_CALL clEnqueueReleaseDX9ObjectsINTEL(cl_command_queue commandQueue
     retVal = cmdQ->enqueueReleaseSharedObjects(numObjects, memObjects, numEventsInWaitList,
                                                eventWaitList, event, CL_COMMAND_RELEASE_DX9_OBJECTS_INTEL);
     if (!cmdQ->getContext().getInteropUserSyncEnabled()) {
-        cmdQ->finish();
+        cmdQ->finish(false);
     }
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
@@ -291,7 +293,7 @@ cl_int CL_API_CALL clEnqueueReleaseDX9MediaSurfacesKHR(cl_command_queue commandQ
         auto memObject = castToObject<MemObj>(memObjects[object]);
         if (memObject) {
             if (!static_cast<D3DSharing<D3DTypesHelper::D3D9> *>(memObject->peekSharingHandler())->isSharedResource()) {
-                cmdQ->finish();
+                cmdQ->finish(false);
                 break;
             }
 
@@ -304,7 +306,7 @@ cl_int CL_API_CALL clEnqueueReleaseDX9MediaSurfacesKHR(cl_command_queue commandQ
     retVal = cmdQ->enqueueReleaseSharedObjects(numObjects, memObjects, numEventsInWaitList,
                                                eventWaitList, event, CL_COMMAND_RELEASE_DX9_MEDIA_SURFACES_KHR);
     if (!cmdQ->getContext().getInteropUserSyncEnabled()) {
-        cmdQ->finish();
+        cmdQ->finish(false);
     }
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
@@ -336,8 +338,8 @@ cl_int CL_API_CALL clGetDeviceIDsFromD3D10KHR(cl_platform_id platform, cl_d3d10_
         return retVal;
     }
 
-    if (DebugManager.injectFcn) {
-        sharingFcns.getDxgiDescFcn = (D3DSharingFunctions<D3DTypesHelper::D3D10>::GetDxgiDescFcn)DebugManager.injectFcn;
+    if (debugManager.injectFcn) {
+        sharingFcns.getDxgiDescFcn = (D3DSharingFunctions<D3DTypesHelper::D3D10>::GetDxgiDescFcn)debugManager.injectFcn;
     }
 
     switch (d3dDeviceSource) {
@@ -512,7 +514,7 @@ cl_int CL_API_CALL clEnqueueReleaseD3D10ObjectsKHR(cl_command_queue commandQueue
             return retVal;
         }
         if (!static_cast<D3DSharing<D3DTypesHelper::D3D10> *>(memObject->peekSharingHandler())->isSharedResource()) {
-            cmdQ->finish();
+            cmdQ->finish(false);
             break;
         }
     }
@@ -520,7 +522,7 @@ cl_int CL_API_CALL clEnqueueReleaseD3D10ObjectsKHR(cl_command_queue commandQueue
     retVal = cmdQ->enqueueReleaseSharedObjects(numObjects, memObjects, numEventsInWaitList,
                                                eventWaitList, event, CL_COMMAND_RELEASE_D3D10_OBJECTS_KHR);
     if (!cmdQ->getContext().getInteropUserSyncEnabled()) {
-        cmdQ->finish();
+        cmdQ->finish(false);
     }
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
@@ -551,8 +553,8 @@ cl_int CL_API_CALL clGetDeviceIDsFromD3D11KHR(cl_platform_id platform, cl_d3d11_
         return retVal;
     }
 
-    if (DebugManager.injectFcn) {
-        sharingFcns.getDxgiDescFcn = (D3DSharingFunctions<D3DTypesHelper::D3D11>::GetDxgiDescFcn)DebugManager.injectFcn;
+    if (debugManager.injectFcn) {
+        sharingFcns.getDxgiDescFcn = (D3DSharingFunctions<D3DTypesHelper::D3D11>::GetDxgiDescFcn)debugManager.injectFcn;
     }
 
     switch (d3dDeviceSource) {
@@ -725,7 +727,7 @@ cl_int CL_API_CALL clEnqueueReleaseD3D11ObjectsKHR(cl_command_queue commandQueue
             return retVal;
         }
         if (!static_cast<D3DSharing<D3DTypesHelper::D3D11> *>(memObject->peekSharingHandler())->isSharedResource()) {
-            cmdQ->finish();
+            cmdQ->finish(false);
             break;
         }
     }
@@ -733,7 +735,7 @@ cl_int CL_API_CALL clEnqueueReleaseD3D11ObjectsKHR(cl_command_queue commandQueue
     retVal = cmdQ->enqueueReleaseSharedObjects(numObjects, memObjects, numEventsInWaitList,
                                                eventWaitList, event, CL_COMMAND_RELEASE_D3D11_OBJECTS_KHR);
     if (!cmdQ->getContext().getInteropUserSyncEnabled()) {
-        cmdQ->finish();
+        cmdQ->finish(false);
     }
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
@@ -744,6 +746,7 @@ cl_int CL_API_CALL clGetSupportedDX9MediaSurfaceFormatsINTEL(cl_context context,
                                                              cl_mem_object_type imageType, cl_uint plane,
                                                              cl_uint numEntries, D3DFORMAT *dx9Formats,
                                                              cl_uint *numImageFormats) {
+    FORWARD_TO_LEO_IF_FOREIGN(NEO::Context, context, clGetSupportedDX9MediaSurfaceFormatsINTEL, context, flags, imageType, plane, numEntries, dx9Formats, numImageFormats);
 
     if (validateObject(context) != CL_SUCCESS) {
         return CL_INVALID_CONTEXT;
@@ -796,11 +799,13 @@ cl_int CL_API_CALL clGetSupportedDX9MediaSurfaceFormatsINTEL(cl_context context,
 cl_int CL_API_CALL clGetSupportedD3D10TextureFormatsINTEL(cl_context context, cl_mem_flags flags,
                                                           cl_mem_object_type imageType,
                                                           cl_uint numEntries, DXGI_FORMAT *formats, cl_uint *numTextureFormats) {
+    FORWARD_TO_LEO_IF_FOREIGN(NEO::Context, context, clGetSupportedD3D10TextureFormatsINTEL, context, flags, imageType, numEntries, formats, numTextureFormats);
     return getSupportedDXTextureFormats<D3DTypesHelper::D3D10>(context, imageType, 0, numEntries, formats, numTextureFormats);
 }
 
 cl_int CL_API_CALL clGetSupportedD3D11TextureFormatsINTEL(cl_context context, cl_mem_flags flags,
                                                           cl_mem_object_type imageType, cl_uint plane,
                                                           cl_uint numEntries, DXGI_FORMAT *formats, cl_uint *numTextureFormats) {
+    FORWARD_TO_LEO_IF_FOREIGN(NEO::Context, context, clGetSupportedD3D11TextureFormatsINTEL, context, flags, imageType, plane, numEntries, formats, numTextureFormats);
     return getSupportedDXTextureFormats<D3DTypesHelper::D3D11>(context, imageType, plane, numEntries, formats, numTextureFormats);
 }

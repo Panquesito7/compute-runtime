@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,11 @@
 
 #pragma once
 
+#include "shared/source/helpers/hw_mapper.h"
+
 #include "level_zero/core/source/sampler/sampler_imp.h"
+
+#include <limits>
 
 namespace L0 {
 
@@ -20,7 +24,7 @@ struct SamplerCoreFamily : public SamplerImp {
 
     ze_result_t initialize(Device *device, const ze_sampler_desc_t *desc) override;
 
-    void copySamplerStateToDSH(void *dynamicStateHeap, const uint32_t dynamicStateHeapSize,
+    void copySamplerStateToDSH(ArrayRef<uint8_t> dynamicStateHeap,
                                const uint32_t offset) override;
 
     static constexpr float getGenSamplerMaxLod() {
@@ -29,11 +33,8 @@ struct SamplerCoreFamily : public SamplerImp {
 
   protected:
     SAMPLER_STATE samplerState;
-    float lodMin = 1.0f;
-    float lodMax = 1.0f;
+    float lodMin = 0.0f;
+    float lodMax = std::numeric_limits<float>::max();
 };
-
-template <uint32_t gfxProductFamily>
-struct SamplerProductFamily;
 
 } // namespace L0

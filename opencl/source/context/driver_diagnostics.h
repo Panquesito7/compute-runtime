@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,7 +17,6 @@ enum PerformanceHints {
     CL_IMAGE_MEETS_ALIGNMENT_RESTRICTIONS,
     DRIVER_CALLS_INTERNAL_CL_FLUSH,
     PROFILING_ENABLED,
-    PROFILING_ENABLED_WITH_DISABLED_PREEMPTION,
     SUBBUFFER_SHARES_MEMORY,
     CL_SVM_ALLOC_MEETS_ALIGNMENT_RESTRICTIONS,
     CL_ENQUEUE_READ_BUFFER_REQUIRES_COPY_DATA,
@@ -57,14 +56,14 @@ enum PerformanceHints {
 
 class DriverDiagnostics {
   public:
-    DriverDiagnostics(cl_diagnostics_verbose_level level);
-    bool validFlags(cl_diagnostics_verbose_level flags) const;
+    DriverDiagnostics(cl_diagnostic_verbose_level_intel level);
+    bool validFlags(cl_diagnostic_verbose_level_intel flags) const;
     ~DriverDiagnostics() = default;
     static const char *const hintFormat[];
     static const cl_int maxHintStringSize = 1024;
     PerformanceHints obtainHintForTransferOperation(cl_command_type commandType, bool transferRequired);
 
   protected:
-    cl_diagnostics_verbose_level verboseLevel;
+    cl_diagnostic_verbose_level_intel verboseLevel;
 };
 } // namespace NEO

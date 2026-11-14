@@ -1,14 +1,27 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/built_ins/sip.h"
-#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_usm_memory_pool.h"
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/test/unit_tests/fixtures/memory_ipc_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_built_ins.h"
+
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <new>
+#include <utility>
+#include <vector>
 
 namespace L0 {
 namespace ult {
@@ -16,12 +29,36 @@ namespace ult {
 using MemoryIPCTests = MemoryExportImportWinHandleTest;
 
 TEST_F(MemoryIPCTests,
+       givenCallToGetIpcHandleWithDisabledIpcHandleSharingThenUnsupportedFeatureIsReturned) {
+    // Temporarily disable IPC handle sharing for this test
+    context->settings.enableIpcHandleSharingByDefault = false;
+
+    size_t size = 10;
+    size_t alignment = 1u;
+    void *ptr = nullptr;
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    ze_result_t result = context->allocDeviceMem(device->toHandle(),
+                                                 &deviceDesc,
+                                                 size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    ze_ipc_mem_handle_t ipcHandle;
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, result);
+
+    result = context->freeMem(ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(MemoryIPCTests,
        givenCallToGetIpcHandleWithNotKnownPointerThenInvalidArgumentIsReturned) {
 
     uint32_t value = 0;
 
     ze_ipc_mem_handle_t ipcHandle;
-    ze_result_t result = context->getIpcMemHandle(&value, &ipcHandle);
+    ze_result_t result = context->getIpcMemHandle(&value, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
 }
 
@@ -39,7 +76,7 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = context->freeMem(ptr);
@@ -47,7 +84,7 @@ TEST_F(MemoryIPCTests,
 }
 
 TEST_F(MemoryIPCTests,
-       givenCallToGetIpcHandleWithDeviceAllocationAndCallToPutIpcHandleThenIpcHandleIsReturnedAndReleased) {
+       givenCallToGetIpcHandleWithDeviceAllocationAndCallToPutIpcHandleInNonOpaqueModeThenIpcHandleIsReturnedAndReleased) {
     size_t size = 10;
     size_t alignment = 1u;
     void *ptr = nullptr;
@@ -59,14 +96,116 @@ TEST_F(MemoryIPCTests,
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_NE(nullptr, ptr);
 
-    ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    // Save context useOpaqueHandle setting
+    bool useOpaque = context->settings.useOpaqueHandle;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::none;
+
+    alignas(8) ze_ipc_mem_handle_t ipcHandle;
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // Verify that non-opaque mode by checking the memory type
+    alignas(8) IpcMemoryData ipcData = *reinterpret_cast<IpcMemoryData *>(ipcHandle.data);
+    InternalIpcMemoryType memoryType = static_cast<InternalIpcMemoryType>(ipcData.type);
+    EXPECT_EQ(memoryType, InternalIpcMemoryType::deviceUnifiedMemory);
 
     result = context->putIpcMemHandle(ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(0u, context->getIPCHandleMap().size());
+    // Restore previous context useOpaqueHandle setting
+    context->settings.useOpaqueHandle = useOpaque;
+
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    result = context->freeMem(ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(MemoryIPCTests,
+       givenCallToGetIpcHandleWithDeviceAllocationAndCallToPutIpcHandleInOpaqueDRMModeThenIpcHandleIsReturnedAndReleased) {
+    size_t size = 10;
+    size_t alignment = 1u;
+    void *ptr = nullptr;
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    ze_result_t result = context->allocDeviceMem(device->toHandle(),
+                                                 &deviceDesc,
+                                                 size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    // Save and set context settings for opaque FD handle mode
+    bool useOpaque = context->settings.useOpaqueHandle;
+    IpcHandleType handleType = context->settings.handleType;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::nthandle;
+    context->settings.handleType = IpcHandleType::fdHandle;
+
+    alignas(8) ze_ipc_mem_handle_t ipcHandle;
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // Verify that opaque mode was used by checking the memory type and process ID
+    alignas(8) IpcOpaqueMemoryData ipcData = *reinterpret_cast<IpcOpaqueMemoryData *>(ipcHandle.data);
+    InternalIpcMemoryType memType = static_cast<InternalIpcMemoryType>(ipcData.memoryType);
+    IpcHandleType hdlType = context->settings.handleType;
+    EXPECT_EQ(memType, InternalIpcMemoryType::deviceUnifiedMemory);
+    EXPECT_EQ(hdlType, IpcHandleType::fdHandle);
+    EXPECT_EQ(ipcData.processId, NEO::SysCalls::getCurrentProcessId());
+    EXPECT_NE(ipcData.processId, 0u);
+
+    result = context->putIpcMemHandle(ipcHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // Restore previous context settings
+    context->settings.useOpaqueHandle = useOpaque;
+    context->settings.handleType = handleType;
+
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
+
+    result = context->freeMem(ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(MemoryIPCTests,
+       givenCallToGetIpcHandleWithDeviceAllocationAndCallToPutIpcHandleInOpaqueWDDMModeThenIpcHandleIsReturnedAndReleased) {
+    size_t size = 10;
+    size_t alignment = 1u;
+    void *ptr = nullptr;
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    ze_result_t result = context->allocDeviceMem(device->toHandle(),
+                                                 &deviceDesc,
+                                                 size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    // Save and set context settings for opaque NT handle mode
+    bool useOpaque = context->settings.useOpaqueHandle;
+    IpcHandleType handleType = context->settings.handleType;
+    context->settings.useOpaqueHandle = OpaqueHandlingType::nthandle;
+    context->settings.handleType = IpcHandleType::ntHandle;
+
+    alignas(8) ze_ipc_mem_handle_t ipcHandle;
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // Verify that opaque mode was used by checking the memory type and process ID
+    alignas(8) IpcOpaqueMemoryData ipcData = *reinterpret_cast<IpcOpaqueMemoryData *>(ipcHandle.data);
+    InternalIpcMemoryType memType = static_cast<InternalIpcMemoryType>(ipcData.memoryType);
+    IpcHandleType hdlType = context->settings.handleType;
+    EXPECT_EQ(memType, InternalIpcMemoryType::deviceUnifiedMemory);
+    EXPECT_EQ(hdlType, IpcHandleType::ntHandle);
+    EXPECT_EQ(ipcData.processId, NEO::SysCalls::getCurrentProcessId());
+    EXPECT_NE(ipcData.processId, 0u);
+
+    result = context->putIpcMemHandle(ipcHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // Restore previous context settings
+    context->settings.useOpaqueHandle = useOpaque;
+    context->settings.handleType = handleType;
+
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
 
     result = context->freeMem(ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -86,13 +225,13 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = context->freeMem(ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(0u, context->getIPCHandleMap().size());
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
 }
 
 TEST_F(MemoryIPCTests,
@@ -109,19 +248,19 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-
-    result = context->putIpcMemHandle(ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = context->putIpcMemHandle(ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(0u, context->getIPCHandleMap().size());
+    result = context->putIpcMemHandle(ipcHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
 
     result = context->freeMem(ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -141,21 +280,21 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = context->putIpcMemHandle(ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_NE(0u, context->getIPCHandleMap().size());
+    EXPECT_NE(0u, driverHandle->getIPCHandleMap().size());
 
     result = context->freeMem(ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(0u, context->getIPCHandleMap().size());
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
 }
 
 TEST_F(MemoryIPCTests,
@@ -175,22 +314,22 @@ TEST_F(MemoryIPCTests,
     contextInvalid = std::make_unique<ContextHandleMock>(driverHandle.get());
     EXPECT_NE(contextInvalid, nullptr);
     contextInvalid->getDevices().insert(std::make_pair(device->getRootDeviceIndex(), device->toHandle()));
-    contextInvalid->rootDeviceIndices.push_back(neoDevice->getRootDeviceIndex());
+    contextInvalid->rootDeviceIndices.pushUnique(neoDevice->getRootDeviceIndex());
     contextInvalid->deviceBitfields.insert({neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield()});
 
     ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = context->putIpcMemHandle(ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(0u, context->getIPCHandleMap().size());
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
 
     result = contextInvalid->putIpcMemHandle(ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(0u, context->getIPCHandleMap().size());
+    EXPECT_EQ(0u, driverHandle->getIPCHandleMap().size());
 
     result = context->freeMem(ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -210,7 +349,7 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle = {};
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_ipc_memory_flags_t flags = {};
@@ -240,7 +379,7 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle = {};
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_ipc_memory_flags_t flags = {};
@@ -270,7 +409,7 @@ TEST_F(MemoryIPCTests,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle;
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     result = context->freeMem(ptr);
@@ -291,7 +430,7 @@ struct MemoryGetIpcHandleTest : public ::testing::Test {
 
         neoDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(NEO::defaultHwInfo.get());
         auto mockBuiltIns = new MockBuiltins();
-        neoDevice->executionEnvironment->rootDeviceEnvironments[0]->builtins.reset(mockBuiltIns);
+        MockRootDeviceEnvironment::resetBuiltins(neoDevice->executionEnvironment->rootDeviceEnvironments[0].get(), mockBuiltIns);
         NEO::DeviceVector devices;
         devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
         driverHandle = std::make_unique<DriverHandleGetWinHandleMock>();
@@ -302,7 +441,7 @@ struct MemoryGetIpcHandleTest : public ::testing::Test {
         EXPECT_NE(context, nullptr);
         context->getDevices().insert(std::make_pair(device->getRootDeviceIndex(), device->toHandle()));
         auto neoDevice = device->getNEODevice();
-        context->rootDeviceIndices.push_back(neoDevice->getRootDeviceIndex());
+        context->rootDeviceIndices.pushUnique(neoDevice->getRootDeviceIndex());
         context->deviceBitfields.insert({neoDevice->getRootDeviceIndex(), neoDevice->getDeviceBitfield()});
     }
 
@@ -329,7 +468,7 @@ TEST_F(MemoryGetIpcHandleTest,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle = {};
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_ipc_memory_flags_t flags = {};
@@ -356,7 +495,7 @@ TEST_F(MemoryOpenIpcHandleTest,
     EXPECT_NE(nullptr, ptr);
 
     ze_ipc_mem_handle_t ipcHandle = {};
-    result = context->getIpcMemHandle(ptr, &ipcHandle);
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_ipc_memory_flags_t flags = {};
@@ -370,6 +509,90 @@ TEST_F(MemoryOpenIpcHandleTest,
 
     result = context->freeMem(ptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(MemoryOpenIpcHandleTest,
+       givenHostAllocationAndCallToOpenIpcMemHandleItIsSuccessfullyOpenedAndClosed) {
+    size_t size = 1;
+    size_t alignment = 0u;
+    void *ptr = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    ze_result_t result = context->allocHostMem(&hostDesc,
+                                               size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    ze_ipc_mem_handle_t ipcHandle = {};
+    result = context->getIpcMemHandle(ptr, nullptr, &ipcHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    ze_ipc_memory_flags_t flags = {};
+    void *ipcPtr;
+    result = context->openIpcMemHandle(device->toHandle(), ipcHandle, flags, &ipcPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(ipcPtr, nullptr);
+
+    result = context->closeIpcMemHandle(ipcPtr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = context->freeMem(ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(MemoryExportImportWinHandleTest,
+       givenCallToHostAllocWithExportDescriptorThenAllocationIsMarkedShareable) {
+    size_t size = 1;
+    size_t alignment = 1u;
+    void *ptr = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    hostDesc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+    ze_external_memory_export_desc_t exportDesc = {};
+    exportDesc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC;
+    exportDesc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+    hostDesc.pNext = &exportDesc;
+
+    ze_result_t result = context->allocHostMem(&hostDesc, size, alignment, &ptr);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    ASSERT_NE(nullptr, ptr);
+
+    auto allocData = driverHandle->svmAllocsManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    EXPECT_EQ(1u, allocData->allocationFlagsProperty.flags.shareable);
+
+    auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    EXPECT_EQ(hwInfo.caps.shareMemoryWithoutNTHandle,
+              allocData->allocationFlagsProperty.flags.ipcSupportedAllocationByDefault);
+
+    result = context->freeMem(ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+}
+
+TEST_F(MemoryExportImportWinHandleTest,
+       givenCallToDeviceOrHostAllocWithExtendedImportDescriptorAndInvalidFDThenInvalidArgumentIsReturned) {
+    size_t size = 10;
+    size_t alignment = 1u;
+    ze_device_mem_alloc_desc_t importDeviceDesc = {};
+    ze_external_memory_import_fd_t extendedImportDesc = {};
+    extendedImportDesc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_FD;
+    extendedImportDesc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_FD;
+    extendedImportDesc.fd = std::numeric_limits<int>::max();
+    importDeviceDesc.pNext = &extendedImportDesc;
+
+    void *importedPtr = nullptr;
+    ze_result_t result = context->allocDeviceMem(device->toHandle(),
+                                                 &importDeviceDesc,
+                                                 size, alignment, &importedPtr);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+    EXPECT_EQ(nullptr, importedPtr);
+
+    ze_host_mem_alloc_desc_t importHostDesc = {};
+    importHostDesc.pNext = &extendedImportDesc;
+    result = context->allocHostMem(&importHostDesc,
+                                   size, alignment, &importedPtr);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+    EXPECT_EQ(nullptr, importedPtr);
 }
 
 } // namespace ult

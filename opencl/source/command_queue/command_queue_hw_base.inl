@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/blit_commands_helper.h"
+#include "shared/source/utilities/host_clock.h"
 #include "shared/source/utilities/wait_util.h"
 
 #include "opencl/source/built_ins/aux_translation_builtin.h"
@@ -34,21 +35,21 @@
 namespace NEO {
 template <typename Family>
 void CommandQueueHw<Family>::notifyEnqueueReadBuffer(Buffer *buffer, bool blockingRead, bool notifyBcsCsr) {
-    if (DebugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.get()) {
+    if (debugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.get()) {
         buffer->getGraphicsAllocation(getDevice().getRootDeviceIndex())->setAllocDumpable(blockingRead, notifyBcsCsr);
         buffer->forceDisallowCPUCopy = blockingRead;
     }
 }
 template <typename Family>
 void CommandQueueHw<Family>::notifyEnqueueReadImage(Image *image, bool blockingRead, bool notifyBcsCsr) {
-    if (DebugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.get()) {
+    if (debugManager.flags.AUBDumpAllocsOnEnqueueReadOnly.get()) {
         image->getGraphicsAllocation(getDevice().getRootDeviceIndex())->setAllocDumpable(blockingRead, notifyBcsCsr);
     }
 }
 
 template <typename Family>
 void CommandQueueHw<Family>::notifyEnqueueSVMMemcpy(GraphicsAllocation *gfxAllocation, bool blockingCopy, bool notifyBcsCsr) {
-    if (DebugManager.flags.AUBDumpAllocsOnEnqueueSVMMemcpyOnly.get()) {
+    if (debugManager.flags.AUBDumpAllocsOnEnqueueSVMMemcpyOnly.get()) {
         gfxAllocation->setAllocDumpable(blockingCopy, notifyBcsCsr);
     }
 }
@@ -118,9 +119,9 @@ cl_int CommandQueueHw<Family>::enqueueMarkerForReadWriteOperation(MemObj *memObj
 template <typename Family>
 void CommandQueueHw<Family>::dispatchAuxTranslationBuiltin(MultiDispatchInfo &multiDispatchInfo,
                                                            AuxTranslationDirection auxTranslationDirection) {
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::AuxTranslation, getClDevice());
-    auto &auxTranslationBuilder = static_cast<BuiltInOp<EBuiltInOps::AuxTranslation> &>(builder);
-    BuiltinOpParams dispatchParams;
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::auxTranslation, this->defaultBuiltInMode, getClDevice());
+    auto &auxTranslationBuilder = static_cast<AuxTranslationBuiltin &>(builder);
+    BuiltIn::OpParams dispatchParams;
 
     dispatchParams.auxTranslationDirection = auxTranslationDirection;
 
@@ -129,35 +130,47 @@ void CommandQueueHw<Family>::dispatchAuxTranslationBuiltin(MultiDispatchInfo &mu
 
 template <typename Family>
 bool CommandQueueHw<Family>::forceStateless(size_t size) {
-    return size >= 4ull * MemoryConstants::gigaByte;
+    return isForceStateless || size >= 4ull * MemoryConstants::gigaByte;
 }
 
 template <typename Family>
 bool CommandQueueHw<Family>::isCacheFlushForBcsRequired() const {
-    if (DebugManager.flags.ForceCacheFlushForBcs.get() != -1) {
-        return !!DebugManager.flags.ForceCacheFlushForBcs.get();
+    if (debugManager.flags.ForceCacheFlushForBcs.get() != -1) {
+        return !!debugManager.flags.ForceCacheFlushForBcs.get();
     }
-    return true;
+
+    const auto &productHelper = this->device->getProductHelper();
+    return productHelper.isDcFlushAllowed();
 }
 
 template <typename TSPacketType>
 inline bool waitForTimestampsWithinContainer(TimestampPacketContainer *container, CommandStreamReceiver &csr, WaitStatus &status) {
+    bool printWaitForCompletion = debugManager.flags.LogWaitingForCompletion.get();
     bool waited = false;
-    status = WaitStatus::NotReady;
+    status = WaitStatus::notReady;
 
     if (container) {
-        auto lastHangCheckTime = std::chrono::high_resolution_clock::now();
+        auto lastHangCheckTime = HostClock::getCurrentTimeInNs();
+        auto waitStartTime = lastHangCheckTime;
         for (const auto &timestamp : container->peekNodes()) {
             for (uint32_t i = 0; i < timestamp->getPacketsUsed(); i++) {
+                PRINT_STRING(printWaitForCompletion, stdout,
+                             "\nWaiting for TS 0x%" PRIx64, timestamp->getGpuAddress() + (i * timestamp->getSinglePacketSize()));
+
                 while (timestamp->getContextEndValue(i) == 1) {
                     csr.downloadAllocation(*timestamp->getBaseGraphicsAllocation()->getGraphicsAllocation(csr.getRootDeviceIndex()));
-                    WaitUtils::waitFunctionWithPredicate<const TSPacketType>(static_cast<TSPacketType const *>(timestamp->getContextEndAddress(i)), 1u, std::not_equal_to<TSPacketType>());
-                    if (csr.checkGpuHangDetected(std::chrono::high_resolution_clock::now(), lastHangCheckTime)) {
-                        status = WaitStatus::GpuHang;
+
+                    auto currentTime = HostClock::getCurrentTimeInNs();
+                    WaitUtils::waitFunctionWithPredicate<const TSPacketType>(static_cast<TSPacketType const *>(timestamp->getContextEndAddress(i)), 1u, std::not_equal_to<TSPacketType>(), HostClock::getElapsedTimeInUs(waitStartTime, currentTime));
+
+                    if (csr.checkGpuHangDetected(currentTime, lastHangCheckTime)) {
+                        status = WaitStatus::gpuHang;
+                        PRINT_STRING(printWaitForCompletion, stdout, "\nWaiting for TS failed");
                         return false;
                     }
                 }
-                status = WaitStatus::Ready;
+                PRINT_STRING(printWaitForCompletion, stdout, "\nWaiting for TS completed");
+                status = WaitStatus::ready;
                 waited = true;
             }
         }
@@ -167,21 +180,17 @@ inline bool waitForTimestampsWithinContainer(TimestampPacketContainer *container
 }
 
 template <typename Family>
-bool CommandQueueHw<Family>::waitForTimestamps(Range<CopyEngineState> copyEnginesToWait, TaskCountType taskCount, WaitStatus &status, TimestampPacketContainer *mainContainer, TimestampPacketContainer *deferredContainer) {
+bool CommandQueueHw<Family>::waitForTimestamps(std::span<CopyEngineState> copyEnginesToWait, WaitStatus &status, TimestampPacketContainer *mainContainer, TimestampPacketContainer *deferredContainer) {
     using TSPacketType = typename Family::TimestampPacketType;
     bool waited = false;
 
     if (isWaitForTimestampsEnabled()) {
         waited = waitForTimestampsWithinContainer<TSPacketType>(mainContainer, getGpgpuCommandStreamReceiver(), status);
-        if (isOOQEnabled()) {
-            waitForTimestampsWithinContainer<TSPacketType>(deferredContainer, getGpgpuCommandStreamReceiver(), status);
-        }
-
         if (waited) {
-            getGpgpuCommandStreamReceiver().downloadAllocations();
+            getGpgpuCommandStreamReceiver().downloadAllocations(true);
             for (const auto &copyEngine : copyEnginesToWait) {
                 auto bcsCsr = getBcsCommandStreamReceiver(copyEngine.engineType);
-                bcsCsr->downloadAllocations();
+                bcsCsr->downloadAllocations(true);
             }
         }
     }
@@ -192,34 +201,45 @@ bool CommandQueueHw<Family>::waitForTimestamps(Range<CopyEngineState> copyEngine
 template <typename Family>
 void CommandQueueHw<Family>::setupBlitAuxTranslation(MultiDispatchInfo &multiDispatchInfo) {
     multiDispatchInfo.begin()->dispatchInitCommands.registerMethod(
-        TimestampPacketHelper::programSemaphoreForAuxTranslation<Family, AuxTranslationDirection::AuxToNonAux>);
+        TimestampPacketHelper::programSemaphoreForAuxTranslation<Family, AuxTranslationDirection::auxToNonAux>);
 
     multiDispatchInfo.begin()->dispatchInitCommands.registerCommandsSizeEstimationMethod(
-        TimestampPacketHelper::getRequiredCmdStreamSizeForAuxTranslationNodeDependency<Family, AuxTranslationDirection::AuxToNonAux>);
+        TimestampPacketHelper::getRequiredCmdStreamSizeForAuxTranslationNodeDependency<Family, AuxTranslationDirection::auxToNonAux>);
 
     multiDispatchInfo.rbegin()->dispatchEpilogueCommands.registerMethod(
-        TimestampPacketHelper::programSemaphoreForAuxTranslation<Family, AuxTranslationDirection::NonAuxToAux>);
+        TimestampPacketHelper::programSemaphoreForAuxTranslation<Family, AuxTranslationDirection::nonAuxToAux>);
 
     multiDispatchInfo.rbegin()->dispatchEpilogueCommands.registerCommandsSizeEstimationMethod(
-        TimestampPacketHelper::getRequiredCmdStreamSizeForAuxTranslationNodeDependency<Family, AuxTranslationDirection::NonAuxToAux>);
+        TimestampPacketHelper::getRequiredCmdStreamSizeForAuxTranslationNodeDependency<Family, AuxTranslationDirection::nonAuxToAux>);
 }
 
 template <typename Family>
-bool CommandQueueHw<Family>::obtainTimestampPacketForCacheFlush(bool isCacheFlushRequired) const {
-    return isCacheFlushRequired;
-}
-
-template <typename Family>
-bool CommandQueueHw<Family>::isGpgpuSubmissionForBcsRequired(bool queueBlocked, TimestampPacketDependencies &timestampPacketDependencies) const {
+bool CommandQueueHw<Family>::isGpgpuSubmissionForBcsRequired(bool queueBlocked, TimestampPacketDependencies &timestampPacketDependencies, bool containsCrossEngineDependency, bool textureCacheFlushRequired) const {
     if (queueBlocked || timestampPacketDependencies.barrierNodes.peekNodes().size() > 0u) {
         return true;
     }
+    if (isOOQEnabled()) {
+        return containsCrossEngineDependency;
+    }
 
-    bool required = (latestSentEnqueueType != EnqueueProperties::Operation::Blit) &&
-                    (latestSentEnqueueType != EnqueueProperties::Operation::None) &&
-                    (isCacheFlushForBcsRequired() || !(getGpgpuCommandStreamReceiver().getDispatchMode() == DispatchMode::ImmediateDispatch || getGpgpuCommandStreamReceiver().isLatestTaskCountFlushed()));
-
-    if (DebugManager.flags.ForceGpgpuSubmissionForBcsEnqueue.get() == 1) {
+    bool required = false;
+    switch (latestSentEnqueueType) {
+    case NEO::EnqueueProperties::Operation::explicitCacheFlush:
+    case NEO::EnqueueProperties::Operation::enqueueWithoutSubmission:
+    case NEO::EnqueueProperties::Operation::gpuKernel:
+    case NEO::EnqueueProperties::Operation::profilingOnly:
+        required = isCacheFlushForBcsRequired() || !(getGpgpuCommandStreamReceiver().getDispatchMode() == DispatchMode::immediateDispatch || getGpgpuCommandStreamReceiver().isLatestTaskCountFlushed());
+        break;
+    case NEO::EnqueueProperties::Operation::dependencyResolveOnGpu:
+        return true;
+        break;
+    case NEO::EnqueueProperties::Operation::none:
+    case NEO::EnqueueProperties::Operation::blit:
+    default:
+        break;
+    }
+    required |= textureCacheFlushRequired;
+    if (debugManager.flags.ForceGpgpuSubmissionForBcsEnqueue.get() == 1) {
         required = true;
     }
 
@@ -234,51 +254,18 @@ void CommandQueueHw<Family>::setupEvent(EventBuilder &eventBuilder, cl_event *ou
         *outEvent = eventObj;
 
         if (eventObj->isProfilingEnabled()) {
-            TimeStampData queueTimeStamp;
+            eventObj->setQueueTimeStamp();
 
-            getDevice().getOSTime()->getCpuGpuTime(&queueTimeStamp);
-            eventObj->setQueueTimeStamp(&queueTimeStamp);
-
-            if (isCommandWithoutKernel(cmdType) && cmdType != CL_COMMAND_MARKER) {
+            if (isCommandWithoutKernel(cmdType) && !isFlushForProfilingRequired(cmdType)) {
                 eventObj->setCPUProfilingPath(true);
-                eventObj->setQueueTimeStamp();
             }
         }
         DBG_LOG(EventsDebugEnable, "enqueueHandler commandType", cmdType, "output Event", eventObj);
     }
 }
 
-template <typename GfxFamily>
-void CommandQueueHw<GfxFamily>::registerGpgpuCsrClient() {
-    if (!gpgpuCsrClientRegistered) {
-        gpgpuCsrClientRegistered = true;
-
-        getGpgpuCommandStreamReceiver().registerClient();
-    }
-}
-
-template <typename GfxFamily>
-void CommandQueueHw<GfxFamily>::registerBcsCsrClient(CommandStreamReceiver &bcsCsr) {
-    auto engineType = bcsCsr.getOsContext().getEngineType();
-
-    auto &bcsState = bcsStates[EngineHelpers::getBcsIndex(engineType)];
-
-    if (!bcsState.csrClientRegistered) {
-        bcsState.csrClientRegistered = true;
-        bcsCsr.registerClient();
-    }
-}
-
 template <typename Family>
 CommandQueueHw<Family>::~CommandQueueHw() {
-    if (gpgpuCsrClientRegistered) {
-        gpgpuEngine->commandStreamReceiver->unregisterClient();
-    }
-
-    for (auto &copyEngine : bcsStates) {
-        if (copyEngine.isValid() && copyEngine.csrClientRegistered) {
-            bcsEngines[EngineHelpers::getBcsIndex(copyEngine.engineType)]->commandStreamReceiver->unregisterClient();
-        }
-    }
+    unregisterGpgpuAndBcsCsrClients();
 }
 } // namespace NEO

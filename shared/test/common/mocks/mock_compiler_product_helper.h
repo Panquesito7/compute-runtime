@@ -1,0 +1,51 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
+namespace NEO {
+
+class MockCompilerProductHelper : public CompilerProductHelper {
+  public:
+    using BaseClass = CompilerProductHelper;
+    using BaseClass::getDefaultHwIpVersion;
+
+    ADDMETHOD_CONST_NOBASE(isMatrixMultiplyAccumulateTF32Supported, bool, false, (const HardwareInfo &hwInfo));
+    ADDMETHOD_CONST_NOBASE(isCreateBufferWithPropertiesSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isSubgroupNamedBarrierSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isSubgroupExtendedBlockReadSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isSubgroup2DBlockIOSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isSubgroupBufferPrefetchSupported, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(isForceToStatelessRequired, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(failBuildProgramWithBufferStatefulAccessPreference, bool, false, ());
+    ADDMETHOD_CONST_NOBASE_VOIDRETURN(setProductConfigForHwInfo, (HardwareInfo & hwInfo, HardwareIpVersion config));
+    ADDMETHOD_CONST_NOBASE(getCachingPolicyOptions, const char *, nullptr, (bool isDebuggerActive));
+    ADDMETHOD_CONST_NOBASE(getHwInfoConfig, uint64_t, 0, (const HardwareInfo &hwInfo));
+    ADDMETHOD_CONST_NOBASE(getDefaultHwIpVersion, uint32_t, 0, ());
+    ADDMETHOD_CONST_NOBASE(matchRevisionIdWithProductConfig, uint32_t, 0, (HardwareIpVersion ipVersion, uint32_t revisionID));
+    ADDMETHOD_CONST_NOBASE_VOIDRETURN(adjustHwInfoForIgc, (HardwareInfo & hwInfo));
+    ADDMETHOD_CONST_NOBASE(isHeaplessModeEnabled, bool, false, (const HardwareInfo &hwInfo));
+    ADDMETHOD_CONST_NOBASE(getProductConfigFromHwInfo, uint32_t, 0, (const HardwareInfo &hwInfo));
+    ADDMETHOD_CONST_NOBASE(getDefaultIgcLibraryName, const char *, nullptr, ());
+    ADDMETHOD_CONST_NOBASE(useIgcAsFcl, bool, false, ());
+    ADDMETHOD_CONST_NOBASE(getPreferredIntermediateRepresentation, IGC::CodeType::CodeType_t, IGC::CodeType::undefined, ());
+};
+
+class MockCompilerProductHelperHeapless : public MockCompilerProductHelper {
+  public:
+    bool isHeaplessModeEnabled(const HardwareInfo &hwInfo) const override {
+        return heaplessModeEnabled;
+    }
+
+    MockCompilerProductHelperHeapless() = default;
+    MockCompilerProductHelperHeapless(bool heaplessModeEnabled) : MockCompilerProductHelper(), heaplessModeEnabled(heaplessModeEnabled) {}
+    bool heaplessModeEnabled = false;
+};
+
+} // namespace NEO

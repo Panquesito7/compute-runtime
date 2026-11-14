@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/gtest_helpers.h"
 #include "shared/test/common/mocks/mock_aub_center.h"
 #include "shared/test/common/mocks/mock_aub_manager.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
@@ -26,86 +27,67 @@ using namespace NEO;
 
 using TgllpHwInfo = ::testing::Test;
 
-TGLLPTEST_F(TgllpHwInfo, givenHwInfoErrorneousConfigStringThenThrow) {
+TGLLPTEST_F(TgllpHwInfo, whenSettingDeviceIdThenGeometryIsPickedBasedOnDeviceId) {
     HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
 
-    uint64_t config = 0xdeadbeef;
-    gtSystemInfo = {0};
-    EXPECT_ANY_THROW(hardwareInfoSetup[productFamily](&hwInfo, false, config, *compilerProductHelper));
-    EXPECT_EQ(0u, gtSystemInfo.SliceCount);
-    EXPECT_EQ(0u, gtSystemInfo.SubSliceCount);
-    EXPECT_EQ(0u, gtSystemInfo.DualSubSliceCount);
-    EXPECT_EQ(0u, gtSystemInfo.EUCount);
-}
-
-TGLLPTEST_F(TgllpHwInfo, whenUsingCorrectConfigValueThenCorrectHwInfoIsReturned) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
-    GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
-
-    uint64_t config = 0x100060010;
-
-    gtSystemInfo = {0};
-    hardwareInfoSetup[productFamily](&hwInfo, false, config, *compilerProductHelper);
-    EXPECT_EQ(1u, gtSystemInfo.SliceCount);
-    EXPECT_EQ(6u, gtSystemInfo.DualSubSliceCount);
-
-    config = 0x100020010;
-
-    gtSystemInfo = {0};
-    hardwareInfoSetup[productFamily](&hwInfo, false, config, *compilerProductHelper);
-    EXPECT_EQ(1u, gtSystemInfo.SliceCount);
-    EXPECT_EQ(2u, gtSystemInfo.DualSubSliceCount);
+    for (const auto &deviceId : tgllpDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        gtSystemInfo = {0};
+        hardwareInfoSetup[productFamily](&hwInfo, false);
+        EXPECT_EQ(1u, gtSystemInfo.SliceCount);
+        if (TGLLP::isHw1x2x16(hwInfo)) {
+            EXPECT_EQ(2u, gtSystemInfo.DualSubSliceCount);
+            EXPECT_EQ_VAL(1920u, gtSystemInfo.L3CacheSizeInKb);
+            EXPECT_EQ(4u, gtSystemInfo.L3BankCount);
+        } else {
+            EXPECT_EQ(6u, gtSystemInfo.DualSubSliceCount);
+            EXPECT_EQ_VAL(3840u, gtSystemInfo.L3CacheSizeInKb);
+            EXPECT_EQ(8u, gtSystemInfo.L3BankCount);
+        }
+    }
 }
 
 TGLLPTEST_F(TgllpHwInfo, givenBoolWhenCallTgllpHardwareInfoSetupThenFeatureTableAndWorkaroundTableAreSetCorrect) {
     static bool boolValue[]{
         true, false};
     HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
     FeatureTable &featureTable = hwInfo.featureTable;
     WorkaroundTable &workaroundTable = hwInfo.workaroundTable;
 
-    uint64_t configs[] = {
-        0x100060010,
-        0x100020010};
+    for (auto setParamBool : boolValue) {
 
-    for (auto &config : configs) {
-        for (auto setParamBool : boolValue) {
+        gtSystemInfo = {0};
+        featureTable = {};
+        workaroundTable = {};
+        hardwareInfoSetup[productFamily](&hwInfo, setParamBool);
 
-            gtSystemInfo = {0};
-            featureTable = {};
-            workaroundTable = {};
-            hardwareInfoSetup[productFamily](&hwInfo, setParamBool, config, *compilerProductHelper);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrL3IACoherency);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrPPGTT);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrSVM);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrIA32eGfxPTEs);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrStandardMipTailFormat);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrTranslationTable);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrUserModeTranslationTable);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrTileMappedResource);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrFbc);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrTileY);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcHdr2D);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcLdr2D);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuMidBatchPreempt);
+        EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuThreadGroupLevelPreempt);
+        EXPECT_FALSE(featureTable.flags.ftrHeaplessMode);
 
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrL3IACoherency);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrPPGTT);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrSVM);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrIA32eGfxPTEs);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrStandardMipTailFormat);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrTranslationTable);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrUserModeTranslationTable);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrTileMappedResource);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrFbc);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrTileY);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcHdr2D);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrAstcLdr2D);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuMidBatchPreempt);
-            EXPECT_EQ(setParamBool, featureTable.flags.ftrGpGpuThreadGroupLevelPreempt);
-
-            EXPECT_EQ(setParamBool, workaroundTable.flags.wa4kAlignUVOffsetNV12LinearSurface);
-            EXPECT_EQ(setParamBool, workaroundTable.flags.waUntypedBufferCompression);
-        }
+        EXPECT_EQ(setParamBool, workaroundTable.flags.wa4kAlignUVOffsetNV12LinearSurface);
+        EXPECT_EQ(setParamBool, workaroundTable.flags.waUntypedBufferCompression);
     }
 }
 
 TGLLPTEST_F(TgllpHwInfo, givenSetCommandStreamReceiverInAubModeForTgllpProductFamilyWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenAubCenterIsInitializedCorrectly) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.SetCommandStreamReceiver.set(1);
-    DebugManager.flags.ProductFamilyOverride.set("tgllp");
+    debugManager.flags.SetCommandStreamReceiver.set(1);
+    debugManager.flags.ProductFamilyOverride.set("tgllp");
 
     MockExecutionEnvironment executionEnvironment(defaultHwInfo.get());
 
@@ -118,23 +100,12 @@ TGLLPTEST_F(TgllpHwInfo, givenSetCommandStreamReceiverInAubModeForTgllpProductFa
     EXPECT_FALSE(rootDeviceEnvironment->localMemoryEnabledReceived);
 }
 
-TGLLPTEST_F(TgllpHwInfo, givenProductHelperStringThenAfterSetupResultingVmeIsDisabled) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
-
-    uint64_t config = 0x100060010;
-    hardwareInfoSetup[productFamily](&hwInfo, false, config, *compilerProductHelper);
-    EXPECT_FALSE(hwInfo.capabilityTable.ftrSupportsVmeAvcTextureSampler);
-    EXPECT_FALSE(hwInfo.capabilityTable.ftrSupportsVmeAvcPreemption);
-    EXPECT_FALSE(hwInfo.capabilityTable.supportsVme);
-}
-
 TGLLPTEST_F(TgllpHwInfo, givenSetCommandStreamReceiverInAubModeWithOverrideGpuAddressSpaceWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenAubManagerIsInitializedWithCorrectGpuAddressSpace) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.UseAubStream.set(1);
-    DebugManager.flags.SetCommandStreamReceiver.set(1);
-    DebugManager.flags.ProductFamilyOverride.set("tgllp");
-    DebugManager.flags.OverrideGpuAddressSpace.set(48);
+    debugManager.flags.UseAubStream.set(1);
+    debugManager.flags.SetCommandStreamReceiver.set(1);
+    debugManager.flags.ProductFamilyOverride.set("tgllp");
+    debugManager.flags.OverrideGpuAddressSpace.set(48);
 
     MockExecutionEnvironment executionEnvironment(defaultHwInfo.get());
 
@@ -150,9 +121,9 @@ TGLLPTEST_F(TgllpHwInfo, givenSetCommandStreamReceiverInAubModeWithOverrideGpuAd
 TGLLPTEST_F(TgllpHwInfo, givenSetCommandStreamReceiverInAubModeWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenAllRootDeviceEnvironmentMembersAreInitialized) {
     DebugManagerStateRestore stateRestore;
     auto requiredDeviceCount = 2u;
-    DebugManager.flags.CreateMultipleRootDevices.set(requiredDeviceCount);
-    DebugManager.flags.SetCommandStreamReceiver.set(1);
-    DebugManager.flags.ProductFamilyOverride.set("tgllp");
+    debugManager.flags.CreateMultipleRootDevices.set(requiredDeviceCount);
+    debugManager.flags.SetCommandStreamReceiver.set(1);
+    debugManager.flags.ProductFamilyOverride.set("tgllp");
 
     MockExecutionEnvironment executionEnvironment(defaultHwInfo.get(), true, requiredDeviceCount);
 
@@ -167,7 +138,7 @@ TGLLPTEST_F(TgllpHwInfo, givenSetCommandStreamReceiverInAubModeWhenPrepareDevice
 
         auto memoryOperationInterface = rootDeviceEnvironment->memoryOperationsInterface.get();
         EXPECT_NE(nullptr, memoryOperationInterface);
-        EXPECT_EQ(memoryOperationHandlers.end(), memoryOperationHandlers.find(memoryOperationInterface));
+        EXPECT_FALSE(memoryOperationHandlers.contains(memoryOperationInterface));
         memoryOperationHandlers.insert(memoryOperationInterface);
     }
 }
@@ -178,36 +149,20 @@ TGLLPTEST_F(TgllpProductHelper, whenGettingAubstreamProductFamilyThenProperEnumV
     EXPECT_EQ(aub_stream::ProductFamily::Tgllp, productHelper->getAubStreamProductFamily());
 }
 
-TGLLPTEST_F(TgllpProductHelper, givenProductHelperWhenGettingEvictIfNecessaryFlagSupportedThenExpectTrue) {
-
-    EXPECT_TRUE(productHelper->isEvictionIfNecessaryFlagSupported());
-}
-
 TGLLPTEST_F(TgllpProductHelper, givenProductHelperWhenGetCommandsStreamPropertiesSupportThenExpectCorrectValues) {
 
     EXPECT_FALSE(productHelper->getScmPropertyThreadArbitrationPolicySupport());
-    EXPECT_TRUE(productHelper->getScmPropertyCoherencyRequiredSupport());
     EXPECT_FALSE(productHelper->getScmPropertyZPassAsyncComputeThreadLimitSupport());
     EXPECT_FALSE(productHelper->getScmPropertyPixelAsyncComputeThreadLimitSupport());
     EXPECT_FALSE(productHelper->getScmPropertyLargeGrfModeSupport());
-    EXPECT_FALSE(productHelper->getScmPropertyDevicePreemptionModeSupport());
 
-    EXPECT_FALSE(productHelper->getStateBaseAddressPropertyGlobalAtomicsSupport());
     EXPECT_FALSE(productHelper->getStateBaseAddressPropertyBindingTablePoolBaseAddressSupport());
-
-    EXPECT_TRUE(productHelper->getFrontEndPropertyScratchSizeSupport());
-    EXPECT_FALSE(productHelper->getFrontEndPropertyPrivateScratchSizeSupport());
-
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyPreemptionModeSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyStateSipSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyCsrSurfaceSupport());
 
     EXPECT_FALSE(productHelper->getFrontEndPropertyComputeDispatchAllWalkerSupport());
     EXPECT_TRUE(productHelper->getFrontEndPropertyDisableEuFusionSupport());
     EXPECT_FALSE(productHelper->getFrontEndPropertyDisableOverDispatchSupport());
     EXPECT_FALSE(productHelper->getFrontEndPropertySingleSliceDispatchCcsModeSupport());
 
-    EXPECT_TRUE(productHelper->getPipelineSelectPropertyMediaSamplerDopClockGateSupport());
     EXPECT_FALSE(productHelper->getPipelineSelectPropertySystolicModeSupport());
 }
 

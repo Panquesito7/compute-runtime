@@ -1,13 +1,11 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/stream_properties.h"
-#include "shared/test/common/helpers/default_hw_info.h"
-#include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/command_stream/stream_properties_tests_common.h"
 
 namespace NEO {
@@ -19,6 +17,18 @@ std::vector<StreamProperty *> getAllStateComputeModeProperties(StateComputeModeP
     allProperties.push_back(&properties.zPassAsyncComputeThreadLimit);
     allProperties.push_back(&properties.pixelAsyncComputeThreadLimit);
     allProperties.push_back(&properties.threadArbitrationPolicy);
+    allProperties.push_back(&properties.pipelinedEuThreadArbitration);
+    allProperties.push_back(&properties.memoryAllocationForScratchAndMidthreadPreemptionBuffers);
+    allProperties.push_back(&properties.enableVariableRegisterSizeAllocation);
+    allProperties.push_back(&properties.lscSamplerBackingThreshold);
+    allProperties.push_back(&properties.enableTypedGlobalMemoryCached);
+    allProperties.push_back(&properties.enableOutOfBoundariesInTranslationException);
+    allProperties.push_back(&properties.enablePageFaultException);
+    allProperties.push_back(&properties.enableSystemMemoryReadFence);
+    allProperties.push_back(&properties.enableMemoryException);
+    allProperties.push_back(&properties.enableBreakpoints);
+    allProperties.push_back(&properties.enableForceExternalHaltAndForceException);
+    allProperties.push_back(&properties.l1CachePolicy);
     return allProperties;
 }
 
@@ -34,7 +44,6 @@ std::vector<StreamProperty *> getAllFrontEndProperties(FrontEndProperties &prope
 std::vector<StreamProperty *> getAllPipelineSelectProperties(PipelineSelectProperties &properties) {
     std::vector<StreamProperty *> allProperties;
     allProperties.push_back(&properties.modeSelected);
-    allProperties.push_back(&properties.mediaSamplerDopClockGate);
     allProperties.push_back(&properties.systolicMode);
     return allProperties;
 }

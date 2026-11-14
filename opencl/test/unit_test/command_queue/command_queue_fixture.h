@@ -1,24 +1,30 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/test_macros/test_checks_shared.h"
 
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/fixtures/context_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
 
 #include "CL/cl.h"
 #include "gtest/gtest.h"
 
 namespace NEO {
 class Device;
+class Buffer;
+class ClDevice;
+class CommandQueue;
+class Context;
+class MockClDevice;
+class MockContext;
 
 struct CommandQueueHwFixture {
     CommandQueue *createCommandQueue(ClDevice *device) {
@@ -73,7 +79,7 @@ struct CommandQueueFixture {
     CommandQueue *pCmdQ = nullptr;
 };
 
-static const cl_command_queue_properties AllCommandQueueProperties[] = {
+static const cl_command_queue_properties allCommandQueueProperties[] = {
     0,
     CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
     CL_QUEUE_ON_DEVICE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
@@ -82,30 +88,11 @@ static const cl_command_queue_properties AllCommandQueueProperties[] = {
     CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_ON_DEVICE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE,
     CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_ON_DEVICE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_ON_DEVICE_DEFAULT};
 
-static const cl_command_queue_properties DefaultCommandQueueProperties[] = {
-    0,
-    CL_QUEUE_PROFILING_ENABLE,
-};
-
 template <bool ooq>
 struct CommandQueueHwBlitTest : ClDeviceFixture, ContextFixture, CommandQueueHwFixture, ::testing::Test {
     using ContextFixture::setUp;
 
-    void SetUp() override {
-        hwInfo = *::defaultHwInfo;
-        hwInfo.capabilityTable.blitterOperationsSupported = true;
-
-        DebugManager.flags.EnableBlitterOperationsSupport.set(1);
-        DebugManager.flags.EnableTimestampPacket.set(1);
-        DebugManager.flags.PreferCopyEngineForCopyBufferToBuffer.set(1);
-        ClDeviceFixture::setUpImpl(&hwInfo);
-        cl_device_id device = pClDevice;
-        REQUIRE_FULL_BLITTER_OR_SKIP(pClDevice->getRootDeviceEnvironment());
-
-        ContextFixture::setUp(1, &device);
-        cl_command_queue_properties queueProperties = ooq ? CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE : 0;
-        CommandQueueHwFixture::setUp(pClDevice, queueProperties);
-    }
+    void SetUp() override;
 
     void TearDown() override {
         CommandQueueHwFixture::tearDown();

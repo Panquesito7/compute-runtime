@@ -1,0 +1,37 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
+#include "level_zero/core/source/mutable_cmdlist/mutable_load_register_imm_hw.h"
+#include "level_zero/core/test/unit_tests/white_box.h"
+
+namespace L0 {
+namespace ult {
+
+template <typename GfxFamily>
+struct WhiteBox<::L0::MCL::MutableLoadRegisterImmHw<GfxFamily>>
+    : public ::L0::MCL::MutableLoadRegisterImmHw<GfxFamily> {
+
+    using BaseClass = ::L0::MCL::MutableLoadRegisterImmHw<GfxFamily>;
+
+    using BaseClass::commandSize;
+    using BaseClass::commandView;
+    using BaseClass::gpuDestinationAddress;
+    using BaseClass::isCopy;
+    using BaseClass::loadRegImm;
+    using BaseClass::registerAddress;
+    using BaseClass::type;
+};
+
+template <typename GfxFamily>
+using MockMutableLoadRegisterImmHw = WhiteBox<::L0::MCL::MutableLoadRegisterImmHw<GfxFamily>>;
+
+} // namespace ult
+} // namespace L0

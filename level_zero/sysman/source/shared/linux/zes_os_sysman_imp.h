@@ -1,0 +1,152 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/os_interface/driver_info.h"
+#include "shared/source/os_interface/linux/sys_calls.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include "level_zero/include/level_zero/zes_intel_gpu_sysman.h"
+#include "level_zero/sysman/source/device/os_sysman.h"
+#include "level_zero/sysman/source/shared/linux/pmt/sysman_pmt.h"
+#include "level_zero/sysman/source/shared/linux/sysman_hw_device_id_linux.h"
+#include "level_zero/sysman/source/sysman_const.h"
+
+#include <array>
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace NEO {
+class Drm;
+class ExecutionEnvironment;
+struct PhysicalDevicePciBusInfo;
+struct SystemInfo;
+} // namespace NEO
+
+namespace L0 {
+namespace Sysman {
+
+class SysmanProductHelper;
+class PmuInterface;
+class FirmwareUtil;
+class SysmanKmdInterface;
+class FsAccessInterface;
+class SysFsAccessInterface;
+class ProcFsAccessInterface;
+struct SysmanDeviceImp;
+
+class LinuxSysmanImp : public OsSysman, NEO::NonCopyableAndNonMovableClass {
+  public:
+    LinuxSysmanImp(SysmanDeviceImp *pParentSysmanDeviceImp);
+    ~LinuxSysmanImp() override;
+
+    ze_result_t init() override;
+
+    FirmwareUtil *getFwUtilInterface();
+    PmuInterface *getPmuInterface() { return pPmuInterface; }
+    FsAccessInterface &getFsAccess();
+    ProcFsAccessInterface &getProcfsAccess();
+    SysFsAccessInterface &getSysfsAccess();
+    SysmanDeviceImp *getSysmanDeviceImp();
+    SysmanProductHelper *getSysmanProductHelper();
+    uint32_t getSubDeviceCount() override;
+    uint32_t getRootDeviceIndex() const override { return rootDeviceIndex; }
+    void getDeviceUuids(std::vector<std::string> &deviceUuids) override;
+    MOCKABLE_VIRTUAL std::string getPciUuid();
+    const NEO::HardwareInfo &getHardwareInfo() const override;
+    std::string getPciCardBusDirectoryPath(std::string realPciPath);
+    uint32_t getMemoryType();
+    static NEO::SystemInfo *querySystemInfo(NEO::Drm &drm);
+    static std::string getPciRootPortDirectoryPath(std::string realPciPath);
+    std::string getAlertReasonFilePath();
+    ze_result_t readPowerOffReasons(zes_intel_device_power_off_reason_exp_flags_t &reasons);
+    bool isPowerOffPending();
+    PRODUCT_FAMILY getProductFamilyFromDeviceId(uint32_t deviceId);
+    PRODUCT_FAMILY getProductFamily() const;
+    SysmanHwDeviceIdDrm::SingleInstance getSysmanHwDeviceIdInstance();
+    NEO::Drm *getDrm();
+    MOCKABLE_VIRTUAL void releaseSysmanDeviceResources();
+    MOCKABLE_VIRTUAL ze_result_t reInitSysmanDeviceResources();
+    MOCKABLE_VIRTUAL void reInitSysmanDeviceCache();
+    MOCKABLE_VIRTUAL void getPidFdsForOpenDevice(const ::pid_t, std::vector<int> &);
+    MOCKABLE_VIRTUAL ze_result_t osWarmReset();
+    MOCKABLE_VIRTUAL ze_result_t osColdReset();
+    ze_result_t gpuProcessCleanup(ze_bool_t force);
+    std::string getAddressFromPath(std::string &rootPortPath);
+    decltype(&NEO::SysCalls::pread) preadFunction = NEO::SysCalls::pread;
+    decltype(&NEO::SysCalls::pwrite) pwriteFunction = NEO::SysCalls::pwrite;
+    SysmanDeviceImp *getParentSysmanDeviceImp() { return pParentSysmanDeviceImp; }
+    std::string &getPciRootPath() { return rootPath; }
+    std::string &getDevicePciBdf() { return devicePciBdf; }
+    std::string &getDriverName();
+    void setDriverName(const std::string &driverName) { this->driverName = driverName; }
+    NEO::ExecutionEnvironment *executionEnvironment = nullptr;
+
+    // Wedged state management
+    std::atomic<bool> isDeviceInWedgedState{false};
+
+    uint32_t rootDeviceIndex;
+    bool diagnosticsReset = false;
+    bool isMemoryDiagnostics = false;
+    std::string gtDevicePath;
+    SysmanKmdInterface *getSysmanKmdInterface() { return pSysmanKmdInterface.get(); }
+    static ze_result_t getResult(int err);
+    static ze_result_t getPmtResult(int err);
+    ze_result_t getTelemData(uint32_t subDeviceId, std::string &telemDir, std::string &guid, uint64_t &telemOffset);
+    bool getUuidFromSubDeviceInfo(uint32_t subDeviceID, std::array<uint8_t, CommonConstants::uuidSize> &uuid);
+    bool generateUuidFromPciAndSubDeviceInfo(uint32_t subDeviceID, const NEO::PhysicalDevicePciBusInfo &pciBusInfo, std::array<uint8_t, CommonConstants::uuidSize> &uuid);
+    ze_result_t initSurvivabilityMode(std::unique_ptr<NEO::HwDeviceId> hwDeviceId) override;
+    bool isDeviceInSurvivabilityMode() override;
+    std::unique_ptr<NEO::PhysicalDevicePciBusInfo> getPciBdfInfo() const override { return std::make_unique<NEO::PhysicalDevicePciBusInfo>(pciBdfInfo); }
+    MOCKABLE_VIRTUAL ze_result_t updateBdfDependentData();
+
+  protected:
+    std::unique_ptr<SysmanProductHelper> pSysmanProductHelper;
+    std::unique_ptr<SysmanKmdInterface> pSysmanKmdInterface;
+    FsAccessInterface *pFsAccess = nullptr;
+    ProcFsAccessInterface *pProcfsAccess = nullptr;
+    SysFsAccessInterface *pSysfsAccess = nullptr;
+    uint32_t subDeviceCount = 0;
+    FirmwareUtil *pFwUtilInterface = nullptr;
+    PmuInterface *pPmuInterface = nullptr;
+    std::string rootPath;
+    void releaseFwUtilInterface();
+    uint32_t memType = unknownMemoryType;
+    std::map<uint32_t, std::unique_ptr<PlatformMonitoringTech::TelemData>> mapOfSubDeviceIdToTelemData;
+    std::map<uint32_t, std::string> telemNodesInPciPath;
+    std::unique_ptr<PlatformMonitoringTech::TelemData> pTelemData = nullptr;
+    struct Uuid {
+        bool isValid = false;
+        std::array<uint8_t, CommonConstants::uuidSize> id{};
+    };
+    std::vector<Uuid> uuidVec;
+    NEO::PhysicalDevicePciBusInfo pciBdfInfo = {};
+    std::string pciUuid;
+
+  private:
+    LinuxSysmanImp() = delete;
+    SysmanDeviceImp *pParentSysmanDeviceImp = nullptr;
+    static const std::string deviceDir;
+    void createFwUtilInterface();
+    uint16_t getSlotControlPos(int fd);
+    ze_result_t clearHPIE(int fd, uint16_t slotControlPos, bool &isHotPlugInterruptEnabled);
+    ze_result_t restoreHPIE(int fd, uint16_t slotControlPos);
+    ze_result_t resizeVfBar(uint8_t size);
+    std::mutex fwLock;
+    std::string devicePciBdf = "";
+    std::string driverName;
+};
+
+} // namespace Sysman
+} // namespace L0

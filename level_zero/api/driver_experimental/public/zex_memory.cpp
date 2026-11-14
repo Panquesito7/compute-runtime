@@ -1,12 +1,12 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/api/driver_experimental/public/zex_api.h"
 #include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
 
 namespace L0 {
 
@@ -30,27 +30,24 @@ zexMemOpenIpcHandles(
     return L0::Context::fromHandle(hContext)->openIpcMemHandles(hDevice, numIpcHandles, pIpcHandles, flags, pptr);
 }
 
-} // namespace L0
-
-extern "C" {
-
-ZE_APIEXPORT ze_result_t ZE_APICALL
-zexMemGetIpcHandles(
+ze_result_t ZE_APICALL
+zeIntelMemMapDeviceMemToHost(
     ze_context_handle_t hContext,
     const void *ptr,
-    uint32_t *numIpcHandles,
-    ze_ipc_mem_handle_t *pIpcHandles) {
-    return L0::zexMemGetIpcHandles(hContext, ptr, numIpcHandles, pIpcHandles);
+    void **pptr,
+    void *pNext) {
+    return L0::Context::fromHandle(hContext)->mapDeviceMemToHost(ptr, pptr, pNext);
 }
 
-ZE_APIEXPORT ze_result_t ZE_APICALL
-zexMemOpenIpcHandles(
+ze_result_t ZE_APICALL
+zeIntelMemGetHandleForAddressRange(
     ze_context_handle_t hContext,
-    ze_device_handle_t hDevice,
-    uint32_t numIpcHandles,
-    ze_ipc_mem_handle_t *pIpcHandles,
-    ze_ipc_memory_flags_t flags,
-    void **pptr) {
-    return L0::zexMemOpenIpcHandles(hContext, hDevice, numIpcHandles, pIpcHandles, flags, pptr);
+    void *pHandle,
+    const void *ptr,
+    size_t size,
+    ze_intel_mem_range_handle_type_exp_t handleType,
+    void *pNext) {
+    return L0::Context::fromHandle(hContext)->getHandleForAddressRange(pHandle, ptr, size, handleType, pNext);
 }
-}
+
+} // namespace L0

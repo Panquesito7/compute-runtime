@@ -1,27 +1,29 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/pipeline_select_helper.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/indirect_heap/indirect_heap.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 
 #include "gtest/gtest.h"
 
 namespace NEO {
 
+class CommandStreamReceiver;
 struct KernelInfo;
 
-struct HardwareParse {
+struct HardwareParse : NEO::NonCopyableAndNonMovableClass {
     HardwareParse() {
         itorMediaInterfaceDescriptorLoad = cmdList.end();
         itorMediaVfeState = cmdList.end();
@@ -62,6 +64,42 @@ struct HardwareParse {
     }
 
     template <typename FamilyType>
+        requires std::is_same_v<typename FamilyType::StallingBarrierType, typename FamilyType::RESOURCE_BARRIER>
+    bool
+    isStallingBarrier(GenCmdList::iterator &iter) {
+        using RESOURCE_BARRIER = typename FamilyType::RESOURCE_BARRIER;
+        auto resourceBarrierCmd = genCmdCast<RESOURCE_BARRIER *>(*iter);
+        if (resourceBarrierCmd == nullptr) {
+            return false;
+        }
+        EXPECT_EQ(resourceBarrierCmd->getBarrierType(), RESOURCE_BARRIER::BARRIER_TYPE::BARRIER_TYPE_IMMEDIATE);
+        EXPECT_EQ(resourceBarrierCmd->getWaitStage(), RESOURCE_BARRIER::WAIT_STAGE::WAIT_STAGE_TOP);
+        return true;
+    }
+
+    template <typename FamilyType>
+    bool isStallingBarrier(GenCmdList::iterator &iter) {
+        using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+        auto pipeControlCmd = genCmdCast<PIPE_CONTROL *>(*iter);
+        if (pipeControlCmd == nullptr) {
+            return false;
+        }
+        EXPECT_EQ(pipeControlCmd->getCommandStreamerStallEnable(), true);
+        EXPECT_EQ(pipeControlCmd->getDcFlushEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getRenderTargetCacheFlushEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getInstructionCacheInvalidateEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getTextureCacheInvalidationEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getPipeControlFlushEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getVfCacheInvalidationEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getConstantCacheInvalidationEnable(), false);
+        EXPECT_EQ(pipeControlCmd->getStateCacheInvalidationEnable(), false);
+        return true;
+    }
+
+    template <typename FamilyType>
+    void verifyL1FlushOnStallingBarrier(bool expectInvalidate, bool expectFlush);
+
+    template <typename FamilyType>
     void findHardwareCommands();
 
     template <typename FamilyType>
@@ -71,7 +109,7 @@ struct HardwareParse {
     void parseCommands(NEO::LinearStream &commandStream, size_t startOffset = 0) {
         ASSERT_LE(startOffset, commandStream.getUsed());
         auto sizeToParse = commandStream.getUsed() - startOffset;
-        ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
             cmdList,
             ptrOffset(commandStream.getCpuBase(), startOffset),
             sizeToParse));
@@ -79,7 +117,7 @@ struct HardwareParse {
 
     template <typename FamilyType>
     void parseCommands(NEO::CommandStreamReceiver &commandStreamReceiver, NEO::LinearStream &commandStream) {
-        auto &commandStreamCSR = commandStreamReceiver.getCS();
+        auto &commandStreamCSR = getCsrCommandStream(commandStreamReceiver);
 
         parseCommands<FamilyType>(commandStreamCSR, startCSRCS);
         startCSRCS = commandStreamCSR.getUsed();
@@ -92,7 +130,7 @@ struct HardwareParse {
         previousCS = &commandStream;
 
         sizeUsed = commandStream.getUsed();
-        findHardwareCommands<FamilyType>(&commandStreamReceiver.getIndirectHeap(IndirectHeap::Type::DYNAMIC_STATE, 0));
+        findHardwareCommands<FamilyType>(&getCsrDynamicStateHeap(commandStreamReceiver));
     }
 
     template <typename FamilyType>
@@ -128,6 +166,19 @@ struct HardwareParse {
     template <typename CmdType>
     CmdType *getCommand() {
         return getCommand<CmdType>(cmdList.begin(), cmdList.end());
+    }
+
+    template <typename CmdType>
+    GenCmdList::iterator getCommandItor(GenCmdList::iterator itorStart, GenCmdList::iterator itorEnd) {
+        auto itorCmd = find<CmdType *>(itorStart, itorEnd);
+        return itorCmd != cmdList.end()
+                   ? itorCmd
+                   : cmdList.end();
+    }
+
+    template <typename CmdType>
+    GenCmdList::iterator getCommandItor() {
+        return getCommandItor<CmdType>(cmdList.begin(), cmdList.end());
     }
 
     template <typename FamilyType>
@@ -179,8 +230,32 @@ struct HardwareParse {
     }
 
     template <typename FamilyType>
+    uint32_t getCommandWalkerCount() {
+
+        GenCmdList::iterator cmdItor = cmdList.begin();
+        uint32_t cmdCount = 0;
+
+        do {
+            cmdItor = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdItor, cmdList.end());
+            if (cmdItor != cmdList.end()) {
+                ++cmdCount;
+                ++cmdItor;
+            }
+        } while (cmdItor != cmdList.end());
+
+        return cmdCount;
+    }
+
+    template <typename FamilyType>
     static const char *getCommandName(void *cmd) {
-        return FamilyType::PARSE::getCommandName(cmd);
+        return FamilyType::Parse::getCommandName(cmd);
+    }
+
+    template <typename FamilyType>
+    static GenCmdList parseCommandBuffer(const LinearStream &linearStream, size_t offset) {
+        GenCmdList cmds;
+        EXPECT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(cmds, ptrOffset(linearStream.getCpuBase(), offset), linearStream.getUsed() - offset));
+        return cmds;
     }
 
     // The starting point of parsing commandBuffers.  This is important
@@ -213,6 +288,12 @@ struct HardwareParse {
     void *cmdBindingTableBaseAddress = nullptr;
 
     bool parsePipeControl = false;
+
+  private:
+    static LinearStream &getCsrCommandStream(CommandStreamReceiver &commandStreamReceiver);
+    static IndirectHeap &getCsrDynamicStateHeap(CommandStreamReceiver &commandStreamReceiver);
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<HardwareParse>);
 
 } // namespace NEO

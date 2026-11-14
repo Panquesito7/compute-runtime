@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,9 @@
 
 #pragma once
 #include "shared/source/built_ins/built_in_ops_base.h"
-#include "shared/source/command_stream/transfer_direction.h"
 #include "shared/source/helpers/vec.h"
 
+#include "opencl/source/built_ins/builtin_op_params.h"
 #include "opencl/source/kernel/multi_device_kernel.h"
 #include "opencl/source/program/program.h"
 
@@ -20,8 +20,14 @@
 #include <vector>
 
 namespace NEO {
-struct BuiltinCode;
-typedef std::vector<char> BuiltinResourceT;
+namespace BuiltIn {
+struct Code;
+struct Resource;
+} // namespace BuiltIn
+class BuiltIns;
+class GraphicsAllocation;
+class Kernel;
+struct KernelInfo;
 
 class ClDeviceVector;
 class Context;
@@ -30,37 +36,15 @@ class MemObj;
 struct MultiDispatchInfo;
 class Program;
 
-struct BuiltinOpParams {
-    void *srcPtr = nullptr;
-    void *dstPtr = nullptr;
-    MemObj *srcMemObj = nullptr;
-    MemObj *dstMemObj = nullptr;
-    GraphicsAllocation *srcSvmAlloc = nullptr;
-    GraphicsAllocation *dstSvmAlloc = nullptr;
-    GraphicsAllocation *transferAllocation = nullptr; // mapAllocation or hostPtrAllocation
-    AuxTranslationDirection auxTranslationDirection = AuxTranslationDirection::None;
-    bool unifiedMemoryArgsRequireMemSync = true;
-    Vec3<size_t> srcOffset = {0, 0, 0};
-    Vec3<size_t> dstOffset = {0, 0, 0};
-    Vec3<size_t> size = {0, 0, 0};
-    size_t srcRowPitch = 0;
-    size_t dstRowPitch = 0;
-    size_t srcSlicePitch = 0;
-    size_t dstSlicePitch = 0;
-    uint32_t srcMipLevel = 0;
-    uint32_t dstMipLevel = 0;
-    void *userPtrForPostOperationCpuCopy = nullptr;
-    bool bcsSplit = false;
-    TransferDirection direction = TransferDirection::LocalToLocal;
-};
+namespace BuiltIn {
 
-class BuiltinDispatchInfoBuilder {
+class DispatchInfoBuilder {
   public:
-    BuiltinDispatchInfoBuilder(BuiltIns &kernelLib, ClDevice &device) : kernelsLib(kernelLib), clDevice(device) {}
-    virtual ~BuiltinDispatchInfoBuilder() = default;
+    DispatchInfoBuilder(BuiltIns &kernelLib, ClDevice &device) : kernelsLib(kernelLib), clDevice(device) {}
+    virtual ~DispatchInfoBuilder() = default;
 
     template <typename... KernelsDescArgsT>
-    void populate(EBuiltInOps::Type operation, ConstStringRef options, KernelsDescArgsT &&...desc);
+    void populate(BaseKernel kernel, const AddressingMode &mode, ConstStringRef options, KernelsDescArgsT &&...desc);
 
     virtual bool buildDispatchInfos(MultiDispatchInfo &multiDispatchInfo) const {
         return false;
@@ -83,7 +67,7 @@ class BuiltinDispatchInfoBuilder {
 
     std::vector<std::unique_ptr<MultiDeviceKernel>> &peekUsedKernels() { return usedKernels; }
 
-    static std::unique_ptr<Program> createProgramFromCode(const BuiltinCode &bc, const ClDeviceVector &device);
+    static std::unique_ptr<Program> createProgramFromCode(const Code &bc, const ClDeviceVector &device);
 
   protected:
     template <typename KernelNameT, typename... KernelsDescArgsT>
@@ -96,7 +80,6 @@ class BuiltinDispatchInfoBuilder {
         kernelInfos.resize(rootDeviceIndex + 1);
         kernelInfos[rootDeviceIndex] = kernelInfo;
         kernelDst = MultiDeviceKernel::create(prog.get(), kernelInfos, err);
-        kernelDst->getKernel(rootDeviceIndex)->isBuiltIn = true;
         usedKernels.push_back(std::unique_ptr<MultiDeviceKernel>(kernelDst));
         grabKernels(std::forward<KernelsDescArgsT>(kernelsDesc)...);
     }
@@ -109,21 +92,28 @@ class BuiltinDispatchInfoBuilder {
     ClDevice &clDevice;
 };
 
-class BuiltInDispatchBuilderOp {
+class DispatchBuilderOp {
   public:
-    static BuiltinDispatchInfoBuilder &getBuiltinDispatchInfoBuilder(EBuiltInOps::Type op, ClDevice &device);
+    static DispatchInfoBuilder &getBuiltinDispatchInfoBuilder(BaseKernel kernel, const AddressingMode &mode, ClDevice &device);
+    static DispatchInfoBuilder &getBuiltinDispatchInfoBuilder(const BuiltInId &builtIn, ClDevice &device) {
+        return getBuiltinDispatchInfoBuilder(builtIn.kernel, builtIn.mode, device);
+    }
 };
 
-class BuiltInOwnershipWrapper : public NonCopyableOrMovableClass {
+class OwnershipWrapper : public NonCopyableAndNonMovableClass {
   public:
-    BuiltInOwnershipWrapper() = default;
-    BuiltInOwnershipWrapper(BuiltinDispatchInfoBuilder &inputBuilder, Context *context);
-    ~BuiltInOwnershipWrapper();
+    OwnershipWrapper() = default;
+    OwnershipWrapper(DispatchInfoBuilder &inputBuilder, Context *context);
+    ~OwnershipWrapper();
 
-    void takeOwnership(BuiltinDispatchInfoBuilder &inputBuilder, Context *context);
+    void takeOwnership(DispatchInfoBuilder &inputBuilder, Context *context);
 
   protected:
-    BuiltinDispatchInfoBuilder *builder = nullptr;
+    DispatchInfoBuilder *builder = nullptr;
 };
+
+} // namespace BuiltIn
+
+static_assert(NEO::NonCopyableAndNonMovable<BuiltIn::OwnershipWrapper>);
 
 } // namespace NEO

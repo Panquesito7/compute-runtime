@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,29 +7,19 @@
 
 #include "shared/source/helpers/file_io.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/stdio.h"
+#include "shared/source/utilities/io_functions.h"
 
 #include <cstring>
+#include <map>
 #include <new>
-#include <set>
+#include <sstream>
 
 namespace NEO {
-extern std::set<std::string> virtualFileList;
-}
-
-size_t writeDataToFile(
-    const char *filename,
-    const void *pData,
-    size_t dataSize) {
-
-    DEBUG_BREAK_IF(nullptr == pData);
-    DEBUG_BREAK_IF(nullptr == filename);
-
-    NEO::virtualFileList.insert(filename);
-
-    return dataSize;
-}
+extern std::map<std::string, std::stringstream> virtualFileList;
+extern std::map<std::string, std::stringstream> virtualFileListTestKernelsOnly;
 
 bool fileExists(const std::string &fileName) {
     FILE *pFile = nullptr;
@@ -37,29 +27,106 @@ bool fileExists(const std::string &fileName) {
     DEBUG_BREAK_IF(fileName.empty());
     DEBUG_BREAK_IF(fileName == "");
 
-    if (NEO::virtualFileList.count(fileName) > 0) {
+    if (NEO::virtualFileList.contains(fileName)) {
         return true;
     }
 
-    fopen_s(&pFile, fileName.c_str(), "rb");
+    pFile = NEO::IoFunctions::fopenPtr(fileName.c_str(), "rb");
     if (pFile) {
-        fclose(pFile);
+        NEO::IoFunctions::fclosePtr(pFile);
     }
     return pFile != nullptr;
 }
 
 bool fileExistsHasSize(const std::string &fileName) {
-    FILE *pFile = nullptr;
-    size_t nsize = 0;
-
     DEBUG_BREAK_IF(fileName.empty());
     DEBUG_BREAK_IF(fileName == "");
 
-    fopen_s(&pFile, fileName.c_str(), "rb");
-    if (pFile) {
-        fseek(pFile, 0, SEEK_END);
-        nsize = (size_t)ftell(pFile);
-        fclose(pFile);
+    auto it = NEO::virtualFileList.find(fileName);
+    if (it != NEO::virtualFileList.end()) {
+        std::stringstream &ss = it->second;
+        ss.seekg(0, std::ios::end);
+        return ss.tellg() > 0;
     }
-    return pFile != nullptr && nsize > 0;
+    return false;
+}
+
+size_t writeDataToFile(
+    const char *filename,
+    std::string_view data,
+    bool append) {
+
+    DEBUG_BREAK_IF(nullptr == filename);
+    std::string path = debugManager.flags.ForceLoggingDirectory.get() != "unk" ? debugManager.flags.ForceLoggingDirectory.get() : "";
+    std::string fullPath = path + filename;
+
+    if (!append) {
+        NEO::virtualFileList[fullPath].str({});
+    }
+    NEO::virtualFileList[fullPath] << data;
+
+    return NEO::virtualFileList[fullPath].str().size();
+}
+} // namespace NEO
+
+void removeVirtualFile(const std::string &fileName) {
+    NEO::virtualFileList.erase(fileName);
+}
+
+bool virtualFileExists(const std::string &fileName) {
+    if (NEO::virtualFileList.contains(fileName)) {
+        return true;
+    }
+    return false;
+}
+
+std::unique_ptr<char[]> loadDataFromVirtualFile(
+    const char *filename,
+    size_t &retSize) {
+
+    auto it = NEO::virtualFileList.find(filename);
+    if (it == NEO::virtualFileList.end()) {
+        retSize = 0;
+        return nullptr;
+    }
+    std::unique_ptr<char[]> ret;
+
+    std::stringstream &fileStream = it->second;
+
+    fileStream.seekg(0, std::ios::end);
+    retSize = static_cast<size_t>(fileStream.tellg());
+    fileStream.seekg(0, std::ios::beg);
+
+    ret.reset(new (std::nothrow) char[retSize + 1]);
+    if (ret) {
+        memset(ret.get(), 0x00, retSize + 1);
+        fileStream.read(ret.get(), retSize);
+    } else {
+        retSize = 0;
+    }
+
+    return ret;
+}
+
+std::unique_ptr<char[]> loadDataFromVirtualFileTestKernelsOnly(const char *filename, size_t &retSize) {
+
+    auto it = NEO::virtualFileListTestKernelsOnly.find(filename);
+    if (it == NEO::virtualFileListTestKernelsOnly.end()) {
+        retSize = 0;
+        return nullptr;
+    }
+    std::stringstream &fileStream = it->second;
+    fileStream.seekg(0, std::ios::end);
+    retSize = static_cast<size_t>(fileStream.tellg());
+    fileStream.seekg(0, std::ios::beg);
+
+    auto ret = std::make_unique<char[]>(retSize + 1);
+    if (ret) {
+        ret[retSize] = 0x00;
+        fileStream.read(ret.get(), retSize);
+    } else {
+        retSize = 0;
+    }
+
+    return ret;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,9 @@
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/blit_commands_helper.h"
+#include "shared/source/helpers/blit_properties.h"
 #include "shared/source/helpers/definitions/command_encoder_args.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
@@ -30,11 +32,11 @@ struct BlitColorTests : public DeviceFixture, public testing::TestWithParam<size
 };
 
 template <typename FamilyType>
-class GivenLinearStreamWhenCallDispatchBlitMemoryColorFillThenCorrectDepthIsProgrammed {
+class GivenLinearStreamWhenCallDispatchBlitMemoryFillThenCorrectDepthIsProgrammed {
   public:
     using XY_COLOR_BLT = typename FamilyType::XY_COLOR_BLT;
     using COLOR_DEPTH = typename XY_COLOR_BLT::COLOR_DEPTH;
-    GivenLinearStreamWhenCallDispatchBlitMemoryColorFillThenCorrectDepthIsProgrammed(Device *device) : device(device) {}
+    GivenLinearStreamWhenCallDispatchBlitMemoryFillThenCorrectDepthIsProgrammed(Device *device) : device(device) {}
     void testBodyImpl(size_t patternSize, COLOR_DEPTH expectedDepth) {
         uint32_t streamBuffer[100] = {};
         LinearStream stream(streamBuffer, sizeof(streamBuffer));
@@ -43,19 +45,21 @@ class GivenLinearStreamWhenCallDispatchBlitMemoryColorFillThenCorrectDepthIsProg
         auto gmmHelper = device->getGmmHelper();
         auto canonizedGpuAddress = gmmHelper->canonize(castToUint64(ptr));
         MockGraphicsAllocation mockAllocation(0,
-                                              AllocationType::INTERNAL_HOST_MEMORY,
+                                              1u /*num gmms*/,
+                                              AllocationType::internalHostMemory,
                                               ptr,
                                               size,
                                               0u,
-                                              MemoryPool::System4KBPages,
+                                              MemoryPool::system4KBPages,
                                               MemoryManager::maxOsContextCount,
                                               canonizedGpuAddress);
         uint32_t patternToCommand[4];
         memset(patternToCommand, 4, patternSize);
-        EncodeDummyBlitWaArgs waArgs{false, &(device->getRootDeviceEnvironmentRef())};
-        BlitCommandsHelper<FamilyType>::dispatchBlitMemoryColorFill(&mockAllocation, 0, patternToCommand, patternSize, stream, mockAllocation.getUnderlyingBufferSize(), waArgs);
+        auto blitProperties = BlitProperties::constructPropertiesForMemoryFill(&mockAllocation, 0, mockAllocation.getUnderlyingBufferSize(), patternToCommand, patternSize, 0);
+
+        BlitCommandsHelper<FamilyType>::dispatchBlitMemoryFill(blitProperties, stream, device->getRootDeviceEnvironmentRef());
         GenCmdList cmdList;
-        ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
             cmdList, ptrOffset(stream.getCpuBase(), 0), stream.getUsed()));
         auto itor = find<XY_COLOR_BLT *>(cmdList.begin(), cmdList.end());
         EXPECT_NE(cmdList.end(), itor);

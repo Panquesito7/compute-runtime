@@ -1,21 +1,31 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/os_interface/linux/pmt_util.h"
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include "level_zero/tools/source/sysman/global_operations/os_global_operations.h"
-#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
+
+#include <string>
+
+namespace NEO {
+class ExecutionEnvironment;
+} // namespace NEO
 
 namespace L0 {
 class SysfsAccess;
 struct Device;
+class FsAccess;
+class LinuxSysmanImp;
+class ProcfsAccess;
+struct OsSysman;
 
-class LinuxGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableOrMovableClass {
+class LinuxGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableAndNonMovableClass {
   public:
     bool getSerialNumber(char (&serialNumber)[ZES_STRING_PROPERTY_SIZE]) override;
     bool getBoardNumber(char (&boardNumber)[ZES_STRING_PROPERTY_SIZE]) override;
@@ -29,6 +39,7 @@ class LinuxGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableOrMo
     ze_result_t reset(ze_bool_t force) override;
     ze_result_t scanProcessesState(std::vector<zes_process_state_t> &pProcessList) override;
     ze_result_t deviceGetState(zes_device_state_t *pState) override;
+    ze_result_t resetExt(zes_reset_properties_t *pProperties) override;
     LinuxGlobalOperationsImp() = default;
     LinuxGlobalOperationsImp(OsSysman *pOsSysman);
     ~LinuxGlobalOperationsImp() override = default;
@@ -58,6 +69,7 @@ class LinuxGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableOrMo
     std::string devicePciBdf = "";
     NEO::ExecutionEnvironment *executionEnvironment = nullptr;
     uint32_t rootDeviceIndex = 0u;
+    ze_result_t resetImpl(ze_bool_t force, zes_reset_type_t resetType);
 };
 
 } // namespace L0

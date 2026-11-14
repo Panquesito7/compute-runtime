@@ -1,23 +1,91 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/core/source/driver/driver_handle_imp.h"
-#include "level_zero/sysman/source/sysman_driver_handle_imp.h"
+#include "level_zero/core/source/global_teardown.h"
+
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/os_library.h"
+#include "shared/source/os_interface/sys_calls_common.h"
+
+#include "level_zero/api/opencl/source/platform/leo_platform.h"
+#include "level_zero/api/opencl/source/sharings/leo_sharing_factory.h"
+#include "level_zero/core/source/driver/driver.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/ddi/ze_ddi_tables.h"
+#include "level_zero/sysman/source/driver/sysman_driver_handle_imp.h"
 
 namespace L0 {
 
+decltype(&zelSetDriverTeardown) setDriverTeardownFunc = nullptr;
+
+void globalDriverSetup() {
+    if (!globalDriverHandles) {
+        globalDriverHandles = new std::vector<_ze_driver_handle_t *>;
+    }
+
+    if (!NEO::LEO::platformsImpl) {
+        NEO::LEO::platformsImpl = new std::vector<std::unique_ptr<NEO::LEO::Platform>>;
+        NEO::LEO::platformsInitAttempted = false;
+    }
+}
+
+void removePageFaultManagerAtTermination() {
+    if (globalDriverHandles) {
+        for (auto &globalDriverHandle : *globalDriverHandles) {
+            auto globalDriver = DriverHandle::fromHandle(globalDriverHandle);
+            if (globalDriver != nullptr) {
+                if (globalDriver->getMemoryManager() != nullptr) {
+                    globalDriver->getMemoryManager()->destroyPageFaultManager();
+                }
+            }
+        }
+    }
+}
 void globalDriverTeardown() {
-    if (GlobalDriver != nullptr) {
-        delete GlobalDriver;
-        GlobalDriver = nullptr;
+    if (NEO::LEO::platformsImpl) {
+        delete NEO::LEO::platformsImpl;
     }
-    if (Sysman::GlobalSysmanDriver != nullptr) {
-        delete Sysman::GlobalSysmanDriver;
-        Sysman::GlobalSysmanDriver = nullptr;
+    NEO::LEO::platformsImpl = nullptr;
+    NEO::LEO::platformsInitAttempted = false;
+    NEO::LEO::SharingFactory::clearSharingBuilders();
+
+    if (levelZeroDriverInitialized) {
+        NEO::OsLibraryCreateProperties loaderLibraryProperties("ze_loader.dll");
+        loaderLibraryProperties.performSelfLoad = true;
+        std::unique_ptr<NEO::OsLibrary> loaderLibrary = std::unique_ptr<NEO::OsLibrary>{NEO::OsLibrary::loadFunc(loaderLibraryProperties)};
+        if (loaderLibrary) {
+            setDriverTeardownFunc = reinterpret_cast<decltype(&zelSetDriverTeardown)>(loaderLibrary->getProcAddress("zelSetDriverTeardown"));
+            if (setDriverTeardownFunc) {
+                setDriverTeardownFunc();
+            }
+        }
     }
+
+    if (globalDriverHandles) {
+        for (auto &globalDriverHandle : *globalDriverHandles) {
+            auto globalDriver = DriverHandle::fromHandle(globalDriverHandle);
+            if (globalDriver != nullptr) {
+
+                if (globalDriver->pid == NEO::SysCalls::getCurrentProcessId()) {
+                    delete static_cast<BaseDriver *>(globalDriver);
+                }
+                globalDriver = nullptr;
+            }
+        }
+        delete globalDriverHandles;
+        globalDriverHandles = nullptr;
+    }
+    if (Sysman::globalSysmanDriver != nullptr) {
+        delete Sysman::globalSysmanDriver;
+        Sysman::globalSysmanDriver = nullptr;
+    }
+    globalDriverDispatch.core.isValidFlag = false;
+    globalDriverDispatch.tools.isValidFlag = false;
+    globalDriverDispatch.sysman.isValidFlag = false;
+    globalDriverDispatch.runtime.isValidFlag = false;
 }
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,9 +9,51 @@
 
 #include <cstring>
 #include <iomanip>
+#include <iterator>
+
+void testSimpleCopy(ze_context_handle_t &context, ze_device_handle_t &device, bool &validRet) {
+    constexpr size_t allocSize = 4096;
+    alignas(64) char stackBuffer[allocSize];
+    void *zeBuffer = nullptr;
+
+    ze_command_queue_handle_t cmdQueue;
+    ze_command_list_handle_t cmdList;
+
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    hostDesc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+    hostDesc.flags = 0;
+    hostDesc.pNext = nullptr;
+
+    SUCCESS_OR_TERMINATE(zeMemAllocHost(context, &hostDesc, allocSize, allocSize, &zeBuffer));
+
+    for (size_t i = 0; i < allocSize; ++i) {
+        stackBuffer[i] = static_cast<char>(i + 1);
+    }
+    memset(zeBuffer, 0, allocSize);
+
+    // Copy from heap to host-allocated memory
+    SUCCESS_OR_TERMINATE(zeCommandListAppendMemoryCopy(cmdList, zeBuffer, stackBuffer, allocSize,
+                                                       nullptr, 0, nullptr));
+
+    SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandListClose(cmdList));
+
+    SUCCESS_OR_TERMINATE(zeCommandQueueExecuteCommandLists(cmdQueue, 1, &cmdList, nullptr));
+    SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
+
+    // Validate host and ze buffers have the original data from stackBuffer
+    validRet = LevelZeroBlackBoxTests::validate(stackBuffer, zeBuffer, allocSize);
+
+    SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
+    SUCCESS_OR_TERMINATE(zeCommandListDestroy(cmdList));
+    SUCCESS_OR_TERMINATE(zeCommandQueueDestroy(cmdQueue));
+}
 
 void testAppendMemoryCopyFromHeapToDeviceToStack(ze_context_handle_t &context, ze_device_handle_t &device, bool &validRet) {
-    const size_t allocSize = 4096 + 7; // +7 to break alignment and make it harder
+    const size_t allocSize = 4096;
     char *heapBuffer = new char[allocSize];
     void *zeBuffer = nullptr;
     char stackBuffer[allocSize];
@@ -19,8 +61,8 @@ void testAppendMemoryCopyFromHeapToDeviceToStack(ze_context_handle_t &context, z
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
-    cmdQueue = createCommandQueue(context, device, nullptr);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     ze_device_mem_alloc_desc_t deviceDesc = {};
     deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
@@ -50,7 +92,7 @@ void testAppendMemoryCopyFromHeapToDeviceToStack(ze_context_handle_t &context, z
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     // Validate stack and ze buffers have the original data from heapBuffer
-    validRet = (0 == memcmp(heapBuffer, stackBuffer, allocSize));
+    validRet = LevelZeroBlackBoxTests::validate(heapBuffer, stackBuffer, allocSize);
 
     delete[] heapBuffer;
     SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
@@ -59,7 +101,7 @@ void testAppendMemoryCopyFromHeapToDeviceToStack(ze_context_handle_t &context, z
 }
 
 void testAppendMemoryCopyFromHostToDeviceToStack(ze_context_handle_t &context, ze_device_handle_t &device, bool &validRet) {
-    const size_t allocSize = 4096 + 7; // +7 to break alignment and make it harder
+    const size_t allocSize = 4096;
     char *hostBuffer;
     void *zeBuffer = nullptr;
     char stackBuffer[allocSize];
@@ -67,8 +109,8 @@ void testAppendMemoryCopyFromHostToDeviceToStack(ze_context_handle_t &context, z
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
-    cmdQueue = createCommandQueue(context, device, nullptr);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     ze_host_mem_alloc_desc_t hostDesc = {};
     hostDesc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
@@ -104,7 +146,7 @@ void testAppendMemoryCopyFromHostToDeviceToStack(ze_context_handle_t &context, z
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     // Validate stack and ze buffers have the original data from hostBuffer
-    validRet = (0 == memcmp(hostBuffer, stackBuffer, allocSize));
+    validRet = LevelZeroBlackBoxTests::validate(hostBuffer, stackBuffer, allocSize);
 
     SUCCESS_OR_TERMINATE(zeMemFree(context, hostBuffer));
     SUCCESS_OR_TERMINATE(zeMemFree(context, zeBuffer));
@@ -118,25 +160,25 @@ void testAppendMemoryCopy2DRegion(ze_context_handle_t &context, ze_device_handle
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
-    cmdQueue = createCommandQueue(context, device, nullptr);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     void *dstBuffer = nullptr;
-    uint32_t dstWidth = verbose ? 16 : 256;  // width of the dst 2D buffer in bytes
-    uint32_t dstHeight = verbose ? 32 : 128; // height of the dst 2D buffer in bytes
-    uint32_t dstOriginX = verbose ? 8 : 32;  // Offset in bytes
-    uint32_t dstOriginY = verbose ? 8 : 64;  // Offset in rows
-    uint32_t dstSize = dstHeight * dstWidth; // Size of the dst buffer
+    uint32_t dstWidth = LevelZeroBlackBoxTests::verbose ? 16 : 256;  // width of the dst 2D buffer in bytes
+    uint32_t dstHeight = LevelZeroBlackBoxTests::verbose ? 32 : 128; // height of the dst 2D buffer in bytes
+    uint32_t dstOriginX = LevelZeroBlackBoxTests::verbose ? 8 : 32;  // Offset in bytes
+    uint32_t dstOriginY = LevelZeroBlackBoxTests::verbose ? 8 : 64;  // Offset in rows
+    uint32_t dstSize = dstHeight * dstWidth;                         // Size of the dst buffer
 
     void *srcBuffer = nullptr;
-    uint32_t srcWidth = verbose ? 24 : 128;  // width of the src 2D buffer in bytes
-    uint32_t srcHeight = verbose ? 16 : 96;  // height of the src 2D buffer in bytes
-    uint32_t srcOriginX = verbose ? 4 : 16;  // Offset in bytes
-    uint32_t srcOriginY = verbose ? 4 : 32;  // Offset in rows
-    uint32_t srcSize = srcHeight * srcWidth; // Size of the src buffer
+    uint32_t srcWidth = LevelZeroBlackBoxTests::verbose ? 24 : 128; // width of the src 2D buffer in bytes
+    uint32_t srcHeight = LevelZeroBlackBoxTests::verbose ? 16 : 96; // height of the src 2D buffer in bytes
+    uint32_t srcOriginX = LevelZeroBlackBoxTests::verbose ? 4 : 16; // Offset in bytes
+    uint32_t srcOriginY = LevelZeroBlackBoxTests::verbose ? 4 : 32; // Offset in rows
+    uint32_t srcSize = srcHeight * srcWidth;                        // Size of the src buffer
 
-    uint32_t width = verbose ? 8 : 64;   // width of the region to copy
-    uint32_t height = verbose ? 12 : 32; // height of the region to copy
+    uint32_t width = LevelZeroBlackBoxTests::verbose ? 8 : 64;   // width of the region to copy
+    uint32_t height = LevelZeroBlackBoxTests::verbose ? 12 : 32; // height of the region to copy
     const ze_copy_region_t dstRegion = {dstOriginX, dstOriginY, 0, width, height, 0};
     const ze_copy_region_t srcRegion = {srcOriginX, srcOriginY, 0, width, height, 0};
 
@@ -185,7 +227,7 @@ void testAppendMemoryCopy2DRegion(ze_context_handle_t &context, ze_device_handle
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     uint8_t *dstBufferChar = reinterpret_cast<uint8_t *>(dstBuffer);
-    if (verbose) {
+    if (LevelZeroBlackBoxTests::verbose) {
         std::cout << "srcBufferChar\n";
         for (uint32_t i = 0; i < srcHeight; i++) {
             for (uint32_t j = 0; j < srcWidth; j++) {
@@ -229,8 +271,8 @@ void testMemoryFillWithWordSizedPattern(ze_context_handle_t &context, ze_device_
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
-    cmdQueue = createCommandQueue(context, device, nullptr);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     // Initialize buffers
     ze_device_mem_alloc_desc_t deviceDesc = {};
@@ -260,7 +302,7 @@ void testMemoryFillWithWordSizedPattern(ze_context_handle_t &context, ze_device_
     for (size_t i = 0; i < allocSize; ++i) {
         if (zeBufferChar[i] != pattern[i % sizeof(pattern)]) {
             validRet = false;
-            if (verbose) {
+            if (LevelZeroBlackBoxTests::verbose) {
                 std::cout << "dstBufferChar[" << i << " ] "
                           << static_cast<unsigned int>(zeBufferChar[i])
                           << "!= pattern " << pattern[i % sizeof(pattern)] << "\n";
@@ -275,7 +317,7 @@ void testMemoryFillWithWordSizedPattern(ze_context_handle_t &context, ze_device_
 }
 
 void testAppendMemoryFillWithSomePattern(ze_context_handle_t &context, ze_device_handle_t &device, bool &validRet) {
-    const size_t allocSize = 4096 + 7;
+    const size_t allocSize = 4096;
 
     char pattern0 = 5;
     const size_t pattern1Size = 8;
@@ -286,8 +328,8 @@ void testAppendMemoryFillWithSomePattern(ze_context_handle_t &context, ze_device
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
-    cmdQueue = createCommandQueue(context, device, nullptr);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     // Initialize buffers
     // zeBuffer0 and zeBuffer1 are shared allocations, so they have UVA between host and device
@@ -333,7 +375,7 @@ void testAppendMemoryFillWithSomePattern(ze_context_handle_t &context, ze_device
     for (size_t i = 0; i < allocSize; ++i) {
         if (zeBufferChar0[i] != pattern0) {
             validRet = false;
-            if (verbose) {
+            if (LevelZeroBlackBoxTests::verbose) {
                 std::cout << "dstBufferChar0[" << i << " ] "
                           << static_cast<unsigned int>(zeBufferChar0[i])
                           << "!= pattern0 " << pattern0 << "\n";
@@ -347,7 +389,7 @@ void testAppendMemoryFillWithSomePattern(ze_context_handle_t &context, ze_device
         for (size_t i = 0; i < allocSize; i++) {
             if (zeBufferChar1[i] != pattern1[i % pattern1Size]) {
                 validRet = false;
-                if (verbose) {
+                if (LevelZeroBlackBoxTests::verbose) {
                     std::cout << "dstBufferChar1[" << i << " ] "
                               << static_cast<unsigned int>(zeBufferChar1[i])
                               << "!= pattern1[" << i % pattern1Size << " ] "
@@ -371,30 +413,30 @@ void testAppendMemoryCopy3DRegion(ze_context_handle_t &context, ze_device_handle
     ze_command_queue_handle_t cmdQueue;
     ze_command_list_handle_t cmdList;
 
-    cmdQueue = createCommandQueue(context, device, nullptr);
-    SUCCESS_OR_TERMINATE(createCommandList(context, device, cmdList));
+    cmdQueue = LevelZeroBlackBoxTests::createCommandQueue(context, device, nullptr, false);
+    SUCCESS_OR_TERMINATE(LevelZeroBlackBoxTests::createCommandList(context, device, cmdList, false, 0));
 
     void *dstBuffer = nullptr;
-    uint32_t dstWidth = verbose ? 8 : 64;               // width of the dst 3D buffer in bytes
-    uint32_t dstHeight = verbose ? 8 : 64;              // height of the dst 3D buffer in bytes
-    uint32_t dstDepth = verbose ? 2 : 4;                // depth of the dst 3D buffer in bytes
-    uint32_t dstOriginX = 0;                            // Offset in bytes
-    uint32_t dstOriginY = 0;                            // Offset in rows
-    uint32_t dstOriginZ = 0;                            // Offset in rows
-    uint32_t dstSize = dstHeight * dstWidth * dstDepth; // Size of the dst buffer
+    uint32_t dstWidth = LevelZeroBlackBoxTests::verbose ? 8 : 64;  // width of the dst 3D buffer in bytes
+    uint32_t dstHeight = LevelZeroBlackBoxTests::verbose ? 8 : 64; // height of the dst 3D buffer in bytes
+    uint32_t dstDepth = LevelZeroBlackBoxTests::verbose ? 2 : 4;   // depth of the dst 3D buffer in bytes
+    uint32_t dstOriginX = 0;                                       // Offset in bytes
+    uint32_t dstOriginY = 0;                                       // Offset in rows
+    uint32_t dstOriginZ = 0;                                       // Offset in rows
+    uint32_t dstSize = dstHeight * dstWidth * dstDepth;            // Size of the dst buffer
 
     void *srcBuffer = nullptr;
-    uint32_t srcWidth = verbose ? 8 : 64;               // width of the src 3D buffer in bytes
-    uint32_t srcHeight = verbose ? 8 : 64;              // height of the src 3D buffer in bytes
-    uint32_t srcDepth = verbose ? 2 : 4;                // depth of the src 3D buffer in bytes
-    uint32_t srcOriginX = 0;                            // Offset in bytes
-    uint32_t srcOriginY = 0;                            // Offset in rows
-    uint32_t srcOriginZ = 0;                            // Offset in rows
-    uint32_t srcSize = srcHeight * srcWidth * srcDepth; // Size of the src buffer
+    uint32_t srcWidth = LevelZeroBlackBoxTests::verbose ? 8 : 64;  // width of the src 3D buffer in bytes
+    uint32_t srcHeight = LevelZeroBlackBoxTests::verbose ? 8 : 64; // height of the src 3D buffer in bytes
+    uint32_t srcDepth = LevelZeroBlackBoxTests::verbose ? 2 : 4;   // depth of the src 3D buffer in bytes
+    uint32_t srcOriginX = 0;                                       // Offset in bytes
+    uint32_t srcOriginY = 0;                                       // Offset in rows
+    uint32_t srcOriginZ = 0;                                       // Offset in rows
+    uint32_t srcSize = srcHeight * srcWidth * srcDepth;            // Size of the src buffer
 
-    uint32_t width = verbose ? 8 : 64;  // width of the region to copy
-    uint32_t height = verbose ? 8 : 64; // height of the region to copy
-    uint32_t depth = verbose ? 2 : 4;   // height of the region to copy
+    uint32_t width = LevelZeroBlackBoxTests::verbose ? 8 : 64;  // width of the region to copy
+    uint32_t height = LevelZeroBlackBoxTests::verbose ? 8 : 64; // height of the region to copy
+    uint32_t depth = LevelZeroBlackBoxTests::verbose ? 2 : 4;   // height of the region to copy
     const ze_copy_region_t dstRegion = {dstOriginX, dstOriginY, dstOriginZ, width, height, depth};
     const ze_copy_region_t srcRegion = {srcOriginX, srcOriginY, dstOriginZ, width, height, depth};
 
@@ -446,7 +488,7 @@ void testAppendMemoryCopy3DRegion(ze_context_handle_t &context, ze_device_handle
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     uint8_t *dstBufferChar = reinterpret_cast<uint8_t *>(dstBuffer);
-    if (verbose) {
+    if (LevelZeroBlackBoxTests::verbose) {
         std::cout << "srcBufferChar\n";
         for (uint32_t i = 0; i < srcDepth; i++) {
             for (uint32_t j = 0; j < srcHeight; j++) {
@@ -492,41 +534,60 @@ void testAppendMemoryCopy3DRegion(ze_context_handle_t &context, ze_device_handle
     SUCCESS_OR_TERMINATE(zeCommandQueueDestroy(cmdQueue));
 }
 
+struct CopyTestCase {
+    const char *name;
+    void (*run)(ze_context_handle_t &context, ze_device_handle_t &device, bool &validRet);
+};
+
 int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello Copy";
-    verbose = isVerbose(argc, argv);
-    bool aubMode = isAubMode(argc, argv);
+    const CopyTestCase testCases[] = {
+        {"Simple Copy", testSimpleCopy},
+        {"Append Memory Copy From Heap To Device To Stack", testAppendMemoryCopyFromHeapToDeviceToStack},
+        {"Append Memory Copy From Host To Device To Stack", testAppendMemoryCopyFromHostToDeviceToStack},
+        {"Append Memory Copy 2D Region", testAppendMemoryCopy2DRegion},
+        {"Append Memory Fill With Some Pattern", testAppendMemoryFillWithSomePattern},
+        {"Append Memory Copy 3D Region", testAppendMemoryCopy3DRegion},
+        {"Memory Fill With Word Sized Pattern", testMemoryFillWithWordSizedPattern},
+    };
+
+    if (LevelZeroBlackBoxTests::isParamEnabled(argc, argv, "-h", "--help")) {
+        std::cout << "Usage: zello_copy [-m|-mask <test mask>]" << std::endl
+                  << "By default all test cases are run. Available test cases:" << std::endl;
+        for (uint32_t testIndex = 0; testIndex < std::size(testCases); testIndex++) {
+            std::cout << "  -m 0x" << std::hex << std::setw(2) << std::setfill('0') << (1u << testIndex) << std::dec << "  " << testCases[testIndex].name << std::endl;
+        }
+        return 0;
+    }
+
+    constexpr uint32_t defaultTestMask = std::numeric_limits<uint32_t>::max();
+    LevelZeroBlackBoxTests::TestBitMask testMask = LevelZeroBlackBoxTests::getTestMask(argc, argv, defaultTestMask);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
 
     ze_context_handle_t context = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context);
     auto device = devices[0];
-    bool outputValidationSuccessful = false;
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
-    testAppendMemoryCopyFromHeapToDeviceToStack(context, device, outputValidationSuccessful);
-    if (outputValidationSuccessful || aubMode) {
-        testAppendMemoryCopyFromHostToDeviceToStack(context, device, outputValidationSuccessful);
-    }
-    if (outputValidationSuccessful || aubMode) {
-        testAppendMemoryCopy2DRegion(context, device, outputValidationSuccessful);
-    }
-    if (outputValidationSuccessful || aubMode) {
-        testAppendMemoryFillWithSomePattern(context, device, outputValidationSuccessful);
-    }
-    if (outputValidationSuccessful || aubMode) {
-        testAppendMemoryCopy3DRegion(context, device, outputValidationSuccessful);
-    }
-    if (outputValidationSuccessful || aubMode) {
-        testMemoryFillWithWordSizedPattern(context, device, outputValidationSuccessful);
+    bool boxPass = true;
+    for (uint32_t testIndex = 0; testIndex < std::size(testCases); testIndex++) {
+        if (!testMask.test(testIndex)) {
+            continue;
+        }
+        const auto &testCase = testCases[testIndex];
+        LevelZeroBlackBoxTests::printTestHeader(testCase.name);
+        bool casePass = false;
+        testCase.run(context, device, casePass);
+        LevelZeroBlackBoxTests::printResult(aubMode, casePass, blackBoxName, testCase.name);
+        boxPass &= casePass;
     }
 
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
-
-    printResult(aubMode, outputValidationSuccessful, blackBoxName);
-
-    outputValidationSuccessful = aubMode ? true : outputValidationSuccessful;
-    return (outputValidationSuccessful ? 0 : 1);
+    int mainRetCode = aubMode ? 0 : (boxPass ? 0 : 1);
+    std::string finalStatus = (mainRetCode != 0) ? " FAILED" : " SUCCESS";
+    std::cerr << blackBoxName << finalStatus << std::endl;
+    return mainRetCode;
 }

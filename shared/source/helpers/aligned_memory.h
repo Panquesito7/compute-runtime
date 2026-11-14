@@ -1,17 +1,21 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/debug_helpers.h"
-#include "shared/source/utilities/logger.h"
 
 #include <algorithm>
 #include <functional>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <utility>
 
 #ifdef _MSC_VER
 #define ALIGNAS(x) __declspec(align(x))
@@ -21,8 +25,18 @@
 
 template <typename T, typename TNoRef = typename std::remove_reference<T>::type>
 constexpr inline TNoRef alignUp(T before, size_t alignment) {
+    OPTIONAL_UNRECOVERABLE_IF(!Math::isPow2(alignment));
     TNoRef mask = static_cast<TNoRef>(alignment - 1);
     return (before + mask) & ~mask;
+}
+
+template <typename T, typename TNoRef = typename std::remove_reference<T>::type>
+constexpr inline TNoRef alignUpNonZero(T before, size_t alignment) {
+    if (before == 0) {
+        return alignment;
+    } else {
+        return alignUp(before, alignment);
+    }
 }
 
 template <typename T>
@@ -32,6 +46,7 @@ constexpr inline T *alignUp(T *ptrBefore, size_t alignment) {
 
 template <typename T, typename TNoRef = typename std::remove_reference<T>::type>
 constexpr inline TNoRef alignDown(T before, size_t alignment) {
+    OPTIONAL_UNRECOVERABLE_IF(!Math::isPow2(alignment));
     TNoRef mask = static_cast<TNoRef>(alignment - 1);
     return before & ~mask;
 }
@@ -40,6 +55,9 @@ template <typename T>
 constexpr inline T *alignDown(T *ptrBefore, size_t alignment) {
     return reinterpret_cast<T *>(alignDown(reinterpret_cast<uintptr_t>(ptrBefore), alignment));
 }
+
+void logAlignedMalloc(const char *function, void *originalPtr, size_t size);
+void logAlignedFree(const char *function, void *originalPtr);
 
 inline void *alignedMalloc(size_t bytes, size_t alignment) {
     DEBUG_BREAK_IF(alignment <= 0);
@@ -65,15 +83,15 @@ inline void *alignedMalloc(size_t bytes, size_t alignment) {
         reinterpret_cast<void **>(pAlignedMemory)[-1] = pOriginalMemory;
     }
 
-    DBG_LOG(LogAlignedAllocations, __FUNCTION__, "Pointer:", reinterpret_cast<void *>(pOriginalMemory), "size:", sizeToAlloc);
+    logAlignedMalloc(NEO_FUNCTION_NAME, reinterpret_cast<void *>(pOriginalMemory), sizeToAlloc);
     // Return result
-    return reinterpret_cast<void *>(pAlignedMemory); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+    return reinterpret_cast<void *>(pAlignedMemory);
 }
 
 inline void alignedFree(void *ptr) {
     if (ptr) {
         auto originalPtr = reinterpret_cast<char **>(ptr)[-1];
-        DBG_LOG(LogAlignedAllocations, __FUNCTION__, "Pointer:", reinterpret_cast<void *>(originalPtr));
+        logAlignedFree(NEO_FUNCTION_NAME, reinterpret_cast<void *>(originalPtr));
         delete[] originalPtr;
     }
 }
@@ -96,13 +114,22 @@ inline bool isAligned(T *ptr) {
 
 template <typename T1, typename T2>
 inline bool isAligned(T1 ptr, T2 alignment) {
+    OPTIONAL_UNRECOVERABLE_IF(!Math::isPow2(alignment));
     return ((static_cast<size_t>(ptr)) & (static_cast<size_t>(alignment) - 1u)) == 0;
 }
 
 template <typename T>
 inline bool isAligned(T *ptr) {
+    // alignment requirement (returned by alignof) is always a power of 2
     return (reinterpret_cast<uintptr_t>(ptr) & (alignof(T) - 1)) == 0;
 }
+
+// Variadic template to check if all values are aligned
+template <size_t alignment, typename... Ts>
+inline constexpr bool isAligned(Ts... vals) {
+    return (isAligned<alignment>(vals) && ...);
+}
+
 inline auto allocateAlignedMemory(size_t bytes, size_t alignment) {
     return std::unique_ptr<void, std::function<decltype(alignedFree)>>(alignedMalloc(bytes, alignment), alignedFree);
 }

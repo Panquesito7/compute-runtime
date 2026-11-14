@@ -1,9 +1,12 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "shared/source/utilities/wait_util.h"
+#include "shared/test/common/helpers/variable_backup.h"
 
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/sharings/sharing.h"
@@ -13,7 +16,13 @@
 
 #include <memory>
 
-using namespace NEO;
+namespace CpuIntrinsicsTests {
+extern std::atomic<uintptr_t> lastClFlushedPtr;
+extern std::atomic<uint32_t> clFlushCounter;
+extern std::atomic<uint32_t> sfenceCounter;
+} // namespace CpuIntrinsicsTests
+
+namespace NEO {
 
 using ClEnqueueUnmapMemObjTests = ApiTests;
 
@@ -70,6 +79,45 @@ TEST_F(ClEnqueueUnmapMemObjTests, givenInvalidAddressWhenUnmappingOnCpuThenRetur
     EXPECT_EQ(CL_INVALID_VALUE, retVal);
 }
 
+TEST_F(ClEnqueueUnmapMemObjTests, givenZeroCopyWithoutCoherencyAllowedWhenMapAndUnmapThenFlushCachelines) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.AllowZeroCopyWithoutCoherency.set(1);
+    VariableBackup<WaitUtils::WaitpkgUse> backupWaitpkgUse(&WaitUtils::waitpkgUse, WaitUtils::WaitpkgUse::noUse);
+    VariableBackup<uint32_t> backupWaitCount(&WaitUtils::waitCount, 1);
+
+    auto buffer = std::unique_ptr<Buffer>(BufferHelper<BufferAllocHostPtr<>>::create(pContext));
+    EXPECT_TRUE(buffer->mappingOnCpuAllowed());
+    buffer->isMemObjZeroCopy();
+    cl_int retVal = CL_SUCCESS;
+
+    CpuIntrinsicsTests::clFlushCounter.store(0u);
+    CpuIntrinsicsTests::lastClFlushedPtr.store(0u);
+    CpuIntrinsicsTests::sfenceCounter.store(0u);
+
+    auto mappedPtr = clEnqueueMapBuffer(pCommandQueue, buffer.get(), CL_TRUE, CL_MAP_READ, 0, 1, 0, nullptr, nullptr, &retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(CpuIntrinsicsTests::clFlushCounter.load(), 1u);
+    EXPECT_EQ(CpuIntrinsicsTests::lastClFlushedPtr.load(), reinterpret_cast<uintptr_t>(mappedPtr));
+    EXPECT_EQ(CpuIntrinsicsTests::sfenceCounter.load(), 1u);
+    CpuIntrinsicsTests::lastClFlushedPtr.store(0u);
+
+    retVal = clEnqueueUnmapMemObject(
+        pCommandQueue,
+        buffer.get(),
+        mappedPtr,
+        0,
+        nullptr,
+        nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(CpuIntrinsicsTests::clFlushCounter.load(), 2u);
+    EXPECT_EQ(CpuIntrinsicsTests::lastClFlushedPtr.load(), reinterpret_cast<uintptr_t>(mappedPtr));
+    EXPECT_EQ(CpuIntrinsicsTests::sfenceCounter.load(), 2u);
+
+    CpuIntrinsicsTests::clFlushCounter.store(0u);
+    CpuIntrinsicsTests::lastClFlushedPtr.store(0u);
+    CpuIntrinsicsTests::sfenceCounter.store(0u);
+}
+
 TEST_F(ClEnqueueUnmapMemObjTests, givenInvalidAddressWhenUnmappingOnGpuThenReturnError) {
     auto buffer = std::unique_ptr<Buffer>(BufferHelper<BufferUseHostPtr<>>::create(pContext));
     buffer->setSharingHandler(new SharingHandler());
@@ -118,20 +166,25 @@ struct ClEnqueueUnmapImageTests : ClEnqueueUnmapMemObjTests,
         EXPECT_NE(nullptr, image.get());
     }
 
+    void TearDown() override {
+        this->image.reset();
+        ClEnqueueUnmapMemObjTests::TearDown();
+    }
+
     Image *createImage(cl_mem_object_type type) {
         switch (type) {
         case CL_MEM_OBJECT_IMAGE1D:
-            return Image1dHelper<>::create(pContext);
+            return Image1dHelperUlt<>::create(pContext);
         case CL_MEM_OBJECT_IMAGE1D_BUFFER:
-            return Image1dBufferHelper<>::create(pContext);
+            return Image1dBufferHelperUlt<>::create(pContext);
         case CL_MEM_OBJECT_IMAGE1D_ARRAY:
-            return Image1dArrayHelper<>::create(pContext);
+            return Image1dArrayHelperUlt<>::create(pContext);
         case CL_MEM_OBJECT_IMAGE2D:
-            return Image2dHelper<>::create(pContext);
+            return Image2dHelperUlt<>::create(pContext);
         case CL_MEM_OBJECT_IMAGE2D_ARRAY:
-            return Image2dArrayHelper<>::create(pContext);
+            return Image2dArrayHelperUlt<>::create(pContext);
         case CL_MEM_OBJECT_IMAGE3D:
-            return Image3dHelper<>::create(pContext);
+            return Image3dHelperUlt<>::create(pContext);
         default:
             return nullptr;
         }
@@ -208,3 +261,5 @@ INSTANTIATE_TEST_SUITE_P(
         CL_MEM_OBJECT_IMAGE1D,
         CL_MEM_OBJECT_IMAGE1D_ARRAY,
         CL_MEM_OBJECT_IMAGE1D_BUFFER));
+
+} // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -20,7 +20,7 @@ static auto gfxCore = IGFX_XE_HPG_CORE;
 
 template <>
 void populateFactoryTable<TbxCommandStreamReceiverHw<Family>>() {
-    extern TbxCommandStreamReceiverCreateFunc tbxCommandStreamReceiverFactory[IGFX_MAX_CORE];
+    extern TbxCommandStreamReceiverCreateFunc tbxCommandStreamReceiverFactory[NEO::maxCoreEnumValue];
     UNRECOVERABLE_IF(!isInRange(gfxCore, tbxCommandStreamReceiverFactory));
     tbxCommandStreamReceiverFactory[gfxCore] = TbxCommandStreamReceiverHw<Family>::create;
 }
@@ -29,4 +29,5 @@ void populateFactoryTable<TbxCommandStreamReceiverHw<Family>>() {
 
 template class TbxCommandStreamReceiverHw<Family>;
 template class CommandStreamReceiverWithAUBDump<TbxCommandStreamReceiverHw<Family>>;
+static_assert(NEO::NonCopyableAndNonMovable<CommandStreamReceiverWithAUBDump<TbxCommandStreamReceiverHw<Family>>>);
 } // namespace NEO

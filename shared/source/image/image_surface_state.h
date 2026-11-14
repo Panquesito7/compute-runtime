@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,137 +7,88 @@
 
 #pragma once
 
-#include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/gmm_helper/gmm.h"
-#include "shared/source/gmm_helper/gmm_helper.h"
-#include "shared/source/gmm_helper/resource_info.h"
-#include "shared/source/helpers/basic_math.h"
-#include "shared/source/helpers/surface_format_info.h"
+#include <cstdint>
+#include <type_traits>
+#include <utility>
 
 namespace NEO {
-template <typename GfxFamily>
-void setFilterMode(typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, const HardwareInfo *hwInfo);
 
-template <typename GfxFamily>
-inline void setImageSurfaceState(typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, const ImageInfo &imageInfo, Gmm *gmm, GmmHelper &gmmHelper, uint32_t cubeFaceIndex, uint64_t gpuAddress, const SurfaceOffsets &surfaceOffsets, bool isNV12Format) {
-    using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
-    using SURFACE_FORMAT = typename RENDER_SURFACE_STATE::SURFACE_FORMAT;
-    using AUXILIARY_SURFACE_MODE = typename RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE;
+class Gmm;
+struct SurfaceOffsets;
+class GmmHelper;
+struct ImageInfo;
 
-    auto imageCount = std::max(imageInfo.imgDesc.imageDepth, imageInfo.imgDesc.imageArraySize);
-    if (imageCount == 0) {
-        imageCount = 1;
-    }
+struct ImageSurfaceStateInputs {
+    const ImageInfo *imageInfo = nullptr;
+    Gmm *gmm = nullptr;
+    GmmHelper *gmmHelper = nullptr;
+    const SurfaceOffsets *surfaceOffsets = nullptr;
+    uint64_t gpuAddress = 0;
+    uint32_t cubeFaceIndex = 7u; // __GMM_NO_CUBE_MAP sentinel; every caller sets this explicitly.
 
-    bool isImageArray = imageInfo.imgDesc.imageArraySize > 1 &&
-                        (imageInfo.imgDesc.imageType == ImageType::Image2DArray ||
-                         imageInfo.imgDesc.imageType == ImageType::Image1DArray);
+    // Caller-resolved surface-view parameters (raw HW-field values).
+    uint32_t shaderChannelSelectRed = 0;
+    uint32_t shaderChannelSelectGreen = 0;
+    uint32_t shaderChannelSelectBlue = 0;
+    uint32_t shaderChannelSelectAlpha = 0;
+    uint32_t numberOfMultisamples = 0;
+    uint32_t surfaceMinLOD = 0;
+    uint32_t mipCountLOD = 0;
+    uint32_t compressionFormat = 0;
 
-    isImageArray |= (imageInfo.imgDesc.imageType == ImageType::Image2D || imageInfo.imgDesc.imageType == ImageType::Image2DArray) && DebugManager.flags.Force2dImageAsArray.get() == 1;
+    uint32_t packedSurfaceFormat = 0;
+    uint32_t packedWidth = 0;
+    uint32_t packedTileBpp = 0;
 
-    uint32_t renderTargetViewExtent = static_cast<uint32_t>(imageCount);
-    uint32_t minimumArrayElement = 0;
-    auto hAlign = RENDER_SURFACE_STATE::SURFACE_HORIZONTAL_ALIGNMENT_HALIGN_DEFAULT;
-    auto vAlign = RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4;
+    bool isNV12Format = false;
+    bool isDepthStencilResource = false;
+    bool useChannelSelects = false;
+    bool packedFormatOverride = false;
+    bool multisampleControlSurfacePresent = false;
+    // Protected-content images carry a decryption bit in the caller-built state that cannot be
+    // re-derived from the resource; the caller forwards it here so the encoder can preserve it.
+    bool encryptedData = false;
+};
 
-    if (gmm) {
-        hAlign = static_cast<typename RENDER_SURFACE_STATE::SURFACE_HORIZONTAL_ALIGNMENT>(gmm->gmmResourceInfo->getHAlignSurfaceState());
-        vAlign = static_cast<typename RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT>(gmm->gmmResourceInfo->getVAlignSurfaceState());
-    }
+template <typename SurfaceState, typename = void>
+struct SurfaceStateHasCompressionFormat : std::false_type {};
+template <typename SurfaceState>
+struct SurfaceStateHasCompressionFormat<SurfaceState, std::void_t<decltype(std::declval<const SurfaceState>().getCompressionFormat())>> : std::true_type {};
 
-    if (cubeFaceIndex != __GMM_NO_CUBE_MAP) {
-        isImageArray = true;
-        renderTargetViewExtent = 1;
-        minimumArrayElement = cubeFaceIndex;
-    }
-
-    surfaceState->setAuxiliarySurfaceMode(AUXILIARY_SURFACE_MODE::AUXILIARY_SURFACE_MODE_AUX_NONE);
-    surfaceState->setAuxiliarySurfacePitch(1u);
-    surfaceState->setAuxiliarySurfaceQpitch(0u);
-    surfaceState->setAuxiliarySurfaceBaseAddress(0u);
-    surfaceState->setRenderTargetViewExtent(renderTargetViewExtent);
-    surfaceState->setMinimumArrayElement(minimumArrayElement);
-
-    // SurfaceQpitch is in rows but must be a multiple of VALIGN
-    surfaceState->setSurfaceQpitch(imageInfo.qPitch);
-
-    surfaceState->setSurfaceArray(isImageArray);
-
-    surfaceState->setSurfaceHorizontalAlignment(hAlign);
-    surfaceState->setSurfaceVerticalAlignment(vAlign);
-
-    uint32_t tileMode = gmm ? gmm->gmmResourceInfo->getTileModeSurfaceState()
-                            : static_cast<uint32_t>(RENDER_SURFACE_STATE::TILE_MODE_LINEAR);
-
-    surfaceState->setTileMode(static_cast<typename RENDER_SURFACE_STATE::TILE_MODE>(tileMode));
-
-    surfaceState->setMemoryObjectControlState(gmmHelper.getMOCS(GMM_RESOURCE_USAGE_OCL_IMAGE));
-
-    surfaceState->setCoherencyType(RENDER_SURFACE_STATE::COHERENCY_TYPE_GPU_COHERENT);
-
-    surfaceState->setMultisampledSurfaceStorageFormat(RENDER_SURFACE_STATE::MULTISAMPLED_SURFACE_STORAGE_FORMAT::MULTISAMPLED_SURFACE_STORAGE_FORMAT_MSS);
-
-    surfaceState->setSurfaceBaseAddress(gpuAddress + surfaceOffsets.offset);
-    surfaceState->setXOffset(surfaceOffsets.xOffset);
-    surfaceState->setYOffset(surfaceOffsets.yOffset);
-
-    if (isNV12Format) {
-        surfaceState->setShaderChannelSelectAlpha(RENDER_SURFACE_STATE::SHADER_CHANNEL_SELECT_ONE);
-        surfaceState->setYOffsetForUOrUvPlane(surfaceOffsets.yOffsetForUVplane);
-        surfaceState->setXOffsetForUOrUvPlane(surfaceOffsets.xOffset);
+template <typename SurfaceState>
+uint32_t getSurfaceStateCompressionFormatIfSupported(const SurfaceState &surfaceState) {
+    if constexpr (SurfaceStateHasCompressionFormat<SurfaceState>::value) {
+        return static_cast<uint32_t>(surfaceState.getCompressionFormat());
     } else {
-        surfaceState->setShaderChannelSelectAlpha(RENDER_SURFACE_STATE::SHADER_CHANNEL_SELECT_ALPHA);
-        surfaceState->setYOffsetForUOrUvPlane(0);
-        surfaceState->setXOffsetForUOrUvPlane(0);
+        return 0u;
     }
+}
 
-    surfaceState->setSurfaceFormat(static_cast<SURFACE_FORMAT>(imageInfo.surfaceFormat->genxSurfaceFormat));
-    setFilterMode<GfxFamily>(surfaceState, gmmHelper.getHardwareInfo());
+template <typename SurfaceState, typename = void>
+struct SurfaceStateHasOverrideTileBpp : std::false_type {};
+template <typename SurfaceState>
+struct SurfaceStateHasOverrideTileBpp<SurfaceState, std::void_t<decltype(std::declval<const SurfaceState>().getOverrideTileBPP())>> : std::true_type {};
+
+template <typename SurfaceState>
+uint32_t getSurfaceStateOverrideTileBppIfSupported(const SurfaceState &surfaceState) {
+    if constexpr (SurfaceStateHasOverrideTileBpp<SurfaceState>::value) {
+        return static_cast<uint32_t>(surfaceState.getOverrideTileBPP());
+    } else {
+        return 0u;
+    }
 }
 
 template <typename GfxFamily>
-inline void setImageSurfaceStateDimensions(typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, const ImageInfo &imageInfo, uint32_t cubeFaceIndex, typename GfxFamily::RENDER_SURFACE_STATE::SURFACE_TYPE surfaceType) {
-    auto imageCount = std::max(imageInfo.imgDesc.imageDepth, imageInfo.imgDesc.imageArraySize);
-    if (imageCount == 0) {
-        imageCount = 1;
-    }
+class ImageSurfaceStateHelper {
+  public:
+    using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
+    using SURFACE_TYPE = typename RENDER_SURFACE_STATE::SURFACE_TYPE;
 
-    auto imageHeight = imageInfo.imgDesc.imageHeight;
-    if (imageHeight == 0) {
-        imageHeight = 1;
-    }
-
-    auto imageWidth = imageInfo.imgDesc.imageWidth;
-    if (imageWidth == 0) {
-        imageWidth = 1;
-    }
-
-    if (cubeFaceIndex != __GMM_NO_CUBE_MAP) {
-        imageCount = __GMM_MAX_CUBE_FACE - cubeFaceIndex;
-    }
-
-    surfaceState->setWidth(static_cast<uint32_t>(imageWidth));
-    surfaceState->setHeight(static_cast<uint32_t>(imageHeight));
-    surfaceState->setDepth(static_cast<uint32_t>(imageCount));
-    surfaceState->setSurfacePitch(static_cast<uint32_t>(imageInfo.imgDesc.imageRowPitch));
-    surfaceState->setSurfaceType(surfaceType);
-}
-
-template <typename GfxFamily>
-inline void setWidthForMediaBlockSurfaceState(typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, const ImageInfo &imageInfo) {
-    auto elSize = imageInfo.surfaceFormat->imageElementSizeInBytes;
-    auto numDwords = static_cast<uint32_t>(Math::divideAndRoundUp(imageInfo.imgDesc.imageWidth * elSize, sizeof(uint32_t)));
-    surfaceState->setWidth(numDwords);
-}
-
-template <typename GfxFamily>
-inline void setUnifiedAuxBaseAddress(typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, const Gmm *gmm) {
-    uint64_t baseAddress = surfaceState->getSurfaceBaseAddress() +
-                           gmm->gmmResourceInfo->getUnifiedAuxSurfaceOffset(GMM_UNIFIED_AUX_TYPE::GMM_AUX_SURF);
-    surfaceState->setAuxiliarySurfaceBaseAddress(baseAddress);
-}
-
-template <typename GfxFamily>
-void setMipTailStartLod(typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, Gmm *gmm);
-
+    static void setImageSurfaceState(RENDER_SURFACE_STATE *surfaceState, const ImageInfo &imageInfo, Gmm *gmm, GmmHelper &gmmHelper, uint32_t cubeFaceIndex, uint64_t gpuAddress, const SurfaceOffsets &surfaceOffsets, bool isNV12Format, uint32_t &minimumArrayElement, uint32_t &renderTargetViewExtent);
+    static void setImageSurfaceStateDimensions(RENDER_SURFACE_STATE *surfaceState, const ImageInfo &imageInfo, uint32_t cubeFaceIndex, SURFACE_TYPE surfaceType, uint32_t &depth);
+    static void setWidthForMediaBlockSurfaceState(RENDER_SURFACE_STATE *surfaceState, const ImageInfo &imageInfo);
+    static void setUnifiedAuxBaseAddress(RENDER_SURFACE_STATE *surfaceState, const Gmm *gmm);
+    static void setMipTailStartLOD(RENDER_SURFACE_STATE *surfaceState, Gmm *gmm);
+    static bool imageAsArrayWithArraySizeOf1NotPreferred();
+};
 } // namespace NEO

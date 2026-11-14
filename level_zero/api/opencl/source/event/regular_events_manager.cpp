@@ -1,0 +1,120 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/api/opencl/source/event/regular_events_manager.h"
+
+#include "level_zero/api/opencl/source/l0_dispatch/leo_l0_dispatch.h"
+
+#include <algorithm>
+#include <utility>
+
+namespace NEO {
+namespace LEO {
+
+RegularEventsManager::RegularEventsManager(ze_context_handle_t contextHandle, std::vector<ze_device_handle_t> devices)
+    : contextHandle(contextHandle), devices(std::move(devices)) {}
+
+RegularEventsManager::~RegularEventsManager() {
+    for (auto *group : {&hostVisibleGroup, &timestampGroup}) {
+        for (auto event : group->freeEvents) {
+            zeEventDestroy(event);
+        }
+        for (auto event : group->pendingEvents) {
+            zeEventDestroy(event);
+        }
+        for (auto pool : group->pools) {
+            zeEventPoolDestroy(pool);
+        }
+    }
+}
+
+ze_event_handle_t RegularEventsManager::obtainEvent(bool timestamp) {
+    std::lock_guard<std::mutex> lock(this->mtx);
+
+    auto &group = this->getGroup(timestamp);
+    if (!group.freeEvents.empty()) {
+        auto event = group.freeEvents.back();
+        group.freeEvents.pop_back();
+        if (ZE_RESULT_SUCCESS == zeEventHostReset(event)) {
+            return event;
+        }
+        zeEventDestroy(event);
+    }
+
+    if (group.createdFromLatestPool < eventCountInPool) {
+        return this->createEvent(group, timestamp);
+    }
+
+    auto pendingEvent = this->takeCompletedPendingEvent(group);
+    if (pendingEvent != nullptr) {
+        return pendingEvent;
+    }
+
+    return this->createEvent(group, timestamp);
+}
+
+void RegularEventsManager::returnEvent(ze_event_handle_t event, bool timestamp) {
+    std::lock_guard<std::mutex> lock(this->mtx);
+
+    auto &group = this->getGroup(timestamp);
+    if (zeEventQueryStatus(event) == ZE_RESULT_SUCCESS) {
+        group.freeEvents.push_back(event);
+    } else {
+        group.pendingEvents.push_back(event);
+    }
+}
+
+ze_event_handle_t RegularEventsManager::takeCompletedPendingEvent(EventPoolGroup &group) {
+    auto isCompleted = [](ze_event_handle_t event) { return zeEventQueryStatus(event) == ZE_RESULT_SUCCESS; };
+    auto completedBegin = std::find_if(group.pendingEvents.begin(), group.pendingEvents.end(), isCompleted);
+    if (completedBegin == group.pendingEvents.end()) {
+        return nullptr;
+    }
+    auto completedEnd = std::find_if_not(std::next(completedBegin), group.pendingEvents.end(), isCompleted);
+    group.freeEvents.insert(group.freeEvents.end(), completedBegin, completedEnd);
+    group.pendingEvents.erase(completedBegin, completedEnd);
+
+    auto event = group.freeEvents.back();
+    group.freeEvents.pop_back();
+    if (ZE_RESULT_SUCCESS == zeEventHostReset(event)) {
+        return event;
+    }
+    zeEventDestroy(event);
+    return nullptr;
+}
+
+ze_event_handle_t RegularEventsManager::createEvent(EventPoolGroup &group, bool timestamp) {
+    if (group.createdFromLatestPool >= eventCountInPool) {
+        ze_event_pool_flags_t poolFlags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+        if (timestamp) {
+            poolFlags |= ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+        }
+        ze_event_pool_desc_t eventPoolDesc{ZE_STRUCTURE_TYPE_EVENT_POOL_DESC, nullptr, poolFlags, eventCountInPool};
+        ze_event_pool_handle_t pool{};
+        auto poolResult = zeEventPoolCreate(this->contextHandle, &eventPoolDesc, static_cast<uint32_t>(this->devices.size()), this->devices.data(), &pool);
+        if (ZE_RESULT_SUCCESS != poolResult) [[unlikely]] {
+            return nullptr;
+        }
+        group.pools.push_back(pool);
+        group.createdFromLatestPool = 0u;
+    }
+
+    ze_event_handle_t event{};
+    ze_event_desc_t eventDesc{ZE_STRUCTURE_TYPE_EVENT_DESC, nullptr, group.createdFromLatestPool,
+                              ZE_EVENT_SCOPE_FLAG_HOST | ZE_EVENT_SCOPE_FLAG_DEVICE,
+                              ZE_EVENT_SCOPE_FLAG_HOST | ZE_EVENT_SCOPE_FLAG_DEVICE};
+    auto eventResult = zeEventCreate(group.pools.back(), &eventDesc, &event);
+    if (ZE_RESULT_SUCCESS != eventResult) [[unlikely]] {
+        return nullptr;
+    }
+    group.createdFromLatestPool++;
+
+    return event;
+}
+
+} // namespace LEO
+} // namespace NEO

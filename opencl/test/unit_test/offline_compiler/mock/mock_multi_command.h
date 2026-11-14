@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/offline_compiler/source/multi_command.h"
+#include "shared/offline_compiler/source/ocloc_api.h"
 
 #include "opencl/test/unit_test/offline_compiler/mock/mock_argument_helper.h"
 
@@ -32,8 +33,9 @@ class MockMultiCommand : public MultiCommand {
     using MultiCommand::splitLineInSeparateArgs;
 
     MockMultiCommand() : MultiCommand{} {
+        filesMap[clCopybufferFilename] = kernelSources;
         uniqueHelper = std::make_unique<MockOclocArgHelper>(filesMap);
-        uniqueHelper->setAllCallBase(true);
+        uniqueHelper->setAllCallBase(false);
         argHelper = uniqueHelper.get();
     }
 
@@ -46,13 +48,15 @@ class MockMultiCommand : public MultiCommand {
             return MultiCommand::singleBuild(args);
         }
 
-        return OclocErrorCode::SUCCESS;
+        return OCLOC_SUCCESS;
     }
 
     std::map<std::string, std::string> filesMap{};
     std::unique_ptr<MockOclocArgHelper> uniqueHelper{};
     int singleBuildCalledCount{0};
     bool callBaseSingleBuild{true};
+    const std::string clCopybufferFilename = "some_kernel.cl";
+    std::string kernelSources = "example_kernel(){}";
 };
 
 } // namespace NEO

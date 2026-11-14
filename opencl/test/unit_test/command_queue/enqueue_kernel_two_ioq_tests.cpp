@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/test_macros/test.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/event/event.h"
@@ -82,13 +83,12 @@ struct TwoIOQsTwoDependentWalkers : public HelloWorldTest<HelloWorldFixtureFacto
         delete e1;
         delete e2;
 
-        typedef typename FamilyType::WALKER_TYPE GPGPU_WALKER;
-        itorWalker1 = find<GPGPU_WALKER *>(cmdList.begin(), cmdList.end());
+        itorWalker1 = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
         ASSERT_NE(cmdList.end(), itorWalker1);
 
         itorWalker2 = itorWalker1;
         ++itorWalker2;
-        itorWalker2 = find<GPGPU_WALKER *>(itorWalker2, cmdList.end());
+        itorWalker2 = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(itorWalker2, cmdList.end());
         ASSERT_NE(cmdList.end(), itorWalker2);
     }
 
@@ -102,13 +102,13 @@ HWTEST_F(TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThe
     EXPECT_NE(itorWalker1, itorWalker2);
 }
 
-HWTEST2_F(TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeHpcCore) {
+HWTEST2_F(TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeCore) {
     parseWalkers<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState) {
+HWTEST2_F(TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState, IsGen12LP) {
     parseWalkers<FamilyType>();
 
     auto numCommands = getCommandsList<typename FamilyType::MEDIA_VFE_STATE>().size();
@@ -116,11 +116,16 @@ HWCMDTEST_F(IGFX_GEN8_CORE, TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhe
 }
 
 HWTEST_F(TwoIOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipeControlIsInsertedBetweenWalkers) {
-    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
     parseWalkers<FamilyType>();
     auto itorCmd = find<PIPE_CONTROL *>(itorWalker1, itorWalker2);
 
     // Should find a PC.
-    EXPECT_NE(itorWalker2, itorCmd);
+
+    if (pCmdQ2->getGpgpuCommandStreamReceiver().isUpdateTagFromWaitEnabled()) {
+        EXPECT_EQ(itorWalker2, itorCmd);
+    } else {
+        EXPECT_NE(itorWalker2, itorCmd);
+    }
 }

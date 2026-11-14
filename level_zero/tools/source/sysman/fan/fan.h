@@ -1,26 +1,24 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "level_zero/api/sysman/zes_handles_struct.h"
 #include <level_zero/zes_api.h>
 
 #include <memory>
 #include <mutex>
 #include <vector>
 
-struct _zes_fan_handle_t {
-    virtual ~_zes_fan_handle_t() = default;
-};
-
 namespace L0 {
 
 struct OsSysman;
 class Fan : _zes_fan_handle_t {
   public:
+    virtual ~Fan() = default;
     virtual ze_result_t fanGetProperties(zes_fan_properties_t *pProperties) = 0;
     virtual ze_result_t fanGetConfig(zes_fan_config_t *pConfig) = 0;
     virtual ze_result_t fanSetDefaultMode() = 0;
@@ -35,7 +33,7 @@ class Fan : _zes_fan_handle_t {
     bool initSuccess = false;
 };
 struct FanHandleContext {
-    FanHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    FanHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     ~FanHandleContext();
 
     void init();

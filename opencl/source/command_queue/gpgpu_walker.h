@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,37 +8,38 @@
 #pragma once
 
 #include "shared/source/command_stream/linear_stream.h"
-#include "shared/source/command_stream/preemption.h"
-#include "shared/source/helpers/register_offsets.h"
 #include "shared/source/indirect_heap/indirect_heap.h"
 
-#include "opencl/source/command_queue/cl_local_work_size.h"
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/helpers/hardware_commands_helper.h"
 
 namespace NEO {
+class DispatchInfo;
 class Surface;
 struct RootDeviceEnvironment;
 
 template <typename GfxFamily>
 using MI_STORE_REG_MEM = typename GfxFamily::MI_STORE_REGISTER_MEM_CMD;
 
+struct FlushL3Args {
+    bool containsPrintBuffer;
+    bool usingSharedObjects;
+    bool signalEvent;
+    bool blocking;
+    bool usingSystemAllocation;
+};
+
 template <typename GfxFamily>
 class GpgpuWalkerHelper {
-    using WALKER_TYPE = typename GfxFamily::WALKER_TYPE;
+    using DefaultWalkerType = typename GfxFamily::DefaultWalkerType;
 
   public:
-    static void applyWADisableLSQCROPERFforOCL(LinearStream *pCommandStream,
-                                               const Kernel &kernel,
-                                               bool disablePerfMode);
-
-    static size_t getSizeForWADisableLSQCROPERFforOCL(const Kernel *pKernel);
     static size_t getSizeForWaDisableRccRhwoOptimization(const Kernel *pKernel);
 
+    template <typename WalkerType>
     static size_t setGpgpuWalkerThreadData(
-        WALKER_TYPE *walkerCmd,
+        WalkerType *walkerCmd,
         const KernelDescriptor &kernelDescriptor,
-        const size_t globalOffsets[3],
         const size_t startWorkGroups[3],
         const size_t numWorkGroups[3],
         const size_t localWorkSizesIn[3],
@@ -67,22 +68,27 @@ class GpgpuWalkerHelper {
         TagNodeBase &hwPerfCounter,
         LinearStream *commandStream);
 
+    template <typename WalkerType>
     static void setupTimestampPacket(
         LinearStream *cmdStream,
-        WALKER_TYPE *walkerCmd,
+        WalkerType *walkerCmd,
         TagNodeBase *timestampPacketNode,
         const RootDeviceEnvironment &rootDeviceEnvironment);
+
+    template <typename WalkerType>
+    static void setupPostSyncFlushAndMocs(WalkerType &walkerCmd, const RootDeviceEnvironment &rootDeviceEnvironment);
+
+    template <typename WalkerType>
+    static void setupTimestampPacketFlushL3(
+        WalkerType &walkerCmd, CommandQueue &commandQueue, const FlushL3Args &args);
 
     static void adjustMiStoreRegMemMode(MI_STORE_REG_MEM<GfxFamily> *storeCmd);
 
   private:
     using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
 
-    static void addAluReadModifyWriteRegister(
-        LinearStream *pCommandStream,
-        uint32_t aluRegister,
-        AluRegisters operation,
-        uint32_t mask);
+    template <typename WalkerType>
+    static void setSystolicModeEnable(WalkerType *walkerCmd);
 };
 
 template <typename GfxFamily>
@@ -91,9 +97,9 @@ struct EnqueueOperation {
     static size_t getTotalSizeRequiredCS(uint32_t eventType, const CsrDependencies &csrDeps, bool reserveProfilingCmdsSpace, bool reservePerfCounters, bool blitEnqueue, CommandQueue &commandQueue, const MultiDispatchInfo &multiDispatchInfo, bool isMarkerWithProfiling, bool eventsInWaitList, bool resolveDependenciesByPipecontrol, cl_event *outEvent);
     static size_t getSizeRequiredCS(uint32_t cmdType, bool reserveProfilingCmdsSpace, bool reservePerfCounters, CommandQueue &commandQueue, const Kernel *pKernel, const DispatchInfo &dispatchInfo);
     static size_t getSizeRequiredForTimestampPacketWrite();
-    static size_t getSizeForCacheFlushAfterWalkerCommands(const Kernel &kernel, const CommandQueue &commandQueue);
 
   private:
+    template <typename WalkerType>
     static size_t getSizeRequiredCSKernel(bool reserveProfilingCmdsSpace, bool reservePerfCounters, CommandQueue &commandQueue, const Kernel *pKernel, const DispatchInfo &dispatchInfo);
     static size_t getSizeRequiredCSNonKernel(bool reserveProfilingCmdsSpace, bool reservePerfCounters, CommandQueue &commandQueue);
 };
@@ -113,14 +119,15 @@ IndirectHeap &getIndirectHeap(CommandQueue &commandQueue, const MultiDispatchInf
 
     // clang-format off
     switch (heapType) {
-    case IndirectHeap::Type::DYNAMIC_STATE:   expectedSize = HardwareCommandsHelper<GfxFamily>::getTotalSizeRequiredDSH(multiDispatchInfo); break;
-    case IndirectHeap::Type::INDIRECT_OBJECT: expectedSize = HardwareCommandsHelper<GfxFamily>::getTotalSizeRequiredIOH(multiDispatchInfo); break;
-    case IndirectHeap::Type::SURFACE_STATE:   expectedSize = HardwareCommandsHelper<GfxFamily>::getTotalSizeRequiredSSH(multiDispatchInfo); break;
+    case IndirectHeap::Type::dynamicState:   expectedSize = HardwareCommandsHelper<GfxFamily>::getTotalSizeRequiredDSH(multiDispatchInfo); break;
+    case IndirectHeap::Type::indirectObject: expectedSize = HardwareCommandsHelper<GfxFamily>::getTotalSizeRequiredIOH(multiDispatchInfo); break;
+    case IndirectHeap::Type::surfaceState:   expectedSize = HardwareCommandsHelper<GfxFamily>::getTotalSizeRequiredSSH(multiDispatchInfo); break;
     }
     // clang-format on
 
-    if (ih == nullptr)
+    if (ih == nullptr) {
         ih = &commandQueue.getIndirectHeap(heapType, expectedSize);
+    }
 
     return *ih;
 }

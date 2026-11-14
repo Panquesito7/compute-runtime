@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,26 +8,30 @@
 #pragma once
 #include <cstdint>
 
-#ifndef KMD_PROFILING
-#define KMD_PROFILING 0
-#endif
-
 namespace NEO {
-enum CommandStreamReceiverType {
+enum class CommandStreamReceiverType {
     // Use receiver for real HW
-    CSR_HW = 0,
+    hardware = 0,
     // Capture an AUB file automatically for all traffic going through Device -> CommandStreamReceiver
-    CSR_AUB,
+    aub,
     // Capture an AUB and tunnel all commands going through Device -> CommandStreamReceiver to a TBX server
-    CSR_TBX,
+    tbx,
     // Use receiver for real HW and capture AUB file
-    CSR_HW_WITH_AUB,
+    hardwareWithAub,
     // Use TBX server and capture AUB file
-    CSR_TBX_WITH_AUB,
+    tbxWithAub,
+    // all traffic goes through AUB path but aubstream creates no file
+    nullAub,
     // Number of CSR types
-    CSR_TYPES_NUM
+    typesNum
 };
 
+inline CommandStreamReceiverType obtainCsrTypeFromIntegerValue(int32_t selectedCsrType, CommandStreamReceiverType defaultType) {
+    if (selectedCsrType >= 0 && selectedCsrType < static_cast<int32_t>(CommandStreamReceiverType::typesNum)) {
+        return static_cast<CommandStreamReceiverType>(selectedCsrType);
+    }
+    return defaultType;
+}
 // AUB file folder location
 extern const char *folderAUB;
 

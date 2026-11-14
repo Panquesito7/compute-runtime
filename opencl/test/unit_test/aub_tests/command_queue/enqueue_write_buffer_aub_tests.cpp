@@ -1,18 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/device/device.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include <memory>
+#include <new>
+#include <vector>
 
 using namespace NEO;
 
@@ -35,23 +39,21 @@ typedef WriteBufferHw AUBWriteBuffer;
 HWTEST_P(AUBWriteBuffer, WhenWritingBufferThenExpectationsAreMet) {
     MockContext context(this->pCmdQ->getDevice().getSpecializedDevice<ClDevice>());
 
-    cl_float *srcMemory = new float[1024];
-    cl_float *destMemory = new float[1024];
-    cl_float *zeroMemory = new float[1024];
+    cl_float srcMemory[1024];
+    cl_float destMemory[1024] = {};
+    cl_float zeroMemory[1024] = {};
 
     for (int i = 0; i < 1024; i++) {
-        srcMemory[i] = (float)i + 1.0f;
-        destMemory[i] = 0;
-        zeroMemory[i] = 0;
+        srcMemory[i] = static_cast<float>(i) + 1.0f;
     }
 
     auto retVal = CL_INVALID_VALUE;
-    auto dstBuffer = Buffer::create(
+    std::unique_ptr<Buffer> dstBuffer(Buffer::create(
         &context,
         CL_MEM_USE_HOST_PTR,
         1024 * sizeof(float),
         destMemory,
-        retVal);
+        retVal));
     ASSERT_NE(nullptr, dstBuffer);
 
     auto pSrcMemory = &srcMemory[0];
@@ -65,7 +67,7 @@ HWTEST_P(AUBWriteBuffer, WhenWritingBufferThenExpectationsAreMet) {
 
     dstBuffer->forceDisallowCPUCopy = true;
     retVal = pCmdQ->enqueueWriteBuffer(
-        dstBuffer,
+        dstBuffer.get(),
         blockingWrite,
         offset,
         sizeWritten,
@@ -75,40 +77,36 @@ HWTEST_P(AUBWriteBuffer, WhenWritingBufferThenExpectationsAreMet) {
         eventWaitList,
         event);
 
-    auto pDestMemory = reinterpret_cast<decltype(destMemory)>((dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress()));
+    auto pDestMemory = reinterpret_cast<cl_float *>(ptrOffset(dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), dstBuffer->getOffset()));
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    // Compute our memory expecations based on kernel execution
+    // Compute our memory expectations based on kernel execution
     size_t sizeUserMemory = 1024 * sizeof(float);
     auto pVal = ptrOffset(pDestMemory, offset);
-    AUBCommandStreamFixture::expectMemory<FamilyType>(pVal, pSrcMemory, sizeWritten);
+    expectMemory<FamilyType>(pVal, pSrcMemory, sizeWritten);
 
     // if offset provided, check the beginning
     if (offset > 0) {
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, zeroMemory, offset);
+        expectMemory<FamilyType>(pDestMemory, zeroMemory, offset);
     }
     // If the copykernel wasn't max sized, ensure we didn't overwrite existing memory
     if (offset + sizeWritten < sizeUserMemory) {
         pDestMemory = ptrOffset(pVal, sizeWritten);
 
         size_t sizeRemaining = sizeUserMemory - sizeWritten - offset;
-        AUBCommandStreamFixture::expectMemory<FamilyType>(pDestMemory, zeroMemory, sizeRemaining);
+        expectMemory<FamilyType>(pDestMemory, zeroMemory, sizeRemaining);
     }
-    delete dstBuffer;
-    delete[] srcMemory;
-    delete[] destMemory;
-    delete[] zeroMemory;
 }
 
-INSTANTIATE_TEST_CASE_P(AUBWriteBuffer_simple,
-                        AUBWriteBuffer,
-                        ::testing::Values(
-                            0 * sizeof(cl_float),
-                            1 * sizeof(cl_float),
-                            2 * sizeof(cl_float),
-                            3 * sizeof(cl_float)));
+INSTANTIATE_TEST_SUITE_P(AUBWriteBuffer_simple,
+                         AUBWriteBuffer,
+                         ::testing::Values(
+                             0 * sizeof(cl_float),
+                             1 * sizeof(cl_float),
+                             2 * sizeof(cl_float),
+                             3 * sizeof(cl_float)));
 
 struct AUBWriteBufferUnaligned
     : public CommandEnqueueAUBFixture,
@@ -123,28 +121,11 @@ struct AUBWriteBufferUnaligned
     }
 
     template <typename FamilyType>
-    void testWriteBufferUnaligned(size_t offset, size_t size) {
-        MockContext context(pCmdQ->getDevice().getSpecializedDevice<ClDevice>());
-
+    void testWriteBufferUnaligned(Buffer *buffer, char *bufferGPUPtr, size_t offset, size_t size) {
         char srcMemory[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        const auto bufferSize = sizeof(srcMemory);
-        char dstMemory[bufferSize] = {0};
 
-        auto retVal = CL_INVALID_VALUE;
-
-        auto buffer = std::unique_ptr<Buffer>(Buffer::create(
-            &context,
-            CL_MEM_USE_HOST_PTR,
-            bufferSize,
-            dstMemory,
-            retVal));
-        ASSERT_NE(nullptr, buffer);
-
-        buffer->forceDisallowCPUCopy = true;
-
-        // Do unaligned write
-        retVal = pCmdQ->enqueueWriteBuffer(
-            buffer.get(),
+        auto retVal = pCmdQ->enqueueWriteBuffer(
+            buffer,
             CL_TRUE,
             offset,
             size,
@@ -155,18 +136,33 @@ struct AUBWriteBufferUnaligned
             nullptr);
         EXPECT_EQ(CL_SUCCESS, retVal);
 
-        // Check the memory
-        auto bufferGPUPtr = reinterpret_cast<char *>((buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress()));
-        AUBCommandStreamFixture::expectMemory<FamilyType>(ptrOffset(bufferGPUPtr, offset), ptrOffset(srcMemory, offset), size);
+        expectMemory<FamilyType>(ptrOffset(bufferGPUPtr, offset), ptrOffset(srcMemory, offset), size);
     }
 };
 
 HWTEST_F(AUBWriteBufferUnaligned, GivenOffsetAndSizeWhenWritingBufferThenExpectationsAreMet) {
-    const std::vector<size_t> offsets = {0, 1, 2, 3};
-    const std::vector<size_t> sizes = {4, 3, 2, 1};
+    MockContext context(pCmdQ->getDevice().getSpecializedDevice<ClDevice>());
+
+    constexpr auto bufferSize = sizeof("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    char dstMemory[bufferSize] = {};
+
+    cl_int retVal = CL_INVALID_VALUE;
+    auto buffer = std::unique_ptr<Buffer>(Buffer::create(
+        &context,
+        CL_MEM_USE_HOST_PTR,
+        bufferSize,
+        dstMemory,
+        retVal));
+    ASSERT_NE(nullptr, buffer);
+    buffer->forceDisallowCPUCopy = true;
+
+    auto *bufferGPUPtr = reinterpret_cast<char *>(ptrOffset(buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), buffer->getOffset()));
+
+    static constexpr size_t offsets[] = {0, 1, 2, 3};
+    static constexpr size_t sizes[] = {4, 3, 2, 1};
     for (auto offset : offsets) {
         for (auto size : sizes) {
-            testWriteBufferUnaligned<FamilyType>(offset, size);
+            testWriteBufferUnaligned<FamilyType>(buffer.get(), bufferGPUPtr, offset, size);
         }
     }
 }

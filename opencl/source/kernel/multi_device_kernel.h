@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,6 +15,9 @@
 namespace NEO {
 class ClDeviceVector;
 class MultiGraphicsAllocation;
+class Context;
+class MemObj;
+class MultiDeviceKernel;
 
 template <>
 struct OpenCLObjectMapper<_cl_kernel> {
@@ -34,8 +37,8 @@ class MultiDeviceKernel : public BaseObject<_cl_kernel> {
     Kernel *getKernel(uint32_t rootDeviceIndex) const { return kernels[rootDeviceIndex]; }
     Kernel *getDefaultKernel() const { return defaultKernel; }
 
-    template <typename kernel_t = Kernel, typename program_t = Program, typename multi_device_kernel_t = MultiDeviceKernel>
-    static multi_device_kernel_t *create(program_t *program, const KernelInfoContainer &kernelInfos, cl_int &errcodeRet) {
+    template <typename KernelType = Kernel, typename ProgramType = Program, typename MultiDeviceKernelType = MultiDeviceKernel>
+    static MultiDeviceKernelType *create(ProgramType *program, const KernelInfoContainer &kernelInfos, cl_int &errcodeRet) {
         KernelVectorType kernels{};
         kernels.resize(program->getMaxRootDeviceIndex() + 1);
 
@@ -44,12 +47,12 @@ class MultiDeviceKernel : public BaseObject<_cl_kernel> {
             if (kernels[rootDeviceIndex]) {
                 continue;
             }
-            kernels[rootDeviceIndex] = Kernel::create<kernel_t, program_t>(program, *kernelInfos[rootDeviceIndex], *pDevice, errcodeRet);
+            kernels[rootDeviceIndex] = Kernel::create<KernelType, ProgramType>(program, *kernelInfos[rootDeviceIndex], *pDevice, errcodeRet);
             if (!kernels[rootDeviceIndex]) {
                 return nullptr;
             }
         }
-        auto pMultiDeviceKernel = new multi_device_kernel_t(std::move(kernels), kernelInfos);
+        auto pMultiDeviceKernel = new MultiDeviceKernelType(std::move(kernels), kernelInfos);
 
         return pMultiDeviceKernel;
     }
@@ -78,6 +81,8 @@ class MultiDeviceKernel : public BaseObject<_cl_kernel> {
     const KernelInfoContainer &getKernelInfos() const { return kernelInfos; }
 
   protected:
+    MemObj *getMemObjArg(uint32_t argIndex, size_t argSize, const void *argVal) const;
+
     template <typename FuncType, typename... Args>
     cl_int getResultFromEachKernel(FuncType function, Args &&...args) const {
         cl_int retVal = CL_INVALID_VALUE;
@@ -96,7 +101,7 @@ class MultiDeviceKernel : public BaseObject<_cl_kernel> {
     void callOnEachKernel(FuncType function, Args &&...args) {
         for (auto &pKernel : kernels) {
             if (pKernel) {
-                (pKernel->*function)(std::forward<Args>(args)...);
+                (pKernel->*function)(args...);
             }
         }
     }

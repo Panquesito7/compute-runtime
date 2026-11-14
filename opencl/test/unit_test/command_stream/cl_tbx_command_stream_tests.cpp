@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/device/device.h"
 #include "shared/source/helpers/engine_control.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
@@ -16,7 +17,7 @@
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
@@ -24,8 +25,8 @@ using namespace NEO;
 using ClTbxCommandStreamTests = Test<ClDeviceFixture>;
 HWTEST_F(ClTbxCommandStreamTests, givenTbxCsrWhenDispatchBlitEnqueueThenProcessCorrectly) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableBlitterOperationsSupport.set(1);
-    DebugManager.flags.EnableBlitterForEnqueueOperations.set(1);
+    debugManager.flags.EnableBlitterOperationsSupport.set(1);
+    debugManager.flags.EnableBlitterForEnqueueOperations.set(1);
 
     MockContext context(pClDevice);
 
@@ -38,14 +39,16 @@ HWTEST_F(ClTbxCommandStreamTests, givenTbxCsrWhenDispatchBlitEnqueueThenProcessC
     tbxCsr0.setupContext(osContext0);
     EngineControl engineControl0{&tbxCsr0, &osContext0};
 
-    MockOsContext osContext1(1, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::Regular}, pDevice->getDeviceBitfield()));
-    tbxCsr1.setupContext(osContext0);
+    MockOsContext osContext1(1, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_BCS, EngineUsage::regular}, pDevice->getDeviceBitfield()));
+    tbxCsr1.setupContext(osContext1);
     EngineControl engineControl1{&tbxCsr1, &osContext1};
 
     MockCommandQueueHw<FamilyType> cmdQ(&context, pClDevice, nullptr);
     cmdQ.gpgpuEngine = &engineControl0;
     cmdQ.clearBcsEngines();
     cmdQ.bcsEngines[0] = &engineControl1;
+
+    cmdQ.bcsStates[0] = {aub_stream::ENGINE_BCS, 0, false};
 
     cl_int error = CL_SUCCESS;
     std::unique_ptr<Buffer> buffer(Buffer::create(&context, 0, 1, nullptr, error));

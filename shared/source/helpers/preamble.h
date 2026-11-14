@@ -1,12 +1,12 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +19,6 @@ class Device;
 struct DispatchFlags;
 class GraphicsAllocation;
 class LinearStream;
-class LogicalStateHelper;
 struct PipelineSelectArgs;
 struct StreamProperties;
 struct RootDeviceEnvironment;
@@ -28,34 +27,31 @@ template <typename GfxFamily>
 struct PreambleHelper {
     using MI_LOAD_REGISTER_IMM = typename GfxFamily::MI_LOAD_REGISTER_IMM;
     using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
-    using VFE_STATE_TYPE = typename GfxFamily::VFE_STATE_TYPE;
 
-    static void programL3(LinearStream *pCommandStream, uint32_t l3Config);
+    static void programL3(LinearStream *pCommandStream, uint32_t l3Config, bool isBcs);
     static void programPipelineSelect(LinearStream *pCommandStream,
                                       const PipelineSelectArgs &pipelineSelectArgs,
                                       const RootDeviceEnvironment &rootDeviceEnvironment);
-    static void programPreemption(LinearStream *pCommandStream, Device &device, GraphicsAllocation *preemptionCsr, LogicalStateHelper *logicalStateHelper);
+    static void programPreemption(LinearStream *pCommandStream, Device &device, GraphicsAllocation *preemptionCsr);
     static void addPipeControlBeforeVfeCmd(LinearStream *pCommandStream, const HardwareInfo *hwInfo, EngineGroupType engineGroupType);
     static void appendProgramVFEState(const RootDeviceEnvironment &rootDeviceEnvironment, const StreamProperties &streamProperties, void *cmd);
     static void *getSpaceForVfeState(LinearStream *pCommandStream,
                                      const HardwareInfo &hwInfo,
-                                     EngineGroupType engineGroupType);
+                                     EngineGroupType engineGroupType,
+                                     uint64_t *cmdBufferGpuAddress);
     static void programVfeState(void *pVfeState,
                                 const RootDeviceEnvironment &rootDeviceEnvironment,
                                 uint32_t scratchSize,
                                 uint64_t scratchAddress,
                                 uint32_t maxFrontEndThreads,
-                                const StreamProperties &streamProperties,
-                                LogicalStateHelper *logicalStateHelper);
+                                const StreamProperties &streamProperties);
     static uint64_t getScratchSpaceAddressOffsetForVfeState(LinearStream *pCommandStream, void *pVfeState);
     static void programPreamble(LinearStream *pCommandStream, Device &device, uint32_t l3Config,
-                                GraphicsAllocation *preemptionCsr, LogicalStateHelper *logicalStateHelper);
-    static void programKernelDebugging(LinearStream *pCommandStream);
-    static void programSemaphoreDelay(LinearStream *pCommandStream);
+                                GraphicsAllocation *preemptionCsr, bool isBcs);
+    static void programSemaphoreDelay(LinearStream *pCommandStream, bool isBcs);
     static uint32_t getL3Config(const HardwareInfo &hwInfo, bool useSLM);
     static bool isSystolicModeConfigurable(const RootDeviceEnvironment &rootDeviceEnvironment);
     static size_t getAdditionalCommandsSize(const Device &device);
-    static std::vector<int32_t> getSupportedThreadArbitrationPolicies();
     static size_t getVFECommandsSize();
     static size_t getKernelDebuggingCommandsSize(bool debuggingActive);
     static void programGenSpecificPreambleWorkArounds(LinearStream *pCommandStream, const HardwareInfo &hwInfo);
@@ -63,23 +59,24 @@ struct PreambleHelper {
     static size_t getCmdSizeForPipelineSelect(const RootDeviceEnvironment &rootDeviceEnvironment);
     static size_t getSemaphoreDelayCommandSize();
     static uint32_t getScratchSizeValueToProgramMediaVfeState(uint32_t scratchSize);
+    static void setSingleSliceDispatchMode(void *cmd, bool enable);
 };
 
-template <PRODUCT_FAMILY ProductFamily>
+template <PRODUCT_FAMILY productFamily>
 static uint32_t getL3ConfigHelper(bool useSLM);
 
-template <PRODUCT_FAMILY ProductFamily>
+template <PRODUCT_FAMILY productFamily>
 struct L3CNTLREGConfig {
     static const uint32_t valueForSLM;
     static const uint32_t valueForNoSLM;
 };
 
-template <PRODUCT_FAMILY ProductFamily>
+template <PRODUCT_FAMILY productFamily>
 uint32_t getL3ConfigHelper(bool useSLM) {
     if (!useSLM) {
-        return L3CNTLREGConfig<ProductFamily>::valueForNoSLM;
+        return L3CNTLREGConfig<productFamily>::valueForNoSLM;
     }
-    return L3CNTLREGConfig<ProductFamily>::valueForSLM;
+    return L3CNTLREGConfig<productFamily>::valueForSLM;
 }
 
 template <typename GfxFamily>

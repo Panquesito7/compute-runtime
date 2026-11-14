@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,7 +9,7 @@
 #include "shared/source/command_stream/device_command_stream.h"
 #include "shared/source/command_stream/submission_status.h"
 
-struct COMMAND_BUFFER_HEADER_REC;
+struct COMMAND_BUFFER_HEADER_REC; // NOLINT(readability-identifier-naming), forward declaration from sharedata_wrapper.h
 
 namespace NEO {
 class GmmPageTableMngr;
@@ -26,22 +26,34 @@ class WddmCommandStreamReceiver : public DeviceCommandStreamReceiver<GfxFamily> 
     ~WddmCommandStreamReceiver() override;
 
     SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override;
-    SubmissionStatus processResidency(const ResidencyContainer &allocationsForResidency, uint32_t handleId) override;
+    SubmissionStatus processResidency(ResidencyContainer &allocationsForResidency, uint32_t handleId) override;
     void processEviction() override;
     bool waitForFlushStamp(FlushStamp &flushStampToWait) override;
+    WaitStatus waitForFlushStamp(FlushStamp &flushStampToWait, uint64_t timeoutNanoseconds) override;
+    std::unique_ptr<KmdWaiter> createKmdWaiter(FlushStamp flushStamp, TaskCountType taskCount) override;
+    bool isTlbFlushRequiredForStateCacheFlush() override;
 
     WddmMemoryManager *getMemoryManager() const;
     Wddm *peekWddm() const {
         return wddm;
     }
     GmmPageTableMngr *createPageTableManager() override;
-
+    void flushMonitorFence(bool notifyKmd) override;
+    void setupContext(OsContext &osContext) override;
+    bool waitUserFenceSupported(SyncFence *syncFence) override;
+    bool waitUserFence(TaskCountType waitValue, uint64_t hostAddress, int64_t timeout, bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait, SyncFence *fence) override;
+    void allocateUserFence(std::unique_ptr<SyncFence> &mf) override;
+    bool submitExternalSemaphoreWaits(std::span<const ExternalSemaphoreOperation> waits) override;
     using CommandStreamReceiver::pageTableManager;
 
   protected:
-    void kmDafLockAllocations(ResidencyContainer &allocationsForResidency);
+    void addToEvictionContainer(GraphicsAllocation &gfxAllocation) override;
+    bool validForEnqueuePagingFence(uint64_t pagingFenceValue) const;
 
     Wddm *wddm;
     COMMAND_BUFFER_HEADER_REC *commandBufferHeader;
+
+    bool requiresBlockingResidencyHandling = true;
+    uint64_t lastEnqueuedPagingFenceValue = 0;
 };
 } // namespace NEO

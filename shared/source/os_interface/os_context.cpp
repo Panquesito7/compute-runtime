@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 #include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/os_interface/product_helper.h"
 
 namespace NEO {
 OsContext::OsContext(uint32_t rootDeviceIndex, uint32_t contextId, const EngineDescriptor &engineDescriptor)
@@ -22,16 +23,24 @@ OsContext::OsContext(uint32_t rootDeviceIndex, uint32_t contextId, const EngineD
       numSupportedDevices(static_cast<uint32_t>(engineDescriptor.deviceBitfield.count())),
       engineType(engineDescriptor.engineTypeUsage.first),
       engineUsage(engineDescriptor.engineTypeUsage.second),
-      rootDevice(engineDescriptor.isRootDevice),
-      engineInstancedDevice(engineDescriptor.isEngineInstanced) {}
+      rootDevice(engineDescriptor.isRootDevice) {
+    if (engineUsage == EngineUsage::powerHint) {
+        powerHintValue = powerHintMax;
+    }
+}
+
+void OsContext::adjustSettings(const ProductHelper &productHelper) {
+    initializeInternalEngineImmediately = productHelper.initializeInternalEngineImmediately();
+    directSubmissionSupported = productHelper.isDirectSubmissionSupported();
+}
 
 bool OsContext::isImmediateContextInitializationEnabled(bool isDefaultEngine) const {
-    if (DebugManager.flags.DeferOsContextInitialization.get() == 0) {
+    if (debugManager.flags.DeferOsContextInitialization.get() == 0) {
         return true;
     }
 
-    if (engineUsage == EngineUsage::Internal) {
-        return true;
+    if (engineUsage == EngineUsage::internal) {
+        return initializeInternalEngineImmediately || engineType == aub_stream::EngineType::ENGINE_BCS;
     }
 
     if (isDefaultEngine) {
@@ -47,13 +56,13 @@ bool OsContext::isImmediateContextInitializationEnabled(bool isDefaultEngine) co
 
 bool OsContext::ensureContextInitialized() {
     std::call_once(contextInitializedFlag, [this] {
-        if (DebugManager.flags.PrintOsContextInitializations.get()) {
-            printf("OsContext initialization: contextId=%d usage=%s type=%s isRootDevice=%d\n",
-                   contextId,
-                   EngineHelpers::engineUsageToString(engineUsage).c_str(),
-                   EngineHelpers::engineTypeToString(engineType).c_str(),
-                   static_cast<int>(rootDevice));
-        }
+        PRINT_STRING(debugManager.flags.PrintOsContextInitializations.get(), stdout,
+                     "OsContext initialization: contextId=%d usage=%s type=%s isRootDevice=%d priorityLevel=%s\n",
+                     contextId,
+                     EngineHelpers::engineUsageToString(engineUsage).c_str(),
+                     EngineHelpers::engineTypeToString(engineType).c_str(),
+                     static_cast<int>(rootDevice),
+                     hasPriorityLevel() ? std::to_string(getPriorityLevel()).c_str() : "std::nullopt");
 
         if (!initializeContext()) {
             contextInitialized = false;
@@ -65,14 +74,15 @@ bool OsContext::ensureContextInitialized() {
 }
 
 bool OsContext::isDirectSubmissionAvailable(const HardwareInfo &hwInfo, bool &submitOnInit) {
-    bool enableDirectSubmission = this->isDirectSubmissionSupported(hwInfo);
+    bool enableDirectSubmission = this->isDirectSubmissionSupported() &&
+                                  this->getUmdPowerHintValue() < NEO::OsContext::getUmdPowerHintMax();
 
-    if (DebugManager.flags.SetCommandStreamReceiver.get() > 0) {
+    if (debugManager.flags.SetCommandStreamReceiver.get() > 0 && !debugManager.isDirectSubmissionInSimulationModeEnabled()) {
         enableDirectSubmission = false;
     }
 
-    if (DebugManager.flags.EnableDirectSubmission.get() != -1) {
-        enableDirectSubmission = DebugManager.flags.EnableDirectSubmission.get();
+    if (debugManager.flags.EnableDirectSubmission.get() != -1) {
+        enableDirectSubmission = debugManager.flags.EnableDirectSubmission.get();
     }
 
     if (enableDirectSubmission) {
@@ -81,17 +91,10 @@ bool OsContext::isDirectSubmissionAvailable(const HardwareInfo &hwInfo, bool &su
             hwInfo.capabilityTable.directSubmissionEngines.data[contextEngineType];
 
         bool startDirect = true;
-        if (!this->isDefaultContext()) {
+        if (this->isLowPriority() || this->isInternalEngine()) {
+            startDirect &= false;
+        } else if (!this->isDefaultContext()) {
             startDirect = directSubmissionProperty.useNonDefault;
-        }
-        if (this->isLowPriority()) {
-            startDirect = directSubmissionProperty.useLowPriority;
-        }
-        if (this->isInternalEngine()) {
-            startDirect = directSubmissionProperty.useInternal;
-        }
-        if (this->isRootDevice()) {
-            startDirect = directSubmissionProperty.useRootDevice;
         }
 
         submitOnInit = directSubmissionProperty.submitOnInit;
@@ -113,23 +116,23 @@ bool OsContext::checkDirectSubmissionSupportsEngine(const DirectSubmissionProper
     bool supported = directSubmissionProperty.engineSupported;
     startOnInit = directSubmissionProperty.submitOnInit;
     if (EngineHelpers::isBcs(contextEngineType)) {
-        int32_t blitterOverrideKey = DebugManager.flags.DirectSubmissionOverrideBlitterSupport.get();
+        int32_t blitterOverrideKey = debugManager.flags.DirectSubmissionOverrideBlitterSupport.get();
         if (blitterOverrideKey != -1) {
             supported = blitterOverrideKey == 0 ? false : true;
             startOnInit = blitterOverrideKey == 1 ? true : false;
         }
-    } else if (contextEngineType == aub_stream::ENGINE_RCS) {
-        int32_t renderOverrideKey = DebugManager.flags.DirectSubmissionOverrideRenderSupport.get();
-        if (renderOverrideKey != -1) {
-            supported = renderOverrideKey == 0 ? false : true;
-            startOnInit = renderOverrideKey == 1 ? true : false;
-        }
-    } else {
-        // assume else is CCS
-        int32_t computeOverrideKey = DebugManager.flags.DirectSubmissionOverrideComputeSupport.get();
+    } else if (EngineHelpers::isCcs(contextEngineType)) {
+        int32_t computeOverrideKey = debugManager.flags.DirectSubmissionOverrideComputeSupport.get();
         if (computeOverrideKey != -1) {
             supported = computeOverrideKey == 0 ? false : true;
             startOnInit = computeOverrideKey == 1 ? true : false;
+        }
+    } else {
+        // assume else is RCS
+        int32_t renderOverrideKey = debugManager.flags.DirectSubmissionOverrideRenderSupport.get();
+        if (renderOverrideKey != -1) {
+            supported = renderOverrideKey == 0 ? false : true;
+            startOnInit = renderOverrideKey == 1 ? true : false;
         }
     }
 

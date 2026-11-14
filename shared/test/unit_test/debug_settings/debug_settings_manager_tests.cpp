@@ -1,25 +1,115 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/debug_settings/definitions/translate_debug_settings.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/flush_caches_bitmask.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/memory_manager/svm_allocation_cache.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
+#include "shared/source/os_interface/debug_env_reader.h"
 #include "shared/source/utilities/debug_file_reader.h"
 #include "shared/source/utilities/logger.h"
 #include "shared/test/common/debug_settings/debug_settings_manager_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/gtest_helpers.h"
+#include "shared/test/common/helpers/mock_file_io.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_io_functions.h"
+#include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
+#include "shared/test/common/mocks/mock_settings_reader.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
-#include <cstdio>
 #include <memory>
+#include <regex>
 #include <sstream>
 #include <string>
+
+namespace NEO {
+extern ApiSpecificConfig::ApiType apiTypeForUlts;
+} // namespace NEO
+
+template <typename VariableT, typename ValueT>
+concept PubliclyMutableDebugVariable = requires(VariableT &variable, ValueT value) {
+    variable.set(value);
+};
+
+namespace {
+template <typename DataT, typename ValueT, typename DefaultT>
+FORCE_NOINLINE void expectDefaultValue(const char *variableName, const ValueT &value, DefaultT defaultValue) {
+    EXPECT_TRUE(TestDebugFlagsChecker::isEqual(value, static_cast<DataT>(defaultValue))) << variableName;
+}
+
+template <typename ValueT, typename DefaultT>
+FORCE_NOINLINE void expectDumpedValue(MockSettingsFileReader &reader, const char *variableName, const ValueT &value, DefaultT defaultValue) {
+    DebugVarPrefix type;
+    EXPECT_EQ(value, reader.getSetting(variableName, defaultValue, type)) << variableName;
+}
+
+void expectAllDebugVariablesDumped(FullyEnabledTestDebugManager &debugManager, MockSettingsFileReader &reader) {
+#define DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description) \
+    expectDumpedValue(reader, #variableName, debugManager.flags.variableName.get(), defaultValue);
+#define DECLARE_DEBUG_SCOPED_V(dataType, variableName, defaultValue, description, ...) \
+    DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
+#define DECLARE_DEBUG_VARIABLE_OPT(enabled, dataType, variableName, defaultValue, description) DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
+#include "debug_variables.inl"
+#undef DECLARE_DEBUG_VARIABLE_OPT
+#undef DECLARE_DEBUG_SCOPED_V
+#undef DECLARE_DEBUG_VARIABLE
+}
+} // namespace
+
+TEST(DebugVariables, givenCompileTimeVariablesWhenCheckingTheirClassificationThenOnlyRuntimeAndReleaseVariablesAreMutable) {
+    NEO::DebugVariablesT<true> debugVariables;
+
+    static_assert(debugVariables.useCompileTimeVariables);
+
+#define DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description) \
+    static_assert(!PubliclyMutableDebugVariable<decltype(debugVariables.variableName), dataType>);
+#define DECLARE_DEBUG_SCOPED_V(dataType, variableName, defaultValue, scope, description) \
+    DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
+#define DECLARE_RUNTIME_DEBUG_VARIABLE(dataType, variableName, defaultValue, description) \
+    static_assert(PubliclyMutableDebugVariable<decltype(debugVariables.variableName), dataType>);
+#define DECLARE_DEBUG_VARIABLE_OPT(enabled, dataType, variableName, defaultValue, description) \
+    DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
+#include "debug_variables.inl"
+#undef DECLARE_DEBUG_VARIABLE_OPT
+#undef DECLARE_RUNTIME_DEBUG_VARIABLE
+#undef DECLARE_DEBUG_SCOPED_V
+#undef DECLARE_DEBUG_VARIABLE
+
+#define DECLARE_RELEASE_VARIABLE(dataType, variableName, defaultValue, description) \
+    static_assert(PubliclyMutableDebugVariable<decltype(debugVariables.variableName), dataType>);
+#define DECLARE_RELEASE_VARIABLE_OPT(enabled, dataType, variableName, defaultValue, description) \
+    DECLARE_RELEASE_VARIABLE(dataType, variableName, defaultValue, description)
+#include "release_variables.inl"
+#undef DECLARE_RELEASE_VARIABLE_OPT
+#undef DECLARE_RELEASE_VARIABLE
+
+    using CompileTimeVariable = decltype(debugVariables.EnableSWTags);
+    static_assert(!CompileTimeVariable::get());
+
+    EXPECT_FALSE(debugVariables.EnableSWTags.getRef());
+
+    EXPECT_EQ("unk", debugVariables.OverrideGdiPath.get());
+    debugVariables.OverrideGdiPath.set("test_gdi");
+    EXPECT_EQ("test_gdi", debugVariables.OverrideGdiPath.get());
+
+    EXPECT_EQ(-1, debugVariables.L2ClosNumCacheWays.get());
+
+    EXPECT_EQ(-1, debugVariables.EnableLEO.get());
+    debugVariables.EnableLEO.set(1);
+    EXPECT_EQ(1, debugVariables.EnableLEO.get());
+}
 
 TEST(DebugSettingsManager, WhenDebugManagerIsCreatedThenInjectFcnIsNull) {
     FullyEnabledTestDebugManager debugManager;
@@ -42,33 +132,38 @@ TEST(DebugSettingsManager, WhenDebugManagerIsDisabledThenDebugFunctionalityIsNot
     EXPECT_TRUE(debugManager.disabled());
 
 // debug variables / flags set to default
-#define DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)                                                  \
-    {                                                                                                                              \
-        bool isEqual = TestDebugFlagsChecker::isEqual(debugManager.flags.variableName.get(), static_cast<dataType>(defaultValue)); \
-        EXPECT_TRUE(isEqual);                                                                                                      \
-    }
-#include "shared/source/debug_settings/release_variables.inl"
-
+#define DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description) \
+    expectDefaultValue<dataType>(#variableName, debugManager.flags.variableName.get(), defaultValue);
+#define DECLARE_DEBUG_SCOPED_V(dataType, variableName, defaultValue, description, ...) \
+    DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
+#define DECLARE_DEBUG_VARIABLE_OPT(enabled, dataType, variableName, defaultValue, description) DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
 #include "debug_variables.inl"
+#define DECLARE_RELEASE_VARIABLE(dataType, variableName, defaultValue, description) DECLARE_DEBUG_VARIABLE(dataType, variableName, defaultValue, description)
+#define DECLARE_RELEASE_VARIABLE_OPT(enabled, dataType, variableName, defaultValue, description) DECLARE_RELEASE_VARIABLE(dataType, variableName, defaultValue, description)
+#include "release_variables.inl"
+#undef DECLARE_RELEASE_VARIABLE_OPT
+#undef DECLARE_RELEASE_VARIABLE
+#undef DECLARE_DEBUG_VARIABLE_OPT
+#undef DECLARE_DEBUG_SCOPED_V
 #undef DECLARE_DEBUG_VARIABLE
 }
 
 TEST(DebugSettingsManager, whenDebugManagerIsDisabledThenDebugFunctionalityIsNotAvailableAtCompileTime) {
-    TestDebugSettingsManager<DebugFunctionalityLevel::None> debugManager;
+    TestDebugSettingsManager<DebugFunctionalityLevel::none> debugManager;
 
     static_assert(debugManager.disabled(), "");
     static_assert(false == debugManager.registryReadAvailable(), "");
 }
 
 TEST(DebugSettingsManager, whenDebugManagerIsFullyEnabledThenAllDebugFunctionalityIsAvailableAtCompileTime) {
-    TestDebugSettingsManager<DebugFunctionalityLevel::Full> debugManager;
+    TestDebugSettingsManager<DebugFunctionalityLevel::full> debugManager;
 
     static_assert(false == debugManager.disabled(), "");
     static_assert(debugManager.registryReadAvailable(), "");
 }
 
 TEST(DebugSettingsManager, whenOnlyRegKeysAreEnabledThenAllOtherDebugFunctionalityIsNotAvailableAtCompileTime) {
-    TestDebugSettingsManager<DebugFunctionalityLevel::RegKeys> debugManager;
+    TestDebugSettingsManager<DebugFunctionalityLevel::regKeys> debugManager;
 
     static_assert(false == debugManager.disabled(), "");
     static_assert(debugManager.registryReadAvailable(), "");
@@ -95,7 +190,7 @@ TEST(DebugSettingsManager, givenTwoPossibleVariantsOfHardwareInfoOverrideStringT
 
 TEST(DebugSettingsManager, givenStringDebugVariableWhenLongValueExeedingSmallStringOptimizationIsAssignedThenMemoryLeakIsNotReported) {
     DebugManagerStateRestore debugManagerStateRestore;
-    DebugManager.flags.AUBDumpCaptureFileName.set("ThisIsVeryLongStringValueThatExceedSizeSpecifiedBySmallStringOptimizationAndCausesInternalStringBufferResize");
+    debugManager.flags.AUBDumpCaptureFileName.set("ThisIsVeryLongStringValueThatExceedSizeSpecifiedBySmallStringOptimizationAndCausesInternalStringBufferResize");
 }
 
 TEST(DebugSettingsManager, givenNullAsReaderImplInDebugManagerWhenSettingReaderImplThenItsSetProperly) {
@@ -114,83 +209,188 @@ TEST(DebugSettingsManager, givenReaderImplInDebugManagerWhenSettingDifferentRead
     EXPECT_EQ(readerImpl2, debugManager.getReaderImpl());
 }
 
-TEST(DebugSettingsManager, givenPrintDebugSettingsEnabledWhenCallingDumpFlagsThenFlagsAreWrittenToDumpFile) {
-    testing::internal::CaptureStdout();
-    FullyEnabledTestDebugManager debugManager;
-    debugManager.flags.PrintDebugSettings.set(true);
-    debugManager.flags.LoopAtDriverInit.set(true);
-    debugManager.flags.Enable64kbpages.set(1);
-    debugManager.flags.TbxServer.set("192.168.0.1");
+struct DumpedFlagPrefix {
+    DebugVarPrefix type;
+    const char *string;
+};
 
-    // Clear dump files and generate new
-    std::remove(FullyEnabledTestDebugManager::settingsDumpFileName);
+struct DumpFlagsPrefixTestParams {
+    ApiSpecificConfig::ApiType apiType;
+    DumpedFlagPrefix printDebugSettings;
+    DumpedFlagPrefix loopAtDriverInit;
+    DumpedFlagPrefix enable64kbpages;
+    DumpedFlagPrefix tbxServer;
+};
+
+namespace {
+constexpr DumpedFlagPrefix noPrefix{DebugVarPrefix::none, ""};
+constexpr DumpedFlagPrefix neoPrefix{DebugVarPrefix::neo, "NEO_"};
+constexpr DumpedFlagPrefix neoL0Prefix{DebugVarPrefix::neoL0, "NEO_L0_"};
+constexpr DumpedFlagPrefix neoOclPrefix{DebugVarPrefix::neoOcl, "NEO_OCL_"};
+
+void configureDumpedFlags(FullyEnabledTestDebugManager &debugManager, const DumpFlagsPrefixTestParams &params) {
+    debugManager.flags.PrintDebugSettings.set(true);
+    debugManager.flags.PrintDebugSettings.setPrefixType(params.printDebugSettings.type);
+    debugManager.flags.LoopAtDriverInit.set(true);
+    debugManager.flags.LoopAtDriverInit.setPrefixType(params.loopAtDriverInit.type);
+    debugManager.flags.Enable64kbpages.set(1);
+    debugManager.flags.Enable64kbpages.setPrefixType(params.enable64kbpages.type);
+    debugManager.flags.TbxServer.set("192.168.0.1");
+    debugManager.flags.TbxServer.setPrefixType(params.tbxServer.type);
+}
+
+void expectDumpedLine(const std::string &dumpedFlags, const std::string &expectedLine) {
+    EXPECT_NE(std::string::npos, dumpedFlags.find("\n" + expectedLine + "\n")) << expectedLine;
+}
+} // namespace
+
+TEST(DebugSettingsManager, givenPrintDebugSettingsEnabledWhenCallingDumpFlagsThenAllFlagsAreWrittenToDumpFile) {
+    StreamCapture capture;
+    capture.captureStdout();
+    FullyEnabledTestDebugManager debugManager;
+
+    VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+    configureDumpedFlags(debugManager, {ApiSpecificConfig::L0, noPrefix, noPrefix, noPrefix, noPrefix});
+
+    removeVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName);
     debugManager.dumpFlags();
 
-    // Validate allSettingsDumpFile
-    SettingsFileReader allSettingsReader{FullyEnabledTestDebugManager::settingsDumpFileName};
-#define DECLARE_DEBUG_VARIABLE(dataType, varName, defaultValue, description) \
-    EXPECT_EQ(debugManager.flags.varName.get(), allSettingsReader.getSetting(#varName, defaultValue));
+    MockSettingsFileReader allSettingsReader{FullyEnabledTestDebugManager::settingsDumpFileName};
+    expectAllDebugVariablesDumped(debugManager, allSettingsReader);
 
-#include "debug_variables.inl"
-#undef DECLARE_DEBUG_VARIABLE
-    std::remove(FullyEnabledTestDebugManager::settingsDumpFileName);
-    std::string output = testing::internal::GetCapturedStdout();
+    removeVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName);
+    EXPECT_NE(0u, capture.getCapturedStdout().size());
+}
+
+using DebugSettingsManagerDumpFlagsPrefixTest = ::testing::TestWithParam<DumpFlagsPrefixTestParams>;
+
+TEST_P(DebugSettingsManagerDumpFlagsPrefixTest, givenPrintDebugSettingsEnabledWithPrefixWhenCallingDumpFlagsThenFlagsAreWrittenToDumpFile) {
+    const auto &params = GetParam();
+    StreamCapture capture;
+    capture.captureStdout();
+    FullyEnabledTestDebugManager debugManager;
+
+    auto apiType = params.apiType;
+    VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, apiType);
+    configureDumpedFlags(debugManager, params);
+
+    removeVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName);
+    debugManager.dumpFlags();
+
+    size_t dumpFileSize = 0;
+    auto dumpFileData = loadDataFromVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName, dumpFileSize);
+    ASSERT_NE(nullptr, dumpFileData);
+    const std::string dumpedFlags = "\n" + std::string(dumpFileData.get(), dumpFileSize);
+    expectDumpedLine(dumpedFlags, std::string(params.printDebugSettings.string) + "PrintDebugSettings = 1");
+    expectDumpedLine(dumpedFlags, std::string(params.loopAtDriverInit.string) + "LoopAtDriverInit = 1");
+    expectDumpedLine(dumpedFlags, std::string(params.enable64kbpages.string) + "Enable64kbpages = 1");
+    expectDumpedLine(dumpedFlags, std::string(params.tbxServer.string) + "TbxServer = 192.168.0.1");
+    expectDumpedLine(dumpedFlags, "MakeEachEnqueueBlocking = 0");
+    expectDumpedLine(dumpedFlags, "OverrideGpuAddressSpace = -1");
+    expectDumpedLine(dumpedFlags, "ProductFamilyOverride = unk");
+
+    removeVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName);
+    std::string output = capture.getCapturedStdout();
     ASSERT_NE(0u, output.size());
 
-    EXPECT_NE(std::string::npos, output.find("Non-default value of debug variable: TbxServer = 192.168.0.1"));
-    EXPECT_NE(std::string::npos, output.find("Non-default value of debug variable: LoopAtDriverInit = 1"));
-    EXPECT_NE(std::string::npos, output.find("Non-default value of debug variable: PrintDebugSettings = 1"));
-    EXPECT_NE(std::string::npos, output.find("Non-default value of debug variable: Enable64kbpages = 1"));
+    const std::string nonDefaultValuePrefix = "Non-default value of debug variable: ";
+    EXPECT_NE(std::string::npos, output.find(nonDefaultValuePrefix + params.tbxServer.string + "TbxServer = 192.168.0.1"));
+    EXPECT_NE(std::string::npos, output.find(nonDefaultValuePrefix + params.loopAtDriverInit.string + "LoopAtDriverInit = 1"));
+    EXPECT_NE(std::string::npos, output.find(nonDefaultValuePrefix + params.printDebugSettings.string + "PrintDebugSettings = 1"));
+    EXPECT_NE(std::string::npos, output.find(nonDefaultValuePrefix + params.enable64kbpages.string + "Enable64kbpages = 1"));
+}
+
+INSTANTIATE_TEST_SUITE_P(AllPrefixes,
+                         DebugSettingsManagerDumpFlagsPrefixTest,
+                         ::testing::Values(DumpFlagsPrefixTestParams{ApiSpecificConfig::L0, noPrefix, noPrefix, noPrefix, noPrefix},
+                                           DumpFlagsPrefixTestParams{ApiSpecificConfig::L0, neoPrefix, neoPrefix, neoPrefix, neoPrefix},
+                                           DumpFlagsPrefixTestParams{ApiSpecificConfig::L0, neoL0Prefix, neoL0Prefix, neoL0Prefix, neoL0Prefix},
+                                           DumpFlagsPrefixTestParams{ApiSpecificConfig::OCL, neoOclPrefix, neoOclPrefix, neoOclPrefix, neoOclPrefix},
+                                           DumpFlagsPrefixTestParams{ApiSpecificConfig::L0, neoL0Prefix, neoPrefix, noPrefix, neoL0Prefix}));
+
+TEST(DebugSettingsManager, givenPrintDebugSettingsEnabledWhenReleaseAndEnvVariablesAreNonDefaultThenDumpFlagsWritesThem) {
+    StreamCapture capture;
+    capture.captureStdout();
+    FullyEnabledTestDebugManager debugManager;
+
+    VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+    debugManager.flags.PrintDebugSettings.set(true);
+    debugManager.flags.PrintDebugSettings.setPrefixType(DebugVarPrefix::none);
+
+    // Release variable example.
+    debugManager.flags.EnableLEO.set(1);
+
+    // Env variable example whose C++ member name differs from its real, external env name -
+    // the dump must use the real name ("HOME"), never the translated member name ("EnvHome").
+    debugManager.flags.EnvHome.set("/custom/home");
+
+    removeVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName);
+    debugManager.dumpFlags();
+
+    MockSettingsFileReader allSettingsReader{FullyEnabledTestDebugManager::settingsDumpFileName};
+    DebugVarPrefix type;
+    EXPECT_EQ(1, allSettingsReader.getSetting("EnableLEO", -1, type));
+    EXPECT_STREQ("/custom/home", allSettingsReader.getSetting("HOME", std::string("")).c_str());
+
+    removeVirtualFile(FullyEnabledTestDebugManager::settingsDumpFileName);
+    std::string output = capture.getCapturedStdout();
+    ASSERT_NE(0u, output.size());
+
+    EXPECT_NE(std::string::npos, output.find("Non-default value of debug variable: EnableLEO = 1"));
+    EXPECT_EQ(std::string::npos, output.find("EnableLEO = 1 (env-only variable)"));
+
+    EXPECT_NE(std::string::npos, output.find("Non-default value of debug variable: HOME = /custom/home (env-only variable)"));
+    EXPECT_EQ(std::string::npos, output.find("EnvHome"));
 }
 
 TEST(DebugSettingsManager, givenPrintDebugSettingsEnabledOnDisabledDebugManagerWhenCallingDumpFlagsThenFlagsAreNotWrittenToDumpFile) {
-    testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     FullyDisabledTestDebugManager debugManager;
     debugManager.flags.PrintDebugSettings.set(true);
 
-    std::remove(FullyDisabledTestDebugManager::settingsDumpFileName);
+    removeVirtualFile(FullyDisabledTestDebugManager::settingsDumpFileName);
     debugManager.dumpFlags();
-    std::remove(FullyDisabledTestDebugManager::settingsDumpFileName);
+    removeVirtualFile(FullyDisabledTestDebugManager::settingsDumpFileName);
 
-    std::string output = testing::internal::GetCapturedStdout();
+    std::string output = capture.getCapturedStdout();
     ASSERT_EQ(0u, output.size());
 }
 
 TEST(AllocationInfoLogging, givenBaseGraphicsAllocationWhenGettingImplementationSpecificAllocationInfoThenReturnEmptyInfoString) {
-    GraphicsAllocation graphicsAllocation(0, AllocationType::UNKNOWN, nullptr, 0, 0, MemoryPool::MemoryNull, MemoryManager::maxOsContextCount, 0llu);
+    GraphicsAllocation graphicsAllocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount, 0llu);
     EXPECT_STREQ(graphicsAllocation.getAllocationInfoString().c_str(), "");
 }
 
-TEST(DebugSettingsManager, givenDisabledDebugManagerWhenCreateThenOnlyReleaseVariablesAreRead) {
-    bool settingsFileExists = fileExists(SettingsReader::settingsFileName);
-    if (!settingsFileExists) {
-        const char data[] = "LogApiCalls = 1\nMakeAllBuffersResident = 1";
-        writeDataToFile(SettingsReader::settingsFileName, &data, sizeof(data));
-    }
+TEST(AllocationInfoLogging, givenBaseGraphicsAllocationWhenGettingImplementationSpecificPatIndexInfoThenReturnEmptyInfoString) {
+    GraphicsAllocation graphicsAllocation(0, 1u /*num gmms*/, AllocationType::unknown, nullptr, 0, 0, MemoryPool::memoryNull, MemoryManager::maxOsContextCount, 0llu);
 
-    SettingsReader *reader = SettingsReader::createFileReader();
+    MockProductHelper productHelper{};
+    EXPECT_STREQ(graphicsAllocation.getPatIndexInfoString().c_str(), "");
+}
+
+TEST(DebugSettingsManager, givenDisabledDebugManagerWhenCreateThenOnlyReleaseVariablesAreRead) {
+    ASSERT_FALSE(virtualFileExists(SettingsReader::settingsFileName));
+    constexpr std::string_view data = "LogApiCalls = 1\nEnableLEO=1";
+    NEO::writeDataToFile(SettingsReader::settingsFileName, data, false);
+
+    SettingsReader *reader = MockSettingsReader::createFileReader();
     EXPECT_NE(nullptr, reader);
 
     FullyDisabledTestDebugManager debugManager;
     debugManager.setReaderImpl(reader);
     debugManager.injectSettingsFromReader();
-
-    EXPECT_EQ(1, debugManager.flags.MakeAllBuffersResident.get());
+    EXPECT_EQ(1, debugManager.flags.EnableLEO.get());
     EXPECT_EQ(0, debugManager.flags.LogApiCalls.get());
 
-    if (!settingsFileExists) {
-        remove(SettingsReader::settingsFileName);
-    }
+    removeVirtualFile(SettingsReader::settingsFileName);
 }
 
 TEST(DebugSettingsManager, givenEnabledDebugManagerWhenCreateThenAllVariablesAreRead) {
-    bool settingsFileExists = fileExists(SettingsReader::settingsFileName);
-    if (!settingsFileExists) {
-        const char data[] = "LogApiCalls = 1\nMakeAllBuffersResident = 1";
-        writeDataToFile(SettingsReader::settingsFileName, &data, sizeof(data));
-    }
+    constexpr std::string_view data = "LogApiCalls = 1\nMakeAllBuffersResident = 1";
+    NEO::writeDataToFile(SettingsReader::settingsFileName, data, false);
 
-    SettingsReader *reader = SettingsReader::createFileReader();
+    SettingsReader *reader = MockSettingsReader::createFileReader();
     EXPECT_NE(nullptr, reader);
 
     FullyEnabledTestDebugManager debugManager;
@@ -200,9 +400,7 @@ TEST(DebugSettingsManager, givenEnabledDebugManagerWhenCreateThenAllVariablesAre
     EXPECT_EQ(1, debugManager.flags.MakeAllBuffersResident.get());
     EXPECT_EQ(1, debugManager.flags.LogApiCalls.get());
 
-    if (!settingsFileExists) {
-        remove(SettingsReader::settingsFileName);
-    }
+    removeVirtualFile(SettingsReader::settingsFileName);
 }
 
 TEST(DebugSettingsManager, GivenLogsEnabledAndDumpToFileWhenPrintDebuggerLogCalledThenStringPrintedToFile) {
@@ -210,50 +408,496 @@ TEST(DebugSettingsManager, GivenLogsEnabledAndDumpToFileWhenPrintDebuggerLogCall
         GTEST_SKIP();
     }
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.DebuggerLogBitmask.set(NEO::DebugVariables::DEBUGGER_LOG_BITMASK::DUMP_TO_FILE);
+    NEO::debugManager.flags.DebuggerLogBitmask.set(NEO::DebugVariables::DEBUGGER_LOG_BITMASK::DUMP_TO_FILE);
 
     auto logFile = NEO::fileLoggerInstance().getLogFileName();
 
-    std::remove(logFile);
+    removeVirtualFile(logFile);
 
-    ::testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     PRINT_DEBUGGER_LOG(stdout, "test %s", "log");
-    auto output = ::testing::internal::GetCapturedStdout();
+    auto output = capture.getCapturedStdout();
     EXPECT_EQ(0u, output.size());
 
-    auto logFileExists = fileExists(logFile);
-    EXPECT_TRUE(logFileExists);
+    ASSERT_TRUE(virtualFileExists(logFile));
 
     size_t retSize;
-    auto data = loadDataFromFile(logFile, retSize);
+    auto data = loadDataFromVirtualFile(logFile, retSize);
 
     EXPECT_STREQ("test log", data.get());
-    std::remove(logFile);
+    removeVirtualFile(logFile);
 }
 
 TEST(DebugSettingsManager, GivenLogsDisabledAndDumpToFileWhenPrintDebuggerLogCalledThenStringIsNotPrintedToFile) {
-    if (!NEO::DebugManager.disabled()) {
+    if (!NEO::debugManager.disabled()) {
         GTEST_SKIP();
     }
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.DebuggerLogBitmask.set(NEO::DebugVariables::DEBUGGER_LOG_BITMASK::DUMP_TO_FILE);
+    NEO::debugManager.flags.DebuggerLogBitmask.set(NEO::DebugVariables::DEBUGGER_LOG_BITMASK::DUMP_TO_FILE);
 
     auto logFile = NEO::fileLoggerInstance().getLogFileName();
-    std::remove(logFile);
+    removeVirtualFile(logFile);
 
-    ::testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     PRINT_DEBUGGER_LOG(stdout, "test %s", "log");
 
-    auto output = ::testing::internal::GetCapturedStdout();
+    auto output = capture.getCapturedStdout();
     EXPECT_EQ(0u, output.size());
 
-    auto logFileExists = fileExists(logFile);
-    ASSERT_FALSE(logFileExists);
+    ASSERT_FALSE(virtualFileExists(logFile));
+}
+
+TEST(DebugSettingsManager, GivenLogsEnabledWhenLogCacheOperationCalledThenStringPrintedToFile) {
+    DebugManagerStateRestore restorer;
+    MockExecutionEnvironment executionEnvironment;
+    MockMemoryManager memoryManager(executionEnvironment);
+    auto &logger = executionEnvironment.getUsmReusePerfLogger();
+    if (!logger.enabled()) {
+        GTEST_SKIP();
+    }
+
+    auto logFile = logger.getLogFileName();
+    removeVirtualFile(logFile);
+
+    SVMAllocsManager::SvmAllocationCache svmAllocationCache;
+    svmAllocationCache.memoryManager = &memoryManager;
+    auto timePoint = std::chrono::high_resolution_clock::now();
+    svmAllocationCache.logCacheOperation({.allocationSize = 1024,
+                                          .timePoint = timePoint,
+                                          .allocationType = InternalMemoryType::deviceUnifiedMemory,
+                                          .operationType = SVMAllocsManager::SvmAllocationCache::CacheOperationType::trim,
+                                          .isSuccess = true});
+
+    auto logFileExists = NEO::fileExists(logFile);
+    EXPECT_TRUE(logFileExists);
+
+    size_t retSize;
+    auto data = loadDataFromVirtualFile(logFile, retSize);
+    auto retString = std::string(data.get(), data.get() + retSize);
+    std::stringstream expectedString;
+    expectedString << timePoint.time_since_epoch().count() << " , "
+                   << "device"
+                   << " , "
+                   << "trim"
+                   << " , "
+                   << "1024"
+                   << " , "
+                   << "TRUE";
+
+    EXPECT_NE(std::string::npos, retString.find(expectedString.str()));
+    removeVirtualFile(logFile);
 }
 
 TEST(DebugLog, WhenLogDebugStringCalledThenNothingIsPrintedToStdout) {
-    ::testing::internal::CaptureStdout();
+    StreamCapture capture;
+    capture.captureStdout();
     logDebugString("test log");
-    auto output = ::testing::internal::GetCapturedStdout();
+    auto output = capture.getCapturedStdout();
     EXPECT_EQ(0u, output.size());
+}
+
+TEST(DurationLogTest, givenDurationGetTimeStringThenTimeStringIsCorrect) {
+    auto timeString = DurationLog::getTimeString();
+    for (auto c : timeString) {
+        EXPECT_TRUE(std::isdigit(c) || c == '[' || c == ']' || c == '.' || c == ' ');
+    }
+}
+
+TEST(DebugSettingsManager, GivenTbxOrTbxWithAubCsrTypeAndTbxFaultsEnabledWhenCallingIsTbxMngrEnabledThenReturnTrue) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableTbxPageFaultManager.set(1);
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(2);
+    EXPECT_TRUE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(4);
+    EXPECT_TRUE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+}
+
+TEST(DebugSettingsManager, GivenTbxOrTbxWithAubCsrTypeAndAllElseDefaultWhenCallingIsTbxMngrEnabledThenReturnTrue) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(2);
+    EXPECT_TRUE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(4);
+    EXPECT_TRUE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+}
+
+TEST(DebugSettingsManager, GivenDefaultDirectSubmissionInSimulationModeWhenCheckingIfItIsEnabledThenReturnFalse) {
+    DebugManagerStateRestore restorer;
+    EXPECT_EQ(0, NEO::debugManager.flags.EnableDirectSubmissionInSimulationMode.get());
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::tbx));
+    EXPECT_FALSE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+}
+
+TEST(DebugSettingsManager, GivenTbxOnlyDirectSubmissionInSimulationModeWhenCheckingIfItIsEnabledThenReturnTrueOnlyForTbxCsrType) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableDirectSubmissionInSimulationMode.set(-1);
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::tbx));
+    EXPECT_TRUE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+
+    for (auto csrType : {CommandStreamReceiverType::hardware, CommandStreamReceiverType::aub, CommandStreamReceiverType::tbxWithAub, CommandStreamReceiverType::hardwareWithAub, CommandStreamReceiverType::nullAub}) {
+        NEO::debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(csrType));
+        EXPECT_FALSE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+    }
+}
+
+TEST(DebugSettingsManager, GivenTbxCsrTypeAndAllocationDumpSelectedWhenCheckingIfDirectSubmissionInSimulationModeIsEnabledThenReturnTrueOnlyWhenForced) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableDirectSubmissionInSimulationMode.set(-1);
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::tbx));
+
+    NEO::debugManager.flags.AUBDumpBufferFormat.set("BIN");
+    EXPECT_TRUE(NEO::debugManager.isAllocationDumpSelected());
+    EXPECT_FALSE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+
+    NEO::debugManager.flags.AUBDumpBufferFormat.set("unk");
+    NEO::debugManager.flags.AUBDumpImageFormat.set("BMP");
+    EXPECT_TRUE(NEO::debugManager.isAllocationDumpSelected());
+    EXPECT_FALSE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+
+    NEO::debugManager.flags.EnableDirectSubmissionInSimulationMode.set(1);
+    EXPECT_TRUE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+
+    NEO::debugManager.flags.AUBDumpImageFormat.set("unk");
+    EXPECT_FALSE(NEO::debugManager.isAllocationDumpSelected());
+}
+
+TEST(DebugSettingsManager, GivenDirectSubmissionInSimulationModeSetWhenCheckingIfItIsEnabledThenReturnSetValueForAnyCsrType) {
+    DebugManagerStateRestore restorer;
+
+    for (auto csrType : {CommandStreamReceiverType::aub, CommandStreamReceiverType::tbx, CommandStreamReceiverType::tbxWithAub, CommandStreamReceiverType::nullAub}) {
+        NEO::debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(csrType));
+
+        NEO::debugManager.flags.EnableDirectSubmissionInSimulationMode.set(0);
+        EXPECT_FALSE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+
+        NEO::debugManager.flags.EnableDirectSubmissionInSimulationMode.set(1);
+        EXPECT_TRUE(NEO::debugManager.isDirectSubmissionInSimulationModeEnabled());
+    }
+}
+
+TEST(DebugSettingsManager, givenFlushAllCachesWhenTranslateDebugSettingsThenOverrideEnv) {
+    DebugManagerStateRestore restorer;
+    {
+        NEO::debugManager.flags.FlushAllCaches.set(1);
+        translateDebugSettings(NEO::debugManager.flags);
+        EXPECT_EQ(NEO::debugManager.flags.FlushAllCaches.get(), FlushCachesBitmask::allCaches);
+    }
+
+    {
+        NEO::debugManager.flags.FlushAllCaches.set(1 | FlushCachesBitmask::dcFlush);
+        translateDebugSettings(NEO::debugManager.flags);
+        EXPECT_EQ(NEO::debugManager.flags.FlushAllCaches.get(), FlushCachesBitmask::allCaches);
+    }
+
+    {
+        NEO::debugManager.flags.FlushAllCaches.set(0);
+        translateDebugSettings(NEO::debugManager.flags);
+        EXPECT_EQ(NEO::debugManager.flags.FlushAllCaches.get(), 0);
+    }
+
+    {
+        NEO::debugManager.flags.FlushAllCaches.set(FlushCachesBitmask::constantCache);
+        translateDebugSettings(NEO::debugManager.flags);
+        EXPECT_EQ(NEO::debugManager.flags.FlushAllCaches.get(), FlushCachesBitmask::constantCache);
+    }
+}
+
+TEST(DebugSettingsManager, GivenTbxFaultsDisabledWhenCallingIsTbxMngrEnabledThenReturnFalse) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableTbxPageFaultManager.set(0);
+
+    EXPECT_FALSE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+}
+
+TEST(DebugSettingsManager, GivenHardwareOrHardwareWithAubCsrTypeAndTbxFaultsEnabledWhenCallingIsTbxMngrEnabledThenReturnFalse) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableTbxPageFaultManager.set(1);
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(1);
+    EXPECT_FALSE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(3);
+    EXPECT_FALSE(NEO::debugManager.isTbxPageFaultManagerEnabled());
+}
+
+TEST(DebugSettingsManager, whenDebugVariableDoesntMatchScopeThenIgnoreIt) {
+    auto defaultValue = debugManager.flags.TbxPort.get();
+    struct MockSettingFileReader : SettingsFileReader {
+        MockSettingFileReader() : SettingsFileReader("") {
+            settingStringMap["TbxPort"] = "1";
+            settingStringMap["NEO_TbxPort"] = "1";
+            settingStringMap["NEO_OCL_TbxPort"] = "2";
+            settingStringMap["NEO_L0_TbxPort"] = "3";
+        }
+    };
+
+    VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+    VariableBackup backupPrefixes(&validUltPrefixTypesOverride);
+
+    // EnvCachePersistent is a raw env variable - it is always read from the real OS environment,
+    // never from mockSettingsReader/a settings file, so it must be mocked separately here.
+    std::unordered_map<std::string, std::string> mockableEnvs = {{"NEO_CACHE_PERSISTENT", "1"}};
+    VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+    {
+        mockSettingsReader = std::make_unique<MockSettingFileReader>();
+        FullyEnabledTestDebugManager debugManager;
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_EQ(2, debugManager.flags.TbxPort.get());
+        EXPECT_EQ(1, debugManager.flags.EnvCachePersistent.get());
+    }
+
+    {
+        mockSettingsReader = std::make_unique<MockSettingFileReader>();
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        FullyEnabledTestDebugManager debugManager;
+        EXPECT_EQ(3, debugManager.flags.TbxPort.get());
+        EXPECT_EQ(1, debugManager.flags.EnvCachePersistent.get());
+    }
+
+    {
+        mockSettingsReader = std::make_unique<MockSettingFileReader>();
+        StackVec<DebugVarPrefix, 4> prefixes = {};
+        validUltPrefixTypesOverride = &prefixes;
+        FullyEnabledTestDebugManager debugManager;
+        EXPECT_EQ(defaultValue, debugManager.flags.TbxPort.get());
+        EXPECT_EQ(-1, debugManager.flags.EnvCachePersistent.get());
+    }
+}
+
+TEST(DebugSettingsManager, givenFileOrEnvironmentReaderActiveThenReleaseVariablesFallBackToEnvironmentWhileDebugVariablesDoNot) {
+    // Plays the role of a neo.config/igdrcl.config settings file. Deliberately has no entry for
+    // OverrideDefaultFP64Settings (a release variable, so it falls back to the environment) nor for
+    // LogApiCalls (a debug variable, so it does not).
+    struct MockSettingFileReader : SettingsFileReader {
+        MockSettingFileReader() : SettingsFileReader("") {
+            settingStringMap["EnableLEO"] = "1";
+        }
+    };
+
+    for (bool fileConfigPresent : {true, false}) {
+        // Must be set before FullyEnabledTestDebugManager is constructed - SettingsReaderCreator::
+        // create() picks it up as readerImpl right there, during construction.
+        VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+        VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+
+        // The real OS environment always holds a *different* value for EnableLEO than the file does,
+        // plus values for variables the file doesn't have - one release, one debug - and for the raw
+        // env variable.
+        std::unordered_map<std::string, std::string> mockableEnvs = {
+            {"EnableLEO", "2"},
+            {"OverrideDefaultFP64Settings", "5"},
+            {"LogApiCalls", "1"},
+            {"NEO_CACHE_PERSISTENT", "42"},
+        };
+        VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+        if (fileConfigPresent) {
+            // readerImpl becomes the settings file - authoritative for the keys it holds, with the
+            // environment still consulted for release variables it doesn't.
+            mockSettingsReader = std::make_unique<MockSettingFileReader>();
+        } else {
+            // No settings file - readerImpl falls back to the OS-native reader
+            mockSettingsReader = std::make_unique<EnvironmentVariableReader>();
+        }
+        FullyEnabledTestDebugManager debugManager;
+
+        if (fileConfigPresent) {
+            EXPECT_EQ(1, debugManager.flags.EnableLEO.get());
+            // The file has no entry for this debug variable, and an existing file suppresses
+            // environment reads for debug variables - so it stays at its default.
+            EXPECT_FALSE(debugManager.flags.LogApiCalls.get());
+        } else {
+            EXPECT_EQ(2, debugManager.flags.EnableLEO.get());
+            EXPECT_TRUE(debugManager.flags.LogApiCalls.get());
+        }
+
+        // A release variable the file doesn't hold still comes from the environment.
+        EXPECT_EQ(5, debugManager.flags.OverrideDefaultFP64Settings.get());
+
+        // Raw env variables are read through their own dedicated EnvironmentVariableReader,
+        // completely independent of readerImpl - always the real environment, in both branches above.
+        EXPECT_EQ(42, debugManager.flags.EnvCachePersistent.get());
+    }
+}
+
+TEST(DebugSettingsManager, givenEmptySettingsFileWhenEnvironmentHasValuesThenOnlyReleaseVariablesAreTakenFromIt) {
+    // An empty settings file still counts as "a settings file is present". Debug variables are then
+    // deliberately not read from the environment at all, while release variables are.
+    struct EmptyMockSettingFileReader : SettingsFileReader {
+        EmptyMockSettingFileReader() : SettingsFileReader("") {}
+    };
+
+    VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+    VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+
+    std::unordered_map<std::string, std::string> mockableEnvs = {
+        {"LogApiCalls", "1"},
+        {"OverrideDefaultFP64Settings", "5"},
+        {"NEO_CACHE_PERSISTENT", "42"},
+    };
+    VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+    mockSettingsReader = std::make_unique<EmptyMockSettingFileReader>();
+    // Fully enabled, so debug variables are genuinely eligible to be read - otherwise the debug-side
+    // expectation below would pass for the wrong reason.
+    FullyEnabledTestDebugManager debugManager;
+
+    EXPECT_FALSE(debugManager.flags.LogApiCalls.get());
+    EXPECT_EQ(5, debugManager.flags.OverrideDefaultFP64Settings.get());
+    EXPECT_EQ(42, debugManager.flags.EnvCachePersistent.get());
+}
+
+TEST(DebugSettingsManager, givenReleaseVariableInBothSettingsFileAndEnvironmentThenFileWinsRegardlessOfPrefixUsed) {
+    struct PrefixedCase {
+        const char *fileKey;
+        const char *envKey;
+        DebugVarPrefix expectedPrefix;
+    };
+
+    // The settings file always wins, whichever prefix either side happens to use - the file's own
+    // prefix scan is what picks the winner, and it reports the prefix the file entry was found under.
+    const PrefixedCase cases[] = {
+        {"NEO_OCL_OverrideDefaultFP64Settings", "NEO_OverrideDefaultFP64Settings", DebugVarPrefix::neoOcl},
+        {"NEO_OverrideDefaultFP64Settings", "NEO_OCL_OverrideDefaultFP64Settings", DebugVarPrefix::neo},
+        {"OverrideDefaultFP64Settings", "NEO_OverrideDefaultFP64Settings", DebugVarPrefix::none},
+    };
+
+    for (const auto &testCase : cases) {
+        VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+        VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+
+        std::unordered_map<std::string, std::string> mockableEnvs = {{testCase.envKey, "5"}};
+        VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+        struct MockSettingFileReader : SettingsFileReader {
+            MockSettingFileReader(const char *key) : SettingsFileReader("") {
+                settingStringMap[key] = "1";
+            }
+        };
+        mockSettingsReader = std::make_unique<MockSettingFileReader>(testCase.fileKey);
+        FullyEnabledTestDebugManager debugManager;
+
+        EXPECT_EQ(1, debugManager.flags.OverrideDefaultFP64Settings.get());
+        EXPECT_EQ(testCase.expectedPrefix, debugManager.flags.OverrideDefaultFP64Settings.getPrefixType());
+    }
+}
+
+TEST(DebugSettingsManager, givenReleaseVariableOnlyInEnvironmentUnderPrefixThenItIsUsedAndPrefixIsReported) {
+    struct EmptyMockSettingFileReader : SettingsFileReader {
+        EmptyMockSettingFileReader() : SettingsFileReader("") {}
+    };
+
+    VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+    VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+
+    std::unordered_map<std::string, std::string> mockableEnvs = {{"NEO_OCL_OverrideDefaultFP64Settings", "5"}};
+    VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+    mockSettingsReader = std::make_unique<EmptyMockSettingFileReader>();
+    FullyEnabledTestDebugManager debugManager;
+
+    EXPECT_EQ(5, debugManager.flags.OverrideDefaultFP64Settings.get());
+    EXPECT_EQ(DebugVarPrefix::neoOcl, debugManager.flags.OverrideDefaultFP64Settings.getPrefixType());
+}
+
+TEST(DebugSettingsManager, givenReleaseVariableInNeitherSettingsFileNorEnvironmentThenDefaultIsKept) {
+    struct EmptyMockSettingFileReader : SettingsFileReader {
+        EmptyMockSettingFileReader() : SettingsFileReader("") {}
+    };
+
+    VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+    VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+
+    std::unordered_map<std::string, std::string> mockableEnvs;
+    VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+    mockSettingsReader = std::make_unique<EmptyMockSettingFileReader>();
+    FullyEnabledTestDebugManager debugManager;
+
+    EXPECT_EQ(-1, debugManager.flags.OverrideDefaultFP64Settings.get());
+    EXPECT_EQ(DebugVarPrefix::none, debugManager.flags.OverrideDefaultFP64Settings.getPrefixType());
+}
+
+TEST(DebugSettingsManager, givenSettingsFileWithSomeDebugKeysThenDebugKeysMissingFromItStayAtDefaults) {
+    // Guards the scope boundary: the file reader is demonstrably being consulted (Enable64kbpages
+    // comes from it), yet a debug variable it lacks does not fall back to the environment.
+    struct MockSettingFileReader : SettingsFileReader {
+        MockSettingFileReader() : SettingsFileReader("") {
+            settingStringMap["Enable64kbpages"] = "1";
+        }
+    };
+
+    VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+    VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+
+    std::unordered_map<std::string, std::string> mockableEnvs = {
+        {"LogApiCalls", "1"},
+        {"NEO_OCL_MakeAllBuffersResident", "1"},
+    };
+    VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+    mockSettingsReader = std::make_unique<MockSettingFileReader>();
+    FullyEnabledTestDebugManager debugManager;
+
+    EXPECT_EQ(1, debugManager.flags.Enable64kbpages.get());
+    EXPECT_FALSE(debugManager.flags.LogApiCalls.get());
+    EXPECT_FALSE(debugManager.flags.MakeAllBuffersResident.get());
+}
+
+TEST(DebugSettingsManager, givenSettingsFileHasTheKeyWhenRefreshEnvVariablesIsCalledThenFileValueWinsOverLiveEnvironment) {
+    struct MockSettingFileReader : SettingsFileReader {
+        MockSettingFileReader() : SettingsFileReader("") {
+            settingStringMap["ZE_FLAT_DEVICE_HIERARCHY"] = "FLAT";
+        }
+    };
+
+    VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+    VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::L0);
+
+    std::unordered_map<std::string, std::string> mockableEnvs = {{"ZE_FLAT_DEVICE_HIERARCHY", "COMBINED"}};
+    VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+    mockSettingsReader = std::make_unique<MockSettingFileReader>();
+    FullyEnabledTestDebugManager debugManager;
+    EXPECT_EQ("FLAT", debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.get());
+
+    mockableEnvs["ZE_FLAT_DEVICE_HIERARCHY"] = "COMPOSITE";
+    debugManager.refreshEnvVariables();
+
+    EXPECT_EQ("FLAT", debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.get());
+}
+
+TEST(DebugSettingsManager, givenNoSettingsFileOrKeyMissingFromItWhenRefreshEnvVariablesIsCalledThenLiveEnvironmentWinsOverStaleValue) {
+    struct EmptyMockSettingFileReader : SettingsFileReader {
+        EmptyMockSettingFileReader() : SettingsFileReader("") {}
+    };
+
+    for (bool fileConfigPresent : {true, false}) {
+        VariableBackup<decltype(mockSettingsReader)> backupReader(&mockSettingsReader, {});
+        VariableBackup<ApiSpecificConfig::ApiType> apiBackup(&apiTypeForUlts, ApiSpecificConfig::L0);
+
+        std::unordered_map<std::string, std::string> mockableEnvs = {{"ZE_FLAT_DEVICE_HIERARCHY", "COMBINED"}};
+        VariableBackup<decltype(IoFunctions::mockableEnvValues)> mockableEnvValuesBackup(&IoFunctions::mockableEnvValues, &mockableEnvs);
+
+        if (fileConfigPresent) {
+            mockSettingsReader = std::make_unique<EmptyMockSettingFileReader>();
+        } else {
+            mockSettingsReader = std::make_unique<EnvironmentVariableReader>();
+        }
+
+        FullyEnabledTestDebugManager debugManager;
+        EXPECT_EQ("COMBINED", debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.get());
+
+        mockableEnvs["ZE_FLAT_DEVICE_HIERARCHY"] = "COMPOSITE";
+        debugManager.refreshEnvVariables();
+
+        EXPECT_EQ("COMPOSITE", debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.get());
+    }
 }

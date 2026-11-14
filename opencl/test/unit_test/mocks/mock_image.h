@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,17 +7,18 @@
 
 #pragma once
 
+#include "shared/source/helpers/memory_properties_flags.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 
 #include "opencl/source/mem_obj/image.h"
 
-#include "memory_properties_flags.h"
-
 namespace NEO {
 
 struct MockImageBase : public Image {
+    using Image::associatedMemObject;
     using Image::imageDesc;
     using Image::imageFormat;
+    using Image::is3DUAVOrRTV;
     MockGraphicsAllocation *graphicsAllocation = nullptr;
 
     MockImageBase(uint32_t rootDeviceIndex)
@@ -37,12 +38,8 @@ struct MockImageBase : public Image {
         return graphicsAllocation;
     }
 
-    void setImageArg(void *memory, bool isMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex, bool useGlobalAtomics) override {}
-    void setMediaImageArg(void *memory, uint32_t rootDeviceIndex) override {}
-    void setMediaSurfaceRotation(void *memory) override {}
-    void setSurfaceMemoryObjectControlState(void *memory, uint32_t value) override {}
-    void transformImage2dArrayTo3d(void *memory) override {}
-    void transformImage3dTo2dArray(void *memory) override {}
+    void setImageArg(void *memory, bool isMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex) override {}
+    size_t getSize() const override { return 0; }
 };
 
 } // namespace NEO

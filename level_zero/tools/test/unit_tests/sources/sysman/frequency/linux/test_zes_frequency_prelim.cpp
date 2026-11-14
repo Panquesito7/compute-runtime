@@ -1,16 +1,17 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/os_interface/product_helper.h"
+
+#include "level_zero/tools/test/unit_tests/sources/sysman/frequency/linux/mock_sysfs_frequency_prelim.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysman_fixture.h"
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "igfxfmid.h"
-#include "mock_sysfs_frequency_prelim.h"
+#include "neo_igfxfmid.h"
 
 #include <cmath>
 
@@ -52,6 +53,8 @@ class SysmanDeviceFrequencyFixture : public SysmanDeviceFixture {
         pSysfsAccessOld = pLinuxSysmanImp->pSysfsAccess;
         pSysfsAccess = std::make_unique<MockFrequencySysfsAccess>();
         pLinuxSysmanImp->pSysfsAccess = pSysfsAccess.get();
+        auto &rootDeviceEnvironment = neoDevice->getRootDeviceEnvironmentRef();
+        rootDeviceEnvironment.getMutableHardwareInfo()->capabilityTable.supportsImages = false;
 
         pSysfsAccess->setVal(minFreqFile, minFreq);
         pSysfsAccess->setVal(maxFreqFile, maxFreq);
@@ -76,7 +79,6 @@ class SysmanDeviceFrequencyFixture : public SysmanDeviceFixture {
             deviceHandles.resize(subDeviceCount, nullptr);
             Device::fromHandle(device->toHandle())->getSubDevices(&subDeviceCount, deviceHandles.data());
         }
-        getFreqHandles(0);
     }
 
     void TearDown() override {
@@ -108,6 +110,41 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenComponentCountZeroWhenEnumeratingFrequ
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumFrequencyDomains(device->toHandle(), &count, nullptr));
     EXPECT_EQ(count, handleComponentCount);
+
+    uint32_t testCount = count + 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumFrequencyDomains(device->toHandle(), &testCount, nullptr));
+    EXPECT_EQ(count, testCount);
+
+    auto handles = getFreqHandles(count);
+    for (auto handle : handles) {
+        EXPECT_NE(handle, nullptr);
+    }
+}
+
+TEST_F(SysmanDeviceFrequencyFixture, GivenComponentCountZeroWhenEnumeratingFrequencyHandlesAndMediaFreqDomainIsPresentThenNonZeroCountIsReturnedAndCallSucceds) {
+    neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo()->capabilityTable.supportsImages = true;
+    uint32_t count = 0U;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumFrequencyDomains(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(count, 2U);
+
+    uint32_t testCount = count + 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumFrequencyDomains(device->toHandle(), &testCount, nullptr));
+    EXPECT_EQ(count, testCount);
+
+    auto handles = getFreqHandles(count);
+    for (auto handle : handles) {
+        EXPECT_NE(handle, nullptr);
+    }
+}
+
+TEST_F(SysmanDeviceFrequencyFixture, GivenComponentCountZeroWhenEnumeratingFrequencyHandlesAndMediaDomainIsAbsentThenNonZeroCountIsReturnedAndCallSucceds) {
+    pSysfsAccess->directoryExistsResult = false;
+    neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo()->capabilityTable.supportsImages = true;
+    uint32_t count = 0U;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumFrequencyDomains(device->toHandle(), &count, nullptr));
+    EXPECT_EQ(count, 1U);
 
     uint32_t testCount = count + 1;
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumFrequencyDomains(device->toHandle(), &testCount, nullptr));
@@ -309,7 +346,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
         const double testEfficientValue = 400.0;
         const double testActualValue = 550.0;
         const uint32_t invalidReason = 0;
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         pSysfsAccess->setValU32(throttleReasonStatusFile, invalidReason);
         pSysfsAccess->setVal(requestFreqFile, testRequestValue);
         pSysfsAccess->setVal(tdpFreqFile, testTdpValue);
@@ -356,7 +393,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
         pSysfsAccess->setValU32Legacy(throttleReasonPL2FileLegacy, validReason);
         pSysfsAccess->setValU32Legacy(throttleReasonPL4FileLegacy, validReason);
         pSysfsAccess->setValU32Legacy(throttleReasonThermalFileLegacy, validReason);
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesFrequencyGetState(handle, &state));
         EXPECT_DOUBLE_EQ(testRequestValue, state.request);
         EXPECT_DOUBLE_EQ(testTdpValue, state.tdp);
@@ -394,7 +431,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonAveragePower) {
     auto handles = getFreqHandles(handleComponentCount);
     for (auto handle : handles) {
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         uint32_t validReason = 1;
         pSysfsAccess->setValU32(throttleReasonStatusFile, validReason);
         pSysfsAccess->setValU32(throttleReasonPL1File, validReason);
@@ -407,7 +444,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonBurstPower) {
     auto handles = getFreqHandles(handleComponentCount);
     for (auto handle : handles) {
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         uint32_t validReason = 1;
         pSysfsAccess->setValU32(throttleReasonStatusFile, validReason);
         pSysfsAccess->setValU32(throttleReasonPL2File, validReason);
@@ -420,7 +457,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsCurrentExcursion) {
     auto handles = getFreqHandles(handleComponentCount);
     for (auto handle : handles) {
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         uint32_t validReason = 1;
         pSysfsAccess->setValU32(throttleReasonStatusFile, validReason);
         pSysfsAccess->setValU32(throttleReasonPL4File, validReason);
@@ -433,7 +470,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsThermalExcursion) {
     auto handles = getFreqHandles(handleComponentCount);
     for (auto handle : handles) {
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         uint32_t validReason = 1;
         pSysfsAccess->setValU32(throttleReasonStatusFile, validReason);
         pSysfsAccess->setValU32(throttleReasonThermalFile, validReason);
@@ -446,7 +483,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsInvalidThermalExcursion) {
     auto handles = getFreqHandles(handleComponentCount);
     for (auto handle : handles) {
-        zes_freq_state_t state;
+        zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
         uint32_t validReason = 1;
         uint32_t invalidReason = 0;
         pSysfsAccess->setValU32(throttleReasonStatusFile, validReason);
@@ -459,7 +496,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 }
 
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsStatusforValidReasons) {
-    zes_freq_state_t state;
+    zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
     uint32_t validReason = 1;
     uint32_t setAllThrottleReasons = (ZES_FREQ_THROTTLE_REASON_FLAG_THERMAL_LIMIT |
                                       ZES_FREQ_THROTTLE_REASON_FLAG_CURRENT_LIMIT |
@@ -479,7 +516,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsStatusforInvalidReasons) {
     pSysfsAccess->mockReadUnsignedIntResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
-    zes_freq_state_t state;
+    zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
     uint32_t validReason = 1;
     uint32_t invalidReason = 0;
     uint32_t unsetAllThrottleReasons = 0u;
@@ -496,7 +533,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsStatusforMissingTHermalStatusFile) {
     pSysfsAccess->mockReadThermalResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
-    zes_freq_state_t state;
+    zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
     uint32_t validReason = 1;
     uint32_t invalidReason = 0;
     uint32_t setAllThrottleReasonsExceptThermal =
@@ -520,7 +557,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsStatusforMissingPL4StatusFile) {
     pSysfsAccess->mockReadPL4Result = ZE_RESULT_ERROR_NOT_AVAILABLE;
-    zes_freq_state_t state;
+    zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
     uint32_t validReason = 1;
     uint32_t invalidReason = 0;
     uint32_t setAllThrottleReasonsExceptPL4 =
@@ -544,7 +581,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsStatusforMissingPL2StatusFile) {
     pSysfsAccess->mockReadPL2Result = ZE_RESULT_ERROR_NOT_AVAILABLE;
-    zes_freq_state_t state;
+    zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
     uint32_t validReason = 1;
     uint32_t invalidReason = 0;
     uint32_t setAllThrottleReasonsExceptPL2 =
@@ -568,7 +605,7 @@ TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFreq
 
 TEST_F(SysmanDeviceFrequencyFixture, GivenValidFrequencyHandleWhenCallingzesFrequencyGetStateThenVerifyzesFrequencyThrottleReasonsStatusforMissingPL1StatusFile) {
     pSysfsAccess->mockReadPL1Result = ZE_RESULT_ERROR_NOT_AVAILABLE;
-    zes_freq_state_t state;
+    zes_freq_state_t state{ZES_STRUCTURE_TYPE_FREQ_STATE};
     uint32_t validReason = 1;
     uint32_t invalidReason = 0;
     uint32_t setAllThrottleReasonsExceptPL1 =
@@ -811,16 +848,19 @@ class FreqMultiDeviceFixture : public SysmanMultiDeviceFixture {
     std::unique_ptr<MockFrequencySysfsAccess> pSysfsAccess;
     SysfsAccess *pSysfsAccessOld = nullptr;
     std::vector<ze_device_handle_t> deviceHandles;
+    std::unique_ptr<ProductHelper> pProductHelper;
 
     void SetUp() override {
         if (!sysmanUltsEnable) {
             GTEST_SKIP();
         }
-        NEO::DebugManager.flags.ZE_AFFINITY_MASK.set("0.1");
+        NEO::debugManager.flags.ZE_AFFINITY_MASK.set("0.1");
         SysmanMultiDeviceFixture::SetUp();
         pSysfsAccessOld = pLinuxSysmanImp->pSysfsAccess;
         pSysfsAccess = std::make_unique<MockFrequencySysfsAccess>();
         pLinuxSysmanImp->pSysfsAccess = pSysfsAccess.get();
+        auto &rootDeviceEnvironment = neoDevice->getRootDeviceEnvironmentRef();
+        rootDeviceEnvironment.getMutableHardwareInfo()->capabilityTable.supportsImages = false;
         // delete handles created in initial SysmanDeviceHandleContext::init() call
         for (auto handle : pSysmanDeviceImp->pFrequencyHandleContext->handleList) {
             delete handle;

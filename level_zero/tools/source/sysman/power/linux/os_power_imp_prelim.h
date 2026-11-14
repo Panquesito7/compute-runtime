@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,16 +10,17 @@
 
 #include "level_zero/tools/source/sysman/power/os_power.h"
 
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 
-#include <memory>
 #include <string>
 
 namespace L0 {
 
 class SysfsAccess;
 class PlatformMonitoringTech;
-class LinuxPowerImp : public OsPower, NEO::NonCopyableOrMovableClass {
+struct OsSysman;
+
+class LinuxPowerImp : public OsPower, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t getProperties(zes_power_properties_t *pProperties) override;
     ze_result_t getEnergyCounter(zes_power_energy_counter_t *pEnergy) override;
@@ -63,5 +64,9 @@ class LinuxPowerImp : public OsPower, NEO::NonCopyableOrMovableClass {
         }
         return result;
     }
+    ze_result_t getMinLimit(int32_t &minLimit);
+    ze_result_t getMaxLimit(int32_t &maxLimit);
+    ze_result_t getDefaultLimit(int32_t &defaultLimit);
 };
+
 } // namespace L0

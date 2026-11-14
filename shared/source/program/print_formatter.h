@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,52 +16,56 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 extern int memcpy_s(void *dst, size_t destSize, const void *src, size_t count); // NOLINT(readability-identifier-naming)
 
 namespace NEO {
 
-using StringMap = std::unordered_map<uint32_t, std::string>;
-
-enum class PRINTF_DATA_TYPE : int {
-    INVALID,
-    BYTE,
-    SHORT,
-    INT,
-    FLOAT,
-    STRING,
-    LONG,
-    POINTER,
-    DOUBLE,
-    VECTOR_BYTE,
-    VECTOR_SHORT,
-    VECTOR_INT,
-    VECTOR_LONG,
-    VECTOR_FLOAT,
-    VECTOR_DOUBLE
+enum class PrintfDataType : int {
+    invalidType,
+    byteType,
+    shortType,
+    intType,
+    floatType,
+    stringType,
+    longType,
+    pointerType,
+    doubleType,
+    vectorByteType,
+    vectorShortType,
+    vectorIntType,
+    vectorLongType,
+    vectorFloatType,
+    vectorDoubleType
 };
-static_assert(sizeof(PRINTF_DATA_TYPE) == sizeof(int));
+static_assert(sizeof(PrintfDataType) == sizeof(int));
 
 class PrintFormatter {
   public:
-    PrintFormatter(const uint8_t *printfOutputBuffer, uint32_t printfOutputBufferMaxSize,
-                   bool using32BitPointers, const StringMap *stringLiteralMap = nullptr);
+    PrintFormatter(const uint8_t *printfOutputBuffer, uint32_t printfOutputBufferMaxSize);
     void printKernelOutput(const std::function<void(char *)> &print = [](char *str) { printToStdout(str); });
-
+    void setInitialOffset(uint32_t offset) {
+        initialOffset = offset;
+    }
+    void setStartParsingOffset(uint32_t offset) {
+        startParsingOffset = offset;
+    }
     constexpr static size_t maxSinglePrintStringLength = 16 * MemoryConstants::kiloByte;
 
+    constexpr static uint64_t inlineStringFormatFlag = 0x8000000000000000ull;
+    constexpr static uint64_t endOfDataMarker = 0xffffffff;
+
   protected:
-    const char *queryPrintfString(uint32_t index) const;
     void printString(const char *formatString, const std::function<void(char *)> &print);
     size_t printToken(char *output, size_t size, const char *formatString);
     size_t printStringToken(char *output, size_t size, const char *formatString);
-    size_t printPointerToken(char *output, size_t size, const char *formatString);
+    void skipToken(PrintfDataType type);
 
     char escapeChar(char escape);
     bool isConversionSpecifier(char c);
     void stripVectorFormat(const char *format, char *stripped);
     void stripVectorTypeConversion(char *format);
+    void stripStringLengthModifiers(char *format);
 
     template <class T>
     bool read(T *value) {
@@ -122,15 +126,29 @@ class PrintFormatter {
         return charactersPrinted;
     }
 
+    template <class T>
+    void skipTypedToken() {
+        T value{0};
+        read(&value);
+        currentOffset = alignUp(currentOffset, sizeof(uint32_t));
+    }
+
+    template <class T>
+    void skipTypedVectorToken() {
+        int valueCount = 0;
+        read(&valueCount);
+        for (int i = 0; i < valueCount; i++) {
+            skipTypedToken<T>();
+        }
+    }
+
     std::unique_ptr<char[]> output;
 
     const uint8_t *printfOutputBuffer = nullptr; // buffer extracted from the kernel, contains values to be printed
     uint32_t printfOutputBufferSize = 0;         // size of the data contained in the buffer
 
-    bool using32BitPointers = false;
-    const bool usesStringMap;
-    const StringMap *stringLiteralMap;
-
-    uint32_t currentOffset = 0; // current position in currently parsed buffer
+    uint32_t currentOffset = 0;      // current position in currently parsed buffer
+    uint32_t initialOffset = 0;      // initial offset - reserved memory for header in buffer
+    uint32_t startParsingOffset = 0; // skip entries already emitted by a previous drain of this buffer
 };
 }; // namespace NEO

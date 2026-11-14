@@ -1,0 +1,226 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/device/device.h"
+#include "shared/source/os_interface/linux/drm_debug.h"
+#include "shared/source/os_interface/linux/xe/eudebug/eudebug_interface.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
+#include "level_zero/tools/source/debug/debug_session.h"
+#include "level_zero/tools/source/debug/debug_session_imp.h"
+#include "level_zero/tools/source/debug/linux/debug_session.h"
+#include "level_zero/tools/source/debug/linux/debug_session_factory.h"
+
+namespace L0 {
+struct DebugSession;
+struct Device;
+
+struct DebugSessionLinuxXe : DebugSessionLinux {
+
+    ~DebugSessionLinuxXe() override;
+    DebugSessionLinuxXe(const zet_debug_config_t &config, Device *device, int debugFd, std::unique_ptr<NEO::EuDebugInterface> debugInterface, void *params);
+    static DebugSession *createLinuxSession(const zet_debug_config_t &config, Device *device, ze_result_t &result, bool isRootAttach);
+    static ze_result_t openConnectionUpstream(int pid, Device *device, NEO::EuDebugInterface &debugInterface, NEO::EuDebugConnect *open, int &debugFd);
+
+    ze_result_t initialize() override;
+
+    struct IoctlHandlerXe : DebugSessionLinux::IoctlHandler {
+        IoctlHandlerXe(const NEO::EuDebugInterface &euDebugInterface) : euDebugInterface(euDebugInterface) {};
+        int ioctl(int fd, unsigned long request, void *arg) override {
+            int ret = 0;
+            int error = 0;
+            bool shouldRetryIoctl = false;
+            do {
+                shouldRetryIoctl = false;
+                ret = NEO::SysCalls::ioctl(fd, request, arg);
+                error = errno;
+
+                if (ret == -1) {
+                    shouldRetryIoctl = (error == EINTR || error == EAGAIN || error == EBUSY);
+
+                    if (request == euDebugInterface.getParamValue(NEO::EuDebugParam::ioctlEuControl)) {
+                        shouldRetryIoctl = (error == EINTR || error == EAGAIN);
+                    }
+                }
+            } while (shouldRetryIoctl);
+            return ret;
+        }
+        const NEO::EuDebugInterface &euDebugInterface;
+    };
+
+    using ExecQueueHandle = uint64_t;
+    using LrcHandle = uint64_t;
+
+    struct ExecQueueParams {
+        uint64_t vmHandle = 0;
+        uint16_t engineClass = UINT16_MAX;
+        std::vector<LrcHandle> lrcHandles;
+    };
+
+    uint32_t xeDebuggerVersion = 0;
+
+    std::shared_ptr<ClientConnection> getClientConnection(uint64_t clientHandle) override {
+        return clientHandleToConnection[clientHandle];
+    };
+
+  protected:
+    int threadControl(const std::vector<EuThread::ThreadId> &threads, uint32_t tile, ThreadControlCmd threadCmd, std::unique_ptr<uint8_t[]> &bitmask, size_t &bitmaskSize) override;
+    int threadControlInterruptAll();
+    int threadControlResume(const std::vector<EuThread::ThreadId> &threads);
+    int threadControlStopped(std::unique_ptr<uint8_t[]> &bitmaskOut, size_t &bitmaskSizeOut);
+    MOCKABLE_VIRTUAL void handleAttentionEvent(NEO::EuDebugEventEuAttention *attention);
+    void handleMetadataEvent(NEO::EuDebugEventMetadata *pMetaData);
+    bool handleMetadataOpEvent(NEO::EuDebugEventVmBindOpMetadata *vmBindOpMetadata);
+    void updateContextAndLrcHandlesForThreadsWithAttention(EuThread::ThreadId threadId, const AttentionEventFields &attention) override;
+    int eventAckIoctl(EventToAck &event) override;
+    Module &getModule(uint64_t moduleHandle) override {
+        auto connection = clientHandleToConnection[clientHandle].get();
+        if (euDebugInterface->getInterfaceType() == NEO::EuDebugInterfaceType::upstream) {
+            DEBUG_BREAK_IF(!connection->elfHandleToModule.contains(moduleHandle));
+            return connection->elfHandleToModule[moduleHandle];
+        } else {
+            DEBUG_BREAK_IF(!connection->metaDataToModule.contains(moduleHandle));
+            return connection->metaDataToModule[moduleHandle];
+        }
+    }
+
+    void startAsyncThread() override;
+    static void *asyncThreadFunction(void *arg);
+    bool handleInternalEvent() override;
+    MOCKABLE_VIRTUAL void processPendingVmBindEvents();
+    DebugSessionImp *createTileSession(const zet_debug_config_t &config, Device *device, DebugSessionImp *rootDebugSession) override {
+        return nullptr;
+    }
+
+    int openVmFd(uint64_t vmHandle, bool readOnly) override;
+    int flushVmCache(int vmfd) override;
+    ze_result_t readRegsetForStoppedThread(const EuThread *thread, char *output, size_t size, uint64_t gpuVa) override;
+    void closeVmFd(int vmfd) override {};
+    void closeAllCachedVmFds() override {
+        this->closeVmFdCache();
+    }
+    void closeVmFdCache();
+
+    std::unordered_map<uint64_t, int> vmFdCache;
+    std::mutex vmFdCacheMutex;
+
+    void attachTile() override {
+        UNRECOVERABLE_IF(true);
+    }
+    void detachTile() override {
+        UNRECOVERABLE_IF(true);
+    }
+
+    struct MetaData {
+        NEO::EuDebugEventMetadata metadata;
+        std::unique_ptr<char[]> data;
+    };
+
+    struct ElfInfo {
+        uint64_t elfSize;
+        std::unique_ptr<char[]> elfData;
+    };
+
+    using VmBindOpSeqNo = uint64_t;
+    using VmBindSeqNo = uint64_t;
+    struct VmBindOpData {
+        uint64_t pendingNumExtensions = 0;
+        NEO::EuDebugEventVmBindOp vmBindOp;
+        std::vector<NEO::EuDebugEventVmBindOpMetadata> vmBindOpMetadataVec;
+    };
+
+    struct VmBindData {
+        uint64_t pendingNumBinds = 0;
+        NEO::EuDebugEventVmBind vmBind;
+        bool uFenceReceived = false;
+        NEO::EuDebugEventVmBindUfence vmBindUfence;
+        std::unordered_map<VmBindOpSeqNo, VmBindOpData> vmBindOpMap;
+        std::vector<NEO::EuDebugEventVmBindOpDebugData> vmBindOpDebugDataVec;
+    };
+
+    struct ClientConnectionXe : public ClientConnection {
+        ClientConnectionXe() = default;
+        ClientConnectionXe(const NEO::EuDebugInterface *euDebugInterface) : euDebugInterface(euDebugInterface) {}
+
+        NEO::EuDebugEventClient client = {};
+        size_t getElfSize(uint64_t elfHandle) override {
+            DEBUG_BREAK_IF(metaDataMap.size() > 0 && elfInfoMap.size() > 0);
+            if (euDebugInterface->getInterfaceType() == NEO::EuDebugInterfaceType::upstream) {
+                return elfInfoMap[elfHandle].elfSize;
+            } else {
+                return metaDataMap[elfHandle].metadata.len;
+            }
+        };
+        char *getElfData(uint64_t elfHandle) override {
+            DEBUG_BREAK_IF(metaDataMap.size() > 0 && elfInfoMap.size() > 0);
+            if (euDebugInterface->getInterfaceType() == NEO::EuDebugInterfaceType::upstream) {
+                return elfInfoMap[elfHandle].elfData.get();
+            } else {
+                return metaDataMap[elfHandle].data.get();
+            }
+        };
+
+        std::unordered_map<ExecQueueHandle, ExecQueueParams> execQueues;
+        std::unordered_map<uint64_t, uint64_t> lrcHandleToVmHandle;
+        std::unordered_map<VmBindSeqNo, VmBindData> vmBindMap;
+        // prelim data
+        std::unordered_map<uint64_t, MetaData> metaDataMap;
+        std::unordered_map<uint64_t, Module> metaDataToModule;
+        std::unordered_map<VmBindOpSeqNo, VmBindSeqNo> vmBindIdentifierMap;
+        // upstream data
+        std::unordered_map<uint64_t, Module> elfHandleToModule;
+        std::unordered_map<uint64_t, ElfInfo> elfInfoMap;
+
+        const NEO::EuDebugInterface *euDebugInterface = nullptr;
+    };
+    std::unordered_map<uint64_t, std::shared_ptr<ClientConnectionXe>> clientHandleToConnection;
+    bool canHandleVmBind(VmBindData &vmBindData) const;
+    MOCKABLE_VIRTUAL bool handleVmBind(VmBindData &vmBindData);
+    void handleVmBindWithoutUfence(VmBindData &vmBindData, VmBindOpData &vmBindOpData);
+    MOCKABLE_VIRTUAL bool handleVmBindUpstream(VmBindData &vmBindData);
+
+    void extractMetaData(uint64_t client, const MetaData &metaData);
+    bool checkAllEventsCollected();
+    MOCKABLE_VIRTUAL void handleEvent(NEO::EuDebugEvent *event);
+    MOCKABLE_VIRTUAL bool eventTypeIsAttention(uint16_t eventType);
+    void readInternalEventsAsync() override;
+    std::atomic<bool> detached{false};
+
+    uint64_t getVmHandleFromClientAndlrcHandle(uint64_t clientHandle, uint64_t lrcHandle) override;
+    void checkTriggerEventsForAttentionForTileSession(uint32_t tileIndex) override {}
+    std::unique_lock<std::mutex> getThreadStateMutexForTileSession(uint32_t tileIndex) override {
+        std::mutex m;
+        std::unique_lock<std::mutex> lock(m);
+        lock.release();
+        return lock;
+    }
+    void addThreadToNewlyStoppedFromRaisedAttentionForTileSession(EuThread::ThreadId threadId,
+                                                                  uint64_t memoryHandle,
+                                                                  const void *stateSaveArea,
+                                                                  uint32_t tileIndex) override {}
+
+    void pushApiEventForTileSession(uint32_t tileIndex, zet_debug_event_t &debugEvent) override { UNRECOVERABLE_IF(true) }
+    void setPageFaultForTileSession(uint32_t tileIndex, EuThread::ThreadId threadId, bool hasPageFault) override{UNRECOVERABLE_IF(true)}
+
+    ze_device_thread_t convertToPhysicalWithinDevice(ze_device_thread_t thread, uint32_t deviceIndex) override;
+    EuThread::ThreadId convertToThreadId(ze_device_thread_t thread) override;
+    ze_device_thread_t convertToApi(EuThread::ThreadId threadId) override;
+
+    uint64_t euControlInterruptSeqno = 0;
+
+    ze_result_t readEventImp(NEO::EuDebugEvent *drmDebugEvent);
+    int ioctl(unsigned long request, void *arg);
+    std::atomic<bool> processEntryEventGenerated = false;
+    std::atomic<uint64_t> newestAttSeqNo = 0;
+    std::unique_ptr<NEO::EuDebugInterface> euDebugInterface;
+
+    uint64_t elfHandle = 0;
+};
+
+} // namespace L0

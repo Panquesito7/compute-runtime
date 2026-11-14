@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,28 +9,29 @@
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
-#include "opencl/source/command_queue/command_queue_hw.h"
 #include "opencl/source/command_queue/gpgpu_walker.h"
 #include "opencl/source/event/user_event.h"
-#include "opencl/source/helpers/hardware_commands_helper.h"
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
 
 using BarrierTest = Test<CommandEnqueueFixture>;
 
 HWTEST_F(BarrierTest, givenCsrWithHigherLevelThenCommandQueueWhenEnqueueBarrierIsCalledThenCommandQueueAlignsToCsrWithoutSendingAnyCommands) {
-    auto pCmdQ = this->pCmdQ;
-    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    MockCommandQueueHw<FamilyType> pCmdQ(context, pClDevice, nullptr);
+    auto &commandStreamReceiver = reinterpret_cast<UltCommandStreamReceiver<FamilyType> &>(pCmdQ.getGpgpuCommandStreamReceiver());
+    pCmdQ.updateLatestSentEnqueueType(EnqueueProperties::Operation::gpuKernel);
 
     // Set task levels to known values.
     uint32_t originalCSRLevel = 2;
     commandStreamReceiver.taskLevel = originalCSRLevel;
-    pCmdQ->taskLevel = originalCSRLevel;
+    pCmdQ.taskLevel = originalCSRLevel;
 
     uint32_t originalTaskCount = 15;
     commandStreamReceiver.taskCount = originalTaskCount;
@@ -42,10 +43,10 @@ HWTEST_F(BarrierTest, givenCsrWithHigherLevelThenCommandQueueWhenEnqueueBarrierI
     const cl_event *eventWaitList = nullptr;
     cl_event *event = nullptr;
 
-    auto &commandStream = pCmdQ->getCS(0);
+    auto &commandStream = pCmdQ.getCS(0);
     auto used = commandStream.getUsed();
 
-    auto retVal = pCmdQ->enqueueBarrierWithWaitList(
+    auto retVal = pCmdQ.enqueueBarrierWithWaitList(
         numEventsInWaitList,
         eventWaitList,
         event);
@@ -53,11 +54,13 @@ HWTEST_F(BarrierTest, givenCsrWithHigherLevelThenCommandQueueWhenEnqueueBarrierI
 
     // csr is untouched as we do not submit anything, cmd queue task level goes up as this is barrier call
     EXPECT_EQ(2u, commandStreamReceiver.peekTaskLevel());
-    EXPECT_EQ(3u, pCmdQ->taskLevel);
+    EXPECT_EQ(3u, pCmdQ.taskLevel);
 
     // make sure nothing was added to CommandStream or CSR-CommandStream and command queue still uses this stream
-    EXPECT_EQ(used, commandStream.getUsed());
-    EXPECT_EQ(&commandStream, &pCmdQ->getCS(0));
+    if (!pCmdQ.isWalkerPostSyncSkipEnabled) {
+        EXPECT_EQ(used, commandStream.getUsed());
+    }
+    EXPECT_EQ(&commandStream, &pCmdQ.getCS(0));
 
     EXPECT_EQ(csrUsed, csrCommandStream.getUsed());
     EXPECT_EQ(&csrCommandStream, &commandStreamReceiver.commandStream);
@@ -69,6 +72,7 @@ HWTEST_F(BarrierTest, GivenCsrTaskLevelGreaterThenCmdqTaskLevelWhenEnqueingBarri
     auto pCmdQ = this->pCmdQ;
     auto pCmdBuffer = this->pCmdBuffer;
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    pCmdQ->updateLatestSentEnqueueType(EnqueueProperties::Operation::profilingOnly);
 
     commandStreamReceiver.setMediaVFEStateDirty(false);
 
@@ -90,7 +94,7 @@ HWTEST_F(BarrierTest, GivenCsrTaskLevelGreaterThenCmdqTaskLevelWhenEnqueingBarri
 
     auto sizeUsed = pCS->getUsed();
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, pCmdBuffer, sizeUsed));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, pCmdBuffer, sizeUsed));
 
     // If CSR > CQ then a PC isn't required.
     auto itorCmd = find<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
@@ -126,13 +130,13 @@ HWTEST_F(BarrierTest, GivenEventWhenEnqueingBarrierWithWaitListThenEventIsSetupC
 
 HWTEST_F(BarrierTest, GivenGpuHangAndBlockingCallWhenEnqueingBarrierWithWaitListThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context, device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     cl_uint numEventsInWaitList = 0;
     const cl_event *eventWaitList = nullptr;
@@ -202,10 +206,14 @@ HWTEST_F(BarrierTest, WhenEnqueingBarrierWithWaitListThenDependenciesShouldSync)
     auto pEvent = castToObject<Event>(event);
     auto &csr = pCmdQ->getGpgpuCommandStreamReceiver();
 
-    // in this case only cmdQ raises the taskLevel why csr stay intact
+    // in this case only cmdQ raises the taskLevel while csr stays intact
     EXPECT_EQ(8u, pCmdQ->taskLevel);
     if (csr.peekTimestampPacketWriteEnabled()) {
-        EXPECT_EQ(pCmdQ->taskLevel + 1, commandStreamReceiver.peekTaskLevel());
+        auto expectedTaskLevel = pCmdQ->taskLevel;
+        if (!commandStreamReceiver.isUpdateTagFromWaitEnabled()) {
+            expectedTaskLevel++;
+        }
+        EXPECT_EQ(expectedTaskLevel, commandStreamReceiver.peekTaskLevel());
     } else {
         EXPECT_EQ(7u, commandStreamReceiver.peekTaskLevel());
     }
@@ -269,6 +277,7 @@ HWTEST_F(BarrierTest, givenBlockedCommandQueueAndEnqueueBarrierWithWaitlistRetur
     EXPECT_EQ(pEvent->peekTaskCount(), CompletionStamp::notReady);
     event2.setStatus(CL_COMPLETE);
     clReleaseEvent(event);
+    pCmdQ->finish(false);
 }
 
 HWTEST_F(BarrierTest, givenEmptyCommandStreamAndBlockedBarrierCommandWhenUserEventIsSignaledThenNewCommandStreamIsNotAcquired) {
@@ -312,4 +321,5 @@ HWTEST_F(BarrierTest, givenEmptyCommandStreamAndBlockedBarrierCommandWhenUserEve
     EXPECT_GE(commandStream.getMaxAvailableSpace(), commandStream.getMaxAvailableSpace());
 
     clReleaseEvent(event);
+    pCmdQ->finish(false);
 }

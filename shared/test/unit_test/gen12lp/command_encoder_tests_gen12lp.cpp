@@ -1,22 +1,41 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_container/command_encoder.h"
-#include "shared/source/command_container/encode_surface_state.h"
 #include "shared/source/helpers/preamble.h"
+#include "shared/source/kernel/dispatch_kernel_encoder_interface.h"
+#include "shared/source/kernel/grf_config.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 using namespace NEO;
 
 using Gen12LpCommandEncodeTest = testing::Test;
-GEN12LPTEST_F(Gen12LpCommandEncodeTest, givenGen12LpPlatformWhenDoBindingTablePrefetchIsCalledThenReturnsTrue) {
-    EXPECT_FALSE(EncodeSurfaceState<FamilyType>::doBindingTablePrefetch());
+GEN12LPTEST_F(Gen12LpCommandEncodeTest, givenGen12LpPlatformWhenEncodeSlmSizePerSubSliceThenInterfaceDescriptorIsNotModified) {
+    using INTERFACE_DESCRIPTOR_DATA = typename FamilyType::INTERFACE_DESCRIPTOR_DATA;
+
+    MockExecutionEnvironment executionEnvironment{};
+    auto &rootDeviceEnvironment = *executionEnvironment.rootDeviceEnvironments[0];
+
+    INTERFACE_DESCRIPTOR_DATA idd = FamilyType::cmdInitInterfaceDescriptorData;
+    const INTERFACE_DESCRIPTOR_DATA expectedIdd = FamilyType::cmdInitInterfaceDescriptorData;
+
+    EncodeSlmSizePerSubSliceArgs slmArgs{
+        .threadsPerThreadGroup = 8u,
+        .workloadThreadGroupCount = 1024u,
+        .slmTotalSizePerThreadGroup = 16 * MemoryConstants::kiloByte,
+        .grfCount = GrfConfig::defaultGrfNumber,
+        .slmPolicy = SlmPolicy::slmPolicyLargeSlm};
+
+    EncodeDispatchKernel<FamilyType>::encodeSlmSizePerSubSlice(&idd, rootDeviceEnvironment, slmArgs);
+
+    EXPECT_EQ(0, memcmp(&expectedIdd, &idd, sizeof(INTERFACE_DESCRIPTOR_DATA)));
 }
 
 template <bool rcs>

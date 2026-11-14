@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,21 +13,43 @@
 #include "shared/source/direct_submission/direct_submission_controller.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/affinity_mask.h"
+#include "shared/source/helpers/bindless_heaps_helper.h"
 #include "shared/source/helpers/driver_model_type.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/string_helpers.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/memory_manager/os_agnostic_memory_manager.h"
+#include "shared/source/memory_manager/unified_memory_reuse_cleaner.h"
+#include "shared/source/os_interface/driver_info.h"
 #include "shared/source/os_interface/os_environment.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
-#include "shared/source/utilities/wait_util.h"
+#include "shared/source/utilities/logger.h"
+
+#include <algorithm>
 
 namespace NEO {
 ExecutionEnvironment::ExecutionEnvironment() {
-    WaitUtils::init();
     this->configureNeoEnvironment();
+}
+
+UsmReusePerfLogger &ExecutionEnvironment::getUsmReusePerfLogger() const {
+    std::call_once(usmReusePerfLoggerOnceFlag, [this] {
+        usmReusePerfLogger = std::make_unique<UsmReusePerfLogger>();
+    });
+    return *usmReusePerfLogger;
+}
+
+void ExecutionEnvironment::addLeoPlatformKey(const HardwareInfo &hwInfo) {
+    const DeviceGroupSortKey key{hwInfo.platform.eProductFamily, hwInfo.capabilityTable.isIntegratedDevice};
+    for (const auto &existingKey : leoPlatformKeys) {
+        if (existingKey.productFamily == key.productFamily) {
+            return;
+        }
+    }
+    auto position = std::upper_bound(leoPlatformKeys.begin(), leoPlatformKeys.end(), key, compareDeviceGroups);
+    leoPlatformKeys.insert(position, key);
 }
 
 void ExecutionEnvironment::releaseRootDeviceEnvironmentResources(RootDeviceEnvironment *rootDeviceEnvironment) {
@@ -37,10 +59,16 @@ void ExecutionEnvironment::releaseRootDeviceEnvironmentResources(RootDeviceEnvir
     SipKernel::freeSipKernels(rootDeviceEnvironment, memoryManager.get());
     if (rootDeviceEnvironment->builtins.get()) {
         rootDeviceEnvironment->builtins->freeSipKernels(memoryManager.get());
+        rootDeviceEnvironment->builtins.reset();
     }
+    rootDeviceEnvironment->releaseDummyAllocation();
+    rootDeviceEnvironment->bindlessHeapsHelper.reset();
 }
 
 ExecutionEnvironment::~ExecutionEnvironment() {
+    if (directSubmissionController) {
+        directSubmissionController->stopThread();
+    }
     if (memoryManager) {
         memoryManager->commonCleanup();
         for (const auto &rootDeviceEnvironment : this->rootDeviceEnvironments) {
@@ -48,6 +76,8 @@ ExecutionEnvironment::~ExecutionEnvironment() {
         }
     }
     rootDeviceEnvironments.clear();
+    mapOfSubDeviceIndices.clear();
+    this->restoreCcsMode();
 }
 
 bool ExecutionEnvironment::initializeMemoryManager() {
@@ -55,27 +85,27 @@ bool ExecutionEnvironment::initializeMemoryManager() {
         return memoryManager->isInitialized();
     }
 
-    int32_t setCommandStreamReceiverType = CommandStreamReceiverType::CSR_HW;
-    if (DebugManager.flags.SetCommandStreamReceiver.get() >= 0) {
-        setCommandStreamReceiverType = DebugManager.flags.SetCommandStreamReceiver.get();
-    }
+    auto csrType = obtainCsrTypeFromIntegerValue(debugManager.flags.SetCommandStreamReceiver.get(), CommandStreamReceiverType::hardware);
 
-    switch (setCommandStreamReceiverType) {
-    case CommandStreamReceiverType::CSR_TBX:
-    case CommandStreamReceiverType::CSR_TBX_WITH_AUB:
-    case CommandStreamReceiverType::CSR_AUB:
+    switch (csrType) {
+    case CommandStreamReceiverType::tbx:
+    case CommandStreamReceiverType::tbxWithAub:
+    case CommandStreamReceiverType::aub:
+    case CommandStreamReceiverType::nullAub:
         memoryManager = std::make_unique<OsAgnosticMemoryManager>(*this);
         break;
-    case CommandStreamReceiverType::CSR_HW:
-    case CommandStreamReceiverType::CSR_HW_WITH_AUB:
+    case CommandStreamReceiverType::hardware:
+    case CommandStreamReceiverType::hardwareWithAub:
     default: {
-        auto driverModelType = DriverModelType::UNKNOWN;
+        auto driverModelType = DriverModelType::unknown;
         if (this->rootDeviceEnvironments[0]->osInterface && this->rootDeviceEnvironments[0]->osInterface->getDriverModel()) {
             driverModelType = this->rootDeviceEnvironments[0]->osInterface->getDriverModel()->getDriverModelType();
         }
         memoryManager = MemoryManager::createMemoryManager(*this, driverModelType);
     } break;
     }
+
+    memoryManager->initUsmReuseLimits();
 
     return memoryManager->isInitialized();
 }
@@ -85,35 +115,71 @@ void ExecutionEnvironment::calculateMaxOsContextCount() {
     for (const auto &rootDeviceEnvironment : this->rootDeviceEnvironments) {
         auto hwInfo = rootDeviceEnvironment->getHardwareInfo();
         auto &gfxCoreHelper = rootDeviceEnvironment->getHelper<GfxCoreHelper>();
-        auto osContextCount = static_cast<uint32_t>(gfxCoreHelper.getGpgpuEngineInstances(*rootDeviceEnvironment).size());
+        auto &engineInstances = gfxCoreHelper.getGpgpuEngineInstances(*rootDeviceEnvironment);
+        auto osContextCount = static_cast<uint32_t>(engineInstances.size());
         auto subDevicesCount = GfxCoreHelper::getSubDevicesCount(hwInfo);
-        auto ccsCount = hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled;
         bool hasRootCsr = subDevicesCount > 1;
 
-        MemoryManager::maxOsContextCount += osContextCount * subDevicesCount + hasRootCsr;
-
-        if (ccsCount > 1 && DebugManager.flags.EngineInstancedSubDevices.get()) {
-            MemoryManager::maxOsContextCount += ccsCount * subDevicesCount;
+        uint32_t numRegularEngines = 0;
+        uint32_t numHpEngines = 0;
+        for (const auto &engine : engineInstances) {
+            if (engine.second == EngineUsage::regular) {
+                numRegularEngines++;
+            } else if (engine.second == EngineUsage::highPriority) {
+                numHpEngines++;
+            }
         }
+
+        uint32_t numRootContexts = hasRootCsr ? 1 : 0;
+        uint32_t numSecondaryContexts = 0;
+        if (gfxCoreHelper.areSecondaryContextsSupported()) {
+
+            auto groupCount = gfxCoreHelper.getContextGroupContextsCount();
+            if (rootDeviceEnvironment->osInterface && rootDeviceEnvironment->osInterface->getAggregatedProcessCount() > 1) {
+                groupCount = std::max(groupCount / rootDeviceEnvironment->osInterface->getAggregatedProcessCount(), 2u);
+            }
+            numSecondaryContexts += numRegularEngines * groupCount;
+            numSecondaryContexts += numHpEngines * groupCount;
+            osContextCount -= (numRegularEngines + numHpEngines);
+
+            numRootContexts *= groupCount;
+        }
+
+        MemoryManager::maxOsContextCount += (numSecondaryContexts + osContextCount) * subDevicesCount + numRootContexts;
     }
 }
 
 DirectSubmissionController *ExecutionEnvironment::initializeDirectSubmissionController() {
+    std::lock_guard<std::mutex> lockForInit(initializeDirectSubmissionControllerMutex);
     auto initializeDirectSubmissionController = DirectSubmissionController::isSupported();
 
-    if (DebugManager.flags.SetCommandStreamReceiver.get() > 0) {
+    if (debugManager.flags.SetCommandStreamReceiver.get() > 0) {
         initializeDirectSubmissionController = false;
     }
 
-    if (DebugManager.flags.EnableDirectSubmissionController.get() != -1) {
-        initializeDirectSubmissionController = DebugManager.flags.EnableDirectSubmissionController.get();
+    if (debugManager.flags.EnableDirectSubmissionController.get() != -1) {
+        initializeDirectSubmissionController = debugManager.flags.EnableDirectSubmissionController.get();
     }
 
     if (initializeDirectSubmissionController && this->directSubmissionController == nullptr) {
         this->directSubmissionController = std::make_unique<DirectSubmissionController>();
+        this->directSubmissionController->startThread();
     }
 
     return directSubmissionController.get();
+}
+
+void ExecutionEnvironment::initializeUnifiedMemoryReuseCleaner(bool isAnyDirectSubmissionLightEnabled) {
+    std::lock_guard<std::mutex> lock(initializeUnifiedMemoryReuseCleanerMutex);
+    auto initializeUnifiedMemoryReuseCleaner = UnifiedMemoryReuseCleaner::isSupported() && !isAnyDirectSubmissionLightEnabled;
+
+    if (debugManager.flags.ExperimentalUSMAllocationReuseCleaner.get() != -1) {
+        initializeUnifiedMemoryReuseCleaner = debugManager.flags.ExperimentalUSMAllocationReuseCleaner.get() == 1;
+    }
+
+    if (initializeUnifiedMemoryReuseCleaner && nullptr == this->unifiedMemoryReuseCleaner) {
+        this->unifiedMemoryReuseCleaner = std::make_unique<UnifiedMemoryReuseCleaner>(isAnyDirectSubmissionLightEnabled);
+    }
 }
 
 void ExecutionEnvironment::prepareRootDeviceEnvironments(uint32_t numRootDevices) {
@@ -122,12 +188,15 @@ void ExecutionEnvironment::prepareRootDeviceEnvironments(uint32_t numRootDevices
     }
     for (auto rootDeviceIndex = 0u; rootDeviceIndex < numRootDevices; rootDeviceIndex++) {
         if (!rootDeviceEnvironments[rootDeviceIndex]) {
-            rootDeviceEnvironments[rootDeviceIndex] = std::make_unique<RootDeviceEnvironment>(*this);
+            rootDeviceEnvironments[rootDeviceIndex] = std::make_unique<RootDeviceEnvironment>(*this, rootDeviceIndex);
         }
     }
 }
 
 void ExecutionEnvironment::prepareForCleanup() const {
+    if (unifiedMemoryReuseCleaner) {
+        unifiedMemoryReuseCleaner->stopThread();
+    }
     for (auto &rootDeviceEnvironment : rootDeviceEnvironments) {
         if (rootDeviceEnvironment) {
             rootDeviceEnvironment->prepareForCleanup();
@@ -136,105 +205,125 @@ void ExecutionEnvironment::prepareForCleanup() const {
 }
 
 void ExecutionEnvironment::prepareRootDeviceEnvironment(const uint32_t rootDeviceIndexForReInit) {
-    rootDeviceEnvironments[rootDeviceIndexForReInit] = std::make_unique<RootDeviceEnvironment>(*this);
+    rootDeviceEnvironments[rootDeviceIndexForReInit] = std::make_unique<RootDeviceEnvironment>(*this, rootDeviceIndexForReInit);
+}
+
+int ExecutionEnvironment::setErrorDescription(const std::string &str) {
+    auto threadId = std::this_thread::get_id();
+    {
+        std::lock_guard<std::mutex> errorDescsLock(errorDescsMutex);
+        errorDescs[threadId] = str;
+    }
+    return static_cast<int>(str.size());
+}
+
+void ExecutionEnvironment::getErrorDescription(const char **ppString) {
+    auto threadId = std::this_thread::get_id();
+    {
+        std::lock_guard<std::mutex> errorDescsLock(errorDescsMutex);
+        *ppString = errorDescs[threadId].c_str();
+    }
+}
+
+int ExecutionEnvironment::clearErrorDescription() {
+    auto threadId = std::this_thread::get_id();
+    {
+        std::lock_guard<std::mutex> errorDescsLock(errorDescsMutex);
+        if (auto it = errorDescs.find(threadId); it != errorDescs.end()) {
+            it->second.clear();
+        }
+    }
+    return 0;
+}
+
+bool ExecutionEnvironment::getSubDeviceHierarchy(uint32_t index, std::tuple<uint32_t, uint32_t, uint32_t> *subDeviceMap) {
+    if (auto it = mapOfSubDeviceIndices.find(index); it != mapOfSubDeviceIndices.end()) {
+        *subDeviceMap = it->second;
+        return true;
+    } else {
+        return false;
+    }
 }
 
 void ExecutionEnvironment::parseAffinityMask() {
-    const auto &affinityMaskString = DebugManager.flags.ZE_AFFINITY_MASK.get();
+    const auto &affinityMaskString = debugManager.flags.ZE_AFFINITY_MASK.get();
 
-    if (affinityMaskString.compare("default") == 0 ||
-        affinityMaskString.empty()) {
+    if (!isAffinityMaskSet(affinityMaskString)) {
         return;
     }
 
-    bool exposeSubDevicesAsApiDevices = false;
-    if (NEO::DebugManager.flags.ReturnSubDevicesAsApiDevices.get() != -1) {
-        exposeSubDevicesAsApiDevices = NEO::DebugManager.flags.ReturnSubDevicesAsApiDevices.get();
-    }
+    // If the user has requested FLAT or COMBINED device hierarchy models, then report all the sub devices as devices.
+    bool exposeSubDevices = this->deviceHierarchyMode != DeviceHierarchyMode::composite;
 
-    uint32_t numRootDevices = static_cast<uint32_t>(rootDeviceEnvironments.size());
-
-    RootDeviceIndicesMap mapOfIndexes;
     // Reserve at least for a size equal to rootDeviceEnvironments.size() times four,
     // which is enough for typical configurations
+    uint32_t numRootDevices = static_cast<uint32_t>(rootDeviceEnvironments.size());
+    uint32_t numDevices = numRootDevices;
     size_t reservedSizeForIndices = numRootDevices * 4;
-    mapOfIndexes.reserve(reservedSizeForIndices);
-    if (exposeSubDevicesAsApiDevices) {
-        uint32_t currentDeviceIndex = 0;
-        for (uint32_t currentRootDevice = 0u; currentRootDevice < static_cast<uint32_t>(rootDeviceEnvironments.size()); currentRootDevice++) {
+    RootDeviceIndicesMap mapOfIndices;
+    mapOfIndices.reserve(reservedSizeForIndices);
+    uint32_t hwSubDevicesCount = 0u;
+
+    if (exposeSubDevices) {
+        for (uint32_t currentRootDevice = 0u; currentRootDevice < numRootDevices; currentRootDevice++) {
             auto hwInfo = rootDeviceEnvironments[currentRootDevice]->getHardwareInfo();
-            auto subDevicesCount = GfxCoreHelper::getSubDevicesCount(hwInfo);
+
+            hwSubDevicesCount = GfxCoreHelper::getSubDevicesCount(hwInfo);
             uint32_t currentSubDevice = 0;
-            mapOfIndexes[currentDeviceIndex++] = std::make_tuple(currentRootDevice, currentSubDevice);
-            for (currentSubDevice = 1; currentSubDevice < subDevicesCount; currentSubDevice++) {
-                mapOfIndexes[currentDeviceIndex++] = std::make_tuple(currentRootDevice, currentSubDevice);
+            mapOfIndices.push_back(std::make_tuple(currentRootDevice, currentSubDevice));
+            for (currentSubDevice = 1; currentSubDevice < hwSubDevicesCount; currentSubDevice++) {
+                mapOfIndices.push_back(std::make_tuple(currentRootDevice, currentSubDevice));
             }
         }
 
-        numRootDevices = currentDeviceIndex;
-        UNRECOVERABLE_IF(numRootDevices > reservedSizeForIndices);
+        numDevices = static_cast<uint32_t>(mapOfIndices.size());
     }
 
     std::vector<AffinityMaskHelper> affinityMaskHelper(numRootDevices);
 
     auto affinityMaskEntries = StringHelpers::split(affinityMaskString, ",");
 
+    // Index of the Device to be returned to the user, not the physical device index.
+    uint32_t deviceIndex = 0;
     for (const auto &entry : affinityMaskEntries) {
         auto subEntries = StringHelpers::split(entry, ".");
-        uint32_t rootDeviceIndex = StringHelpers::toUint32t(subEntries[0]);
+        uint32_t entryIndex = StringHelpers::toUint32t(subEntries[0]);
 
-        // tiles as devices
-        if (exposeSubDevicesAsApiDevices) {
-            if (rootDeviceIndex > numRootDevices) {
-                continue;
-            }
-
-            // ReturnSubDevicesAsApiDevices not supported with AllowSingleTileEngineInstancedSubDevices
+        if (entryIndex >= numDevices) {
+            continue;
+        } else if (exposeSubDevices) {
+            // tiles as devices
             // so ignore X.Y
             if (subEntries.size() > 1) {
                 continue;
             }
 
-            std::tuple<uint32_t, uint32_t> indexKey = mapOfIndexes[rootDeviceIndex];
-            auto deviceIndex = std::get<0>(indexKey);
+            std::tuple<uint32_t, uint32_t> indexKey = mapOfIndices[entryIndex];
+            auto hwDeviceIndex = std::get<0>(indexKey);
             auto tileIndex = std::get<1>(indexKey);
-            affinityMaskHelper[deviceIndex].enableGenericSubDevice(tileIndex);
 
-            continue;
-        }
-
-        // cards as devices
-        if (rootDeviceIndex < numRootDevices) {
-            auto hwInfo = rootDeviceEnvironments[rootDeviceIndex]->getHardwareInfo();
+            affinityMaskHelper[hwDeviceIndex].enableGenericSubDevice(tileIndex);
+            // Store the Physical Hierarchy for this SubDevice mapped to the Device Index passed to the user.
+            mapOfSubDeviceIndices[deviceIndex++] = std::make_tuple(hwDeviceIndex, tileIndex, hwSubDevicesCount);
+        } else {
+            // cards as devices
+            auto hwInfo = rootDeviceEnvironments[entryIndex]->getHardwareInfo();
             auto subDevicesCount = GfxCoreHelper::getSubDevicesCount(hwInfo);
 
             if (subEntries.size() > 1) {
                 uint32_t subDeviceIndex = StringHelpers::toUint32t(subEntries[1]);
 
-                bool enableSecondLevelEngineInstanced = ((subDevicesCount == 1) &&
-                                                         (hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled > 1) &&
-                                                         DebugManager.flags.AllowSingleTileEngineInstancedSubDevices.get());
-
-                if (enableSecondLevelEngineInstanced) {
-                    UNRECOVERABLE_IF(subEntries.size() != 2);
-
-                    if (subDeviceIndex < hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled) {
-                        affinityMaskHelper[rootDeviceIndex].enableEngineInstancedSubDevice(0, subDeviceIndex); // Mask: X.Y
-                    }
-                } else if (subDeviceIndex < subDevicesCount) {
+                if (subDeviceIndex < subDevicesCount) {
                     if (subEntries.size() == 2) {
-                        affinityMaskHelper[rootDeviceIndex].enableGenericSubDevice(subDeviceIndex); // Mask: X.Y
+                        // Store the Physical Hierarchy for this SubDevice mapped to the Device Index passed to the user.
+                        mapOfSubDeviceIndices[entryIndex] = std::make_tuple(entryIndex, subDeviceIndex, subDevicesCount);
+                        affinityMaskHelper[entryIndex].enableGenericSubDevice(subDeviceIndex); // Mask: X.Y
                     } else {
                         UNRECOVERABLE_IF(subEntries.size() != 3);
-                        uint32_t ccsIndex = StringHelpers::toUint32t(subEntries[2]);
-
-                        if (ccsIndex < hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled) {
-                            affinityMaskHelper[rootDeviceIndex].enableEngineInstancedSubDevice(subDeviceIndex, ccsIndex); // Mask: X.Y.Z
-                        }
                     }
                 }
             } else {
-                affinityMaskHelper[rootDeviceIndex].enableAllGenericSubDevices(subDevicesCount); // Mask: X
+                affinityMaskHelper[entryIndex].enableAllGenericSubDevices(subDevicesCount); // Mask: X
             }
         }
     }
@@ -252,14 +341,33 @@ void ExecutionEnvironment::parseAffinityMask() {
     rootDeviceEnvironments.swap(filteredEnvironments);
 }
 
+void ExecutionEnvironment::sortNeoDevices() {
+    std::sort(rootDeviceEnvironments.begin(), rootDeviceEnvironments.end(), comparePciIdBusNumber);
+}
+
+void ExecutionEnvironment::setDeviceHierarchyMode(const GfxCoreHelper &gfxCoreHelper) {
+    std::string deviceHierarchyMode = NEO::debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.get();
+    if (strcmp(deviceHierarchyMode.c_str(), "COMPOSITE") == 0) {
+        this->deviceHierarchyMode = DeviceHierarchyMode::composite;
+    } else if (strcmp(deviceHierarchyMode.c_str(), "FLAT") == 0) {
+        this->deviceHierarchyMode = DeviceHierarchyMode::flat;
+    } else if (strcmp(deviceHierarchyMode.c_str(), "COMBINED") == 0) {
+        this->deviceHierarchyMode = DeviceHierarchyMode::combined;
+    } else {
+        this->deviceHierarchyMode = gfxCoreHelper.getDefaultDeviceHierarchy();
+    }
+}
+
 void ExecutionEnvironment::adjustCcsCountImpl(RootDeviceEnvironment *rootDeviceEnvironment) const {
     auto hwInfo = rootDeviceEnvironment->getMutableHardwareInfo();
     auto &productHelper = rootDeviceEnvironment->getHelper<ProductHelper>();
     productHelper.adjustNumberOfCcs(*hwInfo);
 }
 
-void ExecutionEnvironment::adjustCcsCount() {
-    parseCcsCountLimitations();
+bool ExecutionEnvironment::adjustCcsCount() {
+    if (!parseCcsCountLimitations()) {
+        return false;
+    }
 
     for (auto rootDeviceIndex = 0u; rootDeviceIndex < rootDeviceEnvironments.size(); rootDeviceIndex++) {
         auto &rootDeviceEnvironment = rootDeviceEnvironments[rootDeviceIndex];
@@ -268,48 +376,78 @@ void ExecutionEnvironment::adjustCcsCount() {
             adjustCcsCountImpl(rootDeviceEnvironment.get());
         }
     }
+
+    return true;
 }
 
-void ExecutionEnvironment::adjustCcsCount(const uint32_t rootDeviceIndex) const {
+bool ExecutionEnvironment::adjustCcsCount(const uint32_t rootDeviceIndex) const {
     auto &rootDeviceEnvironment = rootDeviceEnvironments[rootDeviceIndex];
     UNRECOVERABLE_IF(!rootDeviceEnvironment);
-    if (rootDeviceNumCcsMap.find(rootDeviceIndex) != rootDeviceNumCcsMap.end()) {
-        rootDeviceEnvironment->limitNumberOfCcs(rootDeviceNumCcsMap.at(rootDeviceIndex));
+    if (auto it = rootDeviceNumCcsMap.find(rootDeviceIndex); it != rootDeviceNumCcsMap.end()) {
+        if (!rootDeviceEnvironment->setNumberOfCcs(it->second)) {
+            return false;
+        }
     } else {
         adjustCcsCountImpl(rootDeviceEnvironment.get());
     }
+
+    return true;
 }
 
-void ExecutionEnvironment::parseCcsCountLimitations() {
-    const auto &numberOfCcsString = DebugManager.flags.ZEX_NUMBER_OF_CCS.get();
+bool ExecutionEnvironment::parseCcsCountLimitations() {
+    const auto &numberOfCcsString = debugManager.flags.ZEX_NUMBER_OF_CCS.get();
 
     if (numberOfCcsString.compare("default") == 0 ||
         numberOfCcsString.empty()) {
-        return;
+        return true;
     }
 
-    const uint32_t numRootDevices = static_cast<uint32_t>(rootDeviceEnvironments.size());
-
-    auto numberOfCcsEntries = StringHelpers::split(numberOfCcsString, ",");
-
-    for (const auto &entry : numberOfCcsEntries) {
-        auto subEntries = StringHelpers::split(entry, ":");
-        uint32_t rootDeviceIndex = StringHelpers::toUint32t(subEntries[0]);
-
-        if (rootDeviceIndex < numRootDevices) {
-            if (subEntries.size() > 1) {
-                uint32_t maxCcsCount = StringHelpers::toUint32t(subEntries[1]);
-                rootDeviceNumCcsMap.insert({rootDeviceIndex, maxCcsCount});
-                rootDeviceEnvironments[rootDeviceIndex]->limitNumberOfCcs(maxCcsCount);
-            }
+    for (auto rootDeviceIndex = 0u; rootDeviceIndex < rootDeviceEnvironments.size(); rootDeviceIndex++) {
+        auto &rootDeviceEnvironment = rootDeviceEnvironments[rootDeviceIndex];
+        UNRECOVERABLE_IF(!rootDeviceEnvironment);
+        auto &productHelper = rootDeviceEnvironment->getHelper<ProductHelper>();
+        if (!productHelper.parseCcsMode(numberOfCcsString, rootDeviceNumCcsMap, rootDeviceIndex, rootDeviceEnvironment.get())) {
+            return false;
         }
     }
+
+    return true;
 }
 
 void ExecutionEnvironment::configureNeoEnvironment() {
-    if (DebugManager.flags.NEO_CAL_ENABLED.get()) {
-        DebugManager.flags.UseKmdMigration.setIfDefault(0);
-        DebugManager.flags.SplitBcsSize.setIfDefault(256);
+    if (debugManager.flags.NEO_CAL_ENABLED.get()) {
+        debugManager.flags.UseKmdMigration.setIfDefault(0);
+        debugManager.flags.SplitBcsSize.setIfDefault(256);
     }
 }
+
+bool ExecutionEnvironment::comparePciIdBusNumber(std::unique_ptr<RootDeviceEnvironment> &rootDeviceEnvironment1, std::unique_ptr<RootDeviceEnvironment> &rootDeviceEnvironment2) {
+    const auto pciOrderVar = debugManager.flags.ZE_ENABLE_PCI_ID_DEVICE_ORDER.get();
+    if (!pciOrderVar) {
+        auto isIntegrated1 = rootDeviceEnvironment1->getHardwareInfo()->capabilityTable.isIntegratedDevice;
+        auto isIntegrated2 = rootDeviceEnvironment2->getHardwareInfo()->capabilityTable.isIntegratedDevice;
+        if (isIntegrated1 != isIntegrated2) {
+            return isIntegrated2;
+        }
+    }
+
+    // BDF sample format is : 00:02.0
+    auto pciBusInfo1 = rootDeviceEnvironment1->osInterface->getDriverModel()->getPciBusInfo();
+    auto pciBusInfo2 = rootDeviceEnvironment2->osInterface->getDriverModel()->getPciBusInfo();
+
+    if (pciBusInfo1.pciDomain != pciBusInfo2.pciDomain) {
+        return (pciBusInfo1.pciDomain < pciBusInfo2.pciDomain);
+    }
+
+    if (pciBusInfo1.pciBus != pciBusInfo2.pciBus) {
+        return (pciBusInfo1.pciBus < pciBusInfo2.pciBus);
+    }
+
+    if (pciBusInfo1.pciDevice != pciBusInfo2.pciDevice) {
+        return (pciBusInfo1.pciDevice < pciBusInfo2.pciDevice);
+    }
+
+    return (pciBusInfo1.pciFunction < pciBusInfo2.pciFunction);
+}
+
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,11 @@
 
 #include "shared/source/os_interface/driver_info.h"
 
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/ecc/windows/mock_ecc.h"
 
 extern bool sysmanUltsEnable;
-
-using ::testing::Matcher;
-using ::testing::NiceMock;
 
 namespace L0 {
 namespace ult {
@@ -32,7 +31,7 @@ class ZesEccFixture : public SysmanDeviceFixture {
         }
         SysmanDeviceFixture::SetUp();
         pFwUtilInterfaceOld = pWddmSysmanImp->pFwUtilInterface;
-        pMockFwInterface = std::make_unique<NiceMock<Mock<EccFwInterface>>>();
+        pMockFwInterface = std::make_unique<Mock<EccFwInterface>>();
         pWddmSysmanImp->pFwUtilInterface = pMockFwInterface.get();
 
         pEccImp = static_cast<L0::EccImp *>(pSysmanDeviceImp->pEcc);
@@ -67,8 +66,8 @@ TEST_F(ZesEccFixture, GivenValidSysmanHandleAndFwInterfaceIsAbsentWhenCallingEcc
     ze_bool_t eccConfigurable = true;
     ze_bool_t eccAvailable = true;
     EccImp *tempEccImp = new EccImp(pOsSysman);
-    auto deviceImp = static_cast<L0::DeviceImp *>(pWddmSysmanImp->getDeviceHandle());
-    deviceImp->driverInfo.reset(nullptr);
+    auto l0Device = static_cast<L0::Device *>(pWddmSysmanImp->getDeviceHandle());
+    l0Device->driverInfo.reset(nullptr);
     pWddmSysmanImp->pFwUtilInterface = nullptr;
     tempEccImp->init();
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, tempEccImp->deviceEccAvailable(&eccAvailable));

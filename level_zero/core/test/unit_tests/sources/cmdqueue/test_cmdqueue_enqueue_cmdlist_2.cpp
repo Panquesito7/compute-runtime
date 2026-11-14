@@ -1,57 +1,72 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/in_order_cmd_helpers.h"
 #include "shared/source/helpers/pause_on_gpu_properties.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_bindless_heaps_helper.h"
+#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/test_macros/heapless_matchers.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "level_zero/core/source/cmdlist/cmdlist.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_context.h"
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
 #include "level_zero/core/source/fence/fence.h"
 #include "level_zero/core/test/unit_tests/fixtures/cmdlist_fixture.inl"
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_fence.h"
+#include "level_zero/core/test/unit_tests/sources/helper/ze_object_utils.h"
+
+#include <cstddef>
+#include <optional>
 
 namespace L0 {
 namespace ult {
 
 using CommandQueueExecuteCommandListsSimpleTest = Test<DeviceFixture>;
 
-HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, GivenSynchronousModeWhenExecutingCommandListThenSynchronizeIsCalled, IsAtLeastSkl) {
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, GivenSynchronousModeWhenExecutingCommandListThenSynchronizeIsCalled) {
     ze_command_queue_desc_t desc;
     desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
-    auto mockCmdQ = new MockCommandQueueHw<gfxCoreFamily>(device, neoDevice->getDefaultEngine().commandStreamReceiver, &desc);
+    auto mockCmdQ = new MockCommandQueueHw<FamilyType::gfxCoreFamily>(device, neoDevice->getDefaultEngine().commandStreamReceiver, &desc);
     mockCmdQ->initialize(false, false, false);
     ze_result_t returnValue;
     ze_command_list_handle_t commandLists[] = {
-        CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle()};
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
     CommandList::fromHandle(commandLists[0])->close();
-    mockCmdQ->executeCommandLists(1, commandLists, nullptr, true);
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    mockCmdQ->executeCommandLists(1, commandLists, nullptr, internalOptions);
     EXPECT_EQ(mockCmdQ->synchronizedCalled, 1u);
     CommandList::fromHandle(commandLists[0])->destroy();
     mockCmdQ->destroy();
 }
 
-HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, GivenSynchronousModeAndDeviceLostSynchronizeWhenExecutingCommandListThenSynchronizeIsCalledAndDeviceLostIsReturned, IsAtLeastSkl) {
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, GivenSynchronousModeAndDeviceLostSynchronizeWhenExecutingCommandListThenSynchronizeIsCalledAndDeviceLostIsReturned) {
     ze_command_queue_desc_t desc;
     desc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
 
-    auto mockCmdQ = new MockCommandQueueHw<gfxCoreFamily>(device, neoDevice->getDefaultEngine().commandStreamReceiver, &desc);
+    auto mockCmdQ = new MockCommandQueueHw<FamilyType::gfxCoreFamily>(device, neoDevice->getDefaultEngine().commandStreamReceiver, &desc);
     mockCmdQ->initialize(false, false, false);
     mockCmdQ->synchronizeReturnValue = ZE_RESULT_ERROR_DEVICE_LOST;
 
     ze_result_t returnValue;
     ze_command_list_handle_t commandLists[] = {
-        CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle()};
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
     CommandList::fromHandle(commandLists[0])->close();
-    const auto result = mockCmdQ->executeCommandLists(1, commandLists, nullptr, true);
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    const auto result = mockCmdQ->executeCommandLists(1, commandLists, nullptr, internalOptions);
     EXPECT_EQ(mockCmdQ->synchronizedCalled, 1u);
     EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
 
@@ -59,29 +74,31 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, GivenSynchronousModeAndDevi
     mockCmdQ->destroy();
 }
 
-HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, GivenAsynchronousModeWhenExecutingCommandListThenSynchronizeIsNotCalled, IsAtLeastSkl) {
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, GivenAsynchronousModeWhenExecutingCommandListThenSynchronizeIsNotCalled) {
     ze_command_queue_desc_t desc;
     desc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-    auto mockCmdQ = new MockCommandQueueHw<gfxCoreFamily>(device, neoDevice->getDefaultEngine().commandStreamReceiver, &desc);
+    auto mockCmdQ = new MockCommandQueueHw<FamilyType::gfxCoreFamily>(device, neoDevice->getDefaultEngine().commandStreamReceiver, &desc);
     mockCmdQ->initialize(false, false, false);
     ze_result_t returnValue;
     ze_command_list_handle_t commandLists[] = {
-        CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle()};
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
     CommandList::fromHandle(commandLists[0])->close();
-    mockCmdQ->executeCommandLists(1, commandLists, nullptr, true);
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    mockCmdQ->executeCommandLists(1, commandLists, nullptr, internalOptions);
     EXPECT_EQ(mockCmdQ->synchronizedCalled, 0u);
     CommandList::fromHandle(commandLists[0])->destroy();
     mockCmdQ->destroy();
 }
 
-HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, whenUsingFenceThenLastPipeControlUpdatesFenceAllocation, IsAtLeastSkl) {
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, whenUsingFenceThenLastPipeControlUpdatesFenceAllocation) {
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using POST_SYNC_OPERATION = typename FamilyType::PIPE_CONTROL::POST_SYNC_OPERATION;
 
     ze_command_queue_desc_t queueDesc = {};
     ze_result_t returnValue;
     queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
     ASSERT_NE(nullptr, commandQueue);
 
     ze_fence_desc_t fenceDesc = {};
@@ -92,12 +109,14 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, whenUsingFenceThenLastPipeC
     auto usedSpaceBefore = commandQueue->commandStream.getUsed();
 
     ze_command_list_handle_t commandLists[] = {
-        CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle(),
-        CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle()};
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle(),
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
     uint32_t numCommandLists = sizeof(commandLists) / sizeof(commandLists[0]);
     CommandList::fromHandle(commandLists[0])->close();
     CommandList::fromHandle(commandLists[1])->close();
-    auto result = commandQueue->executeCommandLists(numCommandLists, commandLists, fenceHandle, true);
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    auto result = commandQueue->executeCommandLists(numCommandLists, commandLists, fenceHandle, internalOptions);
 
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
@@ -105,7 +124,7 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, whenUsingFenceThenLastPipeC
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), 0), usedSpaceAfter));
 
     auto pipeControls = findAll<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
@@ -129,7 +148,7 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, whenUsingFenceThenLastPipeC
     commandQueue->destroy();
 }
 
-HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingSingleCsrWhenExecutingFirstTimeOnBothThenPipelineSelectProgrammedOnce, IsAtMostXeHpcCore) {
+HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingSingleCsrWhenExecutingFirstTimeOnBothThenPipelineSelectProgrammedOnce, IsAtMostXeCore) {
     using PIPELINE_SELECT = typename FamilyType::PIPELINE_SELECT;
 
     auto &productHelper = device->getProductHelper();
@@ -138,24 +157,25 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingS
 
     ze_result_t returnValue;
 
-    ze_command_list_handle_t commandList = CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle();
+    ze_command_list_handle_t commandList = CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle();
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
 
     ze_command_queue_desc_t queueDesc = {};
     queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     ASSERT_NE(nullptr, commandQueue);
 
     CommandList::fromHandle(commandList)->close();
     auto usedSpaceBefore = commandQueue->commandStream.getUsed();
-    returnValue = commandQueue->executeCommandLists(1, &commandList, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, &commandList, nullptr, internalOptions);
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     auto usedSpaceAfter = commandQueue->commandStream.getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandQueue->commandStream.getCpuBase(), usedSpaceBefore),
         usedSpaceAfter - usedSpaceBefore));
@@ -169,17 +189,17 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingS
 
     cmdList.clear();
 
-    auto commandQueue2 = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    auto commandQueue2 = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     ASSERT_NE(nullptr, commandQueue2);
 
     usedSpaceBefore = commandQueue2->commandStream.getUsed();
-    returnValue = commandQueue2->executeCommandLists(1, &commandList, nullptr, false);
+    returnValue = commandQueue2->executeCommandLists(1, &commandList, nullptr, internalOptions);
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     usedSpaceAfter = commandQueue2->commandStream.getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandQueue2->commandStream.getCpuBase(), usedSpaceBefore),
         usedSpaceAfter - usedSpaceBefore));
@@ -193,32 +213,31 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingS
     commandQueue2->destroy();
 }
 
-using IsMmioPreemptionUsed = IsWithinGfxCore<IGFX_GEN9_CORE, IGFX_XE_HPC_CORE>;
-
-HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingSingleCsrWhenExecutingFirstTimeOnBothQueuesThenPreemptionModeIsProgrammedOnce, IsMmioPreemptionUsed) {
+HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingSingleCsrWhenExecutingFirstTimeOnBothQueuesThenPreemptionModeIsProgrammedOnce, IsAtMostXeCore) {
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
 
     ze_result_t returnValue;
 
-    ze_command_list_handle_t commandList = CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)->toHandle();
+    ze_command_list_handle_t commandList = CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle();
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
-    whiteboxCast(CommandList::fromHandle(commandList))->commandListPreemptionMode = NEO::PreemptionMode::ThreadGroup;
+    CommandList::whiteboxCast(CommandList::fromHandle(commandList))->commandListPreemptionMode = NEO::PreemptionMode::ThreadGroup;
 
     ze_command_queue_desc_t queueDesc = {};
     queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     ASSERT_NE(nullptr, commandQueue);
 
     CommandList::fromHandle(commandList)->close();
     auto usedSpaceBefore = commandQueue->commandStream.getUsed();
-    returnValue = commandQueue->executeCommandLists(1, &commandList, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, &commandList, nullptr, internalOptions);
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     auto usedSpaceAfter = commandQueue->commandStream.getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandQueue->commandStream.getCpuBase(), usedSpaceBefore),
         usedSpaceAfter - usedSpaceBefore));
@@ -238,17 +257,17 @@ HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenTwoCommandQueuesUsingS
     cmdList.clear();
     foundPreemptionMmioCount = 0;
 
-    auto commandQueue2 = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    auto commandQueue2 = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     ASSERT_NE(nullptr, commandQueue2);
 
     usedSpaceBefore = commandQueue2->commandStream.getUsed();
-    returnValue = commandQueue2->executeCommandLists(1, &commandList, nullptr, false);
+    returnValue = commandQueue2->executeCommandLists(1, &commandList, nullptr, internalOptions);
     ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
     usedSpaceAfter = commandQueue2->commandStream.getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandQueue2->commandStream.getCpuBase(), usedSpaceBefore),
         usedSpaceAfter - usedSpaceBefore));
@@ -290,17 +309,18 @@ struct PauseOnGpuFixture : public Test<ModuleFixture> {
 
         ze_command_queue_desc_t queueDesc = {};
         ze_result_t returnValue;
-        commandList = CommandList::createImmediate(productFamily, device, &queueDesc, false, NEO::EngineGroupType::RenderCompute, returnValue);
+        commandList = CommandList::createImmediate(device, &queueDesc, false, NEO::EngineGroupType::renderCompute, returnValue);
         ASSERT_NE(nullptr, commandList);
         commandListHandle = commandList->toHandle();
     }
 
-    template <typename MI_SEMAPHORE_WAIT>
+    template <typename FamilyType>
     bool verifySemaphore(const GenCmdList::iterator &iterator, uint64_t debugPauseStateAddress, DebugPauseState requiredDebugPauseState) {
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
         auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*iterator);
 
-        if ((static_cast<uint32_t>(requiredDebugPauseState) == semaphoreCmd->getSemaphoreDataDword()) &&
-            (debugPauseStateAddress == semaphoreCmd->getSemaphoreGraphicsAddress())) {
+        if ((static_cast<uint32_t>(requiredDebugPauseState) == NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd)) &&
+            (debugPauseStateAddress == NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd))) {
 
             EXPECT_EQ(MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_EQUAL_SDD, semaphoreCmd->getCompareOperation());
             EXPECT_EQ(MI_SEMAPHORE_WAIT::WAIT_MODE::WAIT_MODE_POLLING_MODE, semaphoreCmd->getWaitMode());
@@ -331,8 +351,8 @@ struct PauseOnGpuFixture : public Test<ModuleFixture> {
     template <typename FamilyType>
     bool verifyLoadRegImm(const GenCmdList::iterator &iterator) {
         using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-        uint32_t expectedRegisterOffset = DebugManager.flags.GpuScratchRegWriteRegisterOffset.get();
-        uint32_t expectedRegisterData = DebugManager.flags.GpuScratchRegWriteRegisterData.get();
+        uint32_t expectedRegisterOffset = debugManager.flags.GpuScratchRegWriteRegisterOffset.get();
+        uint32_t expectedRegisterData = debugManager.flags.GpuScratchRegWriteRegisterData.get();
         auto loadRegImm = genCmdCast<MI_LOAD_REGISTER_IMM *>(*iterator);
 
         if ((expectedRegisterOffset == loadRegImm->getRegisterOffset()) &&
@@ -343,16 +363,17 @@ struct PauseOnGpuFixture : public Test<ModuleFixture> {
         return false;
     }
 
-    template <typename MI_SEMAPHORE_WAIT>
+    template <typename FamilyType>
     void findSemaphores(GenCmdList &cmdList) {
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
         auto semaphore = find<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
 
         while (semaphore != cmdList.end()) {
-            if (verifySemaphore<MI_SEMAPHORE_WAIT>(semaphore, debugPauseStateAddress, DebugPauseState::hasUserStartConfirmation)) {
+            if (verifySemaphore<FamilyType>(semaphore, debugPauseStateAddress, DebugPauseState::hasUserStartConfirmation)) {
                 semaphoreBeforeWalkerFound++;
             }
 
-            if (verifySemaphore<MI_SEMAPHORE_WAIT>(semaphore, debugPauseStateAddress, DebugPauseState::hasUserEndConfirmation)) {
+            if (verifySemaphore<FamilyType>(semaphore, debugPauseStateAddress, DebugPauseState::hasUserEndConfirmation)) {
                 semaphoreAfterWalkerFound++;
             }
 
@@ -378,15 +399,75 @@ struct PauseOnGpuFixture : public Test<ModuleFixture> {
         }
     }
 
+    template <typename FamilyType>
+    void findPauseLoadRegImms(GenCmdList &cmdList, uint32_t expectedOffset, uint32_t expectedData) {
+        using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+        using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+        for (auto it = cmdList.begin(); it != cmdList.end(); ++it) {
+            if (nullptr == genCmdCast<PIPE_CONTROL *>(*it)) {
+                continue;
+            }
+
+            DebugPauseState semaphoreState;
+            if (verifyPipeControl<FamilyType>(it, debugPauseStateAddress, DebugPauseState::waitingForUserStartConfirmation)) {
+                semaphoreState = DebugPauseState::hasUserStartConfirmation;
+            } else if (verifyPipeControl<FamilyType>(it, debugPauseStateAddress, DebugPauseState::waitingForUserEndConfirmation)) {
+                semaphoreState = DebugPauseState::hasUserEndConfirmation;
+            } else {
+                continue;
+            }
+
+            auto next = it;
+            ++next;
+            auto loadRegImm = find<MI_LOAD_REGISTER_IMM *>(next, cmdList.end());
+            auto semaphore = find<MI_SEMAPHORE_WAIT *>(next, cmdList.end());
+
+            if (loadRegImm == cmdList.end() || semaphore == cmdList.end()) {
+                continue;
+            }
+            if (std::distance(cmdList.begin(), loadRegImm) > std::distance(cmdList.begin(), semaphore)) {
+                continue;
+            }
+
+            auto loadRegImmCmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(*loadRegImm);
+            if ((expectedOffset == loadRegImmCmd->getRegisterOffset()) &&
+                (expectedData == loadRegImmCmd->getDataDword()) &&
+                verifySemaphore<FamilyType>(semaphore, debugPauseStateAddress, semaphoreState)) {
+                if (semaphoreState == DebugPauseState::hasUserStartConfirmation) {
+                    pauseLoadRegImmBeforeWalkerFound++;
+                } else {
+                    pauseLoadRegImmAfterWalkerFound++;
+                }
+            }
+        }
+    }
+
     void enqueueKernel() {
-        auto result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+        auto result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
         result = commandList->close();
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
-
-        result = commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, false);
+        CommandListExecutionInternalOptions internalOptions = {};
+        result = commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions);
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    }
+
+    template <typename FamilyType>
+    void findPauses(NEO::LinearStream &stream, size_t offset) {
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(stream.getCpuBase(), offset), stream.getUsed() - offset));
+        findSemaphores<FamilyType>(cmdList);
+        findPipeControls<FamilyType>(cmdList);
+    }
+
+    void resetPauseCounts() {
+        semaphoreBeforeWalkerFound = 0;
+        semaphoreAfterWalkerFound = 0;
+        pipeControlBeforeWalkerFound = 0;
+        pipeControlAfterWalkerFound = 0;
     }
 
     DebugManagerStateRestore restore;
@@ -404,39 +485,79 @@ struct PauseOnGpuFixture : public Test<ModuleFixture> {
     uint32_t semaphoreAfterWalkerFound = 0;
     uint32_t pipeControlBeforeWalkerFound = 0;
     uint32_t pipeControlAfterWalkerFound = 0;
+    uint32_t pauseLoadRegImmBeforeWalkerFound = 0;
+    uint32_t pauseLoadRegImmAfterWalkerFound = 0;
 };
 
 struct PauseOnGpuTests : public PauseOnGpuFixture {
     void SetUp() override {
         PauseOnGpuFixture::setUp();
+        createQueueAndCommandList();
+    }
 
+    void createQueueAndCommandList() {
         ze_command_queue_desc_t queueDesc = {};
         ze_result_t returnValue;
-        commandQueue = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+        commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
         ASSERT_NE(nullptr, commandQueue);
 
-        commandList = CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue);
+        commandList = CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false);
         ASSERT_NE(nullptr, commandList);
         commandListHandle = commandList->toHandle();
     }
 
+    void recreateQueueAndCommandList() {
+        commandList->destroy();
+        commandQueue->destroy();
+        createQueueAndCommandList();
+    }
+
+    template <typename FamilyType>
+    void verifyQueuePausesSurroundCommandList(size_t queueOffset) {
+        using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+        using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+        auto &queueStream = commandQueue->commandStream;
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(queueStream.getCpuBase(), queueOffset), queueStream.getUsed() - queueOffset));
+
+        const auto listStartAddress = commandList->getCmdContainer().getCmdBufferAllocations()[0]->getGpuAddress();
+        std::optional<size_t> startPause, listStart, endPause;
+        size_t index = 0;
+        for (auto it = cmdList.begin(); it != cmdList.end(); ++it, ++index) {
+            if (genCmdCast<MI_SEMAPHORE_WAIT *>(*it) && verifySemaphore<FamilyType>(it, debugPauseStateAddress, DebugPauseState::hasUserStartConfirmation)) {
+                startPause = index;
+            }
+            if (auto bbStart = genCmdCast<MI_BATCH_BUFFER_START *>(*it); bbStart && bbStart->getBatchBufferStartAddress() == listStartAddress && !listStart) {
+                listStart = index;
+            }
+            if (genCmdCast<PIPE_CONTROL *>(*it) && verifyPipeControl<FamilyType>(it, debugPauseStateAddress, DebugPauseState::waitingForUserEndConfirmation)) {
+                endPause = index;
+            }
+        }
+
+        ASSERT_TRUE(startPause.has_value());
+        ASSERT_TRUE(listStart.has_value());
+        ASSERT_TRUE(endPause.has_value());
+        EXPECT_LT(startPause.value(), listStart.value());
+        EXPECT_LT(listStart.value(), endPause.value());
+    }
+
     void enqueueKernel() {
-        auto result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+        auto result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
         result = commandList->close();
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
-
-        result = commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, false);
+        CommandListExecutionInternalOptions internalOptions = {};
+        result = commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions);
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     }
 };
 
 HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetWhenDispatchWalkersThenInsertPauseCommandsAroundSpecifiedEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(1);
+    debugManager.flags.PauseOnEnqueue.set(1);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -446,12 +567,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetWhenDispatchWalkersThenInser
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
-
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
-    findPipeControls<FamilyType>(cmdList);
+    findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+    findPauses<FamilyType>(commandQueue->commandStream, 0);
 
     EXPECT_EQ(1u, semaphoreBeforeWalkerFound);
     EXPECT_EQ(1u, semaphoreAfterWalkerFound);
@@ -459,11 +576,48 @@ HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetWhenDispatchWalkersThenInser
     EXPECT_EQ(1u, pipeControlAfterWalkerFound);
 }
 
-HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetToAlwaysWhenDispatchWalkersThenInsertPauseCommandsAroundEachEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetWhenDispatchWalkersThenInsertLoadRegisterImmWithDefaultValuesBeforePauseSemaphore) {
+    debugManager.flags.PauseOnEnqueue.set(-2);
 
-    DebugManager.flags.PauseOnEnqueue.set(-2);
+    enqueueKernel();
+
+    auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
+
+    findPauseLoadRegImms<FamilyType>(cmdList,
+                                     static_cast<uint32_t>(debugManager.flags.PauseOnEnqueueRegisterOffset.get()),
+                                     static_cast<uint32_t>(debugManager.flags.PauseOnEnqueueRegisterData.get()));
+
+    EXPECT_EQ(0x4f080u, static_cast<uint32_t>(debugManager.flags.PauseOnEnqueueRegisterOffset.get()));
+    EXPECT_EQ(0xaaaau, static_cast<uint32_t>(debugManager.flags.PauseOnEnqueueRegisterData.get()));
+    EXPECT_EQ(1u, pauseLoadRegImmBeforeWalkerFound);
+    EXPECT_EQ(1u, pauseLoadRegImmAfterWalkerFound);
+}
+
+HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueRegisterOverridesWhenDispatchWalkersThenInsertLoadRegisterImmWithOverriddenValuesBeforePauseSemaphore) {
+    debugManager.flags.PauseOnEnqueue.set(-2);
+    debugManager.flags.PauseOnEnqueueRegisterOffset.set(0x1234);
+    debugManager.flags.PauseOnEnqueueRegisterData.set(0x5678);
+
+    enqueueKernel();
+
+    auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
+
+    findPauseLoadRegImms<FamilyType>(cmdList, 0x1234u, 0x5678u);
+
+    EXPECT_EQ(1u, pauseLoadRegImmBeforeWalkerFound);
+    EXPECT_EQ(1u, pauseLoadRegImmAfterWalkerFound);
+}
+
+HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetToAlwaysWhenDispatchWalkersThenInsertPauseCommandsAroundEachEnqueue) {
+    debugManager.flags.PauseOnEnqueue.set(-2);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -474,10 +628,10 @@ HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetToAlwaysWhenDispatchWalkersT
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
 
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
+    findSemaphores<FamilyType>(cmdList);
     findPipeControls<FamilyType>(cmdList);
 
     EXPECT_EQ(2u, semaphoreBeforeWalkerFound);
@@ -487,11 +641,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseOnEnqueueFlagSetToAlwaysWhenDispatchWalkersT
 }
 
 HWTEST_F(PauseOnGpuTests, givenPauseModeSetToBeforeOnlyWhenDispatchingThenInsertPauseOnlyBeforeEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(0);
-    DebugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeWorkload);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    debugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeWorkload);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -501,13 +652,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseModeSetToBeforeOnlyWhenDispatchingThenInsert
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
-
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
-
-    findPipeControls<FamilyType>(cmdList);
+    findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+    findPauses<FamilyType>(commandQueue->commandStream, 0);
 
     EXPECT_EQ(1u, semaphoreBeforeWalkerFound);
     EXPECT_EQ(0u, semaphoreAfterWalkerFound);
@@ -516,11 +662,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseModeSetToBeforeOnlyWhenDispatchingThenInsert
 }
 
 HWTEST_F(PauseOnGpuTests, givenPauseModeSetToAfterOnlyWhenDispatchingThenInsertPauseOnlyAfterEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(0);
-    DebugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::AfterWorkload);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    debugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::AfterWorkload);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -529,12 +672,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseModeSetToAfterOnlyWhenDispatchingThenInsertP
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
-
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
-    findPipeControls<FamilyType>(cmdList);
+    findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+    findPauses<FamilyType>(commandQueue->commandStream, 0);
 
     EXPECT_EQ(0u, semaphoreBeforeWalkerFound);
     EXPECT_EQ(1u, semaphoreAfterWalkerFound);
@@ -543,11 +682,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseModeSetToAfterOnlyWhenDispatchingThenInsertP
 }
 
 HWTEST_F(PauseOnGpuTests, givenPauseModeSetToBeforeAndAfterWhenDispatchingThenInsertPauseAroundEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(0);
-    DebugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeAndAfterWorkload);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    debugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeAndAfterWorkload);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -556,13 +692,8 @@ HWTEST_F(PauseOnGpuTests, givenPauseModeSetToBeforeAndAfterWhenDispatchingThenIn
     auto usedSpaceAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
-
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
-
-    findPipeControls<FamilyType>(cmdList);
+    findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+    findPauses<FamilyType>(commandQueue->commandStream, 0);
 
     EXPECT_EQ(1u, semaphoreBeforeWalkerFound);
     EXPECT_EQ(1u, semaphoreAfterWalkerFound);
@@ -570,32 +701,182 @@ HWTEST_F(PauseOnGpuTests, givenPauseModeSetToBeforeAndAfterWhenDispatchingThenIn
     EXPECT_EQ(1u, pipeControlAfterWalkerFound);
 }
 
+HWTEST_F(PauseOnGpuTests, givenRegularListRecordedBeforeSelectedSubmissionWhenExecutedRepeatedlyThenOnlySelectedExecutionPauses) {
+    debugManager.flags.PauseOnEnqueue.set(1);
+    neoDevice->debugExecutionCounter.store(0);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+    EXPECT_EQ(2u, commandList->getCommandsToPatch().size());
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    for (uint32_t execution = 0; execution < 3; execution++) {
+        const auto queueOffset = commandQueue->commandStream.getUsed();
+        ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+        EXPECT_EQ(execution + 1, neoDevice->debugExecutionCounter.load());
+
+        resetPauseCounts();
+        findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+        EXPECT_EQ(0u, semaphoreBeforeWalkerFound + semaphoreAfterWalkerFound + pipeControlBeforeWalkerFound + pipeControlAfterWalkerFound);
+
+        findPauses<FamilyType>(commandQueue->commandStream, queueOffset);
+        const uint32_t expectedPauses = execution == 1 ? 1u : 0u;
+        EXPECT_EQ(expectedPauses, semaphoreBeforeWalkerFound);
+        EXPECT_EQ(expectedPauses, semaphoreAfterWalkerFound);
+        EXPECT_EQ(expectedPauses, pipeControlBeforeWalkerFound);
+        EXPECT_EQ(expectedPauses, pipeControlAfterWalkerFound);
+    }
+}
+
+HWTEST_F(PauseOnGpuTests, givenNumberedPauseWhenSubmissionRepeatsListWithMultipleKernelsThenOnlyOnePausePairSurroundsWholeSubmission) {
+    debugManager.flags.PauseOnEnqueue.set(0);
+    neoDevice->debugExecutionCounter.store(0);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+    EXPECT_EQ(4u, commandList->getCommandsToPatch().size());
+
+    ze_command_list_handle_t commandListHandles[] = {commandListHandle, commandListHandle};
+    CommandListExecutionInternalOptions internalOptions = {};
+    const auto queueOffset = commandQueue->commandStream.getUsed();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(2u, commandListHandles, nullptr, internalOptions));
+
+    findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+    EXPECT_EQ(0u, semaphoreBeforeWalkerFound + semaphoreAfterWalkerFound + pipeControlBeforeWalkerFound + pipeControlAfterWalkerFound);
+
+    findPauses<FamilyType>(commandQueue->commandStream, queueOffset);
+    EXPECT_EQ(1u, semaphoreBeforeWalkerFound);
+    EXPECT_EQ(1u, semaphoreAfterWalkerFound);
+    EXPECT_EQ(1u, pipeControlBeforeWalkerFound);
+    EXPECT_EQ(1u, pipeControlAfterWalkerFound);
+}
+
+HWTEST_F(PauseOnGpuTests, givenFailedRegularSubmissionWhenPauseOnEnqueueIsSetThenCounterDoesNotAdvance) {
+    debugManager.flags.PauseOnEnqueue.set(0);
+    neoDevice->debugExecutionCounter.store(0);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+
+    auto csr = static_cast<UltCommandStreamReceiver<FamilyType> *>(commandQueue->csr);
+    CommandListExecutionInternalOptions internalOptions = {};
+    csr->flushReturnValue = SubmissionStatus::outOfMemory;
+    EXPECT_NE(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+    EXPECT_EQ(0u, neoDevice->debugExecutionCounter.load());
+    csr->flushReturnValue.reset();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+    EXPECT_EQ(1u, neoDevice->debugExecutionCounter.load());
+}
+
+HWTEST_F(PauseOnGpuTests, givenPrimaryBatchBufferDispatchWhenNumberedPauseIsSelectedThenCommandListReturnsToEndPause) {
+    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    debugManager.flags.DispatchCmdlistCmdBufferPrimary.set(1);
+    recreateQueueAndCommandList();
+    ASSERT_TRUE(commandQueue->dispatchCmdListBatchBufferAsPrimary);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    neoDevice->debugExecutionCounter.store(0);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    const auto queueOffset = commandQueue->commandStream.getUsed();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+
+    verifyQueuePausesSurroundCommandList<FamilyType>(queueOffset);
+
+    auto &queueStream = commandQueue->commandStream;
+    auto listEndBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(commandList->getCmdContainer().getEndCmdPtr());
+    const auto returnOffset = static_cast<size_t>(listEndBbStart->getBatchBufferStartAddress() - queueStream.getGpuBase());
+    ASSERT_GT(returnOffset, queueOffset);
+    ASSERT_LT(returnOffset, queueStream.getUsed());
+
+    GenCmdList afterReturn;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(afterReturn, ptrOffset(queueStream.getCpuBase(), returnOffset), queueStream.getUsed() - returnOffset));
+    auto endPause = afterReturn.begin();
+    for (; endPause != afterReturn.end(); ++endPause) {
+        if (genCmdCast<PIPE_CONTROL *>(*endPause) && verifyPipeControl<FamilyType>(endPause, debugPauseStateAddress, DebugPauseState::waitingForUserEndConfirmation)) {
+            break;
+        }
+    }
+    ASSERT_NE(afterReturn.end(), endPause);
+    EXPECT_EQ(endPause, find<MI_BATCH_BUFFER_START *>(afterReturn.begin(), endPause));
+}
+
+HWTEST_F(PauseOnGpuTests, givenSecondaryBatchBufferDispatchWhenNumberedPauseIsSelectedThenQueuePausesSurroundCommandList) {
+    debugManager.flags.DispatchCmdlistCmdBufferPrimary.set(0);
+    recreateQueueAndCommandList();
+    ASSERT_FALSE(commandQueue->dispatchCmdListBatchBufferAsPrimary);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    neoDevice->debugExecutionCounter.store(0);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    const auto queueOffset = commandQueue->commandStream.getUsed();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+
+    verifyQueuePausesSurroundCommandList<FamilyType>(queueOffset);
+}
+
+HWTEST_F(PauseOnGpuTests, givenPatchingPreambleWhenNumberedPauseIsSelectedThenQueuePausesSurroundCommandList) {
+    debugManager.flags.PauseOnEnqueue.set(0);
+    neoDevice->debugExecutionCounter.store(0);
+    commandQueue->setPatchingPreamble(true);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    const auto queueOffset = commandQueue->commandStream.getUsed();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+
+    verifyQueuePausesSurroundCommandList<FamilyType>(queueOffset);
+    findPauses<FamilyType>(*commandList->getCmdContainer().getCommandStream(), 0);
+    EXPECT_EQ(0u, semaphoreBeforeWalkerFound + semaphoreAfterWalkerFound + pipeControlBeforeWalkerFound + pipeControlAfterWalkerFound);
+}
+
+HWTEST2_F(PauseOnGpuTests, givenHeaplessQueueWhenNumberedPauseIsSelectedThenQueuePausesSurroundCommandList, IsHeaplessRequired) {
+    ASSERT_TRUE(commandQueue->heaplessModeEnabled);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    neoDevice->debugExecutionCounter.store(0);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    const auto queueOffset = commandQueue->commandStream.getUsed();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandQueue->executeCommandLists(1u, &commandListHandle, nullptr, internalOptions));
+
+    verifyQueuePausesSurroundCommandList<FamilyType>(queueOffset);
+}
+
 struct PauseOnGpuWithImmediateCommandListTests : public PauseOnGpuFixture {
     void SetUp() override {
         PauseOnGpuFixture::setUp();
-        DebugManager.flags.EnableFlushTaskSubmission.set(1);
 
         ze_command_queue_desc_t queueDesc = {};
         ze_result_t returnValue;
-        commandQueue = whiteboxCast(CommandQueue::create(productFamily, device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+        commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
         ASSERT_NE(nullptr, commandQueue);
 
-        commandList = CommandList::createImmediate(productFamily, device, &queueDesc, false, NEO::EngineGroupType::RenderCompute, returnValue);
+        commandList = CommandList::createImmediate(device, &queueDesc, false, NEO::EngineGroupType::renderCompute, returnValue);
         ASSERT_NE(nullptr, commandList);
         commandListHandle = commandList->toHandle();
     }
 
     void enqueueKernel() {
-        auto result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+        auto result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
         ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     }
 };
 
 HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseOnEnqueueFlagSetWhenDispatchWalkersThenInsertPauseCommandsAroundSpecifiedEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(1);
+    debugManager.flags.PauseOnEnqueue.set(1);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -606,10 +887,10 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseOnEnqueueFlagSetWhen
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
 
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
+    findSemaphores<FamilyType>(cmdList);
     findPipeControls<FamilyType>(cmdList);
 
     EXPECT_EQ(1u, semaphoreBeforeWalkerFound);
@@ -619,10 +900,7 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseOnEnqueueFlagSetWhen
 }
 
 HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseOnEnqueueFlagSetToAlwaysWhenDispatchWalkersThenInsertPauseCommandsAroundEachEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(-2);
+    debugManager.flags.PauseOnEnqueue.set(-2);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -633,24 +911,22 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseOnEnqueueFlagSetToAl
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
 
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
+    findSemaphores<FamilyType>(cmdList);
     findPipeControls<FamilyType>(cmdList);
 
     EXPECT_EQ(2u, semaphoreBeforeWalkerFound);
     EXPECT_EQ(2u, semaphoreAfterWalkerFound);
     EXPECT_EQ(2u, pipeControlBeforeWalkerFound);
     EXPECT_EQ(2u, pipeControlAfterWalkerFound);
+    EXPECT_TRUE(commandList->getCommandsToPatch().empty());
 }
 
 HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToBeforeOnlyWhenDispatchingThenInsertPauseOnlyBeforeEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(0);
-    DebugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeWorkload);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    debugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeWorkload);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -661,10 +937,10 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToBeforeOnlyW
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
 
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
+    findSemaphores<FamilyType>(cmdList);
 
     findPipeControls<FamilyType>(cmdList);
 
@@ -675,11 +951,8 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToBeforeOnlyW
 }
 
 HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToAfterOnlyWhenDispatchingThenInsertPauseOnlyAfterEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(0);
-    DebugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::AfterWorkload);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    debugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::AfterWorkload);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -689,10 +962,10 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToAfterOnlyWh
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
 
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
+    findSemaphores<FamilyType>(cmdList);
     findPipeControls<FamilyType>(cmdList);
 
     EXPECT_EQ(0u, semaphoreBeforeWalkerFound);
@@ -702,11 +975,8 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToAfterOnlyWh
 }
 
 HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToBeforeAndAfterWhenDispatchingThenInsertPauseAroundEnqueue) {
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-
-    DebugManager.flags.PauseOnEnqueue.set(0);
-    DebugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeAndAfterWorkload);
+    debugManager.flags.PauseOnEnqueue.set(0);
+    debugManager.flags.PauseOnGpuMode.set(PauseOnGpuProperties::PauseMode::BeforeAndAfterWorkload);
 
     auto usedSpaceBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
 
@@ -716,10 +986,10 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToBeforeAndAf
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), usedSpaceAfter));
 
-    findSemaphores<MI_SEMAPHORE_WAIT>(cmdList);
+    findSemaphores<FamilyType>(cmdList);
 
     findPipeControls<FamilyType>(cmdList);
 
@@ -731,7 +1001,12 @@ HWTEST_F(PauseOnGpuWithImmediateCommandListTests, givenPauseModeSetToBeforeAndAf
 
 using CmdListPipelineSelectStateTest = Test<CmdListPipelineSelectStateFixture>;
 
-using SystolicSupport = IsAnyProducts<IGFX_ALDERLAKE_P, IGFX_XE_HP_SDV, IGFX_DG2, IGFX_PVC>;
+struct SystolicSupport {
+    template <PRODUCT_FAMILY productFamily>
+    static constexpr bool isMatched() {
+        return IsAnyProducts<IGFX_ALDERLAKE_P, IGFX_PVC>::isMatched<productFamily>() || IsXeHpgCore::isMatched<productFamily>();
+    }
+};
 
 HWTEST2_F(CmdListPipelineSelectStateTest,
           givenAppendSystolicKernelToCommandListWhenExecutingCommandListThenPipelineSelectStateIsTrackedCorrectly, SystolicSupport) {
@@ -763,10 +1038,1360 @@ HWTEST2_F(CmdListThreadArbitrationTest,
 
 using CmdListLargeGrfTest = Test<CmdListLargeGrfFixture>;
 
-using LargeGrfSupport = IsAnyProducts<IGFX_XE_HP_SDV, IGFX_DG2, IGFX_PVC>;
+struct LargeGrfSupport {
+    template <PRODUCT_FAMILY productFamily>
+    static constexpr bool isMatched() {
+        return IsXeHpgCore::isMatched<productFamily>() || IsPVC::isMatched<productFamily>();
+    }
+};
+
 HWTEST2_F(CmdListLargeGrfTest,
           givenAppendLargeGrfKernelToCommandListWhenExecutingCommandListThenStateComputeModeStateIsTrackedCorrectly, LargeGrfSupport) {
     testBody<FamilyType>();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, GivenDirtyFlagForContextInBindlessHelperWhenExecutingCmdListsThenStateCacheInvalidateIsSent) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    ze_command_queue_desc_t queueDesc = {};
+    ze_result_t returnValue;
+
+    auto bindlessHeapsHelper = std::make_unique<MockBindlesHeapsHelper>(neoDevice, neoDevice->getNumGenericSubDevices() > 1);
+    MockBindlesHeapsHelper *bindlessHeapsHelperPtr = bindlessHeapsHelper.get();
+
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->bindlessHeapsHelper.reset(bindlessHeapsHelper.release());
+
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    ASSERT_NE(nullptr, commandQueue);
+
+    bindlessHeapsHelperPtr->stateCacheDirtyForContext.at(commandQueue->getCsr()->getOsContext().getContextId()) = true;
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+
+    ze_command_list_handle_t commandLists[] = {
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle(),
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
+    uint32_t numCommandLists = sizeof(commandLists) / sizeof(commandLists[0]);
+    CommandList::fromHandle(commandLists[0])->close();
+    CommandList::fromHandle(commandLists[1])->close();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    auto result = commandQueue->executeCommandLists(numCommandLists, commandLists, nullptr, internalOptions);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), 0), usedSpaceAfter));
+
+    auto pipeControls = findAll<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, pipeControls.size());
+
+    auto pipeControl = reinterpret_cast<PIPE_CONTROL *>(*pipeControls[0]);
+    EXPECT_TRUE(pipeControl->getCommandStreamerStallEnable());
+    EXPECT_TRUE(pipeControl->getStateCacheInvalidationEnable());
+    EXPECT_TRUE(pipeControl->getTextureCacheInvalidationEnable());
+    EXPECT_TRUE(pipeControl->getRenderTargetCacheFlushEnable());
+
+    EXPECT_FALSE(bindlessHeapsHelperPtr->getStateDirtyForContext(commandQueue->getCsr()->getOsContext().getContextId()));
+
+    for (auto i = 0u; i < numCommandLists; i++) {
+        auto commandList = CommandList::fromHandle(commandLists[i]);
+        commandList->destroy();
+    }
+
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, GivenRegisterInstructionCacheFlushWhenExecutingCmdListsThenInstructionCacheInvalidateIsSent) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    ze_command_queue_desc_t queueDesc = {};
+    ze_result_t returnValue;
+
+    neoDevice->getDefaultEngine().commandStreamReceiver->registerInstructionCacheFlush();
+
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    ASSERT_NE(nullptr, commandQueue);
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+
+    ze_command_list_handle_t commandLists[] = {
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
+    uint32_t numCommandLists = 1;
+    CommandList::fromHandle(commandLists[0])->close();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    auto result = commandQueue->executeCommandLists(numCommandLists, commandLists, nullptr, internalOptions);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), 0), usedSpaceAfter));
+
+    auto pipeControls = findAll<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, pipeControls.size());
+
+    bool foundInstructionCacheInvalidate = false;
+    for (auto pipeControlIT : pipeControls) {
+        auto pipeControl = reinterpret_cast<PIPE_CONTROL *>(*pipeControlIT);
+        if (pipeControl->getInstructionCacheInvalidateEnable()) {
+            foundInstructionCacheInvalidate = true;
+            break;
+        }
+    }
+
+    EXPECT_TRUE(foundInstructionCacheInvalidate);
+
+    for (auto i = 0u; i < numCommandLists; i++) {
+        auto commandList = CommandList::fromHandle(commandLists[i]);
+        commandList->destroy();
+    }
+
+    commandQueue->destroy();
+}
+
+using CommandQueueExecuteCommandListsMultiDeviceTest = Test<MultiDeviceFixture>;
+
+HWTEST_F(CommandQueueExecuteCommandListsMultiDeviceTest, GivenDirtyFlagForContextInBindlessHelperWhenExecutingCmdListsThenStateCacheInvalidateIsSent) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    ze_command_queue_desc_t queueDesc = {};
+    ze_result_t returnValue;
+    auto neoDevice = driverHandle->devices[numRootDevices - 1]->getNEODevice();
+    auto device = driverHandle->devices[numRootDevices - 1];
+
+    auto bindlessHeapsHelper = std::make_unique<MockBindlesHeapsHelper>(neoDevice, neoDevice->getNumGenericSubDevices() > 1);
+    MockBindlesHeapsHelper *bindlessHeapsHelperPtr = bindlessHeapsHelper.get();
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->bindlessHeapsHelper.reset(bindlessHeapsHelper.release());
+
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS;
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    ASSERT_NE(nullptr, commandQueue);
+
+    uint32_t contextId = commandQueue->getCsr()->getOsContext().getContextId();
+    uint32_t contextIdFirst = neoDevice->getMemoryManager()->getFirstContextIdForRootDevice(numRootDevices - 1);
+    EXPECT_LE(contextIdFirst, contextId);
+
+    uint32_t firstDeviceFirstContextId = neoDevice->getMemoryManager()->getFirstContextIdForRootDevice(0);
+    EXPECT_EQ(0u, firstDeviceFirstContextId);
+
+    std::fill(bindlessHeapsHelperPtr->stateCacheDirtyForContext.begin(), bindlessHeapsHelperPtr->stateCacheDirtyForContext.end(), true);
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+
+    ze_command_list_handle_t commandLists[] = {
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle(),
+        CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)->toHandle()};
+    uint32_t numCommandLists = sizeof(commandLists) / sizeof(commandLists[0]);
+    CommandList::fromHandle(commandLists[0])->close();
+    CommandList::fromHandle(commandLists[1])->close();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    auto result = commandQueue->executeCommandLists(numCommandLists, commandLists, nullptr, internalOptions);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), 0), usedSpaceAfter));
+
+    auto pipeControls = findAll<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, pipeControls.size());
+
+    auto pipeControl = reinterpret_cast<PIPE_CONTROL *>(*pipeControls[0]);
+    EXPECT_TRUE(pipeControl->getCommandStreamerStallEnable());
+    EXPECT_TRUE(pipeControl->getStateCacheInvalidationEnable());
+    EXPECT_TRUE(pipeControl->getTextureCacheInvalidationEnable());
+    EXPECT_TRUE(pipeControl->getRenderTargetCacheFlushEnable());
+
+    EXPECT_FALSE(bindlessHeapsHelperPtr->getStateDirtyForContext(commandQueue->getCsr()->getOsContext().getContextId()));
+
+    for (auto i = 0u; i < numCommandLists; i++) {
+        auto commandList = CommandList::fromHandle(commandLists[i]);
+        commandList->destroy();
+    }
+
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenRegularCommandListNotClosedWhenExecutingCommandListThenReturnError) {
+    ze_command_queue_desc_t queueDesc = {};
+    ze_result_t returnValue = ZE_RESULT_SUCCESS;
+    auto commandQueue = whiteboxCast(CommandQueue::create(device, neoDevice->getDefaultEngine().commandStreamReceiver, &queueDesc, false, false, false, returnValue));
+    ASSERT_NE(nullptr, commandQueue);
+
+    auto engineGroupType = neoDevice->getGfxCoreHelper().getEngineGroupType(neoDevice->getDefaultEngine().getEngineType(),
+                                                                            neoDevice->getDefaultEngine().getEngineUsage(), neoDevice->getHardwareInfo());
+
+    auto commandList = CommandList::create(device, engineGroupType, 0u, returnValue, false);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    EXPECT_FALSE(commandList->isClosed());
+
+    auto commandListHandle = commandList->toHandle();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    returnValue = commandQueue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, returnValue);
+
+    commandList->close();
+    EXPECT_TRUE(commandList->isClosed());
+
+    commandList->reset();
+    EXPECT_FALSE(commandList->isClosed());
+
+    commandList->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleWhenSingleCmdListExecutedThenPatchPreambleContainsEncodingReturningBbStartCmd) {
+    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    uint32_t bbStartDwordBuffer[sizeof(MI_BATCH_BUFFER_START) / sizeof(uint32_t)] = {0};
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 false,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandLists[] = {commandList->toHandle()};
+    commandList->close();
+    uint64_t endGpuAddress = commandList->getCmdContainer().getEndCmdGpuAddress();
+    uint64_t startGpuAddress = commandList->getCmdContainer().getCmdBufferAllocations()[0]->getGpuAddress();
+
+    commandQueue->setPatchingPreamble(true);
+
+    void *queueCpuBase = commandQueue->commandStream.getCpuBase();
+    uint64_t queueGpuBase = commandQueue->commandStream.getGpuBase();
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    returnValue = commandQueue->executeCommandLists(1, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        queueCpuBase,
+        usedSpaceAfter));
+
+    GenCmdList::iterator patchCmdIterator = cmdList.end();
+    size_t bbStartIdx = 0;
+
+    auto sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, sdiCmds.size());
+    for (auto &sdiCmd : sdiCmds) {
+        auto storeDataImm = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmd);
+        EXPECT_EQ(endGpuAddress + bbStartIdx * sizeof(uint64_t), storeDataImm->getAddress());
+
+        bbStartDwordBuffer[2 * bbStartIdx] = storeDataImm->getDataDword0();
+        if (storeDataImm->getStoreQword()) {
+            bbStartDwordBuffer[2 * bbStartIdx + 1] = storeDataImm->getDataDword1();
+        }
+        bbStartIdx++;
+        patchCmdIterator = sdiCmd;
+    }
+
+    auto bbStarts = findAll<MI_BATCH_BUFFER_START *>(patchCmdIterator, cmdList.end());
+    ASSERT_NE(0u, bbStarts.size());
+
+    auto startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+    EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+    size_t offsetToReturn = ptrDiff(startingBbStart, queueCpuBase);
+    offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+    uint64_t expectedReturnAddress = queueGpuBase + offsetToReturn;
+
+    MI_BATCH_BUFFER_START *chainBackBbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(bbStartDwordBuffer);
+    ASSERT_NE(nullptr, chainBackBbStartCmd);
+    EXPECT_EQ(expectedReturnAddress, chainBackBbStartCmd->getBatchBufferStartAddress());
+
+    usedSpaceBefore = commandQueue->commandStream.getUsed();
+    returnValue = commandQueue->executeCommandLists(1, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    cmdList.clear();
+    bbStartIdx = 0;
+    memset(bbStartDwordBuffer, 0, sizeof(bbStartDwordBuffer));
+
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        ptrOffset(queueCpuBase, usedSpaceBefore),
+        usedSpaceAfter - usedSpaceBefore));
+
+    sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, sdiCmds.size());
+    for (auto &sdiCmd : sdiCmds) {
+        auto storeDataImm = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmd);
+        EXPECT_EQ(endGpuAddress + bbStartIdx * sizeof(uint64_t), storeDataImm->getAddress());
+
+        bbStartDwordBuffer[2 * bbStartIdx] = storeDataImm->getDataDword0();
+        if (storeDataImm->getStoreQword()) {
+            bbStartDwordBuffer[2 * bbStartIdx + 1] = storeDataImm->getDataDword1();
+        }
+        bbStartIdx++;
+        patchCmdIterator = sdiCmd;
+    }
+
+    bbStarts = findAll<MI_BATCH_BUFFER_START *>(patchCmdIterator, cmdList.end());
+    ASSERT_NE(0u, bbStarts.size());
+
+    // second BB_START command should be the one that jumps to the begin of the 1st command list
+    startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+    EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+    offsetToReturn = ptrDiff(startingBbStart, queueCpuBase);
+    offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+    expectedReturnAddress = queueGpuBase + offsetToReturn;
+
+    chainBackBbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(bbStartDwordBuffer);
+    ASSERT_NE(nullptr, chainBackBbStartCmd);
+    EXPECT_EQ(expectedReturnAddress, chainBackBbStartCmd->getBatchBufferStartAddress());
+
+    commandList->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleWhenSingleCmdListExecutedWithRequiredCounterThenPatchPreambleHasPostSyncWithCounter) {
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    using POST_SYNC_OPERATION = typename PIPE_CONTROL::POST_SYNC_OPERATION;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 false,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandLists[] = {commandList->toHandle()};
+    commandList->close();
+
+    commandQueue->setPatchingPreamble(true);
+
+    uint64_t counterHostGpuAddress = 0;
+    uint64_t *hostAddress = nullptr;
+    uint64_t counter = 0;
+    NEO::GraphicsAllocation *counterHostAllocation = nullptr;
+    uint64_t counterDeviceGpuAddress = 0;
+    NEO::GraphicsAllocation *counterDeviceAllocation = nullptr;
+    commandQueue->getPatchPreambleFullData(counter, hostAddress, counterHostGpuAddress, counterHostAllocation, counterDeviceGpuAddress, counterDeviceAllocation);
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(commandQueue->getCsr());
+    ultCsr->storeMakeResidentAllocations = true;
+
+    void *queueCpuBase = commandQueue->commandStream.getCpuBase();
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.patchPreambleRequiredCounter = counter;
+    internalOptions.patchPreambleRequiredDevicePostSyncGpuAddress = counterDeviceGpuAddress;
+    returnValue = commandQueue->executeCommandLists(1, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    EXPECT_TRUE(ultCsr->isMadeResident(counterHostAllocation));
+    EXPECT_TRUE(ultCsr->isMadeResident(counterDeviceAllocation));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        ptrOffset(queueCpuBase, usedSpaceBefore),
+        usedSpaceAfter - usedSpaceBefore));
+
+    bool foundHostPostSyncWithCounter = false;
+    bool foundDevicePostSyncWithCounter = false;
+
+    auto pipeControlCmds = findAll<PIPE_CONTROL *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, pipeControlCmds.size());
+    for (auto &pipeControlCmd : pipeControlCmds) {
+        auto pipeControl = reinterpret_cast<PIPE_CONTROL *>(*pipeControlCmd);
+        if (pipeControl->getPostSyncOperation() == POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA) {
+            auto actualAddress = NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl);
+            if (counterHostGpuAddress == actualAddress &&
+                pipeControl->getImmediateData() == counter) {
+                foundHostPostSyncWithCounter = true;
+            }
+            if (counterDeviceGpuAddress == actualAddress &&
+                pipeControl->getImmediateData() == counter) {
+                foundDevicePostSyncWithCounter = true;
+            }
+            if (foundHostPostSyncWithCounter && foundDevicePostSyncWithCounter) {
+                break;
+            }
+        }
+    }
+
+    EXPECT_TRUE(foundHostPostSyncWithCounter);
+    EXPECT_TRUE(foundDevicePostSyncWithCounter);
+
+    commandList->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleOnCopyEngineWhenSingleCmdListExecutedThenPatchPreambleContainsMiFlushCommand) {
+    using MI_FLUSH_DW = typename FamilyType::MI_FLUSH_DW;
+    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 true,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::copy, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandLists[] = {commandList->toHandle()};
+    commandList->close();
+
+    auto startGpuAddress = commandList->getCmdContainer().getCmdBufferAllocations()[0]->getGpuAddress();
+
+    commandQueue->setPatchingPreamble(true);
+
+    void *queueCpuBase = commandQueue->commandStream.getCpuBase();
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    returnValue = commandQueue->executeCommandLists(1, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        queueCpuBase,
+        usedSpaceAfter));
+
+    auto miFlushCmds = findAll<MI_FLUSH_DW *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, miFlushCmds.size());
+
+    // ensure that MI_FLUSH_DW command is before BATCH_BUFFER_START command jumping to the command list
+    auto bbStarts = findAll<MI_BATCH_BUFFER_START *>(miFlushCmds[0], cmdList.end());
+    ASSERT_NE(0u, bbStarts.size());
+
+    auto startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+    EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+    commandList->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleOnCopyEngineWhenSingleCmdListExecutedWithRequiredCounterThenPatchPreambleHasPostSyncWithCounter) {
+    using MI_FLUSH_DW = typename FamilyType::MI_FLUSH_DW;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 true,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::copy, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandLists[] = {commandList->toHandle()};
+    commandList->close();
+
+    commandQueue->setPatchingPreamble(true);
+
+    uint64_t counterHostGpuAddress = 0;
+    uint64_t *hostAddress = nullptr;
+    uint64_t counter = 0;
+    NEO::GraphicsAllocation *counterHostAllocation = nullptr;
+    uint64_t counterDeviceGpuAddress = 0;
+    NEO::GraphicsAllocation *counterDeviceAllocation = nullptr;
+    commandQueue->getPatchPreambleFullData(counter, hostAddress, counterHostGpuAddress, counterHostAllocation, counterDeviceGpuAddress, counterDeviceAllocation);
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(commandQueue->getCsr());
+    ultCsr->storeMakeResidentAllocations = true;
+
+    void *queueCpuBase = commandQueue->commandStream.getCpuBase();
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.patchPreambleRequiredCounter = counter;
+    returnValue = commandQueue->executeCommandLists(1, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    EXPECT_TRUE(ultCsr->isMadeResident(counterHostAllocation));
+    EXPECT_TRUE(ultCsr->isMadeResident(counterDeviceAllocation));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        ptrOffset(queueCpuBase, usedSpaceBefore),
+        usedSpaceAfter - usedSpaceBefore));
+
+    bool foundHostPostSyncWithCounter = false;
+    bool foundDevicePostSyncWithCounter = false;
+
+    auto miFlushCmds = findAll<MI_FLUSH_DW *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, miFlushCmds.size());
+
+    for (auto &miFlushCmd : miFlushCmds) {
+        auto miFlush = reinterpret_cast<MI_FLUSH_DW *>(*miFlushCmd);
+        if (miFlush->getPostSyncOperation() == MI_FLUSH_DW::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA_QWORD &&
+            miFlush->getDestinationAddress() == counterHostGpuAddress &&
+            miFlush->getImmediateData() == counter) {
+            foundHostPostSyncWithCounter = true;
+        }
+        if (miFlush->getPostSyncOperation() == MI_FLUSH_DW::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA_QWORD &&
+            miFlush->getDestinationAddress() == counterDeviceGpuAddress &&
+            miFlush->getImmediateData() == counter) {
+            foundDevicePostSyncWithCounter = true;
+        }
+        if (foundHostPostSyncWithCounter && foundDevicePostSyncWithCounter) {
+            break;
+        }
+    }
+
+    EXPECT_TRUE(foundHostPostSyncWithCounter);
+    EXPECT_TRUE(foundDevicePostSyncWithCounter);
+
+    commandList->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleWhenTwoCmdListsExecutedThenPatchPreambleContainsEncodingReturningAndChainingBbStartCmd) {
+    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    uint32_t bbStartDwordBuffer[sizeof(MI_BATCH_BUFFER_START) / sizeof(uint32_t)] = {0};
+    uint32_t bbStartDwordBuffer2[sizeof(MI_BATCH_BUFFER_START) / sizeof(uint32_t)] = {0};
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 false,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto commandList2 = CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    commandList->getRequiredStreamState().stateBaseAddress.surfaceStateBaseAddress.set(0x1000);
+    commandList2->getRequiredStreamState().stateBaseAddress.surfaceStateBaseAddress.set(0x2000);
+
+    ze_command_list_handle_t commandLists[] = {commandList->toHandle(), commandList2->toHandle()};
+    commandList->close();
+    commandList2->close();
+
+    uint64_t startGpuAddress = commandList->getCmdContainer().getCmdBufferAllocations()[0]->getGpuAddress();
+    uint64_t chainedGpuAddress = commandList->getCmdContainer().getEndCmdGpuAddress();
+    uint64_t start2GpuAddress = commandList2->getCmdContainer().getCmdBufferAllocations()[0]->getGpuAddress();
+    uint64_t endGpuAddress = commandList2->getCmdContainer().getEndCmdGpuAddress();
+
+    commandQueue->setPatchingPreamble(true);
+
+    void *queueCpuBase = commandQueue->commandStream.getCpuBase();
+    uint64_t queueGpuBase = commandQueue->commandStream.getGpuBase();
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    internalOptions.performMigration = true;
+    returnValue = commandQueue->executeCommandLists(2, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        queueCpuBase,
+        usedSpaceAfter));
+
+    GenCmdList::iterator patchCmdIterator = cmdList.end();
+    size_t bbStartIdx = 0;
+
+    auto sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, sdiCmds.size());
+    size_t sdiSizeHalf = sdiCmds.size() / 2;
+    for (uint32_t i = 0; i < sdiSizeHalf; i++) {
+        auto &sdiCmd = sdiCmds[i];
+        auto &sdiCmd2 = sdiCmds[i + sdiSizeHalf];
+        auto storeDataImm = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmd);
+        auto storeDataImm2 = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmd2);
+
+        EXPECT_EQ(chainedGpuAddress + bbStartIdx * sizeof(uint64_t), storeDataImm->getAddress());
+        EXPECT_EQ(endGpuAddress + bbStartIdx * sizeof(uint64_t), storeDataImm2->getAddress());
+
+        bbStartDwordBuffer[2 * bbStartIdx] = storeDataImm->getDataDword0();
+        bbStartDwordBuffer2[2 * bbStartIdx] = storeDataImm2->getDataDword0();
+        if (storeDataImm->getStoreQword()) {
+            bbStartDwordBuffer[2 * bbStartIdx + 1] = storeDataImm->getDataDword1();
+        }
+        if (storeDataImm2->getStoreQword()) {
+            bbStartDwordBuffer2[2 * bbStartIdx + 1] = storeDataImm2->getDataDword1();
+        }
+
+        bbStartIdx++;
+        patchCmdIterator = sdiCmd2;
+    }
+
+    MI_BATCH_BUFFER_START *chainLinkBbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(bbStartDwordBuffer);
+    ASSERT_NE(nullptr, chainLinkBbStartCmd);
+
+    MI_BATCH_BUFFER_START *chainBackBbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(bbStartDwordBuffer2);
+    ASSERT_NE(nullptr, chainBackBbStartCmd);
+
+    auto bbStarts = findAll<MI_BATCH_BUFFER_START *>(patchCmdIterator, cmdList.end());
+    ASSERT_NE(0u, bbStarts.size());
+
+    // single bb start means two command lists are chained directly
+    // two bb starts means command lists are chained to queue as SBA tracking makes dynamic preamble to reprogram SBA difference between lists
+    if (bbStarts.size() == 1u) {
+        EXPECT_EQ(start2GpuAddress, chainLinkBbStartCmd->getBatchBufferStartAddress());
+
+        auto startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+        EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+        size_t offsetToReturn = ptrDiff(startingBbStart, queueCpuBase);
+        offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+        uint64_t expectedReturnAddress = queueGpuBase + offsetToReturn;
+
+        EXPECT_EQ(expectedReturnAddress, chainBackBbStartCmd->getBatchBufferStartAddress());
+    } else {
+        auto startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+        EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+        size_t offsetToReturn = ptrDiff(startingBbStart, queueCpuBase);
+        offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+        uint64_t expectedReturnAddress = queueGpuBase + offsetToReturn;
+        EXPECT_EQ(expectedReturnAddress, chainLinkBbStartCmd->getBatchBufferStartAddress());
+
+        auto dynamicPremableStartingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[1]);
+        EXPECT_EQ(start2GpuAddress, dynamicPremableStartingBbStart->getBatchBufferStartAddress());
+
+        offsetToReturn = ptrDiff(dynamicPremableStartingBbStart, queueCpuBase);
+        offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+        expectedReturnAddress = queueGpuBase + offsetToReturn;
+        EXPECT_EQ(expectedReturnAddress, chainBackBbStartCmd->getBatchBufferStartAddress());
+    }
+
+    usedSpaceBefore = commandQueue->commandStream.getUsed();
+    returnValue = commandQueue->executeCommandLists(2, commandLists, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    cmdList.clear();
+    bbStartIdx = 0;
+    memset(bbStartDwordBuffer, 0, sizeof(bbStartDwordBuffer));
+    memset(bbStartDwordBuffer2, 0, sizeof(bbStartDwordBuffer2));
+
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList,
+        ptrOffset(queueCpuBase, usedSpaceBefore),
+        usedSpaceAfter - usedSpaceBefore));
+
+    sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+    ASSERT_NE(0u, sdiCmds.size());
+    sdiSizeHalf = sdiCmds.size() / 2;
+    for (uint32_t i = 0; i < sdiSizeHalf; i++) {
+        auto &sdiCmd = sdiCmds[i];
+        auto &sdiCmd2 = sdiCmds[i + sdiSizeHalf];
+        auto storeDataImm = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmd);
+        auto storeDataImm2 = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmd2);
+
+        EXPECT_EQ(chainedGpuAddress + bbStartIdx * sizeof(uint64_t), storeDataImm->getAddress());
+        EXPECT_EQ(endGpuAddress + bbStartIdx * sizeof(uint64_t), storeDataImm2->getAddress());
+
+        bbStartDwordBuffer[2 * bbStartIdx] = storeDataImm->getDataDword0();
+        bbStartDwordBuffer2[2 * bbStartIdx] = storeDataImm2->getDataDword0();
+        if (storeDataImm->getStoreQword()) {
+            bbStartDwordBuffer[2 * bbStartIdx + 1] = storeDataImm->getDataDword1();
+        }
+        if (storeDataImm2->getStoreQword()) {
+            bbStartDwordBuffer2[2 * bbStartIdx + 1] = storeDataImm2->getDataDword1();
+        }
+
+        bbStartIdx++;
+        patchCmdIterator = sdiCmd2;
+    }
+
+    chainLinkBbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(bbStartDwordBuffer);
+    ASSERT_NE(nullptr, chainLinkBbStartCmd);
+
+    chainBackBbStartCmd = genCmdCast<MI_BATCH_BUFFER_START *>(bbStartDwordBuffer2);
+    ASSERT_NE(nullptr, chainBackBbStartCmd);
+
+    bbStarts = findAll<MI_BATCH_BUFFER_START *>(patchCmdIterator, cmdList.end());
+    ASSERT_NE(0u, bbStarts.size());
+
+    // single bb start means two command lists are chained directly
+    // two bb starts means command lists are chained to queue as SBA tracking makes dynamic preamble to reprogram SBA difference between lists
+    if (bbStarts.size() == 1u) {
+        EXPECT_EQ(start2GpuAddress, chainLinkBbStartCmd->getBatchBufferStartAddress());
+
+        auto startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+        EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+        size_t offsetToReturn = ptrDiff(startingBbStart, queueCpuBase);
+        offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+        uint64_t expectedReturnAddress = queueGpuBase + offsetToReturn;
+
+        EXPECT_EQ(expectedReturnAddress, chainBackBbStartCmd->getBatchBufferStartAddress());
+    } else {
+        auto startingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[0]);
+        EXPECT_EQ(startGpuAddress, startingBbStart->getBatchBufferStartAddress());
+
+        size_t offsetToReturn = ptrDiff(startingBbStart, queueCpuBase);
+        offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+        uint64_t expectedReturnAddress = queueGpuBase + offsetToReturn;
+        EXPECT_EQ(expectedReturnAddress, chainLinkBbStartCmd->getBatchBufferStartAddress());
+
+        auto dynamicPremableStartingBbStart = reinterpret_cast<MI_BATCH_BUFFER_START *>(*bbStarts[1]);
+        EXPECT_EQ(start2GpuAddress, dynamicPremableStartingBbStart->getBatchBufferStartAddress());
+
+        offsetToReturn = ptrDiff(dynamicPremableStartingBbStart, queueCpuBase);
+        offsetToReturn += sizeof(MI_BATCH_BUFFER_START);
+
+        expectedReturnAddress = queueGpuBase + offsetToReturn;
+        EXPECT_EQ(expectedReturnAddress, chainBackBbStartCmd->getBatchBufferStartAddress());
+    }
+
+    commandList->destroy();
+    commandList2->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleAndSavingWaitDataWhenQueueSavesDataThenCommandListsHaveCorrectData) {
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    const bool useSemaphore64bCmd = device->getNEODevice()->getDeviceInfo().semaphore64bCmdSupport;
+    const bool qwordIndirect = NEO::InOrderProgrammingHelpers::isLriFor64bDataProgrammingRequired(FamilyType::isQwordInOrderCounter, useSemaphore64bCmd);
+    const size_t expectedSize = qwordIndirect ? 2 * sizeof(MI_LOAD_REGISTER_IMM) + sizeof(MI_SEMAPHORE_WAIT) : sizeof(MI_SEMAPHORE_WAIT);
+    CommandListExecutionContext ctx{};
+
+    auto mockCmdQHw = makeZeUniquePtr<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    returnValue = mockCmdQHw->initialize(false, false, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandListHandle = commandList->toHandle();
+    commandList->close();
+
+    ctx.patchPreambleEnabled = true;
+    mockCmdQHw->setPatchingPreamble(true);
+    EXPECT_TRUE(mockCmdQHw->getPatchingPreamble());
+    mockCmdQHw->saveWaitForPreamble = false;
+    EXPECT_FALSE(mockCmdQHw->getSaveWaitForPreamble());
+
+    NEO::GraphicsAllocation *expectedGpuAllocation = mockCmdQHw->getCsr()->getTagAllocation();
+    TaskCountType expectedTaskCount = 0x456;
+    uint64_t expectedGpuAddress = expectedGpuAllocation->getGpuAddress();
+
+    mockCmdQHw->saveTagAndTaskCountForCommandLists(1, &commandListHandle, expectedGpuAllocation, expectedTaskCount);
+    // save and wait is disabled, so nothing to be saved
+    EXPECT_EQ(0u, commandList->getLatestTagGpuAddress());
+    EXPECT_EQ(0u, commandList->getLatestTaskCount());
+
+    EXPECT_EQ(0u, mockCmdQHw->estimateCommandListPatchPreambleWaitSyncSize(ctx, &commandListHandle, 1));
+
+    mockCmdQHw->setPatchingPreamble(true);
+    EXPECT_TRUE(mockCmdQHw->getPatchingPreamble());
+    mockCmdQHw->saveWaitForPreamble = true;
+    EXPECT_TRUE(mockCmdQHw->getSaveWaitForPreamble());
+
+    EXPECT_EQ(0u, mockCmdQHw->estimateCommandListPatchPreambleWaitSyncSize(ctx, &commandListHandle, 1));
+
+    mockCmdQHw->saveTagAndTaskCountForCommandLists(1, &commandListHandle, expectedGpuAllocation, expectedTaskCount);
+    // save and wait is now enabled
+    EXPECT_EQ(expectedGpuAddress, commandList->getLatestTagGpuAddress());
+    EXPECT_EQ(expectedTaskCount, commandList->getLatestTaskCount());
+
+    EXPECT_EQ(0u, mockCmdQHw->estimateCommandListPatchPreambleWaitSyncSize(ctx, &commandListHandle, 1));
+
+    MockGraphicsAllocation otherTagAllocation(nullptr, expectedGpuAddress + 0x1000, 1);
+
+    mockCmdQHw->saveTagAndTaskCountForCommandLists(1, &commandListHandle, &otherTagAllocation, expectedTaskCount);
+    EXPECT_EQ(expectedSize, mockCmdQHw->estimateCommandListPatchPreambleWaitSyncSize(ctx, &commandListHandle, 1));
+
+    commandList->reset();
+    EXPECT_EQ(0u, commandList->getLatestTagGpuAddress());
+    EXPECT_EQ(0u, commandList->getLatestTaskCount());
+    EXPECT_EQ(nullptr, commandList->getLatestTagGpuAllocation());
+
+    commandList->destroy();
+}
+
+HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleWhenAppendHostFunctionWasCalledThenCmdsWerePatchedCorrectly, IsAtLeastXeCore) {
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.UseMemorySynchronizationForHostFunction.set(0);
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    auto mockCmdQHw = makeZeUniquePtr<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    returnValue = mockCmdQHw->initialize(false, false, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    ze_command_list_handle_t commandListHandle = commandList->toHandle();
+
+    mockCmdQHw->setPatchingPreamble(true);
+
+    commandList->close();
+    EXPECT_EQ(0u, commandList->getHostFunctionsPatchSize());
+    commandList->reset();
+    EXPECT_EQ(0u, commandList->getHostFunctionsPatchSize());
+
+    uint64_t hostFunctionAddress = 0xABCDEF00;
+    auto pHostFunction = reinterpret_cast<ze_host_function_callback_t>(hostFunctionAddress);
+    uint64_t hostFunctionUserData = 0x12345678;
+    CmdListHostFunctionParameters params{};
+    commandList->appendHostFunction(pHostFunction, &hostFunctionUserData, nullptr, nullptr, 0, nullptr, params);
+    commandList->close();
+
+    auto miStoreSize = sizeof(MI_STORE_DATA_IMM);
+    auto semaphoreSize = NEO::EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait();
+    auto encodedMiStoreSize = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(miStoreSize);
+    auto encodedMiSemaphoreSize = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(semaphoreSize);
+    size_t expectedSize = encodedMiStoreSize + encodedMiSemaphoreSize;
+
+    EXPECT_EQ(expectedSize, commandList->getHostFunctionsPatchSize());
+
+    auto usedSpaceBefore = mockCmdQHw->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = mockCmdQHw->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = mockCmdQHw->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(mockCmdQHw->commandStream.getCpuBase(), usedSpaceBefore), usedSpaceAfter - usedSpaceBefore));
+
+    auto semWaitCmds = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+    EXPECT_EQ(0u, semWaitCmds.size()); // semaphore will be encoded using mi store cmds
+
+    size_t expectedMiStoresForStore = (miStoreSize + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    size_t expectedMiStoresForSemaphore = (semaphoreSize + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    size_t additionalMiStores = 2; // for batch buffer start
+    size_t totalExpectedMiStores = expectedMiStoresForStore + expectedMiStoresForSemaphore + additionalMiStores;
+    auto miStoreCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(totalExpectedMiStores, miStoreCmds.size());
+
+    // read programmed mi store commands and reconstruct mi store and mi semaphore wait commands
+
+    MI_STORE_DATA_IMM storeDataImm{};
+    MI_SEMAPHORE_WAIT semaphoreWait{};
+    void *storeDataAddress = &storeDataImm;
+    void *semaphoreWaitAddress = &semaphoreWait;
+
+    auto offset = 0u;
+    for (auto i = 0u; i < expectedMiStoresForStore; i++) {
+
+        auto miStoreCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*miStoreCmds[i]);
+        auto dword0 = miStoreCmd->getDataDword0();
+        memcpy(ptrOffset(storeDataAddress, offset), &dword0, sizeof(uint32_t));
+        offset += 4u;
+        if (miStoreCmd->getStoreQword()) {
+            auto dword1 = miStoreCmd->getDataDword1();
+            memcpy(ptrOffset(storeDataAddress, offset), &dword1, sizeof(uint32_t));
+            offset += 4u;
+        }
+    }
+
+    offset = 0u;
+    for (auto i = expectedMiStoresForStore; i < expectedMiStoresForStore + expectedMiStoresForSemaphore; i++) {
+        auto miStoreCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*miStoreCmds[i]);
+        auto dword0 = miStoreCmd->getDataDword0();
+        memcpy(ptrOffset(semaphoreWaitAddress, offset), &dword0, sizeof(uint32_t));
+        offset += 4u;
+        if (miStoreCmd->getStoreQword()) {
+            auto dword1 = miStoreCmd->getDataDword1();
+            memcpy(ptrOffset(semaphoreWaitAddress, offset), &dword1, sizeof(uint32_t));
+            offset += 4u;
+        }
+    }
+
+    auto expectedHostFunctionMappedMemory = mockCmdQHw->getCsr()->getHostFunctionStreamer().getHostFunctionIdGpuAddress(0);
+
+    auto expectedHostFunctionIdProgrammed = 1u;
+    EXPECT_EQ(expectedHostFunctionIdProgrammed, storeDataImm.getDataDword0());
+    EXPECT_EQ(expectedHostFunctionMappedMemory, storeDataImm.getAddress());
+
+    auto expectedSemaphoreWaitClearedId = 0u;
+    EXPECT_EQ(expectedSemaphoreWaitClearedId, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(&semaphoreWait));
+    EXPECT_EQ(expectedHostFunctionMappedMemory, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(&semaphoreWait));
+
+    commandList->destroy();
+}
+
+HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleWhenHostFunctionsRequireDifferentMemorySynchronizationThenEstimatedSizeIsCorect, IsAtLeastXeCore) {
+    DebugManagerStateRestore restorer;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    auto mockCmdQHw = makeZeUniquePtr<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    returnValue = mockCmdQHw->initialize(false, false, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    mockCmdQHw->setPatchingPreamble(true);
+
+    commandList->close();
+    EXPECT_EQ(0u, commandList->getHostFunctionsPatchSize());
+    commandList->reset();
+    EXPECT_EQ(0u, commandList->getHostFunctionsPatchSize());
+
+    uint64_t hostFunctionAddress = 0xABCDEF00;
+    auto pHostFunction = reinterpret_cast<ze_host_function_callback_t>(hostFunctionAddress);
+    uint64_t hostFunctionUserData = 0x12345678;
+
+    CmdListHostFunctionParameters paramsWithSync{};
+    paramsWithSync.memorySynchronizationRequired = true;
+    commandList->appendHostFunction(pHostFunction, &hostFunctionUserData, nullptr, nullptr, 0, nullptr, paramsWithSync);
+
+    CmdListHostFunctionParameters paramsWithoutSync{};
+    paramsWithoutSync.memorySynchronizationRequired = false;
+    commandList->appendHostFunction(pHostFunction, &hostFunctionUserData, nullptr, nullptr, 0, nullptr, paramsWithoutSync);
+    commandList->close();
+
+    EXPECT_EQ(1u, commandList->getHostFunctionWithMemorySynchronizationCount());
+    EXPECT_EQ(1u, commandList->getHostFunctionWithoutMemorySynchronizationCount());
+
+    auto dcFlushRequired = mockCmdQHw->getCsr()->getDcFlushSupport();
+    auto semaphoreSize = NEO::EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait();
+    auto encodedMiSemaphoreSize = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(semaphoreSize);
+    auto encodedIdSizeWithSync = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(NEO::HostFunctionHelper<FamilyType>::getSizeForHostFunctionIdProgramming(true, dcFlushRequired));
+    auto encodedIdSizeWithoutSync = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(NEO::HostFunctionHelper<FamilyType>::getSizeForHostFunctionIdProgramming(false, dcFlushRequired));
+
+    size_t expectedSize = encodedIdSizeWithSync + encodedIdSizeWithoutSync + (2 * encodedMiSemaphoreSize);
+
+    EXPECT_EQ(expectedSize, commandList->getHostFunctionsPatchSize());
+
+    commandList->destroy();
+}
+
+HWTEST2_F(CommandQueueExecuteCommandListsSimpleTest, givenInOrderAndDcFlushRequiredPatchPreambleWhenAppendHostFunctionWasCalledThenCmdsWerePatchedCorrectly, IsAtLeastXeCore) {
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+
+    if (!device->getNEODevice()->getDefaultEngine().commandStreamReceiver->getDcFlushSupport()) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore restore;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    auto mockCmdQHw = makeZeUniquePtr<MockCommandQueueHw<FamilyType::gfxCoreFamily>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
+    returnValue = mockCmdQHw->initialize(false, false, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, ZE_COMMAND_LIST_FLAG_IN_ORDER, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    ze_command_list_handle_t commandListHandle = commandList->toHandle();
+
+    mockCmdQHw->setPatchingPreamble(true);
+
+    commandList->close();
+    EXPECT_EQ(0u, commandList->getHostFunctionsPatchSize());
+    commandList->reset();
+    EXPECT_EQ(0u, commandList->getHostFunctionsPatchSize());
+
+    uint64_t hostFunctionAddress = 0xABCDEF00;
+    auto pHostFunction = reinterpret_cast<ze_host_function_callback_t>(hostFunctionAddress);
+    uint64_t hostFunctionUserData = 0x12345678;
+    CmdListHostFunctionParameters params{};
+    commandList->appendHostFunction(pHostFunction, &hostFunctionUserData, nullptr, nullptr, 0, nullptr, params);
+    commandList->close();
+
+    auto pcSize = sizeof(PIPE_CONTROL);
+    auto semaphoreSize = NEO::EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait();
+    auto encodedPcSize = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(pcSize);
+    auto encodedMiSemaphoreSize = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(semaphoreSize);
+    size_t expectedSize = encodedPcSize + encodedMiSemaphoreSize;
+
+    EXPECT_EQ(expectedSize, commandList->getHostFunctionsPatchSize());
+
+    auto usedSpaceBefore = mockCmdQHw->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = mockCmdQHw->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = mockCmdQHw->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(mockCmdQHw->commandStream.getCpuBase(), usedSpaceBefore), usedSpaceAfter - usedSpaceBefore));
+
+    auto semWaitCmds = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+    EXPECT_EQ(0u, semWaitCmds.size()); // semaphore will be encoded using mi store cmds
+
+    auto miStoreCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+    // PC size is 6 dwords,
+    // if 1st is not 8 bytes aligned, it will be encoded using:
+    // 4x miStore - 1st miStore with dword, 2 miStores with qword and the last one with dword
+    // if 1st is 8 bytes aligned, it will be encoded using:
+    // 3x miStore - all with qword data
+
+    // 3 or 4 for pipe control(if not 8bytes aligned),
+    // 3 for mi semaphore wait,
+    // 1 for noop cmd
+    // +1 for nooop cmd if commandListImp->getInOrderExecHostGpuAddress() != 0
+    // 2 for batch buffer start
+    // so min = 9, max = 11
+
+    ASSERT_TRUE(miStoreCmds.size() >= 9 && miStoreCmds.size() <= 11);
+
+    // 1st mi store for host function
+    auto firstMiStoreForHostFunctionIndex = 0u;
+    auto firstMiStoreCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*miStoreCmds[firstMiStoreForHostFunctionIndex]);
+
+    bool isFirstStoreQwordAligned = firstMiStoreCmd->getStoreQword();
+    auto miStoresForPc = isFirstStoreQwordAligned ? 3u : 4u;
+
+    PIPE_CONTROL pc{};
+    MI_SEMAPHORE_WAIT semaphoreWait{};
+    void *pcAddress = &pc;
+    void *semaphoreWaitAddress = &semaphoreWait;
+
+    auto offset = 0u;
+    for (auto i = firstMiStoreForHostFunctionIndex; i < miStoresForPc + firstMiStoreForHostFunctionIndex; i++) {
+
+        auto miStoreCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*miStoreCmds[i]);
+        auto dword0 = miStoreCmd->getDataDword0();
+        memcpy(ptrOffset(pcAddress, offset), &dword0, sizeof(uint32_t));
+        offset += 4u;
+        if (miStoreCmd->getStoreQword()) {
+            auto dword1 = miStoreCmd->getDataDword1();
+            memcpy(ptrOffset(pcAddress, offset), &dword1, sizeof(uint32_t));
+            offset += 4u;
+        }
+    }
+
+    offset = 0u;
+    auto miStoreForSemaphoreIndex = miStoresForPc + firstMiStoreForHostFunctionIndex;
+    for (auto i = miStoreForSemaphoreIndex; i < miStoreForSemaphoreIndex + 3; i++) {
+        auto miStoreCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*miStoreCmds[i]);
+        auto dword0 = miStoreCmd->getDataDword0();
+        memcpy(ptrOffset(semaphoreWaitAddress, offset), &dword0, sizeof(uint32_t));
+        offset += 4u;
+        if (miStoreCmd->getStoreQword()) {
+            auto dword1 = miStoreCmd->getDataDword1();
+            memcpy(ptrOffset(semaphoreWaitAddress, offset), &dword1, sizeof(uint32_t));
+            offset += 4u;
+        }
+    }
+
+    auto expectedHostFunctionMappedMemory = mockCmdQHw->getCsr()->getHostFunctionStreamer().getHostFunctionIdGpuAddress(0);
+
+    uint64_t expectedHostFunctionIdProgrammed = 1u;
+    EXPECT_EQ(expectedHostFunctionIdProgrammed, pc.getImmediateData());
+    EXPECT_EQ(getLowPart(expectedHostFunctionMappedMemory), pc.getAddress());
+    EXPECT_EQ(getHighPart(expectedHostFunctionMappedMemory), pc.getAddressHigh());
+    EXPECT_TRUE(pc.getDcFlushEnable());
+
+    auto expectedSemaphoreWaitClearedId = 0u;
+    EXPECT_EQ(expectedSemaphoreWaitClearedId, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(&semaphoreWait));
+    EXPECT_EQ(expectedHostFunctionMappedMemory, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(&semaphoreWait));
+
+    commandList->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleAndSavingWaitDataWhenCmdListExecutedByQueueThenCmdListHaveCorrectData) {
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 false,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandListHandle = commandList->toHandle();
+    commandList->close();
+
+    commandQueue->setPatchingPreamble(true);
+    commandQueue->saveWaitForPreamble = true;
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    uint64_t expectedGpuAddress = commandQueue->getCsr()->getTagAllocation()->getGpuAddress();
+    TaskCountType expectedTaskCount = commandQueue->getTaskCount();
+
+    EXPECT_EQ(expectedGpuAddress, commandList->getLatestTagGpuAddress());
+    EXPECT_EQ(expectedTaskCount, commandList->getLatestTaskCount());
+
+    commandList->destroy();
+    commandQueue->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleAndSavingWaitDataWhenCmdListExecutedByImmediateThenCmdListHaveCorrectData) {
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    std::unique_ptr<L0::CommandList> immediateCmdList(CommandList::createImmediate(device, &queueDesc, false, NEO::EngineGroupType::compute, returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    CommandList *immediateCmdListPtr = CommandList::whiteboxCast(immediateCmdList.get());
+    auto immediateQueue = static_cast<WhiteBox<::L0::CommandQueue> *>(immediateCmdListPtr->cmdQImmediate);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandListHandle = commandList->toHandle();
+    commandList->close();
+
+    immediateCmdList->setPatchingPreamble(true);
+    immediateQueue->saveWaitForPreamble = true;
+
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = immediateCmdList->appendCommandLists(1, &commandListHandle, nullptr, 0, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    uint64_t expectedGpuAddress = immediateQueue->getCsr()->getTagAllocation()->getGpuAddress();
+    TaskCountType expectedTaskCount = immediateQueue->getTaskCount();
+
+    EXPECT_EQ(expectedGpuAddress, commandList->getLatestTagGpuAddress());
+    EXPECT_EQ(expectedTaskCount, commandList->getLatestTaskCount());
+
+    commandList->destroy();
+}
+
+HWTEST_F(CommandQueueExecuteCommandListsSimpleTest, givenPatchPreambleAndSavingWaitDataWhenCmdListExecutedByQueueThenSemaphoreDispatchedWhenNeeded) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using COMPARE_OPERATION = typename FamilyType::MI_SEMAPHORE_WAIT::COMPARE_OPERATION;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    ze_result_t returnValue;
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    queueDesc.ordinal = 0u;
+    queueDesc.index = 0u;
+    queueDesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                                                 neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                                                 &queueDesc,
+                                                                                 false,
+                                                                                 false,
+                                                                                 false,
+                                                                                 returnValue));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    MockGraphicsAllocation otherTagAllocation(nullptr, commandQueue->getCsr()->getTagAllocation()->getGpuAddress() + 0x1000, 1);
+
+    auto commandList = CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    ze_command_list_handle_t commandListHandle = commandList->toHandle();
+    commandList->close();
+    commandQueue->setPatchingPreamble(true);
+    commandQueue->saveWaitForPreamble = true;
+
+    auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), usedSpaceBefore), usedSpaceAfter - usedSpaceBefore));
+
+    // first execution of command list, no prior history and no semaphore required
+    auto semWaitCmds = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+    EXPECT_EQ(0u, semWaitCmds.size());
+
+    usedSpaceBefore = commandQueue->commandStream.getUsed();
+    returnValue = commandQueue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    cmdList.clear();
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), usedSpaceBefore), usedSpaceAfter - usedSpaceBefore));
+
+    // second execution of command list, same tag allocation and no semaphore required
+    semWaitCmds = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+    EXPECT_EQ(0u, semWaitCmds.size());
+
+    // change tag allocation to simulate previous execution on different context
+    constexpr uint32_t otherTaskCount = 0x123;
+    commandList->saveLatestTagAndTaskCount(&otherTagAllocation, otherTaskCount);
+
+    auto ultCsr = static_cast<UltCommandStreamReceiver<FamilyType> *>(commandQueue->getCsr());
+    ultCsr->storeMakeResidentAllocations = true;
+
+    usedSpaceBefore = commandQueue->commandStream.getUsed();
+    returnValue = commandQueue->executeCommandLists(1, &commandListHandle, nullptr, internalOptions);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    usedSpaceAfter = commandQueue->commandStream.getUsed();
+    ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+    cmdList.clear();
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandQueue->commandStream.getCpuBase(), usedSpaceBefore), usedSpaceAfter - usedSpaceBefore));
+
+    // third execution of command list, different tag allocation and semaphore required
+    const bool useSemaphore64bCmd = device->getNEODevice()->getDeviceInfo().semaphore64bCmdSupport;
+    const bool qwordIndirect = NEO::InOrderProgrammingHelpers::isLriFor64bDataProgrammingRequired(FamilyType::isQwordInOrderCounter, useSemaphore64bCmd);
+    auto lriCmds = findAll<MI_LOAD_REGISTER_IMM *>(cmdList.begin(), cmdList.end());
+    if (qwordIndirect) {
+        ASSERT_EQ(2u, lriCmds.size());
+
+        auto lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(*lriCmds[0]);
+        EXPECT_EQ(RegisterOffsets::csGprR0, lriCmd->getRegisterOffset());
+        EXPECT_EQ(getLowPart(otherTaskCount), lriCmd->getDataDword());
+
+        lriCmd = reinterpret_cast<MI_LOAD_REGISTER_IMM *>(*lriCmds[1]);
+        EXPECT_EQ(RegisterOffsets::csGprR0 + 4, lriCmd->getRegisterOffset());
+        EXPECT_EQ(getHighPart(otherTaskCount), lriCmd->getDataDword());
+
+        semWaitCmds = findAll<MI_SEMAPHORE_WAIT *>(lriCmds[1], cmdList.end());
+    } else {
+        EXPECT_EQ(0u, lriCmds.size());
+        semWaitCmds = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+    }
+
+    ASSERT_EQ(1u, semWaitCmds.size());
+    auto semWaitCmd = reinterpret_cast<MI_SEMAPHORE_WAIT *>(*semWaitCmds[0]);
+
+    EXPECT_EQ(otherTagAllocation.getGpuAddress(), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semWaitCmd));
+    EXPECT_EQ(COMPARE_OPERATION::COMPARE_OPERATION_SAD_GREATER_THAN_OR_EQUAL_SDD, semWaitCmd->getCompareOperation());
+
+    EXPECT_TRUE(ultCsr->isMadeResident(&otherTagAllocation));
+
+    // verify that all sdi patching commands are after wait synchronize
+    auto sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), semWaitCmds[0]);
+    EXPECT_EQ(0u, sdiCmds.size());
+
+    sdiCmds = findAll<MI_STORE_DATA_IMM *>(semWaitCmds[0], cmdList.end());
+    EXPECT_NE(0u, sdiCmds.size());
+
+    commandList->destroy();
+    commandQueue->destroy();
 }
 
 } // namespace ult

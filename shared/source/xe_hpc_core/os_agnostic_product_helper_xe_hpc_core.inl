@@ -1,41 +1,18 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/os_interface/product_helper_from_xe_hpg_to_xe3.inl"
+
 namespace NEO {
-template <>
-std::string ProductHelperHw<gfxProduct>::getDeviceMemoryName() const {
-    return "HBM";
-}
 
 template <>
-bool ProductHelperHw<gfxProduct>::isDirectSubmissionSupported(const HardwareInfo &hwInfo) const {
+bool ProductHelperHw<gfxProduct>::isDirectSubmissionSupported() const {
     return true;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isDcFlushAllowed() const {
-    return false;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isTimestampWaitSupportedForEvents() const {
-    return true;
-}
-
-template <>
-std::pair<bool, bool> ProductHelperHw<gfxProduct>::isPipeControlPriorToNonPipelinedStateCommandsWARequired(const HardwareInfo &hwInfo, bool isRcs, const ReleaseHelper *releaseHelper) const {
-    auto isBasicWARequired = false;
-    auto isExtendedWARequired = false;
-
-    if (DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.get() != -1) {
-        isExtendedWARequired = DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.get();
-    }
-
-    return {isBasicWARequired, isExtendedWARequired};
 }
 
 template <>
@@ -43,7 +20,7 @@ void ProductHelperHw<gfxProduct>::adjustSamplerState(void *sampler, const Hardwa
     using SAMPLER_STATE = typename XeHpcCoreFamily::SAMPLER_STATE;
 
     auto samplerState = reinterpret_cast<SAMPLER_STATE *>(sampler);
-    if (DebugManager.flags.ForceSamplerLowFilteringPrecision.get()) {
+    if (debugManager.flags.ForceSamplerLowFilteringPrecision.get()) {
         samplerState->setLowQualityFilter(SAMPLER_STATE::LOW_QUALITY_FILTER_ENABLE);
     }
 }
@@ -54,13 +31,67 @@ bool ProductHelperHw<gfxProduct>::isPrefetcherDisablingInDirectSubmissionRequire
 }
 
 template <>
-bool ProductHelperHw<gfxProduct>::isLinearStoragePreferred(bool isSharedContext, bool isImage1d, bool forceLinearStorage) const {
+bool ProductHelperHw<gfxProduct>::isLinearStoragePreferred(bool isImage1d, bool forceLinearStorage) const {
     return true;
 }
 
 template <>
-uint32_t ProductHelperHw<gfxProduct>::getMaxNumSamplers() const {
-    return 0u;
+bool ProductHelperHw<gfxProduct>::isDeviceToHostCopySignalingFenceRequired() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDeviceUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isHostUsmAllocationReuseSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isHostUsmPoolAllocatorSupported() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDeviceUsmPoolAllocatorSupported() const {
+    return false;
+}
+
+template <>
+uint64_t ProductHelperHw<gfxProduct>::getPatIndex(CacheRegion cacheRegion, CachePolicy cachePolicy) const {
+    /*
+    PAT Index  CLOS   MemType
+    SHARED
+    0          0      UC (00)
+    1          0      WC (01)
+    2          0      WT (10)
+    3          0      WB (11)
+    RESERVED 1
+    4          1      WT (10)
+    5          1      WB (11)
+    RESERVED 2
+    6          2      WT (10)
+    7          2      WB (11)
+    */
+
+    if ((debugManager.flags.ForceAllResourcesUncached.get() == true)) {
+        cacheRegion = CacheRegion::defaultRegion;
+        cachePolicy = CachePolicy::uncached;
+    }
+
+    UNRECOVERABLE_IF((cacheRegion > CacheRegion::defaultRegion) && (cachePolicy < CachePolicy::writeThrough));
+    return (static_cast<uint32_t>(cachePolicy) + (static_cast<uint16_t>(cacheRegion) * 2));
+}
+
+template <>
+uint32_t ProductHelperHw<gfxProduct>::getInternalHeapsPreallocated() const {
+    if (debugManager.flags.SetAmountOfInternalHeapsToPreallocate.get() != -1) {
+        return debugManager.flags.SetAmountOfInternalHeapsToPreallocate.get();
+    }
+    return 1u;
 }
 
 } // namespace NEO

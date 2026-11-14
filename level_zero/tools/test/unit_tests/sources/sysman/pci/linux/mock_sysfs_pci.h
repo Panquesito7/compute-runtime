@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
 #include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/pci/linux/os_pci_imp.h"
 #include "level_zero/tools/source/sysman/pci/pci_imp.h"
@@ -41,10 +43,6 @@ const std::vector<std::string> mockReadBytes =
 struct MockPciSysfsAccess : public SysfsAccess {
 
     bool isStringSymLinkEmpty = false;
-
-    bool isRootUser() override {
-        return true;
-    }
 
     ze_result_t getValStringSymLinkEmpty(const std::string file, std::string &val) {
         if (file.compare(deviceDir) == 0) {
@@ -88,17 +86,14 @@ struct MockPciSysfsAccess : public SysfsAccess {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
+    ADDMETHOD_NOBASE(isRootUser, bool, true, ());
+
     MockPciSysfsAccess() = default;
 };
 
 class PublicLinuxPciImp : public L0::LinuxPciImp {
   public:
     PublicLinuxPciImp(OsSysman *pOsSysman) : LinuxPciImp(pOsSysman) {}
-    using LinuxPciImp::closeFunction;
-    using LinuxPciImp::configMemory;
-    using LinuxPciImp::openFunction;
-    using LinuxPciImp::pciCardBusConfigRead;
-    using LinuxPciImp::pciExtendedConfigRead;
     using LinuxPciImp::preadFunction;
     using LinuxPciImp::pSysfsAccess;
 };

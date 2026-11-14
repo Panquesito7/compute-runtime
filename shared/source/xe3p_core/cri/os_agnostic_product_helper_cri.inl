@@ -1,0 +1,202 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/simd_helper.h"
+#include "shared/source/unified_memory/unified_memory.h"
+
+#include "aubstream/engine_node.h"
+#include "aubstream/product_family.h"
+
+#include <algorithm>
+
+namespace NEO {
+
+template <>
+std::optional<aub_stream::ProductFamily> ProductHelperHw<gfxProduct>::getAubStreamProductFamily() const {
+    return aub_stream::ProductFamily::Cri;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isAvailableExtendedScratch() const {
+    return debugManager.flags.EnableExtendedScratchSurfaceSize.get();
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isLinearStoragePreferred(bool isImage1d, bool forceLinearStorage) const {
+    return true;
+}
+
+template <>
+aub_stream::EngineType ProductHelperHw<gfxProduct>::getDefaultCopyEngine() const {
+    return aub_stream::EngineType::ENGINE_BCS1;
+}
+
+template <>
+size_t ProductHelperHw<gfxProduct>::getMinMiddleSizeForBuiltinBufferCopyWith8ByteAccess() const {
+    return 32 * MemoryConstants::megaByte;
+}
+
+template <>
+void ProductHelperHw<gfxProduct>::adjustEngineGroupType(EngineGroupType &engineGroupType) const {
+    if (engineGroupType == EngineGroupType::linkedCopy) {
+        engineGroupType = EngineGroupType::copy;
+    }
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isImplicitScalingSupported(const HardwareInfo &hwInfo) const {
+    return true;
+}
+
+template <>
+void ProductHelperHw<gfxProduct>::adjustNumberOfCcs(HardwareInfo &hwInfo) const {
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
+}
+
+template <>
+std::optional<bool> ProductHelperHw<gfxProduct>::isCoherentAllocation(uint64_t patIndex) const {
+    std::array<uint64_t, 8> listOfNonCoherentPatIndexes = {0, 3, 5, 8, 18, 23, 26, 29};
+    if (std::find(listOfNonCoherentPatIndexes.begin(), listOfNonCoherentPatIndexes.end(), patIndex) != listOfNonCoherentPatIndexes.end()) {
+        return false;
+    }
+    return true;
+}
+
+template <>
+uint64_t ProductHelperHw<gfxProduct>::getPatIndex(CacheRegion cacheRegion, CachePolicy cachePolicy) const {
+    uint64_t patIndex{0u};
+    switch (cacheRegion) {
+    case CacheRegion::region1:
+        patIndex = 23u;
+        break;
+    case CacheRegion::region2:
+        patIndex = 24u;
+        break;
+    default:
+        break;
+    }
+
+    return patIndex;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::areSecondaryContextsSupported() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::is2MBLocalMemAlignmentEnabled() const {
+    return true;
+}
+
+template <>
+uint32_t ProductHelperHw<gfxProduct>::adjustMaxThreadsPerThreadGroup(const HardwareInfo &hwInfo, uint32_t maxThreadsPerThreadGroup, uint32_t simt, uint32_t grfCount) const {
+    auto adjustedMaxThreadsPerThreadGroup = maxThreadsPerThreadGroup;
+    if (grfCount == 512) {
+        adjustedMaxThreadsPerThreadGroup = 32u;
+    } else if ((isSimd1(simt) || simt == 16u) && (grfCount == 160 || grfCount == 192)) {
+        adjustedMaxThreadsPerThreadGroup = 64u;
+    }
+    return adjustedMaxThreadsPerThreadGroup;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::shouldRegisterEnqueuedWalkerWithProfiling() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isLEOSupported() const {
+    return true;
+}
+
+template <>
+size_t ProductHelperHw<gfxProduct>::getCpuCopyThreshold(TransferType transferType) const {
+    size_t threshold = 0u;
+
+    switch (transferType) {
+    case TransferType::deviceUsmToDeviceUsm:
+        threshold = 4 * MemoryConstants::kiloByte;
+        break;
+    case TransferType::deviceUsmToHostUsm:
+        threshold = 4 * MemoryConstants::kiloByte;
+        break;
+    case TransferType::deviceUsmToHostNonUsm:
+        threshold = 64 * MemoryConstants::kiloByte;
+        break;
+    case TransferType::hostUsmToDeviceUsm:
+        threshold = 64 * MemoryConstants::kiloByte;
+        break;
+    case TransferType::hostUsmToHostUsm:
+        threshold = 1 * MemoryConstants::megaByte;
+        break;
+    case TransferType::hostUsmToHostNonUsm:
+        threshold = 64 * MemoryConstants::megaByte;
+        break;
+    case TransferType::hostNonUsmToDeviceUsm:
+        threshold = 10 * MemoryConstants::megaByte;
+        break;
+    case TransferType::hostNonUsmToHostUsm:
+        threshold = 64 * MemoryConstants::megaByte;
+        break;
+    case TransferType::hostNonUsmToHostNonUsm:
+        threshold = 64 * MemoryConstants::megaByte;
+        break;
+    default:
+        break;
+    }
+
+    return threshold;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isStagingBuffersEnabled() const {
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isStagingFor2MBAlignedHostPtrAllowed() const {
+    return false;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDualStreamCopyOffloadForRegularCmdListSupported() const {
+    if (debugManager.flags.OverrideDualStreamCopyOffloadForRegularSupport.get() != -1) {
+        return (debugManager.flags.OverrideDualStreamCopyOffloadForRegularSupport.get() == 1);
+    }
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isGraphPatchPreambleBarrierSupported() const {
+    if (debugManager.flags.OverrideGraphPatchPreambleBarrierSupport.get() != -1) {
+        return (debugManager.flags.OverrideGraphPatchPreambleBarrierSupport.get() == 1);
+    }
+    return true;
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isWriteSplitRequired(bool isDstSystemOrRemoteMemory) const {
+    switch (debugManager.flags.OverrideBcsWriteSplit.get()) {
+    case 0:
+        return false;
+    case 2:
+        return true;
+    default:
+        return isDstSystemOrRemoteMemory;
+    }
+}
+
+template <>
+bool ProductHelperHw<gfxProduct>::isDirectSubmissionContextGroupIdleDetectionEnabled() const {
+    return false;
+}
+
+} // namespace NEO

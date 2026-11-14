@@ -1,22 +1,20 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/device/device.h"
-#include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/gl_wrapper.h"
 
-#include "opencl/extensions/public/cl_gl_private_intel.h"
+#include "opencl/source/api/leo_forwarding.h"
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/base_object.h"
+#include "opencl/source/mem_obj/mem_obj.h"
 #include "opencl/source/sharings/gl/gl_arb_sync_event.h"
 #include "opencl/source/sharings/gl/linux/gl_sharing_linux.h"
-
-#include <GL/gl.h>
 
 namespace NEO {
 
@@ -26,7 +24,7 @@ bool setupArbSyncObject(GLSharingFunctions &sharing, OSInterface &osInterface, C
     return false;
 }
 
-void signalArbSyncObject(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo) {}
+void signalArbSyncObject(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo, bool signalAtSubmission) {}
 
 void serverWaitForArbSyncObject(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo) {}
 
@@ -81,7 +79,7 @@ void GlArbSyncEvent::unblockEventBy(Event &event, TaskCountType taskLevel, int32
         return;
     }
 
-    ctx->getSharing<GLSharingFunctionsLinux>()->glArbSyncObjectSignal(event.getCommandQueue()->getGpgpuCommandStreamReceiver().getOsContext(), *glSyncInfo);
+    ctx->getSharing<GLSharingFunctionsLinux>()->glArbSyncObjectSignal(event.getCommandQueue()->getGpgpuCommandStreamReceiver().getOsContext(), *glSyncInfo, transitionStatus == CL_COMPLETE);
     ctx->getSharing<GLSharingFunctionsLinux>()->glArbSyncObjectWaitServer(*osInterface, *glSyncInfo);
 }
 } // namespace NEO
@@ -90,17 +88,26 @@ extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clEnqueueMarkerWithSyncObjectINTEL(cl_command_queue commandQueue,
                                    cl_event *event,
                                    cl_context *context) {
+    if (nullptr == NEO::castToObject<NEO::CommandQueue>(commandQueue) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClEnqueueMarkerWithSyncObjectINTEL(commandQueue, event, context);
+    }
     return CL_INVALID_OPERATION;
 }
 
 extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clGetCLObjectInfoINTEL(cl_mem memObj,
                        void *pResourceInfo) {
+    if (nullptr == NEO::castToObject<NEO::MemObj>(memObj) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClGetCLObjectInfoINTEL(memObj, pResourceInfo);
+    }
     return CL_INVALID_OPERATION;
 }
 
 extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clGetCLEventInfoINTEL(cl_event event, PCL_GL_SYNC_INFO *pSyncInfoHandleRet, cl_context *pClContextRet) {
+    if (nullptr == NEO::castToObject<NEO::Event>(event) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClGetCLEventInfoINTEL(event, reinterpret_cast<void **>(pSyncInfoHandleRet), pClContextRet);
+    }
     if ((nullptr == pSyncInfoHandleRet) || (nullptr == pClContextRet)) {
         return CL_INVALID_ARG_VALUE;
     }
@@ -136,6 +143,9 @@ clGetCLEventInfoINTEL(cl_event event, PCL_GL_SYNC_INFO *pSyncInfoHandleRet, cl_c
 
 extern "C" CL_API_ENTRY cl_int CL_API_CALL
 clReleaseGlSharedEventINTEL(cl_event event) {
+    if (nullptr == NEO::castToObject<NEO::Event>(event) && NEO::hasLeoPlatforms()) {
+        return NEO::forwardClReleaseGlSharedEventINTEL(event);
+    }
     auto neoEvent = NEO::castToObject<NEO::Event>(event);
     if (nullptr == neoEvent) {
         return CL_INVALID_EVENT;

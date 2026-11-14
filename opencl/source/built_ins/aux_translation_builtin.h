@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -20,19 +20,18 @@
 #include <memory>
 
 namespace NEO {
-template <>
-class BuiltInOp<EBuiltInOps::AuxTranslation> : public BuiltinDispatchInfoBuilder {
+class AuxTranslationBuiltin : public BuiltIn::DispatchInfoBuilder {
   public:
-    BuiltInOp(BuiltIns &kernelsLib, ClDevice &device);
+    AuxTranslationBuiltin(BuiltIns &kernelsLib, ClDevice &device, BuiltIn::AddressingMode mode);
     template <typename GfxFamily>
-    bool buildDispatchInfosForAuxTranslation(MultiDispatchInfo &multiDispatchInfo, const BuiltinOpParams &operationParams) const {
+    bool buildDispatchInfosForAuxTranslation(MultiDispatchInfo &multiDispatchInfo, const BuiltIn::OpParams &operationParams) const {
         size_t kernelInstanceNumber = 0;
         size_t numKernelObjectsToTranslate = multiDispatchInfo.getKernelObjsForAuxTranslation()->size();
         resizeKernelInstances(numKernelObjectsToTranslate);
         multiDispatchInfo.setBuiltinOpParams(operationParams);
 
         for (auto &kernelObj : *multiDispatchInfo.getKernelObjsForAuxTranslation()) {
-            DispatchInfoBuilder<SplitDispatch::Dim::d1D, SplitDispatch::SplitMode::NoSplit> builder(clDevice);
+            NEO::DispatchInfoBuilder<SplitDispatch::Dim::d1D, SplitDispatch::SplitMode::noSplit> builder(clDevice);
 
             UNRECOVERABLE_IF(builder.getMaxNumDispatches() != 1);
 
@@ -45,21 +44,21 @@ class BuiltInOp<EBuiltInOps::AuxTranslation> : public BuiltinDispatchInfoBuilder
                 registerPipeControlProgramming<GfxFamily>(builder.getDispatchInfo(0).dispatchEpilogueCommands, false);
             }
 
-            if (AuxTranslationDirection::AuxToNonAux == operationParams.auxTranslationDirection) {
+            if (AuxTranslationDirection::auxToNonAux == operationParams.auxTranslationDirection) {
                 builder.setKernel(convertToNonAuxKernel[kernelInstanceNumber++].get());
             } else {
-                UNRECOVERABLE_IF(AuxTranslationDirection::NonAuxToAux != operationParams.auxTranslationDirection);
+                UNRECOVERABLE_IF(AuxTranslationDirection::nonAuxToAux != operationParams.auxTranslationDirection);
                 builder.setKernel(convertToAuxKernel[kernelInstanceNumber++].get());
             }
 
             size_t allocationSize = 0;
-            if (kernelObj.type == KernelObjForAuxTranslation::Type::MEM_OBJ) {
+            if (kernelObj.type == KernelObjForAuxTranslation::Type::memObj) {
                 auto buffer = static_cast<Buffer *>(kernelObj.object);
                 builder.setArg(0, buffer);
                 builder.setArg(1, buffer);
                 allocationSize = alignUp(buffer->getSize(), 512);
             } else {
-                DEBUG_BREAK_IF(kernelObj.type != KernelObjForAuxTranslation::Type::GFX_ALLOC);
+                DEBUG_BREAK_IF(kernelObj.type != KernelObjForAuxTranslation::Type::gfxAlloc);
                 auto svmAlloc = static_cast<GraphicsAllocation *>(kernelObj.object);
                 auto svmPtr = reinterpret_cast<void *>(svmAlloc->getGpuAddressToPatch());
                 builder.setArgSvmAlloc(0, svmPtr, svmAlloc);
@@ -88,7 +87,7 @@ class BuiltInOp<EBuiltInOps::AuxTranslation> : public BuiltinDispatchInfoBuilder
 
     template <typename GfxFamily>
     static size_t getSizeForSinglePipeControl(size_t, const RootDeviceEnvironment &rootDeviceEnvironment, bool) {
-        return MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier(false);
+        return MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier();
     }
 
     template <typename GfxFamily>

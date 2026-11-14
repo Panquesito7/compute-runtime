@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_device.h"
@@ -22,7 +23,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, EngineNodeHelperTestsXeHPAndLater, WhenGetBcsEngine
     EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS, EngineHelpers::getBcsEngineType(rootDeviceEnvironment, {}, selectorCopyEngine, false));
 }
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenDebugVariableSetWhenAskingForEngineTypeThenReturnTheSameAsVariableIndex, IsAtLeastXeHpCore) {
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenDebugVariableSetWhenAskingForEngineTypeThenReturnTheSameAsVariableIndex, IsAtLeastXeCore) {
     DebugManagerStateRestore restore;
     DeviceBitfield deviceBitfield = 0b11;
 
@@ -30,7 +31,7 @@ HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenDebugVariableSetWhenAskingForE
     auto &selectorCopyEngine = pDevice->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
 
     for (int32_t i = 0; i <= 9; i++) {
-        DebugManager.flags.ForceBcsEngineIndex.set(i);
+        debugManager.flags.ForceBcsEngineIndex.set(i);
 
         if (i == 0) {
             EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS, EngineHelpers::getBcsEngineType(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine, false));
@@ -42,9 +43,9 @@ HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenDebugVariableSetWhenAskingForE
     }
 }
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenForceBCSForInternalCopyEngineWhenGetBcsEngineTypeForInternalEngineThenForcedTypeIsReturned, IsAtLeastXeHpCore) {
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenForceBCSForInternalCopyEngineWhenGetBcsEngineTypeForInternalEngineThenForcedTypeIsReturned, IsAtLeastXeCore) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.ForceBCSForInternalCopyEngine.set(0u);
+    debugManager.flags.ForceBCSForInternalCopyEngine.set(0u);
 
     auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
     auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
@@ -53,209 +54,159 @@ HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenForceBCSForInternalCopyEngineW
     DeviceBitfield deviceBitfield = 0xff;
 
     {
-        DebugManager.flags.ForceBCSForInternalCopyEngine.set(0u);
+        debugManager.flags.ForceBCSForInternalCopyEngine.set(0u);
         auto engineType = EngineHelpers::getBcsEngineType(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine, true);
         EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS, engineType);
     }
     {
-        DebugManager.flags.ForceBCSForInternalCopyEngine.set(3u);
+        debugManager.flags.ForceBCSForInternalCopyEngine.set(3u);
         auto engineType = EngineHelpers::getBcsEngineType(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine, true);
         EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS3, engineType);
     }
 }
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenEnableCmdQRoundRobindBcsEngineAssignWhenSelectLinkCopyEngineThenRoundRobinOverAllAvailableLinkedCopyEngines, IsAtLeastXeHpCore) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.set(1u);
-    DeviceBitfield deviceBitfield = 0b10;
-
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenLessThanFourCopyEnginesWhenGetBcsEngineTypeForInternalEngineThenReturnLastAvailableEngine, IsAtLeastXeHpcCore) {
     auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
     auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-    hwInfo.featureTable.ftrBcsInfo.set(7);
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
     auto &selectorCopyEngine = pDevice->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
+    DeviceBitfield deviceBitfield = 0xff;
 
-    int32_t expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    for (int32_t i = 0; i <= 20; i++) {
-        while (!gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, static_cast<aub_stream::EngineType>(expectedEngineType)) || !hwInfo.featureTable.ftrBcsInfo.test(expectedEngineType - aub_stream::EngineType::ENGINE_BCS1 + 1)) {
-            expectedEngineType++;
-            if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS8) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-            }
-        }
-
-        auto engineType = EngineHelpers::selectLinkCopyEngine(pDevice->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
-        EXPECT_EQ(engineType, static_cast<aub_stream::EngineType>(expectedEngineType));
-
-        expectedEngineType++;
-        if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS8) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-        }
+    {
+        hwInfo.featureTable.ftrBcsInfo = 0b1;
+        auto engineType = EngineHelpers::getBcsEngineType(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine, true);
+        EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS, engineType);
+    }
+    {
+        hwInfo.featureTable.ftrBcsInfo = 0b11;
+        auto engineType = EngineHelpers::getBcsEngineType(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine, true);
+        EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS1, engineType);
+    }
+    {
+        hwInfo.featureTable.ftrBcsInfo = 0b111;
+        auto engineType = EngineHelpers::getBcsEngineType(rootDeviceEnvironment, deviceBitfield, selectorCopyEngine, true);
+        EXPECT_EQ(aub_stream::EngineType::ENGINE_BCS2, engineType);
     }
 }
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenEnableCmdQRoundRobindBcsEngineAssignAndMainCopyEngineIncludedWhenSelectLinkCopyEngineThenRoundRobinOverAllAvailableLinkedCopyEnginesAndMainCopyEngine, IsAtLeastXeHpCore) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.set(1u);
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignStartingValue.set(0);
-    DeviceBitfield deviceBitfield = 0b10;
-
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenLessThanFourCopyEnginesWhenGetGpgpuEngineInstancesThenUseLastCopyEngineAsInternal, IsAtLeastXeHpcCore) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ExperimentalUseSecondaryContextForInternalEngine.set(0);
     auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
     auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-    hwInfo.featureTable.ftrBcsInfo = 0x17f;
-    auto &selectorCopyEngine = pDevice->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
-
-    int32_t expectedEngineType = aub_stream::EngineType::ENGINE_BCS;
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
     auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    for (int32_t i = 0; i <= 20; i++) {
-        while (!gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, static_cast<aub_stream::EngineType>(expectedEngineType)) || !hwInfo.featureTable.ftrBcsInfo.test(expectedEngineType == aub_stream::EngineType::ENGINE_BCS
-                                                                                                                                                                                                     ? 0
-                                                                                                                                                                                                     : expectedEngineType - aub_stream::EngineType::ENGINE_BCS1 + 1)) {
-            if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-            } else {
-                expectedEngineType++;
-            }
-            if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS8) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS;
+    auto &productHelper = rootDeviceEnvironment.getProductHelper();
+
+    auto hasInternalEngine = [](const EngineInstancesContainer &engines, aub_stream::EngineType expectedEngineType) {
+        for (auto &[engineType, engineUsage] : engines) {
+            if (engineType == expectedEngineType && engineUsage == EngineUsage::internal) {
+                return true;
             }
         }
+        return false;
+    };
 
-        auto engineType = EngineHelpers::selectLinkCopyEngine(pDevice->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
-        EXPECT_EQ(engineType, static_cast<aub_stream::EngineType>(expectedEngineType));
-
-        if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-        } else {
-            expectedEngineType++;
+    {
+        if (aub_stream::EngineType::ENGINE_BCS == productHelper.getDefaultCopyEngine()) {
+            hwInfo.featureTable.ftrBcsInfo = 0b1;
+            auto &engines = gfxCoreHelper.getGpgpuEngineInstances(rootDeviceEnvironment);
+            EXPECT_TRUE(hasInternalEngine(engines, aub_stream::EngineType::ENGINE_BCS));
+            EXPECT_FALSE(hasInternalEngine(engines, aub_stream::EngineType::ENGINE_BCS3));
         }
-        if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS8) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS;
-        }
+    }
+    {
+        hwInfo.featureTable.ftrBcsInfo = 0b11;
+        auto &engines = gfxCoreHelper.getGpgpuEngineInstances(rootDeviceEnvironment);
+        EXPECT_TRUE(hasInternalEngine(engines, aub_stream::EngineType::ENGINE_BCS1));
+        EXPECT_FALSE(hasInternalEngine(engines, aub_stream::EngineType::ENGINE_BCS3));
+    }
+    {
+        hwInfo.featureTable.ftrBcsInfo = 0b111;
+        auto &engines = gfxCoreHelper.getGpgpuEngineInstances(rootDeviceEnvironment);
+        EXPECT_TRUE(hasInternalEngine(engines, aub_stream::EngineType::ENGINE_BCS2));
+        EXPECT_FALSE(hasInternalEngine(engines, aub_stream::EngineType::ENGINE_BCS3));
     }
 }
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenEnableCmdQRoundRobindBcsEngineAssignAndMainCopyEngineIncludedAndLimitSetWhenSelectLinkCopyEngineThenRoundRobinOverAllAvailableLinkedCopyEnginesAndMainCopyEngine, IsAtLeastXeHpCore) {
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenHpCopyEngineWhenSelectLinkCopyEngineThenHpEngineIsNotSelected, IsAtLeastXeCore) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.set(1u);
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignStartingValue.set(0);
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignLimit.set(6);
-    DeviceBitfield deviceBitfield = 0b10;
+    debugManager.flags.ContextGroupSize.set(8);
+    DeviceBitfield deviceBitfield = 0b1;
+    hardwareInfo.featureTable.ftrBcsInfo = 0b10010;
 
-    auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
-    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-    hwInfo.featureTable.ftrBcsInfo = 0x17f;
-    auto &selectorCopyEngine = pDevice->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
+    std::unique_ptr<Device> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, rootDeviceIndex));
 
-    int32_t expectedEngineType = aub_stream::EngineType::ENGINE_BCS;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    for (int32_t i = 0; i <= 20; i++) {
-        while (!gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, static_cast<aub_stream::EngineType>(expectedEngineType)) || !hwInfo.featureTable.ftrBcsInfo.test(expectedEngineType == aub_stream::EngineType::ENGINE_BCS
-                                                                                                                                                                                                     ? 0
-                                                                                                                                                                                                     : expectedEngineType - aub_stream::EngineType::ENGINE_BCS1 + 1)) {
-            if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-            } else {
-                expectedEngineType++;
-            }
-            if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS5) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS;
-            }
-        }
+    const auto &gfxCoreHelper = device->getGfxCoreHelper();
+    auto hpEngine = gfxCoreHelper.getDefaultHpCopyEngine(hardwareInfo);
+    if (hpEngine == aub_stream::EngineType::NUM_ENGINES) {
+        GTEST_SKIP();
+    }
 
-        auto engineType = EngineHelpers::selectLinkCopyEngine(pDevice->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
-        EXPECT_EQ(engineType, static_cast<aub_stream::EngineType>(expectedEngineType));
+    auto &selectorCopyEngine = device->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
 
-        if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-        } else {
-            expectedEngineType++;
-        }
-        if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS5) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS;
-        }
+    auto engineType = EngineHelpers::selectLinkCopyEngine(device->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
+    EXPECT_NE(hpEngine, engineType);
+
+    auto engineType2 = EngineHelpers::selectLinkCopyEngine(device->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
+    EXPECT_NE(hpEngine, engineType2);
+}
+
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenHpCopyEngineAndBcs0And1And2RegularEnginesWhenDefaultCopyIsNotBcs1ThenHpEngineIsNotSelectedAndDifferentEnginesAreReturned, IsAtLeastXeCore) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.ContextGroupSize.set(8);
+    DeviceBitfield deviceBitfield = 0b1;
+
+    hardwareInfo.featureTable.ftrBcsInfo = 0b10111;
+    std::unique_ptr<Device> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, rootDeviceIndex));
+
+    const auto &gfxCoreHelper = device->getGfxCoreHelper();
+    auto hpEngine = gfxCoreHelper.getDefaultHpCopyEngine(hardwareInfo);
+    if (hpEngine == aub_stream::EngineType::NUM_ENGINES) {
+        GTEST_SKIP();
+    }
+
+    auto &selectorCopyEngine = device->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
+
+    auto engineType = EngineHelpers::selectLinkCopyEngine(device->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
+    EXPECT_NE(hpEngine, engineType);
+
+    auto engineType2 = EngineHelpers::selectLinkCopyEngine(device->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
+    EXPECT_NE(hpEngine, engineType2);
+
+    auto &productHelper = device->getRootDeviceEnvironment().getProductHelper();
+
+    if (aub_stream::ENGINE_BCS1 != productHelper.getDefaultCopyEngine()) {
+        EXPECT_NE(engineType, engineType2);
+        EXPECT_EQ(aub_stream::ENGINE_BCS2, engineType);
+        EXPECT_EQ(aub_stream::ENGINE_BCS1, engineType2);
+    } else {
+        EXPECT_EQ(engineType, engineType2);
     }
 }
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenEnableCmdQRoundRobindBcsEngineAssignAndLimitSetWhenSelectLinkCopyEngineThenRoundRobinOverAllAvailableLinkedCopyEnginesAndMainCopyEngine, IsAtLeastXeHpCore) {
+HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenBcs2HpCopyEngineAndBcs0And1RegularEnginesWhenSelectingLinkCopyEngineThenBcs1IsSelected, IsAtLeastXeCore) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.set(1u);
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignLimit.set(6);
-    DeviceBitfield deviceBitfield = 0b10;
+    debugManager.flags.ContextGroupSize.set(8);
+    DeviceBitfield deviceBitfield = 0b1;
+    hardwareInfo.featureTable.ftrBcsInfo = 0b00111;
 
-    auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
-    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-    hwInfo.featureTable.ftrBcsInfo = 0x17f;
-    auto &selectorCopyEngine = pDevice->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
+    std::unique_ptr<Device> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo, rootDeviceIndex));
 
-    int32_t expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    for (int32_t i = 0; i <= 20; i++) {
-        while (!gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, static_cast<aub_stream::EngineType>(expectedEngineType)) || !hwInfo.featureTable.ftrBcsInfo.test(expectedEngineType == aub_stream::EngineType::ENGINE_BCS
-                                                                                                                                                                                                     ? 0
-                                                                                                                                                                                                     : expectedEngineType - aub_stream::EngineType::ENGINE_BCS1 + 1)) {
-            if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-            } else {
-                expectedEngineType++;
-            }
-            if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS6) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-            }
-        }
-
-        auto engineType = EngineHelpers::selectLinkCopyEngine(pDevice->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
-        EXPECT_EQ(engineType, static_cast<aub_stream::EngineType>(expectedEngineType));
-
-        if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-        } else {
-            expectedEngineType++;
-        }
-        if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS6) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-        }
+    const auto &gfxCoreHelper = device->getGfxCoreHelper();
+    auto hpEngine = gfxCoreHelper.getDefaultHpCopyEngine(hardwareInfo);
+    if (hpEngine == aub_stream::EngineType::NUM_ENGINES) {
+        GTEST_SKIP();
     }
-}
 
-HWTEST2_F(EngineNodeHelperTestsXeHPAndLater, givenEnableCmdQRoundRobindBcsEngineAssignAndStartOffsetIncludedWhenSelectLinkCopyEngineThenRoundRobinOverAllAvailableLinkedCopyEngines, IsAtLeastXeHpCore) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssign.set(1u);
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignStartingValue.set(2);
-    DebugManager.flags.EnableCmdQRoundRobindBcsEngineAssignLimit.set(5);
-    DeviceBitfield deviceBitfield = 0b10;
+    auto &selectorCopyEngine = device->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
 
-    auto &rootDeviceEnvironment = pDevice->getRootDeviceEnvironment();
-    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-    hwInfo.featureTable.ftrBcsInfo = 0x17f;
-    auto &selectorCopyEngine = pDevice->getNearestGenericSubDevice(0)->getSelectorCopyEngine();
+    auto engineType = EngineHelpers::selectLinkCopyEngine(device->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
+    EXPECT_NE(hpEngine, engineType);
 
-    int32_t expectedEngineType = aub_stream::EngineType::ENGINE_BCS3;
-    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    for (int32_t i = 0; i <= 20; i++) {
-        while (!gfxCoreHelper.isSubDeviceEngineSupported(rootDeviceEnvironment, deviceBitfield, static_cast<aub_stream::EngineType>(expectedEngineType)) || !hwInfo.featureTable.ftrBcsInfo.test(expectedEngineType == aub_stream::EngineType::ENGINE_BCS
-                                                                                                                                                                                                     ? 0
-                                                                                                                                                                                                     : expectedEngineType - aub_stream::EngineType::ENGINE_BCS1 + 1)) {
-            if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-            } else {
-                expectedEngineType++;
-            }
-            if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS7) {
-                expectedEngineType = aub_stream::EngineType::ENGINE_BCS3;
-            }
-        }
+    auto engineType2 = EngineHelpers::selectLinkCopyEngine(device->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
+    EXPECT_NE(hpEngine, engineType2);
 
-        auto engineType = EngineHelpers::selectLinkCopyEngine(pDevice->getRootDeviceEnvironment(), deviceBitfield, selectorCopyEngine.selector);
-        EXPECT_EQ(engineType, static_cast<aub_stream::EngineType>(expectedEngineType));
-
-        if (expectedEngineType == aub_stream::EngineType::ENGINE_BCS) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS1;
-        } else {
-            expectedEngineType++;
-        }
-        if (static_cast<aub_stream::EngineType>(expectedEngineType) > aub_stream::EngineType::ENGINE_BCS7) {
-            expectedEngineType = aub_stream::EngineType::ENGINE_BCS3;
-        }
-    }
+    EXPECT_EQ(engineType, engineType2);
+    EXPECT_EQ(aub_stream::ENGINE_BCS1, engineType2);
 }

@@ -1,22 +1,27 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/helpers/ptr_math.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
+
+#include "shared/source/built_ins/built_in_ops_base.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/test/common/mocks/mock_device.h"
 
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
 
 struct EnqueueCopyBufferToImageTest : public CommandEnqueueFixture,
+                                      public SurfaceStateAccessor,
                                       public ::testing::Test {
 
     void SetUp() override {
@@ -27,11 +32,12 @@ struct EnqueueCopyBufferToImageTest : public CommandEnqueueFixture,
         BufferDefaults::context = new MockContext(pClDevice);
         context = new MockContext(pClDevice);
         srcBuffer = BufferHelper<>::create(context);
-        dstImage = Image2dHelper<>::create(context);
+        dstImage = Image2dHelperUlt<>::create(context);
+        initialized = true;
     }
 
     void TearDown() override {
-        if (IsSkipped()) {
+        if (!initialized) {
             return;
         }
         delete dstImage;
@@ -55,11 +61,11 @@ struct EnqueueCopyBufferToImageTest : public CommandEnqueueFixture,
     MockContext *context = nullptr;
     Buffer *srcBuffer = nullptr;
     Image *dstImage = nullptr;
+    bool initialized = false;
 };
 
 struct EnqueueCopyBufferToImageMipMapTest : public CommandEnqueueFixture,
-                                            public ::testing::Test,
-                                            public ::testing::WithParamInterface<uint32_t> {
+                                            public ::testing::Test {
 
     void SetUp(void) override {
         REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
@@ -67,10 +73,11 @@ struct EnqueueCopyBufferToImageMipMapTest : public CommandEnqueueFixture,
         BufferDefaults::context = new MockContext(pClDevice);
         context = new MockContext(pClDevice);
         srcBuffer = BufferHelper<>::create(context);
+        initialized = true;
     }
 
     void TearDown(void) override {
-        if (IsSkipped()) {
+        if (!initialized) {
             return;
         }
         delete srcBuffer;
@@ -79,8 +86,14 @@ struct EnqueueCopyBufferToImageMipMapTest : public CommandEnqueueFixture,
         CommandEnqueueFixture::tearDown();
     }
 
+    BuiltIn::AddressingMode getBuiltinMode(bool isStateless) {
+        bool bindless = ApiSpecificConfig::getBindlessMode(pClDevice->getDevice());
+        return BuiltIn::AddressingMode::getDefaultMode(bindless, isStateless);
+    }
+
     MockContext *context = nullptr;
     Buffer *srcBuffer = nullptr;
+    bool initialized = false;
 };
 
 } // namespace NEO

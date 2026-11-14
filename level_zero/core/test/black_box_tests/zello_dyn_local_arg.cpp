@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,52 +9,16 @@
 #include "zello_compile.h"
 
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <memory>
 #include <vector>
-
-const char *clProgram = R"==(
-__kernel void local_barrier_arg(__local int *local_dst1, __global int *dst, __local int *local_dst2,
-        __local ulong *local_dst3, __local int *local_dst4) {
-    unsigned int gid = get_global_id(0);
-    if(get_local_id(0) == 0){
-        local_dst1[0] = 6;
-        local_dst2[0] = 7;
-        local_dst3[0] = 8;
-        local_dst4[0] = 9;
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if(get_local_id(0) == 0){
-        local_dst1[0] = gid + local_dst1[0];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if(get_local_id(0) == 0){
-        local_dst2[0] = gid + local_dst2[0];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if(get_local_id(0) == 0){
-        local_dst3[0] = gid + local_dst3[0];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if(get_local_id(0) == 0){
-        local_dst4[0] = gid + local_dst4[0];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    barrier(CLK_GLOBAL_MEM_FENCE);
-    if(gid == 0){
-        dst[0] = local_dst1[0] + local_dst2[0] + local_dst3[0] + local_dst4[0];
-    }
-}
-)==";
 
 void createModule(ze_module_handle_t &module, ze_context_handle_t &context, ze_device_handle_t &device) {
     // Prepare spirV
     std::string buildLog;
 
-    auto binaryModule = compileToSpirV(clProgram, "", buildLog);
+    auto binaryModule = LevelZeroBlackBoxTests::compileToSpirV(LevelZeroBlackBoxTests::dynLocalBarrierArgSrc, "", buildLog);
     if (buildLog.size() > 0) {
-        std::cerr << "CL->spirV comilation log : " << buildLog
+        std::cerr << "CL->spirV compilation log : " << buildLog
                   << std::endl;
     }
     SUCCESS_OR_TERMINATE(0 == binaryModule.size());
@@ -75,7 +39,7 @@ void createKernel(ze_module_handle_t &module, ze_kernel_handle_t &kernel, size_t
     // Set group sizes
     SUCCESS_OR_TERMINATE(zeKernelSuggestGroupSize(kernel, static_cast<uint32_t>(numThreads), 1U, 1U, &groupSizeX,
                                                   &groupSizeY, &groupSizeZ));
-    if (verbose) {
+    if (LevelZeroBlackBoxTests::verbose) {
         std::cout << "Group size : (" << groupSizeX << ", " << groupSizeY << ", " << groupSizeZ
                   << ")" << std::endl;
     }
@@ -87,7 +51,7 @@ void createCmdQueueAndCmdList(ze_context_handle_t &context, ze_device_handle_t &
                               ze_command_list_handle_t &cmdList,
                               ze_command_queue_desc_t *cmdQueueDesc,
                               ze_command_list_desc_t *cmdListDesc) {
-    cmdQueueDesc->ordinal = getCommandQueueOrdinal(device);
+    cmdQueueDesc->ordinal = LevelZeroBlackBoxTests::getCommandQueueOrdinal(device, false);
     cmdQueueDesc->mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
     SUCCESS_OR_TERMINATE(zeCommandQueueCreate(context, device, cmdQueueDesc, &cmdqueue));
 
@@ -140,8 +104,8 @@ bool testLocalBarrier(ze_context_handle_t &context, ze_device_handle_t &device) 
     SUCCESS_OR_TERMINATE(zeCommandListAppendBarrier(cmdList, nullptr, 0, nullptr));
 
     realResult = reinterpret_cast<int *>(dstBuffer);
-    if (verbose) {
-        std::cerr << "Inital Gobal Memory Value " << *realResult << std::endl;
+    if (LevelZeroBlackBoxTests::verbose) {
+        std::cout << "Initial Global Memory Value " << *realResult << std::endl;
     }
 
     // Set kernel args and get ready to dispatch
@@ -154,11 +118,7 @@ bool testLocalBarrier(ze_context_handle_t &context, ze_device_handle_t &device) 
     dispatchTraits.groupCountX = 3u;
     dispatchTraits.groupCountY = 1u;
     dispatchTraits.groupCountZ = 1u;
-    if (verbose) {
-        std::cerr << "Number of groups : (" << dispatchTraits.groupCountX << ", "
-                  << dispatchTraits.groupCountY << ", " << dispatchTraits.groupCountZ << ")"
-                  << std::endl;
-    }
+    LevelZeroBlackBoxTests::printGroupCount(dispatchTraits);
 
     SUCCESS_OR_TERMINATE(
         zeCommandListAppendLaunchKernel(cmdList, kernel, &dispatchTraits, nullptr, 0, nullptr));
@@ -168,8 +128,8 @@ bool testLocalBarrier(ze_context_handle_t &context, ze_device_handle_t &device) 
     SUCCESS_OR_TERMINATE(zeCommandQueueSynchronize(cmdQueue, std::numeric_limits<uint64_t>::max()));
 
     realResult = reinterpret_cast<int *>(dstBuffer);
-    if (verbose) {
-        std::cerr << "Final Gobal Memory Value " << *realResult << std::endl;
+    if (LevelZeroBlackBoxTests::verbose) {
+        std::cout << "Final Global Memory Value " << *realResult << std::endl;
     }
 
     if (*realResult != expectedResult) {
@@ -190,23 +150,21 @@ int main(int argc, char *argv[]) {
     const std::string blackBoxName = "Zello Dyn Local Arg";
     bool outputValidationSuccessful;
 
-    verbose = isVerbose(argc, argv);
-    bool aubMode = isAubMode(argc, argv);
+    LevelZeroBlackBoxTests::verbose = LevelZeroBlackBoxTests::isVerbose(argc, argv);
+    bool aubMode = LevelZeroBlackBoxTests::isAubMode(argc, argv);
 
     ze_context_handle_t context = nullptr;
     ze_driver_handle_t driverHandle = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context, driverHandle);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context, driverHandle);
     auto device = devices[0];
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
     outputValidationSuccessful = testLocalBarrier(context, device);
 
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
-
-    printResult(aubMode, outputValidationSuccessful, blackBoxName);
+    LevelZeroBlackBoxTests::printResult(aubMode, outputValidationSuccessful, blackBoxName);
 
     int resultOnFailure = aubMode ? 0 : 1;
     return outputValidationSuccessful ? 0 : resultOnFailure;

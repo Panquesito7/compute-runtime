@@ -1,15 +1,16 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "shared/source/os_interface/os_library.h"
+
 #include "level_zero/tools/source/sysman/linux/nl_api/nl_api.h"
 
-#include "gmock/gmock.h"
+#include <map>
 
 // Define opaque types so variables can be allocated
 struct nl_sock {
@@ -25,6 +26,9 @@ class MockNlDll : public NEO::OsLibrary {
   public:
     bool isLoaded() override { return false; }
     void *getProcAddress(const std::string &procName) override;
+    std::string getFullPath() override {
+        return std::string();
+    }
 
     void deleteEntryPoint(const std::string &procName);
 

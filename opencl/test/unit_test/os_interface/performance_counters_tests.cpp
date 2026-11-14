@@ -1,22 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/command_stream/preemption.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/utilities/perf_counter.h"
 #include "shared/source/utilities/tag_allocator.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
-#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_os_context.h"
 
 #include "opencl/source/event/event.h"
 #include "opencl/test/unit_test/fixtures/device_instrumentation_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/os_interface/mock_performance_counters.h"
 
 #include "gtest/gtest.h"
@@ -60,6 +60,30 @@ TEST_F(PerformanceCountersTest, WhenCreatingPerformanceCountersThenObjectIsNotNu
     auto performanceCounters = PerformanceCounters::create(&device->getDevice());
     EXPECT_NE(nullptr, performanceCounters);
     EXPECT_NE(nullptr, performanceCounters.get());
+}
+
+TEST_F(PerformanceCountersTest, GivenValidDeviceHandleWhenFlushCommandBufferCallbackIsCalledThenReturnsSuccess) {
+    auto performanceCounters = PerformanceCounters::create(&device->getDevice());
+    EXPECT_NE(nullptr, performanceCounters);
+    EXPECT_NE(nullptr, performanceCounters.get());
+
+    MetricsLibraryApi::ClientHandle_1_0 handle = reinterpret_cast<void *>(&device->getDevice());
+    auto callback = performanceCounters->getMetricsLibraryInterface()->api->callbacks.CommandBufferFlush;
+
+    EXPECT_NE(nullptr, callback);
+    EXPECT_EQ(MetricsLibraryApi::StatusCode::Success, callback(handle));
+}
+
+TEST_F(PerformanceCountersTest, GivenInvalidDeviceHandleWhenFlushCommandBufferCallbackIsCalledThenReturnsFailed) {
+    auto performanceCounters = PerformanceCounters::create(&device->getDevice());
+    EXPECT_NE(nullptr, performanceCounters);
+    EXPECT_NE(nullptr, performanceCounters.get());
+
+    MetricsLibraryApi::ClientHandle_1_0 handle = {};
+    auto callback = performanceCounters->getMetricsLibraryInterface()->api->callbacks.CommandBufferFlush;
+
+    EXPECT_NE(nullptr, callback);
+    EXPECT_EQ(MetricsLibraryApi::StatusCode::Failed, callback(handle));
 }
 
 TEST_F(PerformanceCountersTest, givenPerformanceCountersWhenCreatedThenAllValuesProperlyInitialized) {
@@ -204,7 +228,7 @@ TEST_F(PerformanceCountersProcessEventTest, givenNullptrQueryWhenProcessEventPer
     EXPECT_FALSE(retVal);
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     PerfCountersTests,
     PerformanceCountersProcessEventTest,
     testing::Bool());
@@ -215,15 +239,17 @@ struct PerformanceCountersMetricsLibraryTest : public PerformanceCountersMetrics
   public:
     void SetUp() override {
         PerformanceCountersMetricsLibraryFixture::setUp();
-        auto hwInfo = rootDeviceEnvironment->getHardwareInfo();
-        auto &gfxCoreHelper = rootDeviceEnvironment->getHelper<GfxCoreHelper>();
-        osContext = std::make_unique<MockOsContext>(0, EngineDescriptorHelper::getDefaultDescriptor(gfxCoreHelper.getGpgpuEngineInstances(*rootDeviceEnvironment)[0],
+        auto &rootDeviceEnvironment = *executionEnvironment->rootDeviceEnvironments[0];
+        auto hwInfo = rootDeviceEnvironment.getHardwareInfo();
+        auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
+        osContext = std::make_unique<MockOsContext>(0, EngineDescriptorHelper::getDefaultDescriptor(gfxCoreHelper.getGpgpuEngineInstances(rootDeviceEnvironment)[0],
                                                                                                     PreemptionHelper::getDefaultPreemptionMode(*hwInfo)));
         queue->getGpgpuCommandStreamReceiver().setupContext(*osContext);
     }
 
     void TearDown() override {
         PerformanceCountersMetricsLibraryFixture::tearDown();
+        queue->getGpgpuCommandStreamReceiver().setupContext(*device->getDefaultEngine().osContext);
     }
     std::unique_ptr<OsContext> osContext;
 };

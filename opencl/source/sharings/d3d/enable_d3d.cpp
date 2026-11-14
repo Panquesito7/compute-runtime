@@ -1,17 +1,19 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#ifdef WIN32
+#if defined(_WIN32)
 
 #include "opencl/source/sharings/d3d/enable_d3d.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/os_interface/windows/driver_info_windows.h"
 
 #include "opencl/source/api/api.h"
+#include "opencl/source/api/dispatch.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/context/context.inl"
 #include "opencl/source/os_interface/windows/d3d_sharing_functions.h"
@@ -23,6 +25,7 @@
 
 namespace NEO {
 
+template <>
 bool D3DSharingContextBuilder<D3DTypesHelper::D3D9>::processProperties(cl_context_properties &propertyType, cl_context_properties &propertyValue) {
     if (contextData.get() == nullptr) {
         contextData = std::make_unique<D3DCreateContextProperties<D3DTypesHelper::D3D9>>();
@@ -42,6 +45,7 @@ bool D3DSharingContextBuilder<D3DTypesHelper::D3D9>::processProperties(cl_contex
     return false;
 }
 
+template <>
 bool D3DSharingContextBuilder<D3DTypesHelper::D3D10>::processProperties(cl_context_properties &propertyType, cl_context_properties &propertyValue) {
     if (contextData.get() == nullptr) {
         contextData = std::make_unique<D3DCreateContextProperties<D3DTypesHelper::D3D10>>();
@@ -56,6 +60,7 @@ bool D3DSharingContextBuilder<D3DTypesHelper::D3D10>::processProperties(cl_conte
     return false;
 }
 
+template <>
 bool D3DSharingContextBuilder<D3DTypesHelper::D3D11>::processProperties(cl_context_properties &propertyType, cl_context_properties &propertyValue) {
     if (contextData.get() == nullptr) {
         contextData = std::make_unique<D3DCreateContextProperties<D3DTypesHelper::D3D11>>();
@@ -84,8 +89,9 @@ void Context::registerSharing(D3DSharingFunctions<D3DTypesHelper::D3D11> *sharin
 
 template <typename D3D>
 bool D3DSharingContextBuilder<D3D>::finalizeProperties(Context &context, int32_t &errcodeRet) {
-    if (contextData.get() == nullptr)
+    if (contextData.get() == nullptr) {
         return true;
+    }
 
     if (contextData->argumentsDefined) {
         context.registerSharing(new D3DSharingFunctions<D3D>(contextData->pDevice));
@@ -99,18 +105,22 @@ std::unique_ptr<SharingContextBuilder> D3DSharingBuilderFactory<D3D>::createCont
     return std::make_unique<D3DSharingContextBuilder<D3D>>();
 };
 
+template <>
 std::string D3DSharingBuilderFactory<D3DTypesHelper::D3D9>::getExtensions(DriverInfo *driverInfo) {
     return extensionEnabled ? "cl_intel_dx9_media_sharing cl_khr_dx9_media_sharing " : "";
 }
 
+template <>
 std::string D3DSharingBuilderFactory<D3DTypesHelper::D3D10>::getExtensions(DriverInfo *driverInfo) {
     return extensionEnabled ? "cl_khr_d3d10_sharing " : "";
 }
 
+template <>
 std::string D3DSharingBuilderFactory<D3DTypesHelper::D3D11>::getExtensions(DriverInfo *driverInfo) {
     return extensionEnabled ? "cl_khr_d3d11_sharing cl_intel_d3d11_nv12_media_sharing " : "";
 }
 
+template <>
 void D3DSharingBuilderFactory<D3DTypesHelper::D3D9>::fillGlobalDispatchTable() {
     icdGlobalDispatchTable.clGetDeviceIDsFromDX9MediaAdapterKHR = clGetDeviceIDsFromDX9MediaAdapterKHR;
     icdGlobalDispatchTable.clCreateFromDX9MediaSurfaceKHR = clCreateFromDX9MediaSurfaceKHR;
@@ -123,6 +133,7 @@ void D3DSharingBuilderFactory<D3DTypesHelper::D3D9>::fillGlobalDispatchTable() {
     crtGlobalDispatchTable.clEnqueueReleaseDX9ObjectsINTEL = clEnqueueReleaseDX9ObjectsINTEL;
 }
 
+template <>
 void D3DSharingBuilderFactory<D3DTypesHelper::D3D10>::fillGlobalDispatchTable() {
     icdGlobalDispatchTable.clCreateFromD3D10BufferKHR = clCreateFromD3D10BufferKHR;
     icdGlobalDispatchTable.clCreateFromD3D10Texture2DKHR = clCreateFromD3D10Texture2DKHR;
@@ -132,6 +143,7 @@ void D3DSharingBuilderFactory<D3DTypesHelper::D3D10>::fillGlobalDispatchTable() 
     icdGlobalDispatchTable.clGetDeviceIDsFromD3D10KHR = clGetDeviceIDsFromD3D10KHR;
 }
 
+template <>
 void D3DSharingBuilderFactory<D3DTypesHelper::D3D11>::fillGlobalDispatchTable() {
     icdGlobalDispatchTable.clCreateFromD3D11BufferKHR = clCreateFromD3D11BufferKHR;
     icdGlobalDispatchTable.clCreateFromD3D11Texture2DKHR = clCreateFromD3D11Texture2DKHR;
@@ -141,45 +153,51 @@ void D3DSharingBuilderFactory<D3DTypesHelper::D3D11>::fillGlobalDispatchTable() 
     icdGlobalDispatchTable.clGetDeviceIDsFromD3D11KHR = clGetDeviceIDsFromD3D11KHR;
 }
 
+template <>
 void *D3DSharingBuilderFactory<D3DTypesHelper::D3D9>::getExtensionFunctionAddress(const std::string &functionName) {
-    if (DebugManager.flags.EnableFormatQuery.get() &&
+    if (debugManager.flags.EnableFormatQuery.get() &&
         functionName == "clGetSupportedDX9MediaSurfaceFormatsINTEL") {
         return ((void *)(clGetSupportedDX9MediaSurfaceFormatsINTEL));
     }
     return nullptr;
 }
 
+template <>
 void *D3DSharingBuilderFactory<D3DTypesHelper::D3D10>::getExtensionFunctionAddress(const std::string &functionName) {
-    if (DebugManager.flags.EnableFormatQuery.get() &&
+    if (debugManager.flags.EnableFormatQuery.get() &&
         functionName == "clGetSupportedD3D10TextureFormatsINTEL") {
         return ((void *)(clGetSupportedD3D10TextureFormatsINTEL));
     }
     return nullptr;
 }
 
+template <>
 void *D3DSharingBuilderFactory<D3DTypesHelper::D3D11>::getExtensionFunctionAddress(const std::string &functionName) {
-    if (DebugManager.flags.EnableFormatQuery.get() &&
+    if (debugManager.flags.EnableFormatQuery.get() &&
         functionName == "clGetSupportedD3D11TextureFormatsINTEL") {
         return ((void *)(clGetSupportedD3D11TextureFormatsINTEL));
     }
     return nullptr;
 }
 
+template <>
 void D3DSharingBuilderFactory<D3DTypesHelper::D3D9>::setExtensionEnabled(DriverInfo *driverInfo) {
     auto driverInfoWin = driverInfo->as<DriverInfoWindows>();
     extensionEnabled = driverInfo->getMediaSharingSupport() && driverInfoWin->containsSetting(is64bit ? "UserModeDriverName" : "UserModeDriverNameWOW");
 }
 
+template <>
 void D3DSharingBuilderFactory<D3DTypesHelper::D3D10>::setExtensionEnabled(DriverInfo *driverInfo) {
     extensionEnabled = driverInfo->getMediaSharingSupport();
 }
 
+template <>
 void D3DSharingBuilderFactory<D3DTypesHelper::D3D11>::setExtensionEnabled(DriverInfo *driverInfo) {
     extensionEnabled = driverInfo->getMediaSharingSupport();
 }
 
-static SharingFactory::RegisterSharing<D3DSharingBuilderFactory<D3DTypesHelper::D3D9>, D3DSharingFunctions<D3DTypesHelper::D3D9>> D3D9Sharing;
-static SharingFactory::RegisterSharing<D3DSharingBuilderFactory<D3DTypesHelper::D3D10>, D3DSharingFunctions<D3DTypesHelper::D3D10>> D3D10Sharing;
-static SharingFactory::RegisterSharing<D3DSharingBuilderFactory<D3DTypesHelper::D3D11>, D3DSharingFunctions<D3DTypesHelper::D3D11>> D3D11Sharing;
+static SharingFactory::RegisterSharing<D3DSharingBuilderFactory<D3DTypesHelper::D3D9>, D3DSharingFunctions<D3DTypesHelper::D3D9>> registerD3D9Sharing;
+static SharingFactory::RegisterSharing<D3DSharingBuilderFactory<D3DTypesHelper::D3D10>, D3DSharingFunctions<D3DTypesHelper::D3D10>> registerD3D10Sharing;
+static SharingFactory::RegisterSharing<D3DSharingBuilderFactory<D3DTypesHelper::D3D11>, D3DSharingFunctions<D3DTypesHelper::D3D11>> registerD3D11Sharing;
 } // namespace NEO
 #endif

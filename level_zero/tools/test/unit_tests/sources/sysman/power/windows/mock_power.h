@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,6 +12,7 @@
 
 namespace L0 {
 namespace ult {
+constexpr uint32_t mockLimitCount = 3u;
 
 class PowerKmdSysManager : public Mock<MockKmdSysManager> {};
 
@@ -34,8 +35,15 @@ struct Mock<PowerKmdSysManager> : public PowerKmdSysManager {
     uint32_t mockEnergyUnit = 14;
     uint64_t mockEnergyCounter64Bit = 32323232323232;
     uint32_t mockFrequencyTimeStamp = 38400000;
+    uint32_t mockEnergyThresholdProcessId = 12345;
+    uint32_t mockPowerFailure[KmdSysman::Requests::Power::MaxPowerRequests] = {0};
 
-    void getActivityProperty(KmdSysman::GfxSysmanReqHeaderIn *pRequest, KmdSysman::GfxSysmanReqHeaderOut *pResponse) {
+    uint32_t getCurrentProcessId() {
+        // For testing, we'll use a simulated value that can be verified
+        return 999; // Test process ID
+    }
+
+    void getActivityProperty(KmdSysman::GfxSysmanReqHeaderIn *pRequest, KmdSysman::GfxSysmanReqHeaderOut *pResponse) override {
         uint8_t *pBuffer = reinterpret_cast<uint8_t *>(pResponse);
         pBuffer += sizeof(KmdSysman::GfxSysmanReqHeaderOut);
 
@@ -51,6 +59,10 @@ struct Mock<PowerKmdSysManager> : public PowerKmdSysManager {
             pResponse->outReturnCode = KmdSysman::KmdSysmanFail;
         } break;
         }
+    }
+
+    uint32_t getReturnCode(uint32_t powerRequestCode) {
+        return mockPowerFailure[powerRequestCode] ? KmdSysman::KmdSysmanFail : KmdSysman::KmdSysmanSuccess;
     }
 
     void getPowerProperty(KmdSysman::GfxSysmanReqHeaderIn *pRequest, KmdSysman::GfxSysmanReqHeaderOut *pResponse) override {
@@ -126,9 +138,11 @@ struct Mock<PowerKmdSysManager> : public PowerKmdSysManager {
         } break;
         case KmdSysman::Requests::Power::CurrentEnergyThreshold: {
             uint32_t *pValue = reinterpret_cast<uint32_t *>(pBuffer);
+            uint32_t *pProcessId = reinterpret_cast<uint32_t *>(pBuffer + sizeof(uint32_t));
             *pValue = mockEnergyThreshold;
-            pResponse->outReturnCode = KmdSysman::KmdSysmanSuccess;
-            pResponse->outDataSize = sizeof(uint32_t);
+            *pProcessId = mockEnergyThresholdProcessId;
+            pResponse->outReturnCode = getReturnCode(pRequest->inRequestId);
+            pResponse->outDataSize = sizeof(uint32_t) + sizeof(uint32_t);
         } break;
         case KmdSysman::Requests::Power::CurrentEnergyCounter: {
             uint32_t *pValueCounter = reinterpret_cast<uint32_t *>(pBuffer);
@@ -147,8 +161,8 @@ struct Mock<PowerKmdSysManager> : public PowerKmdSysManager {
         case KmdSysman::Requests::Power::CurrentEnergyCounter64Bit: {
             uint64_t *pValueCounter = reinterpret_cast<uint64_t *>(pBuffer);
             uint64_t *pValueTS = reinterpret_cast<uint64_t *>(pBuffer + sizeof(uint64_t));
-            *pValueCounter = mockEnergyCounter64Bit;
-            *pValueTS = mockTimeStamp;
+            memcpy_s(pValueCounter, sizeof(uint64_t), &mockEnergyCounter64Bit, sizeof(mockEnergyCounter64Bit));
+            memcpy_s(pValueTS, sizeof(uint64_t), &mockTimeStamp, sizeof(mockEnergyCounter64Bit));
             pResponse->outReturnCode = KmdSysman::KmdSysmanSuccess;
             pResponse->outDataSize = sizeof(uint64_t) + sizeof(uint64_t);
         } break;
@@ -196,9 +210,12 @@ struct Mock<PowerKmdSysManager> : public PowerKmdSysManager {
         } break;
         case KmdSysman::Requests::Power::CurrentEnergyThreshold: {
             uint32_t *pValue = reinterpret_cast<uint32_t *>(pBuffer);
-            mockEnergyThreshold = *pValue;
-            pResponse->outDataSize = 0;
-            pResponse->outReturnCode = KmdSysman::KmdSysmanSuccess;
+            pResponse->outReturnCode = getReturnCode(pRequest->inRequestId);
+            if (!pResponse->outReturnCode) {
+                mockEnergyThreshold = *pValue;
+                mockEnergyThresholdProcessId = getCurrentProcessId();
+                pResponse->outDataSize = 0;
+            }
         } break;
         default: {
             pResponse->outDataSize = 0;

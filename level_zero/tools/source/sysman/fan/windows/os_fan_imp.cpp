@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -34,8 +34,8 @@ ze_result_t WddmFanImp::getProperties(zes_fan_properties_t *pProperties) {
     request.requestId = KmdSysman::Requests::Fans::CurrentNumOfControlPoints;
     request.dataSize = sizeof(uint32_t);
 
-    uint32_t FanPoints = 2;
-    memcpy_s(request.dataBuffer, sizeof(uint32_t), &FanPoints, sizeof(uint32_t));
+    uint32_t fanPoints = 2;
+    memcpy_s(request.dataBuffer, sizeof(uint32_t), &fanPoints, sizeof(uint32_t));
 
     vRequests.push_back(request);
 
@@ -55,8 +55,8 @@ ze_result_t WddmFanImp::getProperties(zes_fan_properties_t *pProperties) {
     pProperties->canControl = (vResponses[0].returnCode == KmdSysman::Success);
 
     if (vResponses[1].returnCode == KmdSysman::Success) {
-        memcpy_s(&FanPoints, sizeof(uint32_t), vResponses[1].dataBuffer, sizeof(uint32_t));
-        pProperties->maxPoints = maxPoints = static_cast<int32_t>(FanPoints);
+        memcpy_s(&fanPoints, sizeof(uint32_t), vResponses[1].dataBuffer, sizeof(uint32_t));
+        pProperties->maxPoints = maxPoints = static_cast<int32_t>(fanPoints);
     }
     pProperties->maxRPM = -1;
     pProperties->supportedModes = zes_fan_speed_mode_t::ZES_FAN_SPEED_MODE_TABLE;
@@ -82,6 +82,39 @@ ze_result_t WddmFanImp::getConfig(zes_fan_config_t *pConfig) {
         memcpy_s(&value, sizeof(uint32_t), response.dataBuffer, sizeof(uint32_t));
         if (value == 0) {
             pConfig->mode = ZES_FAN_SPEED_MODE_DEFAULT;
+            pConfig->speedTable.numPoints = 0;
+
+            request.commandId = KmdSysman::Command::Get;
+            request.componentId = KmdSysman::Component::FanComponent;
+            request.requestId = KmdSysman::Requests::Fans::MaxFanControlPointsSupported;
+
+            status = pKmdSysManager->requestSingle(request, response);
+            if (status == ZE_RESULT_SUCCESS) {
+                uint32_t maxFanPoints = 0;
+                memcpy_s(&maxFanPoints, sizeof(uint32_t), response.dataBuffer, sizeof(uint32_t));
+                pConfig->speedTable.numPoints = static_cast<int32_t>(maxFanPoints);
+
+                if (maxFanPoints != 0) {
+                    request.requestId = KmdSysman::Requests::Fans::CurrentFanPoint;
+                    // Try reading Default Fan table if the platform supports
+                    // If platform doesn't support reading default fan table we still return valid FanConfig.Mode
+                    // but not the table filled with default fan table entries
+                    for (int32_t i = 0; i < pConfig->speedTable.numPoints; i++) {
+                        if (pKmdSysManager->requestSingle(request, response) == ZE_RESULT_SUCCESS) {
+
+                            FanPoint point = {};
+                            memcpy_s(&point.data, sizeof(uint32_t), response.dataBuffer, sizeof(uint32_t));
+
+                            pConfig->speedTable.table[i].speed.speed = point.fanSpeedPercent;
+                            pConfig->speedTable.table[i].speed.units = ZES_FAN_SPEED_UNITS_PERCENT;
+                            pConfig->speedTable.table[i].temperature = point.temperatureDegreesCelsius;
+                        } else {
+                            pConfig->speedTable.numPoints = i;
+                            break;
+                        }
+                    }
+                }
+            } // else, return Success. We still return valid FanConfig.mode
         } else {
             pConfig->mode = ZES_FAN_SPEED_MODE_TABLE;
             pConfig->speedTable.numPoints = value;
@@ -131,13 +164,13 @@ ze_result_t WddmFanImp::setSpeedTableMode(const zes_fan_speed_table_t *pSpeedTab
     singleRequest.commandId = KmdSysman::Command::Get;
     singleRequest.componentId = KmdSysman::Component::FanComponent;
     singleRequest.requestId = KmdSysman::Requests::Fans::MaxFanControlPointsSupported;
-    uint32_t FanPoints = 2;
+    uint32_t fanPoints = 2;
 
     if (pKmdSysManager->requestSingle(singleRequest, singleResponse) == ZE_RESULT_SUCCESS) {
         if (singleResponse.returnCode == KmdSysman::Success) {
-            memcpy_s(&FanPoints, sizeof(uint32_t), singleResponse.dataBuffer, sizeof(uint32_t));
+            memcpy_s(&fanPoints, sizeof(uint32_t), singleResponse.dataBuffer, sizeof(uint32_t));
         }
-        maxPoints = static_cast<int32_t>(FanPoints);
+        maxPoints = static_cast<int32_t>(fanPoints);
     }
 
     if (pSpeedTable->numPoints == 0 || pSpeedTable->numPoints > maxPoints) {

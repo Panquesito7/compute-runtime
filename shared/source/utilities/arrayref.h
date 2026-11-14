@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <utility>
 
 template <typename DataType>
@@ -42,9 +43,9 @@ class ArrayRef {
         : begIt((ctr.size() > 0) ? &*ctr.begin() : nullptr), endIt((ctr.size() > 0) ? (&*(ctr.end() - 1) + 1) : nullptr) {
     }
 
-    template <size_t Size>
-    ArrayRef(DataType (&array)[Size])
-        : begIt(&array[0]), endIt(&array[Size]) {
+    template <size_t size>
+    ArrayRef(DataType (&array)[size])
+        : begIt(&array[0]), endIt(&array[size]) {
     }
 
     ArrayRef() = default;
@@ -53,7 +54,14 @@ class ArrayRef {
         : begIt(src.begIt), endIt(src.endIt) {
     }
 
+    template <typename T>
+    ArrayRef(std::span<T> span) : begIt(span.data()), endIt(span.data() + span.size()) {
+    }
+
     ArrayRef &operator=(const ArrayRef &src) {
+        if (this == &src) {
+            return *this;
+        }
         this->begIt = src.begIt;
         this->endIt = src.endIt;
         return *this;

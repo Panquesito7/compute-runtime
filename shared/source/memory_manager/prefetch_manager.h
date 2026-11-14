@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/spinlock.h"
 
 #include <memory>
@@ -20,18 +21,23 @@ class CommandStreamReceiver;
 class Device;
 class SVMAllocsManager;
 
+struct Allocation {
+    const void *ptr;
+    const size_t size;
+};
+
 struct PrefetchContext {
-    std::vector<SvmAllocationData> allocations;
+    std::vector<Allocation> allocations;
     SpinLock lock;
 };
 
-class PrefetchManager : public NonCopyableOrMovableClass {
+class PrefetchManager : public NonCopyableAndNonMovableClass {
   public:
     static std::unique_ptr<PrefetchManager> create();
 
     virtual ~PrefetchManager() = default;
 
-    void insertAllocation(PrefetchContext &context, SvmAllocationData &svmData);
+    void insertAllocation(PrefetchContext &context, SVMAllocsManager &unifiedMemoryManager, Device &device, const void *usmPtr, const size_t size);
 
     MOCKABLE_VIRTUAL void migrateAllocationsToGpu(PrefetchContext &context, SVMAllocsManager &unifiedMemoryManager, Device &device, CommandStreamReceiver &csr);
 

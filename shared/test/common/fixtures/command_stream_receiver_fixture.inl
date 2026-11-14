@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,11 +17,11 @@ void CommandStreamReceiverSystolicFixture::testBody() {
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     StreamProperties &streamProperties = commandStreamReceiver.getStreamProperties();
 
+    bool systolicModeSupported = commandStreamReceiver.pipelineSupportFlags.systolicMode;
+
     commandStreamReceiver.isPreambleSent = true;
-    commandStreamReceiver.lastMediaSamplerConfig = false;
 
     flushTaskFlags.pipelineSelectArgs.systolicPipelineSelectMode = true;
-    flushTaskFlags.pipelineSelectArgs.mediaSamplerRequired = false;
 
     commandStreamReceiver.flushTask(commandStream,
                                     0,
@@ -31,8 +31,13 @@ void CommandStreamReceiverSystolicFixture::testBody() {
                                     taskLevel,
                                     flushTaskFlags,
                                     *pDevice);
-    EXPECT_EQ(true, commandStreamReceiver.lastSystolicPipelineSelectMode);
-    EXPECT_EQ(1, streamProperties.pipelineSelect.systolicMode.value);
+    if (systolicModeSupported) {
+        EXPECT_EQ(true, commandStreamReceiver.lastSystolicPipelineSelectMode);
+        EXPECT_EQ(1, streamProperties.pipelineSelect.systolicMode.value);
+    } else {
+        EXPECT_EQ(false, commandStreamReceiver.lastSystolicPipelineSelectMode);
+        EXPECT_EQ(-1, streamProperties.pipelineSelect.systolicMode.value);
+    }
 
     flushTaskFlags.pipelineSelectArgs.systolicPipelineSelectMode = false;
 
@@ -45,5 +50,10 @@ void CommandStreamReceiverSystolicFixture::testBody() {
                                     flushTaskFlags,
                                     *pDevice);
     EXPECT_EQ(false, commandStreamReceiver.lastSystolicPipelineSelectMode);
-    EXPECT_EQ(0, streamProperties.pipelineSelect.systolicMode.value);
+
+    if (systolicModeSupported) {
+        EXPECT_EQ(0, streamProperties.pipelineSelect.systolicMode.value);
+    } else {
+        EXPECT_EQ(-1, streamProperties.pipelineSelect.systolicMode.value);
+    }
 }

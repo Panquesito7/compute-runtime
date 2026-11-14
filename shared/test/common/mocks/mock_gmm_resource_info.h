@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -55,7 +55,7 @@ class MockGmmResourceInfo : public GmmResourceInfo {
 
     uint32_t getAuxQPitch() override { return auxQPitch; }
 
-    uint32_t getMipTailStartLodSurfaceState() override { return mipTailStartLod; }
+    uint32_t getMipTailStartLODSurfaceState() override { return mipTailStartLod; }
 
     GMM_RESOURCE_FORMAT getResourceFormat() override { return mockResourceCreateParams.Format; }
 
@@ -63,15 +63,27 @@ class MockGmmResourceInfo : public GmmResourceInfo {
 
     GMM_RESOURCE_TYPE getResourceType() override { return mockResourceCreateParams.Type; }
 
-    GMM_RESOURCE_FLAG *getResourceFlags() override { return &mockResourceCreateParams.Flags; }
+    GMM_RESOURCE_USAGE_TYPE getResourceUsage() { return mockResourceCreateParams.Usage; }
+
+    ImageTilingMode getTilingMode() override;
+
+    GmmCompressionType getCompressionType() override;
+
+    bool isCacheable() override { return mockResourceCreateParams.Flags.Info.Cacheable; }
+
+    bool isDepthResource() override { return mockResourceCreateParams.Flags.Gpu.Depth; }
+
+    bool isMCS() override { return mockResourceCreateParams.Flags.Gpu.MCS; }
+
+    bool isIndirectClearColor() override { return mockResourceCreateParams.Flags.Gpu.IndirectClearColor; }
+
+    bool isCCS() override { return mockResourceCreateParams.Flags.Gpu.CCS; }
 
     GMM_STATUS getOffset(GMM_REQ_OFFSET_INFO &reqOffsetInfo) override;
 
-    uint8_t cpuBlt(GMM_RES_COPY_BLT *resCopyBlt) override {
+    uint8_t cpuBlt(const GmmCpuBltParams &params) override {
         cpuBltCalled++;
-        if (resCopyBlt) {
-            requestedResCopyBlt = *resCopyBlt;
-        }
+        requestedCpuBltParams = params;
         return cpuBltResult;
     };
 
@@ -81,7 +93,11 @@ class MockGmmResourceInfo : public GmmResourceInfo {
 
     bool is64KBPageSuitable() const override { return is64KBPageSuitableValue; }
 
+    bool isDisplayable() const override { return isDisplayableValue; }
+
     GMM_RESOURCE_INFO *peekGmmResourceInfo() const override { return mockResourceInfoHandle; }
+
+    GMM_RESOURCE_USAGE_TYPE getCachePolicyUsage() const override { return usageType; }
 
     void *peekHandle() const override { return mockResourceInfoHandle; }
 
@@ -91,6 +107,7 @@ class MockGmmResourceInfo : public GmmResourceInfo {
     GMM_RESCREATE_PARAMS mockResourceCreateParams = {};
 
     void overrideReturnedRenderPitch(size_t newPitch) { rowPitch = newPitch; }
+    void overrideReturnedQPitch(uint32_t newQPitch) { qPitch = newQPitch; }
     void overrideReturnedSize(size_t newSize) { size = newSize; }
 
     void setUnifiedAuxTranslationCapable();
@@ -98,7 +115,7 @@ class MockGmmResourceInfo : public GmmResourceInfo {
 
     void setUnifiedAuxPitchTiles(uint32_t value);
     void setAuxQPitch(uint32_t value);
-    void setMipTailStartLod(uint32_t newMipTailStartLod) { mipTailStartLod = newMipTailStartLod; }
+    void setMipTailStartLOD(uint32_t newMipTailStartLod) { mipTailStartLod = newMipTailStartLod; }
 
     void refreshHandle() override {
         refreshHandleCalled++;
@@ -108,18 +125,21 @@ class MockGmmResourceInfo : public GmmResourceInfo {
     using GmmResourceInfo::clientContext;
     using GmmResourceInfo::createResourceInfo;
     using GmmResourceInfo::decodeResourceInfo;
+    using GmmResourceInfo::gmmResourceHandle;
 
     uint64_t driverProtectionBits = 0;
     uint32_t getOffsetCalled = 0u;
     uint32_t arrayIndexPassedToGetOffset = 0;
     SurfaceFormatInfo tempSurface{};
     bool is64KBPageSuitableValue = true;
-    GMM_RES_COPY_BLT requestedResCopyBlt = {};
+    bool isDisplayableValue = false;
+    GmmCpuBltParams requestedCpuBltParams = {};
     uint32_t cpuBltCalled = 0u;
     uint8_t cpuBltResult = 1u;
     static constexpr uint32_t getHAlignSurfaceStateResult = 2u;
     static constexpr uint32_t yMajorTileModeValue = 3u;
     uint32_t refreshHandleCalled = 0u;
+    GMM_RESOURCE_USAGE_TYPE usageType = GMM_RESOURCE_USAGE_OCL_BUFFER;
 
   protected:
     MockGmmResourceInfo();
@@ -136,4 +156,15 @@ class MockGmmResourceInfo : public GmmResourceInfo {
     uint32_t auxQPitch = 1u;
     uint32_t mipTailStartLod = 0;
 };
+
+class MockGmmResourceInfoWithFlags : public GmmResourceInfo {
+  public:
+    MockGmmResourceInfoWithFlags() = default;
+
+    GMM_RESOURCE_FLAG resourceFlags = {};
+
+  protected:
+    GMM_RESOURCE_FLAG *getResourceFlags() override { return &resourceFlags; }
+};
+
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -36,75 +36,22 @@ GEN12LPTEST_F(ClGfxCoreHelperTestsGen12Lp, givenTglLpThenAuxTranslationIsRequire
     }
 }
 
-HWTEST2_F(ClGfxCoreHelperTestsGen12Lp, WhenGettingDeviceIpVersionThenMakeCorrectDeviceIpVersion, IsTGLLP) {
-    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
-    EXPECT_EQ(ClGfxCoreHelperMock::makeDeviceIpVersion(12, 0, 0), clGfxCoreHelper.getDeviceIpVersion(*defaultHwInfo));
-}
-
-HWTEST2_F(ClGfxCoreHelperTestsGen12Lp, WhenGettingDeviceIpVersionThenMakeCorrectDeviceIpVersion, IsRKL) {
-    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
-    EXPECT_EQ(ClGfxCoreHelperMock::makeDeviceIpVersion(12, 0, 0), clGfxCoreHelper.getDeviceIpVersion(*defaultHwInfo));
-}
-
-HWTEST2_F(ClGfxCoreHelperTestsGen12Lp, WhenGettingDeviceIpVersionThenMakeCorrectDeviceIpVersion, IsADLS) {
-    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
-    EXPECT_EQ(ClGfxCoreHelperMock::makeDeviceIpVersion(12, 0, 0), clGfxCoreHelper.getDeviceIpVersion(*defaultHwInfo));
-}
-
-HWTEST2_F(ClGfxCoreHelperTestsGen12Lp, WhenGettingDeviceIpVersionThenMakeCorrectDeviceIpVersion, IsADLP) {
-    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
-    EXPECT_EQ(ClGfxCoreHelperMock::makeDeviceIpVersion(12, 0, 0), clGfxCoreHelper.getDeviceIpVersion(*defaultHwInfo));
-}
-
-HWTEST2_F(ClGfxCoreHelperTestsGen12Lp, WhenGettingDeviceIpVersionThenMakeCorrectDeviceIpVersion, IsDG1) {
-    auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
-    EXPECT_EQ(ClGfxCoreHelperMock::makeDeviceIpVersion(12, 0, 1), clGfxCoreHelper.getDeviceIpVersion(*defaultHwInfo));
-}
-
 GEN12LPTEST_F(ClGfxCoreHelperTestsGen12Lp, WhenGettingSupportedDeviceFeatureCapabilitiesThenReturnCorrectValue) {
     auto &clGfxCoreHelper = getHelper<ClGfxCoreHelper>();
     cl_device_feature_capabilities_intel expectedCapabilities = CL_DEVICE_FEATURE_FLAG_DP4A_INTEL;
-    EXPECT_EQ(expectedCapabilities, clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(getRootDeviceEnvironment()));
+    EXPECT_EQ(expectedCapabilities, clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(hardwareInfo));
 }
 
 using GfxCoreHelperTestGen12Lp = GfxCoreHelperTest;
 
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, WhenGettingMaxBarriersPerSliceThenCorrectSizeIsReturned) {
-    auto &helper = getHelper<GfxCoreHelper>();
-    EXPECT_EQ(32u, helper.getMaxBarrierRegisterPerSlice());
-}
-
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, WhenGettingPitchAlignmentForImageThenCorrectValueIsReturned) {
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-    auto stepping = hardwareInfo.platform.usRevId;
-
-    if (SpecialUltHelperGen12lp::shouldPerformimagePitchAlignment(hardwareInfo.platform.eProductFamily) && stepping == 0) {
-        EXPECT_EQ(64u, gfxCoreHelper.getPitchAlignmentForImage(pDevice->getRootDeviceEnvironment()));
-    } else {
-        EXPECT_EQ(4u, gfxCoreHelper.getPitchAlignmentForImage(pDevice->getRootDeviceEnvironment()));
+struct IsGen12LPIntegrated {
+    template <PRODUCT_FAMILY productFamily>
+    static constexpr bool isMatched() {
+        return IsGen12LP::isMatched<productFamily>() && !IsDG1::isMatched<productFamily>();
     }
-}
+};
 
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, WhenAdjustingDefaultEngineTypeThenRcsIsSet) {
-    hardwareInfo.featureTable.flags.ftrCCSNode = false;
-
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-    auto &productHelper = getHelper<ProductHelper>();
-
-    gfxCoreHelper.adjustDefaultEngineType(&hardwareInfo, productHelper);
-    EXPECT_EQ(aub_stream::ENGINE_RCS, hardwareInfo.capabilityTable.defaultEngineType);
-}
-
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenDifferentSizesOfAllocationWhenCheckingCompressionPreferenceThenReturnCorrectValue) {
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-
-    const size_t sizesToCheck[] = {128, 256, 512, 1023, 1024, 1025};
-    for (size_t size : sizesToCheck) {
-        EXPECT_FALSE(gfxCoreHelper.isBufferSizeSuitableForCompression(size));
-    }
-}
-
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeNotSetAndBcsInfoSetWhenGetGpgpuEnginesThenReturnThreeRcsEnginesAndOneBcsEngine) {
+HWTEST2_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeNotSetAndBcsInfoSetWhenGetGpgpuEnginesThenReturnThreeRcsEnginesAndOneBcsEngine, IsGen12LPIntegrated) {
     HardwareInfo hwInfo = *defaultHwInfo;
     hwInfo.featureTable.flags.ftrCCSNode = false;
     hwInfo.featureTable.ftrBcsInfo = 1;
@@ -120,6 +67,45 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeNotSetAndBcsInfoSetWhenGe
     EXPECT_EQ(aub_stream::ENGINE_RCS, engines[1].first);
     EXPECT_EQ(aub_stream::ENGINE_RCS, engines[2].first);
     EXPECT_EQ(aub_stream::ENGINE_BCS, engines[3].first);
+}
+
+HWTEST2_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeNotSetAndBcsInfoSetWhenGetGpgpuEnginesThenReturnThreeRcsEnginesAndOneBcsEngine, IsDG1) {
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrCCSNode = false;
+    hwInfo.featureTable.ftrBcsInfo = 1;
+    hwInfo.capabilityTable.blitterOperationsSupported = true;
+    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_RCS;
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    EXPECT_EQ(5u, device->allEngines.size());
+    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
+    EXPECT_EQ(5u, engines.size());
+    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[0].first);
+    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[1].first);
+    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[2].first);
+    EXPECT_EQ(aub_stream::ENGINE_BCS, engines[3].first);
+    EXPECT_EQ(aub_stream::ENGINE_BCS, engines[4].first);
+}
+
+GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, WhenGettingPitchAlignmentForImageThenCorrectValueIsReturned) {
+    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+    auto stepping = hardwareInfo.platform.usRevId;
+
+    if (SpecialUltHelperGen12lp::shouldPerformimagePitchAlignment(hardwareInfo.platform.eProductFamily) && stepping == 0) {
+        EXPECT_EQ(64u, gfxCoreHelper.getPitchAlignmentForImage(pDevice->getRootDeviceEnvironment()));
+    } else {
+        EXPECT_EQ(4u, gfxCoreHelper.getPitchAlignmentForImage(pDevice->getRootDeviceEnvironment()));
+    }
+}
+
+GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenDifferentSizesOfAllocationWhenCheckingCompressionPreferenceThenReturnCorrectValue) {
+    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
+
+    const size_t sizesToCheck[] = {128, 256, 512, 1023, 1024, 1025};
+    for (size_t size : sizesToCheck) {
+        EXPECT_FALSE(gfxCoreHelper.isBufferSizeSuitableForCompression(size));
+    }
 }
 
 GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeNotSetAndCcsDefualtEngineWhenGetGpgpuEnginesThenReturnTwoRcsEnginesAndOneCcs) {
@@ -172,28 +158,10 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeSetWhenGetGpgpuEnginesThe
     EXPECT_EQ(aub_stream::ENGINE_CCS, engines[3].first);
 }
 
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeSetFtrGpGpuMidThreadLevelPreemptSetWhenGetGpgpuEnginesThenReturn2RcsAndCcsEngines) {
+GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeSetWhenGetGpgpuEnginesThenReturn2RcsAnd2CcsEngines) {
     HardwareInfo hwInfo = *defaultHwInfo;
     hwInfo.featureTable.flags.ftrCCSNode = true;
     hwInfo.featureTable.ftrBcsInfo = 0;
-    hwInfo.featureTable.flags.ftrGpGpuMidThreadLevelPreempt = true;
-    hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
-
-    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
-    auto &gfxCoreHelper = device->getGfxCoreHelper();
-    EXPECT_EQ(3u, device->allEngines.size());
-    auto &engines = gfxCoreHelper.getGpgpuEngineInstances(device->getRootDeviceEnvironment());
-    EXPECT_EQ(3u, engines.size());
-    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[0].first);
-    EXPECT_EQ(aub_stream::ENGINE_RCS, engines[1].first);
-    EXPECT_EQ(aub_stream::ENGINE_CCS, engines[2].first);
-}
-
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenFtrCcsNodeSetFtrGpGpuMidThreadLevelPreemptNotSetWhenGetGpgpuEnginesThenReturn2RcsAnd2CcsEngines) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    hwInfo.featureTable.flags.ftrCCSNode = true;
-    hwInfo.featureTable.ftrBcsInfo = 0;
-    hwInfo.featureTable.flags.ftrGpGpuMidThreadLevelPreempt = false;
     hwInfo.capabilityTable.defaultEngineType = aub_stream::ENGINE_CCS;
 
     auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo, 0));
@@ -238,7 +206,7 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenTgllpWhenIsFusedEuDispatchEnabledIs
 
     for (auto &[expectedResult, wa, debugKey] : testParams) {
         waTable.flags.waDisableFusedThreadScheduling = wa;
-        DebugManager.flags.CFEFusedEUDispatch.set(debugKey);
+        debugManager.flags.CFEFusedEUDispatch.set(debugKey);
         EXPECT_EQ(expectedResult, gfxCoreHelper.isFusedEuDispatchEnabled(hardwareInfo, false));
     }
 }
@@ -274,7 +242,7 @@ GEN12LPTEST_F(GfxCoreHelperTestsGen12LpBuffer, givenBufferThenCheckResourceCompa
 
     buffer.reset(Buffer::create(context.get(), 0, MemoryConstants::cacheLineSize, nullptr, retVal));
 
-    buffer->getGraphicsAllocation(rootDeviceIndex)->setAllocationType(AllocationType::BUFFER);
+    buffer->getGraphicsAllocation(rootDeviceIndex)->setAllocationType(AllocationType::buffer);
 
     EXPECT_TRUE(gfxCoreHelper.checkResourceCompatibility(*buffer->getGraphicsAllocation(rootDeviceIndex)));
 }
@@ -283,7 +251,7 @@ using LriHelperTestsGen12Lp = ::testing::Test;
 
 GEN12LPTEST_F(LriHelperTestsGen12Lp, whenProgrammingLriCommandThenExpectMmioRemapEnable) {
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-    std::unique_ptr<uint8_t> buffer(new uint8_t[128]);
+    auto buffer = std::make_unique<uint8_t[]>(128);
 
     LinearStream stream(buffer.get(), 128);
     uint32_t address = 0x8888;
@@ -295,7 +263,7 @@ GEN12LPTEST_F(LriHelperTestsGen12Lp, whenProgrammingLriCommandThenExpectMmioRema
     expectedLri.setDataDword(data);
     expectedLri.setMmioRemapEnable(false);
 
-    LriHelper<FamilyType>::program(&stream, address, data, false);
+    LriHelper<FamilyType>::program(&stream, address, data, false, false);
     MI_LOAD_REGISTER_IMM *lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(buffer.get());
     ASSERT_NE(nullptr, lri);
 
@@ -315,17 +283,12 @@ GEN12LPTEST_F(MemorySynchronizatiopCommandsTests, whenSettingCacheFlushExtraFiel
     EXPECT_FALSE(args.constantCacheInvalidationEnable);
 }
 
-GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenGen12WhenCallIsPackedSupportedThenReturnTrue) {
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-    EXPECT_TRUE(gfxCoreHelper.packedFormatsSupported());
-}
-
 GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, whenRequestingMocsThenProperMocsIndicesAreBeingReturned) {
     auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
     auto gmmHelper = this->pDevice->getGmmHelper();
 
-    const auto mocsNoCache = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED) >> 1;
-    const auto mocsL3 = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER) >> 1;
+    const auto mocsNoCache = gmmHelper->getUncachedMOCS() >> 1;
+    const auto mocsL3 = gmmHelper->getL3EnabledMOCS() >> 1;
 
     EXPECT_EQ(mocsNoCache, gfxCoreHelper.getMocsIndex(*gmmHelper, false, false));
     EXPECT_EQ(mocsNoCache, gfxCoreHelper.getMocsIndex(*gmmHelper, false, true));
@@ -335,14 +298,14 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, whenRequestingMocsThenProperMocsIndicesA
 
 GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenL1ForceEnabledWhenRequestingMocsThenProperMocsIndicesAreBeingReturned) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.ForceL1Caching.set(1);
+    debugManager.flags.ForceL1Caching.set(1);
 
     auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
     auto gmmHelper = this->pDevice->getGmmHelper();
 
-    const auto mocsNoCache = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED) >> 1;
-    const auto mocsL3 = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER) >> 1;
-    const auto mocsL1 = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CONST) >> 1;
+    const auto mocsNoCache = gmmHelper->getUncachedMOCS() >> 1;
+    const auto mocsL3 = gmmHelper->getL3EnabledMOCS() >> 1;
+    const auto mocsL1 = gmmHelper->getL1EnabledMOCS() >> 1;
 
     EXPECT_EQ(mocsNoCache, gfxCoreHelper.getMocsIndex(*gmmHelper, false, false));
     EXPECT_EQ(mocsNoCache, gfxCoreHelper.getMocsIndex(*gmmHelper, false, true));
@@ -352,13 +315,13 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenL1ForceEnabledWhenRequestingMocsThe
 
 GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenL1ForceDisabledWhenRequestingMocsThenProperMocsIndicesAreBeingReturned) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.ForceL1Caching.set(0);
+    debugManager.flags.ForceL1Caching.set(0);
 
     auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
     auto gmmHelper = this->pDevice->getGmmHelper();
 
-    const auto mocsNoCache = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED) >> 1;
-    const auto mocsL3 = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER) >> 1;
+    const auto mocsNoCache = gmmHelper->getUncachedMOCS() >> 1;
+    const auto mocsL3 = gmmHelper->getL3EnabledMOCS() >> 1;
 
     EXPECT_EQ(mocsNoCache, gfxCoreHelper.getMocsIndex(*gmmHelper, false, false));
     EXPECT_EQ(mocsNoCache, gfxCoreHelper.getMocsIndex(*gmmHelper, false, true));
@@ -368,19 +331,18 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenL1ForceDisabledWhenRequestingMocsTh
 
 GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenAllocationTypeWithCpuAccessRequiredWhenCpuAccessIsDisallowedThenSystemMemoryIsRequested) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::CpuAccessDisallowed));
+    debugManager.flags.ForceLocalMemoryAccessMode.set(static_cast<int32_t>(LocalMemoryAccessMode::cpuAccessDisallowed));
 
     const AllocationType allocationTypesToUseSystemMemory[] = {
-        AllocationType::COMMAND_BUFFER,
-        AllocationType::CONSTANT_SURFACE,
-        AllocationType::GLOBAL_SURFACE,
-        AllocationType::INTERNAL_HEAP,
-        AllocationType::LINEAR_STREAM,
-        AllocationType::PIPE,
-        AllocationType::PRINTF_SURFACE,
-        AllocationType::TIMESTAMP_PACKET_TAG_BUFFER,
-        AllocationType::RING_BUFFER,
-        AllocationType::SEMAPHORE_BUFFER};
+        AllocationType::commandBuffer,
+        AllocationType::constantSurface,
+        AllocationType::globalSurface,
+        AllocationType::internalHeap,
+        AllocationType::linearStream,
+        AllocationType::printfSurface,
+        AllocationType::timestampPacketTagBuffer,
+        AllocationType::ringBuffer,
+        AllocationType::semaphoreBuffer};
 
     MockMemoryManager mockMemoryManager;
     for (auto allocationType : allocationTypesToUseSystemMemory) {
@@ -393,7 +355,7 @@ GEN12LPTEST_F(GfxCoreHelperTestGen12Lp, givenAllocationTypeWithCpuAccessRequired
     }
 
     AllocationData allocData{};
-    AllocationProperties properties(mockRootDeviceIndex, true, 10, AllocationType::BUFFER, false, mockDeviceBitfield);
+    AllocationProperties properties(mockRootDeviceIndex, true, 10, AllocationType::buffer, false, mockDeviceBitfield);
     mockMemoryManager.getAllocationData(allocData, properties, nullptr, mockMemoryManager.createStorageInfoFromProperties(properties));
     EXPECT_FALSE(allocData.flags.requiresCpuAccess);
     EXPECT_FALSE(allocData.flags.useSystemMemory);

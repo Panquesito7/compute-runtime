@@ -1,0 +1,34 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include <level_zero/zes_api.h>
+#include <level_zero/zes_intel_gpu_sysman.h>
+
+namespace L0 {
+namespace Sysman {
+
+class GlobalOperations {
+  public:
+    virtual ~GlobalOperations() {};
+    virtual ze_result_t reset(ze_bool_t force) = 0;
+    virtual ze_result_t deviceGetProperties(zes_device_properties_t *pProperties) = 0;
+    virtual bool getDeviceInfoByUuid(zes_uuid_t uuid, ze_bool_t *onSubdevice, uint32_t *subdeviceId) = 0;
+    virtual ze_result_t deviceGetSubDeviceProperties(uint32_t *pCount, zes_subdevice_exp_properties_t *pSubdeviceProps) = 0;
+    virtual ze_result_t processesGetState(uint32_t *pCount, zes_process_state_t *pProcesses) = 0;
+    virtual ze_result_t deviceGetState(zes_device_state_t *pState) = 0;
+    virtual ze_result_t resetExt(zes_reset_properties_t *pProperties) = 0;
+    virtual ze_result_t memoryGetPageOfflineStateExp(zes_intel_mem_page_status_exp_t pageStatus, uint32_t *pCount, zes_intel_mem_page_info_exp_t *pPageOfflineInfo) = 0;
+    virtual ze_result_t getDeviceHealthStatus(zes_device_health_status_ext_t *pHealth) = 0;
+    virtual ze_result_t setDeviceHealthStatus(zes_device_health_status_ext_t health) = 0;
+    virtual ze_result_t getPowerOffReasonExp(zes_intel_device_power_off_reason_exp_t *pReason) = 0;
+
+    virtual void init() = 0;
+};
+
+} // namespace Sysman
+} // namespace L0

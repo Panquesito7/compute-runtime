@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,13 +10,16 @@
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/memory_manager/multi_graphics_allocation.h"
 #include "shared/source/utilities/idlist.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "metrics_library_api_1_0.h"
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace NEO {
@@ -31,7 +34,7 @@ class TagNode;
 
 class TagAllocatorBase;
 
-class TagNodeBase : public NonCopyableOrMovableClass {
+class TagNodeBase : public NonCopyableAndNonMovableClass {
   public:
     virtual ~TagNodeBase() = default;
 
@@ -47,6 +50,8 @@ class TagNodeBase : public NonCopyableOrMovableClass {
 
     virtual void initialize() = 0;
 
+    virtual void markAsAborted() = 0;
+
     bool canBeReleased() const;
 
     virtual void *getCpuBase() const = 0;
@@ -58,7 +63,7 @@ class TagNodeBase : public NonCopyableOrMovableClass {
     bool isProfilingCapable() const { return profilingCapable; }
 
     // TagType specific calls
-    virtual void assignDataToAllTimestamps(uint32_t packetIndex, void *source) = 0;
+    virtual void assignDataToAllTimestamps(uint32_t packetIndex, const void *source) = 0;
 
     virtual size_t getGlobalStartOffset() const = 0;
     virtual size_t getContextStartOffset() const = 0;
@@ -69,6 +74,8 @@ class TagNodeBase : public NonCopyableOrMovableClass {
     virtual uint64_t getGlobalStartValue(uint32_t packetIndex) const = 0;
     virtual uint64_t getContextEndValue(uint32_t packetIndex) const = 0;
     virtual uint64_t getGlobalEndValue(uint32_t packetIndex) const = 0;
+
+    virtual void getGlobalTimestampValues(uint32_t packetIndex, uint64_t &globalStart, uint64_t &globalEnd) const = 0;
 
     virtual void const *getContextEndAddress(uint32_t packetIndex) const = 0;
 
@@ -104,17 +111,16 @@ class TagNode : public TagNodeBase, public IDNode<TagNode<TagType>> {
                   "This structure is consumed by GPU and has to follow specific restrictions for padding and size");
 
   public:
+    using ValueT = typename TagType::ValueT;
     TagType *tagForCpuAccess;
 
-    void initialize() override {
-        tagForCpuAccess->initialize();
-        packetsUsed = 1;
-        setProfilingCapable(true);
-    }
+    void initialize() override;
 
     void *getCpuBase() const override { return tagForCpuAccess; }
 
-    void assignDataToAllTimestamps(uint32_t packetIndex, void *source) override;
+    void markAsAborted() override;
+
+    void assignDataToAllTimestamps(uint32_t packetIndex, const void *source) override;
 
     size_t getGlobalStartOffset() const override;
     size_t getContextStartOffset() const override;
@@ -125,6 +131,8 @@ class TagNode : public TagNodeBase, public IDNode<TagNode<TagType>> {
     uint64_t getGlobalStartValue(uint32_t packetIndex) const override;
     uint64_t getContextEndValue(uint32_t packetIndex) const override;
     uint64_t getGlobalEndValue(uint32_t packetIndex) const override;
+
+    void getGlobalTimestampValues(uint32_t packetIndex, uint64_t &globalStart, uint64_t &globalEnd) const override;
 
     void const *getContextEndAddress(uint32_t packetIndex) const override;
 
@@ -138,16 +146,35 @@ class TagNode : public TagNodeBase, public IDNode<TagNode<TagType>> {
 
 class TagAllocatorBase {
   public:
+    using TagNodeUpdateCallback = std::function<void(TagNodeBase &, uint64_t, size_t)>;
+    using TagPoolCreatedCallback = std::function<void(MultiGraphicsAllocation &)>;
+
     virtual ~TagAllocatorBase() { cleanUpResources(); };
 
     virtual void returnTag(TagNodeBase *node) = 0;
 
     virtual TagNodeBase *getTag() = 0;
 
+    void setTagNodeUpdateCallback(TagNodeUpdateCallback callback) { tagNodeUpdateCallback = std::move(callback); }
+    void notifyTagNodeUpdated(TagNodeBase &tagNode, uint64_t tagOffset, size_t chunkSize) {
+        if (tagNodeUpdateCallback) {
+            tagNodeUpdateCallback(tagNode, tagOffset, chunkSize);
+        }
+    }
+    void setTagPoolCreatedCallback(TagPoolCreatedCallback callback) { tagPoolCreatedCallback = std::move(callback); }
+    void notifyTagPoolCreated(MultiGraphicsAllocation &allocation) {
+        if (tagPoolCreatedCallback) {
+            tagPoolCreatedCallback(allocation);
+        }
+    }
+    size_t getTagSize() const { return tagSize; }
+
+    const std::vector<std::unique_ptr<MultiGraphicsAllocation>> &getGfxAllocations() const { return gfxAllocations; }
+
   protected:
     TagAllocatorBase() = delete;
 
-    TagAllocatorBase(const RootDeviceIndicesContainer &rootDeviceIndices, MemoryManager *memMngr, size_t tagCount,
+    TagAllocatorBase(const RootDeviceIndicesContainer &rootDeviceIndices, MemoryManager *memMngr, uint32_t tagCount,
                      size_t tagAlignment, size_t tagSize, bool doNotReleaseNodes,
                      DeviceBitfield deviceBitfield);
 
@@ -164,9 +191,12 @@ class TagAllocatorBase {
     RootDeviceIndicesContainer rootDeviceIndices;
     uint32_t maxRootDeviceIndex = 0;
     MemoryManager *memoryManager;
-    size_t tagCount;
-    size_t tagSize;
+    const uint32_t tagCount;
+    const uint32_t tagSize;
     bool doNotReleaseNodes = false;
+
+    TagNodeUpdateCallback tagNodeUpdateCallback;
+    TagPoolCreatedCallback tagPoolCreatedCallback;
 
     std::mutex allocatorMutex;
 };
@@ -175,14 +205,15 @@ template <typename TagType>
 class TagAllocator : public TagAllocatorBase {
   public:
     using NodeType = TagNode<TagType>;
+    using ValueT = typename TagType::ValueT;
 
-    TagAllocator(const RootDeviceIndicesContainer &rootDeviceIndices, MemoryManager *memMngr, size_t tagCount,
-                 size_t tagAlignment, size_t tagSize, bool doNotReleaseNodes,
-                 DeviceBitfield deviceBitfield);
+    TagAllocator(const RootDeviceIndicesContainer &rootDeviceIndices, MemoryManager *memMngr, uint32_t tagCount,
+                 size_t tagAlignment, size_t tagSize, ValueT initialValue, bool doNotReleaseNodes, bool initializeTags, DeviceBitfield deviceBitfield);
 
     TagNodeBase *getTag() override;
 
     void returnTag(TagNodeBase *node) override;
+    ValueT getInitialValue() const { return initialValue; }
 
   protected:
     TagAllocator() = delete;
@@ -193,13 +224,16 @@ class TagAllocator : public TagAllocatorBase {
 
     void releaseDeferredTags() override;
 
-    void populateFreeTags();
+    bool populateFreeTags();
 
     IDList<NodeType> freeTags;
     IDList<NodeType> usedTags;
     IDList<NodeType> deferredTags;
 
     std::vector<std::unique_ptr<NodeType[]>> tagPoolMemory;
+
+    const ValueT initialValue;
+    bool initializeTags = true;
 };
 } // namespace NEO
 

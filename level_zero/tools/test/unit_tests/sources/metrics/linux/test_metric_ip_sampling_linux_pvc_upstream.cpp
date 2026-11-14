@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,10 @@
 
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "level_zero/tools/source/metrics/os_metric_ip_sampling.h"
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 #include "level_zero/tools/test/unit_tests/sources/metrics/mock_metric_oa.h"
 
 namespace L0 {
@@ -34,7 +35,7 @@ class MetricIpSamplingLinuxTestUpstream : public MetricContextFixture,
     void SetUp() override {
         MetricContextFixture::setUp();
         neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-        auto &osInterface = device->getOsInterface();
+        auto &osInterface = *device->getOsInterface();
         osInterface.setDriverModel(std::make_unique<DrmTipMock>(const_cast<NEO::RootDeviceEnvironment &>(neoDevice->getRootDeviceEnvironment())));
         metricIpSamplingOsInterface = MetricIpSamplingOsInterface::create(static_cast<L0::Device &>(*device));
     }
@@ -45,14 +46,14 @@ class MetricIpSamplingLinuxTestUpstream : public MetricContextFixture,
     std::unique_ptr<MetricIpSamplingOsInterface> metricIpSamplingOsInterface = nullptr;
 };
 
-HWTEST2_F(MetricIpSamplingLinuxTestUpstream, GivenSupportedProductFamilyAndSupportedDeviceIdIsUsedForUpstreamWhenIsDependencyAvailableIsCalledThenReturnFailure, IsPVC) {
+HWTEST2_PRODUCT_F(MetricIpSamplingLinuxTestUpstream, GivenSupportedProductFamilyAndSupportedDeviceIdIsUsedForUpstreamWhenIsDependencyAvailableIsCalledThenReturnFailure, IsPVC) {
 
     auto hwInfo = neoDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     hwInfo->platform.eProductFamily = productFamily;
 
     for (const auto &deviceId : NEO::pvcXtDeviceIds) {
         hwInfo->platform.usDeviceID = deviceId;
-        EXPECT_FALSE(metricIpSamplingOsInterface->isDependencyAvailable());
+        EXPECT_FALSE(metricIpSamplingOsInterface->isOsSupportAvailable());
     }
 }
 

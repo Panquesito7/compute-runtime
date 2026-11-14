@@ -1,38 +1,50 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/source/compiler_interface/linker.h"
+#include "shared/source/compiler_interface/spec_const_values_map.h"
+#include "shared/source/compiler_interface/translation_error_code.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/program/program_info.h"
+#include "shared/source/utilities/const_stringref.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "opencl/source/cl_device/cl_device_vector.h"
 #include "opencl/source/helpers/base_object.h"
 
+#include "cif/builtins/memory/buffer/buffer.h"
+#include "cif/common/cif.h"
+#include "ocl_igc_interface/code_type.h"
+
+#include <algorithm>
 #include <functional>
 
 namespace NEO {
 namespace Zebin::Debug {
 struct Segments;
 }
-namespace PatchTokenBinary {
-struct ProgramFromPatchtokens;
-}
-
 enum class BuildPhase;
-class BuiltinDispatchInfoBuilder;
+namespace BuiltIn {
+class DispatchInfoBuilder;
+}
 class ClDevice;
 class Context;
 class CompilerInterface;
 class Device;
 class ExecutionEnvironment;
 class Program;
+struct MetadataGeneration;
 struct KernelInfo;
+enum class DecodeError : uint8_t;
+struct ExternalFunctionInfo;
+class SharedPoolAllocation;
+class ProductHelper;
+
 template <>
 struct OpenCLObjectMapper<_cl_program> {
     typedef class Program DerivedType;
@@ -46,19 +58,19 @@ using CreateFromILFunc = std::function<Program *(Context *ctx,
 extern CreateFromILFunc createFromIL;
 } // namespace ProgramFunctions
 
-constexpr cl_int asClError(TranslationOutput::ErrorCode err) {
+constexpr cl_int asClError(TranslationErrorCode err) {
     switch (err) {
     default:
         return CL_OUT_OF_HOST_MEMORY;
-    case TranslationOutput::ErrorCode::Success:
+    case TranslationErrorCode::success:
         return CL_SUCCESS;
-    case TranslationOutput::ErrorCode::CompilerNotAvailable:
+    case TranslationErrorCode::compilerNotAvailable:
         return CL_COMPILER_NOT_AVAILABLE;
-    case TranslationOutput::ErrorCode::CompilationFailure:
+    case TranslationErrorCode::compilationFailure:
         return CL_COMPILE_PROGRAM_FAILURE;
-    case TranslationOutput::ErrorCode::BuildFailure:
+    case TranslationErrorCode::buildFailure:
         return CL_BUILD_PROGRAM_FAILURE;
-    case TranslationOutput::ErrorCode::LinkFailure:
+    case TranslationErrorCode::linkFailure:
         return CL_LINK_PROGRAM_FAILURE;
     }
 }
@@ -68,18 +80,16 @@ class Program : public BaseObject<_cl_program> {
     static const cl_ulong objectMagic = 0x5651C89100AAACFELL;
 
     enum class BuildPhase {
-        Init,
-        SourceCodeNotification,
-        BinaryCreation,
-        BinaryProcessing,
-        DebugDataNotification
+        init,
+        binaryCreation,
+        binaryProcessing
     };
 
     enum class CreatedFrom {
-        SOURCE,
-        IL,
-        BINARY,
-        UNKNOWN
+        source,
+        il,
+        binary,
+        unknown
     };
 
     // Create program from binary
@@ -125,17 +135,14 @@ class Program : public BaseObject<_cl_program> {
     Program(Context *context, bool isBuiltIn, const ClDeviceVector &clDevicesIn);
     ~Program() override;
 
-    Program(const Program &) = delete;
-    Program &operator=(const Program &) = delete;
-
     cl_int build(const ClDeviceVector &deviceVector, const char *buildOptions);
 
     cl_int build(const ClDeviceVector &deviceVector, const char *buildOptions,
-                 std::unordered_map<std::string, BuiltinDispatchInfoBuilder *> &builtinsMap);
+                 std::unordered_map<std::string, BuiltIn::DispatchInfoBuilder *> &builtinsMap);
 
     cl_int processGenBinaries(const ClDeviceVector &clDevices, std::unordered_map<uint32_t, BuildPhase> &phaseReached);
-    MOCKABLE_VIRTUAL cl_int processGenBinary(const ClDevice &clDevice);
-    MOCKABLE_VIRTUAL cl_int processProgramInfo(ProgramInfo &dst, const ClDevice &clDevice);
+    MOCKABLE_VIRTUAL cl_int processGenBinary(ClDevice &clDevice);
+    MOCKABLE_VIRTUAL cl_int processProgramInfo(ProgramInfo &dst, ClDevice &clDevice);
 
     cl_int compile(const ClDeviceVector &deviceVector, const char *buildOptions,
                    cl_uint numInputHeaders, const cl_program *inputHeaders, const char **headerIncludeNames);
@@ -171,8 +178,6 @@ class Program : public BaseObject<_cl_program> {
 
     cl_int getSource(std::string &binary) const;
 
-    MOCKABLE_VIRTUAL void processDebugData(uint32_t rootDeviceIndex);
-
     void updateBuildLog(uint32_t rootDeviceIndex, const char *pErrorString, const size_t errorStringSize);
 
     const char *getBuildLog(uint32_t rootDeviceIndex) const;
@@ -185,17 +190,33 @@ class Program : public BaseObject<_cl_program> {
         return isSpirV;
     }
 
-    GraphicsAllocation *getConstantSurface(uint32_t rootDeviceIndex) const {
-        return buildInfos[rootDeviceIndex].constantSurface;
-    }
+    void freeGlobalBufferAllocation(std::unique_ptr<NEO::SharedPoolAllocation> &buffer);
 
-    GraphicsAllocation *getGlobalSurface(uint32_t rootDeviceIndex) const {
-        return buildInfos[rootDeviceIndex].globalSurface;
-    }
+    NEO::SharedPoolAllocation *getConstantSurface(uint32_t rootDeviceIndex) const;
+    NEO::GraphicsAllocation *getConstantSurfaceGA(uint32_t rootDeviceIndex) const;
+    NEO::SharedPoolAllocation *getGlobalSurface(uint32_t rootDeviceIndex) const;
+    NEO::GraphicsAllocation *getGlobalSurfaceGA(uint32_t rootDeviceIndex) const;
+    NEO::GraphicsAllocation *getExportedFunctionsSurface(uint32_t rootDeviceIndex) const;
+    const std::vector<Program *> &getRequiredLibPrograms(uint32_t rootDeviceIndex) const;
 
-    GraphicsAllocation *getExportedFunctionsSurface(uint32_t rootDeviceIndex) const {
-        return buildInfos[rootDeviceIndex].exportedFunctionsSurface;
-    }
+    MOCKABLE_VIRTUAL bool isIsaPoolingEnabled(Device &neoDevice);
+    cl_int setIsaGraphicsAllocations(
+        Device &neoDevice,
+        std::vector<KernelInfo *> &kernelInfoArray,
+        uint32_t rootDeviceIndex);
+
+    MOCKABLE_VIRTUAL bool transferIsaSegmentsToAllocation(
+        Device *pDevice,
+        std::vector<KernelInfo *> &kernelInfoArray,
+        const Linker::PatchableSegments *isaSegmentsForPatching,
+        uint32_t rootDeviceIndex);
+
+    std::pair<const void *, size_t> getKernelHeapPointerAndSize(
+        KernelInfo *const &kernelInfo,
+        std::vector<KernelInfo *> &kernelInfoArray,
+        const Linker::PatchableSegments *isaSegmentsForPatching);
+
+    GraphicsAllocation *getKernelsIsaParentAllocation(uint32_t rootDeviceIndex) const;
 
     void cleanCurrentKernelInfo(uint32_t rootDeviceIndex);
 
@@ -211,20 +232,8 @@ class Program : public BaseObject<_cl_program> {
         return programOptionVersion;
     }
 
-    void enableKernelDebug() {
-        kernelDebugEnabled = true;
-    }
-
-    bool isKernelDebugEnabled() {
-        return kernelDebugEnabled;
-    }
-
     char *getDebugData(uint32_t rootDeviceIndex) {
         return buildInfos[rootDeviceIndex].debugData.get();
-    }
-
-    size_t getDebugDataSize(uint32_t rootDeviceIndex) {
-        return buildInfos[rootDeviceIndex].debugDataSize;
     }
 
     const Linker::RelocatedSymbolsMap &getSymbols(uint32_t rootDeviceIndex) const {
@@ -254,6 +263,8 @@ class Program : public BaseObject<_cl_program> {
     static cl_int processInputDevices(ClDeviceVector *&deviceVectorPtr, cl_uint numDevices, const cl_device_id *deviceList, const ClDeviceVector &allAvailableDevices);
     MOCKABLE_VIRTUAL std::string getInternalOptions() const;
     uint32_t getMaxRootDeviceIndex() const { return maxRootDeviceIndex; }
+    uint32_t getIndirectDetectionVersion() const { return indirectDetectionVersion; }
+    uint32_t getIndirectAccessBufferVersion() const { return indirectAccessBufferMajorVersion; }
     void retainForKernel() {
         std::unique_lock<std::mutex> lock{lockMutex};
         exposedKernels++;
@@ -267,6 +278,9 @@ class Program : public BaseObject<_cl_program> {
         std::unique_lock<std::mutex> lock{lockMutex};
         return 0 != exposedKernels;
     }
+    bool getCreatedFromBinary() const {
+        return isCreatedFromBinary;
+    }
 
     const ExecutionEnvironment &getExecutionEnvironment() const { return executionEnvironment; }
 
@@ -274,14 +288,13 @@ class Program : public BaseObject<_cl_program> {
         this->context = pContext;
     }
 
-    MOCKABLE_VIRTUAL void debugNotify(const ClDeviceVector &deviceVector, std::unordered_map<uint32_t, BuildPhase> &phasesReached);
-    void notifyDebuggerWithDebugData(ClDevice *clDevice);
     MOCKABLE_VIRTUAL void createDebugZebin(uint32_t rootDeviceIndex);
     Zebin::Debug::Segments getZebinSegments(uint32_t rootDeviceIndex);
     MOCKABLE_VIRTUAL void callPopulateZebinExtendedArgsMetadataOnce(uint32_t rootDeviceIndex);
     MOCKABLE_VIRTUAL void callGenerateDefaultExtendedArgsMetadataOnce(uint32_t rootDeviceIndex);
 
   protected:
+    FORCE_NOINLINE void dumpKernelInfoToAubComments();
     MOCKABLE_VIRTUAL cl_int createProgramFromBinary(const void *pBinary, size_t binarySize, ClDevice &clDevice);
 
     cl_int packDeviceBinary(ClDevice &clDevice);
@@ -290,6 +303,12 @@ class Program : public BaseObject<_cl_program> {
                                        size_t variablesInitDataSize, const ProgramInfo::GlobalSurfaceInfo &stringInfo,
                                        std::vector<NEO::ExternalFunctionInfo> &extFuncInfos);
 
+    MOCKABLE_VIRTUAL cl_int resolveRequiredLibs(ClDevice &clDevice, const ProgramInfo &programInfo);
+
+    MOCKABLE_VIRTUAL LinkingStatus linkAgainstRequiredLibs(uint32_t rootDeviceIndex,
+                                                           Linker::PatchableSegments &isaSegmentsForPatching,
+                                                           Linker::UnresolvedExternals &unresolvedExternalsInfo);
+
     void updateNonUniformFlag();
     void updateNonUniformFlag(const Program **inputProgram, size_t numInputPrograms);
 
@@ -297,15 +316,10 @@ class Program : public BaseObject<_cl_program> {
     MOCKABLE_VIRTUAL bool isFlagOption(ConstStringRef option);
     MOCKABLE_VIRTUAL bool isOptionValueValid(ConstStringRef option, ConstStringRef value);
 
-    MOCKABLE_VIRTUAL bool appendKernelDebugOptions(ClDevice &clDevice, std::string &internalOptions);
-    void notifyDebuggerWithSourceCode(ClDevice &clDevice, std::string &filename);
     void prependFilePathToOptions(const std::string &filename);
 
     void setBuildStatus(cl_build_status status);
     void setBuildStatusSuccess(const ClDeviceVector &deviceVector, cl_program_binary_type binaryType);
-
-    bool containsVmeUsage(const std::vector<KernelInfo *> &kernelInfos) const;
-    void disableZebinIfVmeEnabled(std::string &options, std::string &internalOptions, const std::string &sourceCode);
 
     void notifyModuleCreate();
     void notifyModuleDestroy();
@@ -316,7 +330,7 @@ class Program : public BaseObject<_cl_program> {
     std::unique_ptr<char[]> irBinary;
     size_t irBinarySize = 0U;
 
-    CreatedFrom createdFrom = CreatedFrom::UNKNOWN;
+    CreatedFrom createdFrom = CreatedFrom::unknown;
 
     struct DeviceBuildInfo {
         StackVec<ClDevice *, 2> associatedSubDevices;
@@ -337,9 +351,11 @@ class Program : public BaseObject<_cl_program> {
 
     struct BuildInfo : public NonCopyableClass {
         std::vector<KernelInfo *> kernelInfoArray;
-        GraphicsAllocation *constantSurface = nullptr;
-        GraphicsAllocation *globalSurface = nullptr;
+        std::unique_ptr<NEO::SharedPoolAllocation> constantSurface;
+        std::unique_ptr<NEO::SharedPoolAllocation> globalSurface;
+        std::unique_ptr<NEO::SharedPoolAllocation> sharedIsaAllocation;
         GraphicsAllocation *exportedFunctionsSurface = nullptr;
+        std::vector<Program *> requiredLibPrograms;
         size_t globalVarTotalSize = 0U;
         std::unique_ptr<LinkerInput> linkerInput;
         Linker::RelocatedSymbolsMap symbols{};
@@ -377,16 +393,29 @@ class Program : public BaseObject<_cl_program> {
     ClDeviceVector clDevices;
     ClDeviceVector clDevicesInProgram;
 
+    uint32_t indirectDetectionVersion = 0u;
+    uint32_t indirectAccessBufferMajorVersion = 0u;
     bool isBuiltIn = false;
-    bool kernelDebugEnabled = false;
+    bool isGeneratedByIgc = true;
+
     uint32_t maxRootDeviceIndex = std::numeric_limits<uint32_t>::max();
     std::mutex lockMutex;
     uint32_t exposedKernels = 0;
 
     size_t exportedFunctionsKernelId = std::numeric_limits<size_t>::max();
 
-    std::once_flag extractAndDecodeMetadataOnce;
-    std::once_flag generateDefaultMetadataOnce;
+    std::unique_ptr<MetadataGeneration> metadataGeneration;
+
+    struct DecodedSingleDeviceBinary {
+        bool isSet = false;
+        ProgramInfo programInfo;
+        DecodeError decodeError;
+        std::string decodeErrors;
+        std::string decodeWarnings;
+    } decodedSingleDeviceBinary;
+    IGC::CodeType::CodeType_t intermediateRepresentation = IGC::CodeType::invalid;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<Program>);
 
 } // namespace NEO

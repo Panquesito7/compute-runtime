@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -31,12 +31,12 @@ GraphicsAllocation *FlatBatchBufferHelperHw<GfxFamily>::flattenBatchBuffer(uint3
     std::vector<PatchInfoData> indirectPatchInfo;
     std::unique_ptr<char[]> indirectPatchCommands(getIndirectPatchCommands(indirectPatchCommandsSize, indirectPatchInfo));
 
-    if (dispatchMode == DispatchMode::ImmediateDispatch) {
+    if (dispatchMode == DispatchMode::immediateDispatch) {
         if (batchBuffer.chainedBatchBuffer) {
             batchBuffer.chainedBatchBuffer->setAubWritable(false, GraphicsAllocation::defaultBank);
             auto sizeMainBatchBuffer = batchBuffer.chainedBatchBufferStartOffset - batchBuffer.startOffset;
             auto alignedMainBatchBufferSize = alignUp(sizeMainBatchBuffer + indirectPatchCommandsSize + batchBuffer.chainedBatchBuffer->getUnderlyingBufferSize(), MemoryConstants::pageSize);
-            AllocationProperties flatBatchBufferProperties(rootDeviceIndex, alignedMainBatchBufferSize, AllocationType::INTERNAL_HOST_MEMORY, deviceBitfield);
+            AllocationProperties flatBatchBufferProperties(rootDeviceIndex, alignedMainBatchBufferSize, AllocationType::internalHostMemory, deviceBitfield);
             flatBatchBufferProperties.alignment = MemoryConstants::pageSize;
             flatBatchBuffer =
                 getMemoryManager()->allocateGraphicsMemoryWithProperties(flatBatchBufferProperties);
@@ -55,7 +55,7 @@ GraphicsAllocation *FlatBatchBufferHelperHw<GfxFamily>::flattenBatchBuffer(uint3
             sizeBatchBuffer = flatBatchBufferProperties.size;
             patchInfoCollection.insert(std::end(patchInfoCollection), std::begin(indirectPatchInfo), std::end(indirectPatchInfo));
         }
-    } else if (dispatchMode == DispatchMode::BatchedDispatch) {
+    } else if (dispatchMode == DispatchMode::batchedDispatch) {
         CommandChunk firstChunk;
         for (auto &chunk : commandChunkList) {
             bool found = false;
@@ -114,7 +114,7 @@ GraphicsAllocation *FlatBatchBufferHelperHw<GfxFamily>::flattenBatchBuffer(uint3
 
         flatBatchBufferSize = alignUp(flatBatchBufferSize, MemoryConstants::pageSize);
         flatBatchBufferSize += CSRequirements::csOverfetchSize;
-        AllocationProperties flatBatchBufferProperties(rootDeviceIndex, static_cast<size_t>(flatBatchBufferSize), AllocationType::INTERNAL_HOST_MEMORY, deviceBitfield);
+        AllocationProperties flatBatchBufferProperties(rootDeviceIndex, static_cast<size_t>(flatBatchBufferSize), AllocationType::internalHostMemory, deviceBitfield);
         flatBatchBufferProperties.alignment = MemoryConstants::pageSize;
         flatBatchBuffer = getMemoryManager()->allocateGraphicsMemoryWithProperties(flatBatchBufferProperties);
         UNRECOVERABLE_IF(flatBatchBuffer == nullptr);
@@ -158,7 +158,7 @@ char *FlatBatchBufferHelperHw<GfxFamily>::getIndirectPatchCommands(size_t &indir
 
     uint64_t stiCommandOffset = 0;
     std::vector<PatchInfoData> patchInfoCopy = patchInfoCollection;
-    std::unique_ptr<char[]> buffer(new char[indirectPatchCommandsSize]);
+    auto buffer = std::make_unique_for_overwrite<char[]>(indirectPatchCommandsSize);
     LinearStream indirectPatchCommandStream(buffer.get(), indirectPatchCommandsSize);
     patchInfoCollection.clear();
 
@@ -170,20 +170,21 @@ char *FlatBatchBufferHelperHw<GfxFamily>::getIndirectPatchCommands(size_t &indir
                                                               static_cast<uint32_t>((patchInfoData.sourceAllocation + patchInfoData.sourceAllocationOffset) & 0x0000FFFFFFFFULL),
                                                               static_cast<uint32_t>((patchInfoData.sourceAllocation + patchInfoData.sourceAllocationOffset) >> 32),
                                                               !is32BitAddress,
-                                                              false);
+                                                              false,
+                                                              nullptr);
 
             PatchInfoData patchInfoForAddress(patchInfoData.targetAllocation,
                                               patchInfoData.targetAllocationOffset,
                                               patchInfoData.targetType,
                                               0u,
                                               stiCommandOffset + EncodeStoreMemory<GfxFamily>::getStoreDataImmSize() - 2 * sizeof(uint64_t),
-                                              PatchInfoAllocationType::Default);
+                                              PatchInfoAllocationType::defaultType);
             PatchInfoData patchInfoForValue(patchInfoData.sourceAllocation,
                                             patchInfoData.sourceAllocationOffset,
                                             patchInfoData.sourceType,
                                             0u,
                                             stiCommandOffset + EncodeStoreMemory<GfxFamily>::getStoreDataImmSize() - sizeof(uint64_t),
-                                            PatchInfoAllocationType::Default);
+                                            PatchInfoAllocationType::defaultType);
             indirectPatchInfo.push_back(patchInfoForAddress);
             indirectPatchInfo.push_back(patchInfoForValue);
             stiCommandOffset += EncodeStoreMemory<GfxFamily>::getStoreDataImmSize();
@@ -196,7 +197,7 @@ char *FlatBatchBufferHelperHw<GfxFamily>::getIndirectPatchCommands(size_t &indir
 template <typename GfxFamily>
 void FlatBatchBufferHelperHw<GfxFamily>::removePipeControlData(size_t pipeControlLocationSize, void *pipeControlForNooping, const RootDeviceEnvironment &rootDeviceEnvironment) {
     typedef typename GfxFamily::PIPE_CONTROL PIPE_CONTROL;
-    size_t numPipeControls = (pipeControlLocationSize - MemorySynchronizationCommands<GfxFamily>::getSizeForAdditonalSynchronization(rootDeviceEnvironment)) / (sizeof(PIPE_CONTROL));
+    size_t numPipeControls = (pipeControlLocationSize - MemorySynchronizationCommands<GfxFamily>::getSizeForAdditionalSynchronization(NEO::FenceType::release, rootDeviceEnvironment)) / (sizeof(PIPE_CONTROL));
     for (size_t i = 0; i < numPipeControls; i++) {
         PIPE_CONTROL *erasedPipeControl = reinterpret_cast<PIPE_CONTROL *>(pipeControlForNooping);
         removePatchInfoData(reinterpret_cast<uint64_t>(erasedPipeControl) + (i + 1) * sizeof(PIPE_CONTROL) - 2 * sizeof(uint64_t));
@@ -208,7 +209,7 @@ template <typename GfxFamily>
 void FlatBatchBufferHelperHw<GfxFamily>::collectScratchSpacePatchInfo(uint64_t scratchAddress, uint64_t commandOffset, const LinearStream &csr) {
     if (scratchAddress) {
         auto scratchOffset = reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(csr.getCpuBase()) + commandOffset)[0] & 0x3FF;
-        PatchInfoData patchInfoData(scratchAddress, scratchOffset, PatchInfoAllocationType::ScratchSpace, csr.getGraphicsAllocation()->getGpuAddress(), commandOffset, PatchInfoAllocationType::Default);
+        PatchInfoData patchInfoData(scratchAddress, scratchOffset, PatchInfoAllocationType::scratchSpace, csr.getGraphicsAllocation()->getGpuAddress(), commandOffset, PatchInfoAllocationType::defaultType);
         patchInfoCollection.push_back(patchInfoData);
     }
 }

@@ -1,0 +1,59 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/constants.h"
+#include "shared/source/os_interface/driver_info.h"
+#include "shared/source/os_interface/os_time.h"
+
+#include "level_zero/sysman/source/device/os_sysman.h"
+#include "level_zero/sysman/source/shared/firmware_util/sysman_igsc_wrapper.h"
+#include <level_zero/zes_api.h>
+#include <level_zero/zes_intel_gpu_sysman.h>
+
+#include <array>
+#include <string>
+#include <vector>
+
+namespace L0 {
+namespace Sysman {
+
+class OsGlobalOperations {
+  public:
+    virtual bool getSerialNumber(char (&serialNumber)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual bool getOemSerialNumber(std::array<uint8_t, IGSC_MAX_OEM_SN_LENGTH> &serialNumber, uint16_t &serialNumberLen) = 0;
+    virtual bool getBoardNumber(char (&boardNumber)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual void getBrandName(char (&brandName)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual void getModelName(char (&modelName)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual void getVendorName(char (&vendorName)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual void getDriverVersion(char (&driverVersion)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual void getDriverName(char (&driverName)[ZES_STRING_PROPERTY_SIZE]) = 0;
+    virtual void getRepairStatus(zes_device_state_t *pState) = 0;
+    virtual void getTimerResolution(double *pTimerResolution) = 0;
+    virtual bool getUuid(std::array<uint8_t, CommonConstants::uuidSize> &uuid) = 0;
+    virtual bool generateUuidFromPciBusInfo(const NEO::PhysicalDevicePciBusInfo &pciBusInfo, std::array<uint8_t, CommonConstants::uuidSize> &uuid) = 0;
+    virtual ze_bool_t getDeviceInfoByUuid(zes_uuid_t uuid, ze_bool_t *onSubdevice, uint32_t *subdeviceId) = 0;
+    virtual ze_result_t getSubDeviceProperties(uint32_t *pCount, zes_subdevice_exp_properties_t *pSubdeviceProps) = 0;
+    virtual ze_result_t reset(ze_bool_t force) = 0;
+    virtual ze_result_t scanProcessesState(std::vector<zes_process_state_t> &pProcessList) = 0;
+    virtual ze_result_t deviceGetState(zes_device_state_t *pState) = 0;
+    virtual ze_result_t resetExt(zes_reset_properties_t *pProperties) = 0;
+    virtual ze_result_t memoryGetPageOfflineStateExp(zes_intel_mem_page_status_exp_t pageStatus, uint32_t *pCount, zes_intel_mem_page_info_exp_t *pPageOfflineInfo) = 0;
+    virtual ze_result_t getMaxMemoryOfflinePages(uint32_t *pMaxOfflinePages) = 0;
+    virtual ze_result_t getSocUid(zes_uuid_t *pSocUid) = 0;
+    virtual ze_result_t getDeviceHealthStatus(zes_device_health_status_ext_t *pHealth) = 0;
+    virtual ze_result_t setDeviceHealthStatus(zes_device_health_status_ext_t health) = 0;
+    virtual ze_result_t getPowerOffReasonExp(zes_intel_device_power_off_reason_exp_t *pReason) = 0;
+    virtual std::string getGpuGeneration() = 0;
+    virtual void clearUuidCache() = 0;
+    static OsGlobalOperations *create(OsSysman *pOsSysman);
+    virtual ~OsGlobalOperations() {}
+};
+
+} // namespace Sysman
+} // namespace L0

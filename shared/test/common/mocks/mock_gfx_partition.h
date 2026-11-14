@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,6 +13,7 @@ using namespace NEO;
 
 class MockGfxPartition : public GfxPartition {
   public:
+    using GfxPartition::isAddressInHeapRange;
     using GfxPartition::osMemory;
 
     MockGfxPartition() : GfxPartition(reservedCpuAddressRange) {}
@@ -58,6 +59,7 @@ class MockGfxPartition : public GfxPartition {
         if (callHeapAllocate) {
             getHeap(heapIndex).free(ptr, size);
         }
+        heapFreePtr = ptr;
     }
 
     void freeGpuAddressRange(uint64_t gpuAddress, size_t size) override {
@@ -66,19 +68,39 @@ class MockGfxPartition : public GfxPartition {
             GfxPartition::freeGpuAddressRange(gpuAddress, size);
         }
     }
+
+    bool getHeapIndexAndPageSizeBasedOnAddress(uint64_t ptr, HeapIndex &heapIndex, size_t &pageSize) override {
+        getHeapIndexAndPageSizeBasedOnAddressCalled++;
+        if (callBaseGetHeapIndexAndPageSizeBasedOnAddress) {
+            return GfxPartition::getHeapIndexAndPageSizeBasedOnAddress(ptr, heapIndex, pageSize);
+        }
+
+        if (getHeapIndexAndPageSizeBasedOnAddressReturnTrue) {
+            heapIndex = HeapIndex::heapStandard;
+            pageSize = MemoryConstants::pageSize;
+            return true;
+        }
+
+        return false;
+    }
+
     void initHeap(HeapIndex heapIndex, uint64_t base, uint64_t size, size_t allocationAlignment) {
         getHeap(heapIndex).init(base, size, allocationAlignment);
     }
 
     uint32_t freeGpuAddressRangeCalled = 0u;
+    uint32_t getHeapIndexAndPageSizeBasedOnAddressCalled = 0u;
     bool callBasefreeGpuAddressRange = false;
+    bool callBaseGetHeapIndexAndPageSizeBasedOnAddress = false;
+    bool getHeapIndexAndPageSizeBasedOnAddressReturnTrue = false;
 
-    static std::array<HeapIndex, static_cast<uint32_t>(HeapIndex::TOTAL_HEAPS)> allHeapNames;
+    static std::array<HeapIndex, static_cast<uint32_t>(HeapIndex::totalHeaps)> allHeapNames;
 
     OSMemory::ReservedCpuAddressRange reservedCpuAddressRange;
     bool callHeapAllocate = true;
-    HeapIndex heapAllocateIndex = HeapIndex::TOTAL_HEAPS;
+    HeapIndex heapAllocateIndex = HeapIndex::totalHeaps;
     const uint64_t mockGpuVa = std::numeric_limits<uint64_t>::max();
+    uint64_t heapFreePtr = 0;
 };
 
 class MockGfxPartitionBasic : public GfxPartition {
@@ -90,7 +112,7 @@ class MockGfxPartitionBasic : public GfxPartition {
 
 class FailedInitGfxPartition : public MockGfxPartition {
   public:
-    bool init(uint64_t gpuAddressSpace, size_t cpuAddressRangeSizeToReserve, uint32_t rootDeviceIndex, size_t numRootDevices, bool useFrontWindowPool, uint64_t systemMemorySize) override {
+    bool init(uint64_t, size_t, uint32_t, size_t, bool, uint64_t, uint64_t, const ProductHelper *) override {
         return false;
     }
 };

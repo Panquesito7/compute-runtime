@@ -1,0 +1,647 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_stream/csr_definitions.h"
+#include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/command_stream/thread_arbitration_policy.h"
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/helpers/append_operations.h"
+#include "shared/source/helpers/blit_commands_helper.h"
+#include "shared/source/helpers/blit_properties.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/pipeline_select_args.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/memory_manager/memory_pool.h"
+#include "shared/source/os_interface/os_context.h"
+#include "shared/source/xe3_core/hw_cmds_base.h"
+#include "shared/source/xe3_core/hw_cmds_xe3_core.h"
+#include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/test_macros/header/per_product_test_definitions.h"
+#include "shared/test/common/utilities/base_object_utils.h"
+
+#include "opencl/extensions/public/cl_ext_private.h"
+#include "opencl/source/context/context.h"
+#include "opencl/source/mem_obj/buffer.h"
+#include "opencl/source/mem_obj/mem_obj.h"
+#include "opencl/test/unit_test/fixtures/ult_command_stream_receiver_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_context.h"
+
+#include "gtest/gtest.h"
+
+#include <cstdint>
+#include <memory>
+
+using namespace NEO;
+
+struct MemorySynchronizationViaMiSemaphoreWaitTest : public UltCommandStreamReceiverTest {
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+        debugManager.flags.DirectSubmissionInsertExtraMiMemFenceCommands.set(0);
+        UltCommandStreamReceiverTest::SetUp();
+    }
+    DebugManagerStateRestore restore;
+};
+
+using MemorySynchronizationViaMiSemaphoreWaitTestXe3Core = MemorySynchronizationViaMiSemaphoreWaitTest;
+
+XE3_CORETEST_F(MemorySynchronizationViaMiSemaphoreWaitTestXe3Core, givenMemorySynchronizationViaMiSemaphoreWaitWhenProgramEnginePrologueIsCalledThenNoCommandIsProgrammed) {
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    EXPECT_FALSE(commandStreamReceiver.isEnginePrologueSent);
+
+    auto requiredSize = commandStreamReceiver.getCmdSizeForPrologue();
+    EXPECT_EQ(0u, requiredSize);
+
+    StackVec<char, 4096> buffer(requiredSize);
+    LinearStream cmdStream(buffer.begin(), buffer.size());
+
+    commandStreamReceiver.programEnginePrologue(cmdStream);
+    EXPECT_TRUE(commandStreamReceiver.isEnginePrologueSent);
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(cmdStream);
+    EXPECT_EQ(0u, hwParser.cmdList.size());
+}
+
+struct SystemMemoryFenceViaMiMemFenceTest : public UltCommandStreamReceiverTest {
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(1);
+
+        UltCommandStreamReceiverTest::SetUp();
+    }
+    DebugManagerStateRestore restore;
+};
+
+using SystemMemoryFenceViaMiMemFenceTestXe3Core = SystemMemoryFenceViaMiMemFenceTest;
+
+XE3_CORETEST_F(SystemMemoryFenceViaMiMemFenceTestXe3Core, givenCommadStreamReceiverWhenProgramEnginePrologueIsCalledThenIsEnginePrologueSentIsSetToTrue) {
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    EXPECT_FALSE(commandStreamReceiver.isEnginePrologueSent);
+
+    auto requiredSize = commandStreamReceiver.getCmdSizeForPrologue();
+    StackVec<char, 4096> buffer(requiredSize);
+    LinearStream cmdStream(buffer.begin(), buffer.size());
+
+    commandStreamReceiver.programEnginePrologue(cmdStream);
+    EXPECT_TRUE(commandStreamReceiver.isEnginePrologueSent);
+}
+
+XE3_CORETEST_F(SystemMemoryFenceViaMiMemFenceTestXe3Core, givenIsEnginePrologueSentIsSetToTrueWhenGetRequiredCmdStreamSizeIsCalledThenSizeForEnginePrologueIsNotIncluded) {
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    auto dispatchFlags = DispatchFlagsHelper::createDefaultDispatchFlags();
+
+    EXPECT_FALSE(commandStreamReceiver.isEnginePrologueSent);
+    auto sizeForEnginePrologue = commandStreamReceiver.getCmdSizeForPrologue();
+
+    auto sizeWhenEnginePrologueIsNotSent = commandStreamReceiver.getRequiredCmdStreamSize(dispatchFlags, *pDevice);
+
+    commandStreamReceiver.isEnginePrologueSent = true;
+    auto sizeWhenEnginePrologueIsSent = commandStreamReceiver.getRequiredCmdStreamSize(dispatchFlags, *pDevice);
+
+    EXPECT_EQ(sizeForEnginePrologue, sizeWhenEnginePrologueIsNotSent - sizeWhenEnginePrologueIsSent);
+}
+
+struct SystemMemoryFenceViaComputeWalkerTest : public UltCommandStreamReceiverTest {
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(1);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(0);
+
+        UltCommandStreamReceiverTest::SetUp();
+    }
+    DebugManagerStateRestore restore;
+};
+
+using SystemMemoryFenceViaComputeWalkerTestXe3Core = SystemMemoryFenceViaComputeWalkerTest;
+
+XE3_CORETEST_F(SystemMemoryFenceViaComputeWalkerTestXe3Core, givenSystemMemoryFenceGeneratedAsPostSyncOperationInComputeWalkerWhenProgramEnginePrologueIsCalledThenSystemMemFenceAddressIsProgrammed) {
+    using STATE_SYSTEM_MEM_FENCE_ADDRESS = typename FamilyType::STATE_SYSTEM_MEM_FENCE_ADDRESS;
+
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    EXPECT_FALSE(commandStreamReceiver.isEnginePrologueSent);
+
+    auto requiredSize = commandStreamReceiver.getCmdSizeForPrologue();
+    StackVec<char, 4096> buffer(requiredSize);
+    LinearStream cmdStream(buffer.begin(), buffer.size());
+
+    commandStreamReceiver.programEnginePrologue(cmdStream);
+    EXPECT_TRUE(commandStreamReceiver.isEnginePrologueSent);
+
+    if (!pDevice->getHardwareInfo().capabilityTable.isIntegratedDevice) {
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(cmdStream);
+        auto itorSystemMemFenceAddress = find<STATE_SYSTEM_MEM_FENCE_ADDRESS *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+        ASSERT_NE(hwParser.cmdList.end(), itorSystemMemFenceAddress);
+
+        auto systemMemFenceAddressCmd = genCmdCast<STATE_SYSTEM_MEM_FENCE_ADDRESS *>(*itorSystemMemFenceAddress);
+        EXPECT_EQ(commandStreamReceiver.globalFenceAllocation->getGpuAddress(), systemMemFenceAddressCmd->getSystemMemoryFenceAddress());
+    }
+}
+
+struct SystemMemoryFenceViaKernelInstructionTest : public UltCommandStreamReceiverTest {
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.ProgramGlobalFenceAsMiMemFenceCommandInCommandStream.set(0);
+        debugManager.flags.ProgramGlobalFenceAsPostSyncOperationInComputeWalker.set(0);
+        debugManager.flags.ProgramGlobalFenceAsKernelInstructionInEUKernel.set(1);
+
+        UltCommandStreamReceiverTest::SetUp();
+    }
+    DebugManagerStateRestore restore;
+};
+
+using SystemMemoryFenceViaKernelInstructionTestXe3Core = SystemMemoryFenceViaKernelInstructionTest;
+
+XE3_CORETEST_F(SystemMemoryFenceViaKernelInstructionTestXe3Core, givenSystemMemoryFenceGeneratedAsKernelInstructionInKernelCodeWhenProgramEnginePrologueIsCalledThenSystemMemFenceAddressIsProgrammed) {
+    using STATE_SYSTEM_MEM_FENCE_ADDRESS = typename FamilyType::STATE_SYSTEM_MEM_FENCE_ADDRESS;
+
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    EXPECT_FALSE(commandStreamReceiver.isEnginePrologueSent);
+
+    auto requiredSize = commandStreamReceiver.getCmdSizeForPrologue();
+    StackVec<char, 4096> buffer(requiredSize);
+    LinearStream cmdStream(buffer.begin(), buffer.size());
+
+    commandStreamReceiver.programEnginePrologue(cmdStream);
+    EXPECT_TRUE(commandStreamReceiver.isEnginePrologueSent);
+
+    if (!pDevice->getHardwareInfo().capabilityTable.isIntegratedDevice) {
+        HardwareParse hwParser;
+        hwParser.parseCommands<FamilyType>(cmdStream);
+        auto itorSystemMemFenceAddress = find<STATE_SYSTEM_MEM_FENCE_ADDRESS *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+        ASSERT_NE(hwParser.cmdList.end(), itorSystemMemFenceAddress);
+
+        auto systemMemFenceAddressCmd = genCmdCast<STATE_SYSTEM_MEM_FENCE_ADDRESS *>(*itorSystemMemFenceAddress);
+        EXPECT_EQ(commandStreamReceiver.globalFenceAllocation->getGpuAddress(), systemMemFenceAddressCmd->getSystemMemoryFenceAddress());
+    }
+}
+
+struct Xe3MidThreadCommandStreamReceiverTest : public UltCommandStreamReceiverTest {
+    void SetUp() override {
+        debugManager.flags.ForcePreemptionMode.set(static_cast<int32_t>(PreemptionMode::MidThread));
+
+        UltCommandStreamReceiverTest::SetUp();
+    }
+    DebugManagerStateRestore restore;
+};
+
+XE3_CORETEST_F(Xe3MidThreadCommandStreamReceiverTest, givenMidThreadPreemptionWhenCreatingPreemptionAllocationThenExpectProperAlignment) {
+    using STATE_CONTEXT_DATA_BASE_ADDRESS = typename FamilyType::STATE_CONTEXT_DATA_BASE_ADDRESS;
+    constexpr size_t expectedMask = STATE_CONTEXT_DATA_BASE_ADDRESS::CONTEXTDATABASEADDRESS::CONTEXTDATABASEADDRESS_ALIGN_SIZE - 1;
+
+    auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    GraphicsAllocation *preemptionAllocation = csr.getPreemptionAllocation();
+    ASSERT_NE(nullptr, preemptionAllocation);
+
+    size_t addressValue = reinterpret_cast<size_t>(preemptionAllocation->getUnderlyingBuffer());
+    EXPECT_EQ(0u, expectedMask & addressValue);
+}
+
+using Xe3CommandStreamReceiverFlushTaskTests = UltCommandStreamReceiverTest;
+XE3_CORETEST_F(Xe3CommandStreamReceiverFlushTaskTests, givenOverrideThreadArbitrationPolicyDebugVariableSetWhenFlushingThenRequestRequiredMode) {
+    DebugManagerStateRestore restore;
+
+    debugManager.flags.OverrideThreadArbitrationPolicy.set(ThreadArbitrationPolicy::RoundRobin);
+    debugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
+
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    commandStreamReceiver.streamProperties.stateComputeMode.initSupport(pDevice->getRootDeviceEnvironment());
+
+    EXPECT_EQ(-1, commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value);
+
+    flushTask(commandStreamReceiver);
+    EXPECT_EQ(ThreadArbitrationPolicy::RoundRobin,
+              commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value);
+}
+
+XE3_CORETEST_F(Xe3CommandStreamReceiverFlushTaskTests, givenNotExistPolicyWhenFlushingThenDefaultPolicyIsProgrammed) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
+
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    commandStreamReceiver.streamProperties.stateComputeMode.initSupport(pDevice->getRootDeviceEnvironment());
+
+    DispatchFlags dispatchFlags = DispatchFlagsHelper::createDefaultDispatchFlags();
+    int32_t notExistPolicy = -2;
+    flushTaskFlags.threadArbitrationPolicy = notExistPolicy;
+
+    flushTask(commandStreamReceiver);
+
+    EXPECT_EQ(notExistPolicy, commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value);
+}
+
+struct Xe3BcsTests : public UltCommandStreamReceiverTest {
+    void SetUp() override {
+        debugManager.flags.EnableLocalMemory.set(true);
+        UltCommandStreamReceiverTest::SetUp();
+        context = std::make_unique<MockContext>(pClDevice);
+    }
+
+    void TearDown() override {
+        context.reset();
+        UltCommandStreamReceiverTest::TearDown();
+    }
+
+    DebugManagerStateRestore restore;
+    std::unique_ptr<MockContext> context;
+    cl_int retVal = CL_SUCCESS;
+};
+
+XE3_CORETEST_F(Xe3BcsTests, givenBufferInDeviceMemoryWhenStatelessCompressionIsEnabledThenBlitterForBufferUsesStatelessCompressedSettings) {
+    using MEM_COPY = typename Xe3CoreFamily::MEM_COPY;
+
+    debugManager.flags.BcsCompressionFormatForXe2Plus.set(0x1);
+
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_TRUE(!MemoryPoolHelper::isSystemMemoryPool(allocation->getMemoryPool()));
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
+    *bltCmd = Xe3CoreFamily::cmdInitXyCopyBlt;
+
+    BlitCommandsHelper<Xe3CoreFamily>::appendBlitCommandsForBuffer<MEM_COPY>(blitProperties, *bltCmd, context->getDevice(0)->getRootDeviceEnvironment());
+
+    EXPECT_EQ(static_cast<uint32_t>(debugManager.flags.BcsCompressionFormatForXe2Plus.get()), bltCmd->getCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenDstBufferInDeviceAndSrcInSystemMemoryWhenStatelessCompressionIsEnabledThenBlitterForBufferUsesStatelessCompressedSettings) {
+    using MEM_COPY = typename Xe3CoreFamily::MEM_COPY;
+
+    debugManager.flags.BcsCompressionFormatForXe2Plus.set(0x1);
+
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto bufferDst = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    auto bufferSrc = clUniquePtr<Buffer>(Buffer::create(context.get(), CL_MEM_FORCE_HOST_MEMORY_INTEL, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocationDst = bufferDst->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    auto allocationSrc = bufferSrc->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_FALSE(MemoryPoolHelper::isSystemMemoryPool(allocationDst->getMemoryPool()));
+    EXPECT_TRUE(MemoryPoolHelper::isSystemMemoryPool(allocationSrc->getMemoryPool()));
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocationDst, 0,
+        allocationSrc, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
+    *bltCmd = Xe3CoreFamily::cmdInitXyCopyBlt;
+
+    BlitCommandsHelper<Xe3CoreFamily>::appendBlitCommandsForBuffer(blitProperties, *bltCmd, context->getDevice(0)->getRootDeviceEnvironment());
+
+    EXPECT_EQ(static_cast<uint32_t>(debugManager.flags.BcsCompressionFormatForXe2Plus.get()), bltCmd->getCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenCompressibleDstBuffersWhenAppendBlitCommandsForBufferCalledThenSetCompressionFormat) {
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+
+    using MEM_COPY = typename FamilyType::MEM_COPY;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto srcBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto dstBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto srcAllocation = srcBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    srcAllocation->getDefaultGmm()->setCompressionEnabled(false);
+
+    auto dstAllocation = dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_TRUE(dstAllocation->getDefaultGmm()->isCompressionEnabled());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        dstAllocation, 0,
+        srcAllocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
+    *bltCmd = FamilyType::cmdInitXyCopyBlt;
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsForBuffer(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    auto compressionFormat = 2;
+    EXPECT_EQ(compressionFormat, bltCmd->getCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenCompressibleSrcBuffersWhenAppendBlitCommandsForBufferCalledThenSetCompressionFormat) {
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+
+    using MEM_COPY = typename FamilyType::MEM_COPY;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto srcBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto dstBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto srcAllocation = srcBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_TRUE(srcAllocation->getDefaultGmm()->isCompressionEnabled());
+
+    auto dstAllocation = dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    dstAllocation->getDefaultGmm()->setCompressionEnabled(false);
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        dstAllocation, 0,
+        srcAllocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
+    *bltCmd = FamilyType::cmdInitXyCopyBlt;
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsForBuffer(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    auto compressionFormat = 2;
+    EXPECT_EQ(compressionFormat, bltCmd->getCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenCompressibleSrcBuffersWhenAppendBlitCommandsBlockCopyIsCalledThenSetCompressionFormat) {
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto srcBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto dstBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto srcAllocation = srcBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_TRUE(srcAllocation->getDefaultGmm()->isCompressionEnabled());
+
+    auto dstAllocation = dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    dstAllocation->getDefaultGmm()->setCompressionEnabled(false);
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        dstAllocation, 0,
+        srcAllocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(0x2u, bltCmd->getSourceCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenCompressibleDstBuffersWhenAppendBlitCommandsBlockCopyIsCalledThenSetCompressionFormat) {
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto srcBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto dstBuffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto srcAllocation = srcBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    srcAllocation->getDefaultGmm()->setCompressionEnabled(false);
+
+    auto dstAllocation = dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_TRUE(dstAllocation->getDefaultGmm()->isCompressionEnabled());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        dstAllocation, 0,
+        srcAllocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(0x2u, bltCmd->getDestinationCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenCompressibleBuffersWhenBufferCompressionFormatIsForcedThenCompressionFormatIsSet) {
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    EXPECT_TRUE(allocation->getDefaultGmm()->isCompressionEnabled());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    uint32_t forcedCompressionFormat = 1;
+    debugManager.flags.ForceBufferCompressionFormat.set(static_cast<int32_t>(forcedCompressionFormat));
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(forcedCompressionFormat, bltCmd->getDestinationCompressionFormat());
+    EXPECT_EQ(forcedCompressionFormat, bltCmd->getSourceCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenNotCompressibleBuffersWhenBufferCompressionFormatIsForcedThenCompressionFormatIsNotSet) {
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+    allocation->getDefaultGmm()->setCompressionEnabled(false);
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    uint32_t forcedCompressionFormat = 1;
+    debugManager.flags.ForceBufferCompressionFormat.set(static_cast<int32_t>(forcedCompressionFormat));
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(0u, bltCmd->getDestinationCompressionFormat());
+    EXPECT_EQ(0u, bltCmd->getSourceCompressionFormat());
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenOverriddenBlitterTargetToZeroWhenAppendBlitCommandsBlockCopyThenUseSystemMem) {
+    debugManager.flags.OverrideBlitterTargetMemory.set(0);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(bltCmd->getDestinationTargetMemory(), XY_BLOCK_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_SYSTEM_MEM);
+    EXPECT_EQ(bltCmd->getSourceTargetMemory(), XY_BLOCK_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_SYSTEM_MEM);
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenOverriddenBlitterTargetToOneWhenAppendBlitCommandsBlockCopyThenUseLocalMem) {
+    debugManager.flags.OverrideBlitterTargetMemory.set(1);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(bltCmd->getDestinationTargetMemory(), XY_BLOCK_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
+    EXPECT_EQ(bltCmd->getSourceTargetMemory(), XY_BLOCK_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenOverriddenBlitterTargetToTwoWhenAppendBlitCommandsBlockCopyThenUseDefaultMem) {
+    debugManager.flags.OverrideBlitterTargetMemory.set(2);
+
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(bltCmd->getDestinationTargetMemory(), XY_BLOCK_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
+    EXPECT_EQ(bltCmd->getSourceTargetMemory(), XY_BLOCK_COPY_BLT::TARGET_MEMORY::TARGET_MEMORY_LOCAL_MEM);
+}
+
+XE3_CORETEST_F(Xe3BcsTests, givenOverriddenMocksValueWhenAppendBlitCommandsBlockCopyThenMocksValueIsSet) {
+    using XY_BLOCK_COPY_BLT = typename FamilyType::XY_BLOCK_COPY_BLT;
+    char buff[1024] = {0};
+    LinearStream stream(buff, 1024);
+    MockGraphicsAllocation clearColorAlloc;
+
+    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
+
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(
+        allocation, 0,
+        allocation, 0,
+        0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
+    auto bltCmd = stream.getSpaceForCmd<XY_BLOCK_COPY_BLT>();
+    *bltCmd = FamilyType::cmdInitXyBlockCopyBlt;
+    bltCmd->setDestinationX2CoordinateRight(1);
+    bltCmd->setDestinationY2CoordinateBottom(1);
+
+    uint32_t mockValue = context->getDevice(0)->getGmmHelper()->getL3EnabledMOCS();
+    uint32_t newValue = mockValue + 1;
+    debugManager.flags.OverrideBlitterMocs.set(newValue);
+
+    const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
+    BlitCommandsHelper<FamilyType>::appendBlitCommandsBlockCopy(blitProperties, *bltCmd, rootDeviceEnvironment);
+
+    EXPECT_EQ(bltCmd->getDestinationMOCS(), newValue);
+    EXPECT_EQ(bltCmd->getSourceMOCS(), newValue);
+}

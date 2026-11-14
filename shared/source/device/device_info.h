@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace NEO {
 
@@ -47,9 +48,10 @@ struct DeviceInfo {
     StackVec<uint32_t, 6> threadsPerEUConfigs;
     uint32_t vendorId;
     uint32_t vmeAvcSupportsPreemption;
-    bool debuggerActive;
-    bool force32BitAddressess;
     std::string name;
+    bool semaphore64bCmdSupport;
+    std::vector<uint32_t> spirvCapabilities;
+    std::vector<std::string> spirvExtensions;
 };
 
 } // namespace NEO

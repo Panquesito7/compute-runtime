@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,7 +8,9 @@
 #pragma once
 #include "shared/source/built_ins/sip_kernel_type.h"
 #include "shared/source/helpers/affinity_mask.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/options.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <functional>
 #include <memory>
@@ -20,6 +22,8 @@ class AubCenter;
 class BindlessHeapsHelper;
 class BuiltIns;
 class CompilerInterface;
+class FrontEndController;
+class SipExternalLib;
 class Debugger;
 class Device;
 class ExecutionEnvironment;
@@ -39,31 +43,36 @@ class ApiGfxCoreHelper;
 class CompilerProductHelper;
 class GraphicsAllocation;
 class ReleaseHelper;
+class AILConfiguration;
+class HostFunctionWorker;
 
 struct AllocationProperties;
 struct HardwareInfo;
 
-struct RootDeviceEnvironment {
+struct RootDeviceEnvironment : NonCopyableClass {
+
   protected:
     std::unique_ptr<HardwareInfo> hwInfo;
 
   public:
-    RootDeviceEnvironment(ExecutionEnvironment &executionEnvironment);
-    RootDeviceEnvironment(RootDeviceEnvironment &) = delete;
+    RootDeviceEnvironment(ExecutionEnvironment &executionEnvironment, uint32_t index);
+    RootDeviceEnvironment(ExecutionEnvironment &executionEnvironment) : RootDeviceEnvironment(executionEnvironment, 0) {}
     MOCKABLE_VIRTUAL ~RootDeviceEnvironment();
 
     MOCKABLE_VIRTUAL const HardwareInfo *getHardwareInfo() const;
     HardwareInfo *getMutableHardwareInfo() const;
+    uint32_t getRootDeviceIndex() const;
     void setHwInfoAndInitHelpers(const HardwareInfo *hwInfo);
+    void setHwInfo(const HardwareInfo *hwInfo);
     bool isFullRangeSvm() const;
     bool isWddmOnLinux() const;
 
     MOCKABLE_VIRTUAL void initAubCenter(bool localMemoryEnabled, const std::string &aubFileName, CommandStreamReceiverType csrType);
-    bool initOsInterface(std::unique_ptr<HwDeviceId> &&hwDeviceId, uint32_t rootDeviceIndex);
+    MOCKABLE_VIRTUAL bool initOsInterface(std::unique_ptr<HwDeviceId> &&hwDeviceId, uint32_t rootDeviceIndex);
     void initOsTime();
     void initGmm();
-    void initDebugger();
     void initDebuggerL0(Device *neoDevice);
+    void initWaitUtils();
     MOCKABLE_VIRTUAL void initDummyAllocation();
     void setDummyBlitProperties(uint32_t rootDeviceIndex);
 
@@ -72,33 +81,52 @@ struct RootDeviceEnvironment {
     GmmHelper *getGmmHelper() const;
     GmmClientContext *getGmmClientContext() const;
     MOCKABLE_VIRTUAL CompilerInterface *getCompilerInterface();
+    MOCKABLE_VIRTUAL SipExternalLib *getSipExternalLibInterface();
     BuiltIns *getBuiltIns();
     BindlessHeapsHelper *getBindlessHeapsHelper() const;
     AssertHandler *getAssertHandler(Device *neoDevice);
-    void createBindlessHeapsHelper(MemoryManager *memoryManager, bool availableDevices, uint32_t rootDeviceIndex, DeviceBitfield deviceBitfield);
-    void limitNumberOfCcs(uint32_t numberOfCcs);
+    void createBindlessHeapsHelper(Device *rootDevice, bool availableDevices);
+
+    FrontEndController *getFrontEndController() const;
+    void createFrontEndController(Device *rootDevice);
+    bool setNumberOfCcs(uint32_t numberOfCcs);
+    uint32_t getNumberOfCcs() const;
     bool isNumberOfCcsLimited() const;
     void initProductHelper();
     void initHelpers();
     void initGfxCoreHelper();
+    void initializeGfxCoreHelperFromHwInfo();
+    void initializeGfxCoreHelperFromProductHelper(bool hwQueuesSupported);
     void initApiGfxCoreHelper();
     void initCompilerProductHelper();
     void initReleaseHelper();
-    ReleaseHelper *getReleaseHelper() const;
+    void initAilConfigurationHelper();
+    const ReleaseHelper &getReleaseHelper() const;
+    AILConfiguration *getAILConfigurationHelper() const;
     template <typename HelperType>
     HelperType &getHelper() const;
     const ProductHelper &getProductHelper() const;
     GraphicsAllocation *getDummyAllocation() const;
+    void releaseDummyAllocation();
 
-    std::unique_ptr<SipKernel> sipKernels[static_cast<uint32_t>(SipKernelType::COUNT)];
+    void setExposeSingleDeviceMode(bool singleDeviceMode) {
+        exposeSingleDevice = singleDeviceMode;
+    }
+    bool isExposeSingleDeviceMode() const {
+        return exposeSingleDevice;
+    }
+
+    HostFunctionWorker *getOrCreateHostFunctionScheduler(int32_t threadsInThreadPoolLimit);
+
+    std::unique_ptr<SipKernel> sipKernels[static_cast<uint32_t>(SipKernelType::count)];
     std::unique_ptr<GmmHelper> gmmHelper;
     std::unique_ptr<OSInterface> osInterface;
     std::unique_ptr<MemoryOperationsHandler> memoryOperationsInterface;
     std::unique_ptr<AubCenter> aubCenter;
-    std::unique_ptr<BindlessHeapsHelper> bindlessHeapsHelper;
     std::unique_ptr<OSTime> osTime;
 
     std::unique_ptr<CompilerInterface> compilerInterface;
+    std::unique_ptr<SipExternalLib> sipExternalLib;
     std::unique_ptr<BuiltIns> builtins;
     std::unique_ptr<Debugger> debugger;
     std::unique_ptr<SWTagsManager> tagsManager;
@@ -107,7 +135,10 @@ struct RootDeviceEnvironment {
     std::unique_ptr<ProductHelper> productHelper;
     std::unique_ptr<CompilerProductHelper> compilerProductHelper;
     std::unique_ptr<ReleaseHelper> releaseHelper;
-
+    std::unique_ptr<AILConfiguration> ailConfiguration;
+    std::unique_ptr<BindlessHeapsHelper> bindlessHeapsHelper;
+    std::unique_ptr<FrontEndController> frontEndController;
+    std::unique_ptr<HostFunctionWorker> hostFunctionScheduler;
     std::unique_ptr<AssertHandler> assertHandler;
 
     ExecutionEnvironment &executionEnvironment;
@@ -120,11 +151,15 @@ struct RootDeviceEnvironment {
 
     bool limitedNumberOfCcs = false;
     bool isWddmOnLinuxEnable = false;
+    bool exposeSingleDevice = false;
     std::once_flag isDummyAllocationInitialized;
     std::unique_ptr<AllocationProperties> dummyBlitProperties;
+    const uint32_t index;
 
   private:
     std::mutex mtx;
 };
+
+static_assert(NEO::NonCopyable<RootDeviceEnvironment>);
 
 } // namespace NEO

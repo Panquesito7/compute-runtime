@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2021 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,11 +19,13 @@ class RootDevice : public Device {
 
     Device *getRootDevice() const override;
     bool isSubDevice() const override { return false; }
+    bool createSingleDeviceEngines();
+    bool createRootDeviceEngine(EngineTypeUsage engineTypeUsage, DeviceBitfield deviceBitfield);
 
   protected:
     bool createEngines() override;
     void createBindlessHeapsHelper() override;
-
+    void createFrontEndController() override;
     void initializeRootCommandStreamReceiver();
 };
 } // namespace NEO

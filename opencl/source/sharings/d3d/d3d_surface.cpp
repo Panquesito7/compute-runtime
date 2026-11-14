@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,8 +26,8 @@ using namespace NEO;
 
 D3DSurface::D3DSurface(Context *context, cl_dx9_surface_info_khr *surfaceInfo, D3D9Surface *surfaceStaging, cl_uint plane,
                        ImagePlane imagePlane, cl_dx9_media_adapter_type_khr adapterType, bool sharedResource, bool lockable)
-    : D3DSharing(context, surfaceInfo->resource, surfaceStaging, plane, sharedResource), adapterType(adapterType),
-      surfaceInfo(*surfaceInfo), lockable(lockable), plane(plane), imagePlane(imagePlane), d3d9Surface(surfaceInfo->resource),
+    : D3DSharing(context, surfaceInfo->resource, surfaceStaging, plane, sharedResource), lockable(lockable), adapterType(adapterType),
+      surfaceInfo(*surfaceInfo), plane(plane), imagePlane(imagePlane), d3d9Surface(surfaceInfo->resource),
       d3d9SurfaceStaging(surfaceStaging) {
     if (sharingFunctions) {
         resourceDevice = sharingFunctions->getDevice();
@@ -41,7 +41,7 @@ Image *D3DSurface::create(Context *context, cl_dx9_surface_info_khr *surfaceInfo
     ImageInfo imgInfo = {};
     cl_image_format imgFormat = {};
     McsSurfaceInfo mcsSurfaceInfo = {};
-    ImagePlane imagePlane = ImagePlane::NO_PLANE;
+    ImagePlane imagePlane = ImagePlane::noPlane;
 
     if (!context || !context->getSharing<D3DSharingFunctions<D3DTypesHelper::D3D9>>() || !context->getSharing<D3DSharingFunctions<D3DTypesHelper::D3D9>>()->getDevice()) {
         err.set(CL_INVALID_CONTEXT);
@@ -55,7 +55,7 @@ Image *D3DSurface::create(Context *context, cl_dx9_surface_info_khr *surfaceInfo
 
     sharingFcns->updateDevice(surfaceInfo->resource);
 
-    imgInfo.imgDesc.imageType = ImageType::Image2D;
+    imgInfo.imgDesc.imageType = ImageType::image2D;
 
     D3D9SurfaceDesc surfaceDesc = {};
     sharingFcns->getTexture2dDesc(&surfaceDesc, surfaceInfo->resource);
@@ -72,8 +72,8 @@ Image *D3DSurface::create(Context *context, cl_dx9_surface_info_khr *surfaceInfo
         return nullptr;
     }
 
-    imgInfo.plane = GmmTypesConverter::convertPlane(imagePlane);
-    auto *clSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &imgFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    imgInfo.plane = static_cast<ImagePlane>(GmmTypesConverter::convertPlane(imagePlane));
+    auto *clSurfaceFormat = Image::getSurfaceFormatFromTable(flags, &imgFormat);
     imgInfo.surfaceFormat = &clSurfaceFormat->surfaceFormat;
 
     bool isSharedResource = false;
@@ -86,18 +86,19 @@ Image *D3DSurface::create(Context *context, cl_dx9_surface_info_khr *surfaceInfo
         AllocationProperties allocProperties(rootDeviceIndex,
                                              false, // allocateMemory
                                              0u,    // size
-                                             AllocationType::SHARED_IMAGE,
+                                             AllocationType::sharedImage,
                                              false, // isMultiStorageAllocation
                                              context->getDeviceBitfieldForAllocation(rootDeviceIndex));
-        alloc = context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(toOsHandle(surfaceInfo->shared_handle), allocProperties,
+        MemoryManager::OsHandleData osHandleData{surfaceInfo->shared_handle};
+        alloc = context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(osHandleData, allocProperties,
                                                                                       false, false, true, nullptr);
         updateImgInfoAndDesc(alloc->getDefaultGmm(), imgInfo, imagePlane, 0u);
     } else {
-        lockable = !(surfaceDesc.Usage & D3DResourceFlags::USAGE_RENDERTARGET) || imagePlane != ImagePlane::NO_PLANE;
+        lockable = !(surfaceDesc.Usage & D3DResourceFlags::USAGE_RENDERTARGET) || imagePlane != ImagePlane::noPlane;
         if (!lockable) {
             sharingFcns->createTexture2d(&surfaceStaging, &surfaceDesc, 0u);
         }
-        if (imagePlane == ImagePlane::PLANE_U || imagePlane == ImagePlane::PLANE_V || imagePlane == ImagePlane::PLANE_UV) {
+        if (imagePlane == ImagePlane::planeU || imagePlane == ImagePlane::planeV || imagePlane == ImagePlane::planeUV) {
             imgInfo.imgDesc.imageWidth /= 2;
             imgInfo.imgDesc.imageHeight /= 2;
         }
@@ -108,7 +109,7 @@ Image *D3DSurface::create(Context *context, cl_dx9_surface_info_khr *surfaceInfo
                                                                                                   memoryProperties, context->getDevice(0)->getHardwareInfo(),
                                                                                                   context->getDeviceBitfieldForAllocation(rootDeviceIndex),
                                                                                                   context->isSingleDeviceContext());
-        allocProperties.allocationType = AllocationType::SHARED_RESOURCE_COPY;
+        allocProperties.allocationType = AllocationType::sharedResourceCopy;
 
         alloc = context->getMemoryManager()->allocateGraphicsMemoryInPreferredPool(allocProperties, nullptr);
 
@@ -121,7 +122,7 @@ Image *D3DSurface::create(Context *context, cl_dx9_surface_info_khr *surfaceInfo
     auto multiGraphicsAllocation = MultiGraphicsAllocation(rootDeviceIndex);
     multiGraphicsAllocation.addAllocation(alloc);
 
-    return Image::createSharedImage(context, surface, mcsSurfaceInfo, std::move(multiGraphicsAllocation), nullptr, flags, 0, clSurfaceFormat, imgInfo, __GMM_NO_CUBE_MAP, 0, 0);
+    return Image::createSharedImage(context, surface, mcsSurfaceInfo, std::move(multiGraphicsAllocation), nullptr, flags, 0, clSurfaceFormat, imgInfo, gmmNoCubeMap, 0, 0, false, retCode);
 }
 
 void D3DSurface::synchronizeObject(UpdateData &updateData) {
@@ -227,48 +228,49 @@ const std::vector<D3DFORMAT> D3DSurface::D3DPlane2Formats =
     {static_cast<D3DFORMAT>(MAKEFOURCC('Y', 'V', '1', '2'))};
 
 cl_int D3DSurface::findImgFormat(D3DFORMAT d3dFormat, cl_image_format &imgFormat, cl_uint plane, ImagePlane &imagePlane) {
-    imagePlane = ImagePlane::NO_PLANE;
-    static const cl_image_format unknown_format = {0, 0};
+    imagePlane = ImagePlane::noPlane;
+    static const cl_image_format unknownFormat = {0, 0};
 
     auto element = D3DtoClFormatConversions.find(d3dFormat);
     if (element == D3DtoClFormatConversions.end()) {
-        imgFormat = unknown_format;
+        imgFormat = unknownFormat;
         return CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
     }
 
     imgFormat = element->second;
-    switch (d3dFormat) {
-    case static_cast<D3DFORMAT>(MAKEFOURCC('N', 'V', '1', '2')):
+    int d3dFormatValue = d3dFormat;
+    switch (d3dFormatValue) {
+    case MAKEFOURCC('N', 'V', '1', '2'):
         switch (plane) {
         case 0:
             imgFormat.image_channel_order = CL_R;
-            imagePlane = ImagePlane::PLANE_Y;
+            imagePlane = ImagePlane::planeY;
             return CL_SUCCESS;
         case 1:
             imgFormat.image_channel_order = CL_RG;
-            imagePlane = ImagePlane::PLANE_UV;
+            imagePlane = ImagePlane::planeUV;
             return CL_SUCCESS;
         default:
-            imgFormat = unknown_format;
+            imgFormat = unknownFormat;
             return CL_INVALID_VALUE;
         }
 
-    case static_cast<D3DFORMAT>(MAKEFOURCC('Y', 'V', '1', '2')):
+    case MAKEFOURCC('Y', 'V', '1', '2'):
         switch (plane) {
         case 0:
-            imagePlane = ImagePlane::PLANE_Y;
+            imagePlane = ImagePlane::planeY;
             return CL_SUCCESS;
 
         case 1:
-            imagePlane = ImagePlane::PLANE_V;
+            imagePlane = ImagePlane::planeV;
             return CL_SUCCESS;
 
         case 2:
-            imagePlane = ImagePlane::PLANE_U;
+            imagePlane = ImagePlane::planeU;
             return CL_SUCCESS;
 
         default:
-            imgFormat = unknown_format;
+            imgFormat = unknownFormat;
             return CL_INVALID_VALUE;
         }
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,13 +9,14 @@
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include "events.h"
-#include "os_events.h"
 
 #include <mutex>
 
 namespace L0 {
+class OsEvents;
+struct OsSysman;
 
-class EventsImp : public Events, NEO::NonCopyableOrMovableClass {
+class EventsImp : public Events, NEO::NonCopyableAndNonMovableClass {
   public:
     void init() override;
     ze_result_t eventRegister(zes_event_type_flags_t events) override;
@@ -23,7 +24,7 @@ class EventsImp : public Events, NEO::NonCopyableOrMovableClass {
     OsEvents *pOsEvents = nullptr;
 
     EventsImp() = default;
-    EventsImp(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    EventsImp(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     ~EventsImp() override;
 
   private:

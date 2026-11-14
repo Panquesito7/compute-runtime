@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,8 @@
 
 #include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/device_binary_format/elf/elf_decoder.h"
-#include "shared/source/helpers/file_io.h"
-#include "shared/test/common/helpers/test_files.h"
-#include "shared/test/common/libult/global_environment.h"
+#include "shared/test/common/mocks/mock_compilers.h"
+#include "shared/test/common/mocks/mock_zebin_wrapper.h"
 
 #include "opencl/source/context/context.h"
 
@@ -23,24 +22,14 @@ using ClLinkProgramTests = ApiTests;
 
 TEST_F(ClLinkProgramTests, GivenValidParamsWhenLinkingProgramThenSuccessIsReturned) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -83,24 +72,14 @@ TEST_F(ClLinkProgramTests, GivenValidParamsWhenLinkingProgramThenSuccessIsReturn
 
 TEST_F(ClLinkProgramTests, GivenCreateLibraryOptionWhenLinkingProgramThenSuccessIsReturned) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -200,9 +179,9 @@ TEST_F(ClLinkProgramTests, GivenProgramsWithSpecConstantsThenSpecConstantsAreEmb
     std::string receivedInput;
     MockCompilerDebugVars igcDebugVars;
     igcDebugVars.receivedInput = &receivedInput;
-    gEnvironment->igcPushDebugVars(igcDebugVars);
+    NEO::igcPushDebugVars(igcDebugVars);
     progDst->link(progDst->getDevices(), "", 3, inputPrograms);
-    gEnvironment->igcPopDebugVars();
+    NEO::igcPopDebugVars();
 
     std::string elfDecodeError;
     std::string elfDecoceWarnings;
@@ -227,11 +206,11 @@ TEST_F(ClLinkProgramTests, GivenProgramsWithSpecConstantsThenSpecConstantsAreEmb
     ASSERT_EQ(sizeof(ir2), elf.sectionHeaders[6].data.size());
     ASSERT_EQ(sizeof(ir3), elf.sectionHeaders[7].data.size());
 
-    auto readSpecConstId = [](NEO::Elf::Elf<NEO::Elf::EI_CLASS_64>::SectionHeaderAndData &section, uint32_t offset) {
+    auto readSpecConstId = [](NEO::Elf::SectionHeaderAndData<NEO::Elf::EI_CLASS_64> &section, uint32_t offset) {
         return *(reinterpret_cast<const uint32_t *>(section.data.begin()) + offset);
     };
 
-    auto readSpecConstValue = [](NEO::Elf::Elf<NEO::Elf::EI_CLASS_64>::SectionHeaderAndData &section, uint32_t offset) {
+    auto readSpecConstValue = [](NEO::Elf::SectionHeaderAndData<NEO::Elf::EI_CLASS_64> &section, uint32_t offset) {
         return *(reinterpret_cast<const uint64_t *>(section.data.begin()) + offset);
     };
 
@@ -250,24 +229,14 @@ TEST_F(ClLinkProgramTests, GivenProgramsWithSpecConstantsThenSpecConstantsAreEmb
 
 TEST_F(ClLinkProgramTests, GivenInvalidCallbackInputWhenLinkProgramThenInvalidValueErrorIsReturned) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -308,24 +277,14 @@ TEST_F(ClLinkProgramTests, GivenInvalidCallbackInputWhenLinkProgramThenInvalidVa
 
 TEST_F(ClLinkProgramTests, GivenValidCallbackInputWhenLinkProgramThenCallbackIsInvoked) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -371,24 +330,14 @@ TEST_F(ClLinkProgramTests, GivenValidCallbackInputWhenLinkProgramThenCallbackIsI
 
 TEST_F(ClLinkProgramTests, givenMultiDeviceProgramWhenLinkingForInvalidDevicesInputThenInvalidDeviceErrorIsReturned) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "level_zero/tools/source/sysman/memory/memory_imp.h"
 
+#include "level_zero/tools/source/sysman/memory/os_memory.h"
 #include "level_zero/tools/source/sysman/sysman_imp.h"
 
 namespace L0 {
@@ -22,10 +23,6 @@ ze_result_t MemoryImp::memoryGetState(zes_mem_state_t *pState) {
 ze_result_t MemoryImp::memoryGetProperties(zes_mem_properties_t *pProperties) {
     *pProperties = memoryProperties;
     return ZE_RESULT_SUCCESS;
-}
-
-ze_result_t MemoryImp::memoryGetBandwidthEx(uint64_t *pReadCounters, uint64_t *pWriteCounters, uint64_t *pMaxBandwidth, uint64_t timeout) {
-    return pOsMemory->getBandwidthEx(pReadCounters, pWriteCounters, pMaxBandwidth, timeout);
 }
 
 void MemoryImp::init() {

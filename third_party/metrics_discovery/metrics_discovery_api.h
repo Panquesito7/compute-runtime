@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2019-2022 Intel Corporation
+Copyright (C) 2019-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -37,7 +37,7 @@ SPDX-License-Identifier: MIT
 //////////////////////////////////////////////////////////////////////////////////
 // API build number:
 //////////////////////////////////////////////////////////////////////////////////
-#define MD_API_BUILD_NUMBER_CURRENT 164
+#define MD_API_BUILD_NUMBER_CURRENT 199
 
 namespace MetricsDiscovery
 {
@@ -69,7 +69,11 @@ namespace MetricsDiscovery
         MD_API_MINOR_NUMBER_10      = 10, // GetGpuCpuTimestamps API function extended by a correlation indicator param
         MD_API_MINOR_NUMBER_11      = 11, // Add availability equations for metric sets
         MD_API_MINOR_NUMBER_12      = 12, // Add support for Information Set in concurrent group
-        MD_API_MINOR_NUMBER_CURRENT = MD_API_MINOR_NUMBER_12,
+        MD_API_MINOR_NUMBER_13      = 13, // Extend API to support flexible metric sets
+        MD_API_MINOR_NUMBER_14      = 14, // Offline calculation support
+        MD_API_MINOR_NUMBER_15      = 15, // Change IO Stream state
+        MD_API_MINOR_NUMBER_16      = 16, // Metrics Aggregation Support
+        MD_API_MINOR_NUMBER_CURRENT = MD_API_MINOR_NUMBER_16,
         MD_API_MINOR_NUMBER_CEIL    = 0xFFFFFFFF
     } MD_API_MINOR_VERSION;
 
@@ -86,15 +90,43 @@ namespace MetricsDiscovery
         CC_WAIT_TIMEOUT            = 5,
         CC_TRY_AGAIN               = 6,
         CC_INTERRUPTED             = 7,
+        CC_NOT_ENOUGH_DATA         = 8,
+        CC_NO_RESULT               = 9,
         CC_ERROR_INVALID_PARAMETER = 40,
         CC_ERROR_NO_MEMORY         = 41,
         CC_ERROR_GENERAL           = 42,
         CC_ERROR_FILE_NOT_FOUND    = 43,
         CC_ERROR_NOT_SUPPORTED     = 44,
-        CC_LAST_1_0                = 45
+        CC_ERROR_ACCESS_DENIED     = 45,
+        CC_LAST_1_0                = 46
     } TCompletionCode;
 
     /* Forward declarations */
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Abstract interface for the adapter group object.
+    //////////////////////////////////////////////////////////////////////////////////
+    class IAdapterGroup_1_6;
+    class IAdapterGroup_1_8;
+    class IAdapterGroup_1_9;
+    class IAdapterGroup_1_10;
+    class IAdapterGroup_1_11;
+    class IAdapterGroup_1_13;
+    class IAdapterGroup_1_14;
+    class IAdapterGroup_1_15;
+    class IAdapterGroup_1_16;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Abstract interface for the GPU adapter object.
+    //////////////////////////////////////////////////////////////////////////////////
+    class IAdapter_1_6;
+    class IAdapter_1_8;
+    class IAdapter_1_9;
+    class IAdapter_1_10;
+    class IAdapter_1_11;
+    class IAdapter_1_13;
+    class IAdapter_1_15;
+    class IAdapter_1_16;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Abstract interface for the GPU metrics root object.
@@ -105,6 +137,9 @@ namespace MetricsDiscovery
     class IMetricsDevice_1_5;
     class IMetricsDevice_1_10;
     class IMetricsDevice_1_11;
+    class IMetricsDevice_1_13;
+    class IMetricsDevice_1_15;
+    class IMetricsDevice_1_16;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Abstract interface for Metrics Device overrides.
@@ -117,8 +152,12 @@ namespace MetricsDiscovery
     //////////////////////////////////////////////////////////////////////////////////
     class IConcurrentGroup_1_0;
     class IConcurrentGroup_1_1;
+    class IConcurrentGroup_1_3;
     class IConcurrentGroup_1_5;
     class IConcurrentGroup_1_11;
+    class IConcurrentGroup_1_13;
+    class IConcurrentGroup_1_15;
+    class IConcurrentGroup_1_16;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Abstract interface for the metric sets mapping to different HW configuration
@@ -130,11 +169,14 @@ namespace MetricsDiscovery
     class IMetricSet_1_4;
     class IMetricSet_1_5;
     class IMetricSet_1_11;
+    class IMetricSet_1_13;
+    class IMetricSet_1_16;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Abstract interface for the metric that is sampled.
     //////////////////////////////////////////////////////////////////////////////////
     class IMetric_1_0;
+    class IMetric_1_13;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Abstract interface for the measurement information (report reason, etc.).
@@ -147,6 +189,21 @@ namespace MetricsDiscovery
     class IEquation_1_0;
 
     //////////////////////////////////////////////////////////////////////////////////
+    // Abstract interface for the metric enumerator object.
+    //////////////////////////////////////////////////////////////////////////////////
+    class IMetricEnumerator_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Abstract interface for the metric prototype object.
+    //////////////////////////////////////////////////////////////////////////////////
+    class IMetricPrototype_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Abstract interface for the calculation context object.
+    //////////////////////////////////////////////////////////////////////////////////
+    class ICalculationContext_1_16;
+
+    //////////////////////////////////////////////////////////////////////////////////
     // Value types:
     //////////////////////////////////////////////////////////////////////////////////
     typedef enum EValueType
@@ -157,6 +214,8 @@ namespace MetricsDiscovery
         VALUE_TYPE_BOOL,
         VALUE_TYPE_CSTRING,
         VALUE_TYPE_BYTEARRAY,
+        VALUE_TYPE_UINT32_RANGE,
+        VALUE_TYPE_UINT64_RANGE,
         // ...
         VALUE_TYPE_LAST,
     } TValueType;
@@ -251,12 +310,12 @@ namespace MetricsDiscovery
         API_TYPE_OGL      = 0x00000010,
         API_TYPE_OGL4_X   = 0x00000020,
         API_TYPE_OCL      = 0x00000040,
-        API_TYPE_MEDIA    = 0x00000080, // Only option would be using DmaBuffer sampling
+        API_TYPE_MEDIA    = 0x00000080, // Obsolete
         API_TYPE_DX12     = 0x00000100,
-        API_TYPE_BBSTREAM = 0x00000200,
+        API_TYPE_BBSTREAM = 0x00000200, // Obsolete
         API_TYPE_VULKAN   = 0x00000400,
         API_TYPE_RESERVED = 0x00000800,
-        API_TYPE_ALL      = 0xffffffff
+        API_TYPE_ALL      = 0xFFFFFFFF
     } TMetricApiType;
 
     //////////////////////////////////////////////////////////////////////////////////
@@ -267,7 +326,7 @@ namespace MetricsDiscovery
         MEASUREMENT_TYPE_SNAPSHOT_IO    = 0x00000001,
         MEASUREMENT_TYPE_SNAPSHOT_QUERY = 0x00000002,
         MEASUREMENT_TYPE_DELTA_QUERY    = 0x00000004,
-        MEASUREMENT_TYPE_ALL            = 0x0000ffff,
+        MEASUREMENT_TYPE_ALL            = 0x0000FFFF,
     } TMeasurementType;
 
     //////////////////////////////////////////////////////////////////////////////////
@@ -287,7 +346,7 @@ namespace MetricsDiscovery
         USAGE_FLAG_TIER_3    = 0x00001000,
         USAGE_FLAG_TIER_4    = 0x00002000,
         USAGE_FLAG_GLASS_JAW = 0x00004000,
-        USAGE_FLAG_ALL       = 0x0000ffff,
+        USAGE_FLAG_ALL       = 0x0000FFFF,
     } TMetricUsageFlag;
 
     //////////////////////////////////////////////////////////////////////////////////
@@ -295,12 +354,13 @@ namespace MetricsDiscovery
     //////////////////////////////////////////////////////////////////////////////////
     typedef enum ESamplingType
     {
-        SAMPLING_TYPE_OA_TIMER   = 0x00000001,
-        SAMPLING_TYPE_OA_EVENT   = 0x00000002,
-        SAMPLING_TYPE_GPU_QUERY  = 0x00000004,
-        SAMPLING_TYPE_DMA_BUFFER = 0x00000008, // Possible future extension for media
-        SAMPLING_TYPE_OAM_TIMER  = 0x00000010,
-        SAMPLING_TYPE_ALL        = 0x0000ffff,
+        SAMPLING_TYPE_OA_TIMER     = 0x00000001,
+        SAMPLING_TYPE_OA_EVENT     = 0x00000002, // Obsolete
+        SAMPLING_TYPE_GPU_QUERY    = 0x00000004, // Obsolete
+        SAMPLING_TYPE_DMA_BUFFER   = 0x00000008, // Obsolete
+        SAMPLING_TYPE_OAM_TIMER    = 0x00000010,
+        SAMPLING_TYPE_OAMERT_TIMER = 0x00000020,
+        SAMPLING_TYPE_ALL          = 0x0000FFFF,
     } TSamplingType;
 
     //////////////////////////////////////////////////////////////////////////////////
@@ -473,6 +533,15 @@ namespace MetricsDiscovery
     } TEngineParams_1_9;
 
     //////////////////////////////////////////////////////////////////////////////////
+    // Global parameters of GPU engine:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SEngineParams_1_13 : public SEngineParams_1_9
+    {
+        uint32_t GtId;
+        uint32_t OaUnit;
+    } TEngineParams_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
     // Global parameters of Adapter Group:
     //////////////////////////////////////////////////////////////////////////////////
     typedef struct SAdapterGroupParams_1_6
@@ -487,14 +556,22 @@ namespace MetricsDiscovery
     //////////////////////////////////////////////////////////////////////////////////
     typedef struct SConcurrentGroupParams_1_0
     {
-        const char* SymbolName;  // For example "PerfMon" or "OA" or "PipeStats"
-        const char* Description; // For example "PerfMon and ODLAT Uncore ring counters"
+        const char* SymbolName;  // For example "OA" or "OAM0" or "PipeStats"
+        const char* Description; // For example "OA Unit Metrics"
         uint32_t    MeasurementTypeMask;
         uint32_t    MetricSetsCount;
         uint32_t    IoMeasurementInformationCount;
         uint32_t    IoGpuContextInformationCount;
 
     } TConcurrentGroupParams_1_0;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Global parameters of Concurrent Group:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SConcurrentGroupParams_1_13 : SConcurrentGroupParams_1_0
+    {
+        const char* StreamEventName;
+    } TConcurrentGroupParams_1_13;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Global parameters of an Override:
@@ -593,6 +670,15 @@ namespace MetricsDiscovery
     {
         const char* AvailabilityEquation;
     } TMetricSetParams_1_11;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Raw counter size and count of Metric set:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SMetricSetParams_1_16 : SMetricSetParams_1_11
+    {
+        uint32_t RawCounterSize;
+        uint32_t RawCounterCount;
+    } TMetricSetParams_1_16;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Metric result types:
@@ -748,6 +834,7 @@ namespace MetricsDiscovery
         EQUATION_ELEM_STD_NORM_GPU_DURATION,     // Action is $Self $GpuCoreClocks FDIV 100 FMUL
         EQUATION_ELEM_STD_NORM_EU_AGGR_DURATION, // Action is $Self $GpuCoreClocks $EuCoresTotalCount UMUL FDIV 100 FMUL
         EQUATION_ELEM_MASK,                      //
+        EQUATION_ELEM_PREV_METRIC_SYMBOL,        // Defined by prev$$"SymbolName", refers to previous metric value in the local set
         EQUATION_ELEM_LAST_1_0
 
     } TEquationElementType;
@@ -787,6 +874,80 @@ namespace MetricsDiscovery
         EQUATION_OPER_FMAX,   // Floating point MAX function, arguments are casted to be 32b floating points, result is a 32b float
         EQUATION_OPER_LAST_1_0
     } TEquationOperation;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Metric prototype option descriptor types:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum EOptionDescriptorType
+    {
+        OPTION_DESCRIPTOR_TYPE_DISAGGREGATION            = 0, // Metric is disaggregated by: slices, xe cores, l3 banks etc
+        OPTION_DESCRIPTOR_TYPE_LATENCY                   = 1, // Latency measurements
+        OPTION_DESCRIPTOR_TYPE_NORMALIZATION_UTILIZATION = 2, // Produces normalization equation: "raw_metric * 100% / cycles / instance_count", metric unit is updated to percent
+        OPTION_DESCRIPTOR_TYPE_NORMALIZATION_AVERAGE     = 3, // Produces normalization equation: "raw_metric / instance_count", metric unit is not changed
+        OPTION_DESCRIPTOR_TYPE_NORMALIZATION_RATE        = 4, // Produces normalization equation: "raw_metric / timestamp", metric unit is updated to per second
+        OPTION_DESCRIPTOR_TYPE_NORMALIZATION_BYTE        = 5, // Produces normalization equation: "raw_metric * N bytes", metric unit is updated to bytes
+        OPTION_DESCRIPTOR_TYPE_LAST
+    } TOptionDescriptorType;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Disaggregation modes:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum EDisaggregationMode
+    {
+        DISAGGREGATION_MODE_NONE       = 0,
+        DISAGGREGATION_MODE_XECORE     = 1,
+        DISAGGREGATION_MODE_L3BANK     = 2,
+        DISAGGREGATION_MODE_SLICE      = 3,
+        DISAGGREGATION_MODE_SQIDI      = 4,
+        DISAGGREGATION_MODE_L3NODE     = 5,
+        DISAGGREGATION_MODE_COPYENGINE = 6,
+        DISAGGREGATION_MODE_CXL        = 7,
+        DISAGGREGATION_MODE_LAST
+    } TDisaggregationMode;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Query modes:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum EQueryMode
+    {
+        QUERY_MODE_NONE            = 0,
+        QUERY_MODE_RENDER          = 1,
+        QUERY_MODE_COMPUTE         = 2,
+        QUERY_MODE_GLOBAL          = 3,
+        QUERY_MODE_GLOBAL_EXTENDED = 4,
+        QUERY_MODE_LAST
+    } TQueryMode;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Query mode masks:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum EQueryModeMask
+    {
+        QUERY_MODE_MASK_NONE            = 0x00000000,
+        QUERY_MODE_MASK_RENDER          = 0x00000001,
+        QUERY_MODE_MASK_COMPUTE         = 0x00000002,
+        QUERY_MODE_MASK_GLOBAL          = 0x00000004,
+        QUERY_MODE_MASK_GLOBAL_EXTENDED = 0x00000008,
+        QUERY_MODE_MASK_ALL             = 0xFFFFFFFF
+    } TQueryModeMask;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // IO Stream states:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum EIoStreamState
+    {
+        IO_STREAM_STATE_DISABLED = 0,
+        IO_STREAM_STATE_ENABLED,
+    } TIoStreamState;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Counters modes in flexible metric sets:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum ECountersMode
+    {
+        COUNTERS_MODE_NORMAL = 0, // 64 Performance Event Counters (64-bit)
+        COUNTERS_MODE_DENSE,      // 128 Performance Event Counters (32-bit)
+    } TCountersMode;
 
     //////////////////////////////////////////////////////////////////////////////////
     // Read params:
@@ -861,6 +1022,69 @@ namespace MetricsDiscovery
     } TMetricParams_1_0;
 
     //////////////////////////////////////////////////////////////////////////////////
+    // Extended global parameters of Metric:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SMetricParams_1_13 : public SMetricParams_1_0
+    {
+        uint32_t QueryModeMask; // Mask values specified in TQueryModeMask
+    } TMetricParams_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Valid value:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SValidValue_1_13
+    {
+        TValueType ValueType;
+        union
+        {
+            uint32_t ValueUInt32;
+            uint64_t ValueUInt64;
+            struct
+            {
+                uint32_t Min;
+                uint32_t Max;
+            } ValueUInt32Range;
+            struct
+            {
+                uint64_t Min;
+                uint64_t Max;
+            } ValueUInt64Range;
+        };
+    } TValidValue_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Global parameters of Metric Prototype:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SMetricPrototypeParams_1_13
+    {
+        const char*         SymbolName;            // Symbol name, used in equations
+        const char*         ShortName;             // Consistent metric name, not changed platform to platform
+        const char*         GroupName;             // VertexShader for example
+        const char*         LongName;              // Hint about the metric shown to users
+        const char*         DxToOglAlias;          // To replace DX pixels with OGL fragments
+        uint32_t            UsageFlagsMask;        //
+        uint32_t            ApiMask;               //
+        TMetricResultType   ResultType;            //
+        const char*         MetricResultUnits;     //
+        TMetricType         MetricType;            //
+        THwUnitType         HwUnitType;            //
+        uint32_t            OptionDescriptorCount; //
+        TDisaggregationMode DisaggregationMode;    //
+        uint32_t            QueryModeMask;         // Mask values specified in TQueryModeMask
+    } TMetricPrototypeParams_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Global parameters of Metric Prototype Option Descriptor:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SMetricPrototypeOptionDescriptor_1_13
+    {
+        TOptionDescriptorType Type;
+        const char*           SymbolName;
+        TValidValue_1_13*     ValidValues;
+        uint32_t              ValidValueCount;
+    } TMetricPrototypeOptionDescriptor_1_13;
+
+    //////////////////////////////////////////////////////////////////////////////////
     // Global parameters of Information:
     //////////////////////////////////////////////////////////////////////////////////
     typedef struct SInformationParams_1_0
@@ -877,6 +1101,69 @@ namespace MetricsDiscovery
         IEquation_1_0*     QueryReadEquation; // Read equation specification for query (accessing calculated delta values)
         TDeltaFunction_1_0 OverflowFunction;  //
     } TInformationParams_1_0;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Calculation context types:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef enum ECalculationContextType
+    {
+        CALCULATION_CONTEXT_TYPE_IO_STREAM,
+        CALCULATION_CONTEXT_TYPE_QUERY,
+        CALCULATION_CONTEXT_TYPE_LAST
+    } TCalculationContextType;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Time windows:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct STimeWindow_1_16
+    {
+        uint64_t Start; // Start timestamp in nanoseconds
+        uint64_t End;   // End timestamp in nanoseconds
+    } TTimeWindow_1_16;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Calculation context descriptor for IO Stream:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SCalculationContextIoStreamDescriptor_1_16
+    {
+        TTimeWindow_1_16* TimeWindows;             // (Optional) Array of time windows, each containing a start time and an end time in nanoseconds
+        uint32_t          TimeWindowCount;         // Number of time windows
+        uint64_t          NsTimeAggregationWindow; // Aggregation window size in nanoseconds; if 0, no aggregation is performed (applies to time windows if provided)
+    } TCalculationContextIoStreamDescriptor_1_16;
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Calculation context descriptor for Query:
+    //////////////////////////////////////////////////////////////////////////////////
+    typedef struct SCalculationContextQueryDescriptor_1_16
+    {
+    } TCalculationContextQueryDescriptor_1_16;
+
+    ///////////////////////////////////////////////////////////////////////////////
+    // Calculation context descriptor:
+    ///////////////////////////////////////////////////////////////////////////////
+    typedef struct SCalculationContextDescriptor_1_16
+    {
+        TCalculationContextType Type; // Type of the descriptor (IO Stream or Query)
+
+        uint32_t          DataSetCount; // Number of metric sets and raw data sets to aggregate (DataSetCount == 1: time aggregation only, DataSetCount > 1: cross-subdevice aggregation)
+        IMetricSet_1_16** MetricSets;   // Array of metric sets from multiple sub devices ([0..DataSetCount]), all metric sets must be identical (e.g. cannot mix ComputeBasic with VectorEngineProfile)
+        int64_t*          TimeOffsets;  // (Optional) Array of time offsets if timestamps are not synchronized across sub devices ([0..DataSetCount])
+
+        union
+        {
+            TCalculationContextIoStreamDescriptor_1_16 IoStreamDescriptor; // Descriptor for IO Stream
+            TCalculationContextQueryDescriptor_1_16    QueryDescriptor;    // Descriptor for Query
+        };
+    } TCalculationContextDescriptor_1_16;
+
+    ///////////////////////////////////////////////////////////////////////////////
+    // Global parameters of calculation context:
+    ///////////////////////////////////////////////////////////////////////////////
+    typedef struct SCalculationContextParams_1_16
+    {
+        uint32_t MetricsCount;
+        uint32_t InformationCount;
+    } TCalculationContextParams_1_16;
 
     ///////////////////////////////////////////////////////////////////////////////
     //
@@ -908,6 +1195,75 @@ namespace MetricsDiscovery
     public:
         virtual ~IMetric_1_0();
         virtual TMetricParams_1_0* GetParams();
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetric_1_13
+    //
+    // Description:
+    //   Updated 1.0 version to use with 1.13 interface version.
+    //   Introduces new metric params.
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetric_1_13 : public IMetric_1_0
+    {
+    public:
+        virtual ~IMetric_1_13();
+        virtual TMetricParams_1_13* GetParams();
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetricPrototype_1_13
+    //
+    // Description:
+    //   Abstract interface for the metric prototype that is sampled.
+    //
+    // New:
+    // - GetParams:                 To get this metric prototype params
+    // - Clone:                     To clone the metric prototype
+    // - GetOptionDescriptor:       To get option descriptor
+    // - SetOption:                 To set option
+    // - ChangeNames:               To change symbol, short, long or unit names
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricPrototype_1_13
+    {
+    public:
+        virtual ~IMetricPrototype_1_13();
+        virtual const TMetricPrototypeParams_1_13*           GetParams( void ) const;
+        virtual IMetricPrototype_1_13*                       Clone( void );
+        virtual const TMetricPrototypeOptionDescriptor_1_13* GetOptionDescriptor( uint32_t index ) const;
+        virtual TCompletionCode                              SetOption( const TOptionDescriptorType optionType, const TTypedValue_1_0* typedValue );
+        virtual TCompletionCode                              ChangeNames( const char* symbolName, const char* shortName, const char* longName, const char* resultUnits );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetricEnumerator_1_13
+    //
+    // Description:
+    //   Abstract interface for the metric enumerator.
+    //
+    // New:
+    // - GetMetricPrototypeCount:     To get the number of available metric prototypes
+    // - GetMetricPrototype:          To get available metric prototype at a given index
+    // - GetMetricPrototypes:         To get a given number of available metric prototypes
+    // - RemoveClonedMetricPrototype: To remove cloned metric prototype
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricEnumerator_1_13
+    {
+    public:
+        virtual ~IMetricEnumerator_1_13();
+        virtual uint32_t               GetMetricPrototypeCount( void );
+        virtual IMetricPrototype_1_13* GetMetricPrototype( const uint32_t index );
+        virtual TCompletionCode        GetMetricPrototypes( const uint32_t index, uint32_t* count, IMetricPrototype_1_13** metrics );
+        virtual TCompletionCode        RemoveClonedMetricPrototype( IMetricPrototype_1_13* clonedPrototype );
     };
 
     ///////////////////////////////////////////////////////////////////////////////
@@ -1059,6 +1415,95 @@ namespace MetricsDiscovery
         virtual TMetricSetParams_1_11* GetParams( void );
     };
 
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetricSet_1_13
+    //
+    // Description:
+    //   Updated 1.11 version to use with 1.13 interface version.
+    //   Adds an ability to create and delete flexible metric sets.
+    //
+    // New:
+    // - Open:              Prepare metric set for adding metrics
+    // - AddMetric:         To add a given metric to flexible metric set
+    // - RemoveMetric:      To remove a given metric from flexible metric set
+    // - Finalize:          To make metric set usable after adding metrics
+    //
+    // Updates:
+    // - GetMetric          Update to 1.13 interface
+    // - AddCustomMetric    Update to 1.13 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricSet_1_13 : public IMetricSet_1_11
+    {
+    public:
+        virtual ~IMetricSet_1_13();
+
+        // New.
+        virtual TCompletionCode Open();
+        virtual TCompletionCode AddMetric( IMetricPrototype_1_13* metricPrototype );
+        virtual TCompletionCode RemoveMetric( IMetricPrototype_1_13* metricPrototype );
+        virtual TCompletionCode Finalize();
+
+        // Updates.
+        virtual IMetric_1_13* GetMetric( uint32_t index );
+
+        using IMetricSet_1_0::AddCustomMetric; // To avoid hiding by 1.13 interface function
+        virtual IMetric_1_13* AddCustomMetric(
+            const char*       symbolName,
+            const char*       shortName,
+            const char*       groupName,
+            const char*       longName,
+            const char*       dxToOglAlias,
+            uint32_t          usageFlagsMask,
+            uint32_t          apiMask,
+            TMetricResultType resultType,
+            const char*       resultUnits,
+            TMetricType       metricType,
+            int64_t           loWatermark,
+            int64_t           hiWatermark,
+            THwUnitType       hwType,
+            const char*       ioReadEquation,
+            const char*       deltaFunction,
+            const char*       queryReadEquation,
+            const char*       normalizationEquation,
+            const char*       maxValueEquation,
+            const char*       signalName,
+            uint32_t          queryModeMask );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetricSet_1_16
+    //
+    // Description:
+    //   Updated 1.13 version to use with 1.16 interface version.
+    //   Adds an ability to calculate async metrics from raw data.
+    //
+    // New:
+    // - CalculateAsyncMetrics: To calculate async metrics from raw data.
+    //
+    // Updates:
+    // - GetParams          Update to 1.16 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricSet_1_16 : public IMetricSet_1_13
+    {
+    public:
+        virtual ~IMetricSet_1_16();
+
+        // New.
+        virtual TCompletionCode CalculateAsyncMetrics( const uint8_t* rawData, uint32_t rawDataSize, TTypedValue_1_0* out, uint32_t outSize, uint32_t* outReportCount, TTypedValue_1_0* outMaxValues, uint32_t outMaxValuesSize );
+
+        // Updates.
+        virtual TMetricSetParams_1_16* GetParams( void );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
     //   IConcurrentGroup_1_0
     //
     // Description:
@@ -1150,6 +1595,90 @@ namespace MetricsDiscovery
     {
     public:
         virtual IMetricSet_1_11* GetMetricSet( uint32_t index );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IConcurrentGroup_1_13
+    //
+    // Description:
+    //   Updated 1.11 version to use with 1.13 interface version.
+    //
+    // Updates:
+    // - GetParams                      Update to 1.13 interface
+    // - GetMetricSet:                  Update to 1.13 interface
+    //
+    // New:
+    // - GetMetricEnumerator:           To get metric enumerator
+    // - GetMetricEnumeratorFromFile:   To get metric enumerator from file
+    // - AddMetricSet:                  To create flexible metric set
+    // - RemoveMetricSet:               To delete flexible metric set
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IConcurrentGroup_1_13 : public IConcurrentGroup_1_11
+    {
+    public:
+        // Updates.
+        virtual TConcurrentGroupParams_1_13* GetParams( void );
+        virtual IMetricSet_1_13*             GetMetricSet( uint32_t index );
+
+        // New.
+        virtual IMetricEnumerator_1_13* GetMetricEnumerator( void );
+        virtual IMetricEnumerator_1_13* GetMetricEnumeratorFromFile( const char* fileName );
+        virtual IMetricSet_1_13*        AddMetricSet( const char* symbolName, const char* shortName );
+        virtual TCompletionCode         RemoveMetricSet( IMetricSet_1_13* metricSet );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IConcurrentGroup_1_15
+    //
+    // Description:
+    //   Updated 1.13 version to use with 1.15 interface version.
+    //
+    // Updates:
+    // - OpenIoStream:                  Update to 1.15 interface
+    //
+    // New:
+    // - ChangeIoStreamState:           To change IO stream state
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IConcurrentGroup_1_15 : public IConcurrentGroup_1_13
+    {
+    public:
+        // Updates.
+        using IConcurrentGroup_1_13::OpenIoStream; // To avoid hiding by 1.15 interface function
+
+        virtual TCompletionCode OpenIoStream( IMetricSet_1_13* metricSet, uint32_t processId, uint32_t* nsTimerPeriod, uint32_t* oaBufferSize, TIoStreamState state );
+        virtual TCompletionCode ChangeIoStreamState( TIoStreamState state, uint32_t* nsTimerPeriod );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IConcurrentGroup_1_16
+    //
+    // Description:
+    //   Updated 1.15 version to use with 1.16 interface version.
+    //
+    // Updates:
+    // - GetMetricSet:                  Update to 1.16 interface
+    // - AddMetricSet:                  Update to 1.16 interface
+    // - RemoveMetricSet:               Update to 1.16 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IConcurrentGroup_1_16 : public IConcurrentGroup_1_15
+    {
+    public:
+        // Updates.
+        using IConcurrentGroup_1_15::AddMetricSet;    // To avoid hiding by 1.16 interface function
+        using IConcurrentGroup_1_15::RemoveMetricSet; // To avoid hiding by 1.16 interface function
+
+        virtual IMetricSet_1_16* GetMetricSet( uint32_t index );
+        virtual IMetricSet_1_16* AddMetricSet( const char* symbolName, const char* shortName, TCountersMode mode );
+        virtual TCompletionCode  RemoveMetricSet( IMetricSet_1_16* metricSet );
     };
 
     ///////////////////////////////////////////////////////////////////////////////
@@ -1306,6 +1835,88 @@ namespace MetricsDiscovery
     ///////////////////////////////////////////////////////////////////////////////
     //
     // Class:
+    //   IMetricsDevice_1_13
+    //
+    // Description:
+    //   Updated 1.11 version to use with 1.13 interface version.
+    //
+    // Updates:
+    // - GetConcurrentGroup:            Update to 1.13 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricsDevice_1_13 : public IMetricsDevice_1_11
+    {
+    public:
+        virtual IConcurrentGroup_1_13* GetConcurrentGroup( uint32_t index );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetricsDevice_1_15
+    //
+    // Description:
+    //   Updated 1.13 version to use with 1.15 interface version.
+    //
+    // Updates:
+    // - GetConcurrentGroup:            Update to 1.15 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricsDevice_1_15 : public IMetricsDevice_1_13
+    {
+    public:
+        virtual IConcurrentGroup_1_15* GetConcurrentGroup( uint32_t index );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IMetricsDevice_1_16
+    //
+    // Description:
+    //   Updated 1.15 version to use with 1.16 interface version.
+    //
+    // Updates:
+    // - GetConcurrentGroup:            Update to 1.16 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IMetricsDevice_1_16 : public IMetricsDevice_1_15
+    {
+    public:
+        virtual IConcurrentGroup_1_16* GetConcurrentGroup( uint32_t index );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   Calculation Context interface.
+    //
+    // New:
+    // - GetParams:                     To get CalculationContext params
+    // - GetMetric:                     To get particular metric
+    // - GetInformation:                To get particular information
+    // - AggregateData:                 To aggregate data
+    // - CalculateMetrics:              To calculate normalized metrics/information from the raw data
+    // - CalculateSingleWindowMetrics:  To aggregate data for only a single aggregation window and to calculate normalized metrics/information from aggregated raw data
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class ICalculationContext_1_16
+    {
+    public:
+        virtual ~ICalculationContext_1_16();
+
+        virtual const TCalculationContextParams_1_16* GetParams( void ) const;
+        virtual IMetric_1_13*                         GetMetric( uint32_t index );
+        virtual IInformation_1_0*                     GetInformation( uint32_t index );
+
+        virtual TCompletionCode AggregateData( const uint8_t** rawData, const uint32_t* rawDataSizes, uint8_t* outAggregatedRawData, uint32_t* outAggregatedRawDataSize, bool lastDataPortion );
+        virtual TCompletionCode CalculateMetrics( const uint8_t* rawData, uint32_t rawDataSize, TTypedValue_1_0* out, uint32_t outSize, uint32_t* outReportCount, TTypedValue_1_0* outMaxValues, uint32_t outMaxValuesSize );
+        virtual TCompletionCode CalculateSingleWindowMetrics( const uint8_t** rawData, const uint32_t* rawDataSizes, uint32_t* outProcessedRawDataCount, TTypedValue_1_0* out, uint32_t outSize, TTypedValue_1_0* outMaxValues, uint32_t outMaxValuesSize, bool lastDataPortion );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
     //   IAdapter_1_6
     //
     // Description:
@@ -1399,10 +2010,10 @@ namespace MetricsDiscovery
     class IAdapter_1_10 : public IAdapter_1_9
     {
     public:
-        using IAdapter_1_6::OpenMetricsDevice;
-        using IAdapter_1_6::OpenMetricsDeviceFromFile;
-        using IAdapter_1_9::OpenMetricsSubDevice;
-        using IAdapter_1_9::OpenMetricsSubDeviceFromFile;
+        using IAdapter_1_6::OpenMetricsDevice;            // To avoid hiding by 1.10 interface function
+        using IAdapter_1_6::OpenMetricsDeviceFromFile;    // To avoid hiding by 1.10 interface function
+        using IAdapter_1_9::OpenMetricsSubDevice;         // To avoid hiding by 1.10 interface function
+        using IAdapter_1_9::OpenMetricsSubDeviceFromFile; // To avoid hiding by 1.10 interface function
 
         virtual TCompletionCode OpenMetricsDevice( IMetricsDevice_1_10** metricsDevice );
         virtual TCompletionCode OpenMetricsDeviceFromFile( const char* fileName, void* openParams, IMetricsDevice_1_10** metricsDevice );
@@ -1432,10 +2043,10 @@ namespace MetricsDiscovery
     {
     public:
         // Updates.
-        using IAdapter_1_10::OpenMetricsDevice;
-        using IAdapter_1_10::OpenMetricsDeviceFromFile;
-        using IAdapter_1_10::OpenMetricsSubDevice;
-        using IAdapter_1_10::OpenMetricsSubDeviceFromFile;
+        using IAdapter_1_10::OpenMetricsDevice;            // To avoid hiding by 1.11 interface function
+        using IAdapter_1_10::OpenMetricsDeviceFromFile;    // To avoid hiding by 1.11 interface function
+        using IAdapter_1_10::OpenMetricsSubDevice;         // To avoid hiding by 1.11 interface function
+        using IAdapter_1_10::OpenMetricsSubDeviceFromFile; // To avoid hiding by 1.11 interface function
 
         virtual TCompletionCode OpenMetricsDevice( IMetricsDevice_1_11** metricsDevice );
         virtual TCompletionCode OpenMetricsDeviceFromFile( const char* fileName, void* openParams, IMetricsDevice_1_11** metricsDevice );
@@ -1447,6 +2058,102 @@ namespace MetricsDiscovery
         virtual TCompletionCode SaveMetricsDeviceToFile( const char* fileName, void* saveParams, IMetricsDevice_1_11* metricsDevice, const uint32_t minMajorApiVersion, const uint32_t minMinorApiVersion );
     };
 
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapter_1_13
+    //
+    // Description:
+    //   Abstract interface for GPU adapter.
+    //
+    // Updates:
+    // - OpenMetricsDevice:             Update to 1.13 interface
+    // - OpenMetricsDeviceFromFile:     Update to 1.13 interface
+    // - OpenMetricsSubDevice:          Update to 1.13 interface
+    // - OpenMetricsSubDeviceFromFile:  Update to 1.13 interface
+    // - GetEngineParams:               Update to 1.13 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapter_1_13 : public IAdapter_1_11
+    {
+    public:
+        // Updates.
+        using IAdapter_1_11::OpenMetricsDevice;            // To avoid hiding by 1.13 interface function
+        using IAdapter_1_11::OpenMetricsDeviceFromFile;    // To avoid hiding by 1.13 interface function
+        using IAdapter_1_11::OpenMetricsSubDevice;         // To avoid hiding by 1.13 interface function
+        using IAdapter_1_11::OpenMetricsSubDeviceFromFile; // To avoid hiding by 1.13 interface function
+
+        virtual TCompletionCode OpenMetricsDevice( IMetricsDevice_1_13** metricsDevice );
+        virtual TCompletionCode OpenMetricsDeviceFromFile( const char* fileName, void* openParams, IMetricsDevice_1_13** metricsDevice );
+        virtual TCompletionCode OpenMetricsSubDevice( const uint32_t subDeviceIndex, IMetricsDevice_1_13** metricsDevice );
+        virtual TCompletionCode OpenMetricsSubDeviceFromFile( const uint32_t subDeviceIndex, const char* fileName, void* openParams, IMetricsDevice_1_13** metricsDevice );
+
+        virtual const TEngineParams_1_13* GetEngineParams( const uint32_t subDeviceIndex, const uint32_t engineIndex );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapter_1_15
+    //
+    // Description:
+    //   Abstract interface for GPU adapter.
+    //
+    // Updates:
+    // - OpenMetricsDevice:             Update to 1.15 interface
+    // - OpenMetricsDeviceFromFile:     Update to 1.15 interface
+    // - OpenMetricsSubDevice:          Update to 1.15 interface
+    // - OpenMetricsSubDeviceFromFile:  Update to 1.15 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapter_1_15 : public IAdapter_1_13
+    {
+    public:
+        // Updates.
+        using IAdapter_1_13::OpenMetricsDevice;            // To avoid hiding by 1.15 interface function
+        using IAdapter_1_13::OpenMetricsDeviceFromFile;    // To avoid hiding by 1.15 interface function
+        using IAdapter_1_13::OpenMetricsSubDevice;         // To avoid hiding by 1.15 interface function
+        using IAdapter_1_13::OpenMetricsSubDeviceFromFile; // To avoid hiding by 1.15 interface function
+
+        virtual TCompletionCode OpenMetricsDevice( IMetricsDevice_1_15** metricsDevice );
+        virtual TCompletionCode OpenMetricsDeviceFromFile( const char* fileName, void* openParams, IMetricsDevice_1_15** metricsDevice );
+        virtual TCompletionCode OpenMetricsSubDevice( const uint32_t subDeviceIndex, IMetricsDevice_1_15** metricsDevice );
+        virtual TCompletionCode OpenMetricsSubDeviceFromFile( const uint32_t subDeviceIndex, const char* fileName, void* openParams, IMetricsDevice_1_15** metricsDevice );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapter_1_16
+    //
+    // Description:
+    //   Abstract interface for GPU adapter.
+    //
+    // Updates:
+    // - OpenMetricsDevice:             Update to 1.16 interface
+    // - OpenMetricsDeviceFromFile:     Update to 1.16 interface
+    // - OpenMetricsSubDevice:          Update to 1.16 interface
+    // - OpenMetricsSubDeviceFromFile:  Update to 1.16 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapter_1_16 : public IAdapter_1_15
+    {
+    public:
+        // Updates.
+        using IAdapter_1_15::OpenMetricsDevice;            // To avoid hiding by 1.16 interface function
+        using IAdapter_1_15::OpenMetricsDeviceFromFile;    // To avoid hiding by 1.16 interface function
+        using IAdapter_1_15::OpenMetricsSubDevice;         // To avoid hiding by 1.16 interface function
+        using IAdapter_1_15::OpenMetricsSubDeviceFromFile; // To avoid hiding by 1.16 interface function
+
+        virtual TCompletionCode OpenMetricsDevice( IMetricsDevice_1_16** metricsDevice );
+        virtual TCompletionCode OpenMetricsDeviceFromFile( const char* fileName, void* openParams, IMetricsDevice_1_16** metricsDevice );
+        virtual TCompletionCode OpenMetricsSubDevice( const uint32_t subDeviceIndex, IMetricsDevice_1_16** metricsDevice );
+        virtual TCompletionCode OpenMetricsSubDeviceFromFile( const uint32_t subDeviceIndex, const char* fileName, void* openParams, IMetricsDevice_1_16** metricsDevice );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
     //   IAdapterGroup_1_6
     //
     // Description:
@@ -1539,45 +2246,164 @@ namespace MetricsDiscovery
         virtual IAdapter_1_11* GetAdapter( uint32_t index );
     };
 
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapterGroup_1_13
+    //
+    // Description:
+    //   Abstract interface for the GPU adapters root object.
+    //
+    // Updates:
+    // - GetAdapter:                    Update to 1.13 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapterGroup_1_13 : public IAdapterGroup_1_11
+    {
+    public:
+        virtual IAdapter_1_13* GetAdapter( uint32_t index );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapterGroup_1_14
+    //
+    // Description:
+    //   Abstract interface for the GPU adapters root object.
+    //
+    // New:
+    // - OpenOfflineMetricsDeviceFromBuffer: To open offline metrics device from buffer
+    // - CloseOfflineMetricsDevice:          To close offline metrics device
+    // - SaveMetricsDeviceToBuffer:          To save metrics device with chosen sets to buffer
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapterGroup_1_14 : public IAdapterGroup_1_13
+    {
+    public:
+        virtual TCompletionCode OpenOfflineMetricsDeviceFromBuffer( uint8_t* buffer, uint32_t bufferSize, IMetricsDevice_1_13** metricsDevice );
+        virtual TCompletionCode CloseOfflineMetricsDevice( IMetricsDevice_1_13* metricsDevice );
+        virtual TCompletionCode SaveMetricsDeviceToBuffer( IMetricsDevice_1_13* metricsDevice, IMetricSet_1_13** metricSets, uint32_t metricSetCount, uint8_t* buffer, uint32_t* bufferSize, const uint32_t minMajorApiVersion, const uint32_t minMinorApiVersion );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapterGroup_1_15
+    //
+    // Description:
+    //   Abstract interface for the GPU adapters root object.
+    //
+    // Updates:
+    // - GetAdapter:                         Update to 1.15 interface
+    // - OpenOfflineMetricsDeviceFromBuffer: Update to 1.15 interface
+    // - CloseOfflineMetricsDevice:          Update to 1.15 interface
+    // - SaveMetricsDeviceToBuffer:          Update to 1.15 interface
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapterGroup_1_15 : public IAdapterGroup_1_14
+    {
+    public:
+        // Updates.
+        using IAdapterGroup_1_14::OpenOfflineMetricsDeviceFromBuffer; // To avoid hiding by 1.15 interface function
+        using IAdapterGroup_1_14::CloseOfflineMetricsDevice;          // To avoid hiding by 1.15 interface function
+        using IAdapterGroup_1_14::SaveMetricsDeviceToBuffer;          // To avoid hiding by 1.15 interface function
+
+        virtual IAdapter_1_15* GetAdapter( uint32_t index );
+
+        virtual TCompletionCode OpenOfflineMetricsDeviceFromBuffer( uint8_t* buffer, uint32_t bufferSize, IMetricsDevice_1_15** metricsDevice );
+        virtual TCompletionCode CloseOfflineMetricsDevice( IMetricsDevice_1_15* metricsDevice );
+        virtual TCompletionCode SaveMetricsDeviceToBuffer( IMetricsDevice_1_15* metricsDevice, IMetricSet_1_13** metricSets, uint32_t metricSetCount, uint8_t* buffer, uint32_t* bufferSize, const uint32_t minMajorApiVersion, const uint32_t minMinorApiVersion );
+    };
+
+    ///////////////////////////////////////////////////////////////////////////////
+    //
+    // Class:
+    //   IAdapterGroup_1_16
+    //
+    // Description:
+    //   Abstract interface for the GPU adapters root object.
+    //
+    // Updates:
+    // - GetAdapter:                         Update to 1.16 interface
+    // - OpenOfflineMetricsDeviceFromBuffer: Update to 1.16 interface
+    // - CloseOfflineMetricsDevice:          Update to 1.16 interface
+    // - SaveMetricsDeviceToBuffer:          Update to 1.16 interface
+    //
+    // New:
+    // - CreateCalculationContext:           To create calculation context
+    // - DestroyCalculationContext:          To destroy calculation context
+    //
+    ///////////////////////////////////////////////////////////////////////////////
+    class IAdapterGroup_1_16 : public IAdapterGroup_1_15
+    {
+    public:
+        // Updates.
+        using IAdapterGroup_1_15::OpenOfflineMetricsDeviceFromBuffer; // To avoid hiding by 1.16 interface function
+        using IAdapterGroup_1_15::CloseOfflineMetricsDevice;          // To avoid hiding by 1.16 interface function
+        using IAdapterGroup_1_15::SaveMetricsDeviceToBuffer;          // To avoid hiding by 1.16 interface function
+
+        virtual IAdapter_1_16* GetAdapter( uint32_t index );
+
+        virtual TCompletionCode OpenOfflineMetricsDeviceFromBuffer( uint8_t* buffer, uint32_t bufferSize, IMetricsDevice_1_16** metricsDevice );
+        virtual TCompletionCode CloseOfflineMetricsDevice( IMetricsDevice_1_16* metricsDevice );
+        virtual TCompletionCode SaveMetricsDeviceToBuffer( IMetricsDevice_1_16* metricsDevice, IMetricSet_1_16** metricSets, uint32_t metricSetCount, uint8_t* buffer, uint32_t* bufferSize, const uint32_t minMajorApiVersion, const uint32_t minMinorApiVersion );
+
+        // New.
+        virtual TCompletionCode CreateCalculationContext( TCalculationContextDescriptor_1_16* calculationDescriptor, ICalculationContext_1_16** calculationContext );
+        virtual TCompletionCode DestroyCalculationContext( ICalculationContext_1_16* calculationContext );
+    };
+
     //////////////////////////////////////////////////////////////////////////////////
     // Latest interfaces and typedef structs versions:
     //////////////////////////////////////////////////////////////////////////////////
-    using IAdapterGroupLatest               = IAdapterGroup_1_11;
-    using IAdapterLatest                    = IAdapter_1_11;
-    using IConcurrentGroupLatest            = IConcurrentGroup_1_11;
-    using IEquationLatest                   = IEquation_1_0;
-    using IInformationLatest                = IInformation_1_0;
-    using IMetricLatest                     = IMetric_1_0;
-    using IMetricSetLatest                  = IMetricSet_1_11;
-    using IMetricsDeviceLatest              = IMetricsDevice_1_11;
-    using IOverrideLatest                   = IOverride_1_2;
-    using TAdapterGroupParamsLatest         = TAdapterGroupParams_1_6;
-    using TAdapterIdLatest                  = TAdapterId_1_6;
-    using TAdapterIdLuidLatest              = TAdapterIdLuid_1_6;
-    using TAdapterIdMajorMinorLatest        = TAdapterIdMajorMinor_1_6;
-    using TAdapterParamsLatest              = TAdapterParams_1_9;
-    using TApiSpecificIdLatest              = TApiSpecificId_1_0;
-    using TApiVersionLatest                 = TApiVersion_1_0;
-    using TByteArrayLatest                  = TByteArray_1_0;
-    using TConcurrentGroupParamsLatest      = TConcurrentGroupParams_1_0;
-    using TDeltaFunctionLatest              = TDeltaFunction_1_0;
-    using TEngineIdClassInstanceLatest      = TEngineIdClassInstance_1_9;
-    using TEngineIdLatest                   = TEngineId_1_9;
-    using TEngineParamsLatest               = TEngineParams_1_9;
-    using TEquationElementLatest            = TEquationElement_1_0;
-    using TGlobalSymbolLatest               = TGlobalSymbol_1_0;
-    using TInformationParamsLatest          = TInformationParams_1_0;
-    using TMetricParamsLatest               = TMetricParams_1_0;
-    using TMetricSetParamsLatest            = TMetricSetParams_1_11;
-    using TMetricsDeviceParamsLatest        = TMetricsDeviceParams_1_2;
-    using TOverrideParamsLatest             = TOverrideParams_1_2;
-    using TReadParamsLatest                 = TReadParams_1_0;
-    using TSetDriverOverrideParamsLatest    = TSetDriverOverrideParams_1_2;
-    using TSetFrequencyOverrideParamsLatest = TSetFrequencyOverrideParams_1_2;
-    using TSetOverrideParamsLatest          = TSetOverrideParams_1_2;
-    using TSetQueryOverrideParamsLatest     = TSetQueryOverrideParams_1_2;
-    using TSubDeviceParamsLatest            = TSubDeviceParams_1_9;
-    using TTypedValueLatest                 = TTypedValue_1_0;
+    using IAdapterGroupLatest                         = IAdapterGroup_1_16;
+    using IAdapterLatest                              = IAdapter_1_16;
+    using ICalculationContextLatest                   = ICalculationContext_1_16;
+    using IConcurrentGroupLatest                      = IConcurrentGroup_1_16;
+    using IEquationLatest                             = IEquation_1_0;
+    using IInformationLatest                          = IInformation_1_0;
+    using IMetricEnumeratorLatest                     = IMetricEnumerator_1_13;
+    using IMetricLatest                               = IMetric_1_13;
+    using IMetricPrototypeLatest                      = IMetricPrototype_1_13;
+    using IMetricSetLatest                            = IMetricSet_1_16;
+    using IMetricsDeviceLatest                        = IMetricsDevice_1_16;
+    using IOverrideLatest                             = IOverride_1_2;
+    using TAdapterGroupParamsLatest                   = TAdapterGroupParams_1_6;
+    using TAdapterIdLatest                            = TAdapterId_1_6;
+    using TAdapterIdLuidLatest                        = TAdapterIdLuid_1_6;
+    using TAdapterIdMajorMinorLatest                  = TAdapterIdMajorMinor_1_6;
+    using TAdapterParamsLatest                        = TAdapterParams_1_9;
+    using TApiSpecificIdLatest                        = TApiSpecificId_1_0;
+    using TApiVersionLatest                           = TApiVersion_1_0;
+    using TByteArrayLatest                            = TByteArray_1_0;
+    using TCalculationContextDescriptorLatest         = TCalculationContextDescriptor_1_16;
+    using TCalculationContextIoStreamDescriptorLatest = TCalculationContextIoStreamDescriptor_1_16;
+    using TCalculationContextParamsLatest             = TCalculationContextParams_1_16;
+    using TCalculationContextQueryDescriptorLatest    = TCalculationContextQueryDescriptor_1_16;
+    using TConcurrentGroupParamsLatest                = TConcurrentGroupParams_1_13;
+    using TDeltaFunctionLatest                        = TDeltaFunction_1_0;
+    using TEngineIdClassInstanceLatest                = TEngineIdClassInstance_1_9;
+    using TEngineIdLatest                             = TEngineId_1_9;
+    using TEngineParamsLatest                         = TEngineParams_1_13;
+    using TEquationElementLatest                      = TEquationElement_1_0;
+    using TGlobalSymbolLatest                         = TGlobalSymbol_1_0;
+    using TInformationParamsLatest                    = TInformationParams_1_0;
+    using TMetricParamsLatest                         = TMetricParams_1_13;
+    using TMetricPrototypeOptionDescriptorLatest      = TMetricPrototypeOptionDescriptor_1_13;
+    using TMetricPrototypeParamsLatest                = TMetricPrototypeParams_1_13;
+    using TMetricSetParamsLatest                      = TMetricSetParams_1_16;
+    using TMetricsDeviceParamsLatest                  = TMetricsDeviceParams_1_2;
+    using TOverrideParamsLatest                       = TOverrideParams_1_2;
+    using TReadParamsLatest                           = TReadParams_1_0;
+    using TSetDriverOverrideParamsLatest              = TSetDriverOverrideParams_1_2;
+    using TSetFrequencyOverrideParamsLatest           = TSetFrequencyOverrideParams_1_2;
+    using TSetOverrideParamsLatest                    = TSetOverrideParams_1_2;
+    using TSetQueryOverrideParamsLatest               = TSetQueryOverrideParams_1_2;
+    using TSubDeviceParamsLatest                      = TSubDeviceParams_1_9;
+    using TTimeWindowLatest                           = TTimeWindow_1_16;
+    using TTypedValueLatest                           = TTypedValue_1_0;
+    using TValidValueLatest                           = TValidValue_1_13;
 
 #ifdef __cplusplus
     extern "C"

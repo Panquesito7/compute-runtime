@@ -1,26 +1,32 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/xe_hpg_core/hw_cmds_xe_hpg_core_base.h"
+
 #include "level_zero/core/source/cmdlist/cmdlist_hw.h"
 #include "level_zero/core/source/cmdlist/cmdlist_hw.inl"
 #include "level_zero/core/source/cmdlist/cmdlist_hw_dg2_and_pvc.inl"
+#include "level_zero/core/source/cmdlist/cmdlist_hw_gen12lp_to_xe3.inl"
+#include "level_zero/core/source/cmdlist/cmdlist_hw_gen12lp_to_xe3p.inl"
 #include "level_zero/core/source/cmdlist/cmdlist_hw_immediate.h"
 #include "level_zero/core/source/cmdlist/cmdlist_hw_immediate.inl"
 #include "level_zero/core/source/cmdlist/cmdlist_hw_xehp_and_later.inl"
 
 #include "cmdlist_extended.inl"
-#include "hw_cmds_xe_hpg_core_base.h"
+#include "implicit_args.h"
 
 namespace L0 {
 
+static constexpr auto gfxCoreFamily = IGFX_XE_HPG_CORE;
+
 template <>
-void CommandListCoreFamily<IGFX_XE_HPG_CORE>::applyMemoryRangesBarrier(uint32_t numRanges,
-                                                                       const size_t *pRangeSizes,
-                                                                       const void **pRanges) {
+void CommandListCoreFamily<gfxCoreFamily>::applyMemoryRangesBarrier(uint32_t numRanges,
+                                                                    const size_t *pRangeSizes,
+                                                                    const void **pRanges) {
 
     NEO::LinearStream *commandStream = commandContainer.getCommandStream();
     NEO::SVMAllocsManager *svmAllocsManager =
@@ -57,13 +63,16 @@ void CommandListCoreFamily<IGFX_XE_HPG_CORE>::applyMemoryRangesBarrier(uint32_t 
     }
     for (size_t subrangeNumber = 0; subrangeNumber < subranges.size(); subrangeNumber += NEO::maxFlushSubrangeCount) {
         size_t rangeCount = subranges.size() <= subrangeNumber + NEO::maxFlushSubrangeCount ? subranges.size() - subrangeNumber : NEO::maxFlushSubrangeCount;
-        NEO::Range<NEO::L3Range> range = createRange(subranges.begin() + subrangeNumber, rangeCount);
+        std::span<NEO::L3Range> range = {subranges.begin() + subrangeNumber, rangeCount};
 
         NEO::flushGpuCache<GfxFamily>(commandStream, range, postSyncAddressToFlush, device->getHwInfo());
     }
 }
 
-template struct CommandListCoreFamily<IGFX_XE_HPG_CORE>;
-template struct CommandListCoreFamilyImmediate<IGFX_XE_HPG_CORE>;
+template struct CommandListCoreFamily<gfxCoreFamily>;
+template struct CommandListCoreFamilyImmediate<gfxCoreFamily>;
+
+static CommandListPopulateFactory<gfxCoreFamily, CommandListCoreFamily<gfxCoreFamily>> populateXeHpgCore;
+static CommandListImmediatePopulateFactory<gfxCoreFamily, CommandListCoreFamilyImmediate<gfxCoreFamily>> populateXeHpgCoreImmediate;
 
 } // namespace L0

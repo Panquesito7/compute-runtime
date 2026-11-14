@@ -1,0 +1,950 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_container/command_encoder.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/unit_test/mocks/mock_dispatch_kernel_encoder_interface.h"
+
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
+#include "level_zero/core/source/event/event.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/in_order_cmd_list_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_event.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_module.h"
+#include "level_zero/core/test/unit_tests/sources/helper/ze_object_utils.h"
+
+namespace L0 {
+namespace ult {
+
+HWTEST_EXCLUDE_PRODUCT(AppendMemoryCopyTests, givenCopyCommandListWhenTimestampPassedToMemoryCopyThenAppendProfilingCalledOnceBeforeAndAfterCommand, IGFX_XE3P_CORE);
+HWTEST_EXCLUDE_PRODUCT(AppendMemoryCopyTests, givenCopyCommandListWhenTimestampPassedToMemoryCopyRegionBlitThenTimeStampRegistersAreAdded, IGFX_XE3P_CORE);
+HWTEST_EXCLUDE_PRODUCT(InOrderCmdListTests, givenCmdListWhenAskingForQwordDataSizeThenReturnFalse, IGFX_XE3P_CORE);
+
+using CommandListAppendLaunchKernelXe3p = Test<ModuleFixture>;
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3p, givenCmdListWhenAskingForQwordDataSizeThenReturnTrue) {
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+
+    EXPECT_TRUE(commandList->isQwordInOrderCounter());
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3p, givenScratchPointerBeyondInlineDataWhenAddPatchScratchAddressThenPatchTargetsCrossThreadData) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    constexpr auto inlineDataSize = WalkerType::getInlineDataSize();
+
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u));
+    pCommandList->heaplessModeEnabled = true;
+    pCommandList->scratchAddressPatchingEnabled = true;
+
+    NEO::KernelDescriptor kernelDescriptor{};
+    kernelDescriptor.kernelAttributes.flags.passInlineData = true;
+    const auto scratchOffset = static_cast<NEO::InlineDataOffset>(inlineDataSize + 8u);
+    kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.offset = scratchOffset;
+    kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.pointerSize = 8u;
+
+    uint64_t crossThreadStorage[8] = {};
+    NEO::EncodeDispatchKernelArgs dispatchKernelArgs{};
+    dispatchKernelArgs.outWalkerPtr = reinterpret_cast<void *>(0x1000);
+    dispatchKernelArgs.outWalkerGpuVa = 0x1000u;
+    dispatchKernelArgs.outCrossThreadDataPtr = crossThreadStorage;
+    dispatchKernelArgs.outCrossThreadDataGpuVa = 0x555000u;
+
+    CmdListKernelLaunchParams launchParams{};
+    pCommandList->addPatchScratchAddress(pCommandList->commandsToPatch, dispatchKernelArgs, kernelDescriptor, launchParams, true, false);
+
+    ASSERT_EQ(1u, pCommandList->commandsToPatch.size());
+    auto &patch = std::get<PatchComputeWalkerInlineDataScratch>(pCommandList->commandsToPatch[0]);
+    EXPECT_EQ(static_cast<void *>(crossThreadStorage), patch.pDestination);
+    EXPECT_EQ(dispatchKernelArgs.outCrossThreadDataGpuVa, patch.gpuAddress);
+    EXPECT_EQ(static_cast<size_t>(scratchOffset - inlineDataSize), patch.offset);
+    EXPECT_EQ(8u, patch.patchSize);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3p, givenScratchPointerWithinInlineDataWhenAddPatchScratchAddressThenPatchTargetsWalkerInlineData) {
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u));
+    pCommandList->heaplessModeEnabled = true;
+    pCommandList->scratchAddressPatchingEnabled = true;
+
+    NEO::KernelDescriptor kernelDescriptor{};
+    kernelDescriptor.kernelAttributes.flags.passInlineData = true;
+    constexpr NEO::InlineDataOffset scratchOffset = 8u;
+    kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.offset = scratchOffset;
+    kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.pointerSize = 8u;
+
+    uint64_t crossThreadStorage[8] = {};
+    NEO::EncodeDispatchKernelArgs dispatchKernelArgs{};
+    dispatchKernelArgs.outWalkerPtr = reinterpret_cast<void *>(0x1000);
+    dispatchKernelArgs.outWalkerGpuVa = 0x1000u;
+    dispatchKernelArgs.outCrossThreadDataPtr = crossThreadStorage;
+    dispatchKernelArgs.outCrossThreadDataGpuVa = 0x555000u;
+
+    CmdListKernelLaunchParams launchParams{};
+    pCommandList->addPatchScratchAddress(pCommandList->commandsToPatch, dispatchKernelArgs, kernelDescriptor, launchParams, true, false);
+
+    ASSERT_EQ(1u, pCommandList->commandsToPatch.size());
+    auto &patch = std::get<PatchComputeWalkerInlineDataScratch>(pCommandList->commandsToPatch[0]);
+    EXPECT_EQ(dispatchKernelArgs.outWalkerPtr, patch.pDestination);
+    EXPECT_EQ(dispatchKernelArgs.outWalkerGpuVa, patch.gpuAddress);
+    const auto expectedOffset = NEO::EncodeDispatchKernel<FamilyType>::getInlineDataOffset(dispatchKernelArgs) + scratchOffset;
+    EXPECT_EQ(expectedOffset, patch.offset);
+    EXPECT_EQ(8u, patch.patchSize);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3p, givenScratchPointerAndInlineDataDisabledWhenAddPatchScratchAddressThenPatchTargetsCrossThreadData) {
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u));
+    pCommandList->heaplessModeEnabled = true;
+    pCommandList->scratchAddressPatchingEnabled = true;
+
+    NEO::KernelDescriptor kernelDescriptor{};
+    kernelDescriptor.kernelAttributes.flags.passInlineData = false;
+    constexpr NEO::InlineDataOffset scratchOffset = 8u;
+    kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.offset = scratchOffset;
+    kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.pointerSize = 8u;
+
+    uint64_t crossThreadStorage[8] = {};
+    NEO::EncodeDispatchKernelArgs dispatchKernelArgs{};
+    dispatchKernelArgs.outWalkerPtr = reinterpret_cast<void *>(0x1000);
+    dispatchKernelArgs.outWalkerGpuVa = 0x1000u;
+    dispatchKernelArgs.outCrossThreadDataPtr = crossThreadStorage;
+    dispatchKernelArgs.outCrossThreadDataGpuVa = 0x555000u;
+
+    CmdListKernelLaunchParams launchParams{};
+    pCommandList->addPatchScratchAddress(pCommandList->commandsToPatch, dispatchKernelArgs, kernelDescriptor, launchParams, true, false);
+
+    ASSERT_EQ(1u, pCommandList->commandsToPatch.size());
+    auto &patch = std::get<PatchComputeWalkerInlineDataScratch>(pCommandList->commandsToPatch[0]);
+    EXPECT_EQ(static_cast<void *>(crossThreadStorage), patch.pDestination);
+    EXPECT_EQ(dispatchKernelArgs.outCrossThreadDataGpuVa, patch.gpuAddress);
+    EXPECT_EQ(static_cast<size_t>(scratchOffset), patch.offset);
+    EXPECT_EQ(8u, patch.patchSize);
+}
+
+struct LocalMemoryModuleFixture : public ModuleFixture {
+    void setUp() {
+        debugManager.flags.EnableLocalMemory.set(1);
+        ModuleFixture::setUp();
+    }
+    DebugManagerStateRestore restore;
+};
+
+using CommandListAppendLaunchKernelXe3pCore = Test<LocalMemoryModuleFixture>;
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3pCore, givenAppendKernelWhenKernelNotUsingSystemMemoryAllocationsAndEventNotHostSignalScopeThenExpectsNoSystemFenceUsed) {
+
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    constexpr size_t size = 4096u;
+    constexpr size_t alignment = 4096u;
+    void *ptr = nullptr;
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    result = context->allocDeviceMem(device->toHandle(),
+                                     &deviceDesc,
+                                     size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    Mock<::L0::KernelImp> kernel;
+    auto mockModule = std::unique_ptr<Module>(new Mock<Module>(device, nullptr));
+    kernel.module = mockModule.get();
+
+    auto allocData = driverHandle->getSvmAllocsManager()->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    auto kernelAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    ASSERT_NE(nullptr, kernelAllocation);
+    kernel.privateState.argumentsResidencyContainer.push_back(kernelAllocation);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_DEVICE;
+    eventDesc.wait = 0;
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+
+    kernel.setGroupSize(1, 1, 1);
+    ze_group_count_t groupCount{8, 1, 1};
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernelWithParams(&kernel, groupCount, event.get(), launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    GenCmdList commands;
+    ASSERT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(
+        commands,
+        commandList->getCmdContainer().getCommandStream()->getCpuBase(),
+        commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(commands.begin(), commands.end());
+    ASSERT_NE(it, commands.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    EXPECT_FALSE(walker->getPostSync().getSystemMemoryFenceRequest());
+
+    result = context->freeMem(ptr);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3pCore,
+                givenAppendKernelWhenKernelUsingUsmHostMemoryAllocationsAndEventNotHostSignalScopeThenExpectsNoSystemFenceUsed) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    constexpr size_t size = 4096u;
+    constexpr size_t alignment = 4096u;
+    void *ptr = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    result = context->allocHostMem(&hostDesc, size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    Mock<::L0::KernelImp> kernel;
+    auto mockModule = std::unique_ptr<Module>(new Mock<Module>(device, nullptr));
+    kernel.module = mockModule.get();
+
+    auto allocData = driverHandle->getSvmAllocsManager()->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    auto kernelAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    ASSERT_NE(nullptr, kernelAllocation);
+    kernel.privateState.argumentsResidencyContainer.push_back(kernelAllocation);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_DEVICE;
+    eventDesc.wait = 0;
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+
+    kernel.setGroupSize(1, 1, 1);
+    ze_group_count_t groupCount{8, 1, 1};
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernelWithParams(&kernel, groupCount, event.get(), launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    GenCmdList commands;
+    ASSERT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(
+        commands,
+        commandList->getCmdContainer().getCommandStream()->getCpuBase(),
+        commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(commands.begin(), commands.end());
+    ASSERT_NE(it, commands.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    auto &postSync = walker->getPostSync();
+    EXPECT_FALSE(postSync.getSystemMemoryFenceRequest());
+
+    result = context->freeMem(ptr);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3pCore,
+                givenAppendKernelWhenMigrationOnComputeUsingUsmSharedCpuMemoryAllocationsAndEventNotHostSignalScopeThenExpectsNoSystemFenceUsed) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    constexpr size_t size = 4096u;
+    constexpr size_t alignment = 4096u;
+    void *ptr = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    result = context->allocSharedMem(device->toHandle(), &deviceDesc, &hostDesc, size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    auto allocData = driverHandle->getSvmAllocsManager()->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    auto dstAllocation = allocData->cpuAllocation;
+    ASSERT_NE(nullptr, dstAllocation);
+    auto srcAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    ASSERT_NE(nullptr, srcAllocation);
+
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    result = commandList->appendPageFaultCopy(dstAllocation, srcAllocation, size, false, 0);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(commandList->usedKernelLaunchParams.isBuiltInKernel);
+    EXPECT_FALSE(commandList->usedKernelLaunchParams.isKernelSplitOperation);
+    EXPECT_TRUE(commandList->usedKernelLaunchParams.isDestinationAllocationInSystemMemory);
+
+    GenCmdList commands;
+    ASSERT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(
+        commands,
+        commandList->getCmdContainer().getCommandStream()->getCpuBase(),
+        commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(commands.begin(), commands.end());
+    ASSERT_NE(it, commands.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    auto &postSync = walker->getPostSync();
+    EXPECT_FALSE(postSync.getSystemMemoryFenceRequest());
+
+    result = context->freeMem(ptr);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3pCore,
+                givenAppendKernelWhenKernelUsingIndirectSystemMemoryAllocationsAndEventNotHostSignalScopeThenExpectsNoSystemFenceUsed) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    constexpr size_t size = 4096u;
+    constexpr size_t alignment = 4096u;
+    void *ptr = nullptr;
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    result = context->allocDeviceMem(device->toHandle(),
+                                     &deviceDesc,
+                                     size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    Mock<::L0::KernelImp> kernel;
+    auto mockModule = std::unique_ptr<Module>(new Mock<Module>(device, nullptr));
+    kernel.module = mockModule.get();
+
+    auto allocData = driverHandle->getSvmAllocsManager()->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    auto kernelAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    ASSERT_NE(nullptr, kernelAllocation);
+    kernel.privateState.argumentsResidencyContainer.push_back(kernelAllocation);
+
+    kernel.privateState.unifiedMemoryControls.indirectHostAllocationsAllowed = true;
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_DEVICE;
+    eventDesc.wait = 0;
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+
+    kernel.setGroupSize(1, 1, 1);
+    ze_group_count_t groupCount{8, 1, 1};
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernelWithParams(&kernel, groupCount, event.get(), launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    GenCmdList commands;
+    ASSERT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(
+        commands,
+        commandList->getCmdContainer().getCommandStream()->getCpuBase(),
+        commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(commands.begin(), commands.end());
+    ASSERT_NE(it, commands.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    auto &postSync = walker->getPostSync();
+    EXPECT_FALSE(postSync.getSystemMemoryFenceRequest());
+
+    result = context->freeMem(ptr);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3pCore,
+                givenAppendKernelWhenKernelUsingDeviceMemoryAllocationsAndEventHostSignalScopeThenExpectsNoSystemFenceUsed) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    constexpr size_t size = 4096u;
+    constexpr size_t alignment = 4096u;
+    void *ptr = nullptr;
+
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    result = context->allocDeviceMem(device->toHandle(),
+                                     &deviceDesc,
+                                     size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    Mock<::L0::KernelImp> kernel;
+    auto mockModule = std::unique_ptr<Module>(new Mock<Module>(device, nullptr));
+    kernel.module = mockModule.get();
+
+    auto allocData = driverHandle->getSvmAllocsManager()->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    auto kernelAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    ASSERT_NE(nullptr, kernelAllocation);
+    kernel.privateState.argumentsResidencyContainer.push_back(kernelAllocation);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = 0;
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+
+    kernel.setGroupSize(1, 1, 1);
+    ze_group_count_t groupCount{8, 1, 1};
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernelWithParams(&kernel, groupCount, event.get(), launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    GenCmdList commands;
+    ASSERT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(
+        commands,
+        commandList->getCmdContainer().getCommandStream()->getCpuBase(),
+        commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(commands.begin(), commands.end());
+    ASSERT_NE(it, commands.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    auto &postSync = walker->getPostSync();
+    EXPECT_FALSE(postSync.getSystemMemoryFenceRequest());
+
+    result = context->freeMem(ptr);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+}
+
+XE3P_CORETEST_F(CommandListAppendLaunchKernelXe3pCore,
+                givenAppendKernelWhenKernelUsingUsmHostMemoryAllocationsAndEventHostSignalScopeThenExpectsNoSystemFenceUsed) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    constexpr size_t size = 4096u;
+    constexpr size_t alignment = 4096u;
+    void *ptr = nullptr;
+
+    ze_host_mem_alloc_desc_t hostDesc = {};
+    result = context->allocHostMem(&hostDesc, size, alignment, &ptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(nullptr, ptr);
+
+    Mock<::L0::KernelImp> kernel;
+    auto mockModule = std::unique_ptr<Module>(new Mock<Module>(device, nullptr));
+    kernel.module = mockModule.get();
+
+    auto allocData = driverHandle->getSvmAllocsManager()->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocData);
+    auto kernelAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    ASSERT_NE(nullptr, kernelAllocation);
+    kernel.privateState.argumentsResidencyContainer.push_back(kernelAllocation);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+    eventDesc.wait = 0;
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+
+    kernel.setGroupSize(1, 1, 1);
+    ze_group_count_t groupCount{8, 1, 1};
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernelWithParams(&kernel, groupCount, event.get(), launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    GenCmdList commands;
+    ASSERT_TRUE(CmdParse<FamilyType>::parseCommandBuffer(
+        commands,
+        commandList->getCmdContainer().getCommandStream()->getCpuBase(),
+        commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(commands.begin(), commands.end());
+    ASSERT_NE(it, commands.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    auto &postSync = walker->getPostSync();
+    EXPECT_FALSE(postSync.getSystemMemoryFenceRequest());
+
+    result = context->freeMem(ptr);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+}
+
+using CommandListCreateXe3pTest = Test<DeviceFixture>;
+
+XE3P_CORETEST_F(CommandListCreateXe3pTest,
+                givenHeaplessEnabledWhenCreatingRegularCommandListThenScratchAddressPatchingEnabled) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::ult::CommandList> commandList(CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::compute, 0u, returnValue, false)));
+    ASSERT_NE(nullptr, commandList.get());
+
+    EXPECT_TRUE(commandList->scratchAddressPatchingEnabled);
+}
+
+XE3P_CORETEST_F(CommandListCreateXe3pTest,
+                givenHeaplessEnabledWhenCreatingImmediateCommandListThenScratchAddressPatchingDisabled) {
+    ze_result_t returnValue;
+    const ze_command_queue_desc_t desc = {};
+    std::unique_ptr<L0::ult::CommandList> commandList(CommandList::whiteboxCast(CommandList::createImmediate(device, &desc, false, NEO::EngineGroupType::compute, returnValue)));
+    ASSERT_NE(nullptr, commandList.get());
+
+    EXPECT_FALSE(commandList->scratchAddressPatchingEnabled);
+}
+
+using MultiTileSynchronizedDispatchTestsXe3p = MultiTileSynchronizedDispatchFixture;
+
+XE3P_CORETEST_F(MultiTileSynchronizedDispatchTestsXe3p, givenLimitedSyncDispatchWhenAppendingThenProgramTokenCheck) {
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+    using COMPARE_OPERATION = typename MI_SEMAPHORE_WAIT::COMPARE_OPERATION;
+
+    using BaseClass = WhiteBox<L0::CommandListCoreFamilyImmediate<FamilyType::gfxCoreFamily>>;
+    class MyCmdList : public BaseClass {
+      public:
+        void appendSynchronizedDispatchInitializationSection() override {
+            initCalled++;
+            BaseClass::appendSynchronizedDispatchInitializationSection();
+        }
+
+        void appendSynchronizedDispatchCleanupSection() override {
+            cleanupCalled++;
+            BaseClass::appendSynchronizedDispatchCleanupSection();
+        }
+
+        uint32_t initCalled = 0;
+        uint32_t cleanupCalled = 0;
+    };
+
+    void *alloc = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    auto result = context->allocDeviceMem(device->toHandle(), &deviceDesc, 16 * MemoryConstants::kiloByte, 4096u, &alloc);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+
+    auto immCmdList = createImmCmdListImpl<FamilyType::gfxCoreFamily, MyCmdList>(false);
+    immCmdList->partitionCount = partitionCount;
+    immCmdList->synchronizedDispatchMode = NEO::SynchronizedDispatchMode::limited;
+
+    auto eventPool = createEvents<FamilyType>(1, false);
+    events[0]->makeCounterBasedInitiallyDisabled(eventPool->getAllocation());
+
+    auto cmdStream = immCmdList->getCmdContainer().getCommandStream();
+    size_t offset = cmdStream->getUsed();
+
+    uint32_t expectedInitCalls = 1;
+    uint32_t expectedCleanupCalls = 1;
+
+    auto verifyTokenCheck = [&](uint32_t numDependencies, uint32_t semaphoreOffsetFromEnd) {
+        GenCmdList cmdList;
+        EXPECT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), offset), (cmdStream->getUsed() - offset)));
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
+
+        auto allSemaphores = findAll<MI_SEMAPHORE_WAIT *>(cmdList.begin(), cmdList.end());
+        auto nSemaphores = allSemaphores.size();
+        auto i = nSemaphores - 1u;
+        i -= semaphoreOffsetFromEnd;
+        auto semaphore = allSemaphores[i];
+
+        EXPECT_NE(cmdList.end(), semaphore);
+
+        auto semaphoreCmd = genCmdCast<MI_SEMAPHORE_WAIT *>(*semaphore);
+        EXPECT_NE(nullptr, semaphoreCmd);
+
+        EXPECT_EQ(0u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
+        EXPECT_EQ(device->getSyncDispatchTokenAllocation()->getGpuAddress() + sizeof(uint32_t), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
+        EXPECT_EQ(COMPARE_OPERATION::COMPARE_OPERATION_SAD_EQUAL_SDD, semaphoreCmd->getCompareOperation());
+
+        EXPECT_EQ(expectedInitCalls++, immCmdList->initCalled);
+        EXPECT_EQ(expectedCleanupCalls++, immCmdList->cleanupCalled);
+
+        return !::testing::Test::HasFailure();
+    };
+
+    // first run without dependency
+    immCmdList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
+    EXPECT_TRUE(verifyTokenCheck(0, 0));
+
+    offset = cmdStream->getUsed();
+    immCmdList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    CmdListKernelLaunchParams cooperativeParams = {};
+    cooperativeParams.isCooperative = true;
+
+    offset = cmdStream->getUsed();
+    immCmdList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, cooperativeParams);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    immCmdList->appendLaunchKernelIndirect(kernel->toHandle(), *static_cast<ze_group_count_t *>(alloc), nullptr, 0, nullptr, false);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    const ze_kernel_handle_t launchKernels = kernel->toHandle();
+    immCmdList->appendLaunchMultipleKernelsIndirect(1, &launchKernels, reinterpret_cast<const uint32_t *>(alloc), &groupCount, nullptr, 0, nullptr, false);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    immCmdList->appendEventReset(events[0]->toHandle());
+    EXPECT_TRUE(verifyTokenCheck(1, 1));
+
+    offset = cmdStream->getUsed();
+    size_t rangeSizes = 1;
+    const void **ranges = const_cast<const void **>(&alloc);
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    immCmdList->appendMemoryRangesBarrier(1, &rangeSizes, ranges, nullptr, 0, nullptr, waitEventsParameters);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    CmdListMemoryCopyParams copyParams = {};
+    immCmdList->appendMemoryCopy(alloc, alloc, 1, nullptr, 0, nullptr, copyParams);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    ze_copy_region_t region = {0, 0, 0, 1, 1, 1};
+    immCmdList->appendMemoryCopyRegion(alloc, &region, 1, 1, alloc, &region, 1, 1, nullptr, 0, nullptr, copyParams);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    immCmdList->appendMemoryFill(alloc, alloc, 8, 8, nullptr, 0, nullptr, copyParams);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    CmdListWaitEventParameters waitEventsParametersForGlobalTs = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    immCmdList->appendWriteGlobalTimestamp(reinterpret_cast<uint64_t *>(alloc), nullptr, 0, nullptr, waitEventsParametersForGlobalTs);
+    EXPECT_TRUE(verifyTokenCheck(1, 0));
+
+    offset = cmdStream->getUsed();
+    auto handle = events[0]->toHandle();
+    events[0]->unsetCmdQueue();
+    CmdListWaitEventParameters waitEventsParametersForBarrier = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    L0::CmdListSignalEventParameters signalEventParams = {};
+    immCmdList->appendBarrier(nullptr, 1, &handle, waitEventsParametersForBarrier, signalEventParams);
+    EXPECT_TRUE(verifyTokenCheck(2, 0));
+
+    context->freeMem(alloc);
+}
+
+using CommandListTestsScratchPtrPatchXe3p = Test<DeviceFixture>;
+
+XE3P_CORETEST_F(CommandListTestsScratchPtrPatchXe3p, whenAddPatchScratchAddressInImplicitArgsIsCalledThenCommandsToPatchAreCorrect) {
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    auto dispatchInterface = std::make_unique<NEO::MockDispatchKernelEncoder>();
+
+    NEO::ImplicitArgs implicitArgs{};
+    implicitArgs.initializeHeader(1);
+    dispatchInterface->implicitArgsPtr = &implicitArgs;
+
+    dispatchInterface->kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.pointerSize = 8u;
+    dispatchInterface->kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.offset = 8u;
+    DebugManagerStateRestore dbgRestorer;
+
+    ze_command_queue_desc_t queueDesc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
+    ze_result_t returnValue;
+
+    WhiteBox<L0::CommandQueue> *commandQueue = nullptr;
+    commandQueue = whiteboxCast(CommandQueue::create(device,
+                                                     neoDevice->getDefaultEngine().commandStreamReceiver,
+                                                     &queueDesc,
+                                                     false,
+                                                     false,
+                                                     false,
+                                                     returnValue));
+    ASSERT_NE(nullptr, commandQueue);
+    commandQueue->setPatchingPreamble(true);
+
+    NEO::EncodeDispatchKernelArgs args{};
+    args.isHeaplessModeEnabled = true;
+    args.device = device->getNEODevice();
+    args.dispatchInterface = dispatchInterface.get();
+    args.outImplicitArgsPtr = reinterpret_cast<void *>(0xABCD);
+    args.outImplicitArgsGpuVa = 0xAAFF0000;
+
+    void *queueCpuBase = commandQueue->commandStream.getCpuBase();
+
+    {
+        auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+        auto result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+        CommandList::CommandsToPatch &commandsToPatch = commandList->commandsToPatch;
+
+        bool kernelNeedsImplicitArgs = false;
+        commandList->addPatchScratchAddressInImplicitArgs(commandsToPatch, args, dispatchInterface->kernelDescriptor, kernelNeedsImplicitArgs);
+        ASSERT_EQ(0u, commandsToPatch.size());
+    }
+    {
+        NEO::ImplicitArgs implicitArgs0{};
+        implicitArgs0.initializeHeader(0);
+        VariableBackup backupImplicitArgs{&dispatchInterface->implicitArgsPtr, &implicitArgs0};
+
+        auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+        auto result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+        CommandList::CommandsToPatch &commandsToPatch = commandList->commandsToPatch;
+
+        bool kernelNeedsImplicitArgs = true;
+        commandList->addPatchScratchAddressInImplicitArgs(commandsToPatch, args, dispatchInterface->kernelDescriptor, kernelNeedsImplicitArgs);
+        ASSERT_EQ(0u, commandsToPatch.size());
+    }
+    {
+        NEO::ImplicitArgs implicitArgs2{};
+        implicitArgs2.initializeHeader(2);
+        VariableBackup backupImplicitArgs{&dispatchInterface->implicitArgsPtr, &implicitArgs2};
+
+        auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+        auto result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+        CommandList::CommandsToPatch &commandsToPatch = commandList->commandsToPatch;
+
+        bool kernelNeedsImplicitArgs = true;
+        commandList->addPatchScratchAddressInImplicitArgs(commandsToPatch, args, dispatchInterface->kernelDescriptor, kernelNeedsImplicitArgs);
+        ASSERT_EQ(1u, commandsToPatch.size());
+        EXPECT_EQ(0u, commandList->getActiveScratchPatchElements());
+        EXPECT_EQ(1u, commandList->getActiveScratchSizePatchElements());
+
+        auto expectedScratch0SizeAllocatedOffset = implicitArgs2.getScratch0SizeAllocatedOffset();
+        ASSERT_TRUE(expectedScratch0SizeAllocatedOffset.has_value());
+
+        auto *patchedCmd = std::get_if<PatchComputeWalkerImplicitArgsScratch>(&commandsToPatch[0]);
+        ASSERT_NE(nullptr, patchedCmd);
+
+        EXPECT_EQ(args.outImplicitArgsPtr, patchedCmd->pDestination);
+        EXPECT_EQ(expectedScratch0SizeAllocatedOffset.value(), patchedCmd->scratch0SizeAllocatedOffset);
+        EXPECT_TRUE(NEO::isUndefinedOffset(patchedCmd->offset));
+        EXPECT_TRUE(NEO::isUndefined(patchedCmd->patchSize));
+
+        commandList->close();
+        auto cmdListHandle = commandList->toHandle();
+
+        auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+        CommandListExecutionInternalOptions internalOptions = {};
+        returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, internalOptions);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+        auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+        ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+            cmdList,
+            ptrOffset(queueCpuBase, usedSpaceBefore),
+            usedSpaceAfter - usedSpaceBefore));
+        auto sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+
+        auto expectedGpuVa = args.outImplicitArgsGpuVa + expectedScratch0SizeAllocatedOffset.value();
+        bool scratch0SizeAllocatedPatchFound = false;
+        for (auto &sdiCmdIterator : sdiCmds) {
+            auto sdiCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmdIterator);
+            if (sdiCmd->getAddress() == expectedGpuVa) {
+                scratch0SizeAllocatedPatchFound = true;
+                EXPECT_FALSE(sdiCmd->getStoreQword());
+            }
+        }
+        EXPECT_TRUE(scratch0SizeAllocatedPatchFound);
+    }
+    {
+        debugManager.flags.SelectCmdListHeapAddressModel.set(static_cast<int32_t>(NEO::HeapAddressModel::privateHeaps));
+
+        auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+        auto result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+        CommandList::CommandsToPatch &commandsToPatch = commandList->commandsToPatch;
+
+        bool kernelNeedsImplicitArgs = true;
+        commandList->addPatchScratchAddressInImplicitArgs(commandsToPatch, args, dispatchInterface->kernelDescriptor, kernelNeedsImplicitArgs);
+        ASSERT_EQ(1u, commandsToPatch.size());
+        EXPECT_EQ(1u, commandList->getActiveScratchPatchElements());
+
+        auto expectedImplicitArgsPtr = args.outImplicitArgsPtr;
+        auto expectedScratchOffset = dispatchInterface->getImplicitArgs()->getScratchPtrOffset();
+        EXPECT_TRUE(expectedScratchOffset.has_value());
+        auto expectedPatchSize = dispatchInterface->kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.pointerSize;
+        auto ssh = commandList->commandContainer.getIndirectHeap(NEO::HeapType::surfaceState);
+        uint64_t expectedScratchAddress = ssh != nullptr ? ssh->getGpuBase() : 0u;
+        uint64_t expectedScratchAddressAfterPatch = 0u;
+
+        auto *patchedCmd = std::get_if<PatchComputeWalkerImplicitArgsScratch>(&commandsToPatch[0]);
+        ASSERT_NE(nullptr, patchedCmd);
+
+        EXPECT_EQ(expectedPatchSize, patchedCmd->patchSize);
+        EXPECT_EQ(expectedImplicitArgsPtr, patchedCmd->pDestination);
+        EXPECT_EQ(expectedScratchOffset.value(), patchedCmd->offset);
+        EXPECT_EQ(expectedScratchAddress, patchedCmd->baseAddress);
+        EXPECT_EQ(expectedScratchAddressAfterPatch, patchedCmd->scratchAddressAfterPatch);
+        EXPECT_TRUE(NEO::isUndefinedOffset(patchedCmd->scratch0SizeAllocatedOffset));
+
+        commandList->close();
+        auto cmdListHandle = commandList->toHandle();
+
+        auto usedSpaceBefore = commandQueue->commandStream.getUsed();
+        CommandListExecutionInternalOptions internalOptions = {};
+        returnValue = commandQueue->executeCommandLists(1, &cmdListHandle, nullptr, internalOptions);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
+        auto usedSpaceAfter = commandQueue->commandStream.getUsed();
+        ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
+
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+            cmdList,
+            ptrOffset(queueCpuBase, usedSpaceBefore),
+            usedSpaceAfter - usedSpaceBefore));
+        auto sdiCmds = findAll<MI_STORE_DATA_IMM *>(cmdList.begin(), cmdList.end());
+        ASSERT_LT(2u, sdiCmds.size()); // last two SDI encodes returning BB_START
+
+        auto expectedGpuVa = args.outImplicitArgsGpuVa + expectedScratchOffset.value();
+
+        size_t sdiMax = sdiCmds.size() - 2;
+        for (size_t i = 0; i < sdiMax; i++) {
+            auto sdiCmd = reinterpret_cast<MI_STORE_DATA_IMM *>(*sdiCmds[i]);
+            EXPECT_EQ(expectedGpuVa, sdiCmd->getAddress());
+            if (sdiCmd->getStoreQword() == false) {
+                expectedGpuVa += sizeof(uint32_t);
+            }
+        }
+    }
+    {
+        debugManager.flags.SelectCmdListHeapAddressModel.set(static_cast<int32_t>(NEO::HeapAddressModel::globalStateless));
+
+        auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+        auto result = commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+        CommandList::CommandsToPatch &commandsToPatch = commandList->commandsToPatch;
+
+        bool kernelNeedsImplicitArgs = true;
+        commandList->addPatchScratchAddressInImplicitArgs(commandsToPatch, args, dispatchInterface->kernelDescriptor, kernelNeedsImplicitArgs);
+        ASSERT_EQ(1u, commandsToPatch.size());
+        EXPECT_EQ(1u, commandList->getActiveScratchPatchElements());
+
+        auto expectedImplicitArgsPtr = args.outImplicitArgsPtr;
+        auto expectedScratchOffset = dispatchInterface->getImplicitArgs()->getScratchPtrOffset();
+        EXPECT_TRUE(expectedScratchOffset.has_value());
+        auto expectedPatchSize = dispatchInterface->kernelDescriptor.payloadMappings.implicitArgs.scratchPointerAddress.pointerSize;
+        uint64_t expectedBaseAddress = 0;
+        uint64_t expectedScratchAddressAfterPatch = 0u;
+
+        auto *patchedCmd = std::get_if<PatchComputeWalkerImplicitArgsScratch>(&commandsToPatch[0]);
+        ASSERT_NE(nullptr, patchedCmd);
+
+        EXPECT_EQ(expectedPatchSize, patchedCmd->patchSize);
+        EXPECT_EQ(expectedImplicitArgsPtr, patchedCmd->pDestination);
+        EXPECT_EQ(expectedScratchOffset.value(), patchedCmd->offset);
+        EXPECT_EQ(expectedBaseAddress, patchedCmd->baseAddress);
+        EXPECT_EQ(expectedScratchAddressAfterPatch, patchedCmd->scratchAddressAfterPatch);
+        EXPECT_TRUE(NEO::isUndefinedOffset(patchedCmd->scratch0SizeAllocatedOffset));
+    }
+
+    commandQueue->destroy();
+}
+
+XE3P_CORETEST_F(CommandListTestsScratchPtrPatchXe3p, givenImplicitArgsV2AndUndefinedScratchPointerAddressWhenAddPatchScratchAddressIsCalledThenOnlyScratchSizeIsPatched) {
+    auto dispatchInterface = std::make_unique<NEO::MockDispatchKernelEncoder>();
+
+    NEO::ImplicitArgs implicitArgs{};
+    implicitArgs.initializeHeader(2);
+    dispatchInterface->implicitArgsPtr = &implicitArgs;
+
+    NEO::EncodeDispatchKernelArgs args{};
+    args.isHeaplessModeEnabled = true;
+    args.device = device->getNEODevice();
+    args.dispatchInterface = dispatchInterface.get();
+    args.outImplicitArgsPtr = reinterpret_cast<void *>(0xABCD);
+    args.outImplicitArgsGpuVa = 0xAAFF0000;
+
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->initialize(device, NEO::EngineGroupType::compute, 0u));
+    commandList->scratchAddressPatchingEnabled = true;
+
+    CmdListKernelLaunchParams launchParams = {};
+    CommandList::CommandsToPatch &commandsToPatch = commandList->commandsToPatch;
+
+    constexpr bool kernelNeedsScratchSpace = true;
+    constexpr bool kernelNeedsImplicitArgs = true;
+    commandList->addPatchScratchAddress(commandsToPatch, args, dispatchInterface->kernelDescriptor, launchParams, kernelNeedsScratchSpace, kernelNeedsImplicitArgs);
+
+    ASSERT_EQ(2u, commandsToPatch.size());
+    EXPECT_EQ(0u, commandList->getActiveScratchPatchElements());
+    EXPECT_EQ(1u, commandList->getActiveScratchSizePatchElements());
+
+    auto *inlineDataPatch = std::get_if<PatchComputeWalkerInlineDataScratch>(&commandsToPatch[launchParams.scratchAddressPatchIndex]);
+    ASSERT_NE(nullptr, inlineDataPatch);
+    EXPECT_TRUE(NEO::isUndefinedOffset(inlineDataPatch->offset));
+
+    auto expectedScratch0SizeAllocatedOffset = implicitArgs.getScratch0SizeAllocatedOffset();
+    ASSERT_TRUE(expectedScratch0SizeAllocatedOffset.has_value());
+
+    auto *implicitArgsPatch = std::get_if<PatchComputeWalkerImplicitArgsScratch>(&commandsToPatch[1]);
+    ASSERT_NE(nullptr, implicitArgsPatch);
+    EXPECT_EQ(args.outImplicitArgsPtr, implicitArgsPatch->pDestination);
+    EXPECT_EQ(expectedScratch0SizeAllocatedOffset.value(), implicitArgsPatch->scratch0SizeAllocatedOffset);
+    EXPECT_TRUE(NEO::isUndefinedOffset(implicitArgsPatch->offset));
+    EXPECT_TRUE(NEO::isUndefined(implicitArgsPatch->patchSize));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, commandList->close());
+
+    auto expectedPatchSize = NEO::EncodeDataMemory<FamilyType>::getCommandSizeForEncode(sizeof(uint32_t));
+    EXPECT_EQ(expectedPatchSize, commandList->getActiveScratchPatchElemsPatchSize());
+
+    commandList->clearCommandsToPatch();
+    EXPECT_EQ(0u, commandList->getActiveScratchSizePatchElements());
+}
+
+} // namespace ult
+} // namespace L0

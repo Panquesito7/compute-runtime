@@ -1,53 +1,221 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/os_interface/linux/i915.h"
-#include "shared/source/os_interface/linux/memory_info.h"
 
-#include "level_zero/sysman/source/linux/zes_os_sysman_imp.h"
-#include "level_zero/sysman/source/memory/linux/sysman_os_memory_imp.h"
-#include "level_zero/sysman/source/memory/sysman_memory_imp.h"
+#include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/memory_info.h"
+#include "shared/source/os_interface/linux/system_info.h"
+#include "shared/test/common/mocks/linux/mock_ioctl_helper.h"
+
+#include "level_zero/sysman/source/api/memory/linux/sysman_os_memory_imp.h"
+#include "level_zero/sysman/source/api/memory/sysman_memory_imp.h"
+#include "level_zero/sysman/source/shared/linux/pmt/sysman_pmt.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+#include "level_zero/sysman/source/shared/linux/zes_os_sysman_imp.h"
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_hw_device_id.h"
 
 using namespace NEO;
-constexpr uint64_t probedSizeRegionZero = 8 * GB;
-constexpr uint64_t probedSizeRegionOne = 16 * GB;
-constexpr uint64_t probedSizeRegionTwo = 4 * GB;
-constexpr uint64_t probedSizeRegionThree = 16 * GB;
-constexpr uint64_t unallocatedSizeRegionZero = 6 * GB;
-constexpr uint64_t unallocatedSizeRegionOne = 12 * GB;
-constexpr uint64_t unallocatedSizeRegionTwo = 25 * GB;
-constexpr uint64_t unallocatedSizeRegionThree = 3 * GB;
+
+constexpr uint64_t transactionSize = 32;
+constexpr uint64_t hbmRP0Frequency = 4200;
+constexpr uint64_t mockMaxBwDg2 = 1343616u;
+
+constexpr uint32_t vFHbmLRead = 16;
+constexpr uint32_t vFHbmHRead = 2;
+constexpr uint32_t vFHbmLWrite = 8;
+constexpr uint32_t vFHbmHWrite = 2;
+
+constexpr uint32_t vF0Vfid = 88;
+constexpr uint32_t vF1Vfid = 176;
+constexpr uint32_t vF0HbmReadL = 384;
+constexpr uint32_t vF0HbmReadH = 388;
+constexpr uint32_t vF0HbmWriteL = 392;
+constexpr uint32_t vF0HbmWriteH = 396;
+
+constexpr uint32_t vF1HbmReadL = 400;
+constexpr uint32_t vF1HbmReadH = 404;
+constexpr uint32_t vF1HbmWriteL = 408;
+constexpr uint32_t vF1HbmWriteH = 412;
+
+constexpr uint32_t vF0Hbm0Read = 92;
+constexpr uint32_t vF0Hbm0Write = 96;
+constexpr uint32_t vF0Hbm1Read = 104;
+constexpr uint32_t vF0Hbm1Write = 108;
+constexpr uint32_t vF0Hbm2Read = 312;
+constexpr uint32_t vF0Hbm2Write = 316;
+constexpr uint32_t vF0Hbm3Read = 328;
+constexpr uint32_t vF0Hbm3Write = 332;
+
+constexpr uint32_t vFHbm0ReadValue = 92;
+constexpr uint32_t vFHbm0WriteValue = 96;
+constexpr uint32_t vFHbm1ReadValue = 104;
+constexpr uint32_t vFHbm1WriteValue = 108;
+constexpr uint32_t vFHbm2ReadValue = 113;
+constexpr uint32_t vFHbm2WriteValue = 125;
+constexpr uint32_t vFHbm3ReadValue = 135;
+constexpr uint32_t vFHbm3WriteValue = 20;
+
+constexpr uint32_t minIdiReadOffset = 1096;
+constexpr uint32_t minIdiWriteOffset = 1224;
+constexpr uint32_t minDisplayVc1ReadOffset = 1352;
+
+constexpr uint64_t mockIdiReadVal = 8u;
+constexpr uint64_t mockIdiWriteVal = 9u;
+constexpr uint64_t mockDisplayVc1ReadVal = 10u;
+constexpr uint64_t numberMcChannels = 16;
+
+constexpr uint64_t mockIntegratedDeviceAvailableMemory = 8192 * 1024;
+constexpr uint64_t mockIntegratedDeviceFreeMemory = 4096 * 1024;
+constexpr uint64_t mockIntegratedDevicePhysicalSize = 16384 * 1024;
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
-struct MockMemoryNeoDrm : public Drm {
+const std::string deviceMemoryHealth("device_memory_health");
+const std::string telem1NodeName("/sys/class/intel_pmt/telem1");
+const std::string telem2NodeName("/sys/class/intel_pmt/telem2");
+const std::string telem3NodeName("/sys/class/intel_pmt/telem3");
+const std::string telem1OffsetFileName("/sys/class/intel_pmt/telem1/offset");
+const std::string telem1GuidFileName("/sys/class/intel_pmt/telem1/guid");
+const std::string telem1TelemFileName("/sys/class/intel_pmt/telem1/telem");
+const std::string telem2OffsetFileName("/sys/class/intel_pmt/telem2/offset");
+const std::string telem2GuidFileName("/sys/class/intel_pmt/telem2/guid");
+const std::string telem2TelemFileName("/sys/class/intel_pmt/telem2/telem");
+const std::string telem3OffsetFileName("/sys/class/intel_pmt/telem3/offset");
+const std::string telem3GuidFileName("/sys/class/intel_pmt/telem3/guid");
+const std::string telem3TelemFileName("/sys/class/intel_pmt/telem3/telem");
+const std::string hbmFreqFilePath("gt/gt0/mem_RP0_freq_mhz");
+const std::string hbmFreqFilePath2("gt/gt1/mem_RP0_freq_mhz");
+const std::string maxBwFileName("prelim_lmem_max_bw_Mbps");
+const std::string mockPhysicalSize = "0x00000040000000";
+
+constexpr uint32_t mockMemoryVendorIdValue = 0xADu;
+constexpr uint32_t mockSamsungMemoryVendorIdValue = 0x01u;
+constexpr uint32_t mockCxmtMemoryVendorIdValue = 0x13u;
+constexpr uint32_t mockMicronMemoryVendorIdValue = 0xFFu;
+
+struct MockMemoryNeoDrm : public NEO::Drm {
+    using Drm::ioctlHelper;
     using Drm::memoryInfo;
-    const int mockFd = 33;
+    static constexpr int mockFd = 33;
+    uint32_t mockMemoryType = NEO::DeviceBlobConstants::MemoryType::hbm2e;
+    std::vector<bool> mockQuerySystemInfoReturnValue{};
+    bool isRepeated = false;
+    bool mockReturnEmptyRegions = false;
     MockMemoryNeoDrm(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<MockSysmanHwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
-    std::vector<bool> mockQueryMemoryInfoReturnStatus{};
-    bool queryMemoryInfo() override {
-        if (!mockQueryMemoryInfoReturnStatus.empty()) {
-            return mockQueryMemoryInfoReturnStatus.front();
+
+    void setMemoryType(uint32_t memory) {
+        mockMemoryType = memory;
+    }
+
+    std::vector<uint8_t> getMemoryRegionsReturnsEmpty() {
+        return {};
+    }
+
+    void resetSystemInfo() {
+        systemInfo.reset(nullptr);
+    }
+
+    void setMemoryInfoWithDefaultRegions() {
+        std::vector<MemoryRegion> regionInfo(3);
+        regionInfo[0].region = {static_cast<uint16_t>(ioctlHelper->getDrmParamValue(DrmParam::memoryClassSystem)), 0};
+        regionInfo[0].probedSize = NEO::probedSizeRegionZero;
+        regionInfo[0].unallocatedSize = NEO::unallocatedSizeRegionZero;
+        regionInfo[1].region = {static_cast<uint16_t>(ioctlHelper->getDrmParamValue(DrmParam::memoryClassDevice)), 0};
+        regionInfo[1].probedSize = NEO::probedSizeRegionOne;
+        regionInfo[1].unallocatedSize = NEO::unallocatedSizeRegionOne;
+        regionInfo[2].region = {static_cast<uint16_t>(ioctlHelper->getDrmParamValue(DrmParam::memoryClassDevice)), 1};
+        regionInfo[2].probedSize = NEO::probedSizeRegionFour;
+        regionInfo[2].unallocatedSize = NEO::unallocatedSizeRegionFour;
+        memoryInfo.reset(new MemoryInfo(regionInfo, *this));
+    }
+
+    bool querySystemInfo() override {
+        bool returnValue = true;
+        if (!mockQuerySystemInfoReturnValue.empty()) {
+            returnValue = mockQuerySystemInfoReturnValue.front();
+            if (isRepeated != true) {
+                mockQuerySystemInfoReturnValue.erase(mockQuerySystemInfoReturnValue.begin());
+            }
+            resetSystemInfo();
+            return returnValue;
         }
 
-        std::vector<MemoryRegion> regionInfo(2);
-        regionInfo[0].region = {drm_i915_gem_memory_class::I915_MEMORY_CLASS_SYSTEM, 0};
-        regionInfo[0].probedSize = probedSizeRegionZero;
-        regionInfo[0].unallocatedSize = unallocatedSizeRegionZero;
-        regionInfo[1].region = {drm_i915_gem_memory_class::I915_MEMORY_CLASS_DEVICE, 0};
-        regionInfo[1].probedSize = probedSizeRegionOne;
-        regionInfo[1].unallocatedSize = unallocatedSizeRegionOne;
+        constexpr uint32_t numHbmStacksPerTile = 2;
+        constexpr uint32_t numChannelsPerHbmStack = 4;
 
-        this->memoryInfo.reset(new MemoryInfo(regionInfo, *this));
-        return true;
+        uint32_t hwBlob[] = {NEO::DeviceBlobConstants::maxMemoryChannels, 1, 8, NEO::DeviceBlobConstants::memoryType, 1, mockMemoryType, NEO::DeviceBlobConstants::numHbmStacksPerTile, 1, numHbmStacksPerTile, NEO::DeviceBlobConstants::numChannelsPerHbmStack, 1, numChannelsPerHbmStack};
+        std::vector<uint32_t> inputBlobData(reinterpret_cast<uint32_t *>(hwBlob), reinterpret_cast<uint32_t *>(ptrOffset(hwBlob, sizeof(hwBlob))));
+        this->systemInfo.reset(new SystemInfo(inputBlobData));
+        return returnValue;
     }
 };
 
+class PublicLinuxMemoryImp : public L0::Sysman::LinuxMemoryImp {
+  public:
+    PublicLinuxMemoryImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId) : LinuxMemoryImp(pOsSysman, onSubdevice, subdeviceId) {}
+    PublicLinuxMemoryImp() = default;
+    using L0::Sysman::LinuxMemoryImp::pSysmanKmdInterface;
+};
+
+struct MockMemorySysFsAccessInterface : public L0::Sysman::SysFsAccessInterface {
+    std::vector<ze_result_t> mockReadReturnStatus{};
+    std::vector<std::string> mockReadStringValue{};
+    bool isRepeated = false;
+
+    ze_result_t read(const std::string file, std::string &val) override {
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        if (!mockReadReturnStatus.empty()) {
+            result = mockReadReturnStatus.front();
+            if (!mockReadStringValue.empty()) {
+                val = mockReadStringValue.front();
+            }
+
+            if (isRepeated != true) {
+                mockReadReturnStatus.erase(mockReadReturnStatus.begin());
+                if (!mockReadStringValue.empty()) {
+                    mockReadStringValue.erase(mockReadStringValue.begin());
+                }
+            }
+            return result;
+        }
+
+        if (file.compare(deviceMemoryHealth) == 0) {
+            val = "OK";
+        }
+        return result;
+    }
+};
+
+struct MockMemoryFsAccessInterface : public L0::Sysman::FsAccessInterface {
+    std::vector<std::string> customMemInfo;
+    ze_result_t read(std::string file, std::vector<std::string> &val) override {
+        if (file == "/proc/meminfo") {
+            if (!customMemInfo.empty()) {
+                val = customMemInfo;
+            } else {
+                val.push_back("MemTotal: 16384 kB");
+                val.push_back("MemFree: 4096 kB");
+                val.push_back("MemAvailable: 8192 kB");
+            }
+        }
+        return ZE_RESULT_SUCCESS;
+    }
+    MockMemoryFsAccessInterface() = default;
+};
+
+class MockProcFsAccessInterface : public L0::Sysman::ProcFsAccessInterface {
+  public:
+    MockProcFsAccessInterface() = default;
+    ~MockProcFsAccessInterface() override = default;
+};
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

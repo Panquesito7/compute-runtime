@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,46 +17,46 @@ namespace ult {
 TEST(CompressionSelectorL0Tests, GivenDefaultDebugFlagWhenProvidingUsmAllocationThenExpectCompressionDisabled) {
     DeviceBitfield deviceBitfield{0x0};
     AllocationProperties properties(0, MemoryConstants::pageSize,
-                                    AllocationType::BUFFER,
+                                    AllocationType::buffer,
                                     deviceBitfield);
-    properties.flags.isUSMDeviceAllocation = 1u;
+    properties.flags.isHostInaccessibleAllocation = 1u;
 
     EXPECT_FALSE(NEO::CompressionSelector::preferCompressedAllocation(properties));
 }
 
 TEST(CompressionSelectorL0Tests, GivenDisabledDebugFlagWhenProvidingUsmAllocationThenExpectCompressionDisabled) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.EnableUsmCompression.set(0);
+    debugManager.flags.EnableUsmCompression.set(0);
 
     DeviceBitfield deviceBitfield{0x0};
     AllocationProperties properties(0, MemoryConstants::pageSize,
-                                    AllocationType::BUFFER,
+                                    AllocationType::buffer,
                                     deviceBitfield);
-    properties.flags.isUSMDeviceAllocation = 1u;
+    properties.flags.isHostInaccessibleAllocation = 1u;
 
     EXPECT_FALSE(NEO::CompressionSelector::preferCompressedAllocation(properties));
 }
 
 TEST(CompressionSelectorL0Tests, GivenEnabledDebugFlagWhenProvidingUsmAllocationThenExpectCompressionEnabled) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.EnableUsmCompression.set(1);
+    debugManager.flags.EnableUsmCompression.set(1);
 
     DeviceBitfield deviceBitfield{0x0};
     AllocationProperties properties(0, MemoryConstants::pageSize,
-                                    AllocationType::BUFFER,
+                                    AllocationType::buffer,
                                     deviceBitfield);
-    properties.flags.isUSMDeviceAllocation = 1u;
+    properties.flags.isHostInaccessibleAllocation = 1u;
 
     EXPECT_TRUE(NEO::CompressionSelector::preferCompressedAllocation(properties));
 }
 
 TEST(CompressionSelectorL0Tests, GivenEnabledDebugFlagWhenProvidingSvmGpuAllocationThenExpectCompressionEnabled) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.EnableUsmCompression.set(1);
+    debugManager.flags.EnableUsmCompression.set(1);
 
     DeviceBitfield deviceBitfield{0x0};
     AllocationProperties properties(0, MemoryConstants::pageSize,
-                                    AllocationType::SVM_GPU,
+                                    AllocationType::svmGpu,
                                     deviceBitfield);
 
     EXPECT_TRUE(NEO::CompressionSelector::preferCompressedAllocation(properties));
@@ -64,11 +64,11 @@ TEST(CompressionSelectorL0Tests, GivenEnabledDebugFlagWhenProvidingSvmGpuAllocat
 
 TEST(CompressionSelectorL0Tests, GivenEnabledDebugFlagWhenProvidingOtherAllocationThenExpectCompressionDisabled) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.EnableUsmCompression.set(1);
+    debugManager.flags.EnableUsmCompression.set(1);
 
     DeviceBitfield deviceBitfield{0x0};
     AllocationProperties properties(0, MemoryConstants::pageSize,
-                                    AllocationType::BUFFER_HOST_MEMORY,
+                                    AllocationType::bufferHostMemory,
                                     deviceBitfield);
 
     EXPECT_FALSE(NEO::CompressionSelector::preferCompressedAllocation(properties));

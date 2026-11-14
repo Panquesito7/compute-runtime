@@ -1,12 +1,16 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/addressing_mode_helper.h"
+
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/helpers/mipmap.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/image.h"
@@ -24,21 +28,12 @@ cl_int CommandQueueHw<GfxFamily>::enqueueCopyBufferToImage(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
-    auto eBuiltInOpsType = EBuiltInOps::CopyBufferToImage3d;
 
-    if (forceStateless(srcBuffer->getSize())) {
-        eBuiltInOpsType = EBuiltInOps::CopyBufferToImage3dStateless;
-    }
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(srcBuffer->getSize());
+    BuiltIn::BuiltInId builtIn{BuiltIn::BaseKernel::copyBufferToImage3d, builtInMode};
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(eBuiltInOpsType,
-                                                                            this->getClDevice());
-    BuiltInOwnershipWrapper builtInLock(builder, this->context);
-
-    MemObjSurface srcBufferSurf(srcBuffer);
-    MemObjSurface dstImgSurf(dstImage);
-    Surface *surfaces[] = {&srcBufferSurf, &dstImgSurf};
-
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcMemObj = srcBuffer;
     dc.dstMemObj = dstImage;
     dc.srcOffset = {srcOffset, 0, 0};
@@ -47,6 +42,17 @@ cl_int CommandQueueHw<GfxFamily>::enqueueCopyBufferToImage(
     if (isMipMapped(dstImage->getImageDesc())) {
         dc.dstMipLevel = findMipLevel(dstImage->getImageDesc().image_type, dstOrigin);
     }
+    if (dstImage->isImage1dBufferFromBuffer()) {
+        overrideBuiltinForImage1dBufferWithParentBuffer(dc, builtIn, false);
+    }
+
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(builtIn,
+                                                                              this->getClDevice());
+    BuiltIn::OwnershipWrapper builtInLock(builder, this->context);
+
+    MemObjSurface srcBufferSurf(srcBuffer);
+    MemObjSurface dstImgSurf(dstImage);
+    Surface *surfaces[] = {&srcBufferSurf, &dstImgSurf};
 
     MultiDispatchInfo dispatchInfo(dc);
     builder.buildDispatchInfos(dispatchInfo);

@@ -1,15 +1,20 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "sys_calls.h"
+#include "shared/source/os_interface/windows/sys_calls.h"
 
+#include "shared/source/os_interface/windows/os_inc.h"
+#include "shared/test/common/mock_gdi/mock_driver_store_paths.h"
 #include "shared/test/common/os_interface/windows/mock_sys_calls.h"
 
 #include <cstdint>
+#include <cwchar>
+#include <unordered_map>
+#include <vector>
 
 namespace NEO {
 
@@ -19,26 +24,258 @@ unsigned int getProcessId() {
     return 0xABCEDF;
 }
 
+unsigned int getCurrentProcessId() {
+    return 0xABCEDF;
+}
+
+std::string getProcessNameResult = "process_name";
+
+std::string getProcessName() {
+    return getProcessNameResult;
+}
+
 unsigned long getNumThreads() {
     return 1;
 }
 
+size_t getLastErrorCalled = 0u;
+extern const size_t getLastErrorResultCount = 4;
+DWORD getLastErrorResults[getLastErrorResultCount] = {0, 0, 0, 0};
+BOOL getLastErrorConstantResult = TRUE;
+bool isShutdownInProgressRetVal = false;
 BOOL systemPowerStatusRetVal = 1;
 BYTE systemPowerStatusACLineStatusOverride = 1;
-const wchar_t *currentLibraryPath = L"";
+const wchar_t *currentLibraryPath = mockLibraryFromAdapterDriverStore.data();
+DWORD getModuleFileNameResult = TRUE;
 uint32_t regOpenKeySuccessCount = 0u;
 uint32_t regQueryValueSuccessCount = 0u;
 uint64_t regQueryValueExpectedData = 0ull;
+uint32_t remainingRegReadCount = 0u;
 const HKEY validHkey = reinterpret_cast<HKEY>(0);
 bool getNumThreadsCalled = false;
 bool mmapAllowExtendedPointers = false;
-bool pathExistsMock = false;
 
-bool pathExists(const std::string &path) {
-    return pathExistsMock;
+size_t closeHandleCalled = 0u;
+
+size_t getTempFileNameACalled = 0u;
+UINT getTempFileNameAResult = 0u;
+
+BOOL moveFileExAResult = TRUE;
+
+size_t lockFileExCalled = 0u;
+BOOL lockFileExResult = TRUE;
+
+size_t unlockFileExCalled = 0u;
+BOOL unlockFileExResult = TRUE;
+
+size_t createDirectoryACalled = 0u;
+BOOL createDirectoryAResult = TRUE;
+
+size_t removeDirectoryACalled = 0u;
+BOOL removeDirectoryAResult = TRUE;
+BOOL erasePathAttributes = FALSE;
+
+size_t createFileACalled = 0u;
+size_t createFileACreateAlwaysCalled = 0u;
+DWORD createFileALastFlagsAndAttributes = 0u;
+extern const size_t createFileAResultsCount = 4;
+HANDLE createFileAResults[createFileAResultsCount] = {nullptr, nullptr, nullptr, nullptr};
+
+size_t deleteFileACalled = 0u;
+BOOL deleteFileAResult = TRUE;
+const size_t deleteFilesCount = 4;
+constexpr size_t deleteFilesMaxLength = 256;
+char deleteFiles[deleteFilesCount][deleteFilesMaxLength] = {{0}};
+
+HRESULT shGetKnownFolderPathResult = 0;
+extern const size_t shGetKnownFolderSetPathSize = 50;
+wchar_t shGetKnownFolderSetPath[shGetKnownFolderSetPathSize];
+
+bool callBaseReadFile = true;
+BOOL readFileResult = TRUE;
+size_t readFileCalled = 0u;
+extern const size_t readFileBufferDataSize = 32;
+char readFileBufferData[readFileBufferDataSize];
+DWORD readFileNumberOfBytesRead = 0u;
+
+size_t writeFileCalled = 0u;
+BOOL writeFileResult = true;
+extern const size_t writeFileBufferSize = 32;
+char writeFileBuffer[writeFileBufferSize];
+DWORD writeFileNumberOfBytesWritten = 0u;
+
+size_t findFirstFileACalled = 0u;
+extern const size_t findFirstFileAResultsCount = 4;
+HANDLE findFirstFileAResults[findFirstFileAResultsCount] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};
+WIN32_FIND_DATAA findFirstFileAFfd[findFirstFileAResultsCount]{};
+
+size_t findNextFileACalled = 0u;
+BOOL findNextFileAResult = TRUE;
+extern const size_t findNextFileAFileDataCount = 4;
+WIN32_FIND_DATAA findNextFileAFileData[findNextFileAFileDataCount];
+
+size_t findCloseCalled = 0u;
+
+size_t getFileAttributesCalled = 0u;
+DWORD getFileAttributesResult = INVALID_FILE_ATTRIBUTES;
+std::unordered_map<std::string, DWORD> pathAttributes;
+
+size_t setFilePointerCalled = 0u;
+DWORD setFilePointerResult = 0;
+
+size_t getFileSizeExCalled = 0u;
+BOOL getFileSizeExResult = TRUE;
+extern const size_t getFileSizeExFileSizesCount = 4;
+LONGLONG getFileSizeExFileSizes[getFileSizeExFileSizesCount] = {0, 0, 0, 0};
+
+size_t createFileMappingACalled = 0u;
+uint64_t createFileMappingALastMaximumSize = 0u;
+extern const size_t createFileMappingAResultsCount = 4;
+HANDLE createFileMappingAResults[createFileMappingAResultsCount] = {nullptr, nullptr, nullptr, nullptr};
+
+size_t mapViewOfFileCalled = 0u;
+extern const size_t mapViewOfFileResultsCount = 4;
+LPVOID mapViewOfFileResults[mapViewOfFileResultsCount] = {nullptr, nullptr, nullptr, nullptr};
+DWORD mapViewOfFileLastDesiredAccess = 0u;
+SIZE_T mapViewOfFileLastNumberOfBytesToMap = 0u;
+
+size_t unmapViewOfFileCalled = 0u;
+LPCVOID unmapViewOfFileLastAddress = nullptr;
+
+size_t setProcessPowerThrottlingStateCalled = 0u;
+ProcessPowerThrottlingState setProcessPowerThrottlingStateLastValue{};
+
+size_t setThreadPriorityCalled = 0u;
+ThreadPriority setThreadPriorityLastValue{};
+
+HANDLE(*sysCallsCreateFile)
+(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) = nullptr;
+
+BOOL (*sysCallsDeviceIoControl)(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped) = nullptr;
+
+CONFIGRET(*sysCallsCmGetDeviceInterfaceListSize)
+(PULONG pulLen, LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, ULONG ulFlags) = nullptr;
+
+CONFIGRET(*sysCallsCmGetDeviceInterfaceList)
+(LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, PZZWSTR buffer, ULONG bufferLen, ULONG ulFlags) = nullptr;
+
+CONFIGRET(*sysCallsCmGetDeviceIdSize)
+(PULONG pulLen, DEVINST dnDevInst, ULONG ulFlags) = nullptr;
+
+CONFIGRET(*sysCallsCmGetDeviceId)
+(DEVINST dnDevInst, PWSTR buffer, ULONG bufferLen, ULONG ulFlags) = nullptr;
+
+CONFIGRET(*sysCallsCmGetChild)
+(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags) = nullptr;
+
+CONFIGRET(*sysCallsCmGetSibling)
+(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags) = nullptr;
+
+BOOL (*sysCallsSetupDiGetDeviceRegistryProperty)(HDEVINFO deviceInfoSet, PSP_DEVINFO_DATA deviceInfoData, DWORD property, PDWORD propertyRegDataType, PBYTE propertyBuffer, DWORD propertyBufferSize, PDWORD requiredSize) = nullptr;
+
+BOOL (*sysCallsSetupDiOpenDeviceInfo)(HDEVINFO deviceInfoSet, PCWSTR deviceInstanceId, HWND hwndParent, DWORD openFlags, PSP_DEVINFO_DATA deviceInfoData) = nullptr;
+
+BOOL (*sysCallsSetupDiEnumDeviceInfo)(HDEVINFO deviceInfoSet, DWORD memberIndex, PSP_DEVINFO_DATA deviceInfoData) = nullptr;
+
+BOOL (*sysCallsSetupDiDestroyDeviceInfoList)(HDEVINFO deviceInfoSet) = nullptr;
+
+HDEVINFO(*sysCallsSetupDiGetClassDevs)
+(GUID *classGuid, PCWSTR enumerator, HWND hwndParent, DWORD flags) = nullptr;
+
+LPVOID(*sysCallsHeapAlloc)
+(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes) = nullptr;
+
+BOOL (*sysCallsHeapFree)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) = nullptr;
+
+BOOL (*sysCallsDuplicateHandle)(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions) = nullptr;
+
+HANDLE(*sysCallsOpenProcess)
+(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) = nullptr;
+
+DWORD(*sysCallsWaitForSingleObject)
+(HANDLE hHandle, DWORD dwMilliseconds) = nullptr;
+
+BOOL (*sysCallsRegisterWaitForSingleObject)(PHANDLE phNewWaitObject, HANDLE hObject, WAITORTIMERCALLBACK callback, PVOID context, ULONG dwMilliseconds, ULONG dwFlags) = nullptr;
+
+BOOL (*sysCallsUnregisterWait)(HANDLE waitHandle) = nullptr;
+
+size_t ntOpenDirectoryObjectCalled = 0u;
+BOOL (*sysCallsProcessIdToSessionId)(DWORD dwProcessId, DWORD *pSessionId) = nullptr;
+void (*sysCallsRtlInitUnicodeString)(PUNICODE_STRING destinationString, PCWSTR sourceString) = nullptr;
+NTSTATUS (*sysCallsNtOpenDirectoryObject)(PHANDLE directoryHandle, ACCESS_MASK desiredAccess, POBJECT_ATTRIBUTES objectAttributes) = nullptr;
+size_t ntQueryObjectCalled = 0u;
+NTSTATUS ntQueryObjectResult = STATUS_SUCCESS;
+const wchar_t *ntQueryObjectTypeName = nullptr;
+HANDLE ntQueryObjectLastHandle = nullptr;
+OBJECT_INFORMATION_CLASS ntQueryObjectLastInformationClass = ObjectBasicInformation;
+ULONG ntQueryObjectLastInformationLength = 0u;
+HANDLE openFileMappingResult = nullptr;
+DWORD openFileMappingLastDesiredAccess = 0u;
+LPCWSTR openFileMappingLastName = nullptr;
+
+bool isShutdownInProgress() {
+    return isShutdownInProgressRetVal;
+}
+
+BOOL processIdToSessionId(DWORD dwProcessId, DWORD *pSessionId) {
+    if (sysCallsProcessIdToSessionId != nullptr) {
+        return sysCallsProcessIdToSessionId(dwProcessId, pSessionId);
+    }
+    *pSessionId = 0;
+    return TRUE;
+}
+
+void rtlInitUnicodeString(PUNICODE_STRING destinationString, PCWSTR sourceString) {
+    if (sysCallsRtlInitUnicodeString != nullptr) {
+        sysCallsRtlInitUnicodeString(destinationString, sourceString);
+        return;
+    }
+    destinationString->Buffer = const_cast<PWSTR>(sourceString);
+    destinationString->Length = static_cast<USHORT>(wcslen(sourceString) * sizeof(wchar_t));
+    destinationString->MaximumLength = static_cast<USHORT>(destinationString->Length + sizeof(wchar_t));
+}
+
+NTSTATUS ntOpenDirectoryObject(PHANDLE directoryHandle, ACCESS_MASK desiredAccess, POBJECT_ATTRIBUTES objectAttributes) {
+    ntOpenDirectoryObjectCalled++;
+    if (sysCallsNtOpenDirectoryObject != nullptr) {
+        return sysCallsNtOpenDirectoryObject(directoryHandle, desiredAccess, objectAttributes);
+    }
+    *directoryHandle = reinterpret_cast<HANDLE>(dummyHandle);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ntQueryObject(HANDLE handle, OBJECT_INFORMATION_CLASS objectInformationClass, PVOID objectInformation, ULONG objectInformationLength, PULONG returnLength) {
+    ntQueryObjectCalled++;
+    ntQueryObjectLastHandle = handle;
+    ntQueryObjectLastInformationClass = objectInformationClass;
+    ntQueryObjectLastInformationLength = objectInformationLength;
+    if (ntQueryObjectResult != STATUS_SUCCESS) {
+        return ntQueryObjectResult;
+    }
+    auto &typeName = static_cast<PUBLIC_OBJECT_TYPE_INFORMATION *>(objectInformation)->TypeName;
+    typeName.Buffer = const_cast<PWSTR>(ntQueryObjectTypeName);
+    typeName.Length = ntQueryObjectTypeName ? static_cast<USHORT>(wcslen(ntQueryObjectTypeName) * sizeof(wchar_t)) : 0u;
+    typeName.MaximumLength = typeName.Length;
+    return STATUS_SUCCESS;
+}
+
+HANDLE openFileMapping(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName) {
+    openFileMappingLastDesiredAccess = dwDesiredAccess;
+    openFileMappingLastName = lpName;
+    return openFileMappingResult;
 }
 
 void exit(int code) {
+}
+
+DWORD getLastError() {
+    if (getLastErrorConstantResult) {
+        return getLastErrorResults[0];
+    }
+    if (getLastErrorCalled >= getLastErrorResultCount) {
+        return 0;
+    }
+    return getLastErrorResults[getLastErrorCalled++];
 }
 
 HANDLE createEvent(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCSTR lpName) {
@@ -48,7 +285,64 @@ HANDLE createEvent(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, B
     return reinterpret_cast<HANDLE>(dummyHandle);
 }
 
+std::atomic<size_t> resetEventCalled = 0u;
+BOOL resetEventResult = TRUE;
+BOOL resetEvent(HANDLE hEvent) {
+    resetEventCalled++;
+    return resetEventResult;
+}
+
+BOOL setEvent(HANDLE hEvent) {
+    return TRUE;
+}
+
+DWORD waitForMultipleObjectsLastTimeout = 0u;
+DWORD waitForMultipleObjectsReturnValue = 0u;
+size_t waitForMultipleObjectsCalled = 0u;
+
+DWORD waitForMultipleObjects(DWORD nCount, CONST HANDLE *lpHandles, BOOL bWaitAll, DWORD dwMilliseconds) {
+    waitForMultipleObjectsCalled++;
+    waitForMultipleObjectsLastTimeout = dwMilliseconds;
+    return waitForMultipleObjectsReturnValue;
+}
+
+DWORD waitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
+    if (sysCallsWaitForSingleObject) {
+        return sysCallsWaitForSingleObject(hHandle, dwMilliseconds);
+    }
+    return WAIT_OBJECT_0;
+}
+
+HANDLE createWaitableTimerEx(LPSECURITY_ATTRIBUTES lpTimerAttributes, LPCWSTR lpTimerName, DWORD dwFlags, DWORD dwDesiredAccess) {
+    return reinterpret_cast<HANDLE>(dummyHandle);
+}
+
+size_t setWaitableTimerCalled = 0u;
+int64_t setWaitableTimerLastDueTime = 0;
+BOOL setWaitableTimerResult = TRUE;
+
+BOOL setWaitableTimer(HANDLE hTimer, const LARGE_INTEGER *lpDueTime, LONG lPeriod, PTIMERAPCROUTINE pfnCompletionRoutine, LPVOID lpArgToCompletionRoutine, BOOL fResume) {
+    setWaitableTimerCalled++;
+    setWaitableTimerLastDueTime = lpDueTime->QuadPart;
+    return setWaitableTimerResult;
+}
+
+BOOL registerWaitForSingleObject(PHANDLE phNewWaitObject, HANDLE hObject, WAITORTIMERCALLBACK callback, PVOID context, ULONG dwMilliseconds, ULONG dwFlags) {
+    if (sysCallsRegisterWaitForSingleObject) {
+        return sysCallsRegisterWaitForSingleObject(phNewWaitObject, hObject, callback, context, dwMilliseconds, dwFlags);
+    }
+    return TRUE;
+}
+
+BOOL unregisterWait(HANDLE waitHandle) {
+    if (sysCallsUnregisterWait) {
+        return sysCallsUnregisterWait(waitHandle);
+    }
+    return TRUE;
+}
+
 BOOL closeHandle(HANDLE hObject) {
+    closeHandleCalled++;
     if (mockCloseHandleClb) {
         return mockCloseHandleClb(hObject, mockCloseHandleClbData);
     }
@@ -59,6 +353,16 @@ BOOL getSystemPowerStatus(LPSYSTEM_POWER_STATUS systemPowerStatusPtr) {
     systemPowerStatusPtr->ACLineStatus = systemPowerStatusACLineStatusOverride;
     return systemPowerStatusRetVal;
 }
+
+BOOL (*sysCallsGetLogicalProcessorInformationEx)(LOGICAL_PROCESSOR_RELATIONSHIP relationshipType, PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer, PDWORD returnedLength) = nullptr;
+
+BOOL getLogicalProcessorInformationEx(LOGICAL_PROCESSOR_RELATIONSHIP relationshipType, PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer, PDWORD returnedLength) {
+    if (sysCallsGetLogicalProcessorInformationEx != nullptr) {
+        return sysCallsGetLogicalProcessorInformationEx(relationshipType, buffer, returnedLength);
+    }
+    return FALSE;
+}
+
 BOOL getModuleHandle(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule) {
     constexpr auto expectedFlags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
     if (dwFlags != expectedFlags) {
@@ -67,23 +371,336 @@ BOOL getModuleHandle(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule) {
     *phModule = handleValue;
     return TRUE;
 }
+
 DWORD getModuleFileName(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
     lstrcpyW(lpFilename, currentLibraryPath);
+    return getModuleFileNameResult;
+}
+
+UINT getTempFileNameA(LPCSTR lpPathName, LPCSTR lpPrefixString, UINT uUnique, LPSTR lpTempFileName) {
+    getTempFileNameACalled++;
+    return getTempFileNameAResult;
+}
+
+BOOL moveFileExA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName, DWORD dwFlags) {
+    return moveFileExAResult;
+}
+
+BOOL lockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, LPOVERLAPPED lpOverlapped) {
+    lockFileExCalled++;
+    return lockFileExResult;
+}
+
+BOOL unlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, LPOVERLAPPED lpOverlapped) {
+    unlockFileExCalled++;
+    return unlockFileExResult;
+}
+
+BOOL getOverlappedResult(HANDLE hFile, LPOVERLAPPED lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait) {
     return TRUE;
 }
 
-char *openCLDriverName = "igdrcl.dll";
-
-char *getenv(const char *variableName) {
-    if (strcmp(variableName, "OpenCLDriverName") == 0) {
-        return openCLDriverName;
+BOOL createDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
+    createDirectoryACalled++;
+    if (createDirectoryAResult) {
+        pathAttributes[lpPathName] = FILE_ATTRIBUTE_DIRECTORY;
     }
-    return ::getenv(variableName);
+    return createDirectoryAResult;
+}
+
+BOOL removeDirectoryA(LPCSTR lpPathName) {
+    removeDirectoryACalled++;
+    if (removeDirectoryAResult && erasePathAttributes) {
+        pathAttributes.erase(lpPathName);
+    }
+    return removeDirectoryAResult;
+}
+
+HANDLE createFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
+    HANDLE retVal = nullptr;
+
+    if (createFileACalled < createFileAResultsCount) {
+        retVal = createFileAResults[createFileACalled];
+    }
+    if (dwCreationDisposition == CREATE_ALWAYS) {
+        createFileACreateAlwaysCalled++;
+    }
+    createFileALastFlagsAndAttributes = dwFlagsAndAttributes;
+
+    createFileACalled++;
+    return retVal;
+}
+
+BOOL deleteFileA(LPCSTR lpFileName) {
+    if (deleteFileACalled < deleteFilesCount) {
+        memcpy_s(deleteFiles[deleteFileACalled], deleteFilesMaxLength, lpFileName, strlen(lpFileName));
+    }
+    deleteFileACalled++;
+    return deleteFileAResult;
+}
+
+HRESULT shGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken, PWSTR *ppszPat) {
+    *ppszPat = shGetKnownFolderSetPath;
+    return shGetKnownFolderPathResult;
+}
+
+BOOL readFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped) {
+    readFileCalled++;
+    if (callBaseReadFile) {
+        return ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped);
+    }
+    if (lpBuffer && nNumberOfBytesToRead <= readFileBufferDataSize) {
+        memcpy_s(lpBuffer, nNumberOfBytesToRead, readFileBufferData, nNumberOfBytesToRead);
+    }
+    if (lpNumberOfBytesRead) {
+        *lpNumberOfBytesRead = readFileNumberOfBytesRead;
+    }
+    return readFileResult;
+}
+
+BOOL writeFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped) {
+    writeFileCalled++;
+    memcpy_s(writeFileBuffer, writeFileBufferSize, lpBuffer, nNumberOfBytesToWrite);
+    if (lpNumberOfBytesWritten) {
+        *lpNumberOfBytesWritten = writeFileNumberOfBytesWritten;
+    }
+    return writeFileResult;
+}
+
+HANDLE findFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData) {
+    if (findFirstFileACalled < findFirstFileAResultsCount) {
+        if (lpFindFileData && findFirstFileAFfd[findFirstFileACalled].cFileName[0] != '\0') {
+            *lpFindFileData = findFirstFileAFfd[findFirstFileACalled];
+        }
+        return findFirstFileAResults[findFirstFileACalled++];
+    }
+    findFirstFileACalled++;
+    return INVALID_HANDLE_VALUE;
+}
+
+BOOL findNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData) {
+    if (findNextFileACalled < findNextFileAFileDataCount) {
+        *lpFindFileData = findNextFileAFileData[findNextFileACalled];
+    } else {
+        findNextFileAResult = FALSE;
+    }
+    findNextFileACalled++;
+
+    return findNextFileAResult;
+}
+
+BOOL findClose(HANDLE hFindFile) {
+    findCloseCalled++;
+    return TRUE;
+}
+
+DWORD getFileAttributesA(LPCSTR lpFileName) {
+    getFileAttributesCalled++;
+
+    std::string tempP1 = lpFileName;
+    if (!tempP1.empty() && tempP1.back() == PATH_SEPARATOR) {
+        tempP1.pop_back();
+    }
+
+    for (const auto &[path, attributes] : pathAttributes) {
+        if (path.empty()) {
+            continue;
+        }
+
+        std::string tempP2 = path;
+        if (tempP2.back() == PATH_SEPARATOR) {
+            tempP2.pop_back();
+        }
+
+        if (tempP1 == tempP2) {
+            return attributes;
+        }
+    }
+
+    return getFileAttributesResult;
+}
+
+DWORD setFilePointer(HANDLE hFile, LONG lDistanceToMove, PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod) {
+    setFilePointerCalled++;
+    return setFilePointerResult;
+}
+
+BOOL getFileSizeEx(HANDLE hFile, PLARGE_INTEGER lpFileSize) {
+    lpFileSize->QuadPart = 0;
+    if (getFileSizeExCalled < getFileSizeExFileSizesCount) {
+        lpFileSize->QuadPart = getFileSizeExFileSizes[getFileSizeExCalled];
+    }
+    getFileSizeExCalled++;
+    return getFileSizeExResult;
+}
+
+HANDLE createFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES lpFileMappingAttributes, DWORD flProtect, DWORD dwMaximumSizeHigh, DWORD dwMaximumSizeLow, LPCSTR lpName) {
+    HANDLE retVal = nullptr;
+    if (createFileMappingACalled < createFileMappingAResultsCount) {
+        retVal = createFileMappingAResults[createFileMappingACalled];
+    }
+    createFileMappingALastMaximumSize = (static_cast<uint64_t>(dwMaximumSizeHigh) << 32) | dwMaximumSizeLow;
+    createFileMappingACalled++;
+    return retVal;
+}
+
+LPVOID mapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess, DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap) {
+    LPVOID retVal = nullptr;
+    if (mapViewOfFileCalled < mapViewOfFileResultsCount) {
+        retVal = mapViewOfFileResults[mapViewOfFileCalled];
+    }
+    mapViewOfFileCalled++;
+    mapViewOfFileLastDesiredAccess = dwDesiredAccess;
+    mapViewOfFileLastNumberOfBytesToMap = dwNumberOfBytesToMap;
+    return retVal;
+}
+
+BOOL unmapViewOfFile(LPCVOID lpBaseAddress) {
+    unmapViewOfFileCalled++;
+    unmapViewOfFileLastAddress = lpBaseAddress;
+    return TRUE;
+}
+
+void coTaskMemFree(LPVOID pv) {
+    return;
+}
+
+void setProcessPowerThrottlingState(ProcessPowerThrottlingState state) {
+    setProcessPowerThrottlingStateCalled++;
+    setProcessPowerThrottlingStateLastValue = state;
+}
+
+void setThreadPriority(ThreadPriority priority) {
+    setThreadPriorityCalled++;
+    setThreadPriorityLastValue = priority;
+}
+
+HANDLE createFile(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
+    if (sysCallsCreateFile != nullptr) {
+        return sysCallsCreateFile(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    }
+    return nullptr;
+}
+
+BOOL deviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped) {
+    if (sysCallsDeviceIoControl != nullptr) {
+        return sysCallsDeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped);
+    }
+    return false;
+}
+
+CONFIGRET cmGetDeviceInterfaceListSize(PULONG pulLen, LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, ULONG ulFlags) {
+    if (sysCallsCmGetDeviceInterfaceListSize != nullptr) {
+        return sysCallsCmGetDeviceInterfaceListSize(pulLen, interfaceClassGuid, pDeviceID, ulFlags);
+    }
+    return -1;
+}
+
+CONFIGRET cmGetDeviceInterfaceList(LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, PZZWSTR buffer, ULONG bufferLen, ULONG ulFlags) {
+    if (sysCallsCmGetDeviceInterfaceList != nullptr) {
+        return sysCallsCmGetDeviceInterfaceList(interfaceClassGuid, pDeviceID, buffer, bufferLen, ulFlags);
+    }
+    return -1;
+}
+
+CONFIGRET cmGetDeviceIdSize(PULONG pulLen, DEVINST dnDevInst, ULONG ulFlags) {
+    if (sysCallsCmGetDeviceIdSize != nullptr) {
+        return sysCallsCmGetDeviceIdSize(pulLen, dnDevInst, ulFlags);
+    }
+    return -1;
+}
+
+CONFIGRET cmGetDeviceId(DEVINST dnDevInst, PWSTR buffer, ULONG bufferLen, ULONG ulFlags) {
+    if (sysCallsCmGetDeviceId != nullptr) {
+        return sysCallsCmGetDeviceId(dnDevInst, buffer, bufferLen, ulFlags);
+    }
+    return -1;
+}
+
+CONFIGRET cmGetChild(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags) {
+    if (sysCallsCmGetChild != nullptr) {
+        return sysCallsCmGetChild(pdnDevInst, dnDevInst, ulFlags);
+    }
+    return -1;
+}
+
+CONFIGRET cmGetSibling(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags) {
+    if (sysCallsCmGetSibling != nullptr) {
+        return sysCallsCmGetSibling(pdnDevInst, dnDevInst, ulFlags);
+    }
+    return -1;
+}
+
+BOOL setupDiGetDeviceRegistryProperty(HDEVINFO deviceInfoSet, PSP_DEVINFO_DATA deviceInfoData, DWORD property, PDWORD propertyRegDataType, PBYTE propertyBuffer, DWORD propertyBufferSize, PDWORD requiredSize) {
+    if (sysCallsSetupDiGetDeviceRegistryProperty != nullptr) {
+        return sysCallsSetupDiGetDeviceRegistryProperty(deviceInfoSet, deviceInfoData, property, propertyRegDataType, propertyBuffer, propertyBufferSize, requiredSize);
+    }
+    return false;
+}
+
+BOOL setupDiOpenDeviceInfo(HDEVINFO deviceInfoSet, PCWSTR deviceInstanceId, HWND hwndParent, DWORD openFlags, PSP_DEVINFO_DATA deviceInfoData) {
+    if (sysCallsSetupDiOpenDeviceInfo != nullptr) {
+        return sysCallsSetupDiOpenDeviceInfo(deviceInfoSet, deviceInstanceId, hwndParent, openFlags, deviceInfoData);
+    }
+    return false;
+}
+
+BOOL setupDiEnumDeviceInfo(HDEVINFO deviceInfoSet, DWORD memberIndex, PSP_DEVINFO_DATA deviceInfoData) {
+    if (sysCallsSetupDiEnumDeviceInfo != nullptr) {
+        return sysCallsSetupDiEnumDeviceInfo(deviceInfoSet, memberIndex, deviceInfoData);
+    }
+    return false;
+}
+
+BOOL setupDiDestroyDeviceInfoList(HDEVINFO deviceInfoSet) {
+    if (sysCallsSetupDiDestroyDeviceInfoList != nullptr) {
+        return sysCallsSetupDiDestroyDeviceInfoList(deviceInfoSet);
+    }
+    return false;
+}
+
+HDEVINFO setupDiGetClassDevs(GUID *classGuid, PCWSTR enumerator, HWND hwndParent, DWORD flags) {
+    if (sysCallsSetupDiGetClassDevs != nullptr) {
+        return sysCallsSetupDiGetClassDevs(classGuid, enumerator, hwndParent, flags);
+    }
+    return nullptr;
+}
+
+LPVOID heapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes) {
+    if (sysCallsHeapAlloc != nullptr) {
+        return sysCallsHeapAlloc(hHeap, dwFlags, dwBytes);
+    }
+    return HeapAlloc(hHeap, dwFlags, dwBytes);
+}
+
+BOOL heapFree(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem) {
+    if (sysCallsHeapFree != nullptr) {
+        return sysCallsHeapFree(hHeap, dwFlags, lpMem);
+    }
+    return HeapFree(hHeap, dwFlags, lpMem);
+}
+
+BOOL duplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions) {
+    if (sysCallsDuplicateHandle != nullptr) {
+        return sysCallsDuplicateHandle(hSourceProcessHandle, hSourceHandle, hTargetProcessHandle, lpTargetHandle, dwDesiredAccess, bInheritHandle, dwOptions);
+    }
+    return FALSE;
+}
+
+HANDLE openProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) {
+    if (sysCallsOpenProcess != nullptr) {
+        return sysCallsOpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId);
+    }
+    return nullptr;
 }
 
 LSTATUS regOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {
-    if (regOpenKeySuccessCount > 0) {
-        regOpenKeySuccessCount--;
+    if (regOpenKeySuccessCount > 0 || remainingRegReadCount > 0) {
+        if (regOpenKeySuccessCount > 0) {
+            regOpenKeySuccessCount--;
+        } else {
+            remainingRegReadCount--;
+        }
         if (phkResult) {
             *phkResult = validHkey;
         }
@@ -93,14 +710,18 @@ LSTATUS regOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDes
 };
 
 LSTATUS regQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData) {
-    if (hKey == validHkey && regQueryValueSuccessCount > 0) {
-        regQueryValueSuccessCount--;
+    if (hKey == validHkey && (regQueryValueSuccessCount > 0 || remainingRegReadCount > 0)) {
+        if (regQueryValueSuccessCount > 0) {
+            regQueryValueSuccessCount--;
+        } else {
+            remainingRegReadCount--;
+        }
 
         if (lpcbData) {
             if (strcmp(lpValueName, "settingSourceString") == 0) {
                 const auto settingSource = "registry";
                 if (lpData) {
-                    strcpy(reinterpret_cast<char *>(lpData), settingSource);
+                    strcpy_s(reinterpret_cast<char *>(lpData), strlen(settingSource) + 1u, settingSource);
                 } else {
                     *lpcbData = static_cast<DWORD>(strlen(settingSource) + 1u);
                     if (lpType) {
@@ -143,18 +764,80 @@ LSTATUS regQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDW
     }
     return ERROR_FILE_NOT_FOUND;
 };
+
+MEMORY_BASIC_INFORMATION virtualQueryMemoryBasicInformation = {};
+SIZE_T virtualQueryResult = sizeof(MEMORY_BASIC_INFORMATION);
+SIZE_T virtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength) {
+    memcpy_s(lpBuffer, sizeof(MEMORY_BASIC_INFORMATION), &virtualQueryMemoryBasicInformation, sizeof(MEMORY_BASIC_INFORMATION));
+    return virtualQueryResult;
+}
+
+BOOL (*sysCallsGetModuleHandleExW)(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule) = nullptr;
+DWORD(*sysCallsGetModuleFileNameW)
+(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) = nullptr;
+BOOL (*sysCallsGetModuleHandleExA)(DWORD dwFlags, LPCSTR lpModuleName, HMODULE *phModule) = nullptr;
+DWORD(*sysCallsGetModuleFileNameA)
+(HMODULE hModule, LPSTR lpFilename, DWORD nSize) = nullptr;
+DWORD(*sysCallsGetFileVersionInfoSizeW)
+(LPCWSTR lptstrFilename, LPDWORD lpdwHandle) = nullptr;
+BOOL (*sysCallsGetFileVersionInfoW)(LPCWSTR lptstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData) = nullptr;
+BOOL (*sysCallsVerQueryValueW)(LPCVOID pBlock, LPCWSTR lpSubBlock, LPVOID *lplpBuffer, PUINT puLen) = nullptr;
+DWORD(*sysCallsGetLastError)
+() = nullptr;
+BOOL getModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule) {
+    if (sysCallsGetModuleHandleExW) {
+        return sysCallsGetModuleHandleExW(dwFlags, lpModuleName, phModule);
+    }
+    return FALSE;
+}
+DWORD getModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
+    if (sysCallsGetModuleFileNameW) {
+        return sysCallsGetModuleFileNameW(hModule, lpFilename, nSize);
+    }
+    return 0;
+}
+BOOL getModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName, HMODULE *phModule) {
+    if (sysCallsGetModuleHandleExA) {
+        return sysCallsGetModuleHandleExA(dwFlags, lpModuleName, phModule);
+    }
+    return FALSE;
+}
+DWORD getModuleFileNameA(HMODULE hModule, LPSTR lpFilename, DWORD nSize) {
+    if (sysCallsGetModuleFileNameA) {
+        return sysCallsGetModuleFileNameA(hModule, lpFilename, nSize);
+    }
+    return 0;
+}
+DWORD getFileVersionInfoSizeW(LPCWSTR lptstrFilename, LPDWORD lpdwHandle) {
+    if (sysCallsGetFileVersionInfoSizeW) {
+        return sysCallsGetFileVersionInfoSizeW(lptstrFilename, lpdwHandle);
+    }
+    return 0;
+}
+BOOL getFileVersionInfoW(LPCWSTR lptstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData) {
+    if (sysCallsGetFileVersionInfoW) {
+        return sysCallsGetFileVersionInfoW(lptstrFilename, dwHandle, dwLen, lpData);
+    }
+    return FALSE;
+}
+BOOL verQueryValueW(LPCVOID pBlock, LPCWSTR lpSubBlock, LPVOID *lplpBuffer, PUINT puLen) {
+    if (sysCallsVerQueryValueW) {
+        return sysCallsVerQueryValueW(pBlock, lpSubBlock, lplpBuffer, puLen);
+    }
+    return FALSE;
+}
+LPWCH mockEnvStringsW = nullptr;
+BOOL mockFreeEnvStringsWResult = TRUE;
+LPWCH getEnvironmentStringsW() {
+    return mockEnvStringsW;
+}
+BOOL freeEnvironmentStringsW(LPWCH) {
+    return mockFreeEnvStringsWResult;
+}
+
 } // namespace SysCalls
-
-bool isShutdownInProgress() {
-    return false;
-}
-
-unsigned int getPid() {
-    return 0xABCEDF;
-}
 
 unsigned int readEnablePreemptionRegKey() {
     return 1;
 }
-
 } // namespace NEO

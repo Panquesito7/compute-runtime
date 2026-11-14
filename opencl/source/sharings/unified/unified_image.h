@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,14 +14,18 @@
 namespace NEO {
 class Image;
 class Context;
+class GraphicsAllocation;
+enum class UnifiedSharingHandleType;
 struct ImageInfo;
+struct UnifiedSharingMemoryDescription;
 
 class UnifiedImage : public UnifiedSharing {
     using UnifiedSharing::UnifiedSharing;
 
   public:
     static Image *createSharedUnifiedImage(Context *context, cl_mem_flags flags, UnifiedSharingMemoryDescription description,
-                                           const cl_image_format *imageFormat, const cl_image_desc *imageDesc, cl_int *errcodeRet);
+                                           const cl_image_format *imageFormat, const cl_image_desc *imageDesc, cl_int *errcodeRet,
+                                           const RootDeviceIndicesContainer &targetRootDeviceIndices);
 
     static void *swapGmm(GraphicsAllocation *graphicsAllocation, Context *context, ImageInfo *imgInfo);
 };

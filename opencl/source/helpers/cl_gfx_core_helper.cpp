@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,7 +12,7 @@
 
 namespace NEO {
 
-createClGfxCoreHelperFunctionType clGfxCoreHelperFactory[IGFX_MAX_CORE] = {};
+createClGfxCoreHelperFunctionType clGfxCoreHelperFactory[NEO::maxCoreEnumValue] = {};
 
 std::unique_ptr<ClGfxCoreHelper> ClGfxCoreHelper::create(GFXCORE_FAMILY gfxCore) {
     auto createClGfxCoreHelperFunc = clGfxCoreHelperFactory[gfxCore];
@@ -21,14 +21,6 @@ std::unique_ptr<ClGfxCoreHelper> ClGfxCoreHelper::create(GFXCORE_FAMILY gfxCore)
     }
     auto clGfxCoreHelper = createClGfxCoreHelperFunc();
     return clGfxCoreHelper;
-}
-
-uint8_t ClGfxCoreHelper::makeDeviceRevision(const HardwareInfo &hwInfo) {
-    return static_cast<uint8_t>(!hwInfo.capabilityTable.isIntegratedDevice);
-}
-
-cl_version ClGfxCoreHelper::makeDeviceIpVersion(uint16_t major, uint8_t minor, uint8_t revision) {
-    return (major << 16) | (minor << 8) | revision;
 }
 
 template <>

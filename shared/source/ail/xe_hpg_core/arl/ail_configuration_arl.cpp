@@ -1,0 +1,56 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/ail/ail_configuration_base.inl"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/hw_info.h"
+
+#include "aubstream/engine_node.h"
+
+#include <map>
+#include <vector>
+
+namespace NEO {
+
+extern std::map<std::string_view, std::vector<AILEnumeration>> applicationMapXeHpgLpg;
+
+static EnableAIL<IGFX_ARROWLAKE> enableAILARL;
+
+template <>
+void AILConfigurationHw<IGFX_ARROWLAKE>::applyExt(HardwareInfo &hwInfo) {
+    auto search = applicationMapXeHpgLpg.find(processName);
+    if (search != applicationMapXeHpgLpg.end()) {
+        for (size_t i = 0; i < search->second.size(); ++i) {
+            switch (search->second[i]) {
+            case AILEnumeration::disableDirectSubmission:
+                hwInfo.capabilityTable.directSubmissionEngines.data[aub_stream::ENGINE_CCS].engineSupported = false;
+                break;
+            case AILEnumeration::directSubmissionControllerConfig:
+                debugManager.flags.DirectSubmissionControllerTimeout.set(1000);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
+template <>
+bool AILConfigurationHw<IGFX_ARROWLAKE>::isBufferPoolEnabled() {
+    auto iterator = applicationsBufferPoolDisabledXe.find(processName);
+    return iterator == applicationsBufferPoolDisabledXe.end();
+}
+
+template <>
+bool AILConfigurationHw<IGFX_ARROWLAKE>::limitAmountOfDeviceMemoryForRecycling() {
+    auto iterator = applicationsDeviceUSMRecyclingLimited.find(processName);
+    return iterator != applicationsDeviceUSMRecyclingLimited.end();
+}
+
+template class AILConfigurationHw<IGFX_ARROWLAKE>;
+
+} // namespace NEO

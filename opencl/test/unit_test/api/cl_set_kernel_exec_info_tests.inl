@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,7 +15,7 @@
 
 using namespace NEO;
 
-class KernelExecInfoFixture : public ApiFixture<> {
+class KernelExecInfoFixture : public ApiFixture {
   protected:
     void setUp() {
         ApiFixture::setUp();
@@ -69,42 +69,7 @@ TEST_F(clSetKernelExecInfoTests, GivenNullKernelWhenSettingAdditionalKernelInfoT
     EXPECT_EQ(CL_INVALID_KERNEL, retVal);
 }
 
-TEST_F(clSetKernelExecInfoTests, GivenDeviceNotSupportingSvmWhenSettingKernelExecInfoThenErrorIsReturnedOnSvmRelatedParams) {
-    auto &clGfxCoreHelper = pDevice->getRootDeviceEnvironment().getHelper<ClGfxCoreHelper>();
-    if (!clGfxCoreHelper.isSupportedKernelThreadArbitrationPolicy()) {
-        GTEST_SKIP();
-    }
-    auto hwInfo = executionEnvironment->rootDeviceEnvironments[ApiFixture::testedRootDeviceIndex]->getMutableHardwareInfo();
-    VariableBackup<bool> ftrSvm{&hwInfo->capabilityTable.ftrSvm, false};
-
-    cl_int retVal{CL_SUCCESS};
-    std::unique_ptr<MultiDeviceKernel> pMultiDeviceKernel(MultiDeviceKernel::create<MockKernel>(
-        pProgram, MockKernel::toKernelInfoContainer(*pKernelInfo, testedRootDeviceIndex), retVal));
-    ASSERT_EQ(CL_SUCCESS, retVal);
-
-    uint32_t newPolicy = CL_KERNEL_EXEC_INFO_THREAD_ARBITRATION_POLICY_ROUND_ROBIN_INTEL;
-    retVal = clSetKernelExecInfo(
-        pMockMultiDeviceKernel,                              // cl_kernel kernel
-        CL_KERNEL_EXEC_INFO_THREAD_ARBITRATION_POLICY_INTEL, // cl_kernel_exec_info param_name
-        sizeof(newPolicy),                                   // size_t param_value_size
-        &newPolicy                                           // const void *param_value
-    );
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    cl_kernel_exec_info svmParams[] = {CL_KERNEL_EXEC_INFO_SVM_PTRS, CL_KERNEL_EXEC_INFO_SVM_FINE_GRAIN_SYSTEM};
-    for (auto svmParam : svmParams) {
-        retVal = clSetKernelExecInfo(
-            pMockMultiDeviceKernel, // cl_kernel kernel
-            svmParam,               // cl_kernel_exec_info param_name
-            0,                      // size_t param_value_size
-            nullptr                 // const void *param_value
-        );
-        EXPECT_EQ(CL_INVALID_OPERATION, retVal);
-    }
-}
-
 TEST_F(clSetKernelExecInfoTests, GivenNullParamValueWhenSettingAdditionalKernelInfoThenInvalidValueErrorIsReturned) {
-    REQUIRE_SVM_OR_SKIP(defaultHwInfo);
     void **pSvmPtrList = nullptr;
     size_t svmPtrListSizeInBytes = 1 * sizeof(void *);
 
@@ -118,7 +83,6 @@ TEST_F(clSetKernelExecInfoTests, GivenNullParamValueWhenSettingAdditionalKernelI
 }
 
 TEST_F(clSetKernelExecInfoTests, GivenNullPointerInParamValueWhenSettingAdditionalKernelInfoThenInvalidValueErrorIsReturned) {
-    REQUIRE_SVM_OR_SKIP(defaultHwInfo);
     void *pSvmPtrList[] = {nullptr};
     size_t svmPtrListSizeInBytes = 1 * sizeof(void *);
 
@@ -132,7 +96,6 @@ TEST_F(clSetKernelExecInfoTests, GivenNullPointerInParamValueWhenSettingAddition
 }
 
 TEST_F(clSetKernelExecInfoTests, GivenParamSizeZeroWhenSettingAdditionalKernelInfoThenInvalidValueErrorIsReturned) {
-    REQUIRE_SVM_OR_SKIP(defaultHwInfo);
     void *pSvmPtrList[] = {ptrSvm};
     size_t svmPtrListSizeInBytes = 0;
 
@@ -146,7 +109,6 @@ TEST_F(clSetKernelExecInfoTests, GivenParamSizeZeroWhenSettingAdditionalKernelIn
 }
 
 TEST_F(clSetKernelExecInfoTests, GivenInvalidParamSizeWhenSettingAdditionalKernelInfoThenInvalidValueErrorIsReturned) {
-    REQUIRE_SVM_OR_SKIP(defaultHwInfo);
     void *pSvmPtrList[] = {ptrSvm};
     size_t svmPtrListSizeInBytes = (size_t)(-1);
 
@@ -202,60 +164,6 @@ TEST_F(clSetKernelExecInfoTests, GivenValidPointerListWithOnePointerWhenSettingA
     }
 }
 
-TEST_F(clSetKernelExecInfoTests, GivenValidPointerListWithMultiplePointersWhenSettingAdditionalKernelInfoThenSuccessIsReturned) {
-    if (svmCapabilities != 0) {
-        void *ptrSvm1 = clSVMAlloc(pContext, CL_MEM_READ_WRITE, 256, 4);
-        EXPECT_NE(nullptr, ptrSvm1);
-
-        void *ptrSvm2 = clSVMAlloc(pContext, CL_MEM_READ_WRITE, 256, 4);
-        EXPECT_NE(nullptr, ptrSvm2);
-
-        void *pSvmPtrList[] = {ptrSvm, ptrSvm1, ptrSvm2};
-        size_t svmPtrListSizeInBytes = 3 * sizeof(void *);
-
-        retVal = clSetKernelExecInfo(
-            pMockMultiDeviceKernel,       // cl_kernel kernel
-            CL_KERNEL_EXEC_INFO_SVM_PTRS, // cl_kernel_exec_info param_name
-            svmPtrListSizeInBytes,        // size_t param_value_size
-            pSvmPtrList                   // const void *param_value
-        );
-        EXPECT_EQ(CL_SUCCESS, retVal);
-
-        EXPECT_EQ(3u, pMockKernel->kernelSvmGfxAllocations.size());
-        EXPECT_TRUE(pMockKernel->svmAllocationsRequireCacheFlush);
-
-        clSVMFree(pContext, ptrSvm1);
-        clSVMFree(pContext, ptrSvm2);
-    }
-}
-
-TEST_F(clSetKernelExecInfoTests, givenReadOnlySvmPtrListWhenUsedAsKernelPointersThenCacheFlushIsNotRequired) {
-    if (svmCapabilities != 0) {
-        void *ptrSvm1 = clSVMAlloc(pContext, CL_MEM_READ_ONLY, 256, 4);
-        EXPECT_NE(nullptr, ptrSvm1);
-
-        void *ptrSvm2 = clSVMAlloc(pContext, CL_MEM_READ_ONLY, 256, 4);
-        EXPECT_NE(nullptr, ptrSvm2);
-
-        void *pSvmPtrList[] = {ptrSvm1, ptrSvm2};
-        size_t svmPtrListSizeInBytes = 2 * sizeof(void *);
-
-        retVal = clSetKernelExecInfo(
-            pMockMultiDeviceKernel,       // cl_kernel kernel
-            CL_KERNEL_EXEC_INFO_SVM_PTRS, // cl_kernel_exec_info param_name
-            svmPtrListSizeInBytes,        // size_t param_value_size
-            pSvmPtrList                   // const void *param_value
-        );
-        EXPECT_EQ(CL_SUCCESS, retVal);
-
-        EXPECT_EQ(2u, pMockKernel->kernelSvmGfxAllocations.size());
-        EXPECT_FALSE(pMockKernel->svmAllocationsRequireCacheFlush);
-
-        clSVMFree(pContext, ptrSvm1);
-        clSVMFree(pContext, ptrSvm2);
-    }
-}
-
 TEST_F(clSetKernelExecInfoTests, GivenMultipleSettingKernelInfoOperationsWhenSettingAdditionalKernelInfoThenSuccessIsReturned) {
     if (svmCapabilities != 0) {
         void *pSvmPtrList[] = {ptrSvm};
@@ -280,6 +188,16 @@ TEST_F(clSetKernelExecInfoTests, GivenMultipleSettingKernelInfoOperationsWhenSet
         EXPECT_EQ(CL_SUCCESS, retVal);
 
         EXPECT_EQ(1u, pMockKernel->kernelSvmGfxAllocations.size());
+
+        retVal = clSetKernelExecInfo(
+            pMockMultiDeviceKernel,       // cl_kernel kernel
+            CL_KERNEL_EXEC_INFO_SVM_PTRS, // cl_kernel_exec_info param_name
+            0,                            // size_t param_value_size
+            nullptr                       // const void *param_value
+        );
+        EXPECT_EQ(CL_SUCCESS, retVal);
+
+        EXPECT_EQ(0u, pMockKernel->kernelSvmGfxAllocations.size());
     }
 }
 
@@ -399,7 +317,7 @@ HWTEST_F(clSetKernelExecInfoTests, givenDifferentExecutionTypesWhenSettingAdditi
         &kernelExecutionType    // const void *param_value
     );
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(KernelExecutionType::Default, pMockKernel->executionType);
+    EXPECT_EQ(KernelExecutionType::defaultType, pMockKernel->executionType);
 
     kernelExecutionType = CL_KERNEL_EXEC_INFO_CONCURRENT_TYPE_INTEL;
     retVal = clSetKernelExecInfo(
@@ -409,7 +327,82 @@ HWTEST_F(clSetKernelExecInfoTests, givenDifferentExecutionTypesWhenSettingAdditi
         &kernelExecutionType    // const void *param_value
     );
     EXPECT_EQ(CL_SUCCESS, retVal);
-    EXPECT_EQ(KernelExecutionType::Concurrent, pMockKernel->executionType);
+    EXPECT_EQ(KernelExecutionType::concurrent, pMockKernel->executionType);
+}
+
+HWTEST_F(clSetKernelExecInfoTests, givenDispatchTypeParamWhenSettingKernelExecInfoThenDispatchTypeValuesAreAppliedAndOtherValuesAreRejected) {
+    cl_kernel_exec_info paramName = CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_INTEL;
+    size_t paramSize = sizeof(cl_kernel_exec_info_dispatch_type_intel);
+    cl_kernel_exec_info_dispatch_type_intel dispatchType = CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_CONCURRENT_INTEL;
+
+    retVal = clSetKernelExecInfo(
+        pMockMultiDeviceKernel, // cl_kernel kernel
+        paramName,              // cl_kernel_exec_info param_name
+        paramSize,              // size_t param_value_size
+        &dispatchType           // const void *param_value
+    );
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(KernelExecutionType::concurrent, pMockKernel->executionType);
+
+    dispatchType = CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_DEFAULT_INTEL;
+    retVal = clSetKernelExecInfo(
+        pMockMultiDeviceKernel, // cl_kernel kernel
+        paramName,              // cl_kernel_exec_info param_name
+        paramSize,              // size_t param_value_size
+        &dispatchType           // const void *param_value
+    );
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(KernelExecutionType::defaultType, pMockKernel->executionType);
+
+    dispatchType = CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_CONCURRENT_INTEL + 1;
+    retVal = clSetKernelExecInfo(
+        pMockMultiDeviceKernel, // cl_kernel kernel
+        paramName,              // cl_kernel_exec_info param_name
+        paramSize,              // size_t param_value_size
+        &dispatchType           // const void *param_value
+    );
+    EXPECT_EQ(CL_INVALID_VALUE, retVal);
+    EXPECT_EQ(KernelExecutionType::defaultType, pMockKernel->executionType);
+}
+
+TEST_F(clSetKernelExecInfoTests, GivenSystemPtrWithSharedSystemEnabledWhenSettingKernelExecInfoThenSuccessIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableSharedSystemUsmSupport.set(1);
+
+    if (!pDevice->areSharedSystemAllocationsAllowed()) {
+        GTEST_SKIP();
+    }
+
+    uint8_t data{};
+
+    void *pSvmPtrList[] = {&data};
+    size_t svmPtrListSizeInBytes = 1 * sizeof(void *);
+
+    retVal = clSetKernelExecInfo(
+        pMockMultiDeviceKernel,       // cl_kernel kernel
+        CL_KERNEL_EXEC_INFO_SVM_PTRS, // cl_kernel_exec_info param_name
+        svmPtrListSizeInBytes,        // size_t param_value_size
+        pSvmPtrList                   // const void *param_value
+    );
+    EXPECT_EQ(CL_SUCCESS, retVal);
+}
+
+TEST_F(clSetKernelExecInfoTests, GivenSystemPtrWithSharedSystemNotEnabledWhenSettingKernelExecInfoThenInvalidValueErrorIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableSharedSystemUsmSupport.set(0);
+
+    uint8_t data{};
+
+    void *pSvmPtrList[] = {&data};
+    size_t svmPtrListSizeInBytes = 1 * sizeof(void *);
+
+    retVal = clSetKernelExecInfo(
+        pMockMultiDeviceKernel,       // cl_kernel kernel
+        CL_KERNEL_EXEC_INFO_SVM_PTRS, // cl_kernel_exec_info param_name
+        svmPtrListSizeInBytes,        // size_t param_value_size
+        pSvmPtrList                   // const void *param_value
+    );
+    EXPECT_EQ(CL_INVALID_VALUE, retVal);
 }
 
 } // namespace ULT

@@ -1,36 +1,46 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/aub/aub_helper.h"
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/aub_mem_dump/page_table_entry_bits.h"
 #include "shared/source/command_stream/command_stream_receiver_simulated_common_hw.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/bit_helpers.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/tbx/tbx_proto.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/test_macros/hw_test.h"
-#include "shared/test/unit_test/mocks/mock_lrca_helper.h"
 
 using namespace NEO;
 
-TEST(AubHelper, GivenZeroPdEntryBitsWhenGetMemTraceIsCalledThenTraceNonLocalIsReturned) {
-    int hint = AubHelper::getMemTrace(0u);
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceNonlocal, hint);
-}
-
 TEST(AubHelper, WhenGetPtEntryBitsIsCalledThenEntryBitsAreNotMasked) {
-    uint64_t entryBits = BIT(PageTableEntry::presentBit) |
-                         BIT(PageTableEntry::writableBit) |
-                         BIT(PageTableEntry::userSupervisorBit);
+    uint64_t entryBits = makeBitMask<PageTableEntry::presentBit,
+                                     PageTableEntry::writableBit,
+                                     PageTableEntry::userSupervisorBit>();
     uint64_t maskedEntryBits = AubHelper::getPTEntryBits(entryBits);
     EXPECT_EQ(entryBits, maskedEntryBits);
+}
+
+TEST(AubHelper, givenConditionalTileFormatWhenGettingDeviceConfigStringThenTileCountIsIncludedOnlyForMultipleTiles) {
+    EXPECT_EQ("2x3x4", AubHelper::getDeviceConfigString(false, false, 1, 2, 3, 4));
+    EXPECT_EQ("2tx2x3x4", AubHelper::getDeviceConfigString(false, false, 2, 2, 3, 4));
+}
+
+TEST(AubHelper, givenAlwaysIncludeTileFormatWhenGettingDeviceConfigStringThenTileCountIsAlwaysIncluded) {
+    EXPECT_EQ("1tx2x3x4", AubHelper::getDeviceConfigString(true, false, 1, 2, 3, 4));
+    EXPECT_EQ("12tx9x6x3", AubHelper::getDeviceConfigString(true, false, 12, 9, 6, 3));
+}
+
+TEST(AubHelper, givenXeCuSegmentFormatWhenGettingDeviceConfigStringThenXeCuCountIsDerivedFromSliceCount) {
+    EXPECT_EQ("1tx1x4x3x2", AubHelper::getDeviceConfigString(true, true, 1, 4, 3, 2));
+    EXPECT_EQ("1tx2x4x3x2", AubHelper::getDeviceConfigString(true, true, 1, 8, 3, 2));
 }
 
 TEST(AubHelper, GivenMultipleSubDevicesWhenGettingDeviceCountThenCorrectValueIsReturned) {
@@ -40,152 +50,143 @@ TEST(AubHelper, GivenMultipleSubDevicesWhenGettingDeviceCountThenCorrectValueIsR
     RuntimeCapabilityTable capTable = {};
     GT_SYSTEM_INFO sysInfo = {};
     PLATFORM platform = {};
-    HardwareInfo hwInfo{&platform, &featureTable, &workaroundTable, &sysInfo, capTable, {}};
-    DebugManager.flags.CreateMultipleSubDevices.set(2);
+    HardwareInfo hwInfo{&platform, &featureTable, &workaroundTable, &sysInfo, capTable};
+    debugManager.flags.CreateMultipleSubDevices.set(2);
 
     uint32_t devicesCount = GfxCoreHelper::getSubDevicesCount(&hwInfo);
     EXPECT_EQ(devicesCount, 2u);
 
-    DebugManager.flags.CreateMultipleSubDevices.set(0);
+    debugManager.flags.CreateMultipleSubDevices.set(0);
     devicesCount = GfxCoreHelper::getSubDevicesCount(&hwInfo);
     EXPECT_EQ(devicesCount, 1u);
 }
 
-TEST(AubHelper, WhenGetMemTraceIsCalledWithLocalMemoryPDEntryBitsThenTraceLocalIsReturned) {
-    int hint = AubHelper::getMemTrace(BIT(PageTableEntry::localMemoryBit));
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, hint);
-}
-
 TEST(AubHelper, WhenMaskPTEntryBitsIsCalledThenLocalMemoryBitIsMasked) {
-    uint64_t entryBits = BIT(PageTableEntry::presentBit) |
-                         BIT(PageTableEntry::writableBit) |
-                         BIT(PageTableEntry::userSupervisorBit) |
-                         BIT(PageTableEntry::localMemoryBit);
+    uint64_t entryBits = makeBitMask<PageTableEntry::presentBit,
+                                     PageTableEntry::writableBit,
+                                     PageTableEntry::userSupervisorBit,
+                                     PageTableEntry::localMemoryBit>();
     uint64_t maskedEntryBits = AubHelper::getPTEntryBits(entryBits);
-    EXPECT_EQ(entryBits & ~BIT(PageTableEntry::localMemoryBit), maskedEntryBits);
-}
-
-TEST(AubHelper, WhenGetMemTypeIsCalledWithAGivenAddressSpaceThenCorrectMemTypeIsReturned) {
-    uint32_t addressSpace = AubHelper::getMemType(AubMemDump::AddressSpaceValues::TraceLocal);
-    EXPECT_EQ(mem_types::MEM_TYPE_LOCALMEM, addressSpace);
-
-    addressSpace = AubHelper::getMemType(AubMemDump::AddressSpaceValues::TraceNonlocal);
-    EXPECT_EQ(mem_types::MEM_TYPE_SYSTEM, addressSpace);
+    EXPECT_EQ(entryBits & ~makeBitMask<PageTableEntry::localMemoryBit>(), maskedEntryBits);
 }
 
 TEST(AubHelper, WhenHBMSizePerTileInGigabytesIsSetThenGetMemBankSizeReturnsCorrectValue) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.HBMSizePerTileInGigabytes.set(8);
+    debugManager.flags.HBMSizePerTileInGigabytes.set(8);
 
     HardwareInfo hwInfo = *defaultHwInfo;
     GT_SYSTEM_INFO &sysInfo = hwInfo.gtSystemInfo;
+    auto releaseHelper = ReleaseHelper::create(hwInfo.ipVersion);
 
     sysInfo.MultiTileArchInfo.IsValid = true;
     sysInfo.MultiTileArchInfo.TileCount = 1;
-    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo));
+    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo, *releaseHelper));
 
     sysInfo.MultiTileArchInfo.TileCount = 2;
-    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo));
+    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo, *releaseHelper));
 
     sysInfo.MultiTileArchInfo.TileCount = 4;
-    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo));
+    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo, *releaseHelper));
 }
 
-TEST(AubHelper, WhenHBMSizePerTileInGigabytesIsNotSetThenGetMemBankSizeReturnsCorrectValue) {
+TEST(AubHelper, givenAllocationTypeWhenAskingIfOneTimeWritableThenReturnCorrectResult) {
+    for (uint32_t i = 0; i < static_cast<uint32_t>(AllocationType::count); i++) {
+        auto allocType = static_cast<AllocationType>(i);
+
+        bool isOneTimeWritable = AubHelper::isOneTimeAubWritableAllocationType(allocType);
+
+        switch (allocType) {
+        case AllocationType::constantSurface:
+        case AllocationType::globalSurface:
+        case AllocationType::kernelIsa:
+        case AllocationType::kernelIsaInternal:
+        case AllocationType::privateSurface:
+        case AllocationType::scratchSurface:
+        case AllocationType::workPartitionSurface:
+        case AllocationType::buffer:
+        case AllocationType::bufferHostMemory:
+        case AllocationType::image:
+        case AllocationType::timestampPacketTagBuffer:
+        case AllocationType::externalHostPtr:
+        case AllocationType::mapAllocation:
+        case AllocationType::svmCpu:
+        case AllocationType::svmGpu:
+        case AllocationType::gpuTimestampDeviceBuffer:
+        case AllocationType::assertBuffer:
+        case AllocationType::tagBuffer:
+        case AllocationType::syncDispatchToken:
+        case AllocationType::hostFunction:
+        case AllocationType::commandBuffer:
+            EXPECT_TRUE(isOneTimeWritable);
+            break;
+        default:
+            EXPECT_FALSE(isOneTimeWritable);
+            break;
+        }
+    }
+}
+
+TEST(AubHelper, givenAlwaysAubWritableAndEnableTbxFaultManagerSetExternallyThenAllocationIsOneTimeAubWritableShouldReturnCorrectResult) {
+    DebugManagerStateRestore stateRestore;
+    NEO::debugManager.flags.EnableTbxPageFaultManager.set(0);
+    NEO::debugManager.flags.SetCommandStreamReceiver.set(2);
+
+    for (auto isAlwaysAubWritable : {false, true}) {
+        for (auto isTbxFaultManagerEnabled : {false, true}) {
+            NEO::debugManager.flags.SetBufferHostMemoryAlwaysAubWritable.set(isAlwaysAubWritable);
+            NEO::debugManager.flags.EnableTbxPageFaultManager.set(isTbxFaultManagerEnabled);
+
+            bool isOneTimeAubWritable = AubHelper::isOneTimeAubWritableAllocationType(AllocationType::bufferHostMemory);
+            EXPECT_EQ(!isAlwaysAubWritable || isTbxFaultManagerEnabled, isOneTimeAubWritable);
+        }
+    }
+}
+
+using AubHelperTest = ::testing::Test;
+
+HWTEST_F(AubHelperTest, WhenHBMSizePerTileInGigabytesIsNotSetThenGetMemBankSizeReturnsCorrectValue) {
     HardwareInfo hwInfo = *defaultHwInfo;
     GT_SYSTEM_INFO &sysInfo = hwInfo.gtSystemInfo;
+    auto releaseHelper = ReleaseHelper::create(hwInfo.ipVersion);
 
     sysInfo.MultiTileArchInfo.IsValid = true;
     sysInfo.MultiTileArchInfo.TileCount = 1;
-    EXPECT_EQ(32 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo));
+    EXPECT_EQ(32 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo, *releaseHelper));
 
     sysInfo.MultiTileArchInfo.TileCount = 2;
-    EXPECT_EQ(16 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo));
+    EXPECT_EQ(16 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo, *releaseHelper));
 
     sysInfo.MultiTileArchInfo.TileCount = 4;
-    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo));
+    EXPECT_EQ(8 * MemoryConstants::gigaByte, AubHelper::getPerTileLocalMemorySize(&hwInfo, *releaseHelper));
 }
 
-using AubHelperHwTest = Test<DeviceFixture>;
-
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetDataHintForPml4EntryIsCalledThenTraceNotypeIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int dataHint = aubHelper.getDataHintForPml4Entry();
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceNotype, dataHint);
+TEST(AubHelper, givenRootDeviceZeroWhenGettingTbxSharedMemoryFileNameThenNameIsUnchanged) {
+    EXPECT_EQ(std::string("dir/tbx_sys.bin"), NEO::AubHelper::getTbxSharedMemoryFileName("dir/tbx_sys.bin", 0u));
 }
 
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetDataHintForPdpEntryIsCalledThenTraceNotypeIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int dataHint = aubHelper.getDataHintForPdpEntry();
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceNotype, dataHint);
+TEST(AubHelper, givenRootDeviceWithIndexWhenGettingTbxSharedMemoryFileNameThenIndexIsInsertedBeforeExtension) {
+    EXPECT_EQ(std::string("dir/tbx_sys_1.bin"), NEO::AubHelper::getTbxSharedMemoryFileName("dir/tbx_sys.bin", 1u));
+    EXPECT_EQ(std::string("C:\\shm\\tbx_local.v4_2.bin"), NEO::AubHelper::getTbxSharedMemoryFileName("C:\\shm\\tbx_local.v4.bin", 2u));
 }
 
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetDataHintForPdEntryIsCalledThenTraceNotypeIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int dataHint = aubHelper.getDataHintForPdEntry();
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceNotype, dataHint);
+TEST(AubHelper, givenFileNameWithoutExtensionWhenGettingTbxSharedMemoryFileNameForRootDeviceThenIndexIsAppended) {
+    EXPECT_EQ(std::string("tbx_sys_1"), NEO::AubHelper::getTbxSharedMemoryFileName("tbx_sys", 1u));
+    EXPECT_EQ(std::string("C:\\dir.v4\\tbx_sys_1"), NEO::AubHelper::getTbxSharedMemoryFileName("C:\\dir.v4\\tbx_sys", 1u));
+    EXPECT_EQ(std::string("/tmp/dir.v4/tbx_sys_3"), NEO::AubHelper::getTbxSharedMemoryFileName("/tmp/dir.v4/tbx_sys", 3u));
 }
 
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetDataHintForPtEntryIsCalledThenTraceNotypeIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int dataHint = aubHelper.getDataHintForPtEntry();
-    EXPECT_EQ(AubMemDump::DataTypeHintValues::TraceNotype, dataHint);
+TEST(AubHelper, givenMultipleRootDevicesWhenGettingTbxPortThenRootDeviceIndexIsAddedToPort) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.TbxPort.set(5000);
+    NEO::debugManager.flags.CreateMultipleRootDevices.set(2);
+
+    EXPECT_EQ(5000u, NEO::AubHelper::getTbxPort(0u));
+    EXPECT_EQ(5001u, NEO::AubHelper::getTbxPort(1u));
 }
 
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetMemTraceForPml4EntryIsCalledThenTracePml4EntryIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int addressSpace = aubHelper.getMemTraceForPml4Entry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TracePml4Entry, addressSpace);
-}
+TEST(AubHelper, givenSingleRootDeviceWhenGettingTbxPortThenConfiguredPortIsReturned) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.TbxPort.set(5000);
 
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetMemTraceForPdpEntryIsCalledThenTracePhysicalPdpEntryIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int addressSpace = aubHelper.getMemTraceForPdpEntry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TracePhysicalPdpEntry, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetMemTraceForPd4EntryIsCalledThenTracePpgttPdEntryIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int addressSpace = aubHelper.getMemTraceForPdEntry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TracePpgttPdEntry, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, GivenDisabledLocalMemoryWhenGetMemTraceForPtEntryIsCalledThenTracePpgttEntryIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(false);
-    int addressSpace = aubHelper.getMemTraceForPtEntry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TracePpgttEntry, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, GivenEnabledLocalMemoryWhenGetMemTraceForPml4EntryIsCalledThenTraceLocalIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(true);
-    int addressSpace = aubHelper.getMemTraceForPml4Entry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, GivenEnabledLocalMemoryWhenGetMemTraceForPdpEntryIsCalledThenTraceLocalIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(true);
-    int addressSpace = aubHelper.getMemTraceForPdpEntry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, GivenEnabledLocalMemoryWhenGetMemTraceForPd4EntryIsCalledThenTraceLocalIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(true);
-    int addressSpace = aubHelper.getMemTraceForPdEntry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, GivenEnabledLocalMemoryWhenGetMemTraceForPtEntryIsCalledThenTraceLocalIsReturned) {
-    AubHelperHw<FamilyType> aubHelper(true);
-    int addressSpace = aubHelper.getMemTraceForPtEntry();
-    EXPECT_EQ(AubMemDump::AddressSpaceValues::TraceLocal, addressSpace);
-}
-
-HWTEST_F(AubHelperHwTest, givenLrcaHelperWhenContextIsInitializedThenContextFlagsAreSet) {
-    const auto &csTraits = CommandStreamReceiverSimulatedCommonHw<FamilyType>::getCsTraits(aub_stream::ENGINE_RCS);
-    MockLrcaHelper lrcaHelper(csTraits.mmioBase);
-
-    std::unique_ptr<void, std::function<void(void *)>> lrcaBase(alignedMalloc(csTraits.sizeLRCA, csTraits.alignLRCA), alignedFree);
-
-    lrcaHelper.initialize(lrcaBase.get());
-    ASSERT_NE(0u, lrcaHelper.setContextSaveRestoreFlagsCalled);
+    EXPECT_EQ(5000u, NEO::AubHelper::getTbxPort(1u));
 }

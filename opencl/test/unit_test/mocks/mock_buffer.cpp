@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,10 +8,22 @@
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
 
 #include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_resource_usage_ocl_buffer.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/test/common/mocks/mock_device.h"
 
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
+
+namespace NEO {
+class Context;
+class GmmHelper;
+} // namespace NEO
+
+MockBufferStorage::MockBufferStorage() : mockGfxAllocation(data, sizeof(data) / 2),
+                                         multiGfxAllocation(GraphicsAllocationHelper::toMultiGraphicsAllocation(&mockGfxAllocation)) {
+    initDevice();
+}
 
 MockBufferStorage::MockBufferStorage(bool unaligned) : mockGfxAllocation(unaligned ? alignUp(&data, 4) : alignUp(&data, 64), sizeof(data) / 2),
                                                        multiGfxAllocation(GraphicsAllocationHelper::toMultiGraphicsAllocation(&mockGfxAllocation)) {
@@ -20,7 +32,7 @@ MockBufferStorage::MockBufferStorage(bool unaligned) : mockGfxAllocation(unalign
 
 void MockBufferStorage::initDevice() {
     VariableBackup<uint32_t> maxOsContextCountBackup(&MemoryManager::maxOsContextCount);
-    device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
+    device = std::make_unique<MockDevice>();
 }
 
 MockBufferStorage::~MockBufferStorage() {
@@ -36,11 +48,14 @@ void MockBuffer::setAllocationType(uint32_t rootDeviceIndex, bool compressed) {
 
 void MockBuffer::setAllocationType(GraphicsAllocation *graphicsAllocation, GmmHelper *gmmHelper, bool compressed) {
     if (compressed && !graphicsAllocation->getDefaultGmm()) {
-        graphicsAllocation->setDefaultGmm(new Gmm(gmmHelper, nullptr, 0, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, compressed, {}, true));
+        GmmRequirements gmmRequirements{};
+        gmmRequirements.allowLargePages = true;
+        gmmRequirements.preferCompressed = compressed;
+        graphicsAllocation->setDefaultGmm(new Gmm(gmmHelper, nullptr, 0, 0, gmmResourceUsageOclBuffer, {}, gmmRequirements));
     }
 
     if (graphicsAllocation->getDefaultGmm()) {
-        graphicsAllocation->getDefaultGmm()->isCompressionEnabled = compressed;
+        graphicsAllocation->getDefaultGmm()->setCompressionEnabled(compressed);
     }
 }
 
@@ -59,8 +74,8 @@ MockBuffer::MockBuffer()
                                GraphicsAllocationHelper::toMultiGraphicsAllocation(&mockGfxAllocation), true, false, false) {
 }
 
-void MockBuffer::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) {
-    Buffer::setSurfaceState(this->device.get(), memory, forceNonAuxMode, disableL3, getSize(), getCpuAddress(), 0, (externalAlloc != nullptr) ? externalAlloc : &mockGfxAllocation, 0, 0, false, false);
+void MockBuffer::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) {
+    Buffer::setSurfaceState(this->device.get(), memory, forceNonAuxMode, disableL3, getSize(), getCpuAddress(), 0, (externalAlloc != nullptr) ? externalAlloc : &mockGfxAllocation, 0, 0, false);
 }
 
 AlignedBuffer::AlignedBuffer() : MockBufferStorage(false), Buffer(
@@ -77,8 +92,8 @@ AlignedBuffer::AlignedBuffer(Context *context, GraphicsAllocation *gfxAllocation
       externalAlloc(gfxAllocation) {
 }
 
-void AlignedBuffer::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) {
-    Buffer::setSurfaceState(this->device.get(), memory, forceNonAuxMode, disableL3, getSize(), getCpuAddress(), 0, &mockGfxAllocation, 0, 0, false, false);
+void AlignedBuffer::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) {
+    Buffer::setSurfaceState(this->device.get(), memory, forceNonAuxMode, disableL3, getSize(), getCpuAddress(), 0, &mockGfxAllocation, 0, 0, false);
 }
 
 UnalignedBuffer::UnalignedBuffer() : MockBufferStorage(true), Buffer(
@@ -95,6 +110,6 @@ UnalignedBuffer::UnalignedBuffer(Context *context, GraphicsAllocation *gfxAlloca
       externalAlloc(gfxAllocation) {
 }
 
-void UnalignedBuffer::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) {
-    Buffer::setSurfaceState(this->device.get(), memory, forceNonAuxMode, disableL3, getSize(), getCpuAddress(), 0, &mockGfxAllocation, 0, 0, false, false);
+void UnalignedBuffer::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) {
+    Buffer::setSurfaceState(this->device.get(), memory, forceNonAuxMode, disableL3, getSize(), getCpuAddress(), 0, &mockGfxAllocation, 0, 0, false);
 }

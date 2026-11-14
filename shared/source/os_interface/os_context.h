@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,16 @@
 
 #pragma once
 #include "shared/source/helpers/engine_node_helper.h"
+#include "shared/source/helpers/mt_helpers.h"
 #include "shared/source/utilities/reference_tracked_object.h"
 
 #include <mutex>
+#include <optional>
 
 namespace NEO {
+class CommandStreamReceiver;
 class OSInterface;
+class ProductHelper;
 
 struct DirectSubmissionProperties;
 struct HardwareInfo;
@@ -32,17 +36,38 @@ class OsContext : public ReferenceTrackedObject<OsContext> {
     DeviceBitfield getDeviceBitfield() const { return deviceBitfield; }
     PreemptionMode getPreemptionMode() const { return preemptionMode; }
     const aub_stream::EngineType &getEngineType() const { return engineType; }
-    EngineUsage getEngineUsage() { return engineUsage; }
-    bool isRegular() const { return engineUsage == EngineUsage::Regular; }
-    bool isLowPriority() const { return engineUsage == EngineUsage::LowPriority; }
-    bool isInternalEngine() const { return engineUsage == EngineUsage::Internal; }
-    bool isCooperativeEngine() const { return engineUsage == EngineUsage::Cooperative; }
+    EngineUsage getEngineUsage() const { return engineUsage; }
+    bool isLatePreemptionStartTarget() const { return engineType == aub_stream::EngineType::ENGINE_CCS && engineUsage == EngineUsage::regular && !isPartOfContextGroup(); }
+    void overrideEngineUsage(EngineUsage usage) { engineUsage = usage; }
+    virtual void overridePriority(uint32_t newPriority) {
+        if (!priorityLevel.has_value()) {
+            defaultPriorityLevel = newPriority;
+            priorityLevel = newPriority;
+        }
+    }
+
+    bool hasPriorityLevel() const { return priorityLevel.has_value(); }
+    uint32_t getPriorityLevel() const {
+        UNRECOVERABLE_IF(!priorityLevel.has_value());
+        return priorityLevel.value();
+    }
+    std::optional<uint32_t> getDefaultPriorityLevel() const { return defaultPriorityLevel; }
+    bool isRegular() const { return engineUsage == EngineUsage::regular; }
+    bool isLowPriority() const { return engineUsage == EngineUsage::lowPriority; }
+    bool isHighPriority() const { return engineUsage == EngineUsage::highPriority; }
+    bool isInternalEngine() const { return engineUsage == EngineUsage::internal; }
+    bool isCooperativeEngine() const { return engineUsage == EngineUsage::cooperative; }
+    bool isPowerHint() const { return engineUsage == EngineUsage::powerHint; }
     bool isRootDevice() const { return rootDevice; }
-    bool isEngineInstanced() const { return engineInstancedDevice; }
-    virtual bool isDirectSubmissionSupported(const HardwareInfo &hwInfo) const { return false; }
+    virtual bool isDirectSubmissionSupported() const { return directSubmissionSupported; }
     bool isDefaultContext() const { return defaultContext; }
+    void setDefaultContextIfApplicable(const aub_stream::EngineType &defaultType) {
+        if (this->engineType == defaultType && !isLowPriority() && !isInternalEngine() && !isPowerHint()) {
+            setDefaultContext(true);
+        }
+    }
     void setDefaultContext(bool value) { defaultContext = value; }
-    bool isDirectSubmissionActive() { return directSubmissionActive; }
+    bool isDirectSubmissionActive() const { return directSubmissionActive; }
     bool isDebuggableContext() { return debuggableContext; }
     void setDirectSubmissionActive() { directSubmissionActive = true; }
 
@@ -52,13 +77,79 @@ class OsContext : public ReferenceTrackedObject<OsContext> {
                                              bool &startOnInit,
                                              bool &startInContext);
     virtual void reInitializeContext() {}
+
+    static constexpr uint8_t getUmdPowerHintMax() { return NEO::OsContext::powerHintMax; }
     uint8_t getUmdPowerHintValue() { return powerHintValue; }
     void setUmdPowerHintValue(uint8_t powerHintValue) { this->powerHintValue = powerHintValue; }
 
     uint32_t getRootDeviceIndex() { return rootDeviceIndex; }
 
+    void setNewResourceBound() {
+        tlbFlushCounter++;
+    };
+
+    uint32_t peekTlbFlushCounter() const { return tlbFlushCounter.load(); }
+
+    void setTlbFlushed(uint32_t newCounter) {
+        NEO::MultiThreadHelpers::interlockedMax(lastFlushedTlbFlushCounter, newCounter);
+    };
+    bool isTlbFlushRequired() const {
+        return (tlbFlushCounter.load() > lastFlushedTlbFlushCounter.load());
+    };
+
+    void setPrimaryContext(const OsContext *primary) {
+        primaryContext = primary;
+        contextGroupCount = primary->contextGroupCount;
+    }
+    const OsContext *getPrimaryContext() const {
+        return primaryContext;
+    }
+    void setIsPrimaryEngine(const bool isPrimaryEngine) {
+        this->isPrimaryEngine = isPrimaryEngine;
+    }
+    bool getIsPrimaryEngine() const {
+        return this->isPrimaryEngine;
+    }
+    void setIsDefaultEngine(const bool isDefaultEngine) {
+        this->isDefaultEngine = isDefaultEngine;
+    }
+    bool getIsDefaultEngine() const {
+        return this->isDefaultEngine;
+    }
+    void setContextGroupCount(uint32_t contextGroupCount) {
+        this->contextGroupCount = contextGroupCount;
+    }
+    uint32_t getContextGroupCount() {
+        return contextGroupCount;
+    }
+    bool isPartOfContextGroup() const {
+        return contextGroupCount > 0;
+    }
+    void setReservedForInternalEngine(bool reservedForInternalEngine) {
+        this->reservedForInternalEngine = reservedForInternalEngine;
+    }
+    bool isReservedForInternalEngine() const {
+        return reservedForInternalEngine;
+    }
+    void setCommandStreamReceiver(CommandStreamReceiver &commandStreamReceiver) {
+        this->commandStreamReceiver = &commandStreamReceiver;
+    }
+    CommandStreamReceiver *getCommandStreamReceiver() {
+        return this->commandStreamReceiver;
+    }
+    void adjustSettings(const ProductHelper &productHelper);
+    virtual bool isDirectSubmissionLightActive() const { return false; }
+    void setExclusivelyHpContext() { exclusivelyHpContext = true; }
+    bool isExclusivelyHpContext() const { return exclusivelyHpContext; }
+    virtual bool isPriorityChangeSupported() const { return false; }
+    virtual bool isExternalSemaphoreGpuWaitSupported() const { return false; }
+    virtual void onFirstSubmission() {}
+
   protected:
     virtual bool initializeContext() { return true; }
+
+    std::atomic<uint32_t> tlbFlushCounter{0};
+    std::atomic<uint32_t> lastFlushedTlbFlushCounter{0};
 
     const uint32_t rootDeviceIndex;
     const uint32_t contextId;
@@ -66,14 +157,26 @@ class OsContext : public ReferenceTrackedObject<OsContext> {
     const PreemptionMode preemptionMode;
     const uint32_t numSupportedDevices;
     aub_stream::EngineType engineType = aub_stream::ENGINE_RCS;
-    const EngineUsage engineUsage;
+    EngineUsage engineUsage;
+    std::optional<uint32_t> priorityLevel = std::nullopt;
+    std::optional<uint32_t> defaultPriorityLevel = std::nullopt;
     const bool rootDevice = false;
     bool defaultContext = false;
+    bool directSubmissionSupported = false;
     bool directSubmissionActive = false;
     std::once_flag contextInitializedFlag = {};
     bool contextInitialized = false;
     bool debuggableContext = false;
-    bool engineInstancedDevice = false;
+    bool initializeInternalEngineImmediately = true;
+    bool reservedForInternalEngine = false;
     uint8_t powerHintValue = 0;
+    static constexpr inline uint8_t powerHintMax = 100u; // by definition: 100% power-saving
+
+    uint32_t contextGroupCount = 0;
+    const OsContext *primaryContext = nullptr;
+    CommandStreamReceiver *commandStreamReceiver = nullptr;
+    bool isPrimaryEngine = false;
+    bool isDefaultEngine = false;
+    bool exclusivelyHpContext = false;
 };
 } // namespace NEO

@@ -1,16 +1,35 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/device/device.h"
+#include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/utilities/stackvec.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_event.h"
+
+#include <cstdint>
+#include <memory>
+#include <new>
+
+namespace NEO {
+class ExecutionEnvironment;
+} // namespace NEO
+
+using namespace NEO;
 
 namespace L0 {
 namespace ult {
@@ -20,7 +39,7 @@ class MemoryManagerEventPoolIPCMockXeHpc : public NEO::MockMemoryManager {
     MemoryManagerEventPoolIPCMockXeHpc(NEO::ExecutionEnvironment &executionEnvironment) : NEO::MockMemoryManager(executionEnvironment) {}
     void *createMultiGraphicsAllocationInSystemMemoryPool(RootDeviceIndicesContainer &rootDeviceIndices, AllocationProperties &properties, NEO::MultiGraphicsAllocation &multiGraphicsAllocation) override {
         alloc = new NEO::MockGraphicsAllocation(&buffer, sizeof(buffer));
-        alloc->isShareableHostMemory = true;
+        alloc->setShareableHostMemory(true);
         multiGraphicsAllocation.addAllocation(alloc);
         return reinterpret_cast<void *>(alloc->getUnderlyingBuffer());
     };
@@ -51,17 +70,16 @@ HWTEST2_F(EventPoolIPCHandleHpcCoreTests, whenGettingIpcHandleForEventPoolWithDe
 
     auto allocation = &eventPool->getAllocation();
 
-    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::GPU_TIMESTAMP_DEVICE_BUFFER);
+    EXPECT_EQ(allocation->getAllocationType(), NEO::AllocationType::gpuTimestampDeviceBuffer);
 
     ze_ipc_event_pool_handle_t ipcHandle = {};
     ze_result_t res = eventPool->getIpcHandle(&ipcHandle);
     EXPECT_EQ(res, ZE_RESULT_SUCCESS);
 
-    auto &ipcHandleData = *reinterpret_cast<IpcEventPoolData *>(ipcHandle.data);
+    auto &ipcHandleData = *reinterpret_cast<IpcOpaqueEventPoolData *>(ipcHandle.data);
     constexpr uint64_t expectedHandle = static_cast<uint64_t>(-1);
-    EXPECT_NE(expectedHandle, ipcHandleData.handle);
+    EXPECT_NE(expectedHandle, ipcHandleData.handle.val);
     EXPECT_EQ(numEvents, ipcHandleData.numEvents);
-    EXPECT_EQ(0u, ipcHandleData.rootDeviceIndex);
     EXPECT_EQ(1u, ipcHandleData.numDevices);
     EXPECT_TRUE(ipcHandleData.isDeviceEventPoolAllocation);
     EXPECT_TRUE(ipcHandleData.isHostVisibleEventPoolAllocation);

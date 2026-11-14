@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,15 +7,15 @@
 
 #pragma once
 
+#include "shared/source/helpers/memory_properties_flags.h"
 #include "shared/source/memory_manager/multi_graphics_allocation.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
 #include "opencl/source/api/cl_types.h"
 #include "opencl/source/helpers/base_object.h"
 #include "opencl/source/helpers/destructor_callbacks.h"
 #include "opencl/source/helpers/properties_helper.h"
-
-#include "memory_properties_flags.h"
 
 #include <cstdint>
 #include <vector>
@@ -29,6 +29,7 @@ class GraphicsAllocation;
 struct KernelInfo;
 class MemoryManager;
 class Context;
+class MemObj;
 
 template <>
 struct OpenCLObjectMapper<_cl_mem> {
@@ -39,12 +40,12 @@ namespace CreateMemObj {
 struct AllocationInfo {
     GraphicsAllocation *mapAllocation = nullptr;
     GraphicsAllocation *memory = nullptr;
-    AllocationType allocationType = AllocationType::UNKNOWN;
+    AllocationType allocationType = AllocationType::unknown;
 
     bool zeroCopyAllowed = true;
     bool isHostPtrSVM = false;
 
-    bool alignementSatisfied = true;
+    bool alignmentSatisfied = true;
     bool allocateMemory = true;
     bool copyMemoryFromHostPtr = false;
 
@@ -70,7 +71,7 @@ class MemObj : public BaseObject<_cl_mem> {
            MultiGraphicsAllocation &&multiGraphicsAllocation,
            bool zeroCopy,
            bool isHostPtrSVM,
-           bool isObjectRedescrbied);
+           bool isObjectRedescribed);
     ~MemObj() override;
 
     cl_int getMemObjectInfo(cl_mem_info paramName,
@@ -83,7 +84,7 @@ class MemObj : public BaseObject<_cl_mem> {
     void *getCpuAddress() const;
     void *getHostPtr() const;
     bool getIsObjectRedescribed() const { return isObjectRedescribed; };
-    size_t getSize() const;
+    MOCKABLE_VIRTUAL size_t getSize() const;
 
     MapOperationsHandler &getMapOperationsHandler();
     MapOperationsHandler *getMapOperationsHandlerIfExists();
@@ -103,6 +104,7 @@ class MemObj : public BaseObject<_cl_mem> {
     bool isMemObjWithHostPtrSVM() const;
     bool isMemObjUncacheable() const;
     bool isMemObjUncacheableForSurfaceState() const;
+    bool isMemObjDisplayable() const;
     virtual void transferDataToHostPtr(MemObjSizeArray &copySize, MemObjOffsetArray &copyOffset) { UNRECOVERABLE_IF(true); };
     virtual void transferDataFromHostPtr(MemObjSizeArray &copySize, MemObjOffsetArray &copyOffset) { UNRECOVERABLE_IF(true); };
 
@@ -131,8 +133,11 @@ class MemObj : public BaseObject<_cl_mem> {
     void destroyGraphicsAllocation(GraphicsAllocation *allocation, bool asyncDestroy);
     bool checkIfMemoryTransferIsRequired(size_t offsetInMemObject, size_t offsetInHostPtr, const void *ptr, cl_command_type cmdType);
     bool mappingOnCpuAllowed() const;
-    virtual size_t calculateOffsetForMapping(const MemObjOffsetArray &offset) const { return offset[0]; }
-    size_t calculateMappedPtrLength(const MemObjSizeArray &size) const { return calculateOffsetForMapping(size); }
+    MOCKABLE_VIRTUAL bool allowCpuAccess() const;
+    bool allowCpuForMapUnmap() const;
+    virtual size_t calculateOffsetForMapping(const MemObjOffsetArray &offset, uint32_t mipLevel) const { return offset[0]; }
+    virtual size_t calculateMappedPtrLength(const MemObjSizeArray &size, uint32_t mipLevel) const { return size[0]; }
+    virtual size_t getHostMapStorageSize() const { return this->getSize(); }
     cl_mem_object_type peekClMemObjType() const { return memObjectType; }
     size_t getOffset() const { return offset; }
     MemoryManager *getMemoryManager() const {
@@ -164,6 +169,12 @@ class MemObj : public BaseObject<_cl_mem> {
     void setSizeInPoolAllocator(size_t size) {
         this->sizeInPoolAllocator = size;
     }
+    bool getIsUnifiedMcsSurface() {
+        return isMcsSurfaceUnified;
+    }
+    void setIsUnifiedMcsSurface(bool isMcsSurfaceUnified) {
+        this->isMcsSurfaceUnified = isMcsSurfaceUnified;
+    }
 
   protected:
     void getOsSpecificMemObjectInfo(const cl_mem_info &paramName, size_t *srcParamSize, void **srcParam);
@@ -188,6 +199,8 @@ class MemObj : public BaseObject<_cl_mem> {
     bool isZeroCopy;
     bool isHostPtrSVM;
     bool isObjectRedescribed;
+    bool isDisplayable{false};
+    bool isMcsSurfaceUnified = false;
     MemoryManager *memoryManager = nullptr;
     MultiGraphicsAllocation multiGraphicsAllocation;
     GraphicsAllocation *mcsAllocation = nullptr;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,12 @@
 
 #include "shared/source/gen12lp/hw_info_tgllp.h"
 
-#include "shared/source/aub_mem_dump/definitions/aub_services.h"
 #include "shared/source/command_stream/preemption_mode.h"
 #include "shared/source/gen12lp/hw_cmds_tgllp.h"
-#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/release_helpers/caps/caps_setup.h"
 
 #include "aubstream/engine_node.h"
-#include "platforms.h"
 
 namespace NEO {
 
@@ -26,63 +24,46 @@ const PLATFORM TGLLP::platform = {
     IGFX_GEN12LP_CORE,
     IGFX_GEN12LP_CORE,
     PLATFORM_NONE, // default init
-    0,             // usDeviceID
+    0x9A49,        // usDeviceID
     0,             // usRevId. 0 sets the stepping to A0
     0,             // usDeviceID_PCH
     0,             // usRevId_PCH
     GTTYPE_UNDEFINED};
 
 const RuntimeCapabilityTable TGLLP::capabilityTable{
-    EngineDirectSubmissionInitVec{
-        {aub_stream::ENGINE_RCS, {true, true}},
-        {aub_stream::ENGINE_CCS, {true, true}}},     // directSubmissionEngines
-    {0, 0, 0, 0, false, false, false, false},        // kmdNotifyProperties
-    MemoryConstants::max64BitAppAddress,             // gpuAddressSpace
-    0,                                               // sharedSystemMemCapabilities
-    83.333,                                          // defaultProfilingTimerResolution
-    MemoryConstants::pageSize,                       // requiredPreemptionSurfaceSize
-    "",                                              // deviceName
-    PreemptionMode::MidThread,                       // defaultPreemptionMode
-    aub_stream::ENGINE_RCS,                          // defaultEngineType
-    0,                                               // maxRenderFrequency
-    30,                                              // clVersionSupport
-    CmdServicesMemTraceVersion::DeviceValues::Tgllp, // aubDeviceId
-    1,                                               // extraQuantityThreadsPerEU
-    64,                                              // slmSize
-    sizeof(TGLLP::GRF),                              // grfSize
-    36u,                                             // timestampValidBits
-    32u,                                             // kernelTimestampValidBits
-    false,                                           // blitterOperationsSupported
-    true,                                            // ftrSupportsInteger64BitAtomics
-    false,                                           // ftrSupportsFP64
-    false,                                           // ftrSupportsFP64Emulation
-    false,                                           // ftrSupports64BitMath
-    true,                                            // ftrSvm
-    false,                                           // ftrSupportsCoherency
-    false,                                           // ftrSupportsVmeAvcTextureSampler
-    false,                                           // ftrSupportsVmeAvcPreemption
-    false,                                           // ftrRenderCompressedBuffers
-    false,                                           // ftrRenderCompressedImages
-    true,                                            // instrumentationEnabled
-    true,                                            // ftr64KBpages
-    false,                                           // sourceLevelDebuggerSupported
-    false,                                           // supportsVme
-    false,                                           // supportCacheFlushAfterWalker
-    true,                                            // supportsImages
-    false,                                           // supportsDeviceEnqueue
-    false,                                           // supportsPipes
-    true,                                            // supportsOcl21Features
-    false,                                           // supportsOnDemandPageFaults
-    false,                                           // supportsIndependentForwardProgress
-    false,                                           // hostPtrTrackingEnabled
-    true,                                            // levelZeroSupported
-    true,                                            // isIntegratedDevice
-    true,                                            // supportsMediaBlock
-    false,                                           // p2pAccessSupported
-    false,                                           // p2pAtomicAccessSupported
-    true,                                            // fusedEuEnabled
-    false,                                           // l0DebuggerSupported;
-    true                                             // supportsFloatAtomics
+    .directSubmissionEngines = makeDirectSubmissionPropertiesPerEngine({
+        {aub_stream::ENGINE_RCS, {.engineSupported = true, .submitOnInit = true, .useNonDefault = false}},
+        {aub_stream::ENGINE_CCS, {.engineSupported = true, .submitOnInit = true, .useNonDefault = false}},
+    }),
+    .kmdNotifyProperties = {0, 0, 0, 0, false, false, false, false},
+    .gpuAddressSpace = MemoryConstants::max64BitAppAddress,
+    .sharedSystemMemCapabilities = 0,
+    .requiredPreemptionSurfaceSize = MemoryConstants::pageSize,
+    .deviceName = "",
+    .preferredPlatformName = nullptr,
+    .defaultPreemptionMode = PreemptionMode::ThreadGroup,
+    .defaultEngineType = aub_stream::ENGINE_RCS,
+    .maxRenderFrequency = 0,
+    .extraQuantityThreadsPerEU = 1,
+    .maxProgrammableSlmSize = 64,
+    .grfSize = sizeof(TGLLP::GRF),
+    .timestampValidBits = 36u,
+    .kernelTimestampValidBits = 32u,
+    .blitterOperationsSupported = false,
+    .ftrSupportsFP64 = false,
+    .ftrSupportsFP64Emulation = false,
+    .ftrSupports64BitMath = false,
+    .ftrSupportsCoherency = false,
+    .ftrRenderCompressedBuffers = false,
+    .ftrRenderCompressedImages = false,
+    .supportCacheFlushAfterWalker = false,
+    .supportsImages = true,
+    .supportsOnDemandPageFaults = false,
+    .supportsIndependentForwardProgress = false,
+    .isIntegratedDevice = true,
+    .supportsMediaBlock = true,
+    .fusedEuEnabled = true,
+    .l0DebuggerSupported = false,
 };
 
 WorkaroundTable TGLLP::workaroundTable = {};
@@ -115,93 +96,50 @@ void TGLLP::setupFeatureAndWorkaroundTable(HardwareInfo *hwInfo) {
     workaroundTable->flags.waUntypedBufferCompression = true;
 };
 
-void TGLLP::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
+void TGLLP::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
     GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->ThreadCount = gtSysInfo->EUCount * compilerProductHelper.getNumThreadsPerEu();
-    gtSysInfo->TotalPsThreadsWindowerRange = 64;
+    gtSysInfo->NumThreadsPerEu = 7u;
+    gtSysInfo->ThreadCount = gtSysInfo->EUCount * gtSysInfo->NumThreadsPerEu;
     gtSysInfo->CsrSizeInMb = 8;
     gtSysInfo->MaxEuPerSubSlice = TGLLP::maxEuPerSubslice;
     gtSysInfo->MaxSlicesSupported = TGLLP::maxSlicesSupported;
     gtSysInfo->MaxSubSlicesSupported = TGLLP::maxSubslicesSupported;
     gtSysInfo->MaxDualSubSlicesSupported = TGLLP::maxDualSubslicesSupported;
-    gtSysInfo->IsL3HashModeEnabled = false;
     gtSysInfo->IsDynamicallyPopulated = false;
 
+    setupCaps(*hwInfo);
     if (setupFeatureTableAndWorkaroundTable) {
         setupFeatureAndWorkaroundTable(hwInfo);
     }
+
+    applyDebugOverrides(*hwInfo);
 }
 
-const HardwareInfo TgllpHw1x6x16::hwInfo = {
+const HardwareInfo TGLLP::hwInfo = {
     &TGLLP::platform,
     &TGLLP::featureTable,
     &TGLLP::workaroundTable,
-    &TgllpHw1x6x16::gtSystemInfo,
-    TGLLP::capabilityTable,
-    AOT::TGL};
+    &TGLLP::gtSystemInfo,
+    TGLLP::capabilityTable};
 
-GT_SYSTEM_INFO TgllpHw1x6x16::gtSystemInfo = {0};
-void TgllpHw1x6x16::setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    TGLLP::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
-
-    GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->SliceCount = 1;
-    gtSysInfo->DualSubSliceCount = 6;
-    gtSysInfo->L3CacheSizeInKb = 3840;
-    gtSysInfo->L3BankCount = 8;
-    gtSysInfo->MaxFillRate = 16;
-    gtSysInfo->TotalVsThreads = 336;
-    gtSysInfo->TotalHsThreads = 336;
-    gtSysInfo->TotalDsThreads = 336;
-    gtSysInfo->TotalGsThreads = 336;
-
-    gtSysInfo->CCSInfo.IsValid = true;
-    gtSysInfo->CCSInfo.NumberOfCCSEnabled = 1;
-    gtSysInfo->CCSInfo.Instances.CCSEnableMask = 0b1;
-};
-
-const HardwareInfo TgllpHw1x2x16::hwInfo = {
-    &TGLLP::platform,
-    &TGLLP::featureTable,
-    &TGLLP::workaroundTable,
-    &TgllpHw1x2x16::gtSystemInfo,
-    TGLLP::capabilityTable,
-    AOT::TGL};
-
-GT_SYSTEM_INFO TgllpHw1x2x16::gtSystemInfo = {0};
-void TgllpHw1x2x16::setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    TGLLP::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
+GT_SYSTEM_INFO TGLLP::gtSystemInfo = {0};
+void TGLLP::setupHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
+    TGLLP::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable);
 
     GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->SliceCount = 1;
-    gtSysInfo->DualSubSliceCount = 2;
-    gtSysInfo->L3CacheSizeInKb = 1920;
-    gtSysInfo->L3BankCount = 4;
-    gtSysInfo->MaxFillRate = 16;
-    gtSysInfo->TotalVsThreads = 224;
-    gtSysInfo->TotalHsThreads = 224;
-    gtSysInfo->TotalDsThreads = 224;
-    gtSysInfo->TotalGsThreads = 224;
 
-    gtSysInfo->CCSInfo.IsValid = true;
-    gtSysInfo->CCSInfo.NumberOfCCSEnabled = 1;
-    gtSysInfo->CCSInfo.Instances.CCSEnableMask = 0b1;
-};
-
-const HardwareInfo TGLLP::hwInfo = TgllpHw1x6x16::hwInfo;
-
-void setupTGLLPHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, uint64_t hwInfoConfig, const CompilerProductHelper &compilerProductHelper) {
-    if (hwInfoConfig == 0x100060010) {
-        TgllpHw1x6x16::setupHardwareInfo(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
-    } else if (hwInfoConfig == 0x100020010) {
-        TgllpHw1x2x16::setupHardwareInfo(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
-    } else if (hwInfoConfig == 0x0) {
-        // Default config
-        TgllpHw1x6x16::setupHardwareInfo(hwInfo, setupFeatureTableAndWorkaroundTable, compilerProductHelper);
-    } else {
-        UNRECOVERABLE_IF(true);
+    const bool isHw1x2x16 = TGLLP::isHw1x2x16(*hwInfo);
+    if (gtSysInfo->SliceCount == 0) {
+        gtSysInfo->SliceCount = 1;
+        gtSysInfo->DualSubSliceCount = isHw1x2x16 ? 2 : 6;
     }
-}
+    gtSysInfo->L3CacheSizeInKb = isHw1x2x16 ? 1920 : 3840;
+    gtSysInfo->L3BankCount = isHw1x2x16 ? 4 : 8;
 
-void (*TGLLP::setupHardwareInfo)(HardwareInfo *, bool, uint64_t, const CompilerProductHelper &) = setupTGLLPHardwareInfoImpl;
+    gtSysInfo->CCSInfo.IsValid = true;
+    gtSysInfo->CCSInfo.NumberOfCCSEnabled = 1;
+    gtSysInfo->CCSInfo.Instances.CCSEnableMask = 0b1;
+};
+
+void (*TGLLP::setupHardwareInfo)(HardwareInfo *, bool) = TGLLP::setupHardwareInfoImpl;
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,25 +9,30 @@
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/os_interface/linux/file_descriptor.h"
 
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/sysman_imp.h"
 
 #include <algorithm>
-#include <errno.h>
 #include <fcntl.h>
-#include <string.h>
 
 namespace L0 {
 const std::string PlatformMonitoringTech::baseTelemSysFS("/sys/class/intel_pmt");
 const std::string PlatformMonitoringTech::telem("telem");
 uint32_t PlatformMonitoringTech::rootDeviceTelemNodeIndex = 0;
 
+std::string PlatformMonitoringTech::getGuid() {
+    return guid;
+}
+
 ze_result_t PlatformMonitoringTech::readValue(const std::string key, uint32_t &value) {
     auto offset = keyOffsetMap.find(key);
     if (offset == keyOffsetMap.end()) {
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
-    int fd = this->openFunction(telemetryDeviceEntry.c_str(), O_RDONLY);
+    auto fd = NEO::FileDescriptor(telemetryDeviceEntry.c_str(), O_RDONLY);
     if (fd == -1) {
         return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
     }
@@ -36,11 +41,6 @@ ze_result_t PlatformMonitoringTech::readValue(const std::string key, uint32_t &v
     if (this->preadFunction(fd, &value, sizeof(uint32_t), baseOffset + offset->second) != sizeof(uint32_t)) {
         res = ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
     }
-
-    if (this->closeFunction(fd) < 0) {
-        return ZE_RESULT_ERROR_UNKNOWN;
-    }
-
     return res;
 }
 
@@ -49,7 +49,7 @@ ze_result_t PlatformMonitoringTech::readValue(const std::string key, uint64_t &v
     if (offset == keyOffsetMap.end()) {
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
-    int fd = this->openFunction(telemetryDeviceEntry.c_str(), O_RDONLY);
+    auto fd = NEO::FileDescriptor(telemetryDeviceEntry.c_str(), O_RDONLY);
     if (fd == -1) {
         return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
     }
@@ -57,10 +57,6 @@ ze_result_t PlatformMonitoringTech::readValue(const std::string key, uint64_t &v
     ze_result_t res = ZE_RESULT_SUCCESS;
     if (this->preadFunction(fd, &value, sizeof(uint64_t), baseOffset + offset->second) != sizeof(uint64_t)) {
         res = ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
-    }
-
-    if (this->closeFunction(fd) < 0) {
-        return ZE_RESULT_ERROR_UNKNOWN;
     }
 
     return res;
@@ -78,7 +74,7 @@ bool compareTelemNodes(std::string &telemNode1, std::string &telemNode2) {
 // Check if Telemetry node(say /sys/class/intel_pmt/telem1) and gpuUpstreamPortPath share same PCI Root port
 static bool isValidTelemNode(FsAccess *pFsAccess, const std::string &gpuUpstreamPortPath, const std::string sysfsTelemNode) {
     std::string realPathOfTelemNode;
-    auto result = pFsAccess->getRealPath(sysfsTelemNode, realPathOfTelemNode);
+    auto result = pFsAccess->getRealPath(std::move(sysfsTelemNode), realPathOfTelemNode);
     if (result != ZE_RESULT_SUCCESS) {
         return false;
     }
@@ -89,7 +85,7 @@ static bool isValidTelemNode(FsAccess *pFsAccess, const std::string &gpuUpstream
     // As gpuUpstreamPortPath is a substring of realPathOfTelemNode , hence both sysfs telemNode and GPU device share same PCI Root.
     // the PMT is part of the OOBMSM sitting on a switch port 0000:8b:02.0 attached to the upstream port/ Also known as CardBus
     // Hence this telem node entry is valid for GPU device.
-    return (realPathOfTelemNode.compare(0, gpuUpstreamPortPath.size(), gpuUpstreamPortPath) == 0);
+    return realPathOfTelemNode.starts_with(gpuUpstreamPortPath);
 }
 
 ze_result_t PlatformMonitoringTech::enumerateRootTelemIndex(FsAccess *pFsAccess, std::string &gpuUpstreamPortPath) {
@@ -101,13 +97,15 @@ ze_result_t PlatformMonitoringTech::enumerateRootTelemIndex(FsAccess *pFsAccess,
 
     // listOfTelemNodes vector could contain non "telem" entries which are not interested to us.
     // Lets refactor listOfTelemNodes vector as below
-    for (auto iterator = listOfTelemNodes.begin(); iterator != listOfTelemNodes.end(); iterator++) {
+    for (auto iterator = listOfTelemNodes.begin(); iterator != listOfTelemNodes.end();) {
         if (iterator->compare(0, telem.size(), telem) != 0) {
-            listOfTelemNodes.erase(iterator--); // Remove entry if its suffix is not "telem"
+            iterator = listOfTelemNodes.erase(iterator); // Remove entry if its suffix is not "telem"
+        } else {
+            iterator++;
         }
     }
 
-    // Exmaple: For below directory
+    // Example: For below directory
     // # /sys/class/intel_pmt$ ls
     // telem1  telem2  telem3
     // Then listOfTelemNodes would contain telem1, telem2, telem3
@@ -126,7 +124,7 @@ ze_result_t PlatformMonitoringTech::init(FsAccess *pFsAccess, const std::string 
     std::string telemNode = telem + std::to_string(rootDeviceTelemNodeIndex);
     // For XE_HP_SDV and PVC single tile devices, telemetry info is retrieved from
     // tile's telem node rather from root device telem node.
-    if ((isSubdevice) || ((productFamily == IGFX_PVC) || (productFamily == IGFX_XE_HP_SDV))) {
+    if ((isSubdevice) || (productFamily == IGFX_PVC)) {
         uint32_t telemNodeIndex = 0;
         // If rootDeviceTelemNode is telem1, then rootDeviceTelemNodeIndex = 1
         // And thus for subdevice0 --> telem node will be telem2,
@@ -141,8 +139,8 @@ ze_result_t PlatformMonitoringTech::init(FsAccess *pFsAccess, const std::string 
 
     telemetryDeviceEntry = baseTelemSysFSNode + "/" + telem;
     if (!pFsAccess->fileExists(telemetryDeviceEntry)) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "Telemetry support not available. No file %s\n", telemetryDeviceEntry.c_str());
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Telemetry support not available. No file %s\n", telemetryDeviceEntry.c_str());
         return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
     }
 
@@ -150,21 +148,21 @@ ze_result_t PlatformMonitoringTech::init(FsAccess *pFsAccess, const std::string 
     std::string guidPath = baseTelemSysFSNode + std::string("/guid");
     ze_result_t result = pFsAccess->read(guidPath, guid);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "Telemetry sysfs entry not available %s\n", guidPath.c_str());
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Telemetry sysfs entry not available %s\n", guidPath.c_str());
         return result;
     }
-    result = PlatformMonitoringTech::getKeyOffsetMap(guid, keyOffsetMap);
+    result = PlatformMonitoringTech::getKeyOffsetMap(std::move(guid), keyOffsetMap);
     if (ZE_RESULT_SUCCESS != result) {
-        // We didnt have any entry for this guid in guidToKeyOffsetMap
+        // We did not have any entry for this guid in guidToKeyOffsetMap
         return result;
     }
 
     std::string offsetPath = baseTelemSysFSNode + std::string("/offset");
     result = pFsAccess->read(offsetPath, baseOffset);
     if (ZE_RESULT_SUCCESS != result) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr,
-                              "Telemetry sysfs entry not available %s\n", offsetPath.c_str());
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Telemetry sysfs entry not available %s\n", offsetPath.c_str());
         return result;
     }
 

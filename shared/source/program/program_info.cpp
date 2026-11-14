@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,14 @@
 
 #include "shared/source/program/program_info.h"
 
-#include "shared/source/compiler_interface/compiler_interface.h"
-#include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/compiler_interface/external_functions.h"
 #include "shared/source/compiler_interface/linker.h"
-#include "shared/source/device/device.h"
 #include "shared/source/program/kernel_info.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 
 namespace NEO {
 
@@ -35,27 +37,6 @@ size_t getMaxInlineSlmNeeded(const ProgramInfo &programInfo) {
         ret = std::max(ret, kernelInfo->kernelDescriptor.kernelAttributes.slmInlineSize);
     }
     return ret;
-}
-
-bool requiresLocalMemoryWindowVA(const ProgramInfo &programInfo) {
-    for (const auto &kernelInfo : programInfo.kernelInfos) {
-        if (isValidOffset(kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.localMemoryStatelessWindowStartAddres)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool isRebuiltToPatchtokensRequired(Device *neoDevice, ArrayRef<const uint8_t> archive, std::string &optionsString, bool isBuiltin, bool isVmeUsed) {
-    if (isBuiltin) {
-        return false;
-    }
-    auto isSourceLevelDebuggerActive = (nullptr != neoDevice->getSourceLevelDebugger());
-    auto isZebinFormat = NEO::isDeviceBinaryFormat<NEO::DeviceBinaryFormat::Zebin>(archive);
-    if ((isSourceLevelDebuggerActive || isVmeUsed) && isZebinFormat) {
-        return neoDevice->getCompilerInterface()->disableZebin(optionsString, optionsString);
-    }
-    return false;
 }
 
 } // namespace NEO

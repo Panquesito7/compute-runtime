@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
@@ -48,9 +49,6 @@ struct EnqueueWriteBufferRectTest : public CommandEnqueueFixture,
   protected:
     template <typename FamilyType>
     void enqueueWriteBufferRect2D(cl_bool blocking = CL_FALSE) {
-        typedef typename FamilyType::WALKER_TYPE GPGPU_WALKER;
-        typedef typename FamilyType::PIPELINE_SELECT PIPELINE_SELECT;
-
         size_t bufferOrigin[] = {0, 0, 0};
         size_t hostOrigin[] = {0, 0, 0};
         size_t region[] = {50, 50, 1};

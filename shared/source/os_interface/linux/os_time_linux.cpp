@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,23 +7,28 @@
 
 #include "shared/source/os_interface/linux/os_time_linux.h"
 
-#include "shared/source/os_interface/linux/device_time_drm.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/os_interface.h"
 
-#include <time.h>
+#include <chrono>
 
 namespace NEO {
 
-OSTimeLinux::OSTimeLinux(OSInterface *osInterface, std::unique_ptr<DeviceTime> deviceTime) {
-    this->osInterface = osInterface;
+OSTimeLinux::OSTimeLinux(OSInterface &osInterface, std::unique_ptr<DeviceTime> deviceTime) {
+    this->osInterface = &osInterface;
+    auto hwInfo = osInterface.getDriverModel()->getHardwareInfo();
+    if (hwInfo->capabilityTable.timestampValidBits < 64) {
+        this->maxGpuTimeStamp = 1ull << hwInfo->capabilityTable.timestampValidBits;
+    }
+
     resolutionFunc = &clock_getres;
     getTimeFunc = &clock_gettime;
     this->deviceTime = std::move(deviceTime);
 }
 
 bool OSTimeLinux::getCpuTime(uint64_t *timestamp) {
-    struct timespec ts;
-
+    struct timespec ts{};
     if (getTimeFunc(CLOCK_MONOTONIC_RAW, &ts)) {
         return false;
     }
@@ -33,8 +38,18 @@ bool OSTimeLinux::getCpuTime(uint64_t *timestamp) {
     return true;
 }
 
+bool OSTime::getCpuTimeHost(uint64_t *timestamp) {
+    struct timespec ts{};
+
+    auto ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+
+    *timestamp = (uint64_t)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+
+    return ret;
+}
+
 double OSTimeLinux::getHostTimerResolution() const {
-    struct timespec ts;
+    struct timespec ts{};
     if (resolutionFunc(CLOCK_MONOTONIC_RAW, &ts)) {
         return 0;
     }
@@ -54,8 +69,8 @@ uint64_t OSTimeLinux::getCpuRawTimestamp() {
     return timesInNsec / ticksInNsec;
 }
 
-std::unique_ptr<OSTime> OSTimeLinux::create(OSInterface *osInterface, std::unique_ptr<DeviceTime> deviceTime) {
-    return std::unique_ptr<OSTime>(new OSTimeLinux(osInterface, std::move(deviceTime)));
+std::unique_ptr<OSTime> OSTimeLinux::create(OSInterface &osInterface, std::unique_ptr<DeviceTime> deviceTime) {
+    return std::make_unique<OSTimeLinux>(osInterface, std::move(deviceTime));
 }
 
 } // namespace NEO

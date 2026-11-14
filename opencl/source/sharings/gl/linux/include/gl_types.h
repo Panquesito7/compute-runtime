@@ -1,13 +1,18 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#pragma once
 #include <EGL/egl.h>
 
-using GLDisplay = EGLDisplay;
-using GLContext = EGLContext;
+typedef void *GLDisplay;
+typedef void *GLContext;
 using GLType = uint32_t;
 using GLFunctionType = decltype(&eglGetProcAddress);
+
+#include "shared/source/os_interface/gl_wrapper.h"
+
+#include "GL/glext.h"

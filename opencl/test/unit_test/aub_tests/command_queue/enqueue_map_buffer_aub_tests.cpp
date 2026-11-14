@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
@@ -76,6 +77,6 @@ HWTEST_F(AUBMapBuffer, WhenMappingAndUnmappingThenExpectationsAreMet) {
     ASSERT_EQ(CL_SUCCESS, retVal);
 
     for (size_t i = 0; i < bufferSize; i++) {
-        AUBCommandStreamFixture::expectMemory<FamilyType>(&readMemory[i], &i, sizeof(uint8_t));
+        expectMemory<FamilyType>(&readMemory[i], &i, sizeof(uint8_t));
     }
 }

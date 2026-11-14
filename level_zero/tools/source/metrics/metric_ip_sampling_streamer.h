@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,25 +8,25 @@
 #pragma once
 
 #include "level_zero/tools/source/metrics/metric.h"
-#include "level_zero/tools/source/metrics/os_metric_ip_sampling.h"
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 
+#include <unordered_set>
 namespace L0 {
 
 class IpSamplingMetricSourceImp;
+struct IpSamplingMetricImp;
+struct IpSamplingMetricGroupBase;
+struct IpSamplingMetricGroupImp;
+class L0GfxCoreHelper;
 
 struct IpSamplingMetricStreamerBase : public MetricStreamer {
     ze_result_t appendStreamerMarker(CommandList &commandList, uint32_t value) override { return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE; }
-    void attachEvent(ze_event_handle_t hNotificationEvent);
-
-  protected:
-    void detachEvent();
-    Event *pNotificationEvent = nullptr;
 };
 
 struct IpSamplingMetricStreamerImp : public IpSamplingMetricStreamerBase {
 
     IpSamplingMetricStreamerImp(IpSamplingMetricSourceImp &ipSamplingSource) : ipSamplingSource(ipSamplingSource) {}
-    ~IpSamplingMetricStreamerImp() override{};
+    ~IpSamplingMetricStreamerImp() override {};
     ze_result_t readData(uint32_t maxReportCount, size_t *pRawDataSize, uint8_t *pRawData) override;
     ze_result_t close() override;
     Event::State getNotificationState() override;
@@ -46,6 +46,69 @@ struct MultiDeviceIpSamplingMetricStreamerImp : public IpSamplingMetricStreamerB
 
   protected:
     std::vector<IpSamplingMetricStreamerImp *> subDeviceStreamers = {};
+};
+
+struct IpSamplingMetricCalcOpImp : public MetricCalcOpImp {
+    IpSamplingMetricCalcOpImp(bool multidevice,
+                              const std::vector<MetricScopeImp *> &metricScopesInCalcOp,
+                              std::vector<MetricImp *> &metricsInReport,
+                              const std::vector<MetricScopeImp *> &metricScopesInReport,
+                              IpSamplingMetricSourceImp &metricSource,
+                              std::map<uint32_t, std::vector<uint32_t>> &perScopeIncludedMetricIndexes,
+                              std::vector<MetricImp *> &excludedMetrics);
+    ~IpSamplingMetricCalcOpImp() override {};
+
+    static ze_result_t create(bool isMultiDevice,
+                              IpSamplingMetricSourceImp &metricSource,
+                              zet_intel_metric_calculation_exp_desc_t *pCalculationDesc,
+                              zet_intel_metric_calculation_operation_exp_handle_t *phCalculationOperation);
+    ze_result_t destroy() override;
+
+    ze_result_t metricCalculateValues(const size_t rawDataSize, const uint8_t *pRawData,
+                                      bool lastCall, size_t *usedSize,
+                                      uint32_t *pTotalMetricReportCount,
+                                      zet_intel_metric_result_exp_t *pMetricResults) override;
+
+  protected:
+    IpSamplingMetricSourceImp &metricSource;
+    std::map<uint32_t, std::vector<uint32_t>> perScopeIncludedMetricIndexes{};
+    std::vector<MetricScopeImp *> metricScopesInCalcOp{};
+    bool isMultiDeviceData = false;
+
+    std::map<uint32_t, std::map<uint64_t, void *> *> perScopeIpDataCaches{};
+    size_t processedSize = 0;
+    L0::L0GfxCoreHelper *l0GfxCoreHelper = nullptr;
+
+    ze_result_t updateCacheForSingleScope(const size_t rawDataSize, const uint8_t *pRawData,
+                                          bool newData, std::map<uint64_t, void *> &reportDataMap, bool &dataOverflow);
+    ze_result_t updateCachesForMultiScopes(const size_t rawDataSize, const uint8_t *pRawData,
+                                           bool newData, bool &dataOverflow);
+    bool isScopeCacheEmpty(uint32_t scopeId) {
+        return perScopeIpDataCaches[scopeId]->empty();
+    }
+
+    bool areAllCachesEmpty() {
+        for (const auto &it : perScopeIpDataCaches) {
+            if (!isScopeCacheEmpty(it.first)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void clearScopesCaches();
+
+    std::map<uint64_t, void *> *getScopeCache(uint32_t scopeId) {
+        return perScopeIpDataCaches[scopeId];
+    }
+
+    uint32_t getLargestCacheSize() {
+        uint32_t maxSize = 0;
+        for (auto &it : perScopeIpDataCaches) {
+            maxSize = std::max(maxSize, static_cast<uint32_t>(it.second->size()));
+        }
+        return maxSize;
+    }
 };
 
 } // namespace L0

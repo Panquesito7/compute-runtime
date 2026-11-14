@@ -1,17 +1,17 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include <cstdint>
 #include <memory>
 namespace NEO {
 struct HardwareInfo;
 class LinearStream;
 class IndirectHeap;
-struct DebugData;
 class GraphicsAllocation;
 struct RootDeviceEnvironment;
 
@@ -28,39 +28,35 @@ class Debugger {
         uint64_t bindlessSamplerStateBaseAddress = 0;
     };
 
-    static std::unique_ptr<Debugger> create(const NEO::RootDeviceEnvironment &rootDeviceEnvironment);
     virtual ~Debugger() = default;
-    bool isLegacy() const { return isLegacyMode; }
     virtual void captureStateBaseAddress(NEO::LinearStream &cmdStream, SbaAddresses sba, bool useFirstLevelBB) = 0;
     virtual size_t getSbaTrackingCommandsSize(size_t trackedAddressCount) = 0;
+    virtual bool getSingleAddressSpaceSbaTracking() const = 0;
 
     void *getDebugSurfaceReservedSurfaceState(IndirectHeap &ssh);
 
     inline static bool isDebugEnabled(bool internalUsage) {
         return !internalUsage;
     }
-
-  protected:
-    bool isLegacyMode = true;
 };
 
 enum class DebuggingMode : uint32_t {
-    Disabled,
-    Online,
-    Offline
+    disabled,
+    online,
+    offline
 };
 
 inline DebuggingMode getDebuggingMode(uint32_t programDebugging) {
     switch (programDebugging) {
     case 1: {
-        return DebuggingMode::Online;
+        return DebuggingMode::online;
     }
     case 2: {
-        return DebuggingMode::Offline;
+        return DebuggingMode::offline;
     }
     case 0:
     default: {
-        return DebuggingMode::Disabled;
+        return DebuggingMode::disabled;
     }
     }
 }

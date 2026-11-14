@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -49,9 +49,9 @@ TEST(GlArbSyncEvent, whenCreateArbSyncEventNameIsCalledMultipleTimesThenEachCall
     NEO::destroyArbSyncEventName(name3);
 }
 
-template <bool SignalWaited>
+template <bool signalWaited>
 inline void glArbSyncObjectWaitServerMock(NEO::OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo) {
-    glSyncInfo.waitCalled = SignalWaited;
+    glSyncInfo.waitCalled = signalWaited;
 }
 
 struct MockBaseEvent : Event {
@@ -68,12 +68,12 @@ struct GlArbSyncEventTest : public ::testing::Test {
     }
 
     void SetUp() override {
+        EnvironmentWithCsrWrapper environment;
+        environment.setCsrType<MockCommandStreamReceiver>();
         executionEnvironment = platform()->peekExecutionEnvironment();
         executionEnvironment->memoryManager = std::make_unique<OsAgnosticMemoryManager>(*executionEnvironment);
         device = std::make_unique<MockClDevice>(MockDevice::create<MockDevice>(executionEnvironment, 0u));
-        auto mockCsr = new MockCommandStreamReceiver(*executionEnvironment, 0, device->getDeviceBitfield());
-        device->resetCommandStreamReceiver(mockCsr);
-        ctx.reset(new MockContext);
+        ctx.reset(new MockContext(device.get()));
         cmdQ.reset(new MockCommandQueue(ctx.get(), device.get(), nullptr, false));
         sharing = new GlSharingFunctionsMock();
         ctx->setSharingFunctions(sharing);

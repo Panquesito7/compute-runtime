@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/helpers/dispatch_info.h"
@@ -33,13 +34,13 @@ class DispatchInfoFixture : public ContextFixture, public ClDeviceFixture {
         ContextFixture::setUp(1, &device);
         pKernelInfo = std::make_unique<MockKernelInfo>();
 
-        pKernelInfo->setPerThreadScratchSize(1024, 0);
+        pKernelInfo->kernelDescriptor.kernelAttributes.perThreadScratchSize[0] = 1024;
         pKernelInfo->setPrintfSurface(sizeof(uintptr_t), 0);
 
         pProgram = new MockProgram(pContext, false, toClDeviceVector(*pClDevice));
 
         pKernel = new MockKernel(pProgram, *pKernelInfo, *pClDevice);
-        pKernel->slmTotalSize = 128;
+        pKernel->slmTotalSizePerThreadGroup = 128;
     }
     void tearDown() {
         delete pKernel;
@@ -60,7 +61,7 @@ TEST_F(DispatchInfoTest, GivenNoGeometryWhenDispatchInfoIsCreatedThenValuesAreSe
     std::unique_ptr<DispatchInfo> dispatchInfo(new DispatchInfo);
 
     EXPECT_EQ(nullptr, dispatchInfo->getKernel());
-    EXPECT_EQ(0u, dispatchInfo->getRequiredScratchSize());
+    EXPECT_EQ(0u, dispatchInfo->getRequiredScratchSize(0u));
     EXPECT_FALSE(dispatchInfo->usesSlm());
     EXPECT_FALSE(dispatchInfo->usesStatelessPrintfSurface());
     EXPECT_EQ(0u, dispatchInfo->getDim());
@@ -84,7 +85,7 @@ TEST_F(DispatchInfoTest, GivenUserGeometryWhenDispatchInfoIsCreatedThenValuesAre
     std::unique_ptr<DispatchInfo> dispatchInfo(new DispatchInfo(pClDevice, pKernel, 3, gws, elws, offset));
 
     EXPECT_NE(nullptr, dispatchInfo->getKernel());
-    EXPECT_EQ(1024u, dispatchInfo->getRequiredScratchSize());
+    EXPECT_EQ(1024u, dispatchInfo->getRequiredScratchSize(0u));
     EXPECT_TRUE(dispatchInfo->usesSlm());
     EXPECT_TRUE(dispatchInfo->usesStatelessPrintfSurface());
     EXPECT_EQ(3u, dispatchInfo->getDim());
@@ -117,7 +118,7 @@ TEST_F(DispatchInfoTest, GivenFullGeometryWhenDispatchInfoIsCreatedThenValuesAre
     std::unique_ptr<DispatchInfo> dispatchInfo(new DispatchInfo(pClDevice, pKernel, 3, gws, elws, offset, agws, lws, twgs, nwgs, swgs));
 
     EXPECT_NE(nullptr, dispatchInfo->getKernel());
-    EXPECT_EQ(1024u, dispatchInfo->getRequiredScratchSize());
+    EXPECT_EQ(1024u, dispatchInfo->getRequiredScratchSize(0u));
     EXPECT_TRUE(dispatchInfo->usesSlm());
     EXPECT_TRUE(dispatchInfo->usesStatelessPrintfSurface());
     EXPECT_EQ(3u, dispatchInfo->getDim());
@@ -148,7 +149,7 @@ TEST_F(DispatchInfoTest, WhenMultiDispatchInfoIsCreatedThenItIsNonAssignable) {
 TEST_F(DispatchInfoTest, WhenMultiDispatchInfoIsCreatedThenItIsEmpty) {
     MultiDispatchInfo multiDispatchInfo;
     EXPECT_TRUE(multiDispatchInfo.empty());
-    EXPECT_EQ(0u, multiDispatchInfo.getRequiredScratchSize());
+    EXPECT_EQ(0u, multiDispatchInfo.getRequiredScratchSize(0u));
     EXPECT_FALSE(multiDispatchInfo.usesSlm());
     EXPECT_FALSE(multiDispatchInfo.usesStatelessPrintfSurface());
     EXPECT_EQ(0u, multiDispatchInfo.getRedescribedSurfaces().size());
@@ -157,7 +158,7 @@ TEST_F(DispatchInfoTest, WhenMultiDispatchInfoIsCreatedThenItIsEmpty) {
 TEST_F(DispatchInfoTest, GivenRedescribedSurfacesWhenCreatingMultiDispatchInfoThenRedescribedSurfacesSizeisOne) {
     MultiDispatchInfo multiDispatchInfo;
 
-    auto image = std::unique_ptr<Image>(Image2dHelper<>::create(pContext));
+    auto image = std::unique_ptr<Image>(Image2dHelperUlt<>::create(pContext));
     ASSERT_NE(nullptr, image);
 
     auto imageRedescribed = image->redescribe();
@@ -172,7 +173,7 @@ TEST_F(DispatchInfoTest, GivenNoGeometryWhenMultiDispatchInfoIsCreatedThenValues
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     EXPECT_FALSE(multiDispatchInfo.empty());
-    EXPECT_EQ(0u, multiDispatchInfo.getRequiredScratchSize());
+    EXPECT_EQ(0u, multiDispatchInfo.getRequiredScratchSize(0u));
     EXPECT_FALSE(multiDispatchInfo.usesSlm());
     EXPECT_FALSE(multiDispatchInfo.usesStatelessPrintfSurface());
 }
@@ -187,7 +188,7 @@ TEST_F(DispatchInfoTest, GivenUserGeometryWhenMultiDispatchInfoIsCreatedThenValu
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     EXPECT_FALSE(multiDispatchInfo.empty());
-    EXPECT_EQ(1024u, multiDispatchInfo.getRequiredScratchSize());
+    EXPECT_EQ(1024u, multiDispatchInfo.getRequiredScratchSize(0u));
     EXPECT_TRUE(multiDispatchInfo.usesSlm());
     EXPECT_TRUE(multiDispatchInfo.usesStatelessPrintfSurface());
 
@@ -220,7 +221,7 @@ TEST_F(DispatchInfoTest, GivenFullGeometryWhenMultiDispatchInfoIsCreatedThenValu
     MultiDispatchInfo multiDispatchInfo;
     multiDispatchInfo.push(dispatchInfo);
     EXPECT_FALSE(multiDispatchInfo.empty());
-    EXPECT_EQ(1024u, multiDispatchInfo.getRequiredScratchSize());
+    EXPECT_EQ(1024u, multiDispatchInfo.getRequiredScratchSize(0u));
     EXPECT_TRUE(multiDispatchInfo.usesSlm());
     EXPECT_TRUE(multiDispatchInfo.usesStatelessPrintfSurface());
 
@@ -317,10 +318,4 @@ TEST(DispatchInfoBasicTests, givenDispatchInfoWhenSetCanBePartitionIsCalledThenS
     DispatchInfo dispatchInfo;
     dispatchInfo.setCanBePartitioned(true);
     EXPECT_TRUE(dispatchInfo.peekCanBePartitioned());
-}
-
-TEST(DispatchInfoBasicTests, givenDispatchInfoWithoutKernelWhenGettingSizeForPrivateScratchThenZeroIsReturned) {
-    DispatchInfo dispatchInfo;
-    EXPECT_EQ(nullptr, dispatchInfo.getKernel());
-    EXPECT_EQ(0u, dispatchInfo.getRequiredPrivateScratchSize());
 }

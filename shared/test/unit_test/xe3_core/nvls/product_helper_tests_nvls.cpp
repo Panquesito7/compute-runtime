@@ -1,0 +1,53 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/xe3_core/hw_info_xe3_core.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/test_macros/header/per_product_test_definitions.h"
+#include "shared/test/unit_test/os_interface/product_helper_tests.h"
+
+#include "platforms.h"
+
+using namespace NEO;
+
+using NvlsProductHelper = ProductHelperTest;
+
+NVLSTEST_F(NvlsProductHelper, whenGettingPreferredAllocationMethodThenAllocateByKmdIsReturned) {
+    for (auto i = 0; i < static_cast<int>(AllocationType::count); i++) {
+        auto allocationType = static_cast<AllocationType>(i);
+        auto preferredAllocationMethod = productHelper->getPreferredAllocationMethod(allocationType);
+        EXPECT_TRUE(preferredAllocationMethod.has_value());
+        EXPECT_EQ(GfxMemoryAllocationMethod::allocateByKmd, preferredAllocationMethod.value());
+    }
+}
+
+NVLSTEST_F(NvlsProductHelper, givenCompilerProductHelperWhenGetDefaultHwIpVersionThenCorrectValueIsSet) {
+    EXPECT_EQ(compilerProductHelper->getDefaultHwIpVersion(), AOT::NVL_S_A0);
+}
+
+NVLSTEST_F(NvlsProductHelper, givenProductHelperWhenCheckoverrideAllocationCpuCacheableThenTrueIsReturnedForCommandBuffer) {
+    AllocationData allocationData{};
+    allocationData.type = AllocationType::commandBuffer;
+    EXPECT_TRUE(productHelper->overrideAllocationCpuCacheable(allocationData));
+
+    allocationData.type = AllocationType::buffer;
+    EXPECT_FALSE(productHelper->overrideAllocationCpuCacheable(allocationData));
+}
+
+NVLSTEST_F(NvlsProductHelper, givenProductHelperWhenCallIsStagingBuffersEnabledThenReturnTrue) {
+    EXPECT_TRUE(productHelper->isStagingBuffersEnabled());
+}
+
+NVLSTEST_F(NvlsProductHelper, givenProductHelperWhenCheckingInitializeInternalEngineImmediatelyThenCorrectValueIsReturned) {
+    EXPECT_FALSE(productHelper->initializeInternalEngineImmediately());
+}

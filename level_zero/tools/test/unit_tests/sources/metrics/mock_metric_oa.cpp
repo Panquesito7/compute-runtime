@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,38 +7,23 @@
 
 #include "level_zero/tools/test/unit_tests/sources/metrics/mock_metric_oa.h"
 
-#include "shared/source/command_container/implicit_scaling.h"
 #include "shared/test/common/mocks/mock_os_library.h"
 
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
 #include "level_zero/tools/source/metrics/metric_ip_sampling_source.h"
 #include "level_zero/tools/source/metrics/metric_oa_source.h"
 #include "level_zero/tools/source/metrics/metric_oa_streamer_imp.h"
-#include "level_zero/tools/source/metrics/os_metric_ip_sampling.h"
+#include "level_zero/tools/source/metrics/os_interface_metric.h"
 
 using namespace MetricsLibraryApi;
-
-using ::testing::_;
-using ::testing::Return;
 
 namespace L0 {
 namespace ult {
 
-class MockIpSamplingOsInterface : public MetricIpSamplingOsInterface {
-
-  public:
-    ~MockIpSamplingOsInterface() override = default;
-    ze_result_t startMeasurement(uint32_t &notifyEveryNReports, uint32_t &samplingPeriodNs) override {
-        return ZE_RESULT_ERROR_UNKNOWN;
-    }
-    ze_result_t stopMeasurement() override { return ZE_RESULT_ERROR_UNKNOWN; }
-    ze_result_t readData(uint8_t *pRawData, size_t *pRawDataSize) override { return ZE_RESULT_ERROR_UNKNOWN; }
-    uint32_t getRequiredBufferSize(const uint32_t maxReportCount) override { return 0; }
-    uint32_t getUnitReportSize() override { return 0; }
-    bool isNReportsAvailable() override { return false; }
-    bool isDependencyAvailable() override { return false; }
-};
-
 void MetricContextFixture::setUp() {
+
+    debugManager.flags.DisableProgrammableMetricsSupport.set(1);
 
     // Call base class.
     DeviceFixture::setUp();
@@ -47,15 +32,17 @@ void MetricContextFixture::setUp() {
     auto &metricSource = device->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
     metricSource.setInitializationState(ZE_RESULT_SUCCESS);
 
+    mockIpSamplingOsInterface = new MockIpSamplingOsInterface();
     std::unique_ptr<MetricIpSamplingOsInterface> metricIpSamplingOsInterface =
-        std::unique_ptr<MetricIpSamplingOsInterface>(new MockIpSamplingOsInterface());
+        std::unique_ptr<MetricIpSamplingOsInterface>(mockIpSamplingOsInterface);
     auto &ipMetricSource = device->getMetricDeviceContext().getMetricSource<IpSamplingMetricSourceImp>();
     ipMetricSource.setMetricOsInterface(metricIpSamplingOsInterface);
+    device->getMetricDeviceContext().setMetricsCollectionAllowed(true);
 
     // Mock metrics library.
     mockMetricsLibrary = std::unique_ptr<Mock<MetricsLibrary>>(new (std::nothrow) Mock<MetricsLibrary>(metricSource));
     mockMetricsLibrary->setMockedApi(&mockMetricsLibraryApi);
-    mockMetricsLibrary->handle = new MockOsLibrary();
+    mockMetricsLibrary->handle = std::make_unique<MockOsLibrary>();
 
     //  Mock metric enumeration.
     mockMetricEnumeration = std::unique_ptr<Mock<MetricEnumeration>>(new (std::nothrow) Mock<MetricEnumeration>(metricSource));
@@ -70,7 +57,6 @@ void MetricContextFixture::setUp() {
 void MetricContextFixture::tearDown() {
 
     // Restore original metrics library
-    delete mockMetricsLibrary->handle;
     mockMetricsLibrary->setMockedApi(nullptr);
     mockMetricsLibrary.reset();
 
@@ -84,67 +70,25 @@ void MetricContextFixture::tearDown() {
 
 void MetricContextFixture::openMetricsAdapter() {
 
-    EXPECT_CALL(*mockMetricEnumeration, loadMetricsDiscovery())
-        .Times(0);
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, OpenMetricsDevice(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .Times(0);
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&adapter));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    adapter.openMetricsDeviceOutDevice = &metricsDevice;
 }
 
 void MetricContextFixture::openMetricsAdapterGroup() {
 
-    EXPECT_CALL(*mockMetricEnumeration, loadMetricsDiscovery())
-        .Times(0);
-
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, OpenMetricsDevice(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
+    adapter.openMetricsDeviceOutDevice = &metricsDevice;
 }
 
-void MetricContextFixture::setupDefaultMocksForMetricDevice(Mock<IMetricsDevice_1_5> &metricDevice) {
-    EXPECT_CALL(metricDevice, GetParams())
-        .WillRepeatedly(testing::Return(&metricsDeviceParams));
-
-    defaultMaximumOaBufferSize.ValueType = MetricsDiscovery::TValueType::VALUE_TYPE_UINT32;
-    defaultMaximumOaBufferSize.ValueUInt32 = 1024;
-    EXPECT_CALL(metricDevice, GetGlobalSymbolValueByName(_))
-        .WillRepeatedly(testing::Return(&defaultMaximumOaBufferSize));
+void MetricContextFixture::setupDefaultMocksForMetricDevice(Mock<IMetricsDevice_1_13> &metricDevice) {
+    metricDevice.GetParamsResult = &metricsDeviceParams;
 }
 
 void MetricMultiDeviceFixture::setUp() {
-    DebugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.DisableProgrammableMetricsSupport.set(1);
+    debugManager.flags.EnableImplicitScaling.set(1);
 
     MultiDeviceFixture::setUp();
 
@@ -157,33 +101,35 @@ void MetricMultiDeviceFixture::setUp() {
     // Initialize metric api.
     auto &metricSource = devices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
     metricSource.setInitializationState(ZE_RESULT_SUCCESS);
+    devices[0]->getMetricDeviceContext().setMetricsCollectionAllowed(true);
 
     // Mock metrics library.
     mockMetricsLibrary = std::unique_ptr<Mock<MetricsLibrary>>(new (std::nothrow) Mock<MetricsLibrary>(metricSource));
     mockMetricsLibrary->setMockedApi(&mockMetricsLibraryApi);
-    mockMetricsLibrary->handle = new MockOsLibrary();
+    mockMetricsLibrary->handle = std::make_unique<MockOsLibrary>();
 
     //  Mock metric enumeration.
     mockMetricEnumeration = std::unique_ptr<Mock<MetricEnumeration>>(new (std::nothrow) Mock<MetricEnumeration>(metricSource));
     mockMetricEnumeration->setMockedApi(&mockMetricsDiscoveryApi);
     mockMetricEnumeration->hMetricsDiscovery = std::make_unique<MockOsLibrary>();
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
     mockMetricEnumerationSubDevices.resize(subDeviceCount);
     mockMetricsLibrarySubDevices.resize(subDeviceCount);
 
     for (uint32_t i = 0; i < subDeviceCount; i++) {
-        auto &metricsSubDeviceContext = deviceImp.subDevices[i]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
+        auto &metricsSubDeviceContext = l0Device.subDevices[i]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
         mockMetricEnumerationSubDevices[i] = std::unique_ptr<Mock<MetricEnumeration>>(new (std::nothrow) Mock<MetricEnumeration>(metricsSubDeviceContext));
         mockMetricEnumerationSubDevices[i]->setMockedApi(&mockMetricsDiscoveryApi);
         mockMetricEnumerationSubDevices[i]->hMetricsDiscovery = std::make_unique<MockOsLibrary>();
 
         mockMetricsLibrarySubDevices[i] = std::unique_ptr<Mock<MetricsLibrary>>(new (std::nothrow) Mock<MetricsLibrary>(metricsSubDeviceContext));
         mockMetricsLibrarySubDevices[i]->setMockedApi(&mockMetricsLibraryApi);
-        mockMetricsLibrarySubDevices[i]->handle = new MockOsLibrary();
+        mockMetricsLibrarySubDevices[i]->handle = std::make_unique<MockOsLibrary>();
 
         metricsSubDeviceContext.setInitializationState(ZE_RESULT_SUCCESS);
+        l0Device.subDevices[i]->getMetricDeviceContext().setMetricsCollectionAllowed(true);
     }
     // Metrics Discovery device common settings.
     metricsDeviceParams.Version.MajorNumber = MetricEnumeration::requiredMetricsDiscoveryMajorVersion;
@@ -192,15 +138,14 @@ void MetricMultiDeviceFixture::setUp() {
 
 void MetricMultiDeviceFixture::tearDown() {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     for (uint32_t i = 0; i < subDeviceCount; i++) {
 
         mockMetricEnumerationSubDevices[i]->setMockedApi(nullptr);
         mockMetricEnumerationSubDevices[i].reset();
 
-        delete mockMetricsLibrarySubDevices[i]->handle;
         mockMetricsLibrarySubDevices[i]->setMockedApi(nullptr);
         mockMetricsLibrarySubDevices[i].reset();
     }
@@ -209,7 +154,6 @@ void MetricMultiDeviceFixture::tearDown() {
     mockMetricsLibrarySubDevices.clear();
 
     // Restore original metrics library
-    delete mockMetricsLibrary->handle;
     mockMetricsLibrary->setMockedApi(nullptr);
     mockMetricsLibrary.reset();
 
@@ -222,136 +166,51 @@ void MetricMultiDeviceFixture::tearDown() {
 
 void MetricMultiDeviceFixture::openMetricsAdapter() {
 
-    EXPECT_CALL(*mockMetricEnumeration, loadMetricsDiscovery())
-        .Times(0);
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, OpenMetricsSubDevice(_, _))
-        .Times(2)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<1>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .Times(2)
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .Times(0);
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&adapter));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    adapter.openMetricsSubDeviceOutDevice = &metricsDevice;
+    adapter.openMetricsDeviceOutDevice = &metricsDevice;
 }
 
 void MetricMultiDeviceFixture::openMetricsAdapterSubDevice(uint32_t subDeviceIndex) {
 
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[subDeviceIndex], loadMetricsDiscovery())
-        .Times(0);
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
 
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[subDeviceIndex]->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumerationSubDevices[subDeviceIndex]->getMetricsAdapterResult = &adapter;
 
-    EXPECT_CALL(adapter, OpenMetricsDevice(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .Times(1)
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(adapterGroup, GetAdapter(_))
-        .Times(0);
-
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[subDeviceIndex], getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&adapter));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    adapter.openMetricsDeviceOutDevice = &metricsDevice;
 }
 
 void MetricMultiDeviceFixture::openMetricsAdapterDeviceAndSubDeviceNoCountVerify(uint32_t subDeviceIndex) {
 
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
+    mockMetricEnumeration->getMetricsAdapterResult = &adapter;
+    mockMetricEnumerationSubDevices[subDeviceIndex]->getMetricsAdapterResult = &adapter;
 
-    EXPECT_CALL(adapter, OpenMetricsSubDevice(_, _))
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<1>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .WillRepeatedly(Return(&adapter));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[subDeviceIndex]->g_mockApi, MockOpenAdapterGroup(_))
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, OpenMetricsDevice(_))
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<0>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[subDeviceIndex], getMetricsAdapter())
-        .WillRepeatedly(Return(&adapter));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
+    adapter.openMetricsDeviceOutDevice = &metricsDevice;
+    adapter.openMetricsSubDeviceOutDevice = &metricsDevice;
 }
 
 void MetricMultiDeviceFixture::openMetricsAdapterGroup() {
 
-    EXPECT_CALL(*mockMetricEnumeration, loadMetricsDiscovery())
-        .Times(0);
-
-    EXPECT_CALL(*mockMetricEnumeration->g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&adapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, OpenMetricsDevice(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&metricsDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(adapter, CloseMetricsDevice(_))
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(adapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&adapterGroup);
+    adapter.openMetricsDeviceOutDevice = &metricsDevice;
 }
 
-void MetricMultiDeviceFixture::setupDefaultMocksForMetricDevice(Mock<IMetricsDevice_1_5> &metricDevice) {
-    EXPECT_CALL(metricDevice, GetParams())
-        .WillRepeatedly(testing::Return(&metricsDeviceParams));
-
-    defaultMaximumOaBufferSize.ValueType = MetricsDiscovery::TValueType::VALUE_TYPE_UINT32;
-    defaultMaximumOaBufferSize.ValueUInt32 = 1024;
-    EXPECT_CALL(metricDevice, GetGlobalSymbolValueByName(_))
-        .WillRepeatedly(testing::Return(&defaultMaximumOaBufferSize));
+void MetricMultiDeviceFixture::setupDefaultMocksForMetricDevice(Mock<IMetricsDevice_1_13> &metricDevice) {
+    metricDevice.GetParamsResult = &metricsDeviceParams;
 }
 
 void MetricStreamerMultiDeviceFixture::cleanup(zet_device_handle_t &hDevice, zet_metric_streamer_handle_t &hStreamer) {
 
     OaMetricStreamerImp *pStreamerImp = static_cast<OaMetricStreamerImp *>(MetricStreamer::fromHandle(hStreamer));
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
+    auto &l0Device = *static_cast<Device *>(devices[0]);
 
-    for (size_t index = 0; index < deviceImp.subDevices.size(); index++) {
+    for (size_t index = 0; index < l0Device.subDevices.size(); index++) {
         zet_metric_streamer_handle_t metricStreamerSubDeviceHandle = pStreamerImp->getMetricStreamers()[index];
         OaMetricStreamerImp *pStreamerSubDevImp = static_cast<OaMetricStreamerImp *>(MetricStreamer::fromHandle(metricStreamerSubDeviceHandle));
-        auto device = deviceImp.subDevices[index];
+        auto device = l0Device.subDevices[index];
         auto &metricSource = device->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
         auto &metricsLibrary = metricSource.getMetricsLibrary();
         metricSource.setMetricStreamer(nullptr);
@@ -377,7 +236,9 @@ void Mock<MetricsLibrary>::setMockedApi(MockMetricsLibraryApi *mockedApi) {
 
         //  Mock class used to communicate with metrics library.
         metricsLibrary = &metricSource.getMetricsLibrary();
-        metricSource.setMetricsLibrary(*this);
+        auto &actualMetricsLibrary = metricSource.getMetricsLibraryObject();
+        actualMetricsLibrary.release();
+        actualMetricsLibrary.reset(this);
 
         // Mock metrics library api functions.
         contextCreateFunction = mockedApi->contextCreate;
@@ -410,72 +271,74 @@ void Mock<MetricsLibrary>::setMockedApi(MockMetricsLibraryApi *mockedApi) {
     } else {
 
         // Restore an original class used to communicate with metrics library.
-        metricSource.setMetricsLibrary(*metricsLibrary);
+        auto &actualMetricsLibrary = metricSource.getMetricsLibraryObject();
+        actualMetricsLibrary.release();
+        actualMetricsLibrary.reset(metricsLibrary);
     }
 }
 
 StatusCode MockMetricsLibraryApi::contextCreate(ClientType_1_0 clientType, ContextCreateData_1_0 *createData, ContextHandle_1_0 *handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockContextCreate(clientType, createData, handle);
+    return Mock<MetricsLibrary>::g_mockApi->contextCreateImpl(clientType, createData, handle);
 }
 
 StatusCode MockMetricsLibraryApi::contextDelete(const ContextHandle_1_0 handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockContextDelete(handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::getParameter(const ParameterType parameter, ValueType *type, TypedValue_1_0 *value) {
-    return Mock<MetricsLibrary>::g_mockApi->MockGetParameter(parameter, type, value);
+    return Mock<MetricsLibrary>::g_mockApi->getParameterImpl(parameter, type, value);
 }
 
 StatusCode MockMetricsLibraryApi::commandBufferGet(const CommandBufferData_1_0 *data) {
-    return Mock<MetricsLibrary>::g_mockApi->MockCommandBufferGet(data);
+    return Mock<MetricsLibrary>::g_mockApi->commandBufferGetImpl(data);
 }
 
 StatusCode MockMetricsLibraryApi::commandBufferGetSize(const CommandBufferData_1_0 *data, CommandBufferSize_1_0 *size) {
-    return Mock<MetricsLibrary>::g_mockApi->MockCommandBufferGetSize(data, size);
+    return Mock<MetricsLibrary>::g_mockApi->commandBufferGetSizeImpl(data, size);
 }
 
 StatusCode MockMetricsLibraryApi::queryCreate(const QueryCreateData_1_0 *createData, QueryHandle_1_0 *handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockQueryCreate(createData, handle);
+    return Mock<MetricsLibrary>::g_mockApi->queryCreateImpl(createData, handle);
 }
 
 StatusCode MockMetricsLibraryApi::queryDelete(const QueryHandle_1_0 handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockQueryDelete(handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::overrideCreate(const OverrideCreateData_1_0 *createData, OverrideHandle_1_0 *handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockOverrideCreate(createData, handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::overrideDelete(const OverrideHandle_1_0 handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockOverrideDelete(handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::markerCreate(const MarkerCreateData_1_0 *createData, MarkerHandle_1_0 *handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockMarkerCreate(createData, handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::markerDelete(const MarkerHandle_1_0 handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockMarkerDelete(handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::configurationCreate(const ConfigurationCreateData_1_0 *createData, ConfigurationHandle_1_0 *handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockConfigurationCreate(createData, handle);
+    return Mock<MetricsLibrary>::g_mockApi->configurationCreateImpl(createData, handle);
 }
 
 StatusCode MockMetricsLibraryApi::configurationActivate(const ConfigurationHandle_1_0 handle, const ConfigurationActivateData_1_0 *activateData) {
-    return Mock<MetricsLibrary>::g_mockApi->MockConfigurationActivate(handle, activateData);
+    return Mock<MetricsLibrary>::g_mockApi->configurationActivateImpl(handle, activateData);
 }
 
 StatusCode MockMetricsLibraryApi::configurationDeactivate(const ConfigurationHandle_1_0 handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockConfigurationDeactivate(handle);
+    return Mock<MetricsLibrary>::g_mockApi->configurationDeactivateImpl(handle);
 }
 
 StatusCode MockMetricsLibraryApi::configurationDelete(const ConfigurationHandle_1_0 handle) {
-    return Mock<MetricsLibrary>::g_mockApi->MockConfigurationDelete(handle);
+    return StatusCode::Success;
 }
 
 StatusCode MockMetricsLibraryApi::getData(GetReportData_1_0 *data) {
-    return Mock<MetricsLibrary>::g_mockApi->MockGetData(data);
+    return Mock<MetricsLibrary>::g_mockApi->getDataImpl(data);
 }
 
 Mock<MetricQuery>::Mock() {}

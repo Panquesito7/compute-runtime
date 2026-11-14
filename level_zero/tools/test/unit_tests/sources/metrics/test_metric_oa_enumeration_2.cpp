@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,16 +7,14 @@
 
 #include "shared/test/common/test_macros/test.h"
 
-#include "level_zero/core/source/device/device_imp.h"
-#include "level_zero/core/test/unit_tests/mocks/mock_driver.h"
+#include "level_zero/api/extensions/public/ze_exp_ext.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/metrics/metric_oa_source.h"
 #include "level_zero/tools/test/unit_tests/sources/metrics/mock_metric_oa.h"
+#include "level_zero/tools/test/unit_tests/sources/metrics/mock_metric_source.h"
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
-
-using ::testing::_;
-using ::testing::Return;
 
 namespace L0 {
 namespace ult {
@@ -24,12 +22,12 @@ using MetricEnumerationTest = Test<MetricContextFixture>;
 
 TEST_F(MetricEnumerationTest, givenTimeAndBufferSizeWhenOpenIoStreamReturnsErrorThenTheMetricGroupOpenIoStreamReturnsErrorUnknown) {
 
-    Mock<MetricsDiscovery::IConcurrentGroup_1_5> concurrentGroup;
-    MetricGroupImpTest metricGroup;
+    Mock<MetricsDiscovery::IConcurrentGroup_1_13> concurrentGroup;
+    MockMetricSource mockSource{};
+    MetricGroupImpTest metricGroup(mockSource);
 
     metricGroup.pReferenceConcurrentGroup = &concurrentGroup;
-    EXPECT_CALL(concurrentGroup, OpenIoStream(_, _, _, _))
-        .WillRepeatedly(Return(MetricsDiscovery::CC_ERROR_GENERAL));
+    concurrentGroup.openIoStreamResult = TCompletionCode::CC_ERROR_GENERAL;
 
     uint32_t timerPeriodNs = 1;
     uint32_t oaBufferSize = 100;
@@ -37,44 +35,14 @@ TEST_F(MetricEnumerationTest, givenTimeAndBufferSizeWhenOpenIoStreamReturnsError
     EXPECT_EQ(metricGroup.openIoStream(timerPeriodNs, oaBufferSize), ZE_RESULT_ERROR_UNKNOWN);
 }
 
-TEST_F(MetricEnumerationTest, givenReportCountAndReportDataWhenReadIoStreamReturnsOkTheMetricGroupReadIoStreamReturnsSuccess) {
-
-    Mock<MetricsDiscovery::IConcurrentGroup_1_5> concurrentGroup;
-    MetricGroupImpTest metricGroup;
-
-    metricGroup.pReferenceConcurrentGroup = &concurrentGroup;
-    EXPECT_CALL(concurrentGroup, ReadIoStream(_, _, _))
-        .WillOnce(Return(MetricsDiscovery::CC_OK));
-
-    uint32_t reportCount = 1;
-    uint8_t reportData = 0;
-
-    EXPECT_EQ(metricGroup.readIoStream(reportCount, reportData), ZE_RESULT_SUCCESS);
-}
-
-TEST_F(MetricEnumerationTest, givenReportCountAndReportDataWhenReadIoStreamReturnsPendingTheMetricGroupReadIoStreamReturnsSuccess) {
-
-    Mock<MetricsDiscovery::IConcurrentGroup_1_5> concurrentGroup;
-    MetricGroupImpTest metricGroup;
-
-    metricGroup.pReferenceConcurrentGroup = &concurrentGroup;
-    EXPECT_CALL(concurrentGroup, ReadIoStream(_, _, _))
-        .WillOnce(Return(MetricsDiscovery::CC_READ_PENDING));
-
-    uint32_t reportCount = 1;
-    uint8_t reportData = 0;
-
-    EXPECT_EQ(metricGroup.readIoStream(reportCount, reportData), ZE_RESULT_SUCCESS);
-}
-
 TEST_F(MetricEnumerationTest, givenReportCountAndReportDataWhenReadIoStreamReturnsErrorThenMetrigGroupReadIoStreamReturnsError) {
 
-    Mock<MetricsDiscovery::IConcurrentGroup_1_5> concurrentGroup;
-    MetricGroupImpTest metricGroup;
+    Mock<MetricsDiscovery::IConcurrentGroup_1_13> concurrentGroup;
+    MockMetricSource mockSource{};
+    MetricGroupImpTest metricGroup(mockSource);
 
     metricGroup.pReferenceConcurrentGroup = &concurrentGroup;
-    EXPECT_CALL(concurrentGroup, ReadIoStream(_, _, _))
-        .WillOnce(Return(MetricsDiscovery::CC_ERROR_GENERAL));
+    concurrentGroup.readIoStreamResult = TCompletionCode::CC_ERROR_GENERAL;
 
     uint32_t reportCount = 1;
     uint8_t reportData = 0;
@@ -84,13 +52,12 @@ TEST_F(MetricEnumerationTest, givenReportCountAndReportDataWhenReadIoStreamRetur
 
 TEST_F(MetricEnumerationTest, givenTimeAndBufferSizeWhenCloseIoStreamIsCalledCloseAndFailThenIoStreamReturnsErrorUnknown) {
 
-    Mock<MetricsDiscovery::IConcurrentGroup_1_5> concurrentGroup;
-    MetricGroupImpTest metricGroup;
+    Mock<MetricsDiscovery::IConcurrentGroup_1_13> concurrentGroup;
+    MockMetricSource mockSource{};
+    MetricGroupImpTest metricGroup(mockSource);
 
     metricGroup.pReferenceConcurrentGroup = &concurrentGroup;
-    EXPECT_CALL(concurrentGroup, CloseIoStream())
-        .WillRepeatedly(Return(MetricsDiscovery::CC_ERROR_GENERAL));
-
+    concurrentGroup.CloseIoStreamResult = TCompletionCode::CC_ERROR_GENERAL;
     EXPECT_EQ(metricGroup.closeIoStream(), ZE_RESULT_ERROR_UNKNOWN);
 }
 
@@ -98,15 +65,17 @@ TEST_F(MetricEnumerationTest, givenTTypedValueWhenCopyValueIsCalledReturnsFilled
 
     MetricsDiscovery::TTypedValue_1_0 source = {};
     zet_typed_value_t destination = {};
-    MetricGroupImpTest metricGroup = {};
+    MockMetricSource mockSource{};
+    MetricGroupImpTest metricGroup(mockSource);
 
     for (int vType = MetricsDiscovery::VALUE_TYPE_UINT32;
          vType < MetricsDiscovery::VALUE_TYPE_LAST; vType++) {
         source.ValueType = static_cast<MetricsDiscovery::TValueType>(vType);
-        if (vType != MetricsDiscovery::VALUE_TYPE_BOOL)
+        if (vType != MetricsDiscovery::VALUE_TYPE_BOOL) {
             source.ValueUInt64 = 0xFF;
-        else
+        } else {
             source.ValueBool = true;
+        }
 
         metricGroup.copyValue(const_cast<MetricsDiscovery::TTypedValue_1_0 &>(source), destination);
         switch (vType) {
@@ -138,47 +107,42 @@ TEST_F(MetricEnumerationTest, givenTTypedValueWhenCopyValueIsCalledReturnsFilled
     }
 }
 
+TEST_F(MetricEnumerationTest, GivenValidOASourceComputeMetricScopesAreEnumeratedOnce) {
+    MetricDeviceContext &metricsDevContext = device->getMetricDeviceContext();
+    EXPECT_EQ(ZE_RESULT_SUCCESS, metricsDevContext.enableMetricApi());
+
+    metricsDevContext.setComputeMetricScopeInitialized();
+
+    auto &metricSource = metricsDevContext.getMetricSource<OaMetricSourceImp>();
+    EXPECT_EQ(metricSource.isAvailable(), true);
+
+    uint32_t metricScopesCount = 0;
+    metricsDevContext.metricScopesGet(context->toHandle(), &metricScopesCount, nullptr);
+    EXPECT_EQ(metricScopesCount, 0u);
+}
+
+TEST_F(MetricEnumerationTest, givenMetricEnumerationWhenGetMetricSourceIsCalledThenOwningOaMetricSourceIsReturned) {
+    auto &metricSource = device->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
+    EXPECT_EQ(&metricSource, &mockMetricEnumeration->getMetricSource());
+}
+
 using MetricEnumerationMultiDeviceTest = Test<MetricMultiDeviceFixture>;
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceWhenLoadDependenciesIsCalledThenOpenMetricsSubDeviceWillBeCalled) {
 
     // Use first root device.
     auto &metricSource = devices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
-    Mock<IAdapterGroup_1_9> mockAdapterGroup;
-    Mock<IAdapter_1_9> mockAdapter;
-    Mock<IMetricsDevice_1_5> mockDevice;
+    Mock<IAdapterGroup_1_13> mockAdapterGroup;
+    Mock<IAdapter_1_13> mockAdapter;
+    Mock<IMetricsDevice_1_13> mockDevice;
 
-    EXPECT_CALL(*mockMetricsLibrary, load())
-        .Times(1)
-        .WillOnce(Return(true));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&mockAdapterGroup);
+    mockMetricEnumeration->getMetricsAdapterResult = &mockAdapter;
 
-    EXPECT_CALL(*mockMetricEnumeration, loadMetricsDiscovery())
-        .Times(1)
-        .WillOnce(Return(ZE_RESULT_SUCCESS));
-
-    EXPECT_CALL(*Mock<MetricEnumeration>::g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&mockAdapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&mockAdapter));
-
-    EXPECT_CALL(mockAdapter, OpenMetricsSubDevice(_, _))
-        .Times(subDeviceCount)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<1>(&mockDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(mockAdapter, CloseMetricsDevice(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
+    mockAdapter.openMetricsSubDeviceOutDevice = &mockDevice;
+    mockAdapter.openMetricsDeviceOutDevice = &mockDevice;
 
     setupDefaultMocksForMetricDevice(mockDevice);
-
-    EXPECT_CALL(mockAdapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
 
     // Use root device.
     devices[0]->getMetricDeviceContext().setSubDeviceIndex(0);
@@ -186,39 +150,26 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceWhenLoadDependenciesIsCa
 
     EXPECT_EQ(metricSource.loadDependencies(), true);
     EXPECT_EQ(metricSource.isInitialized(), true);
-    EXPECT_EQ(mockMetricEnumeration->baseIsInitialized(), true);
+    mockMetricEnumeration->isInitializedCallBase = true;
+    EXPECT_EQ(mockMetricEnumeration->isInitialized(), true);
     EXPECT_EQ(mockMetricEnumeration->cleanupMetricsDiscovery(), ZE_RESULT_SUCCESS);
 }
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenSubDeviceWhenOpenMetricsDiscoveryIsCalledThenOpenMetricsSubDeviceWillBeCalled) {
 
     // Use sub device
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
     ASSERT_GE(subDeviceCount, 2u);
-    Mock<IAdapterGroup_1_9> mockAdapterGroup;
-    Mock<IAdapter_1_9> mockAdapter;
-    Mock<IMetricsDevice_1_5> mockDevice;
+    Mock<IAdapterGroup_1_13> mockAdapterGroup;
+    Mock<IAdapter_1_13> mockAdapter;
+    Mock<IMetricsDevice_1_13> mockDevice;
 
-    EXPECT_CALL(*Mock<MetricEnumeration>::g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&mockAdapterGroup), Return(TCompletionCode::CC_OK)));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&mockAdapterGroup);
 
-    EXPECT_CALL(mockAdapter, CloseMetricsDevice(_))
-        .Times(1)
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
+    mockMetricEnumerationSubDevices[1]->getMetricsAdapterResult = &mockAdapter;
 
-    EXPECT_CALL(mockAdapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[1], getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&mockAdapter));
-
-    EXPECT_CALL(mockAdapter, OpenMetricsSubDevice(_, _))
-        .Times(1)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<1>(&mockDevice), Return(TCompletionCode::CC_OK)));
+    mockAdapter.openMetricsSubDeviceOutDevice = &mockDevice;
 
     setupDefaultMocksForMetricDevice(mockDevice);
 
@@ -229,35 +180,18 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenSubDeviceWhenOpenMetricsDiscoveryI
 TEST_F(MetricEnumerationMultiDeviceTest, givenSubDeviceWhenOpenMetricsDiscoveryIsCalledAndReadingOABufferMaxSizeFailsThenZeroIsUsed) {
 
     // Use sub device
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
     ASSERT_GE(subDeviceCount, 2u);
-    Mock<IAdapterGroup_1_9> mockAdapterGroup;
-    Mock<IAdapter_1_9> mockAdapter;
-    Mock<IMetricsDevice_1_5> mockDevice;
+    Mock<IAdapterGroup_1_13> mockAdapterGroup;
+    Mock<IAdapter_1_13> mockAdapter;
+    Mock<IMetricsDevice_1_13> mockDevice;
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&mockAdapterGroup);
+    mockMetricEnumerationSubDevices[1]->getMetricsAdapterResult = &mockAdapter;
 
-    EXPECT_CALL(*Mock<MetricEnumeration>::g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&mockAdapterGroup), Return(TCompletionCode::CC_OK)));
+    mockAdapter.openMetricsSubDeviceOutDevice = &mockDevice;
 
-    EXPECT_CALL(mockAdapter, CloseMetricsDevice(_))
-        .Times(1)
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(mockAdapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(*mockMetricEnumerationSubDevices[1], getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&mockAdapter));
-
-    EXPECT_CALL(mockAdapter, OpenMetricsSubDevice(_, _))
-        .Times(1)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<1>(&mockDevice), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(mockDevice, GetGlobalSymbolValueByName(_))
-        .WillRepeatedly(testing::Return(nullptr));
+    mockDevice.forceGetSymbolByNameFail = true;
 
     EXPECT_EQ(mockMetricEnumerationSubDevices[1]->openMetricsDiscovery(), ZE_RESULT_SUCCESS);
     EXPECT_EQ(mockMetricEnumerationSubDevices[1]->getMaxOaBufferSize(), 0u);
@@ -268,39 +202,14 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceWhenLoadDependenciesIsCa
 
     // Use first root device.
     auto &metricSource = devices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
-    Mock<IAdapterGroup_1_9> mockAdapterGroup;
-    Mock<IAdapter_1_9> mockAdapter;
-    Mock<IMetricsDevice_1_5> mockDevice;
+    Mock<IAdapterGroup_1_13> mockAdapterGroup;
+    Mock<IAdapter_1_13> mockAdapter;
+    Mock<IMetricsDevice_1_13> mockDevice;
 
-    EXPECT_CALL(*mockMetricsLibrary, load())
-        .Times(1)
-        .WillOnce(Return(true));
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&mockAdapterGroup);
+    mockMetricEnumeration->getMetricsAdapterResult = &mockAdapter;
 
-    EXPECT_CALL(*mockMetricEnumeration, loadMetricsDiscovery())
-        .Times(1)
-        .WillOnce(Return(ZE_RESULT_SUCCESS));
-
-    EXPECT_CALL(*Mock<MetricEnumeration>::g_mockApi, MockOpenAdapterGroup(_))
-        .Times(1)
-        .WillOnce(DoAll(::testing::SetArgPointee<0>(&mockAdapterGroup), Return(TCompletionCode::CC_OK)));
-
-    EXPECT_CALL(*mockMetricEnumeration, getMetricsAdapter())
-        .Times(1)
-        .WillOnce(Return(&mockAdapter));
-
-    EXPECT_CALL(mockAdapter, OpenMetricsSubDevice(_, _))
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_ERROR_GENERAL));
-
-    EXPECT_CALL(mockAdapter, CloseMetricsDevice(_))
-        .Times(0);
-
-    EXPECT_CALL(mockDevice, GetParams())
-        .Times(0);
-
-    EXPECT_CALL(mockAdapterGroup, Close())
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_OK));
+    mockAdapter.openMetricsSubDeviceResult = TCompletionCode::CC_ERROR_GENERAL;
 
     // Use root device.
     devices[0]->getMetricDeviceContext().setSubDeviceIndex(0);
@@ -308,7 +217,34 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceWhenLoadDependenciesIsCa
 
     EXPECT_EQ(metricSource.loadDependencies(), true);
     EXPECT_EQ(metricSource.isInitialized(), true);
-    EXPECT_EQ(mockMetricEnumeration->baseIsInitialized(), false);
+    mockMetricEnumeration->isInitializedCallBase = true;
+    EXPECT_EQ(mockMetricEnumeration->isInitialized(), false);
+    EXPECT_EQ(0u, mockDevice.GetParamsCalled);
+}
+
+TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceWhenLoadDependenciesAndOpenAdapterOnRootDeviceFailsThenCLeanUpIsDone) {
+
+    // Use first root device.
+    auto &metricSource = devices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
+    Mock<IAdapterGroup_1_13> mockAdapterGroup;
+    Mock<IAdapter_1_13> mockAdapter;
+    Mock<IMetricsDevice_1_13> mockDevice;
+
+    mockMetricEnumeration->globalMockApi->adapterGroup = reinterpret_cast<IAdapterGroupLatest *>(&mockAdapterGroup);
+
+    mockMetricEnumeration->getMetricsAdapterResult = &mockAdapter;
+
+    mockAdapter.openMetricsSubDeviceOutDevice = &mockDevice;
+    mockAdapter.openMetricsDeviceResult = TCompletionCode::CC_ERROR_GENERAL;
+
+    setupDefaultMocksForMetricDevice(mockDevice);
+
+    // Use root device.
+    devices[0]->getMetricDeviceContext().setSubDeviceIndex(0);
+    mockMetricsLibrary->initializationState = ZE_RESULT_SUCCESS;
+
+    EXPECT_EQ(metricSource.loadDependencies(), true);
+    EXPECT_EQ(mockMetricEnumeration->openMetricsDiscovery(), ZE_RESULT_ERROR_NOT_AVAILABLE);
 }
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenIncorrectMetricsDiscoveryInterfaceVersionWhenZetGetMetricGroupIsCalledThenReturnsFail) {
@@ -321,29 +257,38 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenIncorrectMetricsDiscoveryInterface
     setupDefaultMocksForMetricDevice(metricsDevice);
 
     uint32_t metricGroupCount = 0;
-    EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &metricGroupCount, nullptr), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &metricGroupCount, nullptr), ZE_RESULT_ERROR_UNKNOWN);
     EXPECT_EQ(metricGroupCount, 0u);
 }
 
-TEST_F(MetricEnumerationMultiDeviceTest, givenValidArgumentsWhenZetMetricGetPropertiestIsCalledThenReturnSuccess) {
-
-    // Use first root device.
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+TEST_F(MetricEnumerationMultiDeviceTest, givenValidArgumentsWhenZetMetricGetPropertiesIsCalledThenReturnSuccess) {
 
     // Metrics Discovery device.
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
     // Metrics Discovery concurrent group.
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
     metricsConcurrentGroupParams.Description = "OA description";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
+
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
 
     // Metrics Discovery:: metric set.
-    Mock<MetricsDiscovery::IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.MetricsCount = 0;
     metricsSetParams.SymbolName = "Metric set name";
@@ -351,8 +296,8 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenValidArgumentsWhenZetMetricGetProp
     metricsSetParams.MetricsCount = 1;
 
     // Metrics Discovery:: metric.
-    Mock<IMetric_1_0> metric;
-    TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    TMetricParams_1_13 metricParams = {};
     metricParams.SymbolName = "Metric symbol name";
     metricParams.ShortName = "Metric short name";
     metricParams.LongName = "Metric long name";
@@ -368,30 +313,17 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenValidArgumentsWhenZetMetricGetProp
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metric, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group count.
     uint32_t metricGroupCount = 0;
@@ -418,6 +350,8 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenValidArgumentsWhenZetMetricGetProp
     EXPECT_EQ(metricCount, 1u);
     EXPECT_EQ(zetMetricGet(metricGroupHandle, &metricCount, &metricHandle), ZE_RESULT_SUCCESS);
     EXPECT_NE(metricHandle, nullptr);
+    EXPECT_TRUE(static_cast<OaMetricImp *>(metricHandle)->isImmutable());
+    EXPECT_TRUE(static_cast<OaMetricImp *>(metricHandle)->getMetricSource().isAvailable());
 
     // Obtain metric params.
     EXPECT_EQ(zetMetricGetProperties(metricHandle, &metricProperties), ZE_RESULT_SUCCESS);
@@ -429,25 +363,38 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenValidArgumentsWhenZetMetricGetProp
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceIsEnumeratedAfterSubDeviceWhenZetMetricGetIsCalledThenMetricGroupCountIsSameForRootAndSubDevice) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
+    auto &l0Device = *static_cast<Device *>(devices[0]);
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
     metricsConcurrentGroupParams.Description = "OA description";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<MetricsDiscovery::IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+
+    Mock<MetricsDiscovery::IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.MetricsCount = 0;
     metricsSetParams.SymbolName = "Metric set name";
     metricsSetParams.ShortName = "Metric set description";
     metricsSetParams.MetricsCount = 1;
 
-    Mock<IMetric_1_0> metric;
-    TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    TMetricParams_1_13 metricParams = {};
     metricParams.SymbolName = "Metric symbol name";
     metricParams.ShortName = "Metric short name";
     metricParams.LongName = "Metric long name";
@@ -458,30 +405,21 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceIsEnumeratedAfterSubDevi
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
+    metric.GetParamsResult = &metricParams;
 
     uint32_t subDeviceMetricGroupCount = 0;
-    auto &subDeviceImp = *static_cast<DeviceImp *>(deviceImp.subDevices[0]);
-    EXPECT_EQ(zetMetricGroupGet(subDeviceImp.toHandle(), &subDeviceMetricGroupCount, nullptr), ZE_RESULT_SUCCESS);
+    auto &subDevice = *static_cast<Device *>(l0Device.subDevices[0]);
+    EXPECT_EQ(zetMetricGroupGet(subDevice.toHandle(), &subDeviceMetricGroupCount, nullptr), ZE_RESULT_SUCCESS);
 
     uint32_t rootDeviceMetricGroupCount = 0;
     EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &rootDeviceMetricGroupCount, nullptr), ZE_RESULT_SUCCESS);
@@ -491,24 +429,37 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenRootDeviceIsEnumeratedAfterSubDevi
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricGroupCalculateMetricValuesExpIsCalledTwiceThenReturnsSuccess) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.QueryReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -518,34 +469,18 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricG
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+    metricsSet.calculateMetricsOutReportCount = &returnedMetricCount;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(subDeviceCount)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<4>(returnedMetricCount), Return(TCompletionCode::CC_OK)));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -556,11 +491,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricG
     // Raw results.
     const size_t rawResultsSize = 560;
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -589,24 +524,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricG
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidDataCountAndTotalMetricCountWhenZetMetricGroupCalculateMetricValuesExpIsCalledThenReturnsCorrectDataCountAndTotalMetricCount) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.QueryReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -614,30 +564,15 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidDataCountAndTotalMetricCoun
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -648,11 +583,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidDataCountAndTotalMetricCoun
     // Raw results.
     const size_t rawResultsSize = 560;
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -682,24 +617,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidDataCountAndTotalMetricCoun
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidQueryReportSizeWhenZetMetricGroupCalculateMetricValuesExpIsCalledThenReturnsFail) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.QueryReportSize = 0;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -707,30 +657,15 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidQueryReportSizeWhenZetMetri
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -741,11 +676,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidQueryReportSizeWhenZetMetri
     // Raw results.
     const size_t rawResultsSize = 560;
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -765,26 +700,111 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenInvalidQueryReportSizeWhenZetMetri
     EXPECT_EQ(totalMetricCount, 0u);
 }
 
-TEST_F(MetricEnumerationMultiDeviceTest, givenErrorGeneralOnCalculateMetricsWhenZetMetricGroupCalculateMetricValuesExpIsCalledThenReturnsFail) {
+TEST_F(MetricEnumerationMultiDeviceTest, givenSubDeviceRawDataSizeNotMultipleOfReportSizeWhenZetMetricGroupCalculateMultipleMetricValuesExpIsCalledForCountThenErrorInvalidSizeIsReturnedAndCountsAreZero) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.QueryReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
+    metric.GetParamsResult = &metricParams;
+
+    openMetricsAdapter();
+    setupDefaultMocksForMetricDevice(metricsDevice);
+
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+
+    zet_metric_group_handle_t metricGroupHandle = {};
+    uint32_t metricGroupCount = 1;
+    EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &metricGroupCount, &metricGroupHandle), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(metricGroupCount, 1u);
+
+    const size_t rawResultsSize = 560;
+    uint8_t rawResults[rawResultsSize] = {};
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
+
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
+    pRawHeader->dataCount = subDeviceCount;
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
+    pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
+    pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
+
+    uint32_t *pRawDataSizes = reinterpret_cast<uint32_t *>(rawResults + pRawHeader->rawDataSizes);
+    pRawDataSizes[0] = metricsSetParams.QueryReportSize;
+    pRawDataSizes[1] = metricsSetParams.QueryReportSize - 1;
+
+    uint32_t dataCount = 0;
+    uint32_t totalMetricCount = 0;
+    EXPECT_EQ(L0::zetMetricGroupCalculateMultipleMetricValuesExp(metricGroupHandle, ZET_METRIC_GROUP_CALCULATION_TYPE_METRIC_VALUES, rawResultsSize, rawResults, &dataCount, &totalMetricCount, nullptr, nullptr), ZE_RESULT_ERROR_INVALID_SIZE);
+    EXPECT_EQ(dataCount, 0u);
+    EXPECT_EQ(totalMetricCount, 0u);
+}
+
+TEST_F(MetricEnumerationMultiDeviceTest, givenErrorGeneralOnCalculateMetricsWhenZetMetricGroupCalculateMetricValuesExpIsCalledThenReturnsFail) {
+
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
+
+    metricsDeviceParams.ConcurrentGroupsCount = 1;
+
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
+    metricsConcurrentGroupParams.MetricSetsCount = 1;
+    metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
+
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
+    metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
+    metricsSetParams.QueryReportSize = 256;
+    metricsSetParams.MetricsCount = 11;
+
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -792,34 +812,16 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenErrorGeneralOnCalculateMetricsWhen
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+    metricsSet.calculateMetricsResult = TCompletionCode::CC_ERROR_GENERAL;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(1)
-        .WillOnce(Return(TCompletionCode::CC_ERROR_GENERAL));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -830,11 +832,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenErrorGeneralOnCalculateMetricsWhen
     // Raw results.
     const size_t rawResultsSize = 560;
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -863,24 +865,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenErrorGeneralOnCalculateMetricsWhen
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricGroupCalculateMetricValuesIsCalledThenReturnsFail) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_OCL;
     metricsSetParams.QueryReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -888,30 +905,15 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricG
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -922,11 +924,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricG
     // Raw results.
     const size_t rawResultsSize = 560;
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -946,24 +948,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenZetMetricG
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenFirstSubDeviceHasNoReportsToCalculateThenZetMetricGroupCalculateMetricValuesExpReturnsPartialDataForSecondSubDeviceAndReturnsSuccess) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
     metricsSetParams.RawReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -973,34 +990,16 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenFirstSubDe
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+    metricsSet.calculateMetricsOutReportCount = &returnedMetricCount;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(subDeviceCount - 1)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<4>(returnedMetricCount), Return(TCompletionCode::CC_OK)));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -1011,11 +1010,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenFirstSubDe
     // Raw results.
     constexpr size_t rawResultsSize = 512; // metricsSetParams.RawReportSize * returnedMetricCount
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -1045,24 +1044,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenFirstSubDe
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenSecondSubDeviceHasNoReportsToCalculateThenZetMetricGroupCalculateMetricValuesExpReturnsPartialDataForFirstSubDeviceAndReturnsSuccess) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
     metricsSetParams.RawReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -1072,34 +1086,16 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenSecondSubD
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+    metricsSet.calculateMetricsOutReportCount = &returnedMetricCount;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(subDeviceCount - 1)
-        .WillRepeatedly(DoAll(::testing::SetArgPointee<4>(returnedMetricCount), Return(TCompletionCode::CC_OK)));
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -1110,11 +1106,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenSecondSubD
     // Raw results.
     constexpr size_t rawResultsSize = 512; // metricsSetParams.RawReportSize * returnedMetricCount
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -1144,24 +1140,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenSecondSubD
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDevicesHaveNoReportsToCalculateThenZetMetricGroupCalculateMetricValuesExpReturnsFail) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
     metricsSetParams.RawReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -1169,33 +1180,15 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(0);
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -1206,11 +1199,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
     // Raw results.
     constexpr size_t rawResultsSize = 512; // metricsSetParams.RawReportSize * returnedMetricCount
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -1233,24 +1226,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDevicesHaveNoReportsToCalculateAndPassInvalidArgumentsThatOneSubDeviceHasDataToCalculateToZetMetricGroupCalculateMetricValuesExpOnSecondCallReturnsFail) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
     metricsSetParams.RawReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -1258,34 +1266,15 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(0);
-
+    metric.GetParamsResult = &metricParams;
     // Metric group handles.
     uint32_t metricGroupCount = 1;
     EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &metricGroupCount, &metricGroupHandle), ZE_RESULT_SUCCESS);
@@ -1295,11 +1284,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
     // Raw results.
     constexpr size_t rawResultsSize = 512; // metricsSetParams.RawReportSize * returnedMetricCount
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -1332,24 +1321,39 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
 
 TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDevicesHasNoReportsToCalculateAndPassInvalidArgumentsThatTwoSubDevicesHaveDataToCalculateToZetMetricGroupCalculateMetricValuesExpOnSecondCallReturnsFail) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(devices[0]);
-    const uint32_t subDeviceCount = static_cast<uint32_t>(deviceImp.subDevices.size());
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    const uint32_t subDeviceCount = static_cast<uint32_t>(l0Device.subDevices.size());
 
     metricsDeviceParams.ConcurrentGroupsCount = 1;
 
-    Mock<IConcurrentGroup_1_5> metricsConcurrentGroup;
-    TConcurrentGroupParams_1_0 metricsConcurrentGroupParams = {};
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
     metricsConcurrentGroupParams.MetricSetsCount = 1;
     metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
 
-    Mock<IMetricSet_1_5> metricsSet;
-    MetricsDiscovery::TMetricSetParams_1_4 metricsSetParams = {};
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
     metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
     metricsSetParams.RawReportSize = 256;
     metricsSetParams.MetricsCount = 11;
 
-    Mock<IMetric_1_0> metric;
-    MetricsDiscovery::TMetricParams_1_0 metricParams = {};
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
 
     zet_metric_group_handle_t metricGroupHandle = {};
 
@@ -1357,33 +1361,15 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
 
     setupDefaultMocksForMetricDevice(metricsDevice);
 
-    EXPECT_CALL(metricsDevice, GetConcurrentGroup(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroup));
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
 
-    EXPECT_CALL(metricsConcurrentGroup, GetParams())
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsConcurrentGroupParams));
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
 
-    EXPECT_CALL(metricsConcurrentGroup, GetMetricSet(_))
-        .Times(subDeviceCount)
-        .WillRepeatedly(Return(&metricsSet));
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
 
-    EXPECT_CALL(metricsSet, GetParams())
-        .WillRepeatedly(Return(&metricsSetParams));
-
-    EXPECT_CALL(metricsSet, GetMetric(_))
-        .Times(metricsSetParams.MetricsCount * subDeviceCount)
-        .WillRepeatedly(Return(&metric));
-
-    EXPECT_CALL(metricsSet, SetApiFiltering(_))
-        .WillRepeatedly(Return(TCompletionCode::CC_OK));
-
-    EXPECT_CALL(metric, GetParams())
-        .WillRepeatedly(Return(&metricParams));
-
-    EXPECT_CALL(metricsSet, CalculateMetrics(_, _, _, _, _, _, _))
-        .Times(0);
+    metric.GetParamsResult = &metricParams;
 
     // Metric group handles.
     uint32_t metricGroupCount = 1;
@@ -1394,11 +1380,11 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
     // Raw results.
     constexpr size_t rawResultsSize = 512; // metricsSetParams.RawReportSize * returnedMetricCount
     uint8_t rawResults[rawResultsSize] = {};
-    MetricGroupCalculateHeader *pRawHeader = reinterpret_cast<MetricGroupCalculateHeader *>(rawResults);
+    OaMetricGroupCalculateHeader *pRawHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(rawResults);
 
-    pRawHeader->magic = MetricGroupCalculateHeader::magicValue;
+    pRawHeader->magic = OaMetricGroupCalculateHeader::magicValue;
     pRawHeader->dataCount = subDeviceCount;
-    pRawHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+    pRawHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
     pRawHeader->rawDataSizes = pRawHeader->rawDataOffsets + sizeof(uint32_t) * pRawHeader->dataCount;
     pRawHeader->rawDataOffset = pRawHeader->rawDataSizes + sizeof(uint32_t) * pRawHeader->dataCount;
 
@@ -1428,6 +1414,146 @@ TEST_F(MetricEnumerationMultiDeviceTest, givenCorrectRawDataHeaderWhenBothSubDev
     EXPECT_EQ(totalMetricCount, 0u);
     EXPECT_EQ(metricCounts[0], 0u);
     EXPECT_EQ(metricCounts[1], 0u);
+}
+
+TEST_F(MetricEnumerationMultiDeviceTest, givenOaMetricSourceWhenGetConcurrentMetricGroupsIsCalledThenCorrectConcurrentGroupsAreRetrieved) {
+    auto &metricSource = devices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
+
+    metricsDeviceParams.ConcurrentGroupsCount = 1;
+
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
+    metricsConcurrentGroupParams.MetricSetsCount = 1;
+    metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
+
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
+    metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
+    metricsSetParams.RawReportSize = 256;
+    metricsSetParams.MetricsCount = 11;
+
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
+
+    zet_metric_group_handle_t metricGroupHandle = {};
+
+    uint32_t returnedMetricCount = 2;
+
+    openMetricsAdapter();
+
+    setupDefaultMocksForMetricDevice(metricsDevice);
+
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
+
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+    metricsSet.calculateMetricsOutReportCount = &returnedMetricCount;
+
+    metric.GetParamsResult = &metricParams;
+
+    // Metric group handles.
+    uint32_t metricGroupCount = 1;
+    EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &metricGroupCount, &metricGroupHandle), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(metricGroupCount, 1u);
+    EXPECT_NE(metricGroupHandle, nullptr);
+
+    std::vector<zet_metric_group_handle_t> metricGroupList{};
+    metricGroupList.push_back(metricGroupHandle);
+
+    uint32_t concurrentGroupCount = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, metricSource.getConcurrentMetricGroups(metricGroupList, &concurrentGroupCount, nullptr));
+    EXPECT_EQ(concurrentGroupCount, 1u);
+
+    std::vector<uint32_t> countPerConcurrentGroup(concurrentGroupCount);
+    concurrentGroupCount += 1;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, metricSource.getConcurrentMetricGroups(metricGroupList, &concurrentGroupCount, countPerConcurrentGroup.data()));
+    EXPECT_EQ(concurrentGroupCount, 1u);
+}
+
+TEST_F(MetricEnumerationMultiDeviceTest, GivenOaMetricSourceWhenGetConcurrentMetricGroupsIsCalledWithSubDeviceMetricHandleAndRootDeviceMetricGroupsThenCorrectConcurrentGroupsThenCallFails) {
+    auto &l0Device = *static_cast<Device *>(devices[0]);
+    zet_device_handle_t metricSubDeviceDeviceHandle = l0Device.subDevices[0]->toHandle();
+
+    metricsDeviceParams.ConcurrentGroupsCount = 1;
+
+    Mock<IConcurrentGroup_1_13> metricsConcurrentGroup;
+    TConcurrentGroupParams_1_13 metricsConcurrentGroupParams = {};
+    metricsConcurrentGroupParams.MetricSetsCount = 1;
+    metricsConcurrentGroupParams.SymbolName = "OA";
+    metricsConcurrentGroupParams.IoMeasurementInformationCount = 1;
+
+    Mock<MetricsDiscovery::IEquation_1_0> ioReadEquation;
+    MetricsDiscovery::TEquationElement_1_0 ioEquationElement = {};
+    ioEquationElement.Type = MetricsDiscovery::EQUATION_ELEM_IMM_UINT64;
+    ioEquationElement.ImmediateUInt64 = 0;
+
+    ioReadEquation.getEquationElement.push_back(&ioEquationElement);
+
+    Mock<MetricsDiscovery::IInformation_1_0> ioMeasurement;
+    MetricsDiscovery::TInformationParams_1_0 oaInformation = {};
+    oaInformation.SymbolName = "BufferOverflow";
+    oaInformation.IoReadEquation = &ioReadEquation;
+
+    Mock<IMetricSet_1_13> metricsSet;
+    MetricsDiscovery::TMetricSetParams_1_11 metricsSetParams = {};
+    metricsSetParams.ApiMask = MetricsDiscovery::API_TYPE_IOSTREAM;
+    metricsSetParams.RawReportSize = 256;
+    metricsSetParams.MetricsCount = 11;
+
+    Mock<IMetric_1_13> metric;
+    MetricsDiscovery::TMetricParams_1_13 metricParams = {};
+
+    zet_metric_group_handle_t metricGroupHandle = {};
+
+    uint32_t returnedMetricCount = 2;
+
+    openMetricsAdapter();
+
+    setupDefaultMocksForMetricDevice(metricsDevice);
+
+    metricsDevice.getConcurrentGroupResults.push_back(&metricsConcurrentGroup);
+
+    metricsConcurrentGroup.GetParamsResult = &metricsConcurrentGroupParams;
+    metricsConcurrentGroup.getMetricSetResult = &metricsSet;
+    metricsConcurrentGroup.GetIoMeasurementInformationResult = &ioMeasurement;
+    ioMeasurement.GetParamsResult = &oaInformation;
+
+    metricsSet.GetParamsResult = &metricsSetParams;
+    metricsSet.GetMetricResult = &metric;
+    metricsSet.calculateMetricsOutReportCount = &returnedMetricCount;
+
+    metric.GetParamsResult = &metricParams;
+
+    // Metric group handles.
+    uint32_t metricGroupCount = 1;
+    EXPECT_EQ(zetMetricGroupGet(devices[0]->toHandle(), &metricGroupCount, &metricGroupHandle), ZE_RESULT_SUCCESS);
+    EXPECT_EQ(metricGroupCount, 1u);
+    EXPECT_NE(metricGroupHandle, nullptr);
+
+    std::vector<zet_metric_group_handle_t> metricGroupList{};
+    metricGroupList.push_back(metricGroupHandle);
+
+    uint32_t concurrentGroupCount = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, zetDeviceGetConcurrentMetricGroupsExp(metricSubDeviceDeviceHandle, 1, metricGroupList.data(), nullptr, &concurrentGroupCount));
+    EXPECT_EQ(concurrentGroupCount, 0u);
 }
 
 } // namespace ult

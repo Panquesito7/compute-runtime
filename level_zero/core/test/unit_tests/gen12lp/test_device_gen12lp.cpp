@@ -1,15 +1,21 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "level_zero/core/source/cmdlist/cmdlist.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_device.h"
+#include "level_zero/ze_intel_gpu.h"
 
 namespace L0 {
 namespace ult {
@@ -25,6 +31,23 @@ HWTEST2_F(DeviceFixtureGen12LP, GivenTargetGen12LPaWhenGettingMemoryPropertiesTh
     EXPECT_EQ(0u, memProperties.maxClockRate);
 }
 
+HWTEST2_F(DeviceFixtureGen12LP, GivenTargetGen12LPWhenGettingDpSupportThenReturnsTrue, IsXeLpg) {
+    ze_device_module_properties_t deviceModProps = {ZE_STRUCTURE_TYPE_DEVICE_MODULE_PROPERTIES};
+    ze_intel_device_module_dp_exp_properties_t moduleDpProps = {ZE_STRUCTURE_INTEL_DEVICE_MODULE_DP_EXP_PROPERTIES};
+    moduleDpProps.flags = 0u;
+    deviceModProps.pNext = &moduleDpProps;
+
+    ze_result_t res = device->getKernelProperties(&deviceModProps);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    auto expDpas = this->neoDevice->getHardwareInfo().caps.dotProductAccumulateSystolicSupported;
+
+    bool dp4a = moduleDpProps.flags & ZE_INTEL_DEVICE_MODULE_EXP_FLAG_DP4A;
+    bool dpas = moduleDpProps.flags & ZE_INTEL_DEVICE_MODULE_EXP_FLAG_DPAS;
+    EXPECT_TRUE(dp4a);
+    EXPECT_EQ(expDpas, dpas);
+}
+
 using CommandQueueGroupTest = Test<DeviceFixture>;
 
 HWTEST2_F(CommandQueueGroupTest,
@@ -36,10 +59,10 @@ HWTEST2_F(CommandQueueGroupTest,
     hwInfo.featureTable.ftrBcsInfo.set(0, false);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(count, 1u);
 }
@@ -53,10 +76,10 @@ HWTEST2_F(CommandQueueGroupTest,
     hwInfo.featureTable.ftrBcsInfo.set(0);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(count, 2u);
 }
@@ -64,7 +87,7 @@ HWTEST2_F(CommandQueueGroupTest,
 class DeviceCopyQueueGroupGen12LpFixture : public DeviceFixture {
   public:
     void setUp() {
-        DebugManager.flags.EnableBlitterOperationsSupport.set(0);
+        debugManager.flags.EnableBlitterOperationsSupport.set(0);
         DeviceFixture::setUp();
     }
 
@@ -81,22 +104,21 @@ HWTEST2_F(DeviceCopyQueueGroupGen12LpTest,
     const uint32_t rootDeviceIndex = 0u;
     NEO::HardwareInfo hwInfo = *NEO::defaultHwInfo.get();
     hwInfo.featureTable.flags.ftrCCSNode = false;
-    hwInfo.capabilityTable.blitterOperationsSupported = true;
     hwInfo.featureTable.ftrBcsInfo.set(0);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
     std::vector<ze_command_queue_group_properties_t> properties(count);
-    res = deviceImp.getCommandQueueGroupProperties(&count, properties.data());
+    res = mockDevice.getCommandQueueGroupProperties(&count, properties.data());
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
     for (auto &engineGroup : neoMockDevice->getRegularEngineGroups()) {
-        EXPECT_NE(NEO::EngineGroupType::Copy, engineGroup.engineGroupType);
+        EXPECT_NE(NEO::EngineGroupType::copy, engineGroup.engineGroupType);
     }
 }
 
@@ -110,33 +132,33 @@ HWTEST2_F(CommandQueueGroupTest,
     hwInfo.featureTable.ftrBcsInfo.set(0);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(count, 3u);
 
     std::vector<ze_command_queue_group_properties_t> properties(count);
-    res = deviceImp.getCommandQueueGroupProperties(&count, properties.data());
+    res = mockDevice.getCommandQueueGroupProperties(&count, properties.data());
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
     auto &engineGroups = neoMockDevice->getRegularEngineGroups();
     for (uint32_t i = 0; i < count; i++) {
-        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::RenderCompute) {
+        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::renderCompute) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_METRICS);
             EXPECT_EQ(properties[i].numQueues, 1u);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, std::numeric_limits<size_t>::max());
-        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::Compute) {
+        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::compute) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS);
             EXPECT_EQ(properties[i].numQueues, 1u);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, std::numeric_limits<size_t>::max());
-        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::Copy) {
+        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::copy) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_EQ(properties[i].numQueues, 1u);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, 4 * sizeof(uint32_t));
@@ -154,35 +176,35 @@ HWTEST2_F(CommandQueueGroupTest,
     hwInfo.featureTable.ftrBcsInfo.set(0);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(count, 3u);
 
     count = 2;
     std::vector<ze_command_queue_group_properties_t> properties(count);
-    res = deviceImp.getCommandQueueGroupProperties(&count, properties.data());
+    res = mockDevice.getCommandQueueGroupProperties(&count, properties.data());
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(2u, count);
 
     auto &engineGroups = neoMockDevice->getRegularEngineGroups();
     for (uint32_t i = 0; i < count; i++) {
-        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::RenderCompute) {
+        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::renderCompute) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_METRICS);
             EXPECT_EQ(properties[i].numQueues, 1u);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, std::numeric_limits<size_t>::max());
-        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::Compute) {
+        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::compute) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS);
             EXPECT_EQ(properties[i].numQueues, 1u);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, std::numeric_limits<size_t>::max());
-        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::Copy) {
+        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::copy) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_EQ(properties[i].numQueues, 1u);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, 4 * sizeof(uint32_t));
@@ -199,27 +221,27 @@ HWTEST2_F(CommandQueueGroupTest,
     hwInfo.featureTable.ftrBcsInfo.set(0);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(count, 2u);
 
     std::vector<ze_command_queue_group_properties_t> properties(count);
-    res = deviceImp.getCommandQueueGroupProperties(&count, properties.data());
+    res = mockDevice.getCommandQueueGroupProperties(&count, properties.data());
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
     auto &engineGroups = neoMockDevice->getRegularEngineGroups();
     for (uint32_t i = 0; i < count; i++) {
-        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::RenderCompute) {
+        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::renderCompute) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_METRICS);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, std::numeric_limits<size_t>::max());
             EXPECT_EQ(properties[i].numQueues, 1u);
-        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::Copy) {
+        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::copy) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, 4 * sizeof(uint32_t));
             EXPECT_EQ(properties[i].numQueues, 1u);
@@ -236,15 +258,15 @@ HWTEST2_F(CommandQueueGroupTest,
     hwInfo.featureTable.ftrBcsInfo.set(0);
     auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo,
                                                                                               rootDeviceIndex);
-    Mock<L0::DeviceImp> deviceImp(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp mockDevice(neoMockDevice);
 
     uint32_t count = 0;
-    ze_result_t res = deviceImp.getCommandQueueGroupProperties(&count, nullptr);
+    ze_result_t res = mockDevice.getCommandQueueGroupProperties(&count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(count, 2u);
 
     std::vector<ze_command_queue_group_properties_t> properties(count);
-    res = deviceImp.getCommandQueueGroupProperties(&count, properties.data());
+    res = mockDevice.getCommandQueueGroupProperties(&count, properties.data());
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
     ze_context_handle_t hContext;
@@ -255,14 +277,14 @@ HWTEST2_F(CommandQueueGroupTest,
 
     auto &engineGroups = neoMockDevice->getRegularEngineGroups();
     for (uint32_t i = 0; i < count; i++) {
-        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::RenderCompute) {
+        if (engineGroups[i].engineGroupType == NEO::EngineGroupType::renderCompute) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COOPERATIVE_KERNELS);
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_METRICS);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, std::numeric_limits<size_t>::max());
             EXPECT_EQ(properties[i].numQueues, 1u);
-        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::Copy) {
+        } else if (engineGroups[i].engineGroupType == NEO::EngineGroupType::copy) {
             EXPECT_TRUE(properties[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY);
             EXPECT_EQ(properties[i].maxMemoryFillPatternSize, 4 * sizeof(uint32_t));
             EXPECT_EQ(properties[i].numQueues, 1u);
@@ -272,7 +294,7 @@ HWTEST2_F(CommandQueueGroupTest,
         desc.commandQueueGroupOrdinal = i;
         ze_command_list_handle_t hCommandList = {};
 
-        res = context->createCommandList(&deviceImp, &desc, &hCommandList);
+        res = context->createCommandList(&mockDevice, &desc, &hCommandList);
         EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
         CommandList *commandList = CommandList::fromHandle(hCommandList);

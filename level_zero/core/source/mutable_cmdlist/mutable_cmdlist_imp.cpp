@@ -1,0 +1,802 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/core/source/mutable_cmdlist/mutable_cmdlist_imp.h"
+
+#include "shared/source/command_container/cmdcontainer.h"
+#include "shared/source/device/device.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/string.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/source/memory_manager/memory_manager.h"
+
+#include "level_zero/core/source/cmdlist/cmdlist.h"
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/event/event.h"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
+#include "level_zero/core/source/kernel/kernel_imp.h"
+#include "level_zero/core/source/mutable_cmdlist/helper.h"
+#include "level_zero/core/source/mutable_cmdlist/mcl_kernel_ext.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_kernel_dispatch.h"
+#include "level_zero/experimental/source/graph/graph.h"
+
+#include "implicit_args.h"
+
+#include <algorithm>
+#include <memory>
+
+namespace L0 {
+namespace MCL {
+
+void MutableResidencyAllocations::addAllocation(NEO::GraphicsAllocation *allocation) {
+    auto allocationElement = std::find_if(addedAllocations.begin(),
+                                          addedAllocations.end(),
+                                          [allocation](const auto &argument) { return argument.allocation == allocation; });
+    if (allocationElement == addedAllocations.end()) {
+        addedAllocations.emplace_back(allocation, 1);
+    } else {
+        allocationElement->refCount++;
+    }
+}
+
+void MutableResidencyAllocations::removeAllocation(NEO::GraphicsAllocation *allocation) {
+    auto allocationElement = std::find_if(addedAllocations.begin(),
+                                          addedAllocations.end(),
+                                          [allocation](const auto &argument) { return argument.allocation == allocation; });
+    if (allocationElement != addedAllocations.end()) {
+        allocationElement->refCount--;
+        if (allocationElement->refCount == 0) {
+            // if not last element, swap with the last
+            if (allocationElement + 1 != addedAllocations.end()) {
+                auto lastElemIterator = addedAllocations.end() - 1;
+                std::swap(*allocationElement, *lastElemIterator);
+            }
+            // remove last element
+            addedAllocations.pop_back();
+        }
+    }
+}
+
+void MutableResidencyAllocations::populateInputResidencyContainer(NEO::ResidencyContainer &cmdListResidency, bool baseCmdListClosed) {
+    if (!baseCmdListClosed) {
+        immutableResidencySize = cmdListResidency.size();
+    } else {
+        cmdListResidency.resize(immutableResidencySize);
+    }
+    for (auto &allocationElement : addedAllocations) {
+        auto lastImmutableIterator = cmdListResidency.begin() + immutableResidencySize;
+        auto allocationInImmutable = std::lower_bound(cmdListResidency.begin(), lastImmutableIterator, allocationElement.allocation);
+        if ((allocationInImmutable == lastImmutableIterator) || (*allocationInImmutable != allocationElement.allocation)) {
+            cmdListResidency.emplace_back(allocationElement.allocation);
+        }
+    }
+}
+
+void MutableResidencyAllocations::cleanResidencyContainer() {
+    addedAllocations.clear();
+    immutableResidencySize = 0;
+}
+
+MutableCommandListAllocFn mutableCommandListFactory[NEO::maxCoreEnumValue] = {};
+
+MutableCommandList *MutableCommandList::fromHandle(ze_command_list_handle_t handle) {
+    return static_cast<MutableCommandList *>(L0::CommandList::fromHandle(handle)->asMutable());
+}
+
+CommandList *MutableCommandList::create(Device *device, NEO::EngineGroupType engineGroupType,
+                                        ze_command_list_flags_t flags, ze_result_t &resultValue, bool useInternalEngineType, uint32_t estimatedNumberOfCommands) {
+    MutableCommandListAllocFn allocator = nullptr;
+    auto gfxCoreFamily = device->getNEODevice()->getRenderCoreFamily();
+    if (gfxCoreFamily < NEO::maxCoreEnumValue) {
+        allocator = mutableCommandListFactory[gfxCoreFamily];
+    }
+    if (allocator == nullptr) {
+        resultValue = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+        return nullptr;
+    }
+
+    MutableCommandListImp *commandList = nullptr;
+    resultValue = ZE_RESULT_ERROR_UNINITIALIZED;
+
+    commandList = reinterpret_cast<MutableCommandListImp *>((*allocator)(CommandList::defaultNumIddsPerBlock));
+    commandList->getBase()->setEstimatedNumberOfCommands(estimatedNumberOfCommands);
+    resultValue = commandList->initialize(device, engineGroupType, flags);
+    if (resultValue != ZE_RESULT_SUCCESS) {
+        commandList->getBase()->destroy();
+        return nullptr;
+    }
+
+    return static_cast<CommandList *>(commandList->toHandle());
+}
+
+MutableCommandList::~MutableCommandList() {
+}
+
+MutableCommandListImp::~MutableCommandListImp() {
+    auto memoryManager = base->getDevice()->getNEODevice()->getMemoryManager();
+    auto freeGraphicsAllocation = [memoryManager](auto allocation) {
+        if (allocation) {
+            memoryManager->freeGraphicsMemory(allocation.release());
+        }
+    };
+    freeGraphicsAllocation(std::move(allocs.ihAlloc));
+    freeGraphicsAllocation(std::move(allocs.sshAlloc));
+    freeGraphicsAllocation(std::move(allocs.constsAlloc));
+    freeGraphicsAllocation(std::move(allocs.varsAlloc));
+}
+
+ze_command_list_handle_t MutableCommandListImp::toHandle() {
+    return base->toHandle();
+}
+
+CommandList *MutableCommandListImp::getBase() {
+    return base;
+}
+
+void MutableCommandListImp::processResidencyContainer(bool baseCmdListClosed) {
+    if (this->finalizeCommandListResidency) {
+        auto &cmdListResidency = this->base->getCmdContainer().getResidencyContainer();
+        mutableAllocations.populateInputResidencyContainer(cmdListResidency, baseCmdListClosed);
+
+        this->finalizeCommandListResidency = false;
+    }
+}
+
+ze_result_t MutableCommandListImp::addVariableDispatch(const NEO::KernelDescriptor &kernelDescriptor, KernelDispatch &kernelDispatch, Variable *groupSize, Variable *groupCount, Variable *globalOffset,
+                                                       Variable *lastSlmArgumentVariable, const std::vector<Variable *> *buffersVariables, MutableComputeWalker *mutableComputeWalker, const MutableKernelDispatchParameters &dispatchParams) {
+    if (groupSize != nullptr && (false == groupSize->isType(VariableType::groupSize))) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (groupCount != nullptr && (false == groupCount->isType(VariableType::groupCount))) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (globalOffset != nullptr && (false == globalOffset->isType(VariableType::globalOffset))) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL kernel dispatch parameters variables: group count %p, group size %p, global offset %p\n", groupCount, groupSize, globalOffset);
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL initial group count %u %u %u\n", dispatchParams.groupCount[0], dispatchParams.groupCount[1], dispatchParams.groupCount[2]);
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL initial group size %u %u %u\n", dispatchParams.groupSize[0], dispatchParams.groupSize[1], dispatchParams.groupSize[2]);
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL initial global offset %u %u %u\n", dispatchParams.globalOffset[0], dispatchParams.globalOffset[1], dispatchParams.globalOffset[2]);
+
+    const auto iohCpuBase = reinterpret_cast<CpuAddress>(base->getCmdContainer().getIndirectHeap(NEO::HeapType::indirectObject)->getCpuBase());
+
+    auto offsets = MutableIndirectData::createOffsets(kernelDescriptor);
+
+    ArrayRef<uint8_t> inlineData;
+
+    size_t crossThreadDataSize = kernelDescriptor.kernelAttributes.crossThreadDataSize;
+    if (kernelDescriptor.kernelAttributes.flags.passInlineData) {
+        crossThreadDataSize -= std::min(crossThreadDataSize, static_cast<size_t>(mutableComputeWalker->getInlineDataSize()));
+        inlineData = {reinterpret_cast<uint8_t *>(mutableComputeWalker->getInlineDataPointer()), mutableComputeWalker->getInlineDataSize()};
+    }
+    ArrayRef<uint8_t> crossThreadData = {reinterpret_cast<uint8_t *>(ptrOffset(iohCpuBase, kernelDispatch.offsets.crossThreadOffset)), crossThreadDataSize};
+
+    ArrayRef<uint8_t> perThreadData;
+    if (kernelDispatch.offsets.perThreadOffset != undefined<IndirectObjectHeapOffset>) {
+        const size_t perThreadDataSize = kernelDispatch.indirectObjectHeap.size() - crossThreadDataSize;
+        perThreadData = {reinterpret_cast<uint8_t *>(ptrOffset(iohCpuBase, kernelDispatch.offsets.perThreadOffset)), perThreadDataSize};
+    }
+
+    auto mutableIndirectData = std::make_unique<MutableIndirectData>(std::move(offsets), crossThreadData, perThreadData, inlineData);
+    kernelDispatch.varDispatch = std::make_unique<VariableDispatch>(&kernelDispatch, std::move(mutableIndirectData), mutableComputeWalker,
+                                                                    groupSize, groupCount, globalOffset, lastSlmArgumentVariable, buffersVariables,
+                                                                    base->getDevice()->getHwInfo().capabilityTable.grfSize,
+                                                                    dispatchParams, base->getPartitionCount(), base->getEngineGroupType());
+
+    return ZE_RESULT_SUCCESS;
+}
+
+KernelData *MutableCommandListImp::getKernelData(L0::Kernel *kernel) {
+    KernelData *kernelDataEntry = nullptr;
+
+    auto &kernelDescriptor = kernel->getKernelDescriptor();
+
+    const auto &kernelName = kernelDescriptor.kernelMetadata.kernelName;
+    const L0::Module *module = &(static_cast<L0::KernelImp *>(kernel)->getParentModule());
+    std::pair<const L0::Module *, std::string> pairFind(module, kernelName);
+
+    auto kernelDataIt = std::find_if(kernelData.begin(), kernelData.end(), [&pairFind](auto &kd) {
+        return (kd.get()->module == pairFind.first) && (kd.get()->kernelName == pairFind.second);
+    });
+    if (kernelDataIt != kernelData.end()) {
+        kernelDataEntry = (*kernelDataIt).get();
+    } else {
+        auto kernelImmutableData = kernel->getImmutableData();
+
+        auto isa = kernelImmutableData->getIsaGraphicsAllocation();
+        auto isaSize = kernelImmutableData->getIsaSize();
+        auto isaOffsetWithinAllocation = kernelImmutableData->getIsaOffsetInParentAllocation();
+
+        kernelData.emplace_back(std::make_unique<KernelData>());
+        kernelDataEntry = (*kernelData.rbegin()).get();
+
+        kernelDataEntry->kernelIsa = ArrayRef<const uint8_t>{reinterpret_cast<const uint8_t *>(isa->getUnderlyingBuffer()) + isaOffsetWithinAllocation, isaSize};
+        kernelDataEntry->kernelName = kernelName;
+        kernelDataEntry->module = module;
+        kernelDataEntry->simdSize = kernelDescriptor.kernelAttributes.simdSize;
+        kernelDataEntry->requiredThreadGroupDispatchSize = kernelDescriptor.kernelMetadata.requiredThreadGroupDispatchSize;
+        kernelDataEntry->grfCount = kernelDescriptor.kernelAttributes.numGrfRequired;
+        kernelDataEntry->barrierCount = kernelDescriptor.kernelAttributes.barrierCount;
+        kernelDataEntry->singleWorkGroupPerDss = this->base->getDevice()->getGfxCoreHelper().isSingleWorkGroupPerDssRequired(kernelDescriptor);
+        kernelDataEntry->slmAllocationMode = kernelDescriptor.kernelAttributes.slmAllocationMode;
+        kernelDataEntry->kernelStartOffset = isa->getAllocationOffset() + isaOffsetWithinAllocation;
+        if (this->base->isHeaplessModeEnabled()) {
+            kernelDataEntry->kernelStartAddress = isa->getGpuAddress() + isaOffsetWithinAllocation;
+        } else {
+            kernelDataEntry->kernelStartAddress = isa->getGpuAddressToPatch() + isaOffsetWithinAllocation;
+        }
+        kernelDataEntry->skipPerThreadDataLoad = kernelDescriptor.entryPoints.skipPerThreadDataLoad;
+        kernelDataEntry->passInlineData = kernelDescriptor.kernelAttributes.flags.passInlineData;
+        kernelDataEntry->indirectOffset = kernelDescriptor.payloadMappings.implicitArgs.indirectDataPointerAddress.offset;
+        kernelDataEntry->requiresWorkgroupWalkOrder = kernelDescriptor.kernelAttributes.flags.requiresWorkgroupWalkOrder;
+        kernelDataEntry->workgroupWalkOrder[0] = kernelDescriptor.kernelAttributes.workgroupWalkOrder[0];
+        kernelDataEntry->workgroupWalkOrder[1] = kernelDescriptor.kernelAttributes.workgroupWalkOrder[1];
+        kernelDataEntry->workgroupWalkOrder[2] = kernelDescriptor.kernelAttributes.workgroupWalkOrder[2];
+        kernelDataEntry->isaOffsetWithinAllocation = isaOffsetWithinAllocation;
+        if (kernel->usesSyncBuffer()) {
+            kernelDataEntry->usesSyncBuffer = true;
+            kernelDataEntry->syncBufferAddressOffset = kernelDescriptor.payloadMappings.implicitArgs.syncBufferAddress.stateless;
+            kernelDataEntry->syncBufferPointerSize = kernelDescriptor.payloadMappings.implicitArgs.syncBufferAddress.pointerSize;
+        }
+        kernelDataEntry->numLocalIdChannels = kernelDescriptor.kernelAttributes.numLocalIdChannels;
+    }
+
+    return kernelDataEntry;
+}
+
+ze_result_t MutableCommandListImp::parseDispatchedKernel(L0::Kernel *kernel, MutableComputeWalker *mutableComputeWalker,
+                                                         size_t extraHeapSize, NEO::GraphicsAllocation *syncBuffer,
+                                                         Variable *firstSlmArgumentVariable, bool resetSlmArgumentValues) {
+    auto kernelData = getKernelData(kernel);
+    auto &kernelDescriptor = kernel->getKernelDescriptor();
+
+    if (firstSlmArgumentVariable != nullptr) {
+        const auto slmBaseOffset = kernelData->slmAllocationMode == NEO::KernelDescriptor::SlmAllocationMode::runtimeAdjusted
+                                       ? kernelDescriptor.kernelAttributes.slmInlineSize
+                                       : 0u;
+        firstSlmArgumentVariable->setSlmBaseOffset(slmBaseOffset);
+    }
+
+    auto ioh = base->getCmdContainer().getIndirectHeap(NEO::HeapType::indirectObject);
+    size_t reservedPerThreadDataSize = 0;
+    const size_t consumedPerThreadDataSize = kernel->getPerThreadDataSizeForWholeThreadGroup();
+    if (this->enableReservePerThreadForLocalId) {
+        reservedPerThreadDataSize = this->maxPerThreadDataSize;
+    }
+    const size_t totalPerThreadDataSize = reservedPerThreadDataSize + consumedPerThreadDataSize;
+
+    IndirectObjectHeapOffset inlineDataSize = 0;
+    if (kernelData->passInlineData) {
+        inlineDataSize = mutableComputeWalker->getInlineDataSize();
+    }
+    const size_t currentCrossThreadDataSize = kernel->getCrossThreadDataSize() - std::min(kernel->getCrossThreadDataSize(), static_cast<uint32_t>(inlineDataSize));
+    const size_t consumedHeapSize = currentCrossThreadDataSize + totalPerThreadDataSize + extraHeapSize;
+    const size_t kernelIohSize = alignUp(consumedHeapSize, this->iohAlignment);
+    const auto kernelIohStartOffset = ioh->getUsed() - kernelIohSize;
+    const auto kernelFullOffset = reinterpret_cast<IndirectObjectHeapOffset>(ptrOffset(ioh->getCpuBase(), kernelIohStartOffset));
+
+    auto kernelSshOffset = undefined<SurfaceStateHeapOffset>;
+    size_t kernelSshSize = 0;
+
+    auto ssh = base->getCmdContainer().getIndirectHeap(NEO::HeapType::surfaceState);
+    if (ssh != nullptr) {
+        kernelSshSize = kernel->getSurfaceStateHeapDataSize();
+        if (kernelSshSize > 0) {
+            kernelSshOffset = ssh->getUsed() - kernelSshSize;
+        }
+    }
+
+    auto walkerCmd = mutableComputeWalker->getWalkerCmdPointer();
+    auto walkerCmdOffset = ptrDiff(walkerCmd, base->getCmdContainer().findCpuBaseForCmdBufferAddress(walkerCmd));
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL append kernel name %s from module: %p inline data %d\n", kernelData->kernelName.c_str(), kernelData->module, kernelData->passInlineData);
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL append kernel IOH cpu base %p full offset %zx and gpuva %" PRIx64 "\n", ioh->getCpuBase(), kernelFullOffset, ioh->getGraphicsAllocation()->getGpuAddress());
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL append kernel ioh total %zu cross-thread total %zu per-thread total %zu\n", kernelIohSize, currentCrossThreadDataSize, totalPerThreadDataSize);
+
+    auto kdPtr = std::make_unique<KernelDispatch>();
+    dispatches.emplace_back(std::move(kdPtr));
+    auto &dispatch = *(*dispatches.rbegin()).get();
+    dispatch.indirectObjectHeap = {reinterpret_cast<uint8_t *>(ptrOffset(ioh->getCpuBase(), kernelIohStartOffset)), kernelIohSize};
+    dispatch.surfaceStateHeapSize = {kernelSshSize};
+    dispatch.offsets.crossThreadOffset = kernelIohStartOffset;
+    if (totalPerThreadDataSize == 0) {
+        dispatch.offsets.perThreadOffset = undefined<IndirectObjectHeapOffset>;
+    } else {
+        dispatch.offsets.perThreadOffset = kernelIohStartOffset + currentCrossThreadDataSize;
+    }
+    dispatch.offsets.sshOffset = kernelSshOffset;
+    dispatch.offsets.btOffset = kernelDescriptor.payloadMappings.bindingTable.tableOffset;
+    dispatch.offsets.kernelStartOffset = kernel->getImmutableData()->getIsaGraphicsAllocation()->getAllocationOffset() + kernelData->isaOffsetWithinAllocation;
+    dispatch.offsets.walkerCmdOffset = walkerCmdOffset;
+    dispatch.kernelData = kernelData;
+    dispatch.walkerCmd = walkerCmd;
+    dispatch.slmTotalSizePerThreadGroup = kernel->getSlmTotalSizePerThreadGroup();
+    dispatch.slmInlineSize = kernelDescriptor.kernelAttributes.slmInlineSize;
+    dispatch.slmPolicy = static_cast<uint32_t>(kernel->getSlmPolicy());
+    if (dispatch.kernelData->usesSyncBuffer) {
+        dispatch.syncBuffer = syncBuffer;
+    }
+
+    const auto &args = kernelDescriptor.payloadMappings.explicitArgs;
+    auto &kernelExt = MclKernelExt::get(kernel);
+    auto &vars = kernelExt.getVariables();
+    DEBUG_BREAK_IF(args.size() != vars.size());
+    auto &slmArgOffsetValues = static_cast<L0::KernelImp *>(kernel)->getSlmArgOffsetValues();
+    auto &slmArgSizes = static_cast<L0::KernelImp *>(kernel)->getSlmArgSizes();
+    auto currentSlmArgSize = undefined<SlmOffset>;
+    auto currentSlmArgOffset = undefined<SlmOffset>;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (vars[i] == nullptr) {
+            continue;
+        }
+        if (resetSlmArgumentValues == false) {
+            currentSlmArgSize = slmArgSizes[i];
+            currentSlmArgOffset = slmArgOffsetValues[i];
+        }
+        auto variable = Variable::fromHandle(vars[i]);
+        auto retVal = variable->addKernelArgUsage(args[i], kernelIohStartOffset, kernelFullOffset, kernelSshOffset,
+                                                  currentSlmArgSize, currentSlmArgOffset,
+                                                  walkerCmdOffset, mutableComputeWalker,
+                                                  kernelData->passInlineData);
+        if (retVal != ZE_RESULT_SUCCESS) {
+            DEBUG_BREAK_IF(true);
+            return retVal;
+        }
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t MutableCommandListImp::getNextCommandId(const ze_mutable_command_id_ext_desc_t *desc, uint32_t numKernels, ze_kernel_handle_t *phKernels, uint64_t *pCommandId) {
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_KERNEL_ARGUMENTS == MutableFlag::kernelArgument, "ZE_MUTABLE_COMMAND_EXT_FLAG_KERNEL_ARGUMENTS and MutableFlag::kernelArgument must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_GROUP_SIZE == MutableFlag::groupSize, "ZE_MUTABLE_COMMAND_EXT_FLAG_GROUP_SIZE and MutableFlag::groupSize must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_GROUP_COUNT == MutableFlag::groupCount, "ZE_MUTABLE_COMMAND_EXT_FLAG_GROUP_COUNT and MutableFlag::groupCount must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_GLOBAL_OFFSET == MutableFlag::globalOffset, "ZE_MUTABLE_COMMAND_EXT_FLAG_GLOBAL_OFFSET and MutableFlag::globalOffset must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_SIGNAL_EVENT == MutableFlag::signalEvent, "ZE_MUTABLE_COMMAND_EXT_FLAG_SIGNAL_EVENT and MutableFlag::signalEvent must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_WAIT_EVENTS == MutableFlag::waitEvents, "ZE_MUTABLE_COMMAND_EXT_FLAG_WAIT_EVENTS and MutableFlag::waitEvents must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXT_FLAG_KERNEL_INSTRUCTION == MutableFlag::kernelInstruction, "ZE_MUTABLE_COMMAND_EXT_FLAG_KERNEL_INSTRUCTION and MutableFlag::kernelInstruction must be the same value");
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL getNextCommandId cmdlist: %p, flags: %u, numKernels: %u\n", this, desc->flags, numKernels);
+
+    MutableCommandIdDescriptor commandIdDesc;
+    commandIdDesc.flags = static_cast<MutableFlags>(desc->flags);
+    return getNextCommandIdImpl(commandIdDesc, numKernels, phKernels, pCommandId);
+}
+
+ze_result_t MutableCommandListImp::getNextCommandId(const ze_mutable_command_id_exp_desc_t *desc, uint32_t numKernels, ze_kernel_handle_t *phKernels, uint64_t *pCommandId) {
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_KERNEL_ARGUMENTS == MutableFlag::kernelArgument, "ZE_MUTABLE_COMMAND_EXP_FLAG_KERNEL_ARGUMENTS and MutableFlag::kernelArgument must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_GROUP_SIZE == MutableFlag::groupSize, "ZE_MUTABLE_COMMAND_EXP_FLAG_GROUP_SIZE and MutableFlag::groupSize must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_GROUP_COUNT == MutableFlag::groupCount, "ZE_MUTABLE_COMMAND_EXP_FLAG_GROUP_COUNT and MutableFlag::groupCount must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_GLOBAL_OFFSET == MutableFlag::globalOffset, "ZE_MUTABLE_COMMAND_EXP_FLAG_GLOBAL_OFFSET and MutableFlag::globalOffset must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_SIGNAL_EVENT == MutableFlag::signalEvent, "ZE_MUTABLE_COMMAND_EXP_FLAG_SIGNAL_EVENT and MutableFlag::signalEvent must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_WAIT_EVENTS == MutableFlag::waitEvents, "ZE_MUTABLE_COMMAND_EXP_FLAG_WAIT_EVENTS and MutableFlag::waitEvents must be the same value");
+    static_assert(ZE_MUTABLE_COMMAND_EXP_FLAG_KERNEL_INSTRUCTION == MutableFlag::kernelInstruction, "ZE_MUTABLE_COMMAND_EXP_FLAG_KERNEL_INSTRUCTION and MutableFlag::kernelInstruction must be the same value");
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL getNextCommandId cmdlist: %p, flags: %u, numKernels: %u\n", this, desc->flags, numKernels);
+
+    MutableCommandIdDescriptor commandIdDesc;
+    commandIdDesc.flags = static_cast<MutableFlags>(desc->flags);
+    return getNextCommandIdImpl(commandIdDesc, numKernels, phKernels, pCommandId);
+}
+
+auto MutableCommandListImp::getNextCommandIdImpl(const MutableCommandIdDescriptor &commandIdDesc, uint32_t numKernels, ze_kernel_handle_t *phKernels, uint64_t *pCommandId) -> ze_result_t {
+    AppendKernelMutation nextAppendKernel;
+    AppendEventMutation nextAppendEvents;
+    if (commandIdDesc.flags == 0) {
+        this->nextMutationFlags = MutableFlag::all & (~MutableFlag::kernelInstruction);
+    } else {
+        this->nextMutationFlags = commandIdDesc.flags;
+    }
+    if (kernelInstructionMutationEnabled(this->nextMutationFlags)) {
+        if (numKernels == 0) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        auto mutableKernelGroup = std::make_unique<MutableKernelGroup>(numKernels, phKernels, this->inlineDataSize, this->maxPerThreadDataSize);
+        this->mutableKernelGroups.emplace_back(std::move(mutableKernelGroup));
+        nextAppendKernel.kernelGroup = (*this->mutableKernelGroups.rbegin()).get();
+
+        // prepare kernel data for the whole kernel group - next append call will have them all ready
+        bool allocateSyncBufferHandler = false;
+        auto &mutableKernels = nextAppendKernel.kernelGroup->getKernelsInGroup();
+        for (uint32_t i = 0; i < numKernels; i++) {
+            auto kernelData = getKernelData(Kernel::fromHandle(phKernels[i]));
+            allocateSyncBufferHandler |= kernelData->usesSyncBuffer;
+            if (!mutableKernels[i]->checkKernelCompatible()) {
+                return ZE_RESULT_ERROR_INVALID_KERNEL_ATTRIBUTE_VALUE;
+            }
+        }
+
+        if (allocateSyncBufferHandler) {
+            getBase()->getDevice()->getNEODevice()->allocateSyncBufferHandler();
+        }
+    }
+
+    kernelMutations.push_back(std::move(nextAppendKernel));
+    eventMutations.push_back(std::move(nextAppendEvents));
+
+    *pCommandId = ++nextCommandId;
+    nextAppendKernelMutable = true;
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL getNextCommandId cmdlist: %p, command id: %" PRIu64 "\n", this, *pCommandId);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t MutableCommandListImp::updateMutableCommands(const ze_mutable_commands_ext_desc_t *desc) {
+    const void *next = desc->pNext;
+    this->mutationDescriptors.clear();
+    while (next != nullptr) {
+        const ze_base_desc_t *extendedDesc = reinterpret_cast<const ze_base_desc_t *>(next);
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_KERNEL_ARGUMENT_EXT_DESC) {
+            const ze_mutable_kernel_argument_ext_desc_t *apiKernelArgumentDesc = reinterpret_cast<const ze_mutable_kernel_argument_ext_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(KernelArgumentMutationDescriptor{
+                .commandId = apiKernelArgumentDesc->commandId,
+                .argIndex = apiKernelArgumentDesc->argIndex,
+                .argSize = apiKernelArgumentDesc->argSize,
+                .argValue = apiKernelArgumentDesc->pArgValue,
+            });
+        }
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_GROUP_COUNT_EXT_DESC) {
+            const ze_mutable_group_count_ext_desc_t *groupCountDesc = reinterpret_cast<const ze_mutable_group_count_ext_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(GroupCountMutationDescriptor{
+                .commandId = groupCountDesc->commandId,
+                .groupCount = *groupCountDesc->pGroupCount,
+            });
+        }
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_GROUP_SIZE_EXT_DESC) {
+            const ze_mutable_group_size_ext_desc_t *groupSizeDesc = reinterpret_cast<const ze_mutable_group_size_ext_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(GroupSizeMutationDescriptor{
+                .commandId = groupSizeDesc->commandId,
+                .groupSize = {groupSizeDesc->groupSizeX, groupSizeDesc->groupSizeY, groupSizeDesc->groupSizeZ},
+            });
+        }
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_GLOBAL_OFFSET_EXT_DESC) {
+            const ze_mutable_global_offset_ext_desc_t *globalOffsetDesc = reinterpret_cast<const ze_mutable_global_offset_ext_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(GlobalOffsetMutationDescriptor{
+                .commandId = globalOffsetDesc->commandId,
+                .globalOffset = {globalOffsetDesc->offsetX, globalOffsetDesc->offsetY, globalOffsetDesc->offsetZ},
+            });
+        }
+        next = extendedDesc->pNext;
+    }
+
+    return updateMutableCommandsImpl();
+}
+
+ze_result_t MutableCommandListImp::updateMutableCommands(const ze_mutable_commands_exp_desc_t *desc) {
+    const void *next = desc->pNext;
+    this->mutationDescriptors.clear();
+    while (next != nullptr) {
+        const ze_base_desc_t *extendedDesc = reinterpret_cast<const ze_base_desc_t *>(next);
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_KERNEL_ARGUMENT_EXP_DESC) {
+            const ze_mutable_kernel_argument_exp_desc_t *apiKernelArgumentDesc = reinterpret_cast<const ze_mutable_kernel_argument_exp_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(KernelArgumentMutationDescriptor{
+                .commandId = apiKernelArgumentDesc->commandId,
+                .argIndex = apiKernelArgumentDesc->argIndex,
+                .argSize = apiKernelArgumentDesc->argSize,
+                .argValue = apiKernelArgumentDesc->pArgValue,
+            });
+        }
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_GROUP_COUNT_EXP_DESC) {
+            const ze_mutable_group_count_exp_desc_t *groupCountDesc = reinterpret_cast<const ze_mutable_group_count_exp_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(GroupCountMutationDescriptor{
+                .commandId = groupCountDesc->commandId,
+                .groupCount = *groupCountDesc->pGroupCount,
+            });
+        }
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_GROUP_SIZE_EXP_DESC) {
+            const ze_mutable_group_size_exp_desc_t *groupSizeDesc = reinterpret_cast<const ze_mutable_group_size_exp_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(GroupSizeMutationDescriptor{
+                .commandId = groupSizeDesc->commandId,
+                .groupSize = {groupSizeDesc->groupSizeX, groupSizeDesc->groupSizeY, groupSizeDesc->groupSizeZ},
+            });
+        }
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_MUTABLE_GLOBAL_OFFSET_EXP_DESC) {
+            const ze_mutable_global_offset_exp_desc_t *globalOffsetDesc = reinterpret_cast<const ze_mutable_global_offset_exp_desc_t *>(next);
+            this->mutationDescriptors.emplace_back(GlobalOffsetMutationDescriptor{
+                .commandId = globalOffsetDesc->commandId,
+                .globalOffset = {globalOffsetDesc->offsetX, globalOffsetDesc->offsetY, globalOffsetDesc->offsetZ},
+            });
+        }
+        next = extendedDesc->pNext;
+    }
+
+    return updateMutableCommandsImpl();
+}
+
+auto MutableCommandListImp::applyMutation(const KernelArgumentMutationDescriptor &mutation) -> ze_result_t {
+    AppendKernelMutation &selectedAppend = this->kernelMutations[(mutation.commandId - 1)];
+    auto currentVariables = getVariableDescriptorContainer(selectedAppend);
+    if (mutation.argIndex + 1 > currentVariables->kernelArguments.size()) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    KernelArgumentVariableDescriptor &kernelArgDesc = currentVariables->kernelArguments[mutation.argIndex];
+    UNRECOVERABLE_IF(kernelArgDesc.argIndex != mutation.argIndex);
+    if (kernelArgDesc.kernelArgumentVariable == nullptr) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    auto result = kernelArgDesc.kernelArgumentVariable->setValue(mutation.argSize, 0, mutation.argValue);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+    this->updatedCommandList = true;
+    if (kernelArgDesc.kernelArgumentVariable->getType() == VariableType::slmBuffer && kernelArgDesc.kernelArgumentVariable->isCooperativeVariable()) {
+        this->cooperativeKernelVariableDispatches.insert(kernelArgDesc.kernelArgumentVariable->getInitialVariableDispatch());
+    }
+    if (base->getFlatCapture()) {
+        base->getFlatCapture()->updateKernelArgument(mutation.commandId, mutation.argIndex, mutation.argSize, mutation.argValue);
+    }
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL update kernel arg commandId: %" PRIu64 " argument idx: %u, size: %zu, val: %p\n",
+                 mutation.commandId, mutation.argIndex, mutation.argSize, kernelArgDesc.kernelArgumentVariable->getDesc().argValue);
+    return ZE_RESULT_SUCCESS;
+}
+
+auto MutableCommandListImp::applyMutation(const GroupCountMutationDescriptor &mutation) -> ze_result_t {
+    AppendKernelMutation &selectedAppend = this->kernelMutations[(mutation.commandId - 1)];
+    auto currentVariables = getVariableDescriptorContainer(selectedAppend);
+    if (currentVariables->groupCount == nullptr) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    auto result = currentVariables->groupCount->setValue(sizeof(ze_group_count_t), 0, &mutation.groupCount);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+    this->updatedCommandList = true;
+    if (currentVariables->groupCount->isCooperativeVariable()) {
+        this->cooperativeKernelVariableDispatches.insert(currentVariables->groupCount->getInitialVariableDispatch());
+    }
+    if (base->getFlatCapture()) {
+        base->getFlatCapture()->updateKernelGroupCount(mutation.commandId, &mutation.groupCount);
+    }
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL update group count commandId: %" PRIu64 " x: %u y: %u z: %u\n",
+                 mutation.commandId, mutation.groupCount.groupCountX, mutation.groupCount.groupCountY, mutation.groupCount.groupCountZ);
+    return ZE_RESULT_SUCCESS;
+}
+
+auto MutableCommandListImp::applyMutation(const GroupSizeMutationDescriptor &mutation) -> ze_result_t {
+    AppendKernelMutation &selectedAppend = this->kernelMutations[(mutation.commandId - 1)];
+    auto currentVariables = getVariableDescriptorContainer(selectedAppend);
+    if (currentVariables->groupSize == nullptr) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    auto result = currentVariables->groupSize->setValue(sizeof(mutation.groupSize), 0, mutation.groupSize);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+    this->updatedCommandList = true;
+    if (currentVariables->groupSize->isCooperativeVariable()) {
+        this->cooperativeKernelVariableDispatches.insert(currentVariables->groupSize->getInitialVariableDispatch());
+    }
+    if (base->getFlatCapture()) {
+        base->getFlatCapture()->updateKernelGroupSize(mutation.commandId, mutation.groupSize);
+    }
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL update group size commandId: %" PRIu64 " x: %u y: %u z: %u\n",
+                 mutation.commandId, mutation.groupSize[0], mutation.groupSize[1], mutation.groupSize[2]);
+    return ZE_RESULT_SUCCESS;
+}
+
+auto MutableCommandListImp::applyMutation(const GlobalOffsetMutationDescriptor &mutation) -> ze_result_t {
+    AppendKernelMutation &selectedAppend = this->kernelMutations[(mutation.commandId - 1)];
+    auto currentVariables = getVariableDescriptorContainer(selectedAppend);
+    if (currentVariables->globalOffset == nullptr) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    auto result = currentVariables->globalOffset->setValue(sizeof(mutation.globalOffset), 0, mutation.globalOffset);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+    this->updatedCommandList = true;
+    if (base->getFlatCapture()) {
+        base->getFlatCapture()->updateKernelGlobalOffset(mutation.commandId, mutation.globalOffset);
+    }
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL update global offset commandId: %" PRIu64 " x: %u y: %u z: %u\n",
+                 mutation.commandId, mutation.globalOffset[0], mutation.globalOffset[1], mutation.globalOffset[2]);
+    return ZE_RESULT_SUCCESS;
+}
+
+auto MutableCommandListImp::updateMutableCommandsImpl() -> ze_result_t {
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL updateMutableCommandsImpl cmdlist: %p\n", this);
+    for (const auto &mutationDesc : this->mutationDescriptors) {
+        auto result = std::visit([this](const auto &mutation) -> ze_result_t {
+            return this->applyMutation(mutation);
+        },
+                                 mutationDesc);
+        if (result != ZE_RESULT_SUCCESS) {
+            return result;
+        }
+    }
+
+    for (auto &varDispatch : this->cooperativeKernelVariableDispatches) {
+        if (varDispatch->getMaxCooperativeGroupCount() < varDispatch->getTotalGroupCount()) {
+            return ZE_RESULT_ERROR_UNSUPPORTED_SIZE;
+        }
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t MutableCommandListImp::updateMutableCommandSignalEvent(uint64_t commandId, ze_event_handle_t signalEvent) {
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL updateMutableCommandSignalEvent cmdlist: %p commandId: %" PRIu64 " new signal event handle: %p\n", this, commandId, signalEvent);
+    AppendEventMutation &selectedAppend = this->eventMutations[(commandId - 1)];
+    if (selectedAppend.signalEvent.eventVariable == nullptr) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    auto inputEvent = Event::fromHandle(signalEvent);
+    if (selectedAppend.signalEvent.event == inputEvent) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    auto ret = selectedAppend.signalEvent.eventVariable->setValue(0, 0, inputEvent);
+    if (ret == ZE_RESULT_SUCCESS) {
+        selectedAppend.signalEvent.event = inputEvent;
+        this->updatedCommandList = true;
+    }
+    if (base->getFlatCapture()) {
+        base->getFlatCapture()->updateSignalEvent(commandId, signalEvent);
+    }
+    return ret;
+}
+
+ze_result_t MutableCommandListImp::updateMutableCommandWaitEvents(uint64_t commandId, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents) {
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL updateMutableCommandWaitEvents cmdlist: %p commandId: %" PRIu64 " numWaitEvents: %u\n", this, commandId, numWaitEvents);
+    AppendEventMutation &selectedAppend = this->eventMutations[(commandId - 1)];
+    if (numWaitEvents > selectedAppend.waitEvents.size()) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    for (uint32_t eventNum = 0; eventNum < numWaitEvents; eventNum++) {
+        WaitEventVariableDescriptor &mutableWaitEventDesc = selectedAppend.waitEvents[eventNum];
+        UNRECOVERABLE_IF(mutableWaitEventDesc.waitEventIndex != eventNum);
+        auto waitEventHandle = phWaitEvents[eventNum];
+        auto inputEvent = Event::fromHandle(waitEventHandle);
+        PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL event number: %u old wait event: %p\n", eventNum, mutableWaitEventDesc.event);
+        if (mutableWaitEventDesc.event == inputEvent && !mutableWaitEventDesc.eventVariable->getDesc().eventValue.counterBasedEvent) {
+            continue;
+        }
+
+        auto retCode = mutableWaitEventDesc.eventVariable->setValue(0, 0, inputEvent);
+        if (retCode == ZE_RESULT_SUCCESS) {
+            mutableWaitEventDesc.event = inputEvent;
+            this->updatedCommandList = true;
+        } else {
+            return retCode;
+        }
+        PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL event number: %u new wait event: %p\n", eventNum, inputEvent);
+    }
+    if (base->getFlatCapture()) {
+        base->getFlatCapture()->updateWaitEvents(commandId, numWaitEvents, phWaitEvents);
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t MutableCommandListImp::updateMutableCommandKernels(uint32_t numKernels, uint64_t *pCommandId, ze_kernel_handle_t *phKernels) {
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL updateMutableCommandKernels cmdlist: %p numKernels: %u\n", this, numKernels);
+    for (uint32_t id = 0; id < numKernels; id++) {
+        auto commandId = pCommandId[id];
+        auto kernelHandle = phKernels[id];
+        auto kernel = Kernel::fromHandle(kernelHandle);
+        auto kernelGroup = this->kernelMutations[(commandId - 1)].kernelGroup;
+        if (kernelGroup == nullptr) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+
+        auto oldMutableKernel = kernelGroup->getCurrentMutableKernel();
+        // when old mutable kernel handle is the same as new, then skip mutation
+        if (oldMutableKernel->getKernel() == kernel) {
+            continue;
+        }
+        auto oldKernelComputeWalker = oldMutableKernel->getMutableComputeWalker();
+
+        kernelGroup->setCurrentMutableKernel(kernel);
+        auto newMutableKernel = kernelGroup->getCurrentMutableKernel();
+
+        // remove old kernel from mutable residency
+        {
+            oldMutableKernel->updateResidencySnapshotContainer();
+            auto &residencyContainer = oldMutableKernel->getKernelResidencySnapshotContainer();
+            for (auto resource : residencyContainer) {
+                removeFromResidencyContainer(resource, false);
+            }
+        }
+        // remove old kernel arguments (buffers) from mutable residency and reset variables
+        {
+            auto &kernelVariableDescriptors = oldMutableKernel->getKernelVariables();
+            for (auto &kernelArgVarDesc : kernelVariableDescriptors.kernelArguments) {
+                if (kernelArgVarDesc.kernelArgumentVariable == nullptr) {
+                    continue;
+                }
+                auto &varDescriptor = kernelArgVarDesc.kernelArgumentVariable->getDesc();
+                if (varDescriptor.type == VariableType::buffer) {
+                    if (varDescriptor.bufferAlloc != nullptr) {
+                        removeFromResidencyContainer(varDescriptor.bufferAlloc, false);
+                    }
+                    kernelArgVarDesc.kernelArgumentVariable->resetBufferVariable();
+                }
+                if (varDescriptor.type == VariableType::slmBuffer) {
+                    kernelArgVarDesc.kernelArgumentVariable->resetSlmVariable();
+                }
+            }
+            kernelVariableDescriptors.groupCount->resetGroupCountVariable();
+            if (kernelVariableDescriptors.groupSize != nullptr) {
+                kernelVariableDescriptors.groupSize->resetGroupSizeVariable();
+            }
+            if (kernelVariableDescriptors.globalOffset != nullptr) {
+                kernelVariableDescriptors.globalOffset->resetGlobalOffsetVariable();
+            }
+        }
+
+        // copy const data from host view into heap payload
+        newMutableKernel->copyTemplateViewIndirectData();
+
+        {
+            // copy noop patch indices
+            auto oldKernelDispatch = oldMutableKernel->getKernelDispatch();
+            auto newKernelDispatch = newMutableKernel->getKernelDispatch();
+
+            newKernelDispatch->syncBufferNoopPatchIndex = oldKernelDispatch->syncBufferNoopPatchIndex;
+
+            if (newKernelDispatch->syncBufferNoopPatchIndex != undefined<size_t> &&
+                newKernelDispatch->kernelData->usesSyncBuffer == false) {
+                // disable noop patch index if sync buffer is not used
+                disableAddressNoopPatch(newKernelDispatch->syncBufferNoopPatchIndex);
+            }
+        }
+
+        // copy post sync and possible indirect/scratch pointers from old walker host view into new walker host view
+        auto newKernelComputeWalker = newMutableKernel->getMutableComputeWalker();
+        newKernelComputeWalker->copyWalkerDataToHostBuffer(oldKernelComputeWalker);
+
+        if (kernelGroup->isScratchNeeded()) {
+            // update walker with latest patched scratch address
+            auto scratchAddressPatchIndex = kernelGroup->getScratchAddressPatchIndex();
+            auto newKernelIndirectData = newMutableKernel->getKernelDispatch()->varDispatch->getIndirectData();
+            this->updateScratchAddress(scratchAddressPatchIndex, *oldKernelComputeWalker, *newKernelComputeWalker, newKernelIndirectData);
+        }
+
+        // save new host view inline data/post sync into command buffer
+        newKernelComputeWalker->saveCpuBufferIntoGpuBuffer(false, true);
+
+        // update reminder variables (signal event variable) with new compute walker to have correct reference for new post sync addresses
+        if (kernelGroup->getSharedSignalVariable() != nullptr) {
+            kernelGroup->getSharedSignalVariable()->updateMutableComputeWalker(newKernelComputeWalker);
+        }
+
+        // add new kernel to mutable residency
+        {
+            newMutableKernel->makeKernelResidencySnapshotContainer(false);
+            auto &residencyContainer = newMutableKernel->getKernelResidencySnapshotContainer();
+            for (auto resource : residencyContainer) {
+                addToResidencyContainer(resource, false);
+            }
+        }
+
+        updateKernelMemoryPrefetch(*kernel, kernelGroup->getIohForPrefetch(), kernelGroup->getPrefetchCmd(), commandId);
+
+        this->updatedCommandList = true;
+
+        if (base->getFlatCapture()) {
+            base->getFlatCapture()->updateKernel(commandId, kernelHandle);
+        }
+        PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL kernel number: %u commandId: %" PRIu64 " new kernel handle: %p\n", id, commandId, kernelHandle);
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+void MutableCommandListImp::addAsyncMutationElement(uint64_t gpuDestination, void *hostSource, size_t size, bool redirectToCopyOffload) {
+    if (redirectToCopyOffload) {
+        auto copyOffloadSubCmdList = this->base->getCopyOffloadSubCmdList();
+        UNRECOVERABLE_IF(copyOffloadSubCmdList == nullptr);
+        auto mutableCopyOffloadSubCmdList = static_cast<MutableCommandList *>(copyOffloadSubCmdList->asMutable());
+        UNRECOVERABLE_IF(mutableCopyOffloadSubCmdList == nullptr);
+        mutableCopyOffloadSubCmdList->addAsyncMutationElement(gpuDestination, hostSource, size, false);
+    } else {
+        base->getAsyncPatchContainer().push_back({gpuDestination, hostSource, size});
+    }
+}
+
+} // namespace MCL
+} // namespace L0

@@ -1,16 +1,18 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/helpers/debug_manager_state_restore.h"
-
-#include "opencl/test/unit_test/event/event_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_event.h"
 
+#include "gtest/gtest.h"
+
 #include <memory>
+#include <thread>
+
+using namespace NEO;
 
 class SmallMockEvent : public Event {
   public:
@@ -25,7 +27,7 @@ class SmallMockEvent : public Event {
 
 TEST(EventTestMt, WhenWaitingForEventsThenDoNotReturnUntilAllStatusesSetToComplete) {
 
-    for (uint32_t i = 0; i < 100; i++) {
+    for (uint32_t i = 0; i < 4; i++) {
         std::unique_ptr<UserEvent> userEvent = std::unique_ptr<UserEvent>(new UserEvent(nullptr));
 
         std::thread t([&]() {

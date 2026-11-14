@@ -1,16 +1,20 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_wddm.h"
-#include "shared/test/common/test_macros/test.h"
 
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
+
+#include "gtest/gtest.h"
+
+#include <cstring>
+#include <memory>
 
 using namespace NEO;
 
@@ -80,6 +84,6 @@ TEST(GetDeviceInfo, givenClDeviceWhenGettingDeviceInfoThenGetNodeMask) {
     auto retVal = clDevice->getDeviceInfo(CL_DEVICE_NODE_MASK_KHR, sizeof(cl_uint), &nodeMask, 0);
 
     ASSERT_EQ(retVal, CL_SUCCESS);
-    EXPECT_EQ(nodeMask, 0b1);
+    EXPECT_EQ(nodeMask, 0b1u);
 }
 } // namespace ULT

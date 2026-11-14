@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,14 +11,13 @@
 
 #include "level_zero/tools/source/sysman/pci/os_pci.h"
 
-#include <memory>
 namespace L0 {
 class SysfsAccess;
 class FsAccess;
 class LinuxSysmanImp;
 struct OsSysman;
 
-class LinuxPciImp : public OsPci, NEO::NonCopyableOrMovableClass {
+class LinuxPciImp : public OsPci, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t getPciBdf(zes_pci_properties_t &pciProperties) override;
     void getMaxLinkCaps(double &maxLinkSpeed, int32_t &maxLinkWidth) override;
@@ -27,6 +26,8 @@ class LinuxPciImp : public OsPci, NEO::NonCopyableOrMovableClass {
     bool resizableBarSupported() override;
     bool resizableBarEnabled(uint32_t barIndex) override;
     ze_result_t initializeBarProperties(std::vector<zes_pci_bar_properties_t *> &pBarProperties) override;
+    static uint32_t getRebarCapabilityPos(uint8_t *configMemory, bool isVfBar);
+    static uint16_t getLinkCapabilityPos(uint8_t *configMem);
     LinuxPciImp() = default;
     LinuxPciImp(OsSysman *pOsSysman);
     ~LinuxPciImp() override = default;
@@ -34,12 +35,7 @@ class LinuxPciImp : public OsPci, NEO::NonCopyableOrMovableClass {
   protected:
     SysfsAccess *pSysfsAccess = nullptr;
     LinuxSysmanImp *pLinuxSysmanImp = nullptr;
-    std::unique_ptr<uint8_t[]> configMemory;
-    std::unique_ptr<uint8_t[]> uspConfigMemory;
-    void pciExtendedConfigRead();
-    void pciCardBusConfigRead();
-    decltype(&NEO::SysCalls::open) openFunction = NEO::SysCalls::open;
-    decltype(&NEO::SysCalls::close) closeFunction = NEO::SysCalls::close;
+    bool getPciConfigMemory(std::string pciPath, std::vector<uint8_t> &configMem);
     decltype(&NEO::SysCalls::pread) preadFunction = NEO::SysCalls::pread;
 
   private:
@@ -48,18 +44,6 @@ class LinuxPciImp : public OsPci, NEO::NonCopyableOrMovableClass {
     static const std::string maxLinkSpeedFile;
     static const std::string maxLinkWidthFile;
     bool isLmemSupported = false;
-    uint32_t getDwordFromConfig(uint32_t pos) {
-        return configMemory[pos] | (configMemory[pos + 1] << 8) |
-               (configMemory[pos + 2] << 16) | (configMemory[pos + 3] << 24);
-    }
-    uint16_t getWordFromConfig(uint32_t pos, uint8_t *configMem) {
-        return configMem[pos] | (configMem[pos + 1] << 8);
-    }
-    uint8_t getByteFromConfig(uint32_t pos, uint8_t *configMem) {
-        return configMem[pos];
-    }
-    uint32_t getRebarCapabilityPos();
-    uint16_t getLinkCapabilityPos();
 };
 
 } // namespace L0

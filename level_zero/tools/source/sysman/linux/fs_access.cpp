@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,12 +9,14 @@
 
 #include <climits>
 
-#include <array>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <dirent.h>
+#include <sstream>
 #include <unistd.h>
 
 namespace L0 {
@@ -31,17 +33,54 @@ static ze_result_t getResult(int err) {
     }
 }
 
+void FdCache::eraseLeastUsedEntryFromCache() {
+    auto it = fdMap.begin();
+    uint32_t fdCountRef = it->second.second;
+    std::map<std::string, std::pair<int, uint32_t>>::iterator leastUsedIterator = it;
+    while (++it != fdMap.end()) {
+        if (it->second.second < fdCountRef) {
+            fdCountRef = it->second.second;
+            leastUsedIterator = it;
+        }
+    }
+    NEO::SysCalls::close(leastUsedIterator->second.first);
+    fdMap.erase(leastUsedIterator);
+}
+
+int FdCache::getFd(std::string file) {
+    if (auto it = fdMap.find(file); it != fdMap.end()) {
+        it->second.second++;
+        return it->second.first;
+    }
+    int fd = NEO::SysCalls::open(file.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    if (fdMap.size() == maxSize) {
+        eraseLeastUsedEntryFromCache();
+    }
+    fdMap.emplace(std::move(file), std::make_pair(fd, 1));
+    return fd;
+}
+
+FdCache::~FdCache() {
+    for (auto it = fdMap.begin(); it != fdMap.end(); ++it) {
+        NEO::SysCalls::close(it->second.first);
+    }
+    fdMap.clear();
+}
+
 template <typename T>
 ze_result_t FsAccess::readValue(const std::string file, T &val) {
+    auto lock = this->obtainMutex();
 
     std::string readVal(64, '\0');
-    int fd = NEO::SysCalls::open(file.c_str(), O_RDONLY);
+    int fd = pFdCache->getFd(std::move(file));
     if (fd < 0) {
         return getResult(errno);
     }
 
     ssize_t bytesRead = NEO::SysCalls::pread(fd, readVal.data(), readVal.size(), 0);
-    NEO::SysCalls::close(fd);
     if (bytesRead < 0) {
         return getResult(errno);
     }
@@ -57,77 +96,112 @@ ze_result_t FsAccess::readValue(const std::string file, T &val) {
 
 // Generic Filesystem Access
 FsAccess::FsAccess() {
+    pFdCache = std::make_unique<FdCache>();
 }
+
+FsAccess::FsAccess(const FsAccess &fsAccess) : pFdCache(std::make_unique<FdCache>()) {}
 
 FsAccess *FsAccess::create() {
     return new FsAccess();
 }
 
 ze_result_t FsAccess::read(const std::string file, uint64_t &val) {
-    return readValue<uint64_t>(file, val);
+    return readValue<uint64_t>(std::move(file), val);
 }
 
 ze_result_t FsAccess::read(const std::string file, double &val) {
-    return readValue<double>(file, val);
+    return readValue<double>(std::move(file), val);
 }
 
 ze_result_t FsAccess::read(const std::string file, int32_t &val) {
-    return readValue<int32_t>(file, val);
+    return readValue<int32_t>(std::move(file), val);
 }
 
 ze_result_t FsAccess::read(const std::string file, uint32_t &val) {
-    return readValue<uint32_t>(file, val);
+    return readValue<uint32_t>(std::move(file), val);
 }
 
 ze_result_t FsAccess::read(const std::string file, std::string &val) {
-    // Read a single line from text file without trailing newline
-    std::ifstream fs;
     val.clear();
 
-    fs.open(file.c_str());
-    if (fs.fail()) {
+    int fd = NEO::SysCalls::open(file.c_str(), O_RDONLY);
+    if (fd < 0) {
         return getResult(errno);
-    }
-    fs >> val;
-    if (fs.fail()) {
-        fs.close();
-        return getResult(errno);
-    }
-    fs.close();
-    // Strip trailing newline
-    if (val.back() == '\n') {
-        val.pop_back();
     }
 
+    char buf[readBufSize];
+    ssize_t bytesRead = 0;
+    bool done = false;
+    while (!done && (bytesRead = NEO::SysCalls::read(fd, buf, sizeof(buf))) > 0) {
+        const char *ptr = buf;
+        const char *const end = buf + bytesRead;
+        while (ptr < end && val.empty() && std::isspace(static_cast<unsigned char>(*ptr))) {
+            ++ptr;
+        }
+        const char *spanEnd = ptr;
+        while (spanEnd < end && !std::isspace(static_cast<unsigned char>(*spanEnd))) {
+            ++spanEnd;
+        }
+        val.append(ptr, spanEnd);
+        if (!val.empty() && spanEnd < end) {
+            done = true;
+        }
+    }
+    int savedErrno = errno;
+    NEO::SysCalls::close(fd);
+
+    if (bytesRead < 0) {
+        val.clear();
+        return getResult(savedErrno);
+    }
+    if (val.empty()) {
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
     return ZE_RESULT_SUCCESS;
 }
 
 ze_result_t FsAccess::read(const std::string file, std::vector<std::string> &val) {
-    // Read a entire text file, one line per vector entry
-    std::string line;
-    std::ifstream fs;
     val.clear();
 
-    fs.open(file.c_str());
-    if (fs.fail()) {
+    int fd = NEO::SysCalls::open(file.c_str(), O_RDONLY);
+    if (fd < 0) {
         return getResult(errno);
     }
-    while (std::getline(fs, line)) {
-        if (fs.fail()) {
-            fs.close();
-            return getResult(errno);
+
+    std::string leftover;
+    char buf[readBufSize];
+    ssize_t bytesRead = 0;
+    while ((bytesRead = NEO::SysCalls::read(fd, buf, sizeof(buf))) > 0) {
+        const char *ptr = buf;
+        const char *end = buf + bytesRead;
+        const char *nl;
+        while ((nl = static_cast<const char *>(memchr(ptr, '\n', static_cast<size_t>(end - ptr)))) != nullptr) {
+            if (leftover.empty()) {
+                val.emplace_back(ptr, nl);
+            } else {
+                leftover.append(ptr, nl);
+                val.push_back(std::move(leftover));
+                leftover.clear();
+            }
+            ptr = nl + 1;
         }
-        if (line.back() == '\n') {
-            line.pop_back();
-        }
-        val.push_back(line);
+        leftover.append(ptr, end);
     }
-    fs.close();
+    int savedErrno = errno;
+    NEO::SysCalls::close(fd);
+
+    if (bytesRead < 0) {
+        val.clear();
+        return getResult(savedErrno);
+    }
+    if (!leftover.empty()) {
+        val.push_back(std::move(leftover));
+    }
 
     return ZE_RESULT_SUCCESS;
 }
 
-ze_result_t FsAccess::write(const std::string file, const std::string val) {
+ze_result_t FsAccess::write(const std::string file, std::string_view val) {
 
     int fd = NEO::SysCalls::open(file.c_str(), O_WRONLY);
     if (fd < 0) {
@@ -170,7 +244,7 @@ ze_result_t FsAccess::canWrite(const std::string file) {
 }
 
 bool FsAccess::fileExists(const std::string file) {
-    if (NEO::SysCalls::access(file.c_str(), F_OK)) {
+    if (NEO::SysCalls::access(file, F_OK)) {
         return false;
     }
     return true;
@@ -188,7 +262,7 @@ ze_result_t FsAccess::getFileMode(const std::string file, ::mode_t &mode) {
 ze_result_t FsAccess::readSymLink(const std::string path, std::string &val) {
     // returns the value of symlink at path
     char buf[PATH_MAX];
-    ssize_t len = ::readlink(path.c_str(), buf, PATH_MAX - 1);
+    ssize_t len = static_cast<ssize_t>(NEO::SysCalls::readlink(path.c_str(), buf, PATH_MAX - 1));
     if (len < 0) {
         return getResult(errno);
     }
@@ -210,7 +284,7 @@ ze_result_t FsAccess::getRealPath(const std::string path, std::string &val) {
 
 ze_result_t FsAccess::listDirectory(const std::string path, std::vector<std::string> &list) {
     list.clear();
-    ::DIR *procDir = ::opendir(path.c_str());
+    ::DIR *procDir = NEO::SysCalls::opendir(path.c_str());
     if (!procDir) {
         return getResult(errno);
     }
@@ -218,7 +292,7 @@ ze_result_t FsAccess::listDirectory(const std::string path, std::vector<std::str
     int err = 0;
     // readdir doesn't clear errno, so make sure it is clear
     errno = 0;
-    while (NULL != (ent = ::readdir(procDir))) {
+    while (NULL != (ent = NEO::SysCalls::readdir(procDir))) {
         // Ignore . and ..
         std::string name = std::string(ent->d_name);
         if (!name.compare(".") || !name.compare("..")) {
@@ -229,7 +303,7 @@ ze_result_t FsAccess::listDirectory(const std::string path, std::vector<std::str
         errno = 0;
     }
     err = errno;
-    ::closedir(procDir);
+    NEO::SysCalls::closedir(procDir);
     // Check if in above while loop, readdir encountered any error.
     if ((err != 0) && (err != ENOENT)) {
         list.clear();
@@ -239,7 +313,7 @@ ze_result_t FsAccess::listDirectory(const std::string path, std::vector<std::str
 }
 
 std::string FsAccess::getBaseName(const std::string path) {
-    size_t pos = path.rfind("/");
+    size_t pos = path.rfind('/');
     if (std::string::npos == pos) {
         return path;
     }
@@ -247,7 +321,7 @@ std::string FsAccess::getBaseName(const std::string path) {
 }
 
 std::string FsAccess::getDirName(const std::string path) {
-    size_t pos = path.rfind("/");
+    size_t pos = path.rfind('/');
     if (std::string::npos == pos) {
         return std::string("");
     }
@@ -266,6 +340,10 @@ bool FsAccess::directoryExists(const std::string path) {
     return true;
 }
 
+std::unique_lock<std::mutex> FsAccess::obtainMutex() {
+    return std::unique_lock<std::mutex>(this->fsMutex);
+}
+
 // Procfs Access
 const std::string ProcfsAccess::procDir = "/proc/";
 const std::string ProcfsAccess::fdDir = "/fd/";
@@ -276,7 +354,7 @@ std::string ProcfsAccess::fullPath(const ::pid_t pid) {
 }
 
 std::string ProcfsAccess::fdDirPath(const ::pid_t pid) {
-    // Returns the full path to file descritpor directory
+    // Returns the full path to file descriptor directory
     // for process pid
     return std::string(fullPath(pid) + fdDir);
 }
@@ -360,19 +438,19 @@ const std::string SysfsAccess::drmDriverDevNodeDir = "/dev/dri/";
 const std::string SysfsAccess::intelGpuBindEntry = "/sys/bus/pci/drivers/i915/bind";
 const std::string SysfsAccess::intelGpuUnbindEntry = "/sys/bus/pci/drivers/i915/unbind";
 
-std::string SysfsAccess::fullPath(const std::string file) {
+std::string SysfsAccess::fullPath(const std::string &file) {
     // Prepend sysfs directory path for this device
     return std::string(dirname + file);
 }
 
 SysfsAccess::SysfsAccess(const std::string dev) {
     // dev could be either /dev/dri/cardX or /dev/dri/renderDX
-    std::string fileName = FsAccess::getBaseName(dev);
+    std::string fileName = FsAccess::getBaseName(std::move(dev));
     std::string devicesDir = drmPath + fileName + std::string("/") + devicesPath;
 
-    FsAccess::listDirectory(devicesDir, deviceNames);
+    FsAccess::listDirectory(std::move(devicesDir), deviceNames);
     for (auto &&next : deviceNames) {
-        if (!next.compare(0, primaryDevName.length(), primaryDevName)) {
+        if (next.starts_with(primaryDevName)) {
             dirname = drmPath + next + std::string("/");
             break;
         }
@@ -380,7 +458,7 @@ SysfsAccess::SysfsAccess(const std::string dev) {
 }
 
 SysfsAccess *SysfsAccess::create(const std::string dev) {
-    return new SysfsAccess(dev);
+    return new SysfsAccess(std::move(dev));
 }
 
 ze_result_t SysfsAccess::canRead(const std::string file) {
@@ -424,8 +502,7 @@ ze_result_t SysfsAccess::read(const std::string file, std::vector<std::string> &
     return FsAccess::read(fullPath(file), val);
 }
 
-ze_result_t SysfsAccess::write(const std::string file, const std::string val) {
-    // Prepend sysfs directory path and call the base write
+ze_result_t SysfsAccess::write(const std::string file, std::string_view val) {
     return FsAccess::write(fullPath(file), val);
 }
 
@@ -475,11 +552,11 @@ ze_result_t SysfsAccess::getRealPath(const std::string path, std::string &val) {
 }
 
 ze_result_t SysfsAccess::bindDevice(std::string device) {
-    return FsAccess::write(intelGpuBindEntry, device);
+    return FsAccess::write(intelGpuBindEntry, std::move(device));
 }
 
 ze_result_t SysfsAccess::unbindDevice(std::string device) {
-    return FsAccess::write(intelGpuUnbindEntry, device);
+    return FsAccess::write(intelGpuUnbindEntry, std::move(device));
 }
 
 bool SysfsAccess::fileExists(const std::string file) {

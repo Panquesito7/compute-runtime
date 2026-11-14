@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -33,6 +33,10 @@ inline bool isCommandWithoutKernel(uint32_t commandType) {
             (commandType == CL_COMMAND_SVM_UNMAP));
 }
 
+inline bool isFlushForProfilingRequired(uint32_t commandType) {
+    return (commandType == CL_COMMAND_BARRIER || commandType == CL_COMMAND_MARKER);
+}
+
 inline void retainQueue(cl_command_queue commandQueue, cl_int &retVal) {
     using BaseType = typename CommandQueue::BaseType;
     auto queue = castToObject<CommandQueue>(static_cast<BaseType *>(commandQueue));
@@ -48,6 +52,10 @@ inline void releaseQueue(cl_command_queue commandQueue, cl_int &retVal) {
     if (queue) {
         queue->flush();
         releaseVirtualEvent(*queue);
+
+        if (queue->waitOnDestructionNeeded()) {
+            queue->waitForAllEngines(false, nullptr, true, false);
+        }
         queue->release();
         retVal = CL_SUCCESS;
     }
@@ -127,8 +135,8 @@ inline void getQueueInfo(cl_command_queue commandQueue,
     }
 }
 
-template <typename returnType>
-returnType getCmdQueueProperties(const cl_queue_properties *properties,
+template <typename ReturnType>
+ReturnType getCmdQueueProperties(const cl_queue_properties *properties,
                                  cl_queue_properties propertyName = CL_QUEUE_PROPERTIES,
                                  bool *foundValue = nullptr) {
     if (properties != nullptr) {
@@ -137,7 +145,7 @@ returnType getCmdQueueProperties(const cl_queue_properties *properties,
                 if (foundValue) {
                     *foundValue = true;
                 }
-                return static_cast<returnType>(*(properties + 1));
+                return static_cast<ReturnType>(*(properties + 1));
             }
             properties += 2;
         }

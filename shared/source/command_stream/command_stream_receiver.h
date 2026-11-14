@@ -1,39 +1,62 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/command_stream/csr_definitions.h"
 #include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/command_stream/memory_compression_state.h"
+#include "shared/source/command_stream/preemption_mode.h"
 #include "shared/source/command_stream/stream_properties.h"
 #include "shared/source/helpers/blit_properties_container.h"
 #include "shared/source/helpers/cache_policy.h"
 #include "shared/source/helpers/completion_stamp.h"
+#include "shared/source/helpers/device_bitfield.h"
+#include "shared/source/helpers/kmd_notify_helper.h"
+#include "shared/source/helpers/kmd_notify_properties.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/options.h"
+#include "shared/source/helpers/private_allocs_to_reuse_container.h"
+#include "shared/source/host_function/host_function.h"
+#include "shared/source/kernel/kernel_execution_type.h"
+#include "shared/source/memory_manager/residency_container.h"
+#include "shared/source/os_interface/defs.h"
+#include "shared/source/os_interface/external_semaphore.h"
+#include "shared/source/os_interface/user_fence.h"
+#include "shared/source/utilities/host_clock.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/spinlock.h"
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <optional>
+#include <span>
+
+namespace aub_stream {
+struct AllocationParams;
+} // namespace aub_stream
 
 namespace NEO {
-
+enum class AllocationType;
 enum class DebugPauseState : uint32_t;
 struct BatchBuffer;
+struct DispatchBcsFlags;
+struct DispatchFlags;
 struct HardwareInfo;
+struct ImmediateDispatchFlags;
 struct WaitParams;
 class SubmissionAggregator;
 class FlushStampTracker;
 class Thread;
 class FlatBatchBufferHelper;
 class AllocationsList;
+class HostFunctionAllocator;
 class Device;
 class ExecutionEnvironment;
-class ExperimentalCommandBuffer;
 class GmmPageTableMngr;
 class GraphicsAllocation;
 class HostPtrSurface;
@@ -49,29 +72,38 @@ class HwPerfCounter;
 class HwTimeStamps;
 class GmmHelper;
 class TagAllocatorBase;
-class LogicalStateHelper;
+class TimestampPacketContainer;
 class KmdNotifyHelper;
 class GfxCoreHelper;
 class ProductHelper;
 class ReleaseHelper;
+class HostFunctionWorker;
 enum class WaitStatus;
 struct AubSubCaptureStatus;
+struct DeferredFreeContext;
+class SharedPoolAllocation;
 
-template <typename TSize>
+template <typename TSize, uint32_t packetCount>
 class TimestampPackets;
 
 template <typename T1>
 class TagAllocator;
+class TagNodeBase;
 
-enum class DispatchMode {
-    DeviceDefault = 0,          // default for given device
-    ImmediateDispatch,          // everything is submitted to the HW immediately
-    AdaptiveDispatch,           // dispatching is handled to async thread, which combines batch buffers basing on load (not implemented)
-    BatchedDispatchWithCounter, // dispatching is batched, after n commands there is implicit flush (not implemented)
-    BatchedDispatch             // dispatching is batched, explicit clFlush is required
+class KmdWaiter : NEO::NonCopyableAndNonMovableClass {
+  public:
+    virtual ~KmdWaiter() = default;
+    // std::nullopt means the OS wait failed and the waiter must not be used again.
+    virtual std::optional<WaitStatus> wait(uint64_t timeoutNanoseconds) = 0;
 };
 
-class CommandStreamReceiver {
+enum class DispatchMode {
+    deviceDefault = 0, // default for given device
+    immediateDispatch, // everything is submitted to the HW immediately
+    batchedDispatch    // dispatching is batched, explicit clFlush is required
+};
+
+class CommandStreamReceiver : NEO::NonCopyableAndNonMovableClass {
   public:
     static constexpr size_t startingResidencyContainerSize = 128;
 
@@ -82,10 +114,14 @@ class CommandStreamReceiver {
     };
 
     using MutexType = std::recursive_mutex;
-    using TimeType = std::chrono::high_resolution_clock::time_point;
+    using TimeType = HostClock::TimestampNs;
+
+    CommandStreamReceiver() = delete;
+
     CommandStreamReceiver(ExecutionEnvironment &executionEnvironment,
                           uint32_t rootDeviceIndex,
                           const DeviceBitfield deviceBitfield);
+
     virtual ~CommandStreamReceiver();
 
     virtual SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) = 0;
@@ -93,12 +129,21 @@ class CommandStreamReceiver {
     virtual CompletionStamp flushTask(LinearStream &commandStreamTask, size_t commandStreamTaskStart,
                                       const IndirectHeap *dsh, const IndirectHeap *ioh, const IndirectHeap *ssh,
                                       TaskCountType taskLevel, DispatchFlags &dispatchFlags, Device &device) = 0;
+
     virtual CompletionStamp flushBcsTask(LinearStream &commandStream, size_t commandStreamStart, const DispatchBcsFlags &dispatchBcsFlags, const HardwareInfo &hwInfo) = 0;
+    virtual CompletionStamp flushImmediateTask(LinearStream &immediateCommandStream, size_t immediateCommandStreamStart,
+                                               ImmediateDispatchFlags &dispatchFlags, Device &device) = 0;
+
+    virtual CompletionStamp flushImmediateTaskHeapless(LinearStream &immediateCommandStream, size_t immediateCommandStreamStart,
+                                                       ImmediateDispatchFlags &dispatchFlags, Device &device) = 0;
     virtual SubmissionStatus sendRenderStateCacheFlush() = 0;
 
     virtual bool flushBatchedSubmissions() = 0;
     MOCKABLE_VIRTUAL SubmissionStatus submitBatchBuffer(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency);
-    virtual void pollForCompletion() {}
+    void pollForCompletion() { pollForCompletion(false); }
+    virtual void pollForAubCompletion() {};
+    virtual void pollForCompletion(bool skipTaskCountCheck) {}
+    virtual bool isPerQueuePrologueRequired() const = 0;
     virtual void programHardwareContext(LinearStream &cmdStream) = 0;
     virtual size_t getCmdsSizeForHardwareContext() const = 0;
 
@@ -106,28 +151,33 @@ class CommandStreamReceiver {
     MOCKABLE_VIRTUAL void makeResident(GraphicsAllocation &gfxAllocation);
     virtual void makeNonResident(GraphicsAllocation &gfxAllocation);
     MOCKABLE_VIRTUAL void makeSurfacePackNonResident(ResidencyContainer &allocationsForResidency, bool clearAllocations);
-    virtual SubmissionStatus processResidency(const ResidencyContainer &allocationsForResidency, uint32_t handleId);
+    virtual SubmissionStatus processResidency(ResidencyContainer &allocationsForResidency, uint32_t handleId);
     virtual void processEviction();
     void makeResidentHostPtrAllocation(GraphicsAllocation *gfxAllocation);
+    void makeResidentPreemptionAllocation();
 
     MOCKABLE_VIRTUAL void ensureCommandBufferAllocation(LinearStream &commandStream, size_t minimumRequiredSize, size_t additionalAllocationSize);
 
     MemoryManager *getMemoryManager() const;
 
     ResidencyContainer &getResidencyAllocations();
-    ResidencyContainer &getEvictionAllocations();
+    PrivateAllocsToReuseContainer &getOwnedPrivateAllocations();
 
     virtual GmmPageTableMngr *createPageTableManager() { return nullptr; }
     bool needsPageTableManager() const;
+    bool isPageTableManagerInitializationRequired() const { return pageTableManager.get() != nullptr && !pageTableManagerInitialized; }
 
     MOCKABLE_VIRTUAL WaitStatus waitForTaskCount(TaskCountType requiredTaskCount);
     WaitStatus waitForTaskCountAndCleanAllocationList(TaskCountType requiredTaskCount, uint32_t allocationUsage);
     MOCKABLE_VIRTUAL WaitStatus waitForTaskCountAndCleanTemporaryAllocationList(TaskCountType requiredTaskCount);
+    MOCKABLE_VIRTUAL void createHostFunctionWorker();
+    HostFunctionWorker *getHostFunctionWorker();
 
     LinearStream &getCS(size_t minRequiredSize = 1024u);
     OSInterface *getOSInterface() const;
     ExecutionEnvironment &peekExecutionEnvironment() const { return executionEnvironment; }
     GmmHelper *peekGmmHelper() const;
+    DeviceBitfield peekDeviceBitfield() const { return deviceBitfield; }
 
     MOCKABLE_VIRTUAL void setTagAllocation(GraphicsAllocation *allocation);
     GraphicsAllocation *getTagAllocation() const {
@@ -136,16 +186,20 @@ class CommandStreamReceiver {
     MultiGraphicsAllocation *getTagsMultiAllocation() const {
         return tagsMultiAllocation;
     }
-    MultiGraphicsAllocation &createTagsMultiAllocation();
-
+    MultiGraphicsAllocation &createMultiAllocationInSystemMemoryPool(AllocationType allocationType);
     TaskCountType getNextBarrierCount() { return this->barrierCount.fetch_add(1u); }
     TaskCountType peekBarrierCount() const { return this->barrierCount.load(); }
     volatile TagAddressType *getTagAddress() const { return tagAddress; }
+    volatile TagAddressType *getUcTagAddress() const { return ucTagAddress; }
     volatile TagAddressType *getBarrierCountTagAddress() const { return this->barrierCountTagAddress; }
     uint64_t getBarrierCountGpuAddress() const;
     uint64_t getDebugPauseStateGPUAddress() const;
+    uint64_t getUcTagGPUAddress() const;
 
     virtual bool waitForFlushStamp(FlushStamp &flushStampToWait) { return true; }
+    virtual WaitStatus waitForFlushStamp(FlushStamp &flushStampToWait, uint64_t timeoutNanoseconds) { return WaitStatus::notReady; }
+    // Does not block; nullptr if the KMD wait is not possible.
+    virtual std::unique_ptr<KmdWaiter> createKmdWaiter(FlushStamp flushStamp, TaskCountType taskCount) { return nullptr; }
 
     TaskCountType peekTaskCount() const { return taskCount; }
 
@@ -173,21 +227,68 @@ class CommandStreamReceiver {
     bool getBtdCommandDirty() const { return btdCommandDirty; }
     bool isRayTracingStateProgramingNeeded(Device &device) const;
 
-    void setRequiredScratchSizes(uint32_t newRequiredScratchSize, uint32_t newRequiredPrivateScratchSize);
+    void setRequiredScratchSizes(uint32_t newRequiredScratchSlot0Size, uint32_t newRequiredPrivateScratchSlot1Size);
+    bool reserveScratchSpace(uint32_t requiredScratchSlot0Size, uint32_t requiredScratchSlot1Size);
     GraphicsAllocation *getScratchAllocation();
-    GraphicsAllocation *getDebugSurfaceAllocation() const { return debugSurface; }
+    GraphicsAllocation *getDebugSurfaceAllocation() const {
+        if (primaryCsr) {
+            return primaryCsr->getDebugSurfaceAllocation();
+        }
+        return debugSurface;
+    }
     GraphicsAllocation *allocateDebugSurface(size_t size);
-    GraphicsAllocation *getPreemptionAllocation() const { return preemptionAllocation; }
-    GraphicsAllocation *getGlobalFenceAllocation() const { return globalFenceAllocation; }
-    GraphicsAllocation *getWorkPartitionAllocation() const { return workPartitionAllocation; }
-    GraphicsAllocation *getGlobalStatelessHeapAllocation() const { return globalStatelessHeapAllocation; }
-    GraphicsAllocation *getKernelArgsBufferAllocation() const { return kernelArgsBufferAllocation; }
+
+    GraphicsAllocation *getFrontEndAllocation() const {
+        return frontEndAllocation;
+    }
+    GraphicsAllocation *allocateFrontEndAllocation(size_t size);
+
+    GraphicsAllocation *getPreemptionAllocation() const {
+        if (primaryCsr) {
+            return primaryCsr->getPreemptionAllocation();
+        }
+        return preemptionAllocation;
+    }
+    GraphicsAllocation *getGlobalFenceAllocation() const {
+        if (primaryCsr) {
+            return primaryCsr->getGlobalFenceAllocation();
+        }
+
+        return globalFenceAllocation;
+    }
+    GraphicsAllocation *getWorkPartitionAllocation() const {
+        if (primaryCsr) {
+            return primaryCsr->getWorkPartitionAllocation();
+        }
+        return workPartitionAllocation;
+    }
+
+    GraphicsAllocation *getGlobalStatelessHeapAllocation() const {
+        if (primaryCsr) {
+            return primaryCsr->getGlobalStatelessHeapAllocation();
+        }
+
+        return globalStatelessHeapAllocation;
+    }
+    bool getSkipPreemptionAllocation() const {
+        if (primaryCsr) {
+            return primaryCsr->getSkipPreemptionAllocation();
+        }
+        return skipPreemptionAllocation;
+    }
 
     virtual WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle) = 0;
+    virtual WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle, uint64_t timeoutNanoseconds) { return WaitStatus::notReady; }
     virtual WaitStatus waitForCompletionWithTimeout(const WaitParams &params, TaskCountType taskCountToWait);
     WaitStatus baseWaitFunction(volatile TagAddressType *pollAddress, const WaitParams &params, TaskCountType taskCountToWait);
-    MOCKABLE_VIRTUAL bool testTaskCountReady(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait);
-    virtual void downloadAllocations(){};
+    MOCKABLE_VIRTUAL bool testTaskCountReady(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait, bool blockOnMiss);
+    MOCKABLE_VIRTUAL bool isTagReached(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait, bool blockOnMiss);
+    bool testTaskCountReady(volatile TagAddressType *pollAddress, TaskCountType taskCountToWait) {
+        return testTaskCountReady(pollAddress, taskCountToWait, false);
+    }
+    void downloadAllocations(bool blockingWait) { downloadAllocations(blockingWait, this->latestFlushedTaskCount); };
+    virtual void downloadAllocations(bool blockingWait, TaskCountType taskCount) {};
+    virtual void removeDownloadAllocation(GraphicsAllocation *alloc) {};
 
     void setSamplerCacheFlushRequired(SamplerCacheFlushState value) { this->samplerCacheFlushRequired = value; }
 
@@ -205,16 +306,13 @@ class CommandStreamReceiver {
     void *getIndirectHeapCurrentPtr(IndirectHeapType heapType) const;
 
     virtual enum CommandStreamReceiverType getType() const = 0;
-    void setExperimentalCmdBuffer(std::unique_ptr<ExperimentalCommandBuffer> &&cmdBuffer);
 
     bool initializeTagAllocation();
     MOCKABLE_VIRTUAL bool createWorkPartitionAllocation(const Device &device);
     MOCKABLE_VIRTUAL bool createGlobalFenceAllocation();
     MOCKABLE_VIRTUAL bool createPreemptionAllocation();
-    MOCKABLE_VIRTUAL bool createPerDssBackedBuffer(Device &device);
-    virtual void createKernelArgsBufferAllocation() = 0;
     [[nodiscard]] MOCKABLE_VIRTUAL std::unique_lock<MutexType> obtainUniqueOwnership();
-
+    [[nodiscard]] MOCKABLE_VIRTUAL std::unique_lock<MutexType> tryObtainUniqueOwnership();
     bool peekTimestampPacketWriteEnabled() const { return timestampPacketWriteEnabled; }
 
     bool isLatestTaskCountFlushed() {
@@ -222,26 +320,49 @@ class CommandStreamReceiver {
     }
 
     size_t defaultSshSize = 0u;
-    bool canUse4GbHeaps = true;
 
     AllocationsList &getTemporaryAllocations();
     AllocationsList &getAllocationsForReuse();
     AllocationsList &getDeferredAllocations();
     InternalAllocationStorage *getInternalAllocationStorage() const { return internalAllocationStorage.get(); }
     MOCKABLE_VIRTUAL bool createAllocationForHostSurface(HostPtrSurface &surface, bool requiresL3Flush);
-    virtual size_t getPreferredTagPoolSize() const;
+    virtual uint32_t getPreferredTagPoolSize() const;
     virtual void fillReusableAllocationsList();
-    virtual void setupContext(OsContext &osContext) { this->osContext = &osContext; }
+    void releaseHeapAllocation(GraphicsAllocation *heapMemory);
+    void releaseCommandBufferAllocation(GraphicsAllocation *commandBufferMemory);
+    virtual void setupContext(OsContext &osContext);
+    void setDevice(Device *device) { this->device = device; }
+    Device *getDevice() const { return this->device; }
     OsContext &getOsContext() const { return *osContext; }
-    bool initializeResources();
+    uint8_t getUmdPowerHintValue() const;
+    bool initializeResources(const PreemptionMode preemptionMode);
     TagAllocatorBase *getEventTsAllocator();
     TagAllocatorBase *getEventPerfCountAllocator(const uint32_t tagSize);
     virtual TagAllocatorBase *getTimestampPacketAllocator() = 0;
-    virtual std::unique_ptr<TagAllocatorBase> createMultiRootDeviceTimestampPacketAllocator(const RootDeviceIndicesContainer rootDeviceIndices) = 0;
+    virtual std::unique_ptr<TagAllocatorBase> createMultiRootDeviceTimestampPacketAllocator(const RootDeviceIndicesContainer &rootDeviceIndices) = 0;
+    void setupTagAllocatorForSimulation(TagAllocatorBase &tagAllocator);
+    void writeAllocationChunkToSimulation(GraphicsAllocation &gfxAllocation, uint64_t chunkOffset, size_t chunkSize);
+    void writeBatchBufferToSimulation(const BatchBuffer &batchBuffer);
+    void writeStreamChunkToSimulation(LinearStream &stream, size_t chunkStartOffset);
+    void writeCommandBufferPatchToSimulation(GraphicsAllocation &commandBufferAllocation, const ResidencyContainer *candidateAllocations, const void *patchLocation, size_t patchSize);
+    void writeTagAllocationChunkToSimulation(TagNodeBase &tagNode, uint64_t tagOffset, size_t chunkSize);
+
+    virtual bool isChunkCopySupportedForSimulation() const { return false; }
+    virtual void setWritableForSimulation(bool, GraphicsAllocation &) {}
+    virtual bool isAubSubCaptureInactive() const { return false; }
 
     virtual bool expectMemory(const void *gfxAddress, const void *srcAddress, size_t length, uint32_t compareOperation);
+    MOCKABLE_VIRTUAL bool writeMemory(GraphicsAllocation &gfxAllocation) { return writeMemory(gfxAllocation, false, 0, 0); }
+    virtual bool writeMemory(GraphicsAllocation &gfxAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) { return false; }
+    virtual void writeMemoryAub(aub_stream::AllocationParams &allocationParams) {};
+    virtual void writePooledMemory(SharedPoolAllocation &sharedPoolAllocation, bool initFullPageTables) {};
+    virtual void initializeEngine() {};
 
     virtual bool isMultiOsContextCapable() const = 0;
+
+    bool isResidencyContainerDuplicateRemovalRequired() const {
+        return residencyContainerDuplicateRemovalRequired;
+    }
 
     virtual MemoryCompressionState getMemoryCompressionState(bool auxTranslationRequired) const = 0;
 
@@ -252,17 +373,48 @@ class CommandStreamReceiver {
         this->latestFlushedTaskCount = latestFlushedTaskCount;
     }
 
-    virtual TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, bool profilingEnabled, Device &device) = 0;
+    virtual TaskCountType flushBcsTask(const BlitPropertiesContainer &blitPropertiesContainer, bool blocking, Device &device) = 0;
 
     virtual SubmissionStatus flushTagUpdate() = 0;
     virtual void updateTagFromWait() = 0;
     virtual bool isUpdateTagFromWaitEnabled() = 0;
+    virtual void flushMonitorFence(bool notifyKmd) {};
+    virtual bool isTlbFlushRequiredForStateCacheFlush();
+
+    TaskCountType flushTagUpdateIfRequired() {
+        return flushTagUpdateIfRequired(this->peekTaskCount());
+    }
+
+    TaskCountType flushTagUpdateIfRequired(TaskCountType taskCountToWait) {
+        if (taskCountToWait > this->peekLatestFlushedTaskCount()) {
+            auto lock = this->obtainUniqueOwnership();
+            if (taskCountToWait > this->peekLatestFlushedTaskCount()) {
+                this->flushTagUpdate();
+            }
+        }
+        return this->peekLatestFlushedTaskCount();
+    }
 
     ScratchSpaceController *getScratchSpaceController() const {
         return scratchSpaceController.get();
     }
 
+    ScratchSpaceController *getPrimaryScratchSpaceController() const {
+        if (primaryCsr) {
+            return primaryCsr->getScratchSpaceController();
+        }
+        return getScratchSpaceController();
+    }
+
     void downloadAllocation(GraphicsAllocation &gfxAllocation);
+
+    bool isInstructionCacheFlushRequired() const {
+        return requiresInstructionCacheFlush;
+    }
+
+    void setInstructionCacheFlushed() {
+        requiresInstructionCacheFlush = false;
+    }
 
     void registerInstructionCacheFlush() {
         auto mutex = obtainUniqueOwnership();
@@ -273,9 +425,7 @@ class CommandStreamReceiver {
 
     uint32_t getRootDeviceIndex() const { return rootDeviceIndex; }
 
-    void startControllingDirectSubmissions();
-
-    bool isAnyDirectSubmissionEnabled() {
+    MOCKABLE_VIRTUAL bool isAnyDirectSubmissionEnabled() const {
         return this->isDirectSubmissionEnabled() || isBlitterDirectSubmissionEnabled();
     }
 
@@ -295,7 +445,17 @@ class CommandStreamReceiver {
         return false;
     }
 
-    virtual void stopDirectSubmission() {}
+    virtual uint32_t getDirectSubmissionRelaxedOrderingQueueDepth() const { return 0; }
+
+    virtual bool isKmdWaitOnTaskCountAllowed() const {
+        return false;
+    }
+
+    virtual void stopDirectSubmission(bool blocking, bool needsLock) {}
+    virtual void unregisterDirectSubmissionFromController() {};
+    virtual void resetDirectSubmission() {};
+
+    virtual QueueThrottle getLastDirectSubmissionThrottle() = 0;
 
     bool isStaticWorkPartitioningEnabled() const {
         return staticWorkPartitioningEnabled;
@@ -304,8 +464,6 @@ class CommandStreamReceiver {
     uint64_t getWorkPartitionAllocationGpuAddress() const;
 
     MOCKABLE_VIRTUAL bool isRcs() const;
-
-    virtual void initializeDefaultsForInternalEngine(){};
 
     virtual GraphicsAllocation *getClearColorAllocation() = 0;
 
@@ -335,8 +493,12 @@ class CommandStreamReceiver {
 
     std::unique_ptr<GmmPageTableMngr> pageTableManager;
 
-    inline uint32_t getPostSyncWriteOffset() const {
-        return postSyncWriteOffset;
+    inline uint32_t getImmWritePostSyncWriteOffset() const {
+        return immWritePostSyncWriteOffset;
+    }
+
+    inline uint32_t getTimeStampPostSyncWriteOffset() const {
+        return timeStampPostSyncWriteOffset;
     }
 
     inline bool isMultiTileOperationEnabled() const {
@@ -346,24 +508,26 @@ class CommandStreamReceiver {
     virtual void programComputeBarrierCommand(LinearStream &cmdStream) = 0;
     virtual size_t getCmdsSizeForComputeBarrierCommand() const = 0;
 
+    virtual void programStallingCommandsForBarrier(LinearStream &cmdStream, TimestampPacketContainer *barrierTimestampPacketNodes, const bool isDcFlushRequired) = 0;
+
     const HardwareInfo &peekHwInfo() const;
     const RootDeviceEnvironment &peekRootDeviceEnvironment() const;
 
     const GfxCoreHelper &getGfxCoreHelper() const;
     const ProductHelper &getProductHelper() const;
-    const ReleaseHelper *getReleaseHelper() const;
+    const ReleaseHelper &getReleaseHelper() const;
 
     MOCKABLE_VIRTUAL bool isGpuHangDetected() const;
     MOCKABLE_VIRTUAL bool checkGpuHangDetected(TimeType currentTime, TimeType &lastHangCheckTime) const;
 
     uint64_t getCompletionAddress() const;
 
+    bool isGpuHangCheckPeriodElapsed(int64_t elapsedTimeUs) const { return elapsedTimeUs >= this->gpuHangCheckPeriodUs; }
+
     TaskCountType getCompletionValue(const GraphicsAllocation &gfxAllocation);
     DispatchMode getDispatchMode() const {
         return this->dispatchMode;
     }
-
-    LogicalStateHelper *getLogicalStateHelper() const;
 
     bool getPreambleSetFlag() const {
         return isPreambleSent;
@@ -373,25 +537,50 @@ class CommandStreamReceiver {
         isPreambleSent = value;
     }
 
+    bool getSipSentFlag() const {
+        return isStateSipSent;
+    }
+
+    void setSipSentFlag(bool value) {
+        isStateSipSent = value;
+    }
+
     PreemptionMode getPreemptionMode() const {
+        if (primaryCsr) {
+            return primaryCsr->getPreemptionMode();
+        }
         return lastPreemptionMode;
     }
 
     void setPreemptionMode(PreemptionMode value) {
         lastPreemptionMode = value;
     }
+    bool csrSurfaceProgrammed() const {
+        return csrSurfaceProgrammingDone;
+    }
+    void setCsrSurfaceProgrammed(bool value) {
+        csrSurfaceProgrammingDone = value;
+    }
 
-    virtual SubmissionStatus initializeDeviceWithFirstSubmission() = 0;
+    virtual SubmissionStatus initializeDeviceWithFirstSubmission(Device &device) = 0;
 
     uint32_t getNumClients() const {
         return this->numClients.load();
     }
-    uint32_t registerClient() {
-        return this->numClients.fetch_add(1u);
+    void registerClient(void *client);
+    void unregisterClient(void *client);
+
+    void retainQueueOwnership() {
+        owningQueueCount.fetch_add(1);
     }
-    void unregisterClient() {
-        this->numClients--;
+    void releaseQueueOwnership() {
+        DEBUG_BREAK_IF(owningQueueCount.load() == 0u);
+        owningQueueCount.fetch_sub(1);
     }
+    uint32_t getOwningQueueCount() const {
+        return owningQueueCount.load();
+    }
+    TaskCountType getOutstandingWorkCount();
 
     bool getDcFlushSupport() const {
         return dcFlushSupport;
@@ -401,7 +590,13 @@ class CommandStreamReceiver {
         return externalCondition ? dcFlushSupport : false;
     }
 
+    bool getHeaplessModeEnabled() const {
+        return heaplessModeEnabled;
+    }
+
     bool isTbxMode() const;
+    bool isAubMode() const;
+    bool isHardwareMode() const;
     bool ensureTagAllocationForRootDeviceIndex(uint32_t rootDeviceIndex);
 
     L1CachePolicy *getStoredL1CachePolicy() {
@@ -409,38 +604,186 @@ class CommandStreamReceiver {
     }
     void createGlobalStatelessHeap();
     IndirectHeap *getGlobalStatelessHeap() {
+        if (primaryCsr) {
+            return primaryCsr->getGlobalStatelessHeap();
+        }
         return globalStatelessHeap.get();
     }
 
     bool isRecyclingTagForHeapStorageRequired() const { return heapStorageRequiresRecyclingTag; }
 
+    struct PendingSubmissionRequests {
+        bool ucResourceRequiresTagUpdate = false;
+        bool heapStorageRequiresRecyclingTag = false;
+        bool isWalkerWithProfilingEnqueued = false;
+    };
+    PendingSubmissionRequests peekPendingSubmissionRequests() const {
+        return {this->ucResourceRequiresTagUpdate, this->heapStorageRequiresRecyclingTag, this->isWalkerWithProfilingEnqueued};
+    }
+    void restorePendingSubmissionRequests(const PendingSubmissionRequests &requests) {
+        this->ucResourceRequiresTagUpdate |= requests.ucResourceRequiresTagUpdate;
+        this->heapStorageRequiresRecyclingTag |= requests.heapStorageRequiresRecyclingTag;
+        this->isWalkerWithProfilingEnqueued |= requests.isWalkerWithProfilingEnqueued;
+    }
+
+    virtual bool waitUserFenceSupported(SyncFence *syncFence) { return false; }
+    virtual bool isWaitUserFenceNotEqualSupported() { return false; }
+    virtual bool waitUserFence(TaskCountType waitValue, uint64_t hostAddress, int64_t timeout, bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait, SyncFence *userFence) { return false; }
+    virtual bool waitUserFence(UserFenceWaitOperation operation, uint64_t waitValue, uint64_t hostAddress, UserFenceValueWidth dataWidth, int64_t timeout, bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait, SyncFence *userFence) { return false; }
+    virtual void allocateUserFence(std::unique_ptr<SyncFence> &mf) {}
+    void setPrimaryCsr(CommandStreamReceiver *primaryCsr) {
+        this->primaryCsr = primaryCsr;
+    }
+    CommandStreamReceiver *getPrimaryCsr() const { return primaryCsr; }
+
+    void requestPreallocation();
+    void releasePreallocationRequest();
+    void preallocateAllocation(AllocationType type, size_t size);
+    void preallocateCommandBuffer();
+    void preallocateInternalHeap();
+
+    DeferredFreeContext createDeferredFreeContext() const;
+
+    bool isInitialized() const {
+        return this->resourcesInitialized;
+    }
+
+    MOCKABLE_VIRTUAL bool getAcLineConnected(bool updateStatus) const {
+        if (updateStatus) {
+            this->kmdNotifyHelper->updateAcLineStatus();
+        }
+        return this->kmdNotifyHelper->getAcLineConnected();
+    }
+
+    uint32_t getRequiredScratchSlot0Size() { return requiredScratchSlot0Size; }
+    uint32_t getRequiredScratchSlot1Size() { return requiredScratchSlot1Size; }
+    uint32_t getPerThreadScratchSizeSlot0Allocated() const;
+    virtual bool submitDependencyUpdate(TagNodeBase *tag) = 0;
+
+    MOCKABLE_VIRTUAL bool isBusy() {
+        return !testTaskCountReady(getTagAddress(), this->taskCount);
+    }
+
+    MOCKABLE_VIRTUAL bool isBusyWithoutHang(TimeType &lastHangCheckTime) {
+        return isBusy() && !this->checkGpuHangDetected(HostClock::getCurrentTimeInNs(), lastHangCheckTime);
+    }
+
+    bool canUse4GbHeaps() const {
+        return this->use4GbHeaps;
+    }
+
+    void ensurePrimaryCsrInitialized(Device &device);
+
+    bool enqueueWaitForPagingFence(uint64_t pagingFenceValue);
+    virtual void unblockPagingFenceSemaphore(uint64_t pagingFenceValue) {}
+    MOCKABLE_VIRTUAL void drainPagingFenceQueue();
+    bool isLatestFlushIsTaskCountUpdateOnly() const { return latestFlushIsTaskCountUpdateOnly; }
+
+    MOCKABLE_VIRTUAL uint32_t getContextGroupId() const;
+
+    MOCKABLE_VIRTUAL void signalHostFunctionWorker(uint32_t nHostFunctions);
+    void ensureHostFunctionWorkerStarted(HostFunctionAllocator *allocator);
+    void createHostFunctionStreamer(HostFunctionAllocator *allocator);
+    HostFunctionStreamer &getHostFunctionStreamer();
+
+    [[nodiscard]] std::unique_lock<MutexType> obtainHostFunctionWorkerStartLock();
+
+    void setHostFunctionWorker(HostFunctionWorker *hostFunctionWorker) {
+        this->hostFunctionWorker = hostFunctionWorker;
+    }
+
+    [[nodiscard]] std::unique_lock<MutexType> obtainHostAllocationLock();
+    void makeResidentHostFunctionAllocation();
+
+    virtual void submitLateMidThreadPreemptionStart() {}
+    bool isLateMidThreadPreemptionStartRequired(bool hasMidThreadPreemptionKernel) const {
+        return hasMidThreadPreemptionKernel && skipPreemptionAllocation;
+    }
+    size_t getCmdSizeForLateMidThreadPreemptionStart(bool hasMidThreadPreemptionKernel) const {
+        return isLateMidThreadPreemptionStartRequired(hasMidThreadPreemptionKernel) ? lateMidThreadPreemptionStartCmdSize : 0;
+    }
+    void programLateMidThreadPreemptionStart(LinearStream &cmdStream, bool hasMidThreadPreemptionKernel) {
+        if (isLateMidThreadPreemptionStartRequired(hasMidThreadPreemptionKernel)) {
+            dispatchLateMidThreadPreemptionStart(cmdStream);
+            skipPreemptionAllocation = false;
+            lateMidThreadPreemptionStartSubmissionPending = true;
+        }
+    }
+    bool isMidThreadPreemptionStateDeferred() const;
+    bool isMidThreadPreemptionStateProgrammingRequired(bool hasMidThreadPreemptionKernel) const {
+        return hasMidThreadPreemptionKernel && isMidThreadPreemptionStateDeferred();
+    }
+    bool isStateSipProgrammingRequired() const {
+        return !isStateSipSent && !isMidThreadPreemptionStateDeferred();
+    }
+    void handleLateMidThreadPreemptionStartSubmission(SubmissionStatus submissionStatus) {
+        if (lateMidThreadPreemptionStartSubmissionPending) {
+            lateMidThreadPreemptionStartSubmissionPending = false;
+            skipPreemptionAllocation = submissionStatus != SubmissionStatus::success;
+        }
+    }
+
+    void initializeResourcesAndDirectSubmission(const PreemptionMode preemptionMode) {
+        this->initializeResources(preemptionMode);
+        this->fillReusableAllocationsList();
+        this->initDirectSubmission();
+    }
+
+    bool isExternalSemaphoreGpuWaitAllowed() const { return externalSemaphoreGpuWaitAllowed; }
+    virtual bool submitExternalSemaphoreWaits(std::span<const ExternalSemaphoreOperation> waits) { return false; }
+
   protected:
+    MOCKABLE_VIRTUAL void startHostFunctionWorker(HostFunctionAllocator *allocator);
+    virtual void dispatchLateMidThreadPreemptionStart(LinearStream &cmdStream) = 0;
+
+    virtual CompletionStamp flushTaskHeapless(LinearStream &commandStreamTask, size_t commandStreamTaskStart,
+                                              const IndirectHeap *dsh, const IndirectHeap *ioh, const IndirectHeap *ssh,
+                                              TaskCountType taskLevel, DispatchFlags &dispatchFlags, Device &device) = 0;
+
+    virtual CompletionStamp flushTaskHeapful(LinearStream &commandStreamTask, size_t commandStreamTaskStart,
+                                             const IndirectHeap *dsh, const IndirectHeap *ioh, const IndirectHeap *ssh,
+                                             TaskCountType taskLevel, DispatchFlags &dispatchFlags, Device &device) = 0;
+
     void cleanupResources();
+    void releaseGlobalStatelessHeap();
+    void cleanupHostFunctionWorker();
     void printDeviceIndex();
     void checkForNewResources(TaskCountType submittedTaskCount, TaskCountType allocationTaskCount, GraphicsAllocation &gfxAllocation);
     bool checkImplicitFlushForGpuIdle();
+    MOCKABLE_VIRTUAL bool getAndClearIsWalkerWithProfilingEnqueued();
     void downloadTagAllocation(TaskCountType taskCountToWait);
     void printTagAddressContent(TaskCountType taskCountToWait, int64_t waitTimeout, bool start);
+    virtual void addToEvictionContainer(GraphicsAllocation &gfxAllocation);
+
     [[nodiscard]] MOCKABLE_VIRTUAL std::unique_lock<MutexType> obtainHostPtrSurfaceCreationLock();
+
+    std::vector<void *> registeredClients;
 
     std::unique_ptr<FlushStampTracker> flushStamp;
     std::unique_ptr<SubmissionAggregator> submissionAggregator;
     std::unique_ptr<FlatBatchBufferHelper> flatBatchBufferHelper;
-    std::unique_ptr<ExperimentalCommandBuffer> experimentalCmdBuffer;
     std::unique_ptr<InternalAllocationStorage> internalAllocationStorage;
+    std::atomic<uint32_t> preallocatedAmount{0};
+    std::atomic<uint32_t> requestedPreallocationsAmount{0};
+
     std::unique_ptr<KmdNotifyHelper> kmdNotifyHelper;
     std::unique_ptr<ScratchSpaceController> scratchSpaceController;
     std::unique_ptr<TagAllocatorBase> profilingTimeStampAllocator;
     std::unique_ptr<TagAllocatorBase> perfCounterAllocator;
     std::unique_ptr<TagAllocatorBase> timestampPacketAllocator;
     std::unique_ptr<Thread> userPauseConfirmation;
-    std::unique_ptr<LogicalStateHelper> logicalStateHelper;
     std::unique_ptr<IndirectHeap> globalStatelessHeap;
+    std::unique_ptr<HostFunctionStreamer> hostFunctionStreamer;
+    HostFunctionWorker *hostFunctionWorker = nullptr;
 
     ResidencyContainer residencyAllocations;
-    ResidencyContainer evictionAllocations;
+    PrivateAllocsToReuseContainer ownedPrivateAllocations;
+
     MutexType ownershipMutex;
     MutexType hostPtrSurfaceCreationMutex;
+    MutexType registeredClientsMutex;
+    MutexType hostFunctionWorkerStartMutex;
+    MutexType hostAllocationMutex;
     ExecutionEnvironment &executionEnvironment;
 
     LinearStream commandStream;
@@ -451,29 +794,32 @@ class CommandStreamReceiver {
     L1CachePolicy l1CachePolicyData{};
 
     uint64_t totalMemoryUsed = 0u;
+    size_t lateMidThreadPreemptionStartCmdSize = 0;
 
     volatile TagAddressType *tagAddress = nullptr;
+    volatile TagAddressType *ucTagAddress = nullptr;
     volatile TagAddressType *barrierCountTagAddress = nullptr;
     volatile DebugPauseState *debugPauseStateAddress = nullptr;
     SpinLock debugPauseStateLock;
     static void *asyncDebugBreakConfirmation(void *arg);
-    static std::function<void()> debugConfirmationFunction;
-    std::function<void(GraphicsAllocation &)> downloadAllocationImpl;
+    std::function<void()> debugConfirmationFunction;
+    std::function<void(GraphicsAllocation &, uint64_t offset, size_t size)> downloadAllocationImpl;
+    std::function<void(GraphicsAllocation &, uint64_t offset, size_t size)> uploadAllocationChunkImpl;
 
     GraphicsAllocation *tagAllocation = nullptr;
     GraphicsAllocation *globalFenceAllocation = nullptr;
     GraphicsAllocation *preemptionAllocation = nullptr;
     GraphicsAllocation *debugSurface = nullptr;
-    GraphicsAllocation *perDssBackedBuffer = nullptr;
     GraphicsAllocation *clearColorAllocation = nullptr;
     GraphicsAllocation *workPartitionAllocation = nullptr;
-    GraphicsAllocation *kernelArgsBufferAllocation = nullptr;
     GraphicsAllocation *globalStatelessHeapAllocation = nullptr;
-
+    GraphicsAllocation *frontEndAllocation = nullptr;
     MultiGraphicsAllocation *tagsMultiAllocation = nullptr;
 
-    IndirectHeap *indirectHeap[IndirectHeapType::NUM_TYPES];
+    IndirectHeap *indirectHeap[IndirectHeapType::numTypes];
     OsContext *osContext = nullptr;
+    Device *device = nullptr;
+    CommandStreamReceiver *primaryCsr = nullptr;
     TaskCountType *completionFenceValuePointer = nullptr;
 
     std::atomic<TaskCountType> barrierCount{0};
@@ -483,41 +829,46 @@ class CommandStreamReceiver {
     std::atomic<TaskCountType> latestFlushedTaskCount{0};
     // taskCount - # of tasks submitted
     std::atomic<TaskCountType> taskCount{0};
+    TaskCountType latestTaskCountUpdateOnlyFlushTaskCount = 0;
 
     std::atomic<uint32_t> numClients = 0u;
-
-    DispatchMode dispatchMode = DispatchMode::ImmediateDispatch;
+    std::atomic<uint32_t> owningQueueCount = 0u;
+    DispatchMode dispatchMode = DispatchMode::immediateDispatch;
     SamplerCacheFlushState samplerCacheFlushRequired = SamplerCacheFlushState::samplerCacheFlushNotRequired;
     PreemptionMode lastPreemptionMode = PreemptionMode::Initial;
 
-    std::chrono::microseconds gpuHangCheckPeriod{500'000};
-    uint32_t lastSentL3Config = 0;
-    uint32_t latestSentStatelessMocsConfig = 0;
-    uint64_t lastSentSliceCount = QueueSliceCount::defaultSliceCount;
-
-    uint32_t requiredScratchSize = 0;
-    uint32_t requiredPrivateScratchSize = 0;
-    uint32_t lastAdditionalKernelExecInfo = AdditionalKernelExecInfo::NotSet;
-    KernelExecutionType lastKernelExecutionType = KernelExecutionType::Default;
-    MemoryCompressionState lastMemoryCompressionState = MemoryCompressionState::NotApplicable;
+    int64_t gpuHangCheckPeriodUs{CommonConstants::gpuHangCheckTimeInUS};
+    uint32_t latestSentStatelessMocsConfig;
+    uint64_t lastSentSliceCount;
+    HostFunctionWorkerMode hostFunctionWorkerMode = HostFunctionWorkerMode::countingSemaphore;
+    uint32_t requiredScratchSlot0Size = 0;
+    uint32_t requiredScratchSlot1Size = 0;
+    uint32_t lastAdditionalKernelExecInfo;
+    KernelExecutionType lastKernelExecutionType = KernelExecutionType::defaultType;
+    MemoryCompressionState lastMemoryCompressionState = MemoryCompressionState::notApplicable;
     uint32_t activePartitions = 1;
     uint32_t activePartitionsConfig = 1;
-    uint32_t postSyncWriteOffset = 0;
+    uint32_t immWritePostSyncWriteOffset = 0;
+    uint32_t timeStampPostSyncWriteOffset = 0;
     TaskCountType completionFenceValue = 0;
-
     const uint32_t rootDeviceIndex;
     const DeviceBitfield deviceBitfield;
-
-    int8_t lastMediaSamplerConfig = -1;
-
+    std::atomic<bool> hostFunctionWorkerStarted = false;
+    std::once_flag preallocateResourcesFlag;
     bool isPreambleSent = false;
     bool isStateSipSent = false;
+    bool skipPreemptionAllocation = false;
+    bool midThreadPreemptionAllocationOnDemand = false;
+    bool lateMidThreadPreemptionStartSubmissionPending = false;
     bool isEnginePrologueSent = false;
+    bool areExceptionsSent = false;
     bool isPerDssBackedBufferSent = false;
+    bool isWalkerWithProfilingEnqueued = false;
     bool gsbaFor32BitProgrammed = false;
     bool gsbaStateDirty = true;
     bool bindingTableBaseAddressRequired = false;
     bool heapStorageRequiresRecyclingTag = false;
+    bool ucResourceRequiresTagUpdate = false;
     bool mediaVfeStateDirty = true;
     bool stateComputeModeDirty = true;
     bool btdCommandDirty = true;
@@ -527,20 +878,32 @@ class CommandStreamReceiver {
     bool nTo1SubmissionModelEnabled = false;
     bool lastSystolicPipelineSelectMode = false;
     bool requiresInstructionCacheFlush = false;
+    bool requiresDcFlush = false;
+    bool pushAllocationsForMakeResident = true;
 
     bool localMemoryEnabled = false;
     bool pageTableManagerInitialized = false;
+    bool pageTableManagerRegistersSubmissionPending = false;
 
     bool useNewResourceImplicitFlush = false;
     bool newResources = false;
     bool useGpuIdleImplicitFlush = false;
-    bool lastSentUseGlobalAtomics = false;
     bool useNotifyEnableForPostSync = false;
     bool dcFlushSupport = false;
     bool forceSkipResourceCleanupRequired = false;
-    volatile bool resourcesInitialized = false;
+    bool resourcesInitialized = false;
+    bool heaplessPrologProgrammed = false;
     bool doubleSbaWa = false;
+    bool dshSupported = false;
+    bool heaplessModeEnabled = false;
+    bool use4GbHeaps = true;
+    bool csrSurfaceProgrammingDone = false;
+    bool latestFlushIsTaskCountUpdateOnly = false;
+    bool residencyContainerDuplicateRemovalRequired = false;
+    bool externalSemaphoreGpuWaitAllowed = false;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<CommandStreamReceiver>);
 
 typedef CommandStreamReceiver *(*CommandStreamReceiverCreateFunc)(bool withAubDump,
                                                                   ExecutionEnvironment &executionEnvironment,

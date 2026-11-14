@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
+#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/memory_manager/allocation_properties.h"
@@ -18,9 +19,7 @@
 #include "shared/source/os_interface/os_library.h"
 
 #include "level_zero/core/source/cmdlist/cmdlist.h"
-#include "level_zero/core/source/cmdlist/cmdlist_imp.h"
 #include "level_zero/core/source/device/device.h"
-#include "level_zero/core/source/device/device_imp.h"
 #include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/tools/source/metrics/metric_oa_enumeration_imp.h"
 #include "level_zero/tools/source/metrics/metric_oa_source.h"
@@ -51,18 +50,21 @@ bool MetricsLibrary::isInitialized() {
 
 uint32_t MetricsLibrary::getQueryReportGpuSize() {
 
+    if (!this->isInitialized()) {
+        DEBUG_BREAK_IF(true);
+        return 0;
+    }
+
     TypedValue_1_0 gpuReportSize = {};
 
     // Obtain gpu report size.
-    if (!isInitialized() ||
-        api.GetParameter(ParameterType::QueryHwCountersReportGpuSize, &gpuReportSize.Type, &gpuReportSize) != StatusCode::Success) {
-
-        DEBUG_BREAK_IF(true);
+    if (!this->callMdapi("GetParameter QueryHwCountersReportGpuSize", this->api.GetParameter, ParameterType::QueryHwCountersReportGpuSize, &gpuReportSize.Type, &gpuReportSize)) {
         return 0;
     }
 
     // Validate gpu report size.
     if (!gpuReportSize.ValueUInt32) {
+        METRICS_LOG_ERR("%s", "MDAPI GetParameter QueryHwCountersReportGpuSize returned an invalid report size of 0");
         DEBUG_BREAK_IF(true);
         return 0;
     }
@@ -87,8 +89,7 @@ bool MetricsLibrary::createMetricQuery(const uint32_t slotsCount, QueryHandle_1_
     queryData.Slots = slotsCount;
 
     // Create query pool within metrics library.
-    if (api.QueryCreate(&queryData, &query) != StatusCode::Success) {
-        DEBUG_BREAK_IF(true);
+    if (!this->callMdapi("QueryCreate", this->api.QueryCreate, &queryData, &query)) {
         return false;
     }
 
@@ -107,7 +108,7 @@ bool MetricsLibrary::destroyMetricQuery(QueryHandle_1_0 &query) {
     std::lock_guard<std::mutex> lock(mutex);
     DEBUG_BREAK_IF(!query.IsValid());
 
-    const bool result = isInitialized() && (api.QueryDelete(query) == StatusCode::Success);
+    const bool result = this->isInitialized() && this->callMdapi("QueryDelete", this->api.QueryDelete, query);
     auto iter = std::find_if(queries.begin(), queries.end(), [&](const QueryHandle_1_0 &element) { return element.data == query.data; });
 
     // Unregister query.
@@ -122,14 +123,25 @@ bool MetricsLibrary::getMetricQueryReportSize(size_t &rawDataSize) {
     ValueType valueType = ValueType::Last;
     TypedValue_1_0 value = {};
 
-    const bool result = isInitialized() && (api.GetParameter(ParameterType::QueryHwCountersReportApiSize, &valueType, &value) == StatusCode::Success);
+    rawDataSize = 0;
+    if (!this->isInitialized()) {
+        DEBUG_BREAK_IF(true);
+        return false;
+    }
+
+    const bool result = this->callMdapi("GetParameter QueryHwCountersReportApiSize", this->api.GetParameter, ParameterType::QueryHwCountersReportApiSize, &valueType, &value);
     rawDataSize = static_cast<size_t>(value.ValueUInt32);
-    DEBUG_BREAK_IF(!result);
+
     return result;
 }
 
 bool MetricsLibrary::getMetricQueryReport(QueryHandle_1_0 &query, const uint32_t slot,
                                           const size_t rawDataSize, uint8_t *pData) {
+
+    if (!this->isInitialized()) {
+        DEBUG_BREAK_IF(true);
+        return false;
+    }
 
     GetReportData_1_0 report = {};
     report.Type = ObjectType::QueryHwCounters;
@@ -139,9 +151,7 @@ bool MetricsLibrary::getMetricQueryReport(QueryHandle_1_0 &query, const uint32_t
     report.Query.Data = pData;
     report.Query.DataSize = static_cast<uint32_t>(rawDataSize);
 
-    const bool result = isInitialized() && (api.GetData(&report) == StatusCode::Success);
-    DEBUG_BREAK_IF(!result);
-    return result;
+    return this->callMdapi("GetData QueryHwCounters", this->api.GetData, &report);
 }
 
 void MetricsLibrary::initialize() {
@@ -178,7 +188,7 @@ void MetricsLibrary::release() {
 
 bool MetricsLibrary::load() {
     // Load library.
-    handle = OaMetricSourceImp::osLibraryLoadFunction(getFilename());
+    handle.reset(NEO::OsLibrary::loadFunc({getFilename()}));
 
     // Load exported functions.
     if (handle) {
@@ -189,7 +199,7 @@ bool MetricsLibrary::load() {
     }
 
     if (contextCreateFunction == nullptr || contextDeleteFunction == nullptr) {
-        PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "cannot load %s exported functions\n", MetricsLibrary::getFilename());
+        METRICS_LOG_ERR("cannot load %s exported functions", MetricsLibrary::getFilename());
         return false;
     }
 
@@ -207,19 +217,31 @@ void MetricsLibrary::getSubDeviceClientOptions(
     ClientOptionsData_1_0 &subDeviceCount,
     ClientOptionsData_1_0 &workloadPartition) {
 
-    auto &deviceImp = *static_cast<DeviceImp *>(&metricSource.getDevice());
+    auto &device = metricSource.getDevice();
 
-    if (!deviceImp.isSubdevice) {
+    std::tuple<uint32_t, uint32_t, uint32_t> subDeviceMap;
+    uint32_t hwSubDeviceIndex = 0u;
+    uint32_t hwSubDevicesCount = 0u;
+    bool requiresSubDeviceHierarchy = false;
+    bool isSubDevice = device.isSubdevice;
+    if (device.getNEODevice()->getExecutionEnvironment()->getSubDeviceHierarchy(device.getNEODevice()->getRootDeviceIndex(), &subDeviceMap)) {
+        hwSubDeviceIndex = std::get<1>(subDeviceMap);
+        hwSubDevicesCount = std::get<2>(subDeviceMap);
+        requiresSubDeviceHierarchy = true;
+        isSubDevice = true;
+    }
+
+    if (!isSubDevice) {
 
         // Root device.
         subDevice.Type = ClientOptionsType::SubDevice;
         subDevice.SubDevice.Enabled = false;
 
         subDeviceIndex.Type = ClientOptionsType::SubDeviceIndex;
-        subDeviceIndex.SubDeviceIndex.Index = static_cast<uint8_t>(deviceImp.getPhysicalSubDeviceId());
+        subDeviceIndex.SubDeviceIndex.Index = static_cast<uint8_t>(device.getPhysicalSubDeviceId());
 
         subDeviceCount.Type = ClientOptionsType::SubDeviceCount;
-        subDeviceCount.SubDeviceCount.Count = std::max(deviceImp.getNEODevice()->getRootDevice()->getNumSubDevices(), 1u);
+        subDeviceCount.SubDeviceCount.Count = std::max(device.getNEODevice()->getRootDevice()->getNumSubDevices(), 1u);
 
         workloadPartition.Type = ClientOptionsType::WorkloadPartition;
         workloadPartition.WorkloadPartition.Enabled = false;
@@ -231,10 +253,18 @@ void MetricsLibrary::getSubDeviceClientOptions(
         subDevice.SubDevice.Enabled = true;
 
         subDeviceIndex.Type = ClientOptionsType::SubDeviceIndex;
-        subDeviceIndex.SubDeviceIndex.Index = static_cast<uint8_t>(deviceImp.getPhysicalSubDeviceId());
+        if (requiresSubDeviceHierarchy) {
+            subDeviceIndex.SubDeviceIndex.Index = hwSubDeviceIndex;
+        } else {
+            subDeviceIndex.SubDeviceIndex.Index = static_cast<uint8_t>(device.getPhysicalSubDeviceId());
+        }
 
         subDeviceCount.Type = ClientOptionsType::SubDeviceCount;
-        subDeviceCount.SubDeviceCount.Count = std::max(deviceImp.getNEODevice()->getRootDevice()->getNumSubDevices(), 1u);
+        if (requiresSubDeviceHierarchy) {
+            subDeviceCount.SubDeviceCount.Count = hwSubDevicesCount;
+        } else {
+            subDeviceCount.SubDeviceCount.Count = std::max(device.getNEODevice()->getRootDevice()->getNumSubDevices(), 1u);
+        }
 
         workloadPartition.Type = ClientOptionsType::WorkloadPartition;
         workloadPartition.WorkloadPartition.Enabled = isWorkloadPartitionEnabled;
@@ -256,8 +286,7 @@ bool MetricsLibrary::createContext() {
         return engine.first == aub_stream::ENGINE_CCS;
     });
 
-    const auto &deviceImp = *static_cast<DeviceImp *>(&device);
-    const auto &commandStreamReceiver = *deviceImp.getNEODevice()->getDefaultEngine().commandStreamReceiver;
+    const auto &commandStreamReceiver = *device.getNEODevice()->getDefaultEngine().commandStreamReceiver;
     const auto engineType = commandStreamReceiver.getOsContext().getEngineType();
     const bool isComputeUsed = NEO::EngineHelpers::isCcs(engineType);
 
@@ -300,25 +329,27 @@ ClientGen MetricsLibrary::getGenType(const NEO::GfxCoreHelper &gfxCoreHelper) co
 uint32_t MetricsLibrary::getGpuCommandsSize(CommandBufferData_1_0 &commandBuffer) {
     CommandBufferSize_1_0 commandBufferSize = {};
 
-    bool result = isInitialized();
-
-    // Validate metrics library initialization state.
-    if (result) {
-        commandBuffer.HandleContext = context;
-        result = api.CommandBufferGetSize(&commandBuffer, &commandBufferSize) == StatusCode::Success;
+    if (!this->isInitialized()) {
+        DEBUG_BREAK_IF(true);
+        return 0;
     }
 
-    DEBUG_BREAK_IF(!result);
+    // Validate metrics library initialization state.
+    commandBuffer.HandleContext = context;
+    const bool result = this->callMdapi("CommandBufferGetSize", this->api.CommandBufferGetSize, &commandBuffer, &commandBufferSize);
+
     return result ? commandBufferSize.GpuMemorySize : 0;
 }
 
 bool MetricsLibrary::getGpuCommands(CommandBufferData_1_0 &commandBuffer) {
 
+    if (!this->isInitialized()) {
+        DEBUG_BREAK_IF(true);
+        return false;
+    }
+
     // Obtain gpu commands from metrics library.
-    const bool result =
-        isInitialized() && (api.CommandBufferGet(&commandBuffer) == StatusCode::Success);
-    DEBUG_BREAK_IF(!result);
-    return result;
+    return this->callMdapi("CommandBufferGet", this->api.CommandBufferGet, &commandBuffer);
 }
 
 bool MetricsLibrary::getGpuCommands(CommandList &commandList,
@@ -340,11 +371,7 @@ bool MetricsLibrary::getGpuCommands(CommandList &commandList,
     // Fill attached command buffer with gpu commands.
     commandBuffer.Data = buffer;
 
-    // Obtain gpu commands from metrics library.
-    const bool result =
-        isInitialized() && (api.CommandBufferGet(&commandBuffer) == StatusCode::Success);
-    DEBUG_BREAK_IF(!result);
-    return result;
+    return this->getGpuCommands(commandBuffer);
 }
 
 ConfigurationHandle_1_0
@@ -373,7 +400,7 @@ MetricsLibrary::createConfiguration(const zet_metric_group_handle_t metricGroupH
         handleData.Type = ObjectType::ConfigurationHwCountersOa;
 
         // Use metrics library to create configuration for the activated metric group.
-        api.ConfigurationCreate(&handleData, &handle);
+        this->callMdapi("ConfigurationCreate", this->api.ConfigurationCreate, &handleData, &handle);
 
         // Use metrics discovery to deactivate metric group.
         metricGroup->deactivateMetricSet();
@@ -397,7 +424,8 @@ ConfigurationHandle_1_0 MetricsLibrary::addConfiguration(zet_metric_group_handle
 
     // Create metrics library configuration.
     auto metricGroup = MetricGroup::fromHandle(handle);
-    auto properties = OaMetricGroupImp::getProperties(handle);
+    zet_metric_group_properties_t properties = {ZET_STRUCTURE_TYPE_METRIC_GROUP_PROPERTIES, nullptr};
+    OaMetricGroupImp::getProperties(handle, &properties);
     auto configuration = createConfiguration(metricGroup, properties);
 
     // Cache configuration if valid.
@@ -415,7 +443,7 @@ void MetricsLibrary::deleteAllConfigurations() {
     if (api.ConfigurationDelete) {
         for (auto &configuration : configurations) {
             if (configuration.second.IsValid()) {
-                api.ConfigurationDelete(configuration.second);
+                this->callMdapi("ConfigurationDelete", this->api.ConfigurationDelete, configuration.second);
             }
         }
     }
@@ -444,24 +472,23 @@ ze_result_t OaMetricQueryPoolImp::metricQueryPoolCreate(zet_context_handle_t hCo
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
-    const auto &deviceImp = *static_cast<DeviceImp *>(device);
     auto metricPoolImp = new OaMetricQueryPoolImp(metricSource, hMetricGroup, *pDesc);
 
     if (metricSource.isImplicitScalingCapable()) {
 
-        auto emptyMetricGroups = std::vector<zet_metric_group_handle_t>();
+        auto emptyMetricGroups = std::vector<MetricGroupImp *>();
 
-        auto &metricGroups = hMetricGroup
-                                 ? static_cast<OaMetricGroupImp *>(MetricGroup::fromHandle(hMetricGroup))->getMetricGroups()
-                                 : emptyMetricGroups;
+        auto metricGroups = hMetricGroup
+                                ? static_cast<OaMetricGroupImp *>(MetricGroup::fromHandle(hMetricGroup))->getMetricGroups()
+                                : emptyMetricGroups;
 
         const bool useMetricGroupSubDevice = metricGroups.size() > 0;
 
         auto &metricPools = metricPoolImp->getMetricQueryPools();
 
-        for (size_t i = 0; i < deviceImp.numSubDevices; ++i) {
+        for (size_t i = 0; i < device->numSubDevices; ++i) {
 
-            auto &subDevice = deviceImp.subDevices[i];
+            auto &subDevice = device->subDevices[i];
             auto &subDeviceMetricSource = subDevice->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
 
             zet_metric_group_handle_t metricGroupHandle = useMetricGroupSubDevice
@@ -477,7 +504,7 @@ ze_result_t OaMetricQueryPoolImp::metricQueryPoolCreate(zet_context_handle_t hCo
                 metricPoolSubdeviceImp = nullptr;
                 metricPoolImp = nullptr;
                 *phMetricQueryPool = nullptr;
-                return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+                return ZE_RESULT_ERROR_UNKNOWN;
             }
 
             metricPools.push_back(metricPoolSubdeviceImp);
@@ -490,7 +517,7 @@ ze_result_t OaMetricQueryPoolImp::metricQueryPoolCreate(zet_context_handle_t hCo
             metricPoolImp->destroy();
             metricPoolImp = nullptr;
             *phMetricQueryPool = nullptr;
-            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+            return ZE_RESULT_ERROR_UNKNOWN;
         }
     }
 
@@ -499,7 +526,7 @@ ze_result_t OaMetricQueryPoolImp::metricQueryPoolCreate(zet_context_handle_t hCo
         metricPoolImp->destroy();
         metricPoolImp = nullptr;
         *phMetricQueryPool = nullptr;
-        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        return ZE_RESULT_ERROR_UNKNOWN;
     }
 
     *phMetricQueryPool = metricPoolImp;
@@ -564,7 +591,7 @@ ze_result_t OaMetricQueryPoolImp::destroy() {
 
     // Check open queries.
     if (metricSource.getMetricsLibrary().getMetricQueryCount() == 0) {
-        if (!metricSource.isMetricGroupActivated()) {
+        if (!metricSource.isMetricGroupActivatedInHw()) {
             metricSource.getMetricsLibrary().release();
         }
     }
@@ -578,19 +605,20 @@ bool OaMetricQueryPoolImp::allocateGpuMemory() {
 
     if (description.type == ZET_METRIC_QUERY_POOL_TYPE_PERFORMANCE) {
         // Get allocation size.
-        const auto &deviceImp = *static_cast<DeviceImp *>(&metricSource.getDevice());
+        auto &device = metricSource.getDevice();
 
         allocationSize = (metricSource.isImplicitScalingCapable())
-                             ? deviceImp.subDevices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>().getMetricsLibrary().getQueryReportGpuSize() * description.count * deviceImp.numSubDevices
+                             ? device.subDevices[0]->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>().getMetricsLibrary().getQueryReportGpuSize() * description.count * device.numSubDevices
                              : metricsLibrary.getQueryReportGpuSize() * description.count;
 
         if (allocationSize == 0) {
+            METRICS_LOG_ERR("%s", "Failed to get allocation size for metric query pool.");
             return false;
         }
 
         // Allocate gpu memory.
         NEO::AllocationProperties properties(
-            metricSource.getDevice().getRootDeviceIndex(), allocationSize, NEO::AllocationType::BUFFER_HOST_MEMORY, metricSource.getDevice().getNEODevice()->getDeviceBitfield());
+            metricSource.getDevice().getRootDeviceIndex(), allocationSize, NEO::AllocationType::bufferHostMemory, metricSource.getDevice().getNEODevice()->getDeviceBitfield());
         properties.alignment = 64u;
         pAllocation = metricSource.getDevice().getDriverHandle()->getMemoryManager()->allocateGraphicsMemoryWithProperties(properties);
 
@@ -604,17 +632,19 @@ bool OaMetricQueryPoolImp::allocateGpuMemory() {
 
 bool OaMetricQueryPoolImp::createMetricQueryPool() {
     // Validate metric group query - only event based is supported.
-    auto metricGroupProperites = OaMetricGroupImp::getProperties(hMetricGroup);
-    const bool validMetricGroup = metricGroupProperites.samplingType == ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED;
+    zet_metric_group_properties_t metricGroupProperties = {ZET_STRUCTURE_TYPE_METRIC_GROUP_PROPERTIES, nullptr};
+    OaMetricGroupImp::getProperties(hMetricGroup, &metricGroupProperties);
+    const bool validMetricGroup = metricGroupProperties.samplingType == ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED;
 
     if (!validMetricGroup) {
+        METRICS_LOG_ERR("%s", "Invalid metric group: only event based sampling is supported.");
         return false;
     }
 
     // Pool initialization.
     pool.reserve(description.count);
     for (uint32_t i = 0; i < description.count; ++i) {
-        pool.push_back({metricSource, *this, i});
+        pool.emplace_back(metricSource, *this, i);
     }
 
     // Metrics library query object initialization.
@@ -625,7 +655,7 @@ bool OaMetricQueryPoolImp::createSkipExecutionQueryPool() {
 
     pool.reserve(description.count);
     for (uint32_t i = 0; i < description.count; ++i) {
-        pool.push_back({metricSource, *this, i});
+        pool.emplace_back(metricSource, *this, i);
     }
 
     return true;
@@ -710,7 +740,7 @@ ze_result_t OaMetricQueryImp::getData(size_t *pRawDataSize, uint8_t *pRawData) {
 
         if (calculateSizeOnly) {
 
-            const size_t headerSize = sizeof(MetricGroupCalculateHeader);
+            const size_t headerSize = sizeof(OaMetricGroupCalculateHeader);
             const size_t rawDataOffsetsRequiredSize = sizeof(uint32_t) * metricQueriesSize;
             const size_t rawDataSizesRequiredSize = sizeof(uint32_t) * metricQueriesSize;
 
@@ -723,12 +753,12 @@ ze_result_t OaMetricQueryImp::getData(size_t *pRawDataSize, uint8_t *pRawData) {
 
         } else {
 
-            MetricGroupCalculateHeader *pRawDataHeader = reinterpret_cast<MetricGroupCalculateHeader *>(pRawData);
-            pRawDataHeader->magic = MetricGroupCalculateHeader::magicValue;
+            OaMetricGroupCalculateHeader *pRawDataHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(pRawData);
+            pRawDataHeader->magic = OaMetricGroupCalculateHeader::magicValue;
             pRawDataHeader->dataCount = static_cast<uint32_t>(metricQueriesSize);
 
             // Relative offsets in the header allow to move/copy the buffer.
-            pRawDataHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+            pRawDataHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
             pRawDataHeader->rawDataSizes = static_cast<uint32_t>(pRawDataHeader->rawDataOffsets + (sizeof(uint32_t) * metricQueriesSize));
             pRawDataHeader->rawDataOffset = static_cast<uint32_t>(pRawDataHeader->rawDataSizes + (sizeof(uint32_t) * metricQueriesSize));
 
@@ -796,12 +826,20 @@ ze_result_t OaMetricQueryImp::writeMetricQuery(CommandList &commandList, ze_even
     commandList.getCmdContainer().addToResidencyContainer(pool.pAllocation);
 
     // Wait for events before executing query.
-    commandList.appendWaitOnEvents(numWaitEvents, phWaitEvents, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    commandList.appendWaitOnEvents(numWaitEvents, phWaitEvents, waitEventsParameters);
 
     if (metricQueriesSize) {
 
         const size_t allocationSizeForSubDevice = pool.allocationSize / metricQueriesSize;
-        static_cast<CommandListImp &>(commandList).appendMultiPartitionPrologue(static_cast<uint32_t>(allocationSizeForSubDevice));
+        commandList.appendMultiPartitionPrologue(static_cast<uint32_t>(allocationSizeForSubDevice));
         void *buffer = nullptr;
         bool gpuCommandStatus = true;
 
@@ -853,7 +891,7 @@ ze_result_t OaMetricQueryImp::writeMetricQuery(CommandList &commandList, ze_even
                 break;
             }
         }
-        static_cast<CommandListImp &>(commandList).appendMultiPartitionEpilogue();
+        commandList.appendMultiPartitionEpilogue();
         if (!gpuCommandStatus) {
             return ZE_RESULT_ERROR_UNKNOWN;
         }
@@ -878,7 +916,10 @@ ze_result_t OaMetricQueryImp::writeMetricQuery(CommandList &commandList, ze_even
 
     // Write completion event.
     if (result && writeCompletionEvent) {
-        result = commandList.appendSignalEvent(hSignalEvent) == ZE_RESULT_SUCCESS;
+        CmdListSignalEventParameters signalEventParameters = {
+            .relaxedOrderingDispatch = false,
+        };
+        result = commandList.appendSignalEvent(hSignalEvent, signalEventParameters) == ZE_RESULT_SUCCESS;
     }
 
     return result ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_UNKNOWN;
@@ -919,5 +960,14 @@ MetricQuery *MetricQuery::fromHandle(zet_metric_query_handle_t handle) {
 }
 
 zet_metric_query_handle_t MetricQuery::toHandle() { return this; }
+
+StatusCode ML_STDCALL MetricsLibrary::flushCommandBufferCallback(ClientHandle_1_0 handle) {
+    Device *device = static_cast<Device *>(handle.data);
+    if (device) {
+        device->getNEODevice()->stopDirectSubmissionAndWaitForCompletion();
+        return StatusCode::Success;
+    }
+    return StatusCode::Failed;
+}
 
 } // namespace L0

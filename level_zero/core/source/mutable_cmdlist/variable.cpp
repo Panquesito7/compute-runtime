@@ -1,0 +1,1126 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/core/source/mutable_cmdlist/variable.h"
+
+#include "shared/source/command_container/cmdcontainer.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/in_order_cmd_helpers.h"
+#include "shared/source/helpers/ptr_math.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/source/indirect_heap/indirect_heap_type.h"
+#include "shared/source/kernel/kernel_arg_descriptor.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
+#include "shared/source/utilities/tag_allocator.h"
+
+#include "level_zero/core/source/cmdlist/cmdlist.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/source/event/event.h"
+#include "level_zero/core/source/mutable_cmdlist/helper.h"
+#include "level_zero/core/source/mutable_cmdlist/mcl_kernel_ext.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_cmdlist.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_command_walker.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_load_register_imm.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_pipe_control.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_semaphore_wait.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_store_data_imm.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_store_register_mem.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_variable_descriptor.h"
+#include "level_zero/core/source/mutable_cmdlist/usage.h"
+#include "level_zero/core/source/mutable_cmdlist/variable_dispatch.h"
+
+#include <cinttypes>
+#include <cstdarg>
+
+namespace L0::MCL {
+using State = VariableDescriptor::State;
+
+bool isCbTimestampEventNooped(L0::CommandList *cmdList, L0::Event *event) {
+    bool cbTsEventNooped = !cmdList->isInOrderCounterWaitRequired(event) && event->getAllocation(cmdList->getDevice()) == nullptr;
+    return cbTsEventNooped;
+}
+
+Variable::Variable(MutableCommandList *cmdList) {
+    this->cmdList = cmdList;
+    this->desc = {};
+}
+
+Variable *Variable::create(ze_command_list_handle_t hCmdList, const InterfaceVariableDescriptor *ifaceVarDesc) {
+    auto var = new Variable(MutableCommandList::fromHandle(hCmdList));
+    auto &desc = var->getDesc();
+
+    desc.isStageCommit = ifaceVarDesc->isStageCommit;
+    desc.immediateValueChunks = ifaceVarDesc->immediateValueChunks;
+    desc.asyncMutation = ifaceVarDesc->asyncMutation;
+    desc.eventValue.apiRequiredExternal = desc.eventValue.isExternalFlag = ifaceVarDesc->apiRequestEventGraphExternal;
+
+    var->setDescExperimentalValues(ifaceVarDesc);
+
+    return var;
+}
+
+bool Variable::hasKernelArgCorrectType(const NEO::ArgDescriptor &arg) {
+    using ArgType = NEO::ArgDescriptor::ArgType;
+    switch (arg.type) {
+    default:
+        return false;
+    case ArgType::argTPointer:
+        if (arg.getTraits().getAddressQualifier() == NEO::KernelArgMetadata::AddrLocal) {
+            return isType(VariableType::slmBuffer);
+        }
+        return isType(VariableType::buffer);
+    case ArgType::argTValue:
+        return isType(VariableType::value);
+    }
+}
+
+bool Variable::isType(VariableType type) {
+    if (desc.state == State::declared) {
+        desc.type = type;
+        desc.state = State::defined;
+        if (type == VariableType::groupSize ||
+            type == VariableType::groupCount ||
+            type == VariableType::globalOffset) {
+            desc.size = 3 * sizeof(uint32_t);
+        } else {
+            desc.size = 8U;
+        }
+        return true;
+    }
+    return desc.type == type && desc.state == State::defined;
+}
+
+ze_result_t Variable::setAsKernelArg(ze_kernel_handle_t hKernel, uint32_t argIndex) {
+    auto kernel = Kernel::fromHandle(hKernel);
+    const auto &kernelArgs = kernel->getKernelDescriptor().payloadMappings.explicitArgs;
+
+    if (argIndex >= kernelArgs.size()) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (false == hasKernelArgCorrectType(kernelArgs[argIndex])) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    auto &kernelExt = MclKernelExt::get(kernel);
+    kernelExt.setArgumentVariable(argIndex, this);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setAsKernelGroupSize(ze_kernel_handle_t hKernel) {
+    if (false == isType(VariableType::groupSize)) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    auto kernel = Kernel::fromHandle(hKernel);
+    auto &kernelExt = MclKernelExt::get(kernel);
+    kernelExt.setGroupSizeVariable(this);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setAsSignalEvent(Event *event, MutableComputeWalker *walkerCmd, MutablePipeControl *postSyncCmd) {
+    if (false == isType(VariableType::signalEvent)) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    this->desc.eventValue.event = event;
+    this->desc.eventValue.eventPoolAllocation = event->getAllocation(cmdList->getBase()->getDevice());
+    this->desc.eventValue.counterBasedEvent = event->isCounterBased();
+    this->desc.eventValue.inOrderIncrementEvent = event->getInOrderIncrementValue(cmdList->getBase()->getPartitionCount()) > 0;
+    this->desc.eventValue.walkerCmd = walkerCmd;
+    this->desc.eventValue.postSyncCmd = postSyncCmd;
+    this->desc.eventValue.packetCount = event->getPacketsInUse();
+    this->desc.eventValue.waitPackets = event->getPacketsToWait();
+    this->desc.eventValue.hasStandaloneProfilingNode = event->hasInOrderTimestampNode();
+    // captured after the append, so it reflects the signaling mode the recorded walker was programmed with
+    this->desc.eventValue.cbEventWithProfiling = event->isCbEventWithProfiling();
+    if (this->desc.eventValue.counterBasedEvent) {
+        this->desc.eventValue.inOrderExecBaseSignalValue = event->getInOrderExecBaseSignalValue();
+        this->desc.eventValue.inOrderAllocationOffset = event->getInOrderAllocationOffset();
+    }
+    this->desc.size = 0;
+    this->desc.eventValue.qwordInUse = cmdList->isQwordInOrderCounter();
+    this->desc.eventValue.useSemaphore64bCmd = cmdList->isSemaphore64bCmdSupported();
+    this->desc.eventValue.qwordIndirect = NEO::InOrderProgrammingHelpers::isLriFor64bDataProgrammingRequired(this->desc.eventValue.qwordInUse, this->desc.eventValue.useSemaphore64bCmd);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setAsWaitEvent(WaitEventVariableDescriptor &waitEventVarDesc) {
+    if (false == isType(VariableType::waitEvent)) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint32_t semWaitReserve = 0;
+    this->desc.eventValue.event = waitEventVarDesc.event;
+    this->desc.eventValue.eventPoolAllocation = waitEventVarDesc.event->getAllocation(cmdList->getBase()->getDevice());
+    this->desc.eventValue.counterBasedEvent = waitEventVarDesc.event->isCounterBased();
+    this->desc.eventValue.packetCount = waitEventVarDesc.event->getPacketsInUse();
+
+    this->desc.eventValue.qwordInUse = cmdList->isQwordInOrderCounter();
+    this->desc.eventValue.useSemaphore64bCmd = cmdList->isSemaphore64bCmdSupported();
+    this->desc.eventValue.qwordIndirect = NEO::InOrderProgrammingHelpers::isLriFor64bDataProgrammingRequired(this->desc.eventValue.qwordInUse, this->desc.eventValue.useSemaphore64bCmd);
+
+    if (this->desc.eventValue.counterBasedEvent) {
+        uint32_t lriMultiplier = this->desc.eventValue.qwordIndirect ? 2 : 0;
+
+        auto deviceCounterAlloc = waitEventVarDesc.event->getInOrderExecEventHelper().getDeviceCounterAllocation();
+        this->desc.eventValue.cbEventDeviceCounterAllocation = cmdList->getDeviceCounterAllocForResidency(deviceCounterAlloc);
+
+        this->desc.eventValue.waitPackets = waitEventVarDesc.waitEventPackets;
+        bool cbTsEventNooped = isCbTimestampEventNooped(cmdList->getBase(), waitEventVarDesc.event);
+        this->desc.eventValue.noopState = cmdList->isCbEventBoundToCmdList(waitEventVarDesc.event) || cbTsEventNooped || !waitEventVarDesc.event->getInOrderExecEventHelper().isDataAssigned();
+        this->desc.eventValue.isCbEventBoundToCmdList = cmdList->isCbEventBoundToCmdList(waitEventVarDesc.event);
+        this->desc.eventValue.isExternalFlag |= waitEventVarDesc.event->isExternalEvent();
+
+        // standard CB events that are not external, but for that append upon requirement to assign patch preamble, can act as external - save the patch preamble values for the variable
+        this->desc.eventValue.patchPreambleCounterValue = waitEventVarDesc.event->getInOrderExecEventHelper().getPatchPreambleCounter();
+        this->desc.eventValue.patchPreambleNoopState = this->desc.eventValue.patchPreambleCounterValue == 0;
+
+        this->desc.eventValue.patchPreambleCounterDeviceAllocation = waitEventVarDesc.event->getInOrderExecEventHelper().getPatchPreambleDeviceAllocation();
+        this->desc.eventValue.patchPreambleCounterDeviceGpuAddress = waitEventVarDesc.event->getInOrderExecEventHelper().getPatchPreambleDeviceGpuAddress();
+
+        if (this->desc.eventValue.isExternalFlag || this->desc.eventValue.patchPreambleNoopState == false) {
+            semWaitReserve += this->desc.eventValue.waitPackets;
+            lriMultiplier += this->desc.eventValue.qwordIndirect ? 2 : 0;
+        }
+
+        if (lriMultiplier > 0) {
+            this->desc.eventValue.loadRegImmCmds.reserve(lriMultiplier * this->desc.eventValue.waitPackets);
+        }
+    } else {
+        this->desc.eventValue.waitPackets = waitEventVarDesc.waitEventPackets;
+    }
+    semWaitReserve += this->desc.eventValue.waitPackets;
+    this->desc.eventValue.semWaitCmds.reserve(semWaitReserve);
+    this->desc.size = 0;
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::addKernelArgUsage(const NEO::ArgDescriptor &kernelArg, IndirectObjectHeapOffset iohOffset, IndirectObjectHeapOffset iohFullOffset, SurfaceStateHeapOffset sshOffset,
+                                        uint32_t slmArgSize, uint32_t slmArgOffsetValue,
+                                        CommandBufferOffset walkerCmdOffset, MutableComputeWalker *mutableComputeWalker, bool inlineData) {
+    if (desc.state != VariableDescriptor::State::defined) {
+        DEBUG_BREAK_IF(true);
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    switch (desc.type) {
+    default:
+        DEBUG_BREAK_IF(true);
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    case VariableType::buffer: {
+        const auto &arg = kernelArg.as<NEO::ArgDescPointer>();
+        if (NEO::isValidOffset(arg.stateless)) {
+            if (inlineData) {
+                if (arg.stateless < mutableComputeWalker->getInlineDataSize()) {
+                    bufferUsages.commandBufferOffsets.push_back(walkerCmdOffset + mutableComputeWalker->getInlineDataOffset() + arg.stateless);
+                    auto walkerInlineFullOffset = reinterpret_cast<CommandBufferOffset>(mutableComputeWalker->getInlineDataPointer()) + arg.stateless;
+                    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured buffer kernel arg patchlist inline %zx stateless offset %" PRIu16 "\n",
+                                 walkerInlineFullOffset, arg.stateless);
+                    bufferUsages.commandBufferWithoutOffset.push_back(walkerInlineFullOffset);
+                } else {
+                    auto statelessOffset = arg.stateless - mutableComputeWalker->getInlineDataSize();
+                    bufferUsages.statelessIndirect.push_back(iohOffset + statelessOffset);
+                    IndirectObjectHeapOffset iohFullStatelessOffset = iohFullOffset + statelessOffset;
+                    bufferUsages.statelessWithoutOffset.push_back(iohFullStatelessOffset);
+
+                    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured buffer kernel arg patchlist heap decreased by inline %zx stateless offset %" PRIu16 " decreased %zu\n",
+                                 iohFullStatelessOffset, arg.stateless, statelessOffset);
+                }
+            } else {
+                bufferUsages.statelessIndirect.push_back(iohOffset + arg.stateless);
+                IndirectObjectHeapOffset iohFullStatelessOffset = iohFullOffset + arg.stateless;
+                bufferUsages.statelessWithoutOffset.push_back(iohFullStatelessOffset);
+
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured buffer kernel arg patchlist heap %zx stateless offset %" PRIu16 "\n",
+                             iohFullStatelessOffset, arg.stateless);
+            }
+        }
+
+        auto ret = addKernelArgUsageStatefulBuffer(kernelArg, iohOffset, sshOffset);
+        if (ret != ZE_RESULT_SUCCESS) {
+            return ret;
+        }
+
+        desc.size = sizeof(void *);
+    } break;
+    case VariableType::value: {
+        return selectImmediateAddKernelArgUsageHandler(kernelArg, iohOffset, iohFullOffset, walkerCmdOffset, mutableComputeWalker, inlineData);
+    } break;
+    case VariableType::slmBuffer: {
+        this->desc.slmValue.slmSize = slmArgSize;
+        this->desc.slmValue.slmOffsetValue = slmArgOffsetValue;
+
+        const auto &arg = kernelArg.as<NEO::ArgDescPointer>();
+        if (NEO::isValidOffset(arg.slmOffset)) {
+            this->desc.slmValue.slmAlignment = arg.requiredSlmAlignment;
+            if (inlineData) {
+                if (arg.slmOffset < mutableComputeWalker->getInlineDataSize()) {
+                    bufferUsages.commandBufferOffsets.push_back(walkerCmdOffset + mutableComputeWalker->getInlineDataOffset() + arg.slmOffset);
+                    auto walkerInlineFullOffset = reinterpret_cast<CommandBufferOffset>(mutableComputeWalker->getInlineDataPointer()) + arg.slmOffset;
+                    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured slm kernel arg patchlist inline %zx slm offset %" PRIu16 "\n",
+                                 walkerInlineFullOffset, arg.slmOffset);
+                    bufferUsages.commandBufferWithoutOffset.push_back(walkerInlineFullOffset);
+                } else {
+                    auto slmOffset = arg.slmOffset - mutableComputeWalker->getInlineDataSize();
+                    bufferUsages.statelessIndirect.push_back(iohOffset + slmOffset);
+                    IndirectObjectHeapOffset iohFullSlmOffset = iohFullOffset + slmOffset;
+                    bufferUsages.statelessWithoutOffset.push_back(iohFullSlmOffset);
+
+                    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured slm kernel arg patchlist heap decreased by inline %zx slm offset %" PRIu16 " decreased %zu\n",
+                                 iohFullSlmOffset, arg.slmOffset, slmOffset);
+                }
+            } else {
+                bufferUsages.statelessIndirect.push_back(iohOffset + arg.slmOffset);
+                IndirectObjectHeapOffset iohFullSlmOffset = iohFullOffset + arg.slmOffset;
+                bufferUsages.statelessWithoutOffset.push_back(iohFullSlmOffset);
+
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured buffer slm kernel arg patchlist heap %zx slm offset %" PRIu16 "\n",
+                             iohFullSlmOffset, arg.slmOffset);
+            }
+        }
+    } break;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::addKernelArgUsageImmediateAsChunk(const NEO::ArgDescriptor &kernelArg, IndirectObjectHeapOffset iohOffset, IndirectObjectHeapOffset iohFullOffset,
+                                                        CommandBufferOffset walkerCmdOffset, MutableComputeWalker *mutableComputeWalker, bool inlineData) {
+    const auto &arg = kernelArg.as<NEO::ArgDescValue>();
+
+    size_t fullSize = 0U;
+
+    for (auto &ele : arg.elements) {
+        auto &valueChunk = this->immediateValueChunks.emplace_back();
+        size_t startOffset = ele.offset;
+        size_t chunkSize = ele.size;
+
+        valueChunk.size = chunkSize;
+        valueChunk.sourceOffset = ele.sourceOffset;
+
+        fullSize = valueChunk.sourceOffset + chunkSize;
+
+        PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured value kernel arg chunk source offset %zu size %zu start offset %zu\n", valueChunk.sourceOffset, chunkSize, startOffset);
+
+        if (inlineData) {
+            auto inlineSize = mutableComputeWalker->getInlineDataSize();
+            // start of variable begins in CW inline data
+            if (startOffset < inlineSize) {
+                valueChunk.commandBufferUsageIndex = valueUsages.commandBufferWithoutOffset.size();
+                auto walkerInlineFullOffset = reinterpret_cast<CommandBufferOffset>(mutableComputeWalker->getInlineDataPointer()) + startOffset;
+                valueUsages.commandBufferWithoutOffset.push_back(walkerInlineFullOffset);
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured value kernel arg cmdbuffer patchlist full offset %zx stateless offset %zu\n",
+                             walkerInlineFullOffset, startOffset);
+
+                valueUsages.commandBufferOffsets.push_back(walkerCmdOffset + mutableComputeWalker->getInlineDataOffset() + startOffset);
+                // check immediate variable fits fully in inline
+                if (startOffset + chunkSize <= inlineSize) {
+                    // full size immediate fits in inline
+                    valueUsages.commandBufferPatchSize.push_back(chunkSize);
+                } else {
+                    // first part fits in inline
+                    size_t csSize = inlineSize - startOffset;
+                    valueUsages.commandBufferPatchSize.push_back(csSize);
+
+                    // cross-thread part of variable continues at the starts of heap
+                    valueChunk.heapStatelessUsageIndex = valueUsages.statelessWithoutOffset.size();
+                    valueUsages.statelessWithoutOffset.push_back(iohFullOffset);
+
+                    valueUsages.statelessIndirect.push_back(iohOffset);
+                    size_t heapSize = (startOffset + chunkSize) - inlineSize;
+                    valueUsages.statelessIndirectPatchSize.push_back(heapSize);
+
+                    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured value kernel arg partial heap patchlist full offset %zx\n",
+                                 iohFullOffset);
+                }
+            } else {
+                // immediate fits only in cross-thread, just decrease start offset by inline size
+                startOffset -= inlineSize;
+
+                valueChunk.heapStatelessUsageIndex = valueUsages.statelessWithoutOffset.size();
+                valueUsages.statelessWithoutOffset.push_back(iohFullOffset + startOffset);
+
+                valueUsages.statelessIndirect.push_back(iohOffset + startOffset);
+                valueUsages.statelessIndirectPatchSize.push_back(chunkSize);
+
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured value kernel arg - inline - heap patchlist full offset %zx stateless offset %zu\n",
+                             (iohFullOffset + startOffset), startOffset);
+            }
+        } else {
+            // no inline in kernel, no need to decrease start offset
+            valueChunk.heapStatelessUsageIndex = valueUsages.statelessWithoutOffset.size();
+            valueUsages.statelessWithoutOffset.push_back(iohFullOffset + startOffset);
+
+            valueUsages.statelessIndirect.push_back(iohOffset + startOffset);
+            valueUsages.statelessIndirectPatchSize.push_back(chunkSize);
+
+            PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL captured value kernel arg - clean - heap patchlist full offset %zx stateless offset %zu\n",
+                         (iohFullOffset + startOffset), startOffset);
+        }
+    }
+
+    desc.size = fullSize;
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setValue(size_t size, uint32_t flags, const void *argVal) {
+    if (desc.isTemporary) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    handleFlags(flags);
+
+    // size of value variable is evaluated in chunks
+    // size of slm variable is changing dynamically
+    if ((desc.type != VariableType::value && desc.type != VariableType::slmBuffer) && size != desc.size) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    switch (desc.type) {
+    default:
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    case VariableType::buffer:
+        return setBufferVariable(size, argVal);
+    case VariableType::value:
+        return setValueVariable(size, argVal);
+    case VariableType::groupSize:
+        return setGroupSizeVariable(size, argVal);
+    case VariableType::groupCount:
+        return setGroupCountVariable(size, argVal);
+    case VariableType::signalEvent:
+        return setSignalEventVariable(size, argVal);
+    case VariableType::waitEvent:
+        return setWaitEventVariable(size, argVal);
+    case VariableType::globalOffset:
+        return setGlobalOffsetVariable(size, argVal);
+    case VariableType::slmBuffer:
+        return setSlmBufferVariable(size, argVal);
+    }
+}
+
+ze_result_t Variable::setBufferVariable(size_t size, const void *argVal) {
+    DEBUG_BREAK_IF(size != sizeof(void *));
+    auto argValue = argVal != nullptr ? *reinterpret_cast<void *const *>(argVal) : nullptr;
+    auto device = cmdList->getBase()->getDevice();
+    auto &commandContainer = cmdList->getBase()->getCmdContainer();
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL variable %p old kernel arg buffer: value %p gpuva %" PRIu64 " alloc id %u alloc id from manager %u\n",
+                 this,
+                 desc.argValue,
+                 desc.bufferGpuAddress,
+                 desc.allocId,
+                 desc.allocIdMemoryManagerCounter);
+
+    auto oldBufferAlloc = desc.bufferAlloc;
+    auto oldArgValue = desc.argValue;
+    GpuAddress gpuAddress = 0u;
+    NEO::GraphicsAllocation *newBufferAlloc = nullptr;
+    uint32_t newAllocId = undefined<uint32_t>;
+    uint32_t newAllocIdMemoryManagerCounter = device->getDriverHandle()->getSvmAllocsManager()->allocationsCounter.load();
+
+    if (argValue != nullptr) {
+        // same arg value and alloc id is set
+        if (desc.allocId > 0 && desc.allocId != newAllocId && desc.argValue == argValue) {
+            // if alloc id is set then compare
+            if (newAllocIdMemoryManagerCounter > 0 && desc.allocIdMemoryManagerCounter == newAllocIdMemoryManagerCounter) {
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL same alloc id from manager, same arg value, alloc id set\n");
+                return ZE_RESULT_SUCCESS;
+            }
+        }
+
+        NEO::SvmAllocationData *newAllocData = nullptr;
+        auto retVal = getBufferGpuAddress(argValue, device, newBufferAlloc, gpuAddress, newAllocData);
+        if (retVal != ZE_RESULT_SUCCESS) {
+            return retVal;
+        }
+        newAllocId = nullptr != newAllocData ? newAllocData->getAllocId() : 0u;
+
+        if (desc.argValue == argValue && desc.allocId == newAllocId &&
+            (nullptr == newAllocData || newAllocData->existedAtCounter(argValue, desc.allocIdMemoryManagerCounter))) {
+            PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL same alloc id, same arg value, updating alloc id from manager to new %u\n",
+                         newAllocIdMemoryManagerCounter);
+            desc.allocIdMemoryManagerCounter = newAllocIdMemoryManagerCounter;
+            return ZE_RESULT_SUCCESS;
+        }
+    } else {
+        if (desc.argValue == argValue) {
+            PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL null buffer argument is the same as new, early quit\n");
+            return ZE_RESULT_SUCCESS;
+        }
+    }
+
+    if (desc.state == State::initialized) {
+        DEBUG_BREAK_IF(desc.argValue == nullptr);
+        desc.bufferAlloc = nullptr;
+        desc.state = State::defined;
+    }
+    DEBUG_BREAK_IF(desc.bufferAlloc != nullptr);
+
+    desc.bufferAlloc = newBufferAlloc;
+    desc.bufferGpuAddress = gpuAddress;
+    desc.argValue = argValue;
+    desc.allocId = newAllocId;
+    desc.allocIdMemoryManagerCounter = newAllocIdMemoryManagerCounter;
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL mutate kernel argument variable %p buffer gpuva %" PRIx64 " arg value %p from allocation %p alloc id %u alloc id from manager %u\n",
+                 this, gpuAddress, argValue, newBufferAlloc, newAllocId, newAllocIdMemoryManagerCounter);
+
+    this->handleBufferTypeChange(oldArgValue, oldBufferAlloc, argValue, newBufferAlloc);
+
+    if (bufferUsages.statelessWithoutOffset.size() > 0) {
+        for (const auto statelessPatch : bufferUsages.statelessWithoutOffset) {
+            PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL patching kernel argument buffer into heap offset %zx\n", statelessPatch);
+            memcpy_s(reinterpret_cast<void *>(statelessPatch), sizeof(GpuAddress), &gpuAddress, sizeof(GpuAddress));
+        }
+    } else {
+        auto iohCpuBase = commandContainer.getIndirectHeap(NEO::HeapType::indirectObject)->getCpuBase();
+        for (const auto statelessOffset : bufferUsages.statelessIndirect) {
+            memcpy_s(ptrOffset(iohCpuBase, statelessOffset), sizeof(GpuAddress), &gpuAddress, sizeof(GpuAddress));
+        }
+    }
+
+    if (bufferUsages.commandBufferWithoutOffset.size() > 0) {
+        for (const auto csPatch : bufferUsages.commandBufferWithoutOffset) {
+            PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL patching kernel argument buffer into inline data cmd buffer offset %zx\n", csPatch);
+            memcpy_s(reinterpret_cast<GpuAddress *>(csPatch), sizeof(GpuAddress), &gpuAddress, sizeof(GpuAddress));
+        }
+    } else {
+        auto csCpuBase = commandContainer.getCommandStream()->getCpuBase();
+        for (const auto csOffset : bufferUsages.commandBufferOffsets) {
+            memcpy_s(ptrOffset(csCpuBase, csOffset), sizeof(GpuAddress), &gpuAddress, sizeof(GpuAddress));
+        }
+    }
+
+    if (argValue != nullptr) {
+        mutateStatefulBufferArg(gpuAddress, newBufferAlloc);
+        desc.state = State::initialized;
+    }
+    updateAllocationResidency(oldBufferAlloc, newBufferAlloc);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+void Variable::handleBufferTypeChange(const void *oldArgValue, NEO::GraphicsAllocation *oldAllocation,
+                                      const void *newArgValue, NEO::GraphicsAllocation *newAllocation) {
+
+    if (usedInDispatch.empty()) {
+        return;
+    }
+
+    const bool sharedSystemAllocationsAllowed = cmdList->getBase()->areSharedSystemAllocationsAllowed();
+    bool isOldAllocSystemMemory = L0::CommandList::isUsingSystemMemory(oldArgValue, oldAllocation, sharedSystemAllocationsAllowed);
+    bool isNewAllocSystemMemory = L0::CommandList::isUsingSystemMemory(newArgValue, newAllocation, sharedSystemAllocationsAllowed);
+
+    bool isOldAllocImported = oldAllocation != nullptr && oldAllocation->getIsImported();
+    bool isNewAllocImported = newAllocation != nullptr && newAllocation->getIsImported();
+
+    int32_t allocSystemMemoryDelta = static_cast<int32_t>(isNewAllocSystemMemory) - static_cast<int32_t>(isOldAllocSystemMemory);
+    int32_t allocImportedDelta = static_cast<int32_t>(isNewAllocImported) - static_cast<int32_t>(isOldAllocImported);
+
+    if (allocSystemMemoryDelta == 0 && allocImportedDelta == 0) {
+        return;
+    }
+
+    bool commitChangesNeeded = false;
+
+    for (auto *variableDispatch : usedInDispatch) {
+        commitChangesNeeded |= variableDispatch->updateAllocationsCount(allocSystemMemoryDelta, allocImportedDelta);
+    }
+
+    if (commitChangesNeeded) {
+        this->setCommitVariable();
+    }
+}
+
+ze_result_t Variable::setValueVariable(size_t size, const void *argVal) {
+    return selectImmediateSetValueHandler(size, argVal);
+}
+
+ze_result_t Variable::setValueVariableInChunks(size_t size, const void *argVal) {
+    for (const auto &chunk : this->immediateValueChunks) {
+        if (chunk.sourceOffset >= size) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        size_t maxBytesToCopy = size - chunk.sourceOffset;
+        size_t bytesToCopy = std::min(chunk.size, maxBytesToCopy);
+
+        const void *newValue = ptrOffset(argVal, chunk.sourceOffset);
+
+        if (chunk.heapStatelessUsageIndex != std::numeric_limits<size_t>::max()) {
+            size_t statelessSize = valueUsages.statelessIndirectPatchSize[chunk.heapStatelessUsageIndex];
+            const bool splitBetween = chunk.commandBufferUsageIndex != std::numeric_limits<size_t>::max();
+            const void *newHeapValue = newValue;
+            if (splitBetween) {
+                DEBUG_BREAK_IF(statelessSize >= bytesToCopy);
+                // handle immediate value split between CW Inline Data and cross-thread indirect heap - here second part that landed in heap
+                newHeapValue = reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(newHeapValue) + (bytesToCopy - statelessSize));
+            } else {
+                statelessSize = std::min(statelessSize, bytesToCopy);
+            }
+
+            void *destinationPtr = nullptr;
+
+            if (valueUsages.statelessWithoutOffset.size() > 0) {
+                destinationPtr = reinterpret_cast<void *>(valueUsages.statelessWithoutOffset[chunk.heapStatelessUsageIndex]);
+            } else {
+                auto iohCpuBase = cmdList->getBase()->getCmdContainer().getIndirectHeap(NEO::HeapType::indirectObject)->getCpuBase();
+
+                const auto &statelessOffset = valueUsages.statelessIndirect[chunk.heapStatelessUsageIndex];
+                destinationPtr = reinterpret_cast<void *>(ptrOffset(iohCpuBase, statelessOffset));
+            }
+            memcpy_s(destinationPtr, statelessSize,
+                     newHeapValue, statelessSize);
+        }
+
+        if (chunk.commandBufferUsageIndex != std::numeric_limits<size_t>::max()) {
+            size_t csSize = valueUsages.commandBufferPatchSize[chunk.commandBufferUsageIndex];
+            csSize = std::min(csSize, bytesToCopy);
+
+            void *destinationPtr = nullptr;
+            if (valueUsages.commandBufferWithoutOffset.size() > 0) {
+                destinationPtr = reinterpret_cast<void *>(valueUsages.commandBufferWithoutOffset[chunk.commandBufferUsageIndex]);
+            } else {
+                auto csCpuBase = cmdList->getBase()->getCmdContainer().getCommandStream()->getCpuBase();
+
+                auto &csOffset = bufferUsages.commandBufferOffsets[chunk.commandBufferUsageIndex];
+                destinationPtr = reinterpret_cast<void *>(ptrOffset(csCpuBase, csOffset));
+            }
+            memcpy_s(destinationPtr, csSize,
+                     newValue, csSize);
+        }
+    }
+
+    desc.state = State::initialized;
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setGroupSizeVariable(size_t size, const void *argVal) {
+    const uint32_t *groupSize = reinterpret_cast<const uint32_t *>(argVal);
+    if (groupSize[0] == desc.kernelDispatch.groupSize[0] &&
+        groupSize[1] == desc.kernelDispatch.groupSize[1] &&
+        groupSize[2] == desc.kernelDispatch.groupSize[2]) {
+        return ZE_RESULT_SUCCESS;
+    }
+    for (auto &vd : usedInDispatch) {
+        vd->setGroupSize(groupSize, *cmdList->getBase()->getDevice()->getNEODevice(), desc.isStageCommit);
+    }
+    setCommitVariable();
+    desc.state = State::initialized;
+    setGroupSizeProperty(groupSize);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setGroupCountVariable(size_t size, const void *argVal) {
+    const uint32_t *groupCount = reinterpret_cast<const uint32_t *>(argVal);
+    if (groupCount[0] == desc.kernelDispatch.groupCount[0] &&
+        groupCount[1] == desc.kernelDispatch.groupCount[1] &&
+        groupCount[2] == desc.kernelDispatch.groupCount[2]) {
+        return ZE_RESULT_SUCCESS;
+    }
+    for (auto &vd : usedInDispatch) {
+        vd->setGroupCount(groupCount, *cmdList->getBase()->getDevice()->getNEODevice(), desc.isStageCommit);
+    }
+    setCommitVariable();
+    desc.state = State::initialized;
+    setGroupCountProperty(groupCount);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setGlobalOffsetVariable(size_t size, const void *argVal) {
+    const uint32_t *globalOffset = reinterpret_cast<const uint32_t *>(argVal);
+    if (globalOffset[0] == desc.kernelDispatch.globalOffset[0] &&
+        globalOffset[1] == desc.kernelDispatch.globalOffset[1] &&
+        globalOffset[2] == desc.kernelDispatch.globalOffset[2]) {
+        return ZE_RESULT_SUCCESS;
+    }
+    for (auto &vd : usedInDispatch) {
+        vd->setGlobalOffset(globalOffset);
+    }
+
+    desc.state = State::initialized;
+    setGlobalOffsetProperty(globalOffset);
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setSignalEventVariable(size_t size, const void *argVal) {
+    Event *newEvent = const_cast<Event *>(reinterpret_cast<const Event *>(argVal));
+    if (newEvent == this->desc.eventValue.event) {
+        return ZE_RESULT_SUCCESS;
+    }
+    auto device = cmdList->getBase()->getDevice();
+
+    if (this->desc.eventValue.hasStandaloneProfilingNode) {
+        auto *inOrderTimestampAllocator = device->getInOrderTimestampAllocator();
+        auto *timestampNode = inOrderTimestampAllocator->getTag();
+        auto *uploadCsr = device->getNEODevice()->getDefaultEngine().commandStreamReceiver;
+        uploadCsr->writeTagAllocationChunkToSimulation(*timestampNode, 0, inOrderTimestampAllocator->getTagSize());
+
+        newEvent->resetInOrderTimestampNode(timestampNode, cmdList->getBase()->getPartitionCount());
+    }
+
+    auto newEventAllocation = newEvent->getAllocation(device);
+    auto oldEventAllocation = this->desc.eventValue.eventPoolAllocation;
+
+    updateAllocationResidency(oldEventAllocation, newEventAllocation);
+
+    if (this->desc.eventValue.counterBasedEvent && !this->desc.eventValue.inOrderIncrementEvent) {
+        this->cmdList->switchCounterBasedEvents(this->desc.eventValue.inOrderExecBaseSignalValue,
+                                                this->desc.eventValue.inOrderAllocationOffset,
+                                                newEvent,
+                                                this->desc.eventValue.apiRequiredExternal);
+
+        if (this->desc.eventValue.hasStandaloneProfilingNode) {
+            newEvent->setCbEventWithProfiling(this->desc.eventValue.cbEventWithProfiling);
+        }
+    }
+
+    uint64_t postSyncAddress = 0;
+    uint64_t inOrderIncrementAddress = 0;
+
+    if (newEventAllocation != nullptr) {
+        postSyncAddress = newEvent->getGpuAddress(device);
+
+        for (auto &mutableStoreDataImm : this->desc.eventValue.storeDataImmCmds) {
+            mutableStoreDataImm->setAddress(postSyncAddress);
+        }
+        for (auto &mutableSemaphoreWait : this->desc.eventValue.semWaitCmds) {
+            mutableSemaphoreWait->setSemaphoreAddress(postSyncAddress);
+        }
+        for (auto &mutableStoreRegMem : this->desc.eventValue.storeRegMemCmds) {
+            mutableStoreRegMem->setMemoryAddress(postSyncAddress);
+        }
+        if (this->desc.eventValue.postSyncCmd) {
+            this->desc.eventValue.postSyncCmd->setPostSyncAddress(postSyncAddress);
+        }
+    }
+
+    if (this->desc.eventValue.inOrderIncrementEvent) {
+        inOrderIncrementAddress = newEvent->getInOrderExecEventHelper().getBaseDeviceAddress();
+    }
+
+    if (postSyncAddress != 0 || inOrderIncrementAddress != 0) {
+        if (this->desc.eventValue.walkerCmd) {
+            this->desc.eventValue.walkerCmd->setPostSyncAddress(postSyncAddress, inOrderIncrementAddress);
+        }
+    }
+
+    newEvent->setPacketsInUse(this->desc.eventValue.packetCount);
+
+    this->desc.eventValue.event = newEvent;
+    this->desc.eventValue.eventPoolAllocation = newEventAllocation;
+    if (this->desc.eventValue.counterBasedEvent) {
+        this->desc.eventValue.inOrderExecBaseSignalValue = newEvent->getInOrderExecBaseSignalValue();
+        this->desc.eventValue.inOrderAllocationOffset = newEvent->getInOrderAllocationOffset();
+    }
+    desc.state = State::initialized;
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t Variable::setWaitEventVariable(size_t size, const void *argVal) {
+    Event *newEvent = const_cast<Event *>(reinterpret_cast<const Event *>(argVal));
+    if (newEvent == this->desc.eventValue.event && !this->desc.eventValue.isExternalFlag) {
+        return ZE_RESULT_SUCCESS;
+    }
+    auto device = cmdList->getBase()->getDevice();
+
+    NEO::GraphicsAllocation *newEventAllocation = nullptr;
+    NEO::GraphicsAllocation *oldEventAllocation = nullptr;
+
+    NEO::GraphicsAllocation *newInOrderAllocation = nullptr;
+    NEO::GraphicsAllocation *oldInOrderAllocation = nullptr;
+
+    NEO::GraphicsAllocation *newPatchPreambleCounterAllocation = nullptr;
+    NEO::GraphicsAllocation *oldPatchPreambleCounterAllocation = nullptr;
+
+    NEO::InOrderExecEventHelper *newInOrderEventHelper = nullptr;
+    bool newCbEventBoundToCmdList = false;
+    bool newNooped = true;
+    bool newPatchPreambleNooped = true;
+    uint64_t newPatchPreambleCounterValue = 0;
+    uint64_t newPatchPreambleCounterGpuAddress = 0;
+    if (newEvent != nullptr) {
+        newInOrderEventHelper = &newEvent->getInOrderExecEventHelper();
+        newNooped = false;
+        newEventAllocation = newEvent->getAllocation(device);
+        if (newEvent->isCounterBased()) {
+            newCbEventBoundToCmdList = cmdList->isCbEventBoundToCmdList(newEvent);
+            bool cbTsEventNooped = isCbTimestampEventNooped(cmdList->getBase(), newEvent);
+            if (newCbEventBoundToCmdList || cbTsEventNooped || !newInOrderEventHelper->isDataAssigned()) {
+                newNooped = true;
+            } else {
+                auto deviceCounterAlloc = newInOrderEventHelper->getDeviceCounterAllocation();
+                newInOrderAllocation = cmdList->getDeviceCounterAllocForResidency(deviceCounterAlloc);
+            }
+            newPatchPreambleCounterAllocation = newInOrderEventHelper->getPatchPreambleDeviceAllocation();
+            newPatchPreambleCounterValue = newInOrderEventHelper->getPatchPreambleCounter();
+            newPatchPreambleCounterGpuAddress = newInOrderEventHelper->getPatchPreambleDeviceGpuAddress();
+            newPatchPreambleNooped = newInOrderEventHelper->getPatchPreambleCounter() == 0;
+        }
+    }
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL old event patch preamble address %" PRIx64 " value %" PRIu64 "\n",
+                 this->desc.eventValue.patchPreambleCounterDeviceGpuAddress,
+                 this->desc.eventValue.patchPreambleCounterValue);
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL new event patch preamble address %" PRIx64 " value %" PRIu64 "\n",
+                 newPatchPreambleCounterGpuAddress,
+                 newPatchPreambleCounterValue);
+
+    bool oldNooped = this->desc.eventValue.noopState;
+    if (this->desc.eventValue.event != nullptr) {
+        oldEventAllocation = this->desc.eventValue.eventPoolAllocation;
+        if (this->desc.eventValue.counterBasedEvent) {
+            oldInOrderAllocation = this->desc.eventValue.cbEventDeviceCounterAllocation;
+            oldPatchPreambleCounterAllocation = this->desc.eventValue.patchPreambleCounterDeviceAllocation;
+        }
+    }
+
+    updateAllocationResidency(oldEventAllocation, newEventAllocation);
+    updateAllocationResidency(oldInOrderAllocation, newInOrderAllocation);
+    updateAllocationResidency(oldPatchPreambleCounterAllocation, newPatchPreambleCounterAllocation);
+
+    const uint64_t patchPreambleCounter = this->desc.eventValue.qwordInUse == false ? getLowPart(newPatchPreambleCounterValue) : newPatchPreambleCounterValue;
+
+    if (this->desc.eventValue.counterBasedEvent && cmdList->getBase()->isInOrderCounterWaitRequired(newEvent)) {
+        if (oldNooped) {
+            if (!newNooped) {
+                // was nooped, needs programming - restore
+                this->desc.eventValue.noopState = false;
+                // update in order info with patching, restore commands with new address
+                auto waitAddress = newInOrderEventHelper->getBaseDeviceAddress() + newEvent->getInOrderAllocationOffset();
+                setCbWaitEventUpdateOperation(CbWaitEventOperationType::restore, waitAddress, newInOrderEventHelper, patchPreambleCounter, newPatchPreambleCounterGpuAddress, newPatchPreambleNooped);
+            }
+        } else {
+            if (newNooped) {
+                // was programed, needs noop
+                this->desc.eventValue.noopState = true;
+                setCbWaitEventUpdateOperation(CbWaitEventOperationType::noop, 0, newInOrderEventHelper, patchPreambleCounter, newPatchPreambleCounterGpuAddress, newPatchPreambleNooped);
+            } else {
+                // was programed, needs update address and new newInOrderEventHelper
+                auto waitAddress = newInOrderEventHelper->getBaseDeviceAddress() + newEvent->getInOrderAllocationOffset();
+                setCbWaitEventUpdateOperation(CbWaitEventOperationType::set, waitAddress, newInOrderEventHelper, patchPreambleCounter, newPatchPreambleCounterGpuAddress, newPatchPreambleNooped);
+            }
+        }
+    } else {
+        auto waitAddress = newEventAllocation != nullptr ? newEvent->getGpuAddress(device) : 0;
+        this->desc.eventValue.noopState = newNooped;
+        setRegularWaitEventUpdateOperation(oldNooped, newNooped, newEventAllocation, waitAddress, patchPreambleCounter, newPatchPreambleCounterGpuAddress, newPatchPreambleNooped);
+    }
+
+    if (desc.asyncMutation) {
+        for (auto &mutableSemWait : this->desc.eventValue.semWaitCmds) {
+            this->cmdList->addAsyncMutationElement(mutableSemWait->getGpuDestinationAddress(), mutableSemWait->getCommandView(), mutableSemWait->getCommandSize(), desc.copyOffloadActive);
+        }
+        for (auto &mutableLri : this->desc.eventValue.loadRegImmCmds) {
+            this->cmdList->addAsyncMutationElement(mutableLri->getGpuDestinationAddress(), mutableLri->getCommandView(), mutableLri->getCommandSize(), desc.copyOffloadActive);
+        }
+    }
+
+    this->desc.eventValue.event = newEvent;
+    this->desc.eventValue.eventPoolAllocation = newEventAllocation;
+    if (this->desc.eventValue.counterBasedEvent) {
+        this->desc.eventValue.isCbEventBoundToCmdList = newCbEventBoundToCmdList;
+        this->desc.eventValue.cbEventDeviceCounterAllocation = newInOrderAllocation;
+        this->desc.eventValue.patchPreambleCounterDeviceAllocation = newPatchPreambleCounterAllocation;
+        this->desc.eventValue.patchPreambleCounterDeviceGpuAddress = newPatchPreambleCounterGpuAddress;
+        this->desc.eventValue.patchPreambleCounterValue = newPatchPreambleCounterValue;
+        this->desc.eventValue.patchPreambleNoopState = newPatchPreambleNooped;
+    }
+    desc.state = State::initialized;
+    return ZE_RESULT_SUCCESS;
+}
+
+void Variable::setCbWaitEventUpdateOperation(CbWaitEventOperationType operation, uint64_t waitAddress, NEO::InOrderExecEventHelper *eventInOrderHelper,
+                                             uint64_t patchPreambleCounter, uint64_t patchPreambleGpuAddress, bool newPatchPreambleNoop) {
+    uint64_t waitValue = eventInOrderHelper == nullptr ? 0u : eventInOrderHelper->getEventData()->counterValue;
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL new CB event wait address %" PRIx64 " value %" PRIu64 "\n",
+                 waitAddress,
+                 waitValue);
+
+    for (auto &mutableSemWait : this->desc.eventValue.semWaitCmds) {
+        if (mutableSemWait->getType() != MutableSemaphoreWait::cbEventWaitPatchPreambleCounter) {
+            if (operation == CbWaitEventOperationType::set) {
+                mutableSemWait->setSemaphoreAddress(waitAddress);
+            } else if (operation == CbWaitEventOperationType::noop) {
+                mutableSemWait->noop();
+            } else if (operation == CbWaitEventOperationType::restore) {
+                mutableSemWait->restoreWithSemaphoreAddress(waitAddress);
+            }
+
+            if (!this->desc.eventValue.qwordIndirect) {
+                if (operation == CbWaitEventOperationType::set || operation == CbWaitEventOperationType::restore) {
+                    mutableSemWait->setSemaphoreValue(waitValue);
+                }
+            }
+        } else {
+            setCbWaitEventPatchPreambleSemWaitOperation(operation, mutableSemWait, patchPreambleCounter, patchPreambleGpuAddress, newPatchPreambleNoop, this->desc.eventValue.qwordIndirect);
+        }
+    }
+    if (this->desc.eventValue.qwordIndirect) {
+        uint32_t cmdIndex = 0;
+        for (auto &mutableLoadRegImm : this->desc.eventValue.loadRegImmCmds) {
+            if (mutableLoadRegImm->getType() != MutableLoadRegisterImm::cbEventWaitLoadPatchPreambleCounter) {
+                if (operation == CbWaitEventOperationType::noop) {
+                    mutableLoadRegImm->noop();
+                } else if (operation == CbWaitEventOperationType::restore) {
+                    mutableLoadRegImm->restore();
+                }
+
+                if (operation == CbWaitEventOperationType::set || operation == CbWaitEventOperationType::restore) {
+                    // check if cmdIndex is even - there can be multiple lri pairs, even takes lower, odd takes higher part of 64b value
+                    uint32_t waitValuePart = ((cmdIndex & 1u) == 0u) ? getLowPart(waitValue) : getHighPart(waitValue);
+                    mutableLoadRegImm->setValue(waitValuePart);
+                }
+            } else {
+                setCbWaitEventPatchPreambleLoadRegImmOperation(operation, mutableLoadRegImm, patchPreambleCounter, cmdIndex, newPatchPreambleNoop);
+            }
+            cmdIndex++;
+        }
+    }
+}
+
+void Variable::setRegularWaitEventUpdateOperation(bool oldNooped, bool newNooped, NEO::GraphicsAllocation *newEventAllocation, uint64_t waitAddress,
+                                                  uint64_t patchPreambleCounter, uint64_t patchPreambleGpuAddress, bool newPatchPreambleNoop) {
+    auto patchPreambleOperation = CbWaitEventOperationType::set;
+    if (newNooped) {
+        patchPreambleOperation = CbWaitEventOperationType::noop;
+    } else if (oldNooped) {
+        patchPreambleOperation = CbWaitEventOperationType::restore;
+    }
+
+    for (auto &mutableSemWait : this->desc.eventValue.semWaitCmds) {
+        if (mutableSemWait->getType() == MutableSemaphoreWait::cbEventWaitPatchPreambleCounter) {
+            setCbWaitEventPatchPreambleSemWaitOperation(patchPreambleOperation, mutableSemWait, patchPreambleCounter, patchPreambleGpuAddress, newPatchPreambleNoop, this->desc.eventValue.qwordIndirect);
+            continue;
+        }
+        if (newEventAllocation != nullptr) {
+            if (oldNooped) {
+                mutableSemWait->restoreWithSemaphoreAddress(waitAddress);
+            } else {
+                mutableSemWait->setSemaphoreAddress(waitAddress);
+            }
+        }
+        if (newNooped) {
+            mutableSemWait->noop();
+        }
+    }
+    if (this->desc.eventValue.qwordIndirect) {
+        uint32_t cmdIndex = 0;
+        for (auto &mutableLoadRegImm : this->desc.eventValue.loadRegImmCmds) {
+            if (mutableLoadRegImm->getType() == MutableLoadRegisterImm::cbEventWaitLoadPatchPreambleCounter) {
+                setCbWaitEventPatchPreambleLoadRegImmOperation(patchPreambleOperation, mutableLoadRegImm, patchPreambleCounter, cmdIndex, newPatchPreambleNoop);
+            }
+            cmdIndex++;
+        }
+    }
+}
+
+void Variable::setCbWaitEventPatchPreambleSemWaitOperation(CbWaitEventOperationType operation, MutableSemaphoreWait *mutableSemWait, uint64_t counter, uint64_t deviceGpuAddress, bool newPatchPreambleNoop, bool qwordIndirect) {
+    if (operation == CbWaitEventOperationType::set) {
+        // general order to set
+        if (this->desc.eventValue.patchPreambleNoopState) {
+            if (newPatchPreambleNoop == false) {
+                // was patch preamble nooped -> can patch preamble set: restore + set value
+                mutableSemWait->restoreWithSemaphoreAddress(deviceGpuAddress);
+                if (qwordIndirect == false) {
+                    mutableSemWait->setSemaphoreValue(counter);
+                }
+            }
+        } else {
+            if (newPatchPreambleNoop == false) {
+                // was patch preamble set -> can patch preamble set: just update address and value
+                mutableSemWait->setSemaphoreAddress(deviceGpuAddress);
+                if (qwordIndirect == false) {
+                    mutableSemWait->setSemaphoreValue(counter);
+                }
+            } else {
+                // was patch preamble set -> needs patch preamble nooped: noop
+                mutableSemWait->noop();
+            }
+        }
+    } else if (operation == CbWaitEventOperationType::noop) {
+        mutableSemWait->noop();
+    } else if (operation == CbWaitEventOperationType::restore) {
+        // general order to restore, can patch preamble restore only if new patch preamble counter is not 0, otherwise noop
+        if (newPatchPreambleNoop == false) {
+            mutableSemWait->restoreWithSemaphoreAddress(deviceGpuAddress);
+            if (qwordIndirect == false) {
+                mutableSemWait->setSemaphoreValue(counter);
+            }
+        }
+    }
+}
+
+void Variable::setCbWaitEventPatchPreambleLoadRegImmOperation(CbWaitEventOperationType operation, MutableLoadRegisterImm *mutableLoadRegImm, uint64_t counter, uint32_t cmdIndex, bool newPatchPreambleNoop) {
+    // check if cmdIndex is even - there can be multiple lri pairs, even takes lower, odd takes higher part of 64b value
+    uint32_t waitValue = ((cmdIndex & 1u) == 0u) ? getLowPart(counter) : getHighPart(counter);
+
+    if (operation == CbWaitEventOperationType::set) {
+        // was patch preamble nooped -> can patch preamble set: restore + set value
+        if (this->desc.eventValue.patchPreambleNoopState) {
+            if (newPatchPreambleNoop == false) {
+                mutableLoadRegImm->restore();
+                mutableLoadRegImm->setValue(waitValue);
+            }
+        } else {
+            if (newPatchPreambleNoop == false) {
+                // was patch preamble set -> can patch preamble set: just update address and value
+                mutableLoadRegImm->setValue(waitValue);
+            } else {
+                // was patch preamble set -> needs patch preamble nooped: noop
+                mutableLoadRegImm->noop();
+            }
+        }
+    } else if (operation == CbWaitEventOperationType::noop) {
+        mutableLoadRegImm->noop();
+    } else if (operation == CbWaitEventOperationType::restore) {
+        // general order to restore, can patch preamble restore only if new patch preamble counter is not 0, otherwise remain noop
+        if (newPatchPreambleNoop == false) {
+            mutableLoadRegImm->restore();
+            mutableLoadRegImm->setValue(waitValue);
+        }
+    }
+}
+
+void Variable::commitVariable() {
+    for (auto &vd : usedInDispatch) {
+        vd->commitChanges(*cmdList->getBase()->getDevice()->getNEODevice());
+    }
+    desc.commitRequired = false;
+}
+
+void Variable::updateAllocationResidency(NEO::GraphicsAllocation *oldAllocation, NEO::GraphicsAllocation *newAllocation) {
+    if (oldAllocation != newAllocation) {
+        cmdList->addToResidencyContainer(newAllocation, desc.copyOffloadActive);
+        cmdList->removeFromResidencyContainer(oldAllocation, desc.copyOffloadActive);
+    }
+}
+
+void Variable::updateCmdListNoopPatchData(size_t noopPatchIndex, void *newCpuPtr, size_t newPatchSize, size_t newOffset, uint64_t newGpuAddress) {
+    cmdList->updateCmdListNoopPatchData(noopPatchIndex, newCpuPtr, newPatchSize, newOffset, newGpuAddress);
+}
+
+size_t Variable::createNewCmdListNoopPatchData(void *newCpuPtr, size_t newPatchSize, size_t newOffset, uint64_t newGpuAddress) {
+    return cmdList->createNewCmdListNoopPatchData(newCpuPtr, newPatchSize, newOffset, newGpuAddress);
+}
+
+void Variable::fillCmdListNoopPatchData(size_t noopPatchIndex, void *&cpuPtr, size_t &patchSize, size_t &offset, uint64_t &gpuAddress) {
+    cmdList->fillCmdListNoopPatchData(noopPatchIndex, cpuPtr, patchSize, offset, gpuAddress);
+}
+
+bool Variable::isCooperativeVariable() const {
+    if (usedInDispatch.empty()) {
+        return false;
+    }
+    return usedInDispatch[0]->isCooperativeDispatch();
+}
+
+ze_result_t Variable::setSlmBufferVariable(size_t size, const void *argVal) {
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL mutate kernel slm argument variable %p new size %u, old size %u\n",
+                 this, size, this->desc.slmValue.slmSize);
+    if (this->desc.slmValue.slmSize != static_cast<SlmOffset>(size)) {
+        this->desc.slmValue.slmSize = static_cast<SlmOffset>(size);
+
+        processVariableDispatchForSlm();
+    }
+
+    desc.state = State::initialized;
+    return ZE_RESULT_SUCCESS;
+}
+
+void Variable::setNextSlmVariableOffset(SlmOffset nextSlmOffset) {
+    SlmOffset alignedNewOffset = alignUp<SlmOffset>(nextSlmOffset, this->desc.slmValue.slmAlignment);
+    bool patchSlmOffset = alignedNewOffset != this->desc.slmValue.slmOffsetValue;
+
+    PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL mutate kernel slm argument variable %p new slm offset %u, old slm offset %u\n",
+                 this, alignedNewOffset, this->desc.slmValue.slmOffsetValue);
+
+    if (patchSlmOffset) {
+        auto &commandContainer = cmdList->getBase()->getCmdContainer();
+
+        if (bufferUsages.statelessWithoutOffset.size() > 0) {
+            for (const auto statelessPatch : bufferUsages.statelessWithoutOffset) {
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL patching kernel slm argument buffer into heap offset %zx\n", statelessPatch);
+                *reinterpret_cast<SlmOffset *>(statelessPatch) = alignedNewOffset;
+            }
+        } else {
+            auto iohCpuBase = commandContainer.getIndirectHeap(NEO::HeapType::indirectObject)->getCpuBase();
+            for (const auto statelessOffset : bufferUsages.statelessIndirect) {
+                *reinterpret_cast<SlmOffset *>(ptrOffset(iohCpuBase, statelessOffset)) = alignedNewOffset;
+            }
+        }
+
+        if (bufferUsages.commandBufferWithoutOffset.size() > 0) {
+            for (const auto csPatch : bufferUsages.commandBufferWithoutOffset) {
+                PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL patching kernel slm argument into inline data cmd buffer offset %zx\n", csPatch);
+                *reinterpret_cast<SlmOffset *>(csPatch) = alignedNewOffset;
+            }
+        } else {
+            auto csCpuBase = commandContainer.getCommandStream()->getCpuBase();
+            for (const auto csOffset : bufferUsages.commandBufferOffsets) {
+                *reinterpret_cast<SlmOffset *>(ptrOffset(csCpuBase, csOffset)) = alignedNewOffset;
+            }
+        }
+
+        this->desc.slmValue.slmOffsetValue = alignedNewOffset;
+        processVariableDispatchForSlm();
+    }
+}
+
+void Variable::processVariableDispatchForSlm() {
+
+    auto slmOffset = this->desc.slmValue.slmOffsetValue;
+    const bool isSlmOffsetResolved = slmOffset != undefined<SlmOffset>;
+    if (!isSlmOffsetResolved) {
+        const bool hasSlmBaseOffset = this->desc.slmValue.slmBaseOffset != undefined<SlmOffset>;
+        if (!hasSlmBaseOffset) {
+            return;
+        }
+        setNextSlmVariableOffset(this->desc.slmValue.slmBaseOffset);
+        return;
+    }
+
+    const bool isSlmSizeInitialized = this->desc.slmValue.slmSize != undefined<SlmOffset>;
+    if (!isSlmSizeInitialized) {
+        return;
+    }
+
+    SlmOffset nextSlmOffset = slmOffset + this->desc.slmValue.slmSize;
+    if (this->desc.slmValue.nextSlmVariable != nullptr) {
+        this->desc.slmValue.nextSlmVariable->setNextSlmVariableOffset(nextSlmOffset);
+    } else {
+        SlmOffset slmArgsTotalSize = static_cast<SlmOffset>(alignUp(nextSlmOffset, MemoryConstants::kiloByte));
+        for (auto &vd : usedInDispatch) {
+            vd->setSlmSize(slmArgsTotalSize, *cmdList->getBase()->getDevice()->getNEODevice(), desc.isStageCommit);
+        }
+        setCommitVariable();
+        PRINT_STRING(NEO::debugManager.flags.PrintMclData.get(), stderr, "MCL mutate kernel slm argument variable %p aligned total arg size %u\n",
+                     this, slmArgsTotalSize);
+    }
+}
+
+uint32_t Variable::getAlignedSlmSize(uint32_t slmSize) {
+    auto &neoDevice = *cmdList->getBase()->getDevice()->getNEODevice();
+    return neoDevice.getGfxCoreHelper().alignSlmSizePerThreadGroup(slmSize, neoDevice.getRootDeviceEnvironment().getReleaseHelper());
+}
+
+void Variable::addCommitVariableToBaseCmdList() {
+    cmdList->addVariableToCommitList(this);
+}
+
+} // namespace L0::MCL

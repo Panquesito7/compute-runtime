@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -20,8 +20,9 @@ using namespace NEO;
 
 TEST(MultiGraphicsAllocationTest, whenCreatingMultiGraphicsAllocationThenTheAllocationIsObtainableAsADefault) {
     GraphicsAllocation graphicsAllocation(1, // rootDeviceIndex
-                                          AllocationType::BUFFER,
-                                          nullptr, 0, 0, MemoryPool::System4KBPages, 0, 0llu);
+                                          1u /*num gmms*/,
+                                          AllocationType::buffer,
+                                          nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
 
     MockMultiGraphicsAllocation multiGraphicsAllocation(1);
     EXPECT_EQ(2u, multiGraphicsAllocation.graphicsAllocations.size());
@@ -36,11 +37,13 @@ TEST(MultiGraphicsAllocationTest, whenCreatingMultiGraphicsAllocationThenTheAllo
 
 TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenAddingMultipleGraphicsAllocationsThenTheyAreObtainableByRootDeviceIndex) {
     GraphicsAllocation graphicsAllocation0(0, // rootDeviceIndex
-                                           AllocationType::BUFFER,
-                                           nullptr, 0, 0, MemoryPool::System4KBPages, 0, 0llu);
+                                           1u /*num gmms*/,
+                                           AllocationType::buffer,
+                                           nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
     GraphicsAllocation graphicsAllocation1(1, // rootDeviceIndex
-                                           AllocationType::BUFFER,
-                                           nullptr, 0, 0, MemoryPool::System4KBPages, 0, 0llu);
+                                           1u /*num gmms*/,
+                                           AllocationType::buffer,
+                                           nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
 
     MockMultiGraphicsAllocation multiGraphicsAllocation(1);
 
@@ -53,10 +56,11 @@ TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenAddingMultiple
 }
 
 TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenGettingAllocationTypeThenReturnAllocationTypeFromDefaultAllocation) {
-    auto expectedAllocationType = AllocationType::BUFFER;
+    auto expectedAllocationType = AllocationType::buffer;
     GraphicsAllocation graphicsAllocation(1, // rootDeviceIndex
+                                          1u /*num gmms*/,
                                           expectedAllocationType,
-                                          nullptr, 0, 0, MemoryPool::System4KBPages, 0, 0llu);
+                                          nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
 
     MockMultiGraphicsAllocation multiGraphicsAllocation(1);
     multiGraphicsAllocation.addAllocation(&graphicsAllocation);
@@ -66,10 +70,11 @@ TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenGettingAllocat
 }
 
 TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenGettingCoherencyStatusThenReturnCoherencyStatusFromDefaultAllocation) {
-    auto expectedAllocationType = AllocationType::BUFFER;
+    auto expectedAllocationType = AllocationType::buffer;
     GraphicsAllocation graphicsAllocation(1, // rootDeviceIndex
+                                          1u /*num gmms*/,
                                           expectedAllocationType,
-                                          nullptr, 0, 0, MemoryPool::System4KBPages, 0, 0llu);
+                                          nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
 
     MockMultiGraphicsAllocation multiGraphicsAllocation(1);
     multiGraphicsAllocation.addAllocation(&graphicsAllocation);
@@ -88,9 +93,9 @@ TEST(MultiGraphicsAllocationTest, WhenCreatingMultiGraphicsAllocationWithoutGrap
 
 TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenRemovingGraphicsAllocationThenTheAllocationIsNoLongerAvailable) {
     uint32_t rootDeviceIndex = 1u;
-    GraphicsAllocation graphicsAllocation(rootDeviceIndex,
-                                          AllocationType::BUFFER,
-                                          nullptr, 0, 0, MemoryPool::System4KBPages, 0, 0llu);
+    GraphicsAllocation graphicsAllocation(rootDeviceIndex, 1u /*num gmms*/,
+                                          AllocationType::buffer,
+                                          nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
 
     MockMultiGraphicsAllocation multiGraphicsAllocation(rootDeviceIndex);
     EXPECT_EQ(2u, multiGraphicsAllocation.graphicsAllocations.size());
@@ -102,6 +107,60 @@ TEST(MultiGraphicsAllocationTest, givenMultiGraphicsAllocationWhenRemovingGraphi
     multiGraphicsAllocation.removeAllocation(rootDeviceIndex);
 
     EXPECT_EQ(nullptr, multiGraphicsAllocation.getGraphicsAllocation(rootDeviceIndex));
+}
+
+TEST(MultiGraphicsAllocationTest, givenStorageOwnerRootDeviceIndexSetWhenGettingDefaultAllocationThenStorageOwnerAllocationIsReturned) {
+    GraphicsAllocation graphicsAllocation0(0, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+    GraphicsAllocation graphicsAllocation1(1, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+
+    MultiGraphicsAllocation multiGraphicsAllocation(1);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation1);
+    multiGraphicsAllocation.setStorageOwnerRootDeviceIndex(1u);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation0);
+
+    EXPECT_EQ(&graphicsAllocation1, multiGraphicsAllocation.getDefaultGraphicsAllocation());
+}
+
+TEST(MultiGraphicsAllocationTest, givenStorageOwnerAllocationRemovedWhenGettingDefaultAllocationThenAllocationWithLowestRootDeviceIndexIsReturned) {
+    GraphicsAllocation graphicsAllocation0(0, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+    GraphicsAllocation graphicsAllocation1(1, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+    GraphicsAllocation graphicsAllocation2(2, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+
+    MultiGraphicsAllocation multiGraphicsAllocation(2);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation2);
+    multiGraphicsAllocation.setStorageOwnerRootDeviceIndex(2u);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation0);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation1);
+
+    multiGraphicsAllocation.removeAllocation(1u);
+    EXPECT_EQ(&graphicsAllocation2, multiGraphicsAllocation.getDefaultGraphicsAllocation());
+
+    multiGraphicsAllocation.removeAllocation(2u);
+    EXPECT_EQ(&graphicsAllocation0, multiGraphicsAllocation.getDefaultGraphicsAllocation());
+
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation2);
+    EXPECT_EQ(&graphicsAllocation0, multiGraphicsAllocation.getDefaultGraphicsAllocation());
+}
+
+TEST(MultiGraphicsAllocationTest, givenStorageOwnerRootDeviceIndexSetWhenCopyingOrMovingMultiGraphicsAllocationThenStorageOwnerAllocationIsStillDefault) {
+    GraphicsAllocation graphicsAllocation0(0, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+    GraphicsAllocation graphicsAllocation1(1, 1u /*num gmms*/, AllocationType::bufferHostMemory, nullptr, 0, 0, MemoryPool::system4KBPages, 0, 0llu);
+
+    MultiGraphicsAllocation multiGraphicsAllocation(1);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation0);
+    multiGraphicsAllocation.addAllocation(&graphicsAllocation1);
+    multiGraphicsAllocation.setStorageOwnerRootDeviceIndex(1u);
+
+    auto copiedMultiGraphicsAllocation(multiGraphicsAllocation);
+    EXPECT_EQ(&graphicsAllocation1, copiedMultiGraphicsAllocation.getDefaultGraphicsAllocation());
+
+    auto movedMultiGraphicsAllocation(std::move(copiedMultiGraphicsAllocation));
+    EXPECT_EQ(&graphicsAllocation1, movedMultiGraphicsAllocation.getDefaultGraphicsAllocation());
+}
+
+TEST(MultiGraphicsAllocationTest, givenNoAllocationForRootDeviceIndexWhenSettingItAsStorageOwnerThenAbortIsCalled) {
+    MultiGraphicsAllocation multiGraphicsAllocation(1);
+    EXPECT_THROW(multiGraphicsAllocation.setStorageOwnerRootDeviceIndex(1u), std::exception);
 }
 
 struct MultiGraphicsAllocationTests : ::testing::Test {
@@ -126,7 +185,7 @@ TEST_F(MultiGraphicsAllocationTests, whenCreatingMultiGraphicsAllocationWithShar
     AllocationProperties allocationProperties{0u,
                                               true, // allocateMemory
                                               MemoryConstants::pageSize,
-                                              AllocationType::BUFFER_HOST_MEMORY,
+                                              AllocationType::bufferHostMemory,
                                               false, // multiOsContextCapable
                                               false, // isMultiStorageAllocationParam
                                               systemMemoryBitfield};
@@ -149,7 +208,7 @@ TEST_F(MultiGraphicsAllocationTests, whenCreatingMultiGraphicsAllocationWithExis
     AllocationProperties allocationProperties{0u,
                                               false, // allocateMemory
                                               MemoryConstants::pageSize,
-                                              AllocationType::BUFFER_HOST_MEMORY,
+                                              AllocationType::bufferHostMemory,
                                               false, // multiOsContextCapable
                                               false, // isMultiStorageAllocationParam
                                               systemMemoryBitfield};
@@ -170,7 +229,7 @@ TEST_F(MultiGraphicsAllocationTests, whenCreatingMultiGraphicsAllocationWithSepa
     AllocationProperties allocationProperties{0u,
                                               true, // allocateMemory
                                               MemoryConstants::pageSize,
-                                              AllocationType::BUFFER_HOST_MEMORY,
+                                              AllocationType::bufferHostMemory,
                                               false, // multiOsContextCapable
                                               false, // isMultiStorageAllocationParam
                                               systemMemoryBitfield};
@@ -190,7 +249,7 @@ TEST_F(MultiGraphicsAllocationTests, givenMultiGraphicsAllocationThatRequiresMig
     AllocationProperties allocationProperties{0u,
                                               true, // allocateMemory
                                               MemoryConstants::pageSize,
-                                              AllocationType::BUFFER_HOST_MEMORY,
+                                              AllocationType::bufferHostMemory,
                                               false, // multiOsContextCapable
                                               false, // isMultiStorageAllocationParam
                                               systemMemoryBitfield};
@@ -222,7 +281,7 @@ struct MigrationSyncDataTests : public MultiGraphicsAllocationTests {
         AllocationProperties allocationProperties{0u,
                                                   true, // allocateMemory
                                                   MemoryConstants::pageSize,
-                                                  AllocationType::BUFFER_HOST_MEMORY,
+                                                  AllocationType::bufferHostMemory,
                                                   false, // multiOsContextCapable
                                                   false, // isMultiStorageAllocationParam
                                                   systemMemoryBitfield};

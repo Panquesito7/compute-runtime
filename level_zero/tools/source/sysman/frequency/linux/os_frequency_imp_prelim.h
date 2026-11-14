@@ -1,20 +1,25 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include "level_zero/tools/source/sysman/frequency/frequency_imp.h"
 #include "level_zero/tools/source/sysman/frequency/os_frequency.h"
-#include "level_zero/tools/source/sysman/linux/fs_access.h"
+
+#include <string>
 
 namespace L0 {
+class SysfsAccess;
+struct Device;
+struct OsSysman;
 
-class LinuxFrequencyImp : public OsFrequency, NEO::NonCopyableOrMovableClass {
+class LinuxFrequencyImp : public OsFrequency, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t osFrequencyGetProperties(zes_freq_properties_t &properties) override;
     double osFrequencyGetStepSize() override;

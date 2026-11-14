@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,14 +8,16 @@
 #pragma once
 #include "shared/source/aub/aub_helper.h"
 #include "shared/source/command_stream/command_stream_receiver_simulated_common_hw.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/gmm_helper/cache_settings_helper.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/helpers/hardware_context_controller.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/physical_address_allocator.h"
 #include "shared/source/os_interface/os_context.h"
 
 #include "aubstream/allocation_params.h"
+#include "aubstream/hint_values.h"
 
 namespace NEO {
 class GraphicsAllocation;
@@ -28,6 +30,7 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
     using CommandStreamReceiverSimulatedCommonHw<GfxFamily>::aubManager;
     using CommandStreamReceiverSimulatedCommonHw<GfxFamily>::hardwareContextController;
     using CommandStreamReceiverSimulatedCommonHw<GfxFamily>::writeMemory;
+    using CommandStreamReceiverSimulatedCommonHw<GfxFamily>::downloadAllocations;
 
   public:
     uint32_t getMemoryBank(GraphicsAllocation *allocation) const {
@@ -39,7 +42,7 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
                                          ? getDeviceIndexFromStorageInfo(allocation->storageInfo)
                                          : getDeviceIndex();
 
-        if (allocation->getMemoryPool() == MemoryPool::LocalMemory) {
+        if (allocation->getMemoryPool() == MemoryPool::localMemory) {
             return MemoryBanks::getBankForLocalMemory(deviceIndexChosen);
         }
         return MemoryBanks::getBank(deviceIndexChosen);
@@ -55,7 +58,7 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
     }
 
     DeviceBitfield getMemoryBanksBitfield(GraphicsAllocation *allocation) const {
-        if (allocation->getMemoryPool() == MemoryPool::LocalMemory) {
+        if (allocation->getMemoryPool() == MemoryPool::localMemory) {
             if (allocation->storageInfo.memoryBanks.any()) {
                 if (allocation->storageInfo.cloningOfPageTables || this->isMultiOsContextCapable()) {
                     return allocation->storageInfo.memoryBanks;
@@ -66,38 +69,15 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
         return {};
     }
 
-    int getAddressSpace(int hint) {
-        bool traceLocalAllowed = false;
-        switch (hint) {
-        case AubMemDump::DataTypeHintValues::TraceLogicalRingContextRcs:
-        case AubMemDump::DataTypeHintValues::TraceLogicalRingContextCcs:
-        case AubMemDump::DataTypeHintValues::TraceLogicalRingContextBcs:
-        case AubMemDump::DataTypeHintValues::TraceLogicalRingContextVcs:
-        case AubMemDump::DataTypeHintValues::TraceLogicalRingContextVecs:
-        case AubMemDump::DataTypeHintValues::TraceCommandBuffer:
-            traceLocalAllowed = true;
-            break;
-        default:
-            break;
-        }
-        if ((traceLocalAllowed && this->localMemoryEnabled) || DebugManager.flags.AUBDumpForceAllToLocalMemory.get()) {
-            return AubMemDump::AddressSpaceValues::TraceLocal;
-        }
-        return AubMemDump::AddressSpaceValues::TraceNonlocal;
-    }
-    PhysicalAddressAllocator *createPhysicalAddressAllocator(const HardwareInfo *hwInfo) {
-        const auto bankSize = AubHelper::getPerTileLocalMemorySize(hwInfo);
+    PhysicalAddressAllocator *createPhysicalAddressAllocator(const HardwareInfo *hwInfo, const ReleaseHelper &releaseHelper) {
+        const auto bankSize = AubHelper::getPerTileLocalMemorySize(hwInfo, releaseHelper);
         const auto devicesCount = GfxCoreHelper::getSubDevicesCount(hwInfo);
         return new PhysicalAddressAllocatorHw<GfxFamily>(bankSize, devicesCount);
     }
-    void writeMemoryWithAubManager(GraphicsAllocation &graphicsAllocation) override {
-        uint64_t gpuAddress;
-        void *cpuAddress;
-        size_t size;
-        this->getParametersForWriteMemory(graphicsAllocation, gpuAddress, cpuAddress, size);
-        int hint = graphicsAllocation.getAllocationType() == AllocationType::COMMAND_BUFFER
-                       ? AubMemDump::DataTypeHintValues::TraceBatchBuffer
-                       : AubMemDump::DataTypeHintValues::TraceNotype;
+    aub_stream::AllocationParams createAllocationParams(GraphicsAllocation &graphicsAllocation, uint64_t gpuAddress, const void *cpuAddress, size_t size) const {
+        int hint = graphicsAllocation.getAllocationType() == AllocationType::commandBuffer
+                       ? aub_stream::DataTypeHintValues::TraceBatchBuffer
+                       : aub_stream::DataTypeHintValues::TraceNotype;
 
         aub_stream::AllocationParams allocationParams(gpuAddress, cpuAddress, size, this->getMemoryBank(&graphicsAllocation),
                                                       hint, graphicsAllocation.getUsedPageSize());
@@ -105,18 +85,50 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
         auto gmm = graphicsAllocation.getDefaultGmm();
 
         if (gmm) {
-            allocationParams.additionalParams.compressionEnabled = gmm->isCompressionEnabled;
-            allocationParams.additionalParams.uncached = CacheSettingsHelper::isUncachedType(gmm->resourceParams.Usage);
+            allocationParams.additionalParams.compressionEnabled = gmm->isCompressionEnabled();
+            allocationParams.additionalParams.uncached = CacheSettingsHelper::isUncachedType(gmm->getResourceUsageType());
+        }
+        return allocationParams;
+    }
+
+    bool isWrittenWithAubManager(GraphicsAllocation &graphicsAllocation) const {
+        bool isSingleDeviceAllocationWrittenByRootCsr = graphicsAllocation.storageInfo.pageTablesVisibility.count() <= 1 && graphicsAllocation.storageInfo.memoryBanks.count() <= 1;
+        isSingleDeviceAllocationWrittenByRootCsr &= (this->osContext && this->osContext->isRootDevice());
+
+        return graphicsAllocation.storageInfo.cloningOfPageTables || !graphicsAllocation.isAllocatedInLocalMemoryPool() || isSingleDeviceAllocationWrittenByRootCsr;
+    }
+
+    void writeMemoryWithAubManager(GraphicsAllocation &graphicsAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) const override {
+        uint64_t gpuAddress;
+        void *cpuAddress;
+        size_t allocSize;
+        this->getParametersForMemory(graphicsAllocation, gpuAddress, cpuAddress, allocSize);
+
+        if (isChunkCopy) {
+            gpuAddress += gpuVaChunkOffset;
+            cpuAddress = ptrOffset(cpuAddress, static_cast<uintptr_t>(gpuVaChunkOffset));
+            allocSize = chunkSize;
         }
 
-        if (graphicsAllocation.storageInfo.cloningOfPageTables || !graphicsAllocation.isAllocatedInLocalMemoryPool()) {
+        std::unique_ptr<unsigned char[]> memoryCopy;
+        if ((graphicsAllocation.isLocked() || graphicsAllocation.isMapped()) && debugManager.flags.CopyLockedMemoryBeforeWrite.get()) {
+            memoryCopy = std::make_unique_for_overwrite<unsigned char[]>(allocSize);
+            memcpy_s(memoryCopy.get(), allocSize, cpuAddress, allocSize);
+            cpuAddress = memoryCopy.get();
+        }
+
+        auto allocationParams = createAllocationParams(graphicsAllocation, gpuAddress, cpuAddress, allocSize);
+
+        if (isWrittenWithAubManager(graphicsAllocation)) {
+            UNRECOVERABLE_IF(nullptr == aubManager);
             aubManager->writeMemory2(allocationParams);
         } else {
+            UNRECOVERABLE_IF(nullptr == hardwareContextController);
             hardwareContextController->writeMemory(allocationParams);
         }
     }
 
-    void setAubWritable(bool writable, GraphicsAllocation &graphicsAllocation) override {
+    void setAubWritable(bool writable, GraphicsAllocation &graphicsAllocation) const override {
         auto bank = getMemoryBank(&graphicsAllocation);
         if (bank == 0u || graphicsAllocation.storageInfo.cloningOfPageTables) {
             bank = GraphicsAllocation::defaultBank;
@@ -133,7 +145,7 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
         return graphicsAllocation.isAubWritable(bank);
     }
 
-    void setTbxWritable(bool writable, GraphicsAllocation &graphicsAllocation) override {
+    void setTbxWritable(bool writable, GraphicsAllocation &graphicsAllocation) const override {
         auto bank = getMemoryBank(&graphicsAllocation);
         if (bank == 0u || graphicsAllocation.storageInfo.cloningOfPageTables) {
             bank = GraphicsAllocation::defaultBank;
@@ -147,6 +159,23 @@ class CommandStreamReceiverSimulatedHw : public CommandStreamReceiverSimulatedCo
             bank = GraphicsAllocation::defaultBank;
         }
         return graphicsAllocation.isTbxWritable(bank);
+    }
+
+    void uploadRingBufferChunk(GraphicsAllocation &ringBufferAllocation, uint64_t chunkOffset, size_t chunkSize) const {
+        writeMemoryWithAubManager(ringBufferAllocation, true, chunkOffset, chunkSize);
+    }
+
+    void submit(GraphicsAllocation &ringBufferAllocation, uint64_t batchBufferGpuAddress, const void *batchBuffer, size_t batchBufferSize,
+                uint32_t memoryBank, uint64_t entryBits, bool overrideRingHead) const {
+        uploadRingBufferChunk(ringBufferAllocation, ptrDiff(batchBufferGpuAddress, ringBufferAllocation.getGpuAddress()), batchBufferSize);
+        UNRECOVERABLE_IF(nullptr == hardwareContextController);
+        hardwareContextController->submit(batchBufferGpuAddress, batchBuffer, batchBufferSize,
+                                          memoryBank, entryBits, overrideRingHead);
+    }
+
+    void resubmitInactiveHardwareContexts() const {
+        UNRECOVERABLE_IF(nullptr == hardwareContextController);
+        hardwareContextController->resubmitInactiveContexts();
     }
 };
 } // namespace NEO

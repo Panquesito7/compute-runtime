@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "shared/source/command_container/implicit_scaling.h"
 #include "shared/source/device/device.h"
 #include "shared/source/helpers/bit_helpers.h"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/populate_factory.h"
 
 #include "opencl/source/mem_obj/buffer.h"
@@ -17,22 +18,13 @@
 
 namespace NEO {
 
-union SURFACE_STATE_BUFFER_LENGTH {
-    uint32_t length;
-    struct SurfaceState {
-        uint32_t width : 7;
-        uint32_t height : 14;
-        uint32_t depth : 11;
-    } surfaceState;
-};
-
 template <typename GfxFamily>
 void BufferHw<GfxFamily>::setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation,
-                                         bool isReadOnlyArgument, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) {
+                                         bool isReadOnlyArgument, const Device &device, bool areMultipleSubDevicesInContext) {
     auto rootDeviceIndex = device.getRootDeviceIndex();
     auto graphicsAllocation = multiGraphicsAllocation.getGraphicsAllocation(rootDeviceIndex);
     const auto isReadOnly = isValueSet(getFlags(), CL_MEM_READ_ONLY) || isReadOnlyArgument;
-    auto isDebuggerActive = device.isDebuggerActive() || device.getDebugger() != nullptr;
+    auto isDebuggerActive = device.getDebugger() != nullptr;
 
     NEO::EncodeSurfaceStateArgs args;
     args.outMemory = memory;
@@ -45,11 +37,10 @@ void BufferHw<GfxFamily>::setArgStateful(void *memory, bool forceNonAuxMode, boo
     args.numAvailableDevices = device.getNumGenericSubDevices();
     args.allocation = graphicsAllocation;
     args.gmmHelper = device.getGmmHelper();
-    args.useGlobalAtomics = useGlobalAtomics;
     args.areMultipleSubDevicesInContext = areMultipleSubDevicesInContext;
     args.implicitScaling = ImplicitScalingHelper::isImplicitScalingEnabled(device.getDeviceBitfield(), true);
     args.isDebuggerActive = isDebuggerActive;
     appendSurfaceStateArgs(args);
-    EncodeSurfaceState<GfxFamily>::encodeBuffer(args);
+    device.getGfxCoreHelper().encodeBufferSurfaceState(args);
 }
 } // namespace NEO

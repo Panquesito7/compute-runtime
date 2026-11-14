@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,7 +14,6 @@
 #include "shared/source/direct_submission/windows/wddm_direct_submission.h"
 #include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/flush_stamp.h"
-#include "shared/source/helpers/windows/gmm_callbacks.h"
 #include "shared/source/memory_manager/internal_allocation_storage.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_interface.h"
@@ -78,22 +77,22 @@ struct MockWddmCsrL0 : public WddmCommandStreamReceiver<GfxFamily> {
             return WddmCommandStreamReceiver<GfxFamily>::initDirectSubmission();
         }
         bool ret = true;
-        if (DebugManager.flags.EnableDirectSubmission.get() == 1) {
+        if (debugManager.flags.EnableDirectSubmission.get() == 1) {
             if (!initBlitterDirectSubmission) {
                 directSubmission = std::make_unique<
                     MockWddmDirectSubmission<GfxFamily, RenderDispatcher<GfxFamily>>>(*this);
-                ret = directSubmission->initialize(true, false);
-                this->dispatchMode = DispatchMode::ImmediateDispatch;
+                ret = directSubmission->initialize(true);
+                this->dispatchMode = DispatchMode::immediateDispatch;
             } else {
                 blitterDirectSubmission = std::make_unique<
                     MockWddmDirectSubmission<GfxFamily, BlitterDispatcher<GfxFamily>>>(*this);
-                blitterDirectSubmission->initialize(true, false);
+                blitterDirectSubmission->initialize(true);
             }
         }
         return ret;
     }
 
-    int flushCalledCount = 0;
+    uint32_t flushCalledCount = 0;
     std::unique_ptr<CommandBuffer> recordedCommandBuffer = nullptr;
 
     bool callParentInitDirectSubmission = true;
@@ -108,6 +107,6 @@ HWTEST_F(WddmSimpleTestL0, givenL0ApiAndDefaultWddmCsrWhenItIsCreatedThenImmedia
     std::unique_ptr<MockDevice> device(Device::create<MockDevice>(executionEnvironment, 0u));
     {
         std::unique_ptr<MockWddmCsrL0<FamilyType>> mockCsr(new MockWddmCsrL0<FamilyType>(*executionEnvironment, 0, 1));
-        EXPECT_EQ(DispatchMode::ImmediateDispatch, mockCsr->dispatchMode);
+        EXPECT_EQ(DispatchMode::immediateDispatch, mockCsr->dispatchMode);
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,7 +14,7 @@
 namespace L0 {
 
 class KmdSysManager;
-class WddmGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableOrMovableClass {
+class WddmGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableAndNonMovableClass {
   public:
     bool getSerialNumber(char (&serialNumber)[ZES_STRING_PROPERTY_SIZE]) override;
     bool getBoardNumber(char (&boardNumber)[ZES_STRING_PROPERTY_SIZE]) override;
@@ -28,11 +28,10 @@ class WddmGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableOrMov
     ze_result_t reset(ze_bool_t force) override;
     ze_result_t scanProcessesState(std::vector<zes_process_state_t> &pProcessList) override;
     ze_result_t deviceGetState(zes_device_state_t *pState) override;
+    ze_result_t resetExt(zes_reset_properties_t *pProperties) override;
 
     WddmGlobalOperationsImp(OsSysman *pOsSysman);
-    WddmGlobalOperationsImp(const WddmGlobalOperationsImp &obj) = delete;
     WddmGlobalOperationsImp() = default;
-    WddmGlobalOperationsImp &operator=(const WddmGlobalOperationsImp &obj) = delete;
     ~WddmGlobalOperationsImp() override = default;
 
   private:
@@ -41,5 +40,7 @@ class WddmGlobalOperationsImp : public OsGlobalOperations, NEO::NonCopyableOrMov
   protected:
     KmdSysManager *pKmdSysManager = nullptr;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<WddmGlobalOperationsImp>);
 
 } // namespace L0

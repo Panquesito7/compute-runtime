@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,10 +10,9 @@
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/product_config_helper_former.h"
 #include "shared/source/helpers/string.h"
-#include "shared/source/release_helper/release_helper.h"
 
-#include "hw_cmds.h"
 #include "platforms.h"
 
 #include <algorithm>
@@ -68,19 +67,21 @@ OclocArgHelper::OclocArgHelper(const uint32_t numSources, const uint8_t **dataSo
     }
 
     productConfigHelper = std::make_unique<ProductConfigHelper>();
+    formerProductConfigHelper = std::make_unique<FormerProductConfigHelper>();
 }
 
 OclocArgHelper::OclocArgHelper() : OclocArgHelper(0, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) {}
 
 OclocArgHelper::~OclocArgHelper() {
     if (outputEnabled()) {
-        saveOutput(oclocStdoutLogName, messagePrinter.getLog());
+        auto log = messagePrinter.getLog().str();
+        OclocArgHelper::saveOutput(oclocStdoutLogName, log.c_str(), log.length() + 1);
         moveOutputs();
     }
 }
 
 bool OclocArgHelper::fileExists(const std::string &filename) const {
-    return sourceFileExists(filename) || ::fileExists(filename);
+    return sourceFileExists(filename) || NEO::fileExists(filename);
 }
 
 void OclocArgHelper::moveOutputs() {
@@ -142,16 +143,16 @@ std::vector<char> OclocArgHelper::readBinaryFile(const std::string &filename) {
 std::unique_ptr<char[]> OclocArgHelper::loadDataFromFile(const std::string &filename, size_t &retSize) {
     if (Source *s = findSourceFile(filename)) {
         auto size = s->length;
-        std::unique_ptr<char[]> ret(new char[size]());
+        auto ret = std::make_unique_for_overwrite<char[]>(size);
         memcpy_s(ret.get(), size, s->data, s->length);
         retSize = s->length;
         return ret;
     } else {
-        return ::loadDataFromFile(filename.c_str(), retSize);
+        return NEO::loadDataFromFile(filename.c_str(), retSize);
     }
 }
 
-uint32_t OclocArgHelper::getProductConfigAndSetHwInfoBasedOnDeviceAndRevId(NEO::HardwareInfo &hwInfo, unsigned short deviceID, int revisionID, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper, std::unique_ptr<NEO::ReleaseHelper> &releaseHelper) {
+uint32_t OclocArgHelper::getProductConfigAndSetHwInfoBasedOnDeviceAndRevId(NEO::HardwareInfo &hwInfo, unsigned short deviceID, int revisionID, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper) {
     const auto &deviceAotMap = productConfigHelper->getDeviceAotInfo();
 
     for (const auto &device : deviceAotMap) {
@@ -165,19 +166,17 @@ uint32_t OclocArgHelper::getProductConfigAndSetHwInfoBasedOnDeviceAndRevId(NEO::
                 auto config = compilerProductHelper->matchRevisionIdWithProductConfig(device.aotConfig, revisionID);
                 if (productConfigHelper->isSupportedProductConfig(config)) {
                     hwInfo.ipVersion = config;
-                    releaseHelper = NEO::ReleaseHelper::create(hwInfo.ipVersion);
                     return config;
                 }
             }
             hwInfo.ipVersion = device.aotConfig.value;
-            releaseHelper = NEO::ReleaseHelper::create(hwInfo.ipVersion);
             return device.aotConfig.value;
         }
     }
     return AOT::UNKNOWN_ISA;
 }
 
-bool OclocArgHelper::setHwInfoForProductConfig(uint32_t productConfig, NEO::HardwareInfo &hwInfo, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper, std::unique_ptr<NEO::ReleaseHelper> &releaseHelper) {
+bool OclocArgHelper::setHwInfoForProductConfig(uint32_t productConfig, NEO::HardwareInfo &hwInfo, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper) {
     if (productConfig == AOT::UNKNOWN_ISA) {
         return false;
     }
@@ -189,37 +188,71 @@ bool OclocArgHelper::setHwInfoForProductConfig(uint32_t productConfig, NEO::Hard
             compilerProductHelper = NEO::CompilerProductHelper::create(hwInfo.platform.eProductFamily);
             UNRECOVERABLE_IF(compilerProductHelper == nullptr);
             compilerProductHelper->setProductConfigForHwInfo(hwInfo, productConfig);
-            releaseHelper = NEO::ReleaseHelper::create(hwInfo.ipVersion);
             return true;
         }
     }
     return false;
 }
 
-void OclocArgHelper::setHwInfoForHwInfoConfig(NEO::HardwareInfo &hwInfo, uint64_t hwInfoConfig, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper, std::unique_ptr<NEO::ReleaseHelper> &releaseHelper) {
+void OclocArgHelper::setHwInfoForHwInfoConfig(NEO::HardwareInfo &hwInfo, uint64_t hwInfoConfig, std::unique_ptr<NEO::CompilerProductHelper> &compilerProductHelper) {
     compilerProductHelper = NEO::CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     UNRECOVERABLE_IF(compilerProductHelper == nullptr);
     uint64_t config = hwInfoConfig ? hwInfoConfig : compilerProductHelper->getHwInfoConfig(hwInfo);
     setHwInfoValuesFromConfig(config, hwInfo);
-    NEO::hardwareInfoBaseSetup[hwInfo.platform.eProductFamily](&hwInfo, true, *compilerProductHelper);
-    releaseHelper = NEO::ReleaseHelper::create(hwInfo.ipVersion);
+    NEO::hardwareInfoBaseSetup[hwInfo.platform.eProductFamily](&hwInfo, true);
+}
+
+std::string OclocArgHelper::removeXePrefix(const std::string &deviceName) const {
+    constexpr std::string_view acronymPrefix = "xe-";
+    constexpr std::string_view versionPrefix = "xe_";
+
+    if (deviceName.starts_with(acronymPrefix)) {
+        auto acronym = deviceName.substr(acronymPrefix.length());
+        auto adjustedAcronym = acronym;
+        ProductConfigHelper::adjustDeviceName(adjustedAcronym);
+
+        const auto &devices = productConfigHelper->getDeviceAotInfo();
+        auto isDeviceAcronym = std::any_of(devices.begin(), devices.end(), [&adjustedAcronym](const DeviceAotInfo &device) {
+            return std::any_of(device.deviceAcronyms.begin(), device.deviceAcronyms.end(), ProductConfigHelper::findAcronymWithoutDash(adjustedAcronym));
+        });
+        isDeviceAcronym |= formerProductConfigHelper->getProductConfigFromAcronym(adjustedAcronym) != AOT::UNKNOWN_ISA;
+        if (isDeviceAcronym) {
+            return acronym;
+        }
+    } else if (deviceName.starts_with(versionPrefix)) {
+        auto version = deviceName.substr(versionPrefix.length());
+        if (version.find('.') != std::string::npos) {
+            return version;
+        }
+    }
+    return deviceName;
+}
+
+void OclocArgHelper::removeXePrefixFromDeviceNames(std::vector<std::string> &args) const {
+    for (size_t argIndex = 0; argIndex + 1 < args.size(); ++argIndex) {
+        if (args[argIndex] != "-device" && args[argIndex] != "-device_options") {
+            continue;
+        }
+        auto &deviceNames = args[++argIndex];
+        std::string adjustedDeviceNames;
+        size_t begin = 0;
+        size_t end = 0;
+        do {
+            end = deviceNames.find_first_of(",:", begin);
+            adjustedDeviceNames += removeXePrefix(deviceNames.substr(begin, end - begin));
+            if (end != std::string::npos) {
+                adjustedDeviceNames += deviceNames[end];
+                begin = end + 1;
+            }
+        } while (end != std::string::npos);
+        deviceNames = std::move(adjustedDeviceNames);
+    }
 }
 
 void OclocArgHelper::saveOutput(const std::string &filename, const void *pData, const size_t &dataSize) {
     if (outputEnabled()) {
         addOutput(filename, pData, dataSize);
     } else {
-        writeDataToFile(filename.c_str(), pData, dataSize);
-    }
-}
-
-void OclocArgHelper::saveOutput(const std::string &filename, const std::ostream &stream) {
-    std::stringstream ss;
-    ss << stream.rdbuf();
-    if (outputEnabled()) {
-        addOutput(filename, ss.str().c_str(), ss.str().length());
-    } else {
-        std::ofstream file(filename);
-        file << ss.str();
+        NEO::writeDataToFile(filename.c_str(), std::string_view(static_cast<const char *>(pData), dataSize), false);
     }
 }

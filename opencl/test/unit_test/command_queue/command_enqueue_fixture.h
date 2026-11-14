@@ -1,33 +1,33 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
 
 #include "opencl/source/command_queue/command_queue_hw.h"
+#include "opencl/source/kernel/kernel.h"
+#include "opencl/source/mem_obj/buffer.h"
+#include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/command_stream/command_stream_fixture.h"
-#include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
-#include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/helpers/cl_hw_parse.h"
 #include "opencl/test/unit_test/indirect_heap/indirect_heap_fixture.h"
-#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 
 namespace NEO {
 
 struct CommandDeviceFixture : public ClDeviceFixture,
                               public CommandQueueHwFixture {
     using CommandQueueHwFixture::setUp;
-    void setUp(cl_command_queue_properties cmdQueueProperties = 0) {
-        ClDeviceFixture::setUp();
-        CommandQueueHwFixture::setUp(pClDevice, cmdQueueProperties);
-    }
+    void setUp(cl_command_queue_properties cmdQueueProperties = 0);
 
     void tearDown() {
         CommandQueueHwFixture::tearDown();
@@ -37,7 +37,7 @@ struct CommandDeviceFixture : public ClDeviceFixture,
 
 struct CommandEnqueueBaseFixture : CommandDeviceFixture,
                                    public IndirectHeapFixture,
-                                   public ClHardwareParse {
+                                   virtual public ClHardwareParse {
     using IndirectHeapFixture::setUp;
     void setUp(cl_command_queue_properties cmdQueueProperties = 0) {
         CommandDeviceFixture::setUp(cmdQueueProperties);
@@ -57,36 +57,55 @@ struct CommandEnqueueFixture : public CommandEnqueueBaseFixture,
     void setUp(cl_command_queue_properties cmdQueueProperties = 0) {
         CommandEnqueueBaseFixture::setUp(cmdQueueProperties);
         CommandStreamFixture::setUp(pCmdQ);
+
+        auto &compilerProductHelper = pCmdQ->getDevice().getCompilerProductHelper();
+        bool isStateless = false;
+        if (compilerProductHelper.isForceToStatelessRequired()) {
+            isStateless = true;
+        }
+        bool bindless = ApiSpecificConfig::getBindlessMode(pCmdQ->getDevice());
+        defaultBuiltInMode = BuiltIn::AddressingMode::getDefaultMode(bindless, isStateless);
+        defaultStatelessMode = defaultBuiltInMode;
+        if (defaultStatelessMode.bufferMode != BuiltIn::AddressingMode::BufferMode::stateless) {
+            defaultStatelessMode.bufferMode = BuiltIn::AddressingMode::BufferMode::stateless;
+            defaultStatelessMode.wideMode = true;
+        }
     }
 
     void tearDown() {
         CommandEnqueueBaseFixture::tearDown();
         CommandStreamFixture::tearDown();
     }
+
+    BuiltIn::AddressingMode defaultStatelessMode{};
+    BuiltIn::AddressingMode defaultBuiltInMode{};
+};
+
+struct SurfaceStateAccessor : virtual public ClHardwareParse {
+    template <typename FamilyType, typename SurfaceStateType>
+    const SurfaceStateType *getSurfaceState(std::unique_ptr<MockCommandQueueHw<FamilyType>> &mockCmdQ, uint32_t index) {
+        const SurfaceStateType *surfaceState = nullptr;
+
+        auto kernel = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel();
+        const auto &kernelInfo = kernel->getKernelInfo();
+        if (kernelInfo.kernelDescriptor.kernelAttributes.imageAddressingMode == KernelDescriptor::AddressingMode::Bindless) {
+            auto bindlessOffset = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(index).template as<ArgDescImage>().bindless);
+            auto bindlessSurfaceStateIndex = kernel->getSurfaceStateIndexForBindlessOffset(bindlessOffset);
+            void *surfaceStateAddress = ptrOffset(kernel->getSurfaceStateHeap(), bindlessSurfaceStateIndex * sizeof(SurfaceStateType));
+            surfaceState = reinterpret_cast<SurfaceStateType *>(surfaceStateAddress);
+        } else {
+            uint32_t bindfulIndex = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(index).template as<ArgDescImage>().bindful) / sizeof(SurfaceStateType);
+            surfaceState = reinterpret_cast<const SurfaceStateType *>(HardwareParse::getSurfaceState<FamilyType>(&mockCmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0), bindfulIndex));
+        }
+
+        return surfaceState;
+    }
 };
 
 struct NegativeFailAllocationCommandEnqueueBaseFixture : public CommandEnqueueBaseFixture {
-    void setUp() {
-        CommandEnqueueBaseFixture::setUp();
-        failMemManager.reset(new FailMemoryManager(*pDevice->getExecutionEnvironment()));
+    void setUp();
 
-        BufferDefaults::context = context;
-        Image2dDefaults::context = context;
-        buffer.reset(BufferHelper<>::create());
-        image.reset(ImageHelper<Image2dDefaults>::create());
-        ptr = static_cast<void *>(array);
-        oldMemManager = pDevice->getExecutionEnvironment()->memoryManager.release();
-        pDevice->injectMemoryManager(failMemManager.release());
-    }
-
-    void tearDown() {
-        pDevice->injectMemoryManager(oldMemManager);
-        buffer.reset(nullptr);
-        image.reset(nullptr);
-        BufferDefaults::context = nullptr;
-        Image2dDefaults::context = nullptr;
-        CommandEnqueueBaseFixture::tearDown();
-    }
+    void tearDown();
 
     std::unique_ptr<Buffer> buffer;
     std::unique_ptr<Image> image;
@@ -98,13 +117,13 @@ struct NegativeFailAllocationCommandEnqueueBaseFixture : public CommandEnqueueBa
 
 template <typename FamilyType>
 struct CommandQueueStateless : public CommandQueueHw<FamilyType> {
-    CommandQueueStateless(Context *context, ClDevice *device) : CommandQueueHw<FamilyType>(context, device, nullptr, false){};
+    CommandQueueStateless(Context *context, ClDevice *device) : CommandQueueHw<FamilyType>(context, device, nullptr, false) {};
 
     void enqueueHandlerHook(const unsigned int commandType, const MultiDispatchInfo &dispatchInfo) override {
         auto kernel = dispatchInfo.begin()->getKernel();
 
-        EXPECT_TRUE(kernel->getKernelInfo().kernelDescriptor.kernelAttributes.supportsBuffersBiggerThan4Gb());
-        if (kernel->getKernelInfo().getArgDescriptorAt(0).is<ArgDescriptor::ArgTPointer>()) {
+        EXPECT_EQ(NEO::KernelDescriptor::Stateless, kernel->getKernelInfo().kernelDescriptor.kernelAttributes.bufferAddressingMode);
+        if (kernel->getKernelInfo().getArgDescriptorAt(0).is<ArgDescriptor::argTPointer>()) {
             EXPECT_FALSE(kernel->getKernelInfo().getArgDescriptorAt(0).as<ArgDescPointer>().isPureStateful());
         }
 
@@ -123,16 +142,15 @@ struct CommandQueueStateless : public CommandQueueHw<FamilyType> {
 
 template <typename FamilyType>
 struct CommandQueueStateful : public CommandQueueHw<FamilyType> {
-    CommandQueueStateful(Context *context, ClDevice *device) : CommandQueueHw<FamilyType>(context, device, nullptr, false){};
+    CommandQueueStateful(Context *context, ClDevice *device) : CommandQueueHw<FamilyType>(context, device, nullptr, false) {
+
+                                                               };
 
     void enqueueHandlerHook(const unsigned int commandType, const MultiDispatchInfo &dispatchInfo) override {
         auto kernel = dispatchInfo.begin()->getKernel();
-        EXPECT_FALSE(kernel->getKernelInfo().kernelDescriptor.kernelAttributes.supportsBuffersBiggerThan4Gb());
+        EXPECT_NE(NEO::KernelDescriptor::Stateless, kernel->getKernelInfo().kernelDescriptor.kernelAttributes.bufferAddressingMode);
 
-        auto &gfxCoreHelper = kernel->getContext().getDevice(0)->getGfxCoreHelper();
-        if (gfxCoreHelper.isStatelessToStatefulWithOffsetSupported()) {
-            EXPECT_TRUE(kernel->allBufferArgsStateful);
-        }
+        EXPECT_TRUE(kernel->allBufferArgsStateful);
 
         if (validateKernelSystemMemory) {
             if (expectedKernelSystemMemory) {

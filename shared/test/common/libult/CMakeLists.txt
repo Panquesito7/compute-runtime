@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2021-2023 Intel Corporation
+# Copyright (C) 2021-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -16,10 +16,6 @@ macro(macro_for_each_platform)
       set(SRC_FILE ${NEO_SHARED_DIRECTORY}${BRANCH_DIR}${CORE_TYPE_LOWER}${BRANCH}enable_compiler_product_helper_${PLATFORM_IT_LOWER}.cpp)
       if(EXISTS ${SRC_FILE})
         list(APPEND neo_libult_common_SRCS_ENABLE_TESTED_HW ${SRC_FILE})
-      endif()
-      set(SRC_FILE ${NEO_SHARED_DIRECTORY}/os_interface/linux/local${BRANCH_DIR_SUFFIX}${PLATFORM_IT_LOWER}/enable_ioctl_helper_${PLATFORM_IT_LOWER}.cpp)
-      if(EXISTS ${SRC_FILE})
-        list(APPEND neo_libult_common_SRCS_ENABLE_TESTED_HW_LINUX ${SRC_FILE})
       endif()
       set(SRC_FILE ${NEO_SHARED_DIRECTORY}/ail${BRANCH_DIR}${CORE_TYPE_LOWER}${BRANCH}${PLATFORM_IT_LOWER}/ail_configuration_${PLATFORM_IT_LOWER}.cpp)
       if(EXISTS ${SRC_FILE})
@@ -70,9 +66,10 @@ apply_macro_for_each_core_type("TESTED")
 append_sources_from_properties(neo_libult_common_SRCS_ENABLE_TESTED_HW NEO_SRCS_ENABLE_CORE)
 
 set(neo_libult_common_SRCS_LIB_ULT
-    ${NEO_SHARED_DIRECTORY}/gmm_helper/resource_info_impl.cpp
+    ${NEO_SHARED_DIRECTORY}/gmm_helper${BRANCH_DIR_SUFFIX}resource_info_impl.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/base_ult_config_listener.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/base_ult_config_listener.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/cmd_parse/hw_parse.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/aub_command_stream_receiver_fixture.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/command_stream_receiver_fixture.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/command_stream_receiver_fixture.h
@@ -91,12 +88,12 @@ set(neo_libult_common_SRCS_LIB_ULT
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/tbx_command_stream_fixture.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/tbx_command_stream_fixture.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_helpers.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_manager_state_restore.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_manager_state_restore.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_variables_listener.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/debug_variables_listener.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/execution_environment_helper.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/execution_environment_helper.h
-    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/kernel_binary_helper.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/kernel_binary_helper.h
-    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/kernel_binary_helper_hash_value.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/kernel_filename_helper.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/memory_leak_listener.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/memory_leak_listener.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/memory_management.cpp
@@ -109,27 +106,34 @@ set(neo_libult_common_SRCS_LIB_ULT
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/test_files.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/unit_test_helper.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/unit_test_helper.inl
-    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/unit_test_helper_bdw_and_later.inl
+    ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/file_io.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/abort.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/create_tbx_sockets.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/blitter_mask_override.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/compiler_options_parser_ult.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/debug_settings_reader_creator.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/global_environment.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/global_environment.h
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/io_functions.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/mock_io_functions.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/options_unit_tests.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/signal_utils.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/signal_utils_common.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/sleep.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/source_level_debugger_library.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/source_level_debugger_library.h
-    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/source_level_debugger_ult.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/ult_aub_command_stream_receiver.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/ult_command_stream_receiver.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_gmm_page_table_mngr.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_memory_manager.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_excludes.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_excludes.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_matcher_registry.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_matcher_registry.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_checks_shared.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/test_macros/test_checks_shared.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/utilities/cpuintrinsics.cpp
 )
+
+if(${NEO_TARGET_PROCESSOR} STREQUAL "x86_64")
+  list(APPEND neo_libult_common_SRCS_LIB_ULT
+       ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/x86_64/stream_copy_ult.cpp
+  )
+endif()
 
 if(TESTS_XEHP_AND_LATER)
   list(APPEND neo_libult_common_SRCS_LIB_ULT
@@ -149,11 +153,25 @@ if(TESTS_PVC_AND_LATER)
   )
 endif()
 
-if(TESTS_XE_HPG_CORE)
+if(TESTS_XE2_AND_LATER)
   list(APPEND neo_libult_common_SRCS_LIB_ULT
-       ${NEO_SHARED_DIRECTORY}/release_helper${BRANCH_DIR_SUFFIX}enable_release_helper_xe.cpp
+       ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/unit_test_helper_xe2_and_later.inl
   )
 endif()
+
+if(TESTS_XE3_AND_BEFORE)
+  list(APPEND neo_libult_common_SRCS_LIB_ULT
+       ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/unit_test_helper_from_gen12lp_to_xe3_core.inl
+  )
+endif()
+
+if(TESTS_XE3P_AND_LATER)
+  list(APPEND neo_libult_common_SRCS_LIB_ULT
+       ${NEO_SHARED_TEST_DIRECTORY}/common/helpers/unit_test_helper_xe3p_core_and_later.inl
+  )
+endif()
+
+append_sources_from_properties(neo_libult_common_SRCS_LIB_ULT NEO_CORE_ENABLE_RELEASE_HELPER)
 
 set_property(GLOBAL PROPERTY neo_libult_common_SRCS_LIB_ULT ${neo_libult_common_SRCS_LIB_ULT})
 
@@ -168,6 +186,7 @@ target_sources(neo_libult_common PRIVATE
 
 set(neo_libult_common_SRCS_LIB_ULT_WIN
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/windows/memory_allocator_multi_device_fixture_windows.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_adapter_luid.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_dxgi_factory.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_dxgi_factory.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_dxcore_factory.cpp
@@ -178,8 +197,6 @@ set_property(GLOBAL PROPERTY neo_libult_common_SRCS_LIB_ULT_WIN ${neo_libult_com
 
 set(neo_libult_common_SRCS_LIB_ULT_LINUX
     ${NEO_SHARED_TEST_DIRECTORY}/common/fixtures/linux/memory_allocator_multi_device_fixture_linux.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/device_command_stream_fixture.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/device_command_stream_fixture.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/drm_buffer_object_fixture.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/signal_utils.cpp
 )
@@ -193,17 +210,28 @@ elseif(UNIX)
 endif()
 
 set(neo_libult_SRCS_LINUX
+    ${NEO_SHARED_TEST_DIRECTORY}/common/libult/create_directory.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/os_interface.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/linux/mock_drm_memory_manager.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/linux/mock_drm_memory_manager.h
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/device_ult.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_direct_submission_controller_enabled.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_unified_memory_reuse_cleaner_enabled.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/create_drm_memory_manager.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/drm_memory_manager_fixture.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/drm_neo_create.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/options.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux${BRANCH_DIR_SUFFIX}/options.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/options.inl
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/setup_external_dependencies_${DRIVER_MODEL}.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/sys_calls_linux_ult.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_get_staging_buffer_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_usm_pool_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_default_heap_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_pool_allocator_sizes.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_pool_info.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_buffer_pool_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_async_launch_mode.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_leo_detection.cpp
 )
 
 set_property(GLOBAL APPEND PROPERTY neo_libult_SRCS_LINUX ${neo_libult_SRCS_LINUX})
@@ -211,13 +239,22 @@ set(neo_libult_SRCS_WINDOWS
     ${NEO_SHARED_TEST_DIRECTORY}/common/libult/os_interface.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/device_ult.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_direct_submission_controller_enabled.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_unified_memory_reuse_cleaner_enabled.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/create_wddm_memory_manager.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/options.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows${BRANCH_DIR_SUFFIX}/options.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/options.inl
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/setup_external_dependencies_drm_or_wddm.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/sys_calls.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/sys_calls_winmm.cpp
     ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/wddm_calls.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/mock_environment_variables.cpp
-    ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/mock_environment_variables.h
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_get_staging_buffer_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_usm_pool_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_default_heap_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_pool_allocator_sizes.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_pool_info.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_buffer_pool_size.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_async_launch_mode.cpp
+    ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_leo_detection.cpp
 )
 
 set_property(GLOBAL APPEND PROPERTY neo_libult_SRCS_WINDOWS ${neo_libult_SRCS_WINDOWS})
@@ -231,6 +268,7 @@ if(WIN32 OR NOT DISABLE_WDDM_LINUX)
   list(APPEND neo_libult_SRCS
        ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/mock_wddm.cpp
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/wddm_create.cpp
+       ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/wddm_fixture.cpp
   )
 endif()
 
@@ -238,6 +276,7 @@ if(UNIX AND NOT DISABLE_WDDM_LINUX)
   list(APPEND neo_libult_SRCS
        ${NEO_SHARED_TEST_DIRECTORY}/common/mocks/linux/mock_dxcore.h
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/linux/sys_calls_win.cpp
+       ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_adapter_luid.h
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_dxcore_factory.cpp
        ${NEO_SHARED_TEST_DIRECTORY}/common/os_interface/windows/ult_dxcore_factory.h
   )
@@ -252,9 +291,9 @@ foreach(target_name "neo_libult_common" "neo_libult")
   set_target_properties(${target_name} PROPERTIES FOLDER ${SHARED_TEST_PROJECTS_FOLDER})
   set_property(TARGET ${target_name} APPEND_STRING PROPERTY COMPILE_FLAGS ${ASAN_FLAGS} ${TSAN_FLAGS})
   target_include_directories(${target_name} PRIVATE
+                             ${NEO_SHARED_TEST_DIRECTORY}/common/test_configuration/unit_tests
                              $<TARGET_PROPERTY:${NEO_SHARED_MOCKABLE_LIB_NAME},INTERFACE_INCLUDE_DIRECTORIES>
-                             $<TARGET_PROPERTY:gmock-gtest,INTERFACE_INCLUDE_DIRECTORIES>
-                             ${SOURCE_LEVEL_DEBUGGER_HEADERS_DIR}
+                             $<TARGET_PROPERTY:neo_gtest,INTERFACE_INCLUDE_DIRECTORIES>
   )
   target_compile_definitions(${target_name} PRIVATE $<TARGET_PROPERTY:${NEO_SHARED_MOCKABLE_LIB_NAME},INTERFACE_COMPILE_DEFINITIONS>)
   # please do not add new sources below this function

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,12 +13,12 @@
 
 namespace L0 {
 class KmdSysManager;
-class WddmTemperatureImp : public OsTemperature, NEO::NonCopyableOrMovableClass {
+class WddmTemperatureImp : public OsTemperature, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t getProperties(zes_temp_properties_t *pProperties) override;
     ze_result_t getSensorTemperature(double *pTemperature) override;
     bool isTempModuleSupported() override;
-
+    uint32_t getNumTempDomainsSupported();
     void setSensorType(zes_temp_sensors_t sensorType);
     WddmTemperatureImp(OsSysman *pOsSysman);
     WddmTemperatureImp() = default;

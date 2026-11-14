@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,15 +8,12 @@
 #pragma once
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
 
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
-
-class OclocArgHelper;
-struct IgaWrapper;
 
 extern void (*abortOclocExecution)(int);
 
@@ -26,14 +23,12 @@ void addSlash(std::string &path);
 
 std::vector<char> readBinaryFile(const std::string &fileName);
 
+void istreamToVectorOfStrings(std::istream &input, std::vector<std::string> &lines, bool replaceTabs = false);
 void readFileToVectorOfStrings(std::vector<std::string> &lines, const std::string &fileName, bool replaceTabs = false);
-void setProductFamilyForIga(const std::string &device, IgaWrapper *iga, OclocArgHelper *argHelper);
-
-size_t findPos(const std::vector<std::string> &lines, const std::string &whatToFind);
 
 PRODUCT_FAMILY getProductFamilyFromDeviceName(const std::string &deviceName);
 
-class MessagePrinter : NEO::NonCopyableOrMovableClass {
+class MessagePrinter : NEO::NonCopyableAndNonMovableClass {
   public:
     explicit MessagePrinter() = default;
     explicit MessagePrinter(bool suppressMessages) : suppressMessages(suppressMessages) {}
@@ -48,9 +43,9 @@ class MessagePrinter : NEO::NonCopyableOrMovableClass {
     template <typename... Args>
     void printf(const char *format, Args... args) {
         if (!suppressMessages) {
-            ::printf(format, std::forward<Args>(args)...);
+            ::printf(format, args...);
         }
-        ss << stringFormat(format, std::forward<Args>(args)...);
+        ss << stringFormat(format, args...);
     }
 
     const std::stringstream &getLog() {

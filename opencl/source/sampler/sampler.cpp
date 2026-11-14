@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,18 +9,17 @@
 
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/kernel/kernel_arg_descriptor.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/get_info_status_mapper.h"
 
-#include "patch_list.h"
-
 #include <limits>
 
 namespace NEO {
 
-SamplerCreateFunc samplerFactory[IGFX_MAX_CORE] = {};
+SamplerCreateFunc samplerFactory[NEO::maxCoreEnumValue] = {};
 
 Sampler::Sampler(Context *context, cl_bool normalizedCoordinates,
                  cl_addressing_mode addressingMode, cl_filter_mode filterMode,
@@ -146,9 +145,9 @@ Sampler *Sampler::create(Context *context,
 
 unsigned int Sampler::getSnapWaValue() const {
     if (filterMode == CL_FILTER_NEAREST && addressingMode == CL_ADDRESS_CLAMP) {
-        return iOpenCL::CONSTANT_REGISTER_BOOLEAN_TRUE;
+        return samplerSnapWaValue;
     } else {
-        return iOpenCL::CONSTANT_REGISTER_BOOLEAN_FALSE;
+        return 0;
     }
 }
 
@@ -215,12 +214,6 @@ cl_int Sampler::getInfo(cl_sampler_info paramName, size_t paramValueSize,
     GetInfo::setParamValueReturnSize(paramValueSizeRet, valueSize, getInfoStatus);
 
     return retVal;
-}
-
-bool Sampler::isTransformable() const {
-    return addressingMode == CL_ADDRESS_CLAMP_TO_EDGE &&
-           filterMode == CL_FILTER_NEAREST &&
-           normalizedCoordinates == CL_FALSE;
 }
 
 void Sampler::storeProperties(const cl_sampler_properties *properties) {

@@ -12,10 +12,12 @@
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/os_interface.h"
 
-#include "level_zero/sysman/source/linux/sysman_hw_device_id_linux.h"
+#include "level_zero/sysman/source/shared/linux/sysman_hw_device_id_linux.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
+
 constexpr int mockFd = -1;
 class SysmanMockDrm : public NEO::Drm {
   public:
@@ -25,4 +27,5 @@ class SysmanMockDrm : public NEO::Drm {
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

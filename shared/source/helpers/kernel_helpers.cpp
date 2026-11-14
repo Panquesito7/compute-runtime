@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,19 +11,42 @@
 #include "shared/source/device/device.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-
-#include <algorithm>
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/program/sync_buffer_handler.h"
 
 namespace NEO {
 
-uint32_t KernelHelper::getMaxWorkGroupCount(uint32_t simd, uint32_t availableThreadCount, uint32_t dssCount, uint32_t availableSlmSize,
-                                            uint32_t usedSlmSize, uint32_t maxBarrierCount, uint32_t numberOfBarriers, uint32_t workDim,
-                                            const size_t *localWorkSize) {
-    if (DebugManager.flags.OverrideMaxWorkGroupCount.get() != -1) {
-        return static_cast<uint32_t>(DebugManager.flags.OverrideMaxWorkGroupCount.get());
+uint32_t KernelHelper::getMaxWorkGroupCount(Device &device, uint16_t numGrfRequired, uint8_t simdSize, uint8_t barrierCount, uint32_t alignedSlmSize, uint32_t workDim, const size_t *localWorkSize,
+                                            EngineGroupType engineGroupType, bool implicitScalingEnabled, bool forceSingleTileQuery, bool singleWorkGroupPerDss) {
+    uint32_t numSubDevicesForExecution = 1;
+
+    if (!forceSingleTileQuery && implicitScalingEnabled) {
+        auto deviceBitfield = device.getDeviceBitfield();
+        numSubDevicesForExecution = static_cast<uint32_t>(deviceBitfield.count());
     }
+
+    return KernelHelper::getMaxWorkGroupCount(device.getRootDeviceEnvironment(), numGrfRequired, simdSize, barrierCount, numSubDevicesForExecution, alignedSlmSize, workDim, localWorkSize, engineGroupType, singleWorkGroupPerDss);
+}
+
+uint32_t KernelHelper::getMaxWorkGroupCount(const RootDeviceEnvironment &rootDeviceEnvironment, uint16_t numGrfRequired, uint8_t simdSize, uint8_t barrierCount,
+                                            uint32_t numSubDevices, uint32_t usedSlmSize, uint32_t workDim, const size_t *localWorkSize, EngineGroupType engineGroupType, bool singleWorkGroupPerDss) {
+    if (debugManager.flags.OverrideMaxWorkGroupCount.get() != -1) {
+        return static_cast<uint32_t>(debugManager.flags.OverrideMaxWorkGroupCount.get());
+    }
+
+    auto &helper = rootDeviceEnvironment.getHelper<NEO::GfxCoreHelper>();
+    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+
+    auto dssCount = hwInfo.gtSystemInfo.DualSubSliceCount;
+    if (dssCount == 0) {
+        dssCount = hwInfo.gtSystemInfo.SubSliceCount;
+    }
+
+    auto availableThreadCount = helper.calculateAvailableThreadCount(hwInfo, numGrfRequired, rootDeviceEnvironment);
+    constexpr auto maxBarrierCount = CommonConstants::maxBarrierRegisterPerSlice;
 
     UNRECOVERABLE_IF((workDim == 0) || (workDim > 3));
     UNRECOVERABLE_IF(localWorkSize == nullptr);
@@ -32,18 +55,27 @@ uint32_t KernelHelper::getMaxWorkGroupCount(uint32_t simd, uint32_t availableThr
     for (uint32_t i = 1; i < workDim; i++) {
         workGroupSize *= localWorkSize[i];
     }
-
-    auto numThreadsPerThreadGroup = static_cast<uint32_t>(Math::divideAndRoundUp(workGroupSize, simd));
+    UNRECOVERABLE_IF(workGroupSize == 0);
+    auto numThreadsPerThreadGroup = static_cast<uint32_t>(Math::divideAndRoundUp(workGroupSize, simdSize));
     auto maxWorkGroupsCount = availableThreadCount / numThreadsPerThreadGroup;
-
-    if (numberOfBarriers > 0) {
-        auto maxWorkGroupsCountDueToBarrierUsage = dssCount * (maxBarrierCount / numberOfBarriers);
+    helper.alignThreadGroupCountToDssSize(maxWorkGroupsCount, dssCount, availableThreadCount / dssCount, numThreadsPerThreadGroup);
+    if (barrierCount > 0) {
+        auto maxWorkGroupsCountDueToBarrierUsage = dssCount * (maxBarrierCount / barrierCount);
         maxWorkGroupsCount = std::min(maxWorkGroupsCount, maxWorkGroupsCountDueToBarrierUsage);
     }
-
     if (usedSlmSize > 0) {
-        auto maxWorkGroupsCountDueToSlm = availableSlmSize / usedSlmSize;
+        auto slmSizePerDss = static_cast<uint32_t>(MemoryConstants::kiloByte * hwInfo.capabilityTable.maxProgrammableSlmSize);
+        auto maxWorkGroupsCountDueToSlm = dssCount * (slmSizePerDss / usedSlmSize);
         maxWorkGroupsCount = std::min(maxWorkGroupsCount, maxWorkGroupsCountDueToSlm);
+    }
+    if (singleWorkGroupPerDss) {
+        maxWorkGroupsCount = std::min(maxWorkGroupsCount, dssCount);
+    }
+
+    maxWorkGroupsCount = helper.adjustMaxWorkGroupCount(maxWorkGroupsCount, engineGroupType, rootDeviceEnvironment);
+
+    if (!helper.singleTileExecImplicitScalingRequired(true)) {
+        maxWorkGroupsCount *= numSubDevices;
     }
 
     return maxWorkGroupsCount;
@@ -51,9 +83,10 @@ uint32_t KernelHelper::getMaxWorkGroupCount(uint32_t simd, uint32_t availableThr
 
 KernelHelper::ErrorCode KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(KernelDescriptor::KernelAttributes attributes, Device *device) {
     auto &gfxCoreHelper = device->getRootDeviceEnvironment().getHelper<NEO::GfxCoreHelper>();
-    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize();
+    auto &productHelper = device->getRootDeviceEnvironment().getHelper<NEO::ProductHelper>();
+    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize(productHelper);
     if ((attributes.perThreadScratchSize[0] > maxScratchSize) || (attributes.perThreadScratchSize[1] > maxScratchSize)) {
-        return KernelHelper::ErrorCode::INVALID_KERNEL;
+        return KernelHelper::ErrorCode::invalidKernel;
     }
     auto globalMemorySize = device->getDeviceInfo().globalMemSize;
     auto computeUnitsForScratch = device->getDeviceInfo().computeUnitsUsedForScratch;
@@ -61,33 +94,36 @@ KernelHelper::ErrorCode KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(Ker
     auto totalScratchSize = KernelHelper::getScratchSize(attributes.perThreadScratchSize[0], computeUnitsForScratch);
     auto totalPrivateScratchSize = KernelHelper::getPrivateScratchSize(attributes.perThreadScratchSize[1], computeUnitsForScratch);
 
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr,
-                       "computeUnits for each thread: %u\n", computeUnitsForScratch);
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr,
+                 "computeUnits for each thread: %u\n", computeUnitsForScratch);
 
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr,
-                       "perHwThreadPrivateMemorySize: %u\t totalPrivateMemorySize: %lu\n",
-                       attributes.perHwThreadPrivateMemorySize, totalPrivateMemorySize);
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr,
+                 "global memory size: %llu\n", globalMemorySize);
 
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr,
-                       "perHwThreadScratchSize: %u\t totalScratchSize: %lu\n",
-                       attributes.perThreadScratchSize[0], totalScratchSize);
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr,
+                 "perHwThreadPrivateMemorySize: %u\t totalPrivateMemorySize: %lu\n",
+                 attributes.perHwThreadPrivateMemorySize, totalPrivateMemorySize);
 
-    PRINT_DEBUG_STRING(DebugManager.flags.PrintDebugMessages.get(), stderr,
-                       "perHwThreadPrivateScratchSize: %u\t totalPrivateScratchSize: %lu\n",
-                       attributes.perThreadScratchSize[1], totalPrivateScratchSize);
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr,
+                 "perHwThreadScratchSize: %u\t totalScratchSize: %lu\n",
+                 attributes.perThreadScratchSize[0], totalScratchSize);
+
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr,
+                 "perHwThreadPrivateScratchSize: %u\t totalPrivateScratchSize: %lu\n",
+                 attributes.perThreadScratchSize[1], totalPrivateScratchSize);
 
     if (totalPrivateMemorySize > globalMemorySize ||
         totalScratchSize > globalMemorySize ||
         totalPrivateScratchSize > globalMemorySize) {
 
-        return KernelHelper::ErrorCode::OUT_OF_DEVICE_MEMORY;
+        return KernelHelper::ErrorCode::outOfDeviceMemory;
     }
-    return KernelHelper::ErrorCode::SUCCESS;
+    return KernelHelper::ErrorCode::success;
 }
 
 bool KernelHelper::isAnyArgumentPtrByValue(const KernelDescriptor &kernelDescriptor) {
     for (auto &argDescriptor : kernelDescriptor.payloadMappings.explicitArgs) {
-        if (argDescriptor.type == NEO::ArgDescriptor::ArgTValue) {
+        if (argDescriptor.type == NEO::ArgDescriptor::argTValue) {
             for (auto &element : argDescriptor.as<NEO::ArgDescValue>().elements) {
                 if (element.isPtr) {
                     return true;
@@ -96,6 +132,24 @@ bool KernelHelper::isAnyArgumentPtrByValue(const KernelDescriptor &kernelDescrip
         }
     }
     return false;
+}
+
+std::pair<GraphicsAllocation *, size_t> KernelHelper::getSyncBufferAllocationOffset(Device &device, const size_t requestedNumberOfWorkgroups) {
+    device.allocateSyncBufferHandler();
+
+    size_t requiredSize = KernelHelper::getSyncBufferSize(requestedNumberOfWorkgroups);
+
+    return device.syncBufferHandler->obtainAllocationAndOffset(requiredSize);
+}
+
+size_t KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(Device &device, size_t isaSize, bool isLastKernel) {
+    const size_t isaPadding = isLastKernel ? device.getGfxCoreHelper().getPaddingForISAAllocation() : 0u;
+    const size_t kernelStartPointerAlignment = device.getGfxCoreHelper().getKernelIsaPointerAlignment();
+    const auto &hwInfo = device.getHardwareInfo();
+    const size_t cacheLineSize = hwInfo.caps.cacheLineSize;
+    const size_t alignment = std::max(kernelStartPointerAlignment, cacheLineSize);
+    DEBUG_BREAK_IF(cacheLineSize > kernelStartPointerAlignment && (cacheLineSize % kernelStartPointerAlignment) != 0);
+    return alignUp(isaPadding + isaSize, alignment);
 }
 
 } // namespace NEO

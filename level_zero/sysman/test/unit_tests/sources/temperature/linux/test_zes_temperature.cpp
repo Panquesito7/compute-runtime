@@ -1,15 +1,19 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "level_zero/sysman/source/linux/pmt/sysman_pmt_xml_offsets.h"
+#include "shared/test/common/test_macros/hw_test.h"
+
 #include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_fixture.h"
 #include "level_zero/sysman/test/unit_tests/sources/temperature/linux/mock_sysfs_temperature.h"
 
+#include <algorithm>
+
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 constexpr uint32_t handleComponentCountForTwoTileDevices = 6u;
@@ -17,46 +21,18 @@ constexpr uint32_t handleComponentCountForSingleTileDevice = 3u;
 constexpr uint32_t handleComponentCountForNoSubDevices = 2u;
 constexpr uint32_t invalidMaxTemperature = 125;
 constexpr uint32_t invalidMinTemperature = 10;
-const std::string sampleGuid1 = "0xb15a0edc";
-const std::string sampleGuid2 = "0x490e01";
+constexpr double expectedMemoryTemperature = 39.0;
+constexpr double expectedGpuTemperature = 45.0;
 
 class SysmanMultiDeviceTemperatureFixture : public SysmanMultiDeviceFixture {
   protected:
-    std::unique_ptr<PublicLinuxTemperatureImp> pPublicLinuxTemperatureImp;
-    std::unique_ptr<MockTemperatureFsAccess> pFsAccess;
-    L0::Sysman::FsAccess *pFsAccessOriginal = nullptr;
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> mapOriginal;
     L0::Sysman::SysmanDevice *device = nullptr;
     void SetUp() override {
         SysmanMultiDeviceFixture::SetUp();
         device = pSysmanDevice;
         pSysmanDeviceImp->pTempHandleContext->handleList.clear();
-        pFsAccess = std::make_unique<MockTemperatureFsAccess>();
-        pFsAccessOriginal = pLinuxSysmanImp->pFsAccess;
-        pLinuxSysmanImp->pFsAccess = pFsAccess.get();
-
-        mapOriginal = pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject;
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.clear();
-
-        auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
-        uint32_t subdeviceId = 0;
-
-        do {
-            ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
-            auto pPmt = new MockTemperaturePmt(pFsAccess.get(), onSubdevice, subdeviceId);
-            pPmt->mockedInit(pFsAccess.get());
-            auto keyOffsetMapEntry = L0::Sysman::guidToKeyOffsetMap.find(sampleGuid1);
-            pPmt->keyOffsetMap = keyOffsetMapEntry->second;
-            pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.emplace(subdeviceId, pPmt);
-        } while (++subdeviceId < subDeviceCount);
-        getTempHandles(0);
     }
     void TearDown() override {
-        for (const auto &pmtMapElement : pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject) {
-            delete pmtMapElement.second;
-        }
-        pLinuxSysmanImp->pFsAccess = pFsAccessOriginal;
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject = mapOriginal;
         SysmanMultiDeviceFixture::TearDown();
     }
 
@@ -67,7 +43,157 @@ class SysmanMultiDeviceTemperatureFixture : public SysmanMultiDeviceFixture {
     }
 };
 
-TEST_F(SysmanMultiDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZetSysmanTemperatureGetThenZeroCountIsReturnedAndVerifySysmanTemperatureGetCallSucceeds) {
+static int mockReadLinkMultiTelemetryNodesSuccess(const char *path, char *buf, size_t bufsize) {
+
+    std::map<std::string, std::string> fileNameLinkMap = {
+        {sysfsPathTelem1, realPathTelem1},
+        {sysfsPathTelem2, realPathTelem2},
+        {sysfsPathTelem3, realPathTelem3},
+        {sysfsPathTelem4, realPathTelem4},
+        {sysfsPathTelem5, realPathTelem5},
+        {sysfsPathTelem6, realPathTelem6},
+    };
+    auto it = fileNameLinkMap.find(std::string(path));
+    if (it != fileNameLinkMap.end()) {
+        std::memcpy(buf, it->second.c_str(), it->second.size());
+        return static_cast<int>(it->second.size());
+    }
+    return -1;
+}
+
+static int mockReadLinkSingleTelemetryNodesSuccess(const char *path, char *buf, size_t bufsize) {
+
+    std::map<std::string, std::string> fileNameLinkMap = {
+        {sysfsPathTelem1, realPathTelem1},
+    };
+    auto it = fileNameLinkMap.find(std::string(path));
+    if (it != fileNameLinkMap.end()) {
+        std::memcpy(buf, it->second.c_str(), it->second.size());
+        return static_cast<int>(it->second.size());
+    }
+    return -1;
+}
+
+static int mockOpenSuccess(const char *pathname, int flags) {
+
+    int returnValue = -1;
+    std::string strPathName(pathname);
+    if (strPathName == telem1OffsetFileName || strPathName == telem2OffsetFileName || strPathName == telem3OffsetFileName || strPathName == telem5OffsetFileName || strPathName == telem6OffsetFileName) {
+        returnValue = 4;
+    } else if (strPathName == telem1GuidFileName || strPathName == telem2GuidFileName || strPathName == telem3GuidFileName || strPathName == telem5GuidFileName || strPathName == telem6GuidFileName) {
+        returnValue = 5;
+    } else if (strPathName == telem1TelemFileName || strPathName == telem2TelemFileName || strPathName == telem3TelemFileName || strPathName == telem5TelemFileName || strPathName == telem6TelemFileName) {
+        returnValue = 6;
+    }
+    return returnValue;
+}
+
+static ssize_t mockReadSuccessPvc(int fd, void *buf, size_t count, off_t offset) {
+    std::ostringstream oStream;
+    uint32_t val = 0;
+    if (fd == 4) {
+        memcpy(buf, &val, count);
+        return count;
+    } else if (fd == 5) {
+        oStream << "0xb15a0ede";
+    } else if (fd == 6) {
+        if (offset == offsetTileMaxTemperature) {
+            val = tileMaxTemperature;
+        } else if (offset == offsetGtMaxTemperature) {
+            val = gtMaxTemperature;
+        } else if (offset == offsetHbm0MaxDeviceTemperature) {
+            val = memory0MaxTemperature;
+        } else if (offset == offsetHbm1MaxDeviceTemperature) {
+            val = memory1MaxTemperature;
+        } else if (offset == offsetHbm2MaxDeviceTemperature) {
+            val = memory2MaxTemperature;
+        } else if (offset == offsetHbm3MaxDeviceTemperature) {
+            val = memory3MaxTemperature;
+        }
+        memcpy(buf, &val, count);
+        return count;
+    } else {
+        oStream << "-1";
+    }
+    std::string value = oStream.str();
+    memcpy(buf, value.data(), count);
+    return count;
+}
+
+static ssize_t mockReadSuccessDg1(int fd, void *buf, size_t count, off_t offset) {
+    std::ostringstream oStream;
+    uint32_t intVal = 0;
+    uint64_t longVal = 0;
+    if (fd == 4) {
+        memcpy(buf, &intVal, count);
+        return count;
+    } else if (fd == 5) {
+        oStream << "0x490e";
+    } else if (fd == 6) {
+        if (offset == offsetComputeTemperatures) {
+            for (uint8_t i = 0; i < sizeof(uint32_t); i++) {
+                intVal |= (uint32_t)tempArrForNoSubDevices[(computeTempIndex) + i] << (i * 8);
+            }
+            memcpy(buf, &intVal, sizeof(intVal));
+            return sizeof(intVal);
+        } else if (offset == offsetCoreTemperatures) {
+            for (uint8_t i = 0; i < sizeof(uint32_t); i++) {
+                intVal |= (uint32_t)tempArrForNoSubDevices[(coreTempIndex) + i] << (i * 8);
+            }
+            memcpy(buf, &intVal, sizeof(intVal));
+            return sizeof(intVal);
+        } else if (offset == offsetSocTemperatures1) {
+            for (uint8_t i = 0; i < sizeof(uint64_t); i++) {
+                longVal |= (uint64_t)tempArrForNoSubDevices[(socTempIndex) + i] << (i * 8);
+            }
+            memcpy(buf, &longVal, sizeof(longVal));
+            return sizeof(longVal);
+        }
+    } else {
+        oStream << "-1";
+    }
+    std::string value = oStream.str();
+    memcpy(buf, value.data(), count);
+    return count;
+}
+
+static ssize_t mockReadSuccessDg2(int fd, void *buf, size_t count, off_t offset) {
+    std::ostringstream oStream;
+    uint64_t val = 0;
+    if (fd == 4) {
+        memcpy(buf, &val, count);
+        return count;
+    } else if (fd == 5) {
+        oStream << "0x4f9502";
+    } else if (fd == 6) {
+        if (offset == offsetSocTemperatures2) {
+            for (uint8_t i = 0; i < sizeof(uint64_t); i++) {
+                val |= (uint64_t)tempArrForNoSubDevices[(socTempIndex) + i] << (i * 8);
+            }
+        }
+        memcpy(buf, &val, sizeof(val));
+        return sizeof(val);
+    } else {
+        oStream << "-1";
+    }
+    std::string value = oStream.str();
+    memcpy(buf, value.data(), count);
+    return count;
+}
+
+inline static int mockStatSuccess(const std::string &filePath, struct stat *statbuf) noexcept {
+    statbuf->st_mode = S_IWUSR | S_IRUSR | S_IFREG;
+    return 0;
+}
+
+HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZesSysmanTemperatureGetThenZeroCountIsReturnedAndVerifySysmanTemperatureGetCallSucceeds, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     uint32_t count = 0;
     ze_result_t result = zesDeviceEnumTemperatureSensors(device->toHandle(), &count, NULL);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -85,8 +211,16 @@ TEST_F(SysmanMultiDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZe
 }
 
 HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureThenValidTemperatureReadingsRetrieved, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_properties_t properties = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
         double temperature;
@@ -105,86 +239,51 @@ HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTe
     }
 }
 
-TEST_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureConfigThenUnsupportedIsReturned) {
+HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureConfigThenUnsupportedIsReturned, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_config_t config = {};
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureGetConfig(handle, &config));
     }
 }
 
-TEST_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenSettingTemperatureConfigThenUnsupportedIsReturned) {
+HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleWhenSettingTemperatureConfigThenUnsupportedIsReturned, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_config_t config = {};
         EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureSetConfig(handle, &config));
     }
 }
 
-TEST_F(SysmanMultiDeviceTemperatureFixture, GivenCreatePmtObjectsWhenRootTileIndexEnumeratesSuccessfulThenValidatePmtObjectsReceivedAndBranches) {
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> mapOfSubDeviceIdToPmtObject;
-    L0::Sysman::PlatformMonitoringTech::create(pLinuxSysmanImp, gpuUpstreamPortPathInTemperature, mapOfSubDeviceIdToPmtObject);
-    uint32_t subdeviceId = 0;
-    for (auto &subDeviceIdToPmtEntry : mapOfSubDeviceIdToPmtObject) {
-        EXPECT_NE(subDeviceIdToPmtEntry.second, nullptr);
-        EXPECT_EQ(subDeviceIdToPmtEntry.first, subdeviceId);
-        subdeviceId++;
-        delete subDeviceIdToPmtEntry.second; // delete memory to avoid mem leak here, as we finished our test validation just above.
-    }
-}
-
-TEST_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandleAndPmtReadValueFailsWhenGettingTemperatureThenFailureReturned) {
-    auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
-
-    auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
-    uint32_t subdeviceId = 0;
-
-    for (subdeviceId = 0; subdeviceId < subDeviceCount; subdeviceId++) {
-        auto pPmt = static_cast<MockTemperaturePmt *>(pLinuxSysmanImp->getPlatformMonitoringTechAccess(subdeviceId));
-        pPmt->mockReadValueResult = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-    }
-
-    for (auto &handle : handles) {
-        zes_temp_properties_t properties = {};
-        EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
-        double temperature;
-        ASSERT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureGetState(handle, &temperature));
-    }
-}
-
 class SysmanDeviceTemperatureFixture : public SysmanDeviceFixture {
   protected:
-    std::unique_ptr<PublicLinuxTemperatureImp> pPublicLinuxTemperatureImp;
-    std::unique_ptr<MockTemperatureFsAccess> pFsAccess;
-    L0::Sysman::FsAccess *pFsAccessOriginal = nullptr;
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> pmtMapOriginal;
     L0::Sysman::SysmanDevice *device = nullptr;
+    MockTemperatureFsAccess *pFsAccess = nullptr;
+    MockTemperatureProcfsAccess *pProcfsAccess = nullptr;
+    MockTemperatureSysfsAccess *pSysfsAccess = nullptr;
+    SysmanKmdInterface *pSysmanKmdInterface = nullptr;
+
     void SetUp() override {
         SysmanDeviceFixture::SetUp();
         device = pSysmanDevice;
-        pFsAccess = std::make_unique<MockTemperatureFsAccess>();
-        pFsAccessOriginal = pLinuxSysmanImp->pFsAccess;
-        pLinuxSysmanImp->pFsAccess = pFsAccess.get();
-
-        auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
-        uint32_t subdeviceId = 0;
-
-        pmtMapOriginal = pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject;
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.clear();
-        do {
-            ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
-            auto pPmt = new MockTemperaturePmt(pFsAccess.get(), onSubdevice, subdeviceId);
-            pPmt->mockedInit(pFsAccess.get());
-            auto keyOffsetMapEntry = L0::Sysman::guidToKeyOffsetMap.find(sampleGuid2);
-            pPmt->keyOffsetMap = keyOffsetMapEntry->second;
-            pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject.emplace(subdeviceId, pPmt);
-        } while (++subdeviceId < subDeviceCount);
-        getTempHandles(0);
     }
     void TearDown() override {
-        pLinuxSysmanImp->releasePmtObject();
-        pLinuxSysmanImp->mapOfSubDeviceIdToPmtObject = pmtMapOriginal;
-        pLinuxSysmanImp->pFsAccess = pFsAccessOriginal;
         SysmanDeviceFixture::TearDown();
     }
 
@@ -193,9 +292,421 @@ class SysmanDeviceTemperatureFixture : public SysmanDeviceFixture {
         EXPECT_EQ(zesDeviceEnumTemperatureSensors(device->toHandle(), &count, handles.data()), ZE_RESULT_SUCCESS);
         return handles;
     }
+
+    void setUpHwmonKmdInterfaceXe() {
+        pFsAccess = new MockTemperatureFsAccess();
+        pProcfsAccess = new MockTemperatureProcfsAccess();
+        pSysfsAccess = new MockTemperatureSysfsAccess();
+        auto pMockSysmanKmdInterface = new MockSysmanKmdInterfaceXe(pLinuxSysmanImp->getSysmanProductHelper());
+        pMockSysmanKmdInterface->pFsAccess.reset(pFsAccess);
+        pMockSysmanKmdInterface->pProcfsAccess.reset(pProcfsAccess);
+        pMockSysmanKmdInterface->pSysfsAccess.reset(pSysfsAccess);
+        pSysmanKmdInterface = pMockSysmanKmdInterface;
+        pLinuxSysmanImp->pSysmanKmdInterface.reset(pSysmanKmdInterface);
+        pLinuxSysmanImp->pFsAccess = pSysmanKmdInterface->getFsAccess();
+        pLinuxSysmanImp->pProcfsAccess = pSysmanKmdInterface->getProcFsAccess();
+        pLinuxSysmanImp->pSysfsAccess = pSysmanKmdInterface->getSysFsAccess();
+    }
+
+    void setUpHwmonKmdInterfaceI915Upstream() {
+        pFsAccess = new MockTemperatureFsAccess();
+        pProcfsAccess = new MockTemperatureProcfsAccess();
+        pSysfsAccess = new MockTemperatureSysfsAccess();
+        pFsAccess->hwmonName0 = "i915";
+        auto pMockSysmanKmdInterface = new MockSysmanKmdInterfaceUpstream(pLinuxSysmanImp->getSysmanProductHelper());
+        pMockSysmanKmdInterface->pFsAccess.reset(pFsAccess);
+        pMockSysmanKmdInterface->pProcfsAccess.reset(pProcfsAccess);
+        pMockSysmanKmdInterface->pSysfsAccess.reset(pSysfsAccess);
+        pSysmanKmdInterface = pMockSysmanKmdInterface;
+        pLinuxSysmanImp->pSysmanKmdInterface.reset(pSysmanKmdInterface);
+        pLinuxSysmanImp->pFsAccess = pSysmanKmdInterface->getFsAccess();
+        pLinuxSysmanImp->pProcfsAccess = pSysmanKmdInterface->getProcFsAccess();
+        pLinuxSysmanImp->pSysfsAccess = pSysmanKmdInterface->getSysFsAccess();
+    }
 };
 
+TEST_F(SysmanDeviceTemperatureFixture, GivenHwmonTemp2EmergencyFileWhenGettingPropertiesThenMaxTemperatureIsReadFromSysfs) {
+    setUpHwmonKmdInterfaceXe();
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_EQ(ZES_TEMP_SENSORS_GPU, properties.type);
+    EXPECT_FALSE(properties.onSubdevice);
+    EXPECT_EQ(0u, properties.subdeviceId);
+    EXPECT_DOUBLE_EQ(125.0, properties.maxTemperature);
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenSubdeviceHandleWhenGettingPropertiesThenSubdeviceMetadataAndMaxTemperatureAreReturned) {
+    setUpHwmonKmdInterfaceXe();
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, true, 1u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_EQ(ZES_TEMP_SENSORS_MEMORY, properties.type);
+    EXPECT_TRUE(properties.onSubdevice);
+    EXPECT_EQ(1u, properties.subdeviceId);
+    EXPECT_DOUBLE_EQ(125.0, properties.maxTemperature);
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenHwmonScanFailureWhenGettingPropertiesThenDefaultMaxTemperatureIsReturned) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->scanResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_DOUBLE_EQ(defaultMaxTemperature, properties.maxTemperature);
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenHwmonNameReadFailureAndNoMatchingHwmonWhenGettingPropertiesThenDefaultMaxTemperatureIsReturned) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->directoryEntries = {"hwmon0", "hwmon1"};
+    pFsAccess->hwmonNameReadResult0 = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    pFsAccess->hwmonNameReadResult1 = ZE_RESULT_SUCCESS;
+    pFsAccess->hwmonName1 = "not_xe";
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_DOUBLE_EQ(defaultMaxTemperature, properties.maxTemperature);
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenTemp2EmergencyNodeMissingWhenGettingPropertiesThenDefaultMaxTemperatureIsReturned) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->temp2EmergencyExists = false;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_DOUBLE_EQ(defaultMaxTemperature, properties.maxTemperature);
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenTemp2EmergencyReadFailureWhenGettingPropertiesThenDefaultMaxTemperatureIsReturned) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->temp2EmergencyReadResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_DOUBLE_EQ(defaultMaxTemperature, properties.maxTemperature);
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenDevicePciBdfIsUnresolvableWhenGettingPropertiesThenDefaultMaxTemperatureIsReturned) {
+    setUpHwmonKmdInterfaceXe();
+    pSysfsAccess->realPathResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    zes_temp_properties_t properties = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getProperties(&properties));
+    EXPECT_DOUBLE_EQ(defaultMaxTemperature, properties.maxTemperature);
+    EXPECT_TRUE(pFsAccess->listDirectoryPathRequested.empty());
+}
+
+TEST_F(SysmanDeviceTemperatureFixture, GivenHwmonDirectoryIsSearchedWhenInitializingThenAbsolutePciDevicePathIsUsed) {
+    setUpHwmonKmdInterfaceXe();
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    EXPECT_EQ(0u, pFsAccess->listDirectoryPathRequested.find("/sys/bus/pci/devices/"));
+    EXPECT_EQ(std::string::npos, pFsAccess->listDirectoryPathRequested.find("/sys/class/drm/"));
+    EXPECT_EQ(mockTemperatureHwmonDir, pFsAccess->listDirectoryPathRequested);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonMemoryTemperatureNodeWhenGettingMemoryTemperatureThenTemperatureIsReadFromSysfs, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_DOUBLE_EQ(expectedMemoryTemperature, temperature);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonMemoryTemperatureReadFailureWhenGettingMemoryTemperatureThenErrorIsReturned, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = true;
+    pFsAccess->memoryTemperatureReadResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, temperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenPrivilegedUserAndHwmonMemoryTemperatureNodeWhenGettingMemoryTemperatureThenTemperatureIsReadFromSysfs, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = true;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_DOUBLE_EQ(expectedMemoryTemperature, temperature);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndMissingHwmonMemoryTemperatureNodeWhenGettingMemoryTemperatureThenTelemetryIsUsed, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = false;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonMemoryTemperatureNodeWhenGettingGpuAndGlobalTemperatureThenTelemetryIsUsed, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp gpuTemperatureImp(pOsSysman, false, 0u, 0u);
+    gpuTemperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+    PublicLinuxTemperatureImp globalTemperatureImp(pOsSysman, false, 0u, 0u);
+    globalTemperatureImp.setSensorType(ZES_TEMP_SENSORS_GLOBAL);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, gpuTemperatureImp.getSensorTemperature(&temperature));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, globalTemperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonMemoryTemperatureNodeAndNoTelemetrySupportWhenCheckingTempModuleSupportThenTrueIsReturned, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    EXPECT_TRUE(temperatureImp.isTempModuleSupported());
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenPrivilegedUserAndHwmonMemoryTemperatureNodeAndNoTelemetrySupportWhenCheckingTempModuleSupportThenTrueIsReturned, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = true;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    EXPECT_TRUE(temperatureImp.isTempModuleSupported());
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonMemoryTemperatureNodeAppearingAfterReInitWhenGettingMemoryTemperatureThenTemperatureIsReadFromSysfs, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+
+    pFsAccess->memoryTemperatureExists = true;
+    temperatureImp.reInit();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_DOUBLE_EQ(expectedMemoryTemperature, temperature);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenSysfsTemperatureSupportedAndKmdInterfaceWithoutMemoryTemperatureFileNameWhenInitializingThenMemoryTemperatureNodeIsNotProbed, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceI915Upstream();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_FALSE(temperatureImp.isTempModuleSupported());
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenProductWithoutSysfsTemperatureSupportAndNonPrivilegedUserWhenGettingMemoryTemperatureThenTelemetryIsUsed, IsDG2) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->memoryTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonGpuTemperatureNodeWhenGettingGpuTemperatureThenTemperatureIsReadFromSysfs, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_DOUBLE_EQ(expectedGpuTemperature, temperature);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonGpuTemperatureReadFailureWhenGettingGpuTemperatureThenErrorIsReturned, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = true;
+    pFsAccess->gpuTemperatureReadResult = ZE_RESULT_ERROR_NOT_AVAILABLE;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, temperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenPrivilegedUserAndHwmonGpuTemperatureNodeWhenGettingGpuTemperatureThenTemperatureIsReadFromSysfs, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = true;
+    pFsAccess->gpuTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_DOUBLE_EQ(expectedGpuTemperature, temperature);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndMissingHwmonGpuTemperatureNodeWhenGettingGpuTemperatureThenTelemetryIsUsed, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = false;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_FALSE(temperatureImp.isTempModuleSupported());
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonGpuTemperatureNodeWhenGettingMemoryAndGlobalTemperatureThenTelemetryIsUsed, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = true;
+
+    PublicLinuxTemperatureImp memoryTemperatureImp(pOsSysman, false, 0u, 0u);
+    memoryTemperatureImp.setSensorType(ZES_TEMP_SENSORS_MEMORY);
+    PublicLinuxTemperatureImp globalTemperatureImp(pOsSysman, false, 0u, 0u);
+    globalTemperatureImp.setSensorType(ZES_TEMP_SENSORS_GLOBAL);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, memoryTemperatureImp.getSensorTemperature(&temperature));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, globalTemperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonGpuTemperatureNodeAndNoTelemetrySupportWhenCheckingTempModuleSupportThenTrueIsReturned, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    EXPECT_TRUE(temperatureImp.isTempModuleSupported());
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenNonPrivilegedUserAndHwmonGpuTemperatureNodeAppearingAfterReInitWhenGettingGpuTemperatureThenTemperatureIsReadFromSysfs, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+
+    pFsAccess->gpuTemperatureExists = true;
+    temperatureImp.reInit();
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_DOUBLE_EQ(expectedGpuTemperature, temperature);
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenSysfsTemperatureSupportedAndKmdInterfaceWithoutGpuTemperatureFileNameWhenInitializingThenGpuTemperatureNodeIsNotProbed, IsBmgOrCri) {
+    setUpHwmonKmdInterfaceI915Upstream();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+    EXPECT_FALSE(temperatureImp.isTempModuleSupported());
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenProductWithoutSysfsTemperatureSupportAndNonPrivilegedUserWhenGettingGpuTemperatureThenTelemetryIsUsed, IsDG2) {
+    setUpHwmonKmdInterfaceXe();
+    pFsAccess->isRootUserResult = false;
+    pFsAccess->gpuTemperatureExists = true;
+
+    PublicLinuxTemperatureImp temperatureImp(pOsSysman, false, 0u, 0u);
+    temperatureImp.setSensorType(ZES_TEMP_SENSORS_GPU);
+
+    double temperature = 0.0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, temperatureImp.getSensorTemperature(&temperature));
+}
+
+HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidPowerHandleAndHandleCountZeroWhenCallingReInitThenValidCountIsReturnedAndVerifyzesDeviceEnumPowerHandleSucceeds, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumTemperatureSensors(device->toHandle(), &count, NULL));
+    EXPECT_EQ(count, handleComponentCountForSingleTileDevice);
+
+    pSysmanDeviceImp->pTempHandleContext->handleList.clear();
+
+    pLinuxSysmanImp->reInitSysmanDeviceResources();
+
+    count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, zesDeviceEnumTemperatureSensors(device->toHandle(), &count, NULL));
+    EXPECT_EQ(count, handleComponentCountForSingleTileDevice);
+}
+
 HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingGPUAndGlobalTemperatureThenValidTemperatureReadingsRetrieved, IsDG1) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkSingleTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessDg1);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     auto handles = getTempHandles(handleComponentCountForNoSubDevices);
     for (auto &handle : handles) {
         zes_temp_properties_t properties = {};
@@ -219,41 +730,14 @@ HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingGPUAndG
     }
 }
 
-HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleAndReadCoreTemperatureFailsWhenGettingGpuAndGlobalTempThenValidGpuTempAndFailureForGlobalTempAreReturned, IsDG1) {
-    auto handles = getTempHandles(handleComponentCountForNoSubDevices);
-    uint32_t subdeviceId = 0;
-
-    auto pPmt = static_cast<MockTemperaturePmt *>(pLinuxSysmanImp->getPlatformMonitoringTechAccess(subdeviceId));
-    pPmt->mockReadCoreTempResult = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-
-    for (auto &handle : handles) {
-        zes_temp_properties_t properties = {};
-        EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
-        double temperature;
-        if (properties.type == ZES_TEMP_SENSORS_GLOBAL) {
-            EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureGetState(handle, &temperature));
-        }
-        if (properties.type == ZES_TEMP_SENSORS_GPU) {
-            ASSERT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetState(handle, &temperature));
-            EXPECT_EQ(temperature, static_cast<double>(tempArrForNoSubDevices[computeIndexForNoSubDevices]));
-        }
-    }
-}
-
-HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleAndReadComputeTemperatureFailsWhenGettingGPUAndGlobalTemperatureThenFailureReturned, IsDG1) {
-    auto handles = getTempHandles(handleComponentCountForNoSubDevices);
-    uint32_t subdeviceId = 0;
-
-    auto pPmt = static_cast<MockTemperaturePmt *>(pLinuxSysmanImp->getPlatformMonitoringTechAccess(subdeviceId));
-    pPmt->mockReadComputeTempResult = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-
-    for (auto &handle : handles) {
-        double temperature;
-        ASSERT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureGetState(handle, &temperature));
-    }
-}
-
 HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingGPUAndGlobalTemperatureThenValidTemperatureReadingsRetrieved, IsDG2) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkSingleTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessDg2);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     auto handles = getTempHandles(handleComponentCountForNoSubDevices);
     for (auto &handle : handles) {
         zes_temp_properties_t properties = {};
@@ -262,7 +746,6 @@ HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingGPUAndG
         ASSERT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetState(handle, &temperature));
         if (properties.type == ZES_TEMP_SENSORS_GLOBAL) {
             uint8_t maxTemp = 0;
-            // For DG2, Global Max temperature will be Maximum of SOC_TEMPERATURES
             for (uint64_t i = 0; i < sizeof(uint64_t); i++) {
                 if ((tempArrForNoSubDevices[i] > invalidMaxTemperature) ||
                     (tempArrForNoSubDevices[i] < invalidMinTemperature) || (maxTemp > tempArrForNoSubDevices[i])) {
@@ -278,63 +761,35 @@ HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingGPUAndG
     }
 }
 
-TEST_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleAndPmtReadValueFailsWhenGettingTemperatureThenFailureReturned) {
-    auto handles = getTempHandles(handleComponentCountForNoSubDevices);
-    uint32_t subdeviceId = 0;
-
-    auto pPmt = static_cast<MockTemperaturePmt *>(pLinuxSysmanImp->getPlatformMonitoringTechAccess(subdeviceId));
-    pPmt->mockReadValueResult = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-
-    for (auto &handle : handles) {
-        zes_temp_properties_t properties = {};
-        EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
-        double temperature;
-        ASSERT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesTemperatureGetState(handle, &temperature));
-    }
-}
-
 TEST_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingUnsupportedSensorsTemperatureThenUnsupportedReturned) {
     auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
     ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
     uint32_t subdeviceId = 0;
 
-    auto pPublicLinuxTemperatureImp = std::make_unique<L0::Sysman::LinuxTemperatureImp>(pOsSysman, onSubdevice, subdeviceId);
+    auto pPublicLinuxTemperatureImp = std::make_unique<L0::Sysman::LinuxTemperatureImp>(pOsSysman, onSubdevice, subdeviceId, 0u);
     pPublicLinuxTemperatureImp->setSensorType(ZES_TEMP_SENSORS_MEMORY_MIN);
     double temperature;
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pPublicLinuxTemperatureImp->getSensorTemperature(&temperature));
 }
 
-TEST_F(SysmanDeviceTemperatureFixture, GivenValidateEnumerateRootTelemIndexWhengetRealPathFailsThenFailureReturned) {
-    pFsAccess->mockErrorListDirectory = ZE_RESULT_ERROR_NOT_AVAILABLE;
-    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE,
-              L0::Sysman::PlatformMonitoringTech::enumerateRootTelemIndex(pFsAccess.get(), gpuUpstreamPortPathInTemperature));
+TEST_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTempSensorsMemoryMinSupportThenFalseIsReturned) {
+    auto subDeviceCount = pLinuxSysmanImp->getSubDeviceCount();
+    ze_bool_t onSubdevice = (subDeviceCount == 0) ? false : true;
+    uint32_t subdeviceId = 0;
 
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> mapOfSubDeviceIdToPmtObject;
-    L0::Sysman::PlatformMonitoringTech::create(pLinuxSysmanImp, gpuUpstreamPortPathInTemperature, mapOfSubDeviceIdToPmtObject);
-    EXPECT_TRUE(mapOfSubDeviceIdToPmtObject.empty());
-}
-
-TEST_F(SysmanDeviceTemperatureFixture, GivenValidatePmtReadValueWhenkeyOffsetMapIsNotThereThenFailureReturned) {
-    auto pPmt = std::make_unique<MockTemperaturePmt>(pFsAccess.get(), 0, 0);
-    pPmt->mockedInit(pFsAccess.get());
-    // Get keyOffsetMap
-    auto keyOffsetMapEntry = L0::Sysman::guidToKeyOffsetMap.find(sampleGuid2);
-    pPmt->keyOffsetMap = keyOffsetMapEntry->second;
-    uint32_t val = 0;
-    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pPmt->readValue("SOMETHING", val));
-}
-
-TEST_F(SysmanDeviceTemperatureFixture, GivenCreatePmtObjectsWhenRootTileIndexEnumeratesSuccessfulThenValidatePmtObjectsReceivedAndBranches) {
-    std::map<uint32_t, L0::Sysman::PlatformMonitoringTech *> mapOfSubDeviceIdToPmtObject;
-    L0::Sysman::PlatformMonitoringTech::create(pLinuxSysmanImp, gpuUpstreamPortPathInTemperature, mapOfSubDeviceIdToPmtObject);
-    for (auto &subDeviceIdToPmtEntry : mapOfSubDeviceIdToPmtObject) {
-        EXPECT_NE(subDeviceIdToPmtEntry.second, nullptr);
-        EXPECT_EQ(subDeviceIdToPmtEntry.first, 0u);
-        delete subDeviceIdToPmtEntry.second;
-    }
+    auto pPublicLinuxTemperatureImp = std::make_unique<L0::Sysman::LinuxTemperatureImp>(pOsSysman, onSubdevice, subdeviceId, 0u);
+    pPublicLinuxTemperatureImp->setSensorType(ZES_TEMP_SENSORS_MEMORY_MIN);
+    EXPECT_EQ(false, pPublicLinuxTemperatureImp->isTempModuleSupported());
 }
 
 HWTEST2_F(SysmanDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZetSysmanTemperatureGetThenZeroCountIsReturnedAndVerifySysmanTemperatureGetCallSucceeds, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     uint32_t count = 0;
     ze_result_t result = zesDeviceEnumTemperatureSensors(device->toHandle(), &count, NULL);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -352,8 +807,16 @@ HWTEST2_F(SysmanDeviceTemperatureFixture, GivenComponentCountZeroWhenCallingZetS
 }
 
 HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTemperatureThenValidTemperatureReadingsRetrieved, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
     auto handles = getTempHandles(handleComponentCountForSingleTileDevice);
     for (auto handle : handles) {
+        ASSERT_NE(nullptr, handle);
         zes_temp_properties_t properties = {};
         EXPECT_EQ(ZE_RESULT_SUCCESS, zesTemperatureGetProperties(handle, &properties));
         double temperature;
@@ -372,5 +835,27 @@ HWTEST2_F(SysmanDeviceTemperatureFixture, GivenValidTempHandleWhenGettingTempera
     }
 }
 
+HWTEST2_F(SysmanMultiDeviceTemperatureFixture, GivenValidTempHandlesWhenCallingReInitOnTemperatureHandleContextThenHandlesRemainValidAndPropertiesCanStillBeQueried, IsPVC) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadLink(&NEO::SysCalls::sysCallsReadlink, &mockReadLinkMultiTelemetryNodesSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, &mockOpenSuccess);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, &mockReadSuccessPvc);
+    VariableBackup<decltype(NEO::SysCalls::sysCallsStat)> mockStat(&NEO::SysCalls::sysCallsStat, &mockStatSuccess);
+    VariableBackup<bool> allowFakeDevicePathBackup(&NEO::SysCalls::allowFakeDevicePath, true);
+
+    auto handles = getTempHandles(handleComponentCountForTwoTileDevices);
+    ASSERT_EQ(handleComponentCountForTwoTileDevices, static_cast<uint32_t>(handles.size()));
+
+    pSysmanDeviceImp->pTempHandleContext->reInit();
+
+    EXPECT_EQ(handleComponentCountForTwoTileDevices, static_cast<uint32_t>(pSysmanDeviceImp->pTempHandleContext->handleList.size()));
+    for (auto &handle : pSysmanDeviceImp->pTempHandleContext->handleList) {
+        ASSERT_NE(nullptr, handle);
+        zes_temp_properties_t properties = {};
+        EXPECT_EQ(ZE_RESULT_SUCCESS, handle->temperatureGetProperties(&properties));
+    }
+}
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

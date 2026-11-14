@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,6 @@
 
 #pragma once
 #include "level_zero/api/sysman/zes_handles_struct.h"
-#include "level_zero/core/source/device/device.h"
 #include <level_zero/zes_api.h>
 
 #include <mutex>
@@ -16,8 +15,10 @@
 namespace L0 {
 
 struct OsSysman;
+
 class Power : _zes_pwr_handle_t {
   public:
+    virtual ~Power() = default;
     virtual ze_result_t powerGetProperties(zes_power_properties_t *pProperties) = 0;
     virtual ze_result_t powerGetEnergyCounter(zes_power_energy_counter_t *pEnergy) = 0;
     virtual ze_result_t powerGetLimits(zes_power_sustained_limit_t *pSustained, zes_power_burst_limit_t *pBurst, zes_power_peak_limit_t *pPeak) = 0;
@@ -35,20 +36,27 @@ class Power : _zes_pwr_handle_t {
     bool isCardPower = false;
 };
 struct PowerHandleContext {
-    PowerHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman){};
+    PowerHandleContext(OsSysman *pOsSysman) : pOsSysman(pOsSysman) {};
     ~PowerHandleContext();
 
     ze_result_t init(std::vector<ze_device_handle_t> &deviceHandles, ze_device_handle_t coreDevice);
     ze_result_t powerGet(uint32_t *pCount, zes_pwr_handle_t *phPower);
     ze_result_t powerGetCardDomain(zes_pwr_handle_t *phPower);
 
+    void releasePowerHandles();
+
     OsSysman *pOsSysman = nullptr;
     std::vector<Power *> handleList = {};
+
+    bool isPowerInitDone() {
+        return powerInitDone;
+    }
 
   private:
     void createHandle(ze_device_handle_t deviceHandle);
     std::once_flag initPowerOnce;
     void initPower();
+    bool powerInitDone = false;
 };
 
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -23,7 +23,7 @@ using namespace NEO;
 
 HWTEST2_F(ComputeModeRequirements, GivenProgramExtendedPipeControlPriorToNonPipelinedStateCommandEnabledThenCorrectCommandsAreAdded, IsDG2) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(true);
+    debugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(true);
 
     setUpImpl<FamilyType>();
 
@@ -71,7 +71,7 @@ HWTEST2_F(ComputeModeRequirements, GivenMultipleCCSEnabledSetupThenCorrectComman
     hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 2;
 
     setUpImpl<FamilyType>(&hwInfo);
-    MockOsContext ccsOsContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::Regular}));
+    MockOsContext ccsOsContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::regular}));
 
     getCsrHw<FamilyType>()->setupContext(ccsOsContext);
 
@@ -119,12 +119,11 @@ HWTEST2_F(ComputeModeRequirements, GivenSingleCCSEnabledSetupThenCorrectCommands
     hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
 
     setUpImpl<FamilyType>(&hwInfo);
-    MockOsContext ccsOsContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::Regular}));
+    MockOsContext ccsOsContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_CCS, EngineUsage::regular}));
 
     getCsrHw<FamilyType>()->setupContext(ccsOsContext);
 
     using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
-    using FORCE_NON_COHERENT = typename STATE_COMPUTE_MODE::FORCE_NON_COHERENT;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
     auto cmdsSize = sizeof(STATE_COMPUTE_MODE) + sizeof(PIPE_CONTROL);
@@ -169,7 +168,7 @@ HWTEST2_F(ComputeModeRequirements, GivenSingleCCSEnabledSetupThenCorrectCommands
 
 HWTEST2_F(ComputeModeRequirements, GivenProgramExtendedPipeControlPriorToNonPipelinedStateCommandEnabledThenCommandSizeIsCalculatedAndCorrectCommandSizeIsReturned, IsDG2) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(true);
+    debugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(true);
 
     using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;

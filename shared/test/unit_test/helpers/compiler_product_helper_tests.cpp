@@ -1,87 +1,62 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/compiler_interface/compiler_options.h"
+#include "shared/source/helpers/bit_helpers.h"
 #include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/kernel/kernel_properties.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/test_macros/heapless_matchers.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 using namespace NEO;
 
 using CompilerProductHelperFixture = Test<DeviceFixture>;
 
-HWTEST_F(CompilerProductHelperFixture, WhenIsMidThreadPreemptionIsSupportedIsCalledThenCorrectResultIsReturned) {
-    auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
-    UnitTestHelper<FamilyType>::setExtraMidThreadPreemptionFlag(hwInfo, false);
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    EXPECT_FALSE(compilerProductHelper.isMidThreadPreemptionSupported(hwInfo));
-    UnitTestHelper<FamilyType>::setExtraMidThreadPreemptionFlag(hwInfo, true);
-    EXPECT_TRUE(compilerProductHelper.isMidThreadPreemptionSupported(hwInfo));
+TEST(CompilerProductHelperTest, GivenIgcLibraryNameDebugKeyWhenQueryingForCustomIgcLibraryNameThenDebugKeyValueisReturned) {
+    DebugManagerStateRestore restorer;
+
+    debugManager.flags.IgcLibraryName.set("my_custom_igc.so");
+    auto compilerProductHelper = CompilerProductHelper::create(defaultHwInfo->platform.eProductFamily);
+    EXPECT_STREQ("my_custom_igc.so", compilerProductHelper->getCustomIgcLibraryName());
 }
 
 TEST(CompilerProductHelperTest, WhenCompilerProductHelperCreateIsCalledWithUnknownProductThenNullptrIsReturned) {
     EXPECT_EQ(nullptr, CompilerProductHelper::create(IGFX_UNKNOWN));
 }
 
-using IsBeforeXeHpc = IsBeforeGfxCore<IGFX_XE_HPC_CORE>;
-
-HWTEST2_F(CompilerProductHelperFixture, GivenProductBeforeXeHpcWhenIsForceToStatelessRequiredThenFalseIsReturned, IsBeforeXeHpc) {
+HWTEST2_F(CompilerProductHelperFixture, GivenProductBeforeXeHpcWhenIsForceToStatelessRequiredThenFalseIsReturned, IsAtMostXeHpgCore) {
     auto &compilerProductHelper = getHelper<CompilerProductHelper>();
     EXPECT_FALSE(compilerProductHelper.isForceToStatelessRequired());
 }
 
-using IsAtLeastXeHpc = IsAtLeastGfxCore<IGFX_XE_HPC_CORE>;
-
-HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterWhenIsForceToStatelessRequiredThenCorrectResultIsReturned, IsAtLeastXeHpc) {
+HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterWhenIsForceToStatelessRequiredThenCorrectResultIsReturned, IsAtLeastXeHpcCore) {
     DebugManagerStateRestore restorer;
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     EXPECT_TRUE(compilerProductHelper.isForceToStatelessRequired());
 
-    DebugManager.flags.DisableForceToStateless.set(false);
+    debugManager.flags.DisableForceToStateless.set(false);
     EXPECT_TRUE(compilerProductHelper.isForceToStatelessRequired());
 
-    DebugManager.flags.DisableForceToStateless.set(true);
+    debugManager.flags.DisableForceToStateless.set(true);
     EXPECT_FALSE(compilerProductHelper.isForceToStatelessRequired());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenGen11AndLaterThenSubgroupLocalBlockIoIsSupported, IsAtLeastGen11) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-
-    EXPECT_TRUE(compilerProductHelper.isSubgroupLocalBlockIoSupported());
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenGen9OrBeforeThenSubgroupLocalBlockIoIsNotSupported, IsAtMostGen9) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-
-    EXPECT_FALSE(compilerProductHelper.isSubgroupLocalBlockIoSupported());
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenXeHpAndLaterThenDotAccumulateIsSupported, IsAtLeastXeHpCore) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-
-    EXPECT_TRUE(compilerProductHelper.isDotAccumulateSupported());
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpThenDotAccumulateIsNotSupported, IsAtMostGen12lp) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-
-    EXPECT_FALSE(compilerProductHelper.isDotAccumulateSupported());
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenXeHpAndLaterThenCreateBufferWithPropertiesIsSupported, IsAtLeastXeHpCore) {
+HWTEST2_F(CompilerProductHelperFixture, GivenXeHpAndLaterThenCreateBufferWithPropertiesIsSupported, IsAtLeastXeCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
     EXPECT_TRUE(compilerProductHelper.isCreateBufferWithPropertiesSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpThenCreateBufferWithPropertiesIsNotSupported, IsAtMostGen12lp) {
+HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpThenCreateBufferWithPropertiesIsNotSupported, IsGen12LP) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
     EXPECT_FALSE(compilerProductHelper.isCreateBufferWithPropertiesSupported());
@@ -99,7 +74,7 @@ HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpcThenSubgroupNamedBarrierIsN
     EXPECT_FALSE(compilerProductHelper.isSubgroupNamedBarrierSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterThenSubgroupExtendedBlockReadIsSupported, IsAtLeastXeHpcCore) {
+HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterThenSubgroupExtendedBlockReadIsSupported, IsWithinXeHpcCoreAndXe3pCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
     EXPECT_TRUE(compilerProductHelper.isSubgroupExtendedBlockReadSupported());
@@ -111,46 +86,51 @@ HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpcThenSubgroupExtendedBlockRe
     EXPECT_FALSE(compilerProductHelper.isSubgroupExtendedBlockReadSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenXeHpAndLaterThenBFloat16ConversionIsSupported, IsAtLeastXeHpCore) {
+HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterThenSubgroup2DBlockIOIsSupported, IsAtLeastXeHpcCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
-    EXPECT_TRUE(compilerProductHelper.isBFloat16ConversionSupported(pDevice->getHardwareInfo()));
+    EXPECT_TRUE(compilerProductHelper.isSubgroup2DBlockIOSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenXeHpAndLaterThenMatrixMultiplyAccumulateIsSupported, IsAtLeastXeHpCore) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    auto releaseHelper = pDevice->getReleaseHelper();
-
-    EXPECT_TRUE(compilerProductHelper.isMatrixMultiplyAccumulateSupported(releaseHelper));
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenXeFamilyThenSplitMatrixMultiplyAccumulateIsSupported, IsWithinXeGfxFamily) {
+HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpcThenSubgroup2DBlockIOIsNotSupported, IsAtMostXeHpgCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
-    EXPECT_TRUE(compilerProductHelper.isSplitMatrixMultiplyAccumulateSupported(pDevice->getHardwareInfo()));
+    EXPECT_FALSE(compilerProductHelper.isSubgroup2DBlockIOSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenNotXeFamilyThenSplitMatrixMultiplyAccumulateIsNotSupported, IsNotWithinXeGfxFamily) {
+HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterThenSubgroupBufferPrefetchIsSupported, IsAtLeastXeHpcCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
-    EXPECT_FALSE(compilerProductHelper.isSplitMatrixMultiplyAccumulateSupported(pDevice->getHardwareInfo()));
+    EXPECT_TRUE(compilerProductHelper.isSubgroupBufferPrefetchSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpThenBFloat16ConversionIsNotSupported, IsAtMostGen12lp) {
+HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpcThenSubgroupBufferPrefetchIsNotSupported, IsAtMostXeHpgCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
-    EXPECT_FALSE(compilerProductHelper.isBFloat16ConversionSupported(pDevice->getHardwareInfo()));
+    EXPECT_FALSE(compilerProductHelper.isSubgroupBufferPrefetchSupported());
 }
 
-HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpThenMatrixMultiplyAccumulateIsNotSupported, IsAtMostGen12lp) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    auto releaseHelper = pDevice->getReleaseHelper();
-    EXPECT_FALSE(compilerProductHelper.isMatrixMultiplyAccumulateSupported(releaseHelper));
-}
-
-HWTEST2_F(CompilerProductHelperFixture, givenAotConfigWhenSetHwInfoRevisionIdThenCorrectValueIsSet, IsAtMostDg2) {
+HWTEST2_F(CompilerProductHelperFixture, GivenXeHpcAndLaterThenMatrixMultiplyAccumulateTF32IsSupported, IsAtLeastXeHpcCore) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     auto hwInfo = *defaultHwInfo;
+
+    EXPECT_TRUE(compilerProductHelper.isMatrixMultiplyAccumulateTF32Supported(hwInfo));
+}
+
+HWTEST2_F(CompilerProductHelperFixture, GivenPreXeHpcThenMatrixMultiplyAccumulateTF32IsNotSupported, IsAtMostXeHpgCore) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto hwInfo = *defaultHwInfo;
+
+    EXPECT_FALSE(compilerProductHelper.isMatrixMultiplyAccumulateTF32Supported(hwInfo));
+}
+
+using IsDg2OrPvc = IsWithinProducts<IGFX_DG2, IGFX_PVC>;
+using IsNotDg2OrPvc = IsNotWithinProducts<IGFX_DG2, IGFX_PVC>;
+
+HWTEST2_F(CompilerProductHelperFixture, givenAotConfigWhenSetHwInfoRevisionIdThenCorrectValueIsSet, IsDg2OrPvc) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.platform.usRevId = CommonConstants::invalidRevisionID;
     auto productConfig = compilerProductHelper.getHwIpVersion(*defaultHwInfo);
     HardwareIpVersion aotConfig = {0};
     aotConfig.value = productConfig;
@@ -159,22 +139,42 @@ HWTEST2_F(CompilerProductHelperFixture, givenAotConfigWhenSetHwInfoRevisionIdThe
     EXPECT_EQ(hwInfo.ipVersion.value, aotConfig.value);
 }
 
-HWTEST2_F(CompilerProductHelperFixture, givenAtMostXeHPWhenGetCachingPolicyOptionsThenReturnNullptr, IsAtMostXeHpCore) {
+HWTEST2_F(CompilerProductHelperFixture, givenAotConfigWhenSetProductConfigForHwInfoThenRevisionIdIsNotChanged, IsNotDg2OrPvc) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.platform.usRevId = CommonConstants::invalidRevisionID;
+    auto productConfig = compilerProductHelper.getHwIpVersion(*defaultHwInfo);
+    HardwareIpVersion aotConfig = {0};
+    aotConfig.value = productConfig;
+    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
+    EXPECT_EQ(CommonConstants::invalidRevisionID, hwInfo.platform.usRevId);
+    EXPECT_EQ(hwInfo.ipVersion.value, aotConfig.value);
+}
+
+HWTEST2_F(CompilerProductHelperFixture, givenAtMostXeHPWhenGetCachingPolicyOptionsThenReturnNullptr, IsGen12LP) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     EXPECT_EQ(compilerProductHelper.getCachingPolicyOptions(false), nullptr);
     EXPECT_EQ(compilerProductHelper.getCachingPolicyOptions(true), nullptr);
 }
 
-HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreWhenGetCachingPolicyOptionsThenReturnWriteByPassPolicyOption, IsAtLeastXeHpgCore) {
+HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreWhenGetCachingPolicyOptionsThenReturnWriteByPassPolicyOption, IsWithinXeCoreAndXe3Core) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     const char *expectedStr = "-cl-store-cache-default=2 -cl-load-cache-default=4";
     EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
     EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
 }
 
-HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreWhenGetCachingPolicyOptionsThenReturnWriteBackPolicyOption, IsAtLeastXeHpgCore) {
+HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreWhenGetCachingPolicyOptionsThenReturnWriteByPassPolicyOption, IsAtLeastXe3pCore) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    const char *expectedStr = "-cl-store-cache-default=30 -cl-load-cache-default=25";
+    const char *dbgExpectedStr = "-cl-store-cache-default=18 -cl-load-cache-default=25";
+    EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
+    EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(true), dbgExpectedStr, strlen(dbgExpectedStr)));
+}
+
+HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreWhenGetCachingPolicyOptionsThenReturnWriteBackPolicyOption, IsWithinXeCoreAndXe3Core) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
 
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     const char *expectedStr = "-cl-store-cache-default=7 -cl-load-cache-default=4";
@@ -182,20 +182,41 @@ HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreWhenGetCachingPolic
     EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
 }
 
-HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreAndDebugFlagSetForceAllResourcesUncachedWhenGetCachingPolicyOptionsThenReturnUncachedPolicyOption, IsAtLeastXeHpgCore) {
+HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXe3pcOREWhenGetCachingPolicyOptionsThenReturnWriteBackPolicyOption, IsAtLeastXe3pCore) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
-    DebugManager.flags.ForceAllResourcesUncached.set(true);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
 
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    const char *expectedStr = "-cl-store-cache-default=1 -cl-load-cache-default=1";
+    const char *expectedStr = "-cl-store-cache-default=30 -cl-load-cache-default=25";
     EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
     EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
 }
 
-HWTEST2_F(CompilerProductHelperFixture, givenCachePolicyWithoutCorrespondingBuildOptionWhenGetCachingPolicyOptionsThenReturnNullptr, IsAtLeastXeHpgCore) {
+HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreAndDebugFlagSetForceAllResourcesUncachedWhenGetCachingPolicyOptionsThenReturnUncachedPolicyOption, IsWithinXeCoreAndXe3Core) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(5);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.ForceAllResourcesUncached.set(true);
+
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    const char *expectedStr = "-cl-store-cache-default=2 -cl-load-cache-default=2";
+    EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
+    EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
+}
+
+HWTEST2_F(CompilerProductHelperFixture, givenAtLeastXeHpgCoreAndDebugFlagSetForceAllResourcesUncachedWhenGetCachingPolicyOptionsThenReturnUncachedPolicyOption, IsAtLeastXe3pCore) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.ForceAllResourcesUncached.set(true);
+
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    const char *expectedStr = "-cl-store-cache-default=18 -cl-load-cache-default=18";
+    EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(false), expectedStr, strlen(expectedStr)));
+    EXPECT_EQ(0, memcmp(compilerProductHelper.getCachingPolicyOptions(true), expectedStr, strlen(expectedStr)));
+}
+
+HWTEST2_F(CompilerProductHelperFixture, givenCachePolicyWithoutCorrespondingBuildOptionWhenGetCachingPolicyOptionsThenReturnNullptr, IsAtLeastXeCore) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(5);
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
 
     EXPECT_EQ(nullptr, compilerProductHelper.getCachingPolicyOptions(false));
@@ -205,79 +226,58 @@ HWTEST2_F(CompilerProductHelperFixture, givenCachePolicyWithoutCorrespondingBuil
 TEST_F(CompilerProductHelperFixture, givenHwInfoWithIndependentForwardProgressThenReportsClKhrSubgroupExtension) {
 
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    auto *releaseHelper = getReleaseHelper();
     auto hwInfo = *defaultHwInfo;
     hwInfo.capabilityTable.supportsIndependentForwardProgress = true;
-    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
+    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
     EXPECT_TRUE(hasSubstr(extensions, std::string("cl_khr_subgroups")));
 
     hwInfo.capabilityTable.supportsIndependentForwardProgress = false;
-    extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
+    extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
     EXPECT_FALSE(hasSubstr(extensions, std::string("cl_khr_subgroups")));
 }
 
-TEST_F(CompilerProductHelperFixture, givenHwInfoWithCLVersionAtLeast20ThenReportsClExtFloatAtomicsExtension) {
+TEST_F(CompilerProductHelperFixture, givenHwInfoThenReportsClExtFloatAtomicsExtension) {
 
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    auto *releaseHelper = getReleaseHelper();
     auto hwInfo = *defaultHwInfo;
-    hwInfo.capabilityTable.clVersionSupport = 20;
-    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
+    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
     EXPECT_TRUE(hasSubstr(extensions, std::string("cl_ext_float_atomics")));
-
-    hwInfo.capabilityTable.clVersionSupport = 21;
-    extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
-    EXPECT_TRUE(hasSubstr(extensions, std::string("cl_ext_float_atomics")));
-
-    hwInfo.capabilityTable.clVersionSupport = 30;
-    extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
-    EXPECT_TRUE(hasSubstr(extensions, std::string("cl_ext_float_atomics")));
-
-    hwInfo.capabilityTable.clVersionSupport = 12;
-    extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
-    EXPECT_FALSE(hasSubstr(extensions, std::string("cl_ext_float_atomics")));
 }
 
-TEST_F(CompilerProductHelperFixture, givenHwInfoWithCLVersion30ThenReportsClKhrExternalMemoryExtension) {
+TEST_F(CompilerProductHelperFixture, givenHwInfoThenReportsClIntelConcurrentDispatchExtension) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-    auto *releaseHelper = getReleaseHelper();
+    auto hwInfo = *defaultHwInfo;
+    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
+    EXPECT_TRUE(hasSubstr(extensions, std::string("cl_intel_concurrent_dispatch")));
+}
+
+TEST_F(CompilerProductHelperFixture, givenHwInfoThenReportsClKhrExternalMemoryExtension) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     auto hwInfo = *defaultHwInfo;
 
-    hwInfo.capabilityTable.clVersionSupport = 30;
-    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
-    EXPECT_FALSE(hasSubstr(extensions, std::string("cl_khr_external_memory")));
+    auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
+    EXPECT_TRUE(hasSubstr(extensions, std::string("cl_khr_external_memory")));
 
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.ClKhrExternalMemoryExtension.set(1);
+    debugManager.flags.ClKhrExternalMemoryExtension.set(0);
 
-    hwInfo.capabilityTable.clVersionSupport = 21;
-    extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
+    extensions = compilerProductHelper.getDeviceExtensions(hwInfo);
     EXPECT_FALSE(hasSubstr(extensions, std::string("cl_khr_external_memory")));
-
-    hwInfo.capabilityTable.clVersionSupport = 30;
-    extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
-    EXPECT_TRUE(hasSubstr(extensions, std::string("cl_khr_external_memory")));
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenAtMostGen11DeviceWhenCheckingIfIntegerDotExtensionIsSupportedThenFalseReturned, IsAtMostGen11) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-
-    EXPECT_FALSE(compilerProductHelper.isDotIntegerProductExtensionSupported());
-}
-
-HWTEST2_F(CompilerProductHelperFixture, GivenAtLeastGen12lpDeviceWhenCheckingIfIntegerDotExtensionIsSupportedThenTrueReturned, IsAtLeastGen12lp) {
-    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
-
-    EXPECT_TRUE(compilerProductHelper.isDotIntegerProductExtensionSupported());
 }
 
 HWTEST2_F(CompilerProductHelperFixture, givenConfigWhenMatchConfigWithRevIdThenProperConfigIsReturned, IsNotPvcOrDg2) {
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     auto config = hwInfo.ipVersion.value;
-    EXPECT_EQ(compilerProductHelper.matchRevisionIdWithProductConfig(config, 0x0), config);
-    EXPECT_EQ(compilerProductHelper.matchRevisionIdWithProductConfig(config, 0x1), config);
-    EXPECT_EQ(compilerProductHelper.matchRevisionIdWithProductConfig(config, 0x4), config);
+    for (uint32_t rev : {0x0, 0x1, 0x4}) {
+        NEO::HardwareIpVersion matchedIpVersion;
+        matchedIpVersion.value = compilerProductHelper.matchRevisionIdWithProductConfig(config, rev);
+        EXPECT_EQ(hwInfo.ipVersion.architecture, matchedIpVersion.architecture) << rev;
+        EXPECT_EQ(hwInfo.ipVersion.release, matchedIpVersion.release) << rev;
+        bool gotSameRevision = (matchedIpVersion.revision == hwInfo.ipVersion.revision);
+        bool gotRequestedRevision = (matchedIpVersion.revision == rev);
+        EXPECT_TRUE(gotSameRevision || gotRequestedRevision) << rev;
+    }
 }
 
 HWTEST_F(CompilerProductHelperFixture, givenProductHelperWhenGetAndOverrideHwIpVersionThenCorrectMatchIsFound) {
@@ -285,7 +285,167 @@ HWTEST_F(CompilerProductHelperFixture, givenProductHelperWhenGetAndOverrideHwIpV
     auto &compilerProductHelper = pDevice->getCompilerProductHelper();
     auto &hwInfo = *pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     uint32_t config = 0x1234;
-    DebugManager.flags.OverrideHwIpVersion.set(config);
+    debugManager.flags.OverrideHwIpVersion.set(config);
     hwInfo.ipVersion.value = 0x5678;
     EXPECT_EQ(compilerProductHelper.getHwIpVersion(hwInfo), config);
+}
+
+TEST_F(CompilerProductHelperFixture, givenFtrHwSemaphore64SetWhenIsAvailableSemaphore64CalledThenValueFromCapsIsReturned) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrHwSemaphore64 = true;
+
+    hwInfo.caps.availableSemaphore64 = true;
+    EXPECT_TRUE(compilerProductHelper.isAvailableSemaphore64(hwInfo));
+
+    hwInfo.caps.availableSemaphore64 = false;
+    EXPECT_FALSE(compilerProductHelper.isAvailableSemaphore64(hwInfo));
+}
+
+TEST_F(CompilerProductHelperFixture, givenNoFtrHwSemaphore64WhenIsAvailableSemaphore64CalledThenFalseReturned) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrHwSemaphore64 = false;
+    hwInfo.caps.availableSemaphore64 = true;
+
+    EXPECT_FALSE(compilerProductHelper.isAvailableSemaphore64(hwInfo));
+}
+
+TEST_F(CompilerProductHelperFixture, givenEnable64BitSemaphoreFlagSetWhenIsAvailableSemaphore64CalledThenFlagValueOverridesEverythingElse) {
+    DebugManagerStateRestore restore;
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrHwSemaphore64 = true;
+    hwInfo.caps.availableSemaphore64 = true;
+
+    debugManager.flags.Enable64BitSemaphore.set(0);
+    EXPECT_FALSE(compilerProductHelper.isAvailableSemaphore64(hwInfo));
+
+    debugManager.flags.Enable64BitSemaphore.set(1);
+    EXPECT_TRUE(compilerProductHelper.isAvailableSemaphore64(hwInfo));
+}
+
+TEST_F(CompilerProductHelperFixture, givenEnable64BitSemaphoreFlagSetWhenIsAvailableSemaphore64CalledThenFtrFlagAndCapsValueAreIgnored) {
+    DebugManagerStateRestore restore;
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    HardwareInfo hwInfo = *defaultHwInfo;
+    hwInfo.featureTable.flags.ftrHwSemaphore64 = false;
+    hwInfo.caps.availableSemaphore64 = false;
+
+    debugManager.flags.Enable64BitSemaphore.set(1);
+    EXPECT_TRUE(compilerProductHelper.isAvailableSemaphore64(hwInfo));
+}
+
+HWTEST2_F(CompilerProductHelperFixture, givenCompilerProductHelperWhenIsHeaplessModeEnabledThenFalseIsReturned, IsAtMostXe3Core) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    EXPECT_FALSE(compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo));
+}
+
+HWTEST2_F(CompilerProductHelperFixture, givenHeaplessModeWhenApplyExtraInternalOptionsIsCalledThenInternalOptionsAreCorrect, IsHeaplessRequired) {
+    std::string enable64bitAddressing = "-ze-intel-64bit-addressing";
+
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+
+    {
+        std::string internalOptions;
+        NEO::CompilerOptions::applyExtraInternalOptions(internalOptions, *defaultHwInfo, compilerProductHelper, NEO::CompilerOptions::HeaplessMode::defaultMode);
+        EXPECT_TRUE(hasSubstr(internalOptions, enable64bitAddressing));
+    }
+    {
+        std::string internalOptions;
+        NEO::CompilerOptions::HeaplessMode heaplessMode = NEO::CompilerOptions::HeaplessMode::disabled;
+        NEO::CompilerOptions::applyExtraInternalOptions(internalOptions, *defaultHwInfo, compilerProductHelper, heaplessMode);
+        EXPECT_FALSE(hasSubstr(internalOptions, enable64bitAddressing));
+    }
+    {
+        std::string internalOptions;
+        NEO::CompilerOptions::HeaplessMode heaplessMode = NEO::CompilerOptions::HeaplessMode::enabled;
+        NEO::CompilerOptions::applyExtraInternalOptions(internalOptions, *defaultHwInfo, compilerProductHelper, heaplessMode);
+        EXPECT_TRUE(hasSubstr(internalOptions, enable64bitAddressing));
+    }
+}
+
+HWTEST_F(CompilerProductHelperFixture, WhenFullListOfSupportedOpenCLCVersionsIsRequestedThenReturnsListOfAllSupportedVersionsByTheAssociatedDevice) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto versions = compilerProductHelper.getDeviceOpenCLCVersions(NEO::OclCVersion{3, 0});
+    ASSERT_LT(3U, versions.size());
+
+    EXPECT_EQ(1, versions[0].major);
+    EXPECT_EQ(0, versions[0].minor);
+
+    EXPECT_EQ(1, versions[1].major);
+    EXPECT_EQ(1, versions[1].minor);
+
+    EXPECT_EQ(1, versions[2].major);
+    EXPECT_EQ(2, versions[2].minor);
+
+    ASSERT_EQ(4U, versions.size());
+    EXPECT_EQ(3, versions[3].major);
+    EXPECT_EQ(0, versions[3].minor);
+}
+
+HWTEST_F(CompilerProductHelperFixture, WhenLimitedListOfSupportedOpenCLCVersionsIsRequestedThenReturnsListOfAllSupportedVersionsByTheAssociatedDeviceTrimmedToProvidedMax) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto versions = compilerProductHelper.getDeviceOpenCLCVersions(NEO::OclCVersion{1, 1});
+    ASSERT_EQ(2U, versions.size());
+
+    EXPECT_EQ(1, versions[0].major);
+    EXPECT_EQ(0, versions[0].minor);
+
+    EXPECT_EQ(1, versions[1].major);
+    EXPECT_EQ(1, versions[1].minor);
+}
+
+HWTEST_F(CompilerProductHelperFixture, GivenRequestForLimitedListOfSupportedOpenCLCVersionsWhenMaxVersionIsEmptyThenReturnsListOfAllSupportedVersionsByTheAssociatedDevice) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto versions = compilerProductHelper.getDeviceOpenCLCVersions(NEO::OclCVersion{0, 0});
+    ASSERT_LT(3U, versions.size());
+
+    EXPECT_EQ(1, versions[0].major);
+    EXPECT_EQ(0, versions[0].minor);
+
+    EXPECT_EQ(1, versions[1].major);
+    EXPECT_EQ(1, versions[1].minor);
+
+    EXPECT_EQ(1, versions[2].major);
+    EXPECT_EQ(2, versions[2].minor);
+
+    ASSERT_EQ(4U, versions.size());
+    EXPECT_EQ(3, versions[3].major);
+    EXPECT_EQ(0, versions[3].minor);
+}
+
+HWTEST_F(CompilerProductHelperFixture, GivenRequestForLimitedListOfSupportedOpenCLCVersionsWhenMaxVersionIsBelow10ThenReturnsListOfAllSupportedVersionsByTheAssociatedDeviceTrimmedToOclC12) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+    auto versions = compilerProductHelper.getDeviceOpenCLCVersions(NEO::OclCVersion{0, 1});
+    ASSERT_EQ(3U, versions.size());
+
+    EXPECT_EQ(1, versions[0].major);
+    EXPECT_EQ(0, versions[0].minor);
+
+    EXPECT_EQ(1, versions[1].major);
+    EXPECT_EQ(1, versions[1].minor);
+
+    EXPECT_EQ(1, versions[2].major);
+    EXPECT_EQ(2, versions[2].minor);
+}
+
+HWTEST_F(CompilerProductHelperFixture, GivenRequestForKernelFp32CapabilitiesThenReturnAddMinMaxAndLoadStoreCapabilities) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+
+    uint32_t fp32Caps = 0u;
+    compilerProductHelper.getKernelFp32AtomicCapabilities(fp32Caps);
+    EXPECT_TRUE(isValueSet(fp32Caps, FpAtomicExtFlags::addAtomicCaps));
+    EXPECT_TRUE(isValueSet(fp32Caps, FpAtomicExtFlags::minMaxAtomicCaps));
+    EXPECT_TRUE(isValueSet(fp32Caps, FpAtomicExtFlags::loadStoreAtomicCaps));
+}
+
+HWTEST_F(CompilerProductHelperFixture, GivenRequestForKernelFp64CapabilitiesThenReturnAddMinMaxAndLoadStoreCapabilities) {
+    auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+
+    uint32_t fp64Caps = 0u;
+    compilerProductHelper.getKernelFp64AtomicCapabilities(fp64Caps);
+    EXPECT_TRUE(isValueSet(fp64Caps, FpAtomicExtFlags::addAtomicCaps));
+    EXPECT_TRUE(isValueSet(fp64Caps, FpAtomicExtFlags::minMaxAtomicCaps));
+    EXPECT_TRUE(isValueSet(fp64Caps, FpAtomicExtFlags::loadStoreAtomicCaps));
 }

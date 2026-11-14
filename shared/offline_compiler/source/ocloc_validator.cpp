@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -20,10 +20,6 @@ ProgramInfo::~ProgramInfo() {
         delete kernelInfo;
     }
     kernelInfos.clear();
-}
-
-KernelInfo::~KernelInfo() {
-    delete[] crossThreadData;
 }
 } // namespace NEO
 
@@ -55,7 +51,7 @@ int validate(const std::vector<std::string> &args, OclocArgHelper *argHelper) {
     argHelper->printf("Validating : %s (%zd bytes).\n", fileName.c_str(), fileData.size());
 
     auto deviceBinary = ArrayRef<const uint8_t>::fromAny(fileData.data(), fileData.size());
-    if (false == NEO::isDeviceBinaryFormat<DeviceBinaryFormat::Zebin>(deviceBinary)) {
+    if (false == NEO::isDeviceBinaryFormat<DeviceBinaryFormat::zebin>(deviceBinary)) {
         argHelper->printf("Input is not a Zebin file (not elf or wrong elf object file type)\n");
         return -2;
     }
@@ -76,8 +72,8 @@ int validate(const std::vector<std::string> &args, OclocArgHelper *argHelper) {
         argHelper->printf("Validator detected errors :\n%s\n", errors.c_str());
     }
 
-    argHelper->printf("Binary is %s (%s).\n", ((NEO::DecodeError::Success == decodeResult) ? "VALID" : "INVALID"), NEO::asString(decodeResult));
-    if (NEO::DecodeError::Success == decodeResult) {
+    argHelper->printf("Binary is %s (%s).\n", ((NEO::DecodeError::success == decodeResult) ? "VALID" : "INVALID"), NEO::asString(decodeResult));
+    if (NEO::DecodeError::success == decodeResult) {
         argHelper->printf("Statistics : \n");
         if (0 != programInfo.globalVariables.size) {
             argHelper->printf("Binary contains global variables section of size :  %zd.\n", programInfo.globalVariables.size);

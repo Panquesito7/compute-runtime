@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,7 +8,6 @@
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/direct_submission/dispatchers/blitter_dispatcher.h"
 #include "shared/source/helpers/definitions/command_encoder_args.h"
-#include "shared/source/xe_hp_core/hw_cmds.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/mocks/mock_direct_submission_hw.h"
@@ -23,7 +22,7 @@ XE_HPC_CORETEST_F(DirectSubmissionTestXeHpcCore, givenXeHpcCoreWhenDispatchDisab
 
     MockDirectSubmissionHw<FamilyType, Dispatcher> directSubmission(*pDevice->getDefaultEngine().commandStreamReceiver);
 
-    EXPECT_EQ(EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{}), directSubmission.getSizeDisablePrefetcher());
+    EXPECT_EQ(EncodeMiArbCheck<FamilyType>::getCommandSize(), directSubmission.getSizeDisablePrefetcher());
 
     bool ret = directSubmission.allocateResources();
     EXPECT_TRUE(ret);
@@ -39,7 +38,7 @@ XE_HPC_CORETEST_F(DirectSubmissionTestXeHpcCore, givenXeHpcCoreWhenDispatchDisab
 
 XE_HPC_CORETEST_F(DirectSubmissionTestXeHpcCore, givenXeHpcCoreAndDisablePrefetcherDebugFlagEnabledWhenDispatchDisablePrefetcherIsCalledThenPrefetcherIsDisabled) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.DirectSubmissionDisablePrefetcher.set(1);
+    debugManager.flags.DirectSubmissionDisablePrefetcher.set(1);
 
     using MI_ARB_CHECK = typename FamilyType::MI_ARB_CHECK;
     using Dispatcher = BlitterDispatcher<FamilyType>;

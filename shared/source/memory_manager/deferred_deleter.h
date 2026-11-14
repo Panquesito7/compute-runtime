@@ -1,12 +1,14 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/utilities/idlist.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -15,13 +17,10 @@
 namespace NEO {
 class DeferrableDeletion;
 class Thread;
-class DeferredDeleter {
+class DeferredDeleter : NEO::NonCopyableAndNonMovableClass {
   public:
     DeferredDeleter();
     virtual ~DeferredDeleter();
-
-    DeferredDeleter(const DeferredDeleter &) = delete;
-    DeferredDeleter &operator=(const DeferredDeleter &) = delete;
 
     MOCKABLE_VIRTUAL void deferDeletion(DeferrableDeletion *deletion);
 
@@ -29,20 +28,23 @@ class DeferredDeleter {
 
     MOCKABLE_VIRTUAL void removeClient();
 
-    MOCKABLE_VIRTUAL void drain(bool blocking);
+    MOCKABLE_VIRTUAL void drain(bool blocking, bool hostptrsOnly);
+
+    MOCKABLE_VIRTUAL bool areElementsReleased(bool hostptrsOnly);
 
   protected:
     void stop();
     void safeStop();
     void ensureThread();
-    MOCKABLE_VIRTUAL void clearQueue();
-    MOCKABLE_VIRTUAL bool areElementsReleased();
+    MOCKABLE_VIRTUAL void clearQueue(bool hostptrsOnly);
     MOCKABLE_VIRTUAL bool shouldStop();
 
     static void *run(void *);
 
-    std::atomic<bool> doWorkInBackground;
-    std::atomic<int> elementsToRelease;
+    std::atomic<bool> exitedMainLoop = false;
+    std::atomic<bool> doWorkInBackground = false;
+    std::atomic<int> elementsToRelease = 0;
+    std::atomic<int> hostptrsToRelease = 0;
     std::unique_ptr<Thread> worker;
     int32_t numClients = 0;
     IDList<DeferrableDeletion, true> queue;
@@ -50,4 +52,7 @@ class DeferredDeleter {
     std::mutex threadMutex;
     std::condition_variable condition;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<DeferredDeleter>);
+
 } // namespace NEO

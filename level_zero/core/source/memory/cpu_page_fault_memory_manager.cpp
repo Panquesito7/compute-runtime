@@ -1,77 +1,97 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "level_zero/core/source/memory/cpu_page_fault_memory_manager.h"
+
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/page_fault_manager/cpu_page_fault_manager.h"
 
 #include "level_zero/core/source/cmdlist/cmdlist.h"
 #include "level_zero/core/source/device/device.h"
-#include "level_zero/core/source/device/device_imp.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 
 namespace NEO {
-void PageFaultManager::transferToCpu(void *ptr, size_t size, void *device) {
-    L0::DeviceImp *deviceImp = static_cast<L0::DeviceImp *>(device);
+void CpuPageFaultManager::transferToCpu(void *ptr, size_t size, void *device) {
+    L0::Device *l0Device = static_cast<L0::Device *>(device);
+    l0Device->getNEODevice()->stopDirectSubmissionForCopyEngine();
 
-    NEO::SvmAllocationData *allocData = deviceImp->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(ptr);
+    NEO::SvmAllocationData *allocData = l0Device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(ptr);
     UNRECOVERABLE_IF(allocData == nullptr);
 
     auto ret =
-        deviceImp->pageFaultCommandList->appendPageFaultCopy(allocData->cpuAllocation,
-                                                             allocData->gpuAllocations.getGraphicsAllocation(deviceImp->getRootDeviceIndex()),
-                                                             allocData->size, true);
+        l0Device->pageFaultCommandList->appendPageFaultCopy(allocData->cpuAllocation,
+                                                            allocData->gpuAllocations.getGraphicsAllocation(l0Device->getRootDeviceIndex()),
+                                                            allocData->size, true, 0);
     UNRECOVERABLE_IF(ret);
 }
-void PageFaultManager::transferToGpu(void *ptr, void *device) {
-    L0::DeviceImp *deviceImp = static_cast<L0::DeviceImp *>(device);
+void CpuPageFaultManager::transferToGpu(void *ptr, void *device) {
+    L0::Device *l0Device = static_cast<L0::Device *>(device);
+    l0Device->getNEODevice()->stopDirectSubmissionForCopyEngine();
 
-    NEO::SvmAllocationData *allocData = deviceImp->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(ptr);
+    NEO::SvmAllocationData *allocData = l0Device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(ptr);
     UNRECOVERABLE_IF(allocData == nullptr);
 
     auto ret =
-        deviceImp->pageFaultCommandList->appendPageFaultCopy(allocData->gpuAllocations.getGraphicsAllocation(deviceImp->getRootDeviceIndex()),
-                                                             allocData->cpuAllocation,
-                                                             allocData->size, false);
+        l0Device->pageFaultCommandList->appendPageFaultCopy(allocData->gpuAllocations.getGraphicsAllocation(l0Device->getRootDeviceIndex()),
+                                                            allocData->cpuAllocation,
+                                                            allocData->size, false, 0);
     UNRECOVERABLE_IF(ret);
+}
+void CpuPageFaultManager::allowCPUMemoryEviction(bool evict, void *ptr, PageFaultData &pageFaultData) {
+    L0::Device *l0Device = static_cast<L0::Device *>(pageFaultData.cmdQ);
 
-    this->evictMemoryAfterImplCopy(allocData->cpuAllocation, deviceImp->getNEODevice());
+    CommandStreamReceiver *csr = nullptr;
+    if (l0Device->getActiveDevice()->getInternalCopyEngine()) {
+        csr = l0Device->getActiveDevice()->getInternalCopyEngine()->commandStreamReceiver;
+    } else {
+        csr = l0Device->getActiveDevice()->getInternalEngine().commandStreamReceiver;
+    }
+    UNRECOVERABLE_IF(csr == nullptr);
+    auto osInterface = l0Device->getNEODevice()->getRootDeviceEnvironment().osInterface.get();
+
+    allowCPUMemoryEvictionImpl(evict, ptr, *csr, osInterface);
 }
 } // namespace NEO
 
 namespace L0 {
-void transferAndUnprotectMemoryWithHints(NEO::PageFaultManager *pageFaultHandler, void *allocPtr, NEO::PageFaultManager::PageFaultData &pageFaultData) {
+void transferAndUnprotectMemoryWithHints(NEO::CpuPageFaultManager *pageFaultHandler, void *allocPtr, NEO::CpuPageFaultManager::PageFaultData &pageFaultData) {
     bool migration = true;
-    if (pageFaultData.domain == NEO::PageFaultManager::AllocationDomain::Gpu) {
-        L0::DeviceImp *deviceImp = static_cast<L0::DeviceImp *>(pageFaultData.cmdQ);
-        NEO::SvmAllocationData *allocData = deviceImp->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(allocPtr);
+    if (pageFaultData.domain == NEO::CpuPageFaultManager::AllocationDomain::gpu) {
+        L0::Device *l0Device = static_cast<L0::Device *>(pageFaultData.cmdQ);
+        NEO::SvmAllocationData *allocData = l0Device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(allocPtr);
 
-        if (deviceImp->memAdviseSharedAllocations.find(allocData) != deviceImp->memAdviseSharedAllocations.end()) {
-            if (deviceImp->memAdviseSharedAllocations[allocData].readOnly && deviceImp->memAdviseSharedAllocations[allocData].devicePreferredLocation) {
+        auto alloc = allocData ? allocData->gpuAllocations.getGraphicsAllocation(l0Device->getRootDeviceIndex()) : nullptr;
+        if (alloc) {
+            auto flags = alloc->getMemAdviseFlags();
+            if (flags.readOnly && flags.devicePreferredLocation) {
                 migration = false;
-                deviceImp->memAdviseSharedAllocations[allocData].cpuMigrationBlocked = 1;
+                flags.cpuMigrationBlocked = 1;
+                alloc->setMemAdviseFlags(flags);
             }
         }
         if (migration) {
-            std::chrono::steady_clock::time_point start;
-            std::chrono::steady_clock::time_point end;
+            const auto transferToCpu = [&]() {
+                pageFaultHandler->transferToCpu(allocPtr, pageFaultData.size, pageFaultData.cmdQ);
+            };
 
-            start = std::chrono::steady_clock::now();
-            pageFaultHandler->transferToCpu(allocPtr, pageFaultData.size, pageFaultData.cmdQ);
-            end = std::chrono::steady_clock::now();
-            long long elapsedTime = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-            pageFaultData.unifiedMemoryManager->nonGpuDomainAllocs.push_back(allocPtr);
-
-            if (NEO::DebugManager.flags.PrintUmdSharedMigration.get()) {
-                printf("UMD transferred shared allocation 0x%llx (%zu B) from GPU to CPU (%f us)\n", reinterpret_cast<unsigned long long int>(allocPtr), pageFaultData.size, elapsedTime / 1e3);
+            if (NEO::debugManager.flags.PrintUmdSharedMigration.get()) {
+                const auto start = std::chrono::steady_clock::now();
+                transferToCpu();
+                const auto elapsedTime = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+                PRINT_STRING(true, stdout, "UMD transferred shared allocation 0x%llx (%zu B) from GPU to CPU (%f us)\n", reinterpret_cast<unsigned long long int>(allocPtr), pageFaultData.size, elapsedTime / 1e3);
+            } else {
+                transferToCpu();
             }
+            pageFaultData.unifiedMemoryManager->nonGpuDomainAllocs.push_back(allocPtr);
         }
     }
     if (migration) {
-        pageFaultData.domain = NEO::PageFaultManager::AllocationDomain::Cpu;
+        pageFaultData.domain = NEO::CpuPageFaultManager::AllocationDomain::cpu;
     }
     pageFaultHandler->allowCPUMemoryAccess(allocPtr, pageFaultData.size);
 }

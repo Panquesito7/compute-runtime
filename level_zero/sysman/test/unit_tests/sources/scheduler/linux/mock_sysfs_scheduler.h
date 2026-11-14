@@ -1,25 +1,25 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/sysman/source/linux/sysman_fs_access.h"
-#include "level_zero/sysman/source/scheduler/linux/sysman_os_scheduler_imp.h"
+
+#include "shared/source/os_interface/linux/drm_neo.h"
+#include "shared/source/os_interface/linux/engine_info.h"
+#include "shared/source/os_interface/linux/xe/xedrm.h"
+
+#include "level_zero/sysman/source/api/scheduler/linux/sysman_os_scheduler_imp.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+#include "level_zero/sysman/test/unit_tests/sources/linux/mock_sysman_hw_device_id.h"
+
+#include <algorithm>
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
-
-const std::string preemptTimeoutMilliSecs("preempt_timeout_ms");
-const std::string defaultPreemptTimeoutMilliSecs(".defaults/preempt_timeout_ms");
-const std::string timesliceDurationMilliSecs("timeslice_duration_ms");
-const std::string defaultTimesliceDurationMilliSecs(".defaults/timeslice_duration_ms");
-const std::string heartbeatIntervalMilliSecs("heartbeat_interval_ms");
-const std::string defaultHeartbeatIntervalMilliSecs(".defaults/heartbeat_interval_ms");
-const std::string engineDir("engine");
-const std::vector<std::string> listOfMockedEngines = {"rcs0", "bcs0", "vcs0", "vcs1", "vecs0"};
 
 typedef struct SchedulerConfigValues {
     uint64_t defaultVal;
@@ -49,7 +49,16 @@ class SchedulerFileProperties {
     }
 };
 
-struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
+struct MockSchedulerSysfsAccess : public L0::Sysman::SysFsAccessInterface {
+
+    std::string preemptTimeout{};
+    std::string defaultpreemptTimeout{};
+    std::string timesliceDuration{};
+    std::string defaulttimesliceDuration{};
+    std::string heartbeatInterval{};
+    std::string defaultheartbeatInterval{};
+    std::string engineDir{};
+    std::vector<std::string> listOfMockedEngines = {"rcs0", "ccs0", "bcs0", "vcs0", "vcs1", "vecs0"};
 
     ze_result_t mockReadFileFailureError = ZE_RESULT_SUCCESS;
     ze_result_t mockWriteFileStatus = ZE_RESULT_SUCCESS;
@@ -58,10 +67,9 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
     std::vector<ze_result_t> mockReadReturnValues{ZE_RESULT_SUCCESS, ZE_RESULT_SUCCESS, ZE_RESULT_SUCCESS, ZE_RESULT_ERROR_NOT_AVAILABLE};
 
     uint32_t mockReadCount = 0;
-
     bool mockReadReturnStatus = false;
 
-    std::map<std::string, SchedulerConfig_t *> engineSchedMap;
+    std::map<std::string, SchedulerConfig_t> engineSchedMap;
     std::map<std::string, SchedulerFileProperties> engineSchedFilePropertiesMap;
 
     ze_result_t getValForError(const std::string file, uint64_t &val) {
@@ -70,15 +78,6 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
 
     ze_result_t getValForErrorWhileWrite(const std::string file, const uint64_t val) {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
-    }
-
-    void cleanUpMap() {
-        for (std::string mappedEngine : listOfMockedEngines) {
-            auto it = engineSchedMap.find(mappedEngine);
-            if (it != engineSchedMap.end()) {
-                delete it->second;
-            }
-        }
     }
 
     ze_result_t getFileProperties(const std::string file, SchedulerFileProperties &fileProps) {
@@ -135,33 +134,33 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
             if (it == engineSchedMap.end()) {
                 return ZE_RESULT_ERROR_NOT_AVAILABLE;
             }
-            if (file.compare((file.length() - preemptTimeoutMilliSecs.length()),
-                             preemptTimeoutMilliSecs.length(),
-                             preemptTimeoutMilliSecs) == 0) {
+            if (file.compare((file.length() - preemptTimeout.length()),
+                             preemptTimeout.length(),
+                             preemptTimeout) == 0) {
                 if (file.find(".defaults") != std::string::npos) {
-                    val = it->second->timeOut.defaultVal;
+                    val = it->second.timeOut.defaultVal;
                 } else {
-                    val = it->second->timeOut.actualVal;
+                    val = it->second.timeOut.actualVal;
                 }
                 return ZE_RESULT_SUCCESS;
             }
-            if (file.compare((file.length() - timesliceDurationMilliSecs.length()),
-                             timesliceDurationMilliSecs.length(),
-                             timesliceDurationMilliSecs) == 0) {
+            if (file.compare((file.length() - timesliceDuration.length()),
+                             timesliceDuration.length(),
+                             timesliceDuration) == 0) {
                 if (file.find(".defaults") != std::string::npos) {
-                    val = it->second->timeSclice.defaultVal;
+                    val = it->second.timeSclice.defaultVal;
                 } else {
-                    val = it->second->timeSclice.actualVal;
+                    val = it->second.timeSclice.actualVal;
                 }
                 return ZE_RESULT_SUCCESS;
             }
-            if (file.compare((file.length() - heartbeatIntervalMilliSecs.length()),
-                             heartbeatIntervalMilliSecs.length(),
-                             heartbeatIntervalMilliSecs) == 0) {
+            if (file.compare((file.length() - heartbeatInterval.length()),
+                             heartbeatInterval.length(),
+                             heartbeatInterval) == 0) {
                 if (file.find(".defaults") != std::string::npos) {
-                    val = it->second->heartBeat.defaultVal;
+                    val = it->second.heartBeat.defaultVal;
                 } else {
-                    val = it->second->heartBeat.actualVal;
+                    val = it->second.heartBeat.actualVal;
                 }
                 return ZE_RESULT_SUCCESS;
             }
@@ -169,7 +168,7 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
-    ze_result_t write(const std::string file, const uint64_t val) override {
+    ze_result_t write(const std::string &file, const uint64_t val) override {
 
         if (mockWriteFileStatus != ZE_RESULT_SUCCESS) {
             return mockWriteFileStatus;
@@ -188,68 +187,40 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
             return ZE_RESULT_ERROR_UNKNOWN;
         }
 
-        for (std::string mappedEngine : listOfMockedEngines) { // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+        for (const auto &mappedEngine : listOfMockedEngines) {
             if (file.find(mappedEngine) == std::string::npos) {
                 continue;
             }
-            SchedulerConfig_t *schedConfig = new SchedulerConfig_t();
-            if (file.compare((file.length() - preemptTimeoutMilliSecs.length()),
-                             preemptTimeoutMilliSecs.length(),
-                             preemptTimeoutMilliSecs) == 0) {
+            if (file.compare((file.length() - preemptTimeout.length()),
+                             preemptTimeout.length(),
+                             preemptTimeout) == 0) {
+                auto &schedConfig = engineSchedMap[mappedEngine];
                 if (file.find(".defaults") != std::string::npos) {
-                    schedConfig->timeOut.defaultVal = val;
+                    schedConfig.timeOut.defaultVal = val;
                 } else {
-                    schedConfig->timeOut.actualVal = val;
-                }
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    if (file.find(".defaults") != std::string::npos) {
-                        itr->second->timeOut.defaultVal = val;
-                    } else {
-                        itr->second->timeOut.actualVal = val;
-                    }
-                    delete schedConfig;
+                    schedConfig.timeOut.actualVal = val;
                 }
                 return ZE_RESULT_SUCCESS;
             }
-            if (file.compare((file.length() - timesliceDurationMilliSecs.length()),
-                             timesliceDurationMilliSecs.length(),
-                             timesliceDurationMilliSecs) == 0) {
+            if (file.compare((file.length() - timesliceDuration.length()),
+                             timesliceDuration.length(),
+                             timesliceDuration) == 0) {
+                auto &schedConfig = engineSchedMap[mappedEngine];
                 if (file.find(".defaults") != std::string::npos) {
-                    schedConfig->timeSclice.defaultVal = val;
+                    schedConfig.timeSclice.defaultVal = val;
                 } else {
-                    schedConfig->timeSclice.actualVal = val;
-                }
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    if (file.find(".defaults") != std::string::npos) {
-                        itr->second->timeSclice.defaultVal = val;
-                    } else {
-                        itr->second->timeSclice.actualVal = val;
-                    }
-                    delete schedConfig;
+                    schedConfig.timeSclice.actualVal = val;
                 }
                 return ZE_RESULT_SUCCESS;
             }
-            if (file.compare((file.length() - heartbeatIntervalMilliSecs.length()),
-                             heartbeatIntervalMilliSecs.length(),
-                             heartbeatIntervalMilliSecs) == 0) {
+            if (file.compare((file.length() - heartbeatInterval.length()),
+                             heartbeatInterval.length(),
+                             heartbeatInterval) == 0) {
+                auto &schedConfig = engineSchedMap[mappedEngine];
                 if (file.find(".defaults") != std::string::npos) {
-                    schedConfig->heartBeat.defaultVal = val;
+                    schedConfig.heartBeat.defaultVal = val;
                 } else {
-                    schedConfig->heartBeat.actualVal = val;
-                }
-                auto ret = engineSchedMap.emplace(mappedEngine, schedConfig);
-                if (ret.second == false) {
-                    auto itr = engineSchedMap.find(mappedEngine);
-                    if (file.find(".defaults") != std::string::npos) {
-                        itr->second->heartBeat.defaultVal = val;
-                    } else {
-                        itr->second->heartBeat.actualVal = val;
-                    }
-                    delete schedConfig;
+                    schedConfig.heartBeat.actualVal = val;
                 }
                 return ZE_RESULT_SUCCESS;
             }
@@ -280,6 +251,7 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
         engineDirectoryPermissions = permission;
     }
 
+  protected:
     MockSchedulerSysfsAccess() = default;
 
   private:
@@ -292,10 +264,125 @@ struct MockSchedulerSysfsAccess : public L0::Sysman::SysfsAccess {
     }
 };
 
+struct MockSchedulerSysfsAccessI915 : MockSchedulerSysfsAccess {
+
+    MockSchedulerSysfsAccessI915() {
+        preemptTimeout = "preempt_timeout_ms";
+        defaultpreemptTimeout = ".defaults/preempt_timeout_ms";
+        timesliceDuration = "timeslice_duration_ms";
+        defaulttimesliceDuration = ".defaults/timeslice_duration_ms";
+        heartbeatInterval = "heartbeat_interval_ms";
+        defaultheartbeatInterval = ".defaults/heartbeat_interval_ms";
+        engineDir = "engine";
+    }
+};
+
+struct MockSchedulerSysfsAccessXe : MockSchedulerSysfsAccess {
+
+    std::string defaultMaximumJobTimeout = ".defaults/job_timeout_max";
+    SchedulerConfigValues_t defaultjobTimeout{};
+
+    MockSchedulerSysfsAccessXe() {
+        preemptTimeout = "preempt_timeout_us";
+        defaultpreemptTimeout = ".defaults/preempt_timeout_us";
+        timesliceDuration = "timeslice_duration_us";
+        defaulttimesliceDuration = ".defaults/timeslice_duration_us";
+        heartbeatInterval = "job_timeout_ms";
+        defaultheartbeatInterval = ".defaults/job_timeout_ms";
+        engineDir = "device/tile0/gt0/engines";
+    }
+
+    ze_result_t read(const std::string file, uint64_t &val) override {
+
+        auto status = MockSchedulerSysfsAccess::read(file, val);
+        if (status == ZE_RESULT_ERROR_NOT_AVAILABLE && mockReadReturnStatus == false) {
+            if (file.compare((file.length() - defaultMaximumJobTimeout.length()),
+                             defaultMaximumJobTimeout.length(),
+                             defaultMaximumJobTimeout) == 0) {
+                val = defaultjobTimeout.defaultVal;
+                return ZE_RESULT_SUCCESS;
+            }
+        }
+        return status;
+    }
+
+    ze_result_t write(const std::string &file, const uint64_t val) override {
+        auto status = MockSchedulerSysfsAccess::write(file, val);
+        if (status == ZE_RESULT_ERROR_NOT_AVAILABLE && mockWriteFileStatus == false) {
+            if (file.compare((file.length() - defaultMaximumJobTimeout.length()),
+                             defaultMaximumJobTimeout.length(),
+                             defaultMaximumJobTimeout) == 0) {
+                defaultjobTimeout.defaultVal = val;
+                return ZE_RESULT_SUCCESS;
+            }
+        }
+        return status;
+    }
+};
+
 class PublicLinuxSchedulerImp : public L0::Sysman::LinuxSchedulerImp {
   public:
     using LinuxSchedulerImp::pSysfsAccess;
 };
 
+struct MockSchedulerNeoDrm : public NEO::Drm {
+    using NEO::Drm::getEngineInfo;
+    using NEO::Drm::setupIoctlHelper;
+    static constexpr int mockFd = 0;
+    MockSchedulerNeoDrm(NEO::RootDeviceEnvironment &rootDeviceEnvironment) : NEO::Drm(std::make_unique<MockSysmanHwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
+
+    bool sysmanQueryEngineInfo() override {
+
+        StackVec<std::vector<NEO::EngineCapabilities>, 2> engineInfosPerTile;
+
+        for (uint32_t tileId = 0; tileId < 2; tileId++) {
+            std::vector<NEO::EngineCapabilities> engineInfo;
+            NEO::EngineClassInstance instance{};
+            instance.engineClass = DRM_XE_ENGINE_CLASS_RENDER;
+            instance.engineInstance = 0;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_RENDER;
+            instance.engineInstance = 1;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_COMPUTE;
+            instance.engineInstance = 0;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_COMPUTE;
+            instance.engineInstance = 1;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_COPY;
+            instance.engineInstance = 0;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_COPY;
+            instance.engineInstance = 1;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_VIDEO_DECODE;
+            instance.engineInstance = 0;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_VIDEO_DECODE;
+            instance.engineInstance = 1;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_VIDEO_ENHANCE;
+            instance.engineInstance = 0;
+            engineInfo.push_back({instance, {}});
+            instance.engineClass = DRM_XE_ENGINE_CLASS_VIDEO_ENHANCE;
+            instance.engineInstance = 1;
+            engineInfo.push_back({instance, {}});
+            engineInfosPerTile.push_back(engineInfo);
+        }
+
+        this->engineInfo.reset(new NEO::EngineInfo(this, engineInfosPerTile));
+        return true;
+    }
+
+    bool queryEngineInfoMockReturnFalse() {
+        return false;
+    }
+    void resetEngineInfo() {
+        engineInfo.reset();
+    }
+};
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

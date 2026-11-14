@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -48,63 +48,32 @@ TEST_F(ClGetPlatformInfoTests, GivenClPlatformProfileWhenGettingPlatformInfoStri
     EXPECT_STREQ(paramValue, "FULL_PROFILE");
 }
 
-class ClGetPlatformInfoParameterizedTests : public ClGetPlatformInfoTests,
-                                            public ::testing::WithParamInterface<uint32_t> {
-    void SetUp() override {
-        DebugManager.flags.ForceOCLVersion.set(GetParam());
-        ClGetPlatformInfoTests::SetUp();
-    }
-
-    void TearDown() override {
-        ClGetPlatformInfoTests::TearDown();
-        DebugManager.flags.ForceOCLVersion.set(0);
-    }
-};
-
-TEST_P(ClGetPlatformInfoParameterizedTests, GivenClPlatformVersionWhenGettingPlatformInfoStringThenCorrectOpenClVersionIsReturned) {
+TEST_F(ClGetPlatformInfoTests, GivenClPlatformVersionWhenGettingPlatformInfoStringThenCorrectStringIsReturned) {
     paramValue = getPlatformInfoString(pPlatform, CL_PLATFORM_VERSION);
+    EXPECT_STREQ("OpenCL 3.0 ", paramValue);
 
     cl_version platformNumericVersion = 0;
+
     auto retVal = clGetPlatformInfo(pPlatform, CL_PLATFORM_NUMERIC_VERSION,
                                     sizeof(platformNumericVersion), &platformNumericVersion, &retSize);
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(sizeof(cl_version), retSize);
 
-    std::string expectedPlatformVersion;
-    cl_version expectedNumericPlatformVersion;
-    switch (GetParam()) {
-    case 30:
-        expectedPlatformVersion = "OpenCL 3.0 ";
-        expectedNumericPlatformVersion = CL_MAKE_VERSION(3, 0, 0);
-        break;
-    case 21:
-        expectedPlatformVersion = "OpenCL 2.1 ";
-        expectedNumericPlatformVersion = CL_MAKE_VERSION(2, 1, 0);
-        break;
-    case 12:
-    default:
-        expectedPlatformVersion = "OpenCL 1.2 ";
-        expectedNumericPlatformVersion = CL_MAKE_VERSION(1, 2, 0);
-        break;
-    }
-
-    EXPECT_STREQ(expectedPlatformVersion.c_str(), paramValue);
-    EXPECT_EQ(expectedNumericPlatformVersion, platformNumericVersion);
+    EXPECT_EQ(static_cast<cl_version>(CL_MAKE_VERSION(3, 0, 0)), platformNumericVersion);
 }
-
-INSTANTIATE_TEST_CASE_P(OCLVersions,
-                        ClGetPlatformInfoParameterizedTests,
-                        ::testing::Values(12, 21, 30));
 
 TEST_F(ClGetPlatformInfoTests, GivenClPlatformNameWhenGettingPlatformInfoStringThenCorrectStringIsReturned) {
     paramValue = getPlatformInfoString(pPlatform, CL_PLATFORM_NAME);
-    EXPECT_STREQ(paramValue, "Intel(R) OpenCL Graphics");
+
+    std::string expectedName = "Intel(R) OpenCL Graphics ";
+    expectedName += pPlatform->getClDevice(0)->getHardwareInfo().capabilityTable.isIntegratedDevice ? "(integrated)" : "(discrete)";
+    EXPECT_STREQ(expectedName.c_str(), paramValue);
 }
 
 class ClGetPlatformInfoOverridePlatformNameTests : public ClGetPlatformInfoTests {
   public:
     void SetUp() override {
-        NEO::DebugManager.flags.OverridePlatformName.set(testPlatformName);
+        NEO::debugManager.flags.OverridePlatformName.set(testPlatformName);
         ClGetPlatformInfoTests::SetUp();
     }
 
@@ -150,6 +119,19 @@ TEST_F(ClGetPlatformInfoTests, GivenClPlatformHostTimerResolutionWhenGettingPlat
     auto device = pPlatform->getClDevice(0);
     cl_ulong resolution = static_cast<cl_ulong>(device->getPlatformHostTimerResolution());
     EXPECT_EQ(resolution, value);
+}
+
+TEST_F(ClGetPlatformInfoTests, givenPlatformInfoWhenGettingUnloadableCapabilityThenTrueIsReturned) {
+    auto retVal = clGetPlatformInfo(pPlatform, CL_PLATFORM_UNLOADABLE_KHR, 0, nullptr, &retSize);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(sizeof(cl_bool), retSize);
+
+    cl_bool value = CL_FALSE;
+    retVal = clGetPlatformInfo(pPlatform, CL_PLATFORM_UNLOADABLE_KHR, retSize, &value, nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+
+    cl_bool expectedValue = CL_TRUE;
+    EXPECT_EQ(expectedValue, value);
 }
 
 TEST_F(ClGetPlatformInfoTests, GivenNullPlatformWhenGettingPlatformInfoStringThenClInvalidPlatformErrorIsReturned) {
@@ -226,6 +208,10 @@ TEST_F(ClGetPlatformInfoTests, WhenCheckingPlatformExtensionsWithVersionThenThey
     for (size_t i = 0; i < extensionsCount; i++) {
         if (strcmp(platformExtensionsWithVersion[i].name, "cl_khr_integer_dot_product") == 0) {
             EXPECT_EQ(CL_MAKE_VERSION(2u, 0, 0), platformExtensionsWithVersion[i].version);
+        } else if (strcmp(platformExtensionsWithVersion[i].name, "cl_intel_unified_shared_memory") == 0) {
+            EXPECT_EQ(CL_MAKE_VERSION(1u, 2u, 0), platformExtensionsWithVersion[i].version);
+        } else if (strcmp(platformExtensionsWithVersion[i].name, "cl_khr_external_memory") == 0) {
+            EXPECT_EQ(CL_MAKE_VERSION(0, 9u, 1u), platformExtensionsWithVersion[i].version);
         } else {
             EXPECT_EQ(CL_MAKE_VERSION(1u, 0, 0), platformExtensionsWithVersion[i].version);
         }
@@ -281,7 +267,7 @@ TEST_P(GetPlatformInfoTests, GivenValidParamWhenGettingPlatformInfoStringThenNon
     delete[] paramValue;
 }
 
-const cl_platform_info PlatformInfoTestValues[] =
+const cl_platform_info platformInfoTestValues[] =
     {
         CL_PLATFORM_PROFILE,
         CL_PLATFORM_VERSION,
@@ -291,7 +277,7 @@ const cl_platform_info PlatformInfoTestValues[] =
         CL_PLATFORM_ICD_SUFFIX_KHR,
 };
 
-INSTANTIATE_TEST_CASE_P(api,
-                        GetPlatformInfoTests,
-                        ::testing::ValuesIn(PlatformInfoTestValues));
+INSTANTIATE_TEST_SUITE_P(api,
+                         GetPlatformInfoTests,
+                         ::testing::ValuesIn(platformInfoTestValues));
 } // namespace ULT

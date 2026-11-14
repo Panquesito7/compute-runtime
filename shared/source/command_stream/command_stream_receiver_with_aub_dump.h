@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,13 +19,14 @@ class CommandStreamReceiverWithAUBDump : public BaseCSR {
     using BaseCSR::osContext;
 
   public:
+    using BaseCSR::pollForCompletion;
+    using BaseCSR::waitForTaskCountWithKmdNotifyFallback;
+    using BaseCSR::writeMemory;
+
     CommandStreamReceiverWithAUBDump(const std::string &baseName,
                                      ExecutionEnvironment &executionEnvironment,
                                      uint32_t rootDeviceIndex,
                                      const DeviceBitfield deviceBitfield);
-
-    CommandStreamReceiverWithAUBDump(const CommandStreamReceiverWithAUBDump &) = delete;
-    CommandStreamReceiverWithAUBDump &operator=(const CommandStreamReceiverWithAUBDump &) = delete;
 
     SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override;
     void makeNonResident(GraphicsAllocation &gfxAllocation) override;
@@ -34,23 +35,28 @@ class CommandStreamReceiverWithAUBDump : public BaseCSR {
     void setupContext(OsContext &osContext) override;
 
     CommandStreamReceiverType getType() const override {
-        if (BaseCSR::getType() == CommandStreamReceiverType::CSR_TBX) {
-            return CommandStreamReceiverType::CSR_TBX_WITH_AUB;
+        if (BaseCSR::getType() == CommandStreamReceiverType::tbx) {
+            return CommandStreamReceiverType::tbxWithAub;
         }
-        return CommandStreamReceiverType::CSR_HW_WITH_AUB;
+        return CommandStreamReceiverType::hardwareWithAub;
     }
 
     WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait,
                                                      bool useQuickKmdSleep, QueueThrottle throttle) override;
 
-    size_t getPreferredTagPoolSize() const override { return 1; }
-
     void addAubComment(const char *comment) override;
 
-    void pollForCompletion() override;
+    void pollForCompletion(bool skipTaskCountCheck) override;
+    void pollForAubCompletion() override;
 
     bool expectMemory(const void *gfxAddress, const void *srcAddress,
                       size_t length, uint32_t compareOperation) override;
+
+    bool writeMemory(GraphicsAllocation &gfxAllocation, bool isChunkCopy, uint64_t gpuVaChunkOffset, size_t chunkSize) override;
+    bool isChunkCopySupportedForSimulation() const override;
+    void setWritableForSimulation(bool writable, GraphicsAllocation &gfxAllocation) override;
+    bool isAubSubCaptureInactive() const override;
+    void writePooledMemory(SharedPoolAllocation &sharedPoolAllocation, bool initFullPageTables) override;
 
     std::unique_ptr<CommandStreamReceiver> aubCSR;
 };

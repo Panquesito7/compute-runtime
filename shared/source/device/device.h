@@ -1,43 +1,65 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/command_stream/preemption_mode.h"
 #include "shared/source/device/device_info.h"
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/engine_control.h"
 #include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/options.h"
-#include "shared/source/os_interface/performance_counters.h"
-#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/memory_manager/unified_memory_reuse.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+#include "shared/source/utilities/pool_allocators.h"
 #include "shared/source/utilities/reference_tracked_object.h"
 
+#include "neo_igfxfmid.h"
+
 #include <array>
+#include <atomic>
+#include <bitset>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace NEO {
+class AILConfiguration;
 class BindlessHeapsHelper;
 class BuiltIns;
 class CompilerInterface;
-class ExecutionEnvironment;
+class CompilerProductHelper;
 class Debugger;
+class DebuggerL0;
+class ExecutionEnvironment;
+class FrontEndController;
+class GfxCoreHelper;
 class GmmClientContext;
 class GmmHelper;
-class SyncBufferHandler;
-enum class EngineGroupType : uint32_t;
-class DebuggerL0;
+class GraphicsAllocation;
+class ISAPoolAllocator;
 class OSTime;
-class SourceLevelDebugger;
-class SubDevice;
-struct PhysicalDevicePciBusInfo;
-class GfxCoreHelper;
+class PerformanceCounters;
 class ProductHelper;
-class CompilerProductHelper;
 class ReleaseHelper;
+class SipExternalLib;
+class SubDevice;
+class SyncBufferHandler;
+class UsmMemAllocPool;
+class UsmMemAllocPoolsFacade;
+enum class EngineGroupType : uint32_t;
+struct PhysicalDevicePciBusInfo;
 
-struct SelectorCopyEngine : NonCopyableOrMovableClass {
+struct SelectorCopyEngine : NonCopyableAndNonMovableClass {
     std::atomic<bool> isMainUsed = false;
     std::atomic<uint32_t> selector = 0;
 };
@@ -48,16 +70,51 @@ struct EngineGroupT {
     EnginesT engines;
 };
 using EngineGroupsT = std::vector<EngineGroupT>;
+using CsrContainer = std::vector<std::unique_ptr<CommandStreamReceiver>>;
+
+struct SecondaryContexts : NEO::NonCopyableAndNonMovableClass {
+    SecondaryContexts() = default;
+    SecondaryContexts(SecondaryContexts &&in) noexcept {
+        this->engines = std::move(in.engines);
+        this->regularCounter = in.regularCounter.load();
+        this->highPriorityCounter = in.highPriorityCounter.load();
+        this->assignedContextsCounter = in.assignedContextsCounter.load();
+        this->regularEnginesTotal = in.regularEnginesTotal;
+        this->highPriorityEnginesTotal = in.highPriorityEnginesTotal;
+        this->internalEngineIndex = in.internalEngineIndex;
+        this->npIndices = std::move(in.npIndices);
+        this->hpIndices = std::move(in.hpIndices);
+    }
+    SecondaryContexts &operator=(SecondaryContexts &&other) noexcept = delete;
+
+    EngineControl *getEngine(const EngineUsage usage, std::optional<uint32_t> priority);
+    EngineControl *getEngineWithoutSharedContextPriorityOverride(const EngineUsage usage, std::optional<uint32_t> priority);
+    EngineControl *selectEngine(const EngineUsage usage, std::optional<uint32_t> priority, bool sharedContextPriorityOverrideAllowed);
+    std::optional<int32_t> selectLeastLoadedIndex(const std::vector<int32_t> &candidateIndices, std::optional<uint32_t> hwPriority,
+                                                  bool requireFreeAndInitialized, size_t scanStartOffset) const;
+
+    EnginesT engines;                                 // vector of secondary EngineControls
+    std::atomic<uint8_t> regularCounter = 0;          // Counter used to assign next regular EngineControl
+    std::atomic<uint8_t> highPriorityCounter = 0;     // Counter used to assign next highPriority EngineControl
+    std::atomic<uint8_t> assignedContextsCounter = 0; // Counter of assigned contexts in group
+    uint32_t regularEnginesTotal = 0;
+    uint32_t highPriorityEnginesTotal = 0;
+    uint32_t internalEngineIndex = 0;
+
+    std::vector<int32_t> npIndices;
+    std::vector<int32_t> hpIndices;
+    std::mutex mutex;
+};
+
+static_assert(NEO::NonCopyable<SecondaryContexts>);
 
 struct RTDispatchGlobalsInfo {
     GraphicsAllocation *rtDispatchGlobalsArray = nullptr;
     std::vector<GraphicsAllocation *> rtStacks; // per tile
 };
 
-class Device : public ReferenceTrackedObject<Device> {
+class Device : public ReferenceTrackedObject<Device>, NEO::NonCopyableAndNonMovableClass {
   public:
-    Device &operator=(const Device &) = delete;
-    Device(const Device &) = delete;
     ~Device() override;
 
     template <typename DeviceT, typename... ArgsT>
@@ -82,13 +139,14 @@ class Device : public ReferenceTrackedObject<Device> {
     EngineGroupsT &getRegularEngineGroups() {
         return this->regularEngineGroups;
     }
+    const EngineGroupT *tryGetRegularEngineGroup(EngineGroupType engineGroupType) const;
     size_t getEngineGroupIndexFromEngineGroupType(EngineGroupType engineGroupType) const;
     EngineControl &getEngine(uint32_t index);
     EngineControl &getDefaultEngine();
-    EngineControl &getNextEngineForCommandQueue();
-    EngineControl &getNextEngineForMultiRegularContextMode(aub_stream::EngineType engineType);
     EngineControl &getInternalEngine();
     EngineControl *getInternalCopyEngine();
+    EngineControl *getInternalLinkCopyEngine();
+    EngineControl *getHpCopyEngine();
     SelectorCopyEngine &getSelectorCopyEngine();
     MemoryManager *getMemoryManager() const;
     GmmHelper *getGmmHelper() const;
@@ -100,9 +158,9 @@ class Device : public ReferenceTrackedObject<Device> {
     GFXCORE_FAMILY getRenderCoreFamily() const;
     PerformanceCounters *getPerformanceCounters() { return performanceCounters.get(); }
     PreemptionMode getPreemptionMode() const { return preemptionMode; }
-    MOCKABLE_VIRTUAL bool isDebuggerActive() const;
+    void overridePreemptionMode(PreemptionMode mode) { preemptionMode = mode; }
     Debugger *getDebugger() const;
-    NEO::SourceLevelDebugger *getSourceLevelDebugger();
+    void setDebugger(Debugger *debugger);
     DebuggerL0 *getL0Debugger();
     const EnginesT &getAllEngines() const;
     const std::string getDeviceName() const;
@@ -113,6 +171,7 @@ class Device : public ReferenceTrackedObject<Device> {
     bool isFullRangeSvm() const;
     static bool isBlitSplitEnabled();
     static bool isInitDeviceWithFirstSubmissionEnabled(CommandStreamReceiverType csrType);
+    static std::vector<DeviceVector> groupDevices(DeviceVector devices);
     bool isBcsSplitSupported();
     bool isInitDeviceWithFirstSubmissionSupported(CommandStreamReceiverType csrType);
     bool areSharedSystemAllocationsAllowed() const;
@@ -125,6 +184,7 @@ class Device : public ReferenceTrackedObject<Device> {
         return reinterpret_cast<SpecializedDeviceT *>(specializedDevice);
     }
     MOCKABLE_VIRTUAL CompilerInterface *getCompilerInterface() const;
+    MOCKABLE_VIRTUAL SipExternalLib *getSipExternalLibInterface() const;
     BuiltIns *getBuiltIns() const;
     void allocateSyncBufferHandler();
 
@@ -139,40 +199,146 @@ class Device : public ReferenceTrackedObject<Device> {
     uint32_t getNumSubDevices() const { return numSubDevices; }
     virtual bool isSubDevice() const = 0;
     bool hasRootCsr() const { return rootCsrCreated; }
-    bool isEngineInstanced() const { return engineInstanced; }
 
     BindlessHeapsHelper *getBindlessHeapsHelper() const;
+    FrontEndController *getFrontEndController() const;
 
-    static decltype(&PerformanceCounters::create) createPerformanceCountersFunc;
+    using CreatePerformanceCountersFunc = std::unique_ptr<PerformanceCounters> (*)(Device *device);
+    static CreatePerformanceCountersFunc createPerformanceCountersFunc;
     std::unique_ptr<SyncBufferHandler> syncBufferHandler;
     GraphicsAllocation *getRTMemoryBackedBuffer() { return rtMemoryBackedBuffer; }
     RTDispatchGlobalsInfo *getRTDispatchGlobals(uint32_t maxBvhLevels);
-    bool rayTracingIsInitialized() const { return rtMemoryBackedBuffer != nullptr; }
+    bool rayTracingIsInitialized() const { return rtMemoryBackedBuffer != nullptr && rtDispatchGlobalsInfos.size() != 0; }
+    void initializeRTMemoryBackedBuffer();
     void initializeRayTracing(uint32_t maxBvhLevels);
     void allocateRTDispatchGlobals(uint32_t maxBvhLevels);
 
-    uint64_t getGlobalMemorySize(uint32_t deviceBitfield) const;
-    const std::vector<SubDevice *> getSubDevices() const { return subdevices; }
-    bool getUuid(std::array<uint8_t, ProductHelper::uuidSize> &uuid);
-    void generateUuid(std::array<uint8_t, ProductHelper::uuidSize> &uuid);
-    void getAdapterLuid(std::array<uint8_t, ProductHelper::luidSize> &luid);
+    MOCKABLE_VIRTUAL uint64_t getGlobalMemorySize(uint32_t deviceBitfield) const;
+    uint64_t getUsableMemorySize() const;
+    const std::vector<SubDevice *> &getSubDevices() const { return subdevices; }
+    bool getUuid(std::array<uint8_t, CommonConstants::uuidSize> &uuid);
+    void generateUuid(std::array<uint8_t, CommonConstants::uuidSize> &uuid);
+    void getAdapterLuid(std::array<uint8_t, CommonConstants::luidSize> &luid);
     MOCKABLE_VIRTUAL bool verifyAdapterLuid();
     void getAdapterMask(uint32_t &nodeMask);
     const GfxCoreHelper &getGfxCoreHelper() const;
     const ProductHelper &getProductHelper() const;
     const CompilerProductHelper &getCompilerProductHelper() const;
-    const ReleaseHelper *getReleaseHelper() const;
+    MOCKABLE_VIRTUAL const ReleaseHelper &getReleaseHelper() const;
+    MOCKABLE_VIRTUAL AILConfiguration *getAilConfigurationHelper() const;
+    ISAPoolAllocator &getIsaPoolAllocator() {
+        return *isaPoolAllocator;
+    }
+    LinearStreamPoolAllocator &getLinearStreamPoolAllocator() {
+        return linearStreamPoolAllocator;
+    }
+    InternalHeapPoolAllocator &getInternalHeapPoolAllocator() {
+        return internalHeapPoolAllocator;
+    }
+    TimestampPoolAllocator &getDeviceTimestampPoolAllocator() {
+        return deviceTimestampPoolAllocator;
+    }
+    GlobalSurfacePoolAllocator &getGlobalSurfacePoolAllocator() {
+        return globalSurfacePoolAllocator;
+    }
+    ConstantSurfacePoolAllocator &getConstantSurfacePoolAllocator() {
+        return constantSurfacePoolAllocator;
+    }
+    CommandBufferPoolAllocator &getCommandBufferPoolAllocator() {
+        return commandBufferPoolAllocator;
+    }
+    SemaphorePoolAllocator &getSemaphorePoolAllocator() {
+        return this->semaphorePoolAllocator;
+    }
+    UsmMemAllocPoolsFacade &getDeviceUsmMemAllocPoolFacade();
+    UsmMemAllocPool *getUsmConstantSurfaceAllocPool() {
+        return usmConstantSurfaceAllocPool.get();
+    }
+    UsmMemAllocPool *getUsmGlobalSurfaceAllocPool() {
+        return usmGlobalSurfaceAllocPool.get();
+    }
+    MOCKABLE_VIRTUAL void stopDirectSubmissionAndWaitForCompletion();
+    MOCKABLE_VIRTUAL void pollForCompletion();
+    bool isAnyDirectSubmissionEnabled() const;
+    bool isAnyDirectSubmissionLightEnabled() const;
+    bool isStateSipRequired() const {
+        return (getPreemptionMode() == PreemptionMode::MidThread || getDebugger() != nullptr) && getCompilerInterface();
+    }
 
-    uint32_t getNumberOfRegularContextsPerEngine() const { return numberOfRegularContextsPerEngine; }
-    bool isMultiRegularContextSelectionAllowed(aub_stream::EngineType engineType, EngineUsage engineUsage) const;
+    MOCKABLE_VIRTUAL EngineControl *getSecondaryEngineCsr(EngineTypeUsage engineTypeUsage, std::optional<uint32_t> hwPriority);
+    EngineControl *getSecondaryEngineCsrWithoutSharedContextPriorityOverride(EngineTypeUsage engineTypeUsage, std::optional<uint32_t> hwPriority);
+    bool isSecondaryContextEngineType(aub_stream::EngineType type) {
+        return EngineHelpers::isCcs(type) || EngineHelpers::isBcs(type);
+    }
+
+    GraphicsAllocation *getDebugSurface() const { return debugSurface; }
+    void setDebugSurface(GraphicsAllocation *debugSurface) { this->debugSurface = debugSurface; };
+    const CsrContainer &getSecondaryCsrs() const { return secondaryCsrs; }
 
     std::atomic<uint32_t> debugExecutionCounter = 0;
+
+    void stopDirectSubmissionForCopyEngine();
+
+    bool shouldLimitAllocationsReuse() const;
+
+    uint32_t getMicrosecondResolution() const {
+        return microsecondResolution;
+    }
+
+    void updateMaxPoolCount(uint32_t type, uint32_t maxPoolCount) {
+        maxBufferPoolCount[type] = maxPoolCount;
+    }
+
+    bool requestPoolCreate(uint32_t type, uint32_t count) {
+        if (maxBufferPoolCount[type] >= count + bufferPoolCount[type].fetch_add(count)) {
+            return true;
+        } else {
+            bufferPoolCount[type] -= count;
+            return false;
+        }
+    }
+
+    void recordPoolsFreed(uint32_t type, uint32_t size) {
+        bufferPoolCount[type] -= size;
+    }
+
+    UsmReuseInfo usmReuseInfo;
+    UsmReuseInfo sharedUsmReuseInfo;
+
+    void cleanupUsmAllocationPool();
+
+    void resetUsmConstantSurfaceAllocPool(UsmMemAllocPool *usmMemAllocPool);
+    void resetUsmGlobalSurfaceAllocPool(UsmMemAllocPool *usmMemAllocPool);
+
+    std::unordered_map<uint32_t, bool> crossAccessEnabledDevices;
+    bool canAccessPeer(Device *peerDevice);
+    static void initializePeerAccessForDevices(const std::vector<NEO::Device *> &devices);
+    MOCKABLE_VIRTUAL bool queryPeerAccess(Device &peerDevice, GraphicsAllocation **probeAllocPtr, uint64_t *handle);
+
+    std::optional<bool> hasAnyPeerAccess() const {
+        return hasPeerAccess;
+    }
+
+    void updatePeerAccessCache(Device *peerDevice, bool value) {
+        this->crossAccessEnabledDevices[peerDevice->getRootDeviceIndex()] = value;
+        peerDevice->crossAccessEnabledDevices[this->getRootDeviceIndex()] = value;
+    }
+
+    std::vector<uint32_t> getSpirvBaseCapabilities() const;
+    void initializeSpirvQueries();
+    MOCKABLE_VIRTUAL bool isDeferredImmediateCmdListEnabled() const {
+        return deferredImmediateCmdListEnabled;
+    }
+    MOCKABLE_VIRTUAL bool areSecondaryEnginesAvailable() const {
+        return secondaryEngines.size() > 0;
+    }
 
   protected:
     Device() = delete;
     Device(ExecutionEnvironment *executionEnvironment, const uint32_t rootDeviceIndex);
 
     MOCKABLE_VIRTUAL void initializeCaps();
+    EngineControl *acquireSecondaryEngineCsr(EngineTypeUsage engineTypeUsage, std::optional<uint32_t> hwPriority, bool sharedContextPriorityOverrideAllowed);
 
     template <typename T>
     static T *createDeviceInternals(T *device) {
@@ -184,64 +350,94 @@ class Device : public ReferenceTrackedObject<Device> {
     }
 
     MOCKABLE_VIRTUAL bool createDeviceImpl();
+    bool initDeviceWithEngines();
+    bool initializeCommonResources();
+    bool initDeviceFully();
+    void initUsmReuseLimits();
     virtual bool createEngines();
 
     void addEngineToEngineGroup(EngineControl &engine);
-    MOCKABLE_VIRTUAL bool createEngine(uint32_t deviceCsrIndex, EngineTypeUsage engineTypeUsage);
+    MOCKABLE_VIRTUAL bool createEngine(EngineTypeUsage engineTypeUsage);
+    MOCKABLE_VIRTUAL bool initializeEngines();
+    MOCKABLE_VIRTUAL bool createSecondaryEngine(CommandStreamReceiver *primaryCsr, EngineTypeUsage engineTypeUsage);
+
     MOCKABLE_VIRTUAL std::unique_ptr<CommandStreamReceiver> createCommandStreamReceiver() const;
     MOCKABLE_VIRTUAL SubDevice *createSubDevice(uint32_t subDeviceIndex);
-    MOCKABLE_VIRTUAL SubDevice *createEngineInstancedSubDevice(uint32_t subDeviceIndex, aub_stream::EngineType engineType);
     MOCKABLE_VIRTUAL size_t getMaxParameterSizeFromIGC() const;
+    MOCKABLE_VIRTUAL bool isAnyDirectSubmissionEnabledImpl(bool light) const;
     double getPercentOfGlobalMemoryAvailable() const;
     virtual void createBindlessHeapsHelper() {}
+    virtual void createFrontEndController() {}
     bool createSubDevices();
     bool createGenericSubDevices();
-    bool createEngineInstancedSubDevices();
-    virtual bool genericSubDevicesAllowed();
-    bool engineInstancedSubDevicesAllowed();
-    void setAsEngineInstanced();
+    bool genericSubDevicesAllowed();
     void finalizeRayTracing();
+    bool createSecondaryContexts(const EngineControl &primaryEngine, SecondaryContexts &secondaryEnginesForType, uint32_t contextCount, uint32_t highPriorityContextCount);
+    MOCKABLE_VIRTUAL bool initializeSecondaryEngine(const EngineControl &engineControl);
+    bool isInternalEngineFromSecondaryContextEnabled() const;
+    EngineControl *tryGetInternalSecondaryEngine(aub_stream::EngineType engineType);
+    void allocateDebugSurface(size_t debugSurfaceSize);
 
     DeviceInfo deviceInfo = {};
+    std::once_flag initializeSpirvQueriesOnce;
 
     std::unique_ptr<PerformanceCounters> performanceCounters;
-    std::vector<std::unique_ptr<CommandStreamReceiver>> commandStreamReceivers;
+    CsrContainer commandStreamReceivers;
     EnginesT allEngines;
+
+    std::unordered_map<aub_stream::EngineType, SecondaryContexts> secondaryEngines;
+    CsrContainer secondaryCsrs;
+
     EngineGroupsT regularEngineGroups;
     std::vector<SubDevice *> subdevices;
 
-    PreemptionMode preemptionMode;
+    PreemptionMode preemptionMode = PreemptionMode::Disabled;
     ExecutionEnvironment *executionEnvironment = nullptr;
-    aub_stream::EngineType engineInstancedType = aub_stream::EngineType::NUM_ENGINES;
     uint32_t defaultEngineIndex = 0;
-    uint32_t defaultBcsEngineIndex = std::numeric_limits<uint32_t>::max();
     uint32_t numSubDevices = 0;
     std::atomic_uint32_t regularCommandQueuesCreatedWithinDeviceCount{0};
-    std::atomic<uint8_t> regularContextPerCcsEngineAssignmentHelper = 0;
-    std::atomic<uint8_t> regularContextPerBcsEngineAssignmentHelper = 0;
     std::bitset<8> availableEnginesForCommandQueueusRoundRobin = 0;
     uint32_t queuesPerEngineCount = 1;
-    uint32_t numberOfRegularContextsPerEngine = 1;
-    void initializeEngineRoundRobinControls();
     bool hasGenericSubDevices = false;
-    bool engineInstanced = false;
     bool rootCsrCreated = false;
     const uint32_t rootDeviceIndex;
+    GraphicsAllocation *debugSurface = nullptr;
 
     SelectorCopyEngine selectorCopyEngine = {};
+    EngineControl *hpCopyEngine = nullptr;
 
     DeviceBitfield deviceBitfield = 1;
 
     uintptr_t specializedDevice = reinterpret_cast<uintptr_t>(nullptr);
+    Debugger *debugger = nullptr;
 
     GraphicsAllocation *rtMemoryBackedBuffer = nullptr;
     std::vector<RTDispatchGlobalsInfo *> rtDispatchGlobalsInfos;
 
+    std::unique_ptr<ISAPoolAllocator> isaPoolAllocator;
+    LinearStreamPoolAllocator linearStreamPoolAllocator;
+    InternalHeapPoolAllocator internalHeapPoolAllocator;
+    TimestampPoolAllocator deviceTimestampPoolAllocator;
+    GlobalSurfacePoolAllocator globalSurfacePoolAllocator;
+    ConstantSurfacePoolAllocator constantSurfacePoolAllocator;
+    CommandBufferPoolAllocator commandBufferPoolAllocator;
+    SemaphorePoolAllocator semaphorePoolAllocator;
+    std::unique_ptr<UsmMemAllocPoolsFacade> deviceUsmMemAllocPoolFacade;
+    std::unique_ptr<UsmMemAllocPool> usmConstantSurfaceAllocPool;
+    std::unique_ptr<UsmMemAllocPool> usmGlobalSurfaceAllocPool;
+
+    std::array<std::atomic_uint32_t, 2> bufferPoolCount = {0u, 0u};
+    std::array<uint32_t, 2> maxBufferPoolCount = {0u, 0u};
+    uint32_t microsecondResolution = 1000u;
+
+    std::optional<bool> hasPeerAccess = std::nullopt;
+    bool deferredImmediateCmdListEnabled = true;
+
     struct {
         bool isValid = false;
-        std::array<uint8_t, ProductHelper::uuidSize> id;
+        std::array<uint8_t, CommonConstants::uuidSize> id;
     } uuid;
-    bool generateUuidFromPciBusInfo(const PhysicalDevicePciBusInfo &pciBusInfo, std::array<uint8_t, ProductHelper::uuidSize> &uuid);
+    bool generateUuidFromPciBusInfo(const PhysicalDevicePciBusInfo &pciBusInfo, std::array<uint8_t, CommonConstants::uuidSize> &uuid);
 };
 
 inline EngineControl &Device::getDefaultEngine() {
@@ -251,5 +447,7 @@ inline EngineControl &Device::getDefaultEngine() {
 inline SelectorCopyEngine &Device::getSelectorCopyEngine() {
     return selectorCopyEngine;
 }
+
+static_assert(NEO::NonCopyableAndNonMovable<Device>);
 
 } // namespace NEO

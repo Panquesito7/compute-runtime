@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2023 Intel Corporation
+Copyright (C) 2020-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -27,13 +27,15 @@ namespace MetricsLibraryApi
 //////////////////////////////////////////////////////////////////////////
 /// @brief Metrics Library handles.
 //////////////////////////////////////////////////////////////////////////
-#define METRICS_LIBRARY_HANDLE( Object ) typedef struct Object##Handle_1_0                                   \
-                                         {                                                                   \
-                                             void* data;                                                     \
-                                             Object##Handle_1_0( void )          { data = nullptr; }         \
-                                             Object##Handle_1_0( void* handle )  { data = handle; }          \
-                                             bool IsValid( void ) const          { return data != nullptr; } \
-                                         } Object##Handle_1_0;
+#define METRICS_LIBRARY_HANDLE( Object )                                                \
+    typedef struct Object##Handle_1_0                                                   \
+    {                                                                                   \
+        void* data;                                                                     \
+        Object##Handle_1_0( void )                      { data = nullptr; }             \
+        Object##Handle_1_0( void* handle )              { data = handle; }              \
+        bool IsValid( void ) const                      { return data != nullptr; }     \
+        bool IsEqual( Object##Handle_1_0 handle ) const { return data == handle.data; } \
+    } Object##Handle_1_0;
 
 METRICS_LIBRARY_HANDLE( Client )
 METRICS_LIBRARY_HANDLE( ClientMemory )
@@ -51,7 +53,8 @@ enum class ClientApi : uint32_t
     Unknown = 0,
     // 1-5 reserved.
     OpenCL = 6,
-    // 7-8 reserved.
+    Vulkan = 7,
+    // 8 reserved.
     OneApi = 9,
     // 10 reserved.
     // ...
@@ -72,6 +75,9 @@ enum class ClientGen : uint32_t
     XeHP    = 9,
     XeHPG   = 10,
     XeHPC   = 11,
+    Xe2HPG  = 12,
+    Xe3     = 13,
+    Xe3P    = 14,
     // ...
     Last
 };
@@ -155,6 +161,7 @@ enum class StatusCode : uint32_t
     ReportWithoutWorkload,
     ContextMismatch,
     ReportWithEmptyConfiguration,
+    ReportQueryModeMismatch,
     // ...
     Last
 };
@@ -356,8 +363,7 @@ struct CommandBufferOverride_1_0
 //////////////////////////////////////////////////////////////////////////
 struct CommandBufferMarkerStreamUser_1_0
 {
-    uint32_t    Reserved : 7;
-    uint32_t    Value    : 25;
+    uint32_t    Value;
 };
 
 //////////////////////////////////////////////////////////////////////////
@@ -737,6 +743,6 @@ using ContextDeleteFunction_1_0 = StatusCode ( ML_STDCALL* ) ( const ContextHand
 //////////////////////////////////////////////////////////////////////////
 #define METRICS_LIBRARY_MAJOR_NUMBER 1
 #define METRICS_LIBRARY_MINOR_NUMBER 0
-#define METRICS_LIBRARY_BUILD_NUMBER 133
+#define METRICS_LIBRARY_BUILD_NUMBER 249
 
 } // namespace MetricsLibraryApi

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,33 +8,53 @@
 #pragma once
 #include "shared/source/os_interface/os_time.h"
 
+#include <atomic>
+
 namespace NEO {
-static int PerfTicks = 0;
+static std::atomic<int> perfTicks{0};
 constexpr uint64_t convertToNs = 100;
 class MockDeviceTime : public DeviceTime {
-    bool getCpuGpuTime(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
-        pGpuCpuTime->gpuTimeStamp = ++PerfTicks;
-        pGpuCpuTime->cpuTimeinNS = PerfTicks * convertToNs;
-        return true;
+  public:
+    ~MockDeviceTime() override = default;
+    TimeQueryStatus getGpuCpuTimeImpl(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
+        if (gpuTimeStampResult) {
+            pGpuCpuTime->gpuTimeStamp = *gpuTimeStampResult;
+        } else {
+            pGpuCpuTime->gpuTimeStamp = ++perfTicks;
+        }
+        if (cpuTimeResult) {
+            pGpuCpuTime->cpuTimeinNS = *cpuTimeResult;
+        } else {
+            pGpuCpuTime->cpuTimeinNS = perfTicks * convertToNs;
+        }
+        return TimeQueryStatus::success;
     }
 
-    double getDynamicDeviceTimerResolution(HardwareInfo const &hwInfo) const override {
-        return OSTime::getDeviceTimerResolution(hwInfo);
+    double getDynamicDeviceTimerResolution() const override {
+        return OSTime::getDeviceTimerResolution();
     }
 
-    uint64_t getDynamicDeviceTimerClock(HardwareInfo const &hwInfo) const override {
-        return static_cast<uint64_t>(1000000000.0 / OSTime::getDeviceTimerResolution(hwInfo));
+    uint64_t getDynamicDeviceTimerClock() const override {
+        return static_cast<uint64_t>(1000000000.0 / OSTime::getDeviceTimerResolution());
     }
+    std::optional<uint64_t> gpuTimeStampResult{};
+    std::optional<uint64_t> cpuTimeResult{};
 };
 
 class MockOSTime : public OSTime {
   public:
+    using OSTime::deviceTime;
     MockOSTime() {
         this->deviceTime = std::make_unique<MockDeviceTime>();
     }
+    ~MockOSTime() override = default;
 
     bool getCpuTime(uint64_t *timeStamp) override {
-        *timeStamp = ++PerfTicks * convertToNs;
+        if (cpuTimeResult) {
+            *timeStamp = *cpuTimeResult;
+        } else {
+            *timeStamp = ++perfTicks * convertToNs;
+        }
         return true;
     };
     double getHostTimerResolution() const override {
@@ -47,6 +67,7 @@ class MockOSTime : public OSTime {
     static std::unique_ptr<OSTime> create() {
         return std::unique_ptr<OSTime>(new MockOSTime());
     }
+    std::optional<uint64_t> cpuTimeResult{};
 };
 
 class MockDeviceTimeWithConstTimestamp : public DeviceTime {
@@ -54,18 +75,18 @@ class MockDeviceTimeWithConstTimestamp : public DeviceTime {
     static constexpr uint64_t cpuTimeInNs = 1u;
     static constexpr uint64_t gpuTimestamp = 2u;
 
-    bool getCpuGpuTime(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
+    TimeQueryStatus getGpuCpuTimeImpl(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
         pGpuCpuTime->gpuTimeStamp = gpuTimestamp;
         pGpuCpuTime->cpuTimeinNS = cpuTimeInNs;
-        return true;
+        return TimeQueryStatus::success;
     }
 
-    double getDynamicDeviceTimerResolution(HardwareInfo const &hwInfo) const override {
+    double getDynamicDeviceTimerResolution() const override {
         return 1.0;
     }
 
-    uint64_t getDynamicDeviceTimerClock(HardwareInfo const &hwInfo) const override {
-        return static_cast<uint64_t>(1000000000.0 / OSTime::getDeviceTimerResolution(hwInfo));
+    uint64_t getDynamicDeviceTimerClock() const override {
+        return static_cast<uint64_t>(1000000000.0 / OSTime::getDeviceTimerResolution());
     }
 };
 
@@ -88,4 +109,14 @@ class MockOSTimeWithConstTimestamp : public OSTime {
         return 0;
     }
 };
+
+class MockOSTimeWithConfigurableCpuTimestamp : public MockOSTimeWithConstTimestamp {
+  public:
+    uint64_t mockCpuTime = 0;
+    bool getCpuTime(uint64_t *timeStamp) override {
+        *timeStamp = mockCpuTime;
+        return true;
+    }
+};
+
 } // namespace NEO

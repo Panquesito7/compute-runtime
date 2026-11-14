@@ -1,32 +1,45 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/compiler_aot_config_bdw_and_later.inl"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/compiler_product_helper_base.inl"
-#include "shared/source/helpers/compiler_product_helper_bdw_and_later.inl"
-#include "shared/source/helpers/compiler_product_helper_enable_split_matrix_multiply_accumulate.inl"
-#include "shared/source/helpers/compiler_product_helper_enable_subgroup_local_block_io.inl"
-#include "shared/source/helpers/compiler_product_helper_tgllp_and_later.inl"
+#include "shared/source/helpers/compiler_product_helper_from_xe_hpc_to_xe3p.inl"
 #include "shared/source/helpers/compiler_product_helper_xe_hp_and_later.inl"
 #include "shared/source/helpers/compiler_product_helper_xe_hpc_and_later.inl"
 #include "shared/source/xe_hpc_core/hw_cmds.h"
 #include "shared/source/xe_hpc_core/pvc/device_ids_configs_pvc.h"
 
-#include "compiler_product_helper_pvc.inl"
 #include "platforms.h"
+
+#include <algorithm>
 namespace NEO {
+template <>
+uint32_t CompilerProductHelperHw<IGFX_PVC>::getDefaultHwIpVersion() const {
+    return AOT::PVC_XT_C0;
+}
+
+template <>
+void CompilerProductHelperHw<IGFX_PVC>::setProductConfigForHwInfo(HardwareInfo &hwInfo, HardwareIpVersion config) const {
+    hwInfo.platform.usRevId = config.revision;
+    hwInfo.ipVersion = config;
+}
 
 template <>
 uint32_t CompilerProductHelperHw<IGFX_PVC>::getProductConfigFromHwInfo(const HardwareInfo &hwInfo) const {
     auto deviceId = hwInfo.platform.usDeviceID;
     bool isPvcXl = (std::find(pvcXlDeviceIds.begin(), pvcXlDeviceIds.end(), deviceId) != pvcXlDeviceIds.end());
     bool isPvcXt = (std::find(pvcXtDeviceIds.begin(), pvcXtDeviceIds.end(), deviceId) != pvcXtDeviceIds.end());
-    if (isPvcXl) {
+    bool isPvcXtVg = (std::find(pvcXtVgDeviceIds.begin(), pvcXtVgDeviceIds.end(), deviceId) != pvcXtVgDeviceIds.end());
+
+    if (isPvcXtVg) {
+        if ((hwInfo.platform.usRevId & PVC::pvcSteppingBits) == 7) {
+            return AOT::PVC_XT_C0_VG;
+        }
+    } else if (isPvcXl) {
         switch (hwInfo.platform.usRevId & PVC::pvcSteppingBits) {
         case 0x0:
             return AOT::PVC_XL_A0;
@@ -47,13 +60,27 @@ uint32_t CompilerProductHelperHw<IGFX_PVC>::getProductConfigFromHwInfo(const Har
             return AOT::PVC_XT_C0;
         }
     }
-    return AOT::UNKNOWN_ISA;
+    return getDefaultHwIpVersion();
 }
 template <>
 uint32_t CompilerProductHelperHw<IGFX_PVC>::matchRevisionIdWithProductConfig(HardwareIpVersion ipVersion, uint32_t revisionID) const {
     HardwareIpVersion pvcConfig = ipVersion;
     pvcConfig.revision = revisionID & PVC::pvcSteppingBits;
     return pvcConfig.value;
+}
+
+template <>
+bool CompilerProductHelperHw<IGFX_PVC>::failBuildProgramWithBufferStatefulAccessPreference() const {
+    return false;
+}
+
+template <>
+bool CompilerProductHelperHw<IGFX_PVC>::isMatrixMultiplyAccumulateTF32Supported(const HardwareInfo &hwInfo) const {
+    auto config = getProductConfigFromHwInfo(hwInfo);
+    if (config >= AOT::PVC_XT_B0 && config < AOT::PVC_XT_C0_VG) {
+        return true;
+    }
+    return false;
 }
 
 static EnableCompilerProductHelper<IGFX_PVC> enableCompilerProductHelperPVC;

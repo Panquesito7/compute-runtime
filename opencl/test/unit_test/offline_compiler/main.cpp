@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/source/os_interface/os_library.h"
 #include "shared/source/utilities/logger.h"
 #include "shared/test/common/helpers/custom_event_listener.h"
+#include "shared/test/common/helpers/debug_variables_listener.h"
 #include "shared/test/common/helpers/gtest_helpers.h"
 #include "shared/test/common/helpers/memory_leak_listener.h"
 #include "shared/test/common/helpers/test_files.h"
@@ -19,16 +20,10 @@
 
 #include "environment.h"
 #include "limits.h"
-#include "test_files_setup.h"
 
 #include <fstream>
 #include <igfxfmid.h>
-
-#ifdef WIN32
-const char *fSeparator = "\\";
-#elif defined(__linux__)
-const char *fSeparator = "/";
-#endif
+#include <regex>
 
 Environment *gEnvironment;
 extern PRODUCT_FAMILY productFamily;
@@ -48,12 +43,6 @@ std::string getRunPath() {
 }
 
 void applyWorkarounds() {
-    {
-        std::ofstream f;
-        const std::string fileName("_tmp_");
-        f.open(fileName, std::ofstream::binary);
-        f.close();
-    }
     {
         std::mutex mtx;
         std::unique_lock<std::mutex> stateLock(mtx);
@@ -75,7 +64,7 @@ void applyWorkarounds() {
     {
         [[maybe_unused]] auto ret = std::regex_search("str", std::regex(std::string(".")));
     }
-    // intialize rand
+    // initialize rand
     srand(static_cast<unsigned int>(time(nullptr)));
 }
 
@@ -89,8 +78,7 @@ int main(int argc, char **argv) {
     bool dumpTestStats = false;
     std::string dumpTestStatsFileName = "";
 
-    std::string devicePrefix("skl");
-    std::string revId("0");
+    std::string devicePrefix(DEFAULT_TEST_PLATFORM_NAME);
     std::string productConfig("");
 
     applyWorkarounds();
@@ -126,9 +114,6 @@ int main(int argc, char **argv) {
             } else if (strcmp("--device", argv[i]) == 0) {
                 ++i;
                 devicePrefix = argv[i];
-            } else if (strcmp("--rev_id", argv[i]) == 0) {
-                ++i;
-                revId = argv[i];
             } else if (!strcmp("--show_test_stats", argv[i])) {
                 showTestStats = true;
             } else if (!strcmp("--dump_test_stats", argv[i])) {
@@ -139,11 +124,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (unsigned int productId = 0; productId < IGFX_MAX_PRODUCT; ++productId) {
+    uint16_t revision = 0;
+    for (unsigned int productId = 0; productId < NEO::maxProductEnumValue; ++productId) {
         if (NEO::hardwarePrefix[productId] && (0 == strcmp(devicePrefix.c_str(), NEO::hardwarePrefix[productId]))) {
             if (NEO::hardwareInfoTable[productId]) {
                 renderCoreFamily = NEO::hardwareInfoTable[productId]->platform.eRenderCoreFamily;
                 productFamily = NEO::hardwareInfoTable[productId]->platform.eProductFamily;
+                revision = NEO::hardwareInfoTable[productId]->platform.usRevId;
                 break;
             }
         }
@@ -166,17 +153,13 @@ int main(int argc, char **argv) {
     nTestFiles.append("/");
     nTestFiles.append(devicePrefix);
     nTestFiles.append("/");
-    nTestFiles.append(revId);
+    nTestFiles.append(std::to_string(revision));
     nTestFiles.append("/");
     nTestFiles.append(testFiles);
     testFiles = nTestFiles;
     binaryNameSuffix.append(devicePrefix);
 
-    std::string nClFiles = NEO_OPENCL_TEST_FILES_DIR;
-    nClFiles.append("/");
-    clFiles = nClFiles;
-
-#ifdef WIN32
+#if defined(_WIN32)
 #include <direct.h>
     if (_chdir(devicePrefix.c_str())) {
         std::cout << "chdir into " << devicePrefix << " directory failed.\nThis might cause test failures." << std::endl;
@@ -198,15 +181,11 @@ int main(int argc, char **argv) {
     }
     listeners.Append(new NEO::MemoryLeakListener);
     listeners.Append(new NEO::VirtualFileSystemListener);
+    listeners.Append(new NEO::DebugVariablesListener);
 
     gEnvironment = reinterpret_cast<Environment *>(::testing::AddGlobalTestEnvironment(new Environment(devicePrefix, productConfig)));
 
-    int sigOut = setAlarm(enableAlarm);
-    if (sigOut != 0) {
-        return sigOut;
-    }
-
-    sigOut = setSegv(enableSegv);
+    int sigOut = setSegv(enableSegv);
     if (sigOut != 0) {
         return sigOut;
     }
@@ -216,7 +195,13 @@ int main(int argc, char **argv) {
         return sigOut;
     }
 
+    sigOut = setAlarm(enableAlarm);
+    if (sigOut != 0) {
+        return sigOut;
+    }
+
     retVal = RUN_ALL_TESTS();
+    cleanupSignals();
 
     if (showTestStats) {
         std::cout << getTestStats() << std::endl;

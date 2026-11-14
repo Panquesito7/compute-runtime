@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,9 +10,8 @@
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/libult/ult_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/helpers/task_information.h"
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
@@ -133,7 +132,7 @@ TEST(UserEvent, GivenInitialUserEventStateWhenCheckingReadyForSubmissionThenFals
 TEST(UserEvent, GivenUserEventWhenGettingTaskLevelThenZeroIsReturned) {
     MyUserEvent uEvent;
     EXPECT_EQ(0U, uEvent.getTaskLevel());
-    EXPECT_EQ(WaitStatus::NotReady, uEvent.wait(false, false));
+    EXPECT_EQ(WaitStatus::notReady, uEvent.wait(false, false));
 }
 
 TEST(UserEvent, WhenSettingStatusThenReadyForSubmissionisTrue) {
@@ -251,7 +250,7 @@ TEST_F(MockEventTests, WhenAddingChildEventThenConnectionIsCreatedAndCountOnRetu
 
     EXPECT_EQ(1U, returnEvent->peekNumEventsBlockingThis());
 
-    // check if user event knows his childs
+    // check if user event knows its children
     EXPECT_TRUE(uEvent->peekHasChildEvents());
 
     // make sure that proper event is set as child
@@ -290,10 +289,10 @@ TEST_F(MockEventTests, WhenAddingTwoChildEventsThenConnectionIsCreatedAndCountOn
 
     ASSERT_EQ(2U, returnEvent->peekNumEventsBlockingThis());
 
-    // check if user event knows his childs
+    // check if user event knows its children
     EXPECT_TRUE(uEvent->peekHasChildEvents());
 
-    // check if user event knows his childs
+    // check if user event knows its children
     EXPECT_TRUE(uEvent2->peekHasChildEvents());
 
     // make sure that proper event is set as child
@@ -333,10 +332,10 @@ TEST_F(MockEventTests, GivenTwoUserEvenstWhenCountOnNdr1IsInjectedThenItIsPropag
 
     ASSERT_EQ(2U, returnEvent1->peekNumEventsBlockingThis());
 
-    // check if user event knows his childs
+    // check if user event knows its children
     EXPECT_TRUE(uEvent->peekHasChildEvents());
 
-    // check if user event knows his childs
+    // check if user event knows its children
     EXPECT_TRUE(uEvent2->peekHasChildEvents());
 
     // make sure that proper event is set as child
@@ -359,11 +358,11 @@ TEST_F(MockEventTests, GivenTwoUserEvenstWhenCountOnNdr1IsInjectedThenItIsPropag
 
     EXPECT_EQ(returnEvent2, returnEvent1->peekChildEvents()->ref);
 
-    // now signal both parents and see if all childs are notified
+    // now signal both parents and see if all children are notified
     uEvent->setStatus(CL_COMPLETE);
     uEvent2->setStatus(CL_COMPLETE);
 
-    // queue shoud be in unblocked state
+    // queue should be in unblocked state
     EXPECT_EQ(pCmdQ->isQueueBlocked(), false);
 
     // finish returns immidieatly
@@ -460,7 +459,7 @@ TEST_F(MockEventTests, GivenUserEventWhenSettingStatusCompleteThenTaskLevelIsUpd
     EXPECT_EQ(CompletionStamp::notReady, returnEvent->taskLevel);
     EXPECT_EQ(CompletionStamp::notReady, returnEvent->peekTaskCount());
 
-    // now set user event for complete status, this triggers update of childs.
+    // now set user event for complete status, this triggers update of children.
     uEvent->setStatus(CL_COMPLETE);
 
     // child event should have the same taskLevel as parentEvent, as parent event is top of the tree and doesn't have any commands.
@@ -486,7 +485,7 @@ TEST_F(MockEventTests, GivenCompleteParentWhenWaitingForEventsThenChildrenAreCom
     Event *returnEvent = castToObject<Event>(retEvent);
     EXPECT_EQ(CompletionStamp::notReady, returnEvent->taskLevel);
 
-    // now set user event for complete status, this triggers update of childs.
+    // now set user event for complete status, this triggers update of children.
     uEvent->setStatus(CL_COMPLETE);
 
     retVal = clWaitForEvents(1, &retEvent);
@@ -543,12 +542,12 @@ TEST_F(MockEventTests, GivenAbortedUserEventWhenEnqueingNdrThenDoNotFlushToCsr) 
 
 TEST_F(MockEventTests, givenDebugVariableWhenStatusIsQueriedThenNoFlushHappens) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.SkipFlushingEventsOnGetStatusCalls.set(1);
-    DebugManager.flags.PerformImplicitFlushForNewResource.set(0);
-    DebugManager.flags.PerformImplicitFlushForIdleGpu.set(0);
+    debugManager.flags.SkipFlushingEventsOnGetStatusCalls.set(1);
+    debugManager.flags.PerformImplicitFlushForNewResource.set(0);
+    debugManager.flags.PerformImplicitFlushForIdleGpu.set(0);
 
     auto &csr = pCmdQ->getGpgpuCommandStreamReceiver();
-    csr.overrideDispatchPolicy(DispatchMode::BatchedDispatch);
+    csr.overrideDispatchPolicy(DispatchMode::batchedDispatch);
     csr.postInitFlagsSetup();
 
     cl_event retEvent = nullptr;
@@ -791,7 +790,7 @@ TEST_F(MockEventTests, givenBlockedQueueThenCommandStreamDoesNotChangeWhileEnque
 
 TEST_F(EventTests, givenUserEventThatHasCallbackAndBlockQueueWhenQueueIsQueriedForBlockedThenCallBackIsCalled) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
     struct EV : UserEvent {
         EV(Context *ctx) : UserEvent(ctx) {
         }
@@ -839,7 +838,7 @@ TEST_F(EventTests, givenUserEventThatHasCallbackAndBlockQueueWhenQueueIsQueriedF
 
 TEST_F(EventTests, GivenEventCallbackWithWaitWhenWaitingForEventsThenSuccessIsReturned) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
     UserEvent event1;
     struct E2Clb {
         static void CL_CALLBACK signalEv2(cl_event e, cl_int status, void *data)
@@ -870,7 +869,7 @@ TEST_F(EventTests, GivenEventCallbackWithWaitWhenWaitingForEventsThenSuccessIsRe
 
 TEST_F(EventTests, GivenEventCallbackWithoutWaitWhenWaitingForEventsThenSuccessIsReturned) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
     UserEvent event1(context);
     struct E2Clb {
         static void CL_CALLBACK signalEv2(cl_event e, cl_int status, void *data)
@@ -902,7 +901,7 @@ TEST_F(MockEventTests, GivenEnqueueReadImageWhenWaitingforEventThenSuccessIsRetu
     uEvent = makeReleaseable<UserEvent>(context);
     cl_event eventWaitList[] = {uEvent.get()};
 
-    auto image = clUniquePtr(Image2dHelper<>::create(this->context));
+    auto image = clUniquePtr(Image2dHelperUlt<>::create(this->context));
     ASSERT_NE(nullptr, image);
 
     auto retVal = EnqueueReadImageHelper<>::enqueueReadImage(pCmdQ,
@@ -954,7 +953,7 @@ TEST_F(EventTests, WhenWaitingForEventsThenTemporaryAllocationsAreDestroyed) {
 TEST_F(EventTest, WhenUserEventIsCreatedThenWaitIsNonBlocking) {
     UserEvent event;
     auto result = event.wait(false, false);
-    EXPECT_EQ(WaitStatus::NotReady, result);
+    EXPECT_EQ(WaitStatus::notReady, result);
 }
 
 TEST_F(EventTest, GivenSingleUserEventWhenWaitingForEventsThenSuccessIsReturned) {
@@ -968,7 +967,7 @@ TEST_F(EventTest, GivenSingleUserEventWhenWaitingForEventsThenSuccessIsReturned)
 
 TEST_F(EventTest, GivenMultipleOutOfOrderCallbacksWhenWaitingForEventsThenSuccessIsReturned) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
     UserEvent event1;
     struct E2Clb {
         static void CL_CALLBACK signalEv2(cl_event e, cl_int status, void *data)
@@ -987,9 +986,9 @@ TEST_F(EventTest, GivenMultipleOutOfOrderCallbacksWhenWaitingForEventsThenSucces
     EXPECT_EQ(result, CL_SUCCESS);
 }
 
-TEST_F(EventTests, WhenCalbackWasRegisteredOnCallbackThenExecutionPassesCorrectExecutionStatus) {
+TEST_F(EventTests, WhenCallbackWasRegisteredOnCallbackThenExecutionPassesCorrectExecutionStatus) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableAsyncEventsHandler.set(false);
+    debugManager.flags.EnableAsyncEventsHandler.set(false);
     struct HelperClb {
         static void CL_CALLBACK setClbStatus(cl_event e, cl_int status, void *data)
 
@@ -1063,7 +1062,7 @@ TEST_F(EventTests, GivenMultipleEventsWhenEventsAreCompletedThenCorrectNumberOfB
 }
 
 TEST_F(EventTests, WhenPassingBlockedUserEventToEnqueueNdRangeThenCommandQueueIsNotRetained) {
-    auto userEvent = clCreateUserEvent(pContext, &retVal);
+    auto userEvent = clCreateUserEvent(pContext.get(), &retVal);
     ASSERT_EQ(CL_SUCCESS, retVal);
 
     auto uEvent = (UserEvent *)userEvent;
@@ -1080,7 +1079,7 @@ TEST_F(EventTests, WhenPassingBlockedUserEventToEnqueueNdRangeThenCommandQueueIs
     cmdQueue = uEvent->getCommandQueue();
     ASSERT_EQ(nullptr, cmdQueue);
 
-    // Virtual event add refference to cmq queue.
+    // Virtual event add reference to cmq queue.
     EXPECT_EQ(intitialRefCount + 1, pCmdQ->getRefInternalCount());
 
     retVal = clSetUserEventStatus(userEvent, CL_COMPLETE);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,96 +8,43 @@
 #include "shared/source/command_stream/csr_definitions.h"
 #include "shared/source/command_stream/stream_properties.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/gen_common/reg_configs_common.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/pipe_control_args.h"
 #include "shared/source/helpers/pipeline_select_helper.h"
 #include "shared/source/helpers/preamble_base.inl"
 
-#include "reg_configs_common.h"
-
-// L3 programming:
-// All L3 Client Pool: 320KB
-// URB Pool: 64KB
-// Use Full ways: true
-// SLM: reserved (always enabled)
-
 namespace NEO {
 
-template <typename Family>
-void PreambleHelper<Family>::programPipelineSelect(LinearStream *pCommandStream,
-                                                   const PipelineSelectArgs &pipelineSelectArgs,
-                                                   const RootDeviceEnvironment &rootDeviceEnvironment) {
-
-    using PIPELINE_SELECT = typename Family::PIPELINE_SELECT;
-
-    PIPELINE_SELECT cmd = Family::cmdInitPipelineSelect;
-
-    if (DebugManager.flags.CleanStateInPreamble.get()) {
-        auto cmdBuffer = pCommandStream->getSpaceForCmd<PIPELINE_SELECT>();
-        cmd.setPipelineSelection(PIPELINE_SELECT::PIPELINE_SELECTION_3D);
-        *cmdBuffer = cmd;
-
-        PipeControlArgs args = {};
-        args.stateCacheInvalidationEnable = true;
-        MemorySynchronizationCommands<Family>::addSingleBarrier(*pCommandStream, args);
-    }
-
-    auto cmdBuffer = pCommandStream->getSpaceForCmd<PIPELINE_SELECT>();
-
-    auto mask = pipelineSelectEnablePipelineSelectMaskBits;
-
-    cmd.setPipelineSelection(PIPELINE_SELECT::PIPELINE_SELECTION_GPGPU);
-    if constexpr (Family::isUsingMediaSamplerDopClockGate) {
-        mask |= pipelineSelectMediaSamplerDopClockGateMaskBits;
-        cmd.setMediaSamplerDopClockGateEnable(!pipelineSelectArgs.mediaSamplerRequired);
-    }
-
-    bool systolicSupport = pipelineSelectArgs.systolicPipelineSelectSupport;
-    bool systolicValue = pipelineSelectArgs.systolicPipelineSelectMode;
-    int32_t overrideSystolic = DebugManager.flags.OverrideSystolicPipelineSelect.get();
-
-    if (overrideSystolic != -1) {
-        systolicSupport = true;
-        systolicValue = !!overrideSystolic;
-    }
-
-    if (systolicSupport) {
-        cmd.setSystolicModeEnable(systolicValue);
-        mask |= pipelineSelectSystolicModeEnableMaskBits;
-    }
-
-    cmd.setMaskBits(mask);
-
-    *cmdBuffer = cmd;
-
-    if (DebugManager.flags.CleanStateInPreamble.get()) {
-        PipeControlArgs args = {};
-        args.stateCacheInvalidationEnable = true;
-        MemorySynchronizationCommands<Family>::addSingleBarrier(*pCommandStream, args);
-    }
+template <typename GfxFamily>
+void PreambleHelper<GfxFamily>::addPipeControlBeforeVfeCmd(LinearStream *pCommandStream, const HardwareInfo *hwInfo, EngineGroupType engineGroupType) {
 }
 
-template <>
-void PreambleHelper<Family>::addPipeControlBeforeVfeCmd(LinearStream *pCommandStream, const HardwareInfo *hwInfo, EngineGroupType engineGroupType) {
+template <typename GfxFamily>
+void PreambleHelper<GfxFamily>::programL3(LinearStream *pCommandStream, uint32_t l3Config, bool isBcs) {
 }
 
-template <>
-void PreambleHelper<Family>::programL3(LinearStream *pCommandStream, uint32_t l3Config) {
-}
-
-template <>
-uint32_t PreambleHelper<Family>::getUrbEntryAllocationSize() {
+template <typename GfxFamily>
+uint32_t PreambleHelper<GfxFamily>::getUrbEntryAllocationSize() {
     return 0u;
 }
-template <>
-void PreambleHelper<Family>::appendProgramVFEState(const RootDeviceEnvironment &rootDeviceEnvironment, const StreamProperties &streamProperties, void *cmd);
 
 template <typename GfxFamily>
 void *PreambleHelper<GfxFamily>::getSpaceForVfeState(LinearStream *pCommandStream,
                                                      const HardwareInfo &hwInfo,
-                                                     EngineGroupType engineGroupType) {
-    using CFE_STATE = typename Family::CFE_STATE;
-    return pCommandStream->getSpace(sizeof(CFE_STATE));
+                                                     EngineGroupType engineGroupType,
+                                                     uint64_t *cmdBufferGpuAddress) {
+    if constexpr (GfxFamily::isHeaplessRequired() == false) {
+        using CFE_STATE = typename GfxFamily::CFE_STATE;
+        void *cmdPtr = pCommandStream->getSpace(sizeof(CFE_STATE));
+        if (cmdBufferGpuAddress) {
+            *cmdBufferGpuAddress = (pCommandStream->getCurrentGpuAddressPosition() - sizeof(CFE_STATE));
+        }
+        return cmdPtr;
+    } else {
+        return nullptr;
+    }
 }
 
 template <typename GfxFamily>
@@ -106,45 +53,72 @@ void PreambleHelper<GfxFamily>::programVfeState(void *pVfeState,
                                                 uint32_t scratchSize,
                                                 uint64_t scratchAddress,
                                                 uint32_t maxFrontEndThreads,
-                                                const StreamProperties &streamProperties,
-                                                LogicalStateHelper *logicalStateHelper) {
-    using CFE_STATE = typename Family::CFE_STATE;
+                                                const StreamProperties &streamProperties) {
+    if constexpr (GfxFamily::isHeaplessRequired() == false) {
+        using CFE_STATE = typename GfxFamily::CFE_STATE;
 
-    auto cfeState = reinterpret_cast<CFE_STATE *>(pVfeState);
-    CFE_STATE cmd = Family::cmdInitCfeState;
+        auto cfeState = reinterpret_cast<CFE_STATE *>(pVfeState);
+        CFE_STATE cmd = GfxFamily::cmdInitCfeState;
 
-    uint32_t lowAddress = uint32_t(0xFFFFFFFF & scratchAddress);
-    cmd.setScratchSpaceBuffer(lowAddress);
-    cmd.setMaximumNumberOfThreads(maxFrontEndThreads);
-    appendProgramVFEState(rootDeviceEnvironment, streamProperties, &cmd);
+        uint32_t lowAddress = uint32_t(0xFFFFFFFF & scratchAddress);
+        cmd.setScratchSpaceBuffer(lowAddress);
+        cmd.setMaximumNumberOfThreads(maxFrontEndThreads);
 
-    if (DebugManager.flags.CFEMaximumNumberOfThreads.get() != -1) {
-        cmd.setMaximumNumberOfThreads(DebugManager.flags.CFEMaximumNumberOfThreads.get());
+        cmd.setComputeOverdispatchDisable(streamProperties.frontEndState.disableOverdispatch.value == 1);
+
+        const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+        auto singleSliceDispatchCcsMode = streamProperties.frontEndState.singleSliceDispatchCcsMode.value == 1 || (rootDeviceEnvironment.getNumberOfCcs() > 1 && hwInfo.caps.singleDispatchRequiredForMultiCCS);
+
+        PreambleHelper<GfxFamily>::setSingleSliceDispatchMode(&cmd, singleSliceDispatchCcsMode);
+
+        appendProgramVFEState(rootDeviceEnvironment, streamProperties, &cmd);
+
+        if (debugManager.flags.ComputeOverdispatchDisable.get() != -1) {
+            cmd.setComputeOverdispatchDisable(debugManager.flags.ComputeOverdispatchDisable.get());
+        }
+
+        if (debugManager.flags.MaximumNumberOfThreads.get() != -1) {
+            cmd.setMaximumNumberOfThreads(debugManager.flags.MaximumNumberOfThreads.get());
+        }
+        if (debugManager.flags.OverDispatchControl.get() != -1) {
+            cmd.setOverDispatchControl(static_cast<typename CFE_STATE::OVER_DISPATCH_CONTROL>(debugManager.flags.OverDispatchControl.get()));
+        }
+
+        *cfeState = cmd;
     }
-    if (DebugManager.flags.CFEOverDispatchControl.get() != -1) {
-        cmd.setOverDispatchControl(static_cast<typename CFE_STATE::OVER_DISPATCH_CONTROL>(DebugManager.flags.CFEOverDispatchControl.get()));
-    }
-    if (DebugManager.flags.CFELargeGRFThreadAdjustDisable.get() != -1) {
-        cmd.setLargeGRFThreadAdjustDisable(DebugManager.flags.CFELargeGRFThreadAdjustDisable.get());
-    }
-
-    *cfeState = cmd;
 }
 
-template <>
-uint64_t PreambleHelper<Family>::getScratchSpaceAddressOffsetForVfeState(LinearStream *pCommandStream, void *pVfeState) {
+template <typename GfxFamily>
+uint64_t PreambleHelper<GfxFamily>::getScratchSpaceAddressOffsetForVfeState(LinearStream *pCommandStream, void *pVfeState) {
     return 0;
 }
 
 template <typename GfxFamily>
 size_t PreambleHelper<GfxFamily>::getVFECommandsSize() {
-    using CFE_STATE = typename Family::CFE_STATE;
-    return sizeof(CFE_STATE);
+    if constexpr (GfxFamily::isHeaplessRequired() == false) {
+        using CFE_STATE = typename GfxFamily::CFE_STATE;
+        return sizeof(CFE_STATE);
+    } else {
+        return 0;
+    }
 }
 
-template <>
-uint32_t PreambleHelper<Family>::getL3Config(const HardwareInfo &hwInfo, bool useSLM) {
+template <typename GfxFamily>
+uint32_t PreambleHelper<GfxFamily>::getL3Config(const HardwareInfo &hwInfo, bool useSLM) {
     return 0u;
+}
+
+template <typename GfxFamily>
+void PreambleHelper<GfxFamily>::setSingleSliceDispatchMode(void *cmd, bool enable) {
+    if constexpr (GfxFamily::isHeaplessRequired() == false) {
+        auto cfeState = reinterpret_cast<typename GfxFamily::CFE_STATE *>(cmd);
+
+        cfeState->setSingleSliceDispatchCcsMode(enable);
+
+        if (debugManager.flags.CFESingleSliceDispatchCCSMode.get() != -1) {
+            cfeState->setSingleSliceDispatchCcsMode(debugManager.flags.CFESingleSliceDispatchCCSMode.get());
+        }
+    }
 }
 
 template <>

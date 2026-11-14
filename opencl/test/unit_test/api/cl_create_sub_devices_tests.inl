@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,11 @@
 
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_io_functions.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/api/api.h"
+#include "opencl/source/cl_device/cl_device_get_cap.inl"
 
 #include <memory>
 
@@ -26,7 +28,7 @@ struct ClCreateSubDevicesTests : ::testing::Test {
     cl_device_id outDevices[4];
 
     void setup(int numberOfDevices) {
-        DebugManager.flags.CreateMultipleSubDevices.set(numberOfDevices);
+        debugManager.flags.CreateMultipleSubDevices.set(numberOfDevices);
         mockDeviceCreateSingleDeviceBackup = (numberOfDevices == 1);
         device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
         outDevicesCount = numberOfDevices;
@@ -114,6 +116,7 @@ TEST_F(ClCreateSubDevicesTests, GivenValidInputWhenCreatingSubDevicesThenSubDevi
 }
 
 TEST_F(ClCreateSubDevicesTests, GivenValidInputWhenCreatingSubDevicesThenDeviceApiReferenceCountIsIncreasedEveryTime) {
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("COMPOSITE");
     setup(2);
 
     EXPECT_EQ(0, device->getSubDevice(0)->getRefApiCount());
@@ -130,8 +133,94 @@ TEST_F(ClCreateSubDevicesTests, GivenValidInputWhenCreatingSubDevicesThenDeviceA
     EXPECT_EQ(2, device->getSubDevice(1)->getRefApiCount());
 }
 
+TEST_F(ClCreateSubDevicesTests, GivenValidInputAndFlatHierarchyWhenCreatingSubDevicesThenDeviceApiReferenceCountIsNotIncreased) {
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("FLAT");
+    setup(2);
+
+    EXPECT_EQ(0, device->getSubDevice(0)->getRefApiCount());
+    EXPECT_EQ(0, device->getSubDevice(1)->getRefApiCount());
+
+    auto retVal = clCreateSubDevices(device.get(), properties, outDevicesCount, outDevices, nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(0, device->getSubDevice(0)->getRefApiCount());
+    EXPECT_EQ(0, device->getSubDevice(1)->getRefApiCount());
+
+    retVal = clCreateSubDevices(device.get(), properties, outDevicesCount, outDevices, nullptr);
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(0, device->getSubDevice(0)->getRefApiCount());
+    EXPECT_EQ(0, device->getSubDevice(1)->getRefApiCount());
+}
+
+TEST_F(ClCreateSubDevicesTests, GivenExposeSingleDeviceModeWhenCreatingSubDevicesThenErrorIsReturned) {
+    debugManager.flags.CreateMultipleSubDevices.set(2);
+    mockDeviceCreateSingleDeviceBackup = false;
+
+    auto executionEnvironment = MockDevice::prepareExecutionEnvironment(defaultHwInfo.get(), 0);
+    for (auto rootDeviceIndex = 0u; rootDeviceIndex < executionEnvironment->rootDeviceEnvironments.size(); rootDeviceIndex++) {
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setExposeSingleDeviceMode(true);
+    }
+
+    device = std::make_unique<MockClDevice>(NEO::MockDevice::createWithExecutionEnvironment<NEO::MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+    outDevicesCount = 2;
+
+    EXPECT_EQ(0, device->getSubDevice(0)->getRefApiCount());
+    EXPECT_EQ(0, device->getSubDevice(1)->getRefApiCount());
+
+    auto retVal = clCreateSubDevices(device.get(), properties, outDevicesCount, outDevices, nullptr);
+    EXPECT_EQ(CL_DEVICE_PARTITION_FAILED, retVal);
+
+    cl_uint numDevices = 0;
+    retVal = clCreateSubDevices(device.get(), properties, 0, nullptr, &numDevices);
+    EXPECT_EQ(CL_DEVICE_PARTITION_FAILED, retVal);
+}
+
+TEST_F(ClCreateSubDevicesTests, GivenExposeSingleDeviceModeWhenQueryingDeviceCapsThenPartitionMaxSubdevicesReturnsZero) {
+    debugManager.flags.CreateMultipleSubDevices.set(2);
+    mockDeviceCreateSingleDeviceBackup = false;
+
+    auto executionEnvironment = MockDevice::prepareExecutionEnvironment(defaultHwInfo.get(), 0);
+    for (auto rootDeviceIndex = 0u; rootDeviceIndex < executionEnvironment->rootDeviceEnvironments.size(); rootDeviceIndex++) {
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setExposeSingleDeviceMode(true);
+    }
+
+    device = std::make_unique<MockClDevice>(NEO::MockDevice::createWithExecutionEnvironment<NEO::MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+    size_t size = sizeof(uint32_t);
+    const void *cap = nullptr;
+    device->getCap<CL_DEVICE_PARTITION_MAX_SUB_DEVICES>(cap, size, size);
+
+    auto *partitionMaxSubDevices = reinterpret_cast<const uint32_t *>(cap);
+
+    EXPECT_EQ(0u, *partitionMaxSubDevices);
+    EXPECT_EQ(0u, device->getDeviceInfo().partitionMaxSubDevices);
+}
+
+TEST_F(ClCreateSubDevicesTests, GivenExposeSingleDeviceModeAndFlatHierarchyWhenCreatingSubDevicesThenErrorIsReturned) {
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("FLAT");
+    debugManager.flags.CreateMultipleSubDevices.set(2);
+    mockDeviceCreateSingleDeviceBackup = false;
+
+    auto executionEnvironment = MockDevice::prepareExecutionEnvironment(defaultHwInfo.get(), 0);
+    for (auto rootDeviceIndex = 0u; rootDeviceIndex < executionEnvironment->rootDeviceEnvironments.size(); rootDeviceIndex++) {
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->setExposeSingleDeviceMode(true);
+    }
+
+    device = std::make_unique<MockClDevice>(NEO::MockDevice::createWithExecutionEnvironment<NEO::MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
+    outDevicesCount = 2;
+
+    EXPECT_EQ(0, device->getSubDevice(0)->getRefApiCount());
+    EXPECT_EQ(0, device->getSubDevice(1)->getRefApiCount());
+
+    auto retVal = clCreateSubDevices(device.get(), properties, outDevicesCount, outDevices, nullptr);
+    EXPECT_EQ(CL_DEVICE_PARTITION_FAILED, retVal);
+
+    cl_uint numDevices = 0;
+    retVal = clCreateSubDevices(device.get(), properties, 0, nullptr, &numDevices);
+    EXPECT_EQ(CL_DEVICE_PARTITION_FAILED, retVal);
+}
+
 struct ClCreateSubDevicesDeviceInfoTests : ClCreateSubDevicesTests {
     void setup(int numberOfDevices) {
+        debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("COMPOSITE");
         ClCreateSubDevicesTests::setup(numberOfDevices);
         expectedSubDeviceParentDevice = device.get();
         expectedRootDevicePartitionMaxSubDevices = numberOfDevices;
@@ -348,7 +437,6 @@ TEST_F(ClCreateSubDevicesDeviceInfoTests, WhenGettingSubDeviceRelatedDeviceInfoV
 }
 
 TEST_F(ClCreateSubDevicesDeviceInfoTests, GivenRootDeviceWithoutSubDevicesWhenGettingSubDeviceRelatedDeviceInfoViaApiThenCorrectValuesAreSet) {
-    DebugManager.flags.EngineInstancedSubDevices.set(false);
     setup(1);
 
     clGetDeviceInfo(device.get(), CL_DEVICE_PARENT_DEVICE,

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,18 +13,19 @@
 #include "gtest/gtest.h"
 
 DrmQueryMock::DrmQueryMock(RootDeviceEnvironment &rootDeviceEnvironment) : DrmMock(rootDeviceEnvironment) {
-    context.hwInfo = rootDeviceEnvironment.getHardwareInfo();
+    context.hwInfo = rootDeviceEnvironment.getMutableHardwareInfo();
     callBaseIsVmBindAvailable = true;
 
     this->ioctlHelper = std::make_unique<IoctlHelperPrelim20>(*this);
 
+    memoryInfoQueried = false;
     EXPECT_TRUE(queryMemoryInfo());
     EXPECT_EQ(2u + getBaseIoctlCalls(), ioctlCallsCount);
     ioctlCallsCount = 0;
 }
 
 int DrmQueryMock::handleRemainingRequests(DrmIoctl request, void *arg) {
-    if (request == DrmIoctl::Query && arg) {
+    if (request == DrmIoctl::query && arg) {
         if (i915QuerySuccessCount == 0) {
             return EINVAL;
         }
@@ -43,7 +44,7 @@ int DrmQueryMock::handleRemainingRequests(DrmIoctl request, void *arg) {
         }
 
         return 0;
-    } else if (request == DrmIoctl::GemContextSetparam && receivedContextParamRequest.param == I915_CONTEXT_PARAM_ENGINES) {
+    } else if (request == DrmIoctl::gemContextSetparam && receivedContextParamRequest.param == I915_CONTEXT_PARAM_ENGINES) {
         EXPECT_LE(receivedContextParamRequest.size, sizeof(receivedContextParamEngines));
         memcpy(&receivedContextParamEngines, reinterpret_cast<const void *>(receivedContextParamRequest.value), receivedContextParamRequest.size);
         auto srcBalancer = reinterpret_cast<const I915::i915_context_engines_load_balance *>(receivedContextParamEngines.extensions);

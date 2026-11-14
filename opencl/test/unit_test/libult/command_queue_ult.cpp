@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,10 +10,6 @@
 #include "opencl/source/command_queue/command_queue.h"
 
 namespace NEO {
-
-bool CommandQueue::isAssignEngineRoundRobinEnabled() {
-    return false;
-}
 
 bool CommandQueue::isTimestampWaitEnabled() {
     return ultHwConfig.useWaitForTimestamps;

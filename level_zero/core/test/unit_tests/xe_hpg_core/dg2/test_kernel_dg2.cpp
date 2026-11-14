@@ -1,17 +1,28 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/cmd_parse/gen_cmd_parse.h"
-#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/source/device/device.h"
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/ptr_math.h"
+#include "shared/source/utilities/stackvec.h"
 #include "shared/test/common/mocks/mock_l0_debugger.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/context/context.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
-#include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_module.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace L0 {
 namespace ult {
@@ -34,7 +45,7 @@ HWTEST2_F(KernelTestDG2, givenKernelImpWhenSetBufferSurfaceStateCalledThenProgra
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     ASSERT_EQ(ZE_RESULT_SUCCESS, res);
@@ -48,21 +59,14 @@ HWTEST2_F(KernelTestDG2, givenKernelImpWhenSetBufferSurfaceStateCalledThenProgra
     auto argInfo = kernelImp->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>();
     auto surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
     auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
-    EXPECT_EQ(RENDER_SURFACE_STATE::L1_CACHE_POLICY_WB, surfaceStateAddress->getL1CachePolicyL1CacheControl());
-
-    const_cast<NEO::DeviceInfo &>(device->getDeviceInfo()).debuggerActive = true;
-    kernelImp->setBufferSurfaceState(argIndex, devicePtr, gpuAlloc);
-    surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
-    surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
-    EXPECT_EQ(RENDER_SURFACE_STATE::L1_CACHE_POLICY_WBP, surfaceStateAddress->getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(RENDER_SURFACE_STATE::L1_CACHE_CONTROL_WB, surfaceStateAddress->getL1CacheControlCachePolicy());
 
     auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
-    const_cast<NEO::DeviceInfo &>(device->getDeviceInfo()).debuggerActive = false;
     kernelImp->setBufferSurfaceState(argIndex, devicePtr, gpuAlloc);
     surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
     surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
-    EXPECT_EQ(RENDER_SURFACE_STATE::L1_CACHE_POLICY_WBP, surfaceStateAddress->getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(RENDER_SURFACE_STATE::L1_CACHE_CONTROL_WBP, surfaceStateAddress->getL1CacheControlCachePolicy());
 
     Kernel::fromHandle(kernelHandle)->destroy();
 

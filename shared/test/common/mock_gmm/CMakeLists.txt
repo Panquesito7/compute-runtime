@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2021 Intel Corporation
+# Copyright (C) 2020-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -19,7 +19,7 @@ target_include_directories(${target_name} PRIVATE
                            ${NEO__GMM_INCLUDE_DIR}
 )
 
+add_subdirectories()
+
 create_project_source_tree(${target_name})
 set_target_properties(${target_name} PROPERTIES FOLDER "test mocks")
-target_compile_definitions(${target_name} PUBLIC)
-

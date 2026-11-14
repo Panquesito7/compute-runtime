@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,27 +11,28 @@
 #include "shared/source/helpers/heap_assigner.h"
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/product_helper.h"
 #include "shared/source/utilities/cpu_info.h"
 #include "shared/source/utilities/heap_allocator.h"
 
 namespace NEO {
 
-const std::array<HeapIndex, 4> GfxPartition::heap32Names{{HeapIndex::HEAP_INTERNAL_DEVICE_MEMORY,
-                                                          HeapIndex::HEAP_INTERNAL,
-                                                          HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY,
-                                                          HeapIndex::HEAP_EXTERNAL}};
+const std::array<HeapIndex, 4> GfxPartition::heap32Names{{HeapIndex::heapInternalDeviceMemory,
+                                                          HeapIndex::heapInternal,
+                                                          HeapIndex::heapExternalDeviceMemory,
+                                                          HeapIndex::heapExternal}};
 
-const std::array<HeapIndex, 8> GfxPartition::heapNonSvmNames{{HeapIndex::HEAP_INTERNAL_DEVICE_MEMORY,
-                                                              HeapIndex::HEAP_INTERNAL,
-                                                              HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY,
-                                                              HeapIndex::HEAP_EXTERNAL,
-                                                              HeapIndex::HEAP_STANDARD,
-                                                              HeapIndex::HEAP_STANDARD64KB,
-                                                              HeapIndex::HEAP_STANDARD2MB,
-                                                              HeapIndex::HEAP_EXTENDED}};
+const std::array<HeapIndex, 8> GfxPartition::heapNonSvmNames{{HeapIndex::heapInternalDeviceMemory,
+                                                              HeapIndex::heapInternal,
+                                                              HeapIndex::heapExternalDeviceMemory,
+                                                              HeapIndex::heapExternal,
+                                                              HeapIndex::heapStandard,
+                                                              HeapIndex::heapStandard64KB,
+                                                              HeapIndex::heapStandard2MB,
+                                                              HeapIndex::heapExtended}};
 
-static void reserveLow48BitRangeWithRetry(OSMemory *osMemory, OSMemory::ReservedCpuAddressRange &reservedCpuAddressRange) {
-    uint64_t reservationSize = 256 * MemoryConstants::gigaByte;
+static void reserveLow48BitRangeWithRetry(OSMemory *osMemory, OSMemory::ReservedCpuAddressRange &reservedCpuAddressRange, size_t numRootDevices) {
+    uint64_t reservationSize = numRootDevices * MemoryConstants::teraByte;
     constexpr uint64_t minimalReservationSize = 32 * MemoryConstants::gigaByte;
 
     while (reservationSize >= minimalReservationSize) {
@@ -81,10 +82,10 @@ static void reserveRangeWithMemoryMapsParse(OSMemory *osMemory, OSMemory::Reserv
     }
 }
 
-static void reserveHigh48BitRangeWithMemoryMapsParse(OSMemory *osMemory, OSMemory::ReservedCpuAddressRange &reservedCpuAddressRange) {
+static void reserveHigh48BitRangeWithMemoryMapsParse(OSMemory *osMemory, OSMemory::ReservedCpuAddressRange &reservedCpuAddressRange, size_t numRootDevices) {
     constexpr uint64_t high48BitAreaBase = maxNBitValue(47) + 1; // 0x800000000000
     constexpr uint64_t high48BitAreaTop = maxNBitValue(48);      // 0xFFFFFFFFFFFF
-    uint64_t reservationSize = MemoryConstants::teraByte;
+    uint64_t reservationSize = numRootDevices * MemoryConstants::teraByte;
     reserveRangeWithMemoryMapsParse(osMemory, reservedCpuAddressRange, high48BitAreaBase, high48BitAreaTop, reservationSize);
 }
 
@@ -94,38 +95,48 @@ static void reserve57BitRangeWithMemoryMapsParse(OSMemory *osMemory, OSMemory::R
     reserveRangeWithMemoryMapsParse(osMemory, reservedCpuAddressRange, areaBase, areaTop, reservationSize);
 }
 
-GfxPartition::GfxPartition(OSMemory::ReservedCpuAddressRange &reservedCpuAddressRangeForHeapSvm) : reservedCpuAddressRangeForHeapSvm(reservedCpuAddressRangeForHeapSvm), osMemory(OSMemory::create()) {}
+GfxPartition::GfxPartition(OSMemory::ReservedCpuAddressRange &reservedCpuAddressRangeForNonSvmHeaps) : reservedCpuAddressRangeForNonSvmHeaps(reservedCpuAddressRangeForNonSvmHeaps), osMemory(OSMemory::create()) {}
 
 GfxPartition::~GfxPartition() {
-    osMemory->releaseCpuAddressRange(reservedCpuAddressRangeForHeapSvm);
-    reservedCpuAddressRangeForHeapSvm = {};
+    osMemory->releaseCpuAddressRange(reservedCpuAddressRangeForNonSvmHeaps);
+    reservedCpuAddressRangeForNonSvmHeaps = {};
     osMemory->releaseCpuAddressRange(reservedCpuAddressRangeForHeapExtended);
+}
+
+void GfxPartition::setFrontWindowPoolSizes(const ProductHelper *productHelper) {
+    const bool alignTo2MB = productHelper != nullptr && productHelper->is2MBLocalMemAlignmentEnabled();
+
+    externalFrontWindowPoolSize = alignTo2MB ? alignUp(defaultExternalFrontWindowPoolSize, MemoryConstants::pageSize2M)
+                                             : defaultExternalFrontWindowPoolSize;
+    internalFrontWindowPoolSize = alignTo2MB ? alignUp(defaultInternalFrontWindowPoolSize, MemoryConstants::pageSize2M)
+                                             : defaultInternalFrontWindowPoolSize;
 }
 
 void GfxPartition::Heap::init(uint64_t base, uint64_t size, size_t allocationAlignment) {
     this->base = base;
     this->size = size;
 
-    auto heapGranularity = GfxPartition::heapGranularity;
-    if (allocationAlignment > heapGranularity) {
-        heapGranularity = GfxPartition::heapGranularity2MB;
+    this->granularity = (allocationAlignment > GfxPartition::heapGranularity) ? GfxPartition::heapGranularity2MB
+                                                                              : GfxPartition::heapGranularity;
+
+    // Exclude very first and very last page from GPU address range allocation
+    if (size > 2 * this->granularity) {
+        size -= 2 * this->granularity;
     }
 
-    // Exclude very first and very last 64K from GPU address range allocation
-    if (size > 2 * heapGranularity) {
-        size -= 2 * heapGranularity;
-    }
-
-    alloc = std::make_unique<HeapAllocator>(base + heapGranularity, size, allocationAlignment);
+    alloc = std::make_unique<HeapAllocator>(base + this->granularity, size, allocationAlignment);
+    initialized = true;
 }
 
 void GfxPartition::Heap::initExternalWithFrontWindow(uint64_t base, uint64_t size) {
     this->base = base;
     this->size = size;
 
+    // Exclude very last 64K from GPU address range allocation (main heap with front window)
     size -= GfxPartition::heapGranularity;
 
     alloc = std::make_unique<HeapAllocator>(base, size, MemoryConstants::pageSize, 0u);
+    initialized = true;
 }
 
 void GfxPartition::Heap::initWithFrontWindow(uint64_t base, uint64_t size, uint64_t frontWindowSize) {
@@ -137,6 +148,7 @@ void GfxPartition::Heap::initWithFrontWindow(uint64_t base, uint64_t size, uint6
     size -= frontWindowSize;
 
     alloc = std::make_unique<HeapAllocator>(base + frontWindowSize, size, MemoryConstants::pageSize);
+    initialized = true;
 }
 
 void GfxPartition::Heap::initFrontWindow(uint64_t base, uint64_t size) {
@@ -144,14 +156,27 @@ void GfxPartition::Heap::initFrontWindow(uint64_t base, uint64_t size) {
     this->size = size;
 
     alloc = std::make_unique<HeapAllocator>(base, size, MemoryConstants::pageSize, 0u);
+    initialized = true;
+}
+
+size_t GfxPartition::Heap::getAllocAlignment() const {
+    return alloc->getAllocationAlignment();
 }
 
 uint64_t GfxPartition::Heap::allocate(size_t &size) {
     return alloc->allocate(size);
 }
 
+uint64_t GfxPartition::Heap::allocateWithStartAddressHint(const uint64_t requiredStartAddress, size_t &size) {
+    return alloc->allocateWithStartAddressHint(requiredStartAddress, size);
+}
+
 uint64_t GfxPartition::Heap::allocateWithCustomAlignment(size_t &sizeToAllocate, size_t alignment) {
     return alloc->allocateWithCustomAlignment(sizeToAllocate, alignment);
+}
+
+uint64_t GfxPartition::Heap::allocateWithCustomAlignmentWithStartAddressHint(const uint64_t requiredStartAddress, size_t &sizeToAllocate, size_t alignment) {
+    return alloc->allocateWithCustomAlignmentWithStartAddressHint(requiredStartAddress, sizeToAllocate, alignment);
 }
 
 void GfxPartition::Heap::free(uint64_t ptr, size_t size) {
@@ -169,28 +194,28 @@ void GfxPartition::freeGpuAddressRange(uint64_t ptr, size_t size) {
 }
 
 uint64_t GfxPartition::getHeapMinimalAddress(HeapIndex heapIndex) {
-    if (heapIndex == HeapIndex::HEAP_SVM ||
-        heapIndex == HeapIndex::HEAP_EXTERNAL_DEVICE_FRONT_WINDOW ||
-        heapIndex == HeapIndex::HEAP_EXTERNAL_FRONT_WINDOW ||
-        heapIndex == HeapIndex::HEAP_INTERNAL_DEVICE_FRONT_WINDOW ||
-        heapIndex == HeapIndex::HEAP_INTERNAL_FRONT_WINDOW) {
+    if (heapIndex == HeapIndex::heapSvm ||
+        heapIndex == HeapIndex::heapStandard64KB ||
+        heapIndex == HeapIndex::heapExternalDeviceFrontWindow ||
+        heapIndex == HeapIndex::heapExternalFrontWindow ||
+        heapIndex == HeapIndex::heapInternalDeviceFrontWindow ||
+        heapIndex == HeapIndex::heapInternalFrontWindow) {
         return getHeapBase(heapIndex);
     } else {
-        if ((heapIndex == HeapIndex::HEAP_EXTERNAL ||
-             heapIndex == HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY) &&
+        if ((heapIndex == HeapIndex::heapExternal ||
+             heapIndex == HeapIndex::heapExternalDeviceMemory) &&
             (getHeapLimit(HeapAssigner::mapExternalWindowIndex(heapIndex)) != 0)) {
-            return getHeapBase(heapIndex) + GfxPartition::externalFrontWindowPoolSize;
-        } else if (heapIndex == HeapIndex::HEAP_INTERNAL ||
-                   heapIndex == HeapIndex::HEAP_INTERNAL_DEVICE_MEMORY) {
-            return getHeapBase(heapIndex) + GfxPartition::internalFrontWindowPoolSize;
-        } else if (heapIndex == HeapIndex::HEAP_STANDARD2MB) {
-            return getHeapBase(heapIndex) + GfxPartition::heapGranularity2MB;
+            return getHeapBase(heapIndex) + externalFrontWindowPoolSize;
+        } else if (heapIndex == HeapIndex::heapInternal ||
+                   heapIndex == HeapIndex::heapInternalDeviceMemory) {
+            return getHeapBase(heapIndex) + internalFrontWindowPoolSize;
         }
-        return getHeapBase(heapIndex) + GfxPartition::heapGranularity;
+        return getHeapBase(heapIndex) + getHeap(heapIndex).getGranularity();
     }
 }
 
-bool GfxPartition::init(uint64_t gpuAddressSpace, size_t cpuAddressRangeSizeToReserve, uint32_t rootDeviceIndex, size_t numRootDevices, bool useExternalFrontWindowPool, uint64_t systemMemorySize) {
+bool GfxPartition::init(uint64_t gpuAddressSpace, size_t cpuAddressRangeSizeToReserve, uint32_t rootDeviceIndex, size_t numRootDevices, bool useExternalFrontWindowPool, uint64_t systemMemorySize, uint64_t gfxTop, const ProductHelper *productHelper) {
+    setFrontWindowPoolSizes(productHelper);
 
     /*
      * I. 64-bit builds:
@@ -238,87 +263,100 @@ bool GfxPartition::init(uint64_t gpuAddressSpace, size_t cpuAddressRangeSizeToRe
      *  0x0  0x100000000                                       gpuAddressSpace
      */
 
-    uint64_t gfxTop = gpuAddressSpace + 1;
     uint64_t gfxBase = 0x0ull;
     const uint64_t gfxHeap32Size = 4 * MemoryConstants::gigaByte;
 
     if (is32bit) {
         gfxBase = maxNBitValue(32) + 1;
-        heapInit(HeapIndex::HEAP_SVM, 0ull, gfxBase);
+        heapInit(HeapIndex::heapSvm, 0ull, gfxBase);
     } else {
         auto cpuVirtualAddressSize = CpuInfo::getInstance().getVirtualAddressSize();
         if (cpuVirtualAddressSize == 48 && gpuAddressSpace == maxNBitValue(48)) {
             gfxBase = maxNBitValue(48 - 1) + 1;
-            heapInit(HeapIndex::HEAP_SVM, 0ull, gfxBase);
+            heapInit(HeapIndex::heapSvm, 0ull, gfxBase);
         } else if (gpuAddressSpace == maxNBitValue(47)) {
-            if (reservedCpuAddressRangeForHeapSvm.alignedPtr == nullptr) {
+            if (reservedCpuAddressRangeForNonSvmHeaps.alignedPtr == nullptr) {
                 if (cpuAddressRangeSizeToReserve == 0) {
                     return false;
                 }
-                reservedCpuAddressRangeForHeapSvm = osMemory->reserveCpuAddressRange(cpuAddressRangeSizeToReserve, GfxPartition::heapGranularity);
-                if (reservedCpuAddressRangeForHeapSvm.originalPtr == nullptr) {
+                reservedCpuAddressRangeForNonSvmHeaps = osMemory->reserveCpuAddressRange(cpuAddressRangeSizeToReserve, GfxPartition::heapGranularity);
+                if (reservedCpuAddressRangeForNonSvmHeaps.originalPtr == nullptr) {
                     return false;
                 }
-                if (!isAligned<GfxPartition::heapGranularity>(reservedCpuAddressRangeForHeapSvm.alignedPtr)) {
+                if (!isAligned<GfxPartition::heapGranularity>(reservedCpuAddressRangeForNonSvmHeaps.alignedPtr)) {
                     return false;
                 }
             }
-            gfxBase = reinterpret_cast<uint64_t>(reservedCpuAddressRangeForHeapSvm.alignedPtr);
+            gfxBase = reinterpret_cast<uint64_t>(reservedCpuAddressRangeForNonSvmHeaps.alignedPtr);
             gfxTop = gfxBase + cpuAddressRangeSizeToReserve;
-            heapInit(HeapIndex::HEAP_SVM, 0ull, gpuAddressSpace + 1);
+            heapInit(HeapIndex::heapSvm, 0ull, gpuAddressSpace + 1);
         } else if (gpuAddressSpace < maxNBitValue(47)) {
             gfxBase = 0ull;
-            heapInit(HeapIndex::HEAP_SVM, 0ull, 0ull);
+            heapInit(HeapIndex::heapSvm, 0ull, 0ull);
         } else {
-            if (!initAdditionalRange(cpuVirtualAddressSize, gpuAddressSpace, gfxBase, gfxTop, rootDeviceIndex, numRootDevices, systemMemorySize)) {
+            if (!initAdditionalRange(cpuVirtualAddressSize, gpuAddressSpace, gfxBase, gfxTop, rootDeviceIndex, systemMemorySize, numRootDevices, productHelper)) {
                 return false;
             }
         }
     }
 
+    if (productHelper && productHelper->is2MBLocalMemAlignmentEnabled()) {
+        gfxBase = alignUp(gfxBase, GfxPartition::heapGranularity2MB);
+    }
+
     for (auto heap : GfxPartition::heap32Names) {
         if (useExternalFrontWindowPool && HeapAssigner::heapTypeExternalWithFrontWindowPool(heap)) {
             heapInitExternalWithFrontWindow(heap, gfxBase, gfxHeap32Size);
-            size_t externalFrontWindowSize = GfxPartition::externalFrontWindowPoolSize;
-            heapInitExternalWithFrontWindow(HeapAssigner::mapExternalWindowIndex(heap), heapAllocate(heap, externalFrontWindowSize),
-                                            externalFrontWindowSize);
+            size_t externalFrontWindowSize = this->externalFrontWindowPoolSize;
+            auto allocation = heapAllocate(heap, externalFrontWindowSize);
+            heapInitExternalFrontWindow(HeapAssigner::mapExternalWindowIndex(heap), allocation,
+                                        externalFrontWindowSize);
         } else if (HeapAssigner::isInternalHeap(heap)) {
-            heapInitWithFrontWindow(heap, gfxBase, gfxHeap32Size, GfxPartition::internalFrontWindowPoolSize);
-            heapInitFrontWindow(HeapAssigner::mapInternalWindowIndex(heap), gfxBase, GfxPartition::internalFrontWindowPoolSize);
+            heapInitWithFrontWindow(heap, gfxBase, gfxHeap32Size, internalFrontWindowPoolSize);
+            heapInitFrontWindow(HeapAssigner::mapInternalWindowIndex(heap), gfxBase, internalFrontWindowPoolSize);
         } else {
             heapInit(heap, gfxBase, gfxHeap32Size);
         }
         gfxBase += gfxHeap32Size;
     }
 
-    constexpr uint32_t numStandardHeaps = static_cast<uint32_t>(HeapIndex::HEAP_STANDARD2MB) - static_cast<uint32_t>(HeapIndex::HEAP_STANDARD) + 1;
+    constexpr uint32_t numStandardHeaps = static_cast<uint32_t>(HeapIndex::heapStandard2MB) - static_cast<uint32_t>(HeapIndex::heapStandard) + 1;
     constexpr uint64_t maxStandardHeapGranularity = std::max(GfxPartition::heapGranularity, GfxPartition::heapGranularity2MB);
 
     gfxBase = alignUp(gfxBase, maxStandardHeapGranularity);
     uint64_t maxStandardHeapSize = alignDown((gfxTop - gfxBase) / numStandardHeaps, maxStandardHeapGranularity);
+    uint64_t maxStandard64HeapSize = maxStandardHeapSize;
+    uint64_t maxStandard2MBHeapSize = maxStandardHeapSize;
+
+    if (gpuAddressSpace == maxNBitValue(57)) {
+        maxStandardHeapSize *= 2;
+        maxStandard64HeapSize /= 2;
+        maxStandard2MBHeapSize /= 2;
+    }
 
     auto gfxStandardSize = maxStandardHeapSize;
-    heapInit(HeapIndex::HEAP_STANDARD, gfxBase, gfxStandardSize);
-    DEBUG_BREAK_IF(!isAligned<GfxPartition::heapGranularity>(getHeapBase(HeapIndex::HEAP_STANDARD)));
+    heapInit(HeapIndex::heapStandard, gfxBase, gfxStandardSize);
+    DEBUG_BREAK_IF(!isAligned<GfxPartition::heapGranularity>(getHeapBase(HeapIndex::heapStandard)));
 
     gfxBase += maxStandardHeapSize;
 
     // Split HEAP_STANDARD64K among root devices
-    auto gfxStandard64KBSize = alignDown(maxStandardHeapSize / numRootDevices, GfxPartition::heapGranularity);
-    heapInitWithAllocationAlignment(HeapIndex::HEAP_STANDARD64KB, gfxBase + rootDeviceIndex * gfxStandard64KBSize, gfxStandard64KBSize, MemoryConstants::pageSize64k);
-    DEBUG_BREAK_IF(!isAligned<GfxPartition::heapGranularity>(getHeapBase(HeapIndex::HEAP_STANDARD64KB)));
+    auto gfxStandard64KBSize = alignDown(maxStandard64HeapSize / numRootDevices, GfxPartition::heapGranularity);
+    heapInitWithAllocationAlignment(HeapIndex::heapStandard64KB, gfxBase + rootDeviceIndex * gfxStandard64KBSize, gfxStandard64KBSize, MemoryConstants::pageSize64k);
+    DEBUG_BREAK_IF(!isAligned<GfxPartition::heapGranularity64k>(getHeapBase(HeapIndex::heapStandard64KB)));
 
-    gfxBase += maxStandardHeapSize;
+    gfxBase += gfxStandard64KBSize * numRootDevices;
+    gfxBase = alignUp(gfxBase, GfxPartition::heapGranularity2MB);
 
     // Split HEAP_STANDARD2MB among root devices
-    auto gfxStandard2MBSize = alignDown(maxStandardHeapSize / numRootDevices, GfxPartition::heapGranularity2MB);
-    heapInitWithAllocationAlignment(HeapIndex::HEAP_STANDARD2MB, gfxBase + rootDeviceIndex * gfxStandard2MBSize, gfxStandard2MBSize, 2 * MemoryConstants::megaByte);
-    DEBUG_BREAK_IF(!isAligned<GfxPartition::heapGranularity2MB>(getHeapBase(HeapIndex::HEAP_STANDARD2MB)));
+    auto gfxStandard2MBSize = alignDown(maxStandard2MBHeapSize / numRootDevices, GfxPartition::heapGranularity2MB);
+    heapInitWithAllocationAlignment(HeapIndex::heapStandard2MB, gfxBase + rootDeviceIndex * gfxStandard2MBSize, gfxStandard2MBSize, 2 * MemoryConstants::megaByte);
+    DEBUG_BREAK_IF(!isAligned<GfxPartition::heapGranularity2MB>(getHeapBase(HeapIndex::heapStandard2MB)));
 
     return true;
 }
 
-bool GfxPartition::initAdditionalRange(uint32_t cpuVirtualAddressSize, uint64_t gpuAddressSpace, uint64_t &gfxBase, uint64_t &gfxTop, uint32_t rootDeviceIndex, size_t numRootDevices, uint64_t systemMemorySize) {
+bool GfxPartition::initAdditionalRange(uint32_t cpuVirtualAddressSize, uint64_t gpuAddressSpace, uint64_t &gfxBase, uint64_t &gfxTop, uint32_t rootDeviceIndex, uint64_t systemMemorySize, size_t numRootDevices, const ProductHelper *productHelper) {
     /*
      * 57-bit Full Range SVM gfx layout:
      *
@@ -343,47 +381,50 @@ bool GfxPartition::initAdditionalRange(uint32_t cpuVirtualAddressSize, uint64_t 
         return false;
     }
 
+    const size_t extendedHeapAllocationAlignment = (productHelper != nullptr && productHelper->is2MBLocalMemAlignmentEnabled())
+                                                       ? MemoryConstants::pageSize2M
+                                                       : MemoryConstants::pageSize;
+
     if (cpuVirtualAddressSize == 57 && CpuInfo::getInstance().isCpuFlagPresent("la57")) {
         // Always reserve 48 bit window on 57 bit CPU
-        if (reservedCpuAddressRangeForHeapSvm.alignedPtr == nullptr) {
-            reserveHigh48BitRangeWithMemoryMapsParse(osMemory.get(), reservedCpuAddressRangeForHeapSvm);
+        if (reservedCpuAddressRangeForNonSvmHeaps.alignedPtr == nullptr) {
+            reserveHigh48BitRangeWithMemoryMapsParse(osMemory.get(), reservedCpuAddressRangeForNonSvmHeaps, numRootDevices);
 
-            if (reservedCpuAddressRangeForHeapSvm.alignedPtr == nullptr) {
-                reserveLow48BitRangeWithRetry(osMemory.get(), reservedCpuAddressRangeForHeapSvm);
+            if (reservedCpuAddressRangeForNonSvmHeaps.alignedPtr == nullptr) {
+                reserveLow48BitRangeWithRetry(osMemory.get(), reservedCpuAddressRangeForNonSvmHeaps, numRootDevices);
             }
 
-            if (reservedCpuAddressRangeForHeapSvm.alignedPtr == nullptr) {
+            if (reservedCpuAddressRangeForNonSvmHeaps.alignedPtr == nullptr) {
                 return false;
             }
         }
 
-        gfxBase = castToUint64(reservedCpuAddressRangeForHeapSvm.alignedPtr);
-        gfxTop = gfxBase + reservedCpuAddressRangeForHeapSvm.sizeToReserve;
+        gfxBase = castToUint64(reservedCpuAddressRangeForNonSvmHeaps.alignedPtr);
+        gfxTop = gfxBase + reservedCpuAddressRangeForNonSvmHeaps.sizeToReserve;
         if (gpuAddressSpace == maxNBitValue(57)) {
-            heapInit(HeapIndex::HEAP_SVM, 0ull, maxNBitValue(57 - 1) + 1);
+            heapInit(HeapIndex::heapSvm, 0ull, maxNBitValue(57 - 1) + 1);
         } else {
-            heapInit(HeapIndex::HEAP_SVM, 0ull, maxNBitValue(48) + 1);
+            heapInit(HeapIndex::heapSvm, 0ull, maxNBitValue(48) + 1);
         }
 
         if (gpuAddressSpace == maxNBitValue(57)) {
             uint64_t heapExtendedSize = 4 * systemMemorySize;
             reserve57BitRangeWithMemoryMapsParse(osMemory.get(), reservedCpuAddressRangeForHeapExtended, heapExtendedSize);
             if (reservedCpuAddressRangeForHeapExtended.alignedPtr) {
-                heapInit(HeapIndex::HEAP_EXTENDED_HOST, castToUint64(reservedCpuAddressRangeForHeapExtended.alignedPtr), heapExtendedSize);
+                heapInitWithAllocationAlignment(HeapIndex::heapExtendedHost, castToUint64(reservedCpuAddressRangeForHeapExtended.alignedPtr), heapExtendedSize, extendedHeapAllocationAlignment);
             }
         }
     } else {
         // On 48 bit CPU this range is reserved for OS usage, do not reserve
         gfxBase = maxNBitValue(48 - 1) + 1; // 0x800000000000
         gfxTop = maxNBitValue(48) + 1;      // 0x1000000000000
-        heapInit(HeapIndex::HEAP_SVM, 0ull, gfxBase);
+        heapInit(HeapIndex::heapSvm, 0ull, gfxBase);
     }
 
     // Init HEAP_EXTENDED only for 57 bit GPU
     if (gpuAddressSpace == maxNBitValue(57)) {
-        // Split HEAP_EXTENDED among root devices (like HEAP_STANDARD64K)
-        auto heapExtendedSize = alignDown((maxNBitValue(48) + 1) / numRootDevices, GfxPartition::heapGranularity);
-        heapInit(HeapIndex::HEAP_EXTENDED, maxNBitValue(57 - 1) + 1 + rootDeviceIndex * heapExtendedSize, heapExtendedSize);
+        auto heapExtendedSize = alignDown((maxNBitValue(48) + 1), GfxPartition::heapGranularity);
+        heapInitWithAllocationAlignment(HeapIndex::heapExtended, maxNBitValue(57 - 1) + 1 + rootDeviceIndex * heapExtendedSize, heapExtendedSize, extendedHeapAllocationAlignment);
     }
 
     return true;

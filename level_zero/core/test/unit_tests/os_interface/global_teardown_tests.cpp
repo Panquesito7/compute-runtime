@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,37 +7,203 @@
 
 #include "level_zero/core/test/unit_tests/os_interface/global_teardown_tests.h"
 
+#include "shared/source/helpers/string.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_library.h"
+#include "shared/source/page_fault_manager/cpu_page_fault_manager.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_os_library.h"
 #include "shared/test/common/test_macros/test.h"
 
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/api/opencl/source/platform/leo_platform.h"
+#include "level_zero/api/opencl/source/sharings/leo_sharing_factory.h"
+#include "level_zero/core/source/driver/driver.h"
+#include "level_zero/core/source/driver/driver_handle.h"
 #include "level_zero/core/source/global_teardown.h"
-#include "level_zero/sysman/source/sysman_driver_handle_imp.h"
+#include "level_zero/ddi/ze_ddi_tables.h"
+#include "level_zero/sysman/source/driver/sysman_driver_handle_imp.h"
 
 namespace L0 {
 namespace ult {
 
-TEST(GlobalTearDownCallbackTests, givenL0LoaderThenGlobalTeardownCallbackIsCalled) {
-    std::unique_ptr<NEO::OsLibrary> loaderLibrary = std::unique_ptr<NEO::OsLibrary>{NEO::OsLibrary::load(L0::ult::testLoaderDllName)};
-    EXPECT_EQ(ZE_RESULT_SUCCESS, setDriverTeardownHandleInLoader(L0::ult::testLoaderDllName));
-}
-TEST(GlobalTearDownCallbackTests, givenL0LoaderIsMissingThenGlobalTeardownCallbackIsNotCalled) {
-    EXPECT_EQ(ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE, setDriverTeardownHandleInLoader("invalid.so"));
-}
-TEST(GlobalTearDownCallbackTests, givenL0LoaderWithoutGlobalTeardownCallbackThenGlobalTeardownCallbackIsNotCalled) {
-    EXPECT_EQ(ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE, setDriverTeardownHandleInLoader(L0::ult::testDllName));
-}
-TEST(GlobalTearDownTests, givenCallToGlobalTearDownFunctionThenGlobalDriversAreNull) {
+namespace {
+uint32_t leoSharingBuilderDestructorCount = 0u;
+
+struct MockLeoSharingBuilderFactory : public NEO::LEO::SharingBuilderFactory {
+    ~MockLeoSharingBuilderFactory() override { leoSharingBuilderDestructorCount++; }
+    std::unique_ptr<NEO::LEO::SharingContextBuilder> createContextBuilder() override { return nullptr; }
+    std::string getExtensions(NEO::LEO::DriverInfo *) override { return {}; }
+    void *getExtensionFunctionAddress(const std::string &) override { return nullptr; }
+};
+
+class LeoSharingFactoryStateRestore : public NEO::LEO::SharingFactory {
+  public:
+    using NEO::LEO::SharingFactory::sharingContextBuilder;
+
+    LeoSharingFactoryStateRestore() {
+        memcpy_s(savedState, sizeof(savedState), sharingContextBuilder, sizeof(sharingContextBuilder));
+        for (auto &builder : sharingContextBuilder) {
+            builder = nullptr;
+        }
+    }
+    ~LeoSharingFactoryStateRestore() {
+        memcpy_s(sharingContextBuilder, sizeof(sharingContextBuilder), savedState, sizeof(savedState));
+    }
+
+  protected:
+    decltype(NEO::LEO::SharingFactory::sharingContextBuilder) savedState;
+};
+} // namespace
+
+struct GlobalTearDownTests : public ::testing::Test {
+    VariableBackup<decltype(globalDriverHandles)> globalDriverHandlesBackup{&globalDriverHandles, nullptr};
+    VariableBackup<decltype(NEO::LEO::platformsImpl)> platformsImplBackup{&NEO::LEO::platformsImpl, nullptr};
+    LeoSharingFactoryStateRestore leoSharingStateRestore;
+};
+
+uint32_t loaderTearDownCalled = 0;
+
+ze_result_t loaderTearDown() {
+    loaderTearDownCalled++;
+    return ZE_RESULT_ERROR_UNKNOWN;
+};
+
+TEST_F(GlobalTearDownTests, givenInitializedDriverWhenCallingGlobalDriverTeardownThenLoaderFunctionForTeardownIsLoadedAndCalledIfAvailable) {
+
+    VariableBackup<decltype(loaderTearDownCalled)> loaderTeardownCalledBackup{&loaderTearDownCalled, 0};
+    VariableBackup<decltype(levelZeroDriverInitialized)> driverInitializeBackup{&levelZeroDriverInitialized, true};
+    VariableBackup<decltype(setDriverTeardownFunc)> teardownFuncBackup{&setDriverTeardownFunc, nullptr};
+    VariableBackup<decltype(NEO::OsLibrary::loadFunc)> loadFuncBackup{&NEO::OsLibrary::loadFunc, MockOsLibraryCustom::load};
+    VariableBackup<decltype(MockOsLibrary::loadLibraryNewObject)> mockLibraryBackup{&MockOsLibrary::loadLibraryNewObject, nullptr};
+
+    MockOsLibrary::loadLibraryNewObject = nullptr;
     globalDriverTeardown();
-    EXPECT_EQ(GlobalDriver, nullptr);
-    EXPECT_EQ(Sysman::GlobalSysmanDriver, nullptr);
-}
-TEST(GlobalTearDownTests, givenCallToGlobalTearDownFunctionWithNullSysManDriverThenGlobalDriverIsNull) {
-    delete Sysman::GlobalSysmanDriver;
-    Sysman::GlobalSysmanDriver = nullptr;
+
+    EXPECT_EQ(nullptr, setDriverTeardownFunc);
+    EXPECT_EQ(0u, loaderTearDownCalled);
+
+    MockOsLibrary::loadLibraryNewObject = new MockOsLibraryCustom(nullptr, true);
     globalDriverTeardown();
-    EXPECT_EQ(GlobalDriver, nullptr);
-    EXPECT_EQ(Sysman::GlobalSysmanDriver, nullptr);
+
+    EXPECT_EQ(nullptr, setDriverTeardownFunc);
+    EXPECT_EQ(0u, loaderTearDownCalled);
+
+    MockOsLibrary::loadLibraryNewObject = new MockOsLibraryCustom(nullptr, true);
+    auto osLibrary = static_cast<MockOsLibraryCustom *>(MockOsLibrary::loadLibraryNewObject);
+    osLibrary->procMap["zelSetDriverTeardown"] = reinterpret_cast<void *>(&loaderTearDown);
+    globalDriverTeardown();
+
+    EXPECT_EQ(&loaderTearDown, reinterpret_cast<void *>(setDriverTeardownFunc));
+    EXPECT_EQ(1u, loaderTearDownCalled);
+
+    MockOsLibrary::loadLibraryNewObject = new MockOsLibraryCustom(nullptr, true);
+    globalDriverTeardown();
+
+    EXPECT_EQ(nullptr, setDriverTeardownFunc);
+    EXPECT_EQ(1u, loaderTearDownCalled);
+}
+
+TEST_F(GlobalTearDownTests, givenInitializedDriverAndNoTeardownFunctionIsAvailableWhenCallGlobalTeardownThenDontCrash) {
+    VariableBackup<bool> initializedBackup{&levelZeroDriverInitialized};
+    VariableBackup<decltype(setDriverTeardownFunc)> teardownFuncBackup{&setDriverTeardownFunc};
+
+    levelZeroDriverInitialized = true;
+    setDriverTeardownFunc = nullptr;
+    EXPECT_NO_THROW(globalDriverTeardown());
+}
+
+TEST_F(GlobalTearDownTests, givenNotInitializedDriverAndTeardownFunctionIsAvailableWhenCallGlobalTeardownThenDontCallTeardownFunc) {
+    VariableBackup<bool> initializedBackup{&levelZeroDriverInitialized};
+    VariableBackup<decltype(setDriverTeardownFunc)> teardownFuncBackup{&setDriverTeardownFunc};
+
+    levelZeroDriverInitialized = false;
+    setDriverTeardownFunc = []() -> ze_result_t {
+        EXPECT_TRUE(false);
+        return ZE_RESULT_SUCCESS;
+    };
+    EXPECT_NO_THROW(globalDriverTeardown());
+}
+
+TEST_F(GlobalTearDownTests, givenCallToGlobalTearDownFunctionThenGlobalDriversAreNull) {
+    globalDriverTeardown();
+    EXPECT_EQ(globalDriverHandles, nullptr);
+    EXPECT_EQ(Sysman::globalSysmanDriver, nullptr);
+}
+TEST_F(GlobalTearDownTests, givenCallToGlobalTearDownFunctionWithNullSysManDriverThenGlobalDriverIsNull) {
+    delete Sysman::globalSysmanDriver;
+    Sysman::globalSysmanDriver = nullptr;
+    globalDriverTeardown();
+    EXPECT_EQ(globalDriverHandles, nullptr);
+    EXPECT_EQ(Sysman::globalSysmanDriver, nullptr);
+}
+
+TEST_F(GlobalTearDownTests, givenForkedProcessWhenGlobalTearDownFunctionCalledThenGlobalDriverIsNotDeleted) {
+    VariableBackup<decltype(globalDriverHandles)> globalDriverHandlesBackup{&globalDriverHandles, nullptr};
+
+    globalDriverHandles = new std::vector<_ze_driver_handle_t *>;
+
+    ze_result_t result = ZE_RESULT_ERROR_UNINITIALIZED;
+    Driver driver;
+    driver.initialize(&result);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, globalDriverHandles->size());
+
+    auto tempDriver = static_cast<L0::DriverHandle *>(DriverHandle::fromHandle((*globalDriverHandles)[0]));
+    EXPECT_NE(tempDriver, nullptr);
+
+    // change pid in driver
+    tempDriver->pid = tempDriver->pid + 5;
+
+    globalDriverTeardown();
+    EXPECT_EQ(globalDriverHandles, nullptr);
+    EXPECT_EQ(Sysman::globalSysmanDriver, nullptr);
+
+    delete tempDriver;
+}
+
+TEST_F(GlobalTearDownTests, givenGlobalDriverDispatchWhenGlobalSetupAndTeardownAreCalledThenPerApiValidFlagsAreChanged) {
+    VariableBackup<DriverDispatch> globalDispatchBackup{&globalDriverDispatch};
+
+    globalDriverSetup();
+
+    EXPECT_TRUE(globalDriverDispatch.core.isValidFlag);
+    EXPECT_TRUE(globalDriverDispatch.tools.isValidFlag);
+    EXPECT_TRUE(globalDriverDispatch.sysman.isValidFlag);
+    EXPECT_TRUE(globalDriverDispatch.runtime.isValidFlag);
+
+    globalDriverTeardown();
+    EXPECT_FALSE(globalDriverDispatch.core.isValidFlag);
+    EXPECT_FALSE(globalDriverDispatch.tools.isValidFlag);
+    EXPECT_FALSE(globalDriverDispatch.sysman.isValidFlag);
+    EXPECT_FALSE(globalDriverDispatch.runtime.isValidFlag);
+}
+
+TEST_F(GlobalTearDownTests, givenLeoSharingBuildersRegisteredWhenGlobalDriverTeardownCalledThenAllBuildersAreCleared) {
+    leoSharingBuilderDestructorCount = 0u;
+    leoSharingStateRestore.sharingContextBuilder[NEO::LEO::SharingType::CLGL_SHARING] = new MockLeoSharingBuilderFactory();
+    leoSharingStateRestore.sharingContextBuilder[NEO::LEO::SharingType::UNIFIED_SHARING] = new MockLeoSharingBuilderFactory();
+
+    globalDriverTeardown();
+
+    EXPECT_EQ(2u, leoSharingBuilderDestructorCount);
+    EXPECT_EQ(nullptr, leoSharingStateRestore.sharingContextBuilder[NEO::LEO::SharingType::CLGL_SHARING]);
+    EXPECT_EQ(nullptr, leoSharingStateRestore.sharingContextBuilder[NEO::LEO::SharingType::UNIFIED_SHARING]);
+}
+
+TEST_F(GlobalTearDownTests, givenGlobalDriverDispatchWhenTerminationThenPageFaultHandlerIsRemoved) {
+    VariableBackup<decltype(globalDriverHandles)> globalDriverHandlesBackup{&globalDriverHandles, nullptr};
+
+    globalDriverHandles = new std::vector<_ze_driver_handle_t *>;
+
+    ze_result_t result = ZE_RESULT_ERROR_UNINITIALIZED;
+    Driver driver;
+    driver.initialize(&result);
+    auto tempDriver = static_cast<L0::DriverHandle *>(DriverHandle::fromHandle((*globalDriverHandles)[0]));
+    tempDriver->getMemoryManager()->initPageFaultManager();
+    EXPECT_NE(tempDriver->getMemoryManager()->getPageFaultManager(), nullptr);
+    removePageFaultManagerAtTermination();
+    EXPECT_EQ(tempDriver->getMemoryManager()->getPageFaultManager(), nullptr);
+    globalDriverTeardown();
 }
 } // namespace ult
 } // namespace L0

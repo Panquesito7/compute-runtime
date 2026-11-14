@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2023 Intel Corporation
+# Copyright (C) 2023-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -8,23 +8,13 @@ target_sources(${L0_STATIC_LIB_NAME}
                PRIVATE
                ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
                ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR_SUFFIX}device_imp_helper.cpp
+               ${CMAKE_CURRENT_SOURCE_DIR}/bcs_split_params.h
                ${CMAKE_CURRENT_SOURCE_DIR}/bcs_split.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/bcs_split.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/bcs_split.inl
+               ${CMAKE_CURRENT_SOURCE_DIR}/bcs_split_params.h
                ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
                ${CMAKE_CURRENT_SOURCE_DIR}/device.h
-               ${CMAKE_CURRENT_SOURCE_DIR}/device_imp_${DRIVER_MODEL}/device_imp.cpp
-               ${CMAKE_CURRENT_SOURCE_DIR}/device_imp.cpp
-               ${CMAKE_CURRENT_SOURCE_DIR}/device_imp.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/device_handle.h
+               ${CMAKE_CURRENT_SOURCE_DIR}/device_imp_${DRIVER_MODEL}/device_imp_${DRIVER_MODEL}.cpp
 )
-
-if(UNIX AND NEO_ENABLE_i915_PRELIM_DETECTION)
-  target_sources(${L0_STATIC_LIB_NAME}
-                 PRIVATE
-                 ${CMAKE_CURRENT_SOURCE_DIR}/device_imp_drm/device_imp_peer.cpp
-  )
-else()
-  target_sources(${L0_STATIC_LIB_NAME}
-                 PRIVATE
-                 ${CMAKE_CURRENT_SOURCE_DIR}/device_imp_peer_stub.cpp
-  )
-endif()

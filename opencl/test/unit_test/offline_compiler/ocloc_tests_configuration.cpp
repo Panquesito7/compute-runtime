@@ -1,11 +1,16 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 namespace NEO {
-unsigned int ultIterationMaxTime = 45;
-const char *executionName = "OCLOC";
+#if defined(_WIN32)
+unsigned int ultIterationMaxTimeInS = 90;
+#else
+unsigned int ultIterationMaxTimeInS = 45;
+#endif
+const char *executionName = "ULT";
+const char *apiName = "OCLOC";
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,17 +7,19 @@
 
 #pragma once
 
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "level_zero/ze_api.h"
 #include "level_zero/zet_api.h"
 
 #include <fcntl.h>
-#include <fstream>
-#include <iostream>
-#include <list>
-#include <sstream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -26,10 +28,32 @@
 
 namespace L0 {
 
+class FdCache : public NEO::NonCopyableAndNonMovableClass {
+  public:
+    FdCache() = default;
+    ~FdCache();
+
+    static const int maxSize = 10;
+    int getFd(std::string file);
+
+  protected:
+    // Map of File name to pair of file descriptor and reference count to file.
+    std::map<std::string, std::pair<int, uint32_t>> fdMap = {};
+
+  private:
+    void eraseLeastUsedEntryFromCache();
+};
+
 class FsAccess {
   public:
+    static constexpr size_t readBufSize = 4096;
+
     static FsAccess *create();
+    FsAccess(const FsAccess &fsAccess);
     virtual ~FsAccess() = default;
+    FsAccess(FsAccess &&other) noexcept = delete;
+    FsAccess &operator=(FsAccess &&other) noexcept = delete;
+    FsAccess &operator=(const FsAccess &other) = delete;
 
     virtual ze_result_t canRead(const std::string file);
     virtual ze_result_t canWrite(const std::string file);
@@ -42,7 +66,7 @@ class FsAccess {
     virtual ze_result_t read(const std::string file, uint32_t &val);
     virtual ze_result_t read(const std::string file, int32_t &val);
 
-    virtual ze_result_t write(const std::string file, const std::string val);
+    virtual ze_result_t write(const std::string file, std::string_view val);
 
     virtual ze_result_t readSymLink(const std::string path, std::string &buf);
     virtual ze_result_t getRealPath(const std::string path, std::string &buf);
@@ -57,10 +81,13 @@ class FsAccess {
     FsAccess();
     decltype(&NEO::SysCalls::access) accessSyscall = NEO::SysCalls::access;
     decltype(&stat) statSyscall = stat;
+    MOCKABLE_VIRTUAL std::unique_lock<std::mutex> obtainMutex();
 
   private:
     template <typename T>
     ze_result_t readValue(const std::string file, T &val);
+    std::unique_ptr<FdCache> pFdCache = nullptr;
+    std::mutex fsMutex{};
 };
 
 class ProcfsAccess : private FsAccess {
@@ -103,7 +130,7 @@ class SysfsAccess : protected FsAccess {
     ze_result_t read(const std::string file, double &val) override;
     ze_result_t read(const std::string file, std::vector<std::string> &val) override;
 
-    ze_result_t write(const std::string file, const std::string val) override;
+    ze_result_t write(const std::string file, std::string_view val) override;
     MOCKABLE_VIRTUAL ze_result_t write(const std::string file, const int val);
     MOCKABLE_VIRTUAL ze_result_t write(const std::string file, const uint64_t val);
     MOCKABLE_VIRTUAL ze_result_t write(const std::string file, const double val);
@@ -125,7 +152,7 @@ class SysfsAccess : protected FsAccess {
   private:
     SysfsAccess(const std::string file);
 
-    std::string fullPath(const std::string file);
+    std::string fullPath(const std::string &file);
     std::string dirname;
     static const std::string drmPath;
     static const std::string devicesPath;
@@ -134,5 +161,7 @@ class SysfsAccess : protected FsAccess {
     static const std::string intelGpuBindEntry;
     static const std::string intelGpuUnbindEntry;
 };
+
+static_assert(NEO::NonMovable<FsAccess>);
 
 } // namespace L0

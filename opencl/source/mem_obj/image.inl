@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,9 +10,13 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/image_helper.h"
 #include "shared/source/helpers/populate_factory.h"
 #include "shared/source/image/image_surface_state.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 
 #include "opencl/source/helpers/cl_validators.h"
 #include "opencl/source/helpers/surface_formats.h"
@@ -23,53 +27,55 @@
 
 namespace NEO {
 
-union SURFACE_STATE_BUFFER_LENGTH {
-    uint32_t length;
-    struct SurfaceState {
-        uint32_t width : BITFIELD_RANGE(0, 6);
-        uint32_t height : BITFIELD_RANGE(7, 20);
-        uint32_t depth : BITFIELD_RANGE(21, 31);
-    } surfaceState;
-};
-
 template <typename GfxFamily>
-void ImageHw<GfxFamily>::setImageArg(void *memory, bool setAsMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex, bool useGlobalAtomics) {
-    using SURFACE_FORMAT = typename RENDER_SURFACE_STATE::SURFACE_FORMAT;
-    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(memory);
+void ImageHw<GfxFamily>::setImageArg(void *memory, bool setAsMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex) {
+    auto &rootDeviceEnvironment = *executionEnvironment->rootDeviceEnvironments[rootDeviceIndex];
+    auto &gfxCoreHelper = rootDeviceEnvironment.getHelper<GfxCoreHelper>();
+
+    const bool usesReducedSurfaceState = gfxCoreHelper.isReducedSurfaceStateInUse(rootDeviceEnvironment);
+    RENDER_SURFACE_STATE localSurfaceState = GfxFamily::cmdInitRenderSurfaceState;
+    auto surfaceState = usesReducedSurfaceState ? &localSurfaceState : reinterpret_cast<RENDER_SURFACE_STATE *>(memory);
 
     auto graphicsAllocation = multiGraphicsAllocation.getGraphicsAllocation(rootDeviceIndex);
     auto gmm = graphicsAllocation->getDefaultGmm();
-    auto gmmHelper = executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->getGmmHelper();
+    auto gmmHelper = rootDeviceEnvironment.getGmmHelper();
 
     auto imageDescriptor = Image::convertDescriptor(getImageDesc());
-    ImageInfo imgInfo;
+    ImageInfo imgInfo{};
     imgInfo.imgDesc = imageDescriptor;
     imgInfo.qPitch = qPitch;
     imgInfo.surfaceFormat = &getSurfaceFormatInfo().surfaceFormat;
 
-    setImageSurfaceState<GfxFamily>(surfaceState, imgInfo, graphicsAllocation->getDefaultGmm(), *gmmHelper, cubeFaceIndex, graphicsAllocation->getGpuAddress(), surfaceOffsets, isNV12Image(&this->getImageFormat()));
+    uint32_t renderTargetViewExtent = 0;
+    uint32_t minArrayElement = 0;
+
+    ImageSurfaceStateHelper<GfxFamily>::setImageSurfaceState(surfaceState, imgInfo, graphicsAllocation->getDefaultGmm(), *gmmHelper, cubeFaceIndex, graphicsAllocation->getGpuAddress(), surfaceOffsets, isNV12Image(&this->getImageFormat()), minArrayElement, renderTargetViewExtent);
+
+    uint32_t depth = 0;
 
     if (getImageDesc().image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER) {
         // image1d_buffer is image1d created from buffer. The length of buffer could be larger
         // than the maximal image width. Mock image1d_buffer with SURFACE_TYPE_SURFTYPE_BUFFER.
-        SURFACE_STATE_BUFFER_LENGTH length = {0};
+        SurfaceStateBufferLength length = {0};
         length.length = static_cast<uint32_t>(getImageDesc().image_width - 1);
 
+        depth = static_cast<uint32_t>(length.surfaceState.depth + 1);
         surfaceState->setWidth(static_cast<uint32_t>(length.surfaceState.width + 1));
         surfaceState->setHeight(static_cast<uint32_t>(length.surfaceState.height + 1));
-        surfaceState->setDepth(static_cast<uint32_t>(length.surfaceState.depth + 1));
+        surfaceState->setDepth(depth);
         surfaceState->setSurfacePitch(static_cast<uint32_t>(getSurfaceFormatInfo().surfaceFormat.imageElementSizeInBytes));
         surfaceState->setSurfaceType(RENDER_SURFACE_STATE::SURFACE_TYPE_SURFTYPE_BUFFER);
     } else {
-        setImageSurfaceStateDimensions<GfxFamily>(surfaceState, imgInfo, cubeFaceIndex, surfaceType);
+        ImageSurfaceStateHelper<GfxFamily>::setImageSurfaceStateDimensions(surfaceState, imgInfo, cubeFaceIndex, surfaceType, depth);
         if (setAsMediaBlockImage) {
-            setWidthForMediaBlockSurfaceState<GfxFamily>(surfaceState, imgInfo);
+            ImageSurfaceStateHelper<GfxFamily>::setWidthForMediaBlockSurfaceState(surfaceState, imgInfo);
         }
     }
 
-    surfaceState->setSurfaceMinLod(this->baseMipLevel + mipLevel);
-    surfaceState->setMipCountLod((this->mipCount > 0) ? (this->mipCount - 1) : 0);
-    setMipTailStartLod<GfxFamily>(surfaceState, gmm);
+    uint32_t mipCount = this->mipCount > 0 ? this->mipCount - 1 : 0;
+    surfaceState->setSurfaceMinLOD(this->baseMipLevel + mipLevel);
+    surfaceState->setMIPCountLOD(mipCount);
+    ImageSurfaceStateHelper<GfxFamily>::setMipTailStartLOD(surfaceState, gmm);
 
     cl_channel_order imgChannelOrder = getSurfaceFormatInfo().oclImageFormat.image_channel_order;
     int shaderChannelValue = ImageHw<GfxFamily>::getShaderChannelValue(RENDER_SURFACE_STATE::SHADER_CHANNEL_SELECT_RED, imgChannelOrder);
@@ -89,10 +95,10 @@ void ImageHw<GfxFamily>::setImageArg(void *memory, bool setAsMediaBlockImage, ui
         surfaceState->setShaderChannelSelectAlpha(RENDER_SURFACE_STATE::SHADER_CHANNEL_SELECT_ONE);
     }
 
-    surfaceState->setNumberOfMultisamples((typename RENDER_SURFACE_STATE::NUMBER_OF_MULTISAMPLES)mcsSurfaceInfo.multisampleCount);
+    surfaceState->setNumberOfMultisamples(static_cast<typename RENDER_SURFACE_STATE::NUMBER_OF_MULTISAMPLES>(mcsSurfaceInfo.multisampleCount));
 
     if (imageDesc.num_samples > 1) {
-        setAuxParamsForMultisamples(surfaceState);
+        setAuxParamsForMultisamples(surfaceState, rootDeviceIndex);
     } else if (graphicsAllocation->isCompressionEnabled()) {
         EncodeSurfaceState<GfxFamily>::setImageAuxParamsForCCS(surfaceState, gmm);
     } else {
@@ -101,29 +107,76 @@ void ImageHw<GfxFamily>::setImageArg(void *memory, bool setAsMediaBlockImage, ui
     appendSurfaceStateDepthParams(surfaceState, gmm);
     EncodeSurfaceState<GfxFamily>::appendImageCompressionParams(surfaceState, graphicsAllocation, gmmHelper, isImageFromBuffer(),
                                                                 this->plane);
-    appendSurfaceStateParams(surfaceState, rootDeviceIndex, useGlobalAtomics);
+
+    adjustDepthLimitations(surfaceState, minArrayElement, renderTargetViewExtent, depth, mipCount, is3DUAVOrRTV);
+    appendSurfaceStateParams(surfaceState, rootDeviceIndex);
     appendSurfaceStateExt(surfaceState);
+
+    if (isPackedFormat) {
+        NEO::EncodeSurfaceState<GfxFamily>::convertSurfaceStateToPacked(surfaceState, imgInfo);
+    }
+
+    if (usesReducedSurfaceState) {
+        ImageSurfaceStateInputs inputs{};
+        inputs.imageInfo = &imgInfo;
+        inputs.gmm = gmm;
+        inputs.gmmHelper = gmmHelper;
+        inputs.surfaceOffsets = &surfaceOffsets;
+        inputs.gpuAddress = graphicsAllocation->getGpuAddress();
+        inputs.cubeFaceIndex = cubeFaceIndex;
+        inputs.useChannelSelects = true;
+        inputs.shaderChannelSelectRed = static_cast<uint32_t>(surfaceState->getShaderChannelSelectRed());
+        inputs.shaderChannelSelectGreen = static_cast<uint32_t>(surfaceState->getShaderChannelSelectGreen());
+        inputs.shaderChannelSelectBlue = static_cast<uint32_t>(surfaceState->getShaderChannelSelectBlue());
+        inputs.shaderChannelSelectAlpha = static_cast<uint32_t>(surfaceState->getShaderChannelSelectAlpha());
+        inputs.numberOfMultisamples = static_cast<uint32_t>(surfaceState->getNumberOfMultisamples());
+        inputs.compressionFormat = NEO::getSurfaceStateCompressionFormatIfSupported(*surfaceState);
+        inputs.isNV12Format = isNV12Image(&this->getImageFormat());
+        inputs.isDepthStencilResource = surfaceState->getDepthStencilResource();
+        inputs.multisampleControlSurfacePresent =
+            (inputs.numberOfMultisamples > 0u) && (surfaceState->getAuxiliarySurfaceBaseAddress() != 0u);
+        inputs.surfaceMinLOD = this->baseMipLevel + mipLevel;
+        inputs.mipCountLOD = mipCount;
+
+        if (isPackedFormat &&
+            static_cast<uint32_t>(surfaceState->getSurfaceFormat()) !=
+                static_cast<uint32_t>(imgInfo.surfaceFormat->genxSurfaceFormat)) {
+            inputs.packedFormatOverride = true;
+            inputs.packedSurfaceFormat = static_cast<uint32_t>(surfaceState->getSurfaceFormat());
+            inputs.packedWidth = surfaceState->getWidth();
+            inputs.packedTileBpp = NEO::getSurfaceStateOverrideTileBppIfSupported(*surfaceState);
+        }
+
+        // Protected-content images carry a decryption bit (LSB) in the caller-built state MOCS, set by
+        // the per-family surface-state extension. The reduced surface state encoder reconstructs MOCS from the
+        // resource and cannot re-derive that bit, so forward it explicitly.
+        inputs.encryptedData = (surfaceState->getMemoryObjectControlState() & 0x1u) != 0u;
+
+        gfxCoreHelper.encodeImageSurfaceState(memory, inputs);
+        gfxCoreHelper.applyImageSurfaceStateMipAndMediaBlock(memory, imgInfo, gmm, this->baseMipLevel + mipLevel, setAsMediaBlockImage, rootDeviceEnvironment);
+    }
 }
 
 template <typename GfxFamily>
-void ImageHw<GfxFamily>::setAuxParamsForMultisamples(RENDER_SURFACE_STATE *surfaceState) {
+void ImageHw<GfxFamily>::setAuxParamsForMultisamples(RENDER_SURFACE_STATE *surfaceState, uint32_t rootDeviceIndex) {
     using SURFACE_FORMAT = typename RENDER_SURFACE_STATE::SURFACE_FORMAT;
 
     if (getMcsAllocation()) {
         auto mcsGmm = getMcsAllocation()->getDefaultGmm();
 
-        if (mcsGmm->unifiedAuxTranslationCapable() && mcsGmm->hasMultisampleControlSurface()) {
-            EncodeSurfaceState<GfxFamily>::setAuxParamsForMCSCCS(surfaceState);
+        if (EncodeSurfaceState<GfxFamily>::shouldProgramAuxForMcs(mcsGmm->unifiedAuxTranslationCapable(), mcsGmm->hasMultisampleControlSurface())) {
+            const auto &hwInfo = *executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->getHardwareInfo();
+            EncodeSurfaceState<GfxFamily>::setAuxParamsForMCSCCS(surfaceState, hwInfo);
             surfaceState->setAuxiliarySurfacePitch(mcsGmm->getUnifiedAuxPitchTiles());
-            surfaceState->setAuxiliarySurfaceQpitch(mcsGmm->getAuxQPitch());
+            surfaceState->setAuxiliarySurfaceQPitch(mcsGmm->getAuxQPitch());
             EncodeSurfaceState<GfxFamily>::setClearColorParams(surfaceState, mcsGmm);
-            setUnifiedAuxBaseAddress<GfxFamily>(surfaceState, mcsGmm);
+            ImageSurfaceStateHelper<GfxFamily>::setUnifiedAuxBaseAddress(surfaceState, mcsGmm);
         } else if (mcsGmm->unifiedAuxTranslationCapable()) {
             EncodeSurfaceState<GfxFamily>::setImageAuxParamsForCCS(surfaceState, mcsGmm);
         } else {
-            surfaceState->setAuxiliarySurfaceMode((typename RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE)1);
+            surfaceState->setAuxiliarySurfaceMode(static_cast<typename RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE>(1));
             surfaceState->setAuxiliarySurfacePitch(mcsSurfaceInfo.pitch);
-            surfaceState->setAuxiliarySurfaceQpitch(mcsSurfaceInfo.qPitch);
+            surfaceState->setAuxiliarySurfaceQPitch(mcsSurfaceInfo.qPitch);
             surfaceState->setAuxiliarySurfaceBaseAddress(mcsAllocation->getGpuAddress());
         }
     } else if (isDepthFormat(imageFormat) && surfaceState->getSurfaceFormat() != SURFACE_FORMAT::SURFACE_FORMAT_R32_FLOAT_X8X24_TYPELESS) {
@@ -132,7 +185,7 @@ void ImageHw<GfxFamily>::setAuxParamsForMultisamples(RENDER_SURFACE_STATE *surfa
 }
 
 template <typename GfxFamily>
-void ImageHw<GfxFamily>::appendSurfaceStateParams(RENDER_SURFACE_STATE *surfaceState, uint32_t rootDeviceIndex, bool useGlobalAtomics) {
+void ImageHw<GfxFamily>::appendSurfaceStateParams(RENDER_SURFACE_STATE *surfaceState, uint32_t rootDeviceIndex) {
 }
 
 template <typename GfxFamily>
@@ -140,93 +193,7 @@ inline void ImageHw<GfxFamily>::appendSurfaceStateDepthParams(RENDER_SURFACE_STA
 }
 
 template <typename GfxFamily>
-void ImageHw<GfxFamily>::setMediaImageArg(void *memory, uint32_t rootDeviceIndex) {
-    using MEDIA_SURFACE_STATE = typename GfxFamily::MEDIA_SURFACE_STATE;
-    using SURFACE_FORMAT = typename MEDIA_SURFACE_STATE::SURFACE_FORMAT;
-    SURFACE_FORMAT surfaceFormat = MEDIA_SURFACE_STATE::SURFACE_FORMAT_Y8_UNORM_VA;
-
-    auto graphicsAllocation = multiGraphicsAllocation.getGraphicsAllocation(rootDeviceIndex);
-    auto gmmHelper = executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->getGmmHelper();
-    auto surfaceState = reinterpret_cast<MEDIA_SURFACE_STATE *>(memory);
-    MEDIA_SURFACE_STATE state = GfxFamily::cmdInitMediaSurfaceState;
-
-    setMediaSurfaceRotation(reinterpret_cast<void *>(&state));
-
-    DEBUG_BREAK_IF(surfaceFormat == MEDIA_SURFACE_STATE::SURFACE_FORMAT_Y1_UNORM);
-    state.setWidth(static_cast<uint32_t>(getImageDesc().image_width));
-
-    state.setHeight(static_cast<uint32_t>(getImageDesc().image_height));
-    state.setPictureStructure(MEDIA_SURFACE_STATE::PICTURE_STRUCTURE_FRAME_PICTURE);
-
-    auto gmm = graphicsAllocation->getDefaultGmm();
-    auto tileMode = static_cast<typename MEDIA_SURFACE_STATE::TILE_MODE>(gmm->gmmResourceInfo->getTileModeSurfaceState());
-
-    state.setTileMode(tileMode);
-    state.setSurfacePitch(static_cast<uint32_t>(getImageDesc().image_row_pitch));
-
-    state.setSurfaceFormat(surfaceFormat);
-
-    state.setHalfPitchForChroma(false);
-    state.setInterleaveChroma(false);
-    state.setXOffsetForUCb(0);
-    state.setYOffsetForUCb(0);
-    state.setXOffsetForVCr(0);
-    state.setYOffsetForVCr(0);
-
-    setSurfaceMemoryObjectControlState(
-        reinterpret_cast<void *>(&state),
-        gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_IMAGE));
-
-    if (isNV12Image(&this->getImageFormat())) {
-        state.setInterleaveChroma(true);
-        state.setYOffsetForUCb(this->surfaceOffsets.yOffsetForUVplane);
-    }
-
-    state.setVerticalLineStride(0);
-    state.setVerticalLineStrideOffset(0);
-
-    state.setSurfaceBaseAddress(graphicsAllocation->getGpuAddress() + this->surfaceOffsets.offset);
-
-    *surfaceState = state;
-}
-
-template <typename GfxFamily>
-void ImageHw<GfxFamily>::transformImage2dArrayTo3d(void *memory) {
-    DEBUG_BREAK_IF(imageDesc.image_type != CL_MEM_OBJECT_IMAGE3D);
-    using SURFACE_TYPE = typename RENDER_SURFACE_STATE::SURFACE_TYPE;
-    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(memory);
-    surfaceState->setSurfaceType(SURFACE_TYPE::SURFACE_TYPE_SURFTYPE_3D);
-    surfaceState->setSurfaceArray(false);
-}
-template <typename GfxFamily>
-void ImageHw<GfxFamily>::transformImage3dTo2dArray(void *memory) {
-    DEBUG_BREAK_IF(imageDesc.image_type != CL_MEM_OBJECT_IMAGE3D);
-    using SURFACE_TYPE = typename RENDER_SURFACE_STATE::SURFACE_TYPE;
-    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(memory);
-    surfaceState->setSurfaceType(SURFACE_TYPE::SURFACE_TYPE_SURFTYPE_2D);
-    surfaceState->setSurfaceArray(true);
-}
-
-template <typename GfxFamily>
-inline void ImageHw<GfxFamily>::setMediaSurfaceRotation(void *memory) {
-    using MEDIA_SURFACE_STATE = typename GfxFamily::MEDIA_SURFACE_STATE;
-    using SURFACE_FORMAT = typename MEDIA_SURFACE_STATE::SURFACE_FORMAT;
-
-    auto surfaceState = reinterpret_cast<MEDIA_SURFACE_STATE *>(memory);
-
-    surfaceState->setRotation(MEDIA_SURFACE_STATE::ROTATION_NO_ROTATION_OR_0_DEGREE);
-    surfaceState->setXOffset(0);
-    surfaceState->setYOffset(0);
-}
-
-template <typename GfxFamily>
-inline void ImageHw<GfxFamily>::setSurfaceMemoryObjectControlState(void *memory, uint32_t value) {
-    using MEDIA_SURFACE_STATE = typename GfxFamily::MEDIA_SURFACE_STATE;
-    using SURFACE_FORMAT = typename MEDIA_SURFACE_STATE::SURFACE_FORMAT;
-
-    auto surfaceState = reinterpret_cast<MEDIA_SURFACE_STATE *>(memory);
-
-    surfaceState->setSurfaceMemoryObjectControlState(value);
+void ImageHw<GfxFamily>::adjustDepthLimitations(RENDER_SURFACE_STATE *surfaceState, uint32_t minArrayElement, uint32_t renderTargetViewExtent, uint32_t depth, uint32_t mipCount, bool is3DUavOrRtv) {
 }
 
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -49,10 +49,9 @@ GEN12LPTEST_F(Gen12lpHwCmdTest, givenStateBaseAddressWhenProgrammingMocsThenMocs
     EXPECT_EQ(expectedMocsIndex, stateBaseAddress.TheStructure.Common.BindlessSamplerStateMemoryObjectControlState_IndexToMocsTables);
 }
 
-GEN12LPTEST_F(Gen12lpHwCmdTest, givenMediaSurfaceStateWhenProgrammingMocsThenMocsIndexIsSetProperly) {
-    auto mediaSurfaceState = FamilyType::cmdInitMediaSurfaceState;
-    uint32_t mocs = 4u;
-    uint32_t expectedMocsIndex = (mocs >> 1);
-    mediaSurfaceState.setSurfaceMemoryObjectControlState(mocs);
-    EXPECT_EQ(expectedMocsIndex, mediaSurfaceState.TheStructure.Common.SurfaceMemoryObjectControlStateIndexToMocsTables);
+GEN12LPTEST_F(Gen12lpHwCmdTest, givenInterfaceDescriptorDataWhenSettingKernelStartPointerAbove4GbThenHighBitsAreKept) {
+    auto idd = FamilyType::cmdInitInterfaceDescriptorData;
+    constexpr uint64_t kernelStartPointer = 0x1'2345'6780ull;
+    idd.setKernelStartPointer(kernelStartPointer);
+    EXPECT_EQ(kernelStartPointer, idd.getKernelStartPointer());
 }

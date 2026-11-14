@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,17 +13,18 @@
 #include "level_zero/core/test/unit_tests/mocks/mock_memory_manager.h"
 #include "level_zero/tools/source/sysman/engine/engine_imp.h"
 #include "level_zero/tools/source/sysman/engine/linux/os_engine_imp.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
 #include "level_zero/tools/source/sysman/linux/pmu/pmu_imp.h"
+#include "level_zero/tools/test/unit_tests/sources/sysman/linux/pmu/mock_pmu.h"
 
 using namespace NEO;
 namespace L0 {
 namespace ult {
-constexpr int64_t mockPmuFd = 10;
 constexpr uint64_t mockTimestamp = 87654321;
 constexpr uint64_t mockActiveTime = 987654321;
 const uint32_t microSecondsToNanoSeconds = 1000u;
-constexpr uint16_t I915_INVALID_ENGINE_CLASS = UINT16_MAX;
+constexpr uint16_t invalidEngineClass = UINT16_MAX;
 const std::string deviceDir("device");
 struct MockMemoryManagerInEngineSysman : public MemoryManagerMock {
     MockMemoryManagerInEngineSysman(NEO::ExecutionEnvironment &executionEnvironment) : MemoryManagerMock(const_cast<NEO::ExecutionEnvironment &>(executionEnvironment)) {}
@@ -32,7 +33,7 @@ struct MockMemoryManagerInEngineSysman : public MemoryManagerMock {
 struct MockEngineNeoDrm : public Drm {
     using Drm::getEngineInfo;
     using Drm::setupIoctlHelper;
-    const int mockFd = 0;
+    static constexpr int mockFd = 0;
     MockEngineNeoDrm(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<HwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
 
     bool mockSysmanQueryEngineInfoReturnFalse = true;
@@ -52,21 +53,24 @@ struct MockEngineNeoDrm : public Drm {
         i915engineInfo[3].engine.engineInstance = 0;
         i915engineInfo[4].engine.engineClass = drm_i915_gem_engine_class::I915_ENGINE_CLASS_VIDEO_ENHANCE;
         i915engineInfo[4].engine.engineInstance = 0;
-        i915engineInfo[5].engine.engineClass = I915_INVALID_ENGINE_CLASS;
+        i915engineInfo[5].engine.engineClass = invalidEngineClass;
         i915engineInfo[5].engine.engineInstance = 0;
 
-        this->engineInfo.reset(new EngineInfo(this, i915engineInfo));
+        StackVec<std::vector<NEO::EngineCapabilities>, 2> engineInfosPerTile{i915engineInfo};
+
+        this->engineInfo.reset(new EngineInfo(this, engineInfosPerTile));
         return true;
     }
 };
 
-struct MockEnginePmuInterfaceImp : public PmuInterfaceImp {
-    using PmuInterfaceImp::perfEventOpen;
-    MockEnginePmuInterfaceImp(LinuxSysmanImp *pLinuxSysmanImp) : PmuInterfaceImp(pLinuxSysmanImp) {}
+struct MockEnginePmuInterfaceImp : public MockPmuInterfaceImpForSysman {
+    MockEnginePmuInterfaceImp(LinuxSysmanImp *pLinuxSysmanImp) : MockPmuInterfaceImpForSysman(pLinuxSysmanImp) {}
 
     int64_t mockPerfEventFailureReturnValue = 0;
+    int32_t mockErrorNumber = -ENOSPC;
     int64_t perfEventOpen(perf_event_attr *attr, pid_t pid, int cpu, int groupFd, uint64_t flags) override {
         if (mockPerfEventFailureReturnValue == -1) {
+            errno = mockErrorNumber;
             return mockPerfEventFailureReturnValue;
         }
 

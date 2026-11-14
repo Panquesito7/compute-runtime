@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,7 +16,7 @@
 
 using namespace NEO;
 struct MockScratchSpaceController : ScratchSpaceControllerBase {
-    using ScratchSpaceControllerBase::privateScratchAllocation;
+    using ScratchSpaceControllerBase::scratchSlot1Allocation;
     using ScratchSpaceControllerBase::ScratchSpaceControllerBase;
 };
 
@@ -24,8 +24,8 @@ using ScratchSpaceControllerTest = Test<ClDeviceFixture>;
 
 TEST_F(ScratchSpaceControllerTest, whenScratchSpaceControllerIsDestroyedThenItReleasePrivateScratchSpaceAllocation) {
     MockScratchSpaceController scratchSpaceController(pDevice->getRootDeviceIndex(), *pDevice->getExecutionEnvironment(), *pDevice->getGpgpuCommandStreamReceiver().getInternalAllocationStorage());
-    scratchSpaceController.privateScratchAllocation = pDevice->getExecutionEnvironment()->memoryManager->allocateGraphicsMemoryInPreferredPool(MockAllocationProperties{pDevice->getRootDeviceIndex(), MemoryConstants::pageSize}, nullptr);
-    EXPECT_NE(nullptr, scratchSpaceController.privateScratchAllocation);
+    scratchSpaceController.scratchSlot1Allocation = pDevice->getExecutionEnvironment()->memoryManager->allocateGraphicsMemoryInPreferredPool(MockAllocationProperties{pDevice->getRootDeviceIndex(), MemoryConstants::pageSize}, nullptr);
+    EXPECT_NE(nullptr, scratchSpaceController.scratchSlot1Allocation);
     // no memory leak is expected
 }
 
@@ -37,14 +37,14 @@ HWTEST_F(BcsTests, given3dImageWhenBlitBufferIsCalledThenBlitCmdIsFoundZtimes) {
     auto hostAllocationPtr = allocateAlignedMemory(hostAllocationSize, MemoryConstants::pageSize);
     void *hostPtr = reinterpret_cast<void *>(hostAllocationPtr.get());
 
-    std::unique_ptr<Image> image(Image3dHelper<>::create(context.get()));
-    BuiltinOpParams builtinOpParams{};
+    std::unique_ptr<Image> image(Image3dHelperUlt<>::create(context.get()));
+    BuiltIn::OpParams builtinOpParams{};
     builtinOpParams.srcPtr = hostPtr;
     builtinOpParams.dstMemObj = image.get();
     builtinOpParams.size = {1, 1, 10};
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::HostPtrToImage,
+    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::hostPtrToImage,
                                                                 csr,
                                                                 builtinOpParams);
     flushBcsTask(&csr, blitProperties, true, *pDevice);
@@ -68,14 +68,14 @@ HWTEST_F(BcsTests, givenImageToHostPtrWhenBlitBufferIsCalledThenBlitCmdIsFound) 
     auto hostAllocationPtr = allocateAlignedMemory(hostAllocationSize, MemoryConstants::pageSize);
     void *hostPtr = reinterpret_cast<void *>(hostAllocationPtr.get());
 
-    std::unique_ptr<Image> image(Image2dHelper<>::create(context.get()));
-    BuiltinOpParams builtinOpParams{};
+    std::unique_ptr<Image> image(Image2dHelperUlt<>::create(context.get()));
+    BuiltIn::OpParams builtinOpParams{};
     builtinOpParams.dstPtr = hostPtr;
     builtinOpParams.srcMemObj = image.get();
     builtinOpParams.size = {1, 1, 1};
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::ImageToHostPtr,
+    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::imageToHostPtr,
                                                                 csr,
                                                                 builtinOpParams);
     flushBcsTask(&csr, blitProperties, true, *pDevice);
@@ -97,15 +97,15 @@ HWTEST_F(BcsTests, givenHostPtrToImageWhenBlitBufferIsCalledThenBlitCmdIsCorrect
     cl_image_desc imgDesc = Image2dDefaults::imageDesc;
     imgDesc.image_width = 10;
     imgDesc.image_height = 12;
-    std::unique_ptr<Image> image(Image2dHelper<>::create(context.get(), &imgDesc));
-    BuiltinOpParams builtinOpParams{};
+    std::unique_ptr<Image> image(Image2dHelperUlt<>::create(context.get(), &imgDesc));
+    BuiltIn::OpParams builtinOpParams{};
     builtinOpParams.srcPtr = hostPtr;
     builtinOpParams.srcMemObj = nullptr;
     builtinOpParams.dstMemObj = image.get();
     builtinOpParams.size = {6, 8, 1};
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::HostPtrToImage,
+    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::hostPtrToImage,
                                                                 csr,
                                                                 builtinOpParams);
     flushBcsTask(&csr, blitProperties, true, *pDevice);
@@ -132,15 +132,15 @@ HWTEST_F(BcsTests, givenImageToHostPtrWhenBlitBufferIsCalledThenBlitCmdIsCorrect
     cl_image_desc imgDesc = Image2dDefaults::imageDesc;
     imgDesc.image_width = 10u;
     imgDesc.image_height = 12u;
-    std::unique_ptr<Image> image(Image2dHelper<>::create(context.get(), &imgDesc));
-    BuiltinOpParams builtinOpParams{};
+    std::unique_ptr<Image> image(Image2dHelperUlt<>::create(context.get(), &imgDesc));
+    BuiltIn::OpParams builtinOpParams{};
     builtinOpParams.dstPtr = hostPtr;
     builtinOpParams.srcMemObj = image.get();
     builtinOpParams.dstMemObj = nullptr;
     builtinOpParams.size = {2, 3, 1};
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::ImageToHostPtr,
+    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::imageToHostPtr,
                                                                 csr,
                                                                 builtinOpParams);
     flushBcsTask(&csr, blitProperties, true, *pDevice);
@@ -163,16 +163,16 @@ HWTEST_F(BcsTests, givenImageToImageWhenBlitBufferIsCalledThenBlitCmdIsCorrectly
     cl_image_desc imgDesc = Image2dDefaults::imageDesc;
     imgDesc.image_width = 10u;
     imgDesc.image_height = 12u;
-    std::unique_ptr<Image> srcImage(Image2dHelper<>::create(context.get(), &imgDesc));
-    std::unique_ptr<Image> dstImage(Image2dHelper<>::create(context.get(), &imgDesc));
+    std::unique_ptr<Image> srcImage(Image2dHelperUlt<>::create(context.get(), &imgDesc));
+    std::unique_ptr<Image> dstImage(Image2dHelperUlt<>::create(context.get(), &imgDesc));
 
-    BuiltinOpParams builtinOpParams{};
+    BuiltIn::OpParams builtinOpParams{};
     builtinOpParams.srcMemObj = srcImage.get();
     builtinOpParams.dstMemObj = dstImage.get();
     builtinOpParams.size = {2, 3, 1};
 
     auto &csr = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::ImageToImage,
+    auto blitProperties = ClBlitProperties::constructProperties(BlitterConstants::BlitDirection::imageToImage,
                                                                 csr,
                                                                 builtinOpParams);
     flushBcsTask(&csr, blitProperties, true, *pDevice);
@@ -196,8 +196,8 @@ HWTEST_F(BcsTests, givenBlitBufferCalledWhenClearColorAllocationIseSetThenItIsMa
     csr.storeMakeResidentAllocations = true;
     Vec3<size_t> copySize = {1, 1, 1};
 
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(&graphicsAllocation1,
-                                                                     &graphicsAllocation2, 0, 0, copySize, 0, 0, 0, 0, &clearColorAllocation);
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(&graphicsAllocation1, 0,
+                                                                     &graphicsAllocation2, 0, 0, 0, copySize, 0, 0, 0, 0, &clearColorAllocation, false);
     flushBcsTask(&csr, blitProperties, false, *pDevice);
     auto iter = csr.makeResidentAllocations.find(&clearColorAllocation);
     ASSERT_NE(iter, csr.makeResidentAllocations.end());
@@ -210,4 +210,15 @@ TEST(BcsConstantsTests, givenBlitConstantsThenTheyHaveDesiredValues) {
     EXPECT_EQ(BlitterConstants::maxBlitHeight, 0x4000u);
     EXPECT_EQ(BlitterConstants::maxBlitSetWidth, 0x1FF80u);
     EXPECT_EQ(BlitterConstants::maxBlitSetHeight, 0x1FFC0u);
+    EXPECT_EQ(BlitterConstants::maxBlitPitch, 0x3FFFFu);
+}
+
+HWTEST2_F(UltCommandStreamReceiverTest, WhenExceptionsRelatedFunctionsAreCalledThenNothingHappens, IsAtMostXe3pCore) {
+    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
+    EXPECT_FALSE(commandStreamReceiver.shouldProgramExceptions());
+    EXPECT_EQ(0u, commandStreamReceiver.getCmdSizeForExceptions());
+
+    auto initialUsed = commandStreamReceiver.getCS(0).getUsed();
+    commandStreamReceiver.programExceptions(commandStreamReceiver.getCS(0), *pDevice);
+    EXPECT_EQ(initialUsed, commandStreamReceiver.getCS(0).getUsed());
 }

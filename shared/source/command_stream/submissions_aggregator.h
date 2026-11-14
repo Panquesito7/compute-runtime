@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,7 @@
 #include "shared/source/command_container/cmdcontainer.h"
 #include "shared/source/command_stream/csr_definitions.h"
 #include "shared/source/command_stream/task_count_helper.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/pipe_control_args.h"
 #include "shared/source/utilities/idlist.h"
 
@@ -19,13 +20,21 @@ class Event;
 class FlushStampTracker;
 class GraphicsAllocation;
 
+struct PagingFenceSemaphoreInfo {
+    bool requiresBlockingResidencyHandling = true;
+    uint64_t pagingFenceValue = 0u;
+
+    bool requiresProgrammingSemaphore() {
+        return !requiresBlockingResidencyHandling && pagingFenceValue > 0u;
+    }
+};
+
 struct BatchBuffer {
     BatchBuffer(GraphicsAllocation *commandBufferAllocation,
                 size_t startOffset,
                 size_t chainedBatchBufferStartOffset,
                 uint64_t taskStartAddress,
                 GraphicsAllocation *chainedBatchBuffer,
-                bool requiresCoherency,
                 bool lowPriority,
                 QueueThrottle throttle,
                 uint64_t sliceCount,
@@ -34,32 +43,39 @@ struct BatchBuffer {
                 void *endCmdPtr,
                 uint32_t numCsrClients,
                 bool hasStallingCmds,
-                bool hasRelaxedOrderingDependencies);
+                bool hasRelaxedOrderingDependencies,
+                bool dispatchMonitorFence,
+                bool taskCountUpdateOnly);
     BatchBuffer() {}
+    PagingFenceSemaphoreInfo pagingFenceSemInfo{};
+
     GraphicsAllocation *commandBufferAllocation = nullptr;
-    size_t startOffset = 0u;
-    size_t chainedBatchBufferStartOffset = 0u;
-    uint64_t taskStartAddress = 0; // if task not available, use CSR stream
-
+    ResidencyContainer *allocationsForResidency = nullptr;
     GraphicsAllocation *chainedBatchBuffer = nullptr;
-    bool requiresCoherency = false;
-    bool lowPriority = false;
-    QueueThrottle throttle = QueueThrottle::MEDIUM;
-    uint64_t sliceCount = QueueSliceCount::defaultSliceCount;
-    size_t usedSize = 0u;
-
-    // only used in drm csr in gem close worker active mode
     LinearStream *stream = nullptr;
     void *endCmdPtr = nullptr;
+
+    size_t startOffset = 0u;
+    size_t chainedBatchBufferStartOffset = 0u;
+    size_t usedSize = 0u;
+
+    uint64_t taskStartAddress = 0; // if task not available, use CSR stream
+    uint64_t sliceCount = QueueSliceCount::defaultSliceCount;
+
+    QueueThrottle throttle = QueueThrottle::MEDIUM;
     uint32_t numCsrClients = 0;
 
+    bool lowPriority = false;
     bool hasStallingCmds = false;
     bool hasRelaxedOrderingDependencies = false;
-    bool ringBufferRestartRequest = false;
+    bool disableFlatRingBuffer = false;
+    bool dispatchMonitorFence = false;
+    bool taskCountUpdateOnly = false;
 };
 
-struct CommandBuffer : public IDNode<CommandBuffer> {
+struct CommandBuffer : public IDNode<CommandBuffer>, NEO::NonCopyableAndNonMovableClass {
     CommandBuffer(Device &device);
+    ~CommandBuffer() override;
     ResidencyContainer surfaces;
     BatchBuffer batchBuffer;
     void *batchBufferEndLocation = nullptr;
@@ -71,6 +87,8 @@ struct CommandBuffer : public IDNode<CommandBuffer> {
     std::unique_ptr<FlushStampTracker> flushStamp;
     Device &device;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<CommandBuffer>);
 
 struct CommandBufferList : public IDList<CommandBuffer, false, true, false> {};
 

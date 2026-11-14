@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,16 +18,6 @@ static auto gfxCore = IGFX_XE_HPC_CORE;
 
 #include "opencl/source/helpers/cl_gfx_core_helper_factory_init.inl"
 #include "opencl/source/helpers/cl_gfx_core_helper_pvc_and_later.inl"
-
-template <>
-bool ClGfxCoreHelperHw<Family>::requiresAuxResolves(const KernelInfo &kernelInfo) const {
-    return false;
-}
-
-template <>
-cl_version ClGfxCoreHelperHw<Family>::getDeviceIpVersion(const HardwareInfo &hwInfo) const {
-    return makeDeviceIpVersion(12, 8, makeDeviceRevision(hwInfo));
-}
 
 template class ClGfxCoreHelperHw<Family>;
 

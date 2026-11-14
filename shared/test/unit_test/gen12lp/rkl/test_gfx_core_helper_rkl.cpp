@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,30 +15,23 @@
 
 using GfxCoreHelperTestRkl = GfxCoreHelperTest;
 
-RKLTEST_F(GfxCoreHelperTestRkl, givenRklSteppingA0WhenAdjustDefaultEngineTypeCalledThenRcsIsReturned) {
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-    const auto &productHelper = getHelper<ProductHelper>();
+RKLTEST_F(GfxCoreHelperTestRkl, givenRevisionEnumThenProperValueForIsWorkaroundRequiredIsReturned) {
+    using us = unsigned short;
+    constexpr us a0 = 0x0;
+    constexpr us b0 = 0x4;
+    constexpr us undefined = 0x5;
+    us steppings[] = {a0, b0, undefined};
+    HardwareInfo hardwareInfo = *defaultHwInfo;
 
-    hardwareInfo.featureTable.flags.ftrCCSNode = true;
-    hardwareInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_A0, hardwareInfo);
+    for (auto stepping : steppings) {
+        hardwareInfo.platform.usRevId = stepping;
+        auto &productHelper = getHelper<ProductHelper>();
 
-    gfxCoreHelper.adjustDefaultEngineType(&hardwareInfo, productHelper);
-    EXPECT_EQ(aub_stream::ENGINE_RCS, hardwareInfo.capabilityTable.defaultEngineType);
-}
-
-RKLTEST_F(GfxCoreHelperTestRkl, givenRklSteppingBWhenAdjustDefaultEngineTypeCalledThenRcsIsReturned) {
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-    const auto &productHelper = getHelper<ProductHelper>();
-
-    hardwareInfo.featureTable.flags.ftrCCSNode = true;
-    hardwareInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(REVISION_B, hardwareInfo);
-
-    gfxCoreHelper.adjustDefaultEngineType(&hardwareInfo, productHelper);
-    EXPECT_EQ(aub_stream::ENGINE_RCS, hardwareInfo.capabilityTable.defaultEngineType);
-}
-
-RKLTEST_F(GfxCoreHelperTestRkl, givenRklWhenRequestedVmeFlagsThenReturnFalse) {
-    EXPECT_FALSE(pDevice->getHardwareInfo().capabilityTable.supportsVme);
-    EXPECT_FALSE(pDevice->getHardwareInfo().capabilityTable.ftrSupportsVmeAvcTextureSampler);
-    EXPECT_FALSE(pDevice->getHardwareInfo().capabilityTable.ftrSupportsVmeAvcPreemption);
+        if (stepping == a0) {
+            EXPECT_TRUE(GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_B, hardwareInfo, productHelper));
+            EXPECT_FALSE(GfxCoreHelper::isWorkaroundRequired(REVISION_B, REVISION_A0, hardwareInfo, productHelper));
+        } else if (stepping == b0 || stepping == undefined) {
+            EXPECT_FALSE(GfxCoreHelper::isWorkaroundRequired(REVISION_A0, REVISION_D, hardwareInfo, productHelper));
+        }
+    }
 }

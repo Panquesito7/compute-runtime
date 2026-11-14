@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,10 @@
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 
 #include "shared/source/helpers/ptr_math.h"
+
+namespace NEO {
+class GraphicsAllocation;
+} // namespace NEO
 
 // clang-format off
 // EnqueueTraits
@@ -82,7 +86,6 @@ const cl_bool EnqueueReadBufferTraits::blocking             = CL_TRUE;
 const size_t EnqueueReadBufferTraits::offset                = 0;
 const size_t EnqueueReadBufferTraits::sizeInBytes           = negOne;
 void *EnqueueReadBufferTraits::hostPtr                      = ptrOutput;
-cl_command_type EnqueueReadBufferTraits::cmdType            = CL_COMMAND_READ_BUFFER;
 GraphicsAllocation *EnqueueReadBufferTraits::mapAllocation  = nullptr;
 
 // EnqueueReadImageTraits
@@ -101,7 +104,6 @@ const cl_bool EnqueueWriteBufferTraits::blocking            = CL_TRUE;
 const size_t EnqueueWriteBufferTraits::offset               = 0;
 const size_t EnqueueWriteBufferTraits::sizeInBytes          = negOne;
 void *EnqueueWriteBufferTraits::hostPtr                     = ptrGarbage;
-cl_command_type EnqueueWriteBufferTraits::cmdType           = CL_COMMAND_WRITE_BUFFER;
 GraphicsAllocation *EnqueueWriteBufferTraits::mapAllocation = nullptr;
 
 // EnqueueWriteBufferRectTraits

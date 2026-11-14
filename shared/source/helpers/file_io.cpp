@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,31 +7,16 @@
 
 #include "file_io.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/stdio.h"
 
 #include <cstring>
-#include <fstream>
+#include <filesystem>
+#include <mutex>
 #include <new>
 
-size_t writeDataToFile(
-    const char *filename,
-    const void *pData,
-    size_t dataSize) {
-    FILE *fp = nullptr;
-    size_t nsize = 0;
-
-    DEBUG_BREAK_IF(nullptr == pData);
-    DEBUG_BREAK_IF(nullptr == filename);
-
-    fopen_s(&fp, filename, "wb");
-    if (fp) {
-        nsize = fwrite(pData, sizeof(unsigned char), dataSize, fp);
-        fclose(fp);
-    }
-
-    return nsize;
-}
+namespace NEO {
 
 bool fileExists(const std::string &fileName) {
     FILE *pFile = nullptr;
@@ -62,13 +47,31 @@ bool fileExistsHasSize(const std::string &fileName) {
     return pFile != nullptr && nsize > 0;
 }
 
-void dumpFileIncrement(const char *data, size_t dataSize, const std::string &filename, const std::string &extension) {
-    std::ofstream fstream;
-    auto filenameWithExt = filename + extension;
-    int suffix = 0;
-    while (fileExists(filenameWithExt)) {
-        filenameWithExt = filename + "_" + std::to_string(suffix) + extension;
-        suffix++;
+size_t writeDataToFile(
+    const char *filename,
+    std::string_view data,
+    bool append) {
+    FILE *fp = nullptr;
+    size_t nsize = 0;
+
+    DEBUG_BREAK_IF(nullptr == filename);
+    static const std::string path = debugManager.flags.ForceLoggingDirectory.get() != "unk" ? debugManager.flags.ForceLoggingDirectory.get() : "";
+    std::string fullPath = path + filename;
+    static std::once_flag createDirectoryOnceFlag;
+    std::call_once(createDirectoryOnceFlag, [&]() {
+        if (!path.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+            UNRECOVERABLE_IF(ec.value() != 0);
+        }
+    });
+
+    fopen_s(&fp, fullPath.c_str(), append ? "ab" : "wb");
+    if (fp) {
+        nsize = fwrite(data.data(), sizeof(unsigned char), data.size(), fp);
+        fclose(fp);
     }
-    writeDataToFile(filenameWithExt.c_str(), data, dataSize);
+
+    return nsize;
 }
+} // namespace NEO

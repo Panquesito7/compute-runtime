@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -23,33 +23,15 @@ SingleMetricCollector::SingleMetricCollector(ExecutionContext *executionCtxt,
     : Collector(executionCtxt), samplingType(samplingType) {
 
     metricGroup = zmu::findMetricGroup(metricGroupName, samplingType, executionCtxt->getDeviceHandle(0));
+    zmu::printMetricGroupAndMetricProperties(metricGroup);
+}
 
-    if (zmu::TestSettings::get()->verboseLevel.get() >= zmu::LogLevel::DEBUG) {
-        zet_metric_group_properties_t metricGroupProperties = {};
-        // Obtain metric group properties to check the group name and sampling type.
-        VALIDATECALL(zetMetricGroupGetProperties(metricGroup, &metricGroupProperties));
-        zmu::printMetricGroupProperties(metricGroupProperties);
+SingleMetricCollector::SingleMetricCollector(ExecutionContext *executionCtxt,
+                                             zet_metric_group_handle_t metricGroup,
+                                             const zet_metric_group_sampling_type_flag_t samplingType)
+    : Collector(executionCtxt), metricGroup(metricGroup), samplingType(samplingType) {
 
-        // Print metrics from metric group.
-        uint32_t metricCount = 0;
-        std::vector<zet_metric_handle_t> metrics = {};
-
-        // Obtain metrics count for verbose purpose.
-        VALIDATECALL(zetMetricGet(metricGroup, &metricCount, nullptr));
-
-        // Obtain metrics for verbose purpose.
-        metrics.resize(metricCount);
-        VALIDATECALL(zetMetricGet(metricGroup, &metricCount, metrics.data()));
-
-        // Enumerate metric group metrics for verbose purpose.
-        for (uint32_t j = 0; j < metricCount; ++j) {
-
-            const zet_metric_handle_t metric = metrics[j];
-            zet_metric_properties_t metricProperties = {};
-            VALIDATECALL(zetMetricGetProperties(metric, &metricProperties));
-            zmu::printMetricProperties(metricProperties);
-        }
-    }
+    zmu::printMetricGroupAndMetricProperties(metricGroup);
 }
 
 ///////////////////////////////////
@@ -58,6 +40,13 @@ SingleMetricCollector::SingleMetricCollector(ExecutionContext *executionCtxt,
 SingleMetricStreamerCollector::SingleMetricStreamerCollector(ExecutionContext *executionCtxt,
                                                              const char *metricGroupName) : SingleMetricCollector(executionCtxt, metricGroupName,
                                                                                                                   ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED) {
+
+    executionCtxt->addActiveMetricGroup(metricGroup);
+}
+
+SingleMetricStreamerCollector::SingleMetricStreamerCollector(ExecutionContext *executionCtxt,
+                                                             zet_metric_group_handle_t metricGroup) : SingleMetricCollector(executionCtxt, metricGroup,
+                                                                                                                            ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED) {
 
     executionCtxt->addActiveMetricGroup(metricGroup);
 }
@@ -77,7 +66,7 @@ bool SingleMetricStreamerCollector::start() {
                                        notificationEvent,
                                        &metricStreamer));
     // Initial pause
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     return true;
 }
 
@@ -98,6 +87,7 @@ bool SingleMetricStreamerCollector::suffixCommands() {
 }
 
 bool SingleMetricStreamerCollector::isDataAvailable() {
+
     auto eventStatus = zeEventQueryStatus(notificationEvent);
     zeEventHostReset(notificationEvent);
     return eventStatus == ZE_RESULT_SUCCESS;
@@ -115,9 +105,17 @@ void SingleMetricStreamerCollector::showResults() {
 
     // Read raw data.
     rawData.resize(rawDataSize, 0);
-    VALIDATECALL(zetMetricStreamerReadData(metricStreamer, maxRawReportCount, &rawDataSize, rawData.data()));
+    ze_result_t status = zetMetricStreamerReadData(metricStreamer, maxRawReportCount, &rawDataSize, rawData.data());
     LOG(zmu::LogLevel::DEBUG) << "Streamer read raw bytes: " << rawDataSize << std::endl;
 
+    if (status == ZE_RESULT_WARNING_DROPPED_DATA) {
+        rawDataSize = (uint32_t)rawData.size();
+        zmu::sleep(5);
+        VALIDATECALL(zetMetricStreamerReadData(metricStreamer, maxRawReportCount, &rawDataSize, rawData.data()));
+        LOG(zmu::LogLevel::DEBUG) << "Streamer read raw bytes: " << rawDataSize << std::endl;
+    } else if (status != ZE_RESULT_SUCCESS) {
+        LOG(zmu::LogLevel::DEBUG) << "zetMetricStreamerReadData() returned Error status with code: " << status << std::endl;
+    }
     zmu::obtainCalculatedMetrics(metricGroup, rawData.data(), static_cast<uint32_t>(rawDataSize));
 }
 
@@ -128,6 +126,12 @@ SingleMetricQueryCollector::SingleMetricQueryCollector(ExecutionContext *executi
                                                        const char *metricGroupName) : SingleMetricCollector(executionCtxt, metricGroupName,
                                                                                                             ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED) {
 
+    executionCtxt->addActiveMetricGroup(metricGroup);
+}
+
+SingleMetricQueryCollector::SingleMetricQueryCollector(ExecutionContext *executionCtxt,
+                                                       zet_metric_group_handle_t metricGroup) : SingleMetricCollector(executionCtxt, metricGroup,
+                                                                                                                      ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_EVENT_BASED) {
     executionCtxt->addActiveMetricGroup(metricGroup);
 }
 

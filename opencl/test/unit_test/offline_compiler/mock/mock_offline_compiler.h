@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,19 +8,20 @@
 #pragma once
 
 #include "shared/offline_compiler/source/offline_compiler.h"
-#include "shared/source/compiler_interface/default_cache_config.h"
 
-#include "opencl/test/unit_test/offline_compiler/mock/mock_argument_helper.h"
-#include "opencl/test/unit_test/offline_compiler/mock/mock_ocloc_fcl_facade.h"
-#include "opencl/test/unit_test/offline_compiler/mock/mock_ocloc_igc_facade.h"
-
+#include <map>
 #include <optional>
 #include <string>
 
+class MockOclocArgHelper;
+
 namespace NEO {
+class MockOclocFclFacade;
+class MockOclocIgcFacade;
 
 class MockOfflineCompiler : public OfflineCompiler {
   public:
+    using OfflineCompiler::addressingMode;
     using OfflineCompiler::allowCaching;
     using OfflineCompiler::appendExtraInternalOptions;
     using OfflineCompiler::argHelper;
@@ -33,8 +34,6 @@ class MockOfflineCompiler : public OfflineCompiler {
     using OfflineCompiler::deviceConfig;
     using OfflineCompiler::deviceName;
     using OfflineCompiler::dumpFiles;
-    using OfflineCompiler::elfBinary;
-    using OfflineCompiler::elfBinarySize;
     using OfflineCompiler::elfHash;
     using OfflineCompiler::excludeIr;
     using OfflineCompiler::fclFacade;
@@ -50,109 +49,64 @@ class MockOfflineCompiler : public OfflineCompiler {
     using OfflineCompiler::igcFacade;
     using OfflineCompiler::initHardwareInfo;
     using OfflineCompiler::initHardwareInfoForProductConfig;
+    using OfflineCompiler::initialize;
+    using OfflineCompiler::inputCodeType;
     using OfflineCompiler::inputFile;
     using OfflineCompiler::inputFileLlvm;
     using OfflineCompiler::inputFileSpirV;
+    using OfflineCompiler::intermediateRepresentation;
     using OfflineCompiler::internalOptions;
     using OfflineCompiler::irBinary;
     using OfflineCompiler::irBinarySize;
     using OfflineCompiler::irHash;
-    using OfflineCompiler::isSpirV;
-    using OfflineCompiler::onlySpirV;
+    using OfflineCompiler::loadSpecializationConstants;
+    using OfflineCompiler::onlyIr;
     using OfflineCompiler::options;
+    using OfflineCompiler::outBinFormat;
     using OfflineCompiler::outputDirectory;
     using OfflineCompiler::outputFile;
     using OfflineCompiler::outputNoSuffix;
     using OfflineCompiler::parseCommandLine;
     using OfflineCompiler::parseDebugSettings;
+    using OfflineCompiler::pBuildInfo;
+    using OfflineCompiler::perDeviceOptions;
     using OfflineCompiler::revisionId;
     using OfflineCompiler::setStatelessToStatefulBufferOffsetFlag;
     using OfflineCompiler::sourceCode;
+    using OfflineCompiler::specConstants;
+    using OfflineCompiler::specConstantsFile;
     using OfflineCompiler::storeBinary;
     using OfflineCompiler::updateBuildLog;
     using OfflineCompiler::useGenFile;
-    using OfflineCompiler::useLlvmBc;
-    using OfflineCompiler::useLlvmText;
+    using OfflineCompiler::useIgcAsFcl;
     using OfflineCompiler::useOptionsSuffix;
 
-    MockOfflineCompiler() : OfflineCompiler() {
-        uniqueHelper = std::make_unique<MockOclocArgHelper>(filesMap);
-        uniqueHelper->setAllCallBase(true);
-        argHelper = uniqueHelper.get();
+    MockOfflineCompiler();
 
-        auto uniqueFclFacadeMock = std::make_unique<MockOclocFclFacade>(argHelper);
-        mockFclFacade = uniqueFclFacadeMock.get();
-        fclFacade = std::move(uniqueFclFacadeMock);
+    ~MockOfflineCompiler() override;
 
-        auto uniqueIgcFacadeMock = std::make_unique<MockOclocIgcFacade>(argHelper);
-        mockIgcFacade = uniqueIgcFacadeMock.get();
-        igcFacade = std::move(uniqueIgcFacadeMock);
-    }
+    int initialize(size_t numArgs, const std::vector<std::string> &argv);
 
-    ~MockOfflineCompiler() override = default;
+    void storeGenBinary(const void *pSrc, const size_t srcSize);
 
-    int initialize(size_t numArgs, const std::vector<std::string> &argv) {
-        return OfflineCompiler::initialize(numArgs, argv, true);
-    }
+    int build() override;
 
-    void storeGenBinary(const void *pSrc, const size_t srcSize) {
-        OfflineCompiler::storeBinary(genBinary, genBinarySize, pSrc, srcSize);
-    }
+    int buildToIrBinary() override;
 
-    int build() override {
-        ++buildCalledCount;
+    int buildSourceCode() override;
 
-        if (buildReturnValue.has_value()) {
-            return *buildReturnValue;
-        }
+    void writeOutAllFiles() override;
 
-        return OfflineCompiler::build();
-    }
+    void clearLog();
 
-    int buildIrBinary() override {
-        if (overrideBuildIrBinaryStatus) {
-            return buildIrBinaryStatus;
-        }
-        return OfflineCompiler::buildIrBinary();
-    }
-
-    int buildSourceCode() override {
-        if (overrideBuildSourceCodeStatus) {
-            return buildSourceCodeStatus;
-        }
-        return OfflineCompiler::buildSourceCode();
-    }
-
-    bool generateElfBinary() override {
-        generateElfBinaryCalled++;
-        return OfflineCompiler::generateElfBinary();
-    }
-
-    void writeOutAllFiles() override {
-        writeOutAllFilesCalled++;
-        OfflineCompiler::writeOutAllFiles();
-    }
-
-    void clearLog() {
-        uniqueHelper = std::make_unique<MockOclocArgHelper>(filesMap);
-        uniqueHelper->setAllCallBase(true);
-        argHelper = uniqueHelper.get();
-    }
-
-    void createDir(const std::string &path) override {
-        if (interceptCreatedDirs) {
-            createdDirs.push_back(path);
-        } else {
-            OfflineCompiler::createDir(path);
-        }
-    }
+    int createDir(const std::string &path) override;
+    void createTempSourceFileForDebug() override;
 
     std::map<std::string, std::string> filesMap{};
-    int buildIrBinaryStatus = 0;
-    bool overrideBuildIrBinaryStatus = false;
+    int buildToIrBinaryStatus = 0;
+    bool overrideBuildToIrBinaryStatus = false;
     int buildSourceCodeStatus = 0;
     bool overrideBuildSourceCodeStatus = false;
-    uint32_t generateElfBinaryCalled = 0u;
     uint32_t writeOutAllFilesCalled = 0u;
     std::unique_ptr<MockOclocArgHelper> uniqueHelper;
     MockOclocIgcFacade *mockIgcFacade = nullptr;
@@ -161,6 +115,7 @@ class MockOfflineCompiler : public OfflineCompiler {
     std::optional<int> buildReturnValue{};
     bool interceptCreatedDirs{false};
     std::vector<std::string> createdDirs{};
+    int createTempSourceFileForDebugCalled{0};
 };
 
 } // namespace NEO

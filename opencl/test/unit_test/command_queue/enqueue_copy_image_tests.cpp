@@ -1,15 +1,17 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_builtins.h"
 #include "shared/test/common/mocks/mock_gmm_resource_info.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/built_ins/builtins_dispatch_builder.h"
@@ -17,16 +19,11 @@
 #include "opencl/test/unit_test/fixtures/one_mip_level_image_fixture.h"
 #include "opencl/test/unit_test/gen_common/gen_commands_common_validation.h"
 #include "opencl/test/unit_test/mocks/mock_builtin_dispatch_info_builder.h"
-#include "opencl/test/unit_test/mocks/mock_cl_execution_environment.h"
-#include "opencl/test/unit_test/mocks/mock_command_queue.h"
-
-#include "reg_configs_common.h"
-
-#include <algorithm>
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 
 using namespace NEO;
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenGpgpuWalkerIsCorrect) {
+HWTEST2_F(EnqueueCopyImageTest, WhenCopyingImageThenGpgpuWalkerIsCorrect, IsGen12LP) {
     typedef typename FamilyType::GPGPU_WALKER GPGPU_WALKER;
     enqueueCopyImage<FamilyType>();
 
@@ -65,18 +62,24 @@ HWTEST_F(EnqueueCopyImageTest, WhenCopyingImageThenTaskCountIsAlignedWithCsr) {
 
     EnqueueCopyImageHelper<>::enqueueCopyImage(pCmdQ, srcImage, dstImage);
     EXPECT_EQ(csr.peekTaskCount(), pCmdQ->taskCount);
-    EXPECT_EQ(csr.peekTaskLevel(), pCmdQ->taskLevel + 1);
+
+    auto cmdQTaskLevel = pCmdQ->taskLevel;
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        cmdQTaskLevel++;
+    }
+
+    EXPECT_EQ(csr.peekTaskLevel(), cmdQTaskLevel);
 }
 
 HWTEST_F(EnqueueCopyImageTest, GivenGpuHangAndBlockingCallWhenCopyingImageThenOutOfResourcesIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.MakeEachEnqueueBlocking.set(true);
+    debugManager.flags.MakeEachEnqueueBlocking.set(true);
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context, device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     const auto enqueueResult = EnqueueCopyImageHelper<>::enqueueCopyImage(&mockCommandQueueHw, srcImage, dstImage);
 
@@ -114,7 +117,7 @@ HWTEST_F(EnqueueCopyImageTest, WhenCopyingImageThenL3ProgrammingIsCorrect) {
     validateL3Programming<FamilyType>(cmdList, itorWalker);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed) {
+HWTEST2_F(EnqueueCopyImageTest, WhenEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed, IsGen12LP) {
     enqueueCopyImage<FamilyType>();
     auto &ultCsr = this->pDevice->getUltCommandStreamReceiver<FamilyType>();
 
@@ -125,7 +128,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenEnqueueIsDoneThenStateBase
                                          pDSH, pIOH, pSSH, itorPipelineSelect, itorWalker, cmdList, 0llu);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenMediaInterfaceDescriptorLoadIsCorrect) {
+HWTEST2_F(EnqueueCopyImageTest, WhenCopyingImageThenMediaInterfaceDescriptorLoadIsCorrect, IsGen12LP) {
     typedef typename FamilyType::MEDIA_INTERFACE_DESCRIPTOR_LOAD MEDIA_INTERFACE_DESCRIPTOR_LOAD;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -148,10 +151,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenMediaInter
     EXPECT_EQ(0u, cmd->getInterfaceDescriptorTotalLength() % alignmentTotalLength);
 
     // Generically validate this command
-    FamilyType::PARSE::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorMediaInterfaceDescriptorLoad);
+    FamilyType::Parse::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorMediaInterfaceDescriptorLoad);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenInterfaceDescriptorDataIsCorrect) {
+HWTEST2_F(EnqueueCopyImageTest, WhenCopyingImageThenInterfaceDescriptorDataIsCorrect, IsGen12LP) {
     typedef typename FamilyType::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -162,7 +165,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenInterfaceD
     auto &interfaceDescriptorData = *(INTERFACE_DESCRIPTOR_DATA *)cmdInterfaceDescriptorData;
 
     // Validate the kernel start pointer.  Technically, a kernel can start at address 0 but let's force a value.
-    auto kernelStartPointer = ((uint64_t)interfaceDescriptorData.getKernelStartPointerHigh() << 32) + interfaceDescriptorData.getKernelStartPointer();
+    auto kernelStartPointer = interfaceDescriptorData.getKernelStartPointer();
     EXPECT_LE(kernelStartPointer, cmdSBA->getInstructionBufferSize() * MemoryConstants::pageSize);
 
     EXPECT_NE(0u, interfaceDescriptorData.getCrossThreadConstantDataReadLength());
@@ -173,7 +176,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenInterfaceD
 }
 
 HWTEST_F(EnqueueCopyImageTest, WhenCopyingImageThenSurfaceStateIsCorrect) {
-    typedef typename FamilyType::RENDER_SURFACE_STATE RENDER_SURFACE_STATE;
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
 
     auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
     VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
@@ -181,10 +184,9 @@ HWTEST_F(EnqueueCopyImageTest, WhenCopyingImageThenSurfaceStateIsCorrect) {
 
     enqueueCopyImage<FamilyType>();
 
-    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
     for (uint32_t i = 0; i < 2; ++i) {
-        uint32_t index = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(i).template as<ArgDescImage>().bindful) / sizeof(RENDER_SURFACE_STATE);
-        const auto surfaceState = getSurfaceState<FamilyType>(&pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), index);
+        const auto surfaceState = SurfaceStateAccessor::getSurfaceState<FamilyType, RENDER_SURFACE_STATE>(mockCmdQ, i);
+
         const auto &imageDesc = dstImage->getImageDesc();
         EXPECT_EQ(imageDesc.image_width, surfaceState->getWidth());
         EXPECT_EQ(imageDesc.image_height, surfaceState->getHeight());
@@ -199,151 +201,139 @@ HWTEST_F(EnqueueCopyImageTest, WhenCopyingImageThenSurfaceStateIsCorrect) {
             surfaceFormat == RENDER_SURFACE_STATE::SURFACE_FORMAT_R8_UINT;
         EXPECT_TRUE(isRedescribedFormat);
         EXPECT_EQ(MockGmmResourceInfo::getHAlignSurfaceStateResult, surfaceState->getSurfaceHorizontalAlignment());
-        EXPECT_EQ(RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4, surfaceState->getSurfaceVerticalAlignment());
+        EXPECT_EQ(static_cast<uint32_t>(FamilyType::RENDER_SURFACE_STATE::SURFACE_VERTICAL_ALIGNMENT_VALIGN_4), static_cast<uint32_t>(surfaceState->getSurfaceVerticalAlignment()));
     }
 
-    uint32_t srcIndex = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(0).template as<ArgDescImage>().bindful) / sizeof(RENDER_SURFACE_STATE);
-    const auto srcSurfaceState = getSurfaceState<FamilyType>(&pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), srcIndex);
+    const auto srcSurfaceState = SurfaceStateAccessor::getSurfaceState<FamilyType, RENDER_SURFACE_STATE>(mockCmdQ, 0);
     EXPECT_EQ(srcImage->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), srcSurfaceState->getSurfaceBaseAddress());
 
-    uint32_t dstIndex = static_cast<uint32_t>(kernelInfo.getArgDescriptorAt(1).template as<ArgDescImage>().bindful) / sizeof(RENDER_SURFACE_STATE);
-    const auto dstSurfaceState = getSurfaceState<FamilyType>(&pCmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), dstIndex);
+    const auto dstSurfaceState = SurfaceStateAccessor::getSurfaceState<FamilyType, RENDER_SURFACE_STATE>(mockCmdQ, 1);
     EXPECT_EQ(dstImage->getGraphicsAllocation(pClDevice->getRootDeviceIndex())->getGpuAddress(), dstSurfaceState->getSurfaceBaseAddress());
 }
 
-HWTEST2_F(EnqueueCopyImageTest, WhenCopyingImageThenNumberOfPipelineSelectsIsOne, IsAtMostXeHpcCore) {
+HWTEST2_F(EnqueueCopyImageTest, WhenCopyingImageThenNumberOfPipelineSelectsIsOne, IsAtMostXeCore) {
     enqueueCopyImage<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueCopyImageTest, WhenCopyingImageThenMediaVfeStateIsSetCorrectly) {
+HWTEST2_F(EnqueueCopyImageTest, WhenCopyingImageThenMediaVfeStateIsSetCorrectly, IsGen12LP) {
     enqueueCopyImage<FamilyType>();
     validateMediaVFEState<FamilyType>(&pDevice->getHardwareInfo(), cmdMediaVfeState, cmdList, itorMediaVfeState);
 }
 
-typedef EnqueueCopyImageMipMapTest MipMapCopyImageTest;
+using MipMapCopyImageTest = EnqueueCopyImageMipMapTest;
 
-HWTEST_P(MipMapCopyImageTest, GivenImagesWithNonZeroMipLevelsWhenCopyImageIsCalledThenProperMipLevelsAreSet) {
-    cl_mem_object_type srcImageType, dstImageType;
-    std::tie(srcImageType, dstImageType) = GetParam();
-    auto builtIns = new MockBuiltins();
-    pCmdQ->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[pCmdQ->getDevice().getRootDeviceIndex()]->builtins.reset(builtIns);
-    auto &origBuilder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(
-        EBuiltInOps::CopyImageToImage3d,
-        pCmdQ->getClDevice());
-    // substitute original builder with mock builder
-    auto oldBuilder = pClExecutionEnvironment->setBuiltinDispatchInfoBuilder(
-        rootDeviceIndex,
-        EBuiltInOps::CopyImageToImage3d,
-        std::unique_ptr<NEO::BuiltinDispatchInfoBuilder>(new MockBuiltinDispatchInfoBuilder(*builtIns, pCmdQ->getClDevice(), &origBuilder)));
+HWTEST_F(MipMapCopyImageTest, GivenImagesWithNonZeroMipLevelsWhenCopyImageIsCalledThenProperMipLevelsAreSet) {
+    const cl_mem_object_type imageTypes[] = {CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY,
+                                             CL_MEM_OBJECT_IMAGE2D, CL_MEM_OBJECT_IMAGE2D_ARRAY,
+                                             CL_MEM_OBJECT_IMAGE3D};
+    for (auto srcImageType : imageTypes) {
+        for (auto dstImageType : imageTypes) {
 
-    cl_int retVal = CL_SUCCESS;
-    cl_image_desc srcImageDesc = {};
-    uint32_t expectedSrcMipLevel = 3;
-    uint32_t expectedDstMipLevel = 4;
-    srcImageDesc.image_type = srcImageType;
-    srcImageDesc.num_mip_levels = 10;
-    srcImageDesc.image_width = 4;
-    srcImageDesc.image_height = 1;
-    srcImageDesc.image_depth = 1;
+            auto builtIns = new MockBuiltins();
+            MockRootDeviceEnvironment::resetBuiltins(pCmdQ->getDevice().getExecutionEnvironment()->rootDeviceEnvironments[pCmdQ->getDevice().getRootDeviceIndex()].get(), builtIns);
+            auto &origBuilder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImageToImage3d, pCmdQ->getDefaultBuiltInMode(), pCmdQ->getClDevice());
+            // substitute original builder with mock builder
+            auto oldBuilder = pClDevice->setBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImageToImage3d, pCmdQ->getDefaultBuiltInMode(), std::unique_ptr<NEO::BuiltIn::DispatchInfoBuilder>(new MockBuiltInDispatchInfoBuilder(*builtIns, pCmdQ->getClDevice(), &origBuilder)));
 
-    cl_image_desc dstImageDesc = srcImageDesc;
-    dstImageDesc.image_type = dstImageType;
+            cl_int retVal = CL_SUCCESS;
+            cl_image_desc srcImageDesc = {};
+            uint32_t expectedSrcMipLevel = 3;
+            uint32_t expectedDstMipLevel = 4;
+            srcImageDesc.image_type = srcImageType;
+            srcImageDesc.num_mip_levels = 10;
+            srcImageDesc.image_width = 4;
+            srcImageDesc.image_height = 1;
+            srcImageDesc.image_depth = 1;
 
-    size_t srcOrigin[] = {0, 0, 0, 0};
-    size_t dstOrigin[] = {0, 0, 0, 0};
-    size_t region[] = {srcImageDesc.image_width, 1, 1};
-    std::unique_ptr<Image> srcImage;
-    std::unique_ptr<Image> dstImage;
+            cl_image_desc dstImageDesc = srcImageDesc;
+            dstImageDesc.image_type = dstImageType;
 
-    switch (srcImageType) {
-    case CL_MEM_OBJECT_IMAGE1D:
-        srcOrigin[1] = expectedSrcMipLevel;
-        srcImage = std::unique_ptr<Image>(ImageHelper<Image1dDefaults>::create(context, &srcImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE1D_ARRAY:
-        srcImageDesc.image_array_size = 2;
-        srcOrigin[2] = expectedSrcMipLevel;
-        srcImage = std::unique_ptr<Image>(ImageHelper<Image1dArrayDefaults>::create(context, &srcImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE2D:
-        srcOrigin[2] = expectedSrcMipLevel;
-        srcImage = std::unique_ptr<Image>(ImageHelper<Image2dDefaults>::create(context, &srcImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE2D_ARRAY:
-        srcImageDesc.image_array_size = 2;
-        srcOrigin[3] = expectedSrcMipLevel;
-        srcImage = std::unique_ptr<Image>(ImageHelper<Image2dArrayDefaults>::create(context, &srcImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE3D:
-        srcOrigin[3] = expectedSrcMipLevel;
-        srcImage = std::unique_ptr<Image>(ImageHelper<Image3dDefaults>::create(context, &srcImageDesc));
-        break;
+            size_t srcOrigin[] = {0, 0, 0, 0};
+            size_t dstOrigin[] = {0, 0, 0, 0};
+            size_t region[] = {srcImageDesc.image_width, 1, 1};
+            std::unique_ptr<Image> srcImage;
+            std::unique_ptr<Image> dstImage;
+
+            switch (srcImageType) {
+            case CL_MEM_OBJECT_IMAGE1D:
+                srcOrigin[1] = expectedSrcMipLevel;
+                srcImage = std::unique_ptr<Image>(ImageHelperUlt<Image1dDefaults>::create(context, &srcImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE1D_ARRAY:
+                srcImageDesc.image_array_size = 2;
+                srcOrigin[2] = expectedSrcMipLevel;
+                srcImage = std::unique_ptr<Image>(ImageHelperUlt<Image1dArrayDefaults>::create(context, &srcImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE2D:
+                srcOrigin[2] = expectedSrcMipLevel;
+                srcImage = std::unique_ptr<Image>(ImageHelperUlt<Image2dDefaults>::create(context, &srcImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE2D_ARRAY:
+                srcImageDesc.image_array_size = 2;
+                srcOrigin[3] = expectedSrcMipLevel;
+                srcImage = std::unique_ptr<Image>(ImageHelperUlt<Image2dArrayDefaults>::create(context, &srcImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE3D:
+                srcOrigin[3] = expectedSrcMipLevel;
+                srcImage = std::unique_ptr<Image>(ImageHelperUlt<Image3dDefaults>::create(context, &srcImageDesc));
+                break;
+            }
+
+            EXPECT_NE(nullptr, srcImage.get());
+
+            switch (dstImageType) {
+            case CL_MEM_OBJECT_IMAGE1D:
+                dstOrigin[1] = expectedDstMipLevel;
+                dstImage = std::unique_ptr<Image>(ImageHelperUlt<Image1dDefaults>::create(context, &dstImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE1D_ARRAY:
+                dstImageDesc.image_array_size = 2;
+                dstOrigin[2] = expectedDstMipLevel;
+                dstImage = std::unique_ptr<Image>(ImageHelperUlt<Image1dArrayDefaults>::create(context, &dstImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE2D:
+                dstOrigin[2] = expectedDstMipLevel;
+                dstImage = std::unique_ptr<Image>(ImageHelperUlt<Image2dDefaults>::create(context, &dstImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE2D_ARRAY:
+                dstOrigin[3] = expectedDstMipLevel;
+                dstImage = std::unique_ptr<Image>(ImageHelperUlt<Image2dArrayDefaults>::create(context, &dstImageDesc));
+                break;
+            case CL_MEM_OBJECT_IMAGE3D:
+                dstOrigin[3] = expectedDstMipLevel;
+                dstImage = std::unique_ptr<Image>(ImageHelperUlt<Image3dDefaults>::create(context, &dstImageDesc));
+                break;
+            }
+
+            EXPECT_NE(nullptr, dstImage.get());
+
+            retVal = pCmdQ->enqueueCopyImage(srcImage.get(),
+                                             dstImage.get(),
+                                             srcOrigin,
+                                             dstOrigin,
+                                             region,
+                                             0,
+                                             nullptr,
+                                             nullptr);
+
+            EXPECT_EQ(CL_SUCCESS, retVal);
+
+            auto &mockBuilder = static_cast<MockBuiltInDispatchInfoBuilder &>(BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImageToImage3d,
+                                                                                                                                        pCmdQ->getDefaultBuiltInMode(),
+                                                                                                                                        pCmdQ->getClDevice()));
+            auto params = mockBuilder.getBuiltinOpParams();
+
+            EXPECT_EQ(expectedSrcMipLevel, params->srcMipLevel);
+            EXPECT_EQ(expectedDstMipLevel, params->dstMipLevel);
+
+            // restore original builder and retrieve mock builder
+            auto newBuilder = pClDevice->setBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyImageToImage3d, pCmdQ->getDefaultBuiltInMode(), std::move(oldBuilder));
+            EXPECT_NE(nullptr, newBuilder);
+        }
     }
-
-    EXPECT_NE(nullptr, srcImage.get());
-
-    switch (dstImageType) {
-    case CL_MEM_OBJECT_IMAGE1D:
-        dstOrigin[1] = expectedDstMipLevel;
-        dstImage = std::unique_ptr<Image>(ImageHelper<Image1dDefaults>::create(context, &dstImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE1D_ARRAY:
-        dstImageDesc.image_array_size = 2;
-        dstOrigin[2] = expectedDstMipLevel;
-        dstImage = std::unique_ptr<Image>(ImageHelper<Image1dArrayDefaults>::create(context, &dstImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE2D:
-        dstOrigin[2] = expectedDstMipLevel;
-        dstImage = std::unique_ptr<Image>(ImageHelper<Image2dDefaults>::create(context, &dstImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE2D_ARRAY:
-        dstImageDesc.image_array_size = 2;
-        dstOrigin[3] = expectedDstMipLevel;
-        dstImage = std::unique_ptr<Image>(ImageHelper<Image2dArrayDefaults>::create(context, &dstImageDesc));
-        break;
-    case CL_MEM_OBJECT_IMAGE3D:
-        dstOrigin[3] = expectedDstMipLevel;
-        dstImage = std::unique_ptr<Image>(ImageHelper<Image3dDefaults>::create(context, &dstImageDesc));
-        break;
-    }
-
-    EXPECT_NE(nullptr, dstImage.get());
-
-    retVal = pCmdQ->enqueueCopyImage(srcImage.get(),
-                                     dstImage.get(),
-                                     srcOrigin,
-                                     dstOrigin,
-                                     region,
-                                     0,
-                                     nullptr,
-                                     nullptr);
-
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    auto &mockBuilder = static_cast<MockBuiltinDispatchInfoBuilder &>(BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyImageToImage3d,
-                                                                                                                              pCmdQ->getClDevice()));
-    auto params = mockBuilder.getBuiltinOpParams();
-
-    EXPECT_EQ(expectedSrcMipLevel, params->srcMipLevel);
-    EXPECT_EQ(expectedDstMipLevel, params->dstMipLevel);
-
-    // restore original builder and retrieve mock builder
-    auto newBuilder = pClExecutionEnvironment->setBuiltinDispatchInfoBuilder(
-        rootDeviceIndex,
-        EBuiltInOps::CopyImageToImage3d,
-        std::move(oldBuilder));
-    EXPECT_NE(nullptr, newBuilder);
 }
-
-uint32_t types[] = {CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY, CL_MEM_OBJECT_IMAGE2D, CL_MEM_OBJECT_IMAGE2D_ARRAY, CL_MEM_OBJECT_IMAGE3D};
-
-INSTANTIATE_TEST_CASE_P(MipMapCopyImageTest_GivenImagesWithNonZeroMipLevelsWhenCopyImageIsCalledThenProperMipLevelsAreSet,
-                        MipMapCopyImageTest,
-                        ::testing::Combine(
-                            ::testing::ValuesIn(types),
-                            ::testing::ValuesIn(types)));
 
 using OneMipLevelCopyImageImageTests = Test<OneMipLevelImageFixture>;
 
@@ -364,4 +354,52 @@ HWTEST_F(OneMipLevelCopyImageImageTests, GivenNotMippedImageWhenCopyingImageThen
     EXPECT_TRUE(builtinOpsParamsCaptured);
     EXPECT_EQ(0u, usedBuiltinOpsParams.srcMipLevel);
     EXPECT_EQ(0u, usedBuiltinOpsParams.dstMipLevel);
+}
+
+HWTEST_F(EnqueueCopyImageTest, WhenCopyImage1dBufferToImage1dBufferThenCorrectBuitInIsSelected) {
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
+    std::unique_ptr<Image> srcImage1dBuffer;
+    srcImage1dBuffer.reset(Image1dBufferHelperUlt<>::create(context));
+    VariableBackup<Image *> srcImageBackup(&srcImage, srcImage1dBuffer.get());
+    std::unique_ptr<Image> dstImage1dBuffer;
+    dstImage1dBuffer.reset(Image1dBufferHelperUlt<>::create(context));
+    VariableBackup<Image *> dstImageBackup(&dstImage, dstImage1dBuffer.get());
+    mockCmdQ->storeMultiDispatchInfo = true;
+    EnqueueCopyImageHelper<>::enqueueCopyImage(pCmdQ, srcImage, dstImage);
+    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
+    EXPECT_TRUE(kernelInfo.kernelDescriptor.kernelMetadata.kernelName == "CopyImage1dBufferToImage1dBuffer");
+}
+
+HWTEST_F(EnqueueCopyImageTest, WhenCopyImage1dBufferToImageThenCorrectBuitInIsSelected) {
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
+    std::unique_ptr<Image> srcImage1dBuffer;
+    srcImage1dBuffer.reset(Image1dBufferHelperUlt<>::create(context));
+    VariableBackup<Image *> srcImageBackup(&srcImage, srcImage1dBuffer.get());
+    mockCmdQ->storeMultiDispatchInfo = true;
+    EnqueueCopyImageHelper<>::enqueueCopyImage(pCmdQ, srcImage, dstImage);
+    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
+    EXPECT_TRUE(kernelInfo.kernelDescriptor.kernelMetadata.kernelName == "CopyImage1dBufferToImage3d");
+}
+
+HWTEST_F(EnqueueCopyImageTest, WhenCopyImageToImage1dBufferThenCorrectBuitInIsSelected) {
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
+    std::unique_ptr<Image> dstImage1dBuffer;
+    dstImage1dBuffer.reset(Image1dBufferHelperUlt<>::create(context));
+    VariableBackup<Image *> dstImageBackup(&dstImage, dstImage1dBuffer.get());
+    mockCmdQ->storeMultiDispatchInfo = true;
+    EnqueueCopyImageHelper<>::enqueueCopyImage(pCmdQ, srcImage, dstImage);
+    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
+    EXPECT_TRUE(kernelInfo.kernelDescriptor.kernelMetadata.kernelName == "CopyImage3dToImage1dBuffer");
+}
+
+HWTEST_F(EnqueueCopyImageTest, WhenCopyImageToImageThenCorrectBuitInIsSelected) {
+    auto mockCmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, pClDevice, nullptr);
+    VariableBackup<CommandQueue *> cmdQBackup(&pCmdQ, mockCmdQ.get());
+    mockCmdQ->storeMultiDispatchInfo = true;
+    EnqueueCopyImageHelper<>::enqueueCopyImage(pCmdQ, srcImage, dstImage);
+    const auto &kernelInfo = mockCmdQ->storedMultiDispatchInfo.begin()->getKernel()->getKernelInfo();
+    EXPECT_TRUE(kernelInfo.kernelDescriptor.kernelMetadata.kernelName == "CopyImage3dToImage3d");
 }

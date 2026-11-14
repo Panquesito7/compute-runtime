@@ -1,21 +1,31 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/aub/aub_kernel_info_helper.h"
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/device_binary_format/device_binary_formats.h"
 #include "shared/source/device_binary_format/zebin/debug_zebin.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/ult_hw_config.h"
+#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_aub_manager.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_modules_zebin.h"
-#include "shared/test/common/mocks/mock_source_level_debugger.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
-#include "opencl/test/unit_test/mocks/mock_buffer.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_program.h"
 #include "opencl/test/unit_test/program/program_with_zebin.h"
 
 #include <memory>
+
 using namespace NEO;
 
 TEST_F(ProgramWithZebinFixture, givenNoZebinThenSegmentsAreEmpty) {
@@ -41,9 +51,52 @@ TEST_F(ProgramWithZebinFixture, givenZebinSegmentsThenSegmentsArePopulated) {
         EXPECT_EQ(static_cast<uintptr_t>(alloc->getGpuAddress()), segment.address);
         EXPECT_EQ(static_cast<size_t>(alloc->getUnderlyingBufferSize()), segment.size);
     };
-    checkGPUSeg(program->buildInfos[rootDeviceIndex].constantSurface, segments.constData);
-    checkGPUSeg(program->buildInfos[rootDeviceIndex].globalSurface, segments.varData);
-    checkGPUSeg(program->getKernelInfoArray(rootDeviceIndex)[0]->getGraphicsAllocation(), segments.nameToSegMap[ZebinTestData::ValidEmptyProgram<>::kernelName]);
+    checkGPUSeg(program->buildInfos[rootDeviceIndex].constantSurface->getGraphicsAllocation(), segments.constData);
+    checkGPUSeg(program->buildInfos[rootDeviceIndex].globalSurface->getGraphicsAllocation(), segments.varData);
+    checkGPUSeg(program->getKernelInfoArray(rootDeviceIndex)[0]->getIsaGraphicsAllocation(), segments.nameToSegMap[ZebinTestData::ValidEmptyProgram<>::kernelName]);
+
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(program->buildInfos[rootDeviceIndex].constStringSectionData.initData), segments.stringData.address);
+    EXPECT_EQ(reinterpret_cast<const char *>(program->buildInfos[rootDeviceIndex].constStringSectionData.initData), strings);
+    EXPECT_EQ(program->buildInfos[rootDeviceIndex].constStringSectionData.size, sizeof(strings));
+}
+
+TEST_F(ProgramWithZebinFixture, givenZebinSegmentsWithSharedGlobalAndConstSurfacesThenSegmentsArePopulated) {
+    const bool createWithSharedGlobalConstSurfaces = true;
+    populateProgramWithSegments(program.get(), createWithSharedGlobalConstSurfaces);
+    auto segments = program->getZebinSegments(rootDeviceIndex);
+
+    auto checkGPUSeg = [](NEO::SharedPoolAllocation *surface, NEO::Zebin::Debug::Segments::Segment segment) {
+        EXPECT_EQ(static_cast<uintptr_t>(surface->getGpuAddress()), segment.address);
+        EXPECT_EQ(static_cast<size_t>(surface->getSize()), segment.size);
+
+        EXPECT_NE(surface->getGraphicsAllocation()->getGpuAddress(), surface->getGpuAddress());
+        EXPECT_NE(surface->getGraphicsAllocation()->getUnderlyingBufferSize(), surface->getSize());
+    };
+    checkGPUSeg(program->buildInfos[rootDeviceIndex].constantSurface.get(), segments.constData);
+    checkGPUSeg(program->buildInfos[rootDeviceIndex].globalSurface.get(), segments.varData);
+}
+
+TEST_F(ProgramWithZebinFixture, givenSharedIsaAllocationWhenGetZebinSegmentsThenSegmentsAreCorrectlyPopulated) {
+    isUsingSharedIsaAllocation = true;
+    populateProgramWithSegments(program.get());
+    auto segments = program->getZebinSegments(rootDeviceIndex);
+
+    auto checkGPUSeg = [](NEO::GraphicsAllocation *alloc, NEO::Zebin::Debug::Segments::Segment segment) {
+        EXPECT_EQ(static_cast<uintptr_t>(alloc->getGpuAddress()), segment.address);
+        EXPECT_EQ(static_cast<size_t>(alloc->getUnderlyingBufferSize()), segment.size);
+    };
+    checkGPUSeg(program->buildInfos[rootDeviceIndex].constantSurface->getGraphicsAllocation(), segments.constData);
+    checkGPUSeg(program->buildInfos[rootDeviceIndex].globalSurface->getGraphicsAllocation(), segments.varData);
+
+    {
+        auto kernelInfo = program->getKernelInfoArray(rootDeviceIndex)[0];
+        auto segment = segments.nameToSegMap[ZebinTestData::ValidEmptyProgram<>::kernelName];
+        auto isaAlloc = kernelInfo->getIsaGraphicsAllocation();
+        auto offset = kernelInfo->getIsaOffsetInParentAllocation();
+
+        EXPECT_EQ(static_cast<uintptr_t>(isaAlloc->getGpuAddress() + offset), segment.address);
+        EXPECT_EQ(static_cast<size_t>(kernelInfo->getIsaSubAllocationSize()), segment.size);
+    }
 
     EXPECT_EQ(reinterpret_cast<uintptr_t>(program->buildInfos[rootDeviceIndex].constStringSectionData.initData), segments.stringData.address);
     EXPECT_EQ(reinterpret_cast<const char *>(program->buildInfos[rootDeviceIndex].constStringSectionData.initData), strings);
@@ -119,40 +172,150 @@ TEST_F(ProgramWithZebinFixture, givenEmptyDebugDataAndZebinBinaryFormatThenCreat
     EXPECT_EQ(numDevices * sizeof(debugData), retData);
 }
 
-TEST_F(ProgramWithZebinFixture, givenZebinFormatAndDebuggerNotAvailableWhenNotifyingDebuggerThenCreateDebugZebinIsCalled) {
-    pClDevice->getExecutionEnvironment()->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]->debugger.reset(nullptr);
+HWTEST_F(ProgramWithZebinFixture, givenProgramWhenDumpKernelInfoToAubCommentsIsCalledThenExpectedTokensAreVisible) {
 
-    addEmptyZebin(program.get());
-    populateProgramWithSegments(program.get());
+    auto &ultCsr = pDevice->getUltCommandStreamReceiver<FamilyType>();
+
+    ultCsr.commandStreamReceiverType = NEO::CommandStreamReceiverType::aub;
+    pDevice->getRootDeviceEnvironmentRef().initAubCenter(false, "", NEO::CommandStreamReceiverType::aub);
+    auto aubManager = static_cast<MockAubManager *>(pDevice->getRootDeviceEnvironmentRef().aubCenter->getAubManager());
+
+    ZebinTestData::ZebinWithExternalFunctionsInfo zebin;
+    auto copyHwInfo = pDevice->getHardwareInfo();
+    auto &compilerProductHelper = pDevice->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
+    zebin.setProductFamily(static_cast<uint16_t>(copyHwInfo.platform.eProductFamily));
+
     auto &buildInfo = program->buildInfos[rootDeviceIndex];
-    buildInfo.debugDataSize = 0u;
-    buildInfo.debugData.reset(nullptr);
-    for (auto &device : program->getDevices()) {
-        program->notifyDebuggerWithDebugData(device);
+    buildInfo.unpackedDeviceBinary = makeCopy<char>(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size());
+    buildInfo.unpackedDeviceBinarySize = zebin.storage.size();
+
+    auto blob = ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(buildInfo.unpackedDeviceBinary.get()), buildInfo.unpackedDeviceBinarySize);
+    NEO::SingleDeviceBinary binary = {};
+    binary.deviceBinary = blob;
+    binary.targetDevice = NEO::getTargetDevice(pDevice->getRootDeviceEnvironment());
+    std::string decodeErrors;
+    std::string decodeWarnings;
+    auto &gfxCoreHelper = pClDevice->getGfxCoreHelper();
+    NEO::ProgramInfo programInfo;
+    NEO::decodeSingleDeviceBinary(programInfo, binary, decodeErrors, decodeWarnings, gfxCoreHelper);
+
+    for (auto *kernelInfo : programInfo.kernelInfos) {
+        buildInfo.kernelInfoArray.push_back(kernelInfo);
     }
-    EXPECT_TRUE(program->wasCreateDebugZebinCalled);
-    EXPECT_FALSE(program->wasProcessDebugDataCalled);
-    EXPECT_NE(nullptr, program->buildInfos[rootDeviceIndex].debugData);
-    EXPECT_GT(program->buildInfos[rootDeviceIndex].debugDataSize, 0u);
-}
+    programInfo.kernelInfos.clear();
 
-TEST_F(ProgramWithZebinFixture, givenZebinFormatAndDebuggerAvailableWhenNotifyingDebuggerThenCreateDebugZebinIsCalledAndDebuggerNotified) {
-    MockSourceLevelDebugger *sourceLevelDebugger = new MockSourceLevelDebugger;
-    sourceLevelDebugger->setActive(true);
-    pClDevice->getExecutionEnvironment()->rootDeviceEnvironments[pDevice->getRootDeviceIndex()]->debugger.reset(sourceLevelDebugger);
-
-    addEmptyZebin(program.get());
-    populateProgramWithSegments(program.get());
-    auto &buildInfo = program->buildInfos[rootDeviceIndex];
-    buildInfo.debugDataSize = 0u;
-    buildInfo.debugData.reset(nullptr);
-    for (auto &device : program->getDevices()) {
-        program->notifyDebuggerWithDebugData(device);
+    for (auto &kernelInfo : buildInfo.kernelInfoArray) {
+        kernelInfo->createKernelAllocation(pClDevice->getDevice(), false);
     }
-    EXPECT_TRUE(program->wasCreateDebugZebinCalled);
-    EXPECT_FALSE(program->wasProcessDebugDataCalled);
-    EXPECT_NE(nullptr, program->buildInfos[rootDeviceIndex].debugData);
-    EXPECT_GT(program->buildInfos[rootDeviceIndex].debugDataSize, 0u);
 
-    EXPECT_EQ(1u, sourceLevelDebugger->notifyKernelDebugDataCalled);
+    NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> fun0Symbol;
+    fun0Symbol.gpuAddress = 0x1234;
+    fun0Symbol.symbol.size = 16;
+    fun0Symbol.symbol.segment = NEO::SegmentType::instructions;
+    buildInfo.symbols["fun0"] = fun0Symbol;
+
+    NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> fun1Symbol;
+    fun1Symbol.gpuAddress = 0x5678;
+    fun1Symbol.symbol.size = 16;
+    fun1Symbol.symbol.segment = NEO::SegmentType::instructions;
+    buildInfo.symbols["fun1"] = fun1Symbol;
+
+    program->dumpKernelInfoToAubComments();
+
+    auto &comments = aubManager->receivedComments;
+
+    // <KernelInfo> tag exists
+    auto kernelInfoPos = comments.find("<KernelInfo>");
+    EXPECT_NE(std::string::npos, kernelInfoPos);
+
+    // <ExportedSymbols> tag exists
+    auto exportedSymbolsPos = comments.find("<ExportedSymbols>");
+    EXPECT_NE(std::string::npos, exportedSymbolsPos);
+
+    // <BuildOptions> tag doesn't exist (options are empty)
+    auto buildOptionsPos = comments.find("<BuildOptions>");
+    EXPECT_EQ(std::string::npos, buildOptionsPos);
+
+    // <Zeinfo> tag exists
+    auto zeInfoPos = comments.find("<Zeinfo>");
+    EXPECT_NE(std::string::npos, zeInfoPos);
+
+    // correct ordering: <KernelInfo> before <ExportedSymbols> before <Zeinfo>
+    EXPECT_LT(kernelInfoPos, exportedSymbolsPos);
+    EXPECT_LT(exportedSymbolsPos, zeInfoPos);
+
+    // kernel names exist between <KernelInfo> and <ExportedSymbols>
+    auto kernelInfoSection = comments.substr(kernelInfoPos, exportedSymbolsPos - kernelInfoPos);
+    EXPECT_NE(std::string::npos, kernelInfoSection.find("name: kernel"));
+    EXPECT_NE(std::string::npos, kernelInfoSection.find("name: Intel_Symbol_Table_Void_Program"));
+
+    // exported symbol names exist between <ExportedSymbols> and <Zeinfo>
+    auto exportedSymbolsSection = comments.substr(exportedSymbolsPos, zeInfoPos - exportedSymbolsPos);
+    EXPECT_NE(std::string::npos, exportedSymbolsSection.find("name: fun0"));
+    EXPECT_NE(std::string::npos, exportedSymbolsSection.find("name: fun1"));
+
+    // zeinfo content exists after <Zeinfo>
+    auto zeInfoSection = comments.substr(zeInfoPos);
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: kernel"));
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: Intel_Symbol_Table_Void_Program"));
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: fun0"));
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: fun1"));
+
+    {
+        // no exported symbols, add build options, add implicit args
+        aubManager->receivedComments.clear();
+
+        std::string testBuildOptions = "-ze-opt-disable -ze-opt-greater-than-4GB-buffer-required";
+        program->options = testBuildOptions;
+        buildInfo.symbols.clear();
+
+        program->indirectAccessBufferMajorVersion = 1;
+        buildInfo.kernelInfoArray[0]->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs = true;
+
+        program->dumpKernelInfoToAubComments();
+
+        // <ImplicitArgs> tag exists
+        auto implicitArgsPos = comments.find("<ImplicitArgs>");
+        EXPECT_NE(std::string::npos, implicitArgsPos);
+
+        // V1 layout
+        EXPECT_NE(std::string::npos, comments.find("struct ImplicitArgsV1:"));
+        EXPECT_NE(std::string::npos, comments.find("Aligned size:"));
+
+        // kernel uses implicit args exists
+        EXPECT_NE(std::string::npos, comments.find("Kernel uses implicit args"));
+
+        // <KernelInfo> tag exists
+        auto kernelInfoPos = comments.find("<KernelInfo>");
+        EXPECT_NE(std::string::npos, kernelInfoPos);
+
+        // <ExportedSymbols> tag doesn't exist
+        auto exportedSymbolsPos = comments.find("<ExportedSymbols>");
+        EXPECT_EQ(std::string::npos, exportedSymbolsPos);
+
+        // <BuildOptions> tag exists
+        auto buildOptionsPos = comments.find("<BuildOptions>");
+        EXPECT_NE(std::string::npos, buildOptionsPos);
+
+        // build options content present
+        EXPECT_NE(std::string::npos, comments.find(testBuildOptions));
+
+        // <Zeinfo> tag exists
+        auto zeInfoPos = comments.find("<Zeinfo>");
+        EXPECT_NE(std::string::npos, zeInfoPos);
+
+        // correct ordering: <ImplicitArgs>, <KernelInfo>, <BuildOptions>, <Zeinfo>
+        EXPECT_LT(implicitArgsPos, kernelInfoPos);
+        EXPECT_LT(kernelInfoPos, buildOptionsPos);
+        EXPECT_LT(buildOptionsPos, zeInfoPos);
+    }
+
+    auto memoryManager = pDevice->getMemoryManager();
+    for (auto &kernelInfo : buildInfo.kernelInfoArray) {
+        if (kernelInfo->getIsaGraphicsAllocation()) {
+            memoryManager->freeGraphicsMemory(kernelInfo->getIsaGraphicsAllocation());
+        }
+        delete kernelInfo;
+    }
 }

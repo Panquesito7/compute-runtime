@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,11 @@
 
 #include "level_zero/tools/source/sysman/fabric_port/fabric_port.h"
 
-#include "shared/source/helpers/basic_math.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/debug_helpers.h"
 
 #include "level_zero/tools/source/sysman/fabric_port/fabric_port_imp.h"
+#include "level_zero/tools/source/sysman/fabric_port/os_fabric_port.h"
 
 namespace L0 {
 
@@ -54,6 +55,20 @@ ze_result_t FabricPortHandleContext::fabricPortGet(uint32_t *pCount, zes_fabric_
         }
     }
     return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t FabricPortHandleContext::fabricPortGetMultiPortThroughput(uint32_t numPorts, zes_fabric_port_handle_t *phPort, zes_fabric_port_throughput_t **pThroughput) {
+    if (!numPorts) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Invalid number of ports \n", NEO_FUNCTION_NAME);
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    std::vector<zes_fabric_port_id_t> portIds = {};
+    zes_fabric_port_properties_t pProperties = {};
+    for (uint32_t i = 0; i < numPorts; i++) {
+        L0::FabricPort::fromHandle(phPort[i])->fabricPortGetProperties(&pProperties);
+        portIds.push_back(pProperties.portId);
+    }
+    return pFabricDevice->getOsFabricDevice()->getMultiPortThroughput(portIds, pThroughput);
 }
 
 } // namespace L0

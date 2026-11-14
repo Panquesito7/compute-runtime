@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,12 @@
 
 #include "shared/test/common/fixtures/command_stream_receiver_fixture.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/command_stream/preemption.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
+
+#include "gtest/gtest.h"
 
 using namespace NEO;
 
@@ -17,7 +20,7 @@ void CommandStreamReceiverFixture::setUp() {
     DeviceFixture::setUp();
 
     commandStream.replaceBuffer(cmdBuffer, bufferSize);
-    auto graphicsAllocation = new MockGraphicsAllocation(cmdBuffer, bufferSize);
+    auto graphicsAllocation = new MockGraphicsAllocation(cmdBuffer, cmdBufferGpuAddress, bufferSize);
     commandStream.replaceGraphicsAllocation(graphicsAllocation);
 
     dsh.replaceBuffer(dshBuffer, bufferSize);
@@ -33,6 +36,18 @@ void CommandStreamReceiverFixture::setUp() {
     ssh.replaceGraphicsAllocation(graphicsAllocation);
 
     flushTaskFlags.preemptionMode = PreemptionHelper::getDefaultPreemptionMode(pDevice->getHardwareInfo());
+
+    requiredStreamProperties.initSupport(pDevice->getRootDeviceEnvironment());
+    immediateFlushTaskFlags.requiredState = &requiredStreamProperties;
+    immediateFlushTaskFlags.sshCpuBase = sshBuffer;
+    immediateFlushTaskFlags.dispatchOperation = NEO::AppendOperations::kernel;
+
+    if (pDevice->getPreemptionMode() == NEO::PreemptionMode::MidThread) {
+        auto &commandStreamReceiver = pDevice->getGpgpuCommandStreamReceiver();
+        if (!commandStreamReceiver.getPreemptionAllocation()) {
+            ASSERT_TRUE(commandStreamReceiver.createPreemptionAllocation());
+        }
+    }
 }
 
 void CommandStreamReceiverFixture::tearDown() {

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -29,48 +29,70 @@ if(NOT DEFINED L0_BLACK_BOX_OCLOC_HEADER_DIR)
 endif()
 
 target_link_libraries(${L0_BLACK_BOX_TEST_SHARED_LIB} PUBLIC ocloc_lib)
-target_include_directories(${L0_BLACK_BOX_TEST_SHARED_LIB} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common ${L0_BLACK_BOX_OCLOC_HEADER_DIR})
+target_include_directories(${L0_BLACK_BOX_TEST_SHARED_LIB} PUBLIC
+                           ${CMAKE_CURRENT_SOURCE_DIR}/common
+                           ${L0_BLACK_BOX_OCLOC_HEADER_DIR}
+                           ${NEO_SOURCE_DIR}/level_zero/include
+)
 
 set_target_properties(${L0_BLACK_BOX_TEST_SHARED_LIB} PROPERTIES FOLDER ${L0_BLACK_BOX_TEST_PROJECT_FOLDER})
 
 set(TEST_TARGETS
+    zello_arg_slm
+    zello_atomic_inc
+    zello_bindless_kernel
     zello_commandlist_immediate
     zello_copy
+    zello_dp_support
     zello_copy_fence
     zello_copy_image
     zello_copy_kernel_printf
     zello_copy_only
-    zello_copy_tracing
     zello_debug_info
     zello_dynamic_link
+    zello_modules_package
     zello_dyn_local_arg
     zello_events
     zello_fence
     zello_fill
     zello_function_pointers_cl
+    zello_global_bindless_kernel
+    zello_graph
+    zello_graph_gemm_submit
+    zello_overcommit
+    zello_visit
+    zello_host_function
     zello_host_pointer
     zello_image
     zello_image_view
     zello_immediate
     zello_ipc_copy_dma_buf
     zello_ipc_copy_dma_buf_p2p
+    zello_ipc_reserved_physical_offset
+    zello_ipc_range
+    zello_ipc_event_pool_p2p
+    zello_memFree_callback
     zello_multidev
     zello_printf
     zello_p2p_copy
+    zello_query_apis
     zello_sandbox
     zello_scratch
+    zello_stress_commandlist
     zello_timestamp
+    zello_usablemem_properties
     zello_world_global_work_offset
     zello_world_gpu
     zello_world_jitc_ocloc
     zello_world_usm
     zello_fabric
+    zello_opencl_interop
 )
 
 include_directories(common)
 
 foreach(TEST_NAME ${TEST_TARGETS})
-  if(MSVC)
+  if(WIN32)
     if(${TEST_NAME} STREQUAL "zello_host_ipc_copy_dma_buf")
       continue()
     endif()
@@ -78,6 +100,15 @@ foreach(TEST_NAME ${TEST_TARGETS})
       continue()
     endif()
     if(${TEST_NAME} STREQUAL "zello_ipc_copy_dma_buf_p2p")
+      continue()
+    endif()
+    if(${TEST_NAME} STREQUAL "zello_ipc_reserved_physical_offset")
+      continue()
+    endif()
+    if(${TEST_NAME} STREQUAL "zello_ipc_range")
+      continue()
+    endif()
+    if(${TEST_NAME} STREQUAL "zello_ipc_event_pool_p2p")
       continue()
     endif()
     if(${TEST_NAME} STREQUAL "zello_export_import_memory")
@@ -89,9 +120,19 @@ foreach(TEST_NAME ${TEST_TARGETS})
     if(${TEST_NAME} STREQUAL "zello_ipc_event")
       continue()
     endif()
+    if(${TEST_NAME} STREQUAL "zello_opencl_interop")
+      continue()
+    endif()
   endif()
 
-  add_executable(${TEST_NAME} ${TEST_NAME}.cpp)
+  set(EXTRA_SOURCES "")
+  if(${TEST_NAME} STREQUAL "zello_bindless_kernel")
+    set(EXTRA_SOURCES ${NEO_SOURCE_DIR}/level_zero/core/source/image/image_format_desc_helper.cpp)
+  endif()
+
+  add_executable(${TEST_NAME} ${TEST_NAME}.cpp
+                 ${EXTRA_SOURCES}
+  )
 
   set_target_properties(${TEST_NAME}
                         PROPERTIES
@@ -100,8 +141,18 @@ foreach(TEST_NAME ${TEST_TARGETS})
                         VS_DEBUGGER_WORKING_DIRECTORY "${TargetDir}"
   )
 
-  add_dependencies(${TEST_NAME} ${TARGET_NAME_L0})
-  target_link_libraries(${TEST_NAME} PUBLIC ${TARGET_NAME_L0})
+  target_link_libraries(${TEST_NAME} PUBLIC ${L0_LOADER_LIBRARY})
+
+  if(${TEST_NAME} STREQUAL "zello_opencl_interop")
+    if(NOT L0_BLACK_BOX_TEST_USE_DRIVER)
+      find_library(NEO_OPENCL_ICD_LOADER_LIBRARY NAMES OpenCL libOpenCL.so.1)
+      if(NEO_OPENCL_ICD_LOADER_LIBRARY)
+        target_link_libraries(${TEST_NAME} PUBLIC ${NEO_OPENCL_ICD_LOADER_LIBRARY})
+      else()
+        message(FATAL_ERROR "OpenCL ICD loader not found, cannot build zello_opencl_interop")
+      endif()
+    endif()
+  endif()
 
   set_target_properties(${TEST_NAME} PROPERTIES FOLDER ${L0_BLACK_BOX_TEST_PROJECT_FOLDER})
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 #include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/memory_manager/surface.h"
 
 #include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
@@ -107,25 +108,19 @@ cl_int CommandQueueHw<GfxFamily>::enqueueKernel(
         if (kernel.hasPrintfOutput()) {
             context->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, PRINTF_DETECTED_IN_KERNEL, kernelInfo.kernelDescriptor.kernelMetadata.kernelName.c_str());
         }
-        if (kernel.requiresCoherency()) {
-            context->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, KERNEL_REQUIRES_COHERENCY, kernelInfo.kernelDescriptor.kernelMetadata.kernelName.c_str());
-        }
     }
 
     if (kernelInfo.builtinDispatchBuilder != nullptr) {
         cl_int err = kernelInfo.builtinDispatchBuilder->validateDispatch(&kernel, workDim, Vec3<size_t>(region), Vec3<size_t>(workGroupSize), Vec3<size_t>(globalWorkOffset));
-        if (err != CL_SUCCESS)
+        if (err != CL_SUCCESS) {
             return err;
+        }
     }
 
     DBG_LOG(PrintDispatchParameters, "Kernel: ", kernelInfo.kernelDescriptor.kernelMetadata.kernelName,
-            ",LWS:, ", localWorkSizeIn ? localWorkSizeIn[0] : 0,
-            ",", localWorkSizeIn ? localWorkSizeIn[1] : 0,
-            ",", localWorkSizeIn ? localWorkSizeIn[2] : 0,
-            ",GWS:,", globalWorkSizeIn[0],
-            ",", globalWorkSizeIn[1],
-            ",", globalWorkSizeIn[2],
-            ",SIMD:, ", kernelInfo.getMaxSimdSize());
+            ", LWS: ", localWorkSizeIn ? localWorkSizeIn[0] : 0, ", ", localWorkSizeIn ? localWorkSizeIn[1] : 0, ", ", localWorkSizeIn ? localWorkSizeIn[2] : 0,
+            ", GWS: ", globalWorkSizeIn[0], ", ", globalWorkSizeIn[1], ", ", globalWorkSizeIn[2],
+            ", SIMD: ", kernelInfo.getMaxSimdSize());
 
     if (totalWorkItems > kernel.getMaxKernelWorkGroupSize()) {
         return CL_INVALID_WORK_GROUP_SIZE;

@@ -1,46 +1,165 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/aub/aub_center.h"
 #include "shared/source/command_container/encode_surface_state.h"
 #include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/compiler_interface/compiler_warnings/compiler_warnings.h"
 #include "shared/source/compiler_interface/external_functions.h"
+#include "shared/source/compiler_interface/intermediate_representations.h"
 #include "shared/source/device_binary_format/ar/ar_encoder.h"
 #include "shared/source/device_binary_format/zebin/debug_zebin.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
 #include "shared/source/helpers/addressing_mode_helper.h"
+#include "shared/source/helpers/bindless_heaps_helper.h"
 #include "shared/source/helpers/blit_helper.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/kernel/implicit_args.h"
+#include "shared/source/helpers/kernel_helpers.h"
+#include "shared/source/helpers/product_config_helper.h"
+#include "shared/source/kernel/implicit_args_helper.h"
+#include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/os_interface/os_inc_base.h"
 #include "shared/source/program/kernel_info.h"
+#include "shared/source/utilities/isa_pool_allocator.h"
 #include "shared/test/common/compiler_interface/linker_mock.h"
-#include "shared/test/common/device_binary_format/patchtokens_tests.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/implicit_args_test_helper.h"
+#include "shared/test/common/helpers/instruction_cache_flush_test_engines.h"
+#include "shared/test/common/helpers/mock_file_io.h"
+#include "shared/test/common/helpers/stream_capture.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_aub_manager.h"
+#include "shared/test/common/mocks/mock_compiler_interface.h"
+#include "shared/test/common/mocks/mock_compiler_product_helper.h"
+#include "shared/test/common/mocks/mock_compilers.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_elf.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_l0_debugger.h"
+#include "shared/test/common/mocks/mock_memory_operations_handler.h"
 #include "shared/test/common/mocks/mock_modules_zebin.h"
-#include "shared/test/common/mocks/mock_source_level_debugger.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
+#include "shared/test/common/mocks/mock_usm_memory_pool.h"
+#include "shared/test/common/mocks/mock_zebin_wrapper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/api/core/ze_module_api_entrypoints.h"
+#include "level_zero/api/internal/l0_module.h"
+#include "level_zero/core/source/context/context.h"
 #include "level_zero/core/source/kernel/kernel_imp.h"
+#include "level_zero/core/source/module/internal_core_program_ext.h"
 #include "level_zero/core/source/module/module_build_log.h"
 #include "level_zero/core/source/module/module_imp.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_device.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_module.h"
+#include "level_zero/driver_experimental/zex_module.h"
+
+#include "platforms.h"
+
+#include <algorithm>
 
 namespace L0 {
 namespace ult {
 
 using ModuleTest = Test<ModuleFixture>;
+
+TEST_F(ModuleTest, givenValidModuleHandleWhenCallingZeModuleGetDeviceHandleThenParentDeviceHandleReturned) {
+    ze_device_handle_t deviceHandle = nullptr;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ::zeModuleGetDeviceHandle(module->toHandle(), &deviceHandle));
+    EXPECT_EQ(device->toHandle(), deviceHandle);
+}
+
+TEST_F(ModuleTest, givenNullModuleHandleWhenCallingZeModuleGetDeviceHandleThenInvalidNullHandleReturned) {
+    ze_device_handle_t deviceHandle = nullptr;
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NULL_HANDLE, ::zeModuleGetDeviceHandle(nullptr, &deviceHandle));
+}
+
+TEST_F(ModuleTest, givenNullDeviceHandlePointerWhenCallingZeModuleGetDeviceHandleThenInvalidNullPointerReturned) {
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NULL_POINTER, ::zeModuleGetDeviceHandle(module->toHandle(), nullptr));
+}
+
+TEST_F(ModuleTest, GivenGeneralRegisterFileDescriptorWhenGetKernelPropertiesIsCalledThenDescriptorIsCorrectlySet) {
+    zex_device_module_register_file_exp_t descriptor{ZEX_STRUCTURE_DEVICE_MODULE_REGISTER_FILE_EXP};
+    ze_device_module_properties_t properties{};
+    properties.pNext = &descriptor;
+
+    const auto &productHelper = getHelper<ProductHelper>();
+    const auto correctRegisterFileSizes = productHelper.getSupportedNumGrfs(device->getNEODevice()->getReleaseHelper());
+    const auto correctRegisterFileSizesCount = static_cast<uint32_t>(correctRegisterFileSizes.size());
+    std::array<std::pair<uint32_t, uint32_t>, 3> testParams = {{{0u, correctRegisterFileSizesCount},
+                                                                {correctRegisterFileSizesCount - 1u, correctRegisterFileSizesCount - 1u},
+                                                                {correctRegisterFileSizesCount + 1u, correctRegisterFileSizesCount}}};
+
+    for (const auto &[registerFileSizesCount, expectedRegisterFileSizesCount] : testParams) {
+        if (expectedRegisterFileSizesCount == 0u) {
+            continue;
+        }
+
+        std::unique_ptr<uint32_t[]> registerSizes;
+
+        descriptor.registerFileSizesCount = registerFileSizesCount;
+        descriptor.registerFileSizes = nullptr;
+        if (registerFileSizesCount != 0u) {
+            registerSizes = std::make_unique<uint32_t[]>(registerFileSizesCount);
+            descriptor.registerFileSizes = registerSizes.get();
+        }
+
+        ze_result_t result = device->getKernelProperties(&properties);
+        EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+
+        if (descriptor.registerFileSizes == nullptr) {
+            registerSizes = std::make_unique<uint32_t[]>(descriptor.registerFileSizesCount);
+            descriptor.registerFileSizes = registerSizes.get();
+
+            result = device->getKernelProperties(&properties);
+            EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+        }
+
+        const std::vector<uint32_t> expectedRegisterFileSizes(correctRegisterFileSizes.begin(), correctRegisterFileSizes.begin() + expectedRegisterFileSizesCount);
+        const std::vector<uint32_t> queriedRegisterFileSizes(descriptor.registerFileSizes, descriptor.registerFileSizes + descriptor.registerFileSizesCount);
+        EXPECT_EQ(expectedRegisterFileSizesCount, descriptor.registerFileSizesCount);
+        EXPECT_EQ(expectedRegisterFileSizes, queriedRegisterFileSizes);
+
+        descriptor = {ZEX_STRUCTURE_DEVICE_MODULE_REGISTER_FILE_EXP};
+    }
+}
+
+TEST_F(ModuleTest, GivenKernelRegisterFileDescriptorWhenGetPropertiesIsCalledThenDescriptorIsCorrectlySet) {
+    createKernel();
+
+    zex_kernel_register_file_size_exp_t descriptor{ZEX_STRUCTURE_KERNEL_REGISTER_FILE_SIZE_EXP};
+    ze_kernel_properties_t properties{};
+    properties.pNext = &descriptor;
+
+    ze_result_t result = kernel->getProperties(&properties);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+
+    const auto &kernelDescriptor = kernel->getKernelDescriptor();
+    EXPECT_EQ(kernelDescriptor.kernelAttributes.numGrfRequired, descriptor.registerFileSize);
+}
+
+TEST_F(ModuleTest, GivenBfloat16AtomicPropertiesWhenGetKernelPropertiesIsCalledThenCorrectPropertiesFromCapsAreReturnedOrNone) {
+    zex_bfloat16_atomic_ext_properties_t bfloat16Properties{ZEX_STRUCTURE_TYPE_BFLOAT16_ATOMIC_EXT_PROPERTIES};
+    ze_device_module_properties_t properties{};
+    properties.pNext = &bfloat16Properties;
+
+    const auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    uint32_t bFloat16AtomicCapabilities = hwInfo.caps.kernelBFloat16AtomicCapabilities;
+
+    ze_result_t result = device->getKernelProperties(&properties);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(bFloat16AtomicCapabilities, bfloat16Properties.bfloat16Flags);
+}
 
 HWTEST_F(ModuleTest, givenBinaryWithDebugDataWhenModuleCreatedFromNativeBinaryThenDebugDataIsStored) {
     size_t size = 0;
@@ -72,7 +191,7 @@ HWTEST_F(ModuleTest, givenZeroCountWhenGettingKernelNamesThenCountIsFilled) {
     auto result = module->getKernelNames(&count, nullptr);
 
     auto whiteboxModule = whiteboxCast(module.get());
-    EXPECT_EQ(whiteboxModule->kernelImmDatas.size(), count);
+    EXPECT_EQ(whiteboxModule->kernelImmData.size(), count);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
@@ -88,32 +207,132 @@ HWTEST_F(ModuleTest, givenNonZeroCountWhenGettingKernelNamesThenNamesAreReturned
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
 
+HWTEST_F(ModuleTest, givenCountGreaterThanNumberOfKernelsWhenCallingZeModuleGetKernelNamesThenCountIsClampedAndNamesAreReturned) {
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ::zeModuleGetKernelNames(module->toHandle(), &count, nullptr));
+    ASSERT_NE(0u, count);
+
+    uint32_t requestedCount = count + 1;
+    std::vector<const char *> kernelNames(requestedCount, nullptr);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, ::zeModuleGetKernelNames(module->toHandle(), &requestedCount, kernelNames.data()));
+
+    EXPECT_EQ(count, requestedCount);
+    auto whiteboxModule = whiteboxCast(module.get());
+    for (uint32_t i = 0; i < count; i++) {
+        EXPECT_STREQ(whiteboxModule->kernelImmData[i]->getDescriptor().kernelMetadata.kernelName.c_str(), kernelNames[i]);
+    }
+    EXPECT_EQ(nullptr, kernelNames[count]);
+}
+
 HWTEST_F(ModuleTest, givenUserModuleTypeWhenCreatingModuleThenCorrectTypeIsSet) {
-    WhiteBox<Module> module(device, nullptr, ModuleType::User);
-    EXPECT_EQ(ModuleType::User, module.type);
+    WhiteBox<Module> module(device, nullptr, ModuleType::user);
+    EXPECT_EQ(ModuleType::user, module.type);
 }
 
 HWTEST_F(ModuleTest, givenBuiltinModuleTypeWhenCreatingModuleThenCorrectTypeIsSet) {
-    WhiteBox<Module> module(device, nullptr, ModuleType::Builtin);
-    EXPECT_EQ(ModuleType::Builtin, module.type);
+    WhiteBox<Module> module(device, nullptr, ModuleType::builtin);
+    EXPECT_EQ(ModuleType::builtin, module.type);
 }
 
 HWTEST_F(ModuleTest, givenUserModuleWhenCreatedThenCorrectAllocationTypeIsUsedForIsa) {
     createKernel();
-    EXPECT_EQ(NEO::AllocationType::KERNEL_ISA, kernel->getIsaAllocation()->getAllocationType());
+    EXPECT_EQ(NEO::AllocationType::kernelIsa, kernel->getIsaAllocation()->getAllocationType());
+}
+
+template <bool localMemEnabled>
+struct ModuleKernelIsaAllocationsFixture : public ModuleFixture {
+    using Module = WhiteBox<::L0::Module>;
+
+    void setUp() {
+        this->dbgRestorer = std::make_unique<DebugManagerStateRestore>();
+        debugManager.flags.EnableLocalMemory.set(localMemEnabled);
+        ModuleFixture::setUp();
+
+        ModuleBuildLog *moduleBuildLog = nullptr;
+        auto type = ModuleType::user;
+        this->module.reset(new Mock<Module>{device, moduleBuildLog, type});
+
+        zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
+        const auto &src = zebinData->storage;
+        this->moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+        this->moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+        this->moduleDesc.inputSize = src.size();
+
+        this->mockModule = static_cast<Mock<Module> *>(this->module.get());
+    }
+
+    void givenIsaMemoryRegionSharedBetweenKernelsWhenGraphicsAllocationFailsThenProperErrorReturned() {
+        // Fill current pool so next request will try to allocate
+        auto alloc = device->getNEODevice()->getIsaPoolAllocator().requestGraphicsAllocationForIsa(false, MemoryConstants::pageSize2M * 2);
+
+        auto memoryManager = reinterpret_cast<MockMemoryManager *>(device->getNEODevice()->getMemoryManager());
+        memoryManager->failInDevicePoolWithError = true;
+        auto result = module->initialize(&this->moduleDesc, device->getNEODevice());
+        EXPECT_EQ(result, ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+        device->getNEODevice()->getIsaPoolAllocator().freeSharedIsaAllocation(alloc);
+    }
+
+    Mock<Module> *mockModule = nullptr;
+    ze_module_desc_t moduleDesc = {};
+    std::unique_ptr<DebugManagerStateRestore> dbgRestorer = nullptr;
+};
+
+using ModuleKernelIsaAllocationsInLocalMemoryTests = Test<ModuleKernelIsaAllocationsFixture<true>>;
+
+HWTEST_F(ModuleKernelIsaAllocationsInLocalMemoryTests, givenIsaMemoryRegionSharedBetweenKernelsWhenGraphicsAllocationFailsThenProperErrorReturned) {
+    this->givenIsaMemoryRegionSharedBetweenKernelsWhenGraphicsAllocationFailsThenProperErrorReturned();
+}
+
+using ModuleKernelIsaAllocationsInSharedMemoryTests = Test<ModuleKernelIsaAllocationsFixture<false>>;
+
+HWTEST_F(ModuleKernelIsaAllocationsInSharedMemoryTests, givenIsaMemoryRegionSharedBetweenKernelsWhenGraphicsAllocationFailsThenProperErrorReturned) {
+    this->givenIsaMemoryRegionSharedBetweenKernelsWhenGraphicsAllocationFailsThenProperErrorReturned();
+}
+
+HWTEST_F(ModuleKernelIsaAllocationsInLocalMemoryTests, givenSeparateIsaMemoryRegionPerKernelWhenGraphicsAllocationFailsThenProperErrorReturned) {
+    // Enable debugger to force per-kernel allocations
+    auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
+    neoDevice->getRootDeviceEnvironmentRef().debugger.reset(debugger);
+    char kernelHeap[MemoryConstants::pageSize] = {};
+    auto kernelInfo = std::make_unique<NEO::KernelInfo>();
+    kernelInfo->heapInfo.pKernelHeap = kernelHeap;
+    kernelInfo->heapInfo.kernelHeapSize = 0x100;
+    mockModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
+    auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
+    mockModule->kernelImmData.push_back(std::move(kernelImmData));
+    mockModule->allocateKernelsIsaMemoryCallBase = false;
+    auto result = mockModule->setIsaGraphicsAllocations();
+    EXPECT_EQ(result, ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+HWTEST_F(ModuleKernelIsaAllocationsInSharedMemoryTests, givenSeparateIsaMemoryRegionPerKernelWhenGraphicsAllocationFailsThenProperErrorReturned) {
+    // Enable debugger to force per-kernel allocations
+    auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
+    neoDevice->getRootDeviceEnvironmentRef().debugger.reset(debugger);
+    char kernelHeap[MemoryConstants::pageSize] = {};
+    auto kernelInfo = std::make_unique<NEO::KernelInfo>();
+    kernelInfo->heapInfo.pKernelHeap = kernelHeap;
+    kernelInfo->heapInfo.kernelHeapSize = 0x100;
+    mockModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
+    auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
+    mockModule->kernelImmData.push_back(std::move(kernelImmData));
+    mockModule->allocateKernelsIsaMemoryCallBase = false;
+    auto result = mockModule->setIsaGraphicsAllocations();
+    EXPECT_EQ(result, ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
 }
 
 HWTEST_F(ModuleTest, givenBuiltinModuleWhenCreatedThenCorrectAllocationTypeIsUsedForIsa) {
-    createModuleFromMockBinary(ModuleType::Builtin);
+    this->module.reset();
+    createModuleFromMockBinary(ModuleType::builtin);
     createKernel();
-    EXPECT_EQ(NEO::AllocationType::KERNEL_ISA_INTERNAL, kernel->getIsaAllocation()->getAllocationType());
+    EXPECT_EQ(NEO::AllocationType::kernelIsaInternal, kernel->getIsaAllocation()->getAllocationType());
 }
 
 HWTEST_F(ModuleTest, givenBlitterAvailableWhenCopyingPatchedSegmentsThenIsaIsTransferredToAllocationWithBlitter) {
 
     auto hwInfo = *NEO::defaultHwInfo;
     hwInfo.featureTable.flags.ftrLocalMemory = true;
-    auto executionEnvironment = MockDevice::prepareExecutionEnvironment(&hwInfo, 0u);
+    auto executionEnvironment = NEO::MockDevice::prepareExecutionEnvironment(&hwInfo, 0u);
     executionEnvironment->memoryManager.reset(new MockMemoryManager(false, true, false, *executionEnvironment));
 
     uint32_t blitterCalled = 0;
@@ -121,13 +340,13 @@ HWTEST_F(ModuleTest, givenBlitterAvailableWhenCopyingPatchedSegmentsThenIsaIsTra
                                           Vec3<size_t> size) -> NEO::BlitOperationResult {
         memcpy(memory->getUnderlyingBuffer(), hostPtr, size.x);
         blitterCalled++;
-        return BlitOperationResult::Success;
+        return BlitOperationResult::success;
     };
     VariableBackup<NEO::BlitHelperFunctions::BlitMemoryToAllocationFunc> blitMemoryToAllocationFuncBackup(
         &NEO::BlitHelperFunctions::blitMemoryToAllocation, mockBlitMemoryToAllocation);
 
     auto *neoMockDevice = NEO::MockDevice::createWithExecutionEnvironment<NEO::MockDevice>(&hwInfo, executionEnvironment, 0);
-    Mock<L0::DeviceImp> device(neoMockDevice, neoMockDevice->getExecutionEnvironment());
+    MockDeviceImp device(neoMockDevice);
     device.driverHandle = driverHandle.get();
 
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device.getHwInfo());
@@ -140,7 +359,7 @@ HWTEST_F(ModuleTest, givenBlitterAvailableWhenCopyingPatchedSegmentsThenIsaIsTra
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::make_unique<L0::ModuleImp>(&device, moduleBuildLog, ModuleType::User);
+    auto module = std::make_unique<L0::ModuleImp>(&device, moduleBuildLog, ModuleType::user);
     ASSERT_NE(nullptr, module.get());
 
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
@@ -156,15 +375,19 @@ HWTEST_F(ModuleTest, givenBlitterAvailableWhenCopyingPatchedSegmentsThenIsaIsTra
     auto &productHelper = device.getProductHelper();
     auto &rootDeviceEnvironment = device.getNEODevice()->getRootDeviceEnvironment();
     if (productHelper.isBlitCopyRequiredForLocalMemory(rootDeviceEnvironment, *module->getKernelImmutableDataVector()[0]->getIsaGraphicsAllocation())) {
-        EXPECT_EQ(zebinData->numOfKernels, blitterCalled);
+        if (module->getKernelsIsaParentAllocation()) {
+            EXPECT_EQ(1u, blitterCalled);
+        } else {
+            EXPECT_EQ(zebinData->numOfKernels, blitterCalled);
+        }
     } else {
         EXPECT_EQ(0u, blitterCalled);
     }
 }
 
-using ModuleTestSupport = IsWithinProducts<IGFX_SKYLAKE, IGFX_TIGERLAKE_LP>;
+using ModuleTestSupport = IsGen12LP;
 
-HWTEST2_F(ModuleTest, givenNonPatchedTokenThenSurfaceBaseAddressIsCorrectlySet, ModuleTestSupport) {
+HWTEST2_PRODUCT_F(ModuleTest, givenNonPatchedTokenThenSurfaceBaseAddressIsCorrectlySet, ModuleTestSupport) {
     using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
     ze_kernel_handle_t kernelHandle;
 
@@ -181,7 +404,7 @@ HWTEST2_F(ModuleTest, givenNonPatchedTokenThenSurfaceBaseAddressIsCorrectlySet, 
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     ASSERT_EQ(ZE_RESULT_SUCCESS, res);
@@ -196,7 +419,9 @@ HWTEST2_F(ModuleTest, givenNonPatchedTokenThenSurfaceBaseAddressIsCorrectlySet, 
     auto surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
     auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
     EXPECT_EQ(devicePtr, reinterpret_cast<void *>(surfaceStateAddress->getSurfaceBaseAddress()));
-    EXPECT_EQ(RENDER_SURFACE_STATE::COHERENCY_TYPE_GPU_COHERENT, surfaceStateAddress->getCoherencyType());
+    if constexpr (IsAtMostXeCore::isMatched<productFamily>()) {
+        EXPECT_EQ(RENDER_SURFACE_STATE::COHERENCY_TYPE_GPU_COHERENT, surfaceStateAddress->getCoherencyType());
+    }
 
     Kernel::fromHandle(kernelHandle)->destroy();
 
@@ -204,7 +429,9 @@ HWTEST2_F(ModuleTest, givenNonPatchedTokenThenSurfaceBaseAddressIsCorrectlySet, 
 }
 
 HWTEST_F(ModuleTest, givenStatefulBufferWhenOffsetIsPatchedThenAllocBaseAddressIsSet) {
-    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getNEODevice()->getRootDeviceIndex()]->bindlessHeapsHelper.reset();
+
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
     ze_kernel_handle_t kernelHandle;
 
     ze_kernel_desc_t kernelDesc = {};
@@ -220,16 +447,19 @@ HWTEST_F(ModuleTest, givenStatefulBufferWhenOffsetIsPatchedThenAllocBaseAddressI
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     ASSERT_EQ(ZE_RESULT_SUCCESS, res);
 
     auto gpuAlloc = device->getDriverHandle()->getSvmAllocsManager()->getSVMAllocs()->get(devicePtr)->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
     ASSERT_NE(nullptr, gpuAlloc);
+    const auto gpuAllocAddress = gpuAlloc->getGpuAddress();
 
     uint32_t argIndex = 0u;
     uint32_t offset = 0x1234;
+
+    // Bindful arg
     const_cast<KernelDescriptor *>(&(kernelImp->getImmutableData()->getDescriptor()))->payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>().bufferOffset = 0;
     const_cast<KernelDescriptor *>(&(kernelImp->getImmutableData()->getDescriptor()))->payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>().bindful = 0x80;
     kernelImp->setBufferSurfaceState(argIndex, ptrOffset(devicePtr, offset), gpuAlloc);
@@ -237,7 +467,18 @@ HWTEST_F(ModuleTest, givenStatefulBufferWhenOffsetIsPatchedThenAllocBaseAddressI
     auto argInfo = kernelImp->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>();
     auto surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
     auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
-    EXPECT_EQ(devicePtr, reinterpret_cast<void *>(surfaceStateAddress->getSurfaceBaseAddress()));
+    EXPECT_EQ(gpuAllocAddress, surfaceStateAddress->getSurfaceBaseAddress());
+
+    // Bindless arg
+    surfaceStateAddress->setSurfaceBaseAddress(0);
+    const_cast<KernelDescriptor *>(&(kernelImp->getImmutableData()->getDescriptor()))->payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>() = ArgDescPointer();
+    const_cast<KernelDescriptor *>(&(kernelImp->getImmutableData()->getDescriptor()))->payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>().bufferOffset = 0x8;
+    const_cast<KernelDescriptor *>(&(kernelImp->getImmutableData()->getDescriptor()))->payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>().bindless = 0;
+    const_cast<KernelDescriptor *>(&(kernelImp->getImmutableData()->getDescriptor()))->bindlessArgsMap[0] = 0;
+    kernelImp->setBufferSurfaceState(argIndex, ptrOffset(devicePtr, offset), gpuAlloc);
+
+    surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(kernelImp->getSurfaceStateHeapData()));
+    EXPECT_EQ(gpuAllocAddress, surfaceStateAddress->getSurfaceBaseAddress());
 
     Kernel::fromHandle(kernelHandle)->destroy();
 
@@ -245,7 +486,7 @@ HWTEST_F(ModuleTest, givenStatefulBufferWhenOffsetIsPatchedThenAllocBaseAddressI
 }
 
 HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenPassedPtrIsSetAsBaseAddress) {
-    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
     ze_kernel_handle_t kernelHandle;
 
     ze_kernel_desc_t kernelDesc = {};
@@ -261,7 +502,7 @@ HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenPassedPtrIsSetAsBaseAd
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     ASSERT_EQ(ZE_RESULT_SUCCESS, res);
@@ -286,7 +527,7 @@ HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenPassedPtrIsSetAsBaseAd
     context->freeMem(devicePtr);
 }
 
-HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenSizeIsDecereasedByOffset) {
+HWTEST2_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenSizeIsDecreasedByOffset, SupportsLegacyRenderSurfaceState) {
     using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
     ze_kernel_handle_t kernelHandle;
 
@@ -298,7 +539,7 @@ HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenSizeIsDecereasedByOffs
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
     auto kernelImp = reinterpret_cast<L0::KernelImp *>(L0::Kernel::fromHandle(kernelHandle));
-    auto allocSize = 16384u;
+    auto allocSize = 16 * MemoryConstants::kiloByte;
     void *devicePtr = nullptr;
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
@@ -310,6 +551,7 @@ HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenSizeIsDecereasedByOffs
 
     auto gpuAlloc = device->getDriverHandle()->getSvmAllocsManager()->getSVMAllocs()->get(devicePtr)->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
     ASSERT_NE(nullptr, gpuAlloc);
+    const auto devicePtrOffsetInAlloc = ptrDiff(devicePtr, gpuAlloc->getGpuAddress());
 
     uint32_t argIndex = 0u;
     uint32_t offset = 0x1234;
@@ -321,8 +563,9 @@ HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenSizeIsDecereasedByOffs
     auto argInfo = kernelImp->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>();
     auto surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
     auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
-    SURFACE_STATE_BUFFER_LENGTH length = {0};
-    length.length = static_cast<uint32_t>((gpuAlloc->getUnderlyingBufferSize() - offset) - 1);
+    SurfaceStateBufferLength length = {0};
+    const auto totalOffset = offset + devicePtrOffsetInAlloc;
+    length.length = static_cast<uint32_t>((gpuAlloc->getUnderlyingBufferSize() - totalOffset) - 1);
     EXPECT_EQ(surfaceStateAddress->getWidth(), static_cast<uint32_t>(length.surfaceState.width + 1));
     EXPECT_EQ(surfaceStateAddress->getHeight(), static_cast<uint32_t>(length.surfaceState.height + 1));
     EXPECT_EQ(surfaceStateAddress->getDepth(), static_cast<uint32_t>(length.surfaceState.depth + 1));
@@ -332,7 +575,7 @@ HWTEST_F(ModuleTest, givenBufferWhenOffsetIsNotPatchedThenSizeIsDecereasedByOffs
     context->freeMem(devicePtr);
 }
 
-HWTEST_F(ModuleTest, givenUnalignedHostBufferWhenSurfaceStateProgrammedThenUnalignedSizeIsAdded) {
+HWTEST2_F(ModuleTest, givenUnalignedHostBufferWhenSurfaceStateProgrammedThenUnalignedSizeIsAdded, SupportsLegacyRenderSurfaceState) {
     using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
     ze_kernel_handle_t kernelHandle;
 
@@ -362,7 +605,7 @@ HWTEST_F(ModuleTest, givenUnalignedHostBufferWhenSurfaceStateProgrammedThenUnali
     auto argInfo = kernelImp->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[argIndex].as<NEO::ArgDescPointer>();
     auto surfaceStateAddressRaw = ptrOffset(kernelImp->getSurfaceStateHeapData(), argInfo.bindful);
     auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
-    SURFACE_STATE_BUFFER_LENGTH length = {0};
+    SurfaceStateBufferLength length = {0};
     length.length = alignUp(static_cast<uint32_t>((mockGa.getUnderlyingBufferSize() + allocationOffset)), alignment) - 1;
     EXPECT_EQ(surfaceStateAddress->getWidth(), static_cast<uint32_t>(length.surfaceState.width + 1));
     EXPECT_EQ(surfaceStateAddress->getHeight(), static_cast<uint32_t>(length.surfaceState.height + 1));
@@ -374,7 +617,7 @@ HWTEST_F(ModuleTest, givenUnalignedHostBufferWhenSurfaceStateProgrammedThenUnali
 using ModuleUncachedBufferTest = Test<ModuleFixture>;
 
 struct KernelImpUncachedTest : public KernelImp {
-    using KernelImp::kernelRequiresUncachedMocsCount;
+    using KernelImp::privateState;
 };
 
 HWTEST2_F(ModuleUncachedBufferTest,
@@ -394,7 +637,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
@@ -428,7 +671,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
     ze_device_mem_alloc_desc_t deviceDesc = {};
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
@@ -438,7 +681,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
 
     uint32_t argIndex = 0u;
     kernelImp->setKernelArgUncached(argIndex, true);
-    kernelImp->kernelRequiresUncachedMocsCount++;
+    kernelImp->privateState.kernelRequiresUncachedMocsCount++;
     kernelImp->setArgBufferWithAlloc(argIndex, reinterpret_cast<uintptr_t>(devicePtr), gpuAlloc, nullptr);
     EXPECT_FALSE(kernelImp->getKernelRequiresUncachedMocs());
 
@@ -465,7 +708,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
     deviceDesc.flags = ZE_DEVICE_MEM_ALLOC_FLAG_BIAS_UNCACHED;
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
@@ -501,7 +744,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
     deviceDesc.flags = ZE_DEVICE_MEM_ALLOC_FLAG_BIAS_UNCACHED;
     res = context->allocDeviceMem(device->toHandle(),
                                   &deviceDesc,
-                                  16384u,
+                                  16 * MemoryConstants::kiloByte,
                                   0u,
                                   &devicePtr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
@@ -511,7 +754,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
 
     uint32_t argIndex = 0u;
     kernelImp->setKernelArgUncached(argIndex, true);
-    kernelImp->kernelRequiresUncachedMocsCount++;
+    kernelImp->privateState.kernelRequiresUncachedMocsCount++;
     kernelImp->setArgBufferWithAlloc(argIndex, reinterpret_cast<uintptr_t>(devicePtr), gpuAlloc, nullptr);
     EXPECT_TRUE(kernelImp->getKernelRequiresUncachedMocs());
 
@@ -521,7 +764,7 @@ HWTEST2_F(ModuleUncachedBufferTest,
     EXPECT_EQ(devicePtr, reinterpret_cast<void *>(surfaceStateAddress->getSurfaceBaseAddress()));
 
     auto gmmHelper = device->getNEODevice()->getGmmHelper();
-    uint32_t expectedMocs = gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
+    uint32_t expectedMocs = gmmHelper->getUncachedMOCS();
 
     EXPECT_EQ(expectedMocs, surfaceStateAddress->getMemoryObjectControlState());
 
@@ -541,6 +784,130 @@ HWTEST_F(ModuleTest, GivenIncorrectNameWhenCreatingKernelThenResultErrorInvalidA
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_KERNEL_NAME, res);
 }
 
+struct DerivedModuleImp : public L0::ModuleImp {
+    using ModuleImp::kernelImmData;
+    using ModuleImp::translationUnit;
+    DerivedModuleImp(L0::Device *device) : ModuleImp(device, nullptr, ModuleType::user) {};
+    ~DerivedModuleImp() override = default;
+
+    bool canModulesShareIsaAllocation() {
+        size_t kernelsCount = this->kernelImmData.size();
+        size_t kernelsIsaTotalSize = 0lu;
+        for (auto i = 0lu; i < kernelsCount; i++) {
+            auto kernelInfo = this->translationUnit->programInfo.kernelInfos[i];
+            auto chunkSize = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*device->getNEODevice(), kernelInfo->heapInfo.kernelHeapSize, ((i + 1) == kernelsCount));
+            kernelsIsaTotalSize += chunkSize;
+        }
+        if (kernelsIsaTotalSize <= this->isaAllocationPageSize) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+};
+
+HWTEST_F(ModuleTest, whenMultipleModulesCreatedThenModulesShareIsaAllocation) {
+    MockZebinWrapper zebin{*NEO::defaultHwInfo};
+    zebin.setAsMockCompilerReturnedBinary();
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableLocalMemory.set(1);
+    uint8_t binary[10];
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = 10;
+    ModuleBuildLog *moduleBuildLog = nullptr;
+    NEO::GraphicsAllocation *allocation;
+    std::vector<std::unique_ptr<L0::ModuleImp>> modules;
+    constexpr size_t numModules = 10;
+    auto testModule = std::make_unique<DerivedModuleImp>(device);
+    testModule->initialize(&moduleDesc, device->getNEODevice());
+    bool canShareIsaAllocation = testModule->canModulesShareIsaAllocation();
+    if (canShareIsaAllocation) {
+        auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+        auto initialWriteMemoryCount = ultCsr.writeMemoryParams.totalCallCount;
+        for (auto i = 0u; i < numModules; i++) {
+            modules.emplace_back(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
+            modules[i]->initialize(&moduleDesc, device->getNEODevice());
+            EXPECT_EQ(initialWriteMemoryCount, ultCsr.writeMemoryParams.totalCallCount);
+
+            if (i == 0) {
+                allocation = modules[i]->getKernelsIsaParentAllocation();
+            }
+            auto &vec = modules[i]->getKernelImmutableDataVector();
+            auto offsetForImmData = vec[0]->getIsaOffsetInParentAllocation();
+            for (auto &immData : vec) {
+                EXPECT_EQ(offsetForImmData, immData->getIsaOffsetInParentAllocation());
+                offsetForImmData += immData->getIsaSubAllocationSize();
+            }
+            // Verify that all imm data share same parent allocation
+            if (i != 0) {
+                EXPECT_EQ(allocation, modules[i]->getKernelsIsaParentAllocation());
+            }
+        }
+        modules.clear();
+
+        ultCsr.commandStreamReceiverType = CommandStreamReceiverType::aub;
+
+        for (auto i = 0u; i < 5; i++) {
+            modules.emplace_back(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
+            modules[i]->initialize(&moduleDesc, device->getNEODevice());
+            EXPECT_EQ(initialWriteMemoryCount + i + 1, ultCsr.writeMemoryParams.totalCallCount);
+
+            if (i == 0) {
+                allocation = modules[i]->getKernelsIsaParentAllocation();
+            }
+            auto &vec = modules[i]->getKernelImmutableDataVector();
+            auto offsetForImmData = vec[0]->getIsaOffsetInParentAllocation();
+            for (auto &immData : vec) {
+                EXPECT_EQ(offsetForImmData, immData->getIsaOffsetInParentAllocation());
+                offsetForImmData += immData->getIsaSubAllocationSize();
+            }
+            // Verify that all imm data share same parent allocation
+            if (i != 0) {
+                EXPECT_EQ(allocation, modules[i]->getKernelsIsaParentAllocation());
+            }
+        }
+        modules.clear();
+
+        ultCsr.commandStreamReceiverType = CommandStreamReceiverType::tbx;
+        initialWriteMemoryCount = ultCsr.writeMemoryParams.totalCallCount;
+
+        auto module = std::make_unique<L0::ModuleImp>(device, moduleBuildLog, ModuleType::user);
+        module->initialize(&moduleDesc, device->getNEODevice());
+        EXPECT_EQ(initialWriteMemoryCount + 1, ultCsr.writeMemoryParams.totalCallCount);
+    }
+};
+
+TEST_F(ModuleTest, GivenLocalMemoryEnabledOrDisabledAnd2MBAlignmentEnabledOrDisabledWhenGettingIsaAllocationPageSizeThenCorrectValueIsReturned) {
+    DebugManagerStateRestore restorer;
+
+    auto mockProductHelper = new MockProductHelper;
+    device->getNEODevice()->getRootDeviceEnvironmentRef().productHelper.reset(mockProductHelper);
+
+    MockModule mockModule{device, nullptr, ModuleType::user};
+    mockModule.isaAllocationPageSize = mockModule.getIsaAllocationPageSize();
+
+    {
+        debugManager.flags.EnableLocalMemory.set(0);
+        mockProductHelper->is2MBLocalMemAlignmentEnabledResult = true;
+
+        EXPECT_EQ(MemoryConstants::pageSize, mockModule.getIsaAllocationPageSize());
+    }
+    {
+        debugManager.flags.EnableLocalMemory.set(1);
+        mockProductHelper->is2MBLocalMemAlignmentEnabledResult = true;
+
+        EXPECT_EQ(MemoryConstants::pageSize2M, mockModule.getIsaAllocationPageSize());
+    }
+    {
+        debugManager.flags.EnableLocalMemory.set(1);
+        mockProductHelper->is2MBLocalMemAlignmentEnabledResult = false;
+
+        EXPECT_EQ(MemoryConstants::pageSize64k, mockModule.getIsaAllocationPageSize());
+    }
+}
+
 template <typename T1, typename T2>
 struct ModuleSpecConstantsFixture : public DeviceFixture {
     void setUp() {
@@ -558,7 +925,7 @@ struct ModuleSpecConstantsFixture : public DeviceFixture {
     }
 
     void runTest() {
-        auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+        auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
         zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
         const auto &src = zebinData->storage;
 
@@ -582,13 +949,14 @@ struct ModuleSpecConstantsFixture : public DeviceFixture {
         specConstants.pConstantValues = specConstantsPointerValues.data();
         moduleDesc.pConstants = &specConstants;
 
-        auto module = new Module(device, nullptr, ModuleType::User);
+        auto module = new Module(device, nullptr, ModuleType::user);
         module->translationUnit.reset(mockTranslationUnit);
         mockTranslationUnit->processUnpackedBinaryCallBase = false;
         ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
         result = module->initialize(&moduleDesc, neoDevice);
         EXPECT_EQ(result, ZE_RESULT_SUCCESS);
         EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
+        EXPECT_EQ(IGC::CodeType::spirV, mockCompiler->receivedSpecConstantsCodeType);
         for (uint32_t i = 0; i < mockCompiler->moduleNumSpecConstants / 2; i++) {
             EXPECT_EQ(static_cast<uint64_t>(module->translationUnit->specConstantsValues[mockCompiler->moduleSpecConstantsIds[2 * i]]), static_cast<uint64_t>(mockCompiler->moduleSpecConstantsValuesT2[i]));
             EXPECT_EQ(static_cast<uint64_t>(module->translationUnit->specConstantsValues[mockCompiler->moduleSpecConstantsIds[2 * i + 1]]), static_cast<uint64_t>(mockCompiler->moduleSpecConstantsValuesT1[i]));
@@ -597,7 +965,7 @@ struct ModuleSpecConstantsFixture : public DeviceFixture {
     }
 
     void runTestStatic() {
-        auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+        auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
         zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
         const auto &src = zebinData->storage;
 
@@ -641,16 +1009,21 @@ struct ModuleSpecConstantsFixture : public DeviceFixture {
         staticLinkModuleDesc.pInputModules = inputSpirVs.data();
         staticLinkModuleDesc.pConstants = specConstantsArray.data();
 
-        auto module = new Module(device, nullptr, ModuleType::User);
+        auto module = new Module(device, nullptr, ModuleType::user);
         module->translationUnit.reset(mockTranslationUnit);
         mockTranslationUnit->processUnpackedBinaryCallBase = false;
         ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
         result = module->initialize(&combinedModuleDesc, neoDevice);
         EXPECT_EQ(result, ZE_RESULT_SUCCESS);
         EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
-        for (uint32_t i = 0; i < mockCompiler->moduleNumSpecConstants / 2; i++) {
-            EXPECT_EQ(static_cast<uint64_t>(module->translationUnit->specConstantsValues[mockCompiler->moduleSpecConstantsIds[2 * i]]), static_cast<uint64_t>(mockCompiler->moduleSpecConstantsValuesT2[i]));
-            EXPECT_EQ(static_cast<uint64_t>(module->translationUnit->specConstantsValues[mockCompiler->moduleSpecConstantsIds[2 * i + 1]]), static_cast<uint64_t>(mockCompiler->moduleSpecConstantsValuesT1[i]));
+        auto linkedSpecConstants = mockCompiler->getLinkedSpecConstantsPerSpirV();
+        ASSERT_EQ(2u, linkedSpecConstants.size());
+        for (auto &moduleSpecConstants : linkedSpecConstants) {
+            EXPECT_EQ(mockCompiler->moduleNumSpecConstants, moduleSpecConstants.size());
+            for (uint32_t i = 0; i < mockCompiler->moduleNumSpecConstants / 2; i++) {
+                EXPECT_EQ(static_cast<uint64_t>(moduleSpecConstants[mockCompiler->moduleSpecConstantsIds[2 * i]]), static_cast<uint64_t>(mockCompiler->moduleSpecConstantsValuesT2[i]));
+                EXPECT_EQ(static_cast<uint64_t>(moduleSpecConstants[mockCompiler->moduleSpecConstantsIds[2 * i + 1]]), static_cast<uint64_t>(mockCompiler->moduleSpecConstantsValuesT1[i]));
+            }
         }
         module->destroy();
     }
@@ -678,19 +1051,60 @@ TEST_F(ModuleSpecConstantsCharTests, givenSpecializationConstantsSetWithCharSize
     runTest();
 }
 
+using ModuleIlFormatTests = Test<ModuleFixtureWithoutModule>;
+
+TEST_F(ModuleIlFormatTests, givenLlvmBitcodePassedAsIlSpirVFormatThenCompilerReceivesLlvmBcCodeType) {
+    auto mockTranslationUnit = new MockModuleTranslationUnit(device);
+    mockTranslationUnit->processUnpackedBinaryCallBase = false;
+
+    std::vector<uint8_t> llvmBc(NEO::llvmBcMagic.begin(), NEO::llvmBcMagic.end());
+    llvmBc.resize(64, 0u);
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = llvmBc.data();
+    moduleDesc.inputSize = static_cast<uint32_t>(llvmBc.size());
+
+    auto module = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
+    module->translationUnit.reset(mockTranslationUnit);
+    module->initialize(&moduleDesc, neoDevice);
+
+    EXPECT_EQ(IGC::CodeType::llvmBc, mockTranslationUnit->passedSrcType);
+}
+
+TEST_F(ModuleIlFormatTests, givenSpirVPassedAsIlSpirVFormatThenCompilerReceivesSpirVCodeType) {
+    auto mockTranslationUnit = new MockModuleTranslationUnit(device);
+    mockTranslationUnit->processUnpackedBinaryCallBase = false;
+
+    std::vector<uint8_t> spirv(NEO::spirvMagic.begin(), NEO::spirvMagic.end());
+    spirv.resize(64, 0u);
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = spirv.data();
+    moduleDesc.inputSize = static_cast<uint32_t>(spirv.size());
+
+    auto module = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
+    module->translationUnit.reset(mockTranslationUnit);
+    module->initialize(&moduleDesc, neoDevice);
+
+    EXPECT_EQ(IGC::CodeType::spirV, mockTranslationUnit->passedSrcType);
+}
+
 TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenCompilerReturnsErrorThenModuleInitFails) {
     class FailingMockCompilerInterfaceWithSpecConstants : public MockCompilerInterfaceWithSpecConstants<uint32_t, uint64_t> {
       public:
         FailingMockCompilerInterfaceWithSpecConstants(uint32_t moduleNumSpecConstants) : MockCompilerInterfaceWithSpecConstants<uint32_t, uint64_t>(moduleNumSpecConstants) {}
-        NEO::TranslationOutput::ErrorCode getSpecConstantsInfo(const NEO::Device &device,
-                                                               ArrayRef<const char> srcSpirV, NEO::SpecConstantInfo &output) override {
-            return NEO::TranslationOutput::ErrorCode::CompilerNotAvailable;
+        NEO::TranslationErrorCode getSpecConstantsInfo(const NEO::Device &device,
+                                                       ArrayRef<const char> srcSpirV, NEO::SpecConstantInfo &output,
+                                                       IGC::CodeType::CodeType_t srcCodeType) override {
+            return NEO::TranslationErrorCode::compilerNotAvailable;
         }
     };
     mockCompiler = new FailingMockCompilerInterfaceWithSpecConstants(moduleNumSpecConstants);
     auto rootDeviceEnvironment = neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0].get();
     rootDeviceEnvironment->compilerInterface.reset(mockCompiler);
-    auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
     const auto &src = zebinData->storage;
 
@@ -712,7 +1126,7 @@ TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenCompiler
     specConstants.pConstantValues = specConstantsPointerValues.data();
     moduleDesc.pConstants = &specConstants;
 
-    auto module = new Module(device, nullptr, ModuleType::User);
+    auto module = new Module(device, nullptr, ModuleType::user);
     module->translationUnit.reset(mockTranslationUnit);
     ze_result_t result = ZE_RESULT_SUCCESS;
     result = module->initialize(&moduleDesc, neoDevice);
@@ -721,7 +1135,7 @@ TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenCompiler
 }
 
 TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenUserPassTooMuchConstsIdsThenModuleInitFails) {
-    auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
     const auto &src = zebinData->storage;
 
@@ -748,7 +1162,7 @@ TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenUserPass
     specConstants.pConstantValues = specConstantsPointerValues.data();
     moduleDesc.pConstants = &specConstants;
 
-    auto module = new Module(device, nullptr, ModuleType::User);
+    auto module = new Module(device, nullptr, ModuleType::user);
     module->translationUnit.reset(mockTranslationUnit);
     ze_result_t result = ZE_RESULT_SUCCESS;
     result = module->initialize(&moduleDesc, neoDevice);
@@ -765,19 +1179,57 @@ TEST_F(ModuleSpecConstantsCharTests, givenSpecializationConstantsSetWithCharSize
     runTestStatic();
 }
 
+TEST_F(ModuleSpecConstantsLongTests, givenSameSpecConstantIdWithDifferentValuePerModuleWhenStaticLinkingThenEachModuleGetsItsOwnValue) {
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
+    zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
+    const auto &src = zebinData->storage;
+
+    const uint32_t specConstantId = mockCompiler->moduleSpecConstantsIds[0];
+    const uint64_t module1Value = 1u;
+    const uint64_t module2Value = 2u;
+    const void *module1ValuePtr = &module1Value;
+    const void *module2ValuePtr = &module2Value;
+    const ze_module_constants_t module1Constants = {1u, &specConstantId, &module1ValuePtr};
+    const ze_module_constants_t module2Constants = {1u, &specConstantId, &module2ValuePtr};
+
+    std::vector<const uint8_t *> inputSpirVs = {src.data(), src.data()};
+    std::vector<size_t> inputSizes = {src.size(), src.size()};
+    std::vector<const ze_module_constants_t *> specConstantsArray = {&module1Constants, &module2Constants};
+
+    ze_module_program_exp_desc_t staticLinkModuleDesc = {ZE_STRUCTURE_TYPE_MODULE_PROGRAM_EXP_DESC};
+    staticLinkModuleDesc.count = 2;
+    staticLinkModuleDesc.inputSizes = inputSizes.data();
+    staticLinkModuleDesc.pInputModules = inputSpirVs.data();
+    staticLinkModuleDesc.pConstants = specConstantsArray.data();
+    ze_module_desc_t combinedModuleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
+    combinedModuleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    combinedModuleDesc.pNext = &staticLinkModuleDesc;
+
+    auto module = std::make_unique<Module>(device, nullptr, ModuleType::user);
+    module->translationUnit.reset(mockTranslationUnit);
+    mockTranslationUnit->processUnpackedBinaryCallBase = false;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, module->initialize(&combinedModuleDesc, neoDevice));
+
+    auto linkedSpecConstants = mockCompiler->getLinkedSpecConstantsPerSpirV();
+    ASSERT_EQ(2u, linkedSpecConstants.size());
+    EXPECT_EQ((NEO::specConstValuesMap{{specConstantId, module1Value}}), linkedSpecConstants[0]);
+    EXPECT_EQ((NEO::specConstValuesMap{{specConstantId, module2Value}}), linkedSpecConstants[1]);
+}
+
 TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenCompilerReturnsErrorFromStaticLinkThenModuleInitFails) {
     class FailingMockCompilerInterfaceWithSpecConstants : public MockCompilerInterfaceWithSpecConstants<uint32_t, uint64_t> {
       public:
         FailingMockCompilerInterfaceWithSpecConstants(uint32_t moduleNumSpecConstants) : MockCompilerInterfaceWithSpecConstants<uint32_t, uint64_t>(moduleNumSpecConstants) {}
-        NEO::TranslationOutput::ErrorCode getSpecConstantsInfo(const NEO::Device &device,
-                                                               ArrayRef<const char> srcSpirV, NEO::SpecConstantInfo &output) override {
-            return NEO::TranslationOutput::ErrorCode::CompilerNotAvailable;
+        NEO::TranslationErrorCode getSpecConstantsInfo(const NEO::Device &device,
+                                                       ArrayRef<const char> srcSpirV, NEO::SpecConstantInfo &output,
+                                                       IGC::CodeType::CodeType_t srcCodeType) override {
+            return NEO::TranslationErrorCode::compilerNotAvailable;
         }
     };
     mockCompiler = new FailingMockCompilerInterfaceWithSpecConstants(moduleNumSpecConstants);
     auto rootDeviceEnvironment = neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0].get();
     rootDeviceEnvironment->compilerInterface.reset(mockCompiler);
-    auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
     const auto &src = zebinData->storage;
 
@@ -822,7 +1274,7 @@ TEST_F(ModuleSpecConstantsLongTests, givenSpecializationConstantsSetWhenCompiler
     staticLinkModuleDesc.pInputModules = inputSpirVs.data();
     staticLinkModuleDesc.pConstants = specConstantsArray.data();
 
-    auto module = new Module(device, nullptr, ModuleType::User);
+    auto module = new Module(device, nullptr, ModuleType::user);
     module->translationUnit.reset(mockTranslationUnit);
     ze_result_t result = ZE_RESULT_SUCCESS;
     result = module->initialize(&combinedModuleDesc, neoDevice);
@@ -840,7 +1292,7 @@ struct ModuleStaticLinkFixture : public DeviceFixture {
     }
 
     void loadModules(bool multiple) {
-        auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+        auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
         zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
         const auto &storage = zebinData->storage;
 
@@ -875,6 +1327,10 @@ struct ModuleStaticLinkFixture : public DeviceFixture {
         staticLinkModuleDesc.pInputModules = inputSpirVs.data();
     }
 
+    void addCreateLibraryOption() {
+        combinedModuleDesc.pBuildFlags = NEO::CompilerOptions::createLibrary.begin();
+    }
+
     void runLinkFailureTest() {
         MockCompilerInterfaceLinkFailure *mockCompiler;
         mockCompiler = new MockCompilerInterfaceLinkFailure();
@@ -886,30 +1342,12 @@ struct ModuleStaticLinkFixture : public DeviceFixture {
 
         setupExpProgramDesc(ZE_MODULE_FORMAT_IL_SPIRV, testMultiple);
 
-        auto module = new Module(device, nullptr, ModuleType::User);
+        auto module = new Module(device, nullptr, ModuleType::user);
         module->translationUnit.reset(mockTranslationUnit);
 
         ze_result_t result = ZE_RESULT_SUCCESS;
         result = module->initialize(&combinedModuleDesc, neoDevice);
         EXPECT_EQ(result, ZE_RESULT_ERROR_MODULE_BUILD_FAILURE);
-        module->destroy();
-    }
-    void runSpirvFailureTest() {
-        MockCompilerInterface *mockCompiler;
-        mockCompiler = new MockCompilerInterface();
-        auto rootDeviceEnvironment = neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0].get();
-        rootDeviceEnvironment->compilerInterface.reset(mockCompiler);
-        mockTranslationUnit = new MockModuleTranslationUnit(device);
-
-        loadModules(testMultiple);
-
-        setupExpProgramDesc(ZE_MODULE_FORMAT_NATIVE, testMultiple);
-
-        auto module = new Module(device, nullptr, ModuleType::User);
-        module->translationUnit.reset(mockTranslationUnit);
-        ze_result_t result = ZE_RESULT_SUCCESS;
-        result = module->initialize(&combinedModuleDesc, neoDevice);
-        EXPECT_EQ(result, ZE_RESULT_ERROR_INVALID_ENUMERATION);
         module->destroy();
     }
     void runExpDescFailureTest() {
@@ -923,7 +1361,7 @@ struct ModuleStaticLinkFixture : public DeviceFixture {
         combinedModuleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
         combinedModuleDesc.pNext = &invalidExpDesc;
 
-        auto module = new Module(device, nullptr, ModuleType::User);
+        auto module = new Module(device, nullptr, ModuleType::user);
         module->translationUnit.reset(mockTranslationUnit);
         ze_result_t result = ZE_RESULT_SUCCESS;
         result = module->initialize(&combinedModuleDesc, neoDevice);
@@ -950,12 +1388,13 @@ struct ModuleStaticLinkFixture : public DeviceFixture {
 
         staticLinkModuleDesc.pBuildFlags = buildFlags.data();
 
-        auto module = new Module(device, nullptr, ModuleType::User);
+        auto module = new Module(device, nullptr, ModuleType::user);
         module->translationUnit.reset(mockTranslationUnit);
         ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
         result = module->initialize(&combinedModuleDesc, neoDevice);
         EXPECT_EQ(result, ZE_RESULT_SUCCESS);
         EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
+        EXPECT_EQ(ModuleTranslationUnit::CompilationMode::staticLink, mockTranslationUnit->passedCompilationMode);
         module->destroy();
     }
     void runSprivLinkBuildWithOneModule() {
@@ -976,12 +1415,13 @@ struct ModuleStaticLinkFixture : public DeviceFixture {
 
         staticLinkModuleDesc.pBuildFlags = buildFlags.data();
 
-        auto module = new Module(device, nullptr, ModuleType::User);
+        auto module = new Module(device, nullptr, ModuleType::user);
         module->translationUnit.reset(mockTranslationUnit);
         ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
         result = module->initialize(&combinedModuleDesc, neoDevice);
         EXPECT_EQ(result, ZE_RESULT_SUCCESS);
         EXPECT_EQ(mockTranslationUnit->processUnpackedBinaryCalled, 1u);
+        EXPECT_EQ(ModuleTranslationUnit::CompilationMode::build, mockTranslationUnit->passedCompilationMode);
         module->destroy();
     }
     std::unique_ptr<ZebinTestData::ZebinWithL0TestCommonModule> zebinData;
@@ -1004,10 +1444,6 @@ TEST_F(ModuleStaticLinkTests, givenMultipleModulesProvidedForSpirVStaticLinkAndC
     runLinkFailureTest();
 }
 
-TEST_F(ModuleStaticLinkTests, givenMultipleModulesProvidedForSpirVStaticLinkAndFormatIsNotSpirvThenFailureisReturned) {
-    runSpirvFailureTest();
-}
-
 TEST_F(ModuleStaticLinkTests, givenInvalidExpDescForModuleCreateThenFailureisReturned) {
     runExpDescFailureTest();
 }
@@ -1018,6 +1454,195 @@ TEST_F(ModuleStaticLinkTests, givenMultipleModulesProvidedForSpirVStaticLinkAndB
 
 TEST_F(ModuleStaticLinkTests, givenSingleModuleProvidedForSpirVStaticLinkAndBuildFlagsRequestedThenSuccessisReturned) {
     runSprivLinkBuildWithOneModule();
+}
+
+TEST_F(ModuleStaticLinkTests, givenEnabledDivergentBarrierWhenStaticLinkingSpirVModulesThenInternalOptionIsAdded) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnableDivergentBarrierHandling.set(true);
+
+    MockCompilerInterface *compilerInterface = new MockCompilerInterface();
+    auto rootDeviceEnvironment = neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0].get();
+    rootDeviceEnvironment->compilerInterface.reset(compilerInterface);
+    mockTranslationUnit = new MockModuleTranslationUnit(device);
+    mockTranslationUnit->processUnpackedBinaryCallBase = false;
+
+    loadModules(testMultiple);
+
+    setupExpProgramDesc(ZE_MODULE_FORMAT_IL_SPIRV, testMultiple);
+
+    auto module = new Module(device, nullptr, ModuleType::user);
+    module->translationUnit.reset(mockTranslationUnit);
+    ze_result_t result = module->initialize(&combinedModuleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(NEO::CompilerOptions::contains(compilerInterface->inputInternalOptions, NEO::CompilerOptions::enableDivergentBarriers));
+    module->destroy();
+}
+
+TEST_F(ModuleStaticLinkTests, GivenOclExtensionsDescWhenStaticLinkingSpirVModulesThenCallerInternalOptionsAreAppended) {
+    MockCompilerInterface *compilerInterface = new MockCompilerInterface();
+    auto rootDeviceEnvironment = neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0].get();
+    rootDeviceEnvironment->compilerInterface.reset(compilerInterface);
+    mockTranslationUnit = new MockModuleTranslationUnit(device);
+    mockTranslationUnit->processUnpackedBinaryCallBase = false;
+
+    loadModules(testMultiple);
+    setupExpProgramDesc(ZE_MODULE_FORMAT_IL_SPIRV, testMultiple);
+
+    const std::string callerInternalOptions = "-ocl-version=300 -cl-ext=+test_marker_ext";
+    L0::ze_module_ocl_extensions_exp_desc_t oclExtensionsDesc;
+    oclExtensionsDesc.pInternalBuildOptions = callerInternalOptions.c_str();
+    oclExtensionsDesc.pNext = combinedModuleDesc.pNext;
+    combinedModuleDesc.pNext = &oclExtensionsDesc;
+
+    auto module = new Module(device, nullptr, ModuleType::user);
+    module->translationUnit.reset(mockTranslationUnit);
+    ze_result_t result = module->initialize(&combinedModuleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(ModuleTranslationUnit::CompilationMode::staticLink, mockTranslationUnit->passedCompilationMode);
+    EXPECT_NE(std::string::npos, compilerInterface->inputInternalOptions.find("-ocl-version=300"));
+    EXPECT_NE(std::string::npos, compilerInterface->inputInternalOptions.find("+test_marker_ext"));
+    module->destroy();
+}
+
+struct ModuleLlvmBcStaticLinkFixture : public ModuleStaticLinkFixture {
+    void setUp() {
+        ModuleStaticLinkFixture::setUp();
+    }
+    void tearDown() {
+        ModuleStaticLinkFixture::tearDown();
+    }
+
+    void loadLlvmBcModule() {
+        auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv}; // actual content not important
+        llvmBcZebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
+        const auto &storage = llvmBcZebinData->storage;
+        llvmSrcModule = storage.data();
+        llvmSizeModule = storage.size();
+        ASSERT_NE(nullptr, llvmSrcModule);
+        ASSERT_NE(0u, llvmSizeModule);
+    }
+
+    void chainLlvmBcExtDesc() {
+        llvmInputModules.push_back(llvmSrcModule);
+        llvmInputSizes.push_back(llvmSizeModule);
+
+        llvmBcDesc.count = static_cast<uint32_t>(llvmInputModules.size());
+        llvmBcDesc.inputSizes = llvmInputSizes.data();
+        llvmBcDesc.pInputModules = llvmInputModules.data();
+
+        staticLinkModuleDesc.pNext = &llvmBcDesc;
+    }
+
+    void runSpirVAndLlvmBcLinkSuccessTest() {
+        auto *mockCompiler = new MockCompilerInterface();
+        neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->compilerInterface.reset(mockCompiler);
+        mockTranslationUnit = new MockModuleTranslationUnit(device);
+        mockTranslationUnit->processUnpackedBinaryCallBase = false;
+
+        loadModules(testMultiple);
+        loadLlvmBcModule();
+        setupExpProgramDesc(ZE_MODULE_FORMAT_IL_SPIRV, testMultiple);
+        chainLlvmBcExtDesc();
+
+        auto module = new Module(device, nullptr, ModuleType::user);
+        module->translationUnit.reset(mockTranslationUnit);
+
+        ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+        result = module->initialize(&combinedModuleDesc, neoDevice);
+        EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+        EXPECT_EQ(ModuleTranslationUnit::CompilationMode::staticLink, mockTranslationUnit->passedCompilationMode);
+        module->destroy();
+    }
+
+    void runSpirVToCreateLibraryLinkSuccessTest() {
+        auto *mockCompiler = new MockCompilerInterface();
+        neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->compilerInterface.reset(mockCompiler);
+        mockTranslationUnit = new MockModuleTranslationUnit(device);
+        mockTranslationUnit->processUnpackedBinaryCallBase = false;
+        testMultiple = false;
+        loadModules(testMultiple);
+        addCreateLibraryOption();
+        setupExpProgramDesc(ZE_MODULE_FORMAT_IL_SPIRV, testMultiple);
+
+        auto module = new Module(device, nullptr, ModuleType::user);
+        module->translationUnit.reset(mockTranslationUnit);
+
+        ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+        result = module->initialize(&combinedModuleDesc, neoDevice);
+        EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+        EXPECT_EQ(ModuleTranslationUnit::CompilationMode::createLibrary, mockTranslationUnit->passedCompilationMode);
+        module->destroy();
+    }
+
+    void runSpirVAndLlvmBcLinkFailureTest() {
+        auto *mockCompiler = new MockCompilerInterfaceLinkFailure();
+        neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->compilerInterface.reset(mockCompiler);
+        mockTranslationUnit = new MockModuleTranslationUnit(device);
+
+        loadModules(testMultiple);
+        loadLlvmBcModule();
+        setupExpProgramDesc(ZE_MODULE_FORMAT_IL_SPIRV, testMultiple);
+        chainLlvmBcExtDesc();
+
+        auto module = new Module(device, nullptr, ModuleType::user);
+        module->translationUnit.reset(mockTranslationUnit);
+
+        ze_result_t result = ZE_RESULT_SUCCESS;
+        result = module->initialize(&combinedModuleDesc, neoDevice);
+        EXPECT_NE(result, ZE_RESULT_SUCCESS);
+        EXPECT_EQ(ModuleTranslationUnit::CompilationMode::staticLink, mockTranslationUnit->passedCompilationMode);
+        module->destroy();
+    }
+
+    void runLlvmBcExtDescAloneIsValidTest() {
+        uint8_t dummySpirV{};
+        ze_module_desc_t desc{};
+        desc.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+        desc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+        desc.inputSize = sizeof(dummySpirV);
+        desc.pInputModule = &dummySpirV;
+
+        L0::ze_module_program_llvmbc_exp_desc_t llvmExt{};
+        llvmExt.count = 0;
+        desc.pNext = &llvmExt;
+
+        auto *mockCompiler = new MockCompilerInterface();
+        neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[0]->compilerInterface.reset(mockCompiler);
+        mockTranslationUnit = new MockModuleTranslationUnit(device);
+        mockTranslationUnit->processUnpackedBinaryCallBase = false;
+
+        auto module = new Module(device, nullptr, ModuleType::user);
+        module->translationUnit.reset(mockTranslationUnit);
+
+        ze_result_t result = module->initialize(&desc, neoDevice);
+        EXPECT_NE(result, ZE_RESULT_ERROR_INVALID_ARGUMENT);
+        module->destroy();
+    }
+
+    std::unique_ptr<ZebinTestData::ZebinWithL0TestCommonModule> llvmBcZebinData;
+    const uint8_t *llvmSrcModule = nullptr;
+    size_t llvmSizeModule = 0u;
+    L0::ze_module_program_llvmbc_exp_desc_t llvmBcDesc{};
+    std::vector<const uint8_t *> llvmInputModules;
+    std::vector<size_t> llvmInputSizes;
+};
+
+using ModuleLlvmBcStaticLinkTests = Test<ModuleLlvmBcStaticLinkFixture>;
+
+TEST_F(ModuleLlvmBcStaticLinkTests, givenSpirVAndLlvmBcModulesProvidedForStaticLinkWhenCompilerSucceedsThenSuccessIsReturned) {
+    runSpirVAndLlvmBcLinkSuccessTest();
+}
+
+TEST_F(ModuleLlvmBcStaticLinkTests, givenSpirVModuleWithCreateLibraryOptionProvidedForStaticLinkWhenCompilerSucceedsThenSuccessIsReturned) {
+    runSpirVToCreateLibraryLinkSuccessTest();
+}
+
+TEST_F(ModuleLlvmBcStaticLinkTests, givenSpirVAndLlvmBcModulesProvidedForStaticLinkWhenCompilerFailsThenFailureIsReturned) {
+    runSpirVAndLlvmBcLinkFailureTest();
+}
+
+TEST_F(ModuleLlvmBcStaticLinkTests, givenLlvmBcExtDescAloneInPNextChainThenValidationDoesNotRejectIt) {
+    runLlvmBcExtDescAloneIsValidTest();
 }
 
 using ModuleLinkingTest = Test<DeviceFixture>;
@@ -1033,13 +1658,13 @@ HWTEST_F(ModuleLinkingTest, whenExternFunctionsAllocationIsPresentThenItsBeingAd
     kernelInfo.heapInfo.kernelHeapSize = sizeof(data);
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(&kernelInfo, device, 0, nullptr, nullptr, false);
-    module.kernelImmDatas.push_back(std::move(kernelImmData));
+    kernelImmData->initialize(&kernelInfo, device, nullptr, nullptr);
+    module.kernelImmData.push_back(std::move(kernelImmData));
 
     module.translationUnit->programInfo.linkerInput.reset(new NEO::LinkerInput);
     module.linkBinary();
-    ASSERT_EQ(1U, module.kernelImmDatas[0]->getResidencyContainer().size());
-    EXPECT_EQ(&alloc, module.kernelImmDatas[0]->getResidencyContainer()[0]);
+    ASSERT_EQ(1U, module.kernelImmData[0]->getResidencyContainer().size());
+    EXPECT_EQ(&alloc, module.kernelImmData[0]->getResidencyContainer()[0]);
 }
 
 HWTEST_F(ModuleLinkingTest, givenFailureDuringLinkingWhenCreatingModuleThenModuleInitialiationFails) {
@@ -1061,7 +1686,7 @@ HWTEST_F(ModuleLinkingTest, givenFailureDuringLinkingWhenCreatingModuleThenModul
     moduleDesc.pInputModule = &spirvData;
     moduleDesc.inputSize = sizeof(spirvData);
 
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     module.translationUnit.reset(mockTranslationUnit);
 
     ze_result_t result = ZE_RESULT_SUCCESS;
@@ -1093,7 +1718,7 @@ HWTEST_F(ModuleLinkingTest, givenRemainingUnresolvedSymbolsDuringLinkingWhenCrea
     moduleDesc.pInputModule = &spirvData;
     moduleDesc.inputSize = sizeof(spirvData);
 
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     module.translationUnit.reset(mockTranslationUnit);
 
     ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
@@ -1126,7 +1751,7 @@ HWTEST_F(ModuleLinkingTest, givenModuleCompiledThenCachingIsTrue) {
     moduleDesc.pInputModule = &spirvData;
     moduleDesc.inputSize = sizeof(spirvData);
 
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     module.translationUnit.reset(mockTranslationUnit);
 
     EXPECT_FALSE(mockCompiler->cachingPassed);
@@ -1140,7 +1765,7 @@ HWTEST_F(ModuleLinkingTest, givenModuleCompiledThenCachingIsTrue) {
 }
 
 HWTEST_F(ModuleLinkingTest, givenNotFullyLinkedModuleWhenCreatingKernelThenErrorIsReturned) {
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     module.isFullyLinked = false;
 
     auto retVal = module.createKernel(nullptr, nullptr);
@@ -1159,7 +1784,7 @@ TEST_F(ModulePropertyTest, whenZeModuleGetPropertiesIsCalledThenGetPropertiesIsC
     // returning error code that is unlikely to be returned by the function
     module.getPropertiesResult = ZE_RESULT_ERROR_UNSUPPORTED_IMAGE_FORMAT;
 
-    ze_result_t res = zeModuleGetProperties(module.toHandle(), &moduleProperties);
+    ze_result_t res = ::zeModuleGetProperties(module.toHandle(), &moduleProperties);
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_IMAGE_FORMAT, res);
 }
 
@@ -1168,12 +1793,41 @@ TEST_F(ModulePropertyTest, givenCallToGetPropertiesWithoutUnresolvedSymbolsThenF
 
     ze_module_property_flags_t expectedFlags = 0;
 
-    ze_result_t res = module->getProperties(&moduleProperties);
     moduleProperties.stype = ZE_STRUCTURE_TYPE_MODULE_PROPERTIES;
     moduleProperties.pNext = nullptr;
+    ze_result_t res = module->getProperties(&moduleProperties);
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     EXPECT_EQ(expectedFlags, moduleProperties.flags);
+}
+
+TEST_F(ModulePropertyTest, givenModuleIgcaTargetPropertiesInExtensionChainWhenGettingPropertiesThenUnsupportedFeatureIsReturned) {
+    ze_module_igca_target_ext_properties_t igcaTargetProperties = {};
+    igcaTargetProperties.stype = ZE_STRUCTURE_TYPE_MODULE_IGCA_TARGET_EXT_PROPERTIES;
+    igcaTargetProperties.pNext = nullptr;
+
+    ze_base_properties_t otherProperties = {};
+    otherProperties.stype = ZE_STRUCTURE_TYPE_FORCE_UINT32;
+    otherProperties.pNext = &igcaTargetProperties;
+
+    ze_module_properties_t moduleProperties = {};
+    moduleProperties.stype = ZE_STRUCTURE_TYPE_MODULE_PROPERTIES;
+    moduleProperties.pNext = &otherProperties;
+
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, module->getProperties(&moduleProperties));
+}
+
+TEST_F(ModulePropertyTest, givenOnlyOtherPropertiesInExtensionChainWhenGettingPropertiesThenSuccessIsReturned) {
+    ze_base_properties_t otherProperties = {};
+    otherProperties.stype = ZE_STRUCTURE_TYPE_FORCE_UINT32;
+    otherProperties.pNext = nullptr;
+
+    ze_module_properties_t moduleProperties = {};
+    moduleProperties.stype = ZE_STRUCTURE_TYPE_MODULE_PROPERTIES;
+    moduleProperties.pNext = &otherProperties;
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, module->getProperties(&moduleProperties));
+    EXPECT_EQ(0u, moduleProperties.flags);
 }
 
 TEST_F(ModulePropertyTest, givenCallToGetPropertiesWithUnresolvedSymbolsThenFlagIsSet) {
@@ -1197,8 +1851,8 @@ TEST_F(ModulePropertyTest, givenCallToGetPropertiesWithUnresolvedSymbolsThenFlag
 
 struct ModuleFunctionPointerTests : public Test<ModuleFixture> {
     void SetUp() override {
-        Test<ModuleFixture>::SetUp();
-        module0 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::User);
+        ModuleFixture::setUp(true);
+        module0 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
     }
     void TearDown() override {
         module0.reset(nullptr);
@@ -1210,9 +1864,9 @@ struct ModuleFunctionPointerTests : public Test<ModuleFixture> {
 struct ModuleDynamicLinkTests : public Test<DeviceFixture> {
     void SetUp() override {
         Test<DeviceFixture>::SetUp();
-        module0 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::User);
-        module1 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::User);
-        module2 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::User);
+        module0 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
+        module1 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
+        module2 = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
     }
     void TearDown() override {
         module0.reset(nullptr);
@@ -1224,6 +1878,203 @@ struct ModuleDynamicLinkTests : public Test<DeviceFixture> {
     std::unique_ptr<WhiteBox<::L0::Module>> module1;
     std::unique_ptr<WhiteBox<::L0::Module>> module2;
 };
+
+struct ModuleInspectionTests : public ModuleDynamicLinkTests {};
+
+TEST_F(ModuleInspectionTests, givenCallToInspectionOnModulesWithoutUnresolvedSymbolsThenUnresolvedSymbolsAreReturnedInTheLog) {
+    ze_linkage_inspection_ext_desc_t inspectDesc;
+    inspectDesc.stype = ZE_STRUCTURE_TYPE_LINKAGE_INSPECTION_EXT_DESC;
+    inspectDesc.flags = ZE_LINKAGE_INSPECTION_EXT_FLAG_UNRESOLVABLE_IMPORTS;
+    inspectDesc.pNext = nullptr;
+    uint32_t numModules = 2;
+    ze_module_build_log_handle_t linkageLog;
+    std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
+    ze_result_t res = module0->inspectLinkage(&inspectDesc, numModules, hModules.data(), &linkageLog);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    size_t buildLogSize;
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, nullptr);
+    EXPECT_GT(static_cast<int>(buildLogSize), 0);
+    char *logBuffer = new char[buildLogSize]();
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, logBuffer);
+    EXPECT_NE(logBuffer, "");
+    delete[] logBuffer;
+    ::zeModuleBuildLogDestroy(linkageLog);
+}
+
+TEST_F(ModuleInspectionTests, givenModuleWithUnresolvedSymbolWhenTheOtherModuleDefinesTheSymbolThenInspectedLinkageShowsSymbolsAreResolvedInTheLog) {
+
+    uint64_t gpuAddress = 0x12345;
+    uint32_t offset = 0x20;
+
+    NEO::Linker::RelocationInfo unresolvedRelocation;
+    unresolvedRelocation.symbolName = "unresolved";
+    unresolvedRelocation.offset = offset;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
+    NEO::Linker::UnresolvedExternal unresolvedExternal;
+    unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
+
+    NEO::SymbolInfo symbolInfo{};
+    NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
+
+    char kernelHeap[MemoryConstants::pageSize] = {};
+
+    auto kernelInfo = std::make_unique<NEO::KernelInfo>();
+    kernelInfo->heapInfo.pKernelHeap = kernelHeap;
+    kernelInfo->heapInfo.kernelHeapSize = MemoryConstants::pageSize;
+    module0->getTranslationUnit()->programInfo.kernelInfos.push_back(kernelInfo.release());
+
+    auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
+    linkerInput->traits.requiresPatchingOfInstructionSegments = true;
+
+    module0->getTranslationUnit()->programInfo.linkerInput = std::move(linkerInput);
+    module0->unresolvedExternalsInfo.push_back({unresolvedRelocation});
+    module0->unresolvedExternalsInfo[0].instructionsSegmentId = 0u;
+
+    auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
+    kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
+
+    module0->kernelImmData.push_back(std::move(kernelImmData));
+
+    module1->symbols[unresolvedRelocation.symbolName] = relocatedSymbol;
+
+    ze_linkage_inspection_ext_desc_t inspectDesc;
+    inspectDesc.stype = ZE_STRUCTURE_TYPE_LINKAGE_INSPECTION_EXT_DESC;
+    inspectDesc.flags = ZE_LINKAGE_INSPECTION_EXT_FLAG_IMPORTS;
+    inspectDesc.pNext = nullptr;
+    uint32_t numModules = 2;
+    ze_module_build_log_handle_t linkageLog;
+    std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
+    ze_result_t res = module0->inspectLinkage(&inspectDesc, numModules, hModules.data(), &linkageLog);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    size_t buildLogSize;
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, nullptr);
+    EXPECT_GT(static_cast<int>(buildLogSize), 0);
+    char *logBuffer = new char[buildLogSize]();
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, logBuffer);
+    EXPECT_NE(logBuffer, "");
+    delete[] logBuffer;
+    ::zeModuleBuildLogDestroy(linkageLog);
+}
+
+TEST_F(ModuleInspectionTests, givenModuleWithExportSymolsThenInspectedLinkageShowsSymbolsInTheLog) {
+
+    uint64_t gpuAddress = 0x12345;
+    uint32_t offset = 0x20;
+
+    NEO::Linker::RelocationInfo unresolvedRelocation;
+    unresolvedRelocation.symbolName = "unresolved";
+    unresolvedRelocation.offset = offset;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
+    NEO::SymbolInfo symbolInfo{};
+    NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
+
+    module1->symbols[unresolvedRelocation.symbolName] = relocatedSymbol;
+
+    ze_linkage_inspection_ext_desc_t inspectDesc;
+    inspectDesc.stype = ZE_STRUCTURE_TYPE_LINKAGE_INSPECTION_EXT_DESC;
+    inspectDesc.flags = ZE_LINKAGE_INSPECTION_EXT_FLAG_EXPORTS;
+    inspectDesc.pNext = nullptr;
+    uint32_t numModules = 1;
+    ze_module_build_log_handle_t linkageLog;
+    std::vector<ze_module_handle_t> hModules = {module1->toHandle()};
+    ze_result_t res = module0->inspectLinkage(&inspectDesc, numModules, hModules.data(), &linkageLog);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    size_t buildLogSize;
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, nullptr);
+    EXPECT_GT(static_cast<int>(buildLogSize), 0);
+    char *logBuffer = new char[buildLogSize]();
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, logBuffer);
+    EXPECT_NE(logBuffer, "");
+    delete[] logBuffer;
+    ::zeModuleBuildLogDestroy(linkageLog);
+}
+
+TEST_F(ModuleInspectionTests, givenModuleWithFunctionDependenciesWhenOtherModuleDefinesThisFunctionThenExportedFunctionsAreDefinedInLog) {
+    std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
+
+    auto linkerInput = new ::WhiteBox<NEO::LinkerInput>();
+    linkerInput->extFunDependencies.push_back({"funMod1", "funMod0"});
+    linkerInput->kernelDependencies.push_back({"funMod1", "kernel"});
+    module0->translationUnit->programInfo.linkerInput.reset(linkerInput);
+
+    module0->translationUnit->programInfo.externalFunctions.push_back({"funMod0", 1U, 128U, 8U});
+    KernelInfo *ki = new KernelInfo();
+    ki->kernelDescriptor.kernelMetadata.kernelName = "kernel";
+    module0->translationUnit->programInfo.kernelInfos.push_back(ki);
+
+    module1->translationUnit->programInfo.externalFunctions.push_back({"funMod1", 3U, 128U, 8U});
+
+    ze_linkage_inspection_ext_desc_t inspectDesc;
+    inspectDesc.stype = ZE_STRUCTURE_TYPE_LINKAGE_INSPECTION_EXT_DESC;
+    inspectDesc.flags = ZE_LINKAGE_INSPECTION_EXT_FLAG_EXPORTS;
+    inspectDesc.pNext = nullptr;
+    uint32_t numModules = 2;
+    ze_module_build_log_handle_t linkageLog;
+    ze_result_t res = module0->inspectLinkage(&inspectDesc, numModules, hModules.data(), &linkageLog);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    size_t buildLogSize;
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, nullptr);
+    EXPECT_GT(static_cast<int>(buildLogSize), 0);
+    char *logBuffer = new char[buildLogSize]();
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, logBuffer);
+    EXPECT_NE(logBuffer, "");
+    delete[] logBuffer;
+    ::zeModuleBuildLogDestroy(linkageLog);
+}
+
+TEST_F(ModuleInspectionTests, givenModuleWithUnresolvedImportsButFullyLinkedThenImportedFunctionsAreDefinedInLog) {
+    NEO::Linker::RelocationInfo unresolvedRelocation;
+    unresolvedRelocation.symbolName = "unresolved";
+
+    module0->unresolvedExternalsInfo.push_back({unresolvedRelocation});
+    module0->isFullyLinked = true;
+
+    ze_linkage_inspection_ext_desc_t inspectDesc;
+    inspectDesc.stype = ZE_STRUCTURE_TYPE_LINKAGE_INSPECTION_EXT_DESC;
+    inspectDesc.flags = ZE_LINKAGE_INSPECTION_EXT_FLAG_IMPORTS;
+    inspectDesc.pNext = nullptr;
+    uint32_t numModules = 1;
+    ze_module_build_log_handle_t linkageLog;
+    std::vector<ze_module_handle_t> linkModules = {module0->toHandle()};
+    ze_result_t res = module0->inspectLinkage(&inspectDesc, numModules, linkModules.data(), &linkageLog);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    size_t buildLogSize;
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, nullptr);
+    EXPECT_GT(static_cast<int>(buildLogSize), 0);
+    char *logBuffer = new char[buildLogSize]();
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, logBuffer);
+    EXPECT_NE(logBuffer, "");
+    delete[] logBuffer;
+    ::zeModuleBuildLogDestroy(linkageLog);
+}
+
+TEST_F(ModuleInspectionTests, givenModuleWithUnresolvedSymbolsNotPresentInOtherModulesWhenInspectLinkageThenUnresolvedSymbolsReturned) {
+
+    NEO::Linker::RelocationInfo unresolvedRelocation;
+    unresolvedRelocation.symbolName = "unresolved";
+
+    module1->isFunctionSymbolExportEnabled = true;
+    module0->unresolvedExternalsInfo.push_back({unresolvedRelocation});
+
+    ze_linkage_inspection_ext_desc_t inspectDesc;
+    inspectDesc.stype = ZE_STRUCTURE_TYPE_LINKAGE_INSPECTION_EXT_DESC;
+    inspectDesc.flags = ZE_LINKAGE_INSPECTION_EXT_FLAG_UNRESOLVABLE_IMPORTS;
+    inspectDesc.pNext = nullptr;
+    uint32_t numModules = 2;
+    ze_module_build_log_handle_t linkageLog;
+    std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
+    ze_result_t res = module0->inspectLinkage(&inspectDesc, numModules, hModules.data(), &linkageLog);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    size_t buildLogSize;
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, nullptr);
+    EXPECT_GT(static_cast<int>(buildLogSize), 0);
+    char *logBuffer = new char[buildLogSize]();
+    ::zeModuleBuildLogGetString(linkageLog, &buildLogSize, logBuffer);
+    EXPECT_NE(logBuffer, "");
+    delete[] logBuffer;
+    ::zeModuleBuildLogDestroy(linkageLog);
+}
 
 TEST_F(ModuleDynamicLinkTests, givenCallToDynamicLinkOnModulesWithoutUnresolvedSymbolsThenSuccessIsReturned) {
     std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
@@ -1265,7 +2116,7 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
@@ -1288,11 +2139,11 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
     auto isaPtr = kernelImmData->getIsaGraphicsAllocation()->getUnderlyingBuffer();
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module1->symbols[unresolvedRelocation.symbolName] = relocatedSymbol;
 
@@ -1311,7 +2162,7 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
@@ -1334,19 +2185,29 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module1->symbols[unresolvedRelocation.symbolName] = relocatedSymbol;
     MockGraphicsAllocation alloc;
     module1->exportedFunctionsSurface = &alloc;
 
+    MockGraphicsAllocation globalsAlloc1;
+    MockGraphicsAllocation globalsAlloc2;
+    module1->getTranslationUnit()->globalConstBuffer = std::make_unique<SharedPoolAllocation>(&globalsAlloc1, 0, 1, nullptr, false);
+    module1->getTranslationUnit()->globalVarBuffer = std::make_unique<SharedPoolAllocation>(&globalsAlloc2, 0, 1, nullptr, false);
+
     std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
     ze_result_t res = module0->performDynamicLink(2, hModules.data(), nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
-    EXPECT_EQ((int)module0->kernelImmDatas[0]->getResidencyContainer().size(), 1);
-    EXPECT_EQ(module0->kernelImmDatas[0]->getResidencyContainer().back(), &alloc);
+    EXPECT_EQ((int)module0->kernelImmData[0]->getResidencyContainer().size(), 3);
+    EXPECT_EQ(module0->kernelImmData[0]->getResidencyContainer()[0], &alloc);
+    EXPECT_EQ(module0->kernelImmData[0]->getResidencyContainer()[1], &globalsAlloc2);
+    EXPECT_EQ(module0->kernelImmData[0]->getResidencyContainer()[2], &globalsAlloc1);
+
+    module1->getTranslationUnit()->globalConstBuffer.reset();
+    module1->getTranslationUnit()->globalVarBuffer.reset();
 }
 
 TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEachModuleDefinesTheSymbolThenTheExportedFunctionSurfaceInBothModulesIsAddedToTheResidencyContainer) {
@@ -1359,21 +2220,21 @@ TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEa
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
     NEO::Linker::RelocationInfo unresolvedRelocationCircular;
     unresolvedRelocationCircular.symbolName = "unresolvedCircular";
     unresolvedRelocationCircular.offset = offset;
-    unresolvedRelocationCircular.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocationCircular.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternalCircular;
     unresolvedExternalCircular.unresolvedRelocation = unresolvedRelocationCircular;
 
     NEO::Linker::RelocationInfo unresolvedRelocationChained;
     unresolvedRelocationChained.symbolName = "unresolvedChained";
     unresolvedRelocationChained.offset = offset;
-    unresolvedRelocationChained.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocationChained.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternalChained;
     unresolvedExternalChained.unresolvedRelocation = unresolvedRelocationChained;
 
@@ -1402,9 +2263,9 @@ TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEa
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module0->symbols[unresolvedRelocationCircular.symbolName] = module0RelocatedSymbol;
     MockGraphicsAllocation alloc0;
@@ -1437,10 +2298,10 @@ TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEa
     std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle(), module2->toHandle()};
     ze_result_t res = module0->performDynamicLink(3, hModules.data(), nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
-    EXPECT_EQ((int)module0->kernelImmDatas[0]->getResidencyContainer().size(), 3);
-    EXPECT_TRUE(std::find(module0->kernelImmDatas[0]->getResidencyContainer().begin(), module0->kernelImmDatas[0]->getResidencyContainer().end(), &alloc0) != module0->kernelImmDatas[0]->getResidencyContainer().end());
-    EXPECT_TRUE(std::find(module0->kernelImmDatas[0]->getResidencyContainer().begin(), module0->kernelImmDatas[0]->getResidencyContainer().end(), &alloc1) != module0->kernelImmDatas[0]->getResidencyContainer().end());
-    EXPECT_TRUE(std::find(module0->kernelImmDatas[0]->getResidencyContainer().begin(), module0->kernelImmDatas[0]->getResidencyContainer().end(), &alloc2) != module0->kernelImmDatas[0]->getResidencyContainer().end());
+    EXPECT_EQ((int)module0->kernelImmData[0]->getResidencyContainer().size(), 3);
+    EXPECT_TRUE(std::find(module0->kernelImmData[0]->getResidencyContainer().begin(), module0->kernelImmData[0]->getResidencyContainer().end(), &alloc0) != module0->kernelImmData[0]->getResidencyContainer().end());
+    EXPECT_TRUE(std::find(module0->kernelImmData[0]->getResidencyContainer().begin(), module0->kernelImmData[0]->getResidencyContainer().end(), &alloc1) != module0->kernelImmData[0]->getResidencyContainer().end());
+    EXPECT_TRUE(std::find(module0->kernelImmData[0]->getResidencyContainer().begin(), module0->kernelImmData[0]->getResidencyContainer().end(), &alloc2) != module0->kernelImmData[0]->getResidencyContainer().end());
 }
 
 TEST_F(ModuleDynamicLinkTests, givenModuleWithInternalRelocationAndUnresolvedExternalSymbolWhenTheOtherModuleDefinesTheSymbolThenAllSymbolsArePatched) {
@@ -1449,13 +2310,14 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithInternalRelocationAndUnresolvedExt
     linkerInput->exportedFunctionsSegmentId = 0;
 
     uint32_t internalRelocationOffset = 0x10;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, internalRelocationOffset, LinkerInput::RelocationInfo::Type::Address, SegmentType::Instructions}});
-    uint32_t expectedInternalRelocationValue = sizeof(ImplicitArgs);
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), internalRelocationOffset, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions}});
+    const auto &hwInfo = neoDevice->getHardwareInfo();
+    uint32_t expectedInternalRelocationValue = ImplicitArgsTestHelper::getImplicitArgsSize(hwInfo.caps.implicitArgsVersion);
 
     uint32_t externalRelocationOffset = 0x20;
     constexpr auto externalSymbolName = "unresolved";
     uint64_t externalSymbolAddress = castToUint64(&externalRelocationOffset);
-    linkerInput->textRelocations[0].push_back({externalSymbolName, externalRelocationOffset, LinkerInput::RelocationInfo::Type::Address, SegmentType::Instructions});
+    linkerInput->textRelocations[0].push_back({externalSymbolName, externalRelocationOffset, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions});
 
     char kernelHeap[MemoryConstants::cacheLineSize] = {};
 
@@ -1469,13 +2331,13 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithInternalRelocationAndUnresolvedExt
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::cacheLineSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::cacheLineSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
     auto isaPtr = kernelImmData->getIsaGraphicsAllocation()->getUnderlyingBuffer();
 
     memset(isaPtr, 0, MemoryConstants::cacheLineSize);
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module1->symbols[externalSymbolName] = {{}, externalSymbolAddress};
 
@@ -1493,6 +2355,97 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithInternalRelocationAndUnresolvedExt
     EXPECT_EQ(externalSymbolAddress, *reinterpret_cast<uint64_t *>(ptrOffset(isaPtr, externalRelocationOffset)));
 }
 
+HWTEST_F(ModuleDynamicLinkTests, givenHeaplessAndModuleWithInternalRelocationAndUnresolvedExternalSymbolWhenLinkModuleThenPatchedAddressesAreCorrect) {
+
+    for (bool heaplessModeEnabled : {true, false}) {
+
+        auto backup = std::unique_ptr<CompilerProductHelper>(new MockCompilerProductHelperHeapless(heaplessModeEnabled));
+        neoDevice->getRootDeviceEnvironmentRef().compilerProductHelper.swap(backup);
+
+        auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
+        linkerInput->traits.requiresPatchingOfInstructionSegments = true;
+        linkerInput->exportedFunctionsSegmentId = 0;
+        uint32_t internalRelocationOffset = 0x10;
+        linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), internalRelocationOffset, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions}});
+        uint32_t externalRelocationOffset = 0x20;
+        constexpr auto externalSymbolName = "unresolved";
+        linkerInput->textRelocations[0].push_back({externalSymbolName, externalRelocationOffset, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions});
+        char kernelHeap[MemoryConstants::cacheLineSize] = {};
+        auto kernelInfo = std::make_unique<NEO::KernelInfo>();
+        kernelInfo->heapInfo.pKernelHeap = kernelHeap;
+        kernelInfo->heapInfo.kernelHeapSize = MemoryConstants::cacheLineSize;
+        kernelInfo->kernelDescriptor.kernelAttributes.flags.useStackCalls = true;
+        auto module = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
+        module->getTranslationUnit()->programInfo.kernelInfos.push_back(kernelInfo.release());
+        module->getTranslationUnit()->programInfo.linkerInput = std::move(linkerInput);
+        auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
+        kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
+            {device->getRootDeviceIndex(), MemoryConstants::cacheLineSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
+
+        auto isaAlloc = kernelImmData->getIsaGraphicsAllocation();
+        auto offsetInParentAllocation = kernelImmData->getIsaOffsetInParentAllocation();
+        auto expectedIsaAddressToPatch = offsetInParentAllocation;
+        expectedIsaAddressToPatch += heaplessModeEnabled ? isaAlloc->getGpuAddress() : isaAlloc->getGpuAddressToPatch();
+
+        module->kernelImmData.push_back(std::move(kernelImmData));
+
+        EXPECT_TRUE(module->linkBinary());
+
+        EXPECT_EQ(expectedIsaAddressToPatch, module->isaSegmentsForPatching[0].gpuAddress);
+        if (heaplessModeEnabled) {
+            EXPECT_EQ(expectedIsaAddressToPatch, module->exportedFunctionsSurface->getGpuAddress());
+        } else {
+            EXPECT_EQ(expectedIsaAddressToPatch, module->exportedFunctionsSurface->getGpuAddressToPatch());
+        }
+
+        neoDevice->getRootDeviceEnvironmentRef().compilerProductHelper.swap(backup);
+    }
+}
+
+HWTEST_F(ModuleDynamicLinkTests, givenHeaplessAndModuleWithInternalRelocationAndUnresolvedExternalSymbolWhenDynamicLinkModuleThenPatchedAddressesAreCorrect) {
+
+    for (bool heaplessModeEnabled : {true, false}) {
+
+        auto backup = std::unique_ptr<CompilerProductHelper>(new MockCompilerProductHelperHeapless(heaplessModeEnabled));
+        neoDevice->getRootDeviceEnvironmentRef().compilerProductHelper.swap(backup);
+
+        auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
+        linkerInput->traits.requiresPatchingOfInstructionSegments = true;
+        linkerInput->exportedFunctionsSegmentId = 0;
+        uint32_t internalRelocationOffset = 0x10;
+        linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), internalRelocationOffset, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions}});
+        uint32_t externalRelocationOffset = 0x20;
+        constexpr auto externalSymbolName = "unresolved";
+        linkerInput->textRelocations[0].push_back({externalSymbolName, externalRelocationOffset, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions});
+
+        char kernelHeap[MemoryConstants::cacheLineSize] = {};
+        auto kernelInfo = std::make_unique<NEO::KernelInfo>();
+        kernelInfo->heapInfo.pKernelHeap = kernelHeap;
+        kernelInfo->heapInfo.kernelHeapSize = MemoryConstants::cacheLineSize;
+        kernelInfo->kernelDescriptor.kernelAttributes.flags.useStackCalls = true;
+        auto module = std::make_unique<WhiteBox<::L0::Module>>(device, nullptr, ModuleType::user);
+        module->getTranslationUnit()->programInfo.kernelInfos.push_back(kernelInfo.release());
+        module->getTranslationUnit()->programInfo.linkerInput = std::move(linkerInput);
+        auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
+        kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
+            {device->getRootDeviceIndex(), MemoryConstants::cacheLineSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
+
+        auto isaAlloc = kernelImmData->getIsaGraphicsAllocation();
+        auto offsetInParentAllocation = kernelImmData->getIsaOffsetInParentAllocation();
+        auto expectedIsaAddressToPatch = offsetInParentAllocation;
+        expectedIsaAddressToPatch += heaplessModeEnabled ? isaAlloc->getGpuAddress() : isaAlloc->getGpuAddressToPatch();
+        module->kernelImmData.push_back(std::move(kernelImmData));
+
+        std::vector<ze_module_handle_t> hModules = {module->toHandle()};
+        ze_result_t res = module->performDynamicLink(1, hModules.data(), nullptr);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        EXPECT_TRUE(module->isFullyLinked);
+        EXPECT_EQ(expectedIsaAddressToPatch, module->isaSegmentsForPatching[0].gpuAddress);
+
+        neoDevice->getRootDeviceEnvironmentRef().compilerProductHelper.swap(backup);
+    }
+}
+
 TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEachModuleDefinesTheSymbolThenTheExportedFunctionSurfaceInBothModulesIsAddedToTheImportedSymbolAllocations) {
 
     uint64_t gpuAddress0 = 0x12345;
@@ -1503,21 +2456,21 @@ TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEa
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
     NEO::Linker::RelocationInfo unresolvedRelocationCircular;
     unresolvedRelocationCircular.symbolName = "unresolvedCircular";
     unresolvedRelocationCircular.offset = offset;
-    unresolvedRelocationCircular.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocationCircular.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternalCircular;
     unresolvedExternalCircular.unresolvedRelocation = unresolvedRelocationCircular;
 
     NEO::Linker::RelocationInfo unresolvedRelocationChained;
     unresolvedRelocationChained.symbolName = "unresolvedChained";
     unresolvedRelocationChained.offset = offset;
-    unresolvedRelocationChained.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocationChained.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternalChained;
     unresolvedExternalChained.unresolvedRelocation = unresolvedRelocationChained;
 
@@ -1546,9 +2499,9 @@ TEST_F(ModuleDynamicLinkTests, givenMultipleModulesWithUnresolvedSymbolWhenTheEa
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module0->symbols[unresolvedRelocationCircular.symbolName] = module0RelocatedSymbol;
     MockGraphicsAllocation alloc0;
@@ -1596,14 +2549,14 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
     NEO::Linker::RelocationInfo unresolvedRelocation2;
     unresolvedRelocation2.symbolName = "unresolved2";
     unresolvedRelocation2.offset = offset2;
-    unresolvedRelocation2.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation2.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal2;
     unresolvedExternal2.unresolvedRelocation = unresolvedRelocation2;
 
@@ -1631,9 +2584,9 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module1->symbols[unresolvedRelocation.symbolName] = relocatedSymbol;
 
@@ -1646,13 +2599,13 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolWhenTheOtherModule
     ze_result_t res = module0->performDynamicLink(2, hModules.data(), &dynLinkLog);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     size_t buildLogSize;
-    zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr);
+    ::zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr);
     EXPECT_GT(static_cast<int>(buildLogSize), 0);
     char *logBuffer = new char[buildLogSize]();
-    zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer);
+    ::zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer);
     EXPECT_NE(logBuffer, "");
     delete[] logBuffer;
-    zeModuleBuildLogDestroy(dynLinkLog);
+    ::zeModuleBuildLogDestroy(dynLinkLog);
 }
 
 TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnotherModuleWhenDynamicLinkThenLinkFailureIsReturnedAndLogged) {
@@ -1663,14 +2616,14 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnoth
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
     NEO::Linker::RelocationInfo unresolvedRelocation2;
     unresolvedRelocation2.symbolName = "unresolved2";
     unresolvedRelocation2.offset = offset2;
-    unresolvedRelocation2.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation2.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal2;
     unresolvedExternal2.unresolvedRelocation = unresolvedRelocation2;
 
@@ -1692,9 +2645,9 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnoth
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
     module0->isFunctionSymbolExportEnabled = true;
     module1->isFunctionSymbolExportEnabled = true;
 
@@ -1702,13 +2655,13 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnoth
     ze_result_t res = module0->performDynamicLink(2, hModules.data(), &dynLinkLog);
     EXPECT_EQ(ZE_RESULT_ERROR_MODULE_LINK_FAILURE, res);
     size_t buildLogSize;
-    zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr);
+    ::zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr);
     EXPECT_GT(static_cast<int>(buildLogSize), 0);
     char *logBuffer = new char[buildLogSize]();
-    zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer);
+    ::zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer);
     EXPECT_NE(logBuffer, "");
     delete[] logBuffer;
-    zeModuleBuildLogDestroy(dynLinkLog);
+    ::zeModuleBuildLogDestroy(dynLinkLog);
 }
 
 TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnotherModuleWhenDynamicLinkWithoutRequiredFlagsThenLinkFailureIsReturnedAndLogged) {
@@ -1719,14 +2672,14 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnoth
     NEO::Linker::RelocationInfo unresolvedRelocation;
     unresolvedRelocation.symbolName = "unresolved";
     unresolvedRelocation.offset = offset;
-    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal;
     unresolvedExternal.unresolvedRelocation = unresolvedRelocation;
 
     NEO::Linker::RelocationInfo unresolvedRelocation2;
     unresolvedRelocation2.symbolName = "unresolved2";
     unresolvedRelocation2.offset = offset2;
-    unresolvedRelocation2.type = NEO::Linker::RelocationInfo::Type::Address;
+    unresolvedRelocation2.type = NEO::Linker::RelocationInfo::Type::address;
     NEO::Linker::UnresolvedExternal unresolvedExternal2;
     unresolvedExternal2.unresolvedRelocation = unresolvedRelocation2;
 
@@ -1748,26 +2701,30 @@ TEST_F(ModuleDynamicLinkTests, givenModuleWithUnresolvedSymbolsNotPresentInAnoth
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
     module0->isFunctionSymbolExportEnabled = false;
     module1->isFunctionSymbolExportEnabled = false;
 
     std::vector<ze_module_handle_t> hModules = {module0->toHandle(), module1->toHandle()};
     ze_result_t res = module0->performDynamicLink(2, hModules.data(), &dynLinkLog);
-    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, res);
+    const char *pStr = nullptr;
+    std::string emptyString = "";
+    zeDriverGetLastErrorDescription(device->getDriverHandle(), &pStr);
+    EXPECT_NE(0, strcmp(pStr, emptyString.c_str()));
+    EXPECT_EQ(ZE_RESULT_ERROR_MODULE_LINK_FAILURE, res);
     size_t buildLogSize;
-    zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr);
+    ::zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, nullptr);
     EXPECT_GT(static_cast<int>(buildLogSize), 0);
     char *logBuffer = new char[buildLogSize]();
-    zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer);
+    ::zeModuleBuildLogGetString(dynLinkLog, &buildLogSize, logBuffer);
     EXPECT_NE(logBuffer, "");
     delete[] logBuffer;
-    zeModuleBuildLogDestroy(dynLinkLog);
+    ::zeModuleBuildLogDestroy(dynLinkLog);
 }
 
-using ModuleDynamicLinkTest = Test<ModuleFixture>;
+using ModuleDynamicLinkTest = Test<ModuleFixtureWithoutModule>;
 TEST_F(ModuleDynamicLinkTest, givenUnresolvedSymbolsWhenModuleIsCreatedThenIsaAllocationsAreNotCopied) {
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
@@ -1783,7 +2740,7 @@ TEST_F(ModuleDynamicLinkTest, givenUnresolvedSymbolsWhenModuleIsCreatedThenIsaAl
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::make_unique<Module>(device, moduleBuildLog, ModuleType::User);
+    auto module = std::make_unique<Module>(device, moduleBuildLog, ModuleType::user);
     ASSERT_NE(nullptr, module.get());
 
     NEO::Linker::RelocationInfo unresolvedRelocation;
@@ -1801,6 +2758,73 @@ TEST_F(ModuleDynamicLinkTest, givenUnresolvedSymbolsWhenModuleIsCreatedThenIsaAl
     }
 
     EXPECT_FALSE(module->isFullyLinked);
+}
+
+TEST_F(ModuleDynamicLinkTest, givenModuleWithUnresolvedSymbolWhenKernelIsCreatedThenErrorIsReturned) {
+    auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
+    const auto &src = zebinData->storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::make_unique<Module>(device, moduleBuildLog, ModuleType::user);
+    ASSERT_NE(nullptr, module.get());
+
+    NEO::Linker::RelocationInfo unresolvedRelocation;
+    unresolvedRelocation.symbolName = "unresolved";
+
+    auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
+    linkerInput->dataRelocations.push_back(unresolvedRelocation);
+    linkerInput->traits.requiresPatchingOfGlobalVariablesBuffer = true;
+    module->unresolvedExternalsInfo.push_back({unresolvedRelocation});
+    module->translationUnit->programInfo.linkerInput = std::move(linkerInput);
+    module->initialize(&moduleDesc, neoDevice);
+    ASSERT_FALSE(module->isFullyLinked);
+
+    ze_kernel_handle_t kernelHandle;
+    ze_kernel_desc_t kernelDesc = {};
+    kernelDesc.pKernelName = "nonexistent_kernel";
+
+    ze_result_t res = module->createKernel(&kernelDesc, &kernelHandle);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_MODULE_UNLINKED, res);
+}
+
+TEST_F(ModuleDynamicLinkTest, givenModuleWithSubDeviceIDSymbolToResolveWhenKernelIsCreatedThenSuccessIsReturned) {
+    auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
+    const auto &src = zebinData->storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::make_unique<Module>(device, moduleBuildLog, ModuleType::user);
+    ASSERT_NE(nullptr, module.get());
+
+    module->unresolvedExternalsInfo.push_back({{"__SubDeviceID", 0, NEO::Linker::RelocationInfo::Type::addressLow, NEO::SegmentType::instructions}, 0u, false});
+    module->unresolvedExternalsInfo.push_back({{"__SubDeviceID", 64, NEO::Linker::RelocationInfo::Type::addressHigh, NEO::SegmentType::instructions}, 0u, false});
+
+    std::vector<char> instructionSegment;
+    instructionSegment.resize(128u);
+    module->isaSegmentsForPatching.push_back({instructionSegment.data(), 64u});
+    module->isaSegmentsForPatching.push_back({&instructionSegment[64], 64u});
+    module->initialize(&moduleDesc, neoDevice);
+    ASSERT_TRUE(module->isFullyLinked);
+
+    ze_kernel_handle_t kernelHandle;
+    ze_kernel_desc_t kernelDesc = {};
+    kernelDesc.pKernelName = "test";
+
+    ze_result_t res = module->createKernel(&kernelDesc, &kernelHandle);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+
+    Kernel::fromHandle(kernelHandle)->destroy();
 }
 
 TEST_F(ModuleDynamicLinkTests, givenModuleWithFunctionDependenciesWhenOtherModuleDefinesThisFunctionThenBarrierCountIsProperlyResolved) {
@@ -1846,7 +2870,7 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolThenGetFunctionP
     uint64_t gpuAddress = 0x12345;
 
     NEO::SymbolInfo symbolInfo{};
-    symbolInfo.segment = NEO::SegmentType::Instructions;
+    symbolInfo.segment = NEO::SegmentType::instructions;
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
     char kernelHeap[MemoryConstants::pageSize] = {};
@@ -1858,9 +2882,9 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolThenGetFunctionP
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module0->symbols["externalFunction"] = relocatedSymbol;
 
@@ -1877,7 +2901,7 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolButNoExportFlags
     uint64_t gpuAddress = 0x12345;
 
     NEO::SymbolInfo symbolInfo{};
-    symbolInfo.segment = NEO::SegmentType::Instructions;
+    symbolInfo.segment = NEO::SegmentType::instructions;
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
     char kernelHeap[MemoryConstants::pageSize] = {};
@@ -1893,16 +2917,20 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolButNoExportFlags
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
     kernelImmData->kernelDescriptor = &kernelDescriptor;
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module0->symbols["externalFunction"] = relocatedSymbol;
 
     void *functionPointer = nullptr;
     ze_result_t res = module0->getFunctionPointer("Invalid", &functionPointer);
+    const char *pStr = nullptr;
+    std::string emptyString = "";
+    zeDriverGetLastErrorDescription(device->getDriverHandle(), &pStr);
+    EXPECT_NE(0, strcmp(pStr, emptyString.c_str()));
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, res);
 }
 
@@ -1911,7 +2939,7 @@ TEST_F(ModuleFunctionPointerTests, givenInvalidFunctionNameAndModuleWithExported
     uint64_t gpuAddress = 0x12345;
 
     NEO::SymbolInfo symbolInfo{};
-    symbolInfo.segment = NEO::SegmentType::Instructions;
+    symbolInfo.segment = NEO::SegmentType::instructions;
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
     char kernelHeap[MemoryConstants::pageSize] = {};
@@ -1927,11 +2955,11 @@ TEST_F(ModuleFunctionPointerTests, givenInvalidFunctionNameAndModuleWithExported
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
     kernelImmData->kernelDescriptor = &kernelDescriptor;
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module0->symbols["externalFunction"] = relocatedSymbol;
 
@@ -1945,7 +2973,7 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolThenGetFunctionP
     uint64_t gpuAddress = 0x12345;
 
     NEO::SymbolInfo symbolInfo{};
-    symbolInfo.segment = NEO::SegmentType::Instructions;
+    symbolInfo.segment = NEO::SegmentType::instructions;
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
     char kernelHeap[MemoryConstants::pageSize] = {};
@@ -1961,11 +2989,11 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolThenGetFunctionP
 
     auto kernelImmData = std::make_unique<WhiteBox<::L0::KernelImmutableData>>(device);
     kernelImmData->isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
 
     kernelImmData->kernelDescriptor = &kernelDescriptor;
 
-    module0->kernelImmDatas.push_back(std::move(kernelImmData));
+    module0->kernelImmData.push_back(std::move(kernelImmData));
 
     module0->symbols["externalFunction"] = relocatedSymbol;
 
@@ -1973,19 +3001,11 @@ TEST_F(ModuleFunctionPointerTests, givenModuleWithExportedSymbolThenGetFunctionP
     ze_result_t res = module0->getFunctionPointer("kernelFunction", &functionPointer);
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
-    EXPECT_EQ(reinterpret_cast<uint64_t>(functionPointer), module0->kernelImmDatas[0]->getIsaGraphicsAllocation()->getGpuAddress());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(functionPointer), module0->kernelImmData[0]->getIsaGraphicsAllocation()->getGpuAddress());
 }
 
-class DeviceModuleSetArgBufferTest : public ModuleFixture, public ::testing::Test {
+class DeviceModuleSetArgBufferFixture : public ModuleFixture {
   public:
-    void SetUp() override {
-        ModuleFixture::setUp();
-    }
-
-    void TearDown() override {
-        ModuleFixture::tearDown();
-    }
-
     void createKernelAndAllocMemory(uint32_t rootDeviceIndex, void **ptr, ze_kernel_handle_t *kernelHandle) {
         ze_kernel_desc_t kernelDesc = {};
         kernelDesc.pKernelName = kernelName.c_str();
@@ -1997,11 +3017,11 @@ class DeviceModuleSetArgBufferTest : public ModuleFixture, public ::testing::Tes
         EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     }
 };
+using DeviceModuleSetArgBufferTest = Test<DeviceModuleSetArgBufferFixture>;
 
 HWTEST_F(DeviceModuleSetArgBufferTest,
          givenValidMemoryUsedinFirstCallToSetArgBufferThenNullptrSetOnTheSecondCallThenArgBufferisUpdatedInEachCallAndSuccessIsReturned) {
     uint32_t rootDeviceIndex = 0;
-    createModuleFromMockBinary();
 
     ze_kernel_handle_t kernelHandle;
     void *validBufferPtr = nullptr;
@@ -2018,7 +3038,7 @@ HWTEST_F(DeviceModuleSetArgBufferTest,
     auto argBufferValue = *reinterpret_cast<uint64_t *>(const_cast<uint8_t *>(argBufferPtr));
     EXPECT_EQ(argBufferValue, reinterpret_cast<uint64_t>(validBufferPtr));
 
-    for (auto alloc : kernel->getResidencyContainer()) {
+    for (auto alloc : kernel->getArgumentsResidencyContainer()) {
         if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(validBufferPtr)) {
             EXPECT_EQ(rootDeviceIndex, alloc->getRootDeviceIndex());
         }
@@ -2061,6 +3081,325 @@ class MultiDeviceModuleSetArgBufferTest : public MultiDeviceModuleFixture, publi
 };
 
 HWTEST_F(MultiDeviceModuleSetArgBufferTest,
+         givenCallsToSetArgBufferWithReservedMemoryThenKernelResidencyContainerHasKernelArgMappedAllocationAndPhysicalMemoryIsNotForcedResidentAtMapTime) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < numRootDevices; rootDeviceIndex++) {
+        createModuleFromMockBinary(rootDeviceIndex);
+        auto device = driverHandle->devices[rootDeviceIndex];
+        auto neoDevice = device->getNEODevice();
+        neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface =
+            std::make_unique<NEO::MockMemoryOperations>();
+
+        NEO::MockMemoryOperations *mockMemoryInterface = static_cast<NEO::MockMemoryOperations *>(
+            neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface.get());
+
+        mockMemoryInterface->captureGfxAllocationsForMakeResident = true;
+
+        ze_kernel_handle_t kernelHandle;
+        void *ptr = nullptr;
+        size_t size = MemoryConstants::pageSize64k;
+        size_t reservationSize = size * 2;
+        ze_kernel_desc_t kernelDesc = {};
+        kernelDesc.pKernelName = kernelName.c_str();
+        ze_result_t res = modules[rootDeviceIndex]->createKernel(&kernelDesc, &kernelHandle);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->reserveVirtualMem(nullptr, reservationSize, &ptr);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_desc_t desc = {};
+        desc.size = size;
+        ze_physical_mem_handle_t phPhysicalMemory;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_handle_t phPhysicalMemory2;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory2);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->mapVirtualMem(ptr, size, phPhysicalMemory, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        void *offsetAddress = reinterpret_cast<void *>(reinterpret_cast<uint64_t>(ptr) + size);
+        res = context->mapVirtualMem(offsetAddress, size, phPhysicalMemory2, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+
+        L0::KernelImp *kernel = reinterpret_cast<L0::KernelImp *>(Kernel::fromHandle(kernelHandle));
+        kernel->setArgBuffer(0, sizeof(ptr), &ptr);
+
+        bool phys1Resident = false;
+        bool phys2Resident = false;
+        for (auto alloc : kernel->getArgumentsResidencyContainer()) {
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(ptr)) {
+                phys1Resident = true;
+            }
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(offsetAddress)) {
+                phys2Resident = true;
+            }
+        }
+        if constexpr (supportsLegacyRenderSurfaceState<FamilyType>()) {
+            auto argInfo = kernel->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[0].as<NEO::ArgDescPointer>();
+            auto surfaceStateAddressRaw = ptrOffset(kernel->getSurfaceStateHeapData(), argInfo.bindful);
+            auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
+            SurfaceStateBufferLength length = {0};
+            length.length = static_cast<uint32_t>((MemoryConstants::fullStatefulRegion)-1);
+            EXPECT_EQ(surfaceStateAddress->getWidth(), static_cast<uint32_t>(length.surfaceState.width));
+            EXPECT_EQ(surfaceStateAddress->getHeight(), static_cast<uint32_t>(length.surfaceState.height + 1));
+            EXPECT_EQ(surfaceStateAddress->getDepth(), static_cast<uint32_t>(length.surfaceState.depth + 1));
+        }
+        EXPECT_TRUE(phys1Resident);
+        EXPECT_FALSE(phys2Resident);
+
+        auto physicalIt = driverHandle->getMemoryManager()->getPhysicalMemoryAllocationMap().find(static_cast<void *>(phPhysicalMemory));
+        auto physical1Allocation = physicalIt->second->allocation;
+        EXPECT_EQ(NEO::MemoryOperationsStatus::memoryNotFound, mockMemoryInterface->isResident(neoDevice, *physical1Allocation));
+
+        physicalIt = driverHandle->getMemoryManager()->getPhysicalMemoryAllocationMap().find(static_cast<void *>(phPhysicalMemory2));
+        auto physical2Allocation = physicalIt->second->allocation;
+        EXPECT_EQ(NEO::MemoryOperationsStatus::memoryNotFound, mockMemoryInterface->isResident(neoDevice, *physical2Allocation));
+
+        res = context->unMapVirtualMem(ptr, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->unMapVirtualMem(offsetAddress, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->freeVirtualMem(ptr, reservationSize);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory2);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        Kernel::fromHandle(kernelHandle)->destroy();
+    }
+}
+
+HWTEST_F(MultiDeviceModuleSetArgBufferTest,
+         givenCallsToSetArgBufferWithOffsetReservedMemoryThenKernelResidencyHasArgMappedAllocationAndPhysicalMemoryIsNotForcedResidentAtMapTime) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < numRootDevices; rootDeviceIndex++) {
+        createModuleFromMockBinary(rootDeviceIndex);
+        auto device = driverHandle->devices[rootDeviceIndex];
+        auto neoDevice = device->getNEODevice();
+        neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface =
+            std::make_unique<NEO::MockMemoryOperations>();
+
+        NEO::MockMemoryOperations *mockMemoryInterface = static_cast<NEO::MockMemoryOperations *>(
+            neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface.get());
+
+        mockMemoryInterface->captureGfxAllocationsForMakeResident = true;
+
+        ze_kernel_handle_t kernelHandle;
+        void *ptr = nullptr;
+        size_t size = MemoryConstants::pageSize64k;
+        size_t reservationSize = size * 2;
+        ze_kernel_desc_t kernelDesc = {};
+        kernelDesc.pKernelName = kernelName.c_str();
+        ze_result_t res = modules[rootDeviceIndex]->createKernel(&kernelDesc, &kernelHandle);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->reserveVirtualMem(nullptr, reservationSize, &ptr);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_desc_t desc = {};
+        desc.size = size;
+        ze_physical_mem_handle_t phPhysicalMemory;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_handle_t phPhysicalMemory2;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory2);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->mapVirtualMem(ptr, size, phPhysicalMemory, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        void *offsetAddress = reinterpret_cast<void *>(reinterpret_cast<uint64_t>(ptr) + size);
+        res = context->mapVirtualMem(offsetAddress, size, phPhysicalMemory2, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+
+        L0::KernelImp *kernel = reinterpret_cast<L0::KernelImp *>(Kernel::fromHandle(kernelHandle));
+        kernel->setArgBuffer(0, sizeof(offsetAddress), &offsetAddress);
+
+        bool phys1Resident = false;
+        bool phys2Resident = false;
+        for (auto alloc : kernel->getArgumentsResidencyContainer()) {
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(ptr)) {
+                phys1Resident = true;
+            }
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(offsetAddress)) {
+                phys2Resident = true;
+            }
+        }
+        if constexpr (supportsLegacyRenderSurfaceState<FamilyType>()) {
+            auto argInfo = kernel->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[0].as<NEO::ArgDescPointer>();
+            auto surfaceStateAddressRaw = ptrOffset(kernel->getSurfaceStateHeapData(), argInfo.bindful);
+            auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
+            SurfaceStateBufferLength length = {0};
+            length.length = static_cast<uint32_t>((MemoryConstants::fullStatefulRegion)-1);
+            EXPECT_EQ(surfaceStateAddress->getWidth(), static_cast<uint32_t>(length.surfaceState.width));
+            EXPECT_EQ(surfaceStateAddress->getHeight(), static_cast<uint32_t>(length.surfaceState.height + 1));
+            EXPECT_EQ(surfaceStateAddress->getDepth(), static_cast<uint32_t>(length.surfaceState.depth + 1));
+        }
+        EXPECT_FALSE(phys1Resident);
+        EXPECT_TRUE(phys2Resident);
+
+        auto physicalIt = driverHandle->getMemoryManager()->getPhysicalMemoryAllocationMap().find(static_cast<void *>(phPhysicalMemory));
+        auto physical1Allocation = physicalIt->second->allocation;
+        EXPECT_EQ(NEO::MemoryOperationsStatus::memoryNotFound, mockMemoryInterface->isResident(neoDevice, *physical1Allocation));
+
+        physicalIt = driverHandle->getMemoryManager()->getPhysicalMemoryAllocationMap().find(static_cast<void *>(phPhysicalMemory2));
+        auto physical2Allocation = physicalIt->second->allocation;
+        EXPECT_EQ(NEO::MemoryOperationsStatus::memoryNotFound, mockMemoryInterface->isResident(neoDevice, *physical2Allocation));
+
+        res = context->unMapVirtualMem(ptr, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->unMapVirtualMem(offsetAddress, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->freeVirtualMem(ptr, reservationSize);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory2);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        Kernel::fromHandle(kernelHandle)->destroy();
+    }
+}
+
+HWTEST_F(MultiDeviceModuleSetArgBufferTest,
+         givenCallsToSetArgBufferWithReservedMemoryWithMappingToFullReservedSizeThenSurfaceStateSizeisUnchanged) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < numRootDevices; rootDeviceIndex++) {
+        createModuleFromMockBinary(rootDeviceIndex);
+        auto device = driverHandle->devices[rootDeviceIndex];
+        driverHandle->devices[rootDeviceIndex]->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface =
+            std::make_unique<NEO::MockMemoryOperations>();
+
+        ze_kernel_handle_t kernelHandle;
+        void *ptr = nullptr;
+        size_t size = MemoryConstants::pageSize64k;
+        size_t reservationSize = size * 2;
+        ze_kernel_desc_t kernelDesc = {};
+        kernelDesc.pKernelName = kernelName.c_str();
+        ze_result_t res = modules[rootDeviceIndex]->createKernel(&kernelDesc, &kernelHandle);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->reserveVirtualMem(nullptr, reservationSize, &ptr);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_desc_t desc = {};
+        desc.size = reservationSize;
+        ze_physical_mem_handle_t phPhysicalMemory;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->mapVirtualMem(ptr, reservationSize, phPhysicalMemory, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+
+        L0::KernelImp *kernel = reinterpret_cast<L0::KernelImp *>(Kernel::fromHandle(kernelHandle));
+        kernel->setArgBuffer(0, sizeof(ptr), &ptr);
+
+        bool phys1Resident = false;
+        for (auto alloc : kernel->getArgumentsResidencyContainer()) {
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(ptr)) {
+                phys1Resident = true;
+            }
+        }
+        if constexpr (supportsLegacyRenderSurfaceState<FamilyType>()) {
+            auto argInfo = kernel->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[0].as<NEO::ArgDescPointer>();
+            auto surfaceStateAddressRaw = ptrOffset(kernel->getSurfaceStateHeapData(), argInfo.bindful);
+            auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
+            SurfaceStateBufferLength length = {0};
+            length.length = static_cast<uint32_t>((MemoryConstants::fullStatefulRegion)-1);
+            EXPECT_EQ(surfaceStateAddress->getWidth(), static_cast<uint32_t>(length.surfaceState.width));
+            EXPECT_EQ(surfaceStateAddress->getHeight(), static_cast<uint32_t>(length.surfaceState.height + 1));
+            EXPECT_EQ(surfaceStateAddress->getDepth(), static_cast<uint32_t>(length.surfaceState.depth + 1));
+        }
+        EXPECT_TRUE(phys1Resident);
+        res = context->unMapVirtualMem(ptr, reservationSize);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->freeVirtualMem(ptr, reservationSize);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        Kernel::fromHandle(kernelHandle)->destroy();
+    }
+}
+
+HWTEST_F(MultiDeviceModuleSetArgBufferTest,
+         givenCallsToSetArgBufferWithReservedMemoryWithMappingLargerThan4GBThenSurfaceStateSizeProgrammedDoesNotExceed4GB) {
+    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < numRootDevices; rootDeviceIndex++) {
+        createModuleFromMockBinary(rootDeviceIndex);
+        auto device = driverHandle->devices[rootDeviceIndex];
+        driverHandle->devices[rootDeviceIndex]->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface =
+            std::make_unique<NEO::MockMemoryOperations>();
+
+        ze_kernel_handle_t kernelHandle;
+        void *ptr = nullptr;
+        size_t size = MemoryConstants::pageSize64k;
+        size_t reservationSize = size * 4;
+        ze_kernel_desc_t kernelDesc = {};
+        kernelDesc.pKernelName = kernelName.c_str();
+        ze_result_t res = modules[rootDeviceIndex]->createKernel(&kernelDesc, &kernelHandle);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->reserveVirtualMem(nullptr, reservationSize, &ptr);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_desc_t desc = {};
+        desc.size = size;
+        ze_physical_mem_handle_t phPhysicalMemory;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_handle_t phPhysicalMemory2;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory2);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        ze_physical_mem_handle_t phPhysicalMemory3;
+        res = context->createPhysicalMem(device->toHandle(), &desc, &phPhysicalMemory3);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->mapVirtualMem(ptr, size, phPhysicalMemory, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        void *offsetAddress = reinterpret_cast<void *>(reinterpret_cast<uint64_t>(ptr) + size);
+        res = context->mapVirtualMem(offsetAddress, size, phPhysicalMemory2, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        void *offsetAddress2 = reinterpret_cast<void *>(reinterpret_cast<uint64_t>(ptr) + (size * 2));
+        res = context->mapVirtualMem(offsetAddress2, size, phPhysicalMemory3, 0, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+
+        auto svmAllocsManager = device->getDriverHandle()->getSvmAllocsManager();
+        auto virtualAlloc = svmAllocsManager->getSVMAlloc(ptr);
+        virtualAlloc->virtualReservationData->mappedAllocations.at(offsetAddress)->mappedAllocation.allocation->setSize((MemoryConstants::gigaByte * 4) - MemoryConstants::pageSize64k);
+
+        L0::KernelImp *kernel = reinterpret_cast<L0::KernelImp *>(Kernel::fromHandle(kernelHandle));
+        kernel->setArgBuffer(0, sizeof(ptr), &ptr);
+
+        virtualAlloc->virtualReservationData->mappedAllocations.at(offsetAddress)->mappedAllocation.allocation->setSize(size);
+
+        bool phys1Resident = false;
+        bool phys2Resident = false;
+        for (auto alloc : kernel->getArgumentsResidencyContainer()) {
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(ptr)) {
+                phys1Resident = true;
+            }
+            if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(offsetAddress)) {
+                phys2Resident = true;
+            }
+        }
+        if constexpr (supportsLegacyRenderSurfaceState<FamilyType>()) {
+            auto argInfo = kernel->getImmutableData()->getDescriptor().payloadMappings.explicitArgs[0].as<NEO::ArgDescPointer>();
+            auto surfaceStateAddressRaw = ptrOffset(kernel->getSurfaceStateHeapData(), argInfo.bindful);
+            auto surfaceStateAddress = reinterpret_cast<RENDER_SURFACE_STATE *>(const_cast<unsigned char *>(surfaceStateAddressRaw));
+            SurfaceStateBufferLength length = {0};
+            length.length = static_cast<uint32_t>((MemoryConstants::fullStatefulRegion)-1);
+            EXPECT_EQ(surfaceStateAddress->getWidth(), static_cast<uint32_t>(length.surfaceState.width));
+            EXPECT_EQ(surfaceStateAddress->getHeight(), static_cast<uint32_t>(length.surfaceState.height + 1));
+            EXPECT_EQ(surfaceStateAddress->getDepth(), static_cast<uint32_t>(length.surfaceState.depth + 1));
+        }
+        EXPECT_TRUE(phys1Resident);
+        EXPECT_FALSE(phys2Resident);
+        res = context->unMapVirtualMem(ptr, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->unMapVirtualMem(offsetAddress, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->unMapVirtualMem(offsetAddress2, size);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->freeVirtualMem(ptr, reservationSize);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory2);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        res = context->destroyPhysicalMem(phPhysicalMemory3);
+        EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+        Kernel::fromHandle(kernelHandle)->destroy();
+    }
+}
+
+HWTEST_F(MultiDeviceModuleSetArgBufferTest,
          givenCallsToSetArgBufferThenAllocationIsSetForCorrectDevice) {
 
     for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < numRootDevices; rootDeviceIndex++) {
@@ -2073,7 +3412,7 @@ HWTEST_F(MultiDeviceModuleSetArgBufferTest,
         L0::KernelImp *kernel = reinterpret_cast<L0::KernelImp *>(Kernel::fromHandle(kernelHandle));
         kernel->setArgBuffer(0, sizeof(ptr), &ptr);
 
-        for (auto alloc : kernel->getResidencyContainer()) {
+        for (auto alloc : kernel->getArgumentsResidencyContainer()) {
             if (alloc && alloc->getGpuAddress() == reinterpret_cast<uint64_t>(ptr)) {
                 EXPECT_EQ(rootDeviceIndex, alloc->getRootDeviceIndex());
             }
@@ -2087,6 +3426,8 @@ HWTEST_F(MultiDeviceModuleSetArgBufferTest,
 using ContextModuleCreateTest = Test<DeviceFixture>;
 
 HWTEST_F(ContextModuleCreateTest, givenCallToCreateModuleThenModuleIsReturned) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.FailBuildProgramWithStatefulAccess.set(0);
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
     const auto &src = zebinData->storage;
 
@@ -2110,29 +3451,43 @@ using ModuleTranslationUnitTest = Test<DeviceFixture>;
 struct MockModuleTU : public L0::ModuleTranslationUnit {
     MockModuleTU(L0::Device *device) : L0::ModuleTranslationUnit(device) {}
 
+    ze_result_t buildFromIntermediate(IGC::CodeType::CodeType_t intermediateType, const char *input, uint32_t inputSize, const char *buildOptions, const char *internalBuildOptions,
+                                      const ze_module_constants_t *pConstants) override {
+        wasBuildFromIntermediateCalled = true;
+        if (callRealBuildFromIntermediate) {
+            return L0::ModuleTranslationUnit::buildFromIntermediate(intermediateType, input, inputSize, buildOptions, internalBuildOptions, pConstants);
+        }
+        return ZE_RESULT_SUCCESS;
+    }
+
     ze_result_t buildFromSpirV(const char *input, uint32_t inputSize, const char *buildOptions, const char *internalBuildOptions,
                                const ze_module_constants_t *pConstants) override {
-        wasBuildFromSpirVCalled = true;
-        if (callRealBuildFromSpirv) {
-            return L0::ModuleTranslationUnit::buildFromSpirV(input, inputSize, buildOptions, internalBuildOptions, pConstants);
-        } else {
+        return buildFromIntermediate(IGC::CodeType::spirV, input, inputSize, buildOptions, internalBuildOptions, pConstants);
+    }
+
+    ze_result_t createFromNativeBinary(const char *input, size_t inputSize, const char *internalBuildOptions) override {
+        debugManager.flags.FailBuildProgramWithStatefulAccess.set(0);
+        wasCreateFromNativeBinaryCalled = true;
+        return L0::ModuleTranslationUnit::createFromNativeBinary(input, inputSize, internalBuildOptions);
+    }
+
+    ze_result_t processUnpackedBinary() override {
+        if (processUnpackedBinaryReturnSuccess) {
             return ZE_RESULT_SUCCESS;
         }
+        return L0::ModuleTranslationUnit::processUnpackedBinary();
     }
 
-    ze_result_t createFromNativeBinary(const char *input, size_t inputSize) override {
-        wasCreateFromNativeBinaryCalled = true;
-        return L0::ModuleTranslationUnit::createFromNativeBinary(input, inputSize);
-    }
-
-    bool callRealBuildFromSpirv = false;
-    bool wasBuildFromSpirVCalled = false;
+    bool callRealBuildFromIntermediate = false;
+    bool wasBuildFromIntermediateCalled = false;
     bool wasCreateFromNativeBinaryCalled = false;
+    bool processUnpackedBinaryReturnSuccess = false;
+    DebugManagerStateRestore restore;
 };
 
 HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWithoutIntermediateCodeWhenCreatingModuleFromNativeBinaryThenModuleIsNotRecompiled) {
     DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.RebuildPrecompiledKernels.set(true);
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
 
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
     const auto &src = zebinData->storage;
@@ -2142,7 +3497,7 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWit
     moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
     moduleDesc.inputSize = src.size();
 
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     MockModuleTU *tu = new MockModuleTU(device);
     module.translationUnit.reset(tu);
 
@@ -2150,12 +3505,12 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWit
     result = module.initialize(&moduleDesc, neoDevice);
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
     EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
-    EXPECT_FALSE(tu->wasBuildFromSpirVCalled);
+    EXPECT_FALSE(tu->wasBuildFromIntermediateCalled);
 }
 
 HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWithoutIntermediateCodeWhenCreatingModuleFromNativeBinaryThenModuleHasSymbolSupportBooleans) {
     DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.RebuildPrecompiledKernels.set(true);
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
 
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
     const auto &src = zebinData->storage;
@@ -2165,7 +3520,7 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWit
     moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
     moduleDesc.inputSize = src.size();
 
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     MockModuleTU *tu = new MockModuleTU(device);
     module.translationUnit.reset(tu);
 
@@ -2179,7 +3534,7 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWit
 
 HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWithIntermediateCodeWhenCreatingModuleFromNativeBinaryThenModuleIsRecompiled) {
     DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.RebuildPrecompiledKernels.set(true);
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
 
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
     const auto &src = zebinData->storage;
@@ -2189,7 +3544,7 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWit
     moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
     moduleDesc.inputSize = src.size();
 
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
     MockModuleTU *tu = new MockModuleTU(device);
     module.translationUnit.reset(tu);
 
@@ -2197,14 +3552,437 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildPrecompiledKernelsFlagAndFileWit
     result = module.initialize(&moduleDesc, neoDevice);
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
     EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
-    EXPECT_EQ(tu->irBinarySize != 0, tu->wasBuildFromSpirVCalled);
+    EXPECT_EQ(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenNewCachePolicyAndFileWithIntermediateCodeBuildWithOldCachePolicyAndOldVersionWhenCreatingModuleFromNativeBinaryThenModuleIsRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(1); //"-cl-store-cache-default=2 -cl-load-cache-default=2"
+
+    const auto &compilerProductHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    bool isDebuggerActive = device->getNEODevice()->getDebugger() != nullptr;
+
+    auto currentCachePolicy = compilerProductHelper.getCachingPolicyOptions(isDebuggerActive);
+    if (!currentCachePolicy) {
+        GTEST_SKIP();
+    }
+
+    auto zebin = ZebinTestData::ValidEmptyProgram<>();
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 60)), productConfig));
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    NEO::ConstStringRef buildOptions = "-cl-example-untouched-option-first=1 -cl-store-cache-default=9 -cl-load-cache-default=9 -cl-example-untouched-option-second=2";
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::buildOptions,
+                        {reinterpret_cast<const uint8_t *>(buildOptions.data()), buildOptions.size()});
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    if (device->getNEODevice()->getRootDeviceEnvironment().getProductHelper().isL1PolicyMissmatchCheckNeeded()) {
+        EXPECT_EQ(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+        EXPECT_TRUE(tu->options.find("-cl-example-untouched-option-first=1 -cl-store-cache-default=2 -cl-load-cache-default=2 -cl-example-untouched-option-second=2") != std::string::npos);
+    } else {
+        EXPECT_NE(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+        EXPECT_TRUE(tu->options.find("-cl-example-untouched-option-first=1 -cl-store-cache-default=9 -cl-load-cache-default=9 -cl-example-untouched-option-second=2") != std::string::npos);
+    }
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenNewCachePolicyAndFileWithIntermediateCodeWithoutCachePolicyAndOldVersionWhenCreatingModuleFromNativeBinaryThenModuleIsRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(1); //"-cl-store-cache-default=2 -cl-load-cache-default=2"
+
+    const auto &compilerProductHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    bool isDebuggerActive = device->getNEODevice()->getDebugger() != nullptr;
+
+    auto currentCachePolicy = compilerProductHelper.getCachingPolicyOptions(isDebuggerActive);
+    if (!currentCachePolicy) {
+        GTEST_SKIP();
+    }
+
+    ZebinTestData::ValidEmptyProgram zebin;
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 60)), productConfig));
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    NEO::ConstStringRef buildOptions = "-cl-example-untouched-option-first=1 -cl-example-untouched-option-second=2";
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::buildOptions,
+                        {reinterpret_cast<const uint8_t *>(buildOptions.data()), buildOptions.size()});
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    if (device->getNEODevice()->getRootDeviceEnvironment().getProductHelper().isL1PolicyMissmatchCheckNeeded()) {
+        EXPECT_EQ(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    } else {
+        EXPECT_NE(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    }
+    EXPECT_TRUE(tu->options.find("-cl-example-untouched-option-first=1 -cl-example-untouched-option-second=2") != std::string::npos);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenNewCachePolicyAndFileWithIntermediateCodeWithoutCachePolicyAndNewVersionWhenCreatingModuleFromNativeBinaryThenModuleIsNotRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(1); //"-cl-store-cache-default=2 -cl-load-cache-default=2"
+
+    const auto &compilerProductHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    bool isDebuggerActive = device->getNEODevice()->getDebugger() != nullptr;
+
+    auto currentCachePolicy = compilerProductHelper.getCachingPolicyOptions(isDebuggerActive);
+    if (!currentCachePolicy) {
+        GTEST_SKIP();
+    }
+
+    ZebinTestData::ValidEmptyProgram zebin;
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 61)), productConfig));
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    NEO::ConstStringRef buildOptions = "-cl-example-untouched-option-first=1 -cl-example-untouched-option-second=2";
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::buildOptions,
+                        {reinterpret_cast<const uint8_t *>(buildOptions.data()), buildOptions.size()});
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_NE(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    EXPECT_TRUE(tu->options.find("-cl-example-untouched-option-first=1 -cl-example-untouched-option-second=2") != std::string::npos);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenBinaryWithoutZeInfoVersionWhenCreatingModuleFromNativeBinaryThenModuleIsNotRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(1); //"-cl-store-cache-default=2 -cl-load-cache-default=2"
+
+    const auto &compilerProductHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    bool isDebuggerActive = device->getNEODevice()->getDebugger() != nullptr;
+
+    auto currentCachePolicy = compilerProductHelper.getCachingPolicyOptions(isDebuggerActive);
+    if (!currentCachePolicy) {
+        GTEST_SKIP();
+    }
+
+    ZebinTestData::ValidEmptyProgram zebin;
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    NEO::ConstStringRef buildOptions = "-cl-example-untouched-option-first=1 -cl-example-untouched-option-second=2";
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::buildOptions,
+                        {reinterpret_cast<const uint8_t *>(buildOptions.data()), buildOptions.size()});
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_NE(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    EXPECT_TRUE(tu->options.find("-cl-example-untouched-option-first=1 -cl-example-untouched-option-second=2") != std::string::npos);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenZeInfoL1CachePolicyMismatchingDriverDefaultAndIntermediateCodeWhenCreatingModuleFromNativeBinaryThenModuleIsRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2); // driver default L1_CACHE_CONTROL_WB
+
+    // zeinfo declares "uc" which mismatches the WB driver default.
+    auto zeInfo = std::string{"---\nversion : \'"} + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) +
+                  "\'\nl1_cache_policy : uc\n" + ZebinTestData::ValidEmptyProgram<>::defaultZeInfo;
+    ZebinTestData::ValidEmptyProgram zebin(zeInfo);
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 69)), productConfig));
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    if (device->getNEODevice()->getRootDeviceEnvironment().getProductHelper().isL1PolicyMissmatchCheckNeeded()) {
+        EXPECT_EQ(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    } else {
+        EXPECT_NE(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    }
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenZeInfoL1CachePolicyMatchingDriverDefaultWhenCreatingModuleFromNativeBinaryThenModuleIsNotRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2); // driver default L1_CACHE_CONTROL_WB
+
+    // zeinfo declares "wb" which matches the driver default - no rebuild expected.
+    auto zeInfo = std::string{"---\nversion : \'"} + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) +
+                  "\'\nl1_cache_policy : wb\n" + ZebinTestData::ValidEmptyProgram<>::defaultZeInfo;
+    ZebinTestData::ValidEmptyProgram zebin(zeInfo);
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 69)), productConfig));
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_FALSE(tu->wasBuildFromIntermediateCalled);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenZeInfoL1CachePolicyMismatchingDriverDefaultWithoutIntermediateCodeWhenCreatingModuleFromNativeBinaryThenModulePolicyOverrideIsSet) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2); // driver default L1_CACHE_CONTROL_WB
+
+    auto zeInfo = std::string{"---\nversion : \'"} + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) +
+                  "\'\nl1_cache_policy : uc\n" + ZebinTestData::ValidEmptyProgram<>::defaultZeInfo;
+    ZebinTestData::ValidEmptyProgram zebin(zeInfo);
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 69)), productConfig));
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_EQ(0u, tu->irBinarySize);
+    EXPECT_FALSE(tu->wasBuildFromIntermediateCalled);
+    if (device->getNEODevice()->getRootDeviceEnvironment().getProductHelper().isL1PolicyMissmatchCheckNeeded()) {
+        // "uc" maps to L1_CACHE_CONTROL_UC (1); no IR -> policy is kept as a module override.
+        ASSERT_TRUE(tu->l1CachePolicyOverride.has_value());
+        EXPECT_EQ(1u, tu->l1CachePolicyOverride.value());
+    } else {
+        EXPECT_FALSE(tu->l1CachePolicyOverride.has_value());
+    }
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenZeInfoL1CachePolicyMismatchingDriverDefaultWithIntermediateCodeWhenCreatingModuleFromNativeBinaryThenBuildOptionsAreReplacedWithDriverPolicy) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2); // driver default L1_CACHE_CONTROL_WB
+
+    const auto &compilerProductHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    bool isDebuggerActive = device->getNEODevice()->getDebugger() != nullptr;
+    auto driverCachePolicy = compilerProductHelper.getCachingPolicyOptions(isDebuggerActive);
+    if (!driverCachePolicy) {
+        GTEST_SKIP();
+    }
+
+    struct MockProductHelperL1Check : MockProductHelper {
+        bool isL1PolicyMissmatchCheckNeeded() const override { return true; }
+    };
+
+    auto mockProductHelper = new MockProductHelperL1Check;
+    neoDevice->getRootDeviceEnvironmentRef().productHelper.reset(mockProductHelper);
+
+    // zeinfo declares "uc" which mismatches the WB driver default.
+    auto zeInfo = std::string{"---\nversion : \'"} + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) +
+                  "\'\nl1_cache_policy : uc\n" + ZebinTestData::ValidEmptyProgram<>::defaultZeInfo;
+    ZebinTestData::ValidEmptyProgram zebin(zeInfo);
+
+    AOT::PRODUCT_CONFIG productConfig = AOT::PRODUCT_CONFIG::TGL;
+    zebin.appendSection(Elf::SHT_NOTE, Zebin::Elf::SectionNames::noteIntelGT,
+                        ZebinTestData::createIntelGTNoteSection(versionToString(NEO::Zebin::ZeInfo::Types::Version(1, 69)), productConfig));
+
+    NEO::ConstStringRef origBuildOptions = "-cl-store-cache-default=1 -cl-other-option";
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::buildOptions,
+                        {reinterpret_cast<const uint8_t *>(origBuildOptions.data()), origBuildOptions.size()});
+
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_TRUE(tu->wasBuildFromIntermediateCalled);
+    EXPECT_NE(tu->options.find(driverCachePolicy), std::string::npos);
+    EXPECT_EQ(tu->options.find("-cl-store-cache-default=1"), std::string::npos);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenNewCachePolicyAndFileWithIntermediateCodeBuildCorrectCachePolicyWhenCreatingModuleFromNativeBinaryThenModuleIsNotRecompiled) {
+    VariableBackup ultConfigBackup(&ultHwConfig);
+    ultHwConfig.recompileKernelsWhenL1PolicyMissmatch = true;
+
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(1); //"-cl-store-cache-default=2 -cl-load-cache-default=2"
+
+    const auto &compilerProductHelper = device->getNEODevice()->getRootDeviceEnvironment().getHelper<NEO::CompilerProductHelper>();
+    bool isDebuggerActive = device->getNEODevice()->getDebugger() != nullptr;
+
+    auto currentCachePolicy = compilerProductHelper.getCachingPolicyOptions(isDebuggerActive);
+    if (!currentCachePolicy) {
+        GTEST_SKIP();
+    }
+
+    ZebinTestData::ValidEmptyProgram zebin;
+    const uint8_t spirvData[30] = {0xd};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_SPIRV, NEO::Zebin::Elf::SectionNames::spv, spirvData);
+
+    NEO::ConstStringRef buildOptions = "-cl-example-untouched-option-first=1 -cl-store-cache-default=2 -cl-load-cache-default=2 -cl-example-untouched-option-second=2";
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::buildOptions,
+                        {reinterpret_cast<const uint8_t *>(buildOptions.data()), buildOptions.size()});
+
+    const auto &src = zebin.storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_NE(tu->irBinarySize != 0, tu->wasBuildFromIntermediateCalled);
+    EXPECT_TRUE(tu->options.find("-cl-example-untouched-option-first=1 -cl-store-cache-default=2 -cl-load-cache-default=2 -cl-example-untouched-option-second=2") != std::string::npos);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenModuleInitializationEvenWhenTranslationUnitInitializationFailsThenBuildLogIsAlwaysUpdated) {
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
+
+    ze_module_desc_t moduleDesc = {};
+    std::unique_ptr<ModuleBuildLog> moduleBuildLog{ModuleBuildLog::create()};
+    Mock<Module> module(device, moduleBuildLog.get(), ModuleType::user);
+    module.initializeTranslationUnitResult = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    module.initializeTranslationUnitCallBase = false;
+
+    ze_result_t result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_ERROR_MODULE_BUILD_FAILURE);
+    EXPECT_EQ(module.initializeTranslationUnitCalled, 1u);
+    EXPECT_EQ(module.updateBuildLogCalled, 1u);
 }
 
 HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNativeBinaryThenModuleRecompilationWarningIsIssued) {
     DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.RebuildPrecompiledKernels.set(true);
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
 
-    auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
     bool forceRecompilation = true;
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections, forceRecompilation);
     const auto &src = zebinData->storage;
@@ -2215,7 +3993,7 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNative
     moduleDesc.inputSize = src.size();
 
     std::unique_ptr<ModuleBuildLog> moduleBuildLog{ModuleBuildLog::create()};
-    Module module(device, moduleBuildLog.get(), ModuleType::User);
+    Module module(device, moduleBuildLog.get(), ModuleType::user);
     MockModuleTU *tu = new MockModuleTU(device);
     module.translationUnit.reset(tu);
 
@@ -2235,11 +4013,142 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNative
     EXPECT_TRUE(containsWarning);
 }
 
+HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNativeBinaryWithPisaThenModuleRecompilationWarningIsIssued) {
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
+
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::pisa};
+    bool forceRecompilation = true;
+    auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections, forceRecompilation);
+    const auto &src = zebinData->storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    std::unique_ptr<ModuleBuildLog> moduleBuildLog{ModuleBuildLog::create()};
+    Module module(device, moduleBuildLog.get(), ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+
+    size_t buildLogSize{};
+    const auto querySizeResult{moduleBuildLog->getString(&buildLogSize, nullptr)};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, querySizeResult);
+
+    std::string buildLog(buildLogSize, '\0');
+    const auto queryBuildLogResult{moduleBuildLog->getString(&buildLogSize, buildLog.data())};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, queryBuildLogResult);
+
+    const auto containsWarning{buildLog.find(CompilerWarnings::recompiledFromIr.data()) != std::string::npos};
+    EXPECT_TRUE(containsWarning);
+    EXPECT_TRUE(tu->wasBuildFromIntermediateCalled);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenNativeBinaryWhenRebuildingFromIntermediateThenCorrectInternalOptionsAreUsed) {
+    DebugManagerStateRestore dgbRestorer;
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
+
+    auto *pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
+    bool forceRecompilation = true;
+    auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections, forceRecompilation);
+    const auto &src = zebinData->storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    std::unique_ptr<ModuleBuildLog> moduleBuildLog{ModuleBuildLog::create()};
+    Module module(device, moduleBuildLog.get(), ModuleType::user);
+
+    auto mockTranslationUnit = new MockModuleTranslationUnit(device);
+    mockTranslationUnit->processUnpackedBinaryCallBase = false;
+    module.translationUnit.reset(mockTranslationUnit);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+
+    char *buildFlags = nullptr;
+    std::string options;
+    std::string internalOptions;
+    module.createBuildOptions(buildFlags, options, internalOptions);
+    internalOptions = module.translationUnit->generateCompilerOptions(options.c_str(), internalOptions.c_str());
+
+    EXPECT_EQ(internalOptions, pMockCompilerInterface->inputInternalOptions);
+
+    pMockCompilerInterface->inputInternalOptions = "";
+
+    uint8_t binary[10];
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = 10;
+    Module module2(device, nullptr, ModuleType::user);
+
+    auto mockTranslationUnit2 = new MockModuleTranslationUnit(device);
+    mockTranslationUnit2->processUnpackedBinaryCallBase = false;
+    module2.translationUnit.reset(mockTranslationUnit2);
+
+    result = module2.initialize(&moduleDesc, neoDevice);
+    ASSERT_EQ(result, ZE_RESULT_SUCCESS);
+
+    // make sure internal options are matching those from buildFromSpirv
+    EXPECT_EQ(internalOptions, pMockCompilerInterface->inputInternalOptions);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenOclExtensionsDescWhenBuildingModuleFromSpirVThenCallerInternalOptionsAreAppended) {
+    auto *pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+
+    uint8_t binary[10]{};
+    ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = sizeof(binary);
+
+    // No descriptor: native L0 contract, no -ocl-version.
+    {
+        Module module(device, nullptr, ModuleType::user);
+        auto mockTranslationUnit = new MockModuleTranslationUnit(device);
+        mockTranslationUnit->processUnpackedBinaryCallBase = false;
+        module.translationUnit.reset(mockTranslationUnit);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, module.initialize(&moduleDesc, neoDevice));
+        EXPECT_EQ(std::string::npos, pMockCompilerInterface->inputInternalOptions.find("-ocl-version"));
+    }
+
+    // With descriptor: caller options are appended to the compiler internal options.
+    {
+        pMockCompilerInterface->inputInternalOptions.clear();
+        const std::string callerInternalOptions = "-ocl-version=300 -cl-ext=+test_marker_ext";
+        L0::ze_module_ocl_extensions_exp_desc_t oclExtensionsDesc;
+        oclExtensionsDesc.pInternalBuildOptions = callerInternalOptions.c_str();
+        moduleDesc.pNext = &oclExtensionsDesc;
+
+        Module module(device, nullptr, ModuleType::user);
+        auto mockTranslationUnit = new MockModuleTranslationUnit(device);
+        mockTranslationUnit->processUnpackedBinaryCallBase = false;
+        module.translationUnit.reset(mockTranslationUnit);
+        ASSERT_EQ(ZE_RESULT_SUCCESS, module.initialize(&moduleDesc, neoDevice));
+        EXPECT_NE(std::string::npos, pMockCompilerInterface->inputInternalOptions.find("-ocl-version=300"));
+        EXPECT_NE(std::string::npos, pMockCompilerInterface->inputInternalOptions.find("+test_marker_ext"));
+    }
+}
+
 HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNativeBinaryAndWarningSuppressionIsPresentThenModuleRecompilationWarningIsNotIssued) {
     DebugManagerStateRestore dgbRestorer;
-    NEO::DebugManager.flags.RebuildPrecompiledKernels.set(true);
+    NEO::debugManager.flags.RebuildPrecompiledKernels.set(true);
 
-    auto additionalSections = {ZebinTestData::appendElfAdditionalSection::SPIRV};
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
     bool forceRecompilation = true;
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections, forceRecompilation);
     const auto &src = zebinData->storage;
@@ -2251,7 +4160,7 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNative
     moduleDesc.pBuildFlags = CompilerOptions::noRecompiledFromIr.data();
 
     std::unique_ptr<ModuleBuildLog> moduleBuildLog{ModuleBuildLog::create()};
-    Module module(device, moduleBuildLog.get(), ModuleType::User);
+    Module module(device, moduleBuildLog.get(), ModuleType::user);
     MockModuleTU *tu = new MockModuleTU(device);
     module.translationUnit.reset(tu);
 
@@ -2274,43 +4183,54 @@ HWTEST_F(ModuleTranslationUnitTest, GivenRebuildFlagWhenCreatingModuleFromNative
 HWTEST_F(ModuleTranslationUnitTest, WhenCreatingFromNativeBinaryThenSetsUpRequiredTargetProductProperly) {
     ZebinTestData::ValidEmptyProgram emptyProgram;
 
-    const auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    auto copyHwInfo = device->getNEODevice()->getHardwareInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
 
-    emptyProgram.elfHeader->machine = hwInfo.platform.eProductFamily;
+    emptyProgram.elfHeader->machine = copyHwInfo.platform.eProductFamily;
     L0::ModuleTranslationUnit moduleTuValid(this->device);
     ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    result = moduleTuValid.createFromNativeBinary(reinterpret_cast<const char *>(emptyProgram.storage.data()), emptyProgram.storage.size());
+    result = moduleTuValid.createFromNativeBinary(reinterpret_cast<const char *>(emptyProgram.storage.data()), emptyProgram.storage.size(), "");
+    const char *pStr = nullptr;
+    std::string emptyString = "";
+    zeDriverGetLastErrorDescription(this->device->getDriverHandle(), &pStr);
+    EXPECT_EQ(0, strcmp(pStr, emptyString.c_str()));
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
 
+    emptyProgram.elfHeader->machine = copyHwInfo.platform.eProductFamily;
     ++emptyProgram.elfHeader->machine;
     L0::ModuleTranslationUnit moduleTuInvalid(this->device);
-    result = moduleTuInvalid.createFromNativeBinary(reinterpret_cast<const char *>(emptyProgram.storage.data()), emptyProgram.storage.size());
+    result = moduleTuInvalid.createFromNativeBinary(reinterpret_cast<const char *>(emptyProgram.storage.data()), emptyProgram.storage.size(), "");
+    zeDriverGetLastErrorDescription(this->device->getDriverHandle(), &pStr);
+    EXPECT_NE(0, strcmp(pStr, emptyString.c_str()));
     EXPECT_EQ(ZE_RESULT_ERROR_MODULE_BUILD_FAILURE, result);
 }
 
 HWTEST_F(ModuleTranslationUnitTest, WhenCreatingFromNativeBinaryThenSetsUpPackedTargetDeviceBinary) {
-    PatchTokensTestData::ValidEmptyProgram programTokens;
+    ZebinTestData::ValidEmptyProgram zebin;
     auto &compilerProductHelper = device->getCompilerProductHelper();
     NEO::HardwareInfo hwInfo = *NEO::defaultHwInfo;
     HardwareIpVersion aotConfig = {0};
     aotConfig.value = compilerProductHelper.getHwIpVersion(hwInfo);
 
-    NEO::Ar::ArEncoder encoder;
+    zebin.elfHeader->machine = static_cast<uint16_t>(productFamily);
+
+    NEO::Ar::ArEncoder encoder{true};
     std::string requiredProduct = NEO::hardwarePrefix[productFamily];
-    std::string requiredStepping = std::to_string(programTokens.header->SteppingId);
-    std::string requiredPointerSize = (programTokens.header->GPUPointerSizeInBytes == 4) ? "32" : "64";
+    std::string requiredStepping = "0";
+    std::string requiredPointerSize = "64";
     std::string requiredProductConfig = ProductConfigHelper::parseMajorMinorRevisionValue(aotConfig);
 
-    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize, programTokens.storage));
-    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize + "." + requiredProduct, programTokens.storage));
-    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize + "unk." + requiredStepping, programTokens.storage));
-    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize + "." + requiredProductConfig, programTokens.storage));
+    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize, zebin.storage));
+    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize + "." + requiredProduct, zebin.storage));
+    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize + "unk." + requiredStepping, zebin.storage));
+    ASSERT_TRUE(encoder.appendFileEntry(requiredPointerSize + "." + requiredProductConfig, zebin.storage));
 
     NEO::TargetDevice target;
-    target.coreFamily = static_cast<GFXCORE_FAMILY>(programTokens.header->Device);
+    target.productFamily = static_cast<PRODUCT_FAMILY>(zebin.elfHeader->machine);
     target.aotConfig.value = compilerProductHelper.getHwIpVersion(hwInfo);
-    target.stepping = programTokens.header->SteppingId;
-    target.maxPointerSizeInBytes = programTokens.header->GPUPointerSizeInBytes;
+    target.stepping = 0U;
+    target.maxPointerSizeInBytes = 8U;
 
     auto arData = encoder.encode();
     auto moduleTuValid = MockModuleTranslationUnit{this->device};
@@ -2318,53 +4238,156 @@ HWTEST_F(ModuleTranslationUnitTest, WhenCreatingFromNativeBinaryThenSetsUpPacked
     moduleTuValid.setDummyKernelInfo();
 
     ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    result = moduleTuValid.createFromNativeBinary(reinterpret_cast<const char *>(arData.data()), arData.size());
+    result = moduleTuValid.createFromNativeBinary(reinterpret_cast<const char *>(arData.data()), arData.size(), "");
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
     EXPECT_EQ(moduleTuValid.processUnpackedBinaryCalled, 1u);
     EXPECT_NE(moduleTuValid.packedDeviceBinarySize, arData.size());
 }
 
-HWTEST_F(ModuleTranslationUnitTest, WhenCreatingFromZebinThenAppendAllowZebinFlagToBuildOptions) {
+HWTEST_F(ModuleTranslationUnitTest, WhenCreatingFromZebinThenDontAppendAllowZebinFlagToBuildOptions) {
     ZebinTestData::ValidEmptyProgram zebin;
 
-    const auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    auto copyHwInfo = device->getNEODevice()->getHardwareInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
 
-    zebin.elfHeader->machine = hwInfo.platform.eProductFamily;
+    zebin.elfHeader->machine = copyHwInfo.platform.eProductFamily;
     L0::ModuleTranslationUnit moduleTu(this->device);
     ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    result = moduleTu.createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size());
+    result = moduleTu.createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size(), "");
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
 
-    auto expectedOptions = " " + NEO::CompilerOptions::enableZebin.str();
-    EXPECT_STREQ(expectedOptions.c_str(), moduleTu.options.c_str());
+    auto expectedOptions = "";
+    EXPECT_STREQ(expectedOptions, moduleTu.options.c_str());
 }
 
-HWTEST2_F(ModuleTranslationUnitTest, givenLargeGrfAndSimd16WhenProcessingBinaryThenKernelGroupSizeReducedToFitWithinSubslice, IsWithinXeGfxFamily) {
+HWTEST_F(ModuleTranslationUnitTest, GivenZebinWithSpecConstantsWhenCreatingFromNativeBinaryThenSpecConstantsValuesArePopulated) {
+    ZebinTestData::ValidEmptyProgram zebin;
+
+    auto copyHwInfo = device->getNEODevice()->getHardwareInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
+
+    zebin.elfHeader->machine = copyHwInfo.platform.eProductFamily;
+
+    const uint32_t specConstIds[] = {1u, 2u, 3u};
+    const uint64_t specConstValues[] = {100u, 200u, 300u};
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::specConstantsIds,
+                        ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(specConstIds), sizeof(specConstIds)));
+    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_MISC, NEO::Zebin::Elf::SectionNames::specConstantsValues,
+                        ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(specConstValues), sizeof(specConstValues)));
+
+    L0::ModuleTranslationUnit moduleTu(this->device);
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = moduleTu.createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size(), "");
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+
+    ASSERT_EQ(3u, moduleTu.specConstantsValues.size());
+    EXPECT_EQ(100u, moduleTu.specConstantsValues[1u]);
+    EXPECT_EQ(200u, moduleTu.specConstantsValues[2u]);
+    EXPECT_EQ(300u, moduleTu.specConstantsValues[3u]);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenOneApiPvcSendWarWaEnvFalseAndFileWithIntermediateCodeWhenCreatingModuleFromNativeBinaryThenModuleIsRecompiledWithInternalOption) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnvOneapiPvcSendWarWa.set(false);
+
+    auto pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::spirv};
+    auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo(), additionalSections);
+    const auto &src = zebinData->storage;
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
+    moduleDesc.inputSize = src.size();
+
+    Module module(device, nullptr, ModuleType::user);
+    MockModuleTU *tu = new MockModuleTU(device);
+    tu->callRealBuildFromIntermediate = true;
+    tu->processUnpackedBinaryReturnSuccess = true;
+    module.translationUnit.reset(tu);
+
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module.initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_TRUE(tu->wasCreateFromNativeBinaryCalled);
+    EXPECT_TRUE(tu->wasBuildFromIntermediateCalled);
+    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-ze-opt-disable-sendwarwa"), std::string::npos);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenOneApiPvcSendWarWaEnvFalseWhenCreatingModuleFromSpirvBinaryThenModuleIsCompiledWithInternalOption) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.EnvOneapiPvcSendWarWa.set(false);
+
+    auto pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+
+    uint8_t binary[10];
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = 10;
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
+    ASSERT_NE(nullptr, module.get());
+    module->initialize(&moduleDesc, device->getNEODevice());
+
+    EXPECT_TRUE(CompilerOptions::contains(pMockCompilerInterface->inputInternalOptions, "-ze-opt-disable-sendwarwa"));
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenDefaultOneApiPvcSendWarWaEnvWhenCreatingModuleFromSpirvBinaryThenModuleIsCompiledWithoutInternalOption) {
+    auto pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+
+    uint8_t binary[10];
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = 10;
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
+    ASSERT_NE(nullptr, module.get());
+    module->initialize(&moduleDesc, device->getNEODevice());
+
+    EXPECT_FALSE(CompilerOptions::contains(pMockCompilerInterface->inputInternalOptions, "-ze-opt-disable-sendwarwa"));
+}
+
+HWTEST2_F(ModuleTranslationUnitTest, givenLargeGrfAndSimd16WhenProcessingBinaryThenKernelGroupSizeReducedToFitWithinSubslice, IsXeCore) {
     std::string validZeInfo = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
 kernels:
     - name : kernel_with_default_maxWGS
       execution_env :
         simd_size : 8
         grf_count: )===" +
-                              std::to_string(GrfConfig::DefaultGrfNumber) + R"===(
+                              std::to_string(GrfConfig::defaultGrfNumber) + R"===(
     - name : kernel_with_reduced_maxWGS
       execution_env :
         simd_size : 16
         grf_count: )===" +
-                              std::to_string(GrfConfig::LargeGrfNumber) + "\n";
+                              std::to_string(GrfConfig::largeGrfNumber) + "\n";
 
     uint8_t kernelIsa[8]{0U};
     ZebinTestData::ValidEmptyProgram zebin;
-    zebin.removeSection(NEO::Zebin::Elf::SHT_ZEBIN::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo);
-    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, ArrayRef<const uint8_t>::fromAny(validZeInfo.data(), validZeInfo.size()));
+    zebin.removeSection(NEO::Zebin::Elf::SectionHeaderTypeZebin::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo);
+    zebin.appendSection(NEO::Zebin::Elf::SectionHeaderTypeZebin::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, ArrayRef<const uint8_t>::fromAny(validZeInfo.data(), validZeInfo.size()));
     zebin.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel_with_default_maxWGS", {kernelIsa, sizeof(kernelIsa)});
     zebin.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel_with_reduced_maxWGS", {kernelIsa, sizeof(kernelIsa)});
     zebin.elfHeader->machine = this->device->getNEODevice()->getHardwareInfo().platform.eProductFamily;
 
-    MockModule mockModule{this->device, nullptr, ModuleType::User};
+    MockModule mockModule{this->device, nullptr, ModuleType::user};
     auto maxWorkGroupSize = static_cast<uint32_t>(this->neoDevice->deviceInfo.maxWorkGroupSize);
     auto mockTU = mockModule.translationUnit.get();
-    auto result = mockTU->createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size());
+    auto result = mockTU->createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size(), "");
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
 
     auto &defaultKernelDescriptor = mockTU->programInfo.kernelInfos[0]->kernelDescriptor;
@@ -2373,12 +4396,12 @@ kernels:
     EXPECT_EQ(mockModule.getMaxGroupSize(reducedKernelDescriptor), (maxWorkGroupSize >> 1));
 
     uint32_t groupSize[3] = {8, 4, (maxWorkGroupSize >> 5)}; // default max WGS
-    Mock<Kernel> defaultKernel;
+    Mock<KernelImp> defaultKernel;
     defaultKernel.module = &mockModule;
     defaultKernel.descriptor.kernelAttributes = defaultKernelDescriptor.kernelAttributes;
     EXPECT_EQ(ZE_RESULT_SUCCESS, defaultKernel.setGroupSize(groupSize[0], groupSize[1], groupSize[2]));
 
-    Mock<Kernel> reducedKernel;
+    Mock<KernelImp> reducedKernel;
     reducedKernel.module = &mockModule;
     reducedKernel.descriptor.kernelAttributes = reducedKernelDescriptor.kernelAttributes;
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_GROUP_SIZE_DIMENSION, reducedKernel.setGroupSize(groupSize[0], groupSize[1], groupSize[2]));
@@ -2386,32 +4409,32 @@ kernels:
     EXPECT_EQ(ZE_RESULT_SUCCESS, reducedKernel.setGroupSize(groupSize[0], groupSize[1], groupSize[2]));
 }
 
-HWTEST2_F(ModuleTranslationUnitTest, givenLargeGrfAndSimd16WhenProcessingBinaryThenSuggestedKernelGroupSizeFitsWithinSubslice, IsWithinXeGfxFamily) {
+HWTEST2_F(ModuleTranslationUnitTest, givenLargeGrfAndSimd16WhenProcessingBinaryThenSuggestedKernelGroupSizeFitsWithinSubslice, IsXeCore) {
     std::string validZeInfo = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
 kernels:
     - name : kernel_with_default_maxWGS
       execution_env :
         simd_size : 8
         grf_count: )===" +
-                              std::to_string(GrfConfig::DefaultGrfNumber) + R"===(
+                              std::to_string(GrfConfig::defaultGrfNumber) + R"===(
     - name : kernel_with_reduced_maxWGS
       execution_env :
         simd_size : 16
         grf_count: )===" +
-                              std::to_string(GrfConfig::LargeGrfNumber) + "\n";
+                              std::to_string(GrfConfig::largeGrfNumber) + "\n";
 
     uint8_t kernelIsa[8]{0U};
     ZebinTestData::ValidEmptyProgram zebin;
-    zebin.removeSection(NEO::Zebin::Elf::SHT_ZEBIN::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo);
-    zebin.appendSection(NEO::Zebin::Elf::SHT_ZEBIN::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, ArrayRef<const uint8_t>::fromAny(validZeInfo.data(), validZeInfo.size()));
+    zebin.removeSection(NEO::Zebin::Elf::SectionHeaderTypeZebin::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo);
+    zebin.appendSection(NEO::Zebin::Elf::SectionHeaderTypeZebin::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, ArrayRef<const uint8_t>::fromAny(validZeInfo.data(), validZeInfo.size()));
     zebin.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel_with_default_maxWGS", {kernelIsa, sizeof(kernelIsa)});
     zebin.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel_with_reduced_maxWGS", {kernelIsa, sizeof(kernelIsa)});
     zebin.elfHeader->machine = this->device->getNEODevice()->getHardwareInfo().platform.eProductFamily;
 
-    MockModule mockModule{this->device, nullptr, ModuleType::User};
+    MockModule mockModule{this->device, nullptr, ModuleType::user};
     auto maxWorkGroupSize = static_cast<uint32_t>(this->neoDevice->deviceInfo.maxWorkGroupSize);
     auto mockTU = mockModule.translationUnit.get();
-    auto result = mockTU->createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size());
+    auto result = mockTU->createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size(), "");
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
 
     auto &defaultKernelDescriptor = mockTU->programInfo.kernelInfos[0]->kernelDescriptor;
@@ -2420,7 +4443,7 @@ kernels:
     EXPECT_EQ(mockModule.getMaxGroupSize(reducedKernelDescriptor), (maxWorkGroupSize >> 1));
 
     uint32_t groupSize[3] = {0u, 0u, 0u};
-    Mock<Kernel> defaultKernel;
+    Mock<KernelImp> defaultKernel;
     defaultKernel.module = &mockModule;
     defaultKernel.descriptor.kernelAttributes = defaultKernelDescriptor.kernelAttributes;
     EXPECT_EQ(ZE_RESULT_SUCCESS, defaultKernel.suggestGroupSize(4096u, 4096u, 4096u, &groupSize[0], &groupSize[1], &groupSize[2]));
@@ -2433,7 +4456,7 @@ kernels:
     EXPECT_LE(groupSize[0] * groupSize[1] * groupSize[2], maxWorkGroupSize);
 
     groupSize[0] = groupSize[1] = groupSize[2] = 0u;
-    Mock<Kernel> reducedKernel;
+    Mock<KernelImp> reducedKernel;
     reducedKernel.module = &mockModule;
     reducedKernel.descriptor.kernelAttributes = reducedKernelDescriptor.kernelAttributes;
     EXPECT_EQ(ZE_RESULT_SUCCESS, reducedKernel.suggestGroupSize(maxWorkGroupSize, 1u, 1u, &groupSize[0], &groupSize[1], &groupSize[2]));
@@ -2461,15 +4484,15 @@ kernels:
     elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataGlobal, std::string{"12345678"});
     auto dataGlobalSectionIndex = elfEncoder.getLastSectionHeaderIndex();
 
-    NEO::Elf::ElfSymbolEntry<NEO::Elf::ELF_IDENTIFIER_CLASS::EI_CLASS_64> symbolTable[2] = {};
+    NEO::Elf::ElfSymbolEntry<NEO::Elf::ElfIdentifierClass::EI_CLASS_64> symbolTable[2] = {};
     symbolTable[0].name = decltype(symbolTable[0].name)(elfEncoder.appendSectionName("const.data"));
-    symbolTable[0].info = NEO::Elf::SYMBOL_TABLE_TYPE::STT_OBJECT | NEO::Elf::SYMBOL_TABLE_BIND::STB_GLOBAL << 4;
+    symbolTable[0].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
     symbolTable[0].shndx = decltype(symbolTable[0].shndx)(dataConstSectionIndex);
     symbolTable[0].size = 4;
     symbolTable[0].value = 0;
 
     symbolTable[1].name = decltype(symbolTable[1].name)(elfEncoder.appendSectionName("global.data"));
-    symbolTable[1].info = NEO::Elf::SYMBOL_TABLE_TYPE::STT_OBJECT | NEO::Elf::SYMBOL_TABLE_BIND::STB_GLOBAL << 4;
+    symbolTable[1].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
     symbolTable[1].shndx = decltype(symbolTable[1].shndx)(dataGlobalSectionIndex);
     symbolTable[1].size = 4;
     symbolTable[1].value = 0;
@@ -2480,28 +4503,248 @@ kernels:
 
     L0::ModuleTranslationUnit moduleTu(this->device);
     moduleTu.unpackedDeviceBinarySize = zebin.size();
-    moduleTu.unpackedDeviceBinary = std::make_unique<char[]>(moduleTu.unpackedDeviceBinarySize);
+    moduleTu.unpackedDeviceBinary = std::make_unique_for_overwrite<char[]>(moduleTu.unpackedDeviceBinarySize);
     memcpy_s(moduleTu.unpackedDeviceBinary.get(), moduleTu.unpackedDeviceBinarySize,
              zebin.data(), zebin.size());
     auto retVal = moduleTu.processUnpackedBinary();
     EXPECT_EQ(retVal, ZE_RESULT_SUCCESS);
-    EXPECT_EQ(AllocationType::CONSTANT_SURFACE, moduleTu.globalConstBuffer->getAllocationType());
-    EXPECT_EQ(AllocationType::GLOBAL_SURFACE, moduleTu.globalVarBuffer->getAllocationType());
+    EXPECT_EQ(AllocationType::constantSurface, moduleTu.globalConstBuffer->getGraphicsAllocation()->getAllocationType());
+    EXPECT_EQ(AllocationType::globalSurface, moduleTu.globalVarBuffer->getGraphicsAllocation()->getAllocationType());
 
     auto svmAllocsManager = device->getDriverHandle()->getSvmAllocsManager();
     auto globalConstBufferAllocType = svmAllocsManager->getSVMAlloc(reinterpret_cast<void *>(moduleTu.globalConstBuffer->getGpuAddress()))->memoryType;
     auto globalVarBufferAllocType = svmAllocsManager->getSVMAlloc(reinterpret_cast<void *>(moduleTu.globalVarBuffer->getGpuAddress()))->memoryType;
-    EXPECT_EQ(DEVICE_UNIFIED_MEMORY, globalConstBufferAllocType);
-    EXPECT_EQ(DEVICE_UNIFIED_MEMORY, globalVarBufferAllocType);
+    EXPECT_EQ(InternalMemoryType::deviceUnifiedMemory, globalConstBufferAllocType);
+    EXPECT_EQ(InternalMemoryType::deviceUnifiedMemory, globalVarBufferAllocType);
+}
+
+TEST_F(ModuleTranslationUnitTest, GivenUsmPoolsAnd2MBLocalMemAlignmentEnabledWhenProcessingZebinThenGlobalBuffersAreTakenFromPoolAndFreedOnModuleTranslationUnitDestroy) {
+    auto usmConstantSurfaceAllocPool = new MockUsmMemAllocPool;
+    auto usmGlobalSurfaceAllocPool = new MockUsmMemAllocPool;
+
+    neoDevice->resetUsmConstantSurfaceAllocPool(usmConstantSurfaceAllocPool);
+    neoDevice->resetUsmGlobalSurfaceAllocPool(usmGlobalSurfaceAllocPool);
+
+    auto mockProductHelper = new MockProductHelper;
+    neoDevice->getRootDeviceEnvironmentRef().productHelper.reset(mockProductHelper);
+    mockProductHelper->is2MBLocalMemAlignmentEnabledResult = true;
+
+    std::string zeInfo = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
+kernels:
+    - name : kernel
+      execution_env :
+        simd_size : 8
+)===";
+    MockElfEncoder<> elfEncoder;
+    elfEncoder.getElfFileHeader().type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel", std::string{});
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataConst, std::string{"12345678"});
+    auto dataConstSectionIndex = elfEncoder.getLastSectionHeaderIndex();
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataGlobal, std::string{"12345678"});
+    auto dataGlobalSectionIndex = elfEncoder.getLastSectionHeaderIndex();
+
+    NEO::Elf::ElfSymbolEntry<NEO::Elf::ElfIdentifierClass::EI_CLASS_64> symbolTable[2] = {};
+    symbolTable[0].name = decltype(symbolTable[0].name)(elfEncoder.appendSectionName("const.data"));
+    symbolTable[0].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
+    symbolTable[0].shndx = decltype(symbolTable[0].shndx)(dataConstSectionIndex);
+    symbolTable[0].size = 4;
+    symbolTable[0].value = 0;
+
+    symbolTable[1].name = decltype(symbolTable[1].name)(elfEncoder.appendSectionName("global.data"));
+    symbolTable[1].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
+    symbolTable[1].shndx = decltype(symbolTable[1].shndx)(dataGlobalSectionIndex);
+    symbolTable[1].size = 4;
+    symbolTable[1].value = 0;
+    elfEncoder.appendSection(NEO::Elf::SHT_SYMTAB, NEO::Zebin::Elf::SectionNames::symtab,
+                             ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(symbolTable), sizeof(symbolTable)));
+    elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, zeInfo);
+    auto zebin = elfEncoder.encode();
+
+    {
+        L0::ModuleTranslationUnit moduleTu(this->device);
+        moduleTu.unpackedDeviceBinarySize = zebin.size();
+        moduleTu.unpackedDeviceBinary = std::make_unique_for_overwrite<char[]>(moduleTu.unpackedDeviceBinarySize);
+        memcpy_s(moduleTu.unpackedDeviceBinary.get(), moduleTu.unpackedDeviceBinarySize,
+                 zebin.data(), zebin.size());
+        auto retVal = moduleTu.processUnpackedBinary();
+        EXPECT_EQ(retVal, ZE_RESULT_SUCCESS);
+        EXPECT_EQ(AllocationType::constantSurface, moduleTu.globalConstBuffer->getGraphicsAllocation()->getAllocationType());
+        EXPECT_EQ(AllocationType::globalSurface, moduleTu.globalVarBuffer->getGraphicsAllocation()->getAllocationType());
+
+        EXPECT_TRUE(neoDevice->getUsmConstantSurfaceAllocPool()->isInPoolRange(reinterpret_cast<void *>(moduleTu.globalConstBuffer->getGpuAddress())));
+        EXPECT_TRUE(neoDevice->getUsmGlobalSurfaceAllocPool()->isInPoolRange(reinterpret_cast<void *>(moduleTu.globalVarBuffer->getGpuAddress())));
+    }
+
+    EXPECT_EQ(1u, usmConstantSurfaceAllocPool->freeSVMAllocCalled);
+    EXPECT_EQ(1u, usmGlobalSurfaceAllocPool->freeSVMAllocCalled);
+}
+
+TEST_F(ModuleTranslationUnitTest, GivenGenericPoolsAnd2MBLocalMemAlignmentEnabledWhenProcessingZebinThenGlobalBuffersAreTakenFromPoolAndFreedOnModuleTranslationUnitDestroy) {
+    auto mockProductHelper = new MockProductHelper;
+    neoDevice->getRootDeviceEnvironmentRef().productHelper.reset(mockProductHelper);
+    mockProductHelper->is2MBLocalMemAlignmentEnabledResult = true;
+
+    constexpr size_t constantDataSize = ConstantSurfacePoolTraits::defaultPoolSize / 2 + MemoryConstants::pageSize;
+    constexpr size_t globalDataSize = GlobalSurfacePoolTraits::defaultPoolSize / 2 + MemoryConstants::pageSize;
+
+    const std::vector<uint8_t> sectionData(std::max(constantDataSize, globalDataSize), 7);
+
+    std::string zeInfo = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
+kernels:
+    - name : kernel
+      execution_env :
+        simd_size : 8
+)===";
+    MockElfEncoder<> elfEncoder;
+    elfEncoder.getElfFileHeader().type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel", std::string{});
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataConst, ArrayRef<const uint8_t>(sectionData.data(), constantDataSize));
+    auto dataConstSectionIndex = elfEncoder.getLastSectionHeaderIndex();
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataGlobal, ArrayRef<const uint8_t>(sectionData.data(), globalDataSize));
+    auto dataGlobalSectionIndex = elfEncoder.getLastSectionHeaderIndex();
+
+    NEO::Elf::ElfSymbolEntry<NEO::Elf::ElfIdentifierClass::EI_CLASS_64> symbolTable[2] = {};
+    symbolTable[0].name = decltype(symbolTable[0].name)(elfEncoder.appendSectionName("const.data"));
+    symbolTable[0].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_LOCAL << 4;
+    symbolTable[0].shndx = decltype(symbolTable[0].shndx)(dataConstSectionIndex);
+    symbolTable[0].size = constantDataSize;
+    symbolTable[0].value = 0;
+
+    symbolTable[1].name = decltype(symbolTable[1].name)(elfEncoder.appendSectionName("global.data"));
+    symbolTable[1].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_LOCAL << 4;
+    symbolTable[1].shndx = decltype(symbolTable[1].shndx)(dataGlobalSectionIndex);
+    symbolTable[1].size = globalDataSize;
+    symbolTable[1].value = 0;
+
+    elfEncoder.appendSection(NEO::Elf::SHT_SYMTAB, NEO::Zebin::Elf::SectionNames::symtab,
+                             ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(symbolTable), sizeof(symbolTable)));
+    elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, zeInfo);
+    auto zebin = elfEncoder.encode();
+
+    GraphicsAllocation *constantAllocation = nullptr;
+    GraphicsAllocation *globalAllocation = nullptr;
+
+    {
+        L0::ModuleTranslationUnit moduleTu(this->device);
+        moduleTu.unpackedDeviceBinarySize = zebin.size();
+        moduleTu.unpackedDeviceBinary = std::make_unique_for_overwrite<char[]>(moduleTu.unpackedDeviceBinarySize);
+        memcpy_s(moduleTu.unpackedDeviceBinary.get(), moduleTu.unpackedDeviceBinarySize,
+                 zebin.data(), zebin.size());
+        auto retVal = moduleTu.processUnpackedBinary();
+        EXPECT_EQ(retVal, ZE_RESULT_SUCCESS);
+        ASSERT_NE(nullptr, moduleTu.globalConstBuffer);
+        ASSERT_NE(nullptr, moduleTu.globalVarBuffer);
+
+        EXPECT_EQ(AllocationType::constantSurface, moduleTu.globalConstBuffer->getGraphicsAllocation()->getAllocationType());
+        EXPECT_EQ(AllocationType::globalSurface, moduleTu.globalVarBuffer->getGraphicsAllocation()->getAllocationType());
+
+        EXPECT_TRUE(moduleTu.globalConstBuffer->isFromPool());
+        EXPECT_TRUE(moduleTu.globalVarBuffer->isFromPool());
+        EXPECT_TRUE(neoDevice->getConstantSurfacePoolAllocator().isPoolBuffer(moduleTu.globalConstBuffer->getGraphicsAllocation()));
+        EXPECT_TRUE(neoDevice->getGlobalSurfacePoolAllocator().isPoolBuffer(moduleTu.globalVarBuffer->getGraphicsAllocation()));
+
+        // Store allocation details before destruction
+        constantAllocation = moduleTu.globalConstBuffer->getGraphicsAllocation();
+        globalAllocation = moduleTu.globalVarBuffer->getGraphicsAllocation();
+    }
+
+    // Allocate the same sizes again - should get the same chunks
+    auto newConstantAlloc = neoDevice->getConstantSurfacePoolAllocator().allocate(constantDataSize);
+    ASSERT_NE(nullptr, newConstantAlloc);
+    EXPECT_TRUE(newConstantAlloc->isFromPool());
+    EXPECT_EQ(constantAllocation, newConstantAlloc->getGraphicsAllocation());
+
+    auto newGlobalAlloc = neoDevice->getGlobalSurfacePoolAllocator().allocate(globalDataSize);
+    ASSERT_NE(nullptr, newGlobalAlloc);
+    EXPECT_TRUE(newGlobalAlloc->isFromPool());
+    EXPECT_EQ(globalAllocation, newGlobalAlloc->getGraphicsAllocation());
+
+    neoDevice->getConstantSurfacePoolAllocator().free(newConstantAlloc);
+    neoDevice->getGlobalSurfacePoolAllocator().free(newGlobalAlloc);
+}
+
+TEST_F(ModuleTranslationUnitTest, GivenUsmPoolEnabledWhenTwoModuleTranslationUnitsAreCreatedWithTheSameDeviceThenTheyShareUnderlyingGlobalSurfacePoolAllocations) {
+    auto usmConstantSurfaceAllocPool = new MockUsmMemAllocPool;
+    auto usmGlobalSurfaceAllocPool = new MockUsmMemAllocPool;
+
+    neoDevice->resetUsmConstantSurfaceAllocPool(usmConstantSurfaceAllocPool);
+    neoDevice->resetUsmGlobalSurfaceAllocPool(usmGlobalSurfaceAllocPool);
+
+    auto mockProductHelper = new MockProductHelper;
+    neoDevice->getRootDeviceEnvironmentRef().productHelper.reset(mockProductHelper);
+    mockProductHelper->is2MBLocalMemAlignmentEnabledResult = true;
+
+    std::string zeInfo = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
+kernels:
+    - name : kernel
+      execution_env :
+        simd_size : 8
+)===";
+    MockElfEncoder<> elfEncoder;
+    elfEncoder.getElfFileHeader().type = NEO::Zebin::Elf::ET_ZEBIN_EXE;
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel", std::string{});
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataConst, std::string{"12345678"});
+    auto dataConstSectionIndex = elfEncoder.getLastSectionHeaderIndex();
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::dataGlobal, std::string{"12345678"});
+    auto dataGlobalSectionIndex = elfEncoder.getLastSectionHeaderIndex();
+
+    NEO::Elf::ElfSymbolEntry<NEO::Elf::ElfIdentifierClass::EI_CLASS_64> symbolTable[2] = {};
+    symbolTable[0].name = decltype(symbolTable[0].name)(elfEncoder.appendSectionName("const.data"));
+    symbolTable[0].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
+    symbolTable[0].shndx = decltype(symbolTable[0].shndx)(dataConstSectionIndex);
+    symbolTable[0].size = 4;
+    symbolTable[0].value = 0;
+
+    symbolTable[1].name = decltype(symbolTable[1].name)(elfEncoder.appendSectionName("global.data"));
+    symbolTable[1].info = NEO::Elf::SymbolTableType::STT_OBJECT | NEO::Elf::SymbolTableBind::STB_GLOBAL << 4;
+    symbolTable[1].shndx = decltype(symbolTable[1].shndx)(dataGlobalSectionIndex);
+    symbolTable[1].size = 4;
+    symbolTable[1].value = 0;
+    elfEncoder.appendSection(NEO::Elf::SHT_SYMTAB, NEO::Zebin::Elf::SectionNames::symtab,
+                             ArrayRef<const uint8_t>(reinterpret_cast<const uint8_t *>(symbolTable), sizeof(symbolTable)));
+    elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, zeInfo);
+    auto zebin = elfEncoder.encode();
+
+    {
+        L0::ModuleTranslationUnit moduleTu(this->device);
+        moduleTu.unpackedDeviceBinarySize = zebin.size();
+        moduleTu.unpackedDeviceBinary = std::make_unique_for_overwrite<char[]>(moduleTu.unpackedDeviceBinarySize);
+        memcpy_s(moduleTu.unpackedDeviceBinary.get(), moduleTu.unpackedDeviceBinarySize,
+                 zebin.data(), zebin.size());
+        auto retVal = moduleTu.processUnpackedBinary();
+        EXPECT_EQ(retVal, ZE_RESULT_SUCCESS);
+
+        EXPECT_TRUE(neoDevice->getUsmConstantSurfaceAllocPool()->isInPoolRange(reinterpret_cast<void *>(moduleTu.globalConstBuffer->getGpuAddress())));
+        EXPECT_TRUE(neoDevice->getUsmGlobalSurfaceAllocPool()->isInPoolRange(reinterpret_cast<void *>(moduleTu.globalVarBuffer->getGpuAddress())));
+
+        L0::ModuleTranslationUnit moduleTu2(this->device);
+        moduleTu2.unpackedDeviceBinarySize = zebin.size();
+        moduleTu2.unpackedDeviceBinary = std::make_unique_for_overwrite<char[]>(moduleTu2.unpackedDeviceBinarySize);
+        memcpy_s(moduleTu2.unpackedDeviceBinary.get(), moduleTu2.unpackedDeviceBinarySize,
+                 zebin.data(), zebin.size());
+        retVal = moduleTu2.processUnpackedBinary();
+        EXPECT_EQ(retVal, ZE_RESULT_SUCCESS);
+
+        EXPECT_TRUE(neoDevice->getUsmConstantSurfaceAllocPool()->isInPoolRange(reinterpret_cast<void *>(moduleTu2.globalConstBuffer->getGpuAddress())));
+        EXPECT_TRUE(neoDevice->getUsmGlobalSurfaceAllocPool()->isInPoolRange(reinterpret_cast<void *>(moduleTu2.globalVarBuffer->getGpuAddress())));
+
+        EXPECT_EQ(moduleTu.globalConstBuffer->getGraphicsAllocation(), moduleTu2.globalConstBuffer->getGraphicsAllocation());
+        EXPECT_EQ(moduleTu.globalVarBuffer->getGraphicsAllocation(), moduleTu2.globalVarBuffer->getGraphicsAllocation());
+
+        EXPECT_NE(moduleTu.globalConstBuffer->getGpuAddress(), moduleTu2.globalConstBuffer->getGpuAddress());
+        EXPECT_NE(moduleTu.globalVarBuffer->getGpuAddress(), moduleTu2.globalVarBuffer->getGpuAddress());
+    }
+
+    EXPECT_EQ(2u, usmConstantSurfaceAllocPool->freeSVMAllocCalled);
+    EXPECT_EQ(2u, usmGlobalSurfaceAllocPool->freeSVMAllocCalled);
 }
 
 HWTEST_F(ModuleTranslationUnitTest, WithNoCompilerWhenCallingBuildFromSpirvThenFailureReturned) {
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
     rootDeviceEnvironment->compilerInterface.reset(nullptr);
     auto oldFclDllName = Os::frontEndDllName;
-    auto oldIgcDllName = Os::igcDllName;
     Os::frontEndDllName = "_invalidFCL";
-    Os::igcDllName = "_invalidIGC";
+    auto igcNameGuard = NEO::pushIgcDllName("_invalidIGC");
 
     L0::ModuleTranslationUnit moduleTu(this->device);
     moduleTu.options = "abcd";
@@ -2509,7 +4752,6 @@ HWTEST_F(ModuleTranslationUnitTest, WithNoCompilerWhenCallingBuildFromSpirvThenF
     ze_result_t result = ZE_RESULT_SUCCESS;
     result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
     EXPECT_EQ(result, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
-    Os::igcDllName = oldIgcDllName;
     Os::frontEndDllName = oldFclDllName;
 }
 
@@ -2517,18 +4759,16 @@ HWTEST_F(ModuleTranslationUnitTest, WithNoCompilerWhenCallingCompileGenBinaryThe
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
     rootDeviceEnvironment->compilerInterface.reset(nullptr);
     auto oldFclDllName = Os::frontEndDllName;
-    auto oldIgcDllName = Os::igcDllName;
     Os::frontEndDllName = "_invalidFCL";
-    Os::igcDllName = "_invalidIGC";
+    auto igcNameGuard = NEO::pushIgcDllName("_invalidIGC");
 
     L0::ModuleTranslationUnit moduleTu(this->device);
     moduleTu.options = "abcd";
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     TranslationInput inputArgs = {IGC::CodeType::spirV, IGC::CodeType::oclGenBin};
-    result = moduleTu.compileGenBinary(inputArgs, false);
+    result = moduleTu.compileGenBinary(inputArgs, ModuleTranslationUnit::CompilationMode::build);
     EXPECT_EQ(result, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
-    Os::igcDllName = oldIgcDllName;
     Os::frontEndDllName = oldFclDllName;
 }
 
@@ -2536,9 +4776,8 @@ HWTEST_F(ModuleTranslationUnitTest, WithNoCompilerWhenCallingStaticLinkSpirVThen
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
     rootDeviceEnvironment->compilerInterface.reset(nullptr);
     auto oldFclDllName = Os::frontEndDllName;
-    auto oldIgcDllName = Os::igcDllName;
     Os::frontEndDllName = "_invalidFCL";
-    Os::igcDllName = "_invalidIGC";
+    auto igcNameGuard = NEO::pushIgcDllName("_invalidIGC");
 
     L0::ModuleTranslationUnit moduleTu(this->device);
     moduleTu.options = "abcd";
@@ -2549,37 +4788,85 @@ HWTEST_F(ModuleTranslationUnitTest, WithNoCompilerWhenCallingStaticLinkSpirVThen
     std::vector<const ze_module_constants_t *> specConstants;
     result = moduleTu.staticLinkSpirV(inputSpirVs, inputModuleSizes, "", "", specConstants);
     EXPECT_EQ(result, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
-    Os::igcDllName = oldIgcDllName;
     Os::frontEndDllName = oldFclDllName;
 }
 
-class ModuleTranslationUnitDebuggerSupportedTest : public ModuleTranslationUnitTest {
-  public:
-    void SetUp() override {
-        NEO::HardwareInfo hwInfo = *NEO::defaultHwInfo;
-        hwInfo.capabilityTable.debuggerSupported = true;
-        DeviceFixture::setUpImpl(&hwInfo);
-    }
+HWTEST_F(ModuleTranslationUnitTest, WithNoCompilerWhenCallingStaticLinkSpirVAndLlvmBcThenFailureReturned) {
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(nullptr);
+    auto oldFclDllName = Os::frontEndDllName;
+    Os::frontEndDllName = "_invalidFCL";
+    auto igcNameGuard = NEO::pushIgcDllName("_invalidIGC");
 
-    void TearDown() override {
-        DeviceFixture::tearDown();
-    }
+    L0::ModuleTranslationUnit moduleTu(this->device);
+    moduleTu.options = "abcd";
 
-    DebugManagerStateRestore restorer;
-};
+    std::vector<const char *> inputSpirVs;
+    std::vector<uint32_t> inputModuleSizes;
+    std::vector<const ze_module_constants_t *> specConstants;
+    std::vector<const char *> inputLlvmBcs;
+    std::vector<uint32_t> inputLlvmBcSizes;
 
-HWTEST2_F(ModuleTranslationUnitDebuggerSupportedTest, WhenCreatingFromZeBinaryWithoutSpirvDataIncludedAndLegacyDebuggerAttachedThenReturnError, HasSourceLevelDebuggerSupport) {
-    ZebinTestData::ValidEmptyProgram<> zebin;
-    const auto &hwInfo = device->getNEODevice()->getHardwareInfo();
-    zebin.elfHeader->machine = hwInfo.platform.eProductFamily;
+    ze_result_t result = moduleTu.staticLinkSpirVAndLlvmBc(inputSpirVs, inputModuleSizes, "", "", specConstants,
+                                                           inputLlvmBcs, inputLlvmBcSizes);
+    EXPECT_EQ(result, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
+    Os::frontEndDllName = oldFclDllName;
+}
 
-    neoDevice->executionEnvironment->rootDeviceEnvironments[mockRootDeviceIndex]->debugger.reset(new MockActiveSourceLevelDebugger);
-    EXPECT_NE(nullptr, neoDevice->getSourceLevelDebugger());
+HWTEST_F(ModuleTranslationUnitTest, GivenSpirVInputWhenCallingGenerateElfFromSpirVThenOutputMatchesGenerateElfFromSpirVAndLlvmBcWithEmptyLlvmBcVectors) {
+    L0::ModuleTranslationUnit moduleTu(this->device);
 
-    MockModuleTU moduleTu{device};
-    ASSERT_EQ(0u, moduleTu.irBinarySize);
-    auto result = moduleTu.createFromNativeBinary(reinterpret_cast<const char *>(zebin.storage.data()), zebin.storage.size());
-    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_NATIVE_BINARY, result);
+    const char dummySpirV[] = "dummy_spirv_payload";
+    std::vector<const char *> inputSpirVs = {dummySpirV};
+    std::vector<uint32_t> inputSizes = {static_cast<uint32_t>(sizeof(dummySpirV))};
+
+    auto elfViaWrapper = moduleTu.generateElfFromSpirV(inputSpirVs, inputSizes);
+    auto elfViaNewFunction = moduleTu.generateElfFromSpirVAndLlvmBc(inputSpirVs, inputSizes, {}, {}, {});
+
+    EXPECT_FALSE(elfViaWrapper.empty());
+    EXPECT_EQ(elfViaWrapper, elfViaNewFunction);
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenSpirVAndLlvmBcInputsWhenGeneratingElfThenElfIsLargerThanSpirVOnlyElf) {
+    L0::ModuleTranslationUnit moduleTu(this->device);
+
+    const char dummySpirV[] = "dummy_spirv_payload";
+    const char dummyLlvmBc[] = "dummy_llvmbc_payload_longer";
+    std::vector<const char *> inputSpirVs = {dummySpirV};
+    std::vector<uint32_t> inputSpirVSizes = {static_cast<uint32_t>(sizeof(dummySpirV))};
+    std::vector<const char *> inputLlvmBcs = {dummyLlvmBc};
+    std::vector<uint32_t> inputLlvmBcSizes = {static_cast<uint32_t>(sizeof(dummyLlvmBc))};
+
+    auto elfSpirVOnly = moduleTu.generateElfFromSpirVAndLlvmBc(inputSpirVs, inputSpirVSizes, {}, {}, {});
+    auto elfSpirVAndLlvmBc = moduleTu.generateElfFromSpirVAndLlvmBc(inputSpirVs, inputSpirVSizes, {},
+                                                                    inputLlvmBcs, inputLlvmBcSizes);
+
+    EXPECT_FALSE(elfSpirVAndLlvmBc.empty());
+    EXPECT_GT(elfSpirVAndLlvmBc.size(), elfSpirVOnly.size());
+}
+
+HWTEST_F(ModuleTranslationUnitTest, GivenMultipleLlvmBcInputsWhenGeneratingElfThenEachLlvmBcAddsToElfSize) {
+    L0::ModuleTranslationUnit moduleTu(this->device);
+
+    const char dummySpirV[] = "dummy_spirv";
+    const char dummyLlvmBc1[] = "llvmbc_module_one";
+    const char dummyLlvmBc2[] = "llvmbc_module_two_longer_payload";
+    std::vector<const char *> inputSpirVs = {dummySpirV};
+    std::vector<uint32_t> inputSpirVSizes = {static_cast<uint32_t>(sizeof(dummySpirV))};
+
+    std::vector<const char *> oneLlvmBc = {dummyLlvmBc1};
+    std::vector<uint32_t> oneLlvmBcSz = {static_cast<uint32_t>(sizeof(dummyLlvmBc1))};
+    std::vector<const char *> twoLlvmBcs = {dummyLlvmBc1, dummyLlvmBc2};
+    std::vector<uint32_t> twoLlvmBcsSz = {static_cast<uint32_t>(sizeof(dummyLlvmBc1)),
+                                          static_cast<uint32_t>(sizeof(dummyLlvmBc2))};
+
+    auto elfOneLlvmBc = moduleTu.generateElfFromSpirVAndLlvmBc(inputSpirVs, inputSpirVSizes, {},
+                                                               oneLlvmBc, oneLlvmBcSz);
+    auto elfTwoLlvmBcs = moduleTu.generateElfFromSpirVAndLlvmBc(inputSpirVs, inputSpirVSizes, {},
+                                                                twoLlvmBcs, twoLlvmBcsSz);
+
+    EXPECT_FALSE(elfOneLlvmBc.empty());
+    EXPECT_GT(elfTwoLlvmBcs.size(), elfOneLlvmBc.size());
 }
 
 HWTEST_F(ModuleTranslationUnitTest, WhenBuildOptionsAreNullThenReuseExistingOptions) {
@@ -2605,7 +4892,7 @@ HWTEST_F(ModuleTranslationUnitTest, WhenBuildOptionsAreNullThenReuseExistingOpti
     rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.DisableStatelessToStatefulOptimization.set(1);
+    debugManager.flags.DisableStatelessToStatefulOptimization.set(1);
 
     MockModuleTranslationUnit moduleTu(this->device);
     moduleTu.processUnpackedBinaryCallBase = false;
@@ -2636,9 +4923,9 @@ HWTEST_F(ModuleTranslationUnitTest, givenInternalOptionsThenLSCCachePolicyIsSet)
     }
 }
 
-HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetToWbWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsAtLeastXeHpgCore) {
+HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetToWbWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsWithinXeCoreAndXe3Core) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
     auto pMockCompilerInterface = new MockCompilerInterface;
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
     rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
@@ -2651,10 +4938,9 @@ HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetToWbWhenGetInternalOptions
     EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=7 -cl-load-cache-default=4"), std::string::npos);
 }
 
-HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetForceAllResourcesUncachedWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsAtLeastXeHpgCore) {
+HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetToWbpWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsAtLeastXe3pCore) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
-    DebugManager.flags.ForceAllResourcesUncached.set(true);
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(0);
     auto pMockCompilerInterface = new MockCompilerInterface;
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
     rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
@@ -2664,10 +4950,45 @@ HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetForceAllResourcesUncachedW
     result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
     EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=1 -cl-load-cache-default=1"), std::string::npos);
+    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=18 -cl-load-cache-default=25"), std::string::npos);
 }
 
-HWTEST2_F(ModuleTranslationUnitTest, givenAtLeastXeHpgCoreWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsAtLeastXeHpgCore) {
+HWTEST_F(ModuleTranslationUnitTest, givenDumpZebinWhenBuildingFromSpirvThenZebinElfDumped) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.DumpZEBin.set(1);
+
+    auto mockCompilerInterface = new NEO::MockCompilerInterfaceCaptureBuildOptions;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(mockCompilerInterface);
+
+    char binary[10];
+    auto zebin = ZebinTestData::ValidEmptyProgram<>();
+
+    mockCompilerInterface->output.intermediateRepresentation.size = zebin.storage.size();
+    mockCompilerInterface->output.intermediateRepresentation.mem.reset(new char[zebin.storage.size()]);
+
+    memcpy_s(mockCompilerInterface->output.intermediateRepresentation.mem.get(), mockCompilerInterface->output.intermediateRepresentation.size,
+             zebin.storage.data(), zebin.storage.size());
+
+    MockModuleTranslationUnit moduleTu(this->device);
+    moduleTu.processUnpackedBinaryCallBase = true;
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+
+    std::string fileName = "dumped_zebin_module.elf";
+    EXPECT_FALSE(virtualFileExists(fileName));
+
+    VariableBackup<decltype(NEO::IoFunctions::fopenPtr)> mockFopenToNullAsNotNeededHere{&NEO::IoFunctions::fopenPtr, [](const char *filename, const char *mode) -> FILE * { return nullptr; }};
+    result = moduleTu.buildFromSpirV(binary, sizeof(binary), nullptr, "", nullptr);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+
+    EXPECT_TRUE(virtualFileExists(fileName));
+    removeVirtualFile(fileName);
+}
+
+HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetForceAllResourcesUncachedWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsWithinXeCoreAndXe3Core) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.ForceAllResourcesUncached.set(true);
     auto pMockCompilerInterface = new MockCompilerInterface;
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
     rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
@@ -2677,7 +4998,53 @@ HWTEST2_F(ModuleTranslationUnitTest, givenAtLeastXeHpgCoreWhenGetInternalOptions
     result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
     EXPECT_EQ(result, ZE_RESULT_SUCCESS);
     EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=2 -cl-load-cache-default=4"), std::string::npos);
+    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=2 -cl-load-cache-default=2"), std::string::npos);
+}
+
+HWTEST2_F(ModuleTranslationUnitTest, givenDebugFlagSetForceAllResourcesUncachedWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsAtLeastXe3pCore) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.OverrideL1CachePolicyInSurfaceStateAndStateless.set(2);
+    debugManager.flags.ForceAllResourcesUncached.set(true);
+    auto pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+    MockModuleTranslationUnit moduleTu(this->device);
+    moduleTu.processUnpackedBinaryCallBase = false;
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
+    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=18 -cl-load-cache-default=18"), std::string::npos);
+}
+
+HWTEST2_F(ModuleTranslationUnitTest, givenDefaultL1CachePolicyWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsWithinXeCoreAndXe3Core) {
+    auto pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+    MockModuleTranslationUnit moduleTu(this->device);
+    moduleTu.processUnpackedBinaryCallBase = false;
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
+    if (this->neoDevice->getProductHelper().getL1CachePolicy(false) == 0) {
+        EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=2 -cl-load-cache-default=4"), std::string::npos);
+    } else {
+        EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=7 -cl-load-cache-default=4"), std::string::npos);
+    }
+}
+
+HWTEST2_F(ModuleTranslationUnitTest, givenDefaultL1CachePolicyWhenGetInternalOptionsThenCorrectBuildOptionIsSet, IsAtLeastXe3pCore) {
+    auto pMockCompilerInterface = new MockCompilerInterface;
+    auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
+    rootDeviceEnvironment->compilerInterface.reset(pMockCompilerInterface);
+    MockModuleTranslationUnit moduleTu(this->device);
+    moduleTu.processUnpackedBinaryCallBase = false;
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
+    EXPECT_NE(pMockCompilerInterface->inputInternalOptions.find("-cl-store-cache-default=30 -cl-load-cache-default=25"), std::string::npos);
 }
 
 HWTEST_F(ModuleTranslationUnitTest, givenForceToStatelessRequiredWhenBuildingModuleThen4GbBuffersAreRequired) {
@@ -2698,70 +5065,6 @@ HWTEST_F(ModuleTranslationUnitTest, givenForceToStatelessRequiredWhenBuildingMod
     } else {
         EXPECT_EQ(mockCompilerInterface->inputInternalOptions.find("cl-intel-greater-than-4GB-buffer-required"), std::string::npos);
     }
-}
-
-HWTEST2_F(ModuleTranslationUnitDebuggerSupportedTest, givenSourceLevelDebuggerAndEnableZebinBuildOptionWhenBuildWithSpirvThenModuleBuildFails, IsAtMostGen12lp) {
-    auto mockCompilerInterface = new MockCompilerInterface;
-    neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->debugger.reset(new MockActiveSourceLevelDebugger);
-    auto &rootDeviceEnvironment = neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
-    rootDeviceEnvironment->compilerInterface.reset(mockCompilerInterface);
-
-    MockModuleTranslationUnit moduleTu(device);
-    ze_result_t result = ZE_RESULT_SUCCESS;
-    auto buildOption = NEO::CompilerOptions::enableZebin.str();
-
-    result = moduleTu.buildFromSpirV("", 0U, buildOption.c_str(), "", nullptr);
-    EXPECT_EQ(result, ZE_RESULT_ERROR_MODULE_BUILD_FAILURE);
-}
-
-HWTEST2_F(ModuleTranslationUnitDebuggerSupportedTest, givenSourceLevelDebuggerAndEnableZebinBuildOptionWhenBuildWithSpirvThenModuleBuildsWithSuccess, IsAtLeastXeHpCore) {
-    auto mockCompilerInterface = new MockCompilerInterface;
-    neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->debugger.reset(new MockActiveSourceLevelDebugger);
-    auto &rootDeviceEnvironment = neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
-    rootDeviceEnvironment->compilerInterface.reset(mockCompilerInterface);
-
-    MockModuleTranslationUnit moduleTu(device);
-    moduleTu.processUnpackedBinaryCallBase = false;
-    ze_result_t result = ZE_RESULT_SUCCESS;
-    auto buildOption = NEO::CompilerOptions::enableZebin.str();
-
-    result = moduleTu.buildFromSpirV("", 0U, buildOption.c_str(), "", nullptr);
-    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-    EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(mockCompilerInterface->receivedApiOptions.find(NEO::CompilerOptions::enableZebin.str()), std::string::npos);
-    EXPECT_EQ(mockCompilerInterface->inputInternalOptions.find(NEO::CompilerOptions::disableZebin.str()), std::string::npos);
-}
-
-HWTEST_F(ModuleTranslationUnitTest, givenEnableZebinBuildOptionWhenBuildWithSpirvThenOptionsContainsAllowZebin) {
-    auto mockCompilerInterface = new MockCompilerInterface;
-    auto &rootDeviceEnvironment = neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
-    rootDeviceEnvironment->compilerInterface.reset(mockCompilerInterface);
-
-    MockModuleTranslationUnit moduleTu(device);
-    moduleTu.processUnpackedBinaryCallBase = false;
-    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    auto buildOption = NEO::CompilerOptions::enableZebin.str();
-
-    result = moduleTu.buildFromSpirV("", 0U, buildOption.c_str(), "", nullptr);
-    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-    EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
-    EXPECT_NE(mockCompilerInterface->receivedApiOptions.find(NEO::CompilerOptions::enableZebin.str()), std::string::npos);
-    EXPECT_EQ(mockCompilerInterface->inputInternalOptions.find(NEO::CompilerOptions::disableZebin.str()), std::string::npos);
-}
-
-HWTEST2_F(ModuleTranslationUnitDebuggerSupportedTest, givenSourceLevelDebuggerWhenBuildWithSpirvThenModuleBuildsWithSuccess, HasSourceLevelDebuggerSupport) {
-    auto mockCompilerInterface = new MockCompilerInterface;
-    neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->debugger.reset(new MockActiveSourceLevelDebugger);
-    auto &rootDeviceEnvironment = neoDevice->executionEnvironment->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
-    rootDeviceEnvironment->compilerInterface.reset(mockCompilerInterface);
-
-    MockModuleTranslationUnit moduleTu(device);
-    moduleTu.processUnpackedBinaryCallBase = false;
-    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-
-    result = moduleTu.buildFromSpirV("", 0U, nullptr, "", nullptr);
-    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
-    EXPECT_EQ(moduleTu.processUnpackedBinaryCalled, 1u);
 }
 
 TEST(ModuleBuildLog, WhenGreaterBufferIsPassedToGetStringThenOutputSizeIsOverridden) {
@@ -2808,6 +5111,8 @@ TEST(ModuleBuildLog, WhenTooSmallBufferIsPassedToGetStringThenErrorIsReturned) {
 using PrintfModuleTest = Test<DeviceFixture>;
 
 HWTEST_F(PrintfModuleTest, GivenModuleWithPrintfWhenKernelIsCreatedThenPrintfAllocationIsPlacedInResidencyContainer) {
+    DebugManagerStateRestore restore{};
+    debugManager.flags.FailBuildProgramWithStatefulAccess.set(0);
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
     const auto &src = zebinData->storage;
 
@@ -2816,21 +5121,19 @@ HWTEST_F(PrintfModuleTest, GivenModuleWithPrintfWhenKernelIsCreatedThenPrintfAll
     moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
     moduleDesc.inputSize = src.size();
     ze_result_t result = ZE_RESULT_SUCCESS;
-    auto module = std::unique_ptr<L0::Module>(Module::create(device, &moduleDesc, nullptr, ModuleType::User, &result));
+    auto module = std::unique_ptr<L0::Module>(Module::create(device, &moduleDesc, nullptr, ModuleType::user, &result));
 
-    auto kernel = std::make_unique<Mock<Kernel>>();
+    auto kernel = std::make_unique<Mock<KernelImp>>();
     ASSERT_NE(nullptr, kernel);
 
-    kernel->module = module.get();
+    kernel->setModule(module.get());
     ze_kernel_desc_t kernelDesc = {};
     kernelDesc.pKernelName = "test";
     kernel->initialize(&kernelDesc);
 
-    auto &container = kernel->residencyContainer;
+    auto &container = kernel->privateState.internalResidencyContainer;
     auto printfPos = std::find(container.begin(), container.end(), kernel->getPrintfBufferAllocation());
     EXPECT_NE(container.end(), printfPos);
-    bool correctPos = printfPos >= container.begin() + kernel->getImmutableData()->getDescriptor().payloadMappings.explicitArgs.size();
-    EXPECT_TRUE(correctPos);
 }
 
 TEST(BuildOptions, givenNoSrcOptionNameInSrcNamesWhenMovingBuildOptionsThenFalseIsReturned) {
@@ -2852,10 +5155,84 @@ TEST(BuildOptions, givenSrcOptionNameInSrcNamesWhenMovingBuildOptionsThenOptionI
     EXPECT_EQ(std::string::npos, srcNames.find(BuildOptions::optDisable.str()));
 }
 
+TEST(BuildOptions, givenNoSrcOptionNameInSrcNamesWhenExtractingBuildOptionWithValueThenFalseIsReturned) {
+    std::string srcNames = NEO::CompilerOptions::concatenate(BuildOptions::optAutoGrf, BuildOptions::optLevel);
+    std::string outOption;
+
+    auto result = extractBuildOptionWithValue(outOption, srcNames, BuildOptions::registerFileSize);
+    EXPECT_FALSE(result);
+}
+
+TEST(BuildOptions, givenNoValueForSrcOptionNameInSrcNamesWhenExtractingBuildOptionWithValueThenFalseIsReturned) {
+    std::string srcNames = NEO::CompilerOptions::concatenate(BuildOptions::optAutoGrf, BuildOptions::registerFileSize);
+    std::string outOption;
+
+    auto result = extractBuildOptionWithValue(outOption, srcNames, BuildOptions::registerFileSize);
+    EXPECT_FALSE(result);
+}
+
+TEST(BuildOptions, givenSrcOptionNameWithValueInSrcNamesWhenExtractingBuildOptionWithValueThenOptionIsExtracted) {
+    std::string srcNames = NEO::CompilerOptions::concatenate(BuildOptions::optAutoGrf, BuildOptions::registerFileSize) + "=2";
+    std::string outOption;
+
+    std::string expectedOutOption = NEO::CompilerOptions::concatenate(BuildOptions::registerFileSize) + " 2";
+
+    auto result = extractBuildOptionWithValue(outOption, srcNames, BuildOptions::registerFileSize);
+    EXPECT_TRUE(result);
+
+    EXPECT_EQ(expectedOutOption, outOption);
+}
+
+TEST_F(ModuleTest, GivenCorrectRegisterFileSizeInBuildFlagWhenInitializeModuleIsCalledThenInvalidArgumentIsNotReturned) {
+    const auto &productHelper = getHelper<ProductHelper>();
+    const auto registerFileSizes = productHelper.getSupportedNumGrfs(device->getNEODevice()->getReleaseHelper());
+    ze_module_desc_t moduleDesc = {};
+
+    for (const auto &registerFileSize : registerFileSizes) {
+        auto pModule = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
+        ASSERT_NE(nullptr, pModule);
+
+        std::string buildOptions = std::string(BuildOptions::registerFileSize) + "=" + std::to_string(registerFileSize);
+        moduleDesc.pBuildFlags = buildOptions.c_str();
+
+        EXPECT_NE(ZE_RESULT_ERROR_INVALID_ARGUMENT, pModule->initialize(&moduleDesc, device->getNEODevice()));
+        std::string expectedRegisterString = std::string(BuildOptions::registerFileSize) + "=" + std::to_string(registerFileSize);
+        EXPECT_STREQ(expectedRegisterString.c_str(), pModule->getTranslationUnit()->options.c_str());
+    }
+}
+
+TEST_F(ModuleTest, GivenIncorrectRegisterFileSizeInBuildFlagWhenInitializeModuleIsCalledThenInvalidArgumentIsReturned) {
+    auto pModule = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
+    ASSERT_NE(nullptr, pModule);
+
+    std::string buildOptions = std::string(BuildOptions::registerFileSize) + "=0";
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.pBuildFlags = buildOptions.c_str();
+
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, pModule->initialize(&moduleDesc, device->getNEODevice()));
+}
+
+TEST_F(ModuleTest, GivenIncorrectBuildFlagsCombinationWhenInitializeModuleIsCalledThenInvalidArgumentIsReturned) {
+    auto pModule = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
+    ASSERT_NE(nullptr, pModule);
+
+    ze_module_desc_t moduleDesc = {};
+    auto registerFileSizeOption = std::string(BuildOptions::registerFileSize) + "=128";
+    std::array<std::string, 3> testParams{{{NEO::CompilerOptions::concatenate(BuildOptions::optLargeRegisterFile, registerFileSizeOption)},
+                                           {NEO::CompilerOptions::concatenate(BuildOptions::optAutoGrf, registerFileSizeOption)},
+                                           {NEO::CompilerOptions::concatenate(BuildOptions::optLargeRegisterFile, BuildOptions::optAutoGrf, registerFileSizeOption)}}};
+
+    for (const auto &buildOptions : testParams) {
+        moduleDesc.pBuildFlags = buildOptions.c_str();
+
+        EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, pModule->initialize(&moduleDesc, device->getNEODevice()));
+    }
+}
+
 TEST_F(ModuleTest, givenInternalOptionsWhenBindlessEnabledThenBindlesOptionsPassed) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UseBindlessMode.set(1);
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    debugManager.flags.UseBindlessMode.set(1);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string buildOptions;
@@ -2867,7 +5244,7 @@ TEST_F(ModuleTest, givenInternalOptionsWhenBindlessEnabledThenBindlesOptionsPass
 }
 
 TEST_F(ModuleTest, givenEnableLibraryCompileThenIsFunctionSymbolExportEnabledTrue) {
-    auto module = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module = std::make_unique<Module>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string buildOptions;
@@ -2880,7 +5257,7 @@ TEST_F(ModuleTest, givenEnableLibraryCompileThenIsFunctionSymbolExportEnabledTru
 }
 
 TEST_F(ModuleTest, givenEnableLibraryCompileThenIsGlobalSymbolExportEnabledTrue) {
-    auto module = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module = std::make_unique<Module>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string buildOptions;
@@ -2894,8 +5271,8 @@ TEST_F(ModuleTest, givenEnableLibraryCompileThenIsGlobalSymbolExportEnabledTrue)
 
 TEST_F(ModuleTest, givenInternalOptionsWhenBuildFlagsIsNullPtrAndBindlessEnabledThenBindlesOptionsPassed) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UseBindlessMode.set(1);
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    debugManager.flags.UseBindlessMode.set(1);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string buildOptions;
@@ -2908,8 +5285,8 @@ TEST_F(ModuleTest, givenInternalOptionsWhenBuildFlagsIsNullPtrAndBindlessEnabled
 
 TEST_F(ModuleTest, givenInternalOptionsWhenBindlessDisabledThenBindlesOptionsNotPassed) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.UseBindlessMode.set(0);
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    debugManager.flags.UseBindlessMode.set(0);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string buildOptions;
@@ -2917,24 +5294,86 @@ TEST_F(ModuleTest, givenInternalOptionsWhenBindlessDisabledThenBindlesOptionsNot
 
     module->createBuildOptions("", buildOptions, internalBuildOptions);
 
-    EXPECT_FALSE(NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::bindlessMode));
+    EXPECT_EQ(device->getCompilerProductHelper().isHeaplessModeEnabled(*defaultHwInfo), NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::bindlessMode));
 }
 
-TEST_F(ModuleTest, givenBuildFlagsWithEnableZebinThenInternalOptionsContainsAllowZebin) {
-    auto module = std::make_unique<Module>(device, nullptr, ModuleType::User);
-    ASSERT_NE(nullptr, module);
+TEST_F(ModuleTest, givenForceBindfulForMsaaImagesWhenCreateBuildOptionsThenBindlessOptionIsNotAdded) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.UseBindlessMode.set(1);
+
+    struct MsaaModule : public L0::ModuleImp {
+        MsaaModule(L0::Device *device) : L0::ModuleImp(device, nullptr, ModuleType::user) {}
+        void setForceBindfulForMsaaImages(bool value) { this->forceBindfulForMsaaImages = value; }
+    };
+    MsaaModule module{device};
 
     std::string buildOptions;
     std::string internalBuildOptions;
+    module.createBuildOptions("", buildOptions, internalBuildOptions);
+    EXPECT_TRUE(NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::bindlessMode));
 
-    module->createBuildOptions(NEO::CompilerOptions::enableZebin.str().c_str(), buildOptions, internalBuildOptions);
+    module.setForceBindfulForMsaaImages(true);
+    std::string buildOptionsBindful;
+    std::string internalBuildOptionsBindful;
+    module.createBuildOptions("", buildOptionsBindful, internalBuildOptionsBindful);
+    EXPECT_FALSE(NEO::CompilerOptions::contains(internalBuildOptionsBindful, NEO::CompilerOptions::bindlessMode));
+}
 
-    EXPECT_FALSE(NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::enableZebin));
-    EXPECT_TRUE(NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::allowZebin));
+TEST_F(ModuleTest, givenProgramInfoWithMultisampleImageArgWhenUsesMsaaImageThenTrueIsReturned) {
+    MockModule module{device, nullptr, ModuleType::user};
+    EXPECT_FALSE(module.usesMsaaImage());
+
+    auto nonMsaaKernelInfo = std::make_unique<NEO::KernelInfo>();
+    auto image = NEO::ArgDescriptor(NEO::ArgDescriptor::argTImage);
+    image.as<NEO::ArgDescImage>().imageType = NEO::NEOImageType::imageType2D;
+    nonMsaaKernelInfo->kernelDescriptor.payloadMappings.explicitArgs.push_back(image);
+    module.translationUnit->programInfo.kernelInfos.push_back(std::move(nonMsaaKernelInfo.release()));
+    EXPECT_FALSE(module.usesMsaaImage());
+
+    auto msaaKernelInfo = std::make_unique<NEO::KernelInfo>();
+    auto msaaImage = NEO::ArgDescriptor(NEO::ArgDescriptor::argTImage);
+    msaaImage.as<NEO::ArgDescImage>().imageType = NEO::NEOImageType::imageType2DArrayMSAA;
+    msaaKernelInfo->kernelDescriptor.payloadMappings.explicitArgs.push_back(msaaImage);
+    module.translationUnit->programInfo.kernelInfos.push_back(std::move(msaaKernelInfo.release()));
+    EXPECT_TRUE(module.usesMsaaImage());
+}
+
+TEST_F(ModuleTest, givenBindlessModeAndMultisampleImageWhenInitializeThenTranslationUnitIsRebuiltBindful) {
+    if (device->getCompilerProductHelper().isHeaplessModeEnabled(*defaultHwInfo)) {
+        GTEST_SKIP();
+    }
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.UseBindlessMode.set(1);
+
+    struct RecompileModule : public L0::ModuleImp {
+        RecompileModule(L0::Device *device) : L0::ModuleImp(device, nullptr, ModuleType::user) {}
+        ze_result_t initializeTranslationUnit(const ze_module_desc_t *desc, NEO::Device *neoDevice) override {
+            forceBindfulPerCall.push_back(this->forceBindfulForMsaaImages);
+            auto kernelInfo = std::make_unique<NEO::KernelInfo>();
+            auto image = NEO::ArgDescriptor(NEO::ArgDescriptor::argTImage);
+            image.as<NEO::ArgDescImage>().imageType = NEO::NEOImageType::imageType2DMSAA;
+            kernelInfo->kernelDescriptor.payloadMappings.explicitArgs.push_back(image);
+            this->translationUnit->programInfo.kernelInfos.clear();
+            this->translationUnit->programInfo.kernelInfos.push_back(std::move(kernelInfo.release()));
+            // Fail the bindful rebuild so initialize returns before the (unmocked) post-build steps.
+            return forceBindfulPerCall.size() == 1u ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+        }
+        std::vector<bool> forceBindfulPerCall;
+    };
+
+    RecompileModule module{device};
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    module.initialize(&moduleDesc, device->getNEODevice());
+
+    ASSERT_EQ(2u, module.forceBindfulPerCall.size());
+    EXPECT_FALSE(module.forceBindfulPerCall[0]);
+    EXPECT_TRUE(module.forceBindfulPerCall[1]);
 }
 
 TEST_F(ModuleTest, givenSrcOptLevelInSrcNamesWhenMovingBuildOptionsThenOptionIsRemovedFromSrcNamesAndTranslatedOptionsStoredInDstNames) {
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string srcNames = NEO::CompilerOptions::concatenate(NEO::CompilerOptions::fastRelaxedMath, BuildOptions::optLevel);
@@ -2950,7 +5389,7 @@ TEST_F(ModuleTest, givenSrcOptLevelInSrcNamesWhenMovingBuildOptionsThenOptionIsR
 }
 
 TEST_F(ModuleTest, givenSrcOptLevelWithoutLevelIntegerInSrcNamesWhenMovingBuildOptionsThenFalseIsReturned) {
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string srcNames = NEO::CompilerOptions::concatenate(NEO::CompilerOptions::fastRelaxedMath, BuildOptions::optLevel);
@@ -2964,7 +5403,7 @@ TEST_F(ModuleTest, givenSrcOptLevelWithoutLevelIntegerInSrcNamesWhenMovingBuildO
 }
 
 TEST_F(ModuleTest, givenSrcProfileFlagsInSrcNamesWhenMovingBuildOptionsThenOptionIsRemovedFromSrcNamesAndTranslatedOptionsStoredInDstNames) {
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string srcNames = NEO::CompilerOptions::concatenate(NEO::CompilerOptions::fastRelaxedMath, BuildOptions::profileFlags);
@@ -2980,7 +5419,7 @@ TEST_F(ModuleTest, givenSrcProfileFlagsInSrcNamesWhenMovingBuildOptionsThenOptio
 }
 
 TEST_F(ModuleTest, givenSrcProfileFlagsWithoutFlagValueInSrcNamesWhenMovingBuildOptionsThenFalseIsReturned) {
-    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::User);
+    auto module = std::make_unique<ModuleImp>(device, nullptr, ModuleType::user);
     ASSERT_NE(nullptr, module);
 
     std::string srcNames = NEO::CompilerOptions::concatenate(NEO::CompilerOptions::fastRelaxedMath, BuildOptions::profileFlags);
@@ -2995,7 +5434,7 @@ TEST_F(ModuleTest, givenSrcProfileFlagsWithoutFlagValueInSrcNamesWhenMovingBuild
 
 TEST_F(ModuleTest, GivenInjectInternalBuildOptionsWhenBuildingUserModuleThenInternalOptionsAreAppended) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.InjectInternalBuildOptions.set(" -abc");
+    debugManager.flags.InjectInternalBuildOptions.set(" -abc");
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -3008,7 +5447,7 @@ TEST_F(ModuleTest, GivenInjectInternalBuildOptionsWhenBuildingUserModuleThenInte
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::User));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
     ASSERT_NE(nullptr, module.get());
     module->initialize(&moduleDesc, device->getNEODevice());
 
@@ -3017,7 +5456,7 @@ TEST_F(ModuleTest, GivenInjectInternalBuildOptionsWhenBuildingUserModuleThenInte
 
 TEST_F(ModuleTest, GivenInjectApiBuildOptionsWhenBuildingUserModuleThenApiOptionsAreAppended) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.InjectApiBuildOptions.set(" -abc");
+    debugManager.flags.InjectApiBuildOptions.set(" -abc");
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -3030,7 +5469,7 @@ TEST_F(ModuleTest, GivenInjectApiBuildOptionsWhenBuildingUserModuleThenApiOption
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::User));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
     ASSERT_NE(nullptr, module.get());
     module->initialize(&moduleDesc, device->getNEODevice());
 
@@ -3039,7 +5478,7 @@ TEST_F(ModuleTest, GivenInjectApiBuildOptionsWhenBuildingUserModuleThenApiOption
 
 TEST_F(ModuleTest, GivenInjectInternalBuildOptionsWhenBuildingBuiltinModuleThenInternalOptionsAreNotAppended) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.InjectInternalBuildOptions.set(" -abc");
+    debugManager.flags.InjectInternalBuildOptions.set(" -abc");
 
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
@@ -3052,12 +5491,56 @@ TEST_F(ModuleTest, GivenInjectInternalBuildOptionsWhenBuildingBuiltinModuleThenI
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::Builtin));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::builtin));
     ASSERT_NE(nullptr, module.get());
     module->initialize(&moduleDesc, device->getNEODevice());
 
     EXPECT_FALSE(CompilerOptions::contains(cip->buildInternalOptions, "-abc"));
 };
+
+TEST_F(ModuleTest, GivenEnabledDivergentBarrierWhenBuildingUserModuleThenInternalOptionIsAdded) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableDivergentBarrierHandling.set(true);
+
+    auto compilerInterface = new NEO::MockCompilerInterfaceCaptureBuildOptions();
+    device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(compilerInterface);
+
+    uint8_t binary[10];
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = 10;
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
+    ASSERT_NE(nullptr, module.get());
+    module->initialize(&moduleDesc, device->getNEODevice());
+
+    EXPECT_TRUE(CompilerOptions::contains(compilerInterface->buildInternalOptions, CompilerOptions::enableDivergentBarriers));
+}
+
+TEST_F(ModuleTest, GivenEnabledDivergentBarrierWhenBuildingBuiltinModuleThenInternalOptionIsNotAdded) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableDivergentBarrierHandling.set(true);
+
+    auto compilerInterface = new NEO::MockCompilerInterfaceCaptureBuildOptions();
+    device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(compilerInterface);
+
+    uint8_t binary[10];
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
+    moduleDesc.pInputModule = binary;
+    moduleDesc.inputSize = 10;
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::builtin));
+    ASSERT_NE(nullptr, module.get());
+    module->initialize(&moduleDesc, device->getNEODevice());
+
+    EXPECT_FALSE(CompilerOptions::contains(compilerInterface->buildInternalOptions, CompilerOptions::enableDivergentBarriers));
+}
 
 TEST_F(ModuleTest, whenContainsStatefulAccessIsCalledThenResultIsCorrect) {
     class MyModuleImpl : public ModuleImp {
@@ -3073,21 +5556,318 @@ TEST_F(ModuleTest, whenContainsStatefulAccessIsCalledThenResultIsCorrect) {
     };
 
     for (auto &[expectedResult, surfaceStateHeapOffset, crossThreadDataOffset] : testParams) {
-        auto module = std::make_unique<MyModuleImpl>(device, nullptr, ModuleType::User);
+        auto module = std::make_unique<MyModuleImpl>(device, nullptr, ModuleType::user);
         ASSERT_NE(nullptr, module);
         auto moduleTranslationUnit = module->getTranslationUnit();
         ASSERT_NE(nullptr, moduleTranslationUnit);
         auto kernelInfo = std::make_unique<KernelInfo>();
         kernelInfo->kernelDescriptor.payloadMappings.explicitArgs.clear();
-        auto argDescriptor = ArgDescriptor(ArgDescriptor::ArgTPointer);
+        auto argDescriptor = ArgDescriptor(ArgDescriptor::argTPointer);
         argDescriptor.as<ArgDescPointer>().bindful = surfaceStateHeapOffset;
         argDescriptor.as<ArgDescPointer>().bindless = crossThreadDataOffset;
         kernelInfo->kernelDescriptor.payloadMappings.explicitArgs.push_back(argDescriptor);
         moduleTranslationUnit->programInfo.kernelInfos.clear();
         moduleTranslationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
 
-        EXPECT_EQ(expectedResult, NEO::AddressingModeHelper::containsStatefulAccess(moduleTranslationUnit->programInfo.kernelInfos, false));
+        EXPECT_EQ(expectedResult, NEO::AddressingModeHelper::containsBufferStatefulAccess(moduleTranslationUnit->programInfo.kernelInfos));
     }
+}
+
+template <bool localMemEnabled>
+struct ModuleIsaAllocationsFixture : public DeviceFixture {
+    static constexpr NEO::MemoryPool isaAllocationMemoryPool = (localMemEnabled ? NEO::MemoryPool::localMemory : NEO::MemoryPool::system4KBPagesWith32BitGpuAddressing);
+
+    void setUp() {
+        this->dbgRestorer = std::make_unique<DebugManagerStateRestore>();
+        debugManager.flags.EnableLocalMemory.set(localMemEnabled);
+
+        DeviceFixture::setUp();
+
+        this->neoDevice = this->device->getNEODevice();
+        this->isaPadding = this->neoDevice->getGfxCoreHelper().getPaddingForISAAllocation();
+        this->kernelStartPointerAlignment = this->neoDevice->getGfxCoreHelper().getKernelIsaPointerAlignment();
+        this->mockMemoryManager = static_cast<MockMemoryManager *>(this->neoDevice->getMemoryManager());
+        this->mockMemoryManager->localMemorySupported[this->neoDevice->getRootDeviceIndex()] = true;
+        this->mockModule.reset(new MockModule{this->device, nullptr, ModuleType::user});
+        this->mockModule->translationUnit.reset(new MockModuleTranslationUnit{this->device});
+        this->isaAllocationPageSize = this->mockModule->getIsaAllocationPageSize();
+        this->maxIsaSizeInPage = this->isaAllocationPageSize > this->isaPadding
+                                     ? alignDown(this->isaAllocationPageSize - this->isaPadding, this->kernelStartPointerAlignment)
+                                     : this->kernelStartPointerAlignment;
+    }
+
+    void tearDown() {
+        this->mockModule->translationUnit.reset();
+        this->mockModule.reset();
+        DeviceFixture::tearDown();
+    }
+
+    void prepareKernelInfoAndAddToTranslationUnit(size_t isaSize) {
+        auto kernelInfo = new KernelInfo{};
+        kernelInfo->heapInfo.pKernelHeap = reinterpret_cast<const void *>(0xdeadbeef0000);
+        kernelInfo->heapInfo.kernelHeapSize = static_cast<uint32_t>(isaSize);
+        this->mockModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
+    }
+
+    size_t computeKernelIsaAllocationSizeWithPadding(size_t isaSize) {
+        auto isaPadding = this->neoDevice->getGfxCoreHelper().getPaddingForISAAllocation();
+        return isaPadding + isaSize;
+    }
+
+    template <typename FamilyType>
+    void givenMultipleKernelIsasWhichFitInSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations() {
+        auto requestedSize = 0x40;
+        this->prepareKernelInfoAndAddToTranslationUnit(requestedSize);
+        this->prepareKernelInfoAndAddToTranslationUnit(requestedSize);
+
+        auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
+        this->neoDevice->getRootDeviceEnvironmentRef().debugger.reset(debugger);
+
+        this->mockModule->initializeKernelImmutableData();
+        auto &kernelImmData = this->mockModule->getKernelImmutableDataVector();
+        EXPECT_EQ(nullptr, kernelImmData[0]->getIsaParentAllocation());
+        EXPECT_NE(nullptr, kernelImmData[0]->getIsaGraphicsAllocation());
+        EXPECT_EQ(nullptr, kernelImmData[1]->getIsaParentAllocation());
+        EXPECT_NE(nullptr, kernelImmData[1]->getIsaGraphicsAllocation());
+    }
+
+    template <typename FamilyType>
+    void givenMultipleKernelIsasWhichExceedSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations() {
+        auto maxAllocationSizeInPage = this->maxIsaSizeInPage;
+        this->prepareKernelInfoAndAddToTranslationUnit(maxAllocationSizeInPage);
+
+        auto tinyAllocationSize = 0x8;
+        this->prepareKernelInfoAndAddToTranslationUnit(tinyAllocationSize);
+
+        auto debugger = MockDebuggerL0Hw<FamilyType>::allocate(neoDevice);
+        this->neoDevice->getRootDeviceEnvironmentRef().debugger.reset(debugger);
+
+        this->mockModule->initializeKernelImmutableData();
+        auto &kernelImmData = this->mockModule->getKernelImmutableDataVector();
+
+        EXPECT_EQ(nullptr, kernelImmData[0]->getIsaParentAllocation());
+        EXPECT_NE(nullptr, kernelImmData[0]->getIsaGraphicsAllocation());
+        EXPECT_EQ(kernelImmData[0]->getIsaOffsetInParentAllocation(), 0lu);
+        EXPECT_EQ(kernelImmData[0]->getIsaSubAllocationSize(), 0lu);
+
+        EXPECT_EQ(nullptr, kernelImmData[1]->getIsaParentAllocation());
+        EXPECT_NE(nullptr, kernelImmData[1]->getIsaGraphicsAllocation());
+        EXPECT_EQ(kernelImmData[1]->getIsaOffsetInParentAllocation(), 0lu);
+        EXPECT_EQ(kernelImmData[1]->getIsaSubAllocationSize(), 0lu);
+
+        EXPECT_NE(kernelImmData[0]->getIsaGraphicsAllocation(), kernelImmData[1]->getIsaGraphicsAllocation());
+
+        if constexpr (localMemEnabled) {
+            auto &productHelper = this->neoDevice->getRootDeviceEnvironment().getProductHelper();
+            auto expectedAlignment = productHelper.is2MBLocalMemAlignmentEnabled() ? MemoryConstants::pageSize2M : MemoryConstants::pageSize64k;
+            EXPECT_EQ(alignUp<size_t>(maxAllocationSizeInPage, expectedAlignment), kernelImmData[0]->getIsaSize());
+            EXPECT_EQ(alignUp<size_t>(tinyAllocationSize, expectedAlignment), kernelImmData[1]->getIsaSize());
+        } else {
+            EXPECT_EQ(this->computeKernelIsaAllocationSizeWithPadding(maxAllocationSizeInPage), kernelImmData[0]->getIsaSize());
+            EXPECT_EQ(this->computeKernelIsaAllocationSizeWithPadding(tinyAllocationSize), kernelImmData[1]->getIsaSize());
+        }
+    }
+
+    void givenMultipleKernelIsasWhichExceedSinglePageWhenKernelImmutableDataAreInitializedThenKernelIsasShareParentAllocation() {
+        auto maxAllocationSizeInPage = this->maxIsaSizeInPage;
+        this->prepareKernelInfoAndAddToTranslationUnit(maxAllocationSizeInPage);
+
+        auto tinyAllocationSize = 0x8;
+        this->prepareKernelInfoAndAddToTranslationUnit(tinyAllocationSize);
+
+        this->mockModule->initializeKernelImmutableData();
+        auto &kernelImmData = this->mockModule->getKernelImmutableDataVector();
+
+        EXPECT_NE(nullptr, kernelImmData[0]->getIsaParentAllocation());
+        EXPECT_NE(nullptr, kernelImmData[0]->getIsaGraphicsAllocation());
+        EXPECT_EQ(kernelImmData[0]->getIsaParentAllocation(), kernelImmData[1]->getIsaParentAllocation());
+        EXPECT_EQ(0lu, kernelImmData[0]->getIsaOffsetInParentAllocation());
+        EXPECT_GT(kernelImmData[0]->getIsaSubAllocationSize(), 0lu);
+
+        auto kernel0AlignedSize = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*this->neoDevice, maxAllocationSizeInPage, false);
+        EXPECT_EQ(kernel0AlignedSize, kernelImmData[0]->getIsaSubAllocationSize());
+        EXPECT_EQ(kernel0AlignedSize, kernelImmData[0]->getIsaSize());
+
+        EXPECT_EQ(kernel0AlignedSize, kernelImmData[1]->getIsaOffsetInParentAllocation());
+        EXPECT_GT(kernelImmData[1]->getIsaSubAllocationSize(), 0lu);
+
+        auto kernel1AlignedSize = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*this->neoDevice, tinyAllocationSize, true);
+        EXPECT_EQ(kernel1AlignedSize, kernelImmData[1]->getIsaSubAllocationSize());
+        EXPECT_EQ(kernel1AlignedSize, kernelImmData[1]->getIsaSize());
+    }
+
+    struct ProxyKernelImmutableData : public KernelImmutableData {
+        using BaseClass = KernelImmutableData;
+        using BaseClass::BaseClass;
+
+        ~ProxyKernelImmutableData() override { this->KernelImmutableData::~KernelImmutableData(); }
+
+        ADDMETHOD(initialize, ze_result_t, true, ZE_RESULT_ERROR_UNKNOWN,
+                  (NEO::KernelInfo * kernelInfo, L0::Device *device, NEO::SharedPoolAllocation *globalConstBuffer, NEO::SharedPoolAllocation *globalVarBuffer),
+                  (kernelInfo, device, globalConstBuffer, globalVarBuffer));
+    };
+
+    void givenMultipleKernelIsasWhenKernelInitializationFailsThenItIsProperlyCleanedAndPreviouslyInitializedKernelsLeftUntouched() {
+        auto requestedSize = 0x40;
+        this->prepareKernelInfoAndAddToTranslationUnit(requestedSize);
+        this->prepareKernelInfoAndAddToTranslationUnit(requestedSize);
+        this->prepareKernelInfoAndAddToTranslationUnit(requestedSize);
+
+        auto &kernelImmData = this->mockModule->getKernelImmutableDataVectorRef();
+        {
+            auto kernelsCount = 3ul;
+            kernelImmData.reserve(kernelsCount);
+            for (size_t i = 0lu; i < kernelsCount; i++) {
+                kernelImmData.emplace_back(new ProxyKernelImmutableData(this->device));
+            }
+            auto result = this->mockModule->setIsaGraphicsAllocations();
+            EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+        }
+
+        static_cast<ProxyKernelImmutableData *>(kernelImmData[2].get())->initializeCallBase = false;
+        auto result = this->mockModule->initializeKernelImmutableData();
+        EXPECT_EQ(result, ZE_RESULT_ERROR_UNKNOWN);
+        ASSERT_NE(kernelImmData[0].get(), nullptr);
+        ASSERT_NE(kernelImmData[1].get(), nullptr);
+        EXPECT_EQ(kernelImmData[2].get(), nullptr);
+        EXPECT_NE(kernelImmData[0]->getIsaGraphicsAllocation(), nullptr);
+        EXPECT_NE(kernelImmData[1]->getIsaGraphicsAllocation(), nullptr);
+    }
+
+    size_t isaPadding;
+    size_t kernelStartPointerAlignment;
+    size_t isaAllocationPageSize;
+    size_t maxIsaSizeInPage;
+    NEO::Device *neoDevice = nullptr;
+    MockMemoryManager *mockMemoryManager = nullptr;
+    std::unique_ptr<MockModule> mockModule = nullptr;
+    std::unique_ptr<DebugManagerStateRestore> dbgRestorer = nullptr;
+};
+using ModuleIsaAllocationsInLocalMemoryTest = Test<ModuleIsaAllocationsFixture<true>>;
+
+TEST_F(ModuleIsaAllocationsInLocalMemoryTest, givenMultipleKernelIsasWhichFitInSinglePage64KWhenKernelImmutableDataInitializedThenKernelIsasShareParentAllocation) {
+    EXPECT_EQ(this->mockModule->isaAllocationPageSize, isaAllocationPageSize);
+
+    auto requestedSize1 = 0x40;
+    this->prepareKernelInfoAndAddToTranslationUnit(requestedSize1);
+    auto isaAllocationSize1 = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*this->neoDevice, requestedSize1, false);
+
+    auto requestedSize2 = isaAllocationPageSize - isaAllocationSize1 - this->isaPadding;
+    this->prepareKernelInfoAndAddToTranslationUnit(requestedSize2);
+    auto isaAllocationSize2 = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*this->neoDevice, requestedSize2, true);
+
+    this->mockModule->initializeKernelImmutableData();
+    auto &kernelImmData = this->mockModule->getKernelImmutableDataVector();
+    EXPECT_EQ(kernelImmData[0]->getIsaGraphicsAllocation(), kernelImmData[0]->getIsaParentAllocation());
+    EXPECT_EQ(kernelImmData[0]->getIsaOffsetInParentAllocation(), 0lu);
+    EXPECT_EQ(kernelImmData[0]->getIsaSubAllocationSize(), isaAllocationSize1);
+    EXPECT_EQ(kernelImmData[1]->getIsaGraphicsAllocation(), kernelImmData[1]->getIsaParentAllocation());
+    EXPECT_EQ(kernelImmData[1]->getIsaOffsetInParentAllocation(), isaAllocationSize1);
+    EXPECT_EQ(kernelImmData[1]->getIsaSubAllocationSize(), isaAllocationSize2);
+
+    EXPECT_EQ(kernelImmData[0]->getIsaSize(), isaAllocationSize1);
+    EXPECT_EQ(kernelImmData[0]->getIsaGraphicsAllocation()->getMemoryPool(), isaAllocationMemoryPool);
+    EXPECT_EQ(kernelImmData[1]->getIsaSize(), isaAllocationSize2);
+    EXPECT_EQ(kernelImmData[1]->getIsaGraphicsAllocation()->getMemoryPool(), isaAllocationMemoryPool);
+}
+
+TEST_F(ModuleIsaAllocationsInLocalMemoryTest, givenMultipleKernelsExceedingPageSizeWhenInitializedThenAllKernelsShareSingleModuleAllocation) {
+    auto kernel1Size = isaAllocationPageSize / 4;
+    auto kernel2Size = isaAllocationPageSize / 4;
+    auto kernel3Size = isaAllocationPageSize / 2 + 0x1000;
+
+    this->prepareKernelInfoAndAddToTranslationUnit(kernel1Size);
+    this->prepareKernelInfoAndAddToTranslationUnit(kernel2Size);
+    this->prepareKernelInfoAndAddToTranslationUnit(kernel3Size);
+
+    this->mockModule->initializeKernelImmutableData();
+    auto &kernelImmData = this->mockModule->getKernelImmutableDataVector();
+
+    // All kernels share the same parent allocation
+    EXPECT_NE(nullptr, kernelImmData[0]->getIsaParentAllocation());
+    EXPECT_EQ(kernelImmData[0]->getIsaParentAllocation(),
+              kernelImmData[1]->getIsaParentAllocation());
+    EXPECT_EQ(kernelImmData[1]->getIsaParentAllocation(),
+              kernelImmData[2]->getIsaParentAllocation());
+
+    auto offset0 = kernelImmData[0]->getIsaOffsetInParentAllocation();
+    auto offset1 = kernelImmData[1]->getIsaOffsetInParentAllocation();
+    auto offset2 = kernelImmData[2]->getIsaOffsetInParentAllocation();
+
+    EXPECT_EQ(0lu, offset0);
+    EXPECT_GT(offset1, offset0);
+    EXPECT_GT(offset2, offset1);
+
+    EXPECT_LE(offset0 + kernelImmData[0]->getIsaSize(), offset1);
+    EXPECT_LE(offset1 + kernelImmData[1]->getIsaSize(), offset2);
+
+    EXPECT_NE(nullptr, this->mockModule->getKernelsIsaParentAllocation());
+}
+
+HWTEST_F(ModuleIsaAllocationsInLocalMemoryTest, givenMultipleKernelIsasWhichFitInSinglePage64KAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations) {
+    this->givenMultipleKernelIsasWhichFitInSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations<FamilyType>();
+}
+
+HWTEST_F(ModuleIsaAllocationsInLocalMemoryTest, givenMultipleKernelIsasWhichExceedSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations) {
+    this->givenMultipleKernelIsasWhichExceedSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations<FamilyType>();
+}
+
+HWTEST_F(ModuleIsaAllocationsInLocalMemoryTest, givenMultipleKernelIsasWhichExceedSinglePage64KWhenKernelImmutableDataAreInitializedThenKernelIsasShareParentAllocation) {
+    this->givenMultipleKernelIsasWhichExceedSinglePageWhenKernelImmutableDataAreInitializedThenKernelIsasShareParentAllocation();
+}
+
+TEST_F(ModuleIsaAllocationsInLocalMemoryTest, givenMultipleKernelIsasWhenKernelInitializationFailsThenItIsProperlyCleanedAndPreviouslyInitializedKernelsLeftUntouched) {
+    this->givenMultipleKernelIsasWhenKernelInitializationFailsThenItIsProperlyCleanedAndPreviouslyInitializedKernelsLeftUntouched();
+}
+
+using ModuleIsaAllocationsInSystemMemoryTest = Test<ModuleIsaAllocationsFixture<false>>;
+
+TEST_F(ModuleIsaAllocationsInSystemMemoryTest, givenKernelIsaWhichCouldFitInPages4KBWhenKernelImmutableDataInitializedThenKernelIsasShareParentAllocationFromPoolOrModuleRegion) {
+    EXPECT_EQ(this->mockModule->isaAllocationPageSize, isaAllocationPageSize);
+
+    const auto requestedSize1 = 0x8;
+    this->prepareKernelInfoAndAddToTranslationUnit(requestedSize1);
+    auto isaAllocationAlignedSize1 = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*this->neoDevice, requestedSize1, false);
+
+    const auto requestedSize2 = 0x4;
+    this->prepareKernelInfoAndAddToTranslationUnit(requestedSize2);
+    auto isaAllocationAlignedSize2 = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*this->neoDevice, requestedSize2, true);
+
+    // for 4kB pages, isaPadding alone can exceed isaAllocationPageSize, which precludes pool sharing
+    const bool isasShouldShareSamePage = (isaAllocationAlignedSize1 + isaAllocationAlignedSize2 <= isaAllocationPageSize);
+
+    this->mockModule->initializeKernelImmutableData();
+    auto &kernelImmData = this->mockModule->getKernelImmutableDataVector();
+    EXPECT_NE(nullptr, this->mockModule->getKernelsIsaParentAllocation());
+    if (isasShouldShareSamePage) {
+        EXPECT_NE(nullptr, this->mockModule->sharedIsaAllocation.get());
+    } else {
+        EXPECT_EQ(nullptr, this->mockModule->sharedIsaAllocation.get());
+    }
+
+    EXPECT_EQ(kernelImmData[0]->getIsaGraphicsAllocation(), kernelImmData[0]->getIsaParentAllocation());
+    EXPECT_EQ(kernelImmData[0]->getIsaOffsetInParentAllocation(), 0lu);
+    EXPECT_EQ(kernelImmData[0]->getIsaSubAllocationSize(), isaAllocationAlignedSize1);
+    EXPECT_EQ(kernelImmData[0]->getIsaSize(), isaAllocationAlignedSize1);
+    EXPECT_EQ(kernelImmData[1]->getIsaGraphicsAllocation(), kernelImmData[1]->getIsaParentAllocation());
+    EXPECT_EQ(kernelImmData[1]->getIsaOffsetInParentAllocation(), isaAllocationAlignedSize1);
+    EXPECT_EQ(kernelImmData[1]->getIsaSubAllocationSize(), isaAllocationAlignedSize2);
+    EXPECT_EQ(kernelImmData[1]->getIsaSize(), isaAllocationAlignedSize2);
+
+    EXPECT_EQ(kernelImmData[0]->getIsaGraphicsAllocation()->getMemoryPool(), isaAllocationMemoryPool);
+    EXPECT_EQ(kernelImmData[1]->getIsaGraphicsAllocation()->getMemoryPool(), isaAllocationMemoryPool);
+}
+
+HWTEST_F(ModuleIsaAllocationsInSystemMemoryTest, givenMultipleKernelIsasWhichFitInSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations) {
+    this->givenMultipleKernelIsasWhichFitInSinglePageAndDebuggerEnabledWhenKernelImmutableDataAreInitializedThenKernelIsasGetSeparateAllocations<FamilyType>();
+}
+
+TEST_F(ModuleIsaAllocationsInSystemMemoryTest, givenMultipleKernelIsasWhichExceedSinglePageWhenKernelImmutableDataAreInitializedThenKernelIsasShareParentAllocation) {
+    this->givenMultipleKernelIsasWhichExceedSinglePageWhenKernelImmutableDataAreInitializedThenKernelIsasShareParentAllocation();
+}
+
+TEST_F(ModuleIsaAllocationsInSystemMemoryTest, givenMultipleKernelIsasWhenKernelInitializationFailsThenItIsProperlyCleanedAndPreviouslyInitializedKernelsLeftUntouched) {
+    this->givenMultipleKernelIsasWhenKernelInitializationFailsThenItIsProperlyCleanedAndPreviouslyInitializedKernelsLeftUntouched();
 }
 
 using ModuleInitializeTest = Test<DeviceFixture>;
@@ -3106,7 +5886,7 @@ TEST_F(ModuleInitializeTest, whenModuleInitializeIsCalledThenCorrectResultIsRetu
         void setAddressingMode(bool isStateful) {
             auto kernelInfo = std::make_unique<KernelInfo>();
             kernelInfo->kernelDescriptor.payloadMappings.explicitArgs.clear();
-            auto argDescriptor = ArgDescriptor(ArgDescriptor::ArgTPointer);
+            auto argDescriptor = ArgDescriptor(ArgDescriptor::argTPointer);
             if (isStateful) {
                 argDescriptor.as<ArgDescPointer>().bindful = 0x40;
                 argDescriptor.as<ArgDescPointer>().bindless = 0x40;
@@ -3126,7 +5906,13 @@ TEST_F(ModuleInitializeTest, whenModuleInitializeIsCalledThenCorrectResultIsRetu
     class MyMockModuleTU : public MockModuleTU {
       public:
         using MockModuleTU::MockModuleTU;
-        ze_result_t createFromNativeBinary(const char *input, size_t inputSize) override { return ZE_RESULT_SUCCESS; }
+        ze_result_t createFromNativeBinary(const char *input, size_t inputSize, const char *internalBuildOptions) override {
+            programInfo.kernelInfos[0]->heapInfo.pKernelHeap = &mockKernelHeap;
+            programInfo.kernelInfos[0]->heapInfo.kernelHeapSize = 4;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        uint32_t mockKernelHeap = 0xDEAD;
     };
 
     const auto &compilerProductHelper = neoDevice->getRootDeviceEnvironment().getHelper<CompilerProductHelper>();
@@ -3142,81 +5928,41 @@ TEST_F(ModuleInitializeTest, whenModuleInitializeIsCalledThenCorrectResultIsRetu
     moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
     moduleDesc.inputSize = src.size();
 
-    std::array<std::tuple<ze_result_t, bool, ModuleType, int32_t>, 5> testParams = {{
-        {ZE_RESULT_SUCCESS, false, ModuleType::Builtin, -1},
-        {ZE_RESULT_SUCCESS, true, ModuleType::Builtin, 0},
-        {ZE_RESULT_SUCCESS, true, ModuleType::User, 0},
-        {ZE_RESULT_SUCCESS, true, ModuleType::Builtin, 1},
-        {ZE_RESULT_ERROR_MODULE_BUILD_FAILURE, true, ModuleType::User, 1},
+    std::array<std::tuple<ze_result_t, bool, bool, ModuleType, int32_t>, 8> testParams = {{
+        {ZE_RESULT_SUCCESS, false, true, ModuleType::builtin, -1},
+        {ZE_RESULT_SUCCESS, true, true, ModuleType::user, -1},
+        {ZE_RESULT_SUCCESS, true, false, ModuleType::user, -1},
+        {ZE_RESULT_SUCCESS, true, true, ModuleType::builtin, 0},
+        {ZE_RESULT_SUCCESS, true, true, ModuleType::user, 0},
+        {ZE_RESULT_SUCCESS, true, true, ModuleType::builtin, 1},
+        {ZE_RESULT_ERROR_MODULE_BUILD_FAILURE, true, true, ModuleType::user, 1},
+        {ZE_RESULT_SUCCESS, true, false, ModuleType::user, 1},
     }};
 
-    for (auto &[expectedResult, isStateful, moduleType, debugKey] : testParams) {
+    for (auto &[expectedResult, isStateful, isIgcGenerated, moduleType, debugKey] : testParams) {
         MockModuleImp module(device, nullptr, moduleType);
         module.translationUnit = std::make_unique<MyMockModuleTU>(device);
-        DebugManager.flags.FailBuildProgramWithStatefulAccess.set(debugKey);
+        module.translationUnit->isGeneratedByIgc = isIgcGenerated;
+        debugManager.flags.FailBuildProgramWithStatefulAccess.set(debugKey);
         module.setAddressingMode(isStateful);
+
+        if (isStateful && debugKey == -1 && isIgcGenerated == true) {
+            if (compilerProductHelper.failBuildProgramWithBufferStatefulAccessPreference() == true) {
+                expectedResult = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+            }
+        }
+
         EXPECT_EQ(expectedResult, module.initialize(&moduleDesc, device->getNEODevice()));
     }
-}
-
-using ModuleDebugDataTest = Test<DeviceFixture>;
-TEST_F(ModuleDebugDataTest, GivenDebugDataWithRelocationsWhenCreatingRelocatedDebugDataThenRelocationsAreApplied) {
-    auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
-    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-
-    uint8_t binary[10];
-    ze_module_desc_t moduleDesc = {};
-    moduleDesc.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    moduleDesc.pInputModule = binary;
-    moduleDesc.inputSize = 10;
-    ModuleBuildLog *moduleBuildLog = nullptr;
-
-    std::unique_ptr<MockModule> module = std::make_unique<MockModule>(device,
-                                                                      moduleBuildLog,
-                                                                      ModuleType::User);
-    module->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
-
-    module->translationUnit->globalVarBuffer = neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::BUFFER, neoDevice->getDeviceBitfield()});
-    module->translationUnit->globalConstBuffer = neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::BUFFER, neoDevice->getDeviceBitfield()});
-
-    uint32_t kernelHeap = 0;
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 1;
-    kernelInfo->heapInfo.pKernelHeap = &kernelHeap;
-
-    kernelInfo->kernelDescriptor.payloadMappings.implicitArgs.systemThreadSurfaceAddress.bindful = 0;
-    kernelInfo->kernelDescriptor.external.debugData = std::make_unique<NEO::DebugData>();
-
-    auto debugData = MockElfEncoder<>::createRelocateableDebugDataElf();
-
-    kernelInfo->kernelDescriptor.external.debugData->vIsaSize = static_cast<uint32_t>(debugData.size());
-    kernelInfo->kernelDescriptor.external.debugData->vIsa = reinterpret_cast<char *>(debugData.data());
-
-    // pass kernelInfo ownership to programInfo
-    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-
-    std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, module->translationUnit->globalConstBuffer, module->translationUnit->globalVarBuffer, false);
-    kernelImmData->createRelocatedDebugData(module->translationUnit->globalConstBuffer, module->translationUnit->globalVarBuffer);
-
-    module->kernelImmDatas.push_back(std::move(kernelImmData));
-
-    EXPECT_NE(nullptr, kernelInfo->kernelDescriptor.external.relocatedDebugData);
-
-    uint64_t *relocAddress = reinterpret_cast<uint64_t *>(kernelInfo->kernelDescriptor.external.relocatedDebugData.get() + 600);
-    auto expectedValue = module->kernelImmDatas[0]->getIsaGraphicsAllocation()->getGpuAddress() + 0x1a8;
-    EXPECT_EQ(expectedValue, *relocAddress);
 }
 
 TEST_F(ModuleTest, givenModuleWithSymbolWhenGettingGlobalPointerThenSizeAndPointerAreReurned) {
     uint64_t gpuAddress = 0x12345000;
 
-    NEO::SymbolInfo symbolInfo{0, 1024u, SegmentType::GlobalVariables};
+    NEO::SymbolInfo symbolInfo{0, 1024u, SegmentType::globalVariables};
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
-    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::user);
     module0->symbols["symbol"] = relocatedSymbol;
     module0->isGlobalSymbolExportEnabled = true;
 
@@ -3232,10 +5978,10 @@ TEST_F(ModuleTest, givenModuleWithSymbolWhenGettingGlobalPointerThenSizeAndPoint
 TEST_F(ModuleTest, givenModuleWithSymbolWhenGettingGlobalPointerThatIsAnInstuctionThenFailureReturned) {
     uint64_t gpuAddress = 0x12345000;
 
-    NEO::SymbolInfo symbolInfo{0, 1024u, SegmentType::Instructions};
+    NEO::SymbolInfo symbolInfo{0, 1024u, SegmentType::instructions};
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
-    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::user);
     module0->symbols["symbol"] = relocatedSymbol;
     module0->isGlobalSymbolExportEnabled = true;
 
@@ -3249,7 +5995,7 @@ TEST_F(ModuleTest, givenModuleWithSymbolWhenGettingGlobalPointerThatIsAnInstucti
 }
 
 TEST_F(ModuleTest, givenModuleWithoutSymbolsThenFailureReturned) {
-    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::user);
     module0->isGlobalSymbolExportEnabled = true;
 
     size_t size = 0;
@@ -3262,7 +6008,7 @@ TEST_F(ModuleTest, givenModuleWithoutSymbolsThenFailureReturned) {
 }
 
 TEST_F(ModuleTest, givenModuleWithoutSymbolExportEnabledThenFailureReturned) {
-    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::user);
     module0->isGlobalSymbolExportEnabled = false;
 
     size_t size = 0;
@@ -3277,10 +6023,10 @@ TEST_F(ModuleTest, givenModuleWithoutSymbolExportEnabledThenFailureReturned) {
 TEST_F(ModuleTest, givenModuleWithSymbolWhenGettingGlobalPointerWithNullptrInputsThenSuccessIsReturned) {
     uint64_t gpuAddress = 0x12345000;
 
-    NEO::SymbolInfo symbolInfo{0, 1024u, SegmentType::GlobalVariables};
+    NEO::SymbolInfo symbolInfo{0, 1024u, SegmentType::globalVariables};
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
-    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<Module>(device, nullptr, ModuleType::user);
     module0->symbols["symbol"] = relocatedSymbol;
     module0->isGlobalSymbolExportEnabled = true;
 
@@ -3296,14 +6042,14 @@ TEST_F(ModuleTest, givenModuleWithGlobalSymbolMapWhenGettingGlobalPointerByHostS
 
     size_t symbolsSize = 1024u;
     uint64_t globalVarGpuAddress = 0x12345000;
-    NEO::SymbolInfo globalVariablesSymbolInfo{0, static_cast<uint32_t>(symbolsSize), SegmentType::GlobalVariables};
+    NEO::SymbolInfo globalVariablesSymbolInfo{0, static_cast<uint32_t>(symbolsSize), SegmentType::globalVariables};
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> globalVariablesRelocatedSymbol{globalVariablesSymbolInfo, globalVarGpuAddress};
 
     uint64_t globalConstGpuAddress = 0x12347000;
-    NEO::SymbolInfo globalConstantsSymbolInfo{0, static_cast<uint32_t>(symbolsSize), SegmentType::GlobalConstants};
+    NEO::SymbolInfo globalConstantsSymbolInfo{0, static_cast<uint32_t>(symbolsSize), SegmentType::globalConstants};
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> globalConstansRelocatedSymbol{globalConstantsSymbolInfo, globalConstGpuAddress};
 
-    auto module0 = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     module0->symbols["devSymbolOne"] = globalVariablesRelocatedSymbol;
     module0->symbols["devSymbolTwo"] = globalConstansRelocatedSymbol;
 
@@ -3331,7 +6077,7 @@ TEST_F(ModuleTest, givenModuleWithGlobalSymbolsMapWhenPopulatingMapWithSymbolNot
     std::string notFoundDevSymbolName = "anotherDevSymbolOne";
     mapping[notFoundDevSymbolName] = "anotherHostSymbolOne";
 
-    auto module0 = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     EXPECT_EQ(0u, module0->symbols.count(notFoundDevSymbolName));
 
     auto result = module0->populateHostGlobalSymbolsMap(mapping);
@@ -3347,10 +6093,10 @@ TEST_F(ModuleTest, givenModuleWithGlobalSymbolsMapWhenPopulatingMapWithSymbolFro
 
     size_t symbolSize = 1024u;
     uint64_t gpuAddress = 0x12345000;
-    NEO::SymbolInfo symbolInfo{0, static_cast<uint32_t>(symbolSize), SegmentType::Instructions};
+    NEO::SymbolInfo symbolInfo{0, static_cast<uint32_t>(symbolSize), SegmentType::instructions};
     NEO::Linker::RelocatedSymbol<NEO::SymbolInfo> relocatedSymbol{symbolInfo, gpuAddress};
 
-    auto module0 = std::make_unique<MockModule>(device, nullptr, ModuleType::User);
+    auto module0 = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
     module0->symbols[incorrectDevSymbolName] = relocatedSymbol;
 
     auto result = module0->populateHostGlobalSymbolsMap(mapping);
@@ -3358,10 +6104,30 @@ TEST_F(ModuleTest, givenModuleWithGlobalSymbolsMapWhenPopulatingMapWithSymbolFro
     std::string expectedErrorOutput = "Error: Symbol with given device name: " + incorrectDevSymbolName + " is not in .data segment.\n";
     EXPECT_STREQ(expectedErrorOutput.c_str(), module0->getTranslationUnit()->buildLog.c_str());
 }
+using ModuleRequiredLibsTests = Test<DeviceFixture>;
+TEST_F(ModuleRequiredLibsTests, givenModuleWhenItIsInitializedThenLinkingInternalRequiredLibsIsAttempted) {
+    auto module = std::make_unique<Mock<Module>>(device, nullptr, ModuleType::user);
+    module->initializeTranslationUnitCallBase = false;
+    module->initializeTranslationUnitResult = ZE_RESULT_SUCCESS;
+    module->linkInternalRequiredLibsModuleCallBase = false;
+    module->linkInternalRequiredLibsModuleCalled = 0U;
+
+    auto fakeBin = std::array<uint8_t, 8>();
+    ze_module_desc_t moduleDesc = {
+        .stype = ZE_STRUCTURE_TYPE_MODULE_DESC,
+        .pNext = nullptr,
+        .format = ZE_MODULE_FORMAT_NATIVE,
+        .inputSize = fakeBin.size(),
+        .pInputModule = fakeBin.data(),
+        .pBuildFlags = "",
+        .pConstants = nullptr};
+    module->initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(1U, module->linkInternalRequiredLibsModuleCalled);
+}
 
 using ModuleTests = Test<DeviceFixture>;
 TEST_F(ModuleTests, whenCopyingPatchedSegmentsThenAllocationsAreSetWritableForTbxAndAub) {
-    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::user);
 
     char data[1]{};
     auto kernelInfo = std::make_unique<KernelInfo>();
@@ -3369,16 +6135,17 @@ TEST_F(ModuleTests, whenCopyingPatchedSegmentsThenAllocationsAreSetWritableForTb
     kernelInfo->heapInfo.pKernelHeap = data;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, false);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo.get(), device, nullptr, nullptr);
 
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
     NEO::Linker::PatchableSegments segments{{data, 0u, 1}};
 
-    auto allocation = pModule->kernelImmDatas[0]->getIsaGraphicsAllocation();
+    auto allocation = pModule->kernelImmData[0]->getIsaGraphicsAllocation();
 
     allocation->setTbxWritable(false, std::numeric_limits<uint32_t>::max());
     allocation->setAubWritable(false, std::numeric_limits<uint32_t>::max());
@@ -3390,7 +6157,7 @@ TEST_F(ModuleTests, whenCopyingPatchedSegmentsThenAllocationsAreSetWritableForTb
 }
 
 TEST_F(ModuleTests, givenConstDataStringSectionWhenLinkingModuleThenSegmentIsPatched) {
-    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::user);
 
     char data[64]{};
     auto kernelInfo = new KernelInfo();
@@ -3398,14 +6165,15 @@ TEST_F(ModuleTests, givenConstDataStringSectionWhenLinkingModuleThenSegmentIsPat
     kernelInfo->heapInfo.pKernelHeap = data;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, nullptr, nullptr, false);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo, device, nullptr, nullptr);
     auto patchAddr = reinterpret_cast<uintptr_t>(ptrOffset(kernelImmData->isaGraphicsAllocation->getUnderlyingBuffer(), 0x8));
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
 
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
-    linkerInput->textRelocations.push_back({{".str", 0x8, LinkerInput::RelocationInfo::Type::Address, SegmentType::Instructions}});
-    linkerInput->symbols.insert({".str", {0x0, 0x8, SegmentType::GlobalStrings}});
+    linkerInput->textRelocations.push_back({{".str", 0x8, LinkerInput::RelocationInfo::Type::address, SegmentType::instructions}});
+    linkerInput->symbols.insert({".str", {0x0, 0x8, SegmentType::globalStrings}});
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
@@ -3419,8 +6187,8 @@ TEST_F(ModuleTests, givenConstDataStringSectionWhenLinkingModuleThenSegmentIsPat
     EXPECT_EQ(static_cast<size_t>(stringsAddr), *reinterpret_cast<size_t *>(patchAddr));
 }
 
-TEST_F(ModuleTests, givenImplicitArgsRelocationAndStackCallsWhenLinkingBuiltinModuleThenSegmentIsNotPatchedAndImplicitArgsAreNotRequired) {
-    auto pModule = std::make_unique<WhiteBox<Module>>(device, nullptr, ModuleType::Builtin);
+TEST_F(ModuleTests, givenImplicitArgsRelocationWhenLinkingBuiltinModuleThenSegmentIsPatchedWithZeroAndImplicitArgsAreNotRequired) {
+    auto pModule = std::make_unique<WhiteBox<Module>>(device, nullptr, ModuleType::builtin);
 
     char data[64]{};
     auto kernelInfo = new KernelInfo();
@@ -3428,15 +6196,15 @@ TEST_F(ModuleTests, givenImplicitArgsRelocationAndStackCallsWhenLinkingBuiltinMo
     kernelInfo->heapInfo.pKernelHeap = data;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, nullptr, nullptr, true);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo, device, nullptr, nullptr);
 
-    kernelImmData->kernelDescriptor->kernelAttributes.flags.useStackCalls = true;
     auto isaCpuPtr = reinterpret_cast<char *>(kernelImmData->isaGraphicsAllocation->getUnderlyingBuffer());
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, 0x8, LinkerInput::RelocationInfo::Type::AddressLow, SegmentType::Instructions}});
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), 0x8, LinkerInput::RelocationInfo::Type::addressLow, SegmentType::instructions}});
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
     EXPECT_FALSE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
@@ -3459,9 +6227,9 @@ TEST_F(ModuleTests, givenImplicitArgsRelocationAndStackCallsWhenLinkingBuiltinMo
 
 TEST_F(ModuleTests, givenFullyLinkedModuleAndSlmSizeExceedingLocalMemorySizeWhenCreatingKernelThenDebugMsgErrIsPrintedAndOutOfDeviceMemoryIsReturned) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.PrintDebugMessages.set(true);
+    debugManager.flags.PrintDebugMessages.set(true);
 
-    auto pModule = std::make_unique<WhiteBox<Module>>(device, nullptr, ModuleType::Builtin);
+    auto pModule = std::make_unique<WhiteBox<Module>>(device, nullptr, ModuleType::builtin);
 
     char data[64]{};
     std::unique_ptr<KernelInfo> kernelInfo = std::make_unique<KernelInfo>();
@@ -3473,19 +6241,21 @@ TEST_F(ModuleTests, givenFullyLinkedModuleAndSlmSizeExceedingLocalMemorySizeWhen
     auto slmInlineSizeCopy = kernelInfo->kernelDescriptor.kernelAttributes.slmInlineSize;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, true);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo.get(), device, nullptr, nullptr);
 
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, 0x8, LinkerInput::RelocationInfo::Type::AddressLow, SegmentType::Instructions}});
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), 0x8, LinkerInput::RelocationInfo::Type::addressLow, SegmentType::instructions}});
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
     auto status = pModule->linkBinary();
     EXPECT_TRUE(status);
 
-    ::testing::internal::CaptureStderr();
+    StreamCapture capture;
+    capture.captureStderr();
 
     ze_kernel_handle_t kernelHandle;
 
@@ -3496,18 +6266,35 @@ TEST_F(ModuleTests, givenFullyLinkedModuleAndSlmSizeExceedingLocalMemorySizeWhen
 
     EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, res);
 
-    std::string output = testing::internal::GetCapturedStderr();
+    std::string output = capture.getCapturedStderr();
     const std::string expectedPart = "Size of SLM (" + std::to_string(slmInlineSizeCopy) + ") larger than available (" + std::to_string(localMemSize) + ")\n";
-    EXPECT_TRUE(output.find(expectedPart));
+    EXPECT_NE(std::string::npos, output.find(expectedPart));
+}
 
-    Kernel::fromHandle(kernelHandle)->destroy();
+TEST_F(ModuleTests, givenSlmSizeExceedingLocalMemorySizeWhenProcessingUnpackedBinaryThenRejectionReasonIsAppendedToBuildLog) {
+    auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
+    const auto &src = zebinData->storage;
+
+    constexpr uint32_t slmNeeded = 64u;
+    constexpr uint32_t slmAvailable = 32u;
+    neoDevice->deviceInfo.localMemSize = slmAvailable;
+
+    L0::ModuleTranslationUnit moduleTu(this->device);
+    moduleTu.unpackedDeviceBinarySize = src.size();
+    moduleTu.unpackedDeviceBinary = std::make_unique_for_overwrite<char[]>(moduleTu.unpackedDeviceBinarySize);
+    memcpy_s(moduleTu.unpackedDeviceBinary.get(), moduleTu.unpackedDeviceBinarySize, src.data(), src.size());
+
+    EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, moduleTu.processUnpackedBinary());
+
+    const std::string expectedPart = "Size of SLM (" + std::to_string(slmNeeded) + ") larger than available (" + std::to_string(slmAvailable) + ")";
+    EXPECT_NE(std::string::npos, moduleTu.buildLog.find(expectedPart));
 }
 
 TEST_F(ModuleTests, givenFullyLinkedModuleWhenCreatingKernelThenDebugMsgOnPrivateAndScratchUsageIsPrinted) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.PrintDebugMessages.set(true);
+    debugManager.flags.PrintDebugMessages.set(true);
 
-    auto pModule = std::make_unique<WhiteBox<Module>>(device, nullptr, ModuleType::Builtin);
+    auto pModule = std::make_unique<WhiteBox<Module>>(device, nullptr, ModuleType::builtin);
 
     char data[64]{};
     std::unique_ptr<KernelInfo> kernelInfo = std::make_unique<KernelInfo>();
@@ -3515,19 +6302,21 @@ TEST_F(ModuleTests, givenFullyLinkedModuleWhenCreatingKernelThenDebugMsgOnPrivat
     kernelInfo->heapInfo.pKernelHeap = data;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo.get(), device, 0, nullptr, nullptr, true);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo.get(), device, nullptr, nullptr);
 
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo.release());
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, 0x8, LinkerInput::RelocationInfo::Type::AddressLow, SegmentType::Instructions}});
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), 0x8, LinkerInput::RelocationInfo::Type::addressLow, SegmentType::instructions}});
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
     auto status = pModule->linkBinary();
     EXPECT_TRUE(status);
 
-    ::testing::internal::CaptureStderr();
+    StreamCapture capture;
+    capture.captureStderr();
 
     ze_kernel_handle_t kernelHandle;
 
@@ -3538,9 +6327,10 @@ TEST_F(ModuleTests, givenFullyLinkedModuleWhenCreatingKernelThenDebugMsgOnPrivat
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
 
-    std::string output = testing::internal::GetCapturedStderr();
+    std::string output = capture.getCapturedStderr();
     std::ostringstream expectedOutput;
     expectedOutput << "computeUnits for each thread: " << std::to_string(this->device->getDeviceInfo().computeUnitsUsedForScratch) << "\n"
+                   << "global memory size: " << std::to_string(this->device->getDeviceInfo().globalMemSize) << "\n"
                    << "perHwThreadPrivateMemorySize: 0\t totalPrivateMemorySize: 0\n"
                    << "perHwThreadScratchSize: 0\t totalScratchSize: 0\n"
                    << "perHwThreadPrivateScratchSize: 0\t totalPrivateScratchSize: 0\n";
@@ -3550,7 +6340,7 @@ TEST_F(ModuleTests, givenFullyLinkedModuleWhenCreatingKernelThenDebugMsgOnPrivat
 }
 
 TEST_F(ModuleTests, givenImplicitArgsRelocationAndStackCallsWhenLinkingModuleThenSegmentIsPatchedAndImplicitArgsAreRequired) {
-    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::user);
 
     char data[64]{};
     auto kernelInfo = new KernelInfo();
@@ -3558,64 +6348,30 @@ TEST_F(ModuleTests, givenImplicitArgsRelocationAndStackCallsWhenLinkingModuleThe
     kernelInfo->heapInfo.pKernelHeap = data;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, nullptr, nullptr, false);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo, device, nullptr, nullptr);
 
     kernelImmData->kernelDescriptor->kernelAttributes.flags.useStackCalls = true;
     auto isaCpuPtr = reinterpret_cast<char *>(kernelImmData->isaGraphicsAllocation->getUnderlyingBuffer());
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, 0x8, LinkerInput::RelocationInfo::Type::AddressLow, SegmentType::Instructions}});
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), 0x8, LinkerInput::RelocationInfo::Type::addressLow, SegmentType::instructions}});
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
     EXPECT_FALSE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
     auto status = pModule->linkBinary();
     EXPECT_TRUE(status);
 
-    EXPECT_EQ(sizeof(ImplicitArgs), *reinterpret_cast<uint32_t *>(ptrOffset(isaCpuPtr, 0x8)));
-
-    EXPECT_TRUE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
-}
-
-using ModuleTestsDebuggingSupported = ModuleTranslationUnitDebuggerSupportedTest;
-
-HWTEST2_F(ModuleTestsDebuggingSupported, givenImplicitArgsRelocationAndDebuggerEnabledWhenLinkingModuleThenSegmentIsPatchedAndImplicitArgsAreRequired, HasSourceLevelDebuggerSupport) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.EnableMockSourceLevelDebugger.set(1);
-    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::User);
-    device->getNEODevice()->getRootDeviceEnvironmentRef().initDebugger();
-
-    EXPECT_NE(nullptr, neoDevice->getDebugger());
-
-    char data[64]{};
-    auto kernelInfo = new KernelInfo();
-    kernelInfo->heapInfo.kernelHeapSize = 64;
-    kernelInfo->heapInfo.pKernelHeap = data;
-
-    std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, nullptr, nullptr, false);
-
-    kernelImmData->kernelDescriptor->kernelAttributes.flags.useStackCalls = false;
-    auto isaCpuPtr = reinterpret_cast<char *>(kernelImmData->isaGraphicsAllocation->getUnderlyingBuffer());
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
-    pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
-    auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
-    linkerInput->traits.requiresPatchingOfInstructionSegments = true;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, 0x8, LinkerInput::RelocationInfo::Type::AddressLow, SegmentType::Instructions}});
-    pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
-
-    EXPECT_FALSE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
-    auto status = pModule->linkBinary();
-    EXPECT_TRUE(status);
-
-    EXPECT_EQ(sizeof(ImplicitArgs), *reinterpret_cast<uint32_t *>(ptrOffset(isaCpuPtr, 0x8)));
+    const auto &hwInfo = device->getHwInfo();
+    EXPECT_EQ(ImplicitArgsTestHelper::getImplicitArgsSize(hwInfo.caps.implicitArgsVersion), *reinterpret_cast<uint32_t *>(ptrOffset(isaCpuPtr, 0x8)));
 
     EXPECT_TRUE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
 }
 
 TEST_F(ModuleTests, givenImplicitArgsRelocationAndNoDebuggerOrStackCallsWhenLinkingModuleThenSegmentIsPatchedAndImplicitArgsAreNotRequired) {
-    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::User);
+    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::user);
     EXPECT_EQ(nullptr, neoDevice->getDebugger());
 
     char data[64]{};
@@ -3624,15 +6380,16 @@ TEST_F(ModuleTests, givenImplicitArgsRelocationAndNoDebuggerOrStackCallsWhenLink
     kernelInfo->heapInfo.pKernelHeap = data;
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, nullptr, nullptr, false);
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo, device, nullptr, nullptr);
 
     kernelImmData->kernelDescriptor->kernelAttributes.flags.useStackCalls = false;
     auto isaCpuPtr = reinterpret_cast<char *>(kernelImmData->isaGraphicsAllocation->getUnderlyingBuffer());
-    pModule->kernelImmDatas.push_back(std::move(kernelImmData));
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
     pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
     auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
     linkerInput->traits.requiresPatchingOfInstructionSegments = true;
-    linkerInput->textRelocations.push_back({{implicitArgsRelocationSymbolName, 0x8, LinkerInput::RelocationInfo::Type::AddressLow, SegmentType::Instructions}});
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), 0x8, LinkerInput::RelocationInfo::Type::addressLow, SegmentType::instructions}});
     pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
 
     EXPECT_FALSE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
@@ -3644,16 +6401,47 @@ TEST_F(ModuleTests, givenImplicitArgsRelocationAndNoDebuggerOrStackCallsWhenLink
     EXPECT_FALSE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
 }
 
+TEST_F(ModuleTests, givenRequiredImplicitArgsInKernelAndNoDebuggerOrStackCallsWhenLinkingModuleThenImplicitArgsRequiredRemainSet) {
+    auto pModule = std::make_unique<Module>(device, nullptr, ModuleType::user);
+    EXPECT_EQ(nullptr, neoDevice->getDebugger());
+
+    char data[64]{};
+    auto kernelInfo = new KernelInfo();
+    kernelInfo->heapInfo.kernelHeapSize = 64;
+    kernelInfo->heapInfo.pKernelHeap = data;
+
+    std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
+    kernelImmData->setIsaPerKernelAllocation(pModule->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize));
+    kernelImmData->initialize(kernelInfo, device, nullptr, nullptr);
+
+    kernelImmData->kernelDescriptor->kernelAttributes.flags.useStackCalls = false;
+    auto isaCpuPtr = reinterpret_cast<char *>(kernelImmData->isaGraphicsAllocation->getUnderlyingBuffer());
+    pModule->kernelImmData.push_back(std::move(kernelImmData));
+    pModule->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
+    auto linkerInput = std::make_unique<::WhiteBox<NEO::LinkerInput>>();
+    linkerInput->traits.requiresPatchingOfInstructionSegments = true;
+    linkerInput->textRelocations.push_back({{std::string(implicitArgsRelocationSymbolName), 0x8, LinkerInput::RelocationInfo::Type::addressLow, SegmentType::instructions}});
+    pModule->translationUnit->programInfo.linkerInput = std::move(linkerInput);
+
+    kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs = true;
+    auto status = pModule->linkBinary();
+    EXPECT_TRUE(status);
+
+    EXPECT_NE(0u, *reinterpret_cast<uint32_t *>(ptrOffset(isaCpuPtr, 0x8)));
+
+    EXPECT_TRUE(kernelInfo->kernelDescriptor.kernelAttributes.flags.requiresImplicitArgs);
+}
+
 TEST_F(ModuleTests, givenModuleWithGlobalAndConstAllocationsWhenGettingModuleAllocationsThenAllAreReturned) {
     std::unique_ptr<MockModule> module = std::make_unique<MockModule>(device,
                                                                       nullptr,
-                                                                      ModuleType::User);
+                                                                      ModuleType::user);
     module->translationUnit = std::make_unique<MockModuleTranslationUnit>(device);
 
-    module->translationUnit->globalVarBuffer = neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::BUFFER, neoDevice->getDeviceBitfield()});
-    module->translationUnit->globalConstBuffer = neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::BUFFER, neoDevice->getDeviceBitfield()});
+    module->translationUnit->globalVarBuffer = std::make_unique<SharedPoolAllocation>(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::buffer, neoDevice->getDeviceBitfield()}));
+    module->translationUnit->globalConstBuffer = std::make_unique<SharedPoolAllocation>(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::buffer, neoDevice->getDeviceBitfield()}));
 
     uint32_t kernelHeap = 0;
     auto kernelInfo = new KernelInfo();
@@ -3664,23 +6452,122 @@ TEST_F(ModuleTests, givenModuleWithGlobalAndConstAllocationsWhenGettingModuleAll
     module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
 
     std::unique_ptr<WhiteBox<::L0::KernelImmutableData>> kernelImmData{new WhiteBox<::L0::KernelImmutableData>(this->device)};
-    kernelImmData->initialize(kernelInfo, device, 0, module->translationUnit->globalConstBuffer, module->translationUnit->globalVarBuffer, false);
-    module->kernelImmDatas.push_back(std::move(kernelImmData));
+    auto isaAlloc = module->allocateKernelsIsaMemory(kernelInfo->heapInfo.kernelHeapSize);
+    ASSERT_NE(isaAlloc, nullptr);
+    kernelImmData->setIsaPerKernelAllocation(isaAlloc);
+    kernelImmData->initialize(kernelInfo, device, module->translationUnit->globalConstBuffer.get(), module->translationUnit->globalVarBuffer.get());
+    module->kernelImmData.push_back(std::move(kernelImmData));
 
     const auto allocs = module->getModuleAllocations();
 
     EXPECT_EQ(3u, allocs.size());
 
-    auto iter = std::find(allocs.begin(), allocs.end(), module->translationUnit->globalConstBuffer);
+    auto iter = std::find(allocs.begin(), allocs.end(), module->translationUnit->getGlobalConstBufferGA());
     EXPECT_NE(allocs.end(), iter);
 
-    iter = std::find(allocs.begin(), allocs.end(), module->translationUnit->globalVarBuffer);
+    iter = std::find(allocs.begin(), allocs.end(), module->translationUnit->getGlobalVarBufferGA());
     EXPECT_NE(allocs.end(), iter);
 
-    iter = std::find(allocs.begin(), allocs.end(), module->kernelImmDatas[0]->getIsaGraphicsAllocation());
+    iter = std::find(allocs.begin(), allocs.end(), module->kernelImmData[0]->getIsaGraphicsAllocation());
     EXPECT_NE(allocs.end(), iter);
 }
 
+TEST_F(ModuleTests, givenSharedIsaUsedOnlyBySecondaryWhenDestroyingModuleThenComputeGroupRequiresInstructionCacheFlush) {
+    VariableBackup<uint32_t> maxOsContextCountBackup{&NEO::MemoryManager::maxOsContextCount};
+
+    auto neoDevice = this->neoDevice;
+    auto rootDeviceIndex = neoDevice->getRootDeviceIndex();
+    auto memoryManager = neoDevice->getMemoryManager();
+
+    NEO::InstructionCacheFlushTestEngines engines(
+        *neoDevice->getExecutionEnvironment(), rootDeviceIndex);
+
+    for (const auto &engine : memoryManager->getRegisteredEngines(rootDeviceIndex)) {
+        NEO::MemoryManager::maxOsContextCount = std::max(
+            NEO::MemoryManager::maxOsContextCount, engine.osContext->getContextId() + 1u);
+    }
+
+    VariableBackup<std::unique_ptr<NEO::ISAPoolAllocator>> isaPoolAllocatorBackup{
+        &neoDevice->isaPoolAllocator,
+        std::make_unique<NEO::ISAPoolAllocator>(neoDevice)};
+
+    auto module = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
+    module->translationUnit.reset(new MockModuleTranslationUnit{device});
+
+    const uint8_t kernelHeap[0x40] = {};
+    auto kernelInfo = new NEO::KernelInfo{};
+    kernelInfo->heapInfo.pKernelHeap = kernelHeap;
+    kernelInfo->heapInfo.kernelHeapSize = sizeof(kernelHeap);
+    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
+
+    ASSERT_EQ(nullptr, device->getL0Debugger());
+
+    const auto requiredIsaSize =
+        NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(
+            *neoDevice, sizeof(kernelHeap), true);
+    module->isaAllocationPageSize = std::max(
+        module->isaAllocationPageSize, requiredIsaSize);
+
+    ASSERT_EQ(ZE_RESULT_SUCCESS, module->initializeKernelImmutableData());
+    ASSERT_NE(nullptr, module->sharedIsaAllocation);
+
+    auto isaAllocation = module->getKernelsIsaParentAllocation();
+    ASSERT_NE(nullptr, isaAllocation);
+    isaAllocation->updateTaskCount(1u, engines.secondary->getOsContext().getContextId());
+
+    ASSERT_FALSE(isaAllocation->isUsedByOsContext(engines.primary->getOsContext().getContextId()));
+    ASSERT_FALSE(isaAllocation->isUsedByOsContext(engines.sibling->getOsContext().getContextId()));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, module.release()->destroy());
+
+    EXPECT_TRUE(engines.primary->isInstructionCacheFlushRequired());
+    EXPECT_TRUE(engines.secondary->isInstructionCacheFlushRequired());
+    EXPECT_TRUE(engines.sibling->isInstructionCacheFlushRequired());
+    EXPECT_FALSE(engines.unrelatedPrimary->isInstructionCacheFlushRequired());
+    EXPECT_FALSE(engines.unrelatedSecondary->isInstructionCacheFlushRequired());
+}
+
+TEST_F(ModuleTests, givenPerKernelIsaUsedOnlyBySecondaryWhenDestroyingModuleThenComputeGroupRequiresInstructionCacheFlush) {
+    VariableBackup<uint32_t> maxOsContextCountBackup{&NEO::MemoryManager::maxOsContextCount};
+
+    auto neoDevice = device->getNEODevice();
+    auto rootDeviceIndex = neoDevice->getRootDeviceIndex();
+    auto memoryManager = neoDevice->getMemoryManager();
+
+    NEO::InstructionCacheFlushTestEngines engines(
+        *neoDevice->getExecutionEnvironment(), rootDeviceIndex);
+
+    for (const auto &engine : memoryManager->getRegisteredEngines(rootDeviceIndex)) {
+        NEO::MemoryManager::maxOsContextCount = std::max(
+            NEO::MemoryManager::maxOsContextCount, engine.osContext->getContextId() + 1u);
+    }
+
+    auto module = std::make_unique<MockModule>(device, nullptr, ModuleType::user);
+    auto kernelData = std::make_unique<KernelImmutableData>(device);
+
+    NEO::AllocationProperties properties{
+        rootDeviceIndex, MemoryConstants::pageSize,
+        NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()};
+    auto isaAllocation = memoryManager->allocateGraphicsMemoryWithProperties(properties);
+    ASSERT_NE(nullptr, isaAllocation);
+
+    kernelData->setIsaPerKernelAllocation(isaAllocation);
+    module->getKernelImmutableDataVectorRef().push_back(std::move(kernelData));
+
+    ASSERT_EQ(nullptr, module->getKernelsIsaParentAllocation());
+    isaAllocation->updateTaskCount(1u, engines.secondary->getOsContext().getContextId());
+
+    ASSERT_FALSE(isaAllocation->isUsedByOsContext(engines.primary->getOsContext().getContextId()));
+    ASSERT_FALSE(isaAllocation->isUsedByOsContext(engines.sibling->getOsContext().getContextId()));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, module.release()->destroy());
+
+    EXPECT_TRUE(engines.primary->isInstructionCacheFlushRequired());
+    EXPECT_TRUE(engines.secondary->isInstructionCacheFlushRequired());
+    EXPECT_TRUE(engines.sibling->isInstructionCacheFlushRequired());
+    EXPECT_FALSE(engines.unrelatedPrimary->isInstructionCacheFlushRequired());
+    EXPECT_FALSE(engines.unrelatedSecondary->isInstructionCacheFlushRequired());
+}
 using ModuleIsaCopyTest = Test<ModuleImmutableDataFixture>;
 
 TEST_F(ModuleIsaCopyTest, whenModuleIsInitializedThenIsaIsCopied) {
@@ -3693,10 +6580,10 @@ TEST_F(ModuleIsaCopyTest, whenModuleIsInitializedThenIsaIsCopied) {
 
     uint32_t previouscopyMemoryToAllocationCalledTimes = mockMemoryManager->copyMemoryToAllocationCalledTimes;
 
-    auto additionalSections = {ZebinTestData::appendElfAdditionalSection::GLOBAL};
+    auto additionalSections = {ZebinTestData::AppendElfAdditionalSection::global};
     createModuleFromMockBinary(perHwThreadPrivateMemorySizeRequested, isInternal, mockKernelImmData.get(), additionalSections);
 
-    uint32_t numOfKernels = static_cast<uint32_t>(module->getKernelImmutableDataVector().size());
+    uint32_t numOfKernels = module->getKernelsIsaParentAllocation() ? 1u : static_cast<uint32_t>(module->getKernelImmutableDataVector().size());
     const uint32_t numOfGlobalBuffers = 1;
 
     EXPECT_EQ(previouscopyMemoryToAllocationCalledTimes + numOfGlobalBuffers + numOfKernels, mockMemoryManager->copyMemoryToAllocationCalledTimes);
@@ -3730,12 +6617,28 @@ TEST_F(ModuleWithZebinTest, givenZebinSegmentsThenSegmentsArePopulated) {
         EXPECT_EQ(alloc->getGpuAddress(), segment.address);
         EXPECT_EQ(alloc->getUnderlyingBufferSize(), segment.size);
     };
-    checkGPUSeg(module->translationUnit->globalConstBuffer, segments.constData);
-    checkGPUSeg(module->translationUnit->globalConstBuffer, segments.varData);
-    checkGPUSeg(module->kernelImmDatas[0]->getIsaGraphicsAllocation(), segments.nameToSegMap[ZebinTestData::ValidEmptyProgram<>::kernelName]);
+    checkGPUSeg(module->translationUnit->getGlobalConstBufferGA(), segments.constData);
+    checkGPUSeg(module->translationUnit->getGlobalConstBufferGA(), segments.varData);
+    checkGPUSeg(module->kernelImmData[0]->getIsaGraphicsAllocation(), segments.nameToSegMap[ZebinTestData::ValidEmptyProgram<>::kernelName]);
 
     EXPECT_EQ(reinterpret_cast<uintptr_t>(module->translationUnit->programInfo.globalStrings.initData), segments.stringData.address);
     EXPECT_EQ(module->translationUnit->programInfo.globalStrings.size, segments.stringData.size);
+}
+
+TEST_F(ModuleWithZebinTest, givenZebinSegmentsWithSharedGlobalConstAndVarBuffersThenSegmentsArePopulated) {
+    constexpr bool createWithSharedGlobalConstSurfaces = true;
+    module->addSegments(createWithSharedGlobalConstSurfaces);
+    auto segments = module->getZebinSegments();
+
+    auto checkGPUSeg = [](NEO::SharedPoolAllocation *poolAlloc, NEO::Zebin::Debug::Segments::Segment segment) {
+        EXPECT_EQ(poolAlloc->getGpuAddress(), segment.address);
+        EXPECT_EQ(poolAlloc->getSize(), segment.size);
+
+        EXPECT_NE(poolAlloc->getGpuAddress(), poolAlloc->getGraphicsAllocation()->getGpuAddress());
+        EXPECT_NE(poolAlloc->getSize(), poolAlloc->getGraphicsAllocation()->getUnderlyingBufferSize());
+    };
+    checkGPUSeg(module->translationUnit->globalConstBuffer.get(), segments.constData);
+    checkGPUSeg(module->translationUnit->globalVarBuffer.get(), segments.varData);
 }
 
 TEST_F(ModuleWithZebinTest, givenValidZebinWhenGettingDebugInfoThenDebugZebinIsCreatedAndReturned) {
@@ -3748,6 +6651,69 @@ TEST_F(ModuleWithZebinTest, givenValidZebinWhenGettingDebugInfoThenDebugZebinIsC
     ASSERT_NE(nullptr, module->translationUnit->debugData.get());
     EXPECT_EQ(0, memcmp(module->translationUnit->debugData.get(), debugData.get(), debugDataSize));
     EXPECT_EQ(retCode, ZE_RESULT_SUCCESS);
+}
+
+TEST_F(ModuleTranslationUnitTest, givenModuleWithMultipleKernelsWhenDebugInfoQueriedThenCorrectSegmentsAreDefined) {
+    std::string zeInfo = std::string("version :\'") + versionToString(NEO::Zebin::ZeInfo::zeInfoDecoderVersion) + R"===('
+kernels:
+    - name : kernel1
+      execution_env :
+        simd_size : 8
+    - name : kernel2
+      execution_env :
+        simd_size : 8
+)===";
+    auto copyHwInfo = device->getHwInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
+
+    MockElfEncoder<> elfEncoder;
+    elfEncoder.getElfFileHeader().type = NEO::Elf::ET_REL;
+    elfEncoder.getElfFileHeader().machine = copyHwInfo.platform.eProductFamily;
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel1", std::string{});
+    elfEncoder.appendSection(NEO::Elf::SHT_PROGBITS, NEO::Zebin::Elf::SectionNames::textPrefix.str() + "kernel2", std::string{});
+    elfEncoder.appendSection(NEO::Zebin::Elf::SHT_ZEBIN_ZEINFO, NEO::Zebin::Elf::SectionNames::zeInfo, zeInfo);
+    auto zebin = elfEncoder.encode();
+
+    auto module = new Module(device, nullptr, ModuleType::user);
+
+    ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.inputSize = zebin.size();
+    moduleDesc.pInputModule = zebin.data();
+    moduleDesc.pNext = nullptr;
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    result = module->initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    size_t debugDataSize;
+    module->getDebugInfo(&debugDataSize, nullptr);
+    auto debugData = std::make_unique<uint8_t[]>(debugDataSize);
+    result = module->getDebugInfo(&debugDataSize, debugData.get());
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+    ASSERT_NE(nullptr, module->translationUnit->debugData.get());
+
+    std::string errors, warnings;
+    auto outElf = Elf::decodeElf<NEO::Elf::EI_CLASS_64>(ArrayRef<const uint8_t>(debugData.get(), debugDataSize), errors, warnings);
+
+    auto kernel1 = module->kernelImmData[0].get();
+    auto kernel2 = module->kernelImmData[1].get();
+    EXPECT_EQ(kernel1->getIsaGraphicsAllocation(), kernel2->getIsaGraphicsAllocation());
+    EXPECT_EQ(kernel1->getIsaGraphicsAllocation(), kernel2->getIsaGraphicsAllocation());
+    EXPECT_NE(nullptr, kernel1->getIsaParentAllocation());
+
+    auto kernel1Address = kernel1->getIsaGraphicsAllocation()->getGpuAddress() + kernel1->getIsaOffsetInParentAllocation();
+    auto kernel1Size = kernel1->getIsaSubAllocationSize();
+
+    EXPECT_EQ(kernel1Address, outElf.programHeaders[0].header->vAddr);
+    EXPECT_EQ(kernel1Size, outElf.programHeaders[0].header->memSz);
+
+    auto kernel2Address = kernel2->getIsaGraphicsAllocation()->getGpuAddress() + kernel2->getIsaOffsetInParentAllocation();
+    auto kernel2Size = kernel2->getIsaSubAllocationSize();
+
+    EXPECT_EQ(kernel2Address, outElf.programHeaders[1].header->vAddr);
+    EXPECT_EQ(kernel2Size, outElf.programHeaders[1].header->memSz);
+
+    module->destroy();
 }
 
 TEST_F(ModuleWithZebinTest, givenValidZebinAndPassedDataSmallerThanDebugDataThenErrorIsReturned) {
@@ -3765,7 +6731,6 @@ TEST_F(ModuleWithZebinTest, givenNonZebinaryFormatWhenGettingDebugInfoThenDebugZ
     size_t mockProgramSize = sizeof(Elf::ElfFileHeader<Elf::EI_CLASS_64>);
     module->translationUnit->unpackedDeviceBinary = std::make_unique<char[]>(mockProgramSize);
     module->translationUnit->unpackedDeviceBinarySize = mockProgramSize;
-    module->isZebinBinary = false;
     size_t debugDataSize;
     ze_result_t retCode = module->getDebugInfo(&debugDataSize, nullptr);
     EXPECT_EQ(debugDataSize, 0u);
@@ -3775,9 +6740,11 @@ TEST_F(ModuleWithZebinTest, givenNonZebinaryFormatWhenGettingDebugInfoThenDebugZ
 HWTEST_F(ModuleWithZebinTest, givenZebinWithKernelCallingExternalFunctionThenUpdateKernelsBarrierCount) {
     ZebinTestData::ZebinWithExternalFunctionsInfo zebin;
 
-    const auto &hwInfo = device->getNEODevice()->getHardwareInfo();
+    auto copyHwInfo = device->getHwInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
 
-    zebin.setProductFamily(static_cast<uint16_t>(hwInfo.platform.eProductFamily));
+    zebin.setProductFamily(static_cast<uint16_t>(copyHwInfo.platform.eProductFamily));
 
     ze_module_desc_t moduleDesc = {};
     moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
@@ -3786,7 +6753,7 @@ HWTEST_F(ModuleWithZebinTest, givenZebinWithKernelCallingExternalFunctionThenUpd
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::User));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::user));
     ASSERT_NE(nullptr, module.get());
     ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
     result = module->initialize(&moduleDesc, device->getNEODevice());
@@ -3797,8 +6764,135 @@ HWTEST_F(ModuleWithZebinTest, givenZebinWithKernelCallingExternalFunctionThenUpd
     EXPECT_EQ(zebin.barrierCount, kernImmData->getDescriptor().kernelAttributes.barrierCount);
 }
 
-using ModuleKernelImmDatasTest = Test<ModuleFixture>;
-TEST_F(ModuleKernelImmDatasTest, givenDeviceOOMWhenMemoryManagerFailsToAllocateMemoryThenReturnInformativeErrorToTheCaller) {
+HWTEST_F(ModuleTest, givenModuleInitalizationWhenDumpKernelInfoToAubCommentsIsCalledThenExpectedTokensAreVisible) {
+
+    class MyModuleImpl : public ModuleImp {
+      public:
+        using ModuleImp::dumpKernelInfoToAubComments;
+        using ModuleImp::kernelImmData;
+        using ModuleImp::ModuleImp;
+        using ModuleImp::symbols;
+        using ModuleImp::translationUnit;
+    };
+
+    auto &ultCsr = neoDevice->getUltCommandStreamReceiver<FamilyType>();
+    ultCsr.commandStreamReceiverType = NEO::CommandStreamReceiverType::aub;
+    neoDevice->getRootDeviceEnvironmentRef().initAubCenter(false, "", NEO::CommandStreamReceiverType::aub);
+    auto aubManager = static_cast<MockAubManager *>(neoDevice->getRootDeviceEnvironmentRef().aubCenter->getAubManager());
+
+    ZebinTestData::ZebinWithExternalFunctionsInfo zebin;
+
+    auto copyHwInfo = device->getHwInfo();
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+    compilerProductHelper.adjustHwInfoForIgc(copyHwInfo);
+
+    zebin.setProductFamily(static_cast<uint16_t>(copyHwInfo.platform.eProductFamily));
+
+    ze_module_desc_t moduleDesc = {};
+    moduleDesc.format = ZE_MODULE_FORMAT_NATIVE;
+    moduleDesc.pInputModule = zebin.storage.data();
+    moduleDesc.inputSize = zebin.storage.size();
+
+    ModuleBuildLog *moduleBuildLog = nullptr;
+
+    auto module = std::make_unique<MyModuleImpl>(device, moduleBuildLog, ModuleType::user);
+    ASSERT_NE(nullptr, module.get());
+    ze_result_t result = ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
+    result = module->initialize(&moduleDesc, neoDevice);
+    EXPECT_EQ(result, ZE_RESULT_SUCCESS);
+
+    auto &comments = aubManager->receivedComments;
+
+    // <KernelInfo> tag exists
+    auto kernelInfoPos = comments.find("<KernelInfo>");
+    EXPECT_NE(std::string::npos, kernelInfoPos);
+
+    // <ExportedSymbols> tag exists
+    auto exportedSymbolsPos = comments.find("<ExportedSymbols>");
+    EXPECT_NE(std::string::npos, exportedSymbolsPos);
+
+    // <BuildOptions> tag doesn't exist
+    auto buildOptionsPos = comments.find("<BuildOptions>");
+    EXPECT_EQ(std::string::npos, buildOptionsPos);
+
+    // <Zeinfo> tag exists
+    auto zeInfoPos = comments.find("<Zeinfo>");
+    EXPECT_NE(std::string::npos, zeInfoPos);
+
+    // correct ordering: <KernelInfo> before <ExportedSymbols> before <Zeinfo>
+    EXPECT_LT(kernelInfoPos, exportedSymbolsPos);
+    EXPECT_LT(exportedSymbolsPos, zeInfoPos);
+
+    // kernel names exist between <KernelInfo> and <ExportedSymbols>
+    auto kernelInfoSection = comments.substr(kernelInfoPos, exportedSymbolsPos - kernelInfoPos);
+    EXPECT_NE(std::string::npos, kernelInfoSection.find("name: kernel"));
+    EXPECT_NE(std::string::npos, kernelInfoSection.find("name: Intel_Symbol_Table_Void_Program"));
+
+    // exported symbol names exist between <ExportedSymbols> and <Zeinfo>
+    auto exportedSymbolsSection = comments.substr(exportedSymbolsPos, zeInfoPos - exportedSymbolsPos);
+    EXPECT_NE(std::string::npos, exportedSymbolsSection.find("name: fun0"));
+    EXPECT_NE(std::string::npos, exportedSymbolsSection.find("name: fun1"));
+
+    // zeinfo content exists after <Zeinfo>
+    auto zeInfoSection = comments.substr(zeInfoPos);
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: kernel"));
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: Intel_Symbol_Table_Void_Program"));
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: fun0"));
+    EXPECT_NE(std::string::npos, zeInfoSection.find("name: fun1"));
+
+    {
+        // no exported symbols, add build options, add implicit args
+
+        aubManager->receivedComments.clear();
+
+        std::string testBuildOptions = "-ze-opt-disable -ze-opt-greater-than-4GB-buffer-required";
+        module->translationUnit->options = testBuildOptions;
+        module->symbols.clear();
+        module->translationUnit->programInfo.indirectAccessBufferMajorVersion = 1;
+
+        auto &kernelDesc = const_cast<KernelDescriptor &>(module->kernelImmData[0]->getDescriptor());
+        kernelDesc.kernelAttributes.flags.requiresImplicitArgs = true;
+
+        module->dumpKernelInfoToAubComments();
+
+        // <ImplicitArgs> tag exists
+        auto implicitArgsPos = comments.find("<ImplicitArgs>");
+        EXPECT_NE(std::string::npos, implicitArgsPos);
+
+        // V1 layout
+        EXPECT_NE(std::string::npos, comments.find("struct ImplicitArgsV1:"));
+        EXPECT_NE(std::string::npos, comments.find("Aligned size:"));
+
+        // kernel uses implicit args exists
+        EXPECT_NE(std::string::npos, comments.find("Kernel uses implicit args"));
+
+        // <KernelInfo> tag exists
+        auto kernelInfoPos = comments.find("<KernelInfo>");
+        EXPECT_NE(std::string::npos, kernelInfoPos);
+
+        // <ExportedSymbols> tag doesn't exist
+        auto exportedSymbolsPos = comments.find("<ExportedSymbols>");
+        EXPECT_EQ(std::string::npos, exportedSymbolsPos);
+
+        // <BuildOptions> tag exists
+        auto buildOptionsPos = comments.find("<BuildOptions>");
+        EXPECT_NE(std::string::npos, buildOptionsPos);
+
+        // <Zeinfo> tag exists
+        auto zeInfoPos = comments.find("<Zeinfo>");
+        EXPECT_NE(std::string::npos, zeInfoPos);
+
+        // correct ordering: <ImplicitArgs>, <KernelInfo>, <BuildOptions>, <Zeinfo>
+        EXPECT_LT(implicitArgsPos, kernelInfoPos);
+        EXPECT_LT(kernelInfoPos, buildOptionsPos);
+        EXPECT_LT(buildOptionsPos, zeInfoPos);
+    }
+}
+
+using ModuleKernelImmDataTest = Test<ModuleFixture>;
+TEST_F(ModuleKernelImmDataTest, givenDeviceOOMWhenMemoryManagerFailsToAllocateMemoryThenReturnInformativeErrorToTheCaller) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.FailBuildProgramWithStatefulAccess.set(0);
 
     auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
     const auto &src = zebinData->storage;
@@ -3809,15 +6903,38 @@ TEST_F(ModuleKernelImmDatasTest, givenDeviceOOMWhenMemoryManagerFailsToAllocateM
     moduleDesc.inputSize = src.size();
 
     ModuleBuildLog *moduleBuildLog = nullptr;
+    module.reset(nullptr);
+    auto module = std::make_unique<Module>(device, moduleBuildLog, ModuleType::user);
+    ASSERT_NE(nullptr, module.get());
+    // Fill current pool so next request will try to allocate
+    auto alloc = device->getNEODevice()->getIsaPoolAllocator().requestGraphicsAllocationForIsa(false, MemoryConstants::pageSize2M * 2);
     auto mockMemoryManager = static_cast<NEO::MockMemoryManager *>(neoDevice->getMemoryManager());
     mockMemoryManager->isMockHostMemoryManager = true;
     mockMemoryManager->forceFailureInPrimaryAllocation = true;
-
-    auto module = std::make_unique<Module>(device, moduleBuildLog, ModuleType::User);
-    ASSERT_NE(nullptr, module.get());
-
     auto result = module->initialize(&moduleDesc, neoDevice);
     EXPECT_EQ(result, ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+    device->getNEODevice()->getIsaPoolAllocator().freeSharedIsaAllocation(alloc);
 };
+
+using MultiTileModuleTest = Test<MultiTileModuleFixture>;
+HWTEST_F(MultiTileModuleTest, givenTwoKernelPrivateAllocsWhichExceedGlobalMemSizeOfSingleTileButNotEntireGlobalMemSizeThenPrivateMemoryShouldBeAllocatedPerDispatch) {
+    auto devInfo = device->getNEODevice()->getDeviceInfo();
+    auto kernelsNb = 2u;
+    uint32_t margin128KB = 131072u;
+    auto underAllocSize = static_cast<uint32_t>(devInfo.globalMemSize / kernelsNb / devInfo.computeUnitsUsedForScratch) - margin128KB;
+    auto kernelNames = std::array<std::string, 2u>{"test1", "test2"};
+
+    auto &kernelImmData = this->modules[0]->kernelImmData;
+    for (size_t i = 0; i < kernelsNb; i++) {
+        auto &kernelDesc = const_cast<KernelDescriptor &>(kernelImmData[i]->getDescriptor());
+        kernelDesc.kernelAttributes.perHwThreadPrivateMemorySize = underAllocSize;
+        kernelDesc.kernelAttributes.flags.usesPrintf = false;
+        kernelDesc.kernelMetadata.kernelName = kernelNames[i];
+    }
+
+    EXPECT_FALSE(this->modules[0]->shouldAllocatePrivateMemoryPerDispatch());
+    this->modules[0]->checkIfPrivateMemoryPerDispatchIsNeeded();
+    EXPECT_TRUE(this->modules[0]->shouldAllocatePrivateMemoryPerDispatch());
+}
 } // namespace ult
 } // namespace L0

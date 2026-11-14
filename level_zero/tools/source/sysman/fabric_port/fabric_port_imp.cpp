@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,8 @@
 #include "level_zero/tools/source/sysman/fabric_port/fabric_port_imp.h"
 
 #include "shared/source/helpers/debug_helpers.h"
+
+#include "level_zero/tools/source/sysman/fabric_port/os_fabric_port.h"
 
 #include <chrono>
 
@@ -31,6 +33,10 @@ FabricDeviceImp::~FabricDeviceImp() {
 void fabricPortGetTimestamp(uint64_t &timestamp) {
     std::chrono::time_point<std::chrono::steady_clock> ts = std::chrono::steady_clock::now();
     timestamp = std::chrono::duration_cast<std::chrono::microseconds>(ts.time_since_epoch()).count();
+}
+
+ze_result_t FabricPortImp::fabricPortGetErrorCounters(zes_fabric_port_error_counters_t *pErrors) {
+    return pOsFabricPort->getErrorCounters(pErrors);
 }
 
 ze_result_t FabricPortImp::fabricPortGetProperties(zes_fabric_port_properties_t *pProperties) {

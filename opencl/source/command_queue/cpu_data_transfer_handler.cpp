@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,8 @@
 #include "shared/source/device/device.h"
 #include "shared/source/helpers/flush_stamp.h"
 #include "shared/source/helpers/get_info.h"
+#include "shared/source/helpers/preprocessor.h"
+#include "shared/source/utilities/cpuintrinsics.h"
 #include "shared/source/utilities/logger.h"
 
 #include "opencl/source/command_queue/command_queue.h"
@@ -20,6 +22,15 @@
 #include "opencl/source/mem_obj/image.h"
 
 namespace NEO {
+void cachelineFlushMemory(char *ptr, size_t size) {
+    const auto lastPtr = ptr + size;
+    while (ptr < lastPtr) {
+        CpuIntrinsics::clFlushOpt(ptr);
+        ptr += MemoryConstants::cacheLineSize;
+    }
+    CpuIntrinsics::sfence();
+}
+
 void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferProperties, EventsRequest &eventsRequest, cl_int &retVal) {
     MapInfo unmapInfo;
     Event *outEventObj = nullptr;
@@ -27,14 +38,16 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
     EventBuilder eventBuilder;
     bool eventCompleted = false;
     bool mapOperation = transferProperties.cmdType == CL_COMMAND_MAP_BUFFER || transferProperties.cmdType == CL_COMMAND_MAP_IMAGE;
+
     ErrorCodeHelper err(&retVal, CL_SUCCESS);
 
     if (mapOperation) {
         returnPtr = ptrOffset(transferProperties.memObj->getCpuAddressForMapping(),
-                              transferProperties.memObj->calculateOffsetForMapping(transferProperties.offset) + transferProperties.mipPtrOffset);
+                              transferProperties.memObj->calculateOffsetForMapping(transferProperties.offset, transferProperties.mipLevel) + transferProperties.mipPtrOffset);
 
-        if (!transferProperties.memObj->addMappedPtr(returnPtr, transferProperties.memObj->calculateMappedPtrLength(transferProperties.size),
-                                                     transferProperties.mapFlags, transferProperties.size, transferProperties.offset, transferProperties.mipLevel, nullptr)) {
+        auto graphicsAllocationForMap = transferProperties.memObj->getGraphicsAllocation(getDevice().getRootDeviceIndex());
+        if (!transferProperties.memObj->addMappedPtr(returnPtr, transferProperties.memObj->calculateMappedPtrLength(transferProperties.size, transferProperties.mipLevel),
+                                                     transferProperties.mapFlags, transferProperties.size, transferProperties.offset, transferProperties.mipLevel, graphicsAllocationForMap)) {
             err.set(CL_INVALID_OPERATION);
             return nullptr;
         }
@@ -45,8 +58,18 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
         }
         transferProperties.memObj->removeMappedPtr(unmapInfo.ptr);
     }
+    auto blockQueue = false;
+    TaskCountType taskLevel = 0u;
+    TakeOwnershipWrapper<CommandQueue> queueOwnership(*this);
+    auto commandStreamReceiverOwnership = getGpgpuCommandStreamReceiver().obtainUniqueOwnership();
+    obtainTaskLevelAndBlockedStatus(taskLevel, eventsRequest.numEventsInWaitList, eventsRequest.eventWaitList, blockQueue, transferProperties.cmdType);
+    bool isMarkerRequiredForEventSignal = !blockQueue &&
+                                          !transferProperties.blocking &&
+                                          !transferProperties.finishRequired &&
+                                          !isOOQEnabled() &&
+                                          eventsRequest.outEvent != nullptr;
 
-    if (eventsRequest.outEvent) {
+    if (eventsRequest.outEvent && !isMarkerRequiredForEventSignal) {
         eventBuilder.create<Event>(this, transferProperties.cmdType, CompletionStamp::notReady, CompletionStamp::notReady);
         outEventObj = eventBuilder.getEvent();
         outEventObj->setQueueTimeStamp();
@@ -54,14 +77,7 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
         *eventsRequest.outEvent = outEventObj;
     }
 
-    TakeOwnershipWrapper<CommandQueue> queueOwnership(*this);
-    auto commandStreamReceiverOwnership = getGpgpuCommandStreamReceiver().obtainUniqueOwnership();
-
-    auto blockQueue = false;
-    TaskCountType taskLevel = 0u;
-    obtainTaskLevelAndBlockedStatus(taskLevel, eventsRequest.numEventsInWaitList, eventsRequest.eventWaitList, blockQueue, transferProperties.cmdType);
-
-    DBG_LOG(LogTaskCounts, __FUNCTION__, "taskLevel", taskLevel);
+    DBG_LOG(LogTaskCounts, NEO_FUNCTION_NAME, "taskLevel", taskLevel);
 
     if (outEventObj) {
         outEventObj->taskLevel = taskLevel;
@@ -74,16 +90,17 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
         // Pass size and offset only. Unblocked command will call transferData(size, offset) method
         enqueueBlockedMapUnmapOperation(eventsRequest.eventWaitList,
                                         static_cast<size_t>(eventsRequest.numEventsInWaitList),
-                                        mapOperation ? MAP : UNMAP,
+                                        mapOperation ? MapOperationType::map : MapOperationType::unmap,
                                         transferProperties.memObj,
                                         mapOperation ? transferProperties.size : unmapInfo.size,
                                         mapOperation ? transferProperties.offset : unmapInfo.offset,
                                         mapOperation ? transferProperties.mapFlags == CL_MAP_READ : unmapInfo.readOnly,
                                         eventBuilder);
     }
-
-    commandStreamReceiverOwnership.unlock();
-    queueOwnership.unlock();
+    if (!isMarkerRequiredForEventSignal) {
+        commandStreamReceiverOwnership.unlock();
+        queueOwnership.unlock();
+    }
 
     // read/write buffers are always blocking
     if (!blockQueue || transferProperties.blocking) {
@@ -93,12 +110,15 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
         if (outEventObj) {
             outEventObj->setSubmitTimeStamp();
         }
-        // wait for the completness of previous commands
-        if (transferProperties.cmdType != CL_COMMAND_UNMAP_MEM_OBJECT) {
-            if (!transferProperties.memObj->isMemObjZeroCopy() || transferProperties.blocking) {
-                finish();
-                eventCompleted = true;
+        // wait for the completeness of previous commands
+        if (transferProperties.finishRequired) {
+            auto ret = finish(true);
+
+            if (ret != CL_SUCCESS) {
+                err.set(ret);
+                return nullptr;
             }
+            eventCompleted = true;
         }
 
         if (outEventObj) {
@@ -113,6 +133,8 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
                     transferProperties.memObj->transferDataToHostPtr(transferProperties.size, transferProperties.offset);
                 }
                 eventCompleted = true;
+            } else if (debugManager.flags.AllowZeroCopyWithoutCoherency.get() == 1) {
+                cachelineFlushMemory(static_cast<char *>(transferProperties.getCpuPtrForReadWrite()), transferProperties.size[0]);
             }
             break;
         case CL_COMMAND_MAP_IMAGE:
@@ -129,6 +151,8 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
                     transferProperties.memObj->transferDataFromHostPtr(unmapInfo.size, unmapInfo.offset);
                 }
                 eventCompleted = true;
+            } else if (debugManager.flags.AllowZeroCopyWithoutCoherency.get() == 1) {
+                cachelineFlushMemory(static_cast<char *>(transferProperties.getCpuPtrForReadWrite()), transferProperties.memObj->getSize());
             }
             if (!unmapInfo.readOnly) {
                 modifySimulationFlags = true;
@@ -158,6 +182,12 @@ void *CommandQueue::cpuDataTransferHandler(TransferProperties &transferPropertie
             } else {
                 outEventObj->updateExecutionStatus();
             }
+        } else if (isMarkerRequiredForEventSignal) {
+            enqueueMarkerWithWaitList(0, nullptr, eventsRequest.outEvent);
+            commandStreamReceiverOwnership.unlock();
+            queueOwnership.unlock();
+            outEventObj = castToObject<Event>(*eventsRequest.outEvent);
+            outEventObj->setCmdType(transferProperties.cmdType);
         }
         if (modifySimulationFlags) {
             auto graphicsAllocation = transferProperties.memObj->getGraphicsAllocation(getDevice().getRootDeviceIndex());

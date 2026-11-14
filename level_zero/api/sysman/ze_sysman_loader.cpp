@@ -1,80 +1,66 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/os_interface/debug_env_reader.h"
-
-#include "level_zero/source/inc/ze_intel_gpu.h"
+#include "level_zero/ddi/ze_ddi_tables.h"
 #include <level_zero/ze_api.h>
-#include <level_zero/ze_ddi.h>
-#include <level_zero/zes_api.h>
 #include <level_zero/zes_ddi.h>
-#include <level_zero/zet_api.h>
-#include <level_zero/zet_ddi.h>
-
-#include "ze_ddi_tables.h"
-#include "zes_sysman_all_api_entrypoints.h"
-
-extern ze_gpu_driver_dditable_t driverDdiTable;
 
 ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetDeviceProcAddrTable(
     ze_api_version_t version,
     zes_device_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesDeviceGetProperties;
-    pDdiTable->pfnGetState = L0::zesDeviceGetState;
-    pDdiTable->pfnReset = L0::zesDeviceReset;
-    pDdiTable->pfnProcessesGetState = L0::zesDeviceProcessesGetState;
-    pDdiTable->pfnPciGetProperties = L0::zesDevicePciGetProperties;
-    pDdiTable->pfnPciGetState = L0::zesDevicePciGetState;
-    pDdiTable->pfnPciGetBars = L0::zesDevicePciGetBars;
-    pDdiTable->pfnPciGetStats = L0::zesDevicePciGetStats;
-    pDdiTable->pfnEnumDiagnosticTestSuites = L0::zesDeviceEnumDiagnosticTestSuites;
-    pDdiTable->pfnEnumEngineGroups = L0::zesDeviceEnumEngineGroups;
-    pDdiTable->pfnEventRegister = L0::zesDeviceEventRegister;
-    pDdiTable->pfnEnumFabricPorts = L0::zesDeviceEnumFabricPorts;
-    pDdiTable->pfnEnumFans = L0::zesDeviceEnumFans;
-    pDdiTable->pfnEnumFirmwares = L0::zesDeviceEnumFirmwares;
-    pDdiTable->pfnEnumFrequencyDomains = L0::zesDeviceEnumFrequencyDomains;
-    pDdiTable->pfnEnumLeds = L0::zesDeviceEnumLeds;
-    pDdiTable->pfnEnumMemoryModules = L0::zesDeviceEnumMemoryModules;
-    pDdiTable->pfnEnumPerformanceFactorDomains = L0::zesDeviceEnumPerformanceFactorDomains;
-    pDdiTable->pfnEnumPowerDomains = L0::zesDeviceEnumPowerDomains;
-    pDdiTable->pfnGetCardPowerDomain = L0::zesDeviceGetCardPowerDomain;
-    pDdiTable->pfnEnumPsus = L0::zesDeviceEnumPsus;
-    pDdiTable->pfnEnumRasErrorSets = L0::zesDeviceEnumRasErrorSets;
-    pDdiTable->pfnEnumSchedulers = L0::zesDeviceEnumSchedulers;
-    pDdiTable->pfnEnumStandbyDomains = L0::zesDeviceEnumStandbyDomains;
-    pDdiTable->pfnEnumTemperatureSensors = L0::zesDeviceEnumTemperatureSensors;
-    pDdiTable->pfnEccAvailable = L0::zesDeviceEccAvailable;
-    pDdiTable->pfnEccConfigurable = L0::zesDeviceEccConfigurable;
-    pDdiTable->pfnGetEccState = L0::zesDeviceGetEccState;
-    pDdiTable->pfnSetEccState = L0::zesDeviceSetEccState;
-    pDdiTable->pfnGet = L0::zesDeviceGet;
-    pDdiTable->pfnSetOverclockWaiver = L0::zesDeviceSetOverclockWaiver;
-    pDdiTable->pfnGetOverclockDomains = L0::zesDeviceGetOverclockDomains;
-    pDdiTable->pfnGetOverclockControls = L0::zesDeviceGetOverclockControls;
-    pDdiTable->pfnResetOverclockSettings = L0::zesDeviceResetOverclockSettings;
-    pDdiTable->pfnReadOverclockState = L0::zesDeviceReadOverclockState;
-    pDdiTable->pfnEnumOverclockDomains = L0::zesDeviceEnumOverclockDomains;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanDevice.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanDevice.pfnGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnReset, L0::globalDriverDispatch.sysmanDevice.pfnReset, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnProcessesGetState, L0::globalDriverDispatch.sysmanDevice.pfnProcessesGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnPciGetProperties, L0::globalDriverDispatch.sysmanDevice.pfnPciGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnPciGetState, L0::globalDriverDispatch.sysmanDevice.pfnPciGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnPciGetBars, L0::globalDriverDispatch.sysmanDevice.pfnPciGetBars, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnPciGetStats, L0::globalDriverDispatch.sysmanDevice.pfnPciGetStats, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumDiagnosticTestSuites, L0::globalDriverDispatch.sysmanDevice.pfnEnumDiagnosticTestSuites, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumEngineGroups, L0::globalDriverDispatch.sysmanDevice.pfnEnumEngineGroups, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEventRegister, L0::globalDriverDispatch.sysmanDevice.pfnEventRegister, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumFabricPorts, L0::globalDriverDispatch.sysmanDevice.pfnEnumFabricPorts, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumFans, L0::globalDriverDispatch.sysmanDevice.pfnEnumFans, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumFirmwares, L0::globalDriverDispatch.sysmanDevice.pfnEnumFirmwares, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumFrequencyDomains, L0::globalDriverDispatch.sysmanDevice.pfnEnumFrequencyDomains, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumLeds, L0::globalDriverDispatch.sysmanDevice.pfnEnumLeds, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumMemoryModules, L0::globalDriverDispatch.sysmanDevice.pfnEnumMemoryModules, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumPerformanceFactorDomains, L0::globalDriverDispatch.sysmanDevice.pfnEnumPerformanceFactorDomains, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumPowerDomains, L0::globalDriverDispatch.sysmanDevice.pfnEnumPowerDomains, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumPsus, L0::globalDriverDispatch.sysmanDevice.pfnEnumPsus, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumRasErrorSets, L0::globalDriverDispatch.sysmanDevice.pfnEnumRasErrorSets, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumSchedulers, L0::globalDriverDispatch.sysmanDevice.pfnEnumSchedulers, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumStandbyDomains, L0::globalDriverDispatch.sysmanDevice.pfnEnumStandbyDomains, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEnumTemperatureSensors, L0::globalDriverDispatch.sysmanDevice.pfnEnumTemperatureSensors, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetCardPowerDomain, L0::globalDriverDispatch.sysmanDevice.pfnGetCardPowerDomain, version, ZE_API_VERSION_1_3);
+    fillDdiEntry(pDdiTable->pfnEccAvailable, L0::globalDriverDispatch.sysmanDevice.pfnEccAvailable, version, ZE_API_VERSION_1_4);
+    fillDdiEntry(pDdiTable->pfnEccConfigurable, L0::globalDriverDispatch.sysmanDevice.pfnEccConfigurable, version, ZE_API_VERSION_1_4);
+    fillDdiEntry(pDdiTable->pfnGetEccState, L0::globalDriverDispatch.sysmanDevice.pfnGetEccState, version, ZE_API_VERSION_1_4);
+    fillDdiEntry(pDdiTable->pfnSetEccState, L0::globalDriverDispatch.sysmanDevice.pfnSetEccState, version, ZE_API_VERSION_1_4);
+    fillDdiEntry(pDdiTable->pfnGet, L0::globalDriverDispatch.sysmanDevice.pfnGet, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnSetOverclockWaiver, L0::globalDriverDispatch.sysmanDevice.pfnSetOverclockWaiver, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetOverclockDomains, L0::globalDriverDispatch.sysmanDevice.pfnGetOverclockDomains, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetOverclockControls, L0::globalDriverDispatch.sysmanDevice.pfnGetOverclockControls, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnResetOverclockSettings, L0::globalDriverDispatch.sysmanDevice.pfnResetOverclockSettings, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnReadOverclockState, L0::globalDriverDispatch.sysmanDevice.pfnReadOverclockState, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnEnumOverclockDomains, L0::globalDriverDispatch.sysmanDevice.pfnEnumOverclockDomains, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnResetExt, L0::globalDriverDispatch.sysmanDevice.pfnResetExt, version, ZE_API_VERSION_1_7);
+    fillDdiEntry(pDdiTable->pfnPciLinkSpeedUpdateExt, L0::globalDriverDispatch.sysmanDevice.pfnPciLinkSpeedUpdateExt, version, ZE_API_VERSION_1_15);
+    fillDdiEntry(pDdiTable->pfnGetHealthStatusExt, L0::globalDriverDispatch.sysmanDevice.pfnGetHealthStatusExt, version, ZE_API_VERSION_1_18);
+    fillDdiEntry(pDdiTable->pfnSetHealthStatusExt, L0::globalDriverDispatch.sysmanDevice.pfnSetHealthStatusExt, version, ZE_API_VERSION_1_18);
 
     return result;
 }
@@ -83,21 +69,15 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetGlobalProcAddrTable(
     ze_api_version_t version,
     zes_global_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-    pDdiTable->pfnInit = L0::zesInit;
+    fillDdiEntry(pDdiTable->pfnInit, L0::globalDriverDispatch.sysmanGlobal.pfnInit, version, ZE_API_VERSION_1_5);
 
     return result;
 }
@@ -106,25 +86,24 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetDriverProcAddrTable(
     ze_api_version_t version,
     zes_driver_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnEventListen = L0::zesDriverEventListen;
-    pDdiTable->pfnEventListenEx = L0::zesDriverEventListenEx;
-    pDdiTable->pfnGet = L0::zesDriverGet;
-
+    fillDdiEntry(pDdiTable->pfnEventListen, L0::globalDriverDispatch.sysmanDriver.pfnEventListen, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnEventListenEx, L0::globalDriverDispatch.sysmanDriver.pfnEventListenEx, version, ZE_API_VERSION_1_1);
+    fillDdiEntry(pDdiTable->pfnGet, L0::globalDriverDispatch.sysmanDriver.pfnGet, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetExtensionProperties, L0::globalDriverDispatch.sysmanDriver.pfnGetExtensionProperties, version, ZE_API_VERSION_1_8);
+    fillDdiEntry(pDdiTable->pfnGetExtensionFunctionAddress, L0::globalDriverDispatch.sysmanDriver.pfnGetExtensionFunctionAddress, version, ZE_API_VERSION_1_8);
+    fillDdiEntry(pDdiTable->pfnEventRegisterExt, L0::globalDriverDispatch.sysmanDriver.pfnEventRegisterExt, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnEventListenExt, L0::globalDriverDispatch.sysmanDriver.pfnEventListenExt, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnEnumInfoLogsExt, L0::globalDriverDispatch.sysmanDriver.pfnEnumInfoLogsExt, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanDriver.pfnGetProperties, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnGetPciDeviceProperties, L0::globalDriverDispatch.sysmanDriver.pfnGetPciDeviceProperties, version, ZE_API_VERSION_1_20);
     return result;
 }
 
@@ -132,24 +111,17 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetDiagnosticsProcAddrTable(
     ze_api_version_t version,
     zes_diagnostics_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesDiagnosticsGetProperties;
-    pDdiTable->pfnGetTests = L0::zesDiagnosticsGetTests;
-    pDdiTable->pfnRunTests = L0::zesDiagnosticsRunTests;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanDiagnostics.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetTests, L0::globalDriverDispatch.sysmanDiagnostics.pfnGetTests, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnRunTests, L0::globalDriverDispatch.sysmanDiagnostics.pfnRunTests, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -158,24 +130,18 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetEngineProcAddrTable(
     ze_api_version_t version,
     zes_engine_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
 
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesEngineGetProperties;
-    pDdiTable->pfnGetActivity = L0::zesEngineGetActivity;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanEngine.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetActivity, L0::globalDriverDispatch.sysmanEngine.pfnGetActivity, version, ZE_API_VERSION_1_7);
+    fillDdiEntry(pDdiTable->pfnGetActivityExt, L0::globalDriverDispatch.sysmanEngine.pfnGetActivityExt, version, ZE_API_VERSION_1_7);
 
     return result;
 }
@@ -184,27 +150,22 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetFabricPortProcAddrTable(
     ze_api_version_t version,
     zes_fabric_port_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesFabricPortGetProperties;
-    pDdiTable->pfnGetLinkType = L0::zesFabricPortGetLinkType;
-    pDdiTable->pfnGetConfig = L0::zesFabricPortGetConfig;
-    pDdiTable->pfnSetConfig = L0::zesFabricPortSetConfig;
-    pDdiTable->pfnGetState = L0::zesFabricPortGetState;
-    pDdiTable->pfnGetThroughput = L0::zesFabricPortGetThroughput;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanFabricPort.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetLinkType, L0::globalDriverDispatch.sysmanFabricPort.pfnGetLinkType, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetConfig, L0::globalDriverDispatch.sysmanFabricPort.pfnGetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetConfig, L0::globalDriverDispatch.sysmanFabricPort.pfnSetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanFabricPort.pfnGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetThroughput, L0::globalDriverDispatch.sysmanFabricPort.pfnGetThroughput, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetFabricErrorCounters, L0::globalDriverDispatch.sysmanFabricPort.pfnGetFabricErrorCounters, version, ZE_API_VERSION_1_7);
+    fillDdiEntry(pDdiTable->pfnGetMultiPortThroughput, L0::globalDriverDispatch.sysmanFabricPort.pfnGetMultiPortThroughput, version, ZE_API_VERSION_1_7);
 
     return result;
 }
@@ -213,27 +174,20 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetFanProcAddrTable(
     ze_api_version_t version,
     zes_fan_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesFanGetProperties;
-    pDdiTable->pfnGetConfig = L0::zesFanGetConfig;
-    pDdiTable->pfnSetDefaultMode = L0::zesFanSetDefaultMode;
-    pDdiTable->pfnSetFixedSpeedMode = L0::zesFanSetFixedSpeedMode;
-    pDdiTable->pfnSetSpeedTableMode = L0::zesFanSetSpeedTableMode;
-    pDdiTable->pfnGetState = L0::zesFanGetState;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanFan.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetConfig, L0::globalDriverDispatch.sysmanFan.pfnGetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetDefaultMode, L0::globalDriverDispatch.sysmanFan.pfnSetDefaultMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetFixedSpeedMode, L0::globalDriverDispatch.sysmanFan.pfnSetFixedSpeedMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetSpeedTableMode, L0::globalDriverDispatch.sysmanFan.pfnSetSpeedTableMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanFan.pfnGetState, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -242,23 +196,18 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetFirmwareProcAddrTable(
     ze_api_version_t version,
     zes_firmware_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesFirmwareGetProperties;
-    pDdiTable->pfnFlash = L0::zesFirmwareFlash;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanFirmware.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnFlash, L0::globalDriverDispatch.sysmanFirmware.pfnFlash, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetFlashProgress, L0::globalDriverDispatch.sysmanFirmware.pfnGetFlashProgress, version, ZE_API_VERSION_1_8);
+    fillDdiEntry(pDdiTable->pfnGetConsoleLogs, L0::globalDriverDispatch.sysmanFirmware.pfnGetConsoleLogs, version, ZE_API_VERSION_1_9);
 
     return result;
 }
@@ -267,39 +216,32 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetFrequencyProcAddrTable(
     ze_api_version_t version,
     zes_frequency_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
 
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesFrequencyGetProperties;
-    pDdiTable->pfnGetAvailableClocks = L0::zesFrequencyGetAvailableClocks;
-    pDdiTable->pfnGetRange = L0::zesFrequencyGetRange;
-    pDdiTable->pfnSetRange = L0::zesFrequencySetRange;
-    pDdiTable->pfnGetState = L0::zesFrequencyGetState;
-    pDdiTable->pfnGetThrottleTime = L0::zesFrequencyGetThrottleTime;
-    pDdiTable->pfnOcGetCapabilities = L0::zesFrequencyOcGetCapabilities;
-    pDdiTable->pfnOcGetFrequencyTarget = L0::zesFrequencyOcGetFrequencyTarget;
-    pDdiTable->pfnOcSetFrequencyTarget = L0::zesFrequencyOcSetFrequencyTarget;
-    pDdiTable->pfnOcGetVoltageTarget = L0::zesFrequencyOcGetVoltageTarget;
-    pDdiTable->pfnOcSetVoltageTarget = L0::zesFrequencyOcSetVoltageTarget;
-    pDdiTable->pfnOcSetMode = L0::zesFrequencyOcSetMode;
-    pDdiTable->pfnOcGetMode = L0::zesFrequencyOcGetMode;
-    pDdiTable->pfnOcGetIccMax = L0::zesFrequencyOcGetIccMax;
-    pDdiTable->pfnOcSetIccMax = L0::zesFrequencyOcSetIccMax;
-    pDdiTable->pfnOcGetTjMax = L0::zesFrequencyOcGetTjMax;
-    pDdiTable->pfnOcSetTjMax = L0::zesFrequencyOcSetTjMax;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanFrequency.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetAvailableClocks, L0::globalDriverDispatch.sysmanFrequency.pfnGetAvailableClocks, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetRange, L0::globalDriverDispatch.sysmanFrequency.pfnGetRange, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetRange, L0::globalDriverDispatch.sysmanFrequency.pfnSetRange, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanFrequency.pfnGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetThrottleTime, L0::globalDriverDispatch.sysmanFrequency.pfnGetThrottleTime, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcGetCapabilities, L0::globalDriverDispatch.sysmanFrequency.pfnOcGetCapabilities, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcGetFrequencyTarget, L0::globalDriverDispatch.sysmanFrequency.pfnOcGetFrequencyTarget, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcSetFrequencyTarget, L0::globalDriverDispatch.sysmanFrequency.pfnOcSetFrequencyTarget, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcGetVoltageTarget, L0::globalDriverDispatch.sysmanFrequency.pfnOcGetVoltageTarget, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcSetVoltageTarget, L0::globalDriverDispatch.sysmanFrequency.pfnOcSetVoltageTarget, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcSetMode, L0::globalDriverDispatch.sysmanFrequency.pfnOcSetMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcGetMode, L0::globalDriverDispatch.sysmanFrequency.pfnOcGetMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcGetIccMax, L0::globalDriverDispatch.sysmanFrequency.pfnOcGetIccMax, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcSetIccMax, L0::globalDriverDispatch.sysmanFrequency.pfnOcSetIccMax, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcGetTjMax, L0::globalDriverDispatch.sysmanFrequency.pfnOcGetTjMax, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnOcSetTjMax, L0::globalDriverDispatch.sysmanFrequency.pfnOcSetTjMax, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -308,25 +250,18 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetLedProcAddrTable(
     ze_api_version_t version,
     zes_led_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesLedGetProperties;
-    pDdiTable->pfnGetState = L0::zesLedGetState;
-    pDdiTable->pfnSetState = L0::zesLedSetState;
-    pDdiTable->pfnSetColor = L0::zesLedSetColor;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanLed.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanLed.pfnGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetState, L0::globalDriverDispatch.sysmanLed.pfnSetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetColor, L0::globalDriverDispatch.sysmanLed.pfnSetColor, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -335,24 +270,17 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetMemoryProcAddrTable(
     ze_api_version_t version,
     zes_memory_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesMemoryGetProperties;
-    pDdiTable->pfnGetState = L0::zesMemoryGetState;
-    pDdiTable->pfnGetBandwidth = L0::zesMemoryGetBandwidth;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanMemory.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanMemory.pfnGetState, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetBandwidth, L0::globalDriverDispatch.sysmanMemory.pfnGetBandwidth, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -361,24 +289,17 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetPerformanceFactorProcAddrTable(
     ze_api_version_t version,
     zes_performance_factor_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesPerformanceFactorGetProperties;
-    pDdiTable->pfnGetConfig = L0::zesPerformanceFactorGetConfig;
-    pDdiTable->pfnSetConfig = L0::zesPerformanceFactorSetConfig;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanPerformanceFactor.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetConfig, L0::globalDriverDispatch.sysmanPerformanceFactor.pfnGetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetConfig, L0::globalDriverDispatch.sysmanPerformanceFactor.pfnSetConfig, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -387,29 +308,25 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetPowerProcAddrTable(
     ze_api_version_t version,
     zes_power_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesPowerGetProperties;
-    pDdiTable->pfnGetEnergyCounter = L0::zesPowerGetEnergyCounter;
-    pDdiTable->pfnGetLimits = L0::zesPowerGetLimits;
-    pDdiTable->pfnSetLimits = L0::zesPowerSetLimits;
-    pDdiTable->pfnGetLimitsExt = L0::zesPowerGetLimitsExt;
-    pDdiTable->pfnSetLimitsExt = L0::zesPowerSetLimitsExt;
-    pDdiTable->pfnGetEnergyThreshold = L0::zesPowerGetEnergyThreshold;
-    pDdiTable->pfnSetEnergyThreshold = L0::zesPowerSetEnergyThreshold;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanPower.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetEnergyCounter, L0::globalDriverDispatch.sysmanPower.pfnGetEnergyCounter, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetLimits, L0::globalDriverDispatch.sysmanPower.pfnGetLimits, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetLimits, L0::globalDriverDispatch.sysmanPower.pfnSetLimits, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetEnergyThreshold, L0::globalDriverDispatch.sysmanPower.pfnGetEnergyThreshold, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetEnergyThreshold, L0::globalDriverDispatch.sysmanPower.pfnSetEnergyThreshold, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetLimitsExt, L0::globalDriverDispatch.sysmanPower.pfnGetLimitsExt, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetLimitsExt, L0::globalDriverDispatch.sysmanPower.pfnSetLimitsExt, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetUsage, L0::globalDriverDispatch.sysmanPower.pfnGetUsage, version, ZE_API_VERSION_1_16);
+    fillDdiEntry(pDdiTable->pfnGetLimitsExt2, L0::globalDriverDispatch.sysmanPower.pfnGetLimitsExt2, version, ZE_API_VERSION_1_16);
+    fillDdiEntry(pDdiTable->pfnSetLimitsExt2, L0::globalDriverDispatch.sysmanPower.pfnSetLimitsExt2, version, ZE_API_VERSION_1_16);
 
     return result;
 }
@@ -418,23 +335,16 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetPsuProcAddrTable(
     ze_api_version_t version,
     zes_psu_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesPsuGetProperties;
-    pDdiTable->pfnGetState = L0::zesPsuGetState;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanPsu.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanPsu.pfnGetState, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -443,25 +353,152 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetRasProcAddrTable(
     ze_api_version_t version,
     zes_ras_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanRas.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetConfig, L0::globalDriverDispatch.sysmanRas.pfnGetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetConfig, L0::globalDriverDispatch.sysmanRas.pfnSetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanRas.pfnGetState, version, ZE_API_VERSION_1_0);
 
-    pDdiTable->pfnGetProperties = L0::zesRasGetProperties;
-    pDdiTable->pfnGetConfig = L0::zesRasGetConfig;
-    pDdiTable->pfnSetConfig = L0::zesRasSetConfig;
-    pDdiTable->pfnGetState = L0::zesRasGetState;
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL
+zesGetRasExpProcAddrTable(
+    ze_api_version_t version,
+    zes_ras_exp_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnGetStateExp, L0::globalDriverDispatch.sysmanRasExp.pfnGetStateExp, version, ZE_API_VERSION_1_7);
+    fillDdiEntry(pDdiTable->pfnClearStateExp, L0::globalDriverDispatch.sysmanRasExp.pfnClearStateExp, version, ZE_API_VERSION_1_7);
+    fillDdiEntry(pDdiTable->pfnGetSupportedCategoriesExp, L0::globalDriverDispatch.sysmanRasExp.pfnGetSupportedCategoriesExp, version, ZE_API_VERSION_1_16);
+    fillDdiEntry(pDdiTable->pfnGetStateExp2, L0::globalDriverDispatch.sysmanRasExp.pfnGetStateExp2, version, ZE_API_VERSION_1_16);
+    fillDdiEntry(pDdiTable->pfnGetConfigExp, L0::globalDriverDispatch.sysmanRasExp.pfnGetConfigExp, version, ZE_API_VERSION_1_16);
+    fillDdiEntry(pDdiTable->pfnSetConfigExp, L0::globalDriverDispatch.sysmanRasExp.pfnSetConfigExp, version, ZE_API_VERSION_1_16);
+
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL zesGetDriverExpProcAddrTable(
+    ze_api_version_t version, zes_driver_exp_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnGetDeviceByUuidExp, L0::globalDriverDispatch.sysmanDriverExp.pfnGetDeviceByUuidExp, version, ZE_API_VERSION_1_9);
+
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL
+zesGetInfoLogProcAddrTable(
+    ze_api_version_t version,
+    zes_info_log_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnGetPropertiesExt, L0::globalDriverDispatch.sysmanInfoLog.pfnGetPropertiesExt, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnCreateInstanceExt, L0::globalDriverDispatch.sysmanInfoLog.pfnCreateInstanceExt, version, ZE_API_VERSION_1_19);
+
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL
+zesGetInfoLogInstanceProcAddrTable(
+    ze_api_version_t version,
+    zes_info_log_instance_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnReadWithMetadataExt, L0::globalDriverDispatch.sysmanInfoLogInstance.pfnReadWithMetadataExt, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnPeekWithMetadataExt, L0::globalDriverDispatch.sysmanInfoLogInstance.pfnPeekWithMetadataExt, version, ZE_API_VERSION_1_19);
+    fillDdiEntry(pDdiTable->pfnDeleteExt, L0::globalDriverDispatch.sysmanInfoLogInstance.pfnDeleteExt, version, ZE_API_VERSION_1_19);
+
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL zesGetDeviceExpProcAddrTable(
+    ze_api_version_t version,
+    zes_device_exp_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnGetSubDevicePropertiesExp, L0::globalDriverDispatch.sysmanDeviceExp.pfnGetSubDevicePropertiesExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnEnumActiveVFExp, L0::globalDriverDispatch.sysmanDeviceExp.pfnEnumActiveVFExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnEnumEnabledVFExp, L0::globalDriverDispatch.sysmanDeviceExp.pfnEnumEnabledVFExp, version, ZE_API_VERSION_1_10);
+
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL
+zesGetVFManagementExpProcAddrTable(
+    ze_api_version_t version,
+    zes_vf_management_exp_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnGetVFPropertiesExp, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFPropertiesExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnGetVFMemoryUtilizationExp, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFMemoryUtilizationExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnGetVFEngineUtilizationExp, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFEngineUtilizationExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnSetVFTelemetryModeExp, L0::globalDriverDispatch.sysmanVFManagementExp.pfnSetVFTelemetryModeExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnSetVFTelemetrySamplingIntervalExp, L0::globalDriverDispatch.sysmanVFManagementExp.pfnSetVFTelemetrySamplingIntervalExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnGetVFCapabilitiesExp, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFCapabilitiesExp, version, ZE_API_VERSION_1_10);
+    fillDdiEntry(pDdiTable->pfnGetVFMemoryUtilizationExp2, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFMemoryUtilizationExp2, version, ZE_API_VERSION_1_10);
+    fillDdiEntry(pDdiTable->pfnGetVFEngineUtilizationExp2, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFEngineUtilizationExp2, version, ZE_API_VERSION_1_10);
+    fillDdiEntry(pDdiTable->pfnGetVFCapabilitiesExp2, L0::globalDriverDispatch.sysmanVFManagementExp.pfnGetVFCapabilitiesExp2, version, ZE_API_VERSION_1_12);
+
+    return result;
+}
+
+ZE_DLLEXPORT ze_result_t ZE_APICALL zesGetFirmwareExpProcAddrTable(
+    ze_api_version_t version,
+    zes_firmware_exp_dditable_t *pDdiTable) {
+    if (nullptr == pDdiTable) {
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
+        return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
+    ze_result_t result = ZE_RESULT_SUCCESS;
+
+    fillDdiEntry(pDdiTable->pfnGetSecurityVersionExp, L0::globalDriverDispatch.sysmanFirmwareExp.pfnGetSecurityVersionExp, version, ZE_API_VERSION_1_9);
+    fillDdiEntry(pDdiTable->pfnSetSecurityVersionExp, L0::globalDriverDispatch.sysmanFirmwareExp.pfnSetSecurityVersionExp, version, ZE_API_VERSION_1_9);
 
     return result;
 }
@@ -470,29 +507,22 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetSchedulerProcAddrTable(
     ze_api_version_t version,
     zes_scheduler_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesSchedulerGetProperties;
-    pDdiTable->pfnGetCurrentMode = L0::zesSchedulerGetCurrentMode;
-    pDdiTable->pfnGetTimeoutModeProperties = L0::zesSchedulerGetTimeoutModeProperties;
-    pDdiTable->pfnGetTimesliceModeProperties = L0::zesSchedulerGetTimesliceModeProperties;
-    pDdiTable->pfnSetTimeoutMode = L0::zesSchedulerSetTimeoutMode;
-    pDdiTable->pfnSetTimesliceMode = L0::zesSchedulerSetTimesliceMode;
-    pDdiTable->pfnSetExclusiveMode = L0::zesSchedulerSetExclusiveMode;
-    pDdiTable->pfnSetComputeUnitDebugMode = L0::zesSchedulerSetComputeUnitDebugMode;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanScheduler.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetCurrentMode, L0::globalDriverDispatch.sysmanScheduler.pfnGetCurrentMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetTimeoutModeProperties, L0::globalDriverDispatch.sysmanScheduler.pfnGetTimeoutModeProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetTimesliceModeProperties, L0::globalDriverDispatch.sysmanScheduler.pfnGetTimesliceModeProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetTimeoutMode, L0::globalDriverDispatch.sysmanScheduler.pfnSetTimeoutMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetTimesliceMode, L0::globalDriverDispatch.sysmanScheduler.pfnSetTimesliceMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetExclusiveMode, L0::globalDriverDispatch.sysmanScheduler.pfnSetExclusiveMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetComputeUnitDebugMode, L0::globalDriverDispatch.sysmanScheduler.pfnSetComputeUnitDebugMode, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -501,24 +531,17 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetStandbyProcAddrTable(
     ze_api_version_t version,
     zes_standby_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesStandbyGetProperties;
-    pDdiTable->pfnGetMode = L0::zesStandbyGetMode;
-    pDdiTable->pfnSetMode = L0::zesStandbySetMode;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanStandby.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetMode, L0::globalDriverDispatch.sysmanStandby.pfnGetMode, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetMode, L0::globalDriverDispatch.sysmanStandby.pfnSetMode, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -527,25 +550,18 @@ ZE_DLLEXPORT ze_result_t ZE_APICALL
 zesGetTemperatureProcAddrTable(
     ze_api_version_t version,
     zes_temperature_dditable_t *pDdiTable) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetProperties = L0::zesTemperatureGetProperties;
-    pDdiTable->pfnGetConfig = L0::zesTemperatureGetConfig;
-    pDdiTable->pfnSetConfig = L0::zesTemperatureSetConfig;
-    pDdiTable->pfnGetState = L0::zesTemperatureGetState;
+    fillDdiEntry(pDdiTable->pfnGetProperties, L0::globalDriverDispatch.sysmanTemperature.pfnGetProperties, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetConfig, L0::globalDriverDispatch.sysmanTemperature.pfnGetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnSetConfig, L0::globalDriverDispatch.sysmanTemperature.pfnSetConfig, version, ZE_API_VERSION_1_0);
+    fillDdiEntry(pDdiTable->pfnGetState, L0::globalDriverDispatch.sysmanTemperature.pfnGetState, version, ZE_API_VERSION_1_0);
 
     return result;
 }
@@ -555,30 +571,23 @@ zesGetOverclockProcAddrTable(
     ze_api_version_t version,           ///< [in] API version requested
     zes_overclock_dditable_t *pDdiTable ///< [in,out] pointer to table of DDI function pointers
 ) {
-    if (nullptr == pDdiTable)
+    if (nullptr == pDdiTable) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    if (ZE_MAJOR_VERSION(driverDdiTable.version) != ZE_MAJOR_VERSION(version) ||
-        ZE_MINOR_VERSION(driverDdiTable.version) > ZE_MINOR_VERSION(version))
+    }
+    if (ZE_MAJOR_VERSION(L0::globalDriverDispatch.sysman.version) != ZE_MAJOR_VERSION(version)) {
         return ZE_RESULT_ERROR_UNSUPPORTED_VERSION;
+    }
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    NEO::EnvironmentVariableReader envReader;
-    bool isSysManEnabled =
-        envReader.getSetting("ZES_ENABLE_SYSMAN", false);
-    if (false == isSysManEnabled) {
-        *pDdiTable = {};
-        return result;
-    }
-
-    pDdiTable->pfnGetDomainProperties = L0::zesOverclockGetDomainProperties;
-    pDdiTable->pfnGetDomainVFProperties = L0::zesOverclockGetDomainVFProperties;
-    pDdiTable->pfnGetDomainControlProperties = L0::zesOverclockGetDomainControlProperties;
-    pDdiTable->pfnGetControlCurrentValue = L0::zesOverclockGetControlCurrentValue;
-    pDdiTable->pfnGetControlPendingValue = L0::zesOverclockGetControlPendingValue;
-    pDdiTable->pfnSetControlUserValue = L0::zesOverclockSetControlUserValue;
-    pDdiTable->pfnGetControlState = L0::zesOverclockGetControlState;
-    pDdiTable->pfnGetVFPointValues = L0::zesOverclockGetVFPointValues;
-    pDdiTable->pfnSetVFPointValues = L0::zesOverclockSetVFPointValues;
+    fillDdiEntry(pDdiTable->pfnGetDomainProperties, L0::globalDriverDispatch.sysmanOverclock.pfnGetDomainProperties, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetDomainVFProperties, L0::globalDriverDispatch.sysmanOverclock.pfnGetDomainVFProperties, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetDomainControlProperties, L0::globalDriverDispatch.sysmanOverclock.pfnGetDomainControlProperties, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetControlCurrentValue, L0::globalDriverDispatch.sysmanOverclock.pfnGetControlCurrentValue, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetControlPendingValue, L0::globalDriverDispatch.sysmanOverclock.pfnGetControlPendingValue, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnSetControlUserValue, L0::globalDriverDispatch.sysmanOverclock.pfnSetControlUserValue, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetControlState, L0::globalDriverDispatch.sysmanOverclock.pfnGetControlState, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnGetVFPointValues, L0::globalDriverDispatch.sysmanOverclock.pfnGetVFPointValues, version, ZE_API_VERSION_1_5);
+    fillDdiEntry(pDdiTable->pfnSetVFPointValues, L0::globalDriverDispatch.sysmanOverclock.pfnSetVFPointValues, version, ZE_API_VERSION_1_5);
 
     return result;
 }

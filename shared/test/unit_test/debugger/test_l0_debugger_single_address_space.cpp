@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,8 @@
 
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
-#include "shared/source/helpers/definitions/command_encoder_args.h"
 #include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/fixtures/device_fixture.h"
@@ -21,7 +21,7 @@ namespace NEO {
 
 struct SingleAddressSpaceFixture : public Test<NEO::DeviceFixture> {
     void SetUp() override {
-        NEO::DebugManager.flags.DebuggerForceSbaTrackingMode.set(1);
+        NEO::debugManager.flags.DebuggerForceSbaTrackingMode.set(1);
         Test<NEO::DeviceFixture>::SetUp();
     }
 
@@ -34,7 +34,7 @@ struct SingleAddressSpaceFixture : public Test<NEO::DeviceFixture> {
 
 struct L0DebuggerBBlevelParameterizedTest : ::testing::TestWithParam<bool>, public NEO::DeviceFixture {
     void SetUp() override {
-        NEO::DebugManager.flags.DebuggerForceSbaTrackingMode.set(1);
+        NEO::debugManager.flags.DebuggerForceSbaTrackingMode.set(1);
         DeviceFixture::setUp();
     }
     void TearDown() override {
@@ -43,19 +43,23 @@ struct L0DebuggerBBlevelParameterizedTest : ::testing::TestWithParam<bool>, publ
     DebugManagerStateRestore restorer;
 };
 
-HWTEST_F(SingleAddressSpaceFixture, givenDebugFlagForceSbaTrackingModeSetWhenDebuggerIsCreatedThenItHasCorrectSingleAddressSpaceValue) {
+using PlatformsSupportingSbaTracking = IsWithinGfxCore<IGFX_GEN12_CORE, IGFX_XE3_CORE>;
+
+HWTEST2_F(SingleAddressSpaceFixture, givenDebugFlagForceSbaTrackingModeSetWhenDebuggerIsCreatedThenItHasCorrectSingleAddressSpaceValue, PlatformsSupportingSbaTracking) {
     DebugManagerStateRestore restorer;
-    NEO::DebugManager.flags.DebuggerForceSbaTrackingMode.set(1);
+    NEO::debugManager.flags.DebuggerForceSbaTrackingMode.set(1);
     auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
+    debugger->initialize();
     EXPECT_TRUE(debugger->singleAddressSpaceSbaTracking);
 
-    NEO::DebugManager.flags.DebuggerForceSbaTrackingMode.set(0);
+    NEO::debugManager.flags.DebuggerForceSbaTrackingMode.set(0);
     debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
     EXPECT_FALSE(debugger->singleAddressSpaceSbaTracking);
 }
 
-HWTEST_F(SingleAddressSpaceFixture, givenSingleAddressSpaceWhenDebuggerIsCreatedThenSbaTrackingGpuVaIsNotReserved) {
+HWTEST2_F(SingleAddressSpaceFixture, givenSingleAddressSpaceWhenDebuggerIsCreatedThenSbaTrackingGpuVaIsNotReserved, PlatformsSupportingSbaTracking) {
     auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
+    debugger->initialize();
 
     EXPECT_EQ(0u, debugger->sbaTrackingGpuVa.address);
     EXPECT_EQ(0u, debugger->sbaTrackingGpuVa.size);
@@ -69,7 +73,7 @@ HWTEST_F(SingleAddressSpaceFixture, givenSingleAddressSpaceWhenDebuggerIsCreated
         auto sbaAllocation = debugger->getSbaTrackingBuffer(engine.osContext->getContextId());
         ASSERT_NE(nullptr, sbaAllocation);
         allocations.push_back(sbaAllocation);
-        EXPECT_EQ(NEO::AllocationType::DEBUG_SBA_TRACKING_BUFFER, sbaAllocation->getAllocationType());
+        EXPECT_EQ(NEO::AllocationType::debugSbaTrackingBuffer, sbaAllocation->getAllocationType());
     }
 
     for (uint32_t i = 0; i < allocations.size() - 1; i++) {
@@ -77,38 +81,9 @@ HWTEST_F(SingleAddressSpaceFixture, givenSingleAddressSpaceWhenDebuggerIsCreated
     }
 }
 
-HWTEST2_F(SingleAddressSpaceFixture, WhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenAbortIsCalledAndNoCommandsAreAddedToStream, IsAtMostGen11) {
+HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenNonZeroSbaAddressesWhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenCorrectSequenceOfCommandsAreAddedToStream, PlatformsSupportingSbaTracking) {
     auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
-    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
-    using MI_ARB_CHECK = typename FamilyType::MI_ARB_CHECK;
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
-    using MI_MATH = typename FamilyType::MI_MATH;
-
-    StackVec<char, 4096> buffer(4096);
-    NEO::LinearStream cmdStream(buffer.begin(), buffer.size());
-    uint64_t gsba = 0x60000;
-    uint64_t ssba = 0x1234567000;
-    uint64_t iba = 0xfff80000;
-    uint64_t ioba = 0x8100000;
-    uint64_t dsba = 0xffff0000aaaa0000;
-
-    NEO::Debugger::SbaAddresses sbaAddresses = {};
-    sbaAddresses.generalStateBaseAddress = gsba;
-    sbaAddresses.surfaceStateBaseAddress = ssba;
-    sbaAddresses.instructionBaseAddress = iba;
-    sbaAddresses.indirectObjectBaseAddress = ioba;
-    sbaAddresses.dynamicStateBaseAddress = dsba;
-    sbaAddresses.bindlessSurfaceStateBaseAddress = ssba;
-
-    EXPECT_THROW(debugger->programSbaTrackingCommandsSingleAddressSpace(cmdStream, sbaAddresses, false), std::exception);
-
-    EXPECT_EQ(0u, cmdStream.getUsed());
-    EXPECT_THROW(debugger->getSbaTrackingCommandsSize(6), std::exception);
-}
-
-HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenNonZeroSbaAddressesWhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenCorrectSequenceOfCommandsAreAddedToStream, IsAtLeastGen12lp) {
-    auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
+    debugger->initialize();
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
     using MI_ARB_CHECK = typename FamilyType::MI_ARB_CHECK;
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
@@ -119,7 +94,7 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenNonZeroSbaAddressesWhenProgra
     AllocationProperties commandBufferProperties = {pDevice->getRootDeviceIndex(),
                                                     true,
                                                     MemoryConstants::pageSize,
-                                                    AllocationType::COMMAND_BUFFER,
+                                                    AllocationType::commandBuffer,
                                                     false,
                                                     pDevice->getDeviceBitfield()};
     auto streamAllocation = pDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(commandBufferProperties);
@@ -146,21 +121,21 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenNonZeroSbaAddressesWhenProgra
     debugger->programSbaTrackingCommandsSingleAddressSpace(cmdStream, sbaAddresses, GetParam());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
 
-    size_t sizeExpected = EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{}) + sizeof(MI_BATCH_BUFFER_START);
+    size_t sizeExpected = EncodeMiArbCheck<FamilyType>::getCommandSize() + sizeof(MI_BATCH_BUFFER_START);
 
     for (int i = 0; i < 6; i++) {
         sizeExpected += NEO::EncodeSetMMIO<FamilyType>::sizeIMM;
         sizeExpected += NEO::EncodeMath<FamilyType>::streamCommandSize;
         sizeExpected += 2 * sizeof(MI_STORE_REGISTER_MEM);
         sizeExpected += 2 * sizeof(MI_STORE_DATA_IMM);
-        sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{});
+        sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSize();
         sizeExpected += sizeof(MI_BATCH_BUFFER_START);
         sizeExpected += sizeof(MI_STORE_DATA_IMM);
     }
 
-    sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{}) + sizeof(MI_BATCH_BUFFER_START);
+    sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSize() + sizeof(MI_BATCH_BUFFER_START);
 
     EXPECT_EQ(sizeExpected, cmdStream.getUsed());
 
@@ -179,7 +154,7 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenNonZeroSbaAddressesWhenProgra
         ASSERT_NE(cmdList.end(), itor);
 
         auto lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(*itor);
-        EXPECT_EQ(CS_GPR_R0, lri->getRegisterOffset());
+        EXPECT_EQ(RegisterOffsets::csGprR13, lri->getRegisterOffset());
 
         itor = find<MI_MATH *>(itor, cmdList.end());
         ASSERT_NE(cmdList.end(), itor);
@@ -227,8 +202,9 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenNonZeroSbaAddressesWhenProgra
     pDevice->getMemoryManager()->freeGraphicsMemory(streamAllocation);
 }
 
-HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenOneNonZeroSbaAddressesWhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenONlyPartOfCommandsAreAddedToStream, IsAtLeastGen12lp) {
+HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenOneNonZeroSbaAddressesWhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenONlyPartOfCommandsAreAddedToStream, PlatformsSupportingSbaTracking) {
     auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
+    debugger->initialize();
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
     using MI_ARB_CHECK = typename FamilyType::MI_ARB_CHECK;
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
@@ -239,7 +215,7 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenOneNonZeroSbaAddressesWhenPro
     AllocationProperties commandBufferProperties = {pDevice->getRootDeviceIndex(),
                                                     true,
                                                     MemoryConstants::pageSize,
-                                                    AllocationType::COMMAND_BUFFER,
+                                                    AllocationType::commandBuffer,
                                                     false,
                                                     pDevice->getDeviceBitfield()};
     auto streamAllocation = pDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(commandBufferProperties);
@@ -258,19 +234,19 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenOneNonZeroSbaAddressesWhenPro
     debugger->captureStateBaseAddress(cmdStream, sbaAddresses, GetParam());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
 
-    size_t sizeExpected = EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{}) + sizeof(MI_BATCH_BUFFER_START);
+    size_t sizeExpected = EncodeMiArbCheck<FamilyType>::getCommandSize() + sizeof(MI_BATCH_BUFFER_START);
 
     sizeExpected += NEO::EncodeSetMMIO<FamilyType>::sizeIMM;
     sizeExpected += NEO::EncodeMath<FamilyType>::streamCommandSize;
     sizeExpected += 2 * sizeof(MI_STORE_REGISTER_MEM);
     sizeExpected += 2 * sizeof(MI_STORE_DATA_IMM);
-    sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{});
+    sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSize();
     sizeExpected += sizeof(MI_BATCH_BUFFER_START);
     sizeExpected += sizeof(MI_STORE_DATA_IMM);
 
-    sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSizeWithWa(EncodeDummyBlitWaArgs{}) + sizeof(MI_BATCH_BUFFER_START);
+    sizeExpected += EncodeMiArbCheck<FamilyType>::getCommandSize() + sizeof(MI_BATCH_BUFFER_START);
 
     EXPECT_EQ(sizeExpected, cmdStream.getUsed());
     EXPECT_EQ(sizeExpected, debugger->getSbaTrackingCommandsSize(1));
@@ -287,7 +263,7 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenOneNonZeroSbaAddressesWhenPro
     ASSERT_NE(cmdList.end(), itor);
 
     auto lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(*itor);
-    EXPECT_EQ(CS_GPR_R0, lri->getRegisterOffset());
+    EXPECT_EQ(RegisterOffsets::csGprR13, lri->getRegisterOffset());
 
     itor = find<MI_MATH *>(itor, cmdList.end());
     ASSERT_NE(cmdList.end(), itor);
@@ -338,14 +314,74 @@ HWTEST2_P(L0DebuggerBBlevelParameterizedTest, GivenOneNonZeroSbaAddressesWhenPro
     pDevice->getMemoryManager()->freeGraphicsMemory(streamAllocation);
 }
 
-INSTANTIATE_TEST_CASE_P(BBLevelForSbaTracking, L0DebuggerBBlevelParameterizedTest, ::testing::Values(false, true));
-
-HWTEST2_F(SingleAddressSpaceFixture, GivenAllZeroSbaAddressesWhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenNoCommandsAreAddedToStream, IsAtLeastGen12lp) {
+HWTEST2_P(L0DebuggerBBlevelParameterizedTest, givenSingleAddressSpaceSbaTrackingWhenProgrammingCommandsThenScratchGprsAvoidGpr0AndGpr1, PlatformsSupportingSbaTracking) {
     auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
+    debugger->initialize();
+    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+
     AllocationProperties commandBufferProperties = {pDevice->getRootDeviceIndex(),
                                                     true,
                                                     MemoryConstants::pageSize,
-                                                    AllocationType::COMMAND_BUFFER,
+                                                    AllocationType::commandBuffer,
+                                                    false,
+                                                    pDevice->getDeviceBitfield()};
+    auto streamAllocation = pDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(commandBufferProperties);
+    ASSERT_NE(nullptr, streamAllocation);
+
+    NEO::LinearStream cmdStream;
+    cmdStream.replaceGraphicsAllocation(streamAllocation);
+    cmdStream.replaceBuffer(streamAllocation->getUnderlyingBuffer(), streamAllocation->getUnderlyingBufferSize());
+
+    NEO::Debugger::SbaAddresses sbaAddresses = {};
+    sbaAddresses.generalStateBaseAddress = 0x60000;
+    sbaAddresses.surfaceStateBaseAddress = 0x1234567000;
+    sbaAddresses.instructionBaseAddress = 0xfff80000;
+    sbaAddresses.indirectObjectBaseAddress = 0x8100000;
+    sbaAddresses.dynamicStateBaseAddress = 0xffff0000aaaa0000;
+    sbaAddresses.bindlessSurfaceStateBaseAddress = 0x1234567000;
+
+    debugger->programSbaTrackingCommandsSingleAddressSpace(cmdStream, sbaAddresses, GetParam());
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream.getCpuBase(), cmdStream.getUsed()));
+
+    // The Direct Submission relaxed-ordering scheduler keeps GPR0-GPR11 live across task dispatch
+    // and reads its indirect MI_BATCH_BUFFER_START target from GPR0, so the debugger must not use
+    // GPR0/GPR1 as scratch. Verify GPR13/GPR14 are used instead and GPR0/GPR1 are never referenced.
+    auto lriList = findAll<MI_LOAD_REGISTER_IMM *>(cmdList.begin(), cmdList.end());
+    ASSERT_FALSE(lriList.empty());
+    for (auto &it : lriList) {
+        auto lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(*it);
+        EXPECT_EQ(RegisterOffsets::csGprR13, lri->getRegisterOffset());
+        EXPECT_NE(RegisterOffsets::csGprR0, lri->getRegisterOffset());
+        EXPECT_NE(RegisterOffsets::csGprR1, lri->getRegisterOffset());
+    }
+
+    auto srmList = findAll<MI_STORE_REGISTER_MEM *>(cmdList.begin(), cmdList.end());
+    ASSERT_FALSE(srmList.empty());
+    for (auto &it : srmList) {
+        auto srm = genCmdCast<MI_STORE_REGISTER_MEM *>(*it);
+        const auto registerAddress = srm->getRegisterAddress();
+        EXPECT_TRUE(registerAddress == RegisterOffsets::csGprR14 || registerAddress == RegisterOffsets::csGprR14 + 4);
+        EXPECT_NE(RegisterOffsets::csGprR0, registerAddress);
+        EXPECT_NE(RegisterOffsets::csGprR0 + 4, registerAddress);
+        EXPECT_NE(RegisterOffsets::csGprR1, registerAddress);
+        EXPECT_NE(RegisterOffsets::csGprR1 + 4, registerAddress);
+    }
+
+    pDevice->getMemoryManager()->freeGraphicsMemory(streamAllocation);
+}
+
+INSTANTIATE_TEST_SUITE_P(BBLevelForSbaTracking, L0DebuggerBBlevelParameterizedTest, ::testing::Values(false, true));
+
+HWTEST2_F(SingleAddressSpaceFixture, GivenAllZeroSbaAddressesWhenProgrammingSbaTrackingCommandsForSingleAddressSpaceThenNoCommandsAreAddedToStream, PlatformsSupportingSbaTracking) {
+    auto debugger = std::make_unique<MockDebuggerL0Hw<FamilyType>>(pDevice);
+    debugger->initialize();
+    AllocationProperties commandBufferProperties = {pDevice->getRootDeviceIndex(),
+                                                    true,
+                                                    MemoryConstants::pageSize,
+                                                    AllocationType::commandBuffer,
                                                     false,
                                                     pDevice->getDeviceBitfield()};
     auto streamAllocation = pDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(commandBufferProperties);

@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/array_count.h"
+#include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/test_macros/hw_test.h"
@@ -14,10 +15,9 @@
 #include "opencl/source/helpers/hardware_commands_helper.h"
 #include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
 #include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_kernel_fixture.h"
 #include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
-#include "opencl/test/unit_test/fixtures/hello_world_kernel_fixture.h"
-#include "opencl/test/unit_test/fixtures/simple_arg_kernel_fixture.h"
 #include "opencl/test/unit_test/indirect_heap/indirect_heap_fixture.h"
 
 using namespace NEO;
@@ -61,7 +61,7 @@ struct Gen12AubScratchSpaceForPrivateFixture : public KernelAUBFixture<SimpleKer
             sumEven += (i + valEven);
         }
 
-        dstBuffer = alignedMalloc(expectedMemorySize, 0x1000);
+        dstBuffer = clHostMemAllocINTEL(this->context, nullptr, expectedMemorySize, 0, &retVal);
         ASSERT_NE(nullptr, dstBuffer);
         memset(dstBuffer, 0, expectedMemorySize);
 
@@ -76,9 +76,12 @@ struct Gen12AubScratchSpaceForPrivateFixture : public KernelAUBFixture<SimpleKer
             }
         }
 
-        kernels[kernelIdx]->setArgSvm(0, expectedMemorySize, dstBuffer, nullptr, 0u);
-        dstAllocation = createHostPtrAllocationFromSvmPtr(dstBuffer, expectedMemorySize);
+        const auto svmManager = context->getSVMAllocsManager();
+        auto svmData = svmManager->getSVMAlloc(dstBuffer);
+        auto svmAllocs = &svmData->gpuAllocations;
+        auto allocId = svmData->getAllocId();
 
+        kernels[kernelIdx]->setArgSvmAlloc(0, dstBuffer, svmAllocs->getDefaultGraphicsAllocation(), allocId);
         kernels[kernelIdx]->setArgSvm(1, expectedMemorySize, srcBuffer, nullptr, 0u);
         srcAllocation = createHostPtrAllocationFromSvmPtr(srcBuffer, expectedMemorySize);
 
@@ -99,7 +102,7 @@ struct Gen12AubScratchSpaceForPrivateFixture : public KernelAUBFixture<SimpleKer
             srcBuffer = nullptr;
         }
         if (dstBuffer) {
-            alignedFree(dstBuffer);
+            clMemFreeINTEL(this->context, dstBuffer);
             dstBuffer = nullptr;
         }
 
@@ -155,19 +158,11 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, Gen12AubScratchSpaceForPrivateTest, WhenKernelUsesS
     expectMemory<FamilyType>(dstBuffer, expectedMemory, expectedMemorySize);
 }
 
-class DefaultGrfKernelFixture : public ProgramFixture {
-  public:
-    using ProgramFixture::setUp;
-
+class DefaultGrfKernelFixture {
   protected:
     void setUp(ClDevice *device, Context *context) {
-        ProgramFixture::setUp();
-
         std::string programName("simple_spill_fill_kernel");
-        createProgramFromBinary(
-            context,
-            context->getDevices(),
-            programName);
+        pProgram = createProgramFromBinaryFile(context, programName);
         ASSERT_NE(nullptr, pProgram);
 
         retVal = pProgram->build(
@@ -176,7 +171,7 @@ class DefaultGrfKernelFixture : public ProgramFixture {
         ASSERT_EQ(CL_SUCCESS, retVal);
 
         kernel.reset(Kernel::create<MockKernel>(
-            pProgram,
+            pProgram.get(),
             pProgram->getKernelInfoForKernel("spill_test"),
             *device,
             retVal));
@@ -187,11 +182,10 @@ class DefaultGrfKernelFixture : public ProgramFixture {
         if (kernel) {
             kernel.reset(nullptr);
         }
-
-        ProgramFixture::tearDown();
     }
 
     cl_int retVal = CL_SUCCESS;
+    ReleaseableObjectPtr<MockProgram> pProgram;
     std::unique_ptr<Kernel> kernel;
 };
 
@@ -320,7 +314,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, Gen12AubScratchSpaceForSpillFillTest, givenSurfaceS
         event);
     ASSERT_EQ(CL_SUCCESS, retVal);
 
-    pCmdQ->finish();
+    pCmdQ->flush();
 
     expectMemory<FamilyType>(outBuffer, expectedMemory, expectedMemorySize);
 }

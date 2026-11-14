@@ -1,13 +1,15 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/test/unit_test/fixtures/two_walker_fixture.h"
@@ -22,13 +24,13 @@ HWTEST_F(IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenTwoDiffe
     EXPECT_NE(itorWalker1, itorWalker2);
 }
 
-HWTEST2_F(IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeHpcCore) {
+HWTEST2_F(IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeCore) {
     enqueueTwoKernels<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState) {
+HWTEST2_F(IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState, IsGen12LP) {
     enqueueTwoKernels<FamilyType>();
 
     auto numCommands = getCommandsList<typename FamilyType::MEDIA_VFE_STATE>().size();
@@ -36,6 +38,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuin
 }
 
 HWTEST_F(IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipeControlIsInsertedBetweenWalkers) {
+
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.EnableL3FlushAfterPostSync.set(0);
+
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
     commandStreamReceiver.timestampPacketWriteEnabled = false;
 
@@ -63,5 +69,125 @@ HWTEST_F(IOQWithTwoWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipeC
     EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA, pipeControl->getPostSyncOperation());
     // The PC address should match the CS tag address
     EXPECT_EQ(commandStreamReceiver.getTagAllocation()->getGpuAddress(), NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*pipeControl));
-    EXPECT_EQ(1u, pipeControl->getImmediateData());
+    EXPECT_EQ(commandStreamReceiver.heaplessPrologProgrammed ? 2u : 1u, pipeControl->getImmediateData());
+}
+
+HWTEST_F(IOQWithTwoWalkers, GivenStateCacheInvalidationWaIsRequiredWhenTwoKernelsWithStatefulAccessAreEnqueuedThenPipeControlWithStateCacheInvalidationAndCsStallIsInsertedBetweenWalkers) {
+    NEO::ArgDescriptor ptrArg(NEO::ArgDescriptor::argTPointer);
+    auto &explicitArgs = const_cast<KernelDescriptor &>(pKernel->getDescriptor()).payloadMappings.explicitArgs;
+    explicitArgs.clear();
+    explicitArgs.push_back(ptrArg);
+    enqueueTwoKernels<FamilyType>();
+
+    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
+    using COMPUTE_WALKER = typename FamilyType::DefaultWalkerType;
+
+    auto walkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(2u, walkers.size());
+
+    auto itorPC = findAll<PIPE_CONTROL *>(walkers[0], walkers[1]);
+
+    PIPE_CONTROL *stateCacheInvalidationPipeControl = nullptr;
+    for (auto it : itorPC) {
+        auto pcCmd = genCmdCast<PIPE_CONTROL *>(*it);
+        if (pcCmd->getStateCacheInvalidationEnable()) {
+            stateCacheInvalidationPipeControl = pcCmd;
+            break;
+        }
+    }
+
+    const auto &releaseHelper = pClDevice->getDevice().getReleaseHelper();
+    if (releaseHelper.isStateCacheInvalidationWaRequired(false, false)) {
+        ASSERT_NE(nullptr, stateCacheInvalidationPipeControl);
+        EXPECT_TRUE(stateCacheInvalidationPipeControl->getCommandStreamerStallEnable());
+    } else {
+        EXPECT_EQ(nullptr, stateCacheInvalidationPipeControl);
+    }
+}
+
+HWTEST_F(IOQWithTwoWalkers, GivenStateCacheInvalidationWaIsRequiredWhenTwoKernelsWithoutStatefulAccessAreEnqueuedThenPipeControlWithStateCacheInvalidationIsNotInsertedBetweenWalkers) {
+    enqueueTwoKernels<FamilyType>();
+
+    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
+    using COMPUTE_WALKER = typename FamilyType::DefaultWalkerType;
+
+    auto walkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(2u, walkers.size());
+
+    auto itorPC = findAll<PIPE_CONTROL *>(walkers[0], walkers[1]);
+
+    bool foundStateCacheInvalidation = false;
+    for (auto it : itorPC) {
+        auto pcCmd = genCmdCast<PIPE_CONTROL *>(*it);
+        if (pcCmd->getStateCacheInvalidationEnable()) {
+            foundStateCacheInvalidation = true;
+            break;
+        }
+    }
+
+    EXPECT_FALSE(foundStateCacheInvalidation);
+}
+
+HWTEST_F(IOQWithTwoWalkers, GivenStateCacheInvalidationWaIsRequiredWhenTwoKernelsUsingImagesAreEnqueuedThenPipeControlWithStateCacheInvalidationAndCsStallIsInsertedBetweenWalkers) {
+    auto &kernelDescriptor = const_cast<KernelDescriptor &>(pKernel->getDescriptor());
+    kernelDescriptor.kernelAttributes.flags.usesImages = true;
+    NEO::ArgDescriptor imageArg(NEO::ArgDescriptor::argTImage);
+    imageArg.as<NEO::ArgDescImage>().bindful = 0x0;
+    auto &explicitArgs = kernelDescriptor.payloadMappings.explicitArgs;
+    explicitArgs.clear();
+    explicitArgs.push_back(imageArg);
+
+    enqueueTwoKernels<FamilyType>();
+
+    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
+    using COMPUTE_WALKER = typename FamilyType::DefaultWalkerType;
+
+    auto walkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(2u, walkers.size());
+
+    auto itorPC = findAll<PIPE_CONTROL *>(walkers[0], walkers[1]);
+
+    PIPE_CONTROL *stateCacheInvalidationPipeControl = nullptr;
+    for (auto it : itorPC) {
+        auto pcCmd = genCmdCast<PIPE_CONTROL *>(*it);
+        if (pcCmd->getStateCacheInvalidationEnable()) {
+            stateCacheInvalidationPipeControl = pcCmd;
+            break;
+        }
+    }
+
+    const auto &releaseHelper = pClDevice->getDevice().getReleaseHelper();
+    if (releaseHelper.isStateCacheInvalidationWaRequired(true, true)) {
+        ASSERT_NE(nullptr, stateCacheInvalidationPipeControl);
+        EXPECT_TRUE(stateCacheInvalidationPipeControl->getCommandStreamerStallEnable());
+    } else {
+        EXPECT_EQ(nullptr, stateCacheInvalidationPipeControl);
+    }
+}
+
+HWTEST_F(IOQWithTwoWalkers, GivenStateCacheInvalidationWaIsRequiredWhenTwoImageKernelsWithoutStatefulAccessAreEnqueuedThenPipeControlWithStateCacheInvalidationIsNotInsertedBetweenWalkers) {
+    auto &kernelDescriptor = const_cast<KernelDescriptor &>(pKernel->getDescriptor());
+    kernelDescriptor.kernelAttributes.flags.usesImages = true;
+    kernelDescriptor.payloadMappings.explicitArgs.clear();
+
+    enqueueTwoKernels<FamilyType>();
+
+    typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
+    using COMPUTE_WALKER = typename FamilyType::DefaultWalkerType;
+
+    auto walkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(2u, walkers.size());
+
+    auto itorPC = findAll<PIPE_CONTROL *>(walkers[0], walkers[1]);
+
+    bool foundStateCacheInvalidation = false;
+    for (auto it : itorPC) {
+        auto pcCmd = genCmdCast<PIPE_CONTROL *>(*it);
+        if (pcCmd->getStateCacheInvalidationEnable()) {
+            foundStateCacheInvalidation = true;
+            break;
+        }
+    }
+
+    EXPECT_FALSE(foundStateCacheInvalidation);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,11 +8,14 @@
 #pragma once
 
 #include "level_zero/tools/source/sysman/linux/nl_api/iaf_nl_api.h"
-#include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
 
 #include "fabric_device_access.h"
 
+#include <map>
+
 namespace L0 {
+class LinuxSysmanImp;
+struct OsSysman;
 
 struct Port {
     bool onSubdevice;
@@ -29,7 +32,7 @@ class FabricDeviceAccessNl : public FabricDeviceAccess {
     ~FabricDeviceAccessNl() override;
 
     ze_result_t getState(const zes_fabric_port_id_t portId, zes_fabric_port_state_t &state) override;
-    ze_result_t getThroughput(const zes_fabric_port_id_t portId, zes_fabric_port_throughput_t &througput) override;
+    ze_result_t getThroughput(const zes_fabric_port_id_t portId, zes_fabric_port_throughput_t &throughput) override;
 
     ze_result_t getPortEnabledState(const zes_fabric_port_id_t portId, bool &enabled) override;
     ze_result_t getPortBeaconState(const zes_fabric_port_id_t portId, bool &enabled) override;
@@ -45,6 +48,7 @@ class FabricDeviceAccessNl : public FabricDeviceAccess {
     ze_result_t getPorts(std::vector<zes_fabric_port_id_t> &ports) override;
     void getProperties(const zes_fabric_port_id_t portId, std::string &model, bool &onSubdevice,
                        uint32_t &subdeviceId, zes_fabric_port_speed_t &maxRxSpeed, zes_fabric_port_speed_t &maxTxSpeed) override;
+    ze_result_t getMultiPortThroughput(std::vector<zes_fabric_port_id_t> &portIdList, zes_fabric_port_throughput_t **pThroughput) override;
 
   private:
     ze_result_t init();

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,12 +14,10 @@
 #include "shared/source/os_interface/linux/cache_info.h"
 #include "shared/source/os_interface/linux/drm_wrappers.h"
 #include "shared/source/os_interface/linux/i915_prelim.h"
+#include "shared/source/os_interface/linux/numa_library.h"
 #include "shared/test/common/libult/linux/drm_mock_helper.h"
 
 #include <gtest/gtest.h>
-
-#include <cmath>
-#include <errno.h>
 
 namespace {
 
@@ -39,7 +37,7 @@ constexpr std::array<uint64_t, 9> copyEnginesCapsMap = {{
 
 int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
     switch (request) {
-    case DrmIoctl::Getparam: {
+    case DrmIoctl::getparam: {
         auto gp = static_cast<GetParam *>(arg);
         if (gp->param == PRELIM_I915_PARAM_HAS_PAGE_FAULT) {
             *gp->value = hasPageFaultQueryValue;
@@ -52,16 +50,20 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
             setPairQueryCalled++;
             *gp->value = setPairQueryValue;
             return setPairQueryReturn;
+        } else if (gp->param == PRELIM_I915_PARAM_HAS_CHUNK_SIZE) {
+            chunkingQueryCalled++;
+            *gp->value = chunkingQueryValue;
+            return chunkingQueryReturn;
         }
     } break;
-    case DrmIoctl::GemContextGetparam: {
+    case DrmIoctl::gemContextGetparam: {
         auto gp = static_cast<GemContextParam *>(arg);
         if (gp->param == PRELIM_I915_CONTEXT_PARAM_DEBUG_FLAGS) {
             gp->value = contextDebugSupported ? PRELIM_I915_CONTEXT_PARAM_DEBUG_FLAG_SIP << 32 : 0;
             return 0;
         }
     } break;
-    case DrmIoctl::GemContextCreateExt: {
+    case DrmIoctl::gemContextCreateExt: {
         auto create = static_cast<GemContextCreateExt *>(arg);
         auto setParam = reinterpret_cast<GemContextCreateExtSetParam *>(create->extensions);
         if (setParam->param.param == PRELIM_I915_CONTEXT_PARAM_ACC) {
@@ -72,12 +74,12 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         }
         return 0;
     } break;
-    case DrmIoctl::GemMmapOffset: {
+    case DrmIoctl::gemMmapOffset: {
         auto mmapArg = static_cast<GemMmapOffset *>(arg);
         mmapArg->offset = 0;
         return mmapOffsetReturn;
     } break;
-    case DrmIoctl::GemClosReserve: {
+    case DrmIoctl::gemClosReserve: {
         auto closReserveArg = static_cast<prelim_drm_i915_gem_clos_reserve *>(arg);
         closIndex++;
         if (closIndex == 0) {
@@ -86,7 +88,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         closReserveArg->clos_index = closIndex;
         return 0;
     } break;
-    case DrmIoctl::GemClosFree: {
+    case DrmIoctl::gemClosFree: {
         auto closFreeArg = static_cast<prelim_drm_i915_gem_clos_free *>(arg);
         if (closFreeArg->clos_index > closIndex) {
             return EINVAL;
@@ -94,12 +96,13 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         closIndex--;
         return 0;
     } break;
-    case DrmIoctl::GemCacheReserve: {
+    case DrmIoctl::gemCacheReserve: {
         auto cacheReserveArg = static_cast<prelim_drm_i915_gem_cache_reserve *>(arg);
         if (cacheReserveArg->clos_index > closIndex) {
             return EINVAL;
         }
-        auto maxReservationNumWays = cacheInfo ? cacheInfo->getMaxReservationNumWays() : maxNumWays;
+        const auto cacheLevel{toCacheLevel(cacheReserveArg->cache_level)};
+        auto maxReservationNumWays = cacheInfo ? cacheInfo->getMaxReservationNumWays(cacheLevel) : maxNumWays;
         if (cacheReserveArg->num_ways > maxReservationNumWays) {
             return EINVAL;
         }
@@ -110,7 +113,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         allocNumWays += cacheReserveArg->num_ways;
         return 0;
     } break;
-    case DrmIoctl::GemVmBind: {
+    case DrmIoctl::gemVmBind: {
         vmBindCalled++;
         const auto vmBind = reinterpret_cast<prelim_drm_i915_gem_vm_bind *>(arg);
         receivedVmBind = VmBindParams{
@@ -125,7 +128,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         storeVmBindExtensions(vmBind->extensions, true);
         return vmBindReturn;
     } break;
-    case DrmIoctl::GemVmUnbind: {
+    case DrmIoctl::gemVmUnbind: {
         vmUnbindCalled++;
         const auto vmBind = reinterpret_cast<prelim_drm_i915_gem_vm_bind *>(arg);
         receivedVmUnbind = VmBindParams{
@@ -140,7 +143,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         storeVmBindExtensions(vmBind->extensions, false);
         return vmUnbindReturn;
     } break;
-    case DrmIoctl::GemCreateExt: {
+    case DrmIoctl::gemCreateExt: {
         auto createExt = static_cast<prelim_drm_i915_gem_create_ext *>(arg);
         if (createExt->size == 0) {
             return EINVAL;
@@ -160,21 +163,38 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
             return EINVAL;
         }
 
+        prelim_drm_i915_gem_create_ext_setparam *pairSetparamRegion = nullptr;
+        prelim_drm_i915_gem_create_ext_setparam *chunkingSetparamRegion = nullptr;
         prelim_drm_i915_gem_create_ext_vm_private *vmPrivateExt = nullptr;
-        if (extension->base.next_extension != 0) {
-
-            prelim_drm_i915_gem_create_ext_setparam *pairSetparamRegion = nullptr;
-            pairSetparamRegion = reinterpret_cast<prelim_drm_i915_gem_create_ext_setparam *>(extension->base.next_extension);
-            if (pairSetparamRegion->base.name == PRELIM_I915_GEM_CREATE_EXT_SETPARAM) {
-                if ((pairSetparamRegion->base.name & PRELIM_I915_PARAM_SET_PAIR) == 0) {
+        prelim_drm_i915_gem_create_ext_memory_policy *memPolicyExt = nullptr;
+        void *nextExtension = reinterpret_cast<void *>(extension->base.next_extension);
+        while (nextExtension != 0) {
+            auto *setparamCandidate = reinterpret_cast<prelim_drm_i915_gem_create_ext_setparam *>(nextExtension);
+            if (setparamCandidate->base.name == PRELIM_I915_GEM_CREATE_EXT_SETPARAM) {
+                if ((setparamCandidate->param.param & PRELIM_I915_PARAM_SET_PAIR) != 0) {
+                    pairSetparamRegion = setparamCandidate;
+                } else if ((setparamCandidate->param.param & PRELIM_I915_PARAM_SET_CHUNK_SIZE) != 0) {
+                    chunkingSetparamRegion = setparamCandidate;
+                } else {
                     return EINVAL;
                 }
-            } else {
-                vmPrivateExt = reinterpret_cast<prelim_drm_i915_gem_create_ext_vm_private *>(extension->base.next_extension);
-                if (vmPrivateExt->base.name != PRELIM_I915_GEM_CREATE_EXT_VM_PRIVATE) {
-                    return EINVAL;
-                }
+                nextExtension = reinterpret_cast<void *>(setparamCandidate->base.next_extension);
+                continue;
             }
+            auto *vmPrivateCandidate = reinterpret_cast<prelim_drm_i915_gem_create_ext_vm_private *>(nextExtension);
+            if (vmPrivateCandidate->base.name == PRELIM_I915_GEM_CREATE_EXT_VM_PRIVATE) {
+                vmPrivateExt = vmPrivateCandidate;
+                nextExtension = reinterpret_cast<void *>(vmPrivateCandidate->base.next_extension);
+                continue;
+            }
+            auto *memPolicyCandidate = reinterpret_cast<prelim_drm_i915_gem_create_ext_memory_policy *>(nextExtension);
+            if (memPolicyCandidate->base.name == PRELIM_I915_GEM_CREATE_EXT_MEMORY_POLICY) {
+                memPolicyExt = memPolicyCandidate;
+                nextExtension = reinterpret_cast<void *>(memPolicyCandidate->base.next_extension);
+                continue;
+            }
+            // incorrect extension detected
+            return EINVAL;
         }
 
         auto data = reinterpret_cast<MemoryClassInstance *>(extension->param.data);
@@ -190,6 +210,20 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
             receivedCreateGemExt->vmPrivateExt = CreateGemExt::VmPrivate{vmPrivateExt->vm_id};
         }
 
+        if (memPolicyExt != nullptr) {
+            receivedCreateGemExt->memPolicyExt = CreateGemExt::MemPolicy{memPolicyExt->mode, std::vector<unsigned long>()};
+            auto *memPolicyPtr = reinterpret_cast<unsigned long *>(memPolicyExt->nodemask_ptr);
+            for (auto i = 0u; i < memPolicyExt->nodemask_max / Linux::NumaLibrary::bitsPerNodeMaskElement; i++) {
+                receivedCreateGemExt->memPolicyExt.nodeMask.value().push_back(memPolicyPtr[i]);
+            }
+        }
+        if (pairSetparamRegion != nullptr) {
+            receivedCreateGemExt->pairSetParamExt = CreateGemExt::SetParam{pairSetparamRegion->param.handle, pairSetparamRegion->param.size, pairSetparamRegion->param.param};
+        }
+        if (chunkingSetparamRegion != nullptr) {
+            receivedCreateGemExt->chunkingSetParamExt = CreateGemExt::SetParam{chunkingSetparamRegion->param.handle, chunkingSetparamRegion->param.size, chunkingSetparamRegion->param.param};
+        }
+
         receivedCreateGemExt->memoryRegions.clear();
         for (uint32_t i = 0; i < extension->param.size; i++) {
             receivedCreateGemExt->memoryRegions.push_back({data[i].memoryClass, data[i].memoryInstance});
@@ -202,7 +236,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
 
         return gemCreateExtReturn;
     } break;
-    case DrmIoctl::GemWaitUserFence: {
+    case DrmIoctl::gemWaitUserFence: {
         waitUserFenceCalled++;
         const auto wait = reinterpret_cast<prelim_drm_i915_gem_wait_user_fence *>(arg);
         receivedWaitUserFence = WaitUserFence{
@@ -217,7 +251,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         };
         return 0;
     } break;
-    case DrmIoctl::GemContextSetparam: {
+    case DrmIoctl::gemContextSetparam: {
         const auto req = reinterpret_cast<GemContextParam *>(arg);
         if (req->param == PRELIM_I915_CONTEXT_PARAM_DEBUG_FLAGS) {
             receivedSetContextParamValue = req->value;
@@ -226,7 +260,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
 
         return !contextDebugSupported ? EINVAL : 0;
     } break;
-    case DrmIoctl::GemVmAdvise: {
+    case DrmIoctl::gemVmAdvise: {
         const auto req = reinterpret_cast<prelim_drm_i915_gem_vm_advise *>(arg);
         switch (req->attribute) {
         case PRELIM_I915_VM_ADVISE_ATOMIC_NONE:
@@ -240,13 +274,13 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         }
         return vmAdviseReturn;
     } break;
-    case DrmIoctl::GemVmPrefetch: {
+    case DrmIoctl::gemVmPrefetch: {
         const auto req = static_cast<prelim_drm_i915_gem_vm_prefetch *>(arg);
         vmPrefetchCalled++;
         receivedVmPrefetch.push_back(VmPrefetch{req->vm_id, req->region});
         return 0;
     } break;
-    case DrmIoctl::UuidRegister: {
+    case DrmIoctl::uuidRegister: {
         auto uuidControl = reinterpret_cast<prelim_drm_i915_uuid_control *>(arg);
 
         if (uuidControl->uuid_class != uint32_t(PRELIM_I915_UUID_CLASS_STRING) && uuidControl->uuid_class > uuidHandle) {
@@ -267,7 +301,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         memcpy_s(receivedRegisterUuid->uuid, sizeof(receivedRegisterUuid->uuid), uuidControl->uuid, sizeof(uuidControl->uuid));
         return uuidControlReturn;
     } break;
-    case DrmIoctl::UuidUnregister: {
+    case DrmIoctl::uuidUnregister: {
         auto uuidControl = reinterpret_cast<prelim_drm_i915_uuid_control *>(arg);
         receivedUnregisterUuid = UuidControl{
             {},
@@ -282,7 +316,7 @@ int DrmMockPrelimContext::handlePrelimRequest(DrmIoctl request, void *arg) {
         return uuidControlReturn;
     } break;
 
-    case DrmIoctl::DebuggerOpen: {
+    case DrmIoctl::debuggerOpen: {
         auto debuggerOpen = reinterpret_cast<prelim_drm_i915_debugger_open_param *>(arg);
         if (debuggerOpen->pid != 0 && debuggerOpen->events == 0) {
             if (debuggerOpen->version != 0) {
@@ -399,14 +433,15 @@ bool DrmMockPrelimContext::handlePrelimQueryItem(void *arg) {
 
     case PRELIM_DRM_I915_QUERY_COMPUTE_SUBSLICES: {
         auto &gtSystemInfo = rootDeviceEnvironment.getHardwareInfo()->gtSystemInfo;
-        auto maxEuPerSubslice = gtSystemInfo.MaxEuPerSubSlice;
-        auto maxSlices = gtSystemInfo.MaxSlicesSupported;
-        auto maxSubslices = gtSystemInfo.MaxSubSlicesSupported / maxSlices;
-        auto threadsPerEu = gtSystemInfo.ThreadCount / gtSystemInfo.EUCount;
-        auto realEuCount = threadsPerEu * maxEuPerSubslice * maxSubslices * maxSlices;
+        const uint16_t subslicesPerSlice = gtSystemInfo.MaxSubSlicesSupported / gtSystemInfo.MaxSlicesSupported;
+        const uint16_t eusPerSubslice = gtSystemInfo.MaxEuPerSubSlice;
+        const uint16_t threadsPerEu = gtSystemInfo.ThreadCount / gtSystemInfo.EUCount;
+        const uint16_t subsliceOffset = static_cast<uint16_t>(Math::divideAndRoundUp(gtSystemInfo.MaxSlicesSupported, 8u));
+        const uint16_t subsliceStride = static_cast<uint16_t>(Math::divideAndRoundUp(subslicesPerSlice, 8u));
+        const uint16_t euOffset = subsliceOffset + gtSystemInfo.MaxSlicesSupported * subsliceStride;
+        const uint16_t euStride = static_cast<uint16_t>(Math::divideAndRoundUp(eusPerSubslice, 8u));
 
-        auto dataSize = static_cast<size_t>(std::ceil(realEuCount / 8.0)) + maxSlices * static_cast<uint16_t>(std::ceil(maxSubslices / 8.0)) +
-                        static_cast<uint16_t>(std::ceil(maxSlices / 8.0));
+        const uint16_t dataSize = euOffset + gtSystemInfo.MaxSubSlicesSupported * euStride;
 
         if (queryItem->length == 0) {
             queryItem->length = static_cast<int32_t>(sizeof(QueryTopologyInfo) + dataSize);
@@ -416,21 +451,20 @@ bool DrmMockPrelimContext::handlePrelimQueryItem(void *arg) {
             if (failRetTopology) {
                 return false;
             }
-            topologyArg->maxSlices = maxSlices;
-            topologyArg->maxSubslices = maxSubslices;
-            topologyArg->maxEusPerSubslice = maxEuPerSubslice;
-
-            topologyArg->subsliceStride = static_cast<uint16_t>(std::ceil(maxSubslices / 8.0));
-            topologyArg->euStride = static_cast<uint16_t>(std::ceil(maxEuPerSubslice / 8.0));
-            topologyArg->subsliceOffset = static_cast<uint16_t>(std::ceil(maxSlices / 8.0));
-            topologyArg->euOffset = static_cast<uint16_t>(std::ceil(maxSubslices / 8.0)) * maxSlices;
+            topologyArg->maxSlices = gtSystemInfo.MaxSlicesSupported;
+            topologyArg->maxSubslices = subslicesPerSlice;
+            topologyArg->maxEusPerSubslice = eusPerSubslice;
+            topologyArg->subsliceOffset = subsliceOffset;
+            topologyArg->subsliceStride = subsliceStride;
+            topologyArg->euOffset = euOffset;
+            topologyArg->euStride = euStride;
 
             int threadData = (threadsPerEu == 8) ? 0xff : 0x7f;
 
             uint8_t *data = topologyArg->data;
-            for (uint32_t sliceId = 0; sliceId < maxSlices; sliceId++) {
+            for (uint32_t sliceId = 0; sliceId < gtSystemInfo.MaxSlicesSupported; sliceId++) {
                 data[0] |= 1 << (sliceId % 8);
-                if (sliceId == 7 || sliceId == maxSlices - 1) {
+                if (((sliceId + 1) % 8) == 0 || sliceId == gtSystemInfo.MaxSlicesSupported - 1) {
                     data++;
                 }
             }
@@ -438,11 +472,11 @@ bool DrmMockPrelimContext::handlePrelimQueryItem(void *arg) {
             DEBUG_BREAK_IF(ptrDiff(data, topologyArg->data) != topologyArg->subsliceOffset);
 
             data = ptrOffset(topologyArg->data, topologyArg->subsliceOffset);
-            for (uint32_t sliceId = 0; sliceId < maxSlices; sliceId++) {
-                for (uint32_t i = 0; i < maxSubslices; i++) {
+            for (uint32_t sliceId = 0; sliceId < gtSystemInfo.MaxSlicesSupported; sliceId++) {
+                for (uint32_t i = 0; i < subslicesPerSlice; i++) {
                     data[0] |= 1 << (i % 8);
 
-                    if (i == 7 || i == maxSubslices - 1) {
+                    if (((i + 1) % 8) == 0 || i == static_cast<uint32_t>(subslicesPerSlice) - 1) {
                         data++;
                     }
                 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -120,14 +120,6 @@ static_assert(offsetof(GemWait, boHandle) == offsetof(drm_i915_gem_wait, bo_hand
 static_assert(offsetof(GemWait, flags) == offsetof(drm_i915_gem_wait, flags));
 static_assert(offsetof(GemWait, timeoutNs) == offsetof(drm_i915_gem_wait, timeout_ns));
 
-static_assert(sizeof(ResetStats) == sizeof(drm_i915_reset_stats));
-static_assert(offsetof(ResetStats, contextId) == offsetof(drm_i915_reset_stats, ctx_id));
-static_assert(offsetof(ResetStats, flags) == offsetof(drm_i915_reset_stats, flags));
-static_assert(offsetof(ResetStats, resetCount) == offsetof(drm_i915_reset_stats, reset_count));
-static_assert(offsetof(ResetStats, batchActive) == offsetof(drm_i915_reset_stats, batch_active));
-static_assert(offsetof(ResetStats, batchPending) == offsetof(drm_i915_reset_stats, batch_pending));
-static_assert(offsetof(ResetStats, reserved) == offsetof(drm_i915_reset_stats, pad));
-
 static_assert(sizeof(GetParam) == sizeof(struct drm_i915_getparam));
 static_assert(offsetof(GetParam, param) == offsetof(struct drm_i915_getparam, param));
 static_assert(offsetof(GetParam, value) == offsetof(struct drm_i915_getparam, value));
@@ -137,7 +129,7 @@ static_assert(offsetof(Query, numItems) == offsetof(struct drm_i915_query, num_i
 static_assert(offsetof(Query, flags) == offsetof(struct drm_i915_query, flags));
 static_assert(offsetof(Query, itemsPtr) == offsetof(struct drm_i915_query, items_ptr));
 
-static_assert(sizeof(GemClose) == sizeof(drm_gem_close));
+static_assert(sizeof(GemClose) >= sizeof(drm_gem_close));
 static_assert(offsetof(GemClose, handle) == offsetof(drm_gem_close, handle));
 static_assert(offsetof(GemClose, reserved) == offsetof(drm_gem_close, pad));
 
@@ -158,9 +150,10 @@ static_assert(offsetof(DrmVersion, descLen) == offsetof(drm_version, desc_len));
 static_assert(offsetof(DrmVersion, desc) == offsetof(drm_version, desc));
 
 typedef I915_DEFINE_CONTEXT_PARAM_ENGINES(I915ContextParamEngines, 3);
-static_assert(sizeof(ContextParamEngines<3>) == sizeof(I915ContextParamEngines));
+static_assert(sizeof(ContextParamEngines<3>) >= sizeof(I915ContextParamEngines));
 static_assert(offsetof(ContextParamEngines<3>, extensions) == offsetof(I915ContextParamEngines, extensions));
-static_assert(offsetof(ContextParamEngines<3>, engines) == offsetof(I915ContextParamEngines, engines));
+static_assert(offsetof(ContextParamEngines<3>, enginesData) == offsetof(I915ContextParamEngines, engines));
+static_assert(offsetof(ContextParamEngines<3>, numEnginesInContext) >= sizeof(I915ContextParamEngines)); // numEnginesInContext is not a part of I915ContextParamEngines
 
 typedef I915_DEFINE_CONTEXT_ENGINES_LOAD_BALANCE(I915ContextEnginesLoadBalance, 3);
 static_assert(sizeof(ContextEnginesLoadBalance<3>) == sizeof(I915ContextEnginesLoadBalance));

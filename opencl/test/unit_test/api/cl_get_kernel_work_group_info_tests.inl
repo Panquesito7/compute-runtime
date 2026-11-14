@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/device_binary_format/patchtokens_decoder.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/test/unit_test/fixtures/kernel_work_group_info_fixture.h"
 
@@ -14,7 +14,6 @@ using namespace NEO;
 namespace ULT {
 
 TEST_P(ClGetKernelWorkGroupInfoTests, GivenValidParametersWhenGettingKernelWorkGroupInfoThenSuccessIsReturned) {
-
     size_t paramValueSizeRet;
     auto retVal = clGetKernelWorkGroupInfo(
         kernel,
@@ -29,7 +28,6 @@ TEST_P(ClGetKernelWorkGroupInfoTests, GivenValidParametersWhenGettingKernelWorkG
 }
 
 TEST_F(ClGetKernelWorkGroupInfoTest, GivenInvalidDeviceWhenGettingWorkGroupInfoFromSingleDeviceKernelThenInvalidDeviceErrorIsReturned) {
-
     size_t paramValueSizeRet;
     auto retVal = clGetKernelWorkGroupInfo(
         pMultiDeviceKernel,
@@ -43,7 +41,6 @@ TEST_F(ClGetKernelWorkGroupInfoTest, GivenInvalidDeviceWhenGettingWorkGroupInfoF
 }
 
 TEST_F(ClGetKernelWorkGroupInfoTest, GivenNullDeviceWhenGettingWorkGroupInfoFromSingleDeviceKernelThenSuccessIsReturned) {
-
     size_t paramValueSizeRet;
     auto retVal = clGetKernelWorkGroupInfo(
         pMultiDeviceKernel,
@@ -57,7 +54,6 @@ TEST_F(ClGetKernelWorkGroupInfoTest, GivenNullDeviceWhenGettingWorkGroupInfoFrom
 }
 
 TEST_F(ClGetKernelWorkGroupInfoTest, GivenNullDeviceWhenGettingWorkGroupInfoFromMultiDeviceKernelThenInvalidDeviceErrorIsReturned) {
-
     size_t paramValueSizeRet;
     MockUnrestrictiveContext context;
     auto mockProgram = std::make_unique<MockProgram>(&context, false, context.getDevices());
@@ -74,16 +70,15 @@ TEST_F(ClGetKernelWorkGroupInfoTest, GivenNullDeviceWhenGettingWorkGroupInfoFrom
 
     EXPECT_EQ(CL_INVALID_DEVICE, retVal);
 }
-TEST_F(ClGetKernelWorkGroupInfoTests, GivenKernelRequiringScratchSpaceWhenGettingKernelWorkGroupInfoThenCorrectSpillMemSizeIsReturned) {
+
+TEST_F(ClGetKernelWorkGroupInfoTests, GivenKernelRequiringScratchSpaceForSpillWhenGettingKernelWorkGroupInfoThenCorrectSpillMemSizeIsReturned) {
     size_t paramValueSizeRet;
     cl_ulong paramValue;
     auto pDevice = castToObject<ClDevice>(testedClDevice);
 
-    MockKernelWithInternals mockKernel(*pDevice);
-    mockKernel.kernelInfo.setPerThreadScratchSize(1024, 0);
-
-    cl_ulong scratchSpaceSize = static_cast<cl_ulong>(mockKernel.mockKernel->getScratchSize());
-    EXPECT_EQ(scratchSpaceSize, 1024u);
+    MockKernelWithInternals mockKernel(*pContext);
+    auto spillMemorySize = 1024u;
+    mockKernel.kernelInfo.kernelDescriptor.kernelAttributes.spillFillScratchMemorySize = spillMemorySize;
 
     retVal = clGetKernelWorkGroupInfo(
         mockKernel.mockMultiDeviceKernel,
@@ -95,16 +90,15 @@ TEST_F(ClGetKernelWorkGroupInfoTests, GivenKernelRequiringScratchSpaceWhenGettin
 
     EXPECT_EQ(retVal, CL_SUCCESS);
     EXPECT_EQ(paramValueSizeRet, sizeof(cl_ulong));
-    EXPECT_EQ(paramValue, scratchSpaceSize);
+    EXPECT_EQ(paramValue, spillMemorySize);
 }
 
-using matcher = IsWithinProducts<IGFX_SKYLAKE, IGFX_DG1>;
-HWTEST2_F(ClGetKernelWorkGroupInfoTests, givenKernelHavingPrivateMemoryAllocationWhenAskedForPrivateAllocationSizeThenProperSizeIsReturned, matcher) {
+HWTEST2_F(ClGetKernelWorkGroupInfoTests, givenKernelHavingPrivateMemoryAllocationWhenAskedForPrivateAllocationSizeThenProperSizeIsReturned, IsGen12LP) {
     size_t paramValueSizeRet;
     cl_ulong paramValue;
     auto pDevice = castToObject<ClDevice>(testedClDevice);
 
-    MockKernelWithInternals mockKernel(*pDevice);
+    MockKernelWithInternals mockKernel(*pContext);
     mockKernel.kernelInfo.setPrivateMemory(1024, false, 0, 0, 0);
 
     retVal = clGetKernelWorkGroupInfo(
@@ -125,7 +119,7 @@ TEST_F(ClGetKernelWorkGroupInfoTests, givenKernelNotHavingPrivateMemoryAllocatio
     cl_ulong paramValue;
     auto pDevice = castToObject<ClDevice>(testedClDevice);
 
-    MockKernelWithInternals mockKernel(*pDevice);
+    MockKernelWithInternals mockKernel(*pContext);
 
     retVal = clGetKernelWorkGroupInfo(
         mockKernel.mockMultiDeviceKernel,
@@ -140,6 +134,23 @@ TEST_F(ClGetKernelWorkGroupInfoTests, givenKernelNotHavingPrivateMemoryAllocatio
     EXPECT_EQ(paramValue, 0u);
 }
 
+TEST_F(ClGetKernelWorkGroupInfoTests, whenWorkgroupSizeCheckedThenSizeLimitIs1kOrLess) {
+    size_t paramValueSizeRet = 0;
+    size_t paramValue = 0;
+
+    retVal = clGetKernelWorkGroupInfo(
+        kernel,
+        testedClDevice,
+        CL_KERNEL_WORK_GROUP_SIZE,
+        sizeof(size_t),
+        &paramValue,
+        &paramValueSizeRet);
+
+    EXPECT_EQ(retVal, CL_SUCCESS);
+    EXPECT_EQ(paramValueSizeRet, sizeof(size_t));
+    EXPECT_LE(paramValue, CommonConstants::maxWorkgroupSize);
+}
+
 static cl_kernel_work_group_info paramNames[] = {
     CL_KERNEL_WORK_GROUP_SIZE,
     CL_KERNEL_COMPILE_WORK_GROUP_SIZE,
@@ -148,7 +159,7 @@ static cl_kernel_work_group_info paramNames[] = {
     CL_KERNEL_SPILL_MEM_SIZE_INTEL,
     CL_KERNEL_PRIVATE_MEM_SIZE};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     api,
     ClGetKernelWorkGroupInfoTests,
     testing::ValuesIn(paramNames));

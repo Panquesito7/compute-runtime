@@ -1,31 +1,46 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/test/common/helpers/variable_backup.h"
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <dirent.h>
-#include <iostream>
 #include <poll.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
+extern "C" {
+extern char **environ;
+}
 namespace NEO {
 namespace SysCalls {
 
 extern int (*sysCallsMkdir)(const std::string &dir);
+extern int (*sysCallsRmdir)(const std::string &dir);
 extern int (*sysCallsOpen)(const char *pathname, int flags);
+extern int (*sysCallsClose)(int fileDescriptor);
 extern int (*sysCallsOpenWithMode)(const char *pathname, int flags, int mode);
+extern int (*sysCallsFtruncate)(int fd, off_t length);
+extern int (*sysCallsAccess)(const char *pathname, int mode);
+extern int (*sysCallsDlinfo)(void *handle, int request, void *info);
 extern ssize_t (*sysCallsPread)(int fd, void *buf, size_t count, off_t offset);
 extern ssize_t (*sysCallsPwrite)(int fd, const void *buf, size_t count, off_t offset);
 extern int (*sysCallsReadlink)(const char *path, char *buf, size_t bufsize);
 extern int (*sysCallsIoctl)(int fileDescriptor, unsigned long int request, void *arg);
 extern int (*sysCallsPoll)(struct pollfd *pollFd, unsigned long int numberOfFds, int timeout);
 extern ssize_t (*sysCallsRead)(int fd, void *buf, size_t count);
-extern ssize_t (*sysCallsWrite)(int fd, void *buf, size_t count);
+extern ssize_t (*sysCallsWrite)(int fd, const void *buf, size_t count);
 extern int (*sysCallsPipe)(int pipeFd[2]);
 extern int (*sysCallsFstat)(int fd, struct stat *buf);
 extern char *(*sysCallsRealpath)(const char *path, char *buf);
@@ -40,15 +55,48 @@ extern int (*sysCallsUnlink)(const std::string &pathname);
 extern int (*sysCallsStat)(const std::string &filePath, struct stat *statbuf);
 extern int (*sysCallsMkstemp)(char *fileName);
 extern bool (*sysCallsPathExists)(const std::string &path);
+extern DIR *(*sysCallsOpendir)(const char *name);
+extern struct dirent *(*sysCallsReaddir)(DIR *dir);
+extern int (*sysCallsClosedir)(DIR *dir);
+extern int (*sysCallsGetDevicePath)(int deviceFd, char *buf, size_t &bufSize);
+extern int (*sysCallsClose)(int fileDescriptor);
+extern int (*sysCallsPidfdOpen)(pid_t pid, unsigned int flags);
+extern int (*sysCallsPidfdGetfd)(int pidfd, int fd, unsigned int flags);
+extern int (*sysCallsPrctl)(int option, unsigned long arg);
+extern off_t (*sysCallsLseek)(int fd, off_t offset, int whence);
+extern int (*sysCallsSocket)(int domain, int type, int protocol);
+extern int (*sysCallsBind)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+extern int (*sysCallsListen)(int sockfd, int backlog);
+extern int (*sysCallsAccept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+extern int (*sysCallsConnect)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+extern ssize_t (*sysCallsSend)(int sockfd, const void *buf, size_t len, int flags);
+extern ssize_t (*sysCallsRecv)(int sockfd, void *buf, size_t len, int flags);
+extern ssize_t (*sysCallsSendmsg)(int sockfd, const struct msghdr *msg, int flags);
+extern ssize_t (*sysCallsRecvmsg)(int sockfd, struct msghdr *msg, int flags);
+extern int (*sysCallsSetsockopt)(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
+extern int (*sysCallsDup)(int oldfd);
+extern int (*sysCallsFcntl)(int fd, int cmd, int arg);
+extern void *(*sysCallsMmap)(void *addr, size_t size, int prot, int flags, int fd, off_t off);
+extern int (*sysCallsMunmap)(void *addr, size_t size);
+extern void *(*sysCallsMremapFixed)(void *oldAddress, size_t size, void *newAddress);
+extern void *(*sysCallsMmapFixedNoReplace)(void *address, size_t size);
+extern pid_t (*sysCallsGetpid)();
+extern int (*sysCallsGetrlimit)(int resource, struct rlimit *rlim);
+extern FILE *(*sysCallsFdopen)(int fd, const char *mode);
+extern char *(*sysCallsFgets)(char *s, int size, FILE *stream);
+extern int (*sysCallsFclose)(FILE *stream);
+extern int (*sysCallsSetvbuf)(FILE *stream, char *buf, int mode, size_t size);
 
+extern bool allowFakeDevicePath;
 extern int flockRetVal;
+extern int openFuncRetVal;
+extern uint32_t openFuncCalled;
+extern uint32_t accessFuncCalled;
+extern uint32_t pollFuncCalled;
 extern int closeFuncRetVal;
 extern int closeFuncArgPassed;
 extern const char *drmVersion;
 constexpr int fakeFileDescriptor = 123;
-extern int passedFileDescriptorFlagsToSet;
-extern int getFileDescriptorFlagsCalled;
-extern int setFileDescriptorFlagsCalled;
 extern uint32_t closeFuncCalled;
 extern bool exitCalled;
 extern int latestExitCode;
@@ -58,6 +106,38 @@ extern int mkstempCalled;
 extern int renameCalled;
 extern int pathFileExistsCalled;
 extern int flockCalled;
+extern int syncCalled;
+extern int fsyncCalled;
+extern int fsyncArgPassed;
+extern int fsyncRetVal;
+extern uint32_t readFuncCalled;
+extern uint32_t writeFuncCalled;
+extern uint32_t mkfifoFuncCalled;
+extern bool failMkfifo;
+extern bool failFcntl;
+extern bool failFcntl1;
+extern bool failAccess;
+extern int setErrno;
+extern int pidfdopenCalled;
+extern int pidfdgetfdCalled;
+extern int prctlCalled;
+extern int opendirCalled;
+extern int readdirCalled;
+extern int closedirCalled;
+extern int rmdirCalled;
+extern int socketCalled;
+extern int bindCalled;
+extern int listenCalled;
+extern int acceptCalled;
+extern int connectCalled;
+extern int sendCalled;
+extern int recvCalled;
+extern int sendmsgCalled;
+extern int recvmsgCalled;
+extern int setsockoptCalled;
+extern int dupCalled;
+extern int getpidCalled;
+extern int getrlimitCalled;
 
 extern std::vector<void *> mmapVector;
 extern std::vector<void *> mmapCapturedExtendedPointers;
@@ -65,5 +145,33 @@ extern bool mmapCaptureExtendedPointers;
 extern bool mmapAllowExtendedPointers;
 extern uint32_t mmapFuncCalled;
 extern uint32_t munmapFuncCalled;
+extern uint32_t mremapFixedFuncCalled;
+extern uint32_t mmapFixedNoReplaceFuncCalled;
+
+extern off_t lseekReturn;
+extern std::atomic<int> lseekCalledCount;
+extern bool captureDlOpenFilePath;
+extern std::string dlOpenFilePathPassed;
+extern std::string mkfifoPathNamePassed;
+extern std::string getProcessNameResult;
+
+extern long sysconfReturn;
+char **getEnviron();
 } // namespace SysCalls
+namespace ULT {
+char **getCurrentEnviron();
+void setMockEnviron(char **mock);
+
+class MockEnvironBackup {
+  public:
+    MockEnvironBackup(char **newEnviron);
+    ~MockEnvironBackup() = default;
+
+    static int defaultStatMock(const std::string &filePath, struct stat *statbuf) noexcept;
+    static std::vector<char *> buildEnvironFromMap(const std::unordered_map<std::string, std::string> &envs, std::vector<std::string> &storage);
+
+  private:
+    VariableBackup<char **> mockEnvironBackup;
+};
+} // namespace ULT
 } // namespace NEO

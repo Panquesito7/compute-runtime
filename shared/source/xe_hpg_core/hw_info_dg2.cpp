@@ -1,20 +1,17 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/aub_mem_dump/definitions/aub_services.h"
 #include "shared/source/command_stream/preemption_mode.h"
-#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/release_helpers/caps/caps_setup.h"
 #include "shared/source/xe_hpg_core/hw_cmds_dg2.h"
 
 #include "aubstream/engine_node.h"
-#include "device_ids_configs_dg2.h"
-#include "platforms.h"
 
 namespace NEO {
 
@@ -33,159 +30,85 @@ const PLATFORM DG2::platform = {
     GTTYPE_UNDEFINED};
 
 const RuntimeCapabilityTable DG2::capabilityTable{
-    EngineDirectSubmissionInitVec{
-        {aub_stream::ENGINE_RCS, {false, false, false, false}},
-        {aub_stream::ENGINE_CCS, {true, false, false, true}},
-        {aub_stream::ENGINE_CCS1, {true, false, true, true}},
-        {aub_stream::ENGINE_CCS2, {true, false, true, true}},
-        {aub_stream::ENGINE_CCS3, {true, false, true, true}}}, // directSubmissionEngines
-    {0, 0, 0, 0, false, false, false, false},                  // kmdNotifyProperties
-    MemoryConstants::max48BitAddress,                          // gpuAddressSpace
-    0,                                                         // sharedSystemMemCapabilities
-    83.333,                                                    // defaultProfilingTimerResolution
-    MemoryConstants::pageSize,                                 // requiredPreemptionSurfaceSize
-    "",                                                        // deviceName
-    PreemptionMode::ThreadGroup,                               // defaultPreemptionMode
-    aub_stream::ENGINE_CCS,                                    // defaultEngineType
-    0,                                                         // maxRenderFrequency
-    30,                                                        // clVersionSupport
-    CmdServicesMemTraceVersion::DeviceValues::Dg2,             // aubDeviceId
-    0,                                                         // extraQuantityThreadsPerEU
-    64,                                                        // slmSize
-    sizeof(DG2::GRF),                                          // grfSize
-    36u,                                                       // timestampValidBits
-    32u,                                                       // kernelTimestampValidBits
-    false,                                                     // blitterOperationsSupported
-    true,                                                      // ftrSupportsInteger64BitAtomics
-    false,                                                     // ftrSupportsFP64
-    true,                                                      // ftrSupportsFP64Emulation
-    true,                                                      // ftrSupports64BitMath
-    true,                                                      // ftrSvm
-    false,                                                     // ftrSupportsCoherency
-    false,                                                     // ftrSupportsVmeAvcTextureSampler
-    false,                                                     // ftrSupportsVmeAvcPreemption
-    false,                                                     // ftrRenderCompressedBuffers
-    false,                                                     // ftrRenderCompressedImages
-    true,                                                      // ftr64KBpages
-    true,                                                      // instrumentationEnabled
-    false,                                                     // sourceLevelDebuggerSupported
-    false,                                                     // supportsVme
-    true,                                                      // supportCacheFlushAfterWalker
-    true,                                                      // supportsImages
-    false,                                                     // supportsDeviceEnqueue
-    false,                                                     // supportsPipes
-    true,                                                      // supportsOcl21Features
-    false,                                                     // supportsOnDemandPageFaults
-    false,                                                     // supportsIndependentForwardProgress
-    false,                                                     // hostPtrTrackingEnabled
-    true,                                                      // levelZeroSupported
-    false,                                                     // isIntegratedDevice
-    true,                                                      // supportsMediaBlock
-    true,                                                      // p2pAccessSupported
-    false,                                                     // p2pAtomicAccessSupported
-    true,                                                      // fusedEuEnabled
-    true,                                                      // l0DebuggerSupported
-    true                                                       // supportsFloatAtomics
+    .directSubmissionEngines = makeDirectSubmissionPropertiesPerEngine({
+        {aub_stream::ENGINE_RCS, {.engineSupported = false, .submitOnInit = false, .useNonDefault = false}},
+        {aub_stream::ENGINE_CCS, {.engineSupported = true, .submitOnInit = false, .useNonDefault = false}},
+        {aub_stream::ENGINE_CCS1, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_CCS2, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+        {aub_stream::ENGINE_CCS3, {.engineSupported = true, .submitOnInit = false, .useNonDefault = true}},
+
+    }),
+    .kmdNotifyProperties = {0, 0, 0, 0, false, false, false, false},
+    .gpuAddressSpace = MemoryConstants::max48BitAddress,
+    .sharedSystemMemCapabilities = 0,
+    .requiredPreemptionSurfaceSize = MemoryConstants::pageSize,
+    .deviceName = "",
+    .preferredPlatformName = nullptr,
+    .defaultPreemptionMode = PreemptionMode::ThreadGroup,
+    .defaultEngineType = aub_stream::ENGINE_CCS,
+    .maxRenderFrequency = 0,
+    .extraQuantityThreadsPerEU = 0,
+    .maxProgrammableSlmSize = 64,
+    .grfSize = sizeof(DG2::GRF),
+    .timestampValidBits = 36u,
+    .kernelTimestampValidBits = 32u,
+    .blitterOperationsSupported = false,
+    .ftrSupportsFP64 = false,
+    .ftrSupportsFP64Emulation = true,
+    .ftrSupports64BitMath = true,
+    .ftrSupportsCoherency = false,
+    .ftrRenderCompressedBuffers = false,
+    .ftrRenderCompressedImages = false,
+    .supportCacheFlushAfterWalker = true,
+    .supportsImages = true,
+    .supportsOnDemandPageFaults = false,
+    .supportsIndependentForwardProgress = false,
+    .isIntegratedDevice = false,
+    .supportsMediaBlock = true,
+    .fusedEuEnabled = true,
+    .l0DebuggerSupported = true,
 };
 
 WorkaroundTable DG2::workaroundTable = {};
 FeatureTable DG2::featureTable = {};
 
 void DG2::setupFeatureAndWorkaroundTable(HardwareInfo *hwInfo) {
+    setupDefaultFeatureTableAndWorkaroundTable(hwInfo);
     FeatureTable *featureTable = &hwInfo->featureTable;
-    WorkaroundTable *workaroundTable = &hwInfo->workaroundTable;
 
-    featureTable->flags.ftrL3IACoherency = true;
     featureTable->flags.ftrFlatPhysCCS = true;
-    featureTable->flags.ftrPPGTT = true;
-    featureTable->flags.ftrSVM = true;
-    featureTable->flags.ftrIA32eGfxPTEs = true;
-    featureTable->flags.ftrStandardMipTailFormat = true;
-    featureTable->flags.ftrTranslationTable = true;
-    featureTable->flags.ftrUserModeTranslationTable = true;
-    featureTable->flags.ftrTileMappedResource = true;
-    featureTable->flags.ftrFbc = true;
-    featureTable->flags.ftrAstcHdr2D = true;
-    featureTable->flags.ftrAstcLdr2D = true;
-
-    featureTable->flags.ftrGpGpuMidBatchPreempt = true;
-    featureTable->flags.ftrGpGpuThreadGroupLevelPreempt = true;
-
-    featureTable->flags.ftrTileY = false;
     featureTable->flags.ftrLocalMemory = true;
-    featureTable->flags.ftrLinearCCS = true;
     featureTable->flags.ftrE2ECompression = true;
-    featureTable->flags.ftrCCSNode = true;
-    featureTable->flags.ftrCCSRing = true;
-
     featureTable->flags.ftrUnified3DMediaCompressionFormats = true;
-
-    workaroundTable->flags.wa4kAlignUVOffsetNV12LinearSurface = true;
+    featureTable->flags.ftrTile64Optimization = true;
+    featureTable->ftrBcsInfo = 1;
 };
 
-void DG2::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->ThreadCount = gtSysInfo->EUCount * compilerProductHelper.getNumThreadsPerEu();
-    gtSysInfo->TotalVsThreads = 336;
-    gtSysInfo->TotalHsThreads = 336;
-    gtSysInfo->TotalDsThreads = 336;
-    gtSysInfo->TotalGsThreads = 336;
-    gtSysInfo->TotalPsThreadsWindowerRange = 64;
-    gtSysInfo->CsrSizeInMb = 8;
-    gtSysInfo->MaxEuPerSubSlice = DG2::maxEuPerSubslice;
-    gtSysInfo->MaxSlicesSupported = DG2::maxSlicesSupported;
-    gtSysInfo->MaxSubSlicesSupported = DG2::maxSubslicesSupported;
-    gtSysInfo->MaxDualSubSlicesSupported = DG2::maxDualSubslicesSupported;
-    gtSysInfo->IsL3HashModeEnabled = false;
-    gtSysInfo->IsDynamicallyPopulated = false;
+void DG2::setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
+    setupDefaultGtSysInfo(hwInfo);
 
-    adjustHardwareInfo(hwInfo);
+    hwInfo->gtSystemInfo.NumThreadsPerEu = 8u;
+    hwInfo->gtSystemInfo.ThreadCount = hwInfo->gtSystemInfo.EUCount * hwInfo->gtSystemInfo.NumThreadsPerEu;
+
+    setupCaps(*hwInfo);
     if (setupFeatureTableAndWorkaroundTable) {
         setupFeatureAndWorkaroundTable(hwInfo);
     }
+
+    applyDebugOverrides(*hwInfo);
 }
 
-const HardwareInfo Dg2HwConfig::hwInfo = {
+const HardwareInfo DG2::hwInfo = {
     &DG2::platform,
     &DG2::featureTable,
     &DG2::workaroundTable,
-    &Dg2HwConfig::gtSystemInfo,
-    DG2::capabilityTable,
-    AOT::DG2_G10_A0};
-GT_SYSTEM_INFO Dg2HwConfig::gtSystemInfo = {0};
-void Dg2HwConfig::setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper) {
-    GT_SYSTEM_INFO *gtSysInfo = &hwInfo->gtSystemInfo;
-    gtSysInfo->CsrSizeInMb = 8;
-    gtSysInfo->IsL3HashModeEnabled = false;
-    gtSysInfo->IsDynamicallyPopulated = false;
+    &DG2::gtSystemInfo,
+    DG2::capabilityTable};
 
-    // non-zero values for unit tests
-    if (gtSysInfo->SliceCount == 0) {
-        gtSysInfo->SliceCount = 2;
-        gtSysInfo->SubSliceCount = 8;
-        gtSysInfo->DualSubSliceCount = gtSysInfo->SubSliceCount;
-        gtSysInfo->EUCount = 40;
-        gtSysInfo->MaxEuPerSubSlice = gtSysInfo->EUCount / gtSysInfo->SubSliceCount;
-        gtSysInfo->MaxSlicesSupported = gtSysInfo->SliceCount;
-        gtSysInfo->MaxSubSlicesSupported = gtSysInfo->SubSliceCount;
-        gtSysInfo->IsDynamicallyPopulated = true;
-        gtSysInfo->L3BankCount = 1;
-    }
-    gtSysInfo->L3CacheSizeInKb = 1;
-
-    gtSysInfo->CCSInfo.IsValid = true;
-    gtSysInfo->CCSInfo.NumberOfCCSEnabled = 1;
-
-    hwInfo->featureTable.ftrBcsInfo = 1;
-    for (uint32_t slice = 0; slice < gtSysInfo->SliceCount; slice++) {
-        gtSysInfo->SliceInfo[slice].Enabled = true;
-    }
-
-    adjustHardwareInfo(hwInfo);
-    if (setupFeatureTableAndWorkaroundTable) {
-        DG2::setupFeatureAndWorkaroundTable(hwInfo);
-    }
+GT_SYSTEM_INFO DG2::gtSystemInfo = {0};
+void DG2::setupHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable) {
+    DG2::setupHardwareInfoBase(hwInfo, setupFeatureTableAndWorkaroundTable);
 };
 
-#include "hw_info_setup_dg2.inl"
+void (*DG2::setupHardwareInfo)(HardwareInfo *, bool) = DG2::setupHardwareInfoImpl;
 } // namespace NEO

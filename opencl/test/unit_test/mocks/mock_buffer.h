@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,18 +10,23 @@
 
 #include "opencl/source/mem_obj/buffer.h"
 
+#include <cstdint>
+#include <memory>
+#include <optional>
+
 namespace NEO {
+class Context;
+class Device;
+class GmmHelper;
+class GraphicsAllocation;
 class MockDevice;
-}
+} // namespace NEO
 
 using namespace NEO;
 
 class MockBufferStorage {
   public:
-    MockBufferStorage() : mockGfxAllocation(data, sizeof(data) / 2),
-                          multiGfxAllocation(GraphicsAllocationHelper::toMultiGraphicsAllocation(&mockGfxAllocation)) {
-        initDevice();
-    }
+    MockBufferStorage();
 
     MockBufferStorage(bool unaligned);
     void initDevice();
@@ -39,6 +44,7 @@ class MockBuffer : public MockBufferStorage, public Buffer {
     using Buffer::size;
     using MemObj::associatedMemObject;
     using MemObj::context;
+    using MemObj::hostPtr;
     using MemObj::isZeroCopy;
     using MemObj::memObjectType;
     using MemObj::memoryStorage;
@@ -62,7 +68,14 @@ class MockBuffer : public MockBufferStorage, public Buffer {
         }
     }
 
-    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) override;
+    bool allowCpuAccess() const override {
+        if (allowCpuAccessReturnValue.has_value()) {
+            return *allowCpuAccessReturnValue;
+        }
+        return Buffer::allowCpuAccess();
+    }
+
+    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) override;
 
     void transferDataToHostPtr(MemObjSizeArray &copySize, MemObjOffsetArray &copyOffset) override {
         ++transferDataToHostPtrCalledCount;
@@ -81,12 +94,12 @@ class MockBuffer : public MockBufferStorage, public Buffer {
     }
 
     GraphicsAllocation *externalAlloc = nullptr;
+    int transferDataToHostPtrCalledCount{0};
+    int transferDataFromHostPtrCalledCount{0};
+    std::optional<bool> allowCpuAccessReturnValue{};
 
     bool callBaseTransferDataToHostPtr{true};
     bool callBaseTransferDataFromHostPtr{true};
-
-    int transferDataToHostPtrCalledCount{0};
-    int transferDataFromHostPtrCalledCount{0};
 };
 
 class AlignedBuffer : public MockBufferStorage, public Buffer {
@@ -106,7 +119,7 @@ class AlignedBuffer : public MockBufferStorage, public Buffer {
         }
     }
 
-    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) override;
+    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) override;
 
     GraphicsAllocation *externalAlloc = nullptr;
 };
@@ -128,7 +141,7 @@ class UnalignedBuffer : public MockBufferStorage, public Buffer {
         }
     }
 
-    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) override;
+    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) override;
 
     GraphicsAllocation *externalAlloc = nullptr;
 };

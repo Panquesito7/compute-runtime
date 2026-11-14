@@ -1,15 +1,20 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/gmm_helper/gmm_lib.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+
+#include "third_party/opencl_headers/CL/cl_ext.h"
+
+#include <cstdint>
+#include <cstdio>
 
 namespace NEO {
-enum GFX3DSTATE_SURFACEFORMAT : unsigned short {
+enum SurfaceFormat : unsigned short {
     GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_FLOAT = 0x000,
     GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_SINT = 0x001,
     GFX3DSTATE_SURFACEFORMAT_R32G32B32A32_UINT = 0x002,
@@ -178,23 +183,30 @@ enum GFX3DSTATE_SURFACEFORMAT : unsigned short {
     GFX3DSTATE_SURFACEFORMAT_PLANAR_420_8 = 0x1A5,
     GFX3DSTATE_SURFACEFORMAT_PLANAR_420_16 = 0x1a6,
     GFX3DSTATE_SURFACEFORMAT_PACKED_422_16 = 0x1a7,
-    GFX3DSTATE_SURFACEFORMAT_R10G10B10A2_SINT = 0x1b6,
+    GFX3DSTATE_SURFACEFORMAT_R16G16B16_UINT = 0x1b0,
+    GFX3DSTATE_SURFACEFORMAT_R16G16B16_SINT = 0x1b1,
     GFX3DSTATE_SURFACEFORMAT_R10G10B10A2_SNORM = 0x1b3,
+    GFX3DSTATE_SURFACEFORMAT_R10G10B10A2_SINT = 0x1b6,
+    GFX3DSTATE_SURFACEFORMAT_R8G8B8_UINT = 0x1c8,
+    GFX3DSTATE_SURFACEFORMAT_R8G8B8_SINT = 0x1c9,
     GFX3DSTATE_SURFACEFORMAT_RAW = 0x1FF,
     NUM_GFX3DSTATE_SURFACEFORMATS
 };
 
 enum class ImagePlane {
-    NO_PLANE = 0,
-    PLANE_Y,
-    PLANE_U,
-    PLANE_V,
-    PLANE_UV
+    noPlane = 0,
+    planeY,
+    planeU,
+    planeV,
+    planeUV
 };
 
+using GmmResourceFormat = int32_t;
+constexpr GmmResourceFormat gmmFormatR8G8B8A8Unorm = 126;
+
 struct SurfaceFormatInfo {
-    GMM_RESOURCE_FORMAT gmmSurfaceFormat;
-    GFX3DSTATE_SURFACEFORMAT genxSurfaceFormat;
+    GmmResourceFormat gmmSurfaceFormat;
+    SurfaceFormat genxSurfaceFormat;
     uint32_t gmmTileWalk;
     uint32_t numChannels;
     uint32_t perChannelSizeInBytes;
@@ -202,13 +214,13 @@ struct SurfaceFormatInfo {
 };
 
 enum class ImageType {
-    Invalid,
-    Image1D,
-    Image2D,
-    Image3D,
-    Image1DArray,
-    Image2DArray,
-    Image1DBuffer
+    invalid,
+    image1D,
+    image2D,
+    image3D,
+    image1DArray,
+    image2DArray,
+    image1DBuffer
 };
 
 struct ImageDescriptor {
@@ -224,6 +236,17 @@ struct ImageDescriptor {
     bool fromParent;
 };
 
+enum class ImageTilingMode {
+    tiledX,
+    tiledY,
+    tiledW,
+    notTiled,
+    tiled4,
+    tiled64,
+    tiledYf,
+    tiledYs,
+};
+
 struct ImageInfo {
     ImageDescriptor imgDesc;
     const SurfaceFormatInfo *surfaceFormat;
@@ -235,12 +258,64 @@ struct ImageInfo {
     uint32_t xOffset;
     uint32_t yOffset;
     uint32_t yOffsetForUVPlane;
-    GMM_YUV_PLANE_ENUM plane;
+    ImagePlane plane;
     uint32_t baseMipLevel;
     uint32_t mipCount;
     bool linearStorage;
     bool useLocalMemory;
+    bool isDisplayable;
+    ImageTilingMode forceTiling = ImageTilingMode::notTiled;
+
+    void print() const {
+        if (!NEO::debugManager.flags.PrintImgInfo.get()) {
+            return;
+        }
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "ImageInfo:\n");
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageType: %d\n", static_cast<int>(imgDesc.imageType));
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageWidth: %zu\n", imgDesc.imageWidth);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageHeight: %zu\n", imgDesc.imageHeight);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageDepth: %zu\n", imgDesc.imageDepth);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageArraySize: %zu\n", imgDesc.imageArraySize);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageRowPitch: %zu\n", imgDesc.imageRowPitch);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.imageSlicePitch: %zu\n", imgDesc.imageSlicePitch);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.numMipLevels: %u\n", imgDesc.numMipLevels);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.numSamples: %u\n", imgDesc.numSamples);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  imgDesc.fromParent: %d\n", imgDesc.fromParent);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  surfaceFormat: %p\n", static_cast<const void *>(surfaceFormat));
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  size: %zu\n", size);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  rowPitch: %zu\n", rowPitch);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  slicePitch: %zu\n", slicePitch);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  qPitch: %u\n", qPitch);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  offset: %zu\n", offset);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  xOffset: %u\n", xOffset);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  yOffset: %u\n", yOffset);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  yOffsetForUVPlane: %u\n", yOffsetForUVPlane);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  plane: %d\n", static_cast<int>(plane));
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  baseMipLevel: %u\n", baseMipLevel);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  mipCount: %u\n", mipCount);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  linearStorage: %d\n", linearStorage);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  useLocalMemory: %d\n", useLocalMemory);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  isDisplayable: %d\n", isDisplayable);
+        PRINT_STRING(NEO::debugManager.flags.PrintImgInfo.get(), stdout, "  forceTiling: %d\n", static_cast<int>(forceTiling));
+    }
 };
+
+struct ImageImplicitArgs {
+    const uint8_t structSize = sizeof(ImageImplicitArgs);
+    uint8_t structVersion;
+    uint64_t imageWidth;
+    uint64_t imageHeight;
+    uint64_t imageDepth;
+    uint64_t imageArraySize;
+    uint32_t numSamples;
+    cl_channel_type channelType;
+    cl_channel_order channelOrder;
+    uint32_t numMipLevels;
+
+    static constexpr uint8_t getSize() { return sizeof(ImageImplicitArgs); }
+};
+
+static_assert(ImageImplicitArgs::getSize() == 56);
 
 struct McsSurfaceInfo {
     uint32_t pitch;
@@ -254,5 +329,9 @@ struct SurfaceOffsets {
     uint32_t yOffset;
     uint32_t yOffsetForUVplane;
 };
+
+using GmmCubeFace = int32_t;
+constexpr GmmCubeFace gmmMaxCubeFace = 6;
+constexpr GmmCubeFace gmmNoCubeMap = 7;
 
 } // namespace NEO

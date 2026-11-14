@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,13 +9,12 @@
 
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
-#include "level_zero/sysman/source/fabric_port/sysman_fabric_port.h"
-#include "level_zero/sysman/source/linux/sysman_fs_access.h"
-#include "level_zero/sysman/source/linux/zes_os_sysman_imp.h"
-
-#include "gmock/gmock.h"
+#include "level_zero/sysman/source/api/fabric_port/sysman_fabric_port.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+#include "level_zero/sysman/source/shared/linux/zes_os_sysman_imp.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 const uint32_t mockNumPorts = 2;
@@ -28,11 +27,11 @@ struct MockFabricDevice : public L0::Sysman::FabricDevice {
     MockFabricDevice() = default;
 };
 
-class MockFabricFsAccess : public L0::Sysman::FsAccess {
+class MockFabricFsAccess : public L0::Sysman::FsAccessInterface {
   public:
     ze_result_t mockListDirectory = ZE_RESULT_SUCCESS;
     ze_result_t canRead(const std::string file) override {
-        if (accessibleNodes.find(file) != accessibleNodes.end()) {
+        if (accessibleNodes.contains(file)) {
             return ZE_RESULT_SUCCESS;
         }
         return ZE_RESULT_ERROR_UNKNOWN;
@@ -66,9 +65,9 @@ class MockFabricFsAccess : public L0::Sysman::FsAccess {
     std::vector<std::string> accessibleDirectories = {};
 };
 
-class MockFabricSysFsAccess : public L0::Sysman::SysfsAccess {
+class MockFabricSysFsAccess : public L0::Sysman::SysFsAccessInterface {
   public:
-    ze_result_t getRealPath(const std::string path, std::string &buf) override {
+    ze_result_t getRealPath(const std::string &path, std::string &buf) override {
         buf.append("/mockRealPath");
         return mockRealPathStatus;
     }
@@ -77,4 +76,5 @@ class MockFabricSysFsAccess : public L0::Sysman::SysfsAccess {
 };
 
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

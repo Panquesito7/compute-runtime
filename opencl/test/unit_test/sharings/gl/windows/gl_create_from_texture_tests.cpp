@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,10 +8,11 @@
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/memory_manager/os_agnostic_memory_manager.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/mocks/mock_gmm_resource_info.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/helpers/gmm_types_converter.h"
@@ -22,6 +23,8 @@
 
 #include "gtest/gtest.h"
 
+#include <memory>
+
 namespace NEO {
 class CreateFromGlTexture : public ::testing::Test {
   public:
@@ -31,9 +34,9 @@ class CreateFromGlTexture : public ::testing::Test {
         TempMM() : OsAgnosticMemoryManager(*(new MockExecutionEnvironment(defaultHwInfo.get()))) {
             mockExecutionEnvironment.reset(&executionEnvironment);
         }
-        GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
-            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(handle, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
-            if (handle == CreateFromGlTexture::mcsHandle) {
+        GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(osHandleData, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
+            if (osHandleData.handle == CreateFromGlTexture::mcsHandle) {
                 alloc->setDefaultGmm(forceMcsGmm);
             } else {
                 alloc->setDefaultGmm(forceGmm);
@@ -70,7 +73,7 @@ class CreateFromGlTexture : public ::testing::Test {
             mcsImgDesc.imageHeight = 128;
             mcsImgDesc.imageRowPitch = 256;
             mcsImgDesc.imageWidth = 128;
-            mcsImgDesc.imageType = ImageType::Image2D;
+            mcsImgDesc.imageType = ImageType::image2D;
             auto mcsImgInfo = MockGmm::initImgInfo(mcsImgDesc, 0, nullptr);
             mcsGmm = MockGmm::queryImgParams(clContext.getDevice(0)->getGmmHelper(), mcsImgInfo, false);
             tempMM.forceMcsGmm = mcsGmm.get();
@@ -95,7 +98,7 @@ class CreateFromGlTextureTestsWithParams : public CreateFromGlTexture,
 class CreateFromGlTextureTests : public CreateFromGlTexture {
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     CreateFromGlTextureTestsWithParams,
     CreateFromGlTextureTestsWithParams,
     testing::ValuesIn(glTextureTargets::supportedTargets));
@@ -139,9 +142,9 @@ TEST_P(CreateFromGlTextureTestsWithParams, givenAllTextureSpecificParamsWhenCrea
 
     ASSERT_EQ(CL_SUCCESS, retVal);
     if (target == GL_RENDERBUFFER_EXT) {
-        EXPECT_EQ(1, glSharing->dllParam->getParam("GLAcquireSharedRenderBufferCalled"));
+        EXPECT_EQ(1, glSharing->dllParam->getParam("glAcquireSharedRenderBufferCalled"));
     } else {
-        EXPECT_EQ(1, glSharing->dllParam->getParam("GLAcquireSharedTextureCalled"));
+        EXPECT_EQ(1, glSharing->dllParam->getParam("glAcquireSharedTextureCalled"));
     }
 
     EXPECT_EQ(GmmTypesConverter::getCubeFaceIndex(target), glImage->getCubeFaceIndex());
@@ -171,17 +174,17 @@ TEST_P(CreateFromGlTextureTestsWithParams, givenAllTextureSpecificParamsWhenCrea
             EXPECT_EQ(glImage->getImageDesc().image_row_pitch, gmmRowPitch);
         }
 
-        size_t ImageInfoRowPitch = 0;
-        retVal = clGetImageInfo(glImage, CL_IMAGE_ROW_PITCH, sizeof(size_t), &ImageInfoRowPitch, NULL);
+        size_t imageInfoRowPitch = 0;
+        retVal = clGetImageInfo(glImage, CL_IMAGE_ROW_PITCH, sizeof(size_t), &imageInfoRowPitch, NULL);
         ASSERT_EQ(CL_SUCCESS, retVal);
-        ASSERT_EQ(rowPitch, ImageInfoRowPitch);
+        ASSERT_EQ(rowPitch, imageInfoRowPitch);
 
-        size_t ImageInfoSlicePitch = 0;
+        size_t imageInfoSlicePitch = 0;
         slicePitch *= !(glImage->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE2D || glImage->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE1D || glImage->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER);
 
-        retVal = clGetImageInfo(glImage, CL_IMAGE_SLICE_PITCH, sizeof(size_t), &ImageInfoSlicePitch, NULL);
+        retVal = clGetImageInfo(glImage, CL_IMAGE_SLICE_PITCH, sizeof(size_t), &imageInfoSlicePitch, NULL);
         ASSERT_EQ(CL_SUCCESS, retVal);
-        ASSERT_EQ(slicePitch, ImageInfoSlicePitch);
+        ASSERT_EQ(slicePitch, imageInfoSlicePitch);
     }
 
     EXPECT_EQ(glImage->getImageDesc().image_height, gmm->gmmResourceInfo->getBaseHeight());
@@ -193,18 +196,18 @@ TEST_P(CreateFromGlTextureTestsWithParams, givenAllTextureSpecificParamsWhenCrea
     }
 
     if (imgDesc.imageArraySize > 1 || imgDesc.imageDepth > 1) {
-        GMM_REQ_OFFSET_INFO GMMReqInfo = {};
-        GMMReqInfo.ArrayIndex = imgDesc.imageArraySize > 1 ? 1 : 0;
-        GMMReqInfo.Slice = imgDesc.imageDepth > 1 ? 1 : 0;
-        GMMReqInfo.ReqLock = 1;
-        gmm->gmmResourceInfo->getOffset(GMMReqInfo);
-        size_t expectedSlicePitch = GMMReqInfo.Lock.Offset;
+        GMM_REQ_OFFSET_INFO gmmReqInfo = {};
+        gmmReqInfo.ArrayIndex = imgDesc.imageArraySize > 1 ? 1 : 0;
+        gmmReqInfo.Slice = imgDesc.imageDepth > 1 ? 1 : 0;
+        gmmReqInfo.ReqLock = 1;
+        gmm->gmmResourceInfo->getOffset(gmmReqInfo);
+        size_t expectedSlicePitch = gmmReqInfo.Lock.Offset;
         EXPECT_EQ(glImage->getImageDesc().image_slice_pitch, expectedSlicePitch);
     } else {
         EXPECT_EQ(glImage->getImageDesc().image_slice_pitch, imgInfo.size);
     }
 
-    EXPECT_EQ(glImage->getQPitch(), gmm->queryQPitch(gmm->gmmResourceInfo->getResourceType()));
+    EXPECT_EQ(glImage->getQPitch(), gmm->queryQPitch());
 
     // gmm returns 1 by default - OCL requires 0
     uint32_t numSamples = static_cast<uint32_t>(gmm->gmmResourceInfo->getNumSamples());
@@ -344,6 +347,6 @@ TEST_F(CreateFromGlTextureTests, GivenGlTextureWhenCreateIsCalledThenAllocationT
 
     auto graphicsAllocation = glImage->getGraphicsAllocation(clContext.getDevice(0)->getRootDeviceIndex());
     ASSERT_NE(nullptr, graphicsAllocation);
-    EXPECT_EQ(AllocationType::SHARED_IMAGE, graphicsAllocation->getAllocationType());
+    EXPECT_EQ(AllocationType::sharedImage, graphicsAllocation->getAllocationType());
 }
 } // namespace NEO

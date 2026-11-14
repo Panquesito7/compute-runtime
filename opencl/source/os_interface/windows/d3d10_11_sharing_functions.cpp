@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,138 +11,33 @@
 #include "opencl/source/sharings/d3d/d3d_sharing.h"
 #include "opencl/source/sharings/sharing_factory.h"
 
-#include "DXGI1_2.h"
+#include "dxgi1_2.h"
 
 using namespace NEO;
 
-template class D3DSharingFunctions<D3DTypesHelper::D3D10>;
-template class D3DSharingFunctions<D3DTypesHelper::D3D11>;
-
+template <>
 const uint32_t D3DSharingFunctions<D3DTypesHelper::D3D10>::sharingId = SharingType::D3D10_SHARING;
+template <>
 const uint32_t D3DSharingFunctions<D3DTypesHelper::D3D11>::sharingId = SharingType::D3D11_SHARING;
-
-static const DXGI_FORMAT DXGIFormats[] = {
-    DXGI_FORMAT_R32G32B32A32_TYPELESS,
-    DXGI_FORMAT_R32G32B32A32_FLOAT,
-    DXGI_FORMAT_R32G32B32A32_UINT,
-    DXGI_FORMAT_R32G32B32A32_SINT,
-    DXGI_FORMAT_R32G32B32_TYPELESS,
-    DXGI_FORMAT_R32G32B32_FLOAT,
-    DXGI_FORMAT_R32G32B32_UINT,
-    DXGI_FORMAT_R32G32B32_SINT,
-    DXGI_FORMAT_R16G16B16A16_TYPELESS,
-    DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R16G16B16A16_UNORM,
-    DXGI_FORMAT_R16G16B16A16_UINT,
-    DXGI_FORMAT_R16G16B16A16_SNORM,
-    DXGI_FORMAT_R16G16B16A16_SINT,
-    DXGI_FORMAT_R32G32_TYPELESS,
-    DXGI_FORMAT_R32G32_FLOAT,
-    DXGI_FORMAT_R32G32_UINT,
-    DXGI_FORMAT_R32G32_SINT,
-    DXGI_FORMAT_R32G8X24_TYPELESS,
-    DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
-    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
-    DXGI_FORMAT_R10G10B10A2_TYPELESS,
-    DXGI_FORMAT_R10G10B10A2_UNORM,
-    DXGI_FORMAT_R10G10B10A2_UINT,
-    DXGI_FORMAT_R11G11B10_FLOAT,
-    DXGI_FORMAT_R8G8B8A8_TYPELESS,
-    DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-    DXGI_FORMAT_R8G8B8A8_UINT,
-    DXGI_FORMAT_R8G8B8A8_SNORM,
-    DXGI_FORMAT_R8G8B8A8_SINT,
-    DXGI_FORMAT_R16G16_TYPELESS,
-    DXGI_FORMAT_R16G16_FLOAT,
-    DXGI_FORMAT_R16G16_UNORM,
-    DXGI_FORMAT_R16G16_UINT,
-    DXGI_FORMAT_R16G16_SNORM,
-    DXGI_FORMAT_R16G16_SINT,
-    DXGI_FORMAT_R32_TYPELESS,
-    DXGI_FORMAT_D32_FLOAT,
-    DXGI_FORMAT_R32_FLOAT,
-    DXGI_FORMAT_R32_UINT,
-    DXGI_FORMAT_R32_SINT,
-    DXGI_FORMAT_R24G8_TYPELESS,
-    DXGI_FORMAT_D24_UNORM_S8_UINT,
-    DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-    DXGI_FORMAT_X24_TYPELESS_G8_UINT,
-    DXGI_FORMAT_R8G8_TYPELESS,
-    DXGI_FORMAT_R8G8_UNORM,
-    DXGI_FORMAT_R8G8_UINT,
-    DXGI_FORMAT_R8G8_SNORM,
-    DXGI_FORMAT_R8G8_SINT,
-    DXGI_FORMAT_R16_TYPELESS,
-    DXGI_FORMAT_R16_FLOAT,
-    DXGI_FORMAT_D16_UNORM,
-    DXGI_FORMAT_R16_UNORM,
-    DXGI_FORMAT_R16_UINT,
-    DXGI_FORMAT_R16_SNORM,
-    DXGI_FORMAT_R16_SINT,
-    DXGI_FORMAT_R8_TYPELESS,
-    DXGI_FORMAT_R8_UNORM,
-    DXGI_FORMAT_R8_UINT,
-    DXGI_FORMAT_R8_SNORM,
-    DXGI_FORMAT_R8_SINT,
-    DXGI_FORMAT_A8_UNORM,
-    DXGI_FORMAT_R1_UNORM,
-    DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
-    DXGI_FORMAT_R8G8_B8G8_UNORM,
-    DXGI_FORMAT_G8R8_G8B8_UNORM,
-    DXGI_FORMAT_BC1_TYPELESS,
-    DXGI_FORMAT_BC1_UNORM,
-    DXGI_FORMAT_BC1_UNORM_SRGB,
-    DXGI_FORMAT_BC2_TYPELESS,
-    DXGI_FORMAT_BC2_UNORM,
-    DXGI_FORMAT_BC2_UNORM_SRGB,
-    DXGI_FORMAT_BC3_TYPELESS,
-    DXGI_FORMAT_BC3_UNORM,
-    DXGI_FORMAT_BC3_UNORM_SRGB,
-    DXGI_FORMAT_BC4_TYPELESS,
-    DXGI_FORMAT_BC4_UNORM,
-    DXGI_FORMAT_BC4_SNORM,
-    DXGI_FORMAT_BC5_TYPELESS,
-    DXGI_FORMAT_BC5_UNORM,
-    DXGI_FORMAT_BC5_SNORM,
-    DXGI_FORMAT_B5G6R5_UNORM,
-    DXGI_FORMAT_B5G5R5A1_UNORM,
-    DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_B8G8R8X8_UNORM,
-    DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
-    DXGI_FORMAT_B8G8R8A8_TYPELESS,
-    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-    DXGI_FORMAT_B8G8R8X8_TYPELESS,
-    DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
-    DXGI_FORMAT_BC6H_TYPELESS,
-    DXGI_FORMAT_BC6H_UF16,
-    DXGI_FORMAT_BC6H_SF16,
-    DXGI_FORMAT_BC7_TYPELESS,
-    DXGI_FORMAT_BC7_UNORM,
-    DXGI_FORMAT_BC7_UNORM_SRGB,
-    DXGI_FORMAT_AYUV,
-    DXGI_FORMAT_Y410,
-    DXGI_FORMAT_Y416,
-    DXGI_FORMAT_NV12,
-    DXGI_FORMAT_P010,
-    DXGI_FORMAT_P016,
-    DXGI_FORMAT_YUY2,
-    DXGI_FORMAT_Y210,
-    DXGI_FORMAT_Y216,
-    DXGI_FORMAT_AI44,
-    DXGI_FORMAT_IA44,
-    DXGI_FORMAT_P8,
-    DXGI_FORMAT_A8P8,
-    DXGI_FORMAT_B4G4R4A4_UNORM,
-    DXGI_FORMAT_V208,
-    DXGI_FORMAT_V408,
-    DXGI_FORMAT_FORCE_UINT};
 
 template <typename D3D>
 void D3DSharingFunctions<D3D>::createQuery(D3DQuery **query) {
     D3DQueryDesc desc = {};
     d3dDevice->CreateQuery(&desc, query);
+}
+
+template <>
+void D3DSharingFunctions<D3DTypesHelper::D3D10>::createFence(D3DFence **fence) {
+}
+
+template <>
+void D3DSharingFunctions<D3DTypesHelper::D3D11>::createFence(D3DFence **fence) {
+    ID3D11Device5 *d3d11Device5 = nullptr;
+    d3dDevice->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&d3d11Device5));
+    if (d3d11Device5) {
+        d3d11Device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(D3DFence), (void **)fence);
+        d3d11Device5->Release();
+    }
 }
 
 template <typename D3D>
@@ -235,24 +130,141 @@ std::vector<DXGI_FORMAT> &D3DSharingFunctions<D3D>::retrieveTextureFormats(cl_me
         bool success;
         std::tie(cached, success) = textureFormatCache.emplace(imageType, std::vector<DXGI_FORMAT>(0));
         if (!success) {
-            return DXGINoFormats;
+            return dxgiNoFormats;
         }
-        std::vector<DXGI_FORMAT> &cached_formats = cached->second;
+        std::vector<DXGI_FORMAT> &cachedFormats = cached->second;
         std::vector<DXGI_FORMAT> planarFormats(0);
 
-        cached_formats.reserve(arrayCount(DXGIFormats));
-        for (auto DXGIFormat : DXGIFormats) {
+        constexpr DXGI_FORMAT dxgiFormats[] = {
+            DXGI_FORMAT_R32G32B32A32_TYPELESS,
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            DXGI_FORMAT_R32G32B32A32_UINT,
+            DXGI_FORMAT_R32G32B32A32_SINT,
+            DXGI_FORMAT_R32G32B32_TYPELESS,
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            DXGI_FORMAT_R32G32B32_UINT,
+            DXGI_FORMAT_R32G32B32_SINT,
+            DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_UINT,
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16B16A16_SINT,
+            DXGI_FORMAT_R32G32_TYPELESS,
+            DXGI_FORMAT_R32G32_FLOAT,
+            DXGI_FORMAT_R32G32_UINT,
+            DXGI_FORMAT_R32G32_SINT,
+            DXGI_FORMAT_R32G8X24_TYPELESS,
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+            DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+            DXGI_FORMAT_R10G10B10A2_TYPELESS,
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            DXGI_FORMAT_R10G10B10A2_UINT,
+            DXGI_FORMAT_R11G11B10_FLOAT,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UINT,
+            DXGI_FORMAT_R8G8B8A8_SNORM,
+            DXGI_FORMAT_R8G8B8A8_SINT,
+            DXGI_FORMAT_R16G16_TYPELESS,
+            DXGI_FORMAT_R16G16_FLOAT,
+            DXGI_FORMAT_R16G16_UNORM,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R16G16_SNORM,
+            DXGI_FORMAT_R16G16_SINT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_D32_FLOAT,
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R32_SINT,
+            DXGI_FORMAT_R24G8_TYPELESS,
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+            DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+            DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            DXGI_FORMAT_R8G8_TYPELESS,
+            DXGI_FORMAT_R8G8_UNORM,
+            DXGI_FORMAT_R8G8_UINT,
+            DXGI_FORMAT_R8G8_SNORM,
+            DXGI_FORMAT_R8G8_SINT,
+            DXGI_FORMAT_R16_TYPELESS,
+            DXGI_FORMAT_R16_FLOAT,
+            DXGI_FORMAT_D16_UNORM,
+            DXGI_FORMAT_R16_UNORM,
+            DXGI_FORMAT_R16_UINT,
+            DXGI_FORMAT_R16_SNORM,
+            DXGI_FORMAT_R16_SINT,
+            DXGI_FORMAT_R8_TYPELESS,
+            DXGI_FORMAT_R8_UNORM,
+            DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R8_SNORM,
+            DXGI_FORMAT_R8_SINT,
+            DXGI_FORMAT_A8_UNORM,
+            DXGI_FORMAT_R1_UNORM,
+            DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            DXGI_FORMAT_R8G8_B8G8_UNORM,
+            DXGI_FORMAT_G8R8_G8B8_UNORM,
+            DXGI_FORMAT_BC1_TYPELESS,
+            DXGI_FORMAT_BC1_UNORM,
+            DXGI_FORMAT_BC1_UNORM_SRGB,
+            DXGI_FORMAT_BC2_TYPELESS,
+            DXGI_FORMAT_BC2_UNORM,
+            DXGI_FORMAT_BC2_UNORM_SRGB,
+            DXGI_FORMAT_BC3_TYPELESS,
+            DXGI_FORMAT_BC3_UNORM,
+            DXGI_FORMAT_BC3_UNORM_SRGB,
+            DXGI_FORMAT_BC4_TYPELESS,
+            DXGI_FORMAT_BC4_UNORM,
+            DXGI_FORMAT_BC4_SNORM,
+            DXGI_FORMAT_BC5_TYPELESS,
+            DXGI_FORMAT_BC5_UNORM,
+            DXGI_FORMAT_BC5_SNORM,
+            DXGI_FORMAT_B5G6R5_UNORM,
+            DXGI_FORMAT_B5G5R5A1_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
+            DXGI_FORMAT_B8G8R8A8_TYPELESS,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            DXGI_FORMAT_B8G8R8X8_TYPELESS,
+            DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
+            DXGI_FORMAT_BC6H_TYPELESS,
+            DXGI_FORMAT_BC6H_UF16,
+            DXGI_FORMAT_BC6H_SF16,
+            DXGI_FORMAT_BC7_TYPELESS,
+            DXGI_FORMAT_BC7_UNORM,
+            DXGI_FORMAT_BC7_UNORM_SRGB,
+            DXGI_FORMAT_AYUV,
+            DXGI_FORMAT_Y410,
+            DXGI_FORMAT_Y416,
+            DXGI_FORMAT_NV12,
+            DXGI_FORMAT_P010,
+            DXGI_FORMAT_P016,
+            DXGI_FORMAT_YUY2,
+            DXGI_FORMAT_Y210,
+            DXGI_FORMAT_Y216,
+            DXGI_FORMAT_AI44,
+            DXGI_FORMAT_IA44,
+            DXGI_FORMAT_P8,
+            DXGI_FORMAT_A8P8,
+            DXGI_FORMAT_B4G4R4A4_UNORM,
+            DXGI_FORMAT_V208,
+            DXGI_FORMAT_V408,
+            DXGI_FORMAT_FORCE_UINT};
+        cachedFormats.reserve(arrayCount(dxgiFormats));
+        for (auto dxgiFormat : dxgiFormats) {
             UINT format = 0;
-            if (checkFormatSupport(DXGIFormat, &format)) {
+            if (checkFormatSupport(dxgiFormat, &format)) {
                 if (memObjectFormatSupport(imageType, format)) {
-                    cached_formats.push_back(DXGIFormat);
-                    if (D3DSharing<D3D>::isFormatWithPlane1(DXGIFormat)) {
-                        planarFormats.push_back(DXGIFormat);
+                    cachedFormats.push_back(dxgiFormat);
+                    if (D3DSharing<D3D>::isFormatWithPlane1(dxgiFormat)) {
+                        planarFormats.push_back(dxgiFormat);
                     }
                 }
             }
         }
-        cached_formats.shrink_to_fit();
+        cachedFormats.shrink_to_fit();
         textureFormatPlane1Cache.emplace(imageType, planarFormats);
     }
 
@@ -292,7 +304,7 @@ void D3DSharingFunctions<D3D>::getTexture3dDesc(D3DTexture3dDesc *textureDesc, D
 template <typename D3D>
 void D3DSharingFunctions<D3D>::getSharedHandle(D3DResource *resource, void **handle) {
     IDXGIResource *dxgiResource = nullptr;
-    resource->QueryInterface(__uuidof(IDXGIResource), (void **)&dxgiResource);
+    resource->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgiResource));
     dxgiResource->GetSharedHandle(handle);
     dxgiResource->Release();
 }
@@ -301,8 +313,8 @@ template <typename D3D>
 void D3DSharingFunctions<D3D>::getSharedNTHandle(D3DResource *resource, void **handle) {
     IDXGIResource *dxgiResource = nullptr;
     IDXGIResource1 *dxgiResource1 = nullptr;
-    resource->QueryInterface(__uuidof(IDXGIResource), (void **)&dxgiResource);
-    dxgiResource->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgiResource1);
+    resource->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgiResource));
+    dxgiResource->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dxgiResource1));
     dxgiResource1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, handle);
     dxgiResource1->Release();
     dxgiResource->Release();
@@ -315,7 +327,9 @@ void D3DSharingFunctions<D3D>::addRef(D3DResource *resource) {
 
 template <typename D3D>
 void D3DSharingFunctions<D3D>::release(IUnknown *resource) {
-    resource->Release();
+    if (resource) {
+        resource->Release();
+    }
 }
 
 template <typename D3D>
@@ -350,16 +364,34 @@ template <>
 void D3DSharingFunctions<D3DTypesHelper::D3D10>::flushAndWait(D3DQuery *query) {
     query->End();
     d3dDevice->Flush();
-    while (query->GetData(nullptr, 0, 0) != S_OK)
+    while (query->GetData(nullptr, 0, 0) != S_OK) {
         ;
+    }
+}
+
+template <>
+void D3DSharingFunctions<D3DTypesHelper::D3D10>::signalAndWait(D3DFence *fence) {
 }
 
 template <>
 void D3DSharingFunctions<D3DTypesHelper::D3D11>::flushAndWait(D3DQuery *query) {
     d3d11DeviceContext->End(query);
     d3d11DeviceContext->Flush();
-    while (d3d11DeviceContext->GetData(query, nullptr, 0, 0) != S_OK)
+    while (d3d11DeviceContext->GetData(query, nullptr, 0, 0) != S_OK) {
         ;
+    }
+}
+
+template <>
+void D3DSharingFunctions<D3DTypesHelper::D3D11>::signalAndWait(D3DFence *fence) {
+    ID3D11DeviceContext4 *d3d11DeviceContext4 = nullptr;
+    d3d11DeviceContext->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&d3d11DeviceContext4));
+    auto valueToWait = fence->GetCompletedValue() + 1;
+    d3d11DeviceContext4->Signal(fence, valueToWait);
+    while (fence->GetCompletedValue() < valueToWait) {
+        ;
+    }
+    d3d11DeviceContext4->Release();
 }
 
 template <>
@@ -380,11 +412,12 @@ void D3DSharingFunctions<D3DTypesHelper::D3D11>::releaseDeviceContext(D3DQuery *
     d3d11DeviceContext->Release();
     d3d11DeviceContext = nullptr;
 }
+
 template <typename D3D>
 void D3DSharingFunctions<D3D>::getDxgiDesc(DXGI_ADAPTER_DESC *dxgiDesc, IDXGIAdapter *adapter, D3DDevice *device) {
     if (!adapter) {
         IDXGIDevice *dxgiDevice = nullptr;
-        device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgiDevice);
+        device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgiDevice));
         dxgiDevice->GetAdapter(&adapter);
         dxgiDevice->Release();
     } else {
@@ -396,3 +429,6 @@ void D3DSharingFunctions<D3D>::getDxgiDesc(DXGI_ADAPTER_DESC *dxgiDesc, IDXGIAda
 
 template D3DSharingFunctions<D3DTypesHelper::D3D10> *Context::getSharing<D3DSharingFunctions<D3DTypesHelper::D3D10>>();
 template D3DSharingFunctions<D3DTypesHelper::D3D11> *Context::getSharing<D3DSharingFunctions<D3DTypesHelper::D3D11>>();
+
+template class NEO::D3DSharingFunctions<D3DTypesHelper::D3D10>;
+template class NEO::D3DSharingFunctions<D3DTypesHelper::D3D11>;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,6 @@
 
 #include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/metrics/metric_oa_query_imp.h"
-#include "level_zero/tools/source/metrics/metric_oa_source.h"
 
 using namespace MetricsLibraryApi;
 
@@ -20,13 +19,15 @@ const char *MetricsLibrary::getFilename() { return "libigdml.so.1"; }
 
 bool MetricsLibrary::getContextData(Device &device, ContextCreateData_1_0 &contextData) {
 
-    auto &osInterface = device.getOsInterface();
+    auto &osInterface = *device.getOsInterface();
     auto drm = osInterface.getDriverModel()->as<NEO::Drm>();
     auto drmFileDescriptor = drm->getFileDescriptor();
     auto &osData = contextData.ClientData->Linux;
 
     osData.Adapter->Type = LinuxAdapterType::DrmFileDescriptor;
     osData.Adapter->DrmFileDescriptor = drmFileDescriptor;
+    callbacks.CommandBufferFlush = &flushCommandBufferCallback;
+    contextData.ClientData->Handle = reinterpret_cast<void *>(&device);
 
     return drmFileDescriptor != -1;
 }
@@ -40,7 +41,7 @@ bool MetricsLibrary::activateConfiguration(const ConfigurationHandle_1_0 configu
     const bool validConfiguration = configurationHandle.IsValid();
     const bool result =
         validMetricsLibrary && validConfiguration &&
-        (api.ConfigurationActivate(configurationHandle, &activateData) == StatusCode::Success);
+        this->callMdapi("ConfigurationActivate", this->api.ConfigurationActivate, configurationHandle, &activateData);
 
     DEBUG_BREAK_IF(!result);
     return result;
@@ -51,7 +52,7 @@ bool MetricsLibrary::deactivateConfiguration(const ConfigurationHandle_1_0 confi
     const bool validMetricsLibrary = isInitialized();
     const bool validConfiguration = configurationHandle.IsValid();
     const bool result = validMetricsLibrary && validConfiguration &&
-                        (api.ConfigurationDeactivate(configurationHandle) == StatusCode::Success);
+                        this->callMdapi("ConfigurationDeactivate", this->api.ConfigurationDeactivate, configurationHandle);
 
     DEBUG_BREAK_IF(!result);
     return result;

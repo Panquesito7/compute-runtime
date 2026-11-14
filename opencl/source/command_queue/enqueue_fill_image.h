@@ -1,22 +1,18 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
-#include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/vec.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/helpers/hardware_commands_helper.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/source/memory_manager/mem_obj_surface.h"
-
-#include <algorithm>
-#include <new>
 
 namespace NEO {
 
@@ -29,14 +25,21 @@ cl_int CommandQueueHw<GfxFamily>::enqueueFillImage(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::FillImage3d,
-                                                                            this->getClDevice());
-    BuiltInOwnershipWrapper builtInLock(builder, this->context);
+
+    auto baseKernel = (image->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER)
+                          ? BuiltIn::BaseKernel::fillImage1dBuffer
+                          : BuiltIn::BaseKernel::fillImage3d;
+    BuiltIn::BuiltInId builtIn{baseKernel, this->defaultBuiltInMode};
+
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(builtIn,
+                                                                              this->getClDevice());
+
+    BuiltIn::OwnershipWrapper builtInLock(builder, this->context);
 
     MemObjSurface dstImgSurf(image);
     Surface *surfaces[] = {&dstImgSurf};
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = const_cast<void *>(fillColor);
     dc.dstMemObj = image;
     dc.srcOffset = {0, 0, 0};

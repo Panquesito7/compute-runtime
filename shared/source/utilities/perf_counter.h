@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,16 +14,18 @@ namespace NEO {
 
 class HwPerfCounter : public TagTypeBase {
   public:
-    void initialize() {
+    using ValueT = uint8_t;
+
+    void initialize(uint8_t initValue) {
         query = {};
-        report[0] = 0;
+        report[0] = initValue;
     }
 
     static constexpr AllocationType getAllocationType() {
-        return AllocationType::PROFILING_TAG_BUFFER;
+        return AllocationType::profilingTagBuffer;
     }
 
-    static constexpr TagNodeType getTagNodeType() { return TagNodeType::HwPerfCounter; }
+    static constexpr TagNodeType getTagNodeType() { return TagNodeType::hwPerfCounter; }
 
     template <typename Type>
     static uint32_t getSize(Type &performanceCounters) {

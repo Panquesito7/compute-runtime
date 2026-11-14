@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/pmt/pmt.h"
 #include "level_zero/tools/source/sysman/temperature/linux/os_temperature_imp.h"
 #include "level_zero/tools/source/sysman/temperature/temperature_imp.h"
@@ -41,9 +42,7 @@ const std::string sysfsPahTelem5 = "/sys/class/intel_pmt/telem5";
 
 struct MockTemperaturePmt : public PlatformMonitoringTech {
     MockTemperaturePmt(FsAccess *pFsAccess, ze_bool_t onSubdevice, uint32_t subdeviceId) : PlatformMonitoringTech(pFsAccess, onSubdevice, subdeviceId) {}
-    using PlatformMonitoringTech::closeFunction;
     using PlatformMonitoringTech::keyOffsetMap;
-    using PlatformMonitoringTech::openFunction;
     using PlatformMonitoringTech::preadFunction;
     using PlatformMonitoringTech::telemetryDeviceEntry;
 

@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#pragma once
 #include "shared/source/gmm_helper/gmm_lib.h"
 #include "shared/source/helpers/abort.h"
 #include "shared/source/helpers/completion_stamp.h"
@@ -17,16 +18,20 @@
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/api/dispatch.h"
+
 #include "hw_cmds.h"
 #include "third_party/opencl_headers/CL/cl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <list>
 #include <map>
 #include <memory>
+#include <ranges>
 #include <set>
-#include <stdio.h>
+#include <sstream>
 #include <string>
 #include <vector>

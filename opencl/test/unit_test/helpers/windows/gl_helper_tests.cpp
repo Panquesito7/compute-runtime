@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,7 @@
 
 #include "shared/source/os_interface/os_library.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/helpers/gl_helper.h"
 #include "opencl/test/unit_test/helpers/windows/mock_function.h"
@@ -26,16 +26,16 @@ class GlFunctionHelperMock : public GlFunctionHelper {
 };
 
 TEST(GlFunctionHelper, whenCreateGlFunctionHelperThenSetGlFunctionPtrToLoadAnotherFunctions) {
-    std::unique_ptr<OsLibrary> glLibrary(OsLibrary::load("mock_opengl32.dll"));
+    std::unique_ptr<OsLibrary> glLibrary(OsLibrary::loadFunc({"mock_opengl32.dll"}));
     EXPECT_TRUE(glLibrary->isLoaded());
     GlFunctionHelperMock loader(glLibrary.get(), "mockLoader");
-    funcType function1 = ConvertibleProcAddr{loader.glFunctionPtr("realFunction")};
+    funcType function1 = ConvertibleProcAddr{reinterpret_cast<void *>(loader.glFunctionPtr("realFunction"))};
     funcType function2 = loader["realFunction"];
     EXPECT_STREQ(function1(), function2());
 }
 
 TEST(GlFunctionHelper, givenNonExistingFunctionNameWhenCreateGlFunctionHelperThenNullptr) {
-    std::unique_ptr<OsLibrary> glLibrary(OsLibrary::load("mock_opengl32.dll"));
+    std::unique_ptr<OsLibrary> glLibrary(OsLibrary::loadFunc({"mock_opengl32.dll"}));
     EXPECT_TRUE(glLibrary->isLoaded());
     GlFunctionHelper loader(glLibrary.get(), "mockLoader");
     funcType function = loader["nonExistingFunction"];
@@ -43,7 +43,7 @@ TEST(GlFunctionHelper, givenNonExistingFunctionNameWhenCreateGlFunctionHelperThe
 }
 
 TEST(GlFunctionHelper, givenRealFunctionNameWhenCreateGlFunctionHelperThenGetPointerToAppropriateFunction) {
-    std::unique_ptr<OsLibrary> glLibrary(OsLibrary::load("mock_opengl32.dll"));
+    std::unique_ptr<OsLibrary> glLibrary(OsLibrary::loadFunc({"mock_opengl32.dll"}));
     EXPECT_TRUE(glLibrary->isLoaded());
     GlFunctionHelper loader(glLibrary.get(), "mockLoader");
     funcType function = loader["realFunction"];

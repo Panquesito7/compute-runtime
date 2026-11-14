@@ -1,16 +1,18 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/api/api.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
@@ -25,7 +27,7 @@ using namespace NEO;
 namespace ULT {
 
 template <typename T>
-struct ClCreateImageTests : public ApiFixture<>,
+struct ClCreateImageTests : public ApiFixture,
                             public T {
 
     void SetUp() override {
@@ -148,7 +150,7 @@ TEST_F(clCreateImageTest, GivenDeviceThatDoesntSupportImagesWhenCreatingImageWit
 
     imageDesc.image_type = CL_MEM_OBJECT_IMAGE1D;
     imageDesc.image_height = 1;
-    DebugManager.flags.ForceLinearImages.set(true);
+    debugManager.flags.ForceLinearImages.set(true);
 
     auto image = clCreateImageWithPropertiesINTEL(
         &mockContext,
@@ -625,7 +627,7 @@ TEST_F(clCreateImageTestYUV, Given1DImageTypeWhenCreatingYuvImageThenInvalidImag
     EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
 }
 
-typedef ClCreateImageTests<::testing::TestWithParam<uint64_t>> clCreateImageValidFlags;
+typedef ClCreateImageTests<::testing::Test> clCreateImageValidFlags;
 
 static cl_mem_flags validFlags[] = {
     CL_MEM_READ_WRITE,
@@ -642,38 +644,35 @@ static cl_mem_flags validFlags[] = {
     CL_MEM_ACCESS_FLAGS_UNRESTRICTED_INTEL,
 };
 
-INSTANTIATE_TEST_CASE_P(CreateImageWithFlags,
-                        clCreateImageValidFlags,
-                        ::testing::ValuesIn(validFlags));
-
-TEST_P(clCreateImageValidFlags, GivenValidFlagsWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
+TEST_F(clCreateImageValidFlags, GivenValidFlagsWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
     REQUIRE_IMAGE_SUPPORT_OR_SKIP(pContext);
-    cl_mem_flags flags = GetParam();
-    std::unique_ptr<char[]> ptr;
-    char *hostPtr = nullptr;
+    for (auto flags : validFlags) {
+        std::unique_ptr<char[]> ptr;
+        char *hostPtr = nullptr;
 
-    if (flags & CL_MEM_USE_HOST_PTR ||
-        flags & CL_MEM_COPY_HOST_PTR) {
-        ptr = std::make_unique<char[]>(alignUp(imageDesc.image_width * imageDesc.image_height * 4, MemoryConstants::pageSize));
-        hostPtr = ptr.get();
+        if (flags & CL_MEM_USE_HOST_PTR ||
+            flags & CL_MEM_COPY_HOST_PTR) {
+            ptr = std::make_unique<char[]>(alignUp(imageDesc.image_width * imageDesc.image_height * 4, MemoryConstants::pageSize));
+            hostPtr = ptr.get();
+        }
+
+        auto image = clCreateImage(
+            pContext,
+            flags,
+            &imageFormat,
+            &imageDesc,
+            hostPtr,
+            &retVal);
+
+        ASSERT_EQ(CL_SUCCESS, retVal);
+        EXPECT_NE(nullptr, image);
+
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_SUCCESS, retVal);
     }
-
-    auto image = clCreateImage(
-        pContext,
-        flags,
-        &imageFormat,
-        &imageDesc,
-        hostPtr,
-        &retVal);
-
-    ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, image);
-
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-typedef ClCreateImageTests<::testing::TestWithParam<uint64_t>> clCreateImageInvalidFlags;
+typedef ClCreateImageTests<::testing::Test> clCreateImageInvalidFlags;
 
 static cl_mem_flags invalidFlagsCombinations[] = {
     CL_MEM_READ_WRITE | CL_MEM_WRITE_ONLY,
@@ -688,58 +687,54 @@ static cl_mem_flags invalidFlagsCombinations[] = {
     CL_MEM_NO_ACCESS_INTEL | CL_MEM_WRITE_ONLY,
     CL_MEM_NO_ACCESS_INTEL | CL_MEM_READ_ONLY};
 
-INSTANTIATE_TEST_CASE_P(CreateImageWithFlags,
-                        clCreateImageInvalidFlags,
-                        ::testing::ValuesIn(invalidFlagsCombinations));
-
-TEST_P(clCreateImageInvalidFlags, GivenInvalidFlagsCombinationsWhenCreatingImageThenInvalidValueErrorIsReturned) {
+TEST_F(clCreateImageInvalidFlags, GivenInvalidFlagsCombinationsWhenCreatingImageThenInvalidValueErrorIsReturned) {
     REQUIRE_IMAGE_SUPPORT_OR_SKIP(pContext);
+    for (auto flags : invalidFlagsCombinations) {
+        char ptr[10];
+        imageDesc.image_row_pitch = 128;
 
-    char ptr[10];
-    imageDesc.image_row_pitch = 128;
-    cl_mem_flags flags = GetParam();
+        auto image = clCreateImage(
+            pContext,
+            flags,
+            &imageFormat,
+            &imageDesc,
+            ptr,
+            &retVal);
 
-    auto image = clCreateImage(
-        pContext,
-        flags,
-        &imageFormat,
-        &imageDesc,
-        ptr,
-        &retVal);
+        ASSERT_EQ(CL_INVALID_VALUE, retVal);
+        EXPECT_EQ(nullptr, image);
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
 
-    ASSERT_EQ(CL_INVALID_VALUE, retVal);
-    EXPECT_EQ(nullptr, image);
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
+        cl_mem_properties_intel properties[] = {CL_MEM_FLAGS, flags, 0};
+        image = clCreateImageWithPropertiesINTEL(
+            pContext,
+            properties,
+            0,
+            &imageFormat,
+            &imageDesc,
+            ptr,
+            &retVal);
 
-    cl_mem_properties_intel properties[] = {CL_MEM_FLAGS, flags, 0};
-    image = clCreateImageWithPropertiesINTEL(
-        pContext,
-        properties,
-        0,
-        &imageFormat,
-        &imageDesc,
-        ptr,
-        &retVal);
+        ASSERT_EQ(CL_INVALID_PROPERTY, retVal);
+        EXPECT_EQ(nullptr, image);
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
 
-    ASSERT_EQ(CL_INVALID_PROPERTY, retVal);
-    EXPECT_EQ(nullptr, image);
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
+        image = clCreateImageWithPropertiesINTEL(
+            pContext,
+            nullptr,
+            flags,
+            &imageFormat,
+            &imageDesc,
+            ptr,
+            &retVal);
 
-    image = clCreateImageWithPropertiesINTEL(
-        pContext,
-        nullptr,
-        flags,
-        &imageFormat,
-        &imageDesc,
-        ptr,
-        &retVal);
-
-    ASSERT_EQ(CL_INVALID_VALUE, retVal);
-    EXPECT_EQ(nullptr, image);
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
+        ASSERT_EQ(CL_INVALID_VALUE, retVal);
+        EXPECT_EQ(nullptr, image);
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
+    }
 }
 
 struct ImageFlags {
@@ -751,49 +746,46 @@ static ImageFlags flagsWithUnrestrictedIntel[] = {
     {CL_MEM_ACCESS_FLAGS_UNRESTRICTED_INTEL, CL_MEM_READ_WRITE},
     {CL_MEM_READ_WRITE, CL_MEM_ACCESS_FLAGS_UNRESTRICTED_INTEL}};
 
-typedef ClCreateImageTests<::testing::TestWithParam<ImageFlags>> clCreateImageFlagsUnrestrictedIntel;
+typedef ClCreateImageTests<::testing::Test> clCreateImageFlagsUnrestrictedIntel;
 
-INSTANTIATE_TEST_CASE_P(CreateImageWithFlags,
-                        clCreateImageFlagsUnrestrictedIntel,
-                        ::testing::ValuesIn(flagsWithUnrestrictedIntel));
-
-TEST_P(clCreateImageFlagsUnrestrictedIntel, GivenFlagsIncludingUnrestrictedIntelWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
+TEST_F(clCreateImageFlagsUnrestrictedIntel, GivenFlagsIncludingUnrestrictedIntelWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
     REQUIRE_IMAGES_OR_SKIP(pContext);
+    for (const auto &imageFlags : flagsWithUnrestrictedIntel) {
+        imageDesc.mem_object = nullptr;
+        imageFormat.image_channel_order = CL_NV12_INTEL;
+        cl_mem_flags parentFlags = imageFlags.parentFlags;
+        cl_mem_flags flags = imageFlags.flags;
 
-    imageFormat.image_channel_order = CL_NV12_INTEL;
-    ImageFlags imageFlags = GetParam();
-    cl_mem_flags parentFlags = imageFlags.parentFlags;
-    cl_mem_flags flags = imageFlags.flags;
+        auto image = clCreateImage(
+            pContext,
+            parentFlags | CL_MEM_HOST_NO_ACCESS,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    auto image = clCreateImage(
-        pContext,
-        parentFlags | CL_MEM_HOST_NO_ACCESS,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+        EXPECT_NE(nullptr, image);
 
-    ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, image);
+        imageDesc.mem_object = image;
+        imageFormat.image_channel_order = CL_RG;
 
-    imageDesc.mem_object = image;
-    imageFormat.image_channel_order = CL_RG;
+        auto imageFromImageObject = clCreateImage(
+            pContext,
+            flags,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    auto imageFromImageObject = clCreateImage(
-        pContext,
-        flags,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+        EXPECT_NE(nullptr, imageFromImageObject);
 
-    ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, imageFromImageObject);
-
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    retVal = clReleaseMemObject(imageFromImageObject);
-    EXPECT_EQ(CL_SUCCESS, retVal);
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        retVal = clReleaseMemObject(imageFromImageObject);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+    }
 }
 
 static ImageFlags validFlagsAndParentFlags[] = {
@@ -802,49 +794,46 @@ static ImageFlags validFlagsAndParentFlags[] = {
     {CL_MEM_NO_ACCESS_INTEL, CL_MEM_HOST_NO_ACCESS},
     {CL_MEM_HOST_NO_ACCESS, CL_MEM_READ_WRITE}};
 
-typedef ClCreateImageTests<::testing::TestWithParam<ImageFlags>> clCreateImageValidFlagsAndParentFlagsCombinations;
+typedef ClCreateImageTests<::testing::Test> clCreateImageValidFlagsAndParentFlagsCombinations;
 
-INSTANTIATE_TEST_CASE_P(CreateImageWithFlags,
-                        clCreateImageValidFlagsAndParentFlagsCombinations,
-                        ::testing::ValuesIn(validFlagsAndParentFlags));
-
-TEST_P(clCreateImageValidFlagsAndParentFlagsCombinations, GivenValidFlagsAndParentFlagsWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
+TEST_F(clCreateImageValidFlagsAndParentFlagsCombinations, GivenValidFlagsAndParentFlagsWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
     REQUIRE_IMAGES_OR_SKIP(pContext);
+    for (const auto &imageFlags : validFlagsAndParentFlags) {
+        imageDesc.mem_object = nullptr;
+        imageFormat.image_channel_order = CL_NV12_INTEL;
+        cl_mem_flags parentFlags = imageFlags.parentFlags;
+        cl_mem_flags flags = imageFlags.flags;
 
-    imageFormat.image_channel_order = CL_NV12_INTEL;
-    ImageFlags imageFlags = GetParam();
-    cl_mem_flags parentFlags = imageFlags.parentFlags;
-    cl_mem_flags flags = imageFlags.flags;
+        auto image = clCreateImage(
+            pContext,
+            parentFlags | CL_MEM_HOST_NO_ACCESS,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    auto image = clCreateImage(
-        pContext,
-        parentFlags | CL_MEM_HOST_NO_ACCESS,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+        EXPECT_NE(nullptr, image);
 
-    ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, image);
+        imageDesc.mem_object = image;
+        imageFormat.image_channel_order = CL_RG;
 
-    imageDesc.mem_object = image;
-    imageFormat.image_channel_order = CL_RG;
+        auto imageFromImageObject = clCreateImage(
+            pContext,
+            flags,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    auto imageFromImageObject = clCreateImage(
-        pContext,
-        flags,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+        EXPECT_NE(nullptr, imageFromImageObject);
 
-    ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, imageFromImageObject);
-
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    retVal = clReleaseMemObject(imageFromImageObject);
-    EXPECT_EQ(CL_SUCCESS, retVal);
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        retVal = clReleaseMemObject(imageFromImageObject);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+    }
 }
 
 static ImageFlags invalidFlagsAndParentFlags[] = {
@@ -858,48 +847,46 @@ static ImageFlags invalidFlagsAndParentFlags[] = {
     {CL_MEM_HOST_NO_ACCESS, CL_MEM_HOST_WRITE_ONLY},
     {CL_MEM_HOST_NO_ACCESS, CL_MEM_HOST_READ_ONLY}};
 
-typedef ClCreateImageTests<::testing::TestWithParam<ImageFlags>> clCreateImageInvalidFlagsAndParentFlagsCombinations;
+typedef ClCreateImageTests<::testing::Test> clCreateImageInvalidFlagsAndParentFlagsCombinations;
 
-INSTANTIATE_TEST_CASE_P(CreateImageWithFlags,
-                        clCreateImageInvalidFlagsAndParentFlagsCombinations,
-                        ::testing::ValuesIn(invalidFlagsAndParentFlags));
-
-TEST_P(clCreateImageInvalidFlagsAndParentFlagsCombinations, GivenInvalidFlagsAndParentFlagsWhenCreatingImageThenInvalidMemObjectErrorIsReturned) {
+TEST_F(clCreateImageInvalidFlagsAndParentFlagsCombinations, GivenInvalidFlagsAndParentFlagsWhenCreatingImageThenInvalidMemObjectErrorIsReturned) {
     REQUIRE_IMAGE_SUPPORT_OR_SKIP(pContext);
-    imageFormat.image_channel_order = CL_NV12_INTEL;
-    ImageFlags imageFlags = GetParam();
-    cl_mem_flags parentFlags = imageFlags.parentFlags;
-    cl_mem_flags flags = imageFlags.flags;
+    for (const auto &imageFlags : invalidFlagsAndParentFlags) {
+        imageDesc.mem_object = nullptr;
+        imageFormat.image_channel_order = CL_NV12_INTEL;
+        cl_mem_flags parentFlags = imageFlags.parentFlags;
+        cl_mem_flags flags = imageFlags.flags;
 
-    auto image = clCreateImage(
-        pContext,
-        parentFlags | CL_MEM_HOST_NO_ACCESS,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        auto image = clCreateImage(
+            pContext,
+            parentFlags | CL_MEM_HOST_NO_ACCESS,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    ASSERT_EQ(CL_SUCCESS, retVal);
-    EXPECT_NE(nullptr, image);
+        ASSERT_EQ(CL_SUCCESS, retVal);
+        EXPECT_NE(nullptr, image);
 
-    imageFormat.image_channel_order = CL_RG;
-    imageDesc.mem_object = image;
+        imageFormat.image_channel_order = CL_RG;
+        imageDesc.mem_object = image;
 
-    auto imageFromImageObject = clCreateImage(
-        pContext,
-        flags,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        auto imageFromImageObject = clCreateImage(
+            pContext,
+            flags,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    ASSERT_EQ(CL_INVALID_VALUE, retVal);
-    EXPECT_EQ(nullptr, imageFromImageObject);
+        ASSERT_EQ(CL_INVALID_VALUE, retVal);
+        EXPECT_EQ(nullptr, imageFromImageObject);
 
-    retVal = clReleaseMemObject(image);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    retVal = clReleaseMemObject(imageFromImageObject);
-    EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
+        retVal = clReleaseMemObject(image);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        retVal = clReleaseMemObject(imageFromImageObject);
+        EXPECT_EQ(CL_INVALID_MEM_OBJECT, retVal);
+    }
 }
 
 struct ImageSizes {
@@ -910,30 +897,27 @@ struct ImageSizes {
 
 ImageSizes validImage2DSizes[] = {{64, 64, 1}, {3, 3, 1}, {8192, 1, 1}, {117, 39, 1}, {16384, 4, 1}, {4, 16384, 1}};
 
-typedef ClCreateImageTests<::testing::TestWithParam<ImageSizes>> clCreateImageValidSizesTest;
+typedef ClCreateImageTests<::testing::Test> clCreateImageValidSizesTest;
 
-INSTANTIATE_TEST_CASE_P(validImage2DSizes,
-                        clCreateImageValidSizesTest,
-                        ::testing::ValuesIn(validImage2DSizes));
-
-TEST_P(clCreateImageValidSizesTest, GivenValidSizesWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
+TEST_F(clCreateImageValidSizesTest, GivenValidSizesWhenCreatingImageThenImageIsCreatedAndSuccessReturned) {
     REQUIRE_IMAGE_SUPPORT_OR_SKIP(pContext);
-    ImageSizes sizes = GetParam();
-    imageDesc.image_width = sizes.width;
-    imageDesc.image_height = sizes.height;
-    imageDesc.image_depth = sizes.depth;
+    for (const auto &sizes : validImage2DSizes) {
+        imageDesc.image_width = sizes.width;
+        imageDesc.image_height = sizes.height;
+        imageDesc.image_depth = sizes.depth;
 
-    auto image = clCreateImage(
-        pContext,
-        CL_MEM_READ_WRITE,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+        auto image = clCreateImage(
+            pContext,
+            CL_MEM_READ_WRITE,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    EXPECT_NE(nullptr, image);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-    retVal = clReleaseMemObject(image);
+        EXPECT_NE(nullptr, image);
+        EXPECT_EQ(CL_SUCCESS, retVal);
+        retVal = clReleaseMemObject(image);
+    }
 }
 
 typedef ClCreateImageTests<::testing::Test> clCreateImage2DTest;
@@ -1206,15 +1190,10 @@ TEST_F(ClCreateImageFromImageTest, GivenImage2dWhenCreatingImage2dFromImageWithT
         nullptr,
         &retVal);
 
-    if (pContext->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features == false) {
-        EXPECT_EQ(CL_IMAGE_FORMAT_NOT_SUPPORTED, retVal);
-        EXPECT_EQ(nullptr, imageFromImageObject);
-    } else {
-        EXPECT_EQ(CL_SUCCESS, retVal);
-        EXPECT_NE(nullptr, imageFromImageObject);
-        retVal = clReleaseMemObject(imageFromImageObject);
-        EXPECT_EQ(CL_SUCCESS, retVal);
-    }
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_NE(nullptr, imageFromImageObject);
+    retVal = clReleaseMemObject(imageFromImageObject);
+    EXPECT_EQ(CL_SUCCESS, retVal);
 
     retVal = clReleaseMemObject(image);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -1264,11 +1243,7 @@ TEST_F(ClCreateImageFromImageTest, GivenImage2dWhenCreatingImage2dFromImageWithD
         nullptr,
         &retVal);
 
-    if (pContext->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features) {
-        EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
-    } else {
-        EXPECT_EQ(CL_IMAGE_FORMAT_NOT_SUPPORTED, retVal);
-    }
+    EXPECT_EQ(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR, retVal);
     EXPECT_EQ(nullptr, imageFromImageObject);
 
     retVal = clReleaseMemObject(image);
@@ -1327,8 +1302,7 @@ TEST_F(ClCreateImageFromImageTest, GivenImage2dWhenCreatingImage2dFromImageWithT
 
 uint32_t non2dImageTypes[] = {CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY, CL_MEM_OBJECT_IMAGE1D_BUFFER, CL_MEM_OBJECT_IMAGE2D_ARRAY, CL_MEM_OBJECT_IMAGE3D};
 
-struct ClCreateNon2dImageFromImageTest : public ClCreateImageFromImageTest,
-                                         public ::testing::WithParamInterface<uint32_t /*image type*/> {
+struct ClCreateNon2dImageFromImageTest : public ClCreateImageFromImageTest {
     void SetUp() override {
         ClCreateImageFromImageTest::SetUp();
         image = ImageFunctions::validateAndCreateImage(pContext, nullptr, CL_MEM_READ_ONLY, 0, &imageFormat, &imageDesc, nullptr, retVal);
@@ -1343,31 +1317,29 @@ struct ClCreateNon2dImageFromImageTest : public ClCreateImageFromImageTest,
     cl_mem image;
 };
 
-TEST_P(ClCreateNon2dImageFromImageTest, GivenImage2dWhenCreatingImageFromNon2dImageThenInvalidImageDescriptorErrorIsReturned) {
+TEST_F(ClCreateNon2dImageFromImageTest, GivenImage2dWhenCreatingImageFromNon2dImageThenInvalidImageDescriptorErrorIsReturned) {
     REQUIRE_IMAGE_SUPPORT_OR_SKIP(pContext);
-    imageDesc.image_type = GetParam();
-    auto imageFromImageObject = clCreateImage(
-        pContext,
-        CL_MEM_READ_ONLY,
-        &imageFormat,
-        &imageDesc,
-        nullptr,
-        &retVal);
+    for (auto imageType : non2dImageTypes) {
+        imageDesc.image_type = imageType;
+        auto imageFromImageObject = clCreateImage(
+            pContext,
+            CL_MEM_READ_ONLY,
+            &imageFormat,
+            &imageDesc,
+            nullptr,
+            &retVal);
 
-    EXPECT_EQ(CL_INVALID_IMAGE_DESCRIPTOR, retVal);
-    EXPECT_EQ(nullptr, imageFromImageObject);
+        EXPECT_EQ(CL_INVALID_IMAGE_DESCRIPTOR, retVal);
+        EXPECT_EQ(nullptr, imageFromImageObject);
+    }
 }
-
-INSTANTIATE_TEST_CASE_P(clCreateNon2dImageFromImageTests,
-                        ClCreateNon2dImageFromImageTest,
-                        ::testing::ValuesIn(non2dImageTypes));
 
 using clCreateImageWithMultiDeviceContextTests = MultiRootDeviceFixture;
 
 TEST_F(clCreateImageWithMultiDeviceContextTests, GivenImageCreatedWithoutHostPtrAndWithContextdWithMultiDeviceThenGraphicsAllocationsAreProperlyCreatedAndMapPtrIsNotSet) {
     REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
 
-    std::unique_ptr<Image> image(ImageHelper<ImageWithoutHostPtr>::create(context.get()));
+    std::unique_ptr<Image> image(ImageHelperUlt<ImageWithoutHostPtr>::create(context.get()));
 
     EXPECT_EQ(image->getMultiGraphicsAllocation().getGraphicsAllocations().size(), 3u);
     EXPECT_NE(image->getMultiGraphicsAllocation().getGraphicsAllocation(1u), nullptr);
@@ -1382,7 +1354,7 @@ TEST_F(clCreateImageWithMultiDeviceContextTests, GivenImageCreatedWithHostPtrAnd
     REQUIRE_IMAGES_OR_SKIP(defaultHwInfo);
     DebugManagerStateRestore dbgRestore;
 
-    std::unique_ptr<Image> image(ImageHelper<ImageUseHostPtr<Image1dDefaults>>::create(context.get()));
+    std::unique_ptr<Image> image(ImageHelperUlt<ImageUseHostPtr<Image1dDefaults>>::create(context.get()));
 
     EXPECT_EQ(image->getMultiGraphicsAllocation().getGraphicsAllocations().size(), 3u);
     EXPECT_NE(image->getMultiGraphicsAllocation().getGraphicsAllocation(1u), nullptr);
@@ -1401,7 +1373,7 @@ TEST_F(clCreateImageWithMultiDeviceContextTests, GivenContextdWithMultiDeviceFai
         static_cast<MockMemoryManager *>(context->getMemoryManager())->successAllocatedGraphicsMemoryIndex = 0u;
         static_cast<MockMemoryManager *>(context->getMemoryManager())->maxSuccessAllocatedGraphicsMemoryIndex = 0u;
 
-        std::unique_ptr<Image> image(ImageHelper<ImageWithoutHostPtr>::create(context.get()));
+        std::unique_ptr<Image> image(ImageHelperUlt<ImageWithoutHostPtr>::create(context.get()));
 
         EXPECT_EQ(nullptr, image);
     }
@@ -1410,7 +1382,7 @@ TEST_F(clCreateImageWithMultiDeviceContextTests, GivenContextdWithMultiDeviceFai
         static_cast<MockMemoryManager *>(context->getMemoryManager())->successAllocatedGraphicsMemoryIndex = 0u;
         static_cast<MockMemoryManager *>(context->getMemoryManager())->maxSuccessAllocatedGraphicsMemoryIndex = 1u;
 
-        std::unique_ptr<Image> image(ImageHelper<ImageWithoutHostPtr>::create(context.get()));
+        std::unique_ptr<Image> image(ImageHelperUlt<ImageWithoutHostPtr>::create(context.get()));
 
         EXPECT_EQ(nullptr, image);
     }

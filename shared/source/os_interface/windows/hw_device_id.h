@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,9 @@
 
 #pragma once
 #include "shared/source/helpers/driver_model_type.h"
-#include "shared/source/os_interface/os_interface.h"
+#include "shared/source/os_interface/hw_device_id.h"
+#include "shared/source/os_interface/windows/d3dkmthk_wrapper.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
-
-#include <d3dkmthk.h>
 
 #include <memory>
 
@@ -21,7 +20,7 @@ struct OsEnvironment;
 
 class HwDeviceIdWddm : public HwDeviceId {
   public:
-    static constexpr DriverModelType driverModelType = DriverModelType::WDDM;
+    static constexpr DriverModelType driverModelType = DriverModelType::wddm;
 
     HwDeviceIdWddm(D3DKMT_HANDLE adapterIn, LUID adapterLuidIn, uint32_t adapterNodeMaskIn, OsEnvironment *osEnvironmentIn, std::unique_ptr<UmKmDataTranslator> umKmDataTranslator);
     Gdi *getGdi() const;
@@ -39,6 +38,7 @@ class HwDeviceIdWddm : public HwDeviceId {
     UmKmDataTranslator *getUmKmDataTranslator() {
         return umKmDataTranslator.get();
     }
+    bool isDriverStoreValid() const;
 
   protected:
     const LUID adapterLuid;

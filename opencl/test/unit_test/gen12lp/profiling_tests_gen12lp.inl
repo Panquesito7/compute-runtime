@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/os_interface/os_time.h"
 #include "shared/source/utilities/hw_timestamps.h"
 #include "shared/test/common/test_macros/test.h"
 
@@ -19,7 +20,7 @@ struct ProfilingTestsGen12LP : public CommandEnqueueFixture,
                                public ::testing::Test {
     void SetUp() override {
         CommandEnqueueFixture::setUp(CL_QUEUE_PROFILING_ENABLE);
-        mockKernelWithInternals = std::make_unique<MockKernelWithInternals>(*pClDevice, nullptr);
+        mockKernelWithInternals = std::make_unique<MockKernelWithInternals>(*context);
     }
 
     void TearDown() override {
@@ -32,7 +33,6 @@ struct ProfilingTestsGen12LP : public CommandEnqueueFixture,
 
 GEN12LPTEST_F(ProfilingTestsGen12LP, GivenCommandQueueWithProflingWhenWalkerIsDispatchedThenTwoPIPECONTROLSWithOPERATION_WRITE_TIMESTAMPArePresentInCS) {
     typedef typename FamilyType::PIPE_CONTROL PIPE_CONTROL;
-    typedef typename FamilyType::GPGPU_WALKER GPGPU_WALKER;
 
     size_t globalOffsets[3] = {0, 0, 0};
     size_t workItems[3] = {1, 1, 1};
@@ -85,17 +85,17 @@ struct MockTagNode : public TagNode<TagType> {
 };
 
 class MyDeviceTime : public DeviceTime {
-    double getDynamicDeviceTimerResolution(HardwareInfo const &hwInfo) const override {
+    double getDynamicDeviceTimerResolution() const override {
         EXPECT_FALSE(true);
         return 1.0;
     }
-    uint64_t getDynamicDeviceTimerClock(HardwareInfo const &hwInfo) const override {
+    uint64_t getDynamicDeviceTimerClock() const override {
         EXPECT_FALSE(true);
         return 0;
     }
-    bool getCpuGpuTime(TimeStampData *pGpuCpuTime, OSTime *) override {
+    TimeQueryStatus getGpuCpuTimeImpl(TimeStampData *pGpuCpuTime, OSTime *) override {
         EXPECT_FALSE(true);
-        return false;
+        return TimeQueryStatus::deviceLost;
     }
 };
 
@@ -125,7 +125,7 @@ int MyOSTime::instanceNum = 0;
 
 GEN12LPTEST_F(ProfilingTestsGen12LP, givenRawTimestampsDebugModeWhenDataIsQueriedThenRawDataIsReturnedGen12Lp) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.ReturnRawGpuTimestamps.set(1);
+    debugManager.flags.ReturnRawGpuTimestamps.set(1);
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
     MyOSTime::instanceNum = 0;
     device->setOSTime(new MyOSTime());
@@ -150,20 +150,20 @@ GEN12LPTEST_F(ProfilingTestsGen12LP, givenRawTimestampsDebugModeWhenDataIsQuerie
     MockEvent<Event> event(&cmdQ, CL_COMPLETE, 0, 0);
     cl_event clEvent = &event;
 
-    event.queueTimeStamp.cpuTimeinNS = 1;
+    event.queueTimeStamp.cpuTimeInNs = 1;
     event.queueTimeStamp.gpuTimeStamp = 2;
 
-    event.submitTimeStamp.cpuTimeinNS = 3;
+    event.submitTimeStamp.cpuTimeInNs = 3;
     event.submitTimeStamp.gpuTimeStamp = 4;
 
     event.setCPUProfilingPath(false);
     event.timeStampNode = &timestampNode;
     event.calcProfilingData();
 
-    cl_ulong queued, submited, start, end, complete;
+    cl_ulong queued, submitted, start, end, complete;
 
     clGetEventProfilingInfo(clEvent, CL_PROFILING_COMMAND_QUEUED, sizeof(cl_ulong), &queued, nullptr);
-    clGetEventProfilingInfo(clEvent, CL_PROFILING_COMMAND_SUBMIT, sizeof(cl_ulong), &submited, nullptr);
+    clGetEventProfilingInfo(clEvent, CL_PROFILING_COMMAND_SUBMIT, sizeof(cl_ulong), &submitted, nullptr);
     clGetEventProfilingInfo(clEvent, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start, nullptr);
     clGetEventProfilingInfo(clEvent, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end, nullptr);
     clGetEventProfilingInfo(clEvent, CL_PROFILING_COMMAND_COMPLETE, sizeof(cl_ulong), &complete, nullptr);
@@ -171,7 +171,7 @@ GEN12LPTEST_F(ProfilingTestsGen12LP, givenRawTimestampsDebugModeWhenDataIsQuerie
     EXPECT_EQ(timestamp.globalEndTS, complete);
     EXPECT_EQ(timestamp.globalEndTS, end);
     EXPECT_EQ(timestamp.globalStartTS, start);
-    EXPECT_EQ(event.submitTimeStamp.gpuTimeStamp, submited);
+    EXPECT_EQ(event.submitTimeStamp.gpuTimeStamp, submitted);
     EXPECT_EQ(event.queueTimeStamp.gpuTimeStamp, queued);
     event.timeStampNode = nullptr;
 }

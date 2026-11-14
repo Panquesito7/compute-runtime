@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,18 +9,24 @@
 
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
-#include "level_zero/sysman/source/standby/linux/sysman_os_standby_imp.h"
+#include "level_zero/sysman/source/api/standby/linux/sysman_os_standby_imp.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
 
 namespace L0 {
+namespace Sysman {
 namespace ult {
 
 const std::string standbyModeFile("gt/gt0/rc6_enable");
 const std::string standbyModeFile1("gt/gt1/rc6_enable");
 const std::string standbyModeFileLegacy("power/rc6_enable");
+const std::string standbyModeFileXe("device/power/control");
+const std::string standbyModeXeDefault("auto");
+const std::string standbyModeXeNever("on");
 
-struct MockStandbySysfsAccess : public L0::Sysman::SysfsAccess {
+struct MockStandbySysfsAccessInterface : public L0::Sysman::SysFsAccessInterface {
     ze_result_t mockError = ZE_RESULT_SUCCESS;
     int mockStandbyMode = -1;
+    std::string mockStandbyModeString = "";
     bool isStandbyModeFileAvailable = true;
     ::mode_t mockStandbyFileMode = S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR;
     ADDMETHOD_NOBASE(directoryExists, bool, true, (const std::string path));
@@ -29,7 +35,15 @@ struct MockStandbySysfsAccess : public L0::Sysman::SysfsAccess {
         return getVal(file, val);
     }
 
-    ze_result_t write(const std::string file, int val) override {
+    ze_result_t write(const std::string &file, int val) override {
+        return setVal(file, val);
+    }
+
+    ze_result_t read(const std::string file, std::string &val) override {
+        return getVal(file, val);
+    }
+
+    ze_result_t write(const std::string &file, std::string_view val) override {
         return setVal(file, val);
     }
 
@@ -83,16 +97,55 @@ struct MockStandbySysfsAccess : public L0::Sysman::SysfsAccess {
         return ZE_RESULT_ERROR_UNKNOWN;
     }
 
+    ze_result_t getVal(const std::string file, std::string &val) {
+        if (mockError != ZE_RESULT_SUCCESS) {
+            return mockError;
+        }
+        if ((isFileAccessible(file) == true) &&
+            (mockStandbyFileMode & S_IRUSR) != 0) {
+            val = mockStandbyModeString;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        if (isStandbyModeFileAvailable == false) {
+            return ZE_RESULT_ERROR_NOT_AVAILABLE;
+        }
+
+        if ((mockStandbyFileMode & S_IRUSR) == 0) {
+            return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+        }
+
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
+    ze_result_t setVal(const std::string file, const std::string_view val) {
+        if ((isFileAccessible(file) == true) &&
+            (mockStandbyFileMode & S_IWUSR) != 0) {
+            mockStandbyModeString = val;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        if (isFileAccessible(file) == false) {
+            return ZE_RESULT_ERROR_NOT_AVAILABLE;
+        }
+
+        if ((mockStandbyFileMode & S_IWUSR) == 0) {
+            return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+        }
+
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+
     void setValReturnError(ze_result_t error) {
         mockError = error;
     }
 
-    MockStandbySysfsAccess() = default;
-    ~MockStandbySysfsAccess() override = default;
+    MockStandbySysfsAccessInterface() = default;
+    ~MockStandbySysfsAccessInterface() override = default;
 
   private:
     bool isFileAccessible(const std::string file) {
-        if (((file.compare(standbyModeFile) == 0) || (file.compare(standbyModeFile1) == 0) || (file.compare(standbyModeFileLegacy) == 0)) && (isStandbyModeFileAvailable == true)) {
+        if (((file.compare(standbyModeFile) == 0) || (file.compare(standbyModeFile1) == 0) || (file.compare(standbyModeFileLegacy) == 0) || (file.compare(standbyModeFileXe) == 0)) && (isStandbyModeFileAvailable == true)) {
             return true;
         }
         return false;
@@ -103,6 +156,9 @@ class PublicLinuxStandbyImp : public L0::Sysman::LinuxStandbyImp {
   public:
     PublicLinuxStandbyImp(L0::Sysman::OsSysman *pOsSysman, ze_bool_t onSubdevice, uint32_t subdeviceId) : L0::Sysman::LinuxStandbyImp(pOsSysman, onSubdevice, subdeviceId) {}
     using L0::Sysman::LinuxStandbyImp::pSysfsAccess;
+    using L0::Sysman::LinuxStandbyImp::pSysmanKmdInterface;
 };
+
 } // namespace ult
+} // namespace Sysman
 } // namespace L0

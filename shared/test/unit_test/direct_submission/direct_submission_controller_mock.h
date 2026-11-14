@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,26 +11,81 @@
 
 namespace NEO {
 struct DirectSubmissionControllerMock : public DirectSubmissionController {
+    using DirectSubmissionController::activeSubmissionsCount;
+    using DirectSubmissionController::bcsTimeoutDivisor;
     using DirectSubmissionController::checkNewSubmissions;
+    using DirectSubmissionController::condVarMutex;
+    using DirectSubmissionController::contextGroupTimeout;
     using DirectSubmissionController::directSubmissionControllingThread;
     using DirectSubmissionController::directSubmissions;
     using DirectSubmissionController::directSubmissionsMutex;
+    using DirectSubmissionController::getSleepValue;
+    using DirectSubmissionController::groupLastActivityTime;
+    using DirectSubmissionController::handlePagingFenceRequests;
+    using DirectSubmissionController::isCopyEngineOnDeviceIdle;
+    using DirectSubmissionController::isCsrsContextGroupIdleDetectionEnabled;
+    using DirectSubmissionController::isDirectSubmissionIdle;
     using DirectSubmissionController::keepControlling;
-    using DirectSubmissionController::lastTerminateCpuTimestamp;
-    using DirectSubmissionController::maxTimeout;
+    using DirectSubmissionController::pagingFenceRequests;
     using DirectSubmissionController::timeout;
-    using DirectSubmissionController::timeoutDivisor;
+    using DirectSubmissionController::timeSinceLastCheck;
 
-    void sleep() override {
-        DirectSubmissionController::sleep();
+    void wait(std::unique_lock<std::mutex> &lock) override {
+        waitOnConditionVar.store(!waitPredicate());
+        DirectSubmissionController::wait(lock);
+    }
+
+    void waitTillSleep() {
+        do {
+            std::this_thread::yield();
+            std::lock_guard<std::mutex> lock(condVarMutex);
+        } while (!waitOnConditionVar.load());
+    }
+
+    bool sleep(std::unique_lock<std::mutex> &lock) override {
         this->sleepCalled = true;
+        if (callBaseSleepMethod) {
+            return DirectSubmissionController::sleep(lock);
+        } else {
+            auto ret = sleepReturnValue.load();
+            sleepReturnValue.store(false);
+            return ret;
+        }
+    }
+
+    void handlePagingFenceRequests(std::unique_lock<std::mutex> &lock) override {
+        handlePagingFenceRequestsCalled = true;
+        DirectSubmissionController::handlePagingFenceRequests(lock);
+    }
+
+    void checkNewSubmissions() override {
+        checkNewSubmissionCalled.store(true);
+        DirectSubmissionController::checkNewSubmissions();
     }
 
     SteadyClock::time_point getCpuTimestamp() override {
-        return cpuTimestamp;
+        auto current = cpuTimestamp;
+        cpuTimestamp += cpuTimestampIncrementPerCall;
+        return current;
+    }
+
+    TimeoutElapsedMode timeoutElapsed() override {
+        if (timeoutElapsedCallBase) {
+            return DirectSubmissionController::timeoutElapsed();
+        }
+        auto ret = timeoutElapsedReturnValue.load();
+        return ret;
     }
 
     SteadyClock::time_point cpuTimestamp{};
-    bool sleepCalled = false;
+    std::chrono::microseconds cpuTimestampIncrementPerCall{0};
+    std::atomic<bool> waitOnConditionVar{false};
+    std::atomic<bool> sleepCalled{false};
+    std::atomic<bool> sleepReturnValue{false};
+    std::atomic<TimeoutElapsedMode> timeoutElapsedReturnValue{TimeoutElapsedMode::notElapsed};
+    std::atomic<bool> timeoutElapsedCallBase{false};
+    std::atomic<bool> checkNewSubmissionCalled{false};
+    std::atomic<bool> handlePagingFenceRequestsCalled{false};
+    bool callBaseSleepMethod = false;
 };
 } // namespace NEO

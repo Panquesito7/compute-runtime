@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,16 +7,23 @@
 
 #pragma once
 
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/memory_manager/os_agnostic_memory_manager.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/ult_hw_config.h"
 #include "shared/test/common/mocks/mock_gmm.h"
 #include "shared/test/common/mocks/mock_gmm_resource_info.h"
-#include "shared/test/common/test_macros/test.h"
 
+#include "opencl/source/sharings/d3d/cl_d3d_api.h"
 #include "opencl/test/unit_test/fixtures/platform_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_d3d_objects.h"
+
+#include "gtest/gtest.h"
+
+#include <memory>
 
 namespace NEO {
 template <>
@@ -37,6 +44,7 @@ class D3DTests : public PlatformFixture, public ::testing::Test {
   public:
     typedef typename T::D3DDevice D3DDevice;
     typedef typename T::D3DQuery D3DQuery;
+    typedef typename T::D3DFence D3DFence;
     typedef typename T::D3DQueryDesc D3DQueryDesc;
     typedef typename T::D3DResource D3DResource;
     typedef typename T::D3DBufferDesc D3DBufferDesc;
@@ -50,28 +58,18 @@ class D3DTests : public PlatformFixture, public ::testing::Test {
       public:
         using OsAgnosticMemoryManager::OsAgnosticMemoryManager;
         bool failAlloc = false;
-        GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+        GraphicsAllocation *createGraphicsAllocationFromSharedHandle(const OsHandleData &osHandleData, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
             if (failAlloc) {
                 return nullptr;
             }
-            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(handle, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
-            alloc->setDefaultGmm(forceGmm);
-            gmmOwnershipPassed = true;
-            return alloc;
-        }
-        GraphicsAllocation *createGraphicsAllocationFromNTHandle(void *handle, uint32_t rootDeviceIndex, AllocationType allocType) override {
-            if (failAlloc) {
-                return nullptr;
-            }
-            AllocationProperties properties(rootDeviceIndex, true, 0, AllocationType::INTERNAL_HOST_MEMORY, false, false, 0);
-            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(toOsHandle(handle), properties, false, false, true, nullptr);
+            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(osHandleData, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
             alloc->setDefaultGmm(forceGmm);
             gmmOwnershipPassed = true;
             return alloc;
         }
 
         bool verifyValue = true;
-        bool verifyHandle(osHandle handle, uint32_t rootDeviceIndex, bool) { return verifyValue; }
+        bool verifyHandle(osHandle handle, uint32_t rootDeviceIndex, bool) override { return verifyValue; }
 
         bool mapAuxGpuVA(GraphicsAllocation *graphicsAllocation) override {
             mapAuxGpuVACalled++;
@@ -88,7 +86,7 @@ class D3DTests : public PlatformFixture, public ::testing::Test {
         imgDesc.imageHeight = 4;
         imgDesc.imageWidth = 4;
         imgDesc.imageDepth = 1;
-        imgDesc.imageType = ImageType::Image2D;
+        imgDesc.imageType = ImageType::image2D;
         auto imgInfo = MockGmm::initImgInfo(imgDesc, 0, nullptr);
         gmm = MockGmm::queryImgParams(pPlatform->peekExecutionEnvironment()->rootDeviceEnvironments[0]->getGmmHelper(), imgInfo, false).release();
         mockGmmResInfo = static_cast<MockGmmResourceInfo *>(gmm->gmmResourceInfo.get());
@@ -112,7 +110,7 @@ class D3DTests : public PlatformFixture, public ::testing::Test {
         context->setSharingFunctions(mockSharingFcns);
         context->memoryManager = mockMM.get();
         cmdQ = new MockCommandQueue(context, context->getDevice(0), 0, false);
-        DebugManager.injectFcn = &mockSharingFcns->mockGetDxgiDesc;
+        debugManager.injectFcn = reinterpret_cast<void *>(&mockSharingFcns->mockGetDxgiDesc);
 
         mockSharingFcns->mockTexture2dDesc.ArraySize = 1;
         mockSharingFcns->mockTexture2dDesc.MipLevels = 4;
@@ -198,12 +196,12 @@ class D3DTests : public PlatformFixture, public ::testing::Test {
     }
 
     MockD3DSharingFunctions<T> *mockSharingFcns;
-    MockContext *context;
-    MockCommandQueue *cmdQ;
-    char dummyD3DBuffer;
-    char dummyD3DBufferStaging;
-    char dummyD3DTexture;
-    char dummyD3DTextureStaging;
+    MockContext *context = nullptr;
+    MockCommandQueue *cmdQ = nullptr;
+    uint64_t dummyD3DBuffer{};
+    uint64_t dummyD3DBufferStaging{};
+    uint64_t dummyD3DTexture{};
+    uint64_t dummyD3DTextureStaging{};
     Gmm *gmm = nullptr;
     MockGmmResourceInfo *mockGmmResInfo = nullptr;
 

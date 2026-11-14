@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,6 +26,7 @@ struct TestMachineConfiguration {
     } devices[MAX_DEVICES_IN_MACHINE];
     uint32_t deviceCount = 0;
     uint32_t deviceId;
+    std::vector<ze_driver_extension_properties_t> driverExtensionsProperties{};
 };
 
 template <class T>
@@ -56,6 +57,7 @@ class TestSettings {
     std::vector<TestParameter<std::string>> metricNames{};
     TestParameter<uint32_t> eventNReportCount{1};
     TestParameter<bool> showSystemInfo{false};
+    TestParameter<uint32_t> programmableLimit{0};
     void readMetricNames(char *optArg);
 
   private:
@@ -78,6 +80,7 @@ void createL0();
 ze_driver_handle_t getDriver();
 ze_context_handle_t createContext(ze_driver_handle_t &driverHandle);
 bool isDeviceAvailable(uint32_t deviceIndex, int32_t subDeviceIndex);
+bool isDeviceSubDevice(ze_device_handle_t deviceHandle);
 ze_device_handle_t getDevice(ze_driver_handle_t &driverHandle, uint32_t deviceIndex);
 ze_device_handle_t getSubDevice(ze_device_handle_t &deviceHandle, uint32_t subDeviceIndex);
 ze_command_queue_handle_t createCommandQueue(ze_context_handle_t &contextHandle,
@@ -85,14 +88,38 @@ ze_command_queue_handle_t createCommandQueue(ze_context_handle_t &contextHandle,
 ze_command_list_handle_t createCommandList(ze_context_handle_t &contextHandle, ze_device_handle_t &deviceHandle);
 ze_command_list_handle_t createImmediateCommandList(ze_context_handle_t &contextHandle, ze_device_handle_t &deviceHandle);
 void printMetricGroupProperties(const zet_metric_group_properties_t &properties);
+void printMetricGroupAndMetricProperties(zet_metric_group_handle_t metricGroup);
 void printMetricProperties(const zet_metric_properties_t &properties);
 void sleep(uint32_t milliseconds);
 bool getTestMachineConfiguration(TestMachineConfiguration &machineConfig);
 zet_metric_group_handle_t findMetricGroup(const char *groupName,
-                                          const zet_metric_group_sampling_type_flag_t samplingType,
+                                          const zet_metric_group_sampling_type_flags_t samplingType,
                                           ze_device_handle_t deviceHandle);
 ze_event_pool_handle_t createHostVisibleEventPool(ze_context_handle_t contextHandle, ze_device_handle_t deviceHandle);
 ze_event_handle_t createHostVisibleEvent(ze_event_pool_handle_t hostVisibleEventPool);
 void obtainCalculatedMetrics(zet_metric_group_handle_t metricGroup, uint8_t *rawData, uint32_t rawDataSize);
+void showMetricsExportData(uint8_t *pExportData, size_t exportDataSize);
+
+typedef ze_result_t (*pfzetIntelMetricScopesGetExp)(
+    zet_context_handle_t, zet_device_handle_t, uint32_t *, zet_intel_metric_scope_exp_handle_t *);
+typedef ze_result_t (*pfzetIntelMetricScopeGetPropertiesExp)(
+    zet_intel_metric_scope_exp_handle_t, zet_intel_metric_scope_properties_exp_t *);
+typedef ze_result_t (*pfzetIntelMetricSupportedScopesGetExp)(
+    zet_metric_handle_t, uint32_t *, zet_intel_metric_scope_exp_handle_t *);
+
+class ZetIntelMetricExtensions {
+  public:
+    pfzetIntelMetricScopesGetExp zetIntelMetricScopesGetExp = nullptr;
+    pfzetIntelMetricScopeGetPropertiesExp zetIntelMetricScopeGetPropertiesExp = nullptr;
+    pfzetIntelMetricSupportedScopesGetExp zetIntelMetricSupportedScopesGetExp = nullptr;
+
+    ZetIntelMetricExtensions(ze_driver_handle_t driverHandle);
+};
+
+// os specific methods
+bool osStreamMpCollectionWorkloadDifferentProcess();
+bool osStreamMpCollectionWorkloadSameProcess();
+int32_t osRunAllTests(int32_t runStatus);
+bool isEnvVariableSet(const char *name);
 
 } // namespace ZelloMetricsUtility

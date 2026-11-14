@@ -1,21 +1,25 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/memory_manager/allocation_properties.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/test/common/helpers/ult_hw_config.h"
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/libult/create_command_stream.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/cmdqueue/cmdqueue_cmdlist_execution_internal_options.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_module.h"
 
 namespace L0 {
 namespace ult {
@@ -42,8 +46,7 @@ HWTEST2_F(CommandQueueLinuxTests, givenExecBufferErrorOnXeHpcWhenExecutingComman
     drm->errnoRetVal = EWOULDBLOCK;
     const ze_command_queue_desc_t desc = {};
     ze_result_t returnValue;
-    auto commandQueue = whiteboxCast(CommandQueue::create(productFamily,
-                                                          device,
+    auto commandQueue = whiteboxCast(CommandQueue::create(device,
                                                           neoDevice->getDefaultEngine().commandStreamReceiver,
                                                           &desc,
                                                           false,
@@ -52,23 +55,26 @@ HWTEST2_F(CommandQueueLinuxTests, givenExecBufferErrorOnXeHpcWhenExecutingComman
                                                           returnValue));
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
-    Mock<Kernel> kernel;
+    std::unique_ptr<L0::ult::Module> mockModule = std::make_unique<L0::ult::Module>(device, nullptr, ModuleType::builtin);
+
+    Mock<::L0::KernelImp> kernel;
+    kernel.module = mockModule.get();
     kernel.immutableData.isaGraphicsAllocation.reset(neoDevice->getMemoryManager()->allocateGraphicsMemoryWithProperties(
-        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::KERNEL_ISA, neoDevice->getDeviceBitfield()}));
+        {device->getRootDeviceIndex(), MemoryConstants::pageSize, NEO::AllocationType::kernelIsa, neoDevice->getDeviceBitfield()}));
     kernel.immutableData.device = device;
 
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue)));
+    auto commandList = std::unique_ptr<CommandList>(CommandList::whiteboxCast(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false)));
     EXPECT_EQ(ZE_RESULT_SUCCESS, returnValue);
     ASSERT_NE(nullptr, commandList);
 
     ze_group_count_t dispatchFunctionArguments{1, 1, 1};
     CmdListKernelLaunchParams launchParams = {};
-    commandList->appendLaunchKernel(kernel.toHandle(), &dispatchFunctionArguments, nullptr, 0, nullptr, launchParams, false);
+    commandList->appendLaunchKernel(kernel.toHandle(), dispatchFunctionArguments, nullptr, 0, nullptr, launchParams);
     commandList->close();
 
     ze_command_list_handle_t cmdListHandles[1] = {commandList->toHandle()};
-
-    returnValue = commandQueue->executeCommandLists(1, cmdListHandles, nullptr, false);
+    CommandListExecutionInternalOptions internalOptions = {};
+    returnValue = commandQueue->executeCommandLists(1, cmdListHandles, nullptr, internalOptions);
     EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY, returnValue);
     commandQueue->destroy();
     neoDevice->getMemoryManager()->freeGraphicsMemory(kernel.immutableData.isaGraphicsAllocation.release());

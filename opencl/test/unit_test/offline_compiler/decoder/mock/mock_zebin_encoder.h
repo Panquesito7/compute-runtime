@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,11 +7,12 @@
 
 #pragma once
 #include "shared/offline_compiler/source/decoder/zebin_manipulator.h"
+#include "shared/offline_compiler/source/ocloc_api.h"
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
 
 #include "opencl/test/unit_test/offline_compiler/decoder/mock/mock_iga_wrapper.h"
 
-template <NEO::Elf::ELF_IDENTIFIER_CLASS numBits>
+template <NEO::Elf::ElfIdentifierClass numBits>
 struct MockZebinEncoder : public NEO::Zebin::Manipulator::ZebinEncoder<numBits> {
     using Base = NEO::Zebin::Manipulator::ZebinEncoder<numBits>;
     using ErrorCode = NEO::Zebin::Manipulator::ErrorCode;
@@ -30,7 +31,7 @@ struct MockZebinEncoder : public NEO::Zebin::Manipulator::ZebinEncoder<numBits> 
         mockIga = iga.get();
         this->iga = std::move(iga);
         retValGetIntelGTNotes.resize(1);
-        retValGetIntelGTNotes[0].type = NEO::Zebin::Elf::IntelGTSectionType::ProductFamily;
+        retValGetIntelGTNotes[0].type = NEO::Zebin::Elf::IntelGTSectionType::productFamily;
         retValGetIntelGTNotes[0].data = ArrayRef<const uint8_t>::fromAny(&productFamily, 1);
     }
 
@@ -76,9 +77,9 @@ struct MockZebinEncoder : public NEO::Zebin::Manipulator::ZebinEncoder<numBits> 
 
     MockIgaWrapper *mockIga;
     std::vector<NEO::Zebin::Elf::IntelGTNote> retValGetIntelGTNotes;
-    ErrorCode retValLoadSectionsInfo = NEO::OclocErrorCode::SUCCESS;
-    ErrorCode retValCheckIfAllFilesExist = NEO::OclocErrorCode::SUCCESS;
-    ErrorCode retValAppendSections = NEO::OclocErrorCode::SUCCESS;
+    ErrorCode retValLoadSectionsInfo = OCLOC_SUCCESS;
+    ErrorCode retValCheckIfAllFilesExist = OCLOC_SUCCESS;
+    ErrorCode retValAppendSections = OCLOC_SUCCESS;
     bool callBaseGetIntelGTNotesSection = false;
     bool callBaseGetIntelGTNotes = false;
     bool callBaseLoadSectionsInfo = false;

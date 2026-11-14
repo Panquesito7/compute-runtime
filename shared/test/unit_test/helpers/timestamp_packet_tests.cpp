@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -31,7 +31,7 @@ void setTagToReadyState(TagNodeBase *tagNode) {
 
     typename FamilyType::TimestampPacketType zeros[4] = {};
 
-    for (uint32_t i = 0; i < TimestampPacketConstants::preferredPacketCount; i++) {
+    for (uint32_t i = 0; i < FamilyType::timestampPacketCount; i++) {
         tagNode->assignDataToAllTimestamps(i, zeros);
     }
     tagNode->setPacketsUsed(packetsUsed);
@@ -39,27 +39,27 @@ void setTagToReadyState(TagNodeBase *tagNode) {
 } // namespace
 
 struct TimestampPacketTests : public ::testing::Test {
-    struct MockTagNode : public TagNode<TimestampPackets<uint32_t>> {
-        using TagNode<TimestampPackets<uint32_t>>::gpuAddress;
+    struct MockTagNode : public TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> {
+        using TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>>::gpuAddress;
     };
-
-    template <typename MI_SEMAPHORE_WAIT>
-    void verifySemaphore(MI_SEMAPHORE_WAIT *semaphoreCmd, TagNodeBase *timestampPacketNode, uint32_t packetId) {
+    template <typename FamilyType>
+    void verifySemaphore(typename FamilyType::MI_SEMAPHORE_WAIT *semaphoreCmd, TagNodeBase *timestampPacketNode, uint32_t packetId) {
+        using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
         EXPECT_NE(nullptr, semaphoreCmd);
         EXPECT_EQ(semaphoreCmd->getCompareOperation(), MI_SEMAPHORE_WAIT::COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD);
-        EXPECT_EQ(1u, semaphoreCmd->getSemaphoreDataDword());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd));
 
-        uint64_t compareOffset = packetId * TimestampPackets<uint32_t>::getSinglePacketSize();
+        uint64_t compareOffset = packetId * TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>::getSinglePacketSize();
         auto dataAddress = TimestampPacketHelper::getContextEndGpuAddress(*timestampPacketNode) + compareOffset;
 
-        EXPECT_EQ(dataAddress, semaphoreCmd->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(dataAddress, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd));
     };
 };
 
 HWTEST_F(TimestampPacketTests, givenTagNodeWhenSemaphoreIsProgrammedThenUseGpuAddress) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
-    TimestampPackets<uint32_t> tag;
+    TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount> tag;
     MockTagNode mockNode;
     mockNode.tagForCpuAccess = &tag;
     mockNode.gpuAddress = 0x1230000;
@@ -67,18 +67,17 @@ HWTEST_F(TimestampPacketTests, givenTagNodeWhenSemaphoreIsProgrammedThenUseGpuAd
     StackVec<char, 4096> buffer(4096);
     LinearStream cmdStream(buffer.begin(), buffer.size());
 
-    TimestampPacketHelper::programSemaphore<FamilyType>(cmdStream, mockNode);
+    TimestampPacketHelper::programSemaphore<FamilyType>(cmdStream, mockNode, HasSemaphore64bCmd<FamilyType>);
 
     HardwareParse hwParser;
     hwParser.parseCommands<FamilyType>(cmdStream, 0);
     auto it = hwParser.cmdList.begin();
-    verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*it++), &mockNode, 0);
+    verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*it++), &mockNode, 0);
 }
 
 HWTEST_F(TimestampPacketTests, givenTagNodeWithPacketsUsed2WhenSemaphoreIsProgrammedThenUseGpuAddress) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-
-    TimestampPackets<uint32_t> tag;
+    TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount> tag;
     MockTagNode mockNode;
     mockNode.tagForCpuAccess = &tag;
     mockNode.gpuAddress = 0x1230000;
@@ -87,18 +86,18 @@ HWTEST_F(TimestampPacketTests, givenTagNodeWithPacketsUsed2WhenSemaphoreIsProgra
     StackVec<char, 4096> buffer(4096);
     LinearStream cmdStream(buffer.begin(), buffer.size());
 
-    TimestampPacketHelper::programSemaphore<FamilyType>(cmdStream, mockNode);
+    TimestampPacketHelper::programSemaphore<FamilyType>(cmdStream, mockNode, HasSemaphore64bCmd<FamilyType>);
 
     HardwareParse hwParser;
     hwParser.parseCommands<FamilyType>(cmdStream, 0);
     auto it = hwParser.cmdList.begin();
     for (uint32_t packetId = 0; packetId < mockNode.getPacketsUsed(); packetId++) {
-        verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*it++), &mockNode, packetId);
+        verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*it++), &mockNode, packetId);
     }
 }
 
 TEST_F(TimestampPacketTests, givenTagNodeWhatAskingForGpuAddressesThenReturnCorrectValue) {
-    TimestampPackets<uint32_t> tag;
+    TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount> tag;
     MockTagNode mockNode;
     mockNode.tagForCpuAccess = &tag;
     mockNode.gpuAddress = 0x1230000;
@@ -113,11 +112,11 @@ TEST_F(TimestampPacketTests, givenTimestampPacketContainerWhenMovedThenMoveAllNo
     EXPECT_FALSE(std::is_copy_assignable<TimestampPacketContainer>::value);
     EXPECT_FALSE(std::is_copy_constructible<TimestampPacketContainer>::value);
 
-    struct MockTagNode : public TagNode<TimestampPackets<uint32_t>> {
+    struct MockTagNode : public TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> {
         void returnTag() override {
             returnCalls++;
         }
-        using TagNode<TimestampPackets<uint32_t>>::refCount;
+        using TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>>::refCount;
         uint32_t returnCalls = 0;
     };
 
@@ -143,7 +142,7 @@ TEST_F(TimestampPacketTests, givenTimestampPacketContainerWhenMovedThenMoveAllNo
 }
 
 TEST_F(TimestampPacketTests, givenTagNodesWhenReleaseIsCalledThenReturnAllTagsToPool) {
-    struct MockTagNode : public TagNode<TimestampPackets<uint32_t>> {
+    struct MockTagNode : public TagNode<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> {
         void returnTag() override {
             returnCalls++;
         }
@@ -200,6 +199,31 @@ HWTEST_F(TimestampPacketTests, whenNewTagIsTakenThenReinitialize) {
     EXPECT_EQ(1u, firstNode->getPacketsUsed());
 }
 
+HWTEST_F(TimestampPacketTests, GivenTagNodeWhenCallMarkAsAbortedThenClearTimestamps) {
+    MockExecutionEnvironment executionEnvironment(defaultHwInfo.get());
+    MockMemoryManager memoryManager(executionEnvironment);
+    MockTagAllocator<MockTimestampPackets32> allocator(0, &memoryManager, 1);
+
+    using MockNode = TagNode<MockTimestampPackets32>;
+
+    auto firstNode = static_cast<MockNode *>(allocator.getTag());
+    auto initValue = 1u;
+    for (auto &packet : firstNode->tagForCpuAccess->packets) {
+        packet.contextStart = initValue;
+        packet.globalStart = initValue;
+        packet.contextEnd = initValue;
+        packet.globalEnd = initValue;
+    }
+    firstNode->markAsAborted();
+
+    for (const auto &packet : firstNode->tagForCpuAccess->packets) {
+        EXPECT_EQ(0u, packet.contextStart);
+        EXPECT_EQ(0u, packet.globalStart);
+        EXPECT_EQ(0u, packet.contextEnd);
+        EXPECT_EQ(0u, packet.globalEnd);
+    }
+}
+
 TEST_F(TimestampPacketTests, whenObjectIsCreatedThenInitializeAllStamps) {
     MockTimestampPackets32 timestampPacketStorage;
     EXPECT_EQ(TimestampPacketConstants::preferredPacketCount * sizeof(timestampPacketStorage.packets[0]), sizeof(timestampPacketStorage.packets));
@@ -213,7 +237,7 @@ TEST_F(TimestampPacketTests, whenObjectIsCreatedThenInitializeAllStamps) {
 }
 
 HWTEST_F(TimestampPacketTests, whenEstimatingSizeForNodeDependencyThenReturnCorrectValue) {
-    TimestampPackets<uint32_t> tag;
+    TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount> tag;
     MockTagNode mockNode;
     mockNode.tagForCpuAccess = &tag;
     mockNode.gpuAddress = 0x1230000;
@@ -231,7 +255,7 @@ struct DeviceTimestampPacketTests : public ::testing::Test, DeviceFixture {
     ExecutionEnvironment *executionEnvironment{nullptr};
 
     void SetUp() override {
-        DebugManager.flags.EnableTimestampPacket.set(1);
+        debugManager.flags.EnableTimestampPacket.set(1);
         DeviceFixture::setUp();
         executionEnvironment = pDevice->executionEnvironment;
     }
@@ -262,7 +286,7 @@ HWTEST_F(DeviceTimestampPacketTests, givenDebugFlagSetWhenCreatingAllocatorThenU
     }
 
     {
-        DebugManager.flags.OverrideTimestampPacketSize.set(4);
+        debugManager.flags.OverrideTimestampPacketSize.set(4);
 
         CommandStreamReceiverHw<FamilyType> csr(*executionEnvironment, 0, osContext.getDeviceBitfield());
         csr.setupContext(osContext);
@@ -274,7 +298,7 @@ HWTEST_F(DeviceTimestampPacketTests, givenDebugFlagSetWhenCreatingAllocatorThenU
     }
 
     {
-        DebugManager.flags.OverrideTimestampPacketSize.set(8);
+        debugManager.flags.OverrideTimestampPacketSize.set(8);
 
         CommandStreamReceiverHw<FamilyType> csr(*executionEnvironment, 0, osContext.getDeviceBitfield());
         csr.setupContext(osContext);
@@ -286,18 +310,33 @@ HWTEST_F(DeviceTimestampPacketTests, givenDebugFlagSetWhenCreatingAllocatorThenU
     }
 
     {
-        DebugManager.flags.OverrideTimestampPacketSize.set(-1);
+        debugManager.flags.OverrideTimestampPacketSize.set(-1);
         CommandStreamReceiverHw<FamilyType> csr(*executionEnvironment, 0, osContext.getDeviceBitfield());
         csr.setupContext(osContext);
 
-        DebugManager.flags.OverrideTimestampPacketSize.set(12);
+        debugManager.flags.OverrideTimestampPacketSize.set(12);
         EXPECT_ANY_THROW(csr.getTimestampPacketAllocator());
+    }
+}
+
+HWTEST_F(DeviceTimestampPacketTests, givenTagAllocatorForTimstampAndQueryPacketCountThenResultIsCorrect) {
+    OsContext &osContext = *executionEnvironment->memoryManager->getRegisteredEngines(mockRootDeviceIndex)[0].osContext;
+    {
+        using TimestampPacketType = typename FamilyType::TimestampPacketType;
+        using TimestampPacketsT = NEO::TimestampPackets<TimestampPacketType, FamilyType::timestampPacketCount>;
+        CommandStreamReceiverHw<FamilyType> csr(*executionEnvironment, 0, osContext.getDeviceBitfield());
+        csr.setupContext(osContext);
+
+        auto allocator = csr.getTimestampPacketAllocator();
+        auto tag = static_cast<NEO::TagNode<TimestampPacketsT> *>(allocator->getTag());
+        uint32_t packetCount = tag->tagForCpuAccess->getPacketCount();
+        EXPECT_EQ(FamilyType::timestampPacketCount, packetCount);
     }
 }
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, DeviceTimestampPacketTests, givenInvalidDebugFlagSetWhenCreatingCsrThenExceptionIsThrown) {
     OsContext &osContext = *executionEnvironment->memoryManager->getRegisteredEngines(mockRootDeviceIndex)[0].osContext;
-    DebugManager.flags.OverrideTimestampPacketSize.set(12);
+    debugManager.flags.OverrideTimestampPacketSize.set(12);
 
     EXPECT_ANY_THROW(CommandStreamReceiverHw<FamilyType> csr(*executionEnvironment, 0, osContext.getDeviceBitfield()));
 }
@@ -318,7 +357,7 @@ HWTEST_F(DeviceTimestampPacketTests, givenTagAlignmentWhenCreatingAllocatorThenG
 
 HWTEST_F(DeviceTimestampPacketTests, givenDebugFlagSetWhenCreatingTimestampPacketAllocatorThenDisableReusingAndLimitPoolSize) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.DisableTimestampPacketOptimizations.set(true);
+    debugManager.flags.DisableTimestampPacketOptimizations.set(true);
     OsContext &osContext = *executionEnvironment->memoryManager->getRegisteredEngines(mockRootDeviceIndex)[0].osContext;
 
     CommandStreamReceiverHw<FamilyType> csr(*executionEnvironment, 0, osContext.getDeviceBitfield());
@@ -331,9 +370,14 @@ HWTEST_F(DeviceTimestampPacketTests, givenDebugFlagSetWhenCreatingTimestampPacke
     EXPECT_FALSE(tag->canBeReleased());
 }
 
+HWTEST_F(DeviceTimestampPacketTests, givenTimestampPacketTypeAndSizeWhenCheckingSizeOfTimestampPacketsThenItIsCorrect) {
+    EXPECT_EQ((4 * FamilyType::timestampPacketCount) * sizeof(typename FamilyType::TimestampPacketType),
+              sizeof(TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>));
+}
+
 using TimestampPacketHelperTests = Test<DeviceFixture>;
 
-HWTEST_F(TimestampPacketHelperTests, givenTagNodesInMultiRootSyncContainerWhenProgramingDependensiecThenSemaforesAreProgrammed) {
+HWTEST_F(TimestampPacketHelperTests, givenTagNodesInMultiRootSyncContainerWhenProgrammingDependenciesThenSemaphoresAreProgrammed) {
     StackVec<char, 4096> buffer(4096);
     LinearStream cmdStream(buffer.begin(), buffer.size());
     CsrDependencies deps;
@@ -341,24 +385,24 @@ HWTEST_F(TimestampPacketHelperTests, givenTagNodesInMultiRootSyncContainerWhenPr
     TimestampPacketContainer container = {};
     container.add(mockTagAllocator->getTag());
     deps.multiRootTimeStampSyncContainer.push_back(&container);
-    TimestampPacketHelper::programCsrDependenciesForForMultiRootDeviceSyncContainer<FamilyType>(cmdStream, deps);
+    TimestampPacketHelper::programCsrDependenciesForForMultiRootDeviceSyncContainer<FamilyType>(cmdStream, deps, HasSemaphore64bCmd<FamilyType>);
     EXPECT_EQ(cmdStream.getUsed(), NEO::EncodeSemaphore<FamilyType>::getSizeMiSemaphoreWait());
 }
 
-HWTEST_F(TimestampPacketHelperTests, givenEmptyContainerMultiRootSyncContainerWhenProgramingDependensiecThenZeroSemaforesAreProgrammed) {
+HWTEST_F(TimestampPacketHelperTests, givenEmptyContainerMultiRootSyncContainerWhenProgrammingDependenciesThenZeroSemaphoresAreProgrammed) {
     StackVec<char, 4096> buffer(4096);
     LinearStream cmdStream(buffer.begin(), buffer.size());
     CsrDependencies deps;
     TimestampPacketContainer container = {};
     deps.multiRootTimeStampSyncContainer.push_back(&container);
-    TimestampPacketHelper::programCsrDependenciesForForMultiRootDeviceSyncContainer<FamilyType>(cmdStream, deps);
+    TimestampPacketHelper::programCsrDependenciesForForMultiRootDeviceSyncContainer<FamilyType>(cmdStream, deps, HasSemaphore64bCmd<FamilyType>);
     EXPECT_EQ(cmdStream.getUsed(), 0u);
 }
 
-HWTEST_F(TimestampPacketHelperTests, givenEmptyMultiRootSyncContainerWhenProgramingDependensiecThenZeroSemaforesAreProgrammed) {
+HWTEST_F(TimestampPacketHelperTests, givenEmptyMultiRootSyncContainerWhenProgrammingDependenciesThenZeroSemaphoresAreProgrammed) {
     StackVec<char, 4096> buffer(4096);
     LinearStream cmdStream(buffer.begin(), buffer.size());
     CsrDependencies deps;
-    TimestampPacketHelper::programCsrDependenciesForForMultiRootDeviceSyncContainer<FamilyType>(cmdStream, deps);
+    TimestampPacketHelper::programCsrDependenciesForForMultiRootDeviceSyncContainer<FamilyType>(cmdStream, deps, HasSemaphore64bCmd<FamilyType>);
     EXPECT_EQ(cmdStream.getUsed(), 0u);
 }

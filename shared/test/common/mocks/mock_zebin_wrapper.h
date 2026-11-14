@@ -1,0 +1,116 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/mocks/mock_compilers.h"
+#include "shared/test/common/mocks/mock_modules_zebin.h"
+
+namespace NEO {
+extern std::map<std::string, std::stringstream> virtualFileList;
+}
+
+namespace NEO {
+template <size_t binariesCount = 1u, Elf::ElfIdentifierClass numBits = is32bit ? Elf::EI_CLASS_32 : Elf::EI_CLASS_64>
+struct MockZebinImageWrapper {
+    MockZebinImageWrapper(const HardwareInfo &hwInfo)
+        : data(hwInfo) {
+        std::fill_n(binaries.begin(), binariesCount, reinterpret_cast<const unsigned char *>(this->data.storage.data()));
+        std::fill_n(binarySizes.begin(), binariesCount, this->data.storage.size());
+    }
+
+    void setAsMockCompilerReturnedBinary() {
+        debugVarsRestore.reset();
+        MockCompilerDebugVars debugVars;
+        debugVars.binaryToReturn = const_cast<unsigned char *>(this->binaries[0]);
+        debugVars.binaryToReturnSize = sizeof(unsigned char) * this->binarySizes[0];
+        NEO::igcPushDebugVars(debugVars);
+        NEO::fclPushDebugVars(debugVars);
+        this->debugVarsRestore = std::unique_ptr<void, void (*)(void *)>{this, [](void *) -> void {
+                                                                             NEO::fclPopDebugVars();
+                                                                             NEO::igcPopDebugVars();
+                                                                         }};
+    }
+
+    ZebinTestData::ZebinCopyImageModule<numBits> data;
+    std::array<const unsigned char *, binariesCount> binaries;
+    std::array<size_t, binariesCount> binarySizes;
+    std::unique_ptr<void, void (*)(void *)> debugVarsRestore{nullptr, nullptr};
+    const char *kernelName = "CopyImage";
+};
+
+template <size_t binariesCount = 1u, Elf::ElfIdentifierClass numBits = is32bit ? Elf::EI_CLASS_32 : Elf::EI_CLASS_64>
+struct MockZebinWrapper {
+    using Descriptor = ZebinTestData::ZebinCopyBufferModule<numBits>::Descriptor;
+
+    MockZebinWrapper(const HardwareInfo &hwInfo, Descriptor desc)
+        : data(hwInfo, desc) {
+        std::fill_n(binaries.begin(), binariesCount, reinterpret_cast<const unsigned char *>(this->data.storage.data()));
+        std::fill_n(binarySizes.begin(), binariesCount, this->data.storage.size());
+    }
+
+    MockZebinWrapper(const HardwareInfo &hwInfo) : MockZebinWrapper(hwInfo, getDefaultDescriptor(hwInfo)) {}
+    MockZebinWrapper(const HardwareInfo &hwInfo, bool useStateless) : MockZebinWrapper(hwInfo, getDescriptor(useStateless)) {}
+
+    static Descriptor getDefaultDescriptor(const HardwareInfo &hwInfo) {
+        Descriptor desc{};
+        auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
+        if (compilerProductHelper) {
+            desc.isStateless = compilerProductHelper->isForceToStatelessRequired();
+        }
+        return desc;
+    }
+
+    static Descriptor getDescriptor(bool useStateless) {
+        Descriptor desc{};
+        desc.isStateless = useStateless;
+        return desc;
+    }
+
+    auto &getFlags() {
+        return reinterpret_cast<Zebin::Elf::ZebinTargetFlags &>(this->data.elfHeader->flags);
+    }
+
+    void setAsMockCompilerReturnedBinary() {
+        debugVarsRestore.reset();
+        MockCompilerDebugVars debugVars;
+        debugVars.binaryToReturn = const_cast<unsigned char *>(this->binaries[0]);
+        debugVars.binaryToReturnSize = sizeof(unsigned char) * this->binarySizes[0];
+        NEO::igcPushDebugVars(debugVars);
+        NEO::fclPushDebugVars(debugVars);
+        this->debugVarsRestore = std::unique_ptr<void, void (*)(void *)>{this, [](void *) -> void {
+                                                                             NEO::igcPopDebugVars();
+                                                                             NEO::fclPopDebugVars();
+                                                                         }};
+    }
+
+    ZebinTestData::ZebinCopyBufferModule<numBits> data;
+    std::array<const unsigned char *, binariesCount> binaries;
+    std::array<size_t, binariesCount> binarySizes;
+    std::unique_ptr<void, void (*)(void *)> debugVarsRestore{nullptr, nullptr};
+    const char *kernelName = "CopyBuffer";
+};
+
+class FixtureWithMockZebin {
+  public:
+    void setUp() {
+        zebinPtr = std::make_unique<MockZebinWrapper<>>(*defaultHwInfo);
+        zebinPtr->setAsMockCompilerReturnedBinary();
+    }
+
+    void tearDown() {
+        zebinPtr.reset();
+    }
+
+    static constexpr const char sourceKernel[] = "example_kernel(){}";
+    static constexpr size_t sourceKernelSize = sizeof(sourceKernel);
+    const char *sources[1] = {sourceKernel};
+    std::unique_ptr<MockZebinWrapper<>> zebinPtr;
+};
+} // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -26,7 +26,7 @@ HWTEST2_F(CommandEncodeStatesDG2Test, givenCommandContainerWhenSetStateBaseAddre
 
     STATE_BASE_ADDRESS sba;
     auto gmmHelper = cmdContainer->getDevice()->getRootDeviceEnvironment().getGmmHelper();
-    uint32_t statelessMocsIndex = (gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER) >> 1);
+    uint32_t statelessMocsIndex = (gmmHelper->getL3EnabledMOCS() >> 1);
 
     EncodeStateBaseAddressArgs<FamilyType> args = createDefaultEncodeStateBaseAddressArgs<FamilyType>(cmdContainer.get(), sba, statelessMocsIndex);
 
@@ -40,21 +40,21 @@ HWTEST2_F(CommandEncodeStatesDG2Test, givenCommandContainerWhenSetStateBaseAddre
 
     auto cmd = genCmdCast<STATE_BASE_ADDRESS *>(*itorCmd);
 
-    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_POLICY_WB, cmd->getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_CONTROL_WB, cmd->getL1CacheControlCachePolicy());
 }
 
-HWTEST2_F(CommandEncodeStatesDG2Test, givenCommandContainerAndDebuggerActiveWhenSetStateBaseAddressCalledThenCachePolicyIsWBP, IsDG2) {
+HWTEST2_F(CommandEncodeStatesDG2Test, givenCommandContainerAndDebuggerWhenSetStateBaseAddressCalledThenCachePolicyIsWBP, IsDG2) {
     using STATE_BASE_ADDRESS = typename FamilyType::STATE_BASE_ADDRESS;
     cmdContainer->dirtyHeaps = 0;
     auto debugger = new MockDebugger();
 
     cmdContainer->getDevice()->getExecutionEnvironment()->rootDeviceEnvironments[0]->debugger.reset(debugger);
+    cmdContainer->getDevice()->setDebugger(debugger);
     STATE_BASE_ADDRESS sba;
     auto gmmHelper = cmdContainer->getDevice()->getRootDeviceEnvironment().getGmmHelper();
-    uint32_t statelessMocsIndex = (gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER) >> 1);
+    uint32_t statelessMocsIndex = (gmmHelper->getL3EnabledMOCS() >> 1);
 
     EncodeStateBaseAddressArgs<FamilyType> args = createDefaultEncodeStateBaseAddressArgs<FamilyType>(cmdContainer.get(), sba, statelessMocsIndex);
-    const_cast<DeviceInfo &>(pDevice->getDeviceInfo()).debuggerActive = true;
     EncodeStateBaseAddress<FamilyType>::encode(args);
 
     GenCmdList commands;
@@ -65,5 +65,5 @@ HWTEST2_F(CommandEncodeStatesDG2Test, givenCommandContainerAndDebuggerActiveWhen
 
     auto cmd = genCmdCast<STATE_BASE_ADDRESS *>(*itorCmd);
 
-    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_POLICY_WBP, cmd->getL1CachePolicyL1CacheControl());
+    EXPECT_EQ(FamilyType::STATE_BASE_ADDRESS::L1_CACHE_CONTROL_WBP, cmd->getL1CacheControlCachePolicy());
 }

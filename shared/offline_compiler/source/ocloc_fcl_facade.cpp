@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,8 @@
 
 #include "shared/offline_compiler/source/ocloc_fcl_facade.h"
 
+#include "shared/offline_compiler/source/ocloc_api.h"
 #include "shared/offline_compiler/source/ocloc_arg_helper.h"
-#include "shared/offline_compiler/source/ocloc_error_code.h"
 #include "shared/source/compiler_interface/igc_platform_helper.h"
 #include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/hw_info.h"
@@ -29,22 +29,25 @@ OclocFclFacade::OclocFclFacade(OclocArgHelper *argHelper)
 OclocFclFacade::~OclocFclFacade() = default;
 
 int OclocFclFacade::initialize(const HardwareInfo &hwInfo) {
+    if (initialized) {
+        return OCLOC_SUCCESS;
+    }
     fclLib = loadFclLibrary();
     if (!fclLib) {
         argHelper->printf("Error! Loading of FCL library has failed! Filename: %s\n", Os::frontEndDllName);
-        return OclocErrorCode::OUT_OF_HOST_MEMORY;
+        return OCLOC_OUT_OF_HOST_MEMORY;
     }
 
     const auto fclCreateMainFunction = loadCreateFclMainFunction();
     if (!fclCreateMainFunction) {
         argHelper->printf("Error! Cannot load required functions from FCL library.\n");
-        return OclocErrorCode::OUT_OF_HOST_MEMORY;
+        return OCLOC_OUT_OF_HOST_MEMORY;
     }
 
     fclMain = createFclMain(fclCreateMainFunction);
     if (!fclMain) {
         argHelper->printf("Error! Cannot create FCL main component!\n");
-        return OclocErrorCode::OUT_OF_HOST_MEMORY;
+        return OCLOC_OUT_OF_HOST_MEMORY;
     }
 
     if (!isFclInterfaceCompatible()) {
@@ -52,33 +55,33 @@ int OclocFclFacade::initialize(const HardwareInfo &hwInfo) {
         argHelper->printf("Error! Incompatible interface in FCL: %s\n", incompatibleInterface.c_str());
 
         DEBUG_BREAK_IF(true);
-        return OclocErrorCode::OUT_OF_HOST_MEMORY;
+        return OCLOC_OUT_OF_HOST_MEMORY;
     }
 
     fclDeviceCtx = createFclDeviceContext();
     if (!fclDeviceCtx) {
         argHelper->printf("Error! Cannot create FCL device context!\n");
-        return OclocErrorCode::OUT_OF_HOST_MEMORY;
+        return OCLOC_OUT_OF_HOST_MEMORY;
     }
 
-    fclDeviceCtx->SetOclApiVersion(hwInfo.capabilityTable.clVersionSupport * 10);
+    fclDeviceCtx->SetOclApiVersion(ocl30ApiVersion);
 
     if (shouldPopulateFclInterface()) {
         const auto platform = getPlatformHandle();
         if (!platform) {
             argHelper->printf("Error! FCL device context has not been properly created!\n");
-            return OclocErrorCode::OUT_OF_HOST_MEMORY;
+            return OCLOC_OUT_OF_HOST_MEMORY;
         }
 
         populateFclInterface(*platform, hwInfo);
     }
 
     initialized = true;
-    return OclocErrorCode::SUCCESS;
+    return OCLOC_SUCCESS;
 }
 
 std::unique_ptr<OsLibrary> OclocFclFacade::loadFclLibrary() const {
-    return std::unique_ptr<OsLibrary>{OsLibrary::load(Os::frontEndDllName)};
+    return std::unique_ptr<OsLibrary>{OsLibrary::loadFunc({Os::frontEndDllName})};
 }
 
 CIF::CreateCIFMainFunc_t OclocFclFacade::loadCreateFclMainFunction() const {
@@ -97,19 +100,19 @@ std::string OclocFclFacade::getIncompatibleInterface() const {
     return CIF::InterfaceIdCoder::Dec(fclMain->FindIncompatible<IGC::FclOclDeviceCtx>());
 }
 
-CIF::RAII::UPtr_t<IGC::FclOclDeviceCtxTagOCL> OclocFclFacade::createFclDeviceContext() const {
-    return fclMain->CreateInterface<IGC::FclOclDeviceCtxTagOCL>();
+CIF::RAII::UPtr_t<NEO::FclOclDeviceCtxTag> OclocFclFacade::createFclDeviceContext() const {
+    return fclMain->CreateInterface<NEO::FclOclDeviceCtxTag>();
 }
 
 bool OclocFclFacade::shouldPopulateFclInterface() const {
     return fclDeviceCtx->GetUnderlyingVersion() > 4U;
 }
 
-CIF::RAII::UPtr_t<IGC::PlatformTagOCL> OclocFclFacade::getPlatformHandle() const {
-    return fclDeviceCtx->GetPlatformHandle();
+CIF::RAII::UPtr_t<NEO::PlatformTag> OclocFclFacade::getPlatformHandle() const {
+    return fclDeviceCtx->GetPlatformHandle<NEO::PlatformTag>();
 }
 
-void OclocFclFacade::populateFclInterface(IGC::PlatformTagOCL &handle, const HardwareInfo &hwInfo) {
+void OclocFclFacade::populateFclInterface(NEO::PlatformTag &handle, const HardwareInfo &hwInfo) {
     populateIgcPlatform(handle, hwInfo);
 }
 
@@ -121,8 +124,24 @@ CIF::RAII::UPtr_t<CIF::Builtins::BufferLatest> OclocFclFacade::createConstBuffer
     return CIF::Builtins::CreateConstBuffer(fclMain.get(), data, size);
 }
 
-CIF::RAII::UPtr_t<IGC::FclOclTranslationCtxTagOCL> OclocFclFacade::createTranslationContext(IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType, CIF::Builtins::BufferLatest *error) {
-    return fclDeviceCtx->CreateTranslationCtx(inType, outType, error);
+CIF::RAII::UPtr_t<NEO::OclTranslationOutputTag> OclocFclFacade::translate(IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType, CIF::Builtins::BufferLatest *error,
+                                                                          CIF::Builtins::BufferSimple *src,
+                                                                          CIF::Builtins::BufferSimple *options,
+                                                                          CIF::Builtins::BufferSimple *internalOptions,
+                                                                          CIF::Builtins::BufferSimple *tracingOptions,
+                                                                          uint32_t tracingOptionsCount) {
+
+    auto fclTranslationCtx = this->createTranslationContext(inType, outType, error);
+
+    if ((nullptr != error->GetMemory<char>()) || (nullptr == fclTranslationCtx)) {
+        return nullptr;
+    }
+
+    return fclTranslationCtx->Translate(src, options, internalOptions, nullptr, 0);
+}
+
+CIF::RAII::UPtr_t<NEO::FclOclTranslationCtxTag> OclocFclFacade::createTranslationContext(IGC::CodeType::CodeType_t inType, IGC::CodeType::CodeType_t outType, CIF::Builtins::BufferLatest *error) {
+    return fclDeviceCtx->CreateTranslationCtx<NEO::FclOclTranslationCtxTag>(inType, outType, error);
 }
 
 bool OclocFclFacade::isInitialized() const {

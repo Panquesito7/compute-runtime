@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,7 +11,8 @@
 
 #include "opencl/source/sharings/va/va_sharing.h"
 
-#include <drm/drm_fourcc.h>
+#include "drm_fourcc.h"
+
 #include <va/va_drmcommon.h>
 
 namespace NEO {
@@ -61,7 +62,7 @@ class VASharingFunctionsMock : public VASharingFunctions {
         }};
 
     VASharingFunctionsMock(VADisplay vaDisplay) : VASharingFunctions(vaDisplay) {}
-    VASharingFunctionsMock() : VASharingFunctionsMock(nullptr){};
+    VASharingFunctionsMock() : VASharingFunctionsMock(nullptr) {};
 
     VAStatus deriveImage(VASurfaceID vaSurface, VAImage *vaImage) override {
         if (deriveImageReturnStatus != VA_STATUS_SUCCESS) {
@@ -125,7 +126,7 @@ class VASharingFunctionsMock : public VASharingFunctions {
             return queryImageFormatsReturnStatus;
         }
         if (numFormats) {
-            *numFormats = 6;
+            *numFormats = 7;
         }
 
         if (formatList) {
@@ -152,12 +153,16 @@ class VASharingFunctionsMock : public VASharingFunctions {
             formatList[5].fourcc = VA_FOURCC_Y210;
             formatList[5].bits_per_pixel = 32;
             formatList[5].byte_order = VA_LSB_FIRST;
+
+            formatList[6].fourcc = VA_FOURCC_ARGB;
+            formatList[6].bits_per_pixel = 32;
+            formatList[6].byte_order = VA_LSB_FIRST;
         }
         return VA_STATUS_SUCCESS;
     }
 
     int maxNumImageFormats(VADisplay vaDisplay) override {
-        return 6;
+        return 7;
     }
 };
 

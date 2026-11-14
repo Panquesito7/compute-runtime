@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,10 +7,18 @@
 
 #pragma once
 
+#include "shared/source/device_binary_format/zebin/zeinfo_l1_cache_policy.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/utilities/const_stringref.h"
+#include "shared/source/utilities/mem_lifetime.h"
 
 #include <array>
+#include <cstdint>
+#include <cstring>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace NEO::Zebin::ZeInfo {
 
@@ -19,7 +27,17 @@ inline constexpr ConstStringRef kernels("kernels");
 inline constexpr ConstStringRef version("version");
 inline constexpr ConstStringRef globalHostAccessTable("global_host_access_table");
 inline constexpr ConstStringRef functions("functions");
+inline constexpr ConstStringRef requiredLibs("required_libs");
 inline constexpr ConstStringRef kernelMiscInfo("kernels_misc_info");
+inline constexpr ConstStringRef l1CachePolicy("l1_cache_policy");
+
+namespace L1CachePolicy {
+inline constexpr ConstStringRef writeBypass("wbp");
+inline constexpr ConstStringRef uncached("uc");
+inline constexpr ConstStringRef writeBack("wb");
+inline constexpr ConstStringRef writeThrough("wt");
+inline constexpr ConstStringRef writeStreaming("ws");
+} // namespace L1CachePolicy
 
 namespace Kernel {
 inline constexpr ConstStringRef attributes("user_attributes");
@@ -55,16 +73,28 @@ inline constexpr ConstStringRef requiredWorkGroupSize("required_work_group_size"
 inline constexpr ConstStringRef requireDisableEUFusion("require_disable_eufusion");
 inline constexpr ConstStringRef simdSize("simd_size");
 inline constexpr ConstStringRef slmSize("slm_size");
+inline constexpr ConstStringRef slmAllocMode("slm_alloc_mode");
 inline constexpr ConstStringRef subgroupIndependentForwardProgress("subgroup_independent_forward_progress");
 inline constexpr ConstStringRef workGroupWalkOrderDimensions("work_group_walk_order_dimensions");
 inline constexpr ConstStringRef threadSchedulingMode("thread_scheduling_mode");
 inline constexpr ConstStringRef hasSample("has_sample");
+inline constexpr ConstStringRef actualKernelStartOffset("actual_kernel_start_offset");
+inline constexpr ConstStringRef requireImplicitArgBuffer("require_iab");
+inline constexpr ConstStringRef hasLscStoresWithNonDefaultL1CacheControls("has_lsc_stores_with_non_default_l1_cache_controls");
+inline constexpr ConstStringRef hasPrintfCalls("has_printf_calls");
+inline constexpr ConstStringRef hasIndirectCalls("has_indirect_calls");
+inline constexpr ConstStringRef requireAssertBuffer("require_assert_buffer");
+inline constexpr ConstStringRef requireSyncBuffer("require_sync_buffer");
+inline constexpr ConstStringRef hasBindlessImageRead("has_bindless_image_read");
+
 namespace ThreadSchedulingMode {
 inline constexpr ConstStringRef ageBased("age_based");
 inline constexpr ConstStringRef roundRobin("round_robin");
 inline constexpr ConstStringRef roundRobinStall("round_robin_stall");
 } // namespace ThreadSchedulingMode
 inline constexpr ConstStringRef indirectStatelessCount("indirect_stateless_count");
+inline constexpr ConstStringRef privateSize("private_size");
+inline constexpr ConstStringRef spillSize("spill_size");
 } // namespace ExecutionEnv
 
 namespace Attributes {
@@ -75,10 +105,12 @@ inline constexpr ConstStringRef invalidKernel("invalid_kernel");
 inline constexpr ConstStringRef vecTypeHint("vec_type_hint");
 inline constexpr ConstStringRef workgroupSizeHint("work_group_size_hint");
 inline constexpr ConstStringRef hintSuffix("_hint");
+inline constexpr ConstStringRef intelReqdThreadgroupDispatchSize("intel_reqd_thread_group_dispatch_size");
 } // namespace Attributes
 
 namespace DebugEnv {
 inline constexpr ConstStringRef debugSurfaceBTI("sip_surface_bti");
+inline constexpr ConstStringRef debugSurfaceOffset("sip_surface_offset");
 } // namespace DebugEnv
 
 namespace PayloadArgument {
@@ -121,6 +153,11 @@ inline constexpr ConstStringRef rtGlobalBuffer("rt_global_buffer");
 inline constexpr ConstStringRef dataConstBuffer("const_base");
 inline constexpr ConstStringRef dataGlobalBuffer("global_base");
 inline constexpr ConstStringRef assertBuffer("assert_buffer");
+inline constexpr ConstStringRef indirectDataPointer("indirect_data_pointer");
+inline constexpr ConstStringRef scratchPointer("scratch_pointer");
+inline constexpr ConstStringRef regionGroupDimension("region_group_dimension");
+inline constexpr ConstStringRef inlineSampler("inline_sampler");
+inline constexpr ConstStringRef bufferSize("buffer_size");
 
 namespace Image {
 inline constexpr ConstStringRef width("image_width");
@@ -131,10 +168,6 @@ inline constexpr ConstStringRef channelOrder("image_channel_order");
 inline constexpr ConstStringRef arraySize("image_array_size");
 inline constexpr ConstStringRef numSamples("image_num_samples");
 inline constexpr ConstStringRef numMipLevels("image_num_mip_levels");
-inline constexpr ConstStringRef flatBaseOffset("flat_image_baseoffset");
-inline constexpr ConstStringRef flatWidth("flat_image_width");
-inline constexpr ConstStringRef flatHeight("flat_image_height");
-inline constexpr ConstStringRef flatPitch("flat_image_pitch");
 } // namespace Image
 namespace Sampler {
 inline constexpr ConstStringRef snapWa("sampler_snap_wa");
@@ -251,8 +284,8 @@ inline constexpr ConstStringRef normalized("normalized");
 namespace AddrMode {
 inline constexpr ConstStringRef none("none");
 inline constexpr ConstStringRef repeat("repeat");
-inline constexpr ConstStringRef clamp_edge("clamp_edge");
-inline constexpr ConstStringRef clamp_border("clamp_border");
+inline constexpr ConstStringRef clampEdge("clamp_edge");
+inline constexpr ConstStringRef clampBorder("clamp_border");
 inline constexpr ConstStringRef mirror("mirror");
 } // namespace AddrMode
 
@@ -307,6 +340,11 @@ enum ThreadSchedulingMode : uint8_t {
     ThreadSchedulingModeMax
 };
 
+namespace Constants {
+inline constexpr int32_t compilerResolved = 0;
+inline constexpr int32_t runtimeAdjusted = 1;
+} // namespace Constants
+
 using ActualKernelStartOffsetT = int32_t;
 using BarrierCountT = int32_t;
 using EuThreadCountT = int32_t;
@@ -332,11 +370,21 @@ using RequiredWorkGroupSizeT = int32_t[3];
 using RequireDisableEUFusionT = bool;
 using SimdSizeT = int32_t;
 using SlmSizeT = int32_t;
+using SlmAllocModeT = int32_t;
 using SubgroupIndependentForwardProgressT = bool;
 using WorkgroupWalkOrderDimensionsT = int32_t[3];
 using ThreadSchedulingModeT = ThreadSchedulingMode;
 using IndirectStatelessCountT = int32_t;
 using HasSampleT = bool;
+using PrivateSizeT = int32_t;
+using SpillSizeT = int32_t;
+using RequireImplicitArgBufferT = bool;
+using HasLscStoresWithNonDefaultL1CacheControlsT = bool;
+using HasPrintfCallsT = bool;
+using HasIndirectCallsT = bool;
+using RequireAssertBufferT = bool;
+using RequireSyncBufferT = bool;
+using HasBindlessImageReadT = bool;
 
 namespace Defaults {
 inline constexpr BarrierCountT barrierCount = 0;
@@ -361,18 +409,32 @@ inline constexpr RequiredSubGroupSizeT requiredSubGroupSize = 0;
 inline constexpr RequiredWorkGroupSizeT requiredWorkGroupSize = {0, 0, 0};
 inline constexpr RequireDisableEUFusionT requireDisableEUFusion = false;
 inline constexpr SlmSizeT slmSize = 0;
+inline constexpr SlmAllocModeT slmAllocMode = 0;
 inline constexpr SubgroupIndependentForwardProgressT subgroupIndependentForwardProgress = false;
 inline constexpr WorkgroupWalkOrderDimensionsT workgroupWalkOrderDimensions = {0, 1, 2};
 inline constexpr ThreadSchedulingModeT threadSchedulingMode = ThreadSchedulingModeUnknown;
 inline constexpr IndirectStatelessCountT indirectStatelessCount = 0;
 inline constexpr HasSampleT hasSample = false;
+inline constexpr PrivateSizeT privateSize = 0;
+inline constexpr SpillSizeT spillSize = 0;
+inline constexpr RequireImplicitArgBufferT requireImplicitArgBuffer = false;
+inline constexpr HasLscStoresWithNonDefaultL1CacheControlsT hasLscStoresWithNonDefaultL1CacheControls = false;
+inline constexpr HasPrintfCallsT hasPrintfCalls = false;
+inline constexpr HasIndirectCallsT hasIndirectCalls = false;
+inline constexpr RequireAssertBufferT requireAssertBuffer = false;
+inline constexpr RequireSyncBufferT requireSyncBuffer = false;
+inline constexpr HasBindlessImageReadT hasBindlessImageRead = false;
 } // namespace Defaults
 
 inline constexpr ConstStringRef required[] = {
     Tags::Kernel::ExecutionEnv::grfCount,
     Tags::Kernel::ExecutionEnv::simdSize};
 
-struct ExecutionEnvBaseT {
+struct ExecutionEnvExt;
+
+struct ExecutionEnvBaseT final : NEO::NonCopyableAndNonMovableClass {
+    Ext<ExecutionEnvExt, true> execEnvExt;
+
     BarrierCountT barrierCount = Defaults::barrierCount;
     DisableMidThreadPreemptionT disableMidThreadPreemption = Defaults::disableMidThreadPreemption;
     EuThreadCountT euThreadCount = Defaults::euThreadCount;
@@ -394,12 +456,24 @@ struct ExecutionEnvBaseT {
     RequireDisableEUFusionT requireDisableEUFusion = Defaults::requireDisableEUFusion;
     SimdSizeT simdSize = -1;
     SlmSizeT slmSize = Defaults::slmSize;
+    SlmAllocModeT slmAllocMode = Defaults::slmAllocMode;
     SubgroupIndependentForwardProgressT subgroupIndependentForwardProgress = Defaults::subgroupIndependentForwardProgress;
     WorkgroupWalkOrderDimensionsT workgroupWalkOrderDimensions{Defaults::workgroupWalkOrderDimensions[0], Defaults::workgroupWalkOrderDimensions[1], Defaults::workgroupWalkOrderDimensions[2]};
     ThreadSchedulingModeT threadSchedulingMode = Defaults::threadSchedulingMode;
     IndirectStatelessCountT indirectStatelessCount = Defaults::indirectStatelessCount;
     HasSampleT hasSample = Defaults::hasSample;
+    PrivateSizeT privateSize = Defaults::privateSize;
+    SpillSizeT spillSize = Defaults::spillSize;
+    RequireImplicitArgBufferT requireImplicitArgBuffer = Defaults::requireImplicitArgBuffer;
+    HasLscStoresWithNonDefaultL1CacheControlsT hasLscStoresWithNonDefaultL1CacheControls = Defaults::hasLscStoresWithNonDefaultL1CacheControls;
+    HasPrintfCallsT hasPrintfCalls = Defaults::hasPrintfCalls;
+    HasIndirectCallsT hasIndirectCalls = Defaults::hasIndirectCalls;
+    RequireAssertBufferT requireAssertBuffer = Defaults::requireAssertBuffer;
+    RequireSyncBufferT requireSyncBuffer = Defaults::requireSyncBuffer;
+    HasBindlessImageReadT hasBindlessImageRead = Defaults::hasBindlessImageRead;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<ExecutionEnvBaseT>);
 
 struct ExperimentalPropertiesBaseT {
     HasNonKernelArgLoadT hasNonKernelArgLoad = Defaults::hasNonKernelArgLoad;
@@ -416,12 +490,14 @@ using ReqdWorkgroupSizeT = std::array<int32_t, 3>;
 using InvalidKernelT = ConstStringRef;
 using WorkgroupSizeHint = std::array<int32_t, 3>;
 using VecTypeHintT = ConstStringRef;
+using IntelReqdThreadgroupDispatchSizeT = int32_t;
 
 namespace Defaults {
 inline constexpr IntelReqdSubgroupSizeT intelReqdSubgroupSize = 0;
 inline constexpr IntelReqdWorkgroupWalkOrder intelReqdWorkgroupWalkOrder = {0, 0, 0};
 inline constexpr ReqdWorkgroupSizeT reqdWorkgroupSize = {0, 0, 0};
 inline constexpr WorkgroupSizeHint workgroupSizeHint = {0, 0, 0};
+inline constexpr IntelReqdThreadgroupDispatchSizeT intelReqdThreadgroupDispatchSize = 0;
 } // namespace Defaults
 
 struct AttributesBaseT {
@@ -431,64 +507,69 @@ struct AttributesBaseT {
     std::optional<InvalidKernelT> invalidKernel;
     std::optional<WorkgroupSizeHint> workgroupSizeHint;
     std::optional<VecTypeHintT> vecTypeHint;
+    std::optional<IntelReqdThreadgroupDispatchSizeT> intelReqdThreadgroupDispatchSize;
     std::vector<std::pair<ConstStringRef, ConstStringRef>> otherHints;
 };
 } // namespace Attributes
 
 namespace DebugEnv {
 using DebugSurfaceBTIT = int32_t;
+using DebugSurfaceOffset = int32_t;
 
 namespace Defaults {
 inline constexpr DebugSurfaceBTIT debugSurfaceBTI = -1;
+inline constexpr DebugSurfaceOffset debugSurfaceOffset = -1;
 } // namespace Defaults
 
 struct DebugEnvBaseT {
     DebugSurfaceBTIT debugSurfaceBTI = Defaults::debugSurfaceBTI;
+    DebugSurfaceOffset debugSurfaceOffset = Defaults::debugSurfaceOffset;
 };
 } // namespace DebugEnv
 
 enum ArgType : uint8_t {
-    ArgTypeUnknown = 0,
-    ArgTypePackedLocalIds = 1,
-    ArgTypeLocalId,
-    ArgTypeLocalSize,
-    ArgTypeGroupCount,
-    ArgTypeGlobalSize,
-    ArgTypeEnqueuedLocalSize,
-    ArgTypeGlobalIdOffset,
-    ArgTypePrivateBaseStateless,
-    ArgTypeArgByvalue,
-    ArgTypeArgBypointer,
-    ArgTypeBufferAddress,
-    ArgTypeBufferOffset,
-    ArgTypePrintfBuffer,
-    ArgTypeWorkDimensions,
-    ArgTypeImplicitArgBuffer,
-    ArgTypeImageWidth,
-    ArgTypeImageHeight,
-    ArgTypeImageDepth,
-    ArgTypeImageChannelDataType,
-    ArgTypeImageChannelOrder,
-    ArgTypeImageArraySize,
-    ArgTypeImageNumSamples,
-    ArgTypeImageMipLevels,
-    ArgTypeImageFlatBaseOffset,
-    ArgTypeImageFlatWidth,
-    ArgTypeImageFlatHeight,
-    ArgTypeImageFlatPitch,
-    ArgTypeSamplerSnapWa,
-    ArgTypeSamplerNormCoords,
-    ArgTypeSamplerAddrMode,
-    ArgTypeVmeMbBlockType,
-    ArgTypeVmeSubpixelMode,
-    ArgTypeVmeSadAdjustMode,
-    ArgTypeVmeSearchPathType,
-    ArgTypeSyncBuffer,
-    ArgTypeRtGlobalBuffer,
-    ArgTypeDataConstBuffer,
-    ArgTypeDataGlobalBuffer,
-    ArgTypeAssertBuffer,
-    ArgTypeMax
+    argTypeUnknown = 0,
+    argTypePackedLocalIds = 1,
+    argTypeLocalId,
+    argTypeLocalSize,
+    argTypeGroupCount,
+    argTypeGlobalSize,
+    argTypeEnqueuedLocalSize,
+    argTypeGlobalIdOffset,
+    argTypePrivateBaseStateless,
+    argTypeArgByvalue,
+    argTypeArgBypointer,
+    argTypeBufferAddress,
+    argTypeBufferOffset,
+    argTypePrintfBuffer,
+    argTypeWorkDimensions,
+    argTypeImplicitArgBuffer,
+    argTypeImageWidth,
+    argTypeImageHeight,
+    argTypeImageDepth,
+    argTypeImageChannelDataType,
+    argTypeImageChannelOrder,
+    argTypeImageArraySize,
+    argTypeImageNumSamples,
+    argTypeImageMipLevels,
+    argTypeSamplerSnapWa,
+    argTypeSamplerNormCoords,
+    argTypeSamplerAddrMode,
+    argTypeVmeMbBlockType,
+    argTypeVmeSubpixelMode,
+    argTypeVmeSadAdjustMode,
+    argTypeVmeSearchPathType,
+    argTypeSyncBuffer,
+    argTypeRtGlobalBuffer,
+    argTypeDataConstBuffer,
+    argTypeDataGlobalBuffer,
+    argTypeAssertBuffer,
+    argTypeIndirectDataPointer,
+    argTypeScratchPointer,
+    argTypeRegionGroupDimension,
+    argTypeInlineSampler,
+    argTypeBufferSize,
+    argTypeMax
 };
 
 namespace PerThreadPayloadArgument {
@@ -501,7 +582,7 @@ namespace Defaults {
 }
 
 struct PerThreadPayloadArgumentBaseT {
-    ArgTypeT argType = ArgTypeUnknown;
+    ArgTypeT argType = argTypeUnknown;
     OffsetT offset = -1;
     SizeT size = -1;
 };
@@ -511,68 +592,68 @@ struct PerThreadPayloadArgumentBaseT {
 namespace PayloadArgument {
 
 enum MemoryAddressingMode : uint8_t {
-    MemoryAddressingModeUnknown = 0,
-    MemoryAddressingModeStateful = 1,
-    MemoryAddressingModeStateless,
-    MemoryAddressingModeBindless,
-    MemoryAddressingModeSharedLocalMemory,
-    MemoryAddressIngModeMax
+    memoryAddressingModeUnknown = 0,
+    memoryAddressingModeStateful = 1,
+    memoryAddressingModeStateless,
+    memoryAddressingModeBindless,
+    memoryAddressingModeSharedLocalMemory,
+    memoryAddressIngModeMax
 };
 
 enum AddressSpace : uint8_t {
-    AddressSpaceUnknown = 0,
-    AddressSpaceGlobal = 1,
-    AddressSpaceLocal,
-    AddressSpaceConstant,
-    AddressSpaceImage,
-    AddressSpaceSampler,
-    AddressSpaceMax
+    addressSpaceUnknown = 0,
+    addressSpaceGlobal = 1,
+    addressSpaceLocal,
+    addressSpaceConstant,
+    addressSpaceImage,
+    addressSpaceSampler,
+    addressSpaceMax
 };
 
 enum AccessType : uint8_t {
-    AccessTypeUnknown = 0,
-    AccessTypeReadonly = 1,
-    AccessTypeWriteonly,
-    AccessTypeReadwrite,
-    AccessTypeMax
+    accessTypeUnknown = 0,
+    accessTypeReadonly = 1,
+    accessTypeWriteonly,
+    accessTypeReadwrite,
+    accessTypeMax
 };
 
 enum ImageType : uint8_t {
-    ImageTypeUnknown,
-    ImageTypeBuffer,
-    ImageType1D,
-    ImageType1DArray,
-    ImageType2D,
-    ImageType2DArray,
-    ImageType3D,
-    ImageTypeCube,
-    ImageTypeCubeArray,
-    ImageType2DDepth,
-    ImageType2DArrayDepth,
-    ImageType2DMSAA,
-    ImageType2DMSAADepth,
-    ImageType2DArrayMSAA,
-    ImageType2DArrayMSAADepth,
-    ImageType2DMedia,
-    ImageType2DMediaBlock,
-    ImageTypeMax
+    imageTypeUnknown,
+    imageTypeBuffer,
+    imageType1D,
+    imageType1DArray,
+    imageType2D,
+    imageType2DArray,
+    imageType3D,
+    imageTypeCube,
+    imageTypeCubeArray,
+    imageType2DDepth,
+    imageType2DArrayDepth,
+    imageType2DMSAA,
+    imageType2DMSAADepth,
+    imageType2DArrayMSAA,
+    imageType2DArrayMSAADepth,
+    imageType2DMedia,
+    imageType2DMediaBlock,
+    imageTypeMax
 };
 
 enum SamplerType : uint8_t {
-    SamplerTypeUnknown,
-    SamplerTypeTexture,
-    SamplerType8x8,
-    SamplerType2DConvolve8x8,
-    SamplerTypeErode8x8,
-    SamplerTypeDilate8x8,
-    SamplerTypeMinMaxFilter8x8,
-    SamplerTypeCentroid8x8,
-    SamplerTypeBoolCentroid8x8,
-    SamplerTypeBoolSum8x8,
-    SamplerTypeVME,
-    SamplerTypeVE,
-    SamplerTypeVD,
-    SamplerTypeMax
+    samplerTypeUnknown,
+    samplerTypeTexture,
+    samplerType8x8,
+    samplerType2DConvolve8x8,
+    samplerTypeErode8x8,
+    samplerTypeDilate8x8,
+    samplerTypeMinMaxFilter8x8,
+    samplerTypeCentroid8x8,
+    samplerTypeBoolCentroid8x8,
+    samplerTypeBoolSum8x8,
+    samplerTypeVME,
+    samplerTypeVE,
+    samplerTypeVD,
+    samplerTypeMax
 };
 
 using ArgTypeT = ArgType;
@@ -596,23 +677,26 @@ inline constexpr OffsetT offset = -1;
 inline constexpr BtiValueT btiValue = -1;
 } // namespace Defaults
 
+struct PayloadArgumentExtT;
+
 struct PayloadArgumentBaseT {
-    ArgTypeT argType = ArgTypeUnknown;
+    ArgTypeT argType = argTypeUnknown;
     OffsetT offset = Defaults::offset;
     SourceOffseT sourceOffset = Defaults::sourceOffset;
     SizeT size = 0;
     ArgIndexT argIndex = Defaults::argIndex;
     BtiValueT btiValue = Defaults::btiValue;
-    AddrmodeT addrmode = MemoryAddressingModeUnknown;
-    AddrspaceT addrspace = AddressSpaceUnknown;
-    AccessTypeT accessType = AccessTypeUnknown;
+    AddrmodeT addrmode = memoryAddressingModeUnknown;
+    AddrspaceT addrspace = addressSpaceUnknown;
+    AccessTypeT accessType = accessTypeUnknown;
     SamplerIndexT samplerIndex = Defaults::samplerIndex;
     SlmAlignmentT slmArgAlignment = Defaults::slmArgAlignment;
-    ImageType imageType = ImageTypeUnknown;
-    SamplerType samplerType = SamplerTypeUnknown;
+    ImageType imageType = imageTypeUnknown;
+    SamplerType samplerType = samplerTypeUnknown;
     bool imageTransformable = false;
     bool isPipe = false;
     bool isPtr = false;
+    Ext<PayloadArgumentExtT> pPayArgExt;
 };
 
 } // namespace PayloadArgument
@@ -665,20 +749,20 @@ struct PerThreadMemoryBufferBaseT {
 
 namespace InlineSamplers {
 enum class AddrMode : uint8_t {
-    Unknown,
-    None,
-    Repeat,
-    ClampEdge,
-    ClampBorder,
-    Mirror,
-    Max
+    unknown,
+    none,
+    repeat,
+    clampEdge,
+    clampBorder,
+    mirror,
+    max
 };
 
 enum FilterMode {
-    Unknown,
-    Nearest,
-    Linear,
-    Max
+    unknown,
+    nearest,
+    linear,
+    max
 };
 
 using SamplerIndexT = int32_t;
@@ -688,8 +772,8 @@ using NormalizedT = bool;
 
 namespace Defaults {
 inline constexpr SamplerIndexT samplerIndex = -1;
-inline constexpr AddrModeT addrMode = AddrMode::Unknown;
-inline constexpr FilterModeT filterMode = FilterMode::Unknown;
+inline constexpr AddrModeT addrMode = AddrMode::unknown;
+inline constexpr FilterModeT filterMode = FilterMode::unknown;
 inline constexpr NormalizedT normalized = false;
 }; // namespace Defaults
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/test/common/libult/linux/drm_mock.h"
 #include "shared/test/common/mocks/linux/mock_drm_command_stream_receiver.h"
 #include "shared/test/common/mocks/linux/mock_drm_memory_manager.h"
+#include "shared/test/common/mocks/linux/mock_ioctl_helper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/command_queue/command_queue_hw.h"
@@ -18,6 +19,7 @@
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 using namespace NEO;
+#include "shared/test/common/test_macros/heapless_matchers.h"
 
 struct ClCreateCommandQueueWithPropertiesLinux : public UltCommandStreamReceiverTest {
     void SetUp() override {
@@ -29,10 +31,10 @@ struct ClCreateCommandQueueWithPropertiesLinux : public UltCommandStreamReceiver
         auto osInterface = new OSInterface();
         osInterface->setDriverModel(std::unique_ptr<DriverModel>(drm));
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface.reset(osInterface);
-        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, rootDeviceIndex);
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*drm, rootDeviceIndex, false);
         executionEnvironment->memoryManager.reset(new TestedDrmMemoryManager(*executionEnvironment));
         mdevice = std::make_unique<MockClDevice>(MockDevice::create<MockDevice>(executionEnvironment, rootDeviceIndex));
-
+        ASSERT_NE(nullptr, mdevice.get());
         clDevice = mdevice.get();
         retVal = CL_SUCCESS;
         context = std::unique_ptr<Context>(Context::create<MockContext>(nullptr, ClDeviceVector(&clDevice, 1), nullptr, nullptr, retVal));
@@ -106,7 +108,7 @@ TEST_F(ClCreateCommandQueueWithPropertiesLinux, givenPossiblePropertiesWithClQue
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-HWTEST_F(ClCreateCommandQueueWithPropertiesLinux, givenPropertiesWithClQueueSliceCountWhenCreateCommandQueueThenCallFlushTaskAndSliceCountIsSet) {
+HWTEST2_F(ClCreateCommandQueueWithPropertiesLinux, givenPropertiesWithClQueueSliceCountWhenCreateCommandQueueThenCallFlushTaskAndSliceCountIsSet, IsHeapfulRequired) {
     uint64_t newSliceCount = 1;
     size_t maxSliceCount;
     clGetDeviceInfo(clDevice, CL_DEVICE_SLICE_COUNT_INTEL, sizeof(size_t), &maxSliceCount, nullptr);
@@ -119,6 +121,9 @@ HWTEST_F(ClCreateCommandQueueWithPropertiesLinux, givenPropertiesWithClQueueSlic
     auto mockCsr = new TestedDrmCommandStreamReceiver<FamilyType>(*mdevice->executionEnvironment, rootDeviceIndex, 1);
     mockCsr->flushInternalCallBase = false;
     mdevice->resetCommandStreamReceiver(mockCsr);
+    if (mockCsr->getHeaplessModeEnabled()) {
+        GTEST_SKIP();
+    }
 
     cl_command_queue cmdQ = clCreateCommandQueueWithProperties(context.get(), clDevice, properties, &retVal);
 
@@ -151,7 +156,7 @@ HWTEST_F(ClCreateCommandQueueWithPropertiesLinux, givenPropertiesWithClQueueSlic
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-HWTEST_F(ClCreateCommandQueueWithPropertiesLinux, givenSameSliceCountAsRecentlySetWhenCreateCommandQueueThenSetQueueSliceCountNotCalled) {
+HWTEST2_F(ClCreateCommandQueueWithPropertiesLinux, givenSameSliceCountAsRecentlySetWhenCreateCommandQueueThenSetQueueSliceCountNotCalled, IsHeapfulRequired) {
     uint64_t newSliceCount = 1;
     size_t maxSliceCount;
 
@@ -197,7 +202,7 @@ HWTEST_F(ClCreateCommandQueueWithPropertiesLinux, givenSameSliceCountAsRecentlyS
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-HWTEST_F(ClCreateCommandQueueWithPropertiesLinux, givenPropertiesWithClQueueSliceCountWhenCreateCommandQueueThenSetReturnFalseAndLastSliceCountNotModify) {
+HWTEST2_F(ClCreateCommandQueueWithPropertiesLinux, givenPropertiesWithClQueueSliceCountWhenCreateCommandQueueThenSetReturnFalseAndLastSliceCountNotModify, IsHeapfulRequired) {
     uint64_t newSliceCount = 1;
     size_t maxSliceCount;
     clGetDeviceInfo(clDevice, CL_DEVICE_SLICE_COUNT_INTEL, sizeof(size_t), &maxSliceCount, nullptr);

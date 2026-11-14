@@ -1,0 +1,28 @@
+/*
+ * Copyright (C) 2018-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "common/gtsysinfo.h"
+#include "neo_igfxfmid.h"
+
+#include <cstdint>
+
+namespace Os {
+///////////////////////////////////////////////////////////////////////////////
+// These options determine the Windows specific behavior for
+// the runtime unit tests
+///////////////////////////////////////////////////////////////////////////////
+const char *frontEndDllName = "";
+const char *igcDllName = "";
+const char *gdiDllName = "";
+const char *dxcoreDllName = "";
+const char *testDllName = "test_dynamic_lib.dll";
+const char *metricsLibraryDllName = "";
+} // namespace Os
+
+namespace ContextGroup {
+uint32_t maxContextCount = 4;
+}

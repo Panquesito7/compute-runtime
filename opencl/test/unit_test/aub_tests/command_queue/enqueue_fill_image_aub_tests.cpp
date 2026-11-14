@@ -1,82 +1,85 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/ptr_math.h"
+#include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "opencl/source/cl_device/cl_device.h"
+#include "opencl/source/context/context.h"
+#include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/mem_obj/image.h"
-#include "opencl/test/unit_test/aub_tests/command_queue/command_enqueue_fixture.h"
+#include "opencl/test/unit_test/aub_tests/command_stream/aub_command_stream_fixture.h"
+#include "opencl/test/unit_test/aub_tests/fixtures/aub_fixture.h"
+#include "opencl/test/unit_test/command_queue/command_queue_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
-#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <tuple>
 
 using namespace NEO;
 
-// clang-format off
 struct FillImageParams {
     cl_mem_object_type imageType;
     size_t offsets[3];
 } imageParams[] = {
-    {CL_MEM_OBJECT_IMAGE1D, { 0u, 0u, 0u}}, 
-    {CL_MEM_OBJECT_IMAGE1D, { 1u, 0u, 0u}}, 
-    {CL_MEM_OBJECT_IMAGE2D, { 0u, 0u, 0u}}, 
-    {CL_MEM_OBJECT_IMAGE2D, { 1u, 2u, 0u}},
-    {CL_MEM_OBJECT_IMAGE3D, { 0u, 0u, 0u}},
-    {CL_MEM_OBJECT_IMAGE3D, { 1u, 2u, 3u}}
-};
+    {CL_MEM_OBJECT_IMAGE1D, {0u, 0u, 0u}},
+    {CL_MEM_OBJECT_IMAGE1D, {1u, 0u, 0u}},
+    {CL_MEM_OBJECT_IMAGE2D, {0u, 0u, 0u}},
+    {CL_MEM_OBJECT_IMAGE2D, {1u, 2u, 0u}},
+    {CL_MEM_OBJECT_IMAGE3D, {0u, 0u, 0u}},
+    {CL_MEM_OBJECT_IMAGE3D, {1u, 2u, 3u}}};
 
-static const uint32_t fillValues[4] = { 0x3f800000, 0x00000000, 0x3f555555, 0x3f2aaaaa };
+static const uint32_t fillValues[4] = {0x3f800000, 0x00000000, 0x3f555555, 0x3f2aaaaa};
 
-static const uint16_t expectedHALF_FLOAT[4] = {0x3c00, 0x0000, 0x3aaa, 0x3955};
+static const uint16_t expectedHalfFloat[4] = {0x3c00, 0x0000, 0x3aaa, 0x3955};
 
-static const uint16_t expectedUNORM16[4]    = {0xffff, 0x0000, 0xd554, 0xaaa9};
-static const uint8_t  expectedUNORM8[4]     = {  0xff,   0x00,   0xd4,   0xa9};
-//The distance between sRGB values and the expected values should not be greater than 0.6f
-//In this test, for simplicity purposes, we are checking if the distance is 0
-static const uint8_t  expectedUNORM8sRGB[4]     = {  0xff,   0x00,   0xeb,   0xa9};
-static const uint8_t  expectedUNORM8sBGR[4]     = {  0xeb,   0x00,   0xff,   0xa9};
+static const uint16_t expectedUnorm16[4] = {0xffff, 0x0000, 0xd554, 0xaaa9};
+static const uint8_t expectedUnorm8[4] = {0xff, 0x00, 0xd4, 0xa9};
+// The distance between sRGB values and the expected values should not be greater than 0.6f
+// In this test, for simplicity purposes, we are checking if the distance is 0
+static const uint8_t expectedUnorm8srgb[4] = {0xff, 0x00, 0xeb, 0xa9};
+static const uint8_t expectedUnorm8sbgr[4] = {0xeb, 0x00, 0xff, 0xa9};
 
-static const uint16_t expectedSNORM16[4]    = {0x7fff, 0x0000, 0x6AA9, 0x5554};
-static const uint8_t  expectedSNORM8[4]     = {  0x7f,   0x00,   0x69,   0x54};
+static const uint16_t expectedSnorm16[4] = {0x7fff, 0x0000, 0x6AA9, 0x5554};
+static const uint8_t expectedSnorm8[4] = {0x7f, 0x00, 0x69, 0x54};
 
-static auto     expectedSINT32    = fillValues;
-static uint16_t expectedSINT16[4] = { 0x0000, 0x0000, 0x5555, 0xaaaa };
-static uint8_t  expectedSINT8[4]  = {   0x00,   0x00,   0x55,   0xaa };
+static auto expectedSint32 = fillValues;
+static uint16_t expectedSint16[4] = {0x0000, 0x0000, 0x5555, 0xaaaa};
+static uint8_t expectedSint8[4] = {0x00, 0x00, 0x55, 0xaa};
 
-static auto     expectedUINT32    = fillValues;
-static uint16_t expectedUINT16[4] = { 0x0000, 0x0000, 0x5555, 0xaaaa };
-static uint8_t  expectedUINT8[4]  = {   0x00,   0x00,   0x55,   0xaa };
+static auto expectedUint32 = fillValues;
+static uint16_t expectedUint16[4] = {0x0000, 0x0000, 0x5555, 0xaaaa};
+static uint8_t expectedUint8[4] = {0x00, 0x00, 0x55, 0xaa};
 
-static auto expectedFLOAT = fillValues;
+static auto expectedFloat = fillValues;
 
 // ChannelTypes/FillValues for test
 struct FillChannelType {
     cl_channel_type type;
     const void *expectedValues;
 } fillChannelTypes[] = {
-    {CL_SNORM_INT8,     expectedSNORM8},
-    {CL_SNORM_INT16,    expectedSNORM16},
-    {CL_UNORM_INT8,     expectedUNORM8},
-    {CL_UNORM_INT16,    expectedUNORM16},
-    {CL_SIGNED_INT8,    expectedSINT8},
-    {CL_SIGNED_INT16,   expectedSINT16},
-    {CL_SIGNED_INT32,   expectedSINT32},
-    {CL_UNSIGNED_INT8,  expectedUINT8},
-    {CL_UNSIGNED_INT16, expectedUINT16},
-    {CL_UNSIGNED_INT32, expectedUINT32},
-    {CL_HALF_FLOAT,     expectedHALF_FLOAT},
-    {CL_FLOAT,          expectedFLOAT}};
-// clang-format on
+    {CL_SNORM_INT8, expectedSnorm8},
+    {CL_SNORM_INT16, expectedSnorm16},
+    {CL_UNORM_INT8, expectedUnorm8},
+    {CL_UNORM_INT16, expectedUnorm16},
+    {CL_SIGNED_INT8, expectedSint8},
+    {CL_SIGNED_INT16, expectedSint16},
+    {CL_SIGNED_INT32, expectedSint32},
+    {CL_UNSIGNED_INT8, expectedUint8},
+    {CL_UNSIGNED_INT16, expectedUint16},
+    {CL_UNSIGNED_INT32, expectedUint32},
+    {CL_HALF_FLOAT, expectedHalfFloat},
+    {CL_FLOAT, expectedFloat}};
 
 struct AubFillImage
-    : public CommandDeviceFixture,
-      public AUBCommandStreamFixture,
+    : public AUBCommandStreamFixture,
       public ::testing::WithParamInterface<std::tuple<FillChannelType, uint32_t /*cl_channel_order*/, FillImageParams>>,
       public ::testing::Test {
 
@@ -95,24 +98,16 @@ struct AubFillImage
             // sRGBA and sBGRA support only unorm int8 type
             GTEST_SKIP();
         }
-        CommandDeviceFixture::setUp(cl_command_queue_properties(0));
-        CommandStreamFixture::setUp(pCmdQ);
 
-        context = std::make_unique<MockContext>(pClDevice);
-        if ((pClDevice->getHardwareInfo().capabilityTable.supportsOcl21Features == false) && (channelOrder == CL_sRGBA || channelOrder == CL_sBGRA)) {
-            GTEST_SKIP();
-        }
+        CommandStreamFixture::setUp();
     }
 
     void TearDown() override {
         image.reset();
-        context.reset();
 
         CommandStreamFixture::tearDown();
-        CommandDeviceFixture::tearDown();
     }
 
-    std::unique_ptr<MockContext> context;
     std::unique_ptr<Image> image;
 };
 
@@ -181,9 +176,9 @@ HWTEST_P(AubFillImage, WhenFillingThenExpectationsMet) {
 
     auto retVal = CL_INVALID_VALUE;
     cl_mem_flags flags = CL_MEM_READ_ONLY;
-    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat, context->getDevice(0)->getHardwareInfo().capabilityTable.supportsOcl21Features);
+    auto surfaceFormat = Image::getSurfaceFormatFromTable(flags, &imageFormat);
     image.reset(Image::create(
-        context.get(),
+        context,
         ClMemoryPropertiesHelper::createMemoryProperties(flags, 0, 0, &context->getDevice(0)->getDevice()),
         flags,
         0,
@@ -233,13 +228,14 @@ HWTEST_P(AubFillImage, WhenFillingThenExpectationsMet) {
 
     auto expected = std::get<0>(GetParam()).expectedValues;
     if (imageFormat.image_channel_order == CL_sRGBA) {
-        expected = expectedUNORM8sRGB;
+        expected = expectedUnorm8srgb;
     }
     if (imageFormat.image_channel_order == CL_sBGRA) {
-        expected = expectedUNORM8sBGR;
+        expected = expectedUnorm8sbgr;
     }
 
     auto pImageData = dstMemory;
+    std::vector<uint8_t> expectedRow(testWidth * elementSize);
 
     for (size_t z = 0; z < testDepth; ++z) {
         for (size_t y = 0; y < testHeight; ++y) {
@@ -247,11 +243,12 @@ HWTEST_P(AubFillImage, WhenFillingThenExpectationsMet) {
                 if (z >= origin[2] && z < (origin[2] + region[2]) &&
                     y >= origin[1] && y < (origin[1] + region[1]) &&
                     x >= origin[0] && x < (origin[0] + region[0])) {
-                    AUBCommandStreamFixture::expectMemory<FamilyType>(&pImageData[x * elementSize], expected, elementSize);
+                    memcpy_s(&expectedRow[x * elementSize], elementSize, expected, elementSize);
                 } else {
-                    AUBCommandStreamFixture::expectMemory<FamilyType>(&pImageData[x * elementSize], srcMemory, elementSize);
+                    memcpy_s(&expectedRow[x * elementSize], elementSize, srcMemory, elementSize);
                 }
             }
+            AUBCommandStreamFixture::expectMemory<FamilyType>(pImageData, expectedRow.data(), testWidth * elementSize);
             pImageData = ptrOffset(pImageData, rowPitch);
         }
         pImageData = ptrOffset(pImageData, slicePitch - (rowPitch * (testHeight > 0 ? testHeight : 1)));
@@ -261,14 +258,14 @@ HWTEST_P(AubFillImage, WhenFillingThenExpectationsMet) {
     delete[] srcMemory;
 }
 
-INSTANTIATE_TEST_CASE_P(AubFillImage_simple,
-                        AubFillImage,
-                        ::testing::Combine(
-                            ::testing::ValuesIn(fillChannelTypes),
-                            ::testing::Values( // channels
-                                CL_R,
-                                CL_RG,
-                                CL_RGBA,
-                                CL_sRGBA,
-                                CL_sBGRA),
-                            ::testing::ValuesIn(imageParams)));
+INSTANTIATE_TEST_SUITE_P(AubFillImage_simple,
+                         AubFillImage,
+                         ::testing::Combine(
+                             ::testing::ValuesIn(fillChannelTypes),
+                             ::testing::Values( // channels
+                                 CL_R,
+                                 CL_RG,
+                                 CL_RGBA,
+                                 CL_sRGBA,
+                                 CL_sBGRA),
+                             ::testing::ValuesIn(imageParams)));

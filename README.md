@@ -1,6 +1,6 @@
 <!---
 
-Copyright (C) 2018-2021 Intel Corporation
+Copyright (C) 2018-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -32,14 +32,46 @@ You may obtain a copy of the License at: https://opensource.org/licenses/MIT
 
 ## Supported Platforms
 
-|Platform|OpenCL|Level Zero|
-|--------|:----:|:--------:|
-|Intel Core Processors with Gen8 graphics devices (formerly Broadwell)| 3.0 | - |
-|Intel Core Processors with Gen9 graphics devices (formerly Skylake, Kaby Lake, Coffee Lake)| 3.0 | Y |
-|Intel Atom Processors with Gen9 graphics devices (formerly Apollo Lake, Gemini Lake)| 3.0 | - |
-|Intel Core Processors with Gen11 graphics devices (formerly Ice Lake)| 3.0 | Y |
-|Intel Atom Processors with Gen11 graphics devices (formerly Elkhart Lake)| 3.0 | - |
-|Intel Core Processors with Gen12 graphics devices (formerly Tiger Lake, Rocket Lake, Alder Lake)| 3.0 | Y |
+Platforms at production quality expose OpenCL 3.0 and Level Zero 1.18, and are supported on WSL.
+
+### Discrete
+
+* [DG1](https://ark.intel.com/content/www/us/en/ark/products/codename/195485/products-formerly-dg1.html)
+* [Alchemist](https://ark.intel.com/content/www/us/en/ark/products/codename/226095/products-formerly-alchemist.html)
+* [Battlemage](https://www.intel.com/content/www/us/en/ark/products/series/240391/intel-arc-b-series-graphics.html)
+
+### Integrated
+
+* [Tiger Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/88759/tiger-lake.html) / [Rocket Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/192985/rocket-lake.html) / [Alder Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/147470/products-formerly-alder-lake.html) / [Raptor Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/215599/products-formerly-raptor-lake.html)
+* [Meteor Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/90353/products-formerly-meteor-lake.html) / [Arrow Lake](https://www.intel.com/content/www/us/en/ark/products/codename/225837/products-formerly-arrow-lake.html)
+* [Lunar Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/213792/products-formerly-lunar-lake.html)
+* [Panther Lake](https://www.intel.com/content/www/us/en/ark/products/codename/237132/products-formerly-panther-lake.html) / [Wildcat Lake](https://www.intel.com/content/www/us/en/ark/products/codename/241450/products-formerly-wildcat-lake.html)
+
+## Pre-Release Platforms
+
+Support for these platforms is a work in progress. Feature set, API versions and WSL support may change before they reach production quality.
+
+* Discrete: [Crescent Island](https://www.intel.com/content/www/us/en/products/details/discrete-gpus/data-center-gpu/d-series.html)
+* Integrated: Nova Lake
+
+_No code changes may be introduced that would regress support for any currently supported hardware. All contributions must ensure continued compatibility and functionality across all supported hardware platforms. Failure to maintain hardware compatibility may result in the rejection or reversion of the contribution. Any deliberate modifications or removal of hardware support will be transparently communicated in the release notes._
+
+_Debug parameters, environmental variables, and internal data structures are considered as internal implementation detail and may be changed or removed at any time._
+
+## Support for legacy platforms
+
+Support for Gen8, Gen9 and Gen11 devices is delivered via packages with legacy1 suffix, more details [here](documentation/LEGACY_PLATFORMS.md)
+
+## Legacy Platforms
+
+|Platform|OpenCL|Level Zero|WSL|
+|--------|:----:|:--------:|:-:|
+|Intel Core Processors with Gen8 graphics devices (formerly Broadwell)| 3.0 | - | - |
+|Intel Core Processors with Gen9 graphics devices (formerly Skylake, Kaby Lake)| 3.0 | 1.5 | - |
+|Intel Core Processors with Gen9 graphics devices (formerly Coffee Lake)| 3.0 | 1.5 | Y |
+|Intel Atom Processors with Gen9 graphics devices (formerly Apollo Lake, Gemini Lake)| 3.0 | - | - |
+|Intel Core Processors with Gen11 graphics devices (formerly Ice Lake)| 3.0 | 1.5 | Y |
+|Intel Atom Processors with Gen11 graphics devices (formerly Elkhart Lake)| 3.0 | - | Y |
 
 ## Release cadence
 
@@ -52,6 +84,9 @@ _Release cadence changed from weekly to monthly late 2022_
 * We publish and document a monthly release from the tip of that branch. 
 * During subsequent weeks of a given month, we continue to cherry-pick fixes to that branch and may publish a hotfix release. 
 * Quality level of the driver (per platform) will be provided in the Release Notes.
+* Once a monthly release is posted on compute-runtime GitHub, it may propagate to secondary release channels and/or be repackaged / rebuilt for convenience (e.g., [intel-graphics](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics)). Users should choose package origin (GitHub/PPA) that is most convenient for them.
+* A secondary channel must not release a version that was not released on GitHub prior.
+ 
 
 ## Installation Options
 
@@ -77,7 +112,7 @@ Release Notes on the [release page](https://github.com/intel/compute-runtime/rel
 
 Directly linking to the runtime library is not supported:
 * Level Zero applications should link with [Level Zero loader](https://github.com/oneapi-src/level-zero)
-* OpenCL applications should link with [ICD loader library (ocl-icd)](https://github.com/OCL-dev/ocl-icd)
+* OpenCL applications should link with [ICD loader library](https://github.com/KhronosGroup/OpenCL-ICD-Loader)
 
 ## Dependencies
 
@@ -85,8 +120,8 @@ Directly linking to the runtime library is not supported:
 * Intel Graphics Compiler - https://github.com/intel/intel-graphics-compiler
 
 In addition, to enable performance counters support, the following packages are needed:
-* Intel Metrics Discovery - https://github.com/intel/metrics-discovery
-* Intel Metrics Library for MDAPI - https://github.com/intel/metrics-library
+* Intel(R) Metrics Discovery (MDAPI) - https://github.com/intel/metrics-discovery
+* Intel(R) Metrics Library for MDAPI - https://github.com/intel/metrics-library
 
 ## How to provide feedback
 
@@ -102,11 +137,14 @@ for more details.
 
 ## See also
 
+* [Architecture Overview](https://github.com/intel/compute-runtime/blob/master/ARCHITECTURE.md)
 * [Contribution guidelines](https://github.com/intel/compute-runtime/blob/master/CONTRIBUTING.md)
-* [Frequently Asked Questions](https://github.com/intel/compute-runtime/blob/master/FAQ.md)
+* [Programmers Guide](https://github.com/intel/compute-runtime/blob/master/programmers-guide/PROGRAMMERS_GUIDE.md)
+* [Issue Submission Guide](https://github.com/intel/compute-runtime/blob/master/documentation/ISSUE_SUBMISSION_GUIDE.md)
+* [Frequently Asked Questions](https://github.com/intel/compute-runtime/blob/master/documentation/FAQ.md)
 
 ### Level Zero specific
-* [oneAPI Level Zero specification](https://spec.oneapi.com/versions/latest/elements/l0/source/index.html)
+* [oneAPI Level Zero specification](https://oneapi-src.github.io/level-zero-spec/level-zero/latest/index.html)
 * [Intel(R) OneApi Level Zero Specification API C/C++ header files](https://github.com/oneapi-src/level-zero/)
 * [oneAPI Level Zero tests](https://github.com/oneapi-src/level-zero-tests/)
 

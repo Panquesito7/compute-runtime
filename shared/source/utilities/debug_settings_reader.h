@@ -1,34 +1,42 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include <stdint.h>
+#include <cstdint>
 #include <string>
 
 namespace NEO {
+
+enum class DebugVarPrefix : uint8_t;
 
 class SettingsReader {
   public:
     virtual ~SettingsReader() = default;
     static SettingsReader *create(const std::string &regKey) {
         SettingsReader *readerImpl = createFileReader();
-        if (readerImpl != nullptr)
+        if (readerImpl != nullptr) {
             return readerImpl;
+        }
 
         return createOsReader(false, regKey);
     }
     static SettingsReader *createOsReader(bool userScope, const std::string &regKey);
     static SettingsReader *createFileReader();
+    virtual bool hasSetting(const char *settingName, DebugVarPrefix &type) = 0;
+    virtual int32_t getSetting(const char *settingName, int32_t defaultValue, DebugVarPrefix &type) = 0;
     virtual int32_t getSetting(const char *settingName, int32_t defaultValue) = 0;
+    virtual int64_t getSetting(const char *settingName, int64_t defaultValue, DebugVarPrefix &type) = 0;
     virtual int64_t getSetting(const char *settingName, int64_t defaultValue) = 0;
+    virtual bool getSetting(const char *settingName, bool defaultValue, DebugVarPrefix &type) = 0;
     virtual bool getSetting(const char *settingName, bool defaultValue) = 0;
+    virtual std::string getSetting(const char *settingName, const std::string &value, DebugVarPrefix &type) = 0;
     virtual std::string getSetting(const char *settingName, const std::string &value) = 0;
     virtual const char *appSpecificLocation(const std::string &name) = 0;
     static const char *settingsFileName;
-    MOCKABLE_VIRTUAL char *getenv(const char *settingName);
+    static const char *neoSettingsFileName;
 };
 }; // namespace NEO

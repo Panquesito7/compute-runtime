@@ -1,0 +1,399 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/api/opencl/source/event/leo_event.h"
+
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/device/device.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/event_profiling_helpers.h"
+#include "shared/source/helpers/get_info.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/os_interface/os_time.h"
+#include "shared/source/os_interface/performance_counters.h"
+#include "shared/source/utilities/perf_counter.h"
+#include "shared/source/utilities/tag_allocator.h"
+
+#include "level_zero/api/internal/l0_event.h"
+#include "level_zero/api/opencl/source/event/leo_async_events_handler.h"
+#include "level_zero/api/opencl/source/helpers/l0_to_cl_return_types_mapper.h"
+#include "level_zero/api/opencl/source/helpers/leo_get_info_status_mapper.h"
+#include "level_zero/api/opencl/source/l0_dispatch/leo_l0_dispatch.h"
+#include "level_zero/api/opencl/source/platform/leo_platform.h"
+#include "level_zero/core/source/cmdlist/cmdlist.h"
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/event/event.h"
+
+namespace NEO {
+namespace LEO {
+
+EventHandleSpan::EventHandleSpan(cl_uint numEvents, const cl_event *eventWaitList) noexcept {
+    if (eventWaitList && numEvents > 0) {
+        count = numEvents;
+        ze_event_handle_t *ptr;
+        if (numEvents <= maxInlineWaitEvents) {
+            ptr = std::get<InlineStorage>(storage).data();
+        } else {
+            storage = HeapStorage(numEvents);
+            ptr = std::get<HeapStorage>(storage).data();
+        }
+        for (cl_uint i = 0; i < numEvents; ++i) {
+            ptr[i] = NEO::LEO::castToObject<NEO::LEO::Event>(eventWaitList[i])->getL0Handle();
+        }
+    }
+}
+
+Event::Event(cl_command_type commandType, NEO::LEO::CommandQueue *commandQueue) : commandType(commandType), oclObj(commandQueue) {
+    if (!commandQueue) {
+        UNRECOVERABLE_IF(true);
+    }
+    commandQueue->incRefInternal();
+
+    const bool profiling = commandQueue->isProfilingEnabled();
+    if (profiling) {
+        this->setQueueTimeStamp();
+    }
+
+    if (commandQueue->isOutOfOrder()) {
+        this->backing = profiling ? EventBacking::regularTimestamp : EventBacking::regular;
+        this->eventHandle = commandQueue->getContext()->obtainRegularEvent(profiling);
+    } else {
+        auto l0CmdList = commandQueue->getL0Object();
+        auto deviceHandle = l0CmdList->getDevice();
+        auto contextHandle = l0CmdList->getCmdListContext();
+
+        ze_event_counter_based_desc_t eventDesc{ZE_STRUCTURE_TYPE_EVENT_COUNTER_BASED_DESC, nullptr, ZE_EVENT_COUNTER_BASED_FLAG_IMMEDIATE, ZE_EVENT_SCOPE_FLAG_HOST, ZE_EVENT_SCOPE_FLAG_DEVICE};
+        if (profiling) {
+            eventDesc.flags |= ZE_EVENT_COUNTER_BASED_FLAG_DEVICE_TIMESTAMP;
+        }
+
+        ze_event_handle_t hSignalEvent{};
+        zeEventCounterBasedCreate(contextHandle, deviceHandle, &eventDesc, &hSignalEvent);
+        this->eventHandle = hSignalEvent;
+    }
+
+    this->perfCountersEnabled = commandQueue->isPerfCountersEnabled();
+}
+
+Event::Event(NEO::LEO::Context *context) : commandType(CL_COMMAND_USER), oclObj(context) {
+    if (!context) {
+        UNRECOVERABLE_IF(true);
+    }
+    context->incRefInternal();
+    this->backing = EventBacking::regular;
+    this->eventHandle = context->obtainRegularEvent(false);
+}
+
+Event::~Event() {
+    auto lastStatus = this->eventStatus.load();
+    if (lastStatus > CL_COMPLETE) {
+        lastStatus = executionTerminatedOnDestruction;
+        this->eventStatus.store(lastStatus);
+    }
+    if (this->peekHasCallbacks()) {
+        this->executeCallbacks(lastStatus);
+    }
+
+    this->arbEvent.reset(nullptr);
+
+    if (perfCounterNode != nullptr) {
+        UNRECOVERABLE_IF(!std::holds_alternative<CommandQueue *>(oclObj));
+        auto cmdQ = std::get<CommandQueue *>(oclObj);
+        cmdQ->getPerfCounters()->deleteQuery(perfCounterNode->getQueryHandleRef());
+        perfCounterNode->getQueryHandleRef() = {};
+        perfCounterNode->returnTag();
+        getL0Object()->setPerfCounterNode(nullptr);
+    }
+
+    if (this->backing == EventBacking::counterBased) {
+        zeEventDestroy(this->eventHandle);
+    } else {
+        this->getContext()->returnRegularEvent(this->eventHandle, this->backing == EventBacking::regularTimestamp);
+    }
+
+    std::visit([](auto &baseObject) { baseObject->decRefInternal(); }, oclObj);
+}
+
+cl_int Event::getProfilingInfo(cl_profiling_info paramName, size_t paramValueSize, void *paramValue, size_t *paramValueSizeRet) {
+    if (this->isUserEvent()) {
+        return CL_PROFILING_INFO_NOT_AVAILABLE;
+    }
+
+    auto device = getL0Object()->getDevice();
+    auto neoDevice = device->getNEODevice();
+    auto resolution = neoDevice->getDeviceInfo().profilingTimerResolution;
+
+    const ProfilingInfo *anchor = nullptr;
+    switch (paramName) {
+    case CL_PROFILING_COMMAND_QUEUED:
+        anchor = &queueTimeStamp;
+        break;
+    case CL_PROFILING_COMMAND_SUBMIT:
+        anchor = &submitTimeStamp;
+        break;
+    case CL_PROFILING_COMMAND_START:
+        anchor = &startTimeStamp;
+        break;
+    case CL_PROFILING_COMMAND_END:
+    case CL_PROFILING_COMMAND_COMPLETE:
+        anchor = &endTimeStamp;
+        break;
+    case CL_PROFILING_COMMAND_PERFCOUNTERS_INTEL: {
+        if (!perfCountersEnabled) {
+            return CL_INVALID_VALUE;
+        }
+        auto cmdQ = getCommandQueue();
+        if (!cmdQ->getPerfCounters()->getApiReport(perfCounterNode, paramValueSize, paramValue, paramValueSizeRet,
+                                                   queryAndUpdateEventStatus() == CL_COMPLETE)) {
+            return CL_PROFILING_INFO_NOT_AVAILABLE;
+        }
+        return CL_SUCCESS;
+    }
+    default:
+        return CL_INVALID_VALUE;
+    }
+
+    // calculateProfilingData can move the submit/queue anchors, so a second pass would shift them again.
+    // The query can wait for the timestamp writeback, so it runs before ownership is taken.
+    if (!dataCalculated.load(std::memory_order_acquire)) {
+        ze_kernel_timestamp_result_t ts{};
+        auto queryResult = this->queryKernelTimestamp(ts);
+        if (queryResult != ZE_RESULT_SUCCESS) {
+            return L0ToClResultMapper(queryResult);
+        }
+
+        auto lock = this->takeOwnership();
+        if (!dataCalculated) {
+            auto &gfxCoreHelper = neoDevice->getGfxCoreHelper();
+            const uint32_t kernelTimestampValidBits = neoDevice->getHardwareInfo().capabilityTable.kernelTimestampValidBits;
+            uint64_t contextCompleteTS = 0; // no separate device-enqueue completion writeback -> complete == end
+            NEO::calculateProfilingData(gfxCoreHelper, *neoDevice->getOSTime(), resolution, kernelTimestampValidBits,
+                                        queueTimeStamp, submitTimeStamp, startTimeStamp, endTimeStamp, completeTimeStamp,
+                                        ts.global.kernelStart, ts.global.kernelEnd, &contextCompleteTS, ts.global.kernelStart);
+            dataCalculated.store(true, std::memory_order_release);
+        }
+    }
+
+    const uint64_t timestamp = device->getGfxCoreHelper().getGpuTimeStampInNS(anchor->gpuTimeStamp, resolution);
+
+    auto getInfoStatus = GetInfo::getInfo(paramValue, paramValueSize, &timestamp, sizeof(timestamp));
+    GetInfo::setParamValueReturnSize(paramValueSizeRet, sizeof(timestamp), getInfoStatus);
+
+    return changeGetInfoStatusToCLResultType(getInfoStatus);
+}
+
+ze_result_t Event::queryKernelTimestamp(ze_kernel_timestamp_result_t &result) {
+    return zeEventQueryKernelTimestamp(eventHandle, &result);
+}
+
+cl_int Event::getEventInfo(cl_event_info paramName, size_t paramValueSize, void *paramValue, size_t *paramValueSizeRet) {
+    cl_int retVal = CL_INVALID_VALUE;
+    GetInfoHelper info(paramValue, paramValueSize, paramValueSizeRet);
+
+    auto cmdQ = this->isUserEvent() ? nullptr : std::get<CommandQueue *>(oclObj);
+    auto context = this->getContext();
+
+    switch (paramName) {
+    default:
+        return retVal;
+    case CL_EVENT_L0_HANDLE_INTEL: {
+        auto source = &this->eventHandle;
+        auto sourceSize = sizeof(this->eventHandle);
+        auto getInfoStatus = GetInfo::getInfo(paramValue, paramValueSize, source, sourceSize);
+        retVal = changeGetInfoStatusToCLResultType(getInfoStatus);
+        GetInfo::setParamValueReturnSize(paramValueSizeRet, sourceSize, getInfoStatus);
+        return retVal;
+    }
+    case CL_EVENT_COMMAND_QUEUE:
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_command_queue>(cmdQ));
+        return retVal;
+    case CL_EVENT_CONTEXT:
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_context>(context));
+        return retVal;
+    case CL_EVENT_COMMAND_TYPE:
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_command_type>(this->commandType));
+        return retVal;
+    case CL_EVENT_COMMAND_EXECUTION_STATUS:
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_int>(this->queryAndUpdateEventStatus()));
+        return retVal;
+    case CL_EVENT_REFERENCE_COUNT:
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_uint>(this->getReference()));
+        return retVal;
+    }
+}
+
+ze_result_t Event::wait(uint64_t timeout) {
+    return zeEventHostSynchronize(this->eventHandle, timeout);
+}
+
+ze_result_t Event::signal(cl_int executionStatus) {
+    auto ret = zeEventHostSignal(this->eventHandle);
+    if (ret == ZE_RESULT_SUCCESS) {
+        this->eventStatus = executionStatus;
+        this->executeCallbacks(executionStatus);
+    }
+    return ret;
+}
+
+void Event::updateExecutionStatus() {
+    auto status = this->queryAndUpdateEventStatus();
+    if (status <= CL_COMPLETE) {
+        this->executeCallbacks(status);
+    }
+}
+
+void Event::abortExecutionDueToGpuHang() {
+    this->eventStatus = executionAbortedDueToGpuHang;
+    this->executeCallbacks(executionAbortedDueToGpuHang);
+}
+
+bool Event::peekHasCallbacks() {
+    auto lock = std::unique_lock<std::mutex>(callbacksMtx);
+    return !callbacks.empty();
+}
+
+void Event::addCallback(Callback::ClbFuncT fn, cl_int type, void *data) {
+    DEBUG_BREAK_IF((type != CL_RUNNING) && (type != CL_COMPLETE));
+    {
+        auto lock = std::unique_lock<std::mutex>(callbacksMtx);
+        callbacks.emplace_back(this, fn, type, data);
+    }
+
+    auto status = this->peekExecutionStatus();
+    if (status <= CL_COMPLETE) {
+        this->executeCallbacks(status);
+    }
+
+    if (!isUserEvent()) {
+        getContext()->getClDevice()->getPlatform()->getAsyncEventsHandler().registerEvent(this);
+    }
+}
+
+void Event::executeCallbacks(cl_int executionStatus) {
+    bool terminated = executionStatus < 0;
+
+    std::vector<Callback> detachedCallbacks;
+    {
+        auto lock = std::unique_lock<std::mutex>(callbacksMtx);
+        detachedCallbacks.swap(callbacks);
+    }
+
+    for (auto &callback : detachedCallbacks) {
+        if (terminated) {
+            callback.overrideCallbackExecutionStatusTarget(executionStatus);
+        }
+        callback.execute();
+    }
+}
+
+cl_int Event::queryAndUpdateEventStatus() {
+    auto status = this->eventStatus.load();
+    if (status <= CL_COMPLETE) {
+        return status;
+    }
+
+    if (zeEventQueryStatus(this->eventHandle) != ZE_RESULT_SUCCESS) {
+        return this->eventStatus.load();
+    }
+
+    if (!this->eventStatus.compare_exchange_strong(status, CL_COMPLETE)) {
+        return status;
+    }
+
+    if (!this->isUserEvent()) {
+        auto cmdList = this->getCommandQueue()->getL0Object();
+
+        if (!cmdList->getPrintfKernelContainer().empty()) {
+
+            auto ret = this->wait();
+            cmdList->handlePostSyncPrintfAndAssert(ret != ZE_RESULT_SUCCESS);
+        }
+    }
+    return CL_COMPLETE;
+}
+
+void Event::setQueueTimeStamp() {
+    this->getCommandQueue()->getDevice()->getDevice().getOSTime()->getCpuTime(&queueTimeStamp.cpuTimeInNs);
+}
+
+void Event::setSubmitTimeStamp() {
+    auto device = getL0Object()->getDevice()->getNEODevice();
+    auto &gfxCoreHelper = device->getGfxCoreHelper();
+    auto resolution = device->getDeviceInfo().profilingTimerResolution;
+
+    device->getOSTime()->getCpuTime(&this->submitTimeStamp.cpuTimeInNs);
+    TimeStampData submitCpuGpuTime{};
+    device->getOSTime()->getGpuCpuTime(&submitCpuGpuTime);
+    this->submitTimeStamp.gpuTimeInNs = gfxCoreHelper.getGpuTimeStampInNS(submitCpuGpuTime.gpuTimeStamp, resolution);
+    this->submitTimeStamp.gpuTimeStamp = submitCpuGpuTime.gpuTimeStamp;
+
+    setupRelativeProfilingInfo(queueTimeStamp);
+}
+
+void Event::setupRelativeProfilingInfo(ProfilingInfo &profilingInfo) {
+    auto resolution = getL0Object()->getDevice()->getNEODevice()->getDeviceInfo().profilingTimerResolution;
+
+    if (profilingInfo.cpuTimeInNs > submitTimeStamp.cpuTimeInNs) {
+        auto timeDiff = profilingInfo.cpuTimeInNs - submitTimeStamp.cpuTimeInNs;
+        auto gpuTicksDiff = static_cast<uint64_t>(timeDiff / resolution);
+        profilingInfo.gpuTimeInNs = submitTimeStamp.gpuTimeInNs + timeDiff;
+        profilingInfo.gpuTimeStamp = submitTimeStamp.gpuTimeStamp + std::max<uint64_t>(gpuTicksDiff, 1ul);
+    } else if (profilingInfo.cpuTimeInNs < submitTimeStamp.cpuTimeInNs) {
+        auto timeDiff = submitTimeStamp.cpuTimeInNs - profilingInfo.cpuTimeInNs;
+        auto gpuTicksDiff = static_cast<uint64_t>(timeDiff / resolution);
+        profilingInfo.gpuTimeInNs = submitTimeStamp.gpuTimeInNs - timeDiff;
+        profilingInfo.gpuTimeStamp = submitTimeStamp.gpuTimeStamp - std::max<uint64_t>(gpuTicksDiff, 1ul);
+    } else {
+        profilingInfo.gpuTimeInNs = submitTimeStamp.gpuTimeInNs;
+        profilingInfo.gpuTimeStamp = submitTimeStamp.gpuTimeStamp;
+    }
+}
+
+std::pair<EventHandleSpan, ze_event_handle_t> Event::setupEvents(cl_uint numEventsInWaitList, const cl_event *eventWaitList,
+                                                                 cl_event *event, cl_command_type commandType,
+                                                                 NEO::LEO::CommandQueue *commandQueue) {
+    EventHandleSpan waitEvents{numEventsInWaitList, eventWaitList};
+    ze_event_handle_t signalEvent = nullptr;
+
+    commandQueue->storeDependencies(numEventsInWaitList, eventWaitList);
+
+    if (event) {
+        auto e = std::make_unique<NEO::LEO::Event>(commandType, commandQueue);
+        signalEvent = e->eventHandle;
+
+        if (commandQueue->isProfilingEnabled()) {
+            e->setSubmitTimeStamp();
+        }
+
+        *event = e.release();
+    }
+
+    return {std::move(waitEvents), signalEvent};
+}
+
+TagNodeBase *Event::getHwPerfCounterNode() {
+    auto lock = this->takeOwnership();
+    if (!perfCounterNode) {
+        auto cmdQ = getCommandQueue();
+        auto perfCounters = cmdQ->getPerfCounters();
+        if (perfCounters) {
+            const uint32_t gpuReportSize = HwPerfCounter::getSize(*perfCounters);
+            auto csr = cmdQ->getL0Object()->getCsr(false);
+            if (csr) {
+                perfCounterNode = csr->getEventPerfCountAllocator(gpuReportSize)->getTag();
+            }
+        }
+    }
+    return perfCounterNode;
+}
+
+L0::Event *Event::getL0Object() const { return L0::Event::fromHandle(this->eventHandle); }
+
+} // namespace LEO
+} // namespace NEO

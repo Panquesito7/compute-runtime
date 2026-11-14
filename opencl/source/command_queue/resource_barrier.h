@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/utilities/stackvec.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
@@ -13,7 +15,9 @@
 
 namespace NEO {
 class CommandQueue;
-class BarrierCommand {
+class Surface;
+
+class BarrierCommand : NEO::NonCopyableAndNonMovableClass {
   public:
     BarrierCommand(CommandQueue *commandQueue, const cl_resource_barrier_descriptor_intel *descriptors, uint32_t numDescriptors);
     ~BarrierCommand() {}
@@ -21,4 +25,7 @@ class BarrierCommand {
     StackVec<ResourceSurface, 32> surfaces;
     StackVec<Surface *, 32> surfacePtrs;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<BarrierCommand>);
+
 } // namespace NEO

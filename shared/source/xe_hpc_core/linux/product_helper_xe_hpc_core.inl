@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,13 +12,9 @@
 namespace NEO {
 template <>
 int ProductHelperHw<gfxProduct>::configureHardwareCustom(HardwareInfo *hwInfo, OSInterface *osIface) const {
-    enableCompression(hwInfo);
-
     hwInfo->featureTable.flags.ftr57bGPUAddressing = (hwInfo->capabilityTable.gpuAddressSpace == maxNBitValue(57));
 
     enableBlitterOperationsSupport(hwInfo);
-
-    disableRcsExposure(hwInfo);
 
     auto &kmdNotifyProperties = hwInfo->capabilityTable.kmdNotifyProperties;
     kmdNotifyProperties.enableKmdNotify = true;
@@ -27,11 +23,6 @@ int ProductHelperHw<gfxProduct>::configureHardwareCustom(HardwareInfo *hwInfo, O
     kmdNotifyProperties.delayQuickKmdSleepForDirectSubmissionMicroseconds = 20;
 
     return 0;
-}
-
-template <>
-bool ProductHelperHw<gfxProduct>::isNonBlockingGpuSubmissionSupported() const {
-    return true;
 }
 
 } // namespace NEO

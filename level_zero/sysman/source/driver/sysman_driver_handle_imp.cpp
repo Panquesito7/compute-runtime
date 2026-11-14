@@ -1,0 +1,506 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/sysman/source/driver/sysman_driver_handle_imp.h"
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/string.h"
+#include "shared/source/os_interface/hw_device_id.h"
+#include "shared/source/os_interface/os_interface.h"
+
+#include "level_zero/core/source/device/device.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/source/driver/extension_function_address.h"
+#include "level_zero/sysman/source/device/os_sysman.h"
+#include "level_zero/sysman/source/device/sysman_device.h"
+#include "level_zero/sysman/source/device/sysman_device_imp.h"
+#include "level_zero/sysman/source/device/sysman_hw_device_id.h"
+#include "level_zero/sysman/source/driver/os_sysman_driver.h"
+#include "level_zero/sysman/source/driver/sysman_driver.h"
+#include "level_zero/sysman/source/driver/sysman_driver_imp.h"
+#include "level_zero/zes_intel_gpu_sysman.h"
+
+#include "driver_version.h"
+
+#include <algorithm>
+
+namespace L0 {
+namespace Sysman {
+
+struct SysmanDriverHandleImp *globalSysmanDriver;
+
+SysmanDriverHandleImp::SysmanDriverHandleImp() = default;
+
+void *getSysmanExtensionFunctionAddress(const std::string &functionName) {
+#define RETURN_FUNC_PTR_IF_EXIST(name)    \
+    {                                     \
+        if (functionName == #name) {      \
+            void *ret = ((void *)(name)); \
+            return ret;                   \
+        }                                 \
+    }
+
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDevicePciLinkSpeedUpdateExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDeviceMemoryGetPageOfflineStateExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDriverEventRegisterExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDriverEventListenExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDriverRescanDevicesExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDeviceGetPowerOffReasonExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDriverEnumInfoLogsExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelDriverGetApiVersionExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogGetPropertiesExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogCreateInstanceExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogInstanceReadWithMetadataExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogInstancePeekWithMetadataExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogInstanceDeleteExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogCreateDecoderContextExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogDecoderGetFieldInfoExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogDecoderDecodeStartExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogDecoderReadFieldExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogDecoderDecodeStopExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelInfoLogDeleteDecoderContextExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelEngineStartActivityCollectionExp);
+    RETURN_FUNC_PTR_IF_EXIST(zesIntelEngineStopActivityCollectionExp);
+
+#undef RETURN_FUNC_PTR_IF_EXIST
+
+    return nullptr;
+}
+
+void SysmanDriverHandleImp::updateUuidMap(SysmanDevice *sysmanDevice) {
+    std::vector<std::string> uuidArr;
+    sysmanDevice->getDeviceUuids(uuidArr);
+    for (auto &uuid : uuidArr) {
+        uuidDeviceMap[uuid] = sysmanDevice;
+    }
+    return;
+}
+
+void SysmanDriverHandleImp::moveSysmanDeviceToLost(SysmanDevice *sysmanDevice) {
+    lostSysmanDevices.push_back(sysmanDevice);
+    std::erase(sysmanDevices, sysmanDevice);
+    numDevices = static_cast<uint32_t>(sysmanDevices.size());
+}
+
+bool SysmanDriverHandleImp::isLostSysmanDevice(SysmanDevice *sysmanDevice) const {
+    return std::find(lostSysmanDevices.begin(), lostSysmanDevices.end(), sysmanDevice) != lostSysmanDevices.end();
+}
+
+bool SysmanDriverHandleImp::isLostDeviceHandle(zes_device_handle_t hDevice) {
+    if (this->isLostSysmanDevice(static_cast<SysmanDevice *>(hDevice))) {
+        return true;
+    }
+    const std::lock_guard<std::mutex> lock(this->coreToSysmanDeviceMapLock);
+    auto sysmanDevice = this->findSysmanDeviceFromCoreToSysmanDeviceMap(hDevice);
+    return sysmanDevice != nullptr && this->isLostSysmanDevice(sysmanDevice);
+}
+
+SysmanDevice *SysmanDriverHandleImp::findSysmanDeviceFromCoreToSysmanDeviceMap(ze_device_handle_t handle) {
+    auto iterator = coreToSysmanDeviceMap.find(handle);
+    if (iterator != coreToSysmanDeviceMap.end()) {
+        SysmanDevice *sysmanDevice = iterator->second;
+        return sysmanDevice;
+    }
+    return nullptr;
+}
+
+SysmanDriverHandle *SysmanDriverHandleImp::findSysmanDriverHandleFromCoreToSysmanDriverMap(ze_driver_handle_t handle) {
+    auto iterator = coreToSysmanDriverMap.find(handle);
+    if (iterator != coreToSysmanDriverMap.end()) {
+        SysmanDriverHandle *sysmanDriverHandle = iterator->second;
+        return sysmanDriverHandle;
+    }
+    return nullptr;
+}
+
+SysmanDevice *SysmanDriverHandleImp::getSysmanDeviceFromCoreDeviceHandle(ze_device_handle_t hDevice) {
+    const std::lock_guard<std::mutex> lock(this->coreToSysmanDeviceMapLock);
+    if (hDevice == nullptr) {
+        return nullptr;
+    }
+
+    SysmanDevice *sysmanDevice = findSysmanDeviceFromCoreToSysmanDeviceMap(hDevice);
+    if (sysmanDevice != nullptr) {
+        return sysmanDevice;
+    }
+
+    ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+    Device::fromHandle(hDevice)->getProperties(&deviceProperties);
+    std::string uuid(reinterpret_cast<char const *>(deviceProperties.uuid.id), ZES_MAX_UUID_SIZE);
+    auto it = uuidDeviceMap.find(uuid);
+    if (it == uuidDeviceMap.end()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "SysmanDriverHandleImp::getSysmanDeviceFromCoreDeviceHandle() - sysman device handle equivalent to core device handle not found!! %s\n", "");
+        return nullptr;
+    }
+    sysmanDevice = it->second;
+    coreToSysmanDeviceMap[hDevice] = sysmanDevice;
+
+    return sysmanDevice;
+}
+
+ze_result_t SysmanDriverHandleImp::initialize(NEO::ExecutionEnvironment &executionEnvironment) {
+    for (uint32_t rootDeviceIndex = 0u; rootDeviceIndex < executionEnvironment.rootDeviceEnvironments.size(); rootDeviceIndex++) {
+        auto pSysmanDevice = SysmanDevice::create(executionEnvironment, rootDeviceIndex);
+        if (pSysmanDevice != nullptr) {
+            this->sysmanDevices.push_back(pSysmanDevice);
+            updateUuidMap(pSysmanDevice);
+        }
+    }
+
+    if (this->sysmanDevices.size() == 0) {
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+
+    this->executionEnvironment = &executionEnvironment;
+    this->executionEnvironment->incRefInternal();
+
+    getOsSysmanDriver();
+    this->numDevices = static_cast<uint32_t>(this->sysmanDevices.size());
+
+    uuidTimestamp = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t SysmanDriverHandleImp::performDeferredDiscovery() {
+    std::lock_guard<std::mutex> lock(deferredDiscoveryMutex);
+
+    if (devicesDiscovered) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    UNRECOVERABLE_IF(savedExecutionEnvironment == nullptr);
+
+    // Perform device discovery using saved ExecutionEnvironment
+    using HwDeviceIds = std::vector<std::unique_ptr<NEO::HwDeviceId>>;
+    HwDeviceIds hwDeviceIds = discoverHwDevices(*savedExecutionEnvironment);
+    auto rootDeviceIndex = SysmanDriverImp::discoverAndInitializeDevices(*savedExecutionEnvironment, hwDeviceIds, "SysmanDriverImp::performDeferredDiscovery");
+    // Initialize devices
+    if (rootDeviceIndex > 0) {
+        ze_result_t initResult = initialize(*savedExecutionEnvironment);
+        if (initResult != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "Deferred discovery: Device initialization failed\n");
+            savedExecutionEnvironment->decRefInternal();
+            savedExecutionEnvironment = nullptr;
+            devicesDiscovered = true;
+            return initResult;
+        }
+    }
+
+    // Release the saved ExecutionEnvironment
+    if (savedExecutionEnvironment != nullptr) {
+        savedExecutionEnvironment->decRefInternal();
+        savedExecutionEnvironment = nullptr;
+    }
+
+    devicesDiscovered = true;
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t SysmanDriverHandleImp::getExtensionFunctionAddress(const char *pFuncName, void **pfunc) {
+    *pfunc = getSysmanExtensionFunctionAddress(pFuncName);
+    if (*pfunc) {
+        return ZE_RESULT_SUCCESS;
+    }
+    *pfunc = ExtensionFunctionAddressHelper::getExtensionFunctionAddress(pFuncName);
+    if (*pfunc) {
+        return ZE_RESULT_SUCCESS;
+    }
+    return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+}
+
+SysmanDriverHandle *SysmanDriverHandle::create(NEO::ExecutionEnvironment &executionEnvironment, ze_result_t *returnValue) {
+    SysmanDriverHandleImp *driverHandle = new SysmanDriverHandleImp;
+    UNRECOVERABLE_IF(nullptr == driverHandle);
+
+    ze_result_t res = driverHandle->initialize(executionEnvironment);
+    if (res != ZE_RESULT_SUCCESS) {
+        delete driverHandle;
+        driverHandle = nullptr;
+        *returnValue = res;
+        return nullptr;
+    }
+
+    globalSysmanDriver = driverHandle;
+    *returnValue = res;
+    return driverHandle;
+}
+
+void SysmanDriverHandleImp::initializeDeferredMode(NEO::ExecutionEnvironment *executionEnvironment) {
+    deferredDiscoveryMode = true;
+    devicesDiscovered = false;
+    savedExecutionEnvironment = executionEnvironment;
+}
+
+SysmanDriverHandle *SysmanDriverHandle::createDeferred(NEO::ExecutionEnvironment &executionEnvironment, ze_result_t *returnValue) {
+    SysmanDriverHandleImp *driverHandle = new SysmanDriverHandleImp;
+    UNRECOVERABLE_IF(nullptr == driverHandle);
+
+    // Set deferred discovery mode
+    driverHandle->initializeDeferredMode(&executionEnvironment);
+
+    globalSysmanDriver = driverHandle;
+    *returnValue = ZE_RESULT_SUCCESS;
+    return driverHandle;
+}
+
+SysmanDriverHandle *SysmanDriverHandleImp::getSysmanDriverHandleFromCoreDriverHandle(ze_driver_handle_t handle) {
+    const std::lock_guard<std::mutex> lock(this->coreToSysmanDriverMapLock);
+    // search coreSysmanDriverMap for sysman driver handle
+    auto sysmanDriverHandle = findSysmanDriverHandleFromCoreToSysmanDriverMap(handle);
+    if (sysmanDriverHandle != nullptr) {
+        return sysmanDriverHandle;
+    }
+    // Get Device List from Core Driver
+    uint32_t deviceCount = 0;
+    ze_result_t result = DriverHandle::fromHandle(handle)->getDevice(&deviceCount, nullptr);
+    if (result != ZE_RESULT_SUCCESS || deviceCount == 0) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "failed to get device count for core driver handle\n");
+        return nullptr;
+    }
+
+    std::vector<ze_device_handle_t> coreDevices(deviceCount);
+    DriverHandle::fromHandle(handle)->getDevice(&deviceCount, coreDevices.data());
+
+    // For first Device, Get Properties (UUID)
+    zes_uuid_t deviceUuid = {};
+    ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+    Device::fromHandle(coreDevices[0])->getProperties(&deviceProperties);
+    std::memcpy(deviceUuid.id, deviceProperties.uuid.id, sizeof(deviceUuid.id));
+
+    // Enumerate Sysman Drivers
+    uint32_t sysmanDriverCount = 0;
+    result = L0::Sysman::driverHandleGet(&sysmanDriverCount, nullptr);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "failed to get sysman driver count\n");
+        return nullptr;
+    }
+
+    std::vector<zes_driver_handle_t> sysmanDrivers(sysmanDriverCount);
+    L0::Sysman::driverHandleGet(&sysmanDriverCount, sysmanDrivers.data());
+
+    // Check for Matching Sysman Device
+    for (auto sysmanDriver : sysmanDrivers) {
+        zes_device_handle_t sysmanDevice = nullptr;
+        ze_bool_t onSubdevice = false;
+        uint32_t subdeviceId = 0;
+
+        // Check if this sysman driver has a device with matching UUID
+        SysmanDriverHandle::fromHandle(sysmanDriver)->getDeviceByUuid(deviceUuid, &sysmanDevice, &onSubdevice, &subdeviceId);
+        if (sysmanDevice != nullptr) {
+            coreToSysmanDriverMap[handle] = static_cast<SysmanDriverHandle *>(sysmanDriver);
+            return static_cast<SysmanDriverHandle *>(sysmanDriver);
+        }
+    }
+
+    PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "No matching sysman driver found for core driver\n");
+    return nullptr;
+}
+
+SysmanDriverHandle *SysmanDriverHandle::fromHandle(zes_driver_handle_t handle) {
+    SysmanDriverHandle *sysmanDriverHandle = nullptr;
+    if (handle != nullptr) {
+        // if driver handle is same as sysman driver handle
+        if (handle == globalSysmanDriver) {
+            sysmanDriverHandle = static_cast<SysmanDriverHandle *>(globalSysmanDriver);
+        } else {
+            sysmanDriverHandle = globalSysmanDriver->getSysmanDriverHandleFromCoreDriverHandle(handle);
+        }
+    }
+
+    return sysmanDriverHandle;
+}
+
+ze_result_t SysmanDriverHandleImp::getDevice(uint32_t *pCount, zes_device_handle_t *phDevices) {
+    // Trigger deferred discovery if needed
+    if (deferredDiscoveryMode && !devicesDiscovered) {
+        ze_result_t result = performDeferredDiscovery();
+        if (result != ZE_RESULT_SUCCESS) {
+            *pCount = 0;
+            return result;
+        }
+    }
+
+    if (*pCount == 0) {
+        *pCount = this->numDevices;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    if (*pCount > this->numDevices) {
+        *pCount = this->numDevices;
+    }
+
+    if (phDevices == nullptr) {
+        return ZE_RESULT_ERROR_INVALID_NULL_HANDLE;
+    }
+
+    for (uint32_t i = 0; i < *pCount; i++) {
+        phDevices[i] = this->sysmanDevices[i];
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t SysmanDriverHandleImp::getDeviceByUuid(zes_uuid_t uuid, zes_device_handle_t *phDevice, ze_bool_t *onSubdevice, uint32_t *subdeviceId) {
+    for (uint32_t index = 0; index < this->numDevices; index++) {
+        ze_bool_t deviceFound = this->sysmanDevices[index]->getDeviceInfoByUuid(uuid, onSubdevice, subdeviceId);
+        if (deviceFound) {
+            *phDevice = this->sysmanDevices[index];
+            return ZE_RESULT_SUCCESS;
+        }
+    }
+    return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+}
+
+ze_result_t SysmanDriverHandleImp::getExtensionProperties(uint32_t *pCount, zes_driver_extension_properties_t *pExtensionProperties, const std::vector<std::pair<std::string, uint32_t>> &extensionsSupported) {
+    if (*pCount == 0) {
+        *pCount = static_cast<uint32_t>(extensionsSupported.size());
+        return ZE_RESULT_SUCCESS;
+    }
+    uint32_t numExtensionsToCopy = std::min(*pCount, static_cast<uint32_t>(extensionsSupported.size()));
+    for (uint32_t i = 0; i < numExtensionsToCopy; i++) {
+        std::strncpy(pExtensionProperties[i].name, extensionsSupported[i].first.c_str(), ZES_MAX_EXTENSION_NAME - 1);
+        pExtensionProperties[i].name[ZES_MAX_EXTENSION_NAME - 1] = '\0';
+        pExtensionProperties[i].version = extensionsSupported[i].second;
+    }
+    *pCount = numExtensionsToCopy;
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t SysmanDriverHandleImp::sysmanEventsListen(uint32_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents) {
+    if (pOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+    return pOsSysmanDriver->eventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents);
+}
+
+ze_result_t SysmanDriverHandleImp::sysmanEventsListenEx(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents) {
+    if (pOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+    return pOsSysmanDriver->eventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents);
+};
+
+ze_result_t SysmanDriverHandleImp::sysmanDriverEventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents, zes_event_type_flags_t *pDriverEvents) {
+    if (pOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+    return pOsSysmanDriver->driverEventsListen(timeout, count, phDevices, pNumDeviceEvents, pEvents, pDriverEvents);
+}
+
+ze_result_t SysmanDriverHandleImp::driverEventRegister(zes_event_type_flags_t events) {
+    if (pOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+    return pOsSysmanDriver->driverEventRegister(events);
+}
+
+ze_result_t SysmanDriverHandleImp::enumInfoLogs(uint32_t *pCount, zes_info_log_handle_t *phInfoLogs) {
+
+    if (pOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+    return pOsSysmanDriver->enumInfoLogs(pCount, phInfoLogs);
+}
+
+ze_result_t SysmanDriverHandleImp::getDeviceRescan(uint32_t *pCount, zes_device_handle_t *phDevices) {
+    std::lock_guard<std::mutex> lock(rescanMutex);
+
+    if (pOsSysmanDriver == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman Driver Not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+
+    return pOsSysmanDriver->rescanDevices(this, pCount, phDevices);
+}
+
+zes_intel_api_version_exp_t SysmanDriverHandle::getSupportedApiVersion() {
+    return ZES_INTEL_API_VERSION_EXP_1_20;
+}
+
+ze_result_t SysmanDriverHandleImp::getApiVersion(zes_intel_api_version_exp_t *pVersion) {
+    *pVersion = SysmanDriverHandle::getSupportedApiVersion();
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t SysmanDriverHandleImp::getDriverProperties(zes_driver_properties_t *pProperties) {
+    uint32_t versionBuild = static_cast<uint32_t>(NEO_VERSION_BUILD);
+    if (NEO::debugManager.flags.OverrideVersionBuild.get() > -1) {
+        versionBuild = static_cast<uint32_t>(NEO::debugManager.flags.OverrideVersionBuild.get());
+    }
+
+    pProperties->driverVersion = SysmanDriverHandle::initialDriverVersionValue + versionBuild;
+    if (NEO::debugManager.flags.OverrideDriverVersion.get() > -1) {
+        pProperties->driverVersion = static_cast<uint32_t>(NEO::debugManager.flags.OverrideDriverVersion.get());
+    }
+
+    uint64_t uniqueId = (pProperties->driverVersion) | (uuidTimestamp & 0xFFFFFFFF00000000);
+    memset(pProperties->uuid.id, 0, sizeof(pProperties->uuid.id));
+    memcpy_s(pProperties->uuid.id, sizeof(pProperties->uuid.id), &uniqueId, sizeof(uniqueId));
+
+    return ZE_RESULT_SUCCESS;
+}
+
+OsSysmanDriver *SysmanDriverHandleImp::getOsSysmanDriver() {
+    std::lock_guard<std::mutex> lock(osSysmanDriverMutex);
+    if (pOsSysmanDriver == nullptr) {
+        pOsSysmanDriver = L0::Sysman::OsSysmanDriver::create();
+    }
+    return pOsSysmanDriver;
+}
+
+ze_result_t SysmanDriverHandleImp::getPciDeviceProperties(uint32_t *pCount, zes_driver_pci_device_properties_t *pProperties) {
+    return getOsSysmanDriver()->getPciDeviceProperties(pCount, pProperties);
+}
+
+SysmanDriverHandleImp::~SysmanDriverHandleImp() {
+    for (auto &device : this->sysmanDevices) {
+        delete device;
+    }
+    this->sysmanDevices.clear();
+    for (auto &device : this->lostSysmanDevices) {
+        delete device;
+    }
+    this->lostSysmanDevices.clear();
+
+    if (pOsSysmanDriver != nullptr) {
+        delete pOsSysmanDriver;
+        pOsSysmanDriver = nullptr;
+    }
+
+    if (executionEnvironment != nullptr) {
+        executionEnvironment->decRefInternal();
+        executionEnvironment = nullptr;
+    }
+
+    // Clean up saved ExecutionEnvironment if discovery never happened
+    if (savedExecutionEnvironment != nullptr) {
+        savedExecutionEnvironment->decRefInternal();
+        savedExecutionEnvironment = nullptr;
+    }
+}
+
+SysmanDriverHandleImp::HwDeviceIds SysmanDriverHandleImp::discoverHwDevices(NEO::ExecutionEnvironment &executionEnvironment) {
+    return NEO::OSInterface::discoverDevices(executionEnvironment);
+}
+
+} // namespace Sysman
+} // namespace L0

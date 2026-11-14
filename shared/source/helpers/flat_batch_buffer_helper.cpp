@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -53,13 +53,13 @@ bool FlatBatchBufferHelper::registerCommandChunk(CommandChunk &commandChunk) {
 }
 
 bool FlatBatchBufferHelper::registerBatchBufferStartAddress(uint64_t commandAddress, uint64_t startAddress) {
-    batchBufferStartAddressSequence.insert(std::pair<uint64_t, uint64_t>(commandAddress, startAddress));
+    batchBufferStartAddressSequence.emplace(commandAddress, startAddress);
     return true;
 }
 
 void FlatBatchBufferHelper::fixCrossThreadDataInfo(std::vector<PatchInfoData> &data, size_t offsetCrossThreadData, uint64_t gpuAddress) {
     for (auto &patchInfoData : data) {
-        if (patchInfoData.sourceType == PatchInfoAllocationType::KernelArg) {
+        if (patchInfoData.sourceType == PatchInfoAllocationType::kernelArg) {
             patchInfoData.targetAllocation = gpuAddress;
             patchInfoData.targetAllocationOffset += offsetCrossThreadData;
         }

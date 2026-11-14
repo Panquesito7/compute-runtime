@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,11 +10,15 @@
 #include "level_zero/core/source/sampler/sampler.h"
 
 namespace L0 {
+struct Device;
 
 class SamplerImp : public Sampler {
   public:
     ze_result_t destroy() override;
     virtual ze_result_t initialize(Device *device, const ze_sampler_desc_t *desc);
+
+  protected:
+    static void adjustSamplerState(void *samplerState, Device *device);
 };
 
 } // namespace L0

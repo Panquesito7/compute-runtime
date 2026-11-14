@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,7 +22,7 @@ template <bool multipleSubDevices>
 class DrmMemoryManagerWithSubDevicesPrelimTest : public ::testing::Test {
   public:
     void SetUp() override {
-        DebugManager.flags.CreateMultipleSubDevices.set(multipleSubDevices ? 2 : 1);
+        debugManager.flags.CreateMultipleSubDevices.set(multipleSubDevices ? 2 : 1);
 
         executionEnvironment = new ExecutionEnvironment();
         executionEnvironment->prepareRootDeviceEnvironments(1);
@@ -36,7 +36,7 @@ class DrmMemoryManagerWithSubDevicesPrelimTest : public ::testing::Test {
 
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface = std::make_unique<OSInterface>();
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mock));
-        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, 0u);
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, 0u, false);
 
         memoryManager = new TestedDrmMemoryManager(true, false, false, *executionEnvironment);
         executionEnvironment->memoryManager.reset(memoryManager);
@@ -57,7 +57,7 @@ class DrmMemoryManagerWithSubDevicesPrelimTest : public ::testing::Test {
 class DrmMemoryManagerLocalMemoryPrelimTest : public ::testing::Test {
   public:
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(localMemoryEnabled);
+        debugManager.flags.EnableLocalMemory.set(localMemoryEnabled);
 
         executionEnvironment = new ExecutionEnvironment();
         executionEnvironment->prepareRootDeviceEnvironments(1);
@@ -75,7 +75,7 @@ class DrmMemoryManagerLocalMemoryPrelimTest : public ::testing::Test {
 
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface = std::make_unique<OSInterface>();
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mock));
-        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, 0u);
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, 0u, false);
 
         memoryManager = new TestedDrmMemoryManager(localMemoryEnabled, false, false, *executionEnvironment);
         executionEnvironment->memoryManager.reset(memoryManager);
@@ -92,51 +92,4 @@ class DrmMemoryManagerLocalMemoryPrelimTest : public ::testing::Test {
 
     constexpr static uint32_t rootDeviceIndex{0u};
     constexpr static bool localMemoryEnabled{true};
-};
-
-class DrmMemoryManagerLocalMemoryWithCustomPrelimMockTest : public ::testing::Test {
-  public:
-    void SetUp() override {
-        const bool localMemoryEnabled = true;
-        executionEnvironment = new ExecutionEnvironment;
-        executionEnvironment->prepareRootDeviceEnvironments(1);
-        executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
-
-        mock = new DrmMockCustomPrelim(*executionEnvironment->rootDeviceEnvironments[0]);
-        executionEnvironment->rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
-        executionEnvironment->rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mock));
-
-        device.reset(MockDevice::createWithExecutionEnvironment<MockDevice>(defaultHwInfo.get(), executionEnvironment, 0));
-        memoryManager = std::make_unique<TestedDrmMemoryManager>(localMemoryEnabled, false, false, *executionEnvironment);
-    }
-
-  protected:
-    std::unique_ptr<MockDevice> device;
-    std::unique_ptr<TestedDrmMemoryManager> memoryManager;
-    DrmMockCustomPrelim *mock;
-    ExecutionEnvironment *executionEnvironment;
-};
-
-class DrmMemoryManagerFixturePrelim : public DrmMemoryManagerFixture {
-  public:
-    void setUp() {
-        regionInfo.resize(2);
-        regionInfo[0].region = {drm_i915_gem_memory_class::I915_MEMORY_CLASS_SYSTEM, 1};
-        regionInfo[1].region = {drm_i915_gem_memory_class::I915_MEMORY_CLASS_DEVICE, DrmMockHelper::getEngineOrMemoryInstanceValue(0, 0)};
-
-        MemoryManagementFixture::setUp();
-        executionEnvironment = MockDevice::prepareExecutionEnvironment(defaultHwInfo.get(), numRootDevices - 1);
-        mock = new DrmMockCustomPrelim(*executionEnvironment->rootDeviceEnvironments[0]);
-        mock->memoryInfo.reset(new MemoryInfo(regionInfo, *mock));
-
-        DrmMemoryManagerFixture::setUp(mock, true);
-    }
-
-    void tearDown() {
-        mock->testIoctls();
-        DrmMemoryManagerFixture::tearDown();
-    }
-
-    std::vector<MemoryRegion> regionInfo;
-    DrmMockCustomPrelim *mock;
 };

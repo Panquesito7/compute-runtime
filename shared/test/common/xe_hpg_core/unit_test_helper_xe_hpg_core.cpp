@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,6 +9,8 @@
 #include "shared/source/xe_hpg_core/hw_info.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/helpers/unit_test_helper.inl"
+#include "shared/test/common/helpers/unit_test_helper_from_gen12lp_to_xe3_core.inl"
+#include "shared/test/common/helpers/unit_test_helper_from_gen12lp_to_xe_hpg.inl"
 #include "shared/test/common/helpers/unit_test_helper_xe_hpg_and_xe_hpc.inl"
 #include "shared/test/common/helpers/unit_test_helper_xehp_and_later.inl"
 
@@ -30,7 +32,7 @@ template <>
 const bool UnitTestHelper<Family>::additionalMiFlushDwRequired = true;
 
 template <>
-bool UnitTestHelper<Family>::getDisableFusionStateFromFrontEndCommand(const typename Family::VFE_STATE_TYPE &feCmd) {
+bool UnitTestHelperWithHeap<Family>::getDisableFusionStateFromFrontEndCommand(const typename Family::FrontEndStateCommand &feCmd) {
     return feCmd.getFusedEuDispatch();
 }
 
@@ -50,4 +52,7 @@ bool UnitTestHelper<Family>::requiresTimestampPacketsInSystemMemory(HardwareInfo
 }
 
 template struct UnitTestHelper<Family>;
+template struct UnitTestHelperWithHeap<Family>;
+
+template uint64_t UnitTestHelper<Family>::getWalkerActivePostSyncAddress<Family::COMPUTE_WALKER>(Family::COMPUTE_WALKER *walkerCmd);
 } // namespace NEO

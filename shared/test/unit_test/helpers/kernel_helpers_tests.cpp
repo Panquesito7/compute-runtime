@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,69 +11,268 @@
 #include "shared/source/helpers/kernel_helpers.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/mock_product_helper_hw.h"
+#include "shared/test/common/helpers/raii_gfx_core_helper.h"
+#include "shared/test/common/helpers/raii_product_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_gfx_core_helper.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
+
+#include <algorithm>
+#include <array>
 
 using namespace NEO;
 
-struct KernelHelperMaxWorkGroupsTests : ::testing::Test {
-    uint32_t simd = 8;
-    uint32_t threadCount = 8 * 1024;
-    uint32_t dssCount = 16;
-    uint32_t availableSlm = 64 * KB;
-    uint32_t usedSlm = 0;
-    uint32_t maxBarrierCount = 32;
-    uint32_t numberOfBarriers = 0;
-    uint32_t workDim = 3;
+struct KernelHelperMaxWorkGroupsFixture : public DeviceFixture {
     size_t lws[3] = {10, 10, 10};
 
-    uint32_t getMaxWorkGroupCount() {
-        return KernelHelper::getMaxWorkGroupCount(simd, threadCount, dssCount, availableSlm, usedSlm,
-                                                  maxBarrierCount, numberOfBarriers, workDim, lws);
+    EngineGroupType engineType = EngineGroupType::compute;
+    uint32_t dssCount = 16;
+    uint32_t availableSlm = 64 * MemoryConstants::kiloByte;
+    uint32_t usedSlm = 0;
+    uint32_t workDim = 3;
+    uint32_t numSubdevices = 1;
+
+    uint16_t grf = 128;
+
+    uint8_t simd = 8;
+    uint8_t numberOfBarriers = 0;
+
+    bool implicitScalingEnabled = false;
+    bool forceSingleTileQuery = true;
+    bool singleWorkGroupPerDss = false;
+
+    void setUp() {
+        DeviceFixture::setUp();
+        rootDeviceEnvironment = &pDevice->getRootDeviceEnvironmentRef();
     }
+
+    uint32_t getMaxWorkGroupCount() {
+        auto hwInfo = rootDeviceEnvironment->getMutableHardwareInfo();
+        hwInfo->gtSystemInfo.DualSubSliceCount = dssCount;
+        hwInfo->capabilityTable.maxProgrammableSlmSize = (availableSlm / MemoryConstants::kiloByte) / dssCount;
+
+        if (numSubdevices > 1) {
+            forceSingleTileQuery = false;
+            implicitScalingEnabled = true;
+            for (uint32_t pos = 0; pos < numSubdevices; pos++) {
+                pDevice->deviceBitfield.set(pos);
+            }
+        }
+
+        return KernelHelper::getMaxWorkGroupCount(*pDevice, grf, simd, numberOfBarriers, usedSlm, workDim, lws, engineType, implicitScalingEnabled, forceSingleTileQuery, singleWorkGroupPerDss);
+    }
+
+    RootDeviceEnvironment *rootDeviceEnvironment = nullptr;
 };
 
-TEST_F(KernelHelperMaxWorkGroupsTests, GivenNoBarriersOrSlmUsedWhenCalculatingMaxWorkGroupsCountThenResultIsCalculatedWithSimd) {
-    auto workGroupSize = lws[0] * lws[1] * lws[2];
-    auto expected = threadCount / Math::divideAndRoundUp(workGroupSize, simd);
+using KernelHelperMaxWorkGroupsTests = Test<KernelHelperMaxWorkGroupsFixture>;
+
+TEST_F(KernelHelperMaxWorkGroupsTests, GivenNoBarriersOrSlmUsedWhenCalculatingMaxWorkGroupsCountThenResultIsAlignedToDss) {
+    auto &helper = rootDeviceEnvironment->getHelper<NEO::GfxCoreHelper>();
+
+    uint32_t workGroupSize = static_cast<uint32_t>(lws[0] * lws[1] * lws[2]);
+    auto hwInfo = *rootDeviceEnvironment->getHardwareInfo();
+
+    auto dssCount = hwInfo.gtSystemInfo.DualSubSliceCount;
+    if (dssCount == 0) {
+        dssCount = hwInfo.gtSystemInfo.SubSliceCount;
+    }
+    auto availableThreadCount = helper.calculateAvailableThreadCount(hwInfo, grf, *rootDeviceEnvironment);
+    auto numThreadsPerThreadGroup = static_cast<uint32_t>(Math::divideAndRoundUp(workGroupSize, simd));
+    uint32_t expected = availableThreadCount / numThreadsPerThreadGroup;
+
+    helper.alignThreadGroupCountToDssSize(expected, dssCount, availableThreadCount / dssCount, numThreadsPerThreadGroup);
+    expected = helper.adjustMaxWorkGroupCount(expected, EngineGroupType::compute, *rootDeviceEnvironment);
     EXPECT_EQ(expected, getMaxWorkGroupCount());
 }
 
 TEST_F(KernelHelperMaxWorkGroupsTests, GivenDebugFlagSetWhenGetMaxWorkGroupCountCalledThenReturnCorrectValue) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.OverrideMaxWorkGroupCount.set(123);
+    debugManager.flags.OverrideMaxWorkGroupCount.set(123);
+
+    forceSingleTileQuery = false;
 
     EXPECT_EQ(123u, getMaxWorkGroupCount());
 }
 
-TEST_F(KernelHelperMaxWorkGroupsTests, GivenBarriersWhenCalculatingMaxWorkGroupsCountThenResultIsCalculatedWithRegardToBarriersCount) {
+TEST_F(KernelHelperMaxWorkGroupsTests, givenMultipleSubdevicesWenCalculatingMaxWorkGroupsCountTenMultiply) {
+    auto &helper = rootDeviceEnvironment->getHelper<NEO::GfxCoreHelper>();
+
+    auto baseCount = getMaxWorkGroupCount();
+
+    numSubdevices = 4;
+
+    auto countWithSubdevices = getMaxWorkGroupCount();
+
+    if (helper.singleTileExecImplicitScalingRequired(true)) {
+        EXPECT_EQ(baseCount, countWithSubdevices);
+    } else {
+        EXPECT_EQ(baseCount * numSubdevices, countWithSubdevices);
+    }
+}
+
+HWTEST2_PRODUCT_F(KernelHelperMaxWorkGroupsTests, GivenBarriersWhenCalculatingMaxWorkGroupsCountThenResultIsCalculatedWithRegardToBarriersCount, HasDispatchAllSupport) {
+    NEO::RAIIProductHelperFactory<MockProductHelperHw<productFamily>> raii(*rootDeviceEnvironment);
+    raii.mockProductHelper->isCooperativeEngineSupportedValue = false;
+    lws[0] = 1;
+    lws[1] = 0;
+    lws[2] = 0;
+    workDim = 1;
+    numberOfBarriers = 0;
+
     numberOfBarriers = 16;
 
-    auto expected = dssCount * (maxBarrierCount / numberOfBarriers);
+    auto expected = dssCount * (CommonConstants::maxBarrierRegisterPerSlice / numberOfBarriers);
     EXPECT_EQ(expected, getMaxWorkGroupCount());
 }
 
-TEST_F(KernelHelperMaxWorkGroupsTests, GivenUsedSlmSizeWhenCalculatingMaxWorkGroupsCountThenResultIsCalculatedWithRegardToUsedSlmSize) {
-    usedSlm = 4 * KB;
+HWTEST2_PRODUCT_F(KernelHelperMaxWorkGroupsTests, GivenUsedSlmSizeWhenCalculatingMaxWorkGroupsCountThenResultIsCalculatedWithRegardToUsedSlmSize, HasDispatchAllSupport) {
+    NEO::RAIIProductHelperFactory<MockProductHelperHw<productFamily>> raii(*rootDeviceEnvironment);
+    raii.mockProductHelper->isCooperativeEngineSupportedValue = false;
+    usedSlm = 0;
+    lws[0] = 1;
+    lws[1] = 0;
+    lws[2] = 0;
+    workDim = 1;
+
+    usedSlm = 4 * MemoryConstants::kiloByte;
 
     auto expected = availableSlm / usedSlm;
     EXPECT_EQ(expected, getMaxWorkGroupCount());
 }
 
-TEST_F(KernelHelperMaxWorkGroupsTests, GivenVariousValuesWhenCalculatingMaxWorkGroupsCountThenLowestResultIsAlwaysReturned) {
-    usedSlm = 1 * KB;
+struct KernelHelperMaxWorkGroupsSlmPerDssFixture : public KernelHelperMaxWorkGroupsFixture {
+    static constexpr uint32_t kb = static_cast<uint32_t>(MemoryConstants::kiloByte);
+    static constexpr uint32_t slmPerDss = 128 * kb;
+
+    void setUp() {
+        KernelHelperMaxWorkGroupsFixture::setUp();
+
+        debugManager.flags.ForceTheoreticalMaxWorkGroupCount.set(true);
+
+        workDim = 1;
+        lws[0] = 1;
+        lws[1] = 0;
+        lws[2] = 0;
+        numberOfBarriers = 0;
+
+        auto hwInfo = rootDeviceEnvironment->getMutableHardwareInfo();
+        hwInfo->gtSystemInfo.ThreadCount = 8192;
+        hwInfo->gtSystemInfo.EUCount = 4096;
+    }
+
+    void setSlmLayout(uint32_t dssCountToUse, uint32_t slmPerDssToUse, uint32_t usedSlmToUse) {
+        dssCount = dssCountToUse;
+        availableSlm = dssCountToUse * slmPerDssToUse;
+        usedSlm = usedSlmToUse;
+    }
+
+    DebugManagerStateRestore restorer;
+};
+
+using KernelHelperMaxWorkGroupsSlmPerDssTests = Test<KernelHelperMaxWorkGroupsSlmPerDssFixture>;
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenSlmSizeNotDividingPerDssCapacityWhenCalculatingMaxWorkGroupsCountThenLeftoverIsNotPooled) {
+    setSlmLayout(20, slmPerDss, 96 * kb);
+
+    EXPECT_EQ(20u, getMaxWorkGroupCount());
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenLargePerDssCapacityAndNonDividingSlmSizeWhenCalculatingMaxWorkGroupsCountThenLeftoverIsNotPooled) {
+    setSlmLayout(32, 384 * kb, 256 * kb);
+
+    EXPECT_EQ(32u, getMaxWorkGroupCount());
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenSlmSizeDividingPerDssCapacityWhenCalculatingMaxWorkGroupsCountThenEveryGroupThatFitsIsReported) {
+    setSlmLayout(20, slmPerDss, 64 * kb);
+
+    EXPECT_EQ(40u, getMaxWorkGroupCount());
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenSlmSizeEqualToPerDssCapacityWhenCalculatingMaxWorkGroupsCountThenOneGroupPerDssIsReported) {
+    setSlmLayout(20, slmPerDss, slmPerDss);
+
+    EXPECT_EQ(20u, getMaxWorkGroupCount());
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenSlmSizeExceedingPerDssCapacityWhenCalculatingMaxWorkGroupsCountThenZeroIsReported) {
+    setSlmLayout(20, slmPerDss, 2 * slmPerDss);
+
+    EXPECT_EQ(0u, getMaxWorkGroupCount());
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenVariousSlmSizesWhenCalculatingMaxWorkGroupsCountThenReportedGroupsAlwaysFitInPerDssCapacity) {
+    constexpr std::array<uint32_t, 12> slmSizes = {8 * kb, 12 * kb, 16 * kb, 20 * kb, 24 * kb, 32 * kb,
+                                                   40 * kb, 48 * kb, 64 * kb, 96 * kb, 100 * kb, 128 * kb};
+
+    for (const auto slmSize : slmSizes) {
+        setSlmLayout(20, slmPerDss, slmSize);
+
+        const auto groupsPerDss = slmPerDss / slmSize;
+        const auto actual = getMaxWorkGroupCount();
+
+        EXPECT_EQ(dssCount * groupsPerDss, actual) << "usedSlm = " << slmSize;
+        EXPECT_LE((actual / dssCount) * slmSize, slmPerDss) << "usedSlm = " << slmSize;
+    }
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenSingleWorkGroupPerDssWhenCalculatingMaxWorkGroupsCountThenOneGroupPerDssIsReported) {
+    setSlmLayout(20, slmPerDss, 0);
+    EXPECT_LT(dssCount, getMaxWorkGroupCount());
+
+    singleWorkGroupPerDss = true;
+    EXPECT_EQ(dssCount, getMaxWorkGroupCount());
+}
+
+TEST_F(KernelHelperMaxWorkGroupsSlmPerDssTests, GivenSingleWorkGroupPerDssAndMultipleSubdevicesWhenCalculatingMaxWorkGroupsCountThenOneGroupPerDssOfEachSubdeviceIsReported) {
+    auto &helper = rootDeviceEnvironment->getHelper<NEO::GfxCoreHelper>();
+    setSlmLayout(20, slmPerDss, 0);
+    singleWorkGroupPerDss = true;
+    numSubdevices = 2;
+
+    auto expectedCount = helper.singleTileExecImplicitScalingRequired(true) ? dssCount : dssCount * numSubdevices;
+    EXPECT_EQ(expectedCount, getMaxWorkGroupCount());
+}
+
+HWTEST_F(KernelHelperMaxWorkGroupsTests, givenUsedSlmSizeWhenCalculatingMaxWorkGroupsCountThenAlignToDssSizeCalled) {
+    auto raiiFactory = RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>>(*rootDeviceEnvironment);
+    usedSlm = 4 * MemoryConstants::kiloByte;
+    getMaxWorkGroupCount();
+    EXPECT_EQ(raiiFactory.mockGfxCoreHelper->alignThreadGroupCountToDssSizeCalledTimes, 1u);
+}
+HWTEST_F(KernelHelperMaxWorkGroupsTests, givenBarriersWhenCalculatingMaxWorkGroupsCountThenAlignToDssSizeCalled) {
+    auto raiiFactory = RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>>(*rootDeviceEnvironment);
+    numberOfBarriers = 1;
+    getMaxWorkGroupCount();
+    EXPECT_EQ(raiiFactory.mockGfxCoreHelper->alignThreadGroupCountToDssSizeCalledTimes, 1u);
+}
+
+HWTEST_F(KernelHelperMaxWorkGroupsTests, givenZeroBarriersAndSlmNotUsedWhenCalculatingMaxWorkGroupsCountThenAlignToDssSizeCalled) {
+    auto raiiFactory = RAIIGfxCoreHelperFactory<MockGfxCoreHelperHw<FamilyType>>(*rootDeviceEnvironment);
+    numberOfBarriers = 0;
+    usedSlm = 0;
+    getMaxWorkGroupCount();
+    EXPECT_NE(raiiFactory.mockGfxCoreHelper->alignThreadGroupCountToDssSizeCalledTimes, 0u);
+}
+
+HWTEST2_F(KernelHelperMaxWorkGroupsTests, GivenVariousValuesWhenCalculatingMaxWorkGroupsCountThenLowestResultIsAlwaysReturned, HasDispatchAllSupport) {
+    engineType = EngineGroupType::cooperativeCompute;
+    usedSlm = 1 * MemoryConstants::kiloByte;
     numberOfBarriers = 1;
     dssCount = 1;
 
     workDim = 1;
     lws[0] = simd;
-    threadCount = 1;
-    EXPECT_EQ(1u, getMaxWorkGroupCount());
+    auto hwInfo = rootDeviceEnvironment->getMutableHardwareInfo();
 
-    threadCount = 1024;
+    hwInfo->gtSystemInfo.ThreadCount = 1024;
     EXPECT_NE(1u, getMaxWorkGroupCount());
 
-    numberOfBarriers = 32;
+    numberOfBarriers = static_cast<uint8_t>(CommonConstants::maxBarrierRegisterPerSlice);
     EXPECT_EQ(1u, getMaxWorkGroupCount());
 
     numberOfBarriers = 1;
@@ -89,7 +288,7 @@ TEST_F(KernelHelperTest, GivenStatelessPrivateSizeGreaterThanGlobalSizeWhenCheck
     auto globalSize = pDevice->getDeviceInfo().globalMemSize;
     KernelDescriptor::KernelAttributes attributes = {};
     attributes.perHwThreadPrivateMemorySize = (static_cast<uint32_t>((globalSize + pDevice->getDeviceInfo().computeUnitsUsedForScratch) / pDevice->getDeviceInfo().computeUnitsUsedForScratch)) + 100;
-    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::OUT_OF_DEVICE_MEMORY);
+    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::outOfDeviceMemory);
 }
 
 TEST_F(KernelHelperTest, GivenScratchSizeGreaterThanGlobalSizeWhenCheckingIfThereIsEnaughSpaceThenOutOfMemReturned) {
@@ -97,10 +296,11 @@ TEST_F(KernelHelperTest, GivenScratchSizeGreaterThanGlobalSizeWhenCheckingIfTher
     KernelDescriptor::KernelAttributes attributes = {};
     attributes.perThreadScratchSize[0] = (static_cast<uint32_t>((globalSize + pDevice->getDeviceInfo().computeUnitsUsedForScratch) / pDevice->getDeviceInfo().computeUnitsUsedForScratch)) + 100;
     auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    if (attributes.perThreadScratchSize[0] > gfxCoreHelper.getMaxScratchSize()) {
-        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::INVALID_KERNEL);
+    auto &productHelper = pDevice->getProductHelper();
+    if (attributes.perThreadScratchSize[0] > gfxCoreHelper.getMaxScratchSize(productHelper)) {
+        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::invalidKernel);
     } else {
-        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::OUT_OF_DEVICE_MEMORY);
+        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::outOfDeviceMemory);
     }
 }
 
@@ -109,10 +309,11 @@ TEST_F(KernelHelperTest, GivenScratchPrivateSizeGreaterThanGlobalSizeWhenCheckin
     KernelDescriptor::KernelAttributes attributes = {};
     attributes.perThreadScratchSize[1] = (static_cast<uint32_t>((globalSize + pDevice->getDeviceInfo().computeUnitsUsedForScratch) / pDevice->getDeviceInfo().computeUnitsUsedForScratch)) + 100;
     auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
-    if (attributes.perThreadScratchSize[1] > gfxCoreHelper.getMaxScratchSize()) {
-        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::INVALID_KERNEL);
+    auto &productHelper = pDevice->getProductHelper();
+    if (attributes.perThreadScratchSize[1] > gfxCoreHelper.getMaxScratchSize(productHelper)) {
+        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::invalidKernel);
     } else {
-        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::OUT_OF_DEVICE_MEMORY);
+        EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::outOfDeviceMemory);
     }
 }
 
@@ -122,30 +323,33 @@ TEST_F(KernelHelperTest, GivenScratchAndPrivateSizeLessThanGlobalSizeWhenCheckin
     auto size = (static_cast<uint32_t>((globalSize + pDevice->getDeviceInfo().computeUnitsUsedForScratch) / pDevice->getDeviceInfo().computeUnitsUsedForScratch)) - 100;
     attributes.perHwThreadPrivateMemorySize = size;
     auto &gfxCoreHelper = pDevice->getRootDeviceEnvironment().getHelper<NEO::GfxCoreHelper>();
-    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize();
+    auto &productHelper = pDevice->getProductHelper();
+    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize(productHelper);
     attributes.perThreadScratchSize[0] = (size > maxScratchSize) ? maxScratchSize : size;
     attributes.perThreadScratchSize[1] = (size > maxScratchSize) ? maxScratchSize : size;
-    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::SUCCESS);
+    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::success);
 }
 
 TEST_F(KernelHelperTest, GivenScratchSizeGreaterThanMaxScratchSizeWhenCheckingIfThereIsEnaughSpaceThenInvalidKernelIsReturned) {
     KernelDescriptor::KernelAttributes attributes = {};
     auto &gfxCoreHelper = pDevice->getRootDeviceEnvironment().getHelper<NEO::GfxCoreHelper>();
-    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize();
+    auto &productHelper = pDevice->getProductHelper();
+    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize(productHelper);
     attributes.perHwThreadPrivateMemorySize = 0x10;
     attributes.perThreadScratchSize[0] = maxScratchSize + 1;
     attributes.perThreadScratchSize[1] = 0x10;
-    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::INVALID_KERNEL);
+    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::invalidKernel);
 }
 
 TEST_F(KernelHelperTest, GivenScratchPrivateSizeGreaterThanMaxScratchSizeWhenCheckingIfThereIsEnaughSpaceThenInvalidKernelIsReturned) {
     KernelDescriptor::KernelAttributes attributes = {};
     auto &gfxCoreHelper = pDevice->getRootDeviceEnvironment().getHelper<NEO::GfxCoreHelper>();
-    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize();
+    auto &productHelper = pDevice->getProductHelper();
+    uint32_t maxScratchSize = gfxCoreHelper.getMaxScratchSize(productHelper);
     attributes.perHwThreadPrivateMemorySize = 0x10;
     attributes.perThreadScratchSize[0] = 0x10;
     attributes.perThreadScratchSize[1] = maxScratchSize + 1;
-    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::INVALID_KERNEL);
+    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::invalidKernel);
 }
 
 TEST_F(KernelHelperTest, GivenScratchAndEqualsZeroWhenCheckingIfThereIsEnaughSpaceThenSuccessIsReturned) {
@@ -153,7 +357,7 @@ TEST_F(KernelHelperTest, GivenScratchAndEqualsZeroWhenCheckingIfThereIsEnaughSpa
     attributes.perHwThreadPrivateMemorySize = 0;
     attributes.perThreadScratchSize[0] = 0;
     attributes.perThreadScratchSize[1] = 0;
-    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::SUCCESS);
+    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::success);
 }
 
 TEST_F(KernelHelperTest, GivenScratchEqualsZeroAndPrivetGreaterThanZeroWhenCheckingIfThereIsEnaughSpaceThenSuccessIsReturned) {
@@ -161,14 +365,14 @@ TEST_F(KernelHelperTest, GivenScratchEqualsZeroAndPrivetGreaterThanZeroWhenCheck
     attributes.perHwThreadPrivateMemorySize = 0x10;
     attributes.perThreadScratchSize[0] = 0;
     attributes.perThreadScratchSize[1] = 0;
-    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::SUCCESS);
+    EXPECT_EQ(KernelHelper::checkIfThereIsSpaceForScratchOrPrivate(attributes, pDevice), KernelHelper::ErrorCode::success);
 }
 
 TEST_F(KernelHelperTest, GivenNoPtrByValueWhenCheckingIsAnyArgumentPtrByValueThenFalseIsReturned) {
     KernelDescriptor kernelDescriptor;
-    auto pointerArg = ArgDescriptor(ArgDescriptor::ArgTPointer);
+    auto pointerArg = ArgDescriptor(ArgDescriptor::argTPointer);
 
-    auto valueArg = ArgDescriptor(ArgDescriptor::ArgTValue);
+    auto valueArg = ArgDescriptor(ArgDescriptor::argTValue);
     ArgDescValue::Element element;
     element.isPtr = false;
     valueArg.as<ArgDescValue>().elements.push_back(element);
@@ -180,9 +384,9 @@ TEST_F(KernelHelperTest, GivenNoPtrByValueWhenCheckingIsAnyArgumentPtrByValueThe
 
 TEST_F(KernelHelperTest, GivenPtrByValueWhenCheckingIsAnyArgumentPtrByValueThenTrueIsReturned) {
     KernelDescriptor kernelDescriptor;
-    auto pointerArg = ArgDescriptor(ArgDescriptor::ArgTPointer);
+    auto pointerArg = ArgDescriptor(ArgDescriptor::argTPointer);
 
-    auto valueArg = ArgDescriptor(ArgDescriptor::ArgTValue);
+    auto valueArg = ArgDescriptor(ArgDescriptor::argTValue);
     ArgDescValue::Element element;
     element.isPtr = true;
     valueArg.as<ArgDescValue>().elements.push_back(element);
@@ -190,4 +394,57 @@ TEST_F(KernelHelperTest, GivenPtrByValueWhenCheckingIsAnyArgumentPtrByValueThenT
     kernelDescriptor.payloadMappings.explicitArgs.push_back(pointerArg);
     kernelDescriptor.payloadMappings.explicitArgs.push_back(valueArg);
     EXPECT_TRUE(KernelHelper::isAnyArgumentPtrByValue(kernelDescriptor));
+}
+
+TEST_F(KernelHelperTest, GivenThreadGroupCountWhenSyncBufferCreatedThenAllocationIsRetrieved) {
+    const size_t requestedNumberOfWorkgroups = 4;
+    auto offset = KernelHelper::getSyncBufferSize(requestedNumberOfWorkgroups);
+
+    auto pair = KernelHelper::getSyncBufferAllocationOffset(*pDevice, requestedNumberOfWorkgroups);
+    auto allocation = pair.first;
+
+    EXPECT_EQ(0u, pair.second);
+    EXPECT_NE(nullptr, allocation);
+
+    pair = KernelHelper::getSyncBufferAllocationOffset(*pDevice, requestedNumberOfWorkgroups);
+    EXPECT_EQ(offset, pair.second);
+    EXPECT_EQ(allocation, pair.first);
+}
+
+TEST_F(KernelHelperTest, givenVariousIsaSizesWhenComputingAlignedSizeWithPaddingThenResultIsAlignedToMaxOfKernelAlignAndCacheLineSize) {
+    auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
+    const auto &hwInfo = pDevice->getHardwareInfo();
+
+    const size_t kernelAlign = gfxCoreHelper.getKernelIsaPointerAlignment();
+    const size_t cacheLine = static_cast<size_t>(hwInfo.caps.cacheLineSize);
+    const size_t alignment = std::max(kernelAlign, cacheLine);
+    const size_t isaPadding = gfxCoreHelper.getPaddingForISAAllocation();
+
+    std::vector<size_t> testSizes = {1u, 64u, 128u, 256u, 1024u};
+
+    for (auto isaSize : testSizes) {
+        // Last kernel - with padding
+        auto sizeWithPadding = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*pDevice, isaSize, true);
+        auto expectedWithPadding = alignUp(isaSize + isaPadding, alignment);
+
+        EXPECT_EQ(sizeWithPadding, expectedWithPadding);
+        EXPECT_GE(sizeWithPadding, isaSize + isaPadding);
+
+        // Not last kernel - without padding
+        auto sizeWithoutPadding = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*pDevice, isaSize, false);
+        auto expectedWithoutPadding = alignUp(isaSize, alignment);
+
+        EXPECT_EQ(sizeWithoutPadding, expectedWithoutPadding);
+        EXPECT_GE(sizeWithoutPadding, isaSize);
+
+        EXPECT_GE(sizeWithPadding, sizeWithoutPadding);
+    }
+
+    // Test already aligned size
+    size_t alignedIsaSize = alignment * 4;
+    auto alignedWithoutPadding = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*pDevice, alignedIsaSize, false);
+    EXPECT_EQ(alignedIsaSize, alignedWithoutPadding);
+
+    auto alignedWithPadding = NEO::KernelHelper::computeKernelIsaAllocationAlignedSizeWithPadding(*pDevice, alignedIsaSize, true);
+    EXPECT_EQ(alignUp(alignedIsaSize + isaPadding, alignment), alignedWithPadding);
 }

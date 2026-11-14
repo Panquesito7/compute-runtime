@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,7 +8,9 @@
 #include "shared/source/helpers/gfx_core_helper.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/product_helper.h"
 
@@ -16,7 +18,7 @@
 
 namespace NEO {
 
-GfxCoreHelperCreateFunctionType gfxCoreHelperFactory[IGFX_MAX_CORE] = {};
+GfxCoreHelperCreateFunctionType gfxCoreHelperFactory[NEO::maxCoreEnumValue] = {};
 
 std::unique_ptr<GfxCoreHelper> GfxCoreHelper::create(const GFXCORE_FAMILY gfxCoreFamily) {
 
@@ -28,22 +30,54 @@ std::unique_ptr<GfxCoreHelper> GfxCoreHelper::create(const GFXCORE_FAMILY gfxCor
     return gfxCoreHelper;
 }
 
+SipKernelType GfxCoreHelper::getSipKernelType(bool debuggingActive) {
+    if (!debuggingActive) {
+        return SipKernelType::csr;
+    }
+    return debugManager.flags.UseBindlessDebugSip.get() ? SipKernelType::dbgBindless : SipKernelType::dbgCsr;
+}
+
+bool GfxCoreHelper::getEnableLocalMemory(const HardwareInfo &hwInfo) const {
+    if (debugManager.flags.EnableLocalMemory.get() != -1) {
+        return debugManager.flags.EnableLocalMemory.get();
+    } else if (debugManager.flags.AUBDumpForceAllToLocalMemory.get()) {
+        return true;
+    }
+
+    return isLocalMemoryEnabled(hwInfo);
+}
+
+bool GfxCoreHelper::useSystemMemoryPlacementForISA(const HardwareInfo &hwInfo) const {
+    return !getEnableLocalMemory(hwInfo);
+}
+
+uint64_t GfxCoreHelper::getGpuTimeStampInNS(uint64_t timeStamp, double resolution) {
+    auto numBitsForResolution = Math::log2(static_cast<uint64_t>(resolution)) + 1u;
+    UNRECOVERABLE_IF(numBitsForResolution > 64U);
+    auto timestampMask = maxNBitValue(64 - numBitsForResolution);
+    return static_cast<uint64_t>(static_cast<uint64_t>(timeStamp & timestampMask) * resolution);
+}
+
+bool GfxCoreHelper::areSecondaryContextsSupported() const {
+    return getContextGroupContextsCount() > 1;
+}
+
 bool GfxCoreHelper::compressedBuffersSupported(const HardwareInfo &hwInfo) {
-    if (DebugManager.flags.RenderCompressedBuffersEnabled.get() != -1) {
-        return !!DebugManager.flags.RenderCompressedBuffersEnabled.get();
+    if (debugManager.flags.RenderCompressedBuffersEnabled.get() != -1) {
+        return !!debugManager.flags.RenderCompressedBuffersEnabled.get();
     }
     return hwInfo.capabilityTable.ftrRenderCompressedBuffers;
 }
 
 bool GfxCoreHelper::compressedImagesSupported(const HardwareInfo &hwInfo) {
-    if (DebugManager.flags.RenderCompressedImagesEnabled.get() != -1) {
-        return !!DebugManager.flags.RenderCompressedImagesEnabled.get();
+    if (debugManager.flags.RenderCompressedImagesEnabled.get() != -1) {
+        return !!debugManager.flags.RenderCompressedImagesEnabled.get();
     }
     return hwInfo.capabilityTable.ftrRenderCompressedImages;
 }
 
 bool GfxCoreHelper::cacheFlushAfterWalkerSupported(const HardwareInfo &hwInfo) {
-    int32_t dbgFlag = DebugManager.flags.EnableCacheFlushAfterWalker.get();
+    int32_t dbgFlag = debugManager.flags.EnableCacheFlushAfterWalker.get();
     if (dbgFlag == 1) {
         return true;
     } else if (dbgFlag == 0) {
@@ -53,21 +87,21 @@ bool GfxCoreHelper::cacheFlushAfterWalkerSupported(const HardwareInfo &hwInfo) {
 }
 
 uint32_t GfxCoreHelper::getMaxThreadsForVfe(const HardwareInfo &hwInfo) {
-    uint32_t threadsPerEU = (hwInfo.gtSystemInfo.ThreadCount / hwInfo.gtSystemInfo.EUCount) + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
+    uint32_t threadsPerEU = hwInfo.gtSystemInfo.NumThreadsPerEu + hwInfo.capabilityTable.extraQuantityThreadsPerEU;
     auto maxHwThreadsCapable = hwInfo.gtSystemInfo.EUCount * threadsPerEU;
     auto maxHwThreadsReturned = maxHwThreadsCapable;
-    if (DebugManager.flags.MaxHwThreadsPercent.get() != 0) {
-        maxHwThreadsReturned = int(maxHwThreadsCapable * (DebugManager.flags.MaxHwThreadsPercent.get() / 100.0f));
+    if (debugManager.flags.MaxHwThreadsPercent.get() != 0) {
+        maxHwThreadsReturned = int(maxHwThreadsCapable * (debugManager.flags.MaxHwThreadsPercent.get() / 100.0f));
     }
-    if (DebugManager.flags.MinHwThreadsUnoccupied.get() != 0) {
-        maxHwThreadsReturned = std::min(maxHwThreadsReturned, maxHwThreadsCapable - DebugManager.flags.MinHwThreadsUnoccupied.get());
+    if (debugManager.flags.MinHwThreadsUnoccupied.get() != 0) {
+        maxHwThreadsReturned = std::min(maxHwThreadsReturned, maxHwThreadsCapable - debugManager.flags.MinHwThreadsUnoccupied.get());
     }
     return maxHwThreadsReturned;
 }
 
 uint32_t GfxCoreHelper::getSubDevicesCount(const HardwareInfo *pHwInfo) {
-    if (DebugManager.flags.CreateMultipleSubDevices.get() > 0) {
-        return DebugManager.flags.CreateMultipleSubDevices.get();
+    if (debugManager.flags.CreateMultipleSubDevices.get() > 0) {
+        return debugManager.flags.CreateMultipleSubDevices.get();
     } else if (pHwInfo->gtSystemInfo.MultiTileArchInfo.IsValid && pHwInfo->gtSystemInfo.MultiTileArchInfo.TileCount > 0u) {
         return pHwInfo->gtSystemInfo.MultiTileArchInfo.TileCount;
     } else {
@@ -76,7 +110,7 @@ uint32_t GfxCoreHelper::getSubDevicesCount(const HardwareInfo *pHwInfo) {
 }
 
 uint32_t GfxCoreHelper::getHighestEnabledSlice(const HardwareInfo &hwInfo) {
-    uint32_t highestEnabledSlice = 0;
+    uint32_t highestEnabledSlice = 1;
     if (!hwInfo.gtSystemInfo.IsDynamicallyPopulated) {
         return hwInfo.gtSystemInfo.MaxSlicesSupported;
     }
@@ -89,19 +123,55 @@ uint32_t GfxCoreHelper::getHighestEnabledSlice(const HardwareInfo &hwInfo) {
     return highestEnabledSlice;
 }
 
-uint32_t GfxCoreHelper::getHighestEnabledDualSubSlice(const HardwareInfo &hwInfo) {
-    uint32_t highestDualSubSlice = hwInfo.gtSystemInfo.MaxDualSubSlicesSupported;
+uint32_t GfxCoreHelper::getHighestEnabledSubSliceOnAnySlice(const HardwareInfo &hwInfo) {
 
     if (!hwInfo.gtSystemInfo.IsDynamicallyPopulated) {
-        return highestDualSubSlice;
+        return 0;
     }
 
-    uint32_t numDssPerSlice = hwInfo.gtSystemInfo.MaxDualSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
-    uint32_t highestEnabledSliceIdx = getHighestEnabledSlice(hwInfo) - 1;
+    uint32_t highestSubSlice = 0;
+    for (uint32_t sliceId = 0; sliceId < GT_MAX_SLICE; sliceId++) {
+        for (uint32_t subSliceId = 0; subSliceId < GT_MAX_SUBSLICE_PER_SLICE; subSliceId++) {
+            if (hwInfo.gtSystemInfo.SliceInfo[sliceId].SubSliceInfo[subSliceId].Enabled) {
+                highestSubSlice = std::max(highestSubSlice, subSliceId);
+            }
+        }
+    }
 
-    for (uint32_t dssID = 0; dssID < GT_MAX_DUALSUBSLICE_PER_SLICE; dssID++) {
+    return highestSubSlice;
+}
+
+uint32_t getHighestEnabledSubSlice(const HardwareInfo &hwInfo) {
+    uint32_t numSubSlicesPerSlice = hwInfo.gtSystemInfo.MaxSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
+    uint32_t highestEnabledSliceIdx = GfxCoreHelper::getHighestEnabledSlice(hwInfo) - 1;
+    uint32_t highestSubSlice = (highestEnabledSliceIdx + 1) * numSubSlicesPerSlice;
+
+    for (int32_t subSliceId = GT_MAX_SUBSLICE_PER_SLICE - 1; subSliceId >= 0; subSliceId--) {
+        if (hwInfo.gtSystemInfo.SliceInfo[highestEnabledSliceIdx].SubSliceInfo[subSliceId].Enabled) {
+            return highestEnabledSliceIdx * numSubSlicesPerSlice + subSliceId + 1;
+        }
+    }
+
+    return highestSubSlice;
+}
+
+uint32_t GfxCoreHelper::getHighestEnabledDualSubSlice(const HardwareInfo &hwInfo) {
+    uint32_t maxDualSubSlicesSupported = hwInfo.gtSystemInfo.MaxDualSubSlicesSupported;
+    if (!hwInfo.gtSystemInfo.IsDynamicallyPopulated) {
+        return maxDualSubSlicesSupported;
+    }
+
+    if (maxDualSubSlicesSupported == 0) {
+        return getHighestEnabledSubSlice(hwInfo);
+    }
+
+    uint32_t numDssPerSlice = maxDualSubSlicesSupported / hwInfo.gtSystemInfo.MaxSlicesSupported;
+    uint32_t highestEnabledSliceIdx = getHighestEnabledSlice(hwInfo) - 1;
+    uint32_t highestDualSubSlice = (highestEnabledSliceIdx + 1) * numDssPerSlice;
+
+    for (int32_t dssID = GT_MAX_DUALSUBSLICE_PER_SLICE - 1; dssID >= 0; dssID--) {
         if (hwInfo.gtSystemInfo.SliceInfo[highestEnabledSliceIdx].DSSInfo[dssID].Enabled) {
-            highestDualSubSlice = std::max(highestDualSubSlice, (highestEnabledSliceIdx * numDssPerSlice) + dssID + 1);
+            return (highestEnabledSliceIdx * numDssPerSlice) + dssID + 1;
         }
     }
 
@@ -115,6 +185,26 @@ bool GfxCoreHelper::isWorkaroundRequired(uint32_t lowestSteppingWithBug, uint32_
         return false;
     }
     return (lowestHwRevIdWithBug <= hwInfo.platform.usRevId && hwInfo.platform.usRevId < hwRevIdWithFix);
+}
+
+int32_t GfxCoreHelper::getHighestQueuePriorityLevel() const {
+    auto numLevels = getQueuePriorityLevels();
+    if (numLevels == 1) {
+        return 0;
+    }
+    return -static_cast<int32_t>(numLevels / 2);
+}
+
+int32_t GfxCoreHelper::getLowestQueuePriorityLevel() const {
+    auto numLevels = getQueuePriorityLevels();
+    if (numLevels == 1) {
+        return 0;
+    }
+    return (static_cast<int32_t>(Math::divideAndRoundUp(numLevels, 2))) - 1;
+}
+
+int32_t GfxCoreHelper::getDefaultQueuePriorityLevel() const {
+    return 0;
 }
 
 } // namespace NEO

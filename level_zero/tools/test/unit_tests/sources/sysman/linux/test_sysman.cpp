@@ -1,21 +1,42 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/mocks/mock_driver_info.h"
+#include "shared/source/os_interface/linux/system_info.h"
+#include "shared/test/common/mocks/mock_driver_model.h"
 #include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include "level_zero/sysman/source/driver/sysman_driver.h"
+#include "level_zero/tools/source/sysman/diagnostics/diagnostics_imp.h"
 #include "level_zero/tools/source/sysman/diagnostics/linux/os_diagnostics_imp.h"
+#include "level_zero/tools/source/sysman/ecc/ecc.h"
+#include "level_zero/tools/source/sysman/engine/engine.h"
+#include "level_zero/tools/source/sysman/events/events.h"
 #include "level_zero/tools/source/sysman/events/linux/os_events_imp.h"
+#include "level_zero/tools/source/sysman/fabric_port/fabric_port.h"
+#include "level_zero/tools/source/sysman/fan/fan.h"
+#include "level_zero/tools/source/sysman/firmware/firmware_imp.h"
 #include "level_zero/tools/source/sysman/firmware/linux/os_firmware_imp.h"
+#include "level_zero/tools/source/sysman/frequency/frequency.h"
+#include "level_zero/tools/source/sysman/global_operations/global_operations.h"
+#include "level_zero/tools/source/sysman/linux/pmu/pmu.h"
+#include "level_zero/tools/source/sysman/memory/memory.h"
+#include "level_zero/tools/source/sysman/pci/pci.h"
+#include "level_zero/tools/source/sysman/performance/performance.h"
+#include "level_zero/tools/source/sysman/power/power.h"
 #include "level_zero/tools/source/sysman/ras/ras_imp.h"
+#include "level_zero/tools/source/sysman/scheduler/scheduler.h"
+#include "level_zero/tools/source/sysman/standby/standby.h"
+#include "level_zero/tools/source/sysman/temperature/temperature.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysman_fixture.h"
 
-#include "drm/intel_hwconfig_types.h"
+#include "drm.h"
+
+#include <string_view>
 
 namespace NEO {
 namespace SysCalls {
@@ -26,11 +47,11 @@ extern bool allowFakeDevicePath;
 namespace L0 {
 namespace ult {
 
-inline static int mockAccessFailure(const char *pathname, int mode) {
+inline static int mockAccessFailure(const std::string &pathname, int mode) {
     return -1;
 }
 
-inline static int mockAccessSuccess(const char *pathname, int mode) {
+inline static int mockAccessSuccess(const std::string &pathname, int mode) {
     return 0;
 }
 
@@ -103,14 +124,14 @@ TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleInSysmanImpCreationWhenAllSysm
 
 TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleAndIfSysmanDeviceInitFailsThenErrorReturnedWhileQueryingSysmanAPIs) {
     ze_device_handle_t hSysman = device->toHandle();
-    auto pSysmanDeviceOriginal = static_cast<DeviceImp *>(device)->getSysmanHandle();
+    auto pSysmanDeviceOriginal = device->getSysmanHandle();
 
     // L0::SysmanDeviceHandleContext::init() would return nullptr as:
     // L0::SysmanDeviceHandleContext::init() --> sysmanDevice->init() --> pOsSysman->init() --> pSysfsAccess->getRealPath()
     // pSysfsAccess->getRealPath() would fail because pSysfsAccess is not mocked in this test case.
     auto pSysmanDeviceLocal = L0::SysmanDeviceHandleContext::init(hSysman);
     EXPECT_EQ(pSysmanDeviceLocal, nullptr);
-    static_cast<DeviceImp *>(device)->setSysmanHandle(pSysmanDeviceLocal);
+    device->setSysmanHandle(pSysmanDeviceLocal);
     uint32_t count = 0;
     EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, zesDeviceEnumSchedulers(hSysman, &count, nullptr));
     EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, zesDeviceProcessesGetState(hSysman, &count, nullptr));
@@ -151,7 +172,54 @@ TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleAndIfSysmanDeviceInitFailsThen
     zes_device_ecc_properties_t props = {};
     EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, zesDeviceSetEccState(device, &newState, &props));
     EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, zesDeviceGetEccState(device, &props));
-    static_cast<DeviceImp *>(device)->setSysmanHandle(pSysmanDeviceOriginal);
+    device->setSysmanHandle(pSysmanDeviceOriginal);
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleAndSysmanHandleIsSetToNullWhenSysmanAPICalledThenErrorIsReturned) {
+    ze_device_handle_t hSysman = device->toHandle();
+    auto pSysmanDeviceOriginal = device->getSysmanHandle();
+    device->setSysmanHandle(nullptr);
+
+    uint32_t count = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::schedulerGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::processesGetState(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::pciGetBars(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::powerGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::frequencyGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::engineGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::standbyGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::firmwareGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::memoryGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::fabricPortGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::temperatureGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::rasGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::fanGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::diagnosticsGet(hSysman, &count, nullptr));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::performanceGet(hSysman, &count, nullptr));
+    zes_device_properties_t properties;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceGetProperties(hSysman, &properties));
+    zes_device_state_t state;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceGetState(hSysman, &state));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceReset(hSysman, true));
+    zes_pci_properties_t pciProperties;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::pciGetProperties(hSysman, &pciProperties));
+    zes_pci_state_t pciState;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::pciGetState(hSysman, &pciState));
+    zes_pci_stats_t pciStats;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::pciGetStats(hSysman, &pciStats));
+    zes_event_type_flags_t events = ZES_EVENT_TYPE_FLAG_DEVICE_DETACH;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceEventRegister(hSysman, events));
+    zes_pwr_handle_t phPower = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::powerGetCardDomain(hSysman, &phPower));
+    ze_bool_t eccAvailable = false;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceEccAvailable(device, &eccAvailable));
+    ze_bool_t eccConfigurable = false;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceEccConfigurable(device, &eccConfigurable));
+    zes_device_ecc_desc_t newState = {};
+    zes_device_ecc_properties_t props = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceSetEccState(device, &newState, &props));
+    EXPECT_EQ(ZE_RESULT_ERROR_UNINITIALIZED, L0::SysmanDevice::deviceGetEccState(device, &props));
+    device->setSysmanHandle(pSysmanDeviceOriginal);
 }
 
 using MockDeviceSysmanGetTest = Test<DeviceFixture>;
@@ -167,8 +235,18 @@ TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleButSysmanInitFailsThenValidNul
     EXPECT_EQ(pSysmanDevice, nullptr);
 }
 
+TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleWithSysmanOnlyInitSetAsTrueThenSysmanInitFailsAndValidNullptrReceived) {
+    ze_device_handle_t hSysman = device->toHandle();
+    L0::Sysman::sysmanOnlyInit = true;
+    L0::sysmanInitFromCore = false;
+    auto pSysmanDevice = L0::SysmanDeviceHandleContext::init(hSysman);
+    EXPECT_EQ(pSysmanDevice, nullptr);
+    EXPECT_FALSE(L0::sysmanInitFromCore);
+    L0::Sysman::sysmanOnlyInit = false;
+}
+
 TEST_F(SysmanDeviceFixture, GivenSetValidDrmHandleForDeviceWhenDoingOsSysmanDeviceInitThenSameDrmHandleIsRetrieved) {
-    EXPECT_EQ(&pLinuxSysmanImp->getDrm(), device->getOsInterface().getDriverModel()->as<Drm>());
+    EXPECT_EQ(&pLinuxSysmanImp->getDrm(), device->getOsInterface()->getDriverModel()->as<Drm>());
 }
 
 TEST_F(SysmanDeviceFixture, GivenCreateFsAccessHandleWhenCallinggetFsAccessThenCreatedFsAccessHandleWillBeRetrieved) {
@@ -179,6 +257,14 @@ TEST_F(SysmanDeviceFixture, GivenCreateFsAccessHandleWhenCallinggetFsAccessThenC
     }
     pLinuxSysmanImp->pFsAccess = FsAccess::create();
     EXPECT_EQ(&pLinuxSysmanImp->getFsAccess(), pLinuxSysmanImp->pFsAccess);
+}
+
+std::string getcwd(char buf[], size_t size) {
+    auto cwd = ::getcwd(buf, size);
+    if (cwd) {
+        return cwd;
+    }
+    return "";
 }
 
 TEST_F(SysmanDeviceFixture, GivenPublicFsAccessClassWhenCallingDirectoryExistsWithValidAndInvalidPathThenSuccessAndFailureAreReturnedRespectively) {
@@ -193,12 +279,11 @@ TEST_F(SysmanDeviceFixture, GivenPublicFsAccessClassWhenCallingDirectoryExistsWi
     delete tempFsAccess;
 }
 
-TEST_F(SysmanDeviceFixture, GivenPublicSysfsAccessClassWhenCallingDirectoryExistsWithInvalidPathThenFalseIsRetured) {
-    PublicFsAccess *tempSysfsAccess = new PublicFsAccess();
-    tempSysfsAccess->accessSyscall = mockAccessFailure;
+TEST_F(SysmanDeviceFixture, GivenPublicFsAccessClassWhenCallingDirectoryExistsWithInvalidPathThenFalseIsReturned) {
+    auto tempFsAccess = std::make_unique<PublicFsAccess>();
+    tempFsAccess->accessSyscall = mockAccessFailure;
     std::string path = "invalidDiretory";
-    EXPECT_FALSE(tempSysfsAccess->directoryExists(path));
-    delete tempSysfsAccess;
+    EXPECT_FALSE(tempFsAccess->directoryExists(path));
 }
 
 TEST_F(SysmanDeviceFixture, GivenPublicFsAccessClassWhenCallingCanWriteWithUserHavingWritePermissionsThenSuccessIsReturned) {
@@ -344,6 +429,25 @@ TEST_F(SysmanDeviceFixture, GivenValidPathnameWhenCallingSysfsAccessExistsThenSu
 }
 
 TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassAndValidDirectoryWhenCallingscanDirEntriesThenSuccessIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpendir)> mockOpendir(&NEO::SysCalls::sysCallsOpendir, [](const char *name) -> DIR * {
+        return reinterpret_cast<DIR *>(0xc001);
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReaddir)> mockReaddir(
+        &NEO::SysCalls::sysCallsReaddir, [](DIR *dir) -> struct dirent * {
+            static int callCount = 0;
+            callCount++;
+            if (callCount > 1) {
+                return nullptr;
+            }
+            static struct dirent mockEntry = {0, 0, 0, 0, "mockDir"};
+            return &mockEntry;
+        });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClosedir)> mockClosedir(&NEO::SysCalls::sysCallsClosedir, [](DIR *dir) -> int {
+        return 0;
+    });
+
     PublicSysfsAccess *tempSysfsAccess = new PublicSysfsAccess();
     char cwd[PATH_MAX];
     std::string path = getcwd(cwd, PATH_MAX);
@@ -411,6 +515,166 @@ TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassAndIntegerWhenCallingReadThenSu
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read(fileName, iVal32));
     delete tempSysfsAccess;
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidMockMutexFsAccessWhenCallingReadThenMutexLockCounterMatchesNumberOfReadCalls) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::string value = "123";
+        memcpy(buf, value.data(), value.size());
+        return value.size();
+    });
+
+    class MockMutexFsAccess : public L0::FsAccess {
+      public:
+        uint32_t mutexLockCounter = 0;
+        std::unique_lock<std::mutex> obtainMutex() override {
+            mutexLockCounter++;
+            std::unique_lock<std::mutex> mutexLock = L0::FsAccess::obtainMutex();
+            EXPECT_TRUE(mutexLock.owns_lock());
+            return mutexLock;
+        }
+    };
+
+    MockMutexFsAccess *tempFsAccess = new MockMutexFsAccess();
+    std::string fileName = {};
+    uint32_t iVal32;
+    uint32_t testReadCount = 10;
+    for (uint32_t i = 0; i < testReadCount; i++) {
+        fileName = "mockfile" + std::to_string(i) + ".txt";
+        EXPECT_EQ(ZE_RESULT_SUCCESS, tempFsAccess->read(fileName, iVal32));
+    }
+    EXPECT_EQ(tempFsAccess->mutexLockCounter, testReadCount);
+    delete tempFsAccess;
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassAndOpenSysCallFailsWhenCallingReadThenFailureIsReturned) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return -1;
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::string value = "123";
+        memcpy(buf, value.data(), value.size());
+        return value.size();
+    });
+
+    PublicSysfsAccess *tempSysfsAccess = new PublicSysfsAccess();
+    const std::string fileName = "mockFile.txt";
+    int iVal32;
+
+    errno = ENOENT;
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, tempSysfsAccess->read(fileName, iVal32));
+    delete tempSysfsAccess;
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassAndIntegerWhenCallingReadOnMultipleFilesThenSuccessIsReturned) {
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsPread)> mockPread(&NEO::SysCalls::sysCallsPread, [](int fd, void *buf, size_t count, off_t offset) -> ssize_t {
+        std::string value = "123";
+        memcpy(buf, value.data(), value.size());
+        return value.size();
+    });
+
+    PublicSysfsAccess *tempSysfsAccess = new PublicSysfsAccess();
+    std::string fileName = {};
+    int iVal32;
+    for (auto i = 0; i < L0::FdCache::maxSize + 2; i++) {
+        fileName = "mockfile" + std::to_string(i) + ".txt";
+        EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read(fileName, iVal32));
+    }
+    delete tempSysfsAccess;
+}
+
+TEST(FdCacheTest, GivenValidFdCacheWhenCallingGetFdOnSameFileThenVerifyCacheIsUpdatedProperly) {
+
+    class MockFdCache : public FdCache {
+      public:
+        using FdCache::fdMap;
+    };
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+
+    std::unique_ptr<MockFdCache> pFdCache = std::make_unique<MockFdCache>();
+    std::string fileName = {};
+    for (auto i = 0; i < L0::FdCache::maxSize; i++) {
+        fileName = "mockfile" + std::to_string(i) + ".txt";
+        EXPECT_LE(0, pFdCache->getFd(fileName));
+    }
+
+    fileName = "mockfile0.txt";
+    for (auto i = 0; i < 3; i++) {
+        EXPECT_LE(0, pFdCache->getFd(fileName));
+    }
+
+    for (auto i = 1; i < L0::FdCache::maxSize - 1; i++) {
+        fileName = "mockfile" + std::to_string(i) + ".txt";
+        EXPECT_LE(0, pFdCache->getFd(fileName));
+    }
+
+    // Get Fd after the cache is full.
+    EXPECT_LE(0, pFdCache->getFd("dummy.txt"));
+
+    // Verify Cache have the elements that are accessed more number of times
+    EXPECT_TRUE(pFdCache->fdMap.contains("mockfile0.txt"));
+
+    // Verify cache doesn't have an element that is accessed less number of times.
+    EXPECT_FALSE(pFdCache->fdMap.contains("mockfile9.txt"));
+}
+
+TEST(FdCacheTest, GivenValidFdCacheWhenClearingCacheThenVerifyProperFdsAreClosedAndCacheIsUpdatedProperly) {
+
+    class MockFdCache : public FdCache {
+      public:
+        using FdCache::fdMap;
+    };
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        EXPECT_EQ(fileDescriptor, 1);
+        return 0;
+    });
+
+    MockFdCache *pFdCache = new MockFdCache();
+    std::string fileName = {};
+    for (auto i = 0; i < L0::FdCache::maxSize; i++) {
+        fileName = "mockfile" + std::to_string(i) + ".txt";
+        EXPECT_LE(0, pFdCache->getFd(fileName));
+    }
+
+    fileName = "mockfile0.txt";
+    for (auto i = 0; i < 3; i++) {
+        EXPECT_LE(0, pFdCache->getFd(fileName));
+    }
+
+    for (auto i = 1; i < L0::FdCache::maxSize - 1; i++) {
+        fileName = "mockfile" + std::to_string(i) + ".txt";
+        EXPECT_LE(0, pFdCache->getFd(fileName));
+    }
+
+    // Get Fd after the cache is full.
+    EXPECT_LE(0, pFdCache->getFd("dummy.txt"));
+
+    // Verify Cache have the elements that are accessed more number of times
+    EXPECT_TRUE(pFdCache->fdMap.contains("mockfile0.txt"));
+
+    // Verify cache doesn't have an element that is accessed less number of times.
+    EXPECT_FALSE(pFdCache->fdMap.contains("mockfile9.txt"));
+
+    delete pFdCache;
 }
 
 TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassAndUnsignedIntegerWhenCallingReadThenSuccessIsReturned) {
@@ -527,6 +791,27 @@ TEST_F(SysmanDeviceFixture, GivenCreateSysfsAccessHandleWhenCallinggetSysfsAcces
 }
 
 TEST_F(SysmanDeviceFixture, GivenValidPidWhenCallingProcfsAccessGetFileDescriptorsThenSuccessIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpendir)> mockOpendir(&NEO::SysCalls::sysCallsOpendir, [](const char *name) -> DIR * {
+        return reinterpret_cast<DIR *>(0xc001);
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReaddir)> mockReaddir(
+        &NEO::SysCalls::sysCallsReaddir, [](DIR *dir) -> struct dirent * {
+            static int callCount = 0;
+            if (callCount > 2) {
+                return nullptr;
+            }
+            static struct dirent mockEntry[] = {
+                {0, 0, 0, 0, "mockDir"},
+                {0, 0, 0, 0, "mockDir2"},
+                {0, 0, 0, 0, "mockDir3"},
+            };
+            return &mockEntry[callCount++];
+        });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClosedir)> mockClosedir(&NEO::SysCalls::sysCallsClosedir, [](DIR *dir) -> int {
+        return 0;
+    });
     auto procfsAccess = pLinuxSysmanImp->getProcfsAccess();
 
     ::pid_t processID = getpid();
@@ -535,6 +820,28 @@ TEST_F(SysmanDeviceFixture, GivenValidPidWhenCallingProcfsAccessGetFileDescripto
 }
 
 TEST_F(SysmanDeviceFixture, GivenValidProcfsAccessHandleWhenCallingListProcessesThenSuccessIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpendir)> mockOpendir(&NEO::SysCalls::sysCallsOpendir, [](const char *name) -> DIR * {
+        return reinterpret_cast<DIR *>(0xc001);
+    });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReaddir)> mockReaddir(
+        &NEO::SysCalls::sysCallsReaddir, [](DIR *dir) -> struct dirent * {
+            static int callCount = 0;
+            if (callCount > 2) {
+                return nullptr;
+            }
+            static struct dirent mockEntry[] = {
+                {0, 0, 0, 0, "mockDir"},
+                {0, 0, 0, 0, "mockDir2"},
+                {0, 0, 0, 0, "mockDir3"},
+            };
+            return &mockEntry[callCount++];
+        });
+
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClosedir)> mockClosedir(&NEO::SysCalls::sysCallsClosedir, [](DIR *dir) -> int {
+        return 0;
+    });
+
     auto procfsAccess = pLinuxSysmanImp->getProcfsAccess();
 
     std::vector<::pid_t> listPid;
@@ -603,9 +910,9 @@ TEST_F(SysmanDeviceFixture, GivenNullDrmHandleWhenGettingDrmHandleThenValidDrmHa
 }
 
 TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleWhenGettingFwUtilInterfaceAndGetPciBdfFailsThenFailureIsReturned) {
-    auto deviceImp = static_cast<L0::DeviceImp *>(pLinuxSysmanImp->getDeviceHandle());
+    auto l0Device = static_cast<L0::Device *>(pLinuxSysmanImp->getDeviceHandle());
 
-    deviceImp->driverInfo.reset(nullptr);
+    l0Device->driverInfo.reset(nullptr);
     FirmwareUtil *pFwUtilInterfaceOld = pLinuxSysmanImp->pFwUtilInterface;
     pLinuxSysmanImp->pFwUtilInterface = nullptr;
 
@@ -635,7 +942,7 @@ TEST_F(SysmanDeviceFixture, GivenValidEnumeratedHandlesWhenReleaseIsCalledThenHa
 
     count = 0;
     RasImp *pRas = new RasImp(pSysmanDeviceImp->pRasHandleContext->pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
-    pLinuxSysmanImp->memType = INTEL_HWCONFIG_MEMORY_TYPE_LPDDR4;
+    pLinuxSysmanImp->memType = NEO::DeviceBlobConstants::MemoryType::lpddr4;
     pSysmanDeviceImp->pRasHandleContext->handleList.push_back(pRas);
     result = zesDeviceEnumRasErrorSets(device->toHandle(), &count, NULL);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -660,9 +967,9 @@ TEST_F(SysmanDeviceFixture, GivenValidEnumeratedHandlesWhenReleaseIsCalledThenHa
 }
 
 TEST_F(SysmanDeviceFixture, GivenDriverEventsUtilAsNullWhenSysmanDriverDestructorIsCalledThenVerifyNoExceptionOccured) {
-    VariableBackup<L0::OsSysmanDriver *> driverBackup(&GlobalOsSysmanDriver);
+    VariableBackup<L0::OsSysmanDriver *> driverBackup(&globalOsSysmanDriver);
     auto pPublicLinuxSysmanDriverImp = new PublicLinuxSysmanDriverImp();
-    GlobalOsSysmanDriver = static_cast<L0::OsSysmanDriver *>(pPublicLinuxSysmanDriverImp);
+    globalOsSysmanDriver = static_cast<L0::OsSysmanDriver *>(pPublicLinuxSysmanDriverImp);
 
     auto pUdevLib = new UdevLibMock();
     pPublicLinuxSysmanDriverImp->pUdevLib = pUdevLib;
@@ -674,20 +981,20 @@ TEST_F(SysmanDeviceFixture, GivenDriverEventsUtilAsNullWhenSysmanDriverDestructo
 
 TEST_F(SysmanMultiDeviceFixture, GivenValidDeviceHandleHavingSubdevicesWhenValidatingSysmanHandlesForSubdevicesThenSysmanHandleForSubdeviceWillBeSameAsSysmanHandleForDevice) {
     ze_device_handle_t hSysman = device->toHandle();
-    auto pSysmanDeviceOriginal = static_cast<DeviceImp *>(device)->getSysmanHandle();
+    auto pSysmanDeviceOriginal = device->getSysmanHandle();
     auto pSysmanDeviceLocal = L0::SysmanDeviceHandleContext::init(hSysman);
     EXPECT_EQ(pSysmanDeviceLocal, nullptr);
-    static_cast<DeviceImp *>(device)->setSysmanHandle(pSysmanDeviceLocal);
+    device->setSysmanHandle(pSysmanDeviceLocal);
 
     uint32_t count = 0;
     EXPECT_EQ(ZE_RESULT_SUCCESS, device->getSubDevices(&count, nullptr));
     std::vector<ze_device_handle_t> subDeviceHandles(count, nullptr);
     EXPECT_EQ(ZE_RESULT_SUCCESS, device->getSubDevices(&count, subDeviceHandles.data()));
     for (auto subDeviceHandle : subDeviceHandles) {
-        L0::DeviceImp *subDeviceHandleImp = static_cast<DeviceImp *>(Device::fromHandle(subDeviceHandle));
+        L0::Device *subDeviceHandleImp = static_cast<Device *>(Device::fromHandle(subDeviceHandle));
         EXPECT_EQ(subDeviceHandleImp->getSysmanHandle(), device->getSysmanHandle());
     }
-    static_cast<DeviceImp *>(device)->setSysmanHandle(pSysmanDeviceOriginal);
+    device->setSysmanHandle(pSysmanDeviceOriginal);
 }
 
 TEST_F(SysmanMultiDeviceFixture, GivenValidEffectiveUserIdCheckWhetherPermissionsReturnedByIsRootUserAreCorrect) {
@@ -703,46 +1010,347 @@ TEST_F(SysmanMultiDeviceFixture, GivenValidEffectiveUserIdCheckWhetherPermission
 TEST_F(SysmanMultiDeviceFixture, GivenSysmanEnvironmentVariableSetWhenCreateL0DeviceThenSysmanHandleCreateIsAttempted) {
     driverHandle->enableSysman = true;
     // In SetUp of SysmanMultiDeviceFixture, sysman handle for device is already created, so new sysman handle should not be created
-    static_cast<DeviceImp *>(device)->createSysmanHandle(true);
+    device->createSysmanHandle(true);
     EXPECT_EQ(device->getSysmanHandle(), pSysmanDevice);
 
-    static_cast<DeviceImp *>(device)->createSysmanHandle(false);
+    device->createSysmanHandle(false);
     EXPECT_EQ(device->getSysmanHandle(), pSysmanDevice);
 
     // delete previously allocated sysman handle and then attempt to create sysman handle again
     delete pSysmanDevice;
     device->setSysmanHandle(nullptr);
-    static_cast<DeviceImp *>(device)->createSysmanHandle(true);
+    device->createSysmanHandle(true);
     EXPECT_EQ(device->getSysmanHandle(), nullptr);
 
-    static_cast<DeviceImp *>(device)->createSysmanHandle(false);
+    device->createSysmanHandle(false);
     EXPECT_EQ(device->getSysmanHandle(), nullptr);
 }
-
-class UnknownDriverModel : public DriverModel {
-  public:
-    UnknownDriverModel() : DriverModel(DriverModelType::UNKNOWN) {}
-    void setGmmInputArgs(void *args) override {}
-    uint32_t getDeviceHandle() const override { return 0u; }
-    PhysicalDevicePciBusInfo getPciBusInfo() const override {
-        PhysicalDevicePciBusInfo pciBusInfo(PhysicalDevicePciBusInfo::invalidValue, PhysicalDevicePciBusInfo::invalidValue, PhysicalDevicePciBusInfo::invalidValue, PhysicalDevicePciBusInfo::invalidValue);
-        return pciBusInfo;
-    }
-    PhysicalDevicePciSpeedInfo getPciSpeedInfo() const override { return {}; }
-
-    bool isGpuHangDetected(OsContext &osContext) override {
-        return false;
-    }
-};
 
 using SysmanUnknownDriverModelTest = Test<DeviceFixture>;
 TEST_F(SysmanUnknownDriverModelTest, GivenDriverModelTypeIsNotDrmWhenExecutingSysmanOnLinuxThenErrorIsReturned) {
     neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface = std::make_unique<NEO::OSInterface>();
-    auto &osInterface = device->getOsInterface();
-    osInterface.setDriverModel(std::make_unique<UnknownDriverModel>());
+    auto &osInterface = *device->getOsInterface();
+    osInterface.setDriverModel(std::make_unique<NEO::MockDriverModel>());
     auto pSysmanDeviceImp = std::make_unique<SysmanDeviceImp>(device->toHandle());
     auto pLinuxSysmanImp = static_cast<PublicLinuxSysmanImp *>(pSysmanDeviceImp->pOsSysman);
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pLinuxSysmanImp->init());
+}
+
+class MockOsSysman : public L0::OsSysman {
+    L0::SysmanDeviceImp *pParentSysmanDeviceImp;
+
+  public:
+    ze_bool_t mockDriverVersionSupported = false;
+    ze_result_t mockInitResult = ZE_RESULT_SUCCESS;
+    MockOsSysman(L0::SysmanDeviceImp *pParentSysmanDeviceImp) {
+        this->pParentSysmanDeviceImp = pParentSysmanDeviceImp;
+    }
+    ze_result_t init() override { return mockInitResult; }
+    ze_bool_t isDriverModelSupported() override { return mockDriverVersionSupported; }
+    std::vector<ze_device_handle_t> &getDeviceHandles() override {
+        return pParentSysmanDeviceImp->deviceHandles;
+    }
+    ze_device_handle_t getCoreDeviceHandle() override {
+        return pParentSysmanDeviceImp->hCoreDevice;
+    }
+    static MockOsSysman *create(L0::SysmanDeviceImp *pParentSysmanDeviceImp) {
+        MockOsSysman *pTestSysmanImp = new MockOsSysman(pParentSysmanDeviceImp);
+        return static_cast<MockOsSysman *>(pTestSysmanImp);
+    }
+};
+
+TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleWhenisDriverModelSupportedReturnsTrueThenSuccessIsReturned) {
+    auto osSysmanOriginal = pSysmanDeviceImp->pOsSysman;
+    MockOsSysman *testOsSysman = MockOsSysman::create(pSysmanDeviceImp);
+    testOsSysman->mockInitResult = ZE_RESULT_SUCCESS;
+    testOsSysman->mockDriverVersionSupported = true;
+    pSysmanDeviceImp->pOsSysman = testOsSysman;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, pSysmanDeviceImp->init());
+    pSysmanDeviceImp->pOsSysman = osSysmanOriginal;
+    delete testOsSysman;
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidDeviceHandleWhenisDriverModelSupportedReturnsFalseThenUnSupportedIsReturned) {
+    auto osSysmanOriginal = pSysmanDeviceImp->pOsSysman;
+    MockOsSysman *testOsSysman = MockOsSysman::create(pSysmanDeviceImp);
+    testOsSysman->mockInitResult = ZE_RESULT_SUCCESS;
+    testOsSysman->mockDriverVersionSupported = false;
+    pSysmanDeviceImp->pOsSysman = testOsSysman;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pSysmanDeviceImp->init());
+    pSysmanDeviceImp->pOsSysman = osSysmanOriginal;
+    delete testOsSysman;
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidSysmanDeviceImpWhenOsSysmanInitFailsThenUnSupportedIsReturned) {
+    auto osSysmanOriginal = pSysmanDeviceImp->pOsSysman;
+    MockOsSysman *testOsSysman = MockOsSysman::create(pSysmanDeviceImp);
+    testOsSysman->mockInitResult = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    pSysmanDeviceImp->pOsSysman = testOsSysman;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pSysmanDeviceImp->init());
+    pSysmanDeviceImp->pOsSysman = osSysmanOriginal;
+    delete testOsSysman;
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidLinuxSysmanImpWhenDrmVersionIsXeThenFalseIsReturned) {
+    VariableBackup<decltype(SysCalls::sysCallsIoctl)> mockIoctl(&SysCalls::sysCallsIoctl, [](int fileDescriptor, unsigned long int request, void *arg) -> int {
+        const char *drmVersion = "xe";
+        if (request == DRM_IOCTL_VERSION) {
+            auto pVersion = static_cast<DrmVersion *>(arg);
+            memcpy_s(pVersion->name, pVersion->nameLen, drmVersion, std::min(pVersion->nameLen, strlen(drmVersion) + 1));
+        }
+        return 0;
+    });
+    EXPECT_EQ(false, pLinuxSysmanImp->isDriverModelSupported());
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidLinuxSysmanImpWhenDrmVersionIsi915ThenTrueIsReturned) {
+    VariableBackup<decltype(SysCalls::sysCallsIoctl)> mockIoctl(&SysCalls::sysCallsIoctl, [](int fileDescriptor, unsigned long int request, void *arg) -> int {
+        const char *drmVersion = "i915";
+        if (request == DRM_IOCTL_VERSION) {
+            auto pVersion = static_cast<DrmVersion *>(arg);
+            memcpy_s(pVersion->name, pVersion->nameLen, drmVersion, std::min(pVersion->nameLen, strlen(drmVersion) + 1));
+        }
+        return 0;
+    });
+    EXPECT_EQ(true, pLinuxSysmanImp->isDriverModelSupported());
+}
+
+TEST_F(SysmanDeviceFixture, GivenValidLinuxSysmanImpWhenCallingInitDeviceAfterReleasingDeviceResourcesThenSuccessIsReturned) {
+    pLinuxSysmanImp->releaseDeviceResources();
+    EXPECT_EQ(ZE_RESULT_SUCCESS, pLinuxSysmanImp->initDevice());
+}
+
+TEST_F(SysmanDeviceFixture, GivenFsAccessClassWhenCallingReadSymLinkSucceedsThenValidPathIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadlink(&NEO::SysCalls::sysCallsReadlink, [](const char *path, char *buf, size_t bufsize) -> int {
+        const std::string target = "/mock/target/path";
+        auto len = std::min(bufsize, target.size());
+        memcpy(buf, target.c_str(), len);
+        return static_cast<int>(len);
+    });
+
+    auto tempFsAccess = std::make_unique<PublicFsAccess>();
+    std::string val;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempFsAccess->readSymLink("/some/link", val));
+    EXPECT_EQ("/mock/target/path", val);
+}
+
+TEST_F(SysmanDeviceFixture, GivenFsAccessClassWhenCallingReadSymLinkFailsThenErrorIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadlink(&NEO::SysCalls::sysCallsReadlink, [](const char *path, char *buf, size_t bufsize) -> int {
+        errno = ENOENT;
+        return -1;
+    });
+
+    auto tempFsAccess = std::make_unique<PublicFsAccess>();
+    std::string val;
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, tempFsAccess->readSymLink("/nonexistent/link", val));
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenCallingReadSymLinkSucceedsThenValidPathIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsReadlink)> mockReadlink(&NEO::SysCalls::sysCallsReadlink, [](const char *path, char *buf, size_t bufsize) -> int {
+        const std::string target = "/mock/sysfs/target";
+        auto len = std::min(bufsize, target.size());
+        memcpy(buf, target.c_str(), len);
+        return static_cast<int>(len);
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string val;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->readSymLink("some/link", val));
+    EXPECT_EQ("/mock/sysfs/target", val);
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenCallingReadStringThenSuccessIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        if (++NEO::SysCalls::readFuncCalled == 1) {
+            constexpr std::string_view val = "mockValue\n";
+            auto size = std::min(count, val.size());
+            memcpy(buf, val.data(), size);
+            return static_cast<ssize_t>(size);
+        }
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string sVal;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read("mockFile.txt", sVal));
+    EXPECT_EQ("mockValue", sVal);
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenTokenSpansMultipleReadCallsThenReadStringSucceeds) {
+    // Token spans two read() calls: first fills the entire read buffer, second delivers the tail.
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        const auto call = ++NEO::SysCalls::readFuncCalled;
+        if (call == 1) {
+            memset(buf, 'a', count);
+            return static_cast<ssize_t>(count);
+        }
+        if (call == 2) {
+            constexpr std::string_view tail = "aaaaaaaaaaaaaaaaaaaaaa\n"; // 22 'a' + newline
+            auto size = std::min(count, tail.size());
+            memcpy(buf, tail.data(), size);
+            return static_cast<ssize_t>(size);
+        }
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string sVal;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read("mockFile.txt", sVal));
+    EXPECT_EQ(FsAccess::readBufSize + 22u, sVal.size());
+    EXPECT_TRUE(sVal.find_first_not_of('a') == std::string::npos);
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenFileHasLeadingWhitespaceThenReadStringReturnsToken) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        if (++NEO::SysCalls::readFuncCalled == 1) {
+            constexpr std::string_view content = "  \t mockValue\n";
+            auto size = std::min(count, content.size());
+            memcpy(buf, content.data(), size);
+            return static_cast<ssize_t>(size);
+        }
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string sVal;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read("mockFile.txt", sVal));
+    EXPECT_EQ("mockValue", sVal);
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenFileIsEmptyThenReadStringReturnsError) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string sVal;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, tempSysfsAccess->read("mockFile.txt", sVal));
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenFirstChunkIsWhitespaceOnlyThenReadStringReturnsToken) {
+    // First read() chunk is all whitespace; second read() chunk delivers the actual token.
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        const auto call = ++NEO::SysCalls::readFuncCalled;
+        if (call == 1) {
+            constexpr std::string_view whitespace = "  \t\n  \n";
+            auto size = std::min(count, whitespace.size());
+            memcpy(buf, whitespace.data(), size);
+            return static_cast<ssize_t>(size);
+        }
+        if (call == 2) {
+            constexpr std::string_view val = "42\n";
+            auto size = std::min(count, val.size());
+            memcpy(buf, val.data(), size);
+            return static_cast<ssize_t>(size);
+        }
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string sVal;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read("mockFile.txt", sVal));
+    EXPECT_EQ("42", sVal);
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenReadFailsAndCloseClObbersErrnoThenReadStringReturnsReadError) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        errno = ENOENT;
+        return -1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        errno = EBUSY;
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::string sVal;
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, tempSysfsAccess->read("mockFile.txt", sVal));
+}
+
+TEST_F(SysmanDeviceFixture, GivenSysfsAccessClassWhenCallingReadVectorStringThenSuccessIsReturned) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        if (++NEO::SysCalls::readFuncCalled == 1) {
+            constexpr std::string_view content = "line1\nline2\n";
+            memcpy(buf, content.data(), std::min(count, content.size()));
+            return static_cast<ssize_t>(std::min(count, content.size()));
+        }
+        return 0;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::vector<std::string> lines;
+    EXPECT_EQ(ZE_RESULT_SUCCESS, tempSysfsAccess->read("mockFile.txt", lines));
+    EXPECT_EQ(2u, lines.size());
+    EXPECT_EQ("line1", lines[0]);
+    EXPECT_EQ("line2", lines[1]);
+}
+
+TEST_F(SysmanDeviceFixture, GivenPublicSysfsAccessClassWhenReadVectorStringFailsAfterPartialDataThenValIsCleared) {
+    VariableBackup<decltype(NEO::SysCalls::sysCallsOpen)> mockOpen(&NEO::SysCalls::sysCallsOpen, [](const char *pathname, int flags) -> int {
+        return 1;
+    });
+    VariableBackup<decltype(NEO::SysCalls::sysCallsClose)> mockClose(&NEO::SysCalls::sysCallsClose, [](int fileDescriptor) -> int {
+        return 0;
+    });
+    VariableBackup<decltype(NEO::SysCalls::readFuncCalled)> readCalledBackup{&NEO::SysCalls::readFuncCalled, 0u};
+    VariableBackup<decltype(NEO::SysCalls::sysCallsRead)> mockRead(&NEO::SysCalls::sysCallsRead, [](int fd, void *buf, size_t count) -> ssize_t {
+        if (++NEO::SysCalls::readFuncCalled == 1) {
+            constexpr std::string_view content = "line1\n";
+            memcpy(buf, content.data(), std::min(count, content.size()));
+            return static_cast<ssize_t>(std::min(count, content.size()));
+        }
+        errno = EIO;
+        return -1;
+    });
+
+    auto tempSysfsAccess = std::make_unique<PublicSysfsAccess>();
+    std::vector<std::string> lines = {"preexisting"};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNKNOWN, tempSysfsAccess->read("mockFile.txt", lines));
+    EXPECT_TRUE(lines.empty());
 }
 
 } // namespace ult

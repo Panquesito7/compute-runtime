@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,10 +10,42 @@
 volatile TagAddressType MockCommandStreamReceiver::mockTagAddress[MockCommandStreamReceiver::tagSize];
 
 SubmissionStatus MockCommandStreamReceiver::flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) {
-    return SubmissionStatus::SUCCESS;
+    this->latestFlushedBatchBuffer = batchBuffer;
+    return SubmissionStatus::success;
 }
 
 CompletionStamp MockCommandStreamReceiver::flushTask(
+    LinearStream &commandStream,
+    size_t commandStreamStart,
+    const IndirectHeap *dsh,
+    const IndirectHeap *ioh,
+    const IndirectHeap *ssh,
+    TaskCountType taskLevel,
+    DispatchFlags &dispatchFlags,
+    Device &device) {
+
+    if (this->getHeaplessModeEnabled()) {
+        return flushTaskHeapless(commandStream, commandStreamStart, dsh, ioh, ssh, taskLevel, dispatchFlags, device);
+    } else {
+        return flushTaskHeapful(commandStream, commandStreamStart, dsh, ioh, ssh, taskLevel, dispatchFlags, device);
+    }
+}
+
+CompletionStamp MockCommandStreamReceiver::flushTaskHeapless(
+    LinearStream &commandStream,
+    size_t commandStreamStart,
+    const IndirectHeap *dsh,
+    const IndirectHeap *ioh,
+    const IndirectHeap *ssh,
+    TaskCountType taskLevel,
+    DispatchFlags &dispatchFlags,
+    Device &device) {
+    ++taskCount;
+    CompletionStamp stamp = {taskCount, taskLevel, flushStamp->peekStamp()};
+    return stamp;
+}
+
+CompletionStamp MockCommandStreamReceiver::flushTaskHeapful(
     LinearStream &commandStream,
     size_t commandStreamStart,
     const IndirectHeap *dsh,
@@ -29,6 +61,26 @@ CompletionStamp MockCommandStreamReceiver::flushTask(
 
 CompletionStamp MockCommandStreamReceiver::flushBcsTask(LinearStream &commandStreamTask, size_t commandStreamTaskStart,
                                                         const DispatchBcsFlags &dispatchBcsFlags, const HardwareInfo &hwInfo) {
+    ++taskCount;
+    CompletionStamp stamp = {taskCount, taskLevel, flushStamp->peekStamp()};
+    return stamp;
+}
+
+CompletionStamp MockCommandStreamReceiver::flushImmediateTask(
+    LinearStream &immediateCommandStream,
+    size_t immediateCommandStreamStart,
+    ImmediateDispatchFlags &dispatchFlags,
+    Device &device) {
+    ++taskCount;
+    CompletionStamp stamp = {taskCount, taskLevel, flushStamp->peekStamp()};
+    return stamp;
+}
+
+CompletionStamp MockCommandStreamReceiver::flushImmediateTaskHeapless(
+    LinearStream &immediateCommandStream,
+    size_t immediateCommandStreamStart,
+    ImmediateDispatchFlags &dispatchFlags,
+    Device &device) {
     ++taskCount;
     CompletionStamp stamp = {taskCount, taskLevel, flushStamp->peekStamp()};
     return stamp;

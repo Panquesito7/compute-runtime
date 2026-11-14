@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,9 @@
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/os_interface/linux/drm_allocation.h"
 #include "shared/source/os_interface/linux/drm_buffer_object.h"
+#include "shared/source/os_interface/linux/drm_memory_manager.h"
 #include "shared/source/os_interface/linux/drm_memory_operations_handler.h"
+#include "shared/source/os_interface/linux/drm_memory_operations_handler_default.h"
 #include "shared/source/os_interface/linux/os_context_linux.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
@@ -18,6 +20,8 @@
 #include "shared/test/common/mocks/linux/mock_drm_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_sip.h"
+#include "shared/test/common/os_interface/linux/drm_mock_memory_info.h"
 
 #include "gtest/gtest.h"
 
@@ -36,9 +40,9 @@ class DrmCommandStreamTest : public ::testing::Test {
   public:
     template <typename GfxFamily>
     void setUpT() {
-
         // make sure this is disabled, we don't want to test this now
-        DebugManager.flags.EnableForcePin.set(false);
+        debugManager.flags.EnableL3FlushAfterPostSync.set(0);
+        debugManager.flags.EnableForcePin.set(false);
 
         mock = new DrmMock(mockFd, *executionEnvironment.rootDeviceEnvironments[0]);
         auto hwInfo = executionEnvironment.rootDeviceEnvironments[0]->getHardwareInfo();
@@ -46,7 +50,7 @@ class DrmCommandStreamTest : public ::testing::Test {
 
         executionEnvironment.rootDeviceEnvironments[0]->osInterface = std::make_unique<OSInterface>();
         executionEnvironment.rootDeviceEnvironments[0]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mock));
-        executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, 0u);
+        executionEnvironment.rootDeviceEnvironments[0]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, 0u, false);
         executionEnvironment.rootDeviceEnvironments[0]->initGmm();
         gmmHelper = executionEnvironment.rootDeviceEnvironments[0]->getGmmHelper();
 
@@ -57,16 +61,17 @@ class DrmCommandStreamTest : public ::testing::Test {
                                                                                                   PreemptionHelper::getDefaultPreemptionMode(*hwInfo)));
         osContext->ensureContextInitialized();
 
-        csr = new MockDrmCsr<GfxFamily>(executionEnvironment, 0, 1, gemCloseWorkerMode::gemCloseWorkerActive);
-        ASSERT_NE(nullptr, csr);
+        csr = new MockDrmCsr<GfxFamily>(executionEnvironment, 0, 1);
         csr->setupContext(*osContext);
 
         mock->ioctlCallsCount = 0u;
-        memoryManager = new DrmMemoryManager(gemCloseWorkerMode::gemCloseWorkerActive,
-                                             DebugManager.flags.EnableForcePin.get(),
+        mock->memoryInfo.reset(new MockMemoryInfo{*mock});
+        memoryManager = new DrmMemoryManager(GemCloseWorkerMode::gemCloseWorkerActive,
+                                             debugManager.flags.EnableForcePin.get(),
                                              true,
                                              executionEnvironment);
         executionEnvironment.memoryManager.reset(memoryManager);
+        mock->memoryInfo.reset();
         // Memory manager creates pinBB with ioctl, expect one call
         EXPECT_EQ(1u, mock->ioctlCallsCount);
 
@@ -79,7 +84,9 @@ class DrmCommandStreamTest : public ::testing::Test {
     template <typename GfxFamily>
     void tearDownT() {
         memoryManager->waitForDeletions();
-        memoryManager->peekGemCloseWorker()->close(true);
+        if (memoryManager->peekGemCloseWorker()) {
+            memoryManager->peekGemCloseWorker()->close(true);
+        }
         delete csr;
         if (mock->ioctlTearDownExpects) {
             EXPECT_EQ(mock->ioctlCount.gemWait, mock->ioctlTearDownExpected.gemWait);
@@ -105,6 +112,7 @@ class DrmCommandStreamTest : public ::testing::Test {
 template <typename DrmType>
 class DrmCommandStreamEnhancedTemplate : public ::testing::Test {
   public:
+    VariableBackup<bool> mockSipBackup{&MockSipData::useMockSip, false};
     std::unique_ptr<DebugManagerStateRestore> dbgState;
     MockExecutionEnvironment *executionEnvironment;
     DrmType *mock;
@@ -121,20 +129,19 @@ class DrmCommandStreamEnhancedTemplate : public ::testing::Test {
         executionEnvironment->initGmm();
         this->dbgState = std::make_unique<DebugManagerStateRestore>();
         // make sure this is disabled, we don't want to test this now
-        DebugManager.flags.EnableForcePin.set(false);
+        debugManager.flags.EnableForcePin.set(false);
+        debugManager.flags.EnableL3FlushAfterPostSync.set(0);
 
-        mock = new DrmType(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]);
+        mock = DrmType::create(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]).release();
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface = std::make_unique<OSInterface>();
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mock));
-        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, rootDeviceIndex);
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, rootDeviceIndex, false);
 
         csr = new TestedDrmCommandStreamReceiver<GfxFamily>(*executionEnvironment, rootDeviceIndex, 1);
-        ASSERT_NE(nullptr, csr);
-        mm = new DrmMemoryManager(gemCloseWorkerMode::gemCloseWorkerInactive,
-                                  DebugManager.flags.EnableForcePin.get(),
+        mm = new DrmMemoryManager(GemCloseWorkerMode::gemCloseWorkerInactive,
+                                  debugManager.flags.EnableForcePin.get(),
                                   true,
                                   *executionEnvironment);
-        ASSERT_NE(nullptr, mm);
         executionEnvironment->memoryManager.reset(mm);
         executionEnvironment->prepareRootDeviceEnvironments(1u);
         executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(NEO::defaultHwInfo.get());
@@ -152,7 +159,7 @@ class DrmCommandStreamEnhancedTemplate : public ::testing::Test {
 
     template <typename GfxFamily>
     void makeResidentBufferObjects(OsContext *osContext, DrmAllocation *drmAllocation) {
-        drmAllocation->bindBOs(osContext, 0u, &static_cast<TestedDrmCommandStreamReceiver<GfxFamily> *>(csr)->residency, false);
+        drmAllocation->bindBOs(osContext, 0u, &static_cast<TestedDrmCommandStreamReceiver<GfxFamily> *>(csr)->residency, false, false);
     }
 
     template <typename GfxFamily>
@@ -202,20 +209,18 @@ class DrmCommandStreamEnhancedWithFailingExecTemplate : public ::testing::Test {
         executionEnvironment->initGmm();
         this->dbgState = std::make_unique<DebugManagerStateRestore>();
         // make sure this is disabled, we don't want to test this now
-        DebugManager.flags.EnableForcePin.set(false);
+        debugManager.flags.EnableForcePin.set(false);
 
-        mock = new T(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]);
+        mock = T::create(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]).release();
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface = std::make_unique<OSInterface>();
         executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->osInterface->setDriverModel(std::unique_ptr<DriverModel>(mock));
-        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, rootDeviceIndex);
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface = DrmMemoryOperationsHandler::create(*mock, rootDeviceIndex, false);
 
         csr = new TestedDrmCommandStreamReceiverWithFailingExec<GfxFamily>(*executionEnvironment, rootDeviceIndex, 1);
-        ASSERT_NE(nullptr, csr);
-        mm = new DrmMemoryManager(gemCloseWorkerMode::gemCloseWorkerInactive,
-                                  DebugManager.flags.EnableForcePin.get(),
+        mm = new DrmMemoryManager(GemCloseWorkerMode::gemCloseWorkerInactive,
+                                  debugManager.flags.EnableForcePin.get(),
                                   true,
                                   *executionEnvironment);
-        ASSERT_NE(nullptr, mm);
         executionEnvironment->memoryManager.reset(mm);
         executionEnvironment->prepareRootDeviceEnvironments(1u);
         executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(NEO::defaultHwInfo.get());
@@ -232,7 +237,7 @@ class DrmCommandStreamEnhancedWithFailingExecTemplate : public ::testing::Test {
 
     template <typename GfxFamily>
     void makeResidentBufferObjects(OsContext *osContext, DrmAllocation *drmAllocation) {
-        drmAllocation->bindBOs(osContext, 0u, &static_cast<TestedDrmCommandStreamReceiver<GfxFamily> *>(csr)->residency, false);
+        drmAllocation->bindBOs(osContext, 0u, &static_cast<TestedDrmCommandStreamReceiver<GfxFamily> *>(csr)->residency, false, false);
     }
 
     template <typename GfxFamily>
@@ -248,3 +253,51 @@ class DrmCommandStreamEnhancedWithFailingExecTemplate : public ::testing::Test {
 };
 
 using DrmCommandStreamEnhancedWithFailingExec = DrmCommandStreamEnhancedWithFailingExecTemplate<DrmMockCustom>;
+
+struct DrmCommandStreamDirectSubmissionTest : public DrmCommandStreamEnhancedTest {
+    template <typename GfxFamily>
+    void setUpT() {
+        debugManager.flags.EnableDirectSubmission.set(1u);
+        debugManager.flags.DirectSubmissionFlatRingBuffer.set(0);
+        debugManager.flags.UseVmBind.set(1);
+        DrmCommandStreamEnhancedTest::setUpT<GfxFamily>();
+        auto hwInfo = device->getRootDeviceEnvironment().getMutableHardwareInfo();
+        auto engineType = device->getDefaultEngine().osContext->getEngineType();
+        hwInfo->capabilityTable.directSubmissionEngines.data[engineType].engineSupported = true;
+        device->finalizeRayTracing();
+        csr->initDirectSubmission();
+    }
+
+    template <typename GfxFamily>
+    void tearDownT() {
+        csr->stopDirectSubmission(false, false);
+        this->dbgState.reset();
+        DrmCommandStreamEnhancedTest::tearDownT<GfxFamily>();
+    }
+
+    DebugManagerStateRestore restorer;
+};
+
+struct DrmCommandStreamUllsLightTest : public DrmCommandStreamEnhancedTest {
+    template <typename GfxFamily>
+    void setUpT() {
+        debugManager.flags.DirectSubmissionFlatRingBuffer.set(0);
+        DrmCommandStreamEnhancedTest::setUpT<GfxFamily>();
+        debugManager.flags.EnableDirectSubmission.set(1u);
+        executionEnvironment->rootDeviceEnvironments[rootDeviceIndex]->memoryOperationsInterface =
+            std::make_unique<DrmMemoryOperationsHandlerDefault>(*executionEnvironment->rootDeviceEnvironments[rootDeviceIndex], rootDeviceIndex);
+        auto hwInfo = device->getRootDeviceEnvironment().getMutableHardwareInfo();
+        auto engineType = device->getDefaultEngine().osContext->getEngineType();
+        hwInfo->capabilityTable.directSubmissionEngines.data[engineType].engineSupported = true;
+        csr->initDirectSubmission();
+    }
+
+    template <typename GfxFamily>
+    void tearDownT() {
+        csr->stopDirectSubmission(false, false);
+        this->dbgState.reset();
+        DrmCommandStreamEnhancedTest::tearDownT<GfxFamily>();
+    }
+
+    DebugManagerStateRestore restorer;
+};

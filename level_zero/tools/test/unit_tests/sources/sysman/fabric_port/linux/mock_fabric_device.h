@@ -1,17 +1,16 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "shared/test/common/test_macros/mock_method_macros.h"
+
 #include "level_zero/tools/source/sysman/fabric_port/fabric_port.h"
 #include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
-
-#include "gmock/gmock.h"
 
 namespace L0 {
 namespace ult {
@@ -30,7 +29,7 @@ class MockFabricFsAccess : public FsAccess {
   public:
     ze_result_t mockListDirectory = ZE_RESULT_SUCCESS;
     ze_result_t canRead(const std::string file) override {
-        if (accessibleNodes.find(file) != accessibleNodes.end()) {
+        if (accessibleNodes.contains(file)) {
             return ZE_RESULT_SUCCESS;
         }
         return ZE_RESULT_ERROR_UNKNOWN;

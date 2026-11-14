@@ -1,0 +1,208 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "shared/source/helpers/debug_helpers.h"
+
+#include "level_zero/api/opencl/test/common/fixtures/captured_api.h"
+#include "level_zero/api/opencl/test/common/fixtures/capturing_command_list_args.h"
+#include "level_zero/core/source/event/event.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace NEO {
+namespace LEO {
+namespace ult {
+
+#define LEO_CAPTURED_APIS(MACRO)                                          \
+    MACRO(appendMemoryCopy, AppendMemoryCopyArgs)                         \
+    MACRO(appendMemoryCopyRegion, AppendMemoryCopyRegionArgs)             \
+    MACRO(appendMemoryFill, AppendMemoryFillArgs)                         \
+    MACRO(appendImageCopyFromMemoryExt, AppendImageCopyFromMemoryExtArgs) \
+    MACRO(appendImageCopyToMemoryExt, AppendImageCopyToMemoryExtArgs)     \
+    MACRO(appendLaunchKernel, AppendLaunchKernelArgs)                     \
+    MACRO(appendLaunchKernelNonUniform, AppendLaunchKernelNonUniformArgs) \
+    MACRO(appendBarrier, AppendBarrierArgs)                               \
+    MACRO(appendHostFunction, AppendHostFunctionArgs)                     \
+    MACRO(appendCommandLists, AppendCommandListsArgs)                     \
+    MACRO(hostSynchronize, HostSynchronizeArgs)
+
+enum class ApiId : uint32_t {
+#define LEO_CAPTURED_API_ID(name, argsType) name,
+    LEO_CAPTURED_APIS(LEO_CAPTURED_API_ID)
+#undef LEO_CAPTURED_API_ID
+};
+
+struct CapturingCommandList : public L0::ult::Mock<L0::ult::CommandList> {
+    using BaseClass = L0::ult::Mock<L0::ult::CommandList>;
+    using BaseClass::imageCopyOffloadAllowed;
+    using BaseClass::stagingCopiesAllowed;
+
+    CapturingCommandList() : BaseClass(nullptr) {}
+
+    size_t totalCalls() const { return sequence.size(); }
+
+    void clearCaptures() {
+        stagingCopiesAllowedAtMemoryCopy.clear();
+        stagingCopiesAllowedAtImageCopy.clear();
+        imageCopyOffloadAllowedAtImageCopy.clear();
+        sequence.clear();
+#define LEO_CAPTURED_API_CLEAR(name, argsType) name##Args.records.clear();
+        LEO_CAPTURED_APIS(LEO_CAPTURED_API_CLEAR)
+#undef LEO_CAPTURED_API_CLEAR
+    }
+
+    std::vector<ApiId> sequence{};
+    std::vector<bool> stagingCopiesAllowedAtMemoryCopy{};
+    std::vector<bool> stagingCopiesAllowedAtImageCopy{};
+    std::vector<bool> imageCopyOffloadAllowedAtImageCopy{};
+
+#define LEO_CAPTURED_API_MEMBER(name, argsType) CapturedApi<argsType> name##Args{};
+    LEO_CAPTURED_APIS(LEO_CAPTURED_API_MEMBER)
+#undef LEO_CAPTURED_API_MEMBER
+
+    ze_result_t appendMemoryCopy(void *dstptr, const void *srcptr, size_t size,
+                                 ze_event_handle_t hEvent, uint32_t numWaitEvents,
+                                 ze_event_handle_t *phWaitEvents,
+                                 L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        stagingCopiesAllowedAtMemoryCopy.push_back(this->stagingCopiesAllowed);
+        auto result = BaseClass::appendMemoryCopy(dstptr, srcptr, size, hEvent, numWaitEvents, phWaitEvents, memoryCopyParams);
+        return record(this->appendMemoryCopyArgs, ApiId::appendMemoryCopy,
+                      AppendMemoryCopyArgs{dstptr, srcptr, size, hEvent, numWaitEvents, phWaitEvents}, result);
+    }
+
+    ze_result_t appendMemoryCopyRegion(void *dstptr, const ze_copy_region_t *dstRegion, uint32_t dstPitch,
+                                       uint32_t dstSlicePitch, const void *srcptr, const ze_copy_region_t *srcRegion,
+                                       uint32_t srcPitch, uint32_t srcSlicePitch, ze_event_handle_t hSignalEvent,
+                                       uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                       L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        auto result = BaseClass::appendMemoryCopyRegion(dstptr, dstRegion, dstPitch, dstSlicePitch, srcptr, srcRegion,
+                                                        srcPitch, srcSlicePitch, hSignalEvent, numWaitEvents, phWaitEvents, memoryCopyParams);
+        return record(this->appendMemoryCopyRegionArgs, ApiId::appendMemoryCopyRegion,
+                      AppendMemoryCopyRegionArgs{dstptr, dstRegion, dstPitch, dstSlicePitch, srcptr,
+                                                 srcRegion, srcPitch, srcSlicePitch, hSignalEvent,
+                                                 numWaitEvents, phWaitEvents},
+                      result);
+    }
+
+    ze_result_t appendMemoryFill(void *ptr, const void *pattern, size_t patternSize, size_t size,
+                                 ze_event_handle_t hEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                 L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        auto result = BaseClass::appendMemoryFill(ptr, pattern, patternSize, size, hEvent, numWaitEvents, phWaitEvents, memoryCopyParams);
+        return record(this->appendMemoryFillArgs, ApiId::appendMemoryFill,
+                      AppendMemoryFillArgs{ptr, pattern, patternSize, size, hEvent, numWaitEvents, phWaitEvents},
+                      result);
+    }
+
+    ze_result_t appendImageCopyFromMemoryExt(ze_image_handle_t hDstImage, const void *srcptr,
+                                             const ze_image_region_t *pDstRegion, uint32_t srcRowPitch,
+                                             uint32_t srcSlicePitch, ze_event_handle_t hEvent, uint32_t numWaitEvents,
+                                             ze_event_handle_t *phWaitEvents, L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        stagingCopiesAllowedAtImageCopy.push_back(this->stagingCopiesAllowed);
+        imageCopyOffloadAllowedAtImageCopy.push_back(this->imageCopyOffloadAllowed);
+        return record(this->appendImageCopyFromMemoryExtArgs, ApiId::appendImageCopyFromMemoryExt,
+                      AppendImageCopyFromMemoryExtArgs{hDstImage, srcptr, pDstRegion, srcRowPitch, srcSlicePitch, hEvent, numWaitEvents, phWaitEvents},
+                      appendImageCopyFromMemoryExtResult);
+    }
+
+    ze_result_t appendImageCopyFromMemoryExtResult = ZE_RESULT_SUCCESS;
+
+    ze_result_t appendImageCopyToMemoryExt(void *dstptr, ze_image_handle_t hSrcImage, const ze_image_region_t *pSrcRegion,
+                                           uint32_t destRowPitch, uint32_t destSlicePitch, ze_event_handle_t hEvent,
+                                           uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                           L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        stagingCopiesAllowedAtImageCopy.push_back(this->stagingCopiesAllowed);
+        imageCopyOffloadAllowedAtImageCopy.push_back(this->imageCopyOffloadAllowed);
+        auto result = BaseClass::appendImageCopyToMemoryExt(dstptr, hSrcImage, pSrcRegion, destRowPitch, destSlicePitch, hEvent,
+                                                            numWaitEvents, phWaitEvents, memoryCopyParams);
+        return record(this->appendImageCopyToMemoryExtArgs, ApiId::appendImageCopyToMemoryExt,
+                      AppendImageCopyToMemoryExtArgs{dstptr, hSrcImage, pSrcRegion, destRowPitch, destSlicePitch, hEvent, numWaitEvents, phWaitEvents},
+                      result);
+    }
+
+    ze_result_t appendImageCopyFromMemory(ze_image_handle_t hDstImage, const void *srcptr, const ze_image_region_t *pDstRegion,
+                                          ze_event_handle_t hEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                          L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        imageCopyOffloadAllowedAtImageCopy.push_back(this->imageCopyOffloadAllowed);
+        return BaseClass::appendImageCopyFromMemory(hDstImage, srcptr, pDstRegion, hEvent, numWaitEvents, phWaitEvents, memoryCopyParams);
+    }
+
+    ze_result_t appendImageCopyToMemory(void *dstptr, ze_image_handle_t hSrcImage, const ze_image_region_t *pSrcRegion,
+                                        ze_event_handle_t hEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                        L0::CmdListMemoryCopyParams &memoryCopyParams) override {
+        imageCopyOffloadAllowedAtImageCopy.push_back(this->imageCopyOffloadAllowed);
+        return BaseClass::appendImageCopyToMemory(dstptr, hSrcImage, pSrcRegion, hEvent, numWaitEvents, phWaitEvents, memoryCopyParams);
+    }
+
+    ze_result_t appendLaunchKernel(ze_kernel_handle_t kernelHandle, const ze_group_count_t &threadGroupDimensions,
+                                   ze_event_handle_t hEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                   L0::CmdListKernelLaunchParams &launchParams) override {
+        auto result = BaseClass::appendLaunchKernel(kernelHandle, threadGroupDimensions, hEvent, numWaitEvents, phWaitEvents, launchParams);
+        return record(this->appendLaunchKernelArgs, ApiId::appendLaunchKernel,
+                      AppendLaunchKernelArgs{kernelHandle, threadGroupDimensions, hEvent, numWaitEvents, phWaitEvents, launchParams}, result);
+    }
+
+    ze_result_t appendLaunchKernelNonUniform(ze_kernel_handle_t kernelHandle, const L0::CmdListNonUniformLaunchArgs &launchArgs,
+                                             ze_event_handle_t hEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                             bool relaxedOrderingDispatch) override {
+        auto result = BaseClass::appendLaunchKernelNonUniform(kernelHandle, launchArgs, hEvent, numWaitEvents, phWaitEvents, relaxedOrderingDispatch);
+        return record(this->appendLaunchKernelNonUniformArgs, ApiId::appendLaunchKernelNonUniform,
+                      AppendLaunchKernelNonUniformArgs{kernelHandle, launchArgs, hEvent, numWaitEvents, phWaitEvents}, result);
+    }
+
+    bool completeSignalEventOnAppendBarrier = false;
+
+    ze_result_t appendBarrier(ze_event_handle_t hSignalEvent, uint32_t numWaitEvents,
+                              ze_event_handle_t *phWaitEvents, L0::CmdListWaitEventParameters &waitEventsParameters,
+                              L0::CmdListSignalEventParameters &signalEventParameters) override {
+        auto result = BaseClass::appendBarrier(hSignalEvent, numWaitEvents, phWaitEvents, waitEventsParameters, signalEventParameters);
+        if (this->completeSignalEventOnAppendBarrier && (hSignalEvent != nullptr) && (result == ZE_RESULT_SUCCESS)) {
+            result = L0::Event::fromHandle(hSignalEvent)->hostSignal(false);
+        }
+        return record(this->appendBarrierArgs, ApiId::appendBarrier,
+                      AppendBarrierArgs{hSignalEvent, numWaitEvents, phWaitEvents, waitEventsParameters, signalEventParameters}, result);
+    }
+
+    ze_result_t appendHostFunction(ze_host_function_callback_t pHostFunction, void *pUserData, const void *pNext,
+                                   ze_event_handle_t hSignalEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                   L0::CmdListHostFunctionParameters &parameters) override {
+        auto result = BaseClass::appendHostFunction(pHostFunction, pUserData, pNext, hSignalEvent, numWaitEvents, phWaitEvents, parameters);
+        return record(this->appendHostFunctionArgs, ApiId::appendHostFunction,
+                      AppendHostFunctionArgs{pHostFunction, pUserData, hSignalEvent, numWaitEvents, phWaitEvents}, result);
+    }
+
+    ze_result_t appendCommandLists(uint32_t numCommandLists, ze_command_list_handle_t *phCommandLists,
+                                   ze_event_handle_t hSignalEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                   L0::CommandListExecutionInternalOptions &internalOptions) override {
+        auto result = BaseClass::appendCommandLists(numCommandLists, phCommandLists, hSignalEvent, numWaitEvents, phWaitEvents, internalOptions);
+        return record(this->appendCommandListsArgs, ApiId::appendCommandLists,
+                      AppendCommandListsArgs{numCommandLists, phCommandLists, hSignalEvent, numWaitEvents, phWaitEvents}, result);
+    }
+
+    ze_result_t hostSynchronize(uint64_t timeout) override {
+        auto result = BaseClass::hostSynchronize(timeout);
+        return record(this->hostSynchronizeArgs, ApiId::hostSynchronize, HostSynchronizeArgs{timeout}, result);
+    }
+
+  protected:
+    template <typename Args>
+    ze_result_t record(CapturedApi<Args> &api, ApiId id, Args args, ze_result_t baseResult) {
+        api.records.push_back(std::move(args));
+        sequence.push_back(id);
+        return baseResult;
+    }
+};
+
+#undef LEO_CAPTURED_APIS
+
+} // namespace ult
+} // namespace LEO
+} // namespace NEO

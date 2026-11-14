@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <fcntl.h>
 #include <io.h>
 #include <iostream>
@@ -40,8 +41,22 @@ void printToStderr(const char *str) {
     printToStreamHandle(str, STD_ERROR_HANDLE);
 }
 
+namespace {
+void ignoreInvalidParameter(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, uintptr_t) {}
+
+class InvalidParameterHandlerOverride {
+  public:
+    InvalidParameterHandlerOverride() : previousHandler(_set_thread_local_invalid_parameter_handler(ignoreInvalidParameter)) {}
+    ~InvalidParameterHandlerOverride() { _set_thread_local_invalid_parameter_handler(previousHandler); }
+
+  private:
+    decltype(&ignoreInvalidParameter) previousHandler;
+};
+} // namespace
+
 template <class T>
 size_t simpleSprintf(char *output, size_t outputSize, const char *format, T value) {
+    InvalidParameterHandlerOverride invalidParameterHandlerOverride;
 #if (_MSC_VER == 1800)
     _set_output_format(_TWO_DIGIT_EXPONENT);
 #endif
@@ -51,29 +66,33 @@ size_t simpleSprintf(char *output, size_t outputSize, const char *format, T valu
         return 0;
     }
 
+    int retVal = 0;
     if (len > 3 && *(format + len - 2) == 'h' && *(format + len - 3) == 'h') {
         if (*(format + len - 1) == 'i' || *(format + len - 1) == 'd') {
             int32_t fixedValue = (char)value;
-            return sprintf_s(output, outputSize, format, fixedValue);
+            retVal = sprintf_s(output, outputSize, format, fixedValue);
         } else {
             uint32_t fixedValue = (unsigned char)value;
-            return sprintf_s(output, outputSize, format, fixedValue);
+            retVal = sprintf_s(output, outputSize, format, fixedValue);
         }
     } else if (format[len - 1] == 'F') {
         std::string formatCopy = format;
         *formatCopy.rbegin() = 'f';
 
-        size_t returnValue = sprintf_s(output, outputSize, formatCopy.c_str(), value);
-        for (size_t i = 0; i < returnValue; i++)
+        retVal = sprintf_s(output, outputSize, formatCopy.c_str(), value);
+        for (int i = 0; i < retVal; i++) {
             output[i] = std::toupper(output[i]);
-        return returnValue;
+        }
     } else {
-        return sprintf_s(output, outputSize, format, value);
+        retVal = sprintf_s(output, outputSize, format, value);
     }
+    return retVal < 0 ? 0 : static_cast<size_t>(retVal);
 }
 
 size_t simpleSprintf(char *output, size_t outputSize, const char *format, const char *value) {
-    return sprintf_s(output, outputSize, format, value);
+    InvalidParameterHandlerOverride invalidParameterHandlerOverride;
+    auto retVal = sprintf_s(output, outputSize, format, value);
+    return retVal < 0 ? 0 : static_cast<size_t>(retVal);
 }
 
 template size_t simpleSprintf<float>(char *output, size_t output_size, const char *format, float value);

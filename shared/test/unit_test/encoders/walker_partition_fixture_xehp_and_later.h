@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,11 +22,14 @@ struct WalkerPartitionTests : public ::testing::Test {
 
     template <typename GfxFamily>
     auto createWalker(uint64_t postSyncAddress) {
-        WalkerPartition::COMPUTE_WALKER<GfxFamily> walker;
-        walker = GfxFamily::cmdInitGpgpuWalker;
-        walker.setPartitionType(COMPUTE_WALKER<GfxFamily>::PARTITION_TYPE::PARTITION_TYPE_X);
+        using WalkerType = typename GfxFamily::DefaultWalkerType;
+        using PostSyncType = decltype(GfxFamily::template getPostSyncType<WalkerType>());
+
+        WalkerType walker;
+        walker = GfxFamily::template getInitGpuWalker<WalkerType>();
+        walker.setPartitionType(WalkerType::PARTITION_TYPE::PARTITION_TYPE_X);
         auto &postSync = walker.getPostSync();
-        postSync.setOperation(POSTSYNC_DATA<GfxFamily>::OPERATION::OPERATION_WRITE_TIMESTAMP);
+        postSync.setOperation(PostSyncType::OPERATION::OPERATION_WRITE_TIMESTAMP);
         postSync.setDestinationAddress(postSyncAddress);
         return walker;
     }

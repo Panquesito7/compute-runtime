@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,9 +8,6 @@
 #pragma once
 
 #include "opencl/source/sharings/gl/gl_sharing.h"
-
-#include "gl_types.h"
-#include <GL/gl.h>
 
 namespace NEO {
 // OpenGL API names
@@ -41,7 +38,7 @@ typedef BOOL(OSAPI *PFNwglDeleteContext)(HGLRC hglrcHandle);
 
 typedef bool (*PFNglArbSyncObjectSetup)(GLSharingFunctions &sharing, OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo);
 typedef void (*PFNglArbSyncObjectCleanup)(OSInterface &osInterface, CL_GL_SYNC_INFO *glSyncInfo);
-typedef void (*PFNglArbSyncObjectSignal)(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo);
+typedef void (*PFNglArbSyncObjectSignal)(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo, bool signalAtSubmission);
 typedef void (*PFNglArbSyncObjectWaitServer)(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo);
 
 typedef LUID(OSAPI *PFNGLGETLUIDINTEL)(HGLRC hglrcHandle);
@@ -52,8 +49,8 @@ class GLSharingFunctionsWindows : public GLSharingFunctions {
     GLSharingFunctionsWindows(GLType glhdcType, GLContext glhglrcHandle, GLContext glhglrcHandleBkpCtx, GLDisplay glhdcHandle);
     ~GLSharingFunctionsWindows() override;
 
-    OS_HANDLE getGLDeviceHandle() const { return GLDeviceHandle; }
-    OS_HANDLE getGLContextHandle() const { return GLContextHandle; }
+    OS_HANDLE getGLDeviceHandle() const { return glDeviceHandle; }
+    OS_HANDLE getGLContextHandle() const { return glContextHandle; }
 
     GLboolean initGLFunctions() override;
     bool isOpenGlSharingSupported() override;
@@ -69,49 +66,49 @@ class GLSharingFunctionsWindows : public GLSharingFunctions {
 
     // Gl functions
     GLboolean acquireSharedBufferINTEL(GLvoid *pBufferInfo) {
-        return GLAcquireSharedBuffer(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pBufferInfo);
+        return glAcquireSharedBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pBufferInfo);
     }
     GLboolean releaseSharedBufferINTEL(GLvoid *pBufferInfo) {
-        return GLReleaseSharedBuffer(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pBufferInfo);
+        return glReleaseSharedBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pBufferInfo);
     }
     GLboolean acquireSharedRenderBuffer(GLvoid *pResourceInfo) {
-        return GLAcquireSharedRenderBuffer(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pResourceInfo);
+        return glAcquireSharedRenderBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pResourceInfo);
     }
     GLboolean releaseSharedRenderBuffer(GLvoid *pResourceInfo) {
-        return GLReleaseSharedRenderBuffer(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pResourceInfo);
+        return glReleaseSharedRenderBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pResourceInfo);
     }
     GLboolean acquireSharedTexture(GLvoid *pResourceInfo) {
-        return GLAcquireSharedTexture(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pResourceInfo);
+        return glAcquireSharedTexture(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pResourceInfo);
     }
     GLboolean releaseSharedTexture(GLvoid *pResourceInfo) {
-        return GLReleaseSharedTexture(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pResourceInfo);
+        return glReleaseSharedTexture(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pResourceInfo);
     }
     GLboolean retainSync(GLvoid *pSyncInfo) {
-        return GLRetainSync(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pSyncInfo);
+        return glRetainSync(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pSyncInfo);
     }
     GLboolean releaseSync(GLvoid *pSync) {
-        return GLReleaseSync(GLHDCHandle, GLHGLRCHandle, GLHGLRCHandleBkpCtx, pSync);
+        return glReleaseSync(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pSync);
     }
     void getSynciv(GLvoid *pSync, GLenum pname, GLint *value) {
-        return GLGetSynciv(pSync, pname, value);
+        return glGetSynciv(pSync, pname, value);
     }
     GLContext getCurrentContext() {
-        return GLGetCurrentContext();
+        return glGetCurrentContext();
     }
     GLDisplay getCurrentDisplay() {
-        return GLGetCurrentDisplay();
+        return glGetCurrentDisplay();
     }
     GLboolean makeCurrent(GLContext contextHandle, GLDisplay displayHandle = 0) {
         if (displayHandle == 0) {
-            displayHandle = GLHDCHandle;
+            displayHandle = glHDCHandle;
         }
         return this->wglMakeCurrent(displayHandle, contextHandle);
     }
     GLContext getBackupContextHandle() {
-        return GLHGLRCHandleBkpCtx;
+        return glHGLRCHandleBkpCtx;
     }
     GLContext getContextHandle() {
-        return GLHGLRCHandle;
+        return glHGLRCHandle;
     }
     bool glArbSyncObjectSetup(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo) {
         return pfnGlArbSyncObjectSetup(*this, osInterface, glSyncInfo);
@@ -119,8 +116,8 @@ class GLSharingFunctionsWindows : public GLSharingFunctions {
     void glArbSyncObjectCleanup(OSInterface &osInterface, CL_GL_SYNC_INFO *glSyncInfo) {
         pfnGlArbSyncObjectCleanup(osInterface, glSyncInfo);
     }
-    void glArbSyncObjectSignal(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo) {
-        pfnGlArbSyncObjectSignal(osContext, glSyncInfo);
+    void glArbSyncObjectSignal(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo, bool signalAtSubmission) {
+        pfnGlArbSyncObjectSignal(osContext, glSyncInfo, signalAtSubmission);
     }
     void glArbSyncObjectWaitServer(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo) {
         pfnGlArbSyncObjectWaitServer(osInterface, glSyncInfo);
@@ -134,7 +131,7 @@ class GLSharingFunctionsWindows : public GLSharingFunctions {
 
   protected:
     void updateOpenGLContext() {
-        if (GLSetSharedOCLContextState) {
+        if (glSetSharedOCLContextState) {
             setSharedOCLContextState();
         }
     }
@@ -143,24 +140,24 @@ class GLSharingFunctionsWindows : public GLSharingFunctions {
     bool isOpenGlExtensionSupported(const unsigned char *pExtentionString);
 
     // Handles
-    GLType GLHDCType = 0;
-    GLContext GLHGLRCHandle = 0;
-    GLContext GLHGLRCHandleBkpCtx = 0;
-    GLDisplay GLHDCHandle = 0;
-    OS_HANDLE GLDeviceHandle = 0;
-    OS_HANDLE GLContextHandle = 0;
+    GLType glHDCType = 0;
+    GLContext glHGLRCHandle = 0;
+    GLContext glHGLRCHandleBkpCtx = 0;
+    GLDisplay glHDCHandle = 0;
+    OS_HANDLE glDeviceHandle = 0;
+    OS_HANDLE glContextHandle = 0;
 
     // GL functions
     std::unique_ptr<OsLibrary> glLibrary;
-    PFNOGLSetSharedOCLContextStateINTEL GLSetSharedOCLContextState = nullptr;
-    PFNOGLAcquireSharedBufferINTEL GLAcquireSharedBuffer = nullptr;
-    PFNOGLReleaseSharedBufferINTEL GLReleaseSharedBuffer = nullptr;
-    PFNOGLAcquireSharedRenderBufferINTEL GLAcquireSharedRenderBuffer = nullptr;
-    PFNOGLReleaseSharedRenderBufferINTEL GLReleaseSharedRenderBuffer = nullptr;
-    PFNOGLAcquireSharedTextureINTEL GLAcquireSharedTexture = nullptr;
-    PFNOGLReleaseSharedTextureINTEL GLReleaseSharedTexture = nullptr;
-    PFNOGLGetCurrentContext GLGetCurrentContext = nullptr;
-    PFNOGLGetCurrentDisplay GLGetCurrentDisplay = nullptr;
+    PFNOGLSetSharedOCLContextStateINTEL glSetSharedOCLContextState = nullptr;
+    PFNOGLAcquireSharedBufferINTEL glAcquireSharedBuffer = nullptr;
+    PFNOGLReleaseSharedBufferINTEL glReleaseSharedBuffer = nullptr;
+    PFNOGLAcquireSharedRenderBufferINTEL glAcquireSharedRenderBuffer = nullptr;
+    PFNOGLReleaseSharedRenderBufferINTEL glReleaseSharedRenderBuffer = nullptr;
+    PFNOGLAcquireSharedTextureINTEL glAcquireSharedTexture = nullptr;
+    PFNOGLReleaseSharedTextureINTEL glReleaseSharedTexture = nullptr;
+    PFNOGLGetCurrentContext glGetCurrentContext = nullptr;
+    PFNOGLGetCurrentDisplay glGetCurrentDisplay = nullptr;
     PFNglGetString glGetString = nullptr;
     PFNglGetStringi glGetStringi = nullptr;
     PFNglGetIntegerv glGetIntegerv = nullptr;
@@ -168,9 +165,9 @@ class GLSharingFunctionsWindows : public GLSharingFunctions {
     PFNwglMakeCurrent wglMakeCurrent = nullptr;
     PFNwglShareLists pfnWglShareLists = nullptr;
     PFNwglDeleteContext pfnWglDeleteContext = nullptr;
-    PFNOGLRetainSyncINTEL GLRetainSync = nullptr;
-    PFNOGLReleaseSyncINTEL GLReleaseSync = nullptr;
-    PFNOGLGetSyncivINTEL GLGetSynciv = nullptr;
+    PFNOGLRetainSyncINTEL glRetainSync = nullptr;
+    PFNOGLReleaseSyncINTEL glReleaseSync = nullptr;
+    PFNOGLGetSyncivINTEL glGetSynciv = nullptr;
     PFNglArbSyncObjectSetup pfnGlArbSyncObjectSetup = nullptr;
     PFNglArbSyncObjectCleanup pfnGlArbSyncObjectCleanup = nullptr;
     PFNglArbSyncObjectSignal pfnGlArbSyncObjectSignal = nullptr;

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 #include "CL/cl.h"
 
+#include <vector>
 namespace NEO {
 
 template <typename T>
@@ -16,7 +17,7 @@ class DestructorCallbacks {
 
   public:
     inline void add(CallbackType *callback, void *userData) {
-        callbacks.push_back({callback, userData});
+        callbacks.emplace_back(callback, userData);
     }
     inline bool empty() {
         return callbacks.empty();

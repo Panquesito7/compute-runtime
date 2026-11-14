@@ -1,70 +1,51 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/aub_mem_dump/aub_mem_dump.h"
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/command_container/encode_surface_state.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/bit_helpers.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/flush_caches_bitmask.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/local_id_gen.h"
 #include "shared/source/helpers/pipe_control_args.h"
+#include "shared/source/helpers/surface_format_info.h"
 #include "shared/source/helpers/timestamp_packet.h"
+#include "shared/source/image/image_surface_state.h"
+#include "shared/source/indirect_heap/indirect_heap.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/os_interface/os_interface.h"
 #include "shared/source/os_interface/product_helper.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/source/unified_memory/unified_memory.h"
 #include "shared/source/utilities/tag_allocator.h"
+
+#include "encode_surface_state_args.h"
 
 namespace NEO {
 
 template <typename Family>
-const AuxTranslationMode GfxCoreHelperHw<Family>::defaultAuxTranslationMode = AuxTranslationMode::Builtin;
+const AuxTranslationMode GfxCoreHelperHw<Family>::defaultAuxTranslationMode = AuxTranslationMode::builtin;
 
 template <typename Family>
 bool GfxCoreHelperHw<Family>::isBufferSizeSuitableForCompression(const size_t size) const {
-    if (DebugManager.flags.OverrideBufferSuitableForRenderCompression.get() != -1) {
-        return !!DebugManager.flags.OverrideBufferSuitableForRenderCompression.get();
+    if (debugManager.flags.OverrideBufferSuitableForRenderCompression.get() != -1) {
+        return !!debugManager.flags.OverrideBufferSuitableForRenderCompression.get();
     }
-    return size > KB;
-}
-
-template <typename Family>
-size_t GfxCoreHelperHw<Family>::getMax3dImageWidthOrHeight() const {
-    return 16384;
-}
-
-template <typename Family>
-uint64_t GfxCoreHelperHw<Family>::getMaxMemAllocSize() const {
-    // With stateful messages we have an allocation cap of 4GB
-    // Reason to subtract 8KB is that driver may pad the buffer with addition pages for over fetching
-    return (4ULL * MemoryConstants::gigaByte) - (8ULL * MemoryConstants::kiloByte);
-}
-
-template <typename Family>
-bool GfxCoreHelperHw<Family>::isStatelessToStatefulWithOffsetSupported() const {
-    return true;
-}
-
-template <typename Family>
-SipKernelType GfxCoreHelperHw<Family>::getSipKernelType(bool debuggingActive) const {
-    if (!debuggingActive) {
-        return SipKernelType::Csr;
-    }
-    return DebugManager.flags.UseBindlessDebugSip.get() ? SipKernelType::DbgBindless : SipKernelType::DbgCsr;
-}
-
-template <typename Family>
-size_t GfxCoreHelperHw<Family>::getMaxBarrierRegisterPerSlice() const {
-    return 32;
+    return size > MemoryConstants::kiloByte;
 }
 
 template <typename Family>
@@ -72,14 +53,26 @@ uint32_t GfxCoreHelperHw<Family>::getPitchAlignmentForImage(const RootDeviceEnvi
     return 4u;
 }
 
-template <typename Family>
-const AubMemDump::LrcaHelper &GfxCoreHelperHw<Family>::getCsTraits(aub_stream::EngineType engineType) const {
-    return *AUBFamilyMapper<Family>::csTraits[engineType];
-}
-
 template <typename GfxFamily>
 inline bool GfxCoreHelperHw<GfxFamily>::checkResourceCompatibility(GraphicsAllocation &graphicsAllocation) const {
     return true;
+}
+
+template <typename Family>
+size_t GfxCoreHelperHw<Family>::getRenderSurfaceStateSize(const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    using RENDER_SURFACE_STATE = typename Family::RENDER_SURFACE_STATE;
+    return sizeof(RENDER_SURFACE_STATE);
+}
+
+template <typename Family>
+bool GfxCoreHelperHw<Family>::isReducedSurfaceStateInUse(const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    using RENDER_SURFACE_STATE = typename Family::RENDER_SURFACE_STATE;
+    return getRenderSurfaceStateSize(rootDeviceEnvironment) < sizeof(RENDER_SURFACE_STATE);
+}
+
+template <typename Family>
+size_t GfxCoreHelperHw<Family>::getScratchSurfaceStateSize(const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    return getRenderSurfaceStateSize(rootDeviceEnvironment);
 }
 
 template <typename Family>
@@ -94,6 +87,22 @@ void GfxCoreHelperHw<Family>::setRenderSurfaceStateForScratchResource(const Root
                                                                       uint32_t surfaceType,
                                                                       bool forceNonAuxMode,
                                                                       bool useL1Cache) const {
+    programScratchSurfaceState(rootDeviceEnvironment, surfaceStateBuffer, bufferSize, gpuVa, offset, pitch,
+                               gfxAlloc, isReadOnly, surfaceType, forceNonAuxMode, useL1Cache);
+}
+
+template <typename Family>
+void GfxCoreHelperHw<Family>::programScratchSurfaceState(const RootDeviceEnvironment &rootDeviceEnvironment,
+                                                         void *surfaceStateBuffer,
+                                                         size_t bufferSize,
+                                                         uint64_t gpuVa,
+                                                         size_t offset,
+                                                         uint32_t pitch,
+                                                         GraphicsAllocation *gfxAlloc,
+                                                         bool isReadOnly,
+                                                         uint32_t surfaceType,
+                                                         bool forceNonAuxMode,
+                                                         bool useL1Cache) const {
     using RENDER_SURFACE_STATE = typename Family::RENDER_SURFACE_STATE;
     using SURFACE_FORMAT = typename RENDER_SURFACE_STATE::SURFACE_FORMAT;
     using AUXILIARY_SURFACE_MODE = typename RENDER_SURFACE_STATE::AUXILIARY_SURFACE_MODE;
@@ -103,14 +112,14 @@ void GfxCoreHelperHw<Family>::setRenderSurfaceStateForScratchResource(const Root
     RENDER_SURFACE_STATE state = Family::cmdInitRenderSurfaceState;
     auto surfaceSize = alignUp(bufferSize, 4);
 
-    SURFACE_STATE_BUFFER_LENGTH length = {0};
+    SurfaceStateBufferLength length = {0};
     length.length = static_cast<uint32_t>(surfaceSize - 1);
 
     state.setWidth(length.surfaceState.width + 1);
     state.setHeight(length.surfaceState.height + 1);
     state.setDepth(length.surfaceState.depth + 1);
     if (pitch) {
-        state.setSurfacePitch(pitch);
+        EncodeSurfaceState<Family>::setPitchForScratch(&state, pitch, rootDeviceEnvironment.getProductHelper());
     }
 
     // The graphics allocation for Host Ptr surface will be created in makeResident call and GPU address is expected to be the same as CPU address
@@ -130,12 +139,12 @@ void GfxCoreHelperHw<Family>::setRenderSurfaceStateForScratchResource(const Root
     state.setVerticalLineStrideOffset(0);
     if ((isAligned<MemoryConstants::cacheLineSize>(bufferStateAddress) && isAligned<MemoryConstants::cacheLineSize>(bufferStateSize)) ||
         isReadOnly) {
-        state.setMemoryObjectControlState(gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER));
+        state.setMemoryObjectControlState(gmmHelper->getL3EnabledMOCS());
     } else {
-        state.setMemoryObjectControlState(gmmHelper->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED));
+        state.setMemoryObjectControlState(gmmHelper->getUncachedMOCS());
     }
-    if (DebugManager.flags.OverrideMocsIndexForScratchSpace.get() != -1) {
-        auto mocsIndex = static_cast<uint32_t>(DebugManager.flags.OverrideMocsIndexForScratchSpace.get()) << 1;
+    if (debugManager.flags.OverrideMocsIndexForScratchSpace.get() != -1) {
+        auto mocsIndex = static_cast<uint32_t>(debugManager.flags.OverrideMocsIndexForScratchSpace.get()) << 1;
         state.setMemoryObjectControlState(mocsIndex);
     }
 
@@ -159,17 +168,6 @@ template <typename GfxFamily>
 void NEO::GfxCoreHelperHw<GfxFamily>::setL1CachePolicy(bool useL1Cache, typename GfxFamily::RENDER_SURFACE_STATE *surfaceState, const HardwareInfo *hwInfo) const {}
 
 template <typename Family>
-bool GfxCoreHelperHw<Family>::getEnableLocalMemory(const HardwareInfo &hwInfo) const {
-    if (DebugManager.flags.EnableLocalMemory.get() != -1) {
-        return DebugManager.flags.EnableLocalMemory.get();
-    } else if (DebugManager.flags.AUBDumpForceAllToLocalMemory.get()) {
-        return true;
-    }
-
-    return OSInterface::osEnableLocalMemory && isLocalMemoryEnabled(hwInfo);
-}
-
-template <typename Family>
 bool GfxCoreHelperHw<Family>::is1MbAlignmentSupported(const HardwareInfo &hwInfo, bool isCompressionEnabled) const {
     return false;
 }
@@ -177,13 +175,13 @@ bool GfxCoreHelperHw<Family>::is1MbAlignmentSupported(const HardwareInfo &hwInfo
 template <typename Family>
 AuxTranslationMode GfxCoreHelperHw<Family>::getAuxTranslationMode(const HardwareInfo &hwInfo) {
     auto mode = GfxCoreHelperHw<Family>::defaultAuxTranslationMode;
-    if (DebugManager.flags.ForceAuxTranslationMode.get() != -1) {
-        mode = static_cast<AuxTranslationMode>(DebugManager.flags.ForceAuxTranslationMode.get());
+    if (debugManager.flags.ForceAuxTranslationMode.get() != -1) {
+        mode = static_cast<AuxTranslationMode>(debugManager.flags.ForceAuxTranslationMode.get());
     }
 
-    if (mode == AuxTranslationMode::Blit && !hwInfo.capabilityTable.blitterOperationsSupported) {
+    if (mode == AuxTranslationMode::blit && !hwInfo.capabilityTable.blitterOperationsSupported) {
         DEBUG_BREAK_IF(true);
-        mode = AuxTranslationMode::Builtin;
+        mode = AuxTranslationMode::builtin;
     }
 
     return mode;
@@ -192,9 +190,7 @@ AuxTranslationMode GfxCoreHelperHw<Family>::getAuxTranslationMode(const Hardware
 template <typename GfxFamily>
 void MemorySynchronizationCommands<GfxFamily>::addBarrierWithPostSyncOperation(LinearStream &commandStream, PostSyncMode postSyncMode, uint64_t gpuAddress, uint64_t immediateData,
                                                                                const RootDeviceEnvironment &rootDeviceEnvironment, PipeControlArgs &args) {
-
-    void *commandBuffer = commandStream.getSpace(MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWithPostSyncOperation(rootDeviceEnvironment, args.tlbInvalidation));
-
+    void *commandBuffer = commandStream.getSpace(MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWithPostSyncOperation(rootDeviceEnvironment, postSyncMode));
     MemorySynchronizationCommands<GfxFamily>::setBarrierWithPostSyncOperation(commandBuffer, postSyncMode, gpuAddress, immediateData, rootDeviceEnvironment, args);
 }
 
@@ -207,45 +203,101 @@ void MemorySynchronizationCommands<GfxFamily>::setBarrierWithPostSyncOperation(
     const RootDeviceEnvironment &rootDeviceEnvironment,
     PipeControlArgs &args) {
 
-    MemorySynchronizationCommands<GfxFamily>::setBarrierWa(commandsBuffer, gpuAddress, rootDeviceEnvironment);
+    MemorySynchronizationCommands<GfxFamily>::setBarrierWa(commandsBuffer, gpuAddress, rootDeviceEnvironment, postSyncMode);
 
-    auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
-    setPostSyncExtraProperties(args, hwInfo);
+    if (!args.blockSettingPostSyncProperties) {
+        setPostSyncExtraProperties(args);
+    }
     MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(commandsBuffer, postSyncMode, gpuAddress, immediateData, args);
-    commandsBuffer = ptrOffset(commandsBuffer, getSizeForSingleBarrier(args.tlbInvalidation));
+    commandsBuffer = ptrOffset(commandsBuffer, getSizeForSingleBarrier());
 
-    MemorySynchronizationCommands<GfxFamily>::setAdditionalSynchronization(commandsBuffer, gpuAddress, false, rootDeviceEnvironment);
+    if (postSyncMode != PostSyncMode::noWrite) {
+        MemorySynchronizationCommands<GfxFamily>::setAdditionalSynchronization(commandsBuffer, gpuAddress, NEO::FenceType::release, rootDeviceEnvironment);
+    }
 }
 
 template <typename GfxFamily>
 void MemorySynchronizationCommands<GfxFamily>::addSingleBarrier(LinearStream &commandStream, PipeControlArgs &args) {
-    addSingleBarrier(commandStream, PostSyncMode::NoWrite, 0, 0, args);
+    addSingleBarrier(commandStream, PostSyncMode::noWrite, 0, 0, args);
 }
 
 template <typename GfxFamily>
 void MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(void *commandsBuffer, PipeControlArgs &args) {
-    setSingleBarrier(commandsBuffer, PostSyncMode::NoWrite, 0, 0, args);
+    setSingleBarrier(commandsBuffer, PostSyncMode::noWrite, 0, 0, args);
 }
 
 template <typename GfxFamily>
 void MemorySynchronizationCommands<GfxFamily>::addSingleBarrier(LinearStream &commandStream, PostSyncMode postSyncMode, uint64_t gpuAddress, uint64_t immediateData, PipeControlArgs &args) {
-    auto barrier = commandStream.getSpace(MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier(args.tlbInvalidation));
+    auto barrierSize = MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier();
+    if (args.csStallOnly) {
+        barrierSize = MemorySynchronizationCommands<GfxFamily>::getSizeForStallingBarrier();
+    }
+    auto barrier = commandStream.getSpace(barrierSize);
 
     setSingleBarrier(barrier, postSyncMode, gpuAddress, immediateData, args);
+}
+
+template <class GfxFamily>
+void setStallingBarrier(void *commandsBuffer, PipeControlArgs &args) {
+    using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
+
+    PIPE_CONTROL pipeControl = GfxFamily::cmdInitPipeControl;
+
+    pipeControl.setCommandStreamerStallEnable(true);
+    MemorySynchronizationCommands<GfxFamily>::setPipeControlExtraProperties(pipeControl, args);
+    *reinterpret_cast<PIPE_CONTROL *>(commandsBuffer) = pipeControl;
+}
+
+template <class GfxFamily>
+typename GfxFamily::RESOURCE_BARRIER::SIGNAL_STAGE getStallingBarrierSignalStage()
+    requires(UsesResourceBarrier<GfxFamily>)
+{
+    using RESOURCE_BARRIER = typename GfxFamily::RESOURCE_BARRIER;
+
+    return RESOURCE_BARRIER::SIGNAL_STAGE::SIGNAL_STAGE_GPGPU;
+}
+
+template <class GfxFamily>
+void setStallingBarrier(void *commandsBuffer, PipeControlArgs &args)
+    requires(UsesResourceBarrier<GfxFamily>)
+{
+    using RESOURCE_BARRIER = typename GfxFamily::RESOURCE_BARRIER;
+
+    auto resourceBarrier = GfxFamily::cmdInitResourceBarrier;
+    resourceBarrier.setBarrierType(RESOURCE_BARRIER::BARRIER_TYPE::BARRIER_TYPE_IMMEDIATE);
+    resourceBarrier.setWaitStage(RESOURCE_BARRIER::WAIT_STAGE::WAIT_STAGE_TOP);
+    resourceBarrier.setSignalStage(getStallingBarrierSignalStage<GfxFamily>());
+    auto invalidateL1Cache = args.isL1InvalidateRequired;
+    auto flushL1Cache = args.isL1FlushRequired;
+    auto l1FlushMode = debugManager.flags.ResourceBarrierL1FlushMode.get();
+    if (l1FlushMode != -1) {
+        invalidateL1Cache = (l1FlushMode & 0x1) == 0x1;
+        flushL1Cache = (l1FlushMode & 0x2) == 0x2;
+    }
+    resourceBarrier.setL1DataportCacheInvalidate(invalidateL1Cache);
+    resourceBarrier.setL1DataportUavFlush(flushL1Cache);
+    EncodeCommandLevelMocs<GfxFamily>::apply(resourceBarrier);
+    if constexpr (requires { resourceBarrier.setQueueDrainMode(false); }) {
+        if (debugManager.flags.PcQueueDrainMode.get() != -1) {
+            resourceBarrier.setQueueDrainMode(!!debugManager.flags.PcQueueDrainMode.get());
+        }
+    }
+    *reinterpret_cast<RESOURCE_BARRIER *>(commandsBuffer) = resourceBarrier;
 }
 
 template <typename GfxFamily>
 void MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(void *commandsBuffer, PostSyncMode postSyncMode, uint64_t gpuAddress, uint64_t immediateData, PipeControlArgs &args) {
     using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
 
-    PIPE_CONTROL pipeControl = GfxFamily::cmdInitPipeControl;
-
-    pipeControl.setCommandStreamerStallEnable(true);
-
     if (args.csStallOnly) {
-        *reinterpret_cast<PIPE_CONTROL *>(commandsBuffer) = pipeControl;
+        setStallingBarrier<GfxFamily>(commandsBuffer, args);
         return;
     }
+
+    PIPE_CONTROL pipeControl = GfxFamily::cmdInitPipeControl;
+
+    pipeControl.setCommandStreamerStallEnable(!args.disableCsStall);
+    setPipeControlExtraProperties(pipeControl, args);
 
     pipeControl.setConstantCacheInvalidationEnable(args.constantCacheInvalidationEnable);
     pipeControl.setInstructionCacheInvalidateEnable(args.instructionCacheInvalidateEnable);
@@ -260,24 +312,43 @@ void MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(void *commandsBu
     pipeControl.setDepthCacheFlushEnable(args.depthCacheFlushEnable);
     pipeControl.setDepthStallEnable(args.depthStallEnable);
     pipeControl.setProtectedMemoryDisable(args.protectedMemoryDisable);
+    pipeControl.setCommandCacheInvalidateEnable(args.commandCacheInvalidateEnable);
 
     if constexpr (GfxFamily::isUsingGenericMediaStateClear) {
         pipeControl.setGenericMediaStateClear(args.genericMediaStateClear);
     }
-    setBarrierExtraProperties(&pipeControl, args);
 
-    if (DebugManager.flags.FlushAllCaches.get()) {
-        pipeControl.setDcFlushEnable(true);
-        pipeControl.setRenderTargetCacheFlushEnable(true);
-        pipeControl.setInstructionCacheInvalidateEnable(true);
-        pipeControl.setTextureCacheInvalidationEnable(true);
-        pipeControl.setPipeControlFlushEnable(true);
-        pipeControl.setVfCacheInvalidationEnable(true);
-        pipeControl.setConstantCacheInvalidationEnable(true);
-        pipeControl.setStateCacheInvalidationEnable(true);
-        pipeControl.setTlbInvalidate(true);
+    auto flushCachesMask = debugManager.flags.FlushAllCaches.get();
+    if (flushCachesMask) {
+        if (flushCachesMask & FlushCachesBitmask::dcFlush) {
+            pipeControl.setDcFlushEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::renderTargetCache) {
+            pipeControl.setRenderTargetCacheFlushEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::instructionCache) {
+            pipeControl.setInstructionCacheInvalidateEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::textureCache) {
+            pipeControl.setTextureCacheInvalidationEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::pipeControl) {
+            pipeControl.setPipeControlFlushEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::vfCache) {
+            pipeControl.setVfCacheInvalidationEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::constantCache) {
+            pipeControl.setConstantCacheInvalidationEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::stateCache) {
+            pipeControl.setStateCacheInvalidationEnable(true);
+        }
+        if (flushCachesMask & FlushCachesBitmask::tlb) {
+            pipeControl.setTlbInvalidate(true);
+        }
     }
-    if (DebugManager.flags.DoNotFlushCaches.get()) {
+    if (debugManager.flags.DoNotFlushCaches.get()) {
         pipeControl.setDcFlushEnable(false);
         pipeControl.setRenderTargetCacheFlushEnable(false);
         pipeControl.setInstructionCacheInvalidateEnable(false);
@@ -288,14 +359,15 @@ void MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(void *commandsBu
         pipeControl.setStateCacheInvalidationEnable(false);
     }
 
-    if (postSyncMode != PostSyncMode::NoWrite) {
+    if (postSyncMode != PostSyncMode::noWrite) {
+        args.postSyncCmd = commandsBuffer;
         pipeControl.setAddress(static_cast<uint32_t>(gpuAddress & 0x0000FFFFFFFFULL));
         pipeControl.setAddressHigh(static_cast<uint32_t>(gpuAddress >> 32));
     }
 
-    if (postSyncMode == PostSyncMode::Timestamp) {
+    if (postSyncMode == PostSyncMode::timestamp) {
         pipeControl.setPostSyncOperation(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_TIMESTAMP);
-    } else if (postSyncMode == PostSyncMode::ImmediateData) {
+    } else if (postSyncMode == PostSyncMode::immediateData) {
         pipeControl.setPostSyncOperation(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA);
         pipeControl.setImmediateData(immediateData);
     }
@@ -304,36 +376,36 @@ void MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(void *commandsBu
 }
 
 template <typename GfxFamily>
-void MemorySynchronizationCommands<GfxFamily>::addBarrierWa(LinearStream &commandStream, uint64_t gpuAddress, const RootDeviceEnvironment &rootDeviceEnvironment) {
-    size_t requiredSize = MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWa(rootDeviceEnvironment);
-    void *commandBuffer = commandStream.getSpace(requiredSize);
-    setBarrierWa(commandBuffer, gpuAddress, rootDeviceEnvironment);
-}
-
-template <typename GfxFamily>
-void MemorySynchronizationCommands<GfxFamily>::setBarrierWa(void *&commandsBuffer, uint64_t gpuAddress, const RootDeviceEnvironment &rootDeviceEnvironment) {
+void MemorySynchronizationCommands<GfxFamily>::setBarrierWa(void *&commandsBuffer, uint64_t gpuAddress, const RootDeviceEnvironment &rootDeviceEnvironment, NEO::PostSyncMode postSyncMode) {
     using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
 
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
     if (MemorySynchronizationCommands<GfxFamily>::isBarrierWaRequired(rootDeviceEnvironment)) {
         PIPE_CONTROL cmd = GfxFamily::cmdInitPipeControl;
         MemorySynchronizationCommands<GfxFamily>::setBarrierWaFlags(&cmd);
         *reinterpret_cast<PIPE_CONTROL *>(commandsBuffer) = cmd;
         commandsBuffer = ptrOffset(commandsBuffer, sizeof(PIPE_CONTROL));
 
-        MemorySynchronizationCommands<GfxFamily>::setAdditionalSynchronization(commandsBuffer, gpuAddress, false, rootDeviceEnvironment);
+        MemorySynchronizationCommands<GfxFamily>::setAdditionalSynchronization(commandsBuffer, gpuAddress, NEO::FenceType::release, rootDeviceEnvironment);
+    } else if (postSyncMode == PostSyncMode::timestamp && hwInfo.caps.programAdditionalStallPriorToBarrierWithTimestamp) {
+        PipeControlArgs additionalArgs = {};
+        additionalArgs.csStallOnly = true;
+
+        MemorySynchronizationCommands<GfxFamily>::setSingleBarrier(commandsBuffer, additionalArgs);
+        commandsBuffer = ptrOffset(commandsBuffer, getSizeForStallingBarrier());
     }
 }
 
 template <typename GfxFamily>
-void MemorySynchronizationCommands<GfxFamily>::addAdditionalSynchronization(LinearStream &commandStream, uint64_t gpuAddress, bool acquire, const RootDeviceEnvironment &rootDeviceEnvironment) {
-    size_t requiredSize = MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronization(rootDeviceEnvironment);
+void MemorySynchronizationCommands<GfxFamily>::addAdditionalSynchronization(LinearStream &commandStream, uint64_t gpuAddress, NEO::FenceType fenceType, const RootDeviceEnvironment &rootDeviceEnvironment) {
+    size_t requiredSize = MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronization(fenceType, rootDeviceEnvironment);
     void *commandBuffer = commandStream.getSpace(requiredSize);
-    setAdditionalSynchronization(commandBuffer, gpuAddress, acquire, rootDeviceEnvironment);
+    setAdditionalSynchronization(commandBuffer, gpuAddress, fenceType, rootDeviceEnvironment);
 }
 
 template <typename GfxFamily>
-void MemorySynchronizationCommands<GfxFamily>::addAdditionalSynchronizationForDirectSubmission(LinearStream &commandStream, uint64_t gpuAddress, bool acquire, const RootDeviceEnvironment &rootDeviceEnvironment) {
-    MemorySynchronizationCommands<GfxFamily>::addAdditionalSynchronization(commandStream, gpuAddress, acquire, rootDeviceEnvironment);
+void MemorySynchronizationCommands<GfxFamily>::addAdditionalSynchronizationForDirectSubmission(LinearStream &commandStream, uint64_t gpuAddress, NEO::FenceType fenceType, const RootDeviceEnvironment &rootDeviceEnvironment) {
+    MemorySynchronizationCommands<GfxFamily>::addAdditionalSynchronization(commandStream, gpuAddress, fenceType, rootDeviceEnvironment);
 }
 
 template <typename GfxFamily>
@@ -346,45 +418,50 @@ bool MemorySynchronizationCommands<GfxFamily>::getDcFlushEnable(bool isFlushPref
 }
 
 template <typename GfxFamily>
-size_t MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier(bool tlbInvalidationRequired) {
+size_t MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier() {
     return sizeof(typename GfxFamily::PIPE_CONTROL);
 }
 
 template <typename GfxFamily>
-size_t MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWithPostSyncOperation(const RootDeviceEnvironment &rootDeviceEnvironment, bool tlbInvalidationRequired) {
+size_t MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWithPostSyncOperation(const RootDeviceEnvironment &rootDeviceEnvironment, NEO::PostSyncMode postSyncMode) {
 
-    size_t size = getSizeForSingleBarrier(tlbInvalidationRequired) +
-                  getSizeForBarrierWa(rootDeviceEnvironment) +
-                  getSizeForSingleAdditionalSynchronization(rootDeviceEnvironment);
-    return size;
-}
-
-template <typename GfxFamily>
-size_t MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWa(const RootDeviceEnvironment &rootDeviceEnvironment) {
-    size_t size = 0;
-    if (MemorySynchronizationCommands<GfxFamily>::isBarrierWaRequired(rootDeviceEnvironment)) {
-        size = getSizeForSingleBarrier(false) +
-               getSizeForSingleAdditionalSynchronization(rootDeviceEnvironment);
+    size_t size = getSizeForSingleBarrier();
+    size += getSizeForBarrierWa(rootDeviceEnvironment, postSyncMode);
+    if (postSyncMode != PostSyncMode::noWrite) {
+        size += getSizeForSingleAdditionalSynchronization(NEO::FenceType::release, rootDeviceEnvironment);
     }
     return size;
 }
 
 template <typename GfxFamily>
-void MemorySynchronizationCommands<GfxFamily>::setAdditionalSynchronization(void *&commandsBuffer, uint64_t gpuAddress, bool acquire, const RootDeviceEnvironment &rootDeviceEnvironment) {
+size_t MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWa(const RootDeviceEnvironment &rootDeviceEnvironment, NEO::PostSyncMode postSyncMode) {
+    size_t size = 0;
+    const auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
+    if (MemorySynchronizationCommands<GfxFamily>::isBarrierWaRequired(rootDeviceEnvironment)) {
+        size = getSizeForSingleBarrier() +
+               getSizeForSingleAdditionalSynchronization(NEO::FenceType::release, rootDeviceEnvironment);
+    } else if (postSyncMode == PostSyncMode::timestamp && hwInfo.caps.programAdditionalStallPriorToBarrierWithTimestamp) {
+        size = getSizeForStallingBarrier();
+    }
+    return size;
 }
 
 template <typename GfxFamily>
-inline size_t MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronization(const RootDeviceEnvironment &rootDeviceEnvironment) {
+void MemorySynchronizationCommands<GfxFamily>::setAdditionalSynchronization(void *&commandsBuffer, uint64_t gpuAddress, NEO::FenceType fenceType, const RootDeviceEnvironment &rootDeviceEnvironment) {
+}
+
+template <typename GfxFamily>
+inline size_t MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronization(NEO::FenceType fenceType, const RootDeviceEnvironment &rootDeviceEnvironment) {
     return 0u;
 }
 
 template <typename GfxFamily>
 inline size_t MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronizationForDirectSubmission(const RootDeviceEnvironment &rootDeviceEnvironment) {
-    return MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronization(rootDeviceEnvironment);
+    return MemorySynchronizationCommands<GfxFamily>::getSizeForSingleAdditionalSynchronization(NEO::FenceType::acquire, rootDeviceEnvironment);
 }
 
 template <typename GfxFamily>
-inline size_t MemorySynchronizationCommands<GfxFamily>::getSizeForAdditonalSynchronization(const RootDeviceEnvironment &rootDeviceEnvironment) {
+inline size_t MemorySynchronizationCommands<GfxFamily>::getSizeForAdditionalSynchronization(NEO::FenceType fenceType, const RootDeviceEnvironment &rootDeviceEnvironment) {
     return 0u;
 }
 
@@ -394,38 +471,12 @@ uint32_t GfxCoreHelperHw<GfxFamily>::getMetricsLibraryGenId() const {
 }
 
 template <typename GfxFamily>
-uint32_t GfxCoreHelperHw<GfxFamily>::alignSlmSize(uint32_t slmSize) const {
-    if (slmSize == 0u) {
-        return 0u;
-    }
-    slmSize = std::max(slmSize, 1024u);
-    slmSize = Math::nextPowerOfTwo(slmSize);
-    UNRECOVERABLE_IF(slmSize > 64u * KB);
-    return slmSize;
-}
-
-template <typename GfxFamily>
-uint32_t GfxCoreHelperHw<GfxFamily>::computeSlmValues(const HardwareInfo &hwInfo, uint32_t slmSize) const {
-    auto value = std::max(slmSize, 1024u);
-    value = Math::nextPowerOfTwo(value);
-    value = Math::getMinLsbSet(value);
-    value = value - 9;
-    DEBUG_BREAK_IF(value > 7);
-    return value * !!slmSize;
-}
-
-template <typename GfxFamily>
-uint8_t GfxCoreHelperHw<GfxFamily>::getBarriersCountFromHasBarriers(uint8_t hasBarriers) const {
-    return hasBarriers;
+uint32_t GfxCoreHelperHw<GfxFamily>::alignSlmSizePerThreadGroup(uint32_t slmSize, const ReleaseHelper &releaseHelper) const {
+    return EncodeDispatchKernel<GfxFamily>::alignSlmSizePerThreadGroup(slmSize, releaseHelper);
 }
 
 template <typename GfxFamily>
 inline bool GfxCoreHelperHw<GfxFamily>::isOffsetToSkipSetFFIDGPWARequired(const HardwareInfo &hwInfo, const ProductHelper &productHelper) const {
-    return false;
-}
-
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::isForceDefaultRCSEngineWARequired(const HardwareInfo &hwInfo) {
     return false;
 }
 
@@ -435,34 +486,32 @@ bool GfxCoreHelperHw<GfxFamily>::isWaDisableRccRhwoOptimizationRequired() const 
 }
 
 template <typename GfxFamily>
-inline uint32_t GfxCoreHelperHw<GfxFamily>::getMinimalSIMDSize() const {
-    return 8u;
-}
-
-template <typename GfxFamily>
 std::unique_ptr<TagAllocatorBase> GfxCoreHelperHw<GfxFamily>::createTimestampPacketAllocator(const RootDeviceIndicesContainer &rootDeviceIndices, MemoryManager *memoryManager,
-                                                                                             size_t initialTagCount, CommandStreamReceiverType csrType, DeviceBitfield deviceBitfield) const {
-    bool doNotReleaseNodes = (csrType > CommandStreamReceiverType::CSR_HW) ||
-                             DebugManager.flags.DisableTimestampPacketOptimizations.get();
+                                                                                             uint32_t initialTagCount, CommandStreamReceiverType csrType, DeviceBitfield deviceBitfield) const {
+    bool doNotReleaseNodes = (csrType > CommandStreamReceiverType::hardware) ||
+                             debugManager.flags.DisableTimestampPacketOptimizations.get();
 
     auto tagAlignment = getTimestampPacketAllocatorAlignment();
 
-    if (DebugManager.flags.OverrideTimestampPacketSize.get() != -1) {
-        if (DebugManager.flags.OverrideTimestampPacketSize.get() == 4) {
-            using TimestampPackets32T = TimestampPackets<uint32_t>;
-            return std::make_unique<TagAllocator<TimestampPackets32T>>(rootDeviceIndices, memoryManager, initialTagCount, tagAlignment, sizeof(TimestampPackets32T), doNotReleaseNodes, deviceBitfield);
-        } else if (DebugManager.flags.OverrideTimestampPacketSize.get() == 8) {
-            using TimestampPackets64T = TimestampPackets<uint64_t>;
-            return std::make_unique<TagAllocator<TimestampPackets64T>>(rootDeviceIndices, memoryManager, initialTagCount, tagAlignment, sizeof(TimestampPackets64T), doNotReleaseNodes, deviceBitfield);
+    if (debugManager.flags.OverrideTimestampPacketSize.get() != -1) {
+        if (debugManager.flags.OverrideTimestampPacketSize.get() == 4) {
+            using TimestampPackets32T = TimestampPackets<uint32_t, GfxFamily::timestampPacketCount>;
+            return std::make_unique<TagAllocator<TimestampPackets32T>>(rootDeviceIndices, memoryManager, initialTagCount, tagAlignment, sizeof(TimestampPackets32T), NEO::TimestampPacketConstants::initValue,
+                                                                       doNotReleaseNodes, true, deviceBitfield);
+        } else if (debugManager.flags.OverrideTimestampPacketSize.get() == 8) {
+            using TimestampPackets64T = TimestampPackets<uint64_t, GfxFamily::timestampPacketCount>;
+            return std::make_unique<TagAllocator<TimestampPackets64T>>(rootDeviceIndices, memoryManager, initialTagCount, tagAlignment, sizeof(TimestampPackets64T), NEO::TimestampPacketConstants::initValue,
+                                                                       doNotReleaseNodes, true, deviceBitfield);
         } else {
             UNRECOVERABLE_IF(true);
         }
     }
 
     using TimestampPacketType = typename GfxFamily::TimestampPacketType;
-    using TimestampPacketsT = TimestampPackets<TimestampPacketType>;
+    using TimestampPacketsT = TimestampPackets<TimestampPacketType, GfxFamily::timestampPacketCount>;
 
-    return std::make_unique<TagAllocator<TimestampPacketsT>>(rootDeviceIndices, memoryManager, initialTagCount, tagAlignment, sizeof(TimestampPacketsT), doNotReleaseNodes, deviceBitfield);
+    return std::make_unique<TagAllocator<TimestampPacketsT>>(rootDeviceIndices, memoryManager, initialTagCount, tagAlignment, sizeof(TimestampPacketsT), NEO::TimestampPacketConstants::initValue,
+                                                             doNotReleaseNodes, true, deviceBitfield);
 }
 
 template <typename GfxFamily>
@@ -477,36 +526,43 @@ size_t GfxCoreHelperHw<GfxFamily>::getSingleTimestampPacketSize() const {
 
 template <typename GfxFamily>
 size_t GfxCoreHelperHw<GfxFamily>::getSingleTimestampPacketSizeHw() {
-    if (DebugManager.flags.OverrideTimestampPacketSize.get() != -1) {
-        if (DebugManager.flags.OverrideTimestampPacketSize.get() == 4) {
-            return TimestampPackets<uint32_t>::getSinglePacketSize();
-        } else if (DebugManager.flags.OverrideTimestampPacketSize.get() == 8) {
-            return TimestampPackets<uint64_t>::getSinglePacketSize();
+    if (debugManager.flags.OverrideTimestampPacketSize.get() != -1) {
+        if (debugManager.flags.OverrideTimestampPacketSize.get() == 4) {
+            return TimestampPackets<uint32_t, GfxFamily::timestampPacketCount>::getSinglePacketSize();
+        } else if (debugManager.flags.OverrideTimestampPacketSize.get() == 8) {
+            return TimestampPackets<uint64_t, GfxFamily::timestampPacketCount>::getSinglePacketSize();
         } else {
             UNRECOVERABLE_IF(true);
         }
     }
 
-    return TimestampPackets<typename GfxFamily::TimestampPacketType>::getSinglePacketSize();
+    return TimestampPackets<typename GfxFamily::TimestampPacketType, GfxFamily::timestampPacketCount>::getSinglePacketSize();
 }
 
 template <typename GfxFamily>
-size_t MemorySynchronizationCommands<GfxFamily>::getSizeForFullCacheFlush() {
-    return MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier(true);
+void MemorySynchronizationCommands<GfxFamily>::addStateCacheFlush(LinearStream &commandStream, const RootDeviceEnvironment &rootDeviceEnvironment) {
+    using PIPE_CONTROL = typename GfxFamily::PIPE_CONTROL;
+
+    PIPE_CONTROL cmd = GfxFamily::cmdInitPipeControl;
+    cmd.setCommandStreamerStallEnable(true);
+    cmd.setRenderTargetCacheFlushEnable(true);
+    cmd.setStateCacheInvalidationEnable(true);
+    cmd.setTextureCacheInvalidationEnable(true);
+
+    auto commandsBuffer = commandStream.getSpace(sizeof(PIPE_CONTROL));
+    *reinterpret_cast<PIPE_CONTROL *>(commandsBuffer) = cmd;
 }
 
 template <typename GfxFamily>
-void MemorySynchronizationCommands<GfxFamily>::addFullCacheFlush(LinearStream &commandStream, const RootDeviceEnvironment &rootDeviceEnvironment) {
+size_t MemorySynchronizationCommands<GfxFamily>::getSizeForInstructionCacheFlush() {
+    return MemorySynchronizationCommands<GfxFamily>::getSizeForSingleBarrier();
+}
+
+template <typename GfxFamily>
+void MemorySynchronizationCommands<GfxFamily>::addInstructionCacheFlush(LinearStream &commandStream) {
     PipeControlArgs args;
-    args.dcFlushEnable = MemorySynchronizationCommands<GfxFamily>::getDcFlushEnable(true, rootDeviceEnvironment);
-    args.renderTargetCacheFlushEnable = true;
     args.instructionCacheInvalidateEnable = true;
-    args.textureCacheInvalidationEnable = true;
-    args.pipeControlFlushEnable = true;
-    args.constantCacheInvalidationEnable = true;
-    args.stateCacheInvalidationEnable = true;
-    args.tlbInvalidation = true;
-    MemorySynchronizationCommands<GfxFamily>::setCacheFlushExtraProperties(args);
+
     MemorySynchronizationCommands<GfxFamily>::addSingleBarrier(commandStream, args);
 }
 
@@ -516,51 +572,18 @@ const StackVec<size_t, 3> GfxCoreHelperHw<GfxFamily>::getDeviceSubGroupSizes() c
 }
 
 template <typename GfxFamily>
-const StackVec<uint32_t, 6> GfxCoreHelperHw<GfxFamily>::getThreadsPerEUConfigs() const {
-    return {};
-}
-
-template <typename GfxFamily>
-void GfxCoreHelperHw<GfxFamily>::setExtraAllocationData(AllocationData &allocationData, const AllocationProperties &properties, const RootDeviceEnvironment &rootDeviceEnvironment) const {}
-
-template <typename GfxFamily>
 bool GfxCoreHelperHw<GfxFamily>::isBankOverrideRequired(const HardwareInfo &hwInfo, const ProductHelper &productHelper) const {
     return false;
 }
 
 template <typename GfxFamily>
-int32_t GfxCoreHelperHw<GfxFamily>::getDefaultThreadArbitrationPolicy() const {
-    return 0;
-}
-
-template <typename GfxFamily>
 bool GfxCoreHelperHw<GfxFamily>::useOnlyGlobalTimestamps() const {
-    return false;
-}
-
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::useSystemMemoryPlacementForISA(const HardwareInfo &hwInfo) const {
-    return !getEnableLocalMemory(hwInfo);
+    return debugManager.flags.ForceUseOnlyGlobalTimestamps.get();
 }
 
 template <typename GfxFamily>
 bool MemorySynchronizationCommands<GfxFamily>::isBarrierPriorToPipelineSelectWaRequired(const RootDeviceEnvironment &rootDeviceEnvironment) {
     return false;
-}
-
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::isSipWANeeded(const HardwareInfo &hwInfo) const {
-    return false;
-}
-
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::isAdditionalFeatureFlagRequired(const FeatureTable *featureTable) const {
-    return false;
-}
-
-template <typename GfxFamily>
-uint32_t GfxCoreHelperHw<GfxFamily>::getNumCacheRegions() const {
-    return 0;
 }
 
 template <typename GfxFamily>
@@ -574,42 +597,59 @@ size_t GfxCoreHelperHw<GfxFamily>::getPreemptionAllocationAlignment() const {
 }
 
 template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isMidThreadPreemptionAllocationOnDemandSupported() const {
+    return false;
+}
+
+template <typename GfxFamily>
 void GfxCoreHelperHw<GfxFamily>::applyAdditionalCompressionSettings(Gmm &gmm, bool isNotCompressed) const {}
 
 template <typename GfxFamily>
 void GfxCoreHelperHw<GfxFamily>::applyRenderCompressionFlag(Gmm &gmm, uint32_t isCompressed) const {
-    gmm.resourceParams.Flags.Info.RenderCompressed = isCompressed;
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm.resourceParamsData.data());
+    gmmResourceParams->Flags.Info.RenderCompressed = isCompressed;
 }
 
 template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::isSipKernelAsHexadecimalArrayPreferred() const {
-    return false;
+void GfxCoreHelperHw<GfxFamily>::encodeImageSurfaceState(void *outMemory, const ImageSurfaceStateInputs &inputs) const {
 }
 
 template <typename GfxFamily>
-void GfxCoreHelperHw<GfxFamily>::setSipKernelData(uint32_t *&sipKernelBinary, size_t &kernelBinarySize) const {
-}
+void GfxCoreHelperHw<GfxFamily>::applyImageSurfaceStateMipAndMediaBlock(void *outMemory,
+                                                                        const ImageInfo &imageInfo,
+                                                                        Gmm *gmm,
+                                                                        uint32_t mipLevel,
+                                                                        bool isMediaBlockImage,
+                                                                        const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
+    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(outMemory);
 
-template <typename GfxFamily>
-size_t GfxCoreHelperHw<GfxFamily>::getSipKernelMaxDbgSurfaceSize(const HardwareInfo &hwInfo) const {
-    return 24 * MB;
-}
+    if (imageInfo.mipCount > 1u) {
+        const uint32_t mipCountLod = imageInfo.mipCount - 1u;
+        const uint32_t clampedMip = std::min(mipLevel, mipCountLod);
+        surfaceState->setSurfaceMinLOD(clampedMip);
+        surfaceState->setMIPCountLOD(mipCountLod);
+        if (gmm != nullptr) {
+            ImageSurfaceStateHelper<GfxFamily>::setMipTailStartLOD(surfaceState, gmm);
+        }
+    }
 
-template <typename GfxFamily>
-void GfxCoreHelperHw<GfxFamily>::adjustPreemptionSurfaceSize(size_t &csrSize) const {
+    if (isMediaBlockImage) {
+        ImageSurfaceStateHelper<GfxFamily>::setWidthForMediaBlockSurfaceState(surfaceState, imageInfo);
+    }
 }
 
 template <typename GfxFamily>
 void GfxCoreHelperHw<GfxFamily>::encodeBufferSurfaceState(EncodeSurfaceStateArgs &args) const {
+    using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
+    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(args.outMemory);
+    if (args.inTemplateMemory != nullptr) {
+        *surfaceState = *reinterpret_cast<RENDER_SURFACE_STATE *>(args.inTemplateMemory);
+    } else {
+        *surfaceState = GfxFamily::cmdInitRenderSurfaceState;
+    }
+
     EncodeSurfaceState<GfxFamily>::encodeBuffer(args);
-}
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::isRevisionSpecificBinaryBuiltinRequired() const {
-    return false;
-}
-template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::forceNonGpuCoherencyWA(bool requiresCoherency) const {
-    return requiresCoherency;
 }
 template <typename GfxFamily>
 size_t GfxCoreHelperHw<GfxFamily>::getBatchBufferEndSize() const {
@@ -634,55 +674,259 @@ void GfxCoreHelperHw<GfxFamily>::encodeBatchBufferStart(void *cmdBuffer, uint64_
 }
 
 template <typename GfxFamily>
-bool GfxCoreHelperHw<GfxFamily>::isPlatformFlushTaskEnabled(const ProductHelper &productHelper) const {
-    return productHelper.isFlushTaskAllowed();
+bool GfxCoreHelperHw<GfxFamily>::copyThroughLockedPtrEnabled(const HardwareInfo &hwInfo, const ProductHelper &productHelper) const {
+    if (debugManager.flags.ExperimentalCopyThroughLock.get() != -1) {
+        return debugManager.flags.ExperimentalCopyThroughLock.get() == 1;
+    }
+    return false;
 }
 
 template <typename GfxFamily>
-uint64_t GfxCoreHelperHw<GfxFamily>::getPatIndex(CacheRegion cacheRegion, CachePolicy cachePolicy) const {
-    UNRECOVERABLE_IF(true);
-
-    return -1;
-}
-
-template <typename gfxProduct>
-bool GfxCoreHelperHw<gfxProduct>::copyThroughLockedPtrEnabled(const HardwareInfo &hwInfo, const ProductHelper &productHelper) const {
-    if (DebugManager.flags.ExperimentalCopyThroughLock.get() != -1) {
-        return DebugManager.flags.ExperimentalCopyThroughLock.get() == 1;
-    }
+bool GfxCoreHelperHw<GfxFamily>::isChipsetUniqueUUIDSupported() const {
     return false;
 }
 
-template <typename gfxProduct>
-uint32_t GfxCoreHelperHw<gfxProduct>::getAmountOfAllocationsToFill() const {
-    if (DebugManager.flags.SetAmountOfReusableAllocations.get() != -1) {
-        return DebugManager.flags.SetAmountOfReusableAllocations.get();
-    }
-    return 0u;
-}
-
-template <typename gfxProduct>
-bool GfxCoreHelperHw<gfxProduct>::isChipsetUniqueUUIDSupported() const {
-    return false;
-}
-
-template <typename gfxProduct>
-bool GfxCoreHelperHw<gfxProduct>::isTimestampShiftRequired() const {
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isTimestampShiftRequired() const {
     return true;
 }
 
-template <typename gfxProduct>
-bool GfxCoreHelperHw<gfxProduct>::isRelaxedOrderingSupported() const {
+template <typename GfxFamily>
+std::optional<uint32_t> GfxCoreHelperHw<GfxFamily>::getTimestampMmioOffset() const {
+    return std::nullopt;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isRelaxedOrderingSupported() const {
     return false;
 }
 
 template <typename GfxFamily>
-uint32_t GfxCoreHelperHw<GfxFamily>::adjustMaxWorkGroupSize(const uint32_t numGrf, const uint32_t simd, const uint32_t defaultMaxGroupSize) const {
+uint32_t GfxCoreHelperHw<GfxFamily>::overrideMaxWorkGroupSize(uint32_t maxWG) const {
+    return std::min(maxWG, 1024u);
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::adjustMaxWorkGroupSize(const uint32_t grfCount, const uint32_t simd, const uint32_t defaultMaxGroupSize, const RootDeviceEnvironment &rootDeviceEnvironment) const {
     return defaultMaxGroupSize;
 }
 
 template <typename GfxFamily>
-uint32_t GfxCoreHelperHw<GfxFamily>::getMinimalGrfSize() const {
-    return 128u;
+uint32_t GfxCoreHelperHw<GfxFamily>::calculateNumThreadsPerThreadGroup(uint32_t simd, uint32_t totalWorkItems, uint32_t grfCount, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    return getThreadsPerWG(simd, totalWorkItems);
 }
+
+template <typename GfxFamily>
+DeviceHierarchyMode GfxCoreHelperHw<GfxFamily>::getDefaultDeviceHierarchy() const {
+    return DeviceHierarchyMode::composite;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getContextGroupContextsCount() const {
+    if (debugManager.flags.ContextGroupSize.get() != -1) {
+        return debugManager.flags.ContextGroupSize.get();
+    }
+    return 0;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getContextGroupHpContextsCount(EngineGroupType type, bool hpEngineAvailable) const {
+    if (hpEngineAvailable) {
+        return 0;
+    }
+    return std::min(getContextGroupContextsCount() / 2, 4u);
+}
+
+template <typename GfxFamily>
+void GfxCoreHelperHw<GfxFamily>::adjustCopyEngineRegularContextCount(const size_t enginesCount, uint32_t &contextCount) const {
+}
+
+template <typename GfxFamily>
+aub_stream::EngineType GfxCoreHelperHw<GfxFamily>::getDefaultHpCopyEngine(const HardwareInfo &hwInfo) const {
+    return hpCopyEngineType;
+}
+
+template <typename GfxFamily>
+void GfxCoreHelperHw<GfxFamily>::initializeDefaultHpCopyEngine(const HardwareInfo &hwInfo) {
+    hpCopyEngineType = aub_stream::EngineType::NUM_ENGINES;
+}
+
+template <typename GfxFamily>
+void GfxCoreHelperHw<GfxFamily>::initializeFromProductHelper(const ProductHelper &productHelper, bool hwQueuesSupported) {
+    secondaryContextsEnabled = productHelper.areSecondaryContextsSupported() && hwQueuesSupported;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::is48ResourceNeededForCmdBuffer() const {
+    return true;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isStateSipRequired() const {
+    return true;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::singleTileExecImplicitScalingRequired(bool cooperativeKernel) const {
+    return EncodeDispatchKernel<GfxFamily>::singleTileExecImplicitScalingRequired(cooperativeKernel);
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::duplicatedInOrderCounterStorageEnabled() const {
+    return (debugManager.flags.InOrderDuplicatedCounterStorageEnabled.get() == 1);
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::inOrderAtomicSignallingEnabled() const {
+    return (debugManager.flags.InOrderAtomicSignallingEnabled.get() == 1);
+}
+
+template <typename GfxFamily>
+uint64_t GfxCoreHelperHw<GfxFamily>::getRenderSurfaceStateBaseAddress(void *renderSurfaceState, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
+    return reinterpret_cast<RENDER_SURFACE_STATE *>(renderSurfaceState)->getSurfaceBaseAddress();
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getRenderSurfaceStatePitch(void *renderSurfaceState, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    using RENDER_SURFACE_STATE = typename GfxFamily::RENDER_SURFACE_STATE;
+    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(renderSurfaceState);
+    return EncodeSurfaceState<GfxFamily>::getPitchForScratchInBytes(surfaceState, rootDeviceEnvironment.getHelper<ProductHelper>());
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isRuntimeLocalIdsGenerationRequired(uint32_t activeChannels,
+                                                                     const size_t *lws,
+                                                                     std::array<uint8_t, 3> &walkOrder,
+                                                                     bool requireInputWalkOrder,
+                                                                     uint32_t &requiredWalkOrder,
+                                                                     uint32_t simd) const {
+    return EncodeDispatchKernel<GfxFamily>::isRuntimeLocalIdsGenerationRequired(activeChannels,
+                                                                                lws,
+                                                                                walkOrder,
+                                                                                requireInputWalkOrder,
+                                                                                requiredWalkOrder,
+                                                                                simd);
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getDefaultSshSize(const ProductHelper &productHelper) const {
+    return static_cast<uint32_t>(HeapSize::getDefaultHeapSize(IndirectHeapType::surfaceState));
+}
+
+template <typename GfxFamily>
+void *LriHelper<GfxFamily>::program(LinearStream *cmdStream, uint32_t address, uint32_t value, bool remap, bool isBcs) {
+    auto lri = cmdStream->getSpaceForCmd<MI_LOAD_REGISTER_IMM>();
+    return LriHelper<GfxFamily>::program(lri, address, value, remap, isBcs);
+}
+
+template <typename GfxFamily>
+void MemorySynchronizationCommands<GfxFamily>::encodeAdditionalTimestampOffsets(LinearStream &commandStream, uint64_t contextAddress, uint64_t globalAddress, bool isBcs) {
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::usmCompressionSupported(const NEO::HardwareInfo &hwInfo) const {
+    return false;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::calculateAvailableThreadCount(const HardwareInfo &hwInfo, uint32_t grfCount, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    auto maxThreadsPerEuCount = 8u;
+    if (grfCount == GrfConfig::largeGrfNumber) {
+        maxThreadsPerEuCount = 4;
+    }
+    return std::min(hwInfo.gtSystemInfo.ThreadCount, maxThreadsPerEuCount * hwInfo.gtSystemInfo.EUCount);
+}
+
+template <typename GfxFamily>
+void GfxCoreHelperHw<GfxFamily>::alignThreadGroupCountToDssSize(uint32_t &threadCount, uint32_t dssCount, uint32_t threadsPerDss, uint32_t threadGroupSize) const {
+    uint32_t availableTreadCount = (threadsPerDss / threadGroupSize) * dssCount;
+    threadCount = std::min(threadCount, availableTreadCount);
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isSingleWorkGroupPerDssRequired(const KernelDescriptor &kernelDescriptor) const {
+    return false;
+}
+
+template <typename Family>
+uint32_t GfxCoreHelperHw<Family>::getInternalCopyEngineIndex(const HardwareInfo &hwInfo) const {
+    if (debugManager.flags.ForceBCSForInternalCopyEngine.get() != -1) {
+        return debugManager.flags.ForceBCSForInternalCopyEngine.get();
+    }
+
+    constexpr uint32_t defaultInternalCopyEngineIndex = 3u;
+    auto highestAvailableIndex = getMostSignificantSetBitIndex(hwInfo.featureTable.ftrBcsInfo.to_ullong());
+    return std::min(defaultInternalCopyEngineIndex, highestAvailableIndex);
+}
+
+template <typename Family>
+bool GfxCoreHelperHw<Family>::isSipExternalLibRequired() const {
+    return false;
+}
+
+template <typename GfxFamily>
+size_t MemorySynchronizationCommands<GfxFamily>::getSizeForStallingBarrier() {
+    return sizeof(typename GfxFamily::StallingBarrierType);
+}
+
+template <typename Family>
+uint32_t GfxCoreHelperHw<Family>::getQueuePriorityLevels() const {
+    return 2;
+}
+
+template <typename Family>
+uint32_t GfxCoreHelperHw<Family>::getHwQueuePriority(int32_t apiPriority) const {
+    if (apiPriority < 0) {
+        return 2;
+    } else {
+        return 0;
+    }
+}
+
+template <typename Family>
+uintptr_t GfxCoreHelperHw<Family>::getSurfaceBaseAddressAlignmentMask() const {
+    return EncodeSurfaceState<Family>::getSurfaceBaseAddressAlignmentMask();
+}
+
+template <typename Family>
+uintptr_t GfxCoreHelperHw<Family>::getSurfaceBaseAddressAlignment() const {
+    return EncodeSurfaceState<Family>::getSurfaceBaseAddressAlignment();
+}
+
+template <typename Family>
+bool GfxCoreHelperHw<Family>::isExtendedUsmPoolSizeEnabled() const {
+    return false;
+}
+
+template <typename Family>
+bool GfxCoreHelperHw<Family>::isUsmPoolManagerSupported(InternalMemoryType memoryType) const {
+    return memoryType == InternalMemoryType::hostUnifiedMemory;
+}
+
+template <typename Family>
+bool GfxCoreHelperHw<Family>::isWalkerPostSyncSkipEnabled(bool isBarrierUsedForImplicitDependency) const {
+    if (debugManager.flags.EnableWalkerPostSyncSkip.get() != -1) {
+        return debugManager.flags.EnableWalkerPostSyncSkip.get() == 1;
+    }
+    return false;
+}
+
+template <typename Family>
+bool GfxCoreHelperHw<Family>::isPerContextDebugSipRequired() const {
+    return false;
+}
+
+template <typename Family>
+void GfxCoreHelperHw<Family>::initCommandLevelMocsDefaults(GmmHelper &gmmHelper) const {
+}
+
+template <typename Family>
+void GfxCoreHelperHw<Family>::adjustRTDispatchGlobals(RTDispatchGlobals &rtDispatchGlobals, uint32_t rtStacksPerDss) const {
+}
+
+template <typename GfxFamily>
+void MemorySynchronizationCommands<GfxFamily>::setPipeControlRequiredFields(typename GfxFamily::PIPE_CONTROL &pipeControl, PipeControlArgs &args) {
+}
+
 } // namespace NEO

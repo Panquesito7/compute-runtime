@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,9 +11,7 @@
 #include "zello_common.h"
 #include "zello_compile.h"
 
-#include <fstream>
 #include <iostream>
-#include <memory>
 
 int main(int argc, char *argv[]) {
 
@@ -46,19 +44,17 @@ int main(int argc, char *argv[]) {
     //
 
     std::string buildLog;
-    auto moduleBinary = compileToSpirV(memcpyBytesWithPrintfTestKernelSrc, "-g", buildLog);
-    if (!buildLog.empty()) {
-        std::cout << "Build log " << buildLog;
-    }
+    auto moduleBinary = LevelZeroBlackBoxTests::compileToSpirV(LevelZeroBlackBoxTests::memcpyBytesWithPrintfTestKernelSrc, "-g", buildLog);
+    LevelZeroBlackBoxTests::printBuildLog(buildLog);
     SUCCESS_OR_TERMINATE((0 == moduleBinary.size()));
 
     ze_context_handle_t context = nullptr;
-    auto devices = zelloInitContextAndGetDevices(context);
+    auto devices = LevelZeroBlackBoxTests::zelloInitContextAndGetDevices(context);
     auto device = devices[0];
 
     ze_device_properties_t deviceProperties = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
     SUCCESS_OR_TERMINATE(zeDeviceGetProperties(device, &deviceProperties));
-    printDeviceProperties(deviceProperties);
+    LevelZeroBlackBoxTests::printDeviceProperties(deviceProperties);
 
     ze_module_handle_t module;
     ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
@@ -92,7 +88,6 @@ int main(int argc, char *argv[]) {
     SUCCESS_OR_TERMINATE_BOOL(debugInfo[0] != 0xff);
 
     SUCCESS_OR_TERMINATE(zeModuleDestroy(module));
-    SUCCESS_OR_TERMINATE(zeContextDestroy(context));
 
     delete[] debugInfo;
 

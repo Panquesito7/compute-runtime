@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2019-2023 Intel Corporation
+# Copyright (C) 2019-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -18,12 +18,15 @@ function(generate_shared_lib LIB_NAME MOCKABLE)
               ${CORE_SOURCES}
   )
   if(${MOCKABLE})
-    target_compile_definitions(${LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=virtual DEFAULT_TEST_PLATFORM=${DEFAULT_TESTED_PLATFORM} DEFAULT_TEST_FAMILY_NAME=${DEFAULT_TESTED_FAMILY_NAME} ${TESTED_CORE_FLAGS_DEFINITONS})
+    target_compile_definitions(${LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=virtual MOCKABLE= DEFAULT_TEST_PLATFORM=${DEFAULT_TESTED_PLATFORM} ${TESTED_CORE_FLAGS_DEFINITONS})
   else()
-    target_compile_definitions(${LIB_NAME} PUBLIC MOCKABLE_VIRTUAL=)
+    if(WIN32 AND NOT RELEASE_WITH_REGKEYS)
+      target_compile_definitions(${LIB_NAME} PUBLIC $<$<CONFIG:Release>:NEO_USE_CONSTEXPR_DEBUG_VARIABLES>)
+    endif()
   endif()
 
   list(APPEND LIB_FLAGS_DEFINITIONS ${SUPPORTED_CORE_FLAGS_DEFINITONS})
+  list(APPEND LIB_FLAGS_DEFINITIONS ${AOT_DEFINITIONS})
 
   set_property(TARGET ${LIB_NAME} APPEND_STRING PROPERTY COMPILE_FLAGS ${ASAN_FLAGS} ${TSAN_FLAGS})
   set_target_properties(${LIB_NAME} PROPERTIES FOLDER "${SHARED_SOURCE_PROJECTS_FOLDER}")
@@ -32,14 +35,13 @@ function(generate_shared_lib LIB_NAME MOCKABLE)
 
   target_include_directories(${LIB_NAME} PUBLIC
                              ${AOT_CONFIG_HEADERS_DIR}
-                             ${KMDAF_HEADERS_DIR}
                              ${ENGINE_NODE_DIR}
                              ${NEO__GMM_INCLUDE_DIR}
                              ${CIF_BASE_DIR}
                              ${IGC_OCL_ADAPTOR_DIR}
                              ${NEO__IGC_INCLUDE_DIR}
                              ${KHRONOS_HEADERS_DIR}
-                             ${SOURCE_LEVEL_DEBUGGER_HEADERS_DIR}
+                             ${KHRONOS_SPIRV_HEADERS_DIR}
                              ${VISA_INCLUDE_DIR}
                              ${CMAKE_CURRENT_SOURCE_DIR}/os_interface/create_command_stream_receiver_${DRIVER_MODEL}
                              ${CMAKE_CURRENT_SOURCE_DIR}/direct_submission/create_direct_submission_${DRIVER_MODEL}
@@ -61,8 +63,7 @@ function(generate_shared_lib LIB_NAME MOCKABLE)
   endif()
 
   create_project_source_tree(${LIB_NAME})
-
-  # Enable SSE4/AVX2 options for files that need them
+  # Enable SSE4/AVX2/AVX512 options for files that need them
   if(MSVC)
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/helpers/${NEO_TARGET_PROCESSOR}/local_id_gen_avx2.cpp PROPERTIES COMPILE_FLAGS /arch:AVX2)
   else()
@@ -72,10 +73,6 @@ function(generate_shared_lib LIB_NAME MOCKABLE)
     if(COMPILER_SUPPORTS_SSE42)
       set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/helpers/local_id_gen_sse4.cpp PROPERTIES COMPILE_FLAGS -msse4.2)
     endif()
-  endif()
-
-  if(DEFINED AUB_STREAM_PROJECT_NAME)
-    target_link_libraries(${LIB_NAME} ${AUB_STREAM_PROJECT_NAME})
   endif()
 
 endfunction()
@@ -125,6 +122,8 @@ append_sources_from_properties(CORE_SOURCES
                                NEO_CORE_GEN_COMMON
                                NEO_CORE_GMM_HELPER
                                NEO_CORE_HELPERS
+                               NEO_CORE_HELPERS_SIP_EXTERNAL_LIB
+                               NEO_CORE_HOST_FUNCTION
                                NEO_CORE_IMAGE
                                NEO_CORE_INDIRECT_HEAP
                                NEO_CORE_KERNEL
@@ -133,20 +132,23 @@ append_sources_from_properties(CORE_SOURCES
                                NEO_CORE_OS_INTERFACE
                                NEO_CORE_PAGE_FAULT_MANAGER
                                NEO_CORE_PROGRAM
+                               NEO_CORE_SEMAPHORE
                                NEO_CORE_SKU_INFO_BASE
                                NEO_CORE_SRCS_BUILT_INS
                                NEO_CORE_SRCS_BUILT_INS_OPS
                                NEO_CORE_SRCS_BUILT_IN_KERNELS
-                               NEO_CORE_SRCS_SOURCE_LEVEL_DEBUGGER
-                               NEO_CORE_TBX
                                NEO_CORE_UTILITIES
+                               NEO_CORE_ZEINFO_EXTRA
                                NEO_DEVICE_BINARY_FORMAT
                                NEO_UNIFIED_MEMORY
                                NEO_CORE_RELEASE_HELPER
+                               NEO_GTPIN
+
 )
 
 if(WIN32)
   append_sources_from_properties(CORE_SOURCES
+                                 NEO_CORE_COMPILER_INTERFACE_WINDOWS
                                  NEO_CORE_GMM_HELPER_WINDOWS
                                  NEO_CORE_HELPERS_GMM_CALLBACKS_WINDOWS
                                  NEO_CORE_DIRECT_SUBMISSION_WINDOWS
@@ -162,6 +164,7 @@ if(WIN32)
   )
 else()
   append_sources_from_properties(CORE_SOURCES
+                                 NEO_CORE_COMPILER_INTERFACE_LINUX
                                  NEO_CORE_DIRECT_SUBMISSION_LINUX
                                  NEO_CORE_OS_INTERFACE_LINUX
                                  NEO_CORE_PAGE_FAULT_MANAGER_LINUX
@@ -187,7 +190,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${BRANCH_TYPE}/core_sources.cmake)
 endif()
 
 if(NOT MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fpermissive -fPIC")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fpermissive")
+endif()
+
+if(NOT WIN32)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 endif()
 
 if(DONT_CARE_OF_VIRTUALS)
@@ -204,5 +211,19 @@ set_property(GLOBAL APPEND PROPERTY NEO_CORE_SRCS_LINK ${CORE_SRCS_LINK})
 get_property(NEO_SRCS_ENABLE_CORE GLOBAL PROPERTY NEO_SRCS_ENABLE_CORE)
 target_sources(ocloc_lib PRIVATE ${NEO_SRCS_ENABLE_CORE})
 if(UNIX)
-  set_property(GLOBAL APPEND PROPERTY NEO_CORE_SRCS_LINK ${CORE_SRCS_LINK_LINUX})
+  target_include_directories(${NEO_SHARED_RELEASE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pin/linux)
+  if(NOT NEO_SKIP_UNIT_TESTS)
+    target_include_directories(${NEO_SHARED_MOCKABLE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pin/linux)
+  endif()
+else()
+  target_include_directories(${NEO_SHARED_RELEASE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pin/windows)
+  if(NOT NEO_SKIP_UNIT_TESTS)
+    target_include_directories(${NEO_SHARED_MOCKABLE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pin/windows)
+  endif()
+endif()
+
+if(MSVC AND NOT DISABLE_ULT_PCH_WIN)
+  target_link_libraries(${NEO_SHARED_RELEASE_LIB_NAME} PRIVATE dxguid)
+  target_sources(${NEO_SHARED_RELEASE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${NEO_SHARED_RELEASE_LIB_NAME}_pch.h)
+  target_precompile_headers(${NEO_SHARED_RELEASE_LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${NEO_SHARED_RELEASE_LIB_NAME}_pch.h)
 endif()

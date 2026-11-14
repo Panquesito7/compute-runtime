@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/os_interface.h"
+#include "shared/source/utilities/io_functions.h"
 
 namespace NEO {
 std::unique_ptr<NEO::Debugger> DebuggerL0::create(NEO::Device *device) {
@@ -18,9 +19,20 @@ std::unique_ptr<NEO::Debugger> DebuggerL0::create(NEO::Device *device) {
     if (!hwInfo.capabilityTable.l0DebuggerSupported) {
         return nullptr;
     }
+    auto osInterface = device->getRootDeviceEnvironment().osInterface.get();
+    if (!osInterface) {
+        return nullptr;
+    }
+    if (!osInterface->isDebugAttachAvailable()) {
+        auto cardName = osInterface->getDriverModel()->as<Drm>()->getSysFsPciPathBaseName();
+        IoFunctions::fprintf(stderr, "Kernel debug mode is not enabled for %s. Device is not available for use\n", cardName.c_str());
+        return nullptr;
+    }
+
     auto success = initDebuggingInOs(device->getRootDeviceEnvironment().osInterface.get());
     if (success) {
         auto debugger = debuggerL0Factory[device->getHardwareInfo().platform.eRenderCoreFamily](device);
+        device->setDebugger(debugger);
         return std::unique_ptr<DebuggerL0>(debugger);
     }
     return std::unique_ptr<DebuggerL0>(nullptr);

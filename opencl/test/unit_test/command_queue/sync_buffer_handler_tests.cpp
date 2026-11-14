@@ -1,41 +1,38 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/program/sync_buffer_handler.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
+#include "shared/test/common/mocks/mock_sync_buffer_handler.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
 #include "opencl/source/api/api.h"
 #include "opencl/test/unit_test/fixtures/enqueue_handler_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
-#include "opencl/test/unit_test/mocks/mock_mdi.h"
-#include "opencl/test/unit_test/mocks/mock_platform.h"
 
 #include "aubstream/engine_node.h"
 
-using namespace NEO;
+namespace NEO {
+template <typename GfxFamily>
+class UltCommandStreamReceiver;
+} // namespace NEO
 
-class MockSyncBufferHandler : public SyncBufferHandler {
-  public:
-    using SyncBufferHandler::bufferSize;
-    using SyncBufferHandler::graphicsAllocation;
-    using SyncBufferHandler::usedBufferSize;
-};
+using namespace NEO;
 
 class SyncBufferEnqueueHandlerTest : public EnqueueHandlerTest {
   public:
     void SetUp() override {
         hardwareInfo = *defaultHwInfo;
         hardwareInfo.capabilityTable.blitterOperationsSupported = true;
-        auto compilerProductHelper = CompilerProductHelper::create(hardwareInfo.platform.eProductFamily);
-        hardwareInfoSetup[productFamily](&hardwareInfo, true, 0, *compilerProductHelper);
+        hardwareInfoSetup[productFamily](&hardwareInfo, true);
         setUpImpl(&hardwareInfo);
     }
 
@@ -50,7 +47,6 @@ class SyncBufferEnqueueHandlerTest : public EnqueueHandlerTest {
         pDevice = MockDevice::createWithNewExecutionEnvironment<MockDevice>(hardwareInfo);
         ASSERT_NE(nullptr, pDevice);
         pClDevice = new MockClDevice{pDevice};
-        ASSERT_NE(nullptr, pClDevice);
 
         auto &commandStreamReceiver = pDevice->getGpgpuCommandStreamReceiver();
         pTagMemory = commandStreamReceiver.getTagAddress();
@@ -68,15 +64,20 @@ class SyncBufferHandlerTest : public SyncBufferEnqueueHandlerTest {
     template <typename FamilyType>
     void setUpT() {
         SyncBufferEnqueueHandlerTest::SetUp();
-        kernelInternals = std::make_unique<MockKernelWithInternals>(*pClDevice, context);
+        kernelInternals = std::make_unique<MockKernelWithInternals>(*context);
         kernelInternals->kernelInfo.kernelDescriptor.kernelAttributes.bufferAddressingMode = KernelDescriptor::Stateless;
         kernel = kernelInternals->mockKernel;
-        kernel->executionType = KernelExecutionType::Concurrent;
+        kernel->executionType = KernelExecutionType::concurrent;
         commandQueue = reinterpret_cast<MockCommandQueue *>(new MockCommandQueueHw<FamilyType>(context, pClDevice, 0));
         auto &hwInfo = pClDevice->getHardwareInfo();
         auto &productHelper = pClDevice->getProductHelper();
         if (productHelper.isCooperativeEngineSupported(hwInfo)) {
-            commandQueue->gpgpuEngine = &pClDevice->getEngine(aub_stream::EngineType::ENGINE_CCS, EngineUsage::Cooperative);
+            auto engine = pClDevice->device.tryGetEngine(aub_stream::EngineType::ENGINE_CCS, EngineUsage::cooperative);
+            if (engine) {
+                commandQueue->gpgpuEngine = engine;
+            } else {
+                GTEST_SKIP();
+            }
         }
     }
 
@@ -116,7 +117,7 @@ class SyncBufferHandlerTest : public SyncBufferEnqueueHandlerTest {
     MockCommandQueue *commandQueue;
 };
 
-HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenAllocateSyncBufferPatchAndConcurrentKernelWhenEnqueuingKernelThenSyncBufferIsUsed) {
+HWTEST2_TEMPLATED_F(SyncBufferHandlerTest, GivenAllocateSyncBufferPatchAndConcurrentKernelWhenEnqueuingKernelThenSyncBufferIsUsed, HasDispatchAllSupport) {
     patchAllocateSyncBuffer();
 
     enqueueNDCount();
@@ -137,28 +138,78 @@ HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenAllocateSyncBufferPatchAndConcurr
     enqueueNDCount();
 
     auto syncBufferHandler = getSyncBufferHandler();
-    EXPECT_EQ(CommonConstants::maximalSizeOfAtomicType, syncBufferHandler->usedBufferSize);
+    auto minimalSyncBufferSize = alignUp(CommonConstants::minimalSyncBufferSize, CommonConstants::maximalSizeOfAtomicType);
+    EXPECT_EQ(minimalSyncBufferSize, syncBufferHandler->usedBufferSize);
 
     enqueueNDCount();
-    EXPECT_EQ(2u * CommonConstants::maximalSizeOfAtomicType, syncBufferHandler->usedBufferSize);
+    EXPECT_EQ(2u * minimalSyncBufferSize, syncBufferHandler->usedBufferSize);
 }
 
-HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenConcurrentKernelWithoutAllocateSyncBufferPatchWhenEnqueuingConcurrentKernelThenSyncBufferIsNotCreated) {
+HWTEST2_TEMPLATED_F(SyncBufferHandlerTest, GivenConcurrentKernelWithoutAllocateSyncBufferPatchWhenEnqueuingConcurrentKernelThenSyncBufferIsNotCreated, HasDispatchAllSupport) {
     auto retVal = enqueueNDCount();
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(nullptr, getSyncBufferHandler());
 }
 
-HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenDefaultKernelUsingSyncBufferWhenEnqueuingKernelThenErrorIsReturnedAndSyncBufferIsNotCreated) {
+HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenDefaultKernelUsingSyncBufferWhenEnqueuingKernelThenSyncBufferIsNotCreatedAndNullPointerIsPatched) {
     patchAllocateSyncBuffer();
-    kernel->executionType = KernelExecutionType::Default;
+    kernel->executionType = KernelExecutionType::defaultType;
+
+    const auto &syncBufferAddress = kernel->getKernelInfo().kernelDescriptor.payloadMappings.implicitArgs.syncBufferAddress;
+    auto patchedSyncBufferAddress = reinterpret_cast<uint32_t *>(ptrOffset(kernel->getCrossThreadData(), syncBufferAddress.stateless));
+    constexpr uint32_t staleSyncBufferAddress = 0x1000u;
+    *patchedSyncBufferAddress = staleSyncBufferAddress;
 
     auto retVal = enqueueNDCount();
-    EXPECT_EQ(CL_INVALID_KERNEL, retVal);
+    EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(nullptr, getSyncBufferHandler());
+    EXPECT_EQ(0u, *patchedSyncBufferAddress);
 }
 
-HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenConcurrentKernelWithAllocateSyncBufferPatchWhenEnqueuingConcurrentKernelThenSyncBufferIsCreated) {
+HWTEST2_TEMPLATED_F(SyncBufferHandlerTest, GivenDefaultKernelUsingBindfulSyncBufferWhenEnqueuingKernelThenNullSurfaceStateIsProgrammed, SupportsLegacyRenderSurfaceState) {
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
+
+    kernelInternals->kernelInfo.setBufferAddressingMode(KernelDescriptor::BindfulAndStateless);
+    patchAllocateSyncBuffer();
+    kernel->executionType = KernelExecutionType::defaultType;
+
+    auto surfaceState = reinterpret_cast<RENDER_SURFACE_STATE *>(ptrOffset(kernel->getSurfaceStateHeap(),
+                                                                           kernel->getKernelInfo().kernelDescriptor.payloadMappings.implicitArgs.syncBufferAddress.bindful));
+    constexpr uint64_t staleSyncBufferAddress = 0x1000u;
+    surfaceState->setSurfaceBaseAddress(staleSyncBufferAddress);
+    surfaceState->setSurfaceType(RENDER_SURFACE_STATE::SURFACE_TYPE_SURFTYPE_BUFFER);
+
+    auto retVal = enqueueNDCount();
+    EXPECT_EQ(CL_SUCCESS, retVal);
+    EXPECT_EQ(nullptr, getSyncBufferHandler());
+    EXPECT_EQ(0u, surfaceState->getSurfaceBaseAddress());
+    EXPECT_EQ(RENDER_SURFACE_STATE::SURFACE_TYPE_SURFTYPE_NULL, surfaceState->getSurfaceType());
+}
+
+HWTEST2_TEMPLATED_F(SyncBufferHandlerTest, GivenSyncBufferKernelWithImplicitArgsEnqueuedAsConcurrentWhenEnqueuedAgainAsDefaultThenSyncBufferPointersAreCleared, HasDispatchAllSupport) {
+    kernelInternals->kernelInfo.setSyncBuffer(sizeof(uint32_t), 0);
+    UnitTestHelper<FamilyType>::adjustKernelDescriptorForImplicitArgs(kernelInternals->kernelInfo.kernelDescriptor);
+    kernel->pImplicitArgs = std::make_unique<ImplicitArgs>();
+    kernel->pImplicitArgs->initializeHeader(1);
+
+    const auto &syncBufferAddress = kernel->getKernelInfo().kernelDescriptor.payloadMappings.implicitArgs.syncBufferAddress;
+    auto patchedSyncBufferAddress = reinterpret_cast<uint32_t *>(ptrOffset(kernel->getCrossThreadData(), syncBufferAddress.stateless));
+
+    EXPECT_EQ(CL_SUCCESS, enqueueNDCount());
+    auto syncBufferHandler = getSyncBufferHandler();
+    ASSERT_NE(nullptr, syncBufferHandler);
+    auto expectedSyncBufferAddress = syncBufferHandler->graphicsAllocation->getGpuAddressToPatch();
+    EXPECT_EQ(expectedSyncBufferAddress, kernel->pImplicitArgs->v1.syncBufferPtr);
+    EXPECT_EQ(static_cast<uint32_t>(expectedSyncBufferAddress), *patchedSyncBufferAddress);
+
+    kernel->executionType = KernelExecutionType::defaultType;
+    EXPECT_EQ(CL_SUCCESS, enqueueNDCount());
+
+    EXPECT_EQ(0u, kernel->pImplicitArgs->v1.syncBufferPtr);
+    EXPECT_EQ(0u, *patchedSyncBufferAddress);
+}
+
+HWTEST2_TEMPLATED_F(SyncBufferHandlerTest, GivenConcurrentKernelWithAllocateSyncBufferPatchWhenEnqueuingConcurrentKernelThenSyncBufferIsCreated, HasDispatchAllSupport) {
     patchAllocateSyncBuffer();
     auto retVal = enqueueNDCount();
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -166,7 +217,7 @@ HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenConcurrentKernelWithAllocateSyncB
 }
 
 HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenMaxWorkgroupCountWhenEnqueuingConcurrentKernelThenSuccessIsReturned) {
-    auto maxWorkGroupCount = kernel->getMaxWorkGroupCount(workDim, lws, commandQueue);
+    auto maxWorkGroupCount = kernel->getMaxWorkGroupCount(workDim, lws, commandQueue, false);
     workgroupCount[0] = maxWorkGroupCount;
 
     auto retVal = enqueueNDCount();
@@ -174,14 +225,14 @@ HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenMaxWorkgroupCountWhenEnqueuingCon
 }
 
 HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenTooHighWorkgroupCountWhenEnqueuingConcurrentKernelThenErrorIsReturned) {
-    size_t maxWorkGroupCount = kernel->getMaxWorkGroupCount(workDim, lws, commandQueue);
+    size_t maxWorkGroupCount = kernel->getMaxWorkGroupCount(workDim, lws, commandQueue, false);
     workgroupCount[0] = maxWorkGroupCount + 1;
 
     auto retVal = enqueueNDCount();
     EXPECT_EQ(CL_INVALID_VALUE, retVal);
 }
 
-HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenSyncBufferFullWhenEnqueuingKernelThenNewBufferIsAllocated) {
+HWTEST2_TEMPLATED_F(SyncBufferHandlerTest, GivenSyncBufferFullWhenEnqueuingKernelThenNewBufferIsAllocated, HasDispatchAllSupport) {
     patchAllocateSyncBuffer();
     enqueueNDCount();
     auto syncBufferHandler = getSyncBufferHandler();
@@ -192,7 +243,7 @@ HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenSyncBufferFullWhenEnqueuingKernel
 }
 
 HWTEST_TEMPLATED_F(SyncBufferHandlerTest, GivenSshRequiredWhenPatchingSyncBufferThenSshIsProperlyPatched) {
-    using RENDER_SURFACE_STATE = typename FamilyType::RENDER_SURFACE_STATE;
+    using RENDER_SURFACE_STATE = typename FamilyType::DefaultRenderSurfaceState;
     kernelInternals->kernelInfo.setBufferAddressingMode(KernelDescriptor::BindfulAndStateless);
 
     patchAllocateSyncBuffer();

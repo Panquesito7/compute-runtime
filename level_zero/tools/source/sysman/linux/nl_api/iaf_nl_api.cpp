@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,15 +7,14 @@
 
 #include "iaf_nl_api.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
 #include "shared/source/os_interface/linux/sys_calls.h"
 #include "shared/source/utilities/directory.h"
 
 #include <fcntl.h>
 #include <limits>
 #include <netlink/attr.h>
-#include <netlink/genl/ctrl.h>
-#include <netlink/genl/family.h>
-#include <sys/socket.h>
 
 namespace L0 {
 
@@ -56,6 +55,7 @@ static const struct {
     {.id = IAF_CMD_OP_SUB_DEVICE_TRAP_COUNT_QUERY, .name = const_cast<char *>("FPORT_EVENT_COUNT_QUERY")},
     {.id = IAF_CMD_OP_FPORT_PROPERTIES, .name = const_cast<char *>("FPORT_PROPERTIES")},
     {.id = IAF_CMD_OP_FPORT_XMIT_RECV_COUNTS, .name = const_cast<char *>("FPORT_XMIT_RECV_COUNTS")},
+    {.id = IAF_CMD_OP_FPORT_THROUGHPUT, .name = const_cast<char *>("FPORT_THROUGHPUT")},
     {.id = 0, .name = nullptr},
 };
 
@@ -98,6 +98,7 @@ ze_result_t IafNlApi::allocMsg(const uint16_t cmdOp, struct nl_msg *&msg) {
 }
 
 ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, const uint32_t fabricId, const uint32_t attachId, const uint8_t portNumber, void *pOutput) {
+    std::unique_lock<std::mutex> lock(iafMutex);
     ze_result_t result = init();
     if (ZE_RESULT_SUCCESS != result) {
         return result;
@@ -114,7 +115,35 @@ ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, const uint32_t fabricId
     return result;
 }
 
+void IafNlApi::addNestedFabricPortList(struct nl_msg *msg, std::vector<IafPortId> &iafPortIdList) {
+    for (const auto &iafPortId : iafPortIdList) {
+        struct nlattr *attr = pNlApi->nlaNestStart(msg, IAF_ATTR_FABRIC_PORT);
+        pNlApi->nlaPutU32(msg, IAF_ATTR_FABRIC_ID, iafPortId.fabricId);
+        pNlApi->nlaPutU8(msg, IAF_ATTR_SD_INDEX, iafPortId.attachId);
+        pNlApi->nlaPutU8(msg, IAF_ATTR_FABRIC_PORT_NUMBER, iafPortId.portNumber);
+        pNlApi->nlaNestEnd(msg, attr);
+    }
+}
+
+ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, std::vector<IafPortId> &iafPortIdList, void *pOutput) {
+    std::unique_lock<std::mutex> lock(iafMutex);
+    ze_result_t result = init();
+    if (ZE_RESULT_SUCCESS != result) {
+        return result;
+    }
+
+    struct nl_msg *msg;
+    result = allocMsg(cmdOp, msg);
+    if (ZE_RESULT_SUCCESS == result) {
+        addNestedFabricPortList(msg, iafPortIdList);
+        result = performTransaction(cmdOp, msg, pOutput);
+    }
+    cleanup();
+    return result;
+}
+
 ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, const uint32_t fabricId, const uint32_t attachId, void *pOutput) {
+    std::unique_lock<std::mutex> lock(iafMutex);
     ze_result_t result = init();
     if (ZE_RESULT_SUCCESS != result) {
         return result;
@@ -131,6 +160,7 @@ ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, const uint32_t fabricId
 }
 
 ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, const uint32_t fabricId, void *pOutput) {
+    std::unique_lock<std::mutex> lock(iafMutex);
     ze_result_t result = init();
     if (ZE_RESULT_SUCCESS != result) {
         return result;
@@ -146,6 +176,7 @@ ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, const uint32_t fabricId
 }
 
 ze_result_t IafNlApi::issueRequest(const uint16_t cmdOp, void *pOutput) {
+    std::unique_lock<std::mutex> lock(iafMutex);
     ze_result_t result = init();
     if (ZE_RESULT_SUCCESS != result) {
         return result;
@@ -208,6 +239,8 @@ ze_result_t IafNlApi::handleResponse(const uint16_t cmdOp, struct genl_info *inf
         return subdevicePropertiesGetRsp(info, pOutput);
     case IAF_CMD_OP_FPORT_PROPERTIES:
         return fportPropertiesRsp(info, pOutput);
+    case IAF_CMD_OP_FPORT_THROUGHPUT:
+        return getMultiPortThroughputRsp(info, pOutput);
     case IAF_CMD_OP_PORT_BEACON_ENABLE:
     case IAF_CMD_OP_PORT_BEACON_DISABLE:
     case IAF_CMD_OP_PORT_ENABLE:
@@ -219,6 +252,45 @@ ze_result_t IafNlApi::handleResponse(const uint16_t cmdOp, struct genl_info *inf
     default:
         return ZE_RESULT_ERROR_UNKNOWN;
     }
+}
+
+ze_result_t IafNlApi::getMultiPortThroughputRsp(struct genl_info *info, void *pOutput) {
+    std::vector<IafThroughPutInfo> *iafPortThroughputList = reinterpret_cast<std::vector<IafThroughPutInfo> *>(pOutput);
+    iafPortThroughputList->clear();
+    const struct nlmsghdr *nlh = info->nlh;
+
+    auto nla = pNlApi->nlmsgAttrdata(nlh, GENL_HDRLEN);
+    auto rem = pNlApi->nlmsgAttrlen(nlh, GENL_HDRLEN);
+    for (; pNlApi->nlaOk(nla, rem); nla = pNlApi->nlaNext(nla, &rem)) {
+        if (pNlApi->nlaType(nla) == IAF_ATTR_FABRIC_PORT_THROUGHPUT) {
+            auto cur = (struct nlattr *)pNlApi->nlaData(nla);
+            auto rem = pNlApi->nlaLen(nla);
+            IafThroughPutInfo iafPortThroughputInfo = {};
+            for (; pNlApi->nlaOk(cur, rem); cur = pNlApi->nlaNext(cur, &rem)) {
+                switch (pNlApi->nlaType(cur)) {
+                case IAF_ATTR_FPORT_RX_BYTES:
+                    iafPortThroughputInfo.iafThroughput.rxCounter = pNlApi->nlaGetU64(cur);
+                    break;
+                case IAF_ATTR_FPORT_TX_BYTES:
+                    iafPortThroughputInfo.iafThroughput.txCounter = pNlApi->nlaGetU64(cur);
+                    break;
+                case IAF_ATTR_FABRIC_PORT_NUMBER:
+                    iafPortThroughputInfo.iafPortId.portNumber = pNlApi->nlaGetU8(cur);
+                    break;
+                case IAF_ATTR_FABRIC_ID:
+                    iafPortThroughputInfo.iafPortId.fabricId = pNlApi->nlaGetU32(cur);
+                    break;
+                case IAF_ATTR_SD_INDEX:
+                    iafPortThroughputInfo.iafPortId.attachId = pNlApi->nlaGetU8(cur);
+                    break;
+                default:
+                    break;
+                }
+            }
+            iafPortThroughputList->push_back(iafPortThroughputInfo);
+        }
+    }
+    return ZE_RESULT_SUCCESS;
 }
 
 ze_result_t IafNlApi::fPortStatusQueryRsp(struct genl_info *info, void *pOutput) {
@@ -512,6 +584,10 @@ ze_result_t IafNlApi::getThroughput(const IafPortId portId, IafPortThroughPut &t
     return issueRequest(IAF_CMD_OP_FPORT_XMIT_RECV_COUNTS, portId.fabricId, portId.attachId, portId.portNumber, reinterpret_cast<void *>(&throughput));
 }
 
+ze_result_t IafNlApi::getMultiPortThroughPut(std::vector<IafPortId> &iafPortIdList, std::vector<IafThroughPutInfo> &throughput) {
+    return issueRequest(IAF_CMD_OP_FPORT_THROUGHPUT, iafPortIdList, reinterpret_cast<void *>(&throughput));
+}
+
 ze_result_t IafNlApi::portStateQuery(const IafPortId portId, bool &enabled) {
     return issueRequest(IAF_CMD_OP_PORT_STATE_QUERY, portId.fabricId, portId.attachId, portId.portNumber, reinterpret_cast<void *>(&enabled));
 }
@@ -620,7 +696,7 @@ int IafNlApi::nlOperation(struct nl_cache_ops *ops, struct genl_cmd *cmd, struct
     if (info->attrs[IAF_ATTR_CMD_OP_CONTEXT]) {
         uint64_t context = pNlApi->nlaGetU64(info->attrs[IAF_ATTR_CMD_OP_CONTEXT]);
         bool found = false;
-        for (auto i : validContexts) {
+        for (auto &i : validContexts) {
             if (context == i) {
                 found = true;
                 break;
@@ -654,8 +730,8 @@ ze_result_t IafNlApi::init() {
 
     int retval = pNlApi->genlRegisterFamily(&ops);
     if (-NLE_EXIST == retval) {
-        // Temporary error
-        return ZE_RESULT_NOT_READY;
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to register netlink family and returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_NOT_AVAILABLE);
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
     } else if (!retval) {
         nlSock = pNlApi->nlSocketAlloc();
         if (nullptr != nlSock) {
@@ -699,7 +775,7 @@ ze_result_t IafNlApi::initPorts(const uint32_t fabricId, std::vector<IafPort> &i
             iafPorts.clear();
             return ZE_RESULT_ERROR_UNKNOWN;
         }
-        for (auto port : ports) {
+        for (auto &port : ports) {
             IafPort p = {};
             IafPortSpeed rxSpeed, txSpeed;
             uint8_t neighbourPortNumber = 0;
@@ -725,7 +801,7 @@ ze_result_t IafNlApi::getPorts(const std::string &devicePciPath, std::vector<Iaf
     std::string path;
     path.clear();
     std::vector<std::string> list = NEO::Directory::getFiles(devicePciPath);
-    for (auto entry : list) {
+    for (auto &entry : list) {
         if ((entry.find(iafDirectory) != std::string::npos) ||
             (entry.find(iafDirectoryLegacy) != std::string::npos)) {
             path = entry + fabricIdFile;
@@ -842,6 +918,7 @@ IafNlApi::IafNlApi() {
     policy[IAF_ATTR_FPORT_RX_BYTES].type = NLA_U64;
     policy[IAF_ATTR_FPORT_BPS_LINK_SPEED_MAX].type = NLA_U64;
     policy[IAF_ATTR_FPORT_LQI_CHANGE_COUNT].type = NLA_U32;
+    policy[IAF_ATTR_FABRIC_PORT_THROUGHPUT].type = NLA_NESTED;
 
     int i;
     memset(cmds, 0, sizeof(genl_cmd) * _IAF_CMD_OP_COUNT);

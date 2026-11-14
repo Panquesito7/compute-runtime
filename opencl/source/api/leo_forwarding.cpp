@@ -1,0 +1,163 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "opencl/source/api/leo_forwarding.h"
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/os_interface/os_library.h"
+
+#include "opencl/source/platform/platform.h"
+
+#include <algorithm>
+
+namespace NEO {
+
+static void loadL0Library();
+
+bool isLeoForcedOn() {
+    return debugManager.flags.EnableLEO.get() == 1;
+}
+
+bool isLeoForcedOff() {
+    return debugManager.flags.EnableLEO.get() == 0;
+}
+
+bool ensureLeoLibraryLoaded() {
+    loadL0Library();
+    return l0ForwardingState && l0ForwardingState->library && l0ForwardingState->library->isLoaded();
+}
+
+bool isLeoPlatformHandle(cl_platform_id platform) {
+    if (platform == nullptr || leoPlatformEntries == nullptr) {
+        return false;
+    }
+    return std::any_of(leoPlatformEntries->begin(), leoPlatformEntries->end(),
+                       [platform](const LeoPlatformEntry &entry) { return entry.handle == platform; });
+}
+
+bool hasLeoPlatforms() {
+    if (isLeoForcedOn()) {
+        return true;
+    }
+    return leoPlatformEntries != nullptr && !leoPlatformEntries->empty();
+}
+
+std::vector<cl_platform_id> getLeoPlatforms() {
+    std::vector<cl_platform_id> leoPlatforms;
+    if (!ensureLeoLibraryLoaded() || l0ForwardingState->clGetPlatformIDsFunc == nullptr) {
+        return leoPlatforms;
+    }
+
+    cl_uint numLeoPlatforms = 0u;
+    if (CL_SUCCESS != l0ForwardingState->clGetPlatformIDsFunc(0u, nullptr, &numLeoPlatforms) || numLeoPlatforms == 0u) {
+        return leoPlatforms;
+    }
+
+    leoPlatforms.resize(numLeoPlatforms);
+    if (CL_SUCCESS != l0ForwardingState->clGetPlatformIDsFunc(numLeoPlatforms, leoPlatforms.data(), nullptr)) {
+        leoPlatforms.clear();
+    }
+    return leoPlatforms;
+}
+
+L0ForwardingState *l0ForwardingState = nullptr;
+
+void leoSetup() {
+    l0ForwardingState = new L0ForwardingState;
+}
+
+void leoTeardown() {
+    delete l0ForwardingState;
+    l0ForwardingState = nullptr;
+}
+
+static void loadL0Library() {
+    if (!l0ForwardingState || l0ForwardingState->loaded) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(l0ForwardingState->mutex);
+    if (l0ForwardingState->loaded) {
+        return;
+    }
+
+    l0ForwardingState->loaded = true;
+    static constexpr const char *l0LibraryName =
+#if defined(_WIN64)
+        "ze_intel_gpu64.dll";
+#else
+        "libze_intel_gpu.so.1";
+#endif
+    OsLibraryCreateProperties properties(l0LibraryName);
+    properties.performSelfLoad = leoForwardingSelfLoad();
+    l0ForwardingState->library.reset(OsLibrary::loadFunc(properties));
+    if (l0ForwardingState->library && l0ForwardingState->library->isLoaded() && !properties.performSelfLoad) {
+        l0ForwardingState->clGetExtensionFunctionAddressFunc = reinterpret_cast<decltype(&clGetExtensionFunctionAddress)>(l0ForwardingState->library->getProcAddress("clGetExtensionFunctionAddress"));
+        l0ForwardingState->clGetPlatformInfoFunc = reinterpret_cast<decltype(&clGetPlatformInfo)>(l0ForwardingState->library->getProcAddress("clGetPlatformInfo"));
+        if (l0ForwardingState->clGetExtensionFunctionAddressFunc) {
+            l0ForwardingState->clGetPlatformIDsFunc = reinterpret_cast<pfnClIcdGetPlatformIDsKHR>(l0ForwardingState->clGetExtensionFunctionAddressFunc("clIcdGetPlatformIDsKHR"));
+        }
+        l0ForwardingState->clEnqueueMarkerWithSyncObjectINTELFunc = reinterpret_cast<pfnClEnqueueMarkerWithSyncObjectINTEL>(l0ForwardingState->library->getProcAddress("clEnqueueMarkerWithSyncObjectINTEL"));
+        l0ForwardingState->clGetCLObjectInfoINTELFunc = reinterpret_cast<pfnClGetCLObjectInfoINTEL>(l0ForwardingState->library->getProcAddress("clGetCLObjectInfoINTEL"));
+        l0ForwardingState->clGetCLEventInfoINTELFunc = reinterpret_cast<pfnClGetCLEventInfoINTEL>(l0ForwardingState->library->getProcAddress("clGetCLEventInfoINTEL"));
+        l0ForwardingState->clReleaseGlSharedEventINTELFunc = reinterpret_cast<pfnClReleaseGlSharedEventINTEL>(l0ForwardingState->library->getProcAddress("clReleaseGlSharedEventINTEL"));
+    }
+}
+
+cl_int forwardClGetPlatformIDs(cl_uint numEntries, cl_platform_id *platforms, cl_uint *numPlatforms) {
+    if (l0ForwardingState && l0ForwardingState->clGetPlatformIDsFunc) [[likely]] {
+        return l0ForwardingState->clGetPlatformIDsFunc(numEntries, platforms, numPlatforms);
+    }
+    if (numPlatforms) {
+        *numPlatforms = 0u;
+    }
+    return CL_SUCCESS;
+}
+
+cl_int forwardClGetPlatformInfo(cl_platform_id platform, cl_platform_info paramName, size_t paramValueSize, void *paramValue, size_t *paramValueSizeRet) {
+    if (l0ForwardingState && l0ForwardingState->clGetPlatformInfoFunc) [[likely]] {
+        return l0ForwardingState->clGetPlatformInfoFunc(platform, paramName, paramValueSize, paramValue, paramValueSizeRet);
+    }
+    return CL_INVALID_PLATFORM;
+}
+
+void *forwardClGetExtensionFunctionAddress(const char *funcName) {
+    if (l0ForwardingState && l0ForwardingState->clGetExtensionFunctionAddressFunc) [[likely]] {
+        return l0ForwardingState->clGetExtensionFunctionAddressFunc(funcName);
+    }
+    return nullptr;
+}
+
+cl_int forwardClEnqueueMarkerWithSyncObjectINTEL(cl_command_queue commandQueue, cl_event *event, cl_context *context) {
+    if (l0ForwardingState && l0ForwardingState->clEnqueueMarkerWithSyncObjectINTELFunc) [[likely]] {
+        return l0ForwardingState->clEnqueueMarkerWithSyncObjectINTELFunc(commandQueue, event, context);
+    }
+    return CL_INVALID_OPERATION;
+}
+
+cl_int forwardClGetCLObjectInfoINTEL(cl_mem memObj, void *pResourceInfo) {
+    if (l0ForwardingState && l0ForwardingState->clGetCLObjectInfoINTELFunc) [[likely]] {
+        return l0ForwardingState->clGetCLObjectInfoINTELFunc(memObj, pResourceInfo);
+    }
+    return CL_INVALID_OPERATION;
+}
+
+cl_int forwardClGetCLEventInfoINTEL(cl_event event, void **pSyncInfoHandleRet, cl_context *pClContextRet) {
+    if (l0ForwardingState && l0ForwardingState->clGetCLEventInfoINTELFunc) [[likely]] {
+        return l0ForwardingState->clGetCLEventInfoINTELFunc(event, pSyncInfoHandleRet, pClContextRet);
+    }
+    return CL_INVALID_OPERATION;
+}
+
+cl_int forwardClReleaseGlSharedEventINTEL(cl_event event) {
+    if (l0ForwardingState && l0ForwardingState->clReleaseGlSharedEventINTELFunc) [[likely]] {
+        return l0ForwardingState->clReleaseGlSharedEventINTELFunc(event);
+    }
+    return CL_INVALID_OPERATION;
+}
+
+} // namespace NEO

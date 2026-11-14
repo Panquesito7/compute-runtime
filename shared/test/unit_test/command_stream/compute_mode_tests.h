@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
@@ -21,7 +22,7 @@ struct ComputeModeRequirements : public ::testing::Test {
         using CommandStreamReceiver::commandStream;
         using CommandStreamReceiver::streamProperties;
         MyCsr(ExecutionEnvironment &executionEnvironment, const DeviceBitfield deviceBitfield)
-            : UltCommandStreamReceiver<FamilyType>(executionEnvironment, 0, deviceBitfield){};
+            : UltCommandStreamReceiver<FamilyType>(executionEnvironment, 0, deviceBitfield) {};
         CsrSizeRequestFlags *getCsrRequestFlags() { return &this->csrSizeRequestFlags; }
         bool hasSharedHandles() override {
             if (hasSharedHandlesReturnValue) {
@@ -41,9 +42,9 @@ struct ComputeModeRequirements : public ::testing::Test {
                                     uint32_t numGrfRequired = 128u) {
         overrideComputeModeRequest<FamilyType>(reqestChanged, requireCoherency, hasSharedHandles, numGrfRequiredChanged, numGrfRequired);
         if (modifyThreadArbitrationPolicy) {
-            auto &gfxCoreHelper = device->getGfxCoreHelper();
+            const auto &hwInfo = device->getHardwareInfo();
             auto csrHw = getCsrHw<FamilyType>();
-            csrHw->streamProperties.stateComputeMode.threadArbitrationPolicy.value = gfxCoreHelper.getDefaultThreadArbitrationPolicy();
+            csrHw->streamProperties.stateComputeMode.threadArbitrationPolicy.value = hwInfo.caps.defaultThreadArbitrationPolicy;
             csrHw->streamProperties.stateComputeMode.threadArbitrationPolicy.isDirty = true;
         }
     }
@@ -56,10 +57,9 @@ struct ComputeModeRequirements : public ::testing::Test {
                                     uint32_t numGrfRequired) {
         auto csrHw = getCsrHw<FamilyType>();
         csrHw->hasSharedHandlesReturnValue = hasSharedHandles;
-        flags.requiresCoherency = requireCoherency;
         csrHw->streamProperties.stateComputeMode.isCoherencyRequired.value = requireCoherency;
         csrHw->streamProperties.stateComputeMode.isCoherencyRequired.isDirty = coherencyRequestChanged;
-        csrHw->streamProperties.stateComputeMode.largeGrfMode.value = (numGrfRequired == GrfConfig::LargeGrfNumber);
+        csrHw->streamProperties.stateComputeMode.largeGrfMode.value = (numGrfRequired == GrfConfig::largeGrfNumber);
         csrHw->streamProperties.stateComputeMode.largeGrfMode.isDirty = numGrfRequiredChanged;
         if (hasSharedHandles) {
             makeResidentSharedAlloc();
@@ -84,9 +84,10 @@ struct ComputeModeRequirements : public ::testing::Test {
         csr = new MyCsr<FamilyType>(*device->executionEnvironment, device->getDeviceBitfield());
 
         device->resetCommandStreamReceiver(csr);
-        AllocationProperties properties(device->getRootDeviceIndex(), false, MemoryConstants::pageSize, AllocationType::SHARED_BUFFER, false, {});
+        AllocationProperties properties(device->getRootDeviceIndex(), false, MemoryConstants::pageSize, AllocationType::sharedBuffer, false, {});
 
-        alloc = device->getMemoryManager()->createGraphicsAllocationFromSharedHandle(static_cast<osHandle>(123), properties, false, false, true, nullptr);
+        MemoryManager::OsHandleData osHandleData{123u};
+        alloc = device->getMemoryManager()->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
     }
 
     void TearDown() override {
@@ -95,6 +96,6 @@ struct ComputeModeRequirements : public ::testing::Test {
 
     CommandStreamReceiver *csr = nullptr;
     std::unique_ptr<MockDevice> device;
-    DispatchFlags flags{{}, nullptr, {}, nullptr, QueueThrottle::MEDIUM, PreemptionMode::Disabled, GrfConfig::DefaultGrfNumber, L3CachingSettings::l3CacheOn, ThreadArbitrationPolicy::NotPresent, AdditionalKernelExecInfo::NotApplicable, KernelExecutionType::NotApplicable, MemoryCompressionState::NotApplicable, QueueSliceCount::defaultSliceCount, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false};
+    DispatchFlags flags{nullptr, {}, nullptr, QueueThrottle::MEDIUM, PreemptionMode::Disabled, GrfConfig::defaultGrfNumber, L3CachingSettings::l3CacheOn, ThreadArbitrationPolicy::NotPresent, AdditionalKernelExecInfo::notApplicable, KernelExecutionType::notApplicable, MemoryCompressionState::notApplicable, QueueSliceCount::defaultSliceCount, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false};
     GraphicsAllocation *alloc = nullptr;
 };

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,7 +10,7 @@
 #include "shared/source/helpers/debug_helpers.h"
 
 #include "level_zero/core/source/cmdlist/cmdlist.h"
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/metrics/metric_oa_enumeration_imp.h"
 #include "level_zero/tools/source/metrics/metric_oa_query_imp.h"
 #include "level_zero/tools/source/metrics/metric_oa_source.h"
@@ -28,7 +28,7 @@ ze_result_t OaMetricStreamerImp::readData(uint32_t maxReportCount, size_t *pRawD
         auto pMetricStreamer = MetricStreamer::fromHandle(metricStreamers[0]);
         // Return required size if requested.
         if (*pRawDataSize == 0) {
-            const size_t headerSize = sizeof(MetricGroupCalculateHeader);
+            const size_t headerSize = sizeof(OaMetricGroupCalculateHeader);
             const size_t rawDataOffsetsRequiredSize = sizeof(uint32_t) * metricStreamerSize;
             const size_t rawDataSizesRequiredSize = sizeof(uint32_t) * metricStreamerSize;
             const size_t rawDataRequiredSize = static_cast<OaMetricStreamerImp *>(pMetricStreamer)->getRequiredBufferSize(maxReportCount) * metricStreamerSize;
@@ -36,12 +36,12 @@ ze_result_t OaMetricStreamerImp::readData(uint32_t maxReportCount, size_t *pRawD
             return ZE_RESULT_SUCCESS;
         }
 
-        MetricGroupCalculateHeader *pRawDataHeader = reinterpret_cast<MetricGroupCalculateHeader *>(pRawData);
-        pRawDataHeader->magic = MetricGroupCalculateHeader::magicValue;
+        OaMetricGroupCalculateHeader *pRawDataHeader = reinterpret_cast<OaMetricGroupCalculateHeader *>(pRawData);
+        pRawDataHeader->magic = OaMetricGroupCalculateHeader::magicValue;
         pRawDataHeader->dataCount = static_cast<uint32_t>(metricStreamerSize);
 
         // Relative offsets in the header allow to move/copy the buffer.
-        pRawDataHeader->rawDataOffsets = sizeof(MetricGroupCalculateHeader);
+        pRawDataHeader->rawDataOffsets = sizeof(OaMetricGroupCalculateHeader);
         pRawDataHeader->rawDataSizes = static_cast<uint32_t>(pRawDataHeader->rawDataOffsets + (sizeof(uint32_t) * metricStreamerSize));
         pRawDataHeader->rawDataOffset = static_cast<uint32_t>(pRawDataHeader->rawDataSizes + (sizeof(uint32_t) * metricStreamerSize));
 
@@ -86,8 +86,10 @@ ze_result_t OaMetricStreamerImp::readData(uint32_t maxReportCount, size_t *pRawD
 
         // Read streamer data.
         result = metricGroup->readIoStream(reportCount, *pRawData);
-        if (result == ZE_RESULT_SUCCESS) {
+        if (result == ZE_RESULT_SUCCESS || result == ZE_RESULT_WARNING_DROPPED_DATA) {
             *pRawDataSize = reportCount * rawReportSize;
+        } else {
+            *pRawDataSize = 0;
         }
     }
 
@@ -103,8 +105,9 @@ ze_result_t OaMetricStreamerImp::close() {
             auto tmpResult = metricStreamer->close();
 
             // Hold the first error result.
-            if (result == ZE_RESULT_SUCCESS)
+            if (result == ZE_RESULT_SUCCESS) {
                 result = tmpResult;
+            }
         }
 
         // Delete metric streamer aggregator.
@@ -150,35 +153,48 @@ ze_result_t OaMetricStreamerImp::initialize(ze_device_handle_t hDevice,
     return ZE_RESULT_SUCCESS;
 }
 
-ze_result_t OaMetricStreamerImp::startMeasurements(uint32_t &notifyEveryNReports,
-                                                   uint32_t &samplingPeriodNs) {
-    auto metricGroup = static_cast<OaMetricGroupImp *>(MetricGroup::fromHandle(hMetricGroup));
-    uint32_t requestedOaBufferSize = getOaBufferSize(notifyEveryNReports);
+uint32_t OaMetricStreamerImp::getOaBufferSizeForNotification(const uint32_t notifyEveryNReports) const {
 
-    const ze_result_t result = metricGroup->openIoStream(samplingPeriodNs, requestedOaBufferSize);
+    // Notification is on half full buffer, hence multiplication by 2.
+    return notifyEveryNReports * rawReportSize * 2;
+}
+
+uint32_t OaMetricStreamerImp::getOaBufferSizeForReports(const uint32_t maxReportCount) const {
+
+    return maxReportCount * rawReportSize;
+}
+
+ze_result_t OaMetricStreamerImp::updateStreamerDescriptionAndStartMeasurements(zet_metric_streamer_desc_t &streamerDesc, const bool isNotificationEnabled) {
+    auto metricGroup = static_cast<OaMetricGroupImp *>(MetricGroup::fromHandle(hMetricGroup));
+    uint32_t requestedOaBufferSize = 0;
+    bool useNotifyNReports = true;
+    auto hwBufferSizeDesc = MetricSource::getHwBufferSizeDesc(static_cast<zet_base_desc_t *>(const_cast<void *>(streamerDesc.pNext)));
+
+    if (hwBufferSizeDesc.has_value() && !isNotificationEnabled) {
+        // Use value inside hwBufferSizeDesc only if notification was not enabled
+        auto expectReportCount = static_cast<uint32_t>(hwBufferSizeDesc.value()->sizeInBytes / rawReportSize);
+        requestedOaBufferSize = getOaBufferSizeForReports(expectReportCount);
+        useNotifyNReports = false;
+    }
+
+    if (useNotifyNReports) {
+        requestedOaBufferSize = getOaBufferSizeForNotification(streamerDesc.notifyEveryNReports);
+    }
+
+    const ze_result_t result = metricGroup->openIoStream(streamerDesc.samplingPeriod, requestedOaBufferSize);
 
     // Return oa buffer size and notification event aligned to gpu capabilities.
     if (result == ZE_RESULT_SUCCESS) {
         oaBufferSize = requestedOaBufferSize;
-        notifyEveryNReports = getNotifyEveryNReports(requestedOaBufferSize);
+        if (useNotifyNReports) {
+            streamerDesc.notifyEveryNReports = getNotifyEveryNReports(requestedOaBufferSize);
+        }
+        if (hwBufferSizeDesc != std::nullopt) {
+            hwBufferSizeDesc.value()->sizeInBytes = requestedOaBufferSize;
+        }
     }
 
     return result;
-}
-
-void OaMetricStreamerImp::attachEvent(ze_event_handle_t hNotificationEvent) {
-    // Associate notification event with metric streamer.
-    pNotificationEvent = Event::fromHandle(hNotificationEvent);
-    if (pNotificationEvent != nullptr) {
-        pNotificationEvent->setMetricStreamer(this);
-    }
-}
-
-void OaMetricStreamerImp::detachEvent() {
-    // Release notification event.
-    if (pNotificationEvent != nullptr) {
-        pNotificationEvent->setMetricStreamer(nullptr);
-    }
 }
 
 ze_result_t OaMetricStreamerImp::stopMeasurements() {
@@ -233,6 +249,7 @@ uint32_t OaMetricStreamerImp::getRequiredBufferSize(const uint32_t maxReportCoun
 }
 
 ze_result_t OaMetricGroupImp::openForDevice(Device *pDevice, zet_metric_streamer_desc_t &desc,
+                                            const bool isNotificationEnabled,
                                             zet_metric_streamer_handle_t *phMetricStreamer) {
 
     auto &metricSource = pDevice->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
@@ -258,9 +275,9 @@ ze_result_t OaMetricGroupImp::openForDevice(Device *pDevice, zet_metric_streamer
     }
 
     // Check metric group sampling type.
-    zet_metric_group_properties_t metricGroupProperties = {ZET_STRUCTURE_TYPE_METRIC_GROUP_PROPERTIES};
+    zet_metric_group_properties_t metricGroupProperties = {ZET_STRUCTURE_TYPE_METRIC_GROUP_PROPERTIES, nullptr};
     getProperties(&metricGroupProperties);
-    if (metricGroupProperties.samplingType != ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED) {
+    if ((metricGroupProperties.samplingType & ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED) != ZET_METRIC_GROUP_SAMPLING_TYPE_FLAG_TIME_BASED) {
         return ZE_RESULT_ERROR_INVALID_ARGUMENT;
     }
 
@@ -273,8 +290,7 @@ ze_result_t OaMetricGroupImp::openForDevice(Device *pDevice, zet_metric_streamer
     UNRECOVERABLE_IF(pMetricStreamer == nullptr);
     pMetricStreamer->initialize(pDevice->toHandle(), toHandle());
 
-    const ze_result_t result = pMetricStreamer->startMeasurements(
-        desc.notifyEveryNReports, desc.samplingPeriod);
+    const ze_result_t result = pMetricStreamer->updateStreamerDescriptionAndStartMeasurements(desc, isNotificationEnabled);
     if (result == ZE_RESULT_SUCCESS) {
         metricSource.setMetricStreamer(pMetricStreamer);
     } else {
@@ -296,20 +312,29 @@ ze_result_t OaMetricGroupImp::streamerOpen(
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto pDevice = Device::fromHandle(hDevice);
-    const auto pDeviceImp = static_cast<const DeviceImp *>(pDevice);
+    const auto isNotificationEnabled = hNotificationEvent != nullptr;
 
-    if (pDeviceImp->metricContext->isImplicitScalingCapable()) {
-        const uint32_t subDeviceCount = pDeviceImp->numSubDevices;
+    if (pDevice->metricContext->isImplicitScalingCapable()) {
+        const uint32_t subDeviceCount = pDevice->numSubDevices;
         auto pMetricStreamer = new OaMetricStreamerImp();
         UNRECOVERABLE_IF(pMetricStreamer == nullptr);
 
         auto &metricStreamers = pMetricStreamer->getMetricStreamers();
         metricStreamers.resize(subDeviceCount);
 
+        // for a root-device handle, split the sizeInBytes request considering the sub-device count
+        auto isHwBufferSizeRequested = false;
+        auto hwBufferSizeDesc = MetricSource::getHwBufferSizeDesc(static_cast<zet_base_desc_t *>(const_cast<void *>(desc->pNext)));
+
+        if (hwBufferSizeDesc != std::nullopt) {
+            hwBufferSizeDesc.value()->sizeInBytes /= subDeviceCount;
+            isHwBufferSizeRequested = true;
+        }
+
         for (uint32_t i = 0; i < subDeviceCount; i++) {
 
             auto metricGroupsSubDevice = static_cast<OaMetricGroupImp *>(MetricGroup::fromHandle(getMetricGroups()[i]));
-            result = metricGroupsSubDevice->openForDevice(pDeviceImp->subDevices[i], *desc, &metricStreamers[i]);
+            result = metricGroupsSubDevice->openForDevice(pDevice->subDevices[i], *desc, isNotificationEnabled, &metricStreamers[i]);
             if (result != ZE_RESULT_SUCCESS) {
                 for (uint32_t j = 0; j < i; j++) {
                     auto metricStreamerSubDevice = MetricStreamer::fromHandle(metricStreamers[j]);
@@ -320,10 +345,15 @@ ze_result_t OaMetricGroupImp::streamerOpen(
             }
         }
 
+        // for a root-device handle, update the sizeInBytes considering the sub-device count
+        if (isHwBufferSizeRequested) {
+            hwBufferSizeDesc.value()->sizeInBytes *= subDeviceCount;
+        }
+
         *phMetricStreamer = pMetricStreamer->toHandle();
 
     } else {
-        result = openForDevice(pDevice, *desc, phMetricStreamer);
+        result = openForDevice(pDevice, *desc, isNotificationEnabled, phMetricStreamer);
     }
 
     if (result == ZE_RESULT_SUCCESS) {
@@ -335,30 +365,8 @@ ze_result_t OaMetricGroupImp::streamerOpen(
 }
 
 ze_result_t OaMetricStreamerImp::appendStreamerMarker(CommandList &commandList, uint32_t value) {
-
-    DeviceImp *pDeviceImp = static_cast<DeviceImp *>(commandList.getDevice());
-
-    if (pDeviceImp->metricContext->isImplicitScalingCapable()) {
-        // Use one of the sub-device contexts to append to command list.
-        pDeviceImp = static_cast<DeviceImp *>(pDeviceImp->subDevices[0]);
-    }
-
-    OaMetricSourceImp &metricSource = pDeviceImp->metricContext->getMetricSource<OaMetricSourceImp>();
-    auto &metricsLibrary = metricSource.getMetricsLibrary();
-
-    const uint32_t streamerMarkerHighBitsShift = 25;
-
-    // Obtain gpu commands.
-    CommandBufferData_1_0 commandBuffer = {};
-    commandBuffer.CommandsType = ObjectType::MarkerStreamUser;
-    commandBuffer.MarkerStreamUser.Value = value;
-    commandBuffer.MarkerStreamUser.Reserved = (value >> streamerMarkerHighBitsShift);
-    commandBuffer.Type = metricSource.isComputeUsed()
-                             ? GpuCommandBufferType::Compute
-                             : GpuCommandBufferType::Render;
-
-    return metricsLibrary.getGpuCommands(commandList, commandBuffer) ? ZE_RESULT_SUCCESS
-                                                                     : ZE_RESULT_ERROR_UNKNOWN;
+    auto &metricSource = commandList.getDevice()->getMetricDeviceContext().getMetricSource<OaMetricSourceImp>();
+    return metricSource.appendMarker(commandList.toHandle(), hMetricGroup, value);
 }
 
 } // namespace L0

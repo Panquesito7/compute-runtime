@@ -1,318 +1,110 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/stream_properties.h"
-#include "shared/source/execution_environment/execution_environment.h"
-#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/allocation_type.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/xe_hpg_core/hw_cmds_mtl.h"
-#include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/default_hw_info.h"
-#include "shared/test/common/helpers/gtest_helpers.h"
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/os_interface/product_helper_tests.h"
 
-#include "aubstream/product_family.h"
 #include "platforms.h"
+
+namespace NEO {
+extern ApiSpecificConfig::ApiType apiTypeForUlts;
+}
 
 using namespace NEO;
 
 using MtlProductHelper = ProductHelperTest;
 
-MTLTEST_F(MtlProductHelper, givenMtlConfigWhenSetupHardwareInfoBaseThenGtSystemInfoIsCorrect) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
-    GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
-    MtlHwConfig::setupHardwareInfoBase(&hwInfo, false, *compilerProductHelper);
-
-    EXPECT_EQ(336u, gtSystemInfo.TotalVsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalHsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalDsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalGsThreads);
-    EXPECT_EQ(64u, gtSystemInfo.TotalPsThreadsWindowerRange);
-    EXPECT_EQ(8u, gtSystemInfo.CsrSizeInMb);
-    EXPECT_FALSE(gtSystemInfo.IsL3HashModeEnabled);
-    EXPECT_FALSE(gtSystemInfo.IsDynamicallyPopulated);
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlConfigWhenSetupHardwareInfoThenGtSystemInfoHasNonZeroValues) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
-    GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
-    MtlHwConfig::setupHardwareInfo(&hwInfo, false, *compilerProductHelper);
-
-    EXPECT_GT(gtSystemInfo.SliceCount, 0u);
-    EXPECT_GT(gtSystemInfo.SubSliceCount, 0u);
-    EXPECT_GT(gtSystemInfo.DualSubSliceCount, 0u);
-    EXPECT_GT(gtSystemInfo.EUCount, 0u);
-    EXPECT_GT(gtSystemInfo.MaxEuPerSubSlice, 0u);
-    EXPECT_GT(gtSystemInfo.MaxSlicesSupported, 0u);
-    EXPECT_GT_VAL(gtSystemInfo.L3CacheSizeInKb, 0u);
-    EXPECT_GT(gtSystemInfo.L3BankCount, 0u);
-
-    EXPECT_TRUE(gtSystemInfo.CCSInfo.IsValid);
-    EXPECT_GT(gtSystemInfo.CCSInfo.NumberOfCCSEnabled, 0u);
-}
-
-MTLTEST_F(MtlProductHelper, whenGettingAubstreamProductFamilyThenProperEnumValueIsReturned) {
-    EXPECT_EQ(aub_stream::ProductFamily::Mtl, productHelper->getAubStreamProductFamily());
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlProductHelperWhenIsInitBuiltinAsyncSupportedThenReturnFalse) {
-    EXPECT_FALSE(productHelper->isInitBuiltinAsyncSupported(*defaultHwInfo));
-}
-
-MTLTEST_F(MtlProductHelper, givenProductHelperWhenGettingEvictIfNecessaryFlagSupportedThenExpectTrue) {
-    EXPECT_TRUE(productHelper->isEvictionIfNecessaryFlagSupported());
-}
-
-MTLTEST_F(MtlProductHelper, givenProductHelperWhenGetCommandsStreamPropertiesSupportThenExpectCorrectValues) {
-
-    EXPECT_FALSE(productHelper->getScmPropertyThreadArbitrationPolicySupport());
-    EXPECT_TRUE(productHelper->getScmPropertyCoherencyRequiredSupport());
-    EXPECT_TRUE(productHelper->getScmPropertyZPassAsyncComputeThreadLimitSupport());
-    EXPECT_TRUE(productHelper->getScmPropertyPixelAsyncComputeThreadLimitSupport());
-    EXPECT_TRUE(productHelper->getScmPropertyLargeGrfModeSupport());
-    EXPECT_FALSE(productHelper->getScmPropertyDevicePreemptionModeSupport());
-
-    EXPECT_FALSE(productHelper->getStateBaseAddressPropertyGlobalAtomicsSupport());
-    EXPECT_TRUE(productHelper->getStateBaseAddressPropertyBindingTablePoolBaseAddressSupport());
-
-    EXPECT_TRUE(productHelper->getFrontEndPropertyScratchSizeSupport());
-    EXPECT_TRUE(productHelper->getFrontEndPropertyPrivateScratchSizeSupport());
-
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyPreemptionModeSupport());
-    EXPECT_TRUE(productHelper->getPreemptionDbgPropertyStateSipSupport());
-    EXPECT_FALSE(productHelper->getPreemptionDbgPropertyCsrSurfaceSupport());
-
-    EXPECT_FALSE(productHelper->getFrontEndPropertyComputeDispatchAllWalkerSupport());
-    EXPECT_TRUE(productHelper->getFrontEndPropertyDisableEuFusionSupport());
-    EXPECT_TRUE(productHelper->getFrontEndPropertyDisableOverDispatchSupport());
-    EXPECT_TRUE(productHelper->getFrontEndPropertySingleSliceDispatchCcsModeSupport());
-
-    EXPECT_FALSE(productHelper->getPipelineSelectPropertyMediaSamplerDopClockGateSupport());
-    EXPECT_TRUE(productHelper->getPipelineSelectPropertySystolicModeSupport());
-}
-
-MTLTEST_F(MtlProductHelper, givenProductHelperWhenAdditionalKernelExecInfoSupportCheckedThenCorrectValueIsReturned) {
-
+MTLTEST_F(MtlProductHelper, givenMtlWithoutHwIpVersionInHwInfoWhenGettingIpVersionThenCorrectValueIsReturnedBasedOnDeviceIdAndRevId) {
     auto hwInfo = *defaultHwInfo;
-    EXPECT_TRUE(productHelper->isDisableOverdispatchAvailable(hwInfo));
+    hwInfo.ipVersion = {};
 
-    FrontEndPropertiesSupport fePropertiesSupport{};
-    productHelper->fillFrontEndPropertiesSupportStructure(fePropertiesSupport, hwInfo);
-    EXPECT_TRUE(fePropertiesSupport.disableOverdispatch);
+    auto mtlMDeviceIds = {0x7D40, 0x7D45};
+    auto mtlPDeviceIds = {0x7D55, 0X7DD5};
 
-    hwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(REVISION_B, hwInfo);
-    EXPECT_TRUE(productHelper->isDisableOverdispatchAvailable(hwInfo));
+    for (auto &deviceId : mtlMDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        for (auto &revision : {0, 2}) {
+            hwInfo.platform.usRevId = revision;
 
-    productHelper->fillFrontEndPropertiesSupportStructure(fePropertiesSupport, hwInfo);
-    EXPECT_TRUE(fePropertiesSupport.disableOverdispatch);
+            EXPECT_EQ(AOT::MTL_U_A0, compilerProductHelper->getHwIpVersion(hwInfo));
+        }
+        for (auto &revision : {3, 8}) {
+            hwInfo.platform.usRevId = revision;
+
+            EXPECT_EQ(AOT::MTL_U_B0, compilerProductHelper->getHwIpVersion(hwInfo));
+        }
+        hwInfo.platform.usRevId = 0xdead;
+
+        EXPECT_EQ(compilerProductHelper->getDefaultHwIpVersion(), compilerProductHelper->getHwIpVersion(hwInfo));
+    }
+
+    for (auto &deviceId : mtlPDeviceIds) {
+        hwInfo.platform.usDeviceID = deviceId;
+        for (auto &revision : {0, 2}) {
+            hwInfo.platform.usRevId = revision;
+
+            EXPECT_EQ(AOT::MTL_H_A0, compilerProductHelper->getHwIpVersion(hwInfo));
+        }
+        for (auto &revision : {3, 8}) {
+            hwInfo.platform.usRevId = revision;
+
+            EXPECT_EQ(AOT::MTL_H_B0, compilerProductHelper->getHwIpVersion(hwInfo));
+        }
+        hwInfo.platform.usRevId = 0xdead;
+
+        EXPECT_EQ(compilerProductHelper->getDefaultHwIpVersion(), compilerProductHelper->getHwIpVersion(hwInfo));
+    }
+
+    hwInfo.platform.usDeviceID = 0;
+    hwInfo.platform.usRevId = 0xdead;
+
+    EXPECT_EQ(compilerProductHelper->getDefaultHwIpVersion(), compilerProductHelper->getHwIpVersion(hwInfo));
 }
 
-MTLTEST_F(MtlProductHelper, givenCompressionFtrEnabledWhenAskingForPageTableManagerThenReturnCorrectValue) {
-    auto hwInfo = *defaultHwInfo;
+MTLTEST_F(MtlProductHelper, givenProductHelperWhenCheckoverrideAllocationCpuCacheableThenTrueIsReturnedForCommandBuffer) {
+    AllocationData allocationData{};
+    allocationData.type = AllocationType::commandBuffer;
+    EXPECT_TRUE(productHelper->overrideAllocationCpuCacheable(allocationData));
 
-    hwInfo.capabilityTable.ftrRenderCompressedBuffers = false;
-    hwInfo.capabilityTable.ftrRenderCompressedImages = false;
-    EXPECT_FALSE(productHelper->isPageTableManagerSupported(hwInfo));
-
-    hwInfo.capabilityTable.ftrRenderCompressedBuffers = true;
-    hwInfo.capabilityTable.ftrRenderCompressedImages = false;
-    EXPECT_TRUE(productHelper->isPageTableManagerSupported(hwInfo));
-
-    hwInfo.capabilityTable.ftrRenderCompressedBuffers = false;
-    hwInfo.capabilityTable.ftrRenderCompressedImages = true;
-    EXPECT_TRUE(productHelper->isPageTableManagerSupported(hwInfo));
-
-    hwInfo.capabilityTable.ftrRenderCompressedBuffers = true;
-    hwInfo.capabilityTable.ftrRenderCompressedImages = true;
-    EXPECT_TRUE(productHelper->isPageTableManagerSupported(hwInfo));
+    allocationData.type = AllocationType::buffer;
+    EXPECT_FALSE(productHelper->overrideAllocationCpuCacheable(allocationData));
 }
 
-MTLTEST_F(MtlProductHelper, givenHwIpVersionWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnCcsThenAllowOnlyOn12700And12710) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto isRcs = false;
-
-    hwInfo.ipVersion.architecture = 12;
-    hwInfo.ipVersion.release = 70;
-    hwInfo.ipVersion.revision = 0;
-    refreshReleaseHelper(&hwInfo);
-
+MTLTEST_F(MtlProductHelper, givenProductHelperWhenCheckingIsHostDeviceUsmPoolAllocatorSupportedThenCorrectValueIsReturned) {
     {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_TRUE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmPoolAllocatorSupported());
     }
-
-    hwInfo.ipVersion.revision = 4;
-    refreshReleaseHelper(&hwInfo);
-
     {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_FALSE(isBasicWARequired);
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        EXPECT_FALSE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_FALSE(productHelper->isDeviceUsmPoolAllocatorSupported());
     }
+}
 
-    hwInfo.ipVersion.release = 71;
-    hwInfo.ipVersion.revision = 0;
-    refreshReleaseHelper(&hwInfo);
-
+MTLTEST_F(MtlProductHelper, givenProductHelperWhenCheckingIsUsmAllocationReuseSupportedThenCorrectValueIsReturned) {
     {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_TRUE(productHelper->isHostUsmAllocationReuseSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmAllocationReuseSupported());
     }
-
-    hwInfo.ipVersion.revision = 4;
-    refreshReleaseHelper(&hwInfo);
-
     {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_FALSE(isBasicWARequired);
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        EXPECT_FALSE(productHelper->isHostUsmAllocationReuseSupported());
+        EXPECT_FALSE(productHelper->isDeviceUsmAllocationReuseSupported());
     }
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlNotLpgWhenIsBFloat16ConversionSupportedIsCalledThenTrueIsReturned) {
-    auto hwInfo = *defaultHwInfo.get();
-    uint32_t notLpgArchitecture = 10;
-
-    HardwareIpVersion aotConfig = {0};
-    aotConfig.architecture = notLpgArchitecture;
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
-
-    EXPECT_TRUE(compilerProductHelper.isBFloat16ConversionSupported(hwInfo));
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlLpgWhenIsBFloat16ConversionSupportedIsCalledThenFalseIsReturned) {
-    auto hwInfo = *defaultHwInfo.get();
-    uint32_t lpgArchitecture = 12;
-    uint32_t lpgRelease = 71;
-
-    HardwareIpVersion aotConfig = {0};
-    aotConfig.architecture = lpgArchitecture;
-    aotConfig.release = lpgRelease;
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
-
-    EXPECT_FALSE(compilerProductHelper.isBFloat16ConversionSupported(hwInfo));
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlMA0WhengetProductMaxPreferredSlmSizeThen96KbValueReturned) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename XeHpgCoreFamily::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
-    PREFERRED_SLM_ALLOCATION_SIZE preferredEnumValue = PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K;
-    auto hwInfo = *defaultHwInfo.get();
-    HardwareIpVersion aotConfig = {0};
-    aotConfig.value = AOT::MTL_M_A0;
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
-    preferredEnumValue = static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(productHelper->getProductMaxPreferredSlmSize(hwInfo, preferredEnumValue));
-    EXPECT_EQ(preferredEnumValue, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_96K);
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlPA0WhengetProductMaxPreferredSlmSizeThen96KbValueReturned) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename XeHpgCoreFamily::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
-    PREFERRED_SLM_ALLOCATION_SIZE preferredEnumValue = PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K;
-    auto hwInfo = *defaultHwInfo.get();
-    HardwareIpVersion aotConfig = {0};
-    aotConfig.value = AOT::MTL_P_A0;
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
-    preferredEnumValue = static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(productHelper->getProductMaxPreferredSlmSize(hwInfo, preferredEnumValue));
-    EXPECT_EQ(preferredEnumValue, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_96K);
-}
-MTLTEST_F(MtlProductHelper, givenMtlMB0WhengetProductMaxPreferredSlmSizeThenPassedValueReturned) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename XeHpgCoreFamily::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
-    PREFERRED_SLM_ALLOCATION_SIZE preferredEnumValue = PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K;
-    auto hwInfo = *defaultHwInfo.get();
-    HardwareIpVersion aotConfig = {0};
-    aotConfig.value = AOT::MTL_M_B0;
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
-    preferredEnumValue = static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(productHelper->getProductMaxPreferredSlmSize(hwInfo, preferredEnumValue));
-    EXPECT_EQ(preferredEnumValue, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K);
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlPB0WhengetProductMaxPreferredSlmSizeThenPassedValueReturned) {
-    using PREFERRED_SLM_ALLOCATION_SIZE = typename XeHpgCoreFamily::INTERFACE_DESCRIPTOR_DATA::PREFERRED_SLM_ALLOCATION_SIZE;
-    PREFERRED_SLM_ALLOCATION_SIZE preferredEnumValue = PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K;
-    auto hwInfo = *defaultHwInfo.get();
-    HardwareIpVersion aotConfig = {0};
-    aotConfig.value = AOT::MTL_P_B0;
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    compilerProductHelper.setProductConfigForHwInfo(hwInfo, aotConfig);
-    preferredEnumValue = static_cast<PREFERRED_SLM_ALLOCATION_SIZE>(productHelper->getProductMaxPreferredSlmSize(hwInfo, preferredEnumValue));
-    EXPECT_EQ(preferredEnumValue, PREFERRED_SLM_ALLOCATION_SIZE::PREFERRED_SLM_ALLOCATION_SIZE_0K);
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlWhenCallIsAdjustWalkOrderAvailableThenReturnProperValue) {
-    VariableBackup<HardwareInfo> backupHwInfo(defaultHwInfo.get());
-    unsigned int gmdReleases[] = {70, 71};
-    defaultHwInfo->ipVersion.architecture = 12;
-
-    for (auto gmdRelease : gmdReleases) {
-        defaultHwInfo->ipVersion.release = gmdRelease;
-        refreshReleaseHelper(defaultHwInfo.get());
-        EXPECT_EQ(!MTL::isLpg(*defaultHwInfo), productHelper->isAdjustWalkOrderAvailable(releaseHelper));
-    }
-}
-
-MTLTEST_F(MtlProductHelper, givenMtlAndReleaseHelperNullptrWhengetIsMatrixMultiplyAccumulateSupportedThenReturnsFalse) {
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    ReleaseHelper *releaseHelper = nullptr;
-    EXPECT_FALSE(compilerProductHelper.isMatrixMultiplyAccumulateSupported(releaseHelper));
-}
-
-MTLTEST_F(MtlProductHelper, givenVariousMtlReleasesWhenGetExtensionsIsCalledThenMatrixMultiplyAccumulateExtensionsAreCorrectlyReported) {
-
-    auto &rootDeviceEnvironment = *this->executionEnvironment->rootDeviceEnvironments[0].get();
-    auto &compilerProductHelper = this->executionEnvironment->rootDeviceEnvironments[0]->getHelper<CompilerProductHelper>();
-    auto &hwInfo = *rootDeviceEnvironment.getMutableHardwareInfo();
-    unsigned int gmdReleases[] = {70, 71};
-    hwInfo.ipVersion.architecture = 12;
-
-    for (auto gmdRelease : gmdReleases) {
-        hwInfo.ipVersion.release = gmdRelease;
-
-        refreshReleaseHelper(&hwInfo);
-        auto releaseHelper = rootDeviceEnvironment.getReleaseHelper();
-        auto extensions = compilerProductHelper.getDeviceExtensions(hwInfo, releaseHelper);
-
-        EXPECT_EQ(!MTL::isLpg(hwInfo), hasSubstr(extensions, std::string("cl_intel_subgroup_matrix_multiply_accumulate")));
-        EXPECT_EQ(!MTL::isLpg(hwInfo), hasSubstr(extensions, std::string("cl_intel_subgroup_split_matrix_multiply_accumulate")));
-        EXPECT_EQ(!MTL::isLpg(hwInfo), compilerProductHelper.isMatrixMultiplyAccumulateSupported(releaseHelper));
-        EXPECT_EQ(!MTL::isLpg(hwInfo), compilerProductHelper.isSplitMatrixMultiplyAccumulateSupported(hwInfo));
-    }
-}
-
-using ProductHelperTestMtl = Test<DeviceFixture>;
-
-MTLTEST_F(ProductHelperTestMtl, givenPatIndexAndAllocationTypeWhenCallOverridePatIndexThenForTimestampPacketTagBufferReturnTwo) {
-    auto &helper = getHelper<ProductHelper>();
-    uint64_t expectedPatIndexWhenTimestampPacketTagBuffer = 2u;
-    uint64_t patIndex = 1u;
-    auto allocationType = NEO::AllocationType::TIMESTAMP_PACKET_TAG_BUFFER;
-    EXPECT_EQ(expectedPatIndexWhenTimestampPacketTagBuffer, helper.overridePatIndex(allocationType, patIndex));
-    allocationType = NEO::AllocationType::BUFFER;
-    patIndex = 3u;
-    EXPECT_EQ(patIndex, helper.overridePatIndex(allocationType, patIndex));
-}
-
-MTLTEST_F(ProductHelperTestMtl, givenMtlWhenCheckIsCachingOnCpuAvailableThenAlwaysFalse) {
-    const auto &productHelper = getHelper<ProductHelper>();
-    EXPECT_FALSE(productHelper.isCachingOnCpuAvailable());
 }

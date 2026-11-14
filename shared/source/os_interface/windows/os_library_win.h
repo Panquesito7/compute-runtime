@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/os_interface/os_library.h"
 
 #define UMDF_USING_NTSTATUS
@@ -14,24 +15,31 @@
 namespace NEO {
 namespace Windows {
 
-class OsLibrary : public NEO::OsLibrary {
+extern "C" IMAGE_DOS_HEADER __ImageBase; // NOLINT(readability-identifier-naming)
+__inline HINSTANCE getModuleHINSTANCE() { return (HINSTANCE)&__ImageBase; }
+
+class OsLibrary : public NEO::OsLibrary, NEO::NonCopyableAndNonMovableClass {
   private:
     HMODULE handle;
 
   public:
-    OsLibrary(const std::string &name, std::string *errorValue);
+    OsLibrary(const OsLibraryCreateProperties &properties);
     ~OsLibrary();
 
     bool isLoaded();
     void *getProcAddress(const std::string &procName);
     static decltype(&GetSystemDirectoryA) getSystemDirectoryA;
     void getLastErrorString(std::string *errorValue);
+    std::string getFullPath();
 
   protected:
     HMODULE loadDependency(const std::string &dependencyFileName) const;
 
+    static decltype(&GetModuleHandleA) getModuleHandleA;
     static decltype(&LoadLibraryExA) loadLibraryExA;
     static decltype(&GetModuleFileNameA) getModuleFileNameA;
+    static decltype(&FreeLibrary) freeLibrary;
+    bool selfOpen = false;
 };
 } // namespace Windows
 } // namespace NEO

@@ -1,0 +1,61 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_stream/command_stream_receiver.h"
+#include "shared/source/helpers/blit_properties.h"
+#include "shared/source/memory_manager/memory_operations_handler.h"
+#include "shared/source/xe2_hpg_core/hw_cmds.h"
+
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_base.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_pvc_and_later.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_pvc_to_xe2.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_xe2_hpg_and_later.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_xe2_hpg_xe3.inl"
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_xehp_and_later.inl"
+#include "level_zero/core/source/helpers/l0_populate_factory.h"
+
+namespace L0 {
+using Family = NEO::Xe2HpgCoreFamily;
+static auto gfxCore = IGFX_XE2_HPG_CORE;
+
+template <typename Family>
+uint32_t L0GfxCoreHelperHw<Family>::getGrfRegisterCount(uint32_t *regPtr) const {
+    bool largeGrfModeEnabled = false;
+    largeGrfModeEnabled = ((regPtr[1] & 0x6000) == 0x6000);
+    if (largeGrfModeEnabled) {
+        return 256;
+    }
+    return 128;
+}
+
+template <>
+bool L0GfxCoreHelperHw<Family>::alwaysAllocateEventInLocalMem() const {
+    return true;
+}
+
+template <>
+void L0GfxCoreHelperHw<Family>::p2pDecompressBufferIfRequired(NEO::GraphicsAllocation *alloc, DriverHandle *driverHandle) const {
+    // Devices of a driver handle are one product family, so they are not indexed by root device index.
+    for (auto device : driverHandle->devices) {
+        auto neoDevice = device->getNEODevice();
+        if (neoDevice->getRootDeviceIndex() != alloc->getRootDeviceIndex()) {
+            continue;
+        }
+        auto memoryOperationsIface = neoDevice->getRootDeviceEnvironment().memoryOperationsInterface.get();
+        if (memoryOperationsIface) {
+            memoryOperationsIface->decompress(neoDevice, *alloc);
+        }
+        break;
+    }
+}
+
+#include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper_from_xe2_hpg_to_xe3.inl"
+#include "level_zero/core/source/helpers/l0_gfx_core_helper_factory_init.inl"
+
+template class L0GfxCoreHelperHw<Family>;
+} // namespace L0

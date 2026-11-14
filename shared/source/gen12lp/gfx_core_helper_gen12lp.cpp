@@ -1,42 +1,117 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/gen12lp/aub_mapper.h"
 #include "shared/source/gen12lp/hw_cmds_base.h"
+#include "shared/source/helpers/populate_factory.h"
 
 using Family = NEO::Gen12LpFamily;
 
+#include "shared/source/helpers/engine_node_helper.h"
 #include "shared/source/helpers/flat_batch_buffer_helper_hw.inl"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/gfx_core_helper_base.inl"
-#include "shared/source/helpers/gfx_core_helper_bdw_and_later.inl"
-#include "shared/source/helpers/gfx_core_helper_bdw_to_dg2.inl"
 #include "shared/source/helpers/gfx_core_helper_tgllp_and_later.inl"
+#include "shared/source/helpers/gfx_core_helper_tgllp_to_dg2.inl"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/helpers/local_memory_access_modes.h"
-#include "shared/source/helpers/logical_state_helper.inl"
+#include "shared/source/kernel/kernel_descriptor.h"
 
 namespace NEO {
+
+template <typename GfxFamily>
+inline uint32_t GfxCoreHelperHw<GfxFamily>::getGlobalTimeStampBits() const {
+    return 36;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::timestampPacketWriteSupported() const {
+    return false;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isUpdateTaskCountFromWaitSupported() const {
+    return false;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getAmountOfAllocationsToFill() const {
+    if (debugManager.flags.SetAmountOfReusableAllocations.get() != -1) {
+        return debugManager.flags.SetAmountOfReusableAllocations.get();
+    }
+    return 0u;
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::makeResidentBeforeLockNeeded(bool precondition) const {
+    return precondition;
+}
+
+template <typename GfxFamily>
+inline uint32_t GfxCoreHelperHw<GfxFamily>::calculateMaxWorkGroupSize(const KernelDescriptor &kernelDescriptor, uint32_t defaultMaxGroupSize, const RootDeviceEnvironment &rootDeviceEnvironment) const {
+    return std::min(defaultMaxGroupSize, CommonConstants::maxWorkgroupSize);
+}
+
+template <typename GfxFamily>
+aub_stream::MMIOList GfxCoreHelperHw<GfxFamily>::getExtraMmioList(const HardwareInfo &hwInfo, const GmmHelper &gmmHelper) const {
+    return {};
+}
+
+template <typename GfxFamily>
+inline void MemorySynchronizationCommands<GfxFamily>::setPostSyncExtraProperties(PipeControlArgs &args) {
+}
+
+template <typename GfxFamily>
+inline void MemorySynchronizationCommands<GfxFamily>::setBarrierWaFlags(void *barrierCmd) {
+    reinterpret_cast<typename GfxFamily::PIPE_CONTROL *>(barrierCmd)->setCommandStreamerStallEnable(true);
+}
+
+template <typename GfxFamily>
+bool GfxCoreHelperHw<GfxFamily>::isScratchSpaceSurfaceStateAccessible() const {
+    return false;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getMaxScratchSize(const NEO::ProductHelper &productHelper) const {
+    return 2 * MemoryConstants::megaByte;
+}
+
+template <typename GfxFamily>
+inline bool GfxCoreHelperHw<GfxFamily>::platformSupportsImplicitScaling(const NEO::RootDeviceEnvironment &rootDeviceEnvironment) const {
+    return false;
+}
+
+template <typename GfxFamily>
+inline bool GfxCoreHelperHw<GfxFamily>::preferInternalBcsEngine() const {
+    return false;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getMinimalScratchSpaceSize() const {
+    return 1024U;
+}
+
+template <typename GfxFamily>
+uint32_t GfxCoreHelperHw<GfxFamily>::getKernelPrivateMemSize(const KernelDescriptor &kernelDescriptor) const {
+    return kernelDescriptor.kernelAttributes.perHwThreadPrivateMemorySize;
+}
 
 template <>
 inline bool GfxCoreHelperHw<Family>::isFusedEuDispatchEnabled(const HardwareInfo &hwInfo, bool disableEUFusionForKernel) const {
     auto fusedEuDispatchEnabled = !hwInfo.workaroundTable.flags.waDisableFusedThreadScheduling;
     fusedEuDispatchEnabled &= hwInfo.capabilityTable.fusedEuEnabled;
 
-    if (disableEUFusionForKernel)
+    if (disableEUFusionForKernel) {
         fusedEuDispatchEnabled = false;
+    }
 
-    if (DebugManager.flags.CFEFusedEUDispatch.get() != -1) {
-        fusedEuDispatchEnabled = (DebugManager.flags.CFEFusedEUDispatch.get() == 0);
+    if (debugManager.flags.CFEFusedEUDispatch.get() != -1) {
+        fusedEuDispatchEnabled = (debugManager.flags.CFEFusedEUDispatch.get() == 0);
     }
     return fusedEuDispatchEnabled;
-}
-
-template <>
-size_t GfxCoreHelperHw<Family>::getMax3dImageWidthOrHeight() const {
-    return 2048;
 }
 
 template <>
@@ -47,11 +122,6 @@ bool GfxCoreHelperHw<Family>::isOffsetToSkipSetFFIDGPWARequired(const HardwareIn
 template <>
 bool GfxCoreHelperHw<Family>::isWaDisableRccRhwoOptimizationRequired() const {
     return true;
-}
-
-template <>
-bool GfxCoreHelperHw<Family>::isAdditionalFeatureFlagRequired(const FeatureTable *featureTable) const {
-    return featureTable->flags.ftrGpGpuMidThreadLevelPreempt;
 }
 
 template <>
@@ -70,8 +140,8 @@ bool GfxCoreHelperHw<Family>::isLocalMemoryEnabled(const HardwareInfo &hwInfo) c
 
 template <>
 bool GfxCoreHelperHw<Family>::isBufferSizeSuitableForCompression(const size_t size) const {
-    if (DebugManager.flags.OverrideBufferSuitableForRenderCompression.get() != -1) {
-        return !!DebugManager.flags.OverrideBufferSuitableForRenderCompression.get();
+    if (debugManager.flags.OverrideBufferSuitableForRenderCompression.get() != -1) {
+        return !!debugManager.flags.OverrideBufferSuitableForRenderCompression.get();
     }
     return false;
 }
@@ -103,17 +173,34 @@ const EngineInstancesContainer GfxCoreHelperHw<Family>::getGpgpuEngineInstances(
 
     EngineInstancesContainer engines;
 
-    if (defaultEngine == aub_stream::EngineType::ENGINE_CCS && hwInfo.featureTable.flags.ftrCCSNode && !hwInfo.featureTable.flags.ftrGpGpuMidThreadLevelPreempt) {
-        engines.push_back({aub_stream::ENGINE_CCS, EngineUsage::Regular});
+    if (defaultEngine == aub_stream::EngineType::ENGINE_CCS && hwInfo.featureTable.flags.ftrCCSNode) {
+        engines.push_back({aub_stream::ENGINE_CCS, EngineUsage::regular});
     }
 
-    engines.push_back({aub_stream::ENGINE_RCS, EngineUsage::Regular});
-    engines.push_back({aub_stream::ENGINE_RCS, EngineUsage::LowPriority}); // low priority
-    engines.push_back({defaultEngine, EngineUsage::Internal});             // internal usage
+    engines.push_back({aub_stream::ENGINE_RCS, EngineUsage::regular});
+    engines.push_back({aub_stream::ENGINE_RCS, EngineUsage::lowPriority}); // low priority
+    engines.push_back({defaultEngine, EngineUsage::internal});             // internal usage
+
+    const bool isPowerHintEngineSupported = NEO::EngineHelpers::isPowerHintEngineSupported(rootDeviceEnvironment);
+    if (isPowerHintEngineSupported) {
+        engines.push_back({defaultEngine, EngineUsage::powerHint});
+    }
 
     if (hwInfo.capabilityTable.blitterOperationsSupported) {
         if (hwInfo.featureTable.ftrBcsInfo.test(0)) {
-            engines.push_back({aub_stream::ENGINE_BCS, EngineUsage::Regular});
+            engines.push_back({aub_stream::ENGINE_BCS, EngineUsage::regular}); // Main copy engine
+            if (!hwInfo.capabilityTable.isIntegratedDevice) {
+                engines.push_back({aub_stream::ENGINE_BCS, EngineUsage::internal}); // internal usage
+            }
+        }
+
+        if (isPowerHintEngineSupported) {
+            const auto &productHelper = rootDeviceEnvironment.getProductHelper();
+            auto defaultCopyEngine = productHelper.getDefaultCopyEngine();
+            auto defaultCopyBcsIndex = NEO::EngineHelpers::getBcsIndex(defaultCopyEngine);
+            if (defaultCopyBcsIndex < hwInfo.featureTable.ftrBcsInfo.size() && hwInfo.featureTable.ftrBcsInfo.test(defaultCopyBcsIndex)) {
+                engines.push_back({defaultCopyEngine, EngineUsage::powerHint});
+            }
         }
     }
 
@@ -124,26 +211,24 @@ template <>
 EngineGroupType GfxCoreHelperHw<Family>::getEngineGroupType(aub_stream::EngineType engineType, EngineUsage engineUsage, const HardwareInfo &hwInfo) const {
     switch (engineType) {
     case aub_stream::ENGINE_RCS:
-        return EngineGroupType::RenderCompute;
+        return EngineGroupType::renderCompute;
     case aub_stream::ENGINE_CCS:
-        return EngineGroupType::Compute;
+        return EngineGroupType::compute;
     case aub_stream::ENGINE_BCS:
-        return EngineGroupType::Copy;
+        return EngineGroupType::copy;
     default:
         UNRECOVERABLE_IF(true);
     }
 }
 
 template <>
-inline void MemorySynchronizationCommands<Family>::setBarrierExtraProperties(void *barrierCmd, PipeControlArgs &args) {
-    auto &pipeControl = *reinterpret_cast<typename Family::PIPE_CONTROL *>(barrierCmd);
-
+inline void MemorySynchronizationCommands<Family>::setPipeControlExtraProperties(Family::PIPE_CONTROL &pipeControl, PipeControlArgs &args) {
     pipeControl.setHdcPipelineFlush(args.hdcPipelineFlush);
 
-    if (DebugManager.flags.FlushAllCaches.get()) {
+    if (debugManager.flags.FlushAllCaches.get()) {
         pipeControl.setHdcPipelineFlush(true);
     }
-    if (DebugManager.flags.DoNotFlushCaches.get()) {
+    if (debugManager.flags.DoNotFlushCaches.get()) {
         pipeControl.setHdcPipelineFlush(false);
     }
 }
@@ -162,18 +247,18 @@ bool GfxCoreHelperHw<Family>::useOnlyGlobalTimestamps() const {
 template <>
 uint32_t GfxCoreHelperHw<Family>::getMocsIndex(const GmmHelper &gmmHelper, bool l3enabled, bool l1enabled) const {
     if (l3enabled) {
-        if (DebugManager.flags.ForceL1Caching.get() != 1) {
+        if (debugManager.flags.ForceL1Caching.get() != 1) {
             l1enabled = false;
         }
 
         if (l1enabled) {
-            return gmmHelper.getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CONST) >> 1;
+            return gmmHelper.getL1EnabledMOCS() >> 1;
         } else {
-            return gmmHelper.getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER) >> 1;
+            return gmmHelper.getL3EnabledMOCS() >> 1;
         }
     }
 
-    return gmmHelper.getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED) >> 1;
+    return gmmHelper.getUncachedMOCS() >> 1;
 }
 
 template <>
@@ -192,27 +277,22 @@ template <>
 void GfxCoreHelperHw<Family>::setExtraAllocationData(AllocationData &allocationData, const AllocationProperties &properties, const RootDeviceEnvironment &rootDeviceEnvironment) const {
     auto &productHelper = rootDeviceEnvironment.getHelper<ProductHelper>();
     auto &hwInfo = *rootDeviceEnvironment.getHardwareInfo();
-    if (productHelper.getLocalMemoryAccessMode(hwInfo) == LocalMemoryAccessMode::CpuAccessDisallowed) {
+    if (productHelper.getLocalMemoryAccessMode(hwInfo) == LocalMemoryAccessMode::cpuAccessDisallowed) {
         if (GraphicsAllocation::isCpuAccessRequired(properties.allocationType)) {
             allocationData.flags.useSystemMemory = true;
         }
     }
-    if (productHelper.isStorageInfoAdjustmentRequired()) {
-        if (properties.allocationType == AllocationType::BUFFER && !properties.flags.preferCompressed && !properties.flags.shareable) {
+    if (hwInfo.caps.storageInfoAdjustmentRequired) {
+        if (properties.allocationType == AllocationType::buffer && !properties.flags.preferCompressed && !properties.flags.shareable) {
             allocationData.storageInfo.isLockable = true;
         }
     }
 }
 
-template <>
-bool GfxCoreHelperHw<Family>::forceNonGpuCoherencyWA(bool requiresCoherency) const {
-    return false;
-}
+#include "shared/source/helpers/gfx_core_helper_factory_init.inl"
 
 template class GfxCoreHelperHw<Family>;
 template class FlatBatchBufferHelperHw<Family>;
 template struct MemorySynchronizationCommands<Family>;
 template struct LriHelper<Family>;
-
-template LogicalStateHelper *LogicalStateHelper::create<Family>();
 } // namespace NEO

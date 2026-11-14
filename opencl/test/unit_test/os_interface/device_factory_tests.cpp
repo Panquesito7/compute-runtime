@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,15 +12,16 @@
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/os_interface/os_interface.h"
-#include "shared/source/os_interface/os_library.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/ult_hw_config.h"
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
+#include "shared/test/common/mocks/mock_io_functions.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/platform/platform.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
@@ -31,22 +32,17 @@
 
 using namespace NEO;
 
-OsLibrary *setAdapterInfo(const PLATFORM *platform, const GT_SYSTEM_INFO *gtSystemInfo, uint64_t gpuAddressSpace);
+void setAdapterInfo(const HardwareInfo *hwInfo);
 
 struct DeviceFactoryTest : public ::testing::Test {
   public:
     void SetUp() override {
         const HardwareInfo *hwInfo = defaultHwInfo.get();
         executionEnvironment = platform()->peekExecutionEnvironment();
-        mockGdiDll = setAdapterInfo(&hwInfo->platform, &hwInfo->gtSystemInfo, hwInfo->capabilityTable.gpuAddressSpace);
-    }
-
-    void TearDown() override {
-        delete mockGdiDll;
+        setAdapterInfo(hwInfo);
     }
 
   protected:
-    OsLibrary *mockGdiDll;
     ExecutionEnvironment *executionEnvironment;
 };
 
@@ -74,17 +70,17 @@ TEST_F(DeviceFactoryTest, WhenOverridingUsingDebugManagerThenOverridesAreApplied
     auto refEnableQuickKmdSleepForDirectSubmission = hwInfo->capabilityTable.kmdNotifyProperties.enableQuickKmdSleepForDirectSubmission;
     auto refDelayQuickKmdSleepForDirectSubmissionMicroseconds = hwInfo->capabilityTable.kmdNotifyProperties.delayQuickKmdSleepForDirectSubmissionMicroseconds;
 
-    DebugManager.flags.OverrideEnableKmdNotify.set(!refEnableKmdNotify);
-    DebugManager.flags.OverrideKmdNotifyDelayMicroseconds.set(static_cast<int32_t>(refDelayKmdNotifyMicroseconds) + 10);
+    debugManager.flags.OverrideEnableKmdNotify.set(!refEnableKmdNotify);
+    debugManager.flags.OverrideKmdNotifyDelayMicroseconds.set(static_cast<int32_t>(refDelayKmdNotifyMicroseconds) + 10);
 
-    DebugManager.flags.OverrideEnableQuickKmdSleep.set(!refEnableQuickKmdSleep);
-    DebugManager.flags.OverrideQuickKmdSleepDelayMicroseconds.set(static_cast<int32_t>(refDelayQuickKmdSleepMicroseconds) + 11);
+    debugManager.flags.OverrideEnableQuickKmdSleep.set(!refEnableQuickKmdSleep);
+    debugManager.flags.OverrideQuickKmdSleepDelayMicroseconds.set(static_cast<int32_t>(refDelayQuickKmdSleepMicroseconds) + 11);
 
-    DebugManager.flags.OverrideEnableQuickKmdSleepForSporadicWaits.set(!refEnableQuickKmdSleepForSporadicWaits);
-    DebugManager.flags.OverrideDelayQuickKmdSleepForSporadicWaitsMicroseconds.set(static_cast<int32_t>(refDelayQuickKmdSleepForSporadicWaitsMicroseconds) + 12);
+    debugManager.flags.OverrideEnableQuickKmdSleepForSporadicWaits.set(!refEnableQuickKmdSleepForSporadicWaits);
+    debugManager.flags.OverrideDelayQuickKmdSleepForSporadicWaitsMicroseconds.set(static_cast<int32_t>(refDelayQuickKmdSleepForSporadicWaitsMicroseconds) + 12);
 
-    DebugManager.flags.OverrideEnableQuickKmdSleepForDirectSubmission.set(!refEnableQuickKmdSleepForDirectSubmission);
-    DebugManager.flags.OverrideDelayQuickKmdSleepForDirectSubmissionMicroseconds.set(static_cast<int32_t>(refDelayQuickKmdSleepForDirectSubmissionMicroseconds) + 15);
+    debugManager.flags.OverrideEnableQuickKmdSleepForDirectSubmission.set(!refEnableQuickKmdSleepForDirectSubmission);
+    debugManager.flags.OverrideDelayQuickKmdSleepForDirectSubmissionMicroseconds.set(static_cast<int32_t>(refDelayQuickKmdSleepForDirectSubmissionMicroseconds) + 15);
 
     platformsImpl->clear();
     executionEnvironment = constructPlatform()->peekExecutionEnvironment();
@@ -113,7 +109,7 @@ TEST_F(DeviceFactoryTest, givenDebugFlagSetWhenCreatingDevicesThenForceImagesSup
     DebugManagerStateRestore stateRestore;
 
     for (int32_t flag : {0, 1}) {
-        DebugManager.flags.ForceImagesSupport.set(flag);
+        debugManager.flags.ForceImagesSupport.set(flag);
 
         MockExecutionEnvironment mockExecutionEnvironment(defaultHwInfo.get());
 
@@ -127,9 +123,10 @@ TEST_F(DeviceFactoryTest, givenDebugFlagSetWhenCreatingDevicesThenForceImagesSup
 
 TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetWhenCreateDevicesThenProperNumberOfDevicesIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleRootDevices.set(5);
-    DebugManager.flags.CreateMultipleSubDevices.set(4);
-    DebugManager.flags.ZE_AFFINITY_MASK.set("1.0,2.3,2.1,1.3,0,2.0,4.0,4.2,4.3,4.1");
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("COMPOSITE");
+    debugManager.flags.CreateMultipleRootDevices.set(5);
+    debugManager.flags.CreateMultipleSubDevices.set(4);
+    debugManager.flags.ZE_AFFINITY_MASK.set("1.0,2.3,2.1,1.3,0,2.0,4.0,4.2,4.3,4.1");
     VariableBackup<UltHwConfig> backup(&ultHwConfig);
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
 
@@ -144,9 +141,10 @@ TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetWhenCreateDevicesThenProperNumbe
 
 TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetToGreaterRootDeviceThanAvailableWhenCreateDevicesThenProperNumberOfDevicesIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleRootDevices.set(2);
-    DebugManager.flags.CreateMultipleSubDevices.set(4);
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0,92,1.1");
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("COMPOSITE");
+    debugManager.flags.CreateMultipleRootDevices.set(2);
+    debugManager.flags.CreateMultipleSubDevices.set(4);
+    debugManager.flags.ZE_AFFINITY_MASK.set("0,92,1.1");
     VariableBackup<UltHwConfig> backup(&ultHwConfig);
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
 
@@ -160,9 +158,10 @@ TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetToGreaterRootDeviceThanAvailable
 
 TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetToGreaterSubDeviceThanAvailableWhenCreateDevicesThenProperNumberOfDevicesIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleRootDevices.set(2);
-    DebugManager.flags.CreateMultipleSubDevices.set(4);
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0,1.54");
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("COMPOSITE");
+    debugManager.flags.CreateMultipleRootDevices.set(2);
+    debugManager.flags.CreateMultipleSubDevices.set(4);
+    debugManager.flags.ZE_AFFINITY_MASK.set("0,1.54");
     VariableBackup<UltHwConfig> backup(&ultHwConfig);
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
 
@@ -174,9 +173,10 @@ TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetToGreaterSubDeviceThanAvailableW
 
 TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetToRootDevicesOnlyWhenCreateDevicesThenProperNumberOfDevicesIsReturned) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleRootDevices.set(2);
-    DebugManager.flags.CreateMultipleSubDevices.set(4);
-    DebugManager.flags.ZE_AFFINITY_MASK.set("0,1");
+    debugManager.flags.ZE_FLAT_DEVICE_HIERARCHY.set("COMPOSITE");
+    debugManager.flags.CreateMultipleRootDevices.set(2);
+    debugManager.flags.CreateMultipleSubDevices.set(4);
+    debugManager.flags.ZE_AFFINITY_MASK.set("0,1");
     VariableBackup<UltHwConfig> backup(&ultHwConfig);
     ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
 
@@ -190,7 +190,7 @@ TEST_F(DeviceFactoryTest, givenZeAffinityMaskSetToRootDevicesOnlyWhenCreateDevic
 TEST_F(DeviceFactoryTest, WhenOverridingEngineTypeThenDebugEngineIsReported) {
     DebugManagerStateRestore dbgRestorer;
     int32_t debugEngineType = 2;
-    DebugManager.flags.NodeOrdinal.set(debugEngineType);
+    debugManager.flags.NodeOrdinal.set(debugEngineType);
 
     bool success = DeviceFactory::prepareDeviceEnvironments(*executionEnvironment);
     ASSERT_TRUE(success);
@@ -203,19 +203,17 @@ TEST_F(DeviceFactoryTest, WhenOverridingEngineTypeThenDebugEngineIsReported) {
 TEST_F(DeviceFactoryTest, givenPointerToHwInfoWhenGetDevicedCalledThenRequiedSurfaceSizeIsSettedProperly) {
     bool success = DeviceFactory::prepareDeviceEnvironments(*executionEnvironment);
     ASSERT_TRUE(success);
-    auto hwInfo = executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo();
+    auto &rootDeviceEnvironment = executionEnvironment->rootDeviceEnvironments[0];
+    auto hwInfo = rootDeviceEnvironment->getHardwareInfo();
 
-    const auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
     auto expextedSize = static_cast<size_t>(hwInfo->gtSystemInfo.CsrSizeInMb * MemoryConstants::megaByte);
-    gfxCoreHelper.adjustPreemptionSurfaceSize(expextedSize);
-
     EXPECT_EQ(expextedSize, hwInfo->capabilityTable.requiredPreemptionSurfaceSize);
 }
 
 TEST_F(DeviceFactoryTest, givenCreateMultipleRootDevicesDebugFlagWhenPrepareDeviceEnvironmentsIsCalledThenNumberOfReturnedDevicesIsEqualToDebugVariable) {
     DebugManagerStateRestore stateRestore;
     auto requiredDeviceCount = 2u;
-    DebugManager.flags.CreateMultipleRootDevices.set(requiredDeviceCount);
+    debugManager.flags.CreateMultipleRootDevices.set(requiredDeviceCount);
 
     bool success = DeviceFactory::prepareDeviceEnvironments(*executionEnvironment);
 
@@ -223,70 +221,10 @@ TEST_F(DeviceFactoryTest, givenCreateMultipleRootDevicesDebugFlagWhenPrepareDevi
     EXPECT_EQ(requiredDeviceCount, executionEnvironment->rootDeviceEnvironments.size());
 }
 
-TEST_F(DeviceFactoryTest, givenDebugFlagSetWhenPrepareDeviceEnvironmentsIsCalledThenOverrideGpuAddressSpace) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.OverrideGpuAddressSpace.set(12);
-
-    bool success = DeviceFactory::prepareDeviceEnvironments(*executionEnvironment);
-
-    EXPECT_TRUE(success);
-    EXPECT_EQ(maxNBitValue(12), executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->capabilityTable.gpuAddressSpace);
-}
-
-TEST_F(DeviceFactoryTest, givenDebugFlagSetWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenOverrideGpuAddressSpace) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.OverrideGpuAddressSpace.set(12);
-
-    bool success = DeviceFactory::prepareDeviceEnvironmentsForProductFamilyOverride(*executionEnvironment);
-
-    EXPECT_TRUE(success);
-    EXPECT_EQ(maxNBitValue(12), executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->capabilityTable.gpuAddressSpace);
-}
-
-TEST_F(DeviceFactoryTest, givenDebugFlagSetWhenPrepareDeviceEnvironmentsIsCalledThenOverrideRevision) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.OverrideRevision.set(3);
-
-    bool success = DeviceFactory::prepareDeviceEnvironments(*executionEnvironment);
-
-    EXPECT_TRUE(success);
-    EXPECT_EQ(3u, executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->platform.usRevId);
-}
-
-TEST_F(DeviceFactoryTest, givenDebugFlagSetWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenOverrideRevision) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.OverrideRevision.set(3);
-
-    bool success = DeviceFactory::prepareDeviceEnvironmentsForProductFamilyOverride(*executionEnvironment);
-
-    EXPECT_TRUE(success);
-    EXPECT_EQ(3u, executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->platform.usRevId);
-}
-
-TEST_F(DeviceFactoryTest, givenDebugFlagWithoutZeroXWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenOverrideDeviceIdToHexValue) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.ForceDeviceId.set("1234");
-
-    bool success = DeviceFactory::prepareDeviceEnvironmentsForProductFamilyOverride(*executionEnvironment);
-
-    EXPECT_TRUE(success);
-    EXPECT_EQ(0x1234u, executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->platform.usDeviceID);
-}
-
-TEST_F(DeviceFactoryTest, givenDebugFlagWithZeroXWhenPrepareDeviceEnvironmentsForProductFamilyOverrideIsCalledThenOverrideDeviceIdToHexValue) {
-    DebugManagerStateRestore restore;
-    DebugManager.flags.ForceDeviceId.set("0x1234");
-
-    bool success = DeviceFactory::prepareDeviceEnvironmentsForProductFamilyOverride(*executionEnvironment);
-
-    EXPECT_TRUE(success);
-    EXPECT_EQ(0x1234u, executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->platform.usDeviceID);
-}
-
 TEST_F(DeviceFactoryTest, whenPrepareDeviceEnvironmentsIsCalledThenAllRootDeviceEnvironmentMembersAreInitialized) {
     DebugManagerStateRestore stateRestore;
     auto requiredDeviceCount = 2u;
-    DebugManager.flags.CreateMultipleRootDevices.set(requiredDeviceCount);
+    debugManager.flags.CreateMultipleRootDevices.set(requiredDeviceCount);
 
     MockExecutionEnvironment executionEnvironment(defaultHwInfo.get(), true, requiredDeviceCount);
 
@@ -300,19 +238,19 @@ TEST_F(DeviceFactoryTest, whenPrepareDeviceEnvironmentsIsCalledThenAllRootDevice
 
         auto memoryOperationInterface = rootDeviceEnvironment->memoryOperationsInterface.get();
         EXPECT_NE(nullptr, memoryOperationInterface);
-        EXPECT_EQ(memoryOperationHandlers.end(), memoryOperationHandlers.find(memoryOperationInterface));
+        EXPECT_FALSE(memoryOperationHandlers.contains(memoryOperationInterface));
         memoryOperationHandlers.insert(memoryOperationInterface);
 
         auto osInterface = rootDeviceEnvironment->osInterface.get();
         EXPECT_NE(nullptr, osInterface);
-        EXPECT_EQ(osInterfaces.end(), osInterfaces.find(osInterface));
+        EXPECT_FALSE(osInterfaces.contains(osInterface));
         osInterfaces.insert(osInterface);
     }
 }
 
 TEST_F(DeviceFactoryTest, givenInvalidHwConfigStringWhenPreparingDeviceEnvironmentsForProductFamilyOverrideThenFalseIsReturned) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.HardwareInfoOverride.set("1x3");
+    debugManager.flags.HardwareInfoOverride.set("1x3");
 
     MockExecutionEnvironment executionEnvironment(defaultHwInfo.get());
 
@@ -326,7 +264,7 @@ TEST_F(DeviceFactoryTest, givenPrepareDeviceEnvironmentsCallWhenItIsDoneThenOsIn
     EXPECT_NE(nullptr, executionEnvironment->rootDeviceEnvironments[0]->osInterface);
 }
 
-TEST(DeviceFactory, givenCreateMultipleRootDevicesWhenCreateDevicesIsCalledThenVectorReturnedWouldContainFirstDiscreteDevicesThenIntegratedDevices) {
+TEST(DeviceFactory, givenCreateMultipleRootDevicesWhenCreateDevicesIsCalledThenVectorReturnedWouldContainDevicesInTheSameOrder) {
     uint32_t numRootDevices = 8u;
     NEO::HardwareInfo hwInfo[8];
     auto executionEnvironment = new NEO::ExecutionEnvironment();
@@ -345,36 +283,145 @@ TEST(DeviceFactory, givenCreateMultipleRootDevicesWhenCreateDevicesIsCalledThenV
     executionEnvironment->rootDeviceEnvironments[6]->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = true;
     executionEnvironment->rootDeviceEnvironments[7]->getMutableHardwareInfo()->capabilityTable.isIntegratedDevice = false;
     auto devices = DeviceFactory::createDevices(*executionEnvironment);
-    for (auto iterator = 0u; iterator < 3; iterator++) {
-        EXPECT_FALSE(devices[iterator]->getHardwareInfo().capabilityTable.isIntegratedDevice); // Initial entries would be for discrete devices
+    for (auto iterator = 0u; iterator < 8; iterator++) {
+        EXPECT_EQ(iterator, devices[iterator]->getRootDeviceIndex());
     }
-    for (auto iterator = 3u; iterator < 8u; iterator++) {
-        EXPECT_TRUE(devices[iterator]->getHardwareInfo().capabilityTable.isIntegratedDevice); // Later entries would be for integrated
+}
+
+namespace {
+std::vector<uint32_t> leoTestCreatedRootDeviceIndices;
+} // namespace
+
+struct DeviceFactoryLeoTest : public ::testing::Test {
+    void SetUp() override {
+        debugManager.flags.EnableLEO.set(-1);
+        ultHwConfig.leoDetectionEnabled = true;
+        std::vector<uint32_t>{}.swap(leoTestCreatedRootDeviceIndices);
+        DeviceFactory::createRootDeviceFunc = [](ExecutionEnvironment &, uint32_t rootDeviceIndex) -> std::unique_ptr<Device> {
+            leoTestCreatedRootDeviceIndices.push_back(rootDeviceIndex);
+            return nullptr;
+        };
     }
+
+    void TearDown() override {
+        std::vector<uint32_t>{}.swap(leoTestCreatedRootDeviceIndices);
+    }
+
+    MockExecutionEnvironment &prepareEnvWithLeoSupport(const std::vector<bool> &leoSupportPerRootDevice) {
+        executionEnvironment = std::make_unique<MockExecutionEnvironment>(defaultHwInfo.get(), true, static_cast<uint32_t>(leoSupportPerRootDevice.size()));
+        for (size_t i = 0; i < leoSupportPerRootDevice.size(); i++) {
+            auto mockProductHelper = new MockProductHelper;
+            mockProductHelper->isLEOSupportedResult = leoSupportPerRootDevice[i];
+            executionEnvironment->rootDeviceEnvironments[i]->productHelper.reset(mockProductHelper);
+        }
+        return *executionEnvironment;
+    }
+
+    DebugManagerStateRestore restorer;
+    VariableBackup<UltHwConfig> ultHwConfigBackup{&ultHwConfig};
+    VariableBackup<decltype(DeviceFactory::createRootDeviceFunc)> createRootDeviceFuncBackup{&DeviceFactory::createRootDeviceFunc};
+    std::unique_ptr<MockExecutionEnvironment> executionEnvironment;
+};
+
+TEST_F(DeviceFactoryLeoTest, givenAffinityMaskSelectingNativeDeviceThenItSurvivesAndNoLeoKeyIsRecorded) {
+    debugManager.flags.ZE_AFFINITY_MASK.set("1");
+    auto &executionEnvironment = prepareEnvWithLeoSupport({true, false});
+
+    executionEnvironment.parseAffinityMask();
+    dropLeoRootDeviceEnvironments(executionEnvironment);
+
+    EXPECT_EQ(1u, executionEnvironment.rootDeviceEnvironments.size());
+    EXPECT_FALSE(executionEnvironment.isLeoRootDeviceDetected());
+}
+
+TEST_F(DeviceFactoryLeoTest, givenAffinityMaskSelectingLeoDeviceThenOnlyItsKeyIsRecordedAndNoNativeDeviceSurvives) {
+    debugManager.flags.ZE_AFFINITY_MASK.set("1");
+    auto &executionEnvironment = prepareEnvWithLeoSupport({false, true});
+
+    executionEnvironment.parseAffinityMask();
+    dropLeoRootDeviceEnvironments(executionEnvironment);
+
+    EXPECT_TRUE(executionEnvironment.rootDeviceEnvironments.empty());
+    EXPECT_EQ(1u, executionEnvironment.getLeoPlatformKeys().size());
+}
+
+TEST_F(DeviceFactoryLeoTest, givenNoAffinityMaskThenLeoDevicesAreDroppedAndTheirKeysRecorded) {
+    auto &executionEnvironment = prepareEnvWithLeoSupport({true, false});
+
+    executionEnvironment.parseAffinityMask();
+    dropLeoRootDeviceEnvironments(executionEnvironment);
+
+    EXPECT_EQ(1u, executionEnvironment.rootDeviceEnvironments.size());
+    EXPECT_EQ(1u, executionEnvironment.getLeoPlatformKeys().size());
+}
+
+TEST_F(DeviceFactoryLeoTest, givenOpenClApiAndAutoEnableLeoWhenProductSupportsLeoThenNoNativeDeviceIsCreatedAndDetectionIsReported) {
+    auto &executionEnvironment = prepareEnvWithLeoSupport({true});
+    DeviceFactory::createDevices(executionEnvironment);
+    EXPECT_TRUE(executionEnvironment.isLeoRootDeviceDetected());
+    EXPECT_TRUE(leoTestCreatedRootDeviceIndices.empty());
+}
+
+TEST_F(DeviceFactoryLeoTest, givenOpenClApiAndAutoEnableLeoWhenProductDoesNotSupportLeoThenNativeDeviceIsCreated) {
+    auto &executionEnvironment = prepareEnvWithLeoSupport({false});
+    DeviceFactory::createDevices(executionEnvironment);
+    EXPECT_FALSE(executionEnvironment.isLeoRootDeviceDetected());
+    EXPECT_EQ(std::vector<uint32_t>{0u}, leoTestCreatedRootDeviceIndices);
+}
+
+TEST_F(DeviceFactoryLeoTest, givenMixedRootDevicesWhenOnlySomeSupportLeoThenOnlyTheRestAreCreatedNatively) {
+    auto &executionEnvironment = prepareEnvWithLeoSupport({false, true, false});
+    DeviceFactory::createDevices(executionEnvironment);
+    EXPECT_TRUE(executionEnvironment.isLeoRootDeviceDetected());
+    const std::vector<uint32_t> expected{0u, 2u};
+    EXPECT_EQ(expected, leoTestCreatedRootDeviceIndices);
+}
+
+TEST_F(DeviceFactoryLeoTest, givenLeoForcedOffWhenProductSupportsLeoThenNativeDeviceIsStillCreated) {
+    debugManager.flags.EnableLEO.set(0);
+    auto &executionEnvironment = prepareEnvWithLeoSupport({true});
+    DeviceFactory::createDevices(executionEnvironment);
+    EXPECT_FALSE(executionEnvironment.isLeoRootDeviceDetected());
+    EXPECT_EQ(std::vector<uint32_t>{0u}, leoTestCreatedRootDeviceIndices);
+}
+
+TEST_F(DeviceFactoryLeoTest, givenLeoForcedOnWhenProductSupportsLeoThenDetectionIsNotReported) {
+    debugManager.flags.EnableLEO.set(1);
+    auto &executionEnvironment = prepareEnvWithLeoSupport({true});
+    DeviceFactory::createDevices(executionEnvironment);
+    EXPECT_FALSE(executionEnvironment.isLeoRootDeviceDetected());
+}
+
+TEST_F(DeviceFactoryLeoTest, givenLeoDetectionDisabledWhenProductSupportsLeoThenNativeDeviceIsCreated) {
+    ultHwConfig.leoDetectionEnabled = false;
+    auto &executionEnvironment = prepareEnvWithLeoSupport({true});
+    DeviceFactory::createDevices(executionEnvironment);
+    EXPECT_FALSE(executionEnvironment.isLeoRootDeviceDetected());
+    EXPECT_EQ(std::vector<uint32_t>{0u}, leoTestCreatedRootDeviceIndices);
 }
 
 TEST(DeviceFactory, givenHwModeSelectedWhenIsHwModeSelectedIsCalledThenTrueIsReturned) {
     DebugManagerStateRestore stateRestore;
-    constexpr int32_t hwModes[] = {-1, CommandStreamReceiverType::CSR_HW, CommandStreamReceiverType::CSR_HW_WITH_AUB};
+    constexpr int32_t hwModes[] = {-1, static_cast<int32_t>(CommandStreamReceiverType::hardware), static_cast<int32_t>(CommandStreamReceiverType::hardwareWithAub)};
     for (const auto &hwMode : hwModes) {
-        DebugManager.flags.SetCommandStreamReceiver.set(hwMode);
+        debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(hwMode));
         EXPECT_TRUE(DeviceFactory::isHwModeSelected());
     }
 }
 
 TEST(DeviceFactory, givenNonHwModeSelectedWhenIsHwModeSelectedIsCalledThenFalseIsReturned) {
     DebugManagerStateRestore stateRestore;
-    constexpr int32_t nonHwModes[] = {CommandStreamReceiverType::CSR_AUB, CommandStreamReceiverType::CSR_TBX, CommandStreamReceiverType::CSR_TBX_WITH_AUB};
+    constexpr CommandStreamReceiverType nonHwModes[] = {CommandStreamReceiverType::aub, CommandStreamReceiverType::tbx, CommandStreamReceiverType::tbxWithAub, CommandStreamReceiverType::nullAub};
     for (const auto &nonHwMode : nonHwModes) {
-        DebugManager.flags.SetCommandStreamReceiver.set(nonHwMode);
+        debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(nonHwMode));
         EXPECT_FALSE(DeviceFactory::isHwModeSelected());
     }
 }
 
 TEST(DiscoverDevices, whenDiscoverDevicesAndFilterDifferentFromTheExistingDeviceThenReturnNullptr) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.FilterDeviceId.set("invalid");
-    DebugManager.flags.FilterBdfPath.set("invalid");
+    debugManager.flags.FilterDeviceId.set("invalid");
+    debugManager.flags.FilterBdfPath.set("invalid");
     ExecutionEnvironment executionEnvironment;
     auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
     EXPECT_TRUE(hwDeviceIds.empty());
@@ -382,8 +429,8 @@ TEST(DiscoverDevices, whenDiscoverDevicesAndFilterDifferentFromTheExistingDevice
 
 TEST(DiscoverDevices, whenDiscoverDevicesAndFilterDifferentFromTheExistingDeviceThenPrepareDeviceEnvironmentsReturnsFalse) {
     DebugManagerStateRestore stateRestore;
-    DebugManager.flags.FilterDeviceId.set("invalid");
-    DebugManager.flags.FilterBdfPath.set("invalid");
+    debugManager.flags.FilterDeviceId.set("invalid");
+    debugManager.flags.FilterBdfPath.set("invalid");
     ExecutionEnvironment executionEnvironment;
 
     auto result = DeviceFactory::prepareDeviceEnvironments(executionEnvironment);

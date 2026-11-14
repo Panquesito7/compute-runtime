@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,10 @@
 
 #include "shared/test/common/mocks/mock_wddm.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/os_interface/windows/gdi_interface.h"
 #include "shared/source/os_interface/windows/os_environment_win.h"
@@ -21,6 +23,15 @@
 #include "gtest/gtest.h"
 
 using namespace NEO;
+
+namespace NEO {
+NTSTATUS(*pCallEscape)
+(D3DKMT_ESCAPE &escapeCommand) = nullptr;
+uint32_t (*pGetTimestampFrequency)() = nullptr;
+bool (*pPerfOpenEuStallStream)(uint32_t sampleRate, uint32_t minBufferSize) = nullptr;
+bool (*pPerfDisableEuStallStream)() = nullptr;
+bool (*pPerfReadEuStallStream)(uint8_t *pRawData, size_t *pRawDataSize, uint32_t *pOutRetCode) = nullptr;
+} // namespace NEO
 
 struct MockHwDeviceId : public HwDeviceIdWddm {
     using HwDeviceIdWddm::osEnvironment;
@@ -62,6 +73,9 @@ bool WddmMock::makeResident(const D3DKMT_HANDLE *handles, uint32_t count, bool c
 }
 bool WddmMock::evict(const D3DKMT_HANDLE *handles, uint32_t num, uint64_t &sizeToTrim, bool evictNeeded) {
     evictResult.called++;
+    for (uint32_t i = 0; i < num; i++) {
+        handlesToEvict.push_back(handles[i]);
+    }
     if (callBaseEvict) {
         evictStatus = Wddm::evict(handles, num, sizeToTrim, evictNeeded);
     }
@@ -74,6 +88,12 @@ NTSTATUS WddmMock::createAllocationsAndMapGpuVa(OsHandleStorage &osHandles) {
     }
     return createAllocationsAndMapGpuVaStatus;
 }
+NTSTATUS WddmMock::escape(D3DKMT_ESCAPE &escapeCommand) {
+    if (pCallEscape != nullptr) {
+        return pCallEscape(escapeCommand);
+    }
+    return Wddm::escape(escapeCommand);
+}
 bool WddmMock::mapGpuVirtualAddress(WddmAllocation *allocation) {
     D3DGPU_VIRTUAL_ADDRESS minimumAddress = gfxPartition.Standard.Base;
     D3DGPU_VIRTUAL_ADDRESS maximumAddress = gfxPartition.Standard.Limit;
@@ -82,14 +102,20 @@ bool WddmMock::mapGpuVirtualAddress(WddmAllocation *allocation) {
         maximumAddress = MemoryConstants::maxSvmAddress;
     }
     return mapGpuVirtualAddress(allocation->getDefaultGmm(), allocation->getDefaultHandle(), minimumAddress, maximumAddress,
-                                reinterpret_cast<D3DGPU_VIRTUAL_ADDRESS>(allocation->getAlignedCpuPtr()), allocation->getGpuAddressToModify());
+                                reinterpret_cast<D3DGPU_VIRTUAL_ADDRESS>(allocation->getAlignedCpuPtr()), allocation->getGpuAddressToModify(), allocation->getAllocationType(), memoryFlagsToPass, 0u);
 }
-bool WddmMock::mapGpuVirtualAddress(Gmm *gmm, D3DKMT_HANDLE handle, D3DGPU_VIRTUAL_ADDRESS minimumAddress, D3DGPU_VIRTUAL_ADDRESS maximumAddress, D3DGPU_VIRTUAL_ADDRESS preferredAddress, D3DGPU_VIRTUAL_ADDRESS &gpuPtr) {
+bool WddmMock::mapGpuVirtualAddress(Gmm *gmm, D3DKMT_HANDLE handle, D3DGPU_VIRTUAL_ADDRESS minimumAddress, D3DGPU_VIRTUAL_ADDRESS maximumAddress, D3DGPU_VIRTUAL_ADDRESS preferredAddress, D3DGPU_VIRTUAL_ADDRESS &gpuPtr, AllocationType type, const MemoryFlags *memoryFlags, D3DGPU_SIZE_T offsetInPages) {
     mapGpuVirtualAddressResult.called++;
     mapGpuVirtualAddressResult.cpuPtrPassed = reinterpret_cast<void *>(preferredAddress);
     mapGpuVirtualAddressResult.uint64ParamPassed = preferredAddress;
+
+    auto *gmmResourceParams = reinterpret_cast<GMM_RESCREATE_PARAMS *>(gmm->resourceParamsData.data());
+    mapGpuVirtualAddressResult.alignment = gmmResourceParams->BaseAlignment;
+    if (mapGpuVaFailFromCall != 0u && mapGpuVirtualAddressResult.called >= mapGpuVaFailFromCall) {
+        return mapGpuVirtualAddressResult.success = false;
+    }
     if (callBaseMapGpuVa) {
-        return mapGpuVirtualAddressResult.success = Wddm::mapGpuVirtualAddress(gmm, handle, minimumAddress, maximumAddress, preferredAddress, gpuPtr);
+        return mapGpuVirtualAddressResult.success = Wddm::mapGpuVirtualAddress(gmm, handle, minimumAddress, maximumAddress, preferredAddress, gpuPtr, type, memoryFlags, offsetInPages);
     } else {
         gpuPtr = preferredAddress;
         return mapGpuVaStatus;
@@ -100,11 +126,15 @@ bool WddmMock::freeGpuVirtualAddress(D3DGPU_VIRTUAL_ADDRESS &gpuPtr, uint64_t si
     freeGpuVirtualAddressResult.called++;
     freeGpuVirtualAddressResult.uint64ParamPassed = gpuPtr;
     freeGpuVirtualAddressResult.sizePassed = size;
+    if (failFreeGpuVirtualAddress) {
+        gpuPtr = 0;
+        return freeGpuVirtualAddressResult.success = false;
+    }
     return freeGpuVirtualAddressResult.success = Wddm::freeGpuVirtualAddress(gpuPtr, size);
 }
 NTSTATUS WddmMock::createAllocation(WddmAllocation *wddmAllocation) {
     if (wddmAllocation) {
-        return createAllocation(wddmAllocation->getAlignedCpuPtr(), wddmAllocation->getDefaultGmm(), wddmAllocation->getHandleToModify(0u), wddmAllocation->resourceHandle, wddmAllocation->getSharedHandleToModify());
+        return createAllocation(wddmAllocation->getAlignedCpuPtr(), wddmAllocation->getDefaultGmm(), wddmAllocation->getHandleToModify(0u), wddmAllocation->getResourceHandleToModify(), wddmAllocation->getSharedHandleToModify());
     }
     return false;
 }
@@ -119,6 +149,30 @@ NTSTATUS WddmMock::createAllocation(const void *alignedCpuPtr, const Gmm *gmm, D
     } else {
         createAllocationResult.success = true;
         outHandle = ALLOCATION_HANDLE;
+        return createAllocationStatus;
+    }
+    return createAllocationStatus;
+}
+
+NTSTATUS WddmMock::createAllocation(const void *alignedCpuPtr, const Gmm *gmm, D3DKMT_HANDLE &outHandle, D3DKMT_HANDLE &outResourceHandle, uint64_t *outSharedHandle, bool createNTHandle) {
+    createAllocationResult.called++;
+    if (failCreateAllocation) {
+        return STATUS_NO_MEMORY;
+    }
+    if (callBaseDestroyAllocations) {
+        createAllocationStatus = Wddm::createAllocation(alignedCpuPtr, gmm, outHandle, outResourceHandle, outSharedHandle, createNTHandle);
+        createAllocationResult.success = createAllocationStatus == STATUS_SUCCESS;
+        if (createAllocationStatus != STATUS_SUCCESS) {
+            destroyAllocationResult.called++;
+        }
+    } else {
+        createAllocationResult.success = true;
+        outHandle = ALLOCATION_HANDLE;
+        outResourceHandle = ALLOCATION_HANDLE;
+        if (outSharedHandle && !createNTHandle) {
+            // For shared allocations without NT handle, set a special value
+            *outSharedHandle = 1u;
+        }
         return createAllocationStatus;
     }
     return createAllocationStatus;
@@ -150,10 +204,10 @@ bool WddmMock::destroyAllocation(WddmAllocation *alloc, OsContextWin *osContext)
     D3DKMT_HANDLE resourceHandle = 0;
     void *reserveAddress = alloc->getReservedAddressPtr();
     if (alloc->peekSharedHandle()) {
-        resourceHandle = alloc->resourceHandle;
+        resourceHandle = alloc->getResourceHandle();
     } else {
         allocationHandles = &alloc->getHandles()[0];
-        allocationCount = 1;
+        allocationCount = static_cast<uint32_t>(alloc->getHandles().size());
     }
     auto success = destroyAllocations(allocationHandles, allocationCount, resourceHandle);
     ::alignedFree(alloc->getDriverAllocatedCpuPtr());
@@ -161,11 +215,11 @@ bool WddmMock::destroyAllocation(WddmAllocation *alloc, OsContextWin *osContext)
     return success;
 }
 
-bool WddmMock::openSharedHandle(D3DKMT_HANDLE handle, WddmAllocation *alloc) {
+bool WddmMock::openSharedHandle(const MemoryManager::OsHandleData &osHandleData, WddmAllocation *alloc) {
     if (failOpenSharedHandle) {
         return false;
     } else {
-        return Wddm::openSharedHandle(handle, alloc);
+        return Wddm::openSharedHandle(osHandleData, alloc);
     }
 }
 
@@ -211,25 +265,10 @@ void *WddmMock::lockResource(const D3DKMT_HANDLE &handle, bool applyMakeResident
     return ptr;
 }
 
-void WddmMock::unlockResource(const D3DKMT_HANDLE &handle) {
+void WddmMock::unlockResource(const D3DKMT_HANDLE &handle, bool applyMakeResidentPriorToLock) {
     unlockResult.called++;
     unlockResult.success = true;
-    Wddm::unlockResource(handle);
-}
-
-void WddmMock::kmDafLock(D3DKMT_HANDLE handle) {
-    kmDafLockResult.called++;
-    kmDafLockResult.success = true;
-    kmDafLockResult.lockedAllocations.push_back(handle);
-    Wddm::kmDafLock(handle);
-}
-
-bool WddmMock::isKmDafEnabled() const {
-    return kmDafEnabled;
-}
-
-void WddmMock::setKmDafEnabled(bool state) {
-    kmDafEnabled = state;
+    Wddm::unlockResource(handle, applyMakeResidentPriorToLock);
 }
 
 void WddmMock::setHwContextId(unsigned long hwContextId) {
@@ -249,14 +288,53 @@ GMM_GFX_PARTITIONING *WddmMock::getGfxPartitionPtr() {
     return &gfxPartition;
 }
 
-bool WddmMock::waitFromCpu(uint64_t lastFenceValue, const MonitoredFence &monitoredFence) {
+bool WddmMock::waitFromCpu(uint64_t lastFenceValue, const MonitoredFence &monitoredFence, bool busyWait) {
     waitFromCpuResult.called++;
     waitFromCpuResult.uint64ParamPassed = lastFenceValue;
     waitFromCpuResult.monitoredFence = &monitoredFence;
     if (callBaseWaitFromCpu) {
-        return waitFromCpuResult.success = Wddm::waitFromCpu(lastFenceValue, monitoredFence);
+        return waitFromCpuResult.success = Wddm::waitFromCpu(lastFenceValue, monitoredFence, busyWait);
     }
     return waitFromCpuResult.success = true;
+}
+
+WaitStatus WddmMock::waitFromCpu(uint64_t lastFenceValue, OsContextWin &osContext, uint64_t timeoutNanoseconds) {
+    this->waitFromCpuWithTimeoutCalled++;
+    this->waitFromCpuWithTimeoutFenceValue = lastFenceValue;
+    this->waitFromCpuTimeoutNanoseconds = timeoutNanoseconds;
+    this->waitFromCpuWithTimeoutOsContext = &osContext;
+    if (this->callBaseWaitFromCpuWithTimeout) {
+        return Wddm::waitFromCpu(lastFenceValue, osContext, timeoutNanoseconds);
+    }
+    return this->waitFromCpuWithTimeoutReturnValue;
+}
+
+std::unique_ptr<KmdWaiter> WddmMock::createMonitoredFenceKmdWaiter(const OsContextWin &osContext, uint64_t fenceValue) {
+    this->createMonitoredFenceKmdWaiterCalled++;
+    this->createMonitoredFenceKmdWaiterFenceValue = fenceValue;
+    return nullptr;
+}
+
+HANDLE WddmMock::createMonitoredFenceKmdWaitEvent() {
+    this->monitoredFenceKmdWaitEventResult.createCalled++;
+    return this->monitoredFenceKmdWaitEventResult.eventHandle;
+}
+
+bool WddmMock::resetMonitoredFenceKmdWaitEvent(HANDLE eventHandle) {
+    this->monitoredFenceKmdWaitEventResult.resetCalled++;
+    this->monitoredFenceKmdWaitEventResult.resetEventHandle = eventHandle;
+    return this->monitoredFenceKmdWaitEventResult.resetSuccess;
+}
+
+bool WddmMock::waitForMonitoredFenceKmdWaitEvent(HANDLE eventHandle, uint32_t timeoutMilliseconds) {
+    this->monitoredFenceKmdWaitEventResult.waitCalled++;
+    this->monitoredFenceKmdWaitEventResult.waitEventHandle = eventHandle;
+    this->monitoredFenceKmdWaitEventResult.timeoutMilliseconds = timeoutMilliseconds;
+    if (this->monitoredFenceKmdWaitEventResult.waitResult &&
+        this->monitoredFenceKmdWaitEventResult.fenceAddressToSignal != nullptr) {
+        *this->monitoredFenceKmdWaitEventResult.fenceAddressToSignal = this->monitoredFenceKmdWaitEventResult.fenceValueToSignal;
+    }
+    return this->monitoredFenceKmdWaitEventResult.waitResult;
 }
 
 void *WddmMock::virtualAlloc(void *inPtr, size_t size, bool topDownHint) {
@@ -272,7 +350,7 @@ void WddmMock::virtualFree(void *ptr, size_t size) {
 void WddmMock::releaseReservedAddress(void *reservedAddress) {
     releaseReservedAddressResult.called++;
     if (reservedAddress != nullptr) {
-        std::set<void *>::iterator it;
+        std::unordered_multiset<void *>::iterator it;
         it = reservedAddresses.find(reservedAddress);
         EXPECT_NE(reservedAddresses.end(), it);
         reservedAddresses.erase(it);
@@ -284,20 +362,20 @@ bool WddmMock::reserveValidAddressRange(size_t size, void *&reservedMem) {
     reserveValidAddressRangeResult.called++;
     bool ret = Wddm::reserveValidAddressRange(size, reservedMem);
     if (reservedMem != nullptr) {
-        std::set<void *>::iterator it;
+        std::unordered_multiset<void *>::iterator it;
         it = reservedAddresses.find(reservedMem);
-        EXPECT_EQ(reservedAddresses.end(), it);
         reservedAddresses.insert(reservedMem);
     }
     return ret;
 }
-VOID *WddmMock::registerTrimCallback(PFND3DKMT_TRIMNOTIFICATIONCALLBACK callback, WddmResidencyController &residencyController) {
+VOID *WddmMock::registerTrimCallback(PFND3DKMT_TRIMNOTIFICATIONCALLBACK callback) {
     registerTrimCallbackResult.called++;
-    return Wddm::registerTrimCallback(callback, residencyController);
+    return Wddm::registerTrimCallback(callback);
 }
 
 NTSTATUS WddmMock::reserveGpuVirtualAddress(D3DGPU_VIRTUAL_ADDRESS baseAddress, D3DGPU_VIRTUAL_ADDRESS minimumAddress, D3DGPU_VIRTUAL_ADDRESS maximumAddress, D3DGPU_SIZE_T size, D3DGPU_VIRTUAL_ADDRESS *reservedAddress) {
     reserveGpuVirtualAddressResult.called++;
+    reserveGpuVirtualAddressResult.uint64ParamPassed = baseAddress;
     if (failReserveGpuVirtualAddress) {
         D3DGPU_VIRTUAL_ADDRESS nullAddress = {};
         *reservedAddress = nullAddress;
@@ -306,7 +384,7 @@ NTSTATUS WddmMock::reserveGpuVirtualAddress(D3DGPU_VIRTUAL_ADDRESS baseAddress, 
     return Wddm::reserveGpuVirtualAddress(baseAddress, minimumAddress, maximumAddress, size, reservedAddress);
 }
 
-uint64_t *WddmMock::getPagingFenceAddress() {
+volatile uint64_t *WddmMock::getPagingFenceAddress() {
     if (NEO::wddmResidencyLoggingAvailable) {
         getPagingFenceAddressResult.called++;
     }
@@ -314,17 +392,23 @@ uint64_t *WddmMock::getPagingFenceAddress() {
     return &mockPagingFence;
 }
 
-void WddmMock::waitOnPagingFenceFromCpu() {
+void WddmMock::waitOnPagingFenceFromCpu(bool isKmdWaitNeeded) {
     waitOnPagingFenceFromCpuResult.called++;
-    Wddm::waitOnPagingFenceFromCpu();
+    waitOnPagingFenceFromCpuResult.isKmdWaitNeededPassed = isKmdWaitNeeded;
+    Wddm::waitOnPagingFenceFromCpu(isKmdWaitNeeded);
+}
+
+void WddmMock::delayPagingFenceFromCpu(int64_t delayTime) {
+    delayPagingFenceFromCpuResult.called++;
+    Wddm::delayPagingFenceFromCpu(delayTime);
 }
 
 void WddmMock::createPagingFenceLogger() {
     if (callBaseCreatePagingLogger) {
         Wddm::createPagingFenceLogger();
     } else {
-        if (DebugManager.flags.WddmResidencyLogger.get()) {
-            residencyLogger = std::make_unique<MockWddmResidencyLogger>(device, pagingFenceAddress);
+        if (debugManager.flags.WddmResidencyLogger.get()) {
+            residencyLogger = std::make_unique<MockWddmResidencyLogger>(device, pagingFenceAddress, debugManager.flags.WddmResidencyLoggerOutputDirectory.get());
         }
     }
 }
@@ -338,4 +422,32 @@ bool WddmMock::setAllocationPriority(const D3DKMT_HANDLE *handles, uint32_t allo
         return status;
     }
     return setAllocationPriorityResult.success;
+}
+
+bool WddmMock::perfOpenEuStallStream(uint32_t sampleRate, uint32_t minBufferSize) {
+    if (pPerfOpenEuStallStream != nullptr) {
+        return pPerfOpenEuStallStream(sampleRate, minBufferSize);
+    }
+    return Wddm::perfOpenEuStallStream(sampleRate, minBufferSize);
+}
+
+bool WddmMock::perfDisableEuStallStream() {
+    if (pPerfDisableEuStallStream != nullptr) {
+        return pPerfDisableEuStallStream();
+    }
+    return Wddm::perfDisableEuStallStream();
+}
+
+bool WddmMock::perfReadEuStallStream(uint8_t *pRawData, size_t *pRawDataSize, uint32_t *pOutRetCode) {
+    if (pPerfReadEuStallStream != nullptr) {
+        return pPerfReadEuStallStream(pRawData, pRawDataSize, pOutRetCode);
+    }
+    return Wddm::perfReadEuStallStream(pRawData, pRawDataSize, pOutRetCode);
+}
+
+uint32_t WddmMock::getTimestampFrequency() const {
+    if (pGetTimestampFrequency != nullptr) {
+        return pGetTimestampFrequency();
+    }
+    return Wddm::getTimestampFrequency();
 }

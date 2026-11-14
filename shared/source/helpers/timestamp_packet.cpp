@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 #include "shared/source/command_stream/linear_stream.h"
 #include "shared/source/utilities/tag_allocator.h"
 
+#include <algorithm>
 #include <iterator>
 
 using namespace NEO;
@@ -65,4 +66,5 @@ void TimestampPacketDependencies::moveNodesToNewContainer(TimestampPacketContain
     barrierNodes.moveNodesToNewContainer(timestampPacketContainer);
     auxToNonAuxNodes.moveNodesToNewContainer(timestampPacketContainer);
     nonAuxToAuxNodes.moveNodesToNewContainer(timestampPacketContainer);
+    multiCsrDependencies.moveNodesToNewContainer(timestampPacketContainer);
 }

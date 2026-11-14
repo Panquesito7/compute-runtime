@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/pmt/pmt.h"
 
 namespace L0 {
@@ -60,7 +61,7 @@ struct MockPmtFsAccess : public FsAccess {
         std::string guidPathForSubdevice1 = baseTelemSysFSNodeForSubdevice1 + std::string("/guid");
         if ((file.compare(guidPathForSubdevice0) == 0) ||
             (file.compare(guidPathForSubdevice1) == 0)) {
-            val = "0xfdc76194";
+            val = "0x490e01";
             return ZE_RESULT_SUCCESS;
         }
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
@@ -145,11 +146,9 @@ struct MockPmtFsAccess : public FsAccess {
 class PublicPlatformMonitoringTech : public L0::PlatformMonitoringTech {
   public:
     PublicPlatformMonitoringTech(FsAccess *pFsAccess, ze_bool_t onSubdevice, uint32_t subdeviceId) : PlatformMonitoringTech(pFsAccess, onSubdevice, subdeviceId) {}
-    using PlatformMonitoringTech::closeFunction;
     using PlatformMonitoringTech::doInitPmtObject;
     using PlatformMonitoringTech::init;
     using PlatformMonitoringTech::keyOffsetMap;
-    using PlatformMonitoringTech::openFunction;
     using PlatformMonitoringTech::preadFunction;
     using PlatformMonitoringTech::telemetryDeviceEntry;
 };

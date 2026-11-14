@@ -1,0 +1,208 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/helpers/api_specific_config.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/product_config_helper.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/unified_memory/unified_memory.h"
+#include "shared/source/xe2_hpg_core/hw_cmds_bmg.h"
+#include "shared/source/xe2_hpg_core/hw_info_xe2_hpg_core.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_release_helper.h"
+#include "shared/test/common/test_macros/header/per_product_test_definitions.h"
+#include "shared/test/common/test_macros/test.h"
+#include "shared/test/unit_test/os_interface/product_helper_tests.h"
+
+#include "aubstream/product_family.h"
+#include "platforms.h"
+namespace NEO {
+extern ApiSpecificConfig::ApiType apiTypeForUlts;
+}
+using namespace NEO;
+
+using BmgProductHelper = ProductHelperTest;
+
+BMGTEST_F(BmgProductHelper, whenGettingAubstreamProductFamilyThenProperEnumValueIsReturned) {
+    EXPECT_EQ(aub_stream::ProductFamily::Bmg, productHelper->getAubStreamProductFamily());
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenGetCommandsStreamPropertiesSupportThenExpectCorrectValues) {
+
+    EXPECT_TRUE(productHelper->getScmPropertyThreadArbitrationPolicySupport());
+    EXPECT_FALSE(productHelper->getScmPropertyZPassAsyncComputeThreadLimitSupport());
+    EXPECT_FALSE(productHelper->getScmPropertyPixelAsyncComputeThreadLimitSupport());
+    EXPECT_TRUE(productHelper->getScmPropertyLargeGrfModeSupport());
+
+    EXPECT_TRUE(productHelper->getStateBaseAddressPropertyBindingTablePoolBaseAddressSupport());
+
+    EXPECT_FALSE(productHelper->getFrontEndPropertyComputeDispatchAllWalkerSupport());
+    EXPECT_FALSE(productHelper->getFrontEndPropertyDisableEuFusionSupport());
+    EXPECT_TRUE(productHelper->getFrontEndPropertyDisableOverDispatchSupport());
+    EXPECT_TRUE(productHelper->getFrontEndPropertySingleSliceDispatchCcsModeSupport());
+
+    EXPECT_FALSE(productHelper->getPipelineSelectPropertySystolicModeSupport());
+}
+
+BMGTEST_F(BmgProductHelper, whenCheckPreferredAllocationMethodThenAllocateByKmdIsReturnedExcept32bitSvmCpu) {
+    for (auto i = 0; i < static_cast<int>(AllocationType::count); i++) {
+        auto allocationType = static_cast<AllocationType>(i);
+        auto preferredAllocationMethod = productHelper->getPreferredAllocationMethod(allocationType);
+        EXPECT_TRUE(preferredAllocationMethod.has_value());
+        if constexpr (is32bit) {
+            if (allocationType == AllocationType::svmCpu) {
+                EXPECT_EQ(GfxMemoryAllocationMethod::useUmdSystemPtr, preferredAllocationMethod.value());
+            } else {
+                EXPECT_EQ(GfxMemoryAllocationMethod::allocateByKmd, preferredAllocationMethod.value());
+            }
+        } else {
+            EXPECT_EQ(GfxMemoryAllocationMethod::allocateByKmd, preferredAllocationMethod.value());
+        }
+    }
+}
+
+BMGTEST_F(BmgProductHelper, WhenFillingScmPropertiesSupportThenExpectUseCorrectExtraGetters) {
+    StateComputeModePropertiesSupport scmPropertiesSupport = {};
+
+    productHelper->fillScmPropertiesSupportStructure(scmPropertiesSupport);
+
+    EXPECT_EQ(true, scmPropertiesSupport.allocationForScratchAndMidthreadPreemption);
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenAdditionalKernelExecInfoSupportCheckedThenCorrectValueIsReturned) {
+
+    EXPECT_TRUE(productHelper->isDisableOverdispatchAvailable(*defaultHwInfo));
+
+    FrontEndPropertiesSupport fePropertiesSupport{};
+    productHelper->fillFrontEndPropertiesSupportStructure(fePropertiesSupport, *defaultHwInfo);
+    EXPECT_TRUE(fePropertiesSupport.disableOverdispatch);
+}
+
+BMGTEST_F(BmgProductHelper, givenCompilerProductHelperWhenGetDefaultHwIpVersonThenCorrectValueIsSet) {
+    EXPECT_EQ(compilerProductHelper->getDefaultHwIpVersion(), AOT::BMG_G21_A0);
+}
+
+TEST(BmgProductConfigHelperTest, givenBmgG21ReservedSteppingProductConfigWhenCheckingIsSupportedProductConfigThenFalseIsReturned) {
+    ProductConfigHelper productConfigHelper{};
+    EXPECT_FALSE(productConfigHelper.isSupportedProductConfig(AOT::BMG_G21_A1_RESERVED));
+    EXPECT_FALSE(productConfigHelper.isSupportedProductConfig(AOT::BMG_G21_B0_RESERVED));
+}
+
+TEST(BmgProductConfigHelperTest, givenLegacyProductConfigWhenGettingDeviceIdThenFallbackToFirstSupportedCompatibleTarget) {
+    for (auto legacyProductConfig : {AOT::BMG_G21_A1_RESERVED, AOT::BMG_G21_B0_RESERVED}) {
+        ProductConfigHelper productConfigHelper{};
+
+        auto compatibleConfigsIt = AOT::compatibilityMapping.find(legacyProductConfig);
+        ASSERT_NE(compatibleConfigsIt, AOT::compatibilityMapping.end());
+        auto compatibleConfigs = compatibleConfigsIt->second;
+        ASSERT_FALSE(compatibleConfigs.empty());
+
+        auto deviceIdOf = [&](AOT::PRODUCT_CONFIG config) -> uint32_t {
+            DeviceAotInfo info{};
+            return productConfigHelper.getDeviceAotInfoForProductConfig(config, info) ? info.deviceIds->front() : 0u;
+        };
+
+        // Disable one compatible target at a time (in the order the mapping declares them) and
+        // confirm the fallback always matches whichever entry is still the first supported one.
+        for (auto configToDisable : compatibleConfigs) {
+            uint32_t expectedDeviceId = 0u;
+            for (auto compatibleConfig : compatibleConfigs) {
+                expectedDeviceId = deviceIdOf(compatibleConfig);
+                if (expectedDeviceId != 0u) {
+                    break;
+                }
+            }
+            EXPECT_EQ(expectedDeviceId, productConfigHelper.getDeviceIdFromIpVersion(legacyProductConfig));
+
+            for (auto &device : productConfigHelper.getDeviceAotInfo()) {
+                if (device.aotConfig.value == configToDisable) {
+                    device.aotConfig.value = AOT::UNKNOWN_ISA;
+                }
+            }
+        }
+
+        EXPECT_EQ(0u, productConfigHelper.getDeviceIdFromIpVersion(legacyProductConfig));
+    }
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenAdjustNumberOfCcsThenOverrideToSingleCcs) {
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 223;
+    productHelper->adjustNumberOfCcs(hwInfo);
+    EXPECT_EQ(hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled, 1u);
+}
+
+BMGTEST_F(BmgProductHelper, whenAdjustScratchSizeThenSizeIsDoubled) {
+    constexpr size_t initialScratchSize = 0x1234u;
+    size_t scratchSize = initialScratchSize;
+    productHelper->adjustScratchSize(scratchSize);
+    EXPECT_EQ(initialScratchSize * 2, scratchSize);
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenCallDeferMOCSToPatOnWSLThenTrueIsReturned) {
+    EXPECT_TRUE(productHelper->deferMOCSToPatIndex(true));
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenCheckingIsHostDeviceUsmPoolAllocatorSupportedThenCorrectValueIsReturned) {
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_TRUE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmPoolAllocatorSupported());
+    }
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        EXPECT_TRUE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmPoolAllocatorSupported());
+    }
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenCheckingInitializeInternalEngineImmediatelyThenCorrectValueIsReturned) {
+    EXPECT_FALSE(productHelper->initializeInternalEngineImmediately());
+}
+
+BMGTEST_F(BmgProductHelper, givenSingleCcsAndSliceCountAboveTwoWhenAdjustDispatchAllRequiredThenReturnTrue) {
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1u;
+    hwInfo.gtSystemInfo.SliceCount = 3u;
+    EXPECT_TRUE(productHelper->adjustDispatchAllRequired(hwInfo));
+}
+
+BMGTEST_F(BmgProductHelper, givenSingleCcsAndSliceCountNotAboveTwoWhenAdjustDispatchAllRequiredThenReturnFalse) {
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1u;
+    hwInfo.gtSystemInfo.SliceCount = 2u;
+    EXPECT_FALSE(productHelper->adjustDispatchAllRequired(hwInfo));
+}
+
+BMGTEST_F(BmgProductHelper, givenMultipleCcsEnabledWhenAdjustDispatchAllRequiredThenReturnFalse) {
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 2u;
+    hwInfo.gtSystemInfo.SliceCount = 4u;
+    EXPECT_FALSE(productHelper->adjustDispatchAllRequired(hwInfo));
+}
+
+BMGTEST_F(BmgProductHelper, givenProductHelperWhenGetCpuCopyThresholdThenReturnBmgThresholds) {
+    EXPECT_EQ(0u, productHelper->getCpuCopyThreshold(TransferType::unknown));
+
+    EXPECT_EQ(4 * MemoryConstants::kiloByte, productHelper->getCpuCopyThreshold(TransferType::deviceUsmToDeviceUsm));
+    EXPECT_EQ(4 * MemoryConstants::kiloByte, productHelper->getCpuCopyThreshold(TransferType::deviceUsmToHostUsm));
+    EXPECT_EQ(64 * MemoryConstants::kiloByte, productHelper->getCpuCopyThreshold(TransferType::deviceUsmToHostNonUsm));
+
+    EXPECT_EQ(64 * MemoryConstants::kiloByte, productHelper->getCpuCopyThreshold(TransferType::hostUsmToDeviceUsm));
+    EXPECT_EQ(1 * MemoryConstants::megaByte, productHelper->getCpuCopyThreshold(TransferType::hostUsmToHostUsm));
+    EXPECT_EQ(64 * MemoryConstants::megaByte, productHelper->getCpuCopyThreshold(TransferType::hostUsmToHostNonUsm));
+
+    EXPECT_EQ(10 * MemoryConstants::megaByte, productHelper->getCpuCopyThreshold(TransferType::hostNonUsmToDeviceUsm));
+    EXPECT_EQ(64 * MemoryConstants::megaByte, productHelper->getCpuCopyThreshold(TransferType::hostNonUsmToHostUsm));
+    EXPECT_EQ(64 * MemoryConstants::megaByte, productHelper->getCpuCopyThreshold(TransferType::hostNonUsmToHostNonUsm));
+
+    EXPECT_EQ(0u, productHelper->getCpuCopyThreshold(TransferType::sharedUsmToSharedUsm));
+}

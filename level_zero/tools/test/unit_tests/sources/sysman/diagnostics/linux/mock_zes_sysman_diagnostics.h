@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,24 +7,25 @@
 
 #pragma once
 #include "level_zero/tools/source/sysman/diagnostics/linux/os_diagnostics_imp.h"
+#include "level_zero/tools/source/sysman/engine/engine.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysman_fixture.h"
 
 namespace L0 {
 namespace ult {
 
-uint32_t mockDiagHandleCount = 2;
 const std::string mockQuiescentGpuFile("quiesce_gpu");
 const std::string mockinvalidateLmemFile("invalidate_lmem_mmaps");
 const std::vector<std::string> mockSupportedDiagTypes = {"MOCKSUITE1", "MOCKSUITE2"};
 const std::string deviceDirDiag("device");
 const std::string mockRealPathConfig("/sys/devices/pci0000:89/0000:89:02.0/config");
 const std::string mockdeviceDirDiag("/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:01.0/0000:8c:00.0");
+const std::string mockdeviceDirConfig("/sys/devices/pci0000:89/0000:89:02.0/0000:8a:00.0/0000:8b:01.0/0000:8c:00.0/config");
 const std::string mockDeviceName("/MOCK_DEVICE_NAME");
 const std::string mockRemove("remove");
 const std::string mockRescan("rescan");
 const std::string mockSlotPath("/sys/bus/pci/slots/");
 const std::string mockSlotPath1("/sys/bus/pci/slots/1/");
-const std::string mockCorrectRootAddress("0000:8a:00.0");
+const std::string mockCorrectRootAddress("0000:8a:00");
 const std::string mockWrongRootAddress("0000:7a:00.0");
 
 struct MockDiagnosticsFwInterface : public FirmwareUtil {
@@ -37,7 +38,7 @@ struct MockDiagnosticsFwInterface : public FirmwareUtil {
     void setFwInitRetVal(ze_result_t val) {
         mockFwInitResult = val;
     }
-    ze_result_t getFirstDevice(igsc_device_info *info) override {
+    ze_result_t getFirstDevice(IgscDeviceInfo *info) override {
         return ZE_RESULT_SUCCESS;
     }
     ze_result_t fwSupportedDiagTests(std::vector<std::string> &supportedDiagTests) override {
@@ -60,14 +61,14 @@ struct MockDiagnosticsFwInterface : public FirmwareUtil {
     ADDMETHOD_NOBASE(flashFirmware, ze_result_t, ZE_RESULT_SUCCESS, (std::string fwType, void *pImage, uint32_t size));
     ADDMETHOD_NOBASE(fwIfrApplied, ze_result_t, ZE_RESULT_SUCCESS, (bool &ifrStatus));
     ADDMETHOD_NOBASE(fwGetMemoryErrorCount, ze_result_t, ZE_RESULT_SUCCESS, (zes_ras_error_type_t category, uint32_t subDeviceCount, uint32_t subDeviceId, uint64_t &count));
-    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t * currentState, uint8_t *pendingState));
+    ADDMETHOD_NOBASE(fwGetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t *currentState, uint8_t *pendingState));
     ADDMETHOD_NOBASE(fwSetEccConfig, ze_result_t, ZE_RESULT_SUCCESS, (uint8_t newState, uint8_t *currentState, uint8_t *pendingState));
     ADDMETHOD_NOBASE_VOIDRETURN(getDeviceSupportedFwTypes, (std::vector<std::string> & fwTypes));
     ADDMETHOD_NOBASE_VOIDRETURN(fwGetMemoryHealthIndicator, (zes_mem_health_t * health));
 };
 struct MockGlobalOperationsEngineHandleContext : public EngineHandleContext {
     MockGlobalOperationsEngineHandleContext(OsSysman *pOsSysman) : EngineHandleContext(pOsSysman) {}
-    void init(std::vector<ze_device_handle_t> &deviceHandles) override {}
+    ADDMETHOD_NOBASE_VOIDRETURN(init, (std::vector<ze_device_handle_t> & deviceHandles));
 };
 
 struct MockDiagFsAccess : public FsAccess {
@@ -77,13 +78,11 @@ struct MockDiagFsAccess : public FsAccess {
     int checkErrorAfterCount = 0;
     std::string mockRootAddress = mockCorrectRootAddress;
 
-    ze_result_t write(const std::string file, std::string val) override {
+    ze_result_t write(const std::string file, std::string_view val) override {
         if (checkErrorAfterCount) {
             checkErrorAfterCount--;
-        } else {
-            if (mockWriteError != ZE_RESULT_SUCCESS) {
-                return mockWriteError;
-            }
+        } else if (mockWriteError != ZE_RESULT_SUCCESS) {
+            return mockWriteError;
         }
         if (!file.compare(mockSlotPath1 + "power")) {
             return ZE_RESULT_SUCCESS;
@@ -143,10 +142,8 @@ struct MockDiagSysfsAccess : public SysfsAccess {
     ze_result_t write(const std::string file, const int val) override {
         if (checkErrorAfterCount) {
             checkErrorAfterCount--;
-        } else {
-            if (mockError != ZE_RESULT_SUCCESS) {
-                return mockError;
-            }
+        } else if (mockError != ZE_RESULT_SUCCESS) {
+            return mockError;
         }
         if (std::string::npos != file.find(mockQuiescentGpuFile)) {
             if (checkErrorAfterCount) {
@@ -252,7 +249,6 @@ struct MockDiagLinuxSysmanImp : public LinuxSysmanImp {
 };
 class PublicLinuxDiagnosticsImp : public L0::LinuxDiagnosticsImp {
   public:
-    using LinuxDiagnosticsImp::gpuProcessCleanup;
     using LinuxDiagnosticsImp::pFwInterface;
     using LinuxDiagnosticsImp::pLinuxSysmanImp;
     using LinuxDiagnosticsImp::pSysfsAccess;

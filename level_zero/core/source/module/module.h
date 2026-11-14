@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,16 +7,20 @@
 
 #pragma once
 
-#include <level_zero/ze_api.h>
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+
+#include "level_zero/core/source/helpers/api_handle_helper.h"
 
 #include <memory>
 #include <vector>
 
-struct _ze_module_handle_t {};
+struct _ze_module_handle_t : BaseHandle {};
+static_assert(IsCompliantWithDdiHandlesExt<_ze_module_handle_t>);
 
 namespace NEO {
+class Device;
 struct KernelDescriptor;
-}
+} // namespace NEO
 
 namespace L0 {
 struct Device;
@@ -24,15 +28,17 @@ struct ModuleBuildLog;
 struct KernelImmutableData;
 
 enum class ModuleType {
-    Builtin,
-    User
+    builtin,
+    user
 };
 
-struct Module : _ze_module_handle_t {
+struct Module : _ze_module_handle_t, NEO::NonCopyableAndNonMovableClass {
 
     static Module *create(Device *device, const ze_module_desc_t *desc, ModuleBuildLog *moduleBuildLog, ModuleType type, ze_result_t *result);
 
     virtual ~Module() = default;
+
+    virtual ze_result_t initialize(const ze_module_desc_t *desc, NEO::Device *neoDevice) = 0;
 
     virtual Device *getDevice() const = 0;
 
@@ -40,6 +46,7 @@ struct Module : _ze_module_handle_t {
                                      ze_kernel_handle_t *kernelHandle) = 0;
     virtual ze_result_t destroy() = 0;
     virtual ze_result_t getNativeBinary(size_t *pSize, uint8_t *pModuleNativeBinary) = 0;
+    virtual ze_result_t getIrBinary(size_t *pSize, uint8_t *pModuleIrBinary) = 0;
     virtual ze_result_t getFunctionPointer(const char *pKernelName, void **pfnFunction) = 0;
     virtual ze_result_t getGlobalPointer(const char *pGlobalName, size_t *pSize, void **pPtr) = 0;
     virtual ze_result_t getDebugInfo(size_t *pDebugDataSize, uint8_t *pDebugData) = 0;
@@ -48,24 +55,27 @@ struct Module : _ze_module_handle_t {
     virtual ze_result_t performDynamicLink(uint32_t numModules,
                                            ze_module_handle_t *phModules,
                                            ze_module_build_log_handle_t *phLinkLog) = 0;
+    virtual ze_result_t inspectLinkage(ze_linkage_inspection_ext_desc_t *pInspectDesc,
+                                       uint32_t numModules,
+                                       ze_module_handle_t *phModules,
+                                       ze_module_build_log_handle_t *phLog) = 0;
 
     virtual const KernelImmutableData *getKernelImmutableData(const char *kernelName) const = 0;
     virtual const std::vector<std::unique_ptr<KernelImmutableData>> &getKernelImmutableDataVector() const = 0;
     virtual uint32_t getMaxGroupSize(const NEO::KernelDescriptor &kernelDescriptor) const = 0;
-    virtual bool isDebugEnabled() const = 0;
     virtual bool shouldAllocatePrivateMemoryPerDispatch() const = 0;
     virtual uint32_t getProfileFlags() const = 0;
     virtual void checkIfPrivateMemoryPerDispatchIsNeeded() = 0;
-
-    Module() = default;
-    Module(const Module &) = delete;
-    Module(Module &&) = delete;
-    Module &operator=(const Module &) = delete;
-    Module &operator=(Module &&) = delete;
+    virtual void populateZebinExtendedArgsMetadata() = 0;
+    virtual void generateDefaultExtendedArgsMetadata() = 0;
+    virtual bool isModulesPackage() const = 0;
+    virtual bool isLinkedFully() const = 0;
 
     static Module *fromHandle(ze_module_handle_t handle) { return static_cast<Module *>(handle); }
 
     inline ze_module_handle_t toHandle() { return this; }
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<Module>);
 
 } // namespace L0

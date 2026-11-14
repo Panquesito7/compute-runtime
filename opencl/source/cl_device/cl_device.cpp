@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,22 +7,26 @@
 
 #include "opencl/source/cl_device/cl_device.h"
 
+#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/compiler_interface/oclc_extensions.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
 #include "shared/source/device/sub_device.h"
+#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/required_libs_helpers.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/os_interface/driver_info.h"
 #include "shared/source/os_interface/os_interface.h"
-#include "shared/source/source_level_debugger/source_level_debugger.h"
 
-#include "opencl/source/gtpin/gtpin_gfx_core_helper.h"
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
+#include "opencl/source/cl_device/cl_device_vector.h"
 #include "opencl/source/helpers/cl_gfx_core_helper.h"
 #include "opencl/source/platform/platform.h"
+#include "opencl/source/program/program.h"
 
 namespace NEO {
 
@@ -33,8 +37,8 @@ ClDevice::ClDevice(Device &device, ClDevice &rootClDevice, Platform *platform) :
     name.reserve(100);
     auto osInterface = getRootDeviceEnvironment().osInterface.get();
     driverInfo.reset(DriverInfo::create(&device.getHardwareInfo(), osInterface));
-    initGTPinHelper();
     initializeCaps();
+    initializeMaxPoolCount();
 
     OpenClCFeaturesContainer emptyOpenClCFeatures;
     compilerExtensions = convertEnabledExtensionsToCompilerInternalOptions(deviceInfo.deviceExtensions, emptyOpenClCFeatures);
@@ -48,19 +52,21 @@ ClDevice::ClDevice(Device &device, ClDevice &rootClDevice, Platform *platform) :
         auto pClSubDevice = std::make_unique<ClDevice>(*subDevice, rootClDevice, platform);
         pClSubDevice->incRefInternal();
         pClSubDevice->decRefApi();
+        pClSubDevice->internalParentDevice = this;
 
-        auto &deviceInfo = pClSubDevice->deviceInfo;
-        deviceInfo.parentDevice = this;
-        deviceInfo.partitionType[0] = CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN;
-        deviceInfo.partitionType[1] = CL_DEVICE_AFFINITY_DOMAIN_NUMA;
-        deviceInfo.partitionType[2] = 0;
+        if (device.getExecutionEnvironment()->getDeviceHierarchyMode() == DeviceHierarchyMode::composite) {
+            auto &deviceInfo = pClSubDevice->deviceInfo;
+            deviceInfo.parentDevice = this;
+            deviceInfo.partitionType[0] = CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN;
+            deviceInfo.partitionType[1] = CL_DEVICE_AFFINITY_DOMAIN_NUMA;
+            deviceInfo.partitionType[2] = 0;
+        }
 
         subDevices.push_back(std::move(pClSubDevice));
     }
 
-    if (getSharedDeviceInfo().debuggerActive && getSourceLevelDebugger()) {
-        auto osInterface = device.getRootDeviceEnvironment().osInterface.get();
-        getSourceLevelDebugger()->notifyNewDevice(osInterface ? osInterface->getDriverModel()->getDeviceHandle() : 0);
+    if (!device.isSubDevice()) {
+        builtinOpsBuilders = std::make_unique<BuilderT[]>(BuiltIn::maxBuilderIndex());
     }
 }
 
@@ -68,11 +74,9 @@ ClDevice::ClDevice(Device &device, Platform *platformId) : ClDevice(device, *thi
 }
 
 ClDevice::~ClDevice() {
-
-    if (getSharedDeviceInfo().debuggerActive && getSourceLevelDebugger()) {
-        getSourceLevelDebugger()->notifyDeviceDestruction();
-    }
-
+    // cached lib programs reference this device - they must die before device.decRefInternal()
+    requiredLibsRegistry->clear();
+    builtinOpsBuilders.reset();
     for (auto &subDevice : subDevices) {
         subDevice.reset();
     }
@@ -80,19 +84,19 @@ ClDevice::~ClDevice() {
 }
 
 void ClDevice::incRefInternal() {
-    if (deviceInfo.parentDevice == nullptr) {
+    if (internalParentDevice == nullptr) {
         BaseObject<_cl_device_id>::incRefInternal();
         return;
     }
-    auto pParentDevice = static_cast<ClDevice *>(deviceInfo.parentDevice);
+    auto pParentDevice = static_cast<ClDevice *>(internalParentDevice);
     pParentDevice->incRefInternal();
 }
 
 unique_ptr_if_unused<ClDevice> ClDevice::decRefInternal() {
-    if (deviceInfo.parentDevice == nullptr) {
+    if (internalParentDevice == nullptr) {
         return BaseObject<_cl_device_id>::decRefInternal();
     }
-    auto pParentDevice = static_cast<ClDevice *>(deviceInfo.parentDevice);
+    auto pParentDevice = static_cast<ClDevice *>(internalParentDevice);
     return pParentDevice->decRefInternal();
 }
 
@@ -124,15 +128,6 @@ ClDevice *ClDevice::getSubDevice(uint32_t deviceId) const {
 }
 
 ClDevice *ClDevice::getNearestGenericSubDevice(uint32_t deviceId) {
-    /*
-     * EngineInstanced: Upper level
-     * Generic SubDevice: 'this'
-     * RootCsr Device: Next level SubDevice (generic)
-     */
-
-    if (getDevice().isEngineInstanced()) {
-        return rootClDevice.getNearestGenericSubDevice(Math::log2(static_cast<uint32_t>(getDeviceBitfield().to_ulong())));
-    }
 
     if (subDevices.empty() || !getDevice().hasRootCsr()) {
         return this;
@@ -144,7 +139,9 @@ ClDevice *ClDevice::getNearestGenericSubDevice(uint32_t deviceId) {
 bool ClDevice::getDeviceAndHostTimer(uint64_t *deviceTimestamp, uint64_t *hostTimestamp) const { return device.getDeviceAndHostTimer(deviceTimestamp, hostTimestamp); }
 bool ClDevice::getHostTimer(uint64_t *hostTimestamp) const { return device.getHostTimer(hostTimestamp); }
 const HardwareInfo &ClDevice::getHardwareInfo() const { return device.getHardwareInfo(); }
-EngineControl &ClDevice::getEngine(aub_stream::EngineType engineType, EngineUsage engineUsage) { return device.getEngine(engineType, engineUsage); }
+EngineControl &ClDevice::getEngine(aub_stream::EngineType engineType, EngineUsage engineUsage) {
+    return device.getEngine(engineType, engineUsage);
+}
 EngineControl &ClDevice::getDefaultEngine() { return device.getDefaultEngine(); }
 EngineControl &ClDevice::getInternalEngine() { return device.getInternalEngine(); }
 SelectorCopyEngine &ClDevice::getSelectorCopyEngine() { return device.getSelectorCopyEngine(); }
@@ -155,9 +152,7 @@ double ClDevice::getPlatformHostTimerResolution() const { return device.getPlatf
 GFXCORE_FAMILY ClDevice::getRenderCoreFamily() const { return device.getRenderCoreFamily(); }
 PerformanceCounters *ClDevice::getPerformanceCounters() { return device.getPerformanceCounters(); }
 PreemptionMode ClDevice::getPreemptionMode() const { return device.getPreemptionMode(); }
-bool ClDevice::isDebuggerActive() const { return device.isDebuggerActive(); }
 Debugger *ClDevice::getDebugger() { return device.getDebugger(); }
-SourceLevelDebugger *ClDevice::getSourceLevelDebugger() { return device.getSourceLevelDebugger(); }
 ExecutionEnvironment *ClDevice::getExecutionEnvironment() const { return device.getExecutionEnvironment(); }
 const RootDeviceEnvironment &ClDevice::getRootDeviceEnvironment() const { return device.getRootDeviceEnvironment(); }
 bool ClDevice::isFullRangeSvm() const { return device.isFullRangeSvm(); }
@@ -191,17 +186,6 @@ const std::string &ClDevice::peekCompilerExtensionsWithFeatures() const {
 }
 DeviceBitfield ClDevice::getDeviceBitfield() const {
     return device.getDeviceBitfield();
-}
-
-bool ClDevice::arePipesSupported() const {
-    if (DebugManager.flags.ForcePipeSupport.get() != -1) {
-        return DebugManager.flags.ForcePipeSupport.get();
-    }
-    return device.getHardwareInfo().capabilityTable.supportsPipes;
-}
-
-void ClDevice::initGTPinHelper() {
-    gtpinGfxCoreHelper = GTPinGfxCoreHelper::create(this->getRootDeviceEnvironment().getHardwareInfo()->platform.eRenderCoreFamily);
 }
 
 cl_command_queue_capabilities_intel ClDevice::getQueueFamilyCapabilitiesAll() {
@@ -251,13 +235,13 @@ void ClDevice::getQueueFamilyName(char *outputName, EngineGroupType type) {
 
     if (!hasHwSpecificName) {
         switch (type) {
-        case EngineGroupType::RenderCompute:
+        case EngineGroupType::renderCompute:
             name = "rcs";
             break;
-        case EngineGroupType::Compute:
+        case EngineGroupType::compute:
             name = "ccs";
             break;
-        case EngineGroupType::Copy:
+        case EngineGroupType::copy:
             name = "bcs";
             break;
         default:
@@ -288,14 +272,64 @@ const CompilerProductHelper &ClDevice::getCompilerProductHelper() const {
     return device.getCompilerProductHelper();
 }
 
-const GTPinGfxCoreHelper &ClDevice::getGTPinGfxCoreHelper() const {
-    return *gtpinGfxCoreHelper;
-}
 cl_version ClDevice::getExtensionVersion(std::string name) {
-    if (name.compare("cl_khr_integer_dot_product") == 0)
-        return CL_MAKE_VERSION(2u, 0, 0);
-    else
-        return CL_MAKE_VERSION(1u, 0, 0);
+    return getOclCExtensionVersion(name, CL_MAKE_VERSION(1u, 0, 0));
+}
+
+Program *ClDevice::getRequiredLibProgram(const std::string &libName) {
+    {
+        auto lock = requiredLibsRegistry.lock();
+        if (auto it = requiredLibsRegistry->find(libName); it != requiredLibsRegistry->end()) {
+            return it->second.get();
+        }
+    }
+
+    cl_int errcodeRet = CL_SUCCESS;
+    std::unique_ptr<Program> created{createRequiredLibProgram(libName, errcodeRet)};
+    if (created == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Creating program from required-lib binary: %s failed (%d)\n",
+                     libName.c_str(), errcodeRet);
+        return nullptr;
+    }
+
+    // a nested required_libs dependency may have inserted this entry while the lock was released
+    auto lock = requiredLibsRegistry.lock();
+    return requiredLibsRegistry->try_emplace(libName, std::move(created)).first->second.get();
+}
+
+Program *ClDevice::createRequiredLibProgram(const std::string &libName, cl_int &errcodeRet) {
+    std::string dirPath;
+    if (!RequiredLibsHelpers::getRequiredLibDirPath(libName, requiredLibsOptionalSearchPaths, dirPath)) {
+        errcodeRet = CL_INVALID_BINARY;
+        return nullptr;
+    }
+
+    const auto blob = loadRequiredLibBinary(dirPath, libName);
+    if (blob.empty()) {
+        errcodeRet = CL_INVALID_BINARY;
+        return nullptr;
+    }
+
+    ClDeviceVector deviceVector;
+    deviceVector.push_back(this);
+
+    std::unique_ptr<Program> lib{Program::createBuiltInFromGenBinary(nullptr, deviceVector, blob.data, blob.size, &errcodeRet)};
+    if (lib == nullptr) {
+        return nullptr;
+    }
+
+    if (auto ret = lib->processGenBinary(*this); ret != CL_SUCCESS) {
+        errcodeRet = ret;
+        return nullptr;
+    }
+
+    return lib.release();
+}
+
+NEO::BuiltIn::Resource ClDevice::loadRequiredLibBinary(const std::string &dirPath,
+                                                       const std::string &fileName) const {
+    return NEO::BuiltIn::FileStorage(dirPath).load(fileName);
 }
 
 } // namespace NEO

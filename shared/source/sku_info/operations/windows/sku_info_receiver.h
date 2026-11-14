@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,10 +19,12 @@ class SkuInfoReceiver {
 
   protected:
     static void receiveFtrTableFromAdapterInfoBase(FeatureTable *ftrTable, ADAPTER_INFO_KMD *adapterInfo) {
+        ftrTable->flags.ftrWddmHwQueues = adapterInfo->SkuTable.FtrHwScheduling;
+        ftrTable->flags.ftrHeaplessMode = adapterInfo->SkuTable.FtrEfficient64BitAddressing;
+
 #define RECEIVE_FTR(VAL_NAME) ftrTable->flags.ftr##VAL_NAME = adapterInfo->SkuTable.Ftr##VAL_NAME
         RECEIVE_FTR(GpGpuMidBatchPreempt);
         RECEIVE_FTR(GpGpuThreadGroupLevelPreempt);
-        RECEIVE_FTR(GpGpuMidThreadLevelPreempt);
 
         RECEIVE_FTR(Wddm2Svm);
         RECEIVE_FTR(PooledEuEnabled);
@@ -40,6 +42,7 @@ class SkuInfoReceiver {
 
         RECEIVE_FTR(Fbc);
 
+        RECEIVE_FTR(BlitterRing);
         RECEIVE_FTR(ULT);
         RECEIVE_FTR(LCIA);
         RECEIVE_FTR(TileMappedResource);
@@ -67,6 +70,13 @@ class SkuInfoReceiver {
         RECEIVE_FTR(Ppgtt64KBWalkOptimization);
         RECEIVE_FTR(Unified3DMediaCompressionFormats);
         RECEIVE_FTR(57bGPUAddressing);
+        RECEIVE_FTR(Tile64Optimization);
+        RECEIVE_FTR(WalkerMTP);
+        RECEIVE_FTR(Xe2Compression);
+        RECEIVE_FTR(Xe2PlusTiling);
+        RECEIVE_FTR(Pml5Support);
+        RECEIVE_FTR(L3TransientDataFlush);
+        RECEIVE_FTR(HwSemaphore64);
 
 #undef RECEIVE_FTR
     }
@@ -95,6 +105,9 @@ class SkuInfoReceiver {
         RECEIVE_WA(UntypedBufferCompression);
         RECEIVE_WA(DisableFusedThreadScheduling);
         RECEIVE_WA(AuxTable64KGranular);
+        RECEIVE_WA(_15010089951);
+        RECEIVE_WA(_14018984349);
+        RECEIVE_WA(_14018976079);
 
 #undef RECEIVE_WA
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,17 @@
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/helpers/common_types.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/os_interface/linux/cache_info.h"
 #include "shared/source/os_interface/linux/drm_wrappers.h"
-#include "shared/source/os_interface/linux/i915_upstream.h"
+#include "shared/source/os_interface/linux/i915.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
 
 namespace NEO {
 
 bool IoctlHelperUpstream::initialize() {
+    detectExtSetPatSupport();
+    initializeGetGpuTimeFunction();
     return true;
 }
 
@@ -22,47 +25,98 @@ bool IoctlHelperUpstream::isSetPairAvailable() {
     return false;
 }
 
+bool IoctlHelperUpstream::isChunkingAvailable() {
+    return false;
+}
+
 bool IoctlHelperUpstream::isVmBindAvailable() {
     return false;
 }
 
-int IoctlHelperUpstream::createGemExt(const MemRegionsVec &memClassInstances, size_t allocSize, uint32_t &handle, std::optional<uint32_t> vmId, int32_t pairHandle) {
+int IoctlHelperUpstream::createGemExt(const MemRegionsVec &memClassInstances, size_t allocSize, uint32_t &handle, uint64_t patIndex, std::optional<uint32_t> vmId, int32_t pairHandle, bool isChunked, uint32_t numOfChunks, std::optional<uint32_t> memPolicyMode, std::optional<std::vector<unsigned long>> memPolicyNodemask, std::optional<bool> isCoherent, [[maybe_unused]] GemCreateExtHint hint, [[maybe_unused]] std::optional<bool> deferBacking) {
+    bool isPatIndexValid = (patIndex != CommonConstants::unsupportedPatIndex) && (patIndex <= std::numeric_limits<uint32_t>::max());
+    bool useSetPat = this->isSetPatSupported && isPatIndexValid;
+
     uint32_t regionsSize = static_cast<uint32_t>(memClassInstances.size());
     std::vector<drm_i915_gem_memory_class_instance> regions(regionsSize);
     for (uint32_t i = 0; i < regionsSize; i++) {
         regions[i].memory_class = memClassInstances[i].memoryClass;
         regions[i].memory_instance = memClassInstances[i].memoryInstance;
     }
+
     drm_i915_gem_create_ext_memory_regions memRegions{};
     memRegions.num_regions = regionsSize;
     memRegions.regions = reinterpret_cast<uintptr_t>(regions.data());
     memRegions.base.name = I915_GEM_CREATE_EXT_MEMORY_REGIONS;
 
+    drm_i915_gem_create_ext_set_pat setPat{};
+    setPat.pat_index = static_cast<uint32_t>(patIndex);
+    setPat.base.name = I915_GEM_CREATE_EXT_SET_PAT;
+
     drm_i915_gem_create_ext createExt{};
     createExt.size = allocSize;
     createExt.extensions = reinterpret_cast<uintptr_t>(&memRegions);
 
-    printDebugString(DebugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "Performing GEM_CREATE_EXT with { size: %lu",
-                     allocSize);
-
-    if (DebugManager.flags.PrintBOCreateDestroyResult.get()) {
-        for (uint32_t i = 0; i < regionsSize; i++) {
-            auto region = regions[i];
-            printDebugString(DebugManager.flags.PrintBOCreateDestroyResult.get(), stdout, ", memory class: %d, memory instance: %d",
-                             region.memory_class, region.memory_instance);
-        }
-        printDebugString(DebugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "%s", " }\n");
+    if (useSetPat) {
+        memRegions.base.next_extension = reinterpret_cast<uintptr_t>(&setPat);
     }
 
-    auto ret = ioctl(DrmIoctl::GemCreateExt, &createExt);
+    if (debugManager.flags.PrintBOCreateDestroyResult.get()) {
+        PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "Performing GEM_CREATE_EXT with { size: %lu",
+                     allocSize);
 
-    printDebugString(DebugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "GEM_CREATE_EXT with EXT_MEMORY_REGIONS has returned: %d BO-%u with size: %lu\n", ret, createExt.handle, createExt.size);
+        for (uint32_t i = 0; i < regionsSize; i++) {
+            auto region = regions[i];
+            PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, ", memory class: %d, memory instance: %d",
+                         region.memory_class, region.memory_instance);
+        }
+
+        if (useSetPat) {
+            PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, ", pat index: %lu", patIndex);
+        }
+
+        PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "%s", " }\n");
+    }
+
+    auto ret = ioctl(DrmIoctl::gemCreateExt, &createExt);
     handle = createExt.handle;
+
+    PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "GEM_CREATE_EXT with EXT_MEMORY_REGIONS%s has returned: %d BO-%u with size: %lu\n",
+                 (useSetPat) ? " with EXT_SET_PAT" : "",
+                 ret, createExt.handle, createExt.size);
+
     return ret;
 }
 
-CacheRegion IoctlHelperUpstream::closAlloc() {
-    return CacheRegion::None;
+void IoctlHelperUpstream::detectExtSetPatSupport() {
+    drm_i915_gem_create_ext_set_pat setPat{};
+    setPat.pat_index = 0;
+    setPat.base.name = I915_GEM_CREATE_EXT_SET_PAT;
+
+    drm_i915_gem_create_ext createExt{};
+    createExt.size = 1;
+    createExt.extensions = reinterpret_cast<uintptr_t>(&setPat);
+
+    auto isSetPatDisabled = debugManager.flags.DisableGemCreateExtSetPat.get();
+
+    if (!isSetPatDisabled) {
+        int returnValue = ioctl(DrmIoctl::gemCreateExt, &createExt);
+        this->isSetPatSupported = (returnValue == 0);
+
+        if (returnValue == 0) {
+            GemClose close{};
+            close.handle = createExt.handle;
+            returnValue = ioctl(DrmIoctl::gemClose, &close);
+            UNRECOVERABLE_IF(returnValue);
+        }
+    }
+
+    PRINT_STRING(debugManager.flags.PrintBOCreateDestroyResult.get(), stdout, "EXT_SET_PAT support is: %s\n",
+                 this->isSetPatSupported ? "enabled" : "disabled");
+}
+
+CacheRegion IoctlHelperUpstream::closAlloc(CacheLevel cacheLevel) {
+    return CacheRegion::none;
 }
 
 uint16_t IoctlHelperUpstream::closAllocWays(CacheRegion closIndex, uint16_t cacheLevel, uint16_t numWays) {
@@ -70,15 +124,23 @@ uint16_t IoctlHelperUpstream::closAllocWays(CacheRegion closIndex, uint16_t cach
 }
 
 CacheRegion IoctlHelperUpstream::closFree(CacheRegion closIndex) {
-    return CacheRegion::None;
+    return CacheRegion::none;
 }
 
-int IoctlHelperUpstream::waitUserFence(uint32_t ctxId, uint64_t address,
-                                       uint64_t value, uint32_t dataWidth, int64_t timeout, uint16_t flags) {
+int IoctlHelperUpstream::waitUserFence(uint32_t ctxId, uint64_t address, uint64_t value, uint32_t dataWidth, int64_t timeout, uint16_t flags,
+                                       bool userInterrupt, uint32_t externalInterruptId, GraphicsAllocation *allocForInterruptWait) {
     return 0;
 }
 
 uint32_t IoctlHelperUpstream::getAtomicAdvise(bool isNonAtomic) {
+    return 0;
+}
+
+uint32_t IoctlHelperUpstream::getAtomicAccess(AtomicAccessMode mode) {
+    return 0;
+}
+
+uint64_t IoctlHelperUpstream::getPreferredLocationArgs(int deviceFd, MemAdvise memAdviseOp, const std::vector<MemoryRegion> &memoryInfo) {
     return 0;
 }
 
@@ -94,6 +156,10 @@ bool IoctlHelperUpstream::setVmBoAdvise(int32_t handle, uint32_t attribute, void
     return true;
 }
 
+bool IoctlHelperUpstream::setVmBoAdviseForChunking(int32_t handle, uint64_t start, uint64_t length, uint32_t attribute, void *region) {
+    return true;
+}
+
 bool IoctlHelperUpstream::setVmPrefetch(uint64_t start, uint64_t length, uint32_t region, uint32_t vmId) {
     return true;
 }
@@ -102,11 +168,11 @@ uint32_t IoctlHelperUpstream::getDirectSubmissionFlag() {
     return 0u;
 }
 
-std::unique_ptr<uint8_t[]> IoctlHelperUpstream::prepareVmBindExt(const StackVec<uint32_t, 2> &bindExtHandles) {
+std::unique_ptr<uint8_t[]> IoctlHelperUpstream::prepareVmBindExt(const StackVec<uint32_t, 2> &bindExtHandles, uint64_t cookie) {
     return {};
 }
 
-uint64_t IoctlHelperUpstream::getFlagsForVmBind(bool bindCapture, bool bindImmediate, bool bindMakeResident) {
+uint64_t IoctlHelperUpstream::getFlagsForVmBind(bool bindCapture, bool bindImmediate, bool bindMakeResident, bool bindLockedMemory, bool readOnlyResource, bool resolveResource) {
     return 0u;
 }
 
@@ -122,25 +188,31 @@ uint16_t IoctlHelperUpstream::getWaitUserFenceSoftFlag() {
 }
 
 int IoctlHelperUpstream::execBuffer(ExecBuffer *execBuffer, uint64_t completionGpuAddress, TaskCountType counterValue) {
-    return ioctl(DrmIoctl::GemExecbuffer2, execBuffer);
+    return ioctl(DrmIoctl::gemExecbuffer2, execBuffer);
 }
 
 bool IoctlHelperUpstream::completionFenceExtensionSupported(const bool isVmBindAvailable) {
     return false;
 }
 
-std::optional<DrmParam> IoctlHelperUpstream::getHasPageFaultParamId() {
-    return std::nullopt;
+bool IoctlHelperUpstream::isPageFaultSupported() {
+    return false;
 };
 
-bool IoctlHelperUpstream::getEuStallProperties(std::array<uint64_t, 12u> &properties, uint64_t dssBufferSize,
-                                               uint64_t samplingRate, uint64_t pollPeriod, uint64_t engineInstance,
-                                               uint64_t notifyNReports) {
+bool IoctlHelperUpstream::isEuStallSupported() {
     return false;
 }
 
 uint32_t IoctlHelperUpstream::getEuStallFdParameter() {
     return 0u;
+}
+
+bool IoctlHelperUpstream::perfOpenEuStallStream(uint32_t euStallFdParameter, uint32_t &samplingPeriodNs, uint64_t engineInstance, uint64_t notifyNReports, uint64_t gpuTimeStampfrequency, int32_t *stream) {
+    return false;
+}
+
+bool IoctlHelperUpstream::perfDisableEuStallStream(int32_t *stream) {
+    return false;
 }
 
 std::unique_ptr<uint8_t[]> IoctlHelperUpstream::createVmControlExtRegion(const std::optional<MemoryClassInstance> &regionInstanceClass) {
@@ -163,15 +235,9 @@ void IoctlHelperUpstream::fillVmBindExtSetPat(VmBindExtSetPatT &vmBindExtSetPat,
 
 void IoctlHelperUpstream::fillVmBindExtUserFence(VmBindExtUserFenceT &vmBindExtUserFence, uint64_t fenceAddress, uint64_t fenceValue, uint64_t nextExtension) {}
 
-std::optional<uint64_t> IoctlHelperUpstream::getCopyClassSaturatePCIECapability() {
-    return std::nullopt;
-}
+void IoctlHelperUpstream::setVmBindUserFence(VmBindParams &vmBind, VmBindExtUserFenceT vmBindUserFence) {};
 
-std::optional<uint64_t> IoctlHelperUpstream::getCopyClassSaturateLinkCapability() {
-    return std::nullopt;
-}
-
-uint32_t IoctlHelperUpstream::getVmAdviseAtomicAttribute() {
+std::optional<uint32_t> IoctlHelperUpstream::getVmAdviseAtomicAttribute() {
     return 0;
 }
 
@@ -181,6 +247,20 @@ int IoctlHelperUpstream::vmBind(const VmBindParams &vmBindParams) {
 
 int IoctlHelperUpstream::vmUnbind(const VmBindParams &vmBindParams) {
     return 0;
+}
+
+int IoctlHelperUpstream::getContextHealth(ContextHealth &contextHealth) {
+    drm_i915_reset_stats resetStats{};
+    resetStats.ctx_id = contextHealth.contextId;
+
+    const auto retVal = ioctl(DrmIoctl::queryContextHealth, &resetStats);
+    if (retVal != 0) {
+        return retVal;
+    }
+    contextHealth.banReason = ((resetStats.batch_active > 0) || (resetStats.batch_pending > 0))
+                                  ? ContextBanReason::gpuHang
+                                  : ContextBanReason::none;
+    return retVal;
 }
 
 UuidRegisterResult IoctlHelperUpstream::registerUuid(const std::string &uuid, uint32_t uuidClass, uint64_t ptr, uint64_t size) {
@@ -209,34 +289,31 @@ bool IoctlHelperUpstream::isDebugAttachAvailable() {
 
 unsigned int IoctlHelperUpstream::getIoctlRequestValue(DrmIoctl ioctlRequest) const {
     switch (ioctlRequest) {
-    case DrmIoctl::GemCreateExt:
+    case DrmIoctl::gemCreateExt:
         return DRM_IOCTL_I915_GEM_CREATE_EXT;
     default:
-        return getIoctlRequestValueBase(ioctlRequest);
+        return IoctlHelperI915::getIoctlRequestValue(ioctlRequest);
     }
 }
 
 int IoctlHelperUpstream::getDrmParamValue(DrmParam drmParam) const {
     switch (drmParam) {
-    case DrmParam::EngineClassCompute:
+    case DrmParam::engineClassCompute:
         return 4;
-    case DrmParam::QueryHwconfigTable:
+    case DrmParam::queryHwconfigTable:
         return DRM_I915_QUERY_HWCONFIG_BLOB;
-    case DrmParam::QueryComputeSlices:
+    case DrmParam::queryComputeSlices:
         return 0;
     default:
-        return getDrmParamValueBase(drmParam);
+        return IoctlHelperI915::getDrmParamValueBase(drmParam);
     }
-}
-std::string IoctlHelperUpstream::getDrmParamString(DrmParam param) const {
-    return getDrmParamStringBase(param);
 }
 std::string IoctlHelperUpstream::getIoctlString(DrmIoctl ioctlRequest) const {
     switch (ioctlRequest) {
-    case DrmIoctl::GemCreateExt:
+    case DrmIoctl::gemCreateExt:
         return "DRM_IOCTL_I915_GEM_CREATE_EXT";
     default:
-        return getIoctlStringBase(ioctlRequest);
+        return IoctlHelperI915::getIoctlString(ioctlRequest);
     }
 }
 
@@ -244,7 +321,8 @@ bool IoctlHelperUpstream::getFabricLatency(uint32_t fabricId, uint32_t &latency,
     return false;
 }
 
-bool IoctlHelperUpstream::isWaitBeforeBindRequired(bool bind) const {
+bool IoctlHelperUpstream::requiresUserFenceSetup(bool bind) const {
     return false;
 }
+
 } // namespace NEO

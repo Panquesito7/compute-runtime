@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -45,16 +45,26 @@ struct EventFixture : public EventFixtureImpl {
     }
 };
 
-template <int32_t eventPoolHostFlag, int32_t eventPoolTimestampFlag, int32_t signalAllEventPackets, int32_t compactEventPackets>
-struct EventUsedPacketSignalFixture : public EventFixture<eventPoolHostFlag, eventPoolTimestampFlag> {
+template <int32_t eventPoolHostFlag, int32_t eventPoolTimestampFlag, int32_t compactEventPackets>
+struct EventCompactL3FlushFixture : public EventFixture<eventPoolHostFlag, eventPoolTimestampFlag> {
     void setUp() {
-        NEO::DebugManager.flags.SignalAllEventPackets.set(signalAllEventPackets);
-
-        NEO::DebugManager.flags.UsePipeControlMultiKernelEventSync.set(compactEventPackets);
-        NEO::DebugManager.flags.CompactL3FlushEventPacket.set(compactEventPackets);
+        NEO::debugManager.flags.CompactL3FlushEventPacket.set(compactEventPackets);
 
         EventFixture<eventPoolHostFlag, eventPoolTimestampFlag>::setUp();
     }
+};
+
+struct CounterBasedEventFixture : public EventFixtureImpl {
+    void setUp() {
+        eventPoolDesc.pNext = &counterBasedEventPoolDesc;
+        EventFixtureImpl::setUpImpl(0, 0);
+    }
+
+    void tearDown() {
+        EventFixtureImpl::tearDown();
+    }
+
+    ze_event_pool_counter_based_exp_desc_t counterBasedEventPoolDesc{ZE_STRUCTURE_TYPE_COUNTER_BASED_EVENT_POOL_EXP_DESC};
 };
 
 } // namespace ult

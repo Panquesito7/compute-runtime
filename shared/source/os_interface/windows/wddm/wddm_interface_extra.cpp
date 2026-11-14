@@ -1,0 +1,42 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/os_interface/windows/gdi_interface.h"
+#include "shared/source/os_interface/windows/wddm/wddm.h"
+#include "shared/source/os_interface/windows/wddm/wddm_interface.h"
+
+using namespace NEO;
+
+bool WddmInterface32::createSyncObject(MonitoredFence &monitorFence) {
+    return createNativeFence(monitorFence, false);
+}
+
+bool WddmInterface32::createNativeFence(MonitoredFence &monitorFence, bool useForWalkerInterrupt) {
+    UNRECOVERABLE_IF(wddm.getGdi()->createNativeFence == nullptr);
+    auto &rootDeviceEnvironment = wddm.getRootDeviceEnvironment();
+    NTSTATUS status = STATUS_SUCCESS;
+    D3DKMT_CREATENATIVEFENCE createNativeFenceObject = {0};
+    createNativeFenceObject.hDevice = wddm.getDeviceHandle();
+    createNativeFenceObject.Info.Type = D3DDDI_NATIVEFENCE_TYPE_DEFAULT;
+    createNativeFenceObject.Info.InitialFenceValue = 0;
+    auto privateData = reinterpret_cast<CREATENATIVEFENCE_PVTDATA *>(&createNativeFenceObject.PrivateDriverData);
+    privateData->UseForWalkerInterrupt = useForWalkerInterrupt;
+    privateData->UseHw64bToken = debugManager.flags.WddmUseHw64bToken.get() &&
+                                 rootDeviceEnvironment.getHelper<CompilerProductHelper>().isAvailableSemaphore64(*rootDeviceEnvironment.getHardwareInfo());
+
+    status = wddm.getGdi()->createNativeFence(&createNativeFenceObject);
+    DEBUG_BREAK_IF(STATUS_SUCCESS != status);
+
+    monitorFence.fenceHandle = createNativeFenceObject.hSyncObject;
+    monitorFence.cpuAddress = reinterpret_cast<uint64_t *>(createNativeFenceObject.Info.NativeFenceMapping.CurrentValueCpuVa);
+    monitorFence.gpuAddress = createNativeFenceObject.Info.NativeFenceMapping.CurrentValueGpuVa;
+
+    return status == STATUS_SUCCESS;
+}

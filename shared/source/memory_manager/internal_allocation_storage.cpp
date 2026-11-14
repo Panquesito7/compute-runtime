@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,12 +10,13 @@
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/memory_manager/host_ptr_manager.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
 
 namespace NEO {
 
 InternalAllocationStorage::InternalAllocationStorage(CommandStreamReceiver &commandStreamReceiver)
-    : commandStreamReceiver(commandStreamReceiver){};
+    : commandStreamReceiver(commandStreamReceiver) {};
 
 void InternalAllocationStorage::storeAllocation(std::unique_ptr<GraphicsAllocation> &&gfxAllocation, uint32_t allocationUsage) {
     TaskCountType taskCount = gfxAllocation->getTaskCount(commandStreamReceiver.getOsContext().getContextId());
@@ -27,27 +28,37 @@ void InternalAllocationStorage::storeAllocation(std::unique_ptr<GraphicsAllocati
     storeAllocationWithTaskCount(std::move(gfxAllocation), allocationUsage, taskCount);
 }
 void InternalAllocationStorage::storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation> &&gfxAllocation, uint32_t allocationUsage, TaskCountType taskCount) {
+    auto memoryManager = commandStreamReceiver.getMemoryManager();
+    auto osContextId = commandStreamReceiver.getOsContext().getContextId();
+
+    if (allocationUsage == TEMPORARY_ALLOCATION) {
+        memoryManager->storeTemporaryAllocation(std::move(gfxAllocation), osContextId, taskCount);
+        return;
+    }
+
     if (allocationUsage == REUSABLE_ALLOCATION) {
-        if (DebugManager.flags.DisableResourceRecycling.get()) {
-            commandStreamReceiver.getMemoryManager()->freeGraphicsMemory(gfxAllocation.release());
+        if (debugManager.flags.DisableResourceRecycling.get()) {
+            memoryManager->freeGraphicsMemory(gfxAllocation.release());
             return;
         }
     }
     auto &allocationsList = allocationLists[allocationUsage];
-    gfxAllocation->updateTaskCount(taskCount, commandStreamReceiver.getOsContext().getContextId());
+    gfxAllocation->updateTaskCount(taskCount, osContextId);
     allocationsList.pushTailOne(*gfxAllocation.release());
 }
 
 void InternalAllocationStorage::cleanAllocationList(TaskCountType waitTaskCount, uint32_t allocationUsage) {
     freeAllocationsList(waitTaskCount, allocationLists[allocationUsage]);
-
-    if (allocationUsage == TEMPORARY_ALLOCATION) {
-        freeAllocationsList(waitTaskCount, allocationLists[DEFERRED_DEALLOCATION]);
-    }
 }
 
 void InternalAllocationStorage::freeAllocationsList(TaskCountType waitTaskCount, AllocationsList &allocationsList) {
     auto memoryManager = commandStreamReceiver.getMemoryManager();
+
+    if (&allocationsList == &allocationLists[TEMPORARY_ALLOCATION]) {
+        memoryManager->cleanTemporaryAllocations(commandStreamReceiver, waitTaskCount);
+        return;
+    }
+
     auto lock = memoryManager->getHostPtrManager()->obtainOwnership();
 
     GraphicsAllocation *curr = allocationsList.detachNodes();
@@ -55,7 +66,7 @@ void InternalAllocationStorage::freeAllocationsList(TaskCountType waitTaskCount,
     IDList<GraphicsAllocation, false, true> allocationsLeft;
     while (curr != nullptr) {
         auto *next = curr->next;
-        if (curr->hostPtrTaskCountAssignment == 0 && curr->getTaskCount(commandStreamReceiver.getOsContext().getContextId()) <= waitTaskCount) {
+        if (curr->getHostPtrTaskCountAssignment() == 0 && curr->getTaskCount(commandStreamReceiver.getOsContext().getContextId()) <= waitTaskCount) {
             memoryManager->freeGraphicsMemory(curr);
         } else {
             allocationsLeft.pushTailOne(*curr);
@@ -74,8 +85,17 @@ std::unique_ptr<GraphicsAllocation> InternalAllocationStorage::obtainReusableAll
 }
 
 std::unique_ptr<GraphicsAllocation> InternalAllocationStorage::obtainTemporaryAllocationWithPtr(size_t requiredSize, const void *requiredPtr, AllocationType allocationType) {
-    auto allocation = allocationLists[TEMPORARY_ALLOCATION].detachAllocation(requiredSize, requiredPtr, &commandStreamReceiver, allocationType);
-    return allocation;
+    return obtainTemporaryAllocationWithPtr(requiredSize, requiredPtr, allocationType, nullptr);
+}
+
+std::unique_ptr<GraphicsAllocation> InternalAllocationStorage::obtainTemporaryAllocationWithPtr(size_t requiredSize, const void *requiredPtr, AllocationType allocationType, bool *nonUsmHostPtrPartialOverlapFound) {
+    auto memoryManager = commandStreamReceiver.getMemoryManager();
+    return memoryManager->obtainTemporaryAllocationWithPtr(&commandStreamReceiver, requiredSize, requiredPtr, allocationType, nonUsmHostPtrPartialOverlapFound);
+}
+
+AllocationsList &InternalAllocationStorage::getTemporaryAllocations() {
+    auto memoryManager = commandStreamReceiver.getMemoryManager();
+    return memoryManager->getTemporaryAllocationsList();
 }
 
 DeviceBitfield InternalAllocationStorage::getDeviceBitfield() const {

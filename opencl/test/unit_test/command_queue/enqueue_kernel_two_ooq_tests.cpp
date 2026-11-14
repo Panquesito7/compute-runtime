@@ -1,11 +1,12 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
 #include "opencl/source/command_queue/command_queue.h"
@@ -98,13 +99,12 @@ struct TwoOOQsTwoDependentWalkers : public HelloWorldTest<OOQFixtureFactory>,
         delete e1;
         delete e2;
 
-        typedef typename FamilyType::WALKER_TYPE GPGPU_WALKER;
-        itorWalker1 = find<GPGPU_WALKER *>(cmdList.begin(), cmdList.end());
+        itorWalker1 = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
         ASSERT_NE(cmdList.end(), itorWalker1);
 
         itorWalker2 = itorWalker1;
         ++itorWalker2;
-        itorWalker2 = find<GPGPU_WALKER *>(itorWalker2, cmdList.end());
+        itorWalker2 = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(itorWalker2, cmdList.end());
         ASSERT_NE(cmdList.end(), itorWalker2);
     }
 
@@ -127,13 +127,13 @@ HWTEST_F(TwoOOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThe
     EXPECT_NE(itorWalker1, itorWalker2);
 }
 
-HWTEST2_F(TwoOOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeHpcCore) {
+HWTEST2_F(TwoOOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenOnePipelineSelectExists, IsAtMostXeCore) {
     parseWalkers<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, TwoOOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState) {
+HWTEST2_F(TwoOOQsTwoDependentWalkers, GivenTwoCommandQueuesWhenEnqueuingKernelThenThereIsOneVfeState, IsGen12LP) {
     using MEDIA_VFE_STATE = typename FamilyType::MEDIA_VFE_STATE;
     parseWalkers<FamilyType>();
 

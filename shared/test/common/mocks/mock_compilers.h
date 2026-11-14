@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,17 +7,33 @@
 
 #pragma once
 
-#include "shared/source/compiler_interface/compiler_interface.h"
 #include "shared/test/common/mocks/mock_cif.h"
 
+#include "cif/builtins/memory/buffer/buffer.h"
+#include "cif/common/cif.h"
+#include "cif/common/id.h"
+#include "igc_interface.h"
+#include "ocl_igc_interface/code_type.h"
 #include "ocl_igc_interface/fcl_ocl_device_ctx.h"
+#include "ocl_igc_interface/fcl_ocl_translation_ctx.h"
+#include "ocl_igc_interface/gt_system_info.h"
+#include "ocl_igc_interface/igc_features_and_workarounds.h"
 #include "ocl_igc_interface/igc_ocl_device_ctx.h"
+#include "ocl_igc_interface/igc_ocl_translation_ctx.h"
+#include "ocl_igc_interface/ocl_translation_output.h"
+#include "ocl_igc_interface/platform.h"
 
-#include <functional>
-#include <map>
+#include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace NEO {
+
+struct PopIgcDllNameGuard {
+    ~PopIgcDllNameGuard();
+};
+[[nodiscard]] std::unique_ptr<PopIgcDllNameGuard> pushIgcDllName(const char *name);
 
 struct MockCompilerDebugVars {
     enum class SipAddressingType {
@@ -28,15 +44,19 @@ struct MockCompilerDebugVars {
     bool shouldReturnInvalidTranslationOutput = false;
     bool shouldFailCreationOfTranslationContext = false;
     bool forceBuildFailure = false;
+    // When true, forceBuildFailure only applies to IGC translation contexts
+    // created with outType == oclGenBin (the actual backend/build step), not
+    // to front-end (FCL-role) IGC translation contexts used when a device's
+    // compilerProductHelper::useIgcAsFcl() is true.
+    bool forceBuildFailureBackendOnly = false;
     bool forceSuccessWithEmptyOutput = false;
-    bool forceCreateFailure = false;
-    bool forceRegisterFail = false;
     bool internalOptionsExpected = false;
-    bool appendOptionsToFileName = true;
     void *debugDataToReturn = nullptr;
     size_t debugDataToReturnSize = 0;
     void *binaryToReturn = nullptr;
     size_t binaryToReturnSize = 0;
+    void *stateSaveAreaHeaderToReturn = nullptr;
+    size_t stateSaveAreaHeaderToReturnSize = 0;
     bool failCreatePlatformInterface = false;
     bool failCreateGtSystemInfoInterface = false;
     bool failCreateIgcFeWaInterface = false;
@@ -44,11 +64,14 @@ struct MockCompilerDebugVars {
     IGC::SystemRoutineType::SystemRoutineType_t typeOfSystemRoutine = IGC::SystemRoutineType::undefined;
     SipAddressingType receivedSipAddressingType = SipAddressingType::unknown;
     std::string *receivedInternalOptionsOutput = nullptr;
+    std::string *receivedApiOptionsOutput = nullptr;
     std::string *receivedInput = nullptr;
+    std::vector<uint32_t> *receivedSpecConstantIdsOutput = nullptr;
+    std::vector<uint64_t> *receivedSpecConstantValuesOutput = nullptr;
 
-    std::string fileName;
-    std::string fileNameSuffix;
+    std::string buildLogToReturn;
     std::string translationContextCreationError;
+    std::string spirvExtensionsYAMLToReturn;
 };
 
 struct MockCompilerEnableGuard {
@@ -59,9 +82,9 @@ struct MockCompilerEnableGuard {
     void Disable(); // NOLINT(readability-identifier-naming)
 
     const char *oldFclDllName;
-    const char *oldIgcDllName;
 
     bool enabled = false;
+    std::unique_ptr<PopIgcDllNameGuard> igcNameGuard;
 };
 
 void setFclDebugVars(MockCompilerDebugVars &dbgv);
@@ -72,7 +95,12 @@ void clearIgcDebugVars();
 MockCompilerDebugVars getFclDebugVars();
 MockCompilerDebugVars getIgcDebugVars();
 
-struct MockCIFPlatform : MockCIF<IGC::PlatformTagOCL> {
+void fclPushDebugVars(MockCompilerDebugVars &newDebugVars);
+void fclPopDebugVars();
+void igcPushDebugVars(MockCompilerDebugVars &newDebugVars);
+void igcPopDebugVars();
+
+struct MockCIFPlatform : MockCIF<NEO::PlatformTag> {
     IGC::TypeErasedEnum GetProductFamily() const override {
         return productFamily;
     }
@@ -91,7 +119,7 @@ struct MockCIFPlatform : MockCIF<IGC::PlatformTagOCL> {
     IGC::TypeErasedEnum renderCoreFamily;
 };
 
-struct MockGTSystemInfo : MockCIF<IGC::GTSystemInfoTagOCL> {
+struct MockGTSystemInfo : MockCIF<NEO::GTSystemInfoTag> {
     uint32_t GetEUCount() const override {
         return this->euCount;
     }
@@ -124,7 +152,7 @@ struct MockGTSystemInfo : MockCIF<IGC::GTSystemInfoTagOCL> {
     uint32_t subsliceCount;
 };
 
-struct MockIgcFeaturesAndWorkarounds : MockCIF<IGC::IgcFeaturesAndWorkaroundsTagOCL> {
+struct MockIgcFeaturesAndWorkarounds : MockCIF<NEO::IgcFeaturesAndWorkaroundsTag> {
     uint32_t GetMaxOCLParamSize() const override {
         return this->maxOCLParamSize;
     };
@@ -132,10 +160,19 @@ struct MockIgcFeaturesAndWorkarounds : MockCIF<IGC::IgcFeaturesAndWorkaroundsTag
     uint32_t maxOCLParamSize = 0;
 };
 
-struct MockIgcOclTranslationCtx : MockCIF<IGC::IgcOclTranslationCtxTagOCL> {
-    using MockCIF<IGC::IgcOclTranslationCtxTagOCL>::TranslateImpl;
+struct MockIgcOptionsAndCapabilities : MockCIF<IGC::IgcOptionsAndCapabilitiesLatest> {
+    void GetCompilerSupportedSPIRVExtensionsYAML(CIF::Builtins::BufferSimple *outSupportedSPIRVExtensionsYAML) const override;
+};
+
+struct MockIgcOclTranslationCtx : MockCIF<NEO::IgcOclTranslationCtxTag> {
+    using MockCIF<NEO::IgcOclTranslationCtxTag>::TranslateImpl;
     MockIgcOclTranslationCtx();
     ~MockIgcOclTranslationCtx() override;
+
+    // outType this context was created with (see MockIgcOclDeviceCtx::CreateTranslationCtxImpl).
+    // Used to distinguish front-end (FCL-role) from backend/build translation
+    // calls when forceBuildFailureBackendOnly is set.
+    IGC::CodeType::CodeType_t createdOutType = IGC::CodeType::undefined;
 
     IGC::OclTranslationOutputBase *TranslateImpl(
         CIF::Version_t outVersion,
@@ -171,7 +208,7 @@ struct MockIgcOclTranslationCtx : MockCIF<IGC::IgcOclTranslationCtxTagOCL> {
         void *gtPinInput) override;
 };
 
-struct MockOclTranslationOutput : MockCIF<IGC::OclTranslationOutputTagOCL> {
+struct MockOclTranslationOutput : MockCIF<NEO::OclTranslationOutputTag> {
     MockOclTranslationOutput();
     ~MockOclTranslationOutput() override;
     CIF::Builtins::BufferBase *GetBuildLogImpl(CIF::Version_t bufferVersion) override;
@@ -186,6 +223,7 @@ struct MockOclTranslationOutput : MockCIF<IGC::OclTranslationOutputTagOCL> {
         setError("");
     }
     void setError(const std::string &message);
+    void setBuildLog(const std::string &message);
     void setOutput(const void *data, size_t dataLen);
     void setDebugData(const void *data, size_t dataLen);
 
@@ -195,7 +233,7 @@ struct MockOclTranslationOutput : MockCIF<IGC::OclTranslationOutputTagOCL> {
     MockCIFBuffer *debugData = nullptr;
 };
 
-struct MockIgcOclDeviceCtx : MockCIF<IGC::IgcOclDeviceCtxTagOCL> {
+struct MockIgcOclDeviceCtx : MockCIF<NEO::IgcOclDeviceCtxTag> {
     static CIF::ICIF *Create(CIF::InterfaceId_t intId, CIF::Version_t version); // NOLINT(readability-identifier-naming)
 
     MockIgcOclDeviceCtx();
@@ -222,6 +260,10 @@ struct MockIgcOclDeviceCtx : MockCIF<IGC::IgcOclDeviceCtxTagOCL> {
         return igcFtrWa;
     }
 
+    IGC::IgcOptionsAndCapabilitiesBase *GetIgcOptionsAndCapabilitiesHandleImpl(CIF::Version_t ver) override {
+        return igcOptionsAndCapabilities;
+    }
+
     IGC::IgcOclTranslationCtxBase *CreateTranslationCtxImpl(CIF::Version_t ver,
                                                             IGC::CodeType::CodeType_t inType,
                                                             IGC::CodeType::CodeType_t outType) override;
@@ -231,20 +273,26 @@ struct MockIgcOclDeviceCtx : MockCIF<IGC::IgcOclDeviceCtxTagOCL> {
                           CIF::Builtins::BufferSimple *outSystemRoutineBuffer,
                           CIF::Builtins::BufferSimple *stateSaveAreaHeaderInit) override;
 
+    const char *GetIGCRevision() override;
+
+    void GetIGCRegKeys(CIF::Builtins::BufferSimple *outIgcRegKeysBuffer) override;
+
     void SetDebugVars(MockCompilerDebugVars &debugVars) { // NOLINT(readability-identifier-naming)
         this->debugVars = debugVars;
     }
 
+    std::string igcRegKeysToReturn = "mockigcregkeys";
     MockCIFPlatform *platform = nullptr;
     MockGTSystemInfo *gtSystemInfo = nullptr;
     MockIgcFeaturesAndWorkarounds *igcFtrWa = nullptr;
+    MockIgcOptionsAndCapabilities *igcOptionsAndCapabilities = nullptr;
     MockCompilerDebugVars debugVars;
 
     using TranslationOpT = std::pair<IGC::CodeType::CodeType_t, IGC::CodeType::CodeType_t>;
     std::vector<TranslationOpT> requestedTranslationCtxs;
 };
 
-struct MockFclOclTranslationCtx : MockCIF<IGC::FclOclTranslationCtxTagOCL> {
+struct MockFclOclTranslationCtx : MockCIF<NEO::FclOclTranslationCtxTag> {
     MockFclOclTranslationCtx();
     ~MockFclOclTranslationCtx() override;
 
@@ -257,7 +305,7 @@ struct MockFclOclTranslationCtx : MockCIF<IGC::FclOclTranslationCtxTagOCL> {
         uint32_t tracingOptionsCount) override;
 };
 
-struct MockFclOclDeviceCtx : MockCIF<IGC::FclOclDeviceCtxTagOCL> {
+struct MockFclOclDeviceCtx : MockCIF<NEO::FclOclDeviceCtxTag> {
     MockFclOclDeviceCtx();
     ~MockFclOclDeviceCtx() override;
 

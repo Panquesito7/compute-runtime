@@ -1,17 +1,18 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/tbx_command_stream_receiver.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
+#include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/helpers/bit_helpers.h"
+#include "shared/source/helpers/device_bitfield.h"
 #include "shared/source/helpers/gfx_core_helper.h"
-#include "shared/source/indirect_heap/indirect_heap.h"
+#include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
-#include "shared/source/os_interface/os_inc_base.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/helpers/raii_gfx_core_helper.h"
@@ -19,19 +20,18 @@
 #include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
-#include "shared/test/common/mocks/mock_csr.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_driver_info.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
 #include "shared/test/common/mocks/mock_os_context.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 #include "shared/test/common/test_macros/hw_test.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
 
 #include "opencl/source/platform/platform.h"
 #include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
-#include "opencl/test/unit_test/mocks/mock_context.h"
 #include "opencl/test/unit_test/mocks/mock_platform.h"
 
 #include <memory>
@@ -48,13 +48,6 @@ TEST_F(DeviceTest, givenDeviceWhenGetProductAbbrevThenReturnsHardwarePrefix) {
 
 TEST_F(DeviceTest, WhenDeviceIsCreatedThenCommandStreamReceiverIsNotNull) {
     EXPECT_NE(nullptr, &pDevice->getGpgpuCommandStreamReceiver());
-}
-
-TEST_F(DeviceTest, WhenDeviceIsCreatedThenEnabledClVersionMatchesHardwareInfo) {
-    auto version = pClDevice->getEnabledClVersion();
-    auto version2 = pDevice->getHardwareInfo().capabilityTable.clVersionSupport;
-
-    EXPECT_EQ(version, version2);
 }
 
 TEST_F(DeviceTest, givenDeviceWhenEngineIsCreatedThenSetInitialValueForTag) {
@@ -74,25 +67,25 @@ TEST_F(DeviceTest, givenDeviceWhenAskedForSpecificEngineThenReturnIt) {
     auto &gfxCoreHelper = mockClDevice.getGfxCoreHelper();
     auto &engines = gfxCoreHelper.getGpgpuEngineInstances(mockClDevice.getRootDeviceEnvironment());
     for (uint32_t i = 0; i < engines.size(); i++) {
-        auto &deviceEngine = mockClDevice.getEngine(engines[i].first, EngineUsage::Regular);
+        auto &deviceEngine = mockClDevice.getEngine(engines[i].first, EngineUsage::regular);
         EXPECT_EQ(deviceEngine.osContext->getEngineType(), engines[i].first);
         EXPECT_EQ(deviceEngine.osContext->isLowPriority(), false);
     }
 
-    auto &deviceEngine = mockClDevice.getEngine(hwInfo.capabilityTable.defaultEngineType, EngineUsage::LowPriority);
+    auto &deviceEngine = mockClDevice.getEngine(hwInfo.capabilityTable.defaultEngineType, EngineUsage::lowPriority);
     EXPECT_EQ(deviceEngine.osContext->getEngineType(), hwInfo.capabilityTable.defaultEngineType);
     EXPECT_EQ(deviceEngine.osContext->isLowPriority(), true);
 
-    EXPECT_THROW(mockClDevice.getEngine(aub_stream::ENGINE_VCS, EngineUsage::Regular), std::exception);
+    EXPECT_THROW(mockClDevice.getEngine(aub_stream::ENGINE_VCS, EngineUsage::regular), std::exception);
 }
 
 TEST_F(DeviceTest, givenDebugVariableToAlwaysChooseEngineZeroWhenNotExistingEngineSelectedThenIndexZeroEngineIsReturned) {
     DebugManagerStateRestore restore;
-    DebugManager.flags.OverrideInvalidEngineWithDefault.set(true);
+    debugManager.flags.OverrideInvalidEngineWithDefault.set(true);
     auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
     auto &engines = gfxCoreHelper.getGpgpuEngineInstances(pDevice->getRootDeviceEnvironment());
-    auto &deviceEngine = pDevice->getEngine(engines[0].first, EngineUsage::Regular);
-    auto &notExistingEngine = pDevice->getEngine(aub_stream::ENGINE_VCS, EngineUsage::Regular);
+    auto &deviceEngine = pDevice->getEngine(engines[0].first, EngineUsage::regular);
+    auto &notExistingEngine = pDevice->getEngine(aub_stream::ENGINE_VCS, EngineUsage::regular);
     EXPECT_EQ(&notExistingEngine, &deviceEngine);
 }
 
@@ -101,19 +94,6 @@ TEST_F(DeviceTest, WhenDeviceIsCreatedThenOsTimeIsNotNull) {
 
     OSTime *osTime = pDevice->getOSTime();
     ASSERT_NE(nullptr, osTime);
-}
-
-TEST_F(DeviceTest, GivenDebugVariableForcing32BitAllocationsWhenDeviceIsCreatedThenMemoryManagerHasForce32BitFlagSet) {
-    DebugManager.flags.Force32bitAddressing.set(true);
-    auto pDevice = std::unique_ptr<Device>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    if constexpr (is64bit) {
-        EXPECT_TRUE(pDevice->getDeviceInfo().force32BitAddressess);
-        EXPECT_TRUE(pDevice->getMemoryManager()->peekForce32BitAllocations());
-    } else {
-        EXPECT_FALSE(pDevice->getDeviceInfo().force32BitAddressess);
-        EXPECT_FALSE(pDevice->getMemoryManager()->peekForce32BitAllocations());
-    }
-    DebugManager.flags.Force32bitAddressing.set(false);
 }
 
 TEST_F(DeviceTest, WhenRetainingThenReferenceIsOneAndApiIsUsed) {
@@ -175,7 +155,7 @@ HWTEST_F(DeviceTest, WhenDeviceIsCreatedThenActualEngineTypeIsSameAsDefault) {
     int defaultCounter = 0;
     const auto &engines = device->getAllEngines();
     for (const auto &engine : engines) {
-        if (engine.osContext->isDefaultContext()) {
+        if (engine.osContext->getIsDefaultEngine()) {
             defaultCounter++;
         }
     }
@@ -202,7 +182,7 @@ TEST_F(DeviceTest, givenDeviceWithThreadsPerEUConfigsWhenQueryingEuThreadCountsT
 
 TEST_F(DeviceTest, givenRootDeviceWithSubDevicesWhenCreatingThenRootDeviceContextIsInitialized) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.DeferOsContextInitialization.set(1);
 
     UltDeviceFactory factory(1, 2);
     MockDevice &device = *factory.rootDevices[0];
@@ -246,9 +226,10 @@ HWTEST_F(DeviceTest, givenMultiDeviceWhenCreatingContextsThenMemoryManagerDefaul
 }
 
 TEST(DeviceCleanup, givenDeviceWhenItIsDestroyedThenFlushBatchedSubmissionsIsCalled) {
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCommandStreamReceiver>();
     auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    MockCommandStreamReceiver *csr = new MockCommandStreamReceiver(*mockDevice->getExecutionEnvironment(), mockDevice->getRootDeviceIndex(), mockDevice->getDeviceBitfield());
-    mockDevice->resetCommandStreamReceiver(csr);
+    MockCommandStreamReceiver *csr = static_cast<MockCommandStreamReceiver *>(&mockDevice->getGpgpuCommandStreamReceiver());
     int flushedBatchedSubmissionsCalledCount = 0;
     csr->flushBatchedSubmissionsCallCounter = &flushedBatchedSubmissionsCalledCount;
     mockDevice.reset(nullptr);
@@ -256,18 +237,7 @@ TEST(DeviceCleanup, givenDeviceWhenItIsDestroyedThenFlushBatchedSubmissionsIsCal
     EXPECT_EQ(1, flushedBatchedSubmissionsCalledCount);
 }
 
-TEST(DeviceCreation, GiveNonExistingFclWhenCreatingDeviceThenCompilerInterfaceIsNotCreated) {
-    VariableBackup<const char *> frontEndDllName(&Os::frontEndDllName);
-    Os::frontEndDllName = "_fake_fcl1_so";
-
-    auto mockDevice = std::unique_ptr<Device>(MockDevice::createWithNewExecutionEnvironment<Device>(nullptr));
-    ASSERT_NE(nullptr, mockDevice);
-
-    auto compilerInterface = mockDevice->getCompilerInterface();
-    ASSERT_EQ(nullptr, compilerInterface);
-}
-
-TEST(DeviceCreation, givenDeviceWhenItIsCreatedThenOsContextIsRegistredInMemoryManager) {
+TEST(DeviceCreation, givenDeviceWhenItIsCreatedThenOsContextIsRegisteredInMemoryManager) {
     auto hwInfo = *defaultHwInfo;
     hwInfo.capabilityTable.blitterOperationsSupported = true;
     auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hwInfo));
@@ -284,6 +254,10 @@ TEST(DeviceCreation, givenDeviceWhenItIsCreatedThenOsContextIsRegistredInMemoryM
     } else if (device->getNumSubDevices() > 0) {
         numEnginesForDevice += device->getNumSubDevices();
     }
+    for (const auto &secondaryContexts : device->secondaryEngines) {
+        numEnginesForDevice += secondaryContexts.second.engines.size() - 1;
+    }
+
     EXPECT_EQ(numEnginesForDevice, memoryManager->getRegisteredEngines(device->getRootDeviceIndex()).size());
 }
 
@@ -296,43 +270,29 @@ TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachOsContextHasU
         executionEnvironment->rootDeviceEnvironments[i]->initGmm();
         executionEnvironment->rootDeviceEnvironments[i]->getMutableHardwareInfo()->capabilityTable.blitterOperationsSupported = true;
     }
+    executionEnvironment->calculateMaxOsContextCount();
 
     auto device1 = std::unique_ptr<MockDevice>(Device::create<MockDevice>(executionEnvironment, 0u));
     auto device2 = std::unique_ptr<MockDevice>(Device::create<MockDevice>(executionEnvironment, 1u));
 
     MockDevice *devices[] = {device1.get(), device2.get()};
+    MockMemoryManager *memoryManager = static_cast<MockMemoryManager *>(executionEnvironment->memoryManager.get());
 
     auto &gfxCoreHelper = device1->getGfxCoreHelper();
     const auto &numGpgpuEngines = static_cast<uint32_t>(gfxCoreHelper.getGpgpuEngineInstances(device1->getRootDeviceEnvironment()).size());
 
     size_t numExpectedGenericEnginesPerDevice = numGpgpuEngines;
-    size_t numExpectedEngineInstancedEnginesPerDevice = 0;
-    if (device1->getNumSubDevices() > 0) {
-        numExpectedEngineInstancedEnginesPerDevice = device1->getNumSubDevices();
-    }
-
-    auto expectedTotalRegisteredEnginesPerRootDevice = numExpectedGenericEnginesPerDevice + numExpectedEngineInstancedEnginesPerDevice;
+    auto expectedTotalRegisteredEnginesPerRootDevice = numExpectedGenericEnginesPerDevice;
 
     uint32_t contextId = 0;
     for (uint32_t i = 0; i < numDevices; i++) {
         uint32_t contextWithinRootDevice = 0;
+        size_t numSecondaryEngines = memoryManager->secondaryEngines[i].size();
+
         auto &registeredEngines = executionEnvironment->memoryManager->getRegisteredEngines(i);
 
-        EXPECT_EQ(expectedTotalRegisteredEnginesPerRootDevice, registeredEngines.size());
+        EXPECT_EQ(expectedTotalRegisteredEnginesPerRootDevice + numSecondaryEngines, registeredEngines.size());
         auto device = devices[i];
-
-        for (uint32_t j = 0; j < numExpectedEngineInstancedEnginesPerDevice; j++) {
-            auto subDevice = device->getSubDevice(j);
-            auto &engine = subDevice->getEngine(0);
-            EXPECT_EQ(contextId, engine.osContext->getContextId());
-            EXPECT_EQ(1u, engine.osContext->getDeviceBitfield().to_ulong());
-
-            EXPECT_EQ(registeredEngines[contextWithinRootDevice].commandStreamReceiver,
-                      engine.commandStreamReceiver);
-
-            contextId++;
-            contextWithinRootDevice++;
-        }
 
         for (uint32_t j = 0; j < numExpectedGenericEnginesPerDevice; j++) {
             auto &engine = device->getEngine(j);
@@ -346,17 +306,31 @@ TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachOsContextHasU
             contextId++;
             contextWithinRootDevice++;
         }
+        for (uint32_t j = 0; j < numExpectedGenericEnginesPerDevice; j++) {
+            auto &engine = device->getEngine(j);
+            if (engine.osContext->getIsPrimaryEngine()) {
+                for (size_t secondaryEngineId = 1; secondaryEngineId < device->secondaryEngines[engine.getEngineType()].engines.size(); secondaryEngineId++) {
+
+                    EXPECT_EQ(contextId, device->secondaryEngines[engine.getEngineType()].engines[secondaryEngineId].osContext->getContextId());
+                    contextId++;
+                }
+            }
+        }
     }
 }
 
-TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSeperateDeviceIndex) {
+TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSeparateDeviceIndex) {
     ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
     const size_t numDevices = 2;
     executionEnvironment->prepareRootDeviceEnvironments(numDevices);
     for (auto i = 0u; i < executionEnvironment->rootDeviceEnvironments.size(); i++) {
         executionEnvironment->rootDeviceEnvironments[i]->setHwInfoAndInitHelpers(defaultHwInfo.get());
+
         executionEnvironment->rootDeviceEnvironments[i]->initGmm();
     }
+
+    executionEnvironment->calculateMaxOsContextCount();
+
     auto device = std::unique_ptr<MockDevice>(Device::create<MockDevice>(executionEnvironment, 0u));
     auto device2 = std::unique_ptr<MockDevice>(Device::create<MockDevice>(executionEnvironment, 1u));
 
@@ -364,7 +338,7 @@ TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSepe
     EXPECT_EQ(1u, device2->getRootDeviceIndex());
 }
 
-TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSeperateCommandStreamReceiver) {
+TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSeparateCommandStreamReceiver) {
     ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
     const size_t numDevices = 2;
     executionEnvironment->prepareRootDeviceEnvironments(numDevices);
@@ -373,6 +347,7 @@ TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSepe
         executionEnvironment->rootDeviceEnvironments[i]->initGmm();
         executionEnvironment->rootDeviceEnvironments[i]->getMutableHardwareInfo()->capabilityTable.blitterOperationsSupported = true;
     }
+    executionEnvironment->calculateMaxOsContextCount();
 
     auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
     const auto &numGpgpuEngines = gfxCoreHelper.getGpgpuEngineInstances(*executionEnvironment->rootDeviceEnvironments[0]).size();
@@ -390,20 +365,21 @@ TEST(DeviceCreation, givenMultiRootDeviceWhenTheyAreCreatedThenEachDeviceHasSepe
 HWTEST_F(DeviceTest, givenDeviceWhenAskingForDefaultEngineThenReturnValidValue) {
     ExecutionEnvironment *executionEnvironment = platform()->peekExecutionEnvironment();
     executionEnvironment->prepareRootDeviceEnvironments(1u);
-    auto &gfxCoreHelper = getHelper<GfxCoreHelper>();
-    auto &productHelper = getHelper<ProductHelper>();
-    gfxCoreHelper.adjustDefaultEngineType(executionEnvironment->rootDeviceEnvironments[0]->getMutableHardwareInfo(), productHelper);
+    executionEnvironment->rootDeviceEnvironments[0]->getMutableHardwareInfo()->caps.rcsExposureDisabled = false;
+    EngineHelpers::setupDefaultEngineType(*executionEnvironment->rootDeviceEnvironments[0]);
 
     auto device = std::unique_ptr<MockDevice>(Device::create<MockDevice>(executionEnvironment, 0));
     auto osContext = device->getDefaultEngine().osContext;
 
-    EXPECT_EQ(device->getHardwareInfo().capabilityTable.defaultEngineType, osContext->getEngineType());
+    auto defaultEngineType = device->getHardwareInfo().capabilityTable.defaultEngineType;
+    auto engineType = osContext->getEngineType();
+    EXPECT_EQ(defaultEngineType, engineType);
     EXPECT_FALSE(osContext->isLowPriority());
 }
 
 HWTEST_F(DeviceTest, givenDebugFlagWhenCreatingRootDeviceWithSubDevicesThenWorkPartitionAllocationIsCreatedForRootDevice) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.EnableImplicitScaling.set(1);
     {
         UltDeviceFactory deviceFactory{1, 2};
         EXPECT_NE(nullptr, deviceFactory.rootDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
@@ -414,7 +390,7 @@ HWTEST_F(DeviceTest, givenDebugFlagWhenCreatingRootDeviceWithSubDevicesThenWorkP
         EXPECT_FALSE(deviceFactory.subDevices[1]->getDefaultEngine().commandStreamReceiver->isStaticWorkPartitioningEnabled());
     }
     {
-        DebugManager.flags.EnableStaticPartitioning.set(0);
+        debugManager.flags.EnableStaticPartitioning.set(0);
         UltDeviceFactory deviceFactory{1, 2};
         EXPECT_EQ(nullptr, deviceFactory.rootDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
         EXPECT_EQ(nullptr, deviceFactory.subDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
@@ -424,7 +400,7 @@ HWTEST_F(DeviceTest, givenDebugFlagWhenCreatingRootDeviceWithSubDevicesThenWorkP
         EXPECT_FALSE(deviceFactory.subDevices[1]->getDefaultEngine().commandStreamReceiver->isStaticWorkPartitioningEnabled());
     }
     {
-        DebugManager.flags.EnableStaticPartitioning.set(1);
+        debugManager.flags.EnableStaticPartitioning.set(1);
         UltDeviceFactory deviceFactory{1, 2};
         EXPECT_NE(nullptr, deviceFactory.rootDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
         EXPECT_EQ(nullptr, deviceFactory.subDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
@@ -437,18 +413,18 @@ HWTEST_F(DeviceTest, givenDebugFlagWhenCreatingRootDeviceWithSubDevicesThenWorkP
 
 HWTEST_F(DeviceTest, givenDebugFlagWhenCreatingRootDeviceWithoutSubDevicesThenWorkPartitionAllocationIsNotCreated) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.EnableImplicitScaling.set(1);
+    debugManager.flags.EnableImplicitScaling.set(1);
     {
         UltDeviceFactory deviceFactory{1, 1};
         EXPECT_EQ(nullptr, deviceFactory.rootDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
     }
     {
-        DebugManager.flags.EnableStaticPartitioning.set(0);
+        debugManager.flags.EnableStaticPartitioning.set(0);
         UltDeviceFactory deviceFactory{1, 1};
         EXPECT_EQ(nullptr, deviceFactory.rootDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
     }
     {
-        DebugManager.flags.EnableStaticPartitioning.set(1);
+        debugManager.flags.EnableStaticPartitioning.set(1);
         UltDeviceFactory deviceFactory{1, 1};
         EXPECT_EQ(nullptr, deviceFactory.rootDevices[0]->getDefaultEngine().commandStreamReceiver->getWorkPartitionAllocation());
     }
@@ -481,22 +457,19 @@ TEST(DeviceCreation, whenCheckingEngineGroupsThenGroupsAreUnique) {
     VariableBackup<HardwareInfo> backupHwInfo(defaultHwInfo.get());
     defaultHwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 4;
 
-    for (auto ftrGpGpuMidThreadLevelPreempt : ::testing::Bool()) {
-        defaultHwInfo->featureTable.flags.ftrGpGpuMidThreadLevelPreempt = ftrGpGpuMidThreadLevelPreempt;
-        for (auto blitterOperationsSupported : ::testing::Bool()) {
-            defaultHwInfo->capabilityTable.blitterOperationsSupported = blitterOperationsSupported;
-            for (auto ftrRcsNode : ::testing::Bool()) {
-                defaultHwInfo->featureTable.flags.ftrRcsNode = ftrRcsNode;
-                for (auto ftrCCSNode : ::testing::Bool()) {
-                    defaultHwInfo->featureTable.flags.ftrCCSNode = ftrCCSNode;
+    for (auto blitterOperationsSupported : ::testing::Bool()) {
+        defaultHwInfo->capabilityTable.blitterOperationsSupported = blitterOperationsSupported;
+        for (auto rcsExposed : ::testing::Bool()) {
+            defaultHwInfo->caps.rcsExposureDisabled = !rcsExposed;
+            for (auto ftrCCSNode : ::testing::Bool()) {
+                defaultHwInfo->featureTable.flags.ftrCCSNode = ftrCCSNode;
 
-                    UltDeviceFactory deviceFactory{1, 0};
-                    std::set<EngineGroupType> uniqueEngineGroupTypes;
-                    for (auto &engineGroup : deviceFactory.rootDevices[0]->getRegularEngineGroups()) {
-                        uniqueEngineGroupTypes.insert(engineGroup.engineGroupType);
-                    }
-                    EXPECT_EQ(uniqueEngineGroupTypes.size(), deviceFactory.rootDevices[0]->getRegularEngineGroups().size());
+                UltDeviceFactory deviceFactory{1, 0};
+                std::set<EngineGroupType> uniqueEngineGroupTypes;
+                for (auto &engineGroup : deviceFactory.rootDevices[0]->getRegularEngineGroups()) {
+                    uniqueEngineGroupTypes.insert(engineGroup.engineGroupType);
                 }
+                EXPECT_EQ(uniqueEngineGroupTypes.size(), deviceFactory.rootDevices[0]->getRegularEngineGroups().size());
             }
         }
     }
@@ -560,10 +533,10 @@ HWTEST_F(DeviceHwTest, givenBothCcsAndRcsEnginesInDeviceWhenGettingEngineGroupsT
     struct MyGfxCoreHelper : GfxCoreHelperHw<FamilyType> {
         EngineGroupType getEngineGroupType(aub_stream::EngineType engineType, EngineUsage engineUsage, const HardwareInfo &hwInfo) const override {
             if (engineType == aub_stream::ENGINE_RCS) {
-                return EngineGroupType::RenderCompute;
+                return EngineGroupType::renderCompute;
             }
             if (EngineHelpers::isCcs(engineType)) {
-                return EngineGroupType::Compute;
+                return EngineGroupType::compute;
             }
             UNRECOVERABLE_IF(true);
         }
@@ -573,10 +546,10 @@ HWTEST_F(DeviceHwTest, givenBothCcsAndRcsEnginesInDeviceWhenGettingEngineGroupsT
     RAIIGfxCoreHelperFactory<MyGfxCoreHelper> overrideGfxCoreHelper{
         *device.executionEnvironment->rootDeviceEnvironments[0]};
 
-    MockOsContext rcsContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_RCS, EngineUsage::Regular}));
+    MockOsContext rcsContext(0, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_RCS, EngineUsage::regular}));
     EngineControl rcsEngine{nullptr, &rcsContext};
 
-    MockOsContext ccsContext(1, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_CCS, EngineUsage::Regular}));
+    MockOsContext ccsContext(1, EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_CCS, EngineUsage::regular}));
     EngineControl ccsEngine{nullptr, &ccsContext};
 
     ASSERT_EQ(0u, device.getRegularEngineGroups().size());
@@ -584,10 +557,10 @@ HWTEST_F(DeviceHwTest, givenBothCcsAndRcsEnginesInDeviceWhenGettingEngineGroupsT
     device.addEngineToEngineGroup(rcsEngine);
     auto &engineGroups = device.getRegularEngineGroups();
     EXPECT_EQ(1u, engineGroups[0].engines.size());
-    EXPECT_EQ(EngineGroupType::Compute, engineGroups[0].engineGroupType);
+    EXPECT_EQ(EngineGroupType::compute, engineGroups[0].engineGroupType);
     EXPECT_EQ(aub_stream::EngineType::ENGINE_CCS, engineGroups[0].engines[0].getEngineType());
     EXPECT_EQ(1u, engineGroups[1].engines.size());
-    EXPECT_EQ(EngineGroupType::RenderCompute, engineGroups[1].engineGroupType);
+    EXPECT_EQ(EngineGroupType::renderCompute, engineGroups[1].engineGroupType);
     EXPECT_EQ(aub_stream::EngineType::ENGINE_RCS, engineGroups[1].engines[0].getEngineType());
 
     device.getRegularEngineGroups().clear();
@@ -595,14 +568,16 @@ HWTEST_F(DeviceHwTest, givenBothCcsAndRcsEnginesInDeviceWhenGettingEngineGroupsT
     device.addEngineToEngineGroup(ccsEngine);
     engineGroups = device.getRegularEngineGroups();
     EXPECT_EQ(1u, engineGroups[0].engines.size());
-    EXPECT_EQ(EngineGroupType::RenderCompute, engineGroups[0].engineGroupType);
+    EXPECT_EQ(EngineGroupType::renderCompute, engineGroups[0].engineGroupType);
     EXPECT_EQ(aub_stream::EngineType::ENGINE_RCS, engineGroups[0].engines[0].getEngineType());
     EXPECT_EQ(1u, engineGroups[1].engines.size());
-    EXPECT_EQ(EngineGroupType::Compute, engineGroups[1].engineGroupType);
+    EXPECT_EQ(EngineGroupType::compute, engineGroups[1].engineGroupType);
     EXPECT_EQ(aub_stream::EngineType::ENGINE_CCS, engineGroups[1].engines[0].getEngineType());
 }
 
 TEST(DeviceGetEngineTest, givenHwCsrModeWhenGetEngineThenDedicatedForInternalUsageEngineIsReturned) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ExperimentalUseSecondaryContextForInternalEngine.set(0);
     auto device = std::unique_ptr<Device>(MockDevice::createWithNewExecutionEnvironment<Device>(nullptr));
 
     auto &internalEngine = device->getInternalEngine();
@@ -644,7 +619,7 @@ TEST(DeviceGetEngineTest, givenVariousIndicesWhenGettingEngineGroupIndexFromEngi
 
 TEST(DeviceGetEngineTest, givenDeferredContextInitializationEnabledWhenCreatingEnginesThenInitializeOnlyOsContextsWhichRequireIt) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.DeferOsContextInitialization.set(1);
 
     auto device = std::unique_ptr<Device>(MockDevice::createWithNewExecutionEnvironment<Device>(nullptr));
     const auto defaultEngineType = getChosenEngineType(device->getHardwareInfo());
@@ -659,7 +634,7 @@ TEST(DeviceGetEngineTest, givenDeferredContextInitializationEnabledWhenCreatingE
 
 TEST(DeviceGetEngineTest, givenDeferredContextInitializationDisabledWhenCreatingEnginesThenInitializeAllOsContexts) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.DeferOsContextInitialization.set(0);
+    debugManager.flags.DeferOsContextInitialization.set(0);
 
     auto device = std::unique_ptr<Device>(MockDevice::createWithNewExecutionEnvironment<Device>(nullptr));
     EXPECT_NE(0u, device->getAllEngines().size());
@@ -670,7 +645,7 @@ TEST(DeviceGetEngineTest, givenDeferredContextInitializationDisabledWhenCreating
 
 TEST(DeviceGetEngineTest, givenNonHwCsrModeWhenGetEngineThenDefaultEngineIsReturned) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.SetCommandStreamReceiver.set(CommandStreamReceiverType::CSR_AUB);
+    debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::aub));
 
     VariableBackup<UltHwConfig> backup(&ultHwConfig);
     ultHwConfig.useHwCsr = true;
@@ -706,11 +681,11 @@ HWTEST_F(QueueFamiliesTests, whenGettingQueueFamilyCapabilitiesAllThenReturnCorr
 
 HWTEST_F(QueueFamiliesTests, givenComputeQueueWhenGettingQueueFamilyCapabilitiesThenReturnDefaultCapabilities) {
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
-    EXPECT_EQ(static_cast<uint64_t>(CL_QUEUE_DEFAULT_CAPABILITIES_INTEL), device->getQueueFamilyCapabilities(NEO::EngineGroupType::Compute));
-    EXPECT_EQ(static_cast<uint64_t>(CL_QUEUE_DEFAULT_CAPABILITIES_INTEL), device->getQueueFamilyCapabilities(NEO::EngineGroupType::RenderCompute));
+    EXPECT_EQ(static_cast<uint64_t>(CL_QUEUE_DEFAULT_CAPABILITIES_INTEL), device->getQueueFamilyCapabilities(NEO::EngineGroupType::compute));
+    EXPECT_EQ(static_cast<uint64_t>(CL_QUEUE_DEFAULT_CAPABILITIES_INTEL), device->getQueueFamilyCapabilities(NEO::EngineGroupType::renderCompute));
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, QueueFamiliesTests, givenCopyQueueWhenGettingQueueFamilyCapabilitiesThenDoNotReturnUnsupportedOperations) {
+HWTEST2_F(QueueFamiliesTests, givenCopyQueueWhenGettingQueueFamilyCapabilitiesThenDoNotReturnUnsupportedOperations, IsGen12LP) {
     const cl_command_queue_capabilities_intel capabilitiesNotSupportedOnBlitter = CL_QUEUE_CAPABILITY_KERNEL_INTEL |
                                                                                   CL_QUEUE_CAPABILITY_FILL_BUFFER_INTEL |
                                                                                   CL_QUEUE_CAPABILITY_TRANSFER_IMAGE_INTEL |
@@ -720,7 +695,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, QueueFamiliesTests, givenCopyQueueWhenGettingQueueFa
                                                                                   CL_QUEUE_CAPABILITY_CREATE_CROSS_QUEUE_EVENTS_INTEL;
     const cl_command_queue_capabilities_intel expectedBlitterCapabilities = setBits(MockClDevice::getQueueFamilyCapabilitiesAll(), false, capabilitiesNotSupportedOnBlitter);
     auto device = std::make_unique<MockClDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
-    EXPECT_EQ(expectedBlitterCapabilities, device->getQueueFamilyCapabilities(NEO::EngineGroupType::Copy));
+    EXPECT_EQ(expectedBlitterCapabilities, device->getQueueFamilyCapabilities(NEO::EngineGroupType::copy));
 }
 
 TEST(ClDeviceHelperTest, givenNonZeroNumberOfTilesWhenPrepareDeviceEnvironmentsCountCalledThenReturnCorrectValue) {
@@ -732,8 +707,8 @@ TEST(ClDeviceHelperTest, givenNonZeroNumberOfTilesWhenPrepareDeviceEnvironmentsC
     sysInfo.MultiTileArchInfo.IsValid = true;
     sysInfo.MultiTileArchInfo.TileCount = 3;
     PLATFORM platform = {};
-    HardwareInfo hwInfo{&platform, &skuTable, &waTable, &sysInfo, capTable, {}};
-    DebugManager.flags.CreateMultipleSubDevices.set(0);
+    HardwareInfo hwInfo{&platform, &skuTable, &waTable, &sysInfo, capTable};
+    debugManager.flags.CreateMultipleSubDevices.set(0);
 
     uint32_t devicesCount = GfxCoreHelper::getSubDevicesCount(&hwInfo);
     EXPECT_EQ(devicesCount, 3u);
@@ -748,9 +723,58 @@ TEST(ClDeviceHelperTest, givenZeroNumberOfTilesWhenPrepareDeviceEnvironmentsCoun
     sysInfo.MultiTileArchInfo.IsValid = true;
     sysInfo.MultiTileArchInfo.TileCount = 0;
     PLATFORM platform = {};
-    HardwareInfo hwInfo{&platform, &skuTable, &waTable, &sysInfo, capTable, {}};
-    DebugManager.flags.CreateMultipleSubDevices.set(0);
+    HardwareInfo hwInfo{&platform, &skuTable, &waTable, &sysInfo, capTable};
+    debugManager.flags.CreateMultipleSubDevices.set(0);
 
     uint32_t devicesCount = GfxCoreHelper::getSubDevicesCount(&hwInfo);
     EXPECT_EQ(devicesCount, 1u);
+}
+
+using MultipleDeviceTest = ::testing::TestWithParam<uint32_t>;
+
+TEST_P(MultipleDeviceTest, givenMultipleDevicesWhenGetNumTilesThenReturnNumberOfDevices) {
+    DebugManagerStateRestore debugStateRestorer;
+    VariableBackup<UltHwConfig> backup(&ultHwConfig);
+    ultHwConfig.useHwCsr = true;
+    ultHwConfig.forceOsAgnosticMemoryManager = false;
+    ultHwConfig.useMockedPrepareDeviceEnvironmentsFunc = false;
+    auto numDevices = GetParam();
+    debugManager.flags.CreateMultipleSubDevices.set(numDevices);
+    debugManager.flags.DeferOsContextInitialization.set(0);
+    initPlatform();
+    auto device = platform()->getClDevice(0);
+    cl_uint numTiles;
+    size_t paramRetSize;
+
+    EXPECT_EQ(CL_SUCCESS, device->getDeviceInfo(CL_DEVICE_PARTITION_MAX_SUB_DEVICES, sizeof(cl_uint), &numTiles, &paramRetSize));
+    cl_uint expectedNumTiles = (numDevices > 1 ? numDevices : 0);
+    EXPECT_EQ(expectedNumTiles, numTiles);
+    EXPECT_EQ(sizeof(cl_uint), paramRetSize);
+    platformsImpl->clear();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MultiDeviceTests,
+    MultipleDeviceTest,
+    testing::Range<uint32_t>(1u, 5u));
+
+using ClDeviceHelperTests = ::testing::Test;
+
+TEST(DeviceEngineTest, givenDebugVariableOverrideEngineTypeWhenDeviceIsCreatedThenUseDebugVariable) {
+    MockExecutionEnvironment mockExecutionEnvironment{};
+    auto &gfxCoreHelper = mockExecutionEnvironment.rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
+    auto actualEngine = defaultHwInfo->capabilityTable.defaultEngineType;
+    auto expectedEngine = actualEngine == aub_stream::ENGINE_RCS ? aub_stream::ENGINE_CCS
+                                                                 : aub_stream::ENGINE_RCS;
+
+    auto supportedGpgpuEngines = gfxCoreHelper.getGpgpuEngineInstances(*mockExecutionEnvironment.rootDeviceEnvironments[0]);
+    if (supportedGpgpuEngines[0].first != expectedEngine) {
+        return;
+    }
+    DebugManagerStateRestore dbgRestorer;
+    debugManager.flags.NodeOrdinal.set(static_cast<int32_t>(expectedEngine));
+
+    auto device = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+
+    EXPECT_EQ(expectedEngine, device->getDefaultEngine().osContext->getEngineType());
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -22,6 +22,7 @@ class MockCsrBase : public UltCommandStreamReceiver<GfxFamily> {
     using BaseUltCsrClass::BaseUltCsrClass;
     using BaseUltCsrClass::debugPauseStateLock;
     using BaseUltCsrClass::preemptionAllocation;
+    using BaseUltCsrClass::waitForTaskCountWithKmdNotifyFallback;
 
     MockCsrBase() = delete;
 
@@ -29,7 +30,13 @@ class MockCsrBase : public UltCommandStreamReceiver<GfxFamily> {
                 ExecutionEnvironment &executionEnvironment,
                 uint32_t rootDeviceIndex,
                 const DeviceBitfield deviceBitfield)
-        : BaseUltCsrClass(executionEnvironment, rootDeviceIndex, deviceBitfield), executionStamp(&execStamp), flushTaskStamp(-1) {
+        : BaseUltCsrClass(executionEnvironment, rootDeviceIndex, deviceBitfield), executionStamp(&execStamp) {
+    }
+
+    MockCsrBase(ExecutionEnvironment &executionEnvironment,
+                uint32_t rootDeviceIndex,
+                const DeviceBitfield deviceBitfield)
+        : BaseUltCsrClass(executionEnvironment, rootDeviceIndex, deviceBitfield), executionStamp(&defaultExecStamp) {
     }
 
     void makeResident(GraphicsAllocation &gfxAllocation) override {
@@ -47,16 +54,18 @@ class MockCsrBase : public UltCommandStreamReceiver<GfxFamily> {
 
     bool isMadeResident(GraphicsAllocation *gfxAllocation) {
         for (GraphicsAllocation *gfxAlloc : madeResidentGfxAllocations) {
-            if (gfxAlloc == gfxAllocation)
+            if (gfxAlloc == gfxAllocation) {
                 return true;
+            }
         }
         return false;
     }
 
     bool isMadeNonResident(GraphicsAllocation *gfxAllocation) {
         for (GraphicsAllocation *gfxAlloc : madeNonResidentGfxAllocations) {
-            if (gfxAlloc == gfxAllocation)
+            if (gfxAlloc == gfxAllocation) {
                 return true;
+            }
         }
         return false;
     }
@@ -69,11 +78,19 @@ class MockCsrBase : public UltCommandStreamReceiver<GfxFamily> {
         processEvictionCalled = true;
     }
 
+    WaitStatus waitForTaskCountWithKmdNotifyFallback(TaskCountType taskCountToWait, FlushStamp flushStampToWait, bool useQuickKmdSleep, QueueThrottle throttle) override {
+        waitForTaskCountWithKmdNotifyFallbackCalled++;
+
+        return BaseUltCsrClass::waitForTaskCountWithKmdNotifyFallback(taskCountToWait, flushStampToWait, useQuickKmdSleep, throttle);
+    }
+
     ResidencyContainer madeResidentGfxAllocations;
     ResidencyContainer madeNonResidentGfxAllocations;
     int32_t *executionStamp;
-    int32_t flushTaskStamp;
+    int32_t flushTaskStamp = -1;
+    uint32_t waitForTaskCountWithKmdNotifyFallbackCalled = 0;
     bool processEvictionCalled = false;
+    int32_t defaultExecStamp = 0;
 };
 
 template <typename GfxFamily>
@@ -87,8 +104,14 @@ class MockCsrAub : public MockCsrBase<GfxFamily> {
                uint32_t rootDeviceIndex,
                const DeviceBitfield deviceBitfield)
         : MockCsrBase<GfxFamily>(execStamp, executionEnvironment, rootDeviceIndex, deviceBitfield) {}
+    MockCsrAub(ExecutionEnvironment &executionEnvironment,
+               uint32_t rootDeviceIndex,
+               const DeviceBitfield deviceBitfield)
+        : MockCsrBase<GfxFamily>(MockCsrBase<GfxFamily>::defaultExecStamp, executionEnvironment, rootDeviceIndex, deviceBitfield) {
+        this->defaultExecStamp = 1;
+    }
     CommandStreamReceiverType getType() const override {
-        return CommandStreamReceiverType::CSR_AUB;
+        return CommandStreamReceiverType::aub;
     }
 };
 
@@ -107,9 +130,14 @@ class MockCsr : public MockCsrBase<GfxFamily> {
             const DeviceBitfield deviceBitfield)
         : BaseClass(execStamp, executionEnvironment, rootDeviceIndex, deviceBitfield) {
     }
+    MockCsr(ExecutionEnvironment &executionEnvironment,
+            uint32_t rootDeviceIndex,
+            const DeviceBitfield deviceBitfield)
+        : BaseClass(BaseClass::defaultExecStamp, executionEnvironment, rootDeviceIndex, deviceBitfield) {
+    }
 
     SubmissionStatus flush(BatchBuffer &batchBuffer, ResidencyContainer &allocationsForResidency) override {
-        return SubmissionStatus::SUCCESS;
+        return SubmissionStatus::success;
     }
 
     CompletionStamp flushTask(
@@ -167,7 +195,7 @@ class MockFlatBatchBufferHelper : public FlatBatchBufferHelperHw<GfxFamily> {
         uint32_t rootDeviceIndex = 0u;
         BatchBuffer batchBuffer = {};
         size_t sizeBatchBuffer = 0u;
-        DispatchMode dispatchMode = DispatchMode::DeviceDefault;
+        DispatchMode dispatchMode = DispatchMode::deviceDefault;
         DeviceBitfield deviceBitfield = {};
     };
 

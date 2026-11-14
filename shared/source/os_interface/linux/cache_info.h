@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,50 +7,57 @@
 
 #pragma once
 
+#include "shared/source/helpers/common_types.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/os_interface/linux/clos_cache.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 #include "shared/source/utilities/spinlock.h"
 
-#include <stddef.h>
-#include <stdint.h>
-#include <unordered_map>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 
 namespace NEO {
 
-class Drm;
+class IoctlHelper;
 
-struct CacheInfo {
-    CacheInfo(Drm &drm, size_t maxReservationCacheSize, uint32_t maxReservationNumCacheRegions, uint16_t maxReservationNumWays)
-        : maxReservationCacheSize(maxReservationCacheSize),
-          maxReservationNumCacheRegions(maxReservationNumCacheRegions),
-          maxReservationNumWays(maxReservationNumWays),
-          cacheReserve(drm) {
+struct CacheReservationParameters {
+    size_t maxSize{0U};
+    uint32_t maxNumRegions{0U};
+    uint16_t maxNumWays{0U};
+};
+
+struct CacheInfo : NEO::NonCopyableAndNonMovableClass {
+    CacheInfo(IoctlHelper &ioctlHelper, const CacheReservationParameters l2Limits, const CacheReservationParameters l3Limits)
+        : l2ReservationLimits{l2Limits},
+          l3ReservationLimits{l3Limits},
+          cacheReserve{ioctlHelper} {
+
+        reservedCacheRegionsSize.fill(0UL);
     }
 
     MOCKABLE_VIRTUAL ~CacheInfo();
 
-    CacheInfo(const CacheInfo &) = delete;
-    CacheInfo &operator=(const CacheInfo &) = delete;
-
-    size_t getMaxReservationCacheSize() const {
-        return maxReservationCacheSize;
+    size_t getMaxReservationCacheSize(CacheLevel cacheLevel) const {
+        return getLimitsForCacheLevel(cacheLevel).maxSize;
     }
 
-    size_t getMaxReservationNumCacheRegions() const {
-        return maxReservationNumCacheRegions;
+    size_t getMaxReservationNumCacheRegions(CacheLevel cacheLevel) const {
+        return getLimitsForCacheLevel(cacheLevel).maxNumRegions;
     }
 
-    size_t getMaxReservationNumWays() const {
-        return maxReservationNumWays;
+    size_t getMaxReservationNumWays(CacheLevel cacheLevel) const {
+        return getLimitsForCacheLevel(cacheLevel).maxNumWays;
     }
 
-    CacheRegion reserveCacheRegion(size_t cacheReservationSize) {
+    CacheRegion reserveCacheRegion(CacheLevel cacheLevel, size_t cacheReservationSize) {
         std::unique_lock<SpinLock> lock{mtx};
-        return reserveRegion(cacheReservationSize);
+        return reserveRegion(cacheLevel, cacheReservationSize);
     }
 
-    CacheRegion freeCacheRegion(CacheRegion regionIndex) {
+    CacheRegion freeCacheRegion(CacheLevel cacheLevel, CacheRegion regionIndex) {
         std::unique_lock<SpinLock> lock{mtx};
-        return freeRegion(regionIndex);
+        return freeRegion(cacheLevel, regionIndex);
     }
 
     MOCKABLE_VIRTUAL bool getCacheRegion(size_t regionSize, CacheRegion regionIndex) {
@@ -58,19 +65,31 @@ struct CacheInfo {
         return getRegion(regionSize, regionIndex);
     }
 
-  protected:
-    CacheRegion reserveRegion(size_t cacheReservationSize);
-    CacheRegion freeRegion(CacheRegion regionIndex);
-    bool isRegionReserved(CacheRegion regionIndex, [[maybe_unused]] size_t regionSize) const;
-    bool getRegion(size_t regionSize, CacheRegion regionIndex);
+    CacheLevel getLevelForRegion(CacheRegion regionIndex) const {
+        DEBUG_BREAK_IF(regionIndex == CacheRegion::defaultRegion);
+        DEBUG_BREAK_IF(regionIndex >= CacheRegion::count);
+        return (regionIndex == CacheRegion::region3 ? CacheLevel::level2 : CacheLevel::level3);
+    }
+
+    CacheLevel getLevelForRegion(uint16_t regionIndex) const {
+        return getLevelForRegion(toCacheRegion(regionIndex));
+    }
 
   protected:
-    size_t maxReservationCacheSize;
-    uint32_t maxReservationNumCacheRegions;
-    uint16_t maxReservationNumWays;
+    CacheRegion reserveRegion(CacheLevel cacheLevel, size_t cacheReservationSize);
+    CacheRegion freeRegion(CacheLevel cacheLevel, CacheRegion regionIndex);
+    bool isRegionReserved(CacheRegion regionIndex, [[maybe_unused]] size_t regionSize) const;
+    bool getRegion(size_t regionSize, CacheRegion regionIndex);
+    const CacheReservationParameters &getLimitsForCacheLevel(CacheLevel cacheLevel) const;
+
+  protected:
+    CacheReservationParameters l2ReservationLimits{};
+    CacheReservationParameters l3ReservationLimits{};
     ClosCacheReservation cacheReserve;
-    std::unordered_map<CacheRegion, size_t> cacheRegionsReserved;
+    std::array<size_t, toUnderlying(CacheRegion::count)> reservedCacheRegionsSize;
     SpinLock mtx;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<CacheInfo>);
 
 } // namespace NEO

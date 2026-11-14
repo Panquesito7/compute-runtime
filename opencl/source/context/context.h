@@ -1,32 +1,34 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/debug_settings/debug_settings_manager.h"
-#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/string.h"
+#include "shared/source/memory_manager/unified_memory_pooling.h"
+#include "shared/source/utilities/buffer_pool_allocator.h"
+#include "shared/source/utilities/stackvec.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
 #include "opencl/source/cl_device/cl_device_vector.h"
 #include "opencl/source/context/context_type.h"
 #include "opencl/source/context/driver_diagnostics.h"
-#include "opencl/source/gtpin/gtpin_notify.h"
 #include "opencl/source/helpers/base_object.h"
 #include "opencl/source/helpers/destructor_callbacks.h"
 #include "opencl/source/mem_obj/map_operations_handler.h"
 
 #include <map>
+#include <type_traits>
+#include <utility>
 
-enum InternalMemoryType : uint32_t;
+enum class InternalMemoryType : uint32_t;
 
 namespace NEO {
 struct MemoryProperties;
 class HeapAllocator;
-
 class AsyncEventsHandler;
 class CommandQueue;
 class Device;
@@ -34,9 +36,12 @@ class Kernel;
 class MemoryManager;
 class SharingFunctions;
 class SVMAllocsManager;
+class ProductHelper;
 class Program;
 class Platform;
 class TagAllocatorBase;
+class StagingBufferManager;
+class ClDevice;
 
 template <>
 struct OpenCLObjectMapper<_cl_context> {
@@ -44,66 +49,74 @@ struct OpenCLObjectMapper<_cl_context> {
 };
 
 class Context : public BaseObject<_cl_context> {
+    using UsmDeviceMemAllocPool = UsmMemAllocPool;
+    static void printDriverDiagnostics(const char *hint);
+
   public:
-    class BufferPoolAllocator {
+    using BufferAllocationsVec = StackVec<GraphicsAllocation *, 1>;
+
+    enum BufferPoolType : uint32_t {
+        SmallBuffersPool = 0,
+        LargeBuffersPool = 1,
+        NumBufferPoolTypes = 2
+    };
+    struct BufferPool : public AbstractBuffersPool<BufferPool, Buffer, MemObj> {
+        using BaseType = AbstractBuffersPool<BufferPool, Buffer, MemObj>;
+
+        BufferPool(Context *context, const SmallBuffersParams &params, bool isCpuAccessRequired);
+        Buffer *allocate(const MemoryProperties &memoryProperties,
+                         cl_mem_flags flags,
+                         cl_mem_flags_intel flagsIntel,
+                         size_t requestedSize,
+                         void *hostPtr,
+                         cl_int &errcodeRet);
+
+        const StackVec<NEO::GraphicsAllocation *, 1> &getAllocationsVector();
+    };
+    static_assert(NEO::NonCopyable<AbstractBuffersPool<BufferPool, Buffer, MemObj>>);
+
+    static_assert(std::is_nothrow_move_constructible_v<BufferPool>, "Pools live in std::vector and have a deleted copy ctor, so vector reallocation"
+                                                                    "requires a noexcept move ctor - otherwise it fails to compile.");
+
+    class BufferPoolAllocator : public AbstractBuffersAllocator<BufferPool, Buffer, MemObj> {
+        using BaseType = AbstractBuffersAllocator<BufferPool, Buffer, MemObj>;
+
       public:
-        static constexpr auto aggregatedSmallBuffersPoolSize = 64 * KB;
-        static constexpr auto smallBufferThreshold = 4 * KB;
-        static constexpr auto chunkAlignment = 512u;
-        static constexpr auto startingOffset = chunkAlignment;
-
-        static_assert(aggregatedSmallBuffersPoolSize > smallBufferThreshold, "Largest allowed buffer needs to fit in pool");
-
+        BufferPoolAllocator() = default;
+        void setParams(const SmallBuffersParams &newParams, BufferPoolType type) {
+            BaseType::setParams(newParams);
+            this->poolType = type;
+        }
+        bool isAggregatedSmallBuffersEnabled(Context *context) const;
+        void initAggregatedSmallBuffers(Context *context);
         Buffer *allocateBufferFromPool(const MemoryProperties &memoryProperties,
                                        cl_mem_flags flags,
                                        cl_mem_flags_intel flagsIntel,
-                                       size_t size,
+                                       size_t requestedSize,
                                        void *hostPtr,
                                        cl_int &errcodeRet);
-
-        void releaseSmallBufferPool();
-        bool isAggregatedSmallBuffersEnabled(Context *context) const;
-        void initAggregatedSmallBuffers(Context *context);
-        bool isPoolBuffer(const MemObj *buffer) const;
         bool flagsAllowBufferFromPool(const cl_mem_flags &flags, const cl_mem_flags_intel &flagsIntel) const;
-        void tryFreeFromPoolBuffer(MemObj *possiblePoolBuffer, size_t offset, size_t size);
+        static inline uint32_t calculateMaxPoolCount(SmallBuffersParams smallBuffersParams, uint64_t totalMemory, size_t percentOfMemory) {
+            const auto maxPoolCount = static_cast<uint32_t>(totalMemory * (percentOfMemory / 100.0) / (smallBuffersParams.aggregatedSmallBuffersPoolSize));
+            return maxPoolCount ? maxPoolCount : 1u;
+        }
+        static inline BufferPoolType getBufferPoolTypeBySize(size_t size) {
+            return (size <= SmallBuffersParams::getDefaultParams().smallBufferThreshold) ? BufferPoolType::SmallBuffersPool : BufferPoolType::LargeBuffersPool;
+        }
+        BufferPoolType getPoolType() const { return poolType; }
 
       protected:
         Buffer *allocateFromPools(const MemoryProperties &memoryProperties,
                                   cl_mem_flags flags,
                                   cl_mem_flags_intel flagsIntel,
-                                  size_t size,
+                                  size_t requestedSize,
                                   void *hostPtr,
                                   cl_int &errcodeRet);
-
-        inline bool isSizeWithinThreshold(size_t size) const {
-            return BufferPoolAllocator::smallBufferThreshold >= size;
-        }
-
-        void drain();
-        void addNewBufferPool();
-
-        struct BufferPool {
-            BufferPool(Context *context);
-            BufferPool(BufferPool &&bufferPool);
-            bool isPoolBuffer(const MemObj *buffer) const;
-            void tryFreeFromPoolBuffer(MemObj *possiblePoolBuffer, size_t offset, size_t size);
-            Buffer *allocate(const MemoryProperties &memoryProperties,
-                             cl_mem_flags flags,
-                             cl_mem_flags_intel flagsIntel,
-                             size_t size,
-                             void *hostPtr,
-                             cl_int &errcodeRet);
-            void drain();
-            MemoryManager *memoryManager{nullptr};
-            std::unique_ptr<Buffer> mainStorage;
-            std::unique_ptr<HeapAllocator> chunkAllocator;
-            std::vector<std::pair<uint64_t, size_t>> chunksToFree;
-        };
         Context *context{nullptr};
-        std::mutex mutex;
-        std::vector<BufferPool> bufferPools;
+        BufferPoolType poolType{BufferPoolType::SmallBuffersPool};
+        std::once_flag lazyInitFlag;
     };
+
     static const cl_ulong objectMagic = 0xA4234321DC002130LL;
 
     bool createImpl(const cl_context_properties *properties,
@@ -116,24 +129,16 @@ class Context : public BaseObject<_cl_context> {
                      const ClDeviceVector &devices,
                      void(CL_CALLBACK *funcNotify)(const char *, const void *, size_t, void *),
                      void *data, cl_int &errcodeRet) {
-
         auto pContext = new T(funcNotify, data);
 
         if (!pContext->createImpl(properties, devices, funcNotify, data, errcodeRet)) {
             delete pContext;
             pContext = nullptr;
         } else {
-            auto &bufferPoolAllocator = pContext->getBufferPoolAllocator();
-            if (bufferPoolAllocator.isAggregatedSmallBuffersEnabled(pContext)) {
-                bufferPoolAllocator.initAggregatedSmallBuffers(pContext);
-            }
+            pContext->getBufferPoolAllocator(BufferPoolType::SmallBuffersPool).initAggregatedSmallBuffers(pContext);
         }
-        gtpinNotifyContextCreate(pContext);
         return pContext;
     }
-
-    Context &operator=(const Context &) = delete;
-    Context(const Context &) = delete;
 
     ~Context() override;
 
@@ -155,11 +160,17 @@ class Context : public BaseObject<_cl_context> {
         return memoryManager;
     }
 
+    StagingBufferManager *getStagingBufferManager() const {
+        return stagingBufferManager;
+    }
+
     SVMAllocsManager *getSVMAllocsManager() const {
         return svmAllocsManager;
     }
 
-    auto &getMapOperationsStorage() { return mapOperationsStorage; }
+    auto &getMapOperationsStorage() {
+        return mapOperationsStorage;
+    }
 
     cl_int tryGetExistingHostPtrAllocation(const void *ptr,
                                            size_t size,
@@ -192,7 +203,7 @@ class Context : public BaseObject<_cl_context> {
     void registerSharing(Sharing *sharing);
 
     template <typename... Args>
-    void providePerformanceHint(cl_diagnostics_verbose_level flags, PerformanceHints performanceHint, Args &&...args) {
+    void providePerformanceHint(cl_diagnostic_verbose_level_intel flags, PerformanceHints performanceHint, Args &&...args) {
         DEBUG_BREAK_IF(contextCallback == nullptr);
         DEBUG_BREAK_IF(driverDiagnostics == nullptr);
         char hint[DriverDiagnostics::maxHintStringSize];
@@ -201,16 +212,14 @@ class Context : public BaseObject<_cl_context> {
             if (contextCallback) {
                 contextCallback(hint, &flags, sizeof(flags), userData);
             }
-            if (DebugManager.flags.PrintDriverDiagnostics.get() != -1) {
-                printf("\n%s\n", hint);
-            }
+            printDriverDiagnostics(hint);
         }
     }
 
     template <typename... Args>
     void providePerformanceHintForMemoryTransfer(cl_command_type commandType, bool transferRequired, Args &&...args) {
-        cl_diagnostics_verbose_level verboseLevel = transferRequired ? CL_CONTEXT_DIAGNOSTICS_LEVEL_BAD_INTEL
-                                                                     : CL_CONTEXT_DIAGNOSTICS_LEVEL_GOOD_INTEL;
+        cl_diagnostic_verbose_level_intel verboseLevel = transferRequired ? CL_CONTEXT_DIAGNOSTICS_LEVEL_BAD_INTEL
+                                                                          : CL_CONTEXT_DIAGNOSTICS_LEVEL_GOOD_INTEL;
         PerformanceHints hint = driverDiagnostics->obtainHintForTransferOperation(commandType, transferRequired);
 
         providePerformanceHint(verboseLevel, hint, args...);
@@ -220,12 +229,18 @@ class Context : public BaseObject<_cl_context> {
         return driverDiagnostics != nullptr;
     }
 
-    bool getInteropUserSyncEnabled() { return interopUserSync; }
-    void setInteropUserSyncEnabled(bool enabled) { interopUserSync = enabled; }
+    bool getInteropUserSyncEnabled() {
+        return interopUserSync;
+    }
+    void setInteropUserSyncEnabled(bool enabled) {
+        interopUserSync = enabled;
+    }
     bool areMultiStorageAllocationsPreferred();
     bool isSingleDeviceContext();
 
-    ContextType peekContextType() const { return contextType; }
+    ContextType peekContextType() const {
+        return contextType;
+    }
 
     bool isDeviceAssociated(const ClDevice &clDevice) const;
     ClDevice *getSubDeviceByIndex(uint32_t subDeviceIndex) const;
@@ -242,17 +257,29 @@ class Context : public BaseObject<_cl_context> {
     const ClDeviceVector &getDevices() const {
         return devices;
     }
-    const std::map<uint32_t, DeviceBitfield> &getDeviceBitfields() const { return deviceBitfields; };
+    const std::map<uint32_t, DeviceBitfield> &getDeviceBitfields() const {
+        return deviceBitfields;
+    };
 
     static Platform *getPlatformFromProperties(const cl_context_properties *properties, cl_int &errcode);
-    BufferPoolAllocator &getBufferPoolAllocator() {
-        return smallBufferPoolAllocator;
+    BufferPoolAllocator &getBufferPoolAllocator(BufferPoolType type) {
+        return bufferPoolAllocators[type];
     }
+    UsmMemAllocPoolsFacade &getDeviceMemAllocPoolsManager() {
+        return usmDeviceMemAllocPoolsManager;
+    }
+
     TagAllocatorBase *getMultiRootDeviceTimestampPacketAllocator();
     std::unique_lock<std::mutex> obtainOwnershipForMultiRootDeviceAllocator();
     void setMultiRootDeviceTimestampPacketAllocator(std::unique_ptr<TagAllocatorBase> &allocator);
-    void setContextAsNonZebin();
-    bool checkIfContextIsNonZebin() const;
+
+    void initializeDeviceUsmAllocationPool();
+    bool isPoolBuffer(const MemObj *buffer);
+
+    template <typename Func>
+    void forEachBufferPoolAllocator(Func func) {
+        std::for_each(bufferPoolAllocators.begin(), bufferPoolAllocators.end(), func);
+    }
 
   protected:
     struct BuiltInKernel {
@@ -273,6 +300,8 @@ class Context : public BaseObject<_cl_context> {
 
     void setupContextType();
 
+    virtual void initializeManagers();
+
     RootDeviceIndicesContainer rootDeviceIndices;
     std::map<uint32_t, DeviceBitfield> deviceBitfields;
     std::vector<std::unique_ptr<SharingFunctions>> sharingFunctions;
@@ -288,7 +317,8 @@ class Context : public BaseObject<_cl_context> {
     MapOperationsStorage mapOperationsStorage = {};
     StackVec<CommandQueue *, 1> specialQueues;
     DriverDiagnostics *driverDiagnostics = nullptr;
-    BufferPoolAllocator smallBufferPoolAllocator;
+    std::array<BufferPoolAllocator, BufferPoolType::NumBufferPoolTypes> bufferPoolAllocators;
+    UsmMemAllocPoolsFacade usmDeviceMemAllocPoolsManager;
 
     uint32_t maxRootDeviceIndex = std::numeric_limits<uint32_t>::max();
     cl_bool preferD3dSharedResources = 0u;
@@ -296,8 +326,14 @@ class Context : public BaseObject<_cl_context> {
     std::unique_ptr<TagAllocatorBase> multiRootDeviceTimestampPacketAllocator;
     std::mutex multiRootDeviceAllocatorMtx;
 
+    StagingBufferManager *stagingBufferManager = nullptr;
+
     bool interopUserSync = false;
     bool resolvesRequiredInKernels = false;
-    bool nonZebinContext = false;
+    bool usmPoolInitialized = false;
+    bool platformManagersInitialized = false;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<Context>);
+
 } // namespace NEO

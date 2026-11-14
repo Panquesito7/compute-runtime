@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,9 +8,12 @@
 #include "shared/source/helpers/local_work_size.h"
 
 #include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/device/device.h"
+#include "shared/source/device/device_info.h"
 #include "shared/source/helpers/array_count.h"
 #include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/program/kernel_info.h"
 #include "shared/source/program/work_size_info.h"
 
@@ -23,7 +26,7 @@ namespace NEO {
 // big cores like SKL have 8EU * 7 HW threads per subslice and are considered as highThreadCount devices
 constexpr uint32_t highThreadCountThreshold = 56u;
 
-static const uint32_t optimalHardwareThreadCountGeneric[] = {32, 16, 8, 4, 2, 1};
+constexpr uint32_t optimalHardwareThreadCountGeneric[] = {32, 16, 8, 4, 2, 1};
 
 static const uint32_t primeNumbers[] = {
     251,
@@ -52,7 +55,7 @@ static const uint32_t primeNumbers[] = {
     19, 17, 13, 11,
     7, 5, 3, 2};
 
-static const size_t MAX_PRIMES = sizeof(primeNumbers) / sizeof(primeNumbers[0]);
+static const size_t maxPrimes = sizeof(primeNumbers) / sizeof(primeNumbers[0]);
 
 // Recursive template function to test prime factors
 template <uint32_t primeIndex>
@@ -91,32 +94,34 @@ inline uint32_t factor<0>(size_t workItems, uint32_t workSize, uint32_t maxWorkG
 
 void computePowerOfTwoLWS(const size_t workItems[3], WorkSizeInfo &workGroupInfo, size_t workGroupSize[3], const uint32_t workDim, bool canUseNx4) {
     uint32_t targetIndex = (canUseNx4 || workGroupInfo.numThreadsPerSubSlice < highThreadCountThreshold) ? 2 : 0;
-    auto arraySize = arrayCount(optimalHardwareThreadCountGeneric);
     auto simdSize = workGroupInfo.simdSize;
 
-    while (targetIndex < arraySize &&
-           optimalHardwareThreadCountGeneric[targetIndex] > 1 &&
+    while (optimalHardwareThreadCountGeneric[targetIndex] > 1 &&
            workGroupInfo.maxWorkGroupSize < optimalHardwareThreadCountGeneric[targetIndex] * simdSize) {
         targetIndex++;
     }
+
     uint32_t optimalLocalThreads = optimalHardwareThreadCountGeneric[targetIndex];
 
     if (workDim == 2) {
         uint32_t xDim, yDim;
         xDim = uint32_t(optimalLocalThreads * simdSize) / (canUseNx4 ? 4 : 1);
-        while (xDim > workItems[0])
+        while (xDim > workItems[0]) {
             xDim = xDim >> 1;
+        }
         yDim = canUseNx4 ? 4 : (uint32_t(optimalLocalThreads * simdSize) / xDim);
         workGroupSize[0] = xDim;
         workGroupSize[1] = yDim;
     } else {
         uint32_t xDim, yDim, zDim;
         xDim = uint32_t(optimalLocalThreads * simdSize);
-        while (xDim > workItems[0])
+        while (xDim > workItems[0]) {
             xDim = xDim >> 1;
+        }
         yDim = uint32_t(optimalLocalThreads * simdSize) / xDim;
-        while (yDim > workItems[1])
+        while (yDim > workItems[1]) {
             yDim = yDim >> 1;
+        }
         UNRECOVERABLE_IF((xDim * yDim) == 0);
         zDim = uint32_t(optimalLocalThreads * simdSize) / (xDim * yDim);
         workGroupSize[0] = xDim;
@@ -221,7 +226,7 @@ void computeWorkgroupSize1D(uint32_t maxWorkGroupSize, size_t workGroupSize[3], 
     workSize = std::min(workSize, maxWorkGroupSize);
 
     // Try all primes as potential factors
-    workSize = factor<MAX_PRIMES - 1>(items, workSize, maxWorkGroupSize);
+    workSize = factor<maxPrimes - 1>(items, workSize, maxWorkGroupSize);
 
     workGroupSize[0] = workSize;
     workGroupSize[1] = 1;
@@ -247,8 +252,9 @@ void choosePrefferedWorkgroupSize(WorkSizeInfo &wsInfo, size_t workGroupSize[3],
     // find all divisors for all dimensions
     uint32_t xyzFactors[3][1024];
     uint32_t xyzFactorsLen[3] = {};
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         xyzFactors[i][xyzFactorsLen[i]++] = 1;
+    }
     for (auto i = 0u; i < workDim; i++) {
         for (auto j = 2u; j < wsInfo.maxWorkGroupSize; ++j) {
             if ((workItems[i] % j) == 0) {
@@ -277,8 +283,9 @@ void computeWorkgroupSize2D(uint32_t maxWorkGroupSize, size_t workGroupSize[3], 
     uint32_t xDim;
     uint32_t yDim;
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         workGroupSize[i] = 1;
+    }
 
     for (uint32_t i = 2; i <= maxWorkGroupSize; i++) {
         if ((workItems[0] % i) == 0) {
@@ -326,53 +333,68 @@ void computeWorkgroupSize2D(uint32_t maxWorkGroupSize, size_t workGroupSize[3], 
 }
 
 void computeWorkgroupSizeSquared(uint32_t maxWorkGroupSize, size_t workGroupSize[3], const size_t workItems[3], size_t simdSize, const uint32_t workDim) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         workGroupSize[i] = 1;
+    }
     size_t itemsPowerOfTwoDivisors[3] = {1, 1, 1};
     for (auto i = 0u; i < workDim; i++) {
         uint32_t requiredWorkItemsCount = maxWorkGroupSize;
-        while (requiredWorkItemsCount > 1 && !(Math::isDivisibleByPowerOfTwoDivisor(uint32_t(workItems[i]), requiredWorkItemsCount)))
+        while (requiredWorkItemsCount > 1 && !(Math::isDivisibleByPowerOfTwoDivisor(uint32_t(workItems[i]), requiredWorkItemsCount))) {
             requiredWorkItemsCount >>= 1;
+        }
         itemsPowerOfTwoDivisors[i] = requiredWorkItemsCount;
     }
     if (itemsPowerOfTwoDivisors[0] * itemsPowerOfTwoDivisors[1] >= maxWorkGroupSize) {
         while (itemsPowerOfTwoDivisors[0] * itemsPowerOfTwoDivisors[1] > maxWorkGroupSize) {
-            if (itemsPowerOfTwoDivisors[0] > itemsPowerOfTwoDivisors[1])
+            if (itemsPowerOfTwoDivisors[0] > itemsPowerOfTwoDivisors[1]) {
                 itemsPowerOfTwoDivisors[0] >>= 1;
-            else
+            } else {
                 itemsPowerOfTwoDivisors[1] >>= 1;
+            }
         }
-        for (auto i = 0u; i < 3; i++)
+        for (auto i = 0u; i < 3; i++) {
             workGroupSize[i] = itemsPowerOfTwoDivisors[i];
+        }
         return;
 
     } else if (workItems[0] * workItems[1] > maxWorkGroupSize) {
         computeWorkgroupSize2D(maxWorkGroupSize, workGroupSize, workItems, simdSize);
         return;
     } else {
-        for (auto i = 0u; i < workDim; i++)
+        for (auto i = 0u; i < workDim; i++) {
             workGroupSize[i] = workItems[i];
+        }
         return;
     }
 }
 
 void computeWorkgroupSizeND(WorkSizeInfo &wsInfo, size_t workGroupSize[3], const size_t workItems[3], const uint32_t workDim) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         workGroupSize[i] = 1;
+    }
 
     UNRECOVERABLE_IF(wsInfo.simdSize == 0);
+    uint64_t totalNumberOfItems = workItems[0] * workItems[1] * workItems[2];
+    auto optimalWgThreadCount = optimalHardwareThreadCountGeneric[0];
+    bool totalRequiredThreadGroupsMoreThanSingleThreadGroup = totalNumberOfItems > wsInfo.simdSize * optimalWgThreadCount;
 
-    // Find biggest power of two which devide each dimension size
-    if (wsInfo.slmTotalSize == 0 && !wsInfo.hasBarriers) {
-        if (DebugManager.flags.EnableComputeWorkSizeSquared.get() && workDim == 2 && !wsInfo.imgUsed) {
+    // Find biggest power of two which divide each dimension size
+    if (wsInfo.slmTotalSizePerThreadGroup == 0 && !wsInfo.hasBarriers) {
+        if (debugManager.flags.EnableComputeWorkSizeSquared.get() && workDim == 2 && !wsInfo.imgUsed) {
             return computeWorkgroupSizeSquared(wsInfo.maxWorkGroupSize, workGroupSize, workItems, wsInfo.simdSize, workDim);
+        }
+
+        if (wsInfo.preferredWgCountPerSubSlice != 0 && wsInfo.simdSize == 32 && totalRequiredThreadGroupsMoreThanSingleThreadGroup) {
+            optimalWgThreadCount = std::min(optimalWgThreadCount, wsInfo.numThreadsPerSubSlice / wsInfo.preferredWgCountPerSubSlice);
+            wsInfo.maxWorkGroupSize = wsInfo.simdSize * optimalWgThreadCount;
         }
 
         size_t itemsPowerOfTwoDivisors[3] = {1, 1, 1};
         for (auto i = 0u; i < workDim; i++) {
-            uint32_t requiredWorkItemsCount = uint32_t(wsInfo.simdSize * optimalHardwareThreadCountGeneric[0]);
-            while (requiredWorkItemsCount > 1 && !(Math::isDivisibleByPowerOfTwoDivisor(uint32_t(workItems[i]), requiredWorkItemsCount)))
+            uint32_t requiredWorkItemsCount = uint32_t(wsInfo.simdSize * optimalWgThreadCount);
+            while (requiredWorkItemsCount > 1 && !(Math::isDivisibleByPowerOfTwoDivisor(uint32_t(workItems[i]), requiredWorkItemsCount))) {
                 requiredWorkItemsCount >>= 1;
+            }
             itemsPowerOfTwoDivisors[i] = requiredWorkItemsCount;
         }
 
@@ -383,23 +405,24 @@ void computeWorkgroupSizeND(WorkSizeInfo &wsInfo, size_t workGroupSize[3], const
         // If computed dimension sizes which are powers of two are creating group which is
         // bigger than maxWorkGroupSize or this group would create more than optimal hardware threads then downsize it
         uint64_t allItems = itemsPowerOfTwoDivisors[0] * itemsPowerOfTwoDivisors[1] * itemsPowerOfTwoDivisors[2];
-        if (allItems > wsInfo.simdSize && (allItems > wsInfo.maxWorkGroupSize || allItems > wsInfo.simdSize * optimalHardwareThreadCountGeneric[0])) {
+        if (allItems > wsInfo.simdSize && (allItems > wsInfo.maxWorkGroupSize || allItems > wsInfo.simdSize * optimalWgThreadCount)) {
             return computePowerOfTwoLWS(itemsPowerOfTwoDivisors, wsInfo, workGroupSize, workDim, canUseNx4);
         }
-        // If coputed workgroup is at this point in correct size
+        // If computed workgroup is at this point in correct size
         else if (allItems >= wsInfo.simdSize) {
             itemsPowerOfTwoDivisors[1] = canUseNx4 ? 4 : itemsPowerOfTwoDivisors[1];
-            for (auto i = 0u; i < workDim; i++)
+            for (auto i = 0u; i < workDim; i++) {
                 workGroupSize[i] = itemsPowerOfTwoDivisors[i];
+            }
             return;
         }
     }
 
-    uint64_t totalNuberOfItems = workItems[0] * workItems[1] * workItems[2];
     // If dimensions are not powers of two but total number of items is less than max work group size
-    if (totalNuberOfItems <= wsInfo.maxWorkGroupSize) {
-        for (auto i = 0u; i < workDim; i++)
+    if (totalNumberOfItems <= wsInfo.maxWorkGroupSize) {
+        for (auto i = 0u; i < workDim; i++) {
             workGroupSize[i] = workItems[i];
+        }
         return;
     }
 
@@ -408,6 +431,49 @@ void computeWorkgroupSizeND(WorkSizeInfo &wsInfo, size_t workGroupSize[3], const
     }
 
     choosePrefferedWorkgroupSize(wsInfo, workGroupSize, workItems, workDim);
+}
+
+WorkSizeInfo createWorkSizeInfoForKernel(const KernelDescriptor &kernelDescriptor, uint32_t maxWorkGroupSize,
+                                         uint32_t slmTotalSizePerThreadGroup, const Device &device) {
+    const auto &kernelAttributes = kernelDescriptor.kernelAttributes;
+    const auto &deviceInfo = device.getDeviceInfo();
+    auto numThreadsPerSubSlice = static_cast<uint32_t>(deviceInfo.maxNumEUsPerSubSlice) * deviceInfo.numThreadsPerEU;
+
+    WorkSizeInfo wsInfo(maxWorkGroupSize,
+                        kernelAttributes.usesBarriers(),
+                        kernelAttributes.simdSize,
+                        slmTotalSizePerThreadGroup,
+                        device.getRootDeviceEnvironment(),
+                        numThreadsPerSubSlice,
+                        static_cast<uint32_t>(deviceInfo.localMemSize),
+                        false,
+                        false,
+                        kernelAttributes.flags.requiresDisabledEUFusion);
+
+    wsInfo.setIfUseImg(kernelDescriptor);
+
+    auto preferredWorkgroupCount = device.getHardwareInfo().caps.preferredWorkgroupCountPerSubslice;
+    if (debugManager.flags.OverridePreferredWorkgroupCountPerSubslice.get() != -1) {
+        preferredWorkgroupCount = static_cast<uint32_t>(debugManager.flags.OverridePreferredWorkgroupCountPerSubslice.get());
+    }
+    wsInfo.setPreferredWgCountPerSubslice(preferredWorkgroupCount);
+
+    return wsInfo;
+}
+
+void computeWorkgroupSizeForKernel(const KernelDescriptor &kernelDescriptor, uint32_t maxWorkGroupSize,
+                                   uint32_t slmTotalSizePerThreadGroup, const Device &device,
+                                   uint32_t workDim, const size_t workItems[3], size_t workGroupSize[3]) {
+    if (debugManager.flags.EnableComputeWorkSizeND.get()) {
+        auto wsInfo = createWorkSizeInfoForKernel(kernelDescriptor, maxWorkGroupSize, slmTotalSizePerThreadGroup, device);
+        computeWorkgroupSizeND(wsInfo, workGroupSize, workItems, workDim);
+    } else if (workDim == 1) {
+        computeWorkgroupSize1D(maxWorkGroupSize, workGroupSize, workItems, kernelDescriptor.kernelAttributes.simdSize);
+    } else if (debugManager.flags.EnableComputeWorkSizeSquared.get() && workDim == 2) {
+        computeWorkgroupSizeSquared(maxWorkGroupSize, workGroupSize, workItems, kernelDescriptor.kernelAttributes.simdSize, workDim);
+    } else {
+        computeWorkgroupSize2D(maxWorkGroupSize, workGroupSize, workItems, kernelDescriptor.kernelAttributes.simdSize);
+    }
 }
 
 Vec3<size_t> computeWorkgroupsNumber(const Vec3<size_t> &gws, const Vec3<size_t> &lws) {

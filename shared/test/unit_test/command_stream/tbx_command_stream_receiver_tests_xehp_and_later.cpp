@@ -1,15 +1,15 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/tbx_command_stream_receiver_hw.h"
-#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/memory_manager/memory_banks.h"
 #include "shared/source/memory_manager/memory_pool.h"
 #include "shared/source/memory_manager/physical_address_allocator.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/gfx_core_helper_tests.h"
@@ -23,8 +23,7 @@ struct XeHPAndLaterTbxCommandStreamReceiverTests : DeviceFixture, ::testing::Tes
     template <typename FamilyType>
     void setUpImpl() {
         hardwareInfo = *defaultHwInfo;
-        auto compilerProductHelper = CompilerProductHelper::create(hardwareInfo.platform.eProductFamily);
-        hardwareInfoSetup[hardwareInfo.platform.eProductFamily](&hardwareInfo, true, 0, *compilerProductHelper);
+        hardwareInfoSetup[hardwareInfo.platform.eProductFamily](&hardwareInfo, true);
         hardwareInfo.gtSystemInfo.MultiTileArchInfo.IsValid = true;
         DeviceFixture::setUpImpl(&hardwareInfo);
     }
@@ -70,7 +69,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenGra
     setUpImpl<FamilyType>();
     auto tbxCsr = std::make_unique<MockTbxCommandStreamReceiverHw<FamilyType>>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockGraphicsAllocation allocation(nullptr, 0);
-    allocation.overrideMemoryPool(MemoryPool::LocalMemory);
+    allocation.overrideMemoryPool(MemoryPool::localMemory);
     auto bits = tbxCsr->getPPGTTAdditionalBits(&allocation);
 
     EXPECT_EQ(3u | (1 << 11), bits);
@@ -79,7 +78,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenGra
 HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenAubDumpForceAllToLocalMemoryPoolWhenGetPPGTTAdditionalBitsIsCalledThenLocalBitIsReturned) {
     setUpImpl<FamilyType>();
     DebugManagerStateRestore debugRestorer;
-    DebugManager.flags.AUBDumpForceAllToLocalMemory.set(true);
+    debugManager.flags.AUBDumpForceAllToLocalMemory.set(true);
 
     auto tbxCsr = std::make_unique<MockTbxCommandStreamReceiverHw<FamilyType>>(*pDevice->executionEnvironment, pDevice->getRootDeviceIndex(), pDevice->getDeviceBitfield());
     MockGraphicsAllocation allocation(nullptr, 0);
@@ -89,25 +88,10 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenAub
     EXPECT_EQ(3u | (1 << 11), bits);
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenLocalMemoryFeatureWhenGetGTTDataIsCalledThenLocalMemoryIsSet) {
-    setUpImpl<FamilyType>();
-    DebugManagerStateRestore debugRestorer;
-    DebugManager.flags.EnableLocalMemory.set(1);
-    hardwareInfo.featureTable.flags.ftrLocalMemory = true;
-
-    std::unique_ptr<MockDevice> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo));
-    auto tbxCsr = std::make_unique<MockTbxCommandStreamReceiverHw<FamilyType>>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
-    tbxCsr->setupContext(*device->getDefaultEngine().osContext);
-
-    AubGTTData data = {false, false};
-    tbxCsr->getGTTData(nullptr, data);
-    EXPECT_TRUE(data.localMemory);
-}
-
 HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenLocalMemoryEnabledWhenGetMemoryBankForGttIsCalledThenCorrectBankForDeviceIsReturned) {
     setUpImpl<FamilyType>();
     DebugManagerStateRestore debugRestorer;
-    DebugManager.flags.EnableLocalMemory.set(1);
+    debugManager.flags.EnableLocalMemory.set(1);
     hardwareInfo.featureTable.flags.ftrLocalMemory = true;
 
     std::unique_ptr<MockDevice> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo));
@@ -129,27 +113,29 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, givenLoc
     EXPECT_EQ(MemoryBanks::getBankForLocalMemory(3), bank);
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, whenPhysicalAllocatorIsCreatedThenItHasCorrectBankSzieAndNumberOfBanks) {
+HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, whenPhysicalAllocatorIsCreatedThenItHasCorrectBankSizeAndNumberOfBanks) {
     setUpImpl<FamilyType>();
     std::unique_ptr<MockDevice> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo));
     auto tbxCsr = std::make_unique<MockTbxCommandStreamReceiverHw<FamilyType>>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
     auto physicalAddressAllocator = tbxCsr->physicalAddressAllocator.get();
     auto allocator = reinterpret_cast<PhysicalAddressAllocatorHw<FamilyType> *>(physicalAddressAllocator);
+    auto expectedBankSize = pDevice->getReleaseHelper().getTotalMemBankSize();
 
-    EXPECT_EQ(32 * MemoryConstants::gigaByte, allocator->getBankSize());
+    EXPECT_EQ(expectedBankSize, allocator->getBankSize());
     EXPECT_EQ(1u, allocator->getNumberOfBanks());
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, whenPhysicalAllocatorIsCreatedFor4TilesThenItHasCorrectBankSzieAndNumberOfBanks) {
+HWCMDTEST_F(IGFX_XE_HP_CORE, XeHPAndLaterTbxCommandStreamReceiverTests, whenPhysicalAllocatorIsCreatedFor4TilesThenItHasCorrectBankSizeAndNumberOfBanks) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleSubDevices.set(4);
+    debugManager.flags.CreateMultipleSubDevices.set(4);
     setUpImpl<FamilyType>();
     std::unique_ptr<MockDevice> device(MockDevice::createWithNewExecutionEnvironment<MockDevice>(&hardwareInfo));
     auto tbxCsr = std::make_unique<MockTbxCommandStreamReceiverHw<FamilyType>>(*device->executionEnvironment, device->getRootDeviceIndex(), device->getDeviceBitfield());
     auto physicalAddressAllocator = tbxCsr->physicalAddressAllocator.get();
     auto allocator = reinterpret_cast<PhysicalAddressAllocatorHw<FamilyType> *>(physicalAddressAllocator);
+    auto expectedBankSize = pDevice->getReleaseHelper().getTotalMemBankSize() / 4;
 
-    EXPECT_EQ(8 * MemoryConstants::gigaByte, allocator->getBankSize());
+    EXPECT_EQ(expectedBankSize, allocator->getBankSize());
     EXPECT_EQ(4u, allocator->getNumberOfBanks());
 }
 

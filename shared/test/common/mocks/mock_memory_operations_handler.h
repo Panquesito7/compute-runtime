@@ -1,16 +1,18 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/memory_operations_handler.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/test_macros/mock_method_macros.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace NEO {
 
@@ -19,29 +21,37 @@ class GraphicsAllocation;
 class MockMemoryOperationsHandler : public MemoryOperationsHandler {
   public:
     MockMemoryOperationsHandler() {}
-    MemoryOperationsStatus makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) override { return MemoryOperationsStatus::UNSUPPORTED; }
-    MemoryOperationsStatus evict(Device *device, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::UNSUPPORTED; }
-    MemoryOperationsStatus isResident(Device *device, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::UNSUPPORTED; }
-    MemoryOperationsStatus makeResidentWithinOsContext(OsContext *osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable) override { return MemoryOperationsStatus::UNSUPPORTED; }
-    MemoryOperationsStatus evictWithinOsContext(OsContext *osContext, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::UNSUPPORTED; }
+    MemoryOperationsStatus makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations, bool isDummyExecNeeded, const bool forcePagingFence) override { return MemoryOperationsStatus::unsupported; }
+    MemoryOperationsStatus decompress(Device *device, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::unsupported; }
+    MemoryOperationsStatus lock(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) override { return MemoryOperationsStatus::unsupported; }
+    MemoryOperationsStatus evict(Device *device, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::unsupported; }
+    MemoryOperationsStatus isResident(Device *device, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::unsupported; }
+    MemoryOperationsStatus makeResidentWithinOsContext(OsContext *osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable, const bool forcePagingFence, const bool acquireLock) override { return MemoryOperationsStatus::unsupported; }
+    MemoryOperationsStatus evictWithinOsContext(OsContext *osContext, GraphicsAllocation &gfxAllocation) override { return MemoryOperationsStatus::unsupported; }
 };
 
 class MockMemoryOperationsHandlerTests : public MemoryOperationsHandler {
   public:
     MockMemoryOperationsHandlerTests() {}
-    ADDMETHOD_NOBASE(makeResident, MemoryOperationsStatus, MemoryOperationsStatus::UNSUPPORTED, (Device * device, ArrayRef<GraphicsAllocation *> gfxAllocations));
-    ADDMETHOD_NOBASE(evict, MemoryOperationsStatus, MemoryOperationsStatus::UNSUPPORTED, (Device * device, GraphicsAllocation &gfxAllocation));
-    ADDMETHOD_NOBASE(isResident, MemoryOperationsStatus, MemoryOperationsStatus::UNSUPPORTED, (Device * device, GraphicsAllocation &gfxAllocation));
-    ADDMETHOD_NOBASE(makeResidentWithinOsContext, MemoryOperationsStatus, MemoryOperationsStatus::UNSUPPORTED, (OsContext * osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable));
-    ADDMETHOD_NOBASE(evictWithinOsContext, MemoryOperationsStatus, MemoryOperationsStatus::UNSUPPORTED, (OsContext * osContext, GraphicsAllocation &gfxAllocation));
+    ADDMETHOD_NOBASE(makeResident, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (Device * device, ArrayRef<GraphicsAllocation *> gfxAllocations, bool isDummyExecNeeded, const bool forcePagingFence));
+    ADDMETHOD_NOBASE(decompress, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (Device * device, GraphicsAllocation &gfxAllocation));
+    ADDMETHOD_NOBASE(lock, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (Device * device, ArrayRef<GraphicsAllocation *> gfxAllocations));
+    ADDMETHOD_NOBASE(evict, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (Device * device, GraphicsAllocation &gfxAllocation));
+    ADDMETHOD_NOBASE(isResident, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (Device * device, GraphicsAllocation &gfxAllocation));
+    ADDMETHOD_NOBASE(makeResidentWithinOsContext, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (OsContext * osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable, const bool forcePagingFence, const bool acquireLock));
+    ADDMETHOD_NOBASE(evictWithinOsContext, MemoryOperationsStatus, MemoryOperationsStatus::unsupported, (OsContext * osContext, GraphicsAllocation &gfxAllocation));
 };
 
 class MockMemoryOperations : public MemoryOperationsHandler {
   public:
     MockMemoryOperations() {}
 
-    MemoryOperationsStatus makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) override {
+    MemoryOperationsStatus makeResident(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations, bool isDummyExecNeeded, const bool forcePagingFence) override {
         makeResidentCalledCount++;
+        makeResidentForcePagingFenceValue = forcePagingFence;
+        if (MemoryOperationsStatus::success != makeResidentResult) {
+            return makeResidentResult;
+        }
         if (captureGfxAllocationsForMakeResident) {
             for (auto &gfxAllocation : gfxAllocations) {
                 if (!gfxAllocation->getAubInfo().writeMemoryOnly) {
@@ -49,34 +59,49 @@ class MockMemoryOperations : public MemoryOperationsHandler {
                 }
             }
         }
-        return MemoryOperationsStatus::SUCCESS;
+        return MemoryOperationsStatus::success;
     }
+
+    MemoryOperationsStatus decompress(Device *device, GraphicsAllocation &gfxAllocation) override {
+        decompressDevices.push_back(device);
+        return decompressResult;
+    }
+
+    MemoryOperationsStatus lock(Device *device, ArrayRef<GraphicsAllocation *> gfxAllocations) override {
+        lockCalledCount++;
+        return MemoryOperationsStatus::success;
+    }
+
     MemoryOperationsStatus evict(Device *device, GraphicsAllocation &gfxAllocation) override {
         evictCalledCount++;
         if (captureGfxAllocationsForMakeResident) {
             auto allocIterator = std::find(gfxAllocationsForMakeResident.begin(), gfxAllocationsForMakeResident.end(), &gfxAllocation);
             if (allocIterator != gfxAllocationsForMakeResident.end()) {
                 gfxAllocationsForMakeResident.erase(allocIterator);
-                return MemoryOperationsStatus::SUCCESS;
+                return MemoryOperationsStatus::success;
             } else {
-                return MemoryOperationsStatus::MEMORY_NOT_FOUND;
+                return MemoryOperationsStatus::memoryNotFound;
             }
         }
-        return MemoryOperationsStatus::SUCCESS;
+        return MemoryOperationsStatus::success;
+    }
+    MemoryOperationsStatus releaseExplicitResidency(Device *device, GraphicsAllocation &gfxAllocation) override {
+        releaseExplicitResidencyCalledCount++;
+        return MemoryOperationsHandler::releaseExplicitResidency(device, gfxAllocation);
     }
     MemoryOperationsStatus isResident(Device *device, GraphicsAllocation &gfxAllocation) override {
         isResidentCalledCount++;
         if (captureGfxAllocationsForMakeResident) {
             if (std::find(gfxAllocationsForMakeResident.begin(), gfxAllocationsForMakeResident.end(), &gfxAllocation) != gfxAllocationsForMakeResident.end()) {
-                return MemoryOperationsStatus::SUCCESS;
+                return MemoryOperationsStatus::success;
             } else {
-                return MemoryOperationsStatus::MEMORY_NOT_FOUND;
+                return MemoryOperationsStatus::memoryNotFound;
             }
         }
-        return MemoryOperationsStatus::SUCCESS;
+        return MemoryOperationsStatus::success;
     }
 
-    MemoryOperationsStatus makeResidentWithinOsContext(OsContext *osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable) override {
+    MemoryOperationsStatus makeResidentWithinOsContext(OsContext *osContext, ArrayRef<GraphicsAllocation *> gfxAllocations, bool evictable, const bool forcePagingFence, const bool acquireLock) override {
         makeResidentCalledCount++;
         if (osContext) {
             makeResidentContextId = osContext->getContextId();
@@ -86,19 +111,39 @@ class MockMemoryOperations : public MemoryOperationsHandler {
                 gfxAllocationsForMakeResident.push_back(gfxAllocation);
             }
         }
-        return MemoryOperationsStatus::SUCCESS;
+        return MemoryOperationsStatus::success;
     }
     MemoryOperationsStatus evictWithinOsContext(OsContext *osContext, GraphicsAllocation &gfxAllocation) override {
         evictCalledCount++;
-        return MemoryOperationsStatus::SUCCESS;
+        return MemoryOperationsStatus::success;
+    }
+
+    MemoryOperationsStatus free(Device *device, GraphicsAllocation &gfxAllocation) override {
+        freeCalledCount++;
+
+        if (captureGfxAllocationsForMakeResident) {
+            auto itor = std::find(gfxAllocationsForMakeResident.begin(), gfxAllocationsForMakeResident.end(), &gfxAllocation);
+            if (itor != gfxAllocationsForMakeResident.end()) {
+                gfxAllocationsForMakeResident.erase(itor, itor + 1);
+            }
+        }
+
+        return MemoryOperationsStatus::success;
     }
 
     std::vector<GraphicsAllocation *> gfxAllocationsForMakeResident{};
-    int makeResidentCalledCount = 0;
-    int evictCalledCount = 0;
-    uint32_t isResidentCalledCount = 0;
+    std::vector<Device *> decompressDevices{};
+    std::atomic<int> makeResidentCalledCount{0};
+    std::atomic<bool> makeResidentForcePagingFenceValue{false};
+    std::atomic<int> evictCalledCount{0};
+    std::atomic<int> releaseExplicitResidencyCalledCount{0};
+    std::atomic<int> freeCalledCount{0};
+    std::atomic<uint32_t> isResidentCalledCount{0};
+    std::atomic<uint32_t> lockCalledCount{0};
     uint32_t makeResidentContextId = std::numeric_limits<uint32_t>::max();
     bool captureGfxAllocationsForMakeResident = false;
+    MemoryOperationsStatus makeResidentResult = MemoryOperationsStatus::success;
+    MemoryOperationsStatus decompressResult = MemoryOperationsStatus::unsupported;
 };
 
 } // namespace NEO

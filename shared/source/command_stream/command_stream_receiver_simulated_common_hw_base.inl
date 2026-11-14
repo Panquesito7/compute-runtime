@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,57 +13,56 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/gmm_helper/gmm.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
-#include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/hardware_context_controller.h"
-#include "shared/source/memory_manager/address_mapper.h"
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/os_context.h"
 
 #include "aubstream/aub_manager.h"
+#include "aubstream/aubstream.h"
 
 namespace NEO {
-
-template <typename GfxFamily>
-void CommandStreamReceiverSimulatedCommonHw<GfxFamily>::initAdditionalMMIO() {
-    if (DebugManager.flags.AubDumpAddMmioRegistersList.get() != "unk") {
-        auto mmioList = AubHelper::getAdditionalMmioList();
-        for (auto &mmioPair : mmioList) {
-            stream->writeMMIO(mmioPair.first, mmioPair.second);
-        }
-    }
-}
 
 template <typename GfxFamily>
 void CommandStreamReceiverSimulatedCommonHw<GfxFamily>::setupContext(OsContext &osContext) {
     CommandStreamReceiverHw<GfxFamily>::setupContext(osContext);
 
-    auto engineType = osContext.getEngineType();
     uint32_t flags = 0;
-    getCsTraits(engineType).setContextSaveRestoreFlags(flags);
-
-    if (DebugManager.flags.AppendAubStreamContextFlags.get() != -1) {
-        flags |= static_cast<uint32_t>(DebugManager.flags.AppendAubStreamContextFlags.get());
+    if (NEO::debugManager.flags.ForceRunAloneContext.get() == 1) {
+        flags |= aub_stream::hardwareContextFlags::runAlone;
     }
 
-    if (aubManager && !osContext.isLowPriority()) {
+    if (osContext.isPartOfContextGroup()) {
+        constexpr uint32_t contextGroupBit = aub_stream::hardwareContextFlags::contextGroup;
+        flags |= contextGroupBit;
+    }
+
+    if (osContext.isHighPriority()) {
+        flags |= aub_stream::hardwareContextFlags::highPriority;
+    } else if (osContext.isLowPriority()) {
+        flags |= aub_stream::hardwareContextFlags::lowPriority;
+    }
+
+    if (aubManager) {
         hardwareContextController = std::make_unique<HardwareContextController>(*aubManager, osContext, flags);
     }
 }
 
 template <typename GfxFamily>
-bool CommandStreamReceiverSimulatedCommonHw<GfxFamily>::getParametersForWriteMemory(GraphicsAllocation &graphicsAllocation, uint64_t &gpuAddress, void *&cpuAddress, size_t &size) const {
+bool CommandStreamReceiverSimulatedCommonHw<GfxFamily>::getParametersForMemory(GraphicsAllocation &graphicsAllocation, uint64_t &gpuAddress, void *&cpuAddress, size_t &size) const {
     cpuAddress = graphicsAllocation.getUnderlyingBuffer();
     gpuAddress = peekExecutionEnvironment().rootDeviceEnvironments[graphicsAllocation.getRootDeviceIndex()].get()->gmmHelper.get()->decanonize(graphicsAllocation.getGpuAddress());
     size = graphicsAllocation.getUnderlyingBufferSize();
 
     if (graphicsAllocation.isCompressionEnabled()) {
-        size = graphicsAllocation.getDefaultGmm()->gmmResourceInfo->getSizeAllocation();
+        size = graphicsAllocation.getDefaultGmm()->getSizeAllocation();
     }
 
-    if (size == 0)
+    if (size == 0) {
         return false;
+    }
 
     if (cpuAddress == nullptr && graphicsAllocation.isAllocationLockable()) {
         cpuAddress = this->getMemoryManager()->lockResource(&graphicsAllocation);
@@ -73,40 +72,27 @@ bool CommandStreamReceiverSimulatedCommonHw<GfxFamily>::getParametersForWriteMem
 
 template <typename GfxFamily>
 bool CommandStreamReceiverSimulatedCommonHw<GfxFamily>::expectMemoryEqual(void *gfxAddress, const void *srcAddress, size_t length) {
-    return this->expectMemory(gfxAddress, srcAddress, length,
-                              AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareEqual);
+    auto gpuAddress = this->peekGmmHelper()->decanonize(castToUint64(gfxAddress));
+    return this->expectMemory(reinterpret_cast<void *>(gpuAddress), srcAddress, length,
+                              aub_stream::CompareOperationValues::CompareEqual);
 }
 template <typename GfxFamily>
 bool CommandStreamReceiverSimulatedCommonHw<GfxFamily>::expectMemoryNotEqual(void *gfxAddress, const void *srcAddress, size_t length) {
-    return this->expectMemory(gfxAddress, srcAddress, length,
-                              AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareNotEqual);
+    auto gpuAddress = this->peekGmmHelper()->decanonize(castToUint64(gfxAddress));
+    return this->expectMemory(reinterpret_cast<void *>(gpuAddress), srcAddress, length,
+                              aub_stream::CompareOperationValues::CompareNotEqual);
 }
 template <typename GfxFamily>
 bool CommandStreamReceiverSimulatedCommonHw<GfxFamily>::expectMemoryCompressed(void *gfxAddress, const void *srcAddress, size_t length) {
-    return this->expectMemory(gfxAddress, srcAddress, length,
-                              AubMemDump::CmdServicesMemTraceMemoryCompare::CompareOperationValues::CompareNotEqual);
-}
-
-template <typename GfxFamily>
-void CommandStreamReceiverSimulatedCommonHw<GfxFamily>::freeEngineInfo(AddressMapper &gttRemap) {
-    alignedFree(engineInfo.pLRCA);
-    gttRemap.unmap(engineInfo.pLRCA);
-    engineInfo.pLRCA = nullptr;
-
-    alignedFree(engineInfo.pGlobalHWStatusPage);
-    gttRemap.unmap(engineInfo.pGlobalHWStatusPage);
-    engineInfo.pGlobalHWStatusPage = nullptr;
-
-    alignedFree(engineInfo.pRingBuffer);
-    gttRemap.unmap(engineInfo.pRingBuffer);
-    engineInfo.pRingBuffer = nullptr;
+    auto gpuAddress = this->peekGmmHelper()->decanonize(castToUint64(gfxAddress));
+    return this->expectMemory(reinterpret_cast<void *>(gpuAddress), srcAddress, length,
+                              aub_stream::CompareOperationValues::CompareNotEqual);
 }
 
 template <typename GfxFamily>
 void CommandStreamReceiverSimulatedCommonHw<GfxFamily>::makeNonResident(GraphicsAllocation &gfxAllocation) {
     if (gfxAllocation.isResident(osContext->getContextId())) {
         dumpAllocation(gfxAllocation);
-        this->getEvictionAllocations().push_back(&gfxAllocation);
         gfxAllocation.releaseResidencyInOsContext(this->osContext->getContextId());
     }
 }
@@ -119,10 +105,35 @@ template <typename GfxFamily>
 CommandStreamReceiverSimulatedCommonHw<GfxFamily>::CommandStreamReceiverSimulatedCommonHw(ExecutionEnvironment &executionEnvironment,
                                                                                           uint32_t rootDeviceIndex,
                                                                                           const DeviceBitfield deviceBitfield)
-    : CommandStreamReceiverHw<GfxFamily>(executionEnvironment, rootDeviceIndex, deviceBitfield) {
+    : CommandStreamReceiverHw<GfxFamily>(executionEnvironment, rootDeviceIndex, deviceBitfield),
+      releaseHelper(&executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->getReleaseHelper()) {
     this->useNewResourceImplicitFlush = false;
     this->useGpuIdleImplicitFlush = false;
+    const auto &capabilityTable = executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->getHardwareInfo()->capabilityTable;
+
+    bool anyDirectSubmissionEngineSupported = false;
+    for (auto &engine : capabilityTable.directSubmissionEngines.data) {
+        if (engine.engineSupported) {
+            anyDirectSubmissionEngineSupported = true;
+            break;
+        }
+    }
+    bool directSubmissionEnabled = executionEnvironment.rootDeviceEnvironments[rootDeviceIndex]->getProductHelper().isDirectSubmissionSupported();
+    if (debugManager.flags.EnableDirectSubmission.get() != -1) {
+        directSubmissionEnabled = debugManager.flags.EnableDirectSubmission.get() > 0;
+    }
+    this->pollForCompletionEnabled = !(directSubmissionEnabled &&
+                                       debugManager.isDirectSubmissionInSimulationModeEnabled() &&
+                                       anyDirectSubmissionEngineSupported);
 }
 template <typename GfxFamily>
-CommandStreamReceiverSimulatedCommonHw<GfxFamily>::~CommandStreamReceiverSimulatedCommonHw() = default;
+CommandStreamReceiverSimulatedCommonHw<GfxFamily>::~CommandStreamReceiverSimulatedCommonHw() {
+    if (aubManager) {
+        if (hardwareContextController) {
+            for (auto &hardwareContext : hardwareContextController->hardwareContexts) {
+                aubManager->releaseHardwareContext(hardwareContext.release());
+            }
+        }
+    }
+}
 } // namespace NEO

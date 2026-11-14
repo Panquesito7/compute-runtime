@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 
 #include "opencl/source/sharings/va/va_surface.h"
 
+#include <algorithm>
 #include <dlfcn.h>
 
 namespace Os {
@@ -44,8 +45,8 @@ bool VASharingFunctions::isVaLibraryAvailable() {
 
 void VASharingFunctions::initFunctions() {
     bool enableVaLibCalls = true;
-    if (DebugManager.flags.EnableVaLibCalls.get() != -1) {
-        enableVaLibCalls = !!DebugManager.flags.EnableVaLibCalls.get();
+    if (debugManager.flags.EnableVaLibCalls.get() != -1) {
+        enableVaLibCalls = !!debugManager.flags.EnableVaLibCalls.get();
     }
 
     if (enableVaLibCalls) {
@@ -78,7 +79,7 @@ void VASharingFunctions::initFunctions() {
 void VASharingFunctions::querySupportedVaImageFormats(VADisplay vaDisplay) {
     int maxFormats = this->maxNumImageFormats(vaDisplay);
     if (maxFormats > 0) {
-        std::unique_ptr<VAImageFormat[]> allVaFormats(new VAImageFormat[maxFormats]);
+        auto allVaFormats = std::make_unique_for_overwrite<VAImageFormat[]>(maxFormats);
         auto result = this->queryImageFormats(vaDisplay, allVaFormats.get(), &maxFormats);
         if (result == VA_STATUS_SUCCESS) {
             for (int i = 0; i < maxFormats; i++) {

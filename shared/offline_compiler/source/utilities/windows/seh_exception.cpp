@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2020 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -23,11 +23,11 @@
 #include <psapi.h>
 
 std::string SehException::getExceptionDescription(unsigned int code) {
-    switch (code) {
+    switch (static_cast<long>(code)) {
     case EXCEPTION_ACCESS_VIOLATION:
         return "Access violation";
     case EXCEPTION_DATATYPE_MISALIGNMENT:
-        return "Datatype misalignement";
+        return "Datatype misalignment";
     case EXCEPTION_FLT_DIVIDE_BY_ZERO:
     case EXCEPTION_INT_DIVIDE_BY_ZERO:
         return "Divide by zero";
@@ -44,7 +44,7 @@ int SehException::filter(unsigned int code, struct _EXCEPTION_POINTERS *ep) {
 
     printf("EXCEPTION: %s\n", SehException::getExceptionDescription(code).c_str());
 
-    if (code != EXCEPTION_STACK_OVERFLOW) {
+    if (static_cast<long>(code) != EXCEPTION_STACK_OVERFLOW) {
         std::string callstack;
 
         SehException::getCallStack(code, ep, callstack);
@@ -57,6 +57,7 @@ void SehException::getCallStack(unsigned int code, struct _EXCEPTION_POINTERS *e
     DWORD machine = 0;
     HANDLE hProcess = GetCurrentProcess();
     HANDLE hThread = GetCurrentThread();
+    auto contextRecord = *ep->ContextRecord;
 
     SYSTEM_INFO systemInfo;
     GetSystemInfo(&systemInfo);
@@ -87,7 +88,7 @@ void SehException::getCallStack(unsigned int code, struct _EXCEPTION_POINTERS *e
     DWORD displacement = 0;
     DWORD64 displacement64 = 0;
 
-    std::unique_ptr<NEO::OsLibrary> psApiLib(NEO::OsLibrary::load("psapi.dll"));
+    std::unique_ptr<NEO::OsLibrary> psApiLib(NEO::OsLibrary::loadFunc({"psapi.dll"}));
     auto getMappedFileName = reinterpret_cast<getMappedFileNameFunction>(psApiLib->getProcAddress("GetMappedFileNameA"));
 
     size_t callstackCounter = 0;
@@ -113,7 +114,7 @@ void SehException::getCallStack(unsigned int code, struct _EXCEPTION_POINTERS *e
     while (callstackCounter < maxCallstackDepth) {
         symbol->Name[255] = '\0';
 
-        if (!StackWalk64(machine, hProcess, hThread, &stackFrame, ep->ContextRecord, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, 0)) {
+        if (!StackWalk64(machine, hProcess, hThread, &stackFrame, &contextRecord, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, 0)) {
             break;
         }
 

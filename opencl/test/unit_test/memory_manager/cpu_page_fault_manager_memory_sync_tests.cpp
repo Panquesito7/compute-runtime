@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,15 +7,18 @@
 
 #include "shared/source/memory_manager/unified_memory_manager.h"
 #include "shared/test/common/fixtures/cpu_page_fault_manager_tests_fixture.h"
-#include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_memory_manager.h"
-#include "shared/test/common/test_macros/test_checks_shared.h"
 
-#include "opencl/source/command_queue/command_queue.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_command_queue.h"
 
 #include "gtest/gtest.h"
+
+namespace NEO {
+class MemoryManager;
+} // namespace NEO
 
 using namespace NEO;
 
@@ -34,7 +37,7 @@ struct CommandQueueMock : public MockCommandQueue {
         passedMapFlags = mapFlags;
         return CL_SUCCESS;
     }
-    cl_int finish() override {
+    cl_int finish(bool resolvePendingL3Flushes) override {
         finishCalled++;
         return CL_SUCCESS;
     }
@@ -47,10 +50,9 @@ struct CommandQueueMock : public MockCommandQueue {
 
 TEST_F(PageFaultManagerTest, givenUnifiedMemoryAllocWhenSynchronizeMemoryThenEnqueueProperCalls) {
     MockExecutionEnvironment executionEnvironment;
-    REQUIRE_SVM_OR_SKIP(executionEnvironment.rootDeviceEnvironments[0]->getHardwareInfo());
 
     auto memoryManager = std::make_unique<MockMemoryManager>(executionEnvironment);
-    auto svmAllocsManager = std::make_unique<SVMAllocsManager>(memoryManager.get(), false);
+    auto svmAllocsManager = std::make_unique<SVMAllocsManager>(memoryManager.get());
     auto device = std::unique_ptr<MockClDevice>(new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     auto rootDeviceIndex = device->getRootDeviceIndex();
     RootDeviceIndicesContainer rootDeviceIndices = {rootDeviceIndex};
@@ -77,7 +79,6 @@ TEST_F(PageFaultManagerTest, givenUnifiedMemoryAllocWhenSynchronizeMemoryThenEnq
 
 TEST_F(PageFaultManagerTest, givenUnifiedMemoryAllocWhenGpuTransferIsInvokedThenInsertMapOperation) {
     MockExecutionEnvironment executionEnvironment;
-    REQUIRE_SVM_OR_SKIP(executionEnvironment.rootDeviceEnvironments[0]->getHardwareInfo());
 
     struct MockSVMAllocsManager : SVMAllocsManager {
         using SVMAllocsManager::SVMAllocsManager;
@@ -88,7 +89,7 @@ TEST_F(PageFaultManagerTest, givenUnifiedMemoryAllocWhenGpuTransferIsInvokedThen
         int insertSvmMapOperationCalled = 0;
     };
     auto memoryManager = std::make_unique<MockMemoryManager>(executionEnvironment);
-    auto svmAllocsManager = std::make_unique<MockSVMAllocsManager>(memoryManager.get(), false);
+    auto svmAllocsManager = std::make_unique<MockSVMAllocsManager>(memoryManager.get());
     auto device = std::unique_ptr<MockClDevice>(new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     auto rootDeviceIndex = device->getRootDeviceIndex();
     RootDeviceIndicesContainer rootDeviceIndices = {rootDeviceIndex};
@@ -101,6 +102,36 @@ TEST_F(PageFaultManagerTest, givenUnifiedMemoryAllocWhenGpuTransferIsInvokedThen
     EXPECT_EQ(svmAllocsManager->insertSvmMapOperationCalled, 0);
     pageFaultManager->baseGpuTransfer(alloc, cmdQ.get());
     EXPECT_EQ(svmAllocsManager->insertSvmMapOperationCalled, 1);
+
+    svmAllocsManager->freeSVMAlloc(alloc);
+    cmdQ->device = nullptr;
+}
+
+TEST_F(PageFaultManagerTest, givenUnifiedMemoryAllocWhenAllowCPUMemoryEvictionIsCalledThenSelectCorrectCsrWithOsContextForEviction) {
+    MockExecutionEnvironment executionEnvironment;
+
+    auto memoryManager = std::make_unique<MockMemoryManager>(executionEnvironment);
+    auto svmAllocsManager = std::make_unique<SVMAllocsManager>(memoryManager.get());
+    auto device = std::unique_ptr<MockClDevice>(new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    auto rootDeviceIndex = device->getRootDeviceIndex();
+    RootDeviceIndicesContainer rootDeviceIndices = {rootDeviceIndex};
+    std::map<uint32_t, DeviceBitfield> deviceBitfields{{rootDeviceIndex, device->getDeviceBitfield()}};
+    void *alloc = svmAllocsManager->createSVMAlloc(256, {}, rootDeviceIndices, deviceBitfields);
+    auto cmdQ = std::make_unique<CommandQueueMock>();
+    cmdQ->device = device.get();
+    pageFaultManager->insertAllocation(alloc, 256, svmAllocsManager.get(), cmdQ.get(), {});
+
+    NEO::CpuPageFaultManager::PageFaultData pageData;
+    pageData.cmdQ = cmdQ.get();
+
+    pageFaultManager->baseAllowCPUMemoryEviction(true, alloc, pageData);
+    EXPECT_EQ(pageFaultManager->allowCPUMemoryEvictionImplCalled, 1);
+
+    auto allocData = svmAllocsManager->getSVMAlloc(alloc);
+    CsrSelectionArgs csrSelectionArgs{CL_COMMAND_READ_BUFFER, &allocData->gpuAllocations, {}, cmdQ->getDevice().getRootDeviceIndex(), nullptr};
+    auto &csr = cmdQ->selectCsrForBuiltinOperation(csrSelectionArgs);
+    EXPECT_EQ(pageFaultManager->engineType, csr.getOsContext().getEngineType());
+    EXPECT_EQ(pageFaultManager->engineUsage, csr.getOsContext().getEngineUsage());
 
     svmAllocsManager->freeSVMAlloc(alloc);
     cmdQ->device = nullptr;

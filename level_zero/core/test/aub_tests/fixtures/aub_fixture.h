@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,12 +11,21 @@
 #include "shared/source/command_stream/command_stream_receiver_simulated_common_hw.h"
 #include "shared/source/command_stream/command_stream_receiver_with_aub_dump.h"
 #include "shared/source/command_stream/tbx_command_stream_receiver_hw.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/ult_hw_config.h"
+#include "shared/test/common/helpers/variable_backup.h"
+
+#include "level_zero/core/test/unit_tests/mock.h"
+#include <level_zero/zes_api.h>
 
 #include "test_mode.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace NEO {
 class CommandStreamReceiver;
@@ -33,8 +42,8 @@ template <typename Type>
 struct WhiteBox;
 } // namespace ult
 
-struct ContextImp;
-struct DriverHandleImp;
+struct Context;
+class DriverHandle;
 struct CommandQueue;
 struct CommandList;
 struct Device;
@@ -46,7 +55,6 @@ class AUBFixtureL0 {
     void setUp();
     void setUp(const NEO::HardwareInfo *hardwareInfo, bool debuggingEnabled);
     void tearDown();
-    static void prepareCopyEngines(NEO::MockDevice &device, const std::string &filename);
 
     template <typename FamilyType>
     NEO::CommandStreamReceiverSimulatedCommonHw<FamilyType> *getSimulatedCsr() const {
@@ -57,7 +65,7 @@ class AUBFixtureL0 {
     void expectMemory(void *gfxAddress, const void *srcAddress, size_t length) {
         NEO::CommandStreamReceiverSimulatedCommonHw<FamilyType> *csrSimulated = getSimulatedCsr<FamilyType>();
 
-        if (NEO::testMode == NEO::TestMode::AubTestsWithTbx) {
+        if (NEO::testMode == NEO::TestMode::aubTestsWithTbx) {
             auto tbxCsr = csrSimulated;
             EXPECT_TRUE(tbxCsr->expectMemoryEqual(gfxAddress, srcAddress, length));
             csrSimulated = static_cast<NEO::CommandStreamReceiverSimulatedCommonHw<FamilyType> *>(
@@ -73,7 +81,7 @@ class AUBFixtureL0 {
     void expectNotEqualMemory(void *gfxAddress, const void *srcAddress, size_t length) {
         NEO::CommandStreamReceiverSimulatedCommonHw<FamilyType> *csrSimulated = getSimulatedCsr<FamilyType>();
 
-        if (NEO::testMode == NEO::TestMode::AubTestsWithTbx) {
+        if (NEO::testMode == NEO::TestMode::aubTestsWithTbx) {
             auto tbxCsr = csrSimulated;
             EXPECT_TRUE(tbxCsr->expectMemoryNotEqual(gfxAddress, srcAddress, length));
             csrSimulated = static_cast<NEO::CommandStreamReceiverSimulatedCommonHw<FamilyType> *>(
@@ -88,7 +96,7 @@ class AUBFixtureL0 {
     template <typename FamilyType>
     void expectMMIO(uint32_t mmioRegister, uint32_t expectedValue) {
         NEO::AUBCommandStreamReceiverHw<FamilyType> *aubCsr = static_cast<NEO::AUBCommandStreamReceiverHw<FamilyType> *>(csr);
-        if (NEO::testMode == NEO::TestMode::AubTestsWithTbx) {
+        if (NEO::testMode == NEO::TestMode::aubTestsWithTbx) {
             aubCsr = static_cast<NEO::AUBCommandStreamReceiverHw<FamilyType> *>(static_cast<NEO::CommandStreamReceiverWithAUBDump<NEO::TbxCommandStreamReceiverHw<FamilyType>> *>(csr)->aubCSR.get());
         }
 
@@ -97,19 +105,34 @@ class AUBFixtureL0 {
         }
     }
 
+    void *allocateHostMemory(size_t size, size_t alignment);
+    void *allocateDeviceMemory(size_t size, size_t alignment);
+    void executeAndSynchronize();
+    ze_kernel_handle_t createKernel(const std::string &moduleFileName, const std::string &kernelName, bool useSharedFile);
+
+    static ze_module_handle_t createModuleFromFile(const std::string &fileName, ze_context_handle_t context, ze_device_handle_t device, const std::string &buildFlags, bool useSharedFile = false);
+
+    std::string aubFileName;
+    std::unique_ptr<VariableBackup<NEO::UltHwConfig>> backupUltConfig;
+
     const uint32_t rootDeviceIndex = 0;
     NEO::ExecutionEnvironment *executionEnvironment;
     NEO::MemoryManager *memoryManager = nullptr;
     NEO::MockDevice *neoDevice = nullptr;
 
-    std::unique_ptr<ult::Mock<DriverHandleImp>> driverHandle;
+    std::unique_ptr<ult::Mock<DriverHandle>> driverHandle;
     std::unique_ptr<ult::WhiteBox<L0::CommandList>> commandList;
 
     Device *device = nullptr;
-    ContextImp *context = nullptr;
+    Context *context = nullptr;
     CommandQueue *pCmdq = nullptr;
 
     NEO::CommandStreamReceiver *csr = nullptr;
+
+    std::vector<void *> usmAllocations;
+    std::map<std::pair<std::string, bool>, ze_module_handle_t> modules;
+    std::vector<ze_kernel_handle_t> kernels;
+    DebugManagerStateRestore debugManagerStateRestore;
 };
 
 } // namespace L0

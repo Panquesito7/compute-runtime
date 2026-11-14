@@ -1,24 +1,22 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "opencl/source/accelerators/intel_accelerator.h"
+#include "shared/test/common/mocks/mock_device.h"
+
 #include "opencl/source/api/api.h"
 #include "opencl/source/api/cl_types.h"
-#include "opencl/source/command_queue/command_queue.h"
+#include "opencl/source/api/dispatch.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/base_object.h"
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/mem_obj.h"
-#include "opencl/source/platform/platform.h"
 #include "opencl/source/program/program.h"
-#include "opencl/source/sampler/sampler.h"
 #include "opencl/source/sharings/sharing_factory.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/fixtures/image_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
@@ -81,7 +79,7 @@ class MockObject : public MockObjectBase<BaseType> {};
 template <>
 class MockObject<Buffer> : public MockObjectBase<Buffer> {
   public:
-    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) override {}
+    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) override {}
 };
 
 template <>
@@ -98,7 +96,6 @@ class MockObject<Program> : public MockObjectBase<Program> {
 
 typedef ::testing::Types<
     MockPlatform,
-    IntelAccelerator,
     // Context,
     // Program,
     // Kernel,
@@ -109,19 +106,18 @@ typedef ::testing::Types<
 
 typedef ::testing::Types<
     MockPlatform,
-    IntelAccelerator,
     Context,
     Program,
     Buffer,
     MockCommandQueue>
     BaseObjectTypesForCastInvalidMagicTest;
 
-TYPED_TEST_CASE(BaseObjectTests, BaseObjectTypes);
+TYPED_TEST_SUITE(BaseObjectTests, BaseObjectTypes);
 
 // "typedef" BaseObjectTests template to use with different TypeParams for testing
 template <typename T>
 using BaseObjectWithDefaultCtorTests = BaseObjectTests<T>;
-TYPED_TEST_CASE(BaseObjectWithDefaultCtorTests, BaseObjectTypesForCastInvalidMagicTest);
+TYPED_TEST_SUITE(BaseObjectWithDefaultCtorTests, BaseObjectTypesForCastInvalidMagicTest);
 
 TYPED_TEST(BaseObjectWithDefaultCtorTests, GivenInvalidMagicWhenCastingToObjectThenNullptrIsReturned) {
     MockObject<TypeParam> *object = new MockObject<TypeParam>;
@@ -226,18 +222,6 @@ TYPED_TEST(BaseObjectTests, WhenCastingToDispatchTableThenEntriesAreCorrect) {
     EXPECT_EQ(nullptr, genericObject->dispatch.crtDispatch->placeholder21);
 }
 
-TEST(BaseObjectTests, WhenSettingSharedContextFlagThenItIsSetCorrectly) {
-    MockContext newContext;
-
-    // cast to cl_context
-    cl_context clContext = &newContext;
-    EXPECT_FALSE(newContext.isSharedContext);
-
-    clContext->isSharedContext = true;
-
-    EXPECT_TRUE(newContext.isSharedContext);
-}
-
 TYPED_TEST(BaseObjectTests, WhenTakingAndReleasingOwnershipThenOwnershipCountIsUpdated) {
     TypeParam obj;
     EXPECT_FALSE(obj.hasOwnership());
@@ -276,7 +260,7 @@ TEST(CastToBuffer, WhenCastingFromMemObjThenBehavesAsExpected) {
 
 TEST(CastToImage, WhenCastingFromMemObjThenBehavesAsExpected) {
     MockContext context;
-    auto image = Image2dHelper<>::create(&context);
+    auto image = Image2dHelperUlt<>::create(&context);
     MemObj *memObj = image;
     cl_mem clObj = image;
 
@@ -297,7 +281,7 @@ class MockBuffer : public MockBufferStorage, public Buffer {
                           CL_MEM_USE_HOST_PTR, 0, sizeof(data), &data, &data, GraphicsAllocationHelper::toMultiGraphicsAllocation(&mockGfxAllocation), true, false, false) {
     }
 
-    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool useGlobalAtomics, bool areMultipleSubDevicesInContext) override {
+    void setArgStateful(void *memory, bool forceNonAuxMode, bool disableL3, bool alignSizeForAuxTranslation, bool isReadOnly, const Device &device, bool areMultipleSubDevicesInContext) override {
     }
 };
 

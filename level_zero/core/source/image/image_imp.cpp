@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,30 +7,130 @@
 
 #include "level_zero/core/source/image/image_imp.h"
 
+#include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/device/device.h"
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/client_context/gmm_client_context.h"
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_helper.h"
+#include "shared/source/gmm_helper/resource_info.h"
+#include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/bindless_heaps_helper.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/ptr_math.h"
+#include "shared/source/helpers/string.h"
 #include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/product_helper.h"
+#include "shared/source/utilities/tag_allocator.h"
 
 #include "level_zero/core/source/device/device.h"
-#include "level_zero/core/source/device/device_imp.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/core/source/driver/driver_handle.h"
+#include "level_zero/core/source/image/image_format_desc_helper.h"
+#include "level_zero/core/source/image/image_formats.h"
 
-#include "igfxfmid.h"
+#include "neo_igfxfmid.h"
+#include "third_party/opencl_headers/CL/cl_gl.h"
+
+#include <algorithm>
+#include <mutex>
 
 namespace L0 {
+ImageAllocatorFn imageFactory[NEO::maxCoreEnumValue] = {};
 
-ImageAllocatorFn imageFactory[IGFX_MAX_PRODUCT] = {};
+bool isImportedWin32Handle(const ze_image_desc_t *imgDesc) {
+    const ze_base_desc_t *extendedDesc = reinterpret_cast<const ze_base_desc_t *>(imgDesc->pNext);
+    bool importedWin32Handle = false;
+    while (extendedDesc) {
+        if (extendedDesc->stype == ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMPORT_WIN32) {
+            importedWin32Handle = true;
+        }
+        extendedDesc = reinterpret_cast<const ze_base_desc_t *>(extendedDesc->pNext);
+    }
+    return importedWin32Handle;
+}
+
+void getImageDescriptorFor3ChEmulation(const ze_image_desc_t *origImgDesc, ze_image_desc_t *imgDesc) {
+    *imgDesc = *origImgDesc;
+    if (origImgDesc->format.layout == ZE_IMAGE_FORMAT_LAYOUT_16_16_16) {
+        imgDesc->format.layout = ZE_IMAGE_FORMAT_LAYOUT_16_16_16_16;
+        imgDesc->format.x = ZE_IMAGE_FORMAT_SWIZZLE_R;
+        imgDesc->format.y = ZE_IMAGE_FORMAT_SWIZZLE_G;
+        imgDesc->format.z = ZE_IMAGE_FORMAT_SWIZZLE_B;
+        imgDesc->format.w = ZE_IMAGE_FORMAT_SWIZZLE_1;
+    }
+    if (origImgDesc->format.layout == ZE_IMAGE_FORMAT_LAYOUT_8_8_8) {
+        imgDesc->format.layout = ZE_IMAGE_FORMAT_LAYOUT_8_8_8_8;
+        imgDesc->format.x = ZE_IMAGE_FORMAT_SWIZZLE_R;
+        imgDesc->format.y = ZE_IMAGE_FORMAT_SWIZZLE_G;
+        imgDesc->format.z = ZE_IMAGE_FORMAT_SWIZZLE_B;
+        imgDesc->format.w = ZE_IMAGE_FORMAT_SWIZZLE_1;
+    }
+    return;
+}
 
 ImageImp::~ImageImp() {
-    if (!isImageView && this->device != nullptr) {
-        this->device->getNEODevice()->getMemoryManager()->freeGraphicsMemory(this->allocation);
+    bool allocationCached = false;
+    if (this->device != nullptr && !isImageView() && !imageFromBuffer) {
+        auto imageAllocationCache = this->isAllocationReusable ? this->device->getDriverHandle()->getImageAllocationCache() : nullptr;
+        if (imageAllocationCache != nullptr && this->allocation != nullptr && !this->pendingBindlessState.encodedSurfaceStates.empty()) {
+            imageAllocationCache->releaseBindlessState(*this->allocation, this->pendingBindlessState);
+        }
+        if (imageAllocationCache != nullptr) {
+            ImageBindlessState bindlessState;
+            bindlessState.mipLevelBindlessInfos = std::move(this->mipLevelBindlessInfos);
+            bindlessState.mediaBlockBindlessInfo = std::move(this->mediaBlockBindlessInfo);
+            bindlessState.implicitArgsTag = this->implicitArgsTag;
+            bindlessState.mainBindlessSlotsWritten = this->mainBindlessSlotsWritten;
+            bindlessState.encodedSurfaceStates = this->encodedSurfaceStates;
+            allocationCached = imageAllocationCache->insert(this->allocationCacheKey, this->allocatedImgInfo, this->allocation, bindlessState);
+            if (allocationCached) {
+                this->implicitArgsTag = nullptr;
+            } else {
+                this->mipLevelBindlessInfos = std::move(bindlessState.mipLevelBindlessInfos);
+                this->mediaBlockBindlessInfo = std::move(bindlessState.mediaBlockBindlessInfo);
+            }
+        }
+    }
+    if (this->device != nullptr) {
+        auto rootIndex = this->device->getNEODevice()->getRootDeviceIndex();
+        auto bindlessHeapsHelper = this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[rootIndex]->getBindlessHeapsHelper();
+        if (bindlessHeapsHelper != nullptr) {
+            for (const auto &mipLevelBindlessInfo : mipLevelBindlessInfos) {
+                if (mipLevelBindlessInfo != nullptr) {
+                    bindlessHeapsHelper->releaseSSToReusePool(*mipLevelBindlessInfo);
+                }
+            }
+            if (mediaBlockBindlessInfo != nullptr) {
+                bindlessHeapsHelper->releaseSSToReusePool(*mediaBlockBindlessInfo);
+            }
+        }
+    }
+    if ((isImageView() || imageFromBuffer) && this->device != nullptr) {
+        auto rootIndex = this->device->getNEODevice()->getRootDeviceIndex();
+        if (bindlessInfo.get() && this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[rootIndex]->getBindlessHeapsHelper() != nullptr) {
+            this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[rootIndex]->getBindlessHeapsHelper()->releaseSSToReusePool(*bindlessInfo);
+        }
+    }
+    if (this->device != nullptr) {
+        if (!isImageView() && !imageFromBuffer && !allocationCached) {
+            this->device->getNEODevice()->getMemoryManager()->freeGraphicsMemory(this->allocation);
+        }
+        if (implicitArgsTag) {
+            implicitArgsTag->returnTag();
+        }
+        if (mcsAllocation) {
+            this->device->getNEODevice()->getMemoryManager()->freeGraphicsMemory(this->mcsAllocation);
+        }
     }
 }
 
 ze_result_t ImageImp::destroy() {
     if (this->getAllocation() && this->device) {
         auto imageAllocPtr = reinterpret_cast<const void *>(this->getAllocation()->getGpuAddress());
-        DriverHandleImp *driverHandle = static_cast<DriverHandleImp *>(this->device->getDriverHandle());
+        DriverHandle *driverHandle = this->device->getDriverHandle();
 
         for (auto peerDevice : driverHandle->devices) {
             this->destroyPeerImages(imageAllocPtr, peerDevice);
@@ -42,52 +142,254 @@ ze_result_t ImageImp::destroy() {
 }
 
 ze_result_t ImageImp::destroyPeerImages(const void *ptr, Device *device) {
-    DeviceImp *deviceImp = static_cast<DeviceImp *>(device);
 
-    std::unique_lock<NEO::SpinLock> lock(deviceImp->peerImageAllocationsMutex);
+    std::unique_lock<NEO::SpinLock> lock(device->peerImageAllocationsMutex);
 
-    if (deviceImp->peerImageAllocations.find(ptr) != deviceImp->peerImageAllocations.end()) {
-        delete deviceImp->peerImageAllocations[ptr];
-        deviceImp->peerImageAllocations.erase(ptr);
+    if (auto it = device->peerImageAllocations.find(ptr); it != device->peerImageAllocations.end()) {
+        delete it->second;
+        device->peerImageAllocations.erase(it);
     }
 
     return ZE_RESULT_SUCCESS;
 }
 
 ze_result_t ImageImp::createView(Device *device, const ze_image_desc_t *desc, ze_image_handle_t *pImage) {
-    auto productFamily = device->getNEODevice()->getHardwareInfo().platform.eProductFamily;
+    auto gfxCoreFamily = device->getNEODevice()->getHardwareInfo().platform.eRenderCoreFamily;
 
     ImageAllocatorFn allocator = nullptr;
-    allocator = imageFactory[productFamily];
+    allocator = imageFactory[gfxCoreFamily];
 
     ImageImp *image = nullptr;
 
     image = static_cast<ImageImp *>((*allocator)());
-    image->isImageView = true;
     image->allocation = allocation;
-    auto result = image->initialize(device, desc);
+    image->sourceImageFormatDesc = this->imageFormatDesc;
+    image->imgInfo = this->imgInfo;
+    image->imageFromBuffer = this->imageFromBuffer;
+    image->customRowPitch = this->customRowPitch;
+    image->customSlicePitch = this->customSlicePitch;
 
+    auto result = ZE_RESULT_SUCCESS;
+    switch (desc->format.layout) {
+    default:
+        result = image->initialize(device, desc);
+        break;
+    case ZE_IMAGE_FORMAT_LAYOUT_32_32_32:
+        result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+        break;
+    case ZE_IMAGE_FORMAT_LAYOUT_8_8_8:
+    case ZE_IMAGE_FORMAT_LAYOUT_16_16_16:
+        if (isImportedWin32Handle(desc)) {
+            result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+        } else {
+            ze_image_desc_t imgDesc = {};
+            getImageDescriptorFor3ChEmulation(desc, &imgDesc);
+            image->setMimickedImage(true);
+            result = image->initialize(device, &imgDesc);
+        }
+        break;
+    }
     if (result != ZE_RESULT_SUCCESS) {
         image->destroy();
         image = nullptr;
     }
-
     *pImage = image;
 
     return result;
 }
 
-ze_result_t Image::create(uint32_t productFamily, Device *device, const ze_image_desc_t *desc, Image **pImage) {
+ze_result_t ImageImp::allocateBindlessSlot() {
+    if (!isImageView() && !imageFromBuffer) {
+        if (!this->device->getNEODevice()->getMemoryManager()->allocateBindlessSlot(allocation)) {
+            return ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        if (!bindlessInfo && allocation->getBindlessOffset() != std::numeric_limits<uint64_t>::max()) {
+            bindlessInfo = std::make_unique<NEO::SurfaceStateInHeapInfo>(allocation->getBindlessInfo());
+        }
+        return ZE_RESULT_SUCCESS;
+    }
+    auto bindlessHelper = this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[allocation->getRootDeviceIndex()]->getBindlessHeapsHelper();
+
+    if (bindlessHelper && !bindlessInfo) {
+        auto &allocRootDeviceEnvironment = *this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[allocation->getRootDeviceIndex()];
+        auto &gfxCoreHelper = allocRootDeviceEnvironment.getHelper<NEO::GfxCoreHelper>();
+        const auto surfStateCount = NEO::BindlessImageSlot::max;
+        auto surfaceStateSize = surfStateCount * gfxCoreHelper.getRenderSurfaceStateSize(allocRootDeviceEnvironment);
+
+        auto surfaceStateInfo = bindlessHelper->allocateSSInHeap(surfaceStateSize, allocation, NEO::BindlessHeapsHelper::globalSsh);
+        if (surfaceStateInfo.heapAllocation == nullptr) {
+            return ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        bindlessInfo = std::make_unique<NEO::SurfaceStateInHeapInfo>(surfaceStateInfo);
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+NEO::SurfaceStateInHeapInfo *ImageImp::getBindlessSlot() {
+    return bindlessInfo.get();
+}
+
+NEO::SurfaceStateInHeapInfo *ImageImp::allocateBindlessSlotCopy(std::unique_ptr<NEO::SurfaceStateInHeapInfo> &slotCopy,
+                                                                std::initializer_list<uint32_t> bindlessSlots,
+                                                                uint32_t mipLevel,
+                                                                bool isMediaBlockArg) {
+    if (slotCopy != nullptr) {
+        return slotCopy.get();
+    }
+
+    auto &rootDeviceEnvironment = *this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[allocation->getRootDeviceIndex()];
+    const auto surfaceStateSize = rootDeviceEnvironment.getHelper<NEO::GfxCoreHelper>().getRenderSurfaceStateSize(rootDeviceEnvironment);
+    const auto slotSize = NEO::BindlessImageSlot::max * surfaceStateSize;
+
+    auto surfaceStateInfo = rootDeviceEnvironment.getBindlessHeapsHelper()->allocateSSInHeap(slotSize, allocation, NEO::BindlessHeapsHelper::globalSsh);
+    if (surfaceStateInfo.heapAllocation == nullptr) {
+        return nullptr;
+    }
+
+    memcpy_s(surfaceStateInfo.ssPtr, surfaceStateInfo.ssSize, bindlessInfo->ssPtr, std::min(bindlessInfo->ssSize, surfaceStateInfo.ssSize));
+
+    for (const auto slot : bindlessSlots) {
+        copySurfaceStateToSSH(ptrOffset(surfaceStateInfo.ssPtr, surfaceStateSize * slot), 0u, slot, isMediaBlockArg && slot == NEO::BindlessImageSlot::image, mipLevel);
+    }
+
+    slotCopy = std::make_unique<NEO::SurfaceStateInHeapInfo>(surfaceStateInfo);
+    return slotCopy.get();
+}
+
+void ImageImp::adoptCachedBindlessState(ImageBindlessState &bindlessState) {
+    if (bindlessState.implicitArgsTag != nullptr) {
+        this->implicitArgsTag = bindlessState.implicitArgsTag;
+        this->implicitArgsAllocation = this->implicitArgsTag->getBaseGraphicsAllocation()->getGraphicsAllocation(this->device->getRootDeviceIndex());
+        bindlessState.implicitArgsTag = nullptr;
+    }
+    this->pendingBindlessState = std::move(bindlessState);
+}
+
+void ImageImp::finalizeCachedBindlessState() {
+    auto &pending = this->pendingBindlessState;
+    const bool sameSurfaceStates = pending.encodedSurfaceStates == this->encodedSurfaceStates &&
+                                   pending.mipLevelBindlessInfos.size() == this->mipLevelBindlessInfos.size();
+    if (sameSurfaceStates) {
+        this->mipLevelBindlessInfos = std::move(pending.mipLevelBindlessInfos);
+        this->mediaBlockBindlessInfo = std::move(pending.mediaBlockBindlessInfo);
+        this->mainBindlessSlotsWritten = pending.mainBindlessSlotsWritten;
+        pending = {};
+        return;
+    }
+    this->device->getDriverHandle()->getImageAllocationCache()->releaseBindlessState(*this->allocation, pending);
+}
+
+void ImageImp::writeMainBindlessSlots() {
+    if (this->mainBindlessSlotsWritten) {
+        return;
+    }
+
+    auto &rootDeviceEnvironment = *this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[allocation->getRootDeviceIndex()];
+    const auto surfaceStateSize = rootDeviceEnvironment.getHelper<NEO::GfxCoreHelper>().getRenderSurfaceStateSize(rootDeviceEnvironment);
+
+    for (const auto slot : {NEO::BindlessImageSlot::image, NEO::BindlessImageSlot::implicitArgs, NEO::BindlessImageSlot::redescribedImage, NEO::BindlessImageSlot::packedImage}) {
+        copySurfaceStateToSSH(ptrOffset(this->bindlessInfo->ssPtr, surfaceStateSize * slot), 0u, slot, false, 0u);
+    }
+    this->mainBindlessSlotsWritten = true;
+}
+
+ze_result_t ImageImp::allocateBindlessSlotWithMipmap(uint32_t mipLevel) {
+    auto result = allocateBindlessSlot();
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    const auto numMipLevels = imgInfo.imgDesc.numMipLevels;
+    if (mipLevel == 0u || numMipLevels <= 1u || bindlessInfo == nullptr) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    auto &rootDeviceEnvironment = *this->device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[allocation->getRootDeviceIndex()];
+    if (rootDeviceEnvironment.getBindlessHeapsHelper() == nullptr) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    const auto clampedMipLevel = std::min(mipLevel, numMipLevels - 1u);
+
+    std::lock_guard<std::mutex> lock(this->mipLevelBindlessInfosMutex);
+    UNRECOVERABLE_IF(clampedMipLevel >= this->mipLevelBindlessInfos.size());
+    writeMainBindlessSlots();
+    auto slotCopy = allocateBindlessSlotCopy(this->mipLevelBindlessInfos[clampedMipLevel],
+                                             {NEO::BindlessImageSlot::image, NEO::BindlessImageSlot::redescribedImage, NEO::BindlessImageSlot::packedImage},
+                                             clampedMipLevel, false);
+    return slotCopy != nullptr ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+NEO::SurfaceStateInHeapInfo *ImageImp::getOrInitializeBindlessSlot(uint32_t bindlessSlot, uint32_t mipLevel, bool isMediaBlockArg) {
+    if (isMediaBlockArg) {
+        if (allocateBindlessSlot() != ZE_RESULT_SUCCESS) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(this->mipLevelBindlessInfosMutex);
+        writeMainBindlessSlots();
+        return allocateBindlessSlotCopy(this->mediaBlockBindlessInfo, {NEO::BindlessImageSlot::image, NEO::BindlessImageSlot::implicitArgs}, 0u, true);
+    }
+
+    if (allocateBindlessSlotWithMipmap(mipLevel) != ZE_RESULT_SUCCESS) {
+        return nullptr;
+    }
+
+    const auto numMipLevels = imgInfo.imgDesc.numMipLevels;
+    if (mipLevel > 0u && numMipLevels > 1u) {
+        return getBindlessSlotWithMipmap(mipLevel);
+    }
+
+    std::lock_guard<std::mutex> lock(this->mipLevelBindlessInfosMutex);
+    writeMainBindlessSlots();
+
+    return this->bindlessInfo.get();
+}
+
+NEO::SurfaceStateInHeapInfo *ImageImp::getBindlessSlotWithMipmap(uint32_t mipLevel) {
+    const auto numMipLevels = imgInfo.imgDesc.numMipLevels;
+    if (mipLevel == 0u || numMipLevels <= 1u) {
+        return getBindlessSlot();
+    }
+
+    const auto clampedMipLevel = std::min(mipLevel, numMipLevels - 1u);
+
+    std::lock_guard<std::mutex> lock(this->mipLevelBindlessInfosMutex);
+    UNRECOVERABLE_IF(clampedMipLevel >= this->mipLevelBindlessInfos.size());
+    auto &mipLevelBindlessInfo = this->mipLevelBindlessInfos[clampedMipLevel];
+    UNRECOVERABLE_IF(mipLevelBindlessInfo == nullptr);
+    return mipLevelBindlessInfo.get();
+}
+
+ze_result_t Image::create(Device *device, const ze_image_desc_t *desc, Image **pImage) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     ImageAllocatorFn allocator = nullptr;
-    if (productFamily < IGFX_MAX_PRODUCT) {
-        allocator = imageFactory[productFamily];
+    auto gfxCoreFamily = device->getNEODevice()->getRenderCoreFamily();
+    if (gfxCoreFamily < NEO::maxCoreEnumValue) {
+        allocator = imageFactory[gfxCoreFamily];
     }
 
     ImageImp *image = nullptr;
     if (allocator) {
         image = static_cast<ImageImp *>((*allocator)());
-        result = image->initialize(device, desc);
+        switch (desc->format.layout) {
+        default:
+            result = image->initialize(device, desc);
+            break;
+        case ZE_IMAGE_FORMAT_LAYOUT_8_8_8:
+        case ZE_IMAGE_FORMAT_LAYOUT_16_16_16:
+            if (isImportedWin32Handle(desc)) {
+                result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+            } else {
+                ze_image_desc_t imgDesc = {};
+                getImageDescriptorFor3ChEmulation(desc, &imgDesc);
+                image->setMimickedImage(true);
+                result = image->initialize(device, &imgDesc);
+            }
+            break;
+        case ZE_IMAGE_FORMAT_LAYOUT_32_32_32:
+            result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+            break;
+        }
         if (result != ZE_RESULT_SUCCESS) {
             image->destroy();
             image = nullptr;
@@ -98,5 +400,231 @@ ze_result_t Image::create(uint32_t productFamily, Device *device, const ze_image
     *pImage = image;
 
     return result;
+}
+
+ze_result_t Image::getPitchFor2dImage(
+    ze_device_handle_t hDevice,
+    size_t imageWidth,
+    size_t imageHeight,
+    unsigned int elementSizeInByte,
+    size_t *rowPitch) {
+
+    NEO::ImageInfo imgInfo = {};
+    imgInfo.imgDesc.imageType = NEO::ImageType::image2D;
+    imgInfo.imgDesc.imageWidth = imageWidth;
+    imgInfo.imgDesc.imageHeight = imageHeight;
+    imgInfo.linearStorage = true;
+    [[maybe_unused]] uint32_t exponent;
+    switch (elementSizeInByte) {
+    default:
+        exponent = Math::log2(elementSizeInByte);
+        if (exponent >= 5u) {
+            return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+        }
+        imgInfo.surfaceFormat = &ImageFormats::surfaceFormatsForRedescribe[exponent % 5];
+        break;
+    case 3:
+        imgInfo.surfaceFormat = &ImageFormats::surfaceFormatsForRedescribe[5];
+        break;
+    case 6:
+        imgInfo.surfaceFormat = &ImageFormats::surfaceFormatsForRedescribe[6];
+        break;
+    }
+
+    Device *device = Device::fromHandle(hDevice);
+    *rowPitch = ImageImp::getRowPitchFor2dImage(device, imgInfo);
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t ImageImp::getDeviceOffset(uint64_t *deviceOffset) {
+    if (!this->bindlessImage) {
+        return ZE_RESULT_ERROR_NOT_AVAILABLE;
+    }
+
+    DEBUG_BREAK_IF(this->getBindlessSlot() == nullptr);
+    *deviceOffset = this->getBindlessSlot()->surfaceStateOffset;
+
+    return ZE_RESULT_SUCCESS;
+}
+
+size_t ImageImp::getRowPitchFor2dImage(Device *device, const NEO::ImageInfo &imgInfo) {
+    NEO::StorageInfo storageInfo = {};
+    NEO::ImageInfo info = imgInfo;
+
+    NEO::Gmm gmm(device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->getGmmHelper(),
+                 info,
+                 storageInfo,
+                 false);
+
+    return info.rowPitch;
+}
+
+ze_result_t ImageImp::allocateImplicitArgsOnDemand() {
+    std::lock_guard<std::mutex> lock(implicitArgsAllocationMutex);
+    if (implicitArgsAllocation != nullptr) {
+        return ZE_RESULT_SUCCESS;
+    }
+
+    if (!obtainImplicitArgsTag()) {
+        return ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (!writeImplicitArgsToTag()) {
+        implicitArgsTag->returnTag();
+        implicitArgsTag = nullptr;
+        implicitArgsAllocation = nullptr;
+        return ZE_RESULT_ERROR_UNKNOWN;
+    }
+    encodeImplicitArgsSurfaceState();
+    return ZE_RESULT_SUCCESS;
+}
+
+bool ImageImp::obtainImplicitArgsTag() {
+    implicitArgsTag = device->getImageImplicitArgsAllocator()->getTag();
+    if (implicitArgsTag == nullptr) {
+        return false;
+    }
+    implicitArgsAllocation = implicitArgsTag->getBaseGraphicsAllocation()->getGraphicsAllocation(device->getRootDeviceIndex());
+    return true;
+}
+
+bool ImageImp::writeImplicitArgsToTag() {
+    NEO::ImageImplicitArgs imageImplicitArgs{};
+    populateImageImplicitArgs(imageImplicitArgs);
+
+    auto cpuBase = implicitArgsTag->getCpuBase();
+    if (cpuBase == nullptr) {
+        return false;
+    }
+    memcpy_s(cpuBase, NEO::ImageImplicitArgs::getSize(), &imageImplicitArgs, NEO::ImageImplicitArgs::getSize());
+
+    auto csr = device->getNEODevice()->getDefaultEngine().commandStreamReceiver;
+    csr->writeTagAllocationChunkToSimulation(*implicitArgsTag, 0, NEO::ImageImplicitArgs::getSize());
+    return true;
+}
+
+cl_channel_type ImageImp::overrideChannelTypeForDepthInt24Image(cl_channel_type clChannelType, bool isDepthStencil,
+                                                                NEO::GraphicsAllocation *allocation) {
+    bool isDepthResource = isDepthStencil || (allocation && allocation->getDefaultGmm() && allocation->getDefaultGmm()->gmmResourceInfo->isDepthResource() && static_cast<int>(clChannelType) == CL_INVALID_VALUE);
+    if (isDepthResource && static_cast<int>(clChannelType) != CL_FLOAT) {
+        return CL_UNORM_INT24;
+    }
+    return clChannelType;
+}
+
+void ImageImp::populateImageImplicitArgs(NEO::ImageImplicitArgs &imageImplicitArgs) {
+    imageImplicitArgs.structVersion = 0;
+    imageImplicitArgs.imageWidth = imgInfo.imgDesc.imageWidth;
+    imageImplicitArgs.imageHeight = imgInfo.imgDesc.imageHeight;
+    imageImplicitArgs.imageDepth = imgInfo.imgDesc.imageDepth;
+    imageImplicitArgs.imageArraySize = imgInfo.imgDesc.imageArraySize;
+    imageImplicitArgs.numSamples = imgInfo.imgDesc.numSamples;
+    imageImplicitArgs.numMipLevels = imgInfo.imgDesc.numMipLevels;
+
+    imageImplicitArgs.channelType = getClChannelDataType(imageFormatDesc.format);
+    imageImplicitArgs.channelOrder = getClChannelOrder(imageFormatDesc.format, this->isSrgb());
+    imageImplicitArgs.channelType = overrideChannelTypeForDepthInt24Image(imageImplicitArgs.channelType,
+                                                                          this->isDepthStencil(),
+                                                                          this->allocation);
+}
+
+void ImageImp::applyGlTextureExtOverrides(NEO::GraphicsAllocation *allocation,
+                                          NEO::ImageInfo &imgInfo,
+                                          void *pGmmResInfo,
+                                          uint64_t textureBufferOffset,
+                                          uint32_t glHWFormat,
+                                          bool isAuxEnabled,
+                                          uint32_t numberOfSamples,
+                                          void *mcsNtHandle,
+                                          void *pGmmResInfoMcs,
+                                          bool hasUnifiedMcsSurface) {
+    if (allocation == nullptr) {
+        return;
+    }
+
+    auto &rootDeviceEnvironment = this->device->getNEODevice()->getRootDeviceEnvironment();
+    auto gmmHelper = rootDeviceEnvironment.getGmmHelper();
+
+    if (pGmmResInfo) {
+        auto gmmResInfo = gmmHelper->getClientContext()->getGmmResInfoFromExternalResourceHandle(pGmmResInfo);
+        auto importedGmmResInfo = std::unique_ptr<NEO::GmmResourceInfo>(NEO::GmmResourceInfo::create(gmmHelper->getClientContext(), gmmResInfo));
+        if (importedGmmResInfo) {
+            allocation->setDefaultGmm(std::make_unique<NEO::Gmm>(gmmHelper, importedGmmResInfo.get()));
+        }
+    }
+
+    if (textureBufferOffset != 0) {
+        allocation->setAllocationOffset(textureBufferOffset);
+    }
+
+    if (glHWFormat != 0 && glHWFormat != static_cast<uint32_t>(NEO::NUM_GFX3DSTATE_SURFACEFORMATS)) {
+        this->overriddenSurfaceFormat = *imgInfo.surfaceFormat;
+        this->overriddenSurfaceFormat.genxSurfaceFormat = static_cast<NEO::SurfaceFormat>(glHWFormat);
+        this->hasOverriddenSurfaceFormat = true;
+        imgInfo.surfaceFormat = &this->overriddenSurfaceFormat;
+    }
+
+    if (isAuxEnabled && allocation->getDefaultGmm() != nullptr &&
+        allocation->getDefaultGmm()->unifiedAuxTranslationCapable()) {
+        const auto &productHelper = rootDeviceEnvironment.getHelper<NEO::ProductHelper>();
+        auto memoryManager = this->device->getNEODevice()->getMemoryManager();
+        bool compressionEnabled = productHelper.isPageTableManagerSupported(this->device->getNEODevice()->getHardwareInfo())
+                                      ? memoryManager->mapAuxGpuVA(allocation)
+                                      : true;
+        allocation->getDefaultGmm()->setCompressionEnabled(compressionEnabled);
+    }
+
+    if (numberOfSamples <= 1) {
+        return;
+    }
+    this->numSamples = numberOfSamples;
+
+    const bool gmmHasMcs = (allocation->getDefaultGmm() != nullptr) &&
+                           allocation->getDefaultGmm()->hasMultisampleControlSurface();
+    this->isUnifiedMcsSurface = hasUnifiedMcsSurface && gmmHasMcs;
+
+    auto toRenderMultisamplesCount = [](uint32_t n) -> uint32_t {
+        switch (n) {
+        case 2:
+            return 1;
+        case 4:
+            return 2;
+        case 8:
+            return 3;
+        case 16:
+            return 4;
+        default:
+            return 0;
+        }
+    };
+    this->mcsMultisampleCount = toRenderMultisamplesCount(numberOfSamples);
+
+    if (mcsNtHandle != nullptr) {
+        auto neoDevice = this->device->getNEODevice();
+        auto memoryManager = neoDevice->getMemoryManager();
+
+        NEO::AllocationProperties properties(neoDevice->getRootDeviceIndex(), 0u,
+                                             NEO::AllocationType::mcs,
+                                             neoDevice->getDeviceBitfield());
+        NEO::MemoryManager::OsHandleData osHandleData{mcsNtHandle};
+        this->mcsAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
+
+        if (this->mcsAllocation != nullptr && pGmmResInfoMcs != nullptr) {
+            auto gmmResInfoMcs = gmmHelper->getClientContext()->getGmmResInfoFromExternalResourceHandle(pGmmResInfoMcs);
+            auto mcsGmmResInfo = std::unique_ptr<NEO::GmmResourceInfo>(NEO::GmmResourceInfo::create(gmmHelper->getClientContext(), gmmResInfoMcs));
+            if (mcsGmmResInfo) {
+                this->mcsAllocation->setDefaultGmm(std::make_unique<NEO::Gmm>(gmmHelper, mcsGmmResInfo.get()));
+            }
+        }
+
+        if (this->mcsAllocation != nullptr && this->mcsAllocation->getDefaultGmm() != nullptr) {
+            auto mcsGmm = this->mcsAllocation->getDefaultGmm();
+            this->mcsPitch = static_cast<uint32_t>(mcsGmm->gmmResourceInfo->getRenderPitch() / 128);
+            if (this->mcsPitch == 0u) {
+                this->mcsPitch = 1u;
+            }
+            this->mcsQPitch = mcsGmm->gmmResourceInfo->getQPitch();
+        }
+    }
 }
 } // namespace L0

@@ -1,11 +1,14 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "iga_wrapper_tests.h"
+
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_os_library.h"
 
 #include "opencl/test/unit_test/offline_compiler/mock/mock_iga_dll_guard.h"
 #include "opencl/test/unit_test/offline_compiler/stdout_capturer.h"
@@ -15,6 +18,9 @@
 namespace NEO {
 
 TEST_F(IgaWrapperTest, GivenInvalidPathToIgaLibraryWhenDisassemblingGenIsaThenFalseIsReturnedAndErrorMessageIsPrinted) {
+    MockOsLibrary::loadLibraryNewObject = nullptr;
+    VariableBackup<decltype(NEO::OsLibrary::loadFunc)> funcBackup{&NEO::OsLibrary::loadFunc, MockOsLibrary::load};
+
     MockIgaDllGuard mockIgaDllGuard{"some_invalid_path_to_library"};
     mockIgaDllGuard.enable();
 
@@ -178,6 +184,9 @@ TEST_F(IgaWrapperTest, GivenContextCreationSuccessAndDisassemblationSuccessAndWa
 }
 
 TEST_F(IgaWrapperTest, GivenInvalidPathToIgaLibraryWhenAssemblingGenIsaThenFalseIsReturnedAndErrorMessageIsPrinted) {
+    MockOsLibrary::loadLibraryNewObject = nullptr;
+    VariableBackup<decltype(NEO::OsLibrary::loadFunc)> funcBackup{&NEO::OsLibrary::loadFunc, MockOsLibrary::load};
+
     MockIgaDllGuard mockIgaDllGuard{"some_invalid_path_to_library"};
     mockIgaDllGuard.enable();
 
@@ -283,12 +292,12 @@ TEST_F(IgaWrapperTest, GivenIgcWrapperWhenLoadingLibraryTwiceWithPathChangeInThe
 
 TEST_F(IgaWrapperTest, GivenIgcWrapperWhenCallingSetGfxCoreMultipleTimesThenFirstValidGfxCoreFamilyIsPreserved) {
     ASSERT_FALSE(testedIgaWrapper.isKnownPlatform());
-    constexpr auto invalidGfxCoreFamily = IGFX_MAX_CORE;
+    constexpr auto invalidGfxCoreFamily = NEO::maxCoreEnumValue;
 
     testedIgaWrapper.setGfxCore(invalidGfxCoreFamily);
     EXPECT_FALSE(testedIgaWrapper.isKnownPlatform());
 
-    testedIgaWrapper.setGfxCore(IGFX_GEN11LP_CORE);
+    testedIgaWrapper.setGfxCore(IGFX_GEN12LP_CORE);
     EXPECT_TRUE(testedIgaWrapper.isKnownPlatform());
 
     // Expect that a valid family is preserved.
@@ -298,12 +307,12 @@ TEST_F(IgaWrapperTest, GivenIgcWrapperWhenCallingSetGfxCoreMultipleTimesThenFirs
 
 TEST_F(IgaWrapperTest, GivenIgcWrapperWhenCallingSetProductFamilyMultipleTimesThenFirstValidProductFamilyIsPreserved) {
     ASSERT_FALSE(testedIgaWrapper.isKnownPlatform());
-    constexpr auto invalidProductFamily = IGFX_MAX_PRODUCT;
+    constexpr auto invalidProductFamily = NEO::maxProductEnumValue;
 
     testedIgaWrapper.setProductFamily(invalidProductFamily);
     EXPECT_FALSE(testedIgaWrapper.isKnownPlatform());
 
-    testedIgaWrapper.setProductFamily(IGFX_SKYLAKE);
+    testedIgaWrapper.setProductFamily(IGFX_TIGERLAKE_LP);
     EXPECT_TRUE(testedIgaWrapper.isKnownPlatform());
 
     // Expect that a valid family is preserved.

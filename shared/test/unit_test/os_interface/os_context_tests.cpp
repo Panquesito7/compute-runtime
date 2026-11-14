@@ -1,16 +1,21 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
+#include "shared/test/common/helpers/raii_product_helper.h"
+#include "shared/test/common/helpers/stream_capture.h"
 #include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_os_context.h"
+#include "shared/test/common/mocks/mock_product_helper.h"
 
 #include "gtest/gtest.h"
 
@@ -25,7 +30,7 @@ TEST(OSContext, whenCreatingDefaultOsContextThenExpectInitializedAlways) {
 }
 
 TEST(OSContext, givenInternalAndRootDeviceAreTrueWhenCreatingDefaultOsContextThenExpectGettersTrue) {
-    auto descriptor = EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_RCS, EngineUsage::Internal});
+    auto descriptor = EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_RCS, EngineUsage::internal});
     descriptor.isRootDevice = true;
 
     OsContext *osContext = OsContext::create(nullptr, 0, 0, descriptor);
@@ -36,7 +41,7 @@ TEST(OSContext, givenInternalAndRootDeviceAreTrueWhenCreatingDefaultOsContextThe
 }
 
 TEST(OSContext, givenLowPriorityAndRootDeviceAreTrueWhenCreatingDefaultOsContextThenExpectGettersTrue) {
-    auto descriptor = EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_RCS, EngineUsage::LowPriority});
+    auto descriptor = EngineDescriptorHelper::getDefaultDescriptor({aub_stream::ENGINE_RCS, EngineUsage::lowPriority});
     descriptor.isRootDevice = true;
 
     OsContext *osContext = OsContext::create(nullptr, 0, 0, descriptor);
@@ -56,12 +61,47 @@ TEST(OSContext, givenOsContextCreatedDefaultIsFalseWhenSettingTrueThenFlagTrueRe
 
 TEST(OSContext, givenCooperativeEngineWhenIsCooperativeEngineIsCalledThenReturnTrue) {
     auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
-    engineDescriptor.engineTypeUsage.second = EngineUsage::Cooperative;
+    engineDescriptor.engineTypeUsage.second = EngineUsage::cooperative;
     auto pOsContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
     EXPECT_FALSE(pOsContext->isRegular());
     EXPECT_FALSE(pOsContext->isLowPriority());
     EXPECT_FALSE(pOsContext->isInternalEngine());
     EXPECT_TRUE(pOsContext->isCooperativeEngine());
+    delete pOsContext;
+}
+
+TEST(OSContext, givenPowerHintEngineWhenIsPowerHintCalledThenReturnTrueAndOtherUsageGettersReturnFalse) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    engineDescriptor.engineTypeUsage.second = EngineUsage::powerHint;
+    auto pOsContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
+    EXPECT_TRUE(pOsContext->isPowerHint());
+    EXPECT_FALSE(pOsContext->isRegular());
+    EXPECT_FALSE(pOsContext->isLowPriority());
+    EXPECT_FALSE(pOsContext->isInternalEngine());
+    EXPECT_FALSE(pOsContext->isCooperativeEngine());
+    delete pOsContext;
+}
+
+TEST(OSContext, givenPowerHintEngineWhenConstructedThenUmdPowerHintValueIsSetToMax) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    engineDescriptor.engineTypeUsage.second = EngineUsage::powerHint;
+    auto pOsContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
+    EXPECT_EQ(OsContext::getUmdPowerHintMax(), pOsContext->getUmdPowerHintValue());
+    delete pOsContext;
+}
+
+TEST(OSContext, givenNonPowerHintEngineWhenConstructedThenUmdPowerHintValueRemainsDefault) {
+    auto pOsContext = OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor());
+    EXPECT_NE(OsContext::getUmdPowerHintMax(), pOsContext->getUmdPowerHintValue());
+    delete pOsContext;
+}
+
+TEST(OSContext, givenPowerHintEngineWhenSetDefaultContextIfApplicableCalledWithMatchingEngineTypeThenContextIsNotMarkedDefault) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    engineDescriptor.engineTypeUsage.second = EngineUsage::powerHint;
+    auto pOsContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
+    pOsContext->setDefaultContextIfApplicable(engineDescriptor.engineTypeUsage.first);
+    EXPECT_FALSE(pOsContext->isDefaultContext());
     delete pOsContext;
 }
 
@@ -81,10 +121,151 @@ TEST(OSContext, givenSetPowerHintThenGetPowerHintShowsTheSameValue) {
     delete pOsContext;
 }
 
+TEST(OSContext, givenPowerHintSetToMaxWhenCheckingDirectSubmissionAvailabilityThenFalseIsReturnedUnlessDebugFlagEnableDirectSubmissionTrue) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    auto pOsContext = std::make_unique<OsContextMock>(0, 0, engineDescriptor);
+    ASSERT_NE(pOsContext, nullptr);
+    pOsContext->callBaseIsDirectSubmissionSupported = false;
+    pOsContext->mockDirectSubmissionSupported = true;
+    pOsContext->setDefaultContext(true);
+    ASSERT_NE(defaultHwInfo, nullptr);
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.capabilityTable.directSubmissionEngines.data[pOsContext->getEngineType()]
+        .engineSupported = true;
+    bool submitOnInit = false;
+
+    pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax());
+    EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+    pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax() / 2);
+    EXPECT_TRUE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+
+    DebugManagerStateRestore debugFlagsStateRestorer;
+    {
+        debugManager.flags.EnableDirectSubmission.set(-1); // only in this case second/csr flag have any significance here
+        {
+            debugManager.flags.SetCommandStreamReceiver.set(0); // as representation of values <= 0
+            pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax());
+            EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+            pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax() / 2);
+            EXPECT_TRUE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+        }
+        {
+            debugManager.flags.SetCommandStreamReceiver.set(1); // as representation of values > 0
+            pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax());
+            EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+            pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax() / 2);
+            EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+        }
+    }
+    {
+        debugManager.flags.EnableDirectSubmission.set(0);
+        pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax());
+        EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+        pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax() / 2);
+        EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+    }
+    {
+        debugManager.flags.EnableDirectSubmission.set(1);
+        pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax());
+        EXPECT_TRUE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+        pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax() / 2);
+        EXPECT_TRUE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+    }
+}
+
+TEST(OSContext, givenSimulationCsrTypeWhenCheckingDirectSubmissionAvailabilityThenItIsNotAvailableByDefaultAndAvailableInTbxModeOnlyWhenTbxOnlyModeIsSelected) {
+    DebugManagerStateRestore debugFlagsStateRestorer;
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    auto pOsContext = std::make_unique<OsContextMock>(0, 0, engineDescriptor);
+    pOsContext->callBaseIsDirectSubmissionSupported = false;
+    pOsContext->mockDirectSubmissionSupported = true;
+    pOsContext->setDefaultContext(true);
+    pOsContext->setUmdPowerHintValue(OsContextMock::getUmdPowerHintMax() / 2);
+    auto hwInfo = *defaultHwInfo;
+    hwInfo.capabilityTable.directSubmissionEngines.data[pOsContext->getEngineType()].engineSupported = true;
+    bool submitOnInit = false;
+
+    debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::tbx));
+    EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+
+    debugManager.flags.EnableDirectSubmissionInSimulationMode.set(-1);
+    EXPECT_TRUE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+
+    for (auto csrType : {CommandStreamReceiverType::aub, CommandStreamReceiverType::tbxWithAub, CommandStreamReceiverType::hardwareWithAub, CommandStreamReceiverType::nullAub}) {
+        debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(csrType));
+        EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+    }
+
+    debugManager.flags.EnableDirectSubmissionInSimulationMode.set(1);
+    debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::aub));
+    EXPECT_TRUE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+
+    debugManager.flags.EnableDirectSubmissionInSimulationMode.set(0);
+    debugManager.flags.SetCommandStreamReceiver.set(static_cast<int32_t>(CommandStreamReceiverType::tbx));
+    EXPECT_FALSE(pOsContext->isDirectSubmissionAvailable(hwInfo, submitOnInit));
+}
+
 TEST(OSContext, givenOsContextWhenQueryingForOfflineDumpContextIdThenCorrectValueIsReturned) {
     OsContext *osContext = OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor());
     EXPECT_EQ(0u, osContext->getOfflineDumpContextId(0));
     delete osContext;
+}
+
+TEST(OSContext, givenOsContextWhenSetNewResourceBoundThenTlbFLushRequired) {
+    auto osContext = std::unique_ptr<OsContext>(OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor()));
+
+    EXPECT_EQ(osContext->peekTlbFlushCounter(), 0u);
+    EXPECT_FALSE(osContext->isTlbFlushRequired());
+
+    osContext->setNewResourceBound();
+
+    EXPECT_EQ(osContext->peekTlbFlushCounter(), 1u);
+    EXPECT_TRUE(osContext->isTlbFlushRequired());
+
+    osContext->setTlbFlushed(1u);
+
+    EXPECT_EQ(osContext->peekTlbFlushCounter(), 1u);
+    EXPECT_FALSE(osContext->isTlbFlushRequired());
+}
+
+TEST(OSContext, givenOsContextWhenCreatedThenPriorityLevelIsNotSet) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    auto osContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
+
+    EXPECT_FALSE(osContext->hasPriorityLevel());
+    EXPECT_ANY_THROW(osContext->getPriorityLevel()); // Default value
+
+    delete osContext;
+}
+
+TEST(OSContext, givenOsContextWhenOverridingPriorityThenPriorityLevelIsSet) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    auto osContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
+
+    osContext->overridePriority(2);
+    EXPECT_TRUE(osContext->hasPriorityLevel());
+    EXPECT_EQ(2u, osContext->getPriorityLevel());
+
+    delete osContext;
+}
+
+TEST(OSContext, givenOsContextWithPriorityLevelWhenOverridingAgainThenPriorityLevelRemainsUnchanged) {
+    auto engineDescriptor = EngineDescriptorHelper::getDefaultDescriptor();
+    auto osContext = OsContext::create(nullptr, 0, 0, engineDescriptor);
+
+    osContext->overridePriority(3);
+    osContext->overridePriority(7); // Second override should be ignored
+
+    EXPECT_TRUE(osContext->hasPriorityLevel());
+    EXPECT_EQ(3u, osContext->getPriorityLevel()); // Should remain 3
+
+    delete osContext;
+}
+
+TEST(OSContext, givenOsContextWhenCheckingExternalSemaphoreGpuWaitSupportThenFalseIsReturned) {
+    auto pOsContext = OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor());
+    EXPECT_FALSE(pOsContext->isExternalSemaphoreGpuWaitSupported());
+    delete pOsContext;
 }
 
 struct DeferredOsContextCreationTests : ::testing::Test {
@@ -96,6 +277,7 @@ struct DeferredOsContextCreationTests : ::testing::Test {
     std::unique_ptr<OsContext> createOsContext(EngineTypeUsage engineTypeUsage, bool defaultEngine) {
         OSInterface *osInterface = device->getRootDeviceEnvironment().osInterface.get();
         std::unique_ptr<OsContext> osContext{OsContext::create(osInterface, device->getRootDeviceIndex(), 0, EngineDescriptorHelper::getDefaultDescriptor(engineTypeUsage))};
+        osContext->adjustSettings(device->getProductHelper());
         EXPECT_FALSE(osContext->isInitialized());
         return osContext;
     }
@@ -119,9 +301,10 @@ struct DeferredOsContextCreationTests : ::testing::Test {
     }
 
     std::unique_ptr<MockDevice> device;
-    static inline const EngineTypeUsage engineTypeUsageRegular{aub_stream::ENGINE_RCS, EngineUsage::Regular};
-    static inline const EngineTypeUsage engineTypeUsageInternal{aub_stream::ENGINE_RCS, EngineUsage::Internal};
-    static inline const EngineTypeUsage engineTypeUsageBlitter{aub_stream::ENGINE_BCS, EngineUsage::Regular};
+    static inline const EngineTypeUsage engineTypeUsageRegular{aub_stream::ENGINE_RCS, EngineUsage::regular};
+    static inline const EngineTypeUsage engineTypeUsageInternal{aub_stream::ENGINE_RCS, EngineUsage::internal};
+    static inline const EngineTypeUsage engineTypeUsageBlitter{aub_stream::ENGINE_BCS, EngineUsage::regular};
+    static inline const EngineTypeUsage engineTypeUsageInternalBlitter{aub_stream::ENGINE_BCS, EngineUsage::internal};
 };
 
 TEST_F(DeferredOsContextCreationTests, givenRegularEngineWhenCreatingOsContextThenOsContextIsInitializedDeferred) {
@@ -129,10 +312,10 @@ TEST_F(DeferredOsContextCreationTests, givenRegularEngineWhenCreatingOsContextTh
 
     expectDeferredContextCreation(engineTypeUsageRegular, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.DeferOsContextInitialization.set(1);
     expectDeferredContextCreation(engineTypeUsageRegular, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(0);
+    debugManager.flags.DeferOsContextInitialization.set(0);
     expectImmediateContextCreation(engineTypeUsageRegular, false);
 }
 
@@ -141,23 +324,47 @@ TEST_F(DeferredOsContextCreationTests, givenDefaultEngineWhenCreatingOsContextTh
 
     expectImmediateContextCreation(engineTypeUsageRegular, true);
 
-    DebugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.DeferOsContextInitialization.set(1);
     expectImmediateContextCreation(engineTypeUsageRegular, true);
 
-    DebugManager.flags.DeferOsContextInitialization.set(0);
+    debugManager.flags.DeferOsContextInitialization.set(0);
     expectImmediateContextCreation(engineTypeUsageRegular, true);
 }
 
 TEST_F(DeferredOsContextCreationTests, givenInternalEngineWhenCreatingOsContextThenOsContextIsInitializedImmediately) {
     DebugManagerStateRestore restore{};
+    RAIIProductHelperFactory<MockProductHelper> productHelper(*device->getExecutionEnvironment()->rootDeviceEnvironments[0]);
+    {
+        productHelper.mockProductHelper->initializeInternalEngineImmediatelyResult = true;
+        expectImmediateContextCreation(engineTypeUsageInternal, false);
+        expectImmediateContextCreation(engineTypeUsageInternalBlitter, false);
 
-    expectImmediateContextCreation(engineTypeUsageInternal, false);
+        productHelper.mockProductHelper->initializeInternalEngineImmediatelyResult = false;
+        expectDeferredContextCreation(engineTypeUsageInternal, false);
+        expectImmediateContextCreation(engineTypeUsageInternalBlitter, false);
+    }
 
-    DebugManager.flags.DeferOsContextInitialization.set(1);
-    expectImmediateContextCreation(engineTypeUsageInternal, false);
+    {
+        debugManager.flags.DeferOsContextInitialization.set(1);
+        productHelper.mockProductHelper->initializeInternalEngineImmediatelyResult = true;
+        expectImmediateContextCreation(engineTypeUsageInternal, false);
+        expectImmediateContextCreation(engineTypeUsageInternalBlitter, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(0);
-    expectImmediateContextCreation(engineTypeUsageInternal, false);
+        productHelper.mockProductHelper->initializeInternalEngineImmediatelyResult = false;
+        expectDeferredContextCreation(engineTypeUsageInternal, false);
+        expectImmediateContextCreation(engineTypeUsageInternalBlitter, false);
+    }
+
+    {
+        debugManager.flags.DeferOsContextInitialization.set(0);
+        productHelper.mockProductHelper->initializeInternalEngineImmediatelyResult = true;
+        expectImmediateContextCreation(engineTypeUsageInternal, false);
+        expectImmediateContextCreation(engineTypeUsageInternalBlitter, false);
+
+        productHelper.mockProductHelper->initializeInternalEngineImmediatelyResult = false;
+        expectImmediateContextCreation(engineTypeUsageInternal, false);
+        expectImmediateContextCreation(engineTypeUsageInternalBlitter, false);
+    }
 }
 
 TEST_F(DeferredOsContextCreationTests, givenBlitterEngineWhenCreatingOsContextThenOsContextIsInitializedImmediately) {
@@ -165,10 +372,10 @@ TEST_F(DeferredOsContextCreationTests, givenBlitterEngineWhenCreatingOsContextTh
 
     expectImmediateContextCreation(engineTypeUsageBlitter, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.DeferOsContextInitialization.set(1);
     expectImmediateContextCreation(engineTypeUsageBlitter, false);
 
-    DebugManager.flags.DeferOsContextInitialization.set(0);
+    debugManager.flags.DeferOsContextInitialization.set(0);
     expectImmediateContextCreation(engineTypeUsageBlitter, false);
 }
 
@@ -220,15 +427,36 @@ TEST_F(DeferredOsContextCreationTests, givenEnsureContextInitializeCalledMultipl
 
 TEST_F(DeferredOsContextCreationTests, givenPrintOsContextInitializationsIsSetWhenOsContextItIsInitializedThenInfoIsLoggedToStdout) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.DeferOsContextInitialization.set(1);
-    DebugManager.flags.PrintOsContextInitializations.set(1);
-    testing::internal::CaptureStdout();
+    debugManager.flags.DeferOsContextInitialization.set(1);
+    debugManager.flags.PrintOsContextInitializations.set(1);
+    StreamCapture capture;
+    capture.captureStdout();
 
     auto osContext = createOsContext(engineTypeUsageRegular, false);
-    EXPECT_EQ(std::string{}, testing::internal::GetCapturedStdout());
+    EXPECT_EQ(std::string{}, capture.getCapturedStdout());
 
-    testing::internal::CaptureStdout();
+    capture.captureStdout();
     osContext->ensureContextInitialized();
-    std::string expectedMessage = "OsContext initialization: contextId=0 usage=Regular type=RCS isRootDevice=0\n";
-    EXPECT_EQ(expectedMessage, testing::internal::GetCapturedStdout());
+    std::string expectedMessage = "OsContext initialization: contextId=0 usage=Regular type=RCS isRootDevice=0 priorityLevel=std::nullopt\n";
+    EXPECT_EQ(expectedMessage, capture.getCapturedStdout());
+}
+
+TEST(OSContext, givenEngineTypeUsageAndContextGroupWhenCheckingLatePreemptionStartTargetThenOnlyRegularCcsOutsideOfContextGroupIsTarget) {
+    struct Case {
+        aub_stream::EngineType engineType;
+        EngineUsage engineUsage;
+        bool expected;
+    };
+    for (auto &testCase : {Case{aub_stream::ENGINE_CCS, EngineUsage::regular, true},
+                           Case{aub_stream::ENGINE_CCS, EngineUsage::lowPriority, false},
+                           Case{aub_stream::ENGINE_CCS, EngineUsage::internal, false},
+                           Case{aub_stream::ENGINE_CCS1, EngineUsage::regular, false},
+                           Case{aub_stream::ENGINE_RCS, EngineUsage::regular, false},
+                           Case{aub_stream::ENGINE_BCS, EngineUsage::regular, false}}) {
+        auto osContext = OsContext::create(nullptr, 0, 0, EngineDescriptorHelper::getDefaultDescriptor({testCase.engineType, testCase.engineUsage}));
+        EXPECT_EQ(testCase.expected, osContext->isLatePreemptionStartTarget());
+        osContext->setContextGroupCount(2);
+        EXPECT_FALSE(osContext->isLatePreemptionStartTarget());
+        delete osContext;
+    }
 }

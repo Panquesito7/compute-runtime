@@ -1,23 +1,25 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/helpers/basic_math.h"
+#include "shared/source/helpers/addressing_mode_helper.h"
+#include "shared/source/helpers/engine_node_helper.h"
+#include "shared/source/helpers/vec.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/os_interface/os_context.h"
 
+#include "opencl/source/built_ins/builtins_dispatch_builder.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
-#include "opencl/source/helpers/hardware_commands_helper.h"
+#include "opencl/source/command_queue/csr_selection_args.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/source/helpers/mipmap.h"
 #include "opencl/source/mem_obj/image.h"
-
-#include <algorithm>
-#include <new>
+#include "opencl/source/memory_manager/mem_obj_surface.h"
 
 namespace NEO {
 
@@ -38,6 +40,25 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteImage(
 
     CsrSelectionArgs csrSelectionArgs{cmdType, nullptr, dstImage, device->getRootDeviceIndex(), region, nullptr, origin};
     CommandStreamReceiver &csr = selectCsrForBuiltinOperation(csrSelectionArgs);
+    return enqueueWriteImageImpl(dstImage, blockingWrite, origin, region, inputRowPitch, inputSlicePitch, ptr, mapAllocation, numEventsInWaitList, eventWaitList, event, csr);
+}
+
+template <typename GfxFamily>
+cl_int CommandQueueHw<GfxFamily>::enqueueWriteImageImpl(
+    Image *dstImage,
+    cl_bool blockingWrite,
+    const size_t *origin,
+    const size_t *region,
+    size_t inputRowPitch,
+    size_t inputSlicePitch,
+    const void *ptr,
+    GraphicsAllocation *mapAllocation,
+    cl_uint numEventsInWaitList,
+    const cl_event *eventWaitList,
+    cl_event *event,
+    CommandStreamReceiver &csr) {
+    constexpr cl_command_type cmdType = CL_COMMAND_WRITE_IMAGE;
+    CsrSelectionArgs csrSelectionArgs{cmdType, nullptr, dstImage, device->getRootDeviceIndex(), region, nullptr, origin};
 
     auto isMemTransferNeeded = true;
 
@@ -61,6 +82,20 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteImage(
 
     auto bcsSplit = this->isSplitEnqueueBlitNeeded(csrSelectionArgs.direction, getTotalSizeFromRectRegion(region), csr);
 
+    if (!mapAllocation) {
+        InternalMemoryType memoryType = InternalMemoryType::notSpecified;
+        bool isCpuCopyAllowed = false;
+        cl_int retVal = getContext().tryGetExistingHostPtrAllocation(srcPtr, hostPtrSize, device->getRootDeviceIndex(), mapAllocation, memoryType, isCpuCopyAllowed);
+        if (retVal != CL_SUCCESS) {
+            return retVal;
+        }
+
+        if (mapAllocation) {
+            mapAllocation->setAubWritable(true, GraphicsAllocation::defaultBank);
+            mapAllocation->setTbxWritable(true, GraphicsAllocation::defaultBank);
+        }
+    }
+
     if (mapAllocation) {
         surfaces[1] = &mapSurface;
         mapSurface.setGraphicsAllocation(mapAllocation);
@@ -82,10 +117,12 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteImage(
         }
     }
 
-    void *alignedSrcPtr = alignDown(srcPtr, 4);
+    // blitter takes host ptr as is - offset.x is used as a pixel coordinate, so it can't carry byte alignment remainder
+    const bool isBcs = EngineHelpers::isBcs(csr.getOsContext().getEngineType());
+    void *alignedSrcPtr = isBcs ? srcPtr : alignDown(srcPtr, 4);
     size_t srcPtrOffset = ptrDiff(srcPtr, alignedSrcPtr);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = alignedSrcPtr;
     dc.srcOffset.x = srcPtrOffset;
     dc.dstMemObj = dstImage;
@@ -100,10 +137,16 @@ cl_int CommandQueueHw<GfxFamily>::enqueueWriteImage(
     dc.bcsSplit = bcsSplit;
     dc.direction = csrSelectionArgs.direction;
 
-    auto eBuiltInOps = EBuiltInOps::CopyBufferToImage3d;
+    auto builtInMode = this->defaultBuiltInMode;
+    builtInMode.adjustToWideStatelessIfRequired(hostPtrSize);
+    BuiltIn::BuiltInId builtIn{BuiltIn::BaseKernel::copyBufferToImage3d, builtInMode};
+    if (!isBcs && dstImage->isImage1dBufferFromBuffer()) {
+        overrideBuiltinForImage1dBufferWithParentBuffer(dc, builtIn, false);
+    }
     MultiDispatchInfo dispatchInfo(dc);
 
-    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_WRITE_IMAGE>(dispatchInfo, surfaces, eBuiltInOps, numEventsInWaitList, eventWaitList, event, blockingWrite == CL_TRUE, csr);
+    const auto dispatchResult = dispatchBcsOrGpgpuEnqueue<CL_COMMAND_WRITE_IMAGE>(dispatchInfo, surfaces, builtIn, numEventsInWaitList, eventWaitList, event, blockingWrite == CL_TRUE, csr);
+
     if (dispatchResult != CL_SUCCESS) {
         return dispatchResult;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,10 @@
 
 #pragma once
 #include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include "opencl/source/helpers/surface_formats.h"
+#include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/mem_obj.h"
 
 namespace NEO {
@@ -16,12 +18,15 @@ namespace NEO {
 class GfxCoreHelper;
 class Gmm;
 class Image;
+class ReleaseHelper;
 struct HardwareInfo;
 struct KernelInfo;
 struct SurfaceFormatInfo;
 struct UnifiedSharingMemoryDescription;
+class MemoryManager;
+class SharingHandler;
 
-using ImageCreateFunc = Image *(*)(Context *context,
+using ImageCreateFunc = Image *(*)(Context * context,
                                    const MemoryProperties &memoryProperties,
                                    uint64_t flags,
                                    uint64_t flagsIntel,
@@ -36,6 +41,12 @@ using ImageCreateFunc = Image *(*)(Context *context,
                                    uint32_t mipCount,
                                    const ClSurfaceFormatInfo *surfaceFormatInfo,
                                    const SurfaceOffsets *surfaceOffsets);
+
+struct MipLevelHostLayout {
+    size_t rowPitch = 0;
+    size_t slicePitch = 0;
+    size_t size = 0;
+};
 
 struct ImageFactoryFuncs {
     ImageCreateFunc createImageFunction;
@@ -58,7 +69,7 @@ class Image : public MemObj {
     const static cl_ulong maskMagic = 0xFFFFFFFFFFFFFFFFLL;
     static const cl_ulong objectMagic = MemObj::objectMagic | 0x01;
 
-    ~Image() override = default;
+    ~Image() override;
 
     static Image *create(Context *context,
                          const MemoryProperties &memoryProperties,
@@ -86,7 +97,11 @@ class Image : public MemObj {
 
     static Image *createSharedImage(Context *context, SharingHandler *sharingHandler, const McsSurfaceInfo &mcsSurfaceInfo,
                                     MultiGraphicsAllocation multiGraphicsAllocation, GraphicsAllocation *mcsAllocation,
-                                    cl_mem_flags flags, cl_mem_flags_intel flagsIntel, const ClSurfaceFormatInfo *surfaceFormat, ImageInfo &imgInfo, uint32_t cubeFaceIndex, uint32_t baseMipLevel, uint32_t mipCount);
+                                    cl_mem_flags flags, cl_mem_flags_intel flagsIntel, const ClSurfaceFormatInfo *surfaceFormat, ImageInfo &imgInfo, uint32_t cubeFaceIndex, uint32_t baseMipLevel, uint32_t mipCount, bool hasUnifiedMcsSurface,
+                                    cl_int *errcodeRet);
+
+    static bool isMultisampleConfigurationSupported(const NEO::Device &device, const ImageInfo &imgInfo,
+                                                    const GraphicsAllocation *mcsAllocation, bool hasUnifiedMcsSurface);
 
     static cl_int validate(Context *context,
                            const MemoryProperties &memoryProperties,
@@ -137,10 +152,7 @@ class Image : public MemObj {
                         void *paramValue,
                         size_t *paramValueSizeRet);
 
-    virtual void setImageArg(void *memory, bool isMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex, bool useGlobalAtomics) = 0;
-    virtual void setMediaImageArg(void *memory, uint32_t rootDeviceIndex) = 0;
-    virtual void setMediaSurfaceRotation(void *memory) = 0;
-    virtual void setSurfaceMemoryObjectControlState(void *memory, uint32_t value) = 0;
+    virtual void setImageArg(void *memory, bool isMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex) = 0;
 
     const cl_image_desc &getImageDesc() const;
     const cl_image_format &getImageFormat() const;
@@ -170,9 +182,11 @@ class Image : public MemObj {
         surfaceOffsets.yOffsetForUVplane = yOffsetForUVPlane;
     }
     void getSurfaceOffsets(SurfaceOffsets &surfaceOffsetsOut) { surfaceOffsetsOut = this->surfaceOffsets; }
+    bool getIsDisplayable() const { return isDisplayable; }
+    void setIsDisplayable(bool displayable) { this->isDisplayable = displayable; }
 
-    void setCubeFaceIndex(uint32_t index) { cubeFaceIndex = index; }
-    uint32_t getCubeFaceIndex() { return cubeFaceIndex; }
+    void setCubeFaceIndex(GmmCubeFace index) { cubeFaceIndex = index; }
+    GmmCubeFace getCubeFaceIndex() { return cubeFaceIndex; }
     void setMediaPlaneType(cl_uint type) { mediaPlaneType = type; }
     cl_uint getMediaPlaneType() const { return mediaPlaneType; }
     int peekBaseMipLevel() { return baseMipLevel; }
@@ -181,23 +195,25 @@ class Image : public MemObj {
     uint32_t peekMipCount() { return mipCount; }
     void setMipCount(uint32_t mipCountNew) { this->mipCount = mipCountNew; }
 
-    static const ClSurfaceFormatInfo *getSurfaceFormatFromTable(cl_mem_flags flags, const cl_image_format *imageFormat, bool supportsOcl20Features);
+    static const ClSurfaceFormatInfo *getSurfaceFormatFromTable(cl_mem_flags flags, const cl_image_format *imageFormat);
     static cl_int validateRegionAndOrigin(const size_t *origin, const size_t *region, const cl_image_desc &imgDesc);
 
     cl_int writeNV12Planes(const void *hostPtr, size_t hostPtrRowPitch, uint32_t rootDeviceIndex);
     void setMcsSurfaceInfo(const McsSurfaceInfo &info) { mcsSurfaceInfo = info; }
     const McsSurfaceInfo &getMcsSurfaceInfo() { return mcsSurfaceInfo; }
-    void setPlane(const GMM_YUV_PLANE_ENUM plane) { this->plane = plane; }
-    GMM_YUV_PLANE_ENUM getPlane() const { return this->plane; }
-    size_t calculateOffsetForMapping(const MemObjOffsetArray &origin) const override;
-
-    virtual void transformImage2dArrayTo3d(void *memory) = 0;
-    virtual void transformImage3dTo2dArray(void *memory) = 0;
+    void setPlane(ImagePlane plane) { this->plane = plane; }
+    ImagePlane getPlane() const { return this->plane; }
+    size_t calculateOffsetForMapping(const MemObjOffsetArray &origin, uint32_t mipLevel) const override;
+    size_t calculateMappedPtrLength(const MemObjSizeArray &size, uint32_t mipLevel) const override;
+    size_t getHostMapStorageSize() const override;
+    MipLevelHostLayout getMipLevelHostLayout(uint32_t mipLevel) const;
+    size_t getMipLevelsHostSize(uint32_t mipLevelCount) const;
 
     bool hasSameDescriptor(const cl_image_desc &imageDesc) const;
     bool hasValidParentImageFormat(const cl_image_format &imageFormat) const;
 
     bool isImageFromBuffer() const { return castToObject<Buffer>(static_cast<cl_mem>(associatedMemObject)) ? true : false; }
+    bool isImage1dBufferFromBuffer() const { return imageDesc.image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER && isImageFromBuffer(); }
     bool isImageFromImage() const { return castToObject<Image>(static_cast<cl_mem>(associatedMemObject)) ? true : false; }
 
     static cl_int checkIfDeviceSupportsImages(cl_context context);
@@ -205,6 +221,8 @@ class Image : public MemObj {
     void fillImageRegion(size_t *region) const;
 
     static bool validateHandleType(MemoryProperties &memoryProperties, UnifiedSharingMemoryDescription &extMem);
+    void setAs3DUavOrRtvImage(bool isUavOrRtv);
+    void setIsPackedFormat(bool isPackedFormat) { this->isPackedFormat = isPackedFormat; }
 
   protected:
     Image(Context *context,
@@ -238,12 +256,14 @@ class Image : public MemObj {
     size_t hostPtrRowPitch = 0;
     size_t hostPtrSlicePitch = 0;
     size_t imageCount = 0;
-    uint32_t cubeFaceIndex = __GMM_NO_CUBE_MAP;
+    GmmCubeFace cubeFaceIndex = gmmNoCubeMap;
     cl_uint mediaPlaneType = 0;
     SurfaceOffsets surfaceOffsets = {0};
     uint32_t baseMipLevel = 0;
     uint32_t mipCount = 1;
-    GMM_YUV_PLANE_ENUM plane = GMM_NO_PLANE;
+    ImagePlane plane = ImagePlane::noPlane;
+    bool is3DUAVOrRTV = false;
+    bool isPackedFormat = false;
 
     static bool isValidSingleChannelFormat(const cl_image_format *imageFormat);
     static bool isValidIntensityFormat(const cl_image_format *imageFormat);
@@ -272,9 +292,6 @@ class Image : public MemObj {
     static void setAllocationInfoFromParentBuffer(CreateMemObj::AllocationInfo &allocationInfo, const void *&hostPtr, void *&hostPtrToSet,
                                                   Buffer *parentBuffer, ImageInfo &imageInfo, uint32_t rootDeviceIndex);
 
-    static void setAllocationInfoFromHostPtrWithSharedContext(CreateMemObj::AllocationInfo &allocationInfo, uint32_t rootDeviceIndex, ImageInfo &imageInfo,
-                                                              Context *context, bool preferCompression, MemoryManager *memoryManager, const void *hostPtr);
-
     static void setAllocationInfoFromHostPtr(CreateMemObj::AllocationInfo &allocationInfo, uint32_t rootDeviceIndex, const HardwareInfo &hwInfo,
                                              const MemoryProperties &memoryProperties, ImageInfo &imageInfo, Context *context, bool preferCompression,
                                              MemoryManager *memoryManager, const void *hostPtr, size_t hostPtrMinSize);
@@ -285,7 +302,7 @@ class Image : public MemObj {
 
     static void providePerformanceHintForCreateImage(Image *image, const HardwareInfo &hwInfo, CreateMemObj::AllocationInfo &allocationInfo, Context *context);
 
-    static void setImageDesriptorIfParentImage(cl_image_desc &imageDescriptor, size_t imageWidth, size_t imageHeight, cl_mem memObject);
+    static void setImageDescriptorIfParentImage(cl_image_desc &imageDescriptor, size_t imageWidth, size_t imageHeight, cl_mem memObject);
 };
 
 template <typename GfxFamily>
@@ -334,16 +351,12 @@ class ImageHw : public Image {
         }
     }
 
-    void setImageArg(void *memory, bool setAsMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex, bool useGlobalAtomics) override;
-    void setAuxParamsForMultisamples(RENDER_SURFACE_STATE *surfaceState);
-    void setMediaImageArg(void *memory, uint32_t rootDeviceIndex) override;
-    void setMediaSurfaceRotation(void *memory) override;
-    void setSurfaceMemoryObjectControlState(void *memory, uint32_t value) override;
-    void appendSurfaceStateParams(RENDER_SURFACE_STATE *surfaceState, uint32_t rootDeviceIndex, bool useGlobalAtomics);
+    void setImageArg(void *memory, bool setAsMediaBlockImage, uint32_t mipLevel, uint32_t rootDeviceIndex) override;
+    void setAuxParamsForMultisamples(RENDER_SURFACE_STATE *surfaceState, uint32_t rootDeviceIndex);
+    void appendSurfaceStateParams(RENDER_SURFACE_STATE *surfaceState, uint32_t rootDeviceIndex);
     void appendSurfaceStateDepthParams(RENDER_SURFACE_STATE *surfaceState, Gmm *gmm);
     void appendSurfaceStateExt(void *memory);
-    void transformImage2dArrayTo3d(void *memory) override;
-    void transformImage3dTo2dArray(void *memory) override;
+    static void adjustDepthLimitations(RENDER_SURFACE_STATE *surfaceState, uint32_t minArrayElement, uint32_t renderTargetViewExtent, uint32_t depth, uint32_t mipCount, bool is3DUavOrRtv);
     static Image *create(Context *context,
                          const MemoryProperties &memoryProperties,
                          cl_mem_flags flags,

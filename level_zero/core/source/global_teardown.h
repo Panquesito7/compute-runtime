@@ -1,19 +1,19 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include <level_zero/loader/ze_loader.h>
 #include <level_zero/ze_api.h>
 
-#include <string>
-
 namespace L0 {
-using zelSetDriverTeardown_fn = ze_result_t (*)();
-static const std::string loaderLibraryFilename = "ze_loader";
+extern decltype(&zelSetDriverTeardown) setDriverTeardownFunc;
 
 void globalDriverTeardown();
-ze_result_t setDriverTeardownHandleInLoader(std::string loaderLibraryName);
+void removePageFaultManagerAtTermination();
+void globalDriverSetup();
+
 } // namespace L0

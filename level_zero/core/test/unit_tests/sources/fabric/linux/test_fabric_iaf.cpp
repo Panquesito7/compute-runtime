@@ -1,103 +1,37 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/os_interface/device_factory.h"
+#include "shared/source/os_interface/linux/drm_fabric.h"
 #include "shared/source/os_interface/linux/ioctl_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
-#include "shared/test/common/mocks/ult_device_factory.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/os_interface/linux/sys_calls_linux_ult.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include "level_zero/api/extensions/public/ze_exp_ext.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/core/source/fabric/fabric.h"
 #include "level_zero/core/source/fabric/linux/fabric_device_iaf.h"
-#include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/fixtures/device_fixture_extended.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_fabric.h"
 
 #include "gtest/gtest.h"
+
+namespace NEO {
+extern std::map<std::string, std::vector<std::string>> directoryFilesMap;
+} // namespace NEO
 
 namespace L0 {
 namespace ult {
 
-class MockIafNlApi : public IafNlApi {
-  public:
-    ze_result_t fPortStatusQueryStatus = ZE_RESULT_SUCCESS;
-    ze_result_t fportPropertiesStatus = ZE_RESULT_SUCCESS;
-    ze_result_t subDevicePropertiesStatus = ZE_RESULT_SUCCESS;
-    ze_result_t getPortsStatus = ZE_RESULT_SUCCESS;
-    iaf_fport_health fPortStatusQueryHealthStatus = IAF_FPORT_HEALTH_HEALTHY;
-    bool portEnumerationEnable = true;
-
-    ze_result_t handleResponse(const uint16_t cmdOp, struct genl_info *info, void *pOutput) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t fPortStatusQuery(const IafPortId portId, IafPortState &state) override {
-        state.healthStatus = fPortStatusQueryHealthStatus;
-        return fPortStatusQueryStatus;
-    };
-
-    ze_result_t getThroughput(const IafPortId portId, IafPortThroughPut &throughput) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portStateQuery(const IafPortId portId, bool &enabled) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portBeaconStateQuery(const IafPortId portId, bool &enabled) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portBeaconEnable(const IafPortId portId) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portBeaconDisable(const IafPortId portId) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portEnable(const IafPortId portId) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portDisable(const IafPortId portId) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portUsageEnable(const IafPortId portId) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t portUsageDisable(const IafPortId portId) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t remRequest() override { return ZE_RESULT_SUCCESS; };
-    ze_result_t routingGenQuery(uint32_t &start, uint32_t &end) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t deviceEnum(std::vector<uint32_t> &fabricIds) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t fabricDeviceProperties(const uint32_t fabricId, uint32_t &numSubdevices) override { return ZE_RESULT_SUCCESS; };
-    ze_result_t subdevicePropertiesGet(const uint32_t fabricId, const uint32_t attachId, uint64_t &guid, std::vector<uint8_t> &ports) override {
-        return subDevicePropertiesStatus;
-    };
-    ze_result_t fportProperties(const IafPortId portId, uint64_t &neighborGuid, uint8_t &neighborPortNumber,
-                                IafPortSpeed &maxRxSpeed, IafPortSpeed &maxTxSpeed,
-                                IafPortSpeed &rxSpeed, IafPortSpeed &txSpeed) override {
-        neighborPortNumber = 8;
-        neighborGuid = 0xFEEDBEAD;
-        maxRxSpeed.width = 4;
-        maxRxSpeed.bitRate = 53125000000;
-        maxTxSpeed = maxRxSpeed;
-        rxSpeed = maxRxSpeed;
-        txSpeed = maxRxSpeed;
-
-        return fportPropertiesStatus;
-    };
-    ze_result_t getPorts(const std::string &devicePciPath, std::vector<IafPort> &ports) override {
-
-        if (portEnumerationEnable) {
-            IafPort defaultPort;
-            defaultPort.onSubdevice = true;
-            defaultPort.portId.fabricId = testPortId.fabricId;
-            defaultPort.portId.attachId = testPortId.attachId;
-            defaultPort.portId.portNumber = testPortId.portNumber;
-            defaultPort.model = "XeLink";
-            defaultPort.maxRxSpeed.width = 4;
-            defaultPort.maxRxSpeed.bitRate = 53125000000;
-            defaultPort.maxTxSpeed = defaultPort.maxRxSpeed;
-
-            ports.push_back(defaultPort);
-            defaultPort.portId.fabricId = testPortId.fabricId + 1;
-            defaultPort.portId.attachId = testPortId.attachId + 1;
-            defaultPort.portId.portNumber = testPortId.portNumber + 1;
-            ports.push_back(defaultPort);
-            defaultPort.portId.fabricId = testPortId.fabricId + 2;
-            defaultPort.portId.attachId = testPortId.attachId;
-            defaultPort.portId.portNumber = testPortId.portNumber + 2;
-            ports.push_back(defaultPort);
-        }
-
-        return getPortsStatus;
-    };
-
-    IafPortId testPortId = {};
-};
-
 struct TestFabricIaf : public ::testing::Test {
     void SetUp() override {
-        DebugManager.flags.CreateMultipleSubDevices.set(1);
+        debugManager.flags.CreateMultipleSubDevices.set(1);
         executionEnvironment = new NEO::ExecutionEnvironment();
         executionEnvironment->prepareRootDeviceEnvironments(1);
         executionEnvironment->rootDeviceEnvironments[0]->setHwInfoAndInitHelpers(defaultHwInfo.get());
@@ -115,24 +49,24 @@ struct TestFabricIaf : public ::testing::Test {
     OSInterface *osInterface = nullptr;
     NEO::MockDevice *neoDevice = nullptr;
     DrmMockResources *drmMock = nullptr;
-    L0::DriverHandleImp *driverHandle = nullptr;
+    L0::DriverHandle *driverHandle = nullptr;
 };
 
 TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenFabricVerticesAreCreatedThenEnumerationIsSuccessful) {
 
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
 
-    auto deviceImp = static_cast<DeviceImp *>(driverHandle->devices[0]);
+    auto device = driverHandle->devices[0];
 
-    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(device);
     subDeviceFabric->setIafNlApi(new MockIafNlApi());
     EXPECT_EQ(ZE_RESULT_SUCCESS, subDeviceFabric->enumerate());
     delete subDeviceFabric;
 
-    FabricDeviceIaf *deviceFabric = new FabricDeviceIaf(deviceImp);
+    FabricDeviceIaf *deviceFabric = new FabricDeviceIaf(device);
     deviceFabric->subDeviceIafs[0]->setIafNlApi(new MockIafNlApi());
     EXPECT_EQ(ZE_RESULT_SUCCESS, deviceFabric->enumerate());
     delete deviceFabric;
@@ -142,12 +76,12 @@ TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenPortStatusQueryIsUnsuccessfulTh
 
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
 
-    auto deviceImp = static_cast<DeviceImp *>(driverHandle->devices[0]);
+    auto device = driverHandle->devices[0];
 
-    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(device);
     MockIafNlApi *mockNlApi = new MockIafNlApi();
     mockNlApi->fPortStatusQueryStatus = ZE_RESULT_ERROR_UNKNOWN;
     subDeviceFabric->setIafNlApi(mockNlApi);
@@ -155,7 +89,7 @@ TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenPortStatusQueryIsUnsuccessfulTh
     EXPECT_EQ(subDeviceFabric->connections.size(), 0u);
     delete subDeviceFabric;
 
-    subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    subDeviceFabric = new FabricSubDeviceIaf(device);
     mockNlApi = new MockIafNlApi();
     mockNlApi->fPortStatusQueryStatus = ZE_RESULT_SUCCESS;
     mockNlApi->fPortStatusQueryHealthStatus = IAF_FPORT_HEALTH_DEGRADED;
@@ -169,12 +103,12 @@ TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenPortPropertiesQueryIsUnsuccessf
 
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
 
-    auto deviceImp = static_cast<DeviceImp *>(driverHandle->devices[0]);
+    auto device = driverHandle->devices[0];
 
-    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(device);
     MockIafNlApi *mockNlApi = new MockIafNlApi();
     mockNlApi->fportPropertiesStatus = ZE_RESULT_ERROR_UNKNOWN;
     subDeviceFabric->setIafNlApi(mockNlApi);
@@ -187,12 +121,12 @@ TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenSubDevicePropertiesGetIsUnsucce
 
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
 
-    auto deviceImp = static_cast<DeviceImp *>(driverHandle->devices[0]);
+    auto device = driverHandle->devices[0];
 
-    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(device);
     MockIafNlApi *mockNlApi = new MockIafNlApi();
     mockNlApi->subDevicePropertiesStatus = ZE_RESULT_ERROR_UNKNOWN;
     subDeviceFabric->setIafNlApi(mockNlApi);
@@ -204,12 +138,12 @@ TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenNoPortsCanBeEnumeratedThenRetur
 
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
 
-    auto deviceImp = static_cast<DeviceImp *>(driverHandle->devices[0]);
+    auto device = driverHandle->devices[0];
 
-    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(device);
     MockIafNlApi *mockNlApi = new MockIafNlApi();
     mockNlApi->portEnumerationEnable = false;
     subDeviceFabric->setIafNlApi(mockNlApi);
@@ -220,11 +154,11 @@ TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenNoPortsCanBeEnumeratedThenRetur
 TEST_F(TestFabricIaf, GivenIafFabricAvailableWhenGetPortsReturnsErrorThenReturnError) {
     NEO::DeviceVector devices;
     devices.push_back(std::unique_ptr<NEO::Device>(neoDevice));
-    std::unique_ptr<Mock<L0::DriverHandleImp>> driverHandle = std::make_unique<Mock<L0::DriverHandleImp>>();
+    std::unique_ptr<Mock<L0::DriverHandle>> driverHandle = std::make_unique<Mock<L0::DriverHandle>>();
     driverHandle->initialize(std::move(devices));
-    auto deviceImp = static_cast<DeviceImp *>(driverHandle->devices[0]);
+    auto device = driverHandle->devices[0];
 
-    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(deviceImp);
+    FabricSubDeviceIaf *subDeviceFabric = new FabricSubDeviceIaf(device);
     MockIafNlApi *mockNlApi = new MockIafNlApi();
     mockNlApi->getPortsStatus = ZE_RESULT_ERROR_UNKNOWN;
     subDeviceFabric->setIafNlApi(mockNlApi);
@@ -254,6 +188,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
         auto osInterface = new OSInterface();
         auto drmMock = new DrmMockResources(*rootDeviceEnvironment);
         drmMock->ioctlHelper.reset(new MockIoctlHelperIafTest(*drmMock));
+        drmMock->drmFabric = std::make_unique<NEO::DrmFabricStub>();
         rootDeviceEnvironment->osInterface.reset(osInterface);
         executionEnvironment->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface->setDriverModel(std::unique_ptr<Drm>(drmMock));
     }
@@ -364,7 +299,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
 
     auto &fabricVertex0 = driverHandle->fabricVertices[0];
     {
-        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex0->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex0->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         auto &fabricSubDeviceIaf0 = fabricDeviceIaf->subDeviceIafs[0];
         fabricSubDeviceIaf0->connections.clear();
         fabricSubDeviceIaf0->connections = connection00To10;
@@ -377,13 +312,13 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
 
         // SubVertices
         auto &fabricVertex00 = fabricVertex0->subVertices[0];
-        auto fabricSubDeviceIaf00 = static_cast<FabricSubDeviceIaf *>(fabricVertex00->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricSubDeviceIaf00 = static_cast<FabricSubDeviceIaf *>(fabricVertex00->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         fabricSubDeviceIaf00->connections.clear();
         fabricSubDeviceIaf00->connections = connection00To10;
         fabricSubDeviceIaf00->guid = 0xA;
 
         auto &fabricVertex01 = fabricVertex0->subVertices[1];
-        auto fabricSubDeviceIaf01 = static_cast<FabricSubDeviceIaf *>(fabricVertex01->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricSubDeviceIaf01 = static_cast<FabricSubDeviceIaf *>(fabricVertex01->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         fabricSubDeviceIaf01->connections.clear();
         fabricSubDeviceIaf01->connections = connection01To11;
         fabricSubDeviceIaf01->guid = 0xAB;
@@ -391,7 +326,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
 
     auto fabricVertex1 = static_cast<FabricVertex *>(driverHandle->fabricVertices[1]);
     {
-        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex1->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex1->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         auto &fabricSubDeviceIaf0 = fabricDeviceIaf->subDeviceIafs[0];
         fabricSubDeviceIaf0->connections.clear();
         fabricSubDeviceIaf0->connections = connection10To00;
@@ -404,13 +339,13 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
 
         // SubVertices
         auto &fabricVertex00 = fabricVertex1->subVertices[0];
-        auto fabricSubDeviceIaf00 = static_cast<FabricSubDeviceIaf *>(fabricVertex00->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricSubDeviceIaf00 = static_cast<FabricSubDeviceIaf *>(fabricVertex00->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         fabricSubDeviceIaf00->connections.clear();
         fabricSubDeviceIaf00->connections = connection10To00;
         fabricSubDeviceIaf00->guid = 0xABC;
 
         auto &fabricVertex01 = fabricVertex1->subVertices[1];
-        auto fabricSubDeviceIaf01 = static_cast<FabricSubDeviceIaf *>(fabricVertex01->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricSubDeviceIaf01 = static_cast<FabricSubDeviceIaf *>(fabricVertex01->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         fabricSubDeviceIaf01->connections.clear();
         fabricSubDeviceIaf01->connections = connection11To01;
         fabricSubDeviceIaf01->guid = 0xABCD;
@@ -420,7 +355,11 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
         delete edge;
     }
     driverHandle->fabricEdges.clear();
-    FabricEdge::createEdgesFromVertices(driverHandle->fabricVertices, driverHandle->fabricEdges);
+    for (auto &edge : driverHandle->fabricIndirectEdges) {
+        delete edge;
+    }
+    driverHandle->fabricIndirectEdges.clear();
+    FabricEdge::createEdgesFromVertices(driverHandle->fabricVertices, driverHandle->fabricEdges, driverHandle->fabricIndirectEdges);
 
     constexpr uint32_t root2root = 1;
     constexpr uint32_t subDevice2root = 4;          // 2 root to 2 sub-devices each
@@ -429,11 +368,12 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(static_cast<uint32_t>(driverHandle->fabricEdges.size()), root2root + subDevice2root + subDevice2SubDevice);
 
     count = 0;
-    std::vector<ze_fabric_edge_handle_t> edges(30);
+    std::vector<ze_fabric_edge_handle_t> edges;
 
     // Root to Root Connection
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->toHandle(), fabricVertex0->toHandle(), &count, nullptr));
     EXPECT_EQ(count, 1u);
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->toHandle(), fabricVertex0->toHandle(), &count, edges.data()));
     ze_fabric_vertex_handle_t vertexA = nullptr, vertexB = nullptr;
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetVerticesExp(edges[0], &vertexA, &vertexB));
@@ -453,7 +393,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->toHandle(), fabricVertex1->subVertices[0], &count, nullptr));
     EXPECT_EQ(count, 1u);
-    edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->toHandle(), fabricVertex1->subVertices[0], &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 2u);
@@ -465,6 +405,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->toHandle(), fabricVertex1->subVertices[1], &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->toHandle(), fabricVertex1->subVertices[1], &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 2u);
@@ -477,6 +418,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->subVertices[0], fabricVertex1->toHandle(), &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->subVertices[0], fabricVertex1->toHandle(), &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 2u);
@@ -488,6 +430,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->subVertices[1], fabricVertex1->toHandle(), &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->subVertices[1], fabricVertex1->toHandle(), &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 2u);
@@ -498,6 +441,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->subVertices[0], fabricVertex0->subVertices[1], &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex0->subVertices[0], fabricVertex0->subVertices[1], &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 0u);
@@ -511,6 +455,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->subVertices[0], fabricVertex1->subVertices[1], &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->subVertices[0], fabricVertex1->subVertices[1], &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_STREQ(edgeProperties.model, "MDFI");
@@ -519,6 +464,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->subVertices[0], fabricVertex0->subVertices[0], &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->subVertices[0], fabricVertex0->subVertices[0], &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 2u);
@@ -530,6 +476,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenCreatingEdgesT
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->subVertices[1], fabricVertex0->subVertices[1], &count, nullptr));
     EXPECT_EQ(count, 1u);
     edges.clear();
+    edges.resize(count);
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetExp(fabricVertex1->subVertices[1], fabricVertex0->subVertices[1], &count, edges.data()));
     EXPECT_EQ(ZE_RESULT_SUCCESS, L0::zeFabricEdgeGetPropertiesExp(edges[0], &edgeProperties));
     EXPECT_EQ(edgeProperties.bandwidth, 2u);
@@ -547,6 +494,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenLatencyRequest
         auto mockIoctlHelper = new MockIoctlHelperIafTest(*drmMock);
         mockIoctlHelper->mockFabricLatencyReturn = false;
         drmMock->ioctlHelper.reset(mockIoctlHelper);
+        drmMock->drmFabric = std::make_unique<NEO::DrmFabricStub>();
         rootDeviceEnvironment->osInterface.reset(osInterface);
         executionEnvironment->rootDeviceEnvironments[device->getRootDeviceIndex()]->osInterface->setDriverModel(std::unique_ptr<Drm>(drmMock));
     }
@@ -588,7 +536,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenLatencyRequest
 
     auto &fabricVertex0 = driverHandle->fabricVertices[0];
     {
-        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex0->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex0->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         auto &fabricSubDeviceIaf0 = fabricDeviceIaf->subDeviceIafs[0];
         fabricSubDeviceIaf0->connections.clear();
         fabricSubDeviceIaf0->connections = connection00To10;
@@ -597,7 +545,7 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenLatencyRequest
 
     auto fabricVertex1 = static_cast<FabricVertex *>(driverHandle->fabricVertices[1]);
     {
-        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex1->pFabricDeviceInterfaces[FabricDeviceInterface::Type::Iaf].get());
+        auto fabricDeviceIaf = static_cast<FabricDeviceIaf *>(fabricVertex1->pFabricDeviceInterfaces[FabricDeviceInterface::Type::iaf].get());
         auto &fabricSubDeviceIaf0 = fabricDeviceIaf->subDeviceIafs[0];
         fabricSubDeviceIaf0->connections.clear();
         fabricSubDeviceIaf0->connections = connection10To00;
@@ -608,7 +556,11 @@ TEST_F(FabricIafEdgeFixture, GivenMultipleDevicesAndSubDevicesWhenLatencyRequest
         delete edge;
     }
     driverHandle->fabricEdges.clear();
-    FabricEdge::createEdgesFromVertices(driverHandle->fabricVertices, driverHandle->fabricEdges);
+    for (auto &edge : driverHandle->fabricIndirectEdges) {
+        delete edge;
+    }
+    driverHandle->fabricIndirectEdges.clear();
+    FabricEdge::createEdgesFromVertices(driverHandle->fabricVertices, driverHandle->fabricEdges, driverHandle->fabricIndirectEdges);
     count = 0;
     std::vector<ze_fabric_edge_handle_t> edges(30);
 

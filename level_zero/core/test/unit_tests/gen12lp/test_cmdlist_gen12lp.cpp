@@ -1,41 +1,41 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/gmm_helper/gmm_helper.h"
-#include "shared/source/helpers/register_offsets.h"
-#include "shared/source/helpers/state_base_address.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
-#include "level_zero/core/source/gen12lp/cmdlist_gen12lp.h"
+#include "level_zero/core/source/context/context.h"
 #include "level_zero/core/test/unit_tests/fixtures/cmdlist_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_cmdqueue.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_kernel.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_module.h"
 
 namespace L0 {
 namespace ult {
 
-using CommandListCreate = Test<DeviceFixture>;
+using CommandListCreateGen12Lp = Test<DeviceFixture>;
 
-template <PRODUCT_FAMILY productFamily>
-struct CommandListAdjustStateComputeMode : public WhiteBox<::L0::CommandListProductFamily<productFamily>> {
-    CommandListAdjustStateComputeMode() : WhiteBox<::L0::CommandListProductFamily<productFamily>>(1) {}
-    using ::L0::CommandListProductFamily<productFamily>::applyMemoryRangesBarrier;
-    using ::L0::CommandListProductFamily<productFamily>::commandContainer;
+template <GFXCORE_FAMILY gfxCoreFamily>
+struct CommandListAdjustStateComputeMode : public WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>> {
+    CommandListAdjustStateComputeMode() : WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>() {}
+    using ::L0::CommandListCoreFamily<gfxCoreFamily>::applyMemoryRangesBarrier;
+    using ::L0::CommandListCoreFamily<gfxCoreFamily>::commandContainer;
 };
 
-HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierThenCheckWhetherL3ControlIsProgrammed, IsGen12LP) {
-    using GfxFamily = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using L3_CONTROL = typename GfxFamily::L3_CONTROL;
+HWTEST2_F(CommandListCreateGen12Lp, givenAllocationsWhenApplyRangesBarrierThenCheckWhetherL3ControlIsProgrammed, IsGen12LP) {
+
+    using L3_CONTROL = typename FamilyType::L3_CONTROL;
     auto &hardwareInfo = this->neoDevice->getHardwareInfo();
-    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    commandList->initialize(device, NEO::EngineGroupType::Copy, 0u);
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    commandList->initialize(device, NEO::EngineGroupType::copy, 0u);
     uint64_t gpuAddress = 0x1200;
     void *buffer = reinterpret_cast<void *>(gpuAddress);
     size_t size = 0x1100;
@@ -49,7 +49,7 @@ HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierThenCheckWhet
     const size_t sizes[] = {size};
     commandList->applyMemoryRangesBarrier(1, sizes, ranges);
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->commandContainer.getCommandStream()->getCpuBase(), 0), commandList->commandContainer.getCommandStream()->getUsed()));
     auto itor = find<L3_CONTROL *>(cmdList.begin(), cmdList.end());
     if (hardwareInfo.capabilityTable.supportCacheFlushAfterWalker) {
@@ -59,7 +59,7 @@ HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierThenCheckWhet
     }
 }
 
-HWTEST2_F(CommandListCreate, GivenNullptrWaitEventsArrayAndCountGreaterThanZeroWhenAppendingMemoryBarrierThenInvalidArgumentErrorIsReturned,
+HWTEST2_F(CommandListCreateGen12Lp, GivenNullptrWaitEventsArrayAndCountGreaterThanZeroWhenAppendingMemoryBarrierThenInvalidArgumentErrorIsReturned,
           IsDG1) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     uint32_t numRanges = 1;
@@ -67,22 +67,29 @@ HWTEST2_F(CommandListCreate, GivenNullptrWaitEventsArrayAndCountGreaterThanZeroW
     const char *ranges[pRangeSizes];
     const void **pRanges = reinterpret_cast<const void **>(&ranges[0]);
 
-    auto commandList = new CommandListAdjustStateComputeMode<productFamily>();
-    bool ret = commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandList = new CommandListAdjustStateComputeMode<FamilyType::gfxCoreFamily>();
+    bool ret = commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_FALSE(ret);
 
     uint32_t numWaitEvents{1};
     ze_event_handle_t *phWaitEvents{nullptr};
-
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
     result = commandList->appendMemoryRangesBarrier(numRanges, &pRangeSizes,
                                                     pRanges, nullptr, numWaitEvents,
-                                                    phWaitEvents);
+                                                    phWaitEvents, waitEventsParameters);
     EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
 
     commandList->destroy();
 }
 
-HWTEST2_F(CommandListCreate, GivenImmediateListAndExecutionSuccessWhenAppendingMemoryBarrierThenExecuteCommandListImmediateCalledAndSuccessReturned,
+HWTEST2_F(CommandListCreateGen12Lp, GivenImmediateListAndExecutionSuccessWhenAppendingMemoryBarrierThenExecuteCommandListImmediateCalledAndSuccessReturned,
           IsDG1) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     uint32_t numRanges = 1;
@@ -90,21 +97,32 @@ HWTEST2_F(CommandListCreate, GivenImmediateListAndExecutionSuccessWhenAppendingM
     const char *rangesBuffer[rangeSizes];
     const void **ranges = reinterpret_cast<const void **>(&rangesBuffer[0]);
 
-    auto cmdList = new MockCommandListImmediateHw<gfxCoreFamily>;
-    cmdList->cmdListType = CommandList::CommandListType::TYPE_IMMEDIATE;
-    cmdList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
-    cmdList->executeCommandListImmediateReturnValue = ZE_RESULT_SUCCESS;
+    ze_command_queue_desc_t queueDesc = {};
+    auto queue = std::make_unique<Mock<CommandQueue>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
 
+    auto cmdList = new MockCommandListImmediateHw<FamilyType::gfxCoreFamily>;
+    cmdList->cmdListType = CommandList::CommandListType::typeImmediate;
+    cmdList->cmdQImmediate = queue.get();
+    cmdList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+    cmdList->executeCommandListImmediateWithFlushTaskReturnValue = ZE_RESULT_SUCCESS;
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
     result = cmdList->appendMemoryRangesBarrier(numRanges, &rangeSizes,
                                                 ranges, nullptr, 0,
-                                                nullptr);
-    EXPECT_EQ(1u, cmdList->executeCommandListImmediateCalledCount);
+                                                nullptr, waitEventsParameters);
+    EXPECT_EQ(1u, cmdList->executeCommandListImmediateWithFlushTaskCalledCount);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     cmdList->destroy();
 }
 
-HWTEST2_F(CommandListCreate, GivenImmediateListAndGpuFailureWhenAppendingMemoryBarrierThenExecuteCommandListImmediateCalledAndDeviceLostReturned,
+HWTEST2_F(CommandListCreateGen12Lp, GivenImmediateListAndGpuFailureWhenAppendingMemoryBarrierThenExecuteCommandListImmediateCalledAndDeviceLostReturned,
           IsDG1) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     uint32_t numRanges = 1;
@@ -112,21 +130,32 @@ HWTEST2_F(CommandListCreate, GivenImmediateListAndGpuFailureWhenAppendingMemoryB
     const char *rangesBuffer[rangeSizes];
     const void **ranges = reinterpret_cast<const void **>(&rangesBuffer[0]);
 
-    auto cmdList = new MockCommandListImmediateHw<gfxCoreFamily>;
-    cmdList->cmdListType = CommandList::CommandListType::TYPE_IMMEDIATE;
-    cmdList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
-    cmdList->executeCommandListImmediateReturnValue = ZE_RESULT_ERROR_DEVICE_LOST;
+    ze_command_queue_desc_t queueDesc = {};
+    auto queue = std::make_unique<Mock<CommandQueue>>(device, device->getNEODevice()->getDefaultEngine().commandStreamReceiver, &queueDesc);
 
+    auto cmdList = new MockCommandListImmediateHw<FamilyType::gfxCoreFamily>;
+    cmdList->cmdListType = CommandList::CommandListType::typeImmediate;
+    cmdList->cmdQImmediate = queue.get();
+    cmdList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
+    cmdList->executeCommandListImmediateWithFlushTaskReturnValue = ZE_RESULT_ERROR_DEVICE_LOST;
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
     result = cmdList->appendMemoryRangesBarrier(numRanges, &rangeSizes,
                                                 ranges, nullptr, 0,
-                                                nullptr);
-    EXPECT_EQ(1u, cmdList->executeCommandListImmediateCalledCount);
+                                                nullptr, waitEventsParameters);
+    EXPECT_EQ(1u, cmdList->executeCommandListImmediateWithFlushTaskCalledCount);
     EXPECT_EQ(ZE_RESULT_ERROR_DEVICE_LOST, result);
 
     cmdList->destroy();
 }
 
-HWTEST2_F(CommandListCreate, GivenHostMemoryNotInSvmManagerWhenAppendingMemoryBarrierThenAdditionalCommandsNotAdded,
+HWTEST2_F(CommandListCreateGen12Lp, GivenHostMemoryNotInSvmManagerWhenAppendingMemoryBarrierThenAdditionalCommandsNotAdded,
           IsDG1) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     uint32_t numRanges = 1;
@@ -134,15 +163,23 @@ HWTEST2_F(CommandListCreate, GivenHostMemoryNotInSvmManagerWhenAppendingMemoryBa
     const char *ranges[pRangeSizes];
     const void **pRanges = reinterpret_cast<const void **>(&ranges[0]);
 
-    auto commandList = new CommandListAdjustStateComputeMode<productFamily>();
-    bool ret = commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandList = new CommandListAdjustStateComputeMode<FamilyType::gfxCoreFamily>();
+    bool ret = commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_FALSE(ret);
 
     auto usedSpaceBefore =
         commandList->commandContainer.getCommandStream()->getUsed();
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
     result = commandList->appendMemoryRangesBarrier(numRanges, &pRangeSizes,
                                                     pRanges, nullptr, 0,
-                                                    nullptr);
+                                                    nullptr, waitEventsParameters);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter =
@@ -153,7 +190,7 @@ HWTEST2_F(CommandListCreate, GivenHostMemoryNotInSvmManagerWhenAppendingMemoryBa
     commandList->destroy();
 }
 
-HWTEST2_F(CommandListCreate, GivenHostMemoryInSvmManagerWhenAppendingMemoryBarrierThenL3CommandsAdded,
+HWTEST2_F(CommandListCreateGen12Lp, GivenHostMemoryInSvmManagerWhenAppendingMemoryBarrierThenL3CommandsAdded,
           IsDG1) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     uint32_t numRanges = 1;
@@ -169,22 +206,30 @@ HWTEST2_F(CommandListCreate, GivenHostMemoryInSvmManagerWhenAppendingMemoryBarri
 
     const void **pRanges = const_cast<const void **>(&ranges);
 
-    auto commandList = new CommandListAdjustStateComputeMode<productFamily>();
-    bool ret = commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandList = new CommandListAdjustStateComputeMode<FamilyType::gfxCoreFamily>();
+    bool ret = commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_FALSE(ret);
 
     auto usedSpaceBefore =
         commandList->commandContainer.getCommandStream()->getUsed();
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
     result = commandList->appendMemoryRangesBarrier(numRanges, &pRangeSizes,
                                                     pRanges, nullptr, 0,
-                                                    nullptr);
+                                                    nullptr, waitEventsParameters);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     auto usedSpaceAfter =
         commandList->commandContainer.getCommandStream()->getUsed();
     ASSERT_NE(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(
             commandList->commandContainer.getCommandStream()->getCpuBase(), 0),
@@ -212,7 +257,7 @@ HWTEST2_F(CommandListCreate, GivenHostMemoryInSvmManagerWhenAppendingMemoryBarri
     context->freeMem(ranges);
 }
 
-HWTEST2_F(CommandListCreate, GivenHostMemoryWhenAppendingMemoryBarrierThenAddressMisalignmentCorrected,
+HWTEST2_F(CommandListCreateGen12Lp, GivenHostMemoryWhenAppendingMemoryBarrierThenAddressMisalignmentCorrected,
           IsDG1) {
     ze_result_t result = ZE_RESULT_SUCCESS;
     uint32_t numRanges = 1;
@@ -232,22 +277,30 @@ HWTEST2_F(CommandListCreate, GivenHostMemoryWhenAppendingMemoryBarrierThenAddres
     ranges = static_cast<void *>(cPRanges);
     const void **pRanges = const_cast<const void **>(&ranges);
 
-    auto commandList = new CommandListAdjustStateComputeMode<productFamily>();
-    bool ret = commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandList = new CommandListAdjustStateComputeMode<FamilyType::gfxCoreFamily>();
+    bool ret = commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_FALSE(ret);
 
     auto usedSpaceBefore =
         commandList->commandContainer.getCommandStream()->getUsed();
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
     result = commandList->appendMemoryRangesBarrier(numRanges, &pRangeSizes,
                                                     pRanges, nullptr, 0,
-                                                    nullptr);
+                                                    nullptr, waitEventsParameters);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     auto usedSpaceAfter =
         commandList->commandContainer.getCommandStream()->getUsed();
     ASSERT_NE(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(
             commandList->commandContainer.getCommandStream()->getCpuBase(), 0),
@@ -276,9 +329,9 @@ HWTEST2_F(CommandListCreate, GivenHostMemoryWhenAppendingMemoryBarrierThenAddres
     context->freeMem(ranges);
 }
 
-HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierWithInvalidAddressSizeThenL3ControlIsNotProgrammed, IsDG1) {
-    using GfxFamily = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using L3_CONTROL = typename GfxFamily::L3_CONTROL;
+HWTEST2_F(CommandListCreateGen12Lp, givenAllocationsWhenApplyRangesBarrierWithInvalidAddressSizeThenL3ControlIsNotProgrammed, IsDG1) {
+
+    using L3_CONTROL = typename FamilyType::L3_CONTROL;
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     const size_t pRangeSizes = 4096;
@@ -291,27 +344,25 @@ HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierWithInvalidAd
                                      &ranges);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    auto commandList = new CommandListAdjustStateComputeMode<productFamily>();
-    ASSERT_NE(nullptr, commandList); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
-    bool ret = commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandList = std::make_unique<CommandListAdjustStateComputeMode<FamilyType::gfxCoreFamily>>();
+    bool ret = commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_FALSE(ret);
 
     const void *pRanges[] = {ranges};
     const size_t sizes[] = {2 * pRangeSizes};
     commandList->applyMemoryRangesBarrier(1, sizes, pRanges);
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->commandContainer.getCommandStream()->getCpuBase(), 0), commandList->commandContainer.getCommandStream()->getUsed()));
     auto itor = find<L3_CONTROL *>(cmdList.begin(), cmdList.end());
     EXPECT_EQ(cmdList.end(), itor);
 
-    commandList->destroy();
     context->freeMem(ranges);
 }
 
-HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierWithInvalidAddressThenL3ControlIsNotProgrammed, IsDG1) {
-    using GfxFamily = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using L3_CONTROL = typename GfxFamily::L3_CONTROL;
+HWTEST2_F(CommandListCreateGen12Lp, givenAllocationsWhenApplyRangesBarrierWithInvalidAddressThenL3ControlIsNotProgrammed, IsDG1) {
+
+    using L3_CONTROL = typename FamilyType::L3_CONTROL;
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     const size_t pRangeSizes = 4096;
@@ -324,21 +375,19 @@ HWTEST2_F(CommandListCreate, givenAllocationsWhenApplyRangesBarrierWithInvalidAd
                                      &ranges);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    auto commandList = new CommandListAdjustStateComputeMode<productFamily>();
-    ASSERT_NE(nullptr, commandList); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
-    bool ret = commandList->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandList = std::make_unique<CommandListAdjustStateComputeMode<FamilyType::gfxCoreFamily>>();
+    bool ret = commandList->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_FALSE(ret);
 
     const void *pRanges[] = {nullptr};
     const size_t sizes[] = {pRangeSizes};
     commandList->applyMemoryRangesBarrier(1, sizes, pRanges);
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->commandContainer.getCommandStream()->getCpuBase(), 0), commandList->commandContainer.getCommandStream()->getUsed()));
     auto itor = find<L3_CONTROL *>(cmdList.begin(), cmdList.end());
     EXPECT_EQ(cmdList.end(), itor);
 
-    commandList->destroy();
     context->freeMem(ranges);
 }
 
@@ -358,12 +407,10 @@ GEN12LPTEST_F(CommandListGen12LpStateComputeModeTrackingTest,
     auto &cmdListFinalState = commandList->getFinalStreamState();
     auto &commandListStream = *commandList->commandContainer.getCommandStream();
 
-    EXPECT_EQ(-1, cmdlistRequiredState.stateComputeMode.devicePreemptionMode.value);
     EXPECT_EQ(-1, cmdlistRequiredState.stateComputeMode.isCoherencyRequired.value);
     EXPECT_EQ(-1, cmdlistRequiredState.stateComputeMode.largeGrfMode.value);
     EXPECT_EQ(-1, cmdlistRequiredState.stateComputeMode.threadArbitrationPolicy.value);
 
-    EXPECT_EQ(-1, cmdListFinalState.stateComputeMode.devicePreemptionMode.value);
     EXPECT_EQ(-1, cmdListFinalState.stateComputeMode.isCoherencyRequired.value);
     EXPECT_EQ(-1, cmdListFinalState.stateComputeMode.largeGrfMode.value);
     EXPECT_EQ(-1, cmdListFinalState.stateComputeMode.threadArbitrationPolicy.value);
@@ -377,30 +424,16 @@ GEN12LPTEST_F(CommandListGen12LpStateComputeModeTrackingTest,
     size_t sizeAfter = 0;
     auto result = ZE_RESULT_SUCCESS;
 
-    mockKernelImmData->kernelDescriptor->kernelAttributes.numGrfRequired = GrfConfig::DefaultGrfNumber;
-    mockKernelImmData->kernelDescriptor->kernelAttributes.threadArbitrationPolicy = NEO::ThreadArbitrationPolicy::RoundRobin;
+    mockKernelImmData->kernelDescriptor->kernelAttributes.numGrfRequired = GrfConfig::defaultGrfNumber;
+    kernel->privateState.threadArbitrationPolicy = NEO::ThreadArbitrationPolicy::RoundRobin;
 
     sizeBefore = commandListStream.getUsed();
-    result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     sizeAfter = commandListStream.getUsed();
 
-    if (scmPropertiesSupport.devicePreemptionMode) {
-        int32_t expectedPreemption = static_cast<int32_t>(device->getDevicePreemptionMode());
-        EXPECT_EQ(expectedPreemption, cmdlistRequiredState.stateComputeMode.devicePreemptionMode.value);
-        EXPECT_EQ(expectedPreemption, cmdListFinalState.stateComputeMode.devicePreemptionMode.value);
-    } else {
-        EXPECT_EQ(-1, cmdlistRequiredState.stateComputeMode.devicePreemptionMode.value);
-        EXPECT_EQ(-1, cmdListFinalState.stateComputeMode.devicePreemptionMode.value);
-    }
-
-    if (scmPropertiesSupport.coherencyRequired) {
-        EXPECT_EQ(0, cmdlistRequiredState.stateComputeMode.isCoherencyRequired.value);
-        EXPECT_EQ(0, cmdListFinalState.stateComputeMode.isCoherencyRequired.value);
-    } else {
-        EXPECT_EQ(-1, cmdlistRequiredState.stateComputeMode.isCoherencyRequired.value);
-        EXPECT_EQ(-1, cmdListFinalState.stateComputeMode.isCoherencyRequired.value);
-    }
+    EXPECT_EQ(0, cmdlistRequiredState.stateComputeMode.isCoherencyRequired.value);
+    EXPECT_EQ(0, cmdListFinalState.stateComputeMode.isCoherencyRequired.value);
 
     if (scmPropertiesSupport.largeGrfMode) {
         EXPECT_EQ(0, cmdlistRequiredState.stateComputeMode.largeGrfMode.value);
@@ -419,11 +452,29 @@ GEN12LPTEST_F(CommandListGen12LpStateComputeModeTrackingTest,
     }
 
     auto currentBuffer = ptrOffset(commandListStream.getCpuBase(), sizeBefore);
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList,
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList,
                                                       currentBuffer,
                                                       (sizeAfter - sizeBefore)));
     stateComputeModeList = findAll<STATE_COMPUTE_MODE *>(cmdList.begin(), cmdList.end());
     ASSERT_NE(0u, stateComputeModeList.size());
+}
+
+HWTEST2_F(CommandListCreateGen12Lp, givenKernelUsingSyncBufferWhenAppendingNonCooperativeLaunchThenSuccessIsReturnedAndSyncBufferIsNotCreated, IsGen12LP) {
+    Mock<::L0::KernelImp> kernel;
+    auto pMockModule = std::unique_ptr<Module>(new Mock<Module>(device, nullptr));
+    kernel.module = pMockModule.get();
+    kernel.immutableData.kernelDescriptor->kernelAttributes.flags.usesSyncBuffer = true;
+    kernel.setGroupSize(4, 1, 1);
+    ze_group_count_t groupCount{8, 1, 1};
+
+    auto commandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    commandList->initialize(device, NEO::EngineGroupType::compute, 0u);
+    CmdListKernelLaunchParams launchParams = {};
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams));
+    EXPECT_EQ(std::numeric_limits<size_t>::max(), kernel.getSyncBufferIndex());
+    EXPECT_EQ(nullptr, kernel.getSyncBufferAllocation());
+    EXPECT_EQ(nullptr, device->getNEODevice()->syncBufferHandler.get());
 }
 
 } // namespace ult

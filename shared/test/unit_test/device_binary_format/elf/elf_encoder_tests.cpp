@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,10 @@
 
 #include "shared/source/device_binary_format/elf/elf_encoder.h"
 #include "shared/source/helpers/aligned_memory.h"
-#include "shared/source/utilities/range.h"
+#include "shared/test/common/mocks/mock_elf.h"
 #include "shared/test/common/test_macros/test.h"
+
+#include <span>
 
 using namespace NEO::Elf;
 
@@ -268,6 +270,34 @@ TEST(ElfEncoder, WhenAppendingSegmentWithDataThenOffsetsAreProperlyUpdated) {
     EXPECT_EQ(0, memcmp(data, segLoadBitsData, sizeof(data)));
 }
 
+TEST(ElfEncoder, WhenAppendingManySectionsThenDataIsNotReallocatedOnEveryAppend) {
+    MockElfEncoder<EI_CLASS_64> elfEncoder64;
+    const uint8_t data[64] = {};
+    constexpr uint32_t numAppends = 64;
+    uint32_t reallocations = 0;
+    for (uint32_t i = 0; i < numAppends; i++) {
+        auto dataBefore = elfEncoder64.data.data();
+        elfEncoder64.appendSection(SHT_PROGBITS, ".data", data);
+        reallocations += (dataBefore != elfEncoder64.data.data()) ? 1 : 0;
+    }
+    EXPECT_EQ(numAppends * sizeof(data), elfEncoder64.data.size());
+    EXPECT_LT(reallocations, numAppends / 4);
+}
+
+TEST(ElfEncoder, WhenAppendingManySegmentsThenDataIsNotReallocatedOnEveryAppend) {
+    MockElfEncoder<EI_CLASS_64> elfEncoder64;
+    const uint8_t data[64] = {};
+    constexpr uint32_t numAppends = 64;
+    uint32_t reallocations = 0;
+    for (uint32_t i = 0; i < numAppends; i++) {
+        auto dataBefore = elfEncoder64.data.data();
+        elfEncoder64.appendSegment(PT_LOAD, data);
+        reallocations += (dataBefore != elfEncoder64.data.data()) ? 1 : 0;
+    }
+    EXPECT_EQ(numAppends * sizeof(data), elfEncoder64.data.size());
+    EXPECT_LT(reallocations, numAppends / 4);
+}
+
 TEST(ElfEncoder, WhenAppendingSegmentWithoutDataThenOffsetsAreLeftIntact) {
     ElfEncoder<EI_CLASS_64> elfEncoder64(false, false);
     elfEncoder64.appendSegment(PT_LOAD, {});
@@ -401,10 +431,10 @@ TEST(ElfEncoder, WhenDefaultAlignmentIsRaisedThenSegmentDataAbideByIt) {
     auto &header64 = *reinterpret_cast<ElfFileHeader<EI_CLASS_64> *>(elfData64.data());
     auto sectionHeaders = reinterpret_cast<NEO::Elf::ElfSectionHeader<EI_CLASS_64> *>(elfData64.data() + static_cast<size_t>(header64.shOff));
     auto programHeaders = reinterpret_cast<NEO::Elf::ElfProgramHeader<EI_CLASS_64> *>(elfData64.data() + static_cast<size_t>(header64.phOff));
-    for (const auto &section : NEO::createRange(sectionHeaders, header64.shNum)) {
+    for (const auto &section : std::span(sectionHeaders, header64.shNum)) {
         EXPECT_EQ(0U, section.offset % 8U);
     }
-    for (const auto &segment : NEO::createRange(programHeaders, header64.phNum)) {
+    for (const auto &segment : std::span(programHeaders, header64.phNum)) {
         EXPECT_EQ(0U, segment.offset % alignment);
         EXPECT_LE(alignment, segment.align);
     }
@@ -499,4 +529,77 @@ TEST(ElfEncoder, WhenGetSectionHeaderIndexIsCalledThenCorrectSectionIdxIsReturne
 
     auto &sec1 = elfEncoder64.appendSection(SHT_PROGBITS, "", {});
     EXPECT_EQ(1U, elfEncoder64.getSectionHeaderIndex(sec1));
+}
+
+TEST(ElfEncoder, givenEmptyArrayWhenSetInitialStringTabIsUsedThenResetsStringTabToEmpty) {
+    ElfEncoder<EI_CLASS_64> elfEncoder;
+    elfEncoder.setInitialStringsTab({});
+    EXPECT_EQ(0U, elfEncoder.appendSectionName({}));
+}
+
+TEST(ElfEncoder, givenUnterminatedArrayWhenSetInitialStringTabIsUsedThenTerminateUnderlyingArray) {
+    ElfEncoder<EI_CLASS_64> elfEncoder;
+    char data[2] = {'\0', 's'};
+    elfEncoder.setInitialStringsTab(ArrayRef<const uint8_t>::fromAny(data, sizeof(data)));
+    EXPECT_EQ(1U, elfEncoder.appendSectionName("s"));
+}
+
+TEST(ElfEncoder, givenArrayWhenSetInitialStringTabIsUsedThenIncorporateItToInternalStringTab) {
+    ElfEncoder<EI_CLASS_64> elfEncoder;
+    char data[] = "\0string0\0string1";
+    elfEncoder.setInitialStringsTab(ArrayRef<const uint8_t>::fromAny(data, sizeof(data)));
+    EXPECT_EQ(1U, elfEncoder.appendSectionName("string0"));
+    EXPECT_EQ(9U, elfEncoder.appendSectionName("string1"));
+}
+
+TEST(EncodeElfNoteSection, givenZeroNotesToEncodeThenReturnsEmptyDataVector) {
+    auto encoded = NEO::Elf::encodeNoteSectionData({});
+    EXPECT_TRUE(encoded.empty());
+}
+
+TEST(EncodeElfNoteSection, givenValidNotesToEncodeThenReturnsProperlyEncodedData) {
+    std::string unalignedDescName = "note"
+                                    "Type";
+    std::string unalignedDesc = "some"
+                                " Des"
+                                "c ";
+    uint32_t unalignedDescNoteType = 3;
+
+    std::string unalignedNameName = "note"
+                                    "Ty";
+    std::string unalignedNameDesc = "so"
+                                    "me";
+    uint32_t unalignedNameNoteType = 5;
+
+    std::string alignedDescName = "some"
+                                  "Note";
+    std::string alignedDesc = "some"
+                              "Desc";
+    uint32_t alignedDescNoteType = 7;
+
+    NEO::Elf::NoteToEncode notes[] = {{unalignedDescName, unalignedDesc, unalignedDescNoteType},
+                                      {unalignedNameName, unalignedNameDesc, unalignedNameNoteType},
+                                      {alignedDescName, alignedDesc, alignedDescNoteType}};
+
+    size_t expectedSize = 0;
+    for (const auto &note : notes) {
+        expectedSize += sizeof(NEO::Elf::ElfNoteSection);
+        expectedSize += note.name.size();
+        expectedSize += note.desc.size();
+        expectedSize = alignUp(expectedSize, 4);
+    }
+
+    auto encoded = NEO::Elf::encodeNoteSectionData({notes, 3});
+    ASSERT_EQ(expectedSize, encoded.size());
+
+    uint8_t *pos = encoded.data();
+    for (int i = 0; i < 3; ++i) {
+        auto header = reinterpret_cast<NEO::Elf::ElfNoteSection *>(pos);
+        EXPECT_EQ(notes[i].type, header->type);
+        EXPECT_EQ(notes[i].name.size(), header->nameSize);
+        EXPECT_EQ(notes[i].desc.size(), header->descSize);
+        EXPECT_EQ(notes[i].name, NEO::ConstStringRef(reinterpret_cast<const char *>((header + 1)), notes[i].name.size()));
+        EXPECT_EQ(notes[i].desc, NEO::ConstStringRef(reinterpret_cast<const char *>((header + 1)) + notes[i].name.size(), notes[i].desc.size()));
+        pos = alignUp(pos + sizeof(NEO::Elf::ElfNoteSection) + notes[i].name.size() + notes[i].desc.size(), 4);
+    }
 }

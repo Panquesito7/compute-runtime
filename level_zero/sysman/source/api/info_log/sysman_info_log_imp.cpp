@@ -1,0 +1,192 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/sysman/source/api/info_log/sysman_info_log_imp.h"
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
+
+#include "level_zero/sysman/source/api/info_log/sysman_info_log_decoder_context_imp.h"
+
+#include <algorithm>
+
+namespace L0 {
+namespace Sysman {
+
+ze_result_t InfoLogImp::infoLogGetProperties(zes_info_log_ext_properties_t *pProperties) {
+    if (initResult != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Info log properties were not captured, returning error: 0x%x\n", NEO_FUNCTION_NAME, initResult);
+        return initResult;
+    }
+
+    if (pProperties->pNext != nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Extension structures are not supported, pNext must be nullptr, returning error: 0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_INVALID_ARGUMENT);
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    pProperties->infoLogType = infoLogProperties.infoLogType;
+    pProperties->infoLogFormat = infoLogProperties.infoLogFormat;
+    pProperties->isNamedInstanceSupported = infoLogProperties.isNamedInstanceSupported;
+    pProperties->isPeekDataSupported = infoLogProperties.isPeekDataSupported;
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t InfoLogImp::infoLogCreateInstance(const char *pInstanceName,
+                                              zes_info_log_instance_ext_desc_t *pDesc,
+                                              zes_info_log_instance_handle_t *phInfoLogInstance) {
+    if (initResult != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Info log properties were not captured, returning error: 0x%x\n", NEO_FUNCTION_NAME, initResult);
+        return initResult;
+    }
+
+    if (pDesc->pNext != nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Extension structures are not supported, pNext must be nullptr, returning error: 0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_INVALID_ARGUMENT);
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (pInstanceName != nullptr && !infoLogProperties.isNamedInstanceSupported) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Named collection instances are not supported, returning error: 0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    std::lock_guard<std::mutex> lock(instancesMutex);
+
+    if (pInstanceName != nullptr && activeInstanceNames.contains(pInstanceName)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Collection instance '%s' is already in use, returning error: 0x%x\n", NEO_FUNCTION_NAME, pInstanceName, ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE);
+        return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
+    }
+
+    std::unique_ptr<OsInfoLogInstance> pOsInstance;
+    auto result = pOsInfoLog->createInstance(pInstanceName, pDesc, pOsInstance);
+    if (result != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): The backend failed to create the collection instance, returning error: 0x%x\n", NEO_FUNCTION_NAME, result);
+        return result;
+    }
+
+    auto pInstance = std::make_unique<InfoLogInstanceImp>(this, pInstanceName, std::move(pOsInstance));
+    if (pInstanceName != nullptr) {
+        activeInstanceNames.insert(pInstanceName);
+    }
+
+    *phInfoLogInstance = pInstance->toHandle();
+    instances.push_back(std::move(pInstance));
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t InfoLogImp::checkDecodeSupported() const {
+    if (initResult != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Info log properties were not captured, returning error: 0x%x\n", NEO_FUNCTION_NAME, initResult);
+        return initResult;
+    }
+
+    if (infoLogProperties.infoLogFormat != ZES_INFO_LOG_FORMAT_EXT_CPER) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Decoding is not supported for info log format %d, returning error: 0x%x\n", NEO_FUNCTION_NAME, infoLogProperties.infoLogFormat, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t InfoLogImp::infoLogCreateDecoderContext(zes_intel_info_log_decoder_context_handle_t *phDecoderContext) {
+    auto result = checkDecodeSupported();
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(decoderContextsMutex);
+
+    auto pDecoderContext = std::make_unique<InfoLogDecoderContextImp>(pOsInfoLog.get());
+    *phDecoderContext = pDecoderContext->toHandle();
+    decoderContexts.push_back(std::move(pDecoderContext));
+
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t InfoLogImp::infoLogDeleteDecoderContext(zes_intel_info_log_decoder_context_handle_t *phDecoderContext) {
+    if (*phDecoderContext == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): *phDecoderContext is nullptr, returning error: 0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+        return ZE_RESULT_ERROR_INVALID_NULL_HANDLE;
+    }
+
+    auto pDecoderContext = InfoLogDecoderContext::fromHandle(*phDecoderContext);
+
+    std::lock_guard<std::mutex> lock(decoderContextsMutex);
+
+    auto it = std::find_if(decoderContexts.begin(), decoderContexts.end(),
+                           [pDecoderContext](const std::unique_ptr<InfoLogDecoderContext> &pOwned) { return pOwned.get() == pDecoderContext; });
+    if (it == decoderContexts.end()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): The decoder context was not created from this info log, returning error: 0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_INVALID_ARGUMENT);
+        return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    }
+
+    decoderContexts.erase(it);
+    *phDecoderContext = nullptr;
+
+    return ZE_RESULT_SUCCESS;
+}
+
+void InfoLogImp::destroyAllDecoderContexts() {
+    std::lock_guard<std::mutex> lock(decoderContextsMutex);
+    decoderContexts.clear();
+}
+
+ze_result_t InfoLogImp::destroyInstance(InfoLogInstance *pInstance) {
+    std::lock_guard<std::mutex> lock(instancesMutex);
+
+    auto it = std::find_if(instances.begin(), instances.end(),
+                           [pInstance](const std::unique_ptr<InfoLogInstance> &pOwned) { return pOwned.get() == pInstance; });
+    if (it == instances.end()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Collection instance is not owned by this info log, returning error: 0x%x\n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+        return ZE_RESULT_ERROR_INVALID_NULL_HANDLE;
+    }
+
+    auto result = pInstance->teardown();
+
+    auto pInstanceImp = static_cast<InfoLogInstanceImp *>(pInstance);
+    if (pInstanceImp->isNamed()) {
+        activeInstanceNames.erase(pInstanceImp->getInstanceName());
+    }
+
+    instances.erase(it);
+
+    return result;
+}
+
+void InfoLogImp::destroyAllInstances() {
+    std::lock_guard<std::mutex> lock(instancesMutex);
+
+    for (auto &pInstance : instances) {
+        auto result = pInstance->teardown();
+        if (result != ZE_RESULT_SUCCESS) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Error@ %s(): Failed to tear down a collection instance, error: 0x%x, dropping it regardless\n", NEO_FUNCTION_NAME, result);
+        }
+    }
+
+    instances.clear();
+    activeInstanceNames.clear();
+}
+
+void InfoLogImp::init() {
+    initResult = pOsInfoLog->getProperties(&infoLogProperties);
+}
+
+InfoLogImp::InfoLogImp(zes_info_log_format_ext_t format) {
+    pOsInfoLog = OsInfoLog::create(format);
+    init();
+}
+
+// The call is qualified because virtual dispatch is already restricted to this class once the
+// destructor runs.
+InfoLogImp::~InfoLogImp() {
+    InfoLogImp::destroyAllDecoderContexts();
+    InfoLogImp::destroyAllInstances();
+}
+
+} // namespace Sysman
+} // namespace L0

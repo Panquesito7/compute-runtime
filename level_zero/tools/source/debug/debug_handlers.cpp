@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,9 +7,10 @@
 
 #include "level_zero/tools/source/debug/debug_handlers.h"
 
-#include "shared/source/os_interface/debug_env_reader.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/affinity_mask.h"
 
-#include "level_zero/core/source/device/device_imp.h"
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/debug/debug_session.h"
 
 namespace L0 {
@@ -20,23 +21,21 @@ std::mutex debugSessionMutex;
 ze_result_t debugAttach(zet_device_handle_t hDevice, const zet_debug_config_t *config, zet_debug_session_handle_t *phDebug) {
     ze_result_t result = ZE_RESULT_SUCCESS;
 
-    if (L0::Device::fromHandle(hDevice)->getNEODevice()->isSubDevice() && !NEO::DebugManager.flags.ExperimentalEnableTileAttach.get()) {
+    if (L0::Device::fromHandle(hDevice)->getNEODevice()->isSubDevice() && !NEO::debugManager.flags.ExperimentalEnableTileAttach.get()) {
         return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
     }
 
-    NEO::EnvironmentVariableReader envReader;
-    auto affinityMask = envReader.getSetting("ZE_AFFINITY_MASK", std::string(""));
-
-    if (!affinityMask.empty()) {
-        NEO::printDebugString(NEO::DebugManager.flags.PrintDebugMessages.get(), stdout,
-                              "%s", "ZE_AFFINITY_MASK is not recommended while using program debug API\n");
+    const auto &affinityMask = NEO::debugManager.flags.ZE_AFFINITY_MASK.get();
+    if (NEO::isAffinityMaskSet(affinityMask)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stdout,
+                     "%s", "ZE_AFFINITY_MASK is not recommended while using program debug API\n");
     }
 
     auto session = L0::Device::fromHandle(hDevice)->getDebugSession(*config);
 
     std::unique_lock<std::mutex> lock(debugSessionMutex);
 
-    auto rootSession = L0::Device::fromHandle(hDevice)->getNEODevice()->getRootDevice()->getSpecializedDevice<DeviceImp>()->getDebugSession(*config);
+    auto rootSession = L0::Device::fromHandle(hDevice)->getNEODevice()->getRootDevice()->getSpecializedDevice<L0::Device>()->getDebugSession(*config);
 
     if (session && session->isAttached()) {
         if (session->getDebugConfig().pid != config->pid) {
@@ -82,7 +81,7 @@ ze_result_t debugDetach(zet_debug_session_handle_t hDebug) {
             delete session;
         } else {
             std::unique_lock<std::mutex> lock(debugSessionMutex);
-            auto rootL0Device = device->getNEODevice()->getRootDevice()->getSpecializedDevice<DeviceImp>();
+            auto rootL0Device = device->getNEODevice()->getRootDevice()->getSpecializedDevice<L0::Device>();
             zet_debug_config_t dummy = {};
             auto rootSession = rootL0Device->getDebugSession(dummy);
             session->setDetached();
@@ -125,11 +124,11 @@ ze_result_t debugGetThreadRegisterSetProperties(zet_debug_session_handle_t hDebu
 }
 
 ze_result_t debugReadRegisters(zet_debug_session_handle_t hDebug, ze_device_thread_t thread, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
-    return L0::DebugSession::fromHandle(hDebug)->readRegisters(thread, type, start, count, pRegisterValues);
+    return L0::DebugSession::fromHandle(hDebug)->readRegisters(thread, static_cast<zet_debug_regset_type_intel_gpu_t>(type), start, count, pRegisterValues);
 }
 
 ze_result_t debugWriteRegisters(zet_debug_session_handle_t hDebug, ze_device_thread_t thread, uint32_t type, uint32_t start, uint32_t count, void *pRegisterValues) {
-    return L0::DebugSession::fromHandle(hDebug)->writeRegisters(thread, type, start, count, pRegisterValues);
+    return L0::DebugSession::fromHandle(hDebug)->writeRegisters(thread, static_cast<zet_debug_regset_type_intel_gpu_t>(type), start, count, pRegisterValues);
 }
 
 } // namespace DebugApiHandlers

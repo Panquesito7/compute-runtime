@@ -1,0 +1,57 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/sysman/source/api/fan/sysman_fan.h"
+
+#include "level_zero/sysman/source/api/fan/sysman_fan_imp.h"
+#include "level_zero/sysman/source/device/os_sysman.h"
+
+namespace L0 {
+namespace Sysman {
+
+FanHandleContext::~FanHandleContext() = default;
+
+void FanHandleContext::createHandle(uint32_t fanIndex, bool multipleFansSupported) {
+    std::unique_ptr<Fan> pFan = std::make_unique<FanImp>(pOsSysman, fanIndex, multipleFansSupported);
+    handleList.push_back(std::move(pFan));
+}
+
+void FanHandleContext::init() {
+    auto channels = OsFan::getSupportedFanChannels(pOsSysman);
+    bool multipleFansSupported = (channels.size() > 1);
+
+    for (uint32_t channel : channels) {
+        createHandle(channel, multipleFansSupported);
+    }
+}
+
+void FanHandleContext::reInit() {
+    for (auto &handle : handleList) {
+        handle->reInit();
+    }
+}
+
+ze_result_t FanHandleContext::fanGet(uint32_t *pCount, zes_fan_handle_t *phFan) {
+    std::call_once(initFanOnce, [this]() {
+        this->init();
+        this->fanInitDone = true;
+    });
+    uint32_t handleListSize = static_cast<uint32_t>(handleList.size());
+    uint32_t numToCopy = std::min(*pCount, handleListSize);
+    if (0 == *pCount || *pCount > handleListSize) {
+        *pCount = handleListSize;
+    }
+    if (nullptr != phFan) {
+        for (uint32_t i = 0; i < numToCopy; i++) {
+            phFan[i] = handleList[i]->toHandle();
+        }
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+} // namespace Sysman
+} // namespace L0

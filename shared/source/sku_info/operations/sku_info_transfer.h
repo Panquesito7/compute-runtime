@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,6 +18,7 @@ class SkuInfoTransfer {
 
   protected:
     static void transferFtrTableForGmmBase(_SKU_FEATURE_TABLE *dstFtrTable, const NEO::FeatureTable *srcFtrTable) {
+        dstFtrTable->FtrEfficient64BitAddressing = srcFtrTable->flags.ftrHeaplessMode;
 #define TRANSFER_FTR_TO_GMM(VAL_NAME) dstFtrTable->Ftr##VAL_NAME = srcFtrTable->flags.ftr##VAL_NAME
         TRANSFER_FTR_TO_GMM(StandardMipTailFormat);
         TRANSFER_FTR_TO_GMM(ULT);
@@ -48,6 +49,11 @@ class SkuInfoTransfer {
         TRANSFER_FTR_TO_GMM(Ppgtt64KBWalkOptimization);
         TRANSFER_FTR_TO_GMM(Unified3DMediaCompressionFormats);
         TRANSFER_FTR_TO_GMM(57bGPUAddressing);
+        TRANSFER_FTR_TO_GMM(Xe2Compression);
+        TRANSFER_FTR_TO_GMM(Xe2PlusTiling);
+        TRANSFER_FTR_TO_GMM(Pml5Support);
+        TRANSFER_FTR_TO_GMM(L3TransientDataFlush);
+        TRANSFER_FTR_TO_GMM(AppTransientCaching);
 
 #undef TRANSFER_FTR_TO_GMM
     }
@@ -63,7 +69,9 @@ class SkuInfoTransfer {
         TRANSFER_WA_TO_GMM(Limit128BMediaCompr);
         TRANSFER_WA_TO_GMM(UntypedBufferCompression);
         TRANSFER_WA_TO_GMM(AuxTable64KGranular);
-
+        TRANSFER_WA_TO_GMM(_15010089951);
+        TRANSFER_WA_TO_GMM(_14018976079);
+        TRANSFER_WA_TO_GMM(_14018984349);
 #undef TRANSFER_WA_TO_GMM
     }
 };

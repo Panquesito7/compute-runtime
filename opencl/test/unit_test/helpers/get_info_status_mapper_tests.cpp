@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,17 +10,17 @@
 #include "gtest/gtest.h"
 
 TEST(getInfoStatusMapper, GivenValidGetInfoStatusWhenTranslatingThenExpectedClCodeIsReturned) {
-    auto getInfoStatus = changeGetInfoStatusToCLResultType(GetInfoStatus::SUCCESS);
+    auto getInfoStatus = changeGetInfoStatusToCLResultType(GetInfoStatus::success);
     EXPECT_EQ(CL_SUCCESS, getInfoStatus);
 
-    getInfoStatus = changeGetInfoStatusToCLResultType(GetInfoStatus::INVALID_CONTEXT);
+    getInfoStatus = changeGetInfoStatusToCLResultType(GetInfoStatus::invalidContext);
     EXPECT_EQ(CL_INVALID_CONTEXT, getInfoStatus);
 
-    getInfoStatus = changeGetInfoStatusToCLResultType(GetInfoStatus::INVALID_VALUE);
+    getInfoStatus = changeGetInfoStatusToCLResultType(GetInfoStatus::invalidValue);
     EXPECT_EQ(CL_INVALID_VALUE, getInfoStatus);
 }
 
 TEST(getInfoStatusMapper, GivenInvalidGetInfoStatusWhenTranslatingThenClInvalidValueIsReturned) {
-    auto getInfoStatus = changeGetInfoStatusToCLResultType(static_cast<GetInfoStatus>(1));
+    auto getInfoStatus = changeGetInfoStatusToCLResultType(static_cast<GetInfoStatus>(1)); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange)
     EXPECT_EQ(CL_INVALID_VALUE, getInfoStatus);
 }

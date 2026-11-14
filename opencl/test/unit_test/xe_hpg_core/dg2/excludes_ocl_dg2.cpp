@@ -1,18 +1,12 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/test/common/test_macros/hw_test_base.h"
+#include "shared/test/common/test_macros/test_excludes.h"
 
-HWTEST_EXCLUDE_PRODUCT(ProductHelperTestXeHpAndLater, givenXeHPAndLaterPlatformWhenAskedIfTile64With3DSurfaceOnBCSIsSupportedThenFalseIsReturned, IGFX_DG2);
-HWTEST_EXCLUDE_PRODUCT(WddmMemoryManagerSimpleTest, givenLinearStreamWhenItIsAllocatedThenItIsInLocalMemoryHasCpuPointerAndHasStandardHeap64kbAsGpuAddress, IGFX_DG2);
-HWTEST_EXCLUDE_PRODUCT(GfxCoreHelperTestXeHPAndLater, GiveCcsNodeThenDefaultEngineTypeIsCcs, IGFX_DG2);
-HWTEST_EXCLUDE_PRODUCT(XeHPAndLaterDeviceCapsTests, givenHwInfoWhenRequestedComputeUnitsUsedForScratchThenReturnValidValue, IGFX_DG2);
-HWTEST_EXCLUDE_PRODUCT(ProgramTests, givenAtLeastXeHpgCoreWhenGetInternalOptionsThenCorrectBuildOptionIsSet_IsAtLeastXeHpgCore, IGFX_DG2);
 HWTEST_EXCLUDE_PRODUCT(CmdsProgrammingTestsXeHpgCore, givenL3ToL1DebugFlagWhenStatelessMocsIsProgrammedThenItHasL1CachingOn, IGFX_DG2);
 HWTEST_EXCLUDE_PRODUCT(CmdsProgrammingTestsXeHpgCore, givenAlignedCacheableReadOnlyBufferThenChoseOclBufferConstPolicy, IGFX_DG2);
 HWTEST_EXCLUDE_PRODUCT(CmdsProgrammingTestsXeHpgCore, whenAppendingRssThenProgramWBPL1CachePolicy, IGFX_DG2);
-HWTEST_EXCLUDE_PRODUCT(AggregatedSmallBuffersDefaultTest, givenDifferentFlagValuesAndSingleOrMultiDeviceContextWhenCheckIfEnabledThenReturnCorrectValue, IGFX_DG2);

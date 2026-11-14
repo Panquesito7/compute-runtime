@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,14 +8,14 @@
 #pragma once
 
 #include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/is_pod_v.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 template <typename T>
 struct Vec3 {
-    static_assert(std::is_pod<T>::value);
+    static_assert(NEO::TypeTraits::isPodV<T>);
 
     Vec3(T x, T y, T z) : x(x), y(y), z(z) {}
     Vec3(const Vec3 &v) : x(v.x), y(v.y), z(v.z) {}

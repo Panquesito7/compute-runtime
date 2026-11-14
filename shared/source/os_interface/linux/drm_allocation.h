@@ -1,22 +1,28 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/device/sub_device_ids_vec.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/memory_manager/memadvise_flags.h"
-#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/linux/drm_debug.h"
+#include "shared/source/os_interface/linux/memory_unmap_function.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 namespace NEO {
 class BufferObject;
+class MemoryManager;
 class OsContext;
+class ProductHelper;
 class Drm;
 class OsContextLinux;
 enum class CachePolicy : uint32_t;
 enum class CacheRegion : uint16_t;
+enum class AtomicAccessMode : uint32_t;
 
 struct OsHandleLinux : OsHandle {
     ~OsHandleLinux() override = default;
@@ -27,44 +33,26 @@ using BufferObjects = StackVec<BufferObject *, EngineLimits::maxHandleCount>;
 
 class DrmAllocation : public GraphicsAllocation {
   public:
-    using MemoryUnmapFunction = int (*)(void *, size_t);
-
     struct MemoryToUnmap {
         void *pointer;
         size_t size;
         MemoryUnmapFunction unmapFunction;
     };
 
-    DrmAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, BufferObject *bo, void *ptrIn, size_t sizeIn, osHandle sharedHandle, MemoryPool pool, uint64_t canonizedGpuAddress)
-        : DrmAllocation(rootDeviceIndex, 1, allocationType, bo, ptrIn, sizeIn, sharedHandle, pool, canonizedGpuAddress) {}
+    DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObject *bo, void *ptrIn, size_t sizeIn, osHandle sharedHandle, MemoryPool pool, uint64_t canonizedGpuAddress);
+    DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObject *bo, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool);
+    DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObjects &bos, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool);
 
-    DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObject *bo, void *ptrIn, size_t sizeIn, osHandle sharedHandle, MemoryPool pool, uint64_t canonizedGpuAddress)
-        : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, ptrIn, sizeIn, sharedHandle, pool, MemoryManager::maxOsContextCount, canonizedGpuAddress), bufferObjects(EngineLimits::maxHandleCount) {
-        bufferObjects[0] = bo;
-        handles.resize(EngineLimits::maxHandleCount, std::numeric_limits<uint64_t>::max());
-    }
+  protected:
+    DrmAllocation(DrmAllocation *parentAllocation, size_t offsetInParentAllocation, size_t viewSize);
 
-    DrmAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, BufferObject *bo, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool)
-        : DrmAllocation(rootDeviceIndex, 1, allocationType, bo, ptrIn, canonizedGpuAddress, sizeIn, pool) {}
-
-    DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObject *bo, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool)
-        : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, ptrIn, canonizedGpuAddress, 0, sizeIn, pool, MemoryManager::maxOsContextCount), bufferObjects(EngineLimits::maxHandleCount) {
-        bufferObjects[0] = bo;
-        handles.resize(EngineLimits::maxHandleCount, std::numeric_limits<uint64_t>::max());
-    }
-
-    DrmAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, BufferObjects &bos, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool)
-        : DrmAllocation(rootDeviceIndex, 1, allocationType, bos, ptrIn, canonizedGpuAddress, sizeIn, pool) {}
-
-    DrmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, BufferObjects &bos, void *ptrIn, uint64_t canonizedGpuAddress, size_t sizeIn, MemoryPool pool)
-        : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, ptrIn, canonizedGpuAddress, 0, sizeIn, pool, MemoryManager::maxOsContextCount),
-          bufferObjects(bos) {
-        handles.resize(EngineLimits::maxHandleCount, std::numeric_limits<uint64_t>::max());
-    }
-
+  public:
     ~DrmAllocation() override;
 
+    GraphicsAllocation *createView(size_t offsetInParentAllocation, size_t viewSize) override;
+
     std::string getAllocationInfoString() const override;
+    std::string getPatIndexInfoString() const override;
 
     BufferObject *getBO() const {
         if (fragmentsStorage.fragmentCount) {
@@ -72,6 +60,19 @@ class DrmAllocation : public GraphicsAllocation {
         }
         return this->bufferObjects[0];
     }
+    BufferObject *getBOForVmHandle(uint32_t vmHandleId) const {
+        if (this->storageInfo.getNumBanks() > 1 && !this->storageInfo.isChunked) {
+            return this->bufferObjects[vmHandleId];
+        }
+        return this->getBO();
+    }
+    StackVec<BufferObject *, maxFragmentsCount> getBOsForResidency(uint32_t vmHandleId) const {
+        if (this->fragmentsStorage.fragmentCount > 0) {
+            return this->getFragmentBOsForResidency(vmHandleId);
+        }
+        return {this->getBOForVmHandle(vmHandleId)};
+    }
+    StackVec<BufferObject *, maxFragmentsCount> getFragmentBOsForResidency(uint32_t vmHandleId) const;
     const BufferObjects &getBOs() const {
         return this->bufferObjects;
     }
@@ -94,27 +95,41 @@ class DrmAllocation : public GraphicsAllocation {
     uint64_t getHandleAddressBase(uint32_t handleIndex) override;
 
     size_t getHandleSize(uint32_t handleIndex) override;
-    int createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) override;
+    bool isPartialObjectMapping() const override;
+    int createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) override;
 
     void clearInternalHandle(uint32_t handleId) override;
 
-    int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle) override;
+    int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle, void *reservedHandleData) override;
 
-    int peekInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) override;
+    int peekInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) override;
 
     bool setCacheRegion(Drm *drm, CacheRegion regionIndex);
-    bool setCacheAdvice(Drm *drm, size_t regionSize, CacheRegion regionIndex);
+    bool setCacheAdvice(Drm *drm, size_t regionSize, CacheRegion regionIndex, bool isSystemMemoryPool);
     void setCachePolicy(CachePolicy memType);
 
     bool setPreferredLocation(Drm *drm, PreferredLocation memoryLocation);
 
     bool setMemAdvise(Drm *drm, MemAdviseFlags flags);
+    bool setAtomicAccess(Drm *drm, size_t size, AtomicAccessMode mode);
     bool setMemPrefetch(Drm *drm, SubDeviceIdsVec &subDeviceIds);
 
-    void *getMmapPtr() { return this->mmapPtr; }
+    void *getMmapPtr() {
+        if (this->importedMmapPtr) {
+            return this->importedMmapPtr;
+        } else {
+            return this->mmapPtr;
+        }
+    }
     void setMmapPtr(void *ptr) { this->mmapPtr = ptr; }
+    void setImportedMmapPtr(void *ptr) { this->importedMmapPtr = ptr; }
     size_t getMmapSize() { return this->mmapSize; }
     void setMmapSize(size_t size) { this->mmapSize = size; }
+
+    void setUsmHostAllocation(bool flag) { usmHostAllocation = flag; }
+    bool isUsmHostAllocation() { return usmHostAllocation; }
+    void setLocalMemoryReserved(bool flag) { localMemoryReserved = flag; }
+    bool isLocalMemoryReserved() const { return localMemoryReserved; }
 
     OsContextLinux *getOsContext() const {
         return this->osContext;
@@ -124,27 +139,40 @@ class DrmAllocation : public GraphicsAllocation {
         this->osContext = context;
     }
 
-    MOCKABLE_VIRTUAL int makeBOsResident(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind);
-    MOCKABLE_VIRTUAL int bindBO(BufferObject *bo, OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind);
-    MOCKABLE_VIRTUAL int bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind);
+    bool isMapped() override { return getMmapPtr() != nullptr; }
+
+    bool prefetchBOWithChunking(Drm *drm);
+    MOCKABLE_VIRTUAL int makeBOsResident(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence);
+    MOCKABLE_VIRTUAL int bindBO(BufferObject *bo, OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence);
+    MOCKABLE_VIRTUAL int bindBOs(OsContext *osContext, uint32_t vmHandleId, std::vector<BufferObject *> *bufferObjects, bool bind, const bool forcePagingFence);
     MOCKABLE_VIRTUAL bool prefetchBO(BufferObject *bo, uint32_t vmHandleId, uint32_t subDeviceId);
     MOCKABLE_VIRTUAL void registerBOBindExtHandle(Drm *drm);
+    void addRegisteredBoBindHandle(uint32_t handle) { registeredBoBindHandles.push_back(handle); }
     void freeRegisteredBOBindExtHandles(Drm *drm);
     void linkWithRegisteredHandle(uint32_t handle);
+
     MOCKABLE_VIRTUAL void markForCapture();
     MOCKABLE_VIRTUAL bool shouldAllocationPageFault(const Drm *drm);
     void registerMemoryToUnmap(void *pointer, size_t size, MemoryUnmapFunction unmapFunction);
+    void setAsReadOnly() override;
+    void setIsaDebugDataHandle(uint32_t handle);
+    void setDrmResourceClass(DrmResourceClass resourceClassToSet);
+    void deferSharedBoUnbind() { sharedBoUnbindDeferred = true; }
 
   protected:
     OsContextLinux *osContext = nullptr;
     BufferObjects bufferObjects{};
     StackVec<uint32_t, 1> registeredBoBindHandles;
-    MemAdviseFlags enabledMemAdviseFlags{};
     StackVec<MemoryToUnmap, 1> memoryToUnmap;
-    uint32_t numHandles = 0u;
     std::vector<uint64_t> handles;
 
     void *mmapPtr = nullptr;
+    void *importedMmapPtr = nullptr;
     size_t mmapSize = 0u;
+    uint32_t numHandles = 0u;
+
+    bool usmHostAllocation = false;
+    bool localMemoryReserved = false;
+    bool sharedBoUnbindDeferred = false;
 };
 } // namespace NEO

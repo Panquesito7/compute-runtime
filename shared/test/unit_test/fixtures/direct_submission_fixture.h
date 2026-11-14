@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,12 +7,15 @@
 
 #pragma once
 
+#include "shared/source/command_stream/linear_stream.h"
 #include "shared/source/command_stream/submissions_aggregator.h"
+#include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 #include "shared/source/memory_manager/memory_manager.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/fixtures/device_fixture.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/mocks/mock_device.h"
 
@@ -38,11 +41,11 @@ struct DirectSubmissionFixture : public DeviceFixture {
 
 struct DirectSubmissionDispatchBufferFixture : public DirectSubmissionFixture {
     void setUp() {
-        DebugManager.flags.DirectSubmissionFlatRingBuffer.set(0);
+        debugManager.flags.DirectSubmissionFlatRingBuffer.set(0);
         DirectSubmissionFixture::setUp();
         MemoryManager *memoryManager = pDevice->getExecutionEnvironment()->memoryManager.get();
         const AllocationProperties commandBufferProperties{pDevice->getRootDeviceIndex(), 0x1000,
-                                                           AllocationType::COMMAND_BUFFER, pDevice->getDeviceBitfield()};
+                                                           AllocationType::commandBuffer, pDevice->getDeviceBitfield()};
         commandBuffer = memoryManager->allocateGraphicsMemoryWithProperties(commandBufferProperties);
         stream = std::make_unique<LinearStream>(commandBuffer);
         stream->getSpace(0x40);
@@ -52,6 +55,9 @@ struct DirectSubmissionDispatchBufferFixture : public DirectSubmissionFixture {
         batchBuffer.usedSize = 0x40;
         batchBuffer.taskStartAddress = 0x881112340000;
         batchBuffer.stream = stream.get();
+
+        auto &compilerProductHelper = pDevice->getCompilerProductHelper();
+        heaplessModeEnabled = compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo);
     }
 
     void tearDown() {
@@ -66,4 +72,6 @@ struct DirectSubmissionDispatchBufferFixture : public DirectSubmissionFixture {
     GraphicsAllocation *commandBuffer;
     DebugManagerStateRestore restorer;
     std::unique_ptr<LinearStream> stream;
+
+    bool heaplessModeEnabled = false;
 };

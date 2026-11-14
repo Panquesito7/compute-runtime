@@ -1,15 +1,17 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/kmd_notify_helper.h"
 #include "shared/source/helpers/kmd_notify_properties.h"
 #include "shared/source/os_interface/windows/sys_calls.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/helpers/variable_backup.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
 
 namespace NEO {
 
@@ -18,18 +20,17 @@ extern BOOL systemPowerStatusRetVal;
 extern BYTE systemPowerStatusACLineStatusOverride;
 } // namespace SysCalls
 
-class MockKmdNotifyHelper : public KmdNotifyHelper {
+class PublicKmdNotifyHelper : public KmdNotifyHelper {
   public:
     using KmdNotifyHelper::acLineConnected;
-    using KmdNotifyHelper::getBaseTimeout;
     using KmdNotifyHelper::updateAcLineStatus;
 
-    MockKmdNotifyHelper(const KmdNotifyProperties *newProperties) : KmdNotifyHelper(newProperties){};
+    PublicKmdNotifyHelper(const KmdNotifyProperties *newProperties) : KmdNotifyHelper(newProperties) {};
 };
 
 TEST(KmdNotifyWindowsTests, whenGetSystemPowerStatusReturnSuccessThenUpdateAcLineStatus) {
     auto properties = &(defaultHwInfo->capabilityTable.kmdNotifyProperties);
-    MockKmdNotifyHelper helper(properties);
+    PublicKmdNotifyHelper helper(properties);
     EXPECT_TRUE(helper.acLineConnected);
 
     VariableBackup<BOOL> systemPowerStatusRetValBkp(&SysCalls::systemPowerStatusRetVal);
@@ -48,7 +49,7 @@ TEST(KmdNotifyWindowsTests, whenGetSystemPowerStatusReturnSuccessThenUpdateAcLin
 
 TEST(KmdNotifyWindowsTests, whenGetSystemPowerStatusReturnErrorThenDontUpdateAcLineStatus) {
     auto properties = &(defaultHwInfo->capabilityTable.kmdNotifyProperties);
-    MockKmdNotifyHelper helper(properties);
+    PublicKmdNotifyHelper helper(properties);
     EXPECT_TRUE(helper.acLineConnected);
 
     VariableBackup<BOOL> systemPowerStatusRetValBkp(&SysCalls::systemPowerStatusRetVal);
@@ -58,15 +59,6 @@ TEST(KmdNotifyWindowsTests, whenGetSystemPowerStatusReturnErrorThenDontUpdateAcL
 
     helper.updateAcLineStatus();
     EXPECT_TRUE(helper.acLineConnected);
-}
-
-TEST(KmdNotifyWindowsTests, givenTaskCountDiffGreaterThanOneWhenBaseTimeoutRequestedThenDontMultiply) {
-    auto localProperties = (defaultHwInfo->capabilityTable.kmdNotifyProperties);
-    localProperties.delayKmdNotifyMicroseconds = 10;
-    const int64_t multiplier = 10;
-
-    MockKmdNotifyHelper helper(&localProperties);
-    EXPECT_EQ(localProperties.delayKmdNotifyMicroseconds, helper.getBaseTimeout(multiplier));
 }
 
 } // namespace NEO

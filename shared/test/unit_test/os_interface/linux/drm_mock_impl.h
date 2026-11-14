@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,11 +10,10 @@
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/hw_mapper.h"
 #include "shared/source/os_interface/linux/i915.h"
+#include "shared/source/os_interface/linux/ioctl_helper.h"
 #include "shared/test/common/helpers/default_hw_info.h"
 #include "shared/test/common/libult/linux/drm_mock.h"
-
-#include "gtest/gtest.h"
-#include "test_traits_common.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
 using namespace NEO;
 
@@ -23,8 +22,8 @@ class DrmTipMock : public DrmMock {
     DrmTipMock(RootDeviceEnvironment &rootDeviceEnvironment) : DrmTipMock(rootDeviceEnvironment, defaultHwInfo.get()) {}
     DrmTipMock(RootDeviceEnvironment &rootDeviceEnvironment, const HardwareInfo *inputHwInfo) : DrmMock(rootDeviceEnvironment) {
         rootDeviceEnvironment.setHwInfoAndInitHelpers(inputHwInfo);
-        ioctlHelper.reset();
-        setupIoctlHelper(inputHwInfo->platform.eProductFamily);
+        ioctlHelper = std::make_unique<IoctlHelperUpstream>(*this);
+        ioctlHelper->initialize();
     }
 
     uint32_t i915QuerySuccessCount = std::numeric_limits<uint32_t>::max();
@@ -46,7 +45,7 @@ class DrmTipMock : public DrmMock {
     }
 
     int handleRemainingRequests(DrmIoctl request, void *arg) override {
-        if ((request == DrmIoctl::Query) && (arg != nullptr)) {
+        if ((request == DrmIoctl::query) && (arg != nullptr)) {
             if (i915QuerySuccessCount == 0) {
                 return EINVAL;
             }
@@ -59,7 +58,7 @@ class DrmTipMock : public DrmMock {
                 handleQueryItem(reinterpret_cast<QueryItem *>(query->itemsPtr) + i);
             }
             return 0;
-        } else if (request == DrmIoctl::GemMmapOffset) {
+        } else if (request == DrmIoctl::gemMmapOffset) {
             auto mmapArg = static_cast<GemMmapOffset *>(arg);
             mmapOffsetFlagsReceived = mmapArg->flags;
             mmapArg->offset = offset;
@@ -98,7 +97,7 @@ class DrmTipMock : public DrmMock {
     }
 
     virtual int handleKernelSpecificRequests(DrmIoctl request, void *arg) {
-        if (request == DrmIoctl::GemCreateExt) {
+        if (request == DrmIoctl::gemCreateExt) {
             auto createExtParams = static_cast<drm_i915_gem_create_ext *>(arg);
             if (createExtParams->size == 0) {
                 return EINVAL;
@@ -120,15 +119,5 @@ class DrmTipMock : public DrmMock {
             return gemCreateExtRetVal;
         }
         return -1;
-    }
-};
-
-struct NonDefaultIoctlsSupported {
-    template <PRODUCT_FAMILY productFamily>
-    static constexpr bool isMatched() {
-        if (productFamily == IGFX_DG1) {
-            return true;
-        }
-        return TestTraits<NEO::ToGfxCoreFamily<productFamily>::get()>::isUsingNonDefaultIoctls;
     }
 };

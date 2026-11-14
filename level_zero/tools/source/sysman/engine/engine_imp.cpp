@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,13 @@
 
 #include "level_zero/tools/source/sysman/engine/engine_imp.h"
 
+#include "level_zero/tools/source/sysman/engine/os_engine.h"
+
 namespace L0 {
+
+ze_result_t EngineImp::engineGetActivityExt(uint32_t *pCount, zes_engine_stats_t *pStats) {
+    return pOsEngine->getActivityExt(pCount, pStats);
+}
 
 ze_result_t EngineImp::engineGetActivity(zes_engine_stats_t *pStats) {
     return pOsEngine->getActivity(pStats);
@@ -19,9 +25,9 @@ ze_result_t EngineImp::engineGetProperties(zes_engine_properties_t *pProperties)
 }
 
 void EngineImp::init() {
-    if (pOsEngine->isEngineModuleSupported()) {
+    initStatus = pOsEngine->isEngineModuleSupported();
+    if (initStatus == ZE_RESULT_SUCCESS) {
         pOsEngine->getProperties(engineProperties);
-        this->initSuccess = true;
     }
 }
 

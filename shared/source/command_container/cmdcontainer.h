@@ -1,19 +1,25 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/command_container/cmdcontainer_types.h"
 #include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/debug_helpers.h"
 #include "shared/source/helpers/heap_base_address_model.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/indirect_heap/indirect_heap_type.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <vector>
 
 namespace NEO {
@@ -23,25 +29,14 @@ class Device;
 class GraphicsAllocation;
 class HeapHelper;
 class IndirectHeap;
+struct KernelDescriptor;
+class KernelDispatchStatsTracker;
 class LinearStream;
 class ReservedIndirectHeap;
+class ThreadDataMap;
+class ThreadDataTracker;
 
 struct L1CachePolicy;
-
-using ResidencyContainer = std::vector<GraphicsAllocation *>;
-using CmdBufferContainer = std::vector<GraphicsAllocation *>;
-using HeapContainer = std::vector<GraphicsAllocation *>;
-using HeapType = IndirectHeapType;
-
-namespace CSRequirements {
-// cleanup section usually contains 1-2 pipeControls BB end and place for BB start
-// that makes 16 * 2 + 4 + 8 = 40 bytes
-// then command buffer is aligned to cacheline that can take up to 63 bytes
-// to be sure everything fits minimal size is at 2 x cacheline.
-
-inline constexpr auto minCommandQueueCommandStreamSize = 2 * MemoryConstants::cacheLineSize;
-inline constexpr auto csOverfetchSize = MemoryConstants::pageSize;
-} // namespace CSRequirements
 
 struct HeapReserveData {
     HeapReserveData();
@@ -58,27 +53,29 @@ struct HeapReserveArguments {
     size_t alignment = 0;
 };
 
-class CommandContainer : public NonCopyableOrMovableClass {
+class CommandContainer : public NonCopyableAndNonMovableClass {
   public:
     enum class ErrorCode {
-        SUCCESS = 0,
-        OUT_OF_DEVICE_MEMORY = 1
+        success = 0,
+        outOfDeviceMemory = 1
     };
 
     static constexpr size_t defaultListCmdBufferSize = 1u * MemoryConstants ::megaByte;
     static constexpr size_t cmdBufferReservedSize = MemoryConstants::cacheLineSize +
                                                     CSRequirements::csOverfetchSize;
     static constexpr size_t totalCmdBufferSize = defaultListCmdBufferSize + cmdBufferReservedSize;
+    static constexpr size_t estimatedCmdBufferSizePerCommand = MemoryConstants::kiloByte; // rough estimate of max command size (1KB is more than enough for a COMPUTE_WALKER + WAs), used to estimate total command buffer size
+                                                                                          // based on number of commands in graphs. defaultListCmdBufferSize would fit 1024 commands
     static constexpr size_t startingResidencyContainerSize = 128;
     static constexpr size_t defaultCmdBufferAllocationAlignment = MemoryConstants::pageSize64k;
     static constexpr size_t defaultHeapAllocationAlignment = MemoryConstants::pageSize64k;
     static constexpr size_t minCmdBufferPtrAlign = 8;
 
     CommandContainer();
-
     CommandContainer(uint32_t maxNumAggregatedIdds);
 
     CmdBufferContainer &getCmdBufferAllocations() { return cmdBufferAllocations; }
+    void markCmdBufferAllocationsForSimulationUpload();
 
     ResidencyContainer &getResidencyContainer() { return residencyContainer; }
 
@@ -86,6 +83,8 @@ class CommandContainer : public NonCopyableOrMovableClass {
 
     void addToResidencyContainer(GraphicsAllocation *alloc);
     void removeDuplicatesFromResidencyContainer();
+    void clearResidencyContainer();
+    uint64_t getResidencyContainerStamp() const { return residencyContainerStamp; }
 
     LinearStream *getCommandStream() { return commandStream.get(); }
 
@@ -120,6 +119,7 @@ class CommandContainer : public NonCopyableOrMovableClass {
     GraphicsAllocation *obtainNextCommandBufferAllocation(bool forceHostMemory);
 
     bool swapStreams();
+    void swapCommandStreamState(CommandContainer &other);
 
     void reset();
 
@@ -134,27 +134,38 @@ class CommandContainer : public NonCopyableOrMovableClass {
     void setReservedSshSize(size_t reserveSize) {
         reservedSshSize = reserveSize;
     }
+    void setEstimatedNumberOfCommands(uint32_t estimatedNumberOfCommands) {
+        this->estimatedNumberOfCommands = estimatedNumberOfCommands;
+    }
+    uint32_t getEstimatedNumberOfCommands() const {
+        return this->estimatedNumberOfCommands;
+    }
 
     bool getFlushTaskUsedForImmediate() const { return isFlushTaskUsedForImmediate; }
     void setFlushTaskUsedForImmediate(bool flushTaskUsedForImmediate) { isFlushTaskUsedForImmediate = flushTaskUsedForImmediate; }
     void setImmediateCmdListCsr(CommandStreamReceiver *newValue) {
         this->immediateCmdListCsr = newValue;
     }
+    CommandStreamReceiver *getImmediateCmdListCsr() {
+        return this->immediateCmdListCsr;
+    }
     void enableHeapSharing() { heapSharingEnabled = true; }
     bool immediateCmdListSharedHeap(HeapType heapType) {
-        return (heapSharingEnabled && (heapType == HeapType::DYNAMIC_STATE || heapType == HeapType::SURFACE_STATE));
+        return (heapSharingEnabled && (heapType == HeapType::dynamicState || heapType == HeapType::surfaceState));
     }
 
     void reserveSpaceForDispatch(HeapReserveArguments &sshReserveArg, HeapReserveArguments &dshReserveArg, bool getDsh);
 
     GraphicsAllocation *reuseExistingCmdBuffer();
     GraphicsAllocation *reuseExistingCmdBuffer(bool forceHostMemory);
-    GraphicsAllocation *allocateCommandBuffer();
+    GraphicsAllocation *reuseExistingCmdBuffer(bool forceHostMemory, size_t requiredUsableSize);
     GraphicsAllocation *allocateCommandBuffer(bool forceHostMemory);
+    MOCKABLE_VIRTUAL GraphicsAllocation *allocateCommandBuffer(bool forceHostMemory, size_t requiredUsableSize);
     void setCmdBuffer(GraphicsAllocation *cmdBuffer);
     void addCurrentCommandBufferToReusableAllocationList();
 
     void fillReusableAllocationLists();
+    void updateAllocationTaskCount(GraphicsAllocation *allocation);
     void storeAllocationAndFlushTagUpdate(GraphicsAllocation *allocation);
 
     HeapReserveData &getSurfaceStateHeapReserve() {
@@ -198,24 +209,48 @@ class CommandContainer : public NonCopyableOrMovableClass {
     void *getEndCmdPtr() const {
         return endCmdPtr;
     }
+    uint64_t getEndCmdGpuAddress() const {
+        return endCmdGpuAddress;
+    }
     size_t getAlignedPrimarySize() const {
         return this->alignedPrimarySize;
     }
     void endAlignedPrimaryBuffer();
 
+    void *findCpuBaseForCmdBufferAddress(void *cmdBufferAddress);
+    GraphicsAllocation *findGraphicsAllocationForCpuAddress(void *cpuAddress);
+
+    bool getIOHCacheEnabled() const { return isIOHCacheEnabled; }
+    std::optional<uint64_t> getCachedIohOffset(uint64_t threadDataHash, std::span<const uint8_t> crossThreadData, std::span<const uint8_t> perThreadData) const;
+    std::optional<uint64_t> getCachedIohOffset(std::span<const uint8_t> crossThreadData, std::span<const uint8_t> perThreadData) const;
+    void registerThreadData(uint64_t hash, std::span<const uint8_t> crossThreadData, std::span<const uint8_t> perThreadData);
+    void makeThreadDataMapResident();
+    IndirectHeap *getThreadDataMapStorage() const;
+
+    KernelDispatchStatsTracker &obtainKernelDispatchStats();
+    KernelDispatchStatsTracker *peekKernelDispatchStats() const { return kernelDispatchStats.get(); }
+    COLD_SECTION void trackKernelDispatchStats(const KernelDescriptor &kernelDescriptor, const uint32_t *groupSize,
+                                               uint32_t threadGroupIdXDimension, uint32_t threadGroupIdYDimension, uint32_t threadGroupIdZDimension,
+                                               uint32_t slmTotalSizePerThreadGroup, uint32_t threadsPerThreadGroup, uint32_t threadGroupCount,
+                                               bool isIndirect);
+
   protected:
+    std::unique_ptr<GraphicsAllocation> detachReusableCommandBuffer(AllocationsList &allocations, size_t requiredSize, bool forceHostMemory);
     size_t getAlignedCmdBufferSize() const;
+    size_t getAlignedCmdBufferSize(size_t requiredUsableSize) const;
     size_t getMaxUsableSpace() const {
         return getAlignedCmdBufferSize() - cmdBufferReservedSize;
     }
+    size_t getUsableSpace(const GraphicsAllocation &cmdBuffer) const;
     IndirectHeap *getHeapWithRequiredSize(HeapType heapType, size_t sizeRequired, size_t alignment, bool allowGrow);
     void createAndAssignNewHeap(HeapType heapType, size_t size);
     IndirectHeap *initIndirectHeapReservation(ReservedIndirectHeap *indirectHeapReservation, size_t size, size_t alignment, HeapType heapType);
-    inline bool skipHeapAllocationCreation(HeapType heapType);
+    bool skipHeapAllocationCreation(HeapType heapType);
     size_t getHeapSize(HeapType heapType);
     void alignPrimaryEnding(void *endPtr, size_t exactUsedSize);
+    void extractCommonThreadData();
 
-    GraphicsAllocation *allocationIndirectHeaps[HeapType::NUM_TYPES] = {};
+    GraphicsAllocation *allocationIndirectHeaps[HeapType::numTypes] = {};
 
     CmdBufferContainer cmdBufferAllocations;
     ResidencyContainer residencyContainer;
@@ -225,15 +260,19 @@ class CommandContainer : public NonCopyableOrMovableClass {
     HeapReserveData dynamicStateHeapReserveData;
     HeapReserveData surfaceStateHeapReserveData;
 
-    std::unique_ptr<IndirectHeap> indirectHeaps[HeapType::NUM_TYPES];
+    std::unique_ptr<IndirectHeap> indirectHeaps[HeapType::numTypes];
     std::unique_ptr<HeapHelper> heapHelper;
     std::unique_ptr<LinearStream> commandStream;
     std::unique_ptr<LinearStream> secondaryCommandStreamForImmediateCmdList;
     std::unique_ptr<AllocationsList> immediateReusableAllocationList;
+    std::unique_ptr<ThreadDataTracker> threadDataTracker;
+    std::unique_ptr<KernelDispatchStatsTracker> kernelDispatchStats;
+    std::unique_ptr<ThreadDataMap> threadDataMap;
 
     uint64_t instructionHeapBaseAddress = 0u;
     uint64_t indirectObjectHeapBaseAddress = 0u;
     uint64_t currentLinearStreamStartOffset = 0u;
+    uint64_t endCmdGpuAddress = 0u;
 
     void *iddBlock = nullptr;
     Device *device = nullptr;
@@ -249,11 +288,17 @@ class CommandContainer : public NonCopyableOrMovableClass {
     void *endCmdPtr = nullptr;
     size_t alignedPrimarySize = 0;
 
+    uint64_t residencyContainerStamp = 0u;
+
     uint32_t dirtyHeaps = std::numeric_limits<uint32_t>::max();
     uint32_t numIddsPerBlock = 64;
-    HeapAddressModel heapAddressModel = HeapAddressModel::PrivateHeaps;
+    uint32_t estimatedNumberOfCommands = 0;
+    HeapAddressModel heapAddressModel = HeapAddressModel::privateHeaps;
     uint32_t slmSize = std::numeric_limits<uint32_t>::max();
     uint32_t nextIddInBlock = 0;
+
+    static std::atomic<uint64_t> nextResidencyContainerStamp;
+    static uint64_t acquireResidencyContainerStamp();
 
     bool isFlushTaskUsedForImmediate = false;
     bool isHandleFenceCompletionRequired = false;
@@ -262,10 +307,13 @@ class CommandContainer : public NonCopyableOrMovableClass {
     bool indirectHeapInLocalMemory = false;
     bool stateBaseAddressTracking = false;
     bool lastPipelineSelectModeRequired = false;
-    bool lastSentUseGlobalAtomics = false;
     bool systolicModeSupport = false;
     bool doubleSbaWa = false;
     bool usingPrimaryBuffer = false;
+    bool globalBindlessHeapsEnabled = false;
+    bool isIOHCacheEnabled = false;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<CommandContainer>);
 
 } // namespace NEO

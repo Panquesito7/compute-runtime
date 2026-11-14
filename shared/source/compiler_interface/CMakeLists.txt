@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2019-2023 Intel Corporation
+# Copyright (C) 2019-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -13,8 +13,11 @@ set(NEO_CORE_COMPILER_INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/compiler_interface.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/compiler_options.h
     ${CMAKE_CURRENT_SOURCE_DIR}/compiler_options.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/spirv_capabilities_parser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/spirv_capabilities_parser.h
     ${CMAKE_CURRENT_SOURCE_DIR}/compiler_warnings/compiler_warnings.h
     ${CMAKE_CURRENT_SOURCE_DIR}/create_main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/default_cache_config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/default_cache_config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/external_functions.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/external_functions.h
@@ -24,20 +27,11 @@ set(NEO_CORE_COMPILER_INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/linker.h
     ${CMAKE_CURRENT_SOURCE_DIR}/linker.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/os_compiler_cache_helper.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/oclc_extensions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/spec_const_values_map.h
     ${CMAKE_CURRENT_SOURCE_DIR}/tokenized_string.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/translation_error_code.h
 )
-
-if(WIN32)
-  list(APPEND NEO_CORE_COMPILER_INTERFACE
-       ${CMAKE_CURRENT_SOURCE_DIR}/windows/compiler_cache_windows.cpp
-       ${CMAKE_CURRENT_SOURCE_DIR}/windows/os_compiler_cache_helper.cpp
-  )
-else()
-  list(APPEND NEO_CORE_COMPILER_INTERFACE
-       ${CMAKE_CURRENT_SOURCE_DIR}/linux/compiler_cache_linux.cpp
-       ${CMAKE_CURRENT_SOURCE_DIR}/linux/os_compiler_cache_helper.cpp
-  )
-endif()
 
 set_property(GLOBAL PROPERTY NEO_CORE_COMPILER_INTERFACE ${NEO_CORE_COMPILER_INTERFACE})
 add_subdirectories()

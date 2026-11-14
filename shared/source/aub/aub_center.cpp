@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,8 +8,11 @@
 #include "shared/source/aub/aub_center.h"
 
 #include "shared/source/aub/aub_helper.h"
+#include "shared/source/aub/aub_kernel_info_helper.h"
+#include "shared/source/aub/tbx_in_process_simulator.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
 #include "shared/source/os_interface/product_helper.h"
@@ -22,14 +25,12 @@ namespace NEO {
 extern aub_stream::AubManager *createAubManager(const aub_stream::AubManagerOptions &options);
 
 AubCenter::AubCenter(const RootDeviceEnvironment &rootDeviceEnvironment, bool localMemoryEnabled, const std::string &aubFileName, CommandStreamReceiverType csrType) {
-    if (DebugManager.flags.UseAubStream.get()) {
+    if (debugManager.flags.UseAubStream.get()) {
         auto hwInfo = rootDeviceEnvironment.getHardwareInfo();
         auto devicesCount = GfxCoreHelper::getSubDevicesCount(hwInfo);
-        auto memoryBankSize = AubHelper::getPerTileLocalMemorySize(hwInfo);
-        CommandStreamReceiverType type = csrType;
-        if (DebugManager.flags.SetCommandStreamReceiver.get() >= CommandStreamReceiverType::CSR_HW) {
-            type = static_cast<CommandStreamReceiverType>(DebugManager.flags.SetCommandStreamReceiver.get());
-        }
+        const auto &releaseHelper = rootDeviceEnvironment.getReleaseHelper();
+        auto memoryBankSize = AubHelper::getPerTileLocalMemorySize(hwInfo, releaseHelper);
+        CommandStreamReceiverType type = obtainCsrTypeFromIntegerValue(debugManager.flags.SetCommandStreamReceiver.get(), csrType);
 
         aubStreamMode = getAubStreamMode(aubFileName, type);
 
@@ -46,9 +47,10 @@ AubCenter::AubCenter(const RootDeviceEnvironment &rootDeviceEnvironment, bool lo
 
         extraMmioList.insert(extraMmioList.end(), debugMmioList.begin(), debugMmioList.end());
 
-        aub_stream::injectMMIOList(extraMmioList);
+        aub_stream::injectMMIOListLegacy(extraMmioList);
 
-        AubHelper::setTbxConfiguration();
+        AubHelper::setTbxConfiguration(rootDeviceEnvironment.getRootDeviceIndex());
+        aub_stream::setAubStreamCaller(aub_stream::caller::neo);
 
         aub_stream::AubManagerOptions options{};
         options.version = 1u;
@@ -57,50 +59,179 @@ AubCenter::AubCenter(const RootDeviceEnvironment &rootDeviceEnvironment, bool lo
         options.memoryBankSize = memoryBankSize;
         options.stepping = stepping;
         options.localMemorySupported = localMemoryEnabled;
+        const bool inProcessSimulatorRequested = debugManager.flags.TbxInProcessSimulatorLibrary.get() != "unk";
+        auto sharedMemoryAubStreamMode = getSharedMemoryAubStreamMode(aubStreamMode, inProcessSimulatorRequested);
+        if (sharedMemoryAubStreamMode != aubStreamMode && enableTbxSharedMemory(rootDeviceEnvironment, inProcessSimulatorRequested, options)) {
+            aubStreamMode = sharedMemoryAubStreamMode;
+        }
         options.mode = aubStreamMode;
         options.gpuAddressSpace = hwInfo->capabilityTable.gpuAddressSpace;
+        options.programAdditionalEngineMMIO = productHelper.isProgramAdditionalEngineMMIORequired(*hwInfo);
 
         aubManager.reset(createAubManager(options));
+        aubManager->setCCSMode(hwInfo->gtSystemInfo.CCSInfo.NumberOfCCSEnabled);
     }
-    addressMapper = std::make_unique<AddressMapper>();
-    streamProvider = std::make_unique<AubFileStreamProvider>();
     subCaptureCommon = std::make_unique<AubSubCaptureCommon>();
-    if (DebugManager.flags.AUBDumpSubCaptureMode.get()) {
-        this->subCaptureCommon->subCaptureMode = static_cast<AubSubCaptureCommon::SubCaptureMode>(DebugManager.flags.AUBDumpSubCaptureMode.get());
-        this->subCaptureCommon->subCaptureFilter.dumpKernelStartIdx = static_cast<uint32_t>(DebugManager.flags.AUBDumpFilterKernelStartIdx.get());
-        this->subCaptureCommon->subCaptureFilter.dumpKernelEndIdx = static_cast<uint32_t>(DebugManager.flags.AUBDumpFilterKernelEndIdx.get());
-        this->subCaptureCommon->subCaptureFilter.dumpNamedKernelStartIdx = static_cast<uint32_t>(DebugManager.flags.AUBDumpFilterNamedKernelStartIdx.get());
-        this->subCaptureCommon->subCaptureFilter.dumpNamedKernelEndIdx = static_cast<uint32_t>(DebugManager.flags.AUBDumpFilterNamedKernelEndIdx.get());
-        if (DebugManager.flags.AUBDumpFilterKernelName.get() != "unk") {
-            this->subCaptureCommon->subCaptureFilter.dumpKernelName = DebugManager.flags.AUBDumpFilterKernelName.get();
+    if (debugManager.flags.AUBDumpSubCaptureMode.get()) {
+        this->subCaptureCommon->subCaptureMode = static_cast<AubSubCaptureCommon::SubCaptureMode>(debugManager.flags.AUBDumpSubCaptureMode.get());
+        this->subCaptureCommon->subCaptureFilter.dumpKernelStartIdx = static_cast<uint32_t>(debugManager.flags.AUBDumpFilterKernelStartIdx.get());
+        this->subCaptureCommon->subCaptureFilter.dumpKernelEndIdx = static_cast<uint32_t>(debugManager.flags.AUBDumpFilterKernelEndIdx.get());
+        this->subCaptureCommon->subCaptureFilter.dumpNamedKernelStartIdx = static_cast<uint32_t>(debugManager.flags.AUBDumpFilterNamedKernelStartIdx.get());
+        this->subCaptureCommon->subCaptureFilter.dumpNamedKernelEndIdx = static_cast<uint32_t>(debugManager.flags.AUBDumpFilterNamedKernelEndIdx.get());
+        if (debugManager.flags.AUBDumpFilterKernelName.get() != "unk") {
+            this->subCaptureCommon->subCaptureFilter.dumpKernelName = debugManager.flags.AUBDumpFilterKernelName.get();
         }
     }
 }
 
 AubCenter::AubCenter() {
-    addressMapper = std::make_unique<AddressMapper>();
-    streamProvider = std::make_unique<AubFileStreamProvider>();
     subCaptureCommon = std::make_unique<AubSubCaptureCommon>();
 }
 
-uint32_t AubCenter::getAubStreamMode(const std::string &aubFileName, uint32_t csrType) {
+AubCenter::~AubCenter() = default;
+
+uint32_t AubCenter::getAubStreamMode(const std::string &aubFileName, CommandStreamReceiverType csrType) {
     uint32_t mode = aub_stream::mode::aubFile;
 
     switch (csrType) {
-    case CommandStreamReceiverType::CSR_HW_WITH_AUB:
-    case CommandStreamReceiverType::CSR_AUB:
+    case CommandStreamReceiverType::hardwareWithAub:
+    case CommandStreamReceiverType::aub:
         mode = aub_stream::mode::aubFile;
         break;
-    case CommandStreamReceiverType::CSR_TBX:
+    case CommandStreamReceiverType::tbx:
         mode = aub_stream::mode::tbx;
         break;
-    case CommandStreamReceiverType::CSR_TBX_WITH_AUB:
+    case CommandStreamReceiverType::tbxWithAub:
         mode = aub_stream::mode::aubFileAndTbx;
+        break;
+    case CommandStreamReceiverType::nullAub:
+        mode = aub_stream::mode::null;
         break;
     default:
         break;
     }
 
     return mode;
+}
+
+uint32_t AubCenter::getSharedMemoryAubStreamMode(uint32_t aubStreamMode, bool translationTableMode) {
+    switch (aubStreamMode) {
+    case aub_stream::mode::tbx:
+        return translationTableMode ? aub_stream::mode::tbxShm4 : aub_stream::mode::tbxShm;
+    case aub_stream::mode::aubFileAndTbx:
+        return translationTableMode ? aub_stream::mode::aubFileAndShm4 : aub_stream::mode::aubFileAndShm;
+    default:
+        return aubStreamMode;
+    }
+}
+
+bool AubCenter::isAllocationMemorySharedWithSimulator() const {
+    return this->aubStreamMode == aub_stream::mode::tbxShm4;
+}
+
+bool AubCenter::enableTbxSharedMemory(const RootDeviceEnvironment &rootDeviceEnvironment, bool inProcessSimulatorRequested, aub_stream::AubManagerOptions &options) {
+    const auto &systemMemoryFileSetting = debugManager.flags.TbxSharedSystemMemoryFile.get();
+    if (systemMemoryFileSetting == "unk") {
+        PRINT_STRING(inProcessSimulatorRequested && debugManager.flags.PrintDebugMessages.get(), stderr, "TbxInProcessSimulatorLibrary requires TbxSharedSystemMemoryFile, falling back to TBX socket mode\n");
+        return false;
+    }
+    const auto rootDeviceIndex = rootDeviceEnvironment.getRootDeviceIndex();
+    const auto systemMemoryFile = AubHelper::getTbxSharedMemoryFileName(systemMemoryFileSetting, rootDeviceIndex);
+    const auto &localMemoryFileSetting = debugManager.flags.TbxSharedLocalMemoryFile.get();
+    const auto localMemoryFile = localMemoryFileSetting == "unk" ? std::string() : AubHelper::getTbxSharedMemoryFileName(localMemoryFileSetting, rootDeviceIndex);
+    const auto requiredFileSize = getRequiredTbxSharedMemoryFileSize(inProcessSimulatorRequested, options);
+    if (!mapTbxSharedMemory(systemMemoryFile, localMemoryFile, inProcessSimulatorRequested, requiredFileSize, options.sharedMemoryInfo) ||
+        !isTbxSharedMemorySizeSufficient(requiredFileSize, options)) {
+        unmapTbxSharedMemory(options.sharedMemoryInfo);
+        return false;
+    }
+    if (!inProcessSimulatorRequested) {
+        return true;
+    }
+
+    const auto &simulatorLibrary = debugManager.flags.TbxInProcessSimulatorLibrary.get();
+    const auto &simulatorArgumentsSetting = debugManager.flags.TbxInProcessSimulatorArguments.get();
+    auto simulatorArguments = TbxInProcessSimulator::splitArguments(simulatorArgumentsSetting == "unk" ? std::string() : simulatorArgumentsSetting);
+    if (rootDeviceIndex > 0) {
+        std::vector<std::string> sharedMemoryFiles;
+        if (!localMemoryFile.empty()) {
+            sharedMemoryFiles.push_back(localMemoryFile);
+        }
+        sharedMemoryFiles.push_back(systemMemoryFile);
+        TbxInProcessSimulator::replaceRootDeviceArguments(simulatorArguments, AubHelper::getTbxPort(rootDeviceIndex), sharedMemoryFiles);
+    }
+    this->inProcessSimulator = TbxInProcessSimulator::start(simulatorLibrary, simulatorArguments);
+    if (this->inProcessSimulator) {
+        return true;
+    }
+
+    PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "Failed to start TBX in-process simulator: %s, falling back to TBX socket mode\n", simulatorLibrary.c_str());
+    unmapTbxSharedMemory(options.sharedMemoryInfo);
+    return false;
+}
+
+bool AubCenter::mapTbxSharedMemory(const std::string &systemMemoryFile, const std::string &localMemoryFile, bool createFiles, uint64_t createdFileSize, aub_stream::SharedMemoryInfo &sharedMemoryInfo) {
+    auto mapFile = [createFiles, createdFileSize](const std::string &file) {
+        return createFiles ? MappedFile::create(file, createdFileSize) : MappedFile::open(file);
+    };
+
+    this->sharedSystemMemory = mapFile(systemMemoryFile);
+    if (!this->sharedSystemMemory) {
+        PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "Failed to %s TBX shared system memory file: %s, falling back to TBX socket mode\n", createFiles ? "create" : "map", systemMemoryFile.c_str());
+        return false;
+    }
+    sharedMemoryInfo.sysMemBase = this->sharedSystemMemory->getBase();
+    sharedMemoryInfo.sysMemSize = this->sharedSystemMemory->getSize();
+
+    if (!localMemoryFile.empty()) {
+        this->sharedLocalMemory = mapFile(localMemoryFile);
+        if (!this->sharedLocalMemory) {
+            PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "Failed to %s TBX shared local memory file: %s, falling back to TBX socket mode\n", createFiles ? "create" : "map", localMemoryFile.c_str());
+            return false;
+        }
+        sharedMemoryInfo.localMemBase = this->sharedLocalMemory->getBase();
+        sharedMemoryInfo.localMemSize = this->sharedLocalMemory->getSize();
+    }
+    return true;
+}
+
+uint64_t AubCenter::getRequiredTbxSharedMemoryFileSize(bool translationTableMode, const aub_stream::AubManagerOptions &options) {
+    const uint64_t physicalMemorySize = static_cast<uint64_t>(options.devicesCount) * options.memoryBankSize;
+    return translationTableMode ? physicalMemorySize / MemoryConstants::pageSize * sizeof(uint64_t) : physicalMemorySize;
+}
+
+bool AubCenter::isTbxSharedMemorySizeSufficient(uint64_t requiredFileSize, const aub_stream::AubManagerOptions &options) const {
+    if (options.localMemorySupported) {
+        if (!this->sharedLocalMemory) {
+            PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "TbxSharedLocalMemoryFile is required with local memory, falling back to TBX socket mode\n");
+            return false;
+        }
+        if (this->sharedLocalMemory->getSize() < requiredFileSize) {
+            PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "TBX shared local memory file is too small: %llu bytes, %llu required, falling back to TBX socket mode\n",
+                         static_cast<unsigned long long>(this->sharedLocalMemory->getSize()), static_cast<unsigned long long>(requiredFileSize));
+            return false;
+        }
+        return true;
+    }
+
+    if (this->sharedSystemMemory->getSize() < requiredFileSize) {
+        PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "TBX shared system memory file is too small: %llu bytes, %llu required, falling back to TBX socket mode\n",
+                     static_cast<unsigned long long>(this->sharedSystemMemory->getSize()), static_cast<unsigned long long>(requiredFileSize));
+        return false;
+    }
+    return true;
+}
+
+void AubCenter::unmapTbxSharedMemory(aub_stream::SharedMemoryInfo &sharedMemoryInfo) {
+    sharedMemoryInfo = {};
+    this->sharedLocalMemory.reset();
+    this->sharedSystemMemory.reset();
+}
+
+void AubCenter::addImplicitArgsInfoToAubComments(uint32_t implicitArgsVersion) {
+
+    std::call_once(addImplicitArgsInfoOnceFlag, [implicitArgsVersion, this]() {
+        aubManager->addComment(NEO::AubComment::printImplicitArgsLayouts(implicitArgsVersion).c_str());
+    });
 }
 } // namespace NEO

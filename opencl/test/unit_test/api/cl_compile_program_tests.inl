@@ -1,13 +1,11 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/helpers/file_io.h"
-#include "shared/test/common/helpers/kernel_binary_helper.h"
-#include "shared/test/common/helpers/test_files.h"
+#include "shared/test/common/mocks/mock_zebin_wrapper.h"
 
 #include "opencl/source/context/context.h"
 
@@ -21,26 +19,14 @@ namespace ULT {
 
 TEST_F(ClCompileProgramTests, GivenKernelAsSingleSourceWhenCompilingProgramThenSuccessIsReturned) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    KernelBinaryHelper kbHelper("copybuffer", false);
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -66,47 +52,37 @@ TEST_F(ClCompileProgramTests, GivenKernelAsSingleSourceWhenCompilingProgramThenS
 TEST_F(ClCompileProgramTests, GivenKernelAsSourceWithHeaderWhenCompilingProgramThenSuccessIsReturned) {
     cl_program pProgram = nullptr;
     cl_program pHeader = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
-    const char *simpleHeaderName = "simple_header.h";
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("/copybuffer_with_header.cl");
+    auto copyBufferWithHeader = R"===(
+#include "simple_header.h"
+__kernel void CopyBuffer(){}
+            )===";
 
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
+    auto copyBufferWithHeaderSize = sizeof(copyBufferWithHeader);
 
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
+    auto header = R"===(
+extenr __kernel void AddBuffer();
+            )===";
 
-    const char *sources[1] = {pSource.get()};
+    auto headerSize = sizeof(header);
+    auto headerName = "simple_header.h";
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        &copyBufferWithHeader,
+        &copyBufferWithHeaderSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
     ASSERT_EQ(CL_SUCCESS, retVal);
 
-    testFile.clear();
-    testFile.append(clFiles);
-    testFile.append("simple_header.h");
-    auto pHeaderSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pHeaderSource);
-
-    const char *headerSources[1] = {pHeaderSource.get()};
     pHeader = clCreateProgramWithSource(
         pContext,
         1,
-        headerSources,
-        &sourceSize,
+        &header,
+        &headerSize,
         &retVal);
 
     EXPECT_NE(nullptr, pHeader);
@@ -119,7 +95,7 @@ TEST_F(ClCompileProgramTests, GivenKernelAsSourceWithHeaderWhenCompilingProgramT
         nullptr,
         1,
         &pHeader,
-        &simpleHeaderName,
+        &headerName,
         nullptr,
         nullptr);
 
@@ -148,24 +124,14 @@ TEST_F(ClCompileProgramTests, GivenNullProgramWhenCompilingProgramThenInvalidPro
 
 TEST_F(ClCompileProgramTests, GivenInvalidCallbackInputWhenCompileProgramThenInvalidValueErrorIsReturned) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -190,24 +156,14 @@ TEST_F(ClCompileProgramTests, GivenInvalidCallbackInputWhenCompileProgramThenInv
 
 TEST_F(ClCompileProgramTests, GivenValidCallbackInputWhenLinkProgramThenCallbackIsInvoked) {
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+    MockZebinWrapper zebin{pDevice->getHardwareInfo()};
+    zebin.setAsMockCompilerReturnedBinary();
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         pContext,
         1,
-        sources,
-        &sourceSize,
+        sampleKernelSrcs,
+        &sampleKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -234,34 +190,18 @@ TEST_F(ClCompileProgramTests, GivenValidCallbackInputWhenLinkProgramThenCallback
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-TEST(clCompileProgramTest, givenProgramWhenCompilingForInvalidDevicesInputThenInvalidDeviceErrorIsReturned) {
-    cl_program pProgram = nullptr;
-    std::unique_ptr<char[]> pSource = nullptr;
-    size_t sourceSize = 0;
-    std::string testFile;
+using ClCompileProgramMultiDeviceTest = Test<FixtureWithMockZebin>;
 
-    KernelBinaryHelper kbHelper("CopyBuffer_simd16");
-
-    testFile.append(clFiles);
-    testFile.append("CopyBuffer_simd16.cl");
-
-    pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
-
+TEST_F(ClCompileProgramMultiDeviceTest, givenProgramWhenCompilingForInvalidDevicesInputThenInvalidDeviceErrorIsReturned) {
     MockUnrestrictiveContextMultiGPU context;
+    cl_program pProgram = nullptr;
     cl_int retVal = CL_INVALID_PROGRAM;
 
     pProgram = clCreateProgramWithSource(
         &context,
         1,
         sources,
-        &sourceSize,
+        &sourceKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -328,29 +268,16 @@ TEST(clCompileProgramTest, givenProgramWhenCompilingForInvalidDevicesInputThenIn
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-TEST(clCompileProgramTest, givenMultiDeviceProgramWithCreatedKernelWhenCompilingThenInvalidOperationErrorIsReturned) {
-
+TEST_F(ClCompileProgramMultiDeviceTest, givenMultiDeviceProgramWithCreatedKernelWhenCompilingThenInvalidOperationErrorIsReturned) {
     MockSpecializedContext context;
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
     cl_int retVal = CL_INVALID_PROGRAM;
-    std::string testFile;
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         &context,
         1,
         sources,
-        &sourceSize,
+        &sourceKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);
@@ -369,7 +296,7 @@ TEST(clCompileProgramTest, givenMultiDeviceProgramWithCreatedKernelWhenCompiling
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
-    auto kernel = clCreateKernel(pProgram, "fullCopy", &retVal);
+    auto kernel = clCreateKernel(pProgram, zebinPtr->kernelName, &retVal);
 
     EXPECT_EQ(CL_SUCCESS, retVal);
 
@@ -406,29 +333,16 @@ TEST(clCompileProgramTest, givenMultiDeviceProgramWithCreatedKernelWhenCompiling
     EXPECT_EQ(CL_SUCCESS, retVal);
 }
 
-TEST(clCompileProgramTest, givenMultiDeviceProgramWithCreatedKernelsWhenCompilingThenInvalidOperationErrorIsReturned) {
-
+TEST_F(ClCompileProgramMultiDeviceTest, givenMultiDeviceProgramWithCreatedKernelsWhenCompilingThenInvalidOperationErrorIsReturned) {
     MockSpecializedContext context;
     cl_program pProgram = nullptr;
-    size_t sourceSize = 0;
     cl_int retVal = CL_INVALID_PROGRAM;
-    std::string testFile;
 
-    testFile.append(clFiles);
-    testFile.append("copybuffer.cl");
-    auto pSource = loadDataFromFile(
-        testFile.c_str(),
-        sourceSize);
-
-    ASSERT_NE(0u, sourceSize);
-    ASSERT_NE(nullptr, pSource);
-
-    const char *sources[1] = {pSource.get()};
     pProgram = clCreateProgramWithSource(
         &context,
         1,
         sources,
-        &sourceSize,
+        &sourceKernelSize,
         &retVal);
 
     EXPECT_NE(nullptr, pProgram);

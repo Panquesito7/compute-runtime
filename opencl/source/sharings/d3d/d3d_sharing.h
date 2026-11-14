@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,7 +12,6 @@
 
 #include <mutex>
 
-enum GMM_RESOURCE_FORMAT_ENUM;
 namespace NEO {
 enum class ImagePlane;
 class Context;
@@ -23,6 +22,7 @@ struct ImageInfo;
 template <typename D3D>
 class D3DSharing : public SharingHandler {
     typedef typename D3D::D3DQuery D3DQuery;
+    typedef typename D3D::D3DFence D3DFence;
     typedef typename D3D::D3DResource D3DResource;
 
   public:
@@ -36,9 +36,10 @@ class D3DSharing : public SharingHandler {
     D3DResource **getResourceHandler() { return &resource; }
     void *getResourceStaging() { return resourceStaging; }
     unsigned int &getSubresource() { return subresource; }
-    typename D3DQuery *getQuery() { return d3dQuery; }
+    D3DQuery *getQuery() { return d3dQuery; }
+    D3DFence *getFence() { return d3dFence; }
     bool isSharedResource() { return sharedResource; }
-    static const ClSurfaceFormatInfo *findSurfaceFormatInfo(GMM_RESOURCE_FORMAT_ENUM gmmFormat, cl_mem_flags flags, bool supportsOcl20Features, bool packedSupported);
+    static const ClSurfaceFormatInfo *findSurfaceFormatInfo(int gmmFormat, cl_mem_flags flags);
     static bool isFormatWithPlane1(DXGI_FORMAT format);
 
   protected:
@@ -49,6 +50,7 @@ class D3DSharing : public SharingHandler {
     D3DResource *resource = nullptr;
     D3DResource *resourceStaging = nullptr;
     D3DQuery *d3dQuery = nullptr;
+    D3DFence *d3dFence = nullptr;
     bool sharedResource = false;
     unsigned int subresource = 0;
     std::mutex mtx;

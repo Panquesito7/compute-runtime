@@ -1,15 +1,15 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2023 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "level_zero/tools/source/sysman/sysman_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/firmware/windows/mock_zes_sysman_firmware.h"
 
 extern bool sysmanUltsEnable;
 
-using ::testing::_;
 namespace L0 {
 namespace ult {
 
@@ -216,6 +216,17 @@ TEST_F(ZesFirmwareFixture, GivenValidFirmwareHandleFirmwareLibraryCallFailureWhe
     EXPECT_EQ(ZE_RESULT_SUCCESS, zesFirmwareGetProperties(handles[1], &properties));
     EXPECT_STREQ(mockSupportedFwTypes[1].c_str(), properties.name);
     EXPECT_STREQ("unknown", properties.version);
+}
+
+TEST_F(ZesFirmwareFixture, GivenValidFirmwareHandleWhenGettingFirmwareFlashProgressThenUnsupportedIsReturned) {
+    initFirmware();
+
+    FirmwareImp *ptestFirmwareImp = new FirmwareImp(pSysmanDeviceImp->pFirmwareHandleContext->pOsSysman, mockSupportedFwTypes[0]);
+    pSysmanDeviceImp->pFirmwareHandleContext->handleList.push_back(ptestFirmwareImp);
+
+    auto handles = getFirmwareHandles(mockHandleCount);
+    uint32_t completionPercent = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, zesFirmwareGetFlashProgress(handles[1], &completionPercent));
 }
 
 } // namespace ult

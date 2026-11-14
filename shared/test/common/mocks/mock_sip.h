@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,6 +8,7 @@
 #pragma once
 
 #include "shared/source/built_ins/sip.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 
 #include <memory>
@@ -18,7 +19,6 @@ class MemoryAllocation;
 
 class MockSipKernel : public SipKernel {
   public:
-    using SipKernel::createHeaderFilename;
     using SipKernel::type;
 
     MockSipKernel(SipKernelType type, GraphicsAllocation *sipAlloc);
@@ -32,9 +32,11 @@ class MockSipKernel : public SipKernel {
     const std::vector<char> &getStateSaveAreaHeader() const override;
 
     void createMockSipAllocation();
+    void createTempSipAllocation(size_t osContextCount);
 
     std::unique_ptr<MemoryAllocation> mockSipMemoryAllocation;
-    std::vector<char> mockStateSaveAreaHeader = {'s', 's', 'a', 'h'};
+    std::unique_ptr<MemoryAllocation> tempSipMemoryAllocation;
+    std::vector<char> mockStateSaveAreaHeader;
     MockExecutionEnvironment executionEnvironment;
 };
 
@@ -44,8 +46,14 @@ extern SipKernelType calledType;
 extern bool called;
 extern bool returned;
 extern bool useMockSip;
+extern bool uninitializedSipRequested;
+extern uint64_t totalWmtpDataSize;
 
 void clearUseFlags();
 std::vector<char> createStateSaveAreaHeader(uint32_t version);
+std::vector<char> createStateSaveAreaHeader(uint32_t version, uint16_t grfNum);
+std::vector<char> createStateSaveAreaHeader(uint32_t version, uint16_t grfNum, uint16_t mmeNum);
+std::vector<char> createStateSaveAreaHeaderV3Minor1();
 } // namespace MockSipData
+
 } // namespace NEO

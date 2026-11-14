@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -57,6 +57,7 @@ TEST(ArgDescPointer, WhenDefaultInitializedThenOffsetsAreUndefined) {
     EXPECT_TRUE(NEO::isUndefinedOffset(argPtr.stateless));
     EXPECT_TRUE(NEO::isUndefinedOffset(argPtr.bindless));
     EXPECT_TRUE(NEO::isUndefinedOffset(argPtr.bufferOffset));
+    EXPECT_TRUE(NEO::isUndefinedOffset(argPtr.bufferSize));
     EXPECT_TRUE(NEO::isUndefinedOffset(argPtr.slmOffset));
 
     EXPECT_EQ(0U, argPtr.requiredSlmAlignment);
@@ -85,10 +86,6 @@ TEST(ArgDescImage, WhenDefaultInitializedThenOffsetsAreUndefined) {
     EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.arraySize));
     EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.numSamples));
     EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.numMipLevels));
-    EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.flatBaseOffset));
-    EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.flatWidth));
-    EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.flatHeight));
-    EXPECT_TRUE(NEO::isUndefinedOffset(argImage.metadataPayload.flatPitch));
 }
 
 TEST(ArgDescSampler, WhenDefaultInitializedThenOffsetsAreUndefined) {
@@ -113,7 +110,7 @@ TEST(ArgDescValue, WhenDefaultInitializedThenOffsetsAreUndefined) {
 
 TEST(ArgDescriptor, WhenDefaultInitializedThenTypeIsUnknown) {
     NEO::ArgDescriptor arg;
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTUnknown, arg.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTUnknown, arg.type);
 }
 
 TEST(ArgDescriptorExtendedTypeInfo, WhenDefaultInitializedThenFlagsAreCleared) {
@@ -201,15 +198,15 @@ TEST(ArgDescriptorIsReadOnly, GivenValueArgThenReturnsTrue) {
 }
 
 TEST(ArgDescriptorIs, WhenQueriedThenComparesAgainstStoredArgType) {
-    NEO::ArgDescriptor args[] = {{NEO::ArgDescriptor::ArgTPointer},
-                                 {NEO::ArgDescriptor::ArgTImage},
-                                 {NEO::ArgDescriptor::ArgTSampler},
-                                 {NEO::ArgDescriptor::ArgTValue}};
+    NEO::ArgDescriptor args[] = {{NEO::ArgDescriptor::argTPointer},
+                                 {NEO::ArgDescriptor::argTImage},
+                                 {NEO::ArgDescriptor::argTSampler},
+                                 {NEO::ArgDescriptor::argTValue}};
     for (const auto &arg : args) {
-        EXPECT_EQ(arg.type == NEO::ArgDescriptor::ArgTPointer, arg.is<NEO::ArgDescriptor::ArgTPointer>());
-        EXPECT_EQ(arg.type == NEO::ArgDescriptor::ArgTImage, arg.is<NEO::ArgDescriptor::ArgTImage>());
-        EXPECT_EQ(arg.type == NEO::ArgDescriptor::ArgTSampler, arg.is<NEO::ArgDescriptor::ArgTSampler>());
-        EXPECT_EQ(arg.type == NEO::ArgDescriptor::ArgTValue, arg.is<NEO::ArgDescriptor::ArgTValue>());
+        EXPECT_EQ(arg.type == NEO::ArgDescriptor::argTPointer, arg.is<NEO::ArgDescriptor::argTPointer>());
+        EXPECT_EQ(arg.type == NEO::ArgDescriptor::argTImage, arg.is<NEO::ArgDescriptor::argTImage>());
+        EXPECT_EQ(arg.type == NEO::ArgDescriptor::argTSampler, arg.is<NEO::ArgDescriptor::argTSampler>());
+        EXPECT_EQ(arg.type == NEO::ArgDescriptor::argTValue, arg.is<NEO::ArgDescriptor::argTValue>());
     }
 }
 
@@ -223,10 +220,10 @@ TEST(ArgDescriptorAs, GivenUninitializedArgWhenInitializationRequestedThenInitia
     argImage.as<NEO::ArgDescImage>(true);
     argSampler.as<NEO::ArgDescSampler>(true);
     argValue.as<NEO::ArgDescValue>(true);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTPointer, argPointer.type);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTImage, argImage.type);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTSampler, argSampler.type);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTValue, argValue.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTPointer, argPointer.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTImage, argImage.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTSampler, argSampler.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTValue, argValue.type);
 }
 
 TEST(ArgDescriptorAs, GivenUninitializedArgWhenInitializationNotRequestedThenAborts) {
@@ -239,10 +236,10 @@ TEST(ArgDescriptorAs, GivenUninitializedArgWhenInitializationNotRequestedThenAbo
     EXPECT_THROW(argImage.as<NEO::ArgDescImage>(false), std::exception);
     EXPECT_THROW(argSampler.as<NEO::ArgDescSampler>(false), std::exception);
     EXPECT_THROW(argValue.as<NEO::ArgDescValue>(false), std::exception);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTUnknown, argPointer.type);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTUnknown, argImage.type);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTUnknown, argSampler.type);
-    EXPECT_EQ(NEO::ArgDescriptor::ArgTUnknown, argValue.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTUnknown, argPointer.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTUnknown, argImage.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTUnknown, argSampler.type);
+    EXPECT_EQ(NEO::ArgDescriptor::argTUnknown, argValue.type);
 }
 
 TEST(ArgDescriptorAs, GivenMismatchedArgTypeThenAborts) {
@@ -301,7 +298,7 @@ TEST(ArgDescriptorAs, GivenMismatchedArgTypeThenAborts) {
 
 TEST(ArgDescriptorCopyAssign, WhenCopyAssignedThenCopiesExtendedTypeInfo) {
     NEO::ArgDescriptor arg0;
-    arg0.getExtendedTypeInfo().isAccelerator = true;
+    arg0.getExtendedTypeInfo().isMediaBlockImage = true;
 
     NEO::ArgDescriptor arg1{arg0};
     NEO::ArgDescriptor arg2;
@@ -331,6 +328,7 @@ TEST(ArgDescriptorCopyAssign, GivenPointerArgWhenCopyAssignedThenCopiesDataBased
     argPointer.stateless = 3;
     argPointer.bindless = 5;
     argPointer.bufferOffset = 7;
+    argPointer.bufferSize = 9;
     argPointer.slmOffset = 11;
     argPointer.requiredSlmAlignment = 13;
     argPointer.pointerSize = 17;
@@ -342,6 +340,7 @@ TEST(ArgDescriptorCopyAssign, GivenPointerArgWhenCopyAssignedThenCopiesDataBased
     EXPECT_EQ(argPointer.stateless, arg2.as<NEO::ArgDescPointer>().stateless);
     EXPECT_EQ(argPointer.bindless, arg2.as<NEO::ArgDescPointer>().bindless);
     EXPECT_EQ(argPointer.bufferOffset, arg2.as<NEO::ArgDescPointer>().bufferOffset);
+    EXPECT_EQ(argPointer.bufferSize, arg2.as<NEO::ArgDescPointer>().bufferSize);
     EXPECT_EQ(argPointer.slmOffset, arg2.as<NEO::ArgDescPointer>().slmOffset);
     EXPECT_EQ(argPointer.requiredSlmAlignment, arg2.as<NEO::ArgDescPointer>().requiredSlmAlignment);
     EXPECT_EQ(argPointer.pointerSize, arg2.as<NEO::ArgDescPointer>().pointerSize);
@@ -364,11 +363,6 @@ TEST(ArgDescriptorCopyAssign, GivenImageArgWhenCopyAssignedThenCopiesDataBasedOn
     argImage.metadataPayload.numSamples = 23;
     argImage.metadataPayload.numMipLevels = 29;
 
-    argImage.metadataPayload.flatBaseOffset = 31;
-    argImage.metadataPayload.flatWidth = 37;
-    argImage.metadataPayload.flatHeight = 41;
-    argImage.metadataPayload.flatPitch = 43;
-
     NEO::ArgDescriptor arg2;
     arg2 = arg0;
     EXPECT_EQ(argImage.metadataPayload.imgWidth, arg2.as<NEO::ArgDescImage>().metadataPayload.imgWidth);
@@ -379,10 +373,6 @@ TEST(ArgDescriptorCopyAssign, GivenImageArgWhenCopyAssignedThenCopiesDataBasedOn
     EXPECT_EQ(argImage.metadataPayload.arraySize, arg2.as<NEO::ArgDescImage>().metadataPayload.arraySize);
     EXPECT_EQ(argImage.metadataPayload.numSamples, arg2.as<NEO::ArgDescImage>().metadataPayload.numSamples);
     EXPECT_EQ(argImage.metadataPayload.numMipLevels, arg2.as<NEO::ArgDescImage>().metadataPayload.numMipLevels);
-    EXPECT_EQ(argImage.metadataPayload.flatBaseOffset, arg2.as<NEO::ArgDescImage>().metadataPayload.flatBaseOffset);
-    EXPECT_EQ(argImage.metadataPayload.flatWidth, arg2.as<NEO::ArgDescImage>().metadataPayload.flatWidth);
-    EXPECT_EQ(argImage.metadataPayload.flatHeight, arg2.as<NEO::ArgDescImage>().metadataPayload.flatHeight);
-    EXPECT_EQ(argImage.metadataPayload.flatPitch, arg2.as<NEO::ArgDescImage>().metadataPayload.flatPitch);
 }
 
 TEST(ArgDescriptorCopyAssign, GivenSamplerArgWhenCopyAssignedThenCopiesDataBasedOnArgType) {
@@ -460,6 +450,19 @@ TEST(PatchNonPointer, GivenValidOffsetThenPatchProperly) {
     *reinterpret_cast<uint32_t *>(expected) = value32;
     *reinterpret_cast<uint64_t *>(expected + 8) = value64;
     *reinterpret_cast<uint64_t *>(expected + sizeof(expected) - sizeof(value64)) = value64;
+    EXPECT_EQ(0, memcmp(expected, buffer, sizeof(buffer)));
+}
+
+TEST(PatchNonPointer, GivenOffsetNotAlignedToValueSizeThenPatchProperly) {
+    alignas(8) uint8_t buffer[64];
+    memset(buffer, 3, sizeof(buffer));
+    uint64_t value64 = 0x1122334455667788;
+    constexpr NEO::CrossThreadDataOffset offsetAlignedToDwordOnly = 20;
+    EXPECT_TRUE((NEO::patchNonPointer<uint64_t, uint64_t>(buffer, offsetAlignedToDwordOnly, value64)));
+
+    alignas(8) uint8_t expected[64];
+    memset(expected, 3, sizeof(expected));
+    memcpy(expected + offsetAlignedToDwordOnly, &value64, sizeof(value64));
     EXPECT_EQ(0, memcmp(expected, buffer, sizeof(buffer)));
 }
 

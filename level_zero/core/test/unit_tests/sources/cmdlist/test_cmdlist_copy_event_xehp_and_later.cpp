@@ -1,20 +1,27 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/command_container/implicit_scaling.h"
 #include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/helpers/timestamp_packet.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/helpers/unit_test_helper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/context/context.h"
 #include "level_zero/core/source/gfx_core_helpers/l0_gfx_core_helper.h"
 #include "level_zero/core/test/unit_tests/fixtures/cmdlist_fixture.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 
 namespace L0 {
+struct Context;
+class DriverHandle;
+
 namespace ult {
 
 struct CopyTestInput {
@@ -29,30 +36,26 @@ struct CopyTestInput {
 
     ze_event_pool_flags_t eventPoolFlags = 0;
 
-    int32_t usePipeControlMultiPacketEventSync;
-
     bool useFirstEventPacketAddress = false;
     bool signalAllPackets = false;
-    bool allPackets = false;
 };
 
-template <int32_t usePipeControlMultiPacketEventSync, int32_t compactL3FlushEventPacket, uint32_t multiTile>
-struct AppendMemoryCopyMultiPacketEventFixture : public DeviceFixture {
+template <int32_t compactL3FlushEventPacket, uint32_t multiTile>
+struct AppendMemoryCopyEventPacketFixture : public DeviceFixture {
     void setUp() {
-        DebugManager.flags.UsePipeControlMultiKernelEventSync.set(usePipeControlMultiPacketEventSync);
-        DebugManager.flags.CompactL3FlushEventPacket.set(compactL3FlushEventPacket);
+        debugManager.flags.CompactL3FlushEventPacket.set(compactL3FlushEventPacket);
+        debugManager.flags.EnableL3FlushAfterPostSync.set(0);
+
         if constexpr (multiTile == 1) {
-            DebugManager.flags.CreateMultipleSubDevices.set(2);
-            DebugManager.flags.EnableImplicitScaling.set(1);
+            debugManager.flags.CreateMultipleSubDevices.set(2);
+            debugManager.flags.EnableImplicitScaling.set(1);
         }
         DeviceFixture::setUp();
 
         input.driver = driverHandle.get();
         input.context = context;
         input.device = device;
-        input.usePipeControlMultiPacketEventSync = usePipeControlMultiPacketEventSync;
-        input.signalAllPackets = L0GfxCoreHelper::useSignalAllEventPackets(device->getHwInfo());
-        input.allPackets = !usePipeControlMultiPacketEventSync && !compactL3FlushEventPacket;
+        input.signalAllPackets = true;
 
         ze_event_pool_desc_t eventPoolDesc = {};
         eventPoolDesc.count = 1;
@@ -63,7 +66,7 @@ struct AppendMemoryCopyMultiPacketEventFixture : public DeviceFixture {
         ze_result_t result = ZE_RESULT_SUCCESS;
         testEventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-        testEvent = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(testEventPool.get(), &eventDesc, input.device));
+        testEvent = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(testEventPool.get(), &eventDesc, input.device, result));
     }
 
     void tearDown() {
@@ -85,15 +88,15 @@ struct AppendMemoryCopyMultiPacketEventFixture : public DeviceFixture {
 template <GFXCORE_FAMILY gfxCoreFamily>
 void testSingleTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
     commandList.appendMemoryCopyKernelWithGACallBase = true;
 
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
 
     ze_event_pool_desc_t eventPoolDesc = {};
     eventPoolDesc.count = 1;
@@ -105,7 +108,94 @@ void testSingleTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpect
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
+
+    uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
+
+    uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
+    uint64_t secondKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + event->getSinglePacketSize();
+    uint64_t thirdKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 2 * event->getSinglePacketSize();
+    CmdListMemoryCopyParams copyParams = {};
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
+    EXPECT_EQ(3u, commandList.appendMemoryCopyKernelWithGACalled);
+    EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
+    EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
+        commandList.commandContainer.getCommandStream()->getUsed()));
+
+    auto itWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
+
+    constexpr size_t nWalkers = 3u;
+    ASSERT_EQ(nWalkers, itWalkers.size());
+
+    uint64_t kernelEventAddresses[nWalkers] = {firstKernelEventAddress,
+                                               secondKernelEventAddress,
+                                               thirdKernelEventAddress};
+
+    for (auto i = 0u; i < itWalkers.size(); i++) {
+        auto walkerItor = itWalkers[i];
+        auto walker = genCmdCast<WalkerType *>(*walkerItor);
+
+        auto &postSync = walker->getPostSync();
+
+        EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+        EXPECT_EQ(kernelEventAddresses[i], postSync.getDestinationAddress());
+    }
+
+    if (event->isEventTimestampFlagSet()) {
+        gpuBaseAddress += event->getContextEndOffset();
+    }
+
+    size_t expectedPostSyncStoreDataImm = 0;
+    uint64_t storeDataImmAddress = gpuBaseAddress;
+    if (input.signalAllPackets) {
+        expectedPostSyncStoreDataImm = arg.expectStoreDataImm;
+        storeDataImmAddress += input.storeDataImmOffset;
+    }
+
+    auto itorStoreDataImm = findAll<MI_STORE_DATA_IMM *>(itWalkers[0], cmdList.end());
+    ASSERT_EQ(expectedPostSyncStoreDataImm, itorStoreDataImm.size());
+
+    for (size_t i = 0; i < expectedPostSyncStoreDataImm; i++) {
+        auto cmd = genCmdCast<MI_STORE_DATA_IMM *>(*itorStoreDataImm[i]);
+        EXPECT_EQ(storeDataImmAddress, cmd->getAddress());
+        EXPECT_FALSE(cmd->getStoreQword());
+        EXPECT_EQ(Event::STATE_SIGNALED, cmd->getDataDword0());
+        storeDataImmAddress += event->getSinglePacketSize();
+    }
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, TestExpectedValues &arg) {
+    using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
+
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    using POST_SYNC_OPERATION = typename FamilyType::PIPE_CONTROL::POST_SYNC_OPERATION;
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
+    commandList.appendMemoryCopyKernelWithGACallBase = true;
+
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = input.eventPoolFlags;
+
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
 
@@ -113,36 +203,130 @@ void testSingleTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpect
     uint64_t secondKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + event->getSinglePacketSize();
     uint64_t thirdKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 2 * event->getSinglePacketSize();
 
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
+    CmdListMemoryCopyParams copyParams = {};
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
     EXPECT_EQ(3u, commandList.appendMemoryCopyKernelWithGACalled);
     EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
     EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
         commandList.commandContainer.getCommandStream()->getUsed()));
 
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
-    ASSERT_EQ(3u, itorWalkers.size());
+    auto itWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
+
+    constexpr size_t nWalkers = 3u;
+    ASSERT_EQ(nWalkers, itWalkers.size());
+
+    uint64_t kernelEventAddresses[nWalkers] = {firstKernelEventAddress,
+                                               secondKernelEventAddress,
+                                               thirdKernelEventAddress};
+
+    for (auto i = 0u; i < itWalkers.size(); i++) {
+        auto walkerItor = itWalkers[i];
+        auto walker = genCmdCast<WalkerType *>(*walkerItor);
+
+        auto &postSync = walker->getPostSync();
+
+        EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+        EXPECT_EQ(kernelEventAddresses[i], postSync.getDestinationAddress());
+    }
+
+    if (event->isEventTimestampFlagSet()) {
+        gpuBaseAddress += event->getContextEndOffset();
+    }
+
+    uint64_t l3FlushPostSyncAddress = gpuBaseAddress;
+
+    auto itorStoreDataImm = findAll<MI_STORE_DATA_IMM *>(itWalkers[2], cmdList.end());
+    size_t expectedPostSyncStoreDataImm = 0;
+    uint64_t storeDataImmAddress = gpuBaseAddress;
+    if (input.signalAllPackets) {
+        l3FlushPostSyncAddress = gpuBaseAddress + (event->getMaxPacketsCount() - 1) * event->getSinglePacketSize();
+
+        storeDataImmAddress += input.storeDataImmOffset;
+        expectedPostSyncStoreDataImm = arg.expectStoreDataImm;
+    }
+    ASSERT_EQ(expectedPostSyncStoreDataImm, itorStoreDataImm.size());
+
+    for (size_t i = 0; i < expectedPostSyncStoreDataImm; i++) {
+        auto cmd = genCmdCast<MI_STORE_DATA_IMM *>(*itorStoreDataImm[i]);
+        EXPECT_EQ(storeDataImmAddress, cmd->getAddress());
+        EXPECT_FALSE(cmd->getStoreQword());
+        EXPECT_EQ(Event::STATE_SIGNALED, cmd->getDataDword0());
+        storeDataImmAddress += event->getSinglePacketSize();
+    }
+
+    auto itorPipeControls = findAll<PIPE_CONTROL *>(itWalkers[0], cmdList.end());
+
+    uint32_t postSyncPipeControls = 0;
+    uint32_t dcFlushFound = 0;
+    for (auto it : itorPipeControls) {
+        auto cmd = genCmdCast<PIPE_CONTROL *>(*it);
+        if (cmd->getPostSyncOperation() == POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA) {
+            postSyncPipeControls++;
+            EXPECT_EQ(l3FlushPostSyncAddress, NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*cmd));
+            EXPECT_EQ(Event::STATE_SIGNALED, cmd->getImmediateData());
+        }
+        if (cmd->getDcFlushEnable()) {
+            dcFlushFound++;
+        }
+    }
+    EXPECT_EQ(arg.expectedPostSyncPipeControls, postSyncPipeControls);
+    EXPECT_EQ(1u, dcFlushFound);
+}
+
+template <GFXCORE_FAMILY gfxCoreFamily>
+void testSingleTileAppendMemoryCopySingleKernel(CopyTestInput &input, TestExpectedValues &arg) {
+    using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
+
+    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
+
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
+    commandList.appendMemoryCopyKernelWithGACallBase = true;
+
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
+
+    uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
+    uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
+    CmdListMemoryCopyParams copyParams = {};
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
+    EXPECT_EQ(1u, commandList.appendMemoryCopyKernelWithGACalled);
+    EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
+    EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
+        commandList.commandContainer.getCommandStream()->getUsed()));
+
+    auto itorWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(1u, itorWalkers.size());
     auto firstWalker = itorWalkers[0];
-    auto secondWalker = itorWalkers[1];
-    auto thirdWalker = itorWalkers[2];
 
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    auto walker = genCmdCast<WalkerType *>(*firstWalker);
+    auto &postSync = walker->getPostSync();
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*secondWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(secondKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+    EXPECT_EQ(firstKernelEventAddress, postSync.getDestinationAddress());
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*thirdWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(thirdKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
-
-    if (event->isUsingContextEndOffset()) {
+    if (event->isEventTimestampFlagSet()) {
         gpuBaseAddress += event->getContextEndOffset();
     }
 
@@ -166,19 +350,19 @@ void testSingleTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpect
 }
 
 template <GFXCORE_FAMILY gfxCoreFamily>
-void testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, TestExpectedValues &arg) {
+void testSingleTileAppendMemoryCopySingleKernelAndL3Flush(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using POST_SYNC_OPERATION = typename FamilyType::PIPE_CONTROL::POST_SYNC_OPERATION;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
     commandList.appendMemoryCopyKernelWithGACallBase = true;
 
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
 
     ze_event_pool_desc_t eventPoolDesc = {};
     eventPoolDesc.count = 1;
@@ -191,53 +375,42 @@ void testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, 
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
 
     uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
-    uint64_t secondKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + event->getSinglePacketSize();
-    uint64_t thirdKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 2 * event->getSinglePacketSize();
-
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
-    EXPECT_EQ(3u, commandList.appendMemoryCopyKernelWithGACalled);
+    CmdListMemoryCopyParams copyParams = {};
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
+    EXPECT_EQ(1u, commandList.appendMemoryCopyKernelWithGACalled);
     EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
     EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
         commandList.commandContainer.getCommandStream()->getUsed()));
 
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
-    ASSERT_EQ(3u, itorWalkers.size());
+    auto itorWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
+    ASSERT_EQ(1u, itorWalkers.size());
     auto firstWalker = itorWalkers[0];
-    auto secondWalker = itorWalkers[1];
-    auto thirdWalker = itorWalkers[2];
 
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    auto walker = genCmdCast<WalkerType *>(*firstWalker);
+    auto &postSync = walker->getPostSync();
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*secondWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(secondKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+    EXPECT_EQ(firstKernelEventAddress, postSync.getDestinationAddress());
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*thirdWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(thirdKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
-
-    if (event->isUsingContextEndOffset()) {
+    if (event->isEventTimestampFlagSet()) {
         gpuBaseAddress += event->getContextEndOffset();
     }
 
-    uint64_t l3FlushPostSyncAddress = gpuBaseAddress + 2 * event->getSinglePacketSize() + event->getSinglePacketSize();
-    if (input.usePipeControlMultiPacketEventSync == 1 || input.useFirstEventPacketAddress) {
+    uint64_t l3FlushPostSyncAddress = gpuBaseAddress + event->getSinglePacketSize();
+    if (input.useFirstEventPacketAddress) {
         l3FlushPostSyncAddress = gpuBaseAddress;
     }
 
-    auto itorStoreDataImm = findAll<MI_STORE_DATA_IMM *>(thirdWalker, cmdList.end());
+    auto itorStoreDataImm = findAll<MI_STORE_DATA_IMM *>(firstWalker, cmdList.end());
     size_t expectedPostSyncStoreDataImm = 0;
     uint64_t storeDataImmAddress = gpuBaseAddress;
     if (input.signalAllPackets) {
@@ -276,185 +449,13 @@ void testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, 
 }
 
 template <GFXCORE_FAMILY gfxCoreFamily>
-void testSingleTileAppendMemoryCopySingleKernel(CopyTestInput &input, TestExpectedValues &arg) {
-    using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
-    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
-
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
-    commandList.appendMemoryCopyKernelWithGACallBase = true;
-
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
-
-    ze_event_pool_desc_t eventPoolDesc = {};
-    eventPoolDesc.count = 1;
-    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    ze_event_desc_t eventDesc = {};
-    eventDesc.index = 0;
-
-    ze_result_t result = ZE_RESULT_SUCCESS;
-    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
-
-    uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
-    uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
-
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
-    EXPECT_EQ(1u, commandList.appendMemoryCopyKernelWithGACalled);
-    EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
-    EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
-
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
-        commandList.commandContainer.getCommandStream()->getUsed()));
-
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
-    ASSERT_EQ(1u, itorWalkers.size());
-    auto firstWalker = itorWalkers[0];
-
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
-
-    if (event->isUsingContextEndOffset()) {
-        gpuBaseAddress += event->getContextEndOffset();
-    }
-
-    size_t expectedPostSyncStoreDataImm = 0;
-    uint64_t storeDataImmAddress = gpuBaseAddress;
-    if (input.signalAllPackets) {
-        expectedPostSyncStoreDataImm = arg.expectStoreDataImm;
-        storeDataImmAddress += input.storeDataImmOffset;
-    }
-
-    auto itorStoreDataImm = findAll<MI_STORE_DATA_IMM *>(firstWalker, cmdList.end());
-    ASSERT_EQ(expectedPostSyncStoreDataImm, itorStoreDataImm.size());
-
-    for (size_t i = 0; i < expectedPostSyncStoreDataImm; i++) {
-        auto cmd = genCmdCast<MI_STORE_DATA_IMM *>(*itorStoreDataImm[i]);
-        EXPECT_EQ(storeDataImmAddress, cmd->getAddress());
-        EXPECT_FALSE(cmd->getStoreQword());
-        EXPECT_EQ(Event::STATE_SIGNALED, cmd->getDataDword0());
-        storeDataImmAddress += event->getSinglePacketSize();
-    }
-}
-
-template <GFXCORE_FAMILY gfxCoreFamily>
-void testSingleTileAppendMemoryCopySingleKernelAndL3Flush(CopyTestInput &input, TestExpectedValues &arg) {
-    using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using POST_SYNC_OPERATION = typename FamilyType::PIPE_CONTROL::POST_SYNC_OPERATION;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
-    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
-
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
-    commandList.appendMemoryCopyKernelWithGACallBase = true;
-
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
-
-    ze_event_pool_desc_t eventPoolDesc = {};
-    eventPoolDesc.count = 1;
-    eventPoolDesc.flags = input.eventPoolFlags;
-
-    ze_event_desc_t eventDesc = {};
-    eventDesc.index = 0;
-    eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
-
-    ze_result_t result = ZE_RESULT_SUCCESS;
-    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
-    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
-
-    uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
-
-    uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
-
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
-    EXPECT_EQ(1u, commandList.appendMemoryCopyKernelWithGACalled);
-    EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
-    EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
-
-    GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
-        commandList.commandContainer.getCommandStream()->getUsed()));
-
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
-    ASSERT_EQ(1u, itorWalkers.size());
-    auto firstWalker = itorWalkers[0];
-
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
-
-    if (event->isUsingContextEndOffset()) {
-        gpuBaseAddress += event->getContextEndOffset();
-    }
-
-    uint64_t l3FlushPostSyncAddress = gpuBaseAddress + event->getSinglePacketSize();
-    if (input.useFirstEventPacketAddress) {
-        l3FlushPostSyncAddress = gpuBaseAddress;
-    }
-
-    auto itorStoreDataImm = findAll<MI_STORE_DATA_IMM *>(firstWalker, cmdList.end());
-    size_t expectedPostSyncStoreDataImm = 0;
-    uint64_t storeDataImmAddress = gpuBaseAddress;
-    if (input.signalAllPackets) {
-        if (!input.allPackets) {
-            l3FlushPostSyncAddress = gpuBaseAddress + (event->getMaxPacketsCount() - 1) * event->getSinglePacketSize();
-        }
-
-        storeDataImmAddress += input.storeDataImmOffset;
-        expectedPostSyncStoreDataImm = arg.expectStoreDataImm;
-    }
-    ASSERT_EQ(expectedPostSyncStoreDataImm, itorStoreDataImm.size());
-
-    for (size_t i = 0; i < expectedPostSyncStoreDataImm; i++) {
-        auto cmd = genCmdCast<MI_STORE_DATA_IMM *>(*itorStoreDataImm[i]);
-        EXPECT_EQ(storeDataImmAddress, cmd->getAddress());
-        EXPECT_FALSE(cmd->getStoreQword());
-        EXPECT_EQ(Event::STATE_SIGNALED, cmd->getDataDword0());
-        storeDataImmAddress += event->getSinglePacketSize();
-    }
-
-    auto itorPipeControls = findAll<PIPE_CONTROL *>(firstWalker, cmdList.end());
-
-    uint32_t postSyncPipeControls = 0;
-    uint32_t dcFlushFound = 0;
-    for (auto it : itorPipeControls) {
-        auto cmd = genCmdCast<PIPE_CONTROL *>(*it);
-        if (cmd->getPostSyncOperation() == POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA) {
-            postSyncPipeControls++;
-            EXPECT_EQ(l3FlushPostSyncAddress, NEO::UnitTestHelper<FamilyType>::getPipeControlPostSyncAddress(*cmd));
-            EXPECT_EQ(Event::STATE_SIGNALED, cmd->getImmediateData());
-        }
-        if (cmd->getDcFlushEnable()) {
-            dcFlushFound++;
-        }
-    }
-    EXPECT_EQ(arg.expectedPostSyncPipeControls, postSyncPipeControls);
-    EXPECT_EQ(1u, dcFlushFound);
-}
-
-template <GFXCORE_FAMILY gfxCoreFamily>
 void testSingleTileAppendMemoryCopySignalScopeEventToSubDevice(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using POST_SYNC_OPERATION = typename PIPE_CONTROL::POST_SYNC_OPERATION;
-    using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
     ze_result_t result = ZE_RESULT_SUCCESS;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, input.device, NEO::EngineGroupType::RenderCompute, 0u, result));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(input.device, NEO::EngineGroupType::renderCompute, 0u, result, false));
     auto &commandContainer = commandList->getCmdContainer();
 
     ze_event_pool_desc_t eventPoolDesc = {};
@@ -464,20 +465,21 @@ void testSingleTileAppendMemoryCopySignalScopeEventToSubDevice(CopyTestInput &in
     ze_event_desc_t eventDesc = {};
     eventDesc.index = 0;
     eventDesc.signal = ZE_EVENT_SCOPE_FLAG_SUBDEVICE;
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     size_t usedBefore = commandContainer.getCommandStream()->getUsed();
-    result = commandList->appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event.get(), 0, nullptr, false);
+    CmdListMemoryCopyParams copyParams = {};
+    result = commandList->appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event.get(), 0, nullptr, copyParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     size_t usedAfter = commandContainer.getCommandStream()->getUsed();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandContainer.getCommandStream()->getCpuBase(), usedBefore),
         usedAfter - usedBefore));
 
-    auto itorWalker = find<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    auto itorWalker = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
     ASSERT_NE(cmdList.end(), itorWalker);
 
     auto pipeControls = findAll<PIPE_CONTROL *>(itorWalker, cmdList.end());
@@ -504,15 +506,16 @@ void testSingleTileAppendMemoryCopySignalScopeEventToSubDevice(CopyTestInput &in
 template <GFXCORE_FAMILY gfxCoreFamily>
 void testMultiTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
+
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
     commandList.appendMemoryCopyKernelWithGACallBase = true;
 
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
     EXPECT_EQ(2u, commandList.partitionCount);
 
     ze_event_pool_desc_t eventPoolDesc = {};
@@ -525,44 +528,40 @@ void testMultiTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpecte
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
 
     uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
     uint64_t secondKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 2 * event->getSinglePacketSize();
     uint64_t thirdKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 4 * event->getSinglePacketSize();
-
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
+    CmdListMemoryCopyParams copyParams = {};
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
     EXPECT_EQ(3u, commandList.appendMemoryCopyKernelWithGACalled);
     EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
     EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
         commandList.commandContainer.getCommandStream()->getUsed()));
 
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    auto itorWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
     ASSERT_EQ(3u, itorWalkers.size());
     auto firstWalker = itorWalkers[0];
-    auto secondWalker = itorWalkers[1];
-    auto thirdWalker = itorWalkers[2];
+    uint64_t expectedKernelEventAddress[]{firstKernelEventAddress, secondKernelEventAddress, thirdKernelEventAddress};
 
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    for (auto i = 0u; i < itorWalkers.size(); i++) {
+        auto walkerItor = itorWalkers[i];
+        auto walker = genCmdCast<WalkerType *>(*walkerItor);
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*secondWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(secondKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+        auto &postSync = walker->getPostSync();
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*thirdWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(thirdKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+        EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+        EXPECT_EQ(expectedKernelEventAddress[i], postSync.getDestinationAddress());
+    }
 
-    if (event->isUsingContextEndOffset()) {
+    if (event->isEventTimestampFlagSet()) {
         gpuBaseAddress += event->getContextEndOffset();
     }
 
@@ -593,17 +592,19 @@ void testMultiTileAppendMemoryCopyThreeKernels(CopyTestInput &input, TestExpecte
 template <GFXCORE_FAMILY gfxCoreFamily>
 void testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
+
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using POST_SYNC_OPERATION = typename PIPE_CONTROL::POST_SYNC_OPERATION;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
+
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
     commandList.appendMemoryCopyKernelWithGACallBase = true;
 
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
     EXPECT_EQ(2u, commandList.partitionCount);
     auto &commandContainer = commandList.commandContainer;
 
@@ -618,55 +619,50 @@ void testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, T
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
 
     uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
     uint64_t secondKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 2 * event->getSinglePacketSize();
     uint64_t thirdKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress + 4 * event->getSinglePacketSize();
-
+    CmdListMemoryCopyParams copyParams = {};
     size_t usedBefore = commandContainer.getCommandStream()->getUsed();
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
     size_t usedAfter = commandContainer.getCommandStream()->getUsed();
 
     EXPECT_EQ(3u, commandList.appendMemoryCopyKernelWithGACalled);
     EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
     EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandContainer.getCommandStream()->getCpuBase(), usedBefore),
         usedAfter - usedBefore));
 
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    auto itorWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
     ASSERT_EQ(3u, itorWalkers.size());
     auto firstWalker = itorWalkers[0];
-    auto secondWalker = itorWalkers[1];
     auto thirdWalker = itorWalkers[2];
 
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    uint64_t expectedKernelEventAddress[]{firstKernelEventAddress, secondKernelEventAddress, thirdKernelEventAddress};
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*secondWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(secondKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    for (auto i = 0u; i < itorWalkers.size(); i++) {
+        auto walkerItor = itorWalkers[i];
+        auto walker = genCmdCast<WalkerType *>(*walkerItor);
 
-    walkerCmd = genCmdCast<COMPUTE_WALKER *>(*thirdWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(thirdKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+        auto &postSync = walker->getPostSync();
 
-    if (event->isUsingContextEndOffset()) {
+        EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+        EXPECT_EQ(expectedKernelEventAddress[i], postSync.getDestinationAddress());
+    }
+
+    if (event->isEventTimestampFlagSet()) {
         gpuBaseAddress += event->getContextEndOffset();
     }
 
-    uint64_t l3FlushPostSyncAddress = gpuBaseAddress + 6 * event->getSinglePacketSize();
-    if (input.usePipeControlMultiPacketEventSync == 1 || input.useFirstEventPacketAddress) {
-        l3FlushPostSyncAddress = gpuBaseAddress;
-    }
+    uint64_t l3FlushPostSyncAddress = gpuBaseAddress;
 
     // three kernels, each kernel cleanup of 3 SDI
     constexpr uint32_t kernels = 3;
@@ -677,9 +673,7 @@ void testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, T
     size_t expectedPostSyncStoreDataImm = 0;
     uint64_t storeDataImmAddress = gpuBaseAddress;
     if (input.signalAllPackets) {
-        if (!input.allPackets) {
-            l3FlushPostSyncAddress = gpuBaseAddress + (event->getMaxPacketsCount() - commandList.partitionCount) * event->getSinglePacketSize();
-        }
+        l3FlushPostSyncAddress = gpuBaseAddress + (event->getMaxPacketsCount() - commandList.partitionCount) * event->getSinglePacketSize();
 
         storeDataImmAddress += input.storeDataImmOffset;
         expectedPostSyncStoreDataImm = arg.expectStoreDataImm;
@@ -721,15 +715,16 @@ void testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush(CopyTestInput &input, T
 template <GFXCORE_FAMILY gfxCoreFamily>
 void testMultiTileAppendMemoryCopySingleKernel(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
+
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
     commandList.appendMemoryCopyKernelWithGACallBase = true;
 
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
     EXPECT_EQ(2u, commandList.partitionCount);
 
     ze_event_pool_desc_t eventPoolDesc = {};
@@ -742,31 +737,32 @@ void testMultiTileAppendMemoryCopySingleKernel(CopyTestInput &input, TestExpecte
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
     uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
-
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
+    CmdListMemoryCopyParams copyParams = {};
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
     EXPECT_EQ(1u, commandList.appendMemoryCopyKernelWithGACalled);
     EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
     EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList.commandContainer.getCommandStream()->getCpuBase(), 0),
         commandList.commandContainer.getCommandStream()->getUsed()));
 
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    auto itorWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
     ASSERT_EQ(1u, itorWalkers.size());
     auto firstWalker = itorWalkers[0];
 
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    auto walker = genCmdCast<WalkerType *>(*firstWalker);
+    auto &postSync = walker->getPostSync();
 
-    if (event->isUsingContextEndOffset()) {
+    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+    EXPECT_EQ(firstKernelEventAddress, postSync.getDestinationAddress());
+
+    if (event->isEventTimestampFlagSet()) {
         gpuBaseAddress += event->getContextEndOffset();
     }
     // single kernel, cleanup of 3 SDI
@@ -795,17 +791,18 @@ void testMultiTileAppendMemoryCopySingleKernel(CopyTestInput &input, TestExpecte
 template <GFXCORE_FAMILY gfxCoreFamily>
 void testMultiTileAppendMemoryCopySingleKernelAndL3Flush(CopyTestInput &input, TestExpectedValues &arg) {
     using FamilyType = typename NEO::GfxFamilyMapper<gfxCoreFamily>::GfxFamily;
-    using COMPUTE_WALKER = typename FamilyType::COMPUTE_WALKER;
-    using POSTSYNC_DATA = typename FamilyType::POSTSYNC_DATA;
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using PostSyncType = decltype(FamilyType::template getPostSyncType<WalkerType>());
+    using OPERATION = typename PostSyncType::OPERATION;
+
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
     using POST_SYNC_OPERATION = typename PIPE_CONTROL::POST_SYNC_OPERATION;
-    using OPERATION = typename POSTSYNC_DATA::OPERATION;
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
 
-    MockAppendMemoryCopy<gfxCoreFamily> commandList;
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
     commandList.appendMemoryCopyKernelWithGACallBase = true;
 
-    commandList.initialize(input.device, NEO::EngineGroupType::RenderCompute, 0u);
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
     EXPECT_EQ(2u, commandList.partitionCount);
     auto &commandContainer = commandList.commandContainer;
 
@@ -820,35 +817,36 @@ void testMultiTileAppendMemoryCopySingleKernelAndL3Flush(CopyTestInput &input, T
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device));
+    auto event = std::unique_ptr<L0::Event>(L0::Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, input.device, result));
 
     uint64_t gpuBaseAddress = event->getGpuAddress(input.device);
     uint64_t firstKernelEventAddress = arg.postSyncAddressZero ? 0 : gpuBaseAddress;
-
+    CmdListMemoryCopyParams copyParams = {};
     size_t usedBefore = commandContainer.getCommandStream()->getUsed();
-    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, false);
+    commandList.appendMemoryCopy(input.dstPtr, input.srcPtr, input.size, event->toHandle(), 0, nullptr, copyParams);
     size_t usedAfter = commandContainer.getCommandStream()->getUsed();
 
     EXPECT_EQ(1u, commandList.appendMemoryCopyKernelWithGACalled);
     EXPECT_EQ(0u, commandList.appendMemoryCopyBlitCalled);
     EXPECT_EQ(arg.expectedPacketsInUse, event->getPacketsInUse());
-    EXPECT_EQ(arg.expectedKernelCount, event->getKernelCount());
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(commandContainer.getCommandStream()->getCpuBase(), usedBefore),
         usedAfter - usedBefore));
 
-    auto itorWalkers = findAll<COMPUTE_WALKER *>(cmdList.begin(), cmdList.end());
+    auto itorWalkers = NEO::UnitTestHelper<FamilyType>::findAllWalkerTypeCmds(cmdList.begin(), cmdList.end());
     ASSERT_EQ(1u, itorWalkers.size());
     auto firstWalker = itorWalkers[0];
 
-    auto walkerCmd = genCmdCast<COMPUTE_WALKER *>(*firstWalker);
-    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), walkerCmd->getPostSync().getOperation());
-    EXPECT_EQ(firstKernelEventAddress, walkerCmd->getPostSync().getDestinationAddress());
+    auto walker = genCmdCast<WalkerType *>(*firstWalker);
+    auto &postSync = walker->getPostSync();
 
-    if (event->isUsingContextEndOffset()) {
+    EXPECT_EQ(static_cast<OPERATION>(arg.expectedWalkerPostSyncOp), postSync.getOperation());
+    EXPECT_EQ(firstKernelEventAddress, postSync.getDestinationAddress());
+
+    if (event->isEventTimestampFlagSet()) {
         gpuBaseAddress += event->getContextEndOffset();
     }
 
@@ -863,9 +861,7 @@ void testMultiTileAppendMemoryCopySingleKernelAndL3Flush(CopyTestInput &input, T
     size_t expectedPostSyncStoreDataImm = 0;
     uint64_t storeDataImmAddress = gpuBaseAddress;
     if (input.signalAllPackets) {
-        if (!input.allPackets) {
-            l3FlushPostSyncAddress = gpuBaseAddress + (event->getMaxPacketsCount() - commandList.partitionCount) * event->getSinglePacketSize();
-        }
+        l3FlushPostSyncAddress = gpuBaseAddress + (event->getMaxPacketsCount() - commandList.partitionCount) * event->getSinglePacketSize();
 
         storeDataImmAddress += input.storeDataImmOffset;
         expectedPostSyncStoreDataImm = arg.expectStoreDataImm;
@@ -904,152 +900,45 @@ void testMultiTileAppendMemoryCopySingleKernelAndL3Flush(CopyTestInput &input, T
     EXPECT_EQ(expectedDcFlush, dcFlushFound);
 }
 
-using AppendMemoryCopyXeHpAndLaterMultiPacket = Test<AppendMemoryCopyMultiPacketEventFixture<0, 0, 0>>;
+using AppendMemoryCopyXeHpAndLaterSinglePacket = Test<AppendMemoryCopyEventPacketFixture<0, 0>>;
 
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateKernels,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 3;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
+HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
+          givenZeroSizeMemoryCopyWithSignalEventWhenNoKernelIsDispatchedThenEventKeepsSinglePacketInUse,
+          IsAtLeastXeCore) {
+    MockCommandListCoreFamily<FamilyType::gfxCoreFamily> commandList;
+    commandList.appendMemoryCopyKernelWithGACallBase = true;
+    commandList.initialize(input.device, NEO::EngineGroupType::renderCompute, 0u);
 
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.count = 1;
 
-    if (input.signalAllPackets) {
-        arg.expectStoreDataImm = testEvent->getMaxPacketsCount() - arg.expectedPacketsInUse;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
 
-    testSingleTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    auto eventPool = std::unique_ptr<L0::EventPool>(L0::EventPool::create(input.driver, input.context, 0, nullptr, &eventPoolDesc, result));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+    auto event = std::unique_ptr<L0::Event>(getHelper<L0GfxCoreHelper>().createEvent(eventPool.get(), &eventDesc, input.device, result));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, result);
+
+    // dirty the packet count first, so the expectation below proves the append actually rewrote it
+    event->setPacketsInUse(3u);
+
+    CmdListMemoryCopyParams copyParams = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, commandList.appendMemoryCopy(reinterpret_cast<void *>(0x20000000), reinterpret_cast<void *>(0x1234),
+                                                              0, event->toHandle(), 0, nullptr, copyParams));
+
+    // a zero-size copy splits into no kernels at all, so the pre-walker reset is the only thing that touches
+    // the packet count. The event must still report one packet in use - queryTimestampsExp returns this as
+    // *pCount and appendQueryKernelTimestamps programs it as packetsInUse, so it is app-visible.
+    EXPECT_EQ(0u, commandList.appendMemoryCopyKernelWithGACalled);
+    EXPECT_EQ(1u, event->getPacketsInUse());
 }
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleKernel,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    if (input.signalAllPackets) {
-        uint32_t reminderPostSyncOps = 2;
-        if (NEO::MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, input.device->getNEODevice()->getRootDeviceEnvironment())) {
-            reminderPostSyncOps = 3;
-        }
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testSingleTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateKernelsAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 4;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListAndEventWithSignalScopeWhenImmediateProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateKernelsAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 4;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = input.device->isImplicitScalingCapable() ? 3 : 1;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = 0;
-
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateKernelAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListAndEventWithSignalScopeWhenImmediateProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateKernelAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = input.device->isImplicitScalingCapable() ? 3 : 1;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = 0;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenCommandListWhenMemoryCopyWithSignalEventScopeSetToSubDeviceThenB2BPipeControlIsAddedWithDcFlushWithPostSyncForLastPC, IsXeHpOrXeHpgCore) {
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    testSingleTileAppendMemoryCopySignalScopeEventToSubDevice<gfxCoreFamily>(input, arg);
-}
-
-using AppendMemoryCopyXeHpAndLaterSinglePacket = Test<AppendMemoryCopyMultiPacketEventFixture<1, 0, 0>>;
 
 HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
           givenCommandListWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForRegisterOnly,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.postSyncAddressZero = true;
 
@@ -1063,17 +952,16 @@ HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
             reminderPostSyncOps = 1;
         }
         arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
+        input.storeDataImmOffset = arg.expectedPacketsInUse * NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
     }
 
-    testSingleTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopyThreeKernels<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
           givenCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleKernel,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 3;
     arg.postSyncAddressZero = false;
 
@@ -1087,17 +975,16 @@ HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
             reminderPostSyncOps = 1;
         }
         arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
+        input.storeDataImmOffset = arg.expectedPacketsInUse * NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
     }
 
-    testSingleTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopySingleKernel<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
           givenCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForRegisterAndL3FlushWithNoPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 0;
     arg.postSyncAddressZero = true;
@@ -1111,17 +998,16 @@ HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
     if (input.signalAllPackets) {
         constexpr uint32_t reminderPostSyncOps = 1;
         arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = testEvent->getSinglePacketSize();
+        input.storeDataImmOffset = NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
     }
 
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
           givenCommandListAndEventWithSignalScopeWhenImmediateProvidedByPipeControlPostSyncPassedToMemoryCopyThenEventProfilingCalledForPipeControlAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 1;
     arg.postSyncAddressZero = true;
@@ -1137,194 +1023,24 @@ HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
         arg.expectStoreDataImm = reminderPostSyncOps;
     }
 
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
-          givenCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateKernelAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
-          givenCommandListAndEventWithSignalScopeWhenImmediateProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateKernelAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = input.device->isImplicitScalingCapable() ? 3 : 1;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = 0;
-
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyXeHpAndLaterSinglePacket,
-          givenCommandListWhenMemoryCopyWithSignalEventScopeSetToSubDeviceThenB2BPipeControlIsAddedWithDcFlushWithPostSyncForLastPC, IsXeHpOrXeHpgCore) {
+          givenCommandListWhenMemoryCopyWithSignalEventScopeSetToSubDeviceThenB2BPipeControlIsAddedWithDcFlushWithPostSyncForLastPC, IsXeHpgCore) {
     input.srcPtr = reinterpret_cast<void *>(0x1231);
     input.dstPtr = reinterpret_cast<void *>(0x200002345);
     input.size = 0x100002345;
 
-    testSingleTileAppendMemoryCopySignalScopeEventToSubDevice<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopySignalScopeEventToSubDevice<FamilyType::gfxCoreFamily>(input, arg);
 }
 
-using MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket = Test<AppendMemoryCopyMultiPacketEventFixture<0, 0, 1>>;
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateMultiTileKernels,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 6;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    if (input.signalAllPackets) {
-        if (NEO::MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, input.device->getNEODevice()->getRootDeviceEnvironment())) {
-            constexpr uint32_t reminderPostSyncOps = 1;
-            arg.expectStoreDataImm = reminderPostSyncOps;
-            input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-        }
-    }
-
-    testMultiTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateMultiTileKernel,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    if (input.signalAllPackets) {
-        uint32_t reminderPostSyncOps = 2;
-        if (NEO::MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, input.device->getNEODevice()->getRootDeviceEnvironment())) {
-            reminderPostSyncOps = 3;
-        }
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testMultiTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenMultiTileCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateMultiTileKernelsAndL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 8;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenMultiTileCommandListAndEventWithSignalScopeWhenImmdiateProvidedByComputeWalkerAndPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateMultiTileKernelsAndL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 8;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = 0;
-
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenMultiTileCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateMultiTileKernelAndL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 4;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterMultiPacket,
-          givenMultiTileCommandListAndEventWithSignalScopeWhenImmdiateProvidedByComputeWalkerAndPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateMultiTileKernelAndL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 4;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = 0;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-using MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket = Test<AppendMemoryCopyMultiPacketEventFixture<1, 0, 1>>;
+using MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket = Test<AppendMemoryCopyEventPacketFixture<0, 1>>;
 
 HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
           givenMultiTileCommandListWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForMultiTileRegisterPipeControlPacket,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.postSyncAddressZero = true;
 
@@ -1336,18 +1052,17 @@ HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
         if (NEO::MemorySynchronizationCommands<FamilyType>::getDcFlushEnable(true, input.device->getNEODevice()->getRootDeviceEnvironment())) {
             constexpr uint32_t reminderPostSyncOps = 1;
             arg.expectStoreDataImm = reminderPostSyncOps;
-            input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
+            input.storeDataImmOffset = arg.expectedPacketsInUse * NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
         }
     }
 
-    testMultiTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopyThreeKernels<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
           givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateMultiTileKernel,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 3;
     arg.postSyncAddressZero = false;
 
@@ -1358,17 +1073,16 @@ HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
     if (input.signalAllPackets) {
         constexpr uint32_t partitionCount = 2;
         arg.expectStoreDataImm = (testEvent->getMaxPacketsCount() - partitionCount) / partitionCount;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
+        input.storeDataImmOffset = arg.expectedPacketsInUse * NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
     }
 
-    testMultiTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopySingleKernel<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
           givenMultiTileCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForMultiTileRegisterPostSyncAndL3FlushForScopedEvent,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 0;
     arg.postSyncAddressZero = true;
@@ -1382,17 +1096,16 @@ HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
     if (input.signalAllPackets) {
         constexpr uint32_t reminderPostSyncOps = 1;
         arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
+        input.storeDataImmOffset = arg.expectedPacketsInUse * NEO::TimestampPackets<typename FamilyType::TimestampPacketType, FamilyType::timestampPacketCount>::getSinglePacketSize();
     }
 
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
           givenMultiTileCommandListAndEventWithSignalScopeWhenImmediateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForPipeControlPostSyncAndL3FlushAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 1;
     arg.postSyncAddressZero = true;
@@ -1408,320 +1121,15 @@ HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
         arg.expectStoreDataImm = reminderPostSyncOps;
     }
 
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
-          givenMultiTileCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleKernelPostSync,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 4;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyXeHpAndLaterSinglePacket,
-          givenMultiTileCommandListAndEventWithSignalScopeWhenImmediateProvidedByComputeWalkerAndPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleKernelAndL3FlushPipeControlPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 4;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = 0;
-
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-using AppendMemoryCopyL3CompactEventTest = Test<AppendMemoryCopyMultiPacketEventFixture<0, 1, 0>>;
-
-HWTEST2_F(AppendMemoryCopyL3CompactEventTest,
-          givenCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateKernels,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 3;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    testSingleTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyL3CompactEventTest,
-          givenCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleKernel,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = testEvent->getSinglePacketSize();
-    }
-
-    testSingleTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyL3CompactEventTest,
-          givenCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateKernelsAndL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 0;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = testEvent->getSinglePacketSize();
-    }
-
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyL3CompactEventTest,
-          givenCommandListAndEventWithSignalScopeWhenImmediateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = 0;
-    input.useFirstEventPacketAddress = true;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-    }
-
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyL3CompactEventTest,
-          givenCommandListAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 0;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = testEvent->getSinglePacketSize();
-    }
-
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(AppendMemoryCopyL3CompactEventTest,
-          givenCommandListAndEventWithSignalScopeWhenImmediateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = 0;
-    input.useFirstEventPacketAddress = true;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-    }
-
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-using MultiTileAppendMemoryCopyL3CompactEventTest = Test<AppendMemoryCopyMultiPacketEventFixture<0, 1, 1>>;
-
-HWTEST2_F(MultiTileAppendMemoryCopyL3CompactEventTest,
-          givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateMultiTileKernels,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 6;
-    arg.expectedKernelCount = 3;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    testMultiTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyL3CompactEventTest,
-          givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleSeparateMultiTileKernel,
-          IsAtLeastXeHpCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 3;
-    arg.postSyncAddressZero = false;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testMultiTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyL3CompactEventTest,
-          givenMultiTileCommandListCopyUsingThreeKernelsAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 0;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyL3CompactEventTest,
-          givenMultiTileCommandListCopyUsingThreeKernelsAndEventWithSignalScopeWhenImmdiateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1231);
-    input.dstPtr = reinterpret_cast<void *>(0x200002345);
-    input.size = 0x100002345;
-
-    input.eventPoolFlags = 0;
-    input.useFirstEventPacketAddress = true;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-    }
-
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyL3CompactEventTest,
-          givenMultiTileCommandListCopyUsingSingleKernelAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 0;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-        input.storeDataImmOffset = arg.expectedPacketsInUse * testEvent->getSinglePacketSize();
-    }
-
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-HWTEST2_F(MultiTileAppendMemoryCopyL3CompactEventTest,
-          givenMultiTileCommandListCopyUsingSingleKernelAndEventWithSignalScopeWhenImmdiateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
-    arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
-    arg.expectedWalkerPostSyncOp = 0;
-    arg.expectedPostSyncPipeControls = 1;
-    arg.postSyncAddressZero = true;
-
-    input.srcPtr = reinterpret_cast<void *>(0x1000);
-    input.dstPtr = reinterpret_cast<void *>(0x20000000);
-    input.size = 0x100000000;
-
-    input.eventPoolFlags = 0;
-    input.useFirstEventPacketAddress = true;
-
-    if (input.signalAllPackets) {
-        constexpr uint32_t reminderPostSyncOps = 2;
-        arg.expectStoreDataImm = reminderPostSyncOps;
-    }
-
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
-}
-
-using AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest = Test<AppendMemoryCopyMultiPacketEventFixture<1, 1, 0>>;
+using AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest = Test<AppendMemoryCopyEventPacketFixture<1, 0>>;
 
 HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenCommandListWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSinglePacket,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.postSyncAddressZero = true;
 
@@ -1729,14 +1137,13 @@ HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
     input.dstPtr = reinterpret_cast<void *>(0x200002345);
     input.size = 0x100002345;
 
-    testSingleTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopyThreeKernels<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleKernel,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 3;
     arg.postSyncAddressZero = false;
 
@@ -1744,14 +1151,13 @@ HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
     input.dstPtr = reinterpret_cast<void *>(0x20000000);
     input.size = 0x100000000;
 
-    testSingleTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopySingleKernel<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenCommandListCopyUsingThreeKernelsAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 0;
     arg.postSyncAddressZero = true;
@@ -1762,14 +1168,13 @@ HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
 
     input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
 
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenCommandListCopyUsingThreeKernelsAndEventWithSignalScopeWhenImmediateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 1;
     arg.postSyncAddressZero = true;
@@ -1780,14 +1185,13 @@ HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
 
     input.eventPoolFlags = 0;
 
-    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenCommandListCopyUsingSingleKernelAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 0;
     arg.postSyncAddressZero = true;
@@ -1798,14 +1202,13 @@ HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
 
     input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
 
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenCommandListCopyUsingSingleKernelAndEventWithSignalScopeWhenImmediateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedOnce,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 1;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 1;
     arg.postSyncAddressZero = true;
@@ -1817,16 +1220,15 @@ HWTEST2_F(AppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
     input.eventPoolFlags = 0;
     input.useFirstEventPacketAddress = true;
 
-    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
+    testSingleTileAppendMemoryCopySingleKernelAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
-using MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest = Test<AppendMemoryCopyMultiPacketEventFixture<1, 1, 1>>;
+using MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest = Test<AppendMemoryCopyEventPacketFixture<1, 1>>;
 
 HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForThreeSeparateMultiTileKernels,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.postSyncAddressZero = true;
 
@@ -1834,14 +1236,13 @@ HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
     input.dstPtr = reinterpret_cast<void *>(0x200002345);
     input.size = 0x100002345;
 
-    testMultiTileAppendMemoryCopyThreeKernels<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopyThreeKernels<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenMultiTileCommandListWhenTimestampProvidedByComputeWalkerPostSyncPassedToMemoryCopyThenAppendProfilingCalledForSingleMultiTileKernel,
-          IsAtLeastXeHpCore) {
+          IsAtLeastXeCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 3;
     arg.postSyncAddressZero = false;
 
@@ -1849,14 +1250,13 @@ HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
     input.dstPtr = reinterpret_cast<void *>(0x20000000);
     input.size = 0x100000000;
 
-    testMultiTileAppendMemoryCopySingleKernel<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopySingleKernel<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenMultiTileCommandListCopyUsingThreeKernelsAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 0;
     arg.postSyncAddressZero = true;
@@ -1867,14 +1267,13 @@ HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
 
     input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
 
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenMultiTileCommandListCopyUsingThreeKernelsAndEventWithSignalScopeWhenImmdiateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 1;
     arg.postSyncAddressZero = true;
@@ -1885,14 +1284,13 @@ HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
 
     input.eventPoolFlags = 0;
 
-    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopyThreeKernelsAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenMultiTileCommandListCopyUsingThreeKernelAndTimestampEventWithSignalScopeWhenTimestampProvidedByRegisterPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 0;
     arg.postSyncAddressZero = true;
@@ -1903,14 +1301,13 @@ HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
 
     input.eventPoolFlags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
 
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
           givenMultiTileCommandListCopyUsingSingleKernelAndEventWithSignalScopeWhenImmdiateProvidedByPipeControlPostSyncPassedToMemoryCopyThenAppendProfilingCalledForL3FlushWithPostSyncAddedForScopedEvent,
-          IsXeHpOrXeHpgCore) {
+          IsXeHpgCore) {
     arg.expectedPacketsInUse = 2;
-    arg.expectedKernelCount = 1;
     arg.expectedWalkerPostSyncOp = 0;
     arg.expectedPostSyncPipeControls = 1;
     arg.postSyncAddressZero = true;
@@ -1922,7 +1319,7 @@ HWTEST2_F(MultiTileAppendMemoryCopyL3CompactAndSingleKernelPacketEventTest,
     input.eventPoolFlags = 0;
     input.useFirstEventPacketAddress = true;
 
-    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<gfxCoreFamily>(input, arg);
+    testMultiTileAppendMemoryCopySingleKernelAndL3Flush<FamilyType::gfxCoreFamily>(input, arg);
 }
 
 } // namespace ult

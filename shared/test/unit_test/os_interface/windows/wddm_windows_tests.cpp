@@ -1,34 +1,61 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/gmm_helper/gmm.h"
+#include "shared/source/gmm_helper/gmm_callbacks.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
-#include "shared/source/os_interface/windows/driver_info_windows.h"
-#include "shared/source/os_interface/windows/dxgi_wrapper.h"
-#include "shared/source/os_interface/windows/sharedata_wrapper.h"
-#include "shared/source/os_interface/windows/wddm_engine_mapper.h"
-#include "shared/source/os_interface/windows/wddm_memory_manager.h"
-#include "shared/source/utilities/debug_settings_reader.h"
+#include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/kmd_notify_properties.h"
+#include "shared/source/memory_manager/allocation_type.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/os_interface/windows/hw_device_id.h"
+#include "shared/source/os_interface/windows/wddm/um_km_data_translator.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_gfx_partition.h"
-#include "shared/test/common/mocks/mock_io_functions.h"
-#include "shared/test/common/mocks/mock_memory_manager.h"
-#include "shared/test/common/mocks/mock_wddm_residency_logger.h"
+#include "shared/test/common/mocks/mock_gmm_client_context_base.h"
 #include "shared/test/common/mocks/windows/mock_gdi_interface.h"
-#include "shared/test/common/mocks/windows/mock_gmm_memory_base.h"
-#include "shared/test/common/mocks/windows/mock_wddm_allocation.h"
-#include "shared/test/common/os_interface/windows/ult_dxcore_factory.h"
+#include "shared/test/common/mocks/windows/mock_gmm_memory.h"
+#include "shared/test/common/os_interface/windows/mock_sys_calls.h"
 #include "shared/test/common/os_interface/windows/wddm_fixture.h"
-#include "shared/test/common/test_macros/hw_test.h"
+#include "shared/test/common/test_macros/test.h"
+
+#include "gtest/gtest.h"
+
+#include <functional>
+#include <memory>
+#include <string_view>
+#include <vector>
 
 namespace NEO {
 namespace SysCalls {
 extern const wchar_t *currentLibraryPath;
-}
+extern DWORD getModuleFileNameResult;
+extern size_t setProcessPowerThrottlingStateCalled;
+extern SysCalls::ProcessPowerThrottlingState setProcessPowerThrottlingStateLastValue;
+extern size_t setThreadPriorityCalled;
+extern SysCalls::ThreadPriority setThreadPriorityLastValue;
+extern MEMORY_BASIC_INFORMATION virtualQueryMemoryBasicInformation;
+extern size_t closeHandleCalled;
+extern BOOL (*sysCallsDuplicateHandle)(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions);
+extern HANDLE (*sysCallsOpenProcess)(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+} // namespace SysCalls
 extern uint32_t numRootDevicesToEnum;
+extern bool gCreateAllocation2FailOnReadOnlyAllocation;
+extern bool gCreateAllocation2ReadOnlyFlagWasPassed;
+extern uint32_t gCreateAllocation2NumCalled;
 std::unique_ptr<HwDeviceIdWddm> createHwDeviceIdFromAdapterLuid(OsEnvironmentWin &osEnvironment, LUID adapterLuid, uint32_t adapterNodeOrdinalIn);
 } // namespace NEO
 
@@ -36,8 +63,10 @@ namespace GmmHelperFunctionsWindows {
 Gmm *getGmm(void *ptr, size_t size, GmmHelper *gmmHelper) {
     size_t alignedSize = alignSizeWholePage(ptr, size);
     void *alignedPtr = alignUp(ptr, 4096);
-
-    Gmm *gmm = new Gmm(gmmHelper, alignedPtr, alignedSize, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, false, {}, true);
+    GmmRequirements gmmRequirements{};
+    gmmRequirements.allowLargePages = true;
+    gmmRequirements.preferCompressed = false;
+    Gmm *gmm = new Gmm(gmmHelper, alignedPtr, alignedSize, 0, GMM_RESOURCE_USAGE_OCL_BUFFER, {}, gmmRequirements);
     EXPECT_NE(gmm->gmmResourceInfo.get(), nullptr);
     return gmm;
 }
@@ -60,9 +89,7 @@ struct Wddm20WithMockGdiDllTests : public Wddm20WithMockGdiDllTestsWithoutWddmIn
 
 TEST(Wddm20EnumAdaptersTest, givenEmptyHardwareInfoWhenEnumAdapterIsCalledThenCapabilityTableIsSet) {
     const HardwareInfo *hwInfo = defaultHwInfo.get();
-    std::unique_ptr<OsLibrary> mockGdiDll(setAdapterInfo(&hwInfo->platform,
-                                                         &hwInfo->gtSystemInfo,
-                                                         hwInfo->capabilityTable.gpuAddressSpace));
+    setAdapterInfo(hwInfo);
 
     ExecutionEnvironment executionEnvironment;
     executionEnvironment.prepareRootDeviceEnvironments(1);
@@ -74,38 +101,14 @@ TEST(Wddm20EnumAdaptersTest, givenEmptyHardwareInfoWhenEnumAdapterIsCalledThenCa
 
     EXPECT_EQ(outHwInfo.platform.eDisplayCoreFamily, hwInfo->platform.eDisplayCoreFamily);
 
-    EXPECT_EQ(outHwInfo.capabilityTable.defaultProfilingTimerResolution, hwInfo->capabilityTable.defaultProfilingTimerResolution);
-    EXPECT_EQ(outHwInfo.capabilityTable.clVersionSupport, hwInfo->capabilityTable.clVersionSupport);
     EXPECT_EQ(outHwInfo.capabilityTable.kmdNotifyProperties.enableKmdNotify, hwInfo->capabilityTable.kmdNotifyProperties.enableKmdNotify);
     EXPECT_EQ(outHwInfo.capabilityTable.kmdNotifyProperties.delayKmdNotifyMicroseconds, hwInfo->capabilityTable.kmdNotifyProperties.delayKmdNotifyMicroseconds);
     EXPECT_EQ(outHwInfo.capabilityTable.kmdNotifyProperties.enableQuickKmdSleep, hwInfo->capabilityTable.kmdNotifyProperties.enableQuickKmdSleep);
     EXPECT_EQ(outHwInfo.capabilityTable.kmdNotifyProperties.delayQuickKmdSleepMicroseconds, hwInfo->capabilityTable.kmdNotifyProperties.delayQuickKmdSleepMicroseconds);
 }
 
-HWTEST_F(Wddm20InstrumentationTest, WhenConfiguringDeviceAddressSpaceThenTrueIsReturned) {
-    SYSTEM_INFO sysInfo = {};
-    WddmMock::getSystemInfo(&sysInfo);
-
-    D3DKMT_HANDLE adapterHandle = ADAPTER_HANDLE;
-    D3DKMT_HANDLE deviceHandle = DEVICE_HANDLE;
-    const HardwareInfo hwInfo = *defaultHwInfo;
-    BOOLEAN FtrL3IACoherency = hwInfo.featureTable.flags.ftrL3IACoherency ? 1 : 0;
-    uintptr_t maxAddr = hwInfo.capabilityTable.gpuAddressSpace >= MemoryConstants::max64BitAppAddress
-                            ? reinterpret_cast<uintptr_t>(sysInfo.lpMaximumApplicationAddress) + 1
-                            : 0;
-
-    wddm->init();
-    EXPECT_EQ(1u, gmmMem->configureDeviceAddressSpaceCalled);
-    EXPECT_EQ(adapterHandle, gmmMem->configureDeviceAddressSpaceParamsPassed[0].hAdapter);
-    EXPECT_EQ(deviceHandle, gmmMem->configureDeviceAddressSpaceParamsPassed[0].hDevice);
-    EXPECT_EQ(wddm->getGdi()->escape.mFunc, gmmMem->configureDeviceAddressSpaceParamsPassed[0].pfnEscape);
-    EXPECT_EQ(maxAddr, gmmMem->configureDeviceAddressSpaceParamsPassed[0].svmSize);
-    EXPECT_EQ(FtrL3IACoherency, gmmMem->configureDeviceAddressSpaceParamsPassed[0].bdwL3Coherency);
-}
-
 TEST_F(Wddm20Tests, givenSuccessWhenRegisteringTrimCallbackThenReturnTrimCallbackHandle) {
-    WddmResidencyController residencyController{*wddm, 0u};
-    auto trimCallbackHandle = wddm->registerTrimCallback([](D3DKMT_TRIMNOTIFICATION *) {}, residencyController);
+    auto trimCallbackHandle = wddm->registerTrimCallback([](D3DKMT_TRIMNOTIFICATION *) {});
     EXPECT_NE(nullptr, trimCallbackHandle);
 }
 
@@ -134,10 +137,10 @@ TEST_F(Wddm20Tests, givenGraphicsAllocationWhenItIsMappedInHeap0ThenItHasGpuAddr
     size_t alignedSize = 0x2000;
     std::unique_ptr<Gmm> gmm(GmmHelperFunctionsWindows::getGmm(alignedPtr, alignedSize, getGmmHelper()));
     uint64_t gpuAddress = 0u;
-    auto heapBase = wddm->getGfxPartition().Heap32[static_cast<uint32_t>(HeapIndex::HEAP_INTERNAL_DEVICE_MEMORY)].Base;
-    auto heapLimit = wddm->getGfxPartition().Heap32[static_cast<uint32_t>(HeapIndex::HEAP_INTERNAL_DEVICE_MEMORY)].Limit;
+    auto heapBase = wddm->getGfxPartition().Heap32[static_cast<uint32_t>(HeapIndex::heapInternalDeviceMemory)].Base;
+    auto heapLimit = wddm->getGfxPartition().Heap32[static_cast<uint32_t>(HeapIndex::heapInternalDeviceMemory)].Limit;
 
-    bool ret = wddm->mapGpuVirtualAddress(gmm.get(), ALLOCATION_HANDLE, heapBase, heapLimit, 0u, gpuAddress);
+    bool ret = wddm->mapGpuVirtualAddress(gmm.get(), ALLOCATION_HANDLE, heapBase, heapLimit, 0u, gpuAddress, AllocationType::unknown, nullptr, 0u);
     EXPECT_TRUE(ret);
 
     auto gmmHelper = rootDeviceEnvironment->getGmmHelper();
@@ -161,25 +164,22 @@ TEST(WddmGfxPartitionTests, WhenInitializingGfxPartitionThen64KBHeapsAreUsed) {
 
     uint32_t rootDeviceIndex = 3;
     size_t numRootDevices = 5;
+    auto &productHelper = executionEnvironment.rootDeviceEnvironments[0]->getProductHelper();
 
     MockGfxPartition gfxPartition;
     wddm->init();
-    wddm->initGfxPartition(gfxPartition, rootDeviceIndex, numRootDevices, false);
+    wddm->initGfxPartition(gfxPartition, rootDeviceIndex, numRootDevices, false, &productHelper);
 
     auto heapStandard64KBSize = alignDown((wddm->gfxPartition.Standard64KB.Limit - wddm->gfxPartition.Standard64KB.Base + 1) / numRootDevices, GfxPartition::heapGranularity);
-    EXPECT_EQ(heapStandard64KBSize, gfxPartition.getHeapSize(HeapIndex::HEAP_STANDARD64KB));
-    EXPECT_EQ(wddm->gfxPartition.Standard64KB.Base + rootDeviceIndex * heapStandard64KBSize, gfxPartition.getHeapBase(HeapIndex::HEAP_STANDARD64KB));
+    EXPECT_EQ(heapStandard64KBSize, gfxPartition.getHeapSize(HeapIndex::heapStandard64KB));
+    EXPECT_EQ(wddm->gfxPartition.Standard64KB.Base + rootDeviceIndex * heapStandard64KBSize, gfxPartition.getHeapBase(HeapIndex::heapStandard64KB));
 }
 
-namespace NEO {
-long __stdcall notifyAubCapture(void *csrHandle, uint64_t gfxAddress, size_t gfxSize, bool allocate);
-}
-
-TEST_F(Wddm20WithMockGdiDllTests, whenSetDeviceInfoSucceedsThenDeviceCallbacksArePassedToGmmMemory) {
+TEST_F(Wddm20WithMockGdiDllTests, givenDefaultScenarioWhenSetDeviceInfoSucceedsThenDeviceCallbacksWithoutNotifyAubCaptureArePassedToGmmMemory) {
     GMM_DEVICE_CALLBACKS_INT expectedDeviceCb{};
     wddm->init();
     auto gdi = wddm->getGdi();
-    auto gmmMemory = static_cast<MockGmmMemoryBase *>(wddm->getGmmMemory());
+    auto gmmMemory = static_cast<MockGmmMemory *>(wddm->getGmmMemory());
 
     expectedDeviceCb.Adapter.KmtHandle = wddm->getAdapter();
     expectedDeviceCb.hDevice.KmtHandle = wddm->getDeviceHandle();
@@ -189,6 +189,7 @@ TEST_F(Wddm20WithMockGdiDllTests, whenSetDeviceInfoSucceedsThenDeviceCallbacksAr
 
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnAllocate = gdi->createAllocation;
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate = gdi->destroyAllocation;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate2 = gdi->destroyAllocation2;
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMapGPUVA = gdi->mapGpuVirtualAddress;
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMakeResident = gdi->makeResident;
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEvict = gdi->evict;
@@ -199,7 +200,7 @@ TEST_F(Wddm20WithMockGdiDllTests, whenSetDeviceInfoSucceedsThenDeviceCallbacksAr
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnUnLock = gdi->unlock2;
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEscape = gdi->escape;
     expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnFreeGPUVA = gdi->freeGpuVirtualAddress;
-    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture = notifyAubCapture;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture = nullptr;
 
     EXPECT_EQ(expectedDeviceCb.Adapter.KmtHandle, gmmMemory->deviceCallbacks.Adapter.KmtHandle);
     EXPECT_EQ(expectedDeviceCb.hDevice.KmtHandle, gmmMemory->deviceCallbacks.hDevice.KmtHandle);
@@ -208,6 +209,7 @@ TEST_F(Wddm20WithMockGdiDllTests, whenSetDeviceInfoSucceedsThenDeviceCallbacksAr
     EXPECT_EQ(expectedDeviceCb.PagingFence, gmmMemory->deviceCallbacks.PagingFence);
     EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnAllocate, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnAllocate);
     EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnDeallocate);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate2, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnDeallocate2);
     EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMapGPUVA, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnMapGPUVA);
     EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMakeResident, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnMakeResident);
     EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEvict, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnEvict);
@@ -221,73 +223,349 @@ TEST_F(Wddm20WithMockGdiDllTests, whenSetDeviceInfoSucceedsThenDeviceCallbacksAr
     EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture);
 }
 
-class MockRegistryReaderWithDriverStorePath : public SettingsReader {
+TEST_F(Wddm20WithMockGdiDllTests, givenHwWithAubCaptureWhenSetDeviceInfoSucceedsThenNotifyAubCaptureDeviceCallbackIsPassedToGmmMemory) {
+
+    DebugManagerStateRestore restorer{};
+    debugManager.flags.SetCommandStreamReceiver.set(3);
+    GMM_DEVICE_CALLBACKS_INT expectedDeviceCb{};
+    wddm->init();
+    auto gdi = wddm->getGdi();
+    auto gmmMemory = static_cast<MockGmmMemory *>(wddm->getGmmMemory());
+
+    expectedDeviceCb.Adapter.KmtHandle = wddm->getAdapter();
+    expectedDeviceCb.hDevice.KmtHandle = wddm->getDeviceHandle();
+    expectedDeviceCb.hCsr = nullptr;
+    expectedDeviceCb.PagingQueue = wddm->getPagingQueue();
+    expectedDeviceCb.PagingFence = wddm->getPagingQueueSyncObject();
+
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnAllocate = gdi->createAllocation;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate = gdi->destroyAllocation;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate2 = gdi->destroyAllocation2;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMapGPUVA = gdi->mapGpuVirtualAddress;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMakeResident = gdi->makeResident;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEvict = gdi->evict;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnReserveGPUVA = gdi->reserveGpuVirtualAddress;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnUpdateGPUVA = gdi->updateGpuVirtualAddress;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnWaitFromCpu = gdi->waitForSynchronizationObjectFromCpu;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnLock = gdi->lock2;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnUnLock = gdi->unlock2;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEscape = gdi->escape;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnFreeGPUVA = gdi->freeGpuVirtualAddress;
+    expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture = notifyAubCaptureFuncFactory[defaultHwInfo->platform.eRenderCoreFamily];
+
+    EXPECT_EQ(expectedDeviceCb.Adapter.KmtHandle, gmmMemory->deviceCallbacks.Adapter.KmtHandle);
+    EXPECT_EQ(expectedDeviceCb.hDevice.KmtHandle, gmmMemory->deviceCallbacks.hDevice.KmtHandle);
+    EXPECT_EQ(expectedDeviceCb.hCsr, gmmMemory->deviceCallbacks.hCsr);
+    EXPECT_EQ(expectedDeviceCb.PagingQueue, gmmMemory->deviceCallbacks.PagingQueue);
+    EXPECT_EQ(expectedDeviceCb.PagingFence, gmmMemory->deviceCallbacks.PagingFence);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnAllocate, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnAllocate);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnDeallocate);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnDeallocate2, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnDeallocate2);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMapGPUVA, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnMapGPUVA);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnMakeResident, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnMakeResident);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEvict, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnEvict);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnReserveGPUVA, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnReserveGPUVA);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnUpdateGPUVA, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnUpdateGPUVA);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnWaitFromCpu, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnWaitFromCpu);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnLock, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnLock);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnUnLock, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnUnLock);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnEscape, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnEscape);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnFreeGPUVA, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnFreeGPUVA);
+    EXPECT_EQ(expectedDeviceCb.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture);
+    EXPECT_NE(nullptr, gmmMemory->deviceCallbacks.DevCbPtrs.KmtCbPtrs.pfnNotifyAubCapture);
+}
+
+class MockGmmMemoryWindows : public MockGmmMemory {
   public:
-    MockRegistryReaderWithDriverStorePath(const char *driverStorePathArg) : driverStorePath(driverStorePathArg){};
-    std::string getSetting(const char *settingName, const std::string &value) override {
-        std::string key(settingName);
-        if (key == "DriverStorePathForComputeRuntime") {
-            return driverStorePath;
-        } else if (key == "OpenCLDriverName") {
-            return driverStorePath;
+    using MockGmmMemory::MockGmmMemory;
+    bool setDeviceInfo(GMM_DEVICE_INFO *deviceInfo) override {
+        for (int i = 0; i < 3; i++) {
+            segmentId[i] = deviceInfo->MsSegId[i];
         }
-        return value;
+        adapterLocalMemory = deviceInfo->AdapterLocalMemory;
+        adapterCpuVisibleMemory = deviceInfo->AdapterCpuVisibleLocalMemory;
+        return MockGmmMemory::setDeviceInfo(deviceInfo);
     }
 
-    bool getSetting(const char *settingName, bool defaultValue) override { return defaultValue; };
-    int64_t getSetting(const char *settingName, int64_t defaultValue) override { return defaultValue; };
-    int32_t getSetting(const char *settingName, int32_t defaultValue) override { return defaultValue; };
-    const char *appSpecificLocation(const std::string &name) override { return name.c_str(); };
-
-    const std::string driverStorePath;
+    uint64_t adapterLocalMemory = 0;
+    uint64_t adapterCpuVisibleMemory = 0;
+    uint8_t segmentId[3]{};
 };
 
-TEST(DiscoverDevices, whenDriverInfoHasIncompatibleDriverStoreThenHwDeviceIdIsNotCreated) {
-    VariableBackup<decltype(DriverInfoWindows::createRegistryReaderFunc)> createFuncBackup{&DriverInfoWindows::createRegistryReaderFunc};
-    DriverInfoWindows::createRegistryReaderFunc = [](const std::string &) -> std::unique_ptr<SettingsReader> {
-        return std::make_unique<MockRegistryReaderWithDriverStorePath>("driverStore\\0x8086");
-    };
-    VariableBackup<const wchar_t *> currentLibraryPathBackup(&SysCalls::currentLibraryPath);
-    currentLibraryPathBackup = L"driverStore\\different_driverStore\\myLib.dll";
+TEST_F(Wddm20WithMockGdiDllTests, whenInitWddmThenAdapterInfoCapsArePassedToGmmLibViaSetDeviceInfo) {
+    uint8_t expectedSegmentId[3] = {0x12, 0x34, 0x56};
+    uint64_t expectedAdapterLocalMemory = 0x123467800u;
+    uint64_t expectedAdapterCpuVisibleMemory = 0x123467A0u;
+
+    wddm->segmentId[0] = 0u;
+    wddm->segmentId[1] = 0u;
+    wddm->segmentId[2] = 0u;
+    wddm->lmemBarSize = 0u;
+    wddm->dedicatedVideoMemory = 0u;
+
+    wddm->gmmMemory = std::make_unique<MockGmmMemoryWindows>(getGmmClientContext());
+    auto gmmMemory = static_cast<MockGmmMemoryWindows *>(wddm->getGmmMemory());
+    wddm->init();
+
+    EXPECT_EQ(1u, gmmMemory->setDeviceInfoCalled);
+    EXPECT_EQ(expectedSegmentId[0], gmmMemory->segmentId[0]);
+    EXPECT_EQ(expectedSegmentId[1], gmmMemory->segmentId[1]);
+    EXPECT_EQ(expectedSegmentId[2], gmmMemory->segmentId[2]);
+    EXPECT_EQ(expectedAdapterLocalMemory, gmmMemory->adapterLocalMemory);
+    EXPECT_EQ(expectedAdapterCpuVisibleMemory, gmmMemory->adapterCpuVisibleMemory);
+}
+
+namespace {
+constexpr wchar_t hostDriverStoreRepository[] = L"\\System32\\HostDriverStore\\FileRepository\\";
+constexpr auto adapterHostDriverStorePath = joinWideStrings(mockSystemRootPrefix, hostDriverStoreRepository, mockAdapterDriverPackage);
+constexpr auto libraryFromAdapterHostDriverStore = joinWideStrings(mockWindowsDirectoryPrefix, hostDriverStoreRepository, mockAdapterDriverPackage, mockOpenClLibraryName);
+constexpr auto libraryFromAdapterDriverStoreSubdirectory = joinWideStrings(mockWindowsDirectoryPrefix, mockDriverStoreRepository, mockAdapterDriverPackage, L"\\x64", mockOpenClLibraryName);
+constexpr auto otherComputeRuntimePath = joinWideStrings(mockWindowsDirectoryPrefix, mockDriverStoreRepository, mockOtherDriverPackage);
+} // namespace
+
+TEST(DiscoverDevices, givenAdapterFromOtherDriverStoreWhenDiscoveringDevicesThenHwDeviceIdIsNotCreatedAndPrivateDriverDataIsNotQueried) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, mockAdapterDriverStorePath.data()};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+    VariableBackup<uint32_t> privateQueryCountBackup{&queryAdapterInfoUmDriverPrivateCallCount, 0u};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_TRUE(hwDeviceIds.empty());
+    EXPECT_EQ(0u, queryAdapterInfoUmDriverPrivateCallCount);
+}
+
+TEST(DiscoverDevices, givenAdapterFromOtherDriverStoreWhenDiscoveringDevicesThenAdapterIsClosed) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, mockAdapterDriverStorePath.data()};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+    VariableBackup<uint32_t> closeAdapterCallCountBackup{&closeAdapterCallCount, 0u};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_TRUE(hwDeviceIds.empty());
+    EXPECT_EQ(1u, closeAdapterCallCount);
+}
+
+TEST(DiscoverDevices, givenLibOutsideOfAdapterDriverStoreAndComputeRuntimePathPointingToLibDirectoryWhenDiscoveringDevicesThenHwDeviceIdIsCreatedAndPrivateDriverDataIsNotQueried) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, mockAdapterDriverStorePath.data()};
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, L"C:\\local\\neo\\bin"};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\local\\neo\\bin\\igdrcl64.dll"};
+    VariableBackup<uint32_t> privateQueryCountBackup{&queryAdapterInfoUmDriverPrivateCallCount, 0u};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_EQ(1u, hwDeviceIds.size());
+    EXPECT_EQ(0u, queryAdapterInfoUmDriverPrivateCallCount);
+}
+
+TEST(DiscoverDevices, givenLibOutsideOfAdapterDriverStoreAndComputeRuntimePathPointingToOtherDirectoryWhenDiscoveringDevicesThenHwDeviceIdIsNotCreated) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, mockAdapterDriverStorePath.data()};
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, L"C:\\local\\neo\\bin"};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\other\\igdrcl64.dll"};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_TRUE(hwDeviceIds.empty());
+}
+
+TEST(DiscoverDevices, givenDriverStorePathQueryFailsAndComputeRuntimePathPointingToLibDirectoryWhenDiscoveringDevicesThenHwDeviceIdIsNotCreated) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, nullptr};
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, L"C:\\local\\neo\\bin"};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\local\\neo\\bin\\igdrcl64.dll"};
     ExecutionEnvironment executionEnvironment;
     auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
     EXPECT_TRUE(hwDeviceIds.empty());
 }
 
 TEST(DiscoverDevices, givenDifferentCaseInLibPathAndInDriverStorePathWhenDiscoveringDeviceThenHwDeviceIdIsCreated) {
-    VariableBackup<decltype(DriverInfoWindows::createRegistryReaderFunc)> createFuncBackup{&DriverInfoWindows::createRegistryReaderFunc};
-    DriverInfoWindows::createRegistryReaderFunc = [](const std::string &) -> std::unique_ptr<SettingsReader> {
-        return std::make_unique<MockRegistryReaderWithDriverStorePath>("\\SystemRoot\\driverStore\\0x8086");
-    };
-    VariableBackup<const wchar_t *> currentLibraryPathBackup(&SysCalls::currentLibraryPath);
-    currentLibraryPathBackup = L"\\SyStEmrOOt\\driverstore\\0x8086\\myLib.dll";
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, mockAdapterDriverStorePath.data()};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\WINDOWS\\system32\\driverstore\\FILEREPOSITORY\\IIGD_DCH.INF_AMD64_0X8086\\IGDRCL64.DLL"};
     ExecutionEnvironment executionEnvironment;
     auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
     EXPECT_EQ(1u, hwDeviceIds.size());
 }
 
-TEST(DiscoverDevices, givenLibFromHostDriverStoreAndRegistryWithDriverStoreWhenDiscoveringDeviceThenHwDeviceIdIsCreated) {
-    VariableBackup<decltype(DriverInfoWindows::createRegistryReaderFunc)> createFuncBackup{&DriverInfoWindows::createRegistryReaderFunc};
-    DriverInfoWindows::createRegistryReaderFunc = [](const std::string &) -> std::unique_ptr<SettingsReader> {
-        return std::make_unique<MockRegistryReaderWithDriverStorePath>("\\SystemRoot\\driverStore\\0x8086");
-    };
-    VariableBackup<const wchar_t *> currentLibraryPathBackup(&SysCalls::currentLibraryPath);
-    currentLibraryPathBackup = L"\\SystemRoot\\hostdriverStore\\0x8086\\myLib.dll";
+TEST(DiscoverDevices, givenLibFromHostDriverStoreAndAdapterFromDriverStoreWhenDiscoveringDeviceThenHwDeviceIdIsCreated) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, mockAdapterDriverStorePath.data()};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, libraryFromAdapterHostDriverStore.data()};
     ExecutionEnvironment executionEnvironment;
     auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
     EXPECT_EQ(1u, hwDeviceIds.size());
 }
 
-TEST(DiscoverDevices, givenLibFromDriverStoreAndRegistryWithHostDriverStoreWhenDiscoveringDeviceThenHwDeviceIdIsCreated) {
-    VariableBackup<decltype(DriverInfoWindows::createRegistryReaderFunc)> createFuncBackup{&DriverInfoWindows::createRegistryReaderFunc};
-    DriverInfoWindows::createRegistryReaderFunc = [](const std::string &) -> std::unique_ptr<SettingsReader> {
-        return std::make_unique<MockRegistryReaderWithDriverStorePath>("\\SystemRoot\\driverStore\\0x8086");
-    };
-    VariableBackup<const wchar_t *> currentLibraryPathBackup(&SysCalls::currentLibraryPath);
-    currentLibraryPathBackup = L"\\SystemRoot\\hostdriverStore\\0x8086\\myLib.dll";
+TEST(DiscoverDevices, givenLibFromDriverStoreAndAdapterFromHostDriverStoreWhenDiscoveringDeviceThenHwDeviceIdIsCreated) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, adapterHostDriverStorePath.data()};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromAdapterDriverStore.data()};
     ExecutionEnvironment executionEnvironment;
     auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
     EXPECT_EQ(1u, hwDeviceIds.size());
+}
+
+TEST(DiscoverDevices, givenDriverStorePathQueryFailsAndNoComputeRuntimePathWhenDiscoveringDeviceThenHwDeviceIdIsNotCreated) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, nullptr};
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, nullptr};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_TRUE(hwDeviceIds.empty());
+}
+
+TEST(DiscoverDevices, givenLibOutsideOfAdapterDriverStoreAndNoComputeRuntimePathWhenDiscoveringDevicesThenHwDeviceIdIsCreated) {
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, nullptr};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\local\\neo\\bin\\igdrcl64.dll"};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_EQ(1u, hwDeviceIds.size());
+}
+
+TEST(DiscoverDevices, givenAdapterFromOtherDriverStoreWithoutOpenClDriverNameAndComputeRuntimePathWhenDiscoveringDevicesThenHwDeviceIdIsNotCreatedAndPrivateDriverDataIsNotQueried) {
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, nullptr};
+    VariableBackup<const wchar_t *> openClDriverNameBackup{&queryRegistryOpenClDriverName, nullptr};
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+    VariableBackup<uint32_t> privateQueryCountBackup{&queryAdapterInfoUmDriverPrivateCallCount, 0u};
+    ExecutionEnvironment executionEnvironment;
+    auto hwDeviceIds = OSInterface::discoverDevices(executionEnvironment);
+    EXPECT_TRUE(hwDeviceIds.empty());
+    EXPECT_EQ(0u, queryAdapterInfoUmDriverPrivateCallCount);
+}
+
+bool isCompatibleDriverStoreWithRegistryPaths(std::wstring_view adapterDriverStorePathInRegistry, std::wstring_view computeRuntimePathInRegistry) {
+    VariableBackup<const wchar_t *> driverStorePathBackup{&queryRegistryDriverStorePath, adapterDriverStorePathInRegistry.data()};
+    VariableBackup<const wchar_t *> computeRuntimePathBackup{&queryRegistryComputeRuntimePath, computeRuntimePathInRegistry.data()};
+    OsEnvironmentWin osEnvironment;
+    HwDeviceIdWddm hwDeviceId(ADAPTER_HANDLE, LUID{}, 1u, &osEnvironment, std::make_unique<UmKmDataTranslator>());
+    return hwDeviceId.isDriverStoreValid();
+}
+
+TEST(DriverStoreCompatibility, givenEnabledUmKmDataTranslatorAndLibraryFromOtherDriverStoreWhenCheckingDriverStoreThenItIsValid) {
+    struct EnabledUmKmDataTranslator : UmKmDataTranslator {
+        EnabledUmKmDataTranslator() {
+            this->isEnabled = true;
+        }
+    };
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+    OsEnvironmentWin osEnvironment;
+    HwDeviceIdWddm hwDeviceId(ADAPTER_HANDLE, LUID{}, 1u, &osEnvironment, std::make_unique<EnabledUmKmDataTranslator>());
+
+    EXPECT_TRUE(hwDeviceId.isDriverStoreValid());
+}
+
+TEST(DriverStoreCompatibility, givenOverriddenGdiPathAndLibraryFromOtherDriverStoreWhenCheckingDriverStoreThenItIsValid) {
+    DebugManagerStateRestore restorer;
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+    OsEnvironmentWin osEnvironment;
+    HwDeviceIdWddm hwDeviceId(ADAPTER_HANDLE, LUID{}, 1u, &osEnvironment, std::make_unique<UmKmDataTranslator>());
+    EXPECT_FALSE(hwDeviceId.isDriverStoreValid());
+
+    debugManager.flags.OverrideGdiPath.set("customGdi.dll");
+    EXPECT_TRUE(hwDeviceId.isDriverStoreValid());
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryPathQueryFailsWhenCheckingDriverStoreThenItIsNotValid) {
+    VariableBackup<DWORD> getModuleFileNameResultBackup{&SysCalls::getModuleFileNameResult, FALSE};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryLoadedFromAdapterDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromAdapterDriverStore.data()};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenNoOpenClDriverNameInAdapterRegistryWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromAdapterDriverStore.data()};
+    VariableBackup<const wchar_t *> openClDriverNameBackup{&queryRegistryOpenClDriverName, nullptr};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryLoadedFromSubdirectoryOfAdapterDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, libraryFromAdapterDriverStoreSubdirectory.data()};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryLoadedFromOtherDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryLoadedOutsideOfDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\Program Files\\Application\\igdrcl64.dll"};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenDifferentCaseInCurrentLibraryPathAndAdapterDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\WINDOWS\\system32\\driverstore\\FILEREPOSITORY\\IIGD_DCH.INF_AMD64_0X8086\\IGDRCL64.DLL"};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryFromHostDriverStoreAndAdapterFromDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, libraryFromAdapterHostDriverStore.data()};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryFromDriverStoreAndAdapterFromHostDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromAdapterDriverStore.data()};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(adapterHostDriverStorePath.data(), L""));
+}
+
+TEST(DriverStoreCompatibility, givenEmptyAdapterDriverStorePathWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromAdapterDriverStore.data()};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(L"", L""));
+}
+
+TEST(DriverStoreCompatibility, givenEmptyCurrentLibraryPathWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L""};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, mockComputeRuntimePath));
+}
+
+TEST(DriverStoreCompatibility, givenAdapterPathOutsideOfDriverStoreWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromAdapterDriverStore.data()};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(L"C:\\Windows\\System32", L""));
+}
+
+TEST(DriverStoreCompatibility, givenSamePathOutsideOfDriverStoreForAdapterAndCurrentLibraryWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"\\"};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(L"\\", L""));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryInComputeRuntimeDirectoryWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\Local\\Neo\\bin\\igdrcl64.dll"};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, L"C:\\local\\neo\\bin"));
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, L"C:\\local\\neo\\bin\\"));
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, L"C:\\local\\neo"));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryOutsideOfComputeRuntimeDirectoryWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\local\\other\\igdrcl64.dll"};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, L"C:\\local\\neo\\bin"));
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, L"C:\\other"));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryFromOtherDriverStoreAndInComputeRuntimeDirectoryWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, otherComputeRuntimePath.data()));
+}
+
+TEST(DriverStoreCompatibility, givenEmptyAdapterDriverStorePathAndCurrentLibraryInComputeRuntimeDirectoryWhenCheckingDriverStoreCompatibilityThenItIsNotCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, L"C:\\local\\neo\\bin\\igdrcl64.dll"};
+
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(L"", L"C:\\local\\neo\\bin"));
+    EXPECT_FALSE(isCompatibleDriverStoreWithRegistryPaths(L"", L""));
+}
+
+TEST(DriverStoreCompatibility, givenCurrentLibraryFromOtherDriverStoreAndNoComputeRuntimePathWhenCheckingDriverStoreCompatibilityThenItIsCompatible) {
+    VariableBackup<const wchar_t *> currentLibraryPathBackup{&SysCalls::currentLibraryPath, mockLibraryFromOtherDriverStore.data()};
+
+    EXPECT_TRUE(isCompatibleDriverStoreWithRegistryPaths(mockAdapterDriverStorePath, L""));
 }
 
 TEST(WddmDiscoverDevices, WhenMultipleRootDevicesAreAvailableThenAllAreDiscovered) {
@@ -305,13 +583,520 @@ TEST_F(WddmGfxPartitionTest, WhenInitializingGfxPartitionThenAllHeapsAreInitiali
         ASSERT_FALSE(gfxPartition.heapInitialized(heap));
     }
 
-    wddm->initGfxPartition(gfxPartition, 0, 1, false);
+    auto &productHelper = rootDeviceEnvironment->getProductHelper();
+    wddm->initGfxPartition(gfxPartition, 0, 1, false, &productHelper);
 
     for (auto heap : MockGfxPartition::allHeapNames) {
         if (!gfxPartition.heapInitialized(heap)) {
-            EXPECT_TRUE(heap == HeapIndex::HEAP_SVM || heap == HeapIndex::HEAP_STANDARD2MB || heap == HeapIndex::HEAP_EXTENDED);
+            EXPECT_TRUE(heap == HeapIndex::heapSvm || heap == HeapIndex::heapStandard2MB || heap == HeapIndex::heapExtended);
         } else {
             EXPECT_TRUE(gfxPartition.heapInitialized(heap));
         }
     }
+}
+
+TEST_F(WddmGfxPartitionTest, GivenHeapAndAddressInGfxPartitionThenIsAddressInHeapRangeCorrectlyReturns) {
+    MockGfxPartition gfxPartition;
+
+    for (auto heap : MockGfxPartition::allHeapNames) {
+        ASSERT_FALSE(gfxPartition.heapInitialized(heap));
+    }
+
+    auto &productHelper = rootDeviceEnvironment->getProductHelper();
+    wddm->initGfxPartition(gfxPartition, 0, 1, false, &productHelper);
+
+    for (auto heap : MockGfxPartition::allHeapNames) {
+        if (!gfxPartition.heapInitialized(heap)) {
+            EXPECT_TRUE(heap == HeapIndex::heapSvm || heap == HeapIndex::heapStandard2MB || heap == HeapIndex::heapExtended);
+        } else {
+
+            auto heapBase = gfxPartition.getHeapBase(heap);
+            auto heapLimit = gfxPartition.getHeapLimit(heap);
+
+            EXPECT_FALSE(gfxPartition.isAddressInHeapRange(heap, heapBase - 1));
+            EXPECT_TRUE(gfxPartition.isAddressInHeapRange(heap, heapBase));
+            EXPECT_TRUE(gfxPartition.isAddressInHeapRange(heap, heapBase + MemoryConstants::pageSize));
+            EXPECT_TRUE(gfxPartition.isAddressInHeapRange(heap, heapLimit));
+            EXPECT_FALSE(gfxPartition.isAddressInHeapRange(heap, heapLimit + 1));
+        }
+    }
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetProcessPowerThrottlingStateDefaultWhenInitWddmThenPowerThrottlingStateIsNotSet) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetProcessPowerThrottlingState.set(-1);
+    SysCalls::setProcessPowerThrottlingStateCalled = 0u;
+    SysCalls::setProcessPowerThrottlingStateLastValue = SysCalls::ProcessPowerThrottlingState::Eco;
+    wddm->init();
+    EXPECT_EQ(0u, SysCalls::setProcessPowerThrottlingStateCalled);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetProcessPowerThrottlingState0WhenInitWddmThenPowerThrottlingStateIsNotSet) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetProcessPowerThrottlingState.set(0);
+    SysCalls::setProcessPowerThrottlingStateCalled = 0u;
+    SysCalls::setProcessPowerThrottlingStateLastValue = SysCalls::ProcessPowerThrottlingState::Eco;
+    wddm->init();
+    EXPECT_EQ(0u, SysCalls::setProcessPowerThrottlingStateCalled);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetProcessPowerThrottlingState1WhenInitWddmThenPowerThrottlingStateIsSetToEco) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetProcessPowerThrottlingState.set(1);
+    SysCalls::setProcessPowerThrottlingStateCalled = 0u;
+    SysCalls::setProcessPowerThrottlingStateLastValue = SysCalls::ProcessPowerThrottlingState::High;
+    wddm->init();
+    EXPECT_EQ(1u, SysCalls::setProcessPowerThrottlingStateCalled);
+    EXPECT_EQ(SysCalls::ProcessPowerThrottlingState::Eco, SysCalls::setProcessPowerThrottlingStateLastValue);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetProcessPowerThrottlingState2WhenInitWddmThenPowerThrottlingStateIsSetToHigh) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetProcessPowerThrottlingState.set(2);
+    SysCalls::setProcessPowerThrottlingStateCalled = 0u;
+    SysCalls::setProcessPowerThrottlingStateLastValue = SysCalls::ProcessPowerThrottlingState::Eco;
+    wddm->init();
+    EXPECT_EQ(1u, SysCalls::setProcessPowerThrottlingStateCalled);
+    EXPECT_EQ(SysCalls::ProcessPowerThrottlingState::High, SysCalls::setProcessPowerThrottlingStateLastValue);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetProcessPowerThrottlingStateUnsupportedWhenInitWddmThenPowerThrottlingStateIsNotSet) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetProcessPowerThrottlingState.set(3);
+    SysCalls::setProcessPowerThrottlingStateCalled = 0u;
+    SysCalls::setProcessPowerThrottlingStateLastValue = SysCalls::ProcessPowerThrottlingState::Eco;
+    wddm->init();
+    EXPECT_EQ(0u, SysCalls::setProcessPowerThrottlingStateCalled);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetThreadPriorityStateDefaultWhenInitWddmThenThreadPriorityIsNotSet) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetThreadPriority.set(-1);
+    SysCalls::setThreadPriorityCalled = 0u;
+    SysCalls::setThreadPriorityLastValue = SysCalls::ThreadPriority::Normal;
+    wddm->init();
+    EXPECT_EQ(0u, SysCalls::setThreadPriorityCalled);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetThreadPriorityStateDisabledWhenInitWddmThenThreadPriorityIsNotSet) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetThreadPriority.set(0);
+    SysCalls::setThreadPriorityCalled = 0u;
+    SysCalls::setThreadPriorityLastValue = SysCalls::ThreadPriority::Normal;
+    wddm->init();
+    EXPECT_EQ(0u, SysCalls::setThreadPriorityCalled);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenSetThreadPriorityStateEnabledWhenInitWddmThenThreadPriorityIsSet) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetThreadPriority.set(1);
+    SysCalls::setThreadPriorityCalled = 0u;
+    SysCalls::setThreadPriorityLastValue = SysCalls::ThreadPriority::Normal;
+    wddm->init();
+    EXPECT_EQ(1u, SysCalls::setThreadPriorityCalled);
+    EXPECT_EQ(SysCalls::ThreadPriority::AboveNormal, SysCalls::setThreadPriorityLastValue);
+}
+
+TEST_F(WddmTestWithMockGdiDll, whenGettingReadOnlyFlagThenReturnTrueOnlyForPageMisaligedCpuPointer) {
+    void *alignedPtr = reinterpret_cast<void *>(MemoryConstants::pageSize);
+    EXPECT_FALSE(wddm->getReadOnlyFlagValue(alignedPtr));
+
+    void *misalignedPtr = reinterpret_cast<void *>(MemoryConstants::pageSize + MemoryConstants::cacheLineSize);
+    EXPECT_TRUE(wddm->getReadOnlyFlagValue(misalignedPtr));
+
+    EXPECT_FALSE(wddm->getReadOnlyFlagValue(nullptr));
+}
+
+TEST_F(WddmTestWithMockGdiDll, whenGettingReadOnlyFlagFallbackSupportThenTrueIsReturned) {
+    EXPECT_TRUE(wddm->isReadOnlyFlagFallbackSupported());
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenOsHandleDataWithoutParentProcessWhenGettingSharedHandleThenReturnOriginalHandle) {
+    uint64_t originalHandle = 0x12345678;
+    MemoryManager::OsHandleData osHandleData(originalHandle);
+
+    HANDLE sharedHandle = wddm->getSharedHandle(osHandleData);
+
+    EXPECT_EQ(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(originalHandle)), sharedHandle);
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenOsHandleDataWithParentProcessWhenGettingSharedHandleThenDuplicateHandleFromParentProcess) {
+    uint64_t originalHandle = 0x12345678;
+    uint32_t parentProcessId = 1234;
+    MemoryManager::OsHandleData osHandleData(originalHandle);
+    osHandleData.parentProcessId = parentProcessId;
+
+    HANDLE mockDuplicatedHandle = reinterpret_cast<HANDLE>(0x8888);
+
+    // Mock openProcess to return a valid handle
+    SysCalls::sysCallsOpenProcess = [](DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) -> HANDLE {
+        EXPECT_EQ(static_cast<DWORD>(PROCESS_DUP_HANDLE), dwDesiredAccess);
+        EXPECT_EQ(FALSE, bInheritHandle);
+        EXPECT_EQ(1234u, dwProcessId);
+        return reinterpret_cast<HANDLE>(0x9999);
+    };
+
+    // Mock duplicateHandle to succeed
+    SysCalls::sysCallsDuplicateHandle = [](HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions) -> BOOL {
+        EXPECT_EQ(reinterpret_cast<HANDLE>(0x9999), hSourceProcessHandle);
+        EXPECT_EQ(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x12345678)), hSourceHandle);
+        EXPECT_EQ(GetCurrentProcess(), hTargetProcessHandle);
+        EXPECT_EQ(GENERIC_READ | GENERIC_WRITE, dwDesiredAccess);
+        EXPECT_EQ(FALSE, bInheritHandle);
+        EXPECT_EQ(0u, dwOptions);
+        *lpTargetHandle = reinterpret_cast<HANDLE>(0x8888);
+        return TRUE;
+    };
+
+    size_t closeHandleCallsBefore = SysCalls::closeHandleCalled;
+
+    HANDLE sharedHandle = wddm->getSharedHandle(osHandleData);
+
+    EXPECT_EQ(mockDuplicatedHandle, sharedHandle);
+    EXPECT_EQ(closeHandleCallsBefore + 1, SysCalls::closeHandleCalled); // Parent process handle should be closed
+
+    // Cleanup
+    SysCalls::sysCallsOpenProcess = nullptr;
+    SysCalls::sysCallsDuplicateHandle = nullptr;
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenOsHandleDataWithParentProcessWhenOpenProcessFailsThenReturnOriginalHandle) {
+    uint64_t originalHandle = 0x12345678;
+    uint32_t parentProcessId = 1234;
+    MemoryManager::OsHandleData osHandleData(originalHandle);
+    osHandleData.parentProcessId = parentProcessId;
+
+    // Mock openProcess to fail
+    SysCalls::sysCallsOpenProcess = [](DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) -> HANDLE {
+        return nullptr;
+    };
+
+    HANDLE sharedHandle = wddm->getSharedHandle(osHandleData);
+
+    EXPECT_EQ(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(originalHandle)), sharedHandle);
+
+    // Cleanup
+    SysCalls::sysCallsOpenProcess = nullptr;
+}
+
+TEST_F(WddmTestWithMockGdiDll, givenOsHandleDataWithParentProcessWhenDuplicateHandleFailsThenReturnOriginalHandle) {
+    uint64_t originalHandle = 0x12345678;
+    uint32_t parentProcessId = 1234;
+    MemoryManager::OsHandleData osHandleData(originalHandle);
+    osHandleData.parentProcessId = parentProcessId;
+
+    // Mock openProcess to succeed
+    SysCalls::sysCallsOpenProcess = [](DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) -> HANDLE {
+        return reinterpret_cast<HANDLE>(0x9999);
+    };
+
+    // Mock duplicateHandle to fail
+    SysCalls::sysCallsDuplicateHandle = [](HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions) -> BOOL {
+        return FALSE;
+    };
+
+    size_t closeHandleCallsBefore = SysCalls::closeHandleCalled;
+
+    HANDLE sharedHandle = wddm->getSharedHandle(osHandleData);
+
+    EXPECT_EQ(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(originalHandle)), sharedHandle);
+    EXPECT_EQ(closeHandleCallsBefore + 1, SysCalls::closeHandleCalled); // Parent process handle should still be closed
+
+    // Cleanup
+    SysCalls::sysCallsOpenProcess = nullptr;
+    SysCalls::sysCallsDuplicateHandle = nullptr;
+}
+
+namespace {
+struct OpenNtHandleFromNameCapture {
+    static NTSTATUS __stdcall openNtHandleFromName(IN OUT D3DKMT_OPENNTHANDLEFROMNAME *openNtHandle) {
+        callCount++;
+        lastDesiredAccess = openNtHandle->dwDesiredAccess;
+        lastRootDirectory = openNtHandle->pObjAttrib->RootDirectory;
+        if (fail) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        openNtHandle->hNtHandle = handleToReturn;
+        return STATUS_SUCCESS;
+    }
+
+    static void reset() {
+        callCount = 0u;
+        lastDesiredAccess = 0u;
+        lastRootDirectory = nullptr;
+        fail = false;
+    }
+
+    inline static uint32_t callCount = 0u;
+    inline static DWORD lastDesiredAccess = 0u;
+    inline static HANDLE lastRootDirectory = nullptr;
+    inline static bool fail = false;
+    inline static HANDLE handleToReturn = reinterpret_cast<HANDLE>(0x4321);
+};
+
+struct WddmOpenNTHandleFromNameTest : public WddmTest {
+    void SetUp() override {
+        WddmTest::SetUp();
+        OpenNtHandleFromNameCapture::reset();
+        gdi->openNtHandleFromName = OpenNtHandleFromNameCapture::openNtHandleFromName;
+    }
+
+    void TearDown() override {
+        OpenNtHandleFromNameCapture::reset();
+        WddmTest::TearDown();
+    }
+};
+} // namespace
+
+TEST_F(WddmOpenNTHandleFromNameTest, givenNameWhenOpeningNTHandleFromNameThenGdiIsCalledWithAllAccessUnderNamedObjectDirectoryAndHandleIsReturned) {
+    VariableBackup<decltype(SysCalls::sysCallsNtOpenDirectoryObject)> backupOpenDir(&SysCalls::sysCallsNtOpenDirectoryObject, [](PHANDLE directoryHandle, ACCESS_MASK, POBJECT_ATTRIBUTES) -> NTSTATUS {
+        *directoryHandle = reinterpret_cast<HANDLE>(0x7);
+        return STATUS_SUCCESS;
+    });
+
+    auto handle = wddm->openNTHandleFromName(L"myMemory", false);
+
+    EXPECT_EQ(OpenNtHandleFromNameCapture::handleToReturn, handle);
+    EXPECT_EQ(1u, OpenNtHandleFromNameCapture::callCount);
+    EXPECT_EQ(static_cast<DWORD>(SHARED_ALLOCATION_ALL_ACCESS), OpenNtHandleFromNameCapture::lastDesiredAccess);
+    EXPECT_EQ(reinterpret_cast<HANDLE>(0x7), OpenNtHandleFromNameCapture::lastRootDirectory);
+}
+
+TEST_F(WddmOpenNTHandleFromNameTest, givenForceGlobalWhenOpeningNTHandleFromNameThenNameIsLookedUpInGlobalOrSessionDirectory) {
+    static wchar_t openedDirectory[64];
+    VariableBackup<decltype(SysCalls::sysCallsProcessIdToSessionId)> backupSessionId(&SysCalls::sysCallsProcessIdToSessionId, [](DWORD, DWORD *sessionId) -> BOOL {
+        *sessionId = 1;
+        return TRUE;
+    });
+    VariableBackup<decltype(SysCalls::sysCallsNtOpenDirectoryObject)> backupOpenDir(&SysCalls::sysCallsNtOpenDirectoryObject, [](PHANDLE directoryHandle, ACCESS_MASK, POBJECT_ATTRIBUTES objectAttributes) -> NTSTATUS {
+        wcsncpy_s(openedDirectory, objectAttributes->ObjectName->Buffer, objectAttributes->ObjectName->Length / sizeof(wchar_t));
+        *directoryHandle = reinterpret_cast<HANDLE>(0x7);
+        return STATUS_SUCCESS;
+    });
+
+    EXPECT_NE(nullptr, wddm->openNTHandleFromName(L"myMemory", true));
+    EXPECT_STREQ(L"\\BaseNamedObjects", openedDirectory);
+
+    EXPECT_NE(nullptr, wddm->openNTHandleFromName(L"myMemory", false));
+    EXPECT_STREQ(L"\\Sessions\\1\\BaseNamedObjects", openedDirectory);
+}
+
+TEST_F(WddmOpenNTHandleFromNameTest, givenGdiFailsWhenOpeningNTHandleFromNameThenNullptrIsReturned) {
+    OpenNtHandleFromNameCapture::fail = true;
+
+    EXPECT_EQ(nullptr, wddm->openNTHandleFromName(L"myMemory", false));
+    EXPECT_EQ(1u, OpenNtHandleFromNameCapture::callCount);
+}
+
+TEST_F(WddmTest, GivenWddmWhenMapGpuVaCalledWithMemoryFlagsWithNoAccessThenMemoryAccessFlagsPassedToGmmHasNoAccessSet) {
+    wddm->callBaseDestroyAllocations = false;
+    wddm->pagingQueue = PAGINGQUEUE_HANDLE;
+    auto memoryManager = std::make_unique<MockWddmMemoryManager>(*executionEnvironment);
+    auto allocation = static_cast<WddmAllocation *>(memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0, MemoryConstants::pageSize}));
+    MemoryFlags flags = {};
+    flags.noAccess = true;
+    wddm->memoryFlagsToPass = &flags;
+    wddm->mapGpuVirtualAddress(allocation);
+    EXPECT_EQ(reinterpret_cast<MockGmmClientContextBase *>(allocation->getDefaultGmm()->getGmmHelper()->getClientContext())->passedNoAccess, 1u);
+    memoryManager->freeGraphicsMemory(allocation);
+}
+
+TEST_F(WddmTest, GivenWddmWhenMapGpuVaCalledWithMemoryFlagsWithReadWriteThenMemoryAccessFlagsPassedToGmmHasWriteSet) {
+    wddm->callBaseDestroyAllocations = false;
+    wddm->pagingQueue = PAGINGQUEUE_HANDLE;
+    auto memoryManager = std::make_unique<MockWddmMemoryManager>(*executionEnvironment);
+    auto allocation = static_cast<WddmAllocation *>(memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0, MemoryConstants::pageSize}));
+    MemoryFlags flags = {};
+    flags.readWrite = true;
+    wddm->memoryFlagsToPass = &flags;
+    wddm->mapGpuVirtualAddress(allocation);
+    EXPECT_EQ(reinterpret_cast<MockGmmClientContextBase *>(allocation->getDefaultGmm()->getGmmHelper()->getClientContext())->passedWrite, 1u);
+    memoryManager->freeGraphicsMemory(allocation);
+}
+
+TEST_F(WddmTest, GivenWddmWhenMapGpuVaCalledWithMemoryFlagsWithReadOnlyThenMemoryAccessFlagsPassedToGmmHasNoAccessAndWriteIsNotSet) {
+    wddm->callBaseDestroyAllocations = false;
+    wddm->pagingQueue = PAGINGQUEUE_HANDLE;
+    auto memoryManager = std::make_unique<MockWddmMemoryManager>(*executionEnvironment);
+    auto allocation = static_cast<WddmAllocation *>(memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0, MemoryConstants::pageSize}));
+    MemoryFlags flags = {};
+    flags.readOnly = true;
+    wddm->memoryFlagsToPass = &flags;
+    wddm->mapGpuVirtualAddress(allocation);
+    EXPECT_EQ(reinterpret_cast<MockGmmClientContextBase *>(allocation->getDefaultGmm()->getGmmHelper()->getClientContext())->passedWrite, 0u);
+    EXPECT_EQ(reinterpret_cast<MockGmmClientContextBase *>(allocation->getDefaultGmm()->getGmmHelper()->getClientContext())->passedNoAccess, 0u);
+    memoryManager->freeGraphicsMemory(allocation);
+}
+
+TEST_F(WddmTest, GivenWddmDriverModelWhenLatePreemptionStartSupportIsCheckedThenCorrectValueIsReturned) {
+    DebugManagerStateRestore restorer;
+    VariableBackup<FeatureTableBase::Flags> ftrFlags{&defaultHwInfo->featureTable.flags};
+
+    debugManager.flags.OverrideLatePreemptionStart.set(-1);
+    defaultHwInfo->featureTable.flags.ftrSelectiveWmtp = false;
+    EXPECT_FALSE(wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+
+    defaultHwInfo->featureTable.flags.ftrSelectiveWmtp = true;
+    EXPECT_EQ(defaultHwInfo->caps.latePreemptionStartSupported, wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+
+    debugManager.flags.OverrideLatePreemptionStart.set(0);
+    EXPECT_FALSE(wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+
+    debugManager.flags.OverrideLatePreemptionStart.set(1);
+    defaultHwInfo->featureTable.flags.ftrSelectiveWmtp = false;
+    EXPECT_TRUE(wddm->isLatePreemptionStartSupported(*NEO::defaultHwInfo));
+}
+
+namespace {
+uint64_t kmdWaiterRegistrationCount = 0;
+uint64_t kmdWaiterRegisteredFenceValue = 0;
+D3DKMT_HANDLE kmdWaiterRegisteredFenceHandle = 0;
+HANDLE kmdWaiterRegisteredAsyncEvent = nullptr;
+NTSTATUS kmdWaiterRegistrationStatus = STATUS_SUCCESS;
+
+NTSTATUS __stdcall registerKmdWaiterMock(const D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU *waitStruct) {
+    kmdWaiterRegistrationCount++;
+    kmdWaiterRegisteredFenceValue = waitStruct->FenceValueArray[0];
+    kmdWaiterRegisteredFenceHandle = waitStruct->ObjectHandleArray[0];
+    kmdWaiterRegisteredAsyncEvent = waitStruct->hAsyncEvent;
+    return kmdWaiterRegistrationStatus;
+}
+
+size_t kmdWaiterCreatedEvents = 0;
+HANDLE countingCreateEventMock(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR, void *) {
+    kmdWaiterCreatedEvents++;
+    return reinterpret_cast<HANDLE>(dummyHandle);
+}
+} // namespace
+
+TEST_F(Wddm20Tests, givenMonitoredFenceWhenCreatingKmdWaiterThenAsyncKmdWaitIsRegisteredAndEachWaitIsBoundedByTimer) {
+    VariableBackup<uint64_t> registrationCountBackup(&kmdWaiterRegistrationCount, 0u);
+    VariableBackup<HANDLE> asyncEventBackup(&kmdWaiterRegisteredAsyncEvent, nullptr);
+    VariableBackup<size_t> setTimerCallsBackup(&SysCalls::setWaitableTimerCalled, 0u);
+    VariableBackup<int64_t> dueTimeBackup(&SysCalls::setWaitableTimerLastDueTime, 0);
+    VariableBackup<size_t> waitCallsBackup(&SysCalls::waitForMultipleObjectsCalled, 0u);
+    VariableBackup<DWORD> waitTimeoutBackup(&SysCalls::waitForMultipleObjectsLastTimeout, 0u);
+    VariableBackup<DWORD> waitResultBackup(&SysCalls::waitForMultipleObjectsReturnValue, WAIT_OBJECT_0 + 1);
+    wddm->getGdi()->waitForSynchronizationObjectFromCpu = &registerKmdWaiterMock;
+
+    uint64_t fenceCpuValue = 4u;
+    D3DKMT_HANDLE fenceHandle = 7u;
+    D3DGPU_VIRTUAL_ADDRESS fenceGpuAddress = castToUint64(&fenceCpuValue);
+    osContext->resetMonitoredFenceParams(fenceHandle, &fenceCpuValue, fenceGpuAddress);
+
+    auto kmdWaiter = wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 5u);
+    ASSERT_NE(nullptr, kmdWaiter);
+    EXPECT_EQ(1u, kmdWaiterRegistrationCount);
+    EXPECT_EQ(5u, kmdWaiterRegisteredFenceValue);
+    EXPECT_EQ(7u, kmdWaiterRegisteredFenceHandle);
+    EXPECT_NE(nullptr, kmdWaiterRegisteredAsyncEvent);
+
+    EXPECT_EQ(WaitStatus::notReady, kmdWaiter->wait(500000u));
+    EXPECT_EQ(-5000, SysCalls::setWaitableTimerLastDueTime);
+    EXPECT_EQ(INFINITE, SysCalls::waitForMultipleObjectsLastTimeout);
+    EXPECT_EQ(1u, SysCalls::waitForMultipleObjectsCalled);
+
+    fenceCpuValue = 5u;
+    EXPECT_EQ(WaitStatus::ready, kmdWaiter->wait(500000u));
+    fenceCpuValue = Wddm::gpuHangIndication;
+    EXPECT_EQ(WaitStatus::gpuHang, kmdWaiter->wait(500000u));
+    EXPECT_EQ(1u, SysCalls::setWaitableTimerCalled);
+}
+
+TEST_F(Wddm20Tests, givenFinishedKmdWaiterWhenCreatingNextKmdWaiterThenItsHandlesAreReusedResetAndOnlyWddmDestructionClosesThem) {
+    VariableBackup<size_t> createdEventsBackup(&kmdWaiterCreatedEvents, 0u);
+    VariableBackup<decltype(mockCreateEventClb)> createEventBackup(&mockCreateEventClb, &countingCreateEventMock);
+    VariableBackup<size_t> closeCallsBackup(&SysCalls::closeHandleCalled, 0u);
+    VariableBackup<DWORD> waitResultBackup(&SysCalls::waitForMultipleObjectsReturnValue, WAIT_OBJECT_0);
+    wddm->getGdi()->waitForSynchronizationObjectFromCpu = &registerKmdWaiterMock;
+    const auto resetCallsBefore = SysCalls::resetEventCalled.load();
+
+    uint64_t fenceCpuValue = 0u;
+    D3DKMT_HANDLE fenceHandle = osContext->getMonitoredFence().fenceHandle;
+    D3DGPU_VIRTUAL_ADDRESS fenceGpuAddress = castToUint64(&fenceCpuValue);
+    osContext->resetMonitoredFenceParams(fenceHandle, &fenceCpuValue, fenceGpuAddress);
+
+    wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u).reset();
+    auto reusingKmdWaiter = wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 2u);
+    ASSERT_NE(nullptr, reusingKmdWaiter);
+    EXPECT_EQ(1u, kmdWaiterCreatedEvents);
+    EXPECT_EQ(resetCallsBefore + 2u, SysCalls::resetEventCalled);
+
+    EXPECT_EQ(WaitStatus::notReady, reusingKmdWaiter->wait(500000u));
+    EXPECT_EQ(resetCallsBefore + 3u, SysCalls::resetEventCalled);
+
+    reusingKmdWaiter.reset();
+    EXPECT_EQ(0u, SysCalls::closeHandleCalled);
+    EXPECT_EQ(1u, wddm->unusedKmdWaitHandles.size());
+
+    wddm->releaseUnusedKmdWaitHandles();
+    EXPECT_EQ(2u, SysCalls::closeHandleCalled);
+    EXPECT_TRUE(wddm->unusedKmdWaitHandles.empty());
+}
+
+TEST_F(Wddm20Tests, givenFailingTimerArmWaitOrEventResetWhenKmdWaiterWaitsThenFailureIsReportedAndItsHandlesAreNotReused) {
+    VariableBackup<size_t> waitCallsBackup(&SysCalls::waitForMultipleObjectsCalled, 0u);
+    VariableBackup<size_t> closeCallsBackup(&SysCalls::closeHandleCalled, 0u);
+    wddm->getGdi()->waitForSynchronizationObjectFromCpu = &registerKmdWaiterMock;
+
+    uint64_t fenceCpuValue = 0u;
+    D3DKMT_HANDLE fenceHandle = osContext->getMonitoredFence().fenceHandle;
+    D3DGPU_VIRTUAL_ADDRESS fenceGpuAddress = castToUint64(&fenceCpuValue);
+    osContext->resetMonitoredFenceParams(fenceHandle, &fenceCpuValue, fenceGpuAddress);
+
+    {
+        auto kmdWaiter = wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u);
+        ASSERT_NE(nullptr, kmdWaiter);
+        VariableBackup<BOOL> timerResultBackup(&SysCalls::setWaitableTimerResult, FALSE);
+        EXPECT_EQ(std::nullopt, kmdWaiter->wait(500000u));
+        EXPECT_EQ(0u, SysCalls::waitForMultipleObjectsCalled);
+    }
+    {
+        auto kmdWaiter = wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u);
+        ASSERT_NE(nullptr, kmdWaiter);
+        VariableBackup<DWORD> waitResultBackup(&SysCalls::waitForMultipleObjectsReturnValue, WAIT_FAILED);
+        EXPECT_EQ(std::nullopt, kmdWaiter->wait(500000u));
+    }
+    {
+        auto kmdWaiter = wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u);
+        ASSERT_NE(nullptr, kmdWaiter);
+        VariableBackup<DWORD> waitResultBackup(&SysCalls::waitForMultipleObjectsReturnValue, WAIT_OBJECT_0);
+        VariableBackup<BOOL> resetResultBackup(&SysCalls::resetEventResult, FALSE);
+        EXPECT_EQ(std::nullopt, kmdWaiter->wait(500000u));
+    }
+    EXPECT_EQ(6u, SysCalls::closeHandleCalled);
+    EXPECT_TRUE(wddm->unusedKmdWaitHandles.empty());
+}
+
+TEST_F(Wddm20Tests, givenEventCreationResetOrKmdWaitRegistrationFailureWhenCreatingKmdWaiterThenNothingIsReturnedAndNoHandleLeaks) {
+    VariableBackup<uint64_t> registrationCountBackup(&kmdWaiterRegistrationCount, 0u);
+    VariableBackup<NTSTATUS> registrationStatusBackup(&kmdWaiterRegistrationStatus, STATUS_UNSUCCESSFUL);
+    VariableBackup<size_t> closeCallsBackup(&SysCalls::closeHandleCalled, 0u);
+    wddm->getGdi()->waitForSynchronizationObjectFromCpu = &registerKmdWaiterMock;
+
+    uint64_t fenceCpuValue = 0u;
+    D3DKMT_HANDLE fenceHandle = osContext->getMonitoredFence().fenceHandle;
+    D3DGPU_VIRTUAL_ADDRESS fenceGpuAddress = castToUint64(&fenceCpuValue);
+    osContext->resetMonitoredFenceParams(fenceHandle, &fenceCpuValue, fenceGpuAddress);
+
+    {
+        VariableBackup<decltype(mockCreateEventClb)> createEventBackup(&mockCreateEventClb, [](LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR, void *) -> HANDLE {
+            return nullptr;
+        });
+        EXPECT_EQ(nullptr, wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u));
+        EXPECT_EQ(0u, kmdWaiterRegistrationCount);
+        EXPECT_EQ(1u, SysCalls::closeHandleCalled);
+        EXPECT_TRUE(wddm->unusedKmdWaitHandles.empty());
+    }
+
+    EXPECT_EQ(nullptr, wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u));
+    EXPECT_EQ(1u, kmdWaiterRegistrationCount);
+    EXPECT_EQ(1u, SysCalls::closeHandleCalled);
+    EXPECT_EQ(1u, wddm->unusedKmdWaitHandles.size());
+
+    VariableBackup<BOOL> resetResultBackup(&SysCalls::resetEventResult, FALSE);
+    EXPECT_EQ(nullptr, wddm->Wddm::createMonitoredFenceKmdWaiter(*osContext, 1u));
+    EXPECT_EQ(1u, kmdWaiterRegistrationCount);
+    EXPECT_EQ(3u, SysCalls::closeHandleCalled);
+    EXPECT_TRUE(wddm->unusedKmdWaitHandles.empty());
 }

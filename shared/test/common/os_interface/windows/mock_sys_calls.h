@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,9 @@
 
 #pragma once
 
-#include "sys_calls.h"
+#include "shared/source/os_interface/windows/sys_calls.h"
+
+#include <atomic>
 
 using mockCreateEventClbT = HANDLE (*)(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCSTR lpName, void *data);
 inline mockCreateEventClbT mockCreateEventClb = nullptr;
@@ -35,7 +37,7 @@ struct MockGlobalSysCallRestorer {
     }
     MockGlobalSysCallRestorer(const MockGlobalSysCallRestorer &rhs) = delete;
     MockGlobalSysCallRestorer &operator=(const MockGlobalSysCallRestorer &rhs) = delete;
-    MockGlobalSysCallRestorer(MockGlobalSysCallRestorer &&rhs)
+    MockGlobalSysCallRestorer(MockGlobalSysCallRestorer &&rhs) noexcept
         : globalClb(rhs.globalClb), globalClbData(rhs.globalClbData) {
         callbackPrev = rhs.callbackPrev;
         callbackData = rhs.callbackData;
@@ -56,3 +58,73 @@ MockGlobalSysCallRestorer<CallbackT> changeSysCallMock(CallbackT &globalClb, voi
     globalClbData = mockCallbackData;
     return ret;
 }
+
+namespace NEO {
+
+namespace SysCalls {
+
+extern size_t closeHandleCalled;
+extern std::string getProcessNameResult;
+
+extern HANDLE (*sysCallsCreateFile)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+extern BOOL (*sysCallsDeviceIoControl)(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped);
+extern CONFIGRET (*sysCallsCmGetDeviceInterfaceListSize)(PULONG pulLen, LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, ULONG ulFlags);
+extern CONFIGRET (*sysCallsCmGetDeviceInterfaceList)(LPGUID interfaceClassGuid, DEVINSTID_W pDeviceID, PZZWSTR buffer, ULONG bufferLen, ULONG ulFlags);
+extern CONFIGRET (*sysCallsCmGetDeviceIdSize)(PULONG pulLen, DEVINST dnDevInst, ULONG ulFlags);
+extern CONFIGRET (*sysCallsCmGetDeviceId)(DEVINST dnDevInst, PWSTR buffer, ULONG bufferLen, ULONG ulFlags);
+extern CONFIGRET (*sysCallsCmGetChild)(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags);
+extern CONFIGRET (*sysCallsCmGetSibling)(PDEVINST pdnDevInst, DEVINST dnDevInst, ULONG ulFlags);
+extern BOOL (*sysCallsSetupDiGetDeviceRegistryProperty)(HDEVINFO deviceInfoSet, PSP_DEVINFO_DATA deviceInfoData, DWORD property, PDWORD propertyRegDataType, PBYTE propertyBuffer, DWORD propertyBufferSize, PDWORD requiredSize);
+extern BOOL (*sysCallsSetupDiOpenDeviceInfo)(HDEVINFO deviceInfoSet, PCWSTR deviceInstanceId, HWND hwndParent, DWORD openFlags, PSP_DEVINFO_DATA deviceInfoData);
+extern BOOL (*sysCallsSetupDiEnumDeviceInfo)(HDEVINFO deviceInfoSet, DWORD memberIndex, PSP_DEVINFO_DATA deviceInfoData);
+extern BOOL (*sysCallsSetupDiDestroyDeviceInfoList)(HDEVINFO deviceInfoSet);
+extern HDEVINFO (*sysCallsSetupDiGetClassDevs)(GUID *classGuid, PCWSTR enumerator, HWND hwndParent, DWORD flags);
+extern LPVOID (*sysCallsHeapAlloc)(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes);
+extern BOOL (*sysCallsHeapFree)(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem);
+extern BOOL (*sysCallsDuplicateHandle)(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, LPHANDLE lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions);
+extern HANDLE (*sysCallsOpenProcess)(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+extern DWORD (*sysCallsWaitForSingleObject)(HANDLE hHandle, DWORD dwMilliseconds);
+
+extern BOOL (*sysCallsGetModuleHandleExW)(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule);
+extern DWORD (*sysCallsGetModuleFileNameW)(HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
+extern BOOL (*sysCallsGetModuleHandleExA)(DWORD dwFlags, LPCSTR lpModuleName, HMODULE *phModule);
+extern DWORD (*sysCallsGetModuleFileNameA)(HMODULE hModule, LPSTR lpFilename, DWORD nSize);
+extern DWORD (*sysCallsGetFileVersionInfoSizeW)(LPCWSTR lptstrFilename, LPDWORD lpdwHandle);
+extern BOOL (*sysCallsGetFileVersionInfoW)(LPCWSTR lptstrFilename, DWORD dwHandle, DWORD dwLen, LPVOID lpData);
+extern BOOL (*sysCallsVerQueryValueW)(LPCVOID pBlock, LPCWSTR lpSubBlock, LPVOID *lplpBuffer, PUINT puLen);
+extern DWORD (*sysCallsGetLastError)();
+extern BOOL (*sysCallsGetLogicalProcessorInformationEx)(LOGICAL_PROCESSOR_RELATIONSHIP relationshipType, PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer, PDWORD returnedLength);
+extern BOOL (*sysCallsRegisterWaitForSingleObject)(PHANDLE phNewWaitObject, HANDLE hObject, WAITORTIMERCALLBACK callback, PVOID context, ULONG dwMilliseconds, ULONG dwFlags);
+extern BOOL (*sysCallsUnregisterWait)(HANDLE waitHandle);
+extern DWORD waitForMultipleObjectsLastTimeout;
+extern DWORD waitForMultipleObjectsReturnValue;
+extern size_t waitForMultipleObjectsCalled;
+extern std::atomic<size_t> resetEventCalled;
+extern BOOL resetEventResult;
+extern size_t setWaitableTimerCalled;
+extern int64_t setWaitableTimerLastDueTime;
+extern BOOL setWaitableTimerResult;
+
+extern size_t ntOpenDirectoryObjectCalled;
+extern BOOL (*sysCallsProcessIdToSessionId)(DWORD dwProcessId, DWORD *pSessionId);
+extern void (*sysCallsRtlInitUnicodeString)(PUNICODE_STRING destinationString, PCWSTR sourceString);
+extern NTSTATUS (*sysCallsNtOpenDirectoryObject)(PHANDLE directoryHandle, ACCESS_MASK desiredAccess, POBJECT_ATTRIBUTES objectAttributes);
+extern size_t ntQueryObjectCalled;
+extern NTSTATUS ntQueryObjectResult;
+extern const wchar_t *ntQueryObjectTypeName;
+extern HANDLE ntQueryObjectLastHandle;
+extern OBJECT_INFORMATION_CLASS ntQueryObjectLastInformationClass;
+extern ULONG ntQueryObjectLastInformationLength;
+extern HANDLE openFileMappingResult;
+extern DWORD openFileMappingLastDesiredAccess;
+extern LPCWSTR openFileMappingLastName;
+extern size_t mapViewOfFileCalled;
+extern LPVOID mapViewOfFileResults[];
+extern DWORD mapViewOfFileLastDesiredAccess;
+extern SIZE_T mapViewOfFileLastNumberOfBytesToMap;
+extern size_t unmapViewOfFileCalled;
+extern LPCVOID unmapViewOfFileLastAddress;
+extern MEMORY_BASIC_INFORMATION virtualQueryMemoryBasicInformation;
+extern SIZE_T virtualQueryResult;
+} // namespace SysCalls
+} // namespace NEO

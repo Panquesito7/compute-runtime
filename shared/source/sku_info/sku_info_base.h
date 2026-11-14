@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,15 +17,10 @@ using BcsInfoMask = std::bitset<bcsInfoMaskSize>;
 
 struct FeatureTableBase {
   public:
-    FeatureTableBase() {
-        flags.ftrRcsNode = 1;
-    }
-
     struct Flags {
         // DW0
         uint32_t ftrGpGpuMidBatchPreempt : 1;
         uint32_t ftrGpGpuThreadGroupLevelPreempt : 1;
-        uint32_t ftrGpGpuMidThreadLevelPreempt : 1;
         uint32_t ftrWddm2Svm : 1;
         uint32_t ftrPooledEuEnabled : 1;
         uint32_t ftrPPGTT : 1;
@@ -55,9 +50,8 @@ struct FeatureTableBase {
         uint32_t ftrE2ECompression : 1;
         uint32_t ftrLinearCCS : 1;
         uint32_t ftrCCSRing : 1;
-        // DW1
         uint32_t ftrCCSNode : 1;
-        uint32_t ftrRcsNode : 1;
+        // DW1
         uint32_t ftrLocalMemory : 1;
         uint32_t ftrLocalMemoryAllows4KB : 1;
         uint32_t ftrFlatPhysCCS : 1;
@@ -65,10 +59,22 @@ struct FeatureTableBase {
         uint32_t ftrPpgtt64KBWalkOptimization : 1;
         uint32_t ftrUnified3DMediaCompressionFormats : 1;
         uint32_t ftr57bGPUAddressing : 1;
-        uint32_t reserved : 23;
+        uint32_t ftrTile64Optimization : 1;
+        uint32_t ftrWalkerMTP : 1;
+        uint32_t ftrXe2Compression : 1;
+        uint32_t ftrXe2PlusTiling : 1;
+        uint32_t ftrL3TransientDataFlush : 1;
+        uint32_t ftrPml5Support : 1;
+        uint32_t ftrHeaplessMode : 1;
+        uint32_t ftrBlitterRing : 1;
+        uint32_t ftrHwSemaphore64 : 1;
+        uint32_t ftrSelectiveWmtp : 1;
+        uint32_t ftrAppTransientCaching : 1;
+        uint32_t reserved : 14;
     };
 
     BcsInfoMask ftrBcsInfo = 1;
+    uint32_t regionCount = 1;
 
     union {
         Flags flags;
@@ -103,7 +109,10 @@ struct WorkaroundTableBase {
         uint32_t waAuxTable16KGranular : 1;
         uint32_t waDisableFusedThreadScheduling : 1;
         uint32_t waAuxTable64KGranular : 1;
-        uint32_t reserved : 11;
+        uint32_t wa_15010089951 : 1; // NOLINT(readability-identifier-naming)
+        uint32_t wa_14018976079 : 1; // NOLINT(readability-identifier-naming)
+        uint32_t wa_14018984349 : 1; // NOLINT(readability-identifier-naming)
+        uint32_t reserved : 8;
     };
 
     union {

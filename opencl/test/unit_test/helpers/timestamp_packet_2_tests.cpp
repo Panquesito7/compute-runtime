@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,11 +9,17 @@
 #include "shared/test/common/cmd_parse/hw_parse.h"
 #include "shared/test/common/mocks/mock_command_stream_receiver.h"
 #include "shared/test/common/mocks/mock_timestamp_container.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
 #include "opencl/source/event/user_event.h"
 #include "opencl/test/unit_test/helpers/timestamp_packet_tests.h"
+#include "opencl/test/unit_test/mocks/mock_command_queue_hw.h"
 #include "opencl/test/unit_test/mocks/mock_event.h"
+
+namespace NEO {
+class IndirectHeap;
+} // namespace NEO
 
 using namespace NEO;
 
@@ -22,6 +28,7 @@ HWTEST_F(TimestampPacketTests, givenEmptyWaitlistAndNoOutputEventWhenEnqueueingM
     csr.timestampPacketWriteEnabled = true;
 
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
+    cmdQ->updateLatestSentEnqueueType(EnqueueProperties::Operation::gpuKernel);
 
     cmdQ->enqueueMarkerWithWaitList(0, nullptr, nullptr);
 
@@ -69,27 +76,28 @@ class MockCommandStreamReceiverHW : public UltCommandStreamReceiver<FamilyType> 
             dispatchFlags,
             device);
     }
+
     LinearStream *stream = nullptr;
 };
 
-HWTEST_F(TimestampPacketTests, givenEmptyWaitlistAndEventWhenMarkerProfilingEnabledThenPipeControlAddedBeforeWritingTimestamp) {
+using TimestampPacketTestsWithMockCsrHw = TimestampPacketTestsWithMockCsrT<MockCommandStreamReceiverHW>;
+
+HWTEST_TEMPLATED_F(TimestampPacketTestsWithMockCsrHw, givenEmptyWaitlistAndEventWheBarrierProfilingEnabledThenPipeControlAddedBeforeWritingTimestamp) {
     using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    auto commandStreamReceiver = std::make_unique<MockCommandStreamReceiverHW<FamilyType>>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
-    auto commandStreamReceiverPtr = commandStreamReceiver.get();
+    auto commandStreamReceiver = static_cast<MockCommandStreamReceiverHW<FamilyType> *>(&device->getUltCommandStreamReceiver<FamilyType>());
     commandStreamReceiver->timestampPacketWriteEnabled = true;
-    device->resetCommandStreamReceiver(commandStreamReceiver.release());
 
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
     cmdQ->setProfilingEnabled();
 
     cl_event event;
-    cmdQ->enqueueMarkerWithWaitList(0, nullptr, &event);
+    cmdQ->enqueueBarrierWithWaitList(0, nullptr, &event);
 
     HardwareParse hwParser;
-    hwParser.parseCommands<FamilyType>(*(commandStreamReceiverPtr->stream), 0);
+    hwParser.parseCommands<FamilyType>(*(commandStreamReceiver->stream), 0);
     GenCmdList storeRegMemList = hwParser.getCommandsList<MI_STORE_REGISTER_MEM>();
-    EXPECT_EQ(4u, storeRegMemList.size());
+    EXPECT_EQ(0u, storeRegMemList.size() % 4u);
     auto storeRegMemIt = find<MI_STORE_REGISTER_MEM *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
     EXPECT_NE(storeRegMemIt, hwParser.cmdList.end());
     auto pipeControlIt = find<PIPE_CONTROL *>(hwParser.cmdList.begin(), storeRegMemIt);
@@ -99,22 +107,11 @@ HWTEST_F(TimestampPacketTests, givenEmptyWaitlistAndEventWhenMarkerProfilingEnab
     clReleaseEvent(event);
 }
 
-HWCMDTEST_F(IGFX_XE_HP_CORE, TimestampPacketTests, givenEmptyWaitlistAndEventWhenMarkerProfilingEnabledOnMultiTileCommandQueueThenCrossTileBarrierAddedBeforeWritingTimestamp) {
+HWTEST_TEMPLATED_F(TimestampPacketTestsWithMockCsrHw, givenEmptyWaitlistAndEventWhenMarkerProfilingEnabledThenPipeControlAddedBeforeWritingTimestamp) {
     using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
     using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
-    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
-    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
-
-    auto commandStreamReceiver = std::make_unique<MockCommandStreamReceiverHW<FamilyType>>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
-    auto commandStreamReceiverPtr = commandStreamReceiver.get();
+    auto commandStreamReceiver = static_cast<MockCommandStreamReceiverHW<FamilyType> *>(&device->getUltCommandStreamReceiver<FamilyType>());
     commandStreamReceiver->timestampPacketWriteEnabled = true;
-    commandStreamReceiver->activePartitions = 2;
-    commandStreamReceiver->activePartitionsConfig = 2;
-    commandStreamReceiver->staticWorkPartitioningEnabled = true;
-
-    device->resetCommandStreamReceiver(commandStreamReceiver.release());
-    *ptrOffset(commandStreamReceiverPtr->tagAddress, commandStreamReceiverPtr->postSyncWriteOffset) = *commandStreamReceiverPtr->tagAddress;
 
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
     cmdQ->setProfilingEnabled();
@@ -123,9 +120,43 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, TimestampPacketTests, givenEmptyWaitlistAndEventWhe
     cmdQ->enqueueMarkerWithWaitList(0, nullptr, &event);
 
     HardwareParse hwParser;
-    hwParser.parseCommands<FamilyType>(*(commandStreamReceiverPtr->stream), 0);
+    hwParser.parseCommands<FamilyType>(*(commandStreamReceiver->stream), 0);
     GenCmdList storeRegMemList = hwParser.getCommandsList<MI_STORE_REGISTER_MEM>();
-    EXPECT_EQ(4u, storeRegMemList.size());
+    EXPECT_EQ(0u, storeRegMemList.size() % 4u);
+    auto storeRegMemIt = find<MI_STORE_REGISTER_MEM *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
+    EXPECT_NE(storeRegMemIt, hwParser.cmdList.end());
+    auto pipeControlIt = find<PIPE_CONTROL *>(hwParser.cmdList.begin(), storeRegMemIt);
+    EXPECT_NE(storeRegMemIt, pipeControlIt);
+    EXPECT_NE(hwParser.cmdList.end(), pipeControlIt);
+
+    clReleaseEvent(event);
+}
+
+HWCMDTEST_TEMPLATED_F(IGFX_XE_HP_CORE, TimestampPacketTestsWithMockCsrHw, givenEmptyWaitlistAndEventWhenMarkerProfilingEnabledOnMultiTileCommandQueueThenCrossTileBarrierAddedBeforeWritingTimestamp) {
+    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
+    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
+    using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
+    using MI_ATOMIC = typename FamilyType::MI_ATOMIC;
+    using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
+
+    auto commandStreamReceiver = static_cast<MockCommandStreamReceiverHW<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
+    commandStreamReceiver->timestampPacketWriteEnabled = true;
+    commandStreamReceiver->activePartitions = 2;
+    commandStreamReceiver->activePartitionsConfig = 2;
+    commandStreamReceiver->staticWorkPartitioningEnabled = true;
+
+    *ptrOffset(commandStreamReceiver->tagAddress, commandStreamReceiver->immWritePostSyncWriteOffset) = *commandStreamReceiver->tagAddress;
+
+    auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
+    cmdQ->setProfilingEnabled();
+
+    cl_event event;
+    cmdQ->enqueueMarkerWithWaitList(0, nullptr, &event);
+
+    HardwareParse hwParser;
+    hwParser.parseCommands<FamilyType>(*(commandStreamReceiver->stream), 0);
+    GenCmdList storeRegMemList = hwParser.getCommandsList<MI_STORE_REGISTER_MEM>();
+    EXPECT_EQ(0u, storeRegMemList.size() % 4u);
     auto storeRegMemIt = find<MI_STORE_REGISTER_MEM *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
     EXPECT_NE(storeRegMemIt, hwParser.cmdList.end());
     GenCmdList::reverse_iterator rItorStoreRegMemIt(storeRegMemIt);
@@ -148,11 +179,9 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, TimestampPacketTests, givenEmptyWaitlistAndEventWhe
     clReleaseEvent(event);
 }
 
-HWTEST_F(TimestampPacketTests, givenWithWaitlistAndEventWhenMarkerProfilingEnabledThenPipeControllNotAddedBeforeWritingTimestamp) {
-    auto commandStreamReceiver = std::make_unique<MockCommandStreamReceiverHW<FamilyType>>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
-    auto commandStreamReceiverPtr = commandStreamReceiver.get();
+HWTEST_TEMPLATED_F(TimestampPacketTestsWithMockCsrHw, givenWithWaitlistAndEventWhenMarkerProfilingEnabledThenPipeControllNotAddedBeforeWritingTimestamp) {
+    auto commandStreamReceiver = static_cast<MockCommandStreamReceiverHW<FamilyType> *>(&device->getUltCommandStreamReceiver<FamilyType>());
     commandStreamReceiver->timestampPacketWriteEnabled = true;
-    device->resetCommandStreamReceiver(commandStreamReceiver.release());
 
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
     cmdQ->setProfilingEnabled();
@@ -169,7 +198,7 @@ HWTEST_F(TimestampPacketTests, givenWithWaitlistAndEventWhenMarkerProfilingEnabl
     cmdQ->enqueueMarkerWithWaitList(waitListSize, waitList, &event);
 
     HardwareParse hwParser;
-    hwParser.parseCommands<FamilyType>(*(commandStreamReceiverPtr->stream), 0);
+    hwParser.parseCommands<FamilyType>(*(commandStreamReceiver->stream), 0);
     auto storeRegMemIt = find<typename FamilyType::MI_STORE_REGISTER_MEM *>(hwParser.cmdList.begin(), hwParser.cmdList.end());
     EXPECT_NE(storeRegMemIt, hwParser.cmdList.end());
     auto pipeControlIt = find<typename FamilyType::PIPE_CONTROL *>(hwParser.cmdList.begin(), storeRegMemIt);
@@ -185,29 +214,30 @@ HWTEST_F(TimestampPacketTests, whenEnqueueingBarrierThenDontRequestPipeControlOn
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
     EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
 
-    MockKernelWithInternals mockKernel(*device, context);
+    MockKernelWithInternals mockKernel(*context);
     cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr); // obtain first TimestampPackets<uint32_t>
 
     TimestampPacketContainer cmdQNodes;
     cmdQNodes.assignAndIncrementNodesRefCounts(*cmdQ.timestampPacketContainer);
 
     cmdQ.enqueueBarrierWithWaitList(0, nullptr, nullptr);
-
-    EXPECT_EQ(cmdQ.timestampPacketContainer->peekNodes().at(0), cmdQNodes.peekNodes().at(0)); // dont obtain new node
-    EXPECT_EQ(1u, cmdQ.timestampPacketContainer->peekNodes().size());
-
+    if (cmdQ.isWalkerPostSyncSkipEnabled) {
+        EXPECT_EQ(0u, cmdQ.timestampPacketContainer->peekNodes().size());
+    } else {
+        EXPECT_EQ(cmdQ.timestampPacketContainer->peekNodes().at(0), cmdQNodes.peekNodes().at(0)); // dont obtain new node
+        EXPECT_EQ(1u, cmdQ.timestampPacketContainer->peekNodes().size());
+    }
     EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
 }
 
 HWTEST_F(TimestampPacketTests, givenWaitlistWhenEnqueueingBarrierThenProgramNonStallingBarrier) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     using MI_STORE_DATA_IMM = typename FamilyType::MI_STORE_DATA_IMM;
-    using PIPE_CONTROL = typename FamilyType::PIPE_CONTROL;
 
     auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
     csr.timestampPacketWriteEnabled = true;
 
-    MockKernelWithInternals mockKernel(*device, context);
+    MockKernelWithInternals mockKernel(*context);
 
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
 
@@ -228,8 +258,8 @@ HWTEST_F(TimestampPacketTests, givenWaitlistWhenEnqueueingBarrierThenProgramNonS
 
     auto it = hwParser.cmdList.begin();
 
-    if (device->getProductHelper().isResolveDependenciesByPipeControlsSupported(device->getHardwareInfo(), false, cmdQ.taskCount, cmdQ.getGpgpuCommandStreamReceiver())) {
-        EXPECT_NE(nullptr, genCmdCast<PIPE_CONTROL *>(*it));
+    if (device->getProductHelper().isResolveDependenciesByPipeControlsSupported()) {
+        EXPECT_TRUE(hwParser.isStallingBarrier<FamilyType>(it));
     } else {
         EXPECT_NE(nullptr, genCmdCast<MI_SEMAPHORE_WAIT *>(*it));
         EXPECT_NE(nullptr, genCmdCast<MI_SEMAPHORE_WAIT *>(*(++it)));
@@ -254,9 +284,9 @@ HWTEST_F(TimestampPacketTests, givenMultiTileConfigWhenProgrammingNonStallingBar
     csr.activePartitionsConfig = 2;
     csr.staticWorkPartitioningEnabled = true;
 
-    *ptrOffset(csr.tagAddress, csr.postSyncWriteOffset) = *csr.tagAddress;
+    *ptrOffset(csr.tagAddress, csr.immWritePostSyncWriteOffset) = *csr.tagAddress;
 
-    MockKernelWithInternals mockKernel(*device, context);
+    MockKernelWithInternals mockKernel(*context);
 
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
 
@@ -276,7 +306,7 @@ HWTEST_F(TimestampPacketTests, givenMultiTileConfigWhenProgrammingNonStallingBar
 }
 
 HWTEST_F(TimestampPacketTests, givenDebugFlagSetWhenEnqueueingBarrierThenRequestPipeControlOnCsrFlush) {
-    DebugManager.flags.OptimizeIoqBarriersHandling.set(0);
+    debugManager.flags.OptimizeIoqBarriersHandling.set(0);
 
     auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
     csr.timestampPacketWriteEnabled = true;
@@ -284,8 +314,9 @@ HWTEST_F(TimestampPacketTests, givenDebugFlagSetWhenEnqueueingBarrierThenRequest
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
     EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
 
-    MockKernelWithInternals mockKernel(*device, context);
-    cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr); // obtain first TimestampPackets<uint32_t>
+    MockKernelWithInternals mockKernel(*context);
+    cl_event event{};
+    cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, &event); // obtain first TimestampPackets<uint32_t>
 
     TimestampPacketContainer cmdQNodes;
     cmdQNodes.assignAndIncrementNodesRefCounts(*cmdQ.timestampPacketContainer);
@@ -296,6 +327,7 @@ HWTEST_F(TimestampPacketTests, givenDebugFlagSetWhenEnqueueingBarrierThenRequest
     EXPECT_EQ(1u, cmdQ.timestampPacketContainer->peekNodes().size());
 
     EXPECT_TRUE(cmdQ.isStallingCommandsOnNextFlushRequired());
+    clReleaseEvent(event);
 }
 
 HWTEST_F(TimestampPacketTests, givenTimestampPacketWriteDisabledWhenEnqueueingBarrierThenDontRequestPipeControlOnCsrFlush) {
@@ -308,19 +340,6 @@ HWTEST_F(TimestampPacketTests, givenTimestampPacketWriteDisabledWhenEnqueueingBa
     cmdQ.enqueueBarrierWithWaitList(0, nullptr, nullptr);
 
     EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
-}
-
-HWTEST_F(TimestampPacketTests, givenBlockedQueueWhenEnqueueingBarrierThenDontRequestPipeControlOnCsrFlush) {
-    auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
-    csr.timestampPacketWriteEnabled = true;
-
-    MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
-    EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
-    auto userEvent = makeReleaseable<UserEvent>();
-    cl_event waitlist[] = {userEvent.get()};
-    cmdQ.enqueueBarrierWithWaitList(1, waitlist, nullptr);
-    EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
-    userEvent->setStatus(CL_COMPLETE);
 }
 
 HWTEST_F(TimestampPacketTests, givenPipeControlRequestWhenEstimatingCsrStreamSizeThenAddSizeForPipeControl) {
@@ -352,7 +371,7 @@ HWTEST_F(TimestampPacketTests, givenPipeControlRequestWithBarrierWriteWhenEstima
     flags.isStallingCommandsOnNextFlushRequired = true;
     auto sizeWithPcRequest = device->getUltCommandStreamReceiver<FamilyType>().getRequiredCmdStreamSize(flags, device->getDevice());
 
-    size_t extendedSize = sizeWithoutPcRequest + MemorySynchronizationCommands<FamilyType>::getSizeForBarrierWithPostSyncOperation(device->getRootDeviceEnvironment(), false);
+    size_t extendedSize = sizeWithoutPcRequest + MemorySynchronizationCommands<FamilyType>::getSizeForBarrierWithPostSyncOperation(device->getRootDeviceEnvironment(), NEO::PostSyncMode::immediateData);
 
     EXPECT_EQ(sizeWithPcRequest, extendedSize);
 }
@@ -379,7 +398,7 @@ HWTEST_F(TimestampPacketTests, givenPipeControlRequestWhenFlushingThenProgramPip
 
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
     cmdQ.setStallingCommandsOnNextFlush(true);
-    MockKernelWithInternals mockKernel(*device, context);
+    MockKernelWithInternals mockKernel(*context);
     cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr);
 
     EXPECT_FALSE(cmdQ.isStallingCommandsOnNextFlushRequired());
@@ -392,7 +411,12 @@ HWTEST_F(TimestampPacketTests, givenPipeControlRequestWhenFlushingThenProgramPip
 
     auto pipeControl = genCmdCast<typename FamilyType::PIPE_CONTROL *>(*hwParser.pipeControlList.begin());
     ASSERT_NE(nullptr, pipeControl);
-    EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_NO_WRITE, pipeControl->getPostSyncOperation());
+
+    if (cmdQ.heaplessModeEnabled) {
+        EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_WRITE_IMMEDIATE_DATA, pipeControl->getPostSyncOperation());
+    } else {
+        EXPECT_EQ(PIPE_CONTROL::POST_SYNC_OPERATION::POST_SYNC_OPERATION_NO_WRITE, pipeControl->getPostSyncOperation());
+    }
     EXPECT_TRUE(pipeControl->getCommandStreamerStallEnable());
 
     cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr);
@@ -401,44 +425,24 @@ HWTEST_F(TimestampPacketTests, givenPipeControlRequestWhenFlushingThenProgramPip
 
 HWTEST_F(TimestampPacketTests, givenKernelWhichDoesntRequireFlushWhenEnqueueingKernelThenOneNodeIsCreated) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableCacheFlushAfterWalker.set(false);
+    debugManager.flags.EnableCacheFlushAfterWalker.set(false);
     auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
     csr.timestampPacketWriteEnabled = true;
 
     auto mockTagAllocator = new MockTagAllocator<>(device->getRootDeviceIndex(), executionEnvironment->memoryManager.get());
     csr.timestampPacketAllocator.reset(mockTagAllocator);
     auto cmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, device.get(), nullptr);
-    // obtain first node for cmdQ and event1
-    cmdQ->enqueueKernel(kernel->mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr);
+    // obtain first node for cmdQ and event
+    cl_event event{};
+    cmdQ->enqueueKernel(kernel->mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, &event);
     auto size = cmdQ->timestampPacketContainer->peekNodes().size();
     EXPECT_EQ(size, 1u);
-}
-
-HWTEST_F(TimestampPacketTests, givenKernelWhichRequiresFlushWhenEnqueueingKernelThenTwoNodesAreCreated) {
-    DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableCacheFlushAfterWalker.set(true);
-
-    auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
-    csr.timestampPacketWriteEnabled = true;
-
-    auto mockTagAllocator = new MockTagAllocator<>(device->getRootDeviceIndex(), executionEnvironment->memoryManager.get());
-    csr.timestampPacketAllocator.reset(mockTagAllocator);
-    auto cmdQ = std::make_unique<MockCommandQueueHw<FamilyType>>(context, device.get(), nullptr);
-    kernel->mockKernel->svmAllocationsRequireCacheFlush = true;
-    // obtain first node for cmdQ and event1
-    cmdQ->enqueueKernel(kernel->mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr);
-    auto node1 = cmdQ->timestampPacketContainer->peekNodes().at(0);
-    auto node2 = cmdQ->timestampPacketContainer->peekNodes().at(1);
-    auto size = cmdQ->timestampPacketContainer->peekNodes().size();
-    EXPECT_EQ(size, 2u);
-    EXPECT_NE(nullptr, node1);
-    EXPECT_NE(nullptr, node2);
-    EXPECT_NE(node1, node2);
+    clReleaseEvent(event);
 }
 
 HWTEST_F(TimestampPacketTests, givenEventsWaitlistFromDifferentCSRsWhenEnqueueingThenMakeAllTimestampsResident) {
-    MockTagAllocator<TimestampPackets<uint32_t>> tagAllocator(device->getRootDeviceIndex(), executionEnvironment->memoryManager.get(), 1, 1,
-                                                              sizeof(TimestampPackets<uint32_t>), false, device->getDeviceBitfield());
+    MockTagAllocator<TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>> tagAllocator(device->getRootDeviceIndex(), executionEnvironment->memoryManager.get(), 1, 1,
+                                                                                                              sizeof(TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>), false, device->getDeviceBitfield());
 
     auto &ultCsr = device->getUltCommandStreamReceiver<FamilyType>();
     ultCsr.timestampPacketWriteEnabled = true;
@@ -478,20 +482,21 @@ HWTEST_F(TimestampPacketTests, givenTimestampPacketWhenEnqueueingNonBlockedThenM
     csr.timestampPacketWriteEnabled = true;
     csr.storeMakeResidentAllocations = true;
 
-    MockKernelWithInternals mockKernel(*device, context);
+    MockKernelWithInternals mockKernel(*context);
     MockCommandQueueHw<FamilyType> cmdQ(context, device.get(), nullptr);
-
-    cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr);
+    cl_event event{};
+    cmdQ.enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, &event);
     auto timestampPacketNode = cmdQ.timestampPacketContainer->peekNodes().at(0);
 
     EXPECT_TRUE(csr.isMadeResident(timestampPacketNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation(), csr.taskCount));
+    clReleaseEvent(event);
 }
 
 HWTEST_F(TimestampPacketTests, givenTimestampPacketWhenEnqueueingBlockedThenMakeItResidentOnSubmit) {
     auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
     csr.timestampPacketWriteEnabled = true;
 
-    MockKernelWithInternals mockKernel(*device, context);
+    MockKernelWithInternals mockKernel(*context);
 
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
 
@@ -499,20 +504,21 @@ HWTEST_F(TimestampPacketTests, givenTimestampPacketWhenEnqueueingBlockedThenMake
 
     UserEvent userEvent;
     cl_event clEvent = &userEvent;
-
-    cmdQ->enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 1, &clEvent, nullptr);
+    cl_event event{};
+    cmdQ->enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 1, &clEvent, &event);
     auto timestampPacketNode = cmdQ->timestampPacketContainer->peekNodes().at(0);
 
     EXPECT_FALSE(csr.isMadeResident(timestampPacketNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation(), csr.taskCount));
     userEvent.setStatus(CL_COMPLETE);
     EXPECT_TRUE(csr.isMadeResident(timestampPacketNode->getBaseGraphicsAllocation()->getDefaultGraphicsAllocation(), csr.taskCount));
     cmdQ->isQueueBlocked();
+    clReleaseEvent(event);
 }
 
 HWTEST_F(TimestampPacketTests, givenTimestampPacketWriteEnabledWhenEnqueueingBlockedThenVirtualEventIncrementsRefInternalAndDecrementsAfterCompleteEvent) {
     auto &csr = device->getUltCommandStreamReceiver<FamilyType>();
     csr.timestampPacketWriteEnabled = true;
-    MockKernelWithInternals mockKernelWithInternals(*device, context);
+    MockKernelWithInternals mockKernelWithInternals(*context);
     auto mockKernel = mockKernelWithInternals.mockKernel;
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
 
@@ -538,12 +544,12 @@ TEST_F(TimestampPacketTests, givenDispatchSizeWhenAskingForNewTimestampsThenObta
     EXPECT_EQ(dispatchSize, mockCmdQ->timestampPacketContainer->peekNodes().size());
 }
 
-HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingWithoutKernelThenInheritTimestampPacketsWithoutSubmitting) {
+HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingWithoutKernelOnOOQThenInheritTimestampPacketsWithoutSubmitting) {
     device->getUltCommandStreamReceiver<FamilyType>().timestampPacketWriteEnabled = true;
 
     auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
-
-    MockKernelWithInternals mockKernel(*device, context);
+    cmdQ->setOoqEnabled();
+    MockKernelWithInternals mockKernel(*context);
     cmdQ->enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr); // obtain first TimestampPackets<uint32_t>
 
     TimestampPacketContainer cmdQNodes;
@@ -569,31 +575,67 @@ HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingWithoutK
 
     auto outEvent = castToObject<Event>(clOutEvent);
 
-    EXPECT_EQ(cmdQ->timestampPacketContainer->peekNodes().at(0), cmdQNodes.peekNodes().at(0)); // no new nodes obtained
-    EXPECT_EQ(1u, cmdQ->timestampPacketContainer->peekNodes().size());
-
     auto &eventsNodes = outEvent->getTimestampPacketNodes()->peekNodes();
-    EXPECT_EQ(numEventsWithContainer + 1, eventsNodes.size()); // numEventsWithContainer + command queue
-    EXPECT_EQ(cmdQNodes.peekNodes().at(0), eventsNodes.at(0));
-    EXPECT_EQ(event0.getTimestampPacketNodes()->peekNodes().at(0), eventsNodes.at(1));
-    EXPECT_EQ(event1.getTimestampPacketNodes()->peekNodes().at(0), eventsNodes.at(2));
+    EXPECT_EQ(event0.getTimestampPacketNodes()->peekNodes().at(0), eventsNodes.at(0));
+    EXPECT_EQ(event1.getTimestampPacketNodes()->peekNodes().at(0), eventsNodes.at(1));
 
     clReleaseEvent(clOutEvent);
     userEvent.setStatus(CL_COMPLETE);
     cmdQ->isQueueBlocked();
 }
 
-HWTEST_F(TimestampPacketTests, givenBlockedEnqueueWithoutKernelWhenSubmittingThenDispatchBlockedCommands) {
+HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingWithoutKernelOnIOQThenDoNotInheritTimestampPackets) {
+    device->getUltCommandStreamReceiver<FamilyType>().timestampPacketWriteEnabled = true;
+
+    auto cmdQ = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
+    MockKernelWithInternals mockKernel(*context);
+    cmdQ->enqueueKernel(mockKernel.mockKernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr); // obtain first TimestampPackets<uint32_t>
+
+    TimestampPacketContainer cmdQNodes;
+    cmdQNodes.assignAndIncrementNodesRefCounts(*cmdQ->timestampPacketContainer);
+
+    MockTimestampPacketContainer node1(*device->getGpgpuCommandStreamReceiver().getTimestampPacketAllocator(), 1);
+    MockTimestampPacketContainer node2(*device->getGpgpuCommandStreamReceiver().getTimestampPacketAllocator(), 1);
+
+    Event event0(cmdQ.get(), 0, 0, 0);
+    event0.addTimestampPacketNodes(node1);
+    Event event1(cmdQ.get(), 0, 0, 0);
+    event1.addTimestampPacketNodes(node2);
+    UserEvent userEvent;
+    Event eventWithoutContainer(nullptr, 0, 0, 0);
+
+    uint32_t numEventsWithContainer = 2;
+    uint32_t numEventsOnWaitlist = numEventsWithContainer + 2; // UserEvent + eventWithoutContainer
+
+    cl_event waitlist[] = {&event0, &event1, &userEvent, &eventWithoutContainer};
+
+    cl_event clOutEvent;
+    cmdQ->enqueueMarkerWithWaitList(numEventsOnWaitlist, waitlist, &clOutEvent);
+
+    auto outEvent = castToObject<Event>(clOutEvent);
+
+    auto &eventsNodes = outEvent->getTimestampPacketNodes()->peekNodes();
+    EXPECT_EQ(1u, eventsNodes.size());
+    EXPECT_NE(event0.getTimestampPacketNodes()->peekNodes().at(0), eventsNodes.at(0));
+    EXPECT_NE(event1.getTimestampPacketNodes()->peekNodes().at(0), eventsNodes.at(0));
+
+    clReleaseEvent(clOutEvent);
+    userEvent.setStatus(CL_COMPLETE);
+    cmdQ->isQueueBlocked();
+}
+
+using TimestampPacketTestsWithMockCsrHw2 = TimestampPacketTestsWithMockCsrT<MockCsrHw2>;
+
+HWTEST_TEMPLATED_F(TimestampPacketTestsWithMockCsrHw2, givenBlockedEnqueueWithoutKernelWhenSubmittingThenDispatchBlockedCommands) {
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
 
-    auto mockCsr = new MockCsrHw2<FamilyType>(*device->getExecutionEnvironment(), device->getRootDeviceIndex(), device->getDeviceBitfield());
-    device->resetCommandStreamReceiver(mockCsr);
+    auto mockCsr = static_cast<MockCsrHw2<FamilyType> *>(&device->getGpgpuCommandStreamReceiver());
     mockCsr->timestampPacketWriteEnabled = true;
     mockCsr->storeFlushedTaskStream = true;
 
     auto cmdQ0 = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
 
-    auto &secondEngine = device->getEngine(getChosenEngineType(device->getHardwareInfo()), EngineUsage::LowPriority);
+    auto &secondEngine = device->getEngine(getChosenEngineType(device->getHardwareInfo()), EngineUsage::lowPriority);
     static_cast<UltCommandStreamReceiver<FamilyType> *>(secondEngine.commandStreamReceiver)->timestampPacketWriteEnabled = true;
 
     auto cmdQ1 = clUniquePtr(new MockCommandQueueHw<FamilyType>(context, device.get(), nullptr));
@@ -634,20 +676,24 @@ HWTEST_F(TimestampPacketTests, givenBlockedEnqueueWithoutKernelWhenSubmittingThe
         hwParserCmdQ.parseCommands<FamilyType>(taskStream, 0);
 
         auto queueSemaphores = findAll<MI_SEMAPHORE_WAIT *>(hwParserCmdQ.cmdList.begin(), hwParserCmdQ.cmdList.end());
-        auto expectedQueueSemaphoresCount = 2u;
+        auto expectedQueueSemaphoresCount = commands[i] == CL_COMMAND_MARKER ? 2u : 3u;
         if (UnitTestHelper<FamilyType>::isAdditionalMiSemaphoreWaitRequired(device->getRootDeviceEnvironment())) {
             expectedQueueSemaphoresCount += 1;
         }
         EXPECT_EQ(expectedQueueSemaphoresCount, queueSemaphores.size());
         ASSERT_GE(queueSemaphores.size(), 2u);
-        verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[0])), node0.getNode(0), 0);
-        verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[1])), node1.getNode(0), 0);
+        verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[0])), node0.getNode(0), 0);
+        verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[1])), node1.getNode(0), 0);
 
         auto csrSemaphores = findAll<MI_SEMAPHORE_WAIT *>(hwParserCsr.cmdList.begin(), hwParserCsr.cmdList.end());
         EXPECT_EQ(0u, csrSemaphores.size());
 
         EXPECT_TRUE(mockCsr->passedDispatchFlags.blocking);
-        EXPECT_TRUE(mockCsr->passedDispatchFlags.guardCommandBufferWithPipeControl);
+        if (mockCsr->isUpdateTagFromWaitEnabled()) {
+            EXPECT_FALSE(mockCsr->passedDispatchFlags.guardCommandBufferWithPipeControl);
+        } else {
+            EXPECT_TRUE(mockCsr->passedDispatchFlags.guardCommandBufferWithPipeControl);
+        }
         EXPECT_EQ(device->getPreemptionMode(), mockCsr->passedDispatchFlags.preemptionMode);
 
         cmdQ0->isQueueBlocked();
@@ -694,8 +740,8 @@ HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingMarkerWi
     }
     EXPECT_EQ(expectedQueueSemaphoresCount, queueSemaphores.size());
     ASSERT_GE(queueSemaphores.size(), 2u);
-    verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[0])), node1.getNode(0), 0);
-    verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[1])), node2.getNode(0), 0);
+    verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[0])), node1.getNode(0), 0);
+    verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[1])), node2.getNode(0), 0);
 }
 
 HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingBarrierWithoutKernelThenInheritTimestampPacketsAndProgramSemaphores) {
@@ -738,5 +784,5 @@ HWTEST_F(TimestampPacketTests, givenWaitlistAndOutputEventWhenEnqueueingBarrierW
     }
     EXPECT_EQ(expectedQueueSemaphoresCount, queueSemaphores.size());
     ASSERT_GT(queueSemaphores.size(), 0u);
-    verifySemaphore(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[0])), node1.getNode(0), 0);
+    verifySemaphore<FamilyType>(genCmdCast<MI_SEMAPHORE_WAIT *>(*(queueSemaphores[0])), node1.getNode(0), 0);
 }

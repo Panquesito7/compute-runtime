@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 #include "shared/source/program/kernel_info.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
+#include "shared/test/common/mocks/mock_sip.h"
 #include "shared/test/common/mocks/ult_device_factory.h"
 
 #include "opencl/test/unit_test/fixtures/multi_root_device_fixture.h"
@@ -63,7 +64,7 @@ TEST(KernelInfoTest, givenKernelInfoWhenCreatingKernelAllocationWithInternalIsaF
     auto retVal = kernelInfo.createKernelAllocation(*device, false);
     EXPECT_TRUE(retVal);
     auto allocation = kernelInfo.kernelAllocation;
-    EXPECT_EQ(AllocationType::KERNEL_ISA, allocation->getAllocationType());
+    EXPECT_EQ(AllocationType::kernelIsa, allocation->getAllocationType());
     device->getMemoryManager()->checkGpuUsageAndDestroyGraphicsAllocations(allocation);
 }
 
@@ -79,17 +80,18 @@ TEST(KernelInfoTest, givenKernelInfoWhenCreatingKernelAllocationWithInternalIsaT
     auto retVal = kernelInfo.createKernelAllocation(*device, true);
     EXPECT_TRUE(retVal);
     auto allocation = kernelInfo.kernelAllocation;
-    EXPECT_EQ(AllocationType::KERNEL_ISA_INTERNAL, allocation->getAllocationType());
+    EXPECT_EQ(AllocationType::kernelIsaInternal, allocation->getAllocationType());
     device->getMemoryManager()->checkGpuUsageAndDestroyGraphicsAllocations(allocation);
 }
 
 class MyMemoryManager : public OsAgnosticMemoryManager {
   public:
     using OsAgnosticMemoryManager::OsAgnosticMemoryManager;
-    GraphicsAllocation *allocate32BitGraphicsMemoryImpl(const AllocationData &allocationData, bool useLocalMemory) override { return nullptr; }
+    GraphicsAllocation *allocate32BitGraphicsMemoryImpl(const AllocationData &allocationData) override { return nullptr; }
 };
 
 TEST(KernelInfoTest, givenKernelInfoWhenCreateKernelAllocationAndCannotAllocateMemoryThenReturnsFalse) {
+    VariableBackup<bool> useMockSip(&MockSipData::useMockSip);
     KernelInfo kernelInfo;
     auto executionEnvironment = new MockExecutionEnvironment(defaultHwInfo.get());
     executionEnvironment->memoryManager.reset(new MyMemoryManager(*executionEnvironment));
@@ -103,7 +105,7 @@ TEST(KernelInfoTest, givenKernelInfoWhenCreateKernelAllocationAndCannotAllocateM
 
 TEST(KernelInfoTest, givenReuseKernelBinariesWhenCreateKernelAllocationThenReuseAllocationFromMap) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ReuseKernelBinaries.set(1);
+    debugManager.flags.ReuseKernelBinaries.set(1);
 
     auto factory = UltDeviceFactory{1, 0};
     auto device = factory.rootDevices[0];
@@ -156,11 +158,4 @@ TEST(KernelInfo, whenGetKernelNamesStringIsCalledThenNamesAreProperlyConcatenate
     kernelInfoArray.push_back(&kernel1);
     kernelInfoArray.push_back(&kernel2);
     EXPECT_STREQ("kern1;kern2", concatenateKernelNames(kernelInfoArray).c_str());
-}
-
-TEST(KernelInfo, givenNumbersOfSamplerWhenCheckSamplerStateCountAndSamplerStateArraySizeThenCorrectValueAreReturned) {
-    KernelInfo kernel = {};
-    uint8_t numSamplers = 5u;
-    kernel.kernelDescriptor.payloadMappings.samplerTable.numSamplers = numSamplers;
-    EXPECT_EQ(kernel.getSamplerStateArrayCount(), numSamplers);
 }

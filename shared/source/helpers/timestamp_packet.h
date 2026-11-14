@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,14 +8,18 @@
 #pragma once
 #include "shared/source/command_container/command_encoder.h"
 #include "shared/source/command_stream/csr_deps.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/aux_translation.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/cpu_copy_helper.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/pipe_control_args.h"
 #include "shared/source/helpers/string.h"
 #include "shared/source/helpers/timestamp_packet_constants.h"
 #include "shared/source/helpers/timestamp_packet_container.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
 #include "shared/source/utilities/tag_allocator.h"
 
 #include <cstdint>
@@ -25,27 +29,29 @@ class CommandStreamReceiver;
 class LinearStream;
 
 #pragma pack(1)
-template <typename TSize>
+template <typename TSize, uint32_t packetCount>
 class TimestampPackets : public TagTypeBase {
   public:
+    using ValueT = TSize;
+
     static constexpr AllocationType getAllocationType() {
-        return AllocationType::TIMESTAMP_PACKET_TAG_BUFFER;
+        return AllocationType::timestampPacketTagBuffer;
     }
 
-    static constexpr TagNodeType getTagNodeType() { return TagNodeType::TimestampPacket; }
+    static constexpr TagNodeType getTagNodeType() { return TagNodeType::timestampPacket; }
 
     static constexpr size_t getSinglePacketSize() { return sizeof(Packet); }
 
-    void initialize() {
+    void initialize(TSize initValue) {
         for (auto &packet : packets) {
-            packet.contextStart = TimestampPacketConstants::initValue;
-            packet.globalStart = TimestampPacketConstants::initValue;
-            packet.contextEnd = TimestampPacketConstants::initValue;
-            packet.globalEnd = TimestampPacketConstants::initValue;
+            packet.contextStart = initValue;
+            packet.globalStart = initValue;
+            packet.contextEnd = initValue;
+            packet.globalEnd = initValue;
         }
     }
 
-    void assignDataToAllTimestamps(uint32_t packetIndex, void *source) {
+    void assignDataToAllTimestamps(uint32_t packetIndex, const void *source) {
         memcpy_s(&packets[packetIndex], sizeof(Packet), source, sizeof(Packet));
     }
 
@@ -59,8 +65,19 @@ class TimestampPackets : public TagTypeBase {
     uint64_t getContextEndValue(uint32_t packetIndex) const { return static_cast<uint64_t>(packets[packetIndex].contextEnd); }
     uint64_t getGlobalEndValue(uint32_t packetIndex) const { return static_cast<uint64_t>(packets[packetIndex].globalEnd); }
 
+    void getGlobalTimestampValues(uint32_t packetIndex, uint64_t &globalStart, uint64_t &globalEnd) const {
+        alignas(64) Packet local;
+        streamCopy(&local, &packets[packetIndex], sizeof(Packet), false);
+        globalStart = static_cast<uint64_t>(local.globalStart);
+        globalEnd = static_cast<uint64_t>(local.globalEnd);
+    }
+
     void const *getContextEndAddress(uint32_t packetIndex) const { return static_cast<void const *>(&packets[packetIndex].contextEnd); }
     void const *getContextStartAddress(uint32_t packetIndex) const { return static_cast<void const *>(&packets[packetIndex].contextStart); }
+
+    uint32_t getPacketCount() const {
+        return packetCount;
+    }
 
   protected:
     struct alignas(1) Packet {
@@ -70,11 +87,11 @@ class TimestampPackets : public TagTypeBase {
         TSize globalEnd = TimestampPacketConstants::initValue;
     };
 
-    Packet packets[TimestampPacketConstants::preferredPacketCount];
+    Packet packets[packetCount];
 };
 #pragma pack()
 
-static_assert(((4 * TimestampPacketConstants::preferredPacketCount) * sizeof(uint32_t)) == sizeof(TimestampPackets<uint32_t>),
+static_assert(((4 * TimestampPacketConstants::preferredPacketCount) * sizeof(uint32_t)) == sizeof(TimestampPackets<uint32_t, TimestampPacketConstants::preferredPacketCount>),
               "This structure is consumed by GPU and has to follow specific restrictions for padding and size");
 
 struct TimestampPacketHelper {
@@ -92,37 +109,42 @@ struct TimestampPacketHelper {
     }
 
     template <typename GfxFamily>
-    static void programSemaphore(LinearStream &cmdStream, TagNodeBase &timestampPacketNode) {
+    static void programSemaphore(LinearStream &cmdStream, TagNodeBase &timestampPacketNode, bool useSemaphore64bCmd) {
         using COMPARE_OPERATION = typename GfxFamily::MI_SEMAPHORE_WAIT::COMPARE_OPERATION;
+
+        PRINT_STRING(debugManager.flags.PrintTimestampPacketUsage.get() == 1,
+                     stdout,
+                     "\nPID: %u, TSP used for Semaphore: 0x%" PRIX64 ", cmdBuffer pos: 0x%" PRIX64,
+                     SysCalls::getProcessId(), timestampPacketNode.getGpuAddress(), cmdStream.getCurrentGpuAddressPosition());
 
         auto compareAddress = getContextEndGpuAddress(timestampPacketNode);
 
         for (uint32_t packetId = 0; packetId < timestampPacketNode.getPacketsUsed(); packetId++) {
             uint64_t compareOffset = packetId * timestampPacketNode.getSinglePacketSize();
-            EncodeSemaphore<GfxFamily>::addMiSemaphoreWaitCommand(cmdStream, compareAddress + compareOffset, TimestampPacketConstants::initValue, COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD);
+            EncodeSemaphore<GfxFamily>::addMiSemaphoreWaitCommand(cmdStream, compareAddress + compareOffset, TimestampPacketConstants::initValue, COMPARE_OPERATION::COMPARE_OPERATION_SAD_NOT_EQUAL_SDD, false, false, false, false, useSemaphore64bCmd, nullptr);
         }
     }
 
     template <typename GfxFamily>
-    static void programConditionalBbStartForRelaxedOrdering(LinearStream &cmdStream, TagNodeBase &timestampPacketNode) {
+    static void programConditionalBbStartForRelaxedOrdering(LinearStream &cmdStream, TagNodeBase &timestampPacketNode, bool isBcs) {
         auto compareAddress = getContextEndGpuAddress(timestampPacketNode);
 
         for (uint32_t packetId = 0; packetId < timestampPacketNode.getPacketsUsed(); packetId++) {
             uint64_t compareOffset = packetId * timestampPacketNode.getSinglePacketSize();
 
             EncodeBatchBufferStartOrEnd<GfxFamily>::programConditionalDataMemBatchBufferStart(cmdStream, 0, compareAddress + compareOffset, TimestampPacketConstants::initValue,
-                                                                                              NEO::CompareOperation::Equal, true);
+                                                                                              NEO::CompareOperation::equal, true, false, isBcs);
         }
     }
 
     template <typename GfxFamily>
-    static void programCsrDependenciesForTimestampPacketContainer(LinearStream &cmdStream, const CsrDependencies &csrDependencies, bool relaxedOrderingEnabled) {
+    static void programCsrDependenciesForTimestampPacketContainer(LinearStream &cmdStream, const CsrDependencies &csrDependencies, bool relaxedOrderingEnabled, bool isBcs, bool useSemaphore64bCmd) {
         for (auto timestampPacketContainer : csrDependencies.timestampPacketContainer) {
             for (auto &node : timestampPacketContainer->peekNodes()) {
                 if (relaxedOrderingEnabled) {
-                    TimestampPacketHelper::programConditionalBbStartForRelaxedOrdering<GfxFamily>(cmdStream, *node);
+                    TimestampPacketHelper::programConditionalBbStartForRelaxedOrdering<GfxFamily>(cmdStream, *node, isBcs);
                 } else {
-                    TimestampPacketHelper::programSemaphore<GfxFamily>(cmdStream, *node);
+                    TimestampPacketHelper::programSemaphore<GfxFamily>(cmdStream, *node, useSemaphore64bCmd);
                 }
             }
         }
@@ -132,14 +154,15 @@ struct TimestampPacketHelper {
     static void nonStallingContextEndNodeSignal(LinearStream &cmdStream, const TagNodeBase &timestampPacketNode, bool multiTileOperation) {
         uint64_t contextEndAddress = getContextEndGpuAddress(timestampPacketNode);
 
-        NEO::EncodeStoreMemory<GfxFamily>::programStoreDataImm(cmdStream, contextEndAddress, 0, 0, false, multiTileOperation);
+        NEO::EncodeStoreMemory<GfxFamily>::programStoreDataImm(cmdStream, contextEndAddress, 0, 0, false, multiTileOperation,
+                                                               nullptr);
     }
 
     template <typename GfxFamily>
-    static void programCsrDependenciesForForMultiRootDeviceSyncContainer(LinearStream &cmdStream, const CsrDependencies &csrDependencies) {
+    static void programCsrDependenciesForForMultiRootDeviceSyncContainer(LinearStream &cmdStream, const CsrDependencies &csrDependencies, bool useSemaphore64bCmd) {
         for (auto timestampPacketContainer : csrDependencies.multiRootTimeStampSyncContainer) {
             for (auto &node : timestampPacketContainer->peekNodes()) {
-                TimestampPacketHelper::programSemaphore<GfxFamily>(cmdStream, *node);
+                TimestampPacketHelper::programSemaphore<GfxFamily>(cmdStream, *node, useSemaphore64bCmd);
             }
         }
     }
@@ -148,24 +171,27 @@ struct TimestampPacketHelper {
     static void programSemaphoreForAuxTranslation(LinearStream &cmdStream,
                                                   const TimestampPacketDependencies *timestampPacketDependencies,
                                                   const RootDeviceEnvironment &rootDeviceEnvironment) {
-        auto &container = (auxTranslationDirection == AuxTranslationDirection::AuxToNonAux)
+        auto &container = (auxTranslationDirection == AuxTranslationDirection::auxToNonAux)
                               ? timestampPacketDependencies->auxToNonAuxNodes
                               : timestampPacketDependencies->nonAuxToAuxNodes;
 
         // cache flush after NDR, before NonAuxToAux
-        if (auxTranslationDirection == AuxTranslationDirection::NonAuxToAux && timestampPacketDependencies->cacheFlushNodes.peekNodes().size() > 0) {
+        if (auxTranslationDirection == AuxTranslationDirection::nonAuxToAux && timestampPacketDependencies->cacheFlushNodes.peekNodes().size() > 0) {
             UNRECOVERABLE_IF(timestampPacketDependencies->cacheFlushNodes.peekNodes().size() != 1);
             auto cacheFlushTimestampPacketGpuAddress = getContextEndGpuAddress(*timestampPacketDependencies->cacheFlushNodes.peekNodes()[0]);
 
             PipeControlArgs args;
             args.dcFlushEnable = MemorySynchronizationCommands<GfxFamily>::getDcFlushEnable(true, rootDeviceEnvironment);
             MemorySynchronizationCommands<GfxFamily>::addBarrierWithPostSyncOperation(
-                cmdStream, PostSyncMode::ImmediateData,
+                cmdStream, PostSyncMode::immediateData,
                 cacheFlushTimestampPacketGpuAddress, 0, rootDeviceEnvironment, args);
         }
 
+        const auto &compilerProductHelper = rootDeviceEnvironment.getHelper<CompilerProductHelper>();
+        const bool useSemaphore64bCmd = compilerProductHelper.isAvailableSemaphore64(*rootDeviceEnvironment.getHardwareInfo());
+
         for (auto &node : container.peekNodes()) {
-            TimestampPacketHelper::programSemaphore<GfxFamily>(cmdStream, *node);
+            TimestampPacketHelper::programSemaphore<GfxFamily>(cmdStream, *node, useSemaphore64bCmd);
         }
     }
 
@@ -173,8 +199,8 @@ struct TimestampPacketHelper {
     static size_t getRequiredCmdStreamSizeForAuxTranslationNodeDependency(size_t count, const RootDeviceEnvironment &rootDeviceEnvironment, bool cacheFlushForBcsRequired) {
         size_t size = count * TimestampPacketHelper::getRequiredCmdStreamSizeForNodeDependencyWithBlitEnqueue<GfxFamily>();
 
-        if (auxTranslationDirection == AuxTranslationDirection::NonAuxToAux && cacheFlushForBcsRequired) {
-            size += MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWithPostSyncOperation(rootDeviceEnvironment, false);
+        if (auxTranslationDirection == AuxTranslationDirection::nonAuxToAux && cacheFlushForBcsRequired) {
+            size += MemorySynchronizationCommands<GfxFamily>::getSizeForBarrierWithPostSyncOperation(rootDeviceEnvironment, NEO::PostSyncMode::immediateData);
         }
 
         return size;
@@ -192,7 +218,7 @@ struct TimestampPacketHelper {
 
     template <typename GfxFamily>
     static size_t getRequiredCmdStreamSizeForRelaxedOrderingNodeDependency(TagNodeBase &timestampPacketNode) {
-        return (timestampPacketNode.getPacketsUsed() * EncodeBatchBufferStartOrEnd<GfxFamily>::getCmdSizeConditionalDataMemBatchBufferStart());
+        return (timestampPacketNode.getPacketsUsed() * EncodeBatchBufferStartOrEnd<GfxFamily>::getCmdSizeConditionalDataMemBatchBufferStart(false));
     }
 
     template <typename GfxFamily>

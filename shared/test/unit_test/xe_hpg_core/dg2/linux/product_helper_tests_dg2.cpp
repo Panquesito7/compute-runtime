@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -24,10 +24,18 @@ struct Dg2ProductHelperLinux : ProductHelperTestLinux {
     }
 };
 
+DG2TEST_F(Dg2ProductHelperLinux, givenProductHelperWhenAskedIfDisableScratchPagesIsSupportedForDebuggerThenReturnFalse) {
+    EXPECT_FALSE(productHelper->isDisableScratchPagesRequiredForDebugger());
+}
+
 DG2TEST_F(Dg2ProductHelperLinux, WhenConfiguringHwInfoThenZeroIsReturned) {
 
     auto ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
     EXPECT_EQ(0, ret);
+}
+
+DG2TEST_F(Dg2ProductHelperLinux, givenProductHelperWhenCheckDirectSubmissionSupportedThenTrueIsReturned) {
+    EXPECT_TRUE(productHelper->isDirectSubmissionSupported());
 }
 
 DG2TEST_F(Dg2ProductHelperLinux, GivenDg2WhenConfigureHardwareCustomThenKmdNotifyIsEnabled) {

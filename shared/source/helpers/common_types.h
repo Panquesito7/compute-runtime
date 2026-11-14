@@ -1,23 +1,30 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
-#include "shared/source/utilities/stackvec.h"
+#include "shared/source/helpers/debug_helpers.h"
+#include "shared/source/helpers/enum_cast.h"
+#include "shared/source/sku_info/sku_info_base.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace NEO {
+class GraphicsAllocation;
 struct EngineControl;
 using EngineControlContainer = std::vector<EngineControl>;
-using MultiDeviceEngineControlContainer = StackVec<EngineControlContainer, 6u>;
 class Device;
 using DeviceVector = std::vector<std::unique_ptr<Device>>;
+
+template <typename T, typename... Ts>
+constexpr bool isAnyOfType = (std::is_same_v<T, Ts> || ...);
 
 enum class DebugPauseState : uint32_t {
     disabled,
@@ -30,51 +37,117 @@ enum class DebugPauseState : uint32_t {
 };
 
 enum class ColouringPolicy : uint32_t {
-    DeviceCountBased,
-    ChunkSizeBased,
-    MappingBased
+    deviceCountBased,
+    chunkSizeBased,
+    mappingBased
 };
 
 class TagTypeBase {
 };
 
 enum class TagNodeType {
-    TimestampPacket,
-    HwTimeStamps,
-    HwPerfCounter
+    timestampPacket,
+    hwTimeStamps,
+    hwPerfCounter,
+    counter64b,
+    fillPattern,
+    inOrderIpcData,
+    imageImplicitArgs
 };
 
 enum class CacheRegion : uint16_t {
-    Default = 0,
-    Region1,
-    Region2,
-    Count,
-    None = 0xFFFF
+    defaultRegion = 0,
+    region1,
+    region2,
+    region3,
+    count,
+    none = 0xFFFF
 };
+constexpr inline auto toCacheRegion(std::underlying_type_t<CacheRegion> region) {
+    DEBUG_BREAK_IF(region >= toUnderlying(CacheRegion::count));
+    return toEnum<CacheRegion>(region);
+}
 
 enum class CacheLevel : uint16_t {
-    Default = 0,
-    Level3 = 3
+    defaultLevel = 0,
+    level2 = 2,
+    level3 = 3
 };
+constexpr inline auto toCacheLevel(std::underlying_type_t<CacheRegion> level) {
+    DEBUG_BREAK_IF(level == 1U);
+    DEBUG_BREAK_IF(level > 3U);
+    return toEnum<CacheLevel>(level);
+}
 
 enum class CachePolicy : uint32_t {
-    Uncached = 0,
-    WriteCombined = 1,
-    WriteThrough = 2,
-    WriteBack = 3,
+    uncached = 0,
+    writeCombined = 1,
+    writeThrough = 2,
+    writeBack = 3,
 };
 
 enum class PreferredLocation : int16_t {
-    Clear = -1,
-    System = 0,
-    Device = 1,
-    None = 2,
+    clear = -1,
+    system = 0,
+    device = 1,
+    none = 2,
+    defaultLocation = device
 };
 
 enum class PostSyncMode : uint32_t {
-    NoWrite = 0,
-    Timestamp = 1,
-    ImmediateData = 2,
+    noWrite = 0,
+    timestamp = 1,
+    immediateData = 2,
 };
 
+enum class AtomicAccessMode : uint32_t {
+    none = 1,
+    host = 2,
+    device = 3,
+    system = 4,
+    invalid = 5
+};
+
+enum class SynchronizedDispatchMode : uint32_t {
+    disabled = 0,
+    full = 1,
+    limited = 2
+};
+
+enum class LocalMemAllocationMode : uint32_t {
+    hwDefault = 0U,
+    localOnly = 1U,
+    localPreferred = 2U,
+    count = 3U
+};
+constexpr inline auto toLocalMemAllocationMode(std::underlying_type_t<LocalMemAllocationMode> modeFlag) {
+    DEBUG_BREAK_IF(modeFlag >= toUnderlying(LocalMemAllocationMode::count));
+    return toEnum<LocalMemAllocationMode>(modeFlag);
+}
+inline bool getLocalOnlyFlagForMode(LocalMemAllocationMode usmDeviceAllocationMode, bool defaultValue) {
+    switch (usmDeviceAllocationMode) {
+    case LocalMemAllocationMode::hwDefault:
+        return defaultValue;
+    case LocalMemAllocationMode::localOnly:
+        return true;
+    case LocalMemAllocationMode::localPreferred:
+        return false;
+    default:
+        UNRECOVERABLE_IF(true);
+    }
+}
+
+namespace InterruptId {
+static constexpr uint32_t notUsed = std::numeric_limits<uint32_t>::max();
+}
+
+struct BcsSplitSettings {
+    BcsInfoMask allEngines = {};
+    BcsInfoMask h2dEngines = {};
+    BcsInfoMask d2hEngines = {};
+    size_t perEngineMaxSize = 1;
+    uint32_t minRequiredTotalCsrCount = 0;
+    uint32_t requiredTileCount = 0;
+    bool enabled = false;
+};
 } // namespace NEO

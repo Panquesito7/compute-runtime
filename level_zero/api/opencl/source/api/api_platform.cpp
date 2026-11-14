@@ -1,0 +1,248 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/api/opencl/source/api/leo_additional_extensions.h"
+#include "level_zero/api/opencl/source/api/leo_api.h"
+#include "level_zero/api/opencl/source/command_buffer/leo_command_buffer.h"
+#include "level_zero/api/opencl/source/helpers/l0_to_cl_return_types_mapper.h"
+#include "level_zero/api/opencl/source/helpers/leo_base_object.h"
+#include "level_zero/api/opencl/source/helpers/leo_cl_validators.h"
+#include "level_zero/api/opencl/source/l0_dispatch/leo_l0_dispatch.h"
+#include "level_zero/api/opencl/source/platform/leo_platform.h"
+#include "level_zero/api/opencl/source/sharings/leo_sharing_factory.h"
+#include "level_zero/api/opencl/source/tracing/leo_tracing_api.h"
+#include "level_zero/api/opencl/source/tracing/leo_tracing_notify.h"
+#include "level_zero/core/source/driver/driver.h"
+#include <level_zero/ze_api.h>
+
+#include "CL/cl.h"
+
+#include <cstring>
+
+namespace NEO {
+namespace LEO {
+
+extern "C" {
+
+cl_int CL_API_CALL clGetPlatformIDs(cl_uint numEntries,
+                                    cl_platform_id *platforms,
+                                    cl_uint *numPlatforms) {
+    TRACING_ENTER(ClGetPlatformIDs, &numEntries, &platforms, &numPlatforms);
+    if ((numEntries == 0 && platforms != nullptr) ||
+        (numEntries > 0 && platforms == nullptr && numPlatforms == nullptr)) [[unlikely]] {
+        cl_int retVal = CL_INVALID_VALUE;
+        TRACING_EXIT(ClGetPlatformIDs, &retVal);
+        return retVal;
+    }
+
+    if (!NEO::LEO::platformsImpl) {
+        if (numPlatforms) {
+            *numPlatforms = 0;
+        }
+        cl_int retVal = CL_SUCCESS;
+        TRACING_EXIT(ClGetPlatformIDs, &retVal);
+        return retVal;
+    }
+
+    ze_result_t initResult = ZE_RESULT_SUCCESS;
+    {
+        std::lock_guard<std::mutex> lock(NEO::LEO::Platform::platformsMutex);
+
+        if (!NEO::LEO::platformsInitAttempted && NEO::LEO::platformsImpl->empty()) {
+            NEO::LEO::platformsInitAttempted = true;
+
+            uint32_t driverCount = 0;
+            ze_init_driver_type_desc_t desc{ZE_STRUCTURE_TYPE_INIT_DRIVER_TYPE_DESC, nullptr, ZE_INIT_DRIVER_TYPE_FLAG_GPU};
+
+            L0::Driver::get()->setGtpinInitSkipped(true);
+            initL0Dispatch();
+
+            initResult = zeInitDrivers(&driverCount, nullptr, &desc);
+
+            if (initResult == ZE_RESULT_SUCCESS) {
+                std::vector<ze_driver_handle_t> driverHandles(driverCount);
+                initResult = zeInitDrivers(&driverCount, driverHandles.data(), &desc);
+
+                if (initResult == ZE_RESULT_SUCCESS) {
+                    for (int i = 0; i < std::ssize(driverHandles); ++i) {
+                        if (!NEO::LEO::isLeoExposedDriver(driverHandles[i])) {
+                            continue;
+                        }
+                        NEO::LEO::platformsImpl->push_back(std::make_unique<NEO::LEO::Platform>(driverHandles[i]));
+                    }
+                }
+            }
+            L0::Driver::get()->setGtpinInitSkipped(false);
+        }
+    }
+
+    if (initResult != ZE_RESULT_SUCCESS) {
+        cl_int retVal = L0ToClResultMapper(initResult);
+        TRACING_EXIT(ClGetPlatformIDs, &retVal);
+        return retVal;
+    }
+
+    if (numPlatforms) {
+        *numPlatforms = NEO::LEO::platformsImpl ? static_cast<cl_uint>(NEO::LEO::platformsImpl->size()) : 0u;
+    }
+    if (platforms && NEO::LEO::platformsImpl) {
+        auto numPlatformsToReturn = std::min(static_cast<cl_uint>(NEO::LEO::platformsImpl->size()), numEntries);
+        for (cl_uint i = 0; i < numPlatformsToReturn; ++i) {
+            platforms[i] = (*NEO::LEO::platformsImpl)[i].get();
+        }
+    }
+
+    cl_int retVal = CL_SUCCESS;
+    TRACING_EXIT(ClGetPlatformIDs, &retVal);
+    return retVal;
+}
+
+CL_API_ENTRY cl_int CL_API_CALL clIcdGetPlatformIDsKHR(cl_uint numEntries,
+                                                       cl_platform_id *platforms,
+                                                       cl_uint *numPlatforms) {
+    TRACING_ENTER(ClIcdGetPlatformIDsKHR, &numEntries, &platforms, &numPlatforms);
+    cl_int retVal = clGetPlatformIDs(numEntries, platforms, numPlatforms);
+    TRACING_EXIT(ClIcdGetPlatformIDsKHR, &retVal);
+    return retVal;
+}
+
+cl_int CL_API_CALL clGetPlatformInfo(cl_platform_id platform,
+                                     cl_platform_info paramName,
+                                     size_t paramValueSize,
+                                     void *paramValue,
+                                     size_t *paramValueSizeRet) {
+    TRACING_ENTER(ClGetPlatformInfo, &platform, &paramName, &paramValueSize, &paramValue, &paramValueSizeRet);
+    auto [retVal, pPlatform] = NEO::LEO::validateAndCast(std::make_tuple(platform));
+    if (retVal != CL_SUCCESS) [[unlikely]] {
+        TRACING_EXIT(ClGetPlatformInfo, &retVal);
+        return retVal;
+    }
+
+    cl_int ret = pPlatform->getInfo(paramName, paramValueSize, paramValue, paramValueSizeRet);
+    TRACING_EXIT(ClGetPlatformInfo, &ret);
+    return ret;
+}
+
+cl_int CL_API_CALL clUnloadPlatformCompiler(cl_platform_id platform) {
+    TRACING_ENTER(ClUnloadPlatformCompiler, &platform);
+    auto [retVal, pPlatform] = NEO::LEO::validateAndCast(std::make_tuple(platform));
+    TRACING_EXIT(ClUnloadPlatformCompiler, &retVal);
+    return retVal;
+}
+
+cl_int CL_API_CALL clUnloadCompiler() {
+    return CL_SUCCESS;
+}
+
+#define RETURN_FUNC_PTR_IF_EXIST(name)                                                    \
+    {                                                                                     \
+        if (!strcmp(funcName, #name)) {                                                   \
+            void *ret = reinterpret_cast<void *>(name);                                   \
+            TRACING_EXIT(ClGetExtensionFunctionAddress, reinterpret_cast<void **>(&ret)); \
+            return ret;                                                                   \
+        }                                                                                 \
+    }
+void *CL_API_CALL clGetExtensionFunctionAddress(const char *funcName) {
+    TRACING_ENTER(ClGetExtensionFunctionAddress, &funcName);
+    // Support an internal call by the ICD
+    RETURN_FUNC_PTR_IF_EXIST(clIcdGetPlatformIDsKHR);
+
+    // perf counters
+    RETURN_FUNC_PTR_IF_EXIST(clCreatePerfCountersCommandQueueINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clSetPerformanceConfigurationINTEL);
+    // Support device extensions
+    RETURN_FUNC_PTR_IF_EXIST(clCreateAcceleratorINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetAcceleratorInfoINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clRetainAcceleratorINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clReleaseAcceleratorINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clCreateBufferWithPropertiesINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clCreateImageWithPropertiesINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clAddCommentINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueVerifyMemoryINTEL);
+
+    RETURN_FUNC_PTR_IF_EXIST(clCreateTracingHandleINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clSetTracingPointINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clDestroyTracingHandleINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnableTracingINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clDisableTracingINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetTracingStateINTEL);
+
+    RETURN_FUNC_PTR_IF_EXIST(clHostMemAllocINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clDeviceMemAllocINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clSharedMemAllocINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clMemFreeINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clMemBlockingFreeINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetMemAllocInfoINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clSetKernelArgMemPointerINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueMemsetINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueMemFillINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueMemcpyINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueMigrateMemINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueMemAdviseINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetDeviceFunctionPointerINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetDeviceGlobalVariablePointerINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetKernelMaxConcurrentWorkGroupCountINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clGetKernelSuggestedLocalWorkSizeINTEL);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueNDCountKernelINTEL);
+
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueAcquireExternalMemObjectsKHR);
+    RETURN_FUNC_PTR_IF_EXIST(clEnqueueReleaseExternalMemObjectsKHR);
+
+    // Resolved only while cl_khr_command_buffer is advertised, so a client probing for a
+    // function pointer cannot mistake it for support.
+    if (NEO::LEO::CommandBuffer::isSupported()) {
+        RETURN_FUNC_PTR_IF_EXIST(clCreateCommandBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clFinalizeCommandBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clRetainCommandBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clReleaseCommandBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clEnqueueCommandBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clGetCommandBufferInfoKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandBarrierWithWaitListKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandCopyBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandCopyBufferRectKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandCopyBufferToImageKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandCopyImageKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandCopyImageToBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandFillBufferKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandFillImageKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandSVMMemcpyKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandSVMMemFillKHR);
+        RETURN_FUNC_PTR_IF_EXIST(clCommandNDRangeKernelKHR);
+    }
+
+    void *ret = NEO::LEO::sharingFactory.getExtensionFunctionAddress(funcName);
+    if (ret != nullptr) {
+        TRACING_EXIT(ClGetExtensionFunctionAddress, &ret);
+        return ret;
+    }
+
+    // SPIR-V support through the cl_khr_il_program extension
+    RETURN_FUNC_PTR_IF_EXIST(clCreateProgramWithILKHR);
+    RETURN_FUNC_PTR_IF_EXIST(clCreateCommandQueueWithPropertiesKHR);
+
+    RETURN_FUNC_PTR_IF_EXIST(clSetProgramSpecializationConstant);
+
+    RETURN_FUNC_PTR_IF_EXIST(clGetKernelSuggestedLocalWorkSize);
+    RETURN_FUNC_PTR_IF_EXIST(clGetKernelSuggestedLocalWorkSizeKHR);
+    ret = NEO::getAdditionalExtensionFunctionAddress(funcName);
+    TRACING_EXIT(ClGetExtensionFunctionAddress, &ret);
+    return ret;
+}
+
+// OpenCL 1.2
+void *CL_API_CALL clGetExtensionFunctionAddressForPlatform(cl_platform_id platform,
+                                                           const char *funcName) {
+    TRACING_ENTER(ClGetExtensionFunctionAddressForPlatform, &platform, &funcName);
+    void *ret = clGetExtensionFunctionAddress(funcName);
+    TRACING_EXIT(ClGetExtensionFunctionAddressForPlatform, &ret);
+    return ret;
+}
+
+} // extern "C"
+
+} // namespace LEO
+} // namespace NEO

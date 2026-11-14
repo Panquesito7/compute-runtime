@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,6 +10,7 @@
 
 #include "opencl/test/unit_test/command_queue/command_enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
 
 namespace NEO {
@@ -56,7 +57,7 @@ struct EnqueueCopyBufferRectTest : public CommandEnqueueFixture,
 
     void SetUp(void) override {
         CommandEnqueueFixture::setUp();
-        BufferDefaults::context = new MockContext;
+        BufferDefaults::context = new MockContext(pClDevice);
 
         srcBuffer = BufferHelper<BufferRect>::create();
         dstBuffer = BufferHelper<BufferRect>::create();
@@ -72,9 +73,6 @@ struct EnqueueCopyBufferRectTest : public CommandEnqueueFixture,
   protected:
     template <typename FamilyType>
     void enqueueCopyBufferRect2D() {
-        typedef typename FamilyType::WALKER_TYPE GPGPU_WALKER;
-        typedef typename FamilyType::PIPELINE_SELECT PIPELINE_SELECT;
-
         size_t srcOrigin[] = {0, 0, 0};
         size_t dstOrigin[] = {0, 0, 0};
         size_t region[] = {50, 50, 1};
@@ -99,9 +97,6 @@ struct EnqueueCopyBufferRectTest : public CommandEnqueueFixture,
 
     template <typename FamilyType>
     void enqueueCopyBufferRect3D() {
-        typedef typename FamilyType::WALKER_TYPE GPGPU_WALKER;
-        typedef typename FamilyType::PIPELINE_SELECT PIPELINE_SELECT;
-
         size_t srcOrigin[] = {0, 0, 0};
         size_t dstOrigin[] = {0, 0, 0};
         size_t region[] = {50, 50, 50};

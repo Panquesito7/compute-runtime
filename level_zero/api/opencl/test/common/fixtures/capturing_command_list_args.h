@@ -1,0 +1,203 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+
+#include "level_zero/core/source/cmdlist/cmdlist_launch_params.h"
+#include "level_zero/core/source/cmdlist/cmdlist_signal_event_parameters.h"
+#include "level_zero/core/source/cmdlist/cmdlist_wait_event_parameters.h"
+#include "level_zero/driver_experimental/zex_cmdlist.h"
+#include <level_zero/ze_api.h>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace NEO {
+namespace LEO {
+namespace ult {
+
+using EventHandles = std::vector<ze_event_handle_t>;
+
+// Level Zero APIs often take a pointer as an argument. These objects are already destroyed by the
+// time we leave the LEO API call, so we need to deep copy them if we want to compare them in ULTS.
+inline EventHandles copyWaitEvents(uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents) {
+    if ((phWaitEvents == nullptr) || (numWaitEvents == 0u)) {
+        return {};
+    }
+    return {phWaitEvents, phWaitEvents + numWaitEvents};
+}
+
+inline std::vector<ze_command_list_handle_t> copyCommandLists(uint32_t numCommandLists, ze_command_list_handle_t *phCommandLists) {
+    if ((phCommandLists == nullptr) || (numCommandLists == 0u)) {
+        return {};
+    }
+    return {phCommandLists, phCommandLists + numCommandLists};
+}
+
+inline std::vector<uint8_t> copyPattern(const void *pattern, size_t patternSize) {
+    if ((pattern == nullptr) || (patternSize == 0u)) {
+        return {};
+    }
+    auto bytes = reinterpret_cast<const uint8_t *>(pattern);
+    return {bytes, bytes + patternSize};
+}
+
+template <typename T>
+std::optional<T> copyValue(const T *value) {
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    return *value;
+}
+
+struct AppendMemoryCopyArgs {
+    void *dstptr;
+    const void *srcptr;
+    size_t size;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendMemoryCopyArgs(void *dstptr, const void *srcptr, size_t size, ze_event_handle_t signalEvent,
+                         uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : dstptr(dstptr), srcptr(srcptr), size(size), signalEvent(signalEvent),
+          waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendMemoryCopyRegionArgs {
+    void *dstptr;
+    std::optional<ze_copy_region_t> dstRegion;
+    uint32_t dstPitch;
+    uint32_t dstSlicePitch;
+    const void *srcptr;
+    std::optional<ze_copy_region_t> srcRegion;
+    uint32_t srcPitch;
+    uint32_t srcSlicePitch;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendMemoryCopyRegionArgs(void *dstptr, const ze_copy_region_t *dstRegion, uint32_t dstPitch, uint32_t dstSlicePitch,
+                               const void *srcptr, const ze_copy_region_t *srcRegion, uint32_t srcPitch, uint32_t srcSlicePitch,
+                               ze_event_handle_t signalEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : dstptr(dstptr), dstRegion(copyValue(dstRegion)), dstPitch(dstPitch), dstSlicePitch(dstSlicePitch),
+          srcptr(srcptr), srcRegion(copyValue(srcRegion)), srcPitch(srcPitch), srcSlicePitch(srcSlicePitch),
+          signalEvent(signalEvent), waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendMemoryFillArgs {
+    void *ptr;
+    std::vector<uint8_t> pattern;
+    size_t patternSize;
+    size_t size;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendMemoryFillArgs(void *ptr, const void *pattern, size_t patternSize, size_t size,
+                         ze_event_handle_t signalEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : ptr(ptr), pattern(copyPattern(pattern, patternSize)), patternSize(patternSize), size(size),
+          signalEvent(signalEvent), waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendLaunchKernelArgs {
+    ze_kernel_handle_t kernel;
+    ze_group_count_t groupCount;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+    L0::CmdListKernelLaunchParams launchParams;
+
+    AppendLaunchKernelArgs(ze_kernel_handle_t kernel, const ze_group_count_t &groupCount, ze_event_handle_t signalEvent,
+                           uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents, const L0::CmdListKernelLaunchParams &launchParams)
+        : kernel(kernel), groupCount(groupCount), signalEvent(signalEvent),
+          waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)), launchParams(launchParams) {}
+};
+
+struct AppendLaunchKernelNonUniformArgs {
+    ze_kernel_handle_t kernel;
+    L0::CmdListNonUniformLaunchArgs launchArgs;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendLaunchKernelNonUniformArgs(ze_kernel_handle_t kernel, const L0::CmdListNonUniformLaunchArgs &launchArgs, ze_event_handle_t signalEvent,
+                                     uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : kernel(kernel), launchArgs(launchArgs), signalEvent(signalEvent),
+          waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendBarrierArgs {
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+    L0::CmdListWaitEventParameters waitEventsParameters;
+    L0::CmdListSignalEventParameters signalEventParameters;
+
+    AppendBarrierArgs(ze_event_handle_t signalEvent, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                      L0::CmdListWaitEventParameters waitEventsParameters, L0::CmdListSignalEventParameters signalEventParameters)
+        : signalEvent(signalEvent), waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)),
+          waitEventsParameters(waitEventsParameters), signalEventParameters(signalEventParameters) {}
+};
+
+struct AppendImageCopyFromMemoryExtArgs {
+    ze_image_handle_t dstImage;
+    const void *srcptr;
+    std::optional<ze_image_region_t> dstRegion;
+    uint32_t srcRowPitch;
+    uint32_t srcSlicePitch;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendImageCopyFromMemoryExtArgs(ze_image_handle_t dstImage, const void *srcptr, const ze_image_region_t *dstRegion,
+                                     uint32_t srcRowPitch, uint32_t srcSlicePitch, ze_event_handle_t signalEvent,
+                                     uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : dstImage(dstImage), srcptr(srcptr), dstRegion(copyValue(dstRegion)), srcRowPitch(srcRowPitch),
+          srcSlicePitch(srcSlicePitch), signalEvent(signalEvent), waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendImageCopyToMemoryExtArgs {
+    void *dstptr;
+    ze_image_handle_t srcImage;
+    std::optional<ze_image_region_t> srcRegion;
+    uint32_t destRowPitch;
+    uint32_t destSlicePitch;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendImageCopyToMemoryExtArgs(void *dstptr, ze_image_handle_t srcImage, const ze_image_region_t *srcRegion,
+                                   uint32_t destRowPitch, uint32_t destSlicePitch, ze_event_handle_t signalEvent,
+                                   uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : dstptr(dstptr), srcImage(srcImage), srcRegion(copyValue(srcRegion)), destRowPitch(destRowPitch),
+          destSlicePitch(destSlicePitch), signalEvent(signalEvent), waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendHostFunctionArgs {
+    ze_host_function_callback_t hostFunction;
+    void *userData;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendHostFunctionArgs(ze_host_function_callback_t hostFunction, void *userData, ze_event_handle_t signalEvent,
+                           uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : hostFunction(hostFunction), userData(userData), signalEvent(signalEvent),
+          waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct AppendCommandListsArgs {
+    std::vector<ze_command_list_handle_t> commandLists;
+    ze_event_handle_t signalEvent;
+    EventHandles waitEvents;
+
+    AppendCommandListsArgs(uint32_t numCommandLists, ze_command_list_handle_t *phCommandLists, ze_event_handle_t signalEvent,
+                           uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents)
+        : commandLists(copyCommandLists(numCommandLists, phCommandLists)), signalEvent(signalEvent),
+          waitEvents(copyWaitEvents(numWaitEvents, phWaitEvents)) {}
+};
+
+struct HostSynchronizeArgs {
+    uint64_t timeout = 0u;
+};
+
+} // namespace ult
+} // namespace LEO
+} // namespace NEO

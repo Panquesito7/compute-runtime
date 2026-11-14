@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 -->
 
-# Level Zero Immediate Command list
+# Level Zero Immediate Command Lists
 
 * [Introduction](#Introduction)
 * [Availability](#Availability)
@@ -17,7 +17,7 @@ SPDX-License-Identifier: MIT
 
 # Introduction
 
-Immediate command lists is a feature provided by Level-Zero specification to allow for very low latency submission usage models. In this scheme, commands appended on the command list such as launching a kernel or performing a memory copy are immediately submitted to the device for execution. This is different from a regular command list where multiple commands can be stitched and submitted together for execution .
+Immediate command lists is a feature provided by Level-Zero specification to allow for very low latency submission usage models. In this scheme, commands appended on the command list such as launching a kernel or performing a memory copy are immediately submitted to the device for execution. This is different from a regular command list where multiple commands can be stitched and submitted together for execution.
 
 Distinctions between an immediate command list compared to a regular command list include (but not limited to) the following:
 
@@ -26,12 +26,12 @@ Distinctions between an immediate command list compared to a regular command lis
 * Immediate command lists are not required to be closed or reset.
 * Synchronization of immediate command lists cannot be performed by user via zeCommandQueueSynchronize as the user will not have a command queue handle or via a fence handle as fences are associated with a command queue. Proper synchronization models are detailed further below.
 
-Since the intention of immediate command lists are to primarily provide a razor thin submission interface to the device, they are well suited to be used in workloads who have tendency to launch small or short running kernels and also need to run multiple iterations of such kernels. Examples of workloads with such characteristics can be found in HPC environments and also ML/DL frameworks.
+Since the intention of immediate command lists are to primarily provide a razor thin submission interface to the device, they are well suited to be used in workloads that have tendency to launch small or short running kernels and also need to run multiple iterations of such kernels. Examples of workloads with such characteristics can be found in HPC environments and also ML/DL frameworks.
 
 ## Programming model
 
 Pseudo-code for creating immediate command list (async mode):
-```
+```cpp
     ze_command_queue_desc_t cmdQueueDesc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
     cmdQueueDesc.pNext = nullptr;
     cmdQueueDesc.flags = 0;
@@ -44,7 +44,7 @@ Pseudo-code for creating immediate command list (async mode):
 
 Submitting commands and synchronization:
 Launching kernels:
-```
+```cpp
     zeCommandListAppendLaunchKernel(cmdList, kernel, &dispatchTraits,
                                     events[0], 0, nullptr);
     // If Async mode, use event for sync
@@ -52,7 +52,7 @@ Launching kernels:
 ```
 
 Performing copies:
-```
+```cpp
     zeCommandListAppendMemoryCopy(cmdList, deviceBuffer, hostBuffer, allocSize,
                                     events[0],
                                     0, nullptr);
@@ -62,11 +62,11 @@ Performing copies:
                                     1,
                                     &events[0]);
 
-    zeEventHostSynchronize(events[1], std::numeric_limits<uint64_t>::max() - 1));
+    zeEventHostSynchronize(events[1], std::numeric_limits<uint64_t>::max() - 1);
 ```
 
 Pseudo-code for creating immediate command list (sync mode):
-```
+```cpp
     ze_command_queue_desc_t cmdQueueDesc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC};
     cmdQueueDesc.pNext = nullptr;
     cmdQueueDesc.flags = 0;
@@ -78,7 +78,7 @@ Pseudo-code for creating immediate command list (sync mode):
 ```
 
 Launching kernel:
-```
+```cpp
     zeCommandListAppendLaunchKernel(cmdList, kernel, &dispatchTraits,
                                     nullptr, 0, nullptr);
 ```
@@ -108,4 +108,4 @@ For more code samples, please refer [compute-benchmarks](https://github.com/inte
 
 # References
 
-* https://one-api.gitlab-pages.devtools.intel.com/level_zero/core/PROG.html#low-latency-immediate-command-lists
+* https://oneapi-src.github.io/level-zero-spec/level-zero/latest/core/PROG.html#low-latency-immediate-command-lists

@@ -12,7 +12,6 @@
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/mock_sysman_fixture.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/linux/nl_api/mock_iaf_nl_api_prelim.h"
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 #include <limits>
@@ -560,6 +559,481 @@ TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingZesFabricPortG
     // Timestamp is not provided by IafNlApi
     EXPECT_EQ(pMockIafNlApi->rxCounter, throughput.rxCounter);
     EXPECT_EQ(pMockIafNlApi->txCounter, throughput.txCounter);
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingZesFabricPortGetMultiPortThroughputThenZesFabricPortGetMultiPortThroughputCallSucceeds) {
+    uint32_t count = pMockIafNlApi->numPorts;
+    ASSERT_LE(count, maxNumPorts);
+    zes_fabric_port_handle_t hPorts[maxNumPorts];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    zes_fabric_port_throughput_t throughputArray[maxNumPorts] = {};
+    zes_fabric_port_throughput_t *pThroughput = throughputArray;
+    result = zesFabricPortGetMultiPortThroughput(device, count, hPorts, &pThroughput);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    for (uint32_t i = 0; i < count; i++) {
+        EXPECT_EQ(pMockIafNlApi->rxCounter, throughputArray[i].rxCounter);
+        EXPECT_EQ(pMockIafNlApi->txCounter, throughputArray[i].txCounter);
+    }
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingGetMultiPortThroughputAndGetThroughputThenVerifyThroughputFromBothApisAreEqual) {
+    uint32_t count = pMockIafNlApi->numPorts;
+    ASSERT_LE(count, maxNumPorts);
+    zes_fabric_port_handle_t hPorts[maxNumPorts];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    uint8_t portNumberIndex = pMockIafNlApi->testPortId.portNumber - 1U;
+
+    if (1U == pMockIafNlApi->testPortId.attachId) {
+        portNumberIndex += pMockIafNlApi->portsPerSubdevice;
+    }
+
+    zes_fabric_port_throughput_t throughput = {};
+    result = zesFabricPortGetThroughput(hPorts[portNumberIndex], &throughput);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    zes_fabric_port_throughput_t throughputArray[1] = {};
+    zes_fabric_port_throughput_t *pThroughput = throughputArray;
+    result = zesFabricPortGetMultiPortThroughput(device, 1, &hPorts[portNumberIndex], &pThroughput);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(throughput.rxCounter, throughputArray[0].rxCounter);
+    EXPECT_EQ(throughput.txCounter, throughputArray[0].txCounter);
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingZesFabricPortGetMultiPortThroughputWithCountAsZeroThenApiCallReturnsFailure) {
+    uint32_t count = pMockIafNlApi->numPorts;
+    ASSERT_LE(count, maxNumPorts);
+    zes_fabric_port_handle_t hPorts[maxNumPorts];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    zes_fabric_port_throughput_t throughputArray[maxNumPorts] = {};
+    zes_fabric_port_throughput_t *pThroughput = throughputArray;
+    result = zesFabricPortGetMultiPortThroughput(device, 0, hPorts, &pThroughput);
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingZesFabricPortGetMultiPortThroughputAndIafGetThroughPutFailsThenApiCallReturnsFailure) {
+    uint32_t count = pMockIafNlApi->numPorts;
+    ASSERT_LE(count, maxNumPorts);
+    zes_fabric_port_handle_t hPorts[maxNumPorts];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    pMockIafNlApi->mockgetMultiPortThroughPutReturnStatus = ZE_RESULT_ERROR_NOT_AVAILABLE;
+
+    zes_fabric_port_throughput_t throughputArray[maxNumPorts] = {};
+    zes_fabric_port_throughput_t *pThroughput = throughputArray;
+    result = zesFabricPortGetMultiPortThroughput(device, count, hPorts, &pThroughput);
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingZesFabricPortGetMultiPortThroughputAndPortIdAreInvalidThenCountersOfZeroAreReturned) {
+    uint32_t count = 3;
+    zes_fabric_port_handle_t hPorts[maxNumPorts];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    IafPortId invalidPortNumber = {pMockIafNlApi->defaultFabricId, pMockIafNlApi->testPortId.attachId, pMockIafNlApi->testPortId.portNumber + 1U};
+    IafPortId invalidAttachId = {pMockIafNlApi->defaultFabricId, pMockIafNlApi->testPortId.attachId + 10U, pMockIafNlApi->testPortId.portNumber};
+    IafPortId invalidFabricId = {pMockIafNlApi->defaultFabricId + 20U, pMockIafNlApi->testPortId.attachId, pMockIafNlApi->testPortId.portNumber};
+    pMockIafNlApi->mockIafPortIds.insert(pMockIafNlApi->mockIafPortIds.end(), {invalidPortNumber, invalidAttachId, invalidFabricId});
+
+    zes_fabric_port_throughput_t throughputArray[maxNumPorts] = {};
+    zes_fabric_port_throughput_t *pThroughput = throughputArray;
+    result = zesFabricPortGetMultiPortThroughput(device, count, hPorts, &pThroughput);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    for (uint32_t i = 0; i < count; i++) {
+        EXPECT_EQ(0U, throughputArray[i].rxCounter);
+        EXPECT_EQ(0U, throughputArray[i].txCounter);
+    }
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersWithLegacyPathAndCallSucceeds) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    zes_fabric_port_properties_t properties;
+
+    result = zesFabricPortGetProperties(hPorts[0], &properties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    std::string fabricLinkErrorPath = "/mockRealPath/iaf.5/sd." + std::to_string(properties.portId.attachId) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricFwErrorPath = "/mockRealPath/iaf.5/sd." + std::to_string(properties.portId.attachId);
+    std::vector<std::string> dirs = {"driver", "drm", "iaf.5"};
+    uint64_t mockLinkFailures = 401;
+    uint64_t mockLinkDegrades = 501;
+    uint64_t mockFwErrors = 301;
+    uint64_t mockFwCommErrors = 201;
+    std::map<std::string, uint64_t> nodes = {
+        {fabricLinkErrorPath + "/link_failures", mockLinkFailures},
+        {fabricLinkErrorPath + "/link_degrades", mockLinkDegrades},
+        {fabricFwErrorPath + "/fw_error", mockFwErrors},
+        {fabricFwErrorPath + "/fw_comm_errors", mockFwCommErrors},
+    };
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleNodes(nodes);
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(errors.linkFailureCount, mockLinkFailures);
+    EXPECT_EQ(errors.linkDegradeCount, mockLinkDegrades);
+    EXPECT_EQ(errors.fwErrorCount, mockFwErrors);
+    EXPECT_EQ(errors.fwCommErrorCount, mockFwCommErrors);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersCallSucceeds) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    zes_fabric_port_properties_t properties;
+
+    result = zesFabricPortGetProperties(hPorts[0], &properties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    std::string fabricLinkErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricFwErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId);
+    std::vector<std::string> dirs = {"i915.iaf.5",
+                                     "driver", "drm"};
+    uint64_t mockLinkFailures = 401;
+    uint64_t mockLinkDegrades = 501;
+    uint64_t mockFwErrors = 301;
+    uint64_t mockFwCommErrors = 201;
+    std::map<std::string, uint64_t> nodes = {
+        {fabricLinkErrorPath + "/link_failures", mockLinkFailures},
+        {fabricLinkErrorPath + "/link_degrades", mockLinkDegrades},
+        {fabricFwErrorPath + "/fw_error", mockFwErrors},
+        {fabricFwErrorPath + "/fw_comm_errors", mockFwCommErrors},
+    };
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleNodes(nodes);
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(errors.linkFailureCount, mockLinkFailures);
+    EXPECT_EQ(errors.linkDegradeCount, mockLinkDegrades);
+    EXPECT_EQ(errors.fwErrorCount, mockFwErrors);
+    EXPECT_EQ(errors.fwCommErrorCount, mockFwCommErrors);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndGetRealPathFailsThenFailureIsReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    static_cast<MockFabricSysFsAccess *>(pSysfsAccess)->mockRealPathStatus = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndListDirectoryFailsThenFailureIsReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    static_cast<MockFabricFsAccess *>(pFsAccess)->mockListDirectory = ZE_RESULT_ERROR_NOT_AVAILABLE;
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndIafSysfsFilesAreNotPresentThenFailureIsReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    std::vector<std::string> dirs = {"driver", "drm"};
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+
+    zes_fabric_port_error_counters_t errors;
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_ERROR_NOT_AVAILABLE, result);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndLinkFailureSysfsNodeIsAbsentThenZeroLinkFailuresAreReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    zes_fabric_port_properties_t properties;
+
+    result = zesFabricPortGetProperties(hPorts[0], &properties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    std::string fabricLinkErrorIncorrectPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId + 1) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricLinkErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricFwErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId);
+    std::vector<std::string> dirs = {"i915.iaf.5",
+                                     "driver", "drm"};
+    uint64_t mockLinkFailures = 401;
+    uint64_t mockLinkDegrades = 501;
+    uint64_t mockFwErrors = 301;
+    uint64_t mockFwCommErrors = 201;
+    std::map<std::string, uint64_t> nodes = {
+        {fabricLinkErrorIncorrectPath + "/link_failures", mockLinkFailures},
+        {fabricLinkErrorPath + "/link_degrades", mockLinkDegrades},
+        {fabricFwErrorPath + "/fw_error", mockFwErrors},
+        {fabricFwErrorPath + "/fw_comm_errors", mockFwCommErrors},
+    };
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleNodes(nodes);
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(errors.linkFailureCount, 0u);
+    EXPECT_EQ(errors.linkDegradeCount, mockLinkDegrades);
+    EXPECT_EQ(errors.fwErrorCount, mockFwErrors);
+    EXPECT_EQ(errors.fwCommErrorCount, mockFwCommErrors);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndLinkDegradesSysfsNodeIsAbsentThenZeroLinkDegradesAreReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    zes_fabric_port_properties_t properties;
+
+    result = zesFabricPortGetProperties(hPorts[0], &properties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    std::string fabricLinkErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricLinkErrorIncorrectPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId + 1) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricFwErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId);
+    std::vector<std::string> dirs = {"i915.iaf.5",
+                                     "driver", "drm"};
+    uint64_t mockLinkFailures = 401;
+    uint64_t mockLinkDegrades = 501;
+    uint64_t mockFwErrors = 301;
+    uint64_t mockFwCommErrors = 201;
+    std::map<std::string, uint64_t> nodes = {
+        {fabricLinkErrorPath + "/link_failures", mockLinkFailures},
+        {fabricLinkErrorIncorrectPath + "/link_degrades", mockLinkDegrades},
+        {fabricFwErrorPath + "/fw_error", mockFwErrors},
+        {fabricFwErrorPath + "/fw_comm_errors", mockFwCommErrors},
+    };
+
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleNodes(nodes);
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(errors.linkFailureCount, mockLinkFailures);
+    EXPECT_EQ(errors.linkDegradeCount, 0u);
+    EXPECT_EQ(errors.fwErrorCount, mockFwErrors);
+    EXPECT_EQ(errors.fwCommErrorCount, mockFwCommErrors);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndFwErrorSysfsNodeIsAbsentThenZeroFwErrorsAreReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    zes_fabric_port_properties_t properties;
+
+    result = zesFabricPortGetProperties(hPorts[0], &properties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    std::string fabricLinkErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricFwErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId);
+    std::string fabricFwErrorIncorrectPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId + 1);
+    std::vector<std::string> dirs = {"i915.iaf.5",
+                                     "driver", "drm"};
+    uint64_t mockLinkFailures = 401;
+    uint64_t mockLinkDegrades = 501;
+    uint64_t mockFwErrors = 301;
+    uint64_t mockFwCommErrors = 201;
+    std::map<std::string, uint64_t> nodes = {
+        {fabricLinkErrorPath + "/link_failures", mockLinkFailures},
+        {fabricLinkErrorPath + "/link_degrades", mockLinkDegrades},
+        {fabricFwErrorIncorrectPath + "/fw_error", mockFwErrors},
+        {fabricFwErrorPath + "/fw_comm_errors", mockFwCommErrors},
+    };
+
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleNodes(nodes);
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(errors.linkFailureCount, mockLinkFailures);
+    EXPECT_EQ(errors.linkDegradeCount, mockLinkDegrades);
+    EXPECT_EQ(errors.fwErrorCount, 0u);
+    EXPECT_EQ(errors.fwCommErrorCount, mockFwCommErrors);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
+}
+
+TEST_F(ZesFabricPortFixture, GivenValidFabricPortHandleWhenCallingzesFabricPortGetFabricErrorCountersAndFwCommErrorSysfsNodeIsAbsentThenZeroFwCommErrorsAreReturned) {
+    VariableBackup<FsAccess *> backupFsAccess(&pLinuxSysmanImp->pFsAccess);
+    VariableBackup<SysfsAccess *> backupSysfsAccess(&pLinuxSysmanImp->pSysfsAccess);
+    auto pFsAccess = new MockFabricFsAccess;
+    auto pSysfsAccess = new MockFabricSysFsAccess;
+    pLinuxSysmanImp->pFsAccess = pFsAccess;
+    pLinuxSysmanImp->pSysfsAccess = pSysfsAccess;
+
+    uint32_t count = 1U;
+    zes_fabric_port_handle_t hPorts[1U];
+    ze_result_t result = zesDeviceEnumFabricPorts(device, &count, hPorts);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(count, 1U);
+
+    zes_fabric_port_properties_t properties;
+
+    result = zesFabricPortGetProperties(hPorts[0], &properties);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    std::string fabricLinkErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId) + "/port." + std::to_string(properties.portId.portNumber);
+    std::string fabricFwErrorPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId);
+    std::string fabricFwErrorIncorrectPath = "/mockRealPath/i915.iaf.5/sd." + std::to_string(properties.portId.attachId + 1);
+    std::vector<std::string> dirs = {"i915.iaf.5",
+                                     "driver", "drm"};
+    uint64_t mockLinkFailures = 401;
+    uint64_t mockLinkDegrades = 501;
+    uint64_t mockFwErrors = 301;
+    uint64_t mockFwCommErrors = 201;
+    std::map<std::string, uint64_t> nodes = {
+        {fabricLinkErrorPath + "/link_failures", mockLinkFailures},
+        {fabricLinkErrorPath + "/link_degrades", mockLinkDegrades},
+        {fabricFwErrorPath + "/fw_error", mockFwErrors},
+        {fabricFwErrorIncorrectPath + "/fw_comm_errors", mockFwCommErrors},
+    };
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleDirectories(dirs);
+    static_cast<MockFabricFsAccess *>(pFsAccess)->setAccessibleNodes(nodes);
+    zes_fabric_port_error_counters_t errors;
+
+    result = zesFabricPortGetFabricErrorCounters(hPorts[0], &errors);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(errors.linkFailureCount, mockLinkFailures);
+    EXPECT_EQ(errors.linkDegradeCount, mockLinkDegrades);
+    EXPECT_EQ(errors.fwErrorCount, mockFwErrors);
+    EXPECT_EQ(errors.fwCommErrorCount, 0u);
+
+    delete pFsAccess;
+    delete pSysfsAccess;
 }
 
 } // namespace ult

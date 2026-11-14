@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,21 +7,20 @@
 
 #pragma once
 #define UMDF_USING_NTSTATUS
-#include "shared/source/helpers/aligned_memory.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/source/os_interface/windows/d3dkmthk_wrapper.h"
 #include "shared/source/os_interface/windows/windows_wrapper.h"
+
+#include <string>
 
 namespace NEO {
 
 struct OsHandleWin : OsHandle {
     ~OsHandleWin() override = default;
-    D3DKMT_HANDLE handle = 0;
     D3DGPU_VIRTUAL_ADDRESS gpuPtr = 0;
     Gmm *gmm = nullptr;
+    D3DKMT_HANDLE handle = 0;
 };
-
-constexpr size_t trimListUnusedPosition = std::numeric_limits<size_t>::max();
 
 class WddmAllocation : public GraphicsAllocation {
   public:
@@ -30,38 +29,42 @@ class WddmAllocation : public GraphicsAllocation {
         uint64_t size = 0;
     };
 
-    WddmAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, void *cpuPtrIn, uint64_t canonizedAddress, size_t sizeIn, void *reservedAddr, MemoryPool pool, uint32_t shareable, size_t maxOsContextCount)
-        : WddmAllocation(rootDeviceIndex, 1, allocationType, cpuPtrIn, canonizedAddress, sizeIn, reservedAddr, pool, shareable, maxOsContextCount) {}
-
     WddmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, void *cpuPtrIn, uint64_t canonizedAddress, size_t sizeIn,
                    void *reservedAddr, MemoryPool pool, uint32_t shareable, size_t maxOsContextCount)
         : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, cpuPtrIn, canonizedAddress, 0llu, sizeIn, pool, maxOsContextCount),
-          shareable(shareable), trimCandidateListPositions(maxOsContextCount, trimListUnusedPosition) {
+          shareable(shareable) {
         reservedAddressRangeInfo.addressPtr = reservedAddr;
         reservedAddressRangeInfo.rangeSize = sizeIn;
         handles.resize(gmms.size());
     }
 
-    WddmAllocation(uint32_t rootDeviceIndex, AllocationType allocationType, void *cpuPtrIn, size_t sizeIn, osHandle sharedHandle,
-                   MemoryPool pool, size_t maxOsContextCount, uint64_t canonizedGpuAddress)
-        : WddmAllocation(rootDeviceIndex, 1, allocationType, cpuPtrIn, sizeIn, sharedHandle, pool, maxOsContextCount, canonizedGpuAddress) {}
-
     WddmAllocation(uint32_t rootDeviceIndex, size_t numGmms, AllocationType allocationType, void *cpuPtrIn, size_t sizeIn,
                    osHandle sharedHandle, MemoryPool pool, size_t maxOsContextCount, uint64_t canonizedGpuAddress)
-        : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, cpuPtrIn, sizeIn, sharedHandle, pool, maxOsContextCount, canonizedGpuAddress),
-          trimCandidateListPositions(maxOsContextCount, trimListUnusedPosition) {
+        : GraphicsAllocation(rootDeviceIndex, numGmms, allocationType, cpuPtrIn, sizeIn, sharedHandle, pool, maxOsContextCount, canonizedGpuAddress) {
         handles.resize(gmms.size());
     }
 
-    void *getAlignedCpuPtr() const {
-        return alignDown(this->cpuPtr, MemoryConstants::pageSize);
+  protected:
+    WddmAllocation(WddmAllocation *parent, size_t offsetInParentAllocation, size_t viewSize)
+        : GraphicsAllocation(parent, offsetInParentAllocation, viewSize),
+          handles(parent->handles),
+          resourceHandle(parent->resourceHandle),
+          shareable(parent->shareable),
+          allocInFrontWindowPool(parent->allocInFrontWindowPool),
+          physicalMemoryReservation(parent->physicalMemoryReservation),
+          mappedPhysicalMemoryReservation(parent->mappedPhysicalMemoryReservation),
+          makeResidentBeforeLockRequired(parent->makeResidentBeforeLockRequired),
+          ipcSupportedAllocationByDefault(parent->ipcSupportedAllocationByDefault) {
     }
 
-    size_t getAlignedSize() const {
-        return alignSizeWholePage(this->cpuPtr, this->size);
-    }
+  public:
+    GraphicsAllocation *createView(size_t offsetInParentAllocation, size_t viewSize) override;
 
-    const StackVec<D3DKMT_HANDLE, EngineLimits::maxHandleCount> &getHandles() const { return handles; }
+    void *getAlignedCpuPtr() const;
+
+    size_t getAlignedSize() const;
+
+    const std::vector<D3DKMT_HANDLE> &getHandles() const { return handles; }
     D3DKMT_HANDLE &getHandleToModify(uint32_t handleIndex) { return handles[handleIndex]; }
     D3DKMT_HANDLE getDefaultHandle() const { return handles[0]; }
     D3DKMT_HANDLE getHandle(uint32_t handleIndex) const { return handles[handleIndex]; }
@@ -74,9 +77,15 @@ class WddmAllocation : public GraphicsAllocation {
 
     void clearInternalHandle(uint32_t handleId) override;
 
-    int createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle) override;
+    int createInternalHandle(MemoryManager *memoryManager, uint32_t handleId, uint64_t &handle, void *reservedHandleData) override;
 
-    int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle) override {
+    int peekInternalHandle(MemoryManager *memoryManager, uint64_t &handle, void *reservedHandleData) override {
+        if (parentAllocation) {
+            return static_cast<WddmAllocation *>(parentAllocation)->peekInternalHandle(memoryManager, handle, reservedHandleData);
+        }
+        if (mappedPhysicalAllocation) {
+            return createInternalHandle(memoryManager, 0u, handle, reservedHandleData);
+        }
         handle = ntSecureHandle;
         return handle == 0;
     }
@@ -88,43 +97,53 @@ class WddmAllocation : public GraphicsAllocation {
         return nullptr;
     }
 
-    void setTrimCandidateListPosition(uint32_t osContextId, size_t position) {
-        trimCandidateListPositions[osContextId] = position;
-    }
-
-    size_t getTrimCandidateListPosition(uint32_t osContextId) const {
-        if (osContextId < trimCandidateListPositions.size()) {
-            return trimCandidateListPositions[osContextId];
-        }
-        return trimListUnusedPosition;
-    }
-
     void setGpuAddress(uint64_t graphicsAddress) { this->gpuAddress = graphicsAddress; }
     void setCpuAddress(void *cpuPtr) { this->cpuPtr = cpuPtr; }
 
     std::string getAllocationInfoString() const override;
+    std::string getPatIndexInfoString() const override;
     uint64_t &getGpuAddressToModify() { return gpuAddress; }
+    bool needsMakeResidentBeforeLock() const { return makeResidentBeforeLockRequired; }
+    void setMakeResidentBeforeLockRequired(bool makeResidentBeforeLockRequired) { this->makeResidentBeforeLockRequired = makeResidentBeforeLockRequired; }
+    bool isAllocInFrontWindowPool() const { return allocInFrontWindowPool; }
+    void setAllocInFrontWindowPool(bool allocInFrontWindowPool) { this->allocInFrontWindowPool = allocInFrontWindowPool; }
+    bool isShareable() const { return shareable; }
+    bool isipcSupportedAllocationByDefault() const { return ipcSupportedAllocationByDefault; }
+    void setipcSupportedAllocationByDefault(bool ipcSupportedAllocationByDefault) { this->ipcSupportedAllocationByDefault = ipcSupportedAllocationByDefault; }
+    bool isPhysicalMemoryReservation() const { return physicalMemoryReservation; }
+    void setPhysicalMemoryReservation(bool physicalMemoryReservation) { this->physicalMemoryReservation = physicalMemoryReservation; }
+    bool isMappedPhysicalMemoryReservation() const { return mappedPhysicalMemoryReservation; }
+    void setMappedPhysicalMemoryReservation(bool mappedPhysicalMemoryReservation) { this->mappedPhysicalMemoryReservation = mappedPhysicalMemoryReservation; }
 
+    D3DGPU_VIRTUAL_ADDRESS getReservedGpuVirtualAddress() const { return reservedGpuVirtualAddress; }
+    D3DGPU_VIRTUAL_ADDRESS &getReservedGpuVirtualAddressToModify() { return reservedGpuVirtualAddress; }
+    void setReservedGpuVirtualAddress(D3DGPU_VIRTUAL_ADDRESS reservedGpuVirtualAddress) { this->reservedGpuVirtualAddress = reservedGpuVirtualAddress; }
+    uint64_t getReservedSizeForGpuVirtualAddress() const { return reservedSizeForGpuVirtualAddress; }
+    void setReservedSizeForGpuVirtualAddress(uint64_t reservedSizeForGpuVirtualAddress) { this->reservedSizeForGpuVirtualAddress = reservedSizeForGpuVirtualAddress; }
+
+    uint64_t getNtSecureHandle() const { return ntSecureHandle; }
+    D3DKMT_HANDLE getResourceHandle() const { return resourceHandle; }
+    D3DKMT_HANDLE &getResourceHandleToModify() { return resourceHandle; }
+    void setResourceHandle(D3DKMT_HANDLE resourceHandle) { this->resourceHandle = resourceHandle; }
+
+    void *getSectionView() const { return sectionView; }
+    void setSectionView(void *sectionView) { this->sectionView = sectionView; }
+
+  protected:
     // OS assigned fields
-    D3DKMT_HANDLE resourceHandle = 0u; // used by shared resources
-    bool needsMakeResidentBeforeLock = false;
     D3DGPU_VIRTUAL_ADDRESS reservedGpuVirtualAddress = 0u;
     uint64_t reservedSizeForGpuVirtualAddress = 0u;
+    uint64_t ntSecureHandle = 0u;
+    std::string getHandleInfoString() const;
+
+    std::vector<D3DKMT_HANDLE> handles;
+    D3DKMT_HANDLE resourceHandle = 0u; // used by shared resources
+    void *sectionView = nullptr;
     uint32_t shareable = 0u;
     bool allocInFrontWindowPool = false;
     bool physicalMemoryReservation = false;
     bool mappedPhysicalMemoryReservation = false;
-
-  protected:
-    uint64_t ntSecureHandle = 0u;
-    std::string getHandleInfoString() const {
-        std::stringstream ss;
-        for (auto &handle : handles) {
-            ss << " Handle: " << handle;
-        }
-        return ss.str();
-    }
-    std::vector<size_t> trimCandidateListPositions;
-    StackVec<D3DKMT_HANDLE, EngineLimits::maxHandleCount> handles;
+    bool makeResidentBeforeLockRequired = false;
+    bool ipcSupportedAllocationByDefault = false;
 };
 } // namespace NEO

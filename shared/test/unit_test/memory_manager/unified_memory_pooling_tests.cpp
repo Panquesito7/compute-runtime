@@ -1,0 +1,2465 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/gfx_core_helper.h"
+#include "shared/source/memory_manager/pool_info.h"
+#include "shared/source/memory_manager/unified_memory_pooling.h"
+#include "shared/source/os_interface/os_context.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/engine_descriptor_helper.h"
+#include "shared/test/common/helpers/variable_backup.h"
+#include "shared/test/common/mocks/mock_allocation_properties.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/mocks/mock_memory_manager.h"
+#include "shared/test/common/mocks/mock_memory_operations_handler.h"
+#include "shared/test/common/mocks/mock_svm_manager.h"
+#include "shared/test/common/mocks/mock_usm_memory_pool.h"
+#include "shared/test/common/mocks/ult_device_factory.h"
+#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/test_macros/test_checks_shared.h"
+
+#include "gtest/gtest.h"
+
+#include <array>
+#include <functional>
+using namespace NEO;
+
+using UnifiedMemoryPoolingStaticTest = ::testing::Test;
+TEST_F(UnifiedMemoryPoolingStaticTest, givenUsmAllocPoolWhenCallingStaticMethodsThenReturnCorrectValues) {
+    EXPECT_EQ(0.08, UsmMemAllocPool::getPercentOfFreeMemoryForRecycling(InternalMemoryType::deviceUnifiedMemory));
+    EXPECT_EQ(0.02, UsmMemAllocPool::getPercentOfFreeMemoryForRecycling(InternalMemoryType::hostUnifiedMemory));
+    EXPECT_EQ(0.00, UsmMemAllocPool::getPercentOfFreeMemoryForRecycling(InternalMemoryType::sharedUnifiedMemory));
+
+    EXPECT_TRUE(UsmMemAllocPool::alignmentIsAllowed(UsmMemAllocPool::chunkAlignment / 2));
+    EXPECT_TRUE(UsmMemAllocPool::alignmentIsAllowed(UsmMemAllocPool::chunkAlignment));
+    EXPECT_TRUE(UsmMemAllocPool::alignmentIsAllowed(UsmMemAllocPool::chunkAlignment * 2));
+    EXPECT_TRUE(UsmMemAllocPool::alignmentIsAllowed(UsmMemAllocPool::poolAlignment));
+    EXPECT_FALSE(UsmMemAllocPool::alignmentIsAllowed(UsmMemAllocPool::poolAlignment * 2));
+
+    const RootDeviceIndicesContainer rootDeviceIndices;
+    const std::map<uint32_t, DeviceBitfield> deviceBitfields;
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+    EXPECT_TRUE(UsmMemAllocPool::flagsAreAllowed(unifiedMemoryProperties));
+    unifiedMemoryProperties.allocationFlags.allFlags = 1u;
+    unifiedMemoryProperties.allocationFlags.allAllocFlags = 0u;
+    EXPECT_FALSE(UsmMemAllocPool::flagsAreAllowed(unifiedMemoryProperties));
+    unifiedMemoryProperties.allocationFlags.allFlags = 0u;
+    unifiedMemoryProperties.allocationFlags.allAllocFlags = 1u;
+    EXPECT_FALSE(UsmMemAllocPool::flagsAreAllowed(unifiedMemoryProperties));
+    unifiedMemoryProperties.allocationFlags.allFlags = 0u;
+    unifiedMemoryProperties.allocationFlags.allAllocFlags = 0u;
+    unifiedMemoryProperties.allocationFlags.hostptr = 0x1u;
+    EXPECT_FALSE(UsmMemAllocPool::flagsAreAllowed(unifiedMemoryProperties));
+}
+
+using UnifiedMemoryPoolingTest = Test<SVMMemoryAllocatorFixture<true, 1u>>;
+
+TEST_F(UnifiedMemoryPoolingTest, givenUsmAllocPoolWhenCallingIsInitializedThenReturnCorrectValue) {
+    MockUsmMemAllocPool usmMemAllocPool;
+    EXPECT_FALSE(usmMemAllocPool.isInitialized());
+    EXPECT_EQ(0u, usmMemAllocPool.getPoolAddress());
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+    EXPECT_TRUE(usmMemAllocPool.initialize(svmManager.get(), unifiedMemoryProperties, 1 * MemoryConstants::megaByte, 0u, 1 * MemoryConstants::megaByte));
+    EXPECT_TRUE(usmMemAllocPool.isInitialized());
+    EXPECT_EQ(castToUint64(usmMemAllocPool.pool), usmMemAllocPool.getPoolAddress());
+
+    usmMemAllocPool.cleanup();
+    EXPECT_FALSE(usmMemAllocPool.isInitialized());
+    EXPECT_EQ(0u, usmMemAllocPool.getPoolAddress());
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(reinterpret_cast<void *>(0x1), FreePolicyType::blocking).freeSucceeded);
+    EXPECT_FALSE(usmMemAllocPool.addMemFreeCallback(reinterpret_cast<void *>(0x1), {nullptr, nullptr}));
+    EXPECT_TRUE(usmMemAllocPool.takeMemFreeCallbacks(reinterpret_cast<void *>(0x1)).empty());
+}
+
+TEST_F(UnifiedMemoryPoolingTest, givenPooledAllocationWhenAddingMemFreeCallbacksThenTheyAreTakenInRegistrationOrderAndEntryIsEmptied) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 1));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    MockUsmMemAllocPool usmMemAllocPool;
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+    ASSERT_TRUE(usmMemAllocPool.initialize(svmManager.get(), unifiedMemoryProperties, 2 * MemoryConstants::megaByte, 0u, 1 * MemoryConstants::megaByte));
+
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(1024u, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    auto callbackFunction = +[](void *) {};
+    int firstUserData = 0;
+    int secondUserData = 0;
+    EXPECT_TRUE(usmMemAllocPool.addMemFreeCallback(pooledPtr, {callbackFunction, &firstUserData}));
+    EXPECT_TRUE(usmMemAllocPool.addMemFreeCallback(ptrOffset(pooledPtr, 64u), {callbackFunction, &secondUserData}));
+    auto allocationInfo = usmMemAllocPool.allocations.get(pooledPtr);
+    ASSERT_NE(nullptr, allocationInfo);
+    EXPECT_EQ(2u, allocationInfo->memFreeCallbacks.size());
+
+    auto callbacks = usmMemAllocPool.takeMemFreeCallbacks(ptrOffset(pooledPtr, 128u));
+    ASSERT_EQ(2u, callbacks.size());
+    EXPECT_EQ(&firstUserData, callbacks[0].userData);
+    EXPECT_EQ(&secondUserData, callbacks[1].userData);
+    EXPECT_TRUE(allocationInfo->memFreeCallbacks.empty());
+
+    usmMemAllocPool.cleanup();
+}
+
+TEST_F(UnifiedMemoryPoolingTest, givenPointerThatIsNotAllocatedChunkWhenAddingMemFreeCallbackThenFalseIsReturnedAndNothingIsStored) {
+    std::unique_ptr<UltDeviceFactory> deviceFactory(new UltDeviceFactory(1, 1));
+    auto device = deviceFactory->rootDevices[0];
+    auto svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+
+    MockUsmMemAllocPool usmMemAllocPool;
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+    ASSERT_TRUE(usmMemAllocPool.initialize(svmManager.get(), unifiedMemoryProperties, 2 * MemoryConstants::megaByte, 0u, 1 * MemoryConstants::megaByte));
+
+    auto callbackFunction = +[](void *) {};
+    EXPECT_FALSE(usmMemAllocPool.addMemFreeCallback(reinterpret_cast<void *>(0x1), {callbackFunction, nullptr}));
+    EXPECT_TRUE(usmMemAllocPool.takeMemFreeCallbacks(reinterpret_cast<void *>(0x1)).empty());
+
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(1024u, unifiedMemoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::none).freeSucceeded);
+
+    EXPECT_FALSE(usmMemAllocPool.addMemFreeCallback(pooledPtr, {callbackFunction, nullptr}));
+    EXPECT_TRUE(usmMemAllocPool.takeMemFreeCallbacks(pooledPtr).empty());
+    EXPECT_EQ(nullptr, usmMemAllocPool.allocations.get(pooledPtr));
+
+    usmMemAllocPool.cleanup();
+}
+
+TEST_F(UnifiedMemoryPoolingTest, givenUsmPoolChunkAllocatorSizeThresholdSetWhenInitializingThenHeapAllocatorUsesGivenThreshold) {
+    struct HeapAllocatorThresholdReader : HeapAllocator {
+        using HeapAllocator::sizeThreshold;
+    };
+
+    DebugManagerStateRestore restorer;
+    const size_t maxServicedSize = 1 * MemoryConstants::megaByte;
+    const size_t overrideThreshold = 64 * MemoryConstants::kiloByte;
+
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+
+    {
+        MockUsmMemAllocPool defaultPool;
+        ASSERT_TRUE(defaultPool.initialize(svmManager.get(), unifiedMemoryProperties, 2 * MemoryConstants::megaByte, 0u, maxServicedSize));
+        EXPECT_EQ(maxServicedSize / 2, defaultPool.chunkAllocator.get()->*(&HeapAllocatorThresholdReader::sizeThreshold));
+        defaultPool.cleanup();
+    }
+
+    debugManager.flags.UsmPoolChunkAllocatorSizeThreshold.set(static_cast<int32_t>(overrideThreshold));
+
+    {
+        MockUsmMemAllocPool overriddenPool;
+        ASSERT_TRUE(overriddenPool.initialize(svmManager.get(), unifiedMemoryProperties, 2 * MemoryConstants::megaByte, 0u, maxServicedSize));
+        EXPECT_EQ(overrideThreshold, overriddenPool.chunkAllocator.get()->*(&HeapAllocatorThresholdReader::sizeThreshold));
+        overriddenPool.cleanup();
+    }
+}
+
+TEST_F(UnifiedMemoryPoolingTest, givenUsmAllocPoolWhenCallingResidencyOperationsThenTrackResidencyCounts) {
+    MockUsmMemAllocPool usmMemAllocPool;
+    const auto poolBase = addrToPtr(0xFF00u);
+    std::array<void *, 3> pooledPtrs = {poolBase, ptrOffset(poolBase, MemoryConstants::pageSize), ptrOffset(poolBase, 2 * MemoryConstants::pageSize)};
+
+    MockDevice mockDevice;
+    usmMemAllocPool.allocations.insert(pooledPtrs[0], UsmMemAllocPool::AllocationInfo{
+                                                          .address = castToUint64(pooledPtrs[0]),
+                                                          .size = MemoryConstants::pageSize,
+                                                          .requestedSize = MemoryConstants::pageSize,
+                                                          .isResident = decltype(UsmMemAllocPool::AllocationInfo::isResident){{&mockDevice, false}}});
+    auto firstInfo = usmMemAllocPool.allocations.get(pooledPtrs[0]);
+    ASSERT_NE(nullptr, firstInfo);
+    EXPECT_EQ(pooledPtrs[0], addrToPtr(firstInfo->address));
+
+    usmMemAllocPool.allocations.insert(pooledPtrs[1], UsmMemAllocPool::AllocationInfo{
+                                                          .address = castToUint64(pooledPtrs[1]),
+                                                          .size = MemoryConstants::pageSize,
+                                                          .requestedSize = MemoryConstants::pageSize,
+                                                          .isResident = decltype(UsmMemAllocPool::AllocationInfo::isResident){{&mockDevice, false}}});
+    auto secondInfo = usmMemAllocPool.allocations.get(pooledPtrs[1]);
+    ASSERT_NE(nullptr, secondInfo);
+    EXPECT_EQ(pooledPtrs[1], addrToPtr(secondInfo->address));
+
+    usmMemAllocPool.pool = pooledPtrs[0];
+    usmMemAllocPool.poolInfo.poolSize = 3 * MemoryConstants::pageSize;
+    usmMemAllocPool.poolEnd = ptrOffset(usmMemAllocPool.pool, usmMemAllocPool.poolInfo.poolSize);
+    auto mockMemoryOperationsHandler = static_cast<MockMemoryOperations *>(mockDevice.getRootDeviceEnvironment().memoryOperationsInterface.get());
+    mockMemoryOperationsHandler->captureGfxAllocationsForMakeResident = true;
+    usmMemAllocPool.device = &mockDevice;
+    usmMemAllocPool.enableResidencyTracking();
+    EXPECT_TRUE(usmMemAllocPool.trackResidency);
+    MockGraphicsAllocation mockGfxAlloc;
+    usmMemAllocPool.allocation = &mockGfxAlloc;
+    EXPECT_TRUE(usmMemAllocPool.isInitialized());
+
+    MockDevice mockPeerDevice;
+    MockGraphicsAllocation mockPeerGfxAlloc;
+    auto mockMemoryOperationsHandlerPeer = static_cast<MockMemoryOperations *>(mockPeerDevice.getRootDeviceEnvironment().memoryOperationsInterface.get());
+    mockMemoryOperationsHandlerPeer->captureGfxAllocationsForMakeResident = true;
+    auto expectedMakeResidentCountPeer = mockMemoryOperationsHandlerPeer->makeResidentCalledCount.load();
+    auto expectedEvictCountPeer = mockMemoryOperationsHandlerPeer->evictCalledCount.load();
+    // ptr in pool but not allocated -> error
+    const auto notAllocatedPtrInPool = pooledPtrs[2];
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(notAllocatedPtrInPool));
+    auto expectedMakeResidentCount = mockMemoryOperationsHandler->makeResidentCalledCount.load();
+    auto expectedEvictCount = mockMemoryOperationsHandler->evictCalledCount.load();
+    EXPECT_EQ(MemoryOperationsStatus::memoryNotFound, usmMemAllocPool.makeChunkResident(notAllocatedPtrInPool, &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::memoryNotFound, usmMemAllocPool.evictChunk(notAllocatedPtrInPool, &mockDevice));
+    EXPECT_EQ(MemoryOperationsStatus::memoryNotFound, usmMemAllocPool.makeChunkResident(notAllocatedPtrInPool, &mockPeerDevice, &mockPeerGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::memoryNotFound, usmMemAllocPool.evictChunk(notAllocatedPtrInPool, &mockPeerDevice));
+    EXPECT_EQ(expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+
+    ASSERT_EQ(0u, firstInfo->isResident.count(&mockPeerDevice));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[0], &mockPeerDevice));
+    EXPECT_EQ(expectedEvictCountPeer, mockMemoryOperationsHandlerPeer->evictCalledCount);
+    EXPECT_EQ(0u, firstInfo->isResident.count(&mockPeerDevice));
+
+    // ptr in pool, make resident -> make resident
+    EXPECT_FALSE(firstInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(++expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    auto expectResidencyCounts = [&]() {
+        EXPECT_EQ(expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+        EXPECT_EQ(expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+        EXPECT_EQ(expectedMakeResidentCountPeer, mockMemoryOperationsHandlerPeer->makeResidentCalledCount);
+        EXPECT_EQ(expectedEvictCountPeer, mockMemoryOperationsHandlerPeer->evictCalledCount);
+    };
+    mockMemoryOperationsHandlerPeer->makeResidentResult = MemoryOperationsStatus::failed;
+    EXPECT_EQ(MemoryOperationsStatus::failed, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockPeerDevice, &mockPeerGfxAlloc));
+    EXPECT_EQ(++expectedMakeResidentCountPeer, mockMemoryOperationsHandlerPeer->makeResidentCalledCount);
+    EXPECT_FALSE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residentPoolAllocations.count(&mockPeerDevice));
+    mockMemoryOperationsHandlerPeer->makeResidentResult = MemoryOperationsStatus::success;
+
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockPeerDevice, &mockPeerGfxAlloc));
+    EXPECT_EQ(++expectedMakeResidentCountPeer, mockMemoryOperationsHandlerPeer->makeResidentCalledCount);
+    EXPECT_EQ(expectedEvictCountPeer, mockMemoryOperationsHandlerPeer->evictCalledCount);
+    ASSERT_EQ(1u, mockMemoryOperationsHandler->gfxAllocationsForMakeResident.size());
+    EXPECT_EQ(&mockGfxAlloc, mockMemoryOperationsHandler->gfxAllocationsForMakeResident[0]);
+    ASSERT_EQ(1u, mockMemoryOperationsHandlerPeer->gfxAllocationsForMakeResident.size());
+    EXPECT_EQ(&mockPeerGfxAlloc, mockMemoryOperationsHandlerPeer->gfxAllocationsForMakeResident[0]);
+    EXPECT_EQ(&mockGfxAlloc, usmMemAllocPool.residentPoolAllocations[&mockDevice]);
+    EXPECT_EQ(&mockPeerGfxAlloc, usmMemAllocPool.residentPoolAllocations[&mockPeerDevice]);
+    EXPECT_TRUE(firstInfo->isResident[&mockDevice]);
+    EXPECT_TRUE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    // ptr in pool already resident -> skip
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockPeerDevice, &mockPeerGfxAlloc));
+    expectResidencyCounts();
+    EXPECT_TRUE(firstInfo->isResident[&mockDevice]);
+    EXPECT_TRUE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    // second ptr in pool make resident -> skip
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[1], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[1], &mockPeerDevice, &mockPeerGfxAlloc));
+    expectResidencyCounts();
+    EXPECT_TRUE(firstInfo->isResident[&mockDevice]);
+    EXPECT_TRUE(secondInfo->isResident[&mockDevice]);
+    EXPECT_TRUE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_TRUE(secondInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(2u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(2u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    // first ptr evict -> skip
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[0], &mockDevice));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[0], &mockPeerDevice));
+    expectResidencyCounts();
+    EXPECT_FALSE(firstInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_TRUE(secondInfo->isResident[&mockDevice]);
+    EXPECT_TRUE(secondInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    // second ptr evict -> evict
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[1], &mockDevice));
+    EXPECT_EQ(++expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_EQ(1u, mockMemoryOperationsHandlerPeer->gfxAllocationsForMakeResident.size());
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[1], &mockPeerDevice));
+    EXPECT_EQ(++expectedEvictCountPeer, mockMemoryOperationsHandlerPeer->evictCalledCount);
+    EXPECT_EQ(0u, mockMemoryOperationsHandler->gfxAllocationsForMakeResident.size());
+    EXPECT_EQ(0u, mockMemoryOperationsHandlerPeer->gfxAllocationsForMakeResident.size());
+    EXPECT_TRUE(usmMemAllocPool.residentPoolAllocations.empty());
+    EXPECT_EQ(expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_FALSE(firstInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    // evict already evicted ptr -> skip
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[1], &mockDevice));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[1], &mockPeerDevice));
+    expectResidencyCounts();
+    EXPECT_FALSE(firstInfo->isResident[&mockDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_FALSE(firstInfo->isResident[&mockPeerDevice]);
+    EXPECT_FALSE(secondInfo->isResident[&mockPeerDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    class MockHeapAllocator : public HeapAllocator {
+      public:
+        MockHeapAllocator() : HeapAllocator(0, 0) {};
+        void free(uint64_t ptr, size_t size) override {}
+    };
+    usmMemAllocPool.chunkAllocator = std::make_unique<MockHeapAllocator>();
+    MockSVMAllocsManager mockSvmManager(nullptr);
+    usmMemAllocPool.svmMemoryManager = &mockSvmManager;
+
+    usmMemAllocPool.allocations.insert(pooledPtrs[2], UsmMemAllocPool::AllocationInfo{
+                                                          .address = castToUint64(pooledPtrs[2]),
+                                                          .size = MemoryConstants::pageSize,
+                                                          .requestedSize = MemoryConstants::pageSize,
+                                                          .isResident = decltype(UsmMemAllocPool::AllocationInfo::isResident){{&mockDevice, false}}});
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[1], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[2], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(++expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[2], &mockPeerDevice, &mockPeerGfxAlloc));
+    EXPECT_EQ(++expectedMakeResidentCountPeer, mockMemoryOperationsHandlerPeer->makeResidentCalledCount);
+    EXPECT_EQ(expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+    ASSERT_FALSE(firstInfo->isResident[&mockDevice]);
+    ASSERT_TRUE(secondInfo->isResident[&mockDevice]);
+    auto thirdInfo = usmMemAllocPool.allocations.get(pooledPtrs[2]);
+    ASSERT_TRUE(thirdInfo->isResident[&mockDevice]);
+    ASSERT_TRUE(thirdInfo->isResident[&mockPeerDevice]);
+    ASSERT_EQ(2u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    ASSERT_EQ(1u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+
+    // free not resident chunk -> skip
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtrs[0], FreePolicyType::none).freeSucceeded);
+    EXPECT_EQ(expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    // free resident chunk while other chunk is resident -> skip
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtrs[1], FreePolicyType::none).freeSucceeded);
+    EXPECT_EQ(expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    // free last resident chunk -> evict
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtrs[2], FreePolicyType::none).freeSucceeded);
+    EXPECT_EQ(expectedMakeResidentCount, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(++expectedEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_EQ(++expectedEvictCountPeer, mockMemoryOperationsHandlerPeer->evictCalledCount);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockPeerDevice]);
+    EXPECT_EQ(0u, mockMemoryOperationsHandlerPeer->gfxAllocationsForMakeResident.size());
+    EXPECT_TRUE(usmMemAllocPool.residentPoolAllocations.empty());
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockDevice]);
+}
+
+TEST_F(UnifiedMemoryPoolingTest, givenUsmAllocPoolWithoutResidencyTrackingWhenCallingResidencyOperationsThenPoolIsMadeResidentOnEveryCallAndNeverEvicted) {
+    MockUsmMemAllocPool usmMemAllocPool;
+    const auto pooledPtr = addrToPtr(0xFF00u);
+    const auto notAllocatedPtrInPool = ptrOffset(pooledPtr, MemoryConstants::pageSize);
+    MockDevice mockDevice;
+    usmMemAllocPool.allocations.insert(pooledPtr, UsmMemAllocPool::AllocationInfo{
+                                                      .address = castToUint64(pooledPtr),
+                                                      .size = MemoryConstants::pageSize,
+                                                      .requestedSize = MemoryConstants::pageSize,
+                                                      .isResident = {}});
+    usmMemAllocPool.pool = pooledPtr;
+    usmMemAllocPool.poolInfo.poolSize = 2 * MemoryConstants::pageSize;
+    usmMemAllocPool.poolEnd = ptrOffset(usmMemAllocPool.pool, usmMemAllocPool.poolInfo.poolSize);
+    usmMemAllocPool.device = &mockDevice;
+    MockGraphicsAllocation mockGfxAlloc;
+    usmMemAllocPool.allocation = &mockGfxAlloc;
+    ASSERT_FALSE(usmMemAllocPool.trackResidency);
+    auto mockMemoryOperationsHandler = static_cast<MockMemoryOperations *>(mockDevice.getRootDeviceEnvironment().memoryOperationsInterface.get());
+    const auto initialMakeResidentCount = mockMemoryOperationsHandler->makeResidentCalledCount.load();
+    const auto initialEvictCount = mockMemoryOperationsHandler->evictCalledCount.load();
+
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtr, &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtr, &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtr, &mockDevice));
+    EXPECT_EQ(MemoryOperationsStatus::memoryNotFound, usmMemAllocPool.makeChunkResident(notAllocatedPtrInPool, &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::memoryNotFound, usmMemAllocPool.evictChunk(notAllocatedPtrInPool, &mockDevice));
+
+    EXPECT_EQ(initialMakeResidentCount + 2, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(initialEvictCount, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_TRUE(usmMemAllocPool.residencyCounts.empty());
+}
+
+TEST_F(UnifiedMemoryPoolingTest, givenPoolMakeResidentFailsWhenMakingChunkResidentThenResidencyIsNotRecordedAndNextCallRetries) {
+    MockUsmMemAllocPool usmMemAllocPool;
+    const auto pooledPtr = addrToPtr(0xFF00u);
+    MockDevice mockDevice;
+    usmMemAllocPool.allocations.insert(pooledPtr, UsmMemAllocPool::AllocationInfo{
+                                                      .address = castToUint64(pooledPtr),
+                                                      .size = MemoryConstants::pageSize,
+                                                      .requestedSize = MemoryConstants::pageSize,
+                                                      .isResident = {}});
+    usmMemAllocPool.pool = pooledPtr;
+    usmMemAllocPool.poolInfo.poolSize = MemoryConstants::pageSize;
+    usmMemAllocPool.poolEnd = ptrOffset(usmMemAllocPool.pool, usmMemAllocPool.poolInfo.poolSize);
+    usmMemAllocPool.device = &mockDevice;
+    MockGraphicsAllocation mockGfxAlloc;
+    usmMemAllocPool.allocation = &mockGfxAlloc;
+    usmMemAllocPool.enableResidencyTracking();
+    auto chunkInfo = usmMemAllocPool.allocations.get(pooledPtr);
+    ASSERT_NE(nullptr, chunkInfo);
+    auto mockMemoryOperationsHandler = static_cast<MockMemoryOperations *>(mockDevice.getRootDeviceEnvironment().memoryOperationsInterface.get());
+    const auto initialMakeResidentCount = mockMemoryOperationsHandler->makeResidentCalledCount.load();
+
+    mockMemoryOperationsHandler->makeResidentResult = MemoryOperationsStatus::outOfMemory;
+    EXPECT_EQ(MemoryOperationsStatus::outOfMemory, usmMemAllocPool.makeChunkResident(pooledPtr, &mockDevice, &mockGfxAlloc));
+    EXPECT_FALSE(chunkInfo->isResident[&mockDevice]);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockDevice]);
+
+    mockMemoryOperationsHandler->makeResidentResult = MemoryOperationsStatus::success;
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtr, &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(initialMakeResidentCount + 2, mockMemoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_TRUE(chunkInfo->isResident[&mockDevice]);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockDevice]);
+}
+
+struct ResidencyTrackingUnifiedMemoryPoolingTest : public UnifiedMemoryPoolingTest {
+    void SetUp() override {
+        UnifiedMemoryPoolingTest::SetUp();
+        for (auto ptr : pooledPtrs) {
+            usmMemAllocPool.allocations.insert(ptr, UsmMemAllocPool::AllocationInfo{
+                                                        .address = castToUint64(ptr),
+                                                        .size = MemoryConstants::pageSize,
+                                                        .requestedSize = MemoryConstants::pageSize});
+        }
+        usmMemAllocPool.pool = pooledPtrs[0];
+        usmMemAllocPool.poolInfo.poolSize = pooledPtrs.size() * MemoryConstants::pageSize;
+        usmMemAllocPool.poolEnd = ptrOffset(usmMemAllocPool.pool, usmMemAllocPool.poolInfo.poolSize);
+        usmMemAllocPool.device = &mockDevice;
+        usmMemAllocPool.allocation = &mockGfxAlloc;
+        usmMemAllocPool.enableResidencyTracking();
+        memoryOperationsHandler = static_cast<MockMemoryOperations *>(mockDevice.getRootDeviceEnvironment().memoryOperationsInterface.get());
+        memoryOperationsHandler->captureGfxAllocationsForMakeResident = true;
+    }
+
+    const std::array<void *, 2> pooledPtrs = {addrToPtr(0xFF000u), addrToPtr(0xFF000u + MemoryConstants::pageSize)};
+    MockUsmMemAllocPool usmMemAllocPool;
+    MockDevice mockDevice;
+    MockGraphicsAllocation mockGfxAlloc;
+    MockMemoryOperations *memoryOperationsHandler = nullptr;
+};
+
+TEST_F(ResidencyTrackingUnifiedMemoryPoolingTest, givenTwoResidentChunksWhenEvictingThemThenExplicitResidencyOfPoolIsReleasedOnlyAfterTheLastOne) {
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[1], &mockDevice, &mockGfxAlloc));
+
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[0], &mockDevice));
+    EXPECT_EQ(0, memoryOperationsHandler->releaseExplicitResidencyCalledCount);
+
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.evictChunk(pooledPtrs[1], &mockDevice));
+    EXPECT_EQ(1, memoryOperationsHandler->releaseExplicitResidencyCalledCount);
+    EXPECT_EQ(0u, usmMemAllocPool.residentPoolAllocations.count(&mockDevice));
+}
+
+TEST_F(ResidencyTrackingUnifiedMemoryPoolingTest, givenResidentPoolWhenMakingAnotherChunkResidentThenPoolIsNotMadeResidentAgain) {
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[0], &mockDevice, &mockGfxAlloc));
+    const auto makeResidentCount = memoryOperationsHandler->makeResidentCalledCount.load();
+
+    EXPECT_EQ(MemoryOperationsStatus::success, usmMemAllocPool.makeChunkResident(pooledPtrs[1], &mockDevice, &mockGfxAlloc));
+    EXPECT_EQ(makeResidentCount, memoryOperationsHandler->makeResidentCalledCount);
+    EXPECT_EQ(2u, usmMemAllocPool.residencyCounts[&mockDevice]);
+}
+
+template <InternalMemoryType poolMemoryType, bool failAllocation>
+class InitializedUnifiedMemoryPoolingTest : public UnifiedMemoryPoolingTest {
+  public:
+    void SetUp() override {
+        UnifiedMemoryPoolingTest::setUp();
+        EXPECT_FALSE(usmMemAllocPool.isInitialized());
+
+        memoryManager->failInDevicePoolWithError = failAllocation;
+
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(poolMemoryType, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+        if constexpr (InternalMemoryType::deviceUnifiedMemory == poolMemoryType) {
+            deviceFactory = std::make_unique<UltDeviceFactory>(1, 1, executionEnvironment);
+            executionEnvironment.incRefInternal();
+            device = deviceFactory->rootDevices[0];
+            poolMemoryProperties->device = device;
+        }
+        ASSERT_EQ(!failAllocation, usmMemAllocPool.initialize(svmManager.get(), *poolMemoryProperties.get(), poolSize, 0u, poolAllocationThreshold));
+    }
+    void TearDown() override {
+        usmMemAllocPool.cleanup();
+        UnifiedMemoryPoolingTest::tearDown();
+    }
+
+    UnifiedMemoryProperties makeHostProperties() {
+        return UnifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+    }
+
+    const size_t poolSize = 2 * MemoryConstants::megaByte;
+    MockUsmMemAllocPool usmMemAllocPool;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    Device *device = nullptr;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+    constexpr static auto poolAllocationThreshold = 1 * MemoryConstants::megaByte;
+};
+
+using InitializedDeviceUnifiedMemoryPoolingTest = InitializedUnifiedMemoryPoolingTest<InternalMemoryType::deviceUnifiedMemory, false>;
+TEST_F(InitializedDeviceUnifiedMemoryPoolingTest, givenDevicePoolWhenInitializedThenFieldsRequiredForResidencyOperationsSet) {
+    EXPECT_EQ(device, usmMemAllocPool.device);
+    auto poolGfxAllocation = svmManager->getSVMAlloc(usmMemAllocPool.pool)->gpuAllocations.getGraphicsAllocation(device->getRootDeviceIndex());
+    EXPECT_EQ(poolGfxAllocation, usmMemAllocPool.allocation);
+}
+
+using InitializedHostUnifiedMemoryPoolingTest = InitializedUnifiedMemoryPoolingTest<InternalMemoryType::hostUnifiedMemory, false>;
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenDifferentAllocationSizesWhenCallingCanBePooledThenCorrectValueIsReturned) {
+    auto memoryProperties = makeHostProperties();
+    EXPECT_TRUE(usmMemAllocPool.canBePooled(poolAllocationThreshold, memoryProperties));
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold + 1, memoryProperties));
+
+    memoryProperties.memoryType = InternalMemoryType::sharedUnifiedMemory;
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold, memoryProperties));
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold + 1, memoryProperties));
+
+    memoryProperties.memoryType = InternalMemoryType::deviceUnifiedMemory;
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold, memoryProperties));
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold + 1, memoryProperties));
+
+    memoryProperties.memoryType = InternalMemoryType::hostUnifiedMemory;
+    memoryProperties.allocationFlags.allFlags = 1u;
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold, memoryProperties));
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold + 1, memoryProperties));
+
+    memoryProperties.allocationFlags.allFlags = 0u;
+    memoryProperties.allocationFlags.allAllocFlags = 1u;
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold, memoryProperties));
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold + 1, memoryProperties));
+
+    memoryProperties.allocationFlags.allAllocFlags = 0u;
+    constexpr auto notAllowedAlignment = UsmMemAllocPool::poolAlignment * 2;
+    memoryProperties.alignment = notAllowedAlignment;
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold, memoryProperties));
+    EXPECT_FALSE(usmMemAllocPool.canBePooled(poolAllocationThreshold + 1, memoryProperties));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenVariousPointersWhenCallingIsInPoolAndGetOffsetInPoolThenCorrectValuesAreReturned) {
+    void *ptrBeforePool = reinterpret_cast<void *>(reinterpret_cast<size_t>(usmMemAllocPool.pool) - 1);
+    void *lastPtrInPool = reinterpret_cast<void *>(reinterpret_cast<size_t>(usmMemAllocPool.poolEnd) - 1);
+
+    EXPECT_FALSE(usmMemAllocPool.isInPoolRange(ptrBeforePool));
+    EXPECT_EQ(0u, usmMemAllocPool.getOffsetInPool(ptrBeforePool));
+
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(usmMemAllocPool.pool));
+    EXPECT_EQ(0u, usmMemAllocPool.getOffsetInPool(usmMemAllocPool.pool));
+
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(lastPtrInPool));
+    EXPECT_EQ(ptrDiff(lastPtrInPool, usmMemAllocPool.pool), usmMemAllocPool.getOffsetInPool(lastPtrInPool));
+
+    EXPECT_FALSE(usmMemAllocPool.isInPoolRange(usmMemAllocPool.poolEnd));
+    EXPECT_EQ(0u, usmMemAllocPool.getOffsetInPool(usmMemAllocPool.poolEnd));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenAlignmentsWhenCallingAlignmentIsAllowedThenCorrectValueIsReturned) {
+    EXPECT_TRUE(usmMemAllocPool.alignmentIsAllowed(UsmMemAllocPool::chunkAlignment / 2));
+    EXPECT_TRUE(usmMemAllocPool.alignmentIsAllowed(UsmMemAllocPool::chunkAlignment));
+    EXPECT_TRUE(usmMemAllocPool.alignmentIsAllowed(UsmMemAllocPool::chunkAlignment * 2));
+    EXPECT_TRUE(usmMemAllocPool.alignmentIsAllowed(UsmMemAllocPool::poolAlignment));
+    EXPECT_FALSE(usmMemAllocPool.alignmentIsAllowed(UsmMemAllocPool::poolAlignment * 2));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPoolableAllocationWhenUsingPoolThenAllocationIsPooledUnlessPoolIsFull) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = poolAllocationThreshold;
+    const auto allocationSizeAboveThreshold = allocationSize + 1;
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(allocationSizeAboveThreshold, memoryProperties));
+    EXPECT_EQ(nullptr, usmMemAllocPool.allocations.get(reinterpret_cast<void *>(0x1)));
+
+    auto allocFromPool = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    EXPECT_NE(nullptr, allocFromPool);
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(allocFromPool));
+    auto allocationInfo = usmMemAllocPool.allocations.get(allocFromPool);
+    EXPECT_NE(nullptr, allocationInfo);
+    EXPECT_EQ(allocationSize, allocationInfo->size);
+
+    auto svmData = svmManager->getSVMAlloc(allocFromPool);
+    auto poolSvmData = svmManager->getSVMAlloc(usmMemAllocPool.pool);
+    EXPECT_EQ(svmData, poolSvmData);
+
+    const auto allocationsToFillPool = poolSize / allocationSize;
+    for (auto i = 1u; i < allocationsToFillPool; ++i) {
+        // exhaust pool
+        EXPECT_NE(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties));
+    }
+
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(1, memoryProperties));
+
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(reinterpret_cast<void *>(0x1), FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(ptrOffset(allocFromPool, 1u), FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(ptrOffset(allocFromPool, 1u), FreePolicyType::none).freeSucceeded);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(allocFromPool, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(1u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(allocFromPool, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(1u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_EQ(nullptr, usmMemAllocPool.allocations.get(reinterpret_cast<void *>(0x1)));
+    EXPECT_EQ(nullptr, usmMemAllocPool.allocations.extract(reinterpret_cast<void *>(0x1)));
+
+    EXPECT_NE(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPoolWithLiveChunksWhenFreeingOneChunkThenPoolNowEmptyIsFalse) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto firstAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    auto secondAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, firstAlloc);
+    ASSERT_NE(nullptr, secondAlloc);
+
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(firstAlloc, FreePolicyType::blocking).poolNowEmpty);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPoolWithSingleChunkWhenFreeingItThenPoolNowEmptyIsTrue) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto allocFromPool = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, allocFromPool);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(allocFromPool, FreePolicyType::blocking).poolNowEmpty);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenExportedChunkWhenFreeingItThenChunkIsNotReusedAndPoolNowEmptyIsTrue) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto exportedAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, exportedAlloc);
+    usmMemAllocPool.markChunkExported(exportedAlloc);
+    EXPECT_TRUE(usmMemAllocPool.allocationData->isExportedAllocation);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(exportedAlloc, FreePolicyType::blocking).poolNowEmpty);
+
+    auto nextAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, nextAlloc);
+    EXPECT_NE(exportedAlloc, nextAlloc);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenInteriorPointerOfChunkWhenMarkingItExportedThenChunkIsNotReused) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto exportedAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, exportedAlloc);
+    usmMemAllocPool.markChunkExported(ptrOffset(exportedAlloc, allocationSize / 2));
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(exportedAlloc, FreePolicyType::blocking).freeSucceeded);
+
+    auto nextAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, nextAlloc);
+    EXPECT_NE(exportedAlloc, nextAlloc);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenFreedChunkWhenMarkingItExportedThenPoolIsNotMarkedExportedAndChunkIsReused) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto freedAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, freedAlloc);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(freedAlloc, FreePolicyType::blocking).freeSucceeded);
+
+    usmMemAllocPool.markChunkExported(freedAlloc);
+    EXPECT_FALSE(usmMemAllocPool.allocationData->isExportedAllocation);
+
+    EXPECT_EQ(freedAlloc, usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPointerNotFromPoolWhenFreeingThenFreeSucceededAndPoolNowEmptyAreFalse) {
+    ASSERT_TRUE(usmMemAllocPool.isEmpty());
+    const auto bogusPtr = reinterpret_cast<void *>(0x1);
+
+    const auto result = usmMemAllocPool.freeSVMAlloc(bogusPtr, FreePolicyType::blocking);
+    EXPECT_FALSE(result.freeSucceeded);
+    EXPECT_FALSE(result.poolNowEmpty);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenVariousAlignmentsWhenUsingPoolThenAddressIsAligned) {
+    UnifiedMemoryProperties memoryProperties(InternalMemoryType::hostUnifiedMemory, 0u, rootDeviceIndices, deviceBitfields);
+    const auto allocationSize = poolAllocationThreshold;
+
+    std::array<size_t, 8> alignmentsToCheck = {UsmMemAllocPool::chunkAlignment,
+                                               UsmMemAllocPool::chunkAlignment * 2,
+                                               UsmMemAllocPool::chunkAlignment * 4,
+                                               UsmMemAllocPool::chunkAlignment * 8,
+                                               UsmMemAllocPool::chunkAlignment * 16,
+                                               UsmMemAllocPool::chunkAlignment * 32,
+                                               UsmMemAllocPool::chunkAlignment * 64,
+                                               UsmMemAllocPool::chunkAlignment * 128};
+    auto expectedWaitForEnginesCompletionCalled = 0u;
+    EXPECT_EQ(expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+    for (const auto &alignment : alignmentsToCheck) {
+        if (alignment > poolAllocationThreshold) {
+            break;
+        }
+        memoryProperties.alignment = alignment;
+        auto allocFromPool = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+        EXPECT_NE(nullptr, allocFromPool);
+        EXPECT_TRUE(usmMemAllocPool.isInPoolRange(allocFromPool));
+        auto address = castToUint64(allocFromPool);
+        EXPECT_EQ(0u, address % alignment);
+
+        EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(allocFromPool, FreePolicyType::blocking).freeSucceeded);
+        EXPECT_EQ(++expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+    }
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPoolableAllocationWhenGettingSizeAndBasePtrThenCorrectValuesAreReturned) {
+    const auto bogusPtr = reinterpret_cast<void *>(0x1);
+    const auto emptyPoolBogusLookup = usmMemAllocPool.lookupAlloc(bogusPtr);
+    EXPECT_EQ(nullptr, emptyPoolBogusLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(0u, emptyPoolBogusLookup.pooledAllocationSize);
+
+    const auto ptrInPoolButNotAllocated = usmMemAllocPool.pool;
+    const auto emptyPoolBaseLookup = usmMemAllocPool.lookupAlloc(ptrInPoolButNotAllocated);
+    EXPECT_EQ(nullptr, emptyPoolBaseLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(0u, emptyPoolBaseLookup.pooledAllocationSize);
+
+    auto memoryProperties = makeHostProperties();
+    const auto requestedAllocSize = 1 * MemoryConstants::kiloByte;
+    EXPECT_GT(poolAllocationThreshold, requestedAllocSize + usmMemAllocPool.chunkAlignment);
+
+    // we want an allocation from the middle of the pool for testing
+    auto unusedAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(requestedAllocSize, memoryProperties);
+    EXPECT_NE(nullptr, unusedAlloc);
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(unusedAlloc));
+    auto allocFromPool = usmMemAllocPool.createUnifiedMemoryAllocation(requestedAllocSize, memoryProperties);
+    EXPECT_NE(nullptr, allocFromPool);
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(allocFromPool));
+    auto allocInfo = usmMemAllocPool.allocations.get(allocFromPool);
+    EXPECT_NE(nullptr, allocInfo);
+    auto actualAllocSize = allocInfo->size;
+    EXPECT_GE(actualAllocSize, requestedAllocSize);
+
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(unusedAlloc, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(1u, memoryManager->waitForEnginesCompletionCalled);
+
+    auto offsetPointer = ptrOffset(allocFromPool, actualAllocSize - 1);
+    auto pastEndPointer = ptrOffset(allocFromPool, actualAllocSize);
+
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(offsetPointer));
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(pastEndPointer));
+
+    const auto bogusLookup = usmMemAllocPool.lookupAlloc(bogusPtr);
+    EXPECT_EQ(0u, bogusLookup.pooledAllocationSize);
+    EXPECT_EQ(nullptr, bogusLookup.pooledAllocationBasePtr);
+
+    const auto poolBaseLookup = usmMemAllocPool.lookupAlloc(usmMemAllocPool.pool);
+    EXPECT_EQ(0u, poolBaseLookup.pooledAllocationSize);
+    EXPECT_EQ(nullptr, poolBaseLookup.pooledAllocationBasePtr);
+
+    const auto allocLookup = usmMemAllocPool.lookupAlloc(allocFromPool);
+    EXPECT_EQ(requestedAllocSize, allocLookup.pooledAllocationSize);
+    EXPECT_EQ(allocFromPool, allocLookup.pooledAllocationBasePtr);
+
+    const auto offsetLookup = usmMemAllocPool.lookupAlloc(offsetPointer);
+    EXPECT_EQ(requestedAllocSize, offsetLookup.pooledAllocationSize);
+    EXPECT_EQ(allocFromPool, offsetLookup.pooledAllocationBasePtr);
+
+    const auto pastEndLookup = usmMemAllocPool.lookupAlloc(pastEndPointer);
+    EXPECT_EQ(0u, pastEndLookup.pooledAllocationSize);
+    EXPECT_EQ(nullptr, pastEndLookup.pooledAllocationBasePtr);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenChunkReallocatedAtSameAddressWhenLookingUpAllocThenEachChunkHasOwnAllocationId) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto firstAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, firstAlloc);
+    const auto firstAllocId = usmMemAllocPool.getChunkAllocId(firstAlloc);
+    EXPECT_EQ(svmManager->allocationsCounter.load(), firstAllocId);
+    EXPECT_NE(svmManager->getSVMAlloc(firstAlloc)->getAllocId(), firstAllocId);
+    EXPECT_EQ(firstAllocId, svmManager->getSVMAlloc(firstAlloc)->getAllocId(firstAlloc));
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(firstAlloc, FreePolicyType::none).freeSucceeded);
+    auto secondAlloc = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_EQ(firstAlloc, secondAlloc);
+    const auto secondAllocId = usmMemAllocPool.getChunkAllocId(secondAlloc);
+    EXPECT_EQ(svmManager->allocationsCounter.load(), secondAllocId);
+    EXPECT_NE(firstAllocId, secondAllocId);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(secondAlloc, FreePolicyType::none).freeSucceeded);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenInteriorPointerOfChunkWhenGettingChunkAllocIdThenChunkAllocIdIsReturned) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 4 * MemoryConstants::kiloByte;
+
+    auto chunk = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, chunk);
+    const auto chunkAllocId = usmMemAllocPool.getChunkAllocId(chunk);
+    EXPECT_NE(0u, chunkAllocId);
+    EXPECT_EQ(chunkAllocId, usmMemAllocPool.getChunkAllocId(ptrOffset(chunk, allocationSize - 1)));
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(chunk, FreePolicyType::none).freeSucceeded);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenFreedChunkAboveLiveChunkWhenGettingChunkAllocIdThenZeroIsReturned) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto firstChunk = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    auto secondChunk = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    ASSERT_NE(nullptr, firstChunk);
+    ASSERT_NE(nullptr, secondChunk);
+    auto lowerChunk = std::min(firstChunk, secondChunk);
+    auto higherChunk = std::max(firstChunk, secondChunk);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(higherChunk, FreePolicyType::none).freeSucceeded);
+    EXPECT_EQ(0u, usmMemAllocPool.getChunkAllocId(higherChunk));
+    EXPECT_NE(0u, usmMemAllocPool.getChunkAllocId(lowerChunk));
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(lowerChunk, FreePolicyType::none).freeSucceeded);
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenEmptyPoolWhenGettingChunkAllocIdAtPoolStartThenZeroIsReturned) {
+    EXPECT_EQ(0u, usmMemAllocPool.getChunkAllocId(usmMemAllocPool.pool));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPoolWhenCleanedUpThenPoolAllocationDataNoLongerPointsToPool) {
+    auto poolPtr = usmMemAllocPool.pool;
+    auto poolAllocationData = svmManager->getSVMAlloc(poolPtr);
+    ASSERT_NE(nullptr, poolAllocationData);
+    EXPECT_EQ(&usmMemAllocPool, poolAllocationData->usmPool);
+
+    svmManager->freeSVMAllocImplCallBase = false;
+    usmMemAllocPool.cleanup();
+    EXPECT_EQ(nullptr, poolAllocationData->usmPool);
+
+    svmManager->freeSVMAllocImplCallBase = true;
+    EXPECT_TRUE(svmManager->freeSVMAlloc(poolPtr));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenAllocationOutsidePoolWhenGettingAllocIdForPointerThenAllocationIdIsReturned) {
+    auto memoryProperties = makeHostProperties();
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(poolAllocationThreshold + 1, memoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    auto allocationData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocationData);
+    EXPECT_EQ(nullptr, allocationData->usmPool);
+    EXPECT_EQ(allocationData->getAllocId(), allocationData->getAllocId(ptr));
+
+    EXPECT_TRUE(svmManager->freeSVMAlloc(ptr));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenChunkWhenCheckingExistedAtCounterThenCountersFromBeforeChunkAllocationDoNotMatch) {
+    auto memoryProperties = makeHostProperties();
+    const auto counterBeforeChunk = svmManager->allocationsCounter.load();
+    auto chunk = usmMemAllocPool.createUnifiedMemoryAllocation(1 * MemoryConstants::kiloByte, memoryProperties);
+    ASSERT_NE(nullptr, chunk);
+    const auto counterAfterChunk = svmManager->allocationsCounter.load();
+    auto poolAllocationData = svmManager->getSVMAlloc(chunk);
+    ASSERT_NE(nullptr, poolAllocationData);
+
+    EXPECT_FALSE(poolAllocationData->existedAtCounter(chunk, counterBeforeChunk));
+    EXPECT_TRUE(poolAllocationData->existedAtCounter(chunk, counterAfterChunk));
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(chunk, FreePolicyType::none).freeSucceeded);
+    EXPECT_FALSE(poolAllocationData->existedAtCounter(chunk, counterAfterChunk));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenAllocationOutsidePoolWhenCheckingExistedAtCounterThenItsAllocIdIsCompared) {
+    auto memoryProperties = makeHostProperties();
+    const auto counterBeforeAllocation = svmManager->allocationsCounter.load();
+    auto ptr = svmManager->createHostUnifiedMemoryAllocation(poolAllocationThreshold + 1, memoryProperties);
+    ASSERT_NE(nullptr, ptr);
+    auto allocationData = svmManager->getSVMAlloc(ptr);
+    ASSERT_NE(nullptr, allocationData);
+
+    EXPECT_FALSE(allocationData->existedAtCounter(ptr, counterBeforeAllocation));
+    EXPECT_TRUE(allocationData->existedAtCounter(ptr, allocationData->getAllocId()));
+
+    EXPECT_TRUE(svmManager->freeSVMAlloc(ptr));
+}
+
+TEST_F(InitializedHostUnifiedMemoryPoolingTest, givenPointersWithDifferentOwnershipWhenCallingFreeIfOwnedAndIsPooledAllocationThenOwnershipIsRespected) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = 1 * MemoryConstants::kiloByte;
+
+    auto allocFromPool = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    EXPECT_NE(nullptr, allocFromPool);
+    EXPECT_TRUE(usmMemAllocPool.lookupAlloc(allocFromPool).isAllocatedInPool());
+
+    const auto ptrInPoolButNotAllocated = usmMemAllocPool.pool;
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(ptrInPoolButNotAllocated));
+    EXPECT_FALSE(usmMemAllocPool.lookupAlloc(ptrInPoolButNotAllocated).isAllocatedInPool());
+
+    const auto ptrOutsidePool = reinterpret_cast<void *>(0x1);
+    EXPECT_FALSE(usmMemAllocPool.isInPoolRange(ptrOutsidePool));
+
+    // null pool is never the owner
+    EXPECT_FALSE(UsmMemAllocPool::freeIfOwned(nullptr, allocFromPool, FreePolicyType::none));
+
+    // ptr outside the pool is not owned, nothing is freed
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_FALSE(UsmMemAllocPool::freeIfOwned(&usmMemAllocPool, ptrOutsidePool, FreePolicyType::blocking));
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_TRUE(usmMemAllocPool.lookupAlloc(allocFromPool).isAllocatedInPool());
+
+    // owned ptr is freed, blocking path waits for engines
+    EXPECT_TRUE(UsmMemAllocPool::freeIfOwned(&usmMemAllocPool, allocFromPool, FreePolicyType::blocking));
+    EXPECT_EQ(1u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_FALSE(usmMemAllocPool.lookupAlloc(allocFromPool).isAllocatedInPool());
+}
+
+// Registers an engine in the memory manager the pool allocates from, and lets a test drive
+// that engine's completion tag. The engine must exist before the pool allocation is created,
+// so that the allocation has room to track this context's task count.
+struct UsmPoolCompletionControl {
+    void setUpCompletionControl(MockExecutionEnvironment &executionEnvironment, MockMemoryManager &memoryManager, const DeviceBitfield &deviceBitfield) {
+        // ~CommandStreamReceiver unregisters itself through executionEnvironment.memoryManager,
+        // which MockExecutionEnvironment leaves empty unless a device was created. Point it at
+        // the given memory manager and hand ownership back in tearDown.
+        this->ownerExecutionEnvironment = &executionEnvironment;
+        this->borrowedMemoryManager = nullptr == executionEnvironment.memoryManager.get();
+        if (this->borrowedMemoryManager) {
+            executionEnvironment.memoryManager.reset(&memoryManager);
+        }
+
+        csr = std::make_unique<MockCommandStreamReceiver>(executionEnvironment, 0u, deviceBitfield);
+        auto osContext = memoryManager.createAndRegisterOsContext(csr.get(), EngineDescriptorHelper::getDefaultDescriptor());
+        csr->setupContext(*osContext);
+        *csr->tagAddress = completedTaskCount;
+    }
+
+    void tearDownCompletionControl() {
+        // destroy the csr while its memory manager is still reachable, then hand ownership back
+        csr.reset();
+        if (this->borrowedMemoryManager) {
+            [[maybe_unused]] auto unownedMemoryManager = this->ownerExecutionEnvironment->memoryManager.release();
+        }
+    }
+
+    void markUsedByGpu(GraphicsAllocation *allocation, TaskCountType taskCount) {
+        allocation->updateTaskCount(taskCount, csr->getOsContext().getContextId());
+    }
+
+    void signalCompletion(TaskCountType taskCount) {
+        *csr->tagAddress = taskCount;
+    }
+
+    static constexpr TaskCountType completedTaskCount = 10u;
+    MockExecutionEnvironment *ownerExecutionEnvironment = nullptr;
+    std::unique_ptr<MockCommandStreamReceiver> csr;
+    bool borrowedMemoryManager = false;
+};
+
+struct DeferredFreeUnifiedMemoryPoolingTest : public UnifiedMemoryPoolingTest, public UsmPoolCompletionControl {
+    void SetUp() override {
+        UnifiedMemoryPoolingTest::setUp();
+        setUpCompletionControl(executionEnvironment, *memoryManager, deviceBitfields.at(0u));
+
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M,
+                                                                         rootDeviceIndices, deviceBitfields);
+        ASSERT_TRUE(usmMemAllocPool.initialize(svmManager.get(), *poolMemoryProperties, poolSize, 0u, poolAllocationThreshold));
+
+        poolGraphicsAllocation = svmManager->getSVMAlloc(usmMemAllocPool.pool)->gpuAllocations.getGraphicsAllocation(0u);
+        ASSERT_NE(nullptr, poolGraphicsAllocation);
+        svmManager->maxLatestResidentObjectId = svmManager->getSVMAlloc(usmMemAllocPool.pool)->getAllocId();
+    }
+
+    void TearDown() override {
+        usmMemAllocPool.cleanup();
+        tearDownCompletionControl();
+        UnifiedMemoryPoolingTest::tearDown();
+    }
+
+    UnifiedMemoryProperties makeHostProperties() {
+        return UnifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+    }
+
+    void markPoolUsedByGpu(TaskCountType taskCount) {
+        markUsedByGpu(poolGraphicsAllocation, taskCount);
+    }
+
+    // Allocates until the pool has no room left, so that the only space a later
+    // allocation can come from is a reclaimed chunk.
+    std::vector<void *> fillPool(size_t allocationSize) {
+        auto memoryProperties = makeHostProperties();
+        std::vector<void *> allocations;
+        while (auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties)) {
+            allocations.push_back(pooledPtr);
+            EXPECT_GT(maxAllocationsToFillPool, allocations.size()) << "pool did not run out of space";
+            if (allocations.size() >= maxAllocationsToFillPool) {
+                break;
+            }
+        }
+        EXPECT_FALSE(allocations.empty());
+        return allocations;
+    }
+
+    static constexpr size_t maxAllocationsToFillPool = 128u;
+    static constexpr size_t poolSize = 2 * MemoryConstants::megaByte;
+    static constexpr size_t poolAllocationThreshold = 1 * MemoryConstants::megaByte;
+    const size_t chunkSize = poolAllocationThreshold / 2;
+    MockUsmMemAllocPool usmMemAllocPool;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+    GraphicsAllocation *poolGraphicsAllocation = nullptr;
+};
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenDeferFreePolicyWhenChunkIsUsedByGpuThenChunkIsNotReusedUntilWorkCompletes) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+
+    // chunk is no longer a pooled allocation, but its space is withheld from the allocator
+    EXPECT_FALSE(usmMemAllocPool.lookupAlloc(deferFreedPtr).isAllocatedInPool());
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    *csr->tagAddress = completedTaskCount + 1;
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenExportedChunkDeferFreedWhileUsedByGpuWhenWorkCompletesThenChunkIsNotReused) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto exportedPtr = pooledPtrs[0];
+    usmMemAllocPool.markChunkExported(exportedPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(exportedPtr, FreePolicyType::defer).freeSucceeded);
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+
+    *csr->tagAddress = completedTaskCount + 1;
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenDeferFreePolicyWhenGpuWorkAlreadyCompletedThenChunkIsReclaimedImmediately) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    markPoolUsedByGpu(completedTaskCount);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolWithDeferFreedChunkWhenCheckingIsEmptyThenPoolIsNotEmptyUntilChunkIsReclaimed) {
+    auto memoryProperties = makeHostProperties();
+    auto firstPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    auto secondPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, firstPtr);
+    ASSERT_NE(nullptr, secondPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(firstPtr, FreePolicyType::defer).freeSucceeded);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(secondPtr, FreePolicyType::none).freeSucceeded);
+    EXPECT_FALSE(usmMemAllocPool.isEmpty());
+
+    signalCompletion(completedTaskCount + 1);
+    auto thirdPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, thirdPtr);
+    // an allocation served from free space does not reclaim, completion polling stays off that path
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(thirdPtr, FreePolicyType::none).freeSucceeded);
+    EXPECT_TRUE(usmMemAllocPool.isEmpty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenLastChunkFreedWithDeferPolicyWhenChunkHasNotRetiredThenPoolNowEmptyIsFalse) {
+    auto memoryProperties = makeHostProperties();
+    auto deferFreedPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, deferFreedPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).poolNowEmpty);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenDeferredChunkRetiredWhenFreeingLastLiveChunkThenPoolNowEmptyIsTrue) {
+    auto memoryProperties = makeHostProperties();
+    auto firstPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    auto secondPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, firstPtr);
+    ASSERT_NE(nullptr, secondPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(firstPtr, FreePolicyType::defer).poolNowEmpty);
+
+    signalCompletion(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(secondPtr, FreePolicyType::none).poolNowEmpty);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenMultiplePartitionsWhenLaterPartitionIsBehindSnapshotThenChunkIsNotReclaimed) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    csr->setActivePartitions(2u);
+    csr->immWritePostSyncWriteOffset = static_cast<uint32_t>(sizeof(TagAddressType));
+    csr->tagAddress[0] = completedTaskCount;
+    csr->tagAddress[1] = completedTaskCount;
+    markPoolUsedByGpu(completedTaskCount + 1);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    ASSERT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+
+    // first partition is done, the second one still holds the chunk
+    csr->tagAddress[0] = completedTaskCount + 1;
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+
+    csr->tagAddress[1] = completedTaskCount + 1;
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolWithDeferFreedChunkWhenCleaningUpThenPoolAllocationIsDeferFreedWithoutWaiting) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::defer).freeSucceeded);
+    ASSERT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(0u, svmManager->applyIndirectAccessTaskCountFloorCalled);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    ASSERT_EQ(0u, svmManager->getNumDeferFreeAllocs());
+
+    memoryManager->deferAllocInUse = true;
+    usmMemAllocPool.cleanup();
+    EXPECT_EQ(1u, svmManager->applyIndirectAccessTaskCountFloorCalled);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_EQ(FreePolicyType::defer, svmManager->freeSVMAllocImplLastFreePolicy);
+    EXPECT_EQ(1u, svmManager->getNumDeferFreeAllocs());
+
+    memoryManager->deferAllocInUse = false;
+    svmManager->freeSVMAllocDeferImpl();
+    EXPECT_EQ(0u, svmManager->getNumDeferFreeAllocs());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolWithoutDeferFreedChunksWhenCleaningUpThenEnginesAreNotWaitedFor) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::none).freeSucceeded);
+
+    usmMemAllocPool.cleanup();
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    EXPECT_EQ(FreePolicyType::none, svmManager->freeSVMAllocImplLastFreePolicy);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolAllocationNotInUseWhenCleaningUpThenItIsReleasedImmediately) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::defer).freeSucceeded);
+
+    usmMemAllocPool.cleanup();
+    EXPECT_EQ(FreePolicyType::defer, svmManager->freeSVMAllocImplLastFreePolicy);
+    EXPECT_EQ(0u, svmManager->getNumDeferFreeAllocs());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolKeptResidentForIndirectAccessWithoutDeferFreedChunksWhenCleaningUpThenTaskCountFloorIsNotApplied) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    const auto osContextId = csr->getOsContext().getContextId();
+    const TaskCountType latestSentTaskCount = completedTaskCount + 5;
+    markPoolUsedByGpu(completedTaskCount);
+    poolGraphicsAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContextId);
+    svmManager->indirectAllocationsResidency[csr.get()] = {latestSentTaskCount, 0u};
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::none).freeSucceeded);
+
+    auto poolPtr = usmMemAllocPool.pool;
+    svmManager->freeSVMAllocImplCallBase = false;
+    usmMemAllocPool.cleanup();
+    EXPECT_EQ(completedTaskCount, poolGraphicsAllocation->getTaskCount(osContextId));
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    svmManager->freeSVMAllocImplCallBase = true;
+    svmManager->freeSVMAlloc(poolPtr, true);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolKeptResidentForIndirectAccessWhenChunkIsDeferFreedThenLatestSentTaskCountIsRespected) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    // pool was made resident once for indirect access, its task count stopped advancing
+    const auto osContextId = csr->getOsContext().getContextId();
+    const TaskCountType latestSentTaskCount = completedTaskCount + 5;
+    markPoolUsedByGpu(completedTaskCount);
+    poolGraphicsAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContextId);
+    svmManager->indirectAllocationsResidency[csr.get()] = {latestSentTaskCount, 0u};
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    ASSERT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+
+    // stale task count alone would look completed, latest sent task count keeps the chunk withheld
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+
+    *csr->tagAddress = latestSentTaskCount;
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolNotUsedByEngineButKeptResidentForIndirectAccessWhenChunkIsDeferFreedThenEngineIsAddedToSnapshot) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    // no submission ever stamped a task count, residency came from indirect access handling only
+    const auto osContextId = csr->getOsContext().getContextId();
+    const TaskCountType latestSentTaskCount = completedTaskCount + 5;
+    ASSERT_FALSE(poolGraphicsAllocation->isUsedByOsContext(osContextId));
+    poolGraphicsAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContextId);
+    svmManager->indirectAllocationsResidency[csr.get()] = {latestSentTaskCount, 0u};
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    ASSERT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+
+    *csr->tagAddress = latestSentTaskCount;
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolKeptResidentForIndirectAccessWhenChunkIsFreedWithBlockingPolicyThenTaskCountIsRaisedBeforeWaiting) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    const auto osContextId = csr->getOsContext().getContextId();
+    const TaskCountType latestSentTaskCount = completedTaskCount + 5;
+    markPoolUsedByGpu(completedTaskCount);
+    poolGraphicsAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContextId);
+    svmManager->indirectAllocationsResidency[csr.get()] = {latestSentTaskCount, 0u};
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(latestSentTaskCount, poolGraphicsAllocation->getTaskCount(osContextId));
+    EXPECT_EQ(1u, memoryManager->waitForEnginesCompletionCalled);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolNotKeptResidentForIndirectAccessWhenChunkIsFreedThenTaskCountIsNotRaised) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    // indirect access tracked for this csr, but the pool is not always resident
+    const auto osContextId = csr->getOsContext().getContextId();
+    markPoolUsedByGpu(completedTaskCount);
+    svmManager->indirectAllocationsResidency[csr.get()] = {completedTaskCount + 5, 0u};
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(completedTaskCount, poolGraphicsAllocation->getTaskCount(osContextId));
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenTaskCountAlreadyPastLatestSentTaskCountWhenFreeingChunkThenTaskCountIsNotLowered) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    // a submission stamped the pool past what the csr last sent, the floor must not pull it back
+    const auto osContextId = csr->getOsContext().getContextId();
+    const TaskCountType stampedTaskCount = completedTaskCount + 5;
+    markPoolUsedByGpu(stampedTaskCount);
+    poolGraphicsAllocation->updateResidencyTaskCount(GraphicsAllocation::objectAlwaysResident, osContextId);
+    svmManager->indirectAllocationsResidency[csr.get()] = {completedTaskCount + 1, 0u};
+    signalCompletion(stampedTaskCount);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(stampedTaskCount, poolGraphicsAllocation->getTaskCount(osContextId));
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenPoolNotKeptResidentForIndirectAccessWhenChunkIsDeferFreedThenEngineIsNotAddedToSnapshot) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    // indirect access tracked for this csr, but the pool is not always resident, so the
+    // snapshot must keep the stamped task count instead of the latest sent one
+    markPoolUsedByGpu(completedTaskCount + 1);
+    svmManager->indirectAllocationsResidency[csr.get()] = {completedTaskCount + 5, 0u};
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    ASSERT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+
+    signalCompletion(completedTaskCount + 1);
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenCsrWithoutTagAddressWhenChunkIsDeferFreedThenEngineIsSkippedAndChunkIsReclaimed) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtrs = fillPool(chunkSize);
+    auto deferFreedPtr = pooledPtrs[0];
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    auto restoreTagAddress = csr->tagAddress;
+    csr->tagAddress = nullptr;
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+
+    // tag address is used by teardown paths
+    csr->tagAddress = restoreTagAddress;
+    signalCompletion(completedTaskCount + 1);
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingTest, givenResidencyTrackingPoolWhenChunkIsDeferFreedThenPoolIsEvictedWhenChunkIsReclaimed) {
+    MockDevice mockDevice;
+    MockGraphicsAllocation mockGfxAlloc;
+    auto mockMemoryOperationsHandler = static_cast<MockMemoryOperations *>(mockDevice.getRootDeviceEnvironment().memoryOperationsInterface.get());
+    usmMemAllocPool.enableResidencyTracking();
+    usmMemAllocPool.device = &mockDevice;
+    usmMemAllocPool.allocation = &mockGfxAlloc;
+
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+    const auto evictCountBeforeFree = mockMemoryOperationsHandler->evictCalledCount.load();
+    EXPECT_EQ(MemoryOperationsStatus::success,
+              usmMemAllocPool.makeChunkResident(pooledPtr, &mockDevice, &mockGfxAlloc));
+    ASSERT_EQ(1u, usmMemAllocPool.residencyCounts[&mockDevice]);
+
+    markPoolUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::defer).freeSucceeded);
+
+    // the gpu may still read the chunk, so the pool has to stay resident with it
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(evictCountBeforeFree, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_EQ(1u, usmMemAllocPool.residencyCounts[&mockDevice]);
+
+    signalCompletion(completedTaskCount + 1);
+    usmMemAllocPool.reclaimDeferredFreeChunks();
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+    EXPECT_EQ(evictCountBeforeFree + 1, mockMemoryOperationsHandler->evictCalledCount);
+    EXPECT_EQ(0u, usmMemAllocPool.residencyCounts[&mockDevice]);
+}
+
+struct DeferredFreeDeviceUnifiedMemoryPoolingTest : public UnifiedMemoryPoolingTest, public UsmPoolCompletionControl {
+    void SetUp() override {
+        UnifiedMemoryPoolingTest::setUp();
+
+        deviceFactory = std::make_unique<UltDeviceFactory>(1, 1, executionEnvironment);
+        executionEnvironment.incRefInternal();
+        device = deviceFactory->rootDevices[0];
+        setUpCompletionControl(executionEnvironment, *memoryManager, deviceBitfields.at(0u));
+
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(InternalMemoryType::deviceUnifiedMemory, MemoryConstants::pageSize2M,
+                                                                         rootDeviceIndices, deviceBitfields);
+        poolMemoryProperties->device = device;
+        ASSERT_TRUE(usmMemAllocPool.initialize(svmManager.get(), *poolMemoryProperties, poolSize, 0u, poolAllocationThreshold));
+        ASSERT_NE(nullptr, usmMemAllocPool.allocation);
+    }
+
+    void TearDown() override {
+        usmMemAllocPool.cleanup();
+        tearDownCompletionControl();
+        UnifiedMemoryPoolingTest::tearDown();
+    }
+
+    UnifiedMemoryProperties makeDeviceProperties() {
+        UnifiedMemoryProperties memoryProperties(InternalMemoryType::deviceUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+        memoryProperties.device = device;
+        return memoryProperties;
+    }
+
+    static constexpr size_t poolSize = 2 * MemoryConstants::megaByte;
+    static constexpr size_t poolAllocationThreshold = 1 * MemoryConstants::megaByte;
+    const size_t chunkSize = poolAllocationThreshold / 2;
+    MockUsmMemAllocPool usmMemAllocPool;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    Device *device = nullptr;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+};
+
+TEST_F(DeferredFreeDeviceUnifiedMemoryPoolingTest, givenDeviceUsmPoolWhenChunkIsDeferFreedThenChunkIsWithheldUntilWorkCompletes) {
+    auto memoryProperties = makeDeviceProperties();
+    auto deferFreedPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, deferFreedPtr);
+    while (auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties)) {
+        EXPECT_NE(deferFreedPtr, pooledPtr);
+    }
+
+    markUsedByGpu(usmMemAllocPool.allocation, completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    signalCompletion(completedTaskCount + 1);
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+struct PeerAllocationsDeviceUnifiedMemoryPoolingTest : public DeferredFreeDeviceUnifiedMemoryPoolingTest {
+    void SetUp() override {
+        DeferredFreeDeviceUnifiedMemoryPoolingTest::SetUp();
+
+        auto deviceMemoryManager = device->getMemoryManager();
+        MemoryManager::maxOsContextCount++;
+        peerCsr = std::make_unique<MockCommandStreamReceiver>(executionEnvironment, 0u, deviceBitfields.at(0u));
+        auto osContext = deviceMemoryManager->createAndRegisterOsContext(peerCsr.get(), EngineDescriptorHelper::getDefaultDescriptor());
+        peerCsr->setupContext(*osContext);
+        *peerCsr->tagAddress = completedTaskCount;
+
+        peerAllocation = deviceMemoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{0u, MemoryConstants::pageSize});
+        ASSERT_NE(nullptr, peerAllocation);
+        usmMemAllocPool.setPeerAllocationsFn([this](const void *ptr) {
+            queriedPoolPtrs.push_back(ptr);
+            return StackVec<GraphicsAllocation *, 4>{this->peerAllocation};
+        });
+    }
+
+    void TearDown() override {
+        device->getMemoryManager()->freeGraphicsMemory(peerAllocation);
+        peerCsr.reset();
+        DeferredFreeDeviceUnifiedMemoryPoolingTest::TearDown();
+    }
+
+    void markPeerUsedByGpu(TaskCountType taskCount) {
+        peerAllocation->updateTaskCount(taskCount, peerCsr->getOsContext().getContextId());
+    }
+
+    VariableBackup<uint32_t> maxOsContextCountBackup{&MemoryManager::maxOsContextCount};
+    std::unique_ptr<MockCommandStreamReceiver> peerCsr;
+    GraphicsAllocation *peerAllocation = nullptr;
+    std::vector<const void *> queriedPoolPtrs;
+};
+
+TEST_F(PeerAllocationsDeviceUnifiedMemoryPoolingTest, givenPeerAllocationsFnWhenChunkIsFreedWithoutFreePolicyThenPeerAllocationsAreNotQueried) {
+    auto memoryProperties = makeDeviceProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::none).freeSucceeded);
+    EXPECT_TRUE(queriedPoolPtrs.empty());
+}
+
+TEST_F(PeerAllocationsDeviceUnifiedMemoryPoolingTest, givenPeerAllocationWhenChunkIsFreedWithBlockingPolicyThenPeerAllocationIsWaitedFor) {
+    auto memoryProperties = makeDeviceProperties();
+    auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    auto deviceMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+    deviceMemoryManager->waitAllocations = std::make_unique<MultiGraphicsAllocation>(0u);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(pooledPtr, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(peerAllocation, deviceMemoryManager->waitAllocations->getGraphicsAllocation(0u));
+    ASSERT_EQ(1u, queriedPoolPtrs.size());
+    EXPECT_EQ(usmMemAllocPool.pool, queriedPoolPtrs[0]);
+    deviceMemoryManager->waitAllocations.reset();
+}
+
+TEST_F(PeerAllocationsDeviceUnifiedMemoryPoolingTest, givenPeerAllocationWithPendingWorkWhenChunkIsDeferFreedThenChunkIsWithheldUntilPeerWorkCompletes) {
+    auto memoryProperties = makeDeviceProperties();
+    auto deferFreedPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, deferFreedPtr);
+    while (auto pooledPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties)) {
+        EXPECT_NE(deferFreedPtr, pooledPtr);
+    }
+
+    markPeerUsedByGpu(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    EXPECT_EQ(1u, usmMemAllocPool.deferredFreeChunks.size());
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    ASSERT_EQ(1u, queriedPoolPtrs.size());
+    EXPECT_EQ(usmMemAllocPool.pool, queriedPoolPtrs[0]);
+
+    *peerCsr->tagAddress = completedTaskCount + 1;
+    EXPECT_EQ(deferFreedPtr, usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties));
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+// The indirect residency map is driver wide, so it can hold an engine belonging to a root
+// device the pool allocation does not span - a device usm pool exists on one root device
+// only. Such an engine has no allocation to bound and must be skipped.
+struct DeferredFreeMultiRootDeviceUnifiedMemoryPoolingTest : public Test<SVMMemoryAllocatorFixture<true, 2u>> {
+    void SetUp() override {
+        SVMMemoryAllocatorFixture::setUp();
+        deviceFactory = std::make_unique<UltDeviceFactory>(2u, 1, executionEnvironment);
+        executionEnvironment.incRefInternal();
+
+        // the fixture's rootDeviceIndices spans both devices, the pool must span only the first
+        poolRootDeviceIndices.pushUnique(0u);
+        poolDeviceBitfields.insert({0u, deviceBitfields.at(0u)});
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M,
+                                                                         poolRootDeviceIndices, poolDeviceBitfields);
+        ASSERT_TRUE(usmMemAllocPool.initialize(svmManager.get(), *poolMemoryProperties, poolSize, 0u, poolAllocationThreshold));
+
+        auto poolAllocations = svmManager->getSVMAlloc(usmMemAllocPool.pool);
+        ASSERT_NE(nullptr, poolAllocations->gpuAllocations.getGraphicsAllocation(0u));
+        ASSERT_EQ(nullptr, poolAllocations->gpuAllocations.getGraphicsAllocation(1u));
+
+        // UsmPoolCompletionControl always builds its engine on root device 0, this one has to
+        // sit on the other root device, so it is set up here instead
+        foreignRootDeviceCsr = std::make_unique<MockCommandStreamReceiver>(executionEnvironment, 1u, deviceBitfields.at(1u));
+        auto osContext = memoryManager->createAndRegisterOsContext(foreignRootDeviceCsr.get(), EngineDescriptorHelper::getDefaultDescriptor());
+        foreignRootDeviceCsr->setupContext(*osContext);
+        // the mock tag defaults to all ones, which would read as complete - hold it below the
+        // sent task count so that a wrongly captured foreign engine withholds the chunk
+        *foreignRootDeviceCsr->tagAddress = 0u;
+        svmManager->indirectAllocationsResidency[foreignRootDeviceCsr.get()] = {foreignLatestSentTaskCount, 0u};
+    }
+
+    void TearDown() override {
+        usmMemAllocPool.cleanup();
+        foreignRootDeviceCsr.reset();
+        SVMMemoryAllocatorFixture::tearDown();
+    }
+
+    // UnifiedMemoryProperties keeps references to both containers, so they have to outlive
+    // every properties object built from them - they are members, never locals
+    UnifiedMemoryProperties makeHostProperties() {
+        return UnifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k,
+                                       poolRootDeviceIndices, poolDeviceBitfields);
+    }
+
+    // never reached by any tag, the engine holding it must be skipped before it is used
+    static constexpr TaskCountType foreignLatestSentTaskCount = 1000u;
+    static constexpr size_t poolSize = 2 * MemoryConstants::megaByte;
+    static constexpr size_t poolAllocationThreshold = 1 * MemoryConstants::megaByte;
+    const size_t chunkSize = poolAllocationThreshold / 2;
+    RootDeviceIndicesContainer poolRootDeviceIndices;
+    std::map<uint32_t, DeviceBitfield> poolDeviceBitfields;
+    MockUsmMemAllocPool usmMemAllocPool;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+    std::unique_ptr<MockCommandStreamReceiver> foreignRootDeviceCsr;
+};
+
+TEST_F(DeferredFreeMultiRootDeviceUnifiedMemoryPoolingTest, givenIndirectAccessEngineFromOtherRootDeviceWhenChunkIsFreedThenEngineIsSkipped) {
+    auto memoryProperties = makeHostProperties();
+    auto deferFreedPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    auto blockingFreedPtr = usmMemAllocPool.createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, deferFreedPtr);
+    ASSERT_NE(nullptr, blockingFreedPtr);
+
+    // the foreign engine has no allocation to bound, so it must not reach the snapshot -
+    // its task count is never signalled and would withhold the chunk for good
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(deferFreedPtr, FreePolicyType::defer).freeSucceeded);
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+
+    // same engine on the blocking path, where it has no task count to raise either
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(blockingFreedPtr, FreePolicyType::blocking).freeSucceeded);
+}
+
+struct DeferredFreeUnifiedMemoryPoolingManagerTest : public UnifiedMemoryPoolingTest, public UsmPoolCompletionControl {
+    void SetUp() override {
+        UnifiedMemoryPoolingTest::setUp();
+        setUpCompletionControl(executionEnvironment, *memoryManager, deviceBitfields.at(0u));
+
+        usmMemAllocPoolsManager = std::make_unique<MockUsmMemAllocPoolsManager>(InternalMemoryType::hostUnifiedMemory, rootDeviceIndices,
+                                                                                deviceBitfields, nullptr, false);
+        ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+
+        // unit tests mock PoolInfo with small buckets, so the chunk size has to come from the
+        // bucket itself - a hardcoded size is not servicable by any pool
+        pooledBucket = usmMemAllocPoolsManager->getPoolInfos()[1];
+        chunkSize = pooledBucket.maxServicedSize;
+        ASSERT_GT(pooledBucket.poolSize, 2 * chunkSize) << "bucket must fit more than one chunk";
+    }
+
+    void TearDown() override {
+        usmMemAllocPoolsManager->cleanup();
+        tearDownCompletionControl();
+        UnifiedMemoryPoolingTest::tearDown();
+    }
+
+    UnifiedMemoryProperties makeHostProperties() {
+        return UnifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, UsmMemAllocPool::chunkAlignment, rootDeviceIndices, deviceBitfields);
+    }
+
+    // pools are owned by the manager and are not mock instances, so only the public interface
+    // is available here - a withheld chunk shows up as a pool that does not report empty
+    GraphicsAllocation *getPoolAllocation(UsmMemAllocPool *pool) {
+        return svmManager->getSVMAlloc(addrToPtr(pool->getPoolAddress()))->gpuAllocations.getGraphicsAllocation(0u);
+    }
+
+    PoolInfo pooledBucket{};
+    size_t chunkSize = 0u;
+    std::unique_ptr<MockUsmMemAllocPoolsManager> usmMemAllocPoolsManager;
+};
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingManagerTest, givenPoolsManagerWhenChunkIsDeferFreedThenOwningPoolWithholdsItUntilWorkCompletes) {
+    auto memoryProperties = makeHostProperties();
+    auto deferFreedPtr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, deferFreedPtr);
+    auto pool = usmMemAllocPoolsManager->getPoolContainingAlloc(deferFreedPtr).pool;
+    ASSERT_NE(nullptr, pool);
+
+    markUsedByGpu(getPoolAllocation(pool), completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(deferFreedPtr, FreePolicyType::defer));
+    EXPECT_FALSE(pool->lookupAlloc(deferFreedPtr).isAllocatedInPool());
+    EXPECT_FALSE(pool->isEmpty());
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+
+    auto secondPtr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, secondPtr);
+    signalCompletion(completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(secondPtr, FreePolicyType::none));
+    EXPECT_TRUE(pool->isEmpty());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingManagerTest, givenPoolWithDeferFreedChunkWhenTrimmingEmptyPoolsThenPoolIsKeptUntilChunkRetires) {
+    auto memoryProperties = makeHostProperties();
+    auto deferFreedPtr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, deferFreedPtr);
+    const auto lookupResult = usmMemAllocPoolsManager->getPoolContainingAlloc(deferFreedPtr);
+    auto pool = lookupResult.pool;
+    const auto poolInfo = lookupResult.poolInfo;
+    ASSERT_NE(nullptr, pool);
+    ASSERT_NE(nullptr, usmMemAllocPoolsManager->tryAddPool(poolInfo));
+    ASSERT_EQ(2u, usmMemAllocPoolsManager->pools[poolInfo].size());
+
+    // freeing the last chunk leaves it awaiting completion, so the pool must not be trimmed
+    markUsedByGpu(getPoolAllocation(pool), completedTaskCount + 1);
+    EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(deferFreedPtr, FreePolicyType::defer));
+    EXPECT_EQ(2u, usmMemAllocPoolsManager->pools[poolInfo].size());
+
+    // once the work retires, trimming reclaims the chunk and the pool becomes trimmable
+    signalCompletion(completedTaskCount + 1);
+    usmMemAllocPoolsManager->trimEmptyPools(poolInfo);
+    EXPECT_EQ(UsmMemAllocPoolsManager::maxEmptyPoolsPerBucket, usmMemAllocPoolsManager->pools[poolInfo].size());
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingManagerTest, givenTrimmedPoolWhenCleaningItUpThenItIsAlreadyRemovedFromTheBucket) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+    const auto lookupResult = usmMemAllocPoolsManager->getPoolContainingAlloc(pooledPtr);
+    auto pool = lookupResult.pool;
+    const auto poolInfo = lookupResult.poolInfo;
+    ASSERT_NE(nullptr, pool);
+    ASSERT_NE(nullptr, usmMemAllocPoolsManager->tryAddPool(poolInfo));
+    ASSERT_EQ(2u, usmMemAllocPoolsManager->pools[poolInfo].size());
+
+    size_t bucketSizeDuringCleanup = 0u;
+    for (auto &bucketPool : usmMemAllocPoolsManager->pools[poolInfo]) {
+        bucketPool->setCustomCleanup([this, poolInfo, &bucketSizeDuringCleanup](const void *) {
+            bucketSizeDuringCleanup = usmMemAllocPoolsManager->pools[poolInfo].size();
+        });
+    }
+
+    EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(pooledPtr, FreePolicyType::none));
+    EXPECT_EQ(UsmMemAllocPoolsManager::maxEmptyPoolsPerBucket, usmMemAllocPoolsManager->pools[poolInfo].size());
+    EXPECT_EQ(UsmMemAllocPoolsManager::maxEmptyPoolsPerBucket, bucketSizeDuringCleanup);
+
+    for (auto &bucketPool : usmMemAllocPoolsManager->pools[poolInfo]) {
+        bucketPool->setCustomCleanup(nullptr);
+    }
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingManagerTest, givenPooledAllocationWhenGettingPoolContainingAllocThenItIsReportedAsAllocated) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+
+    const auto baseLookup = usmMemAllocPoolsManager->getPoolContainingAlloc(pooledPtr);
+    EXPECT_NE(nullptr, baseLookup.pool);
+    EXPECT_TRUE(baseLookup.isAllocatedInPool());
+    EXPECT_EQ(pooledBucket.minServicedSize, baseLookup.poolInfo.minServicedSize);
+    EXPECT_EQ(pooledPtr, baseLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(chunkSize, baseLookup.pooledAllocationSize);
+
+    const auto interiorLookup = usmMemAllocPoolsManager->getPoolContainingAlloc(ptrOffset(pooledPtr, chunkSize - 1));
+    EXPECT_EQ(baseLookup.pool, interiorLookup.pool);
+    EXPECT_TRUE(interiorLookup.isAllocatedInPool());
+    EXPECT_EQ(pooledPtr, interiorLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(chunkSize, interiorLookup.pooledAllocationSize);
+
+    EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(pooledPtr, FreePolicyType::none));
+}
+
+TEST_F(DeferredFreeUnifiedMemoryPoolingManagerTest, givenPointerInPoolRangeButNotAllocatedWhenGettingPoolContainingAllocThenItIsNotReportedAsAllocated) {
+    auto memoryProperties = makeHostProperties();
+    auto pooledPtr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(chunkSize, memoryProperties);
+    ASSERT_NE(nullptr, pooledPtr);
+    auto notAllocatedPtr = ptrOffset(pooledPtr, chunkSize - 1);
+    ASSERT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(pooledPtr, FreePolicyType::none));
+
+    const auto lookupResult = usmMemAllocPoolsManager->getPoolContainingAlloc(notAllocatedPtr);
+    EXPECT_NE(nullptr, lookupResult.pool);
+    EXPECT_FALSE(lookupResult.isAllocatedInPool());
+    EXPECT_EQ(nullptr, lookupResult.pooledAllocationBasePtr);
+    EXPECT_EQ(0u, lookupResult.pooledAllocationSize);
+    EXPECT_FALSE(usmMemAllocPoolsManager->freeSVMAlloc(notAllocatedPtr, FreePolicyType::none));
+}
+
+class InitializedHostMultiDeviceUnifiedMemoryPoolingTest : public Test<SVMMemoryAllocatorFixture<true, 4u>> {
+  public:
+    void SetUp() override {
+        SVMMemoryAllocatorFixture::setUp();
+        EXPECT_FALSE(usmMemAllocPool.isInitialized());
+
+        deviceFactory = std::make_unique<UltDeviceFactory>(4u, 1, executionEnvironment);
+        executionEnvironment.incRefInternal();
+
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+        ASSERT_TRUE(usmMemAllocPool.initialize(svmManager.get(), *poolMemoryProperties.get(), poolSize, 0u, poolAllocationThreshold));
+    }
+    void TearDown() override {
+        usmMemAllocPool.cleanup();
+        SVMMemoryAllocatorFixture::tearDown();
+    }
+
+    UnifiedMemoryProperties makeHostProperties() {
+        return UnifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, MemoryConstants::pageSize64k, rootDeviceIndices, deviceBitfields);
+    }
+
+    const size_t poolSize = 2 * MemoryConstants::megaByte;
+    MockUsmMemAllocPool usmMemAllocPool;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+    constexpr static auto poolAllocationThreshold = 1 * MemoryConstants::megaByte;
+};
+
+TEST_F(InitializedHostMultiDeviceUnifiedMemoryPoolingTest, givenInitializedPoolWhenUsingPoolThenGraphicsAllocationsAreSetForAllRootDevices) {
+    const auto devicesCount = deviceFactory->rootDevices.size();
+    const auto allocationSize = 4;
+    auto memoryProperties = makeHostProperties();
+
+    auto allocFromPool = usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties);
+    EXPECT_NE(nullptr, allocFromPool);
+    EXPECT_TRUE(usmMemAllocPool.isInPoolRange(allocFromPool));
+
+    auto svmData = svmManager->getSVMAlloc(allocFromPool);
+    EXPECT_EQ(memoryProperties.rootDeviceIndices.size(), devicesCount);
+    EXPECT_EQ(devicesCount, svmData->gpuAllocations.getGraphicsAllocations().size());
+    EXPECT_TRUE(usmMemAllocPool.freeSVMAlloc(allocFromPool, FreePolicyType::blocking).freeSucceeded);
+}
+
+using InitializationFailedUnifiedMemoryPoolingTest = InitializedUnifiedMemoryPoolingTest<InternalMemoryType::hostUnifiedMemory, true>;
+TEST_F(InitializationFailedUnifiedMemoryPoolingTest, givenNotInitializedPoolWhenUsingPoolThenMethodsSucceed) {
+    auto memoryProperties = makeHostProperties();
+    const auto allocationSize = poolAllocationThreshold;
+    EXPECT_EQ(nullptr, usmMemAllocPool.createUnifiedMemoryAllocation(allocationSize, memoryProperties));
+    const auto bogusPtr = reinterpret_cast<void *>(0x1);
+    EXPECT_FALSE(usmMemAllocPool.freeSVMAlloc(bogusPtr, FreePolicyType::blocking).freeSucceeded);
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    const auto bogusLookup = usmMemAllocPool.lookupAlloc(bogusPtr);
+    EXPECT_EQ(0u, bogusLookup.pooledAllocationSize);
+    EXPECT_EQ(nullptr, bogusLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(0u, usmMemAllocPool.getOffsetInPool(bogusPtr));
+    usmMemAllocPool.reclaimDeferredFreeChunks();
+    EXPECT_TRUE(usmMemAllocPool.deferredFreeChunks.empty());
+}
+
+class UnifiedMemoryPoolingManagerTest : public SVMMemoryAllocatorFixture<true, 1u>, public ::testing::TestWithParam<std::tuple<InternalMemoryType>> {
+  public:
+    void SetUp() override {
+        REQUIRE_64BIT_OR_SKIP();
+        SVMMemoryAllocatorFixture::setUp();
+        poolMemoryType = std::get<0>(GetParam());
+        ASSERT_TRUE(InternalMemoryType::deviceUnifiedMemory == poolMemoryType ||
+                    InternalMemoryType::hostUnifiedMemory == poolMemoryType);
+
+        if (isDevicePool()) {
+            deviceFactory = std::unique_ptr<UltDeviceFactory>(new UltDeviceFactory(1, 1, executionEnvironment));
+            executionEnvironment.incRefInternal();
+            device = deviceFactory->rootDevices[0];
+        }
+
+        usmMemAllocPoolsManager.reset(new MockUsmMemAllocPoolsManager(poolMemoryType,
+                                                                      rootDeviceIndices,
+                                                                      deviceBitfields,
+                                                                      device,
+                                                                      false));
+        ASSERT_NE(nullptr, usmMemAllocPoolsManager);
+        EXPECT_FALSE(usmMemAllocPoolsManager->isInitialized());
+        if (isDevicePool()) {
+            memoryManager->localMemorySupported[mockRootDeviceIndex] = true;
+        }
+
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(poolMemoryType, MemoryConstants::preferredAlignment, rootDeviceIndices, deviceBitfields);
+        poolMemoryProperties->device = device;
+    }
+    void TearDown() override {
+        SVMMemoryAllocatorFixture::tearDown();
+    }
+
+    void *createAlloc(size_t size, UnifiedMemoryProperties &unifiedMemoryProperties) {
+        void *ptr = nullptr;
+        auto mockGa = std::make_unique<MockGraphicsAllocation>(mockRootDeviceIndex, nullptr, size);
+        mockGa->gpuAddress = nextMockGraphicsAddress;
+        mockGa->cpuPtr = reinterpret_cast<void *>(nextMockGraphicsAddress);
+        if (isDevicePool()) {
+            mockGa->setAllocationType(AllocationType::buffer);
+            memoryManager->mockGa = mockGa.release();
+            memoryManager->returnMockGAFromDevicePool = true;
+            ptr = svmManager->createUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+            memoryManager->returnMockGAFromDevicePool = false;
+        } else {
+            mockGa->setAllocationType(AllocationType::bufferHostMemory);
+            memoryManager->mockGa = mockGa.release();
+            memoryManager->returnMockGAFromHostPool = true;
+            ptr = svmManager->createHostUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+            memoryManager->returnMockGAFromHostPool = false;
+        }
+        EXPECT_NE(nullptr, ptr);
+        nextMockGraphicsAddress = alignUp(nextMockGraphicsAddress + size + 1, MemoryConstants::pageSize2M);
+        return ptr;
+    }
+
+    bool isDevicePool() {
+        return InternalMemoryType::deviceUnifiedMemory == poolMemoryType;
+    }
+
+    void preallocatePools() {
+        for (const auto &poolInfo : usmMemAllocPoolsManager->getPoolInfos()) {
+            EXPECT_NE(nullptr, usmMemAllocPoolsManager->tryAddPool(poolInfo));
+        }
+    }
+    const size_t poolSize = 2 * MemoryConstants::megaByte;
+    std::unique_ptr<MockUsmMemAllocPoolsManager> usmMemAllocPoolsManager;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    Device *device = nullptr;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+    InternalMemoryType poolMemoryType;
+    uint64_t nextMockGraphicsAddress = alignUp(std::numeric_limits<uint64_t>::max() - MemoryConstants::teraByte, MemoryConstants::pageSize2M);
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    UnifiedMemoryPoolingManagerTestParameterized,
+    UnifiedMemoryPoolingManagerTest,
+    ::testing::Combine(
+        ::testing::Values(InternalMemoryType::deviceUnifiedMemory, InternalMemoryType::hostUnifiedMemory)));
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenUsmMemAllocPoolsManagerWhenCallingCanBePooledThenCorrectValueIsReturned) {
+    const RootDeviceIndicesContainer rootDeviceIndices;
+    const std::map<uint32_t, DeviceBitfield> deviceBitfields;
+    UnifiedMemoryProperties unifiedMemoryProperties(poolMemoryType, MemoryConstants::pageSize2M, rootDeviceIndices, deviceBitfields);
+    size_t maxPoolableSize = 0u;
+    if (this->isDevicePool()) {
+        maxPoolableSize = PoolInfo::getMaxPoolableSize(device->getGfxCoreHelper());
+    } else {
+        maxPoolableSize = PoolInfo::getHostMaxPoolableSize();
+    }
+    EXPECT_TRUE(usmMemAllocPoolsManager->canBePooled(maxPoolableSize, unifiedMemoryProperties));
+    EXPECT_FALSE(usmMemAllocPoolsManager->canBePooled(maxPoolableSize + 1, unifiedMemoryProperties));
+
+    unifiedMemoryProperties.alignment = UsmMemAllocPool::poolAlignment * 2;
+    EXPECT_FALSE(usmMemAllocPoolsManager->canBePooled(maxPoolableSize, unifiedMemoryProperties));
+
+    unifiedMemoryProperties.alignment = UsmMemAllocPool::chunkAlignment;
+    unifiedMemoryProperties.allocationFlags.allFlags = 1u;
+    EXPECT_FALSE(usmMemAllocPoolsManager->canBePooled(maxPoolableSize, unifiedMemoryProperties));
+
+    unifiedMemoryProperties.allocationFlags.allFlags = 0u;
+    unifiedMemoryProperties.allocationFlags.allAllocFlags = 1u;
+    EXPECT_FALSE(usmMemAllocPoolsManager->canBePooled(maxPoolableSize, unifiedMemoryProperties));
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenInitializationFailsForPoolWhenCallingTryAddPullThenNullptrIsReturned) {
+    memoryManager->maxSuccessAllocatedGraphicsMemoryIndex = memoryManager->successAllocatedGraphicsMemoryIndex.load();
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+    for (const auto &poolInfo : usmMemAllocPoolsManager->getPoolInfos()) {
+        EXPECT_EQ(nullptr, usmMemAllocPoolsManager->tryAddPool(poolInfo));
+        EXPECT_EQ(0u, usmMemAllocPoolsManager->pools[poolInfo].size());
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenTrackResidencySetWhenInitializingThanSetTrackingResidencyForPools) {
+    usmMemAllocPoolsManager->enableResidencyTracking();
+    EXPECT_TRUE(usmMemAllocPoolsManager->trackResidency);
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+    this->preallocatePools();
+    for (auto &[_, bucket] : usmMemAllocPoolsManager->pools) {
+        for (const auto &pool : bucket) {
+            EXPECT_TRUE(reinterpret_cast<MockUsmMemAllocPool *>(pool.get())->trackResidency);
+        }
+    }
+
+    usmMemAllocPoolsManager->cleanup();
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenPeerAllocationsFnWhenPoolsAreAddedThenFnIsSetOnPools) {
+    usmMemAllocPoolsManager->setPeerAllocationsFn([](const void *) { return StackVec<GraphicsAllocation *, 4>{}; });
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+    this->preallocatePools();
+    for (auto &[_, bucket] : usmMemAllocPoolsManager->pools) {
+        for (const auto &pool : bucket) {
+            EXPECT_TRUE(static_cast<bool>(reinterpret_cast<MockUsmMemAllocPool *>(pool.get())->peerAllocationsFn));
+        }
+    }
+
+    usmMemAllocPoolsManager->cleanup();
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenCustomCleanupFunctionWhenPoolsAreAddedAndCleanedUpThenCustomCleanupIsSetAndCalled) {
+    auto customCleanup = [](std::vector<void *> *vec, const void *ptr) {
+        std::erase(*vec, ptr);
+    };
+    std::vector<void *> poolPtrs;
+
+    usmMemAllocPoolsManager->setCustomCleanup(std::bind(customCleanup, &poolPtrs, std::placeholders::_1));
+
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+    this->preallocatePools();
+    for (auto &[_, bucket] : usmMemAllocPoolsManager->pools) {
+        for (const auto &pool : bucket) {
+            poolPtrs.push_back(addrToPtr(pool->getPoolAddress()));
+        }
+    }
+    EXPECT_GT(poolPtrs.size(), 0u);
+    usmMemAllocPoolsManager->cleanup();
+    EXPECT_EQ(0u, poolPtrs.size());
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenInitializedPoolsManagerWhenAllocatingGreaterThan2MBOrWrongAlignmentOrWrongFlagsThenDoNotPool) {
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+    auto allocOverLimit = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(2 * MemoryConstants::megaByte + 1u, *poolMemoryProperties.get());
+    EXPECT_EQ(nullptr, allocOverLimit);
+
+    poolMemoryProperties->allocationFlags.allFlags = 1u;
+    auto allocWithExtraFlags = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(1u, *poolMemoryProperties.get());
+    EXPECT_EQ(nullptr, allocWithExtraFlags);
+
+    poolMemoryProperties->allocationFlags.allFlags = 0u;
+    poolMemoryProperties->alignment = 4 * MemoryConstants::megaByte;
+    auto allocWithWrongAlignment = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(1u, *poolMemoryProperties.get());
+    EXPECT_EQ(nullptr, allocWithWrongAlignment);
+
+    usmMemAllocPoolsManager->cleanup();
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, whenGetPoolInfosCalledThenCorrectInfoIsReturned) {
+    auto &poolInfos = usmMemAllocPoolsManager->getPoolInfos();
+    EXPECT_EQ(3u, poolInfos.size());
+
+    EXPECT_EQ(2 * MemoryConstants::kiloByte, poolInfos[0].poolSize);
+    EXPECT_EQ(0u, poolInfos[0].minServicedSize);
+    EXPECT_EQ(256u, poolInfos[0].maxServicedSize);
+
+    EXPECT_EQ(8 * MemoryConstants::kiloByte, poolInfos[1].poolSize);
+    EXPECT_EQ(256u + 1, poolInfos[1].minServicedSize);
+    EXPECT_EQ(1 * MemoryConstants::kiloByte, poolInfos[1].maxServicedSize);
+
+    EXPECT_EQ(2 * MemoryConstants::pageSize, poolInfos[2].poolSize);
+    EXPECT_EQ(1 * MemoryConstants::kiloByte + 1, poolInfos[2].minServicedSize);
+    EXPECT_EQ(MemoryConstants::pageSize, poolInfos[2].maxServicedSize);
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenInitializedPoolsManagerWhenCallingMethodsWithNotAllocatedPointersThenReturnCorrectValues) {
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+    this->preallocatePools();
+
+    void *ptrOutsidePools = addrToPtr(0x1);
+    EXPECT_FALSE(usmMemAllocPoolsManager->freeSVMAlloc(ptrOutsidePools, FreePolicyType::blocking));
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    const auto outsidePoolsLookup = usmMemAllocPoolsManager->getPoolContainingAlloc(ptrOutsidePools);
+    EXPECT_EQ(nullptr, outsidePoolsLookup.pool);
+    EXPECT_FALSE(outsidePoolsLookup.isAllocatedInPool());
+    EXPECT_EQ(nullptr, outsidePoolsLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(0u, outsidePoolsLookup.pooledAllocationSize);
+
+    void *notAllocatedPtrInPoolAddressSpace = addrToPtr(usmMemAllocPoolsManager->pools[usmMemAllocPoolsManager->getPoolInfos()[0]][0]->getPoolAddress());
+    EXPECT_FALSE(usmMemAllocPoolsManager->freeSVMAlloc(notAllocatedPtrInPoolAddressSpace, FreePolicyType::blocking));
+    EXPECT_EQ(0u, memoryManager->waitForEnginesCompletionCalled);
+    const auto notAllocatedLookup = usmMemAllocPoolsManager->getPoolContainingAlloc(notAllocatedPtrInPoolAddressSpace);
+    EXPECT_NE(nullptr, notAllocatedLookup.pool);
+    EXPECT_FALSE(notAllocatedLookup.isAllocatedInPool());
+    EXPECT_EQ(nullptr, notAllocatedLookup.pooledAllocationBasePtr);
+    EXPECT_EQ(0u, notAllocatedLookup.pooledAllocationSize);
+
+    usmMemAllocPoolsManager->cleanup();
+}
+
+TEST_P(UnifiedMemoryPoolingManagerTest, givenInitializedPoolsManagerWhenAllocatingNotGreaterThan2MBThenPoolsAreUsed) {
+    ASSERT_TRUE(usmMemAllocPoolsManager->initialize(svmManager.get()));
+    ASSERT_TRUE(usmMemAllocPoolsManager->isInitialized());
+
+    auto expectedWaitForEnginesCompletionCalled = 0u;
+    EXPECT_EQ(expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+    size_t totalSize = 0u;
+    for (auto &poolInfo : usmMemAllocPoolsManager->getPoolInfos()) {
+        size_t minServicedSize = poolInfo.minServicedSize ? poolInfo.minServicedSize : 1;
+        totalSize += poolInfo.poolSize;
+
+        auto poolAllocMinSize = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(minServicedSize, *poolMemoryProperties.get());
+        EXPECT_NE(nullptr, poolAllocMinSize);
+        const auto minSizeLookup = usmMemAllocPoolsManager->getPoolContainingAlloc(poolAllocMinSize);
+        EXPECT_EQ(poolAllocMinSize, minSizeLookup.pooledAllocationBasePtr);
+        EXPECT_EQ(minServicedSize, minSizeLookup.pooledAllocationSize);
+        EXPECT_TRUE(usmMemAllocPoolsManager->pools[poolInfo][0]->isInPoolRange(poolAllocMinSize));
+        EXPECT_EQ(totalSize, usmMemAllocPoolsManager->totalSize);
+        EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(poolAllocMinSize, FreePolicyType::blocking));
+        EXPECT_EQ(++expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+
+        auto poolAllocMaxSize = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(poolInfo.maxServicedSize, *poolMemoryProperties.get());
+        EXPECT_NE(nullptr, poolAllocMaxSize);
+        const auto maxSizeLookup = usmMemAllocPoolsManager->getPoolContainingAlloc(poolAllocMaxSize);
+        EXPECT_EQ(poolAllocMaxSize, maxSizeLookup.pooledAllocationBasePtr);
+        EXPECT_EQ(poolInfo.maxServicedSize, maxSizeLookup.pooledAllocationSize);
+        EXPECT_TRUE(usmMemAllocPoolsManager->pools[poolInfo][0]->isInPoolRange(poolAllocMaxSize));
+        EXPECT_EQ(totalSize, usmMemAllocPoolsManager->totalSize);
+        EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(poolAllocMaxSize, FreePolicyType::blocking));
+        EXPECT_EQ(++expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+    }
+
+    ASSERT_EQ(usmMemAllocPoolsManager->getPoolInfos().size(), usmMemAllocPoolsManager->pools.size());
+    for (auto &poolInfo : usmMemAllocPoolsManager->getPoolInfos()) {
+        ASSERT_EQ(1u, usmMemAllocPoolsManager->pools[poolInfo].size());
+        auto &pool = usmMemAllocPoolsManager->pools[poolInfo][0];
+        ASSERT_TRUE(pool->isInitialized());
+        EXPECT_EQ(poolInfo.poolSize, pool->getPoolSize());
+        EXPECT_TRUE(pool->isEmpty());
+
+        EXPECT_FALSE(pool->sizeIsAllowed(poolInfo.minServicedSize - 1));
+        EXPECT_TRUE(pool->sizeIsAllowed(poolInfo.minServicedSize));
+        EXPECT_TRUE(pool->sizeIsAllowed(poolInfo.maxServicedSize));
+        EXPECT_FALSE(pool->sizeIsAllowed(poolInfo.maxServicedSize + 1));
+    }
+
+    usmMemAllocPoolsManager->canAddPools = false;
+    std::vector<void *> ptrsToFree;
+    auto thirdPoolInfo = usmMemAllocPoolsManager->getPoolInfos()[2];
+    auto allocationsToOverfillThirdPool = thirdPoolInfo.poolSize / thirdPoolInfo.maxServicedSize + 1;
+    for (auto i = 0u; i < allocationsToOverfillThirdPool; ++i) {
+        auto ptr = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(thirdPoolInfo.maxServicedSize, *poolMemoryProperties.get());
+        if (nullptr == ptr) {
+            break;
+        }
+        const auto address = castToUint64(ptr);
+        const auto pool = usmMemAllocPoolsManager->getPoolContainingAlloc(ptr).pool;
+        const auto poolAddress = pool->getPoolAddress();
+        EXPECT_EQ(ptrOffset(poolAddress, pool->getOffsetInPool(ptr)), address);
+
+        ptrsToFree.push_back(ptr);
+    }
+    EXPECT_EQ(1u, usmMemAllocPoolsManager->pools[thirdPoolInfo].size());
+    usmMemAllocPoolsManager->canAddPools = true;
+
+    auto thirdPoolAllocOverCapacity = usmMemAllocPoolsManager->createUnifiedMemoryAllocation(thirdPoolInfo.maxServicedSize, *poolMemoryProperties.get());
+    EXPECT_NE(nullptr, thirdPoolAllocOverCapacity);
+    EXPECT_EQ(totalSize + thirdPoolInfo.poolSize, usmMemAllocPoolsManager->totalSize);
+    ASSERT_EQ(2u, usmMemAllocPoolsManager->pools[thirdPoolInfo].size());
+    auto &newPool = usmMemAllocPoolsManager->pools[thirdPoolInfo][1];
+    EXPECT_TRUE(newPool->lookupAlloc(thirdPoolAllocOverCapacity).isAllocatedInPool());
+
+    ptrsToFree.push_back(thirdPoolAllocOverCapacity);
+    EXPECT_EQ(expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+    for (auto ptr : ptrsToFree) {
+        EXPECT_TRUE(usmMemAllocPoolsManager->freeSVMAlloc(ptr, FreePolicyType::blocking));
+        EXPECT_EQ(++expectedWaitForEnginesCompletionCalled, memoryManager->waitForEnginesCompletionCalled);
+    }
+    EXPECT_EQ(1u, usmMemAllocPoolsManager->pools[thirdPoolInfo].size());
+
+    usmMemAllocPoolsManager->cleanup();
+}
+
+TEST(UnifiedMemoryPoolingFacadeStaticTest, givenDebugFlagWhenCheckingPoolManagerSupportThenFlagOverridesGfxCoreHelper) {
+    DebugManagerStateRestore restorer;
+    UltDeviceFactory deviceFactory{1, 1};
+    auto device = deviceFactory.rootDevices[0];
+
+    debugManager.flags.EnableUsmAllocationPoolManager.set(-1);
+    EXPECT_EQ(device->getGfxCoreHelper().isUsmPoolManagerSupported(InternalMemoryType::hostUnifiedMemory),
+              UsmMemAllocPoolsFacade::isPoolManagerSupported(InternalMemoryType::hostUnifiedMemory, device));
+    EXPECT_EQ(device->getGfxCoreHelper().isUsmPoolManagerSupported(InternalMemoryType::deviceUnifiedMemory),
+              UsmMemAllocPoolsFacade::isPoolManagerSupported(InternalMemoryType::deviceUnifiedMemory, device));
+
+    debugManager.flags.EnableUsmAllocationPoolManager.set(0);
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::isPoolManagerSupported(InternalMemoryType::hostUnifiedMemory, device));
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::isPoolManagerSupported(InternalMemoryType::deviceUnifiedMemory, device));
+
+    debugManager.flags.EnableUsmAllocationPoolManager.set(1);
+    EXPECT_TRUE(UsmMemAllocPoolsFacade::isPoolManagerSupported(InternalMemoryType::hostUnifiedMemory, device));
+    EXPECT_TRUE(UsmMemAllocPoolsFacade::isPoolManagerSupported(InternalMemoryType::deviceUnifiedMemory, device));
+}
+
+class UnifiedMemoryPoolingFacadeTest : public ::testing::TestWithParam<std::tuple<InternalMemoryType, bool>> {
+  public:
+    void SetUp() override {
+        REQUIRE_64BIT_OR_SKIP();
+        rootDeviceIndices.pushUnique(mockRootDeviceIndex);
+        deviceBitfields.insert({mockRootDeviceIndex, mockDeviceBitfield});
+
+        if (isPoolManagerEnabled) {
+            debugManager.flags.EnableUsmAllocationPoolManager.set(1);
+        } else {
+            debugManager.flags.EnableUsmAllocationPoolManager.set(0);
+        }
+
+        deviceFactory = std::unique_ptr<UltDeviceFactory>(new UltDeviceFactory(1, 1));
+        device = deviceFactory->rootDevices[0];
+
+        svmManager = std::make_unique<MockSVMAllocsManager>(device->getMemoryManager());
+        mockMemoryManager = static_cast<MockMemoryManager *>(device->getMemoryManager());
+        if (InternalMemoryType::deviceUnifiedMemory == poolMemoryType) {
+            mockMemoryManager->localMemorySupported[mockRootDeviceIndex] = true;
+        }
+
+        poolMemoryProperties = std::make_unique<UnifiedMemoryProperties>(poolMemoryType, MemoryConstants::preferredAlignment, rootDeviceIndices, deviceBitfields);
+        poolMemoryProperties->device = poolMemoryType == InternalMemoryType::deviceUnifiedMemory ? device : nullptr;
+
+        mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {});
+    }
+    void TearDown() override {
+        mockUsmMemAllocPoolsFacade.cleanup();
+    }
+
+    const InternalMemoryType poolMemoryType = std::get<0>(GetParam());
+    const bool isPoolManagerEnabled = std::get<1>(GetParam());
+    const size_t poolSize = 2 * MemoryConstants::megaByte;
+
+    RootDeviceIndicesContainer rootDeviceIndices;
+    std::map<uint32_t, DeviceBitfield> deviceBitfields;
+    std::unique_ptr<MockUsmMemAllocPoolsManager> usmMemAllocPoolsManager;
+    std::unique_ptr<UltDeviceFactory> deviceFactory;
+    std::unique_ptr<MockSVMAllocsManager> svmManager;
+    std::unique_ptr<UnifiedMemoryProperties> poolMemoryProperties;
+
+    MockMemoryManager *mockMemoryManager;
+    Device *device;
+    MockUsmMemAllocPoolsFacade mockUsmMemAllocPoolsFacade;
+
+  private:
+    DebugManagerStateRestore restorer;
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    UnifiedMemoryPoolingFacadeTestParameterized,
+    UnifiedMemoryPoolingFacadeTest,
+    ::testing::Combine(
+        ::testing::Values(InternalMemoryType::deviceUnifiedMemory, InternalMemoryType::hostUnifiedMemory), ::testing::Bool()));
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenCombinationOfPoolManagerAndSinglePoolThenPoolsFacadeIsInitializedCorrectly) {
+    if (isPoolManagerEnabled) {
+        EXPECT_TRUE(mockUsmMemAllocPoolsFacade.isInitialized());
+        EXPECT_TRUE(mockUsmMemAllocPoolsFacade.poolManager->isInitialized());
+        EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.pool.get());
+    } else {
+        EXPECT_TRUE(mockUsmMemAllocPoolsFacade.isInitialized());
+        EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.poolManager.get());
+        EXPECT_TRUE(mockUsmMemAllocPoolsFacade.pool->isInitialized());
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenVariousConfigurationsWhenAllocatingThenCorrectPathIsTaken) {
+    size_t allocationSize = 1 * MemoryConstants::kiloByte;
+    void *allocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(allocationSize, *poolMemoryProperties.get());
+    if (isPoolManagerEnabled) {
+        EXPECT_EQ(mockUsmMemAllocPoolsFacade.poolManager->getPoolContainingAlloc(allocation).pool, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool);
+        EXPECT_TRUE(mockUsmMemAllocPoolsFacade.poolManager->getPoolContainingAlloc(allocation).pool->isInPoolRange(allocation));
+    } else {
+        EXPECT_EQ(mockUsmMemAllocPoolsFacade.pool.get(), mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool);
+        EXPECT_TRUE(mockUsmMemAllocPoolsFacade.pool->isInPoolRange(allocation));
+    }
+
+    EXPECT_NE(nullptr, allocation);
+    EXPECT_EQ(allocationSize, mockUsmMemAllocPoolsFacade.getPooledAllocationSize(allocation));
+    EXPECT_EQ(allocation, mockUsmMemAllocPoolsFacade.getPooledAllocationBasePtr(ptrOffset(allocation, 20)));
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(allocation, FreePolicyType::blocking));
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenInvalidAllocationWhenUsingPoolsFacadeThenCorrectValuesAreReturned) {
+    void *allocation = reinterpret_cast<void *>(0x123);
+    EXPECT_EQ(0u, mockUsmMemAllocPoolsFacade.getPooledAllocationSize(allocation));
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.getPooledAllocationBasePtr(allocation));
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool);
+    EXPECT_FALSE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(allocation, FreePolicyType::blocking));
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenNotInitializedPoolsFacadeWhenUsingPoolsFacadeThenCorrectValuesAreReturned) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    EXPECT_FALSE(mockUsmMemAllocPoolsFacade.isInitialized());
+
+    void *allocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(1 * MemoryConstants::kiloByte, *poolMemoryProperties.get());
+    EXPECT_EQ(nullptr, allocation);
+    EXPECT_EQ(0u, mockUsmMemAllocPoolsFacade.getPooledAllocationSize(allocation));
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.getPooledAllocationBasePtr(allocation));
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool);
+    EXPECT_FALSE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(allocation, FreePolicyType::blocking));
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenNoDebugFlagsWhenInitializingPoolsFacadeThenPoolManagerIsEnabledByDefault) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    EXPECT_FALSE(mockUsmMemAllocPoolsFacade.isInitialized());
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUsmAllocationPoolManager.set(-1);
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {});
+
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.isInitialized());
+    if (device->getGfxCoreHelper().isUsmPoolManagerSupported(poolMemoryType)) {
+        EXPECT_NE(nullptr, mockUsmMemAllocPoolsFacade.poolManager);
+        EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.pool.get());
+    } else {
+        EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.poolManager);
+        EXPECT_NE(nullptr, mockUsmMemAllocPoolsFacade.pool.get());
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenPoolManagerDisabledAndCustomPoolSizeWhenInitializingPoolsFacadeThenPoolHasCorrectSize) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    EXPECT_FALSE(mockUsmMemAllocPoolsFacade.isInitialized());
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableUsmAllocationPoolManager.set(0);
+    debugManager.flags.EnableDeviceUsmAllocationPool.set(1);
+    debugManager.flags.EnableHostUsmAllocationPool.set(2);
+
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {});
+
+    if (poolMemoryType == InternalMemoryType::deviceUnifiedMemory) {
+        EXPECT_EQ(1 * MemoryConstants::megaByte, mockUsmMemAllocPoolsFacade.pool->getPoolSize());
+    } else {
+        EXPECT_EQ(2 * MemoryConstants::megaByte, mockUsmMemAllocPoolsFacade.pool->getPoolSize());
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenHostMemoryTypeWhenInitializingPoolManagerThenManagerIsCreatedWithNullDevice) {
+    if (!isPoolManagerEnabled) {
+        GTEST_SKIP();
+    }
+    auto mockManager = reinterpret_cast<MockUsmMemAllocPoolsManager *>(mockUsmMemAllocPoolsFacade.poolManager.get());
+    ASSERT_NE(nullptr, mockManager);
+    if (poolMemoryType == InternalMemoryType::deviceUnifiedMemory) {
+        EXPECT_EQ(device, mockManager->device);
+    } else {
+        EXPECT_EQ(nullptr, mockManager->device);
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenInitParamsWithResidencyTrackingWhenInitializingThenTrackingIsEnabledOnPool) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {nullptr, true, false});
+
+    if (isPoolManagerEnabled) {
+        EXPECT_TRUE(reinterpret_cast<MockUsmMemAllocPoolsManager *>(mockUsmMemAllocPoolsFacade.poolManager.get())->trackResidency);
+    } else {
+        EXPECT_TRUE(reinterpret_cast<MockUsmMemAllocPool *>(mockUsmMemAllocPoolsFacade.pool.get())->trackResidency);
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenInitParamsWithCustomCleanupWhenInitializingThenCleanupIsSetOnPool) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    UsmMemAllocPool::CustomCleanupFn cleanupFn = [](const void *) {};
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {cleanupFn, false, false});
+
+    if (isPoolManagerEnabled) {
+        EXPECT_TRUE(static_cast<bool>(reinterpret_cast<MockUsmMemAllocPoolsManager *>(mockUsmMemAllocPoolsFacade.poolManager.get())->customCleanup));
+    } else {
+        EXPECT_TRUE(static_cast<bool>(reinterpret_cast<MockUsmMemAllocPool *>(mockUsmMemAllocPoolsFacade.pool.get())->customCleanup));
+    }
+}
+
+TEST_P(UnifiedMemoryPoolingFacadeTest, givenInitParamsWithPeerAllocationsFnWhenInitializingThenFnIsSetOnPool) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    UsmMemAllocPool::PeerAllocationsFn peerAllocationsFn = [](const void *) { return StackVec<GraphicsAllocation *, 4>{}; };
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {nullptr, false, false, peerAllocationsFn});
+
+    if (isPoolManagerEnabled) {
+        EXPECT_TRUE(static_cast<bool>(reinterpret_cast<MockUsmMemAllocPoolsManager *>(mockUsmMemAllocPoolsFacade.poolManager.get())->peerAllocationsFn));
+    } else {
+        EXPECT_TRUE(static_cast<bool>(reinterpret_cast<MockUsmMemAllocPool *>(mockUsmMemAllocPoolsFacade.pool.get())->peerAllocationsFn));
+    }
+}
+
+class UnifiedMemoryDevicePoolingFacadeTest : public UnifiedMemoryPoolingFacadeTest {
+  public:
+    void SetUp() override {
+        debugManager.flags.RenderCompressedBuffersEnabled.set(1);
+        UnifiedMemoryPoolingFacadeTest::SetUp();
+        if (IsSkipped()) {
+            return;
+        }
+        if (!device->getGfxCoreHelper().usmCompressionSupported(device->getHardwareInfo())) {
+            GTEST_SKIP();
+        }
+    }
+
+    bool isPoolOfAllocationCompressed(void *allocation) {
+        auto pool = mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool;
+        auto poolAllocationData = svmManager->getSVMAlloc(addrToPtr(pool->getPoolAddress()));
+        return poolAllocationData->gpuAllocations.getDefaultGraphicsAllocation()->isCompressionEnabled();
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    UnifiedMemoryDevicePoolingFacadeTestParameterized,
+    UnifiedMemoryDevicePoolingFacadeTest,
+    ::testing::Combine(
+        ::testing::Values(InternalMemoryType::deviceUnifiedMemory), ::testing::Bool()));
+
+TEST_P(UnifiedMemoryDevicePoolingFacadeTest, givenCompressionSupportedAndDefaultInitParamsWhenAllocatingThenPoolIsCompressed) {
+    void *allocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    ASSERT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool);
+    EXPECT_TRUE(isPoolOfAllocationCompressed(allocation));
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(allocation, FreePolicyType::blocking));
+}
+
+TEST_P(UnifiedMemoryDevicePoolingFacadeTest, givenCompressionSupportedAndInitParamsWithUncompressedPoolWhenAllocatingThenPoolIsNotCompressed) {
+    mockUsmMemAllocPoolsFacade.cleanup();
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {nullptr, false, true, {}, true});
+    void *allocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    ASSERT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(allocation).pool);
+    EXPECT_FALSE(isPoolOfAllocationCompressed(allocation));
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(allocation, FreePolicyType::blocking));
+}
+
+TEST_P(UnifiedMemoryDevicePoolingFacadeTest, givenResourceDecompressionDisabledAndCompressedPoolWhenAllocatingWithCompressionHintsThenOnlyMatchingHintIsPooled) {
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(false);
+    void *noHintAllocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    ASSERT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(noHintAllocation).pool);
+    ASSERT_TRUE(isPoolOfAllocationCompressed(noHintAllocation));
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(noHintAllocation, FreePolicyType::blocking));
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 1u;
+    void *compressedHintAllocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    EXPECT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(compressedHintAllocation).pool);
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(compressedHintAllocation, FreePolicyType::blocking));
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 0u;
+    poolMemoryProperties->allocationFlags.flags.uncompressedHint = 1u;
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties));
+}
+
+TEST_P(UnifiedMemoryDevicePoolingFacadeTest, givenResourceDecompressionDisabledAndUncompressedPoolWhenAllocatingWithCompressionHintsThenOnlyMatchingHintIsPooled) {
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(false);
+    mockUsmMemAllocPoolsFacade.cleanup();
+    mockUsmMemAllocPoolsFacade.initialize(poolMemoryType, rootDeviceIndices, deviceBitfields, device, svmManager.get(), {nullptr, false, true, {}, true});
+    void *noHintAllocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    ASSERT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(noHintAllocation).pool);
+    ASSERT_FALSE(isPoolOfAllocationCompressed(noHintAllocation));
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(noHintAllocation, FreePolicyType::blocking));
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 1u;
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties));
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 0u;
+    poolMemoryProperties->allocationFlags.flags.uncompressedHint = 1u;
+    void *uncompressedHintAllocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    EXPECT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(uncompressedHintAllocation).pool);
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(uncompressedHintAllocation, FreePolicyType::blocking));
+}
+
+TEST_P(UnifiedMemoryDevicePoolingFacadeTest, givenResourceDecompressionDisabledAndPoolManagerWithoutPoolsWhenAllocatingWithCompressionHintThenNoPoolIsAdded) {
+    if (!isPoolManagerEnabled) {
+        GTEST_SKIP();
+    }
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(false);
+    auto poolManager = reinterpret_cast<MockUsmMemAllocPoolsManager *>(mockUsmMemAllocPoolsFacade.poolManager.get());
+    ASSERT_TRUE(poolManager->pools.empty());
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 1u;
+    EXPECT_EQ(nullptr, mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties));
+    EXPECT_TRUE(poolManager->pools.empty());
+}
+
+TEST_P(UnifiedMemoryDevicePoolingFacadeTest, givenResourceDecompressionEnabledAndCompressionHintWhenAllocatingThenAllocationIsPooled) {
+    device->getExecutionEnvironment()->setResourceDecompressionEnabled(true);
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 1u;
+    void *compressedHintAllocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    EXPECT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(compressedHintAllocation).pool);
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(compressedHintAllocation, FreePolicyType::blocking));
+
+    poolMemoryProperties->allocationFlags.flags.compressedHint = 0u;
+    poolMemoryProperties->allocationFlags.flags.uncompressedHint = 1u;
+    void *uncompressedHintAllocation = mockUsmMemAllocPoolsFacade.createUnifiedMemoryAllocation(MemoryConstants::kiloByte, *poolMemoryProperties);
+    EXPECT_NE(nullptr, mockUsmMemAllocPoolsFacade.getPoolContainingAlloc(uncompressedHintAllocation).pool);
+    EXPECT_TRUE(mockUsmMemAllocPoolsFacade.freeSVMAlloc(uncompressedHintAllocation, FreePolicyType::blocking));
+}
+
+TEST(UnifiedMemoryPooling, givenCompressionHintsWhenCreatingPoolMemoryPropertiesThenUncompressedHintWinsAndHintsApplyOnlyToDeviceMemory) {
+    UltDeviceFactory deviceFactory{1, 1};
+    auto device = deviceFactory.rootDevices[0];
+    RootDeviceIndicesContainer rootDeviceIndices = {device->getRootDeviceIndex()};
+    std::map<uint32_t, DeviceBitfield> deviceBitfields{{device->getRootDeviceIndex(), device->getDeviceBitfield()}};
+
+    auto defaultProperties = UsmMemAllocPool::createPoolMemoryProperties(InternalMemoryType::deviceUnifiedMemory, rootDeviceIndices, deviceBitfields, device, false, false);
+    EXPECT_EQ(device, defaultProperties.device);
+    EXPECT_EQ(0u, defaultProperties.allocationFlags.flags.compressedHint);
+    EXPECT_EQ(0u, defaultProperties.allocationFlags.flags.uncompressedHint);
+
+    auto compressedProperties = UsmMemAllocPool::createPoolMemoryProperties(InternalMemoryType::deviceUnifiedMemory, rootDeviceIndices, deviceBitfields, device, true, false);
+    EXPECT_EQ(1u, compressedProperties.allocationFlags.flags.compressedHint);
+    EXPECT_EQ(0u, compressedProperties.allocationFlags.flags.uncompressedHint);
+
+    auto uncompressedProperties = UsmMemAllocPool::createPoolMemoryProperties(InternalMemoryType::deviceUnifiedMemory, rootDeviceIndices, deviceBitfields, device, true, true);
+    EXPECT_EQ(0u, uncompressedProperties.allocationFlags.flags.compressedHint);
+    EXPECT_EQ(1u, uncompressedProperties.allocationFlags.flags.uncompressedHint);
+
+    auto hostProperties = UsmMemAllocPool::createPoolMemoryProperties(InternalMemoryType::hostUnifiedMemory, rootDeviceIndices, deviceBitfields, device, true, true);
+    EXPECT_EQ(nullptr, hostProperties.device);
+    EXPECT_EQ(0u, hostProperties.allocationFlags.flags.compressedHint);
+    EXPECT_EQ(0u, hostProperties.allocationFlags.flags.uncompressedHint);
+}
+
+TEST(UnifiedMemoryPoolingFacade, givenPoolingEnabledWhenDebugFlagSetThenOverrideAppliesPerMemoryType) {
+    DebugManagerStateRestore restorer;
+
+    // device: flag unset -> base value passes through unchanged
+    debugManager.flags.EnableDeviceUsmAllocationPool.set(-1);
+    EXPECT_TRUE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::deviceUnifiedMemory, true));
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::deviceUnifiedMemory, false));
+
+    // device: flag forces the result regardless of base
+    debugManager.flags.EnableDeviceUsmAllocationPool.set(1);
+    EXPECT_TRUE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::deviceUnifiedMemory, false));
+    debugManager.flags.EnableDeviceUsmAllocationPool.set(0);
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::deviceUnifiedMemory, true));
+
+    // host reads the host flag, independent of the device flag (device flag forced off here)
+    debugManager.flags.EnableDeviceUsmAllocationPool.set(0);
+    debugManager.flags.EnableHostUsmAllocationPool.set(-1);
+    EXPECT_TRUE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::hostUnifiedMemory, true));
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::hostUnifiedMemory, false));
+
+    debugManager.flags.EnableHostUsmAllocationPool.set(1);
+    EXPECT_TRUE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::hostUnifiedMemory, false));
+    debugManager.flags.EnableHostUsmAllocationPool.set(0);
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::hostUnifiedMemory, true));
+}
+
+TEST(UnifiedMemoryPoolingFacade, givenUnsupportedMemoryTypeWhenQueryingPoolingEnabledThenPoolingIsDisabledRegardlessOfBaseValue) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.EnableDeviceUsmAllocationPool.set(1);
+    debugManager.flags.EnableHostUsmAllocationPool.set(1);
+
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::sharedUnifiedMemory, true));
+    EXPECT_FALSE(UsmMemAllocPoolsFacade::poolingEnabled(InternalMemoryType::sharedUnifiedMemory, false));
+}

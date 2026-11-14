@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -15,9 +15,11 @@ namespace NEO {
 uint32_t resolveExternalDependencies(const ExternalFunctionInfosT &externalFunctionInfos, const KernelDependenciesT &kernelDependencies,
                                      const FunctionDependenciesT &funcDependencies, const KernelDescriptorMapT &nameToKernelDescriptor) {
     FuncNameToIdMapT funcNameToId;
+    bool anyExtFuncHasPrintf = false;
     for (size_t i = 0U; i < externalFunctionInfos.size(); i++) {
         auto &extFuncInfo = externalFunctionInfos[i];
         funcNameToId[extFuncInfo->functionName] = i;
+        anyExtFuncHasPrintf |= extFuncInfo->hasPrintfCalls;
     }
 
     auto error = resolveExtFuncDependencies(externalFunctionInfos, funcNameToId, funcDependencies);
@@ -26,7 +28,20 @@ uint32_t resolveExternalDependencies(const ExternalFunctionInfosT &externalFunct
     }
 
     error = resolveKernelDependencies(externalFunctionInfos, funcNameToId, kernelDependencies, nameToKernelDescriptor);
-    return error;
+    if (error != RESOLVE_SUCCESS) {
+        return error;
+    }
+
+    // A kernel with indirect calls may dispatch any external function at runtime.
+    if (anyExtFuncHasPrintf) {
+        for (auto &[kernelName, kd] : nameToKernelDescriptor) {
+            if (kd->kernelAttributes.flags.hasIndirectCalls) {
+                kd->kernelAttributes.flags.usesPrintf = true;
+            }
+        }
+    }
+
+    return RESOLVE_SUCCESS;
 }
 
 uint32_t getExtFuncDependencies(const FuncNameToIdMapT &funcNameToId, const FunctionDependenciesT &funcDependencies, size_t numExternalFuncs,
@@ -35,8 +50,11 @@ uint32_t getExtFuncDependencies(const FuncNameToIdMapT &funcNameToId, const Func
     outCalledBy.resize(numExternalFuncs);
     for (size_t i = 0; i < funcDependencies.size(); i++) {
         auto funcDep = funcDependencies[i];
-        if (funcNameToId.count(funcDep->callerFuncName) == 0 ||
-            funcNameToId.count(funcDep->usedFuncName) == 0) {
+        if (!funcNameToId.contains(funcDep->callerFuncName) ||
+            !funcNameToId.contains(funcDep->usedFuncName)) {
+            if (funcDep->optional) {
+                continue;
+            }
             return ERROR_EXTERNAL_FUNCTION_INFO_MISSING;
         }
         size_t callerId = funcNameToId.at(funcDep->callerFuncName);
@@ -65,6 +83,10 @@ uint32_t resolveExtFuncDependencies(const ExternalFunctionInfosT &externalFuncti
             auto caller = externalFunctionInfos[callerId];
             caller->barrierCount = std::max(caller->barrierCount, callee->barrierCount);
             caller->hasRTCalls |= callee->hasRTCalls;
+            caller->hasPrintfCalls |= callee->hasPrintfCalls;
+            caller->hasIndirectCalls |= callee->hasIndirectCalls;
+            caller->requireAssertBuffer |= callee->requireAssertBuffer;
+            caller->requireSyncBuffer |= callee->requireSyncBuffer;
         }
     }
     return RESOLVE_SUCCESS;
@@ -72,15 +94,22 @@ uint32_t resolveExtFuncDependencies(const ExternalFunctionInfosT &externalFuncti
 
 uint32_t resolveKernelDependencies(const ExternalFunctionInfosT &externalFunctionInfos, const FuncNameToIdMapT &funcNameToId, const KernelDependenciesT &kernelDependencies, const KernelDescriptorMapT &nameToKernelDescriptor) {
     for (auto &kernelDep : kernelDependencies) {
-        if (funcNameToId.count(kernelDep->usedFuncName) == 0) {
+        if (!funcNameToId.contains(kernelDep->usedFuncName)) {
+            if (kernelDep->optional) {
+                continue;
+            }
             return ERROR_EXTERNAL_FUNCTION_INFO_MISSING;
-        } else if (nameToKernelDescriptor.count(kernelDep->kernelName) == 0) {
+        } else if (!nameToKernelDescriptor.contains(kernelDep->kernelName)) {
             return ERROR_KERNEL_DESCRIPTOR_MISSING;
         }
         auto &kernelAttributes = nameToKernelDescriptor.at(kernelDep->kernelName)->kernelAttributes;
         const auto &externalFunctionInfo = *externalFunctionInfos.at(funcNameToId.at(kernelDep->usedFuncName));
         kernelAttributes.barrierCount = std::max(externalFunctionInfo.barrierCount, kernelAttributes.barrierCount);
         kernelAttributes.flags.hasRTCalls |= externalFunctionInfo.hasRTCalls;
+        kernelAttributes.flags.usesPrintf |= externalFunctionInfo.hasPrintfCalls;
+        kernelAttributes.flags.hasIndirectCalls |= externalFunctionInfo.hasIndirectCalls;
+        kernelAttributes.flags.usesAssert |= externalFunctionInfo.requireAssertBuffer;
+        kernelAttributes.flags.usesSyncBuffer |= externalFunctionInfo.requireSyncBuffer;
     }
     return RESOLVE_SUCCESS;
 }

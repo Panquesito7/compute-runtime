@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -52,6 +52,15 @@ TEST(AlignmentSelectorTests, givenApplyForSmallerSizeEnabledAndAllocationIsTooSm
     EXPECT_EQ(128u, selector.selectAlignment(127).alignment);
 }
 
+TEST(AlignmentSelectorTests, givenMaximimumPossibleAlignmentWhenSelectAlignmentThenDoNotSelectGreaterThanLimit) {
+    AlignmentSelector selector{};
+    selector.addCandidateAlignment(1024, false, AlignmentSelector::anyWastage);
+    selector.addCandidateAlignment(2048, false, AlignmentSelector::anyWastage);
+
+    EXPECT_EQ(2048u, selector.selectAlignment(90000, std::numeric_limits<size_t>::max()).alignment);
+    EXPECT_EQ(1024u, selector.selectAlignment(90000, 1024u).alignment);
+}
+
 TEST(AlignmentSelectorTests, givenMultipleMatchingCandidateAlignmentsWhenSelectingAlignmentThenSelectTheBiggest) {
     AlignmentSelector selector{};
     selector.addCandidateAlignment(1024, false, AlignmentSelector::anyWastage);
@@ -84,18 +93,18 @@ TEST(AlignmentSelectorTests, givenMaxWastageThresholdWhenSelectingAlignmentThenR
 TEST(AlignmentSelectorTests, givenCandidateArgumentHeapNotProvidedWhenSelectingAlignmentThenDefaultToUnknownHeap) {
     AlignmentSelector selector{};
     selector.addCandidateAlignment(1, false, AlignmentSelector::anyWastage);
-    EXPECT_EQ(HeapIndex::TOTAL_HEAPS, selector.selectAlignment(1).heap);
+    EXPECT_EQ(HeapIndex::totalHeaps, selector.selectAlignment(1).heap);
 }
 
 TEST(AlignmentSelectorTests, givenCandidateArgumentHeapProvidedWhenSelectingAlignmentThenReturnTheHeap) {
     AlignmentSelector selector{};
-    selector.addCandidateAlignment(1, false, AlignmentSelector::anyWastage, HeapIndex::HEAP_INTERNAL);
-    selector.addCandidateAlignment(16, false, AlignmentSelector::anyWastage, HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY);
-    selector.addCandidateAlignment(32, false, AlignmentSelector::anyWastage, HeapIndex::HEAP_STANDARD2MB);
+    selector.addCandidateAlignment(1, false, AlignmentSelector::anyWastage, HeapIndex::heapInternal);
+    selector.addCandidateAlignment(16, false, AlignmentSelector::anyWastage, HeapIndex::heapExternalDeviceMemory);
+    selector.addCandidateAlignment(32, false, AlignmentSelector::anyWastage, HeapIndex::heapStandard2MB);
 
-    EXPECT_EQ(HeapIndex::HEAP_INTERNAL, selector.selectAlignment(1).heap);
-    EXPECT_EQ(HeapIndex::HEAP_EXTERNAL_DEVICE_MEMORY, selector.selectAlignment(16).heap);
-    EXPECT_EQ(HeapIndex::HEAP_STANDARD2MB, selector.selectAlignment(32).heap);
+    EXPECT_EQ(HeapIndex::heapInternal, selector.selectAlignment(1).heap);
+    EXPECT_EQ(HeapIndex::heapExternalDeviceMemory, selector.selectAlignment(16).heap);
+    EXPECT_EQ(HeapIndex::heapStandard2MB, selector.selectAlignment(32).heap);
 }
 
 } // namespace NEO

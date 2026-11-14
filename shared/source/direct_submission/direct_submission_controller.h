@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,60 +9,137 @@
 
 #include "shared/source/command_stream/task_count_helper.h"
 #include "shared/source/helpers/device_bitfield.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <queue>
 #include <unordered_map>
 
 namespace NEO {
 class MemoryManager;
 class CommandStreamReceiver;
 class Thread;
+class ProductHelper;
 
 using SteadyClock = std::chrono::steady_clock;
+
+struct WaitForPagingFenceRequest {
+    CommandStreamReceiver *csr;
+    uint64_t pagingFenceValue;
+};
+
+enum class TimeoutElapsedMode {
+    notElapsed,
+    bcsOnly,
+    fullyElapsed
+};
 
 class DirectSubmissionController {
   public:
     static constexpr size_t defaultTimeout = 5'000;
+    static constexpr size_t defaultContextGroupTimeout = 1'000;
+    static constexpr size_t timeToPollTagUpdateNS = 20'000;
     DirectSubmissionController();
     virtual ~DirectSubmissionController();
 
     void registerDirectSubmission(CommandStreamReceiver *csr);
     void unregisterDirectSubmission(CommandStreamReceiver *csr);
 
-    void startControlling();
+    void startThread();
+    void stopThread();
 
     static bool isSupported();
 
+    void enqueueWaitForPagingFence(CommandStreamReceiver *csr, uint64_t pagingFenceValue);
+    void drainPagingFenceQueue();
+    void notifyNewSubmission(const CommandStreamReceiver *csr);
+
   protected:
     struct DirectSubmissionState {
-        bool isStopped = true;
-        TaskCountType taskCount = 0u;
+        DirectSubmissionState(DirectSubmissionState &&other) noexcept {
+            isActive = other.isActive.load();
+            isStopped = other.isStopped.load();
+            taskCount = other.taskCount.load();
+            idleSince = other.idleSince;
+        }
+        DirectSubmissionState &operator=(const DirectSubmissionState &other) {
+            if (this == &other) {
+                return *this;
+            }
+            this->isActive = other.isActive.load();
+            this->isStopped = other.isStopped.load();
+            this->taskCount = other.taskCount.load();
+            this->idleSince = other.idleSince;
+            return *this;
+        }
+
+        DirectSubmissionState() = default;
+        ~DirectSubmissionState() = default;
+
+        DirectSubmissionState(const DirectSubmissionState &other) = delete;
+        DirectSubmissionState &operator=(DirectSubmissionState &&other) = delete;
+
+        std::atomic_bool isActive{false};
+        std::atomic_bool isStopped{true};
+        std::atomic<TaskCountType> taskCount{0};
+        std::optional<SteadyClock::time_point> idleSince{};
+    };
+
+    struct ContextGroupProgress {
+        uint64_t taskCountsSum = 0;
+        uint64_t currentTaskCountsSum = 0;
+        bool hasProgressed = false;
     };
 
     static void *controlDirectSubmissionsState(void *self);
-    void checkNewSubmissions();
-    MOCKABLE_VIRTUAL void sleep();
+    MOCKABLE_VIRTUAL void checkNewSubmissions();
+    void updateContextGroupsProgress(SteadyClock::time_point now);
+    bool hasContextGroupProgressed(CommandStreamReceiver *csr);
+    bool isDirectSubmissionIdle(CommandStreamReceiver *csr, std::unique_lock<std::recursive_mutex> &csrLock);
+    bool isCsrIdleAfterTagFlush(CommandStreamReceiver *csr, std::unique_lock<std::recursive_mutex> &csrLock);
+    bool isCsrIdleWithoutTagFlush(CommandStreamReceiver *csr);
+    bool areOtherContextGroupMembersIdle(CommandStreamReceiver *csr);
+    bool isCopyEngineOnDeviceIdle(uint32_t rootDeviceIndex, std::optional<TaskCountType> &bcsTaskCount);
+    MOCKABLE_VIRTUAL bool sleep(std::unique_lock<std::mutex> &lock);
+    bool waitPredicate() { return !keepControlling || !pagingFenceRequests.empty() || activeSubmissionsCount; }
+    MOCKABLE_VIRTUAL void wait(std::unique_lock<std::mutex> &lock) {
+        condVar.wait(lock, [&]() { return waitPredicate(); });
+    }
     MOCKABLE_VIRTUAL SteadyClock::time_point getCpuTimestamp();
+    MOCKABLE_VIRTUAL void overrideDirectSubmissionTimeouts(const ProductHelper &productHelper);
 
-    void adjustTimeout(CommandStreamReceiver *csr);
-    void recalculateTimeout();
+    MOCKABLE_VIRTUAL void handlePagingFenceRequests(std::unique_lock<std::mutex> &lock);
+    MOCKABLE_VIRTUAL TimeoutElapsedMode timeoutElapsed();
+    std::chrono::microseconds getSleepValue() const { return std::chrono::microseconds(this->timeout / this->bcsTimeoutDivisor); }
 
     uint32_t maxCcsCount = 1u;
     std::array<uint32_t, DeviceBitfield().size()> ccsCount = {};
     std::unordered_map<CommandStreamReceiver *, DirectSubmissionState> directSubmissions;
     std::mutex directSubmissionsMutex;
+    std::unordered_map<uint32_t, SteadyClock::time_point> groupLastActivityTime;
+    std::unordered_map<uint32_t, ContextGroupProgress> contextGroupsProgress;
 
     std::unique_ptr<Thread> directSubmissionControllingThread;
     std::atomic_bool keepControlling = true;
-    std::atomic_bool runControlling = false;
+    std::atomic_uint activeSubmissionsCount = 0;
 
-    SteadyClock::time_point lastTerminateCpuTimestamp{};
-    std::chrono::microseconds maxTimeout{defaultTimeout};
+    SteadyClock::time_point timeSinceLastCheck{};
+    int64_t lastHangCheckTime{};
     std::chrono::microseconds timeout{defaultTimeout};
-    int timeoutDivisor = 1;
+    std::chrono::microseconds contextGroupTimeout{defaultContextGroupTimeout};
+    int32_t bcsTimeoutDivisor = 1;
+    bool isCsrIdleDetectionEnabled = false;
+    bool isCsrsContextGroupIdleDetectionEnabled = false;
+
+    std::condition_variable condVar;
+    std::mutex condVarMutex;
+
+    std::queue<WaitForPagingFenceRequest> pagingFenceRequests;
 };
 } // namespace NEO

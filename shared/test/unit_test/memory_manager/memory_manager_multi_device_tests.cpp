@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,16 +14,19 @@
 #include "shared/test/common/mocks/mock_graphics_allocation.h"
 #include "shared/test/common/test_macros/test.h"
 
+#include <algorithm>
+
 using namespace NEO;
 
 using MemoryManagerMultiDeviceTest = MemoryAllocatorMultiDeviceFixture<10>;
 
 TEST_P(MemoryManagerMultiDeviceTest, givenRootDeviceIndexSpecifiedWhenAllocateGraphicsMemoryIsCalledThenGraphicsAllocationHasTheSameRootDeviceIndex) {
-    std::vector<AllocationType> allocationTypes{AllocationType::BUFFER,
-                                                AllocationType::KERNEL_ISA};
+    std::vector<AllocationType> allocationTypes{AllocationType::buffer,
+                                                AllocationType::kernelIsa};
     for (auto allocationType : allocationTypes) {
         for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < getNumRootDevices(); ++rootDeviceIndex) {
             AllocationProperties properties{rootDeviceIndex, true, MemoryConstants::pageSize, allocationType, false, false, mockDeviceBitfield};
+            MemoryManager::OsHandleData osHandleData{static_cast<uint64_t>(0ull)};
 
             auto gfxAllocation = memoryManager->allocateGraphicsMemoryWithProperties(properties);
             ASSERT_NE(gfxAllocation, nullptr);
@@ -45,12 +48,12 @@ TEST_P(MemoryManagerMultiDeviceTest, givenRootDeviceIndexSpecifiedWhenAllocateGr
             EXPECT_EQ(rootDeviceIndex, gfxAllocation->getRootDeviceIndex());
             memoryManager->freeGraphicsMemory(gfxAllocation);
 
-            gfxAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(static_cast<osHandle>(0u), properties, false, false, true, nullptr);
+            gfxAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, false, false, true, nullptr);
             ASSERT_NE(gfxAllocation, nullptr);
             EXPECT_EQ(rootDeviceIndex, gfxAllocation->getRootDeviceIndex());
             memoryManager->freeGraphicsMemory(gfxAllocation);
 
-            gfxAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(static_cast<osHandle>(0u), properties, true, false, true, nullptr);
+            gfxAllocation = memoryManager->createGraphicsAllocationFromSharedHandle(osHandleData, properties, true, false, true, nullptr);
             ASSERT_NE(gfxAllocation, nullptr);
             EXPECT_EQ(rootDeviceIndex, gfxAllocation->getRootDeviceIndex());
             memoryManager->freeGraphicsMemory(gfxAllocation);
@@ -58,20 +61,19 @@ TEST_P(MemoryManagerMultiDeviceTest, givenRootDeviceIndexSpecifiedWhenAllocateGr
     }
 }
 
-INSTANTIATE_TEST_CASE_P(MemoryManagerType, MemoryManagerMultiDeviceTest, ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(MemoryManagerType, MemoryManagerMultiDeviceTest, ::testing::Bool());
 
 TEST_P(MemoryManagerMultiDeviceTest, givenRootDeviceIndexSpecifiedWhenAllocateGraphicsMemoryIsCalledThenGraphicsAllocationHasProperGpuAddress) {
     RootDeviceIndicesContainer rootDeviceIndices;
 
     for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < getNumRootDevices(); ++rootDeviceIndex) {
-        rootDeviceIndices.push_back(rootDeviceIndex);
+        rootDeviceIndices.pushUnique(rootDeviceIndex);
     }
-    rootDeviceIndices.remove_duplicates();
 
     auto maxRootDeviceIndex = *std::max_element(rootDeviceIndices.begin(), rootDeviceIndices.end(), std::less<uint32_t const>());
     auto tagsMultiAllocation = new MultiGraphicsAllocation(maxRootDeviceIndex);
 
-    AllocationProperties unifiedMemoryProperties{rootDeviceIndices.at(0), MemoryConstants::pageSize, AllocationType::TAG_BUFFER, systemMemoryBitfield};
+    AllocationProperties unifiedMemoryProperties{rootDeviceIndices.at(0), MemoryConstants::pageSize, AllocationType::tagBuffer, systemMemoryBitfield};
 
     memoryManager->createMultiGraphicsAllocationInSystemMemoryPool(rootDeviceIndices, unifiedMemoryProperties, *tagsMultiAllocation);
     EXPECT_NE(nullptr, tagsMultiAllocation);
@@ -92,14 +94,13 @@ TEST_P(MemoryManagerMultiDeviceTest, givenRootDeviceIndexSpecifiedWhenAllocateGr
     RootDeviceIndicesContainer rootDeviceIndices;
 
     for (uint32_t rootDeviceIndex = 0; rootDeviceIndex < getNumRootDevices(); ++rootDeviceIndex) {
-        rootDeviceIndices.push_back(rootDeviceIndex);
+        rootDeviceIndices.pushUnique(rootDeviceIndex);
     }
-    rootDeviceIndices.remove_duplicates();
 
     auto maxRootDeviceIndex = *std::max_element(rootDeviceIndices.begin(), rootDeviceIndices.end(), std::less<uint32_t const>());
     auto tagsMultiAllocation = new MultiGraphicsAllocation(maxRootDeviceIndex);
 
-    AllocationProperties unifiedMemoryProperties{rootDeviceIndices.at(0), MemoryConstants::pageSize, AllocationType::TAG_BUFFER, systemMemoryBitfield};
+    AllocationProperties unifiedMemoryProperties{rootDeviceIndices.at(0), MemoryConstants::pageSize, AllocationType::tagBuffer, systemMemoryBitfield};
 
     memoryManager->createMultiGraphicsAllocationInSystemMemoryPool(rootDeviceIndices, unifiedMemoryProperties, *tagsMultiAllocation);
     EXPECT_NE(nullptr, tagsMultiAllocation);

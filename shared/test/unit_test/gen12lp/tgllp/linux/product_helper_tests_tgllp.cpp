@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -28,46 +28,10 @@ struct TgllpProductHelperLinux : ProductHelperTestLinux {
     }
 };
 
-TGLLPTEST_F(TgllpProductHelperLinux, GivenTGLLPWhenConfigureHardwareCustomThenMTPIsNotSet) {
-
-    pInHwInfo.capabilityTable.defaultPreemptionMode = PreemptionMode::ThreadGroup;
-    PreemptionHelper::adjustDefaultPreemptionMode(pInHwInfo.capabilityTable, true, true, true);
-
-    auto ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-    EXPECT_EQ(0, ret);
-    EXPECT_FALSE(outHwInfo.featureTable.flags.ftrGpGpuMidThreadLevelPreempt);
-}
-
-TGLLPTEST_F(TgllpProductHelperLinux, WhenConfiguringHwInfoThenInfoIsSetCorrectly) {
-
-    auto ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-    EXPECT_EQ(0, ret);
-    EXPECT_EQ((uint32_t)drm->storedEUVal, outHwInfo.gtSystemInfo.EUCount);
-    EXPECT_EQ((uint32_t)drm->storedSSVal, outHwInfo.gtSystemInfo.SubSliceCount);
-    EXPECT_EQ(1u, outHwInfo.gtSystemInfo.SliceCount);
-
-    EXPECT_FALSE(outHwInfo.featureTable.flags.ftrTileY);
-}
-
-TGLLPTEST_F(TgllpProductHelperLinux, GivenInvalidDeviceIdWhenConfiguringHwInfoThenErrorIsReturned) {
-
-    drm->failRetTopology = true;
-    drm->storedRetValForEUVal = -1;
-
-    auto ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-    EXPECT_EQ(-1, ret);
-
-    drm->storedRetValForEUVal = 0;
-    drm->storedRetValForSSVal = -1;
-
-    ret = productHelper->configureHwInfoDrm(&pInHwInfo, &outHwInfo, getRootDeviceEnvironment());
-    EXPECT_EQ(-1, ret);
-}
-
 template <typename T>
 class TgllpHwInfoLinux : public ::testing::Test {};
-typedef ::testing::Types<TgllpHw1x6x16> tgllpTestTypes;
-TYPED_TEST_CASE(TgllpHwInfoLinux, tgllpTestTypes);
+typedef ::testing::Types<TGLLP> tgllpTestTypes;
+TYPED_TEST_SUITE(TgllpHwInfoLinux, tgllpTestTypes);
 TYPED_TEST(TgllpHwInfoLinux, gtSetupIsCorrect) {
     auto executionEnvironment = std::make_unique<ExecutionEnvironment>();
     executionEnvironment->prepareRootDeviceEnvironments(1);
@@ -75,9 +39,10 @@ TYPED_TEST(TgllpHwInfoLinux, gtSetupIsCorrect) {
     executionEnvironment->rootDeviceEnvironments[0]->initGmm();
 
     DrmMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    DeviceDescriptor device = {0, &TypeParam::hwInfo, &TypeParam::setupHardwareInfo};
+    DeviceDescriptor device = {0, IGFX_TIGERLAKE_LP};
+    drm.overrideDeviceDescriptor = &device;
 
-    int ret = drm.setupHardwareInfo(&device, false);
+    int ret = drm.setupHardwareInfo(0, false);
 
     const auto &gtSystemInfo = executionEnvironment->rootDeviceEnvironments[0]->getHardwareInfo()->gtSystemInfo;
 
@@ -89,7 +54,7 @@ TYPED_TEST(TgllpHwInfoLinux, gtSetupIsCorrect) {
     EXPECT_GT(gtSystemInfo.DualSubSliceCount, 0u);
     EXPECT_GT_VAL(gtSystemInfo.L3CacheSizeInKb, 0u);
     EXPECT_EQ(gtSystemInfo.CsrSizeInMb, 8u);
-    EXPECT_FALSE(gtSystemInfo.IsDynamicallyPopulated);
+    EXPECT_TRUE(gtSystemInfo.IsDynamicallyPopulated);
     EXPECT_GT(gtSystemInfo.DualSubSliceCount, 0u);
     EXPECT_GT(gtSystemInfo.MaxDualSubSlicesSupported, 0u);
 }

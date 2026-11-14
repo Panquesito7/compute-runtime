@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,6 +13,11 @@ namespace aub_stream {
 
 struct AllocationParams;
 struct SurfaceInfo;
+
+struct CompareOperationValues {
+    enum { CompareNotEqual = 1,
+           CompareEqual = 0 };
+};
 
 struct HardwareContext {
     virtual void initialize() = 0;
@@ -29,6 +34,11 @@ struct HardwareContext {
     virtual void writeMemory2(AllocationParams allocationParams) = 0;
     virtual void writeMMIO(uint32_t offset, uint32_t value) = 0;
     virtual void pollForFenceCompletion() = 0;
+    virtual void release() {};
+    virtual uint32_t getCurrentFence() { return 0; };
+    virtual uint32_t getExpectedFence() { return 0; };
+    virtual bool isActive() { return false; };
+    virtual void resubmit() {};
 };
 
 } // namespace aub_stream

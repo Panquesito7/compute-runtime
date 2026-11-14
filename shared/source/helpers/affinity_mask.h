@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,10 +10,16 @@
 #include "shared/source/helpers/device_bitfield.h"
 
 #include <bitset>
+#include <cstdint>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace NEO {
+
+inline bool isAffinityMaskSet(const std::string &affinityMask) {
+    return affinityMask.compare("default") != 0 && !affinityMask.empty();
+}
 
 class AffinityMaskHelper {
   public:
@@ -33,10 +39,6 @@ class AffinityMaskHelper {
 
     void enableGenericSubDevice(uint32_t subDeviceIndex) {
         enableGenericSubDevice(subDeviceIndex, std::numeric_limits<uint32_t>::max());
-    }
-
-    void enableEngineInstancedSubDevice(uint32_t subDeviceIndex, uint32_t engineIndex) {
-        enableGenericSubDevice(subDeviceIndex, (1u << engineIndex));
     }
 
     void enableAllGenericSubDevices(uint32_t subDeviceCount) {

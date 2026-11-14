@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -16,14 +16,15 @@
 namespace L0 {
 
 class OsDiagnostics;
+struct OsSysman;
 
-class DiagnosticsImp : public Diagnostics, NEO::NonCopyableOrMovableClass {
+class DiagnosticsImp : public Diagnostics, NEO::NonCopyableAndNonMovableClass {
   public:
     ze_result_t diagnosticsGetProperties(zes_diag_properties_t *pProperties) override;
     ze_result_t diagnosticsGetTests(uint32_t *pCount, zes_diag_test_t *pTests) override;
     ze_result_t diagnosticsRunTests(uint32_t start, uint32_t end, zes_diag_result_t *pResult) override;
     DiagnosticsImp() = default;
-    DiagnosticsImp(OsSysman *pOsSysman, const std::string &initalizedDiagTest);
+    DiagnosticsImp(OsSysman *pOsSysman, const std::string &initializedDiagTest);
     ~DiagnosticsImp() override;
     std::unique_ptr<OsDiagnostics> pOsDiagnostics = nullptr;
 };

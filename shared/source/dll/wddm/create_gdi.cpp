@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2024 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,15 +12,15 @@
 namespace NEO {
 
 inline const std::string getGdiName() {
-    if (DebugManager.flags.OverrideGdiPath.get() != "unk") {
-        return DebugManager.flags.OverrideGdiPath.get();
+    if (debugManager.flags.OverrideGdiPath.get() != "unk") {
+        return debugManager.flags.OverrideGdiPath.get();
     } else {
         return Os::gdiDllName;
     }
 }
 
 NEO::OsLibrary *Gdi::createGdiDLL() {
-    return NEO::OsLibrary::load(getGdiName(), nullptr);
+    return NEO::OsLibrary::loadFunc(getGdiName());
 }
 
 } // namespace NEO

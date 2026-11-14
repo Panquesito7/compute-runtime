@@ -1,44 +1,50 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/os_interface/linux/drm_neo.h"
 #include "shared/source/os_interface/linux/engine_info.h"
+#include "shared/source/os_interface/linux/hw_device_id.h"
 #include "shared/source/os_interface/linux/i915_prelim.h"
 
 #include "level_zero/core/test/unit_tests/mocks/mock_memory_manager.h"
 #include "level_zero/tools/source/sysman/engine/engine_imp.h"
 #include "level_zero/tools/source/sysman/engine/linux/os_engine_imp.h"
+#include "level_zero/tools/source/sysman/linux/fs_access.h"
 #include "level_zero/tools/source/sysman/linux/os_sysman_imp.h"
 #include "level_zero/tools/source/sysman/linux/pmu/pmu_imp.h"
+#include "level_zero/tools/test/unit_tests/sources/sysman/linux/pmu/mock_pmu.h"
+
+#include "gtest/gtest.h"
 
 using namespace NEO;
 namespace L0 {
 namespace ult {
-constexpr int64_t mockPmuFd = 10;
-constexpr uint64_t mockTimestamp = 87654321;
 constexpr uint64_t mockActiveTime = 987654321;
-const uint32_t microSecondsToNanoSeconds = 1000u;
-constexpr uint16_t I915_INVALID_ENGINE_CLASS = UINT16_MAX;
+constexpr uint16_t invalidEngineClass = UINT16_MAX;
 const std::string deviceDir("device");
 constexpr uint32_t numberOfMockedEnginesForSingleTileDevice = 7u;
 constexpr uint32_t numberOfTiles = 2u;
 constexpr uint32_t numberOfMockedEnginesForMultiTileDevice = 2u;
+constexpr uint32_t singleEngineInstanceCount = 1u;
+
 struct MockMemoryManagerInEngineSysman : public MemoryManagerMock {
     MockMemoryManagerInEngineSysman(NEO::ExecutionEnvironment &executionEnvironment) : MemoryManagerMock(const_cast<NEO::ExecutionEnvironment &>(executionEnvironment)) {}
 };
 
-struct MockEngineNeoDrm : public Drm {
+struct MockEngineNeoDrmPrelim : public Drm {
     using Drm::engineInfo;
     using Drm::setupIoctlHelper;
-    const int mockFd = 0;
-    MockEngineNeoDrm(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<HwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
+    static constexpr int mockFd = 0;
+    MockEngineNeoDrmPrelim(RootDeviceEnvironment &rootDeviceEnvironment) : Drm(std::make_unique<HwDeviceIdDrm>(mockFd, ""), rootDeviceEnvironment) {}
 
     bool mockReadSysmanQueryEngineInfo = false;
     bool mockReadSysmanQueryEngineInfoMultiDevice = false;
+    static bool mockQuerySingleEngineInstance;
 
     bool sysmanQueryEngineInfo() override {
 
@@ -63,10 +69,16 @@ struct MockEngineNeoDrm : public Drm {
         i915QueryEngineInfo[4].engine.engineInstance = 0;
         i915QueryEngineInfo[5].engine.engineClass = PrelimI915::prelim_drm_i915_gem_engine_class::PRELIM_I915_ENGINE_CLASS_COMPUTE;
         i915QueryEngineInfo[5].engine.engineInstance = 0;
-        i915QueryEngineInfo[6].engine.engineClass = I915_INVALID_ENGINE_CLASS;
+        i915QueryEngineInfo[6].engine.engineClass = invalidEngineClass;
         i915QueryEngineInfo[6].engine.engineInstance = 0;
 
-        this->engineInfo.reset(new EngineInfo(this, i915QueryEngineInfo));
+        if (mockQuerySingleEngineInstance == true) {
+            i915QueryEngineInfo.resize(singleEngineInstanceCount);
+        }
+
+        StackVec<std::vector<NEO::EngineCapabilities>, 2> engineInfosPerTile{i915QueryEngineInfo};
+
+        this->engineInfo.reset(new EngineInfo(this, engineInfosPerTile));
         return true;
     }
 
@@ -100,16 +112,25 @@ struct MockEngineNeoDrm : public Drm {
     }
 };
 
-struct MockEnginePmuInterfaceImp : public PmuInterfaceImp {
-    using PmuInterfaceImp::perfEventOpen;
-    MockEnginePmuInterfaceImp(LinuxSysmanImp *pLinuxSysmanImp) : PmuInterfaceImp(pLinuxSysmanImp) {}
+struct MockEnginePmuInterfaceImpPrelim : public MockPmuInterfaceImpForSysman {
+    MockEnginePmuInterfaceImpPrelim(LinuxSysmanImp *pLinuxSysmanImp) : MockPmuInterfaceImpForSysman(pLinuxSysmanImp) {}
 
     bool mockPmuRead = false;
     bool mockPerfEventOpenRead = false;
+    int32_t mockErrorNumber = -ENOSPC;
+    int32_t mockPerfEventOpenFailAtCount = 1;
+    uint64_t mockTimestamp = 87654321;
+    static uint32_t engineConfigIndex;
+    std::vector<uint64_t> mockSingleEngineConfigs = {
+        __PRELIM_I915_PMU_TOTAL_ACTIVE_TICKS(0),
+        PRELIM_I915_PMU_ENGINE_TOTAL_TICKS(drm_i915_gem_engine_class::I915_ENGINE_CLASS_RENDER, 0),
+        __PRELIM_I915_PMU_TOTAL_ACTIVE_TICKS(0)};
 
     int64_t perfEventOpen(perf_event_attr *attr, pid_t pid, int cpu, int groupFd, uint64_t flags) override {
 
-        if (mockPerfEventOpenRead == true) {
+        mockPerfEventOpenFailAtCount = std::max<int32_t>(mockPerfEventOpenFailAtCount - 1, 1);
+        const bool shouldCheckForError = (mockPerfEventOpenFailAtCount == 1);
+        if (shouldCheckForError && mockPerfEventOpenRead == true) {
             return mockedPerfEventOpenAndFailureReturn(attr, pid, cpu, groupFd, flags);
         }
 
@@ -117,10 +138,15 @@ struct MockEnginePmuInterfaceImp : public PmuInterfaceImp {
     }
 
     int64_t mockedPerfEventOpenAndFailureReturn(perf_event_attr *attr, pid_t pid, int cpu, int groupFd, uint64_t flags) {
+        errno = mockErrorNumber;
         return -1;
     }
 
     int pmuRead(int fd, uint64_t *data, ssize_t sizeOfdata) override {
+
+        if (fd < 0) {
+            return -1;
+        }
 
         if (mockPmuRead == true) {
             return mockedPmuReadAndFailureReturn(fd, data, sizeOfdata);
@@ -128,15 +154,25 @@ struct MockEnginePmuInterfaceImp : public PmuInterfaceImp {
 
         data[0] = mockActiveTime;
         data[1] = mockTimestamp;
+        data[2] = mockActiveTime;
+        data[3] = mockTimestamp;
         return 0;
     }
 
     int mockedPmuReadAndFailureReturn(int fd, uint64_t *data, ssize_t sizeOfdata) {
         return -1;
     }
+
+    int64_t pmuInterfaceOpen(uint64_t config, int group, uint32_t format) override {
+        if (group > -1 && MockEngineNeoDrmPrelim::mockQuerySingleEngineInstance == true) {
+            auto testConfig = mockSingleEngineConfigs[engineConfigIndex++];
+            EXPECT_EQ(config, testConfig);
+        }
+        return MockPmuInterfaceImpForSysman::pmuInterfaceOpen(config, group, format);
+    }
 };
 
-struct MockEngineFsAccess : public FsAccess {
+struct MockEngineFsAccessPrelim : public FsAccess {
 
     bool mockReadVal = false;
 
@@ -156,10 +192,12 @@ struct MockEngineFsAccess : public FsAccess {
     }
 };
 
-struct MockEngineSysfsAccess : public SysfsAccess {
+struct MockEngineSysfsAccessPrelim : public SysfsAccess {
 
     bool mockReadSymLinkFailure = false;
     bool mockReadSymLinkSuccess = false;
+    ze_result_t mockReadStatus = ZE_RESULT_SUCCESS;
+    uint32_t mockReadVal = 0;
 
     ze_result_t readSymLink(const std::string file, std::string &val) override {
 
@@ -180,6 +218,7 @@ struct MockEngineSysfsAccess : public SysfsAccess {
             val = "/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:01.0/0000:03:00.0";
             return ZE_RESULT_SUCCESS;
         }
+
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
@@ -187,7 +226,12 @@ struct MockEngineSysfsAccess : public SysfsAccess {
         return ZE_RESULT_ERROR_NOT_AVAILABLE;
     }
 
-    MockEngineSysfsAccess() = default;
+    ze_result_t read(const std::string file, uint32_t &val) override {
+        val = mockReadVal;
+        return mockReadStatus;
+    }
+
+    MockEngineSysfsAccessPrelim() = default;
 };
 } // namespace ult
 } // namespace L0

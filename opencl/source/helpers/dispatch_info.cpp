@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -13,19 +13,15 @@
 namespace NEO {
 
 bool DispatchInfo::usesSlm() const {
-    return (kernel == nullptr) ? false : kernel->getSlmTotalSize() > 0;
+    return (kernel == nullptr) ? false : kernel->getSlmTotalSizePerThreadGroup() > 0;
 }
 
 bool DispatchInfo::usesStatelessPrintfSurface() const {
     return (kernel == nullptr) ? false : kernel->hasPrintfOutput();
 }
 
-uint32_t DispatchInfo::getRequiredScratchSize() const {
-    return (kernel == nullptr) ? 0 : kernel->getScratchSize();
-}
-
-uint32_t DispatchInfo::getRequiredPrivateScratchSize() const {
-    return (kernel == nullptr) ? 0 : kernel->getPrivateScratchSize();
+uint32_t DispatchInfo::getRequiredScratchSize(uint32_t slotId) const {
+    return (kernel == nullptr) ? 0 : kernel->getScratchSize(slotId);
 }
 
 MultiDispatchInfo::~MultiDispatchInfo() {

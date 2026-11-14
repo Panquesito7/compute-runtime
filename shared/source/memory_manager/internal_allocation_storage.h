@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #pragma once
 #include "shared/source/memory_manager/allocations_list.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <array>
 
@@ -21,9 +22,11 @@ class InternalAllocationStorage {
     void storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation> &&gfxAllocation, uint32_t allocationUsage, TaskCountType taskCount);
     std::unique_ptr<GraphicsAllocation> obtainReusableAllocation(size_t requiredSize, AllocationType allocationType);
     std::unique_ptr<GraphicsAllocation> obtainTemporaryAllocationWithPtr(size_t requiredSize, const void *requiredPtr, AllocationType allocationType);
-    AllocationsList &getTemporaryAllocations() { return allocationLists[TEMPORARY_ALLOCATION]; }
+    std::unique_ptr<GraphicsAllocation> obtainTemporaryAllocationWithPtr(size_t requiredSize, const void *requiredPtr, AllocationType allocationType, bool *nonUsmHostPtrPartialOverlapFound);
+    AllocationsList &getTemporaryAllocations();
     AllocationsList &getAllocationsForReuse() { return allocationLists[REUSABLE_ALLOCATION]; }
     AllocationsList &getDeferredAllocations() { return allocationLists[DEFERRED_DEALLOCATION]; }
+    CommandStreamReceiver &getCommandStreamReceiver() { return commandStreamReceiver; }
     DeviceBitfield getDeviceBitfield() const;
 
   protected:

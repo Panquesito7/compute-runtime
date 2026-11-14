@@ -1,35 +1,61 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_container/implicit_scaling.h"
-#include "shared/source/gen9/reg_configs.h"
+#include "shared/source/command_container/cmdcontainer.h"
+#include "shared/source/command_container/command_encoder.h"
+#include "shared/source/command_container/encode_indirect_params.h"
+#include "shared/source/command_stream/linear_stream.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/device/device.h"
+#include "shared/source/device/device_info.h"
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/helpers/aligned_memory.h"
+#include "shared/source/helpers/compiler_product_helper.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/local_id_gen.h"
 #include "shared/source/helpers/per_thread_data.h"
+#include "shared/source/helpers/ptr_math.h"
+#include "shared/source/helpers/register_offsets.h"
 #include "shared/source/indirect_heap/indirect_heap.h"
-#include "shared/source/kernel/implicit_args.h"
-#include "shared/source/utilities/software_tags_manager.h"
+#include "shared/source/indirect_heap/indirect_heap_type.h"
+#include "shared/source/kernel/implicit_args_helper.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/utilities/software_tags.h"
 #include "shared/test/common/cmd_parse/gen_cmd_parse.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/stream_capture.h"
+#include "shared/test/common/helpers/test_traits.h"
 #include "shared/test/common/helpers/unit_test_helper.h"
-#include "shared/test/common/mocks/mock_compilers.h"
+#include "shared/test/common/mocks/mock_bindless_heaps_helper.h"
 #include "shared/test/common/test_macros/hw_test.h"
 
+#include "level_zero/core/source/context/context.h"
 #include "level_zero/core/source/event/event.h"
 #include "level_zero/core/test/unit_tests/fixtures/module_fixture.h"
 #include "level_zero/core/test/unit_tests/fixtures/multi_tile_fixture.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_cmdlist.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_module.h"
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+using namespace NEO;
+#include "shared/test/common/test_macros/heapless_matchers.h"
+
 namespace L0 {
 namespace ult {
 struct CommandListAppendLaunchKernelSWTags : public Test<ModuleFixture> {
     void SetUp() override {
 
-        NEO::DebugManager.flags.EnableSWTags.set(true);
+        NEO::debugManager.flags.EnableSWTags.set(true);
         ModuleFixture::setUp();
     }
 
@@ -39,9 +65,9 @@ struct CommandListAppendLaunchKernelSWTags : public Test<ModuleFixture> {
 struct CommandListDualStorage : public Test<ModuleFixture> {
     void SetUp() override {
 
-        DebugManager.flags.EnableLocalMemory.set(1);
-        DebugManager.flags.AllocateSharedAllocationsWithCpuAndGpuStorage.set(1);
-        ModuleFixture::setUp();
+        debugManager.flags.EnableLocalMemory.set(1);
+        debugManager.flags.AllocateSharedAllocationsWithCpuAndGpuStorage.set(1);
+        ModuleFixture::setUp(true);
     }
     void TearDown() override {
         ModuleFixture::tearDown();
@@ -55,7 +81,9 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     using MI_LOAD_REGISTER_REG = typename FamilyType::MI_LOAD_REGISTER_REG;
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
 
-    Mock<::L0::Kernel> kernel;
+    std::unique_ptr<L0::ult::Module> mockModule = std::make_unique<L0::ult::Module>(device, nullptr, ModuleType::builtin);
+    Mock<::L0::KernelImp> kernel;
+    kernel.module = mockModule.get();
     uint32_t globalWorkSizeXOffset = 0x20u;
     uint32_t globalWorkSizeYOffset = 0x24u;
     uint32_t globalWorkSizeZOffset = 0x28u;
@@ -69,12 +97,12 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     kernel.descriptor.payloadMappings.dispatchTraits.numWorkGroups[1] = numWorkGroupYOffset;
     kernel.descriptor.payloadMappings.dispatchTraits.numWorkGroups[2] = numWorkGroupZOffset;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
 
     void *alloc = nullptr;
     ze_device_mem_alloc_desc_t deviceDesc = {};
     ze_host_mem_alloc_desc_t hostDesc = {};
-    auto result = context->allocSharedMem(device->toHandle(), &deviceDesc, &hostDesc, 16384u, 4096u, &alloc);
+    auto result = context->allocSharedMem(device->toHandle(), &deviceDesc, &hostDesc, 16 * MemoryConstants::kiloByte, 4096u, &alloc);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_group_count_t *pThreadGroupDimensions = static_cast<ze_group_count_t *>(ptrOffset(alloc, sizeof(ze_group_count_t)));
@@ -84,17 +112,17 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     pThreadGroupDimensions->groupCountZ = 5;
 
     result = commandList->appendLaunchKernelIndirect(kernel.toHandle(),
-                                                     pThreadGroupDimensions,
+                                                     *pThreadGroupDimensions,
                                                      nullptr, 0, nullptr, false);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    auto allocData = device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(pThreadGroupDimensions);
+    auto allocData = device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(static_cast<void *>(pThreadGroupDimensions));
     ASSERT_NE(nullptr, allocData->cpuAllocation);
     auto gpuAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getNEODevice()->getRootDeviceIndex());
     ASSERT_NE(nullptr, gpuAllocation);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), commandList->getCmdContainer().getCommandStream()->getUsed()));
 
     uint32_t regAddress = 0;
@@ -110,7 +138,7 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     regAddress = cmd->getRegisterAddress();
     gpuAddress = cmd->getMemoryAddress();
 
-    EXPECT_EQ(GPUGPU_DISPATCHDIMX, regAddress);
+    EXPECT_EQ(RegisterOffsets::gpgpuDispatchDimX, regAddress);
     EXPECT_EQ(expectedXAddress, gpuAddress);
 
     itor = find<MI_LOAD_REGISTER_MEM *>(++itor, cmdList.end());
@@ -120,7 +148,7 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     regAddress = cmd->getRegisterAddress();
     gpuAddress = cmd->getMemoryAddress();
 
-    EXPECT_EQ(GPUGPU_DISPATCHDIMY, regAddress);
+    EXPECT_EQ(RegisterOffsets::gpgpuDispatchDimY, regAddress);
     EXPECT_EQ(expectedYAddress, gpuAddress);
 
     itor = find<MI_LOAD_REGISTER_MEM *>(++itor, cmdList.end());
@@ -130,7 +158,7 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     regAddress = cmd->getRegisterAddress();
     gpuAddress = cmd->getMemoryAddress();
 
-    EXPECT_EQ(GPUGPU_DISPATCHDIMZ, regAddress);
+    EXPECT_EQ(RegisterOffsets::gpgpuDispatchDimZ, regAddress);
     EXPECT_EQ(expectedZAddress, gpuAddress);
 
     MI_STORE_REGISTER_MEM *cmd2 = nullptr;
@@ -138,12 +166,12 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     do {
         itor = find<MI_STORE_REGISTER_MEM *>(++itor, cmdList.end());
         cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
-    } while (itor != cmdList.end() && cmd2->getRegisterAddress() != GPUGPU_DISPATCHDIMX);
+    } while (itor != cmdList.end() && cmd2->getRegisterAddress() != RegisterOffsets::gpgpuDispatchDimX);
     EXPECT_NE(cmdList.end(), itor);
 
     auto groupCountStoreRegisterMemCmd = FamilyType::cmdInitStoreRegisterMem;
-    groupCountStoreRegisterMemCmd.setRegisterAddress(GPUGPU_DISPATCHDIMX);
-    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupXOffset);
+    groupCountStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::gpgpuDispatchDimX);
+    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupXOffset);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), groupCountStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), groupCountStoreRegisterMemCmd.getMemoryAddress());
@@ -152,8 +180,8 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    groupCountStoreRegisterMemCmd.setRegisterAddress(GPUGPU_DISPATCHDIMY);
-    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupYOffset);
+    groupCountStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::gpgpuDispatchDimY);
+    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupYOffset);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), groupCountStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), groupCountStoreRegisterMemCmd.getMemoryAddress());
@@ -162,14 +190,14 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    groupCountStoreRegisterMemCmd.setRegisterAddress(GPUGPU_DISPATCHDIMZ);
-    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupZOffset);
+    groupCountStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::gpgpuDispatchDimZ);
+    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupZOffset);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), groupCountStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), groupCountStoreRegisterMemCmd.getMemoryAddress());
 
     auto workSizeStoreRegisterMemCmd = FamilyType::cmdInitStoreRegisterMem;
-    workSizeStoreRegisterMemCmd.setRegisterAddress(CS_GPR_R1);
+    workSizeStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::csGprR1);
 
     // Find workgroup size cmds
     itor = find<MI_LOAD_REGISTER_REG *>(++itor, cmdList.end());
@@ -180,7 +208,7 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeXOffset);
+    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeXOffset);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), workSizeStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), workSizeStoreRegisterMemCmd.getMemoryAddress());
@@ -193,7 +221,7 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeYOffset);
+    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeYOffset);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), workSizeStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), workSizeStoreRegisterMemCmd.getMemoryAddress());
@@ -209,7 +237,7 @@ HWTEST_F(CommandListDualStorage, givenIndirectDispatchWithSharedDualStorageMemor
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeZOffset);
+    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeZOffset);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), workSizeStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), workSizeStoreRegisterMemCmd.getMemoryAddress());
@@ -222,10 +250,11 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     using MI_LOAD_REGISTER_MEM = typename FamilyType::MI_LOAD_REGISTER_MEM;
     using MI_LOAD_REGISTER_REG = typename FamilyType::MI_LOAD_REGISTER_REG;
     using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-    using INLINE_DATA = typename FamilyType::INLINE_DATA;
 
-    Mock<::L0::Kernel> kernel;
-    kernel.crossThreadDataSize = 0x60u;
+    std::unique_ptr<L0::ult::Module> mockModule = std::make_unique<L0::ult::Module>(device, nullptr, ModuleType::builtin);
+    Mock<::L0::KernelImp> kernel;
+    kernel.module = mockModule.get();
+    kernel.privateState.crossThreadData.resize(0x60U, 0x0);
     kernel.descriptor.kernelAttributes.flags.passInlineData = true;
 
     uint32_t globalWorkSizeXOffset = 0x40u;
@@ -241,12 +270,12 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     kernel.descriptor.payloadMappings.dispatchTraits.numWorkGroups[1] = numWorkGroupYOffset;
     kernel.descriptor.payloadMappings.dispatchTraits.numWorkGroups[2] = numWorkGroupZOffset;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
 
     void *alloc = nullptr;
     ze_device_mem_alloc_desc_t deviceDesc = {};
     ze_host_mem_alloc_desc_t hostDesc = {};
-    auto result = context->allocSharedMem(device->toHandle(), &deviceDesc, &hostDesc, 16384u, 4096u, &alloc);
+    auto result = context->allocSharedMem(device->toHandle(), &deviceDesc, &hostDesc, 16 * MemoryConstants::kiloByte, 4096u, &alloc);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_group_count_t *pThreadGroupDimensions = static_cast<ze_group_count_t *>(ptrOffset(alloc, sizeof(ze_group_count_t)));
@@ -256,17 +285,17 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     pThreadGroupDimensions->groupCountZ = 5;
 
     result = commandList->appendLaunchKernelIndirect(kernel.toHandle(),
-                                                     pThreadGroupDimensions,
+                                                     *pThreadGroupDimensions,
                                                      nullptr, 0, nullptr, false);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    auto allocData = device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(pThreadGroupDimensions);
+    auto allocData = device->getDriverHandle()->getSvmAllocsManager()->getSVMAlloc(static_cast<void *>(pThreadGroupDimensions));
     ASSERT_NE(nullptr, allocData->cpuAllocation);
     auto gpuAllocation = allocData->gpuAllocations.getGraphicsAllocation(device->getNEODevice()->getRootDeviceIndex());
     ASSERT_NE(nullptr, gpuAllocation);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0), commandList->getCmdContainer().getCommandStream()->getUsed()));
 
     uint32_t regAddress = 0;
@@ -282,7 +311,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     regAddress = cmd->getRegisterAddress();
     gpuAddress = cmd->getMemoryAddress();
 
-    EXPECT_EQ(GPUGPU_DISPATCHDIMX, regAddress);
+    EXPECT_EQ(RegisterOffsets::gpgpuDispatchDimX, regAddress);
     EXPECT_EQ(expectedXAddress, gpuAddress);
 
     itor = find<MI_LOAD_REGISTER_MEM *>(++itor, cmdList.end());
@@ -292,7 +321,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     regAddress = cmd->getRegisterAddress();
     gpuAddress = cmd->getMemoryAddress();
 
-    EXPECT_EQ(GPUGPU_DISPATCHDIMY, regAddress);
+    EXPECT_EQ(RegisterOffsets::gpgpuDispatchDimY, regAddress);
     EXPECT_EQ(expectedYAddress, gpuAddress);
 
     itor = find<MI_LOAD_REGISTER_MEM *>(++itor, cmdList.end());
@@ -302,7 +331,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     regAddress = cmd->getRegisterAddress();
     gpuAddress = cmd->getMemoryAddress();
 
-    EXPECT_EQ(GPUGPU_DISPATCHDIMZ, regAddress);
+    EXPECT_EQ(RegisterOffsets::gpgpuDispatchDimZ, regAddress);
     EXPECT_EQ(expectedZAddress, gpuAddress);
 
     MI_STORE_REGISTER_MEM *cmd2 = nullptr;
@@ -310,12 +339,17 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     do {
         itor = find<MI_STORE_REGISTER_MEM *>(++itor, cmdList.end());
         cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
-    } while (itor != cmdList.end() && cmd2->getRegisterAddress() != GPUGPU_DISPATCHDIMX);
+    } while (itor != cmdList.end() && cmd2->getRegisterAddress() != RegisterOffsets::gpgpuDispatchDimX);
     EXPECT_NE(cmdList.end(), itor);
 
     auto groupCountStoreRegisterMemCmd = FamilyType::cmdInitStoreRegisterMem;
-    groupCountStoreRegisterMemCmd.setRegisterAddress(GPUGPU_DISPATCHDIMX);
-    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupXOffset - sizeof(INLINE_DATA));
+    groupCountStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::gpgpuDispatchDimX);
+    auto &compilerProductHelper = device->getCompilerProductHelper();
+
+    bool heapless = compilerProductHelper.isHeaplessModeEnabled(*defaultHwInfo);
+    auto inlineDataSize = UnitTestHelper<FamilyType>::getInlineDataSize(heapless);
+
+    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupXOffset - inlineDataSize);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), groupCountStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), groupCountStoreRegisterMemCmd.getMemoryAddress());
@@ -324,8 +358,8 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    groupCountStoreRegisterMemCmd.setRegisterAddress(GPUGPU_DISPATCHDIMY);
-    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupYOffset - sizeof(INLINE_DATA));
+    groupCountStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::gpgpuDispatchDimY);
+    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupYOffset - inlineDataSize);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), groupCountStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), groupCountStoreRegisterMemCmd.getMemoryAddress());
@@ -334,14 +368,14 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    groupCountStoreRegisterMemCmd.setRegisterAddress(GPUGPU_DISPATCHDIMZ);
-    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupZOffset - sizeof(INLINE_DATA));
+    groupCountStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::gpgpuDispatchDimZ);
+    groupCountStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + numWorkGroupZOffset - inlineDataSize);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), groupCountStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), groupCountStoreRegisterMemCmd.getMemoryAddress());
 
     auto workSizeStoreRegisterMemCmd = FamilyType::cmdInitStoreRegisterMem;
-    workSizeStoreRegisterMemCmd.setRegisterAddress(CS_GPR_R1);
+    workSizeStoreRegisterMemCmd.setRegisterAddress(RegisterOffsets::csGprR1);
 
     // Find workgroup size cmds
     itor = find<MI_LOAD_REGISTER_REG *>(++itor, cmdList.end());
@@ -352,7 +386,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeXOffset - sizeof(INLINE_DATA));
+    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeXOffset - inlineDataSize);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), workSizeStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), workSizeStoreRegisterMemCmd.getMemoryAddress());
@@ -365,7 +399,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeYOffset - sizeof(INLINE_DATA));
+    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeYOffset - inlineDataSize);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), workSizeStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), workSizeStoreRegisterMemCmd.getMemoryAddress());
@@ -381,7 +415,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CommandListDualStorage, givenIndirectDispatchWithSh
     EXPECT_NE(cmdList.end(), itor);
     cmd2 = genCmdCast<MI_STORE_REGISTER_MEM *>(*itor);
 
-    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::INDIRECT_OBJECT)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeZOffset - sizeof(INLINE_DATA));
+    workSizeStoreRegisterMemCmd.setMemoryAddress(commandList->getCmdContainer().getIndirectHeap(HeapType::indirectObject)->getGraphicsAllocation()->getGpuAddress() + globalWorkSizeZOffset - inlineDataSize);
 
     EXPECT_EQ(cmd2->getRegisterAddress(), workSizeStoreRegisterMemCmd.getRegisterAddress());
     EXPECT_EQ(cmd2->getMemoryAddress(), workSizeStoreRegisterMemCmd.getMemoryAddress());
@@ -395,20 +429,20 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendLaunchK
     createKernel();
     ze_group_count_t groupCount{1, 1, 1};
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
     auto usedSpaceBefore = cmdStream->getUsed();
 
     CmdListKernelLaunchParams launchParams = {};
-    auto result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+    auto result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = cmdStream->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
     auto noops = findAll<MI_NOOP *>(cmdList.begin(), cmdList.end());
     EXPECT_EQ(6u, noops.size());
 
@@ -416,13 +450,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendLaunchK
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
 
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::KernelName) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::kernelName) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -432,13 +466,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendLaunchK
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameBegin) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameBegin) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -448,13 +482,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendLaunchK
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameEnd) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameEnd) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -466,7 +500,7 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendEventRe
     using MI_NOOP = typename FamilyType::MI_NOOP;
 
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
     auto usedSpaceBefore = cmdStream->getUsed();
@@ -495,7 +529,7 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendEventRe
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
     auto noops = findAll<MI_NOOP *>(cmdList.begin(), cmdList.end());
     uint32_t expecteNumberOfNops = 4u;
     EXPECT_EQ(expecteNumberOfNops, noops.size());
@@ -503,13 +537,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendEventRe
     bool tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameBegin) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameBegin) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -519,13 +553,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendEventRe
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameEnd) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameEnd) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -540,7 +574,7 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendSignalE
     using MI_NOOP = typename FamilyType::MI_NOOP;
 
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
     auto usedSpaceBefore = cmdStream->getUsed();
@@ -562,14 +596,17 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendSignalE
 
     eventPool->createEvent(&eventDesc, &hEvent);
 
-    auto result = commandList->appendSignalEvent(hEvent);
+    CmdListSignalEventParameters signalEventParameters = {
+        .relaxedOrderingDispatch = false,
+    };
+    auto result = commandList->appendSignalEvent(hEvent, signalEventParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = cmdStream->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
     auto noops = findAll<MI_NOOP *>(cmdList.begin(), cmdList.end());
     uint32_t expecteNumberOfNops = 4u;
     EXPECT_EQ(expecteNumberOfNops, noops.size());
@@ -577,13 +614,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendSignalE
     bool tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameBegin) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameBegin) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -593,13 +630,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendSignalE
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameEnd) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameEnd) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -614,7 +651,7 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendWaitOnE
     using MI_NOOP = typename FamilyType::MI_NOOP;
 
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
     auto usedSpaceBefore = cmdStream->getUsed();
@@ -635,15 +672,22 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendWaitOnE
     ASSERT_NE(nullptr, eventPool);
 
     eventPool->createEvent(&eventDesc, &hEvent);
-
-    auto result = commandList->appendWaitOnEvents(1, &hEvent, false, true, false);
+    CmdListWaitEventParameters waitEventsParameters{
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = false,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+        .apiRequest = false};
+    auto result = commandList->appendWaitOnEvents(1, &hEvent, waitEventsParameters);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = cmdStream->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
     auto noops = findAll<MI_NOOP *>(cmdList.begin(), cmdList.end());
     uint32_t expecteNumberOfNops = 4u;
     EXPECT_EQ(expecteNumberOfNops, noops.size());
@@ -651,13 +695,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendWaitOnE
     bool tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameBegin) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameBegin) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -667,13 +711,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendWaitOnE
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameEnd) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameEnd) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -688,7 +732,7 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     using MI_NOOP = typename FamilyType::MI_NOOP;
 
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
     auto usedSpaceBefore = cmdStream->getUsed();
@@ -696,14 +740,15 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     void *srcBuffer = reinterpret_cast<void *>(0x0F000000);
     void *dstBuffer = reinterpret_cast<void *>(0x0FF00000);
     size_t size = 1024;
-    auto result = commandList->appendMemoryCopy(dstBuffer, srcBuffer, size, nullptr, 0, nullptr, false);
+    CmdListMemoryCopyParams copyParams = {};
+    auto result = commandList->appendMemoryCopy(dstBuffer, srcBuffer, size, nullptr, 0, nullptr, copyParams);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = cmdStream->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
     auto noops = findAll<MI_NOOP *>(cmdList.begin(), cmdList.end());
     uint32_t expecteNumberOfNops = 6u;
     EXPECT_EQ(expecteNumberOfNops, noops.size());
@@ -711,13 +756,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     bool tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameBegin) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameBegin) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -727,13 +772,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameEnd) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameEnd) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -745,7 +790,7 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     using MI_NOOP = typename FamilyType::MI_NOOP;
 
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
     auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
     auto usedSpaceBefore = cmdStream->getUsed();
@@ -756,29 +801,30 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     uint32_t height = 16;
     ze_copy_region_t sr = {0U, 0U, 0U, width, height, 0U};
     ze_copy_region_t dr = {0U, 0U, 0U, width, height, 0U};
+    CmdListMemoryCopyParams copyParams = {};
     ze_result_t result = commandList->appendMemoryCopyRegion(dstBuffer, &dr, width, 0,
-                                                             srcBuffer, &sr, width, 0, nullptr, 0, nullptr, false);
+                                                             srcBuffer, &sr, width, 0, nullptr, 0, nullptr, copyParams);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     auto usedSpaceAfter = cmdStream->getUsed();
     ASSERT_GT(usedSpaceAfter, usedSpaceBefore);
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, ptrOffset(cmdStream->getCpuBase(), 0), usedSpaceAfter));
     auto noops = findAll<MI_NOOP *>(cmdList.begin(), cmdList.end());
-    uint32_t expecteNumberOfNops = 10u;
+    uint32_t expecteNumberOfNops = 6u;
     EXPECT_EQ(expecteNumberOfNops, noops.size());
 
     bool tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameBegin) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameBegin) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -788,13 +834,13 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     tagFound = false;
     for (auto it = noops.begin(); it != noops.end() && !tagFound; ++it) {
         auto noop = genCmdCast<MI_NOOP *>(*(*it));
-        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::CallNameEnd) == noop->getIdentificationNumber() &&
-            noop->getIdentificationNumberRegisterWriteEnable() == true &&
+        if (NEO::SWTags::BaseTag::getMarkerNoopID(SWTags::OpCode::callNameEnd) == noop->getIdentificationNumber() &&
+            noop->getIdentificationNumberRegisterWriteEnable() &&
             ++it != noops.end()) {
 
             noop = genCmdCast<MI_NOOP *>(*(*it));
             if (noop->getIdentificationNumber() & 1 << 21 &&
-                noop->getIdentificationNumberRegisterWriteEnable() == false) {
+                noop->getIdentificationNumberRegisterWriteEnable()) {
                 tagFound = true;
             }
         }
@@ -802,125 +848,319 @@ HWTEST_F(CommandListAppendLaunchKernelSWTags, givenEnableSWTagsWhenAppendMemoryC
     EXPECT_TRUE(tagFound);
 }
 
-using CommandListArbitrationPolicyTest = Test<ModuleFixture>;
+struct CommandListAppendLaunchKernelSWTagCounters : public Test<ModuleFixture> {
+    void SetUp() override {
 
-HWTEST_F(CommandListArbitrationPolicyTest, whenCreatingCommandListThenDefaultThreadArbitrationPolicyIsUsed) {
-    using STATE_BASE_ADDRESS = typename FamilyType::STATE_BASE_ADDRESS;
-
-    ze_result_t returnValue;
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(L0::CommandList::create(productFamily,
-                                                                                         device,
-                                                                                         NEO::EngineGroupType::RenderCompute,
-                                                                                         0u,
-                                                                                         returnValue)));
-    EXPECT_NE(nullptr, commandList);
-    EXPECT_NE(nullptr, commandList->getCmdContainer().getCommandStream());
-
-    GenCmdList parsedCommandList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        parsedCommandList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-        commandList->getCmdContainer().getCommandStream()->getUsed()));
-    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-
-    auto miLoadImm = findAll<MI_LOAD_REGISTER_IMM *>(parsedCommandList.begin(), parsedCommandList.end());
-    EXPECT_GE(2u, miLoadImm.size());
-
-    for (auto it : miLoadImm) {
-        auto cmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(*it);
-        if (cmd->getRegisterOffset() == NEO::DebugControlReg2::address) {
-            EXPECT_EQ(NEO::DebugControlReg2::getRegData(NEO::ThreadArbitrationPolicy::RoundRobin),
-                      cmd->getDataDword());
-        }
+        NEO::debugManager.flags.EnableSWTags.set(true);
+        NEO::debugManager.flags.EnableExtendedSoftwareTags.set(true);
+        ModuleFixture::setUp();
     }
-}
 
-HWTEST_F(CommandListArbitrationPolicyTest, whenCreatingCommandListThenChosenThreadArbitrationPolicyIsUsed) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.OverrideThreadArbitrationPolicy.set(0);
-    using STATE_BASE_ADDRESS = typename FamilyType::STATE_BASE_ADDRESS;
-
-    ze_result_t returnValue;
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(L0::CommandList::create(productFamily,
-                                                                                         device,
-                                                                                         NEO::EngineGroupType::RenderCompute,
-                                                                                         0u,
-                                                                                         returnValue)));
-    EXPECT_NE(nullptr, commandList);
-    EXPECT_NE(nullptr, commandList->getCmdContainer().getCommandStream());
-
-    GenCmdList parsedCommandList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-        parsedCommandList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-        commandList->getCmdContainer().getCommandStream()->getUsed()));
-    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
-
-    auto miLoadImm = findAll<MI_LOAD_REGISTER_IMM *>(parsedCommandList.begin(), parsedCommandList.end());
-    EXPECT_GE(2u, miLoadImm.size());
-
-    for (auto it : miLoadImm) {
-        auto cmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(*it);
-        if (cmd->getRegisterOffset() == NEO::DebugControlReg2::address) {
-            EXPECT_EQ(NEO::DebugControlReg2::getRegData(NEO::ThreadArbitrationPolicy::AgeBased),
-                      cmd->getDataDword());
-        }
-    }
-}
-
-HWTEST_F(CommandListArbitrationPolicyTest, whenCommandListIsResetThenOriginalThreadArbitrationPolicyIsKept) {
-    using STATE_BASE_ADDRESS = typename FamilyType::STATE_BASE_ADDRESS;
-
-    ze_result_t returnValue;
-    auto commandList = std::unique_ptr<CommandList>(whiteboxCast(L0::CommandList::create(productFamily,
-                                                                                         device,
-                                                                                         NEO::EngineGroupType::RenderCompute,
-                                                                                         0u,
-                                                                                         returnValue)));
-    EXPECT_NE(nullptr, commandList);
-    EXPECT_NE(nullptr, commandList->getCmdContainer().getCommandStream());
-
-    uint64_t originalThreadArbitrationPolicy = std::numeric_limits<uint64_t>::max();
-    {
-        GenCmdList parsedCommandList;
-        ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-            parsedCommandList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-            commandList->getCmdContainer().getCommandStream()->getUsed()));
+    template <typename FamilyType>
+    std::vector<uint32_t> getCounterValues(GenCmdList &cmdList, NEO::SWTags::OpCode opcode, uint32_t registerOffset) {
+        using MI_NOOP = typename FamilyType::MI_NOOP;
         using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
 
-        auto miLoadImm = findAll<MI_LOAD_REGISTER_IMM *>(parsedCommandList.begin(), parsedCommandList.end());
-        EXPECT_GE(2u, miLoadImm.size());
+        std::vector<uint32_t> values;
 
-        for (auto it : miLoadImm) {
-            auto cmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(*it);
-            if (cmd->getRegisterOffset() == NEO::DebugControlReg2::address) {
-                EXPECT_EQ(NEO::DebugControlReg2::getRegData(NEO::ThreadArbitrationPolicy::RoundRobin),
-                          cmd->getDataDword());
-                originalThreadArbitrationPolicy = cmd->getDataDword();
+        for (auto it = cmdList.begin(); it != cmdList.end(); ++it) {
+            auto marker = genCmdCast<MI_NOOP *>(*it);
+            if (marker == nullptr ||
+                NEO::SWTags::BaseTag::getMarkerNoopID(opcode) != marker->getIdentificationNumber() ||
+                !marker->getIdentificationNumberRegisterWriteEnable()) {
+                continue;
+            }
+
+            auto offsetIt = it;
+            ++offsetIt; // SWTAG_OFFSET
+            if (offsetIt == cmdList.end() || ++offsetIt == cmdList.end()) {
+                break;
+            }
+
+            // Counter is programmed directly after the SWTAG_OFFSET of its tag.
+            auto lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(*offsetIt);
+            if (lri != nullptr && lri->getRegisterOffset() == registerOffset) {
+                values.push_back(static_cast<uint32_t>(lri->getDataDword()));
+            }
+        }
+
+        return values;
+    }
+
+    template <typename FamilyType>
+    void expectSingleRopOperation(L0::CommandList &commandList) {
+        auto cmdStream = commandList.getCmdContainer().getCommandStream();
+        GenCmdList cmdList;
+        ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
+
+        uint32_t callNameBeginTags = 0u;
+        for (auto &cmd : cmdList) {
+            auto marker = genCmdCast<typename FamilyType::MI_NOOP *>(cmd);
+            if (marker != nullptr &&
+                NEO::SWTags::BaseTag::getMarkerNoopID(NEO::SWTags::OpCode::callNameBegin) == marker->getIdentificationNumber() &&
+                marker->getIdentificationNumberRegisterWriteEnable()) {
+                callNameBeginTags++;
+            }
+        }
+        EXPECT_EQ(1u, callNameBeginTags);
+
+        auto ropValues = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin, RegisterOffsets::csGprR11);
+        ASSERT_EQ(1u, ropValues.size());
+        EXPECT_EQ(1u, ropValues[0]);
+
+        auto dispatchValues = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin, RegisterOffsets::csGprR10);
+        EXPECT_EQ(0u, dispatchValues.size());
+    }
+
+    DebugManagerStateRestore dbgRestorer;
+};
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppendingLaunchKernelThenDispatchCounterIsProgrammed) {
+    createKernel();
+    ze_group_count_t groupCount{1, 1, 1};
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+    auto cmdStream = commandList->getCmdContainer().getCommandStream();
+
+    CmdListKernelLaunchParams launchParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
+
+    auto values = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin, RegisterOffsets::csGprR10);
+
+    ASSERT_EQ(2u, values.size());
+    EXPECT_EQ(1u, values[0]);
+    EXPECT_EQ(2u, values[1]);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenCommandListIsResetThenCountersRestart) {
+    createKernel();
+    ze_group_count_t groupCount{1, 1, 1};
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+    auto cmdStream = commandList->getCmdContainer().getCommandStream();
+
+    CmdListKernelLaunchParams launchParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->reset());
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
+
+    auto values = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin, RegisterOffsets::csGprR10);
+
+    ASSERT_EQ(1u, values.size());
+    EXPECT_EQ(1u, values[0]);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppendingMemoryCopyThenRopCounterIsProgrammed) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+    auto cmdStream = commandList->getCmdContainer().getCommandStream();
+
+    void *srcBuffer = reinterpret_cast<void *>(0x0F000000);
+    void *dstBuffer = reinterpret_cast<void *>(0x0FF00000);
+    CmdListMemoryCopyParams copyParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendMemoryCopy(dstBuffer, srcBuffer, 1024, nullptr, 0, nullptr, copyParams));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
+
+    auto ropValues = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin, RegisterOffsets::csGprR11);
+
+    ASSERT_EQ(1u, ropValues.size());
+    EXPECT_EQ(1u, ropValues[0]);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppendingMemoryCopyThenDispatchCounterIsNotProgrammed) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+
+    void *srcBuffer = reinterpret_cast<void *>(0x0F000000);
+    void *dstBuffer = reinterpret_cast<void *>(0x0FF00000);
+    CmdListMemoryCopyParams copyParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendMemoryCopy(dstBuffer, srcBuffer, 1024, nullptr, 0, nullptr, copyParams));
+
+    expectSingleRopOperation<FamilyType>(*commandList);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppending2dMemoryCopyRegionThenOnlyRopCounterIsProgrammed) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+
+    void *srcBuffer = reinterpret_cast<void *>(0x0F000000);
+    void *dstBuffer = reinterpret_cast<void *>(0x0FF00000);
+    uint32_t width = 16;
+    uint32_t height = 16;
+    ze_copy_region_t sr = {0U, 0U, 0U, width, height, 0U};
+    ze_copy_region_t dr = {0U, 0U, 0U, width, height, 0U};
+    CmdListMemoryCopyParams copyParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendMemoryCopyRegion(dstBuffer, &dr, width, 0,
+                                                                     srcBuffer, &sr, width, 0, nullptr, 0, nullptr, copyParams));
+
+    expectSingleRopOperation<FamilyType>(*commandList);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppending3dMemoryCopyRegionThenOnlyRopCounterIsProgrammed) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+
+    void *srcBuffer = reinterpret_cast<void *>(0x0F000000);
+    void *dstBuffer = reinterpret_cast<void *>(0x0FF00000);
+    uint32_t width = 16;
+    uint32_t height = 16;
+    uint32_t depth = 2;
+    ze_copy_region_t sr = {0U, 0U, 0U, width, height, depth};
+    ze_copy_region_t dr = {0U, 0U, 0U, width, height, depth};
+    CmdListMemoryCopyParams copyParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendMemoryCopyRegion(dstBuffer, &dr, width, width * height,
+                                                                     srcBuffer, &sr, width, width * height, nullptr, 0, nullptr, copyParams));
+
+    expectSingleRopOperation<FamilyType>(*commandList);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppendingMemoryFillThenOnlyRopCounterIsProgrammed) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+
+    void *dstBuffer = nullptr;
+    ze_device_mem_alloc_desc_t deviceDesc = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, context->allocDeviceMem(device->toHandle(), &deviceDesc, 16 * MemoryConstants::kiloByte, 4096u, &dstBuffer));
+
+    int pattern = 1;
+    CmdListMemoryCopyParams copyParams = {};
+    EXPECT_EQ(ZE_RESULT_SUCCESS, commandList->appendMemoryFill(dstBuffer, &pattern, sizeof(pattern), 4096u, nullptr, 0, nullptr, copyParams));
+
+    expectSingleRopOperation<FamilyType>(*commandList);
+
+    context->freeMem(dstBuffer);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppendingBarrierThenFlushCounterIsProgrammed) {
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+    auto cmdStream = commandList->getCmdContainer().getCommandStream();
+
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    CmdListSignalEventParameters signalEventParameters = {
+        .relaxedOrderingDispatch = false,
+    };
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendBarrier(nullptr, 0, nullptr, waitEventsParameters, signalEventParameters));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
+
+    auto values = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin,
+                                               RegisterOffsets::csGprR12 + sizeof(uint32_t));
+
+    ASSERT_EQ(1u, values.size());
+    EXPECT_EQ(1u, values[0]);
+}
+
+HWTEST_F(CommandListAppendLaunchKernelSWTagCounters, givenExtendedSWTagsWhenAppendingProfiledOperationFollowedByAnotherTagThenFlushCounterRegisterIsNotClobbered) {
+    using MI_MATH = typename FamilyType::MI_MATH;
+    using MI_MATH_ALU_INST_INLINE = typename FamilyType::MI_MATH_ALU_INST_INLINE;
+    using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+    using MI_LOAD_REGISTER_REG = typename FamilyType::MI_LOAD_REGISTER_REG;
+    using MI_LOAD_REGISTER_MEM = typename FamilyType::MI_LOAD_REGISTER_MEM;
+    using MI_STORE_REGISTER_MEM = typename FamilyType::MI_STORE_REGISTER_MEM;
+
+    constexpr uint32_t flushCounterRegister = RegisterOffsets::csGprR12 + sizeof(uint32_t);
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE | ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+    eventPoolDesc.count = 1;
+
+    ze_event_desc_t eventDesc = {};
+    eventDesc.index = 0;
+
+    ze_result_t returnValue;
+    auto eventPool = std::unique_ptr<L0::EventPool>(EventPool::create(driverHandle.get(), context, 0, nullptr, &eventPoolDesc, returnValue));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
+    auto event = std::unique_ptr<L0::Event>(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, returnValue));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, returnValue);
+
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+    auto cmdStream = commandList->getCmdContainer().getCommandStream();
+
+    CmdListWaitEventParameters waitEventsParameters = {
+        .outWaitCmds = nullptr,
+        .relaxedOrderingAllowed = false,
+        .trackDependencies = true,
+        .waitForImplicitInOrderDependency = true,
+        .skipAddingWaitEventsToResidency = false,
+        .dualStreamCopyOffloadOperation = false,
+    };
+    CmdListSignalEventParameters signalEventParameters = {
+        .relaxedOrderingDispatch = false,
+    };
+    // Profiled operation writes masked kernel timestamps, followed by another tagged operation.
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendBarrier(event->toHandle(), 0, nullptr, waitEventsParameters, signalEventParameters));
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendBarrier(nullptr, 0, nullptr, waitEventsParameters, signalEventParameters));
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
+
+    auto values = getCounterValues<FamilyType>(cmdList, NEO::SWTags::OpCode::callNameBegin, flushCounterRegister);
+    ASSERT_EQ(2u, values.size());
+    EXPECT_EQ(1u, values[0]);
+    EXPECT_EQ(2u, values[1]);
+
+    auto isR12 = [](uint64_t reg) {
+        return reg == RegisterOffsets::csGprR12 || reg == RegisterOffsets::csGprR12 + sizeof(uint32_t);
+    };
+
+    bool maskedTimestampFound = false;
+    for (auto &cmd : cmdList) {
+        if (auto srm = genCmdCast<MI_STORE_REGISTER_MEM *>(cmd)) {
+            maskedTimestampFound |= (srm->getRegisterAddress() == RegisterOffsets::csGprR13);
+        } else if (auto lri = genCmdCast<MI_LOAD_REGISTER_IMM *>(cmd)) {
+            // Only the flush counter itself may be loaded into R12.
+            EXPECT_NE(RegisterOffsets::csGprR12, lri->getRegisterOffset());
+        } else if (auto lrr = genCmdCast<MI_LOAD_REGISTER_REG *>(cmd)) {
+            EXPECT_FALSE(isR12(lrr->getDestinationRegisterAddress()));
+        } else if (auto lrm = genCmdCast<MI_LOAD_REGISTER_MEM *>(cmd)) {
+            EXPECT_FALSE(isR12(lrm->getRegisterAddress()));
+        } else if (auto math = genCmdCast<MI_MATH *>(cmd)) {
+            auto aluInst = reinterpret_cast<MI_MATH_ALU_INST_INLINE *>(ptrOffset(cmd, sizeof(uint32_t)));
+            for (uint32_t i = 0; i <= math->DW0.BitField.DwordLength; i++) {
+                if (aluInst[i].DW0.BitField.ALUOpcode == static_cast<uint32_t>(AluRegisters::opcodeStore)) {
+                    EXPECT_NE(static_cast<uint32_t>(AluRegisters::gpr12), aluInst[i].DW0.BitField.Operand1);
+                }
             }
         }
     }
+    EXPECT_TRUE(maskedTimestampFound);
+}
 
-    commandList->reset();
+HWTEST_F(CommandListAppendLaunchKernelSWTags, givenExtendedSWTagsDisabledWhenAppendingLaunchKernelThenNoCounterIsProgrammed) {
+    createKernel();
+    ze_group_count_t groupCount{1, 1, 1};
+    ze_result_t returnValue;
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
+    auto cmdStream = commandList->getCmdContainer().getCommandStream();
 
-    {
-        GenCmdList parsedCommandList;
-        ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
-            parsedCommandList, ptrOffset(commandList->getCmdContainer().getCommandStream()->getCpuBase(), 0),
-            commandList->getCmdContainer().getCommandStream()->getUsed()));
-        using MI_LOAD_REGISTER_IMM = typename FamilyType::MI_LOAD_REGISTER_IMM;
+    CmdListKernelLaunchParams launchParams = {};
+    ASSERT_EQ(ZE_RESULT_SUCCESS, commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams));
 
-        auto miLoadImm = findAll<MI_LOAD_REGISTER_IMM *>(parsedCommandList.begin(), parsedCommandList.end());
-        EXPECT_GE(2u, miLoadImm.size());
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(cmdList, cmdStream->getCpuBase(), cmdStream->getUsed()));
 
-        uint64_t newThreadArbitrationPolicy = std::numeric_limits<uint64_t>::max();
-        for (auto it : miLoadImm) {
-            auto cmd = genCmdCast<MI_LOAD_REGISTER_IMM *>(*it);
-            if (cmd->getRegisterOffset() == NEO::DebugControlReg2::address) {
-                EXPECT_EQ(NEO::DebugControlReg2::getRegData(NEO::ThreadArbitrationPolicy::RoundRobin),
-                          cmd->getDataDword());
-                newThreadArbitrationPolicy = cmd->getDataDword();
-                EXPECT_EQ(originalThreadArbitrationPolicy, newThreadArbitrationPolicy);
-            }
-        }
+    auto lris = findAll<typename FamilyType::MI_LOAD_REGISTER_IMM *>(cmdList.begin(), cmdList.end());
+    for (auto &it : lris) {
+        auto lri = genCmdCast<typename FamilyType::MI_LOAD_REGISTER_IMM *>(*it);
+        EXPECT_NE(RegisterOffsets::csGprR10, lri->getRegisterOffset());
     }
 }
 
@@ -929,6 +1169,11 @@ struct CmdlistAppendLaunchKernelWithImplicitArgsTests : CmdlistAppendLaunchKerne
 
     void SetUp() override {
         CmdlistAppendLaunchKernelTests::SetUp();
+        memset(&expectedImplicitArgs, 0, sizeof(expectedImplicitArgs));
+
+        expectedImplicitArgs.header.structSize = ImplicitArgsV0::getSize();
+        expectedImplicitArgs.header.structVersion = 0;
+
         expectedImplicitArgs.numWorkDim = 3;
         expectedImplicitArgs.simdWidth = 32;
         expectedImplicitArgs.localSizeX = 2;
@@ -961,14 +1206,16 @@ struct CmdlistAppendLaunchKernelWithImplicitArgsTests : CmdlistAppendLaunchKerne
         kernelDescriptor->kernelAttributes.workgroupDimensionsOrder[0] = workgroupDimOrder[0];
         kernelDescriptor->kernelAttributes.workgroupDimensionsOrder[1] = workgroupDimOrder[1];
         kernelDescriptor->kernelAttributes.workgroupDimensionsOrder[2] = workgroupDimOrder[2];
+        kernelDescriptor->kernelAttributes.flags.usesPrintf = true;
+        kernelDescriptor->kernelAttributes.numLocalIdChannels = 3;
         createModuleFromMockBinary(0u, false, mockKernelImmData.get());
 
         auto kernel = std::make_unique<MockKernel>(module.get());
 
         ze_kernel_desc_t kernelDesc{ZE_STRUCTURE_TYPE_KERNEL_DESC};
         kernel->initialize(&kernelDesc);
-        kernel->kernelRequiresGenerationOfLocalIdsByRuntime = kernelRequiresGenerationOfLocalIdsByRuntime;
-        kernel->requiredWorkgroupOrder = requiredWorkgroupOrder;
+        kernel->privateState.kernelRequiresGenerationOfLocalIdsByRuntime = kernelRequiresGenerationOfLocalIdsByRuntime;
+        kernel->privateState.requiredWorkgroupOrder = requiredWorkgroupOrder;
         kernel->setCrossThreadData(sizeof(uint64_t));
 
         EXPECT_TRUE(kernel->getKernelDescriptor().kernelAttributes.flags.requiresImplicitArgs);
@@ -979,22 +1226,23 @@ struct CmdlistAppendLaunchKernelWithImplicitArgsTests : CmdlistAppendLaunchKerne
         kernel->patchGlobalOffset();
 
         ze_result_t result{};
-        commandList.reset(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, result));
+        commandList.reset(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, result, false));
 
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-        auto indirectHeap = commandList->getCmdContainer().getIndirectHeap(NEO::HeapType::INDIRECT_OBJECT);
+        auto indirectHeap = commandList->getCmdContainer().getIndirectHeap(NEO::HeapType::indirectObject);
         indirectHeapAllocation = indirectHeap->getGraphicsAllocation();
 
         ze_group_count_t groupCount{expectedImplicitArgs.groupCountX, expectedImplicitArgs.groupCountY, expectedImplicitArgs.groupCountZ};
         CmdListKernelLaunchParams launchParams = {};
-        result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+        result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
         EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-        implicitArgsProgrammingSize = ImplicitArgsHelper::getSizeForImplicitArgsPatching(&expectedImplicitArgs, *kernelDescriptor);
+        const auto &rootDeviceEnvironment = device->getNEODevice()->getRootDeviceEnvironment();
+        implicitArgsProgrammingSize = ImplicitArgsHelper::getSizeForImplicitArgsPatching(reinterpret_cast<const ImplicitArgs *>(&expectedImplicitArgs), *kernelDescriptor, !kernelRequiresGenerationOfLocalIdsByRuntime, rootDeviceEnvironment);
         auto sizeCrossThreadData = kernel->getCrossThreadDataSize();
         auto sizePerThreadDataForWholeGroup = kernel->getPerThreadDataSizeForWholeThreadGroup();
-        EXPECT_EQ(indirectHeap->getUsed(), sizeCrossThreadData + sizePerThreadDataForWholeGroup + implicitArgsProgrammingSize);
+        EXPECT_EQ(indirectHeap->getUsed(), alignUp(sizeCrossThreadData + sizePerThreadDataForWholeGroup + implicitArgsProgrammingSize, NEO::EncodeDispatchKernel<FamilyType>::getDefaultIOHAlignment()));
 
         if (FamilyType::supportsCmdSet(IGFX_XE_HP_CORE)) {
             expectedImplicitArgs.localIdTablePtr = indirectHeapAllocation->getGpuAddress();
@@ -1003,7 +1251,7 @@ struct CmdlistAppendLaunchKernelWithImplicitArgsTests : CmdlistAppendLaunchKerne
     }
     std::unique_ptr<L0::CommandList> commandList;
     GraphicsAllocation *indirectHeapAllocation = nullptr;
-    ImplicitArgs expectedImplicitArgs = {sizeof(ImplicitArgs)};
+    ImplicitArgsV0 expectedImplicitArgs = {};
     std::array<uint8_t, 3> workgroupDimOrder{0, 1, 2};
     uint32_t implicitArgsProgrammingSize = 0u;
 
@@ -1022,26 +1270,28 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CmdlistAppendLaunchKernelWithImplicitArgsTests, giv
     dispatchKernelWithImplicitArgs<FamilyType>();
 
     auto grfSize = ImplicitArgsHelper::getGrfSize(expectedImplicitArgs.simdWidth);
-    auto expectedLocalIds = alignedMalloc(implicitArgsProgrammingSize - sizeof(ImplicitArgs), MemoryConstants::cacheLineSize);
-    generateLocalIDs(expectedLocalIds, expectedImplicitArgs.simdWidth, localSize, workgroupDimOrder, false, grfSize);
+    auto numGrf = GrfConfig::defaultGrfNumber;
+    auto expectedLocalIds = alignedMalloc(implicitArgsProgrammingSize - ImplicitArgsV0::getAlignedSize(), MemoryConstants::cacheLineSize);
+    const auto &rootDeviceEnvironment = device->getNEODevice()->getRootDeviceEnvironment();
+    generateLocalIDs(expectedLocalIds, expectedImplicitArgs.simdWidth, localSize, workgroupDimOrder, false, grfSize, numGrf, rootDeviceEnvironment, 3u);
 
-    auto localIdsProgrammingSize = implicitArgsProgrammingSize - sizeof(ImplicitArgs);
-    size_t sizeForLocalIds = NEO::PerThreadDataHelper::getPerThreadDataSizeTotal(expectedImplicitArgs.simdWidth, grfSize, 3u, totalLocalSize);
+    auto localIdsProgrammingSize = implicitArgsProgrammingSize - ImplicitArgsV0::getAlignedSize();
+    size_t sizeForLocalIds = NEO::PerThreadDataHelper::getPerThreadDataSizeTotal(expectedImplicitArgs.simdWidth, grfSize, numGrf, 3u, totalLocalSize, rootDeviceEnvironment);
 
     EXPECT_EQ(0, memcmp(expectedLocalIds, indirectHeapAllocation->getUnderlyingBuffer(), sizeForLocalIds));
     alignedFree(expectedLocalIds);
 
     auto implicitArgsInIndirectData = ptrOffset(indirectHeapAllocation->getUnderlyingBuffer(), localIdsProgrammingSize);
-    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, sizeof(ImplicitArgs)));
+    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, ImplicitArgsV0::getSize()));
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, CmdlistAppendLaunchKernelWithImplicitArgsTests, givenPreXeHpPlatformWhenAppendLaunchKernelWithImplicitArgsThenImplicitArgsAreSentToIndirectHeapWithoutLocalIds) {
+HWCMDTEST_F(IGFX_GEN12LP_CORE, CmdlistAppendLaunchKernelWithImplicitArgsTests, givenPreXeHpPlatformWhenAppendLaunchKernelWithImplicitArgsThenImplicitArgsAreSentToIndirectHeapWithoutLocalIds) {
     dispatchKernelWithImplicitArgs<FamilyType>();
 
     auto implicitArgsInIndirectData = indirectHeapAllocation->getUnderlyingBuffer();
-    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, sizeof(ImplicitArgs)));
+    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, ImplicitArgsV0::getSize()));
 
-    auto crossThreadDataInIndirectData = ptrOffset(indirectHeapAllocation->getUnderlyingBuffer(), 0x80);
+    auto crossThreadDataInIndirectData = ptrOffset(indirectHeapAllocation->getUnderlyingBuffer(), ImplicitArgsV0::getAlignedSize());
 
     auto programmedImplicitArgsGpuVA = reinterpret_cast<uint64_t *>(crossThreadDataInIndirectData)[0];
     EXPECT_EQ(indirectHeapAllocation->getGpuAddress(), programmedImplicitArgsGpuVA);
@@ -1067,17 +1317,19 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CmdlistAppendLaunchKernelWithImplicitArgsTests, giv
     dispatchKernelWithImplicitArgs<FamilyType>();
 
     auto grfSize = ImplicitArgsHelper::getGrfSize(expectedImplicitArgs.simdWidth);
-    auto expectedLocalIds = alignedMalloc(implicitArgsProgrammingSize - sizeof(ImplicitArgs), MemoryConstants::cacheLineSize);
-    generateLocalIDs(expectedLocalIds, expectedImplicitArgs.simdWidth, localSize, expectedDimOrder, false, grfSize);
+    auto numGrf = GrfConfig::defaultGrfNumber;
+    auto expectedLocalIds = alignedMalloc(implicitArgsProgrammingSize - ImplicitArgsV0::getSize(), MemoryConstants::cacheLineSize);
+    const auto &rootDeviceEnvironment = device->getNEODevice()->getRootDeviceEnvironment();
+    generateLocalIDs(expectedLocalIds, expectedImplicitArgs.simdWidth, localSize, expectedDimOrder, false, grfSize, numGrf, rootDeviceEnvironment, 3u);
 
-    auto localIdsProgrammingSize = implicitArgsProgrammingSize - sizeof(ImplicitArgs);
-    size_t sizeForLocalIds = NEO::PerThreadDataHelper::getPerThreadDataSizeTotal(expectedImplicitArgs.simdWidth, grfSize, 3u, totalLocalSize);
+    auto localIdsProgrammingSize = implicitArgsProgrammingSize - ImplicitArgsV0::getAlignedSize();
+    size_t sizeForLocalIds = NEO::PerThreadDataHelper::getPerThreadDataSizeTotal(expectedImplicitArgs.simdWidth, grfSize, numGrf, 3u, totalLocalSize, rootDeviceEnvironment);
 
     EXPECT_EQ(0, memcmp(expectedLocalIds, indirectHeapAllocation->getUnderlyingBuffer(), sizeForLocalIds));
     alignedFree(expectedLocalIds);
 
     auto implicitArgsInIndirectData = ptrOffset(indirectHeapAllocation->getUnderlyingBuffer(), localIdsProgrammingSize);
-    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, sizeof(ImplicitArgs)));
+    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, ImplicitArgsV0::getSize()));
 }
 
 HWCMDTEST_F(IGFX_XE_HP_CORE, CmdlistAppendLaunchKernelWithImplicitArgsTests, givenXeHpAndLaterPlatformWhenAppendLaunchKernelWithImplicitArgsAndSimd1ThenLocalIdsAreGeneratedCorrectly) {
@@ -1099,12 +1351,12 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, CmdlistAppendLaunchKernelWithImplicitArgsTests, giv
 
     EXPECT_EQ(0, memcmp(expectedLocalIds, indirectHeapAllocation->getUnderlyingBuffer(), sizeof(expectedLocalIds)));
 
-    auto localIdsProgrammingSize = implicitArgsProgrammingSize - sizeof(ImplicitArgs);
+    auto localIdsProgrammingSize = implicitArgsProgrammingSize - ImplicitArgsV0::getAlignedSize();
 
     EXPECT_EQ(alignUp(sizeof(expectedLocalIds), MemoryConstants::cacheLineSize), localIdsProgrammingSize);
 
     auto implicitArgsInIndirectData = ptrOffset(indirectHeapAllocation->getUnderlyingBuffer(), localIdsProgrammingSize);
-    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, sizeof(ImplicitArgs)));
+    EXPECT_EQ(0, memcmp(implicitArgsInIndirectData, &expectedImplicitArgs, ImplicitArgsV0::getSize()));
 }
 
 HWTEST_F(CmdlistAppendLaunchKernelTests, givenKernelWithoutImplicitArgsWhenAppendLaunchKernelThenImplicitArgsAreNotSentToIndirectHeap) {
@@ -1127,23 +1379,23 @@ HWTEST_F(CmdlistAppendLaunchKernelTests, givenKernelWithoutImplicitArgsWhenAppen
     kernel->patchGlobalOffset();
 
     ze_result_t result{};
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, result));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, result, false));
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_group_count_t groupCount = {3, 2, 1};
     CmdListKernelLaunchParams launchParams = {};
-    result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    auto indirectHeap = commandList->getCmdContainer().getIndirectHeap(NEO::HeapType::INDIRECT_OBJECT);
+    auto indirectHeap = commandList->getCmdContainer().getIndirectHeap(NEO::HeapType::indirectObject);
 
     auto sizeCrossThreadData = kernel->getCrossThreadDataSize();
     auto sizePerThreadDataForWholeGroup = kernel->getPerThreadDataSizeForWholeThreadGroup();
     EXPECT_EQ(indirectHeap->getUsed(), sizeCrossThreadData + sizePerThreadDataForWholeGroup);
 }
 
-HWTEST2_F(CmdlistAppendLaunchKernelTests, givenKernelWitchScratchAndPrivateWhenAppendLaunchKernelThenCmdListHasCorrectPrivateAndScratchSizesSet, IsAtLeastXeHpCore) {
+HWTEST2_F(CmdlistAppendLaunchKernelTests, givenKernelWithScratchAndPrivateWhenAppendLaunchKernelThenCmdListHasCorrectPrivateAndScratchSizesSet, IsAtLeastXeCore) {
     std::unique_ptr<MockImmutableData> mockKernelImmData = std::make_unique<MockImmutableData>(0u);
     auto kernelDescriptor = mockKernelImmData->kernelDescriptor;
     kernelDescriptor->kernelAttributes.flags.requiresImplicitArgs = false;
@@ -1165,30 +1417,118 @@ HWTEST2_F(CmdlistAppendLaunchKernelTests, givenKernelWitchScratchAndPrivateWhenA
     kernel->patchGlobalOffset();
 
     ze_result_t result{};
-    std::unique_ptr<L0::CommandList> commandList(CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, result));
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, result, false));
 
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
     ze_group_count_t groupCount = {3, 2, 1};
     CmdListKernelLaunchParams launchParams = {};
-    result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    EXPECT_EQ(commandList->getCommandListPerThreadPrivateScratchSize(), static_cast<uint32_t>(0x100));
-    EXPECT_EQ(commandList->getCommandListPerThreadScratchSize(), static_cast<uint32_t>(0x200));
+    EXPECT_EQ(commandList->getCommandListPerThreadScratchSize(1u), static_cast<uint32_t>(0x100));
+    EXPECT_EQ(commandList->getCommandListPerThreadScratchSize(0u), static_cast<uint32_t>(0x200));
+}
+
+struct CmdlistAppendLaunchKernelTestsWithoutHeaplessMatcher {
+    template <PRODUCT_FAMILY productFamily>
+    static constexpr bool isMatched() {
+        return IsAtLeastXeCore::isMatched<productFamily>() && !(TestTraits<NEO::ToGfxCoreFamily<productFamily>::get()>::heaplessRequired);
+    }
+};
+
+HWTEST2_F(CmdlistAppendLaunchKernelTests, givenGlobalBindlessAllocatorAndKernelWithPrivateScratchWhenAppendLaunchKernelThenCmdContainerHasBindfulSSHAllocated, CmdlistAppendLaunchKernelTestsWithoutHeaplessMatcher) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.UseExternalAllocatorForSshAndDsh.set(1);
+
+    auto bindlessHeapsHelper = std::make_unique<MockBindlesHeapsHelper>(neoDevice, neoDevice->getNumGenericSubDevices() > 1);
+    execEnv->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->bindlessHeapsHelper.reset(bindlessHeapsHelper.release());
+
+    std::unique_ptr<MockImmutableData> mockKernelImmData = std::make_unique<MockImmutableData>(0u);
+    auto kernelDescriptor = mockKernelImmData->kernelDescriptor;
+    kernelDescriptor->kernelAttributes.flags.requiresImplicitArgs = false;
+    kernelDescriptor->kernelAttributes.perThreadScratchSize[1] = 0x40;
+    createModuleFromMockBinary(0u, false, mockKernelImmData.get());
+
+    auto kernel = std::make_unique<MockKernel>(module.get());
+
+    ze_kernel_desc_t kernelDesc{ZE_STRUCTURE_TYPE_KERNEL_DESC};
+    kernel->initialize(&kernelDesc);
+
+    EXPECT_FALSE(kernel->getKernelDescriptor().kernelAttributes.flags.requiresImplicitArgs);
+    EXPECT_EQ(nullptr, kernel->getImplicitArgs());
+
+    kernel->setGroupSize(4, 5, 6);
+    kernel->setGroupCount(3, 2, 1);
+    kernel->setGlobalOffsetExp(1, 2, 3);
+    kernel->patchGlobalOffset();
+
+    ze_result_t result{};
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, result, false));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(nullptr, commandList->getCmdContainer().getIndirectHeap(HeapType::surfaceState));
+
+    ze_group_count_t groupCount = {3, 2, 1};
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_NE(nullptr, commandList->getCmdContainer().getIndirectHeap(HeapType::surfaceState));
+}
+
+HWTEST2_F(CmdlistAppendLaunchKernelTests, givenGlobalBindlessAllocatorAndKernelWithScratchWhenAppendLaunchKernelThenCmdContainerHasBindfulSSHAllocated, CmdlistAppendLaunchKernelTestsWithoutHeaplessMatcher) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.UseExternalAllocatorForSshAndDsh.set(1);
+    auto bindlessHeapsHelper = std::make_unique<MockBindlesHeapsHelper>(neoDevice, neoDevice->getNumGenericSubDevices() > 1);
+    execEnv->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->bindlessHeapsHelper.reset(bindlessHeapsHelper.release());
+
+    std::unique_ptr<MockImmutableData> mockKernelImmData = std::make_unique<MockImmutableData>(0u);
+    auto kernelDescriptor = mockKernelImmData->kernelDescriptor;
+    kernelDescriptor->kernelAttributes.flags.requiresImplicitArgs = false;
+    kernelDescriptor->kernelAttributes.perThreadScratchSize[0] = 0x40;
+    createModuleFromMockBinary(0u, false, mockKernelImmData.get());
+
+    auto kernel = std::make_unique<MockKernel>(module.get());
+
+    ze_kernel_desc_t kernelDesc{ZE_STRUCTURE_TYPE_KERNEL_DESC};
+    kernel->initialize(&kernelDesc);
+
+    EXPECT_FALSE(kernel->getKernelDescriptor().kernelAttributes.flags.requiresImplicitArgs);
+    EXPECT_EQ(nullptr, kernel->getImplicitArgs());
+
+    kernel->setGroupSize(4, 5, 6);
+    kernel->setGroupCount(3, 2, 1);
+    kernel->setGlobalOffsetExp(1, 2, 3);
+    kernel->patchGlobalOffset();
+
+    ze_result_t result{};
+    std::unique_ptr<L0::CommandList> commandList(CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, result, false));
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_EQ(nullptr, commandList->getCmdContainer().getIndirectHeap(HeapType::surfaceState));
+
+    ze_group_count_t groupCount = {3, 2, 1};
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, nullptr, 0, nullptr, launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+
+    EXPECT_NE(nullptr, commandList->getCmdContainer().getIndirectHeap(HeapType::surfaceState));
 }
 
 HWTEST_F(CmdlistAppendLaunchKernelTests, whenEncodingWorkDimForIndirectDispatchThenSizeIsProperlyEstimated) {
 
-    Mock<::L0::Kernel> kernel;
+    Mock<::L0::KernelImp> kernel;
     ze_result_t returnValue;
-    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(productFamily, device, NEO::EngineGroupType::RenderCompute, 0u, returnValue));
+    std::unique_ptr<L0::CommandList> commandList(L0::CommandList::create(device, NEO::EngineGroupType::renderCompute, 0u, returnValue, false));
 
     {
         uint32_t groupSize[] = {1, 1, 1};
         auto estimate = EncodeIndirectParams<FamilyType>::getCmdsSizeForSetWorkDimIndirect(groupSize, false);
         auto sizeBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x4, 0u, groupSize);
+        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x4, 0u, groupSize, nullptr);
         auto sizeAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
         EXPECT_LE(sizeAfter - sizeBefore, estimate);
     }
@@ -1196,7 +1536,7 @@ HWTEST_F(CmdlistAppendLaunchKernelTests, whenEncodingWorkDimForIndirectDispatchT
         uint32_t groupSize[] = {1, 1, 2};
         auto estimate = EncodeIndirectParams<FamilyType>::getCmdsSizeForSetWorkDimIndirect(groupSize, false);
         auto sizeBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x4, 0u, groupSize);
+        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x4, 0u, groupSize, nullptr);
         auto sizeAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
         EXPECT_LE(sizeAfter - sizeBefore, estimate);
     }
@@ -1204,7 +1544,7 @@ HWTEST_F(CmdlistAppendLaunchKernelTests, whenEncodingWorkDimForIndirectDispatchT
         uint32_t groupSize[] = {1, 1, 1};
         auto estimate = EncodeIndirectParams<FamilyType>::getCmdsSizeForSetWorkDimIndirect(groupSize, true);
         auto sizeBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x2, 0u, groupSize);
+        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x2, 0u, groupSize, nullptr);
         auto sizeAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
         EXPECT_LE(sizeAfter - sizeBefore, estimate);
     }
@@ -1212,91 +1552,95 @@ HWTEST_F(CmdlistAppendLaunchKernelTests, whenEncodingWorkDimForIndirectDispatchT
         uint32_t groupSize[] = {1, 1, 2};
         auto estimate = EncodeIndirectParams<FamilyType>::getCmdsSizeForSetWorkDimIndirect(groupSize, true);
         auto sizeBefore = commandList->getCmdContainer().getCommandStream()->getUsed();
-        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x2, 0u, groupSize);
+        EncodeIndirectParams<FamilyType>::setWorkDimIndirect(commandList->getCmdContainer(), 0x2, 0u, groupSize, nullptr);
         auto sizeAfter = commandList->getCmdContainer().getCommandStream()->getUsed();
         EXPECT_LE(sizeAfter - sizeBefore, estimate);
     }
 }
 
 using CommandListAppendLaunchKernel = Test<ModuleFixture>;
-HWTEST2_F(CommandListAppendLaunchKernel, givenCooperativeAndNonCooperativeKernelsWhenAppendLaunchCooperativeKernelIsCalledThenReturnError, IsAtLeastSkl) {
-    Mock<::L0::Kernel> kernel;
+HWTEST_F(CommandListAppendLaunchKernel, givenCooperativeAndNonCooperativeKernelsWhenAppendLaunchCooperativeKernelIsCalledThenReturnSuccess) {
+    Mock<::L0::KernelImp> kernel;
     std::unique_ptr<Module> pMockModule = std::make_unique<Mock<Module>>(device, nullptr);
-    kernel.module = pMockModule.get();
+    kernel.setModule(pMockModule.get());
 
     kernel.setGroupSize(4, 1, 1);
     ze_group_count_t groupCount{8, 1, 1};
 
-    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    pCommandList->initialize(device, NEO::EngineGroupType::Compute, 0u);
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u);
     CmdListKernelLaunchParams launchParams = {};
     launchParams.isCooperative = false;
-    auto result = pCommandList->appendLaunchKernelWithParams(&kernel, &groupCount, nullptr, launchParams);
+    auto result = pCommandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     launchParams.isCooperative = true;
-    result = pCommandList->appendLaunchKernelWithParams(&kernel, &groupCount, nullptr, launchParams);
-    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+    result = pCommandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    pCommandList->initialize(device, NEO::EngineGroupType::Compute, 0u);
+    pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u);
     launchParams.isCooperative = true;
-    result = pCommandList->appendLaunchKernelWithParams(&kernel, &groupCount, nullptr, launchParams);
+    result = pCommandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     launchParams.isCooperative = false;
-    result = pCommandList->appendLaunchKernelWithParams(&kernel, &groupCount, nullptr, launchParams);
-    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ARGUMENT, result);
+    result = pCommandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 }
 
-HWTEST2_F(CommandListAppendLaunchKernel, givenKernelWithSlmSizeExceedingLocalMemorySizeWhenAppendLaunchKernelWithParamsIsCalledThenDebugMsgErrIsPrintedAndOutOfDeviceMemoryIsReturned, IsAtLeastSkl) {
+HWTEST_F(CommandListAppendLaunchKernel, givenKernelWithSlmSizeExceedingLocalMemorySizeWhenAppendLaunchKernelWithParamsIsCalledThenDebugMsgErrIsPrintedAndOutOfDeviceMemoryIsReturned) {
     DebugManagerStateRestore dbgRestorer;
-    DebugManager.flags.PrintDebugMessages.set(true);
+    debugManager.flags.PrintDebugMessages.set(true);
 
-    Mock<::L0::Kernel> kernel;
+    Mock<::L0::KernelImp> kernel;
     std::unique_ptr<Module> pMockModule = std::make_unique<Mock<Module>>(device, nullptr);
-    kernel.module = pMockModule.get();
+    kernel.setModule(pMockModule.get());
 
     kernel.setGroupSize(4, 1, 1);
     ze_group_count_t groupCount{8, 1, 1};
 
-    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    pCommandList->initialize(device, NEO::EngineGroupType::Compute, 0u);
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u);
     CmdListKernelLaunchParams launchParams = {};
 
-    ::testing::internal::CaptureStderr();
+    StreamCapture capture;
+    capture.captureStderr();
 
-    auto result = pCommandList->appendLaunchKernelWithParams(&kernel, &groupCount, nullptr, launchParams);
+    auto result = pCommandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
 
-    std::string output = testing::internal::GetCapturedStderr();
+    std::string output = capture.getCapturedStderr();
     EXPECT_EQ(std::string(""), output);
 
     auto localMemSize = static_cast<uint32_t>(device->getNEODevice()->getDeviceInfo().localMemSize);
     kernel.immutableData.kernelDescriptor->kernelAttributes.slmInlineSize = localMemSize + 10u;
 
-    ::testing::internal::CaptureStderr();
+    capture.captureStderr();
 
-    result = pCommandList->appendLaunchKernelWithParams(&kernel, &groupCount, nullptr, launchParams);
+    result = pCommandList->appendLaunchKernelWithParams(&kernel, groupCount, nullptr, launchParams);
+    const char *pStr = nullptr;
+    std::string emptyString = "";
+    zeDriverGetLastErrorDescription(device->getDriverHandle(), &pStr);
+    EXPECT_NE(0, strcmp(pStr, emptyString.c_str()));
     EXPECT_EQ(ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, result);
 
-    output = testing::internal::GetCapturedStderr();
+    output = capture.getCapturedStderr();
     const auto &slmInlineSize = kernel.immutableData.kernelDescriptor->kernelAttributes.slmInlineSize;
     std::string expectedOutput = "Size of SLM (" + std::to_string(slmInlineSize) + ") larger than available (" + std::to_string(localMemSize) + ")\n";
     EXPECT_EQ(expectedOutput, output);
 }
 
-HWTEST2_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichTogetherExceedGlobalMemSizeWhenAppendLaunchKernelWithParamsIsCalledOnlyThenAllocationHappens, IsAtLeastSkl) {
+HWTEST_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichTogetherExceedGlobalMemSizeWhenAppendLaunchKernelWithParamsIsCalledOnlyThenAllocationHappens) {
 
     auto devInfo = device->getNEODevice()->getDeviceInfo();
     auto kernelsNb = 2u;
-    uint32_t margin1KB = (1 << 10);
-    auto overAllocMinSize = static_cast<uint32_t>(devInfo.globalMemSize / kernelsNb / devInfo.computeUnitsUsedForScratch) + margin1KB;
+    auto margin1KB = MemoryConstants::kiloByte;
+    auto overAllocMinSize = static_cast<uint32_t>(devInfo.globalMemSize / kernelsNb / devInfo.computeUnitsUsedForScratch + margin1KB);
     auto kernelNames = std::array<std::string, 2u>{"test1", "test2"};
 
-    auto proxyModuleImpl = static_cast<ModuleFixture::ProxyModuleImp *>(this->module.get());
-    auto &kernelImmDatas = proxyModuleImpl->getKernelImmDatas();
+    auto &kernelImmData = this->module->kernelImmData;
     for (size_t i = 0; i < kernelsNb; i++) {
-        auto &kernelDesc = const_cast<KernelDescriptor &>(kernelImmDatas[i]->getDescriptor());
-        kernelDesc.kernelAttributes.perHwThreadPrivateMemorySize = overAllocMinSize;
+        auto &kernelDesc = const_cast<KernelDescriptor &>(kernelImmData[i]->getDescriptor());
+        kernelDesc.kernelAttributes.perHwThreadPrivateMemorySize = overAllocMinSize + static_cast<uint32_t>(i * MemoryConstants::cacheLineSize);
         kernelDesc.kernelAttributes.flags.usesPrintf = false;
         kernelDesc.kernelMetadata.kernelName = kernelNames[i];
     }
@@ -1305,23 +1649,23 @@ HWTEST2_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichTogethe
     this->module->checkIfPrivateMemoryPerDispatchIsNeeded();
     EXPECT_TRUE(this->module->shouldAllocatePrivateMemoryPerDispatch());
 
-    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
     pCommandList->device = this->module->getDevice();
     auto memoryMgr = static_cast<OsAgnosticMemoryManager *>(pCommandList->device->getNEODevice()->getExecutionEnvironment()->memoryManager.get());
     memoryMgr->turnOnFakingBigAllocations();
 
-    auto kernels = std::vector<std::unique_ptr<WhiteBox<::L0::Kernel>>>();
+    auto kernels = std::vector<std::unique_ptr<WhiteBox<::L0::KernelImp>>>();
     for (size_t i = 0; i < kernelsNb; i++) {
         EXPECT_EQ(pCommandList->getOwnedPrivateAllocationsSize(), i);
         kernels.push_back(this->createKernelWithName(kernelNames[i]));
         // This function is called by appendLaunchKernelWithParams
-        pCommandList->allocateKernelPrivateMemoryIfNeeded(kernels[i].get(),
-                                                          kernels[i]->getKernelDescriptor().kernelAttributes.perHwThreadPrivateMemorySize);
+        pCommandList->allocateOrReuseKernelPrivateMemoryIfNeeded(kernels[i].get(),
+                                                                 kernels[i]->getKernelDescriptor().kernelAttributes.perHwThreadPrivateMemorySize);
         EXPECT_EQ(pCommandList->getOwnedPrivateAllocationsSize(), i + 1);
     }
 }
 
-HWTEST2_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichDontExceedGlobalMemSizeWhenAppendLaunchKernelWithParamsIsCalledThenNoAllocationIsDone, IsAtLeastSkl) {
+HWTEST_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichDontExceedGlobalMemSizeWhenAppendLaunchKernelWithParamsIsCalledThenNoAllocationIsDone) {
 
     auto devInfo = device->getNEODevice()->getDeviceInfo();
     auto kernelsNb = 2u;
@@ -1329,10 +1673,9 @@ HWTEST2_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichDontExc
     auto underAllocSize = static_cast<uint32_t>(devInfo.globalMemSize / kernelsNb / devInfo.computeUnitsUsedForScratch) - margin128KB;
     auto kernelNames = std::array<std::string, 2u>{"test1", "test2"};
 
-    auto proxyModuleImpl = static_cast<ModuleFixture::ProxyModuleImp *>(this->module.get());
-    auto &kernelImmDatas = proxyModuleImpl->getKernelImmDatas();
+    auto &kernelImmData = this->module->kernelImmData;
     for (size_t i = 0; i < kernelsNb; i++) {
-        auto &kernelDesc = const_cast<KernelDescriptor &>(kernelImmDatas[i]->getDescriptor());
+        auto &kernelDesc = const_cast<KernelDescriptor &>(kernelImmData[i]->getDescriptor());
         kernelDesc.kernelAttributes.perHwThreadPrivateMemorySize = underAllocSize;
         kernelDesc.kernelAttributes.flags.usesPrintf = false;
         kernelDesc.kernelMetadata.kernelName = kernelNames[i];
@@ -1342,51 +1685,51 @@ HWTEST2_F(CommandListAppendLaunchKernel, givenTwoKernelPrivateAllocsWhichDontExc
     this->module->checkIfPrivateMemoryPerDispatchIsNeeded();
     EXPECT_FALSE(this->module->shouldAllocatePrivateMemoryPerDispatch());
 
-    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
     pCommandList->device = this->module->getDevice();
     auto memoryMgr = static_cast<OsAgnosticMemoryManager *>(pCommandList->device->getNEODevice()->getExecutionEnvironment()->memoryManager.get());
     memoryMgr->turnOnFakingBigAllocations();
 
-    auto kernels = std::vector<std::unique_ptr<WhiteBox<::L0::Kernel>>>();
+    auto kernels = std::vector<std::unique_ptr<WhiteBox<::L0::KernelImp>>>();
     for (size_t i = 0; i < kernelsNb; i++) {
         EXPECT_EQ(pCommandList->getOwnedPrivateAllocationsSize(), 0u);
         kernels.push_back(this->createKernelWithName(kernelNames[i]));
         // This function is called by appendLaunchKernelWithParams
-        pCommandList->allocateKernelPrivateMemoryIfNeeded(kernels[i].get(),
-                                                          kernels[i]->getKernelDescriptor().kernelAttributes.perHwThreadPrivateMemorySize);
+        pCommandList->allocateOrReuseKernelPrivateMemoryIfNeeded(kernels[i].get(),
+                                                                 kernels[i]->getKernelDescriptor().kernelAttributes.perHwThreadPrivateMemorySize);
         EXPECT_EQ(pCommandList->getOwnedPrivateAllocationsSize(), 0u);
     }
 }
-HWTEST2_F(CommandListAppendLaunchKernel, GivenDebugToggleSetWhenUpdateStreamPropertiesIsCalledThenCorrectThreadArbitrationPolicyIsSet, IsAtLeastSkl) {
+HWTEST2_F(CommandListAppendLaunchKernel, GivenDebugToggleSetWhenUpdateStreamPropertiesIsCalledThenCorrectThreadArbitrationPolicyIsSet, IsHeapfulRequired) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
+    debugManager.flags.ForceThreadArbitrationPolicyProgrammingWithScm.set(1);
 
-    auto &gfxCoreHelper = device->getGfxCoreHelper();
-    auto defaultThreadArbitrationPolicy = gfxCoreHelper.getDefaultThreadArbitrationPolicy();
+    const auto &hwInfo = device->getHwInfo();
+    auto defaultThreadArbitrationPolicy = hwInfo.caps.defaultThreadArbitrationPolicy;
     auto nonDefaultThreadArbitrationPolicy = defaultThreadArbitrationPolicy + 1;
 
-    Mock<::L0::Kernel> kernel;
+    Mock<::L0::KernelImp> kernel;
     std::unique_ptr<Module> pMockModule = std::make_unique<Mock<Module>>(device, nullptr);
-    kernel.module = pMockModule.get();
+    kernel.setModule(pMockModule.get());
 
-    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    auto result = pCommandList->initialize(device, NEO::EngineGroupType::Compute, 0u);
+    auto pCommandList = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto result = pCommandList->initialize(device, NEO::EngineGroupType::compute, 0u);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
 
     // initial kernel with no policy preference
     const ze_group_count_t launchKernelArgs = {};
-    pCommandList->updateStreamProperties(kernel, false, &launchKernelArgs, false);
+    pCommandList->updateStreamProperties(kernel, false, launchKernelArgs, false);
     EXPECT_EQ(defaultThreadArbitrationPolicy, pCommandList->finalStreamState.stateComputeMode.threadArbitrationPolicy.value);
 
     // policy changed to non-default state
     pCommandList->finalStreamState.stateComputeMode.threadArbitrationPolicy.value = nonDefaultThreadArbitrationPolicy;
     // another kernel with no policy preference - do not update policy
-    pCommandList->updateStreamProperties(kernel, false, &launchKernelArgs, false);
+    pCommandList->updateStreamProperties(kernel, false, launchKernelArgs, false);
     EXPECT_EQ(nonDefaultThreadArbitrationPolicy, pCommandList->finalStreamState.stateComputeMode.threadArbitrationPolicy.value);
 
     // another kernel with no policy preference, this time with debug toggle set - update policy back to default value
-    DebugManager.flags.ForceDefaultThreadArbitrationPolicyIfNotSpecified.set(true);
-    pCommandList->updateStreamProperties(kernel, false, &launchKernelArgs, false);
+    debugManager.flags.ForceDefaultThreadArbitrationPolicyIfNotSpecified.set(true);
+    pCommandList->updateStreamProperties(kernel, false, launchKernelArgs, false);
     EXPECT_EQ(defaultThreadArbitrationPolicy, pCommandList->finalStreamState.stateComputeMode.threadArbitrationPolicy.value);
 }
 
@@ -1406,7 +1749,7 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiTileCommandListAppendLaunchKernelXeHpCoreTest,
     ze_result_t result = ZE_RESULT_SUCCESS;
     std::unique_ptr<L0::EventPool> eventPool(EventPool::create(device->getDriverHandle(), context, 1, &deviceHandle, &eventPoolDesc, result));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
-    std::unique_ptr<L0::Event> event(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device));
+    std::unique_ptr<L0::Event> event(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
 
     ze_event_handle_t hEventHandle = event->toHandle();
 
@@ -1414,55 +1757,114 @@ HWCMDTEST_F(IGFX_XE_HP_CORE, MultiTileCommandListAppendLaunchKernelXeHpCoreTest,
 
     ze_group_count_t groupCount{256, 1, 1};
     CmdListKernelLaunchParams launchParams = {};
-    result = commandList->appendLaunchKernel(kernel->toHandle(), &groupCount, hEventHandle, 0, nullptr, launchParams, false);
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, hEventHandle, 0, nullptr, launchParams);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(4u, event->getPacketsInUse());
 
     EXPECT_EQ(4u, commandList->partitionCount);
 }
 
-HWTEST2_F(MultiTileCommandListAppendLaunchKernelXeHpCoreTest, givenCooperativeKernelWhenAppendingKernelsThenSetProperPartitionSize, IsAtLeastXeHpCore) {
+HWCMDTEST_F(IGFX_XE_HP_CORE, MultiTileCommandListAppendLaunchKernelXeHpCoreTest, givenDebugVariableSetWhenUsingNonTimestampEventThenDontOverridePostSyncMode) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+    using POSTSYN_DATA = decltype(FamilyType::template getPostSyncType<WalkerType>());
+
+    ze_event_pool_desc_t eventPoolDesc = {};
+    eventPoolDesc.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+    eventPoolDesc.flags = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+    eventPoolDesc.count = 1;
+
+    ze_event_desc_t eventDesc = {};
+    eventDesc.stype = ZE_STRUCTURE_TYPE_EVENT_DESC;
+    eventDesc.index = 0;
+    auto deviceHandle = device->toHandle();
+
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    std::unique_ptr<L0::EventPool> eventPool(EventPool::create(device->getDriverHandle(), context, 1, &deviceHandle, &eventPoolDesc, result));
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    std::unique_ptr<L0::Event> event(Event::create<typename FamilyType::TimestampPacketType>(eventPool.get(), &eventDesc, device, result));
+
+    EXPECT_FALSE(event->isEventTimestampFlagSet());
+
+    ze_event_handle_t hEventHandle = event->toHandle();
+
+    ze_group_count_t groupCount{256, 1, 1};
+    CmdListKernelLaunchParams launchParams = {};
+    result = commandList->appendLaunchKernel(kernel->toHandle(), groupCount, hEventHandle, 0, nullptr, launchParams);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(4u, event->getPacketsInUse());
+    EXPECT_EQ(4u, commandList->partitionCount);
+
+    GenCmdList cmdList;
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
+        cmdList, commandList->getCmdContainer().getCommandStream()->getCpuBase(), commandList->getCmdContainer().getCommandStream()->getUsed()));
+
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
+    ASSERT_NE(it, cmdList.end());
+    auto walker = genCmdCast<WalkerType *>(*it);
+
+    EXPECT_TRUE(walker->getWorkloadPartitionEnable());
+    auto &postSync = walker->getPostSync();
+    EXPECT_EQ(POSTSYN_DATA::OPERATION_WRITE_IMMEDIATE_DATA, postSync.getOperation());
+}
+
+HWTEST2_F(MultiTileCommandListAppendLaunchKernelXeHpCoreTest, givenCooperativeKernelWhenAppendingKernelsThenSetProperPartitionSize, IsAtLeastXeCore) {
+
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+
     ze_group_count_t groupCount{16, 1, 1};
 
-    auto commandListWithNonCooperativeKernel = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    auto result = commandListWithNonCooperativeKernel->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    auto commandListWithNonCooperativeKernel = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    auto result = commandListWithNonCooperativeKernel->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     auto sizeBefore = commandListWithNonCooperativeKernel->getCmdContainer().getCommandStream()->getUsed();
     CmdListKernelLaunchParams launchParams = {};
-    result = commandListWithNonCooperativeKernel->appendLaunchKernelWithParams(kernel.get(), &groupCount, nullptr, launchParams);
+    result = commandListWithNonCooperativeKernel->appendLaunchKernelWithParams(kernel.get(), groupCount, nullptr, launchParams);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     auto sizeAfter = commandListWithNonCooperativeKernel->getCmdContainer().getCommandStream()->getUsed();
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandListWithNonCooperativeKernel->getCmdContainer().getCommandStream()->getCpuBase(), sizeBefore), sizeAfter - sizeBefore));
-    auto itorWalker = find<typename FamilyType::WALKER_TYPE *>(cmdList.begin(), cmdList.end());
-    auto cmd = genCmdCast<typename FamilyType::WALKER_TYPE *>(*itorWalker);
-    EXPECT_TRUE(cmd->getWorkloadPartitionEnable());
-    EXPECT_EQ(4u, cmd->getPartitionSize());
+    auto itorWalker = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
+    ASSERT_NE(itorWalker, cmdList.end());
+    auto walker = genCmdCast<WalkerType *>(*itorWalker);
+    ASSERT_NE(nullptr, walker);
 
-    auto commandListWithCooperativeKernel = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<gfxCoreFamily>>>();
-    result = commandListWithCooperativeKernel->initialize(device, NEO::EngineGroupType::RenderCompute, 0u);
+    EXPECT_TRUE(walker->getWorkloadPartitionEnable());
+    EXPECT_EQ(4u, walker->getPartitionSize());
+
+    auto commandListWithCooperativeKernel = std::make_unique<WhiteBox<::L0::CommandListCoreFamily<FamilyType::gfxCoreFamily>>>();
+    result = commandListWithCooperativeKernel->initialize(device, NEO::EngineGroupType::renderCompute, 0u);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     sizeBefore = commandListWithCooperativeKernel->getCmdContainer().getCommandStream()->getUsed();
     launchParams.isCooperative = true;
-    result = commandListWithCooperativeKernel->appendLaunchKernelWithParams(kernel.get(), &groupCount, nullptr, launchParams);
+    result = commandListWithCooperativeKernel->appendLaunchKernelWithParams(kernel.get(), groupCount, nullptr, launchParams);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     sizeAfter = commandListWithCooperativeKernel->getCmdContainer().getCommandStream()->getUsed();
     cmdList.clear();
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList, ptrOffset(commandListWithCooperativeKernel->getCmdContainer().getCommandStream()->getCpuBase(), sizeBefore), sizeAfter - sizeBefore));
 
-    itorWalker = find<typename FamilyType::WALKER_TYPE *>(cmdList.begin(), cmdList.end());
-    cmd = genCmdCast<typename FamilyType::WALKER_TYPE *>(*itorWalker);
-    EXPECT_TRUE(cmd->getWorkloadPartitionEnable());
-    EXPECT_EQ(16u, cmd->getPartitionSize());
+    const auto &gfxCoreHelper = device->getGfxCoreHelper();
+    bool singleTileExecImplicitScalingRequired = gfxCoreHelper.singleTileExecImplicitScalingRequired(true);
+    itorWalker = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
+    ASSERT_NE(itorWalker, cmdList.end());
+
+    auto walker2 = genCmdCast<WalkerType *>(*itorWalker);
+    ASSERT_NE(nullptr, walker2);
+    EXPECT_TRUE(walker2->getWorkloadPartitionEnable());
+    if (singleTileExecImplicitScalingRequired) {
+        EXPECT_EQ(16u, walker2->getPartitionSize());
+    } else {
+        EXPECT_EQ(4u, walker2->getPartitionSize());
+    }
 }
 
 HWTEST2_F(MultiTileCommandListAppendLaunchKernelXeHpCoreTest,
-          givenRegularCommandListWhenSynchronizationRequiredThenExpectJumpingBbStartCommandToSecondary, IsAtLeastXeHpCore) {
-    using WALKER_TYPE = typename FamilyType::WALKER_TYPE;
+          givenRegularCommandListWhenSynchronizationRequiredThenExpectJumpingBbStartCommandToSecondary, IsAtLeastXeCore) {
+    using WalkerType = typename FamilyType::DefaultWalkerType;
+
     using MI_BATCH_BUFFER_START = typename FamilyType::MI_BATCH_BUFFER_START;
-    DebugManager.flags.UsePipeControlAfterPartitionedWalker.set(1);
+    debugManager.flags.UsePipeControlAfterPartitionedWalker.set(1);
 
     ze_group_count_t groupCount{128, 1, 1};
 
@@ -1470,19 +1872,21 @@ HWTEST2_F(MultiTileCommandListAppendLaunchKernelXeHpCoreTest,
 
     auto sizeBefore = cmdStream->getUsed();
     CmdListKernelLaunchParams launchParams = {};
-    auto result = commandList->appendLaunchKernel(kernel.get(), &groupCount, nullptr, 0, nullptr, launchParams, false);
+    auto result = commandList->appendLaunchKernel(kernel.get(), groupCount, nullptr, 0, nullptr, launchParams);
     ASSERT_EQ(ZE_RESULT_SUCCESS, result);
     auto sizeAfter = cmdStream->getUsed();
 
     GenCmdList cmdList;
-    ASSERT_TRUE(FamilyType::PARSE::parseCommandBuffer(
+    ASSERT_TRUE(FamilyType::Parse::parseCommandBuffer(
         cmdList,
         ptrOffset(cmdStream->getCpuBase(), sizeBefore),
         sizeAfter - sizeBefore));
 
-    auto itorWalker = find<WALKER_TYPE *>(cmdList.begin(), cmdList.end());
-    auto cmd = genCmdCast<WALKER_TYPE *>(*itorWalker);
-    EXPECT_TRUE(cmd->getWorkloadPartitionEnable());
+    auto it = NEO::UnitTestHelper<FamilyType>::findWalkerTypeCmd(cmdList.begin(), cmdList.end());
+    ASSERT_NE(it, cmdList.end());
+
+    auto walker = genCmdCast<WalkerType *>(*it);
+    EXPECT_TRUE(walker->getWorkloadPartitionEnable());
 
     auto itorBbStart = find<MI_BATCH_BUFFER_START *>(cmdList.begin(), cmdList.end());
     ASSERT_NE(cmdList.end(), itorBbStart);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,13 @@
 
 #include "opencl/source/mem_obj/mem_obj_helper.h"
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
-#include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/memory_properties_helpers.h"
 #include "shared/source/memory_manager/allocation_properties.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/context/context.h"
-#include "opencl/source/helpers/cl_gfx_core_helper.h"
 #include "opencl/source/mem_obj/mem_obj.h"
 
 namespace NEO {
@@ -84,7 +83,7 @@ AllocationProperties MemObjHelper::getAllocationPropertiesWithImageInfo(
     const HardwareInfo &hwInfo, DeviceBitfield subDevicesBitfieldParam, bool deviceOnlyVisibilty) {
 
     auto deviceBitfield = MemoryPropertiesHelper::adjustDeviceBitfield(rootDeviceIndex, memoryProperties, subDevicesBitfieldParam);
-    AllocationProperties allocationProperties{rootDeviceIndex, allocateMemory, imgInfo, AllocationType::IMAGE, deviceBitfield};
+    AllocationProperties allocationProperties{rootDeviceIndex, allocateMemory, &imgInfo, AllocationType::image, deviceBitfield};
     MemoryPropertiesHelper::fillPoliciesInProperties(allocationProperties, memoryProperties, hwInfo, deviceOnlyVisibilty);
     return allocationProperties;
 }
@@ -105,7 +104,7 @@ SVMAllocsManager::SvmAllocationProperties MemObjHelper::getSvmAllocationProperti
     return svmProperties;
 }
 
-bool MemObjHelper::isSuitableForCompression(bool compressionSupported, const MemoryProperties &properties, Context &context, bool preferCompression) {
+bool MemObjHelper::isSuitableForCompression(bool compressionSupported, const MemoryProperties &properties, Context &context, bool preferCompression, bool isImageAllocation) {
     if (!compressionSupported) {
         return false;
     }
@@ -114,22 +113,8 @@ bool MemObjHelper::isSuitableForCompression(bool compressionSupported, const Mem
     }
     for (auto &pClDevice : context.getDevices()) {
         auto rootDeviceIndex = pClDevice->getRootDeviceIndex();
-        auto &clGfxCoreHelper = pClDevice->getRootDeviceEnvironment().getHelper<ClGfxCoreHelper>();
-        if (!clGfxCoreHelper.allowCompressionForContext(*pClDevice, context)) {
-            return false;
-        }
-
         if (context.containsMultipleSubDevices(rootDeviceIndex)) {
-            if (DebugManager.flags.EnableMultiTileCompression.get() <= 0) {
-                return false;
-            }
-
-            // for unrestrictive and default context, turn on compression only for read only surfaces with no host access.
-            bool isContextSpecialized = (context.peekContextType() == ContextType::CONTEXT_TYPE_SPECIALIZED);
-            bool isReadOnlyAndHostNoAccess = (properties.flags.readOnly && properties.flags.hostNoAccess);
-            if (!isContextSpecialized && !isReadOnlyAndHostNoAccess) {
-                return false;
-            }
+            return false;
         }
     }
     if (preferCompression) {
@@ -139,11 +124,11 @@ bool MemObjHelper::isSuitableForCompression(bool compressionSupported, const Mem
         if (properties.flags.compressedHint) {
             return true;
         }
-        int32_t disableCompression = DebugManager.flags.ToggleHintKernelDisableCompression.get();
+        int32_t disableCompression = debugManager.flags.ToggleHintKernelDisableCompression.get();
         if (disableCompression != -1) {
             return !!disableCompression;
         } else {
-            if (context.getResolvesRequiredInKernels()) {
+            if (!isImageAllocation && context.getResolvesRequiredInKernels()) {
                 return false;
             }
         }

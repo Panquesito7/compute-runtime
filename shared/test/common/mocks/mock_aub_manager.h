@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,6 +14,10 @@
 #include "aubstream/aubstream.h"
 #include "aubstream/hardware_context.h"
 
+#include <functional>
+#include <optional>
+#include <unordered_map>
+
 struct MockHardwareContext : public aub_stream::HardwareContext {
     using SurfaceInfo = aub_stream::SurfaceInfo;
 
@@ -25,7 +29,7 @@ struct MockHardwareContext : public aub_stream::HardwareContext {
     void writeAndSubmitBatchBuffer(uint64_t gfxAddress, const void *batchBuffer, size_t size, uint32_t memoryBank, size_t pageSize) override { writeAndSubmitCalled = true; }
     void submitBatchBuffer(uint64_t gfxAddress, bool overrideRingHead) override { submitCalled = true; }
     void writeMemory(uint64_t gfxAddress, const void *memory, size_t size, uint32_t memoryBanks, int hint, size_t pageSize) override {
-        UNRECOVERABLE_IF(true); // shouldnt be used
+        UNRECOVERABLE_IF(true); // should not be used
     }
     void writeMemory2(aub_stream::AllocationParams allocationParams) override {
         writeMemory2Called = true;
@@ -39,15 +43,23 @@ struct MockHardwareContext : public aub_stream::HardwareContext {
     void writeMMIO(uint32_t offset, uint32_t value) override { writeMMIOCalled = true; }
     void freeMemory(uint64_t gfxAddress, size_t size) override { freeMemoryCalled = true; }
     void expectMemory(uint64_t gfxAddress, const void *memory, size_t size, uint32_t compareOperation) override { expectMemoryCalled = true; }
-    void readMemory(uint64_t gfxAddress, void *memory, size_t size, uint32_t memoryBank, size_t pageSize) override { readMemoryCalled = true; }
+    void readMemory(uint64_t gfxAddress, void *memory, size_t size, uint32_t memoryBank, size_t pageSize) override {
+        readMemoryCalled = true;
+        latestGpuVaForMemoryRead = gfxAddress;
+    }
     void dumpBufferBIN(uint64_t gfxAddress, size_t size) override { dumpBufferBINCalled = true; }
     void dumpSurface(const SurfaceInfo &surfaceInfo) override { dumpSurfaceCalled = true; }
     void pollForFenceCompletion() override {}
+    bool isActive() override { return isActiveReturnValue; }
+    void resubmit() override { resubmitCalled = true; }
 
     std::vector<aub_stream::AllocationParams> storedAllocationParams;
+    uint64_t latestGpuVaForMemoryRead = 0;
     bool storeAllocationParams = false;
     bool initializeCalled = false;
     bool pollForCompletionCalled = false;
+    bool isActiveReturnValue = false;
+    bool resubmitCalled = false;
     bool writeAndSubmitCalled = false;
     bool submitCalled = false;
     bool writeMemory2Called = false;
@@ -69,7 +81,7 @@ class MockAubManager : public aub_stream::AubManager {
     using PageInfo = aub_stream::PageInfo;
 
   public:
-    MockAubManager(){};
+    MockAubManager() {};
     MockAubManager(const aub_stream::AubManagerOptions &inputOptions) : options(inputOptions) {
     }
     ~MockAubManager() override {}
@@ -78,6 +90,22 @@ class MockAubManager : public aub_stream::AubManager {
     HardwareContext *createHardwareContext(uint32_t device, uint32_t engine, uint32_t flags) override {
         contextFlags = flags;
         return new MockHardwareContext(device);
+    }
+
+    HardwareContext *createHardwareContext2(const aub_stream::CreateHardwareContext2Params &params, uint32_t device, uint32_t engine, uint32_t flags) override {
+        contextFlags = flags;
+        return new MockHardwareContext(device);
+    }
+
+    HardwareContext *createHardwareContext3(const aub_stream::HardwareContextParamsHeader *params) override {
+        const auto *castedParams = reinterpret_cast<const aub_stream::CreateHardwareContext3Params *>(params);
+        contextFlags = castedParams->flags;
+        return new MockHardwareContext(castedParams->device);
+    }
+
+    bool releaseHardwareContext(HardwareContext *context) override {
+        delete context;
+        return true;
     }
 
     void open(const std::string &aubFileName) override {
@@ -106,7 +134,7 @@ class MockAubManager : public aub_stream::AubManager {
     }
 
     void writeMemory(uint64_t gfxAddress, const void *memory, size_t size, uint32_t memoryBanks, int hint, size_t pageSize) override {
-        UNRECOVERABLE_IF(true); // shouldnt be used
+        UNRECOVERABLE_IF(true); // should not be used
     }
 
     void writeMemory2(aub_stream::AllocationParams allocationParams) override {
@@ -116,6 +144,9 @@ class MockAubManager : public aub_stream::AubManager {
 
         if (storeAllocationParams) {
             storedAllocationParams.push_back(allocationParams);
+        }
+        if (writeMemory2Callback) {
+            writeMemory2Callback();
         }
     }
 
@@ -130,12 +161,60 @@ class MockAubManager : public aub_stream::AubManager {
 
     void freeMemory(uint64_t gfxAddress, size_t size) override {
         freeMemoryCalled = true;
+        freedGfxAddress = gfxAddress;
+        if (freeMemoryCallback) {
+            freeMemoryCallback();
+        }
     }
 
     bool reservePhysicalMemory(aub_stream::AllocationParams allocationParams, aub_stream::PhysicalAllocationInfo &physicalAllocInfo) override { return false; };
     bool mapGpuVa(uint64_t gfxAddress, size_t size, aub_stream::PhysicalAllocationInfo physicalAllocInfo) override { return false; };
 
+    bool reserveOnlyPhysicalSpace(aub_stream::AllocationParams allocationParams, aub_stream::PhysicalAllocationInfo &physicalAllocInfo) override {
+        reserveOnlyPhysicalSpaceCalled++;
+        reservedPhysicalSpaceParams.push_back(allocationParams);
+        physicalAllocInfo = physicalAllocationInfoToReturn;
+        physicalAllocInfo.memoryBank = allocationParams.memoryBanks;
+        physicalAllocInfo.size = allocationParams.size;
+        return reserveOnlyPhysicalSpaceResult;
+    }
+
+    bool mapSystemMemoryToPhysicalAddress(uint64_t physAddress, size_t size, size_t alignment, bool isLocalMemory, const void *p) override {
+        mappedSystemMemoryRanges.push_back({physAddress, size, isLocalMemory, p});
+        return mappedSystemMemoryRanges.size() != failingMapSystemMemoryToPhysicalAddressCall;
+    }
+
+    bool mapGpuVa2(uint64_t physicalAddress, aub_stream::AllocationParams params) override {
+        mappedGpuVaPhysicalAddresses.push_back(physicalAddress);
+        mappedGpuVaParams.push_back(params);
+        return mapGpuVa2Result;
+    }
+
+    uint32_t readMMIO(uint32_t offset) override {
+        if (mmioData) {
+            return (*mmioData)[offset];
+        } else {
+            return ::aub_stream::AubManager::readMMIO(offset);
+        }
+    }
+
+    struct MappedSystemMemoryRange {
+        uint64_t physicalAddress;
+        size_t size;
+        bool isLocalMemory;
+        const void *systemMemory;
+    };
+
     std::vector<aub_stream::AllocationParams> storedAllocationParams;
+    std::vector<MappedSystemMemoryRange> mappedSystemMemoryRanges;
+    std::vector<aub_stream::AllocationParams> reservedPhysicalSpaceParams;
+    std::vector<uint64_t> mappedGpuVaPhysicalAddresses;
+    std::vector<aub_stream::AllocationParams> mappedGpuVaParams;
+    aub_stream::PhysicalAllocationInfo physicalAllocationInfoToReturn{0x400000u, 0u, 0u, 0x10000u};
+    uint32_t reserveOnlyPhysicalSpaceCalled = 0;
+    bool reserveOnlyPhysicalSpaceResult = true;
+    size_t failingMapSystemMemoryToPhysicalAddressCall = 0;
+    bool mapGpuVa2Result = true;
     uint32_t openCalledCnt = 0;
     std::string fileName = "";
     bool closeCalled = false;
@@ -148,10 +227,14 @@ class MockAubManager : public aub_stream::AubManager {
     bool writePageTableEntriesCalled = false;
     bool writePhysicalMemoryPagesCalled = false;
     bool freeMemoryCalled = false;
+    uint64_t freedGfxAddress = 0;
+    std::function<void()> writeMemory2Callback;
+    std::function<void()> freeMemoryCallback;
     bool storeAllocationParams = false;
     uint32_t contextFlags = 0;
     int hintToWriteMemory = 0;
     size_t writeMemoryPageSizePassed = 0;
+    std::optional<std::unordered_map<uint32_t, uint32_t>> mmioData;
 
     aub_stream::AubManagerOptions options{};
 

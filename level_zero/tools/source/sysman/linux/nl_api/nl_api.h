@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,8 +7,7 @@
 
 #pragma once
 #include "shared/source/helpers/non_copyable_or_moveable.h"
-
-#include "level_zero/core/source/device/device.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
 
 #include <memory>
 #include <netlink/attr.h>
@@ -56,8 +55,10 @@ typedef struct nlattr *(*pNlmsgAttrdata)(const struct nlmsghdr *, int);
 typedef int (*pNlmsgAttrlen)(const struct nlmsghdr *, int);
 typedef void (*pNlmsgFree)(struct nl_msg *);
 typedef struct nlmsghdr *(*pNlmsgHdr)(struct nl_msg *);
+typedef struct nlattr *(*pNlaNestStart)(struct nl_msg *, int);
+typedef int (*pNlaNestEnd)(struct nl_msg *, struct nlattr *);
 
-class NlApi : public NEO::NonCopyableOrMovableClass {
+class NlApi : public NEO::NonCopyableAndNonMovableClass {
   public:
     MOCKABLE_VIRTUAL int genlConnect(struct nl_sock *sock);
     MOCKABLE_VIRTUAL int genlCtrlResolve(struct nl_sock *sock, const char *name);
@@ -90,6 +91,8 @@ class NlApi : public NEO::NonCopyableOrMovableClass {
     MOCKABLE_VIRTUAL int nlmsgAttrlen(const struct nlmsghdr *hdr, int attr);
     MOCKABLE_VIRTUAL void nlmsgFree(struct nl_msg *msg);
     MOCKABLE_VIRTUAL struct nlmsghdr *nlmsgHdr(struct nl_msg *msg);
+    MOCKABLE_VIRTUAL struct nlattr *nlaNestStart(struct nl_msg *msg, int id);
+    MOCKABLE_VIRTUAL int nlaNestEnd(struct nl_msg *msg, struct nlattr *attr);
 
     bool isAvailable() { return nullptr != genlLibraryHandle.get(); }
 
@@ -100,7 +103,7 @@ class NlApi : public NEO::NonCopyableOrMovableClass {
 
   protected:
     template <class T>
-    bool getSymbolAddr(const std::string_view &name, T &sym);
+    bool getSymbolAddr(std::string_view name, T &sym);
 
     std::unique_ptr<NEO::OsLibrary> genlLibraryHandle;
 
@@ -135,6 +138,8 @@ class NlApi : public NEO::NonCopyableOrMovableClass {
     pNlmsgAttrlen nlmsgAttrlenEntry = nullptr;
     pNlmsgFree nlmsgFreeEntry = nullptr;
     pNlmsgHdr nlmsgHdrEntry = nullptr;
+    pNlaNestStart nlaNestStartEntry = nullptr;
+    pNlaNestEnd nlaNestEndEntry = nullptr;
 };
 
 } // namespace L0

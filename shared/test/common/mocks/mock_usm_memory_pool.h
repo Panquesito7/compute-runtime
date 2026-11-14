@@ -1,0 +1,102 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/memory_manager/unified_memory_pooling.h"
+
+namespace NEO {
+class MockUsmMemAllocPool : public UsmMemAllocPool {
+  public:
+    using UsmMemAllocPool::allocation;
+    using UsmMemAllocPool::allocationData;
+    using UsmMemAllocPool::allocations;
+    using UsmMemAllocPool::chunkAllocator;
+    using UsmMemAllocPool::customCleanup;
+    using UsmMemAllocPool::deferredFreeChunks;
+    using UsmMemAllocPool::device;
+    using UsmMemAllocPool::peerAllocationsFn;
+    using UsmMemAllocPool::pool;
+    using UsmMemAllocPool::poolEnd;
+    using UsmMemAllocPool::poolInfo;
+    using UsmMemAllocPool::poolMemoryType;
+    using UsmMemAllocPool::residencyCounts;
+    using UsmMemAllocPool::residentPoolAllocations;
+    using UsmMemAllocPool::svmMemoryManager;
+    using UsmMemAllocPool::trackResidency;
+
+    bool initialize(SVMAllocsManager *svmMemoryManager, const UnifiedMemoryProperties &memoryProperties, size_t poolSize, size_t minServicedSize, size_t maxServicedSize) override {
+        if (callBaseInitialize) {
+            return UsmMemAllocPool::initialize(svmMemoryManager, memoryProperties, poolSize, minServicedSize, maxServicedSize);
+        }
+        return initializeResult;
+    }
+    bool callBaseInitialize = true;
+    bool initializeResult = false;
+
+    void *createUnifiedMemoryAllocation(size_t size, const UnifiedMemoryProperties &memoryProperties) override {
+        if (callBaseCreateUnifiedMemoryAllocation) {
+            return UsmMemAllocPool::createUnifiedMemoryAllocation(size, memoryProperties);
+        }
+        return createUnifiedMemoryAllocationResult;
+    }
+    bool callBaseCreateUnifiedMemoryAllocation = true;
+    void *createUnifiedMemoryAllocationResult = nullptr;
+
+    void cleanup() override {
+        ++cleanupCalled;
+        if (callBaseCleanup) {
+            UsmMemAllocPool::cleanup();
+        }
+    }
+    uint32_t cleanupCalled = 0u;
+    bool callBaseCleanup = true;
+
+    UsmPoolFreeResult freeSVMAlloc(const void *ptr, FreePolicyType policy) override {
+        ++freeSVMAllocCalled;
+        return UsmMemAllocPool::freeSVMAlloc(ptr, policy);
+    };
+    uint32_t freeSVMAllocCalled = 0u;
+};
+
+class MockUsmMemAllocPoolsManager : public UsmMemAllocPoolsManager {
+  public:
+    using UsmMemAllocPoolsManager::canBePooled;
+    using UsmMemAllocPoolsManager::customCleanup;
+    using UsmMemAllocPoolsManager::device;
+    using UsmMemAllocPoolsManager::getPoolContainingAlloc;
+    using UsmMemAllocPoolsManager::getPoolInfos;
+    using UsmMemAllocPoolsManager::memoryManager;
+    using UsmMemAllocPoolsManager::mtx;
+    using UsmMemAllocPoolsManager::peerAllocationsFn;
+    using UsmMemAllocPoolsManager::pools;
+    using UsmMemAllocPoolsManager::totalSize;
+    using UsmMemAllocPoolsManager::trackResidency;
+    using UsmMemAllocPoolsManager::UsmMemAllocPoolsManager;
+    bool canAddPool(PoolInfo poolInfo) override {
+        if (canAddPoolCallBase) {
+            return UsmMemAllocPoolsManager::canAddPool(poolInfo);
+        }
+        return canAddPools;
+    }
+    UsmMemAllocPool *tryAddPool(PoolInfo poolInfo) {
+        auto pool = createPool(poolInfo);
+        auto poolPtr = pool.get();
+        if (pool) {
+            insertPool(poolInfo, std::move(pool));
+        }
+        return poolPtr;
+    }
+    bool canAddPools = true;
+    bool canAddPoolCallBase = false;
+};
+
+class MockUsmMemAllocPoolsFacade : public UsmMemAllocPoolsFacade {
+  public:
+    using UsmMemAllocPoolsFacade::pool;
+    using UsmMemAllocPoolsFacade::poolManager;
+};
+} // namespace NEO

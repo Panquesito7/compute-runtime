@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2023 Intel Corporation
+# Copyright (C) 2018-2026 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -7,6 +7,7 @@
 set(IGDRCL_SRCS_tests_api
     ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
     ${CMAKE_CURRENT_SOURCE_DIR}${BRANCH_DIR_SUFFIX}additional_extensions_tests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/leo_forwarding_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/api_tests_wrapper1.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/api_tests_wrapper2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/api_tests_wrapper3.cpp
@@ -27,6 +28,7 @@ set(IGDRCL_SRCS_tests_api
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_perf_counters_command_queue_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_pipe_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_program_with_binary_tests.inl
+    ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_program_with_binary_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_program_with_built_in_kernels_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_sampler_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_create_sampler_with_properties_tests.inl
@@ -83,19 +85,17 @@ set(IGDRCL_SRCS_tests_api
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_max_concurrent_work_group_count_intel_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_sub_group_info_khr_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_sub_group_info_tests.inl
+    ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_suggested_local_work_size_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_suggested_local_work_size_intel_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_suggested_local_work_size_khr_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_kernel_work_group_info_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_mem_object_info_tests.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_pipe_info_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_platform_ids_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_platform_info_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_program_build_info_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_program_info_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_get_supported_image_formats_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_icd_get_platform_ids_khr_tests.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/cl_intel_accelerator_tests.inl
-    ${CMAKE_CURRENT_SOURCE_DIR}/cl_intel_motion_estimation.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_intel_tracing_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_link_program_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_mem_locally_uncached_resource_tests.cpp
@@ -113,6 +113,7 @@ set(IGDRCL_SRCS_tests_api
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_context_destructor_callback.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_event_callback_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_kernel_arg_svm_pointer_tests.inl
+    ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_kernel_arg_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_kernel_exec_info_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_mem_object_destructor_callback_tests.inl
     ${CMAKE_CURRENT_SOURCE_DIR}/cl_set_performance_configuration_tests.inl

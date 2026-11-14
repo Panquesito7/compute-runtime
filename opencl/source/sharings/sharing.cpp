@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -10,8 +10,6 @@
 #include "opencl/source/mem_obj/mem_obj.h"
 
 #include "CL/cl.h"
-
-#include <memory>
 
 namespace NEO {
 
@@ -31,7 +29,7 @@ int SharingHandler::acquire(MemObj *memObj, uint32_t rootDeviceIndex) {
             return CL_OUT_OF_RESOURCES;
         }
 
-        DEBUG_BREAK_IF(graphicsAllocation->peekSharedHandle() != updateData.sharedHandle);
+        DEBUG_BREAK_IF(memObj->getGraphicsAllocation(rootDeviceIndex)->peekSharedHandle() != updateData.sharedHandle);
     }
     acquireCount++;
     return CL_SUCCESS;

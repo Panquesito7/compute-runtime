@@ -1,30 +1,37 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/stream_properties.h"
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/execution_environment.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/api_specific_config.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/product_config_helper.h"
 #include "shared/source/os_interface/product_helper.h"
 #include "shared/source/xe_hpg_core/hw_cmds_dg2.h"
-#include "shared/test/common/fixtures/device_fixture.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
-#include "shared/test/common/mocks/mock_command_stream_receiver.h"
-#include "shared/test/common/mocks/mock_device.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
-#include "shared/test/common/test_macros/test.h"
 #include "shared/test/unit_test/fixtures/product_config_fixture.h"
 #include "shared/test/unit_test/os_interface/product_helper_tests.h"
 
 #include "aubstream/product_family.h"
+#include "gtest/gtest.h"
 #include "platforms.h"
+
+#include <array>
+
+namespace NEO {
+extern ApiSpecificConfig::ApiType apiTypeForUlts;
+}
 
 using namespace NEO;
 using ProductConfigHelperDg2Tests = ::testing::Test;
@@ -151,39 +158,23 @@ DG2TEST_F(ProductHelperTestDg2, whenGettingAubstreamProductFamilyThenProperEnumV
     EXPECT_EQ(aub_stream::ProductFamily::Dg2, productHelper->getAubStreamProductFamily());
 }
 
-DG2TEST_F(ProductHelperTestDg2, givenDg2ConfigWhenSetupHardwareInfoBaseThenGtSystemInfoIsCorrect) {
-    HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
-    GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
-    Dg2HwConfig::setupHardwareInfoBase(&hwInfo, false, *compilerProductHelper);
-
-    EXPECT_EQ(336u, gtSystemInfo.TotalVsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalHsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalDsThreads);
-    EXPECT_EQ(336u, gtSystemInfo.TotalGsThreads);
-    EXPECT_EQ(64u, gtSystemInfo.TotalPsThreadsWindowerRange);
-    EXPECT_EQ(8u, gtSystemInfo.CsrSizeInMb);
-    EXPECT_FALSE(gtSystemInfo.IsL3HashModeEnabled);
-    EXPECT_FALSE(gtSystemInfo.IsDynamicallyPopulated);
-}
-
 DG2TEST_F(ProductHelperTestDg2, givenDg2ConfigWhenSetupHardwareInfoThenGtSystemInfoIsCorrect) {
     HardwareInfo hwInfo = *defaultHwInfo;
-    auto compilerProductHelper = CompilerProductHelper::create(hwInfo.platform.eProductFamily);
     GT_SYSTEM_INFO &gtSystemInfo = hwInfo.gtSystemInfo;
+    DG2::setupHardwareInfoImpl(&hwInfo, false);
 
-    Dg2HwConfig::setupHardwareInfo(&hwInfo, false, *compilerProductHelper);
-    EXPECT_EQ(8u, gtSystemInfo.CsrSizeInMb);
-    EXPECT_FALSE(gtSystemInfo.IsL3HashModeEnabled);
+    EXPECT_EQ(0u, gtSystemInfo.CsrSizeInMb);
+    EXPECT_TRUE(gtSystemInfo.IsDynamicallyPopulated);
 }
 
-DG2TEST_F(ProductHelperTestDg2, givenDg2ProductHelperWhenIsInitBuiltinAsyncSupportedThenReturnTrue) {
-    EXPECT_TRUE(productHelper->isInitBuiltinAsyncSupported(*defaultHwInfo));
+DG2TEST_F(ProductHelperTestDg2, givenProductHelperWhenCheckIsCopyBufferRectSplitSupportedThenReturnsFalse) {
+    EXPECT_FALSE(productHelper->isCopyBufferRectSplitSupported());
 }
 
 DG2TEST_F(ProductHelperTestDg2, givenG10DevIdWhenAdditionalKernelExecInfoSupportCheckedThenCorrectValueIsReturned) {
     HardwareInfo myHwInfo = *defaultHwInfo;
     myHwInfo.platform.usDeviceID = dg2G10DeviceIds[0];
+    myHwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(REVISION_A0, myHwInfo);
     EXPECT_FALSE(productHelper->isDisableOverdispatchAvailable(myHwInfo));
 
     FrontEndPropertiesSupport fePropertiesSupport{};
@@ -239,27 +230,6 @@ DG2TEST_F(ProductHelperTestDg2, givenG12DevIdWhenIsDisableOverdispatchAvailableC
     EXPECT_TRUE(fePropertiesSupport.disableOverdispatch);
 }
 
-DG2TEST_F(ProductHelperTestDg2, whenAdjustingDefaultEngineTypeThenSelectEngineTypeBasedOnRevisionId) {
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.featureTable.flags.ftrCCSNode = true;
-    auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
-    auto &productHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<ProductHelper>();
-
-    for (uint8_t revision : {REVISION_A0, REVISION_A1, REVISION_B, REVISION_C}) {
-        for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-            hwInfo.platform.usRevId = productHelper.getHwRevIdFromStepping(revision, hwInfo);
-            hwInfo.platform.usDeviceID = deviceId;
-            hwInfo.capabilityTable.defaultEngineType = defaultHwInfo->capabilityTable.defaultEngineType;
-            gfxCoreHelper.adjustDefaultEngineType(&hwInfo, productHelper);
-            if (DG2::isG10(hwInfo) && revision < REVISION_B) {
-                EXPECT_EQ(aub_stream::ENGINE_RCS, hwInfo.capabilityTable.defaultEngineType);
-            } else {
-                EXPECT_EQ(aub_stream::ENGINE_CCS, defaultHwInfo->capabilityTable.defaultEngineType);
-            }
-        }
-    }
-}
-
 DG2TEST_F(ProductHelperTestDg2, givenDg2G11OrG12WhenAskingIfMaxThreadsForWorkgroupWAIsRequiredThenReturnFalse) {
     auto hwInfo = *defaultHwInfo;
     for (uint8_t revision : {REVISION_A0, REVISION_A1, REVISION_B, REVISION_C}) {
@@ -268,28 +238,6 @@ DG2TEST_F(ProductHelperTestDg2, givenDg2G11OrG12WhenAskingIfMaxThreadsForWorkgro
             hwInfo.platform.usDeviceID = deviceId;
 
             EXPECT_FALSE(productHelper->isMaxThreadsForWorkgroupWARequired(hwInfo));
-        }
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenDg2G10A0OrA1SteppingWhenAskingIfWAIsRequiredThenReturnTrue) {
-
-    auto hwInfo = *defaultHwInfo;
-    for (uint8_t revision : {REVISION_A0, REVISION_A1, REVISION_B, REVISION_C}) {
-        for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-            hwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(revision, hwInfo);
-            hwInfo.platform.usDeviceID = deviceId;
-            hwInfo.ipVersion.value = compilerProductHelper->getHwIpVersion(hwInfo);
-            if (hwInfo.ipVersion.value == AOT::UNKNOWN_ISA) {
-                continue;
-            }
-
-            auto expectedValue = DG2::isG10(hwInfo) && revision < REVISION_B;
-            refreshReleaseHelper(&hwInfo);
-
-            EXPECT_EQ(expectedValue, productHelper->isDefaultEngineTypeAdjustmentRequired(hwInfo));
-            EXPECT_EQ(expectedValue, productHelper->isAllocationSizeAdjustmentRequired(hwInfo));
-            EXPECT_EQ(expectedValue, productHelper->isPrefetchDisablingRequired(releaseHelper));
         }
     }
 }
@@ -325,167 +273,9 @@ DG2TEST_F(ProductHelperTestDg2, givenDg2G12WhenAskingForSBAWaThenReturnSuccess) 
     }
 }
 
-DG2TEST_F(ProductHelperTestDg2, givenProgramExtendedPipeControlPriorToNonPipelinedStateCommandEnabledWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnCcsThenTrueIsReturned) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(true);
-    auto hwInfo = *defaultHwInfo;
-
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = false;
-
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_TRUE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProgramExtendedPipeControlPriorToNonPipelinedStateCommandEnabledWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnRcsThenTrueIsReturned) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(true);
-
-    auto hwInfo = *defaultHwInfo;
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = true;
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_TRUE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProgramPipeControlPriorToNonPipelinedStateCommandDisabledWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnRcsThenFalseIsReturned) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(0);
-
-    auto hwInfo = *defaultHwInfo;
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = true;
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWithMultipleCSSWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnCcsThenTrueIsReturned) {
-
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 2;
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = false;
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_TRUE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWithMultipleCSSWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnRcsThenFalseIsReturned) {
-
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 2;
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = true;
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWithSingleCSSWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnCcsThenTrueIsReturned) {
-
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = false;
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWithSingleCSSWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnRcsThenTrueIsReturned) {
-
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
-    for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-        hwInfo.platform.usDeviceID = deviceId;
-        auto isRcs = true;
-        refreshReleaseHelper(&hwInfo);
-
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_TRUE(isBasicWARequired);
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenNonG10G11OrG12Dg2WhenProductHelperWithMultipleCSSWhenIsPipeControlPriorToNonPipelinedStateCommandsWARequiredIsCalledOnCcsThenNoWaIsNeededUnlessForcedByDebugFlag) {
-
-    auto hwInfo = *defaultHwInfo;
-    hwInfo.platform.usDeviceID = 0;
-    refreshReleaseHelper(&hwInfo);
-    EXPECT_FALSE(DG2::isG10(hwInfo));
-    EXPECT_FALSE(DG2::isG11(hwInfo));
-    EXPECT_FALSE(DG2::isG12(hwInfo));
-
-    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 2;
-    auto isRcs = false;
-
-    {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_FALSE(isBasicWARequired);
-    }
-    hwInfo.gtSystemInfo.CCSInfo.NumberOfCCSEnabled = 1;
-
-    {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-
-        EXPECT_FALSE(isExtendedWARequired);
-        EXPECT_FALSE(isBasicWARequired);
-    }
-
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.ProgramExtendedPipeControlPriorToNonPipelinedStateCommand.set(1);
-
-    {
-        const auto &[isBasicWARequired, isExtendedWARequired] = productHelper->isPipeControlPriorToNonPipelinedStateCommandsWARequired(hwInfo, isRcs, releaseHelper);
-        EXPECT_TRUE(isExtendedWARequired);
-        EXPECT_FALSE(isBasicWARequired);
-    }
-}
-
 DG2TEST_F(ProductHelperTestDg2, givenDg2WhenIsBlitterForImagesSupportedIsCalledThenTrueIsReturned) {
 
     EXPECT_TRUE(productHelper->isBlitterForImagesSupported());
-}
-
-DG2TEST_F(ProductHelperTestDg2, WhenGetSvmCpuAlignmentThenProperValueIsReturned) {
-
-    EXPECT_EQ(MemoryConstants::pageSize2Mb, productHelper->getSvmCpuAlignment());
 }
 
 DG2TEST_F(ProductHelperTestDg2, givenB0rCSteppingWhenAskingIfTile64With3DSurfaceOnBCSIsSupportedThenReturnTrue) {
@@ -503,27 +293,6 @@ DG2TEST_F(ProductHelperTestDg2, givenB0rCSteppingWhenAskingIfTile64With3DSurface
         productHelper->configureHardwareCustom(&hwInfo, nullptr);
 
         EXPECT_EQ(paramBool, productHelper->isTile64With3DSurfaceOnBCSSupported(hwInfo));
-    }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenDg2G10A0WhenConfigureCalledThenDisableCompression) {
-
-    for (uint8_t revision : {REVISION_A0, REVISION_A1}) {
-        for (auto deviceId : {dg2G10DeviceIds[0], dg2G11DeviceIds[0], dg2G12DeviceIds[0]}) {
-            HardwareInfo hwInfo = *defaultHwInfo;
-            hwInfo.featureTable.flags.ftrE2ECompression = true;
-
-            hwInfo.platform.usRevId = productHelper->getHwRevIdFromStepping(revision, hwInfo);
-            hwInfo.platform.usDeviceID = deviceId;
-
-            productHelper->configureHardwareCustom(&hwInfo, nullptr);
-
-            auto compressionExpected = DG2::isG10(hwInfo) ? (revision != REVISION_A0) : true;
-
-            EXPECT_EQ(compressionExpected, hwInfo.capabilityTable.ftrRenderCompressedBuffers);
-            EXPECT_EQ(compressionExpected, hwInfo.capabilityTable.ftrRenderCompressedImages);
-            EXPECT_EQ(compressionExpected, productHelper->allowCompression(hwInfo));
-        }
     }
 }
 
@@ -648,22 +417,17 @@ DG2TEST_F(ProductHelperTestDg2, givenDg2WhenSetForceNonCoherentThenProperFlagSet
     using FORCE_NON_COHERENT = typename FamilyType::STATE_COMPUTE_MODE::FORCE_NON_COHERENT;
 
     auto stateComputeMode = FamilyType::cmdInitStateComputeMode;
-    auto properties = StateComputeModeProperties{};
 
-    properties.isCoherencyRequired.set(false);
-    productHelper->setForceNonCoherent(&stateComputeMode, properties);
+    productHelper->setForceNonCoherent(&stateComputeMode);
     EXPECT_EQ(FORCE_NON_COHERENT::FORCE_NON_COHERENT_FORCE_GPU_NON_COHERENT, stateComputeMode.getForceNonCoherent());
-    EXPECT_EQ(XeHpgCoreFamily::stateComputeModeForceNonCoherentMask, stateComputeMode.getMaskBits());
-
-    properties.isCoherencyRequired.set(true);
-    productHelper->setForceNonCoherent(&stateComputeMode, properties);
-    EXPECT_EQ(FORCE_NON_COHERENT::FORCE_NON_COHERENT_FORCE_DISABLED, stateComputeMode.getForceNonCoherent());
     EXPECT_EQ(XeHpgCoreFamily::stateComputeModeForceNonCoherentMask, stateComputeMode.getMaskBits());
 }
 
 DG2TEST_F(ProductHelperTestDg2, givenEnabledSliceInNonStandardConfigWhenComputeUnitsUsedForScratchThenProperCalculationIsReturned) {
     HardwareInfo &hwInfo = *executionEnvironment->rootDeviceEnvironments[0]->getMutableHardwareInfo();
     GT_SYSTEM_INFO &testSysInfo = hwInfo.gtSystemInfo;
+    testSysInfo.MaxSlicesSupported = 2;
+    testSysInfo.SliceCount = 2;
     testSysInfo.IsDynamicallyPopulated = true;
     for (auto &sliceInfo : testSysInfo.SliceInfo) {
         sliceInfo.Enabled = false;
@@ -684,10 +448,8 @@ DG2TEST_F(ProductHelperTestDg2, givenEnabledSliceInNonStandardConfigWhenComputeU
 DG2TEST_F(ProductHelperTestDg2, givenNotEnabledSliceWhenComputeUnitsUsedForScratchThenThrowUnrecoverableIf) {
     HardwareInfo &hwInfo = *executionEnvironment->rootDeviceEnvironments[0]->getMutableHardwareInfo();
     GT_SYSTEM_INFO &testSysInfo = hwInfo.gtSystemInfo;
-    testSysInfo.IsDynamicallyPopulated = true;
-    for (auto &sliceInfo : testSysInfo.SliceInfo) {
-        sliceInfo.Enabled = false;
-    }
+    testSysInfo.IsDynamicallyPopulated = false;
+    testSysInfo.MaxSlicesSupported = 0;
 
     auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
 
@@ -697,6 +459,14 @@ DG2TEST_F(ProductHelperTestDg2, givenNotEnabledSliceWhenComputeUnitsUsedForScrat
 DG2TEST_F(ProductHelperTestDg2, givenDG2WhenCheckingIsTimestampWaitSupportedForEventsThenReturnTrue) {
 
     EXPECT_TRUE(productHelper->isTimestampWaitSupportedForEvents());
+}
+
+DG2TEST_F(ProductHelperTestDg2, givenProductHelperWhenCallGetInternalHeapsPreallocatedThenReturnCorrectValue) {
+    EXPECT_EQ(productHelper->getInternalHeapsPreallocated(), 1u);
+
+    DebugManagerStateRestore restorer;
+    debugManager.flags.SetAmountOfInternalHeapsToPreallocate.set(3);
+    EXPECT_EQ(productHelper->getInternalHeapsPreallocated(), 3u);
 }
 
 DG2TEST_F(ProductConfigTests, givenDg2G10DeviceIdsWhenConfigIsCheckedThenCorrectValueIsReturned) {
@@ -729,12 +499,12 @@ DG2TEST_F(ProductConfigTests, givenDg2G12DeviceIdsWhenConfigIsCheckedThenCorrect
     }
 }
 
-DG2TEST_F(ProductConfigTests, givenInvalidRevisionIdWhenDeviceIdIsDefaultThenUnknownIsaIsReturned) {
+DG2TEST_F(ProductConfigTests, givenInvalidRevisionIdWhenDeviceIdIsDefaultThenDefaultConfigIsReturned) {
     hwInfo.platform.usDeviceID = 0;
     hwInfo.platform.usRevId = CommonConstants::invalidRevisionID;
 
     productConfig = compilerProductHelper->getHwIpVersion(hwInfo);
-    EXPECT_EQ(productConfig, AOT::UNKNOWN_ISA);
+    EXPECT_EQ(productConfig, AOT::DG2_G10_C0);
 }
 
 DG2TEST_F(ProductConfigTests, givenDg2G10DeviceIdWhenDifferentRevisionIsPassedThenCorrectProductConfigIsReturned) {
@@ -759,13 +529,13 @@ DG2TEST_F(ProductConfigTests, givenDg2G10DeviceIdWhenDifferentRevisionIsPassedTh
     }
 }
 
-DG2TEST_F(ProductConfigTests, givenDg2DeviceIdWhenIncorrectRevisionIsPassedThenCorrectProductConfigIsReturned) {
+DG2TEST_F(ProductConfigTests, givenDg2DeviceIdWhenIncorrectRevisionIsPassedThenDefaultConfigIsReturned) {
     for (const auto *dg2 : {&dg2G10DeviceIds, &dg2G11DeviceIds}) {
         for (const auto &deviceId : *dg2) {
             hwInfo.platform.usDeviceID = deviceId;
             hwInfo.platform.usRevId = CommonConstants::invalidRevisionID;
             productConfig = compilerProductHelper->getHwIpVersion(hwInfo);
-            EXPECT_EQ(productConfig, AOT::UNKNOWN_ISA);
+            EXPECT_EQ(productConfig, AOT::DG2_G10_C0);
         }
     }
 }
@@ -796,53 +566,23 @@ DG2TEST_F(ProductConfigTests, givenDg2G12DeviceIdWhenGetProductConfigThenCorrect
     }
 }
 
-DG2TEST_F(ProductConfigTests, givenNotSetDeviceAndRevisionIdWhenGetProductConfigThenUnknownIsaIsReturned) {
+DG2TEST_F(ProductConfigTests, givenNotSetDeviceAndRevisionIdWhenGetProductConfigThenDefaultConfigIsReturned) {
     hwInfo.platform.usRevId = 0x0;
     hwInfo.platform.usDeviceID = 0x0;
 
     productConfig = compilerProductHelper->getHwIpVersion(hwInfo);
-    EXPECT_EQ(productConfig, AOT::UNKNOWN_ISA);
+    EXPECT_EQ(productConfig, AOT::DG2_G10_C0);
 }
 
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWhenAskedIfStorageInfoAdjustmentIsRequiredThenTrueIsReturned) {
-    if constexpr (is32bit) {
-        EXPECT_TRUE(productHelper->isStorageInfoAdjustmentRequired());
-    } else {
-        EXPECT_FALSE(productHelper->isStorageInfoAdjustmentRequired());
+DG2TEST_F(ProductHelperTestDg2, givenProductHelperWhenCheckingIsHostDeviceUsmPoolAllocatorSupportedThenCorrectValueIsReturned) {
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::OCL);
+        EXPECT_TRUE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_TRUE(productHelper->isDeviceUsmPoolAllocatorSupported());
     }
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWhenGettingEvictIfNecessaryFlagSupportedThenExpectTrue) {
-
-    EXPECT_TRUE(productHelper->isEvictionIfNecessaryFlagSupported());
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenDebugFlagWhenCheckingIsResolveDependenciesByPipeControlsSupportedThenCorrectValueIsReturned) {
-    DebugManagerStateRestore restorer;
-
-    auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
-    MockCommandStreamReceiver csr(*mockDevice->getExecutionEnvironment(), mockDevice->getRootDeviceIndex(), mockDevice->getDeviceBitfield());
-    csr.taskCount = 2;
-
-    // ResolveDependenciesViaPipeControls = -1 (default)
-    EXPECT_TRUE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, false, 2, csr));
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, true, 2, csr));
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, false, 3, csr));
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, true, 3, csr));
-
-    DebugManager.flags.ResolveDependenciesViaPipeControls.set(0);
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, false, 2, csr));
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, true, 2, csr));
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, false, 3, csr));
-    EXPECT_FALSE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, true, 3, csr));
-
-    DebugManager.flags.ResolveDependenciesViaPipeControls.set(1);
-    EXPECT_TRUE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, false, 2, csr));
-    EXPECT_TRUE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, true, 2, csr));
-    EXPECT_TRUE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, false, 3, csr));
-    EXPECT_TRUE(productHelper->isResolveDependenciesByPipeControlsSupported(pInHwInfo, true, 3, csr));
-}
-
-DG2TEST_F(ProductHelperTestDg2, givenProductHelperWhenCheckingIsBufferPoolAllocatorSupportedThenCorrectValueIsReturned) {
-    EXPECT_TRUE(productHelper->isBufferPoolAllocatorSupported());
+    {
+        VariableBackup<ApiSpecificConfig::ApiType> backup(&apiTypeForUlts, ApiSpecificConfig::L0);
+        EXPECT_FALSE(productHelper->isHostUsmPoolAllocatorSupported());
+        EXPECT_FALSE(productHelper->isDeviceUsmPoolAllocatorSupported());
+    }
 }

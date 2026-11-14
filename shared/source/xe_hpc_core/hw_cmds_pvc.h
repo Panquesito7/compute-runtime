@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,17 +17,10 @@ struct PVC : public XeHpcCoreFamily {
     static const HardwareInfo hwInfo;
     static FeatureTable featureTable;
     static WorkaroundTable workaroundTable;
-    // Initial non-zero values for unit tests
-    static const uint32_t maxEuPerSubslice = 8;
-    static const uint32_t maxSlicesSupported = 8;
-    static const uint32_t maxSubslicesSupported = 64;
-    static const uint32_t maxDualSubslicesSupported = 64;
     static const RuntimeCapabilityTable capabilityTable;
     static constexpr uint32_t numberOfpartsInTileForConcurrentKernels = 8u;
 
     struct FrontEndStateSupport {
-        static constexpr bool scratchSize = true;
-        static constexpr bool privateScratchSize = true;
         static constexpr bool computeDispatchAllWalker = true;
         static constexpr bool disableEuFusion = false;
         static constexpr bool disableOverdispatch = true;
@@ -36,16 +29,15 @@ struct PVC : public XeHpcCoreFamily {
 
     struct StateComputeModeStateSupport {
         static constexpr bool threadArbitrationPolicy = true;
-        static constexpr bool coherencyRequired = true;
         static constexpr bool largeGrfMode = true;
         static constexpr bool zPassAsyncComputeThreadLimit = false;
         static constexpr bool pixelAsyncComputeThreadLimit = false;
-        static constexpr bool devicePreemptionMode = false;
     };
 
-    static void (*setupHardwareInfo)(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, uint64_t hwInfoConfig, const CompilerProductHelper &compilerProductHelper);
+    static void (*setupHardwareInfo)(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable);
     static void setupFeatureAndWorkaroundTable(HardwareInfo *hwInfo);
-    static void setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper);
+    static void setupHardwareInfoBase(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable);
+    static void setupHardwareInfoImpl(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable);
     static void setupHardwareInfoMultiTileBase(HardwareInfo *hwInfo, bool setupMultiTile);
     static void adjustHardwareInfo(HardwareInfo *hwInfo);
 
@@ -55,6 +47,7 @@ struct PVC : public XeHpcCoreFamily {
     static bool isXl(const HardwareInfo &hwInfo);
 
     static bool isXt(const HardwareInfo &hwInfo);
+    static bool isXtVg(const HardwareInfo &hwInfo);
 
     static bool isXlA0(const HardwareInfo &hwInfo) {
         auto revId = hwInfo.platform.usRevId & pvcSteppingBits;
@@ -66,16 +59,11 @@ struct PVC : public XeHpcCoreFamily {
         return (revId <= 0x3);
     }
     static constexpr uint32_t pvcSteppingBits = 0b111;
-};
 
-class PvcHwConfig : public PVC {
-  public:
-    static void setupHardwareInfo(HardwareInfo *hwInfo, bool setupFeatureTableAndWorkaroundTable, const CompilerProductHelper &compilerProductHelper);
-    static const HardwareInfo hwInfo;
+    static constexpr bool isDcFlushAllowed = false;
 
   private:
     static GT_SYSTEM_INFO gtSystemInfo;
 };
 
-#include "hw_cmds_pvc.inl"
 } // namespace NEO

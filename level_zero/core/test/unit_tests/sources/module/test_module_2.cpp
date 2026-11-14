@@ -1,22 +1,31 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/compiler_interface/compiler_options.h"
-#include "shared/source/helpers/aligned_memory.h"
-#include "shared/source/helpers/file_io.h"
-#include "shared/test/common/helpers/test_files.h"
+#include "shared/source/compiler_interface/intermediate_representations.h"
+#include "shared/source/kernel/kernel_properties.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/mocks/mock_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_compiler_interface.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_modules_zebin.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 
-#include "level_zero/core/source/image/image.h"
 #include "level_zero/core/source/kernel/kernel.h"
+#include "level_zero/core/source/module/internal_core_program_ext.h"
 #include "level_zero/core/source/module/module_build_log.h"
 #include "level_zero/core/test/unit_tests/fixtures/device_fixture.h"
+#include "level_zero/core/test/unit_tests/mocks/mock_device.h"
 #include "level_zero/core/test/unit_tests/mocks/mock_module.h"
+#include "level_zero/ze_intel_gpu.h"
+
+#include <string_view>
+
 namespace L0 {
 namespace ult {
 
@@ -24,6 +33,7 @@ class ModuleOnlineCompiled : public DeviceFixture, public testing::Test {
   public:
     void SetUp() override {
         DeviceFixture::setUp();
+        debugManager.flags.FailBuildProgramWithStatefulAccess.set(0);
 
         auto zebinData = std::make_unique<ZebinTestData::ZebinWithL0TestCommonModule>(device->getHwInfo());
         const auto &src = zebinData->storage;
@@ -33,7 +43,7 @@ class ModuleOnlineCompiled : public DeviceFixture, public testing::Test {
         modDesc.inputSize = static_cast<uint32_t>(src.size());
         modDesc.pInputModule = reinterpret_cast<const uint8_t *>(src.data());
         ze_result_t result = ZE_RESULT_SUCCESS;
-        module.reset(whiteboxCast(Module::create(device, &modDesc, nullptr, ModuleType::User, &result)));
+        module.reset(whiteboxCast(Module::create(device, &modDesc, nullptr, ModuleType::user, &result)));
         ASSERT_NE(nullptr, module);
     }
 
@@ -42,27 +52,25 @@ class ModuleOnlineCompiled : public DeviceFixture, public testing::Test {
         DeviceFixture::tearDown();
     }
     std::unique_ptr<WhiteBox<L0::Module>> module;
+    DebugManagerStateRestore restore;
 };
 
 using ModuleTests = Test<DeviceFixture>;
 
 TEST_F(ModuleTests, WhenCreatingBuildOptionsThenOptionsParsedCorrectly) {
-    auto module = new ModuleImp(device, nullptr, ModuleType::User);
-    ASSERT_NE(nullptr, module); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+    ModuleImp module(device, nullptr, ModuleType::user);
 
     std::string buildOptions;
     std::string internalBuildOptions;
 
-    module->createBuildOptions("-ze-opt-disable -ze-opt-greater-than-4GB-buffer-required", buildOptions, internalBuildOptions);
+    module.createBuildOptions("-ze-opt-disable -ze-opt-greater-than-4GB-buffer-required", buildOptions, internalBuildOptions);
 
     EXPECT_TRUE(NEO::CompilerOptions::contains(buildOptions, NEO::CompilerOptions::optDisable));
     EXPECT_TRUE(NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::greaterThan4gbBuffersRequired));
-
-    delete module;
 }
 
 TEST_F(ModuleTests, whenCreatingAutoGrfBuildOptionsThenOptionsParsedCorrectly) {
-    ModuleImp module(device, nullptr, ModuleType::User);
+    ModuleImp module(device, nullptr, ModuleType::user);
 
     std::string buildOptions;
     std::string internalBuildOptions;
@@ -70,6 +78,164 @@ TEST_F(ModuleTests, whenCreatingAutoGrfBuildOptionsThenOptionsParsedCorrectly) {
     module.createBuildOptions(BuildOptions::optAutoGrf.data(), buildOptions, internalBuildOptions);
 
     EXPECT_TRUE(NEO::CompilerOptions::contains(internalBuildOptions, NEO::CompilerOptions::autoGrf));
+}
+
+TEST_F(ModuleTests, givenMalformedRegisterFileSizeWhenVerifyingBuildOptionsThenFalseIsReturned) {
+    ModuleImp module(device, nullptr, ModuleType::user);
+
+    for (const char *buildFlags : {"-ze-exp-register-file-size=abc", "-ze-exp-register-file-size=", "-ze-exp-register-file-size=99999999999999999999",
+                                   "-ze-exp-register-file-size=-1", "-ze-exp-register-file-size=256abc"}) {
+        EXPECT_FALSE(module.verifyBuildOptions(buildFlags)) << buildFlags;
+    }
+}
+
+TEST_F(ModuleTests, givenLibraryCompilationAliasWhenCreatingBuildOptionsThenItIsTranslatedToLibraryCompilationAndFunctionSymbolExportIsEnabled) {
+    for (const char *buildFlags : {"-ze-library-compilation", "-ze-take-global-address -ze-library-compilation"}) {
+        WhiteBox<::L0::Module> module(device, nullptr, ModuleType::user);
+        std::string apiOptions;
+        std::string internalOptions;
+
+        module.createBuildOptions(buildFlags, apiOptions, internalOptions);
+
+        EXPECT_TRUE(module.isFunctionSymbolExportEnabled) << buildFlags;
+        EXPECT_TRUE(NEO::CompilerOptions::contains(apiOptions, BuildOptions::enableLibraryCompile)) << buildFlags;
+        EXPECT_FALSE(NEO::CompilerOptions::contains(apiOptions, BuildOptions::enableLibraryCompileAlias)) << buildFlags;
+        EXPECT_FALSE(NEO::CompilerOptions::contains(apiOptions, "-ze")) << buildFlags;
+    }
+}
+
+struct ModuleFrontendApiOptionsTests : public Test<DeviceFixture> {
+    void SetUp() override {
+        Test<DeviceFixture>::SetUp();
+        mockCompiler = new NEO::MockCompilerInterfaceCaptureBuildOptions();
+        device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(mockCompiler);
+    }
+
+    void createModule(ze_module_format_t format, const char *buildFlags, const void *pNext) {
+        ze_module_desc_t moduleDesc = {ZE_STRUCTURE_TYPE_MODULE_DESC};
+        moduleDesc.pNext = pNext;
+        moduleDesc.format = format;
+        moduleDesc.pInputModule = reinterpret_cast<const uint8_t *>(source);
+        moduleDesc.inputSize = strlen(source) + 1;
+        moduleDesc.pBuildFlags = buildFlags;
+
+        mockCompiler->buildOptions.clear();
+        mockCompiler->frontendBuildOptions.reset();
+        ModuleImp module(device, nullptr, ModuleType::user);
+        module.initialize(&moduleDesc, device->getNEODevice());
+    }
+
+    NEO::MockCompilerInterfaceCaptureBuildOptions *mockCompiler = nullptr;
+    const char *source = "kernel void k(global int *p) { p[0] = 1; }";
+};
+
+TEST_F(ModuleFrontendApiOptionsTests, givenOclcInputWithBackendOnlyOptionsWhenBuildingModuleThenFrontendOptionsExcludeThemAndApiOptionsAreUnchanged) {
+    struct TestCase {
+        std::string buildFlags;
+        std::string expectedFrontendApiOptions;
+        std::string expectedBackendOption;
+    };
+    std::vector<TestCase> testCases = {
+        {"-ze-opt-level=2 -zet-profile-flags 5 -DA=1 -g", "-DA=1 -g", "-ze-opt-level=O2"},
+        {"-ze-opt-level 2 -g", "-g", "-ze-opt-level 2"},
+        {"-ze-opt-level=0", "", "-ze-opt-level=O0"},
+        {"-zet-profile-flags 3 -ze-opt-level -g", "-g", "-zet-profile-flags 3"},
+        {"-zet-profile-flags -1 -DB=2", "-DB=2", "-zet-profile-flags -1"},
+        {"-ze-kernel-debug-enable -g", "-g", "-ze-kernel-debug-enable"},
+    };
+    const auto registerFileSizes = device->getProductHelper().getSupportedNumGrfs(device->getNEODevice()->getReleaseHelper());
+    if (!registerFileSizes.empty()) {
+        const std::string registerFileSize = std::to_string(registerFileSizes[0]);
+        testCases.push_back({"-ze-exp-register-file-size=" + registerFileSize + " -g", "-g", "-ze-exp-register-file-size=" + registerFileSize});
+        testCases.push_back({"-g -ze-exp-register-file-size " + registerFileSize, "-g", "-ze-exp-register-file-size " + registerFileSize});
+    }
+
+    for (const auto &testCase : testCases) {
+        createModule(ZE_MODULE_FORMAT_OCLC, testCase.buildFlags.c_str(), nullptr);
+
+        ASSERT_TRUE(mockCompiler->frontendBuildOptions.has_value()) << testCase.buildFlags;
+        EXPECT_EQ(testCase.expectedFrontendApiOptions, mockCompiler->frontendBuildOptions.value()) << testCase.buildFlags;
+        EXPECT_NE(std::string::npos, mockCompiler->buildOptions.find(testCase.expectedBackendOption)) << testCase.buildFlags;
+    }
+}
+
+TEST_F(ModuleFrontendApiOptionsTests, givenSpirvInputWhenBuildingModuleThenNoFrontendOptionsArePassed) {
+    createModule(ZE_MODULE_FORMAT_IL_SPIRV, "-ze-opt-level=2 -zet-profile-flags 5", nullptr);
+
+    EXPECT_FALSE(mockCompiler->frontendBuildOptions.has_value());
+    EXPECT_NE(std::string::npos, mockCompiler->buildOptions.find("-ze-opt-level=O2"));
+    EXPECT_NE(std::string::npos, mockCompiler->buildOptions.find("-zet-profile-flags 5"));
+}
+
+TEST_F(ModuleFrontendApiOptionsTests, givenOclcInputWithHeadersAndBackendOnlyOptionsWhenCompilingModuleThenFrontendOptionsExcludeThem) {
+    L0::ze_module_program_headers_exp_desc_t headersDesc{};
+    createModule(ZE_MODULE_FORMAT_OCLC, "-ze-opt-level=1 -DA=1 -zet-profile-flags 2", &headersDesc);
+
+    ASSERT_TRUE(mockCompiler->frontendBuildOptions.has_value());
+    EXPECT_EQ("-DA=1", mockCompiler->frontendBuildOptions.value());
+    EXPECT_NE(std::string::npos, mockCompiler->buildOptions.find("-ze-opt-level=O1"));
+    EXPECT_NE(std::string::npos, mockCompiler->buildOptions.find("-zet-profile-flags 2"));
+}
+
+TEST(ModuleDestroyTest, givenIsaAllocationWhenIsModuleDestroyedThenRequireInstructionCacheFlushInCsrThatUsedTheAllocation) {
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCommandStreamReceiver>();
+    const uint32_t rootDeviceIndex = 0u;
+    NEO::HardwareInfo hwInfo = *NEO::defaultHwInfo.get();
+    auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo, rootDeviceIndex);
+
+    auto mockCommandStreamReceiver = static_cast<MockCommandStreamReceiver *>(&neoMockDevice->getGpgpuCommandStreamReceiver());
+    mockCommandStreamReceiver->makeResidentParentCall = true;
+
+    MockDeviceImp mockDevice(neoMockDevice);
+
+    auto module = new MockModule{&mockDevice, nullptr, ModuleType::user};
+    module->translationUnit.reset(new MockModuleTranslationUnit{&mockDevice});
+
+    auto kernelInfo = new KernelInfo{};
+    kernelInfo->heapInfo.pKernelHeap = reinterpret_cast<const void *>(0xdeadbeef0000);
+    kernelInfo->heapInfo.kernelHeapSize = static_cast<uint32_t>(0x40);
+    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
+
+    module->initializeKernelImmutableData();
+    auto &kernelImmData = module->getKernelImmutableDataVector();
+    auto csr = mockDevice.getNEODevice()->getEngine(0).commandStreamReceiver;
+    csr->makeResident(*kernelImmData[0]->getIsaParentAllocation());
+
+    module->destroy();
+
+    EXPECT_TRUE(mockCommandStreamReceiver->requiresInstructionCacheFlush);
+}
+
+TEST(ModuleDestroyTest, givenKernelImmutableDataWithNullIsaAllocationWhenIsModuleDestroyedThenRequiresInstructionCacheFlushIsNotSetInCsr) {
+    EnvironmentWithCsrWrapper environment;
+    environment.setCsrType<MockCommandStreamReceiver>();
+    const uint32_t rootDeviceIndex = 0u;
+    NEO::HardwareInfo hwInfo = *NEO::defaultHwInfo.get();
+    auto *neoMockDevice = NEO::MockDevice::createWithNewExecutionEnvironment<NEO::MockDevice>(&hwInfo, rootDeviceIndex);
+
+    auto mockCommandStreamReceiver = static_cast<MockCommandStreamReceiver *>(&neoMockDevice->getGpgpuCommandStreamReceiver());
+    mockCommandStreamReceiver->makeResidentParentCall = true;
+
+    MockDeviceImp mockDevice(neoMockDevice);
+
+    auto module = new MockModule{&mockDevice, nullptr, ModuleType::user};
+    module->translationUnit.reset(new MockModuleTranslationUnit{&mockDevice});
+
+    auto kernelInfo = new KernelInfo{};
+    kernelInfo->heapInfo.pKernelHeap = reinterpret_cast<const void *>(0xdeadbeef0000);
+    kernelInfo->heapInfo.kernelHeapSize = static_cast<uint32_t>(0x40);
+    module->translationUnit->programInfo.kernelInfos.push_back(kernelInfo);
+
+    module->initializeKernelImmutableData();
+    auto &kernelImmData = module->getKernelImmutableDataVector();
+    for (auto &data : kernelImmData) {
+        data->setIsaParentAllocation(nullptr);
+    }
+
+    module->destroy();
+
+    EXPECT_FALSE(mockCommandStreamReceiver->requiresInstructionCacheFlush);
 }
 
 TEST(ModuleBuildLog, WhenCreatingModuleBuildLogThenNonNullPointerReturned) {
@@ -100,12 +266,12 @@ TEST(ModuleBuildLog, WhenGettingStringThenLogIsParsedCorrectly) {
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(1u, buildLogSize);
 
-    buildLog = reinterpret_cast<char *>(malloc(buildLogSize));
+    alignas(16) uint8_t stackBuffer[32] = {};
+    ASSERT_LE(buildLogSize, sizeof(stackBuffer));
+    buildLog = reinterpret_cast<char *>(stackBuffer);
     result = moduleBuildLog->getString(&buildLogSize, buildLog);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(1u, buildLogSize);
-
-    free(buildLog);
 
     moduleBuildLog->appendString(errorLog, strlen(errorLog));
 
@@ -114,13 +280,11 @@ TEST(ModuleBuildLog, WhenGettingStringThenLogIsParsedCorrectly) {
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ((strlen(errorLog) + 1), buildLogSize);
 
-    buildLog = reinterpret_cast<char *>(malloc(buildLogSize));
+    ASSERT_LE(buildLogSize, sizeof(stackBuffer));
     result = moduleBuildLog->getString(&buildLogSize, buildLog);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ((strlen(errorLog) + 1), buildLogSize);
     EXPECT_STREQ("Error Log", buildLog);
-
-    free(buildLog);
 
     moduleBuildLog->appendString(warnLog, strlen(warnLog));
 
@@ -129,13 +293,12 @@ TEST(ModuleBuildLog, WhenGettingStringThenLogIsParsedCorrectly) {
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ((strlen(errorLog) + strlen("\n") + strlen(warnLog) + 1), buildLogSize);
 
-    buildLog = reinterpret_cast<char *>(malloc(buildLogSize));
+    ASSERT_LE(buildLogSize, sizeof(stackBuffer));
     result = moduleBuildLog->getString(&buildLogSize, buildLog);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ((strlen(errorLog) + strlen("\n") + strlen(warnLog) + 1), buildLogSize);
     EXPECT_STREQ("Error Log\nWarn Log", buildLog);
-
-    free(buildLog);
+    EXPECT_STREQ(buildLog, moduleBuildLog->getBuildLog());
 
     result = moduleBuildLog->destroy();
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
@@ -185,10 +348,30 @@ TEST_F(ModuleOnlineCompiled, WhenCreatingFromNativeBinaryThenGenBinaryIsReturned
     modDesc.inputSize = binarySize;
     modDesc.pInputModule = reinterpret_cast<const uint8_t *>(storage.get());
     ze_result_t initResult = ZE_RESULT_SUCCESS;
-    L0::Module *moduleFromNativeBinary = Module::create(device, &modDesc, nullptr, ModuleType::User, &initResult);
+    L0::Module *moduleFromNativeBinary = Module::create(device, &modDesc, nullptr, ModuleType::user, &initResult);
     EXPECT_NE(nullptr, moduleFromNativeBinary);
 
     delete moduleFromNativeBinary;
+}
+
+TEST_F(ModuleOnlineCompiled, givenSetIrBinaryWhenGettingIrBinaryThenIrBinaryIsReturned) {
+    auto mockIrBinary = std::make_unique<char[]>(8);
+    memcpy_s(mockIrBinary.get(), 8, "IRBINARY", 8);
+    module->translationUnit->irBinary.reset(mockIrBinary.release());
+    module->translationUnit->irBinarySize = 8;
+
+    size_t binarySize = 0;
+    uint8_t *binary = nullptr;
+    auto result = module->getIrBinary(&binarySize, nullptr);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_NE(0u, binarySize);
+
+    auto storage = std::make_unique<uint8_t[]>(binarySize);
+    binary = storage.get();
+    result = module->getIrBinary(&binarySize, binary);
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(0, memcmp(binary, "IRBINARY", 8));
 }
 
 TEST_F(ModuleOnlineCompiled, GivenKernelThenThreadGroupParametersAreCorrect) {
@@ -198,7 +381,6 @@ TEST_F(ModuleOnlineCompiled, GivenKernelThenThreadGroupParametersAreCorrect) {
 
     ze_result_t res = ZE_RESULT_SUCCESS;
     auto kernel = std::unique_ptr<Kernel>(whiteboxCast(Kernel::create(
-        neoDevice->getHardwareInfo().platform.eProductFamily,
         module.get(), &kernelDesc, &res)));
     EXPECT_EQ(ZE_RESULT_SUCCESS, res);
     ASSERT_NE(nullptr, kernel);
@@ -216,7 +398,6 @@ TEST_F(ModuleOnlineCompiled, GivenKernelThenCorrectPropertiesAreReturned) {
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto kernel = std::unique_ptr<Kernel>(whiteboxCast(Kernel::create(
-        neoDevice->getHardwareInfo().platform.eProductFamily,
         module.get(), &kernelDesc, &result)));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, kernel);
@@ -257,7 +438,6 @@ TEST_F(ModuleOnlineCompiled, GivenKernelThenCorrectAttributesAreReturned) {
 
     ze_result_t result = ZE_RESULT_SUCCESS;
     auto kernel = std::unique_ptr<Kernel>(whiteboxCast(Kernel::create(
-        neoDevice->getHardwareInfo().platform.eProductFamily,
         module.get(), &kernelDesc, &result)));
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     ASSERT_NE(nullptr, kernel);
@@ -274,17 +454,17 @@ TEST_F(ModuleOnlineCompiled, GivenKernelThenCorrectAttributesAreReturned) {
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_EQ(strlen(attributeString) + 1, strSize);
 
-    char *attributes = reinterpret_cast<char *>(malloc(sizeof(char) * strSize));
+    alignas(16) uint8_t stackBuffer[32] = {};
+    ASSERT_LE(sizeof(char) * strSize, sizeof(stackBuffer));
+    char *attributes = reinterpret_cast<char *>(stackBuffer);
     result = kernel->getSourceAttributes(&strSize, &attributes);
     EXPECT_EQ(ZE_RESULT_SUCCESS, result);
     EXPECT_STREQ(attributeString, attributes);
-
-    free(attributes);
 }
 
 TEST_F(ModuleTests, givenLargeGrfFlagSetWhenCreatingModuleThenOverrideInternalFlags) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceLargeGrfCompilationMode.set(true);
+    debugManager.flags.ForceLargeGrfCompilationMode.set(true);
 
     auto pMockCompilerInterface = new MockCompilerInterface;
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
@@ -300,7 +480,7 @@ TEST_F(ModuleTests, givenLargeGrfFlagSetWhenCreatingModuleThenOverrideInternalFl
 
     auto mockTranslationUnit = new MockModuleTranslationUnit(device);
     mockTranslationUnit->processUnpackedBinaryCallBase = false;
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
 
     module.translationUnit.reset(mockTranslationUnit);
 
@@ -315,7 +495,7 @@ TEST_F(ModuleTests, givenLargeGrfFlagSetWhenCreatingModuleThenOverrideInternalFl
 
 TEST_F(ModuleTests, givenAutoGrfFlagSetWhenCreatingModuleThenOverrideInternalFlags) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceAutoGrfCompilationMode.set(1);
+    debugManager.flags.ForceAutoGrfCompilationMode.set(1);
 
     auto pMockCompilerInterface = new MockCompilerInterface;
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
@@ -331,7 +511,7 @@ TEST_F(ModuleTests, givenAutoGrfFlagSetWhenCreatingModuleThenOverrideInternalFla
 
     auto mockTranslationUnit = new MockModuleTranslationUnit(device);
     mockTranslationUnit->processUnpackedBinaryCallBase = false;
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
 
     module.translationUnit.reset(mockTranslationUnit);
 
@@ -346,7 +526,7 @@ TEST_F(ModuleTests, givenAutoGrfFlagSetWhenCreatingModuleThenOverrideInternalFla
 
 TEST_F(ModuleTests, givenDefaultGrfFlagSetWhenCreatingModuleThenOverrideInternalFlags) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ForceDefaultGrfCompilationMode.set(true);
+    debugManager.flags.ForceDefaultGrfCompilationMode.set(true);
 
     auto pMockCompilerInterface = new MockCompilerInterface;
     auto &rootDeviceEnvironment = this->neoDevice->executionEnvironment->rootDeviceEnvironments[this->neoDevice->getRootDeviceIndex()];
@@ -362,7 +542,7 @@ TEST_F(ModuleTests, givenDefaultGrfFlagSetWhenCreatingModuleThenOverrideInternal
 
     auto mockTranslationUnit = new MockModuleTranslationUnit(device);
     mockTranslationUnit->processUnpackedBinaryCallBase = false;
-    Module module(device, nullptr, ModuleType::User);
+    Module module(device, nullptr, ModuleType::user);
 
     module.translationUnit.reset(mockTranslationUnit);
 
@@ -376,9 +556,11 @@ TEST_F(ModuleTests, givenDefaultGrfFlagSetWhenCreatingModuleThenOverrideInternal
 }
 
 TEST_F(ModuleTests, givenFP64EmulationDisabledWhenCreatingModuleThenEnableFP64GenEmuOptionIsNotPresent) {
+    DebugManagerStateRestore restorer;
+    ASSERT_FALSE(NEO::debugManager.flags.NEO_FP64_EMULATION.get());
+
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    ASSERT_FALSE(device->getNEODevice()->getExecutionEnvironment()->isFP64EmulationEnabled());
 
     uint8_t binary[10];
     ze_module_desc_t moduleDesc = {};
@@ -388,7 +570,7 @@ TEST_F(ModuleTests, givenFP64EmulationDisabledWhenCreatingModuleThenEnableFP64Ge
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::Builtin));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::builtin));
     ASSERT_NE(nullptr, module.get());
     module->initialize(&moduleDesc, device->getNEODevice());
 
@@ -396,9 +578,11 @@ TEST_F(ModuleTests, givenFP64EmulationDisabledWhenCreatingModuleThenEnableFP64Ge
 };
 
 TEST_F(ModuleTests, givenFP64EmulationEnabledWhenCreatingModuleThenEnableFP64GenEmuOptionIsPresent) {
+    DebugManagerStateRestore restorer;
+    NEO::debugManager.flags.NEO_FP64_EMULATION.set(true);
+
     auto cip = new NEO::MockCompilerInterfaceCaptureBuildOptions();
     device->getNEODevice()->getExecutionEnvironment()->rootDeviceEnvironments[device->getRootDeviceIndex()]->compilerInterface.reset(cip);
-    device->getNEODevice()->getExecutionEnvironment()->setFP64EmulationEnabled();
 
     uint8_t binary[10];
     ze_module_desc_t moduleDesc = {};
@@ -408,12 +592,334 @@ TEST_F(ModuleTests, givenFP64EmulationEnabledWhenCreatingModuleThenEnableFP64Gen
 
     ModuleBuildLog *moduleBuildLog = nullptr;
 
-    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::Builtin));
+    auto module = std::unique_ptr<L0::ModuleImp>(new L0::ModuleImp(device, moduleBuildLog, ModuleType::builtin));
     ASSERT_NE(nullptr, module.get());
     module->initialize(&moduleDesc, device->getNEODevice());
 
     EXPECT_TRUE(CompilerOptions::contains(cip->buildInternalOptions, BuildOptions::enableFP64GenEmu));
 };
+
+struct MockModuleTranslationUnitTrackProcessUnpacked : public L0::ModuleTranslationUnit {
+    using L0::ModuleTranslationUnit::ModuleTranslationUnit;
+
+    ze_result_t processUnpackedBinary() override {
+        ++processUnpackedBinaryCalled;
+        return ZE_RESULT_SUCCESS;
+    }
+    uint32_t processUnpackedBinaryCalled = 0u;
+};
+
+struct MockModuleTranslationUnitCaptureCompileArgs : public L0::ModuleTranslationUnit {
+    using L0::ModuleTranslationUnit::ModuleTranslationUnit;
+
+    ze_result_t compileGenBinary(NEO::TranslationInput &inputArgs,
+                                 CompilationMode compilationMode) override {
+        capturedOutType = inputArgs.outType;
+        capturedStaticLink = (compilationMode == CompilationMode::staticLink);
+        capturedCreateLibrary = (compilationMode == CompilationMode::createLibrary);
+        ++compileGenBinaryCalled;
+        return ZE_RESULT_SUCCESS;
+    }
+
+    IGC::CodeType::CodeType_t capturedOutType = IGC::CodeType::undefined;
+    bool capturedStaticLink = false;
+    bool capturedCreateLibrary = false;
+    uint32_t compileGenBinaryCalled = 0u;
+};
+
+TEST_F(ModuleTests, givenCompileGenBinaryCalledWithCreateLibraryTrueThenCreateLibraryCalledAndProcessUnpackedBinaryNotCalled) {
+    auto mockCompilerInterface = new MockCompilerInterface();
+    auto &rootDeviceEnv = *neoDevice->getExecutionEnvironment()
+                               ->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
+    rootDeviceEnv.compilerInterface.reset(mockCompilerInterface);
+
+    MockModuleTranslationUnitTrackProcessUnpacked tu(device);
+
+    NEO::TranslationInput inputArgs{IGC::CodeType::elf, IGC::CodeType::llvmBc};
+
+    ze_result_t result = tu.compileGenBinary(inputArgs, ModuleTranslationUnit::CompilationMode::createLibrary);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, mockCompilerInterface->createLibraryCallCount);
+    EXPECT_EQ(0u, static_cast<uint32_t>(
+                      mockCompilerInterface->receivedApiOptions.empty() ? 0 : 1));
+    EXPECT_EQ(0u, tu.processUnpackedBinaryCalled);
+};
+
+TEST_F(ModuleTests, givenStaticLinkSpirVAndLlvmBcWithCreateLibraryOptionThenOutTypeIsLlvmBc) {
+    auto mockCompilerInterface = new MockCompilerInterface();
+    auto &rootDeviceEnv = *neoDevice->getExecutionEnvironment()
+                               ->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
+    rootDeviceEnv.compilerInterface.reset(mockCompilerInterface);
+
+    MockModuleTranslationUnitCaptureCompileArgs tu(device);
+
+    const uint8_t dummySpirv[] = {0x03, 0x02, 0x23, 0x07, 0x00, 0x00, 0x00, 0x00};
+    std::vector<const char *> inputSpirVs = {reinterpret_cast<const char *>(dummySpirv)};
+    std::vector<uint32_t> inputModuleSizes = {static_cast<uint32_t>(sizeof(dummySpirv))};
+    std::vector<const ze_module_constants_t *> specConstants = {};
+    std::vector<const char *> inputLlvmBcs = {};
+    std::vector<uint32_t> inputLlvmBcSizes = {};
+
+    const char *buildOptions = NEO::CompilerOptions::createLibrary.data();
+
+    ze_result_t result = tu.staticLinkSpirVAndLlvmBc(
+        inputSpirVs, inputModuleSizes,
+        buildOptions, /*internalBuildOptions=*/nullptr,
+        specConstants,
+        inputLlvmBcs, inputLlvmBcSizes);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, tu.compileGenBinaryCalled);
+    EXPECT_EQ(IGC::CodeType::llvmBc, tu.capturedOutType);
+    EXPECT_TRUE(tu.capturedCreateLibrary);
+};
+
+TEST_F(ModuleTests, givenStaticLinkSpirVAndLlvmBcWithoutCreateLibraryOptionThenOutTypeIsOclGenBin) {
+    auto mockCompilerInterface = new MockCompilerInterface();
+    auto &rootDeviceEnv = *neoDevice->getExecutionEnvironment()
+                               ->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
+    rootDeviceEnv.compilerInterface.reset(mockCompilerInterface);
+
+    MockModuleTranslationUnitCaptureCompileArgs tu(device);
+
+    const uint8_t dummySpirv[] = {0x03, 0x02, 0x23, 0x07, 0x00, 0x00, 0x00, 0x00};
+    std::vector<const char *> inputSpirVs = {reinterpret_cast<const char *>(dummySpirv)};
+    std::vector<uint32_t> inputModuleSizes = {static_cast<uint32_t>(sizeof(dummySpirv))};
+    std::vector<const ze_module_constants_t *> specConstants = {};
+    std::vector<const char *> inputLlvmBcs = {};
+    std::vector<uint32_t> inputLlvmBcSizes = {};
+
+    ze_result_t result = tu.staticLinkSpirVAndLlvmBc(
+        inputSpirVs, inputModuleSizes,
+        /*buildOptions=*/nullptr, /*internalBuildOptions=*/nullptr,
+        specConstants,
+        inputLlvmBcs, inputLlvmBcSizes);
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, tu.compileGenBinaryCalled);
+    EXPECT_EQ(IGC::CodeType::oclGenBin, tu.capturedOutType);
+    EXPECT_TRUE(tu.capturedStaticLink);
+};
+
+TEST_F(ModuleTests, givenBuildFromSourceWithHeadersWithoutCreateLibraryOptionThenOutTypeIsUndefined) {
+    auto mockCompilerInterface = new MockCompilerInterface();
+    auto &rootDeviceEnv = *neoDevice->getExecutionEnvironment()
+                               ->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
+    rootDeviceEnv.compilerInterface.reset(mockCompilerInterface);
+
+    MockModuleTranslationUnitCaptureCompileArgs tu(device);
+    tu.capturedOutType = IGC::CodeType::invalid;
+
+    const char source[] = "constant float foo = 9.6F;\n";
+    ze_result_t result = tu.buildFromSourceWithHeaders(ZE_MODULE_FORMAT_OCLC, source, sizeof(source),
+                                                       nullptr, nullptr,
+                                                       {}, {}, {});
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, tu.compileGenBinaryCalled);
+    EXPECT_EQ(IGC::CodeType::undefined, tu.capturedOutType);
+    EXPECT_FALSE(tu.capturedCreateLibrary);
+};
+
+TEST_F(ModuleTests, givenBuildFromSourceWithHeadersWithCreateLibraryOptionThenOutTypeIsLlvmBc) {
+    auto mockCompilerInterface = new MockCompilerInterface();
+    auto &rootDeviceEnv = *neoDevice->getExecutionEnvironment()
+                               ->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()];
+    rootDeviceEnv.compilerInterface.reset(mockCompilerInterface);
+
+    MockModuleTranslationUnitCaptureCompileArgs tu(device);
+
+    const char source[] = "constant float foo = 9.6F;\n";
+    ze_result_t result = tu.buildFromSourceWithHeaders(ZE_MODULE_FORMAT_OCLC, source, sizeof(source),
+                                                       NEO::CompilerOptions::createLibrary.data(), nullptr,
+                                                       {}, {}, {});
+
+    EXPECT_EQ(ZE_RESULT_SUCCESS, result);
+    EXPECT_EQ(1u, tu.compileGenBinaryCalled);
+    EXPECT_EQ(IGC::CodeType::llvmBc, tu.capturedOutType);
+    EXPECT_TRUE(tu.capturedCreateLibrary);
+};
+
+TEST_F(ModuleTests, givenIsLlvmBcWhenFlagIsNotSetThenReturnsFalse) {
+    WhiteBox<L0::Module> module(device, nullptr, ModuleType::user);
+    EXPECT_FALSE(module.isLlvmBc());
+};
+
+TEST_F(ModuleTests, givenIsLlvmBcWhenFlagIsSetThenReturnsTrue) {
+    WhiteBox<L0::Module> module(device, nullptr, ModuleType::user);
+    module.isLlvmBitcode = true;
+    EXPECT_TRUE(module.isLlvmBc());
+};
+
+constexpr std::string_view pisaSample = R"PISA(
+  .kernel @k(.param[8] .addrspace(global) %arg0, .param[8] .addrspace(global) %arg1)
+  {
+    .reg .64b %r0, %r1, %r2, %r3, %r4;
+    .reg .64b %r5, %r6;
+    .reg .32b %r7;
+    ld.param.64b %r0, [%arg0];
+    ld.param.64b %r1, [%arg1];
+    zext.64b.32b   %r2, %localid.x;
+    umad.full.32b   %r3, %localsize.x, %groupid.x, %r2;
+    ld.const.64b   %r4, [%implargbuffer + 48];
+    iadd.64b   %r5, %r3, %r4;
+    shl.64b   %r6, %r5, 2;
+    ld.global.32b   %r7, [%r1 + %r6];
+    st.global.32b   [%r0 + %r6], %r7;
+    return;
+  }
+)PISA";
+
+using PisaInputTest = Test<DeviceFixture>;
+
+TEST_F(PisaInputTest, GivenPisaInputWithUnknownFormatWhenCreatingModuleThenInvalidEnumeratorErrorIsReturned) {
+    MockModule mod{this->device, nullptr, L0::ModuleType::user};
+    ze_module_desc_t desc = {.stype = ZE_STRUCTURE_TYPE_MODULE_DESC};
+    desc.pInputModule = reinterpret_cast<const uint8_t *>(pisaSample.data());
+    desc.inputSize = pisaSample.size();
+    desc.format = ZE_MODULE_FORMAT_FORCE_UINT32;
+    auto res = mod.initialize(&desc, this->device->getNEODevice());
+    EXPECT_EQ(ZE_RESULT_ERROR_INVALID_ENUMERATION, res);
+}
+
+TEST_F(PisaInputTest, GivenPisaInputWhenCreatingModuleThenProperIntermediateCodeTypeIsUsed) {
+    struct MockTU : ModuleTranslationUnit {
+        using ModuleTranslationUnit::ModuleTranslationUnit;
+
+        ze_result_t buildFromIntermediate(IGC::CodeType::CodeType_t intermediateType, const char *input, uint32_t inputSize, const char *buildOptions, const char *internalBuildOptions,
+                                          const ze_module_constants_t *pConstants) override {
+            intermediateTypeUsed = intermediateType;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        IGC::CodeType::CodeType_t intermediateTypeUsed = IGC::CodeType::invalid;
+    } *mockTranslationUnit = nullptr;
+
+    MockModule mod{this->device, nullptr, L0::ModuleType::user};
+    {
+        auto mtu = std::make_unique<MockTU>(this->device);
+        mockTranslationUnit = mtu.get();
+        mod.translationUnit = std::move(mtu);
+    }
+    ze_module_desc_t desc = {.stype = ZE_STRUCTURE_TYPE_MODULE_DESC};
+    desc.pInputModule = reinterpret_cast<const uint8_t *>(pisaSample.data());
+    desc.inputSize = pisaSample.size();
+    desc.format = ZE_MODULE_FORMAT_PISA;
+    auto res = mod.initialize(&desc, this->device->getNEODevice());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    EXPECT_EQ(NEO::pisaCodeType, mockTranslationUnit->intermediateTypeUsed);
+}
+
+TEST_F(PisaInputTest, GivenPisaInputWithSpecializationConstantsWhenCreatingModuleThenConstantsAreForwardedToTheBuild) {
+    struct MockTU : ModuleTranslationUnit {
+        using ModuleTranslationUnit::ModuleTranslationUnit;
+
+        ze_result_t buildFromIntermediate(IGC::CodeType::CodeType_t intermediateType, const char *input, uint32_t inputSize, const char *buildOptions, const char *internalBuildOptions,
+                                          const ze_module_constants_t *pConstants) override {
+            constantsReceived = pConstants;
+            return ZE_RESULT_SUCCESS;
+        }
+
+        const ze_module_constants_t *constantsReceived = nullptr;
+    } *mockTranslationUnit = nullptr;
+
+    MockModule mod{this->device, nullptr, L0::ModuleType::user};
+    {
+        auto mtu = std::make_unique<MockTU>(this->device);
+        mockTranslationUnit = mtu.get();
+        mod.translationUnit = std::move(mtu);
+    }
+
+    uint32_t constantId = 0u;
+    uint64_t constantValue = 42u;
+    const void *constantValuePtr = &constantValue;
+    ze_module_constants_t specConstants = {};
+    specConstants.numConstants = 1u;
+    specConstants.pConstantIds = &constantId;
+    specConstants.pConstantValues = &constantValuePtr;
+
+    ze_module_desc_t desc = {.stype = ZE_STRUCTURE_TYPE_MODULE_DESC};
+    desc.pInputModule = reinterpret_cast<const uint8_t *>(pisaSample.data());
+    desc.inputSize = pisaSample.size();
+    desc.format = ZE_MODULE_FORMAT_PISA;
+    desc.pConstants = &specConstants;
+
+    auto res = mod.initialize(&desc, this->device->getNEODevice());
+    EXPECT_EQ(ZE_RESULT_SUCCESS, res);
+    EXPECT_EQ(&specConstants, mockTranslationUnit->constantsReceived);
+}
+
+TEST_F(PisaInputTest, GivenPisaInputWithSpecializationConstantsWhenBuildingThenConstantsAreDiscoveredUsingPisaCodeType) {
+    auto neoDevice = this->device->getNEODevice();
+    auto mockCompiler = new MockCompilerInterfaceWithSpecConstants<uint32_t, uint64_t>(1u);
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(mockCompiler);
+
+    MockModuleTranslationUnit translationUnit{this->device};
+    translationUnit.processUnpackedBinaryCallBase = false;
+
+    uint32_t constantId = mockCompiler->moduleSpecConstantsIds[0];
+    uint64_t constantValue = 42u;
+    const void *constantValuePtr = &constantValue;
+    ze_module_constants_t specConstants = {};
+    specConstants.numConstants = 1u;
+    specConstants.pConstantIds = &constantId;
+    specConstants.pConstantValues = &constantValuePtr;
+
+    translationUnit.buildFromIntermediate(NEO::pisaCodeType, pisaSample.data(), static_cast<uint32_t>(pisaSample.size()), "", "", &specConstants);
+    EXPECT_EQ(NEO::pisaCodeType, mockCompiler->receivedSpecConstantsCodeType);
+    EXPECT_EQ(constantValue, translationUnit.specConstantsValues[constantId]);
+}
+
+TEST_F(PisaInputTest, GivenPisaInputWithNonNullEmptySpecializationConstantsWhenBuildingThenSpecConstantsInfoIsNotQueried) {
+    auto neoDevice = this->device->getNEODevice();
+    auto mockCompiler = new MockCompilerInterfaceWithSpecConstants<uint32_t, uint64_t>(0u);
+    neoDevice->getExecutionEnvironment()->rootDeviceEnvironments[neoDevice->getRootDeviceIndex()]->compilerInterface.reset(mockCompiler);
+
+    MockModuleTranslationUnit translationUnit{this->device};
+    translationUnit.processUnpackedBinaryCallBase = false;
+
+    ze_module_constants_t specConstants = {};
+    ASSERT_EQ(0u, specConstants.numConstants);
+
+    translationUnit.buildFromIntermediate(NEO::pisaCodeType, pisaSample.data(), static_cast<uint32_t>(pisaSample.size()), "", "", &specConstants);
+    EXPECT_EQ(0u, mockCompiler->getSpecConstantsInfoCalled);
+    EXPECT_TRUE(translationUnit.specConstantsValues.empty());
+}
+
+HWTEST2_F(ModuleTests, givenKernelExtendedPropertiesStructureWhenKernelPropertiesCalledThenPropertiesAreCorrectlySet, IsAtMostXe3Core) {
+    ze_device_module_properties_t kernelProperties = {};
+    ze_float_atomic_ext_properties_t kernelExtendedProperties = {};
+    kernelExtendedProperties.stype = ZE_STRUCTURE_TYPE_FLOAT_ATOMIC_EXT_PROPERTIES;
+    kernelProperties.pNext = &kernelExtendedProperties;
+    ze_result_t res = device->getKernelProperties(&kernelProperties);
+    EXPECT_EQ(res, ZE_RESULT_SUCCESS);
+
+    const auto &fp16Properties = kernelExtendedProperties.fp16Flags;
+    EXPECT_TRUE(fp16Properties & FpAtomicExtFlags::globalLoadStore);
+    EXPECT_TRUE(fp16Properties & FpAtomicExtFlags::localLoadStore);
+    EXPECT_TRUE(fp16Properties & FpAtomicExtFlags::globalMinMax);
+    EXPECT_TRUE(fp16Properties & FpAtomicExtFlags::localMinMax);
+
+    EXPECT_FALSE(fp16Properties & FpAtomicExtFlags::globalAdd);
+    EXPECT_FALSE(fp16Properties & FpAtomicExtFlags::localAdd);
+
+    const auto &fp32Properties = kernelExtendedProperties.fp32Flags;
+    EXPECT_TRUE(fp32Properties & FpAtomicExtFlags::globalLoadStore);
+    EXPECT_TRUE(fp32Properties & FpAtomicExtFlags::localLoadStore);
+    EXPECT_TRUE(fp32Properties & FpAtomicExtFlags::globalMinMax);
+    EXPECT_TRUE(fp32Properties & FpAtomicExtFlags::localMinMax);
+    EXPECT_TRUE(fp32Properties & FpAtomicExtFlags::globalAdd);
+    EXPECT_TRUE(fp32Properties & FpAtomicExtFlags::localAdd);
+
+    const auto &fp64Properties = kernelExtendedProperties.fp64Flags;
+    EXPECT_TRUE(fp64Properties & FpAtomicExtFlags::globalLoadStore);
+    EXPECT_TRUE(fp64Properties & FpAtomicExtFlags::localLoadStore);
+    EXPECT_TRUE(fp64Properties & FpAtomicExtFlags::globalMinMax);
+    EXPECT_TRUE(fp64Properties & FpAtomicExtFlags::localMinMax);
+    EXPECT_TRUE(fp64Properties & FpAtomicExtFlags::globalAdd);
+    EXPECT_TRUE(fp64Properties & FpAtomicExtFlags::localAdd);
+}
 
 } // namespace ult
 } // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Intel Corporation
+ * Copyright (C) 2022-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,157 +9,331 @@
 #include "shared/source/os_interface/linux/cache_info.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/default_hw_info.h"
-#include "shared/test/common/libult/linux/drm_query_mock.h"
+#include "shared/test/common/libult/linux/drm_mock.h"
+#include "shared/test/common/mocks/linux/mock_ioctl_helper.h"
+#include "shared/test/common/mocks/linux/mock_ioctl_helper_with_capture.h"
 #include "shared/test/common/mocks/mock_execution_environment.h"
 #include "shared/test/common/os_interface/linux/drm_mock_cache_info.h"
+#include "shared/test/common/test_macros/hw_test.h"
 
-#include "gtest/gtest.h"
+#include "clos_matchers.h"
+
+#include <algorithm>
 
 using namespace NEO;
 
-TEST(DrmCacheInfoTest, givenCacheRegionsExistsWhenCallingSetUpCacheInfoThenCacheInfoIsCreatedAndReturnsMaxReservationCacheLimits) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
+struct DrmCacheInfoFixture {
+    static constexpr uint16_t maxNumCacheWays{32};
 
-    auto &gfxCoreHelper = executionEnvironment->rootDeviceEnvironments[0]->getHelper<GfxCoreHelper>();
+    void setUp() {
+        executionEnvironment.reset(new MockExecutionEnvironment{});
+        drm.reset(new DrmMock{*executionEnvironment->rootDeviceEnvironments[0]});
+        ioctlHelper = new MockIoctlHelperWithCapture{*drm};
+        ioctlHelper->closSupported = true;
+        drm->ioctlHelper.reset(ioctlHelper);
 
-    drm.setupCacheInfo(*defaultHwInfo.get());
+        l2CacheParameters.maxSize = 1;
+        l2CacheParameters.maxNumRegions = 1;
+        l2CacheParameters.maxNumWays = 2;
 
-    auto cacheInfo = drm.getCacheInfo();
-    EXPECT_NE(nullptr, cacheInfo);
-
-    if (gfxCoreHelper.getNumCacheRegions() == 0) {
-        EXPECT_EQ(0u, cacheInfo->getMaxReservationCacheSize());
-        EXPECT_EQ(0u, cacheInfo->getMaxReservationNumCacheRegions());
-        EXPECT_EQ(0u, cacheInfo->getMaxReservationNumWays());
-    } else {
-        const GT_SYSTEM_INFO *gtSysInfo = &defaultHwInfo->gtSystemInfo;
-        constexpr uint16_t maxNumWays = 32;
-        constexpr uint16_t globalReservationLimit = 16;
-        constexpr uint16_t clientReservationLimit = 8;
-        constexpr uint16_t maxReservationNumWays = std::min(globalReservationLimit, clientReservationLimit);
-        const size_t totalCacheSize = gtSysInfo->L3CacheSizeInKb * MemoryConstants::kiloByte;
-        const size_t maxReservationCacheSize = (totalCacheSize * maxReservationNumWays) / maxNumWays;
-        const size_t maxReservationNumCacheRegions = gfxCoreHelper.getNumCacheRegions() - 1;
-
-        EXPECT_EQ(maxReservationCacheSize, cacheInfo->getMaxReservationCacheSize());
-        EXPECT_EQ(maxReservationNumCacheRegions, cacheInfo->getMaxReservationNumCacheRegions());
-        EXPECT_EQ(maxReservationNumWays, cacheInfo->getMaxReservationNumWays());
+        l3CacheParameters.maxSize = 32 * MemoryConstants::kiloByte;
+        l3CacheParameters.maxNumRegions = 2;
+        l3CacheParameters.maxNumWays = maxNumCacheWays;
     }
+
+    void tearDown() {
+    }
+
+    std::unique_ptr<MockExecutionEnvironment> executionEnvironment{nullptr};
+    std::unique_ptr<DrmMock> drm{nullptr};
+    MockIoctlHelperWithCapture *ioctlHelper{nullptr};
+    CacheReservationParameters l2CacheParameters{};
+    CacheReservationParameters l3CacheParameters{};
+};
+using DrmCacheInfoTest = Test<DrmCacheInfoFixture>;
+
+HWTEST2_F(DrmCacheInfoTest, givenClosSupportedWhenCallingSetUpCacheInfoThenCacheInfoIsCreatedAndReturnsMaxReservationCacheLimits, IsClosSupported) {
+    const auto &hwInfo = *defaultHwInfo;
+
+    drm->setupCacheInfo(*defaultHwInfo.get());
+
+    auto cacheInfo = drm->getCacheInfo();
+    ASSERT_NE(nullptr, cacheInfo);
+    constexpr auto cacheLevel{CacheLevel::level3};
+
+    const GT_SYSTEM_INFO *gtSysInfo = &defaultHwInfo->gtSystemInfo;
+    constexpr uint16_t maxNumWays = 32;
+    constexpr uint16_t globalReservationLimit = 16;
+    constexpr uint16_t clientReservationLimit = 8;
+    constexpr uint16_t maxReservationNumWays = std::min(globalReservationLimit, clientReservationLimit);
+    const size_t totalCacheSize = gtSysInfo->L3CacheSizeInKb * MemoryConstants::kiloByte;
+    const size_t maxReservationCacheSize = (totalCacheSize * maxReservationNumWays) / maxNumWays;
+    const size_t maxReservationNumCacheRegions = hwInfo.caps.numCacheRegions - 1;
+
+    EXPECT_EQ(maxReservationCacheSize, cacheInfo->getMaxReservationCacheSize(cacheLevel));
+    EXPECT_EQ(maxReservationNumCacheRegions, cacheInfo->getMaxReservationNumCacheRegions(cacheLevel));
+    EXPECT_EQ(maxReservationNumWays, cacheInfo->getMaxReservationNumWays(cacheLevel));
 }
 
-TEST(DrmCacheInfoTest, givenDebugFlagSetWhenCallingSetUpCacheInfoThenCacheInfoIsCreatedWithoutValues) {
+HWTEST2_F(DrmCacheInfoTest, givenClosUnsupportedWhenCallingSetUpCacheInfoThenCacheInfoIsCreatedWithoutReservationLimits, IsClosUnsupported) {
+    drm->setupCacheInfo(*defaultHwInfo.get());
+
+    auto cacheInfo = drm->getCacheInfo();
+    ASSERT_NE(nullptr, cacheInfo);
+    constexpr auto cacheLevel{CacheLevel::level3};
+
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationCacheSize(cacheLevel));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumCacheRegions(cacheLevel));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumWays(cacheLevel));
+}
+
+TEST_F(DrmCacheInfoTest, givenDebugFlagSetWhenCallingSetUpCacheInfoThenCacheInfoIsCreatedWithoutValues) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ClosEnabled.set(0);
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
+    debugManager.flags.ClosEnabled.set(0);
 
-    drm.setupCacheInfo(*defaultHwInfo.get());
-    EXPECT_NE(nullptr, drm.getCacheInfo());
-    auto cacheInfo = drm.getCacheInfo();
+    drm->setupCacheInfo(*defaultHwInfo.get());
+    EXPECT_NE(nullptr, drm->getCacheInfo());
+    auto cacheInfo = drm->getCacheInfo();
 
-    EXPECT_EQ(0u, cacheInfo->getMaxReservationCacheSize());
-    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumCacheRegions());
-    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumWays());
+    constexpr auto cacheLevel3{CacheLevel::level3};
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationCacheSize(cacheLevel3));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumCacheRegions(cacheLevel3));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumWays(cacheLevel3));
+
+    constexpr auto cacheLevel2{CacheLevel::level2};
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationCacheSize(cacheLevel2));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumCacheRegions(cacheLevel2));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumWays(cacheLevel2));
 }
 
-TEST(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionSucceedsToReserveCacheRegionThenReturnTrue) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+HWTEST2_F(DrmCacheInfoTest, givenClosSupportedAndL2ClosNumCacheWaysSetWhenCallingSetUpCacheInfoThenL2CacheInfoIsCreatedAccordingly, IsClosSupported) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.L2ClosNumCacheWays.set(2);
 
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    CacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, 32);
-    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize();
+    drm->setupCacheInfo(*defaultHwInfo.get());
+    auto cacheInfo = drm->getCacheInfo();
+    ASSERT_NE(nullptr, cacheInfo);
 
-    EXPECT_TRUE(cacheInfo.getCacheRegion(cacheReservationSize, CacheRegion::Region1));
-
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.freeCacheRegion(CacheRegion::Region1));
+    constexpr auto cacheLevel2{CacheLevel::level2};
+    EXPECT_EQ(1u, cacheInfo->getMaxReservationCacheSize(cacheLevel2));
+    EXPECT_EQ(1u, cacheInfo->getMaxReservationNumCacheRegions(cacheLevel2));
+    EXPECT_EQ(2u, cacheInfo->getMaxReservationNumWays(cacheLevel2));
 }
 
-TEST(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionFailsToReserveCacheRegionThenReturnFalse) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+HWTEST2_F(DrmCacheInfoTest, givenClosUnsupportedAndL2ClosNumCacheWaysSetWhenCallingSetUpCacheInfoThenL2CacheInfoIsCreatedWithoutReservationLimits, IsClosUnsupported) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.L2ClosNumCacheWays.set(2);
 
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    CacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, 32);
-    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize();
+    drm->setupCacheInfo(*defaultHwInfo.get());
+    auto cacheInfo = drm->getCacheInfo();
+    ASSERT_NE(nullptr, cacheInfo);
 
-    drm.context.closIndex = 0xFFFF;
-    EXPECT_FALSE(cacheInfo.getCacheRegion(cacheReservationSize, CacheRegion::Region1));
-
-    EXPECT_EQ(CacheRegion::None, cacheInfo.freeCacheRegion(CacheRegion::Region1));
+    constexpr auto cacheLevel2{CacheLevel::level2};
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationCacheSize(cacheLevel2));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumCacheRegions(cacheLevel2));
+    EXPECT_EQ(0u, cacheInfo->getMaxReservationNumWays(cacheLevel2));
 }
 
-TEST(DrmCacheInfoTest, givenCacheInfoWithReservedCacheRegionWhenGetCacheRegionIsCalledForReservedCacheRegionThenReturnTrue) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    CacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, 32);
-    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize();
-
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.reserveCacheRegion(cacheReservationSize));
-
-    EXPECT_TRUE(cacheInfo.getCacheRegion(cacheReservationSize, CacheRegion::Region1));
-
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.freeCacheRegion(CacheRegion::Region1));
-}
-
-TEST(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionIsCalledForReservableRegionsWithRegionSizesInverselyProportionalToNumCacheRegionsThenReturnTrue) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
-
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    CacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, 32);
-    size_t regionSize = cacheInfo.getMaxReservationCacheSize() / cacheInfo.getMaxReservationNumCacheRegions();
-
-    EXPECT_TRUE(cacheInfo.getCacheRegion(regionSize, CacheRegion::Region1));
-    EXPECT_TRUE(cacheInfo.getCacheRegion(regionSize, CacheRegion::Region2));
-
-    EXPECT_EQ(CacheRegion::Region2, cacheInfo.freeCacheRegion(CacheRegion::Region2));
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.freeCacheRegion(CacheRegion::Region1));
-}
-
-TEST(DrmCacheInfoTest, givenCacheInfoWhenSpecificNumCacheWaysIsRequestedThenReserveAppropriateCacheSize) {
-    constexpr uint16_t maxNumCacheWays = 32;
+HWTEST2_F(DrmCacheInfoTest, givenClosSupportedAndForceStaticL2ClosReservationWhenCallingSetUpCacheInfoThenL2CacheRegionIsReserved, IsClosSupported) {
+    constexpr auto staticL2CacheReservationSize{1U};
+    constexpr auto staticL2CacheNumWays{2U};
 
     DebugManagerStateRestore restorer;
-    DebugManager.flags.ClosNumCacheWays.set(maxNumCacheWays / 2);
+    debugManager.flags.ForceStaticL2ClosReservation.set(true);
 
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+    auto mockIoctlHelper{new MockIoctlHelper{*drm}};
+    drm->ioctlHelper.reset(mockIoctlHelper);
 
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    MockCacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, maxNumCacheWays);
-    size_t maxReservationCacheSize = cacheInfo.getMaxReservationCacheSize();
+    mockIoctlHelper->closAllocResult = CacheRegion::region3;
+    mockIoctlHelper->closAllocWaysResult = staticL2CacheNumWays;
 
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.reserveCacheRegion(maxReservationCacheSize));
-    EXPECT_TRUE(cacheInfo.isRegionReserved(CacheRegion::Region1, maxReservationCacheSize));
+    drm->setupCacheInfo(*defaultHwInfo.get());
+    ASSERT_NE(nullptr, drm->getCacheInfo());
 
-    auto cacheRegion = cacheInfo.cacheRegionsReserved.begin();
-    EXPECT_EQ(CacheRegion::Region1, cacheRegion->first);
-    EXPECT_EQ(maxReservationCacheSize / 2, cacheRegion->second);
-
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.freeCacheRegion(CacheRegion::Region1));
+    auto *mockCacheInfo{static_cast<MockCacheInfo *>(drm->getCacheInfo())};
+    EXPECT_TRUE(mockCacheInfo->isRegionReserved(CacheRegion::region3, staticL2CacheReservationSize));
 }
 
-TEST(DrmCacheInfoTest, givenCacheInfoWhenNumCacheWaysIsExceededThenDontReserveCacheRegion) {
-    constexpr uint16_t maxNumCacheWays = 32;
+HWTEST2_F(DrmCacheInfoTest, givenClosUnsupportedAndForceStaticL2ClosReservationWhenCallingSetUpCacheInfoThenL2CacheRegionIsNotReserved, IsClosUnsupported) {
+    constexpr auto staticL2CacheReservationSize{1U};
+    constexpr auto staticL2CacheNumWays{2U};
 
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ForceStaticL2ClosReservation.set(true);
 
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    MockCacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, maxNumCacheWays);
-    size_t maxReservationCacheSize = cacheInfo.getMaxReservationCacheSize();
+    auto mockIoctlHelper{new MockIoctlHelper{*drm}};
+    drm->ioctlHelper.reset(mockIoctlHelper);
 
-    EXPECT_EQ(CacheRegion::Region1, cacheInfo.reserveCacheRegion(maxReservationCacheSize));
-    EXPECT_TRUE(cacheInfo.isRegionReserved(CacheRegion::Region1, maxReservationCacheSize));
+    mockIoctlHelper->closAllocResult = CacheRegion::region3;
+    mockIoctlHelper->closAllocWaysResult = staticL2CacheNumWays;
 
-    EXPECT_EQ(CacheRegion::None, cacheInfo.reserveCacheRegion(maxReservationCacheSize));
-    EXPECT_FALSE(cacheInfo.isRegionReserved(CacheRegion::Region2, maxReservationCacheSize));
+    drm->setupCacheInfo(*defaultHwInfo.get());
+    ASSERT_NE(nullptr, drm->getCacheInfo());
+
+    auto *mockCacheInfo{static_cast<MockCacheInfo *>(drm->getCacheInfo())};
+    EXPECT_FALSE(mockCacheInfo->isRegionReserved(CacheRegion::region3, staticL2CacheReservationSize));
 }
 
-TEST(DrmCacheInfoTest, givenCacheInfoCreatedWhenFreeCacheRegionIsCalledForNonReservedRegionThenItFails) {
-    auto executionEnvironment = std::make_unique<MockExecutionEnvironment>();
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionSucceedsToReserveL3CacheRegionThenReturnTrue) {
+    CacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
 
-    DrmQueryMock drm(*executionEnvironment->rootDeviceEnvironments[0]);
-    MockCacheInfo cacheInfo(drm, 32 * MemoryConstants::kiloByte, 2, 32);
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize(cacheLevel);
 
-    cacheInfo.cacheRegionsReserved.insert({CacheRegion::Region1, MemoryConstants::kiloByte});
-    EXPECT_EQ(CacheRegion::None, cacheInfo.freeCacheRegion(CacheRegion::Region1));
+    EXPECT_TRUE(cacheInfo.getCacheRegion(cacheReservationSize, CacheRegion::region1));
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region1));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionFailsToReserveCacheRegionThenReturnFalse) {
+    CacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize(cacheLevel);
+
+    ioctlHelper->closIndex = 0xFFFF;
+    EXPECT_FALSE(cacheInfo.getCacheRegion(cacheReservationSize, CacheRegion::region1));
+    EXPECT_EQ(CacheRegion::none, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region1));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoWithAnyLimitParameterEqualToZeroWhenReservationIsTriedThenCacheRegionNoneIsReturned) {
+    MockCacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize(cacheLevel);
+
+    const auto maxSizeOrig = cacheInfo.l3ReservationLimits.maxSize;
+    cacheInfo.l3ReservationLimits.maxSize = 0;
+    EXPECT_EQ(CacheRegion::none, cacheInfo.reserveCacheRegion(cacheLevel, cacheReservationSize));
+    cacheInfo.l3ReservationLimits.maxSize = maxSizeOrig;
+
+    const auto maxNumWaysOrig = cacheInfo.l3ReservationLimits.maxNumWays;
+    cacheInfo.l3ReservationLimits.maxNumWays = 0;
+    EXPECT_EQ(CacheRegion::none, cacheInfo.reserveCacheRegion(cacheLevel, cacheReservationSize));
+    cacheInfo.l3ReservationLimits.maxNumWays = maxNumWaysOrig;
+
+    const auto maxNumRegionsOrig = cacheInfo.l3ReservationLimits.maxNumRegions;
+    cacheInfo.l3ReservationLimits.maxNumRegions = 0;
+    EXPECT_EQ(CacheRegion::none, cacheInfo.reserveCacheRegion(cacheLevel, cacheReservationSize));
+    cacheInfo.l3ReservationLimits.maxNumRegions = maxNumRegionsOrig;
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoWithReservedCacheRegionWhenGetCacheRegionIsCalledForReservedCacheRegionThenReturnTrue) {
+    CacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t cacheReservationSize = cacheInfo.getMaxReservationCacheSize(cacheLevel);
+
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.reserveCacheRegion(cacheLevel, cacheReservationSize));
+    EXPECT_TRUE(cacheInfo.getCacheRegion(cacheReservationSize, CacheRegion::region1));
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region1));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionIsCalledForReservableRegionsWithRegionSizesInverselyProportionalToNumCacheRegionsThenReturnTrue) {
+    CacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t regionSize = cacheInfo.getMaxReservationCacheSize(cacheLevel) / cacheInfo.getMaxReservationNumCacheRegions(cacheLevel);
+
+    EXPECT_TRUE(cacheInfo.getCacheRegion(regionSize, CacheRegion::region1));
+    EXPECT_TRUE(cacheInfo.getCacheRegion(regionSize, CacheRegion::region2));
+
+    EXPECT_EQ(CacheRegion::region2, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region2));
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region1));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoWhenSpecificNumCacheWaysIsRequestedThenReserveAppropriateCacheSize) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.ClosNumCacheWays.set(maxNumCacheWays / 2);
+
+    MockCacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t maxReservationCacheSize = cacheInfo.getMaxReservationCacheSize(cacheLevel);
+
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.reserveCacheRegion(cacheLevel, maxReservationCacheSize));
+    EXPECT_TRUE(cacheInfo.isRegionReserved(CacheRegion::region1, maxReservationCacheSize));
+
+    auto expectedRegionSize = cacheInfo.reservedCacheRegionsSize[toUnderlying(CacheRegion::region1)];
+    EXPECT_EQ(maxReservationCacheSize / 2, expectedRegionSize);
+
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region1));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoWhenNumCacheWaysIsExceededThenDontReserveCacheRegion) {
+    MockCacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    size_t maxReservationCacheSize = cacheInfo.getMaxReservationCacheSize(cacheLevel);
+
+    EXPECT_EQ(CacheRegion::region1, cacheInfo.reserveCacheRegion(cacheLevel, maxReservationCacheSize));
+    EXPECT_TRUE(cacheInfo.isRegionReserved(CacheRegion::region1, maxReservationCacheSize));
+
+    EXPECT_EQ(CacheRegion::none, cacheInfo.reserveCacheRegion(cacheLevel, maxReservationCacheSize));
+    EXPECT_FALSE(cacheInfo.isRegionReserved(CacheRegion::region2, maxReservationCacheSize));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenFreeCacheRegionIsCalledForNonReservedRegionThenItFails) {
+    MockCacheInfo cacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters);
+
+    constexpr auto cacheLevel{CacheLevel::level3};
+    cacheInfo.reservedCacheRegionsSize[toUnderlying(CacheRegion::region1)] = MemoryConstants::kiloByte;
+    EXPECT_EQ(CacheRegion::none, cacheInfo.freeCacheRegion(cacheLevel, CacheRegion::region1));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenPassingRegionIndexThenCorrectCacheLevelReturned) {
+    auto *cacheInfo{new MockCacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters)};
+    drm->cacheInfo.reset(cacheInfo);
+
+    EXPECT_EQ(CacheLevel::level3, cacheInfo->getLevelForRegion(CacheRegion::region1));
+    EXPECT_EQ(CacheLevel::level3, cacheInfo->getLevelForRegion(CacheRegion::region2));
+    EXPECT_EQ(CacheLevel::level2, cacheInfo->getLevelForRegion(CacheRegion::region3));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenAnyLevelLimitIsZeroThenNoRegionCanBeReserved) {
+    constexpr auto anyNonZeroValue{42U};
+
+    auto *cacheInfo{new MockCacheInfo(*drm->getIoctlHelper(), l2CacheParameters, l3CacheParameters)};
+    drm->cacheInfo.reset(cacheInfo);
+
+    l2CacheParameters.maxSize = 0U;
+    EXPECT_EQ(CacheRegion::none, cacheInfo->reserveCacheRegion(CacheLevel::level2, anyNonZeroValue));
+    EXPECT_FALSE(cacheInfo->isRegionReserved(CacheRegion::region3, anyNonZeroValue));
+
+    l2CacheParameters.maxSize = anyNonZeroValue;
+    l2CacheParameters.maxNumWays = 0U;
+    EXPECT_EQ(CacheRegion::none, cacheInfo->reserveCacheRegion(CacheLevel::level2, anyNonZeroValue));
+    EXPECT_FALSE(cacheInfo->isRegionReserved(CacheRegion::region3, anyNonZeroValue));
+
+    l2CacheParameters.maxNumWays = anyNonZeroValue;
+    l2CacheParameters.maxNumRegions = 0U;
+    EXPECT_EQ(CacheRegion::none, cacheInfo->reserveCacheRegion(CacheLevel::level2, anyNonZeroValue));
+    EXPECT_FALSE(cacheInfo->isRegionReserved(CacheRegion::region3, anyNonZeroValue));
+}
+
+TEST_F(DrmCacheInfoTest, givenCacheInfoCreatedWhenGetCacheRegionSucceedsToReserveL2CacheRegionThenReturnTrue) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.L2ClosNumCacheWays.set(2);
+
+    MockIoctlHelper ioctlHelper{*drm};
+    auto *cacheInfo{new MockCacheInfo(ioctlHelper, l2CacheParameters, l3CacheParameters)};
+    drm->cacheInfo.reset(cacheInfo);
+
+    constexpr auto cacheLevel{CacheLevel::level2};
+    size_t cacheReservationSize = cacheInfo->getMaxReservationCacheSize(cacheLevel);
+
+    ioctlHelper.closAllocResult = CacheRegion::region3;
+    ioctlHelper.closAllocWaysResult = l2CacheParameters.maxNumWays;
+
+    EXPECT_TRUE(cacheInfo->getCacheRegion(cacheReservationSize, CacheRegion::region3));
+    EXPECT_EQ(cacheInfo->reservedCacheRegionsSize[toUnderlying(CacheRegion::region3)], cacheReservationSize);
+    EXPECT_EQ(ioctlHelper.closAllocWaysCalled, 1U);
+
+    ioctlHelper.closFreeResult = CacheRegion::region3;
+    EXPECT_EQ(cacheInfo->freeCacheRegion(cacheLevel, CacheRegion::region3), CacheRegion::region3);
+    EXPECT_EQ(cacheInfo->reservedCacheRegionsSize[toUnderlying(CacheRegion::region3)], 0U);
+    EXPECT_EQ(cacheInfo->freeCacheRegion(cacheLevel, CacheRegion::region3), CacheRegion::none);
+
+    EXPECT_EQ(ioctlHelper.closAllocCalled, 1U);
+    EXPECT_EQ(ioctlHelper.closAllocWaysCalled, 2U);
+    EXPECT_EQ(ioctlHelper.closFreeCalled, 1U);
 }

@@ -1,11 +1,9 @@
 /*
- * Copyright (C) 2022-2023 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
-
-#pragma once
 
 #include "shared/source/helpers/compiler_product_helper.h"
 
@@ -17,12 +15,27 @@ bool CompilerProductHelperHw<gfxProduct>::isForceToStatelessRequired() const {
 }
 
 template <PRODUCT_FAMILY gfxProduct>
+bool CompilerProductHelperHw<gfxProduct>::isMatrixMultiplyAccumulateTF32Supported(const HardwareInfo &hwInfo) const {
+    return false;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
 bool CompilerProductHelperHw<gfxProduct>::isSubgroupNamedBarrierSupported() const {
     return false;
 }
 
 template <PRODUCT_FAMILY gfxProduct>
 bool CompilerProductHelperHw<gfxProduct>::isSubgroupExtendedBlockReadSupported() const {
+    return false;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool CompilerProductHelperHw<gfxProduct>::isSubgroup2DBlockIOSupported() const {
+    return false;
+}
+
+template <PRODUCT_FAMILY gfxProduct>
+bool CompilerProductHelperHw<gfxProduct>::isSubgroupBufferPrefetchSupported() const {
     return false;
 }
 

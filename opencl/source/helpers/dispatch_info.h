@@ -1,16 +1,17 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 #include "shared/source/helpers/registered_method_dispatcher.h"
 #include "shared/source/helpers/vec.h"
 #include "shared/source/utilities/stackvec.h"
 
-#include "opencl/source/built_ins/builtins_dispatch_builder.h"
+#include "opencl/source/built_ins/builtin_op_params.h"
 #include "opencl/source/kernel/kernel_objects_for_aux_translation.h"
 
 #include <algorithm>
@@ -18,10 +19,11 @@
 
 namespace NEO {
 class LinearStream;
-
 class Kernel;
 class ClDevice;
 struct TimestampPacketDependencies;
+class MemObj;
+struct RootDeviceEnvironment;
 
 class DispatchInfo {
 
@@ -39,8 +41,7 @@ class DispatchInfo {
     void setClDevice(ClDevice *device) { pClDevice = device; }
     bool usesSlm() const;
     bool usesStatelessPrintfSurface() const;
-    uint32_t getRequiredScratchSize() const;
-    uint32_t getRequiredPrivateScratchSize() const;
+    uint32_t getRequiredScratchSize(uint32_t slotId) const;
     void setKernel(Kernel *kernel) { this->kernel = kernel; }
     Kernel *getKernel() const { return kernel; }
     uint32_t getDim() const { return dim; }
@@ -83,15 +84,12 @@ class DispatchInfo {
     Vec3<size_t> swgs{0, 0, 0};   // start of work groups
 };
 
-struct MultiDispatchInfo {
+struct MultiDispatchInfo : NEO::NonCopyableAndNonMovableClass {
     ~MultiDispatchInfo();
 
     explicit MultiDispatchInfo(Kernel *mainKernel) : mainKernel(mainKernel) {}
-    explicit MultiDispatchInfo(const BuiltinOpParams &operationParams) : builtinOpParams(operationParams) {}
+    explicit MultiDispatchInfo(const BuiltIn::OpParams &operationParams) : builtinOpParams(operationParams) {}
     MultiDispatchInfo() = default;
-
-    MultiDispatchInfo &operator=(const MultiDispatchInfo &) = delete;
-    MultiDispatchInfo(const MultiDispatchInfo &) = delete;
 
     bool empty() const {
         return dispatchInfos.size() == 0;
@@ -115,18 +113,10 @@ struct MultiDispatchInfo {
         return false;
     }
 
-    uint32_t getRequiredScratchSize() const {
+    uint32_t getRequiredScratchSize(uint32_t slotId) const {
         uint32_t ret = 0;
         for (const auto &dispatchInfo : dispatchInfos) {
-            ret = std::max(ret, dispatchInfo.getRequiredScratchSize());
-        }
-        return ret;
-    }
-
-    uint32_t getRequiredPrivateScratchSize() const {
-        uint32_t ret = 0;
-        for (const auto &dispatchInfo : dispatchInfos) {
-            ret = std::max(ret, dispatchInfo.getRequiredPrivateScratchSize());
+            ret = std::max(ret, dispatchInfo.getRequiredScratchSize(slotId));
         }
         return ret;
     }
@@ -181,11 +171,11 @@ struct MultiDispatchInfo {
 
     Kernel *peekMainKernel() const;
 
-    void setBuiltinOpParams(const BuiltinOpParams &builtinOpParams) {
+    void setBuiltinOpParams(const BuiltIn::OpParams &builtinOpParams) {
         this->builtinOpParams = builtinOpParams;
     }
 
-    const BuiltinOpParams &peekBuiltinOpParams() const {
+    const BuiltIn::OpParams &peekBuiltinOpParams() const {
         return builtinOpParams;
     }
 
@@ -198,10 +188,13 @@ struct MultiDispatchInfo {
     }
 
   protected:
-    BuiltinOpParams builtinOpParams = {};
+    BuiltIn::OpParams builtinOpParams = {};
     StackVec<DispatchInfo, 9> dispatchInfos;
     StackVec<MemObj *, 2> redescribedSurfaces;
     std::unique_ptr<const KernelObjsForAuxTranslation> kernelObjsForAuxTranslation;
     Kernel *mainKernel = nullptr;
 };
+
+static_assert(NEO::NonCopyableAndNonMovable<MultiDispatchInfo>);
+
 } // namespace NEO

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,14 +9,13 @@
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/variable_backup.h"
-#include "shared/test/common/test_macros/test.h"
+#include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
 #include "opencl/source/context/context.h"
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
 #include "opencl/test/unit_test/mocks/mock_cl_device.h"
 #include "opencl/test/unit_test/mocks/mock_context.h"
-#include "opencl/test/unit_test/mocks/ult_cl_device_factory.h"
+#include "opencl/test/unit_test/mocks/ult_cl_device_factory_with_platform.h"
 
 #include "gtest/gtest.h"
 
@@ -28,8 +27,8 @@ TEST(ContextMultiDevice, GivenSingleDeviceWhenCreatingContextThenContextIsCreate
     auto numDevices = static_cast<cl_uint>(arrayCount(devices));
 
     auto retVal = CL_SUCCESS;
-    auto pContext = Context::create<Context>(nullptr, ClDeviceVector(devices, numDevices),
-                                             nullptr, nullptr, retVal);
+    auto pContext = Context::create<MockContext>(nullptr, ClDeviceVector(devices, numDevices),
+                                                 nullptr, nullptr, retVal);
     ASSERT_NE(nullptr, pContext);
 
     auto numDevicesReturned = pContext->getNumDevices();
@@ -52,39 +51,19 @@ TEST(ContextMultiDevice, GivenSingleDeviceWhenCreatingContextThenContextIsCreate
 }
 
 TEST(ContextMultiDevice, GivenMultipleDevicesWhenCreatingContextThenContextIsCreatedForEachDevice) {
-    cl_device_id devices[] = {
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)},
-        new MockClDevice{MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)}};
-    auto numDevices = static_cast<cl_uint>(arrayCount(devices));
-    ASSERT_EQ(8u, numDevices); // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
+    constexpr cl_uint numDevices = 2u;
+    UltClDeviceFactory deviceFactory{numDevices, 0};
+    cl_device_id devices[] = {deviceFactory.rootDevices[0], deviceFactory.rootDevices[1]};
 
     auto retVal = CL_SUCCESS;
-    auto pContext = Context::create<Context>(nullptr, ClDeviceVector(devices, numDevices),
-                                             nullptr, nullptr, retVal);
+    auto pContext = clUniquePtr(Context::create<MockContext>(nullptr, ClDeviceVector(devices, numDevices), nullptr, nullptr, retVal));
     ASSERT_NE(nullptr, pContext);
 
     auto numDevicesReturned = pContext->getNumDevices();
     EXPECT_EQ(numDevices, numDevicesReturned);
 
-    ClDeviceVector ctxDevices;
     for (size_t deviceOrdinal = 0; deviceOrdinal < numDevicesReturned; ++deviceOrdinal) {
-        ctxDevices.push_back(pContext->getDevice(deviceOrdinal));
-    }
-
-    delete pContext;
-
-    for (size_t deviceOrdinal = 0; deviceOrdinal < numDevicesReturned; ++deviceOrdinal) {
-        auto pDevice = (ClDevice *)devices[deviceOrdinal];
-        ASSERT_NE(nullptr, pDevice);
-
-        EXPECT_EQ(pDevice, ctxDevices[deviceOrdinal]);
-        delete pDevice;
+        EXPECT_EQ(deviceFactory.rootDevices[deviceOrdinal], pContext->getDevice(deviceOrdinal));
     }
 }
 
@@ -93,7 +72,7 @@ TEST(ContextMultiDevice, WhenGettingSubDeviceByIndexFromContextThenCorrectDevice
     VariableBackup<bool> createSingleDeviceBackup{&MockDevice::createSingleDevice, false};
     VariableBackup<decltype(DeviceFactory::createRootDeviceFunc)> createRootDeviceFuncBackup{&DeviceFactory::createRootDeviceFunc};
 
-    DebugManager.flags.CreateMultipleSubDevices.set(2);
+    debugManager.flags.CreateMultipleSubDevices.set(2);
     createRootDeviceFuncBackup = [](ExecutionEnvironment &executionEnvironment, uint32_t rootDeviceIndex) -> std::unique_ptr<Device> {
         return std::unique_ptr<Device>(MockDevice::create<MockDevice>(&executionEnvironment, rootDeviceIndex));
     };
@@ -113,16 +92,16 @@ TEST(ContextMultiDevice, WhenGettingSubDeviceByIndexFromContextThenCorrectDevice
     allDevices[2] = onlySubDevices[1] = pSubDevice1;
 
     cl_int retVal;
-    auto pContextWithAllDevices = std::unique_ptr<Context>(Context::create<Context>(nullptr, ClDeviceVector(allDevices, 3),
-                                                                                    nullptr, nullptr, retVal));
+    auto pContextWithAllDevices = std::unique_ptr<Context>(Context::create<MockContext>(nullptr, ClDeviceVector(allDevices, 3),
+                                                                                        nullptr, nullptr, retVal));
     EXPECT_NE(nullptr, pContextWithAllDevices);
 
-    auto pContextWithRootDevices = std::unique_ptr<Context>(Context::create<Context>(nullptr, ClDeviceVector(onlyRootDevices, 1),
-                                                                                     nullptr, nullptr, retVal));
+    auto pContextWithRootDevices = std::unique_ptr<Context>(Context::create<MockContext>(nullptr, ClDeviceVector(onlyRootDevices, 1),
+                                                                                         nullptr, nullptr, retVal));
     EXPECT_NE(nullptr, pContextWithRootDevices);
 
-    auto pContextWithSubDevices = std::unique_ptr<Context>(Context::create<Context>(nullptr, ClDeviceVector(onlySubDevices, 2),
-                                                                                    nullptr, nullptr, retVal));
+    auto pContextWithSubDevices = std::unique_ptr<Context>(Context::create<MockContext>(nullptr, ClDeviceVector(onlySubDevices, 2),
+                                                                                        nullptr, nullptr, retVal));
     EXPECT_NE(nullptr, pContextWithSubDevices);
 
     EXPECT_EQ(pSubDevice0, pContextWithAllDevices->getSubDeviceByIndex(0));
@@ -135,7 +114,7 @@ TEST(ContextMultiDevice, WhenGettingSubDeviceByIndexFromContextThenCorrectDevice
 }
 
 TEST(ContextMultiDevice, givenContextWithNonDefaultContextTypeWhenSetupContextTypeThenDoNothing) {
-    UltClDeviceFactory deviceFactory{1, 2};
+    UltClDeviceFactoryWithPlatform deviceFactory{1, 2};
 
     MockContext context0(deviceFactory.rootDevices[0]);
     context0.contextType = ContextType::CONTEXT_TYPE_DEFAULT;
@@ -164,7 +143,7 @@ TEST(ContextMultiDevice, givenContextWithNonDefaultContextTypeWhenSetupContextTy
 }
 
 TEST(ContextMultiDevice, givenRootDeviceWhenCreatingContextThenItHasDefaultType) {
-    UltClDeviceFactory deviceFactory{1, 2};
+    UltClDeviceFactoryWithPlatform deviceFactory{1, 2};
     cl_int retVal = CL_INVALID_CONTEXT;
     cl_device_id device = deviceFactory.rootDevices[0];
 
@@ -175,7 +154,7 @@ TEST(ContextMultiDevice, givenRootDeviceWhenCreatingContextThenItHasDefaultType)
 }
 
 TEST(ContextMultiDevice, givenSubsetOfSubdevicesWhenCreatingContextThenItHasSpecializedType) {
-    UltClDeviceFactory deviceFactory{1, 2};
+    UltClDeviceFactoryWithPlatform deviceFactory{1, 2};
     cl_int retVal = CL_INVALID_CONTEXT;
     cl_device_id firstSubDevice = deviceFactory.subDevices[0];
     cl_device_id secondSubDevice = deviceFactory.subDevices[1];
@@ -200,7 +179,7 @@ TEST(ContextMultiDevice, givenSubsetOfSubdevicesWhenCreatingContextThenItHasSpec
 }
 
 TEST(ContextMultiDevice, givenRootDeviceAndSubsetOfSubdevicesWhenCreatingContextThenItHasUnrestrictiveType) {
-    UltClDeviceFactory deviceFactory{1, 2};
+    UltClDeviceFactoryWithPlatform deviceFactory{1, 2};
     cl_int retVal = CL_INVALID_CONTEXT;
     cl_device_id rootDeviceAndFirstSubDevice[]{deviceFactory.subDevices[0], deviceFactory.rootDevices[0]};
     cl_device_id rootDeviceAndSecondSubDevice[]{deviceFactory.subDevices[1], deviceFactory.rootDevices[0]};

@@ -1,0 +1,18 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/test/common/test_macros/test_excludes.h"
+using namespace NEO;
+
+namespace L0 {
+namespace ult {
+HWTEST_EXCLUDE_PRODUCT(L0DebuggerGlobalStatelessTest, givenGlobalStatelessWhenCmdListExecutedOnQueueThenQueueDispatchesSurfaceStateOnceToGlobalStatelessHeap_IsAtLeastXeCore, IGFX_XE3P_CORE);
+HWTEST_EXCLUDE_PRODUCT(CommandQueueExecuteCommandListSWTagsTests, givenEnableSWTagsAndCommandListWithDifferentPreemtpionWhenExecutingCommandListThenPipeControlReasonTagIsInserted, IGFX_XE3P_CORE);
+HWTEST_EXCLUDE_PRODUCT(CommandListCreate, givenPlatformSupportsHdcUntypedCacheFlushWhenAppendWriteGlobalTimestampThenExpectNoCacheFlushInPostSyncCommand_IsSbaRequiredAndAtLeastXeCore, IGFX_XE3P_CORE);
+
+} // namespace ult
+} // namespace L0

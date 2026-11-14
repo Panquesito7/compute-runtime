@@ -1,0 +1,253 @@
+/*
+ * Copyright (C) 2025-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "level_zero/core/source/cmdlist/cmdlist_signal_event_parameters.h"
+#include "level_zero/core/source/helpers/api_handle_helper.h"
+#include "level_zero/core/source/mutable_cmdlist/mutable_interface_types.h"
+#include <level_zero/ze_api.h>
+
+namespace NEO {
+class GraphicsAllocation;
+class InOrderExecInfo;
+enum class EngineGroupType : uint32_t;
+enum class MiPredicateType : uint32_t;
+} // namespace NEO
+namespace L0 {
+struct Device;
+struct CommandList;
+struct Kernel;
+struct Event;
+struct CmdListHostFunctionParameters;
+struct CmdListKernelLaunchParams;
+struct CmdListMemoryCopyParams;
+struct CmdListWaitEventParameters;
+
+namespace MCL {
+struct InterfaceLabelDescriptor;
+struct InterfaceVariableDescriptor;
+struct Label;
+struct MutableComputeWalker;
+class MutableIndirectData;
+struct Variable;
+
+enum MclAluReg : uint32_t {
+    mclAluRegGpr0 = 0,
+    mclAluRegGpr0_1 = 1,
+    mclAluRegGpr1 = 2,
+    mclAluRegGpr1_1 = 3,
+    mclAluRegGpr2 = 4,
+    mclAluRegGpr2_1 = 5,
+    mclAluRegGpr3 = 6,
+    mclAluRegGpr3_1 = 7,
+    mclAluRegGpr4 = 8,
+    mclAluRegGpr4_1 = 9,
+    mclAluRegGpr5 = 10,
+    mclAluRegGpr5_1 = 11,
+    mclAluRegGpr6 = 12,
+    mclAluRegGpr6_1 = 13,
+    mclAluRegGpr7 = 14,
+    mclAluRegGpr7_1 = 15,
+    mclAluRegGpr8 = 16,
+    mclAluRegGpr8_1 = 17,
+    mclAluRegGpr9 = 18,
+    mclAluRegGpr9_1 = 19,
+    mclAluRegGpr10 = 20,
+    mclAluRegGpr10_1 = 21,
+    mclAluRegGpr11 = 22,
+    mclAluRegGpr11_1 = 23,
+    mclAluRegGpr12 = 24,
+    mclAluRegGpr12_1 = 25,
+    mclAluRegGpr13 = 26,
+    mclAluRegGpr13_1 = 27,
+    mclAluRegGpr14 = 28,
+    mclAluRegGpr14_1 = 29,
+    mclAluRegGpr15 = 30,
+    mclAluRegGpr15_1 = 31,
+    mclAluRegGprMax = 32,
+    mclAluRegPredicate1 = 33,
+    mclAluRegRegMax = 36,
+    mclAluRegConst0 = 37,
+    mclAluRegConst1 = 38,
+    mclAluRegNone = 39,
+    mclAluRegPredicate2 = 40,
+    mclAluRegPredicateResult = 41,
+    mclAluRegMax = 42
+};
+
+struct InterfaceOperandDescriptor {
+    enum Flags : uint32_t {
+        usesVariable = BIT(0),
+        jumpOnClear = BIT(1)
+    };
+
+    void *memory = nullptr;
+    size_t offset = 0;
+    uint32_t size = 0;
+    uint32_t flags = 0;
+};
+
+struct MutableCommandList {
+    template <typename Type>
+    struct Allocator {
+        static MutableCommandList *allocate(uint32_t numIddsPerBlock) { return new Type(numIddsPerBlock); }
+    };
+
+    static CommandList *create(Device *device, NEO::EngineGroupType engineGroupType,
+                               ze_command_list_flags_t flags, ze_result_t &resultValue, bool useInternalEngineType) {
+        return create(device, engineGroupType, flags, resultValue, useInternalEngineType, 0u);
+    }
+    static CommandList *create(Device *device, NEO::EngineGroupType engineGroupType,
+                               ze_command_list_flags_t flags, ze_result_t &resultValue, bool useInternalEngineType, uint32_t estimatedNumberOfCommands);
+    virtual ze_result_t initialize(Device *device, NEO::EngineGroupType engineGroupType, ze_command_list_flags_t flags) = 0;
+    virtual ~MutableCommandList() = 0;
+
+    static MutableCommandList *fromHandle(ze_command_list_handle_t handle);
+    virtual ze_command_list_handle_t toHandle() = 0;
+    virtual CommandList *getBase() = 0;
+
+    virtual ze_result_t appendLaunchKernel(ze_kernel_handle_t kernelHandle,
+                                           const ze_group_count_t &threadGroupDimensions,
+                                           ze_event_handle_t hEvent, uint32_t numWaitEvents,
+                                           ze_event_handle_t *phWaitEvents,
+                                           CmdListKernelLaunchParams &launchParams) = 0;
+    virtual ze_result_t appendLaunchKernelWithParams(Kernel *kernel,
+                                                     const ze_group_count_t &threadGroupDimensions,
+                                                     Event *event,
+                                                     CmdListKernelLaunchParams &launchParams) = 0;
+    virtual ze_result_t appendVariableLaunchKernel(Kernel *kernel,
+                                                   Variable *groupCount,
+                                                   Event *signalEvent,
+                                                   uint32_t numWaitEvents,
+                                                   ze_event_handle_t *waitEvents) = 0;
+    virtual ze_result_t close() = 0;
+    virtual ze_result_t reset() = 0;
+    virtual ze_result_t appendSetPredicate(NEO::MiPredicateType predicateType) = 0;
+    virtual ze_result_t appendJump(Label *label, const InterfaceOperandDescriptor *condition) = 0;
+    virtual ze_result_t appendMILoadRegVariable(MclAluReg reg, Variable *variable) = 0;
+    virtual ze_result_t appendMIStoreRegVariable(MclAluReg reg, Variable *variable) = 0;
+    virtual ze_result_t appendMILoadRegImm(MclAluReg reg, uint32_t value) = 0;
+    virtual ze_result_t appendMILoadRegReg(MclAluReg dstReg, MclAluReg srcReg) = 0;
+    virtual ze_result_t appendMILoadRegMem(MclAluReg reg, uint64_t address) = 0;
+    virtual ze_result_t appendMIStoreRegMem(MclAluReg reg, uint64_t address) = 0;
+    virtual ze_result_t appendMIMath(void *aluArray, size_t aluCount) = 0;
+
+    virtual ze_result_t appendBarrier(ze_event_handle_t hSignalEvent, uint32_t numWaitEvents,
+                                      ze_event_handle_t *phWaitEvents,
+                                      CmdListWaitEventParameters &waitEventsParameters, CmdListSignalEventParameters &signalEventParameters) = 0;
+    virtual ze_result_t appendMemoryRangesBarrier(uint32_t numRanges, const size_t *pRangeSizes,
+                                                  const void **pRanges,
+                                                  ze_event_handle_t hSignalEvent,
+                                                  uint32_t numWaitEvents,
+                                                  ze_event_handle_t *phWaitEvents,
+                                                  CmdListWaitEventParameters &waitEventParams) = 0;
+    virtual ze_result_t appendImageCopyFromMemoryExt(ze_image_handle_t hDstImage, const void *srcptr,
+                                                     const ze_image_region_t *pDstRegion,
+                                                     uint32_t srcRowPitch, uint32_t srcSlicePitch,
+                                                     ze_event_handle_t hEvent, uint32_t numWaitEvents,
+                                                     ze_event_handle_t *phWaitEvents, CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendImageCopyToMemoryExt(void *dstptr, ze_image_handle_t hSrcImage,
+                                                   const ze_image_region_t *pSrcRegion,
+                                                   uint32_t destRowPitch, uint32_t destSlicePitch,
+                                                   ze_event_handle_t hEvent, uint32_t numWaitEvents,
+                                                   ze_event_handle_t *phWaitEvents, CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendImageCopyRegion(ze_image_handle_t hDstImage, ze_image_handle_t hSrcImage,
+                                              const ze_image_region_t *pDstRegion, const ze_image_region_t *pSrcRegion,
+                                              ze_event_handle_t hSignalEvent, uint32_t numWaitEvents,
+                                              ze_event_handle_t *phWaitEvents, CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendMemoryCopy(void *dstptr, const void *srcptr, size_t size,
+                                         ze_event_handle_t hSignalEvent, uint32_t numWaitEvents,
+                                         ze_event_handle_t *phWaitEvents, CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendMemoryCopyFromContext(void *dstptr, ze_context_handle_t hContextSrc,
+                                                    const void *srcptr, size_t size, ze_event_handle_t hSignalEvent,
+                                                    uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                                    CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendMemoryCopyRegion(void *dstPtr,
+                                               const ze_copy_region_t *dstRegion,
+                                               uint32_t dstPitch,
+                                               uint32_t dstSlicePitch,
+                                               const void *srcPtr,
+                                               const ze_copy_region_t *srcRegion,
+                                               uint32_t srcPitch,
+                                               uint32_t srcSlicePitch,
+                                               ze_event_handle_t hSignalEvent,
+                                               uint32_t numWaitEvents,
+                                               ze_event_handle_t *phWaitEvents, CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendMemoryFill(void *ptr, const void *pattern,
+                                         size_t patternSize, size_t size, ze_event_handle_t hSignalEvent,
+                                         uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents, CmdListMemoryCopyParams &memoryCopyParams) = 0;
+    virtual ze_result_t appendWaitOnEvents(uint32_t numEvents, ze_event_handle_t *phEvent, CmdListWaitEventParameters &waitEventParams) = 0;
+    virtual ze_result_t appendWriteGlobalTimestamp(uint64_t *dstptr, ze_event_handle_t hSignalEvent,
+                                                   uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents,
+                                                   CmdListWaitEventParameters &waitEventParams) = 0;
+
+    virtual ze_result_t appendHostFunction(ze_host_function_callback_t pHostFunction,
+                                           void *pUserData,
+                                           const void *pNext,
+                                           ze_event_handle_t hSignalEvent,
+                                           uint32_t numWaitEvents,
+                                           ze_event_handle_t *phWaitEvents,
+                                           CmdListHostFunctionParameters &parameters) = 0;
+
+    virtual ze_result_t tempMemSetElementCount(size_t elementCount) = 0;
+    virtual ze_result_t tempMemGetSize(size_t *tempMemSize) = 0;
+    virtual ze_result_t tempMemSet(const void *pTempMem) = 0;
+
+    virtual ze_result_t getVariable(const InterfaceVariableDescriptor *varDesc, Variable **outVariable) = 0;
+    virtual ze_result_t getLabel(const InterfaceLabelDescriptor *labelDesc, Label **outLabel) = 0;
+    virtual ze_result_t getVariablesList(uint32_t *outVarCount, Variable **outVariables) = 0;
+
+    virtual ze_result_t getNativeBinary(uint8_t *outBinary, size_t *outBinarySize, const uint8_t *module, size_t moduleSize) = 0;
+    virtual ze_result_t loadFromBinary(const uint8_t *binary, const size_t binarySize) = 0;
+
+    virtual ze_result_t getNextCommandId(const ze_mutable_command_id_ext_desc_t *desc, uint32_t numKernels, ze_kernel_handle_t *phKernels, uint64_t *pCommandId) = 0;
+    virtual ze_result_t getNextCommandId(const ze_mutable_command_id_exp_desc_t *desc, uint32_t numKernels, ze_kernel_handle_t *phKernels, uint64_t *pCommandId) = 0;
+    virtual ze_result_t updateMutableCommands(const ze_mutable_commands_ext_desc_t *desc) = 0;
+    virtual ze_result_t updateMutableCommands(const ze_mutable_commands_exp_desc_t *desc) = 0;
+    virtual ze_result_t updateMutableCommandSignalEvent(uint64_t commandId, ze_event_handle_t signalEvent) = 0;
+    virtual ze_result_t updateMutableCommandWaitEvents(uint64_t commandId, uint32_t numWaitEvents, ze_event_handle_t *phWaitEvents) = 0;
+    virtual ze_result_t updateMutableCommandKernels(uint32_t numKernels, uint64_t *pCommandId, ze_kernel_handle_t *phKernels) = 0;
+
+    virtual void removeFromResidencyContainer(NEO::GraphicsAllocation *allocation, bool redirectToCopyOffload) = 0;
+    virtual void addToResidencyContainer(NEO::GraphicsAllocation *allocation, bool redirectToCopyOffload) = 0;
+    virtual void processResidencyContainer(bool baseCmdListClosed) = 0;
+
+    virtual void setBufferSurfaceState(void *address, NEO::GraphicsAllocation *alloc, Variable *variable) = 0;
+
+    virtual MutableComputeWalker *getCommandWalker(size_t offsetToWalkerCommand, uint16_t indirectOffset, uint16_t scratchOffset) = 0;
+
+    virtual void switchCounterBasedEvents(uint64_t inOrderExecBaseSignalValue, uint32_t inOrderAllocationOffset, Event *newEvent, bool apiRequiredExternalGraphEvent) = 0;
+
+    virtual bool isCbEventBoundToCmdList(Event *event) const = 0;
+    virtual NEO::GraphicsAllocation *getDeviceCounterAllocForResidency(NEO::GraphicsAllocation *counterDeviceAlloc) = 0;
+    virtual bool isQwordInOrderCounter() const = 0;
+    virtual bool isSemaphore64bCmdSupported() const = 0;
+
+    virtual void updateScratchAddress(size_t patchIndex, MutableComputeWalker &oldWalker, MutableComputeWalker &newWalker, MutableIndirectData *newKernelIndirectData) = 0;
+    virtual void updateCmdListScratchPatchCommand(size_t patchIndex, MutableComputeWalker &oldWalker, MutableComputeWalker &newWalker, MutableIndirectData *newKernelIndirectData) = 0;
+    virtual uint64_t getCurrentScratchPatchAddress(size_t scratchAddressPatchIndex) const = 0;
+    virtual void updateCmdListNoopPatchData(size_t noopPatchIndex, void *newCpuPtr, size_t newPatchSize, size_t newOffset, uint64_t newGpuAddress) = 0;
+    virtual size_t createNewCmdListNoopPatchData(void *newCpuPtr, size_t newPatchSize, size_t newOffset, uint64_t newGpuAddress) = 0;
+    virtual void fillCmdListNoopPatchData(size_t noopPatchIndex, void *&cpuPtr, size_t &patchSize, size_t &offset, uint64_t &gpuAddress) = 0;
+    virtual void disableAddressNoopPatch(size_t noopPatchIndex) = 0;
+    virtual void addVariableToCommitList(Variable *variable) = 0;
+    virtual void addAsyncMutationElement(uint64_t gpuDestination, void *hostSource, size_t size, bool redirectToCopyOffload) = 0;
+
+    virtual void toggleCommandListUpdated() = 0;
+};
+
+using MutableCommandListAllocFn = MutableCommandList *(*)(uint32_t);
+extern MutableCommandListAllocFn mutableCommandListFactory[];
+
+template <uint32_t gfxCoreFamily, typename CommandListType>
+struct MutableCommandListPopulateFactory {
+    MutableCommandListPopulateFactory() {
+        mutableCommandListFactory[gfxCoreFamily] = MutableCommandList::Allocator<CommandListType>::allocate;
+    }
+};
+} // namespace MCL
+} // namespace L0

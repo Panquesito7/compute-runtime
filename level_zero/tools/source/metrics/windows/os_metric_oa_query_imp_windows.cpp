@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -27,15 +27,16 @@ const char *MetricsLibrary::getFilename() { return METRICS_LIBRARY_NAME; }
 
 bool MetricsLibrary::getContextData(Device &device, ContextCreateData_1_0 &contextData) {
 
-    auto wddm = device.getOsInterface().getDriverModel()->as<NEO::Wddm>();
+    auto wddm = device.getOsInterface()->getDriverModel()->as<NEO::Wddm>();
     auto &osData = contextData.ClientData->Windows;
 
     // Copy escape data (adapter/device/escape function).
     osData.KmdInstrumentationEnabled = true;
     osData.Device = reinterpret_cast<void *>(static_cast<UINT_PTR>(wddm->getDeviceHandle()));
-    osData.Escape = wddm->getEscapeHandle();
-    osData.Adapter =
-        reinterpret_cast<void *>(static_cast<UINT_PTR>(wddm->getAdapter()));
+    osData.Escape = reinterpret_cast<void *>(wddm->getEscapeHandle());
+    osData.Adapter = reinterpret_cast<void *>(static_cast<UINT_PTR>(wddm->getAdapter()));
+    callbacks.CommandBufferFlush = &flushCommandBufferCallback;
+    contextData.ClientData->Handle = reinterpret_cast<void *>(&device);
 
     return osData.Device && osData.Escape && osData.Adapter;
 }
@@ -48,7 +49,7 @@ bool MetricsLibrary::activateConfiguration(const ConfigurationHandle_1_0 configu
     const bool validMetricsLibrary = isInitialized();
     const bool validConfiguration = configurationHandle.IsValid();
     const bool result = validMetricsLibrary && validConfiguration &&
-                        (api.ConfigurationActivate(configurationHandle, &activateData) == StatusCode::Success);
+                        this->callMdapi("ConfigurationActivate", this->api.ConfigurationActivate, configurationHandle, &activateData);
 
     DEBUG_BREAK_IF(!result);
     return result;
@@ -59,7 +60,7 @@ bool MetricsLibrary::deactivateConfiguration(const ConfigurationHandle_1_0 confi
     const bool validMetricsLibrary = isInitialized();
     const bool validConfiguration = configurationHandle.IsValid();
     const bool result = validMetricsLibrary && validConfiguration &&
-                        (api.ConfigurationDeactivate(configurationHandle) == StatusCode::Success);
+                        this->callMdapi("ConfigurationDeactivate", this->api.ConfigurationDeactivate, configurationHandle);
 
     DEBUG_BREAK_IF(!result);
     return result;

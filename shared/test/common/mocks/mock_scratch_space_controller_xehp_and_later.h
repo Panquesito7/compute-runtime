@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -12,16 +12,17 @@ namespace NEO {
 struct MockScratchSpaceControllerXeHPAndLater : public ScratchSpaceControllerXeHPAndLater {
     using ScratchSpaceControllerXeHPAndLater::computeUnitsUsedForScratch;
     using ScratchSpaceControllerXeHPAndLater::getOffsetToSurfaceState;
-    using ScratchSpaceControllerXeHPAndLater::perThreadScratchSize;
-    using ScratchSpaceControllerXeHPAndLater::privateScratchAllocation;
-    using ScratchSpaceControllerXeHPAndLater::privateScratchSizeBytes;
-    using ScratchSpaceControllerXeHPAndLater::scratchAllocation;
-    using ScratchSpaceControllerXeHPAndLater::scratchSizeBytes;
+    using ScratchSpaceControllerXeHPAndLater::perThreadScratchSpaceSlot0Size;
+    using ScratchSpaceControllerXeHPAndLater::perThreadScratchSpaceSlot1Size;
+    using ScratchSpaceControllerXeHPAndLater::scratchSlot0Allocation;
+    using ScratchSpaceControllerXeHPAndLater::scratchSlot0SizeInBytes;
+    using ScratchSpaceControllerXeHPAndLater::scratchSlot1Allocation;
+    using ScratchSpaceControllerXeHPAndLater::scratchSlot1SizeInBytes;
     using ScratchSpaceControllerXeHPAndLater::ScratchSpaceControllerXeHPAndLater;
     using ScratchSpaceControllerXeHPAndLater::singleSurfaceStateSize;
     using ScratchSpaceControllerXeHPAndLater::slotId;
     using ScratchSpaceControllerXeHPAndLater::stateSlotsCount;
     using ScratchSpaceControllerXeHPAndLater::surfaceStateHeap;
-    using ScratchSpaceControllerXeHPAndLater::updateSlots;
+    using ScratchSpaceControllerXeHPAndLater::twoSlotScratchSpaceSupported;
 };
 } // namespace NEO

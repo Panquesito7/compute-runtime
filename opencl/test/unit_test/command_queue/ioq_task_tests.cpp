@@ -1,9 +1,11 @@
 /*
- * Copyright (C) 2018-2021 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
+
+#include "shared/source/command_stream/command_stream_receiver.h"
 
 #include "opencl/test/unit_test/command_queue/enqueue_fixture.h"
 #include "opencl/test/unit_test/fixtures/hello_world_fixture.h"
@@ -77,7 +79,7 @@ TEST_F(IOQ, GivenUserEventWhenReadingBufferThenTaskCountAndTaskLevelAreIncrement
     auto previousTaskCount = pCmdQ->taskCount;
     auto previousTaskLevel = pCmdQ->taskLevel;
 
-    auto userEvent = clCreateUserEvent(pContext, &retVal);
+    auto userEvent = clCreateUserEvent(pContext.get(), &retVal);
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     retVal = clSetUserEventStatus(userEvent, CL_COMPLETE);

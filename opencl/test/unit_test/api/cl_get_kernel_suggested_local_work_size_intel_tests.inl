@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,6 +7,7 @@
 
 #include "opencl/source/command_queue/cl_local_work_size.h"
 #include "opencl/source/command_queue/command_queue.h"
+#include "opencl/source/helpers/dispatch_info.h"
 #include "opencl/test/unit_test/mocks/mock_kernel.h"
 
 #include "cl_api_tests.h"
@@ -34,7 +35,7 @@ TEST_F(clGetKernelSuggestedLocalWorkSizeTests, GivenInvalidInputWhenCallingGetKe
     pKernel->isPatchedOverride = false;
     retVal = clGetKernelSuggestedLocalWorkSizeINTEL(pCommandQueue, pMultiDeviceKernel, workDim,
                                                     globalWorkOffset, globalWorkSize, suggestedLocalWorkSize);
-    EXPECT_EQ(CL_INVALID_KERNEL, retVal);
+    EXPECT_EQ(CL_INVALID_KERNEL_ARGS, retVal);
     pKernel->isPatchedOverride = true;
 
     retVal = clGetKernelSuggestedLocalWorkSizeINTEL(pCommandQueue, pMultiDeviceKernel, workDim,
@@ -110,7 +111,7 @@ TEST_F(clGetKernelSuggestedLocalWorkSizeTests, GivenKernelWithReqdWorkGroupSizeW
     size_t suggestedLocalWorkSize[] = {0, 0, 0};
     uint16_t regdLocalWorkSize[] = {32, 32, 32};
 
-    MockKernelWithInternals mockKernel(*pDevice);
+    MockKernelWithInternals mockKernel(*pContext);
     mockKernel.kernelInfo.kernelDescriptor.kernelAttributes.requiredWorkgroupSize[0] = regdLocalWorkSize[0];
     mockKernel.kernelInfo.kernelDescriptor.kernelAttributes.requiredWorkgroupSize[1] = regdLocalWorkSize[1];
     mockKernel.kernelInfo.kernelDescriptor.kernelAttributes.requiredWorkgroupSize[2] = regdLocalWorkSize[2];

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -17,6 +17,7 @@ class UnifiedMemoryAubTest : public UnifiedMemoryAubFixture,
   public:
     using UnifiedMemoryAubFixture::tearDown;
 
+    DebugManagerStateRestore restorer;
     std::vector<char> values;
 
     void SetUp() override {
@@ -30,7 +31,7 @@ class UnifiedMemoryAubTest : public UnifiedMemoryAubFixture,
 };
 
 HWTEST_F(UnifiedMemoryAubTest, givenDeviceMemoryAllocWhenWriteIntoItThenValuesMatch) {
-    auto unifiedMemoryType = InternalMemoryType::DEVICE_UNIFIED_MEMORY;
+    auto unifiedMemoryType = InternalMemoryType::deviceUnifiedMemory;
     auto unifiedMemoryPtr = allocateUSM(unifiedMemoryType);
     writeToUsmMemory(values, unifiedMemoryPtr, unifiedMemoryType);
 
@@ -40,7 +41,7 @@ HWTEST_F(UnifiedMemoryAubTest, givenDeviceMemoryAllocWhenWriteIntoItThenValuesMa
 }
 
 HWTEST_F(UnifiedMemoryAubTest, givenSharedMemoryAllocWhenWriteIntoCPUPartThenValuesMatchAfterUsingAllocAsKernelParam) {
-    auto unifiedMemoryType = InternalMemoryType::SHARED_UNIFIED_MEMORY;
+    auto unifiedMemoryType = InternalMemoryType::sharedUnifiedMemory;
     auto unifiedMemoryPtr = allocateUSM(unifiedMemoryType);
     retVal = clEnqueueMemsetINTEL(this->pCmdQ, unifiedMemoryPtr, 0, dataSize, 0, nullptr, nullptr);
     EXPECT_EQ(retVal, CL_SUCCESS);
@@ -59,7 +60,7 @@ HWTEST_F(UnifiedMemoryAubTest, givenSharedMemoryAllocWhenWriteIntoCPUPartThenVal
 }
 
 HWTEST_F(UnifiedMemoryAubTest, givenSharedMemoryAllocWhenWriteIntoGPUPartThenValuesMatchAfterUsingAlloc) {
-    auto unifiedMemoryType = InternalMemoryType::SHARED_UNIFIED_MEMORY;
+    auto unifiedMemoryType = InternalMemoryType::sharedUnifiedMemory;
 
     auto unifiedMemoryPtr = allocateUSM(unifiedMemoryType);
     std::vector<char> input(dataSize, 11);
@@ -67,10 +68,11 @@ HWTEST_F(UnifiedMemoryAubTest, givenSharedMemoryAllocWhenWriteIntoGPUPartThenVal
     retVal = clEnqueueMemcpyINTEL(this->pCmdQ, true, unifiedMemoryPtr, input.data(), dataSize, 0, nullptr, nullptr);
     EXPECT_EQ(retVal, CL_SUCCESS);
 
-    expectNotEqualMemory<FamilyType>(unifiedMemoryPtr, unifiedMemoryPtr, dataSize);
     expectMemory<FamilyType>(unifiedMemoryPtr, input.data(), dataSize);
 
-    expectMemory<FamilyType>(unifiedMemoryPtr, unifiedMemoryPtr, dataSize);
+    if (testMode == TestMode::aubTestsWithTbx) {
+        expectMemory<FamilyType>(unifiedMemoryPtr, unifiedMemoryPtr, dataSize);
+    }
 
     freeUSM(unifiedMemoryPtr, unifiedMemoryType);
 }

@@ -1,25 +1,24 @@
 /*
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/command_stream/command_stream_receiver.h"
-#include "shared/source/device/device.h"
 #include "shared/source/gmm_helper/gmm_helper.h"
-#include "shared/source/gmm_helper/gmm_lib.h"
-#include "shared/source/helpers/state_base_address.h"
 #include "shared/test/common/cmd_parse/hw_parse.h"
-#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
 #include "opencl/extensions/public/cl_ext_private.h"
-#include "opencl/source/api/api.h"
 #include "opencl/source/command_queue/command_queue_hw.h"
 #include "opencl/source/kernel/kernel.h"
 #include "opencl/test/unit_test/fixtures/hello_world_fixture.h"
+
+#include "neo_igfxfmid.h"
+
+#include <cstdint>
 
 using namespace NEO;
 
@@ -59,9 +58,9 @@ const size_t n = 512;
 
 using clMemLocallyUncachedResourceFixture = Test<HelloWorldFixture<HelloWorldFixtureFactory>>;
 
-HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, GivenAtLeastOneLocallyUncacheableResourceWhenSettingKernelArgumentsThenKernelIsUncacheable) {
+HWTEST2_F(clMemLocallyUncachedResourceFixture, GivenAtLeastOneLocallyUncacheableResourceWhenSettingKernelArgumentsThenKernelIsUncacheable, IsGen12LP) {
     cl_int retVal = CL_SUCCESS;
-    MockKernelWithInternals mockKernel(*this->pClDevice, context, true);
+    MockKernelWithInternals mockKernel(*context, MockKernelWithInternalsConfig{.addDefaultArgs = true});
 
     auto kernel = mockKernel.mockKernel;
     auto pMultiDeviceKernel = mockKernel.mockMultiDeviceKernel;
@@ -76,8 +75,8 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, GivenAtLeastOne
     auto bufferUncacheable2 = clCreateBufferWithPropertiesINTEL(context, propertiesUncacheable, 0, n * sizeof(float), nullptr, nullptr);
     auto pBufferUncacheable2 = clUniquePtr(castToObject<Buffer>(bufferUncacheable2));
 
-    auto mocsCacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER);
-    auto mocsUncacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
+    auto mocsCacheable = pClDevice->getGmmHelper()->getL3EnabledMOCS();
+    auto mocsUncacheable = pClDevice->getGmmHelper()->getUncachedMOCS();
 
     retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferCacheable1);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -134,10 +133,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, GivenAtLeastOne
     EXPECT_FALSE(kernel->hasUncacheableStatelessArgs());
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersThatAreUncachedInSurfaceStateWhenStatelessIsProgrammedThenItIsCached) {
+HWTEST2_F(clMemLocallyUncachedResourceFixture, givenBuffersThatAreUncachedInSurfaceStateWhenStatelessIsProgrammedThenItIsCached, IsGen12LP) {
     cl_int retVal = CL_SUCCESS;
 
-    MockKernelWithInternals mockKernel(*this->pClDevice, context, true);
+    MockKernelWithInternals mockKernel(*context, MockKernelWithInternalsConfig{.addDefaultArgs = true});
     auto kernel = mockKernel.mockKernel;
     auto pMultiDeviceKernel = mockKernel.mockMultiDeviceKernel;
 
@@ -153,8 +152,8 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersTha
     auto bufferUncacheable2 = clCreateBufferWithPropertiesINTEL(context, propertiesUncacheableInSurfaceState, 0, n * sizeof(float), nullptr, nullptr);
     auto pBufferUncacheable2 = clUniquePtr(castToObject<Buffer>(bufferUncacheable2));
 
-    auto mocsCacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER);
-    auto mocsUncacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
+    auto mocsCacheable = pClDevice->getGmmHelper()->getL3EnabledMOCS();
+    auto mocsUncacheable = pClDevice->getGmmHelper()->getUncachedMOCS();
 
     retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferCacheable1);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -208,10 +207,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersTha
     EXPECT_EQ(mocsCacheable, cmdQueueMocs<FamilyType>(pCmdQ));
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersThatAreUncachedButKernelDoesntHaveAnyStatelessAccessesThenSurfacesAreNotRecordedAsUncacheable) {
+HWTEST2_F(clMemLocallyUncachedResourceFixture, givenBuffersThatAreUncachedButKernelDoesntHaveAnyStatelessAccessesThenSurfacesAreNotRecordedAsUncacheable, IsGen12LP) {
     cl_int retVal = CL_SUCCESS;
 
-    MockKernelWithInternals mockKernel(*this->pClDevice, context, true);
+    MockKernelWithInternals mockKernel(*context, MockKernelWithInternalsConfig{.addDefaultArgs = true});
     auto kernel = mockKernel.mockKernel;
     auto pMultiDeviceKernel = mockKernel.mockMultiDeviceKernel;
     mockKernel.kernelInfo.setBufferStateful(0);
@@ -227,8 +226,8 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersTha
     auto bufferUncacheable2 = clCreateBufferWithPropertiesINTEL(context, propertiesUncacheable, 0, n * sizeof(float), nullptr, nullptr);
     auto pBufferUncacheable2 = clUniquePtr(castToObject<Buffer>(bufferUncacheable2));
 
-    auto mocsCacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER);
-    auto mocsUncacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
+    auto mocsCacheable = pClDevice->getGmmHelper()->getL3EnabledMOCS();
+    auto mocsUncacheable = pClDevice->getGmmHelper()->getUncachedMOCS();
 
     retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferCacheable1);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -285,9 +284,9 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersTha
     EXPECT_FALSE(kernel->hasUncacheableStatelessArgs());
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, WhenUnsettingUncacheableResourceFromKernelThenKernelContinuesToCorrectlySetMocs) {
+HWTEST2_F(clMemLocallyUncachedResourceFixture, WhenUnsettingUncacheableResourceFromKernelThenKernelContinuesToCorrectlySetMocs, IsGen12LP) {
     cl_int retVal = CL_SUCCESS;
-    MockKernelWithInternals mockKernel(*this->pClDevice, context, true);
+    MockKernelWithInternals mockKernel(*context, MockKernelWithInternalsConfig{.addDefaultArgs = true});
     auto pMultiDeviceKernel = mockKernel.mockMultiDeviceKernel;
     auto kernel = mockKernel.mockKernel;
 
@@ -301,8 +300,8 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, WhenUnsettingUn
     auto bufferUncacheable = clCreateBufferWithPropertiesINTEL(context, propertiesUncacheable, 0, n * sizeof(float), nullptr, nullptr);
     auto pBufferUncacheable = clUniquePtr(castToObject<Buffer>(bufferUncacheable));
 
-    auto mocsCacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER);
-    auto mocsUncacheable = pClDevice->getGmmHelper()->getMOCS(GMM_RESOURCE_USAGE_OCL_BUFFER_CACHELINE_MISALIGNED);
+    auto mocsCacheable = pClDevice->getGmmHelper()->getL3EnabledMOCS();
+    auto mocsUncacheable = pClDevice->getGmmHelper()->getUncachedMOCS();
 
     retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferCacheable1);
     EXPECT_EQ(CL_SUCCESS, retVal);
@@ -347,42 +346,6 @@ HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, WhenUnsettingUn
     retVal = clEnqueueNDRangeKernel(pCmdQ, pMultiDeviceKernel, 1, nullptr, globalWorkSize, localWorkSize, 0, nullptr, nullptr);
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(mocsUncacheable, cmdQueueMocs<FamilyType>(pCmdQ));
-}
-
-HWCMDTEST_F(IGFX_GEN8_CORE, clMemLocallyUncachedResourceFixture, givenBuffersThatAreUncachedInSurfaceStateAndAreNotUsedInStatelessFashionThenThoseResourcesAreNotRegistredAsResourcesForCacheFlush) {
-    DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleSubDevices.set(2);
-    auto context = std::make_unique<MockContext>();
-    cl_int retVal = CL_SUCCESS;
-    MockKernelWithInternals mockKernel(*context->getDevice(0), context.get(), true);
-    auto kernel = mockKernel.mockKernel;
-    auto pMultiDeviceKernel = mockKernel.mockMultiDeviceKernel;
-    mockKernel.kernelInfo.setBufferStateful(0);
-    mockKernel.kernelInfo.setBufferStateful(1);
-
-    auto bufferCacheable = clCreateBufferWithPropertiesINTEL(context.get(), propertiesCacheable, 0, n * sizeof(float), nullptr, nullptr);
-
-    auto bufferUncacheableInSurfaceState = clCreateBufferWithPropertiesINTEL(context.get(), propertiesUncacheableInSurfaceState, 0, n * sizeof(float), nullptr, nullptr);
-    auto bufferUncacheable = clCreateBufferWithPropertiesINTEL(context.get(), propertiesUncacheable, 0, n * sizeof(float), nullptr, nullptr);
-
-    retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferUncacheableInSurfaceState);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    EXPECT_EQ(nullptr, kernel->kernelArgRequiresCacheFlush[0]);
-
-    retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferCacheable);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    EXPECT_NE(nullptr, kernel->kernelArgRequiresCacheFlush[0]);
-
-    retVal = clSetKernelArg(pMultiDeviceKernel, 0, sizeof(cl_mem), &bufferUncacheable);
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    EXPECT_EQ(nullptr, kernel->kernelArgRequiresCacheFlush[0]);
-
-    clReleaseMemObject(bufferUncacheableInSurfaceState);
-    clReleaseMemObject(bufferUncacheable);
-    clReleaseMemObject(bufferCacheable);
 }
 
 } // namespace clMemLocallyUncachedResourceTests

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,7 +7,6 @@
 
 #pragma once
 #include "shared/source/direct_submission/direct_submission_hw.h"
-#include "shared/source/direct_submission/direct_submission_hw_diagnostic_mode.h"
 #include "shared/source/memory_manager/graphics_allocation.h"
 #include "shared/test/common/mocks/mock_memory_operations_handler.h"
 namespace NEO {
@@ -17,48 +16,53 @@ struct MockDirectSubmissionHw : public DirectSubmissionHw<GfxFamily, Dispatcher>
     using BaseClass = DirectSubmissionHw<GfxFamily, Dispatcher>;
     using BaseClass::activeTiles;
     using BaseClass::allocateResources;
+    using BaseClass::asyncNewRingBufferAllocation;
     using BaseClass::completionFenceAllocation;
     using BaseClass::copyCommandBufferIntoRing;
-    using BaseClass::cpuCachelineFlush;
     using BaseClass::currentQueueWorkCount;
     using BaseClass::currentRelaxedOrderingQueueSize;
     using BaseClass::currentRingBuffer;
     using BaseClass::dcFlushRequired;
     using BaseClass::deallocateResources;
     using BaseClass::deferredTasksListAllocation;
-    using BaseClass::diagnostic;
+    using BaseClass::detectGpuHang;
     using BaseClass::DirectSubmissionHw;
-    using BaseClass::disableCacheFlush;
-    using BaseClass::disableCpuCacheFlush;
-    using BaseClass::disableMonitorFence;
     using BaseClass::dispatchDisablePrefetcher;
+    using BaseClass::dispatchMonitorFenceRequired;
     using BaseClass::dispatchPartitionRegisterConfiguration;
     using BaseClass::dispatchPrefetchMitigation;
     using BaseClass::dispatchRelaxedOrderingReturnPtrRegs;
     using BaseClass::dispatchSemaphoreSection;
     using BaseClass::dispatchStartSection;
     using BaseClass::dispatchSwitchRingBufferSection;
+    using BaseClass::dispatchUllsState;
     using BaseClass::dispatchWorkloadSection;
-    using BaseClass::getDiagnosticModeSection;
     using BaseClass::getSizeDisablePrefetcher;
     using BaseClass::getSizeDispatch;
     using BaseClass::getSizeDispatchRelaxedOrderingQueueStall;
     using BaseClass::getSizeEnd;
+    using BaseClass::getSizeNewResourceHandler;
     using BaseClass::getSizePartitionRegisterConfigurationSection;
     using BaseClass::getSizePrefetchMitigation;
     using BaseClass::getSizeSemaphoreSection;
     using BaseClass::getSizeStartSection;
     using BaseClass::getSizeSwitchRingBufferSection;
     using BaseClass::getSizeSystemMemoryFenceAddress;
+    using BaseClass::getTagAddressValueForRingSwitch;
+    using BaseClass::globalFenceAllocation;
+    using BaseClass::gpuVaForAdditionalSynchronizationWA;
+    using BaseClass::handleSemaphoreDataOverflow;
     using BaseClass::hwInfo;
+    using BaseClass::immWritePostSyncOffset;
     using BaseClass::isDisablePrefetcherRequired;
+    using BaseClass::lastSubmittedThrottle;
+    using BaseClass::maxRingBufferCount;
+    using BaseClass::memoryFenceOverPciBarrier;
     using BaseClass::miMemFenceRequired;
     using BaseClass::osContext;
     using BaseClass::partitionConfigSet;
     using BaseClass::partitionedMode;
     using BaseClass::pciBarrierPtr;
-    using BaseClass::performDiagnosticMode;
-    using BaseClass::postSyncOffset;
     using BaseClass::preinitializedRelaxedOrderingScheduler;
     using BaseClass::preinitializedTaskStoreSection;
     using BaseClass::relaxedOrderingEnabled;
@@ -75,21 +79,18 @@ struct MockDirectSubmissionHw : public DirectSubmissionHw<GfxFamily, Dispatcher>
     using BaseClass::semaphorePtr;
     using BaseClass::semaphores;
     using BaseClass::setReturnAddress;
-    using BaseClass::startRingBuffer;
     using BaseClass::stopRingBuffer;
     using BaseClass::switchRingBuffersAllocations;
+    using BaseClass::switchRingBuffersNeeded;
     using BaseClass::systemMemoryFenceAddressSet;
     using BaseClass::unblockGpu;
-    using BaseClass::useNotifyForPostSync;
-    using BaseClass::workloadMode;
-    using BaseClass::workloadModeOneExpectedValue;
-    using BaseClass::workloadModeOneStoreAddress;
+    using BaseClass::updateMemoryFenceOverPciBarrier;
     using BaseClass::workPartitionAllocation;
     using typename BaseClass::RingBufferUse;
 
     ~MockDirectSubmissionHw() override {
         if (ringStart) {
-            stopRingBuffer();
+            stopRingBuffer(false);
         }
         deallocateResources();
     }
@@ -123,6 +124,11 @@ struct MockDirectSubmissionHw : public DirectSubmissionHw<GfxFamily, Dispatcher>
         BaseClass::dispatchTaskStoreSection(taskStartSectionVa);
     }
 
+    void ensureRingCompletion() override {
+        ensureRingCompletionCalled++;
+        BaseClass::ensureRingCompletion();
+    }
+
     bool makeResourcesResident(DirectSubmissionAllocations &allocations) override {
         makeResourcesResidentVectorSize = static_cast<uint32_t>(allocations.size());
         if (callBaseResident) {
@@ -131,21 +137,21 @@ struct MockDirectSubmissionHw : public DirectSubmissionHw<GfxFamily, Dispatcher>
         return true;
     }
 
-    bool submit(uint64_t gpuAddress, size_t size) override {
+    bool submit(uint64_t gpuAddress, size_t size, const ResidencyContainer *allocationsForResidency) override {
         submitGpuAddress = gpuAddress;
         submitSize = size;
         submitCount++;
         return submitReturn;
     }
 
-    bool handleResidency() override {
+    bool handleResidency(const ResidencyContainer *allocationsForResidency) override {
         handleResidencyCount++;
         return handleResidencyReturn;
     }
 
-    void handleSwitchRingBuffers() override {}
+    void handleSwitchRingBuffers(ResidencyContainer *allocationsForResidency) override {}
 
-    uint64_t updateTagValue() override {
+    uint64_t updateTagValue(bool requireMonitorFence) override {
         return updateTagValueReturn;
     }
 
@@ -154,40 +160,48 @@ struct MockDirectSubmissionHw : public DirectSubmissionHw<GfxFamily, Dispatcher>
         tagData.tagValue = tagValueSetValue;
     }
 
-    void performDiagnosticMode() override {
-        if (!NEO::directSubmissionDiagnosticAvailable) {
-            disabledDiagnosticCalled++;
-        }
-        uint32_t add = 1;
-        if (diagnostic.get()) {
-            add += diagnostic->getExecutionsCount();
-        }
-        *static_cast<volatile uint32_t *>(workloadModeOneStoreAddress) = workloadModeOneExpectedValue + add;
-        BaseClass::performDiagnosticMode();
-    }
-
     bool isCompleted(uint32_t ringBufferIndex) override {
         return this->isCompletedReturn;
+    }
+
+    void unblockPagingFenceSemaphore(uint64_t pagingFenceValue) override {
+        this->pagingFenceValueToWait = pagingFenceValue;
+    }
+    void getTagAddressValueForRingSwitch(TagData &tagData) override {
+        getTagAddressValueForRingSwitchCalled++;
+        getTagAddressValue(tagData);
+    }
+
+    GraphicsAllocation *fetchAsyncRingBuffer(bool blockingWait) override {
+        fetchAsyncRingBufferCalled++;
+        if (disableNonBlockingFetch && !blockingWait) {
+            return nullptr;
+        }
+        return BaseClass::fetchAsyncRingBuffer(blockingWait);
     }
 
     uint64_t updateTagValueReturn = 1ull;
     uint64_t tagAddressSetValue = MemoryConstants::pageSize;
     uint64_t tagValueSetValue = 1ull;
     uint64_t submitGpuAddress = 0ull;
+    uint64_t pagingFenceValueToWait = 0ull;
     size_t submitSize = 0u;
     uint32_t submitCount = 0u;
     uint32_t handleResidencyCount = 0u;
-    uint32_t disabledDiagnosticCalled = 0u;
     uint32_t preinitializeRelaxedOrderingSectionsCalled = 0;
     uint32_t dispatchStaticRelaxedOrderingSchedulerCalled = 0;
     uint32_t dispatchRelaxedOrderingSchedulerSectionCalled = 0;
     uint32_t dispatchRelaxedOrderingQueueStallCalled = 0;
     uint32_t dispatchTaskStoreSectionCalled = 0;
+    uint32_t ensureRingCompletionCalled = 0;
+    uint32_t getTagAddressValueForRingSwitchCalled = 0;
+    uint32_t fetchAsyncRingBufferCalled = 0;
     uint32_t makeResourcesResidentVectorSize = 0u;
     bool allocateOsResourcesReturn = true;
     bool submitReturn = true;
     bool handleResidencyReturn = true;
     bool callBaseResident = false;
     bool isCompletedReturn = true;
+    bool disableNonBlockingFetch = false;
 };
 } // namespace NEO

@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2023 Intel Corporation
+ * Copyright (C) 2023-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "level_zero/core/source/device/device.h"
 #include "level_zero/tools/source/sysman/ras/ras_imp.h"
 #include "level_zero/tools/test/unit_tests/sources/sysman/windows/mock_sysman_fixture.h"
 
@@ -66,6 +67,52 @@ TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasSetConfigThenFailureIs
     auto pRasImp = std::make_unique<RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
     zes_ras_config_t config = {};
     EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasSetConfig(&config));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasGetStateExpThenFailureIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    uint32_t pCount = 0;
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasGetStateExp(&pCount, nullptr));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasClearStateExpThenFailureIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasClearStateExp(ZES_RAS_ERROR_CATEGORY_EXP_RESET));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasGetSupportedCategoriesExpThenErrorIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    uint32_t count = 0u;
+    zes_ras_error_category_exp_t categories = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasGetSupportedCategoriesExp(&count, &categories));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasGetConfigExpThenErrorIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    const uint32_t count = 0u;
+    zes_ras_config_exp_t config = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasGetConfigExp(count, &config));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasSetConfigExpThenErrorIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    const uint32_t count = 0u;
+    zes_ras_config_exp_t config = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasSetConfigExp(count, &config));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasGetStateExpThenErrorIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    uint32_t count = 0u;
+    zes_ras_state_exp_t state = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasGetStateExp(&count, &state));
+}
+
+TEST_F(SysmanRasFixture, GivenValidRasHandleWhenCallingRasGetStateExp2ThenUnsupportedFeatureIsReturned) {
+    auto pRasImp = std::make_unique<L0::RasImp>(pOsSysman, ZES_RAS_ERROR_TYPE_CORRECTABLE, device->toHandle());
+    zes_ras_error_category_exp_t category = ZES_RAS_ERROR_CATEGORY_EXP_COMPUTE_ERRORS;
+    zes_ras_state_exp2_t state = {};
+    EXPECT_EQ(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, pRasImp->rasGetStateExp2(1u, &category, &state));
 }
 
 } // namespace ult

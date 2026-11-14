@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,6 +11,7 @@
 #include "shared/source/helpers/ptr_math.h"
 #include "shared/source/os_interface/os_context.h"
 #include "shared/test/common/fixtures/memory_manager_fixture.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
 #include "shared/test/common/helpers/engine_descriptor_helper.h"
 #include "shared/test/common/mocks/mock_allocation_properties.h"
 #include "shared/test/common/mocks/mock_csr.h"
@@ -32,9 +33,9 @@ TEST_F(HostPtrManagerTest, GivenAlignedPointerAndAlignedSizeWhenGettingAllocatio
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
 
     EXPECT_EQ(1u, reqs.requiredFragmentsCount);
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::MIDDLE);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::NONE);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::middle);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::none);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
 
     EXPECT_EQ(reqs.totalRequiredSize, size);
 
@@ -54,9 +55,9 @@ TEST_F(HostPtrManagerTest, GivenAlignedPointerAndNotAlignedSizeWhenGettingAlloca
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(2u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::MIDDLE);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::TRAILING);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::middle);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::trailing);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
     EXPECT_EQ(reqs.totalRequiredSize, alignUp(size, MemoryConstants::pageSize));
 
     EXPECT_EQ(ptr, reqs.allocationFragments[0].allocationPtr);
@@ -77,9 +78,9 @@ TEST_F(HostPtrManagerTest, GivenNotAlignedPointerAndNotAlignedSizeWhenGettingAll
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(3u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::LEADING);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::MIDDLE);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::TRAILING);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::leading);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::middle);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::trailing);
 
     auto leadingPtr = (void *)0x1000;
     auto middlePtr = (void *)0x2000;
@@ -104,9 +105,9 @@ TEST_F(HostPtrManagerTest, GivenNotAlignedPointerAndNotAlignedSizeWithinOnePageW
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(1u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::LEADING);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::NONE);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::leading);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::none);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
 
     auto leadingPtr = (void *)0x1000;
 
@@ -129,9 +130,9 @@ TEST_F(HostPtrManagerTest, GivenNotAlignedPointerAndNotAlignedSizeWithinTwoPages
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(2u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::LEADING);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::TRAILING);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::leading);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::trailing);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
 
     auto leadingPtr = (void *)0x1000;
     auto trailingPtr = (void *)0x2000;
@@ -155,9 +156,9 @@ TEST_F(HostPtrManagerTest, GivenAlignedPointerAndAlignedSizeOfOnePageWhenGetting
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(1u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::MIDDLE);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::NONE);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::middle);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::none);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
 
     auto middlePtr = (void *)0x1000;
 
@@ -180,9 +181,9 @@ TEST_F(HostPtrManagerTest, GivenNotAlignedPointerAndSizeThatFitsToPageWhenGettin
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(2u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::LEADING);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::MIDDLE);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::leading);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::middle);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
 
     auto leadingPtr = (void *)0x1000;
     auto middlePtr = (void *)0x2000;
@@ -206,9 +207,9 @@ TEST_F(HostPtrManagerTest, GivenAlignedPointerAndPageSizeWhenGettingAllocationRe
     AllocationRequirements reqs = MockHostPtrManager::getAllocationRequirements(rootDeviceIndex, ptr, size);
     EXPECT_EQ(1u, reqs.requiredFragmentsCount);
 
-    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::MIDDLE);
-    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::NONE);
-    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::NONE);
+    EXPECT_EQ(reqs.allocationFragments[0].fragmentPosition, FragmentPosition::middle);
+    EXPECT_EQ(reqs.allocationFragments[1].fragmentPosition, FragmentPosition::none);
+    EXPECT_EQ(reqs.allocationFragments[2].fragmentPosition, FragmentPosition::none);
 
     auto middlePtr = (void *)0x1000;
 
@@ -365,7 +366,7 @@ TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledTwiceWithTheSamePointerWhenA
     EXPECT_EQ(1u, hostPtrManager.getFragmentCount());
 }
 
-TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithFragmentsWhenFragmentIsBeingReleasedThenManagerMaintainsProperRefferenceCount) {
+TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithFragmentsWhenFragmentIsBeingReleasedThenManagerMaintainsProperReferenceCount) {
     MockHostPtrManager hostPtrManager;
     FragmentStorage fragment;
     void *cpuPtr = (void *)0x1000;
@@ -649,12 +650,12 @@ TEST_F(HostPtrManagerTest, WhenCheckingForOverlapsThenCorrectStatusIsReturned) {
     auto cptr6 = (void *)0x040000;
     auto frag6 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, cptr6, size1 + 1, overlappingStatus);
     EXPECT_EQ(frag6, nullptr);
-    EXPECT_EQ(overlappingStatus, OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT);
+    EXPECT_EQ(overlappingStatus, OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT);
 
     auto cptr7 = (void *)0x03FFF0;
     auto frag7 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, cptr7, 2 * size1, overlappingStatus);
     EXPECT_EQ(frag7, nullptr);
-    EXPECT_EQ(overlappingStatus, OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT);
+    EXPECT_EQ(overlappingStatus, OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT);
 
     auto cptr8 = (void *)0x040000;
     auto frag8 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, cptr8, size1, overlappingStatus);
@@ -664,7 +665,7 @@ TEST_F(HostPtrManagerTest, WhenCheckingForOverlapsThenCorrectStatusIsReturned) {
     auto cptr9 = (void *)0x010060;
     auto frag9 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, cptr9, 2 * size1, overlappingStatus);
     EXPECT_EQ(frag9, nullptr);
-    EXPECT_EQ(overlappingStatus, OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT);
+    EXPECT_EQ(overlappingStatus, OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT);
 }
 
 TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithBigFragmentWhenAskedForFragmnetInTheMiddleOfBigFragmentThenBigFragmentIsReturned) {
@@ -707,7 +708,7 @@ TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithBigFragmentWhenAskedForF
 
     auto partialFragment = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, ptrPartial, partialBigSize, overlapStatus);
     EXPECT_EQ(nullptr, partialFragment);
-    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT, overlapStatus);
+    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT, overlapStatus);
 }
 
 TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithFragmentsWhenCheckedForOverlappingThenProperOverlappingStatusIsReturned) {
@@ -737,8 +738,30 @@ TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithFragmentsWhenCheckedForO
     EXPECT_EQ(nullptr, fragment3);
 
     auto fragment4 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, ptrNonOverlapingPriorToBigPtrByPage, smallSize + 1, overlapStatus);
-    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT, overlapStatus);
+    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT, overlapStatus);
     EXPECT_EQ(nullptr, fragment4);
+}
+
+TEST_F(HostPtrManagerTest, givenFragmentsStoredForTwoRootDevicesWhenCheckingForOverlapsOnHigherRootDeviceThenItsFragmentIsFound) {
+    MockHostPtrManager hostPtrManager;
+    auto ptr = reinterpret_cast<void *>(0x2000);
+    FragmentStorage lowerRootDeviceFragment;
+    lowerRootDeviceFragment.fragmentCpuPointer = ptr;
+    lowerRootDeviceFragment.fragmentSize = MemoryConstants::pageSize;
+    FragmentStorage higherRootDeviceFragment = lowerRootDeviceFragment;
+    hostPtrManager.storeFragment(rootDeviceIndex - 1, lowerRootDeviceFragment);
+    hostPtrManager.storeFragment(rootDeviceIndex, higherRootDeviceFragment);
+    ASSERT_EQ(2u, hostPtrManager.getFragmentCount());
+
+    OverlapStatus overlapStatus;
+    EXPECT_EQ(hostPtrManager.getFragment({ptr, rootDeviceIndex}), hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, ptr, MemoryConstants::pageSize, overlapStatus));
+    EXPECT_EQ(OverlapStatus::FRAGMENT_WITH_EXACT_SIZE_AS_STORED_FRAGMENT, overlapStatus);
+
+    EXPECT_EQ(nullptr, hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, reinterpret_cast<void *>(0x1000), 2 * MemoryConstants::pageSize, overlapStatus));
+    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT, overlapStatus);
+
+    EXPECT_EQ(nullptr, hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, reinterpret_cast<void *>(0x1000), MemoryConstants::pageSize, overlapStatus));
+    EXPECT_EQ(OverlapStatus::FRAGMENT_NOT_OVERLAPING_WITH_ANY_OTHER, overlapStatus);
 }
 
 TEST_F(HostPtrManagerTest, GivenEmptyHostPtrManagerWhenAskedForOverlapingThenNoOverlappingIsReturned) {
@@ -774,7 +797,7 @@ TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithFragmentsWhenAskedForOve
     EXPECT_EQ(nullptr, fragment1);
 
     auto fragment2 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, ptrNonOverlapingInTheMiddleOfBigPtrs, bigSize * 5, overlapStatus);
-    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT, overlapStatus);
+    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT, overlapStatus);
     EXPECT_EQ(nullptr, fragment2);
 
     auto fragment3 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, ptrNonOverlapingAfterBigPtr, bigSize * 5, overlapStatus);
@@ -811,7 +834,7 @@ TEST_F(HostPtrManagerTest, GivenHostPtrManagerFilledWithFragmentsWhenAskedForOve
 
     OverlapStatus overlapStatus;
     auto fragment1 = hostPtrManager.getFragmentAndCheckForOverlaps(rootDeviceIndex, bigPtr1, bigSize1 + 1, overlapStatus);
-    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THEN_STORED_FRAGMENT, overlapStatus);
+    EXPECT_EQ(OverlapStatus::FRAGMENT_OVERLAPING_AND_BIGGER_THAN_STORED_FRAGMENT, overlapStatus);
     EXPECT_EQ(nullptr, fragment1);
 
     auto priorToBig1 = (void *)0x9999;
@@ -842,6 +865,24 @@ TEST_F(HostPtrAllocationTest, givenTwoAllocationsThatSharesOneFragmentWhenOneIsD
     memoryManager->freeGraphicsMemory(graphicsAllocation1);
     EXPECT_EQ(2u, hostPtrManager->getFragmentCount());
     memoryManager->freeGraphicsMemory(graphicsAllocation2);
+    EXPECT_EQ(0u, hostPtrManager->getFragmentCount());
+}
+
+TEST_F(HostPtrAllocationTest, givenFragmentReusedFromLiveAllocationWhenPopulatingOsHandlesFailsThenReferenceToReusedFragmentIsReleased) {
+    auto hostPtrManager = static_cast<MockHostPtrManager *>(memoryManager->getHostPtrManager());
+    const auto rootDeviceIndex = csr->getRootDeviceIndex();
+    void *storedPtr = reinterpret_cast<void *>(0x101000);
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, storedPtr);
+    ASSERT_NE(nullptr, allocation);
+    ASSERT_EQ(1, hostPtrManager->getFragment({storedPtr, rootDeviceIndex})->refCount);
+
+    memoryManager->callBasePopulateOsHandles = false;
+    memoryManager->populateOsHandlesResult = MemoryManager::AllocationStatus::Error;
+    auto osStorage = hostPtrManager->prepareOsStorageForAllocation(*memoryManager, MemoryConstants::pageSize, ptrOffset(storedPtr, MemoryConstants::pageSize / 2), rootDeviceIndex);
+    EXPECT_EQ(0u, osStorage.fragmentCount);
+    EXPECT_EQ(1, hostPtrManager->getFragment({storedPtr, rootDeviceIndex})->refCount);
+
+    memoryManager->freeGraphicsMemory(allocation);
     EXPECT_EQ(0u, hostPtrManager->getFragmentCount());
 }
 
@@ -893,11 +934,11 @@ TEST_F(HostPtrAllocationTest, whenOverlappedFragmentIsBiggerThenStoredAndStoredF
 
     requirements.allocationFragments[0].allocationPtr = alignDown(cpuPtr1, MemoryConstants::pageSize);
     requirements.allocationFragments[0].allocationSize = MemoryConstants::pageSize * 10;
-    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::NONE;
+    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::none;
 
     RequirementsStatus status = hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
 
-    EXPECT_EQ(RequirementsStatus::SUCCESS, status);
+    EXPECT_EQ(RequirementsStatus::success, status);
 }
 
 HWTEST_F(HostPtrAllocationTest, givenOverlappingFragmentsWhenCheckIsCalledThenWaitAndCleanOnAllEngines) {
@@ -913,7 +954,7 @@ HWTEST_F(HostPtrAllocationTest, givenOverlappingFragmentsWhenCheckIsCalledThenWa
     TaskCountType csr1GpuTag = taskCountNotReady;
     csr0->tagAddress = &csr0GpuTag;
     csr1->tagAddress = &csr1GpuTag;
-    auto osContext = memoryManager->createAndRegisterOsContext(csr1.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_RCS, EngineUsage::LowPriority}));
+    auto osContext = memoryManager->createAndRegisterOsContext(csr1.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_RCS, EngineUsage::lowPriority}));
     csr1->setupContext(*osContext);
 
     void *cpuPtr = reinterpret_cast<void *>(0x100004);
@@ -941,17 +982,181 @@ HWTEST_F(HostPtrAllocationTest, givenOverlappingFragmentsWhenCheckIsCalledThenWa
 
     requirements.allocationFragments[0].allocationPtr = alignDown(cpuPtr, MemoryConstants::pageSize);
     requirements.allocationFragments[0].allocationSize = MemoryConstants::pageSize * 10;
-    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::NONE;
+    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::none;
     requirements.rootDeviceIndex = csr0->getRootDeviceIndex();
 
+    memoryManager->deferAllocInUse = true;
     hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
 
     EXPECT_EQ(1u, csr0->waitForCompletionWithTimeoutCalled);
     EXPECT_EQ(1u, csr1->waitForCompletionWithTimeoutCalled);
     EXPECT_EQ(2u, storage0->cleanAllocationsCalled);
     EXPECT_EQ(2u, storage0->lastCleanAllocationsTaskCount);
-    EXPECT_EQ(2u, storage1->cleanAllocationsCalled);
-    EXPECT_EQ(2u, storage1->lastCleanAllocationsTaskCount);
+
+    EXPECT_EQ(1u, storage1->cleanAllocationsCalled);
+    EXPECT_EQ(1u, storage1->lastCleanAllocationsTaskCount);
+}
+
+HWTEST_F(HostPtrAllocationTest, givenOverlappingFragmentsAndSingleTempAllocationsListWhenCheckIsCalledThenWaitAndCleanOnAllEngines) {
+    TaskCountType taskCountReady = 2;
+    TaskCountType taskCountNotReady = 1;
+
+    auto &engines = memoryManager->getRegisteredEngines(mockRootDeviceIndex);
+    EXPECT_EQ(1u, engines.size());
+
+    auto csr0 = static_cast<MockCommandStreamReceiver *>(engines[0].commandStreamReceiver);
+    auto csr1 = std::make_unique<MockCommandStreamReceiver>(executionEnvironment, 0, 1);
+    TaskCountType csr0GpuTag = taskCountNotReady;
+    TaskCountType csr1GpuTag = taskCountNotReady;
+    csr0->tagAddress = &csr0GpuTag;
+    csr1->tagAddress = &csr1GpuTag;
+    auto osContext = memoryManager->createAndRegisterOsContext(csr1.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_RCS, EngineUsage::lowPriority}));
+    csr1->setupContext(*osContext);
+
+    void *cpuPtr = reinterpret_cast<void *>(0x100004);
+
+    auto hostPtrManager = static_cast<MockHostPtrManager *>(memoryManager->getHostPtrManager());
+    auto graphicsAllocation0 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, cpuPtr);
+    auto graphicsAllocation1 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, cpuPtr);
+
+    auto storage0 = new MockInternalAllocationStorage(*csr0);
+    auto storage1 = new MockInternalAllocationStorage(*csr1);
+    csr0->internalAllocationStorage.reset(storage0);
+    storage0->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(graphicsAllocation0), TEMPORARY_ALLOCATION, taskCountReady);
+    storage0->updateCompletionAfterCleaningList(taskCountReady);
+    csr1->internalAllocationStorage.reset(storage1);
+    storage1->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(graphicsAllocation1), TEMPORARY_ALLOCATION, taskCountReady);
+    storage1->updateCompletionAfterCleaningList(taskCountReady);
+
+    csr0->setLatestSentTaskCount(taskCountNotReady);
+    csr1->setLatestSentTaskCount(taskCountNotReady);
+
+    AllocationRequirements requirements;
+
+    requirements.requiredFragmentsCount = 1;
+    requirements.totalRequiredSize = MemoryConstants::pageSize * 10;
+
+    requirements.allocationFragments[0].allocationPtr = alignDown(cpuPtr, MemoryConstants::pageSize);
+    requirements.allocationFragments[0].allocationSize = MemoryConstants::pageSize * 10;
+    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::none;
+    requirements.rootDeviceIndex = csr0->getRootDeviceIndex();
+
+    memoryManager->deferAllocInUse = true;
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation0));
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation1));
+
+    // first CSR tag updated
+    hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
+
+    EXPECT_FALSE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation0));
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation1));
+
+    // second CSR tag updated
+    hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
+
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekIsEmpty());
+}
+
+HWTEST_F(HostPtrAllocationTest, givenSingleTempAllocationsListWhenAddingToStorageThenCleanCorrectly) {
+    TaskCountType taskCountReady = 2;
+    TaskCountType taskCountNotReady = 1;
+
+    memoryManager->callBaseAllocInUse = true;
+
+    auto &engines = memoryManager->getRegisteredEngines(mockRootDeviceIndex);
+    EXPECT_EQ(1u, engines.size());
+
+    auto csr0 = static_cast<MockCommandStreamReceiver *>(engines[0].commandStreamReceiver);
+    auto csr1 = std::make_unique<MockCommandStreamReceiver>(executionEnvironment, 0, 1);
+    TaskCountType csr0GpuTag = taskCountNotReady;
+    TaskCountType csr1GpuTag = taskCountNotReady;
+    csr0->tagAddress = &csr0GpuTag;
+    csr1->tagAddress = &csr1GpuTag;
+    auto osContext = memoryManager->createAndRegisterOsContext(csr1.get(), EngineDescriptorHelper::getDefaultDescriptor({aub_stream::EngineType::ENGINE_RCS, EngineUsage::lowPriority}));
+    csr1->setupContext(*osContext);
+
+    void *cpuPtr = reinterpret_cast<void *>(0x100004);
+
+    auto graphicsAllocation0 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, cpuPtr);
+    auto graphicsAllocation1 = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, cpuPtr);
+
+    auto storage0 = new MockInternalAllocationStorage(*csr0);
+    auto storage1 = new MockInternalAllocationStorage(*csr1);
+    csr0->internalAllocationStorage.reset(storage0);
+    csr1->internalAllocationStorage.reset(storage1);
+
+    EXPECT_EQ(memoryManager->temporaryAllocations.get(), &csr0->getTemporaryAllocations());
+    EXPECT_EQ(memoryManager->temporaryAllocations.get(), &csr1->getTemporaryAllocations());
+
+    storage0->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(graphicsAllocation0), TEMPORARY_ALLOCATION, taskCountReady);
+    EXPECT_TRUE(storage0->allocationLists[TEMPORARY_ALLOCATION].peekIsEmpty());
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation0));
+    EXPECT_EQ(taskCountReady, graphicsAllocation0->getTaskCount(csr0->getOsContext().getContextId()));
+
+    storage1->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(graphicsAllocation1), TEMPORARY_ALLOCATION, taskCountReady);
+    EXPECT_TRUE(storage1->allocationLists[TEMPORARY_ALLOCATION].peekIsEmpty());
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation1));
+    EXPECT_EQ(taskCountReady, graphicsAllocation1->getTaskCount(csr1->getOsContext().getContextId()));
+
+    csr0->setLatestSentTaskCount(taskCountNotReady);
+    csr1->setLatestSentTaskCount(taskCountNotReady);
+
+    storage0->cleanAllocationList(taskCountNotReady, TEMPORARY_ALLOCATION);
+    storage1->cleanAllocationList(taskCountNotReady, TEMPORARY_ALLOCATION);
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation0));
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation1));
+
+    csr1GpuTag = taskCountReady;
+
+    storage0->cleanAllocationList(taskCountNotReady, TEMPORARY_ALLOCATION);
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation0));
+    EXPECT_FALSE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation1));
+
+    storage1->cleanAllocationList(taskCountNotReady, TEMPORARY_ALLOCATION);
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekContains(*graphicsAllocation0));
+
+    csr0GpuTag = taskCountReady;
+    storage1->cleanAllocationList(taskCountNotReady, TEMPORARY_ALLOCATION);
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekIsEmpty());
+}
+
+HWTEST_F(HostPtrAllocationTest, givenSingleTempAllocationsListWhenAddingToStorageThenObtainCorrectly) {
+    TaskCountType taskCountReady = 2;
+    TaskCountType taskCountNotReady = 1;
+
+    memoryManager->callBaseAllocInUse = true;
+
+    auto &engines = memoryManager->getRegisteredEngines(mockRootDeviceIndex);
+    auto csr = static_cast<MockCommandStreamReceiver *>(engines[0].commandStreamReceiver);
+
+    TaskCountType csrGpuTag = taskCountNotReady;
+    csr->tagAddress = &csrGpuTag;
+
+    void *cpuPtr = reinterpret_cast<void *>(0x100004);
+
+    auto graphicsAllocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{csr->getRootDeviceIndex(), false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, cpuPtr);
+
+    auto storage = new MockInternalAllocationStorage(*csr);
+    csr->internalAllocationStorage.reset(storage);
+    csr->setLatestSentTaskCount(taskCountNotReady);
+
+    storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(graphicsAllocation), TEMPORARY_ALLOCATION, taskCountReady);
+
+    auto alloc = storage->obtainTemporaryAllocationWithPtr(MemoryConstants::pageSize, cpuPtr, graphicsAllocation->getAllocationType());
+    EXPECT_NE(nullptr, alloc.get());
+    EXPECT_TRUE(memoryManager->temporaryAllocations->peekIsEmpty());
+    alloc.release();
+
+    EXPECT_EQ(CompletionStamp::notReady, graphicsAllocation->getTaskCount(csr->getOsContext().getContextId()));
+
+    // clean on CSR destruction
+    storage->storeAllocationWithTaskCount(std::unique_ptr<GraphicsAllocation>(graphicsAllocation), TEMPORARY_ALLOCATION, taskCountReady);
+    csr->tagAddress = nullptr;
+}
+
+TEST_F(HostPtrAllocationTest, givenMemoryManagerWhenCreatedThenInitializeTemporaryAllocationsList) {
+    auto memoryManager = std::make_unique<MockMemoryManager>(executionEnvironment);
+    EXPECT_NE(nullptr, memoryManager->temporaryAllocations.get());
 }
 
 TEST_F(HostPtrAllocationTest, whenOverlappedFragmentIsBiggerThenStoredAndStoredFragmentCannotBeDestroyedThenCheckForOverlappingReturnsError) {
@@ -984,12 +1189,12 @@ TEST_F(HostPtrAllocationTest, whenOverlappedFragmentIsBiggerThenStoredAndStoredF
 
     requirements.allocationFragments[0].allocationPtr = alignDown(cpuPtr1, MemoryConstants::pageSize);
     requirements.allocationFragments[0].allocationSize = MemoryConstants::pageSize * 10;
-    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::NONE;
+    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::none;
     requirements.rootDeviceIndex = csr->getRootDeviceIndex();
 
     RequirementsStatus status = hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
 
-    EXPECT_EQ(RequirementsStatus::FATAL, status);
+    EXPECT_EQ(RequirementsStatus::fatal, status);
 }
 
 TEST_F(HostPtrAllocationTest, GivenAllocationsWithoutBiggerOverlapWhenChckingForOverlappingThenSuccessIsReturned) {
@@ -1023,15 +1228,15 @@ TEST_F(HostPtrAllocationTest, GivenAllocationsWithoutBiggerOverlapWhenChckingFor
 
     requirements.allocationFragments[0].allocationPtr = alignDown(cpuPtr1, MemoryConstants::pageSize);
     requirements.allocationFragments[0].allocationSize = MemoryConstants::pageSize;
-    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::LEADING;
+    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::leading;
 
     requirements.allocationFragments[1].allocationPtr = alignUp(cpuPtr1, MemoryConstants::pageSize);
     requirements.allocationFragments[1].allocationSize = MemoryConstants::pageSize;
-    requirements.allocationFragments[1].fragmentPosition = FragmentPosition::TRAILING;
+    requirements.allocationFragments[1].fragmentPosition = FragmentPosition::trailing;
 
     RequirementsStatus status = hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
 
-    EXPECT_EQ(RequirementsStatus::SUCCESS, status);
+    EXPECT_EQ(RequirementsStatus::success, status);
 
     memoryManager->freeGraphicsMemory(graphicsAllocation1);
     memoryManager->freeGraphicsMemory(graphicsAllocation2);
@@ -1067,11 +1272,11 @@ TEST_F(HostPtrAllocationTest, GivenAllocationsWithBiggerOverlapWhenChckingForOve
 
     requirements.allocationFragments[0].allocationPtr = alignDown(cpuPtr1, MemoryConstants::pageSize);
     requirements.allocationFragments[0].allocationSize = MemoryConstants::pageSize * 10;
-    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::NONE;
+    requirements.allocationFragments[0].fragmentPosition = FragmentPosition::none;
 
     RequirementsStatus status = hostPtrManager->checkAllocationsForOverlapping(*memoryManager, &requirements);
 
-    EXPECT_EQ(RequirementsStatus::SUCCESS, status);
+    EXPECT_EQ(RequirementsStatus::success, status);
 }
 
 TEST(HostPtrEntryKeyTest, givenTwoHostPtrEntryKeysWhenComparingThemThenKeyWithLowerRootDeviceIndexIsLower) {
@@ -1113,4 +1318,35 @@ TEST(HostPtrEntryKeyTest, givenTwoSameHostPtrEntryKeysWithSameRootDeviceIndexWhe
 
     EXPECT_FALSE(key0 < key1);
     EXPECT_FALSE(key1 < key0);
+}
+
+TEST_F(HostPtrAllocationTest, givenStoredFragmentWhenCheckingWhetherFragmentsCanBeStoredThenOnlyRangesWithoutBiggerOverlappingFragmentAreAccepted) {
+    auto hostPtrManager = static_cast<MockHostPtrManager *>(memoryManager->getHostPtrManager());
+    const auto rootDeviceIndex = csr->getRootDeviceIndex();
+    void *storedPtr = reinterpret_cast<void *>(0x101000);
+    auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, storedPtr);
+    ASSERT_NE(nullptr, allocation);
+
+    EXPECT_FALSE(hostPtrManager->canStoreFragments(4 * MemoryConstants::pageSize - 0x80, reinterpret_cast<void *>(0x100040), rootDeviceIndex));
+    EXPECT_TRUE(hostPtrManager->canStoreFragments(0x100, reinterpret_cast<void *>(0x101040), rootDeviceIndex));
+    EXPECT_TRUE(hostPtrManager->canStoreFragments(MemoryConstants::pageSize, storedPtr, rootDeviceIndex));
+    EXPECT_FALSE(hostPtrManager->canStoreFragments(0u, storedPtr, rootDeviceIndex));
+
+    memoryManager->freeGraphicsMemory(allocation);
+}
+
+TEST_F(HostPtrAllocationTest, givenUsmHostPtrFragmentsEnabledWhenFreeingAllocationBackedByFragmentsThenFenceCompletionIsHandled) {
+    DebugManagerStateRestore restorer;
+    const auto rootDeviceIndex = csr->getRootDeviceIndex();
+    void *cpuPtr = reinterpret_cast<void *>(0x101000);
+    for (const int32_t usmHostPtrFragments : {0, 1}) {
+        debugManager.flags.EnableUsmHostPtrFragments.set(usmHostPtrFragments);
+        memoryManager->handleFenceCompletionCalled = 0u;
+        auto allocation = memoryManager->allocateGraphicsMemoryWithProperties(MockAllocationProperties{rootDeviceIndex, false, MemoryConstants::pageSize, csr->getOsContext().getDeviceBitfield()}, cpuPtr);
+        ASSERT_NE(nullptr, allocation);
+        ASSERT_NE(0u, allocation->fragmentsStorage.fragmentCount);
+
+        memoryManager->freeGraphicsMemory(allocation);
+        EXPECT_EQ(static_cast<uint32_t>(usmHostPtrFragments), memoryManager->handleFenceCompletionCalled.load());
+    }
 }

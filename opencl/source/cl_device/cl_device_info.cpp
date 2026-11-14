@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,34 +7,31 @@
 
 #include "opencl/source/cl_device/cl_device_info.h"
 
-#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/device/device.h"
 #include "shared/source/device/device_info.h"
 #include "shared/source/execution_environment/root_device_environment.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/source/helpers/get_info.h"
-#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/source/os_interface/os_time.h"
 
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/cl_device/cl_device_get_cap.inl"
 #include "opencl/source/cl_device/cl_device_info_map.h"
-#include "opencl/source/cl_device/cl_device_vector.h"
 #include "opencl/source/helpers/cl_gfx_core_helper.h"
 #include "opencl/source/helpers/get_info_status_mapper.h"
-#include "opencl/source/platform/platform.h"
+
+#include <algorithm>
 
 namespace NEO {
 
 using ClDeviceInfoTable::Map;
 
-template <cl_device_info Param>
+template <cl_device_info param>
 inline void ClDevice::getStr(const void *&src,
                              size_t &size,
                              size_t &retSize) {
-    src = Map<Param>::getValue(*this);
-    retSize = size = strlen(Map<Param>::getValue(*this)) + 1;
+    src = Map<param>::getValue(*this);
+    retSize = size = strlen(Map<param>::getValue(*this)) + 1;
 }
 
 template <>
@@ -73,6 +70,7 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
     const void *src = nullptr;
     std::array<uint8_t, CL_UUID_SIZE_KHR> uuid;
     std::array<uint8_t, CL_LUID_SIZE_KHR> luid;
+    const auto &hwInfo = getHardwareInfo();
 
     // clang-format off
     // please keep alphabetical order
@@ -106,7 +104,6 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
     case CL_DEVICE_HALF_FP_CONFIG:                              getCap<CL_DEVICE_HALF_FP_CONFIG                              >(src, srcSize, retSize); break;
     case CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL:                 getCap<CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL                 >(src, srcSize, retSize); break;
     case CL_DEVICE_HOST_UNIFIED_MEMORY:                         getCap<CL_DEVICE_HOST_UNIFIED_MEMORY                         >(src, srcSize, retSize); break;
-    case CL_DEVICE_ILS_WITH_VERSION:                            getCap<CL_DEVICE_ILS_WITH_VERSION                            >(src, srcSize, retSize); break;
     case CL_DEVICE_IL_VERSION:                                  getStr<CL_DEVICE_IL_VERSION                                  >(src, srcSize, retSize); break;
     case CL_DEVICE_IMAGE_SUPPORT:                               getCap<CL_DEVICE_IMAGE_SUPPORT                               >(src, srcSize, retSize); break;
     case CL_DEVICE_LATEST_CONFORMANCE_VERSION_PASSED:           getStr<CL_DEVICE_LATEST_CONFORMANCE_VERSION_PASSED           >(src, srcSize, retSize); break;
@@ -236,6 +233,10 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
         src = deviceInfo.openclCFeatures.data();
         retSize = srcSize = deviceInfo.openclCFeatures.size() * sizeof(cl_name_version);
         break;
+    case CL_DEVICE_ILS_WITH_VERSION:
+        src = deviceInfo.ilsWithVersion.data();
+        retSize = srcSize = deviceInfo.ilsWithVersion.size() * sizeof(cl_name_version);
+        break;
     case CL_DEVICE_BUILT_IN_KERNELS_WITH_VERSION:
         src = deviceInfo.builtInKernelsWithVersion.data();
         retSize = srcSize = deviceInfo.builtInKernelsWithVersion.size() * sizeof(cl_name_version);
@@ -256,41 +257,39 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
         retSize = srcSize = deviceInfo.supportedThreadArbitrationPolicies.size() * sizeof(cl_uint);
         break;
     case CL_DEVICE_IP_VERSION_INTEL: {
-        if (DebugManager.flags.UseDeprecatedClDeviceIpVersion.get()) {
-            auto &clGfxCoreHelper = this->getRootDeviceEnvironment().getHelper<ClGfxCoreHelper>();
-            param.uint = clGfxCoreHelper.getDeviceIpVersion(getHardwareInfo());
-        } else {
+        uint32_t hwIpVersion = hwInfo.ipVersionOverrideExposedToTheApplication.value;
+        if (0 == hwIpVersion) {
             auto &compilerProductHelper = device.getCompilerProductHelper();
-            param.uint = static_cast<cl_version>(compilerProductHelper.getHwIpVersion(getHardwareInfo()));
+            hwIpVersion = compilerProductHelper.getHwIpVersion(hwInfo);
         }
+        param.uint = static_cast<cl_version>(hwIpVersion);
         src = &param.uint;
         retSize = srcSize = sizeof(cl_version);
         break;
     }
     case CL_DEVICE_ID_INTEL:
-        param.uint = getHardwareInfo().platform.usDeviceID;
+        param.uint = hwInfo.platform.usDeviceID;
         src = &param.uint;
         retSize = srcSize = sizeof(cl_uint);
         break;
     case CL_DEVICE_NUM_SLICES_INTEL:
-        param.uint = static_cast<cl_uint>(getHardwareInfo().gtSystemInfo.SliceCount * std::max(device.getNumGenericSubDevices(), 1u));
+        param.uint = static_cast<cl_uint>(hwInfo.gtSystemInfo.SliceCount * std::max(device.getNumGenericSubDevices(), 1u));
         src = &param.uint;
         retSize = srcSize = sizeof(cl_uint);
         break;
     case CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL: {
-        const auto &gtSysInfo = getHardwareInfo().gtSystemInfo;
-        param.uint = gtSysInfo.SubSliceCount / gtSysInfo.SliceCount;
+        param.uint = static_cast<cl_uint>(getNumSubSlicesPerSlice(hwInfo));
         src = &param.uint;
         retSize = srcSize = sizeof(cl_uint);
         break;
     }
     case CL_DEVICE_NUM_EUS_PER_SUB_SLICE_INTEL:
-        param.uint = getHardwareInfo().gtSystemInfo.MaxEuPerSubSlice;
+        param.uint = hwInfo.gtSystemInfo.MaxEuPerSubSlice;
         src = &param.uint;
         retSize = srcSize = sizeof(cl_uint);
         break;
     case CL_DEVICE_NUM_THREADS_PER_EU_INTEL: {
-        const auto &gtSysInfo = getHardwareInfo().gtSystemInfo;
+        const auto &gtSysInfo = hwInfo.gtSystemInfo;
         param.uint = gtSysInfo.ThreadCount / gtSysInfo.EUCount;
         src = &param.uint;
         retSize = srcSize = sizeof(cl_uint);
@@ -298,7 +297,7 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
     }
     case CL_DEVICE_FEATURE_CAPABILITIES_INTEL: {
         auto &clGfxCoreHelper = this->getRootDeviceEnvironment().getHelper<ClGfxCoreHelper>();
-        param.bitfield = clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(this->getRootDeviceEnvironment());
+        param.bitfield = clGfxCoreHelper.getSupportedDeviceFeatureCapabilities(hwInfo);
         src = &param.bitfield;
         retSize = srcSize = sizeof(cl_device_feature_capabilities_intel);
         break;
@@ -320,7 +319,7 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
         const void *tmpUuid;
         getStr<CL_DRIVER_UUID_KHR>(tmpUuid, srcSize, retSize);
         uuid.fill(0);
-        memcpy_s(uuid.data(), srcSize, tmpUuid, srcSize);
+        memcpy_s(uuid.data(), CL_UUID_SIZE_KHR, tmpUuid, std::min(srcSize, static_cast<size_t>(CL_UUID_SIZE_KHR)));
         src = uuid.data();
         retSize = srcSize = CL_UUID_SIZE_KHR;
         break;
@@ -353,11 +352,39 @@ cl_int ClDevice::getDeviceInfo(cl_device_info paramName,
         src = getSharedDeviceInfo().threadsPerEUConfigs.begin();
         retSize = srcSize = (getSharedDeviceInfo().threadsPerEUConfigs.size() * sizeof(uint32_t));
         break;
+    case CL_DEVICE_SPIRV_EXTENSIONS_KHR:
+        std::call_once(initializeSpirvQueriesOnce, [this]() {
+            this->initializeSpirvQueries();
+        });
+        src = deviceInfo.spirvExtensions.data();
+        retSize = srcSize = deviceInfo.spirvExtensions.size() * sizeof(const char *);
+        break;
+    case CL_DEVICE_SPIRV_EXTENDED_INSTRUCTION_SETS_KHR:
+        std::call_once(initializeSpirvQueriesOnce, [this]() {
+            this->initializeSpirvQueries();
+        });
+        src = deviceInfo.spirvExtendedInstructionSets.data();
+        retSize = srcSize = deviceInfo.spirvExtendedInstructionSets.size() * sizeof(const char *);
+        break;
+    case CL_DEVICE_SPIRV_CAPABILITIES_KHR:
+        std::call_once(initializeSpirvQueriesOnce, [this]() {
+            this->initializeSpirvQueries();
+        });
+        src = deviceInfo.spirvCapabilities.data();
+        retSize = srcSize = deviceInfo.spirvCapabilities.size() * sizeof(cl_uint);
+        break;
+    case CL_DEVICE_BFLOAT16_FP_ATOMIC_CAPABILITIES_EXT: {
+        param.bitfield = hwInfo.caps.kernelBFloat16AtomicCapabilities;
+        src = &param.bitfield;
+        srcSize = retSize = sizeof(cl_device_atomic_capabilities);
+    } break;
     default:
-        if (getDeviceInfoForImage(paramName, src, srcSize, retSize) && !getSharedDeviceInfo().imageSupport) {
-            src = &value;
-            break;
+        if (getDeviceInfoForImage(paramName, src, srcSize, retSize)) {
+            if (false == getSharedDeviceInfo().imageSupport) {
+                src = &value;
+            }
         }
+        break;
     }
 
     auto getInfoStatus = GetInfo::getInfo(paramValue, paramValueSize, src, srcSize);

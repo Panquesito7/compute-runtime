@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -14,13 +14,14 @@ namespace NEO {
 namespace SysCalls {
 
 unsigned int getProcessId();
+unsigned int getCurrentProcessId();
+std::string getProcessName();
 
 unsigned long getNumThreads();
 
 void exit(int code);
 
-bool pathExists(const std::string &path);
-
+bool isShutdownInProgress();
 } // namespace SysCalls
 
 } // namespace NEO

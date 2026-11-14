@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,14 +7,12 @@
 
 #include "opencl/source/command_queue/cl_local_work_size.h"
 
-#include "shared/source/device/device.h"
-#include "shared/source/helpers/basic_math.h"
-#include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/local_work_size.h"
 #include "shared/source/utilities/logger.h"
 
 #include "opencl/source/context/context.h"
 #include "opencl/source/helpers/dispatch_info.h"
+#include "opencl/source/kernel/kernel.h"
 
 #include <cstdint>
 
@@ -25,30 +23,14 @@ Vec3<size_t> computeWorkgroupSize(const DispatchInfo &dispatchInfo) {
     auto kernel = dispatchInfo.getKernel();
 
     if (kernel != nullptr) {
-        auto &device = dispatchInfo.getClDevice();
-        const auto &rootDeviceEnvironment = device.getRootDeviceEnvironment();
-        auto &gfxCoreHelper = device.getGfxCoreHelper();
-        if (DebugManager.flags.EnableComputeWorkSizeND.get()) {
-            WorkSizeInfo wsInfo = createWorkSizeInfoFromDispatchInfo(dispatchInfo);
-            if (wsInfo.slmTotalSize == 0 && !wsInfo.hasBarriers && !wsInfo.imgUsed && gfxCoreHelper.preferSmallWorkgroupSizeForKernel(kernel->getKernelInfo().heapInfo.kernelUnpaddedSize, rootDeviceEnvironment) &&
-                ((dispatchInfo.getDim() == 1) && (dispatchInfo.getGWS().x % wsInfo.simdSize * 2 == 0))) {
-                wsInfo.maxWorkGroupSize = wsInfo.simdSize * 2;
-            }
-
-            size_t workItems[3] = {dispatchInfo.getGWS().x, dispatchInfo.getGWS().y, dispatchInfo.getGWS().z};
-            computeWorkgroupSizeND(wsInfo, workGroupSize, workItems, dispatchInfo.getDim());
-        } else {
-            auto maxWorkGroupSize = kernel->getMaxKernelWorkGroupSize();
-            auto simd = kernel->getKernelInfo().getMaxSimdSize();
-            size_t workItems[3] = {dispatchInfo.getGWS().x, dispatchInfo.getGWS().y, dispatchInfo.getGWS().z};
-            if (dispatchInfo.getDim() == 1) {
-                computeWorkgroupSize1D(maxWorkGroupSize, workGroupSize, workItems, simd);
-            } else if (DebugManager.flags.EnableComputeWorkSizeSquared.get() && dispatchInfo.getDim() == 2) {
-                computeWorkgroupSizeSquared(maxWorkGroupSize, workGroupSize, workItems, simd, dispatchInfo.getDim());
-            } else {
-                computeWorkgroupSize2D(maxWorkGroupSize, workGroupSize, workItems, simd);
-            }
-        }
+        size_t workItems[3] = {dispatchInfo.getGWS().x, dispatchInfo.getGWS().y, dispatchInfo.getGWS().z};
+        computeWorkgroupSizeForKernel(kernel->getKernelInfo().kernelDescriptor,
+                                      kernel->getMaxKernelWorkGroupSize(),
+                                      static_cast<uint32_t>(kernel->getSlmTotalSizePerThreadGroup()),
+                                      dispatchInfo.getClDevice().getDevice(),
+                                      dispatchInfo.getDim(),
+                                      workItems,
+                                      workGroupSize);
     }
     DBG_LOG(PrintLWSSizes, "Input GWS enqueueBlocked", dispatchInfo.getGWS().x, dispatchInfo.getGWS().y, dispatchInfo.getGWS().z,
             " Driver deduced LWS", workGroupSize[0], workGroupSize[1], workGroupSize[2]);
@@ -92,25 +74,11 @@ void provideLocalWorkGroupSizeHints(Context *context, const DispatchInfo &dispat
 }
 
 WorkSizeInfo createWorkSizeInfoFromDispatchInfo(const DispatchInfo &dispatchInfo) {
-    auto &device = dispatchInfo.getClDevice();
-    const auto &kernelInfo = dispatchInfo.getKernel()->getKernelInfo();
-    auto numThreadsPerSubSlice = static_cast<uint32_t>(device.getSharedDeviceInfo().maxNumEUsPerSubSlice) *
-                                 device.getSharedDeviceInfo().numThreadsPerEU;
-
-    WorkSizeInfo wsInfo(dispatchInfo.getKernel()->getMaxKernelWorkGroupSize(),
-                        kernelInfo.kernelDescriptor.kernelAttributes.usesBarriers(),
-                        static_cast<uint32_t>(kernelInfo.getMaxSimdSize()),
-                        static_cast<uint32_t>(dispatchInfo.getKernel()->getSlmTotalSize()),
-                        device.getRootDeviceEnvironment(),
-                        numThreadsPerSubSlice,
-                        static_cast<uint32_t>(device.getSharedDeviceInfo().localMemSize),
-                        false,
-                        false,
-                        kernelInfo.kernelDescriptor.kernelAttributes.flags.requiresDisabledEUFusion);
-
-    wsInfo.setIfUseImg(kernelInfo);
-
-    return wsInfo;
+    auto kernel = dispatchInfo.getKernel();
+    return createWorkSizeInfoForKernel(kernel->getKernelInfo().kernelDescriptor,
+                                       kernel->getMaxKernelWorkGroupSize(),
+                                       static_cast<uint32_t>(kernel->getSlmTotalSizePerThreadGroup()),
+                                       dispatchInfo.getClDevice().getDevice());
 }
 
 } // namespace NEO

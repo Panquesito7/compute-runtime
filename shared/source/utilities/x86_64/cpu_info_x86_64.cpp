@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2021-2022 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
+#include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/utilities/cpu_info.h"
 
 #ifndef BIT
@@ -13,32 +14,75 @@
 
 namespace NEO {
 void CpuInfo::detect() const {
+    constexpr uint32_t processorInfo = 1;
+    constexpr uint32_t extendedFeatures = 0x7;
+    constexpr uint32_t extendedFunctionId = 0x80000000;
+    constexpr uint32_t addressSize = 0x80000008;
+    constexpr size_t eax = 0;
+    constexpr size_t ebx = 1;
+    constexpr size_t ecx = 2;
+    constexpr size_t edx = 3;
+
+    features = featureNone;
     uint32_t cpuInfo[4] = {};
+    bool osXsave = false;
 
     cpuid(cpuInfo, 0u);
-    auto numFunctionIds = cpuInfo[0];
-    if (numFunctionIds >= 1u) {
-        cpuid(cpuInfo, 1u);
+    auto numFunctionIds = cpuInfo[eax];
+    if (numFunctionIds >= processorInfo) {
+        cpuid(cpuInfo, processorInfo);
         {
-            features |= cpuInfo[3] & BIT(19) ? featureClflush : featureNone;
+            features |= cpuInfo[edx] & BIT(19) ? featureClflush : featureNone;
+            features |= cpuInfo[ecx] & BIT(19) ? featureSse41 : featureNone;
+            osXsave = !!(cpuInfo[ecx] & BIT(27));
         }
     }
 
-    if (numFunctionIds >= 7u) {
-        cpuid(cpuInfo, 7u);
+    if (numFunctionIds >= extendedFeatures) {
+        cpuid(cpuInfo, extendedFeatures);
         {
-            auto mask = BIT(5) | BIT(3) | BIT(8);
-            features |= (cpuInfo[1] & mask) == mask ? featureAvX2 : featureNone;
+            features |= (cpuInfo[ecx] & BIT(5)) ? featureWaitPkg : featureNone;
+
+            if (osXsave) {
+                const uint64_t xcr0 = xgetbvFunc(0);
+
+                constexpr uint64_t avx2CpuMask = BIT(5) | BIT(3) | BIT(8);
+                constexpr uint64_t avx512CpuMask = BIT(16);
+
+                constexpr uint64_t avx2OsMask = BIT(1) | BIT(2);
+                constexpr uint64_t avx512OsMask = BIT(1) | BIT(2) | BIT(5) | BIT(6) | BIT(7);
+
+                if (((cpuInfo[ebx] & avx2CpuMask) == avx2CpuMask) && ((xcr0 & avx2OsMask) == avx2OsMask)) {
+                    features |= featureAvX2;
+                }
+
+                if (((cpuInfo[ebx] & avx512CpuMask) == avx512CpuMask) && ((xcr0 & avx512OsMask) == avx512OsMask)) {
+                    features |= featureAvX512;
+                }
+            }
         }
     }
 
-    cpuid(cpuInfo, 0x80000000);
-    auto maxExtendedId = cpuInfo[0];
-    if (maxExtendedId >= 0x80000008) {
-        cpuid(cpuInfo, 0x80000008);
+    lastLevelCacheSize = getLastLevelCacheSizeFunc();
+
+    cpuid(cpuInfo, extendedFunctionId);
+    auto maxExtendedId = cpuInfo[eax];
+    if (maxExtendedId >= addressSize) {
+        cpuid(cpuInfo, addressSize);
         {
-            virtualAddressSize = (cpuInfo[0] >> 8) & 0xFF;
+            virtualAddressSize = (cpuInfo[eax] >> 8) & 0xFF;
         }
     }
+    featuresDetected = true;
+    PRINT_STRING(debugManager.flags.PrintCpuFlags.get(), stdout,
+                 "CPUFlags:\nCLFlush: %d Avx2: %d Avx512: %d WaitPkg: %d\nVirtual Address Size %u\nLast Level Cache Size %zu\n",
+                 !!(features & featureClflush), !!(features & featureAvX2), !!(features & featureAvX512), !!(features & featureWaitPkg), virtualAddressSize, lastLevelCacheSize);
+}
+
+uint64_t CpuInfo::getMaxCpuVirtualAddress() const {
+    if (getVirtualAddressSize() == 57u && isCpuFlagPresent("la57")) {
+        return maxNBitValue(56);
+    }
+    return maxNBitValue(47);
 }
 } // namespace NEO

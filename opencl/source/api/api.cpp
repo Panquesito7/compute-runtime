@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,27 +8,29 @@
 #include "api.h"
 
 #include "shared/source/aub/aub_center.h"
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/command_stream/command_stream_receiver.h"
 #include "shared/source/debug_settings/debug_settings_manager.h"
 #include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/helpers/constants.h"
 #include "shared/source/helpers/get_info.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
+#include "shared/source/helpers/preprocessor.h"
+#include "shared/source/memory_manager/pool_info.h"
 #include "shared/source/memory_manager/unified_memory_manager.h"
-#include "shared/source/os_interface/debug_env_reader.h"
 #include "shared/source/os_interface/device_factory.h"
+#include "shared/source/utilities/buffer_pool_allocator.inl"
 
-#include "opencl/source/accelerators/intel_motion_estimation.h"
 #include "opencl/source/api/additional_extensions.h"
 #include "opencl/source/api/api_enter.h"
-#include "opencl/source/built_ins/vme_builtin.h"
+#include "opencl/source/api/leo_forwarding.h"
 #include "opencl/source/cl_device/cl_device.h"
 #include "opencl/source/command_queue/command_queue.h"
 #include "opencl/source/context/context.h"
 #include "opencl/source/context/driver_diagnostics.h"
 #include "opencl/source/event/user_event.h"
 #include "opencl/source/execution_environment/cl_execution_environment.h"
+#include "opencl/source/global_teardown/global_platform_teardown.h"
 #include "opencl/source/gtpin/gtpin_notify.h"
 #include "opencl/source/helpers/cl_memory_properties_helpers.h"
 #include "opencl/source/helpers/cl_validators.h"
@@ -40,7 +42,6 @@
 #include "opencl/source/mem_obj/buffer.h"
 #include "opencl/source/mem_obj/image.h"
 #include "opencl/source/mem_obj/mem_obj_helper.h"
-#include "opencl/source/mem_obj/pipe.h"
 #include "opencl/source/platform/platform.h"
 #include "opencl/source/program/program.h"
 #include "opencl/source/sampler/sampler.h"
@@ -54,8 +55,101 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 using namespace NEO;
+
+namespace {
+cl_int buildPlatforms() {
+    const bool leoListAvailable = (leoPlatformEntries != nullptr);
+
+    if (isLeoForcedOn()) {
+        if (!leoListAvailable) {
+            return CL_OUT_OF_HOST_MEMORY;
+        }
+        for (auto handle : getLeoPlatforms()) {
+            leoPlatformEntries->push_back({handle, {}, false});
+        }
+        return leoPlatformEntries->empty() ? CL_OUT_OF_HOST_MEMORY : CL_SUCCESS;
+    }
+
+    auto executionEnvironment = new ClExecutionEnvironment();
+    executionEnvironment->incRefInternal();
+
+    if (NEO::debugManager.flags.ExperimentalEnableL0DebuggerForOpenCL.get()) {
+        const auto programDebugging = NEO::debugManager.flags.ZET_ENABLE_PROGRAM_DEBUGGING.get();
+        const auto dbgMode = NEO::getDebuggingMode(programDebugging);
+        executionEnvironment->setDebuggingMode(dbgMode);
+    }
+
+    std::vector<std::unique_ptr<Device>> allDevices = DeviceFactory::createDevices(*executionEnvironment);
+    const auto leoPlatformKeys = executionEnvironment->getLeoPlatformKeys();
+
+    cl_int retVal = CL_SUCCESS;
+    std::vector<DeviceGroupSortKey> nativeKeys;
+    for (auto &deviceVector : Device::groupDevices(std::move(allDevices))) {
+        const auto &hwInfo = deviceVector[0]->getHardwareInfo();
+        auto pPlatform = Platform::createFunc(*executionEnvironment);
+        if (!pPlatform || !pPlatform->initialize(std::move(deviceVector))) {
+            retVal = CL_OUT_OF_HOST_MEMORY;
+            break;
+        }
+        nativeKeys.push_back({hwInfo.platform.eProductFamily, hwInfo.capabilityTable.isIntegratedDevice});
+        platformsImpl->push_back(std::move(pPlatform));
+    }
+
+    executionEnvironment->decRefInternal();
+    if (retVal != CL_SUCCESS) {
+        return retVal;
+    }
+
+    if (leoListAvailable && !leoPlatformKeys.empty()) {
+        auto leoPlatforms = getLeoPlatforms();
+        const bool pairable = (leoPlatforms.size() == leoPlatformKeys.size());
+        if (!pairable) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "%s", "Warning: LEO platform count does not match detected LEO products; platform ordering degraded\n");
+        }
+        for (size_t i = 0u; i < leoPlatforms.size(); i++) {
+            leoPlatformEntries->push_back({leoPlatforms[i],
+                                           pairable ? leoPlatformKeys[i] : DeviceGroupSortKey{},
+                                           pairable});
+        }
+    }
+
+    if (platformsImpl->empty() && (!leoListAvailable || leoPlatformEntries->empty())) {
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+    return CL_SUCCESS;
+}
+
+void collectExposedPlatforms(StackVec<cl_platform_id, 4> &out) {
+    out.clear();
+    const size_t numLeo = (leoPlatformEntries != nullptr) ? leoPlatformEntries->size() : 0u;
+    out.reserve(platformsImpl->size() + numLeo);
+
+    size_t nativeIdx = 0u;
+    size_t leoIdx = 0u;
+    while (nativeIdx < platformsImpl->size() && leoIdx < numLeo) {
+        const auto &leoEntry = (*leoPlatformEntries)[leoIdx];
+        const auto &nativeHwInfo = (*platformsImpl)[nativeIdx]->getClDevice(0)->getHardwareInfo();
+        const DeviceGroupSortKey nativeKey{nativeHwInfo.platform.eProductFamily, nativeHwInfo.capabilityTable.isIntegratedDevice};
+        if (leoEntry.ordered && compareDeviceGroups(leoEntry.sortKey, nativeKey)) {
+            out.push_back(leoEntry.handle);
+            leoIdx++;
+        } else {
+            out.push_back((*platformsImpl)[nativeIdx].get());
+            nativeIdx++;
+        }
+    }
+    for (; nativeIdx < platformsImpl->size(); nativeIdx++) {
+        out.push_back((*platformsImpl)[nativeIdx].get());
+    }
+    for (; leoIdx < numLeo; leoIdx++) {
+        out.push_back((*leoPlatformEntries)[leoIdx].handle);
+    }
+}
+} // namespace
 
 cl_int CL_API_CALL clGetPlatformIDs(cl_uint numEntries,
                                     cl_platform_id *platforms,
@@ -83,46 +177,22 @@ cl_int CL_API_CALL clGetPlatformIDs(cl_uint numEntries,
 
         static std::mutex mutex;
         std::unique_lock<std::mutex> lock(mutex);
-        if (platformsImpl->empty()) {
-            auto executionEnvironment = new ClExecutionEnvironment();
-            executionEnvironment->incRefInternal();
-
-            NEO::EnvironmentVariableReader envReader;
-            if (NEO::DebugManager.flags.ExperimentalEnableL0DebuggerForOpenCL.get()) {
-                const auto programDebugging = envReader.getSetting("ZET_ENABLE_PROGRAM_DEBUGGING", 0);
-                const auto dbgMode = NEO::getDebuggingMode(programDebugging);
-                executionEnvironment->setDebuggingMode(dbgMode);
-            }
-            if (envReader.getSetting("NEO_FP64_EMULATION", false)) {
-                executionEnvironment->setFP64EmulationEnabled();
-            }
-            auto allDevices = DeviceFactory::createDevices(*executionEnvironment);
-            executionEnvironment->decRefInternal();
-            if (allDevices.empty()) {
-                retVal = CL_OUT_OF_HOST_MEMORY;
-                break;
-            }
-            auto groupedDevices = Platform::groupDevices(std::move(allDevices));
-            for (auto &deviceVector : groupedDevices) {
-
-                auto pPlatform = Platform::createFunc(*executionEnvironment);
-                if (!pPlatform || !pPlatform->initialize(std::move(deviceVector))) {
-                    retVal = CL_OUT_OF_HOST_MEMORY;
-                    break;
-                }
-                platformsImpl->push_back(std::move(pPlatform));
-            }
+        if (platformsImpl->empty() && (leoPlatformEntries == nullptr || leoPlatformEntries->empty())) {
+            retVal = buildPlatforms();
             if (retVal != CL_SUCCESS) {
                 break;
             }
         }
-        cl_uint numPlatformsToExpose = std::min(numEntries, static_cast<cl_uint>(platformsImpl->size()));
+        StackVec<cl_platform_id, 4> allPlatforms;
+        collectExposedPlatforms(allPlatforms);
+
+        cl_uint numPlatformsToExpose = std::min(numEntries, static_cast<cl_uint>(allPlatforms.size()));
         if (numEntries == 0) {
-            numPlatformsToExpose = static_cast<cl_uint>(platformsImpl->size());
+            numPlatformsToExpose = static_cast<cl_uint>(allPlatforms.size());
         }
         if (platforms) {
             for (auto i = 0u; i < numPlatformsToExpose; i++) {
-                platforms[i] = (*platformsImpl)[i].get();
+                platforms[i] = allPlatforms[i];
             }
         }
 
@@ -137,12 +207,14 @@ cl_int CL_API_CALL clGetPlatformIDs(cl_uint numEntries,
 CL_API_ENTRY cl_int CL_API_CALL clIcdGetPlatformIDsKHR(cl_uint numEntries,
                                                        cl_platform_id *platforms,
                                                        cl_uint *numPlatforms) {
+    TRACING_ENTER(ClIcdGetPlatformIDsKHR, &numEntries, &platforms, &numPlatforms);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("numEntries", numEntries,
                    "platforms", platforms,
                    "numPlatforms", numPlatforms);
     retVal = clGetPlatformIDs(numEntries, platforms, numPlatforms);
+    TRACING_EXIT(ClIcdGetPlatformIDsKHR, &retVal);
     return retVal;
 }
 
@@ -151,13 +223,16 @@ cl_int CL_API_CALL clGetPlatformInfo(cl_platform_id platform,
                                      size_t paramValueSize,
                                      void *paramValue,
                                      size_t *paramValueSizeRet) {
+    if (isLeoPlatformHandle(platform)) {
+        return forwardClGetPlatformInfo(platform, paramName, paramValueSize, paramValue, paramValueSizeRet);
+    }
     TRACING_ENTER(ClGetPlatformInfo, &platform, &paramName, &paramValueSize, &paramValue, &paramValueSizeRet);
     cl_int retVal = CL_INVALID_PLATFORM;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("platform", platform,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
     auto pPlatform = castToObject<Platform>(platform);
     if (pPlatform) {
@@ -170,10 +245,10 @@ cl_int CL_API_CALL clGetPlatformInfo(cl_platform_id platform,
 
 bool checkDeviceTypeAndFillDeviceID(ClDevice &device, cl_device_type deviceType, cl_device_id *devices, cl_uint numEntries, cl_uint &retNum) {
     if (deviceType & device.getDeviceInfo().deviceType) {
+        if (retNum >= numEntries) {
+            return false;
+        }
         if (devices) {
-            if (retNum >= numEntries) {
-                return false;
-            }
             devices[retNum] = &device;
         }
         retNum++;
@@ -229,6 +304,10 @@ cl_int CL_API_CALL clGetDeviceIDs(cl_platform_id platform,
                 retVal = CL_DEVICE_NOT_FOUND;
                 break;
             }
+            if (platformsImpl->empty()) {
+                retVal = CL_DEVICE_NOT_FOUND;
+                break;
+            }
             pPlatform = (*platformsImpl)[0].get();
         }
 
@@ -239,10 +318,13 @@ cl_int CL_API_CALL clGetDeviceIDs(cl_platform_id platform,
             break;
         }
 
-        if (DebugManager.flags.LimitAmountOfReturnedDevices.get()) {
-            numDev = std::min(static_cast<cl_uint>(DebugManager.flags.LimitAmountOfReturnedDevices.get()), numDev);
+        if (debugManager.flags.LimitAmountOfReturnedDevices.get()) {
+            numDev = std::min(static_cast<cl_uint>(debugManager.flags.LimitAmountOfReturnedDevices.get()), numDev);
         }
 
+        if (devices == nullptr) {
+            numEntries = std::numeric_limits<cl_uint>::max();
+        }
         if (deviceType == CL_DEVICE_TYPE_ALL) {
             /* According to Spec, set it to all except TYPE_CUSTOM. */
             deviceType = CL_DEVICE_TYPE_GPU | CL_DEVICE_TYPE_CPU |
@@ -250,15 +332,12 @@ cl_int CL_API_CALL clGetDeviceIDs(cl_platform_id platform,
         } else if (deviceType == CL_DEVICE_TYPE_DEFAULT) {
             /* We just set it to GPU now. */
             deviceType = CL_DEVICE_TYPE_GPU;
+            numEntries = 1;
         }
 
         cl_uint retNum = 0;
         for (auto platformDeviceIndex = 0u; platformDeviceIndex < numDev; platformDeviceIndex++) {
-            bool exposeSubDevices = false;
-
-            if (DebugManager.flags.ReturnSubDevicesAsApiDevices.get() != -1) {
-                exposeSubDevices = DebugManager.flags.ReturnSubDevicesAsApiDevices.get();
-            }
+            bool exposeSubDevices = pPlatform->peekExecutionEnvironment()->getDeviceHierarchyMode() != DeviceHierarchyMode::composite;
 
             ClDevice *device = pPlatform->getClDevice(platformDeviceIndex);
             UNRECOVERABLE_IF(device == nullptr);
@@ -289,8 +368,9 @@ cl_int CL_API_CALL clGetDeviceIDs(cl_platform_id platform,
         }
 
         /* If no suitable device, set a error. */
-        if (retNum == 0)
+        if (retNum == 0) {
             retVal = CL_DEVICE_NOT_FOUND;
+        }
     } while (false);
     TRACING_EXIT(ClGetDeviceIDs, &retVal);
     return retVal;
@@ -304,7 +384,7 @@ cl_int CL_API_CALL clGetDeviceInfo(cl_device_id device,
     TRACING_ENTER(ClGetDeviceInfo, &device, &paramName, &paramValueSize, &paramValue, &paramValueSizeRet);
     cl_int retVal = CL_INVALID_DEVICE;
     API_ENTER(&retVal);
-    DBG_LOG_INPUTS("clDevice", device, "paramName", paramName, "paramValueSize", paramValueSize, "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize), "paramValueSizeRet", paramValueSizeRet);
+    DBG_LOG_INPUTS("clDevice", device, "paramName", paramName, "paramValueSize", paramValueSize, "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize), "paramValueSizeRet", paramValueSizeRet);
 
     ClDevice *pDevice = castToObject<ClDevice>(device);
     if (pDevice != nullptr) {
@@ -320,41 +400,54 @@ cl_int CL_API_CALL clCreateSubDevices(cl_device_id inDevice,
                                       cl_uint numDevices,
                                       cl_device_id *outDevices,
                                       cl_uint *numDevicesRet) {
+    TRACING_ENTER(ClCreateSubDevices, &inDevice, &properties, &numDevices, &outDevices, &numDevicesRet);
+    cl_int retVal = CL_INVALID_DEVICE;
+    API_ENTER(&retVal);
+    do {
+        ClDevice *pInDevice = castToObject<ClDevice>(inDevice);
+        if (pInDevice == nullptr) {
+            break;
+        }
+        auto subDevicesCount = pInDevice->getNumSubDevices();
 
-    ClDevice *pInDevice = castToObject<ClDevice>(inDevice);
-    if (pInDevice == nullptr) {
-        return CL_INVALID_DEVICE;
-    }
-    auto subDevicesCount = pInDevice->getNumSubDevices();
-    if (subDevicesCount <= 1) {
-        return CL_DEVICE_PARTITION_FAILED;
-    }
-    if ((properties == nullptr) ||
-        (properties[0] != CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN) ||
-        ((properties[1] != CL_DEVICE_AFFINITY_DOMAIN_NUMA) && (properties[1] != CL_DEVICE_AFFINITY_DOMAIN_NEXT_PARTITIONABLE)) ||
-        (properties[2] != 0)) {
-        return CL_INVALID_VALUE;
-    }
+        if (pInDevice->getDevice().getRootDeviceEnvironment().isExposeSingleDeviceMode()) {
+            subDevicesCount = 0;
+        }
+        if (subDevicesCount <= 1) {
+            retVal = CL_DEVICE_PARTITION_FAILED;
+            break;
+        }
+        if ((properties == nullptr) ||
+            (properties[0] != CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN) ||
+            ((properties[1] != CL_DEVICE_AFFINITY_DOMAIN_NUMA) && (properties[1] != CL_DEVICE_AFFINITY_DOMAIN_NEXT_PARTITIONABLE)) ||
+            (properties[2] != 0)) {
+            retVal = CL_INVALID_VALUE;
+            break;
+        }
 
-    if (numDevicesRet != nullptr) {
-        *numDevicesRet = subDevicesCount;
-    }
+        if (numDevicesRet != nullptr) {
+            *numDevicesRet = subDevicesCount;
+        }
 
-    if (outDevices == nullptr) {
-        return CL_SUCCESS;
-    }
+        if (outDevices == nullptr) {
+            retVal = CL_SUCCESS;
+            break;
+        }
 
-    if (numDevices < subDevicesCount) {
-        return CL_INVALID_VALUE;
-    }
+        if (numDevices < subDevicesCount) {
+            retVal = CL_INVALID_VALUE;
+            break;
+        }
 
-    for (uint32_t i = 0; i < subDevicesCount; i++) {
-        auto pClDevice = pInDevice->getSubDevice(i);
-        pClDevice->retainApi();
-        outDevices[i] = pClDevice;
-    }
-
-    return CL_SUCCESS;
+        for (uint32_t i = 0; i < subDevicesCount; i++) {
+            auto pClDevice = pInDevice->getSubDevice(i);
+            pClDevice->retainApi();
+            outDevices[i] = pClDevice;
+        }
+        retVal = CL_SUCCESS;
+    } while (false);
+    TRACING_EXIT(ClCreateSubDevices, &retVal);
+    return retVal;
 }
 
 cl_int CL_API_CALL clRetainDevice(cl_device_id device) {
@@ -374,7 +467,12 @@ cl_int CL_API_CALL clRetainDevice(cl_device_id device) {
 
 cl_int CL_API_CALL clReleaseDevice(cl_device_id device) {
     TRACING_ENTER(ClReleaseDevice, &device);
-    cl_int retVal = CL_INVALID_DEVICE;
+    cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseDevice, &retVal);
+        return CL_SUCCESS;
+    }
+    retVal = CL_INVALID_DEVICE;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("device", device);
     auto pDevice = castToObject<ClDevice>(device);
@@ -394,12 +492,13 @@ cl_context CL_API_CALL clCreateContext(const cl_context_properties *properties,
                                                                      size_t, void *),
                                        void *userData,
                                        cl_int *errcodeRet) {
+    gtPinTryNotifyInit();
     TRACING_ENTER(ClCreateContext, &properties, &numDevices, &devices, &funcNotify, &userData, &errcodeRet);
 
     cl_int retVal = CL_SUCCESS;
     cl_context context = nullptr;
     API_ENTER(&retVal);
-    DBG_LOG_INPUTS("properties", properties, "numDevices", numDevices, "cl_device_id", devices, "funcNotify", funcNotify, "userData", userData);
+    DBG_LOG_INPUTS("properties", properties, "numDevices", numDevices, "cl_device_id", devices, "funcNotify", reinterpret_cast<void *>(funcNotify), "userData", userData);
 
     do {
         if (devices == nullptr) {
@@ -410,8 +509,9 @@ cl_context CL_API_CALL clCreateContext(const cl_context_properties *properties,
 
         /* validateObjects make sure numDevices != 0. */
         retVal = validateObjects(DeviceList(numDevices, devices));
-        if (retVal != CL_SUCCESS)
+        if (retVal != CL_SUCCESS) {
             break;
+        }
 
         if (funcNotify == nullptr && userData != nullptr) {
             retVal = CL_INVALID_VALUE;
@@ -451,11 +551,12 @@ cl_context CL_API_CALL clCreateContextFromType(const cl_context_properties *prop
                                                                              size_t, void *),
                                                void *userData,
                                                cl_int *errcodeRet) {
+    gtPinTryNotifyInit();
     TRACING_ENTER(ClCreateContextFromType, &properties, &deviceType, &funcNotify, &userData, &errcodeRet);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
-    DBG_LOG_INPUTS("properties", properties, "deviceType", deviceType, "funcNotify", funcNotify, "userData", userData);
-    Context *pContext = nullptr;
+    DBG_LOG_INPUTS("properties", properties, "deviceType", deviceType, "funcNotify", reinterpret_cast<void *>(funcNotify), "userData", userData);
+    cl_context context = nullptr;
 
     do {
         if (funcNotify == nullptr && userData != nullptr) {
@@ -474,20 +575,20 @@ cl_context CL_API_CALL clCreateContextFromType(const cl_context_properties *prop
         }
 
         DEBUG_BREAK_IF(numDevices <= 0);
-        cl_device_id device = nullptr;
+        std::vector<cl_device_id> devices(numDevices, nullptr);
 
-        retVal = clGetDeviceIDs(pPlatform, deviceType, 1, &device, nullptr);
+        retVal = clGetDeviceIDs(pPlatform, deviceType, numDevices, devices.data(), nullptr);
         DEBUG_BREAK_IF(retVal != CL_SUCCESS);
 
-        ClDeviceVector deviceVector(&device, 1);
-        pContext = Context::create<Context>(properties, deviceVector, funcNotify, userData, retVal);
+        ClDeviceVector deviceVector(devices.data(), numDevices);
+        context = Context::create<Context>(properties, deviceVector, funcNotify, userData, retVal);
     } while (false);
 
     if (errcodeRet) {
         *errcodeRet = retVal;
     }
-    TRACING_EXIT(ClCreateContextFromType, (cl_context *)&pContext);
-    return pContext;
+    TRACING_EXIT(ClCreateContextFromType, &context);
+    return context;
 }
 
 cl_int CL_API_CALL clRetainContext(cl_context context) {
@@ -509,6 +610,10 @@ cl_int CL_API_CALL clRetainContext(cl_context context) {
 cl_int CL_API_CALL clReleaseContext(cl_context context) {
     TRACING_ENTER(ClReleaseContext, &context);
     cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseContext, &retVal);
+        return CL_SUCCESS;
+    }
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("context", context);
     Context *pContext = castToObject<Context>(context);
@@ -533,7 +638,7 @@ cl_int CL_API_CALL clGetContextInfo(cl_context context,
     DBG_LOG_INPUTS("context", context,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
     auto pContext = castToObject<Context>(context);
 
@@ -550,7 +655,7 @@ cl_command_queue CL_API_CALL clCreateCommandQueue(cl_context context,
                                                   cl_device_id device,
                                                   const cl_command_queue_properties properties,
                                                   cl_int *errcodeRet) {
-    TRACING_ENTER(ClCreateCommandQueue, &context, &device, (cl_command_queue_properties *)&properties, &errcodeRet);
+    TRACING_ENTER(ClCreateCommandQueue, &context, &device, &properties, &errcodeRet);
     cl_command_queue commandQueue = nullptr;
     ErrorCodeHelper err(errcodeRet, CL_SUCCESS);
     cl_int retVal = CL_SUCCESS;
@@ -595,9 +700,6 @@ cl_command_queue CL_API_CALL clCreateCommandQueue(cl_context context,
             pContext->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, DRIVER_CALLS_INTERNAL_CL_FLUSH);
             if (castToObjectOrAbort<CommandQueue>(commandQueue)->isProfilingEnabled()) {
                 pContext->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, PROFILING_ENABLED);
-                if (pDevice->getDeviceInfo().preemptionSupported && pDevice->getHardwareInfo().platform.eProductFamily < IGFX_SKYLAKE) {
-                    pContext->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, PROFILING_ENABLED_WITH_DISABLED_PREEMPTION);
-                }
             }
         }
     } while (false);
@@ -625,7 +727,12 @@ cl_int CL_API_CALL clRetainCommandQueue(cl_command_queue commandQueue) {
 
 cl_int CL_API_CALL clReleaseCommandQueue(cl_command_queue commandQueue) {
     TRACING_ENTER(ClReleaseCommandQueue, &commandQueue);
-    cl_int retVal = CL_INVALID_COMMAND_QUEUE;
+    cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseCommandQueue, &retVal);
+        return CL_SUCCESS;
+    }
+    retVal = CL_INVALID_COMMAND_QUEUE;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue);
 
@@ -650,7 +757,7 @@ cl_int CL_API_CALL clGetCommandQueueInfo(cl_command_queue commandQueue,
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     getQueueInfo(commandQueue, paramName, paramValueSize, paramValue, paramValueSizeRet, retVal);
@@ -670,7 +777,7 @@ cl_int CL_API_CALL clSetCommandQueueProperty(cl_command_queue commandQueue,
                                              cl_bool enable,
                                              cl_command_queue_properties *oldProperties) {
     TRACING_ENTER(ClSetCommandQueueProperty, &commandQueue, &properties, &enable, &oldProperties);
-    cl_int retVal = CL_INVALID_VALUE;
+    cl_int retVal = CL_INVALID_OPERATION;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "properties", properties,
@@ -685,15 +792,15 @@ cl_mem CL_API_CALL clCreateBuffer(cl_context context,
                                   size_t size,
                                   void *hostPtr,
                                   cl_int *errcodeRet) {
-    if (DebugManager.flags.ForceExtendedBufferSize.get() >= 1) {
-        size += (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedBufferSize.get());
+    if (debugManager.flags.ForceExtendedBufferSize.get() >= 1) {
+        size += (MemoryConstants::pageSize * debugManager.flags.ForceExtendedBufferSize.get());
     }
 
     TRACING_ENTER(ClCreateBuffer, &context, &flags, &size, &hostPtr, &errcodeRet);
     DBG_LOG_INPUTS("cl_context", context,
                    "cl_mem_flags", flags,
                    "size", size,
-                   "hostPtr", NEO::fileLoggerInstance().infoPointerToString(hostPtr, size));
+                   "hostPtr", NEO::getClFileLogger().infoPointerToString(hostPtr, size));
 
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
@@ -714,15 +821,17 @@ cl_mem CL_API_CALL clCreateBufferWithProperties(cl_context context,
                                                 size_t size,
                                                 void *hostPtr,
                                                 cl_int *errcodeRet) {
-    if (DebugManager.flags.ForceExtendedBufferSize.get() >= 1) {
-        size += (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedBufferSize.get());
+
+    TRACING_ENTER(ClCreateBufferWithProperties, &context, &properties, &flags, &size, &hostPtr, &errcodeRet);
+    if (debugManager.flags.ForceExtendedBufferSize.get() >= 1) {
+        size += (MemoryConstants::pageSize * debugManager.flags.ForceExtendedBufferSize.get());
     }
 
     DBG_LOG_INPUTS("cl_context", context,
                    "cl_mem_properties", properties,
                    "cl_mem_flags", flags,
                    "size", size,
-                   "hostPtr", NEO::fileLoggerInstance().infoPointerToString(hostPtr, size));
+                   "hostPtr", NEO::getClFileLogger().infoPointerToString(hostPtr, size));
 
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
@@ -732,6 +841,7 @@ cl_mem CL_API_CALL clCreateBufferWithProperties(cl_context context,
 
     ErrorCodeHelper{errcodeRet, retVal};
     DBG_LOG_INPUTS("buffer", buffer);
+    TRACING_EXIT(ClCreateBufferWithProperties, &buffer);
     return buffer;
 }
 
@@ -741,15 +851,18 @@ cl_mem CL_API_CALL clCreateBufferWithPropertiesINTEL(cl_context context,
                                                      size_t size,
                                                      void *hostPtr,
                                                      cl_int *errcodeRet) {
-    if (DebugManager.flags.ForceExtendedBufferSize.get() >= 1) {
-        size += (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedBufferSize.get());
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clCreateBufferWithPropertiesINTEL, context, properties, flags, size, hostPtr, errcodeRet);
+
+    TRACING_ENTER(ClCreateBufferWithPropertiesINTEL, &context, &properties, &flags, &size, &hostPtr, &errcodeRet);
+    if (debugManager.flags.ForceExtendedBufferSize.get() >= 1) {
+        size += (MemoryConstants::pageSize * debugManager.flags.ForceExtendedBufferSize.get());
     }
 
     DBG_LOG_INPUTS("cl_context", context,
                    "cl_mem_properties_intel", properties,
                    "cl_mem_flags", flags,
                    "size", size,
-                   "hostPtr", NEO::fileLoggerInstance().infoPointerToString(hostPtr, size));
+                   "hostPtr", NEO::getClFileLogger().infoPointerToString(hostPtr, size));
 
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
@@ -759,6 +872,7 @@ cl_mem CL_API_CALL clCreateBufferWithPropertiesINTEL(cl_context context,
 
     ErrorCodeHelper{errcodeRet, retVal};
     DBG_LOG_INPUTS("buffer", buffer);
+    TRACING_EXIT(ClCreateBufferWithPropertiesINTEL, &buffer);
     return buffer;
 }
 
@@ -790,7 +904,7 @@ cl_mem CL_API_CALL clCreateSubBuffer(cl_mem buffer,
         }
 
         if (parentBuffer->isSubBuffer() == true) {
-            if (!parentBuffer->getContext()->getBufferPoolAllocator().isPoolBuffer(parentBuffer->getAssociatedMemObject())) {
+            if (!parentBuffer->getContext()->isPoolBuffer(parentBuffer->getAssociatedMemObject())) {
                 retVal = CL_INVALID_MEM_OBJECT;
                 break;
             }
@@ -882,7 +996,7 @@ cl_mem CL_API_CALL clCreateImage(cl_context context,
                    "cl_image_format.channel_data_type", imageFormat->image_channel_data_type,
                    "cl_image_format.channel_order", imageFormat->image_channel_order,
                    "cl_image_desc.width", imageDesc->image_width,
-                   "cl_image_desc.heigth", imageDesc->image_height,
+                   "cl_image_desc.height", imageDesc->image_height,
                    "cl_image_desc.depth", imageDesc->image_depth,
                    "cl_image_desc.type", imageDesc->image_type,
                    "cl_image_desc.array_size", imageDesc->image_array_size,
@@ -915,13 +1029,14 @@ cl_mem CL_API_CALL clCreateImageWithProperties(cl_context context,
                                                void *hostPtr,
                                                cl_int *errcodeRet) {
 
+    TRACING_ENTER(ClCreateImageWithProperties, &context, &properties, &flags, &imageFormat, &imageDesc, &hostPtr, &errcodeRet);
     DBG_LOG_INPUTS("cl_context", context,
                    "cl_mem_properties", properties,
                    "cl_mem_flags", flags,
                    "cl_image_format.channel_data_type", imageFormat->image_channel_data_type,
                    "cl_image_format.channel_order", imageFormat->image_channel_order,
                    "cl_image_desc.width", imageDesc->image_width,
-                   "cl_image_desc.heigth", imageDesc->image_height,
+                   "cl_image_desc.height", imageDesc->image_height,
                    "cl_image_desc.depth", imageDesc->image_depth,
                    "cl_image_desc.type", imageDesc->image_type,
                    "cl_image_desc.array_size", imageDesc->image_array_size,
@@ -941,6 +1056,7 @@ cl_mem CL_API_CALL clCreateImageWithProperties(cl_context context,
 
     ErrorCodeHelper{errcodeRet, retVal};
     DBG_LOG_INPUTS("image", image);
+    TRACING_EXIT(ClCreateImageWithProperties, &image);
     return image;
 }
 
@@ -951,14 +1067,16 @@ cl_mem CL_API_CALL clCreateImageWithPropertiesINTEL(cl_context context,
                                                     const cl_image_desc *imageDesc,
                                                     void *hostPtr,
                                                     cl_int *errcodeRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clCreateImageWithPropertiesINTEL, context, properties, flags, imageFormat, imageDesc, hostPtr, errcodeRet);
 
+    TRACING_ENTER(ClCreateImageWithPropertiesINTEL, &context, &properties, &flags, &imageFormat, &imageDesc, &hostPtr, &errcodeRet);
     DBG_LOG_INPUTS("cl_context", context,
                    "cl_mem_properties_intel", properties,
                    "cl_mem_flags", flags,
                    "cl_image_format.channel_data_type", imageFormat->image_channel_data_type,
                    "cl_image_format.channel_order", imageFormat->image_channel_order,
                    "cl_image_desc.width", imageDesc->image_width,
-                   "cl_image_desc.heigth", imageDesc->image_height,
+                   "cl_image_desc.height", imageDesc->image_height,
                    "cl_image_desc.depth", imageDesc->image_depth,
                    "cl_image_desc.type", imageDesc->image_type,
                    "cl_image_desc.array_size", imageDesc->image_array_size,
@@ -972,6 +1090,7 @@ cl_mem CL_API_CALL clCreateImageWithPropertiesINTEL(cl_context context,
 
     ErrorCodeHelper{errcodeRet, retVal};
     DBG_LOG_INPUTS("image", image);
+    TRACING_EXIT(ClCreateImageWithPropertiesINTEL, &image);
     return image;
 }
 
@@ -1094,10 +1213,22 @@ cl_int CL_API_CALL clRetainMemObject(cl_mem memobj) {
 
 cl_int CL_API_CALL clReleaseMemObject(cl_mem memobj) {
     TRACING_ENTER(ClReleaseMemObject, &memobj);
-    cl_int retVal = CL_INVALID_MEM_OBJECT;
+    cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseMemObject, &retVal);
+        return CL_SUCCESS;
+    }
+    retVal = CL_INVALID_MEM_OBJECT;
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("memobj", memobj);
+
+    if (debugManager.flags.FillBufferTailWithPattern.get() != 0) {
+        auto pBuffer = castToObject<Buffer>(memobj);
+        if ((pBuffer != nullptr) && (pBuffer->getRefApiCount() == 1) && (false == pBuffer->isTailPatternValid())) {
+            PRINT_STRING(debugManager.flags.PrintDebugMessages.get(), stderr, "Buffer tail pattern corrupted on release: buffer=%p\n", static_cast<void *>(pBuffer));
+        }
+    }
 
     auto pMemObj = castToObject<MemObj>(memobj);
     if (pMemObj) {
@@ -1157,7 +1288,7 @@ cl_int CL_API_CALL clGetMemObjectInfo(cl_mem memobj,
     DBG_LOG_INPUTS("memobj", memobj,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
     MemObj *pMemObj = nullptr;
     retVal = validateObjects(withCastToInternal(memobj, &pMemObj));
@@ -1183,7 +1314,7 @@ cl_int CL_API_CALL clGetImageInfo(cl_mem image,
     DBG_LOG_INPUTS("image", image,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
     retVal = validateObjects(image);
     if (CL_SUCCESS != retVal) {
@@ -1208,6 +1339,8 @@ cl_int CL_API_CALL clGetImageParamsINTEL(cl_context context,
                                          const cl_image_desc *imageDesc,
                                          size_t *imageRowPitch,
                                          size_t *imageSlicePitch) {
+
+    TRACING_ENTER(ClGetImageParamsINTEL, &context, &imageFormat, &imageDesc, &imageRowPitch, &imageSlicePitch);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("context", context,
@@ -1230,14 +1363,14 @@ cl_int CL_API_CALL clGetImageParamsINTEL(cl_context context,
     }
     if (CL_SUCCESS == retVal) {
         auto pClDevice = pContext->getDevice(0);
-        surfaceFormat = Image::getSurfaceFormatFromTable(memFlags, imageFormat,
-                                                         pClDevice->getHardwareInfo().capabilityTable.supportsOcl21Features);
+        surfaceFormat = Image::getSurfaceFormatFromTable(memFlags, imageFormat);
         retVal = Image::validate(pContext, ClMemoryPropertiesHelper::createMemoryProperties(memFlags, 0, 0, &pClDevice->getDevice()),
                                  surfaceFormat, imageDesc, nullptr);
     }
     if (CL_SUCCESS == retVal) {
         retVal = Image::getImageParams(pContext, memFlags, surfaceFormat, imageDesc, imageRowPitch, imageSlicePitch);
     }
+    TRACING_EXIT(ClGetImageParamsINTEL, &retVal);
     return retVal;
 }
 
@@ -1247,8 +1380,8 @@ cl_int CL_API_CALL clSetMemObjectDestructorCallback(cl_mem memobj,
     TRACING_ENTER(ClSetMemObjectDestructorCallback, &memobj, &funcNotify, &userData);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
-    DBG_LOG_INPUTS("memobj", memobj, "funcNotify", funcNotify, "userData", userData);
-    retVal = validateObjects(memobj, (void *)funcNotify);
+    DBG_LOG_INPUTS("memobj", memobj, "funcNotify", reinterpret_cast<void *>(funcNotify), "userData", userData);
+    retVal = validateObjects(memobj, reinterpret_cast<void *>(funcNotify));
 
     if (CL_SUCCESS != retVal) {
         TRACING_EXIT(ClSetMemObjectDestructorCallback, &retVal);
@@ -1316,6 +1449,10 @@ cl_int CL_API_CALL clRetainSampler(cl_sampler sampler) {
 cl_int CL_API_CALL clReleaseSampler(cl_sampler sampler) {
     TRACING_ENTER(ClReleaseSampler, &sampler);
     cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseSampler, &retVal);
+        return CL_SUCCESS;
+    }
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("sampler", sampler);
     auto pSampler = castToObject<Sampler>(sampler);
@@ -1340,7 +1477,7 @@ cl_int CL_API_CALL clGetSamplerInfo(cl_sampler sampler,
     DBG_LOG_INPUTS("sampler", sampler,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     auto pSampler = castToObject<Sampler>(sampler);
@@ -1423,7 +1560,7 @@ cl_program CL_API_CALL clCreateProgramWithBinary(cl_context context,
         }
     }
 
-    NEO::fileLoggerInstance().dumpBinaryProgram(numDevices, lengths, binaries);
+    NEO::getClFileLogger().dumpBinaryProgram(numDevices, lengths, binaries);
 
     if (CL_SUCCESS == retVal) {
         program = Program::create(
@@ -1481,36 +1618,12 @@ cl_program CL_API_CALL clCreateProgramWithBuiltInKernels(cl_context context,
     TRACING_ENTER(ClCreateProgramWithBuiltInKernels, &context, &numDevices, &deviceList, &kernelNames, &errcodeRet);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
+    cl_program program = nullptr;
     DBG_LOG_INPUTS("context", context,
                    "numDevices", numDevices,
                    "deviceList", deviceList,
                    "kernelNames", kernelNames);
-    cl_program program = nullptr;
-    Context *pContext = nullptr;
-
-    retVal = validateObjects(withCastToInternal(context, &pContext), numDevices,
-                             deviceList, kernelNames, errcodeRet);
-
-    if (retVal == CL_SUCCESS) {
-        ClDeviceVector deviceVector;
-        for (auto i = 0u; i < numDevices; i++) {
-            auto device = castToObject<ClDevice>(deviceList[i]);
-            if (!device || !pContext->isDeviceAssociated(*device)) {
-                retVal = CL_INVALID_DEVICE;
-                break;
-            }
-            deviceVector.push_back(device);
-        }
-        if (retVal == CL_SUCCESS) {
-
-            program = Vme::createBuiltInProgram(
-                *pContext,
-                deviceVector,
-                kernelNames,
-                retVal);
-        }
-    }
-
+    retVal = CL_INVALID_VALUE;
     if (errcodeRet) {
         *errcodeRet = retVal;
     }
@@ -1538,6 +1651,10 @@ cl_int CL_API_CALL clRetainProgram(cl_program program) {
 cl_int CL_API_CALL clReleaseProgram(cl_program program) {
     TRACING_ENTER(ClReleaseProgram, &program);
     cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseProgram, &retVal);
+        return CL_SUCCESS;
+    }
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("program", program);
     auto pProgram = castToObject<Program>(program);
@@ -1560,7 +1677,7 @@ cl_int CL_API_CALL clBuildProgram(cl_program program,
     TRACING_ENTER(ClBuildProgram, &program, &numDevices, &deviceList, &options, &funcNotify, &userData);
     cl_int retVal = CL_INVALID_PROGRAM;
     API_ENTER(&retVal);
-    DBG_LOG_INPUTS("clProgram", program, "numDevices", numDevices, "cl_device_id", deviceList, "options", (options != nullptr) ? options : "", "funcNotify", funcNotify, "userData", userData);
+    DBG_LOG_INPUTS("clProgram", program, "numDevices", numDevices, "cl_device_id", deviceList, "options", (options != nullptr) ? options : "", "funcNotify", reinterpret_cast<void *>(funcNotify), "userData", userData);
     Program *pProgram = nullptr;
 
     retVal = validateObjects(withCastToInternal(program, &pProgram), Program::isValidCallback(funcNotify, userData));
@@ -1642,7 +1759,7 @@ cl_program CL_API_CALL clLinkProgram(cl_context context,
 
     ErrorCodeHelper err(errcodeRet, CL_SUCCESS);
     Context *pContext = nullptr;
-    Program *pProgram = nullptr;
+    cl_program clProgram = nullptr;
 
     retVal = validateObjects(withCastToInternal(context, &pContext), Program::isValidCallback(funcNotify, userData));
 
@@ -1653,17 +1770,16 @@ cl_program CL_API_CALL clLinkProgram(cl_context context,
     }
 
     if (CL_SUCCESS == retVal) {
-
-        pProgram = new Program(pContext, false, *deviceVectorPtr);
+        clProgram = new Program(pContext, false, *deviceVectorPtr);
+        auto pProgram = castToObject<Program>(clProgram);
         retVal = pProgram->link(*deviceVectorPtr, options,
                                 numInputPrograms, inputPrograms);
         pProgram->invokeCallback(funcNotify, userData);
     }
 
     err.set(retVal);
-
-    TRACING_EXIT(ClLinkProgram, (cl_program *)&pProgram);
-    return pProgram;
+    TRACING_EXIT(ClLinkProgram, &clProgram);
+    return clProgram;
 }
 
 cl_int CL_API_CALL clUnloadPlatformCompiler(cl_platform_id platform) {
@@ -1688,13 +1804,12 @@ cl_int CL_API_CALL clGetProgramInfo(cl_program program,
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("clProgram", program, "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
-    retVal = validateObjects(program);
+    Program *pProgram = nullptr;
+    retVal = validateObjects(withCastToInternal(program, &pProgram));
 
     if (CL_SUCCESS == retVal) {
-        Program *pProgram = (Program *)(program);
-
         retVal = pProgram->getInfo(
             paramName,
             paramValueSize,
@@ -1715,7 +1830,7 @@ cl_int CL_API_CALL clGetProgramBuildInfo(cl_program program,
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("clProgram", program, "cl_device_id", device,
-                   "paramName", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramName", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSize", paramValueSize, "paramValue", paramValue,
                    "paramValueSizeRet", paramValueSizeRet);
     Program *pProgram = nullptr;
@@ -1796,7 +1911,6 @@ cl_kernel CL_API_CALL clCreateKernel(cl_program clProgram,
     if (errcodeRet) {
         *errcodeRet = retVal;
     }
-    gtpinNotifyKernelCreate(kernel);
     TRACING_EXIT(ClCreateKernel, &kernel);
     return kernel;
 }
@@ -1846,7 +1960,6 @@ cl_int CL_API_CALL clCreateKernelsInProgram(cl_program clProgram,
                     TRACING_EXIT(ClCreateKernelsInProgram, &retVal);
                     return retVal;
                 }
-                gtpinNotifyKernelCreate(kernels[i]);
             }
         }
 
@@ -1880,6 +1993,10 @@ cl_int CL_API_CALL clRetainKernel(cl_kernel kernel) {
 cl_int CL_API_CALL clReleaseKernel(cl_kernel kernel) {
     TRACING_ENTER(ClReleaseKernel, &kernel);
     cl_int retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseKernel, &retVal);
+        return CL_SUCCESS;
+    }
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("kernel", kernel);
     auto pMultiDeviceKernel = castToObject<MultiDeviceKernel>(kernel);
@@ -1903,7 +2020,7 @@ cl_int CL_API_CALL clSetKernelArg(cl_kernel kernel,
     MultiDeviceKernel *pMultiDeviceKernel = nullptr;
     retVal = validateObject(withCastToInternal(kernel, &pMultiDeviceKernel));
     DBG_LOG_INPUTS("kernel", kernel, "argIndex", argIndex,
-                   "argSize", argSize, "argValue", NEO::fileLoggerInstance().infoPointerToString(argValue, argSize));
+                   "argSize", argSize, "argValue", NEO::getClFileLogger().infoPointerToString(argValue, argSize));
     do {
         if (retVal != CL_SUCCESS) {
             break;
@@ -1938,7 +2055,7 @@ cl_int CL_API_CALL clGetKernelInfo(cl_kernel kernel,
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("kernel", kernel, "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
     MultiDeviceKernel *pMultiDeviceKernel = nullptr;
     retVal = validateObject(withCastToInternal(kernel, &pMultiDeviceKernel));
@@ -1967,7 +2084,7 @@ cl_int CL_API_CALL clGetKernelArgInfo(cl_kernel kernel,
                    "argIndx", argIndx,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     auto pMultiDeviceKernel = castToObject<MultiDeviceKernel>(kernel);
@@ -1997,7 +2114,7 @@ cl_int CL_API_CALL clGetKernelWorkGroupInfo(cl_kernel kernel,
                    "device", device,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     MultiDeviceKernel *pMultiDeviceKernel = nullptr;
@@ -2031,8 +2148,9 @@ cl_int CL_API_CALL clWaitForEvents(cl_uint numEvents,
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("eventList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventList), numEvents));
 
-    for (unsigned int i = 0; i < numEvents && retVal == CL_SUCCESS; i++)
+    for (unsigned int i = 0; i < numEvents && retVal == CL_SUCCESS; i++) {
         retVal = validateObjects(eventList[i]);
+    }
 
     if (retVal != CL_SUCCESS) {
         TRACING_EXIT(ClWaitForEvents, &retVal);
@@ -2056,7 +2174,7 @@ cl_int CL_API_CALL clGetEventInfo(cl_event event,
     DBG_LOG_INPUTS("event", event,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     Event *neoEvent = castToObject<Event>(event);
@@ -2097,7 +2215,7 @@ cl_int CL_API_CALL clGetEventInfo(cl_event event,
         TRACING_EXIT(ClGetEventInfo, &retVal);
         return retVal;
     case CL_EVENT_COMMAND_EXECUTION_STATUS:
-        if (DebugManager.flags.SkipFlushingEventsOnGetStatusCalls.get()) {
+        if (debugManager.flags.SkipFlushingEventsOnGetStatusCalls.get()) {
             flushEvents = false;
         }
         if (flushEvents) {
@@ -2174,11 +2292,18 @@ cl_int CL_API_CALL clRetainEvent(cl_event event) {
 cl_int CL_API_CALL clReleaseEvent(cl_event event) {
     TRACING_ENTER(ClReleaseEvent, &event);
     auto retVal = CL_SUCCESS;
+    if (wasPlatformTeardownCalled) {
+        TRACING_EXIT(ClReleaseEvent, &retVal);
+        return CL_SUCCESS;
+    }
     API_ENTER(&retVal);
     auto pEvent = castToObject<Event>(event);
     DBG_LOG_INPUTS("cl_event", event, "Event", pEvent);
 
     if (pEvent) {
+        if (debugManager.flags.BlockingEventRelease.get() && pEvent->getRefApiCount() == 1 && pEvent->getCommandQueue()) {
+            pEvent->wait(false, false);
+        }
         pEvent->release();
         TRACING_EXIT(ClReleaseEvent, &retVal);
         return retVal;
@@ -2273,7 +2398,7 @@ cl_int CL_API_CALL clGetEventProfilingInfo(cl_event event,
     DBG_LOG_INPUTS("event", event,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
     auto eventObject = castToObject<Event>(event);
 
@@ -2313,7 +2438,7 @@ cl_int CL_API_CALL clFinish(cl_command_queue commandQueue) {
     auto pCommandQueue = castToObject<CommandQueue>(commandQueue);
 
     retVal = pCommandQueue
-                 ? pCommandQueue->finish()
+                 ? pCommandQueue->finish(true)
                  : CL_INVALID_COMMAND_QUEUE;
     TRACING_EXIT(ClFinish, &retVal);
     return retVal;
@@ -2359,16 +2484,27 @@ cl_int CL_API_CALL clEnqueueReadBuffer(cl_command_queue commandQueue,
             return retVal;
         }
 
-        retVal = pCommandQueue->enqueueReadBuffer(
-            pBuffer,
-            blockingRead,
-            offset,
-            cb,
-            ptr,
-            nullptr,
-            numEventsInWaitList,
-            eventWaitList,
-            event);
+        if (pCommandQueue->isValidForStagingTransfer(pBuffer, ptr, cb, CL_COMMAND_READ_BUFFER, blockingRead, numEventsInWaitList > 0)) {
+            retVal = pCommandQueue->enqueueStagingBufferTransfer(
+                CL_COMMAND_READ_BUFFER,
+                pBuffer,
+                blockingRead,
+                offset,
+                cb,
+                ptr,
+                event);
+        } else {
+            retVal = pCommandQueue->enqueueReadBuffer(
+                pBuffer,
+                blockingRead,
+                offset,
+                cb,
+                ptr,
+                nullptr,
+                numEventsInWaitList,
+                eventWaitList,
+                event);
+        }
     }
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
@@ -2396,15 +2532,15 @@ cl_int CL_API_CALL clEnqueueReadBufferRect(cl_command_queue commandQueue,
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "buffer", buffer,
                    "blockingRead", blockingRead,
-                   "bufferOrigin[0]", NEO::fileLoggerInstance().getInput(bufferOrigin, 0),
-                   "bufferOrigin[1]", NEO::fileLoggerInstance().getInput(bufferOrigin, 1),
-                   "bufferOrigin[2]", NEO::fileLoggerInstance().getInput(bufferOrigin, 2),
-                   "hostOrigin[0]", NEO::fileLoggerInstance().getInput(hostOrigin, 0),
-                   "hostOrigin[1]", NEO::fileLoggerInstance().getInput(hostOrigin, 1),
-                   "hostOrigin[2]", NEO::fileLoggerInstance().getInput(hostOrigin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0),
-                   "region[1]", NEO::fileLoggerInstance().getInput(region, 1),
-                   "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "bufferOrigin[0]", NEO::getClFileLogger().getInput(bufferOrigin, 0),
+                   "bufferOrigin[1]", NEO::getClFileLogger().getInput(bufferOrigin, 1),
+                   "bufferOrigin[2]", NEO::getClFileLogger().getInput(bufferOrigin, 2),
+                   "hostOrigin[0]", NEO::getClFileLogger().getInput(hostOrigin, 0),
+                   "hostOrigin[1]", NEO::getClFileLogger().getInput(hostOrigin, 1),
+                   "hostOrigin[2]", NEO::getClFileLogger().getInput(hostOrigin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0),
+                   "region[1]", NEO::getClFileLogger().getInput(region, 1),
+                   "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "bufferRowPitch", bufferRowPitch,
                    "bufferSlicePitch", bufferSlicePitch,
                    "hostRowPitch", hostRowPitch,
@@ -2510,16 +2646,27 @@ cl_int CL_API_CALL clEnqueueWriteBuffer(cl_command_queue commandQueue,
             return retVal;
         }
 
-        retVal = pCommandQueue->enqueueWriteBuffer(
-            pBuffer,
-            blockingWrite,
-            offset,
-            cb,
-            ptr,
-            nullptr,
-            numEventsInWaitList,
-            eventWaitList,
-            event);
+        if (pCommandQueue->isValidForStagingTransfer(pBuffer, ptr, cb, CL_COMMAND_WRITE_BUFFER, blockingWrite, numEventsInWaitList > 0)) {
+            retVal = pCommandQueue->enqueueStagingBufferTransfer(
+                CL_COMMAND_WRITE_BUFFER,
+                pBuffer,
+                blockingWrite,
+                offset,
+                cb,
+                ptr,
+                event);
+        } else {
+            retVal = pCommandQueue->enqueueWriteBuffer(
+                pBuffer,
+                blockingWrite,
+                offset,
+                cb,
+                ptr,
+                nullptr,
+                numEventsInWaitList,
+                eventWaitList,
+                event);
+        }
     }
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
@@ -2546,9 +2693,9 @@ cl_int CL_API_CALL clEnqueueWriteBufferRect(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "buffer", buffer, "blockingWrite", blockingWrite,
-                   "bufferOrigin[0]", NEO::fileLoggerInstance().getInput(bufferOrigin, 0), "bufferOrigin[1]", NEO::fileLoggerInstance().getInput(bufferOrigin, 1), "bufferOrigin[2]", NEO::fileLoggerInstance().getInput(bufferOrigin, 2),
-                   "hostOrigin[0]", NEO::fileLoggerInstance().getInput(hostOrigin, 0), "hostOrigin[1]", NEO::fileLoggerInstance().getInput(hostOrigin, 1), "hostOrigin[2]", NEO::fileLoggerInstance().getInput(hostOrigin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "bufferOrigin[0]", NEO::getClFileLogger().getInput(bufferOrigin, 0), "bufferOrigin[1]", NEO::getClFileLogger().getInput(bufferOrigin, 1), "bufferOrigin[2]", NEO::getClFileLogger().getInput(bufferOrigin, 2),
+                   "hostOrigin[0]", NEO::getClFileLogger().getInput(hostOrigin, 0), "hostOrigin[1]", NEO::getClFileLogger().getInput(hostOrigin, 1), "hostOrigin[2]", NEO::getClFileLogger().getInput(hostOrigin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "bufferRowPitch", bufferRowPitch, "bufferSlicePitch", bufferSlicePitch,
                    "hostRowPitch", hostRowPitch, "hostSlicePitch", hostSlicePitch, "ptr", ptr,
                    "numEventsInWaitList", numEventsInWaitList,
@@ -2625,7 +2772,7 @@ cl_int CL_API_CALL clEnqueueFillBuffer(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "buffer", buffer,
-                   "pattern", NEO::fileLoggerInstance().infoPointerToString(pattern, patternSize), "patternSize", patternSize,
+                   "pattern", NEO::getClFileLogger().infoPointerToString(pattern, patternSize), "patternSize", patternSize,
                    "offset", offset, "size", size,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -2638,7 +2785,7 @@ cl_int CL_API_CALL clEnqueueFillBuffer(cl_command_queue commandQueue,
         withCastToInternal(commandQueue, &pCommandQueue),
         withCastToInternal(buffer, &pBuffer),
         pattern,
-        (PatternSize)patternSize,
+        static_cast<PatternSize>(patternSize),
         EventWaitList(numEventsInWaitList, eventWaitList));
 
     if (CL_SUCCESS == retVal) {
@@ -2738,9 +2885,9 @@ cl_int CL_API_CALL clEnqueueCopyBufferRect(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "srcBuffer", srcBuffer, "dstBuffer", dstBuffer,
-                   "srcOrigin[0]", NEO::fileLoggerInstance().getInput(srcOrigin, 0), "srcOrigin[1]", NEO::fileLoggerInstance().getInput(srcOrigin, 1), "srcOrigin[2]", NEO::fileLoggerInstance().getInput(srcOrigin, 2),
-                   "dstOrigin[0]", NEO::fileLoggerInstance().getInput(dstOrigin, 0), "dstOrigin[1]", NEO::fileLoggerInstance().getInput(dstOrigin, 1), "dstOrigin[2]", NEO::fileLoggerInstance().getInput(dstOrigin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "srcOrigin[0]", NEO::getClFileLogger().getInput(srcOrigin, 0), "srcOrigin[1]", NEO::getClFileLogger().getInput(srcOrigin, 1), "srcOrigin[2]", NEO::getClFileLogger().getInput(srcOrigin, 2),
+                   "dstOrigin[0]", NEO::getClFileLogger().getInput(dstOrigin, 0), "dstOrigin[1]", NEO::getClFileLogger().getInput(dstOrigin, 1), "dstOrigin[2]", NEO::getClFileLogger().getInput(dstOrigin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "srcRowPitch", srcRowPitch, "srcSlicePitch", srcSlicePitch,
                    "dstRowPitch", dstRowPitch, "dstSlicePitch", dstSlicePitch,
                    "numEventsInWaitList", numEventsInWaitList,
@@ -2824,8 +2971,8 @@ cl_int CL_API_CALL clEnqueueReadImage(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "image", image, "blockingRead", blockingRead,
-                   "origin[0]", NEO::fileLoggerInstance().getInput(origin, 0), "origin[1]", NEO::fileLoggerInstance().getInput(origin, 1), "origin[2]", NEO::fileLoggerInstance().getInput(origin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "origin[0]", NEO::getClFileLogger().getInput(origin, 0), "origin[1]", NEO::getClFileLogger().getInput(origin, 1), "origin[2]", NEO::getClFileLogger().getInput(origin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "rowPitch", rowPitch, "slicePitch", slicePitch, "ptr", ptr,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -2857,18 +3004,23 @@ cl_int CL_API_CALL clEnqueueReadImage(cl_command_queue commandQueue,
             return retVal;
         }
 
-        retVal = pCommandQueue->enqueueReadImage(
-            pImage,
-            blockingRead,
-            origin,
-            region,
-            rowPitch,
-            slicePitch,
-            ptr,
-            nullptr,
-            numEventsInWaitList,
-            eventWaitList,
-            event);
+        auto hostPtrSize = pCommandQueue->calculateHostPtrSizeForImage(region, rowPitch, slicePitch, pImage);
+        if (pCommandQueue->isValidForStagingTransfer(pImage, ptr, hostPtrSize, CL_COMMAND_READ_IMAGE, blockingRead, numEventsInWaitList > 0)) {
+            retVal = pCommandQueue->enqueueStagingImageTransfer(CL_COMMAND_READ_IMAGE, pImage, blockingRead, origin, region, rowPitch, slicePitch, ptr, event);
+        } else {
+            retVal = pCommandQueue->enqueueReadImage(
+                pImage,
+                blockingRead,
+                origin,
+                region,
+                rowPitch,
+                slicePitch,
+                ptr,
+                nullptr,
+                numEventsInWaitList,
+                eventWaitList,
+                event);
+        }
     }
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
     TRACING_EXIT(ClEnqueueReadImage, &retVal);
@@ -2898,8 +3050,8 @@ cl_int CL_API_CALL clEnqueueWriteImage(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "image", image, "blockingWrite", blockingWrite,
-                   "origin[0]", NEO::fileLoggerInstance().getInput(origin, 0), "origin[1]", NEO::fileLoggerInstance().getInput(origin, 1), "origin[2]", NEO::fileLoggerInstance().getInput(origin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "origin[0]", NEO::getClFileLogger().getInput(origin, 0), "origin[1]", NEO::getClFileLogger().getInput(origin, 1), "origin[2]", NEO::getClFileLogger().getInput(origin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "inputRowPitch", inputRowPitch, "inputSlicePitch", inputSlicePitch, "ptr", ptr,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -2930,18 +3082,23 @@ cl_int CL_API_CALL clEnqueueWriteImage(cl_command_queue commandQueue,
             return retVal;
         }
 
-        retVal = pCommandQueue->enqueueWriteImage(
-            pImage,
-            blockingWrite,
-            origin,
-            region,
-            inputRowPitch,
-            inputSlicePitch,
-            ptr,
-            nullptr,
-            numEventsInWaitList,
-            eventWaitList,
-            event);
+        auto hostPtrSize = pCommandQueue->calculateHostPtrSizeForImage(region, inputRowPitch, inputSlicePitch, pImage);
+        if (pCommandQueue->isValidForStagingTransfer(pImage, ptr, hostPtrSize, CL_COMMAND_WRITE_IMAGE, blockingWrite, numEventsInWaitList > 0)) {
+            retVal = pCommandQueue->enqueueStagingImageTransfer(CL_COMMAND_WRITE_IMAGE, pImage, blockingWrite, origin, region, inputRowPitch, inputSlicePitch, ptr, event);
+        } else {
+            retVal = pCommandQueue->enqueueWriteImage(
+                pImage,
+                blockingWrite,
+                origin,
+                region,
+                inputRowPitch,
+                inputSlicePitch,
+                ptr,
+                nullptr,
+                numEventsInWaitList,
+                eventWaitList,
+                event);
+        }
     }
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
     TRACING_EXIT(ClEnqueueWriteImage, &retVal);
@@ -2970,8 +3127,8 @@ cl_int CL_API_CALL clEnqueueFillImage(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "image", image, "fillColor", fillColor,
-                   "origin[0]", NEO::fileLoggerInstance().getInput(origin, 0), "origin[1]", NEO::fileLoggerInstance().getInput(origin, 1), "origin[2]", NEO::fileLoggerInstance().getInput(origin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "origin[0]", NEO::getClFileLogger().getInput(origin, 0), "origin[1]", NEO::getClFileLogger().getInput(origin, 1), "origin[2]", NEO::getClFileLogger().getInput(origin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
@@ -3025,8 +3182,8 @@ cl_int CL_API_CALL clEnqueueCopyImage(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "srcImage", srcImage, "dstImage", dstImage,
-                   "srcOrigin[0]", NEO::fileLoggerInstance().getInput(srcOrigin, 0), "srcOrigin[1]", NEO::fileLoggerInstance().getInput(srcOrigin, 1), "srcOrigin[2]", NEO::fileLoggerInstance().getInput(srcOrigin, 2),
-                   "dstOrigin[0]", NEO::fileLoggerInstance().getInput(dstOrigin, 0), "dstOrigin[1]", NEO::fileLoggerInstance().getInput(dstOrigin, 1), "dstOrigin[2]", NEO::fileLoggerInstance().getInput(dstOrigin, 2),
+                   "srcOrigin[0]", NEO::getClFileLogger().getInput(srcOrigin, 0), "srcOrigin[1]", NEO::getClFileLogger().getInput(srcOrigin, 1), "srcOrigin[2]", NEO::getClFileLogger().getInput(srcOrigin, 2),
+                   "dstOrigin[0]", NEO::getClFileLogger().getInput(dstOrigin, 0), "dstOrigin[1]", NEO::getClFileLogger().getInput(dstOrigin, 1), "dstOrigin[2]", NEO::getClFileLogger().getInput(dstOrigin, 2),
                    "region[0]", region ? region[0] : 0, "region[1]", region ? region[1] : 0, "region[2]", region ? region[2] : 0,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -3099,13 +3256,13 @@ cl_int CL_API_CALL clEnqueueCopyImageToBuffer(cl_command_queue commandQueue,
                                               cl_uint numEventsInWaitList,
                                               const cl_event *eventWaitList,
                                               cl_event *event) {
-    TRACING_ENTER(ClEnqueueCopyImageToBuffer, &commandQueue, &srcImage, &dstBuffer, &srcOrigin, &region, (size_t *)&dstOffset, &numEventsInWaitList, &eventWaitList, &event);
+    TRACING_ENTER(ClEnqueueCopyImageToBuffer, &commandQueue, &srcImage, &dstBuffer, &srcOrigin, &region, &dstOffset, &numEventsInWaitList, &eventWaitList, &event);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "srcImage", srcImage, "dstBuffer", dstBuffer,
-                   "srcOrigin[0]", NEO::fileLoggerInstance().getInput(srcOrigin, 0), "srcOrigin[1]", NEO::fileLoggerInstance().getInput(srcOrigin, 1), "srcOrigin[2]", NEO::fileLoggerInstance().getInput(srcOrigin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "srcOrigin[0]", NEO::getClFileLogger().getInput(srcOrigin, 0), "srcOrigin[1]", NEO::getClFileLogger().getInput(srcOrigin, 1), "srcOrigin[2]", NEO::getClFileLogger().getInput(srcOrigin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "dstOffset", dstOffset,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -3170,8 +3327,8 @@ cl_int CL_API_CALL clEnqueueCopyBufferToImage(cl_command_queue commandQueue,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "srcBuffer", srcBuffer, "dstImage", dstImage, "srcOffset", srcOffset,
-                   "dstOrigin[0]", NEO::fileLoggerInstance().getInput(dstOrigin, 0), "dstOrigin[1]", NEO::fileLoggerInstance().getInput(dstOrigin, 1), "dstOrigin[2]", NEO::fileLoggerInstance().getInput(dstOrigin, 2),
-                   "region[0]", NEO::fileLoggerInstance().getInput(region, 0), "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
+                   "dstOrigin[0]", NEO::getClFileLogger().getInput(dstOrigin, 0), "dstOrigin[1]", NEO::getClFileLogger().getInput(dstOrigin, 1), "dstOrigin[2]", NEO::getClFileLogger().getInput(dstOrigin, 2),
+                   "region[0]", NEO::getClFileLogger().getInput(region, 0), "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
@@ -3307,11 +3464,11 @@ void *CL_API_CALL clEnqueueMapImage(cl_command_queue commandQueue,
 
     DBG_LOG_INPUTS("commandQueue", commandQueue, "image", image,
                    "blockingMap", blockingMap, "mapFlags", mapFlags,
-                   "origin[0]", NEO::fileLoggerInstance().getInput(origin, 0), "origin[1]", NEO::fileLoggerInstance().getInput(origin, 1),
-                   "origin[2]", NEO::fileLoggerInstance().getInput(origin, 2), "region[0]", NEO::fileLoggerInstance().getInput(region, 0),
-                   "region[1]", NEO::fileLoggerInstance().getInput(region, 1), "region[2]", NEO::fileLoggerInstance().getInput(region, 2),
-                   "imageRowPitch", NEO::fileLoggerInstance().getInput(imageRowPitch, 0),
-                   "imageSlicePitch", NEO::fileLoggerInstance().getInput(imageSlicePitch, 0),
+                   "origin[0]", NEO::getClFileLogger().getInput(origin, 0), "origin[1]", NEO::getClFileLogger().getInput(origin, 1),
+                   "origin[2]", NEO::getClFileLogger().getInput(origin, 2), "region[0]", NEO::getClFileLogger().getInput(region, 0),
+                   "region[1]", NEO::getClFileLogger().getInput(region, 1), "region[2]", NEO::getClFileLogger().getInput(region, 2),
+                   "imageRowPitch", NEO::getClFileLogger().getInput(imageRowPitch, 0),
+                   "imageSlicePitch", NEO::getClFileLogger().getInput(imageSlicePitch, 0),
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
@@ -3504,11 +3661,11 @@ cl_int CL_API_CALL clEnqueueNDRangeKernel(cl_command_queue commandQueue,
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue, "cl_kernel", kernel,
-                   "globalWorkOffset[0]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 0),
-                   "globalWorkOffset[1]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 1),
-                   "globalWorkOffset[2]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 2),
-                   "globalWorkSize", NEO::fileLoggerInstance().getSizes(globalWorkSize, workDim, false),
-                   "localWorkSize", NEO::fileLoggerInstance().getSizes(localWorkSize, workDim, true),
+                   "globalWorkOffset[0]", NEO::getClFileLogger().getInput(globalWorkOffset, 0),
+                   "globalWorkOffset[1]", NEO::getClFileLogger().getInput(globalWorkOffset, 1),
+                   "globalWorkOffset[2]", NEO::getClFileLogger().getInput(globalWorkOffset, 2),
+                   "globalWorkSize", NEO::getClFileLogger().getSizes(globalWorkSize, workDim, false),
+                   "localWorkSize", NEO::getClFileLogger().getSizes(localWorkSize, workDim, true),
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
@@ -3529,17 +3686,16 @@ cl_int CL_API_CALL clEnqueueNDRangeKernel(cl_command_queue commandQueue,
     Kernel *pKernel = pMultiDeviceKernel->getKernel(pCommandQueue->getDevice().getRootDeviceIndex());
 
     auto localMemSize = static_cast<uint32_t>(pCommandQueue->getDevice().getDeviceInfo().localMemSize);
-    auto slmTotalSize = pKernel->getSlmTotalSize();
+    auto slmTotalSizePerThreadGroup = pKernel->getSlmTotalSizePerThreadGroup();
 
-    if (slmTotalSize > 0 && localMemSize < slmTotalSize) {
-        PRINT_DEBUG_STRING(NEO::DebugManager.flags.PrintDebugMessages.get(), stderr, "Size of SLM (%u) larger than available (%u)\n", slmTotalSize, localMemSize);
+    if (slmTotalSizePerThreadGroup > 0 && localMemSize < slmTotalSizePerThreadGroup) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr, "Size of SLM (%u) larger than available (%u)\n", slmTotalSizePerThreadGroup, localMemSize);
         retVal = CL_OUT_OF_RESOURCES;
         TRACING_EXIT(ClEnqueueNdRangeKernel, &retVal);
         return retVal;
     }
 
-    if ((pKernel->getExecutionType() != KernelExecutionType::Default) ||
-        pKernel->usesSyncBuffer()) {
+    if (pKernel->getExecutionType() != KernelExecutionType::defaultType) {
         retVal = CL_INVALID_KERNEL;
         TRACING_EXIT(ClEnqueueNdRangeKernel, &retVal);
         return retVal;
@@ -3549,11 +3705,6 @@ cl_int CL_API_CALL clEnqueueNDRangeKernel(cl_command_queue commandQueue,
         retVal = CL_INVALID_OPERATION;
         TRACING_EXIT(ClEnqueueNdRangeKernel, &retVal);
         return retVal;
-    }
-
-    TakeOwnershipWrapper<MultiDeviceKernel> kernelOwnership(*pMultiDeviceKernel, gtpinIsGTPinInitialized());
-    if (gtpinIsGTPinInitialized()) {
-        gtpinNotifyKernelSubmit(kernel, pCommandQueue);
     }
 
     retVal = pCommandQueue->enqueueKernel(
@@ -3614,7 +3765,7 @@ cl_int CL_API_CALL clEnqueueNativeKernel(cl_command_queue commandQueue,
     TRACING_ENTER(ClEnqueueNativeKernel, &commandQueue, &userFunc, &args, &cbArgs, &numMemObjects, &memList, &argsMemLoc, &numEventsInWaitList, &eventWaitList, &event);
     cl_int retVal = CL_OUT_OF_HOST_MEMORY;
     API_ENTER(&retVal);
-    DBG_LOG_INPUTS("commandQueue", commandQueue, "userFunc", userFunc, "args", args,
+    DBG_LOG_INPUTS("commandQueue", commandQueue, "userFunc", reinterpret_cast<void *>(userFunc), "args", args,
                    "cbArgs", cbArgs, "numMemObjects", numMemObjects, "memList", memList, "argsMemLoc", argsMemLoc,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -3736,6 +3887,15 @@ cl_int CL_API_CALL clEnqueueMarkerWithWaitList(cl_command_queue commandQueue,
         return retVal;
     }
 
+    for (uint32_t i = 0; i < numEventsInWaitList; i++) {
+        auto pEvent = castToObject<Event>(eventWaitList[i]);
+        if (pEvent->getContext() != &pCommandQueue->getContext()) {
+            retVal = CL_INVALID_CONTEXT;
+            TRACING_EXIT(ClEnqueueMarkerWithWaitList, &retVal);
+            return retVal;
+        }
+    }
+
     if (!pCommandQueue->validateCapabilityForOperation(CL_QUEUE_CAPABILITY_MARKER_INTEL, numEventsInWaitList, eventWaitList, event)) {
         retVal = CL_INVALID_OPERATION;
         TRACING_EXIT(ClEnqueueMarkerWithWaitList, &retVal);
@@ -3794,6 +3954,9 @@ clCreatePerfCountersCommandQueueINTEL(
     cl_command_queue_properties properties,
     cl_uint configuration,
     cl_int *errcodeRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clCreatePerfCountersCommandQueueINTEL, context, device, properties, configuration, errcodeRet);
+
+    TRACING_ENTER(ClCreatePerfCountersCommandQueueINTEL, &context, &device, &properties, &configuration, &errcodeRet);
     API_ENTER(nullptr);
 
     DBG_LOG_INPUTS("context", context,
@@ -3808,29 +3971,35 @@ clCreatePerfCountersCommandQueueINTEL(
     withCastToInternal(device, &pDevice);
     if (pDevice == nullptr) {
         err.set(CL_INVALID_DEVICE);
+        TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
         return commandQueue;
     }
 
     if (!pDevice->getHardwareInfo().capabilityTable.instrumentationEnabled) {
         err.set(CL_INVALID_DEVICE);
+        TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
         return commandQueue;
     }
 
     if ((properties & CL_QUEUE_PROFILING_ENABLE) == 0) {
         err.set(CL_INVALID_QUEUE_PROPERTIES);
+        TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
         return commandQueue;
     }
     if ((properties & CL_QUEUE_ON_DEVICE) != 0) {
         err.set(CL_INVALID_QUEUE_PROPERTIES);
+        TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
         return commandQueue;
     }
     if ((properties & CL_QUEUE_ON_DEVICE_DEFAULT) != 0) {
         err.set(CL_INVALID_QUEUE_PROPERTIES);
+        TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
         return commandQueue;
     }
 
     if (configuration != 0) {
         err.set(CL_INVALID_OPERATION);
+        TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
         return commandQueue;
     }
 
@@ -3844,6 +4013,7 @@ clCreatePerfCountersCommandQueueINTEL(
             err.set(CL_OUT_OF_RESOURCES);
         }
     }
+    TRACING_EXIT(ClCreatePerfCountersCommandQueueINTEL, &commandQueue);
     return commandQueue;
 }
 
@@ -3853,6 +4023,7 @@ clSetPerformanceConfigurationINTEL(
     cl_uint count,
     cl_uint *offsets,
     cl_uint *values) {
+    FORWARD_TO_LEO_IF_FOREIGN(ClDevice, device, clSetPerformanceConfigurationINTEL, device, count, offsets, values);
     // Not supported, covered by Metric Library DLL.
     return CL_INVALID_OPERATION;
 }
@@ -3863,8 +4034,11 @@ CL_API_ENTRY void *CL_API_CALL clHostMemAllocINTEL(
     size_t size,
     cl_uint alignment,
     cl_int *errcodeRet) {
-    if (DebugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
-        size += (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedUSMBufferSize.get());
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clHostMemAllocINTEL, context, properties, size, alignment, errcodeRet);
+
+    TRACING_ENTER(ClHostMemAllocINTEL, &context, &properties, &size, &alignment, &errcodeRet);
+    if (debugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
+        size += (MemoryConstants::pageSize * debugManager.flags.ForceExtendedUSMBufferSize.get());
     }
 
     Context *neoContext = nullptr;
@@ -3874,27 +4048,46 @@ CL_API_ENTRY void *CL_API_CALL clHostMemAllocINTEL(
 
     if (retVal != CL_SUCCESS) {
         err.set(retVal);
+        TRACING_EXIT(ClHostMemAllocINTEL, nullptr);
         return nullptr;
     }
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::HOST_UNIFIED_MEMORY, alignment,
-                                                                      neoContext->getRootDeviceIndices(), neoContext->getDeviceBitfields());
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::hostUnifiedMemory, alignment,
+                                                    neoContext->getRootDeviceIndices(), neoContext->getDeviceBitfields());
     cl_mem_flags flags = 0;
     cl_mem_flags_intel flagsIntel = 0;
     cl_mem_alloc_flags_intel allocflags = 0;
     if (!ClMemoryPropertiesHelper::parseMemoryProperties(properties, unifiedMemoryProperties.allocationFlags, flags, flagsIntel,
-                                                         allocflags, ClMemoryPropertiesHelper::ObjType::UNKNOWN,
+                                                         allocflags, ClMemoryPropertiesHelper::ObjType::unknown,
                                                          *neoContext)) {
         err.set(CL_INVALID_VALUE);
+        TRACING_EXIT(ClHostMemAllocINTEL, nullptr);
         return nullptr;
     }
 
-    if (size > neoContext->getDevice(0u)->getSharedDeviceInfo().maxMemAllocSize && !unifiedMemoryProperties.allocationFlags.flags.allowUnrestrictedSize) {
+    if (size == 0 || (size > neoContext->getDevice(0u)->getSharedDeviceInfo().maxMemAllocSize &&
+                      !unifiedMemoryProperties.allocationFlags.flags.allowUnrestrictedSize)) {
         err.set(CL_INVALID_BUFFER_SIZE);
+        TRACING_EXIT(ClHostMemAllocINTEL, nullptr);
         return nullptr;
     }
 
-    return neoContext->getSVMAllocsManager()->createHostUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+    auto platform = neoContext->getDevice(0u)->getPlatform();
+    if (size <= PoolInfo::getHostMaxPoolableSize()) {
+        platform->initializeHostUsmAllocationPool();
+        auto allocationFromPool = platform->getHostMemAllocPoolManager().createUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+        if (allocationFromPool) {
+            TRACING_EXIT(ClHostMemAllocINTEL, &allocationFromPool);
+            return allocationFromPool;
+        }
+    }
+
+    auto ptr = neoContext->getSVMAllocsManager()->createHostUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+    if (!ptr) {
+        err.set(CL_OUT_OF_HOST_MEMORY);
+    }
+    TRACING_EXIT(ClHostMemAllocINTEL, &ptr);
+    return ptr;
 }
 
 CL_API_ENTRY void *CL_API_CALL clDeviceMemAllocINTEL(
@@ -3904,8 +4097,11 @@ CL_API_ENTRY void *CL_API_CALL clDeviceMemAllocINTEL(
     size_t size,
     cl_uint alignment,
     cl_int *errcodeRet) {
-    if (DebugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
-        size += (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedUSMBufferSize.get());
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clDeviceMemAllocINTEL, context, device, properties, size, alignment, errcodeRet);
+
+    TRACING_ENTER(ClDeviceMemAllocINTEL, &context, &device, &properties, &size, &alignment, &errcodeRet);
+    if (debugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
+        size += (MemoryConstants::pageSize * debugManager.flags.ForceExtendedUSMBufferSize.get());
     }
 
     Context *neoContext = nullptr;
@@ -3916,33 +4112,51 @@ CL_API_ENTRY void *CL_API_CALL clDeviceMemAllocINTEL(
 
     if (retVal != CL_SUCCESS) {
         err.set(retVal);
+        TRACING_EXIT(ClDeviceMemAllocINTEL, nullptr);
         return nullptr;
     }
 
     auto subDeviceBitfields = neoContext->getDeviceBitfields();
     subDeviceBitfields[neoDevice->getRootDeviceIndex()] = neoDevice->getDeviceBitfield();
 
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::DEVICE_UNIFIED_MEMORY, alignment,
-                                                                      neoContext->getRootDeviceIndices(), subDeviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::deviceUnifiedMemory, alignment,
+                                                    neoContext->getRootDeviceIndices(), subDeviceBitfields);
     cl_mem_flags flags = 0;
     cl_mem_flags_intel flagsIntel = 0;
     cl_mem_alloc_flags_intel allocflags = 0;
     if (!ClMemoryPropertiesHelper::parseMemoryProperties(properties, unifiedMemoryProperties.allocationFlags, flags, flagsIntel,
-                                                         allocflags, ClMemoryPropertiesHelper::ObjType::UNKNOWN,
+                                                         allocflags, ClMemoryPropertiesHelper::ObjType::unknown,
                                                          *neoContext)) {
         err.set(CL_INVALID_VALUE);
+        TRACING_EXIT(ClDeviceMemAllocINTEL, nullptr);
         return nullptr;
     }
 
-    if (size > neoDevice->getDevice().getDeviceInfo().maxMemAllocSize &&
-        !unifiedMemoryProperties.allocationFlags.flags.allowUnrestrictedSize) {
+    if (size == 0 ||
+        (size > neoDevice->getDevice().getDeviceInfo().maxMemAllocSize &&
+         !unifiedMemoryProperties.allocationFlags.flags.allowUnrestrictedSize)) {
         err.set(CL_INVALID_BUFFER_SIZE);
+        TRACING_EXIT(ClDeviceMemAllocINTEL, nullptr);
         return nullptr;
     }
 
     unifiedMemoryProperties.device = &neoDevice->getDevice();
 
-    return neoContext->getSVMAllocsManager()->createUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+    if (size <= PoolInfo::getMaxPoolableSize(neoDevice->getDevice().getGfxCoreHelper())) {
+        neoContext->initializeDeviceUsmAllocationPool();
+        auto allocationFromPool = neoContext->getDeviceMemAllocPoolsManager().createUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+        if (allocationFromPool) {
+            TRACING_EXIT(ClDeviceMemAllocINTEL, &allocationFromPool);
+            return allocationFromPool;
+        }
+    }
+
+    auto ptr = neoContext->getSVMAllocsManager()->createUnifiedMemoryAllocation(size, unifiedMemoryProperties);
+    if (!ptr) {
+        err.set(CL_OUT_OF_RESOURCES);
+    }
+    TRACING_EXIT(ClDeviceMemAllocINTEL, &ptr);
+    return ptr;
 }
 
 CL_API_ENTRY void *CL_API_CALL clSharedMemAllocINTEL(
@@ -3952,8 +4166,11 @@ CL_API_ENTRY void *CL_API_CALL clSharedMemAllocINTEL(
     size_t size,
     cl_uint alignment,
     cl_int *errcodeRet) {
-    if (DebugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
-        size += (MemoryConstants::pageSize * DebugManager.flags.ForceExtendedUSMBufferSize.get());
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clSharedMemAllocINTEL, context, device, properties, size, alignment, errcodeRet);
+
+    TRACING_ENTER(ClSharedMemAllocINTEL, &context, &device, &properties, &size, &alignment, &errcodeRet);
+    if (debugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
+        size += (MemoryConstants::pageSize * debugManager.flags.ForceExtendedUSMBufferSize.get());
     }
 
     Context *neoContext = nullptr;
@@ -3963,6 +4180,7 @@ CL_API_ENTRY void *CL_API_CALL clSharedMemAllocINTEL(
 
     if (retVal != CL_SUCCESS) {
         err.set(retVal);
+        TRACING_EXIT(ClSharedMemAllocINTEL, nullptr);
         return nullptr;
     }
 
@@ -3975,6 +4193,7 @@ CL_API_ENTRY void *CL_API_CALL clSharedMemAllocINTEL(
     if (neoDevice) {
         if (!neoContext->isDeviceAssociated(*neoDevice)) {
             err.set(CL_INVALID_DEVICE);
+            TRACING_EXIT(ClSharedMemAllocINTEL, nullptr);
             return nullptr;
         }
         unifiedMemoryPropertiesDevice = &neoDevice->getDevice();
@@ -3982,24 +4201,28 @@ CL_API_ENTRY void *CL_API_CALL clSharedMemAllocINTEL(
     } else {
         neoDevice = neoContext->getDevice(0);
     }
-    SVMAllocsManager::UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::SHARED_UNIFIED_MEMORY, alignment, neoContext->getRootDeviceIndices(), subDeviceBitfields);
+    UnifiedMemoryProperties unifiedMemoryProperties(InternalMemoryType::sharedUnifiedMemory, alignment, neoContext->getRootDeviceIndices(), subDeviceBitfields);
     unifiedMemoryProperties.device = unifiedMemoryPropertiesDevice;
     if (!ClMemoryPropertiesHelper::parseMemoryProperties(properties, unifiedMemoryProperties.allocationFlags, flags, flagsIntel,
-                                                         allocflags, ClMemoryPropertiesHelper::ObjType::UNKNOWN,
+                                                         allocflags, ClMemoryPropertiesHelper::ObjType::unknown,
                                                          *neoContext)) {
         err.set(CL_INVALID_VALUE);
+        TRACING_EXIT(ClSharedMemAllocINTEL, nullptr);
         return nullptr;
     }
 
-    if (size > neoDevice->getSharedDeviceInfo().maxMemAllocSize && !unifiedMemoryProperties.allocationFlags.flags.allowUnrestrictedSize) {
+    if (size == 0 ||
+        (size > neoDevice->getSharedDeviceInfo().maxMemAllocSize &&
+         !unifiedMemoryProperties.allocationFlags.flags.allowUnrestrictedSize)) {
         err.set(CL_INVALID_BUFFER_SIZE);
+        TRACING_EXIT(ClSharedMemAllocINTEL, nullptr);
         return nullptr;
     }
     auto ptr = neoContext->getSVMAllocsManager()->createSharedUnifiedMemoryAllocation(size, unifiedMemoryProperties, neoContext->getSpecialQueue(neoDevice->getRootDeviceIndex()));
     if (!ptr) {
         err.set(CL_OUT_OF_RESOURCES);
     }
-
+    TRACING_EXIT(ClSharedMemAllocINTEL, &ptr);
     return ptr;
 }
 
@@ -4013,12 +4236,29 @@ CL_API_ENTRY cl_int CL_API_CALL clMemFreeCommon(cl_context context,
         return retVal;
     }
 
-    if (ptr && !neoContext->getSVMAllocsManager()->freeSVMAlloc(const_cast<void *>(ptr), blocking)) {
-        return CL_INVALID_VALUE;
+    bool successfulFree = false;
+    const auto freePolicy = blocking ? NEO::FreePolicyType::blocking : NEO::FreePolicyType::none;
+
+    if (ptr && neoContext->getDeviceMemAllocPoolsManager().freeSVMAlloc(const_cast<void *>(ptr), freePolicy)) {
+        successfulFree = true;
     }
 
-    if (neoContext->getSVMAllocsManager()->getSvmMapOperation(ptr)) {
-        neoContext->getSVMAllocsManager()->removeSvmMapOperation(ptr);
+    if (!successfulFree && ptr && neoContext->getDevice(0u)->getPlatform()->getHostMemAllocPoolManager().freeSVMAlloc(const_cast<void *>(ptr), freePolicy)) {
+        successfulFree = true;
+    }
+
+    if (!successfulFree) {
+        if (ptr && !neoContext->getSVMAllocsManager()->freeSVMAlloc(const_cast<void *>(ptr), blocking)) {
+            return CL_INVALID_VALUE;
+        }
+
+        if (neoContext->getSVMAllocsManager()->getSvmMapOperation(ptr)) {
+            neoContext->getSVMAllocsManager()->removeSvmMapOperation(ptr);
+        }
+    }
+
+    if (blocking) {
+        neoContext->getMemoryManager()->cleanTemporaryAllocationListOnAllEngines(false);
     }
 
     return CL_SUCCESS;
@@ -4027,13 +4267,25 @@ CL_API_ENTRY cl_int CL_API_CALL clMemFreeCommon(cl_context context,
 CL_API_ENTRY cl_int CL_API_CALL clMemFreeINTEL(
     cl_context context,
     void *ptr) {
-    return clMemFreeCommon(context, ptr, false);
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clMemFreeINTEL, context, ptr);
+    TRACING_ENTER(ClMemFreeINTEL, &context, &ptr);
+    auto retVal = clMemFreeCommon(context,
+                                  ptr,
+                                  false);
+    TRACING_EXIT(ClMemFreeINTEL, &retVal);
+    return retVal;
 }
 
 CL_API_ENTRY cl_int CL_API_CALL clMemBlockingFreeINTEL(
     cl_context context,
     void *ptr) {
-    return clMemFreeCommon(context, ptr, true);
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clMemBlockingFreeINTEL, context, ptr);
+    TRACING_ENTER(ClMemBlockingFreeINTEL, &context, &ptr);
+    auto retVal = clMemFreeCommon(context,
+                                  ptr,
+                                  true);
+    TRACING_EXIT(ClMemBlockingFreeINTEL, &retVal);
+    return retVal;
 }
 
 CL_API_ENTRY cl_int CL_API_CALL clGetMemAllocInfoINTEL(
@@ -4043,17 +4295,22 @@ CL_API_ENTRY cl_int CL_API_CALL clGetMemAllocInfoINTEL(
     size_t paramValueSize,
     void *paramValue,
     size_t *paramValueSizeRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clGetMemAllocInfoINTEL, context, ptr, paramName, paramValueSize, paramValue, paramValueSizeRet);
+
+    TRACING_ENTER(ClGetMemAllocInfoINTEL, &context, &ptr, &paramName, &paramValueSize, &paramValue, &paramValueSizeRet);
     Context *pContext = nullptr;
     cl_int retVal = CL_SUCCESS;
     retVal = validateObject(withCastToInternal(context, &pContext));
-
     if (!pContext) {
+        TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
         return retVal;
     }
 
     auto allocationsManager = pContext->getSVMAllocsManager();
     if (!allocationsManager) {
-        return CL_INVALID_VALUE;
+        retVal = CL_INVALID_VALUE;
+        TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+        return retVal;
     }
 
     GetInfoHelper info(paramValue, paramValueSize, paramValueSizeRet);
@@ -4063,57 +4320,113 @@ CL_API_ENTRY cl_int CL_API_CALL clGetMemAllocInfoINTEL(
     case CL_MEM_ALLOC_TYPE_INTEL: {
         if (!unifiedMemoryAllocation) {
             retVal = changeGetInfoStatusToCLResultType(info.set<cl_int>(CL_MEM_TYPE_UNKNOWN_INTEL));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
             return retVal;
-        } else if (unifiedMemoryAllocation->memoryType == InternalMemoryType::HOST_UNIFIED_MEMORY) {
+        } else if (unifiedMemoryAllocation->memoryType == InternalMemoryType::hostUnifiedMemory) {
             retVal = changeGetInfoStatusToCLResultType(info.set<cl_int>(CL_MEM_TYPE_HOST_INTEL));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
             return retVal;
-        } else if (unifiedMemoryAllocation->memoryType == InternalMemoryType::DEVICE_UNIFIED_MEMORY) {
+        } else if (unifiedMemoryAllocation->memoryType == InternalMemoryType::deviceUnifiedMemory) {
             retVal = changeGetInfoStatusToCLResultType(info.set<cl_int>(CL_MEM_TYPE_DEVICE_INTEL));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
             return retVal;
         } else {
             retVal = changeGetInfoStatusToCLResultType(info.set<cl_int>(CL_MEM_TYPE_SHARED_INTEL));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
             return retVal;
         }
         break;
     }
     case CL_MEM_ALLOC_BASE_PTR_INTEL: {
         if (!unifiedMemoryAllocation) {
-            return changeGetInfoStatusToCLResultType(info.set<void *>(nullptr));
+            retVal = changeGetInfoStatusToCLResultType(info.set<void *>(nullptr));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+            return retVal;
         }
-        return changeGetInfoStatusToCLResultType(info.set<uint64_t>(unifiedMemoryAllocation->gpuAllocations.getDefaultGraphicsAllocation()->getGpuAddress()));
+        auto getPooledBasePtr = [&]() -> void * {
+            if (auto basePtrFromDevicePool = pContext->getDeviceMemAllocPoolsManager().getPooledAllocationBasePtr(ptr)) {
+                return basePtrFromDevicePool;
+            }
+            return pContext->getDevice(0u)->getPlatform()->getHostMemAllocPoolManager().getPooledAllocationBasePtr(ptr);
+        };
+        if (auto pooledBasePtr = getPooledBasePtr()) {
+            retVal = changeGetInfoStatusToCLResultType(info.set<uint64_t>(castToUint64(pooledBasePtr)));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+            return retVal;
+        }
+        retVal = changeGetInfoStatusToCLResultType(info.set<uint64_t>(unifiedMemoryAllocation->gpuAllocations.getDefaultGraphicsAllocation()->getGpuAddress()));
+        TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+        return retVal;
     }
     case CL_MEM_ALLOC_SIZE_INTEL: {
         if (!unifiedMemoryAllocation) {
-            return changeGetInfoStatusToCLResultType(info.set<size_t>(0u));
+            retVal = changeGetInfoStatusToCLResultType(info.set<size_t>(0u));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+            return retVal;
         }
-        return changeGetInfoStatusToCLResultType(info.set<size_t>(unifiedMemoryAllocation->size));
+        auto applyForceExtendedUsmBufferSize = [](size_t allocSize) -> size_t {
+            if (NEO::debugManager.flags.ForceExtendedUSMBufferSize.get() >= 1) {
+                allocSize -= (MemoryConstants::pageSize * NEO::debugManager.flags.ForceExtendedUSMBufferSize.get());
+            }
+            return allocSize;
+        };
+        auto getPooledSize = [&]() -> size_t {
+            if (auto sizeFromDevicePool = pContext->getDeviceMemAllocPoolsManager().getPooledAllocationSize(ptr)) {
+                return sizeFromDevicePool;
+            }
+            return pContext->getDevice(0u)->getPlatform()->getHostMemAllocPoolManager().getPooledAllocationSize(ptr);
+        };
+        if (auto pooledSize = getPooledSize()) {
+            retVal = changeGetInfoStatusToCLResultType(info.set<size_t>(applyForceExtendedUsmBufferSize(pooledSize)));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+            return retVal;
+        }
+        retVal = changeGetInfoStatusToCLResultType(info.set<size_t>(applyForceExtendedUsmBufferSize(unifiedMemoryAllocation->size)));
+        TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+        return retVal;
     }
     case CL_MEM_ALLOC_FLAGS_INTEL: {
         if (!unifiedMemoryAllocation) {
-            return changeGetInfoStatusToCLResultType(info.set<cl_mem_alloc_flags_intel>(0u));
+            retVal = changeGetInfoStatusToCLResultType(info.set<cl_mem_alloc_flags_intel>(0u));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+            return retVal;
         }
-        return changeGetInfoStatusToCLResultType(info.set<cl_mem_alloc_flags_intel>(unifiedMemoryAllocation->allocationFlagsProperty.allAllocFlags));
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_mem_alloc_flags_intel>(unifiedMemoryAllocation->allocationFlagsProperty.allAllocFlags));
+        TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+        return retVal;
     }
     case CL_MEM_ALLOC_DEVICE_INTEL: {
         if (!unifiedMemoryAllocation) {
-            return changeGetInfoStatusToCLResultType(info.set<cl_device_id>(static_cast<cl_device_id>(nullptr)));
+            retVal = changeGetInfoStatusToCLResultType(info.set<cl_device_id>(static_cast<cl_device_id>(nullptr)));
+            TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+            return retVal;
         }
         auto device = unifiedMemoryAllocation->device ? unifiedMemoryAllocation->device->getSpecializedDevice<ClDevice>() : nullptr;
-        return changeGetInfoStatusToCLResultType(info.set<cl_device_id>(device));
+        retVal = changeGetInfoStatusToCLResultType(info.set<cl_device_id>(device));
+        TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+        return retVal;
     }
 
     default: {
     }
     }
 
-    return CL_INVALID_VALUE;
+    retVal = CL_INVALID_VALUE;
+    TRACING_EXIT(ClGetMemAllocInfoINTEL, &retVal);
+    return retVal;
 }
 
 CL_API_ENTRY cl_int CL_API_CALL clSetKernelArgMemPointerINTEL(
     cl_kernel kernel,
     cl_uint argIndex,
     const void *argValue) {
-    return clSetKernelArgSVMPointer(kernel, argIndex, argValue);
+    FORWARD_TO_LEO_IF_FOREIGN(MultiDeviceKernel, kernel, clSetKernelArgMemPointerINTEL, kernel, argIndex, argValue);
+    TRACING_ENTER(ClSetKernelArgMemPointerINTEL, &kernel, &argIndex, &argValue);
+    auto retVal = clSetKernelArgSVMPointer(kernel,
+                                           argIndex,
+                                           argValue);
+    TRACING_EXIT(ClSetKernelArgMemPointerINTEL, &retVal);
+    return retVal;
 }
 
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemsetINTEL(
@@ -4124,6 +4437,9 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemsetINTEL(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueMemsetINTEL, commandQueue, dstPtr, value, size, numEventsInWaitList, eventWaitList, event);
+
+    TRACING_ENTER(ClEnqueueMemsetINTEL, &commandQueue, &dstPtr, &value, &size, &numEventsInWaitList, &eventWaitList, &event);
     auto retVal = clEnqueueSVMMemFill(commandQueue,
                                       dstPtr,
                                       &value,
@@ -4136,7 +4452,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemsetINTEL(
         auto pEvent = castToObjectOrAbort<Event>(*event);
         pEvent->setCmdType(CL_COMMAND_MEMSET_INTEL);
     }
-
+    TRACING_EXIT(ClEnqueueMemsetINTEL, &retVal);
     return retVal;
 }
 
@@ -4149,7 +4465,9 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemFillINTEL(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueMemFillINTEL, commandQueue, dstPtr, pattern, patternSize, size, numEventsInWaitList, eventWaitList, event);
 
+    TRACING_ENTER(ClEnqueueMemFillINTEL, &commandQueue, &dstPtr, &pattern, &patternSize, &size, &numEventsInWaitList, &eventWaitList, &event);
     auto retVal = clEnqueueSVMMemFill(commandQueue,
                                       dstPtr,
                                       pattern,
@@ -4162,7 +4480,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemFillINTEL(
         auto pEvent = castToObjectOrAbort<Event>(*event);
         pEvent->setCmdType(CL_COMMAND_MEMFILL_INTEL);
     }
-
+    TRACING_EXIT(ClEnqueueMemFillINTEL, &retVal);
     return retVal;
 }
 
@@ -4175,6 +4493,9 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemcpyINTEL(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueMemcpyINTEL, commandQueue, blocking, dstPtr, srcPtr, size, numEventsInWaitList, eventWaitList, event);
+
+    TRACING_ENTER(ClEnqueueMemcpyINTEL, &commandQueue, &blocking, &dstPtr, &srcPtr, &size, &numEventsInWaitList, &eventWaitList, &event);
     auto retVal = clEnqueueSVMMemcpy(commandQueue,
                                      blocking,
                                      dstPtr,
@@ -4187,7 +4508,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemcpyINTEL(
         auto pEvent = castToObjectOrAbort<Event>(*event);
         pEvent->setCmdType(CL_COMMAND_MEMCPY_INTEL);
     }
-
+    TRACING_EXIT(ClEnqueueMemcpyINTEL, &retVal);
     return retVal;
 }
 
@@ -4199,6 +4520,9 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMigrateMemINTEL(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueMigrateMemINTEL, commandQueue, ptr, size, flags, numEventsInWaitList, eventWaitList, event);
+
+    TRACING_ENTER(ClEnqueueMigrateMemINTEL, &commandQueue, &ptr, &size, &flags, &numEventsInWaitList, &eventWaitList, &event);
     cl_int retVal = CL_SUCCESS;
 
     CommandQueue *pCommandQueue = nullptr;
@@ -4212,17 +4536,17 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMigrateMemINTEL(
             pEvent->setCmdType(CL_COMMAND_MIGRATEMEM_INTEL);
         }
 
-        if (NEO::DebugManager.flags.AppendMemoryPrefetchForKmdMigratedSharedAllocations.get() == true) {
+        if (NEO::debugManager.flags.AppendMemoryPrefetchForKmdMigratedSharedAllocations.get() == true) {
             auto pSvmAllocMgr = pCommandQueue->getContext().getSVMAllocsManager();
             UNRECOVERABLE_IF(pSvmAllocMgr == nullptr);
 
             auto allocData = pSvmAllocMgr->getSVMAlloc(ptr);
             if (allocData) {
-                pSvmAllocMgr->prefetchMemory(pCommandQueue->getDevice(), pCommandQueue->getGpgpuCommandStreamReceiver(), *allocData);
+                pSvmAllocMgr->prefetchMemory(pCommandQueue->getDevice(), pCommandQueue->getGpgpuCommandStreamReceiver(), ptr, size);
             }
         }
     }
-
+    TRACING_EXIT(ClEnqueueMigrateMemINTEL, &retVal);
     return retVal;
 }
 
@@ -4234,6 +4558,9 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemAdviseINTEL(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueMemAdviseINTEL, commandQueue, ptr, size, advice, numEventsInWaitList, eventWaitList, event);
+
+    TRACING_ENTER(ClEnqueueMemAdviseINTEL, &commandQueue, &ptr, &size, &advice, &numEventsInWaitList, &eventWaitList, &event);
     cl_int retVal = CL_SUCCESS;
 
     CommandQueue *pCommandQueue = nullptr;
@@ -4247,7 +4574,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueMemAdviseINTEL(
             pEvent->setCmdType(CL_COMMAND_MEMADVISE_INTEL);
         }
     }
-
+    TRACING_EXIT(ClEnqueueMemAdviseINTEL, &retVal);
     return retVal;
 }
 
@@ -4255,13 +4582,19 @@ cl_command_queue CL_API_CALL clCreateCommandQueueWithPropertiesKHR(cl_context co
                                                                    cl_device_id device,
                                                                    const cl_queue_properties_khr *properties,
                                                                    cl_int *errcodeRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clCreateCommandQueueWithPropertiesKHR, context, device, properties, errcodeRet);
 
+    TRACING_ENTER(ClCreateCommandQueueWithPropertiesKHR, &context, &device, &properties, &errcodeRet);
     API_ENTER(errcodeRet);
     DBG_LOG_INPUTS("context", context,
                    "device", device,
                    "properties", properties);
-
-    return clCreateCommandQueueWithProperties(context, device, properties, errcodeRet);
+    auto retVal = clCreateCommandQueueWithProperties(context,
+                                                     device,
+                                                     properties,
+                                                     errcodeRet);
+    TRACING_EXIT(ClCreateCommandQueueWithPropertiesKHR, &retVal);
+    return retVal;
 }
 
 cl_accelerator_intel CL_API_CALL clCreateAcceleratorINTEL(
@@ -4270,67 +4603,33 @@ cl_accelerator_intel CL_API_CALL clCreateAcceleratorINTEL(
     size_t descriptorSize,
     const void *descriptor,
     cl_int *errcodeRet) {
-    cl_int retVal = CL_SUCCESS;
+
+    TRACING_ENTER(ClCreateAcceleratorINTEL, &context, &acceleratorType, &descriptorSize, &descriptor, &errcodeRet);
+    cl_int retVal = CL_INVALID_ACCELERATOR_TYPE_INTEL;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("context", context,
                    "acceleratorType", acceleratorType,
                    "descriptorSize", descriptorSize,
-                   "descriptor", NEO::fileLoggerInstance().infoPointerToString(descriptor, descriptorSize));
+                   "descriptor", NEO::getClFileLogger().infoPointerToString(descriptor, descriptorSize));
     cl_accelerator_intel accelerator = nullptr;
-
-    do {
-        retVal = validateObjects(context);
-
-        if (retVal != CL_SUCCESS) {
-            retVal = CL_INVALID_CONTEXT;
-            break;
-        }
-
-        Context *pContext = castToObject<Context>(context);
-
-        DEBUG_BREAK_IF(!pContext);
-
-        switch (acceleratorType) {
-        case CL_ACCELERATOR_TYPE_MOTION_ESTIMATION_INTEL:
-            accelerator = VmeAccelerator::create(
-                pContext,
-                acceleratorType,
-                descriptorSize,
-                descriptor,
-                retVal);
-            break;
-        default:
-            retVal = CL_INVALID_ACCELERATOR_TYPE_INTEL;
-        }
-
-    } while (false);
 
     if (errcodeRet) {
         *errcodeRet = retVal;
     }
 
+    TRACING_EXIT(ClCreateAcceleratorINTEL, &accelerator);
     return accelerator;
 }
 
 cl_int CL_API_CALL clRetainAcceleratorINTEL(
     cl_accelerator_intel accelerator) {
-    cl_int retVal = CL_SUCCESS;
+
+    TRACING_ENTER(ClRetainAcceleratorINTEL, &accelerator);
+    cl_int retVal = CL_INVALID_ACCELERATOR_INTEL;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("accelerator", accelerator);
 
-    IntelAccelerator *pAccelerator = nullptr;
-
-    do {
-        pAccelerator = castToObject<IntelAccelerator>(accelerator);
-
-        if (!pAccelerator) {
-            retVal = CL_INVALID_ACCELERATOR_INTEL;
-            break;
-        }
-
-        pAccelerator->retain();
-    } while (false);
-
+    TRACING_EXIT(ClRetainAcceleratorINTEL, &retVal);
     return retVal;
 }
 
@@ -4340,50 +4639,29 @@ cl_int CL_API_CALL clGetAcceleratorInfoINTEL(
     size_t paramValueSize,
     void *paramValue,
     size_t *paramValueSizeRet) {
-    cl_int retVal = CL_SUCCESS;
+
+    TRACING_ENTER(ClGetAcceleratorInfoINTEL, &accelerator, &paramName, &paramValueSize, &paramValue, &paramValueSizeRet);
+    cl_int retVal = CL_INVALID_ACCELERATOR_INTEL;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("accelerator", accelerator,
                    "paramName", paramName,
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
-    IntelAccelerator *pAccelerator = nullptr;
 
-    do {
-        pAccelerator = castToObject<IntelAccelerator>(accelerator);
-
-        if (!pAccelerator) {
-            retVal = CL_INVALID_ACCELERATOR_INTEL;
-            break;
-        }
-
-        retVal = pAccelerator->getInfo(
-            paramName, paramValueSize, paramValue, paramValueSizeRet);
-
-    } while (false);
-
+    TRACING_EXIT(ClGetAcceleratorInfoINTEL, &retVal);
     return retVal;
 }
 
 cl_int CL_API_CALL clReleaseAcceleratorINTEL(
     cl_accelerator_intel accelerator) {
-    cl_int retVal = CL_SUCCESS;
+
+    TRACING_ENTER(ClReleaseAcceleratorINTEL, &accelerator);
+    cl_int retVal = CL_INVALID_ACCELERATOR_INTEL;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("accelerator", accelerator);
 
-    IntelAccelerator *pAccelerator = nullptr;
-
-    do {
-        pAccelerator = castToObject<IntelAccelerator>(accelerator);
-
-        if (!pAccelerator) {
-            retVal = CL_INVALID_ACCELERATOR_INTEL;
-            break;
-        }
-
-        pAccelerator->release();
-    } while (false);
-
+    TRACING_EXIT(ClReleaseAcceleratorINTEL, &retVal);
     return retVal;
 }
 
@@ -4391,10 +4669,13 @@ cl_program CL_API_CALL clCreateProgramWithILKHR(cl_context context,
                                                 const void *il,
                                                 size_t length,
                                                 cl_int *errcodeRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(Context, context, clCreateProgramWithILKHR, context, il, length, errcodeRet);
+
+    TRACING_ENTER(ClCreateProgramWithILKHR, &context, &il, &length, &errcodeRet);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("context", context,
-                   "il", NEO::fileLoggerInstance().infoPointerToString(il, length),
+                   "il", NEO::getClFileLogger().infoPointerToString(il, length),
                    "length", length);
 
     cl_program program = nullptr;
@@ -4412,7 +4693,107 @@ cl_program CL_API_CALL clCreateProgramWithILKHR(cl_context context,
         *errcodeRet = retVal;
     }
 
+    TRACING_EXIT(ClCreateProgramWithILKHR, &program);
     return program;
+}
+
+namespace {
+cl_int getKernelSuggestedLocalWorkSizeImpl(const char *apiFunctionName,
+                                           cl_command_queue commandQueue,
+                                           cl_kernel kernel,
+                                           cl_uint workDim,
+                                           const size_t *globalWorkOffset,
+                                           const size_t *globalWorkSize,
+                                           size_t *suggestedLocalWorkSize) {
+    cl_int retVal = CL_SUCCESS;
+    LoggerApiEnterWrapper<NEO::FileLogger<globalDebugFunctionalityLevel>::enabled()> apiWrapperForSingleCall(apiFunctionName, &retVal);
+    DBG_LOG_INPUTS("commandQueue", commandQueue, "cl_kernel", kernel,
+                   "globalWorkOffset[0]", NEO::getClFileLogger().getInput(globalWorkOffset, 0),
+                   "globalWorkOffset[1]", NEO::getClFileLogger().getInput(globalWorkOffset, 1),
+                   "globalWorkOffset[2]", NEO::getClFileLogger().getInput(globalWorkOffset, 2),
+                   "globalWorkSize", NEO::getClFileLogger().getSizes(globalWorkSize, workDim, true),
+                   "suggestedLocalWorkSize", suggestedLocalWorkSize);
+
+    MultiDeviceKernel *pMultiDeviceKernel = nullptr;
+    CommandQueue *pCommandQueue = nullptr;
+    retVal = validateObjects(withCastToInternal(commandQueue, &pCommandQueue), withCastToInternal(kernel, &pMultiDeviceKernel));
+
+    if (CL_SUCCESS != retVal) {
+        return retVal;
+    }
+
+    if (&pCommandQueue->getContext() != &pMultiDeviceKernel->getContext()) {
+        retVal = CL_INVALID_CONTEXT;
+        return retVal;
+    }
+
+    const auto rootDeviceIndex = pCommandQueue->getDevice().getRootDeviceIndex();
+    Kernel *pKernel = nullptr;
+    if (rootDeviceIndex < pMultiDeviceKernel->getKernelInfos().size()) {
+        pKernel = pMultiDeviceKernel->getKernel(rootDeviceIndex);
+    }
+    if (pKernel == nullptr) {
+        retVal = CL_INVALID_PROGRAM_EXECUTABLE;
+        return retVal;
+    }
+
+    const auto maxWorkDim = std::min(pCommandQueue->getClDevice().getDeviceInfo().maxWorkItemDimensions, 3u);
+    if ((workDim == 0) || (workDim > maxWorkDim)) {
+        retVal = CL_INVALID_WORK_DIMENSION;
+        return retVal;
+    }
+
+    if (globalWorkSize == nullptr) {
+        retVal = CL_INVALID_GLOBAL_WORK_SIZE;
+        return retVal;
+    }
+
+    const auto deviceAddressBits = pCommandQueue->getDevice().getDeviceInfo().addressBits;
+    const auto deviceSizeTMax = static_cast<size_t>(maxNBitValue(std::min<uint64_t>(deviceAddressBits, std::numeric_limits<size_t>::digits)));
+
+    for (cl_uint i = 0; i < workDim; ++i) {
+        if ((globalWorkSize[i] == 0) || (globalWorkSize[i] > deviceSizeTMax)) {
+            retVal = CL_INVALID_GLOBAL_WORK_SIZE;
+            return retVal;
+        }
+        if ((globalWorkOffset != nullptr) && (globalWorkOffset[i] > deviceSizeTMax - globalWorkSize[i])) {
+            retVal = CL_INVALID_GLOBAL_OFFSET;
+            return retVal;
+        }
+    }
+
+    if (!pKernel->isPatched()) {
+        retVal = CL_INVALID_KERNEL_ARGS;
+        return retVal;
+    }
+
+    if (suggestedLocalWorkSize == nullptr) {
+        retVal = CL_INVALID_VALUE;
+        return retVal;
+    }
+
+    pKernel->getSuggestedLocalWorkSize(workDim, globalWorkSize, globalWorkOffset, suggestedLocalWorkSize);
+    return retVal;
+}
+} // namespace
+
+cl_int CL_API_CALL clGetKernelSuggestedLocalWorkSize(cl_command_queue commandQueue,
+                                                     cl_kernel kernel,
+                                                     cl_uint workDim,
+                                                     const size_t *globalWorkOffset,
+                                                     const size_t *globalWorkSize,
+                                                     size_t *suggestedLocalWorkSize) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clGetKernelSuggestedLocalWorkSize, commandQueue, kernel, workDim, globalWorkOffset, globalWorkSize, suggestedLocalWorkSize);
+    TRACING_ENTER(ClGetKernelSuggestedLocalWorkSize, &commandQueue, &kernel, &workDim, &globalWorkOffset, &globalWorkSize, &suggestedLocalWorkSize);
+    auto retVal = getKernelSuggestedLocalWorkSizeImpl(NEO_FUNCTION_NAME,
+                                                      commandQueue,
+                                                      kernel,
+                                                      workDim,
+                                                      globalWorkOffset,
+                                                      globalWorkSize,
+                                                      suggestedLocalWorkSize);
+    TRACING_EXIT(ClGetKernelSuggestedLocalWorkSize, &retVal);
+    return retVal;
 }
 
 cl_int CL_API_CALL clGetKernelSuggestedLocalWorkSizeKHR(cl_command_queue commandQueue,
@@ -4421,21 +4802,27 @@ cl_int CL_API_CALL clGetKernelSuggestedLocalWorkSizeKHR(cl_command_queue command
                                                         const size_t *globalWorkOffset,
                                                         const size_t *globalWorkSize,
                                                         size_t *suggestedLocalWorkSize) {
-    return clGetKernelSuggestedLocalWorkSizeINTEL(commandQueue,
-                                                  kernel,
-                                                  workDim,
-                                                  globalWorkOffset,
-                                                  globalWorkSize,
-                                                  suggestedLocalWorkSize);
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clGetKernelSuggestedLocalWorkSizeKHR, commandQueue, kernel, workDim, globalWorkOffset, globalWorkSize, suggestedLocalWorkSize);
+
+    TRACING_ENTER(ClGetKernelSuggestedLocalWorkSizeKHR, &commandQueue, &kernel, &workDim, &globalWorkOffset, &globalWorkSize, &suggestedLocalWorkSize);
+    auto retVal = getKernelSuggestedLocalWorkSizeImpl(NEO_FUNCTION_NAME,
+                                                      commandQueue,
+                                                      kernel,
+                                                      workDim,
+                                                      globalWorkOffset,
+                                                      globalWorkSize,
+                                                      suggestedLocalWorkSize);
+    TRACING_EXIT(ClGetKernelSuggestedLocalWorkSizeKHR, &retVal);
+    return retVal;
 }
 
-#define RETURN_FUNC_PTR_IF_EXIST(name)                                  \
-    {                                                                   \
-        if (!strcmp(funcName, #name)) {                                 \
-            void *ret = ((void *)(name));                               \
-            TRACING_EXIT(ClGetExtensionFunctionAddress, (void **)&ret); \
-            return ret;                                                 \
-        }                                                               \
+#define RETURN_FUNC_PTR_IF_EXIST(name)                                                    \
+    {                                                                                     \
+        if (!strcmp(funcName, #name)) {                                                   \
+            void *ret = reinterpret_cast<void *>(name);                                   \
+            TRACING_EXIT(ClGetExtensionFunctionAddress, reinterpret_cast<void **>(&ret)); \
+            return ret;                                                                   \
+        }                                                                                 \
     }
 void *CL_API_CALL clGetExtensionFunctionAddress(const char *funcName) {
     TRACING_ENTER(ClGetExtensionFunctionAddress, &funcName);
@@ -4497,6 +4884,7 @@ void *CL_API_CALL clGetExtensionFunctionAddress(const char *funcName) {
 
     RETURN_FUNC_PTR_IF_EXIST(clSetProgramSpecializationConstant);
 
+    RETURN_FUNC_PTR_IF_EXIST(clGetKernelSuggestedLocalWorkSize);
     RETURN_FUNC_PTR_IF_EXIST(clGetKernelSuggestedLocalWorkSizeKHR);
 
     ret = getAdditionalExtensionFunctionAddress(funcName);
@@ -4565,7 +4953,7 @@ void *CL_API_CALL clSVMAlloc(cl_context context,
     }
 
     auto pDevice = pContext->getDevice(0);
-    bool allowUnrestrictedSize = (flags & CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL) || DebugManager.flags.AllowUnrestrictedSize.get();
+    bool allowUnrestrictedSize = (flags & CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL) || debugManager.flags.AllowUnrestrictedSize.get();
 
     if ((size == 0) ||
         (!allowUnrestrictedSize && (size > pDevice->getSharedDeviceInfo().maxMemAllocSize))) {
@@ -4579,15 +4967,11 @@ void *CL_API_CALL clSVMAlloc(cl_context context,
     }
 
     const HardwareInfo &hwInfo = pDevice->getHardwareInfo();
-    if (!hwInfo.capabilityTable.ftrSvm) {
-        TRACING_EXIT(ClSvmAlloc, &pAlloc);
-        return pAlloc;
-    }
 
     if (flags & CL_MEM_SVM_FINE_GRAIN_BUFFER) {
         bool supportsFineGrained = hwInfo.capabilityTable.ftrSupportsCoherency;
-        if (DebugManager.flags.ForceFineGrainedSVMSupport.get() != -1) {
-            supportsFineGrained = !!DebugManager.flags.ForceFineGrainedSVMSupport.get();
+        if (debugManager.flags.ForceFineGrainedSVMSupport.get() != -1) {
+            supportsFineGrained = !!debugManager.flags.ForceFineGrainedSVMSupport.get();
         }
         if (!supportsFineGrained) {
             TRACING_EXIT(ClSvmAlloc, &pAlloc);
@@ -4615,12 +4999,6 @@ void CL_API_CALL clSVMFree(cl_context context,
         withCastToInternal(context, &pContext));
 
     if (retVal != CL_SUCCESS) {
-        TRACING_EXIT(ClSvmFree, nullptr);
-        return;
-    }
-
-    auto pClDevice = pContext->getDevice(0);
-    if (!pClDevice->getHardwareInfo().capabilityTable.ftrSvm) {
         TRACING_EXIT(ClSvmFree, nullptr);
         return;
     }
@@ -4653,20 +5031,13 @@ cl_int CL_API_CALL clEnqueueSVMFree(cl_command_queue commandQueue,
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "numSvmPointers", numSvmPointers,
                    "svmPointers", svmPointers,
-                   "pfnFreeFunc", pfnFreeFunc,
+                   "pfnFreeFunc", reinterpret_cast<void *>(pfnFreeFunc),
                    "userData", userData,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
 
     if (retVal != CL_SUCCESS) {
-        TRACING_EXIT(ClEnqueueSvmFree, &retVal);
-        return retVal;
-    }
-
-    auto &device = pCommandQueue->getDevice();
-    if (!device.getHardwareInfo().capabilityTable.ftrSvm) {
-        retVal = CL_INVALID_OPERATION;
         TRACING_EXIT(ClEnqueueSvmFree, &retVal);
         return retVal;
     }
@@ -4724,11 +5095,6 @@ cl_int CL_API_CALL clEnqueueSVMMemcpy(cl_command_queue commandQueue,
     }
 
     auto &device = pCommandQueue->getDevice();
-    if (!device.getHardwareInfo().capabilityTable.ftrSvm) {
-        retVal = CL_INVALID_OPERATION;
-        TRACING_EXIT(ClEnqueueSvmMemcpy, &retVal);
-        return retVal;
-    }
 
     if ((dstPtr == nullptr) || (srcPtr == nullptr)) {
         retVal = CL_INVALID_VALUE;
@@ -4742,15 +5108,39 @@ cl_int CL_API_CALL clEnqueueSVMMemcpy(cl_command_queue commandQueue,
         return retVal;
     }
 
-    retVal = pCommandQueue->enqueueSVMMemcpy(
-        blockingCopy,
-        dstPtr,
-        srcPtr,
-        size,
-        numEventsInWaitList,
-        eventWaitList,
-        event);
+    if (size != 0) {
+        const uintptr_t srcStart = reinterpret_cast<uintptr_t>(srcPtr);
+        const uintptr_t srcEnd = srcStart + size;
+        const uintptr_t dstStart = reinterpret_cast<uintptr_t>(dstPtr);
+        const uintptr_t dstEnd = dstStart + size;
 
+        if ((srcStart < dstEnd) && (dstStart < srcEnd)) {
+            retVal = CL_MEM_COPY_OVERLAP;
+            TRACING_EXIT(ClEnqueueSvmMemcpy, &retVal);
+            return retVal;
+        }
+
+        if (pCommandQueue->isValidForStagingBufferCopy(device, dstPtr, srcPtr, size, numEventsInWaitList > 0)) {
+            retVal = pCommandQueue->enqueueStagingBufferMemcpy(blockingCopy, dstPtr, srcPtr, size, event);
+        } else {
+            retVal = pCommandQueue->enqueueSVMMemcpy(
+                blockingCopy,
+                dstPtr,
+                srcPtr,
+                size,
+                numEventsInWaitList,
+                eventWaitList,
+                event,
+                nullptr);
+        }
+    } else {
+        retVal = pCommandQueue->enqueueMarkerWithWaitList(numEventsInWaitList, eventWaitList, event);
+
+        if (event) {
+            auto pEvent = castToObjectOrAbort<Event>(*event);
+            pEvent->setCmdType(CL_COMMAND_SVM_MEMCPY);
+        }
+    }
     TRACING_EXIT(ClEnqueueSvmMemcpy, &retVal);
     return retVal;
 }
@@ -4775,7 +5165,7 @@ cl_int CL_API_CALL clEnqueueSVMMemFill(cl_command_queue commandQueue,
 
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "svmPtr", svmPtr,
-                   "pattern", NEO::fileLoggerInstance().infoPointerToString(pattern, patternSize),
+                   "pattern", NEO::getClFileLogger().infoPointerToString(pattern, patternSize),
                    "patternSize", patternSize,
                    "size", size,
                    "numEventsInWaitList", numEventsInWaitList,
@@ -4787,14 +5177,7 @@ cl_int CL_API_CALL clEnqueueSVMMemFill(cl_command_queue commandQueue,
         return retVal;
     }
 
-    auto &device = pCommandQueue->getDevice();
-    if (!device.getHardwareInfo().capabilityTable.ftrSvm) {
-        retVal = CL_INVALID_OPERATION;
-        TRACING_EXIT(ClEnqueueSvmMemFill, &retVal);
-        return retVal;
-    }
-
-    if ((svmPtr == nullptr) || (size == 0)) {
+    if ((svmPtr == nullptr) && (size != 0)) {
         retVal = CL_INVALID_VALUE;
         TRACING_EXIT(ClEnqueueSvmMemFill, &retVal);
         return retVal;
@@ -4838,20 +5221,13 @@ cl_int CL_API_CALL clEnqueueSVMMap(cl_command_queue commandQueue,
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "blockingMap", blockingMap,
                    "mapFlags", mapFlags,
-                   "svmPtr", NEO::fileLoggerInstance().infoPointerToString(svmPtr, size),
+                   "svmPtr", NEO::getClFileLogger().infoPointerToString(svmPtr, size),
                    "size", size,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
 
     if (CL_SUCCESS != retVal) {
-        TRACING_EXIT(ClEnqueueSvmMap, &retVal);
-        return retVal;
-    }
-
-    auto &device = pCommandQueue->getDevice();
-    if (!device.getHardwareInfo().capabilityTable.ftrSvm) {
-        retVal = CL_INVALID_OPERATION;
         TRACING_EXIT(ClEnqueueSvmMap, &retVal);
         return retVal;
     }
@@ -4905,13 +5281,6 @@ cl_int CL_API_CALL clEnqueueSVMUnmap(cl_command_queue commandQueue,
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
 
     if (retVal != CL_SUCCESS) {
-        TRACING_EXIT(ClEnqueueSvmUnmap, &retVal);
-        return retVal;
-    }
-
-    auto &device = pCommandQueue->getDevice();
-    if (!device.getHardwareInfo().capabilityTable.ftrSvm) {
-        retVal = CL_INVALID_OPERATION;
         TRACING_EXIT(ClEnqueueSvmUnmap, &retVal);
         return retVal;
     }
@@ -4987,15 +5356,6 @@ cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
     DBG_LOG_INPUTS("kernel", kernel, "argIndex", argIndex, "argValue", argValue);
 
     for (const auto &pDevice : multiDeviceKernel->getDevices()) {
-        const HardwareInfo &hwInfo = pDevice->getHardwareInfo();
-        if (!hwInfo.capabilityTable.ftrSvm) {
-            retVal = CL_INVALID_OPERATION;
-            TRACING_EXIT(ClSetKernelArgSvmPointer, &retVal);
-            return retVal;
-        }
-    }
-
-    for (const auto &pDevice : multiDeviceKernel->getDevices()) {
         auto pKernel = multiDeviceKernel->getKernel(pDevice->getRootDeviceIndex());
         cl_int kernelArgAddressQualifier = asClKernelArgAddressQualifier(pKernel->getKernelInfo()
                                                                              .kernelDescriptor.payloadMappings.explicitArgs[argIndex]
@@ -5014,11 +5374,13 @@ cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
     if (argValue != nullptr) {
         auto svmData = svmManager->getSVMAlloc(argValue);
         if (svmData == nullptr) {
-            for (const auto &pDevice : multiDeviceKernel->getDevices()) {
-                if (!pDevice->areSharedSystemAllocationsAllowed()) {
-                    retVal = CL_INVALID_ARG_VALUE;
-                    TRACING_EXIT(ClSetKernelArgSvmPointer, &retVal);
-                    return retVal;
+            if (debugManager.flags.DetectIncorrectPointersOnSetArgCalls.get() == 1) {
+                for (const auto &pDevice : multiDeviceKernel->getDevices()) {
+                    if (!pDevice->areSharedSystemAllocationsAllowed()) {
+                        retVal = CL_INVALID_ARG_VALUE;
+                        TRACING_EXIT(ClSetKernelArgSvmPointer, &retVal);
+                        return retVal;
+                    }
                 }
             }
         } else {
@@ -5026,7 +5388,6 @@ cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
             allocId = svmData->getAllocId();
         }
     }
-
     retVal = multiDeviceKernel->setArgSvmAlloc(argIndex, const_cast<void *>(argValue), svmAllocs, allocId);
     TRACING_EXIT(ClSetKernelArgSvmPointer, &retVal);
     return retVal;
@@ -5043,7 +5404,7 @@ cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel,
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("kernel", kernel, "paramName", paramName,
-                   "paramValueSize", paramValueSize, "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize));
+                   "paramValueSize", paramValueSize, "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize));
 
     if (CL_SUCCESS != retVal) {
         TRACING_EXIT(ClSetKernelExecInfo, &retVal);
@@ -5051,23 +5412,10 @@ cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel,
     }
 
     switch (paramName) {
-    case CL_KERNEL_EXEC_INFO_SVM_PTRS:
-    case CL_KERNEL_EXEC_INFO_SVM_FINE_GRAIN_SYSTEM:
-        for (const auto &pDevice : pMultiDeviceKernel->getDevices()) {
-            const HardwareInfo &hwInfo = pDevice->getHardwareInfo();
-            if (!hwInfo.capabilityTable.ftrSvm) {
-                retVal = CL_INVALID_OPERATION;
-                TRACING_EXIT(ClSetKernelExecInfo, &retVal);
-                return retVal;
-            }
-        }
-    }
-
-    switch (paramName) {
     case CL_KERNEL_EXEC_INFO_INDIRECT_DEVICE_ACCESS_INTEL:
     case CL_KERNEL_EXEC_INFO_INDIRECT_HOST_ACCESS_INTEL:
     case CL_KERNEL_EXEC_INFO_INDIRECT_SHARED_ACCESS_INTEL: {
-        if (NEO::DebugManager.flags.DisableIndirectAccess.get() != 1 && pMultiDeviceKernel->getHasIndirectAccess() == true) {
+        if (NEO::debugManager.flags.DisableIndirectAccess.get() != 1 && pMultiDeviceKernel->getHasIndirectAccess() == true) {
             auto propertyValue = *reinterpret_cast<const cl_bool *>(paramValue);
             pMultiDeviceKernel->setUnifiedMemoryProperty(paramName, propertyValue);
         }
@@ -5075,15 +5423,15 @@ cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel,
 
     case CL_KERNEL_EXEC_INFO_SVM_PTRS:
     case CL_KERNEL_EXEC_INFO_USM_PTRS_INTEL: {
-        if ((paramValueSize == 0) ||
+        if ((paramValueSize == 0 && paramValue) ||
             (paramValueSize % sizeof(void *)) ||
-            (paramValue == nullptr)) {
+            (paramValueSize && paramValue == nullptr)) {
             retVal = CL_INVALID_VALUE;
             TRACING_EXIT(ClSetKernelExecInfo, &retVal);
             return retVal;
         }
         size_t numPointers = paramValueSize / sizeof(void *);
-        size_t *pSvmPtrList = (size_t *)paramValue;
+        auto pSvmPtrList = reinterpret_cast<void **>(const_cast<void *>(paramValue));
 
         if (paramName == CL_KERNEL_EXEC_INFO_SVM_PTRS) {
             pMultiDeviceKernel->clearSvmKernelExecInfo();
@@ -5091,9 +5439,18 @@ cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel,
             pMultiDeviceKernel->clearUnifiedMemoryExecInfo();
         }
 
+        bool sharedSystemSupported = true;
+        for (const auto &pDevice : pMultiDeviceKernel->getDevices()) {
+            if (!pDevice->areSharedSystemAllocationsAllowed()) {
+                sharedSystemSupported = false;
+                break;
+            }
+        }
         for (uint32_t i = 0; i < numPointers; i++) {
-            auto svmData = pMultiDeviceKernel->getContext().getSVMAllocsManager()->getSVMAlloc((const void *)pSvmPtrList[i]);
-            if (svmData == nullptr) {
+            auto svmData = pMultiDeviceKernel->getContext().getSVMAllocsManager()->getSVMAlloc(pSvmPtrList[i]);
+            if (pSvmPtrList[i] != nullptr && svmData == nullptr && sharedSystemSupported) {
+                continue;
+            } else if (svmData == nullptr) {
                 retVal = CL_INVALID_VALUE;
                 TRACING_EXIT(ClSetKernelExecInfo, &retVal);
                 return retVal;
@@ -5111,6 +5468,7 @@ cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel,
     case CL_KERNEL_EXEC_INFO_THREAD_ARBITRATION_POLICY_INTEL: {
         auto propertyValue = *static_cast<const uint32_t *>(paramValue);
         retVal = pMultiDeviceKernel->setKernelThreadArbitrationPolicy(propertyValue);
+        TRACING_EXIT(ClSetKernelExecInfo, &retVal);
         return retVal;
     }
     case CL_KERNEL_EXEC_INFO_SVM_FINE_GRAIN_SYSTEM: {
@@ -5118,6 +5476,7 @@ cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel,
         TRACING_EXIT(ClSetKernelExecInfo, &retVal);
         return retVal;
     }
+    case CL_KERNEL_EXEC_INFO_DISPATCH_TYPE_INTEL:
     case CL_KERNEL_EXEC_INFO_KERNEL_TYPE_INTEL: {
         if (paramValueSize != sizeof(cl_execution_info_kernel_type_intel) ||
             paramValue == nullptr) {
@@ -5147,8 +5506,8 @@ cl_mem CL_API_CALL clCreatePipe(cl_context context,
                                 const cl_pipe_properties *properties,
                                 cl_int *errcodeRet) {
     TRACING_ENTER(ClCreatePipe, &context, &flags, &pipePacketSize, &pipeMaxPackets, &properties, &errcodeRet);
+    cl_int retVal = CL_INVALID_OPERATION;
     cl_mem pipe = nullptr;
-    cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("cl_context", context,
@@ -5157,48 +5516,6 @@ cl_mem CL_API_CALL clCreatePipe(cl_context context,
                    "cl_uint", pipeMaxPackets,
                    "const cl_pipe_properties", properties,
                    "cl_int", errcodeRet);
-
-    Context *pContext = nullptr;
-
-    const cl_mem_flags allValidFlags =
-        CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS;
-
-    do {
-        if ((pipePacketSize == 0) || (pipeMaxPackets == 0)) {
-            retVal = CL_INVALID_PIPE_SIZE;
-            break;
-        }
-
-        /* Are there some invalid flag bits? */
-        if ((flags & (~allValidFlags)) != 0) {
-            retVal = CL_INVALID_VALUE;
-            break;
-        }
-
-        if (properties != nullptr) {
-            retVal = CL_INVALID_VALUE;
-            break;
-        }
-
-        retVal = validateObjects(withCastToInternal(context, &pContext));
-        if (retVal != CL_SUCCESS) {
-            break;
-        }
-        auto pDevice = pContext->getDevice(0);
-
-        if (pDevice->arePipesSupported() == false) {
-            retVal = CL_INVALID_OPERATION;
-            break;
-        }
-
-        if (pipePacketSize > pDevice->getDeviceInfo().pipeMaxPacketSize) {
-            retVal = CL_INVALID_PIPE_SIZE;
-            break;
-        }
-
-        // create the pipe
-        pipe = Pipe::create(pContext, flags, pipePacketSize, pipeMaxPackets, properties, retVal);
-    } while (false);
 
     if (errcodeRet) {
         *errcodeRet = retVal;
@@ -5215,30 +5532,15 @@ cl_int CL_API_CALL clGetPipeInfo(cl_mem pipe,
                                  size_t *paramValueSizeRet) {
     TRACING_ENTER(ClGetPipeInfo, &pipe, &paramName, &paramValueSize, &paramValue, &paramValueSizeRet);
 
-    cl_int retVal = CL_SUCCESS;
+    cl_int retVal = CL_INVALID_MEM_OBJECT;
     API_ENTER(&retVal);
 
     DBG_LOG_INPUTS("cl_mem", pipe,
                    "cl_pipe_info", paramName,
                    "size_t", paramValueSize,
-                   "void *", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "void *", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "size_t*", paramValueSizeRet);
 
-    retVal = validateObjects(pipe);
-    if (CL_SUCCESS != retVal) {
-        TRACING_EXIT(ClGetPipeInfo, &retVal);
-        return retVal;
-    }
-
-    auto pPipeObj = castToObject<Pipe>(pipe);
-
-    if (pPipeObj == nullptr) {
-        retVal = CL_INVALID_MEM_OBJECT;
-        TRACING_EXIT(ClGetPipeInfo, &retVal);
-        return retVal;
-    }
-
-    retVal = pPipeObj->getPipeInfo(paramName, paramValueSize, paramValue, paramValueSizeRet);
     TRACING_EXIT(ClGetPipeInfo, &retVal);
     return retVal;
 }
@@ -5402,9 +5704,6 @@ cl_command_queue CL_API_CALL clCreateCommandQueueWithProperties(cl_context conte
         pContext->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, DRIVER_CALLS_INTERNAL_CL_FLUSH);
         if (castToObjectOrAbort<CommandQueue>(commandQueue)->isProfilingEnabled()) {
             pContext->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, PROFILING_ENABLED);
-            if (pDevice->getDeviceInfo().preemptionSupported && pDevice->getHardwareInfo().platform.eProductFamily < IGFX_SKYLAKE) {
-                pContext->providePerformanceHint(CL_CONTEXT_DIAGNOSTICS_LEVEL_NEUTRAL_INTEL, PROFILING_ENABLED_WITH_DISABLED_PREEMPTION);
-            }
         }
     }
 
@@ -5462,15 +5761,17 @@ cl_int CL_API_CALL clGetKernelSubGroupInfoKHR(cl_kernel kernel,
                                               size_t paramValueSize,
                                               void *paramValue,
                                               size_t *paramValueSizeRet) {
+
+    TRACING_ENTER(ClGetKernelSubGroupInfoKHR, &kernel, &device, &paramName, &inputValueSize, &inputValue, &paramValueSize, &paramValue, &paramValueSizeRet);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("kernel", kernel,
                    "device", device,
                    "paramName", paramName,
                    "inputValueSize", inputValueSize,
-                   "inputValue", NEO::fileLoggerInstance().infoPointerToString(inputValue, inputValueSize),
+                   "inputValue", NEO::getClFileLogger().infoPointerToString(inputValue, inputValueSize),
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     MultiDeviceKernel *pMultiDeviceKernel = nullptr;
@@ -5486,6 +5787,7 @@ cl_int CL_API_CALL clGetKernelSubGroupInfoKHR(cl_kernel kernel,
     }
 
     if (CL_SUCCESS != retVal) {
+        TRACING_EXIT(ClGetKernelSubGroupInfoKHR, &retVal);
         return retVal;
     }
     auto pKernel = pMultiDeviceKernel->getKernel(pClDevice->getRootDeviceIndex());
@@ -5494,12 +5796,15 @@ cl_int CL_API_CALL clGetKernelSubGroupInfoKHR(cl_kernel kernel,
     case CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE:
     case CL_KERNEL_SUB_GROUP_COUNT_FOR_NDRANGE:
     case CL_KERNEL_COMPILE_SUB_GROUP_SIZE_INTEL:
-        return pKernel->getSubGroupInfo(paramName,
-                                        inputValueSize, inputValue,
-                                        paramValueSize, paramValue,
-                                        paramValueSizeRet);
+        retVal = pKernel->getSubGroupInfo(paramName,
+                                          inputValueSize, inputValue,
+                                          paramValueSize, paramValue,
+                                          paramValueSizeRet);
+        TRACING_EXIT(ClGetKernelSubGroupInfoKHR, &retVal);
+        return retVal;
     default: {
         retVal = CL_INVALID_VALUE;
+        TRACING_EXIT(ClGetKernelSubGroupInfoKHR, &retVal);
         return retVal;
     }
     }
@@ -5577,9 +5882,9 @@ cl_int CL_API_CALL clGetKernelSubGroupInfo(cl_kernel kernel,
                    "device", device,
                    "paramName", paramName,
                    "inputValueSize", inputValueSize,
-                   "inputValue", NEO::fileLoggerInstance().infoPointerToString(inputValue, inputValueSize),
+                   "inputValue", NEO::getClFileLogger().infoPointerToString(inputValue, inputValueSize),
                    "paramValueSize", paramValueSize,
-                   "paramValue", NEO::fileLoggerInstance().infoPointerToString(paramValue, paramValueSize),
+                   "paramValue", NEO::getClFileLogger().infoPointerToString(paramValue, paramValueSize),
                    "paramValueSizeRet", paramValueSizeRet);
 
     MultiDeviceKernel *pMultiDeviceKernel = nullptr;
@@ -5648,8 +5953,8 @@ cl_int CL_API_CALL clEnqueueSVMMigrateMem(cl_command_queue commandQueue,
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue,
                    "numSvmPointers", numSvmPointers,
-                   "svmPointers", NEO::fileLoggerInstance().infoPointerToString(svmPointers ? svmPointers[0] : 0, NEO::fileLoggerInstance().getInput(sizes, 0)),
-                   "sizes", NEO::fileLoggerInstance().getInput(sizes, 0),
+                   "svmPointers", NEO::getClFileLogger().infoPointerToString(svmPointers ? svmPointers[0] : 0, NEO::getClFileLogger().getInput(sizes, 0)),
+                   "sizes", NEO::getClFileLogger().getInput(sizes, 0),
                    "flags", flags,
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
@@ -5661,13 +5966,6 @@ cl_int CL_API_CALL clEnqueueSVMMigrateMem(cl_command_queue commandQueue,
         EventWaitList(numEventsInWaitList, eventWaitList));
 
     if (CL_SUCCESS != retVal) {
-        TRACING_EXIT(ClEnqueueSvmMigrateMem, &retVal);
-        return retVal;
-    }
-
-    auto &device = pCommandQueue->getDevice();
-    if (!device.getHardwareInfo().capabilityTable.ftrSvm) {
-        retVal = CL_INVALID_OPERATION;
         TRACING_EXIT(ClEnqueueSvmMigrateMem, &retVal);
         return retVal;
     }
@@ -5698,7 +5996,7 @@ cl_int CL_API_CALL clEnqueueSVMMigrateMem(cl_command_queue commandQueue,
             return retVal;
         }
         if (sizes != nullptr && sizes[i] != 0) {
-            svmData = pSvmAllocMgr->getSVMAlloc(reinterpret_cast<void *>((size_t)svmPointers[i] + sizes[i] - 1));
+            svmData = pSvmAllocMgr->getSVMAlloc(ptrOffset(svmPointers[i], sizes[i] - 1));
             if (svmData == nullptr) {
                 retVal = CL_INVALID_VALUE;
                 TRACING_EXIT(ClEnqueueSvmMigrateMem, &retVal);
@@ -5730,30 +6028,28 @@ cl_kernel CL_API_CALL clCloneKernel(cl_kernel sourceKernel,
                                     cl_int *errcodeRet) {
     TRACING_ENTER(ClCloneKernel, &sourceKernel, &errcodeRet);
     MultiDeviceKernel *pSourceMultiDeviceKernel = nullptr;
-    MultiDeviceKernel *pClonedMultiDeviceKernel = nullptr;
+    cl_kernel clonedMultiDeviceKernel = nullptr;
 
     auto retVal = validateObjects(withCastToInternal(sourceKernel, &pSourceMultiDeviceKernel));
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("sourceKernel", sourceKernel);
 
     if (CL_SUCCESS == retVal) {
-        pClonedMultiDeviceKernel = MultiDeviceKernel::create(pSourceMultiDeviceKernel->getProgram(),
-                                                             pSourceMultiDeviceKernel->getKernelInfos(),
-                                                             retVal);
-        UNRECOVERABLE_IF((pClonedMultiDeviceKernel == nullptr) || (retVal != CL_SUCCESS));
+        clonedMultiDeviceKernel = MultiDeviceKernel::create(pSourceMultiDeviceKernel->getProgram(),
+                                                            pSourceMultiDeviceKernel->getKernelInfos(),
+                                                            retVal);
+        UNRECOVERABLE_IF((clonedMultiDeviceKernel == nullptr) || (retVal != CL_SUCCESS));
 
+        auto pClonedMultiDeviceKernel = castToObject<MultiDeviceKernel>(clonedMultiDeviceKernel);
         retVal = pClonedMultiDeviceKernel->cloneKernel(pSourceMultiDeviceKernel);
     }
 
     if (errcodeRet) {
         *errcodeRet = retVal;
     }
-    if (pClonedMultiDeviceKernel != nullptr) {
-        gtpinNotifyKernelCreate(pClonedMultiDeviceKernel);
-    }
 
-    TRACING_EXIT(ClCloneKernel, (cl_kernel *)&pClonedMultiDeviceKernel);
-    return pClonedMultiDeviceKernel;
+    TRACING_EXIT(ClCloneKernel, &clonedMultiDeviceKernel);
+    return clonedMultiDeviceKernel;
 }
 
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueVerifyMemoryINTEL(cl_command_queue commandQueue,
@@ -5761,6 +6057,9 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueVerifyMemoryINTEL(cl_command_queue comm
                                                            const void *expectedData,
                                                            size_t sizeOfComparison,
                                                            cl_uint comparisonMode) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueVerifyMemoryINTEL, commandQueue, allocationPtr, expectedData, sizeOfComparison, comparisonMode);
+
+    TRACING_ENTER(ClEnqueueVerifyMemoryINTEL, &commandQueue, &allocationPtr, &expectedData, &sizeOfComparison, &comparisonMode);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue,
@@ -5771,12 +6070,14 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueVerifyMemoryINTEL(cl_command_queue comm
 
     if (sizeOfComparison == 0 || expectedData == nullptr || allocationPtr == nullptr) {
         retVal = CL_INVALID_VALUE;
+        TRACING_EXIT(ClEnqueueVerifyMemoryINTEL, &retVal);
         return retVal;
     }
 
     CommandQueue *pCommandQueue = nullptr;
     retVal = validateObjects(withCastToInternal(commandQueue, &pCommandQueue));
     if (retVal != CL_SUCCESS) {
+        TRACING_EXIT(ClEnqueueVerifyMemoryINTEL, &retVal);
         return retVal;
     }
 
@@ -5789,10 +6090,15 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueVerifyMemoryINTEL(cl_command_queue comm
 
     auto &csr = pCommandQueue->getGpgpuCommandStreamReceiver();
     auto status = csr.expectMemory(allocationPtr, expectedData, sizeOfComparison, comparisonMode);
-    return status ? CL_SUCCESS : CL_INVALID_VALUE;
+    retVal = status ? CL_SUCCESS : CL_INVALID_VALUE;
+    TRACING_EXIT(ClEnqueueVerifyMemoryINTEL, &retVal);
+    return retVal;
 }
 
 cl_int CL_API_CALL clAddCommentINTEL(cl_device_id device, const char *comment) {
+    FORWARD_TO_LEO_IF_FOREIGN(ClDevice, device, clAddCommentINTEL, device, comment);
+
+    TRACING_ENTER(ClAddCommentINTEL, &device, &comment);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("device", device, "comment", comment);
@@ -5800,6 +6106,7 @@ cl_int CL_API_CALL clAddCommentINTEL(cl_device_id device, const char *comment) {
     ClDevice *pDevice = nullptr;
     retVal = validateObjects(withCastToInternal(device, &pDevice));
     if (retVal != CL_SUCCESS) {
+        TRACING_EXIT(ClAddCommentINTEL, &retVal);
         return retVal;
     }
     auto aubCenter = pDevice->getRootDeviceEnvironment().aubCenter.get();
@@ -5812,6 +6119,7 @@ cl_int CL_API_CALL clAddCommentINTEL(cl_device_id device, const char *comment) {
         aubCenter->getAubManager()->addComment(comment);
     }
 
+    TRACING_EXIT(ClAddCommentINTEL, &retVal);
     return retVal;
 }
 
@@ -5821,6 +6129,8 @@ cl_int CL_API_CALL clGetDeviceGlobalVariablePointerINTEL(
     const char *globalVariableName,
     size_t *globalVariableSizeRet,
     void **globalVariablePointerRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(ClDevice, device, clGetDeviceGlobalVariablePointerINTEL, device, program, globalVariableName, globalVariableSizeRet, globalVariablePointerRet);
+    TRACING_ENTER(ClGetDeviceGlobalVariablePointerINTEL, &device, &program, &globalVariableName, &globalVariableSizeRet, &globalVariablePointerRet);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("device", device, "program", program,
@@ -5836,7 +6146,7 @@ cl_int CL_API_CALL clGetDeviceGlobalVariablePointerINTEL(
     if (CL_SUCCESS == retVal) {
         const auto &symbols = pProgram->getSymbols(pDevice->getRootDeviceIndex());
         auto symbolIt = symbols.find(globalVariableName);
-        if ((symbolIt == symbols.end()) || (symbolIt->second.symbol.segment == NEO::SegmentType::Instructions)) {
+        if ((symbolIt == symbols.end()) || (symbolIt->second.symbol.segment == NEO::SegmentType::instructions)) {
             retVal = CL_INVALID_ARG_VALUE;
         } else {
             if (globalVariableSizeRet != nullptr) {
@@ -5846,6 +6156,7 @@ cl_int CL_API_CALL clGetDeviceGlobalVariablePointerINTEL(
         }
     }
 
+    TRACING_EXIT(ClGetDeviceGlobalVariablePointerINTEL, &retVal);
     return retVal;
 }
 
@@ -5854,6 +6165,9 @@ cl_int CL_API_CALL clGetDeviceFunctionPointerINTEL(
     cl_program program,
     const char *functionName,
     cl_ulong *functionPointerRet) {
+    FORWARD_TO_LEO_IF_FOREIGN(ClDevice, device, clGetDeviceFunctionPointerINTEL, device, program, functionName, functionPointerRet);
+
+    TRACING_ENTER(ClGetDeviceFunctionPointerINTEL, &device, &program, &functionName, &functionPointerRet);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("device", device, "program", program,
@@ -5870,21 +6184,24 @@ cl_int CL_API_CALL clGetDeviceFunctionPointerINTEL(
     if (CL_SUCCESS == retVal) {
         const auto &symbols = pProgram->getSymbols(pDevice->getRootDeviceIndex());
         auto symbolIt = symbols.find(functionName);
-        if ((symbolIt == symbols.end()) || (symbolIt->second.symbol.segment != NEO::SegmentType::Instructions)) {
+        if ((symbolIt == symbols.end()) || (symbolIt->second.symbol.segment != NEO::SegmentType::instructions)) {
             retVal = CL_INVALID_ARG_VALUE;
         } else {
             *functionPointerRet = static_cast<cl_ulong>(symbolIt->second.gpuAddress);
         }
     }
 
+    TRACING_EXIT(ClGetDeviceFunctionPointerINTEL, &retVal);
     return retVal;
 }
 
 cl_int CL_API_CALL clSetProgramReleaseCallback(cl_program program,
                                                void(CL_CALLBACK *pfnNotify)(cl_program /* program */, void * /* user_data */),
                                                void *userData) {
+
+    TRACING_ENTER(ClSetProgramReleaseCallback, &program, &pfnNotify, &userData);
     DBG_LOG_INPUTS("program", program,
-                   "pfnNotify", pfnNotify,
+                   "pfnNotify", reinterpret_cast<void *>(pfnNotify),
                    "userData", userData);
 
     cl_int retVal = CL_SUCCESS;
@@ -5898,10 +6215,14 @@ cl_int CL_API_CALL clSetProgramReleaseCallback(cl_program program,
         retVal = CL_INVALID_OPERATION;
     }
 
+    TRACING_EXIT(ClSetProgramReleaseCallback, &retVal);
     return retVal;
 }
 
 cl_int CL_API_CALL clSetProgramSpecializationConstant(cl_program program, cl_uint specId, size_t specSize, const void *specValue) {
+    FORWARD_TO_LEO_IF_FOREIGN(Program, program, clSetProgramSpecializationConstant, program, specId, specSize, specValue);
+
+    TRACING_ENTER(ClSetProgramSpecializationConstant, &program, &specId, &specSize, &specValue);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("program", program,
@@ -5916,6 +6237,7 @@ cl_int CL_API_CALL clSetProgramSpecializationConstant(cl_program program, cl_uin
         retVal = pProgram->setProgramSpecializationConstant(specId, specSize, specValue);
     }
 
+    TRACING_EXIT(ClSetProgramSpecializationConstant, &retVal);
     return retVal;
 }
 
@@ -5925,49 +6247,18 @@ cl_int CL_API_CALL clGetKernelSuggestedLocalWorkSizeINTEL(cl_command_queue comma
                                                           const size_t *globalWorkOffset,
                                                           const size_t *globalWorkSize,
                                                           size_t *suggestedLocalWorkSize) {
-    cl_int retVal = CL_SUCCESS;
-    API_ENTER(&retVal);
-    DBG_LOG_INPUTS("commandQueue", commandQueue, "cl_kernel", kernel,
-                   "globalWorkOffset[0]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 0),
-                   "globalWorkOffset[1]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 1),
-                   "globalWorkOffset[2]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 2),
-                   "globalWorkSize", NEO::fileLoggerInstance().getSizes(globalWorkSize, workDim, true),
-                   "suggestedLocalWorkSize", suggestedLocalWorkSize);
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clGetKernelSuggestedLocalWorkSizeINTEL, commandQueue, kernel, workDim, globalWorkOffset, globalWorkSize, suggestedLocalWorkSize);
 
-    MultiDeviceKernel *pMultiDeviceKernel = nullptr;
-    CommandQueue *pCommandQueue = nullptr;
-    retVal = validateObjects(withCastToInternal(commandQueue, &pCommandQueue), withCastToInternal(kernel, &pMultiDeviceKernel));
+    TRACING_ENTER(ClGetKernelSuggestedLocalWorkSizeINTEL, &commandQueue, &kernel, &workDim, &globalWorkOffset, &globalWorkSize, &suggestedLocalWorkSize);
+    auto retVal = getKernelSuggestedLocalWorkSizeImpl(NEO_FUNCTION_NAME,
+                                                      commandQueue,
+                                                      kernel,
+                                                      workDim,
+                                                      globalWorkOffset,
+                                                      globalWorkSize,
+                                                      suggestedLocalWorkSize);
 
-    if (CL_SUCCESS != retVal) {
-        return retVal;
-    }
-
-    if ((workDim == 0) || (workDim > 3)) {
-        retVal = CL_INVALID_WORK_DIMENSION;
-        return retVal;
-    }
-
-    if (globalWorkSize == nullptr ||
-        globalWorkSize[0] == 0 ||
-        (workDim > 1 && globalWorkSize[1] == 0) ||
-        (workDim > 2 && globalWorkSize[2] == 0)) {
-        retVal = CL_INVALID_GLOBAL_WORK_SIZE;
-        return retVal;
-    }
-
-    auto pKernel = pMultiDeviceKernel->getKernel(pCommandQueue->getDevice().getRootDeviceIndex());
-    if (!pKernel->isPatched()) {
-        retVal = CL_INVALID_KERNEL;
-        return retVal;
-    }
-
-    if (suggestedLocalWorkSize == nullptr) {
-        retVal = CL_INVALID_VALUE;
-        return retVal;
-    }
-
-    pKernel->getSuggestedLocalWorkSize(workDim, globalWorkSize, globalWorkOffset, suggestedLocalWorkSize);
-
+    TRACING_EXIT(ClGetKernelSuggestedLocalWorkSizeINTEL, &retVal);
     return retVal;
 }
 
@@ -5977,14 +6268,15 @@ cl_int CL_API_CALL clGetKernelMaxConcurrentWorkGroupCountINTEL(cl_command_queue 
                                                                const size_t *globalWorkOffset,
                                                                const size_t *localWorkSize,
                                                                size_t *suggestedWorkGroupCount) {
-
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clGetKernelMaxConcurrentWorkGroupCountINTEL, commandQueue, kernel, workDim, globalWorkOffset, localWorkSize, suggestedWorkGroupCount);
+    TRACING_ENTER(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &commandQueue, &kernel, &workDim, &globalWorkOffset, &localWorkSize, &suggestedWorkGroupCount);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue, "cl_kernel", kernel,
-                   "globalWorkOffset[0]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 0),
-                   "globalWorkOffset[1]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 1),
-                   "globalWorkOffset[2]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 2),
-                   "localWorkSize", NEO::fileLoggerInstance().getSizes(localWorkSize, workDim, true),
+                   "globalWorkOffset[0]", NEO::getClFileLogger().getInput(globalWorkOffset, 0),
+                   "globalWorkOffset[1]", NEO::getClFileLogger().getInput(globalWorkOffset, 1),
+                   "globalWorkOffset[2]", NEO::getClFileLogger().getInput(globalWorkOffset, 2),
+                   "localWorkSize", NEO::getClFileLogger().getSizes(localWorkSize, workDim, true),
                    "suggestedWorkGroupCount", suggestedWorkGroupCount);
 
     CommandQueue *pCommandQueue = nullptr;
@@ -5993,33 +6285,47 @@ cl_int CL_API_CALL clGetKernelMaxConcurrentWorkGroupCountINTEL(cl_command_queue 
     retVal = validateObjects(withCastToInternal(commandQueue, &pCommandQueue), withCastToInternal(kernel, &pMultiDeviceKernel));
 
     if (CL_SUCCESS != retVal) {
+        TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
         return retVal;
     }
 
     if ((workDim == 0) || (workDim > 3)) {
         retVal = CL_INVALID_WORK_DIMENSION;
+        TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
         return retVal;
     }
 
     if (localWorkSize == nullptr) {
         retVal = CL_INVALID_WORK_GROUP_SIZE;
+        TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
         return retVal;
     }
 
     auto pKernel = pMultiDeviceKernel->getKernel(pCommandQueue->getDevice().getRootDeviceIndex());
     if (!pKernel->isPatched()) {
         retVal = CL_INVALID_KERNEL;
+        TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
         return retVal;
     }
 
     if (suggestedWorkGroupCount == nullptr) {
         retVal = CL_INVALID_VALUE;
+        TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
         return retVal;
     }
 
-    withCastToInternal(commandQueue, &pCommandQueue);
-    *suggestedWorkGroupCount = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue);
+    for (size_t i = 0; i < workDim; i++) {
+        if (localWorkSize[i] == 0) {
+            retVal = CL_INVALID_WORK_GROUP_SIZE;
+            TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
+            return retVal;
+        }
+    }
 
+    withCastToInternal(commandQueue, &pCommandQueue);
+    *suggestedWorkGroupCount = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue, false);
+
+    TRACING_EXIT(ClGetKernelMaxConcurrentWorkGroupCountINTEL, &retVal);
     return retVal;
 }
 
@@ -6032,14 +6338,17 @@ cl_int CL_API_CALL clEnqueueNDCountKernelINTEL(cl_command_queue commandQueue,
                                                cl_uint numEventsInWaitList,
                                                const cl_event *eventWaitList,
                                                cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueNDCountKernelINTEL, commandQueue, kernel, workDim, globalWorkOffset, workgroupCount, localWorkSize, numEventsInWaitList, eventWaitList, event);
+
+    TRACING_ENTER(ClEnqueueNDCountKernelINTEL, &commandQueue, &kernel, &workDim, &globalWorkOffset, &workgroupCount, &localWorkSize, &numEventsInWaitList, &eventWaitList, &event);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue, "cl_kernel", kernel,
-                   "globalWorkOffset[0]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 0),
-                   "globalWorkOffset[1]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 1),
-                   "globalWorkOffset[2]", NEO::fileLoggerInstance().getInput(globalWorkOffset, 2),
-                   "workgroupCount", NEO::fileLoggerInstance().getSizes(workgroupCount, workDim, false),
-                   "localWorkSize", NEO::fileLoggerInstance().getSizes(localWorkSize, workDim, true),
+                   "globalWorkOffset[0]", NEO::getClFileLogger().getInput(globalWorkOffset, 0),
+                   "globalWorkOffset[1]", NEO::getClFileLogger().getInput(globalWorkOffset, 1),
+                   "globalWorkOffset[2]", NEO::getClFileLogger().getInput(globalWorkOffset, 2),
+                   "workgroupCount", NEO::getClFileLogger().getSizes(workgroupCount, workDim, false),
+                   "localWorkSize", NEO::getClFileLogger().getSizes(localWorkSize, workDim, true),
                    "numEventsInWaitList", numEventsInWaitList,
                    "eventWaitList", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(eventWaitList), numEventsInWaitList),
                    "event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1));
@@ -6054,6 +6363,7 @@ cl_int CL_API_CALL clEnqueueNDCountKernelINTEL(cl_command_queue commandQueue,
         EventWaitList(numEventsInWaitList, eventWaitList));
 
     if (CL_SUCCESS != retVal) {
+        TRACING_EXIT(ClEnqueueNDCountKernelINTEL, &retVal);
         return retVal;
     }
 
@@ -6063,49 +6373,47 @@ cl_int CL_API_CALL clEnqueueNDCountKernelINTEL(cl_command_queue commandQueue,
     pKernel = pMultiDeviceKernel->getKernel(rootDeviceIndex);
     size_t globalWorkSize[3];
     for (size_t i = 0; i < workDim; i++) {
+        if (localWorkSize[i] == 0) {
+            retVal = CL_INVALID_WORK_GROUP_SIZE;
+            TRACING_EXIT(ClEnqueueNDCountKernelINTEL, &retVal);
+            return retVal;
+        }
         globalWorkSize[i] = workgroupCount[i] * localWorkSize[i];
     }
 
-    if (pKernel->usesSyncBuffer()) {
-        if (pKernel->getExecutionType() != KernelExecutionType::Concurrent) {
-            retVal = CL_INVALID_KERNEL;
-            return retVal;
-        }
-
+    if (pKernel->requiresSyncBufferSlot()) {
         auto &hardwareInfo = device.getHardwareInfo();
         auto &gfxCoreHelper = device.getGfxCoreHelper();
         auto engineGroupType = gfxCoreHelper.getEngineGroupType(pCommandQueue->getGpgpuEngine().getEngineType(),
                                                                 pCommandQueue->getGpgpuEngine().getEngineUsage(), hardwareInfo);
         if (!gfxCoreHelper.isCooperativeDispatchSupported(engineGroupType, device.getRootDeviceEnvironment())) {
             retVal = CL_INVALID_COMMAND_QUEUE;
+            TRACING_EXIT(ClEnqueueNDCountKernelINTEL, &retVal);
             return retVal;
         }
     }
 
-    if (pKernel->getExecutionType() == KernelExecutionType::Concurrent) {
+    if (pKernel->getExecutionType() == KernelExecutionType::concurrent) {
         size_t requestedNumberOfWorkgroups = 1;
         for (size_t i = 0; i < workDim; i++) {
             requestedNumberOfWorkgroups *= workgroupCount[i];
         }
-        size_t maximalNumberOfWorkgroupsAllowed = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue);
+        size_t maximalNumberOfWorkgroupsAllowed = pKernel->getMaxWorkGroupCount(workDim, localWorkSize, pCommandQueue, false);
         if (requestedNumberOfWorkgroups > maximalNumberOfWorkgroupsAllowed) {
             retVal = CL_INVALID_VALUE;
+            TRACING_EXIT(ClEnqueueNDCountKernelINTEL, &retVal);
             return retVal;
         }
     }
 
     if (!pCommandQueue->validateCapabilityForOperation(CL_QUEUE_CAPABILITY_KERNEL_INTEL, numEventsInWaitList, eventWaitList, event)) {
         retVal = CL_INVALID_OPERATION;
+        TRACING_EXIT(ClEnqueueNDCountKernelINTEL, &retVal);
         return retVal;
     }
 
-    if (pKernel->usesSyncBuffer()) {
+    if (pKernel->requiresSyncBufferSlot()) {
         device.getDevice().allocateSyncBufferHandler();
-    }
-
-    TakeOwnershipWrapper<MultiDeviceKernel> kernelOwnership(*pMultiDeviceKernel, gtpinIsGTPinInitialized());
-    if (gtpinIsGTPinInitialized()) {
-        gtpinNotifyKernelSubmit(kernel, pCommandQueue);
     }
 
     retVal = pCommandQueue->enqueueKernel(
@@ -6119,14 +6427,17 @@ cl_int CL_API_CALL clEnqueueNDCountKernelINTEL(cl_command_queue commandQueue,
         event);
 
     DBG_LOG_INPUTS("event", getClFileLogger().getEvents(reinterpret_cast<const uintptr_t *>(event), 1u));
+    TRACING_EXIT(ClEnqueueNDCountKernelINTEL, &retVal);
     return retVal;
 }
 
 cl_int CL_API_CALL clSetContextDestructorCallback(cl_context context,
                                                   void(CL_CALLBACK *pfnNotify)(cl_context /* context */, void * /* user_data */),
                                                   void *userData) {
+
+    TRACING_ENTER(ClSetContextDestructorCallback, &context, &pfnNotify, &userData);
     DBG_LOG_INPUTS("program", context,
-                   "pfnNotify", pfnNotify,
+                   "pfnNotify", reinterpret_cast<void *>(pfnNotify),
                    "userData", userData);
 
     cl_int retVal = CL_SUCCESS;
@@ -6140,6 +6451,7 @@ cl_int CL_API_CALL clSetContextDestructorCallback(cl_context context,
         retVal = pContext->setDestructorCallback(pfnNotify, userData);
     }
 
+    TRACING_EXIT(ClSetContextDestructorCallback, &retVal);
     return retVal;
 }
 
@@ -6151,6 +6463,7 @@ cl_int CL_API_CALL clEnqueueExternalMemObjectsKHR(
     const cl_event *eventWaitList,
     cl_event *event) {
 
+    TRACING_ENTER(ClEnqueueExternalMemObjectsKHR, &commandQueue, &numMemObjects, &memObjects, &numEventsInWaitList, &eventWaitList, &event);
     cl_int retVal = CL_SUCCESS;
     API_ENTER(&retVal);
     DBG_LOG_INPUTS("commandQueue", commandQueue,
@@ -6165,6 +6478,7 @@ cl_int CL_API_CALL clEnqueueExternalMemObjectsKHR(
                              EventWaitList(numEventsInWaitList, eventWaitList));
 
     if (retVal != CL_SUCCESS) {
+        TRACING_EXIT(ClEnqueueExternalMemObjectsKHR, &retVal);
         return retVal;
     }
 
@@ -6172,12 +6486,14 @@ cl_int CL_API_CALL clEnqueueExternalMemObjectsKHR(
         auto pEvent = castToObject<Event>(eventWaitList[num]);
         if (pEvent->peekExecutionStatus() < CL_COMPLETE) {
             retVal = CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST;
+            TRACING_EXIT(ClEnqueueExternalMemObjectsKHR, &retVal);
             return retVal;
         }
     }
 
     retVal = pCommandQueue->enqueueMarkerWithWaitList(numEventsInWaitList, eventWaitList, event);
 
+    TRACING_EXIT(ClEnqueueExternalMemObjectsKHR, &retVal);
     return retVal;
 }
 
@@ -6188,8 +6504,17 @@ cl_int CL_API_CALL clEnqueueAcquireExternalMemObjectsKHR(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueAcquireExternalMemObjectsKHR, commandQueue, numMemObjects, memObjects, numEventsInWaitList, eventWaitList, event);
 
-    return clEnqueueExternalMemObjectsKHR(commandQueue, numMemObjects, memObjects, numEventsInWaitList, eventWaitList, event);
+    TRACING_ENTER(ClEnqueueAcquireExternalMemObjectsKHR, &commandQueue, &numMemObjects, &memObjects, &numEventsInWaitList, &eventWaitList, &event);
+    auto retVal = clEnqueueExternalMemObjectsKHR(commandQueue,
+                                                 numMemObjects,
+                                                 memObjects,
+                                                 numEventsInWaitList,
+                                                 eventWaitList,
+                                                 event);
+    TRACING_EXIT(ClEnqueueAcquireExternalMemObjectsKHR, &retVal);
+    return retVal;
 }
 
 cl_int CL_API_CALL clEnqueueReleaseExternalMemObjectsKHR(
@@ -6199,6 +6524,15 @@ cl_int CL_API_CALL clEnqueueReleaseExternalMemObjectsKHR(
     cl_uint numEventsInWaitList,
     const cl_event *eventWaitList,
     cl_event *event) {
+    FORWARD_TO_LEO_IF_FOREIGN(CommandQueue, commandQueue, clEnqueueReleaseExternalMemObjectsKHR, commandQueue, numMemObjects, memObjects, numEventsInWaitList, eventWaitList, event);
 
-    return clEnqueueExternalMemObjectsKHR(commandQueue, numMemObjects, memObjects, numEventsInWaitList, eventWaitList, event);
+    TRACING_ENTER(ClEnqueueReleaseExternalMemObjectsKHR, &commandQueue, &numMemObjects, &memObjects, &numEventsInWaitList, &eventWaitList, &event);
+    auto retVal = clEnqueueExternalMemObjectsKHR(commandQueue,
+                                                 numMemObjects,
+                                                 memObjects,
+                                                 numEventsInWaitList,
+                                                 eventWaitList,
+                                                 event);
+    TRACING_EXIT(ClEnqueueReleaseExternalMemObjectsKHR, &retVal);
+    return retVal;
 }

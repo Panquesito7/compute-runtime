@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -8,14 +8,14 @@
 #pragma once
 
 #include "shared/source/helpers/mt_helpers.h"
+#include "shared/source/helpers/non_copyable_or_moveable.h"
 
 #include <atomic>
 #include <memory>
-#include <type_traits>
 
 namespace NEO {
 
-template <typename NodeObjectType, bool Atomic>
+template <typename NodeObjectType, bool atomic>
 struct PtrType {
 };
 
@@ -29,8 +29,8 @@ struct PtrType<NodeObjectType, false> {
     using type = NodeObjectType *;
 };
 
-template <typename NodeObjectType, bool Atomic>
-using PtrType_t = typename PtrType<NodeObjectType, Atomic>::type;
+template <typename NodeObjectType, bool atomic>
+using PtrType_t = typename PtrType<NodeObjectType, atomic>::type;
 
 template <typename NodeObjectType>
 struct IFNode {
@@ -38,6 +38,7 @@ struct IFNode {
         : next(nullptr) {
     }
 
+    virtual ~IFNode() = default;
     void insertOneNext(NodeObjectType &nd) {
         nd.next = next;
         next = &nd;
@@ -87,8 +88,8 @@ struct IFNode {
     NodeObjectType *next;
 };
 
-template <typename NodeObjectType, bool ThreadSafe = true, bool OwnsNodes = false>
-class IFList {
+template <typename NodeObjectType, bool threadSafe = true, bool ownsNodes = false>
+class IFList : NEO::NonCopyableAndNonMovableClass {
   public:
     IFList()
         : head(nullptr) {
@@ -102,37 +103,39 @@ class IFList {
         this->cleanup();
     }
 
-    IFList(const IFList &) = delete;
-    IFList &operator=(const IFList &) = delete;
-
-    template <bool C = ThreadSafe>
-    typename std::enable_if<C, void>::type pushFrontOne(NodeObjectType &node) {
+    template <bool listIsThreadSafe = threadSafe>
+        requires(listIsThreadSafe)
+    void pushFrontOne(NodeObjectType &node) {
         node.next = head;
         compareExchangeHead(node.next, &node);
     }
 
-    template <bool C = ThreadSafe>
-    typename std::enable_if<C, NodeObjectType *>::type detachNodes() {
+    template <bool listIsThreadSafe = threadSafe>
+        requires(listIsThreadSafe)
+    NodeObjectType *detachNodes() {
         NodeObjectType *rest = head;
         compareExchangeHead(rest, nullptr);
         return rest;
     }
 
-    template <bool C = ThreadSafe>
-    typename std::enable_if<!C, void>::type pushFrontOne(NodeObjectType &node) {
+    template <bool listIsThreadSafe = threadSafe>
+        requires(!listIsThreadSafe)
+    void pushFrontOne(NodeObjectType &node) {
         node.next = head;
         head = &node;
     }
 
-    template <bool C = ThreadSafe>
-    typename std::enable_if<!C, NodeObjectType *>::type detachNodes() {
+    template <bool listIsThreadSafe = threadSafe>
+        requires(!listIsThreadSafe)
+    NodeObjectType *detachNodes() {
         NodeObjectType *rest = head;
         head = nullptr;
         return rest;
     }
 
-    template <bool C = ThreadSafe>
-    typename std::enable_if<!C, void>::type splice(NodeObjectType &nodes) {
+    template <bool listIsThreadSafe = threadSafe>
+        requires(!listIsThreadSafe)
+    void splice(NodeObjectType &nodes) {
         if (head == nullptr) {
             head = &nodes;
         } else {
@@ -156,24 +159,27 @@ class IFList {
     }
 
   protected:
-    template <bool C = OwnsNodes>
-    typename std::enable_if<C, void>::type cleanup() {
+    template <bool listOwnsNodes = ownsNodes>
+        requires(listOwnsNodes)
+    void cleanup() {
         deleteAll();
     }
 
-    template <bool C = OwnsNodes>
-    typename std::enable_if<!C, void>::type cleanup() {
+    template <bool listOwnsNodes = ownsNodes>
+        requires(!listOwnsNodes)
+    void cleanup() {
         ;
     }
 
-    template <bool C = ThreadSafe>
-    typename std::enable_if<C, void>::type compareExchangeHead(NodeObjectType *&expected, NodeObjectType *desired) {
+    template <bool listIsThreadSafe = threadSafe>
+        requires(listIsThreadSafe)
+    void compareExchangeHead(NodeObjectType *&expected, NodeObjectType *desired) {
         while (!NEO::MultiThreadHelpers::atomicCompareExchangeWeakSpin(head, expected, desired)) {
             ;
         }
     }
 
-    PtrType_t<NodeObjectType, ThreadSafe> head;
+    PtrType_t<NodeObjectType, threadSafe> head;
 };
 
 template <typename NodeObjectType>
@@ -184,13 +190,13 @@ struct IFNodeRef : IFNode<IFNodeRef<NodeObjectType>> {
     NodeObjectType *ref;
 };
 
-template <typename NodeObjectType, bool ThreadSafe = true, bool OwnsNodes = true>
-class IFRefList : public IFList<IFNodeRef<NodeObjectType>, ThreadSafe, OwnsNodes> {
+template <typename NodeObjectType, bool threadSafe = true, bool ownsNodes = true>
+class IFRefList : public IFList<IFNodeRef<NodeObjectType>, threadSafe, ownsNodes> {
   public:
     void pushRefFrontOne(NodeObjectType &node) {
-        auto up = std::unique_ptr<IFNodeRef<NodeObjectType>>(new IFNodeRef<NodeObjectType>(&node));
+        auto up = std::make_unique<IFNodeRef<NodeObjectType>>(&node);
         this->pushFrontOne(*up);
         up.release();
-    }
+    } // NOLINT(clang-analyzer-cplusplus.NewDeleteLeaks)
 };
 } // namespace NEO

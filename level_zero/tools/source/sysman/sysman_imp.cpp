@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -11,15 +11,25 @@
 #include "shared/source/helpers/basic_math.h"
 #include "shared/source/helpers/gfx_core_helper.h"
 #include "shared/source/helpers/hw_info.h"
-#include "shared/source/helpers/sleep.h"
 
-#include "level_zero/core/source/driver/driver.h"
-#include "level_zero/core/source/driver/driver_handle_imp.h"
+#include "level_zero/tools/source/sysman/diagnostics/diagnostics.h"
 #include "level_zero/tools/source/sysman/ecc/ecc_imp.h"
+#include "level_zero/tools/source/sysman/engine/engine.h"
 #include "level_zero/tools/source/sysman/events/events_imp.h"
+#include "level_zero/tools/source/sysman/fabric_port/fabric_port.h"
+#include "level_zero/tools/source/sysman/fan/fan.h"
+#include "level_zero/tools/source/sysman/firmware/firmware.h"
+#include "level_zero/tools/source/sysman/frequency/frequency.h"
 #include "level_zero/tools/source/sysman/global_operations/global_operations_imp.h"
+#include "level_zero/tools/source/sysman/memory/memory.h"
 #include "level_zero/tools/source/sysman/pci/pci_imp.h"
-#include "level_zero/tools/source/sysman/sysman.h"
+#include "level_zero/tools/source/sysman/performance/performance.h"
+#include "level_zero/tools/source/sysman/power/power.h"
+#include "level_zero/tools/source/sysman/ras/ras.h"
+#include "level_zero/tools/source/sysman/scheduler/scheduler.h"
+#include "level_zero/tools/source/sysman/standby/standby.h"
+#include "level_zero/tools/source/sysman/temperature/temperature.h"
+#include "level_zero/tools/source/sysman/vf_management/vf_management.h"
 
 #include <vector>
 
@@ -46,6 +56,7 @@ SysmanDeviceImp::SysmanDeviceImp(ze_device_handle_t hDevice) {
     pDiagnosticsHandleContext = new DiagnosticsHandleContext(pOsSysman);
     pPerformanceHandleContext = new PerformanceHandleContext(pOsSysman);
     pEcc = new EccImp(pOsSysman);
+    pVfManagementHandleContext = new VfManagementHandleContext(pOsSysman);
 }
 
 SysmanDeviceImp::~SysmanDeviceImp() {
@@ -66,6 +77,7 @@ SysmanDeviceImp::~SysmanDeviceImp() {
     freeResource(pFrequencyHandleContext);
     freeResource(pPowerHandleContext);
     freeResource(pEcc);
+    freeResource(pVfManagementHandleContext);
     freeResource(pOsSysman);
 }
 
@@ -106,8 +118,11 @@ ze_result_t SysmanDeviceImp::init() {
     updateSubDeviceHandlesLocally();
 
     auto result = pOsSysman->init();
-    if (ZE_RESULT_SUCCESS != result) {
-        return result;
+    if (result == ZE_RESULT_SUCCESS) {
+        ze_bool_t driverModelSupported = pOsSysman->isDriverModelSupported();
+        if (!driverModelSupported) {
+            return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+        }
     }
     return result;
 }
@@ -138,6 +153,10 @@ OsSysman *SysmanDeviceImp::deviceGetOsInterface() {
 
 bool SysmanDeviceImp::deviceEventListen(zes_event_type_flags_t &pEvent, uint64_t timeout) {
     return pEvents->eventListen(pEvent, timeout);
+}
+
+ze_result_t SysmanDeviceImp::deviceResetExt(zes_reset_properties_t *pProperties) {
+    return pGlobalOperations->resetExt(pProperties);
 }
 
 ze_result_t SysmanDeviceImp::deviceGetState(zes_device_state_t *pState) {
@@ -178,6 +197,10 @@ ze_result_t SysmanDeviceImp::standbyGet(uint32_t *pCount, zes_standby_handle_t *
 
 ze_result_t SysmanDeviceImp::fabricPortGet(uint32_t *pCount, zes_fabric_port_handle_t *phPort) {
     return pFabricPortHandleContext->fabricPortGet(pCount, phPort);
+}
+
+ze_result_t SysmanDeviceImp::fabricPortGetMultiPortThroughput(uint32_t numPorts, zes_fabric_port_handle_t *phPort, zes_fabric_port_throughput_t **pThroughput) {
+    return pFabricPortHandleContext->fabricPortGetMultiPortThroughput(numPorts, phPort, pThroughput);
 }
 
 ze_result_t SysmanDeviceImp::temperatureGet(uint32_t *pCount, zes_temp_handle_t *phTemperature) {
@@ -223,6 +246,10 @@ ze_result_t SysmanDeviceImp::deviceGetEccState(zes_device_ecc_properties_t *pSta
 }
 ze_result_t SysmanDeviceImp::deviceSetEccState(const zes_device_ecc_desc_t *newState, zes_device_ecc_properties_t *pState) {
     return pEcc->setEccState(newState, pState);
+}
+
+ze_result_t SysmanDeviceImp::deviceEnumEnabledVF(uint32_t *pCount, zes_vf_handle_t *phVFhandle) {
+    return pVfManagementHandleContext->vfManagementGet(pCount, phVFhandle);
 }
 
 } // namespace L0

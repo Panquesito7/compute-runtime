@@ -1,13 +1,13 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
-#include "shared/source/built_ins/built_ins.h"
 #include "shared/source/helpers/compiler_product_helper.h"
 #include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/test_macros/hw_test.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/common/utilities/base_object_utils.h"
 
@@ -19,8 +19,7 @@
 #include "opencl/test/unit_test/fixtures/buffer_fixture.h"
 #include "opencl/test/unit_test/gen_common/gen_commands_common_validation.h"
 #include "opencl/test/unit_test/mocks/mock_buffer.h"
-
-#include "reg_configs_common.h"
+#include "opencl/test/unit_test/mocks/mock_cl_device_factory.h"
 
 using namespace NEO;
 
@@ -79,11 +78,11 @@ HWTEST_F(EnqueueWriteBufferRectTest, GivenGpuHangAndBlockingCallAndValidParamsWh
     size_t dstOrigin[] = {0, 0, 0};
     size_t region[] = {1, 1, 1};
 
-    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
+    std::unique_ptr<ClDevice> device(new MockClDevice{MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(nullptr)});
     cl_queue_properties props = {};
 
     MockCommandQueueHw<FamilyType> mockCommandQueueHw(context.get(), device.get(), &props);
-    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::GpuHang;
+    mockCommandQueueHw.waitForAllEnginesReturnValue = WaitStatus::gpuHang;
 
     const auto enqueueResult = clEnqueueWriteBufferRect(
         &mockCommandQueueHw,
@@ -125,10 +124,16 @@ HWTEST_F(EnqueueWriteBufferRectTest, GivenNonBlockingEnqueueWhenWritingBufferThe
 
     enqueueWriteBufferRect2D<FamilyType>(CL_FALSE);
     EXPECT_EQ(csr.peekTaskCount(), pCmdQ->taskCount);
-    EXPECT_EQ(csr.peekTaskLevel(), pCmdQ->taskLevel + 1);
+
+    auto cmdQTaskLevel = pCmdQ->taskLevel;
+    if (!csr.isUpdateTagFromWaitEnabled()) {
+        cmdQTaskLevel++;
+    }
+
+    EXPECT_EQ(csr.peekTaskLevel(), cmdQTaskLevel);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, Given2dRegionWhenWritingBufferThenCommandsAreProgrammedCorrectly) {
+HWTEST2_F(EnqueueWriteBufferRectTest, Given2dRegionWhenWritingBufferThenCommandsAreProgrammedCorrectly, IsGen12LP) {
     typedef typename FamilyType::GPGPU_WALKER GPGPU_WALKER;
     enqueueWriteBufferRect2D<FamilyType>();
 
@@ -174,18 +179,19 @@ HWTEST_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenCommandsAreAdded) {
     EXPECT_NE(usedCmdBufferBefore, pCS->getUsed());
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenIndirectDataIsAdded) {
+HWTEST2_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenIndirectDataIsAdded, IsGen12LP) {
     auto dshBefore = pDSH->getUsed();
     auto iohBefore = pIOH->getUsed();
     auto sshBefore = pSSH->getUsed();
 
     enqueueWriteBufferRect2D<FamilyType>();
 
-    auto &builder = BuiltInDispatchBuilderOp::getBuiltinDispatchInfoBuilder(EBuiltInOps::CopyBufferRect,
-                                                                            pCmdQ->getClDevice());
+    auto &builder = BuiltIn::DispatchBuilderOp::getBuiltinDispatchInfoBuilder(BuiltIn::BaseKernel::copyBufferRect,
+                                                                              BuiltIn::bindfulImageBindfulBuffer,
+                                                                              pCmdQ->getClDevice());
     ASSERT_NE(nullptr, &builder);
 
-    BuiltinOpParams dc;
+    BuiltIn::OpParams dc;
     dc.srcPtr = hostPtr;
     dc.dstMemObj = buffer.get();
     dc.srcOffset = {0, 0, 0};
@@ -205,7 +211,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenInd
 
     EXPECT_NE(dshBefore, pDSH->getUsed());
     EXPECT_NE(iohBefore, pIOH->getUsed());
-    if (kernel->usesBindfulAddressingForBuffers()) {
+    if (kernel->getKernelInfo().kernelDescriptor.kernelAttributes.bufferAddressingMode == KernelDescriptor::BindfulAndStateless) {
         EXPECT_NE(sshBefore, pSSH->getUsed());
     }
 }
@@ -215,7 +221,7 @@ HWTEST_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenL3ProgrammingIsCorrect
     validateL3Programming<FamilyType>(cmdList, itorWalker);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, When2DEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed) {
+HWTEST2_F(EnqueueWriteBufferRectTest, When2DEnqueueIsDoneThenStateBaseAddressIsProperlyProgrammed, IsGen12LP) {
     enqueueWriteBufferRect2D<FamilyType>();
     auto &ultCsr = this->pDevice->getUltCommandStreamReceiver<FamilyType>();
     auto &gfxCoreHelper = pDevice->getGfxCoreHelper();
@@ -225,7 +231,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, When2DEnqueueIsDoneThenS
                                          pDSH, pIOH, pSSH, itorPipelineSelect, itorWalker, cmdList, 0llu);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenMediaInterfaceDescriptorIsCorrect) {
+HWTEST2_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenMediaInterfaceDescriptorIsCorrect, IsGen12LP) {
     typedef typename FamilyType::MEDIA_INTERFACE_DESCRIPTOR_LOAD MEDIA_INTERFACE_DESCRIPTOR_LOAD;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
 
@@ -250,10 +256,10 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenMed
     EXPECT_EQ(0u, cmd->getInterfaceDescriptorTotalLength() % alignmentTotalLength);
 
     // Generically validate this command
-    FamilyType::PARSE::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorCmd);
+    FamilyType::Parse::template validateCommand<MEDIA_INTERFACE_DESCRIPTOR_LOAD *>(cmdList.begin(), itorCmd);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenInterfaceDescriptorDataIsCorrect) {
+HWTEST2_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenInterfaceDescriptorDataIsCorrect, IsGen12LP) {
     typedef typename FamilyType::MEDIA_INTERFACE_DESCRIPTOR_LOAD MEDIA_INTERFACE_DESCRIPTOR_LOAD;
     typedef typename FamilyType::STATE_BASE_ADDRESS STATE_BASE_ADDRESS;
     typedef typename FamilyType::INTERFACE_DESCRIPTOR_DATA INTERFACE_DESCRIPTOR_DATA;
@@ -282,7 +288,7 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenInt
     auto &idd = *(INTERFACE_DESCRIPTOR_DATA *)cmdInterfaceDescriptorData;
 
     // Validate the kernel start pointer.  Technically, a kernel can start at address 0 but let's force a value.
-    auto kernelStartPointer = ((uint64_t)idd.getKernelStartPointerHigh() << 32) + idd.getKernelStartPointer();
+    auto kernelStartPointer = idd.getKernelStartPointer();
     EXPECT_LE(kernelStartPointer, cmdSBA->getInstructionBufferSize() * MemoryConstants::pageSize);
 
     EXPECT_NE(0u, idd.getNumberOfThreadsInGpgpuThreadGroup());
@@ -290,13 +296,13 @@ HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenInt
     EXPECT_NE(0u, idd.getConstantIndirectUrbEntryReadLength());
 }
 
-HWTEST2_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenOnePipelineSelectIsProgrammed, IsAtMostXeHpcCore) {
+HWTEST2_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenOnePipelineSelectIsProgrammed, IsAtMostXeCore) {
     enqueueWriteBufferRect2D<FamilyType>();
     int numCommands = getNumberOfPipelineSelectsThatEnablePipelineSelect<FamilyType>();
     EXPECT_EQ(1, numCommands);
 }
 
-HWCMDTEST_F(IGFX_GEN8_CORE, EnqueueWriteBufferRectTest, WhenWritingBufferThenMediaVfeStateIsCorrect) {
+HWTEST2_F(EnqueueWriteBufferRectTest, WhenWritingBufferThenMediaVfeStateIsCorrect, IsGen12LP) {
     enqueueWriteBufferRect2D<FamilyType>();
     validateMediaVFEState<FamilyType>(&pDevice->getHardwareInfo(), cmdMediaVfeState, cmdList, itorMediaVfeState);
 }
@@ -525,7 +531,7 @@ HWTEST_F(EnqueueWriteBufferRectTest, givenInOrderQueueAndMemObjWithOffsetPointTh
     EXPECT_EQ(CL_SUCCESS, retVal);
     EXPECT_EQ(pCmdQ->taskLevel, 0u);
 }
-HWTEST_F(EnqueueWriteBufferRectTest, givenInOrderQueueAndMemObjWithOffsetPointDiffrentStorageWithHostWhenWriteBufferIsExecutedThenTaskLevelShouldBeIncreased) {
+HWTEST_F(EnqueueWriteBufferRectTest, givenInOrderQueueAndMemObjWithOffsetPointDifferentStorageWithHostWhenWriteBufferIsExecutedThenTaskLevelShouldBeIncreased) {
     cl_int retVal = CL_SUCCESS;
     void *ptr = buffer->getCpuAddressForMemoryTransfer();
     size_t bufferOrigin[] = {0, 0, 0};
@@ -598,13 +604,13 @@ HWTEST_F(EnqueueReadWriteBufferRectDispatch, givenOffsetResultingInMisalignedPtr
     ASSERT_NE(0u, cmdQ->lastEnqueuedKernels.size());
     Kernel *kernel = cmdQ->lastEnqueuedKernels[0];
 
-    cmdQ->finish();
+    cmdQ->finish(false);
 
     parseCommands<FamilyType>(*cmdQ);
     auto &kernelInfo = kernel->getKernelInfo();
 
     if (hwInfo->capabilityTable.gpuAddressSpace == MemoryConstants::max48BitAddress) {
-        const auto surfaceState = getSurfaceState<FamilyType>(&cmdQ->getIndirectHeap(IndirectHeap::Type::SURFACE_STATE, 0), 0);
+        const auto surfaceState = getSurfaceState<FamilyType>(&cmdQ->getIndirectHeap(IndirectHeap::Type::surfaceState, 0), 0);
 
         if (kernelInfo.getArgDescriptorAt(0).as<ArgDescPointer>().pointerSize == sizeof(uint64_t)) {
             auto pKernelArg = (uint64_t *)(kernel->getCrossThreadData() +
@@ -620,12 +626,12 @@ HWTEST_F(EnqueueReadWriteBufferRectDispatch, givenOffsetResultingInMisalignedPtr
         }
     }
 
-    if (kernelInfo.getArgDescriptorAt(2).as<ArgDescValue>().elements[0].size == 4 * sizeof(uint32_t)) { // size of  uint4 SrcOrigin
+    if (kernelInfo.getArgDescriptorAt(2).as<ArgDescValue>().elements[0].size == 2 * sizeof(uint32_t)) { // size of  uint2 SrcOrigin
         auto dstOffset = (uint32_t *)(kernel->getCrossThreadData() +
                                       kernelInfo.getArgDescriptorAt(2).as<ArgDescValue>().elements[0].offset);
         EXPECT_EQ(hostOffset.x + ptrDiff(misalignedHostPtr, alignDown(misalignedHostPtr, 4)), *dstOffset);
     } else {
-        // SrcOrigin arg should be 16 bytes in size, if that changes, above if path should be modified
+        // SrcOrigin arg should be 8 bytes in size, if that changes, above if path should be modified
         EXPECT_TRUE(false);
     }
 }
@@ -664,7 +670,7 @@ struct EnqueueWriteBufferRectHw : public ::testing::Test {
         if (is32bit) {
             GTEST_SKIP();
         }
-        device = std::make_unique<MockClDevice>(MockClDevice::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
+        device = std::make_unique<MockClDevice>(MockClDeviceFactory::createWithNewExecutionEnvironment<MockDevice>(defaultHwInfo.get()));
         context.reset(new MockContext(device.get()));
     }
 
@@ -709,9 +715,12 @@ HWTEST_F(EnqueueWriteBufferRectStatelessTest, WhenWritingBufferRectStatelessThen
 
 using EnqueueWriteBufferRectStatefulTest = EnqueueWriteBufferRectHw;
 
-HWTEST_F(EnqueueWriteBufferRectStatefulTest, WhenWritingBufferRectStatefulThenSuccessIsReturned) {
+HWTEST2_F(EnqueueWriteBufferRectStatefulTest, WhenWritingBufferRectStatefulThenSuccessIsReturned, IsStatefulBufferPreferredForProduct) {
 
     auto pCmdQ = std::make_unique<CommandQueueStateful<FamilyType>>(context.get(), device.get());
+    if (pCmdQ->getHeaplessModeEnabled()) {
+        GTEST_SKIP();
+    }
     void *missAlignedPtr = reinterpret_cast<void *>(0x1041);
     srcBuffer.size = static_cast<size_t>(smallSize);
     auto retVal = pCmdQ->enqueueWriteBufferRect(&srcBuffer,
@@ -733,7 +742,7 @@ HWTEST_F(EnqueueWriteBufferRectStatefulTest, WhenWritingBufferRectStatefulThenSu
 
 HWTEST_F(EnqueueWriteBufferRectHw, givenHostPtrIsFromMappedBufferWhenWriteBufferRectIsCalledThenReuseGraphicsAllocation) {
     DebugManagerStateRestore restore{};
-    DebugManager.flags.DisableZeroCopyForBuffers.set(1);
+    debugManager.flags.DisableZeroCopyForBuffers.set(1);
 
     MockCommandQueueHw<FamilyType> queue(context.get(), device.get(), nullptr);
     auto &csr = device->getUltCommandStreamReceiver<FamilyType>();

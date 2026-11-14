@@ -1,0 +1,91 @@
+/*
+ * Copyright (C) 2024-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#pragma once
+#include "shared/source/execution_environment/execution_environment.h"
+#include "shared/source/execution_environment/root_device_environment.h"
+#include "shared/source/memory_manager/graphics_allocation.h"
+#include "shared/source/memory_manager/memory_manager.h"
+#include "shared/source/utilities/allocation_logger.h"
+
+#include <sstream>
+
+/* Should not be used outside of NEO (e.g. with ocloc) because of dependencies towards other NEO structures */
+namespace NEO {
+
+template <DebugFunctionalityLevel level>
+void logAllocation(AllocationLogger<level> &logger, GraphicsAllocation const *graphicsAllocation, MemoryManager const *memoryManager) {
+    if (logger.shouldLogAllocationType()) {
+        PRINT_STRING(true, stdout, "Created Graphics Allocation of type %s\n", getAllocationTypeString(graphicsAllocation));
+    }
+
+    if (logger.shouldLogAllocationSummaryReport()) {
+        const bool isLocalMemory = graphicsAllocation->getMemoryPool() == MemoryPool::localMemory;
+        logger.trackAllocationForSummary(getAllocationTypeString(graphicsAllocation),
+                                         graphicsAllocation->getUnderlyingBufferSize(), isLocalMemory);
+        logger.trackLiveAllocation(getAllocationTypeString(graphicsAllocation),
+                                   graphicsAllocation->getUnderlyingBufferSize(), isLocalMemory);
+    }
+
+    auto &fileLogger = logger.getFileLogger();
+    if (!fileLogger.enabled() && !logger.shouldLogAllocationToStdout()) {
+        return;
+    }
+
+    if (logger.shouldLogAllocationMemoryPool() || logger.shouldLogAllocationType()) {
+        std::stringstream ss;
+        std::thread::id thisThread = std::this_thread::get_id();
+
+        ss << " ThreadID: " << thisThread;
+        ss << " Type: " << getAllocationTypeString(graphicsAllocation);
+        ss << " Pool: " << getMemoryPoolString(graphicsAllocation);
+        ss << " Root index: " << graphicsAllocation->getRootDeviceIndex();
+        ss << " Size: " << graphicsAllocation->getUnderlyingBufferSize();
+        if (graphicsAllocation->getUnderlyingBuffer() != nullptr) {
+            ss << " CPU VA: 0x" << std::hex << reinterpret_cast<uintptr_t>(graphicsAllocation->getUnderlyingBuffer()) << " - 0x" << std::hex << reinterpret_cast<uintptr_t>(graphicsAllocation->getUnderlyingBuffer()) + graphicsAllocation->getUnderlyingBufferSize() - 1;
+        } else {
+            ss << " CPU VA: NULL";
+        }
+        ss << " GPU VA: 0x" << std::hex << graphicsAllocation->getGpuAddress() << " - 0x" << std::hex << graphicsAllocation->getGpuAddress() + graphicsAllocation->getUnderlyingBufferSize() - 1;
+
+        ss << graphicsAllocation->getAllocationInfoString();
+
+        if (memoryManager) {
+            auto *rootDeviceEnvironment{[graphicsAllocation, memoryManager]() {
+                auto &rootDeviceEnvironments{memoryManager->peekExecutionEnvironment().rootDeviceEnvironments};
+                auto indexOfAllocation = graphicsAllocation->getRootDeviceIndex();
+                return (indexOfAllocation < rootDeviceEnvironments.size()) ? rootDeviceEnvironments[indexOfAllocation].get() : nullptr;
+            }()};
+            if (rootDeviceEnvironment) {
+                ss << graphicsAllocation->getPatIndexInfoString();
+            }
+
+            ss << " Total sys mem allocated: " << std::dec << memoryManager->getUsedSystemMemorySize();
+            ss << " Total lmem allocated: " << std::dec << memoryManager->getUsedLocalMemorySize(graphicsAllocation->getRootDeviceIndex());
+        }
+
+        ss << std::endl;
+        auto str = ss.str();
+        if (logger.shouldLogAllocationToStdout()) {
+            printf("%s", str.c_str());
+            return;
+        }
+
+        fileLogger.logDebugString(true, str);
+    }
+}
+
+template <DebugFunctionalityLevel level>
+void logFreeAllocation(AllocationLogger<level> &logger, GraphicsAllocation const *graphicsAllocation) {
+    if (logger.shouldLogAllocationSummaryReport()) {
+        const bool isLocalMemory = graphicsAllocation->getMemoryPool() == MemoryPool::localMemory;
+        logger.untrackLiveAllocation(getAllocationTypeString(graphicsAllocation),
+                                     graphicsAllocation->getUnderlyingBufferSize(), isLocalMemory);
+    }
+}
+
+} // namespace NEO

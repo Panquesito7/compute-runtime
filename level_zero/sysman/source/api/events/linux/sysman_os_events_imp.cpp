@@ -1,0 +1,876 @@
+/*
+ * Copyright (C) 2023-2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "level_zero/sysman/source/api/events/linux/sysman_os_events_imp.h"
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/preprocessor.h"
+
+#include "level_zero/sysman/source/api/events/linux/sysman_os_events_netlink.h"
+#include "level_zero/sysman/source/api/global_operations/sysman_global_operations.h"
+#include "level_zero/sysman/source/api/info_log/linux/sysman_os_info_log_imp.h"
+#include "level_zero/sysman/source/api/ras/linux/ras_util/sysman_ras_util.h"
+#include "level_zero/sysman/source/device/sysman_device_imp.h"
+#include "level_zero/sysman/source/driver/sysman_driver_handle_imp.h"
+#include "level_zero/sysman/source/shared/linux/kmd_interface/sysman_kmd_interface.h"
+#include "level_zero/sysman/source/shared/linux/product_helper/sysman_product_helper.h"
+#include "level_zero/sysman/source/shared/linux/sysman_fs_access_interface.h"
+#include "level_zero/sysman/source/shared/linux/zes_os_sysman_driver_imp.h"
+#include "level_zero/sysman/source/shared/linux/zes_os_sysman_imp.h"
+#include "level_zero/sysman/source/sysman_steady_clock.h"
+
+#include <algorithm>
+#include <regex>
+
+namespace L0 {
+namespace Sysman {
+
+const std::string LinuxEventsUtil::add("add");
+const std::string LinuxEventsUtil::remove("remove");
+const std::string LinuxEventsUtil::change("change");
+const std::string LinuxEventsUtil::unbind("unbind");
+const std::string LinuxEventsUtil::bind("bind");
+
+constexpr zes_event_type_flags_t driverScopedAttachDetachEvents = ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH | ZES_EVENT_TYPE_FLAG_DEVICE_DETACH;
+constexpr zes_event_type_flags_t udevDeviceEvents = ZES_EVENT_TYPE_FLAG_DEVICE_DETACH | ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH | ZES_EVENT_TYPE_FLAG_SURVIVABILITY_MODE_DETECTED |
+                                                    ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED | ZES_EVENT_TYPE_FLAG_MEM_HEALTH | ZES_EVENT_TYPE_FLAG_FABRIC_PORT_HEALTH |
+                                                    ZES_INTEL_EVENT_TYPE_EXP_FLAG_DEVICE_POWER_OFF_PENDING;
+constexpr zes_event_type_flags_t netlinkDeviceEvents = ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS | ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS;
+
+static bool isDriverScopedAttachDetachEventSupported() {
+    for (auto *sysmanDevice : globalSysmanDriver->sysmanDevices) {
+        auto pLinuxSysmanImp = static_cast<LinuxSysmanImp *>(sysmanDevice->deviceGetOsInterface());
+        auto pSysmanKmdInterface = pLinuxSysmanImp->getSysmanKmdInterface();
+        if (pSysmanKmdInterface->isDriverScopedAttachDetachEventSupported()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool LinuxEventsImp::eventListen(zes_event_type_flags_t &pEvent, uint64_t timeout) {
+    // This is dummy implementation, Actual implementation is handled at driver level
+    // for all devices.
+    return false;
+}
+
+ze_result_t LinuxEventsImp::eventRegister(zes_event_type_flags_t events) {
+    constexpr zes_event_type_flags_t validEventMask = 0xFFFF | ZES_INTEL_EVENT_TYPE_EXP_FLAG_DEVICE_POWER_OFF_PENDING;
+    if (events & ~validEventMask) {
+        return ZE_RESULT_ERROR_INVALID_ENUMERATION;
+    }
+
+    auto pLinuxSysmanDriverImp = static_cast<LinuxSysmanDriverImp *>(globalSysmanDriver->pOsSysmanDriver);
+    if (pLinuxSysmanDriverImp == nullptr) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Os Sysman driver not initialized\n");
+        return ZE_RESULT_ERROR_UNINITIALIZED;
+    }
+    pLinuxSysmanDriverImp->eventRegister(events, pLinuxSysmanImp->getSysmanDeviceImp());
+    return ZE_RESULT_SUCCESS;
+}
+
+LinuxEventsImp::LinuxEventsImp(OsSysman *pOsSysman) {
+    pLinuxSysmanImp = static_cast<LinuxSysmanImp *>(pOsSysman);
+}
+
+OsEvents *OsEvents::create(OsSysman *pOsSysman) {
+    LinuxEventsImp *pLinuxEventsImp = new LinuxEventsImp(pOsSysman);
+    return static_cast<OsEvents *>(pLinuxEventsImp);
+}
+
+LinuxEventsUtil::LinuxEventsUtil(LinuxSysmanDriverImp *pOsSysmanDriverImp) : pLinuxSysmanDriverImp(pOsSysmanDriverImp) {
+}
+
+bool LinuxEventsUtil::checkRasEvent(zes_event_type_flags_t &pEvent, SysmanDeviceImp *pSysmanDeviceImp, zes_event_type_flags_t registeredEvents) {
+    for (auto rasHandle : pSysmanDeviceImp->pRasHandleContext->handleList) {
+        zes_ras_properties_t properties = {};
+        rasHandle->rasGetProperties(&properties);
+        if ((registeredEvents & ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS) && (properties.type == ZES_RAS_ERROR_TYPE_CORRECTABLE)) {
+            if (LinuxEventsUtil::checkRasEventOccured(rasHandle) == true) {
+                pEvent |= ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS;
+                return true;
+            }
+        }
+        if ((registeredEvents & ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS) && (properties.type == ZES_RAS_ERROR_TYPE_UNCORRECTABLE)) {
+            if (LinuxEventsUtil::checkRasEventOccured(rasHandle) == true) {
+                pEvent |= ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool LinuxEventsUtil::checkRasEventOccured(Ras *rasHandle) {
+    zes_ras_config_t config = {};
+    zes_ras_state_t state = {};
+    rasHandle->rasGetConfig(&config);
+    if (ZE_RESULT_SUCCESS == rasHandle->rasGetState(&state, 0)) {
+        uint64_t totalCategoryThreshold = 0;
+        for (int i = 0; i < ZES_MAX_RAS_ERROR_CATEGORY_COUNT; i++) {
+            totalCategoryThreshold += state.category[i];
+            if ((config.detailedThresholds.category[i] > 0) && (state.category[i] > config.detailedThresholds.category[i])) {
+                return true;
+            }
+        }
+        if ((config.totalThreshold > 0) && (totalCategoryThreshold > config.totalThreshold)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void LinuxEventsUtil::eventRegister(zes_event_type_flags_t events, SysmanDeviceImp *pSysmanDevice) {
+    std::call_once(initEventsOnce, [this]() {
+        this->init();
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(eventsMutex);
+        auto &registeredEvents = deviceEventsMap[pSysmanDevice];
+        const zes_event_type_flags_t prevRegisteredEvents = registeredEvents;
+        if (!events) {
+            // If user is trying to register events with empty events argument, then clear all the registered events
+            registeredEvents = events;
+        } else {
+            // supportedEventMask --> this mask checks for events that supported currently
+            zes_event_type_flags_t supportedEventMask = ZES_EVENT_TYPE_FLAG_FABRIC_PORT_HEALTH | ZES_EVENT_TYPE_FLAG_DEVICE_DETACH |
+                                                        ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH | ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED |
+                                                        ZES_EVENT_TYPE_FLAG_MEM_HEALTH | ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS |
+                                                        ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS |
+                                                        ZES_EVENT_TYPE_FLAG_SURVIVABILITY_MODE_DETECTED |
+                                                        ZES_INTEL_EVENT_TYPE_EXP_FLAG_DEVICE_POWER_OFF_PENDING;
+            registeredEvents |= (events & supportedEventMask);
+        }
+
+        // Resolve the device path while the device is still bound, so its uevents can be matched even if the first listen starts after an unbind
+        if (registeredEvents & (ZES_EVENT_TYPE_FLAG_DEVICE_DETACH | ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH)) {
+            if (auto *osInterface = static_cast<LinuxSysmanImp *>(pSysmanDevice->deviceGetOsInterface())) {
+                updateLastBdfPath(pSysmanDevice, osInterface);
+            }
+        }
+
+        // Write to Pipe only if eventregister() is called during listen and previously registered events are modified.
+        if ((pipeFd[1] != -1) && (prevRegisteredEvents != registeredEvents)) {
+            uint8_t value = 0x00;
+            if (NEO::SysCalls::write(pipeFd[1], &value, 1) < 0) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                             "%s", "Write to Pipe failed\n");
+            }
+        }
+    }
+}
+
+ze_result_t LinuxEventsUtil::driverEventRegister(zes_event_type_flags_t events) {
+    zes_event_type_flags_t supportedDriverEventMask = ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT | driverScopedAttachDetachEvents;
+
+    if (events & ~supportedDriverEventMask) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Error@ %s(): events 0x%x contains a flag which is not a driver scoped event and returning error:0x%x \n", NEO_FUNCTION_NAME, events, ZE_RESULT_ERROR_INVALID_ENUMERATION);
+        return ZE_RESULT_ERROR_INVALID_ENUMERATION;
+    }
+
+    if ((events & driverScopedAttachDetachEvents) && !isDriverScopedAttachDetachEventSupported()) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Error@ %s(): driver scoped device attach/detach events are not supported and returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+        return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(eventsMutex);
+
+        zes_event_type_flags_t prevRegisteredEvents = registeredDriverEvents;
+        registeredDriverEvents = events;
+        if (!(prevRegisteredEvents & ZES_EVENT_TYPE_FLAG_DEVICE_DETACH) && (events & ZES_EVENT_TYPE_FLAG_DEVICE_DETACH)) {
+            // The devices may have changed while detach was not registered, so their addresses are collected again
+            supportedPciDeviceAddressesOutdated = true;
+        }
+
+        if ((pipeFd[1] != -1) && (prevRegisteredEvents != registeredDriverEvents)) {
+            uint8_t value = 0x00;
+            if (NEO::SysCalls::write(pipeFd[1], &value, 1) < 0) {
+                PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                             "%s", "Write to Pipe failed\n");
+            }
+        }
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+void LinuxEventsUtil::init() {
+    pUdevLib = pLinuxSysmanDriverImp->getUdevLibHandle();
+}
+
+void LinuxEventsUtil::initNetlink() {
+    // Iterate all known sysman devices to find one that supports netlink events. This handles heterogeneous multi-device systems
+    // where only some devices support netlink, regardless of which device triggered init.
+    for (auto *sysmanDevice : globalSysmanDriver->sysmanDevices) {
+        auto *dev = static_cast<SysmanDeviceImp *>(sysmanDevice);
+        if (netlinkInitialize(pLinuxSysmanDriverImp, pDrmNl, dev) == ZE_RESULT_SUCCESS) {
+            return;
+        }
+    }
+    pDrmNl = nullptr;
+}
+
+ze_result_t LinuxEventsUtil::eventsListen(uint64_t timeout, uint32_t count, zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents, zes_event_type_flags_t *pEvents, zes_event_type_flags_t *pDriverEvents) {
+    memset(pEvents, 0, count * sizeof(zes_event_type_flags_t));
+    *pNumDeviceEvents = 0;
+    if (pDriverEvents != nullptr) {
+        *pDriverEvents = 0;
+    }
+
+    std::vector<zes_event_type_flags_t> registeredEvents(count, 0);
+
+    for (uint32_t devIndex = 0; devIndex < count; devIndex++) {
+        auto device = static_cast<SysmanDeviceImp *>(L0::Sysman::SysmanDevice::fromHandle(phDevices[devIndex]));
+        if (device == nullptr) {
+            auto result = SysmanDevice::isLostDeviceHandle(phDevices[devIndex]) ? ZE_RESULT_ERROR_DEVICE_LOST : ZE_RESULT_ERROR_INVALID_ARGUMENT;
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "Error@ %s(): device handle at index %d could not be mapped to a sysman device and returning error:0x%x \n", NEO_FUNCTION_NAME, devIndex, result);
+            return result;
+        }
+        {
+            std::unique_lock<std::mutex> lock(eventsMutex);
+            if (auto it = deviceEventsMap.find(device); it != deviceEventsMap.end()) {
+                registeredEvents[devIndex] = it->second;
+            }
+        }
+        if (registeredEvents[devIndex]) {
+            if ((registeredEvents[devIndex] & ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS) || (registeredEvents[devIndex] & ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS)) {
+                if (checkRasEvent(pEvents[devIndex], device, registeredEvents[devIndex])) {
+                    *pNumDeviceEvents = 1;
+                    return ZE_RESULT_SUCCESS;
+                }
+            }
+
+            if (registeredEvents[devIndex] & ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED) {
+                zes_device_state_t deviceState = {};
+                device->pGlobalOperations->deviceGetState(&deviceState);
+                if (deviceState.reset & ZES_RESET_REASON_FLAG_REPAIR) {
+                    pEvents[devIndex] |= ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED;
+                    *pNumDeviceEvents = 1;
+                    return ZE_RESULT_SUCCESS;
+                }
+            }
+        }
+    }
+
+    bool eventReceived = false;
+    ze_result_t result = listenSystemEvents(pEvents, count, registeredEvents, phDevices, timeout, eventReceived, pDriverEvents);
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    if (eventReceived) {
+        for (uint32_t devIndex = 0; devIndex < count; devIndex++) {
+            if (pEvents[devIndex] != 0) {
+                *pNumDeviceEvents = 1;
+                break;
+            }
+        }
+    }
+
+    return ZE_RESULT_SUCCESS;
+}
+
+bool LinuxEventsUtil::isResetRequired(void *dev, zes_event_type_flags_t &pEvent) {
+    if (action.compare(change) != 0) {
+        return false;
+    }
+
+    std::vector<std::string> properties{"RESET_FAILED", "RESET_REQUIRED", "DEVICE_STATUS"};
+    for (auto &property : properties) {
+        const char *propVal = nullptr;
+        propVal = pUdevLib->getEventPropertyValue(dev, property.c_str());
+        if (propVal) {
+            std::string expectedStr = "NEEDS_RESET";
+            if (property != "DEVICE_STATUS") {
+                if (atoi(propVal) == 1) {
+                    pEvent |= ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED;
+                    return true;
+                }
+            } else if (propVal == expectedStr) {
+                pEvent |= ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool LinuxEventsUtil::isSurvivabilityModeAsExpected(FsAccessInterface *pFsAccess, const std::string &devPath, const std::string &mode) {
+    if (pFsAccess == nullptr) {
+        return false;
+    }
+
+    // /sys/bus/pci/devices/<device>/survivability_mode will contain either "Boot" or "Runtime".
+    const std::string survivabilityModeFilePath = "/sys" + devPath + "/survivability_mode";
+    std::string survivabilityModeVal;
+    if (pFsAccess->read(survivabilityModeFilePath, survivabilityModeVal) != ZE_RESULT_SUCCESS) {
+        return false;
+    }
+
+    return survivabilityModeVal == mode;
+}
+
+bool LinuxEventsUtil::isDrmCardNode(const std::string &eventDevPath, const std::string &pciDevPath) {
+    // A single unbind/bind generates add/remove uevents for every child node of the PCI device
+    // (drm card, render node, connectors, auxiliary devices). Only the primary drm card node
+    // (e.g. <pciDevPath>/drm/card0) is used to report the device attach/detach events once.
+    if (!eventDevPath.starts_with(pciDevPath)) {
+        return false;
+    }
+    const std::regex drmCardNodeRegex("/drm/card[0-9]+");
+    return std::regex_match(eventDevPath.substr(pciDevPath.length()), drmCardNodeRegex);
+}
+
+bool LinuxEventsUtil::getPciAddressOfDrmCardNode(const std::string &eventDevPath, std::string &pciAddress) {
+    // Driver scoped attach/detach events are not tied to an enumerated device, so the primary drm card node of
+    // a PCI device (e.g. /devices/pci0000:00/0000:00:02.0/drm/card0) is used, including devices which were
+    // not enumerated by sysman or which come back at a different PCI address. The PCI address of the device
+    // is the path component right before the drm directory.
+    const std::string pciRootRegex = "/devices/pci[^/]+";                                 // e.g. /devices/pci0000:00
+    const std::string pciBridgesRegex = "(?:/[^/]+)*";                                    // e.g. /0000:00:01.0, zero or more bridges
+    const std::string pciAddressRegex = "/([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7])"; // e.g. /0000:03:00.0, captured
+    const std::string drmCardRegex = "/drm/card[0-9]+";                                   // e.g. /drm/card0
+    const std::regex pciDrmCardNodeRegex(pciRootRegex + pciBridgesRegex + pciAddressRegex + drmCardRegex);
+    std::smatch match;
+    if (!std::regex_match(eventDevPath, match, pciDrmCardNodeRegex)) {
+        return false;
+    }
+    pciAddress = match[1].str();
+    return true;
+}
+
+void LinuxEventsUtil::getSupportedPciDeviceAddresses(std::set<std::string> &pciAddresses) {
+    // Restricts driver scoped attach/detach events to the supported Intel GPUs, so devices of other vendors are not reported.
+    // Only the addresses are queried, as reading the PCI device properties would wake up the devices.
+    pciAddresses.clear();
+    for (const auto &address : pLinuxSysmanDriverImp->getPciDeviceAddresses()) {
+        char pciAddress[16] = {};
+        snprintf(pciAddress, sizeof(pciAddress), "%04x:%02x:%02x.%x", address.domain, address.bus, address.device, address.function);
+        pciAddresses.insert(pciAddress);
+    }
+}
+
+void LinuxEventsUtil::updateSupportedPciDeviceAddresses(zes_event_type_flags_t driverRegisteredEvents) {
+    // The device may already be removed from the PCI bus when the remove uevent of its drm card node is received,
+    // so the addresses of the supported devices are collected once detach is registered and then kept up to date
+    // from the uevents. They are not collected again on every listen, as the uevents queued between two listen
+    // calls would then be matched against devices which may already be gone from the PCI bus.
+    if ((driverRegisteredEvents & ZES_EVENT_TYPE_FLAG_DEVICE_DETACH) && supportedPciDeviceAddressesOutdated) {
+        getSupportedPciDeviceAddresses(supportedPciDeviceAddresses);
+        supportedPciDeviceAddressesOutdated = false;
+    }
+}
+
+bool LinuxEventsUtil::checkDeviceDetachEvent(zes_event_type_flags_t &pEvent) {
+    if (action.compare(remove) == 0) {
+        pEvent |= ZES_EVENT_TYPE_FLAG_DEVICE_DETACH;
+        return true;
+    }
+    return false;
+}
+
+bool LinuxEventsUtil::checkDeviceAttachEvent(zes_event_type_flags_t &pEvent) {
+    if (action.compare(add) == 0) {
+        pEvent |= ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH;
+        return true;
+    }
+    return false;
+}
+
+bool LinuxEventsUtil::checkDriverAttachDetachEvent(void *dev, zes_event_type_flags_t driverRegisteredEvents, zes_event_type_flags_t &driverEvents) {
+    if (!(driverRegisteredEvents & driverScopedAttachDetachEvents)) {
+        return false;
+    }
+
+    const char *devicePath = pUdevLib->getEventPropertyValue(dev, "DEVPATH");
+    std::string pciAddress;
+    if ((devicePath == nullptr) || !getPciAddressOfDrmCardNode(devicePath, pciAddress)) {
+        return false;
+    }
+
+    if (action.compare(remove) == 0) {
+        // The addresses are collected again when detach gets registered, so they are not updated while it is not registered
+        if (!(driverRegisteredEvents & ZES_EVENT_TYPE_FLAG_DEVICE_DETACH)) {
+            return false;
+        }
+        if (supportedPciDeviceAddresses.erase(pciAddress) == 0) {
+            return false;
+        }
+        driverEvents |= ZES_EVENT_TYPE_FLAG_DEVICE_DETACH;
+        return true;
+    }
+
+    if (action.compare(add) == 0) {
+        std::set<std::string> pciAddresses;
+        getSupportedPciDeviceAddresses(pciAddresses);
+        if (pciAddresses.count(pciAddress) == 0) {
+            return false;
+        }
+        supportedPciDeviceAddresses.insert(pciAddress);
+        if (!(driverRegisteredEvents & ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH)) {
+            return false;
+        }
+        driverEvents |= ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH;
+        return true;
+    }
+    return false;
+}
+
+bool LinuxEventsUtil::checkIfMemHealthChanged(void *dev, zes_event_type_flags_t &pEvent) {
+    if (action.compare(change) != 0) {
+        return false;
+    }
+
+    std::vector<std::string> properties{"MEM_HEALTH_ALARM", "RESET_REQUIRED", "EC_PENDING", "DEGRADED", "EC_FAILED", "SPARING_STATUS_UNKNOWN"};
+    for (auto &property : properties) {
+        const char *propVal = nullptr;
+        propVal = pUdevLib->getEventPropertyValue(dev, property.c_str());
+        if (propVal && atoi(propVal) == 1) {
+            pEvent |= ZES_EVENT_TYPE_FLAG_MEM_HEALTH;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool LinuxEventsUtil::checkIfFabricPortStatusChanged(void *dev, zes_event_type_flags_t &pEvent) {
+    if (action.compare(change) != 0) {
+        return false;
+    }
+
+    const char *str = pUdevLib->getEventPropertyValue(dev, "TYPE");
+    if (str == nullptr) {
+        return false;
+    }
+
+    std::string expectedStr = "PORT_CHANGE";
+    if (expectedStr == str) {
+        pEvent |= ZES_EVENT_TYPE_FLAG_FABRIC_PORT_HEALTH;
+        return true;
+    }
+    return false;
+}
+
+bool LinuxEventsUtil::checkDeviceWedgedEvent(void *dev, zes_event_type_flags_t &pEvent) {
+    // Only proceed when udev event for the device is "change"
+    if (action.compare(change) != 0) {
+        return false;
+    }
+
+    const char *propVal = pUdevLib->getEventPropertyValue(dev, "WEDGED");
+    if ((propVal != nullptr) && std::string(propVal) == "cold-reset") {
+        pEvent |= ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED;
+        return true;
+    }
+
+    if ((propVal != nullptr) && std::string(propVal) == "vendor-specific") {
+        pEvent |= ZES_EVENT_TYPE_FLAG_SURVIVABILITY_MODE_DETECTED;
+        return true;
+    }
+
+    return false;
+}
+
+bool LinuxEventsUtil::handleNetlinkEvents(zes_event_type_flags_t *pEvents, uint32_t count, zes_device_handle_t *phDevices, const std::vector<zes_event_type_flags_t> &registeredEvents) {
+    return netlinkHandleEvents(pDrmNl, pEvents, count, phDevices, registeredEvents);
+}
+
+bool LinuxEventsUtil::processNetlinkRasEvent(const DrmRasEvent &netlinkEvent, zes_event_type_flags_t *pEvents, uint32_t count, zes_device_handle_t *phDevices, const std::vector<zes_event_type_flags_t> &registeredEvents) {
+    return netlinkProcessRasEvent(netlinkEvent, pEvents, count, phDevices, registeredEvents);
+}
+
+void LinuxEventsUtil::updateLastBdfPath(SysmanDeviceImp *device, LinuxSysmanImp *osInterface) {
+    std::string fullBdfPath;
+    auto pSysfsAccess = &osInterface->getSysfsAccess();
+    if (pSysfsAccess->getRealPath("device", fullBdfPath) != ZE_RESULT_SUCCESS) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Failed to get real path of device\n");
+        return;
+    }
+
+    // /sys needs to be removed from real path inorder to equate with "DEVPATH" property of uevent.
+    // Example of real path: /sys/devices/pci0000:97/0000:97:02.0/0000:98:00.0/0000:99:01.0/0000:9a:00.0
+    // Example of DEVPATH: /devices/pci0000:97/0000:97:02.0/0000:98:00.0/0000:99:01.0/0000:9a:00.0
+    const auto loc = fullBdfPath.find("/devices");
+    if (loc == std::string::npos) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "Invalid device path\n");
+        return;
+    }
+
+    this->sysmanDeviceToLastBdfPathMap[device] = fullBdfPath.substr(loc);
+}
+
+void LinuxEventsUtil::getDevIndexToDevPathMap(std::vector<zes_event_type_flags_t> &registeredEvents, uint32_t count, zes_device_handle_t *phDevices, std::map<uint32_t, std::string> &devIndexToDevBdfPathMap, FsAccessInterface *&pFsAccess) {
+    for (uint32_t devIndex = 0; devIndex < count; devIndex++) {
+        auto device = static_cast<SysmanDeviceImp *>(L0::Sysman::SysmanDevice::fromHandle(phDevices[devIndex]));
+        if (auto it = deviceEventsMap.find(device); it != deviceEventsMap.end()) {
+            registeredEvents[devIndex] = it->second;
+        }
+        if (!registeredEvents[devIndex]) {
+            continue;
+        }
+
+        auto *osInterface = static_cast<L0::Sysman::LinuxSysmanImp *>(device->deviceGetOsInterface());
+        if (!osInterface) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "%s", "Failed to get OS Interface\n");
+            UNRECOVERABLE_IF(true);
+        }
+
+        updateLastBdfPath(device, osInterface);
+
+        // After an unbind or removal the sysfs node of the device is gone, so its uevents are matched by the last resolved path
+        if (auto it = this->sysmanDeviceToLastBdfPathMap.find(device); it != this->sysmanDeviceToLastBdfPathMap.end()) {
+            devIndexToDevBdfPathMap.emplace(devIndex, it->second);
+            pFsAccess = &osInterface->getFsAccess();
+        }
+    }
+}
+
+bool LinuxEventsUtil::checkDeviceEvents(std::vector<zes_event_type_flags_t> &registeredEvents, const std::map<uint32_t, std::string> &devIndexToDevBdfPathMap, FsAccessInterface *pFsAccess, zes_event_type_flags_t *pEvents, void *dev, zes_device_handle_t *phDevices) {
+    const char *devicePath = pUdevLib->getEventPropertyValue(dev, "DEVPATH");
+    bool retVal = false;
+    if (devicePath != nullptr) {
+        std::string devPath(devicePath);
+        for (auto it = devIndexToDevBdfPathMap.begin(); it != devIndexToDevBdfPathMap.end(); it++) {
+            if (devPath.find(it->second.c_str()) != std::string::npos) {
+                const bool isDrmCardNodeEvent = isDrmCardNode(devPath, it->second);
+                if (isDrmCardNodeEvent && (registeredEvents[it->first] & ZES_EVENT_TYPE_FLAG_DEVICE_DETACH)) {
+                    if (checkDeviceDetachEvent(pEvents[it->first])) {
+                        retVal = true;
+                    }
+                }
+                if (isDrmCardNodeEvent && (registeredEvents[it->first] & ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH)) {
+                    if (checkDeviceAttachEvent(pEvents[it->first])) {
+                        retVal = true;
+                    }
+                }
+                if (registeredEvents[it->first] & ZES_EVENT_TYPE_FLAG_SURVIVABILITY_MODE_DETECTED) {
+                    if (isSurvivabilityModeAsExpected(pFsAccess, it->second, "Runtime") &&
+                        checkDeviceWedgedEvent(dev, pEvents[it->first])) {
+                        retVal = true;
+                    }
+                }
+                if (registeredEvents[it->first] & ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED) {
+                    if (isResetRequired(dev, pEvents[it->first])) {
+                        retVal = true;
+                    }
+                    // Check for wedged event with cold-reset requirement
+                    if (checkDeviceWedgedEvent(dev, pEvents[it->first])) {
+                        retVal = true;
+                        // Cache the wedged state directly
+                        auto pSysmanDevice = static_cast<SysmanDeviceImp *>(L0::Sysman::SysmanDevice::fromHandle(phDevices[it->first]));
+                        auto *pLinuxSysmanImp = static_cast<LinuxSysmanImp *>(pSysmanDevice->deviceGetOsInterface());
+                        pLinuxSysmanImp->isDeviceInWedgedState = true;
+                        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                                     "Device %d got wedged cold-reset event\n", it->first);
+                    }
+                }
+                if (registeredEvents[it->first] & ZES_EVENT_TYPE_FLAG_MEM_HEALTH) {
+                    if (checkIfMemHealthChanged(dev, pEvents[it->first])) {
+                        retVal = true;
+                    }
+                }
+                if (registeredEvents[it->first] & ZES_EVENT_TYPE_FLAG_FABRIC_PORT_HEALTH) {
+                    if (checkIfFabricPortStatusChanged(dev, pEvents[it->first])) {
+                        retVal = true;
+                    }
+                }
+                if (registeredEvents[it->first] & ZES_INTEL_EVENT_TYPE_EXP_FLAG_DEVICE_POWER_OFF_PENDING) {
+                    zes_event_type_flags_t wedgedEvent = 0;
+                    auto pSysmanDevice = static_cast<SysmanDeviceImp *>(L0::Sysman::SysmanDevice::fromHandle(phDevices[it->first]));
+                    auto *pLinuxSysmanImp = static_cast<LinuxSysmanImp *>(pSysmanDevice->deviceGetOsInterface());
+                    if (pLinuxSysmanImp->isPowerOffPending() &&
+                        checkDeviceWedgedEvent(dev, wedgedEvent)) {
+                        pEvents[it->first] |= ZES_INTEL_EVENT_TYPE_EXP_FLAG_DEVICE_POWER_OFF_PENDING;
+                        retVal = true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    return retVal;
+}
+
+static bool isCperEventRegistered(zes_event_type_flags_t driverRegisteredEvents) {
+    return (driverRegisteredEvents & ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT) != 0;
+}
+
+static bool isUdevEventRegistered(const std::vector<zes_event_type_flags_t> &registeredEvents, zes_event_type_flags_t driverRegisteredEvents) {
+    if (driverRegisteredEvents & driverScopedAttachDetachEvents) {
+        return true;
+    }
+    return std::any_of(registeredEvents.begin(), registeredEvents.end(), [](zes_event_type_flags_t events) {
+        return (events & udevDeviceEvents) != 0;
+    });
+}
+
+static bool isNetlinkEventRegistered(const std::vector<zes_event_type_flags_t> &registeredEvents, uint32_t count, zes_device_handle_t *phDevices) {
+    for (uint32_t devIndex = 0; devIndex < count; devIndex++) {
+        if (!(registeredEvents[devIndex] & netlinkDeviceEvents)) {
+            continue;
+        }
+        auto pSysmanDevice = static_cast<SysmanDeviceImp *>(L0::Sysman::SysmanDevice::fromHandle(phDevices[devIndex]));
+        auto pLinuxSysmanImp = static_cast<LinuxSysmanImp *>(pSysmanDevice->deviceGetOsInterface());
+        if (pLinuxSysmanImp->getSysmanProductHelper()->isNetlinkEventSupported()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void LinuxEventsUtil::updateCperPollSource(zes_event_type_flags_t driverRegisteredEvents, std::vector<PollDescriptor> &pollSources, bool &cperRegistered) {
+    cperRegistered = isCperEventRegistered(driverRegisteredEvents);
+
+    std::vector<int> cperTracePipeFds = cperRegistered ? pLinuxSysmanDriverImp->getCperTracePipeFds() : std::vector<int>{};
+
+    // Applications may create and delete collection instances between listen calls, so the tracefs
+    // poll sources are reconciled against the current descriptor set on every call.
+    auto isStale = [&cperTracePipeFds](const PollDescriptor &source) {
+        return source.type == PollSourceType::tracefs &&
+               std::find(cperTracePipeFds.begin(), cperTracePipeFds.end(), source.pfd.fd) == cperTracePipeFds.end();
+    };
+    pollSources.erase(std::remove_if(pollSources.begin(), pollSources.end(), isStale), pollSources.end());
+
+    if (cperTracePipeFds.empty()) {
+        if (cperRegistered) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "%s", "Info log collection is not enabled, CPER event will not be reported\n");
+        }
+        return;
+    }
+
+    for (auto fd : cperTracePipeFds) {
+        auto alreadyPolled = std::any_of(pollSources.begin(), pollSources.end(), [fd](const PollDescriptor &source) {
+            return source.type == PollSourceType::tracefs && source.pfd.fd == fd;
+        });
+        if (!alreadyPolled) {
+            pollSources.push_back({{fd, POLLIN, 0}, PollSourceType::tracefs});
+        }
+    }
+}
+
+void LinuxEventsUtil::refreshDriverEventPollSources(zes_event_type_flags_t *pDriverEvents, zes_event_type_flags_t &driverRegisteredEvents, std::vector<PollDescriptor> &pollSources, bool &cperRegistered) {
+    if (pDriverEvents != nullptr) {
+        driverRegisteredEvents = registeredDriverEvents;
+    }
+    updateCperPollSource(driverRegisteredEvents, pollSources, cperRegistered);
+}
+
+ze_result_t LinuxEventsUtil::checkEventSourcesAvailable(const std::vector<zes_event_type_flags_t> &registeredEvents, zes_event_type_flags_t driverRegisteredEvents, uint32_t count, zes_device_handle_t *phDevices) {
+    if (this->pUdevLib == nullptr && isUdevEventRegistered(registeredEvents, driverRegisteredEvents)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Error@ %s(): libudev library instantiation failed and returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    if (!isNetlinkSubscribed(this->pDrmNl) && isNetlinkEventRegistered(registeredEvents, count, phDevices)) {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "Error@ %s(): netlink events are not available and returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
+        return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+    }
+
+    if (isCperEventRegistered(driverRegisteredEvents)) {
+        std::call_once(this->initCperEventSupportOnce, [this]() {
+            this->cperEventSupported = LinuxInfoLogImp::isCperEventSupported();
+        });
+        if (!this->cperEventSupported) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "Error@ %s(): CPER events are not available and returning error:0x%x \n", NEO_FUNCTION_NAME, ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE);
+            return ZE_RESULT_ERROR_DEPENDENCY_UNAVAILABLE;
+        }
+    }
+    return ZE_RESULT_SUCCESS;
+}
+
+ze_result_t LinuxEventsUtil::listenSystemEvents(zes_event_type_flags_t *pEvents, uint32_t count, std::vector<zes_event_type_flags_t> &registeredEvents, zes_device_handle_t *phDevices, uint64_t timeout, bool &eventReceived, zes_event_type_flags_t *pDriverEvents) {
+    std::call_once(initEventsOnce, [this]() {
+        this->init();
+    });
+
+    std::call_once(initNetlinkOnce, [this]() {
+        this->initNetlink();
+    });
+
+    eventReceived = false;
+    zes_event_type_flags_t driverRegisteredEvents = 0;
+    ze_result_t result = ZE_RESULT_SUCCESS;
+    {
+        std::unique_lock<std::mutex> lock(eventsMutex);
+        if (pDriverEvents != nullptr) {
+            driverRegisteredEvents = registeredDriverEvents;
+        }
+        result = checkEventSourcesAvailable(registeredEvents, driverRegisteredEvents, count, phDevices);
+    }
+    if (result != ZE_RESULT_SUCCESS) {
+        return result;
+    }
+
+    std::vector<std::string> subsystemList;
+    std::map<uint32_t, std::string> devIndexToDevBdfPathMap = {};
+    FsAccessInterface *pFsAccess = nullptr;
+    bool cperRegistered = isCperEventRegistered(driverRegisteredEvents);
+
+    std::vector<PollDescriptor> pollSources;
+    if (pUdevLib != nullptr) {
+        subsystemList.push_back("drm");
+        subsystemList.push_back("auxiliary");
+        pollSources.push_back({{pUdevLib->registerEventsFromSubsystemAndGetFd(subsystemList), POLLIN, 0}, PollSourceType::udev});
+    } else {
+        PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                     "%s", "libudev library instantiation failed, listening for events not depending on libudev only\n");
+    }
+
+    auto start = L0::Sysman::SteadyClock::now();
+    std::chrono::duration<double, std::milli> timeElapsed;
+    uint64_t remainingTimeout = timeout;
+    {
+        std::unique_lock<std::mutex> lock(eventsMutex);
+        if (NEO::SysCalls::pipe(pipeFd) < 0) {
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get(), stderr,
+                         "%s", "Creation of pipe failed\n");
+        }
+        pollSources.push_back({{pipeFd[0], POLLIN, 0}, PollSourceType::pipe});
+
+        if (isNetlinkSubscribed(pDrmNl)) {
+            pollSources.push_back({{netlinkGetSocketFd(pDrmNl), POLLIN, 0}, PollSourceType::netlink});
+        }
+
+        refreshDriverEventPollSources(pDriverEvents, driverRegisteredEvents, pollSources, cperRegistered);
+        updateSupportedPciDeviceAddresses(driverRegisteredEvents);
+
+        getDevIndexToDevPathMap(registeredEvents, count, phDevices, devIndexToDevBdfPathMap, pFsAccess);
+        // Re-check since driver events may have been re-registered before the pipe was created
+        result = checkEventSourcesAvailable(registeredEvents, driverRegisteredEvents, count, phDevices);
+    }
+
+    std::vector<struct pollfd> pfds;
+    auto syncPfds = [&]() {
+        pfds.resize(pollSources.size());
+        for (size_t i = 0; i < pollSources.size(); i++) {
+            pfds[i] = pollSources[i].pfd;
+            pfds[i].revents = 0;
+        }
+    };
+    auto syncRevents = [&]() {
+        for (size_t i = 0; i < pollSources.size(); i++) {
+            pollSources[i].pfd.revents = pfds[i].revents;
+        }
+    };
+
+    syncPfds();
+    while (result == ZE_RESULT_SUCCESS && NEO::SysCalls::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), static_cast<int>(remainingTimeout)) > 0) {
+        syncRevents();
+
+        bool pipeTriggered = false;
+        bool netlinkReady = false;
+        bool udevReady = false;
+        bool tracefsReady = false;
+
+        for (auto &src : pollSources) {
+            if (src.pfd.revents & POLLIN) {
+                if (src.type == PollSourceType::udev) {
+                    udevReady = true;
+                } else if (src.type == PollSourceType::pipe) {
+                    pipeTriggered = true;
+                } else if (src.type == PollSourceType::tracefs) {
+                    tracefsReady = true;
+                } else {
+                    netlinkReady = true;
+                }
+            }
+        }
+
+        if (pipeTriggered) {
+            std::unique_lock<std::mutex> lock(eventsMutex);
+            uint8_t dummy;
+            ssize_t pipeReadRet = NEO::SysCalls::read(pipeFd[0], &dummy, 1);
+            PRINT_STRING(NEO::debugManager.flags.PrintDebugMessages.get() && (pipeReadRet < 0),
+                         stderr, "read() on event pipe fd=%d failed errno=%d\n", pipeFd[0], errno);
+            devIndexToDevBdfPathMap.clear();
+            pFsAccess = nullptr;
+            getDevIndexToDevPathMap(registeredEvents, count, phDevices, devIndexToDevBdfPathMap, pFsAccess);
+            refreshDriverEventPollSources(pDriverEvents, driverRegisteredEvents, pollSources, cperRegistered);
+            updateSupportedPciDeviceAddresses(driverRegisteredEvents);
+            result = checkEventSourcesAvailable(registeredEvents, driverRegisteredEvents, count, phDevices);
+            if (result != ZE_RESULT_SUCCESS) {
+                break;
+            }
+            syncPfds();
+        }
+
+        if (tracefsReady && (pDriverEvents != nullptr) && isCperEventRegistered(driverRegisteredEvents)) {
+            *pDriverEvents |= ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT;
+            eventReceived = true;
+        }
+
+        if (devIndexToDevBdfPathMap.empty() && !cperRegistered && !(driverRegisteredEvents & driverScopedAttachDetachEvents)) {
+            break;
+        }
+
+        if (udevReady) {
+            void *dev = nullptr;
+            dev = pUdevLib->allocateDeviceToReceiveData();
+            if (dev != nullptr) {
+                auto eventTypePtr = pUdevLib->getEventType(dev);
+                if (eventTypePtr != nullptr) {
+                    action = std::string(eventTypePtr);
+                    if (checkDeviceEvents(registeredEvents, devIndexToDevBdfPathMap, pFsAccess, pEvents, dev, phDevices)) {
+                        eventReceived = true;
+                    }
+                    if ((pDriverEvents != nullptr) && checkDriverAttachDetachEvent(dev, driverRegisteredEvents, *pDriverEvents)) {
+                        eventReceived = true;
+                    }
+                }
+                pUdevLib->dropDeviceReference(dev);
+            }
+        }
+
+        if (netlinkReady) {
+            if (handleNetlinkEvents(pEvents, count, phDevices, registeredEvents)) {
+                eventReceived = true;
+            }
+        }
+
+        if (eventReceived) {
+            break;
+        }
+
+        timeElapsed = L0::Sysman::SteadyClock::now() - start;
+        if (timeout > timeElapsed.count()) {
+            remainingTimeout = timeout - static_cast<uint64_t>(timeElapsed.count());
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(eventsMutex);
+        for (uint8_t i = 0; i < 2; i++) {
+            if (pipeFd[i] != -1) {
+                NEO::SysCalls::close(pipeFd[i]);
+                pipeFd[i] = -1;
+            }
+        }
+    }
+    // Note: We do NOT unsubscribe from netlink here. It is unsubscribed in the destructor of LinuxEventsUtil, which is called when Sysman driver is closed.
+    // This is to ensure that we can receive netlink events for the entire duration when Sysman driver is open.
+    return result;
+}
+
+} // namespace Sysman
+} // namespace L0

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,6 +18,8 @@
 namespace NEO {
 
 class GraphicsAllocation;
+class SharedPoolAllocation;
+
 namespace Zebin::Debug {
 struct Segments {
     struct Segment {
@@ -26,7 +28,7 @@ struct Segments {
     };
     using CPUSegment = Segment;
     using GPUSegment = Segment;
-    using KernelNameIsaPairT = std::pair<std::string_view, GraphicsAllocation *>;
+    using KernelNameIsaTupleT = std::tuple<std::string_view, Segment>;
     using KernelNameToSegmentMap = std::unordered_map<std::string, GPUSegment>;
 
     GPUSegment varData;
@@ -34,7 +36,7 @@ struct Segments {
     CPUSegment stringData;
     KernelNameToSegmentMap nameToSegMap;
     Segments();
-    Segments(const GraphicsAllocation *globalVarAlloc, const GraphicsAllocation *globalConstAlloc, ArrayRef<const uint8_t> &globalStrings, std::vector<KernelNameIsaPairT> &kernels);
+    Segments(const SharedPoolAllocation *globalVarAlloc, const SharedPoolAllocation *globalConstAlloc, ArrayRef<const uint8_t> &globalStrings, std::vector<KernelNameIsaTupleT> &kernels);
 };
 
 class DebugZebinCreator {
@@ -48,8 +50,8 @@ class DebugZebinCreator {
     inline std::vector<uint8_t> getDebugZebin() { return debugZebin; }
 
   protected:
-    void applyRelocation(uintptr_t addr, uint64_t value, NEO::Zebin::Elf::RELOC_TYPE_ZEBIN type);
-    bool isRelocTypeSupported(NEO::Zebin::Elf::RELOC_TYPE_ZEBIN type);
+    void applyRelocation(uintptr_t addr, uint64_t value, NEO::Zebin::Elf::RelocTypeZebin type);
+    bool isRelocTypeSupported(NEO::Zebin::Elf::RelocTypeZebin type);
     const Segments::Segment *getSegmentByName(ConstStringRef sectionName);
     const Segments::Segment *getTextSegmentByName(ConstStringRef textSegmentName);
     bool isCpuSegment(ConstStringRef sectionName);

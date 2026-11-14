@@ -1,21 +1,25 @@
 /*
- * Copyright (C) 2020-2023 Intel Corporation
+ * Copyright (C) 2020-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+#include "shared/source/helpers/non_copyable_or_moveable.h"
+#include "shared/source/utilities/mockable_virtual_defaults.h"
+
 #include "level_zero/core/source/builtin/builtin_functions_lib.h"
 #include "level_zero/core/source/module/module.h"
 
-#include <future>
+#include <atomic>
 #include <vector>
 
 namespace NEO {
-namespace EBuiltInOps {
-using Type = uint32_t;
-}
+namespace BuiltIn {
+enum class BaseKernel : uint32_t;
+struct AddressingMode;
+} // namespace BuiltIn
 class BuiltIns;
 } // namespace NEO
 
@@ -23,39 +27,52 @@ namespace L0 {
 struct Kernel;
 struct Device;
 
-struct BuiltinFunctionsLibImpl : BuiltinFunctionsLib {
-    struct BuiltinData;
-    BuiltinFunctionsLibImpl(Device *device, NEO::BuiltIns *builtInsLib);
-    ~BuiltinFunctionsLibImpl() override {
-        builtins->reset();
-        imageBuiltins->reset();
+struct BuiltInKernelLibImpl : BuiltInKernelLib, NEO::NonCopyableClass {
+    struct BuiltInKernelData;
+    BuiltInKernelLibImpl(Device *device, NEO::BuiltIns *builtInsLib);
+    ~BuiltInKernelLibImpl() override {
+        this->ensureInitCompletionImpl();
     }
 
-    Kernel *getFunction(Builtin func) override;
-    Kernel *getImageFunction(ImageBuiltin func) override;
-    void initBuiltinKernel(Builtin builtId) override;
-    void initBuiltinImageKernel(ImageBuiltin func) override;
+    Kernel *getFunction(BufferBuiltIn func, const NEO::BuiltIn::AddressingMode &mode) override;
+    Kernel *getImageFunction(ImageBuiltIn func, const NEO::BuiltIn::AddressingMode &mode) override;
+    void initBuiltinKernel(BufferBuiltIn builtId, const NEO::BuiltIn::AddressingMode &mode) override;
+    void initBuiltinImageKernel(ImageBuiltIn func, const NEO::BuiltIn::AddressingMode &mode) override;
     void ensureInitCompletion() override;
-    MOCKABLE_VIRTUAL std::unique_ptr<BuiltinFunctionsLibImpl::BuiltinData> loadBuiltIn(NEO::EBuiltInOps::Type builtin, const char *builtInName);
+    void ensureInitCompletionImpl();
+    MOCKABLE_VIRTUAL std::unique_ptr<BuiltInKernelLibImpl::BuiltInKernelData> loadBuiltIn(NEO::BuiltIn::BaseKernel baseKernel, const NEO::BuiltIn::AddressingMode &mode, const char *kernelName);
 
     static bool initBuiltinsAsyncEnabled(Device *device);
 
   protected:
+    static constexpr uint32_t maxBufferCacheSize = static_cast<uint32_t>(BufferBuiltIn::count) * NEO::BuiltIn::addressingModeCount;
+    static constexpr uint32_t maxImageCacheSize = static_cast<uint32_t>(ImageBuiltIn::count) * NEO::BuiltIn::addressingModeCount;
+
+    uint32_t toBufferCacheIndex(BufferBuiltIn func, const NEO::BuiltIn::AddressingMode &mode) const {
+        return static_cast<uint32_t>(func) * NEO::BuiltIn::addressingModeCount + mode.toIndex();
+    }
+    uint32_t toImageCacheIndex(ImageBuiltIn func, const NEO::BuiltIn::AddressingMode &mode) const {
+        return static_cast<uint32_t>(func) * NEO::BuiltIn::addressingModeCount + mode.toIndex();
+    }
+
     std::vector<std::unique_ptr<Module>> modules = {};
-    std::unique_ptr<BuiltinData> builtins[static_cast<uint32_t>(Builtin::COUNT)];
-    std::unique_ptr<BuiltinData> imageBuiltins[static_cast<uint32_t>(ImageBuiltin::COUNT)];
+    std::unique_ptr<BuiltInKernelData> builtins[maxBufferCacheSize];
+    std::unique_ptr<BuiltInKernelData> imageBuiltins[maxImageCacheSize];
     Device *device;
     NEO::BuiltIns *builtInsLib;
 
-    std::future<void> initAsync = {};
     bool initAsyncComplete = true;
+    std::atomic_bool initAsync = false;
 };
-struct BuiltinFunctionsLibImpl::BuiltinData {
-    MOCKABLE_VIRTUAL ~BuiltinData();
-    BuiltinData();
-    BuiltinData(Module *module, std::unique_ptr<L0::Kernel> &&ker);
+struct BuiltInKernelLibImpl::BuiltInKernelData : NEO::NonCopyableClass {
+    MOCKABLE_VIRTUAL ~BuiltInKernelData();
+    BuiltInKernelData();
+    BuiltInKernelData(Module *module, std::unique_ptr<L0::Kernel> &&ker);
 
     Module *module = nullptr;
     std::unique_ptr<Kernel> func;
 };
+
+static_assert(NEO::NonCopyable<BuiltInKernelLibImpl>);
+static_assert(NEO::NonCopyable<BuiltInKernelLibImpl::BuiltInKernelData>);
 } // namespace L0

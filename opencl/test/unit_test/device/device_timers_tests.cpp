@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -9,12 +9,8 @@
 #include "shared/test/common/mocks/mock_device.h"
 #include "shared/test/common/mocks/mock_ostime.h"
 
-#include "opencl/test/unit_test/fixtures/cl_device_fixture.h"
-
 #include "gtest/gtest.h"
 #include <CL/cl_platform.h>
-
-#include <thread>
 
 using namespace NEO;
 
@@ -25,13 +21,13 @@ TEST(MockOSTime, WhenSleepingThenDeviceAndHostTimerAreIncreased) {
     cl_ulong hostTimestamp[2] = {0, 0};
 
     auto mDev = MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr);
-    mDev->setOSTime(new MockOSTime());
+    auto osTime = new MockOSTime();
+    osTime->setDeviceTimerResolution();
+    mDev->setOSTime(osTime);
 
     mDev->getDeviceAndHostTimer(
         &deviceTimestamp[0],
         &hostTimestamp[0]);
-
-    std::this_thread::sleep_for(std::chrono::nanoseconds(1000));
 
     mDev->getDeviceAndHostTimer(
         &deviceTimestamp[1],
@@ -97,8 +93,6 @@ TEST(MockOSTime, WhenSleepingThenHostTimerIsIncreased) {
     mDev->getHostTimer(
         &hostTimestamp[0]);
 
-    std::this_thread::sleep_for(std::chrono::nanoseconds(1000));
-
     mDev->getHostTimer(
         &hostTimestamp[1]);
 
@@ -121,7 +115,7 @@ TEST(MockOSTime, GivenNullWhenSettingOsTimeThenResolutionIsZero) {
 
 TEST(MockOSTime, givenDeviceTimestampBaseNotEnabledWhenGetDeviceAndHostTimerThenCpuTimestampIsReturned) {
     DebugManagerStateRestore dbgRestore;
-    DebugManager.flags.EnableDeviceBasedTimestamps.set(0);
+    debugManager.flags.EnableDeviceBasedTimestamps.set(0);
     auto mockDevice = std::unique_ptr<MockDevice>(MockDevice::createWithNewExecutionEnvironment<MockDevice>(nullptr));
     mockDevice->setOSTime(new MockOSTimeWithConstTimestamp());
 
@@ -164,16 +158,16 @@ class FailingMockOSTime : public OSTime {
 
 class FailingMockDeviceTime : public DeviceTime {
   public:
-    bool getCpuGpuTime(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
-        return false;
+    TimeQueryStatus getGpuCpuTimeImpl(TimeStampData *pGpuCpuTime, OSTime *osTime) override {
+        return TimeQueryStatus::deviceLost;
     }
 
-    double getDynamicDeviceTimerResolution(HardwareInfo const &hwInfo) const override {
+    double getDynamicDeviceTimerResolution() const override {
         return 1.0;
     }
 
-    uint64_t getDynamicDeviceTimerClock(HardwareInfo const &hwInfo) const override {
-        return static_cast<uint64_t>(1000000000.0 / OSTime::getDeviceTimerResolution(hwInfo));
+    uint64_t getDynamicDeviceTimerClock() const override {
+        return static_cast<uint64_t>(1000000000.0 / OSTime::getDeviceTimerResolution());
     }
 };
 

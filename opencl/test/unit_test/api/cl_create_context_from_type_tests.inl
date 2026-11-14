@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -106,9 +106,9 @@ TEST_F(ClCreateContextFromTypeTests, GivenNonDefaultPlatformWithInvalidIcdDispat
     EXPECT_EQ(nullptr, clContext);
 }
 
-TEST(clCreateContextFromTypeTest, GivenPlatformWithMultipleDevicesWhenCreatingContextFromTypeThenContextContainsOnlyOneDevice) {
+TEST(clCreateContextFromTypeTest, GivenPlatformWithMultipleDevicesWhenCreatingContextFromTypeThenContextContainsAllDevices) {
     DebugManagerStateRestore restorer;
-    DebugManager.flags.CreateMultipleRootDevices.set(2);
+    debugManager.flags.CreateMultipleRootDevices.set(2);
 
     initPlatform();
 
@@ -116,6 +116,29 @@ TEST(clCreateContextFromTypeTest, GivenPlatformWithMultipleDevicesWhenCreatingCo
 
     auto context =
         clCreateContextFromType(nullptr, CL_DEVICE_TYPE_GPU, nullptr, nullptr, &retVal);
+
+    ASSERT_EQ(CL_SUCCESS, retVal);
+    ASSERT_NE(nullptr, context);
+
+    auto pContext = castToObject<Context>(context);
+    EXPECT_EQ(2u, pContext->getNumDevices());
+    EXPECT_EQ(platform()->getClDevice(0), pContext->getDevice(0));
+    EXPECT_EQ(platform()->getClDevice(1), pContext->getDevice(1));
+
+    retVal = clReleaseContext(context);
+    ASSERT_EQ(CL_SUCCESS, retVal);
+}
+
+TEST(clCreateContextFromTypeTest, GivenPlatformWithMultipleDevicesWhenCreatingContextFromTypeWithDeviceTypeDefaultThenContextContainsOnlyOneDefaultDevice) {
+    DebugManagerStateRestore restorer;
+    debugManager.flags.CreateMultipleRootDevices.set(2);
+
+    initPlatform();
+
+    cl_int retVal = CL_INVALID_CONTEXT;
+
+    auto context =
+        clCreateContextFromType(nullptr, CL_DEVICE_TYPE_DEFAULT, nullptr, nullptr, &retVal);
 
     ASSERT_EQ(CL_SUCCESS, retVal);
     ASSERT_NE(nullptr, context);

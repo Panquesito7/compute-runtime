@@ -1,0 +1,214 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ */
+
+#include "shared/source/debug_settings/debug_settings_manager.h"
+#include "shared/source/helpers/constants.h"
+#include "shared/source/helpers/hw_info.h"
+#include "shared/source/release_helpers/release_helper/release_helper.h"
+#include "shared/test/common/helpers/debug_manager_state_restore.h"
+#include "shared/test/common/helpers/default_hw_info.h"
+#include "shared/test/unit_test/release_helpers/release_helper/release_helper_tests_base.h"
+
+#include "gtest/gtest.h"
+#include "platforms.h"
+
+struct ReleaseHelperNvlPTests : public ReleaseHelperTests<35, 10> {
+
+    std::vector<uint32_t> getRevisions() override {
+        return {0, 4};
+    }
+};
+
+TEST_F(ReleaseHelperNvlPTests, whenGettingCapabilitiesThenCorrectPropertiesAreReturned) {
+    for (auto &revision : getRevisions()) {
+        ipVersion.revision = revision;
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+
+        EXPECT_FALSE(releaseHelper->isPipeControlPriorToNonPipelinedStateCommandsExtendedWARequired(*defaultHwInfo, false));
+        EXPECT_FALSE(releaseHelper->isResolvingSubDeviceIDNeeded());
+    }
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenGettingSupportedNumGrfsThenCorrectValuesAreReturned) {
+    SupportedNumGrfs expectedValuesRev0{32u, 64u, 96u, 128u, 160u, 192u, 256u, 512u};
+    SupportedNumGrfs expectedValues{32u, 64u, 96u, 128u, 160u, 192u, 256u, 320u, 448u, 512u};
+    for (auto &baseIpVersion : {static_cast<uint32_t>(AOT::NVL_P_A0)}) {
+        ipVersion.value = baseIpVersion;
+        for (auto &revision : getRevisions()) {
+            ipVersion.revision = revision;
+            releaseHelper = ReleaseHelper::create(ipVersion);
+            ASSERT_NE(nullptr, releaseHelper);
+            if (revision != 0) {
+                EXPECT_EQ(expectedValues, releaseHelper->getSupportedNumGrfs());
+            } else {
+                EXPECT_EQ(expectedValuesRev0, releaseHelper->getSupportedNumGrfs());
+            }
+        }
+    }
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenGettingThreadsPerEuConfigsThenCorrectValueIsReturnedBasedOnNumThreadPerEu) {
+    whenGettingThreadsPerEuConfigsThenCorrectValueIsReturnedBasedOnNumThreadPerEu();
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenGettingTotalMemBankSizeThenReturn32GB) {
+    whenGettingTotalMemBankSizeThenReturn32GB();
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenGettingPreferredSlmSizeThenAllEntriesHaveCorrectValues) {
+    for (auto &revision : getRevisions()) {
+        ipVersion.revision = revision;
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+
+        auto &preferredSlmValueArrayHeapless = releaseHelper->getSizeToPreferredSlmValue();
+        EXPECT_EQ(0u, preferredSlmValueArrayHeapless[0].upperLimit);
+        EXPECT_EQ(0u, preferredSlmValueArrayHeapless[0].valueToProgram);
+
+        EXPECT_EQ(16 * MemoryConstants::kiloByte, preferredSlmValueArrayHeapless[1].upperLimit);
+        EXPECT_EQ(1u, preferredSlmValueArrayHeapless[1].valueToProgram);
+
+        EXPECT_EQ(32 * MemoryConstants::kiloByte, preferredSlmValueArrayHeapless[2].upperLimit);
+        EXPECT_EQ(2u, preferredSlmValueArrayHeapless[2].valueToProgram);
+
+        EXPECT_EQ(64 * MemoryConstants::kiloByte, preferredSlmValueArrayHeapless[3].upperLimit);
+        EXPECT_EQ(3u, preferredSlmValueArrayHeapless[3].valueToProgram);
+
+        EXPECT_EQ(96 * MemoryConstants::kiloByte, preferredSlmValueArrayHeapless[4].upperLimit);
+        EXPECT_EQ(4u, preferredSlmValueArrayHeapless[4].valueToProgram);
+
+        EXPECT_EQ(128 * MemoryConstants::kiloByte, preferredSlmValueArrayHeapless[5].upperLimit);
+        EXPECT_EQ(5u, preferredSlmValueArrayHeapless[5].valueToProgram);
+
+        EXPECT_EQ(160 * MemoryConstants::kiloByte, preferredSlmValueArrayHeapless[6].upperLimit);
+        EXPECT_EQ(6u, preferredSlmValueArrayHeapless[6].valueToProgram);
+
+        EXPECT_EQ(std::numeric_limits<uint32_t>::max(), preferredSlmValueArrayHeapless[7].upperLimit);
+        EXPECT_EQ(7u, preferredSlmValueArrayHeapless[7].valueToProgram);
+    }
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenCallingAdjustMaxThreadsPerEuCountThenCorrectValueIsReturned) {
+    for (auto &baseIpVersion : {static_cast<uint32_t>(AOT::NVL_P_A0)}) {
+        ipVersion.value = baseIpVersion;
+        for (auto &revision : getRevisions()) {
+            ipVersion.revision = revision;
+            releaseHelper = ReleaseHelper::create(ipVersion);
+            ASSERT_NE(nullptr, releaseHelper);
+
+            if (revision != 0) {
+                {
+                    uint32_t maxThreadsPerEuCount = 1;
+                    uint32_t grfCount = 448;
+                    EXPECT_EQ(2u, releaseHelper->adjustMaxThreadsPerEuCount(maxThreadsPerEuCount, grfCount));
+                }
+
+                {
+                    uint32_t maxThreadsPerEuCount = 1;
+                    uint32_t grfCount = 320;
+                    EXPECT_EQ(3u, releaseHelper->adjustMaxThreadsPerEuCount(maxThreadsPerEuCount, grfCount));
+                }
+            } else {
+                {
+                    uint32_t maxThreadsPerEuCount = 1;
+                    uint32_t grfCount = 448;
+                    EXPECT_EQ(maxThreadsPerEuCount, releaseHelper->adjustMaxThreadsPerEuCount(maxThreadsPerEuCount, grfCount));
+                }
+
+                {
+                    uint32_t maxThreadsPerEuCount = 1;
+                    uint32_t grfCount = 320;
+                    EXPECT_EQ(maxThreadsPerEuCount, releaseHelper->adjustMaxThreadsPerEuCount(maxThreadsPerEuCount, grfCount));
+                }
+            }
+
+            {
+                uint32_t maxThreadsPerEuCount = 5;
+                uint32_t grfCount = 255;
+                EXPECT_EQ(maxThreadsPerEuCount, releaseHelper->adjustMaxThreadsPerEuCount(maxThreadsPerEuCount, grfCount));
+            }
+
+            {
+                uint32_t maxThreadsPerEuCount = 1;
+                uint32_t grfCount = 449;
+                EXPECT_EQ(maxThreadsPerEuCount, releaseHelper->adjustMaxThreadsPerEuCount(maxThreadsPerEuCount, grfCount));
+            }
+        }
+    }
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenIsStateCacheInvalidationWaRequiredCalledThenCorrectValueIsReturned) {
+    for (auto &baseIpVersion : {static_cast<uint32_t>(AOT::NVL_P_A0)}) {
+        ipVersion.value = baseIpVersion;
+        for (auto &revision : getRevisions()) {
+            ipVersion.revision = revision;
+            releaseHelper = ReleaseHelper::create(ipVersion);
+            ASSERT_NE(nullptr, releaseHelper);
+            if (revision == 0) {
+                EXPECT_TRUE(releaseHelper->isStateCacheInvalidationWaRequired(false, false));
+            } else {
+                EXPECT_FALSE(releaseHelper->isStateCacheInvalidationWaRequired(false, false));
+            }
+        }
+    }
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenIsStateCacheInvalidationWaRequiredCalledWithDebugFlagSetThenCorrectValueReturned) {
+    whenIsStateCacheInvalidationWaRequiredCalledWithDebugFlagSetThenCorrectValueReturned();
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenCheckingCoherentPatSupportThenNvlPRevisionsBeforeB0RequireAppTransientCoherentPatAndNvlPB0Supports2WayCoherency) {
+    DebugManagerStateRestore restore;
+    debugManager.flags.EnableOverrideToPat19ForSystemMemory.set(-1);
+    ipVersion.value = static_cast<uint32_t>(AOT::NVL_P_A0);
+    releaseHelper = ReleaseHelper::create(ipVersion);
+
+    EXPECT_FALSE(releaseHelper->is2WayCoherentPatSupported());
+    EXPECT_TRUE(releaseHelper->isAppTransientCoherentPatRequired());
+
+    ipVersion.revision = 1u;
+    releaseHelper = ReleaseHelper::create(ipVersion);
+
+    EXPECT_FALSE(releaseHelper->is2WayCoherentPatSupported());
+    EXPECT_TRUE(releaseHelper->isAppTransientCoherentPatRequired());
+
+    ipVersion.value = static_cast<uint32_t>(AOT::NVL_P_B0);
+    releaseHelper = ReleaseHelper::create(ipVersion);
+
+    EXPECT_TRUE(releaseHelper->is2WayCoherentPatSupported());
+    EXPECT_FALSE(releaseHelper->isAppTransientCoherentPatRequired());
+}
+
+TEST_F(ReleaseHelperNvlPTests, givenAppTransientPatOverrideWhenCheckingRequirementThenFlagOverridesSteppingDefault) {
+    DebugManagerStateRestore restore;
+
+    for (const auto baseIpVersion : {AOT::NVL_P_A0, AOT::NVL_P_B0}) {
+        ipVersion.value = static_cast<uint32_t>(baseIpVersion);
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+
+        debugManager.flags.EnableOverrideToPat19ForSystemMemory.set(0);
+        EXPECT_FALSE(releaseHelper->isAppTransientCoherentPatRequired());
+
+        debugManager.flags.EnableOverrideToPat19ForSystemMemory.set(1);
+        EXPECT_TRUE(releaseHelper->isAppTransientCoherentPatRequired());
+
+        debugManager.flags.EnableOverrideToPat19ForSystemMemory.set(-1);
+        EXPECT_EQ(baseIpVersion == AOT::NVL_P_A0, releaseHelper->isAppTransientCoherentPatRequired());
+    }
+}
+
+TEST_F(ReleaseHelperNvlPTests, whenOverridingSystemMemoryPatIndexThenPat19IsReturnedForAllSteppings) {
+    constexpr uint64_t patIndex = 5u;
+    for (const auto baseIpVersion : {AOT::NVL_P_A0, AOT::NVL_P_B0}) {
+        ipVersion.value = static_cast<uint32_t>(baseIpVersion);
+        releaseHelper = ReleaseHelper::create(ipVersion);
+        ASSERT_NE(nullptr, releaseHelper);
+        EXPECT_EQ(19u, releaseHelper->overrideSystemMemoryPatIndex(patIndex));
+    }
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -7,16 +7,22 @@
 
 #pragma once
 
+#include "shared/source/helpers/simd_helper.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace NEO {
-inline uint32_t getGRFsPerThread(uint32_t simd, uint32_t grfSize) {
+struct RootDeviceEnvironment;
+inline uint32_t getNumGrfsPerLocalIdCoordinate(uint32_t simd, uint32_t grfSize) {
     return (simd == 32 && grfSize == 32) ? 2 : 1;
 }
 
-inline size_t getThreadsPerWG(uint32_t simd, size_t lws) {
+inline uint32_t getThreadsPerWG(uint32_t simd, uint32_t lws) {
+    if (isSimd1(simd)) {
+        return lws;
+    }
     auto result = lws + simd - 1;
 
     // Original logic:
@@ -26,24 +32,24 @@ inline size_t getThreadsPerWG(uint32_t simd, size_t lws) {
                    ? 5
                : simd == 16
                    ? 4
-               : simd == 8
-                   ? 3
-                   : 0;
+                   : 3; // for SIMD 8
 
     return result;
 }
 
-inline uint32_t getPerThreadSizeLocalIDs(uint32_t simd, uint32_t grfSize, uint32_t numChannels = 3) {
-    auto numGRFSPerThread = getGRFsPerThread(simd, grfSize);
-    uint32_t returnSize = numGRFSPerThread * grfSize * (simd == 1 ? 1u : numChannels);
-    returnSize = std::max(returnSize, grfSize);
+inline uint32_t getPerThreadSizeLocalIDs(uint32_t simd, uint32_t grfSize, uint32_t numChannels) {
+    if (isSimd1(simd)) {
+        return grfSize;
+    }
+    auto numGRFSPerLocalIdCoord = getNumGrfsPerLocalIdCoordinate(simd, grfSize);
+    uint32_t returnSize = numGRFSPerLocalIdCoord * grfSize * numChannels;
     return returnSize;
 }
 
 struct LocalIDHelper {
-    static void (*generateSimd8)(void *buffer, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup, const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize);
-    static void (*generateSimd16)(void *buffer, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup, const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize);
-    static void (*generateSimd32)(void *buffer, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup, const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize);
+    static void (*generateSimd8)(void *buffer, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup, const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize, uint8_t activeChannels);
+    static void (*generateSimd16)(void *buffer, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup, const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize, uint8_t activeChannels);
+    static void (*generateSimd32)(void *buffer, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup, const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize, uint8_t activeChannels);
 
     static LocalIDHelper initializer;
 
@@ -55,10 +61,10 @@ extern const uint16_t initialLocalID[];
 
 template <typename Vec, int simd>
 void generateLocalIDsSimd(void *b, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t threadsPerWorkGroup,
-                          const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize);
+                          const std::array<uint8_t, 3> &dimensionsOrder, bool chooseMaxRowSize, uint8_t activeChannels);
 
 void generateLocalIDs(void *buffer, uint16_t simd, const std::array<uint16_t, 3> &localWorkgroupSize,
-                      const std::array<uint8_t, 3> &dimensionsOrder, bool isImageOnlyKernel, uint32_t grfSize);
+                      const std::array<uint8_t, 3> &dimensionsOrder, bool isImageOnlyKernel, uint32_t grfSize, uint32_t grfCount, const RootDeviceEnvironment &rootDeviceEnvironment, uint8_t activeChannels);
 void generateLocalIDsWithLayoutForImages(void *b, const std::array<uint16_t, 3> &localWorkgroupSize, uint16_t simd);
 
 bool isCompatibleWithLayoutForImages(const std::array<uint16_t, 3> &localWorkgroupSize, const std::array<uint8_t, 3> &dimensionsOrder, uint16_t simd);

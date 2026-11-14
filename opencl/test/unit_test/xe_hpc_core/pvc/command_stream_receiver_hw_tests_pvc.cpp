@@ -1,16 +1,17 @@
 /*
- * Copyright (C) 2021-2023 Intel Corporation
+ * Copyright (C) 2021-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #include "shared/source/command_stream/command_stream_receiver_hw.h"
-#include "shared/source/command_stream/thread_arbitration_policy.h"
+#include "shared/source/compiler_interface/compiler_options.h"
 #include "shared/source/gmm_helper/client_context/gmm_client_context.h"
 #include "shared/source/gmm_helper/resource_info.h"
 #include "shared/source/helpers/blit_commands_helper.h"
 #include "shared/source/helpers/engine_node_helper.h"
+#include "shared/source/helpers/file_io.h"
 #include "shared/source/helpers/preamble.h"
 #include "shared/source/os_interface/device_factory.h"
 #include "shared/source/utilities/tag_allocator.h"
@@ -19,6 +20,7 @@
 #include "shared/test/common/helpers/variable_backup.h"
 #include "shared/test/common/libult/ult_aub_command_stream_receiver.h"
 #include "shared/test/common/libult/ult_command_stream_receiver.h"
+#include "shared/test/common/mocks/mock_zebin_wrapper.h"
 #include "shared/test/common/test_macros/header/per_product_test_definitions.h"
 #include "shared/test/common/test_macros/test.h"
 #include "shared/test/common/utilities/base_object_utils.h"
@@ -38,41 +40,11 @@
 using namespace NEO;
 
 using PvcCommandStreamReceiverFlushTaskTests = UltCommandStreamReceiverTest;
-PVCTEST_F(PvcCommandStreamReceiverFlushTaskTests, givenOverrideThreadArbitrationPolicyDebugVariableSetForPvcWhenFlushingThenRequestRequiredMode) {
-    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
-    DebugManagerStateRestore restore;
-    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
-
-    DebugManager.flags.OverrideThreadArbitrationPolicy.set(ThreadArbitrationPolicy::RoundRobin);
-
-    EXPECT_EQ(-1, commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value);
-
-    flushTask(commandStreamReceiver);
-    EXPECT_EQ(ThreadArbitrationPolicy::RoundRobin,
-              commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value);
-}
-
-PVCTEST_F(PvcCommandStreamReceiverFlushTaskTests, givenNotExistPolicyWhenFlushingThenDefaultPolicyIsProgrammed) {
-    using STATE_COMPUTE_MODE = typename FamilyType::STATE_COMPUTE_MODE;
-    char buff[1024] = {0};
-    LinearStream stream(buff, 1024);
-
-    auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
-    DispatchFlags dispatchFlags = DispatchFlagsHelper::createDefaultDispatchFlags();
-    int32_t notExistPolicy = -2;
-    flushTaskFlags.threadArbitrationPolicy = notExistPolicy;
-
-    flushTask(commandStreamReceiver);
-
-    EXPECT_EQ(notExistPolicy, commandStreamReceiver.streamProperties.stateComputeMode.threadArbitrationPolicy.value);
-}
-
 PVCTEST_F(PvcCommandStreamReceiverFlushTaskTests, givenRevisionBAndAboveWhenLastSystolicPipelineSelectModeIsTrueAndFlushTaskIsCalledThenDontReprogramPipelineSelect) {
     auto hwInfo = pDevice->getRootDeviceEnvironment().getMutableHardwareInfo();
     auto &commandStreamReceiver = pDevice->getUltCommandStreamReceiver<FamilyType>();
 
     flushTaskFlags.pipelineSelectArgs.systolicPipelineSelectMode = true;
-    flushTaskFlags.pipelineSelectArgs.mediaSamplerRequired = false;
 
     struct {
         unsigned short revId;
@@ -90,7 +62,6 @@ PVCTEST_F(PvcCommandStreamReceiverFlushTaskTests, givenRevisionBAndAboveWhenLast
         hwInfo->platform.usRevId = testInput.revId;
         productHelper.fillPipelineSelectPropertiesSupportStructure(commandStreamReceiver.pipelineSupportFlags, *hwInfo);
         commandStreamReceiver.isPreambleSent = true;
-        commandStreamReceiver.lastMediaSamplerConfig = false;
         commandStreamReceiver.lastSystolicPipelineSelectMode = false;
         commandStreamReceiver.streamProperties.pipelineSelect.systolicMode.value = -1;
 
@@ -106,7 +77,7 @@ PVCTEST_F(PvcCommandStreamReceiverFlushTaskTests, givenRevisionBAndAboveWhenLast
 
 struct PVcBcsTests : public UltCommandStreamReceiverTest {
     void SetUp() override {
-        DebugManager.flags.EnableLocalMemory.set(true);
+        debugManager.flags.EnableLocalMemory.set(true);
         UltCommandStreamReceiverTest::SetUp();
         context = std::make_unique<MockContext>(pClDevice);
     }
@@ -122,7 +93,7 @@ struct PVcBcsTests : public UltCommandStreamReceiverTest {
 };
 
 PVCTEST_F(PVcBcsTests, givenCompressibleBuffersWhenStatefulCompressionIsEnabledThenProgramBlitterWithStatefulCompressionSettings) {
-    DebugManager.flags.RenderCompressedBuffersEnabled.set(1);
+    debugManager.flags.RenderCompressedBuffersEnabled.set(1);
 
     using MEM_COPY = typename FamilyType::MEM_COPY;
     char buff[1024] = {0};
@@ -136,23 +107,20 @@ PVCTEST_F(PVcBcsTests, givenCompressibleBuffersWhenStatefulCompressionIsEnabledT
     EXPECT_EQ(CL_SUCCESS, retVal);
 
     auto srcAllocation = srcBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
-    EXPECT_TRUE(srcAllocation->getDefaultGmm()->isCompressionEnabled);
+    EXPECT_TRUE(srcAllocation->getDefaultGmm()->isCompressionEnabled());
 
     auto dstAllocation = dstBuffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
-    EXPECT_TRUE(dstAllocation->getDefaultGmm()->isCompressionEnabled);
+    EXPECT_TRUE(dstAllocation->getDefaultGmm()->isCompressionEnabled());
 
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(srcAllocation, dstAllocation, 0, 0,
-                                                                     {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
+    auto blitProperties = BlitProperties::constructPropertiesForCopy(srcAllocation, 0, dstAllocation, 0, 0, 0,
+                                                                     {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc, false);
     auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
     *bltCmd = FamilyType::cmdInitXyCopyBlt;
-
-    platformsImpl->clear();
-    EXPECT_EQ(platform(), nullptr);
 
     const auto &rootDeviceEnvironment = context->getDevice(0)->getRootDeviceEnvironment();
     BlitCommandsHelper<FamilyType>::appendBlitCommandsForBuffer(blitProperties, *bltCmd, rootDeviceEnvironment);
 
-    EXPECT_EQ(bltCmd->getDestinationCompressionEnable(), MEM_COPY::DESTINATION_COMPRESSION_ENABLE::DESTINATION_COMPRESSION_ENABLE_ENABLE);
+    EXPECT_TRUE(bltCmd->getDestinationCompressionEnable());
     EXPECT_EQ(bltCmd->getDestinationCompressible(), MEM_COPY::DESTINATION_COMPRESSIBLE::DESTINATION_COMPRESSIBLE_COMPRESSIBLE);
     EXPECT_EQ(bltCmd->getSourceCompressible(), MEM_COPY::SOURCE_COMPRESSIBLE::SOURCE_COMPRESSIBLE_COMPRESSIBLE);
 
@@ -162,72 +130,9 @@ PVCTEST_F(PVcBcsTests, givenCompressibleBuffersWhenStatefulCompressionIsEnabledT
     EXPECT_EQ(compressionFormat, bltCmd->getCompressionFormat());
 }
 
-PVCTEST_F(PVcBcsTests, givenBufferInDeviceMemoryWhenStatelessCompressionIsEnabledThenBlitterForBufferUsesStatelessCompressedSettings) {
-    using MEM_COPY = typename FamilyType::MEM_COPY;
-    char buff[1024] = {0};
-    LinearStream stream(buff, 1024);
-    MockGraphicsAllocation clearColorAlloc;
-
-    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), {}, MemoryConstants::pageSize64k, nullptr, retVal));
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
-    EXPECT_TRUE(!MemoryPoolHelper::isSystemMemoryPool(allocation->getMemoryPool()));
-
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(allocation, allocation,
-                                                                     0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
-    auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
-    *bltCmd = FamilyType::cmdInitXyCopyBlt;
-
-    DebugManager.flags.EnableStatelessCompressionWithUnifiedMemory.set(true);
-    platformsImpl->clear();
-    EXPECT_EQ(platform(), nullptr);
-
-    BlitCommandsHelper<FamilyType>::appendBlitCommandsForBuffer(blitProperties, *bltCmd, context->getDevice(0)->getRootDeviceEnvironment());
-
-    EXPECT_EQ(bltCmd->getDestinationCompressionEnable(), MEM_COPY::DESTINATION_COMPRESSION_ENABLE::DESTINATION_COMPRESSION_ENABLE_ENABLE);
-    EXPECT_EQ(bltCmd->getDestinationCompressible(), MEM_COPY::DESTINATION_COMPRESSIBLE::DESTINATION_COMPRESSIBLE_COMPRESSIBLE);
-    EXPECT_EQ(bltCmd->getSourceCompressible(), MEM_COPY::SOURCE_COMPRESSIBLE::SOURCE_COMPRESSIBLE_COMPRESSIBLE);
-    EXPECT_EQ(static_cast<uint32_t>(DebugManager.flags.FormatForStatelessCompressionWithUnifiedMemory.get()), bltCmd->getCompressionFormat());
-}
-
-PVCTEST_F(PVcBcsTests, givenBufferInSystemMemoryWhenStatelessCompressionIsEnabledThenBlitterForBufferDoesntUseStatelessCompressedSettings) {
-    using MEM_COPY = typename FamilyType::MEM_COPY;
-    char buff[1024] = {0};
-    LinearStream stream(buff, 1024);
-    MockGraphicsAllocation clearColorAlloc;
-
-    auto buffer = clUniquePtr<Buffer>(Buffer::create(context.get(), CL_MEM_FORCE_HOST_MEMORY_INTEL, MemoryConstants::pageSize64k, nullptr, retVal));
-    EXPECT_EQ(CL_SUCCESS, retVal);
-
-    auto allocation = buffer->getGraphicsAllocation(pClDevice->getRootDeviceIndex());
-    EXPECT_TRUE(MemoryPoolHelper::isSystemMemoryPool(allocation->getMemoryPool()));
-
-    auto blitProperties = BlitProperties::constructPropertiesForCopy(allocation, allocation,
-                                                                     0, 0, {BlitterConstants::maxBlitWidth - 1, 1, 1}, 0, 0, 0, 0, &clearColorAlloc);
-    auto bltCmd = stream.getSpaceForCmd<MEM_COPY>();
-    *bltCmd = FamilyType::cmdInitXyCopyBlt;
-
-    DebugManager.flags.EnableStatelessCompressionWithUnifiedMemory.set(true);
-    platformsImpl->clear();
-    EXPECT_EQ(platform(), nullptr);
-
-    BlitCommandsHelper<FamilyType>::appendBlitCommandsForBuffer(blitProperties, *bltCmd, context->getDevice(0)->getRootDeviceEnvironment());
-
-    EXPECT_EQ(bltCmd->getDestinationCompressionEnable(), MEM_COPY::DESTINATION_COMPRESSION_ENABLE::DESTINATION_COMPRESSION_ENABLE_DISABLE);
-    EXPECT_EQ(bltCmd->getDestinationCompressible(), MEM_COPY::DESTINATION_COMPRESSIBLE::DESTINATION_COMPRESSIBLE_NOT_COMPRESSIBLE);
-    EXPECT_EQ(bltCmd->getSourceCompressible(), MEM_COPY::SOURCE_COMPRESSIBLE::SOURCE_COMPRESSIBLE_NOT_COMPRESSIBLE);
-    EXPECT_EQ(0u, bltCmd->getCompressionFormat());
-}
-
 using PvcMultiRootDeviceCommandStreamReceiverBufferTests = MultiRootDeviceFixture;
 
-HWTEST_EXCLUDE_PRODUCT(MultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEventInMultiRootDeviceEnvironmentWhenTheyArePassedToEnqueueWithSubmissionThenCsIsWaitingForEventsFromPreviousDevices, IGFX_PVC);
-
 PVCTEST_F(PvcMultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEventInMultiRootDeviceEnvironmentOnPvcWhenTheyArePassedToEnqueueWithSubmissionThenCsIsWaitingForEventsFromPreviousDevices) {
-    REQUIRE_SVM_OR_SKIP(device1);
-    REQUIRE_SVM_OR_SKIP(device2);
-
     using MI_SEMAPHORE_WAIT = typename FamilyType::MI_SEMAPHORE_WAIT;
     cl_int retVal = 0;
     size_t offset = 0;
@@ -236,9 +141,14 @@ PVCTEST_F(PvcMultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEvent
     auto pCmdQ1 = context->getSpecialQueue(1u);
     auto pCmdQ2 = context->getSpecialQueue(2u);
 
-    std::unique_ptr<MockProgram> program(Program::createBuiltInFromSource<MockProgram>("FillBufferBytes", context.get(), context->getDevices(), &retVal));
-    program->build(program->getDevices(), nullptr);
-    std::unique_ptr<MockKernel> kernel(Kernel::create<MockKernel>(program.get(), program->getKernelInfoForKernel("FillBufferBytes"), *context->getDevice(0), retVal));
+    MockZebinWrapper<>::Descriptor desc{};
+    desc.isStateless = true;
+    MockZebinWrapper mockZebin{*defaultHwInfo, desc};
+    mockZebin.setAsMockCompilerReturnedBinary();
+
+    std::unique_ptr<MockProgram> program(Program::createBuiltInFromSource<MockProgram>(mockZebin.kernelName, context.get(), context->getDevices(), &retVal));
+    program->build(program->getDevices(), CompilerOptions::kernelOptions.c_str());
+    std::unique_ptr<MockKernel> kernel(Kernel::create<MockKernel>(program.get(), program->getKernelInfoForKernel(mockZebin.kernelName), *context->getDevice(0), retVal));
 
     size_t svmSize = 4096;
     void *svmPtr = alignedMalloc(svmSize, MemoryConstants::pageSize);
@@ -291,12 +201,12 @@ PVCTEST_F(PvcMultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEvent
         EXPECT_EQ(2u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node4->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node4->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
 
         auto semaphoreCmd1 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[1]));
-        EXPECT_EQ(1u, semaphoreCmd1->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), semaphoreCmd1->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd1));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node5->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd1));
     }
 
     {
@@ -319,12 +229,12 @@ PVCTEST_F(PvcMultiRootDeviceCommandStreamReceiverBufferTests, givenMultipleEvent
         EXPECT_EQ(2u, semaphores.size());
 
         auto semaphoreCmd0 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[0]));
-        EXPECT_EQ(1u, semaphoreCmd0->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), semaphoreCmd0->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd0));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node1->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd0));
 
         auto semaphoreCmd1 = genCmdCast<MI_SEMAPHORE_WAIT *>(*(semaphores[1]));
-        EXPECT_EQ(1u, semaphoreCmd1->getSemaphoreDataDword());
-        EXPECT_EQ(reinterpret_cast<uint64_t>(node3->getContextEndAddress(0u)), semaphoreCmd1->getSemaphoreGraphicsAddress());
+        EXPECT_EQ(1u, NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitData(semaphoreCmd1));
+        EXPECT_EQ(reinterpret_cast<uint64_t>(node3->getContextEndAddress(0u)), NEO::UnitTestHelper<FamilyType>::getSemaphoreWaitAddress(semaphoreCmd1));
     }
     alignedFree(svmPtr);
 }

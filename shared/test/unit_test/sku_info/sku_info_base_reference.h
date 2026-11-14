@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2018-2023 Intel Corporation
+ * Copyright (C) 2018-2026 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
  */
 
 #pragma once
+
+#include "shared/source/gmm_helper/gmm_lib.h"
 
 #include "sku_info.h"
 
@@ -44,6 +46,12 @@ struct SkuInfoBaseReference {
         refFtrTable.FtrPpgtt64KBWalkOptimization = 1;
         refFtrTable.FtrUnified3DMediaCompressionFormats = 1;
         refFtrTable.Ftr57bGPUAddressing = 1;
+        refFtrTable.FtrXe2Compression = 1;
+        refFtrTable.FtrXe2PlusTiling = 1;
+        refFtrTable.FtrPml5Support = 1;
+        refFtrTable.FtrL3TransientDataFlush = 1;
+        refFtrTable.FtrAppTransientCaching = 1;
+        refFtrTable.FtrEfficient64BitAddressing = 1;
     }
 
     static void fillReferenceWaForTransfer(_WA_TABLE &refWaTable) {
@@ -57,6 +65,9 @@ struct SkuInfoBaseReference {
         refWaTable.WaUntypedBufferCompression = 1;
         refWaTable.WaAuxTable16KGranular = 1;
         refWaTable.WaAuxTable64KGranular = 1;
+        refWaTable.Wa_15010089951 = 1;
+        refWaTable.Wa_14018976079 = 1;
+        refWaTable.Wa_14018984349 = 1;
     }
 
     static void fillReferenceFtrToReceive(FeatureTable &refFtrTable) {
@@ -64,7 +75,6 @@ struct SkuInfoBaseReference {
 
         refFtrTable.flags.ftrGpGpuMidBatchPreempt = true;
         refFtrTable.flags.ftrGpGpuThreadGroupLevelPreempt = true;
-        refFtrTable.flags.ftrGpGpuMidThreadLevelPreempt = true;
         refFtrTable.flags.ftrWddm2Svm = true;
         refFtrTable.flags.ftrPooledEuEnabled = true;
 
@@ -81,6 +91,7 @@ struct SkuInfoBaseReference {
 
         refFtrTable.flags.ftrFbc = true;
 
+        refFtrTable.flags.ftrBlitterRing = true;
         refFtrTable.flags.ftrULT = true;
         refFtrTable.flags.ftrLCIA = true;
         refFtrTable.flags.ftrTileMappedResource = true;
@@ -100,7 +111,6 @@ struct SkuInfoBaseReference {
         refFtrTable.flags.ftrLinearCCS = true;
         refFtrTable.flags.ftrCCSRing = true;
         refFtrTable.flags.ftrCCSNode = true;
-        refFtrTable.flags.ftrRcsNode = true;
         refFtrTable.flags.ftrMemTypeMocsDeferPAT = true;
         refFtrTable.flags.ftrLocalMemory = true;
         refFtrTable.flags.ftrLocalMemoryAllows4KB = true;
@@ -110,6 +120,16 @@ struct SkuInfoBaseReference {
         refFtrTable.flags.ftrPpgtt64KBWalkOptimization = true;
         refFtrTable.flags.ftrUnified3DMediaCompressionFormats = true;
         refFtrTable.flags.ftr57bGPUAddressing = true;
+        refFtrTable.flags.ftrTile64Optimization = true;
+
+        refFtrTable.flags.ftrWddmHwQueues = true;
+        refFtrTable.flags.ftrWalkerMTP = true;
+        refFtrTable.flags.ftrXe2Compression = true;
+        refFtrTable.flags.ftrXe2PlusTiling = true;
+        refFtrTable.flags.ftrPml5Support = true;
+        refFtrTable.flags.ftrL3TransientDataFlush = true;
+        refFtrTable.flags.ftrHeaplessMode = true;
+        refFtrTable.flags.ftrHwSemaphore64 = true;
     }
 
     static void fillReferenceWaToReceive(WorkaroundTable &refWaTable) {
@@ -136,6 +156,9 @@ struct SkuInfoBaseReference {
         refWaTable.flags.waAuxTable16KGranular = true;
         refWaTable.flags.waDisableFusedThreadScheduling = true;
         refWaTable.flags.waAuxTable64KGranular = true;
+        refWaTable.flags.wa_15010089951 = true;
+        refWaTable.flags.wa_14018976079 = true;
+        refWaTable.flags.wa_14018984349 = true;
     }
 }; // namespace SkuInfoBaseReference
 } // namespace NEO
